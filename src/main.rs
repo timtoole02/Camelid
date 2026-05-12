@@ -22,6 +22,9 @@ enum Command {
     Serve {
         #[arg(long, default_value = "127.0.0.1:8181", env = "CAMELID_ADDR")]
         addr: SocketAddr,
+        /// Override Rayon worker threads for API inference. Defaults to RAYON_NUM_THREADS/Rayon.
+        #[arg(long, env = "CAMELID_RAYON_THREADS")]
+        threads: Option<usize>,
     },
     /// Inspect GGUF metadata and tensor descriptors.
     Inspect { path: PathBuf },
@@ -101,7 +104,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     match Cli::parse().command {
-        Command::Serve { addr } => api::serve(addr).await?,
+        Command::Serve { addr, threads } => {
+            configure_rayon_threads(threads)?;
+            api::serve(addr).await?;
+        }
         Command::Inspect { path } => {
             let gguf = read_metadata(path)?;
             println!("{}", serde_json::to_string_pretty(&gguf)?);

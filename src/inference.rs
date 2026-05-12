@@ -725,11 +725,24 @@ impl LlamaLoadedWeights {
                 let mut dims: Vec<usize> =
                     first.dimensions.iter().map(|dim| *dim as usize).collect();
                 dims.push(descs.len());
-                store.load_q8_0_split_file_backed_tensor(
-                    format!("{}..{} split experts", first.name, descs.len()),
-                    dims,
-                    descs,
-                )
+                if retain_moe_q8_0_blocks_enabled() {
+                    let mut blocks = Vec::new();
+                    for desc in descs {
+                        let expert_blocks = store.load_q8_0_blocks(&desc.name)?;
+                        blocks.extend(expert_blocks.blocks);
+                    }
+                    CpuTensor::from_q8_0_blocks(
+                        format!("{}..{} retained split experts", first.name, descs.len()),
+                        TensorShape { dims },
+                        blocks,
+                    )
+                } else {
+                    store.load_q8_0_split_file_backed_tensor(
+                        format!("{}..{} split experts", first.name, descs.len()),
+                        dims,
+                        descs,
+                    )
+                }
             }
         };
         let token_embedding = normalize_token_embedding_shape(
@@ -5665,7 +5678,15 @@ fn expert_matrix_view(
         BackendError::RuntimeShapeMismatch("MoE expert offset overflow".to_string())
     })? / Q8_0_BLOCK_VALUES;
     let block_count = expert_elements / Q8_0_BLOCK_VALUES;
-    let mut tensor = if let Some(split_backings) = &weight.q8_0_split_file_backing {
+    let mut tensor = if let Some(blocks) = &weight.q8_0_blocks {
+        CpuTensor::from_q8_0_blocks(
+            name,
+            TensorShape {
+                dims: vec![output_width, input_width],
+            },
+            blocks[block_offset..block_offset + block_count].to_vec(),
+        )?
+    } else if let Some(split_backings) = &weight.q8_0_split_file_backing {
         let backing = split_backings.get(expert_idx).ok_or_else(|| {
             BackendError::RuntimeShapeMismatch(format!(
                 "MoE split expert index {expert_idx} missing from {} split backings",
@@ -5713,9 +5734,6 @@ fn expert_matrix_view(
         CpuTensor::from_f32(name, vec![output_width, input_width], data)?
     };
     tensor.source_type = weight.source_type;
-    if let Some(blocks) = &weight.q8_0_blocks {
-        tensor.q8_0_blocks = Some(blocks[block_offset..block_offset + block_count].to_vec());
-    }
     Ok(tensor)
 }
 
@@ -6128,6 +6146,10 @@ fn lazy_q8_0_linear_enabled() -> bool {
         Err(_) => true,
     }
 }
+fn retain_moe_q8_0_blocks_enabled() -> bool {
+    env_flag_enabled("CAMELID_RETAIN_MOE_Q8_0_BLOCKS")
+}
+
 
 const Q8_0_BLOCK_VALUES: usize = 32;
 
@@ -6725,6 +6747,15 @@ fn q8_0_block_int_dot_horizontal_sum_encoded_impl(
     weight: &[u8],
     input: &[i8; Q8_0_BLOCK_VALUES],
 ) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if x86_64_avx2_enabled() {
+            // SAFETY: AVX2 support is runtime-detected above and both slices contain one full
+            // Q8_0 block (32 signed quant bytes). GGUF stores the quants as raw bytes; casting
+            // through i8 preserves the two's-complement signed values used by the scalar path.
+            return unsafe { q8_0_i8_block_avx2(weight.as_ptr().cast::<i8>(), input.as_ptr()) };
+        }
+    }
     let lanes = [
         q8_0_dot_group4_encoded(weight, input, 0) + q8_0_dot_group4_encoded(weight, input, 16),
         q8_0_dot_group4_encoded(weight, input, 4) + q8_0_dot_group4_encoded(weight, input, 20),
@@ -6755,10 +6786,15 @@ fn q8_0_block_int_dot_horizontal_sum_impl(
     weight: &[i8; Q8_0_BLOCK_VALUES],
     input: &[i8; Q8_0_BLOCK_VALUES],
 ) -> i32 {
-    // The current generic q8_0 x q8_0 dot sums the 32 products in scalar order.
-    // ARM dot-product kernels commonly accumulate four int8 products into each i32 lane and
-    // then horizontally reduce lanes. This is a deterministic scalar equivalent of that
-    // grouping, not a claim that Camelid has identified any exact external runtime kernel.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if x86_64_avx2_enabled() {
+            // SAFETY: AVX2 support is runtime-detected above and both pointers address one full
+            // Q8_0 block (32 signed quant bytes).
+            return unsafe { q8_0_i8_block_avx2(weight.as_ptr(), input.as_ptr()) };
+        }
+    }
+    // The generic q8_0 x q8_0 dot sums the 32 products in deterministic grouped scalar order.
     let lanes = [
         q8_0_dot_group4(weight, input, 0) + q8_0_dot_group4(weight, input, 16),
         q8_0_dot_group4(weight, input, 4) + q8_0_dot_group4(weight, input, 20),
@@ -6786,6 +6822,42 @@ fn q8_0_dot_group4_encoded(weight: &[u8], input: &[i8; Q8_0_BLOCK_VALUES], start
         + i32::from(weight[start + 1] as i8) * i32::from(input[start + 1])
         + i32::from(weight[start + 2] as i8) * i32::from(input[start + 2])
         + i32::from(weight[start + 3] as i8) * i32::from(input[start + 3])
+}
+
+#[cfg(target_arch = "x86_64")]
+fn x86_64_avx2_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !q8_0_env_flag_disabled("CAMELID_X86_64_AVX2_Q8_DOT")
+            && std::arch::is_x86_feature_detected!("avx2")
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn q8_0_i8_block_avx2(weight: *const i8, input: *const i8) -> i32 {
+    use std::arch::x86_64::{
+        __m128i, __m256i, _mm_loadu_si128, _mm256_add_epi32, _mm256_cvtepi8_epi16,
+        _mm256_madd_epi16, _mm256_storeu_si256,
+    };
+
+    // SAFETY: callers pass pointers to at least 32 contiguous i8 values.
+    let weight_lo = unsafe { _mm_loadu_si128(weight.cast::<__m128i>()) };
+    let input_lo = unsafe { _mm_loadu_si128(input.cast::<__m128i>()) };
+    let weight_hi = unsafe { _mm_loadu_si128(weight.add(16).cast::<__m128i>()) };
+    let input_hi = unsafe { _mm_loadu_si128(input.add(16).cast::<__m128i>()) };
+
+    let weight_lo_i16 = _mm256_cvtepi8_epi16(weight_lo);
+    let input_lo_i16 = _mm256_cvtepi8_epi16(input_lo);
+    let weight_hi_i16 = _mm256_cvtepi8_epi16(weight_hi);
+    let input_hi_i16 = _mm256_cvtepi8_epi16(input_hi);
+    let products_lo = _mm256_madd_epi16(weight_lo_i16, input_lo_i16);
+    let products_hi = _mm256_madd_epi16(weight_hi_i16, input_hi_i16);
+    let products = _mm256_add_epi32(products_lo, products_hi);
+
+    let mut lanes = [0_i32; 8];
+    unsafe { _mm256_storeu_si256(lanes.as_mut_ptr().cast::<__m256i>(), products) };
+    lanes.into_iter().sum()
 }
 
 #[cfg(target_arch = "aarch64")]

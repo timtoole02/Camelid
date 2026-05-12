@@ -595,6 +595,36 @@ impl CpuTensor {
         Ok(tensor)
     }
 
+    pub fn from_q8_0_blocks(
+        name: impl Into<String>,
+        shape: TensorShape,
+        q8_0_blocks: Vec<Q8_0Block>,
+    ) -> Result<Self> {
+        let expected_elements = shape.element_count()?;
+        if !expected_elements.is_multiple_of(32) {
+            return Err(BackendError::InvalidTensorData(format!(
+                "q8_0 block-backed tensor element count {expected_elements} is not block aligned"
+            )));
+        }
+        let expected_blocks = expected_elements / 32;
+        if q8_0_blocks.len() != expected_blocks {
+            return Err(BackendError::InvalidTensorData(format!(
+                "q8_0 block-backed tensor expected {expected_blocks} blocks, got {}",
+                q8_0_blocks.len()
+            )));
+        }
+        Ok(Self {
+            name: name.into(),
+            shape,
+            dtype: RuntimeDType::F32,
+            source_type: Some(GgufTensorType::Q8_0),
+            q8_0_blocks: Some(q8_0_blocks),
+            q8_0_file_backing: None,
+            q8_0_split_file_backing: None,
+            data: Vec::new(),
+        })
+    }
+
     pub fn with_q8_0_file_backing(mut self, backing: Q8_0FileBacking) -> Self {
         self.q8_0_file_backing = Some(backing);
         self
