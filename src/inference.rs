@@ -5499,22 +5499,43 @@ fn gated_ffn_activation(
     }
 
     let input_row = &input.data[..input_width];
-    let mut gate = vec![0.0; gate_width];
-    let mut up = vec![0.0; up_width];
+    let (mut gate, up, gate_elapsed, up_elapsed) = if collect_diagnostics {
+        let mut gate = vec![0.0; gate_width];
+        let mut up = vec![0.0; up_width];
 
-    let started = Instant::now();
-    accumulate_linear_row(
-        input_row,
-        gate_weight,
-        &mut gate,
-        "ffn gate",
-        collect_diagnostics,
-    )?;
-    let gate_elapsed = started.elapsed().as_micros();
+        let started = Instant::now();
+        accumulate_linear_row(
+            input_row,
+            gate_weight,
+            &mut gate,
+            "ffn gate",
+            collect_diagnostics,
+        )?;
+        let gate_elapsed = started.elapsed().as_micros();
 
-    let started = Instant::now();
-    accumulate_linear_row(input_row, up_weight, &mut up, "ffn up", collect_diagnostics)?;
-    let up_elapsed = started.elapsed().as_micros();
+        let started = Instant::now();
+        accumulate_linear_row(input_row, up_weight, &mut up, "ffn up", collect_diagnostics)?;
+        let up_elapsed = started.elapsed().as_micros();
+        (gate, up, gate_elapsed, up_elapsed)
+    } else {
+        let (gate_result, up_result) = rayon::join(
+            || {
+                let mut gate = vec![0.0; gate_width];
+                let started = Instant::now();
+                accumulate_linear_row(input_row, gate_weight, &mut gate, "ffn gate", false)?;
+                Result::<_>::Ok((gate, started.elapsed().as_micros()))
+            },
+            || {
+                let mut up = vec![0.0; up_width];
+                let started = Instant::now();
+                accumulate_linear_row(input_row, up_weight, &mut up, "ffn up", false)?;
+                Result::<_>::Ok((up, started.elapsed().as_micros()))
+            },
+        );
+        let (gate, gate_elapsed) = gate_result?;
+        let (up, up_elapsed) = up_result?;
+        (gate, up, gate_elapsed, up_elapsed)
+    };
 
     let gate_projection = collect_diagnostics
         .then(|| CpuTensor::from_f32("ffn_gate_diagnostic", vec![1, gate_width], gate.clone()))
@@ -5584,14 +5605,21 @@ fn gated_ffn_activation_batch(
         )));
     }
 
-    let started = Instant::now();
-    let mut gate =
-        linear_for_role_runtime(input, gate_weight, "ffn_gate_prefill", "ffn gate", false)?;
-    let gate_elapsed = started.elapsed().as_micros();
-
-    let started = Instant::now();
-    let up = linear_for_role_runtime(input, up_weight, "ffn_up_prefill", "ffn up", false)?;
-    let up_elapsed = started.elapsed().as_micros();
+    let (gate_result, up_result) = rayon::join(
+        || {
+            let started = Instant::now();
+            let gate =
+                linear_for_role_runtime(input, gate_weight, "ffn_gate_prefill", "ffn gate", false)?;
+            Result::<_>::Ok((gate, started.elapsed().as_micros()))
+        },
+        || {
+            let started = Instant::now();
+            let up = linear_for_role_runtime(input, up_weight, "ffn_up_prefill", "ffn up", false)?;
+            Result::<_>::Ok((up, started.elapsed().as_micros()))
+        },
+    );
+    let (mut gate, gate_elapsed) = gate_result?;
+    let (up, up_elapsed) = up_result?;
 
     require_tensor_shape(&up, &gate.shape.dims, "gated FFN prefill up projection")?;
     let order = diagnostic_ffn_gate_up_order()?;
@@ -7017,8 +7045,9 @@ fn x86_64_avx2_enabled() -> bool {
 #[target_feature(enable = "avx2")]
 unsafe fn q8_0_i8_block_avx2(weight: *const i8, input: *const i8) -> i32 {
     use std::arch::x86_64::{
-        __m128i, __m256i, _mm_loadu_si128, _mm256_add_epi32, _mm256_cvtepi8_epi16,
-        _mm256_madd_epi16, _mm256_storeu_si256,
+        __m128i, _mm_add_epi32, _mm_cvtsi128_si32, _mm_loadu_si128, _mm_shuffle_epi32,
+        _mm256_add_epi32, _mm256_castsi256_si128, _mm256_cvtepi8_epi16,
+        _mm256_extracti128_si256, _mm256_madd_epi16,
     };
 
     // SAFETY: callers pass pointers to at least 32 contiguous i8 values.
@@ -7035,9 +7064,16 @@ unsafe fn q8_0_i8_block_avx2(weight: *const i8, input: *const i8) -> i32 {
     let products_hi = _mm256_madd_epi16(weight_hi_i16, input_hi_i16);
     let products = _mm256_add_epi32(products_lo, products_hi);
 
-    let mut lanes = [0_i32; 8];
-    unsafe { _mm256_storeu_si256(lanes.as_mut_ptr().cast::<__m256i>(), products) };
-    lanes.into_iter().sum()
+    // Keep the horizontal reduction in registers. The old path spilled every 8-lane
+    // partial dot to a stack array, which is brutal inside millions of Q8 block dots.
+    let lo = _mm256_castsi256_si128(products);
+    let hi = _mm256_extracti128_si256(products, 1);
+    let sum4 = _mm_add_epi32(lo, hi);
+    let shuffled = _mm_shuffle_epi32(sum4, 0b10_11_00_01);
+    let sum2 = _mm_add_epi32(sum4, shuffled);
+    let shuffled = _mm_shuffle_epi32(sum2, 0b01_00_11_10);
+    let sum1 = _mm_add_epi32(sum2, shuffled);
+    _mm_cvtsi128_si32(sum1)
 }
 
 #[cfg(target_arch = "aarch64")]
