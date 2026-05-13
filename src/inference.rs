@@ -5746,6 +5746,17 @@ fn mixtral_moe_ffn(
     expert_used_count: usize,
     name: impl Into<String>,
 ) -> Result<(CpuTensor, u128, u128, u128, u128)> {
+    if mixtral_moe_retained_q8_fast_path_available(gate_experts, up_experts, down_experts) {
+        return mixtral_moe_ffn_retained_q8(
+            input,
+            router,
+            gate_experts,
+            up_experts,
+            down_experts,
+            expert_used_count,
+            name,
+        );
+    }
     if input.rank() != 2 {
         return Err(BackendError::RuntimeShapeMismatch(format!(
             "Mixtral MoE FFN expects rank-2 input, got {:?}",
@@ -5801,6 +5812,175 @@ fn mixtral_moe_ffn(
     }
     Ok((
         CpuTensor::from_f32(name, vec![rows, hidden], output)?,
+        gate_elapsed + router_elapsed,
+        up_elapsed,
+        activation_elapsed,
+        down_elapsed,
+    ))
+}
+
+fn mixtral_moe_retained_q8_fast_path_available(
+    gate_experts: &CpuTensor,
+    up_experts: &CpuTensor,
+    down_experts: &CpuTensor,
+) -> bool {
+    gate_experts.q8_0_blocks.is_some()
+        && up_experts.q8_0_blocks.is_some()
+        && down_experts.q8_0_blocks.is_some()
+}
+
+fn borrowed_retained_expert_matrix_view<'a>(
+    weight: &'a CpuTensor,
+    expert_idx: usize,
+    input_width: usize,
+    output_width: usize,
+) -> Result<BorrowedLinearWeight<'a>> {
+    if weight.rank() != 3 {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "MoE expert tensor {} expected rank 3, got {:?}",
+            weight.name, weight.shape.dims
+        )));
+    }
+    let experts = weight.dim(2)?;
+    if expert_idx >= experts {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "MoE expert index {expert_idx} out of bounds for {} experts",
+            experts
+        )));
+    }
+    if weight.dim(0)? != input_width || weight.dim(1)? != output_width {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "MoE expert tensor {} expected per-expert dims [{input_width}, {output_width}], got {:?}",
+            weight.name, weight.shape.dims
+        )));
+    }
+    let expert_elements = input_width.checked_mul(output_width).ok_or_else(|| {
+        BackendError::RuntimeShapeMismatch("MoE expert element count overflow".to_string())
+    })?;
+    if !expert_elements.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "MoE expert element count {expert_elements} is not Q8_0 block aligned"
+        )));
+    }
+    let block_count = expert_elements / Q8_0_BLOCK_VALUES;
+    let block_offset = block_count.checked_mul(expert_idx).ok_or_else(|| {
+        BackendError::RuntimeShapeMismatch("MoE expert block offset overflow".to_string())
+    })?;
+    let blocks = weight.q8_0_blocks.as_deref().ok_or_else(|| {
+        BackendError::RuntimeShapeMismatch(format!(
+            "MoE retained Q8 fast path requested without retained blocks for {}",
+            weight.name
+        ))
+    })?;
+    let block_end = block_offset.checked_add(block_count).ok_or_else(|| {
+        BackendError::RuntimeShapeMismatch("MoE expert block slice overflow".to_string())
+    })?;
+    if block_end > blocks.len() {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "MoE expert block slice {block_offset}..{block_end} exceeds {} blocks for {}",
+            blocks.len(),
+            weight.name
+        )));
+    }
+    Ok(BorrowedLinearWeight {
+        rows: output_width,
+        cols: input_width,
+        data: &[],
+        source_type: weight.source_type,
+        q8_0_blocks: Some(&blocks[block_offset..block_end]),
+        q8_0_file_backing: None,
+    })
+}
+
+fn mixtral_moe_ffn_retained_q8(
+    input: &CpuTensor,
+    router: &CpuTensor,
+    gate_experts: &CpuTensor,
+    up_experts: &CpuTensor,
+    down_experts: &CpuTensor,
+    expert_used_count: usize,
+    name: impl Into<String>,
+) -> Result<(CpuTensor, u128, u128, u128, u128)> {
+    if input.rank() != 2 {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "Mixtral MoE FFN expects rank-2 input, got {:?}",
+            input.shape.dims
+        )));
+    }
+    let rows = input.dim(0)?;
+    let hidden = input.dim(1)?;
+    let ff = gate_experts.dim(1)?;
+    let output_name = name.into();
+    let router_started = Instant::now();
+    let logits = linear_for_role_runtime(input, router, "mixtral_router", "linear", false)?;
+    let router_elapsed = router_started.elapsed().as_micros();
+    let expert_count = logits.dim(1)?;
+    let mut output = vec![0.0_f32; rows * hidden];
+    let mut gate_elapsed = 0;
+    let mut up_elapsed = 0;
+    let mut activation_elapsed = 0;
+    let mut down_elapsed = 0;
+    let order = diagnostic_ffn_gate_up_order()?;
+
+    for row in 0..rows {
+        let input_start = row * hidden;
+        let input_row = &input.data[input_start..input_start + hidden];
+        let top = softmax_top_k(
+            &logits.data[row * expert_count..(row + 1) * expert_count],
+            expert_used_count,
+        );
+        for (expert_idx, weight) in top {
+            let gate_weight =
+                borrowed_retained_expert_matrix_view(gate_experts, expert_idx, hidden, ff)?;
+            let up_weight = borrowed_retained_expert_matrix_view(up_experts, expert_idx, hidden, ff)?;
+            let down_weight =
+                borrowed_retained_expert_matrix_view(down_experts, expert_idx, ff, hidden)?;
+
+            let mut gate = vec![0.0_f32; ff];
+            let mut up = vec![0.0_f32; ff];
+            let started = Instant::now();
+            accumulate_transposed_linear_row_runtime(
+                input_row,
+                gate_weight,
+                &mut gate,
+                LinearAccumulationPrecision::F32,
+            )?;
+            gate_elapsed += started.elapsed().as_micros();
+            let started = Instant::now();
+            accumulate_transposed_linear_row_runtime(
+                input_row,
+                up_weight,
+                &mut up,
+                LinearAccumulationPrecision::F32,
+            )?;
+            up_elapsed += started.elapsed().as_micros();
+            let started = Instant::now();
+            for (gate_value, up_value) in gate.iter_mut().zip(up) {
+                *gate_value = match order {
+                    FfnGateUpOrder::GateUp => (*gate_value / (1.0 + (-*gate_value).exp())) * up_value,
+                    FfnGateUpOrder::UpGate => (up_value / (1.0 + (-up_value).exp())) * *gate_value,
+                };
+            }
+            activation_elapsed += started.elapsed().as_micros();
+
+            let mut expert_out = vec![0.0_f32; hidden];
+            let started = Instant::now();
+            accumulate_transposed_linear_row_runtime(
+                &gate,
+                down_weight,
+                &mut expert_out,
+                LinearAccumulationPrecision::F32,
+            )?;
+            down_elapsed += started.elapsed().as_micros();
+            let output_start = row * hidden;
+            for col in 0..hidden {
+                output[output_start + col] += expert_out[col] * weight;
+            }
+        }
+    }
+
+    Ok((
+        CpuTensor::from_f32(output_name, vec![rows, hidden], output)?,
         gate_elapsed + router_elapsed,
         up_elapsed,
         activation_elapsed,
