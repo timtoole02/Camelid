@@ -4662,6 +4662,11 @@ fn linear_for_role_runtime_with_plan(
         )? {
             return Ok(output);
         }
+        if let Some(output) =
+            try_x86_q8_ffn_down_packed_rows4_matmul_path(input, weight, &name, rectangular_role)?
+        {
+            return Ok(output);
+        }
         if let Some(output) = try_x86_q8_ffn_down_decode_consumer_path(
             input,
             weight,
@@ -7276,6 +7281,103 @@ fn try_x86_q8_attention_projection_decode_consumer_path(
         vec![1, output_width],
         output,
     )?))
+}
+
+fn x86_q8_packed_rows4_matmul_enabled() -> bool {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL")
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        false
+    }
+}
+
+fn try_x86_q8_ffn_down_packed_rows4_matmul_path(
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    name: &str,
+    rectangular_role: &str,
+) -> Result<Option<CpuTensor>> {
+    if !x86_q8_packed_rows4_matmul_enabled()
+        || rectangular_role != "ffn_down"
+        || input.rank() != 2
+        || weight.source_type != Some(GgufTensorType::Q8_0)
+    {
+        return Ok(None);
+    }
+
+    let input_width = input.dim(1)?;
+    if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        return Ok(None);
+    }
+    let borrowed = borrowed_linear_weight_as_transposed(weight, input_width)?;
+    let Some((packed, interleave)) = q8_0_selected_borrowed_packed_rows4(borrowed) else {
+        return Ok(None);
+    };
+    if interleave != Q8_0PackedRows4Interleave::I8
+        || packed.rows != borrowed.rows
+        || packed.blocks_per_row != input_width / Q8_0_BLOCK_VALUES
+        || !borrowed.rows.is_multiple_of(4)
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(matmul_rhs_transposed_q8_0_packed_rows4_owned(
+        input,
+        packed,
+        interleave,
+        borrowed.rows,
+        name,
+    )?))
+}
+
+fn matmul_rhs_transposed_q8_0_packed_rows4_owned(
+    input: &CpuTensor,
+    packed: &Q8_0PackedRows4,
+    interleave: Q8_0PackedRows4Interleave,
+    output_width: usize,
+    name: impl Into<String>,
+) -> Result<CpuTensor> {
+    let rows = input.dim(0)?;
+    let input_width = input.dim(1)?;
+    if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "packed rows4 matmul input width {input_width} is not a multiple of {Q8_0_BLOCK_VALUES}"
+        )));
+    }
+    let blocks_per_row = input_width / Q8_0_BLOCK_VALUES;
+    if packed.rows != output_width || packed.blocks_per_row != blocks_per_row {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "packed rows4 matmul shape mismatch: packed rows={}, blocks_per_row={}, requested output_width={output_width}, input blocks_per_row={blocks_per_row}",
+            packed.rows, packed.blocks_per_row
+        )));
+    }
+    if !output_width.is_multiple_of(4) {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "packed rows4 matmul output width {output_width} is not divisible by 4"
+        )));
+    }
+
+    let mut quantized_input = Vec::with_capacity(blocks_per_row);
+    let mut output = vec![0.0_f32; rows * output_width];
+    for row in 0..rows {
+        let input_start = row * input_width;
+        quantized_input.clear();
+        quantize_q8_0_blocks_into(
+            &input.data[input_start..input_start + input_width],
+            &mut quantized_input,
+        );
+        let output_start = row * output_width;
+        accumulate_q8_0_packed_rows4_dot_quantized_cpu_serial(
+            &quantized_input,
+            packed,
+            interleave,
+            &mut output[output_start..output_start + output_width],
+        );
+    }
+    CpuTensor::from_f32(name, vec![rows, output_width], output)
 }
 
 fn try_x86_q8_ffn_gate_up_decode_consumer_path(
@@ -12702,6 +12804,7 @@ mod tests {
             "CAMELID_X86_Q8_ATTENTION_PROJECTION_DECODE_CONSUMER",
             "CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER",
             "CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER",
+            "CAMELID_X86_Q8_PACKED_ROWS4_MATMUL",
             "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER",
             "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_OWNER",
             "CAMELID_X86_Q8_OUTPUT_DECODE_OWNER",
@@ -13905,6 +14008,59 @@ mod tests {
 
         assert_eq!(actual.shape.dims, expected.shape.dims);
         assert_slice_close_with_tolerance(&actual.data, &expected.data, 5e-4);
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn q8_ffn_down_packed_rows4_matmul_matches_multirow_runtime_packed_baseline() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        std::env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL", "on");
+        let (_input, packed_weight, _expected) = runtime_packed_ffn_down_case();
+        let output_rows = 32;
+        let input_width = Q8_0_BLOCK_VALUES * 2;
+        let blocks_per_row = input_width / Q8_0_BLOCK_VALUES;
+        let rows = 3;
+        let input = CpuTensor::from_f32(
+            "input_multirow",
+            vec![rows, input_width],
+            (0..rows * input_width)
+                .map(|idx| ((idx % 97) as f32 - 48.0) * 0.03125)
+                .collect(),
+        )
+        .unwrap();
+        let retained_blocks: Vec<Q8_0Block> = (0..output_rows * blocks_per_row)
+            .map(|row| Q8_0Block {
+                scale: 0.125 + row as f32 * 0.006,
+                quants: std::array::from_fn(|idx| {
+                    (idx as i8).wrapping_mul(9).wrapping_sub(row as i8)
+                }),
+            })
+            .collect();
+        let retained_weight = CpuTensor::from_f32_with_q8_0_blocks(
+            "retained_ffn_down_transposed",
+            vec![output_rows, input_width],
+            dequantized_q8_0_rows(&retained_blocks),
+            retained_blocks,
+        )
+        .unwrap();
+        let expected =
+            matmul_rhs_transposed_with_precision(&input, &retained_weight, "expected").unwrap();
+        let plan = ffn_down_consumer_plan(false);
+
+        let actual = linear_for_role_runtime_with_plan(
+            &input,
+            &packed_weight,
+            "actual",
+            "ffn_down",
+            &plan,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(actual.shape.dims, expected.shape.dims);
+        assert_slice_close_with_tolerance(&actual.data, &expected.data, 5e-4);
+        std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL");
     }
 
     #[test]
