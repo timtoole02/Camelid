@@ -9879,6 +9879,23 @@ fn q8_0_packed_rows4_dot(
     interleave: Q8_0PackedRows4Interleave,
 ) -> [f32; 4] {
     debug_assert_eq!(packed_blocks.len(), input.len());
+
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        not(all(target_os = "macos", target_arch = "aarch64"))
+    ))]
+    {
+        if interleave == Q8_0PackedRows4Interleave::I8
+            && x86_q8_kernel_avx2_enabled()
+            && std::arch::is_x86_feature_detected!("avx2")
+        {
+            // SAFETY: runtime feature detection confirms AVX2 support; this helper is only
+            // entered for rows4/I8 blocks, where each packed block has 128 i8 values and each
+            // input block has 32 contiguous i8 values.
+            return unsafe { q8_0_packed_rows4_dot_i8_avx2(packed_blocks, input) };
+        }
+    }
+
     let mut sums = [0.0_f32; 4];
     for (packed_block, input_block) in packed_blocks.iter().zip(input) {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -9906,36 +9923,30 @@ fn q8_0_packed_rows4_dot(
         };
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         let int_sums = {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            {
-                if interleave == Q8_0PackedRows4Interleave::I8
-                    && x86_q8_kernel_avx2_enabled()
-                    && std::arch::is_x86_feature_detected!("avx2")
-                {
-                    // SAFETY: runtime feature detection confirms AVX2 support; packed quants
-                    // contain one complete rows4/I8 block and input quants contain one Q8_0 block.
-                    unsafe {
-                        q8_0_packed_4x8_block_avx2(
-                            packed_block.quants.as_ptr(),
-                            input_block.quants.as_ptr(),
-                        )
-                    }
-                } else {
-                    q8_0_packed_rows4_block_dot_scalar(
-                        &packed_block.quants,
-                        &input_block.quants,
-                        interleave,
-                    )
-                }
-            }
-            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-            {
-                q8_0_packed_rows4_block_dot_scalar(
-                    &packed_block.quants,
-                    &input_block.quants,
-                    interleave,
-                )
-            }
+            q8_0_packed_rows4_block_dot_scalar(
+                &packed_block.quants,
+                &input_block.quants,
+                interleave,
+            )
+        };
+        for lane in 0..4 {
+            sums[lane] += int_sums[lane] as f32 * packed_block.scales[lane] * input_block.scale;
+        }
+    }
+    sums
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn q8_0_packed_rows4_dot_i8_avx2(
+    packed_blocks: &[Q8_0PackedRows4Block],
+    input: &[Q8_0Block],
+) -> [f32; 4] {
+    debug_assert_eq!(packed_blocks.len(), input.len());
+    let mut sums = [0.0_f32; 4];
+    for (packed_block, input_block) in packed_blocks.iter().zip(input) {
+        let int_sums = unsafe {
+            q8_0_packed_4x8_block_avx2(packed_block.quants.as_ptr(), input_block.quants.as_ptr())
         };
         for lane in 0..4 {
             sums[lane] += int_sums[lane] as f32 * packed_block.scales[lane] * input_block.scale;
@@ -9968,35 +9979,48 @@ fn q8_0_packed_rows4_block_dot_scalar(
 unsafe fn q8_0_packed_4x8_block_avx2(packed: *const i8, input: *const i8) -> [i32; 4] {
     #[cfg(target_arch = "x86")]
     use std::arch::x86::{
-        _mm256_cvtepi8_epi16, _mm256_madd_epi16, _mm256_mullo_epi16, _mm256_set1_epi16,
-        _mm256_storeu_si256, _mm_loadl_epi64, _mm_loadu_si128, _mm_unpacklo_epi64,
+        _mm256_add_epi32, _mm256_cvtepi8_epi16, _mm256_madd_epi16, _mm256_mullo_epi16,
+        _mm256_set1_epi16, _mm256_setzero_si256, _mm256_storeu_si256, _mm_loadl_epi64,
+        _mm_loadu_si128, _mm_unpacklo_epi64,
     };
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::{
-        _mm256_cvtepi8_epi16, _mm256_madd_epi16, _mm256_mullo_epi16, _mm256_set1_epi16,
-        _mm256_storeu_si256, _mm_loadl_epi64, _mm_loadu_si128, _mm_unpacklo_epi64,
+        _mm256_add_epi32, _mm256_cvtepi8_epi16, _mm256_madd_epi16, _mm256_mullo_epi16,
+        _mm256_set1_epi16, _mm256_setzero_si256, _mm256_storeu_si256, _mm_loadl_epi64,
+        _mm_loadu_si128, _mm_unpacklo_epi64,
     };
 
     let ones = _mm256_set1_epi16(1);
-    let mut sums = [0_i32; 4];
+    let mut sums01 = _mm256_setzero_si256();
+    let mut sums23 = _mm256_setzero_si256();
     for chunk in 0..4usize {
         let chunk_packed = unsafe { packed.add(chunk * 32) };
         let input8 = unsafe { _mm_loadl_epi64(input.add(chunk * 8).cast()) };
         let input16 = _mm_unpacklo_epi64(input8, input8);
         let input_i16 = _mm256_cvtepi8_epi16(input16);
 
-        for pair in 0..2usize {
-            let packed16 = unsafe { _mm_loadu_si128(chunk_packed.add(pair * 16).cast()) };
-            let packed_i16 = _mm256_cvtepi8_epi16(packed16);
-            let products_i16 = _mm256_mullo_epi16(packed_i16, input_i16);
-            let pair_sums_i32 = _mm256_madd_epi16(products_i16, ones);
-            let mut lanes = [0_i32; 8];
-            unsafe { _mm256_storeu_si256(lanes.as_mut_ptr().cast(), pair_sums_i32) };
-            sums[pair * 2] += lanes[..4].iter().sum::<i32>();
-            sums[pair * 2 + 1] += lanes[4..].iter().sum::<i32>();
-        }
+        let packed01 = unsafe { _mm_loadu_si128(chunk_packed.cast()) };
+        let packed01_i16 = _mm256_cvtepi8_epi16(packed01);
+        let products01_i16 = _mm256_mullo_epi16(packed01_i16, input_i16);
+        sums01 = _mm256_add_epi32(sums01, _mm256_madd_epi16(products01_i16, ones));
+
+        let packed23 = unsafe { _mm_loadu_si128(chunk_packed.add(16).cast()) };
+        let packed23_i16 = _mm256_cvtepi8_epi16(packed23);
+        let products23_i16 = _mm256_mullo_epi16(packed23_i16, input_i16);
+        sums23 = _mm256_add_epi32(sums23, _mm256_madd_epi16(products23_i16, ones));
     }
-    sums
+    let mut lanes01 = [0_i32; 8];
+    let mut lanes23 = [0_i32; 8];
+    unsafe {
+        _mm256_storeu_si256(lanes01.as_mut_ptr().cast(), sums01);
+        _mm256_storeu_si256(lanes23.as_mut_ptr().cast(), sums23);
+    }
+    [
+        lanes01[..4].iter().sum::<i32>(),
+        lanes01[4..].iter().sum::<i32>(),
+        lanes23[..4].iter().sum::<i32>(),
+        lanes23[4..].iter().sum::<i32>(),
+    ]
 }
 
 fn accumulate_q8_0_block_dot_quantized_cpu(
@@ -11615,8 +11639,8 @@ mod tests {
             quants: input,
         };
         let actual = q8_0_packed_rows4_dot(
-            &[packed_block],
-            &[input_block],
+            &[packed_block.clone()],
+            &[input_block.clone()],
             Q8_0PackedRows4Interleave::I8,
         );
         for lane in 0..4 {
@@ -11624,6 +11648,36 @@ mod tests {
                 actual[lane],
                 expected[lane] as f32 * [0.25, 0.5, 0.75, 1.25][lane] * 0.125
             );
+        }
+
+        let second_packed =
+            std::array::from_fn(|idx| (idx as i8).wrapping_mul(-3).wrapping_add(41));
+        let second_input = std::array::from_fn(|idx| (idx as i8).wrapping_mul(13).wrapping_sub(23));
+        let packed_blocks = [
+            packed_block,
+            Q8_0PackedRows4Block {
+                scales: [1.5, 0.125, 0.375, 2.0],
+                quants: second_packed,
+            },
+        ];
+        let input_blocks = [
+            input_block,
+            Q8_0Block {
+                scale: 0.0625,
+                quants: second_input,
+            },
+        ];
+        let second_expected = q8_0_packed_rows4_block_dot_scalar(
+            &second_packed,
+            &second_input,
+            Q8_0PackedRows4Interleave::I8,
+        );
+        let actual =
+            q8_0_packed_rows4_dot(&packed_blocks, &input_blocks, Q8_0PackedRows4Interleave::I8);
+        for lane in 0..4 {
+            let expected = expected[lane] as f32 * packed_blocks[0].scales[lane] * 0.125
+                + second_expected[lane] as f32 * packed_blocks[1].scales[lane] * 0.0625;
+            assert_eq!(actual[lane], expected);
         }
         std::env::remove_var("CAMELID_X86_Q8_KERNEL");
     }
