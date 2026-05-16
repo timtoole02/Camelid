@@ -669,6 +669,7 @@ struct Q8RuntimeFlags {
     block_dot: bool,
     file_reader_block_dot: bool,
     attention_projection_decode_consumer: bool,
+    attention_output_decode_consumer: bool,
     ffn_gate_up_decode_consumer: bool,
     ffn_down_decode_consumer: bool,
     metal: bool,
@@ -702,6 +703,9 @@ impl Q8RuntimeFlags {
             ),
             attention_projection_decode_consumer: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_ATTENTION_PROJECTION_DECODE_CONSUMER",
+            ),
+            attention_output_decode_consumer: q8_0_env_flag_enabled_default_off(
+                "CAMELID_X86_Q8_ATTENTION_OUTPUT_DECODE_CONSUMER",
             ),
             ffn_gate_up_decode_consumer: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER",
@@ -3664,10 +3668,11 @@ fn forward_layer_timed(
     trace_forward_layer_memory(layer_idx, "attention_context_done");
 
     let started = Instant::now();
-    let mut attn_out = linear_runtime_with_plan(
+    let mut attn_out = linear_for_role_runtime_with_plan(
         &context,
         &layer.attention_output,
         format!("layer_{layer_idx}_attention_output"),
+        "attention_output",
         runtime_plan,
         collect_diagnostics,
     )?;
@@ -4057,10 +4062,13 @@ fn forward_prefill_layer_chunk_timed(
     trace_chunk_memory("attention_context_done");
 
     let started = Instant::now();
-    let attn_out = linear_runtime(
+    let runtime_plan = ResolvedRuntimePlan::from_env()?;
+    let attn_out = linear_for_role_runtime_with_plan(
         &context,
         &layer.attention_output,
         format!("layer_{layer_idx}_prefill_attention_output"),
+        "attention_output",
+        &runtime_plan,
         false,
     )?;
     timings.attention_output = started.elapsed().as_micros();
@@ -4654,6 +4662,15 @@ fn linear_for_role_runtime_with_plan(
     } else {
         let name = name.into();
         if let Some(output) = try_x86_q8_attention_projection_decode_consumer_path(
+            input,
+            weight,
+            &name,
+            rectangular_role,
+            runtime_plan,
+        )? {
+            return Ok(output);
+        }
+        if let Some(output) = try_x86_q8_attention_output_decode_consumer_path(
             input,
             weight,
             &name,
@@ -7274,6 +7291,54 @@ fn try_x86_q8_attention_projection_decode_consumer_path(
     Ok(Some(CpuTensor::from_f32(
         name,
         vec![1, output_width],
+        output,
+    )?))
+}
+
+fn try_x86_q8_attention_output_decode_consumer_path(
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    name: &str,
+    rectangular_role: &str,
+    runtime_plan: &ResolvedRuntimePlan,
+) -> Result<Option<CpuTensor>> {
+    if !runtime_plan.q8.attention_output_decode_consumer
+        || rectangular_role != "attention_output"
+        || input.rank() != 2
+        || input.dim(0)? != 1
+        || weight.source_type != Some(GgufTensorType::Q8_0)
+    {
+        return Ok(None);
+    }
+
+    let input_width = input.dim(1)?;
+    if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        return Ok(None);
+    }
+    let borrowed = borrowed_linear_weight_as_transposed(weight, input_width)?;
+    let Some((packed, interleave)) = q8_0_selected_borrowed_packed_rows4(borrowed) else {
+        return Ok(None);
+    };
+    if interleave != Q8_0PackedRows4Interleave::I8
+        || packed.rows != borrowed.rows
+        || packed.blocks_per_row != input_width / Q8_0_BLOCK_VALUES
+        || !borrowed.rows.is_multiple_of(4)
+    {
+        return Ok(None);
+    }
+
+    let quantized_input = quantize_q8_0_row(&input.data[..input_width]);
+    let mut output = vec![0.0_f32; borrowed.rows];
+    let blocks_per_row = packed.blocks_per_row;
+    for (group_idx, output_chunk) in output.chunks_exact_mut(4).enumerate() {
+        let group_blocks =
+            &packed.blocks[group_idx * blocks_per_row..(group_idx + 1) * blocks_per_row];
+        let sums = q8_0_packed_rows4_dot(group_blocks, &quantized_input.blocks, interleave);
+        output_chunk.copy_from_slice(&sums);
+    }
+    Ok(Some(CpuTensor::from_f32(
+        name,
+        vec![1, borrowed.rows],
         output,
     )?))
 }
@@ -12700,6 +12765,7 @@ mod tests {
             "CAMELID_RUNTIME_PROFILE",
             "CAMELID_SQUARE_LINEAR_LAYOUT",
             "CAMELID_X86_Q8_ATTENTION_PROJECTION_DECODE_CONSUMER",
+            "CAMELID_X86_Q8_ATTENTION_OUTPUT_DECODE_CONSUMER",
             "CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER",
             "CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER",
             "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER",
@@ -13016,6 +13082,7 @@ mod tests {
                 block_dot: true,
                 file_reader_block_dot: false,
                 attention_projection_decode_consumer: false,
+                attention_output_decode_consumer: false,
                 ffn_gate_up_decode_consumer: false,
                 ffn_down_decode_consumer: false,
                 metal: false,
@@ -13686,6 +13753,7 @@ mod tests {
                 block_dot: false,
                 file_reader_block_dot: false,
                 attention_projection_decode_consumer: enabled,
+                attention_output_decode_consumer: false,
                 ffn_gate_up_decode_consumer: false,
                 ffn_down_decode_consumer: false,
                 metal: false,
@@ -13815,6 +13883,87 @@ mod tests {
         );
     }
 
+    fn attention_output_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
+        ResolvedRuntimePlan {
+            linear_accumulation_precision: LinearAccumulationPrecision::F32,
+            q8: Q8RuntimeFlags {
+                block_dot: false,
+                file_reader_block_dot: false,
+                attention_projection_decode_consumer: false,
+                attention_output_decode_consumer: enabled,
+                ffn_gate_up_decode_consumer: false,
+                ffn_down_decode_consumer: false,
+                metal: false,
+                metal_retained: false,
+                hybrid_retained: false,
+                hybrid_gpu_rows: None,
+                hybrid_gpu_percent: 10,
+            },
+        }
+    }
+
+    #[test]
+    fn q8_attention_output_consumer_matches_runtime_packed_baseline() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        let (input, packed_weight, expected) = runtime_packed_attention_projection_case(
+            "attention_output",
+            "blk.0.attn_output.weight",
+        );
+        let plan = attention_output_consumer_plan(true);
+
+        let actual = linear_for_role_runtime_with_plan(
+            &input,
+            &packed_weight,
+            "actual_attention_output",
+            "attention_output",
+            &plan,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(actual.shape.dims, expected.shape.dims);
+        assert_slice_close_with_tolerance(&actual.data, &expected.data, 5e-4);
+    }
+
+    #[test]
+    fn q8_attention_output_consumer_is_plan_gated_and_role_limited() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        let (input, packed_weight, _expected) = runtime_packed_attention_projection_case(
+            "attention_output",
+            "blk.0.attn_output.weight",
+        );
+
+        let disabled = attention_output_consumer_plan(false);
+        assert!(
+            try_x86_q8_attention_output_decode_consumer_path(
+                &input,
+                &packed_weight,
+                "disabled",
+                "attention_output",
+                &disabled,
+            )
+            .unwrap()
+            .is_none(),
+            "default-off plan should not enter the attention output consumer"
+        );
+
+        let enabled = attention_output_consumer_plan(true);
+        assert!(
+            try_x86_q8_attention_output_decode_consumer_path(
+                &input,
+                &packed_weight,
+                "wrong_role",
+                "attention_q",
+                &enabled,
+            )
+            .unwrap()
+            .is_none(),
+            "Q/K/V roles must not use the attention output consumer slice"
+        );
+    }
+
     fn ffn_down_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
         ResolvedRuntimePlan {
             linear_accumulation_precision: LinearAccumulationPrecision::F32,
@@ -13822,6 +13971,7 @@ mod tests {
                 block_dot: false,
                 file_reader_block_dot: false,
                 attention_projection_decode_consumer: false,
+                attention_output_decode_consumer: false,
                 ffn_gate_up_decode_consumer: false,
                 ffn_down_decode_consumer: enabled,
                 metal: false,
@@ -14006,6 +14156,7 @@ mod tests {
                 block_dot: false,
                 file_reader_block_dot: false,
                 attention_projection_decode_consumer: false,
+                attention_output_decode_consumer: false,
                 ffn_gate_up_decode_consumer: enabled,
                 ffn_down_decode_consumer: false,
                 metal: false,
@@ -14130,6 +14281,7 @@ mod tests {
                 block_dot: true,
                 file_reader_block_dot: false,
                 attention_projection_decode_consumer: false,
+                attention_output_decode_consumer: false,
                 ffn_gate_up_decode_consumer: false,
                 ffn_down_decode_consumer: false,
                 metal: false,
