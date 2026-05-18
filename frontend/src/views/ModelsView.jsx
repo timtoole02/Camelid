@@ -61,14 +61,14 @@ function matchesLlama32ThreeBTarget(model, capabilities) {
   if (compatibilityHintMatchesExactTarget(capabilities, model, target)) return true
 
   const subject = [model?.id, model?.name, model?.runtime_model_name, model?.model_path, model?.path, model?.quant].filter(Boolean).join(' ').toLowerCase()
-  const exactAcceptanceIdentity = model?.id === LLAMA32_3B_ACCEPTANCE_TARGET.id
-    || model?.model_path === LLAMA32_3B_ACCEPTANCE_TARGET.model_path
   const hasLlama32ThreeB = /llama[\s._-]*3\.2[\s._-]*3b/.test(subject)
     || /llama[\s._-]*32[\s._-]*3b/.test(subject)
   const hasInstruct = /(?:^|[^a-z0-9])instruct(?:[^a-z0-9]|$)/i.test(subject)
   const hasQ8 = /(?:^|[^a-z0-9])q8[\s._-]*0(?:[^a-z0-9]|$)/i.test(subject)
     || /\bfile[_\s-]*type\s*7\b/i.test(subject)
-  return Boolean(exactAcceptanceIdentity || (hasLlama32ThreeB && hasInstruct && hasQ8))
+  const exactAcceptanceIdentity = model?.id === LLAMA32_3B_ACCEPTANCE_TARGET.id
+    || model?.model_path === LLAMA32_3B_ACCEPTANCE_TARGET.model_path
+  return Boolean((exactAcceptanceIdentity && hasQ8) || (hasLlama32ThreeB && hasInstruct && hasQ8))
 }
 
 function findModelMatchingCapabilityRow(models, capabilities, target, runtime, selectedModelId) {

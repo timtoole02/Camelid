@@ -29,6 +29,7 @@ try {
     rowSupportNextStepCopy,
   } = await server.ssrLoadModule('/src/lib/capabilities.js')
   const { resolveLoadedModelDisplayName } = await server.ssrLoadModule('/src/hooks/useDashboardData.js')
+  const { LLAMA32_3B_ACCEPTANCE_TARGET } = await server.ssrLoadModule('/src/lib/acceptanceTargets.js')
 
   const noop = () => {}
   const readyRuntime = {
@@ -363,6 +364,37 @@ try {
   assert.match(modelsMarkup, /Loaded exact-row match/, 'Tracked 3B card should mark the alias model as the loaded exact-row match')
   assert.match(modelsMarkup, /3B API\/WebUI smoke passed/, 'Models view should keep 3B end-to-end WebUI evidence visible on the exact row card')
   assert.doesNotMatch(modelsMarkup, /This browser\/runtime list does not currently show the exact 3B row/, 'Alias runtime matches must not fall through to the missing-3B acceptance placeholder')
+
+  const neighboringQuantAcceptanceRecord = {
+    ...aliasSelectedModel,
+    id: LLAMA32_3B_ACCEPTANCE_TARGET.id,
+    name: 'Llama 3.2 3B Instruct Q4_0',
+    runtime_model_name: 'llama32_3b_instruct_q4_0',
+    quant: 'Q4_0',
+    model_path: '/models/Llama-3.2-3B-Instruct-Q4_0.gguf',
+  }
+  const neighboringQuantAcceptanceMarkup = renderToStaticMarkup(React.createElement(ModelsView, {
+    runtime: { ...readyRuntime, active_model_id: neighboringQuantAcceptanceRecord.runtime_model_name },
+    capabilities,
+    refreshDashboard: noop,
+    registerForm: { id: '', name: '', model_path: '', runtime_model_name: '' },
+    setRegisterForm: noop,
+    externalForm: { id: '', name: '', source: '', api_base: '', api_key: '', model_name: '' },
+    setExternalForm: noop,
+    registerModel: noop,
+    connectExternalModel: noop,
+    models: [neighboringQuantAcceptanceRecord],
+    selectedModelId: neighboringQuantAcceptanceRecord.id,
+    setSelectedModelId: noop,
+    loadingModelId: '',
+    activateModel: noop,
+    unloadCurrentModel: noop,
+    installModel: noop,
+    installCatalogModel: noop,
+    cancelModelDownload: noop,
+  }))
+  assert.match(neighboringQuantAcceptanceMarkup, /This browser\/runtime list does not currently show the exact 3B row/, '3B acceptance placeholder must stay visible when the browser acceptance id is backed by a neighboring quant')
+  assert.match(neighboringQuantAcceptanceMarkup, /llama32_3b_instruct_q8_0: quant mismatch/, '3B acceptance hardening should surface the Q8_0 row mismatch instead of treating the browser id as exact evidence')
 
   const green3BCapabilities = JSON.parse(JSON.stringify(capabilities))
   green3BCapabilities.api_features.push({ id: 'production_throughput', status: 'supported_exact_row_evidence', notes: '3B production-throughput lane validated end-to-end.' })

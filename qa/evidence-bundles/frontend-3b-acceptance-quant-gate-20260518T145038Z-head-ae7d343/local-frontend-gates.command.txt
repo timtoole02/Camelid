@@ -1,0 +1,1 @@
+npm run smoke:model-state && npm run smoke:ui && npm run smoke:streaming && npm run smoke:integration && npm run build

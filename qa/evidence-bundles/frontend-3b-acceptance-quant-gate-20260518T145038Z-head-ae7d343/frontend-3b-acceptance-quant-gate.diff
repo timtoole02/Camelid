@@ -1,0 +1,72 @@
+diff --git a/frontend/scripts/frontend-integration-smoke.mjs b/frontend/scripts/frontend-integration-smoke.mjs
+index bb4b7b0..ba21673 100644
+--- a/frontend/scripts/frontend-integration-smoke.mjs
++++ b/frontend/scripts/frontend-integration-smoke.mjs
+@@ -29,6 +29,7 @@ try {
+     rowSupportNextStepCopy,
+   } = await server.ssrLoadModule('/src/lib/capabilities.js')
+   const { resolveLoadedModelDisplayName } = await server.ssrLoadModule('/src/hooks/useDashboardData.js')
++  const { LLAMA32_3B_ACCEPTANCE_TARGET } = await server.ssrLoadModule('/src/lib/acceptanceTargets.js')
+ 
+   const noop = () => {}
+   const readyRuntime = {
+@@ -364,6 +365,37 @@ try {
+   assert.match(modelsMarkup, /3B API\/WebUI smoke passed/, 'Models view should keep 3B end-to-end WebUI evidence visible on the exact row card')
+   assert.doesNotMatch(modelsMarkup, /This browser\/runtime list does not currently show the exact 3B row/, 'Alias runtime matches must not fall through to the missing-3B acceptance placeholder')
+ 
++  const neighboringQuantAcceptanceRecord = {
++    ...aliasSelectedModel,
++    id: LLAMA32_3B_ACCEPTANCE_TARGET.id,
++    name: 'Llama 3.2 3B Instruct Q4_0',
++    runtime_model_name: 'llama32_3b_instruct_q4_0',
++    quant: 'Q4_0',
++    model_path: '/models/Llama-3.2-3B-Instruct-Q4_0.gguf',
++  }
++  const neighboringQuantAcceptanceMarkup = renderToStaticMarkup(React.createElement(ModelsView, {
++    runtime: { ...readyRuntime, active_model_id: neighboringQuantAcceptanceRecord.runtime_model_name },
++    capabilities,
++    refreshDashboard: noop,
++    registerForm: { id: '', name: '', model_path: '', runtime_model_name: '' },
++    setRegisterForm: noop,
++    externalForm: { id: '', name: '', source: '', api_base: '', api_key: '', model_name: '' },
++    setExternalForm: noop,
++    registerModel: noop,
++    connectExternalModel: noop,
++    models: [neighboringQuantAcceptanceRecord],
++    selectedModelId: neighboringQuantAcceptanceRecord.id,
++    setSelectedModelId: noop,
++    loadingModelId: '',
++    activateModel: noop,
++    unloadCurrentModel: noop,
++    installModel: noop,
++    installCatalogModel: noop,
++    cancelModelDownload: noop,
++  }))
++  assert.match(neighboringQuantAcceptanceMarkup, /This browser\/runtime list does not currently show the exact 3B row/, '3B acceptance placeholder must stay visible when the browser acceptance id is backed by a neighboring quant')
++  assert.match(neighboringQuantAcceptanceMarkup, /llama32_3b_instruct_q8_0: quant mismatch/, '3B acceptance hardening should surface the Q8_0 row mismatch instead of treating the browser id as exact evidence')
++
+   const green3BCapabilities = JSON.parse(JSON.stringify(capabilities))
+   green3BCapabilities.api_features.push({ id: 'production_throughput', status: 'supported_exact_row_evidence', notes: '3B production-throughput lane validated end-to-end.' })
+   green3BCapabilities.model_compatibility = green3BCapabilities.model_compatibility.map((target) => target.id === 'llama32_3b_instruct_q8_0'
+diff --git a/frontend/src/views/ModelsView.jsx b/frontend/src/views/ModelsView.jsx
+index 6eff53d..5ef6d7e 100644
+--- a/frontend/src/views/ModelsView.jsx
++++ b/frontend/src/views/ModelsView.jsx
+@@ -61,14 +61,14 @@ function matchesLlama32ThreeBTarget(model, capabilities) {
+   if (compatibilityHintMatchesExactTarget(capabilities, model, target)) return true
+ 
+   const subject = [model?.id, model?.name, model?.runtime_model_name, model?.model_path, model?.path, model?.quant].filter(Boolean).join(' ').toLowerCase()
+-  const exactAcceptanceIdentity = model?.id === LLAMA32_3B_ACCEPTANCE_TARGET.id
+-    || model?.model_path === LLAMA32_3B_ACCEPTANCE_TARGET.model_path
+   const hasLlama32ThreeB = /llama[\s._-]*3\.2[\s._-]*3b/.test(subject)
+     || /llama[\s._-]*32[\s._-]*3b/.test(subject)
+   const hasInstruct = /(?:^|[^a-z0-9])instruct(?:[^a-z0-9]|$)/i.test(subject)
+   const hasQ8 = /(?:^|[^a-z0-9])q8[\s._-]*0(?:[^a-z0-9]|$)/i.test(subject)
+     || /\bfile[_\s-]*type\s*7\b/i.test(subject)
+-  return Boolean(exactAcceptanceIdentity || (hasLlama32ThreeB && hasInstruct && hasQ8))
++  const exactAcceptanceIdentity = model?.id === LLAMA32_3B_ACCEPTANCE_TARGET.id
++    || model?.model_path === LLAMA32_3B_ACCEPTANCE_TARGET.model_path
++  return Boolean((exactAcceptanceIdentity && hasQ8) || (hasLlama32ThreeB && hasInstruct && hasQ8))
+ }
+ 
+ function findModelMatchingCapabilityRow(models, capabilities, target, runtime, selectedModelId) {

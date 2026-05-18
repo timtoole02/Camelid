@@ -1,0 +1,1 @@
+ssh -o IdentitiesOnly=yes -i /Users/timtoole/Documents/cert/ubuntu.pem ubuntu@16.146.143.184 'curl -fsS http://127.0.0.1:8181/api/runtime ...'
