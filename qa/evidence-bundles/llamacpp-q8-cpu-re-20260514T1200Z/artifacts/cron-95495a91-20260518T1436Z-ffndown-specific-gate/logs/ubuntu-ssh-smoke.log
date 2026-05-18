@@ -1,0 +1,3 @@
+COMMAND: ssh -o IdentitiesOnly=yes -i <ubuntu-key> ubuntu@16.146.143.184 'hostname; uname -a'
+ip-172-31-19-175
+Linux ip-172-31-19-175 6.17.0-1013-aws #13~24.04.1-Ubuntu SMP Fri Apr 24 21:50:45 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux

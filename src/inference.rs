@@ -743,9 +743,10 @@ impl Q8RuntimeFlags {
             ffn_down_decode_consumer: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER",
             ),
-            ffn_down_packed_rows4_matmul: q8_0_env_flag_enabled_default_off(
+            ffn_down_packed_rows4_matmul: q8_0_any_env_flag_enabled_default_off(&[
+                "CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL",
                 "CAMELID_X86_Q8_PACKED_ROWS4_MATMUL",
-            ),
+            ]),
             ffn_down_gemm4_prefill: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_DOWN_GEMM4_PREFILL",
             ),
@@ -7457,6 +7458,11 @@ fn q8_0_env_flag_enabled_default_off(key: &str) -> bool {
                 || value.eq_ignore_ascii_case("yes")
         })
         .unwrap_or(false)
+}
+
+fn q8_0_any_env_flag_enabled_default_off(keys: &[&str]) -> bool {
+    keys.iter()
+        .any(|key| q8_0_env_flag_enabled_default_off(key))
 }
 
 fn q8_0_env_flag_disabled(key: &str) -> bool {
@@ -14464,6 +14470,8 @@ mod tests {
             "CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER",
             "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER",
             "CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER",
+            "CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL",
+            "CAMELID_X86_Q8_PACKED_ROWS4_MATMUL",
             "CAMELID_X86_Q8_OUTPUT_DECODE_OWNER",
         ] {
             std::env::remove_var(key);
@@ -14891,7 +14899,7 @@ mod tests {
         std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL", "on");
         std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_SINGLE_OWNER", "on");
         std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER", "on");
-        std::env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL", "on");
+        std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL", "on");
         std::env::set_var("CAMELID_HYBRID_Q8_GPU_ROWS", "7");
         std::env::set_var("CAMELID_HYBRID_Q8_GPU_PERCENT", "25");
 
@@ -14924,7 +14932,7 @@ mod tests {
         std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL");
         std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_SINGLE_OWNER");
         std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER");
-        std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL");
+        std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL");
         assert!(
             plan.q8.attention_projection_decode_consumer,
             "resolved plan should cache the attention projection consumer gate"
@@ -14972,6 +14980,33 @@ mod tests {
         assert_eq!(plan.q8.hybrid_gpu_rows, Some(7));
         assert_eq!(plan.q8.hybrid_gpu_percent, 25);
         assert_eq!(plan.q8.hybrid_gpu_rows_for_output(100), 7);
+    }
+
+    #[test]
+    fn ffn_down_packed_rows4_matmul_accepts_specific_and_legacy_default_off_gates() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+
+        let plan = ResolvedRuntimePlan::from_env().unwrap();
+        assert!(
+            !plan.q8.ffn_down_packed_rows4_matmul,
+            "FFN-down packed rows4 matmul must stay default-off"
+        );
+
+        std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL", "on");
+        let specific_plan = ResolvedRuntimePlan::from_env().unwrap();
+        assert!(
+            specific_plan.q8.ffn_down_packed_rows4_matmul,
+            "FFN-down-specific gate should opt in only this projection family"
+        );
+
+        clear_dense_diagnostic_env();
+        std::env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL", "on");
+        let legacy_plan = ResolvedRuntimePlan::from_env().unwrap();
+        assert!(
+            legacy_plan.q8.ffn_down_packed_rows4_matmul,
+            "legacy gate remains accepted for existing evidence commands"
+        );
     }
 
     #[test]
