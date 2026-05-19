@@ -1,0 +1,37 @@
+cargo fmt --check && cargo test execution_plan --lib
+warning: function `x86_q8_packed_rows4_avx2_dot_enabled` is never used
+     --> src/inference.rs:10156:4
+      |
+10156 | fn x86_q8_packed_rows4_avx2_dot_enabled() -> bool {
+      |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `ffn_gate_up_packed_rows4_matmul_plan` is never used
+     --> src/inference.rs:16226:8
+      |
+16226 |     fn ffn_gate_up_packed_rows4_matmul_plan(enabled: bool) -> ResolvedRuntimePlan {
+      |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `camelid` (lib test) generated 2 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running unittests src/lib.rs (target/debug/deps/camelid-1a49ffa852c9d3a2)
+
+running 14 tests
+test api::tests::capabilities_can_include_selected_execution_plan ... ok
+test execution_plan::tests::debug_profile_enables_diagnostics_without_changing_claims ... ok
+test execution_plan::tests::explicit_disable_override_falls_back_to_safe ... ok
+test execution_plan::tests::mac_auto_explicit_matches_auto_default_plan ... ok
+test execution_plan::tests::mac_auto_selects_validated_mac_path ... ok
+test execution_plan::tests::invalid_x86_kernel_override_fails_closed ... ok
+test execution_plan::tests::mac_experimental_allows_packed_prefill_scheduler ... ok
+test execution_plan::tests::safe_profile_fails_closed ... ok
+test execution_plan::tests::ubuntu_auto_keeps_x86_experiments_default_off ... ok
+test execution_plan::tests::planner_env_apply_clears_stale_x86_q8_decode_consumer_flags ... ok
+test execution_plan::tests::ubuntu_experimental_missing_x86_gate_fails_closed ... ok
+test execution_plan::tests::ubuntu_experimental_validated_gates_select_rust_avx2_q8_path ... ok
+test execution_plan::tests::ubuntu_experimental_without_avx2_feature_fails_closed ... ok
+test execution_plan::tests::unsupported_row_stays_safe ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 260 filtered out; finished in 0.00s
+

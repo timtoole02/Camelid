@@ -1,0 +1,24 @@
+cargo test q8_ffn_gate_up_single_owner_is_default_off_and_requires_runtime_storage --lib
+warning: function `x86_q8_packed_rows4_avx2_dot_enabled` is never used
+     --> src/inference.rs:10156:4
+      |
+10156 | fn x86_q8_packed_rows4_avx2_dot_enabled() -> bool {
+      |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `ffn_gate_up_packed_rows4_matmul_plan` is never used
+     --> src/inference.rs:16226:8
+      |
+16226 |     fn ffn_gate_up_packed_rows4_matmul_plan(enabled: bool) -> ResolvedRuntimePlan {
+      |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `camelid` (lib test) generated 2 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running unittests src/lib.rs (target/debug/deps/camelid-1a49ffa852c9d3a2)
+
+running 1 test
+test inference::tests::q8_ffn_gate_up_single_owner_is_default_off_and_requires_runtime_storage ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 273 filtered out; finished in 0.00s
+
