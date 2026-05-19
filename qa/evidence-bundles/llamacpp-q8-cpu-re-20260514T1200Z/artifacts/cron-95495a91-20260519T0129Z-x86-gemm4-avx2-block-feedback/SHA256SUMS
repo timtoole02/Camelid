@@ -1,0 +1,5 @@
+2ea8311bbdf9c66d5a6a4c09c8b649c00d6f00fbcbc20c9e088616c0b98ff029  ./README.md
+4064f18b9fdced95707c9ddfec64c8f6d367a2931d92e2d85c407c9f98e7b024  ./commands-and-output.txt
+874f8a26ba0543e0689ee6d3765d1d791330cbfaadec74985410cc2c0abc640e  ./dirty-diff.patch
+21e4a6aee9de311b951e57da468240cbe2566dd586352433d49596232f416952  ./dirty-diff.stat
+c720521f7a6fb5cc468b193f23a712c1377bcab2cbf876e7dbfe7b322cb29a20  ./head-before-commit.txt

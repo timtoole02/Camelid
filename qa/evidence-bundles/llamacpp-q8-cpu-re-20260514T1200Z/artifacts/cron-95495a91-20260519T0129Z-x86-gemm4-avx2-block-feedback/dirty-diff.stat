@@ -1,0 +1,6 @@
+ .../SHA256SUMS                                     |  2 +-
+ .../logs/remote-backend-check.log                  |  2 +-
+ .../SHA256SUMS                                     |  2 +-
+ .../logs/remote-backend-check.log                  |  2 +-
+ src/inference.rs                                   | 36 ++++++++++++++++++++--
+ 5 files changed, 38 insertions(+), 6 deletions(-)

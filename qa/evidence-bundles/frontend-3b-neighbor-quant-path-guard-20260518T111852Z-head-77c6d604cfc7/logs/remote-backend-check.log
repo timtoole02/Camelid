@@ -1,4 +1,4 @@
 timestamp_utc=20260518T111853Z
-hostname=ip-172-31-19-175
+hostname=canonical-private-ubuntu-validation-host
 ---HEALTH---
 curl: (7) Failed to connect to 127.0.0.1 port 8181 after 0 ms: Couldn't connect to server

@@ -1,0 +1,23 @@
+# Commands and sanitized output summary
+
+All commands exited 0 unless noted. Private host/user paths are intentionally omitted from this public evidence bundle.
+
+## Local macOS gates
+- scripts/check-public-scrub.sh
+- node scripts/audit-evidence-bundle-privacy.mjs --root qa/evidence-bundles --strict -> finding_count=0
+- node scripts/check-public-evidence-claims.mjs -> public evidence claim check passed: 95 manifest(s), 48 summary file(s)
+- cargo fmt --check
+- cargo clippy --all-targets -- -D warnings
+- cargo test -> all non-ignored tests passed (lib/main/integration/doc suites)
+
+## Ubuntu x86_64 gates
+- cargo fmt --check
+- cargo test x86_q8_gemm4_avx2_block_matches_scalar_rows4 --lib -> 1 passed
+- cargo test q8_ffn_down_gemm4_avx2_matches_default_gemm4 --lib -> 1 passed
+- cargo clippy --all-targets -- -D warnings
+- cargo test -> all non-ignored tests passed, including x86-only Q8 tests
+
+## Not applicable
+- Validation-script self-tests: not run; validation scripts were not changed.
+- Frontend build/smoke: not run; frontend files were not changed.
+- Benchmark/parity throughput claim: not made; this slice retains a correctness feedback loop only.

@@ -1,0 +1,120 @@
+diff --git a/qa/evidence-bundles/frontend-3b-neighbor-quant-path-guard-20260518T111852Z-head-77c6d604cfc7/SHA256SUMS b/qa/evidence-bundles/frontend-3b-neighbor-quant-path-guard-20260518T111852Z-head-77c6d604cfc7/SHA256SUMS
+index faddb3c..881aa3f 100644
+--- a/qa/evidence-bundles/frontend-3b-neighbor-quant-path-guard-20260518T111852Z-head-77c6d604cfc7/SHA256SUMS
++++ b/qa/evidence-bundles/frontend-3b-neighbor-quant-path-guard-20260518T111852Z-head-77c6d604cfc7/SHA256SUMS
+@@ -1,7 +1,7 @@
+ eee45b1ed5ee6fd6bbded04f8dbfa8f83b434ce07586b94ef7a7bab92c806e24  ./README.md
+ 74ab531e06b86a189d35a37a848d17e8ea655bef9fad239811922e0cd1b04a03  ./local-gates.command.txt
+ 98a87c2d6d69ee046cddd76f7a9b00602696d8ad325bb16d7198192bd8da9b45  ./logs/local-gates.log
+-402a89ec2bf575063f79c97ad1c7288802da530274d85f81f8a7d55c13cddcf4  ./logs/remote-backend-check.log
++3396da7ce7aba82870fc3d7a0e33b1f77460951101693781e1ba13c648cd4a64  ./logs/remote-backend-check.log
+ f0bd6d517c0fc8a426e0646c567b56b2194afe2be0e81d4061c4215438536940  ./logs/repo-state.log
+ f162993951e317bb4251b93c31b4861cf1beba69c7237b724ad2c023e10c0a1b  ./logs/source-inspection.log
+ 270755c15398f0c8c00acff9147d493c01908ab4b4b4f2725ef644d026540788  ./remote-backend-check.command.txt
+diff --git a/qa/evidence-bundles/frontend-3b-neighbor-quant-path-guard-20260518T111852Z-head-77c6d604cfc7/logs/remote-backend-check.log b/qa/evidence-bundles/frontend-3b-neighbor-quant-path-guard-20260518T111852Z-head-77c6d604cfc7/logs/remote-backend-check.log
+index f7d8720..42fd8b9 100644
+--- a/qa/evidence-bundles/frontend-3b-neighbor-quant-path-guard-20260518T111852Z-head-77c6d604cfc7/logs/remote-backend-check.log
++++ b/qa/evidence-bundles/frontend-3b-neighbor-quant-path-guard-20260518T111852Z-head-77c6d604cfc7/logs/remote-backend-check.log
+@@ -1,4 +1,4 @@
+ timestamp_utc=20260518T111853Z
+-hostname=ip-172-31-19-175
++hostname=canonical-private-ubuntu-validation-host
+ ---HEALTH---
+ curl: (7) Failed to connect to 127.0.0.1 port 8181 after 0 ms: Couldn't connect to server
+diff --git a/qa/evidence-bundles/frontend-3b-support-gated-chat-20260518T075933Z-head-bffdfdab8c2e/SHA256SUMS b/qa/evidence-bundles/frontend-3b-support-gated-chat-20260518T075933Z-head-bffdfdab8c2e/SHA256SUMS
+index 43c307a..33563da 100644
+--- a/qa/evidence-bundles/frontend-3b-support-gated-chat-20260518T075933Z-head-bffdfdab8c2e/SHA256SUMS
++++ b/qa/evidence-bundles/frontend-3b-support-gated-chat-20260518T075933Z-head-bffdfdab8c2e/SHA256SUMS
+@@ -5,7 +5,7 @@ cb52430afc0eff83dbf5be0035f5d62b4fdd7ecfa50e57412d6e82b99db5575c  ./dirty-diff.s
+ 9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa  ./logs/frontend-local-gates.exit
+ 1ba20650e25de68bde9fbda819c600d96a8d7a8138f63eeffc319a8c8cecea85  ./logs/frontend-local-gates.log
+ 10159baf262b43a92d95db59dae1f72c645127301661e0a3ce4e38b295a97c58  ./logs/remote-backend-check.exit
+-eb30de740023a51023ce6a89536f506dcfe9d441fae1a898636caeab0c78b45b  ./logs/remote-backend-check.log
++9d753e7afc5df9a727e2630d1b80d15cddd5685c8a5268c44d0602f3d39bfd9c  ./logs/remote-backend-check.log
+ 60455cfaf11ba3ad6e928fdf48a87369fff7a111f3537a6dca1f697380d51c59  ./remote-backend-check.command.txt
+ a139d88e2781f66b6e93a7aa36ace892eba5a6614b9df139d7060823b3f56244  ./repo-head.status
+ bad570cbf81eeac7591b32532fa51bd760669961ac92f86ad8af3cdb2470a80d  ./summary.json
+diff --git a/qa/evidence-bundles/frontend-3b-support-gated-chat-20260518T075933Z-head-bffdfdab8c2e/logs/remote-backend-check.log b/qa/evidence-bundles/frontend-3b-support-gated-chat-20260518T075933Z-head-bffdfdab8c2e/logs/remote-backend-check.log
+index 633e7ca..bf27dc1 100644
+--- a/qa/evidence-bundles/frontend-3b-support-gated-chat-20260518T075933Z-head-bffdfdab8c2e/logs/remote-backend-check.log
++++ b/qa/evidence-bundles/frontend-3b-support-gated-chat-20260518T075933Z-head-bffdfdab8c2e/logs/remote-backend-check.log
+@@ -1,3 +1,3 @@
+ Mon May 18 08:00:02 UTC 2026
+-ip-172-31-19-175
++canonical-private-ubuntu-validation-host
+ curl: (7) Failed to connect to 127.0.0.1 port 8181 after 0 ms: Couldn't connect to server
+diff --git a/src/inference.rs b/src/inference.rs
+index 7fa4f3d..3215516 100644
+--- a/src/inference.rs
++++ b/src/inference.rs
+@@ -8525,7 +8525,7 @@ unsafe fn q8_0_packed_rows4_gemm4_block_avx2(
+ ) -> [[i32; 4]; 4] {
+     let mut sums = [[0_i32; 4]; 4];
+     let mut input_lane = [0_i8; Q8_0_BLOCK_VALUES];
+-    for input_idx in 0..4 {
++    for (input_idx, sum) in sums.iter_mut().enumerate() {
+         for chunk in 0..4usize {
+             let src_start = chunk * 32 + input_idx * 8;
+             let dst_start = chunk * 8;
+@@ -8538,7 +8538,7 @@ unsafe fn q8_0_packed_rows4_gemm4_block_avx2(
+             }
+         }
+         // SAFETY: this function is AVX2-gated and both arrays contain complete rows4/I8 blocks.
+-        sums[input_idx] = unsafe { q8_0_packed_4x8_block_avx2(weight_packed, input_lane.as_ptr()) };
++        *sum = unsafe { q8_0_packed_4x8_block_avx2(weight_packed, input_lane.as_ptr()) };
+     }
+     sums
+ }
+@@ -10184,6 +10184,7 @@ fn x86_q8_kernel_avx2_enabled_from_env() -> bool {
+     )
+ }
+
++#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+ fn x86_q8_packed_rows4_avx2_dot_enabled() -> bool {
+     #[cfg(test)]
+     {
+@@ -13491,6 +13492,36 @@ mod tests {
+         std::env::remove_var("CAMELID_X86_Q8_KERNEL");
+     }
+
++    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
++    #[test]
++    fn x86_q8_gemm4_avx2_block_matches_scalar_rows4() {
++        let _env_guard = env_lock();
++        clear_dense_diagnostic_env();
++        if !std::arch::is_x86_feature_detected!("avx2") {
++            return;
++        }
++        let input = Q8_0PackedRows4Block {
++            scales: [1.0, 0.75, 0.5, 0.25],
++            quants: std::array::from_fn(|idx| {
++                ((idx as i32 * 11 + (idx / 8) as i32 * 3) % 113 - 56) as i8
++            }),
++        };
++        let weight = Q8_0PackedRows4Block {
++            scales: [0.25, 0.5, 0.75, 1.0],
++            quants: std::array::from_fn(|idx| {
++                ((idx as i32 * 7 + (idx / 32) as i32 * 13) % 97 - 48) as i8
++            }),
++        };
++
++        let scalar = q8_0_packed_rows4_gemm4_block_scalar(&input, &weight);
++        // SAFETY: the test checked AVX2 support and both arrays are complete rows4/I8 blocks.
++        let avx2 = unsafe {
++            q8_0_packed_rows4_gemm4_block_avx2(input.quants.as_ptr(), weight.quants.as_ptr())
++        };
++
++        assert_eq!(avx2, scalar);
++    }
++
+     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+     #[test]
+     fn x86_q8_packed_rows4_matmul_chunk_groups_env_override() {
+@@ -16298,6 +16329,7 @@ mod tests {
+         }
+     }
+
++    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+     fn ffn_gate_up_packed_rows4_matmul_plan(enabled: bool) -> ResolvedRuntimePlan {
+         let mut plan = ffn_gate_up_consumer_plan(false);
+         plan.q8.ffn_gate_up_packed_rows4_matmul = enabled;

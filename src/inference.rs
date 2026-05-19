@@ -8525,7 +8525,7 @@ unsafe fn q8_0_packed_rows4_gemm4_block_avx2(
 ) -> [[i32; 4]; 4] {
     let mut sums = [[0_i32; 4]; 4];
     let mut input_lane = [0_i8; Q8_0_BLOCK_VALUES];
-    for input_idx in 0..4 {
+    for (input_idx, sum) in sums.iter_mut().enumerate() {
         for chunk in 0..4usize {
             let src_start = chunk * 32 + input_idx * 8;
             let dst_start = chunk * 8;
@@ -8538,7 +8538,7 @@ unsafe fn q8_0_packed_rows4_gemm4_block_avx2(
             }
         }
         // SAFETY: this function is AVX2-gated and both arrays contain complete rows4/I8 blocks.
-        sums[input_idx] = unsafe { q8_0_packed_4x8_block_avx2(weight_packed, input_lane.as_ptr()) };
+        *sum = unsafe { q8_0_packed_4x8_block_avx2(weight_packed, input_lane.as_ptr()) };
     }
     sums
 }
@@ -10184,6 +10184,7 @@ fn x86_q8_kernel_avx2_enabled_from_env() -> bool {
     )
 }
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn x86_q8_packed_rows4_avx2_dot_enabled() -> bool {
     #[cfg(test)]
     {
@@ -13493,6 +13494,36 @@ mod tests {
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[test]
+    fn x86_q8_gemm4_avx2_block_matches_scalar_rows4() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let input = Q8_0PackedRows4Block {
+            scales: [1.0, 0.75, 0.5, 0.25],
+            quants: std::array::from_fn(|idx| {
+                ((idx as i32 * 11 + (idx / 8) as i32 * 3) % 113 - 56) as i8
+            }),
+        };
+        let weight = Q8_0PackedRows4Block {
+            scales: [0.25, 0.5, 0.75, 1.0],
+            quants: std::array::from_fn(|idx| {
+                ((idx as i32 * 7 + (idx / 32) as i32 * 13) % 97 - 48) as i8
+            }),
+        };
+
+        let scalar = q8_0_packed_rows4_gemm4_block_scalar(&input, &weight);
+        // SAFETY: the test checked AVX2 support and both arrays are complete rows4/I8 blocks.
+        let avx2 = unsafe {
+            q8_0_packed_rows4_gemm4_block_avx2(input.quants.as_ptr(), weight.quants.as_ptr())
+        };
+
+        assert_eq!(avx2, scalar);
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
     fn x86_q8_packed_rows4_matmul_chunk_groups_env_override() {
         let _env_guard = env_lock();
         std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK");
@@ -16298,6 +16329,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     fn ffn_gate_up_packed_rows4_matmul_plan(enabled: bool) -> ResolvedRuntimePlan {
         let mut plan = ffn_gate_up_consumer_plan(false);
         plan.q8.ffn_gate_up_packed_rows4_matmul = enabled;
