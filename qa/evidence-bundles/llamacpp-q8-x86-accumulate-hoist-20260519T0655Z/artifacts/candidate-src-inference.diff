@@ -1,0 +1,80 @@
+diff --git a/src/inference.rs b/src/inference.rs
+index ae14be8..9d6b27f 100644
+--- a/src/inference.rs
++++ b/src/inference.rs
+@@ -11267,6 +11267,7 @@ fn accumulate_q8_0_packed_rows4_dot_quantized_cpu(
+     debug_assert_eq!(packed.blocks_per_row, blocks_per_row);
+     debug_assert_eq!(packed.rows, output.len());
+     debug_assert!(output.len().is_multiple_of(4));
++    let use_hoisted_i8_avx2 = q8_0_packed_rows4_i8_avx2_dot_runtime_enabled(interleave);
+ 
+     if should_parallelize_linear_output(output.len()) {
+         output
+@@ -11280,6 +11281,7 @@ fn accumulate_q8_0_packed_rows4_dot_quantized_cpu(
+                     blocks_per_row,
+                     group_idx,
+                     output_chunk,
++                    use_hoisted_i8_avx2,
+                 )
+             });
+         return;
+@@ -11290,6 +11292,7 @@ fn accumulate_q8_0_packed_rows4_dot_quantized_cpu(
+         packed,
+         interleave,
+         output,
++        use_hoisted_i8_avx2,
+     );
+ }
+ 
+@@ -11298,6 +11301,7 @@ fn accumulate_q8_0_packed_rows4_dot_quantized_cpu_serial(
+     packed: &Q8_0PackedRows4,
+     interleave: Q8_0PackedRows4Interleave,
+     output: &mut [f32],
++    use_hoisted_i8_avx2: bool,
+ ) {
+     let blocks_per_row = quantized_input.len();
+     debug_assert_eq!(packed.blocks_per_row, blocks_per_row);
+@@ -11312,10 +11316,26 @@ fn accumulate_q8_0_packed_rows4_dot_quantized_cpu_serial(
+             blocks_per_row,
+             group_idx,
+             output_chunk,
++            use_hoisted_i8_avx2,
+         );
+     }
+ }
+ 
++fn q8_0_packed_rows4_i8_avx2_dot_runtime_enabled(interleave: Q8_0PackedRows4Interleave) -> bool {
++    if interleave != Q8_0PackedRows4Interleave::I8 {
++        return false;
++    }
++    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
++    {
++        (x86_q8_packed_rows4_avx2_dot_enabled() || x86_q8_kernel_avx2_enabled())
++            && std::arch::is_x86_feature_detected!("avx2")
++    }
++    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
++    {
++        false
++    }
++}
++
+ fn accumulate_q8_0_packed_rows4_output_group(
+     quantized_input: &[Q8_0Block],
+     packed: &Q8_0PackedRows4,
+@@ -11323,10 +11343,15 @@ fn accumulate_q8_0_packed_rows4_output_group(
+     blocks_per_row: usize,
+     group_idx: usize,
+     output_chunk: &mut [f32],
++    use_hoisted_i8_avx2: bool,
+ ) {
+     debug_assert_eq!(output_chunk.len(), 4);
+     let group_blocks = &packed.blocks[group_idx * blocks_per_row..(group_idx + 1) * blocks_per_row];
+-    let sums = q8_0_packed_rows4_dot(group_blocks, quantized_input, interleave);
++    let sums = if interleave == Q8_0PackedRows4Interleave::I8 {
++        q8_0_packed_rows4_dot_i8_matmul(group_blocks, quantized_input, use_hoisted_i8_avx2)
++    } else {
++        q8_0_packed_rows4_dot(group_blocks, quantized_input, interleave)
++    };
+     output_chunk.copy_from_slice(&sums);
+ }
+ 
