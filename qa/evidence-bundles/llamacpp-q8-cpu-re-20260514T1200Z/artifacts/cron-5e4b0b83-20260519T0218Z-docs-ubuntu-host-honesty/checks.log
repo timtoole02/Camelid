@@ -1,0 +1,2 @@
+$ git diff --check -- docs/performance/ubuntu-x86-q8.md docs/CONFIGURATION.md "qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-5e4b0b83-20260519T0218Z-docs-ubuntu-host-honesty"
+$ rg stale canonical host failure wording in docs/README/CONTEXT
