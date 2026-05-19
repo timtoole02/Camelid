@@ -10073,6 +10073,13 @@ fn q8_0_block_int_dot_horizontal_sum_encoded_impl(
 ) -> i32 {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
+        if x86_q8_block_vnni_dot_enabled() {
+            // SAFETY: runtime feature detection in the gate confirms AVX512-VNNI+VL support;
+            // callers pass one complete encoded Q8_0 block and one complete input block.
+            return unsafe {
+                q8_0_i8_block_vnni_compensated(weight.as_ptr().cast::<i8>(), input.as_ptr())
+            };
+        }
         if x86_q8_kernel_avx2_enabled() && std::arch::is_x86_feature_detected!("avx2") {
             // SAFETY: runtime feature detection confirms AVX2 support; callers pass one
             // complete encoded Q8_0 block (32 signed bytes) and one complete input block.
@@ -10105,6 +10112,11 @@ fn q8_0_block_int_dot_horizontal_sum_impl(
 ) -> i32 {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
+        if x86_q8_block_vnni_dot_enabled() {
+            // SAFETY: runtime feature detection in the gate confirms AVX512-VNNI+VL support;
+            // callers pass complete Q8_0 blocks containing 32 contiguous signed bytes each.
+            return unsafe { q8_0_i8_block_vnni_compensated(weight.as_ptr(), input.as_ptr()) };
+        }
         if x86_q8_kernel_avx2_enabled() && std::arch::is_x86_feature_detected!("avx2") {
             // SAFETY: runtime feature detection confirms AVX2 support; callers pass complete
             // Q8_0 blocks containing 32 contiguous signed bytes each.
@@ -10161,6 +10173,30 @@ fn q8_0_dot_group4_encoded(weight: &[u8], input: &[i8; Q8_0_BLOCK_VALUES], start
         + i32::from(weight[start + 1] as i8) * i32::from(input[start + 1])
         + i32::from(weight[start + 2] as i8) * i32::from(input[start + 2])
         + i32::from(weight[start + 3] as i8) * i32::from(input[start + 3])
+}
+
+#[cfg(target_arch = "x86_64")]
+fn x86_q8_block_vnni_dot_enabled() -> bool {
+    #[cfg(test)]
+    {
+        q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_BLOCK_VNNI_DOT")
+            && std::arch::is_x86_feature_detected!("avx512vnni")
+            && std::arch::is_x86_feature_detected!("avx512vl")
+    }
+    #[cfg(not(test))]
+    {
+        static X86_Q8_BLOCK_VNNI_DOT_ENABLED: OnceLock<bool> = OnceLock::new();
+        *X86_Q8_BLOCK_VNNI_DOT_ENABLED.get_or_init(|| {
+            q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_BLOCK_VNNI_DOT")
+                && std::arch::is_x86_feature_detected!("avx512vnni")
+                && std::arch::is_x86_feature_detected!("avx512vl")
+        })
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn x86_q8_block_vnni_dot_enabled() -> bool {
+    false
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -10241,6 +10277,44 @@ fn x86_q8_packed_rows4_avx2_dot_decode_hoist_enabled() -> bool {
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
 fn x86_q8_packed_rows4_avx2_dot_decode_hoist_enabled() -> bool {
     false
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn q8_0_i8_block_vnni_compensated(weight: *const i8, input: *const i8) -> i32 {
+    use std::arch::asm;
+
+    let mut lanes = [0_i32; 8];
+    let input_offset: u32 = 0x8080_8080;
+    // SAFETY: callers gate this helper with AVX512-VNNI+VL runtime detection. VPDPBUSD
+    // computes unsigned-input x signed-weight products; subtracting a vectorized
+    // 128 * sum(weight) compensation restores signed-input Q8_0 dot products without the
+    // scalar byte-sum loop that lost against llama.cpp's prepacked compensation path.
+    unsafe {
+        asm!(
+            "vpxord ymm0, ymm0, ymm0",
+            "vpxord ymm2, ymm2, ymm2",
+            "vpbroadcastd ymm3, {input_offset:e}",
+            "vmovdqu ymm1, ymmword ptr [{input}]",
+            "vpaddb ymm1, ymm1, ymm3",
+            "vpdpbusd ymm0, ymm1, ymmword ptr [{weight}]",
+            "vpdpbusd ymm2, ymm3, ymmword ptr [{weight}]",
+            "vpsubd ymm0, ymm0, ymm2",
+            "vmovdqu ymmword ptr [{out}], ymm0",
+            "vzeroupper",
+            weight = in(reg) weight,
+            input = in(reg) input,
+            out = in(reg) lanes.as_mut_ptr(),
+            input_offset = in(reg) input_offset,
+            options(nostack, preserves_flags)
+        );
+    }
+
+    lanes.iter().sum()
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn q8_0_i8_block_vnni_compensated(_weight: *const i8, _input: *const i8) -> i32 {
+    unreachable!("x86 VNNI helper is only available on x86_64")
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -11748,9 +11822,22 @@ unsafe fn q8_0_packed_rows4_dot_i8_avx2(
 ) -> [f32; 4] {
     debug_assert_eq!(packed_blocks.len(), input.len());
     let mut sums = [0.0_f32; 4];
+    let use_vnni = x86_q8_packed_rows4_vnni_dot_enabled();
     for (packed_block, input_block) in packed_blocks.iter().zip(input) {
-        let int_sums = unsafe {
-            q8_0_packed_4x8_block_avx2(packed_block.quants.as_ptr(), input_block.quants.as_ptr())
+        let int_sums = if use_vnni {
+            unsafe {
+                q8_0_packed_4x8_block_vnni_compensated(
+                    packed_block.quants.as_ptr(),
+                    input_block.quants.as_ptr(),
+                )
+            }
+        } else {
+            unsafe {
+                q8_0_packed_4x8_block_avx2(
+                    packed_block.quants.as_ptr(),
+                    input_block.quants.as_ptr(),
+                )
+            }
         };
         let input_scale = input_block.scale;
         for lane in 0..4 {
@@ -11801,11 +11888,22 @@ fn q8_0_packed_rows4_dot(
                 {
                     // SAFETY: runtime feature detection confirms AVX2 support; packed quants
                     // contain one complete rows4/I8 block and input quants contain one Q8_0 block.
-                    unsafe {
-                        q8_0_packed_4x8_block_avx2(
-                            packed_block.quants.as_ptr(),
-                            input_block.quants.as_ptr(),
-                        )
+                    if x86_q8_packed_rows4_vnni_dot_enabled() {
+                        // SAFETY: the VNNI helper is additionally gated by AVX512-VNNI+VL
+                        // runtime detection inside x86_q8_packed_rows4_vnni_dot_enabled.
+                        unsafe {
+                            q8_0_packed_4x8_block_vnni_compensated(
+                                packed_block.quants.as_ptr(),
+                                input_block.quants.as_ptr(),
+                            )
+                        }
+                    } else {
+                        unsafe {
+                            q8_0_packed_4x8_block_avx2(
+                                packed_block.quants.as_ptr(),
+                                input_block.quants.as_ptr(),
+                            )
+                        }
                     }
                 } else {
                     q8_0_packed_rows4_block_dot_scalar(
@@ -11829,6 +11927,89 @@ fn q8_0_packed_rows4_dot(
         }
     }
     sums
+}
+
+#[cfg(target_arch = "x86_64")]
+fn x86_q8_packed_rows4_vnni_dot_enabled() -> bool {
+    #[cfg(test)]
+    {
+        q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PACKED_ROWS4_VNNI_DOT")
+            && std::arch::is_x86_feature_detected!("avx512vnni")
+            && std::arch::is_x86_feature_detected!("avx512vl")
+    }
+    #[cfg(not(test))]
+    {
+        static X86_Q8_PACKED_ROWS4_VNNI_DOT_ENABLED: OnceLock<bool> = OnceLock::new();
+        *X86_Q8_PACKED_ROWS4_VNNI_DOT_ENABLED.get_or_init(|| {
+            q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PACKED_ROWS4_VNNI_DOT")
+                && std::arch::is_x86_feature_detected!("avx512vnni")
+                && std::arch::is_x86_feature_detected!("avx512vl")
+        })
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn x86_q8_packed_rows4_vnni_dot_enabled() -> bool {
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn q8_0_packed_4x8_block_vnni_compensated(packed: *const i8, input: *const i8) -> [i32; 4] {
+    use std::arch::asm;
+
+    let mut lanes = [0_i32; 8];
+    let input_offset: u32 = 0x8080_8080;
+    // SAFETY: callers gate this helper with AVX512-VNNI+VL runtime detection. Pointers address
+    // one complete rows4/I8 packed block (128 i8) and one complete Q8_0 input block (32 i8).
+    // VPDPBUSD computes unsigned-input x signed-weight products; a second VPDPBUSD with
+    // constant 0x80 bytes performs vector compensation for each output lane. This mirrors the
+    // llama.cpp byte-domain strategy while remaining bounded to Camelid's existing rows4 layout.
+    unsafe {
+        asm!(
+            "vpxord ymm0, ymm0, ymm0",
+            "vpxord ymm2, ymm2, ymm2",
+            "vpbroadcastd ymm3, {input_offset:e}",
+            "vpbroadcastq ymm1, qword ptr [{input} + 0]",
+            "vpaddb ymm1, ymm1, ymm3",
+            "vpdpbusd ymm0, ymm1, ymmword ptr [{packed} + 0]",
+            "vpdpbusd ymm2, ymm3, ymmword ptr [{packed} + 0]",
+            "vpbroadcastq ymm1, qword ptr [{input} + 8]",
+            "vpaddb ymm1, ymm1, ymm3",
+            "vpdpbusd ymm0, ymm1, ymmword ptr [{packed} + 32]",
+            "vpdpbusd ymm2, ymm3, ymmword ptr [{packed} + 32]",
+            "vpbroadcastq ymm1, qword ptr [{input} + 16]",
+            "vpaddb ymm1, ymm1, ymm3",
+            "vpdpbusd ymm0, ymm1, ymmword ptr [{packed} + 64]",
+            "vpdpbusd ymm2, ymm3, ymmword ptr [{packed} + 64]",
+            "vpbroadcastq ymm1, qword ptr [{input} + 24]",
+            "vpaddb ymm1, ymm1, ymm3",
+            "vpdpbusd ymm0, ymm1, ymmword ptr [{packed} + 96]",
+            "vpdpbusd ymm2, ymm3, ymmword ptr [{packed} + 96]",
+            "vpsubd ymm0, ymm0, ymm2",
+            "vmovdqu ymmword ptr [{out}], ymm0",
+            "vzeroupper",
+            input = in(reg) input,
+            packed = in(reg) packed,
+            out = in(reg) lanes.as_mut_ptr(),
+            input_offset = in(reg) input_offset,
+            options(nostack, preserves_flags)
+        );
+    }
+
+    [
+        lanes[0] + lanes[1],
+        lanes[2] + lanes[3],
+        lanes[4] + lanes[5],
+        lanes[6] + lanes[7],
+    ]
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn q8_0_packed_4x8_block_vnni_compensated(
+    _packed: *const i8,
+    _input: *const i8,
+) -> [i32; 4] {
+    unreachable!("x86 VNNI helper is only available on x86_64")
 }
 
 fn q8_0_packed_rows4_block_dot_scalar(
@@ -13556,6 +13737,33 @@ mod tests {
         std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS");
     }
 
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_q8_vnni_block_dot_matches_scalar_dot() {
+        if !std::arch::is_x86_feature_detected!("avx512vnni")
+            || !std::arch::is_x86_feature_detected!("avx512vl")
+        {
+            return;
+        }
+
+        let _env_guard = env_lock();
+        std::env::set_var("CAMELID_X86_Q8_BLOCK_VNNI_DOT", "on");
+        let weight = std::array::from_fn(|idx| (idx as i8).wrapping_mul(7).wrapping_sub(41));
+        let input = std::array::from_fn(|idx| (idx as i8).wrapping_mul(13).wrapping_add(29));
+        let expected = q8_0_block_int_dot_horizontal_sum_scalar(&weight, &input);
+
+        let actual = unsafe { q8_0_i8_block_vnni_compensated(weight.as_ptr(), input.as_ptr()) };
+        assert_eq!(actual, expected);
+        assert_eq!(q8_0_block_int_dot_horizontal_sum(&weight, &input), expected);
+
+        let encoded = weight.map(|value| value as u8);
+        assert_eq!(
+            q8_0_block_int_dot_horizontal_sum_encoded(&encoded, &input),
+            expected
+        );
+        std::env::remove_var("CAMELID_X86_Q8_BLOCK_VNNI_DOT");
+    }
+
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[test]
     fn x86_q8_avx2_packed_rows4_i8_matches_scalar_dot() {
@@ -13591,6 +13799,50 @@ mod tests {
             );
         }
         std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_q8_vnni_packed_rows4_i8_matches_scalar_dot() {
+        if !std::arch::is_x86_feature_detected!("avx512vnni")
+            || !std::arch::is_x86_feature_detected!("avx512vl")
+        {
+            return;
+        }
+
+        let _env_guard = env_lock();
+        std::env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT", "on");
+        std::env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_VNNI_DOT", "on");
+        let packed = std::array::from_fn(|idx| (idx as i8).wrapping_mul(11).wrapping_sub(37));
+        let input = std::array::from_fn(|idx| (idx as i8).wrapping_mul(5).wrapping_add(19));
+        let expected =
+            q8_0_packed_rows4_block_dot_scalar(&packed, &input, Q8_0PackedRows4Interleave::I8);
+
+        let actual =
+            unsafe { q8_0_packed_4x8_block_vnni_compensated(packed.as_ptr(), input.as_ptr()) };
+        assert_eq!(actual, expected);
+
+        let packed_block = Q8_0PackedRows4Block {
+            scales: [0.25, 0.5, 0.75, 1.25],
+            quants: packed,
+        };
+        let input_block = Q8_0Block {
+            scale: 0.125,
+            quants: input,
+        };
+        let actual = q8_0_packed_rows4_dot(
+            &[packed_block],
+            &[input_block],
+            Q8_0PackedRows4Interleave::I8,
+        );
+        for lane in 0..4 {
+            assert_eq!(
+                actual[lane],
+                expected[lane] as f32 * [0.25, 0.5, 0.75, 1.25][lane] * 0.125
+            );
+        }
+        std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT");
+        std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_VNNI_DOT");
     }
 
     #[test]
