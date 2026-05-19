@@ -1,0 +1,34 @@
+$ CAMELID_API_BASE=http://127.0.0.1:18181 CAMELID_FRONTEND_URL=http://127.0.0.1:4177 npm run smoke -- --require-generation --expect-compatibility-row llama32_3b_instruct_q8_0 --expect-compatibility-status supported_exact_row_smoke --expect-contract-supported true --expect-webui-chat enabled
+
+> camelid-frontend@0.1.0 smoke
+> node scripts/smoke.mjs --require-generation --expect-compatibility-row llama32_3b_instruct_q8_0 --expect-compatibility-status supported_exact_row_smoke --expect-contract-supported true --expect-webui-chat enabled
+
+Smoke target API: http://127.0.0.1:18181
+Smoke target frontend: http://127.0.0.1:4177
+  frontend_http_200_ms=23
+✓ frontend returned HTTP 200
+  health_ms=36
+✓ health ok; generation_ready=true; active_model_id=Llama 3.2 3B Instruct
+  models_ms=38
+✓ /v1/models returned 1 model(s): Llama 3.2 3B Instruct
+  current_model_ms=1840
+  capabilities_ms=34
+✓ /api/capabilities returned support gate: Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048 packs; and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral-7B-Instruct-v0.3.Q8_0.gguf now has fail-closed current-head API/WebUI/RSS evidence plus checked 512/1024/2048/4096/8192 validation evidence, but remains active_validation_unsupported with WebUI chat blocked by contract. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied.; compatibility_rows=10; supported_model_families=2; planned_model_families=6; guarded_api_features=2
+✓ WebUI chat gate model=Llama 3.2 3B Instruct; quant=Q8_0; llama32_3b_instruct_q8_0: supported exact row smoke; contract_supported=true
+  WebUI contract note=llama_bpe_decoder · Q8_0 · the exact tracked Llama-3.2-3B-Instruct-Q8_0 GGUF has canonical Ubuntu main-lane API/WebUI support-gate refresh evidence at qa/evidence-bundles/llama32-3b-api-webui-current-head-20260513T2005Z-head-e9f926e/manifest.json for source head e9f926ed1a65, plus exact-row load, completion, chat-completion, frontend-smoke, five-prompt API smoke evidence, compact prompt-token/deterministic 1-token/5-token/bounded 50-token parity, broader three-prompt 50-token parity, first bounded 512-context parity, second bounded 1024-context parity, third bounded 2048-context parity, bounded compact template-shape coverage, exact-row metadata-Jinja renderer coverage for the recognized Llama 3.2 row template, and bounded unique-chat perf/RSS evidence; Camelid supports exact-row smoke for this row only, not broader/full support. Match source: exact model-size + quant match; runtime generation still requires loaded_now=true and generation_ready=true.
+  chat_completion_stream_ms=1521
+✓ streaming chat published 3 visible update(s) before final completion in 1.52s: "Hello! How can"
+  stream_events=bytes,role,content,content,content,finish,done
+  chat_completion_ms=90
+  backend_prompt_token_ids=[128000,128006,882,128007,271,15339,128009,128006,78191,128007,271]
+  backend_generated_token_ids=[9906]
+  backend_tokenize_ms=6
+  backend_weight_load_ms=0
+  backend_weight_cache_hit=true
+  backend_session_create_ms=0
+  backend_generate_ms=38
+  backend_forward_total_ms=0
+  backend_layers_total_ms=0
+  backend_logits_ms=0
+  backend_sample_ms=0.438
+✓ chat completion 1/1 returned in 0.09s: "Hello"

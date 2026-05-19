@@ -1,6 +1,6 @@
 import { memo } from 'react'
 import { clampText, formatPreview, formatSidebarDate } from '../lib/formatters'
-import { formatCapabilityStatus, frontendSupportContractCopy, getCurrentCompatibilityTarget } from '../lib/capabilities'
+import { compatibilityHintLabel, formatCapabilityStatus, frontendSupportContractCopy, getCurrentCompatibilityTarget } from '../lib/capabilities'
 import { getChatGateState } from '../lib/chatGate'
 import { describeModelState, getModelStatusLabel, modelRuntimeIdMatches } from '../lib/modelState'
 
@@ -24,12 +24,21 @@ const navItems = [
   { id: 'system', label: 'System' },
 ]
 
+function exactTargetFromHint(hint) {
+  return hint?.exact === true && hint.target?.id ? hint.target : null
+}
+
+function exactHintDetail(hint) {
+  return exactTargetFromHint(hint) ? compatibilityHintLabel(hint) : ''
+}
+
 function TopBar({ tab, setTab, selectedConversationTitle, selectedConversationUpdatedAt, selectedConversationPreview, runtime, capabilities, selectedModelId, setSelectedModelId, models, demoMode = false }) {
   const rawConversationTitle = selectedConversationTitle?.trim()
   const hasCustomConversationTitle = Boolean(rawConversationTitle && rawConversationTitle.toLowerCase() !== 'new conversation')
   const activeModel = models.find((model) => modelRuntimeIdMatches(model, runtime))
   const selectedModel = models.find((model) => model.id === selectedModelId)
   const activeChatGate = getChatGateState(capabilities, activeModel, runtime)
+  const selectedChatGate = getChatGateState(capabilities, selectedModel, runtime)
   const runtimeChatReady = activeChatGate.chatUnlocked
   const untitledConversationLabel = selectedConversationTitle
     ? `${formatPreview(selectedConversationPreview, 42)} · ${formatSidebarDate(selectedConversationUpdatedAt) || 'New chat'}`
@@ -42,11 +51,15 @@ function TopBar({ tab, setTab, selectedConversationTitle, selectedConversationUp
   const activeModelLabel = activeModel?.name || 'Nothing loaded now'
   const selectedModelLabel = selectedModel?.name || 'Nothing chosen for next chat'
   const selectedModelSummary = selectedModel ? describeModelState(selectedModel) : 'Choose the model you want Camelid to use next.'
-  const currentCompatibilityTarget = getCurrentCompatibilityTarget(capabilities)
+  const exactCompatibilityDetail = exactHintDetail(activeChatGate.hint) || exactHintDetail(selectedChatGate.hint)
+  const currentCompatibilityTarget = exactTargetFromHint(activeChatGate.hint)
+    || exactTargetFromHint(selectedChatGate.hint)
+    || getCurrentCompatibilityTarget(capabilities)
   const supportGateLabel = capabilities ? frontendSupportContractCopy(capabilities) : 'No /api/capabilities contract'
-  const supportGateDetail = currentCompatibilityTarget
-    ? `${currentCompatibilityTarget.id}: ${formatCapabilityStatus(currentCompatibilityTarget.status)}`
-    : 'Open the API contract before treating any model family or quant as supported.'
+  const supportGateDetail = exactCompatibilityDetail
+    || (currentCompatibilityTarget
+      ? `${currentCompatibilityTarget.id}: ${formatCapabilityStatus(currentCompatibilityTarget.status)}`
+      : 'Open the API contract before treating any model family or quant as supported.')
   const runtimeGateDetail = `loaded_now=${runtime?.loaded_now ? 'true' : 'false'} · generation_ready=${runtime?.generation_ready ? 'true' : 'false'} · exact_compatibility_row=${activeChatGate.contractSupported ? 'true' : 'false'}`
 
   if (tab === 'chat') {

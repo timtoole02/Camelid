@@ -1,6 +1,6 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
-import { compatibilityHintCopy, compatibilityHintLabel, findCompatibilityHint, isCompatibilitySupportedForModel } from '../lib/capabilities'
+import { compatibilityHintCopy, compatibilityHintLabel, exactRowSupportLanes, findCompatibilityHint, isCompatibilitySupportedForModel } from '../lib/capabilities'
 import { clampText, formatDate, formatRate } from '../lib/formatters'
 import { getChatGateState } from '../lib/chatGate'
 import { describeModelState, getModelStatusLabel, isRunnableInCurrentRuntime } from '../lib/modelState'
@@ -19,6 +19,23 @@ const cleanLegacyDemoCapCopy = (value) => {
     .replace(/\s*Longer\s+generation\s+is\s+not\s+polished\s+yet\.?/gi, '')
     .replace(/\s{2,}/g, ' ')
     .trim()
+}
+
+function getChatCapabilityLaneCopy(selectedChatGate, capabilities) {
+  if (!selectedChatGate.contractSupported || !selectedChatGate.hint?.target) {
+    return {
+      label: 'Exact row unavailable',
+      copy: 'Capability lanes stay hidden until the selected model has an exact supported /api/capabilities row and matching quant evidence.',
+    }
+  }
+
+  const lanes = exactRowSupportLanes(selectedChatGate.hint.target, capabilities?.api_features || [])
+  const template = lanes.find((lane) => lane.key === 'template')
+  const throughput = lanes.find((lane) => lane.key === 'throughput')
+  return {
+    label: `${template?.ready ? 'Template ready' : 'Template gated'} · ${throughput?.ready ? 'Throughput ready' : 'Throughput not promoted'}`,
+    copy: 'Row-scoped /api/capabilities evidence; it does not widen model-native context, production-throughput, portability, neighboring-row, or broad-family support.',
+  }
 }
 
 const normalizeCodeLanguage = (value) => {
@@ -507,6 +524,7 @@ export default function ChatWorkspace({
       : 'Ready to chat'
   const canSubmit = Boolean(composer.trim()) && selectedModelRunnable && !generationActive
   const selectedCompatibilityHint = findCompatibilityHint(capabilities, selectedModel)
+  const capabilityLaneStatus = getChatCapabilityLaneCopy(selectedChatGate, capabilities)
   const selectedCompatibilityLabel = selectedModel
     ? compatibilityHintLabel(selectedCompatibilityHint, 'No matching COMPATIBILITY.md row')
     : 'No model selected'
@@ -630,6 +648,11 @@ export default function ChatWorkspace({
                     <strong>{supportStatusLabel}</strong>
                     <small>{supportStatusCopy}</small>
                   </div>
+                  <div className="chat-readiness-card">
+                    <span>Capabilities</span>
+                    <strong>{capabilityLaneStatus.label}</strong>
+                    <small>{capabilityLaneStatus.copy}</small>
+                  </div>
                 </div>
               )}
 
@@ -664,11 +687,31 @@ export default function ChatWorkspace({
         ) : (
           <>
             {!demoMode && (
-              <div className={`chat-session-strip is-${readinessState}`} aria-label="Current Camelid chat status">
-                <span className="chat-session-dot" aria-hidden="true" />
-                <strong>{selectedModelName}</strong>
-                <small>{selectedModelRunnable ? 'Ready when you are' : readinessLabel}</small>
-              </div>
+              <>
+                <div className={`chat-session-strip is-${readinessState}`} aria-label="Current Camelid chat status">
+                  <span className="chat-session-dot" aria-hidden="true" />
+                  <strong>{selectedModelName}</strong>
+                  <small>{selectedModelRunnable ? 'Ready when you are' : readinessLabel}</small>
+                </div>
+
+                <div className={`chat-readiness-strip chat-readiness-strip-live is-${readinessState}`} aria-label="Live chat exact-row readiness">
+                  <div className="chat-readiness-card">
+                    <span>Runtime</span>
+                    <strong>{runtimeStatusLabel}</strong>
+                    <small>{runtimeStatusCopy}</small>
+                  </div>
+                  <div className="chat-readiness-card">
+                    <span>Support</span>
+                    <strong>{supportStatusLabel}</strong>
+                    <small>{supportStatusCopy}</small>
+                  </div>
+                  <div className="chat-readiness-card">
+                    <span>Capabilities</span>
+                    <strong>{capabilityLaneStatus.label}</strong>
+                    <small>{capabilityLaneStatus.copy}</small>
+                  </div>
+                </div>
+              </>
             )}
 
             {!selectedModelRunnable && (

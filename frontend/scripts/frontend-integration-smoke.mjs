@@ -143,6 +143,9 @@ try {
   }))
 
   assert.match(streamingMarkup, /data-streaming-state="active"/, 'streaming assistant rows should render an active streaming state')
+  assert.match(streamingMarkup, /Live chat exact-row readiness[\s\S]*Runtime[\s\S]*Local chat ready[\s\S]*Support[\s\S]*Exact row supported[\s\S]*Capabilities[\s\S]*Template ready · Throughput not promoted/, 'non-empty live 3B chats should keep runtime, exact-row support, and row-scoped capability lanes visible after messages exist')
+  assert.match(streamingMarkup, /Row-scoped \/api\/capabilities evidence; it does not widen model-native context/, 'live 3B capability lanes must avoid widening exact-row support into broader claims')
+  assert.match(streamingMarkup, /COMPATIBILITY\.md and \/api\/capabilities agree/, 'live 3B chat readiness must name the exact-row support-contract requirement')
   assert.match(streamingMarkup, /data-streaming-code-state="open"/, 'open streaming fences should expose the active code state')
   assert.match(streamingMarkup, /Still generating — code block incomplete/, 'open streaming code should visibly say it is incomplete')
   assert.match(streamingMarkup, /Streaming code response/, 'streaming code rows should keep an active live-generation label')
@@ -335,6 +338,8 @@ try {
   }))
 
   assert.match(aliasTopBarMarkup, /Runtime chat gate[\s\S]*Llama 3\.2 3B Instruct Q8_0/, 'TopBar runtime readiness should resolve the active model through runtime_model_name aliases')
+  assert.match(aliasTopBarMarkup, /llama32_3b_instruct_q8_0: supported current gate/, 'TopBar support detail should prioritize the active exact 3B row instead of the first supported row')
+  assert.doesNotMatch(aliasTopBarMarkup, /tinyllama_1_1b_chat_q8_0: supported current gate/, 'TopBar support detail must not point at TinyLlama when a 3B exact row is active')
   assert.doesNotMatch(aliasTopBarMarkup, /Nothing loaded now/, 'TopBar must not show an empty runtime state for alias-selected loaded 3B rows')
 
   const modelsMarkup = renderToStaticMarkup(React.createElement(ModelsView, {
@@ -364,6 +369,30 @@ try {
   assert.match(modelsMarkup, /Loaded exact-row match/, 'Tracked 3B card should mark the alias model as the loaded exact-row match')
   assert.match(modelsMarkup, /3B API\/WebUI smoke passed/, 'Models view should keep 3B end-to-end WebUI evidence visible on the exact row card')
   assert.doesNotMatch(modelsMarkup, /This browser\/runtime list does not currently show the exact 3B row/, 'Alias runtime matches must not fall through to the missing-3B acceptance placeholder')
+
+  const staleRuntimeModelsMarkup = renderToStaticMarkup(React.createElement(ModelsView, {
+    runtime: { ...readyRuntime, loaded_now: false },
+    capabilities,
+    refreshDashboard: noop,
+    registerForm: { id: '', name: '', model_path: '', runtime_model_name: '' },
+    setRegisterForm: noop,
+    externalForm: { id: '', name: '', source: '', api_base: '', api_key: '', model_name: '' },
+    setExternalForm: noop,
+    registerModel: noop,
+    connectExternalModel: noop,
+    models: [aliasSelectedModel],
+    selectedModelId: aliasSelectedModel.id,
+    setSelectedModelId: noop,
+    loadingModelId: '',
+    activateModel: noop,
+    unloadCurrentModel: noop,
+    installModel: noop,
+    installCatalogModel: noop,
+    cancelModelDownload: noop,
+  }))
+
+  assert.match(staleRuntimeModelsMarkup, /Runtime still needed/, 'Tracked 3B card must use the shared chat gate and stay blocked when runtime loaded_now=false')
+  assert.doesNotMatch(staleRuntimeModelsMarkup, /Chat unlockable/, 'Tracked 3B card must not present stale browser generation_ready state as WebUI chat support')
 
   const neighboringQuantAcceptanceRecord = {
     ...aliasSelectedModel,

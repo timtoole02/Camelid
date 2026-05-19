@@ -5449,7 +5449,7 @@ textarea.composer-input-gemini {
 .chat-readiness-strip {
   width: min(100%, 900px);
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 12px;
   margin: -4px auto 2px;
 }

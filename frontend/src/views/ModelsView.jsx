@@ -627,8 +627,9 @@ export default function ModelsView({
               const supported = isSupportedCapabilityStatus(target.status)
               const match = findModelMatchingCapabilityRow(models, capabilities, target, runtime, selectedModelId)
               const matchedModel = match.model
-              const runtimeReady = Boolean(match.active && matchedModel && isModelGenerationReady(matchedModel))
-              const chatUnlocked = Boolean(supported && runtimeReady)
+              const matchedChatGate = matchedModel ? getChatGateState(capabilities, matchedModel, runtime) : null
+              const runtimeReady = Boolean(matchedChatGate?.runtimeReady)
+              const chatUnlocked = Boolean(matchedChatGate?.chatUnlocked)
               const supportLanes = exactRowSupportLanes(target, apiFeatures)
               const templateLane = supportLanes.find((lane) => lane.key === 'template')
               const throughputLane = supportLanes.find((lane) => lane.key === 'throughput')

@@ -1,0 +1,327 @@
+diff --git a/frontend/scripts/frontend-3b-closure-smoke.mjs b/frontend/scripts/frontend-3b-closure-smoke.mjs
+index 4f69399..13bbcfd 100644
+--- a/frontend/scripts/frontend-3b-closure-smoke.mjs
++++ b/frontend/scripts/frontend-3b-closure-smoke.mjs
+@@ -97,6 +97,8 @@ assert.equal(exactHint.exact, true, '3B closure must be an exact compatibility h
+ assert.equal(compatibilityHintLabel(exactHint), 'llama32_3b_instruct_q8_0: supported exact row smoke')
+ assert.match(compatibilityHintCopy(exactHint), /runtime generation still requires loaded_now=true and generation_ready=true/)
+ assert.equal(isCompatibilitySupportedForModel(capabilities, exactThreeBModel), true, 'supported 3B rows require an exact row plus Q8_0 evidence')
++const quantMismatchHint = findCompatibilityHint(capabilities, { ...exactThreeBModel, quant: 'Q4_K_M' })
++assert.equal(compatibilityHintLabel(quantMismatchHint), 'llama32_3b_instruct_q8_0: quant mismatch', '3B exact-row surfaces must name quant mismatch instead of falling back to another supported row')
+ assert.equal(compatibilityHintMatchesExactTarget(capabilities, exactThreeBModel, llama32ThreeBTarget), true, 'ModelsView exact-row matching must accept the canonical 3B row')
+ assert.equal(modelRuntimeIdMatches(exactThreeBModel, runtime), true, '3B backend active_model_id must match the selected runtime row')
+ assert.equal(isRunnableInCurrentRuntime(exactThreeBModel, runtime), true, '3B runtime readiness must require the active backend row and generation_ready=true')
+@@ -158,6 +160,7 @@ const hookSource = readFileSync(new URL('../src/hooks/useDashboardData.js', impo
+ const chatSource = readFileSync(new URL('../src/views/ChatWorkspace.jsx', import.meta.url), 'utf8')
+ const modelsSource = readFileSync(new URL('../src/views/ModelsView.jsx', import.meta.url), 'utf8')
+ const apiSource = readFileSync(new URL('../src/views/ApiView.jsx', import.meta.url), 'utf8')
++const topBarSource = readFileSync(new URL('../src/components/TopBar.jsx', import.meta.url), 'utf8')
+ 
+ assert.match(hookSource, /selectedModelChatGate\s*=\s*getChatGateState\(dashboard\?\.capabilities, selectedModel, runtime\)/, 'dashboard selectedModelRunnable must be derived from the shared exact-row chat gate')
+ assert.match(hookSource, /selectedModelRunnable\s*=\s*selectedModelChatGate\.chatUnlocked/, 'dashboard must pass chatUnlocked, not runtime readiness alone, into the composer')
+@@ -166,13 +169,19 @@ assert.match(chatSource, /runnableModels\s*=\s*models\.filter\(\(model\) => getC
+ assert.match(chatSource, /canSubmit\s*=\s*Boolean\(composer\.trim\(\)\) && selectedModelRunnable && !generationActive/, 'composer send button must be blocked unless the exact-row chat gate unlocked')
+ assert.match(chatSource, /runtimeStatusCopy[\s\S]*loaded now and generation_ready=true/, 'chat readiness copy must name the runtime readiness requirement')
+ assert.match(chatSource, /supportStatusCopy[\s\S]*COMPATIBILITY\.md and \/api\/capabilities agree/, 'chat readiness copy must name the support-contract requirement')
++assert.match(chatSource, /chat-readiness-strip-live[\s\S]*runtimeStatusLabel[\s\S]*supportStatusLabel[\s\S]*capabilityLaneStatus\.label/, 'non-empty live 3B chat must keep runtime, exact-row support, and row-scoped capability readiness visible after messages exist')
++assert.match(chatSource, /getChatCapabilityLaneCopy\(selectedChatGate, capabilities\)/, 'live 3B chat must derive capability lane copy from the shared exact-row chat gate')
++assert.match(chatSource, /Row-scoped \/api\/capabilities evidence; it does not widen model-native context/, 'live 3B capability copy must not widen support beyond the exact row')
+ assert.match(chatSource, /LiveGenerationBadge/, 'live 3B chat must keep an active streaming badge after first content arrives')
+ assert.match(chatSource, /StreamingLoader/, 'live 3B chat must keep an accessible pre-token loader')
+ assert.match(modelsSource, /matchesLlama32ThreeBTarget\(model, capabilities\)/, 'ModelsView 3B acceptance target must hide only on exact target match')
+ assert.match(modelsSource, /Fill import form with exact path/, 'ModelsView must provide the exact 3B import path affordance when the row is absent locally')
+ assert.match(modelsSource, /Chat unlockable/, 'ModelsView must expose the retained exact-row chat-unlock state')
++assert.match(modelsSource, /matchedChatGate\s*=\s*matchedModel \? getChatGateState\(capabilities, matchedModel, runtime\) : null/, 'ModelsView retained 3B row cards must use the shared chat gate for loaded_now and generation_ready checks')
+ assert.match(apiSource, /Selected exact-row evidence/, 'API view must surface selected 3B exact-row evidence')
+ assert.match(apiSource, /selectedExactRowReady/, 'API view endpoint readiness must use selected exact-row readiness, not broad family evidence')
+ assert.match(apiSource, /selectedCompatibilityTarget\.frontend_readiness_gate/, 'API view must render the 3B frontend readiness gate from /api/capabilities')
++assert.match(topBarSource, /exactHintDetail\(activeChatGate\.hint\) \|\| exactHintDetail\(selectedChatGate\.hint\)/, 'TopBar support contract detail must prioritize the active/selected exact 3B hint label, including quant-mismatch and quant-missing blockers')
++assert.match(topBarSource, /exactTargetFromHint\(activeChatGate\.hint\)[\s\S]*exactTargetFromHint\(selectedChatGate\.hint\)[\s\S]*getCurrentCompatibilityTarget/, 'TopBar support contract detail must fall back to the first current gate row only after active/selected exact-row hints')
+ 
+ console.log('✓ frontend 3B closure smoke passed')
+diff --git a/frontend/scripts/frontend-integration-smoke.mjs b/frontend/scripts/frontend-integration-smoke.mjs
+index ba21673..75517ee 100644
+--- a/frontend/scripts/frontend-integration-smoke.mjs
++++ b/frontend/scripts/frontend-integration-smoke.mjs
+@@ -143,6 +143,9 @@ try {
+   }))
+ 
+   assert.match(streamingMarkup, /data-streaming-state="active"/, 'streaming assistant rows should render an active streaming state')
++  assert.match(streamingMarkup, /Live chat exact-row readiness[\s\S]*Runtime[\s\S]*Local chat ready[\s\S]*Support[\s\S]*Exact row supported[\s\S]*Capabilities[\s\S]*Template ready · Throughput not promoted/, 'non-empty live 3B chats should keep runtime, exact-row support, and row-scoped capability lanes visible after messages exist')
++  assert.match(streamingMarkup, /Row-scoped \/api\/capabilities evidence; it does not widen model-native context/, 'live 3B capability lanes must avoid widening exact-row support into broader claims')
++  assert.match(streamingMarkup, /COMPATIBILITY\.md and \/api\/capabilities agree/, 'live 3B chat readiness must name the exact-row support-contract requirement')
+   assert.match(streamingMarkup, /data-streaming-code-state="open"/, 'open streaming fences should expose the active code state')
+   assert.match(streamingMarkup, /Still generating — code block incomplete/, 'open streaming code should visibly say it is incomplete')
+   assert.match(streamingMarkup, /Streaming code response/, 'streaming code rows should keep an active live-generation label')
+@@ -335,6 +338,8 @@ try {
+   }))
+ 
+   assert.match(aliasTopBarMarkup, /Runtime chat gate[\s\S]*Llama 3\.2 3B Instruct Q8_0/, 'TopBar runtime readiness should resolve the active model through runtime_model_name aliases')
++  assert.match(aliasTopBarMarkup, /llama32_3b_instruct_q8_0: supported current gate/, 'TopBar support detail should prioritize the active exact 3B row instead of the first supported row')
++  assert.doesNotMatch(aliasTopBarMarkup, /tinyllama_1_1b_chat_q8_0: supported current gate/, 'TopBar support detail must not point at TinyLlama when a 3B exact row is active')
+   assert.doesNotMatch(aliasTopBarMarkup, /Nothing loaded now/, 'TopBar must not show an empty runtime state for alias-selected loaded 3B rows')
+ 
+   const modelsMarkup = renderToStaticMarkup(React.createElement(ModelsView, {
+@@ -365,6 +370,30 @@ try {
+   assert.match(modelsMarkup, /3B API\/WebUI smoke passed/, 'Models view should keep 3B end-to-end WebUI evidence visible on the exact row card')
+   assert.doesNotMatch(modelsMarkup, /This browser\/runtime list does not currently show the exact 3B row/, 'Alias runtime matches must not fall through to the missing-3B acceptance placeholder')
+ 
++  const staleRuntimeModelsMarkup = renderToStaticMarkup(React.createElement(ModelsView, {
++    runtime: { ...readyRuntime, loaded_now: false },
++    capabilities,
++    refreshDashboard: noop,
++    registerForm: { id: '', name: '', model_path: '', runtime_model_name: '' },
++    setRegisterForm: noop,
++    externalForm: { id: '', name: '', source: '', api_base: '', api_key: '', model_name: '' },
++    setExternalForm: noop,
++    registerModel: noop,
++    connectExternalModel: noop,
++    models: [aliasSelectedModel],
++    selectedModelId: aliasSelectedModel.id,
++    setSelectedModelId: noop,
++    loadingModelId: '',
++    activateModel: noop,
++    unloadCurrentModel: noop,
++    installModel: noop,
++    installCatalogModel: noop,
++    cancelModelDownload: noop,
++  }))
++
++  assert.match(staleRuntimeModelsMarkup, /Runtime still needed/, 'Tracked 3B card must use the shared chat gate and stay blocked when runtime loaded_now=false')
++  assert.doesNotMatch(staleRuntimeModelsMarkup, /Chat unlockable/, 'Tracked 3B card must not present stale browser generation_ready state as WebUI chat support')
++
+   const neighboringQuantAcceptanceRecord = {
+     ...aliasSelectedModel,
+     id: LLAMA32_3B_ACCEPTANCE_TARGET.id,
+diff --git a/frontend/scripts/model-state-smoke.mjs b/frontend/scripts/model-state-smoke.mjs
+index 7e1856e..3fa921a 100644
+--- a/frontend/scripts/model-state-smoke.mjs
++++ b/frontend/scripts/model-state-smoke.mjs
+@@ -165,7 +165,7 @@ const capabilityFixture = {
+     { id: 'tinyllama_1_1b_chat_q8_0', family: 'llama_spm_decoder', quantization: 'Q8_0', status: 'supported_current_gate', support_scope: 'current_full_gate_exact_row', full_support_status: 'current_gate_refresh_under_stricter_bar', full_support_blockers: 'do not widen beyond TinyLlama 1.1B Chat Q8_0 without repeated current-head API/WebUI/parity/RSS/context evidence under the stricter bar; arbitrary/Jinja template behavior and production throughput remain outside this exact current gate unless separately validated', frontend_readiness_gate: 'green only when this exact Q8_0 row is loaded_now=true, generation_ready=true, and selected by active_model_id', chat_template_renderer: 'tinyllama-marker', chat_template_shape_pack: 'validated_bounded_pack', performance_measured: 'measured', bounded_context_512_pack: 'validated_bounded_pack', bounded_context_1024_pack: 'not_promoted', bounded_context_2048_pack: 'not_promoted', latest_checked_bucket: 'direct_chat_smoke', latest_checked_result: 'pass', latest_checked_output: 'Certainly! Here', evidence: 'TinyLlama Q8_0 evidence', next_step: 'extend to larger contexts and additional LLaMA-family/quant targets before broadening support claims' },
+     { id: 'llama_spm_q4_k_q5_k', family: 'llama_spm_decoder', quantization: 'Q4_K_M/Q5_K_M', status: 'planned_phase_10', next_step: 'implement K-quant support' },
+     { id: 'llama32_1b_instruct_q8_0', family: 'llama_bpe_decoder', quantization: 'Q8_0', status: 'supported_exact_row_smoke', support_scope: 'exact_row_smoke_only', full_support_status: 'blocked_pending_normalized_full_support', full_support_blockers: 'model-native/larger context beyond checked packs, broader arbitrary templates beyond the supported metadata-Jinja Llama 3.2 1B row template, production throughput, portability, and durable repeated current-head bundles remain missing', frontend_readiness_gate: 'green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id', chat_template_renderer: 'metadata_jinja_supported_for_exact_row', chat_template_shape_pack: 'validated_bounded_pack', performance_measured: 'bounded_unique_chat_perf_rss_validated', bounded_context_512_pack: 'validated_bounded_pack', bounded_context_1024_pack: 'validated_second_pack', bounded_context_2048_pack: 'validated_third_pack', bounded_context_4096_pack: 'validated_fourth_pack', bounded_context_8192_pack: 'validated_fifth_pack', latest_checked_bucket: 'llama3-context-8192-smoke-v1', latest_checked_result: 'pass', latest_checked_output: 'CMLD-819', evidence: '1B exact-row load, completion, chat, frontend smoke, metadata-Jinja row-template parity, checked 512/1024/2048/4096/8192 context evidence, and bounded unique-chat perf/RSS evidence', next_step: 'preserve exact-row smoke plus checked 512/1024/2048/4096/8192 context support while normalizing model-native/larger context beyond checked packs, broader arbitrary-template behavior beyond the supported 1B metadata-Jinja row template, production throughput, portability, and durable full-support bundle evidence before any broader/full-support claim' },
+-    { id: 'llama32_3b_instruct_q8_0', family: 'llama_bpe_decoder', quantization: 'Q8_0', status: 'supported_exact_row_smoke', full_support_status: 'blocked_pending_normalized_full_support', full_support_blockers: 'model-native/larger context beyond checked packs, broader arbitrary/Jinja templates beyond row-scoped metadata-Jinja renderer and template-shape evidence, production throughput beyond bounded perf/RSS and the first-token direction probe, portability, and durable repeated current-head bundles remain missing', frontend_readiness_gate: 'green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id', chat_template_renderer: 'metadata_jinja_supported_for_exact_row', chat_template_shape_pack: 'validated_bounded_pack', performance_measured: 'bounded_unique_chat_perf_rss_validated', bounded_context_1024_pack: 'validated_second_pack', bounded_context_2048_pack: 'validated_third_pack', latest_checked_bucket: 'llama3-context-2048-smoke-v1', latest_checked_result: 'pass', latest_checked_output: 'CMLD-204', evidence: '3B exact-row canonical Ubuntu API/WebUI refresh, load, completion, chat, frontend smoke, compact parity, broader prompt-pack, first 512-context, second 1024-context, third 2048-context, and metadata-Jinja row-template evidence', next_step: 'preserve exact-row smoke plus checked 512/1024/2048 context support while normalizing model-native/larger context, broader arbitrary/Jinja template behavior beyond row-scoped metadata-Jinja/template-shape evidence, production throughput beyond bounded perf/RSS and the first-token direction probe, portability, and durable full-support bundle evidence before any broader/full-support claim' },
++    { id: 'llama32_3b_instruct_q8_0', family: 'llama_bpe_decoder', quantization: 'Q8_0', status: 'supported_exact_row_smoke', full_support_status: 'blocked_pending_normalized_full_support', full_support_blockers: 'model-native/larger context beyond checked packs, broader arbitrary/Jinja templates beyond row-scoped metadata-Jinja renderer and template-shape evidence, production throughput beyond bounded perf/RSS and the first-token direction probe, portability, and durable repeated current-head bundles remain missing', frontend_readiness_gate: 'green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id', chat_template_renderer: 'metadata_jinja_supported_for_exact_row', chat_template_shape_pack: 'validated_bounded_pack', performance_measured: 'bounded_unique_chat_perf_rss_validated', bounded_context_512_pack: 'validated_first_pack', bounded_context_1024_pack: 'validated_second_pack', bounded_context_2048_pack: 'validated_third_pack', latest_checked_bucket: 'llama3-context-2048-smoke-v1', latest_checked_result: 'pass', latest_checked_output: 'CMLD-204', evidence: '3B exact-row canonical Ubuntu API/WebUI refresh, load, completion, chat, frontend smoke, compact parity, broader prompt-pack, first 512-context, second 1024-context, third 2048-context, and metadata-Jinja row-template evidence', next_step: 'preserve exact-row smoke plus checked 512/1024/2048 context support while normalizing model-native/larger context, broader arbitrary/Jinja template behavior beyond row-scoped metadata-Jinja/template-shape evidence, production throughput beyond bounded perf/RSS and the first-token direction probe, portability, and durable full-support bundle evidence before any broader/full-support claim' },
+     { id: 'llama3_8b_instruct_q8_0', family: 'llama_bpe_decoder', quantization: 'Q8_0', status: 'supported_exact_row_smoke', support_scope: 'exact_row_smoke_only', full_support_status: 'blocked_pending_normalized_full_support', full_support_blockers: 'model-native/larger context beyond the checked 512/1024/2048 packs, arbitrary templates, throughput, portability, repeated current-head evidence, and durable normalized full-support bundles remain missing', frontend_readiness_gate: 'green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id', chat_template_renderer: 'compact', chat_template_shape_pack: 'validated_compact_pack', performance_measured: 'bounded_ubuntu_backend_memory_gate_plus_lazy_q8_hotpath_costs', bounded_context_512_pack: 'validated_first_pack', bounded_context_1024_pack: 'validated_second_pack', bounded_context_2048_pack: 'validated_third_pack', latest_checked_bucket: 'llama3-context-2048-smoke-v1', latest_checked_result: 'pass', latest_checked_output: 'CMLD-204', evidence: '8B exact-row API/frontend smoke plus compact 50-token, broader 50-token, checked 512/1024/2048-context packs, compact template-shapes pack evidence, bounded memory/hot-path measurements, and current-head 1024/2048 PASS evidence. No model-native/larger context or broader/full support is implied.', next_step: 'preserve exact-row smoke plus checked 512/1024/2048 context support while collecting model-native/larger-context proof, broader/full-support, production-throughput, portability, arbitrary-template evidence, and repeated current-head evidence before any wider 8B claim' },
+     { id: 'mistral_7b_instruct_v0_3_q8_0', family: 'mistral', quantization: 'Q8_0', status: 'active_validation_unsupported', support_scope: 'bringup_exact_row_unsupported', full_support_status: 'blocked_unsupported_bringup', full_support_blockers: 'API/WebUI readiness, RSS/timing, current-head promotion sync, scrubbed manifest posture, support-surface proof, and durable promotion bundle evidence remain incomplete; exact tokenizer/template references plus row-specific 1-token/bounded/broader parity evidence alone do not promote support', evidence: 'Mistral v0.3 active validation only; exact tokenizer/template, 1-token, broader 50-token, and bounded context evidence are green but support-promotion evidence remains fail-closed' },
+     { id: 'mixtral_8x7b_instruct_v0_1_q8_0', family: 'mixtral_moe', quantization: 'Q8_0', status: 'active_validation_partial_runtime', support_scope: 'exact_row_bounded_moe_runtime_only', full_support_status: 'blocked_later_generation_divergence', full_support_blockers: 'later short-prompt generation still diverges from llama.cpp; API/WebUI readiness, long-context evidence, production throughput, portability, and durable broad prompt coverage are missing', frontend_readiness_gate: 'fail-closed for broad readiness: exact row may be described only as bounded one-token backend runtime evidence until later-generation parity and API/WebUI gates close', evidence: 'Mixtral bounded one-token backend MoE runtime evidence only; later-generation divergence keeps frontend/API/WebUI support blocked' },
+@@ -291,6 +291,16 @@ assert.deepEqual(
+   ],
+   'all current rows should carry an explicit stricter full-support bar and fail-closed frontend readiness gate',
+ )
++assert.deepEqual(
++  trackedTargets.map((target) => [target.id, target.bounded_context_512_pack || 'not_promoted']),
++  [
++    ['tinyllama_1_1b_chat_q8_0', 'validated_bounded_pack'],
++    ['llama32_1b_instruct_q8_0', 'validated_bounded_pack'],
++    ['llama32_3b_instruct_q8_0', 'validated_first_pack'],
++    ['llama3_8b_instruct_q8_0', 'validated_first_pack'],
++  ],
++  'frontend tracked rows should preserve the API 512-context boundary for exact TinyLlama/1B/3B/8B checked packs',
++)
+ assert.deepEqual(
+   trackedTargets.map((target) => [target.id, target.bounded_context_1024_pack]),
+   [
+diff --git a/frontend/scripts/ui-regression-smoke.mjs b/frontend/scripts/ui-regression-smoke.mjs
+index 87d2b5c..8fe71c8 100644
+--- a/frontend/scripts/ui-regression-smoke.mjs
++++ b/frontend/scripts/ui-regression-smoke.mjs
+@@ -40,6 +40,7 @@ const dashboardHookSource = readFileSync(new URL('../src/hooks/useDashboardData.
+ const apiViewSource = readFileSync(new URL('../src/views/ApiView.jsx', import.meta.url), 'utf8')
+ const systemViewSource = readFileSync(new URL('../src/views/SystemView.jsx', import.meta.url), 'utf8')
+ const modelsViewSource = readFileSync(new URL('../src/views/ModelsView.jsx', import.meta.url), 'utf8')
++const topBarSource = readFileSync(new URL('../src/components/TopBar.jsx', import.meta.url), 'utf8')
+ const analyticsViewSource = readFileSync(new URL('../src/views/AnalyticsView.jsx', import.meta.url), 'utf8')
+ const capabilitiesSource = readFileSync(new URL('../src/lib/capabilities.js', import.meta.url), 'utf8')
+ const streamParserSource = readFileSync(new URL('../src/lib/chatCompletionStream.js', import.meta.url), 'utf8')
+@@ -166,7 +167,13 @@ assert.match(modelsViewSource, /modelRuntimeIdMatches\(model, runtime\)/, 'Model
+ assert.match(apiViewSource, /getRuntimeRequestModelId\(selectedModel, runtime, '<loaded-model-id>'\)/, 'API curl examples should use the loaded backend model id for alias-selected exact rows')
+ assert.match(systemViewSource, /getRuntimeRequestModelId\(selectedModel, runtime, '<loaded-model-id>'\)/, 'System curl examples should use the loaded backend model id for alias-selected exact rows')
+ assert.match(modelsViewSource, /modelRuntimeIdMatches\(selectedLocalModel, runtime\)/, 'Models next-chat copy should not fall back to blocked when the selected exact row uses a browser id plus backend runtime_model_name')
++assert.match(chatWorkspaceSource, /chat-readiness-strip-live[\s\S]*runtimeStatusLabel[\s\S]*supportStatusLabel[\s\S]*capabilityLaneStatus\.label/, 'Non-empty live chat should keep exact-row runtime/support/capability readiness visible after the first message')
++assert.match(chatWorkspaceSource, /getChatCapabilityLaneCopy\(selectedChatGate, capabilities\)/, 'Live chat capability copy should come from the selected exact-row support gate')
+ assert.match(modelsViewSource, /compatibilityHintMatchesExactTarget\(capabilities, model, target\)/, 'Models tracked-row matching must require an exact compatibility hint, not a quant-mismatch target id')
++assert.match(modelsViewSource, /matchedChatGate\s*=\s*matchedModel \? getChatGateState\(capabilities, matchedModel, runtime\) : null/, 'Models tracked exact-row cards should use the shared chat gate instead of stale browser readiness')
++assert.match(modelsViewSource, /chatUnlocked\s*=\s*Boolean\(matchedChatGate\?\.chatUnlocked\)/, 'Models tracked exact-row cards should require loaded_now, generation_ready, active_model_id, and exact support before claiming chat unlock')
++assert.match(topBarSource, /exactHintDetail\(activeChatGate\.hint\) \|\| exactHintDetail\(selectedChatGate\.hint\)/, 'TopBar support contract detail should prefer active or selected exact-row hint labels before the first current-gate fallback')
++assert.match(topBarSource, /exactTargetFromHint\(activeChatGate\.hint\)[\s\S]*exactTargetFromHint\(selectedChatGate\.hint\)[\s\S]*getCurrentCompatibilityTarget/, 'TopBar support contract detail should prefer active or selected exact-row evidence before the first current-gate fallback')
+ assert.match(modelsViewSource, /matchesLlama32ThreeBTarget\(model, capabilities\)/, 'The 3B acceptance target should only hide when an exact 3B Q8_0 row is present')
+ assert.match(modelsViewSource, /hasLlama32ThreeB && hasInstruct && hasQ8/, 'The 3B acceptance target fallback must require Llama 3.2 3B Instruct plus Q8_0 evidence')
+ assert.doesNotMatch(modelsViewSource, /findCompatibilityHint\(capabilities, model\)\?\.target\?\.id === target\.id/, 'Models tracked-row matching must not treat quant-mismatch hints as exact-row matches')
+diff --git a/frontend/src/components/TopBar.jsx b/frontend/src/components/TopBar.jsx
+index b8c75fb..220e624 100644
+--- a/frontend/src/components/TopBar.jsx
++++ b/frontend/src/components/TopBar.jsx
+@@ -1,6 +1,6 @@
+ import { memo } from 'react'
+ import { clampText, formatPreview, formatSidebarDate } from '../lib/formatters'
+-import { formatCapabilityStatus, frontendSupportContractCopy, getCurrentCompatibilityTarget } from '../lib/capabilities'
++import { compatibilityHintLabel, formatCapabilityStatus, frontendSupportContractCopy, getCurrentCompatibilityTarget } from '../lib/capabilities'
+ import { getChatGateState } from '../lib/chatGate'
+ import { describeModelState, getModelStatusLabel, modelRuntimeIdMatches } from '../lib/modelState'
+ 
+@@ -24,12 +24,21 @@ const navItems = [
+   { id: 'system', label: 'System' },
+ ]
+ 
++function exactTargetFromHint(hint) {
++  return hint?.exact === true && hint.target?.id ? hint.target : null
++}
++
++function exactHintDetail(hint) {
++  return exactTargetFromHint(hint) ? compatibilityHintLabel(hint) : ''
++}
++
+ function TopBar({ tab, setTab, selectedConversationTitle, selectedConversationUpdatedAt, selectedConversationPreview, runtime, capabilities, selectedModelId, setSelectedModelId, models, demoMode = false }) {
+   const rawConversationTitle = selectedConversationTitle?.trim()
+   const hasCustomConversationTitle = Boolean(rawConversationTitle && rawConversationTitle.toLowerCase() !== 'new conversation')
+   const activeModel = models.find((model) => modelRuntimeIdMatches(model, runtime))
+   const selectedModel = models.find((model) => model.id === selectedModelId)
+   const activeChatGate = getChatGateState(capabilities, activeModel, runtime)
++  const selectedChatGate = getChatGateState(capabilities, selectedModel, runtime)
+   const runtimeChatReady = activeChatGate.chatUnlocked
+   const untitledConversationLabel = selectedConversationTitle
+     ? `${formatPreview(selectedConversationPreview, 42)} · ${formatSidebarDate(selectedConversationUpdatedAt) || 'New chat'}`
+@@ -42,11 +51,15 @@ function TopBar({ tab, setTab, selectedConversationTitle, selectedConversationUp
+   const activeModelLabel = activeModel?.name || 'Nothing loaded now'
+   const selectedModelLabel = selectedModel?.name || 'Nothing chosen for next chat'
+   const selectedModelSummary = selectedModel ? describeModelState(selectedModel) : 'Choose the model you want Camelid to use next.'
+-  const currentCompatibilityTarget = getCurrentCompatibilityTarget(capabilities)
++  const exactCompatibilityDetail = exactHintDetail(activeChatGate.hint) || exactHintDetail(selectedChatGate.hint)
++  const currentCompatibilityTarget = exactTargetFromHint(activeChatGate.hint)
++    || exactTargetFromHint(selectedChatGate.hint)
++    || getCurrentCompatibilityTarget(capabilities)
+   const supportGateLabel = capabilities ? frontendSupportContractCopy(capabilities) : 'No /api/capabilities contract'
+-  const supportGateDetail = currentCompatibilityTarget
+-    ? `${currentCompatibilityTarget.id}: ${formatCapabilityStatus(currentCompatibilityTarget.status)}`
+-    : 'Open the API contract before treating any model family or quant as supported.'
++  const supportGateDetail = exactCompatibilityDetail
++    || (currentCompatibilityTarget
++      ? `${currentCompatibilityTarget.id}: ${formatCapabilityStatus(currentCompatibilityTarget.status)}`
++      : 'Open the API contract before treating any model family or quant as supported.')
+   const runtimeGateDetail = `loaded_now=${runtime?.loaded_now ? 'true' : 'false'} · generation_ready=${runtime?.generation_ready ? 'true' : 'false'} · exact_compatibility_row=${activeChatGate.contractSupported ? 'true' : 'false'}`
+ 
+   if (tab === 'chat') {
+diff --git a/frontend/src/styles/components.css b/frontend/src/styles/components.css
+index b0cd328..073bdd7 100644
+--- a/frontend/src/styles/components.css
++++ b/frontend/src/styles/components.css
+@@ -5449,7 +5449,7 @@ textarea.composer-input-gemini {
+ .chat-readiness-strip {
+   width: min(100%, 900px);
+   display: grid;
+-  grid-template-columns: repeat(2, minmax(0, 1fr));
++  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+   gap: 12px;
+   margin: -4px auto 2px;
+ }
+diff --git a/frontend/src/views/ChatWorkspace.jsx b/frontend/src/views/ChatWorkspace.jsx
+index 7db267d..c8da7f6 100644
+--- a/frontend/src/views/ChatWorkspace.jsx
++++ b/frontend/src/views/ChatWorkspace.jsx
+@@ -1,6 +1,6 @@
+ import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+ 
+-import { compatibilityHintCopy, compatibilityHintLabel, findCompatibilityHint, isCompatibilitySupportedForModel } from '../lib/capabilities'
++import { compatibilityHintCopy, compatibilityHintLabel, exactRowSupportLanes, findCompatibilityHint, isCompatibilitySupportedForModel } from '../lib/capabilities'
+ import { clampText, formatDate, formatRate } from '../lib/formatters'
+ import { getChatGateState } from '../lib/chatGate'
+ import { describeModelState, getModelStatusLabel, isRunnableInCurrentRuntime } from '../lib/modelState'
+@@ -21,6 +21,23 @@ const cleanLegacyDemoCapCopy = (value) => {
+     .trim()
+ }
+ 
++function getChatCapabilityLaneCopy(selectedChatGate, capabilities) {
++  if (!selectedChatGate.contractSupported || !selectedChatGate.hint?.target) {
++    return {
++      label: 'Exact row unavailable',
++      copy: 'Capability lanes stay hidden until the selected model has an exact supported /api/capabilities row and matching quant evidence.',
++    }
++  }
++
++  const lanes = exactRowSupportLanes(selectedChatGate.hint.target, capabilities?.api_features || [])
++  const template = lanes.find((lane) => lane.key === 'template')
++  const throughput = lanes.find((lane) => lane.key === 'throughput')
++  return {
++    label: `${template?.ready ? 'Template ready' : 'Template gated'} · ${throughput?.ready ? 'Throughput ready' : 'Throughput not promoted'}`,
++    copy: 'Row-scoped /api/capabilities evidence; it does not widen model-native context, production-throughput, portability, neighboring-row, or broad-family support.',
++  }
++}
++
+ const normalizeCodeLanguage = (value) => {
+   const language = String(value || '').trim().replace(/[^a-zA-Z0-9_+#.-].*$/, '')
+   if (!language) return 'Code'
+@@ -507,6 +524,7 @@ export default function ChatWorkspace({
+       : 'Ready to chat'
+   const canSubmit = Boolean(composer.trim()) && selectedModelRunnable && !generationActive
+   const selectedCompatibilityHint = findCompatibilityHint(capabilities, selectedModel)
++  const capabilityLaneStatus = getChatCapabilityLaneCopy(selectedChatGate, capabilities)
+   const selectedCompatibilityLabel = selectedModel
+     ? compatibilityHintLabel(selectedCompatibilityHint, 'No matching COMPATIBILITY.md row')
+     : 'No model selected'
+@@ -630,6 +648,11 @@ export default function ChatWorkspace({
+                     <strong>{supportStatusLabel}</strong>
+                     <small>{supportStatusCopy}</small>
+                   </div>
++                  <div className="chat-readiness-card">
++                    <span>Capabilities</span>
++                    <strong>{capabilityLaneStatus.label}</strong>
++                    <small>{capabilityLaneStatus.copy}</small>
++                  </div>
+                 </div>
+               )}
+ 
+@@ -664,11 +687,31 @@ export default function ChatWorkspace({
+         ) : (
+           <>
+             {!demoMode && (
+-              <div className={`chat-session-strip is-${readinessState}`} aria-label="Current Camelid chat status">
+-                <span className="chat-session-dot" aria-hidden="true" />
+-                <strong>{selectedModelName}</strong>
+-                <small>{selectedModelRunnable ? 'Ready when you are' : readinessLabel}</small>
+-              </div>
++              <>
++                <div className={`chat-session-strip is-${readinessState}`} aria-label="Current Camelid chat status">
++                  <span className="chat-session-dot" aria-hidden="true" />
++                  <strong>{selectedModelName}</strong>
++                  <small>{selectedModelRunnable ? 'Ready when you are' : readinessLabel}</small>
++                </div>
++
++                <div className={`chat-readiness-strip chat-readiness-strip-live is-${readinessState}`} aria-label="Live chat exact-row readiness">
++                  <div className="chat-readiness-card">
++                    <span>Runtime</span>
++                    <strong>{runtimeStatusLabel}</strong>
++                    <small>{runtimeStatusCopy}</small>
++                  </div>
++                  <div className="chat-readiness-card">
++                    <span>Support</span>
++                    <strong>{supportStatusLabel}</strong>
++                    <small>{supportStatusCopy}</small>
++                  </div>
++                  <div className="chat-readiness-card">
++                    <span>Capabilities</span>
++                    <strong>{capabilityLaneStatus.label}</strong>
++                    <small>{capabilityLaneStatus.copy}</small>
++                  </div>
++                </div>
++              </>
+             )}
+ 
+             {!selectedModelRunnable && (
+diff --git a/frontend/src/views/ModelsView.jsx b/frontend/src/views/ModelsView.jsx
+index 5ef6d7e..8661275 100644
+--- a/frontend/src/views/ModelsView.jsx
++++ b/frontend/src/views/ModelsView.jsx
+@@ -627,8 +627,9 @@ export default function ModelsView({
+               const supported = isSupportedCapabilityStatus(target.status)
+               const match = findModelMatchingCapabilityRow(models, capabilities, target, runtime, selectedModelId)
+               const matchedModel = match.model
+-              const runtimeReady = Boolean(match.active && matchedModel && isModelGenerationReady(matchedModel))
+-              const chatUnlocked = Boolean(supported && runtimeReady)
++              const matchedChatGate = matchedModel ? getChatGateState(capabilities, matchedModel, runtime) : null
++              const runtimeReady = Boolean(matchedChatGate?.runtimeReady)
++              const chatUnlocked = Boolean(matchedChatGate?.chatUnlocked)
+               const supportLanes = exactRowSupportLanes(target, apiFeatures)
+               const templateLane = supportLanes.find((lane) => lane.key === 'template')
+               const throughputLane = supportLanes.find((lane) => lane.key === 'throughput')
