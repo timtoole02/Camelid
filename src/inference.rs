@@ -38,6 +38,9 @@ use crate::{
     BackendError, Result,
 };
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use crate::tensor::Q8_0AmxPackedBlock;
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct LlamaKvCachePlan {
     pub max_sequence_length: usize,
