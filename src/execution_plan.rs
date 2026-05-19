@@ -17,6 +17,7 @@ const MANAGED_ENV_KEYS: &[&str] = &[
     "CAMELID_X86_Q8_ATTENTION_OUTPUT_PACKED_ROWS4_MATMUL",
     "CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER",
     "CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL",
+    "CAMELID_X86_Q8_ATTENTION_QKV_PREFILL_CONSUMER",
     "CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL",
     "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER",
     "CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL",
@@ -29,6 +30,12 @@ const MANAGED_ENV_KEYS: &[&str] = &[
     "CAMELID_X86_Q8_FFN_DOWN_SINGLE_OWNER",
     "CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER",
     "CAMELID_X86_Q8_OUTPUT_DECODE_OWNER",
+    "CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT",
+    "CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_HOIST",
+    "CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_DECODE_HOIST",
+    "CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK",
+    "CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE",
+    "CAMELID_X86_Q8_PARALLEL_INPUT_QUANTIZE",
 ];
 
 pub const MAC_Q8_PREFILL_I8MM_MIN_ROWS: usize = 4;
@@ -375,6 +382,7 @@ fn select_linux_x86_q8_plan(
         "CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL",
         Some("off"),
     );
+    env_updates.insert("CAMELID_X86_Q8_ATTENTION_QKV_PREFILL_CONSUMER", Some("off"));
     env_updates.insert("CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL", Some("off"));
     env_updates.insert("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER", Some("off"));
     env_updates.insert(
@@ -390,6 +398,14 @@ fn select_linux_x86_q8_plan(
     env_updates.insert("CAMELID_X86_Q8_FFN_DOWN_SINGLE_OWNER", Some("off"));
     env_updates.insert("CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER", Some("off"));
     env_updates.insert("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER", Some("off"));
+    env_updates.insert("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT", Some("off"));
+    env_updates.insert("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_HOIST", Some("off"));
+    env_updates.insert(
+        "CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_DECODE_HOIST",
+        Some("off"),
+    );
+    env_updates.insert("CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE", Some("off"));
+    env_updates.insert("CAMELID_X86_Q8_PARALLEL_INPUT_QUANTIZE", Some("off"));
     reasons.push("validated Ubuntu/Linux x86_64 Rust Q8 runtime repack enabled".into());
     reasons.push("validated Rust AVX2 Q8 packed rows4 kernel selected".into());
     reasons.push(
@@ -759,6 +775,7 @@ mod tests {
             "CAMELID_X86_Q8_ATTENTION_OUTPUT_PACKED_ROWS4_MATMUL",
             "CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER",
             "CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL",
+            "CAMELID_X86_Q8_ATTENTION_QKV_PREFILL_CONSUMER",
             "CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL",
             "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER",
             "CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL",
@@ -771,6 +788,12 @@ mod tests {
             "CAMELID_X86_Q8_FFN_DOWN_SINGLE_OWNER",
             "CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER",
             "CAMELID_X86_Q8_OUTPUT_DECODE_OWNER",
+            "CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT",
+            "CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_HOIST",
+            "CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_DECODE_HOIST",
+            "CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK",
+            "CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE",
+            "CAMELID_X86_Q8_PARALLEL_INPUT_QUANTIZE",
         ] {
             env::remove_var(key);
         }
@@ -1008,6 +1031,12 @@ mod tests {
         assert_eq!(
             outcome
                 .env_updates
+                .get("CAMELID_X86_Q8_ATTENTION_QKV_PREFILL_CONSUMER"),
+            Some(&Some("off"))
+        );
+        assert_eq!(
+            outcome
+                .env_updates
                 .get("CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL"),
             Some(&Some("off"))
         );
@@ -1077,6 +1106,39 @@ mod tests {
                 .get("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER"),
             Some(&Some("off"))
         );
+        assert_eq!(
+            outcome
+                .env_updates
+                .get("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT"),
+            Some(&Some("off"))
+        );
+        assert_eq!(
+            outcome
+                .env_updates
+                .get("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_HOIST"),
+            Some(&Some("off"))
+        );
+        assert_eq!(
+            outcome
+                .env_updates
+                .get("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_DECODE_HOIST"),
+            Some(&Some("off"))
+        );
+        assert_eq!(
+            outcome
+                .env_updates
+                .get("CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE"),
+            Some(&Some("off"))
+        );
+        assert_eq!(
+            outcome
+                .env_updates
+                .get("CAMELID_X86_Q8_PARALLEL_INPUT_QUANTIZE"),
+            Some(&Some("off"))
+        );
+        assert!(!outcome
+            .env_updates
+            .contains_key("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK"));
         clear_profile_env();
     }
 
@@ -1089,6 +1151,7 @@ mod tests {
         env::set_var("CAMELID_X86_Q8_ATTENTION_OUTPUT_PACKED_ROWS4_MATMUL", "on");
         env::set_var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER", "on");
         env::set_var("CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL", "on");
+        env::set_var("CAMELID_X86_Q8_ATTENTION_QKV_PREFILL_CONSUMER", "on");
         env::set_var("CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL", "on");
         env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER", "on");
         env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL", "on");
@@ -1099,6 +1162,14 @@ mod tests {
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_SCHED", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_AVX2", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_SINGLE_OWNER", "on");
+        env::set_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER", "on");
+        env::set_var("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER", "on");
+        env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT", "on");
+        env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_HOIST", "on");
+        env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_DECODE_HOIST", "on");
+        env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK", "1");
+        env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE", "on");
+        env::set_var("CAMELID_X86_Q8_PARALLEL_INPUT_QUANTIZE", "on");
 
         PlannerEnv::capture().apply(&BTreeMap::new());
 
@@ -1107,6 +1178,7 @@ mod tests {
         assert!(env::var("CAMELID_X86_Q8_ATTENTION_OUTPUT_PACKED_ROWS4_MATMUL").is_err());
         assert!(env::var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER").is_err());
         assert!(env::var("CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL").is_err());
+        assert!(env::var("CAMELID_X86_Q8_ATTENTION_QKV_PREFILL_CONSUMER").is_err());
         assert!(env::var("CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL").is_err());
@@ -1117,6 +1189,14 @@ mod tests {
         assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_SCHED").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_AVX2").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_SINGLE_OWNER").is_err());
+        assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER").is_err());
+        assert!(env::var("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER").is_err());
+        assert!(env::var("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT").is_err());
+        assert!(env::var("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_HOIST").is_err());
+        assert!(env::var("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_DECODE_HOIST").is_err());
+        assert!(env::var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK").is_err());
+        assert!(env::var("CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE").is_err());
+        assert!(env::var("CAMELID_X86_Q8_PARALLEL_INPUT_QUANTIZE").is_err());
         clear_profile_env();
     }
 
