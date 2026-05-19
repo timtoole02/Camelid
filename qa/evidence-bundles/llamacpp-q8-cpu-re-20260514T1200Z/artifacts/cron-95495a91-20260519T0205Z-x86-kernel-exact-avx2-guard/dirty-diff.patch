@@ -1,0 +1,102 @@
+diff --git a/docs/CONFIGURATION.md b/docs/CONFIGURATION.md
+index f138470..c368150 100644
+--- a/docs/CONFIGURATION.md
++++ b/docs/CONFIGURATION.md
+@@ -108,6 +108,7 @@ Backend runtime knobs used during performance work:
+ - `CAMELID_PROFILE` selects the execution-planning profile: `safe` keeps only conservative known-good paths, `auto` keeps default-off experiment lanes disabled, `experimental` allows evidence-lane experiments with a warning, and `debug` favors diagnostics over performance claims.
+ - On the Ubuntu x86_64 dense Llama Q8_0 evidence lane, the appliance planner keeps x86 Q8 experiment flags off by default. Manual developer overrides remain evidence-lane only and must not be treated as support-contract, portability, accelerator-backend, or broader model-family evidence. Current reference truth for this lane is `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/README.md`.
+ - `CAMELID_X86_Q8_REPACK=on` is a default-off Ubuntu x86_64 developer experiment that loads selected dense Llama Q8_0 linears into backend-owned packed runtime storage instead of retaining a duplicate row-major packed sidecar. The current x86 slice covers the dense attention projection family (`blk.*.attn_{q,k,v}.weight`, `blk.*.attn_output.weight`), dense FFN gate/up/down rows, and `output.weight`; leave it unset for the safe fallback.
++- `CAMELID_X86_Q8_KERNEL=avx2` is the exact opt-in value for the x86 packed-kernel gate. Boolean aliases such as `on`, `1`, or `true` are intentionally not accepted for this selector; stale or ambiguous values fail closed to the safe CPU path.
+ - `CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER=on`, `CAMELID_X86_Q8_ATTENTION_PROJECTION_DECODE_CONSUMER=on`, and `CAMELID_X86_Q8_ATTENTION_OUTPUT_DECODE_CONSUMER=on` are default-off Ubuntu x86_64 developer experiments that let one-row dense attention Q/K/V and attention-output projections consume backend-owned packed Q8_0 runtime storage directly. They fall back unless the runtime plan, tensor type, shape, row grouping, and packed interleave guards match exactly.
+ - `CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL=on` is a default-off Ubuntu x86_64 developer experiment for multi-row dense attention Q/K/V packed-runtime matmul. It only consumes backend-owned `PackedRows4` Q8_0 runtime storage for `blk.*.attn_{q,k,v}.weight`, and falls back unless all three projections, the runtime plan, dimensions, row count, row grouping, and packed interleave guards match exactly.
+ - `CAMELID_X86_Q8_ATTENTION_OUTPUT_PACKED_ROWS4_MATMUL=on` is a default-off Ubuntu x86_64 developer experiment for multi-row dense attention-output packed-runtime matmul. It only consumes backend-owned `PackedRows4` Q8_0 runtime storage for `blk.*.attn_output.weight`, and falls back unless the runtime plan, tensor type, dimensions, row count, row grouping, and packed interleave guards match exactly.
+diff --git a/src/execution_plan.rs b/src/execution_plan.rs
+index f6bab02..3822836 100644
+--- a/src/execution_plan.rs
++++ b/src/execution_plan.rs
+@@ -691,10 +691,14 @@ fn env_flag_enabled(key: &str) -> bool {
+ 
+ fn x86_kernel_avx2_explicitly_requested() -> bool {
+     env::var("CAMELID_X86_Q8_KERNEL")
+-        .map(|value| value.trim().eq_ignore_ascii_case("avx2"))
++        .map(|value| x86_q8_kernel_value_is_explicit_avx2(&value))
+         .unwrap_or(false)
+ }
+ 
++fn x86_q8_kernel_value_is_explicit_avx2(value: &str) -> bool {
++    value.trim().eq_ignore_ascii_case("avx2")
++}
++
+ fn invalid_x86_kernel_override() -> Option<String> {
+     let value = env::var("CAMELID_X86_Q8_KERNEL").ok()?;
+     let trimmed = value.trim();
+@@ -1297,6 +1301,27 @@ mod tests {
+         clear_profile_env();
+     }
+ 
++    #[test]
++    fn x86_kernel_on_alias_does_not_select_avx2_plan() {
++        let _guard = env_lock();
++        clear_profile_env();
++        env::set_var("CAMELID_PROFILE", "experimental");
++        env::set_var("CAMELID_X86_Q8_REPACK", "on");
++        env::set_var("CAMELID_X86_Q8_KERNEL", "on");
++        let outcome = plan_for_model_with_platform(
++            &PathBuf::from("/tmp/Llama-3.2-3B-Instruct-Q8_0.gguf"),
++            &fixture("Llama 3.2 3B Instruct"),
++            None,
++            platform("linux", "x86_64", &["avx2"]),
++        );
++        assert_eq!(outcome.plan.selected_backend, "cpu_reference");
++        assert_eq!(outcome.plan.selected_q8_path, "safe_q8_0_block_dot");
++        assert!(outcome.plan.reasons.iter().any(|reason| reason.contains(
++            "requires explicit CAMELID_X86_Q8_REPACK=on and CAMELID_X86_Q8_KERNEL=avx2"
++        )));
++        clear_profile_env();
++    }
++
+     #[test]
+     fn unsupported_row_stays_safe() {
+         let _guard = env_lock();
+diff --git a/src/inference.rs b/src/inference.rs
+index 3215516..36712da 100644
+--- a/src/inference.rs
++++ b/src/inference.rs
+@@ -10178,10 +10178,14 @@ fn x86_q8_kernel_avx2_enabled() -> bool {
+ 
+ #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+ fn x86_q8_kernel_avx2_enabled_from_env() -> bool {
+-    matches!(
+-        env::var("CAMELID_X86_Q8_KERNEL").as_deref(),
+-        Ok("avx2") | Ok("AVX2") | Ok("on") | Ok("ON") | Ok("1") | Ok("true") | Ok("TRUE")
+-    )
++    env::var("CAMELID_X86_Q8_KERNEL")
++        .as_deref()
++        .is_ok_and(x86_q8_kernel_value_is_explicit_avx2)
++}
++
++#[cfg(any(test, target_arch = "x86", target_arch = "x86_64"))]
++fn x86_q8_kernel_value_is_explicit_avx2(value: &str) -> bool {
++    value.trim().eq_ignore_ascii_case("avx2")
+ }
+ 
+ #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+@@ -13492,6 +13496,18 @@ mod tests {
+         std::env::remove_var("CAMELID_X86_Q8_KERNEL");
+     }
+ 
++    #[test]
++    fn x86_q8_kernel_gate_requires_explicit_avx2_value() {
++        assert!(x86_q8_kernel_value_is_explicit_avx2("avx2"));
++        assert!(x86_q8_kernel_value_is_explicit_avx2(" AVX2 "));
++        for value in ["", "on", "1", "true", "enabled", "avx512", "amx_int8"] {
++            assert!(
++                !x86_q8_kernel_value_is_explicit_avx2(value),
++                "unexpected CAMELID_X86_Q8_KERNEL alias accepted: {value:?}"
++            );
++        }
++    }
++
+     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+     #[test]
+     fn x86_q8_gemm4_avx2_block_matches_scalar_rows4() {

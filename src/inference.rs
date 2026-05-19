@@ -10178,10 +10178,14 @@ fn x86_q8_kernel_avx2_enabled() -> bool {
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn x86_q8_kernel_avx2_enabled_from_env() -> bool {
-    matches!(
-        env::var("CAMELID_X86_Q8_KERNEL").as_deref(),
-        Ok("avx2") | Ok("AVX2") | Ok("on") | Ok("ON") | Ok("1") | Ok("true") | Ok("TRUE")
-    )
+    env::var("CAMELID_X86_Q8_KERNEL")
+        .as_deref()
+        .is_ok_and(x86_q8_kernel_value_is_explicit_avx2)
+}
+
+#[cfg(any(test, target_arch = "x86", target_arch = "x86_64"))]
+fn x86_q8_kernel_value_is_explicit_avx2(value: &str) -> bool {
+    value.trim().eq_ignore_ascii_case("avx2")
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -13490,6 +13494,18 @@ mod tests {
             expected
         );
         std::env::remove_var("CAMELID_X86_Q8_KERNEL");
+    }
+
+    #[test]
+    fn x86_q8_kernel_gate_requires_explicit_avx2_value() {
+        assert!(x86_q8_kernel_value_is_explicit_avx2("avx2"));
+        assert!(x86_q8_kernel_value_is_explicit_avx2(" AVX2 "));
+        for value in ["", "on", "1", "true", "enabled", "avx512", "amx_int8"] {
+            assert!(
+                !x86_q8_kernel_value_is_explicit_avx2(value),
+                "unexpected CAMELID_X86_Q8_KERNEL alias accepted: {value:?}"
+            );
+        }
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]

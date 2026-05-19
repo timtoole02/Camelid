@@ -1,0 +1,12 @@
+ce306630a86b330aa74d97143b9c5c65655884e4d75ef1b9f8265462697ec38c  ./README.md
+ae6676fe7e669a92278c1291ecb8d2dd0899ace286e8e0b1ec70ac56b43d6d24  ./dirty-diff.patch
+ec3a30ff2d53acc3e74b0e053311c04e488346de18dadb2cb73daff1f764d989  ./dirty-diff.stat
+fe53f2c2cab8be446b51105e131b2d4169990395f2229b38572437421ee97c1f  ./head-before-commit.txt
+b91fcb3077809a2b49b649502e72a4d75f294538845236aa1e3a9a37dee1d137  ./logs/audit-evidence-bundle-privacy.log
+bc962d20f132252509c10433a7840ad107ce59119aaa55e1189ee914b3f01750  ./logs/cargo-clippy-all-targets-all-features.log
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  ./logs/cargo-fmt-check.log
+c762fb0d552cf6e544967f342252cff6fa1062a89964bf9caeba454171fcab44  ./logs/cargo-test-all-targets-all-features.log
+c5db4cb595f2fb243ebbf55f278bde86c9080d80c7c7b1b3bc7efabadb1a420a  ./logs/check-public-evidence-claims.log
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  ./logs/check-public-scrub.log
+b3b924fa11406d07bc73e978187eb5c17a2ff9b092653a56fd3ff09758d68239  ./logs/slice-execution-plan-kernel-alias-test.log
+b3b924fa11406d07bc73e978187eb5c17a2ff9b092653a56fd3ff09758d68239  ./logs/slice-x86-q8-kernel-tests.log

@@ -691,8 +691,12 @@ fn env_flag_enabled(key: &str) -> bool {
 
 fn x86_kernel_avx2_explicitly_requested() -> bool {
     env::var("CAMELID_X86_Q8_KERNEL")
-        .map(|value| value.trim().eq_ignore_ascii_case("avx2"))
+        .map(|value| x86_q8_kernel_value_is_explicit_avx2(&value))
         .unwrap_or(false)
+}
+
+fn x86_q8_kernel_value_is_explicit_avx2(value: &str) -> bool {
+    value.trim().eq_ignore_ascii_case("avx2")
 }
 
 fn invalid_x86_kernel_override() -> Option<String> {
@@ -1294,6 +1298,27 @@ mod tests {
             outcome.env_updates.get("CAMELID_X86_Q8_KERNEL"),
             Some(&Some("off"))
         );
+        clear_profile_env();
+    }
+
+    #[test]
+    fn x86_kernel_on_alias_does_not_select_avx2_plan() {
+        let _guard = env_lock();
+        clear_profile_env();
+        env::set_var("CAMELID_PROFILE", "experimental");
+        env::set_var("CAMELID_X86_Q8_REPACK", "on");
+        env::set_var("CAMELID_X86_Q8_KERNEL", "on");
+        let outcome = plan_for_model_with_platform(
+            &PathBuf::from("/tmp/Llama-3.2-3B-Instruct-Q8_0.gguf"),
+            &fixture("Llama 3.2 3B Instruct"),
+            None,
+            platform("linux", "x86_64", &["avx2"]),
+        );
+        assert_eq!(outcome.plan.selected_backend, "cpu_reference");
+        assert_eq!(outcome.plan.selected_q8_path, "safe_q8_0_block_dot");
+        assert!(outcome.plan.reasons.iter().any(|reason| reason.contains(
+            "requires explicit CAMELID_X86_Q8_REPACK=on and CAMELID_X86_Q8_KERNEL=avx2"
+        )));
         clear_profile_env();
     }
 

@@ -1,0 +1,4 @@
+ docs/CONFIGURATION.md |  1 +
+ src/execution_plan.rs | 27 ++++++++++++++++++++++++++-
+ src/inference.rs      | 24 ++++++++++++++++++++----
+ 3 files changed, 47 insertions(+), 5 deletions(-)
