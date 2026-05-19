@@ -169,6 +169,7 @@ assert.match(chatSource, /runnableModels\s*=\s*models\.filter\(\(model\) => getC
 assert.match(chatSource, /canSubmit\s*=\s*Boolean\(composer\.trim\(\)\) && selectedModelRunnable && !generationActive/, 'composer send button must be blocked unless the exact-row chat gate unlocked')
 assert.match(chatSource, /runtimeStatusCopy[\s\S]*loaded now and generation_ready=true/, 'chat readiness copy must name the runtime readiness requirement')
 assert.match(chatSource, /supportStatusCopy[\s\S]*COMPATIBILITY\.md and \/api\/capabilities agree/, 'chat readiness copy must name the support-contract requirement')
+assert.match(chatSource, /chat-readiness-strip-live[\s\S]*runtimeStatusLabel[\s\S]*supportStatusLabel/, 'non-empty live 3B chat must keep runtime and exact-row support readiness visible after messages exist')
 assert.match(chatSource, /LiveGenerationBadge/, 'live 3B chat must keep an active streaming badge after first content arrives')
 assert.match(chatSource, /StreamingLoader/, 'live 3B chat must keep an accessible pre-token loader')
 assert.match(modelsSource, /matchesLlama32ThreeBTarget\(model, capabilities\)/, 'ModelsView 3B acceptance target must hide only on exact target match')

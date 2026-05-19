@@ -664,11 +664,26 @@ export default function ChatWorkspace({
         ) : (
           <>
             {!demoMode && (
-              <div className={`chat-session-strip is-${readinessState}`} aria-label="Current Camelid chat status">
-                <span className="chat-session-dot" aria-hidden="true" />
-                <strong>{selectedModelName}</strong>
-                <small>{selectedModelRunnable ? 'Ready when you are' : readinessLabel}</small>
-              </div>
+              <>
+                <div className={`chat-session-strip is-${readinessState}`} aria-label="Current Camelid chat status">
+                  <span className="chat-session-dot" aria-hidden="true" />
+                  <strong>{selectedModelName}</strong>
+                  <small>{selectedModelRunnable ? 'Ready when you are' : readinessLabel}</small>
+                </div>
+
+                <div className={`chat-readiness-strip chat-readiness-strip-live is-${readinessState}`} aria-label="Live chat exact-row readiness">
+                  <div className="chat-readiness-card">
+                    <span>Runtime</span>
+                    <strong>{runtimeStatusLabel}</strong>
+                    <small>{runtimeStatusCopy}</small>
+                  </div>
+                  <div className="chat-readiness-card">
+                    <span>Support</span>
+                    <strong>{supportStatusLabel}</strong>
+                    <small>{supportStatusCopy}</small>
+                  </div>
+                </div>
+              </>
             )}
 
             {!selectedModelRunnable && (

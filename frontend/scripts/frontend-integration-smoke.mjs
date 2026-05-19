@@ -143,6 +143,8 @@ try {
   }))
 
   assert.match(streamingMarkup, /data-streaming-state="active"/, 'streaming assistant rows should render an active streaming state')
+  assert.match(streamingMarkup, /Live chat exact-row readiness[\s\S]*Runtime[\s\S]*Local chat ready[\s\S]*Support[\s\S]*Exact row supported/, 'non-empty live 3B chats should keep runtime and exact-row support gates visible after messages exist')
+  assert.match(streamingMarkup, /COMPATIBILITY\.md and \/api\/capabilities agree/, 'live 3B chat readiness must name the exact-row support-contract requirement')
   assert.match(streamingMarkup, /data-streaming-code-state="open"/, 'open streaming fences should expose the active code state')
   assert.match(streamingMarkup, /Still generating — code block incomplete/, 'open streaming code should visibly say it is incomplete')
   assert.match(streamingMarkup, /Streaming code response/, 'streaming code rows should keep an active live-generation label')

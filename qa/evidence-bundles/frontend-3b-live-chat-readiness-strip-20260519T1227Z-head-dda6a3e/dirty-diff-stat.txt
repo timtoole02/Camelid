@@ -1,0 +1,79 @@
+ frontend/scripts/frontend-3b-closure-smoke.mjs  |  1 +
+ frontend/scripts/frontend-integration-smoke.mjs |  2 ++
+ frontend/scripts/ui-regression-smoke.mjs        |  1 +
+ frontend/src/views/ChatWorkspace.jsx            | 25 ++++++++++++++++++++-----
+ 4 files changed, 24 insertions(+), 5 deletions(-)
+
+diff --git a/frontend/scripts/frontend-3b-closure-smoke.mjs b/frontend/scripts/frontend-3b-closure-smoke.mjs
+index 6468f82..35fb717 100644
+--- a/frontend/scripts/frontend-3b-closure-smoke.mjs
++++ b/frontend/scripts/frontend-3b-closure-smoke.mjs
+@@ -169,6 +169,7 @@ assert.match(chatSource, /runnableModels\s*=\s*models\.filter\(\(model\) => getC
+ assert.match(chatSource, /canSubmit\s*=\s*Boolean\(composer\.trim\(\)\) && selectedModelRunnable && !generationActive/, 'composer send button must be blocked unless the exact-row chat gate unlocked')
+ assert.match(chatSource, /runtimeStatusCopy[\s\S]*loaded now and generation_ready=true/, 'chat readiness copy must name the runtime readiness requirement')
+ assert.match(chatSource, /supportStatusCopy[\s\S]*COMPATIBILITY\.md and \/api\/capabilities agree/, 'chat readiness copy must name the support-contract requirement')
++assert.match(chatSource, /chat-readiness-strip-live[\s\S]*runtimeStatusLabel[\s\S]*supportStatusLabel/, 'non-empty live 3B chat must keep runtime and exact-row support readiness visible after messages exist')
+ assert.match(chatSource, /LiveGenerationBadge/, 'live 3B chat must keep an active streaming badge after first content arrives')
+ assert.match(chatSource, /StreamingLoader/, 'live 3B chat must keep an accessible pre-token loader')
+ assert.match(modelsSource, /matchesLlama32ThreeBTarget\(model, capabilities\)/, 'ModelsView 3B acceptance target must hide only on exact target match')
+diff --git a/frontend/scripts/frontend-integration-smoke.mjs b/frontend/scripts/frontend-integration-smoke.mjs
+index d149ed0..46cd54d 100644
+--- a/frontend/scripts/frontend-integration-smoke.mjs
++++ b/frontend/scripts/frontend-integration-smoke.mjs
+@@ -143,6 +143,8 @@ try {
+   }))
+ 
+   assert.match(streamingMarkup, /data-streaming-state="active"/, 'streaming assistant rows should render an active streaming state')
++  assert.match(streamingMarkup, /Live chat exact-row readiness[\s\S]*Runtime[\s\S]*Local chat ready[\s\S]*Support[\s\S]*Exact row supported/, 'non-empty live 3B chats should keep runtime and exact-row support gates visible after messages exist')
++  assert.match(streamingMarkup, /COMPATIBILITY\.md and \/api\/capabilities agree/, 'live 3B chat readiness must name the exact-row support-contract requirement')
+   assert.match(streamingMarkup, /data-streaming-code-state="open"/, 'open streaming fences should expose the active code state')
+   assert.match(streamingMarkup, /Still generating — code block incomplete/, 'open streaming code should visibly say it is incomplete')
+   assert.match(streamingMarkup, /Streaming code response/, 'streaming code rows should keep an active live-generation label')
+diff --git a/frontend/scripts/ui-regression-smoke.mjs b/frontend/scripts/ui-regression-smoke.mjs
+index 1776b88..a902149 100644
+--- a/frontend/scripts/ui-regression-smoke.mjs
++++ b/frontend/scripts/ui-regression-smoke.mjs
+@@ -167,6 +167,7 @@ assert.match(modelsViewSource, /modelRuntimeIdMatches\(model, runtime\)/, 'Model
+ assert.match(apiViewSource, /getRuntimeRequestModelId\(selectedModel, runtime, '<loaded-model-id>'\)/, 'API curl examples should use the loaded backend model id for alias-selected exact rows')
+ assert.match(systemViewSource, /getRuntimeRequestModelId\(selectedModel, runtime, '<loaded-model-id>'\)/, 'System curl examples should use the loaded backend model id for alias-selected exact rows')
+ assert.match(modelsViewSource, /modelRuntimeIdMatches\(selectedLocalModel, runtime\)/, 'Models next-chat copy should not fall back to blocked when the selected exact row uses a browser id plus backend runtime_model_name')
++assert.match(chatWorkspaceSource, /chat-readiness-strip-live[\s\S]*runtimeStatusLabel[\s\S]*supportStatusLabel/, 'Non-empty live chat should keep exact-row runtime/support readiness visible after the first message')
+ assert.match(modelsViewSource, /compatibilityHintMatchesExactTarget\(capabilities, model, target\)/, 'Models tracked-row matching must require an exact compatibility hint, not a quant-mismatch target id')
+ assert.match(modelsViewSource, /matchedChatGate\s*=\s*matchedModel \? getChatGateState\(capabilities, matchedModel, runtime\) : null/, 'Models tracked exact-row cards should use the shared chat gate instead of stale browser readiness')
+ assert.match(modelsViewSource, /chatUnlocked\s*=\s*Boolean\(matchedChatGate\?\.chatUnlocked\)/, 'Models tracked exact-row cards should require loaded_now, generation_ready, active_model_id, and exact support before claiming chat unlock')
+diff --git a/frontend/src/views/ChatWorkspace.jsx b/frontend/src/views/ChatWorkspace.jsx
+index 7db267d..a16cb8c 100644
+--- a/frontend/src/views/ChatWorkspace.jsx
++++ b/frontend/src/views/ChatWorkspace.jsx
+@@ -664,11 +664,26 @@ export default function ChatWorkspace({
+         ) : (
+           <>
+             {!demoMode && (
+-              <div className={`chat-session-strip is-${readinessState}`} aria-label="Current Camelid chat status">
+-                <span className="chat-session-dot" aria-hidden="true" />
+-                <strong>{selectedModelName}</strong>
+-                <small>{selectedModelRunnable ? 'Ready when you are' : readinessLabel}</small>
+-              </div>
++              <>
++                <div className={`chat-session-strip is-${readinessState}`} aria-label="Current Camelid chat status">
++                  <span className="chat-session-dot" aria-hidden="true" />
++                  <strong>{selectedModelName}</strong>
++                  <small>{selectedModelRunnable ? 'Ready when you are' : readinessLabel}</small>
++                </div>
++
++                <div className={`chat-readiness-strip chat-readiness-strip-live is-${readinessState}`} aria-label="Live chat exact-row readiness">
++                  <div className="chat-readiness-card">
++                    <span>Runtime</span>
++                    <strong>{runtimeStatusLabel}</strong>
++                    <small>{runtimeStatusCopy}</small>
++                  </div>
++                  <div className="chat-readiness-card">
++                    <span>Support</span>
++                    <strong>{supportStatusLabel}</strong>
++                    <small>{supportStatusCopy}</small>
++                  </div>
++                </div>
++              </>
+             )}
+ 
+             {!selectedModelRunnable && (
