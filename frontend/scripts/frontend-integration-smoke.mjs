@@ -365,6 +365,30 @@ try {
   assert.match(modelsMarkup, /3B API\/WebUI smoke passed/, 'Models view should keep 3B end-to-end WebUI evidence visible on the exact row card')
   assert.doesNotMatch(modelsMarkup, /This browser\/runtime list does not currently show the exact 3B row/, 'Alias runtime matches must not fall through to the missing-3B acceptance placeholder')
 
+  const staleRuntimeModelsMarkup = renderToStaticMarkup(React.createElement(ModelsView, {
+    runtime: { ...readyRuntime, loaded_now: false },
+    capabilities,
+    refreshDashboard: noop,
+    registerForm: { id: '', name: '', model_path: '', runtime_model_name: '' },
+    setRegisterForm: noop,
+    externalForm: { id: '', name: '', source: '', api_base: '', api_key: '', model_name: '' },
+    setExternalForm: noop,
+    registerModel: noop,
+    connectExternalModel: noop,
+    models: [aliasSelectedModel],
+    selectedModelId: aliasSelectedModel.id,
+    setSelectedModelId: noop,
+    loadingModelId: '',
+    activateModel: noop,
+    unloadCurrentModel: noop,
+    installModel: noop,
+    installCatalogModel: noop,
+    cancelModelDownload: noop,
+  }))
+
+  assert.match(staleRuntimeModelsMarkup, /Runtime still needed/, 'Tracked 3B card must use the shared chat gate and stay blocked when runtime loaded_now=false')
+  assert.doesNotMatch(staleRuntimeModelsMarkup, /Chat unlockable/, 'Tracked 3B card must not present stale browser generation_ready state as WebUI chat support')
+
   const neighboringQuantAcceptanceRecord = {
     ...aliasSelectedModel,
     id: LLAMA32_3B_ACCEPTANCE_TARGET.id,

@@ -167,6 +167,8 @@ assert.match(apiViewSource, /getRuntimeRequestModelId\(selectedModel, runtime, '
 assert.match(systemViewSource, /getRuntimeRequestModelId\(selectedModel, runtime, '<loaded-model-id>'\)/, 'System curl examples should use the loaded backend model id for alias-selected exact rows')
 assert.match(modelsViewSource, /modelRuntimeIdMatches\(selectedLocalModel, runtime\)/, 'Models next-chat copy should not fall back to blocked when the selected exact row uses a browser id plus backend runtime_model_name')
 assert.match(modelsViewSource, /compatibilityHintMatchesExactTarget\(capabilities, model, target\)/, 'Models tracked-row matching must require an exact compatibility hint, not a quant-mismatch target id')
+assert.match(modelsViewSource, /matchedChatGate\s*=\s*matchedModel \? getChatGateState\(capabilities, matchedModel, runtime\) : null/, 'Models tracked exact-row cards should use the shared chat gate instead of stale browser readiness')
+assert.match(modelsViewSource, /chatUnlocked\s*=\s*Boolean\(matchedChatGate\?\.chatUnlocked\)/, 'Models tracked exact-row cards should require loaded_now, generation_ready, active_model_id, and exact support before claiming chat unlock')
 assert.match(modelsViewSource, /matchesLlama32ThreeBTarget\(model, capabilities\)/, 'The 3B acceptance target should only hide when an exact 3B Q8_0 row is present')
 assert.match(modelsViewSource, /hasLlama32ThreeB && hasInstruct && hasQ8/, 'The 3B acceptance target fallback must require Llama 3.2 3B Instruct plus Q8_0 evidence')
 assert.doesNotMatch(modelsViewSource, /findCompatibilityHint\(capabilities, model\)\?\.target\?\.id === target\.id/, 'Models tracked-row matching must not treat quant-mismatch hints as exact-row matches')
