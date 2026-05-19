@@ -1,0 +1,2 @@
+head_before_commit=f640cadcd10ccc9a973a09280f79caa5e2bc7ed8
+branch=frontend-3b-webui-closure-6e9017a8-20260519

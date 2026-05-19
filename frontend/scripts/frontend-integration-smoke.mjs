@@ -335,6 +335,8 @@ try {
   }))
 
   assert.match(aliasTopBarMarkup, /Runtime chat gate[\s\S]*Llama 3\.2 3B Instruct Q8_0/, 'TopBar runtime readiness should resolve the active model through runtime_model_name aliases')
+  assert.match(aliasTopBarMarkup, /llama32_3b_instruct_q8_0: supported current gate/, 'TopBar support detail should prioritize the active exact 3B row instead of the first supported row')
+  assert.doesNotMatch(aliasTopBarMarkup, /tinyllama_1_1b_chat_q8_0: supported current gate/, 'TopBar support detail must not point at TinyLlama when a 3B exact row is active')
   assert.doesNotMatch(aliasTopBarMarkup, /Nothing loaded now/, 'TopBar must not show an empty runtime state for alias-selected loaded 3B rows')
 
   const modelsMarkup = renderToStaticMarkup(React.createElement(ModelsView, {

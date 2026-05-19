@@ -1,0 +1,5 @@
+ frontend/scripts/frontend-3b-closure-smoke.mjs  |  2 ++
+ frontend/scripts/frontend-integration-smoke.mjs |  2 ++
+ frontend/scripts/ui-regression-smoke.mjs        |  2 ++
+ frontend/src/components/TopBar.jsx              | 11 +++++++++--
+ 4 files changed, 15 insertions(+), 2 deletions(-)

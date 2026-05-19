@@ -158,6 +158,7 @@ const hookSource = readFileSync(new URL('../src/hooks/useDashboardData.js', impo
 const chatSource = readFileSync(new URL('../src/views/ChatWorkspace.jsx', import.meta.url), 'utf8')
 const modelsSource = readFileSync(new URL('../src/views/ModelsView.jsx', import.meta.url), 'utf8')
 const apiSource = readFileSync(new URL('../src/views/ApiView.jsx', import.meta.url), 'utf8')
+const topBarSource = readFileSync(new URL('../src/components/TopBar.jsx', import.meta.url), 'utf8')
 
 assert.match(hookSource, /selectedModelChatGate\s*=\s*getChatGateState\(dashboard\?\.capabilities, selectedModel, runtime\)/, 'dashboard selectedModelRunnable must be derived from the shared exact-row chat gate')
 assert.match(hookSource, /selectedModelRunnable\s*=\s*selectedModelChatGate\.chatUnlocked/, 'dashboard must pass chatUnlocked, not runtime readiness alone, into the composer')
@@ -175,5 +176,6 @@ assert.match(modelsSource, /matchedChatGate\s*=\s*matchedModel \? getChatGateSta
 assert.match(apiSource, /Selected exact-row evidence/, 'API view must surface selected 3B exact-row evidence')
 assert.match(apiSource, /selectedExactRowReady/, 'API view endpoint readiness must use selected exact-row readiness, not broad family evidence')
 assert.match(apiSource, /selectedCompatibilityTarget\.frontend_readiness_gate/, 'API view must render the 3B frontend readiness gate from /api/capabilities')
+assert.match(topBarSource, /exactSupportedTargetFromHint\(activeChatGate\.hint\)[\s\S]*exactSupportedTargetFromHint\(selectedChatGate\.hint\)[\s\S]*getCurrentCompatibilityTarget/, 'TopBar support contract detail must prioritize the active/selected exact 3B row before falling back to the first current gate row')
 
 console.log('✓ frontend 3B closure smoke passed')
