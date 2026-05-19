@@ -1,0 +1,6 @@
+ frontend/scripts/frontend-3b-closure-smoke.mjs  |  4 +++-
+ frontend/scripts/frontend-integration-smoke.mjs |  3 ++-
+ frontend/scripts/ui-regression-smoke.mjs        |  3 ++-
+ frontend/src/styles/components.css              |  2 +-
+ frontend/src/views/ChatWorkspace.jsx            | 30 ++++++++++++++++++++++++-
+ 5 files changed, 37 insertions(+), 5 deletions(-)

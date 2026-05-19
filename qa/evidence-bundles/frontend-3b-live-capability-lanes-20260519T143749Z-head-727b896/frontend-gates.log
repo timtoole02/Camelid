@@ -1,0 +1,60 @@
+# npm run smoke (live backend 8181 + frontend preview 4176)
+
+> camelid-frontend@0.1.0 smoke
+> node scripts/smoke.mjs
+
+Smoke target API: http://127.0.0.1:8181
+Smoke target frontend: http://127.0.0.1:4176
+  frontend_http_200_ms=22
+✓ frontend returned HTTP 200
+  health_ms=2
+✓ health ok; generation_ready=false; active_model_id=none
+  models_ms=1
+✓ /v1/models returned 0 model(s): none
+  capabilities_ms=2
+✓ /api/capabilities returned support gate: Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048 packs; and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral-7B-Instruct-v0.3.Q8_0.gguf now has fail-closed current-head API/WebUI/RSS evidence plus checked 512/1024/2048/4096/8192 validation evidence, but remains active_validation_unsupported with WebUI chat blocked by contract. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied.; compatibility_rows=10; supported_model_families=2; planned_model_families=6; guarded_api_features=2
+ℹ chat completion skipped because generation is not ready; frontend should keep chat disabled
+# npm run smoke:model-state
+
+> camelid-frontend@0.1.0 smoke:model-state
+> node scripts/model-state-smoke.mjs
+
+✓ model-state smoke passed
+# npm run smoke:streaming
+
+> camelid-frontend@0.1.0 smoke:streaming
+> node scripts/streaming-parser-smoke.mjs
+
+Streaming parser smoke passed
+# npm run smoke:3b-closure
+
+> camelid-frontend@0.1.0 smoke:3b-closure
+> node scripts/frontend-3b-closure-smoke.mjs
+
+✓ frontend 3B closure smoke passed
+# npm run smoke:ui
+
+> camelid-frontend@0.1.0 smoke:ui
+> node scripts/ui-regression-smoke.mjs
+
+UI regression smoke passed
+# npm run smoke:integration
+
+> camelid-frontend@0.1.0 smoke:integration
+> node scripts/frontend-integration-smoke.mjs
+
+Frontend integration smoke passed
+# npm run build
+
+> camelid-frontend@0.1.0 build
+> vite build
+
+vite v8.0.10 building client environment for production...
+[2Ktransforming...✓ 38 modules transformed.
+rendering chunks...
+computing gzip size...
+dist/index.html                   0.39 kB │ gzip:   0.26 kB
+dist/assets/index-BEi57WzR.css  124.03 kB │ gzip:  21.41 kB
+dist/assets/index-DtKD3KGo.js   375.48 kB │ gzip: 105.71 kB
+
+✓ built in 76ms

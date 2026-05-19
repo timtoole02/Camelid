@@ -1,0 +1,94 @@
+# git state before final gates
+ M frontend/scripts/frontend-3b-closure-smoke.mjs
+ M frontend/scripts/frontend-integration-smoke.mjs
+ M frontend/scripts/ui-regression-smoke.mjs
+ M frontend/src/styles/components.css
+ M frontend/src/views/ChatWorkspace.jsx
+frontend-3b-webui-closure-6e9017a8-20260519
+727b8969beb22d1c70fde5813375e4c50b20ff4b
+ frontend/scripts/frontend-3b-closure-smoke.mjs  |  4 +++-
+ frontend/scripts/frontend-integration-smoke.mjs |  3 ++-
+ frontend/scripts/ui-regression-smoke.mjs        |  3 ++-
+ frontend/src/styles/components.css              |  2 +-
+ frontend/src/views/ChatWorkspace.jsx            | 30 ++++++++++++++++++++++++-
+ 5 files changed, 37 insertions(+), 5 deletions(-)
+
+# live API/frontend endpoints
+{"ok":true,"engine":"camelid","loaded_now":false,"generation_ready":false,"active_model_id":null,"execution_plan":null}{
+  "support_contract": {
+    "current_gate": "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048 packs; and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral-7B-Instruct-v0.3.Q8_0.gguf now has fail-closed current-head API/WebUI/RSS evidence plus checked 512/1024/2048/4096/8192 validation evidence, but remains active_validation_unsupported with WebUI chat blocked by contract. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied.",
+    "support_policy": "A model, tokenizer, quantization, API feature, or context length is supported only after tests, docs, and real-model evidence exist for that lane.",
+    "unsupported_policy": "Unsupported combinations should return typed errors instead of silently falling back to best-effort behavior."
+  },
+  "api_features": [
+    {
+      "id": "openai_chat_completions",
+      "status": "supported_current_gate",
+      "notes": "non-streaming and SSE streaming for loaded supported dense GGUF models"
+    },
+    {
+      "id": "tokenizer_encode_decode",
+      "status": "supported_current_gate",
+      "notes": "loaded-model tokenizer APIs for supported tokenizer families"
+    },
+    {
+      "id": "multi_choice_generation",
+      "status": "unsupported",
+      "notes": "typed unsupported until implemented and tested"
+    },
+    {
+      "id": "rich_logprobs",
+      "status": "partial",
+      "notes": "diagnostic logit surfaces exist; full OpenAI-compatible logprobs remain planned"
+    }
+  ],
+  "llama32_3b_instruct_q8_0": {
+    "id": "llama32_3b_instruct_q8_0",
+    "family": "llama_bpe_decoder",
+    "quantization": "Q8_0",
+    "status": "supported_exact_row_smoke",
+    "support_scope": "exact_row_smoke_only",
+    "full_support_status": "blocked_pending_normalized_full_support",
+    "full_support_blockers": "model-native/larger context beyond checked packs, broader arbitrary/Jinja templates beyond row-scoped metadata-Jinja renderer and template-shape evidence, production throughput beyond bounded perf/RSS and the first-token direction probe, portability, and durable repeated current-head bundles remain missing",
+    "metadata_parses": "validated",
+    "tokenizer_works": "validated_for_compact_and_small_prompt_pack",
+    "tensors_load": "validated",
+    "generation_runs": "api_completion_and_chat_smoke_plus_five_prompt_api_smoke",
+    "parity_audited": "compact_and_broader_prompt_pack_50_token_match",
+    "performance_measured": "bounded_unique_chat_perf_rss_validated",
+    "frontend_load_path_verified": "validated",
+    "frontend_readiness_gate": "green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id",
+    "tested_context": "short_api_webui_smoke_with_broader_prompt_pack_parity_plus_first_512_second_1024_and_third_2048_context_packs",
+    "chat_template_renderer": "metadata_jinja_supported_for_exact_row",
+    "chat_template_shape_pack": "validated_bounded_pack",
+    "chat_template_shape_pack_id": "llama3-chat-template-shapes-v1",
+    "bounded_context_512_pack": "validated_bounded_pack",
+    "bounded_context_512_pack_id": "llama3-context-512-smoke-v1",
+    "bounded_context_window": 512,
+    "bounded_context_1024_pack": "validated_second_pack",
+    "bounded_context_1024_pack_id": "llama3-context-1024-smoke-v1",
+    "bounded_context_1024_window": 1024,
+    "bounded_context_2048_pack": "validated_third_pack",
+    "bounded_context_2048_pack_id": "llama3-context-2048-smoke-v1",
+    "bounded_context_2048_window": 2048,
+    "bounded_context_4096_pack": "not_promoted",
+    "bounded_context_4096_pack_id": "not_selected",
+    "bounded_context_4096_window": 4096,
+    "bounded_context_8192_pack": "not_promoted",
+    "bounded_context_8192_pack_id": "not_selected",
+    "bounded_context_8192_window": 8192,
+    "latest_checked_bucket": "llama3-context-2048-smoke-v1",
+    "latest_checked_result": "pass",
+    "latest_checked_output": "CMLD-204",
+    "evidence": "the exact tracked Llama-3.2-3B-Instruct-Q8_0 GGUF has canonical Ubuntu main-lane API/WebUI support-gate refresh evidence at qa/evidence-bundles/llama32-3b-api-webui-current-head-20260513T2005Z-head-e9f926e/manifest.json for source head e9f926ed1a65, plus exact-row load, completion, chat-completion, frontend-smoke, five-prompt API smoke evidence, compact prompt-token/deterministic 1-token/5-token/bounded 50-token parity, broader three-prompt 50-token parity, first bounded 512-context parity, second bounded 1024-context parity, third bounded 2048-context parity, bounded compact template-shape coverage, exact-row metadata-Jinja renderer coverage for the recognized Llama 3.2 row template, and bounded unique-chat perf/RSS evidence; Camelid supports exact-row smoke for this row only, not broader/full support",
+    "next_step": "preserve exact-row smoke plus checked 512/1024/2048 context support while normalizing model-native/larger context, broader arbitrary/Jinja template behavior beyond row-scoped metadata-Jinja/template-shape evidence, production throughput beyond bounded perf/RSS and the first-token direction probe, portability, and durable full-support bundle evidence before any broader/full-support claim"
+  }
+}
+HTTP/1.1 200 OK
+Vary: Origin
+Content-Type: text/html
+Cache-Control: no-cache
+Etag: W/"188-smTQLvvWQySFdRlVXFv7oDwPTSE"
+Date: Tue, 19 May 2026 14:37:49 GMT
+Connection: keep-alive
+Keep-Alive: timeout=5

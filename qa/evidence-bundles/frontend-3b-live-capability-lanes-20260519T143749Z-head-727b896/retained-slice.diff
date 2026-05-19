@@ -1,0 +1,124 @@
+diff --git a/frontend/scripts/frontend-3b-closure-smoke.mjs b/frontend/scripts/frontend-3b-closure-smoke.mjs
+index 35fb717..13bbcfd 100644
+--- a/frontend/scripts/frontend-3b-closure-smoke.mjs
++++ b/frontend/scripts/frontend-3b-closure-smoke.mjs
+@@ -169,7 +169,9 @@ assert.match(chatSource, /runnableModels\s*=\s*models\.filter\(\(model\) => getC
+ assert.match(chatSource, /canSubmit\s*=\s*Boolean\(composer\.trim\(\)\) && selectedModelRunnable && !generationActive/, 'composer send button must be blocked unless the exact-row chat gate unlocked')
+ assert.match(chatSource, /runtimeStatusCopy[\s\S]*loaded now and generation_ready=true/, 'chat readiness copy must name the runtime readiness requirement')
+ assert.match(chatSource, /supportStatusCopy[\s\S]*COMPATIBILITY\.md and \/api\/capabilities agree/, 'chat readiness copy must name the support-contract requirement')
+-assert.match(chatSource, /chat-readiness-strip-live[\s\S]*runtimeStatusLabel[\s\S]*supportStatusLabel/, 'non-empty live 3B chat must keep runtime and exact-row support readiness visible after messages exist')
++assert.match(chatSource, /chat-readiness-strip-live[\s\S]*runtimeStatusLabel[\s\S]*supportStatusLabel[\s\S]*capabilityLaneStatus\.label/, 'non-empty live 3B chat must keep runtime, exact-row support, and row-scoped capability readiness visible after messages exist')
++assert.match(chatSource, /getChatCapabilityLaneCopy\(selectedChatGate, capabilities\)/, 'live 3B chat must derive capability lane copy from the shared exact-row chat gate')
++assert.match(chatSource, /Row-scoped \/api\/capabilities evidence; it does not widen model-native context/, 'live 3B capability copy must not widen support beyond the exact row')
+ assert.match(chatSource, /LiveGenerationBadge/, 'live 3B chat must keep an active streaming badge after first content arrives')
+ assert.match(chatSource, /StreamingLoader/, 'live 3B chat must keep an accessible pre-token loader')
+ assert.match(modelsSource, /matchesLlama32ThreeBTarget\(model, capabilities\)/, 'ModelsView 3B acceptance target must hide only on exact target match')
+diff --git a/frontend/scripts/frontend-integration-smoke.mjs b/frontend/scripts/frontend-integration-smoke.mjs
+index 46cd54d..75517ee 100644
+--- a/frontend/scripts/frontend-integration-smoke.mjs
++++ b/frontend/scripts/frontend-integration-smoke.mjs
+@@ -143,7 +143,8 @@ try {
+   }))
+ 
+   assert.match(streamingMarkup, /data-streaming-state="active"/, 'streaming assistant rows should render an active streaming state')
+-  assert.match(streamingMarkup, /Live chat exact-row readiness[\s\S]*Runtime[\s\S]*Local chat ready[\s\S]*Support[\s\S]*Exact row supported/, 'non-empty live 3B chats should keep runtime and exact-row support gates visible after messages exist')
++  assert.match(streamingMarkup, /Live chat exact-row readiness[\s\S]*Runtime[\s\S]*Local chat ready[\s\S]*Support[\s\S]*Exact row supported[\s\S]*Capabilities[\s\S]*Template ready · Throughput not promoted/, 'non-empty live 3B chats should keep runtime, exact-row support, and row-scoped capability lanes visible after messages exist')
++  assert.match(streamingMarkup, /Row-scoped \/api\/capabilities evidence; it does not widen model-native context/, 'live 3B capability lanes must avoid widening exact-row support into broader claims')
+   assert.match(streamingMarkup, /COMPATIBILITY\.md and \/api\/capabilities agree/, 'live 3B chat readiness must name the exact-row support-contract requirement')
+   assert.match(streamingMarkup, /data-streaming-code-state="open"/, 'open streaming fences should expose the active code state')
+   assert.match(streamingMarkup, /Still generating — code block incomplete/, 'open streaming code should visibly say it is incomplete')
+diff --git a/frontend/scripts/ui-regression-smoke.mjs b/frontend/scripts/ui-regression-smoke.mjs
+index a902149..8fe71c8 100644
+--- a/frontend/scripts/ui-regression-smoke.mjs
++++ b/frontend/scripts/ui-regression-smoke.mjs
+@@ -167,7 +167,8 @@ assert.match(modelsViewSource, /modelRuntimeIdMatches\(model, runtime\)/, 'Model
+ assert.match(apiViewSource, /getRuntimeRequestModelId\(selectedModel, runtime, '<loaded-model-id>'\)/, 'API curl examples should use the loaded backend model id for alias-selected exact rows')
+ assert.match(systemViewSource, /getRuntimeRequestModelId\(selectedModel, runtime, '<loaded-model-id>'\)/, 'System curl examples should use the loaded backend model id for alias-selected exact rows')
+ assert.match(modelsViewSource, /modelRuntimeIdMatches\(selectedLocalModel, runtime\)/, 'Models next-chat copy should not fall back to blocked when the selected exact row uses a browser id plus backend runtime_model_name')
+-assert.match(chatWorkspaceSource, /chat-readiness-strip-live[\s\S]*runtimeStatusLabel[\s\S]*supportStatusLabel/, 'Non-empty live chat should keep exact-row runtime/support readiness visible after the first message')
++assert.match(chatWorkspaceSource, /chat-readiness-strip-live[\s\S]*runtimeStatusLabel[\s\S]*supportStatusLabel[\s\S]*capabilityLaneStatus\.label/, 'Non-empty live chat should keep exact-row runtime/support/capability readiness visible after the first message')
++assert.match(chatWorkspaceSource, /getChatCapabilityLaneCopy\(selectedChatGate, capabilities\)/, 'Live chat capability copy should come from the selected exact-row support gate')
+ assert.match(modelsViewSource, /compatibilityHintMatchesExactTarget\(capabilities, model, target\)/, 'Models tracked-row matching must require an exact compatibility hint, not a quant-mismatch target id')
+ assert.match(modelsViewSource, /matchedChatGate\s*=\s*matchedModel \? getChatGateState\(capabilities, matchedModel, runtime\) : null/, 'Models tracked exact-row cards should use the shared chat gate instead of stale browser readiness')
+ assert.match(modelsViewSource, /chatUnlocked\s*=\s*Boolean\(matchedChatGate\?\.chatUnlocked\)/, 'Models tracked exact-row cards should require loaded_now, generation_ready, active_model_id, and exact support before claiming chat unlock')
+diff --git a/frontend/src/styles/components.css b/frontend/src/styles/components.css
+index b0cd328..073bdd7 100644
+--- a/frontend/src/styles/components.css
++++ b/frontend/src/styles/components.css
+@@ -5449,7 +5449,7 @@ textarea.composer-input-gemini {
+ .chat-readiness-strip {
+   width: min(100%, 900px);
+   display: grid;
+-  grid-template-columns: repeat(2, minmax(0, 1fr));
++  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+   gap: 12px;
+   margin: -4px auto 2px;
+ }
+diff --git a/frontend/src/views/ChatWorkspace.jsx b/frontend/src/views/ChatWorkspace.jsx
+index a16cb8c..c8da7f6 100644
+--- a/frontend/src/views/ChatWorkspace.jsx
++++ b/frontend/src/views/ChatWorkspace.jsx
+@@ -1,6 +1,6 @@
+ import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+ 
+-import { compatibilityHintCopy, compatibilityHintLabel, findCompatibilityHint, isCompatibilitySupportedForModel } from '../lib/capabilities'
++import { compatibilityHintCopy, compatibilityHintLabel, exactRowSupportLanes, findCompatibilityHint, isCompatibilitySupportedForModel } from '../lib/capabilities'
+ import { clampText, formatDate, formatRate } from '../lib/formatters'
+ import { getChatGateState } from '../lib/chatGate'
+ import { describeModelState, getModelStatusLabel, isRunnableInCurrentRuntime } from '../lib/modelState'
+@@ -21,6 +21,23 @@ const cleanLegacyDemoCapCopy = (value) => {
+     .trim()
+ }
+ 
++function getChatCapabilityLaneCopy(selectedChatGate, capabilities) {
++  if (!selectedChatGate.contractSupported || !selectedChatGate.hint?.target) {
++    return {
++      label: 'Exact row unavailable',
++      copy: 'Capability lanes stay hidden until the selected model has an exact supported /api/capabilities row and matching quant evidence.',
++    }
++  }
++
++  const lanes = exactRowSupportLanes(selectedChatGate.hint.target, capabilities?.api_features || [])
++  const template = lanes.find((lane) => lane.key === 'template')
++  const throughput = lanes.find((lane) => lane.key === 'throughput')
++  return {
++    label: `${template?.ready ? 'Template ready' : 'Template gated'} · ${throughput?.ready ? 'Throughput ready' : 'Throughput not promoted'}`,
++    copy: 'Row-scoped /api/capabilities evidence; it does not widen model-native context, production-throughput, portability, neighboring-row, or broad-family support.',
++  }
++}
++
+ const normalizeCodeLanguage = (value) => {
+   const language = String(value || '').trim().replace(/[^a-zA-Z0-9_+#.-].*$/, '')
+   if (!language) return 'Code'
+@@ -507,6 +524,7 @@ export default function ChatWorkspace({
+       : 'Ready to chat'
+   const canSubmit = Boolean(composer.trim()) && selectedModelRunnable && !generationActive
+   const selectedCompatibilityHint = findCompatibilityHint(capabilities, selectedModel)
++  const capabilityLaneStatus = getChatCapabilityLaneCopy(selectedChatGate, capabilities)
+   const selectedCompatibilityLabel = selectedModel
+     ? compatibilityHintLabel(selectedCompatibilityHint, 'No matching COMPATIBILITY.md row')
+     : 'No model selected'
+@@ -630,6 +648,11 @@ export default function ChatWorkspace({
+                     <strong>{supportStatusLabel}</strong>
+                     <small>{supportStatusCopy}</small>
+                   </div>
++                  <div className="chat-readiness-card">
++                    <span>Capabilities</span>
++                    <strong>{capabilityLaneStatus.label}</strong>
++                    <small>{capabilityLaneStatus.copy}</small>
++                  </div>
+                 </div>
+               )}
+ 
+@@ -682,6 +705,11 @@ export default function ChatWorkspace({
+                     <strong>{supportStatusLabel}</strong>
+                     <small>{supportStatusCopy}</small>
+                   </div>
++                  <div className="chat-readiness-card">
++                    <span>Capabilities</span>
++                    <strong>{capabilityLaneStatus.label}</strong>
++                    <small>{capabilityLaneStatus.copy}</small>
++                  </div>
+                 </div>
+               </>
+             )}
