@@ -1,6 +1,6 @@
 import { memo } from 'react'
 import { clampText, formatPreview, formatSidebarDate } from '../lib/formatters'
-import { formatCapabilityStatus, frontendSupportContractCopy, getCurrentCompatibilityTarget, isExactCompatibilityHint, isSupportedCapabilityStatus } from '../lib/capabilities'
+import { compatibilityHintLabel, formatCapabilityStatus, frontendSupportContractCopy, getCurrentCompatibilityTarget } from '../lib/capabilities'
 import { getChatGateState } from '../lib/chatGate'
 import { describeModelState, getModelStatusLabel, modelRuntimeIdMatches } from '../lib/modelState'
 
@@ -24,8 +24,12 @@ const navItems = [
   { id: 'system', label: 'System' },
 ]
 
-function exactSupportedTargetFromHint(hint) {
-  return isExactCompatibilityHint(hint) && isSupportedCapabilityStatus(hint.target?.status) ? hint.target : null
+function exactTargetFromHint(hint) {
+  return hint?.exact === true && hint.target?.id ? hint.target : null
+}
+
+function exactHintDetail(hint) {
+  return exactTargetFromHint(hint) ? compatibilityHintLabel(hint) : ''
 }
 
 function TopBar({ tab, setTab, selectedConversationTitle, selectedConversationUpdatedAt, selectedConversationPreview, runtime, capabilities, selectedModelId, setSelectedModelId, models, demoMode = false }) {
@@ -47,13 +51,15 @@ function TopBar({ tab, setTab, selectedConversationTitle, selectedConversationUp
   const activeModelLabel = activeModel?.name || 'Nothing loaded now'
   const selectedModelLabel = selectedModel?.name || 'Nothing chosen for next chat'
   const selectedModelSummary = selectedModel ? describeModelState(selectedModel) : 'Choose the model you want Camelid to use next.'
-  const currentCompatibilityTarget = exactSupportedTargetFromHint(activeChatGate.hint)
-    || exactSupportedTargetFromHint(selectedChatGate.hint)
+  const exactCompatibilityDetail = exactHintDetail(activeChatGate.hint) || exactHintDetail(selectedChatGate.hint)
+  const currentCompatibilityTarget = exactTargetFromHint(activeChatGate.hint)
+    || exactTargetFromHint(selectedChatGate.hint)
     || getCurrentCompatibilityTarget(capabilities)
   const supportGateLabel = capabilities ? frontendSupportContractCopy(capabilities) : 'No /api/capabilities contract'
-  const supportGateDetail = currentCompatibilityTarget
-    ? `${currentCompatibilityTarget.id}: ${formatCapabilityStatus(currentCompatibilityTarget.status)}`
-    : 'Open the API contract before treating any model family or quant as supported.'
+  const supportGateDetail = exactCompatibilityDetail
+    || (currentCompatibilityTarget
+      ? `${currentCompatibilityTarget.id}: ${formatCapabilityStatus(currentCompatibilityTarget.status)}`
+      : 'Open the API contract before treating any model family or quant as supported.')
   const runtimeGateDetail = `loaded_now=${runtime?.loaded_now ? 'true' : 'false'} · generation_ready=${runtime?.generation_ready ? 'true' : 'false'} · exact_compatibility_row=${activeChatGate.contractSupported ? 'true' : 'false'}`
 
   if (tab === 'chat') {

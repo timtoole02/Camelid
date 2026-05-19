@@ -1,0 +1,9 @@
+branch: frontend-3b-webui-closure-6e9017a8-20260519
+head: 92c95b963169a1cc5b7d7587938a1d49bbf6aa39
+origin_main: e5b141c37fe9063663344fb5d7df1b7c232bd4bf
+status_short:
+ M frontend/scripts/frontend-3b-closure-smoke.mjs
+ M frontend/scripts/model-state-smoke.mjs
+ M frontend/scripts/ui-regression-smoke.mjs
+ M frontend/src/components/TopBar.jsx
+?? qa/evidence-bundles/frontend-3b-topbar-exact-hint-20260519T095634Z-head-92c95b9/

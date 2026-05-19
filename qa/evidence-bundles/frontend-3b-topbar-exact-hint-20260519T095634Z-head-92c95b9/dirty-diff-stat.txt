@@ -1,0 +1,12 @@
+changed_stat_against_HEAD:
+ frontend/scripts/frontend-3b-closure-smoke.mjs |  5 ++++-
+ frontend/scripts/model-state-smoke.mjs         | 12 +++++++++++-
+ frontend/scripts/ui-regression-smoke.mjs       |  3 ++-
+ frontend/src/components/TopBar.jsx             | 22 ++++++++++++++--------
+ 4 files changed, 31 insertions(+), 11 deletions(-)
+
+changed_files_against_HEAD:
+frontend/scripts/frontend-3b-closure-smoke.mjs
+frontend/scripts/model-state-smoke.mjs
+frontend/scripts/ui-regression-smoke.mjs
+frontend/src/components/TopBar.jsx
