@@ -83,7 +83,7 @@
    Compiling tower v0.5.3
    Compiling hyper-util v0.1.20
    Compiling axum v0.7.9
-   Compiling camelid v0.1.0 (/home/ubuntu/work/camelid-buildqa-58d09b5e-20260520T0056Z-ci)
+   Compiling camelid v0.1.0 (<remote-worktree>)
     Finished `test` profile [unoptimized + debuginfo] target(s) in 13.14s
      Running unittests src/lib.rs (target/debug/deps/camelid-5033b5791b8e7337)
 

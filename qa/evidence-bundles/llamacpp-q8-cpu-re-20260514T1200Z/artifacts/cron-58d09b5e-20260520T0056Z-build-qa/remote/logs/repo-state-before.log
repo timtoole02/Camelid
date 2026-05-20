@@ -1,6 +1,6 @@
-ip-172-31-19-175
-Linux ip-172-31-19-175 6.17.0-1013-aws #13~24.04.1-Ubuntu SMP Fri Apr 24 21:50:45 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
-1.95.0-x86_64-unknown-linux-gnu (overridden by '/home/ubuntu/work/camelid-buildqa-58d09b5e-20260520T0056Z-ci/rust-toolchain.toml')
+<remote-host>
+Linux <remote-host> 6.17.0-1013-aws #13~24.04.1-Ubuntu SMP Fri Apr 24 21:50:45 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+1.95.0-x86_64-unknown-linux-gnu (overridden by '<remote-worktree>/rust-toolchain.toml')
 rustc 1.95.0 (59807616e 2026-04-14)
 cargo 1.95.0 (f2d3ce0bd 2026-03-21)
 e59a1ea403b7ad07c7dd12bf42947ef640475706

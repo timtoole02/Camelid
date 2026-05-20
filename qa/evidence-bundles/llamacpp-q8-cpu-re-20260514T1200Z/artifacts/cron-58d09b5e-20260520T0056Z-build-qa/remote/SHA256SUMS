@@ -1,7 +1,6 @@
-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T0056Z-ubuntu-ci-rerun/SHA256SUMS
-a129065b409419860015a3ad7414cd6a5fae9da63099a2b4b6513856ab590700  qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T0056Z-ubuntu-ci-rerun/commands.txt
-63a17f1126fd91e90c513ecdcf2eb55525a8fffd99e314480f864a25afe09566  qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T0056Z-ubuntu-ci-rerun/logs/cargo-clippy.log
-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T0056Z-ubuntu-ci-rerun/logs/cargo-fmt-check.log
-6256eb06592889f19f96bf284c959398f38ed92e64d1c46110275a8a9b892822  qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T0056Z-ubuntu-ci-rerun/logs/cargo-test.log
-797706d97164b0f39f2637cf75483a571c06d22781e7ddff7f2988ae06886a9d  qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T0056Z-ubuntu-ci-rerun/logs/repo-state-after.log
-94d6b4e8282bd4833e9faffd6c61c9cb234d03f63e3984e8b83c59739f854449  qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T0056Z-ubuntu-ci-rerun/logs/repo-state-before.log
+a129065b409419860015a3ad7414cd6a5fae9da63099a2b4b6513856ab590700  commands.txt
+d3d73924dc03d956dab43e47e11781e8ed1c9f0acfa898660c5c6a69cecf980f  logs/cargo-clippy.log
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  logs/cargo-fmt-check.log
+48354be3eec2b7733ed36b115e642af520ad13e4d5387e707192acbbaeabe009  logs/cargo-test.log
+797706d97164b0f39f2637cf75483a571c06d22781e7ddff7f2988ae06886a9d  logs/repo-state-after.log
+c92745c3fb4d56950111bf19b3bbe9ea97d42842a3285d250ddf2f90ad4498f4  logs/repo-state-before.log

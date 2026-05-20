@@ -96,5 +96,5 @@
     Checking tower v0.5.3
     Checking hyper-util v0.1.20
     Checking axum v0.7.9
-    Checking camelid v0.1.0 (/home/ubuntu/work/camelid-buildqa-58d09b5e-20260520T0056Z-ci)
+    Checking camelid v0.1.0 (<remote-worktree>)
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.74s

@@ -12,7 +12,7 @@ Local macOS arm64 worktree:
 
 Ubuntu x86_64 canonical host:
 
-- Fresh host check used the exact command `ssh -o IdentitiesOnly=yes -i /Users/timtoole/Documents/cert/ubuntu.pem ubuntu@16.146.143.184` and reached Ubuntu 24.04.4 LTS.
+- Fresh host check used the operator-provided canonical Ubuntu SSH command and reached Ubuntu 24.04.4 LTS.
 - First remote CI attempt failed before code checks because non-interactive SSH resolved `/usr/bin/cargo` 1.75.0, which cannot parse Cargo.lock v4. Exact clippy log: `lock file version 4 requires \`-Znext-lockfile-bump\``.
 - Rerun exported `PATH="$HOME/.cargo/bin:$PATH"`, selecting rust/cargo 1.95.0 from `rust-toolchain.toml`.
 - Ubuntu rerun `cargo fmt --all -- --check` — passed; empty log.
@@ -23,7 +23,7 @@ Ubuntu x86_64 canonical host:
 
 - `commands.txt` — command ledger.
 - `logs/` — local logs plus SSH stdout for Ubuntu attempts.
-- `remote/` — imported remote Ubuntu evidence bundle from `/home/ubuntu/work/camelid-buildqa-58d09b5e-20260520T0056Z-ci`.
+- `remote/` — imported redacted remote Ubuntu evidence bundle from `<remote-worktree>`.
 - `SHA256SUMS` — checksums for bundle files.
 
 ## Retain/reject
