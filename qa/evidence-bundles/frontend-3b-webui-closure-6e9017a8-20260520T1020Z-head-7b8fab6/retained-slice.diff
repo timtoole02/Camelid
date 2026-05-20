@@ -1,0 +1,58 @@
+diff --git a/frontend/scripts/frontend-3b-closure-smoke.mjs b/frontend/scripts/frontend-3b-closure-smoke.mjs
+index ca08024..4a94a71 100644
+--- a/frontend/scripts/frontend-3b-closure-smoke.mjs
++++ b/frontend/scripts/frontend-3b-closure-smoke.mjs
+@@ -109,6 +109,11 @@ assert.equal(
+   LLAMA32_3B_ACCEPTANCE_TARGET.name,
+   'loaded backend aliases should render as the canonical 3B row only when the exact GGUF filename and decoded Q8_0 file_type evidence match',
+ )
++assert.equal(
++  resolveLoadedModelDisplayName({ fallbackName: 'scalar_default_rerun', modelPath: exactThreeBModel.model_path, quantLabel: 'file_type 7' }),
++  LLAMA32_3B_ACCEPTANCE_TARGET.name,
++  'loaded backend aliases should also accept direct GGUF file_type 7 quant evidence for the exact 3B Q8_0 row',
++)
+ assert.equal(
+   resolveLoadedModelDisplayName({ fallbackName: 'scalar_default_rerun', modelPath: exactThreeBModel.model_path, quantLabel: 'Q4_K_M' }),
+   'scalar_default_rerun',
+@@ -181,7 +186,7 @@ const topBarSource = readFileSync(new URL('../src/components/TopBar.jsx', import
+
+ assert.match(hookSource, /selectedModelChatGate\s*=\s*getChatGateState\(dashboard\?\.capabilities, selectedModel, runtime\)/, 'dashboard selectedModelRunnable must be derived from the shared exact-row chat gate')
+ assert.match(hookSource, /selectedModelRunnable\s*=\s*selectedModelChatGate\.chatUnlocked/, 'dashboard must pass chatUnlocked, not runtime readiness alone, into the composer')
+-assert.match(loadedModelDisplaySource, /LLAMA32_3B_ACCEPTANCE_FILENAME[\s\S]*normalizeQuantLabel\(quantLabel\) === 'Q8_0'/, 'backend 3B display aliasing must stay exact-filename plus Q8_0 gated')
++assert.match(loadedModelDisplaySource, /quantLabelFromGgufFileType[\s\S]*file\[_\\s-\]\*type[\s\S]*LLAMA32_3B_ACCEPTANCE_FILENAME[\s\S]*normalizeQuantLabel\(quantLabel\) === 'Q8_0'/, 'backend 3B display aliasing must stay exact-filename plus decoded Q8_0/file_type 7 gated')
+ assert.match(hookSource, /resolveLoadedModelDisplayName/, 'dashboard model merge must use the shared exact-filename plus Q8_0 loaded-model display gate')
+ assert.match(chatSource, /runnableModels\s*=\s*models\.filter\(\(model\) => getChatGateState\(capabilities, model, runtime\)\.chatUnlocked\)/, 'chat model picker must list only exact-row unlocked models')
+ assert.match(chatSource, /canSubmit\s*=\s*Boolean\(composer\.trim\(\)\) && selectedModelRunnable && !generationActive/, 'composer send button must be blocked unless the exact-row chat gate unlocked')
+diff --git a/frontend/scripts/ui-regression-smoke.mjs b/frontend/scripts/ui-regression-smoke.mjs
+index 7054027..12eafae 100644
+--- a/frontend/scripts/ui-regression-smoke.mjs
++++ b/frontend/scripts/ui-regression-smoke.mjs
+@@ -103,7 +103,7 @@ assert.match(dashboardHookSource, /selectedConversationIdRef\.current = next[\s\
+ assert.match(dashboardHookSource, /activeModelRunnable && current !== activeModel\.id/, 'browser-selected model should snap back to the backend active model when the runtime changes')
+ assert.match(dashboardHookSource, /modelRuntimeIdMatches/, 'dashboard model merge should treat runtime_model_name as an active_model_id alias instead of losing readiness for imported exact rows')
+ assert.match(dashboardHookSource, /resolveLoadedModelDisplayName/, 'dashboard model merge should rewrite backend-generated active ids to the exact 3B display row only from exact GGUF filename plus Q8_0 metadata')
+-assert.match(loadedModelDisplaySource, /LLAMA32_3B_ACCEPTANCE_FILENAME[\s\S]*normalizeQuantLabel\(quantLabel\) === 'Q8_0'/, 'the 3B display alias must stay exact-row and quant-gated rather than broad-family')
++assert.match(loadedModelDisplaySource, /quantLabelFromGgufFileType[\s\S]*file\[_\\s-\]\*type[\s\S]*LLAMA32_3B_ACCEPTANCE_FILENAME[\s\S]*normalizeQuantLabel\(quantLabel\) === 'Q8_0'/, 'the 3B display alias must stay exact-row and decoded Q8_0/file_type 7 gated rather than broad-family')
+ assert.match(dashboardHookSource, /localRecordMatchesBackendId/, 'dashboard model merge should de-duplicate backend model rows against saved browser records by id or runtime_model_name')
+ assert.match(dashboardHookSource, /const id = localRecord\?\.id \|\| item\.id/, 'backend model merges should preserve the browser row id while keeping the backend runtime id as runtime_model_name')
+ assert.match(dashboardHookSource, /const conversation = await ensureConversation\(\)[\s\S]*?setSelectedConversationId\(conversation\.id\)[\s\S]*?fetch\(`\$\{normalizedApiBase\}\/v1\/chat\/completions`/, 'fresh-chat sends must select the real conversation before streaming starts so the main pane updates with sidebar previews')
+diff --git a/frontend/src/lib/loadedModelDisplay.js b/frontend/src/lib/loadedModelDisplay.js
+index a08b07e..a77f202 100644
+--- a/frontend/src/lib/loadedModelDisplay.js
++++ b/frontend/src/lib/loadedModelDisplay.js
+@@ -1,11 +1,14 @@
+ import { LLAMA32_3B_ACCEPTANCE_TARGET } from './acceptanceTargets.js'
++import { quantLabelFromGgufFileType } from './capabilities.js'
+
+ function pathBasename(value) {
+   return String(value || '').split(/[\\/]/).filter(Boolean).pop() || ''
+ }
+
+ function normalizeQuantLabel(value) {
+-  return String(value || '').trim().toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_+|_+$/g, '')
++  const text = String(value || '').trim()
++  const fileType = text.match(/\bfile[_\s-]*type\s*(\d+)\b/i)?.[1]
++  return String(fileType ? quantLabelFromGgufFileType(fileType) : text).trim().toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_+|_+$/g, '')
+ }
+
+ const LLAMA32_3B_ACCEPTANCE_FILENAME = pathBasename(LLAMA32_3B_ACCEPTANCE_TARGET.source)

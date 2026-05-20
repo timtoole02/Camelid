@@ -1,0 +1,23 @@
+{
+  "schema": "camelid.frontend_3b_slice.v1",
+  "generated_at": "2026-05-20T10:20:00Z",
+  "target": "Llama 3.2 3B Instruct Q8_0 exact-row frontend/WebUI closure",
+  "retained": true,
+  "change": "Decode direct GGUF file_type 7 quant evidence for exact 3B loaded-model display aliasing while preserving exact filename and quant gating.",
+  "gates": {
+    "public_scrub": "pass",
+    "privacy_audit_strict": "pass",
+    "evidence_checksums": "pass",
+    "public_evidence_claims": "pass",
+    "readme_screenshot_guard": "pass",
+    "frontend_npm_ci": "pass",
+    "frontend_build": "pass",
+    "frontend_smoke_model_state": "pass",
+    "frontend_smoke_integration": "pass",
+    "frontend_smoke_3b_closure": "pass",
+    "frontend_smoke_ui": "pass",
+    "frontend_smoke_streaming": "pass",
+    "rust": "not_run_no_rust_touched"
+  },
+  "live_backend": "canonical validation-host API port was not listening; no fresh live backend/WebUI promotion evidence claimed"
+}

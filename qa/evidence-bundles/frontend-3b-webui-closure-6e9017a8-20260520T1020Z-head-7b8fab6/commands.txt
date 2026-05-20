@@ -1,0 +1,19 @@
+# Public scrub/privacy checks
+bash scripts/check-public-scrub.sh
+node scripts/audit-evidence-bundle-privacy.mjs --strict
+bash scripts/check-evidence-bundle-checksums.sh
+node scripts/check-public-evidence-claims.mjs
+node scripts/test-readme-screenshot.mjs
+
+# Frontend CI-equivalent install/build/smokes
+cd frontend
+npm ci
+npm run build
+npm run smoke:model-state
+npm run smoke:integration
+npm run smoke:3b-closure
+npm run smoke:ui
+npm run smoke:streaming
+
+# Live backend/API note
+A non-mutating canonical validation-host API probe was attempted, but the local API port was not listening; no fresh live backend/WebUI promotion evidence is claimed by this slice.

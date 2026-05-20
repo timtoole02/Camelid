@@ -1,0 +1,4 @@
+ frontend/scripts/frontend-3b-closure-smoke.mjs | 7 ++++++-
+ frontend/scripts/ui-regression-smoke.mjs       | 2 +-
+ frontend/src/lib/loadedModelDisplay.js         | 5 ++++-
+ 3 files changed, 11 insertions(+), 3 deletions(-)

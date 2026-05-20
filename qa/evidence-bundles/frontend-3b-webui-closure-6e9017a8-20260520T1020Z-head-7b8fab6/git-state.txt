@@ -1,0 +1,8 @@
+branch: frontend-3b-webui-closure-6e9017a8-20260520T0706Z
+head: 7b8fab63df99f424d621a40dbcef6272787db983
+origin_main: 0c26b9e15ebf775069fbdc8072498d3a2ddb89c1
+status:
+ M frontend/scripts/frontend-3b-closure-smoke.mjs
+ M frontend/scripts/ui-regression-smoke.mjs
+ M frontend/src/lib/loadedModelDisplay.js
+?? qa/evidence-bundles/frontend-3b-webui-closure-6e9017a8-20260520T1020Z-head-7b8fab6/
