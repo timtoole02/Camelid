@@ -1,0 +1,9 @@
+{
+  "schema": "camelid.evidence_bundle_privacy_audit.v1",
+  "generated_at": "2026-05-20T18:54:00.451Z",
+  "root": "qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z",
+  "strict": true,
+  "finding_count": 0,
+  "bundle_count_with_findings": 0,
+  "bundles": []
+}

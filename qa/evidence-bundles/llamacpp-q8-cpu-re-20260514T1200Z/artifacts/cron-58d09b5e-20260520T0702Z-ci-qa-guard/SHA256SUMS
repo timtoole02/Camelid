@@ -1,0 +1,10 @@
+544b3c300f18aac0c60c1551aa982bf2f6e3cc316473c1459f474e11eab474aa  ./README.md
+2f42e2666f0152be91a33cf23131a9546ad420d234c5940cc3d468fff1ad756d  ./logs/local-cargo-test.log
+abaa0e9a3ae11bb2cea602722d4a72c654f4cfa4127d339e7df4979e0166af36  ./logs/local-clippy.log
+1a324c80925fbcd321e1ddafd10aa0e7413f6dbcd44769d60725537e62df3c33  ./logs/local-focused-gates.log
+6fdf579bc9fee0090601523a7f61c05ebd8a2ad0cf16be1150ef1bb4dfde12dc  ./logs/local-git-state.log
+172645138a5a3172eda8c2061d06ffd6238a4c02aef2398fc3a7523e19e64d53  ./logs/local-src-inference-diff.log
+d2eb8290ba2ac8a14ba9f8891b7a888bc806cc2bdb3da878f53cfd2f6b5d3014  ./logs/ubuntu-cargo-test.log
+6538d58b164f1510382c141be7acf30b197814bbecaf73761f8c53f860bed011  ./logs/ubuntu-env.log
+5762b61593561aadd761ffe431c1771ca4016d022b88dedaf3f6228fe6403fe6  ./logs/ubuntu-exact-ssh.log
+bc5ca8d797629bcd113f745665fe6f58cf24ca52abf66fdbce60f44fe08c6b8c  ./logs/ubuntu-focused-gates.log

@@ -1,0 +1,71 @@
+## final local status 2026-05-20T14:11:38Z
+## docs-camelid-ubuntu-host-honesty-20260519T0218Z...origin/docs-camelid-ubuntu-host-honesty-20260519T0218Z
+ M qa/evidence-bundles/frontend-3b-neighbor-quant-path-guard-20260518T111852Z-head-77c6d604cfc7/SHA256SUMS
+ M qa/evidence-bundles/frontend-3b-neighbor-quant-path-guard-20260518T111852Z-head-77c6d604cfc7/logs/remote-backend-check.log
+ M qa/evidence-bundles/frontend-3b-support-gated-chat-20260518T075933Z-head-bffdfdab8c2e/SHA256SUMS
+ M qa/evidence-bundles/frontend-3b-support-gated-chat-20260518T075933Z-head-bffdfdab8c2e/logs/remote-backend-check.log
+ M qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260518T1616Z-ffn-gate-up-single-owner-env-guard/SHA256SUMS
+ M src/inference.rs
+?? qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T0702Z-ci-qa-guard/
+?? qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/
+?? qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260518T1650Z-mac-q8-output-repack-guard/
+
+## evidence files
+total 208
+-rw-------  1 timtoole  staff    39K May 20 07:10 local-cargo-gates.log
+-rw-------  1 timtoole  staff   559B May 20 07:11 local-frontend-build.log
+-rw-------  1 timtoole  staff   1.6K May 20 07:10 local-state.txt
+-rw-------  1 timtoole  staff   1.1K May 20 07:11 summary.txt
+-rw-------  1 timtoole  staff    44K May 20 07:10 ubuntu-cargo-gates.log
+-rw-------  1 timtoole  staff   617B May 20 07:11 ubuntu-frontend-build.log
+
+## gate summaries
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/local-cargo-gates.log:## local cargo gate start 2026-05-20T14:10:29Z
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/local-cargo-gates.log:## docs-camelid-ubuntu-host-honesty-20260519T0218Z...origin/docs-camelid-ubuntu-host-honesty-20260519T0218Z
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/local-cargo-gates.log:rustc 1.95.0 (59807616e 2026-04-14) (Homebrew)
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/local-cargo-gates.log:cargo 1.95.0 (f2d3ce0bd 2026-03-21) (Homebrew)
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/local-cargo-gates.log:+ cargo fmt --check
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/local-cargo-gates.log:+ cargo check --all-targets
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/local-cargo-gates.log:+ cargo test --all-targets
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/local-cargo-gates.log:test result: ok. 278 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.46s
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/local-cargo-gates.log:test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/local-cargo-gates.log:test result: ok. 59 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.90s
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/local-cargo-gates.log:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/local-cargo-gates.log:test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/local-cargo-gates.log:test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/local-cargo-gates.log:test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/local-cargo-gates.log:test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.92s
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/local-cargo-gates.log:test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/local-cargo-gates.log:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/local-cargo-gates.log:+ cargo clippy --all-targets -- -D warnings
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/local-cargo-gates.log:## local cargo gate end 2026-05-20T14:10:34Z
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/local-frontend-build.log:## local frontend gate start 2026-05-20T14:11:03Z
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/local-frontend-build.log:node=v22.22.2
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/local-frontend-build.log:npm=10.9.7
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/local-frontend-build.log:+ npm --prefix frontend run build
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/local-frontend-build.log:✓ built in 223ms
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/local-frontend-build.log:## local frontend gate end 2026-05-20T14:11:04Z
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/ubuntu-cargo-gates.log:## ubuntu cargo gate start 2026-05-20T14:10:08Z
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/ubuntu-cargo-gates.log:## buildqa/clippy-needless-range-loop-58d09b5e-20260518T2100Z...origin/buildqa/clippy-needless-range-loop-58d09b5e-20260518T2100Z
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/ubuntu-cargo-gates.log:rustc 1.87.0 (17067e9ac 2025-05-09)
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/ubuntu-cargo-gates.log:cargo 1.87.0 (99624be96 2025-05-06)
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/ubuntu-cargo-gates.log:+ cargo +1.87.0 fmt --check
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/ubuntu-cargo-gates.log:+ cargo +1.87.0 check --all-targets
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/ubuntu-cargo-gates.log:+ cargo +1.87.0 test --all-targets
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/ubuntu-cargo-gates.log:test result: ok. 281 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.03s
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/ubuntu-cargo-gates.log:test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/ubuntu-cargo-gates.log:test result: ok. 59 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/ubuntu-cargo-gates.log:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/ubuntu-cargo-gates.log:test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/ubuntu-cargo-gates.log:test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/ubuntu-cargo-gates.log:test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/ubuntu-cargo-gates.log:test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/ubuntu-cargo-gates.log:test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/ubuntu-cargo-gates.log:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/ubuntu-cargo-gates.log:+ cargo +1.87.0 clippy --all-targets -- -D warnings
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/ubuntu-cargo-gates.log:## ubuntu cargo gate end 2026-05-20T14:10:37Z
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/ubuntu-frontend-build.log:## ubuntu frontend gate start 2026-05-20T14:11:26Z
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/ubuntu-frontend-build.log:v22.22.2
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/ubuntu-frontend-build.log:+ npm --prefix frontend run build
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/ubuntu-frontend-build.log:✓ built in 161ms
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1407Z-ci-qa-guard/ubuntu-frontend-build.log:## ubuntu frontend gate end 2026-05-20T14:11:27Z

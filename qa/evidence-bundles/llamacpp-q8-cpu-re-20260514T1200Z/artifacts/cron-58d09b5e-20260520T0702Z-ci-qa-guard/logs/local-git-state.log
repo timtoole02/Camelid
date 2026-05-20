@@ -1,0 +1,21 @@
+### date -u
+Wed May 20 07:05:17 UTC 2026
+### git rev-parse HEAD
+2ae221c8ac7c8f52e9cd26002c1de9dfc02685d3
+### git status --short --branch
+## docs-camelid-ubuntu-host-honesty-20260519T0218Z...origin/docs-camelid-ubuntu-host-honesty-20260519T0218Z
+ M qa/evidence-bundles/frontend-3b-neighbor-quant-path-guard-20260518T111852Z-head-77c6d604cfc7/SHA256SUMS
+ M qa/evidence-bundles/frontend-3b-neighbor-quant-path-guard-20260518T111852Z-head-77c6d604cfc7/logs/remote-backend-check.log
+ M qa/evidence-bundles/frontend-3b-support-gated-chat-20260518T075933Z-head-bffdfdab8c2e/SHA256SUMS
+ M qa/evidence-bundles/frontend-3b-support-gated-chat-20260518T075933Z-head-bffdfdab8c2e/logs/remote-backend-check.log
+ M qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260518T1616Z-ffn-gate-up-single-owner-env-guard/SHA256SUMS
+ M src/inference.rs
+?? qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260518T1650Z-mac-q8-output-repack-guard/
+### git diff --stat
+ .../SHA256SUMS                                     |   2 +-
+ .../logs/remote-backend-check.log                  |   2 +-
+ .../SHA256SUMS                                     |   2 +-
+ .../logs/remote-backend-check.log                  |   2 +-
+ .../SHA256SUMS                                     |   4 -
+ src/inference.rs                                   | 265 ++++++++++++++++++++-
+ 6 files changed, 266 insertions(+), 11 deletions(-)

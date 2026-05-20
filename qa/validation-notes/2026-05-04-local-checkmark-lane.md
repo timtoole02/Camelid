@@ -1,4 +1,4 @@
-# Validation note — local checkmark lane while Ubuntu runtime is shut down
+# Validation note — local checkmark lane without remote Ubuntu validation
 
 Superseded operational note: the approved Ubuntu validation lane reopened later on 2026-05-04, then Tim paused it again on 2026-05-12. Keep this file as historical context for the earlier local-only pause, but use `2026-05-12-local-only-validation-lane-paused.md` for current execution guidance.
 
@@ -7,7 +7,7 @@ Repo lane: local/repo-safe only
 
 ## Operator constraint
 
-Tim has intentionally shut down the Ubuntu validation server. Until Tim explicitly says the validation host/runtime lane is back:
+This lane records local-only checks without fresh remote Ubuntu validation. Until Tim explicitly authorizes a remote validation pass:
 
 - do not SSH into the validation host or any substitute remote validation host
 - do not run local Mac llama-server/reference-runtime workloads as a substitute

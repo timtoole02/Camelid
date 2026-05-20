@@ -13,7 +13,7 @@ Do not promote any of these four new lanes to supported/readiness/frontend-green
 - Repository SHA observed via Hugging Face API on 2026-05-06: `6ef9098086fc9885224271e616699049e5c5fb33`.
 - License metadata observed: `apache-2.0`.
 - Repo rfilename observed: `mistral-7b-instruct-v0.3-q8_0.gguf`.
-- Current execution state: Ubuntu load/serve evidence exists, but support is blocked on tokenizer/template parity.
+- Current execution state: Ubuntu load/serve evidence exists, but support is not promotion-ready until tokenizer/template parity passes.
 - Local code-side closure started in this change: Mistral instruct chat rendering now emits metadata BOS as text without asking tokenizer encode to prepend an additional BOS, and keeps special parsing enabled for the rendered `<s>` control token. This is a parity blocker fix, not a support promotion.
 
 Minimum next evidence before support wording can move:

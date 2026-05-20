@@ -1,0 +1,18 @@
+## local frontend gate start 2026-05-20T14:11:03Z
+node=v22.22.2
+npm=10.9.7
++ npm --prefix frontend run build
+
+> camelid-frontend@0.1.0 build
+> vite build
+
+vite v8.0.10 building client environment for production...
+[2Ktransforming...✓ 38 modules transformed.
+rendering chunks...
+computing gzip size...
+dist/index.html                   0.39 kB │ gzip:   0.26 kB
+dist/assets/index-B3xPExzp.css  124.02 kB │ gzip:  21.41 kB
+dist/assets/index-DxeLXuTP.js   373.75 kB │ gzip: 105.34 kB
+
+✓ built in 223ms
+## local frontend gate end 2026-05-20T14:11:04Z

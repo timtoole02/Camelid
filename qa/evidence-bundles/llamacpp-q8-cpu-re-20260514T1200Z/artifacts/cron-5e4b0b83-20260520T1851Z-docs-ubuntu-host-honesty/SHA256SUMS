@@ -1,0 +1,5 @@
+b2374377d52996df3f191ea80e9c8298f0e76ec8258f2c7f10cae3ef6488f065  ./README.md
+5324ed1bf34cac1e1ef241cf534be2436a25174860a570f129f81d0ee2b623e1  ./docs.diff
+d342beeae9373fb636390b39cf71ee57da43fd612ddad77f568cc7fc59890a70  ./logs/privacy-audit.log
+c5db4cb595f2fb243ebbf55f278bde86c9080d80c7c7b1b3bc7efabadb1a420a  ./logs/public-evidence-claims.log
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  ./logs/stale-host-wording-grep.log

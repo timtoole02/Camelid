@@ -1,0 +1,257 @@
+### date -u
+Wed May 20 07:04:10 UTC 2026
+### pwd
+<ubuntu-workdir>
+### uname -a
+Linux <validation-hostname> 6.17.0-1013-aws #13~24.04.1-Ubuntu SMP Fri Apr 24 21:50:45 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+### rustc --version
+rustc 1.95.0 (59807616e 2026-04-14)
+### cargo --version
+cargo 1.95.0 (f2d3ce0bd 2026-03-21)
+### cargo fmt -- --check
+### cargo test q8_attention_output_gemm4 -- --nocapture
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.45
+   Compiling unicode-ident v1.0.24
+   Compiling libc v0.2.186
+   Compiling itoa v1.0.18
+   Compiling pin-project-lite v0.2.17
+   Compiling futures-core v0.3.32
+   Compiling once_cell v1.21.4
+   Compiling serde_core v1.0.228
+   Compiling bytes v1.11.1
+   Compiling log v0.4.29
+   Compiling crossbeam-utils v0.8.21
+   Compiling httparse v1.10.1
+   Compiling cfg-if v1.0.4
+   Compiling zmij v1.0.21
+   Compiling tower-service v0.3.3
+   Compiling serde v1.0.228
+   Compiling serde_json v1.0.149
+   Compiling slab v0.4.12
+   Compiling tower-layer v0.3.3
+   Compiling getrandom v0.4.2
+   Compiling futures-task v0.3.32
+   Compiling tracing-core v0.1.36
+   Compiling smallvec v1.15.1
+   Compiling utf8parse v0.2.2
+   Compiling rustversion v1.0.22
+   Compiling futures-channel v0.3.32
+   Compiling anstyle-query v1.1.5
+   Compiling anstyle-parse v1.0.0
+   Compiling futures-util v0.3.32
+   Compiling regex-syntax v0.8.10
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling rayon-core v1.13.0
+   Compiling memchr v2.8.0
+   Compiling percent-encoding v2.3.2
+   Compiling bitflags v2.11.1
+   Compiling colorchoice v1.0.5
+   Compiling sync_wrapper v1.0.2
+   Compiling httpdate v1.0.3
+   Compiling atomic-waker v1.1.2
+   Compiling anstyle v1.0.14
+   Compiling form_urlencoded v1.2.2
+   Compiling anyhow v1.0.102
+   Compiling clap_lex v1.1.0
+   Compiling http v1.4.0
+   Compiling crossbeam-epoch v0.9.18
+   Compiling anstream v1.0.0
+   Compiling strsim v0.11.1
+   Compiling mime v0.3.17
+   Compiling heck v0.5.0
+   Compiling thiserror v1.0.69
+   Compiling crossbeam-deque v0.8.6
+   Compiling syn v2.0.117
+   Compiling ryu v1.0.23
+   Compiling lazy_static v1.5.0
+   Compiling clap_builder v4.6.0
+   Compiling sharded-slab v0.1.7
+   Compiling tracing-log v0.2.0
+   Compiling thread_local v1.1.9
+   Compiling rustix v1.1.4
+   Compiling either v1.15.0
+   Compiling matchit v0.7.3
+   Compiling nu-ansi-term v0.50.3
+   Compiling memo-map v0.3.3
+   Compiling linux-raw-sys v0.12.1
+   Compiling fastrand v2.4.1
+   Compiling errno v0.3.14
+   Compiling mio v1.2.0
+   Compiling socket2 v0.6.3
+   Compiling signal-hook-registry v1.4.8
+   Compiling http-body v1.0.1
+   Compiling http-body-util v0.1.3
+   Compiling regex-automata v0.4.14
+   Compiling rayon v1.12.0
+   Compiling serde_path_to_error v0.1.20
+   Compiling uuid v1.23.1
+   Compiling tempfile v3.27.0
+   Compiling matchers v0.2.0
+   Compiling tracing-attributes v0.1.31
+   Compiling tokio-macros v2.7.0
+   Compiling serde_derive v1.0.228
+   Compiling async-trait v0.1.89
+   Compiling thiserror-impl v1.0.69
+   Compiling async-stream-impl v0.3.6
+   Compiling clap_derive v4.6.1
+   Compiling async-stream v0.3.6
+   Compiling tokio v1.52.3
+   Compiling tracing v0.1.44
+   Compiling axum-core v0.4.5
+   Compiling tower-http v0.5.2
+   Compiling tracing-subscriber v0.3.23
+   Compiling clap v4.6.1
+   Compiling serde_urlencoded v0.7.1
+   Compiling minijinja v2.19.0
+   Compiling hyper v1.9.0
+   Compiling tower v0.5.3
+   Compiling hyper-util v0.1.20
+   Compiling axum v0.7.9
+   Compiling camelid v0.1.0 (<ubuntu-workdir>)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 15.00s
+     Running unittests src/lib.rs (target/debug/deps/camelid-5033b5791b8e7337)
+
+running 3 tests
+test inference::tests::q8_attention_output_gemm4_prefill_matches_runtime_packed_matmul_with_tail ... ok
+test inference::tests::x86_q8_attention_output_gemm4_row_group_schedule_respects_min_input_groups ... ok
+test inference::tests::q8_attention_output_gemm4_prefill_is_plan_gated_and_rows4_limited ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 279 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/camelid-783e0d818378489a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 59 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+     Running tests/api_vertical_slice.rs (target/debug/deps/api_vertical_slice-9e422fd823cfc629)
+     Running tests/gguf_metadata.rs (target/debug/deps/gguf_metadata-0004d26e01ce859e)
+     Running tests/inference_session.rs (target/debug/deps/inference_session-1b4f7d97f95e8939)
+     Running tests/model_binding.rs (target/debug/deps/model_binding-b3e6070c39a50690)
+     Running tests/tensor_primitives.rs (target/debug/deps/tensor_primitives-8e99542077d888c8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 29 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+
+### cargo clippy --all-targets -- -D warnings
+     Running tests/tensor_store.rs (target/debug/deps/tensor_store-22552b19c33bd0dd)
+     Running tests/tokenizer.rs (target/debug/deps/tokenizer-8e03046a59b18695)
+    Checking libc v0.2.186
+    Checking itoa v1.0.18
+    Checking pin-project-lite v0.2.17
+    Checking futures-core v0.3.32
+    Checking once_cell v1.21.4
+    Checking bytes v1.11.1
+    Checking log v0.4.29
+    Checking tower-service v0.3.3
+    Checking cfg-if v1.0.4
+    Checking smallvec v1.15.1
+    Checking serde_core v1.0.228
+    Checking crossbeam-utils v0.8.21
+    Checking tower-layer v0.3.3
+    Checking slab v0.4.12
+    Checking futures-task v0.3.32
+    Checking utf8parse v0.2.2
+    Checking zmij v1.0.21
+    Checking httparse v1.10.1
+    Checking percent-encoding v2.3.2
+    Checking anstyle-parse v1.0.0
+    Checking futures-channel v0.3.32
+    Checking memchr v2.8.0
+    Checking regex-syntax v0.8.10
+    Checking colorchoice v1.0.5
+    Checking futures-util v0.3.32
+    Checking tracing-core v0.1.36
+    Checking is_terminal_polyfill v1.70.2
+    Checking anstyle-query v1.1.5
+    Checking atomic-waker v1.1.2
+    Checking httpdate v1.0.3
+    Checking sync_wrapper v1.0.2
+    Checking anstyle v1.0.14
+    Checking bitflags v2.11.1
+    Checking form_urlencoded v1.2.2
+    Checking clap_lex v1.1.0
+    Checking ryu v1.0.23
+    Checking mime v0.3.17
+    Checking strsim v0.11.1
+    Checking lazy_static v1.5.0
+    Checking thread_local v1.1.9
+    Checking memo-map v0.3.3
+    Checking sharded-slab v0.1.7
+    Checking matchit v0.7.3
+    Checking anstream v1.0.0
+    Checking either v1.15.0
+    Checking nu-ansi-term v0.50.3
+    Checking thiserror v1.0.69
+    Checking async-stream v0.3.6
+    Checking crossbeam-epoch v0.9.18
+    Checking anyhow v1.0.102
+    Checking linux-raw-sys v0.12.1
+    Checking fastrand v2.4.1
+    Checking tracing v0.1.44
+    Checking tracing-log v0.2.0
+    Checking clap_builder v4.6.0
+    Checking http v1.4.0
+    Checking crossbeam-deque v0.8.6
+    Checking rayon-core v1.13.0
+    Checking rustix v1.1.4
+    Checking errno v0.3.14
+    Checking socket2 v0.6.3
+    Checking mio v1.2.0
+    Checking getrandom v0.4.2
+    Checking signal-hook-registry v1.4.8
+    Checking rayon v1.12.0
+    Checking regex-automata v0.4.14
+    Checking http-body v1.0.1
+    Checking http-body-util v0.1.3
+    Checking tokio v1.52.3
+    Checking tower-http v0.5.2
+    Checking axum-core v0.4.5
+    Checking tempfile v3.27.0
+    Checking serde v1.0.228
+    Checking serde_json v1.0.149
+    Checking serde_path_to_error v0.1.20
+    Checking uuid v1.23.1
+    Checking clap v4.6.1
+    Checking serde_urlencoded v0.7.1
+    Checking matchers v0.2.0
+    Checking tracing-subscriber v0.3.23
+    Checking minijinja v2.19.0
+    Checking hyper v1.9.0
+    Checking tower v0.5.3
+    Checking hyper-util v0.1.20
+    Checking axum v0.7.9
+    Checking camelid v0.1.0 (<ubuntu-workdir>)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.80s

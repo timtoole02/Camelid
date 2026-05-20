@@ -59,7 +59,7 @@ Validation artifacts are under `target/cron-58d09b5e-20260513T2302Z-backend-resu
 - `cargo-clippy-all-targets-all-features.log`: clippy passed with `-D warnings`.
 - `cargo-test-all-targets-all-features.log`: full Rust test suite passed.
 - `frontend-smoke-model-state.log` and `frontend-build.log`: frontend support-surface smoke and production build passed.
-- `ubuntu-readiness.log`: the canonical Ubuntu validation lane remained blocked for fresh current-head validation because `/` was 100% full with about 297 MiB available and the default Rust toolchain was 1.75.0. No fresh remote build was attempted in this resume.
+- `ubuntu-readiness.log`: no fresh remote build was attempted in this resume; the note records historical disk/toolchain observations only and is not current Ubuntu host-status evidence.
 
 This resume still does not promote arbitrary templates, neighboring rows, model-native/larger contexts beyond the checked 512/1024/2048/4096/8192 packs for the exact 1B row, production throughput, portability, or full Llama-family support.
 

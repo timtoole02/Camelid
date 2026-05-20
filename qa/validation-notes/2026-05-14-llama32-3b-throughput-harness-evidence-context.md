@@ -36,4 +36,4 @@ node scripts/bench-llama3-same-host.mjs \
 
 ## Remaining blocker
 
-The exact 3B production-throughput box is still blocked until the canonical Ubuntu host runs the full same-host harness against the exact `Llama-3.2-3B-Instruct-Q8_0.gguf`, captures a scrubbed report/bundle with real GGUF and binary SHA256 values plus measured resource snapshots, and synchronizes `/api/capabilities`, frontend copy, README/COMPATIBILITY/STATUS only for the exact row and measured envelope.
+The exact 3B production-throughput claim is not promotion-ready until a canonical Ubuntu same-host harness runs against the exact `Llama-3.2-3B-Instruct-Q8_0.gguf`, captures a scrubbed report/bundle with real GGUF and binary SHA256 values plus measured resource snapshots, and synchronizes `/api/capabilities`, frontend copy, README/COMPATIBILITY/STATUS only for the exact row and measured envelope.

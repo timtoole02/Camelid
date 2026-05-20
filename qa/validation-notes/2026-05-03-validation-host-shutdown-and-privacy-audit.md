@@ -5,7 +5,7 @@ Repo head oriented: `7f1f565b4e3c`
 
 ## Operating constraint
 
-Tim intentionally shut down the canonical Ubuntu validation host.
+No fresh remote Ubuntu validation was attempted in this note.
 
 Until Tim explicitly says that host is back:
 
@@ -74,7 +74,7 @@ For the four-row full-support push, the blocker stack is now:
 2. remote current-head Llama runtime reruns are therefore blocked
 3. 8B longer-context/performance remains a separate technical blocker even after the host comes back
 
-The privacy-scrub lane is now locally cleaned up and documented, but the runtime-validation lane remains blocked until Tim explicitly brings the Ubuntu host back.
+The privacy-scrub lane is now locally cleaned up and documented; runtime validation requires a separately authorized fresh Ubuntu run.
 
 ## Resume plan once the host returns
 

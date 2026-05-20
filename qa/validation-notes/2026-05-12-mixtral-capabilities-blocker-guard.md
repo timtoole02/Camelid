@@ -5,7 +5,7 @@ Scope: local-only backend/API support-contract guardrail. No SSH, no validation 
 Starting state:
 - Repo head before edits: `7743b61` (`Align status support boundary wording`).
 - Working tree already contained two untracked Llama 3 8B evidence bundle directories; this slice did not modify them.
-- Operator posture: Ubuntu validation lane paused, so promotion-grade reruns are blocked until Tim reactivates an authorized lane.
+- Operator posture: no fresh remote Ubuntu validation was attempted in this note; promotion-grade reruns require an explicitly authorized lane.
 
 Evidence reviewed:
 - `qa/evidence-bundles/mixtral-8x7b-v0.1-q8-blocker-reconciliation-20260512/README.md`

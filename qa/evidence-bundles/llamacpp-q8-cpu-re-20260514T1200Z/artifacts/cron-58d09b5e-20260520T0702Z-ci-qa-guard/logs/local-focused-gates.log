@@ -1,0 +1,129 @@
+### date -u
+Wed May 20 07:03:07 UTC 2026
+### git rev-parse HEAD
+2ae221c8ac7c8f52e9cd26002c1de9dfc02685d3
+### git status --short --branch
+## docs-camelid-ubuntu-host-honesty-20260519T0218Z...origin/docs-camelid-ubuntu-host-honesty-20260519T0218Z
+ M qa/evidence-bundles/frontend-3b-neighbor-quant-path-guard-20260518T111852Z-head-77c6d604cfc7/SHA256SUMS
+ M qa/evidence-bundles/frontend-3b-neighbor-quant-path-guard-20260518T111852Z-head-77c6d604cfc7/logs/remote-backend-check.log
+ M qa/evidence-bundles/frontend-3b-support-gated-chat-20260518T075933Z-head-bffdfdab8c2e/SHA256SUMS
+ M qa/evidence-bundles/frontend-3b-support-gated-chat-20260518T075933Z-head-bffdfdab8c2e/logs/remote-backend-check.log
+ M qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260518T1616Z-ffn-gate-up-single-owner-env-guard/SHA256SUMS
+ M src/inference.rs
+?? qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260518T1650Z-mac-q8-output-repack-guard/
+### cargo fmt -- --check
+### cargo test q8_attention_output_gemm4 -- --nocapture
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.23s
+     Running unittests src/lib.rs (target/debug/deps/camelid-1a49ffa852c9d3a2)
+
+running 3 tests
+test inference::tests::q8_attention_output_gemm4_prefill_is_plan_gated_and_rows4_limited ... ok
+test inference::tests::x86_q8_attention_output_gemm4_row_group_schedule_respects_min_input_groups ... ok
+test inference::tests::q8_attention_output_gemm4_prefill_matches_runtime_packed_matmul_with_tail ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 276 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/camelid-2fc4e05e6ee9a5d6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+     Running tests/api_vertical_slice.rs (target/debug/deps/api_vertical_slice-8e8e457661bd8236)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 59 filtered out; finished in 0.00s
+
+     Running tests/gguf_metadata.rs (target/debug/deps/gguf_metadata-45575ef19394357c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/inference_session.rs (target/debug/deps/inference_session-3d4a7789199febb1)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.00s
+
+     Running tests/model_binding.rs (target/debug/deps/model_binding-7185b3a21097ba82)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+     Running tests/tensor_primitives.rs (target/debug/deps/tensor_primitives-c170961618d40807)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+     Running tests/tensor_store.rs (target/debug/deps/tensor_store-ab659888345e0934)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+
+     Running tests/tokenizer.rs (target/debug/deps/tokenizer-bb05b82c3d9c582f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+
+### cargo test q8_runtime_flags -- --nocapture
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running unittests src/lib.rs (target/debug/deps/camelid-1a49ffa852c9d3a2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 279 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/camelid-2fc4e05e6ee9a5d6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+     Running tests/api_vertical_slice.rs (target/debug/deps/api_vertical_slice-8e8e457661bd8236)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 59 filtered out; finished in 0.00s
+
+     Running tests/gguf_metadata.rs (target/debug/deps/gguf_metadata-45575ef19394357c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/inference_session.rs (target/debug/deps/inference_session-3d4a7789199febb1)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.00s
+
+     Running tests/model_binding.rs (target/debug/deps/model_binding-7185b3a21097ba82)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+     Running tests/tensor_primitives.rs (target/debug/deps/tensor_primitives-c170961618d40807)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+     Running tests/tensor_store.rs (target/debug/deps/tensor_store-ab659888345e0934)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+
+     Running tests/tokenizer.rs (target/debug/deps/tokenizer-bb05b82c3d9c582f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+
