@@ -19,6 +19,7 @@ import {
   rowSupportNextStepCopy,
 } from '../src/lib/capabilities.js'
 import { getChatGateState } from '../src/lib/chatGate.js'
+import { resolveLoadedModelDisplayName } from '../src/lib/loadedModelDisplay.js'
 import {
   getRuntimeRequestModelId,
   isRunnableInCurrentRuntime,
@@ -103,6 +104,21 @@ assert.equal(compatibilityHintMatchesExactTarget(capabilities, exactThreeBModel,
 assert.equal(modelRuntimeIdMatches(exactThreeBModel, runtime), true, '3B backend active_model_id must match the selected runtime row')
 assert.equal(isRunnableInCurrentRuntime(exactThreeBModel, runtime), true, '3B runtime readiness must require the active backend row and generation_ready=true')
 assert.equal(getRuntimeRequestModelId(exactThreeBModel, runtime, 'fallback'), 'scalar_default_rerun', 'API/chat requests should use the loaded backend model id for alias-safe 3B sends')
+assert.equal(
+  resolveLoadedModelDisplayName({ fallbackName: 'scalar_default_rerun', modelPath: exactThreeBModel.model_path, quantLabel: 'Q8_0' }),
+  LLAMA32_3B_ACCEPTANCE_TARGET.name,
+  'loaded backend aliases should render as the canonical 3B row only when the exact GGUF filename and decoded Q8_0 file_type evidence match',
+)
+assert.equal(
+  resolveLoadedModelDisplayName({ fallbackName: 'scalar_default_rerun', modelPath: exactThreeBModel.model_path, quantLabel: 'Q4_K_M' }),
+  'scalar_default_rerun',
+  'loaded backend aliases must not render as the 3B supported row when quant evidence is not Q8_0',
+)
+assert.equal(
+  resolveLoadedModelDisplayName({ fallbackName: 'scalar_default_rerun', modelPath: '/models/llama32-3b-instruct-q8-neighbor.gguf', quantLabel: 'Q8_0' }),
+  'scalar_default_rerun',
+  'loaded backend aliases must not render as the 3B supported row from a loose neighboring filename plus Q8_0 label',
+)
 
 const exactGate = getChatGateState(capabilities, exactThreeBModel, runtime)
 assert.deepEqual(
@@ -157,6 +173,7 @@ assert.match(LLAMA32_3B_ACCEPTANCE_GATING_NOTE, /loaded_now=true and generation_
 assert.match(LLAMA32_3B_ACCEPTANCE_GATING_NOTE, /exact supported Llama 3\.2 3B Q8_0 compatibility row/)
 
 const hookSource = readFileSync(new URL('../src/hooks/useDashboardData.js', import.meta.url), 'utf8')
+const loadedModelDisplaySource = readFileSync(new URL('../src/lib/loadedModelDisplay.js', import.meta.url), 'utf8')
 const chatSource = readFileSync(new URL('../src/views/ChatWorkspace.jsx', import.meta.url), 'utf8')
 const modelsSource = readFileSync(new URL('../src/views/ModelsView.jsx', import.meta.url), 'utf8')
 const apiSource = readFileSync(new URL('../src/views/ApiView.jsx', import.meta.url), 'utf8')
@@ -164,7 +181,8 @@ const topBarSource = readFileSync(new URL('../src/components/TopBar.jsx', import
 
 assert.match(hookSource, /selectedModelChatGate\s*=\s*getChatGateState\(dashboard\?\.capabilities, selectedModel, runtime\)/, 'dashboard selectedModelRunnable must be derived from the shared exact-row chat gate')
 assert.match(hookSource, /selectedModelRunnable\s*=\s*selectedModelChatGate\.chatUnlocked/, 'dashboard must pass chatUnlocked, not runtime readiness alone, into the composer')
-assert.match(hookSource, /LLAMA32_3B_ACCEPTANCE_FILENAME[\s\S]*normalizeQuantLabel\(quantLabel\) === 'Q8_0'/, 'backend 3B display aliasing must stay exact-filename plus Q8_0 gated')
+assert.match(loadedModelDisplaySource, /LLAMA32_3B_ACCEPTANCE_FILENAME[\s\S]*normalizeQuantLabel\(quantLabel\) === 'Q8_0'/, 'backend 3B display aliasing must stay exact-filename plus Q8_0 gated')
+assert.match(hookSource, /resolveLoadedModelDisplayName/, 'dashboard model merge must use the shared exact-filename plus Q8_0 loaded-model display gate')
 assert.match(chatSource, /runnableModels\s*=\s*models\.filter\(\(model\) => getChatGateState\(capabilities, model, runtime\)\.chatUnlocked\)/, 'chat model picker must list only exact-row unlocked models')
 assert.match(chatSource, /canSubmit\s*=\s*Boolean\(composer\.trim\(\)\) && selectedModelRunnable && !generationActive/, 'composer send button must be blocked unless the exact-row chat gate unlocked')
 assert.match(chatSource, /runtimeStatusCopy[\s\S]*loaded now and generation_ready=true/, 'chat readiness copy must name the runtime readiness requirement')

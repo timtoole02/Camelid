@@ -37,6 +37,7 @@ assert.match(readmeSource, /product-forward while still reflecting the local-fir
 
 const chatWorkspaceSource = readFileSync(new URL('../src/views/ChatWorkspace.jsx', import.meta.url), 'utf8')
 const dashboardHookSource = readFileSync(new URL('../src/hooks/useDashboardData.js', import.meta.url), 'utf8')
+const loadedModelDisplaySource = readFileSync(new URL('../src/lib/loadedModelDisplay.js', import.meta.url), 'utf8')
 const apiViewSource = readFileSync(new URL('../src/views/ApiView.jsx', import.meta.url), 'utf8')
 const systemViewSource = readFileSync(new URL('../src/views/SystemView.jsx', import.meta.url), 'utf8')
 const modelsViewSource = readFileSync(new URL('../src/views/ModelsView.jsx', import.meta.url), 'utf8')
@@ -102,7 +103,7 @@ assert.match(dashboardHookSource, /selectedConversationIdRef\.current = next[\s\
 assert.match(dashboardHookSource, /activeModelRunnable && current !== activeModel\.id/, 'browser-selected model should snap back to the backend active model when the runtime changes')
 assert.match(dashboardHookSource, /modelRuntimeIdMatches/, 'dashboard model merge should treat runtime_model_name as an active_model_id alias instead of losing readiness for imported exact rows')
 assert.match(dashboardHookSource, /resolveLoadedModelDisplayName/, 'dashboard model merge should rewrite backend-generated active ids to the exact 3B display row only from exact GGUF filename plus Q8_0 metadata')
-assert.match(dashboardHookSource, /LLAMA32_3B_ACCEPTANCE_FILENAME[\s\S]*normalizeQuantLabel\(quantLabel\) === 'Q8_0'/, 'the 3B display alias must stay exact-row and quant-gated rather than broad-family')
+assert.match(loadedModelDisplaySource, /LLAMA32_3B_ACCEPTANCE_FILENAME[\s\S]*normalizeQuantLabel\(quantLabel\) === 'Q8_0'/, 'the 3B display alias must stay exact-row and quant-gated rather than broad-family')
 assert.match(dashboardHookSource, /localRecordMatchesBackendId/, 'dashboard model merge should de-duplicate backend model rows against saved browser records by id or runtime_model_name')
 assert.match(dashboardHookSource, /const id = localRecord\?\.id \|\| item\.id/, 'backend model merges should preserve the browser row id while keeping the backend runtime id as runtime_model_name')
 assert.match(dashboardHookSource, /const conversation = await ensureConversation\(\)[\s\S]*?setSelectedConversationId\(conversation\.id\)[\s\S]*?fetch\(`\$\{normalizedApiBase\}\/v1\/chat\/completions`/, 'fresh-chat sends must select the real conversation before streaming starts so the main pane updates with sidebar previews')
