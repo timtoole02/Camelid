@@ -1,0 +1,19 @@
+ssh -o IdentitiesOnly=yes -i <ubuntu-identity> ubuntu@<canonical-ubuntu-host> 'bash -seuo pipefail'
+# Remote gate payload used after fresh canonical SSH succeeded:
+export PATH="$HOME/.cargo/bin:$PATH"
+WORK="$HOME/work/cron-58d09b5e-20260520T1840Z-ci-qa-guard-rerun/repo"
+rm -rf "$HOME/work/cron-58d09b5e-20260520T1840Z-ci-qa-guard-rerun"
+mkdir -p "$(dirname "$WORK")"
+git clone --depth 1 --branch buildqa/clippy-needless-range-loop-58d09b5e-20260518T2100Z https://github.com/timtoole02/Camelid.git "$WORK"
+cd "$WORK"
+git rev-parse HEAD
+git status --short --branch
+rustc --version
+cargo --version
+node --version || true
+cargo fmt --all -- --check
+cargo check --all-targets --all-features
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+cargo doc --no-deps --all-features
+bash scripts/check-public-scrub.sh

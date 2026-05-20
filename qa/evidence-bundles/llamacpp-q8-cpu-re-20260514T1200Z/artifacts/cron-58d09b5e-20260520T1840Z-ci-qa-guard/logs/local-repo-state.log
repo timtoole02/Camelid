@@ -1,0 +1,11 @@
+repo=<local-path>
+branch=buildqa/clippy-needless-range-loop-58d09b5e-20260518T2100Z
+head=e9a319de60c4194473fb517f10678c3b89fd562e
+origin_branch=e9a319de60c4194473fb517f10678c3b89fd562e
+## buildqa/clippy-needless-range-loop-58d09b5e-20260518T2100Z...origin/buildqa/clippy-needless-range-loop-58d09b5e-20260518T2100Z
+?? evidence/
+?? qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T1840Z-ci-qa-guard/
+rustc 1.95.0 (59807616e 2026-04-14) (Homebrew)
+cargo 1.95.0 (f2d3ce0bd 2026-03-21) (Homebrew)
+v22.22.2
+10.9.7

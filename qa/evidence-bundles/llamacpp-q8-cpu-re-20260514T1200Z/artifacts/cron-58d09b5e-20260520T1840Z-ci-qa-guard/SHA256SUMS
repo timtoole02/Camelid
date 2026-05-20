@@ -1,0 +1,9 @@
+393f41ddd1db9753d5415d10c45976097e1119bb271a7638f107157426b5b25f  ./README.md
+60945c0bfab2b9bc9ec509b83ea7449e3278c17e3c27b0243de78a2c9b86eab4  ./commands/local-gates.command.txt
+39d2f0ae8df19baa8bf4dee95a83327a0abb1a025f5c18c059c0d6609286a262  ./commands/ubuntu-canonical-ssh.command.txt
+27b29daf8831b60a01a4a4978d7ef639f71c1f44fe4fc1df5be7d598ef669af9  ./commands/ubuntu-gates.command.txt
+9f9cc834e387ae93467447434cb8b60131baf8764490efdc8b29bcdd7bd88d5c  ./logs/local-gates-redacted.log
+23daac051a553128b56a9611009c9a64e501d8c46c74d8a671ba0433bdd98614  ./logs/local-repo-state.log
+45b3d912a7ce1424efffdbc5f4089ba702716e0128aceccb769c932cb384135c  ./logs/ubuntu-canonical-ssh-redacted.log
+5f271ee808f4765b56efe140d2fd4f755a039698867efd0a1fd9c12715c6e3d2  ./logs/ubuntu-gates-redacted.log
+ebed135dc59f01c68ed72cdd68ded464ef7338151b8a529ecf8dc052bab48c0f  ./logs/ubuntu-gates-stderr-redacted.log

@@ -1,0 +1,12 @@
+cargo fmt --all -- --check
+cargo check --all-targets --all-features
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+cargo doc --no-deps --all-features
+bash scripts/check-public-scrub.sh
+node scripts/audit-evidence-bundle-privacy.mjs --strict
+bash scripts/check-evidence-bundle-checksums.sh
+node scripts/check-public-evidence-claims.mjs
+node scripts/test-readme-screenshot.mjs
+for test_script in scripts/test-*.mjs; do node "${test_script}"; done
+(cd frontend && npm run build && npm run smoke:model-state)
