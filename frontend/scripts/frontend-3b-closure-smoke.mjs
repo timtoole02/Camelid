@@ -111,6 +111,12 @@ assert.deepEqual(
   '3B WebUI chat unlock is retained only when loaded_now, generation_ready, active_model_id, and exact supported row all pass',
 )
 
+const missingCapabilitiesGate = getChatGateState(null, exactThreeBModel, runtime)
+assert.equal(missingCapabilitiesGate.runtimeReady, true, '3B runtime readiness must remain visible when /api/capabilities is unavailable')
+assert.equal(missingCapabilitiesGate.contractSupported, false, '3B support must fail closed when /api/capabilities is unavailable')
+assert.equal(missingCapabilitiesGate.chatUnlocked, false, '3B WebUI chat must not unlock from runtime health alone without the exact capabilities row')
+assert.equal(missingCapabilitiesGate.label, 'No matching COMPATIBILITY.md row', '3B support-gated copy should name the missing exact row when capabilities are absent')
+
 for (const [label, model, runtimeOverride] of [
   ['loaded_now=false', exactThreeBModel, { ...runtime, loaded_now: false }],
   ['generation_ready=false', exactThreeBModel, { ...runtime, generation_ready: false }],

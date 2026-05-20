@@ -105,3 +105,9 @@ jobs:
 
       - name: Frontend support-contract smoke
         run: npm run smoke:model-state
+
+      - name: Frontend 3B exact-row closure smoke
+        run: npm run smoke:3b-closure
+
+      - name: Frontend integration smoke
+        run: npm run smoke:integration
