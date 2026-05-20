@@ -17928,6 +17928,68 @@ mod tests {
         (input, packed_weight, expected)
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn runtime_vnni_packed_ffn_down_shape(
+        rows: usize,
+        input_width: usize,
+    ) -> (CpuTensor, CpuTensor) {
+        const Q8_0_BLOCK_BYTES: usize = 34;
+        assert!(rows.is_multiple_of(64));
+        assert!(input_width.is_multiple_of(Q8_0_BLOCK_VALUES));
+        let blocks_per_row = input_width / Q8_0_BLOCK_VALUES;
+        let mut raw = Vec::with_capacity(rows * blocks_per_row * Q8_0_BLOCK_BYTES);
+        for row in 0..rows {
+            for block_idx in 0..blocks_per_row {
+                let scale = 0.0625 + (row % 97) as f32 * 0.0007 + (block_idx % 31) as f32 * 0.0013;
+                let scale_bits = f32_to_f16_bits(scale);
+                raw.extend_from_slice(&scale_bits.to_le_bytes());
+                raw.extend((0..Q8_0_BLOCK_VALUES).map(|idx| {
+                    (idx as i8)
+                        .wrapping_mul(11)
+                        .wrapping_add((row as i8).wrapping_mul(5))
+                        .wrapping_sub((block_idx as i8).wrapping_mul(7)) as u8
+                }));
+            }
+        }
+        let input = CpuTensor::from_f32(
+            "input",
+            vec![1, input_width],
+            (0..input_width)
+                .map(|idx| {
+                    let centered = (idx % 127) as f32 - 63.0;
+                    centered * 0.015625 + ((idx / 127) % 17) as f32 * 0.0005
+                })
+                .collect(),
+        )
+        .unwrap();
+        std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE", "on");
+        let packed = Q8_0PackedRows4::from_q8_0_bytes(
+            rows,
+            blocks_per_row,
+            Q8_0PackedRows4Interleave::I8,
+            &raw,
+        )
+        .unwrap();
+        assert!(packed.vnni_packed.is_some());
+        let packed_weight = CpuTensor::q8_0_runtime_packed_rows4_linear(
+            "blk.0.ffn_down.weight",
+            TensorShape {
+                dims: vec![input_width, rows],
+            },
+            packed,
+        );
+        (input, packed_weight)
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn checksum(values: &[f32]) -> f64 {
+        values
+            .iter()
+            .enumerate()
+            .map(|(idx, value)| f64::from(*value) * ((idx % 251) as f64 + 1.0))
+            .sum()
+    }
+
     #[test]
     fn mac_q8_ffn_down_decode_consumer_alias_is_default_off_and_opt_in() {
         let _env_guard = env_lock();
@@ -18185,6 +18247,125 @@ mod tests {
             .contains_key("ffn_down.x86_vnni_decode_consumer.gate_off"));
         reset_q8_schedule_telemetry();
         std::env::remove_var(Q8_SCHEDULE_TELEMETRY_ENV);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    #[ignore = "manual release microbench for x86 Q8 VNNI FFN-down decode"]
+    fn q8_ffn_down_vnni_decode_rows1_k3072_n8192_benchmark() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        if !x86_q8_vnni_decode_cpu_supported() {
+            eprintln!("skip: CPU lacks AVX512-VNNI");
+            return;
+        }
+
+        let rows = 8192;
+        let input_width = 3072;
+        let warmup_iters = 20;
+        let measure_iters = 100;
+        let (input, packed_weight) = runtime_vnni_packed_ffn_down_shape(rows, input_width);
+        let Some(Q8_0RuntimeStorage::PackedRows4(packed_rows4)) =
+            packed_weight.q8_0_runtime_storage.as_ref()
+        else {
+            panic!("expected PackedRows4 storage");
+        };
+        let vnni = packed_rows4.vnni_packed.as_ref().expect("VNNI sidecar");
+
+        let quantized_input = quantize_q8_0_row(&input.data[..input_width]);
+        let rows4_output = q8_0_packed_rows4_single_input_projection_with_decode_chunking(
+            packed_rows4,
+            &quantized_input.blocks,
+            rows,
+            "rows4",
+            false,
+        )
+        .unwrap();
+        let vnni_output =
+            q8_0_vnni_decode_1x64_projection(vnni, &quantized_input.blocks, rows, "vnni").unwrap();
+        let max_abs_delta = rows4_output
+            .data
+            .iter()
+            .zip(&vnni_output.data)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_abs_delta <= 5e-4,
+            "VNNI output diverged from rows4 baseline: max_abs_delta={max_abs_delta}"
+        );
+
+        for _ in 0..warmup_iters {
+            let q = std::hint::black_box(quantize_q8_0_row(&input.data[..input_width]));
+            let rows4 = q8_0_packed_rows4_single_input_projection_with_decode_chunking(
+                packed_rows4,
+                &q.blocks,
+                rows,
+                "rows4_warmup",
+                false,
+            )
+            .unwrap();
+            let vnni =
+                q8_0_vnni_decode_1x64_projection(vnni, &q.blocks, rows, "vnni_warmup").unwrap();
+            std::hint::black_box(checksum(&rows4.data) + checksum(&vnni.data));
+        }
+
+        let quantize_started = Instant::now();
+        let mut quantize_checksum = 0_i64;
+        for _ in 0..measure_iters {
+            let q = std::hint::black_box(quantize_q8_0_row(&input.data[..input_width]));
+            quantize_checksum += q
+                .blocks
+                .iter()
+                .flat_map(|block| block.quants)
+                .map(i64::from)
+                .sum::<i64>();
+            std::hint::black_box(&q);
+        }
+        let quantize_us = quantize_started.elapsed().as_micros() as f64 / measure_iters as f64;
+
+        let rows4_started = Instant::now();
+        let mut rows4_checksum = 0.0_f64;
+        for _ in 0..measure_iters {
+            let output = q8_0_packed_rows4_single_input_projection_with_decode_chunking(
+                packed_rows4,
+                &quantized_input.blocks,
+                rows,
+                "rows4_measure",
+                false,
+            )
+            .unwrap();
+            rows4_checksum += checksum(&output.data);
+            std::hint::black_box(&output);
+        }
+        let rows4_kernel_us = rows4_started.elapsed().as_micros() as f64 / measure_iters as f64;
+
+        let vnni_started = Instant::now();
+        let mut vnni_checksum = 0.0_f64;
+        for _ in 0..measure_iters {
+            let output = q8_0_vnni_decode_1x64_projection(
+                vnni,
+                &quantized_input.blocks,
+                rows,
+                "vnni_measure",
+            )
+            .unwrap();
+            vnni_checksum += checksum(&output.data);
+            std::hint::black_box(&output);
+        }
+        let vnni_kernel_us = vnni_started.elapsed().as_micros() as f64 / measure_iters as f64;
+
+        println!(
+            "q8_ffn_down_vnni_decode_rows1_k3072_n8192_benchmark threads={} warmup_iters={} measure_iters={} quantize_us_mean={quantize_us:.3} rows4_kernel_us_mean={rows4_kernel_us:.3} vnni_kernel_us_mean={vnni_kernel_us:.3} rows4_total_us_mean={:.3} vnni_total_us_mean={:.3} speedup_kernel={:.3} speedup_total={:.3} max_abs_delta={max_abs_delta:.8} quantize_checksum={} rows4_checksum={rows4_checksum:.6} vnni_checksum={vnni_checksum:.6}",
+            rayon::current_num_threads(),
+            warmup_iters,
+            measure_iters,
+            quantize_us + rows4_kernel_us,
+            quantize_us + vnni_kernel_us,
+            rows4_kernel_us / vnni_kernel_us,
+            (quantize_us + rows4_kernel_us) / (quantize_us + vnni_kernel_us),
+            quantize_checksum
+        );
+        std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE");
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

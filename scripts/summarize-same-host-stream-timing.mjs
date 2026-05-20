@@ -68,6 +68,7 @@ export function summarizeSameHostStreamTiming(input, inputPath = 'same-host.json
   const projectionLayerRoutes = summarizeProjectionLayerRoutes(analyzedRuns)
   const projectionRouteDenials = summarizeProjectionRouteDenials(analyzedRuns)
   const layerRoleHotspots = summarizeLayerRoleHotspots(analyzedRuns)
+  const stageRouteRoleGaps = summarizeStageRouteRoleGaps(analyzedRuns)
   const layerRouteRoleGaps = summarizeLayerRouteRoleGaps(analyzedRuns)
   const roleFocus = summarizeRoleFocus(stages, ['logits', 'attention_context', 'attention_output'])
   const runDeltas = analyzedRuns.map((run, index) => {
@@ -172,6 +173,7 @@ export function summarizeSameHostStreamTiming(input, inputPath = 'same-host.json
     output_projection_layer_routes: projectionLayerRoutes,
     projection_route_denials: projectionRouteDenials,
     layer_role_hotspots: layerRoleHotspots,
+    stage_route_role_gaps: stageRouteRoleGaps,
     layer_route_role_gaps: layerRouteRoleGaps,
     role_focus: roleFocus,
     outliers,
@@ -525,6 +527,98 @@ function summarizeLayerRouteRoleGaps(runs) {
   })
 }
 
+function summarizeStageRouteRoleGaps(runs) {
+  const groups = new Map()
+  for (const run of runs) {
+    const routeGroups = new Map()
+    for (const route of Object.values(run.projection_layer_routes ?? {})) {
+      const stage = typeof route?.stage === 'string' ? route.stage : null
+      const routeRole = typeof route?.role === 'string' ? route.role : null
+      const routeName = typeof route?.route === 'string' ? route.route : null
+      const routeElapsedUs = finite(route?.elapsed_us)
+      const calls = finite(route?.calls)
+      const rows = finite(route?.rows)
+      if (!stage || stage === 'unknown' || !routeRole || !routeName || routeElapsedUs === null) {
+        continue
+      }
+      const key = `${stage}\u0000${routeRole}\u0000${routeName}`
+      if (!routeGroups.has(key)) {
+        routeGroups.set(key, {
+          stage,
+          projection_role: routeRole,
+          route: routeName,
+          elapsed_us: 0,
+          calls: 0,
+          rows: 0,
+        })
+      }
+      const group = routeGroups.get(key)
+      group.elapsed_us += routeElapsedUs
+      if (calls !== null) group.calls += calls
+      if (rows !== null) group.rows += rows
+    }
+
+    for (const routeGroup of routeGroups.values()) {
+      const matchedRoles = hotspotRolesForProjectionRole(routeGroup.projection_role)
+      let roleElapsedMs = 0
+      const presentRoles = []
+      for (const role of matchedRoles) {
+        const elapsedMs = finite(run.roles?.[routeGroup.stage]?.[role])
+        if (elapsedMs !== null) {
+          roleElapsedMs += elapsedMs
+          presentRoles.push(role)
+        }
+      }
+      if (presentRoles.length === 0) continue
+
+      const routeElapsedMs = routeGroup.elapsed_us / 1000
+      const gapMs = round(roleElapsedMs - routeElapsedMs)
+      const key = `${routeGroup.stage}\u0000${routeGroup.projection_role}\u0000${routeGroup.route}`
+      if (!groups.has(key)) {
+        groups.set(key, {
+          stage: routeGroup.stage,
+          projection_role: routeGroup.projection_role,
+          route: routeGroup.route,
+          matched_roles: new Set(),
+          role_elapsed_values: [],
+          route_elapsed_values: [],
+          gap_values: [],
+          abs_gap_values: [],
+          calls_values: [],
+          rows_values: [],
+        })
+      }
+      const group = groups.get(key)
+      for (const role of presentRoles) group.matched_roles.add(role)
+      group.role_elapsed_values.push(roleElapsedMs)
+      group.route_elapsed_values.push(routeElapsedMs)
+      group.gap_values.push(gapMs)
+      group.abs_gap_values.push(Math.abs(gapMs))
+      group.calls_values.push(routeGroup.calls)
+      group.rows_values.push(routeGroup.rows)
+    }
+  }
+
+  return [...groups.values()].map((group) => ({
+    stage: group.stage,
+    projection_role: group.projection_role,
+    route: group.route,
+    matched_roles: [...group.matched_roles].sort(),
+    role_elapsed_ms: stats(group.role_elapsed_values),
+    route_elapsed_ms: stats(group.route_elapsed_values),
+    role_minus_route_ms: stats(group.gap_values),
+    abs_gap_ms: stats(group.abs_gap_values),
+    calls: stats(group.calls_values),
+    rows: stats(group.rows_values),
+  })).sort((left, right) => {
+    const absDelta = (right.abs_gap_ms.mean ?? 0) - (left.abs_gap_ms.mean ?? 0)
+    if (absDelta !== 0) return absDelta
+    return left.stage.localeCompare(right.stage)
+      || left.projection_role.localeCompare(right.projection_role)
+      || left.route.localeCompare(right.route)
+  })
+}
+
 function layerHotspotEntries(run) {
   const rows = []
   for (const [stage, entries] of Object.entries(run.layer_hotspots ?? {})) {
@@ -600,6 +694,9 @@ function humanSummary(report) {
   const layerHotspots = report.layer_role_hotspots.slice(0, 6)
     .map((row, index) => `${index + 1}. ${row.stage}.L${row.layer_index}.${row.role} mean=${fmt(row.elapsed_ms.mean)}ms p95=${fmt(row.elapsed_ms.p95)}ms`)
     .join('\n')
+  const stageRouteGaps = report.stage_route_role_gaps.slice(0, 8)
+    .map((row, index) => `${index + 1}. ${row.stage}.${row.projection_role}.${row.route ?? 'unknown'} role_mean=${fmt(row.role_elapsed_ms.mean)}ms route_mean=${fmt(row.route_elapsed_ms.mean)}ms role_minus_route_mean=${fmt(row.role_minus_route_ms.mean)}ms calls_mean=${fmt(row.calls.mean)} matched=${row.matched_roles.join('+') || 'none'}`)
+    .join('\n')
   const roleFocus = report.role_focus
     .map((row, index) => `${index + 1}. ${row.role} total_mean=${fmt(row.total_mean_ms)}ms prefill=${fmt(row.stages.prefill.mean)}ms first_token=${fmt(row.stages.first_token.mean)}ms generation=${fmt(row.stages.generation.mean)}ms`)
     .join('\n')
@@ -651,6 +748,8 @@ function humanSummary(report) {
     projectionDenials || '(none)',
     'top_layer_role_hotspots:',
     layerHotspots,
+    'top_stage_route_role_gaps:',
+    stageRouteGaps || '(none)',
     'top_layer_route_role_gaps:',
     layerRouteGaps || '(none)',
     'role_focus_logits_attention:',
@@ -729,5 +828,5 @@ function fmt(value) {
 }
 
 function usage() {
-  return `Usage: node scripts/summarize-same-host-stream-timing.mjs --input same-host.json [--out summary.json]\n\nSummarizes Camelid same-host streaming diagnostics, first-byte vs backend generate/first-content gaps, backend first-content residuals, role timing hot spots, per-layer role hot spots, layer route-vs-role gaps, focused logits/attention role buckets, generic Q8 projection routes, and Q8 scheduler work by role.`
+  return `Usage: node scripts/summarize-same-host-stream-timing.mjs --input same-host.json [--out summary.json]\n\nSummarizes Camelid same-host streaming diagnostics, first-byte vs backend generate/first-content gaps, backend first-content residuals, role timing hot spots, per-stage and per-layer route-vs-role gaps, per-layer role hot spots, focused logits/attention role buckets, generic Q8 projection routes, and Q8 scheduler work by role.`
 }
