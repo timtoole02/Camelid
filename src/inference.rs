@@ -10263,6 +10263,11 @@ fn x86_q8_kernel_avx2_enabled_from_env() -> bool {
     )
 }
 
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+fn x86_q8_kernel_avx2_enabled() -> bool {
+    false
+}
+
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn x86_q8_packed_rows4_avx2_dot_enabled() -> bool {
     #[cfg(test)]

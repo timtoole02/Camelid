@@ -1,0 +1,15 @@
++ bash scripts/check-public-scrub.sh
++ node scripts/audit-evidence-bundle-privacy.mjs --strict
+{
+  "schema": "camelid.evidence_bundle_privacy_audit.v1",
+  "generated_at": "2026-05-20T03:19:58.939Z",
+  "root": "qa/evidence-bundles",
+  "strict": true,
+  "finding_count": 0,
+  "bundle_count_with_findings": 0,
+  "bundles": []
+}
++ node scripts/check-public-evidence-claims.mjs
+public evidence claim check passed: 96 manifest(s), 49 summary file(s)
++ node scripts/test-readme-screenshot.mjs
+README screenshot guard passed

@@ -1,0 +1,19 @@
+git status --short --branch
+git rev-parse --abbrev-ref HEAD
+git rev-parse HEAD
+git diff --check
+cargo check --bin camelid
+cargo run -- serve --addr 127.0.0.1:8181
+bash scripts/check-public-scrub.sh
+node scripts/audit-evidence-bundle-privacy.mjs --strict
+node scripts/check-public-evidence-claims.mjs
+node scripts/test-readme-screenshot.mjs
+cd frontend && npm ci
+cd frontend && npm run build
+cd frontend && npm run smoke:model-state
+cd frontend && npm run smoke:3b-closure
+cd frontend && npm run smoke:integration
+cd frontend && npm run smoke:ui
+cd frontend && npm run smoke:streaming
+cd frontend && npm run smoke
+bash scripts/check-evidence-bundle-checksums.sh

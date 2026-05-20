@@ -1,0 +1,4 @@
+$ cargo run -- serve --addr 127.0.0.1:8181
+   Compiling camelid v0.1.0 ($CAMELID_WORKTREE)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.49s
+     Running `target/debug/camelid serve --addr '127.0.0.1:8181'`

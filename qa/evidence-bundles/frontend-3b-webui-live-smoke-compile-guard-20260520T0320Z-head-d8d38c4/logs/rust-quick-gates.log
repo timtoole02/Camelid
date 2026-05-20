@@ -1,0 +1,5 @@
++ git diff --check
++ cargo check --bin camelid
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.07s
+cargo check --bin camelid passed
++ cargo fmt --all -- --check

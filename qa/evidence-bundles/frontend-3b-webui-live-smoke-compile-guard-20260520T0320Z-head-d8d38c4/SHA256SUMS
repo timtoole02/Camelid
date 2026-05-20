@@ -1,0 +1,11 @@
+9aa33b1f27eb2cf99c647716decb16a72f5e7061ff97832e6e6221b63cd381c5  ./README.md
+7ffc2a58a2be47346c4f7651e11052b0511ab61ee55ebddf98d96ba9b1c1f603  ./commands.txt
+07f68232c2afa0c2d745cbc5323a45e0f6062090ddd4ee8107fb970901ef364b  ./dirty-diff-stat.txt
+88ab503727d451afebd9c0cff5b6467b8db9e66e5d579273f92093c8a31f4a7b  ./git-state.txt
+1c814a5876874110c311e4ff088d4f5d70422e2a32af3e0041595110c6be5237  ./logs/backend-gates.log
+41aa387ff8c3a8ca89f12987a4588cc4bf68ea88212cc8448f03932197db9bed  ./logs/backend-live-server.log
+fa6fc3bdfb87e39c6699f6e32de4f92026fc63a886daec75a82a08bf792be22f  ./logs/frontend-gates.log
+3af8ac034cac300bb0183e619c3b2c27b2972668c2938dba4edc70eb846a43f8  ./logs/live-api-probes.log
+8ad66c2a1d50921c5151447e8e8768300de2079993ebd7124b8c462e5e4922df  ./logs/public-scrub-privacy.log
+c7a5fa7aa678902a7fbf5165e1984c08220d9ba3423c288760d36208fbd6659e  ./logs/rust-quick-gates.log
+8ac5f78caed4182f7db5e32c5cb2c6fe360a503c12d89942154eec3a403125da  ./retained-slice.diff
