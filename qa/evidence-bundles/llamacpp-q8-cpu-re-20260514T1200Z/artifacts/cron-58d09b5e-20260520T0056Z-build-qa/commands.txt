@@ -1,0 +1,5 @@
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+ssh -o IdentitiesOnly=yes -i /Users/timtoole/Documents/cert/ubuntu.pem ubuntu@16.146.143.184 <remote ubuntu clone+fmt+clippy+test>
+ssh -o IdentitiesOnly=yes -i /Users/timtoole/Documents/cert/ubuntu.pem ubuntu@16.146.143.184 <remote ubuntu PATH=~/.cargo/bin clone+fmt+clippy+test rerun>

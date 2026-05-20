@@ -1,0 +1,8 @@
+Imported remote Ubuntu rerun evidence from /home/ubuntu/work/camelid-buildqa-58d09b5e-20260520T0056Z-ci/qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T0056Z-ubuntu-ci-rerun
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T0056Z-build-qa/remote/SHA256SUMS
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T0056Z-build-qa/remote/commands.txt
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T0056Z-build-qa/remote/logs/cargo-clippy.log
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T0056Z-build-qa/remote/logs/cargo-fmt-check.log
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T0056Z-build-qa/remote/logs/cargo-test.log
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T0056Z-build-qa/remote/logs/repo-state-after.log
+qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260520T0056Z-build-qa/remote/logs/repo-state-before.log
