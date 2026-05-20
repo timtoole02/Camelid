@@ -1,4 +1,5 @@
-import { capabilityStatusTone, displayCapabilityCopy, displayCapabilityId, findCompatibilityHint, formatCapabilityStatus, frontendSupportContractCopy, guardedCapabilityCopy, isExactCompatibilityHint, isGuardedCapabilityStatus, isSupportedCapabilityStatus } from '../lib/capabilities'
+import { capabilityStatusTone, displayCapabilityCopy, displayCapabilityId, exactRowSupportLanes, findCompatibilityHint, formatCapabilityStatus, frontendSupportContractCopy, guardedCapabilityCopy, isExactCompatibilityHint, isGuardedCapabilityStatus, isSupportedCapabilityStatus } from '../lib/capabilities'
+import { getChatGateState } from '../lib/chatGate'
 import { describeModelState, getRuntimeRequestModelId } from '../lib/modelState'
 
 function runtimeReadinessLabel(runtime) {
@@ -18,8 +19,36 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
   const apiFeatures = capabilities?.api_features || []
   const supportedFeatures = apiFeatures.filter((feature) => isSupportedCapabilityStatus(feature.status))
   const unsupportedFeatures = apiFeatures.filter((feature) => isGuardedCapabilityStatus(feature.status))
+  const selectedChatGate = getChatGateState(capabilities, selectedModel, runtime)
   const selectedCompatibilityHint = findCompatibilityHint(capabilities, selectedModel)
   const selectedCompatibilityTarget = isExactCompatibilityHint(selectedCompatibilityHint) ? selectedCompatibilityHint.target : null
+  const selectedSupportLanes = exactRowSupportLanes(selectedCompatibilityTarget, apiFeatures)
+  const selectedExactRowReady = selectedChatGate.chatUnlocked
+  const endpointReadinessLabel = selectedExactRowReady
+    ? 'Selected exact-row local /v1 ready'
+    : selectedChatGate.runtimeReady
+      ? 'Runtime ready, support gated'
+      : runtime?.generation_ready
+        ? 'Different loaded model or exact row required'
+        : runtime?.loaded_now
+          ? 'Loaded, not generation-ready'
+          : 'Load a supported exact row'
+  const chatCompletionsCopy = selectedExactRowReady
+    ? 'Runs now for this selected GGUF because loaded_now=true, generation_ready=true, active_model_id matches, and the exact /api/capabilities row is supported.'
+    : selectedCompatibilityTarget
+      ? 'Blocked for UX chat until loaded_now=true, generation_ready=true, active_model_id matches, and this exact row is supported.'
+      : 'Blocked for UX chat until a selected model matches an exact supported COMPATIBILITY.md row and runtime readiness is green.'
+  const curlExample = selectedExactRowReady
+    ? `# Selected exact row is runtime-ready now\ncurl ${runtime?.api_base}/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "${modelId}",
+    "messages": [{"role": "user", "content": "Hello from Camelid"}],
+    "temperature": 0
+  }'`
+    : `# Blocked for UX chat until selected exact row evidence and runtime readiness both match
+# loaded_now=${runtime?.loaded_now ? 'true' : 'false'} generation_ready=${runtime?.generation_ready ? 'true' : 'false'} active_model_id=${runtime?.active_model_id || 'none'}
+# selected_exact_row=${selectedCompatibilityTarget?.id || 'none'} support_gate=${selectedChatGate.label}`
   const exactRowQuantEvidence = compatibilityTargets.length
     ? compatibilityTargets.map((target) => `${target.id}: ${target.quantization} (${formatCapabilityStatus(target.status)})`).join(' · ')
     : 'No exact compatibility rows advertised.'
@@ -55,6 +84,7 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
             <div className="runtime-stat"><span>Local engine</span><strong>{runtime?.engine || 'Unknown'}</strong></div>
             <div className="runtime-stat"><span>Loaded model</span><strong>{runtime?.loaded_now ? runtime?.active_model_id : 'Nothing loaded'}</strong></div>
             <div className="runtime-stat"><span>Generation ready</span><strong>{runtime?.generation_ready ? 'Yes' : 'No'}</strong></div>
+            <div className="runtime-stat"><span>Selected exact-row gate</span><strong>{selectedExactRowReady ? 'Ready for chat/API' : selectedChatGate.runtimeReady ? 'Runtime ready; support gated' : selectedChatGate.label}</strong></div>
             <div className="runtime-stat"><span>Acceleration</span><strong>CPU path today; optimized kernels/GPU are not wired yet</strong></div>
             <div className="runtime-stat"><span>Next chat selection</span><strong>{selectedModelName}</strong></div>
             <div className="runtime-stat"><span>API base</span><strong>{apiBase}</strong></div>
@@ -74,7 +104,7 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
             <div className="activity-item">Saved memory remains on-device and can be recalled in later chats.</div>
             <div className="activity-item">Camelid is using the local CPU generation path today; GPU acceleration remains future work.</div>
             <div className="activity-item">Current next-chat model state: {describeModelState(selectedModel)}</div>
-            <div className="activity-item">Chat stays blocked until Camelid reports generation_ready for the selected model; once ready, chat runs until EOS, an explicit request limit, or the backend context window.</div>
+            <div className="activity-item">Chat stays blocked until loaded_now=true, generation_ready=true, active_model_id matches the selected local GGUF, and COMPATIBILITY.md plus /api/capabilities expose an exact supported row.</div>
             <div className="activity-item">The standard /v1-compatible local API is exposed at {apiBase}.</div>
           </div>
         </div>
@@ -87,13 +117,13 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
             <h2>Standard /v1-compatible local API</h2>
             <p className="hero-summary">Use the same local runtime through standard endpoints for apps, scripts, and quick terminal checks.</p>
           </div>
-          <div className={`status-pill ${runtime?.generation_ready ? 'ready' : 'warm'}`}>{runtime?.generation_ready ? 'Local /v1 generation ready' : runtime?.loaded_now ? 'Local /v1 loaded, not ready' : 'Load a model to use generation'}</div>
+          <div className={`status-pill ${selectedExactRowReady ? 'ready' : 'warm'}`}>{endpointReadinessLabel}</div>
         </div>
         <div className="api-grid api-grid-polished">
           <div className="api-card">
             <strong>Chat completions</strong>
             <code>{runtime?.api_base ? `${runtime.api_base}/v1/chat/completions` : 'Unavailable until the local API is running'}</code>
-            <p>Runs only after a local GGUF is loaded and Camelid reports generation_ready=true.</p>
+            <p>{chatCompletionsCopy}</p>
           </div>
           <div className="api-card">
             <strong>Models</strong>
@@ -112,13 +142,7 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
           </div>
           <div className="api-card wide api-card-code">
             <strong>Readiness-gated curl</strong>
-            <pre>{runtime?.api_base ? `# Use only after /v1/health returns generation_ready=true\ncurl ${runtime.api_base}/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "${modelId}",
-    "messages": [{"role": "user", "content": "Hello from Camelid"}],
-    "temperature": 0
-  }'` : 'Start the local runtime to see a ready-to-copy curl example.'}</pre>
+            <pre>{runtime?.api_base ? curlExample : 'Start the local runtime to see an exact-row readiness check.'}</pre>
           </div>
         </div>
       </section>
@@ -154,6 +178,10 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
                 <code>{selectedCompatibilityTarget.id}</code>
                 <p>{formatCapabilityStatus(selectedCompatibilityTarget.status)} · {selectedCompatibilityTarget.family} · {selectedCompatibilityTarget.quantization}</p>
                 <p><b>Readiness gate:</b> {displayCapabilityCopy(selectedCompatibilityTarget.frontend_readiness_gate || 'not advertised')}</p>
+                <p><b>Endpoint/chat gate:</b> {selectedExactRowReady ? 'Ready: runtime readiness and exact-row support both match.' : `${selectedChatGate.label}; loaded_now=${selectedChatGate.runtimeLoaded ? 'true' : 'false'}, generation_ready=${selectedChatGate.runtimeGenerationReady ? 'true' : 'false'}, exact row supported=${selectedChatGate.contractSupported ? 'true' : 'false'}.`}</p>
+                {selectedSupportLanes.map((lane) => (
+                  <p key={lane.key}><b>{lane.key === 'template' ? 'Template/Jinja readiness' : 'Throughput readiness'}:</b> {lane.label}. {displayCapabilityCopy(lane.copy)}</p>
+                ))}
                 <p>{displayCapabilityCopy(selectedCompatibilityTarget.evidence || selectedCompatibilityTarget.next_step || 'No row evidence advertised.')}</p>
               </>
             ) : (
