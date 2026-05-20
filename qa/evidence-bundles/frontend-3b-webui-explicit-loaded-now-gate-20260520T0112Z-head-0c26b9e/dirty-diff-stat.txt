@@ -1,0 +1,3 @@
+ frontend/scripts/frontend-3b-closure-smoke.mjs |  5 ++++
+ frontend/src/hooks/useDashboardData.js         | 35 +++++++++++++-------------
+ 2 files changed, 23 insertions(+), 17 deletions(-)

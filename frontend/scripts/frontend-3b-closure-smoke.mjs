@@ -164,6 +164,11 @@ const topBarSource = readFileSync(new URL('../src/components/TopBar.jsx', import
 
 assert.match(hookSource, /selectedModelChatGate\s*=\s*getChatGateState\(dashboard\?\.capabilities, selectedModel, runtime\)/, 'dashboard selectedModelRunnable must be derived from the shared exact-row chat gate')
 assert.match(hookSource, /selectedModelRunnable\s*=\s*selectedModelChatGate\.chatUnlocked/, 'dashboard must pass chatUnlocked, not runtime readiness alone, into the composer')
+assert.match(hookSource, /loaded_now:\s*Boolean\(health\?\.loaded_now\)/, 'dashboard runtime loaded_now must come from explicit /v1/health loaded_now, not active_model_id fallback')
+assert.match(hookSource, /generation_ready:\s*Boolean\(health\?\.loaded_now && health\?\.generation_ready\)/, 'dashboard runtime generation_ready must stay gated by explicit loaded_now evidence')
+assert.doesNotMatch(hookSource, /loaded_now:\s*Boolean\(health\?\.loaded_now \?\? health\?\.active_model_id\)/, 'active_model_id alone must not synthesize loaded_now for 3B chat readiness')
+assert.match(hookSource, /const loadedNow = active && Boolean\(health\?\.loaded_now\)/, 'merged model rows must expose loaded_now only when the matched backend row explicitly reports loaded_now=true')
+assert.match(hookSource, /const generationReady = loadedNow && Boolean\(health\?\.generation_ready\)/, 'merged model rows must not surface generation readiness when loaded_now is false')
 assert.match(hookSource, /LLAMA32_3B_ACCEPTANCE_FILENAME[\s\S]*normalizeQuantLabel\(quantLabel\) === 'Q8_0'/, 'backend 3B display aliasing must stay exact-filename plus Q8_0 gated')
 assert.match(chatSource, /runnableModels\s*=\s*models\.filter\(\(model\) => getChatGateState\(capabilities, model, runtime\)\.chatUnlocked\)/, 'chat model picker must list only exact-row unlocked models')
 assert.match(chatSource, /canSubmit\s*=\s*Boolean\(composer\.trim\(\)\) && selectedModelRunnable && !generationActive/, 'composer send button must be blocked unless the exact-row chat gate unlocked')

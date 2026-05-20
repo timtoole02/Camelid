@@ -1,0 +1,5 @@
+ M frontend/scripts/frontend-3b-closure-smoke.mjs
+ M frontend/src/hooks/useDashboardData.js
+?? qa/evidence-bundles/frontend-3b-webui-explicit-loaded-now-gate-20260520T0112Z-head-0c26b9e/
+frontend-3b-webui-closure-6e9017a8-20260520T0108Z
+0c26b9e15ebf775069fbdc8072498d3a2ddb89c1

@@ -1,0 +1,8 @@
+dea16e652f3ed2e5d13a78d6fef8edc16a2e019ff2498a9ae9ba542b00f7932d  ./README.md
+c8aa3852939c6cd913f10573bd2785ab6433d370a4236c1a3d567f14fe616b58  ./commands.txt
+6b6032592dcd1beed28a34a339ddeb1cb6ccef177d75e6f2cfc0d014a689c04a  ./dirty-diff-stat.txt
+0d39110f98fb4669d38cf3272cb51d8571d6e83b40bdc196f7ee30483c7328ba  ./git-state.txt
+dc07f1621bae7896d78feae9c67757fe73803c0faeb3ce05fb16fc87badd04d8  ./logs/checksums.log
+994e932664bd04917371f30b541e8771cbce396a1cb67dcf1f2885ac7ba14d8d  ./logs/frontend-gates.log
+136cf03ab2d53ee67aea746b7ca62f4b1c1a1f29e3a6921b1d4f5938eedbe579  ./logs/public-scrub-privacy.log
+395789bdfa4ce7e4db542e1efedfe172008c5c70fee5937b8b04f2f34775772f  ./retained-slice.diff

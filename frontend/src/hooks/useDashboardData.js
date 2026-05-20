@@ -243,20 +243,21 @@ function modelMatchesHealthActive(model, health) {
 
 function modelFromLocalRecord(record, health, currentModel, apiBase) {
   const active = modelMatchesHealthActive(record, health)
-  const generationReady = active && Boolean(health?.generation_ready)
-  const quantLabel = active ? getLoadedModelQuantLabel(currentModel) : record.quant
-  const modelPath = active ? getModelPath(currentModel) || record.model_path : record.model_path
+  const loadedNow = active && Boolean(health?.loaded_now)
+  const generationReady = loadedNow && Boolean(health?.generation_ready)
+  const quantLabel = loadedNow ? getLoadedModelQuantLabel(currentModel) : record.quant
+  const modelPath = loadedNow ? getModelPath(currentModel) || record.model_path : record.model_path
   return {
     ...record,
     name: resolveLoadedModelDisplayName({ fallbackName: record.name, modelPath, quantLabel }),
     status: generationReady ? 'ready' : record.status,
     model_path: modelPath,
     api_base: apiBase,
-    install_error: active ? null : record.install_error,
-    load_error: active ? null : record.load_error,
-    loaded_now: active,
+    install_error: loadedNow ? null : record.install_error,
+    load_error: loadedNow ? null : record.load_error,
+    loaded_now: loadedNow,
     generation_ready: generationReady,
-    camelid: modelReadinessFromCurrent(currentModel, active, generationReady),
+    camelid: modelReadinessFromCurrent(currentModel, loadedNow, generationReady),
   }
 }
 
@@ -264,10 +265,10 @@ function modelFromBackend(item, health, currentModel, localRecord, apiBase) {
   const runtimeModelName = item.id
   const id = localRecord?.id || item.id
   const active = localRecordMatchesBackendId(localRecord, health?.active_model_id) || health?.active_model_id === item.id
-  const generationReady = active && Boolean(health?.generation_ready)
-  const tokenizer = active ? currentModel?.tokenizer : null
-  const quantLabel = active ? getLoadedModelQuantLabel(currentModel) : null
-  const modelPath = active ? getModelPath(currentModel) || localRecord?.model_path || '' : localRecord?.model_path || ''
+  const loadedNow = active && Boolean(health?.loaded_now)
+  const generationReady = loadedNow && Boolean(health?.generation_ready)
+  const quantLabel = loadedNow ? getLoadedModelQuantLabel(currentModel) : null
+  const modelPath = loadedNow ? getModelPath(currentModel) || localRecord?.model_path || '' : localRecord?.model_path || ''
   const fallbackName = localRecord?.name || item.name || item.id
 
   return {
@@ -283,13 +284,13 @@ function modelFromBackend(item, health, currentModel, localRecord, apiBase) {
     size_gb: localRecord?.size_gb || null,
     api_base: apiBase,
     api_key_configured: false,
-    install_error: active ? null : localRecord?.install_error || null,
-    load_error: active ? null : localRecord?.load_error || null,
+    install_error: loadedNow ? null : localRecord?.install_error || null,
+    load_error: loadedNow ? null : localRecord?.load_error || null,
     last_load_attempt_at: localRecord?.last_load_attempt_at || null,
     last_loaded_at: localRecord?.last_loaded_at || null,
-    loaded_now: active,
+    loaded_now: loadedNow,
     generation_ready: generationReady,
-    camelid: modelReadinessFromCurrent(currentModel, active, generationReady),
+    camelid: modelReadinessFromCurrent(currentModel, loadedNow, generationReady),
   }
 }
 
@@ -379,9 +380,9 @@ function makeDashboard({ health, models, currentModel, capabilities, conversatio
     models,
     runtime: {
       engine: normalizeEngineName(health?.engine),
-      loaded_now: Boolean(health?.loaded_now ?? health?.active_model_id),
+      loaded_now: Boolean(health?.loaded_now),
       active_model_id: health?.active_model_id || null,
-      generation_ready: Boolean(health?.generation_ready),
+      generation_ready: Boolean(health?.loaded_now && health?.generation_ready),
       status: health?.ok ? 'online' : 'offline',
       api_base: apiBase,
       current_model: currentModel || null,
