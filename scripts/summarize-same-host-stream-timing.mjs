@@ -375,6 +375,7 @@ function summarizeProjectionLayerRoutes(runs) {
     const elapsedUs = stats(samples.map((sample) => sample.elapsed_us))
     return {
       key: routeName,
+      stage: first.stage ?? null,
       layer_index: finite(first.layer_index),
       role: first.role ?? null,
       route: first.route ?? null,
@@ -466,10 +467,12 @@ function summarizeLayerRouteRoleGaps(runs) {
       const layerIndex = finite(route?.layer_index)
       const routeElapsedUs = finite(route?.elapsed_us)
       const routeRole = typeof route?.role === 'string' ? route.role : null
+      const routeStage = typeof route?.stage === 'string' ? route.stage : null
       if (layerIndex === null || routeElapsedUs === null || !routeRole) continue
       const matchedRoles = hotspotRolesForProjectionRole(routeRole)
       const routeElapsedMs = routeElapsedUs / 1000
       for (const stage of ['prefill', 'first_token', 'generation']) {
+        if (routeStage && routeStage !== 'unknown' && routeStage !== stage) continue
         const matched = hotspots.filter((entry) => (
           entry.stage === stage
           && entry.layer_index === layerIndex
@@ -484,6 +487,7 @@ function summarizeLayerRouteRoleGaps(runs) {
             stage,
             layer_index: layerIndex,
             projection_role: routeRole,
+            route_stage: routeStage,
             route: route.route ?? null,
             route_key: routeKey,
             matched_roles: new Set(),
@@ -506,6 +510,7 @@ function summarizeLayerRouteRoleGaps(runs) {
     stage: group.stage,
     layer_index: group.layer_index,
     projection_role: group.projection_role,
+    route_stage: group.route_stage,
     route: group.route,
     route_key: group.route_key,
     matched_roles: [...group.matched_roles].sort(),

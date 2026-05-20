@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     env,
     fs::File,
@@ -1538,6 +1538,7 @@ pub struct LlamaQ8OutputProjectionRouteTelemetry {
 
 #[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
 pub struct LlamaQ8OutputProjectionLayerRouteTelemetry {
+    pub stage: String,
     pub layer_index: usize,
     pub role: String,
     pub route: String,
@@ -1607,6 +1608,22 @@ static Q8_SCHED_PROJECTION_ROUTE_DENIALS: OnceLock<
 > = OnceLock::new();
 #[cfg(not(test))]
 static Q8_SCHED_TELEMETRY_ENABLED: OnceLock<bool> = OnceLock::new();
+thread_local! {
+    static Q8_SCHED_STAGE: Cell<&'static str> = const { Cell::new("unknown") };
+}
+
+fn q8_schedule_current_stage() -> &'static str {
+    Q8_SCHED_STAGE.with(Cell::get)
+}
+
+fn with_q8_schedule_stage<T>(stage: &'static str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    Q8_SCHED_STAGE.with(|slot| {
+        let previous = slot.replace(stage);
+        let result = f();
+        slot.set(previous);
+        result
+    })
+}
 
 pub fn q8_schedule_telemetry_enabled() -> bool {
     #[cfg(test)]
@@ -1935,7 +1952,8 @@ fn record_q8_schedule_output_projection_route_call(
     else {
         return;
     };
-    let key = format!("layer_{layer_index}.{role}.{route}");
+    let stage = q8_schedule_current_stage();
+    let key = format!("{stage}.layer_{layer_index}.{role}.{route}");
     let by_layer_route =
         Q8_SCHED_OUTPUT_PROJECTION_BY_LAYER_ROUTE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut by_layer_route = by_layer_route
@@ -1945,6 +1963,7 @@ fn record_q8_schedule_output_projection_route_call(
         by_layer_route
             .entry(key)
             .or_insert_with(|| LlamaQ8OutputProjectionLayerRouteTelemetry {
+                stage: stage.to_string(),
                 layer_index,
                 role: role.to_string(),
                 route: route.to_string(),
@@ -2371,6 +2390,15 @@ impl LlamaInferenceSession {
         &mut self,
         token_ids: &[u32],
     ) -> Result<LlamaForwardTimings> {
+        with_q8_schedule_stage("prefill", || {
+            self.forward_prefill_chunk_timed_fast_inner(token_ids)
+        })
+    }
+
+    fn forward_prefill_chunk_timed_fast_inner(
+        &mut self,
+        token_ids: &[u32],
+    ) -> Result<LlamaForwardTimings> {
         if token_ids.is_empty() {
             return Ok(LlamaForwardTimings::default());
         }
@@ -2448,15 +2476,17 @@ impl LlamaInferenceSession {
         token_ids: &[u32],
         chunk_tokens: usize,
     ) -> Result<LlamaForwardTimings> {
-        let forward_passes = if token_ids.is_empty() {
-            0
-        } else {
-            token_ids.len().div_ceil(chunk_tokens)
-        };
-        let q8_file_cache_capacity =
-            prefill_layer_major_q8_file_cache_capacity_override(&self.weights, forward_passes);
-        with_q8_file_cache_capacity_override(q8_file_cache_capacity, || {
-            self.forward_prefill_layer_major_timed_fast_inner(token_ids, chunk_tokens)
+        with_q8_schedule_stage("prefill", || {
+            let forward_passes = if token_ids.is_empty() {
+                0
+            } else {
+                token_ids.len().div_ceil(chunk_tokens)
+            };
+            let q8_file_cache_capacity =
+                prefill_layer_major_q8_file_cache_capacity_override(&self.weights, forward_passes);
+            with_q8_file_cache_capacity_override(q8_file_cache_capacity, || {
+                self.forward_prefill_layer_major_timed_fast_inner(token_ids, chunk_tokens)
+            })
         })
     }
 
@@ -2840,15 +2870,23 @@ impl LlamaInferenceSession {
         } else {
             for token_id in &token_ids[..prefill_count] {
                 add_q8_schedule_counter(&Q8_SCHED_PREFILL_SINGLE_TOKEN_FALLBACKS, 1);
-                let timed = self.forward_single_token_timed_internal(*token_id, false, false)?;
+                let timed = with_q8_schedule_stage("prefill", || {
+                    self.forward_single_token_timed_internal(*token_id, false, false)
+                })?;
                 timings.add_assign(&timed.timings);
                 prefill_timings.add_assign(&timed.timings);
             }
         }
 
         let last_token_id = *token_ids.last().expect("non-empty token_ids checked above");
-        let timed =
-            self.forward_single_token_timed_internal(last_token_id, collect_diagnostics, true)?;
+        let last_token_stage = if prefill_count > 0 || self.kv_cache.position == 0 {
+            "first_token"
+        } else {
+            "generation"
+        };
+        let timed = with_q8_schedule_stage(last_token_stage, || {
+            self.forward_single_token_timed_internal(last_token_id, collect_diagnostics, true)
+        })?;
         timings.add_assign(&timed.timings);
         first_token_timings.add_assign(&timed.timings);
         if let Some(step_diagnostics) = timed.diagnostics {
@@ -17952,15 +17990,19 @@ mod tests {
         );
         assert_eq!(q8_schedule_layer_index_for_projection_name("logits"), None);
 
-        record_q8_schedule_output_projection_route_call(
-            "ffn_down",
-            "mac_decode_consumer",
-            Some("layer_21_ffn_down"),
-            1,
-            8192,
-            3072,
-            12_345,
-        );
+        with_q8_schedule_stage("generation", || {
+            record_q8_schedule_output_projection_route_call(
+                "ffn_down",
+                "mac_decode_consumer",
+                Some("layer_21_ffn_down"),
+                1,
+                8192,
+                3072,
+                12_345,
+            );
+            Ok(())
+        })
+        .unwrap();
         record_q8_schedule_output_projection_route_call(
             "logits",
             "q8_0_retained_blocks",
@@ -17980,8 +18022,9 @@ mod tests {
             .contains_key("ffn_down.mac_decode_consumer"));
         let layer_route = telemetry
             .output_projection_by_layer_route
-            .get("layer_21.ffn_down.mac_decode_consumer")
+            .get("generation.layer_21.ffn_down.mac_decode_consumer")
             .expect("layer route telemetry");
+        assert_eq!(layer_route.stage, "generation");
         assert_eq!(layer_route.layer_index, 21);
         assert_eq!(layer_route.calls, 1);
         assert_eq!(layer_route.elapsed_us, 12_345);
@@ -18083,7 +18126,7 @@ mod tests {
             .contains_key("ffn_down.x86_vnni_decode_consumer"));
         assert!(telemetry
             .output_projection_by_layer_route
-            .contains_key("layer_7.ffn_down.x86_vnni_decode_consumer"));
+            .contains_key("unknown.layer_7.ffn_down.x86_vnni_decode_consumer"));
         reset_q8_schedule_telemetry();
         std::env::remove_var(Q8_SCHEDULE_TELEMETRY_ENV);
         std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE");
