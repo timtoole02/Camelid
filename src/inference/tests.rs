@@ -6920,6 +6920,84 @@ fn q8_packed_rows4_matmul_projection_chunked_prefill_matches_manual_output() {
 }
 
 #[test]
+fn q8_packed_rows4_gate_up_fused_prefill_matches_separate_pair_activation() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+
+    let rows = 6;
+    let output_rows = 128;
+    let blocks_per_row = 3;
+    let input_width = blocks_per_row * Q8_0_BLOCK_VALUES;
+    let gate_blocks: Vec<Q8_0Block> = (0..output_rows * blocks_per_row)
+        .map(|block_idx| Q8_0Block {
+            scale: 0.0234375 + (block_idx % 19) as f32 * 0.001953125,
+            quants: std::array::from_fn(|idx| {
+                ((block_idx as i32 * 5 + idx as i32 * 7) % 83 - 41) as i8
+            }),
+        })
+        .collect();
+    let up_blocks: Vec<Q8_0Block> = (0..output_rows * blocks_per_row)
+        .map(|block_idx| Q8_0Block {
+            scale: 0.03125 + (block_idx % 17) as f32 * 0.001953125,
+            quants: std::array::from_fn(|idx| {
+                ((block_idx as i32 * 11 + idx as i32 * 3) % 79 - 39) as i8
+            }),
+        })
+        .collect();
+    let gate_packed = Q8_0PackedRows4::from_rows(
+        output_rows,
+        blocks_per_row,
+        Q8_0PackedRows4Interleave::I8,
+        &gate_blocks,
+    )
+    .unwrap();
+    let up_packed = Q8_0PackedRows4::from_rows(
+        output_rows,
+        blocks_per_row,
+        Q8_0PackedRows4Interleave::I8,
+        &up_blocks,
+    )
+    .unwrap();
+    let input = CpuTensor::from_f32(
+        "gate_up_fused_prefill_input",
+        vec![rows, input_width],
+        (0..rows * input_width)
+            .map(|idx| ((idx % 43) as f32 - 21.0) * 0.0390625)
+            .collect(),
+    )
+    .unwrap();
+    let quantized_inputs = q8_0_quantized_matmul_input_rows(&input, blocks_per_row).unwrap();
+    let (mut gate, up) = q8_0_packed_rows4_matmul_projection_pair_from_quantized(
+        rows,
+        &gate_packed,
+        &up_packed,
+        output_rows,
+        output_rows,
+        "gate",
+        "up",
+        &quantized_inputs,
+    )
+    .unwrap();
+    for (gate_value, up_value) in gate.data.iter_mut().zip(up.data) {
+        *gate_value = apply_ffn_gate_up_order(*gate_value, up_value, FfnGateUpOrder::GateUp);
+    }
+
+    let fused = q8_0_packed_rows4_matmul_projection_pair_activated_from_quantized(
+        rows,
+        &gate_packed,
+        &up_packed,
+        output_rows,
+        "fused",
+        FfnGateUpOrder::GateUp,
+        &quantized_inputs,
+    )
+    .unwrap();
+
+    assert_eq!(fused.shape.dims, vec![rows, output_rows]);
+    assert_eq!(fused.data, gate.data);
+}
+
+#[test]
 fn q8_packed_rows4_parallel_input_quantize_matches_serial() {
     let _env_guard = env_lock();
     clear_dense_diagnostic_env();
