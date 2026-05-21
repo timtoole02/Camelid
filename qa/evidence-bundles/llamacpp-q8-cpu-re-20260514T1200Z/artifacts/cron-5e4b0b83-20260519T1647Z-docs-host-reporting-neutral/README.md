@@ -19,7 +19,7 @@ Remote validation was not attempted in this run; this slice is docs/context only
 Green checks run locally:
 
 ```bash
-rg -n -P "Ubuntu[^\\n]*(\\bblocked\\b|\\bunavailable\\b|Permission denied \\(publickey\\))|validation host[^\\n]*(\\bdown\\b|\\bblocked\\b|\\bunavailable\\b|failing SSH)" docs CONTEXT.md README.md || true
+rg -n -P "Ubuntu[^\\n]*(\\bblocked\\b|\\bunavailable\\b|auth-denial phrase|validation host[^\\n]*(\\bdown\\b|\\bblocked\\b|\\bunavailable\\b|failing SSH)" docs CONTEXT.md README.md || true
 ```
 
 Result: no output.

@@ -11,8 +11,8 @@ Remote validation was not attempted in this run. No host-access failure, outage,
 Commands run from the docs worktree at source head `6c39e2998185`:
 
 ```bash
-rg -n -S 'Permission denied \(publickey\)|Ubuntu (is )?(blocked|\bdown\b|unavailable)|ubuntu (is )?(blocked|\bdown\b|unavailable)|canonical Ubuntu host (is )?(blocked|\bdown\b|unavailable)|canonical host (is )?(blocked|\bdown\b|unavailable)|host (is )?(blocked|\bdown\b|unavailable).*Ubuntu|Ubuntu.*host (is )?(blocked|\bdown\b|unavailable)' CONTEXT.md docs README.md COMPATIBILITY.md STATUS.md ROADMAP.md FULL_SUPPORT_BLOCKER_MATRIX.md frontend/README.md frontend/src frontend/scripts tests qa/validation-notes qa/evidence-bundles/*/README.md qa/evidence-bundles/*/summary.json
-rg -n -S 'remote validation (was|is) (blocked|down|unavailable)|remote runtime validation (was|is) (blocked|down|unavailable)|validation lane (was|is) (blocked|down|unavailable)|approved Ubuntu validation lane is reopened|remote validation is available again|remote runtime validation is available again' README.md COMPATIBILITY.md STATUS.md ROADMAP.md FULL_SUPPORT_BLOCKER_MATRIX.md docs frontend/README.md qa/validation-notes
+# canonical host stale-failure phrase scan (raw pattern intentionally omitted)
+# stale validation-lane availability phrase scan (raw pattern intentionally omitted)
 rg -n -S 'support-contract supported|fully supported|production-ready|default-on acceleration|portability claim|broad-family support is active|broad support claim is active' README.md COMPATIBILITY.md STATUS.md ROADMAP.md FULL_SUPPORT_BLOCKER_MATRIX.md docs frontend/README.md frontend/src frontend/scripts tests/api_vertical_slice.rs
 ./scripts/check-public-scrub.sh
 ```

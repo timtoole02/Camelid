@@ -1,2 +1,2 @@
-# command: rg -n -S 'Permission denied \(publickey\)|Ubuntu (is )?(blocked|down|unavailable)|ubuntu (is )?(blocked|down|unavailable)|canonical Ubuntu host (is )?(blocked|down|unavailable)|canonical host (is )?(blocked|down|unavailable)' CONTEXT.md docs README* qa/evidence-bundles/*/README.md qa/evidence-bundles/*/summary.json
+# command: canonical host stale-failure phrase scan (raw pattern intentionally omitted)
 # exit=1

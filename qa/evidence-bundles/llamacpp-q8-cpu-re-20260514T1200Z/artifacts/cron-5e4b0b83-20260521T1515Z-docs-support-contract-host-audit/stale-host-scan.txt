@@ -1,0 +1,5 @@
+Command: canonical host stale-failure phrase scan (pattern constructed at runtime; raw pattern intentionally omitted)
+
+Exit: 1
+Output:
+(no matches)

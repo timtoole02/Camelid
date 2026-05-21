@@ -1,0 +1,5 @@
+Command: stale validation-lane availability phrase scan (raw pattern intentionally omitted)
+
+Exit: 1
+Output:
+(no matches)

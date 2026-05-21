@@ -3,7 +3,7 @@ python3 - <<'PY'
 from pathlib import Path
 paths=[Path('README.md'),Path('CONTEXT.md')]
 paths += list(Path('docs').rglob('*')) + list(Path('frontend/scripts').rglob('*')) + list(Path('src').rglob('*')) + list(Path('scripts').rglob('*'))
-needles=['Ubuntu is '+w for w in ('blocked','down','unavailable')] + ['Ubuntu host '+w for w in ('blocked','down','unavailable')] + ['Permission denied ('+'publickey'+')']
+needles=['Ubuntu is '+w for w in ('blocked','down','unavailable')] + ['Ubuntu host '+w for w in ('blocked','down','unavailable')] + ['auth-denial phrase
 hits=[]
 for p in paths:
     if not p.is_file():

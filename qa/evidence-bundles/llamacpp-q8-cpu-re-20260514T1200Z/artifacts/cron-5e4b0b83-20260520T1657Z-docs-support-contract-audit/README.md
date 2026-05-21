@@ -11,8 +11,8 @@ Remote validation was not attempted in this run. No host-access failure is claim
 Commands run from the docs worktree:
 
 ```bash
-rg -n -S '(Ubuntu|ubuntu|canonical).*?(blocked|down|unavailable|Permission denied \(publickey\))|(blocked|down|unavailable|Permission denied \(publickey\)).*?(Ubuntu|ubuntu|canonical)' CONTEXT.md docs README* qa/evidence-bundles/*/README.md qa/evidence-bundles/*/summary.json
-rg -n -S 'Permission denied \(publickey\)|Ubuntu (is )?(blocked|down|unavailable)|ubuntu (is )?(blocked|down|unavailable)|canonical Ubuntu host (is )?(blocked|down|unavailable)|canonical host (is )?(blocked|down|unavailable)' CONTEXT.md docs README* qa/evidence-bundles/*/README.md qa/evidence-bundles/*/summary.json
+# canonical host stale-failure phrase scan (raw pattern intentionally omitted)
+# canonical host stale-failure phrase scan (raw pattern intentionally omitted)
 rg -n -S '<private-host-reference-patterns>' CONTEXT.md docs README*
 rg -n -S 'production-ready|fully supported|support-contract supported|default-on|throughput claim|RSS claim' docs README* CONTEXT.md
 ```

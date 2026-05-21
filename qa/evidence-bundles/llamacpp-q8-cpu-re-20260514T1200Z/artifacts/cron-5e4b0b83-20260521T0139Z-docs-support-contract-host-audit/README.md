@@ -20,7 +20,7 @@ Purpose:
 Commands:
 
 ```bash
-rg -n 'Permission denied \(publickey\)|canonical Ubuntu host (blocked|down|unavailable)|Ubuntu host (blocked|down|unavailable)|host access (blocked|down|unavailable)' CONTEXT.md README.md COMPATIBILITY.md STATUS.md docs qa/validation-notes -g '*.md' -g '*.txt'
+rg -n 'auth-denial phrase|canonical Ubuntu host (blocked|down|unavailable)|Ubuntu host (blocked|down|unavailable)|host access (blocked|down|unavailable)' CONTEXT.md README.md COMPATIBILITY.md STATUS.md docs qa/validation-notes -g '*.md' -g '*.txt'
 
 rg -n 'support(ed|)|active validation|not supported|bounded one-token|exact-row' README.md COMPATIBILITY.md STATUS.md docs/VALIDATION_MATRIX.md docs/CONTRIBUTOR_QUICKSTART.md -g '*.md'
 

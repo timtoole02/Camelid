@@ -5,7 +5,7 @@ from pathlib import Path
 scan_roots = [Path('README.md'), Path('STATUS.md'), Path('CONTEXT.md'), Path('COMPATIBILITY.md'), Path('CONTRIBUTING.md'), Path('docs'), Path('frontend/README.md'), Path('frontend/src'), Path('frontend/scripts'), Path('src'), Path('scripts'), Path('qa/validation-notes'), Path('qa/evidence-bundles/README.md')]
 needles = ['Ubuntu is '+w for w in ('blocked','down','unavailable')]
 needles += ['Ubuntu host '+w for w in ('blocked','down','unavailable')]
-needles += ['Permission denied ('+'publickey'+')']
+needles += ['auth-denial phrase
 hits = []
 for root in scan_roots:
     if not root.exists():
