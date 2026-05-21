@@ -701,6 +701,7 @@ struct Q8RuntimeFlags {
     ffn_down_gemm4_prefill: bool,
     ffn_down_gemm4_row_group_schedule: bool,
     ffn_down_gemm4_avx2: bool,
+    ffn_down_amx_prefill: bool,
     ffn_down_single_owner: bool,
     ffn_down_vnni_decode: bool,
     metal: bool,
@@ -777,6 +778,9 @@ impl Q8RuntimeFlags {
             ),
             ffn_down_gemm4_avx2: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_DOWN_GEMM4_AVX2",
+            ),
+            ffn_down_amx_prefill: q8_0_env_flag_enabled_default_off(
+                "CAMELID_X86_Q8_FFN_DOWN_AMX_PREFILL",
             ),
             ffn_down_single_owner: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_DOWN_SINGLE_OWNER",
@@ -8433,7 +8437,9 @@ fn resolve_x86_q8_ffn_down_route<'a>(
                 || x86_q8_ffn_down_decode_reference_gate_enabled()
         }
         X86Q8FfnDownRouteKind::PackedRows4Matmul => runtime_plan.q8.ffn_down_packed_rows4_matmul,
-        X86Q8FfnDownRouteKind::Gemm4Prefill => runtime_plan.q8.ffn_down_gemm4_prefill,
+        X86Q8FfnDownRouteKind::Gemm4Prefill => {
+            runtime_plan.q8.ffn_down_gemm4_prefill || runtime_plan.q8.ffn_down_amx_prefill
+        }
         X86Q8FfnDownRouteKind::SingleOwner => runtime_plan.q8.ffn_down_single_owner,
     };
     let route_name = route.telemetry_name();
@@ -9586,6 +9592,107 @@ fn run_q8_0_packed_rows4_prefill_gemm4_kernel(
     }
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn try_q8_0_packed_rows4_amx_prefill_projection(
+    input: &CpuTensor,
+    packed: &Q8_0PackedRows4,
+    output_width: usize,
+    name: &str,
+) -> Result<Option<CpuTensor>> {
+    let rows = input.dim(0)?;
+    let input_width = input.dim(1)?;
+    let blocks_per_row = input_width / Q8_0_BLOCK_VALUES;
+    let Some(amx_blocks) = packed.amx_blocks.as_ref() else {
+        return Ok(None);
+    };
+    if packed.interleave != Q8_0PackedRows4Interleave::I8
+        || packed.rows != output_width
+        || packed.blocks_per_row != blocks_per_row
+        || !output_width.is_multiple_of(16)
+        || rows < 4
+    {
+        return Ok(None);
+    }
+    // SAFETY: FFI call only checks CPU/XSTATE support and does not dereference Rust pointers.
+    if unsafe { camelid_x86_q8_amx_supported() } == 0 {
+        return Ok(None);
+    }
+
+    let packed_rows = rows / 4 * 4;
+    let mut output = vec![0.0_f32; rows * output_width];
+    Q8_0_PREFILL_PACKED_INPUTS.with(|cell| {
+        let mut packed_inputs = cell.borrow_mut();
+        packed_inputs.clear();
+        quantize_pack_q8_0_rows4_i8_direct_into(
+            &input.data[..packed_rows * input_width],
+            packed_rows,
+            input_width,
+            blocks_per_row,
+            &mut packed_inputs,
+        );
+
+        let output_tiles = output_width / 16;
+        for row_chunk_start in (0..packed_rows).step_by(16) {
+            let chunk_rows = (packed_rows - row_chunk_start).min(16);
+            let input_group_start = (row_chunk_start / 4) * blocks_per_row;
+            let input_ptr = packed_inputs[input_group_start..].as_ptr();
+            for output_tile in 0..output_tiles {
+                let weight_start = output_tile * blocks_per_row;
+                let output_start = row_chunk_start * output_width + output_tile * 16;
+                // SAFETY: `packed_inputs` contains complete rows4/I8 blocks for this row
+                // chunk, `amx_blocks` contains one 16-row AMX tile per output tile/block,
+                // and `output_start` points at a 16-wide tile in each row-strided output.
+                unsafe {
+                    camelid_q8_0_amx_compute_tile16(
+                        input_ptr,
+                        blocks_per_row,
+                        chunk_rows,
+                        amx_blocks[weight_start..].as_ptr(),
+                        output[output_start..].as_mut_ptr(),
+                        output_width,
+                    );
+                }
+            }
+        }
+        packed_inputs.clear();
+        cap_q8_0_file_reader_scratch(&mut packed_inputs, 0);
+    });
+
+    let tail_rows = rows - packed_rows;
+    if tail_rows > 0 {
+        with_q8_0_file_reader_quantized_inputs(|quantized_inputs| {
+            quantized_inputs.clear();
+            quantized_inputs.reserve(tail_rows * blocks_per_row);
+            for row in input.data[packed_rows * input_width..].chunks_exact(input_width) {
+                quantize_q8_0_blocks_into(row, quantized_inputs);
+            }
+            for tail_row in 0..tail_rows {
+                let input_start = tail_row * blocks_per_row;
+                let output_start = (packed_rows + tail_row) * output_width;
+                accumulate_q8_0_packed_rows4_dot_quantized_cpu(
+                    &quantized_inputs[input_start..input_start + blocks_per_row],
+                    packed,
+                    Q8_0PackedRows4Interleave::I8,
+                    &mut output[output_start..output_start + output_width],
+                );
+            }
+            Ok(())
+        })?;
+    }
+
+    CpuTensor::from_f32(name, vec![rows, output_width], output).map(Some)
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+fn try_q8_0_packed_rows4_amx_prefill_projection(
+    _input: &CpuTensor,
+    _packed: &Q8_0PackedRows4,
+    _output_width: usize,
+    _name: &str,
+) -> Result<Option<CpuTensor>> {
+    Ok(None)
+}
+
 fn q8_0_packed_rows4_gemm4_projection_with_row_group_schedule(
     input: &CpuTensor,
     packed: &Q8_0PackedRows4,
@@ -10238,18 +10345,47 @@ fn try_x86_q8_ffn_down_gemm4_prefill_path(
 
     let rows = input.dim(0)?;
     let telemetry_started = q8_schedule_telemetry_enabled().then(Instant::now);
-    let output = q8_0_packed_rows4_gemm4_projection_with_row_group_schedule(
-        input,
-        route.packed,
-        route.output_width,
-        name,
-        runtime_plan.q8.ffn_down_gemm4_row_group_schedule,
-        runtime_plan.q8.ffn_down_gemm4_avx2,
-    )?;
-    let route_name = if runtime_plan.q8.ffn_down_gemm4_row_group_schedule {
-        "x86_gemm4_prefill_row_group"
+    let (output, route_name) = if runtime_plan.q8.ffn_down_amx_prefill {
+        if let Some(output) = try_q8_0_packed_rows4_amx_prefill_projection(
+            input,
+            route.packed,
+            route.output_width,
+            name,
+        )? {
+            (output, "x86_amx_prefill")
+        } else if !runtime_plan.q8.ffn_down_gemm4_prefill {
+            return Ok(None);
+        } else {
+            let output = q8_0_packed_rows4_gemm4_projection_with_row_group_schedule(
+                input,
+                route.packed,
+                route.output_width,
+                name,
+                runtime_plan.q8.ffn_down_gemm4_row_group_schedule,
+                runtime_plan.q8.ffn_down_gemm4_avx2,
+            )?;
+            let route_name = if runtime_plan.q8.ffn_down_gemm4_row_group_schedule {
+                "x86_gemm4_prefill_row_group"
+            } else {
+                "x86_gemm4_prefill"
+            };
+            (output, route_name)
+        }
     } else {
-        "x86_gemm4_prefill"
+        let output = q8_0_packed_rows4_gemm4_projection_with_row_group_schedule(
+            input,
+            route.packed,
+            route.output_width,
+            name,
+            runtime_plan.q8.ffn_down_gemm4_row_group_schedule,
+            runtime_plan.q8.ffn_down_gemm4_avx2,
+        )?;
+        let route_name = if runtime_plan.q8.ffn_down_gemm4_row_group_schedule {
+            "x86_gemm4_prefill_row_group"
+        } else {
+            "x86_gemm4_prefill"
+        };
+        (output, route_name)
     };
     record_q8_schedule_projection_route_elapsed(
         "ffn_down",
@@ -16580,6 +16716,7 @@ mod tests {
                 ffn_down_gemm4_prefill: false,
                 ffn_down_gemm4_row_group_schedule: false,
                 ffn_down_gemm4_avx2: false,
+                ffn_down_amx_prefill: false,
                 ffn_down_single_owner: false,
                 ffn_down_vnni_decode: false,
                 metal: false,
@@ -17386,6 +17523,7 @@ mod tests {
                 ffn_down_gemm4_prefill: false,
                 ffn_down_gemm4_row_group_schedule: false,
                 ffn_down_gemm4_avx2: false,
+                ffn_down_amx_prefill: false,
                 ffn_down_single_owner: false,
                 ffn_down_vnni_decode: false,
                 metal: false,
@@ -17934,6 +18072,7 @@ mod tests {
                 ffn_down_gemm4_prefill: false,
                 ffn_down_gemm4_row_group_schedule: false,
                 ffn_down_gemm4_avx2: false,
+                ffn_down_amx_prefill: false,
                 ffn_down_single_owner: false,
                 ffn_down_vnni_decode: false,
                 metal: false,
@@ -17971,6 +18110,7 @@ mod tests {
                 ffn_down_gemm4_prefill: false,
                 ffn_down_gemm4_row_group_schedule: false,
                 ffn_down_gemm4_avx2: false,
+                ffn_down_amx_prefill: false,
                 ffn_down_single_owner: false,
                 ffn_down_vnni_decode: false,
                 metal: false,
@@ -18014,6 +18154,7 @@ mod tests {
                 ffn_down_gemm4_prefill: false,
                 ffn_down_gemm4_row_group_schedule: false,
                 ffn_down_gemm4_avx2: false,
+                ffn_down_amx_prefill: false,
                 ffn_down_single_owner: false,
                 ffn_down_vnni_decode: false,
                 metal: false,
@@ -18941,6 +19082,167 @@ mod tests {
 
         assert_eq!(actual.shape.dims, vec![rows, output_width]);
         assert_slice_close_with_tolerance(&actual.data, &expected.data, 5e-4);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn q8_ffn_down_amx_prefill_matches_rows4_matmul_when_supported() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        if unsafe { camelid_x86_q8_amx_supported() } == 0 {
+            return;
+        }
+
+        std::env::set_var("CAMELID_X86_Q8_AMX_REPACK", "on");
+        let (_decode_input, packed_weight, _decode_expected) = runtime_packed_ffn_down_case();
+        let input_width = packed_weight.dim(0).unwrap();
+        let output_width = packed_weight.dim(1).unwrap();
+        let packed = match packed_weight.q8_0_runtime_storage.as_ref() {
+            Some(Q8_0RuntimeStorage::PackedRows4(packed)) => packed,
+            other => panic!("expected runtime-packed rows4 weight, got {other:?}"),
+        };
+        assert!(
+            packed.amx_blocks.is_some(),
+            "explicit AMX repack gate should create AMX tile sidecar"
+        );
+
+        let rows = 20;
+        let input = CpuTensor::from_f32(
+            "ffn_down_amx_prefill_input",
+            vec![rows, input_width],
+            (0..rows * input_width)
+                .map(|idx| {
+                    ((idx % input_width) as f32 - 7.0) * 0.09375
+                        + (idx / input_width) as f32 * 0.03125
+                })
+                .collect(),
+        )
+        .unwrap();
+
+        let mut amx_plan = ffn_down_gemm4_prefill_plan(false);
+        amx_plan.q8.ffn_down_amx_prefill = true;
+        let actual = try_x86_q8_ffn_down_gemm4_prefill_path(
+            &input,
+            &packed_weight,
+            "actual_amx_prefill",
+            "ffn_down",
+            &amx_plan,
+        )
+        .unwrap()
+        .expect("AMX prefill should cover rows4 FFN-down input plus scalar tail");
+        let expected = try_x86_q8_ffn_down_packed_rows4_matmul_path(
+            &input,
+            &packed_weight,
+            "expected_rows4_matmul",
+            "ffn_down",
+            &ffn_down_packed_rows4_matmul_plan(true),
+        )
+        .unwrap()
+        .expect("packed rows4 matmul should cover AMX baseline");
+
+        assert_eq!(actual.shape.dims, vec![rows, output_width]);
+        assert_slice_close_with_tolerance(&actual.data, &expected.data, 5e-4);
+        std::env::remove_var("CAMELID_X86_Q8_AMX_REPACK");
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    #[ignore = "manual x86 Q8 AMX prefill tracer bullet benchmark"]
+    fn q8_ffn_down_amx_prefill_benchmark() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        if unsafe { camelid_x86_q8_amx_supported() } == 0 {
+            println!("amx_supported=0");
+            return;
+        }
+
+        std::env::set_var("CAMELID_X86_Q8_AMX_REPACK", "on");
+        let input_width = Q8_0_BLOCK_VALUES * 8;
+        let output_width = 1024;
+        let blocks_per_row = input_width / Q8_0_BLOCK_VALUES;
+        let row_blocks: Vec<Q8_0Block> = (0..output_width * blocks_per_row)
+            .map(|row| Q8_0Block {
+                scale: 0.03125 + row as f32 * 0.000001,
+                quants: std::array::from_fn(|idx| {
+                    (idx as i8)
+                        .wrapping_mul(7)
+                        .wrapping_add((row as i8).wrapping_mul(3))
+                }),
+            })
+            .collect();
+        let packed_weight = CpuTensor::q8_0_runtime_packed_rows4_linear(
+            "blk.0.ffn_down.weight",
+            TensorShape {
+                dims: vec![input_width, output_width],
+            },
+            Q8_0PackedRows4::from_rows(
+                output_width,
+                blocks_per_row,
+                Q8_0PackedRows4Interleave::I8,
+                &row_blocks,
+            )
+            .unwrap(),
+        );
+        let packed = match packed_weight.q8_0_runtime_storage.as_ref() {
+            Some(Q8_0RuntimeStorage::PackedRows4(packed)) => packed,
+            other => panic!("expected runtime-packed rows4 weight, got {other:?}"),
+        };
+        assert!(packed.amx_blocks.is_some());
+
+        let rows = 16;
+        let input = CpuTensor::from_f32(
+            "ffn_down_amx_bench_input",
+            vec![rows, input_width],
+            (0..rows * input_width)
+                .map(|idx| {
+                    ((idx % input_width) as f32 - 11.0) * 0.0625
+                        + (idx / input_width) as f32 * 0.015625
+                })
+                .collect(),
+        )
+        .unwrap();
+        let iterations = std::env::var("CAMELID_X86_Q8_SCHED_BENCH_ITERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(50);
+
+        let bench = |mut run: Box<dyn FnMut() -> CpuTensor + '_>| {
+            let started = Instant::now();
+            let mut last = None;
+            for _ in 0..iterations {
+                last = Some(run());
+            }
+            let elapsed = started.elapsed().as_micros();
+            (elapsed, last.unwrap())
+        };
+
+        let (rows4_us, rows4) = bench(Box::new(|| {
+            q8_0_packed_rows4_matmul_projection(&input, packed, output_width, "rows4").unwrap()
+        }));
+        let (gemm4_us, gemm4) = bench(Box::new(|| {
+            q8_0_packed_rows4_gemm4_projection_with_row_group_schedule(
+                &input,
+                packed,
+                output_width,
+                "gemm4",
+                false,
+                true,
+            )
+            .unwrap()
+        }));
+        let (amx_us, amx) = bench(Box::new(|| {
+            try_q8_0_packed_rows4_amx_prefill_projection(&input, packed, output_width, "amx")
+                .unwrap()
+                .expect("AMX path should be available")
+        }));
+
+        assert_slice_close_with_tolerance(&gemm4.data, &rows4.data, 5e-4);
+        assert_slice_close_with_tolerance(&amx.data, &rows4.data, 5e-4);
+        println!(
+            "rows={rows} input_width={input_width} output_width={output_width} iterations={iterations} rows4_matmul_us={rows4_us} gemm4_avx2_us={gemm4_us} amx_prefill_us={amx_us}"
+        );
+        std::env::remove_var("CAMELID_X86_Q8_AMX_REPACK");
     }
 
     #[test]
