@@ -9154,11 +9154,7 @@ unsafe fn q8_0_vnni_decode_group64_rawptr_avx2(
             let (ints0, ints1, ints2, ints3) =
                 unsafe { q8_0_vnni_tile16_i32x4_avx2(tile, input_block) };
             let input_scale = _mm_set1_ps(input_block.scale);
-            let mut scales = [0.0_f32; 16];
-            for (dst, scale_bits) in scales.iter_mut().zip(tile.scale_f16.iter().copied()) {
-                *dst = f16_bits_to_f32(scale_bits);
-            }
-            let scales_ptr = scales.as_ptr();
+            let scales_ptr = tile.scale_f32.as_ptr();
             let scale0 = _mm_mul_ps(_mm_loadu_ps(scales_ptr), input_scale);
             let scale1 = _mm_mul_ps(_mm_loadu_ps(unsafe { scales_ptr.add(4) }), input_scale);
             let scale2 = _mm_mul_ps(_mm_loadu_ps(unsafe { scales_ptr.add(8) }), input_scale);
