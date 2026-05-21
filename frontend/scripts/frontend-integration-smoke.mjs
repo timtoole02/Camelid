@@ -117,6 +117,44 @@ try {
   const selectedModelRunnable = getChatGateState(capabilities, selectedModel, readyRuntime).chatUnlocked
   assert.equal(selectedModelRunnable, true, '3B Q8_0 fixture must be end-to-end runnable only when model path, runtime readiness, and exact-row support are all green')
 
+  const quantMissingThreeBModel = {
+    ...selectedModel,
+    quant: null,
+    model_path: '/models/Llama-3.2-3B-Instruct.gguf',
+  }
+  const quantMissingThreeBGate = getChatGateState(capabilities, quantMissingThreeBModel, readyRuntime)
+  assert.equal(quantMissingThreeBGate.runtimeReady, true, '3B runtime readiness should remain visible when the active model lacks Q8_0 evidence')
+  assert.equal(quantMissingThreeBGate.contractSupported, false, '3B exact-row support must not unlock without decoded Q8_0 quant evidence')
+  assert.equal(quantMissingThreeBGate.chatUnlocked, false, '3B WebUI chat must stay blocked when the model-size row matches but quant evidence is missing')
+
+  const quantMissingChatMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
+    selectedConversation: {
+      id: 'conversation-quant-missing',
+      title: 'Quant missing',
+      updated_at: '2026-05-13T04:21:00.000Z',
+      messages: [],
+    },
+    selectedModel: quantMissingThreeBModel,
+    selectedModelId: quantMissingThreeBModel.id,
+    setSelectedModelId: noop,
+    models: [quantMissingThreeBModel],
+    runtime: readyRuntime,
+    capabilities,
+    pendingConversation: null,
+    composer: 'Hello from the 3B row',
+    setComposer: noop,
+    saveToMemory: noop,
+    sendMessage: noop,
+    sending: false,
+    selectedModelRunnable: quantMissingThreeBGate.chatUnlocked,
+    setTab: noop,
+  }))
+
+  assert.match(quantMissingChatMarkup, /Runtime ready, support gated/, '3B chat should show runtime-green state while keeping the support contract blocked when Q8_0 evidence is missing')
+  assert.match(quantMissingChatMarkup, /llama32_3b_instruct_q8_0: quant not verified/, '3B chat support copy should name the exact-row quant-evidence blocker')
+  assert.match(quantMissingChatMarkup, /Exact row unavailable/, '3B capability lanes should stay hidden until exact supported row plus Q8_0 evidence match')
+  assert.match(quantMissingChatMarkup, /disabled="">Send/, '3B composer send button should stay disabled without exact Q8_0 quant evidence even when runtime readiness is green')
+
   const streamingMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
     selectedConversation: {
       id: 'conversation-streaming-code',

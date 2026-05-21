@@ -54,7 +54,7 @@ function splitCapabilityKeys(value) {
   return (value || '').toString().split('/').map(normalizeCapabilityKey).filter(Boolean)
 }
 
-function extractQuantKey(model, catalogItem, subject) {
+function extractQuantKey(model, catalogItem) {
   const explicitLabel = model?.quant || catalogItem?.quant
   const explicitFileType = explicitLabel?.toString().match(/\bfile[_\s-]*type\s*(\d+)\b/i)?.[1]
   const explicit = normalizeCapabilityKey(explicitFileType ? quantLabelFromGgufFileType(explicitFileType) : explicitLabel)
@@ -65,9 +65,7 @@ function extractQuantKey(model, catalogItem, subject) {
   const artifactQuant = normalizeCapabilityKey(artifactMatch?.[1])
   if (artifactQuant) return artifactQuant
 
-  const text = subject || ''
-  const match = text.match(/\b(q\d(?:_k_[ms]|_\d)|bf16|f16|f32)\b/i)
-  return normalizeCapabilityKey(match?.[1])
+  return ''
 }
 
 function targetMatchesQuant(target, quantKey) {
@@ -501,7 +499,7 @@ export function findCompatibilityHint(capabilities, model, catalogItem) {
   if (!subject) return null
   const rows = capabilities?.model_compatibility || []
   const plannedFamilies = capabilities?.planned_model_families || []
-  const quantKey = extractQuantKey(model, catalogItem, subject)
+  const quantKey = extractQuantKey(model, catalogItem)
 
   const findRow = (predicate) => rows.find(predicate) || null
   const findFamily = (predicate) => plannedFamilies.find(predicate) || null
