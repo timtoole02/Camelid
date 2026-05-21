@@ -13329,6 +13329,7 @@ fn q8_0_packed_rows4_block_dot_scalar(
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[allow(clippy::incompatible_msrv)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
 unsafe fn q8_0_packed_4x8_block_avx512vnni_dpbusd(packed: *const i8, input: *const i8) -> [i32; 4] {
     #[cfg(target_arch = "x86")]
@@ -13379,6 +13380,7 @@ unsafe fn q8_0_packed_4x8_block_avx512vnni_dpbusd(packed: *const i8, input: *con
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[allow(clippy::incompatible_msrv)]
 #[target_feature(enable = "avx2,avx512f,avx512bw,avx512vnni")]
 unsafe fn q8_0_packed_4x8_block_avx512vnni_dpwssd(packed: *const i8, input: *const i8) -> [i32; 4] {
     #[cfg(target_arch = "x86")]
