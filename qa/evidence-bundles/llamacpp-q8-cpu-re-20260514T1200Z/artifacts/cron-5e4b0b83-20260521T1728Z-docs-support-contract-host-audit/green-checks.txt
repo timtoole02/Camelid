@@ -1,0 +1,8 @@
+GREEN: public docs/context stale host-status wording scan found no matches.
+GREEN: validation-note stale host-status scan found only support-contract parity-blocker wording, not a host-access claim.
+GREEN: historical validation-host rustfmt wording was neutralized to avoid host-status ambiguity.
+GREEN: support-contract wording scan remained guarded; no row/support/default-on claim was widened.
+GREEN: scripts/check-public-scrub.sh exited 0.
+GREEN: node scripts/check-public-evidence-claims.mjs exited 0.
+GREEN: git diff --check exited 0.
+REMOTE: remote validation was not attempted in this run.

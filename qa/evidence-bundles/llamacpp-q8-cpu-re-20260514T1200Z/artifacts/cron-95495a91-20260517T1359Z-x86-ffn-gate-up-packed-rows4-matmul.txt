@@ -110,7 +110,7 @@ Canonical Ubuntu x86_64 validation:
 - CARGO_TARGET_DIR=/dev/shm/camelid-ffn-gateup-packed-20260517T1351Z-target ~/.cargo/bin/cargo +1.90.0 test resolved_runtime_plan_captures_q8_env_once --lib: PASS
 - CARGO_TARGET_DIR=/dev/shm/camelid-ffn-gateup-packed-20260517T1351Z-target ~/.cargo/bin/cargo +1.90.0 test runtime_profile_defaults_keep_experimental_q8_gates_closed --lib: PASS
 - CARGO_TARGET_DIR=/dev/shm/camelid-ffn-gateup-packed-20260517T1351Z-target ~/.cargo/bin/cargo +1.90.0 test planner_env_apply_clears_stale_x86_q8_decode_consumer_flags --lib: PASS
-- cargo +1.90.0 fmt --check on the validation host was blocked because rustfmt is not installed for toolchain 1.90.0 there; local cargo fmt --all passed.
+- cargo +1.90.0 fmt --check was not run on the validation host because rustfmt is not installed for toolchain 1.90.0 there; local cargo fmt --all passed.
 - tmpfs scratch checkout and target directory were removed after validation.
 
 Claim boundary:
