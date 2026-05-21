@@ -703,6 +703,7 @@ struct Q8RuntimeFlags {
     attention_qkv_packed_rows4_matmul: bool,
     output_packed_rows4_matmul: bool,
     ffn_gate_up_decode_consumer: bool,
+    ffn_gate_up_decode_group_chunking: bool,
     ffn_gate_up_packed_rows4_matmul: bool,
     ffn_gate_up_single_owner: bool,
     ffn_down_decode_consumer: bool,
@@ -767,6 +768,9 @@ impl Q8RuntimeFlags {
                 "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER",
             ) || q8_0_env_flag_enabled_default_off(
                 "CAMELID_MAC_Q8_FFN_GATE_UP_DECODE_CONSUMER",
+            ),
+            ffn_gate_up_decode_group_chunking: q8_0_env_flag_enabled_default_off(
+                "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING",
             ),
             ffn_gate_up_packed_rows4_matmul: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL",
@@ -8172,6 +8176,14 @@ fn x86_q8_attention_qkv_decode_groups_per_chunk() -> usize {
         .unwrap_or(16)
 }
 
+fn x86_q8_ffn_gate_up_decode_groups_per_chunk() -> usize {
+    env::var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUPS_PER_CHUNK")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(16)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum X86Q8AttentionQkvRouteKind {
     Decode,
@@ -8558,12 +8570,13 @@ fn try_x86_q8_ffn_gate_up_decode_consumer_path(
 
     let started = Instant::now();
     let quantized_input = quantize_q8_0_row(&input.data[..input_width]);
-    q8_0_packed_rows4_single_input_projection_pair_into(
+    q8_0_packed_rows4_single_input_projection_pair_into_with_decode_chunking(
         gate_packed,
         up_packed,
         &quantized_input.blocks,
         gate,
         up,
+        runtime_plan.q8.ffn_gate_up_decode_group_chunking,
     )?;
     let total_elapsed = started.elapsed().as_micros();
     record_q8_schedule_output_projection_route_call(
@@ -9566,12 +9579,13 @@ fn q8_0_packed_rows4_single_input_projection_into_with_decode_chunking(
     Ok(())
 }
 
-fn q8_0_packed_rows4_single_input_projection_pair_into(
+fn q8_0_packed_rows4_single_input_projection_pair_into_with_decode_chunking(
     left_packed: &Q8_0PackedRows4,
     right_packed: &Q8_0PackedRows4,
     quantized_input: &[Q8_0Block],
     left_output: &mut [f32],
     right_output: &mut [f32],
+    decode_group_chunking: bool,
 ) -> Result<()> {
     let output_width = left_output.len();
     if right_output.len() != output_width {
@@ -9616,13 +9630,32 @@ fn q8_0_packed_rows4_single_input_projection_pair_into(
     };
 
     if output_groups > 1 && should_parallelize_x86_q8_packed_rows4_decode_output(output_width) {
-        left_output
-            .par_chunks_mut(4)
-            .zip(right_output.par_chunks_mut(4))
-            .enumerate()
-            .for_each(|(group_idx, (left_chunk, right_chunk))| {
-                compute_group(group_idx, left_chunk, right_chunk)
-            });
+        if decode_group_chunking {
+            let groups_per_chunk = x86_q8_ffn_gate_up_decode_groups_per_chunk().min(output_groups);
+            let chunk_floats = groups_per_chunk * 4;
+            left_output
+                .par_chunks_mut(chunk_floats)
+                .zip(right_output.par_chunks_mut(chunk_floats))
+                .enumerate()
+                .for_each(|(chunk_idx, (left_chunk, right_chunk))| {
+                    let first_group_idx = chunk_idx * groups_per_chunk;
+                    for (local_group_idx, (left_group, right_group)) in left_chunk
+                        .chunks_exact_mut(4)
+                        .zip(right_chunk.chunks_exact_mut(4))
+                        .enumerate()
+                    {
+                        compute_group(first_group_idx + local_group_idx, left_group, right_group);
+                    }
+                });
+        } else {
+            left_output
+                .par_chunks_mut(4)
+                .zip(right_output.par_chunks_mut(4))
+                .enumerate()
+                .for_each(|(group_idx, (left_chunk, right_chunk))| {
+                    compute_group(group_idx, left_chunk, right_chunk)
+                });
+        }
     } else {
         for (group_idx, (left_chunk, right_chunk)) in left_output
             .chunks_exact_mut(4)
