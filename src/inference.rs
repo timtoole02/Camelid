@@ -8635,6 +8635,7 @@ fn mac_q8_ffn_down_decode_group_chunking_enabled() -> bool {
     }
 }
 
+#[allow(dead_code)]
 fn mac_q8_ffn_down_decode_groups_per_chunk() -> usize {
     env::var("CAMELID_MAC_Q8_FFN_DOWN_DECODE_GROUPS_PER_CHUNK")
         .ok()
@@ -8671,11 +8672,49 @@ fn mac_q8_ffn_down_single_projection_scheduler_counters_enabled() -> bool {
 
 fn q8_ffn_down_decode_consumer_route_name(decode_group_chunking: bool) -> &'static str {
     if decode_group_chunking {
-        "mac_decode_consumer_group_chunking"
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            "mac_decode_consumer_group_chunking"
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            "x86_decode_consumer_group_chunking"
+        }
     } else if mac_q8_ffn_down_decode_consumer_enabled() {
         "mac_decode_consumer"
     } else {
         "x86_decode_consumer"
+    }
+}
+
+fn x86_q8_ffn_down_decode_group_chunking_enabled() -> bool {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_FFN_DOWN_DECODE_GROUP_CHUNKING")
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        false
+    }
+}
+
+#[allow(dead_code)]
+fn x86_q8_ffn_down_decode_groups_per_chunk() -> usize {
+    env::var("CAMELID_X86_Q8_FFN_DOWN_DECODE_GROUPS_PER_CHUNK")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(16)
+}
+
+fn q8_ffn_down_decode_groups_per_chunk() -> usize {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        mac_q8_ffn_down_decode_groups_per_chunk()
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        x86_q8_ffn_down_decode_groups_per_chunk()
     }
 }
 
@@ -8899,7 +8938,7 @@ fn q8_0_packed_rows4_single_input_projection_into_with_decode_chunking(
 
     if output_groups > 1 && should_parallelize_x86_q8_packed_rows4_decode_output(output_width) {
         if decode_group_chunking {
-            let groups_per_chunk = mac_q8_ffn_down_decode_groups_per_chunk().min(output_groups);
+            let groups_per_chunk = q8_ffn_down_decode_groups_per_chunk().min(output_groups);
             let chunk_floats = groups_per_chunk * 4;
             output.par_chunks_mut(chunk_floats).enumerate().for_each(
                 |(chunk_idx, output_chunk)| {
@@ -10394,7 +10433,8 @@ fn try_x86_q8_ffn_down_decode_consumer_path(
     let telemetry_started = q8_schedule_telemetry_enabled().then(Instant::now);
     add_q8_schedule_counter(&Q8_SCHED_FFN_DOWN_DECODE_CONSUMER_TAKEN, 1);
     let quantized_input = quantize_q8_0_row(&input.data[..route.input_width]);
-    let decode_group_chunking = mac_q8_ffn_down_decode_group_chunking_enabled();
+    let decode_group_chunking = mac_q8_ffn_down_decode_group_chunking_enabled()
+        || x86_q8_ffn_down_decode_group_chunking_enabled();
     let output = q8_0_packed_rows4_single_input_projection_with_decode_chunking(
         route.packed,
         &quantized_input.blocks,
@@ -18200,6 +18240,52 @@ mod tests {
         assert_slice_close_with_tolerance(&chunked.data, &unchunked.data, 1e-6);
         std::env::remove_var("CAMELID_MAC_Q8_FFN_DOWN_DECODE_GROUP_CHUNKING");
         std::env::remove_var("CAMELID_MAC_Q8_FFN_DOWN_DECODE_GROUPS_PER_CHUNK");
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn x86_q8_ffn_down_decode_group_chunking_is_default_off_and_matches_consumer() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_GROUP_CHUNKING");
+        std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_GROUPS_PER_CHUNK");
+        assert!(!x86_q8_ffn_down_decode_group_chunking_enabled());
+
+        let (input, packed_weight, _expected) = runtime_packed_ffn_down_case();
+        let plan = ffn_down_consumer_plan(true);
+        let unchunked = try_x86_q8_ffn_down_decode_consumer_path(
+            &input,
+            &packed_weight,
+            "unchunked",
+            "ffn_down",
+            &plan,
+        )
+        .unwrap()
+        .expect("unchunked ffn_down consumer");
+
+        std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_GROUP_CHUNKING", "on");
+        std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_GROUPS_PER_CHUNK", "2");
+        assert!(x86_q8_ffn_down_decode_group_chunking_enabled());
+        assert_eq!(q8_ffn_down_decode_groups_per_chunk(), 2);
+        assert_eq!(
+            q8_ffn_down_decode_consumer_route_name(true),
+            "x86_decode_consumer_group_chunking"
+        );
+
+        let chunked = try_x86_q8_ffn_down_decode_consumer_path(
+            &input,
+            &packed_weight,
+            "chunked",
+            "ffn_down",
+            &plan,
+        )
+        .unwrap()
+        .expect("chunked ffn_down consumer");
+
+        assert_eq!(chunked.shape.dims, unchunked.shape.dims);
+        assert_slice_close_with_tolerance(&chunked.data, &unchunked.data, 1e-6);
+        std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_GROUP_CHUNKING");
+        std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_GROUPS_PER_CHUNK");
     }
 
     #[test]
