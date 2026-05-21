@@ -1,0 +1,5 @@
+
+> camelid-frontend@0.1.0 smoke:model-state
+> node scripts/model-state-smoke.mjs
+
+✓ model-state smoke passed
