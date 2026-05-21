@@ -8173,16 +8173,47 @@ fn x86_q8_attention_qkv_prefill_consumer_enabled() -> bool {
     }
 }
 
-fn try_x86_q8_attention_qkv_decode_consumer_path(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum X86Q8AttentionQkvRouteKind {
+    Decode,
+    PackedRows4Matmul,
+}
+
+struct X86Q8AttentionQkvRoute<'a> {
+    q_packed: &'a Q8_0PackedRows4,
+    k_packed: &'a Q8_0PackedRows4,
+    v_packed: &'a Q8_0PackedRows4,
+    input_width: usize,
+    q_width: usize,
+    k_width: usize,
+    v_width: usize,
+}
+
+fn resolve_x86_q8_attention_qkv_route<'a>(
     input: &CpuTensor,
-    q_weight: &CpuTensor,
-    k_weight: &CpuTensor,
-    v_weight: &CpuTensor,
+    q_weight: &'a CpuTensor,
+    k_weight: &'a CpuTensor,
+    v_weight: &'a CpuTensor,
     runtime_plan: &ResolvedRuntimePlan,
-) -> Result<Option<(CpuTensor, CpuTensor, CpuTensor)>> {
-    if !runtime_plan.q8.attention_qkv_decode_consumer || input.rank() != 2 || input.dim(0)? != 1 {
+    route: X86Q8AttentionQkvRouteKind,
+) -> Result<Option<X86Q8AttentionQkvRoute<'a>>> {
+    let route_enabled = match route {
+        X86Q8AttentionQkvRouteKind::Decode => runtime_plan.q8.attention_qkv_decode_consumer,
+        X86Q8AttentionQkvRouteKind::PackedRows4Matmul => {
+            runtime_plan.q8.attention_qkv_packed_rows4_matmul
+        }
+    };
+    if !route_enabled || input.rank() != 2 {
         return Ok(None);
     }
+
+    let rows = input.dim(0)?;
+    match route {
+        X86Q8AttentionQkvRouteKind::Decode if rows != 1 => return Ok(None),
+        X86Q8AttentionQkvRouteKind::PackedRows4Matmul if rows <= 1 => return Ok(None),
+        _ => {}
+    }
+
     let input_width = input.dim(1)?;
     if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
         return Ok(None);
@@ -8197,15 +8228,50 @@ fn try_x86_q8_attention_qkv_decode_consumer_path(
     let Some((v_packed, v_width)) = q8_0_runtime_packed_projection(v_weight, input_width)? else {
         return Ok(None);
     };
+    if q_packed.blocks_per_row != k_packed.blocks_per_row
+        || q_packed.blocks_per_row != v_packed.blocks_per_row
+    {
+        return Ok(None);
+    }
 
-    let quantized_input = quantize_q8_0_row(&input.data[..input_width]);
-    let (q, k, v) = q8_0_packed_rows4_single_input_projection_triplet_from_quantized(
+    Ok(Some(X86Q8AttentionQkvRoute {
         q_packed,
         k_packed,
         v_packed,
+        input_width,
         q_width,
         k_width,
         v_width,
+    }))
+}
+
+fn try_x86_q8_attention_qkv_decode_consumer_path(
+    input: &CpuTensor,
+    q_weight: &CpuTensor,
+    k_weight: &CpuTensor,
+    v_weight: &CpuTensor,
+    runtime_plan: &ResolvedRuntimePlan,
+) -> Result<Option<(CpuTensor, CpuTensor, CpuTensor)>> {
+    let Some(route) = resolve_x86_q8_attention_qkv_route(
+        input,
+        q_weight,
+        k_weight,
+        v_weight,
+        runtime_plan,
+        X86Q8AttentionQkvRouteKind::Decode,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    let quantized_input = quantize_q8_0_row(&input.data[..route.input_width]);
+    let (q, k, v) = q8_0_packed_rows4_single_input_projection_triplet_from_quantized(
+        route.q_packed,
+        route.k_packed,
+        route.v_packed,
+        route.q_width,
+        route.k_width,
+        route.v_width,
         &quantized_input.blocks,
     )?;
     Ok(Some((q, k, v)))
@@ -8218,45 +8284,30 @@ fn try_x86_q8_attention_qkv_packed_rows4_matmul_path(
     v_weight: &CpuTensor,
     runtime_plan: &ResolvedRuntimePlan,
 ) -> Result<Option<(CpuTensor, CpuTensor, CpuTensor)>> {
-    if !runtime_plan.q8.attention_qkv_packed_rows4_matmul || input.rank() != 2 || input.dim(0)? <= 1
-    {
-        return Ok(None);
-    }
-    let input_width = input.dim(1)?;
-    if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
-        return Ok(None);
-    }
-
-    let Some((q_packed, q_width)) = q8_0_runtime_packed_projection(q_weight, input_width)? else {
-        return Ok(None);
-    };
-    let Some((k_packed, k_width)) = q8_0_runtime_packed_projection(k_weight, input_width)? else {
+    let Some(route) = resolve_x86_q8_attention_qkv_route(
+        input,
+        q_weight,
+        k_weight,
+        v_weight,
+        runtime_plan,
+        X86Q8AttentionQkvRouteKind::PackedRows4Matmul,
+    )?
+    else {
         return Ok(None);
     };
-    let Some((v_packed, v_width)) = q8_0_runtime_packed_projection(v_weight, input_width)? else {
-        return Ok(None);
-    };
-    if q_packed.interleave != Q8_0PackedRows4Interleave::I8
-        || k_packed.interleave != Q8_0PackedRows4Interleave::I8
-        || v_packed.interleave != Q8_0PackedRows4Interleave::I8
-        || q_packed.blocks_per_row != k_packed.blocks_per_row
-        || q_packed.blocks_per_row != v_packed.blocks_per_row
-    {
-        return Ok(None);
-    }
 
     let (q, k, v) = with_q8_0_quantized_matmul_input_rows(
         input,
-        q_packed.blocks_per_row,
+        route.q_packed.blocks_per_row,
         |rows, quantized_inputs| {
             q8_0_packed_rows4_matmul_projection_triplet_from_quantized(
                 rows,
-                q_packed,
-                k_packed,
-                v_packed,
-                q_width,
-                k_width,
-                v_width,
+                route.q_packed,
+                route.k_packed,
+                route.v_packed,
+                route.q_width,
+                route.k_width,
+                route.v_width,
                 quantized_inputs,
             )
         },
@@ -17762,6 +17813,87 @@ mod tests {
             .is_none(),
             "fused QKV consumer must fail closed unless every Q/K/V projection is runtime-packed Q8_0"
         );
+    }
+
+    #[test]
+    fn q8_attention_qkv_route_resolver_preserves_decode_and_prefill_guards() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        let (decode_input, q_weight, _) =
+            runtime_packed_attention_projection_case("attention_q", "blk.0.attn_q.weight");
+        let (_, k_weight, _) =
+            runtime_packed_attention_projection_case("attention_k", "blk.0.attn_k.weight");
+        let (_, v_weight, _) =
+            runtime_packed_attention_projection_case("attention_v", "blk.0.attn_v.weight");
+        let prefill_input = CpuTensor::from_f32(
+            "prefill_input",
+            vec![2, decode_input.dim(1).unwrap()],
+            vec![0.0; 2 * decode_input.dim(1).unwrap()],
+        )
+        .unwrap();
+
+        let decode_route = resolve_x86_q8_attention_qkv_route(
+            &decode_input,
+            &q_weight,
+            &k_weight,
+            &v_weight,
+            &attention_qkv_consumer_plan(true),
+            X86Q8AttentionQkvRouteKind::Decode,
+        )
+        .unwrap()
+        .expect("decode route should accept one-row runtime-packed Q/K/V weights");
+        assert_eq!(decode_route.input_width, decode_input.dim(1).unwrap());
+        assert_eq!(decode_route.q_width, 12);
+        assert_eq!(decode_route.k_width, 12);
+        assert_eq!(decode_route.v_width, 12);
+
+        assert!(resolve_x86_q8_attention_qkv_route(
+            &prefill_input,
+            &q_weight,
+            &k_weight,
+            &v_weight,
+            &attention_qkv_consumer_plan(true),
+            X86Q8AttentionQkvRouteKind::Decode,
+        )
+        .unwrap()
+        .is_none());
+
+        let prefill_route = resolve_x86_q8_attention_qkv_route(
+            &prefill_input,
+            &q_weight,
+            &k_weight,
+            &v_weight,
+            &attention_qkv_packed_rows4_matmul_plan(true),
+            X86Q8AttentionQkvRouteKind::PackedRows4Matmul,
+        )
+        .unwrap()
+        .expect("prefill route should accept multi-row runtime-packed Q/K/V weights");
+        assert_eq!(prefill_route.input_width, prefill_input.dim(1).unwrap());
+        assert_eq!(prefill_route.q_width, 12);
+        assert_eq!(prefill_route.k_width, 12);
+        assert_eq!(prefill_route.v_width, 12);
+
+        assert!(resolve_x86_q8_attention_qkv_route(
+            &decode_input,
+            &q_weight,
+            &k_weight,
+            &v_weight,
+            &attention_qkv_packed_rows4_matmul_plan(true),
+            X86Q8AttentionQkvRouteKind::PackedRows4Matmul,
+        )
+        .unwrap()
+        .is_none());
+
+        assert!(resolve_x86_q8_attention_qkv_route(
+            &prefill_input,
+            &q_weight,
+            &k_weight,
+            &v_weight,
+            &attention_qkv_packed_rows4_matmul_plan(false),
+            X86Q8AttentionQkvRouteKind::PackedRows4Matmul,
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]
