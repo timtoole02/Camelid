@@ -1,0 +1,53 @@
+Source head before docs slice: 9837151
+
+Remote validation:
+- Not attempted in this run.
+- No Ubuntu host availability, outage, authentication, API, frontend, throughput, RSS, support-row, portability, or default-on claim is made by this docs-only slice.
+
+Command:
+git grep -n -I -E 'Permission denied [(]publickey[)]|canonical Ubuntu host.*(blocked|down|unavailable)|Ubuntu host.*(blocked|down|unavailable)' -- README.md STATUS.md COMPATIBILITY.md CONTEXT.md docs qa/validation-notes ':!docs/performance/ubuntu-x86-q8.md'
+
+Result:
+- PASS: no matches.
+
+Command:
+rg -n 'reopened host|validation lane reopened|approved Ubuntu validation lane' qa/validation-notes docs STATUS.md README.md COMPATIBILITY.md -g '*.md'
+
+Result:
+- PASS after this slice: no current validation-lane availability wording remains in public docs or validation notes.
+
+Command:
+git grep -n -I -E 'remote validation is available again|remote runtime validation is available again|approved Ubuntu validation lane is reopened|Current operator update: The approved Ubuntu validation lane is reopened' -- README.md COMPATIBILITY.md STATUS.md ROADMAP.md FULL_SUPPORT_BLOCKER_MATRIX.md docs frontend/README.md qa/validation-notes scripts ':!scripts/check-public-scrub.sh'
+
+Result:
+- PASS: no matches.
+
+Command:
+rg -n 'saturated|busy|unreachable|unavailable|down|Permission denied|publickey' qa/validation-notes docs STATUS.md README.md COMPATIBILITY.md -g '*.md'
+
+Result:
+- PASS after this slice: no matches.
+
+Command:
+guarded support-contract wording scan
+
+Result:
+- PASS: reviewed exact-row/default-off support wording in README.md, COMPATIBILITY.md, STATUS.md, docs/VALIDATION_MATRIX.md, docs/CONFIGURATION.md, docs/performance/ubuntu-x86-q8.md, and docs/runtime/cross-lane-sync.md. Wording remains support-contract scoped and does not widen model rows, API/WebUI readiness, portability, production throughput, RSS, or default-on acceleration.
+
+Command:
+./scripts/check-public-scrub.sh
+
+Result:
+- PASS: exit 0.
+
+Command:
+node scripts/check-public-evidence-claims.mjs
+
+Result:
+- PASS: public evidence claim check passed.
+
+Command:
+git diff --check
+
+Result:
+- PASS: exit 0.

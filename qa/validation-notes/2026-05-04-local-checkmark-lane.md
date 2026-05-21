@@ -1,6 +1,6 @@
 # Validation note — local checkmark lane during operator-requested validation pause
 
-Superseded operational note: the approved Ubuntu validation lane reopened later on 2026-05-04, then Tim paused it again on 2026-05-12. Keep this file as historical context for the earlier local-only pause, but use `2026-05-12-local-only-validation-lane-paused.md` for current execution guidance.
+Superseded operational note: the Ubuntu validation lane had a temporary operator-status change later on 2026-05-04, then Tim paused it again on 2026-05-12. Keep this file as historical context for the earlier local-only pause, but use `2026-05-12-local-only-validation-lane-paused.md` for current execution guidance.
 
 Date: 2026-05-04
 Repo lane: local/repo-safe only
@@ -26,4 +26,4 @@ This pass only normalized repo-facing contract language and harness scaffolding:
 
 ## Resume rule
 
-When Tim explicitly reopens the Ubuntu validation lane, regenerate the full-support scaffold with `--validation-host-status available`, run only on the approved validation host/runtime lane, and publish only scrubbed artifacts/manifests whose rows passed their exact tracks.
+When Tim explicitly authorizes Ubuntu validation work, regenerate the full-support scaffold with an operator-approved validation-host status, run only on the approved validation host/runtime lane, and publish only scrubbed artifacts/manifests whose rows passed their exact tracks.

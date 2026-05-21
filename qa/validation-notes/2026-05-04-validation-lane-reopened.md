@@ -1,10 +1,10 @@
-# Validation note — Ubuntu validation lane reopened
+# Validation note — historical Ubuntu validation lane operator context
 
 Date: 2026-05-04
 
 Superseded current-operator status: Tim paused the Ubuntu validation lane again on 2026-05-12. Use `qa/validation-notes/2026-05-12-local-only-validation-lane-paused.md` for current execution posture; this file remains historical evidence-lane context only.
 
-The approved Ubuntu validation lane was reopened for Camelid promotion-grade exact-row runtime evidence on 2026-05-04. Do not publish private host addresses, SSH commands, key paths, or local operator-only details in the public repo.
+Historical operator note: the Ubuntu validation lane was temporarily made available for Camelid promotion-grade exact-row runtime evidence on 2026-05-04. Do not publish private host addresses, SSH commands, key paths, or local operator-only details in the public repo.
 
 Execution guardrails:
 
@@ -12,7 +12,7 @@ Execution guardrails:
 - Preserve existing dirty remote worktrees; do not reset or overwrite them just to run current-head validation.
 - Use `scripts/with-rustup-cargo.sh` or an equivalent rustup-managed toolchain on Ubuntu hosts whose distro `/usr/bin/cargo` is too old for the checked-in Rust floor.
 - Generate full-support scaffolds with `node scripts/prepare-full-support-bundle.mjs ...`; when runtime validation has not been attempted for the current run, keep the default `evidence_needed` status so generated runtime commands preserve the missing-evidence boundary without implying host failure.
-- Keep claims exact-row only. A reopened host is not evidence; only passing artifacts can move docs, API, or frontend language.
+- Keep claims exact-row only. Host availability is not evidence; only passing artifacts can move docs, API, or frontend language.
 
 Current promotion posture:
 

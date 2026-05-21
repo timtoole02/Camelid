@@ -17,6 +17,6 @@ Local gates:
 - `./scripts/with-rustup-cargo.sh test -q prefill --lib`
 - `./scripts/with-rustup-cargo.sh clippy -q --all-targets -- -D warnings`
 
-Remote note: the canonical Ubuntu host was already saturated by other long-running Q8 hot-path jobs during this slice, so no duplicate 8B long-context validation run was launched.
+Remote note: remote validation was not attempted for this local slice; no duplicate 8B long-context validation run was launched.
 
 Claim boundary: code-only structural headroom plus local guardrails. The existing exact-row bounded 8B 512/1024/2048 support boundary is unchanged; model-native/larger context, arbitrary templates, production throughput, portability, neighboring rows, and broad/full Llama/8B support remain gated by separate PASS artifacts and synchronized alignment.

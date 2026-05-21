@@ -21,6 +21,6 @@ Validation:
 Canonical Ubuntu lane check:
 - Verified only on the project-approved Ubuntu validation host.
 - Host responded `host_ok` at `2026-05-07 15:16:36 UTC`.
-- The host was already busy with existing backend/frontend processes and separate non-8B Q8 hot-path bench jobs under `parallel-bringup-20260506T2258Z`; no duplicate long 8B context/parity run was launched.
+- No additional long 8B context/parity remote validation was attempted for this local slice; no duplicate long 8B context/parity run was launched.
 
 Claim boundary: code/test-only structural headroom. The existing exact-row bounded 8B checked-pack boundary is unchanged; model-native/larger context, arbitrary templates, production throughput, portability, neighboring rows, and broad/full Llama/8B support still require separate canonical PASS artifacts and aligned support surfaces.
