@@ -23,7 +23,7 @@ Implemented a default-off Rust kernel cleanup for the existing Ubuntu/Linux x86_
 Local host:
 
 ```text
-Darwin Tims-Mac-mini.local 25.5.0 Darwin Kernel Version 25.5.0: Tue Apr 14 21:52:36 PDT 2026; root:xnu-12377.120.99.0.7~25/RELEASE_ARM64_T8132 arm64
+Darwin arm64 local control host, kernel details redacted for public evidence hygiene
 rustc 1.95.0 (59807616e 2026-04-14), host aarch64-apple-darwin
 cargo 1.95.0 (f2d3ce0bd 2026-03-21)
 ```
