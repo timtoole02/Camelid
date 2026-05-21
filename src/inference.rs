@@ -9026,10 +9026,14 @@ fn q8_0_vnni_decode_1x64_projection_into(
     {
         if x86_q8_vnni_decode_rawptr_enabled() {
             // SAFETY: runtime feature detection in `x86_q8_vnni_decode_rawptr_enabled`
-            // confirms AVX512-VNNI support, and the shape guard above proves that
+            // confirms the selected x86 SIMD support, and the shape guard above proves that
             // `packed.tiles`, `quantized_input`, and `output` cover every 64-row group.
             unsafe {
-                q8_0_vnni_decode_1x64_projection_rawptr_avx512(packed, quantized_input, output);
+                if x86_q8_vnni_decode_avx512_supported() {
+                    q8_0_vnni_decode_1x64_projection_rawptr_avx512(packed, quantized_input, output);
+                } else {
+                    q8_0_vnni_decode_1x64_projection_rawptr_avx2(packed, quantized_input, output);
+                }
             }
             return Ok(());
         }
@@ -9068,7 +9072,7 @@ fn q8_0_vnni_decode_1x64_projection_into(
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn x86_q8_vnni_decode_rawptr_enabled() -> bool {
     q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR")
-        && x86_q8_vnni_decode_avx512_supported()
+        && (x86_q8_vnni_decode_avx512_supported() || std::arch::is_x86_feature_detected!("avx2"))
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -9178,6 +9182,179 @@ unsafe fn q8_0_vnni_tile16_i32_avx512(
     }
     let comp = unsafe { _mm512_loadu_si512(tile.comp.as_ptr().cast()) };
     _mm512_sub_epi32(acc, comp)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[allow(clippy::incompatible_msrv)]
+#[target_feature(enable = "avx2")]
+unsafe fn q8_0_vnni_decode_1x64_projection_rawptr_avx2(
+    packed: &Q8_0VnniPacked,
+    quantized_input: &[Q8_0Block],
+    output: &mut [f32],
+) {
+    let blocks_per_row = packed.blocks_per_row;
+    let input_addr = quantized_input.as_ptr() as usize;
+    let tiles_addr = packed.tiles.as_ptr() as usize;
+
+    if output.len() >= 1024 && rayon::current_num_threads() > 1 {
+        output
+            .par_chunks_exact_mut(64)
+            .enumerate()
+            .for_each(|(group64, output_chunk)| {
+                // SAFETY: each parallel chunk owns one disjoint 64-wide output group.
+                // Tile indexing is bounded by the caller's shape guard.
+                unsafe {
+                    q8_0_vnni_decode_group64_rawptr_avx2(
+                        (tiles_addr as *const Q8_0VnniTile16).add(group64 * 4 * blocks_per_row),
+                        blocks_per_row,
+                        input_addr as *const Q8_0Block,
+                        output_chunk.as_mut_ptr(),
+                    );
+                }
+            });
+    } else {
+        for (group64, output_chunk) in output.chunks_exact_mut(64).enumerate() {
+            // SAFETY: each serial chunk owns one disjoint 64-wide output group.
+            // Tile indexing is bounded by the caller's shape guard.
+            unsafe {
+                q8_0_vnni_decode_group64_rawptr_avx2(
+                    (tiles_addr as *const Q8_0VnniTile16).add(group64 * 4 * blocks_per_row),
+                    blocks_per_row,
+                    input_addr as *const Q8_0Block,
+                    output_chunk.as_mut_ptr(),
+                );
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[allow(clippy::incompatible_msrv)]
+#[target_feature(enable = "avx2")]
+unsafe fn q8_0_vnni_decode_group64_rawptr_avx2(
+    group_tiles: *const Q8_0VnniTile16,
+    blocks_per_row: usize,
+    quantized_input: *const Q8_0Block,
+    output: *mut f32,
+) {
+    use std::arch::x86_64::{
+        _mm_add_ps, _mm_cvtepi32_ps, _mm_loadu_ps, _mm_mul_ps, _mm_set1_ps, _mm_setzero_ps,
+        _mm_storeu_ps,
+    };
+
+    for tile_col in 0..4 {
+        let mut acc0 = _mm_setzero_ps();
+        let mut acc1 = _mm_setzero_ps();
+        let mut acc2 = _mm_setzero_ps();
+        let mut acc3 = _mm_setzero_ps();
+        for block_idx in 0..blocks_per_row {
+            let tile = unsafe { &*group_tiles.add(tile_col * blocks_per_row + block_idx) };
+            let input_block = unsafe { &*quantized_input.add(block_idx) };
+            let (ints0, ints1, ints2, ints3) =
+                unsafe { q8_0_vnni_tile16_i32x4_avx2(tile, input_block) };
+            let input_scale = _mm_set1_ps(input_block.scale);
+            let mut scales = [0.0_f32; 16];
+            for (dst, scale_bits) in scales.iter_mut().zip(tile.scale_f16.iter().copied()) {
+                *dst = f16_bits_to_f32(scale_bits);
+            }
+            let scales_ptr = scales.as_ptr();
+            let scale0 = _mm_mul_ps(_mm_loadu_ps(scales_ptr), input_scale);
+            let scale1 = _mm_mul_ps(_mm_loadu_ps(unsafe { scales_ptr.add(4) }), input_scale);
+            let scale2 = _mm_mul_ps(_mm_loadu_ps(unsafe { scales_ptr.add(8) }), input_scale);
+            let scale3 = _mm_mul_ps(_mm_loadu_ps(unsafe { scales_ptr.add(12) }), input_scale);
+            acc0 = _mm_add_ps(acc0, _mm_mul_ps(_mm_cvtepi32_ps(ints0), scale0));
+            acc1 = _mm_add_ps(acc1, _mm_mul_ps(_mm_cvtepi32_ps(ints1), scale1));
+            acc2 = _mm_add_ps(acc2, _mm_mul_ps(_mm_cvtepi32_ps(ints2), scale2));
+            acc3 = _mm_add_ps(acc3, _mm_mul_ps(_mm_cvtepi32_ps(ints3), scale3));
+        }
+        unsafe {
+            let output = output.add(tile_col * 16);
+            _mm_storeu_ps(output, acc0);
+            _mm_storeu_ps(output.add(4), acc1);
+            _mm_storeu_ps(output.add(8), acc2);
+            _mm_storeu_ps(output.add(12), acc3);
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[allow(clippy::incompatible_msrv)]
+#[target_feature(enable = "avx2")]
+unsafe fn q8_0_vnni_tile16_i32x4_avx2(
+    tile: &Q8_0VnniTile16,
+    input_block: &Q8_0Block,
+) -> (
+    std::arch::x86_64::__m128i,
+    std::arch::x86_64::__m128i,
+    std::arch::x86_64::__m128i,
+    std::arch::x86_64::__m128i,
+) {
+    use std::arch::x86_64::{
+        _mm256_add_epi32, _mm256_cvtepi8_epi16, _mm256_madd_epi16, _mm256_setzero_si256,
+        _mm256_storeu_si256, _mm_loadu_si128, _mm_set1_epi32, _mm_setr_epi32,
+    };
+
+    let mut acc0 = _mm256_setzero_si256();
+    let mut acc1 = _mm256_setzero_si256();
+    let mut acc2 = _mm256_setzero_si256();
+    let mut acc3 = _mm256_setzero_si256();
+    for g in 0..8 {
+        let activation = _mm256_cvtepi8_epi16(_mm_set1_epi32(i32::from_le_bytes([
+            input_block.quants[g * 4] as u8,
+            input_block.quants[g * 4 + 1] as u8,
+            input_block.quants[g * 4 + 2] as u8,
+            input_block.quants[g * 4 + 3] as u8,
+        ])));
+        let base = unsafe { tile.quants.as_ptr().add(g * 64) };
+        let weights0 = _mm256_cvtepi8_epi16(unsafe { _mm_loadu_si128(base.cast()) });
+        let weights1 = _mm256_cvtepi8_epi16(unsafe { _mm_loadu_si128(base.add(16).cast()) });
+        let weights2 = _mm256_cvtepi8_epi16(unsafe { _mm_loadu_si128(base.add(32).cast()) });
+        let weights3 = _mm256_cvtepi8_epi16(unsafe { _mm_loadu_si128(base.add(48).cast()) });
+
+        acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(activation, weights0));
+        acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(activation, weights1));
+        acc2 = _mm256_add_epi32(acc2, _mm256_madd_epi16(activation, weights2));
+        acc3 = _mm256_add_epi32(acc3, _mm256_madd_epi16(activation, weights3));
+    }
+
+    let mut pair_sums = [0_i32; 8];
+    unsafe {
+        _mm256_storeu_si256(pair_sums.as_mut_ptr().cast(), acc0);
+    }
+    let ints0 = _mm_setr_epi32(
+        pair_sums[0] + pair_sums[1],
+        pair_sums[2] + pair_sums[3],
+        pair_sums[4] + pair_sums[5],
+        pair_sums[6] + pair_sums[7],
+    );
+    unsafe {
+        _mm256_storeu_si256(pair_sums.as_mut_ptr().cast(), acc1);
+    }
+    let ints1 = _mm_setr_epi32(
+        pair_sums[0] + pair_sums[1],
+        pair_sums[2] + pair_sums[3],
+        pair_sums[4] + pair_sums[5],
+        pair_sums[6] + pair_sums[7],
+    );
+    unsafe {
+        _mm256_storeu_si256(pair_sums.as_mut_ptr().cast(), acc2);
+    }
+    let ints2 = _mm_setr_epi32(
+        pair_sums[0] + pair_sums[1],
+        pair_sums[2] + pair_sums[3],
+        pair_sums[4] + pair_sums[5],
+        pair_sums[6] + pair_sums[7],
+    );
+    unsafe {
+        _mm256_storeu_si256(pair_sums.as_mut_ptr().cast(), acc3);
+    }
+    let ints3 = _mm_setr_epi32(
+        pair_sums[0] + pair_sums[1],
+        pair_sums[2] + pair_sums[3],
+        pair_sums[4] + pair_sums[5],
+        pair_sums[6] + pair_sums[7],
+    );
+    (ints0, ints1, ints2, ints3)
 }
 
 fn q8_0_vnni_tile16_dot(tile: &Q8_0VnniTile16, input_block: &Q8_0Block) -> [i32; 16] {
