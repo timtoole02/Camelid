@@ -1,8 +1,0 @@
-PASS cargo fmt --check
-PASS cargo test q8_ffn_down_vnni_decode -- --nocapture (mac host; linux-only rawptr test cfg-skipped)
-PASS cargo test ubuntu_experimental_preserves_explicit_x86_q8_gate_opt_ins -- --nocapture
-PASS cargo test planner_env_apply_clears_stale_x86_q8_decode_consumer_flags -- --nocapture
-PASS remote ubuntu cargo fmt --check
-PASS remote ubuntu cargo test q8_ffn_down_vnni_decode -- --nocapture (5 passed, including rawptr parity)
-PASS remote ubuntu cargo build --release
-PASS remote ubuntu same-host Camelid vs llama.cpp benchmark with rawptr gate; marker guard passed, ffn_down_vnni_decode_taken=140

@@ -1,7 +1,0 @@
-cargo fmt --check
-cargo test q8_ffn_down_vnni_decode -- --nocapture
-cargo test ubuntu_experimental_preserves_explicit_x86_q8_gate_opt_ins -- --nocapture
-cargo test planner_env_apply_clears_stale_x86_q8_decode_consumer_flags -- --nocapture
-remote ubuntu: cargo fmt --check && cargo test q8_ffn_down_vnni_decode -- --nocapture
-remote ubuntu: cargo build --release
-remote ubuntu: CAMELID_PROFILE=experimental CAMELID_X86_Q8_REPACK=on CAMELID_X86_Q8_KERNEL=avx2 CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE=on CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR=on CAMELID_STREAM_TIMING_DIAGNOSTICS=on CAMELID_Q8_SCHED_TELEMETRY=on node scripts/bench-llama3-same-host.mjs ... --max-tokens 8 --warmup 1 --repeats 1 --threads 16
