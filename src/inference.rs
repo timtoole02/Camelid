@@ -11533,6 +11533,29 @@ fn x86_q8_packed_rows4_avx2_dot_enabled() -> bool {
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn x86_q8_packed_rows4_avx512vnni_dpwssd_dot_enabled() -> bool {
+    #[cfg(test)]
+    {
+        q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PACKED_ROWS4_AVX512VNNI_DPWSSD_DOT")
+            && std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vnni")
+    }
+    #[cfg(not(test))]
+    {
+        static X86_Q8_PACKED_ROWS4_AVX512VNNI_DPWSSD_DOT_ENABLED: OnceLock<bool> = OnceLock::new();
+        *X86_Q8_PACKED_ROWS4_AVX512VNNI_DPWSSD_DOT_ENABLED.get_or_init(|| {
+            q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PACKED_ROWS4_AVX512VNNI_DPWSSD_DOT")
+                && std::arch::is_x86_feature_detected!("avx2")
+                && std::arch::is_x86_feature_detected!("avx512f")
+                && std::arch::is_x86_feature_detected!("avx512bw")
+                && std::arch::is_x86_feature_detected!("avx512vnni")
+        })
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn x86_q8_packed_rows4_avx2_dot_hoist_enabled() -> bool {
     #[cfg(test)]
     {
@@ -13078,6 +13101,11 @@ fn q8_0_packed_rows4_dot_i8_matmul(
 ) -> [f32; 4] {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
+        if x86_q8_packed_rows4_avx512vnni_dpwssd_dot_enabled() {
+            // SAFETY: runtime feature detection in
+            // `x86_q8_packed_rows4_avx512vnni_dpwssd_dot_enabled` confirms support.
+            return unsafe { q8_0_packed_rows4_dot_i8_avx512vnni_dpwssd(packed_blocks, input) };
+        }
         if use_hoisted_avx2 {
             // SAFETY: `use_hoisted_avx2` is only true after runtime AVX2 detection.
             return unsafe { q8_0_packed_rows4_dot_i8_avx2(packed_blocks, input) };
@@ -13085,6 +13113,29 @@ fn q8_0_packed_rows4_dot_i8_matmul(
     }
     let _ = use_hoisted_avx2;
     q8_0_packed_rows4_dot(packed_blocks, input, Q8_0PackedRows4Interleave::I8)
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,avx512f,avx512bw,avx512vnni")]
+unsafe fn q8_0_packed_rows4_dot_i8_avx512vnni_dpwssd(
+    packed_blocks: &[Q8_0PackedRows4Block],
+    input: &[Q8_0Block],
+) -> [f32; 4] {
+    debug_assert_eq!(packed_blocks.len(), input.len());
+    let mut sums = [0.0_f32; 4];
+    for (packed_block, input_block) in packed_blocks.iter().zip(input) {
+        let int_sums = unsafe {
+            q8_0_packed_4x8_block_avx512vnni_dpwssd(
+                packed_block.quants.as_ptr(),
+                input_block.quants.as_ptr(),
+            )
+        };
+        let input_scale = input_block.scale;
+        for lane in 0..4 {
+            sums[lane] += int_sums[lane] as f32 * packed_block.scales[lane] * input_scale;
+        }
+    }
+    sums
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -13143,6 +13194,18 @@ fn q8_0_packed_rows4_dot(
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             {
                 if interleave == Q8_0PackedRows4Interleave::I8
+                    && x86_q8_packed_rows4_avx512vnni_dpwssd_dot_enabled()
+                {
+                    // SAFETY: runtime feature detection confirms AVX512F/BW/VNNI and AVX2
+                    // support; packed quants contain one complete rows4/I8 block and input
+                    // quants contain one Q8_0 block.
+                    unsafe {
+                        q8_0_packed_4x8_block_avx512vnni_dpwssd(
+                            packed_block.quants.as_ptr(),
+                            input_block.quants.as_ptr(),
+                        )
+                    }
+                } else if interleave == Q8_0PackedRows4Interleave::I8
                     && (x86_q8_packed_rows4_avx2_dot_enabled() || x86_q8_kernel_avx2_enabled())
                     && std::arch::is_x86_feature_detected!("avx2")
                 {
@@ -13195,6 +13258,45 @@ fn q8_0_packed_rows4_block_dot_scalar(
         }
     }
     sums
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,avx512f,avx512bw,avx512vnni")]
+unsafe fn q8_0_packed_4x8_block_avx512vnni_dpwssd(packed: *const i8, input: *const i8) -> [i32; 4] {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{
+        _mm256_broadcastsi128_si256, _mm256_loadu_si256, _mm512_cvtepi8_epi16, _mm512_dpwssd_epi32,
+        _mm512_setzero_si512, _mm512_storeu_si512, _mm_loadl_epi64, _mm_unpacklo_epi64,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::{
+        _mm256_broadcastsi128_si256, _mm256_loadu_si256, _mm512_cvtepi8_epi16, _mm512_dpwssd_epi32,
+        _mm512_setzero_si512, _mm512_storeu_si512, _mm_loadl_epi64, _mm_unpacklo_epi64,
+    };
+
+    let mut acc = _mm512_setzero_si512();
+    for chunk in 0..4usize {
+        let packed32 = unsafe { _mm256_loadu_si256(packed.add(chunk * 32).cast()) };
+        let packed_i16 = _mm512_cvtepi8_epi16(packed32);
+
+        let input8 = unsafe { _mm_loadl_epi64(input.add(chunk * 8).cast()) };
+        let input16 = _mm_unpacklo_epi64(input8, input8);
+        let input32 = _mm256_broadcastsi128_si256(input16);
+        let input_i16 = _mm512_cvtepi8_epi16(input32);
+
+        acc = _mm512_dpwssd_epi32(acc, packed_i16, input_i16);
+    }
+
+    let mut lanes = [0_i32; 16];
+    unsafe {
+        _mm512_storeu_si512(lanes.as_mut_ptr().cast(), acc);
+    }
+    [
+        lanes[0..4].iter().sum(),
+        lanes[4..8].iter().sum(),
+        lanes[8..12].iter().sum(),
+        lanes[12..16].iter().sum(),
+    ]
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -14934,6 +15036,48 @@ mod tests {
             );
         }
         std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT");
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn x86_q8_avx512vnni_dpwssd_packed_rows4_i8_matches_scalar_dot() {
+        let _env_guard = env_lock();
+        std::env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_AVX512VNNI_DPWSSD_DOT", "on");
+        let packed = std::array::from_fn(|idx| (idx as i8).wrapping_mul(11).wrapping_sub(37));
+        let input = std::array::from_fn(|idx| (idx as i8).wrapping_mul(5).wrapping_add(19));
+        let expected =
+            q8_0_packed_rows4_block_dot_scalar(&packed, &input, Q8_0PackedRows4Interleave::I8);
+
+        if std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vnni")
+        {
+            let actual =
+                unsafe { q8_0_packed_4x8_block_avx512vnni_dpwssd(packed.as_ptr(), input.as_ptr()) };
+            assert_eq!(actual, expected);
+        }
+
+        let packed_block = Q8_0PackedRows4Block {
+            scales: [0.25, 0.5, 0.75, 1.25],
+            quants: packed,
+        };
+        let input_block = Q8_0Block {
+            scale: 0.125,
+            quants: input,
+        };
+        let actual = q8_0_packed_rows4_dot(
+            &[packed_block],
+            &[input_block],
+            Q8_0PackedRows4Interleave::I8,
+        );
+        for lane in 0..4 {
+            assert_eq!(
+                actual[lane],
+                expected[lane] as f32 * [0.25, 0.5, 0.75, 1.25][lane] * 0.125
+            );
+        }
+        std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_AVX512VNNI_DPWSSD_DOT");
     }
 
     #[test]

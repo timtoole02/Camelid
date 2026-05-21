@@ -32,8 +32,9 @@ Only list the paths that are currently evidence-backed and default-off:
 - Packed Q8 runtime storage for the dense attention projection family plus dense FFN gate/up/down rows in the measured lane.
 - Default-off decode consumers that directly use backend-owned packed runtime storage for narrow one-row dense projection families, including output, attention Q/K/V, attention output, FFN down, and the FFN gate/up activation slice while validation remains opt-in.
 - Default-off packed-rows4 matmul slices consume backend-owned packed runtime storage for concrete dense projection families with per-slice evidence recorded below: FFN down, multi-row FFN gate/up, multi-row attention Q/K/V, multi-row attention output, and local-only multi-row `output.weight`; the newest chunked output-group traversal and quantized-input scratch-reuse follow-ons are local-only until Ubuntu timing/profiling validation is recorded. This is planner/runtime-gate/allocation-shape evidence, not a blanket throughput, support, portability, or default-on claim.
+- `CAMELID_X86_Q8_PACKED_ROWS4_AVX512VNNI_DPWSSD_DOT=on` is retained as a default-off Ubuntu x86_64 rows4/I8 dot-kernel experiment for AVX512VNNI hosts. It reduced the same-host Llama 3.2 3B Q8_0 r5 Camelid wall time from 430.42 ms to 416.93 ms and backend generate time from 369.0 ms to 357.4 ms while staying behind explicit opt-in gating.
 - Default-off FFN-down GEMM4 follow-ons now include prefill, row-group scheduling, a retained min-input-groups scheduler guard, and an AVX2 experiment gate. Current public docs retain these as developer experiments only: canonical Ubuntu parity plus repeated same-host timing/profiling evidence is still required before any throughput/RSS/support/default-on claim.
-- ExecutionPlan now treats the x86 attention Q/K/V, attention-output, output, FFN gate/up/down decode-consumer, FFN gate/up single-owner, packed-rows4 FFN-down matmul, packed-rows4 FFN gate/up matmul, packed-rows4 attention-Q/K/V matmul, packed-rows4 attention-output matmul, packed-rows4 output matmul, and FFN-down GEMM4 flags as managed default-off knobs, so appliance planning clears stale owner experiments instead of inheriting them accidentally.
+- ExecutionPlan now treats the x86 attention Q/K/V, attention-output, output, FFN gate/up/down decode-consumer, FFN gate/up single-owner, packed-rows4 FFN-down matmul, packed-rows4 FFN gate/up matmul, packed-rows4 attention-Q/K/V matmul, packed-rows4 attention-output matmul, packed-rows4 output matmul, packed-rows4 AVX512VNNI DPWSSD dot, and FFN-down GEMM4 flags as managed default-off knobs, so appliance planning clears stale owner experiments instead of inheriting them accidentally.
 
 ## Active experimental direction
 
@@ -48,6 +49,7 @@ Current work is focused on:
 - bounded packed-rows4 matmul scheduling follow-ons that reduce Rayon task granularity by chunking output groups across single/pair/triplet helpers; current proof is local semantic coverage only, not a retained Ubuntu speed claim.
 - bounded packed-rows4 matmul activation-quantization scratch reuse, so existing default-off single/pair/triplet matmul consumers can reuse cleared thread-local input blocks rather than allocating a fresh quantized-input vector per helper call; current proof is local allocation-shape/timing-smoke coverage only, not a retained Ubuntu speed claim.
 - FFN-down GEMM4 AVX2 and output-route-resolver cleanup are evidence-needed tracer bullets: keep them default-off, preserve backend-owned packed runtime storage, and require parity plus same-host guard evidence before retaining any performance claim.
+- FFN-down VNNI decode remains rejected for the model-backed same-host lane despite a synthetic microbench win; it regressed Camelid r3 wall time from 425.39 ms to 438.57 ms and backend generate time from 363.33 ms to 378.33 ms.
 - FFN-down row-group scheduling now has a retained default-off min-input-groups guard for the shallow-prefill synthetic surface; model-backed same-host FFN-down timing remains evidence-needed before any measured throughput claim.
 - reducing wrapper/callback overhead in hot inference
 - keeping the default/reference path safe while experimental paths stay opt-in
@@ -91,7 +93,8 @@ Use only the current reference default-off gates for the retained Ubuntu x86_64 
 
 ```bash
 CAMELID_X86_Q8_REPACK=on \
-CAMELID_X86_Q8_KERNEL=avx2
+CAMELID_X86_Q8_KERNEL=avx2 \
+CAMELID_X86_Q8_PACKED_ROWS4_AVX512VNNI_DPWSSD_DOT=on
 ```
 
 Do not add older sketch flags or matrix-owner placeholders to reproduction commands unless a fresh Ubuntu x86_64 evidence entry proves that exact flag and shape. Narrow decode-consumer/owner flags are separate default-off developer experiments; enable them only when the current evidence report names the exact flag and validation target for that slice.
@@ -145,6 +148,7 @@ Primary public evidence anchors for this lane:
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-5e4b0b83-20260520T1244Z-docs-context-host-reporting-audit/README.md` (docs/context host-reporting retained audit: public docs/context scan passed for stale host-access wording and private host aliases; remote validation was not attempted in this run)
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-5e4b0b83-20260520T1657Z-docs-support-contract-audit/README.md` (docs support-contract/host-reporting audit: narrow stale host-failure scan passed, support-contract wording remains guarded, and remote validation was not attempted in this run)
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-5e4b0b83-20260520T2138Z-docs-support-contract-host-audit/README.md` (docs support-contract/host-reporting audit: narrow stale host-failure scan passed, public docs/context keep canonical host references limited to the reporting rule, and remote validation was not attempted in this run)
+- `qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T001440Z-vnni-samehost/README.md` (retained default-off AVX512VNNI DPWSSD rows4/I8 dot-kernel slice; same-host Llama 3.2 3B Q8_0 r5 timing improved while FFN-down VNNI decode was rejected)
 - the retained/reject notes for bounded Ubuntu x86 Q8 experiments kept under `qa/evidence-bundles/`
 
 ## Product/runtime note

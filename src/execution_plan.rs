@@ -30,6 +30,7 @@ const MANAGED_ENV_KEYS: &[&str] = &[
     "CAMELID_X86_Q8_FFN_DOWN_GEMM4_AVX2",
     "CAMELID_X86_Q8_FFN_DOWN_SINGLE_OWNER",
     "CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE",
+    "CAMELID_X86_Q8_PACKED_ROWS4_AVX512VNNI_DPWSSD_DOT",
     "CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER",
     "CAMELID_X86_Q8_OUTPUT_DECODE_OWNER",
 ];
@@ -443,6 +444,10 @@ fn select_linux_x86_q8_plan(
     env_updates.insert(
         "CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE",
         optional_x86_q8_gate("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE"),
+    );
+    env_updates.insert(
+        "CAMELID_X86_Q8_PACKED_ROWS4_AVX512VNNI_DPWSSD_DOT",
+        optional_x86_q8_gate("CAMELID_X86_Q8_PACKED_ROWS4_AVX512VNNI_DPWSSD_DOT"),
     );
     env_updates.insert(
         "CAMELID_X86_Q8_FFN_GATE_UP_SINGLE_OWNER",
@@ -1208,6 +1213,12 @@ mod tests {
         assert_eq!(
             outcome
                 .env_updates
+                .get("CAMELID_X86_Q8_PACKED_ROWS4_AVX512VNNI_DPWSSD_DOT"),
+            Some(&Some("off"))
+        );
+        assert_eq!(
+            outcome
+                .env_updates
                 .get("CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER"),
             Some(&Some("off"))
         );
@@ -1232,6 +1243,7 @@ mod tests {
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_SCHED", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_AVX2", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE", "on");
+        env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_AVX512VNNI_DPWSSD_DOT", "on");
         let outcome = plan_for_model_with_platform(
             &PathBuf::from("/tmp/Llama-3.2-3B-Instruct-Q8_0.gguf"),
             &fixture("Llama 3.2 3B Instruct"),
@@ -1266,6 +1278,12 @@ mod tests {
             outcome
                 .env_updates
                 .get("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE"),
+            Some(&Some("on"))
+        );
+        assert_eq!(
+            outcome
+                .env_updates
+                .get("CAMELID_X86_Q8_PACKED_ROWS4_AVX512VNNI_DPWSSD_DOT"),
             Some(&Some("on"))
         );
         assert_eq!(
