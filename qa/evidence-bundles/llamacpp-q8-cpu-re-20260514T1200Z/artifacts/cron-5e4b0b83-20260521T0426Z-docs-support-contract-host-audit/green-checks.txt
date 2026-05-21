@@ -1,0 +1,5 @@
+PASS ./scripts/check-public-scrub.sh
+PASS stale host-failure scan: no matches
+PASS stale validation-lane availability scan: no public doc matches
+PASS support-contract guarded scan: matches are guarded exact-row, blocker, default-off, or negative caveat wording
+NOTE remote validation was not attempted in this docs-only run

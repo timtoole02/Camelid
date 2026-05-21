@@ -1,0 +1,6 @@
+Command:
+rg -n -S 'remote validation (was|is) (blocked|down|unavailable)|remote runtime validation (was|is) (blocked|down|unavailable)|validation lane (was|is) (blocked|down|unavailable)|approved Ubuntu validation lane is reopened|remote validation is available again|remote runtime validation is available again' README.md COMPATIBILITY.md STATUS.md ROADMAP.md FULL_SUPPORT_BLOCKER_MATRIX.md docs frontend/README.md qa/validation-notes
+
+Exit: 1
+Output:
+(no matches)
