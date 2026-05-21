@@ -22,10 +22,15 @@ use crate::execution_plan::MAC_Q8_PREFILL_I8MM_MIN_ROWS;
 use crate::metal;
 
 mod kv_cache;
+mod rope;
 
 const Q8_SCHEDULE_TELEMETRY_ENV: &str = "CAMELID_Q8_SCHED_TELEMETRY";
 
 pub use kv_cache::{LlamaKvCache, LlamaKvCachePlan};
+pub use rope::{
+    diagnostic_rope_direction, diagnostic_rope_pairing, diagnostic_rope_position_mode,
+    RopeDirection, RopePairing, RopePositionMode,
+};
 
 use crate::{
     gguf::GgufTensorType,
@@ -159,24 +164,6 @@ pub struct LlamaLoadedWeights {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RopePairing {
-    AdjacentEvenOdd,
-    SplitHalf,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RopeDirection {
-    Forward,
-    Inverse,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RopePositionMode {
-    ZeroBased,
-    OneBased,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputProjectionLayout {
     Descriptor,
     TokenMajor,
@@ -223,40 +210,6 @@ pub enum FfnGateUpOrder {
 pub enum DeltaZeroTarget {
     Attention,
     Ffn,
-}
-
-impl RopePairing {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::AdjacentEvenOdd => "adjacent_even_odd",
-            Self::SplitHalf => "split_half",
-        }
-    }
-}
-
-impl RopeDirection {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Forward => "forward",
-            Self::Inverse => "inverse",
-        }
-    }
-}
-
-impl RopePositionMode {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::ZeroBased => "zero_based",
-            Self::OneBased => "one_based",
-        }
-    }
-
-    fn effective_position(self, position: usize) -> usize {
-        match self {
-            Self::ZeroBased => position,
-            Self::OneBased => position + 1,
-        }
-    }
 }
 
 impl OutputProjectionLayout {
@@ -384,50 +337,6 @@ fn diagnostic_zero_delta_value(key: &str, value: &str, layer_idx: usize) -> Resu
         }
     }
     Ok(false)
-}
-
-pub fn diagnostic_rope_pairing() -> Result<RopePairing> {
-    match env::var("CAMELID_ROPE_PAIRING") {
-        Ok(value) if value == "split_half" => Ok(RopePairing::SplitHalf),
-        Ok(value) if value == "adjacent_even_odd" || value.is_empty() => {
-            Ok(RopePairing::AdjacentEvenOdd)
-        }
-        Ok(value) => Err(BackendError::InvalidModelMetadata(format!(
-            "unsupported CAMELID_ROPE_PAIRING {value:?}; expected adjacent_even_odd or split_half"
-        ))),
-        Err(env::VarError::NotPresent) => Ok(RopePairing::AdjacentEvenOdd),
-        Err(err) => Err(BackendError::InvalidModelMetadata(format!(
-            "invalid CAMELID_ROPE_PAIRING: {err}"
-        ))),
-    }
-}
-
-pub fn diagnostic_rope_direction() -> Result<RopeDirection> {
-    match env::var("CAMELID_ROPE_DIRECTION") {
-        Ok(value) if value == "inverse" => Ok(RopeDirection::Inverse),
-        Ok(value) if value == "forward" || value.is_empty() => Ok(RopeDirection::Forward),
-        Ok(value) => Err(BackendError::InvalidModelMetadata(format!(
-            "unsupported CAMELID_ROPE_DIRECTION {value:?}; expected forward or inverse"
-        ))),
-        Err(env::VarError::NotPresent) => Ok(RopeDirection::Forward),
-        Err(err) => Err(BackendError::InvalidModelMetadata(format!(
-            "invalid CAMELID_ROPE_DIRECTION: {err}"
-        ))),
-    }
-}
-
-pub fn diagnostic_rope_position_mode() -> Result<RopePositionMode> {
-    match env::var("CAMELID_ROPE_POSITION_MODE") {
-        Ok(value) if value == "one_based" => Ok(RopePositionMode::OneBased),
-        Ok(value) if value == "zero_based" || value.is_empty() => Ok(RopePositionMode::ZeroBased),
-        Ok(value) => Err(BackendError::InvalidModelMetadata(format!(
-            "unsupported CAMELID_ROPE_POSITION_MODE {value:?}; expected zero_based or one_based"
-        ))),
-        Err(env::VarError::NotPresent) => Ok(RopePositionMode::ZeroBased),
-        Err(err) => Err(BackendError::InvalidModelMetadata(format!(
-            "invalid CAMELID_ROPE_POSITION_MODE: {err}"
-        ))),
-    }
 }
 
 pub fn diagnostic_gqa_head_mapping() -> Result<GqaHeadMapping> {
