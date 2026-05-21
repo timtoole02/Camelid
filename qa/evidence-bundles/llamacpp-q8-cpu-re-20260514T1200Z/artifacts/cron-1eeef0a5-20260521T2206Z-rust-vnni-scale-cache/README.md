@@ -6,6 +6,10 @@ Source base: `origin/main` at `7904c25` (`test(frontend): harden 3B exact artifa
 
 Branch: `rust-kernel-ubuntu-x86-q8-20260521T1506Z`
 
+Commit: `6bf014c` (`perf(q8): cache VNNI decode scales`)
+
+PR: https://github.com/timtoole02/Camelid/pull/62
+
 ## Slice
 
 Implemented a default-off Rust kernel cleanup for the existing Ubuntu/Linux x86_64 Q8 FFN-down VNNI decode path:
