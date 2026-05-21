@@ -1555,6 +1555,7 @@ fn q8_0_hot_path_uses_resolved_plan_not_current_env() {
             attention_output_decode_consumer: false,
             attention_output_packed_rows4_matmul: false,
             attention_qkv_decode_consumer: false,
+            attention_qkv_decode_group_chunking: false,
             attention_qkv_packed_rows4_matmul: false,
             output_packed_rows4_matmul: false,
             ffn_gate_up_decode_consumer: false,
@@ -2343,6 +2344,7 @@ fn q8_attention_consumer_plan(
             attention_output_decode_consumer: false,
             attention_output_packed_rows4_matmul: false,
             attention_qkv_decode_consumer,
+            attention_qkv_decode_group_chunking: false,
             attention_qkv_packed_rows4_matmul: false,
             output_packed_rows4_matmul: false,
             ffn_gate_up_decode_consumer: false,
@@ -2469,6 +2471,85 @@ fn q8_attention_qkv_consumer_quantizes_once_for_runtime_packed_qkv() {
     assert_slice_close_with_tolerance(&q.data, &q_expected.data, 5e-4);
     assert_slice_close_with_tolerance(&k.data, &k_expected.data, 5e-4);
     assert_slice_close_with_tolerance(&v.data, &v_expected.data, 5e-4);
+}
+
+#[test]
+fn q8_attention_qkv_decode_group_chunking_matches_unchunked_triplet_projection() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+    std::env::set_var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUPS_PER_CHUNK", "7");
+
+    let output_width = X86_Q8_PACKED_ROWS4_DECODE_PARALLEL_MIN_OUTPUTS;
+    let blocks_per_row = 2;
+    let input_width = blocks_per_row * Q8_0_BLOCK_VALUES;
+    let row_blocks: Vec<Q8_0Block> = (0..output_width * blocks_per_row)
+        .map(|idx| Q8_0Block {
+            scale: 0.05 + (idx % 11) as f32 * 0.003,
+            quants: std::array::from_fn(|lane| ((idx * 13 + lane * 7) as i16 % 127 - 63) as i8),
+        })
+        .collect();
+    let q_packed = Q8_0PackedRows4::from_rows(
+        output_width,
+        blocks_per_row,
+        Q8_0PackedRows4Interleave::I8,
+        &row_blocks,
+    )
+    .unwrap();
+    let k_packed = Q8_0PackedRows4::from_rows(
+        output_width,
+        blocks_per_row,
+        Q8_0PackedRows4Interleave::I8,
+        &row_blocks,
+    )
+    .unwrap();
+    let v_packed = Q8_0PackedRows4::from_rows(
+        output_width,
+        blocks_per_row,
+        Q8_0PackedRows4Interleave::I8,
+        &row_blocks,
+    )
+    .unwrap();
+    let input: Vec<f32> = (0..input_width)
+        .map(|idx| (idx as f32 - 17.0) * 0.0625)
+        .collect();
+    let quantized_input = quantize_q8_0_row(&input);
+
+    let (q_expected, k_expected, v_expected) =
+        q8_0_packed_rows4_single_input_projection_triplet_from_quantized(
+            &q_packed,
+            &k_packed,
+            &v_packed,
+            output_width,
+            output_width,
+            output_width,
+            &quantized_input.blocks,
+            false,
+        )
+        .unwrap();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    let (q_actual, k_actual, v_actual) = pool
+        .install(|| {
+            q8_0_packed_rows4_single_input_projection_triplet_from_quantized(
+                &q_packed,
+                &k_packed,
+                &v_packed,
+                output_width,
+                output_width,
+                output_width,
+                &quantized_input.blocks,
+                true,
+            )
+        })
+        .unwrap();
+
+    assert_eq!(x86_q8_attention_qkv_decode_groups_per_chunk(), 7);
+    assert_slice_close_with_tolerance(&q_actual.data, &q_expected.data, 1e-6);
+    assert_slice_close_with_tolerance(&k_actual.data, &k_expected.data, 1e-6);
+    assert_slice_close_with_tolerance(&v_actual.data, &v_expected.data, 1e-6);
+    std::env::remove_var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUPS_PER_CHUNK");
 }
 
 #[test]
@@ -2961,6 +3042,7 @@ fn ffn_down_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             attention_output_decode_consumer: false,
             attention_output_packed_rows4_matmul: false,
             attention_qkv_decode_consumer: false,
+            attention_qkv_decode_group_chunking: false,
             attention_qkv_packed_rows4_matmul: false,
             output_packed_rows4_matmul: false,
             ffn_gate_up_decode_consumer: false,
@@ -2999,6 +3081,7 @@ fn ffn_down_packed_rows4_matmul_plan(enabled: bool) -> ResolvedRuntimePlan {
             attention_output_decode_consumer: false,
             attention_output_packed_rows4_matmul: false,
             attention_qkv_decode_consumer: false,
+            attention_qkv_decode_group_chunking: false,
             attention_qkv_packed_rows4_matmul: false,
             output_packed_rows4_matmul: false,
             ffn_gate_up_decode_consumer: false,
@@ -3043,6 +3126,7 @@ fn ffn_gate_up_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             attention_output_decode_consumer: false,
             attention_output_packed_rows4_matmul: false,
             attention_qkv_decode_consumer: false,
+            attention_qkv_decode_group_chunking: false,
             attention_qkv_packed_rows4_matmul: false,
             output_packed_rows4_matmul: false,
             ffn_gate_up_decode_consumer: enabled,
