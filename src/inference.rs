@@ -43,6 +43,7 @@ use crate::{
 use crate::tensor::Q8_0AmxPackedBlock;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[allow(dead_code)]
 unsafe extern "C" {
     fn camelid_x86_q8_amx_supported() -> std::os::raw::c_int;
     fn camelid_q8_0_amx_compute_tile16(
@@ -8653,15 +8654,9 @@ fn mac_q8_ffn_down_decode_consumer_enabled() -> bool {
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn mac_q8_ffn_down_single_projection_scheduler_counters_enabled() -> bool {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    {
-        q8_0_env_flag_enabled_default_off("CAMELID_MAC_Q8_FFN_DOWN_SINGLE_PROJECTION_COUNTERS")
-    }
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    {
-        false
-    }
+    q8_0_env_flag_enabled_default_off("CAMELID_MAC_Q8_FFN_DOWN_SINGLE_PROJECTION_COUNTERS")
 }
 
 fn q8_ffn_down_decode_consumer_route_name(decode_group_chunking: bool) -> &'static str {
@@ -8806,6 +8801,7 @@ fn q8_0_vnni_tile16_dot_scalar(tile: &Q8_0VnniTile16, input_block: &Q8_0Block) -
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+#[allow(clippy::incompatible_msrv)]
 unsafe fn q8_0_vnni_tile16_dot_avx512(tile: &Q8_0VnniTile16, input_block: &Q8_0Block) -> [i32; 16] {
     #[cfg(target_arch = "x86")]
     use std::arch::x86::{
@@ -17927,6 +17923,7 @@ mod tests {
         std::env::remove_var("CAMELID_MAC_Q8_FFN_DOWN_DECODE_CONSUMER");
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn mac_q8_ffn_down_single_projection_scheduler_counters_are_default_off_and_opt_in() {
         let _env_guard = env_lock();
