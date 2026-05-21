@@ -10161,7 +10161,7 @@ unsafe fn q8_0_packed_rows4_gemm4_accumulate_block_avx2(
     unsafe { _mm_storeu_ps(sums.add(12), _mm_add_ps(sum3, scaled3)) };
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(dead_code, clippy::too_many_arguments)]
 fn q8_0_packed_rows4_matmul_projection_pair_from_quantized(
     rows: usize,
     left_packed: &Q8_0PackedRows4,
