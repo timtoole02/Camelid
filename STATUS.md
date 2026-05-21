@@ -1,6 +1,6 @@
 # Camelid Status
 
-Last updated: 2026-05-18
+Last updated: 2026-05-21
 
 `STATUS.md` is Camelid's current release-evidence checkpoint. It records what Camelid can prove today, what moved recently, and what still blocks the next support change. Treat it as a briefing memo, not a diary. Detailed historical run logs, older validation slices, and superseded tactical notes now live in [`STATUS_ARCHIVE_2026-04.md`](STATUS_ARCHIVE_2026-04.md).
 
@@ -74,7 +74,7 @@ Current public takeaways:
 - Latest local-only packed-rows4 matmul follow-ons chunk parallel output-group traversal and reuse bounded quantized-input scratch for existing single, paired, and triplet multi-row helpers; they keep I8/matching-layout/backend-owned-storage guards and have local fmt/clippy/unit/timing-smoke coverage only, with no Ubuntu x86_64 timing/profiling validation recorded for those local slices.
 - Latest docs/context guard keeps FFN-down GEMM4 AVX2 and output-route-resolver work in the evidence-needed lane: the same-host guard still rejects any Camelid speed promotion, and output route cleanup is implementation guidance only until local plus canonical Ubuntu gates prove it.
 - Latest retained default-off hygiene slices are narrow: FFN-down GEMM4 row-group scheduling has a min-input-groups guard for the shallow-prefill synthetic surface, and ExecutionPlan now clears the FFN gate/up single-owner env gate. These are scheduler/control-plane guards only; they do not widen throughput, support, portability, API/frontend readiness, or default-on claims.
-- Latest docs support-contract/host-reporting retained audit (`qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-5e4b0b83-20260521T0426Z-docs-support-contract-host-audit/README.md`) kept stale Ubuntu host-failure wording, stale validation-lane availability wording, guarded support-contract wording, and public scrub checks green. Remote validation was not attempted in that docs-only run, so it makes no host availability or failure claim.
+- Latest docs support-contract/host-reporting retained audit (`qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-5e4b0b83-20260521T0724Z-docs-support-contract-host-audit/README.md`) kept stale Ubuntu host-failure wording, stale validation-lane availability wording, guarded support-contract wording, public scrub checks, and `git diff --check` green. Remote validation was not attempted in that docs-only run, so it makes no host availability or failure claim.
 
 Boundaries that remain in force:
 

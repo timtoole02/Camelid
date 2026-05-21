@@ -1,0 +1,11 @@
+# commands and outputs:
+
+./scripts/check-public-scrub.sh
+# exit: 0
+# output:
+No output.
+
+git diff --check
+# exit: 0
+# output:
+No output.

@@ -1,0 +1,5 @@
+# command:
+rg -n -S 'Permission denied \(publickey\)|Ubuntu (is )?(blocked|\bdown\b|unavailable)|ubuntu (is )?(blocked|\bdown\b|unavailable)|canonical Ubuntu host (is )?(blocked|\bdown\b|unavailable)|canonical host (is )?(blocked|\bdown\b|unavailable)|host (is )?(blocked|\bdown\b|unavailable).*Ubuntu|Ubuntu.*host (is )?(blocked|\bdown\b|unavailable)' CONTEXT.md docs README.md COMPATIBILITY.md STATUS.md ROADMAP.md FULL_SUPPORT_BLOCKER_MATRIX.md frontend/README.md frontend/src frontend/scripts tests qa/validation-notes qa/evidence-bundles/*/README.md qa/evidence-bundles/*/summary.json
+
+# output:
+No matches.
