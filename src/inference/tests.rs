@@ -3570,7 +3570,7 @@ fn q8_ffn_down_vnni_decode_records_selected_route() {
 fn q8_ffn_down_vnni_decode_rawptr_matches_rows4_decode_baseline() {
     let _env_guard = env_lock();
     clear_dense_diagnostic_env();
-    if !x86_q8_vnni_decode_avx512_supported() {
+    if !x86_q8_vnni_decode_cpu_supported() {
         std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE");
         std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR");
         return;
@@ -3592,6 +3592,36 @@ fn q8_ffn_down_vnni_decode_rawptr_matches_rows4_decode_baseline() {
     assert_eq!(actual.shape.dims, expected.shape.dims);
     assert_slice_close_with_tolerance(&actual.data, &expected.data, 5e-4);
     std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR");
+    std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE");
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn q8_ffn_down_vnni_decode_rawptr_avx2_matches_rows4_decode_baseline() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE");
+        return;
+    }
+    let (input, packed_weight, expected) = runtime_vnni_packed_ffn_down_case();
+    let quantized_input = quantize_q8_0_row(&input.data);
+    let Some(Q8_0RuntimeStorage::PackedRows4(packed)) = packed_weight.q8_0_runtime_storage.as_ref()
+    else {
+        panic!("expected packed rows4 runtime storage");
+    };
+    let vnni_packed = packed.vnni_packed.as_ref().expect("VNNI sidecar");
+    let mut output = vec![0.0_f32; expected.data.len()];
+
+    unsafe {
+        q8_0_vnni_decode_1x64_projection_rawptr_avx2(
+            vnni_packed,
+            &quantized_input.blocks,
+            &mut output,
+        );
+    }
+
+    assert_slice_close_with_tolerance(&output, &expected.data, 5e-4);
     std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE");
 }
 
