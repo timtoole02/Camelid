@@ -592,6 +592,14 @@ pub fn diagnostic_ffn_gate_up_order() -> Result<FfnGateUpOrder> {
     }
 }
 
+#[inline(always)]
+fn apply_ffn_gate_up_order(gate_value: f32, up_value: f32, order: FfnGateUpOrder) -> f32 {
+    match order {
+        FfnGateUpOrder::GateUp => (gate_value / (1.0 + (-gate_value).exp())) * up_value,
+        FfnGateUpOrder::UpGate => (up_value / (1.0 + (-up_value).exp())) * gate_value,
+    }
+}
+
 fn attention_score_scale_value(head_dim: usize, mode: AttentionScoreScale) -> f32 {
     match mode {
         AttentionScoreScale::HeadDim => 1.0 / (head_dim as f32).sqrt(),
@@ -691,6 +699,7 @@ struct Q8RuntimeFlags {
     attention_output_decode_consumer: bool,
     attention_output_packed_rows4_matmul: bool,
     attention_qkv_decode_consumer: bool,
+    attention_qkv_decode_group_chunking: bool,
     attention_qkv_packed_rows4_matmul: bool,
     output_packed_rows4_matmul: bool,
     ffn_gate_up_decode_consumer: bool,
@@ -744,6 +753,9 @@ impl Q8RuntimeFlags {
             ),
             attention_qkv_decode_consumer: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER",
+            ),
+            attention_qkv_decode_group_chunking: q8_0_env_flag_enabled_default_off(
+                "CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUP_CHUNKING",
             ),
             attention_qkv_packed_rows4_matmul: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL",
@@ -7047,10 +7059,7 @@ fn gated_ffn_activation_batch(
     let order = diagnostic_ffn_gate_up_order()?;
     let started = Instant::now();
     for (gate_value, up_value) in gate.data.iter_mut().zip(up.data) {
-        *gate_value = match order {
-            FfnGateUpOrder::GateUp => (*gate_value / (1.0 + (-*gate_value).exp())) * up_value,
-            FfnGateUpOrder::UpGate => (up_value / (1.0 + (-up_value).exp())) * *gate_value,
-        };
+        *gate_value = apply_ffn_gate_up_order(*gate_value, up_value, order);
     }
     gate.name = name;
     let activation_elapsed = started.elapsed().as_micros();
@@ -7126,10 +7135,7 @@ fn try_x86_q8_ffn_gate_up_single_owner_path(
     let order = diagnostic_ffn_gate_up_order()?;
     let activation_started = Instant::now();
     for (gate_value, up_value) in gate.iter_mut().zip(up) {
-        *gate_value = match order {
-            FfnGateUpOrder::GateUp => (*gate_value / (1.0 + (-*gate_value).exp())) * up_value,
-            FfnGateUpOrder::UpGate => (up_value / (1.0 + (-up_value).exp())) * *gate_value,
-        };
+        *gate_value = apply_ffn_gate_up_order(*gate_value, up_value, order);
     }
 
     Ok(Some(GatedFfnActivation {
@@ -7171,19 +7177,19 @@ fn try_x86_q8_ffn_gate_up_packed_rows4_matmul_path(
             return Ok(None);
         };
 
+        let order = diagnostic_ffn_gate_up_order()?;
         let projection_started = Instant::now();
-        let (mut gate, up) = with_q8_0_quantized_matmul_input_rows(
+        let gate = with_q8_0_quantized_matmul_input_rows(
             input,
             route.gate_packed.blocks_per_row,
             |rows, quantized_inputs| {
-                q8_0_packed_rows4_matmul_projection_pair_from_quantized(
+                q8_0_packed_rows4_matmul_projection_pair_activated_from_quantized(
                     rows,
                     route.gate_packed,
                     route.up_packed,
                     route.output_width,
-                    route.output_width,
-                    "ffn_gate_x86_q8_gate_up_packed_rows4_matmul",
-                    "ffn_up_x86_q8_gate_up_packed_rows4_matmul",
+                    name,
+                    order,
                     quantized_inputs,
                 )
             },
@@ -7201,21 +7207,11 @@ fn try_x86_q8_ffn_gate_up_packed_rows4_matmul_path(
         let gate_elapsed = projection_elapsed / 2;
         let up_elapsed = projection_elapsed - gate_elapsed;
 
-        let order = diagnostic_ffn_gate_up_order()?;
-        let activation_started = Instant::now();
-        for (gate_value, up_value) in gate.data.iter_mut().zip(up.data) {
-            *gate_value = match order {
-                FfnGateUpOrder::GateUp => (*gate_value / (1.0 + (-*gate_value).exp())) * up_value,
-                FfnGateUpOrder::UpGate => (up_value / (1.0 + (-up_value).exp())) * *gate_value,
-            };
-        }
-        gate.name = name.to_string();
-
         Ok(Some(GatedFfnActivation {
             tensor: gate,
             gate: gate_elapsed,
             up: up_elapsed,
-            activation: activation_started.elapsed().as_micros(),
+            activation: 0,
             gate_stats: None,
             up_stats: None,
             gate_diagnostic: None,
@@ -8157,6 +8153,25 @@ fn x86_q8_attention_qkv_prefill_consumer_enabled() -> bool {
     }
 }
 
+fn x86_q8_attention_qkv_decode_group_chunking_enabled() -> bool {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUP_CHUNKING")
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        false
+    }
+}
+
+fn x86_q8_attention_qkv_decode_groups_per_chunk() -> usize {
+    env::var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUPS_PER_CHUNK")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(16)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum X86Q8AttentionQkvRouteKind {
     Decode,
@@ -8257,6 +8272,8 @@ fn try_x86_q8_attention_qkv_decode_consumer_path(
         route.k_width,
         route.v_width,
         &quantized_input.blocks,
+        runtime_plan.q8.attention_qkv_decode_group_chunking
+            && x86_q8_attention_qkv_decode_group_chunking_enabled(),
     )?;
     Ok(Some((q, k, v)))
 }
@@ -9448,6 +9465,7 @@ fn q8_0_packed_rows4_single_input_projection_pair_into(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn q8_0_packed_rows4_single_input_projection_triplet_from_quantized(
     q_packed: &Q8_0PackedRows4,
     k_packed: &Q8_0PackedRows4,
@@ -9456,6 +9474,7 @@ fn q8_0_packed_rows4_single_input_projection_triplet_from_quantized(
     k_width: usize,
     v_width: usize,
     quantized_input: &[Q8_0Block],
+    decode_group_chunking: bool,
 ) -> Result<(CpuTensor, CpuTensor, CpuTensor)> {
     let blocks_per_row = q_packed.blocks_per_row;
     if k_packed.blocks_per_row != blocks_per_row
@@ -9498,29 +9517,65 @@ fn q8_0_packed_rows4_single_input_projection_triplet_from_quantized(
         && q_groups > 1
         && should_parallelize_x86_q8_packed_rows4_decode_output(q_width)
     {
-        q_output
-            .par_chunks_mut(4)
-            .zip(k_output.par_chunks_mut(4))
-            .zip(v_output.par_chunks_mut(4))
-            .enumerate()
-            .for_each(|(group_idx, ((q_chunk, k_chunk), v_chunk))| {
-                let group_start = group_idx * blocks_per_row;
-                q_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
-                    &q_packed.blocks[group_start..group_start + blocks_per_row],
-                    quantized_input,
-                    use_hoisted_avx2,
-                ));
-                k_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
-                    &k_packed.blocks[group_start..group_start + blocks_per_row],
-                    quantized_input,
-                    use_hoisted_avx2,
-                ));
-                v_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
-                    &v_packed.blocks[group_start..group_start + blocks_per_row],
-                    quantized_input,
-                    use_hoisted_avx2,
-                ));
-            });
+        if decode_group_chunking {
+            let groups_per_chunk = x86_q8_attention_qkv_decode_groups_per_chunk().min(q_groups);
+            let chunk_floats = groups_per_chunk * 4;
+            q_output
+                .par_chunks_mut(chunk_floats)
+                .zip(k_output.par_chunks_mut(chunk_floats))
+                .zip(v_output.par_chunks_mut(chunk_floats))
+                .enumerate()
+                .for_each(|(chunk_idx, ((q_chunk, k_chunk), v_chunk))| {
+                    let first_group_idx = chunk_idx * groups_per_chunk;
+                    for (local_group_idx, ((q_group, k_group), v_group)) in q_chunk
+                        .chunks_exact_mut(4)
+                        .zip(k_chunk.chunks_exact_mut(4))
+                        .zip(v_chunk.chunks_exact_mut(4))
+                        .enumerate()
+                    {
+                        let group_start = (first_group_idx + local_group_idx) * blocks_per_row;
+                        q_group.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
+                            &q_packed.blocks[group_start..group_start + blocks_per_row],
+                            quantized_input,
+                            use_hoisted_avx2,
+                        ));
+                        k_group.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
+                            &k_packed.blocks[group_start..group_start + blocks_per_row],
+                            quantized_input,
+                            use_hoisted_avx2,
+                        ));
+                        v_group.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
+                            &v_packed.blocks[group_start..group_start + blocks_per_row],
+                            quantized_input,
+                            use_hoisted_avx2,
+                        ));
+                    }
+                });
+        } else {
+            q_output
+                .par_chunks_mut(4)
+                .zip(k_output.par_chunks_mut(4))
+                .zip(v_output.par_chunks_mut(4))
+                .enumerate()
+                .for_each(|(group_idx, ((q_chunk, k_chunk), v_chunk))| {
+                    let group_start = group_idx * blocks_per_row;
+                    q_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
+                        &q_packed.blocks[group_start..group_start + blocks_per_row],
+                        quantized_input,
+                        use_hoisted_avx2,
+                    ));
+                    k_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
+                        &k_packed.blocks[group_start..group_start + blocks_per_row],
+                        quantized_input,
+                        use_hoisted_avx2,
+                    ));
+                    v_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
+                        &v_packed.blocks[group_start..group_start + blocks_per_row],
+                        quantized_input,
+                        use_hoisted_avx2,
+                    ));
+                });
+        }
     } else if q_width == k_width && q_width == v_width {
         for (group_idx, ((q_chunk, k_chunk), v_chunk)) in q_output
             .chunks_exact_mut(4)
@@ -10297,7 +10352,7 @@ unsafe fn q8_0_packed_rows4_gemm4_accumulate_block_avx2(
     unsafe { _mm_storeu_ps(sums.add(12), _mm_add_ps(sum3, scaled3)) };
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(dead_code, clippy::too_many_arguments)]
 fn q8_0_packed_rows4_matmul_projection_pair_from_quantized(
     rows: usize,
     left_packed: &Q8_0PackedRows4,
@@ -10424,6 +10479,115 @@ fn q8_0_packed_rows4_matmul_projection_pair_from_quantized(
         CpuTensor::from_f32(left_name, vec![rows, left_output_width], left_output)?,
         CpuTensor::from_f32(right_name, vec![rows, right_output_width], right_output)?,
     ))
+}
+
+#[cfg(any(test, target_arch = "x86", target_arch = "x86_64"))]
+fn validate_q8_0_packed_rows4_pair_matmul_inputs(
+    rows: usize,
+    left_packed: &Q8_0PackedRows4,
+    right_packed: &Q8_0PackedRows4,
+    output_width: usize,
+    quantized_inputs: &[Q8_0Block],
+    context: &str,
+) -> Result<(usize, usize)> {
+    let blocks_per_row = left_packed.blocks_per_row;
+    if right_packed.blocks_per_row != blocks_per_row {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "Q8_0 packed rows4 {context} blocks_per_row mismatch: left={}, right={}",
+            left_packed.blocks_per_row, right_packed.blocks_per_row
+        )));
+    }
+    if left_packed.interleave != Q8_0PackedRows4Interleave::I8
+        || right_packed.interleave != Q8_0PackedRows4Interleave::I8
+    {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "Q8_0 packed rows4 {context} requires I8 interleave"
+        )));
+    }
+    let expected_quantized_blocks = rows.checked_mul(blocks_per_row).ok_or_else(|| {
+        BackendError::RuntimeShapeMismatch(format!(
+            "Q8_0 packed rows4 {context} input block count overflow"
+        ))
+    })?;
+    if quantized_inputs.len() != expected_quantized_blocks {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "Q8_0 packed rows4 {context} expected {expected_quantized_blocks} quantized input blocks, got {}",
+            quantized_inputs.len()
+        )));
+    }
+    if left_packed.rows != output_width || right_packed.rows != output_width {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "Q8_0 packed rows4 {context} output width mismatch: left packed rows={}, requested={}, right packed rows={}",
+            left_packed.rows, output_width, right_packed.rows
+        )));
+    }
+    let output_groups_per_row =
+        q8_0_packed_rows4_output_groups(output_width, "pair matmul fused projection")?;
+    Ok((blocks_per_row, output_groups_per_row))
+}
+
+#[cfg(any(test, target_arch = "x86", target_arch = "x86_64"))]
+fn q8_0_packed_rows4_matmul_projection_pair_activated_from_quantized(
+    rows: usize,
+    gate_packed: &Q8_0PackedRows4,
+    up_packed: &Q8_0PackedRows4,
+    output_width: usize,
+    name: &str,
+    order: FfnGateUpOrder,
+    quantized_inputs: &[Q8_0Block],
+) -> Result<CpuTensor> {
+    let (blocks_per_row, output_groups_per_row) = validate_q8_0_packed_rows4_pair_matmul_inputs(
+        rows,
+        gate_packed,
+        up_packed,
+        output_width,
+        quantized_inputs,
+        "fused gate/up matmul activation",
+    )?;
+
+    let mut output = vec![0.0_f32; rows * output_width];
+    let use_hoisted_avx2 = x86_q8_packed_rows4_avx2_dot_hoist_enabled();
+    let total_output_groups = rows * output_groups_per_row;
+    let compute_group = |flat_group_idx: usize, output_group: &mut [f32]| {
+        let row_idx = flat_group_idx / output_groups_per_row;
+        let group_idx = flat_group_idx % output_groups_per_row;
+        let input_start = row_idx * blocks_per_row;
+        let group_start = group_idx * blocks_per_row;
+        let quantized_row = &quantized_inputs[input_start..input_start + blocks_per_row];
+        let gate_sums = q8_0_packed_rows4_dot_i8_matmul(
+            &gate_packed.blocks[group_start..group_start + blocks_per_row],
+            quantized_row,
+            use_hoisted_avx2,
+        );
+        let up_sums = q8_0_packed_rows4_dot_i8_matmul(
+            &up_packed.blocks[group_start..group_start + blocks_per_row],
+            quantized_row,
+            use_hoisted_avx2,
+        );
+        for lane in 0..4 {
+            output_group[lane] = apply_ffn_gate_up_order(gate_sums[lane], up_sums[lane], order);
+        }
+    };
+
+    if should_parallelize_q8_packed_rows4_matmul(total_output_groups) {
+        let chunk_floats = q8_packed_rows4_matmul_parallel_chunk_floats(total_output_groups);
+        output
+            .par_chunks_mut(chunk_floats)
+            .enumerate()
+            .for_each(|(chunk_idx, output_chunk)| {
+                let first_group_idx = chunk_idx * (chunk_floats / 4);
+                for (local_group_idx, output_group) in output_chunk.chunks_exact_mut(4).enumerate()
+                {
+                    compute_group(first_group_idx + local_group_idx, output_group);
+                }
+            });
+    } else {
+        for (flat_group_idx, output_group) in output.chunks_exact_mut(4).enumerate() {
+            compute_group(flat_group_idx, output_group);
+        }
+    }
+
+    CpuTensor::from_f32(name, vec![rows, output_width], output)
 }
 
 #[allow(clippy::too_many_arguments)]
