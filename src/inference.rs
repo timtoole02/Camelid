@@ -9193,6 +9193,7 @@ fn q8_0_packed_rows4_single_input_projection_pair_into(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn q8_0_packed_rows4_single_input_projection_triplet_from_quantized(
     q_packed: &Q8_0PackedRows4,
     k_packed: &Q8_0PackedRows4,
