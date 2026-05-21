@@ -1,4 +1,4 @@
-remote_uname=Linux ip-172-31-19-175 6.17.0-1013-aws #13~24.04.1-Ubuntu SMP Fri Apr 24 21:50:45 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+remote_uname=Linux canonical-private-ubuntu-validation-host 6.17.0-1013-aws #13~24.04.1-Ubuntu SMP Fri Apr 24 21:50:45 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
 remote_head=601183d2d0390160a15a792b975a5ad5281f045c
 rustc 1.95.0 (59807616e 2026-04-14)
 cargo 1.95.0 (f2d3ce0bd 2026-03-21)
@@ -507,4 +507,3 @@ test tests::parses_comma_separated_tokens ... ok
 test tests::ranks_logits_and_tracks_requested_tokens ... ok
 
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
-
