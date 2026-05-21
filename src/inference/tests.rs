@@ -3740,6 +3740,7 @@ fn q8_vnni_tile16_avx2_matches_scalar_for_extreme_i8_values() {
     let mut tile = Q8_0VnniTile16 {
         quants: [0; 512],
         scale_f16: [0x3c00; 16],
+        scale_f32: [1.0; 16],
         comp: [0; 16],
     };
     for lane in 0..16 {

@@ -8954,9 +8954,7 @@ fn q8_0_vnni_decode_1x64_projection_into(
                 let tile = &packed.tiles[tile_idx];
                 let int_sums = q8_0_vnni_tile16_dot(tile, input_block);
                 for (lane, sum) in sums.iter_mut().enumerate() {
-                    *sum += int_sums[lane] as f32
-                        * input_block.scale
-                        * f16_bits_to_f32(tile.scale_f16[lane]);
+                    *sum += int_sums[lane] as f32 * input_block.scale * tile.scale_f32[lane];
                 }
             }
             output_chunk[tile_col * 16..tile_col * 16 + 16].copy_from_slice(&sums);
@@ -9047,12 +9045,8 @@ unsafe fn q8_0_vnni_decode_group64_rawptr_avx512(
             let input_block = unsafe { &*quantized_input.add(block_idx) };
             let ints = unsafe { q8_0_vnni_tile16_i32_avx512(tile, input_block) };
             let ints = _mm512_cvtepi32_ps(ints);
-            let mut scales = [0.0_f32; 16];
-            for (dst, scale_bits) in scales.iter_mut().zip(tile.scale_f16.iter().copied()) {
-                *dst = f16_bits_to_f32(scale_bits);
-            }
             let scales = _mm512_mul_ps(
-                _mm512_loadu_ps(scales.as_ptr()),
+                _mm512_loadu_ps(tile.scale_f32.as_ptr()),
                 _mm512_set1_ps(input_block.scale),
             );
             acc = _mm512_fmadd_ps(ints, scales, acc);

@@ -1,0 +1,13 @@
+git fetch origin main
+git worktree add .openclaw-worktrees/rust-kernel-ubuntu-x86-q8-20260521T1506Z origin/main -b rust-kernel-ubuntu-x86-q8-20260521T1506Z
+uname -a
+rustc -Vv
+cargo -V
+cargo fmt --check
+cargo check
+cargo test q8_0_vnni --lib
+cargo test q8_ffn_down_vnni --lib
+cargo test q8_vnni_tile16 --lib
+cargo test vnni --lib
+cargo test --lib
+cargo check --target x86_64-unknown-linux-gnu

@@ -1,0 +1,14 @@
+base: origin/main 7904c25 test(frontend): harden 3B exact artifact closure
+branch: rust-kernel-ubuntu-x86-q8-20260521T1506Z
+commit: 6bf014c perf(q8): cache VNNI decode scales
+pr: https://github.com/timtoole02/Camelid/pull/62
+
+Changed files before commit:
+
+M docs/performance/ubuntu-x86-q8.md
+M src/inference.rs
+M src/inference/tests.rs
+M src/tensor/mod.rs
+A qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-1eeef0a5-20260521T2206Z-rust-vnni-scale-cache/README.md
+A qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-1eeef0a5-20260521T2206Z-rust-vnni-scale-cache/commands.txt
+A qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-1eeef0a5-20260521T2206Z-rust-vnni-scale-cache/git-state.txt
