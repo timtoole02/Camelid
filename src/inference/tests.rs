@@ -4586,6 +4586,99 @@ fn q8_ffn_gate_up_packed_rows4_matmul_is_plan_gated_and_prefill_limited() {
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[test]
+fn q8_ffn_gate_up_prefill_route_resolver_records_route_and_denials() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+    std::env::set_var(Q8_SCHEDULE_TELEMETRY_ENV, "on");
+    reset_q8_schedule_telemetry();
+    let (decode_input, packed_gate, packed_up, _expected) = runtime_packed_ffn_gate_up_case();
+    let input_width = packed_gate.dim(0).unwrap();
+    let output_width = packed_gate.dim(1).unwrap();
+    let rows = 3;
+    let prefill_input = CpuTensor::from_f32(
+        "prefill_gate_up_input",
+        vec![rows, input_width],
+        (0..rows * input_width)
+            .map(|idx| {
+                ((idx % input_width) as f32 - 7.0) * 0.109375
+                    + (idx / input_width) as f32 * 0.046875
+            })
+            .collect(),
+    )
+    .unwrap();
+    let route_name = X86Q8FfnGateUpRouteKind::PackedRows4Matmul.telemetry_name();
+
+    let route = resolve_x86_q8_ffn_gate_up_route(
+        &prefill_input,
+        &packed_gate,
+        &packed_up,
+        &ffn_gate_up_packed_rows4_matmul_plan(true),
+        X86Q8FfnGateUpRouteKind::PackedRows4Matmul,
+    )
+    .unwrap()
+    .expect("prefill route should accept multi-row runtime-packed FFN gate/up weights");
+    assert_eq!(route.rows, rows);
+    assert_eq!(route.input_width, input_width);
+    assert_eq!(route.output_width, output_width);
+
+    assert!(resolve_x86_q8_ffn_gate_up_route(
+        &decode_input,
+        &packed_gate,
+        &packed_up,
+        &ffn_gate_up_packed_rows4_matmul_plan(true),
+        X86Q8FfnGateUpRouteKind::PackedRows4Matmul,
+    )
+    .unwrap()
+    .is_none());
+    assert!(resolve_x86_q8_ffn_gate_up_route(
+        &prefill_input,
+        &packed_gate,
+        &packed_up,
+        &ffn_gate_up_packed_rows4_matmul_plan(false),
+        X86Q8FfnGateUpRouteKind::PackedRows4Matmul,
+    )
+    .unwrap()
+    .is_none());
+
+    let actual = try_x86_q8_ffn_gate_up_packed_rows4_matmul_path(
+        &prefill_input,
+        &packed_gate,
+        &packed_up,
+        "layer_3_ffn_activated",
+        &ffn_gate_up_packed_rows4_matmul_plan(true),
+    )
+    .unwrap()
+    .expect("prefill route should produce the fused gate/up activation");
+    assert_eq!(actual.tensor.shape.dims, vec![rows, output_width]);
+
+    let telemetry = snapshot_q8_schedule_telemetry();
+    let by_route = telemetry
+        .output_projection_by_route
+        .get(&format!("ffn_gate_up.{route_name}"))
+        .expect("FFN gate/up prefill route telemetry");
+    assert_eq!(by_route.calls, 1);
+    assert_eq!(by_route.rows, rows as u64);
+    assert_eq!(by_route.input_width, input_width as u64);
+    assert_eq!(by_route.output_width, output_width as u64);
+    let layer_route = telemetry
+        .output_projection_by_layer_route
+        .get(&format!("layer_3.ffn_gate_up.{route_name}"))
+        .expect("layer-scoped FFN gate/up prefill route telemetry");
+    assert_eq!(layer_route.layer_index, 3);
+    assert_eq!(layer_route.calls, 1);
+    assert!(telemetry
+        .projection_route_denials
+        .contains_key(&format!("ffn_gate_up.{route_name}.decode_or_empty_input")));
+    assert!(telemetry
+        .projection_route_denials
+        .contains_key(&format!("ffn_gate_up.{route_name}.plan_off")));
+
+    reset_q8_schedule_telemetry();
+    std::env::remove_var(Q8_SCHEDULE_TELEMETRY_ENV);
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[test]
 fn q8_ffn_gate_up_single_owner_matches_decode_and_prefill_owners() {
     let _env_guard = env_lock();
     clear_dense_diagnostic_env();

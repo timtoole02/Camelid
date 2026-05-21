@@ -7160,53 +7160,28 @@ fn try_x86_q8_ffn_gate_up_packed_rows4_matmul_path(
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        let rows = input.dim(0)?;
-        if !runtime_plan.q8.ffn_gate_up_packed_rows4_matmul || input.rank() != 2 || rows <= 1 {
-            return Ok(None);
-        }
-        let input_width = input.dim(1)?;
-        if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
-            return Ok(None);
-        }
-
-        let gate_width = linear_output_width(input, gate_weight, "ffn gate")?;
-        let up_width = linear_output_width(input, up_weight, "ffn up")?;
-        if gate_width != up_width {
-            return Err(BackendError::RuntimeShapeMismatch(format!(
-                "gated FFN gate/up width mismatch: gate output {gate_width}, up output {up_width}"
-            )));
-        }
-
-        let Some((gate_packed, packed_gate_width)) =
-            q8_0_runtime_packed_projection(gate_weight, input_width)?
+        let Some(route) = resolve_x86_q8_ffn_gate_up_route(
+            input,
+            gate_weight,
+            up_weight,
+            runtime_plan,
+            X86Q8FfnGateUpRouteKind::PackedRows4Matmul,
+        )?
         else {
             return Ok(None);
         };
-        let Some((up_packed, packed_up_width)) =
-            q8_0_runtime_packed_projection(up_weight, input_width)?
-        else {
-            return Ok(None);
-        };
-        if packed_gate_width != gate_width
-            || packed_up_width != up_width
-            || gate_packed.interleave != Q8_0PackedRows4Interleave::I8
-            || up_packed.interleave != Q8_0PackedRows4Interleave::I8
-            || gate_packed.blocks_per_row != up_packed.blocks_per_row
-        {
-            return Ok(None);
-        }
 
         let projection_started = Instant::now();
         let (mut gate, up) = with_q8_0_quantized_matmul_input_rows(
             input,
-            gate_packed.blocks_per_row,
+            route.gate_packed.blocks_per_row,
             |rows, quantized_inputs| {
                 q8_0_packed_rows4_matmul_projection_pair_from_quantized(
                     rows,
-                    gate_packed,
-                    up_packed,
-                    gate_width,
-                    up_width,
+                    route.gate_packed,
+                    route.up_packed,
+                    route.output_width,
+                    route.output_width,
                     "ffn_gate_x86_q8_gate_up_packed_rows4_matmul",
                     "ffn_up_x86_q8_gate_up_packed_rows4_matmul",
                     quantized_inputs,
@@ -7214,6 +7189,15 @@ fn try_x86_q8_ffn_gate_up_packed_rows4_matmul_path(
             },
         )?;
         let projection_elapsed = projection_started.elapsed().as_micros();
+        record_q8_schedule_output_projection_route_call(
+            "ffn_gate_up",
+            X86Q8FfnGateUpRouteKind::PackedRows4Matmul.telemetry_name(),
+            Some(name),
+            route.rows,
+            route.input_width,
+            route.output_width,
+            projection_elapsed,
+        );
         let gate_elapsed = projection_elapsed / 2;
         let up_elapsed = projection_elapsed - gate_elapsed;
 
@@ -8313,6 +8297,174 @@ fn try_x86_q8_attention_qkv_packed_rows4_matmul_path(
         },
     )?;
     Ok(Some((q, k, v)))
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum X86Q8FfnGateUpRouteKind {
+    PackedRows4Matmul,
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+impl X86Q8FfnGateUpRouteKind {
+    fn telemetry_name(self) -> &'static str {
+        match self {
+            Self::PackedRows4Matmul => "packed_rows4_matmul_prefill",
+        }
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+struct X86Q8FfnGateUpRoute<'a> {
+    gate_packed: &'a Q8_0PackedRows4,
+    up_packed: &'a Q8_0PackedRows4,
+    rows: usize,
+    input_width: usize,
+    output_width: usize,
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn resolve_x86_q8_ffn_gate_up_route<'a>(
+    input: &CpuTensor,
+    gate_weight: &'a CpuTensor,
+    up_weight: &'a CpuTensor,
+    runtime_plan: &ResolvedRuntimePlan,
+    route: X86Q8FfnGateUpRouteKind,
+) -> Result<Option<X86Q8FfnGateUpRoute<'a>>> {
+    let route_enabled = match route {
+        X86Q8FfnGateUpRouteKind::PackedRows4Matmul => {
+            runtime_plan.q8.ffn_gate_up_packed_rows4_matmul
+        }
+    };
+    let route_name = route.telemetry_name();
+    if !route_enabled || input.rank() != 2 {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up",
+            route_name,
+            if !route_enabled {
+                "plan_off"
+            } else {
+                "rank_mismatch"
+            },
+            input.dim(0).unwrap_or(0),
+            input.dim(1).unwrap_or(0),
+            0,
+        );
+        return Ok(None);
+    }
+
+    let rows = input.dim(0)?;
+    match route {
+        X86Q8FfnGateUpRouteKind::PackedRows4Matmul if rows <= 1 => {
+            record_q8_schedule_projection_route_denial(
+                "ffn_gate_up",
+                route_name,
+                "decode_or_empty_input",
+                rows,
+                input.dim(1).unwrap_or(0),
+                0,
+            );
+            return Ok(None);
+        }
+        _ => {}
+    }
+
+    let input_width = input.dim(1)?;
+    if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up",
+            route_name,
+            "bad_input_width",
+            rows,
+            input_width,
+            0,
+        );
+        return Ok(None);
+    }
+
+    let gate_width = linear_output_width(input, gate_weight, "ffn gate")?;
+    let up_width = linear_output_width(input, up_weight, "ffn up")?;
+    if gate_width != up_width {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "gated FFN gate/up width mismatch: gate output {gate_width}, up output {up_width}"
+        )));
+    }
+
+    let Some((gate_packed, packed_gate_width)) =
+        q8_0_runtime_packed_projection(gate_weight, input_width)?
+    else {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up",
+            route_name,
+            "no_runtime_packed_gate",
+            rows,
+            input_width,
+            gate_width,
+        );
+        return Ok(None);
+    };
+    let Some((up_packed, packed_up_width)) =
+        q8_0_runtime_packed_projection(up_weight, input_width)?
+    else {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up",
+            route_name,
+            "no_runtime_packed_up",
+            rows,
+            input_width,
+            up_width,
+        );
+        return Ok(None);
+    };
+    if packed_gate_width != gate_width
+        || packed_up_width != up_width
+        || gate_packed.rows != gate_width
+        || up_packed.rows != up_width
+        || gate_packed.blocks_per_row != input_width / Q8_0_BLOCK_VALUES
+        || up_packed.blocks_per_row != input_width / Q8_0_BLOCK_VALUES
+    {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up",
+            route_name,
+            "packed_shape_mismatch",
+            rows,
+            input_width,
+            gate_width,
+        );
+        return Ok(None);
+    }
+    if gate_packed.interleave != Q8_0PackedRows4Interleave::I8
+        || up_packed.interleave != Q8_0PackedRows4Interleave::I8
+    {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up",
+            route_name,
+            "non_i8_interleave",
+            rows,
+            input_width,
+            gate_width,
+        );
+        return Ok(None);
+    }
+    if gate_packed.blocks_per_row != up_packed.blocks_per_row {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up",
+            route_name,
+            "gate_up_block_stride_mismatch",
+            rows,
+            input_width,
+            gate_width,
+        );
+        return Ok(None);
+    }
+
+    Ok(Some(X86Q8FfnGateUpRoute {
+        gate_packed,
+        up_packed,
+        rows,
+        input_width,
+        output_width: gate_width,
+    }))
 }
 
 fn try_x86_q8_ffn_gate_up_decode_consumer_path(
