@@ -1,0 +1,42 @@
+{
+  "schema": "camelid.frontend_3b_catalog_exact_row_badge.v1",
+  "source_head_before_slice": "93a6502c1726e75a1d86def9edd753acc1f59db1",
+  "branch": "frontend-3b-closure-6e9017a8-20260520",
+  "retained": true,
+  "support_boundary": "Exact Llama 3.2 3B Instruct Q8_0 row only; no neighboring-row, broader-family, production-throughput, model-native larger-context, or portability support is implied.",
+  "changed_files": [
+    "frontend/src/views/ModelsView.jsx",
+    "frontend/scripts/frontend-3b-closure-smoke.mjs"
+  ],
+  "gates": {
+    "frontend_build": "pass",
+    "frontend_smoke_model_state": "pass",
+    "frontend_smoke_streaming": "pass",
+    "frontend_smoke_ui": "pass",
+    "frontend_smoke_integration": "pass",
+    "frontend_smoke_3b_closure": "pass",
+    "frontend_smoke_tiny_with_local_backend": "pass",
+    "public_scrub": "pass",
+    "evidence_privacy_unit": "pass",
+    "public_evidence_claims_unit": "pass"
+  },
+  "remote_3b_api_probe": {
+    "attempted_in_this_run": true,
+    "repo_head": "93a6502c1726e75a1d86def9edd753acc1f59db1",
+    "load_id": "llama-3.2-3b-instruct-q8",
+    "tokenizer": "available",
+    "tensors_bound": true,
+    "gguf_file_type": 7,
+    "loaded_now": true,
+    "generation_ready": true,
+    "active_model_id": "llama-3.2-3b-instruct-q8",
+    "capability_row": "llama32_3b_instruct_q8_0",
+    "capability_status": "supported_exact_row_smoke",
+    "quantization": "Q8_0",
+    "chat_template_renderer": "metadata_jinja_supported_for_exact_row",
+    "performance_measured": "bounded_unique_chat_perf_rss_validated",
+    "chat_finish_reason": "length",
+    "completion_tokens": 1,
+    "non_empty_content": true
+  }
+}

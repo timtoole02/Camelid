@@ -31,9 +31,10 @@ function getChatCapabilityLaneCopy(selectedChatGate, capabilities) {
 
   const lanes = exactRowSupportLanes(selectedChatGate.hint.target, capabilities?.api_features || [])
   const template = lanes.find((lane) => lane.key === 'template')
+  const context = lanes.find((lane) => lane.key === 'context')
   const throughput = lanes.find((lane) => lane.key === 'throughput')
   return {
-    label: `${template?.ready ? 'Template ready' : 'Template gated'} · ${throughput?.ready ? 'Throughput ready' : 'Throughput not promoted'}`,
+    label: `${template?.ready ? 'Template ready' : 'Template gated'} · ${context?.ready ? 'Context ready' : 'Context gated'} · ${throughput?.ready ? 'Throughput ready' : 'Throughput not promoted'}`,
     copy: 'Row-scoped /api/capabilities evidence; it does not widen model-native context, production-throughput, portability, neighboring-row, or broad-family support.',
   }
 }
@@ -515,6 +516,13 @@ export default function ChatWorkspace({
   const selectedRuntimeReady = selectedChatGate.runtimeReady || isRunnableInCurrentRuntime(selectedModel, runtime)
   const selectedModelCapabilitySupported = selectedChatGate.contractSupported || isCompatibilitySupportedForModel(capabilities, selectedModel)
   const supportBlocked = selectedRuntimeReady && !selectedModelCapabilitySupported
+  const selectedCompatibilityHint = selectedChatGate.hint || findCompatibilityHint(capabilities, selectedModel)
+  const selectedCompatibilityLabel = selectedModel
+    ? compatibilityHintLabel(selectedCompatibilityHint, 'No matching COMPATIBILITY.md row')
+    : 'No model selected'
+  const selectedCompatibilityCopy = selectedModel
+    ? compatibilityHintCopy(selectedCompatibilityHint)
+    : 'Choose a model before inferring any support boundary. Camelid will not promote filenames or saved paths into compatibility claims.'
   const selectedModelMeta = supportBlocked
     ? 'Load a supported model to chat'
     : !selectedModelRunnable
@@ -523,14 +531,7 @@ export default function ChatWorkspace({
       ? 'Ready'
       : 'Ready to chat'
   const canSubmit = Boolean(composer.trim()) && selectedModelRunnable && !generationActive
-  const selectedCompatibilityHint = findCompatibilityHint(capabilities, selectedModel)
   const capabilityLaneStatus = getChatCapabilityLaneCopy(selectedChatGate, capabilities)
-  const selectedCompatibilityLabel = selectedModel
-    ? compatibilityHintLabel(selectedCompatibilityHint, 'No matching COMPATIBILITY.md row')
-    : 'No model selected'
-  const selectedCompatibilityCopy = selectedModel
-    ? compatibilityHintCopy(selectedCompatibilityHint)
-    : 'Choose a model before inferring any support boundary. Camelid will not promote filenames or saved paths into compatibility claims.'
   const selectedModelName = selectedModel?.name || selectedModelId || 'No model selected'
   const runtimeStatusLabel = selectedModelRunnable
     ? 'Local chat ready'
@@ -547,12 +548,12 @@ export default function ChatWorkspace({
         ? 'Wait for generation_ready=true before sending prompts.'
         : 'Load a local GGUF from Library to start the readiness check.'
   const supportStatusLabel = selectedModelCapabilitySupported
-    ? 'Exact row supported'
+    ? selectedCompatibilityLabel
     : selectedModel
       ? selectedCompatibilityLabel
       : 'Choose model first'
   const supportStatusCopy = selectedModelCapabilitySupported
-    ? 'COMPATIBILITY.md and /api/capabilities agree for this model and quant.'
+    ? `${selectedCompatibilityLabel}. COMPATIBILITY.md and /api/capabilities agree for this model and quant.`
     : selectedModel
       ? selectedCompatibilityCopy
       : 'Camelid does not infer broad support from filenames, families, or saved paths.'

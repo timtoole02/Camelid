@@ -1,0 +1,26 @@
+Local branch/head:
+git switch -c frontend-3b-closure-6e9017a8-20260520 origin/main
+git rev-parse HEAD
+
+Targeted implementation gates:
+cd frontend
+npm run smoke:3b-closure
+npm run build
+npm run smoke:model-state
+npm run smoke:streaming
+npm run smoke:ui
+npm run smoke:integration
+
+Local backend/frontend smoke:
+cargo run -- serve --addr 127.0.0.1:8181
+cd frontend
+npm run dev
+npm run smoke:tiny
+
+Public scrub/privacy gates:
+scripts/check-public-scrub.sh
+node scripts/test-audit-evidence-bundle-privacy.mjs
+node scripts/test-check-public-evidence-claims.mjs
+
+Canonical Ubuntu 3B API probe:
+project-private SSH command from the cron payload, current main checkout, rustup cargo wrapper, local loopback API port, exact Llama 3.2 3B Instruct Q8_0 GGUF, /api/models/load, /v1/health, /api/capabilities, and /v1/chat/completions one-token request.

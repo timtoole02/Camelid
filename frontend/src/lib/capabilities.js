@@ -86,6 +86,48 @@ const EXACT_LLAMA_PROMOTION_ROWS = [
   { id: 'llama3_8b_instruct_q8_0', versionKey: '3', sizeKey: '8B', requiresInstruct: true },
 ]
 
+const EXACT_ARTIFACT_GATED_ROWS = {
+  llama32_3b_instruct_q8_0: 'Llama-3.2-3B-Instruct-Q8_0.gguf',
+}
+
+function pathBasename(value) {
+  return String(value || '').split(/[\\/]/).filter(Boolean).pop() || ''
+}
+
+function exactArtifactFilenameForRow(row) {
+  return EXACT_ARTIFACT_GATED_ROWS[row?.id] || null
+}
+
+function hasExactArtifactIdentity(row, model, catalogItem) {
+  const filename = exactArtifactFilenameForRow(row)
+  if (!filename) return true
+  const observedFilenames = [
+    model?.model_path,
+    model?.path,
+    model?.hf_filename,
+    model?.source,
+    catalogItem?.filename,
+    catalogItem?.source,
+  ].map(pathBasename).filter(Boolean)
+  return observedFilenames.some((observed) => observed.toLowerCase() === filename.toLowerCase())
+}
+
+function exactArtifactMissingHint(target) {
+  return {
+    kind: 'artifact_mismatch',
+    target,
+    confidence: 'exact row id or model-size label without required GGUF filename evidence',
+    exact: false,
+  }
+}
+
+function applyExactArtifactGate(hint, model, catalogItem) {
+  if (!hint?.target) return hint
+  if (hint.kind === 'quant_mismatch') return hint
+  if (!hasExactArtifactIdentity(hint.target, model, catalogItem)) return exactArtifactMissingHint(hint.target)
+  return hint
+}
+
 function detectLlamaBpeTarget(subject) {
   if (!/llama[\s._-]*3|meta[\s._-]*llama[\s._-]*3/.test(subject)) return null
   const sizeMatch = subject.match(/(?:^|[^a-z0-9])([138])\s*b(?:[^a-z0-9]|$)/i)
@@ -210,6 +252,25 @@ function hasExactRowBoundedPerformanceEvidence(target) {
     || performance.includes('hotpath')
 }
 
+const CHECKED_CONTEXT_PACK_FIELDS = [
+  ['512', 'bounded_context_512_pack'],
+  ['1024', 'bounded_context_1024_pack'],
+  ['2048', 'bounded_context_2048_pack'],
+  ['4096', 'bounded_context_4096_pack'],
+  ['8192', 'bounded_context_8192_pack'],
+]
+
+function checkedContextPacks(target) {
+  return CHECKED_CONTEXT_PACK_FIELDS
+    .map(([label, field]) => ({ label, status: target?.[field] || '' }))
+    .filter((pack) => pack.status)
+}
+
+function readyCheckedContextPacks(target) {
+  if (!isSupportedCapabilityStatus(target?.status || '')) return []
+  return checkedContextPacks(target).filter((pack) => statusContainsSupportedEvidence(pack.status))
+}
+
 export function describeTemplateReadiness(target) {
   if (!target) {
     return { key: 'template', label: 'Template/Jinja', status: 'No exact row selected', tone: '', ready: false, copy: 'Choose an exact compatibility row before treating template behavior as supported.' }
@@ -236,6 +297,33 @@ export function describeTemplateReadiness(target) {
         ? `Template/Jinja readiness is green for this supported exact row: metadata-Jinja renderer ${formatCapabilityStatus(renderer)} with ${formatCapabilityStatus(shapePack || 'row evidence')} coverage.`
         : `Template readiness is green for this supported exact row: renderer ${formatCapabilityStatus(renderer || 'not advertised')} with ${formatCapabilityStatus(shapePack || 'row evidence')} coverage.`
       : 'Template/Jinja evidence is not promoted for this row; keep readiness guarded until /api/capabilities reports supported row evidence.',
+  }
+}
+
+export function describeCheckedContextReadiness(target) {
+  if (!target) {
+    return { key: 'context', label: 'Checked context', status: 'No exact row selected', tone: '', ready: false, copy: 'Choose an exact compatibility row before treating context behavior as supported.' }
+  }
+
+  const packs = checkedContextPacks(target)
+  const readyPacks = readyCheckedContextPacks(target)
+  const ready = readyPacks.length > 0
+  const latest = [target.latest_checked_bucket, target.latest_checked_result].filter(Boolean).map(formatCapabilityStatus).join(' · ')
+  const status = readyPacks.length
+    ? readyPacks.map((pack) => `${pack.label}: ${formatCapabilityStatus(pack.status)}`).join(' · ')
+    : packs.length
+      ? packs.map((pack) => `${pack.label}: ${formatCapabilityStatus(pack.status)}`).join(' · ')
+      : latest || 'not advertised'
+
+  return {
+    key: 'context',
+    label: ready ? 'Checked context packs ready for this exact row' : 'Checked context packs not promoted',
+    status,
+    tone: ready ? 'ready' : 'warm',
+    ready,
+    copy: ready
+      ? `Checked context readiness is green for this supported exact row: ${readyPacks.map((pack) => `${pack.label} context ${formatCapabilityStatus(pack.status)}`).join(', ')}${latest ? `; latest checked ${latest}` : ''}. This does not promote model-native/larger context beyond the checked packs.`
+      : 'Checked context evidence is not promoted for this row; keep context claims guarded until /api/capabilities reports supported exact-row context packs.',
   }
 }
 
@@ -266,7 +354,7 @@ export function describeThroughputReadiness(target, apiFeatures = []) {
 }
 
 export function exactRowSupportLanes(target, apiFeatures = []) {
-  return [describeTemplateReadiness(target), describeThroughputReadiness(target, apiFeatures)]
+  return [describeTemplateReadiness(target), describeCheckedContextReadiness(target), describeThroughputReadiness(target, apiFeatures)]
 }
 
 function resolvedLaneState(target, apiFeatures = []) {
@@ -506,12 +594,21 @@ export function findCompatibilityHint(capabilities, model, catalogItem) {
   const findRow = (predicate) => rows.find(predicate) || null
   const findFamily = (predicate) => plannedFamilies.find(predicate) || null
   const exactIdentityTarget = findExactCompatibilityRowByIdentity(rows, model, catalogItem)
-  if (exactIdentityTarget) return quantAwareCompatibilityHint(exactIdentityTarget, quantKey, 'exact /api/capabilities row id match', { exact: true })
+  if (exactIdentityTarget) {
+    return applyExactArtifactGate(
+      quantAwareCompatibilityHint(exactIdentityTarget, quantKey, 'exact /api/capabilities row id match', { exact: true }),
+      model,
+      catalogItem,
+    )
+  }
 
   const llamaBpeIdentity = detectLlamaBpeTarget(subject)
   if (llamaBpeIdentity) {
     const hint = findLlamaBpeCompatibilityHint(rows, plannedFamilies, quantKey, llamaBpeIdentity)
-    if (hint) return hint.kind === 'quant_mismatch' ? { ...hint, observedQuant: model?.quant || catalogItem?.quant || quantKey } : hint
+    if (hint) {
+      const normalizedHint = hint.kind === 'quant_mismatch' ? { ...hint, observedQuant: model?.quant || catalogItem?.quant || quantKey } : hint
+      return applyExactArtifactGate(normalizedHint, model, catalogItem)
+    }
   }
 
   if (subject.includes('tinyllama')) {
@@ -567,6 +664,7 @@ export function findCompatibilityHint(capabilities, model, catalogItem) {
 
 export function compatibilityHintLabel(hint, fallback = 'No matching compatibility row') {
   if (!hint) return fallback
+  if (hint.kind === 'artifact_mismatch') return `${hint.target.id}: exact GGUF not verified`
   if (hint.kind === 'quant_missing') return `${hint.target.id}: quant not verified`
   if (hint.kind === 'quant_mismatch') return `${hint.target.id}: quant mismatch`
   return `${hint.target.id}: ${formatCapabilityStatus(hint.target.status)}`
@@ -587,6 +685,7 @@ export function compatibilityHintCopy(hint) {
     const boundary = hint.target?.notes || hint.target?.next_step || `${hint.target?.id || 'This family row'} is ${formatCapabilityStatus(hint.target?.status || 'not_supported')}`
     return `${boundary}. This is only a ${hint.confidence}; it is not chat-ready support until a concrete exact compatibility row is validated.`
   }
+  if (hint.kind === 'artifact_mismatch') return `${hint.target.id} requires the exact ${exactArtifactFilenameForRow(hint.target) || 'row GGUF'} artifact before the frontend may treat the support contract as matched. Do not unlock chat from a saved row id, model-size label, or neighboring GGUF filename alone; wait for exact artifact evidence plus loaded_now=true and generation_ready=true.`
   if (hint.kind === 'quant_missing') return `${hint.target.id} is the right model-size row, but this local record does not expose a quant label yet. Do not unlock chat from a size/name match alone; wait for GGUF quant evidence from the loaded model metadata plus generation_ready=true.`
   if (hint.kind === 'quant_mismatch') return `${hint.target.id} is scoped to ${hint.target.quantization}, but this entry appears to be ${displayObservedQuant(hint.observedQuant) || 'a different quantization'}. Do not inherit the supported gate from a same-family row; wait for an exact COMPATIBILITY.md row plus generation_ready=true.`
   return `${hint.target.family} · ${hint.target.quantization} · ${hint.target.evidence || hint.target.next_step}. Match source: ${hint.confidence}; runtime generation still requires loaded_now=true and generation_ready=true.`

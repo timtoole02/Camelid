@@ -8,6 +8,12 @@ function runtimeReadinessLabel(runtime) {
   return 'Waiting for a generation-ready model'
 }
 
+function supportLaneTitle(lane) {
+  if (lane.key === 'template') return 'Template/Jinja readiness'
+  if (lane.key === 'context') return 'Checked context readiness'
+  return 'Throughput readiness'
+}
+
 export default function SystemView({ runtime, selectedModel, capabilities }) {
   const runtimePill = runtimeReadinessLabel(runtime)
   const selectedModelName = selectedModel?.name || 'No next-chat model selected'
@@ -180,7 +186,7 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
                 <p><b>Readiness gate:</b> {displayCapabilityCopy(selectedCompatibilityTarget.frontend_readiness_gate || 'not advertised')}</p>
                 <p><b>Endpoint/chat gate:</b> {selectedExactRowReady ? 'Ready: runtime readiness and exact-row support both match.' : `${selectedChatGate.label}; loaded_now=${selectedChatGate.runtimeLoaded ? 'true' : 'false'}, generation_ready=${selectedChatGate.runtimeGenerationReady ? 'true' : 'false'}, exact row supported=${selectedChatGate.contractSupported ? 'true' : 'false'}.`}</p>
                 {selectedSupportLanes.map((lane) => (
-                  <p key={lane.key}><b>{lane.key === 'template' ? 'Template/Jinja readiness' : 'Throughput readiness'}:</b> {lane.label}. {displayCapabilityCopy(lane.copy)}</p>
+                  <p key={lane.key}><b>{supportLaneTitle(lane)}:</b> {lane.label}. {displayCapabilityCopy(lane.copy)}</p>
                 ))}
                 <p>{displayCapabilityCopy(selectedCompatibilityTarget.evidence || selectedCompatibilityTarget.next_step || 'No row evidence advertised.')}</p>
               </>

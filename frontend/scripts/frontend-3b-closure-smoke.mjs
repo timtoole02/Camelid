@@ -97,9 +97,42 @@ assert.equal(exactHint.target.id, 'llama32_3b_instruct_q8_0', '3B closure must r
 assert.equal(exactHint.exact, true, '3B closure must be an exact compatibility hint, not a family fallback')
 assert.equal(compatibilityHintLabel(exactHint), 'llama32_3b_instruct_q8_0: supported exact row smoke')
 assert.match(compatibilityHintCopy(exactHint), /runtime generation still requires loaded_now=true and generation_ready=true/)
+const catalogThreeBHint = findCompatibilityHint(capabilities, null, {
+  name: 'Llama 3.2 3B Instruct Q8_0',
+  repo_id: 'bartowski/Llama-3.2-3B-Instruct-GGUF',
+  filename: 'Llama-3.2-3B-Instruct-Q8_0.gguf',
+  quant: 'Q8_0',
+})
+assert.equal(catalogThreeBHint.target.id, 'llama32_3b_instruct_q8_0', '3B catalog cards must resolve the exact supported row from catalog filename + Q8_0 evidence')
+assert.equal(catalogThreeBHint.exact, true, '3B catalog cards must not render family-level support from catalog metadata')
 assert.equal(isCompatibilitySupportedForModel(capabilities, exactThreeBModel), true, 'supported 3B rows require an exact row plus Q8_0 evidence')
 const quantMismatchHint = findCompatibilityHint(capabilities, { ...exactThreeBModel, quant: 'Q4_K_M' })
 assert.equal(compatibilityHintLabel(quantMismatchHint), 'llama32_3b_instruct_q8_0: quant mismatch', '3B exact-row surfaces must name quant mismatch instead of falling back to another supported row')
+const spoofedThreeBRowIdWrongArtifact = {
+  ...exactThreeBModel,
+  id: 'llama32_3b_instruct_q8_0',
+  name: 'llama32_3b_instruct_q8_0',
+  runtime_model_name: 'llama32_3b_instruct_q8_0',
+  model_path: '/models/not-Llama-3.2-3B-Instruct-Q8_0.gguf',
+  quant: 'Q8_0',
+}
+const spoofedThreeBHint = findCompatibilityHint(capabilities, spoofedThreeBRowIdWrongArtifact)
+assert.equal(compatibilityHintLabel(spoofedThreeBHint), 'llama32_3b_instruct_q8_0: exact GGUF not verified', '3B exact-row support must not unlock from a saved row id without the exact GGUF filename')
+assert.equal(isCompatibilitySupportedForModel(capabilities, spoofedThreeBRowIdWrongArtifact), false, '3B row-id spoofing with a neighboring GGUF path must fail closed')
+assert.equal(
+  getChatGateState(capabilities, spoofedThreeBRowIdWrongArtifact, { ...runtime, active_model_id: 'llama32_3b_instruct_q8_0' }).chatUnlocked,
+  false,
+  '3B WebUI chat must stay blocked when the active runtime row id is spoofed but artifact identity does not match',
+)
+const spoofedThreeBNameWrongArtifact = {
+  ...exactThreeBModel,
+  id: 'local-wrong-artifact',
+  name: 'Llama 3.2 3B Instruct Q8_0',
+  runtime_model_name: 'local-wrong-artifact',
+  model_path: '/models/Llama-3.2-3B-Instruct-Q8_0-neighbor.gguf',
+  quant: 'Q8_0',
+}
+assert.equal(compatibilityHintLabel(findCompatibilityHint(capabilities, spoofedThreeBNameWrongArtifact)), 'llama32_3b_instruct_q8_0: exact GGUF not verified', '3B model-size labels still need the exact GGUF artifact identity')
 assert.equal(compatibilityHintMatchesExactTarget(capabilities, exactThreeBModel, llama32ThreeBTarget), true, 'ModelsView exact-row matching must accept the canonical 3B row')
 assert.equal(modelRuntimeIdMatches(exactThreeBModel, runtime), true, '3B backend active_model_id must match the selected runtime row')
 assert.equal(isRunnableInCurrentRuntime(exactThreeBModel, runtime), true, '3B runtime readiness must require the active backend row and generation_ready=true')
@@ -169,7 +202,10 @@ assert.equal(findCompatibilityHint(noThreeBRowCapabilities, exactThreeBModel), n
 assert.equal(getChatGateState(noThreeBRowCapabilities, exactThreeBModel, runtime).chatUnlocked, false, '3B WebUI chat must stay blocked without the exact compatibility row')
 
 const lanes = exactRowSupportLanes(llama32ThreeBTarget, capabilities.api_features)
-assert.deepEqual(lanes.map((lane) => [lane.key, lane.ready]), [['template', true], ['throughput', false]], '3B template/Jinja readiness is row-green while production throughput remains unpromoted')
+assert.deepEqual(lanes.map((lane) => [lane.key, lane.ready]), [['template', true], ['context', true], ['throughput', false]], '3B template/Jinja and checked-context readiness are row-green while production throughput remains unpromoted')
+const contextLane = lanes.find((lane) => lane.key === 'context')
+assert.match(contextLane.copy, /512 context validated first pack, 1024 context validated second pack, 2048 context validated third pack/, '3B checked-context copy must name the supported exact-row context packs')
+assert.match(contextLane.copy, /does not promote model-native\/larger context beyond the checked packs/, '3B checked-context copy must keep the larger-context boundary visible')
 const genericThroughputCapabilities = {
   ...capabilities,
   api_features: [
@@ -213,6 +249,8 @@ assert.match(chatSource, /runnableModels\s*=\s*models\.filter\(\(model\) => getC
 assert.match(chatSource, /canSubmit\s*=\s*Boolean\(composer\.trim\(\)\) && selectedModelRunnable && !generationActive/, 'composer send button must be blocked unless the exact-row chat gate unlocked')
 assert.match(chatSource, /runtimeStatusCopy[\s\S]*loaded now and generation_ready=true/, 'chat readiness copy must name the runtime readiness requirement')
 assert.match(chatSource, /supportStatusCopy[\s\S]*COMPATIBILITY\.md and \/api\/capabilities agree/, 'chat readiness copy must name the support-contract requirement')
+assert.match(chatSource, /supportStatusLabel\s*=\s*selectedModelCapabilitySupported[\s\S]*\?\s*selectedCompatibilityLabel/, 'supported live chat readiness must name the exact /api/capabilities row instead of a generic green label')
+assert.match(chatSource, /supportStatusCopy\s*=\s*selectedModelCapabilitySupported[\s\S]*`\$\{selectedCompatibilityLabel\}\. COMPATIBILITY\.md and \/api\/capabilities agree/, 'supported live chat readiness copy must preserve the exact row id after the gate turns green')
 assert.match(chatSource, /chat-readiness-strip-live[\s\S]*runtimeStatusLabel[\s\S]*supportStatusLabel[\s\S]*capabilityLaneStatus\.label/, 'non-empty live 3B chat must keep runtime, exact-row support, and row-scoped capability readiness visible after messages exist')
 assert.match(chatSource, /getChatCapabilityLaneCopy\(selectedChatGate, capabilities\)/, 'live 3B chat must derive capability lane copy from the shared exact-row chat gate')
 assert.match(chatSource, /Row-scoped \/api\/capabilities evidence; it does not widen model-native context/, 'live 3B capability copy must not widen support beyond the exact row')
@@ -222,6 +260,8 @@ assert.match(modelsSource, /matchesLlama32ThreeBTarget\(model, capabilities\)/, 
 assert.match(modelsSource, /Fill import form with exact path/, 'ModelsView must provide the exact 3B import path affordance when the row is absent locally')
 assert.match(modelsSource, /Chat unlockable/, 'ModelsView must expose the retained exact-row chat-unlock state')
 assert.match(modelsSource, /matchedChatGate\s*=\s*matchedModel \? getChatGateState\(capabilities, matchedModel, runtime\) : null/, 'ModelsView retained 3B row cards must use the shared chat gate for loaded_now and generation_ready checks')
+assert.match(modelsSource, /catalogCompatibilityHint\s*=\s*findCompatibilityHint\(capabilities, localMatch, item\)/, 'ModelsView catalog cards must resolve exact-row support through the shared capability matcher')
+assert.match(modelsSource, /catalogExactTarget\.id[\s\S]*supported exact row/, 'ModelsView catalog cards must visibly label exact supported rows without widening catalog metadata into broad support')
 assert.match(apiSource, /Selected exact-row evidence/, 'API view must surface selected 3B exact-row evidence')
 assert.match(apiSource, /selectedChatGate\s*=\s*getChatGateState\(capabilities, selectedModel, runtime\)/, 'API view must use the shared exact-row chat gate for 3B endpoint readiness')
 assert.match(apiSource, /selectedExactRowReady\s*=\s*selectedChatGate\.chatUnlocked/, 'API view must not reimplement 3B endpoint readiness separately from Chat/System')

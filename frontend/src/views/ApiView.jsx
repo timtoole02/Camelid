@@ -13,6 +13,12 @@ function summarizeExactRowField(targets = [], field, fallback = 'No exact compat
   return rows.length ? rows.join(' · ') : fallback
 }
 
+function supportLaneTitle(lane) {
+  if (lane.key === 'template') return 'Template/Jinja readiness'
+  if (lane.key === 'context') return 'Checked context readiness'
+  return 'Throughput readiness'
+}
+
 export default function ApiView({ runtime, selectedModel, capabilities }) {
   const apiBase = runtime?.api_base || ''
   const modelId = getRuntimeRequestModelId(selectedModel, runtime, '<loaded-model-id>') || '<loaded-model-id>'
@@ -154,7 +160,7 @@ export default function ApiView({ runtime, selectedModel, capabilities }) {
                 <p><b>Latest output:</b> {displayCapabilityCopy(selectedCompatibilityTarget.latest_checked_output || 'not advertised')}</p>
                 <p><b>Full-support status:</b> {formatCapabilityStatus(selectedCompatibilityTarget.full_support_status || 'not advertised')}</p>
                 {selectedSupportLanes.map((lane) => (
-                  <p key={lane.key}><b>{lane.key === 'template' ? 'Template/Jinja readiness' : 'Throughput readiness'}:</b> {lane.label}. {displayCapabilityCopy(lane.copy)}</p>
+                  <p key={lane.key}><b>{supportLaneTitle(lane)}:</b> {lane.label}. {displayCapabilityCopy(lane.copy)}</p>
                 ))}
                 <p><b>Remaining support boundary:</b> {displayCapabilityCopy(rowSupportBoundaryCopy(selectedCompatibilityTarget, apiFeatures))}</p>
                 <p>{displayCapabilityCopy(selectedCompatibilityTarget.evidence)}</p>
@@ -193,7 +199,7 @@ export default function ApiView({ runtime, selectedModel, capabilities }) {
                     <strong className={capabilityStatusTone(target.status)}>{formatCapabilityStatus(target.status)} · {target.family} · {target.quantization}</strong>
                     <small>Metadata: {formatCapabilityStatus(target.metadata_parses)} · tokenizer: {formatCapabilityStatus(target.tokenizer_works)} · tensors: {formatCapabilityStatus(target.tensors_load)} · generation: {formatCapabilityStatus(target.generation_runs)} · frontend load: {formatCapabilityStatus(target.frontend_load_path_verified)}</small>
                     <small>Template: {formatCapabilityStatus(target.chat_template_shape_pack || 'not_started')} · 512-context: {formatCapabilityStatus(target.bounded_context_512_pack || 'not_started')} · 1024-context: {formatCapabilityStatus(target.bounded_context_1024_pack || 'not_started')} · 2048-context: {formatCapabilityStatus(target.bounded_context_2048_pack || 'not_started')} · 4096-context: {formatCapabilityStatus(target.bounded_context_4096_pack || 'not_started')} · 8192-context: {formatCapabilityStatus(target.bounded_context_8192_pack || 'not_started')} · perf: {formatCapabilityStatus(target.performance_measured || 'not_started')}</small>
-                    <small>{exactRowSupportLanes(target, apiFeatures).map((lane) => `${lane.key === 'template' ? 'Template/Jinja' : 'Throughput'}: ${lane.label}`).join(' · ')}</small>
+                    <small>{exactRowSupportLanes(target, apiFeatures).map((lane) => `${supportLaneTitle(lane).replace(' readiness', '')}: ${lane.label}`).join(' · ')}</small>
                     <small>{displayCapabilityCopy(rowSupportNextStepCopy(target, apiFeatures))}</small>
                   </div>
                 ))}

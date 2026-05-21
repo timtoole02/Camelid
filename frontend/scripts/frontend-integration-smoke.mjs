@@ -144,7 +144,7 @@ try {
   }))
 
   assert.match(streamingMarkup, /data-streaming-state="active"/, 'streaming assistant rows should render an active streaming state')
-  assert.match(streamingMarkup, /Live chat exact-row readiness[\s\S]*Runtime[\s\S]*Local chat ready[\s\S]*Support[\s\S]*Exact row supported[\s\S]*Capabilities[\s\S]*Template ready · Throughput not promoted/, 'non-empty live 3B chats should keep runtime, exact-row support, and row-scoped capability lanes visible after messages exist')
+  assert.match(streamingMarkup, /Live chat exact-row readiness[\s\S]*Runtime[\s\S]*Local chat ready[\s\S]*Support[\s\S]*llama32_3b_instruct_q8_0: supported current gate[\s\S]*Capabilities[\s\S]*Template ready · Context ready · Throughput not promoted/, 'non-empty live 3B chats should keep runtime, exact-row support, and row-scoped capability lanes visible after messages exist')
   assert.match(streamingMarkup, /Row-scoped \/api\/capabilities evidence; it does not widen model-native context/, 'live 3B capability lanes must avoid widening exact-row support into broader claims')
   assert.match(streamingMarkup, /COMPATIBILITY\.md and \/api\/capabilities agree/, 'live 3B chat readiness must name the exact-row support-contract requirement')
   assert.match(streamingMarkup, /data-streaming-code-state="open"/, 'open streaming fences should expose the active code state')
@@ -439,6 +439,37 @@ try {
   assert.match(neighboringQuantAcceptanceMarkup, /This browser\/runtime list does not currently show the exact 3B row/, '3B acceptance placeholder must stay visible when the browser acceptance id is backed by a neighboring quant')
   assert.match(neighboringQuantAcceptanceMarkup, /llama32_3b_instruct_q8_0: quant mismatch/, '3B acceptance hardening should surface the Q8_0 row mismatch instead of treating the browser id as exact evidence')
 
+  const neighboringArtifactAcceptanceRecord = {
+    ...aliasSelectedModel,
+    id: LLAMA32_3B_ACCEPTANCE_TARGET.id,
+    name: 'Llama 3.2 3B Instruct Q8_0',
+    runtime_model_name: 'llama32_3b_instruct_q8_0_neighbor',
+    quant: 'Q8_0',
+    model_path: '/models/Llama-3.2-3B-Instruct-Q8_0-neighbor.gguf',
+  }
+  const neighboringArtifactAcceptanceMarkup = renderToStaticMarkup(React.createElement(ModelsView, {
+    runtime: { ...readyRuntime, active_model_id: neighboringArtifactAcceptanceRecord.runtime_model_name },
+    capabilities,
+    refreshDashboard: noop,
+    registerForm: { id: '', name: '', model_path: '', runtime_model_name: '' },
+    setRegisterForm: noop,
+    externalForm: { id: '', name: '', source: '', api_base: '', api_key: '', model_name: '' },
+    setExternalForm: noop,
+    registerModel: noop,
+    connectExternalModel: noop,
+    models: [neighboringArtifactAcceptanceRecord],
+    selectedModelId: neighboringArtifactAcceptanceRecord.id,
+    setSelectedModelId: noop,
+    loadingModelId: '',
+    activateModel: noop,
+    unloadCurrentModel: noop,
+    installModel: noop,
+    installCatalogModel: noop,
+    cancelModelDownload: noop,
+  }))
+  assert.match(neighboringArtifactAcceptanceMarkup, /This browser\/runtime list does not currently show the exact 3B row/, '3B acceptance placeholder must stay visible when a same-label Q8 record lacks the exact GGUF filename')
+  assert.match(neighboringArtifactAcceptanceMarkup, /llama32_3b_instruct_q8_0: exact GGUF not verified/, '3B acceptance hardening should require exact artifact identity, not just the 3B Instruct Q8 label')
+
   const green3BCapabilities = JSON.parse(JSON.stringify(capabilities))
   green3BCapabilities.api_features.push({ id: 'production_throughput', status: 'supported_exact_row_evidence', notes: '3B production-throughput lane validated end-to-end.' })
   green3BCapabilities.model_compatibility = green3BCapabilities.model_compatibility.map((target) => target.id === 'llama32_3b_instruct_q8_0'
@@ -454,8 +485,8 @@ try {
   const green3BRow = green3BCapabilities.model_compatibility.find((target) => target.id === 'llama32_3b_instruct_q8_0')
   assert.deepEqual(
     exactRowSupportLanes(green3BRow, green3BCapabilities.api_features).map((lane) => [lane.key, lane.ready]),
-    [['template', true], ['throughput', true]],
-    '3B exact row should show both template/Jinja and production-throughput lanes green once /api/capabilities advertises row evidence',
+    [['template', true], ['context', true], ['throughput', true]],
+    '3B exact row should show template/Jinja, checked-context, and production-throughput lanes green once /api/capabilities advertises row evidence',
   )
   assert.doesNotMatch(rowSupportBoundaryCopy(green3BRow, green3BCapabilities.api_features), /arbitrary|Jinja|production|throughput/i, '3B remaining boundary should filter resolved template/Jinja and production-throughput blockers when both lanes are green')
   assert.doesNotMatch(rowSupportNextStepCopy(green3BRow, green3BCapabilities.api_features), /arbitrary|Jinja|production|throughput/i, '3B next-step copy should filter resolved template/Jinja and production-throughput blockers when both lanes are green')
@@ -582,7 +613,7 @@ try {
   assert.match(liveBackendIdChatMarkup, /How can I help\?/, 'ready 3B live-backend-id chat should render the sendable empty-state hero')
   assert.match(liveBackendIdChatMarkup, /Local chat ready/, 'ready 3B live-backend-id chat should show runtime-green chat UX')
   assert.match(liveBackendIdChatMarkup, /Llama 3\.2 3B Instruct Q8_0 is loaded now and generation_ready=true\./, 'ready 3B live-backend-id chat should display the exact 3B row name instead of the backend-generated runtime id')
-  assert.match(liveBackendIdChatMarkup, /Exact row supported/, 'ready 3B live-backend-id chat should show exact-row support in the composer surface')
+  assert.match(liveBackendIdChatMarkup, /llama32_3b_instruct_q8_0: supported current gate/, 'ready 3B live-backend-id chat should show exact-row support in the composer surface')
   assert.match(liveBackendIdChatMarkup, /Message Camelid…/, 'ready 3B live-backend-id chat should enable the composer instead of showing load-first copy')
   assert.doesNotMatch(liveBackendIdChatMarkup, /Load a model first|Choose a supported model/, 'ready 3B live-backend-id chat should not fall back to blocked chat UX')
 

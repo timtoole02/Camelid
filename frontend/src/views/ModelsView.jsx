@@ -56,19 +56,28 @@ function findCatalogMatch(models, item) {
   return models.find((model) => model.hf_repo === item.repo_id && model.hf_filename === item.filename)
 }
 
+function pathBasename(value) {
+  return String(value || '').split(/[\\/]/).filter(Boolean).pop() || ''
+}
+
+const LLAMA32_3B_ACCEPTANCE_FILENAME = pathBasename(LLAMA32_3B_ACCEPTANCE_TARGET.source)
+
+function hasExactLlama32ThreeBArtifact(model) {
+  const exactTargetPath = model?.model_path === LLAMA32_3B_ACCEPTANCE_TARGET.model_path
+    || model?.path === LLAMA32_3B_ACCEPTANCE_TARGET.model_path
+  const filenames = [
+    model?.model_path,
+    model?.path,
+    model?.hf_filename,
+    model?.source,
+  ].map(pathBasename).filter(Boolean)
+  return exactTargetPath || filenames.some((filename) => filename.toLowerCase() === LLAMA32_3B_ACCEPTANCE_FILENAME.toLowerCase())
+}
+
 function matchesLlama32ThreeBTarget(model, capabilities) {
   const target = { id: 'llama32_3b_instruct_q8_0' }
   if (compatibilityHintMatchesExactTarget(capabilities, model, target)) return true
-
-  const subject = [model?.id, model?.name, model?.runtime_model_name, model?.model_path, model?.path, model?.quant].filter(Boolean).join(' ').toLowerCase()
-  const hasLlama32ThreeB = /llama[\s._-]*3\.2[\s._-]*3b/.test(subject)
-    || /llama[\s._-]*32[\s._-]*3b/.test(subject)
-  const hasInstruct = /(?:^|[^a-z0-9])instruct(?:[^a-z0-9]|$)/i.test(subject)
-  const hasQ8 = /(?:^|[^a-z0-9])q8[\s._-]*0(?:[^a-z0-9]|$)/i.test(subject)
-    || /\bfile[_\s-]*type\s*7\b/i.test(subject)
-  const exactAcceptanceIdentity = model?.id === LLAMA32_3B_ACCEPTANCE_TARGET.id
-    || model?.model_path === LLAMA32_3B_ACCEPTANCE_TARGET.model_path
-  return Boolean((exactAcceptanceIdentity && hasQ8) || (hasLlama32ThreeB && hasInstruct && hasQ8))
+  return hasExactLlama32ThreeBArtifact(model)
 }
 
 function findModelMatchingCapabilityRow(models, capabilities, target, runtime, selectedModelId) {
@@ -104,6 +113,12 @@ function formatRemoteMeta(item) {
 function formatCatalogTitle(item) {
   const suffix = ` (${item.quant})`
   return item.name.endsWith(suffix) ? item.name.slice(0, -suffix.length) : item.name
+}
+
+function supportLaneTitle(lane) {
+  if (lane.key === 'template') return 'Template/Jinja readiness'
+  if (lane.key === 'context') return 'Checked context readiness'
+  return 'Throughput readiness'
 }
 
 function CapabilityEvidenceBlock({ capabilities, model, catalogItem }) {
@@ -618,7 +633,7 @@ export default function ModelsView({
               <p className="panel-kicker">Exact-row full-support hardening</p>
               <h3>Current Q8 support rows</h3>
             </div>
-            <p className="model-summary">These cards mirror the current exact Q8 rows from /api/capabilities. Each row gets credit only for its own evidence, with template/Jinja and production-throughput shown as row-scoped readiness lanes instead of repeated generic caveats; chat still unlocks only when the active local GGUF is loaded_now=true, generation_ready=true, and matched to that exact supported row.</p>
+            <p className="model-summary">These cards mirror the current exact Q8 rows from /api/capabilities. Each row gets credit only for its own evidence, with template/Jinja, checked context, and production-throughput shown as row-scoped readiness lanes instead of repeated generic caveats; chat still unlocks only when the active local GGUF is loaded_now=true, generation_ready=true, and matched to that exact supported row.</p>
           </div>
 
           <div className="models-card-grid">
@@ -699,7 +714,7 @@ export default function ModelsView({
                   <div className="models-card-copy-stack">
                     <p className="model-summary"><b>Evidence:</b> {target.evidence}</p>
                     {supportLanes.map((lane) => (
-                      <p className="model-summary" key={lane.key}><b>{lane.key === 'template' ? 'Template/Jinja readiness' : 'Throughput readiness'}:</b> {lane.copy}</p>
+                      <p className="model-summary" key={lane.key}><b>{supportLaneTitle(lane)}:</b> {lane.copy}</p>
                     ))}
                     <p className="model-summary"><b>Remaining support boundary:</b> {rowSupportBoundaryCopy(target, apiFeatures)}</p>
                     <p className="model-summary"><b>Next step:</b> {rowSupportNextStepCopy(target, apiFeatures)}</p>
@@ -828,6 +843,9 @@ export default function ModelsView({
                 const selected = selectedModelId === localMatch?.id
                 const busy = localMatch && loadingModelId === localMatch.id
                 const errorCopy = modelErrorCopy(localMatch)
+                const catalogCompatibilityHint = findCompatibilityHint(capabilities, localMatch, item)
+                const catalogExactTarget = isExactCompatibilityHint(catalogCompatibilityHint) ? catalogCompatibilityHint.target : null
+                const catalogExactSupported = Boolean(catalogExactTarget && isSupportedCapabilityStatus(catalogExactTarget.status))
 
                 return (
                   <article key={item.catalog_id} className={`model-card models-model-card models-catalog-card-clean ${active ? 'active-model-card' : ''} ${selected ? 'selected-model-card' : ''}`}>
@@ -843,6 +861,7 @@ export default function ModelsView({
                       {active && <div className="pin-badge">Loaded now</div>}
                       {selected && <div className="pin-badge">Next chat</div>}
                       {item.quant && <div className="pin-badge">Catalog quant: {item.quant}</div>}
+                      {catalogExactTarget && <div className={`pin-badge ${catalogExactSupported ? 'ready' : 'warm'}`}>{catalogExactTarget.id}: {catalogExactSupported ? 'supported exact row' : formatCapabilityStatus(catalogExactTarget.status)}</div>}
                       {hasLocalModelPath(localMatch) && <div className="pin-badge">Saved locally</div>}
                     </div>
 
