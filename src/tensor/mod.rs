@@ -129,6 +129,7 @@ pub struct Q8_0AmxPackedBlock {
 pub struct Q8_0VnniTile16 {
     pub quants: [i8; 512],
     pub scale_f16: [u16; 16],
+    pub scale_f32: [f32; 16],
     pub comp: [i32; 16],
 }
 
@@ -304,6 +305,7 @@ fn q8_0_pack_vnni16_if_enabled(
             let mut tile = Q8_0VnniTile16 {
                 quants: [0; 512],
                 scale_f16: [0; 16],
+                scale_f32: [0.0; 16],
                 comp: [0; 16],
             };
             for n in 0..16 {
@@ -311,6 +313,7 @@ fn q8_0_pack_vnni16_if_enabled(
                 let source_start = source_block * Q8_0_BLOCK_BYTES;
                 tile.scale_f16[n] =
                     u16::from_le_bytes([q8_0_bytes[source_start], q8_0_bytes[source_start + 1]]);
+                tile.scale_f32[n] = f16_bits_to_f32(tile.scale_f16[n]);
                 let qs = &q8_0_bytes[source_start + 2..source_start + Q8_0_BLOCK_BYTES];
                 let sum = qs
                     .iter()
@@ -3217,6 +3220,7 @@ mod tests {
                     tile.scale_f16[n],
                     u16::from_le_bytes([bytes[raw_start], bytes[raw_start + 1]])
                 );
+                assert_eq!(tile.scale_f32[n], f16_bits_to_f32(tile.scale_f16[n]));
                 let qs = &bytes[raw_start + 2..raw_start + Q8_0_BLOCK_BYTES];
                 let expected_comp = 128
                     * qs.iter()

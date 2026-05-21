@@ -1,0 +1,9 @@
+uname -a
+rustc --version
+cargo --version
+cargo fmt --check
+cargo test q8_ffn_down_vnni_decode --lib
+cargo test q8_0_vnni_pack --lib
+cargo check
+cargo clippy --all-targets -- -D warnings
+cargo test --lib

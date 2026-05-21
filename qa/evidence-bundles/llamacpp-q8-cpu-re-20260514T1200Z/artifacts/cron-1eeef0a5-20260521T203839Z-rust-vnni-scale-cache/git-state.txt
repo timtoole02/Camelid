@@ -1,0 +1,10 @@
+Base branch: origin/main
+Base commit: 7904c25
+Working branch: rust-kernel-ubuntu-x86-q8-20260521-2034
+Host: Darwin arm64, not Ubuntu x86_64
+
+Diff stat before evidence/docs:
+ src/inference.rs       | 10 ++--------
+ src/inference/tests.rs |  1 +
+ src/tensor/mod.rs      |  4 ++++
+ 3 files changed, 7 insertions(+), 8 deletions(-)
