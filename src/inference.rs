@@ -18263,7 +18263,12 @@ mod tests {
         let rows = 8192;
         let input_width = 3072;
         let warmup_iters = 20;
-        let measure_iters = 100;
+        let measure_iters = std::env::var("CAMELID_X86_Q8_SCHED_BENCH_ITERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(100);
+        std::env::set_var(Q8_SCHEDULE_TELEMETRY_ENV, "on");
         let (input, packed_weight) = runtime_vnni_packed_ffn_down_shape(rows, input_width);
         let Some(Q8_0RuntimeStorage::PackedRows4(packed_rows4)) =
             packed_weight.q8_0_runtime_storage.as_ref()
@@ -18289,10 +18294,41 @@ mod tests {
             .zip(&vnni_output.data)
             .map(|(left, right)| (left - right).abs())
             .fold(0.0_f32, f32::max);
+        let mean_abs_delta = rows4_output
+            .data
+            .iter()
+            .zip(&vnni_output.data)
+            .map(|(left, right)| f64::from((left - right).abs()))
+            .sum::<f64>()
+            / rows as f64;
         assert!(
             max_abs_delta <= 5e-4,
             "VNNI output diverged from rows4 baseline: max_abs_delta={max_abs_delta}"
         );
+        let rows4_reference_checksum = checksum(&rows4_output.data);
+        let vnni_reference_checksum = checksum(&vnni_output.data);
+
+        reset_q8_schedule_telemetry();
+        let route_rows4 = try_x86_q8_ffn_down_decode_consumer_path(
+            &input,
+            &packed_weight,
+            "rows4_route_check",
+            "ffn_down",
+            &ffn_down_consumer_plan(true),
+        )
+        .unwrap()
+        .expect("rows4 route output");
+        let route_vnni = try_x86_q8_ffn_down_decode_consumer_path(
+            &input,
+            &packed_weight,
+            "vnni_route_check",
+            "ffn_down",
+            &ffn_down_vnni_decode_plan(true),
+        )
+        .unwrap()
+        .expect("VNNI route output");
+        assert_slice_close_with_tolerance(&route_rows4.data, &rows4_output.data, 5e-4);
+        assert_slice_close_with_tolerance(&route_vnni.data, &rows4_output.data, 5e-4);
 
         for _ in 0..warmup_iters {
             let q = std::hint::black_box(quantize_q8_0_row(&input.data[..input_width]));
@@ -18354,8 +18390,39 @@ mod tests {
         }
         let vnni_kernel_us = vnni_started.elapsed().as_micros() as f64 / measure_iters as f64;
 
+        reset_q8_schedule_telemetry();
+        let mut route_checksum = 0.0_f64;
+        for _ in 0..measure_iters {
+            let output = try_x86_q8_ffn_down_decode_consumer_path(
+                &input,
+                &packed_weight,
+                "vnni_route_measure",
+                "ffn_down",
+                &ffn_down_vnni_decode_plan(true),
+            )
+            .unwrap()
+            .expect("VNNI route output");
+            route_checksum += checksum(&output.data);
+            std::hint::black_box(&output);
+        }
+        let route_telemetry = snapshot_q8_schedule_telemetry();
+        let route = route_telemetry
+            .output_projection_by_route
+            .get("ffn_down.x86_vnni_decode_consumer")
+            .expect("VNNI route telemetry");
+        assert_eq!(
+            route_telemetry.ffn_down_vnni_decode_taken,
+            measure_iters as u64
+        );
+        assert_eq!(route.calls, measure_iters as u64);
+        let vnni_route_quantize_us =
+            route_telemetry.ffn_down_vnni_decode_quantize_us as f64 / measure_iters as f64;
+        let vnni_route_kernel_us =
+            route_telemetry.ffn_down_vnni_decode_kernel_us as f64 / measure_iters as f64;
+        let vnni_route_total_us = route.elapsed_us as f64 / measure_iters as f64;
+
         println!(
-            "q8_ffn_down_vnni_decode_rows1_k3072_n8192_benchmark threads={} warmup_iters={} measure_iters={} quantize_us_mean={quantize_us:.3} rows4_kernel_us_mean={rows4_kernel_us:.3} vnni_kernel_us_mean={vnni_kernel_us:.3} rows4_total_us_mean={:.3} vnni_total_us_mean={:.3} speedup_kernel={:.3} speedup_total={:.3} max_abs_delta={max_abs_delta:.8} quantize_checksum={} rows4_checksum={rows4_checksum:.6} vnni_checksum={vnni_checksum:.6}",
+            "q8_ffn_down_vnni_decode_rows1_k3072_n8192_benchmark threads={} warmup_iters={} measure_iters={} quantize_us_mean={quantize_us:.3} rows4_kernel_us_mean={rows4_kernel_us:.3} vnni_kernel_us_mean={vnni_kernel_us:.3} rows4_total_us_mean={:.3} vnni_total_us_mean={:.3} speedup_kernel={:.3} speedup_total={:.3} vnni_route_quantize_us_mean={vnni_route_quantize_us:.3} vnni_route_kernel_us_mean={vnni_route_kernel_us:.3} vnni_route_total_us_mean={vnni_route_total_us:.3} max_abs_delta={max_abs_delta:.8} mean_abs_delta={mean_abs_delta:.10} quantize_checksum={} rows4_reference_checksum={rows4_reference_checksum:.6} vnni_reference_checksum={vnni_reference_checksum:.6} rows4_checksum={rows4_checksum:.6} vnni_checksum={vnni_checksum:.6} route_checksum={route_checksum:.6}",
             rayon::current_num_threads(),
             warmup_iters,
             measure_iters,
@@ -18365,6 +18432,8 @@ mod tests {
             (quantize_us + rows4_kernel_us) / (quantize_us + vnni_kernel_us),
             quantize_checksum
         );
+        reset_q8_schedule_telemetry();
+        std::env::remove_var(Q8_SCHEDULE_TELEMETRY_ENV);
         std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE");
     }
 
