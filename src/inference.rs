@@ -8738,14 +8738,19 @@ fn record_q8_ffn_down_vnni_decode_reject(
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn x86_q8_vnni_decode_cpu_supported() -> bool {
-    std::arch::is_x86_feature_detected!("avx512f")
-        && std::arch::is_x86_feature_detected!("avx512bw")
-        && std::arch::is_x86_feature_detected!("avx512vnni")
+    x86_q8_vnni_decode_avx512_supported() || std::arch::is_x86_feature_detected!("avx2")
 }
 
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
 fn x86_q8_vnni_decode_cpu_supported() -> bool {
     false
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn x86_q8_vnni_decode_avx512_supported() -> bool {
+    std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vnni")
 }
 
 fn q8_0_vnni_decode_1x64_projection(
@@ -8824,9 +8829,14 @@ fn q8_0_vnni_decode_1x64_projection_into(
 fn q8_0_vnni_tile16_dot(tile: &Q8_0VnniTile16, input_block: &Q8_0Block) -> [i32; 16] {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        if x86_q8_vnni_decode_cpu_supported() {
+        if x86_q8_vnni_decode_avx512_supported() {
             // SAFETY: runtime feature detection confirms the AVX512-VNNI feature set.
             return unsafe { q8_0_vnni_tile16_dot_avx512(tile, input_block) };
+        }
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: runtime feature detection confirms AVX2 support. The helper only
+            // reads the fixed-size tile/input arrays passed by shared references.
+            return unsafe { q8_0_vnni_tile16_dot_avx2(tile, input_block) };
         }
     }
     q8_0_vnni_tile16_dot_scalar(tile, input_block)
@@ -8881,6 +8891,73 @@ unsafe fn q8_0_vnni_tile16_dot_avx512(tile: &Q8_0VnniTile16, input_block: &Q8_0B
     let mut lanes = [0_i32; 16];
     unsafe {
         _mm512_storeu_si512(lanes.as_mut_ptr().cast(), acc);
+    }
+    lanes
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[allow(clippy::incompatible_msrv)]
+#[target_feature(enable = "avx2")]
+unsafe fn q8_0_vnni_tile16_dot_avx2(tile: &Q8_0VnniTile16, input_block: &Q8_0Block) -> [i32; 16] {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{
+        _mm256_add_epi32, _mm256_cvtepi8_epi16, _mm256_madd_epi16, _mm256_setzero_si256,
+        _mm256_storeu_si256, _mm_loadu_si128, _mm_set1_epi32,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::{
+        _mm256_add_epi32, _mm256_cvtepi8_epi16, _mm256_madd_epi16, _mm256_setzero_si256,
+        _mm256_storeu_si256, _mm_loadu_si128, _mm_set1_epi32,
+    };
+
+    let mut acc0 = _mm256_setzero_si256();
+    let mut acc1 = _mm256_setzero_si256();
+    let mut acc2 = _mm256_setzero_si256();
+    let mut acc3 = _mm256_setzero_si256();
+    for g in 0..8 {
+        let activation = _mm256_cvtepi8_epi16(_mm_set1_epi32(i32::from_le_bytes([
+            input_block.quants[g * 4] as u8,
+            input_block.quants[g * 4 + 1] as u8,
+            input_block.quants[g * 4 + 2] as u8,
+            input_block.quants[g * 4 + 3] as u8,
+        ])));
+        let base = unsafe { tile.quants.as_ptr().add(g * 64) };
+        let weights0 = _mm256_cvtepi8_epi16(unsafe { _mm_loadu_si128(base.cast()) });
+        let weights1 = _mm256_cvtepi8_epi16(unsafe { _mm_loadu_si128(base.add(16).cast()) });
+        let weights2 = _mm256_cvtepi8_epi16(unsafe { _mm_loadu_si128(base.add(32).cast()) });
+        let weights3 = _mm256_cvtepi8_epi16(unsafe { _mm_loadu_si128(base.add(48).cast()) });
+
+        acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(activation, weights0));
+        acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(activation, weights1));
+        acc2 = _mm256_add_epi32(acc2, _mm256_madd_epi16(activation, weights2));
+        acc3 = _mm256_add_epi32(acc3, _mm256_madd_epi16(activation, weights3));
+    }
+
+    let mut pair_sums = [0_i32; 8];
+    let mut lanes = [0_i32; 16];
+    unsafe {
+        _mm256_storeu_si256(pair_sums.as_mut_ptr().cast(), acc0);
+    }
+    for lane in 0..4 {
+        lanes[lane] = pair_sums[lane * 2] + pair_sums[lane * 2 + 1];
+    }
+    unsafe {
+        _mm256_storeu_si256(pair_sums.as_mut_ptr().cast(), acc1);
+    }
+    for lane in 0..4 {
+        lanes[4 + lane] = pair_sums[lane * 2] + pair_sums[lane * 2 + 1];
+    }
+    unsafe {
+        _mm256_storeu_si256(pair_sums.as_mut_ptr().cast(), acc2);
+    }
+    for lane in 0..4 {
+        lanes[8 + lane] = pair_sums[lane * 2] + pair_sums[lane * 2 + 1];
+    }
+    unsafe {
+        _mm256_storeu_si256(pair_sums.as_mut_ptr().cast(), acc3);
+    }
+    for lane in 0..4 {
+        lanes[12 + lane] = pair_sums[lane * 2] + pair_sums[lane * 2 + 1];
     }
     lanes
 }
@@ -18445,6 +18522,49 @@ mod tests {
         reset_q8_schedule_telemetry();
         std::env::remove_var(Q8_SCHEDULE_TELEMETRY_ENV);
         std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE");
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn q8_vnni_tile16_avx2_matches_scalar_for_extreme_i8_values() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let input_block = Q8_0Block {
+            scale: 1.0,
+            quants: std::array::from_fn(|idx| match idx % 4 {
+                0 => -128,
+                1 => -3,
+                2 => 0,
+                _ => 127,
+            }),
+        };
+        let mut tile = Q8_0VnniTile16 {
+            quants: [0; 512],
+            scale_f16: [0x3c00; 16],
+            comp: [0; 16],
+        };
+        for lane in 0..16 {
+            let mut comp = 0_i32;
+            for g in 0..8 {
+                for r in 0..4 {
+                    let value = match (lane + g + r) % 5 {
+                        0 => -128,
+                        1 => -17,
+                        2 => 0,
+                        3 => 63,
+                        _ => 127,
+                    };
+                    tile.quants[g * 64 + lane * 4 + r] = value;
+                    comp += i32::from(value);
+                }
+            }
+            tile.comp[lane] = 128 * comp;
+        }
+
+        let expected = q8_0_vnni_tile16_dot_scalar(&tile, &input_block);
+        let actual = unsafe { q8_0_vnni_tile16_dot_avx2(&tile, &input_block) };
+        assert_eq!(actual, expected);
     }
 
     #[test]
