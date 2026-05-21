@@ -1,0 +1,7 @@
+source_head=fdfbe70e673971c2f1f7c45ce02aa28ed70f2479
+source_branch=docs-camelid-claim-guard-20260518T1526Z
+remote_validation=not_attempted
+stale_host_scan_exit=1
+stale_validation_lane_scan_exit=1
+support_contract_guarded_scan_exit=0
+public_scrub_exit=0

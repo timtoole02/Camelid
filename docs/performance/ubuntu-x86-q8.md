@@ -152,6 +152,7 @@ Primary public evidence anchors for this lane:
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-5e4b0b83-20260520T2332Z-docs-support-contract-host-audit/README.md` (docs support-contract/host-reporting audit: stale host-failure scan passed, support wording remains exact-row scoped, and remote validation was not attempted in this run)
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-5e4b0b83-20260521T0139Z-docs-support-contract-host-audit/README.md` (docs support-contract/host-reporting audit: stale host-failure scan passed, support wording remains exact-row scoped, and remote validation was not attempted in this run)
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-5e4b0b83-20260521T0426Z-docs-support-contract-host-audit/README.md` (docs support-contract/host-reporting audit: stale host-failure and stale validation-lane scans passed, guarded support wording remained exact-row/default-off scoped, public scrub passed, and remote validation was not attempted in this run)
+- `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-5e4b0b83-20260521T1017Z-docs-support-contract-host-audit/README.md` (docs support-contract/host-reporting audit: stale host-failure and stale validation-lane scans passed, guarded support wording remained exact-row/default-off scoped, public scrub passed, and remote validation was not attempted in this run)
 - the retained/reject notes for bounded Ubuntu x86 Q8 experiments kept under `qa/evidence-bundles/`
 
 ## Product/runtime note

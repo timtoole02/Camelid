@@ -1,0 +1,3 @@
+post_edit_stale_host_scan_exit=1
+post_edit_public_scrub_exit=0
+remote_validation=not_attempted
