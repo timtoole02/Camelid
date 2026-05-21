@@ -1,0 +1,17 @@
+  366fd0:	62 f2 7d 48 20 06    	vpmovsxbw (%rsi),%zmm0
+  366fd6:	c4 e2 7d 59 0a       	vpbroadcastq (%rdx),%ymm1
+  366fdb:	62 f2 7d 48 20 c9    	vpmovsxbw %ymm1,%zmm1
+  366fe5:	62 f2 7d 48 20 5e 01 	vpmovsxbw 0x20(%rsi),%zmm3
+  366fec:	62 f2 7d 48 52 d1    	vpdpwssd %zmm1,%zmm0,%zmm2
+  366ff2:	c4 e2 7d 59 42 08    	vpbroadcastq 0x8(%rdx),%ymm0
+  366ff8:	62 f2 7d 48 20 c0    	vpmovsxbw %ymm0,%zmm0
+  366ffe:	62 f1 65 48 f5 c0    	vpmaddwd %zmm0,%zmm3,%zmm0
+  36700a:	62 f2 7d 48 20 4e 02 	vpmovsxbw 0x40(%rsi),%zmm1
+  367011:	c4 e2 7d 59 52 10    	vpbroadcastq 0x10(%rdx),%ymm2
+  367017:	62 f2 7d 48 20 d2    	vpmovsxbw %ymm2,%zmm2
+  36701d:	62 f1 75 48 f5 ca    	vpmaddwd %zmm2,%zmm1,%zmm1
+  367023:	62 f2 7d 48 20 56 03 	vpmovsxbw 0x60(%rsi),%zmm2
+  36702a:	c4 e2 7d 59 5a 18    	vpbroadcastq 0x18(%rdx),%ymm3
+  367036:	62 f2 7d 48 20 cb    	vpmovsxbw %ymm3,%zmm1
+  36703c:	62 f1 6d 48 f5 c9    	vpmaddwd %zmm1,%zmm2,%zmm1
+  36708c:	c5 fa 7f 07          	vmovdqu %xmm0,(%rdi)

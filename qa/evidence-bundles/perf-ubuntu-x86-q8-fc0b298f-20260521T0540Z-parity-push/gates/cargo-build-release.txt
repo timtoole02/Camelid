@@ -1,0 +1,22 @@
+warning: function `mac_q8_ffn_down_single_projection_scheduler_counters_enabled` is never used
+    --> src/inference.rs:8656:4
+     |
+8656 | fn mac_q8_ffn_down_single_projection_scheduler_counters_enabled() -> bool {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `camelid_x86_q8_amx_supported` is never used
+  --> src/inference.rs:47:8
+   |
+47 |     fn camelid_x86_q8_amx_supported() -> std::os::raw::c_int;
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `camelid_q8_0_amx_compute_tile16` is never used
+  --> src/inference.rs:48:8
+   |
+48 |     fn camelid_q8_0_amx_compute_tile16(
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `camelid` (lib) generated 3 warnings
+    Finished `release` profile [optimized] target(s) in 0.05s

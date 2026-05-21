@@ -1,0 +1,5 @@
+000000000006c8d0 t void (anonymous namespace)::tinygemm_kernel_amx<block_q8_0, block_q8_0, float, 32, 0>(int, int, int, void const*, void const*, float*, int) [clone .constprop.0]
+000000000005d610 t (anonymous namespace)::tinygemm_kernel_vnni<block_q8_0, block_q8_0, float, 1, 64, 32>::apply(int, void const*, void const*, float*, int)
+000000000000b800 b (anonymous namespace)::tinygemm_kernel_amx<block_q8_0, block_q8_0, float, 32, 0>(int, int, int, void const*, void const*, float*, int)::Tile23
+000000000000a800 b (anonymous namespace)::tinygemm_kernel_amx<block_q8_0, block_q8_0, float, 32, 0>(int, int, int, void const*, void const*, float*, int)::TileC0
+0000000000009800 b (anonymous namespace)::tinygemm_kernel_amx<block_q8_0, block_q8_0, float, 32, 0>(int, int, int, void const*, void const*, float*, int)::TileC1

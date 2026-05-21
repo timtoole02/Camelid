@@ -1,0 +1,74 @@
+WARNING: Kernel address maps (/proc/{kallsyms,modules}) are restricted,
+check /proc/sys/kernel/kptr_restrict and /proc/sys/kernel/perf_event_paranoid.
+
+Samples in kernel functions may not be resolved if a suitable vmlinux
+file is not found in the buildid cache or in the vmlinux path.
+
+Samples in kernel modules won't be resolved at all.
+
+If some relocation was applied (e.g. kexec) symbols may be misresolved
+even with a suitable vmlinux or kallsyms file.
+
+Couldn't record kernel reference relocation symbol
+Symbol resolution may be skewed if relocation was used (e.g. kexec).
+Check /proc/kallsyms permission or run as root.
+[llama-server] warning: no usable GPU found, --gpu-layers option will be ignored
+warning: one possible reason is that llama.cpp was compiled without GPU support
+warning: consult docs/build.md for compilation instructions
+0.00.002.245 I log_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.002.248 I device_info:
+0.00.002.254 I   - CPU     : Intel(R) Xeon(R) Platinum 8488C (126759 MiB, 126759 MiB free)
+0.00.002.301 I system_info: n_threads = 16 (n_threads_batch = 16) / 16 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX_VNNI = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | AVX512 = 1 | AVX512_VBMI = 1 | AVX512_VNNI = 1 | AVX512_BF16 = 1 | AMX_INT8 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 |
+0.00.002.302 I srv          main: n_parallel is set to auto, using n_parallel = 4 and kv_unified = true
+0.00.002.326 I srv          init: running without SSL
+0.00.002.343 I srv          init: using 15 threads for HTTP server
+0.00.002.413 I srv         start: binding port with default address family
+0.00.003.585 I srv          main: loading model
+0.00.003.592 I srv    load_model: loading model '<model-dir>/Llama-3.2-3B-Instruct-Q8_0.gguf'
+0.00.003.609 I common_init_result: fitting params to device memory ...
+0.00.003.610 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+[llama-server] 0.00.318.840 I common_params_fit_impl: projected to use 718 MiB of host memory vs. 126759 MiB of total host memory
+[llama-server] 0.00.805.466 W llama_context: n_ctx_seq (512) < n_ctx_train (131072) -- the full capacity of the model will not be utilized
+[llama-server] 0.00.828.690 I srv    load_model: initializing slots, n_slots = 4
+[llama-server] 0.00.888.592 W common_speculative_init: no implementations specified for speculative decoding
+0.00.888.604 I slot   load_model: id  0 | task -1 | new slot, n_ctx = 512
+0.00.888.607 I slot   load_model: id  1 | task -1 | new slot, n_ctx = 512
+0.00.888.607 I slot   load_model: id  2 | task -1 | new slot, n_ctx = 512
+0.00.888.608 I slot   load_model: id  3 | task -1 | new slot, n_ctx = 512
+0.00.888.637 I srv    load_model: prompt cache is enabled, size limit: 8192 MiB
+0.00.888.637 I srv    load_model: use `--cache-ram 0` to disable the prompt cache
+0.00.888.638 I srv    load_model: for more info see https://github.com/ggml-org/llama.cpp/pull/16391
+0.00.888.663 I srv          init: idle slots will be saved to prompt cache and cleared upon starting a new task
+[llama-server] 0.00.893.651 I init: chat template, example_format: '<|start_header_id|>system<|end_header_id|>
+
+Cutting Knowledge Date: December 2023
+Today Date: 21 May 2026
+
+You are a helpful assistant<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+Hello<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+Hi there<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+How are you?<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+'
+[llama-server] 0.00.896.274 I srv          init: init: chat template, thinking = 0
+0.00.896.300 I srv          main: model loaded
+0.00.896.303 I srv          main: server is listening on http://127.0.0.1:8183
+0.00.896.306 I srv  update_slots: all slots are idle
+[llama-server] 0.08.458.846 I slot get_availabl: id  3 | task -1 | selected slot by LRU, t_last = -1
+0.08.458.849 I srv  get_availabl: updating prompt cache
+0.08.458.854 I srv          load:  - looking for better prompt, base f_keep = -1.000, sim = 0.000
+0.08.458.857 I srv        update:  - cache state: 0 prompts, 0.000 MiB (limits: 8192.000 MiB, 512 tokens, 8589934592 est)
+0.08.458.858 I srv  get_availabl: prompt cache update took 0.01 ms
+0.08.458.902 I slot launch_slot_: id  3 | task 0 | processing task, is_child = 0
+[llama-server] 0.08.832.836 I slot print_timing: id  3 | task 0 |
+prompt eval time =     158.13 ms /    47 tokens (    3.36 ms per token,   297.23 tokens per second)
+       eval time =     215.72 ms /     6 tokens (   35.95 ms per token,    27.81 tokens per second)
+      total time =     373.85 ms /    53 tokens
+0.08.832.873 I slot      release: id  3 | task 0 | stop processing: n_tokens = 52, truncated = 0
+0.08.832.882 I srv  update_slots: all slots are idle
+[llama-server] 0.08.840.916 I srv    operator(): operator(): cleaning up before exit...
+[ perf record: Woken up 14 times to write data ]
+[ perf record: Captured and wrote 5.838 MB qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T0540Z-parity-push/perf/camelid-samehost-r1.data (58134 samples) ]

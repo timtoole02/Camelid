@@ -1,0 +1,3 @@
+## perf/fc0b298f-ubuntu-x86-q8-20260521...origin/main
+M  src/inference.rs
+?? qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T0540Z-parity-push/

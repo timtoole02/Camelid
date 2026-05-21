@@ -1,0 +1,108 @@
+[llama-server] warning: no usable GPU found, --gpu-layers option will be ignored
+warning: one possible reason is that llama.cpp was compiled without GPU support
+warning: consult docs/build.md for compilation instructions
+0.00.001.928 I log_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.001.931 I device_info:
+0.00.001.938 I   - CPU     : Intel(R) Xeon(R) Platinum 8488C (126759 MiB, 126759 MiB free)
+0.00.001.982 I system_info: n_threads = 16 (n_threads_batch = 16) / 16 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX_VNNI = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | AVX512 = 1 | AVX512_VBMI = 1 | AVX512_VNNI = 1 | AVX512_BF16 = 1 | AMX_INT8 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 |
+0.00.001.986 I srv          main: n_parallel is set to auto, using n_parallel = 4 and kv_unified = true
+0.00.002.011 I srv          init: running without SSL
+0.00.002.030 I srv          init: using 15 threads for HTTP server
+0.00.002.104 I srv         start: binding port with default address family
+0.00.003.257 I srv          main: loading model
+0.00.003.260 I srv    load_model: loading model '<model-dir>/Llama-3.2-3B-Instruct-Q8_0.gguf'
+0.00.003.278 I common_init_result: fitting params to device memory ...
+0.00.003.280 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+[llama-server] 0.00.305.721 I common_params_fit_impl: projected to use 718 MiB of host memory vs. 126759 MiB of total host memory
+[llama-server] 0.00.770.757 W llama_context: n_ctx_seq (512) < n_ctx_train (131072) -- the full capacity of the model will not be utilized
+[llama-server] 0.00.792.976 I srv    load_model: initializing slots, n_slots = 4
+[llama-server] 0.00.846.921 W common_speculative_init: no implementations specified for speculative decoding
+0.00.846.927 I slot   load_model: id  0 | task -1 | new slot, n_ctx = 512
+0.00.846.930 I slot   load_model: id  1 | task -1 | new slot, n_ctx = 512
+0.00.846.931 I slot   load_model: id  2 | task -1 | new slot, n_ctx = 512
+0.00.846.931 I slot   load_model: id  3 | task -1 | new slot, n_ctx = 512
+0.00.846.953 I srv    load_model: prompt cache is enabled, size limit: 8192 MiB
+0.00.846.953 I srv    load_model: use `--cache-ram 0` to disable the prompt cache
+0.00.846.954 I srv    load_model: for more info see https://github.com/ggml-org/llama.cpp/pull/16391
+0.00.846.975 I srv          init: idle slots will be saved to prompt cache and cleared upon starting a new task
+[llama-server] 0.00.851.383 I init: chat template, example_format: '<|start_header_id|>system<|end_header_id|>
+
+Cutting Knowledge Date: December 2023
+Today Date: 21 May 2026
+
+You are a helpful assistant<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+Hello<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+Hi there<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+How are you?<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+'
+[llama-server] 0.00.854.023 I srv          init: init: chat template, thinking = 0
+0.00.854.047 I srv          main: model loaded
+0.00.854.049 I srv          main: server is listening on http://127.0.0.1:8183
+0.00.854.056 I srv  update_slots: all slots are idle
+[llama-server] 0.07.076.333 I slot get_availabl: id  3 | task -1 | selected slot by LRU, t_last = -1
+0.07.076.337 I srv  get_availabl: updating prompt cache
+0.07.076.342 I srv          load:  - looking for better prompt, base f_keep = -1.000, sim = 0.000
+0.07.076.345 I srv        update:  - cache state: 0 prompts, 0.000 MiB (limits: 8192.000 MiB, 512 tokens, 8589934592 est)
+0.07.076.346 I srv  get_availabl: prompt cache update took 0.01 ms
+0.07.076.390 I slot launch_slot_: id  3 | task 0 | processing task, is_child = 0
+[llama-server] 0.07.428.652 I slot print_timing: id  3 | task 0 |
+prompt eval time =     160.45 ms /    47 tokens (    3.41 ms per token,   292.92 tokens per second)
+       eval time =     191.63 ms /     6 tokens (   31.94 ms per token,    31.31 tokens per second)
+      total time =     352.08 ms /    53 tokens
+0.07.428.684 I slot      release: id  3 | task 0 | stop processing: n_tokens = 52, truncated = 0
+0.07.428.694 I srv  update_slots: all slots are idle
+[llama-server] 0.07.883.883 I slot get_availabl: id  3 | task -1 | selected slot by LCP similarity, sim_best = 1.000 (> 0.100 thold), f_keep = 0.904
+0.07.883.938 I slot launch_slot_: id  3 | task 7 | processing task, is_child = 0
+[llama-server] 0.08.231.144 I slot print_timing: id  3 | task 7 |
+prompt eval time =     156.00 ms /    47 tokens (    3.32 ms per token,   301.27 tokens per second)
+       eval time =     191.06 ms /     6 tokens (   31.84 ms per token,    31.40 tokens per second)
+      total time =     347.06 ms /    53 tokens
+0.08.231.359 I slot      release: id  3 | task 7 | stop processing: n_tokens = 52, truncated = 0
+0.08.231.370 I srv  update_slots: all slots are idle
+[llama-server] 0.08.665.752 I slot get_availabl: id  3 | task -1 | selected slot by LCP similarity, sim_best = 1.000 (> 0.100 thold), f_keep = 0.904
+0.08.665.801 I slot launch_slot_: id  3 | task 14 | processing task, is_child = 0
+[llama-server] 0.09.013.162 I slot print_timing: id  3 | task 14 |
+prompt eval time =     156.99 ms /    47 tokens (    3.34 ms per token,   299.38 tokens per second)
+       eval time =     190.21 ms /     6 tokens (   31.70 ms per token,    31.54 tokens per second)
+      total time =     347.20 ms /    53 tokens
+0.09.013.381 I slot      release: id  3 | task 14 | stop processing: n_tokens = 52, truncated = 0
+0.09.013.391 I srv  update_slots: all slots are idle
+[llama-server] 0.09.446.249 I slot get_availabl: id  3 | task -1 | selected slot by LCP similarity, sim_best = 1.000 (> 0.100 thold), f_keep = 0.904
+0.09.446.296 I slot launch_slot_: id  3 | task 21 | processing task, is_child = 0
+[llama-server] 0.09.799.967 I slot print_timing: id  3 | task 21 |
+prompt eval time =     163.02 ms /    47 tokens (    3.47 ms per token,   288.31 tokens per second)
+       eval time =     190.48 ms /     6 tokens (   31.75 ms per token,    31.50 tokens per second)
+      total time =     353.50 ms /    53 tokens
+0.09.800.186 I slot      release: id  3 | task 21 | stop processing: n_tokens = 52, truncated = 0
+0.09.800.200 I srv  update_slots: all slots are idle
+[llama-server] 0.10.205.237 I slot get_availabl: id  3 | task -1 | selected slot by LCP similarity, sim_best = 1.000 (> 0.100 thold), f_keep = 0.904
+0.10.205.289 I slot launch_slot_: id  3 | task 28 | processing task, is_child = 0
+[llama-server] 0.10.559.396 I slot print_timing: id  3 | task 28 |
+prompt eval time =     163.86 ms /    47 tokens (    3.49 ms per token,   286.82 tokens per second)
+       eval time =     190.19 ms /     6 tokens (   31.70 ms per token,    31.55 tokens per second)
+      total time =     354.05 ms /    53 tokens
+0.10.559.426 I slot      release: id  3 | task 28 | stop processing: n_tokens = 52, truncated = 0
+0.10.559.437 I srv  update_slots: all slots are idle
+[llama-server] 0.10.978.480 I slot get_availabl: id  3 | task -1 | selected slot by LCP similarity, sim_best = 1.000 (> 0.100 thold), f_keep = 0.904
+0.10.978.526 I slot launch_slot_: id  3 | task 35 | processing task, is_child = 0
+[llama-server] 0.11.332.753 I slot print_timing: id  3 | task 35 |
+prompt eval time =     163.68 ms /    47 tokens (    3.48 ms per token,   287.15 tokens per second)
+       eval time =     190.50 ms /     6 tokens (   31.75 ms per token,    31.50 tokens per second)
+      total time =     354.17 ms /    53 tokens
+0.11.332.777 I slot      release: id  3 | task 35 | stop processing: n_tokens = 52, truncated = 0
+0.11.332.786 I srv  update_slots: all slots are idle
+camelid_ttft_ms=425.62
+camelid_decode_tok_s=25449.54
+camelid_ms_tok=0.04
+llama_cpp_ttft_ms=165.45
+llama_cpp_decode_tok_s=26.51
+llama_cpp_ms_tok=37.72
+camelid_backend_first_content_ms=106.6
+camelid_backend_generate_ms=366
+camelid_backend_q8_calls=null
+json_out=<camelid-worktree>/qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T0540Z-parity-push/bench/baseline-after-r5.json
+[llama-server] 0.11.341.385 I srv    operator(): operator(): cleaning up before exit...

@@ -1,0 +1,1010 @@
+{
+  "schema": "camelid.same_host_llama3_benchmark.v1",
+  "generated_utc": "2026-05-21T05:50:21.805Z",
+  "model": {
+    "row_id": "llama32_3b_instruct_q8_0",
+    "model_path": "<model-dir>/Llama-3.2-3B-Instruct-Q8_0.gguf",
+    "model_id": "llama32-3b-q8",
+    "render_mode": "compact"
+  },
+  "method": {
+    "warmup": 1,
+    "repeats": 3,
+    "max_tokens": 16,
+    "expected_marker": "CMLD-BENCH",
+    "require_marker": true,
+    "unique_prompt": false,
+    "benchmark_messages": [
+      {
+        "role": "system",
+        "content": "You are Camelid benchmark mode. Reply with the exact requested text and nothing else."
+      },
+      {
+        "role": "user",
+        "content": "Reply with exactly this single line and nothing else: CMLD-BENCH"
+      }
+    ],
+    "estimated_prompt_tokens": 75,
+    "llama_context": 512,
+    "threads": 16,
+    "commands": {
+      "harness": "node scripts/bench-llama3-same-host.mjs --model <model-dir>/Llama-3.2-3B-Instruct-Q8_0.gguf --model-id llama32-3b-q8 --row-id llama32_3b_instruct_q8_0 --max-tokens 16 --warmup 1 --repeats 3 --threads 16 --require-marker --expected-marker CMLD-BENCH --out <camelid-worktree>/qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T0540Z-parity-push/bench/dpwssd-r3-perfstat.json",
+      "camelid_serve": "<camelid-worktree>/target/release/camelid serve --addr 127.0.0.1:8181",
+      "llama_server": "<llama-cpp-worktree>/build/bin/llama-server --host 127.0.0.1 --port 8183 -m <model-dir>/Llama-3.2-3B-Instruct-Q8_0.gguf -ngl 0 -c 512 --no-warmup -t 16",
+      "camelid_load_request": "POST http://127.0.0.1:8181/api/models/load {\"path\":\"<model-dir>/Llama-3.2-3B-Instruct-Q8_0.gguf\",\"id\":\"llama32-3b-q8\"}",
+      "camelid_measure_request": "POST http://127.0.0.1:8181/v1/chat/completions stream=true max_tokens=16 temperature=0",
+      "llama_cpp_measure_request": "POST http://127.0.0.1:8183/completion stream=true n_predict=16 temperature=0 cache_prompt=false"
+    },
+    "outputs": {
+      "stdout": [
+        "camelid_ttft_ms=<mean first non-empty streamed content chunk over measured runs>",
+        "camelid_decode_tok_s=<mean estimated streamed chunks per second after first content>",
+        "camelid_ms_tok=<mean estimated milliseconds per streamed content chunk after first content>",
+        "llama_cpp_ttft_ms=<same metric for llama.cpp>",
+        "llama_cpp_decode_tok_s=<same metric for llama.cpp>",
+        "llama_cpp_ms_tok=<same metric for llama.cpp>",
+        "camelid_backend_generate_ms=<mean Camelid backend generate timing when CAMELID_STREAM_TIMING_DIAGNOSTICS=on>",
+        "camelid_backend_first_content_ms=<mean Camelid backend first-content timing when CAMELID_STREAM_TIMING_DIAGNOSTICS=on>",
+        "json_out=<absolute path when --out is set>"
+      ],
+      "json": "Full machine-readable report at --out, schema camelid.same_host_llama3_benchmark.v1.",
+      "guardrail": "marker_presence=CMLD-BENCH; pass/fail is recorded under guardrails and can be enforced with --require-marker",
+      "lifecycle": "Report records server startup timing, model-load timing, warmups, and whether servers were started by the harness or reused preloaded."
+    },
+    "bounded_metrics": [
+      "first_byte_ms: first network byte from each streaming response",
+      "first_event_ms: first parsed SSE event",
+      "first_content_ms / TTFT: first non-empty streamed content chunk",
+      "total_elapsed_ms: full streaming response wall time",
+      "completion_tokens_estimate: count of non-empty streamed content chunks, not tokenizer-ground-truth tokens",
+      "decode_tok_per_s and ms_per_token_after_first: derived from completion_tokens_estimate after first content",
+      "marker_presence: exact expected marker observed in measured output text, optionally enforced with --require-marker",
+      "camelid_backend_generate_ms and camelid_backend_first_content_ms: opt-in backend timings when CAMELID_STREAM_TIMING_DIAGNOSTICS=on",
+      "camelid_backend_q8_calls and q8 timing counters: opt-in Q8 scheduler diagnostics when Camelid Q8 scheduler telemetry is also enabled; call count includes single-projection, fused gate/up, FFN-down decode, and route-table counters",
+      "resource_snapshots: host memory/load/storage snapshots before start, before measured runs, and after measured runs",
+      "server_lifecycle: Camelid/llama-server startup timing, model-load timing, reuse/preloaded status, and warmup behavior"
+    ],
+    "server_lifecycle": {
+      "camelid_started_by_harness": true,
+      "llama_started_by_harness": true,
+      "camelid_startup_ms": 55.84,
+      "llama_startup_ms": 1064.77,
+      "camelid_model_load_ms": 631.19,
+      "camelid_model_preloaded": false,
+      "llama_model_preloaded": false
+    },
+    "evidence_context": {
+      "repository": {
+        "head": "93a6502c1726e75a1d86def9edd753acc1f59db1",
+        "branch": "perf/fc0b298f-ubuntu-x86-q8-20260521",
+        "status_short": "M  src/inference.rs\n?? qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T0540Z-parity-push/"
+      },
+      "host_class": {
+        "os_type": "Linux",
+        "platform": "linux",
+        "release": "6.17.0-1013-aws",
+        "arch": "x64",
+        "cpu_model": "Intel(R) Xeon(R) Platinum 8488C",
+        "cpu_count": 16,
+        "total_memory_gib": 123.79
+      },
+      "binaries": {
+        "camelid": {
+          "path": "<camelid-worktree>/target/release/camelid",
+          "exists": true,
+          "size_bytes": 8997192,
+          "sha256": "ec1c6f990e6f78c53185a187d5da32ce38de86ac52b222fbcea968e246681aab"
+        },
+        "llama_server": {
+          "path": "<llama-cpp-worktree>/build/bin/llama-server",
+          "exists": true,
+          "size_bytes": 8248216,
+          "sha256": "48868c15f527969bd7fb57f8bf522bf595b57feffe687ae8ef146df085905eef"
+        },
+        "node": "v18.19.1"
+      },
+      "model_artifact": {
+        "path": "<model-dir>/Llama-3.2-3B-Instruct-Q8_0.gguf",
+        "exists": true,
+        "size_bytes": 3421899296,
+        "sha256": "b5607b5090a8280063fff2d706bb3408ca6542341b06aab39c3eca0a28575921"
+      },
+      "privacy_note": "Host name, user name, and home-relative local paths are intentionally not recorded; scrub full artifacts before publication if absolute paths appear in commands."
+    },
+    "resource_snapshots": {
+      "pre_start": {
+        "label": "pre_start",
+        "captured_utc": "2026-05-21T05:50:09.783Z",
+        "loadavg_1m_5m_15m": [
+          1.79,
+          1.58,
+          1.26
+        ],
+        "memory": {
+          "total_gib": 123.79,
+          "free_gib": 121.49,
+          "process_rss_mib": 88.59
+        },
+        "linux_meminfo": {
+          "mem_available_gib": 121.49,
+          "swap_total_gib": 0,
+          "swap_free_gib": 0,
+          "dirty_mib": 4.06
+        },
+        "storage": {
+          "path": "<camelid-worktree>",
+          "total_gib": 192.69,
+          "available_gib": 48.05,
+          "used_pct": 75.07
+        }
+      },
+      "before_measured_runs": {
+        "label": "before_measured_runs",
+        "captured_utc": "2026-05-21T05:50:18.881Z",
+        "loadavg_1m_5m_15m": [
+          1.72,
+          1.57,
+          1.25
+        ],
+        "memory": {
+          "total_gib": 123.79,
+          "free_gib": 114.02,
+          "process_rss_mib": 131.39
+        },
+        "linux_meminfo": {
+          "mem_available_gib": 114.02,
+          "swap_total_gib": 0,
+          "swap_free_gib": 0,
+          "dirty_mib": 4.02
+        },
+        "storage": {
+          "path": "<camelid-worktree>",
+          "total_gib": 192.69,
+          "available_gib": 48.05,
+          "used_pct": 75.07
+        }
+      },
+      "after_measured_runs": {
+        "label": "after_measured_runs",
+        "captured_utc": "2026-05-21T05:50:21.804Z",
+        "loadavg_1m_5m_15m": [
+          1.83,
+          1.6,
+          1.26
+        ],
+        "memory": {
+          "total_gib": 123.79,
+          "free_gib": 113.81,
+          "process_rss_mib": 109.46
+        },
+        "linux_meminfo": {
+          "mem_available_gib": 113.81,
+          "swap_total_gib": 0,
+          "swap_free_gib": 0,
+          "dirty_mib": 0.02
+        },
+        "storage": {
+          "path": "<camelid-worktree>",
+          "total_gib": 192.69,
+          "available_gib": 48.05,
+          "used_pct": 75.07
+        }
+      }
+    },
+    "measured_order": [
+      {
+        "engine": "camelid",
+        "label": "camelid-measure-1"
+      },
+      {
+        "engine": "llama_cpp",
+        "label": "llama-measure-1"
+      },
+      {
+        "engine": "camelid",
+        "label": "camelid-measure-2"
+      },
+      {
+        "engine": "llama_cpp",
+        "label": "llama-measure-2"
+      },
+      {
+        "engine": "camelid",
+        "label": "camelid-measure-3"
+      },
+      {
+        "engine": "llama_cpp",
+        "label": "llama-measure-3"
+      }
+    ],
+    "note": "Same-host comparison using alternating streaming requests to Camelid /v1/chat/completions and llama.cpp /completion. TTFT is first non-empty streamed content chunk; token throughput is estimated from streamed content chunks, not tokenizer-ground-truth completion tokens."
+  },
+  "camelid": {
+    "base_url": "http://127.0.0.1:8181",
+    "warmups": [
+      {
+        "label": "camelid-warmup-1",
+        "text": "CMLD-BENCH",
+        "first_byte_ms": 7047.32,
+        "first_event_ms": 7047.42,
+        "first_content_ms": 7047.48,
+        "total_elapsed_ms": 7047.73,
+        "completion_tokens_estimate": 5,
+        "chunk_count": 5,
+        "backend_timing": {
+          "q8_schedule": null,
+          "timings_ms": {
+            "first_content": 3163,
+            "first_content_accounting": {
+              "first_content_minus_prompt_eval_forward": 31.074999999999818,
+              "first_content_minus_prompt_eval_forward_plus_sample": 30.85799999999972,
+              "prompt_eval_forward_plus_sample": 3132.1420000000003,
+              "prompt_eval_forward_total": 3131.925,
+              "prompt_eval_logits": 7.239,
+              "prompt_eval_sample": 0.217
+            },
+            "first_token_forward_total": 105.949,
+            "first_token_role_timings": {
+              "attention_context": 3.350000000000001,
+              "attention_output": 11.593,
+              "ffn_down": 18.036999999999995,
+              "ffn_gate": 17.44,
+              "ffn_up": 17.450000000000003,
+              "logits": 7.239
+            },
+            "generate": 3733,
+            "generation_forward_total": 3701.143,
+            "generation_role_timings": {
+              "attention_context": 49.679,
+              "attention_output": 434.4130000000001,
+              "ffn_down": 666.3590000000002,
+              "ffn_gate": 674.4019999999999,
+              "ffn_up": 685.556,
+              "logits": 40.524
+            },
+            "layer_role_hotspots": {
+              "first_token": [
+                {
+                  "elapsed_ms": 1.546,
+                  "layer_index": 3,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 1.291,
+                  "layer_index": 3,
+                  "role": "ffn_up"
+                },
+                {
+                  "elapsed_ms": 1.29,
+                  "layer_index": 3,
+                  "role": "ffn_gate"
+                },
+                {
+                  "elapsed_ms": 1.282,
+                  "layer_index": 18,
+                  "role": "ffn_up"
+                },
+                {
+                  "elapsed_ms": 1.281,
+                  "layer_index": 18,
+                  "role": "ffn_gate"
+                },
+                {
+                  "elapsed_ms": 1.128,
+                  "layer_index": 12,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 1.108,
+                  "layer_index": 17,
+                  "role": "ffn_gate"
+                },
+                {
+                  "elapsed_ms": 1.108,
+                  "layer_index": 17,
+                  "role": "ffn_up"
+                },
+                {
+                  "elapsed_ms": 1.01,
+                  "layer_index": 7,
+                  "role": "ffn_gate"
+                },
+                {
+                  "elapsed_ms": 1.01,
+                  "layer_index": 7,
+                  "role": "ffn_up"
+                }
+              ],
+              "generation": [
+                {
+                  "elapsed_ms": 31.789,
+                  "layer_index": 3,
+                  "role": "ffn_up"
+                },
+                {
+                  "elapsed_ms": 30.516,
+                  "layer_index": 0,
+                  "role": "ffn_gate"
+                },
+                {
+                  "elapsed_ms": 29.14,
+                  "layer_index": 0,
+                  "role": "ffn_up"
+                },
+                {
+                  "elapsed_ms": 27.685,
+                  "layer_index": 13,
+                  "role": "ffn_gate"
+                },
+                {
+                  "elapsed_ms": 27.42,
+                  "layer_index": 8,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 27.105,
+                  "layer_index": 6,
+                  "role": "ffn_gate"
+                },
+                {
+                  "elapsed_ms": 27.01,
+                  "layer_index": 16,
+                  "role": "ffn_up"
+                },
+                {
+                  "elapsed_ms": 26.854,
+                  "layer_index": 26,
+                  "role": "ffn_up"
+                },
+                {
+                  "elapsed_ms": 26.781,
+                  "layer_index": 18,
+                  "role": "ffn_gate"
+                },
+                {
+                  "elapsed_ms": 26.602,
+                  "layer_index": 4,
+                  "role": "ffn_down"
+                }
+              ],
+              "prefill": [
+                {
+                  "elapsed_ms": 27.162,
+                  "layer_index": 0,
+                  "role": "ffn_gate"
+                },
+                {
+                  "elapsed_ms": 26.743,
+                  "layer_index": 3,
+                  "role": "ffn_up"
+                },
+                {
+                  "elapsed_ms": 25.782,
+                  "layer_index": 0,
+                  "role": "ffn_up"
+                },
+                {
+                  "elapsed_ms": 24.306,
+                  "layer_index": 13,
+                  "role": "ffn_gate"
+                },
+                {
+                  "elapsed_ms": 23.69,
+                  "layer_index": 16,
+                  "role": "ffn_up"
+                },
+                {
+                  "elapsed_ms": 23.202,
+                  "layer_index": 26,
+                  "role": "ffn_up"
+                },
+                {
+                  "elapsed_ms": 23.097,
+                  "layer_index": 6,
+                  "role": "ffn_gate"
+                },
+                {
+                  "elapsed_ms": 22.815,
+                  "layer_index": 26,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 22.673,
+                  "layer_index": 18,
+                  "role": "ffn_gate"
+                },
+                {
+                  "elapsed_ms": 22.551,
+                  "layer_index": 8,
+                  "role": "ffn_down"
+                }
+              ]
+            },
+            "prefill_forward_total": 3025.976,
+            "prefill_role_timings": {
+              "attention_context": 27.722000000000005,
+              "attention_output": 353.8310000000001,
+              "ffn_down": 542.6730000000001,
+              "ffn_gate": 573.0899999999999,
+              "ffn_up": 584.165,
+              "logits": 0
+            },
+            "prompt_cache_hit": false,
+            "session_create": 0,
+            "stream_event_accounting": {
+              "final_yield": 3733,
+              "final_yield_minus_first_content_yield": 570,
+              "first_content_yield": 3163,
+              "first_content_yield_minus_role_yield": 3163,
+              "generate_start": 0,
+              "generate_start_minus_role_yield": 0,
+              "poll_yield_enabled": false,
+              "role_yield": 0
+            },
+            "tokenize": 29,
+            "weight_cache_hit": false,
+            "weight_load": 3249
+          }
+        },
+        "backend_generate_ms": 3733,
+        "backend_first_content_ms": 3163,
+        "backend_q8_gemm_compute_us": null,
+        "backend_q8_pack_us": null,
+        "backend_q8_calls": null,
+        "decode_tok_per_s": 20071.37,
+        "ms_per_token_after_first": 0.05
+      }
+    ],
+    "runs": [
+      {
+        "label": "camelid-measure-1",
+        "text": "CMLD-BENCH",
+        "first_byte_ms": 608.09,
+        "first_event_ms": 608.14,
+        "first_content_ms": 608.17,
+        "total_elapsed_ms": 608.33,
+        "completion_tokens_estimate": 4,
+        "chunk_count": 4,
+        "backend_timing": {
+          "q8_schedule": null,
+          "timings_ms": {
+            "first_content": 149,
+            "first_content_accounting": {
+              "first_content_minus_prompt_eval_forward": 149,
+              "first_content_minus_prompt_eval_forward_plus_sample": 149,
+              "prompt_eval_forward_plus_sample": 0,
+              "prompt_eval_forward_total": 0,
+              "prompt_eval_logits": 0,
+              "prompt_eval_sample": 0
+            },
+            "first_token_forward_total": 0,
+            "first_token_role_timings": {
+              "attention_context": 0,
+              "attention_output": 0,
+              "ffn_down": 0,
+              "ffn_gate": 0,
+              "ffn_up": 0,
+              "logits": 0
+            },
+            "generate": 552,
+            "generation_forward_total": 503.542,
+            "generation_role_timings": {
+              "attention_context": 17.458,
+              "attention_output": 61.120999999999995,
+              "ffn_down": 93.87899999999999,
+              "ffn_gate": 73.017,
+              "ffn_up": 73.092,
+              "logits": 32.188
+            },
+            "layer_role_hotspots": {
+              "first_token": [],
+              "generation": [
+                {
+                  "elapsed_ms": 5.872,
+                  "layer_index": 4,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 4.682,
+                  "layer_index": 14,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 4.547,
+                  "layer_index": 19,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 4.194,
+                  "layer_index": 3,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 4.052,
+                  "layer_index": 12,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 3.852,
+                  "layer_index": 2,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 3.484,
+                  "layer_index": 1,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 3.419,
+                  "layer_index": 20,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 3.332,
+                  "layer_index": 27,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 3.292,
+                  "layer_index": 5,
+                  "role": "ffn_up"
+                }
+              ],
+              "prefill": []
+            },
+            "prefill_forward_total": 0,
+            "prefill_role_timings": {
+              "attention_context": 0,
+              "attention_output": 0,
+              "ffn_down": 0,
+              "ffn_gate": 0,
+              "ffn_up": 0,
+              "logits": 0
+            },
+            "prompt_cache_hit": true,
+            "session_create": 0,
+            "stream_event_accounting": {
+              "final_yield": 552,
+              "final_yield_minus_first_content_yield": 403,
+              "first_content_yield": 149,
+              "first_content_yield_minus_role_yield": 149,
+              "generate_start": 0,
+              "generate_start_minus_role_yield": 0,
+              "poll_yield_enabled": false,
+              "role_yield": 0
+            },
+            "tokenize": 29,
+            "weight_cache_hit": true,
+            "weight_load": 0
+          }
+        },
+        "backend_generate_ms": 552,
+        "backend_first_content_ms": 149,
+        "backend_q8_gemm_compute_us": null,
+        "backend_q8_pack_us": null,
+        "backend_q8_calls": null,
+        "decode_tok_per_s": 26053.37,
+        "ms_per_token_after_first": 0.04
+      },
+      {
+        "label": "camelid-measure-2",
+        "text": "CMLD-BENCH",
+        "first_byte_ms": 651.06,
+        "first_event_ms": 651.1,
+        "first_content_ms": 651.14,
+        "total_elapsed_ms": 651.48,
+        "completion_tokens_estimate": 4,
+        "chunk_count": 4,
+        "backend_timing": {
+          "q8_schedule": null,
+          "timings_ms": {
+            "first_content": 157,
+            "first_content_accounting": {
+              "first_content_minus_prompt_eval_forward": 157,
+              "first_content_minus_prompt_eval_forward_plus_sample": 157,
+              "prompt_eval_forward_plus_sample": 0,
+              "prompt_eval_forward_total": 0,
+              "prompt_eval_logits": 0,
+              "prompt_eval_sample": 0
+            },
+            "first_token_forward_total": 0,
+            "first_token_role_timings": {
+              "attention_context": 0,
+              "attention_output": 0,
+              "ffn_down": 0,
+              "ffn_gate": 0,
+              "ffn_up": 0,
+              "logits": 0
+            },
+            "generate": 583,
+            "generation_forward_total": 525.241,
+            "generation_role_timings": {
+              "attention_context": 16.986000000000004,
+              "attention_output": 67.507,
+              "ffn_down": 96.832,
+              "ffn_gate": 79.339,
+              "ffn_up": 79.41799999999999,
+              "logits": 32.664
+            },
+            "layer_role_hotspots": {
+              "first_token": [],
+              "generation": [
+                {
+                  "elapsed_ms": 5.001,
+                  "layer_index": 26,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 4.853,
+                  "layer_index": 2,
+                  "role": "attention_output"
+                },
+                {
+                  "elapsed_ms": 4.617,
+                  "layer_index": 20,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 4.535,
+                  "layer_index": 12,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 4.093,
+                  "layer_index": 23,
+                  "role": "attention_output"
+                },
+                {
+                  "elapsed_ms": 4.087,
+                  "layer_index": 23,
+                  "role": "ffn_up"
+                },
+                {
+                  "elapsed_ms": 4.085,
+                  "layer_index": 23,
+                  "role": "ffn_gate"
+                },
+                {
+                  "elapsed_ms": 3.741,
+                  "layer_index": 21,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 3.649,
+                  "layer_index": 23,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 3.593,
+                  "layer_index": 11,
+                  "role": "ffn_down"
+                }
+              ],
+              "prefill": []
+            },
+            "prefill_forward_total": 0,
+            "prefill_role_timings": {
+              "attention_context": 0,
+              "attention_output": 0,
+              "ffn_down": 0,
+              "ffn_gate": 0,
+              "ffn_up": 0,
+              "logits": 0
+            },
+            "prompt_cache_hit": true,
+            "session_create": 0,
+            "stream_event_accounting": {
+              "final_yield": 583,
+              "final_yield_minus_first_content_yield": 426,
+              "first_content_yield": 157,
+              "first_content_yield_minus_role_yield": 157,
+              "generate_start": 0,
+              "generate_start_minus_role_yield": 0,
+              "poll_yield_enabled": false,
+              "role_yield": 0
+            },
+            "tokenize": 31,
+            "weight_cache_hit": true,
+            "weight_load": 0
+          }
+        },
+        "backend_generate_ms": 583,
+        "backend_first_content_ms": 157,
+        "backend_q8_gemm_compute_us": null,
+        "backend_q8_pack_us": null,
+        "backend_q8_calls": null,
+        "decode_tok_per_s": 11756.82,
+        "ms_per_token_after_first": 0.09
+      },
+      {
+        "label": "camelid-measure-3",
+        "text": "CMLD-BENCH",
+        "first_byte_ms": 617.75,
+        "first_event_ms": 617.78,
+        "first_content_ms": 619.63,
+        "total_elapsed_ms": 619.89,
+        "completion_tokens_estimate": 4,
+        "chunk_count": 4,
+        "backend_timing": {
+          "q8_schedule": null,
+          "timings_ms": {
+            "first_content": 139,
+            "first_content_accounting": {
+              "first_content_minus_prompt_eval_forward": 139,
+              "first_content_minus_prompt_eval_forward_plus_sample": 139,
+              "prompt_eval_forward_plus_sample": 0,
+              "prompt_eval_forward_total": 0,
+              "prompt_eval_logits": 0,
+              "prompt_eval_sample": 0
+            },
+            "first_token_forward_total": 0,
+            "first_token_role_timings": {
+              "attention_context": 0,
+              "attention_output": 0,
+              "ffn_down": 0,
+              "ffn_gate": 0,
+              "ffn_up": 0,
+              "logits": 0
+            },
+            "generate": 558,
+            "generation_forward_total": 518.131,
+            "generation_role_timings": {
+              "attention_context": 18.151,
+              "attention_output": 66.931,
+              "ffn_down": 93.13000000000001,
+              "ffn_gate": 76.7,
+              "ffn_up": 76.77900000000001,
+              "logits": 30.4
+            },
+            "layer_role_hotspots": {
+              "first_token": [],
+              "generation": [
+                {
+                  "elapsed_ms": 4.599,
+                  "layer_index": 0,
+                  "role": "attention_output"
+                },
+                {
+                  "elapsed_ms": 4.587,
+                  "layer_index": 15,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 4.557,
+                  "layer_index": 25,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 4.546,
+                  "layer_index": 3,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 3.69,
+                  "layer_index": 25,
+                  "role": "ffn_up"
+                },
+                {
+                  "elapsed_ms": 3.688,
+                  "layer_index": 25,
+                  "role": "ffn_gate"
+                },
+                {
+                  "elapsed_ms": 3.599,
+                  "layer_index": 8,
+                  "role": "attention_output"
+                },
+                {
+                  "elapsed_ms": 3.594,
+                  "layer_index": 17,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 3.565,
+                  "layer_index": 19,
+                  "role": "ffn_up"
+                },
+                {
+                  "elapsed_ms": 3.56,
+                  "layer_index": 19,
+                  "role": "ffn_gate"
+                }
+              ],
+              "prefill": []
+            },
+            "prefill_forward_total": 0,
+            "prefill_role_timings": {
+              "attention_context": 0,
+              "attention_output": 0,
+              "ffn_down": 0,
+              "ffn_gate": 0,
+              "ffn_up": 0,
+              "logits": 0
+            },
+            "prompt_cache_hit": true,
+            "session_create": 0,
+            "stream_event_accounting": {
+              "final_yield": 558,
+              "final_yield_minus_first_content_yield": 419,
+              "first_content_yield": 139,
+              "first_content_yield_minus_role_yield": 139,
+              "generate_start": 0,
+              "generate_start_minus_role_yield": 0,
+              "poll_yield_enabled": false,
+              "role_yield": 0
+            },
+            "tokenize": 32,
+            "weight_cache_hit": true,
+            "weight_load": 0
+          }
+        },
+        "backend_generate_ms": 558,
+        "backend_first_content_ms": 139,
+        "backend_q8_gemm_compute_us": null,
+        "backend_q8_pack_us": null,
+        "backend_q8_calls": null,
+        "decode_tok_per_s": 15240.01,
+        "ms_per_token_after_first": 0.07
+      }
+    ],
+    "summary": {
+      "count": 3,
+      "avg_first_byte_ms": 625.63,
+      "avg_first_event_ms": 625.67,
+      "avg_ttft_ms": 626.31,
+      "avg_total_elapsed_ms": 626.57,
+      "avg_backend_generate_ms": 564.33,
+      "avg_backend_first_content_ms": 148.33,
+      "avg_backend_q8_calls": null,
+      "avg_backend_q8_gemm_compute_us": null,
+      "avg_backend_q8_pack_us": null,
+      "avg_decode_tok_per_s": 17683.4,
+      "avg_ms_per_token_after_first": 0.07,
+      "avg_completion_tokens_estimate": 4
+    }
+  },
+  "llama_cpp": {
+    "base_url": "http://127.0.0.1:8183",
+    "warmups": [
+      {
+        "label": "llama-warmup-1",
+        "text": "CMLD-BENCH",
+        "first_byte_ms": 151.6,
+        "first_event_ms": 151.65,
+        "first_content_ms": 151.71,
+        "total_elapsed_ms": 344.68,
+        "completion_tokens_estimate": 5,
+        "chunk_count": 5,
+        "backend_timing": null,
+        "backend_generate_ms": null,
+        "backend_first_content_ms": null,
+        "backend_q8_gemm_compute_us": null,
+        "backend_q8_pack_us": null,
+        "backend_q8_calls": null,
+        "decode_tok_per_s": 25.91,
+        "ms_per_token_after_first": 38.59
+      }
+    ],
+    "runs": [
+      {
+        "label": "llama-measure-1",
+        "text": "CMLD-BENCH",
+        "first_byte_ms": 154.16,
+        "first_event_ms": 154.2,
+        "first_content_ms": 154.22,
+        "total_elapsed_ms": 346.44,
+        "completion_tokens_estimate": 5,
+        "chunk_count": 5,
+        "backend_timing": null,
+        "backend_generate_ms": null,
+        "backend_first_content_ms": null,
+        "backend_q8_gemm_compute_us": null,
+        "backend_q8_pack_us": null,
+        "backend_q8_calls": null,
+        "decode_tok_per_s": 26.01,
+        "ms_per_token_after_first": 38.44
+      },
+      {
+        "label": "llama-measure-2",
+        "text": "CMLD-BENCH",
+        "first_byte_ms": 150.74,
+        "first_event_ms": 150.78,
+        "first_content_ms": 150.81,
+        "total_elapsed_ms": 346.03,
+        "completion_tokens_estimate": 5,
+        "chunk_count": 5,
+        "backend_timing": null,
+        "backend_generate_ms": null,
+        "backend_first_content_ms": null,
+        "backend_q8_gemm_compute_us": null,
+        "backend_q8_pack_us": null,
+        "backend_q8_calls": null,
+        "decode_tok_per_s": 25.61,
+        "ms_per_token_after_first": 39.05
+      },
+      {
+        "label": "llama-measure-3",
+        "text": "CMLD-BENCH",
+        "first_byte_ms": 150.33,
+        "first_event_ms": 150.36,
+        "first_content_ms": 150.41,
+        "total_elapsed_ms": 346.4,
+        "completion_tokens_estimate": 5,
+        "chunk_count": 5,
+        "backend_timing": null,
+        "backend_generate_ms": null,
+        "backend_first_content_ms": null,
+        "backend_q8_gemm_compute_us": null,
+        "backend_q8_pack_us": null,
+        "backend_q8_calls": null,
+        "decode_tok_per_s": 25.51,
+        "ms_per_token_after_first": 39.2
+      }
+    ],
+    "summary": {
+      "count": 3,
+      "avg_first_byte_ms": 151.74,
+      "avg_first_event_ms": 151.78,
+      "avg_ttft_ms": 151.81,
+      "avg_total_elapsed_ms": 346.29,
+      "avg_backend_generate_ms": null,
+      "avg_backend_first_content_ms": null,
+      "avg_backend_q8_calls": null,
+      "avg_backend_q8_gemm_compute_us": null,
+      "avg_backend_q8_pack_us": null,
+      "avg_decode_tok_per_s": 25.71,
+      "avg_ms_per_token_after_first": 38.9,
+      "avg_completion_tokens_estimate": 5
+    },
+    "binary": "<llama-cpp-worktree>/build/bin/llama-server"
+  },
+  "comparison": {
+    "ttft_delta_pct_vs_llama_cpp": 312.56,
+    "total_elapsed_delta_pct_vs_llama_cpp": 80.94,
+    "decode_tok_per_s_delta_pct_vs_llama_cpp": 68680.24,
+    "ms_per_token_after_first_delta_pct_vs_llama_cpp": -99.82
+  },
+  "guardrails": {
+    "expected_marker": "CMLD-BENCH",
+    "require_marker": true,
+    "marker_presence": {
+      "camelid": [
+        {
+          "label": "camelid-measure-1",
+          "contains_expected_marker": true,
+          "nonempty_streamed_output": true
+        },
+        {
+          "label": "camelid-measure-2",
+          "contains_expected_marker": true,
+          "nonempty_streamed_output": true
+        },
+        {
+          "label": "camelid-measure-3",
+          "contains_expected_marker": true,
+          "nonempty_streamed_output": true
+        }
+      ],
+      "llama_cpp": [
+        {
+          "label": "llama-measure-1",
+          "contains_expected_marker": true,
+          "nonempty_streamed_output": true
+        },
+        {
+          "label": "llama-measure-2",
+          "contains_expected_marker": true,
+          "nonempty_streamed_output": true
+        },
+        {
+          "label": "llama-measure-3",
+          "contains_expected_marker": true,
+          "nonempty_streamed_output": true
+        }
+      ]
+    },
+    "passed": true,
+    "note": "The harness exits non-zero if any measured run omits the expected marker; empty measured output is always treated as a failed guardrail."
+  },
+  "claim_boundary": "Same-host benchmark snapshot only for exact row llama32_3b_instruct_q8_0 with the provided GGUF, prompt, max-token budget, host, binaries, and thread settings. It is bounded timing evidence only: it does not widen support, portability, production-throughput, model-native/larger-context, neighboring-row, broad Llama-family, 1B, or Mixtral claims unless a separate row-specific evidence bundle records those exact conditions."
+}

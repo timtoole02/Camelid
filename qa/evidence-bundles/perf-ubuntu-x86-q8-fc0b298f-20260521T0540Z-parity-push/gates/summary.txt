@@ -1,0 +1,7 @@
+cargo-fmt-check: 0
+test-vnni-dpwssd: 0
+test-x86-q8: 0
+test-q8-ffn-gate-up: 0
+cargo-build-release: 0
+git-diff-check: 0
+check-public-scrub: 0
