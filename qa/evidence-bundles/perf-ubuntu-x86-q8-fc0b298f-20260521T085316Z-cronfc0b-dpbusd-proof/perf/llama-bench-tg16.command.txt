@@ -1,0 +1,1 @@
+taskset -c 0-15 /home/ubuntu/work/llama.cpp-clean-20260517/build/bin/llama-bench -m /home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf -ngl 0 -t 16 -p 47 -n 0,16 -r 1 -o json

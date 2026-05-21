@@ -1,0 +1,145 @@
+warning: function `mac_q8_ffn_down_single_projection_scheduler_counters_enabled` is never used
+    --> src/inference.rs:8656:4
+     |
+8656 | fn mac_q8_ffn_down_single_projection_scheduler_counters_enabled() -> bool {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `camelid_x86_q8_amx_supported` is never used
+  --> src/inference.rs:47:8
+   |
+47 |     fn camelid_x86_q8_amx_supported() -> std::os::raw::c_int;
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `camelid_q8_0_amx_compute_tile16` is never used
+  --> src/inference.rs:48:8
+   |
+48 |     fn camelid_q8_0_amx_compute_tile16(
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `camelid` (lib) generated 3 warnings
+warning: function `camelid_x86_q8_amx_supported` is never used
+  --> src/inference.rs:47:8
+   |
+47 |     fn camelid_x86_q8_amx_supported() -> std::os::raw::c_int;
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `camelid` (lib test) generated 2 warnings (1 duplicate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running unittests src/lib.rs (target/debug/deps/camelid-090ad91c1b51b1cf)
+
+running 45 tests
+test inference::tests::q8_0_block_dot_env_flags_ignore_outer_whitespace ... ok
+test inference::tests::q8_0_block_reader_smoke ... ok
+test inference::tests::q8_0_encoded_horizontal_sum_matches_linear_int_sum ... ok
+test inference::tests::q8_0_encoded_row_matches_decoded_scale_helper ... ok
+test inference::tests::q8_0_block_dot_reads_descriptor_shaped_blocks_as_transposed_rows_when_opted_in ... ok
+test inference::tests::output_projection_diagnostics_reject_q8_0_file_backing_block_mismatch_before_read ... ok
+test inference::tests::output_projection_diagnostics_reject_q8_0_file_backed_unaligned_rows_before_read ... ok
+test inference::tests::gated_ffn_activation_uses_q8_0_descriptor_blocks_for_gate_and_up_when_opted_in ... ok
+test inference::tests::output_projection_diagnostics_support_q8_0_file_backed_token_major_rows ... ok
+test inference::tests::output_projection_diagnostics_match_q8_0_file_backed_block_dot_probe ... ok
+test inference::tests::q8_0_block_reader_linear_matches_existing_q8_path ... ok
+test inference::tests::q8_0_block_dot_uses_raw_weight_blocks_and_quantized_input_when_opted_in ... ok
+test inference::tests::q8_0_file_reader_parallel_respects_explicit_linear_off ... ok
+test inference::tests::output_projection_q8_0_descriptor_shape_uses_storage_token_rows ... ok
+test inference::tests::q8_0_file_reader_quantized_input_buffer_reuses_capacity ... ok
+test inference::tests::q8_0_block_reader_linear_matches_q8_path_with_parallel_chunks ... ok
+test inference::tests::q8_0_horizontal_sum_matches_linear_int_sum ... ok
+test inference::tests::q8_0_file_backed_accumulate_can_use_quantized_input_block_dot ... ok
+test inference::tests::q8_0_input_quantization_uses_unrounded_scale_for_quants ... ok
+test inference::tests::q8_0_file_backed_accumulate_matches_q8_block_dot_across_chunks ... ok
+test inference::tests::q8_0_compute_gates_preserve_default_on_and_explicit_escape_hatches ... ok
+test inference::tests::q8_0_file_backed_accumulate_coalesces_exact_two_chunk_tensor_read ... ok
+test inference::tests::q8_0_file_backed_accumulate_rejects_unaligned_input_width ... ok
+test inference::tests::q8_0_file_backed_batch_matmul_can_use_quantized_input_block_dot ... ok
+test inference::tests::q8_0_file_backed_batch_matmul_reuses_cached_chunks_across_calls ... ok
+test inference::tests::q8_0_file_backed_batch_matmul_reuses_chunk_reads_across_input_rows ... ok
+test inference::tests::q8_0_two_dot_rows_matches_individual_dot_rows ... ok
+test inference::tests::q8_0_file_backed_borrowed_batch_matmul_reuses_chunk_reads_across_input_rows ... ok
+test inference::tests::q8_0_file_backed_packed_rows4_dot_matches_retained_without_q8_blocks ... ok
+test tensor::tests::q8_0_vnni_pack_requires_raw_q8_bytes_for_scale_bits ... ok
+test inference::tests::q8_0_file_backing_cache_reuses_exact_chunk_reads ... ok
+test inference::tests::q8_0_block_dot_uses_quantized_fast_path_when_explicitly_enabled ... ok
+test inference::tests::q8_0_file_reader_parallel_uses_existing_linear_threshold_env ... ok
+test inference::tests::q8_0_file_reader_parallelizes_wide_outputs_by_default ... ok
+test inference::tests::q8_0_file_reader_scratch_retention_is_bounded ... ok
+test inference::tests::q8_0_hot_path_uses_resolved_plan_not_current_env ... ok
+test inference::tests::q8_0_packed_4x4_rows4_matches_retained_block_dot ... ok
+test inference::tests::q8_0_packed_4x8_rows4_matches_retained_block_dot ... ok
+test inference::tests::q8_0_runtime_packed_ffn_down_transposed_view_matches_retained_blocks ... ok
+test inference::tests::q8_0_runtime_packed_ffn_gate_transposed_view_matches_retained_blocks ... ok
+test inference::tests::q8_0_runtime_packed_ffn_gate_up_activation_matches_retained_blocks ... ok
+test inference::tests::q8_0_runtime_packed_ffn_transposed_f32_fallback_handles_empty_runtime_data ... ok
+test inference::tests::q8_0_runtime_packed_rows4_f32_fallback_handles_empty_runtime_data ... ok
+test inference::tests::rectangular_shape_reinterpretation_preserves_q8_0_blocks_for_transposed_dot ... ok
+test tensor::tests::q8_0_vnni_pack_from_q8_0_bytes_matches_llamacpp_tile16_layout ... ok
+
+test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 252 filtered out; finished in 0.01s
+
+     Running unittests src/main.rs (target/debug/deps/camelid-89675ca1bc55f179)
+
+running 1 test
+test tensor_dump_tests::tensor_dump_reports_q8_0_storage_row_size_and_stride ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+     Running tests/api_vertical_slice.rs (target/debug/deps/api_vertical_slice-58de04fe2d948894)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 59 filtered out; finished in 0.00s
+
+     Running tests/gguf_metadata.rs (target/debug/deps/gguf_metadata-8bbc46dbc9dbc27c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/inference_session.rs (target/debug/deps/inference_session-adf0caab35d2f20e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.00s
+
+     Running tests/model_binding.rs (target/debug/deps/model_binding-387b6620e91b4320)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+     Running tests/tensor_primitives.rs (target/debug/deps/tensor_primitives-9df4c1ae873d6db3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+     Running tests/tensor_store.rs (target/debug/deps/tensor_store-59997a56cf1cbb62)
+
+running 14 tests
+test dequantizes_q8_0_block_ranges_without_full_materialization ... ok
+test loads_q8_0_block_backed_linear_without_f32_materialization ... ok
+test loads_q8_0_blocks_without_f32_materialization ... ok
+test adapts_q8_0_all_row_dot_to_single_row_linear_output_shape ... ok
+test dequantizes_q8_0_rows_without_full_materialization ... ok
+test loads_q8_0_file_backed_linear_without_f32_materialization ... ok
+test dots_all_q8_0_block_aligned_rows_without_per_element_row_fallback ... ok
+test loads_q8_0_tensor_payload_as_f32 ... ok
+test dots_q8_0_rows_against_f32_input_without_full_materialization ... ok
+test dots_all_q8_0_rows_into_f32_tensor_without_full_materialization ... ok
+test q8_0_block_backed_embedding_lookup_dequantizes_requested_rows ... ok
+test q8_0_file_backed_embedding_lookup_reads_only_requested_rows ... ok
+test rejects_non_q8_0_block_only_loads ... ok
+test rejects_q8_0_tensor_with_non_block_aligned_first_dimension ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s
+
+     Running tests/tokenizer.rs (target/debug/deps/tokenizer-e626ec46b821d831)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+

@@ -1,0 +1,106 @@
+warning: function `mac_q8_ffn_down_single_projection_scheduler_counters_enabled` is never used
+    --> src/inference.rs:8656:4
+     |
+8656 | fn mac_q8_ffn_down_single_projection_scheduler_counters_enabled() -> bool {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `camelid_x86_q8_amx_supported` is never used
+  --> src/inference.rs:47:8
+   |
+47 |     fn camelid_x86_q8_amx_supported() -> std::os::raw::c_int;
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `camelid_q8_0_amx_compute_tile16` is never used
+  --> src/inference.rs:48:8
+   |
+48 |     fn camelid_q8_0_amx_compute_tile16(
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `camelid` (lib) generated 3 warnings
+warning: function `camelid_x86_q8_amx_supported` is never used
+  --> src/inference.rs:47:8
+   |
+47 |     fn camelid_x86_q8_amx_supported() -> std::os::raw::c_int;
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `camelid` (lib test) generated 2 warnings (1 duplicate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running unittests src/lib.rs (target/debug/deps/camelid-090ad91c1b51b1cf)
+
+running 16 tests
+test inference::tests::x86_q8_avx512vnni_dpbusd_packed_rows4_i8_matches_scalar_dot ... ok
+test inference::tests::x86_q8_ffn_down_decode_uses_avx2_reference_gate ... ok
+test execution_plan::tests::ubuntu_experimental_preserves_explicit_x86_q8_gate_opt_ins ... ok
+test execution_plan::tests::planner_env_apply_clears_stale_x86_q8_decode_consumer_flags ... ok
+test inference::tests::x86_q8_avx2_kernel_matches_scalar_dot ... ok
+test inference::tests::x86_q8_avx512vnni_dpwssd_packed_rows4_i8_matches_scalar_dot ... ok
+test inference::tests::x86_q8_avx2_packed_rows4_hoisted_matmul_matches_scalar_dot ... ok
+test inference::tests::x86_q8_output_packed_rows4_matmul_is_plan_gated_and_prefill_limited ... ok
+test inference::tests::x86_q8_output_decode_owner_path_uses_runtime_packed_storage ... ok
+test inference::tests::x86_q8_avx2_packed_rows4_i8_matches_scalar_dot ... ok
+test inference::tests::x86_q8_ffn_down_gemm4_row_group_schedule_respects_min_input_groups ... ok
+test inference::tests::x86_q8_avx2_packed_rows4_decode_hoist_projection_matches_scalar_dot ... ok
+test inference::tests::x86_q8_output_packed_rows4_matmul_matches_runtime_packed_baseline_for_prefill ... ok
+test inference::tests::x86_q8_packed_rows4_decode_projection_matches_manual_wide_output ... ok
+test inference::tests::x86_q8_packed_rows4_matmul_chunk_groups_env_override ... ok
+test inference::tests::x86_q8_packed_rows4_serial_decode_gate_disables_decode_parallelism ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 281 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/camelid-89675ca1bc55f179)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+     Running tests/api_vertical_slice.rs (target/debug/deps/api_vertical_slice-58de04fe2d948894)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 59 filtered out; finished in 0.00s
+
+     Running tests/gguf_metadata.rs (target/debug/deps/gguf_metadata-8bbc46dbc9dbc27c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/inference_session.rs (target/debug/deps/inference_session-adf0caab35d2f20e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.00s
+
+     Running tests/model_binding.rs (target/debug/deps/model_binding-387b6620e91b4320)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+     Running tests/tensor_primitives.rs (target/debug/deps/tensor_primitives-9df4c1ae873d6db3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+     Running tests/tensor_store.rs (target/debug/deps/tensor_store-59997a56cf1cbb62)
+
+running 5 tests
+test x86_q8_repack_loads_output_projection_as_token_major_packed_runtime ... ok
+test x86_q8_repack_loads_attention_qkv_as_output_row_packed_runtime ... ok
+test x86_q8_repack_loads_attn_q_as_packed_runtime_without_row_major_duplicate ... ok
+test x86_q8_repack_loads_dense_attention_family_as_packed_runtime ... ok
+test x86_q8_repack_loads_dense_ffn_family_as_transposed_packed_runtime ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+
+     Running tests/tokenizer.rs (target/debug/deps/tokenizer-e626ec46b821d831)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+

@@ -1,0 +1,16 @@
+WARNING: Kernel address maps (/proc/{kallsyms,modules}) are restricted,
+check /proc/sys/kernel/kptr_restrict and /proc/sys/kernel/perf_event_paranoid.
+
+Samples in kernel functions may not be resolved if a suitable vmlinux
+file is not found in the buildid cache or in the vmlinux path.
+
+Samples in kernel modules won't be resolved at all.
+
+If some relocation was applied (e.g. kexec) symbols may be misresolved
+even with a suitable vmlinux or kallsyms file.
+
+Couldn't record kernel reference relocation symbol
+Symbol resolution may be skewed if relocation was used (e.g. kexec).
+Check /proc/kallsyms permission or run as root.
+[ perf record: Woken up 2 times to write data ]
+[ perf record: Captured and wrote 1.926 MB qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/perf/llama-bench-tg16.data (21568 samples) ]

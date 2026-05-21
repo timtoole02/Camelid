@@ -1,0 +1,15 @@
+000000000006c8d0 t void (anonymous namespace)::tinygemm_kernel_amx<block_q8_0, block_q8_0, float, 32, 0>(int, int, int, void const*, void const*, float*, int) [clone .constprop.0]
+000000000005ff50 t (anonymous namespace)::tinygemm_kernel_vnni<block_q8_0, block_q4_0, float, 1, 128, 32>::apply(int, void const*, void const*, float*, int)
+000000000005f4b0 t (anonymous namespace)::tinygemm_kernel_vnni<block_q8_0, block_q4_0, float, 1, 64, 32>::apply(int, void const*, void const*, float*, int)
+000000000005f910 t (anonymous namespace)::tinygemm_kernel_vnni<block_q8_0, block_q4_0, float, 1, 96, 32>::apply(int, void const*, void const*, float*, int)
+000000000005ddb0 t (anonymous namespace)::tinygemm_kernel_vnni<block_q8_0, block_q8_0, float, 1, 128, 32>::apply(int, void const*, void const*, float*, int)
+000000000005d610 t (anonymous namespace)::tinygemm_kernel_vnni<block_q8_0, block_q8_0, float, 1, 64, 32>::apply(int, void const*, void const*, float*, int)
+000000000005d940 t (anonymous namespace)::tinygemm_kernel_vnni<block_q8_0, block_q8_0, float, 1, 96, 32>::apply(int, void const*, void const*, float*, int)
+0000000000010400 b (anonymous namespace)::tinygemm_kernel_amx<block_q8_0, block_q4_0, float, 32, 0>(int, int, int, void const*, void const*, float*, int)::Tile0
+0000000000010200 b (anonymous namespace)::tinygemm_kernel_amx<block_q8_0, block_q4_0, float, 32, 0>(int, int, int, void const*, void const*, float*, int)::Tile1
+0000000000010000 b (anonymous namespace)::tinygemm_kernel_amx<block_q8_0, block_q4_0, float, 32, 0>(int, int, int, void const*, void const*, float*, int)::Tile23
+000000000000f000 b (anonymous namespace)::tinygemm_kernel_amx<block_q8_0, block_q4_0, float, 32, 0>(int, int, int, void const*, void const*, float*, int)::TileC0
+000000000000e000 b (anonymous namespace)::tinygemm_kernel_amx<block_q8_0, block_q4_0, float, 32, 0>(int, int, int, void const*, void const*, float*, int)::TileC1
+000000000000b800 b (anonymous namespace)::tinygemm_kernel_amx<block_q8_0, block_q8_0, float, 32, 0>(int, int, int, void const*, void const*, float*, int)::Tile23
+000000000000a800 b (anonymous namespace)::tinygemm_kernel_amx<block_q8_0, block_q8_0, float, 32, 0>(int, int, int, void const*, void const*, float*, int)::TileC0
+0000000000009800 b (anonymous namespace)::tinygemm_kernel_amx<block_q8_0, block_q8_0, float, 32, 0>(int, int, int, void const*, void const*, float*, int)::TileC1

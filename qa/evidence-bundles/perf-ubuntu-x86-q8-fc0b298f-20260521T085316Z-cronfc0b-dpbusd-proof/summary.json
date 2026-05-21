@@ -1,0 +1,68 @@
+{
+  "bench": {
+    "dpwssd-r5": {
+      "camelid_ttft_ms": 423.17,
+      "camelid_total_ms": 423.29,
+      "camelid_decode_tok_s": 32865.83,
+      "llama_ttft_ms": 167.7,
+      "llama_total_ms": 356.43,
+      "llama_decode_tok_s": 26.49,
+      "guardrails_passed": true
+    },
+    "dpbusd-r5": {
+      "camelid_ttft_ms": 413.55,
+      "camelid_total_ms": 413.7,
+      "camelid_decode_tok_s": 28476.92,
+      "llama_ttft_ms": 165.29,
+      "llama_total_ms": 353.97,
+      "llama_decode_tok_s": 26.5,
+      "guardrails_passed": true
+    },
+    "dpwssd-r3-perfstat": {
+      "camelid_ttft_ms": 567.16,
+      "camelid_total_ms": 567.32,
+      "camelid_decode_tok_s": 29754.75,
+      "llama_ttft_ms": 172.02,
+      "llama_total_ms": 366.46,
+      "llama_decode_tok_s": 25.73,
+      "guardrails_passed": true
+    },
+    "dpbusd-r3-perfstat": {
+      "camelid_ttft_ms": 556.31,
+      "camelid_total_ms": 556.46,
+      "camelid_decode_tok_s": 28929.26,
+      "llama_ttft_ms": 168.34,
+      "llama_total_ms": 365.09,
+      "llama_decode_tok_s": 25.44,
+      "guardrails_passed": true
+    }
+  },
+  "perf_counters": {
+    "dpwssd-r3": {
+      "task-clock": 88128736487,
+      "cycles": 282375962122,
+      "instructions": 270934353846,
+      "branches": 40954643044,
+      "branch-misses": 112516256,
+      "context-switches": 319483,
+      "cpu-migrations": 28946,
+      "page-faults": 2517623
+    },
+    "dpbusd-r3": {
+      "task-clock": 87883982351,
+      "cycles": 281945157037,
+      "instructions": 255975638897,
+      "branches": 38055939616,
+      "branch-misses": 108516133,
+      "context-switches": 317345,
+      "cpu-migrations": 26229,
+      "page-faults": 2499563
+    }
+  },
+  "effect": {
+    "camelid_total_ms_delta_vs_dpwssd": -9.59,
+    "camelid_total_ms_pct_vs_dpwssd": -2.27,
+    "camelid_ttft_ms_delta_vs_dpwssd": -9.62,
+    "target_400ms_delta": 13.7
+  }
+}

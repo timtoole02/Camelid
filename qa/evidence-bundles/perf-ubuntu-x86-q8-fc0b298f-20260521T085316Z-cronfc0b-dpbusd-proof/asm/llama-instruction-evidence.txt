@@ -1,0 +1,89 @@
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d654:	62 d2 7d 48 7a c9    	vpbroadcastb %r9d,%zmm1
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d680:	62 72 7d 48 58 b9 02 	vpbroadcastd 0x2(%rcx),%zmm15
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d690:	62 72 7d 48 58 b1 06 	vpbroadcastd 0x6(%rcx),%zmm14
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d6a5:	62 72 7d 48 58 69 fa 	vpbroadcastd -0x18(%rcx),%zmm13
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d6ac:	62 72 7d 48 58 61 fb 	vpbroadcastd -0x14(%rcx),%zmm12
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d6cc:	62 72 7d 48 58 59 fc 	vpbroadcastd -0x10(%rcx),%zmm11
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d6d3:	62 72 7d 48 58 51 fd 	vpbroadcastd -0xc(%rcx),%zmm10
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d6da:	62 f2 05 48 50 80 a0 	vpdpbusd -0x260(%rax),%zmm15,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d6f0:	62 72 7d 48 58 49 fe 	vpbroadcastd -0x8(%rcx),%zmm9
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d703:	62 72 7d 48 58 41 ff 	vpbroadcastd -0x4(%rcx),%zmm8
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d736:	62 f2 0d 48 50 80 e0 	vpdpbusd -0x220(%rax),%zmm14,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d740:	62 f2 15 48 50 80 20 	vpdpbusd -0x1e0(%rax),%zmm13,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d74a:	62 f2 1d 48 50 80 60 	vpdpbusd -0x1a0(%rax),%zmm12,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d754:	62 f2 25 48 50 80 a0 	vpdpbusd -0x160(%rax),%zmm11,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d75e:	62 f2 2d 48 50 80 e0 	vpdpbusd -0x120(%rax),%zmm10,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d768:	62 f2 35 48 50 80 20 	vpdpbusd -0xe0(%rax),%zmm9,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d772:	62 f2 3d 48 50 80 60 	vpdpbusd -0xa0(%rax),%zmm8,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d79c:	62 f2 05 48 50 87 a0 	vpdpbusd -0x260(%rdi),%zmm15,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d7ac:	62 f2 0d 48 50 87 e0 	vpdpbusd -0x220(%rdi),%zmm14,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d7b6:	62 f2 15 48 50 87 20 	vpdpbusd -0x1e0(%rdi),%zmm13,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d7c0:	62 f2 1d 48 50 87 60 	vpdpbusd -0x1a0(%rdi),%zmm12,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d7ca:	62 f2 25 48 50 87 a0 	vpdpbusd -0x160(%rdi),%zmm11,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d7d4:	62 f2 2d 48 50 87 e0 	vpdpbusd -0x120(%rdi),%zmm10,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d7de:	62 f2 35 48 50 87 20 	vpdpbusd -0xe0(%rdi),%zmm9,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d7e8:	62 f2 3d 48 50 87 60 	vpdpbusd -0xa0(%rdi),%zmm8,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d812:	62 f2 05 48 50 82 a0 	vpdpbusd -0x260(%rdx),%zmm15,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d822:	62 f2 0d 48 50 82 e0 	vpdpbusd -0x220(%rdx),%zmm14,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d82c:	62 f2 15 48 50 82 20 	vpdpbusd -0x1e0(%rdx),%zmm13,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d836:	62 f2 1d 48 50 82 60 	vpdpbusd -0x1a0(%rdx),%zmm12,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d840:	62 f2 25 48 50 82 a0 	vpdpbusd -0x160(%rdx),%zmm11,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d84a:	62 f2 2d 48 50 82 e0 	vpdpbusd -0x120(%rdx),%zmm10,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d854:	62 f2 35 48 50 82 20 	vpdpbusd -0xe0(%rdx),%zmm9,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d85e:	62 f2 3d 48 50 82 60 	vpdpbusd -0xa0(%rdx),%zmm8,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d888:	62 f2 05 48 50 86 a0 	vpdpbusd -0x260(%rsi),%zmm15,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d898:	62 f2 0d 48 50 86 e0 	vpdpbusd -0x220(%rsi),%zmm14,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d8a2:	62 f2 15 48 50 86 20 	vpdpbusd -0x1e0(%rsi),%zmm13,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d8ac:	62 f2 1d 48 50 86 60 	vpdpbusd -0x1a0(%rsi),%zmm12,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d8b6:	62 f2 25 48 50 86 a0 	vpdpbusd -0x160(%rsi),%zmm11,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d8c0:	62 f2 2d 48 50 86 e0 	vpdpbusd -0x120(%rsi),%zmm10,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d8ca:	62 f2 35 48 50 86 20 	vpdpbusd -0xe0(%rsi),%zmm9,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-vnni-q8q8-1x64.asm:   5d8d4:	62 f2 3d 48 50 86 60 	vpdpbusd -0xa0(%rsi),%zmm8,%zmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6ca75:	c4 e2 7b 49 e0       	tilezero %tmm4
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6ca7a:	c4 e2 7b 49 f0       	tilezero %tmm6
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6ca9d:	c4 e2 7b 4b 04 01    	tileloadd (%rcx,%rax,1),%tmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6caab:	c4 e2 7b 4b 0c 06    	tileloadd (%rsi,%rax,1),%tmm1
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6cacb:	c4 e2 7b 4b 14 38    	tileloadd (%rax,%rdi,1),%tmm2
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6caf2:	c4 e2 7a 4b 24 38    	tilestored %tmm4,(%rax,%rdi,1)
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6cafe:	c4 e2 7a 4b 34 38    	tilestored %tmm6,(%rax,%rdi,1)
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6ce20:	c4 e2 7b 49 e0       	tilezero %tmm4
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6ce25:	c4 e2 7b 49 f0       	tilezero %tmm6
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6ce35:	c4 e2 7b 49 e8       	tilezero %tmm5
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6ce3a:	c4 e2 7b 49 f8       	tilezero %tmm7
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6ce4c:	c4 e2 7b 4b 04 07    	tileloadd (%rdi,%rax,1),%tmm0
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6ce5a:	c4 e2 7b 4b 0c 07    	tileloadd (%rdi,%rax,1),%tmm1
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6ce76:	c4 e2 7b 4b 14 08    	tileloadd (%rax,%rcx,1),%tmm2
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6ce9d:	c4 e2 7a 4b 24 08    	tilestored %tmm4,(%rax,%rcx,1)
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6cea9:	c4 e2 7a 4b 34 08    	tilestored %tmm6,(%rax,%rcx,1)
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d028:	c4 e2 7b 49 e8       	tilezero %tmm5
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d02d:	c4 e2 7b 49 f8       	tilezero %tmm7
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d05b:	c4 c1 7e 6f 67 02    	vmovdqu 0x2(%r15),%ymm4
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d088:	c5 fe 6f 68 02       	vmovdqu 0x2(%rax),%ymm5
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d09b:	c4 c1 7e 6f 74 24 02 	vmovdqu 0x2(%r12),%ymm6
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d0b8:	c5 fe 6f 78 02       	vmovdqu 0x2(%rax),%ymm7
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d0d3:	c5 fe 6f 68 02       	vmovdqu 0x2(%rax),%ymm5
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d0f1:	c5 fe 6f 68 02       	vmovdqu 0x2(%rax),%ymm5
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d11f:	c4 c1 7e 6f 6c 07 02 	vmovdqu 0x2(%r15,%rax,1),%ymm5
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d14a:	c4 c1 7e 6f 64 07 02 	vmovdqu 0x2(%r15,%rax,1),%ymm4
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d186:	c4 c1 7e 6f 64 07 02 	vmovdqu 0x2(%r15,%rax,1),%ymm4
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d1af:	c4 c1 7e 6f 6c 07 02 	vmovdqu 0x2(%r15,%rax,1),%ymm5
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d1da:	c4 81 7e 6f 7c 07 02 	vmovdqu 0x2(%r15,%r8,1),%ymm7
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d1fa:	c4 c1 7e 6f 74 07 02 	vmovdqu 0x2(%r15,%rax,1),%ymm6
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d221:	c4 81 7e 6f 6c 07 02 	vmovdqu 0x2(%r15,%r8,1),%ymm5
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d23d:	c4 c1 7e 6f 6c 07 02 	vmovdqu 0x2(%r15,%rax,1),%ymm5
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d25a:	c4 c1 7e 6f 6c 07 02 	vmovdqu 0x2(%r15,%rax,1),%ymm5
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d28a:	c4 e2 7b 4b 14 38    	tileloadd (%rax,%rdi,1),%tmm2
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d2ad:	c4 c1 7e 6f 76 02    	vmovdqu 0x2(%r14),%ymm6
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d2d4:	c4 a1 7e 6f 64 28 02 	vmovdqu 0x2(%rax,%r13,1),%ymm4
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d2fb:	c4 a1 7e 6f 64 28 02 	vmovdqu 0x2(%rax,%r13,1),%ymm4
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d322:	c4 a1 7e 6f 74 28 02 	vmovdqu 0x2(%rax,%r13,1),%ymm6
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d349:	c4 a1 7e 6f 74 28 02 	vmovdqu 0x2(%rax,%r13,1),%ymm6
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d373:	c4 a1 7e 6f 6c 28 02 	vmovdqu 0x2(%rax,%r13,1),%ymm5
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d39d:	c4 a1 7e 6f 74 28 02 	vmovdqu 0x2(%rax,%r13,1),%ymm6
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d3c7:	c4 a1 7e 6f 64 28 02 	vmovdqu 0x2(%rax,%r13,1),%ymm4
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d407:	c4 a1 7e 6f 6c 28 02 	vmovdqu 0x2(%rax,%r13,1),%ymm5
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d431:	c4 a1 7e 6f 6c 28 02 	vmovdqu 0x2(%rax,%r13,1),%ymm5
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d45b:	c4 a1 7e 6f 74 28 02 	vmovdqu 0x2(%rax,%r13,1),%ymm6
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d4a4:	c4 a1 7e 6f 74 28 02 	vmovdqu 0x2(%rax,%r13,1),%ymm6
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d4d2:	c4 a1 7e 6f 7c 29 02 	vmovdqu 0x2(%rcx,%r13,1),%ymm7
+qa/evidence-bundles/perf-ubuntu-x86-q8-fc0b298f-20260521T085316Z-cronfc0b-dpbusd-proof/asm/llama-tinygemm-amx-q8q8.asm:   6d4f5:	c4 a1 7e 6f 7c 28 02 	vmovdqu 0x2(%rax,%r13,1),%ymm7
