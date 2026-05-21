@@ -1,0 +1,1 @@
+PASS: stale host-failure wording scan found no matches

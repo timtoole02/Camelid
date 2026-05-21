@@ -1,0 +1,6 @@
+PASS: stale host-failure wording scan found no matches
+PASS: stale validation-lane availability scan found no matches
+PASS: support-contract guarded wording reviewed; matches are exact-row boundaries, negative caveats, default-off experiments, or blocker-matrix text
+PASS: scripts/check-public-scrub.sh exited 0 with no stdout
+PASS: git diff --check exited 0 with no findings
+PASS: remote validation was not attempted in this run

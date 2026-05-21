@@ -1,0 +1,1 @@
+PASS: git diff --check exited 0 with no findings

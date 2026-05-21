@@ -1,0 +1,1 @@
+PASS: public scrub guard exited 0 with no stdout

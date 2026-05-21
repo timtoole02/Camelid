@@ -1,0 +1,11 @@
+docs/performance/ubuntu-x86-q8.md:7:The current goal is production-directional runtime improvement on a narrow Ubuntu x86_64 dense-Q8 lane. It is not a production-ready or broad platform claim.
+README.md:19:- **fail-closed readiness** so unsupported models do not masquerade as production-ready
+README.md:81:- **Ubuntu x86 Q8 performance investigation:** default-off experimental acceleration work is exploring the measured Ubuntu x86 Q8 path through packed Q8 runtime storage, selected matrix-level experiments, and AVX2 packed kernels while keeping the safe fallback path intact. These paths remain under validation and are not public support, portability, or default-on acceleration claims.
+README.md:102:The default/reference path remains available while accelerated paths continue to be validated. The current direction is production-directional runtime work, not a production-ready throughput claim.
+STATUS.md:9:Executive summary guarded broad-support wording: no Mixtral API/WebUI/frontend readiness or broad support claim is active; broad-family support, model-native/larger contexts beyond checked packs, arbitrary template execution beyond row-scoped renderer/template evidence, production throughput, and portability remain outside the support claim.
+STATUS.md:62:Recent Ubuntu x86 Q8 work has significantly improved the experimental accelerated path while keeping the default/reference path intact. The current work focuses on packed Q8 runtime storage, matrix-level execution, and AVX2 packed kernels. These paths remain default-off while validation continues; they are production-directional, not production-ready.
+STATUS.md:81:- No default-on acceleration claim.
+STATUS.md:83:- No portability claim beyond the measured Ubuntu x86_64 lane.
+STATUS.md:148:- Bounded 512-context evidence now exists for the original four Llama-family exact Q8_0 rows. This is checked bounded-pack evidence only, not a model-native context or portability claim.
+FULL_SUPPORT_BLOCKER_MATRIX.md:12:This file tracks what is still missing before anyone should call the entire four-row set “fully supported.”
+FULL_SUPPORT_BLOCKER_MATRIX.md:101:Hot-path probes are optimization-grounding measurement evidence, not production performance or portability claims; neither row has production-throughput or portability closure.
