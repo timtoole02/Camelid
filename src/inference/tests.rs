@@ -3481,6 +3481,36 @@ fn q8_ffn_down_vnni_decode_records_selected_route() {
     std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE");
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn q8_ffn_down_vnni_decode_rawptr_matches_rows4_decode_baseline() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+    if !x86_q8_vnni_decode_avx512_supported() {
+        std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE");
+        std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR");
+        return;
+    }
+    std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR", "on");
+    let (input, packed_weight, expected) = runtime_vnni_packed_ffn_down_case();
+    let plan = ffn_down_vnni_decode_plan(true);
+
+    let actual = try_x86_q8_ffn_down_decode_consumer_path(
+        &input,
+        &packed_weight,
+        "layer_0_ffn_down",
+        "ffn_down",
+        &plan,
+    )
+    .unwrap()
+    .expect("rawptr VNNI FFN-down decode output");
+
+    assert_eq!(actual.shape.dims, expected.shape.dims);
+    assert_slice_close_with_tolerance(&actual.data, &expected.data, 5e-4);
+    std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR");
+    std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE");
+}
+
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[test]
 fn q8_vnni_tile16_avx2_matches_scalar_for_extreme_i8_values() {

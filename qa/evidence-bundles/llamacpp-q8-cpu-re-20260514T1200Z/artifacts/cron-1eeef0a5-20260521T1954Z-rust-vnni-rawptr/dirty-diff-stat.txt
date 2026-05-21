@@ -1,0 +1,5 @@
+ docs/performance/ubuntu-x86-q8.md |   5 +-
+ src/execution_plan.rs             |  15 +++++
+ src/inference.rs                  | 128 ++++++++++++++++++++++++++++++++++++++
+ src/inference/tests.rs            |  30 +++++++++
+ 4 files changed, 177 insertions(+), 1 deletion(-)

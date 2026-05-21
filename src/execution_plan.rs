@@ -31,6 +31,7 @@ const MANAGED_ENV_KEYS: &[&str] = &[
     "CAMELID_X86_Q8_FFN_DOWN_AMX_PREFILL",
     "CAMELID_X86_Q8_FFN_DOWN_SINGLE_OWNER",
     "CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE",
+    "CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR",
     "CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER",
     "CAMELID_X86_Q8_OUTPUT_DECODE_OWNER",
 ];
@@ -450,6 +451,10 @@ fn select_linux_x86_q8_plan(
         optional_x86_q8_gate("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE"),
     );
     env_updates.insert(
+        "CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR",
+        optional_x86_q8_gate("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR"),
+    );
+    env_updates.insert(
         "CAMELID_X86_Q8_FFN_GATE_UP_SINGLE_OWNER",
         optional_x86_q8_gate("CAMELID_X86_Q8_FFN_GATE_UP_SINGLE_OWNER"),
     );
@@ -838,6 +843,7 @@ mod tests {
             "CAMELID_X86_Q8_FFN_DOWN_AMX_PREFILL",
             "CAMELID_X86_Q8_FFN_DOWN_SINGLE_OWNER",
             "CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE",
+            "CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR",
             "CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER",
             "CAMELID_X86_Q8_OUTPUT_DECODE_OWNER",
         ] {
@@ -1245,6 +1251,7 @@ mod tests {
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_AVX2", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_AMX_PREFILL", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE", "on");
+        env::set_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR", "on");
         let outcome = plan_for_model_with_platform(
             &PathBuf::from("/tmp/Llama-3.2-3B-Instruct-Q8_0.gguf"),
             &fixture("Llama 3.2 3B Instruct"),
@@ -1290,6 +1297,12 @@ mod tests {
         assert_eq!(
             outcome
                 .env_updates
+                .get("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR"),
+            Some(&Some("on"))
+        );
+        assert_eq!(
+            outcome
+                .env_updates
                 .get("CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL"),
             Some(&Some("off"))
         );
@@ -1317,6 +1330,7 @@ mod tests {
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_AMX_PREFILL", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_SINGLE_OWNER", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE", "on");
+        env::set_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR", "on");
 
         PlannerEnv::capture().apply(&BTreeMap::new());
 
@@ -1337,6 +1351,7 @@ mod tests {
         assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_AMX_PREFILL").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_SINGLE_OWNER").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE").is_err());
+        assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR").is_err());
         clear_profile_env();
     }
 

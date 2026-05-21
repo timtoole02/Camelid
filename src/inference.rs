@@ -9005,6 +9005,19 @@ fn q8_0_vnni_decode_1x64_projection_into(
         )));
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        if x86_q8_vnni_decode_rawptr_enabled() {
+            // SAFETY: runtime feature detection in `x86_q8_vnni_decode_rawptr_enabled`
+            // confirms AVX512-VNNI support, and the shape guard above proves that
+            // `packed.tiles`, `quantized_input`, and `output` cover every 64-row group.
+            unsafe {
+                q8_0_vnni_decode_1x64_projection_rawptr_avx512(packed, quantized_input, output);
+            }
+            return Ok(());
+        }
+    }
+
     let compute_group64 = |group64: usize, output_chunk: &mut [f32]| {
         for tile_col in 0..4 {
             let mut sums = [0.0_f32; 16];
@@ -9033,6 +9046,121 @@ fn q8_0_vnni_decode_1x64_projection_into(
         }
     }
     Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn x86_q8_vnni_decode_rawptr_enabled() -> bool {
+    q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR")
+        && x86_q8_vnni_decode_avx512_supported()
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[allow(clippy::incompatible_msrv)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn q8_0_vnni_decode_1x64_projection_rawptr_avx512(
+    packed: &Q8_0VnniPacked,
+    quantized_input: &[Q8_0Block],
+    output: &mut [f32],
+) {
+    let blocks_per_row = packed.blocks_per_row;
+    let input_addr = quantized_input.as_ptr() as usize;
+    let tiles_addr = packed.tiles.as_ptr() as usize;
+
+    if output.len() >= 1024 && rayon::current_num_threads() > 1 {
+        output
+            .par_chunks_exact_mut(64)
+            .enumerate()
+            .for_each(|(group64, output_chunk)| {
+                // SAFETY: each parallel chunk owns one disjoint 64-wide output group.
+                // Tile indexing is bounded by the caller's shape guard.
+                unsafe {
+                    q8_0_vnni_decode_group64_rawptr_avx512(
+                        (tiles_addr as *const Q8_0VnniTile16).add(group64 * 4 * blocks_per_row),
+                        blocks_per_row,
+                        input_addr as *const Q8_0Block,
+                        output_chunk.as_mut_ptr(),
+                    );
+                }
+            });
+    } else {
+        for (group64, output_chunk) in output.chunks_exact_mut(64).enumerate() {
+            // SAFETY: each serial chunk owns one disjoint 64-wide output group.
+            // Tile indexing is bounded by the caller's shape guard.
+            unsafe {
+                q8_0_vnni_decode_group64_rawptr_avx512(
+                    (tiles_addr as *const Q8_0VnniTile16).add(group64 * 4 * blocks_per_row),
+                    blocks_per_row,
+                    input_addr as *const Q8_0Block,
+                    output_chunk.as_mut_ptr(),
+                );
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[allow(clippy::incompatible_msrv)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn q8_0_vnni_decode_group64_rawptr_avx512(
+    group_tiles: *const Q8_0VnniTile16,
+    blocks_per_row: usize,
+    quantized_input: *const Q8_0Block,
+    output: *mut f32,
+) {
+    use std::arch::x86_64::{
+        _mm512_cvtepi32_ps, _mm512_fmadd_ps, _mm512_loadu_ps, _mm512_mul_ps, _mm512_set1_ps,
+        _mm512_setzero_ps, _mm512_storeu_ps,
+    };
+
+    for tile_col in 0..4 {
+        let mut acc = _mm512_setzero_ps();
+        for block_idx in 0..blocks_per_row {
+            let tile = unsafe { &*group_tiles.add(tile_col * blocks_per_row + block_idx) };
+            let input_block = unsafe { &*quantized_input.add(block_idx) };
+            let ints = unsafe { q8_0_vnni_tile16_i32_avx512(tile, input_block) };
+            let ints = _mm512_cvtepi32_ps(ints);
+            let mut scales = [0.0_f32; 16];
+            for (dst, scale_bits) in scales.iter_mut().zip(tile.scale_f16.iter().copied()) {
+                *dst = f16_bits_to_f32(scale_bits);
+            }
+            let scales = _mm512_mul_ps(
+                _mm512_loadu_ps(scales.as_ptr()),
+                _mm512_set1_ps(input_block.scale),
+            );
+            acc = _mm512_fmadd_ps(ints, scales, acc);
+        }
+        unsafe {
+            _mm512_storeu_ps(output.add(tile_col * 16), acc);
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[allow(clippy::incompatible_msrv)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn q8_0_vnni_tile16_i32_avx512(
+    tile: &Q8_0VnniTile16,
+    input_block: &Q8_0Block,
+) -> std::arch::x86_64::__m512i {
+    use std::arch::x86_64::{
+        _mm512_dpbusd_epi32, _mm512_loadu_si512, _mm512_set1_epi32, _mm512_setzero_si512,
+        _mm512_sub_epi32,
+    };
+
+    let mut acc = _mm512_setzero_si512();
+    for g in 0..8 {
+        let bytes = [
+            input_block.quants[g * 4] as u8 ^ 0x80,
+            input_block.quants[g * 4 + 1] as u8 ^ 0x80,
+            input_block.quants[g * 4 + 2] as u8 ^ 0x80,
+            input_block.quants[g * 4 + 3] as u8 ^ 0x80,
+        ];
+        let activation = _mm512_set1_epi32(i32::from_le_bytes(bytes));
+        let weights = unsafe { _mm512_loadu_si512(tile.quants.as_ptr().add(g * 64).cast()) };
+        acc = _mm512_dpbusd_epi32(acc, activation, weights);
+    }
+    let comp = unsafe { _mm512_loadu_si512(tile.comp.as_ptr().cast()) };
+    _mm512_sub_epi32(acc, comp)
 }
 
 fn q8_0_vnni_tile16_dot(tile: &Q8_0VnniTile16, input_block: &Q8_0Block) -> [i32; 16] {
