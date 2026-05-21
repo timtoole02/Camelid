@@ -1,0 +1,16 @@
+status_after=
+## buildqa/clippy-needless-range-loop-58d09b5e-20260518T2100Z...origin/buildqa/clippy-needless-range-loop-58d09b5e-20260518T2100Z
+?? evidence/
+?? qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-58d09b5e-20260521T040831Z-ci-qa-guard/
+gate_statuses=
+cargo-check=0
+cargo-clippy=0
+cargo-doc=0
+cargo-fmt=0
+cargo-test=0
+frontend-build=0
+frontend-model-state=0
+frontend-npm-ci=0
+public-evidence-claims=0
+public-scrub=0
+validation-scripts=0

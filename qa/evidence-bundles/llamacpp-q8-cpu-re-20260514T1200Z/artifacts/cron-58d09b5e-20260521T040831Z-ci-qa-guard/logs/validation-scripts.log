@@ -1,0 +1,16 @@
++ for f in scripts/test-*.mjs; do node "$f" || exit $?; done
+chat-parity-harness self-test passed
+check-attention-checkpoints self-test passed
+check-forward-trace-invariants self-test passed
+check-output-projection-layout self-test passed
+compare-attention-checkpoints self-test passed
+compare-dense-stage-flow self-test passed
+compare-forward-traces self-test passed
+compare-tensor-dumps self-test passed
+edge-prompt-gate-report self-test passed
+extract-forward-trace self-test passed
+README screenshot guard passed
+run-llama3-prompt-pack self-test passed
+summarize-dense-capture self-test passed
+summarize-generation-timings self-test passed
+summarize-same-host-stream-timing self-test passed

@@ -1,0 +1,4 @@
++ cargo doc --no-deps --all-features
+ Documenting camelid v0.1.0 (REDACTED_LOCAL_PATH)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.85s
+   Generated REDACTED_LOCAL_PATH

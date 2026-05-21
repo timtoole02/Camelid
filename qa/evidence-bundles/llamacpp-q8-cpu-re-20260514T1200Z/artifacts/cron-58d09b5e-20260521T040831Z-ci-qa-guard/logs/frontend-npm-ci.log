@@ -1,0 +1,8 @@
++ cd frontend && npm ci
+
+added 21 packages, and audited 22 packages in 705ms
+
+8 packages are looking for funding
+  run `npm fund` for details
+
+found 0 vulnerabilities

@@ -1,0 +1,3 @@
++ cargo check --all-targets --all-features
+    Checking camelid v0.1.0 (REDACTED_LOCAL_PATH)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.39s
