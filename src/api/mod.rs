@@ -516,8 +516,10 @@ pub struct GenerationTimings {
     pub session_create: u128,
     pub generate: u128,
     pub generation: GenerationPhaseTimings,
+    pub post_first_token_generation: GenerationPhaseTimings,
     pub prompt_evaluation: PromptEvaluationTimings,
     pub layers: Vec<GenerationLayerTimings>,
+    pub post_first_token_layers: Vec<GenerationLayerTimings>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<crate::inference::LlamaForwardMemoryTimings>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2939,7 +2941,9 @@ fn generate_token_ids(
     let mut dense = None;
     let mut finish_reason = "length";
     let mut forward_timings = LlamaForwardTimings::default();
+    let mut post_first_token_forward_timings = LlamaForwardTimings::default();
     let mut sample = 0;
+    let mut post_first_token_sample = 0;
     let mut reused_prompt_prefix = false;
 
     if !prepared.collect_dense_diagnostics {
@@ -3005,8 +3009,12 @@ fn generate_token_ids(
         {
             store_prompt_prefix_cache(&prepared, &step);
         }
-        if generated.is_empty() && !reused_prompt_prefix {
+        let prompt_eval_step = generated.is_empty() && !reused_prompt_prefix;
+        if prompt_eval_step {
             prepared.timings.prompt_evaluation = prompt_evaluation_timings_from_step(&step);
+        } else {
+            post_first_token_forward_timings.add_assign(&step.timings);
+            post_first_token_sample += step.sample;
         }
         forward_timings.add_assign(&step.timings);
         sample += step.sample;
@@ -3080,7 +3088,13 @@ fn generate_token_ids(
 
     prepared.timings.generate = generation_started.elapsed().as_millis();
     prepared.timings.generation = generation_phase_timings_from_forward(&forward_timings, sample);
+    prepared.timings.post_first_token_generation = generation_phase_timings_from_forward(
+        &post_first_token_forward_timings,
+        post_first_token_sample,
+    );
     prepared.timings.layers = generation_layer_timings_from_forward(&forward_timings.layers);
+    prepared.timings.post_first_token_layers =
+        generation_layer_timings_from_forward(&post_first_token_forward_timings.layers);
     prepared.timings.memory = forward_timings.memory;
     if collect_q8_schedule {
         prepared.timings.q8_schedule = Some(snapshot_q8_schedule_telemetry());
@@ -3269,14 +3283,26 @@ fn stream_role_timings_json(
         "attention_output": sum(|layer| layer.attention_output),
         "ffn_gate": sum(|layer| layer.ffn_gate),
         "ffn_up": sum(|layer| layer.ffn_up),
+        "ffn_activation": sum(|layer| layer.ffn_activation),
         "ffn_down": sum(|layer| layer.ffn_down),
         "logits": phase.logits,
     })
 }
 
+fn stream_layer_role_timings_json(layers: &[GenerationLayerTimings]) -> serde_json::Value {
+    stream_layer_role_rows_json(layers, None)
+}
+
 fn stream_layer_role_hotspots_json(
     layers: &[GenerationLayerTimings],
     limit: usize,
+) -> serde_json::Value {
+    stream_layer_role_rows_json(layers, Some(limit))
+}
+
+fn stream_layer_role_rows_json(
+    layers: &[GenerationLayerTimings],
+    limit: Option<usize>,
 ) -> serde_json::Value {
     let mut rows = Vec::new();
     for layer in layers {
@@ -3313,7 +3339,7 @@ fn stream_layer_role_hotspots_json(
 
     serde_json::Value::Array(
         rows.into_iter()
-            .take(limit)
+            .take(limit.unwrap_or(usize::MAX))
             .map(|(layer_index, role, elapsed_ms)| {
                 serde_json::json!({
                     "layer_index": layer_index,
@@ -3346,13 +3372,22 @@ fn stream_timing_diagnostics_json(
                 "prefill_forward_total": timings.prompt_evaluation.prefill.forward_total,
                 "first_token_forward_total": timings.prompt_evaluation.first_token.forward_total,
                 "generation_forward_total": timings.generation.forward_total,
+                "post_first_token_generation_forward_total": timings.post_first_token_generation.forward_total,
                 "prefill_role_timings": stream_role_timings_json(&timings.prompt_evaluation.prefill, &timings.prompt_evaluation.prefill_layers),
                 "first_token_role_timings": stream_role_timings_json(&timings.prompt_evaluation.first_token, &timings.prompt_evaluation.first_token_layers),
                 "generation_role_timings": stream_role_timings_json(&timings.generation, &timings.layers),
+                "post_first_token_generation_role_timings": stream_role_timings_json(&timings.post_first_token_generation, &timings.post_first_token_layers),
+                "layer_role_timings": {
+                    "prefill": stream_layer_role_timings_json(&timings.prompt_evaluation.prefill_layers),
+                    "first_token": stream_layer_role_timings_json(&timings.prompt_evaluation.first_token_layers),
+                    "generation": stream_layer_role_timings_json(&timings.layers),
+                    "post_first_token_generation": stream_layer_role_timings_json(&timings.post_first_token_layers),
+                },
                 "layer_role_hotspots": {
                     "prefill": stream_layer_role_hotspots_json(&timings.prompt_evaluation.prefill_layers, 10),
                     "first_token": stream_layer_role_hotspots_json(&timings.prompt_evaluation.first_token_layers, 10),
                     "generation": stream_layer_role_hotspots_json(&timings.layers, 10),
+                    "post_first_token_generation": stream_layer_role_hotspots_json(&timings.post_first_token_layers, 10),
                 },
             },
             "q8_schedule": timings.q8_schedule,
@@ -3465,7 +3500,9 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
         let mut reused_prompt_prefix = false;
         let mut first_content_ms = None;
         let mut forward_timings = LlamaForwardTimings::default();
+        let mut post_first_token_forward_timings = LlamaForwardTimings::default();
         let mut sample = 0;
+        let mut post_first_token_sample = 0;
 
         if !prepared.collect_dense_diagnostics {
             if let Some(cached) = lookup_prompt_prefix_cache(&prepared) {
@@ -3541,8 +3578,12 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
             {
                 store_prompt_prefix_cache(&prepared, &step);
             }
-            if generated.is_empty() && !reused_prompt_prefix {
+            let prompt_eval_step = generated.is_empty() && !reused_prompt_prefix;
+            if prompt_eval_step {
                 prepared.timings.prompt_evaluation = prompt_evaluation_timings_from_step(&step);
+            } else {
+                post_first_token_forward_timings.add_assign(&step.timings);
+                post_first_token_sample += step.sample;
             }
             forward_timings.add_assign(&step.timings);
             sample += step.sample;
@@ -3634,7 +3675,13 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
 
         prepared.timings.generate = generation_started.elapsed().as_millis();
         prepared.timings.generation = generation_phase_timings_from_forward(&forward_timings, sample);
+        prepared.timings.post_first_token_generation = generation_phase_timings_from_forward(
+            &post_first_token_forward_timings,
+            post_first_token_sample,
+        );
         prepared.timings.layers = generation_layer_timings_from_forward(&forward_timings.layers);
+        prepared.timings.post_first_token_layers =
+            generation_layer_timings_from_forward(&post_first_token_forward_timings.layers);
         prepared.timings.memory = forward_timings.memory;
         if collect_q8_schedule {
             prepared.timings.q8_schedule = Some(snapshot_q8_schedule_telemetry());
@@ -4378,6 +4425,7 @@ mod tests {
         timings.prompt_evaluation.first_token.logits = 2.5;
         timings.prompt_evaluation.first_token.sample = 0.75;
         timings.generation.forward_total = 30.0;
+        timings.post_first_token_generation.forward_total = 12.0;
         timings.prompt_evaluation.prefill_layers = vec![GenerationLayerTimings {
             layer_index: 2,
             attention_context: 1.25,
@@ -4396,6 +4444,7 @@ mod tests {
             GenerationLayerTimings {
                 layer_index: 4,
                 ffn_down: 7.0,
+                ffn_activation: 17.0,
                 ..GenerationLayerTimings::default()
             },
             GenerationLayerTimings {
@@ -4405,6 +4454,12 @@ mod tests {
                 ..GenerationLayerTimings::default()
             },
         ];
+        timings.post_first_token_layers = vec![GenerationLayerTimings {
+            layer_index: 5,
+            ffn_down: 11.0,
+            attention_output: 13.0,
+            ..GenerationLayerTimings::default()
+        }];
 
         let value = stream_timing_diagnostics_json(
             &timings,
@@ -4475,8 +4530,33 @@ mod tests {
             18.0
         );
         assert_eq!(
+            diagnostics["timings_ms"]["generation_role_timings"]["ffn_activation"],
+            17.0
+        );
+        assert_eq!(
             diagnostics["timings_ms"]["generation_role_timings"]["attention_output"],
             13.0
+        );
+        assert_eq!(
+            diagnostics["timings_ms"]["post_first_token_generation_forward_total"],
+            12.0
+        );
+        assert_eq!(
+            diagnostics["timings_ms"]["post_first_token_generation_role_timings"]["ffn_down"],
+            11.0
+        );
+        assert_eq!(
+            diagnostics["timings_ms"]["layer_role_timings"]["generation"][0]["role"],
+            "ffn_activation"
+        );
+        assert_eq!(
+            diagnostics["timings_ms"]["layer_role_timings"]["generation"][0]["elapsed_ms"],
+            17.0
+        );
+        assert_eq!(
+            diagnostics["timings_ms"]["layer_role_timings"]["post_first_token_generation"][0]
+                ["role"],
+            "attention_output"
         );
         assert_eq!(
             diagnostics["timings_ms"]["layer_role_hotspots"]["prefill"][0]["role"],
@@ -4488,11 +4568,11 @@ mod tests {
         );
         assert_eq!(
             diagnostics["timings_ms"]["layer_role_hotspots"]["generation"][0]["role"],
-            "attention_output"
+            "ffn_activation"
         );
         assert_eq!(
             diagnostics["timings_ms"]["layer_role_hotspots"]["generation"][0]["elapsed_ms"],
-            13.0
+            17.0
         );
         assert!(diagnostics["q8_schedule"].is_null());
     }

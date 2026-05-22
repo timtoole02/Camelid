@@ -110,6 +110,14 @@ The default/reference path remains available while accelerated paths continue to
 
 Camelid is also moving toward an appliance-style execution plan where validated runtime paths can be selected automatically while experimental acceleration remains opt-in.
 
+## Current speed snapshot
+
+Camelid's correctness story is ahead of its throughput story, but the performance work is now concrete enough to measure honestly.
+
+The strongest current Apple Silicon Q8 result is a default-off Llama 3.2 3B short-request candidate from the Mac Q8 lane. In the retained same-host run, the prior Camelid path measured about `857 ms` total against llama.cpp at about `609 ms`; the default-off candidate measured about `478 ms` total against llama.cpp at about `530 ms`. That is a real narrow-envelope win on total wall time, but first-token latency still trails llama.cpp (`478 ms` vs `290 ms`), and longer decode-heavy runs still need to close the gap before Camelid can claim production throughput.
+
+The Ubuntu x86 Q8 lane is not promoted yet. Packed Q8 storage, AVX2/VNNI-oriented kernels, route telemetry, and FFN decode-chain experiments are in place behind default-off gates, but the same-host guard has not retained a broad speed win. Treat that lane as active acceleration work, not a user-facing performance promise.
+
 ## What makes it different
 
 Camelid gives you:

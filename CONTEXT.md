@@ -52,6 +52,10 @@ _Avoid_: duplicate sidecar packed copies as the final performance architecture.
 An internal fail-closed decision seam that validates whether one dense Q8 projection family may use backend-owned packed runtime storage for a specific decode or prefill policy. It should consume the resolved runtime plan, packed-storage invariants, row policy, and dimensions, then hand already-validated storage to math helpers.
 _Avoid_: treating a resolver cleanup as throughput, RSS, profiling, support-contract, frontend, or default-on evidence.
 
+**Q8 projection row policy**
+An internal inference rule describing which input row counts a Q8 projection route may consume, such as single-row decode, multi-row prefill, or a stricter tiled-prefill minimum. It belongs inside route resolution with packed-storage and shape checks; it is not a context-window claim, frontend readiness signal, or support-contract status.
+_Avoid_: using "prefill route accepted" or "decode route accepted" as evidence that a model row, API path, frontend chat path, or wider context length is supported.
+
 **Parity envelope**
 The exact model, quantization, prompt, context, token count, and sampling settings where Camelid has proven equality or bounded equivalence.
 _Avoid_: extending a parity result beyond its envelope.
@@ -64,6 +68,7 @@ _Avoid_: extending a parity result beyond its envelope.
 - A **same-host guard** is one feedback loop used to validate a **parity envelope** or performance claim.
 - **Backend-owned packed runtime storage** is a desired **deep module** direction for Q8 acceleration.
 - A **Q8 projection route resolver** is one way to make backend-owned packed runtime storage a deeper module; it can support a **retained slice** only inside the exact evidence envelope it was gated against.
+- A **Q8 projection row policy** is an input to a **Q8 projection route resolver**; it is lower-level than a **parity envelope** and never widens a **support contract** by itself.
 
 ## Flagged ambiguities
 

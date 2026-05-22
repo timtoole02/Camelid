@@ -35,10 +35,11 @@ export function summarizeSameHostStreamTiming(input, inputPath = 'same-host.json
     'attention_output',
     'ffn_gate',
     'ffn_up',
+    'ffn_activation',
     'ffn_down',
     'logits',
   ]
-  const stageKeys = ['prefill', 'first_token', 'generation']
+  const stageKeys = ['prefill', 'first_token', 'generation', 'post_first_token_generation']
   const stages = Object.fromEntries(stageKeys.map((stage) => [
     stage,
     Object.fromEntries(roleKeys.map((role) => [role, stats(analyzedRuns.map((run) => run.roles?.[stage]?.[role]))])),
@@ -69,6 +70,8 @@ export function summarizeSameHostStreamTiming(input, inputPath = 'same-host.json
   const projectionRouteDenials = summarizeProjectionRouteDenials(analyzedRuns)
   const layerRoleHotspots = summarizeLayerRoleHotspots(analyzedRuns)
   const layerRouteRoleGaps = summarizeLayerRouteRoleGaps(analyzedRuns)
+  const ffnDecodeChainGaps = summarizeFfnDecodeChainGaps(analyzedRuns)
+  const outputLogitsProfile = summarizeOutputLogitsProfile(analyzedRuns)
   const roleFocus = summarizeRoleFocus(stages, ['logits', 'attention_context', 'attention_output'])
   const runDeltas = analyzedRuns.map((run, index) => {
     const llamaTtft = llamaTtfts[index] ?? null
@@ -102,6 +105,11 @@ export function summarizeSameHostStreamTiming(input, inputPath = 'same-host.json
       q8_fused_gate_up_calls: run.q8_fused_gate_up_calls,
       q8_gate_up_decode_consumer_activation_us: run.q8_gate_up_decode_consumer_activation_us,
       q8_gate_up_decode_consumer_tensor_us: run.q8_gate_up_decode_consumer_tensor_us,
+      q8_ffn_decode_chain_taken: run.q8_ffn_decode_chain_taken,
+      q8_ffn_decode_chain_total_us: run.q8_ffn_decode_chain_total_us,
+      q8_ffn_decode_chain_input_quantize_us: run.q8_ffn_decode_chain_input_quantize_us,
+      q8_ffn_decode_chain_activation_quantize_us: run.q8_ffn_decode_chain_activation_quantize_us,
+      q8_ffn_decode_chain_down_us: run.q8_ffn_decode_chain_down_us,
       projection_route_calls: run.projection_route_calls,
       projection_routes: run.projection_routes,
       projection_layer_routes: run.projection_layer_routes,
@@ -157,6 +165,11 @@ export function summarizeSameHostStreamTiming(input, inputPath = 'same-host.json
       q8_fused_gate_up_calls: stats(analyzedRuns.map((run) => run.q8_fused_gate_up_calls)),
       q8_gate_up_decode_consumer_activation_us: stats(analyzedRuns.map((run) => run.q8_gate_up_decode_consumer_activation_us)),
       q8_gate_up_decode_consumer_tensor_us: stats(analyzedRuns.map((run) => run.q8_gate_up_decode_consumer_tensor_us)),
+      q8_ffn_decode_chain_taken: stats(analyzedRuns.map((run) => run.q8_ffn_decode_chain_taken)),
+      q8_ffn_decode_chain_total_us: stats(analyzedRuns.map((run) => run.q8_ffn_decode_chain_total_us)),
+      q8_ffn_decode_chain_input_quantize_us: stats(analyzedRuns.map((run) => run.q8_ffn_decode_chain_input_quantize_us)),
+      q8_ffn_decode_chain_activation_quantize_us: stats(analyzedRuns.map((run) => run.q8_ffn_decode_chain_activation_quantize_us)),
+      q8_ffn_decode_chain_down_us: stats(analyzedRuns.map((run) => run.q8_ffn_decode_chain_down_us)),
       projection_route_calls: stats(analyzedRuns.map((run) => run.projection_route_calls)),
       output_projection_calls: stats(analyzedRuns.map((run) => run.projection_route_calls)),
       prompt_cache_hits: analyzedRuns.filter((run) => run.prompt_cache_hit === true).length,
@@ -173,6 +186,8 @@ export function summarizeSameHostStreamTiming(input, inputPath = 'same-host.json
     projection_route_denials: projectionRouteDenials,
     layer_role_hotspots: layerRoleHotspots,
     layer_route_role_gaps: layerRouteRoleGaps,
+    ffn_decode_chain_gaps: ffnDecodeChainGaps,
+    output_logits_profile: outputLogitsProfile,
     role_focus: roleFocus,
     outliers,
     runs: runDeltas,
@@ -191,6 +206,7 @@ function analyzeCamelidRun(run, index) {
     prefill: timings.prefill_role_timings ?? {},
     first_token: timings.first_token_role_timings ?? {},
     generation: timings.generation_role_timings ?? {},
+    post_first_token_generation: timings.post_first_token_generation_role_timings ?? {},
   }
   const clientFirstByte = finite(run.first_byte_ms)
   const clientTtft = finite(run.first_content_ms ?? run.ttft_ms)
@@ -225,11 +241,17 @@ function analyzeCamelidRun(run, index) {
     q8_fused_gate_up_calls: finite(q8Schedule.i8mm_fused_gate_up_calls),
     q8_gate_up_decode_consumer_activation_us: finite(q8Schedule.ffn_gate_up_decode_consumer_activation_us),
     q8_gate_up_decode_consumer_tensor_us: finite(q8Schedule.ffn_gate_up_decode_consumer_tensor_us),
+    q8_ffn_decode_chain_taken: finite(q8Schedule.ffn_decode_chain_taken),
+    q8_ffn_decode_chain_total_us: finite(q8Schedule.ffn_decode_chain_total_us),
+    q8_ffn_decode_chain_input_quantize_us: finite(q8Schedule.ffn_decode_chain_input_quantize_us),
+    q8_ffn_decode_chain_activation_quantize_us: finite(q8Schedule.ffn_decode_chain_activation_quantize_us),
+    q8_ffn_decode_chain_down_us: finite(q8Schedule.ffn_decode_chain_down_us),
     q8_roles: q8Schedule.i8mm_single_projection_by_role ?? {},
     projection_route_calls: finite(q8Schedule.projection_route_calls ?? q8Schedule.output_projection_calls),
     projection_routes: q8Schedule.projection_routes ?? q8Schedule.output_projection_by_route ?? {},
     projection_layer_routes: q8Schedule.projection_layer_routes ?? q8Schedule.output_projection_by_layer_route ?? {},
     projection_route_denials: q8Schedule.projection_route_denials ?? {},
+    layer_roles: timings.layer_role_timings ?? timings.layer_role_hotspots ?? {},
     layer_hotspots: timings.layer_role_hotspots ?? {},
     prompt_cache_hit: timings.prompt_cache_hit ?? null,
     weight_cache_hit: timings.weight_cache_hit ?? null,
@@ -461,7 +483,7 @@ function summarizeLayerRoleHotspots(runs) {
 function summarizeLayerRouteRoleGaps(runs) {
   const groups = new Map()
   for (const run of runs) {
-    const hotspots = layerHotspotEntries(run)
+    const hotspots = layerRoleEntries(run)
     for (const [routeKey, route] of Object.entries(run.projection_layer_routes ?? {})) {
       const layerIndex = finite(route?.layer_index)
       const routeElapsedUs = finite(route?.elapsed_us)
@@ -521,8 +543,16 @@ function summarizeLayerRouteRoleGaps(runs) {
 }
 
 function layerHotspotEntries(run) {
+  return layerRoleRows(run.layer_hotspots)
+}
+
+function layerRoleEntries(run) {
+  return layerRoleRows(run.layer_roles ?? run.layer_hotspots)
+}
+
+function layerRoleRows(source) {
   const rows = []
-  for (const [stage, entries] of Object.entries(run.layer_hotspots ?? {})) {
+  for (const [stage, entries] of Object.entries(source ?? {})) {
     if (!Array.isArray(entries)) continue
     for (const entry of entries) {
       const layerIndex = finite(entry?.layer_index)
@@ -538,6 +568,204 @@ function layerHotspotEntries(run) {
 function hotspotRolesForProjectionRole(role) {
   if (role === 'ffn_gate_up') return ['ffn_gate', 'ffn_up']
   return [role]
+}
+
+function summarizeFfnDecodeChainGaps(runs) {
+  const rows = runs.map((run) => {
+    const generation = run.roles?.generation ?? {}
+    const firstToken = run.roles?.first_token ?? {}
+    const postFirstTokenGeneration = run.roles?.post_first_token_generation ?? {}
+    const generationRoleMs = sumFinite([
+      generation.ffn_gate,
+      generation.ffn_up,
+      generation.ffn_activation,
+      generation.ffn_down,
+    ])
+    const decodeRoleMs = sumFinite([
+      firstToken.ffn_gate,
+      firstToken.ffn_up,
+      firstToken.ffn_activation,
+      firstToken.ffn_down,
+      postFirstTokenGeneration.ffn_gate,
+      postFirstTokenGeneration.ffn_up,
+      postFirstTokenGeneration.ffn_activation,
+      postFirstTokenGeneration.ffn_down,
+    ])
+    const routeMs = sumFinite([
+      projectionRouteElapsedMs(run, 'ffn_gate_up.decode_consumer'),
+      run.q8_ffn_decode_chain_activation_quantize_us === null ? null : run.q8_ffn_decode_chain_activation_quantize_us / 1000,
+      firstFinite([
+        projectionRouteElapsedMs(run, 'ffn_down.mac_decode_consumer_group_chunking'),
+        projectionRouteElapsedMs(run, 'ffn_down.mac_decode_consumer'),
+      ]),
+    ])
+    const chainTotalMs = run.q8_ffn_decode_chain_total_us === null ? null : run.q8_ffn_decode_chain_total_us / 1000
+    return {
+      label: run.label,
+      generation_role_ms: generationRoleMs,
+      first_token_plus_post_first_generation_role_ms: decodeRoleMs,
+      q8_route_ms: routeMs,
+      generation_role_minus_q8_route_ms: delta(generationRoleMs, routeMs),
+      first_token_plus_post_first_generation_role_minus_q8_route_ms: delta(decodeRoleMs, routeMs),
+      q8_chain_total_ms: chainTotalMs,
+      generation_role_minus_q8_chain_total_ms: delta(generationRoleMs, chainTotalMs),
+      first_token_plus_post_first_generation_role_minus_q8_chain_total_ms: delta(decodeRoleMs, chainTotalMs),
+      q8_chain_total_minus_route_ms: delta(chainTotalMs, routeMs),
+      chain_taken: run.q8_ffn_decode_chain_taken,
+    }
+  }).filter((row) => row.generation_role_ms !== null || row.first_token_plus_post_first_generation_role_ms !== null || row.q8_route_ms !== null)
+
+  const generationGap = stats(rows.map((row) => row.generation_role_minus_q8_route_ms))
+  const stageConsistentGap = stats(rows.map((row) => row.first_token_plus_post_first_generation_role_minus_q8_route_ms))
+  const chainOverhead = stats(rows.map((row) => row.q8_chain_total_minus_route_ms))
+  return {
+    generation_role_ms: stats(rows.map((row) => row.generation_role_ms)),
+    first_token_plus_post_first_generation_role_ms: stats(rows.map((row) => row.first_token_plus_post_first_generation_role_ms)),
+    q8_route_ms: stats(rows.map((row) => row.q8_route_ms)),
+    generation_role_minus_q8_route_ms: generationGap,
+    first_token_plus_post_first_generation_role_minus_q8_route_ms: stageConsistentGap,
+    q8_chain_total_ms: stats(rows.map((row) => row.q8_chain_total_ms)),
+    generation_role_minus_q8_chain_total_ms: stats(rows.map((row) => row.generation_role_minus_q8_chain_total_ms)),
+    first_token_plus_post_first_generation_role_minus_q8_chain_total_ms: stats(rows.map((row) => row.first_token_plus_post_first_generation_role_minus_q8_chain_total_ms)),
+    q8_chain_total_minus_route_ms: chainOverhead,
+    accounting: ffnDecodeChainAccountingInterpretation(generationGap, stageConsistentGap, chainOverhead),
+    runs: rows,
+  }
+}
+
+function summarizeOutputLogitsProfile(runs) {
+  const rows = runs.map((run) => {
+    const prefillLogits = finite(run.roles?.prefill?.logits)
+    const firstTokenLogits = finite(run.roles?.first_token?.logits)
+    const generationLogits = finite(run.roles?.generation?.logits)
+    const postFirstTokenGenerationLogits = finite(run.roles?.post_first_token_generation?.logits)
+    const decodeLogitsRoleMs = sumFinite([
+      firstTokenLogits,
+      generationLogits,
+      postFirstTokenGenerationLogits,
+    ])
+    const routeMs = projectionRoutesElapsedMsForRole(run, 'logits')
+    return {
+      label: run.label,
+      backend_first_content_ms: run.backend_first_content_ms,
+      prompt_eval_logits_ms: run.prompt_eval_logits_ms,
+      prefill_logits_ms: prefillLogits,
+      first_token_logits_ms: firstTokenLogits,
+      generation_logits_ms: generationLogits,
+      post_first_token_generation_logits_ms: postFirstTokenGenerationLogits,
+      decode_logits_role_ms: decodeLogitsRoleMs,
+      q8_logits_route_ms: routeMs,
+      generation_logits_role_minus_q8_route_ms: delta(generationLogits, routeMs),
+      first_token_logits_minus_prompt_eval_logits_ms: delta(firstTokenLogits, run.prompt_eval_logits_ms),
+      decode_logits_role_minus_q8_route_ms: delta(decodeLogitsRoleMs, routeMs),
+    }
+  }).filter((row) => (
+    row.prompt_eval_logits_ms !== null
+    || row.decode_logits_role_ms !== null
+    || row.q8_logits_route_ms !== null
+  ))
+  const promptEvalLogits = stats(rows.map((row) => row.prompt_eval_logits_ms))
+  const decodeRole = stats(rows.map((row) => row.decode_logits_role_ms))
+  const q8Route = stats(rows.map((row) => row.q8_logits_route_ms))
+  const generationRoleMinusRoute = stats(rows.map((row) => row.generation_logits_role_minus_q8_route_ms))
+  const firstTokenMinusPromptEval = stats(rows.map((row) => row.first_token_logits_minus_prompt_eval_logits_ms))
+  const roleMinusRoute = stats(rows.map((row) => row.decode_logits_role_minus_q8_route_ms))
+  return {
+    prompt_eval_logits_ms: promptEvalLogits,
+    decode_logits_role_ms: decodeRole,
+    q8_logits_route_ms: q8Route,
+    generation_logits_role_minus_q8_route_ms: generationRoleMinusRoute,
+    first_token_logits_minus_prompt_eval_logits_ms: firstTokenMinusPromptEval,
+    decode_logits_role_minus_q8_route_ms: roleMinusRoute,
+    accounting: outputLogitsAccountingInterpretation(roleMinusRoute, generationRoleMinusRoute, firstTokenMinusPromptEval),
+    top_route_gap_runs: rows
+      .filter((row) => row.decode_logits_role_minus_q8_route_ms !== null)
+      .sort((left, right) => Math.abs(right.decode_logits_role_minus_q8_route_ms) - Math.abs(left.decode_logits_role_minus_q8_route_ms))
+      .slice(0, 5),
+    top_prompt_eval_logits_runs: rows
+      .filter((row) => row.prompt_eval_logits_ms !== null)
+      .sort((left, right) => right.prompt_eval_logits_ms - left.prompt_eval_logits_ms)
+      .slice(0, 5),
+    runs: rows,
+  }
+}
+
+function outputLogitsAccountingInterpretation(roleMinusRoute, generationRoleMinusRoute, firstTokenMinusPromptEval) {
+  const mean = finite(roleMinusRoute?.mean)
+  const p95 = finite(roleMinusRoute?.p95)
+  const generationMean = finite(generationRoleMinusRoute?.mean)
+  const generationP95 = finite(generationRoleMinusRoute?.p95)
+  const firstTokenPromptMean = finite(firstTokenMinusPromptEval?.mean)
+  if (mean === null) return 'insufficient_output_logits_accounting'
+  if (
+    generationMean !== null
+    && Math.abs(generationMean) <= 5
+    && Math.abs(generationP95 ?? 0) <= 10
+    && firstTokenPromptMean !== null
+    && Math.abs(firstTokenPromptMean) <= 5
+  ) {
+    return 'generation_logits_route_accounted_first_token_matches_prompt_eval'
+  }
+  if (Math.abs(mean) <= 5 && Math.abs(p95 ?? 0) <= 10) return 'output_logits_route_accounted'
+  return 'output_logits_route_residual'
+}
+
+function projectionRoutesElapsedMsForRole(run, role) {
+  let total = 0
+  let count = 0
+  for (const route of Object.values(run.projection_routes ?? {})) {
+    if (route?.role !== role) continue
+    const elapsedUs = finite(route.elapsed_us)
+    if (elapsedUs === null) continue
+    total += elapsedUs / 1000
+    count += 1
+  }
+  return count === 0 ? null : round(total)
+}
+
+function ffnDecodeChainAccountingInterpretation(generationGap, stageConsistentGap, chainOverhead) {
+  const generationMean = finite(generationGap?.mean)
+  const stageConsistentMean = finite(stageConsistentGap?.mean)
+  const chainOverheadMean = finite(chainOverhead?.mean)
+  if (generationMean === null || stageConsistentMean === null) {
+    return 'insufficient_ffn_decode_chain_accounting'
+  }
+  if (Math.abs(stageConsistentMean) <= 5 && generationMean > 100) {
+    return 'generation_role_is_cumulative_accounting_gap'
+  }
+  if (Math.abs(stageConsistentMean) <= 5 && Math.abs(chainOverheadMean ?? 0) <= 5) {
+    return 'stage_consistent_decode_chain_accounted'
+  }
+  return 'stage_consistent_decode_chain_residual'
+}
+
+function projectionRouteElapsedMs(run, key) {
+  const route = run.projection_routes?.[key]
+  const elapsedUs = finite(route?.elapsed_us)
+  return elapsedUs === null ? null : elapsedUs / 1000
+}
+
+function firstFinite(values) {
+  for (const value of values) {
+    if (value === null || value === undefined) continue
+    const number = finite(value)
+    if (number !== null) return number
+  }
+  return null
+}
+
+function sumFinite(values) {
+  let total = 0
+  let count = 0
+  for (const value of values) {
+    if (value === null || value === undefined) continue
+    const number = finite(value)
+    if (number !== null) {
+      total += number
+      count += 1
+    }
+  }
+  return count === 0 ? null : round(total)
 }
 
 function stats(values) {
@@ -596,11 +824,13 @@ function humanSummary(report) {
     .map((row, index) => `${index + 1}. ${row.stage}.L${row.layer_index}.${row.role} mean=${fmt(row.elapsed_ms.mean)}ms p95=${fmt(row.elapsed_ms.p95)}ms`)
     .join('\n')
   const roleFocus = report.role_focus
-    .map((row, index) => `${index + 1}. ${row.role} total_mean=${fmt(row.total_mean_ms)}ms prefill=${fmt(row.stages.prefill.mean)}ms first_token=${fmt(row.stages.first_token.mean)}ms generation=${fmt(row.stages.generation.mean)}ms`)
+    .map((row, index) => `${index + 1}. ${row.role} total_mean=${fmt(row.total_mean_ms)}ms prefill=${fmt(row.stages.prefill.mean)}ms first_token=${fmt(row.stages.first_token.mean)}ms generation=${fmt(row.stages.generation.mean)}ms post_first_token_generation=${fmt(row.stages.post_first_token_generation.mean)}ms`)
     .join('\n')
   const layerRouteGaps = report.layer_route_role_gaps.slice(0, 8)
     .map((row, index) => `${index + 1}. ${row.stage}.L${row.layer_index}.${row.projection_role}.${row.route ?? 'unknown'} role_mean=${fmt(row.role_elapsed_ms.mean)}ms route_mean=${fmt(row.route_elapsed_ms.mean)}ms role_minus_route_mean=${fmt(row.role_minus_route_ms.mean)}ms matched=${row.matched_roles.join('+') || 'none'}`)
     .join('\n')
+  const ffnDecodeChainGaps = report.ffn_decode_chain_gaps ?? {}
+  const outputLogitsProfile = report.output_logits_profile ?? {}
   return [
     `schema=${report.schema}`,
     `input=${report.input}`,
@@ -633,6 +863,27 @@ function humanSummary(report) {
     `q8_gate_up_decode_consumer_activation_mean_ms=${fmt(gateUpDecodeOverhead.activation_ms_mean)}`,
     `q8_gate_up_decode_consumer_tensor_mean_ms=${fmt(gateUpDecodeOverhead.tensor_ms_mean)}`,
     `q8_gate_up_decode_consumer_post_route_mean_ms=${fmt(gateUpDecodeOverhead.total_ms_mean)}`,
+    `q8_ffn_decode_chain_taken_mean=${fmt(report.aggregate.q8_ffn_decode_chain_taken.mean)}`,
+    `q8_ffn_decode_chain_total_mean_ms=${fmt(report.aggregate.q8_ffn_decode_chain_total_us.mean === null ? null : report.aggregate.q8_ffn_decode_chain_total_us.mean / 1000)}`,
+    `q8_ffn_decode_chain_input_quantize_mean_ms=${fmt(report.aggregate.q8_ffn_decode_chain_input_quantize_us.mean === null ? null : report.aggregate.q8_ffn_decode_chain_input_quantize_us.mean / 1000)}`,
+    `q8_ffn_decode_chain_activation_quantize_mean_ms=${fmt(report.aggregate.q8_ffn_decode_chain_activation_quantize_us.mean === null ? null : report.aggregate.q8_ffn_decode_chain_activation_quantize_us.mean / 1000)}`,
+    `q8_ffn_decode_chain_down_mean_ms=${fmt(report.aggregate.q8_ffn_decode_chain_down_us.mean === null ? null : report.aggregate.q8_ffn_decode_chain_down_us.mean / 1000)}`,
+    `generation_ffn_decode_chain_role_mean_ms=${fmt(ffnDecodeChainGaps.generation_role_ms?.mean)}`,
+    `first_token_plus_post_first_generation_ffn_decode_chain_role_mean_ms=${fmt(ffnDecodeChainGaps.first_token_plus_post_first_generation_role_ms?.mean)}`,
+    `q8_ffn_decode_chain_route_mean_ms=${fmt(ffnDecodeChainGaps.q8_route_ms?.mean)}`,
+    `generation_ffn_decode_chain_role_minus_route_mean_ms=${fmt(ffnDecodeChainGaps.generation_role_minus_q8_route_ms?.mean)}`,
+    `first_token_plus_post_first_generation_ffn_decode_chain_role_minus_route_mean_ms=${fmt(ffnDecodeChainGaps.first_token_plus_post_first_generation_role_minus_q8_route_ms?.mean)}`,
+    `q8_ffn_decode_chain_total_gap_mean_ms=${fmt(ffnDecodeChainGaps.q8_chain_total_minus_route_ms?.mean)}`,
+    `q8_ffn_decode_chain_accounting=${ffnDecodeChainGaps.accounting ?? 'n/a'}`,
+    `generation_ffn_decode_chain_role_minus_total_mean_ms=${fmt(ffnDecodeChainGaps.generation_role_minus_q8_chain_total_ms?.mean)}`,
+    `first_token_plus_post_first_generation_ffn_decode_chain_role_minus_total_mean_ms=${fmt(ffnDecodeChainGaps.first_token_plus_post_first_generation_role_minus_q8_chain_total_ms?.mean)}`,
+    `output_logits_prompt_eval_mean_ms=${fmt(outputLogitsProfile.prompt_eval_logits_ms?.mean)}`,
+    `output_logits_decode_role_mean_ms=${fmt(outputLogitsProfile.decode_logits_role_ms?.mean)}`,
+    `output_logits_q8_route_mean_ms=${fmt(outputLogitsProfile.q8_logits_route_ms?.mean)}`,
+    `output_logits_generation_role_minus_q8_route_mean_ms=${fmt(outputLogitsProfile.generation_logits_role_minus_q8_route_ms?.mean)}`,
+    `output_logits_first_token_minus_prompt_eval_mean_ms=${fmt(outputLogitsProfile.first_token_logits_minus_prompt_eval_logits_ms?.mean)}`,
+    `output_logits_decode_role_minus_q8_route_mean_ms=${fmt(outputLogitsProfile.decode_logits_role_minus_q8_route_ms?.mean)}`,
+    `output_logits_accounting=${outputLogitsProfile.accounting ?? 'n/a'}`,
     `projection_route_calls_mean=${fmt(report.aggregate.projection_route_calls.mean)}`,
     'top_roles:',
     top,
@@ -724,5 +975,5 @@ function fmt(value) {
 }
 
 function usage() {
-  return `Usage: node scripts/summarize-same-host-stream-timing.mjs --input same-host.json [--out summary.json]\n\nSummarizes Camelid same-host streaming diagnostics, first-byte vs backend generate/first-content gaps, backend first-content residuals, role timing hot spots, per-layer role hot spots, layer route-vs-role gaps, focused logits/attention role buckets, generic Q8 projection routes, and Q8 scheduler work by role.`
+  return `Usage: node scripts/summarize-same-host-stream-timing.mjs --input same-host.json [--out summary.json]\n\nSummarizes Camelid same-host streaming diagnostics, first-byte vs backend generate/first-content gaps, backend first-content residuals, role timing hot spots, per-layer role timings/hot spots, layer route-vs-role gaps, focused logits/attention role buckets, FFN decode-chain route gaps, generic Q8 projection routes, and Q8 scheduler work by role.`
 }

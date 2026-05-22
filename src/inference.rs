@@ -695,6 +695,7 @@ struct Q8RuntimeFlags {
     ffn_gate_up_decode_consumer: bool,
     ffn_gate_up_packed_rows4_matmul: bool,
     ffn_gate_up_single_owner: bool,
+    ffn_decode_chain: bool,
     ffn_down_decode_consumer: bool,
     ffn_down_packed_rows4_matmul: bool,
     ffn_down_gemm4_prefill: bool,
@@ -760,6 +761,8 @@ impl Q8RuntimeFlags {
             ffn_gate_up_single_owner: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_GATE_UP_SINGLE_OWNER",
             ),
+            ffn_decode_chain: x86_q8_ffn_decode_chain_enabled()
+                || mac_q8_ffn_decode_chain_enabled(),
             ffn_down_decode_consumer: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER",
             ) || q8_0_env_flag_enabled_default_off(
@@ -1481,6 +1484,11 @@ pub struct LlamaQ8ScheduleTelemetry {
     pub projection_route_denials: HashMap<String, LlamaQ8ProjectionRouteDenialTelemetry>,
     pub ffn_gate_up_decode_consumer_activation_us: u64,
     pub ffn_gate_up_decode_consumer_tensor_us: u64,
+    pub ffn_decode_chain_taken: u64,
+    pub ffn_decode_chain_total_us: u64,
+    pub ffn_decode_chain_input_quantize_us: u64,
+    pub ffn_decode_chain_activation_quantize_us: u64,
+    pub ffn_decode_chain_down_us: u64,
     pub activation_pack_calls: u64,
     pub activation_pack_rows: u64,
     pub activation_pack_bytes_requested: u64,
@@ -1565,6 +1573,11 @@ static Q8_SCHED_I8MM_FUSED_GATE_UP_CALLS: AtomicU64 = AtomicU64::new(0);
 static Q8_SCHED_OUTPUT_PROJECTION_CALLS: AtomicU64 = AtomicU64::new(0);
 static Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_ACTIVATION_US: AtomicU64 = AtomicU64::new(0);
 static Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_TENSOR_US: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_FFN_DECODE_CHAIN_TAKEN: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_FFN_DECODE_CHAIN_TOTAL_US: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_FFN_DECODE_CHAIN_INPUT_QUANTIZE_US: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_FFN_DECODE_CHAIN_ACTIVATION_QUANTIZE_US: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_FFN_DECODE_CHAIN_DOWN_US: AtomicU64 = AtomicU64::new(0);
 static Q8_SCHED_ACTIVATION_PACK_CALLS: AtomicU64 = AtomicU64::new(0);
 static Q8_SCHED_ACTIVATION_PACK_ROWS: AtomicU64 = AtomicU64::new(0);
 static Q8_SCHED_ACTIVATION_PACK_BYTES_REQUESTED: AtomicU64 = AtomicU64::new(0);
@@ -1624,6 +1637,11 @@ pub fn reset_q8_schedule_telemetry() {
     Q8_SCHED_OUTPUT_PROJECTION_CALLS.store(0, Ordering::Relaxed);
     Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_ACTIVATION_US.store(0, Ordering::Relaxed);
     Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_TENSOR_US.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_DECODE_CHAIN_TAKEN.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_DECODE_CHAIN_TOTAL_US.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_DECODE_CHAIN_INPUT_QUANTIZE_US.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_DECODE_CHAIN_ACTIVATION_QUANTIZE_US.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_DECODE_CHAIN_DOWN_US.store(0, Ordering::Relaxed);
     Q8_SCHED_ACTIVATION_PACK_CALLS.store(0, Ordering::Relaxed);
     Q8_SCHED_ACTIVATION_PACK_ROWS.store(0, Ordering::Relaxed);
     Q8_SCHED_ACTIVATION_PACK_BYTES_REQUESTED.store(0, Ordering::Relaxed);
@@ -1716,6 +1734,13 @@ pub fn snapshot_q8_schedule_telemetry() -> LlamaQ8ScheduleTelemetry {
             Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_ACTIVATION_US.load(Ordering::Relaxed),
         ffn_gate_up_decode_consumer_tensor_us: Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_TENSOR_US
             .load(Ordering::Relaxed),
+        ffn_decode_chain_taken: Q8_SCHED_FFN_DECODE_CHAIN_TAKEN.load(Ordering::Relaxed),
+        ffn_decode_chain_total_us: Q8_SCHED_FFN_DECODE_CHAIN_TOTAL_US.load(Ordering::Relaxed),
+        ffn_decode_chain_input_quantize_us: Q8_SCHED_FFN_DECODE_CHAIN_INPUT_QUANTIZE_US
+            .load(Ordering::Relaxed),
+        ffn_decode_chain_activation_quantize_us: Q8_SCHED_FFN_DECODE_CHAIN_ACTIVATION_QUANTIZE_US
+            .load(Ordering::Relaxed),
+        ffn_decode_chain_down_us: Q8_SCHED_FFN_DECODE_CHAIN_DOWN_US.load(Ordering::Relaxed),
         activation_pack_calls: Q8_SCHED_ACTIVATION_PACK_CALLS.load(Ordering::Relaxed),
         activation_pack_rows: Q8_SCHED_ACTIVATION_PACK_ROWS.load(Ordering::Relaxed),
         activation_pack_bytes_requested: Q8_SCHED_ACTIVATION_PACK_BYTES_REQUESTED
@@ -4330,61 +4355,100 @@ fn forward_layer_timed(
             ffn_out, None, None, None, None, None, None, None, None, false,
         )
     } else {
-        let activated = gated_ffn_activation_with_plan(
-            &ffn_norm,
-            &layer.ffn_gate,
-            &layer.ffn_up,
-            format!("layer_{layer_idx}_ffn_activated"),
-            runtime_plan,
-            collect_diagnostics,
-        )?;
-        timings.ffn_gate = activated.gate;
-        timings.ffn_up = activated.up;
-        timings.ffn_activation = activated.activation;
-        let ffn_gate_stats = activated.gate_stats;
-        let ffn_up_stats = activated.up_stats;
-        let ffn_gate_diagnostic = activated.gate_diagnostic;
-        let ffn_up_diagnostic = activated.up_diagnostic;
-        let ffn_activation_diagnostic = activated.activation_diagnostic;
-        let activated = activated.tensor;
-        let ffn_activation_stats = collect_diagnostics
-            .then(|| LlamaTensorStats::from_tensor(&activated))
-            .transpose()?;
-        if let Some(memory) = &mut memory {
-            memory.record_after_ffn_activation(capture_memory_sample(kv_cache));
-        }
-        trace_forward_layer_memory(layer_idx, "ffn_gate_up_activation_done");
-        let started = Instant::now();
-        let ffn_out = linear_for_role_runtime_with_plan(
-            &activated,
-            &layer.ffn_down,
-            format!("layer_{layer_idx}_ffn_down"),
-            "ffn_down",
-            runtime_plan,
-            collect_diagnostics,
-        )?;
-        let ffn_out_already_residual = false;
-        let ffn_output_stats = collect_diagnostics
-            .then(|| LlamaTensorStats::from_tensor(&ffn_out))
-            .transpose()?;
-        let ffn_down_diagnostic = collect_diagnostics
+        let activated_name = format!("layer_{layer_idx}_ffn_activated");
+        let down_name = format!("layer_{layer_idx}_ffn_down");
+        if let Some(fused) = (!collect_diagnostics)
             .then(|| {
-                linear_projection_diagnostics(&activated, &layer.ffn_down, &ffn_out, "ffn_down")
+                try_q8_ffn_decode_chain_path(
+                    &ffn_norm,
+                    &layer.ffn_gate,
+                    &layer.ffn_up,
+                    &layer.ffn_down,
+                    &activated_name,
+                    &down_name,
+                    runtime_plan,
+                )
             })
-            .transpose()?;
-        timings.ffn_down = started.elapsed().as_micros();
-        (
-            ffn_out,
-            ffn_gate_stats,
-            ffn_up_stats,
-            ffn_gate_diagnostic,
-            ffn_up_diagnostic,
-            ffn_activation_diagnostic,
-            ffn_activation_stats,
-            ffn_down_diagnostic,
-            ffn_output_stats,
-            ffn_out_already_residual,
-        )
+            .transpose()?
+            .flatten()
+        {
+            timings.ffn_gate = fused.gate;
+            timings.ffn_up = fused.up;
+            timings.ffn_activation = fused.activation;
+            timings.ffn_down = fused.down;
+            if let Some(memory) = &mut memory {
+                memory.record_after_ffn_activation(capture_memory_sample(kv_cache));
+            }
+            trace_forward_layer_memory(layer_idx, "ffn_gate_up_activation_done");
+            (
+                fused.tensor,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+        } else {
+            let activated = gated_ffn_activation_with_plan(
+                &ffn_norm,
+                &layer.ffn_gate,
+                &layer.ffn_up,
+                activated_name,
+                runtime_plan,
+                collect_diagnostics,
+            )?;
+            timings.ffn_gate = activated.gate;
+            timings.ffn_up = activated.up;
+            timings.ffn_activation = activated.activation;
+            let ffn_gate_stats = activated.gate_stats;
+            let ffn_up_stats = activated.up_stats;
+            let ffn_gate_diagnostic = activated.gate_diagnostic;
+            let ffn_up_diagnostic = activated.up_diagnostic;
+            let ffn_activation_diagnostic = activated.activation_diagnostic;
+            let activated = activated.tensor;
+            let ffn_activation_stats = collect_diagnostics
+                .then(|| LlamaTensorStats::from_tensor(&activated))
+                .transpose()?;
+            if let Some(memory) = &mut memory {
+                memory.record_after_ffn_activation(capture_memory_sample(kv_cache));
+            }
+            trace_forward_layer_memory(layer_idx, "ffn_gate_up_activation_done");
+            let started = Instant::now();
+            let ffn_out = linear_for_role_runtime_with_plan(
+                &activated,
+                &layer.ffn_down,
+                down_name,
+                "ffn_down",
+                runtime_plan,
+                collect_diagnostics,
+            )?;
+            let ffn_out_already_residual = false;
+            let ffn_output_stats = collect_diagnostics
+                .then(|| LlamaTensorStats::from_tensor(&ffn_out))
+                .transpose()?;
+            let ffn_down_diagnostic = collect_diagnostics
+                .then(|| {
+                    linear_projection_diagnostics(&activated, &layer.ffn_down, &ffn_out, "ffn_down")
+                })
+                .transpose()?;
+            timings.ffn_down = started.elapsed().as_micros();
+            (
+                ffn_out,
+                ffn_gate_stats,
+                ffn_up_stats,
+                ffn_gate_diagnostic,
+                ffn_up_diagnostic,
+                ffn_activation_diagnostic,
+                ffn_activation_stats,
+                ffn_down_diagnostic,
+                ffn_output_stats,
+                ffn_out_already_residual,
+            )
+        }
     };
     if collect_diagnostics && diagnostic_zero_delta(DeltaZeroTarget::Ffn, layer_idx)? {
         ffn_out = zero_like(&ffn_out, format!("layer_{layer_idx}_ffn_down_zeroed"))?;
@@ -7243,15 +7307,46 @@ fn try_gated_ffn_activation_batch_packed_prefill_i8mm(
     up_weight: &CpuTensor,
     name: &str,
 ) -> Result<Option<GatedFfnActivation>> {
+    let collect_q8_schedule = q8_schedule_telemetry_enabled();
     if !mac_q8_sched_packed_prefill_enabled() {
+        if collect_q8_schedule {
+            record_q8_schedule_projection_route_denial(
+                "ffn_gate_up",
+                "mac_prefill_i8mm_fused",
+                "sched_off",
+                0,
+                0,
+                0,
+            );
+        }
         return Ok(None);
     }
     let rows = input.dim(0)?;
     if rows < 2 {
+        if collect_q8_schedule {
+            record_q8_schedule_projection_route_denial(
+                "ffn_gate_up",
+                "mac_prefill_i8mm_fused",
+                "rows_lt2",
+                rows,
+                0,
+                0,
+            );
+        }
         return Ok(None);
     }
     let input_width = input.dim(1)?;
     if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        if collect_q8_schedule {
+            record_q8_schedule_projection_route_denial(
+                "ffn_gate_up",
+                "mac_prefill_i8mm_fused",
+                "input_width_not_q8_block_multiple",
+                rows,
+                input_width,
+                0,
+            );
+        }
         return Ok(None);
     }
     let blocks_per_row = input_width / Q8_0_BLOCK_VALUES;
@@ -7262,24 +7357,56 @@ fn try_gated_ffn_activation_batch_packed_prefill_i8mm(
             "gated FFN gate/up width mismatch: gate output {gate_width}, up output {up_width}"
         )));
     }
-    let Some((gate_packed, Q8_0PackedRows4Interleave::I8)) =
-        q8_0_selected_packed_rows4(gate_weight)
+    let Some((gate_packed, runtime_gate_width)) =
+        q8_0_runtime_packed_projection(gate_weight, input_width)?
     else {
+        if collect_q8_schedule {
+            record_q8_schedule_projection_route_denial(
+                "ffn_gate_up",
+                "mac_prefill_i8mm_fused",
+                "missing_gate_runtime_packed_rows4",
+                rows,
+                input_width,
+                gate_width,
+            );
+        }
         return Ok(None);
     };
-    let Some((up_packed, Q8_0PackedRows4Interleave::I8)) = q8_0_selected_packed_rows4(up_weight)
+    let Some((up_packed, runtime_up_width)) =
+        q8_0_runtime_packed_projection(up_weight, input_width)?
     else {
+        if collect_q8_schedule {
+            record_q8_schedule_projection_route_denial(
+                "ffn_gate_up",
+                "mac_prefill_i8mm_fused",
+                "missing_up_runtime_packed_rows4",
+                rows,
+                input_width,
+                up_width,
+            );
+        }
         return Ok(None);
     };
     if gate_packed.rows != gate_width
         || up_packed.rows != up_width
+        || runtime_gate_width != gate_width
+        || runtime_up_width != up_width
         || gate_packed.blocks_per_row != blocks_per_row
         || up_packed.blocks_per_row != blocks_per_row
     {
+        if collect_q8_schedule {
+            record_q8_schedule_projection_route_denial(
+                "ffn_gate_up",
+                "mac_prefill_i8mm_fused",
+                "packed_projection_shape_mismatch",
+                rows,
+                input_width,
+                gate_width,
+            );
+        }
         return Ok(None);
     }
 
-    let collect_q8_schedule = q8_schedule_telemetry_enabled();
     let projection_started = Instant::now();
     let (mut gate, up) = if mac_q8_prefill_i8mm_enabled() && rows >= 4 {
         let mut gate = vec![0.0_f32; rows * gate_width];
@@ -7678,6 +7805,14 @@ struct GatedFfnActivation {
     activation_diagnostic: Option<LlamaFfnActivationDiagnostic>,
 }
 
+struct FfnDecodeChainOutput {
+    tensor: CpuTensor,
+    gate: u128,
+    up: u128,
+    activation: u128,
+    down: u128,
+}
+
 fn linear_output_width(input: &CpuTensor, weight: &CpuTensor, role: &str) -> Result<usize> {
     let input_width = input.dim(1)?;
     if weight.rank() != 2 {
@@ -8057,7 +8192,7 @@ fn lazy_q8_0_linear_enabled() -> bool {
 const Q8_0_BLOCK_VALUES: usize = 32;
 const X86_Q8_PACKED_ROWS4_DECODE_PARALLEL_MIN_OUTPUTS: usize = 1024;
 const X86_Q8_PACKED_ROWS4_MATMUL_PARALLEL_MIN_GROUPS: usize = 64;
-const X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK: usize = 8;
+const X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK: usize = 16;
 const X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS: usize = 8;
 
 #[derive(Debug, Clone)]
@@ -8352,6 +8487,279 @@ fn try_x86_q8_ffn_gate_up_decode_consumer_path(
     );
     let gate_elapsed = total_elapsed / 2;
     Ok(Some((gate_elapsed, total_elapsed - gate_elapsed)))
+}
+
+fn try_q8_ffn_decode_chain_path(
+    input: &CpuTensor,
+    gate_weight: &CpuTensor,
+    up_weight: &CpuTensor,
+    down_weight: &CpuTensor,
+    activated_name: &str,
+    down_name: &str,
+    runtime_plan: &ResolvedRuntimePlan,
+) -> Result<Option<FfnDecodeChainOutput>> {
+    if !runtime_plan.q8.ffn_decode_chain
+        || !runtime_plan.q8.ffn_gate_up_decode_consumer
+        || !runtime_plan.q8.ffn_down_decode_consumer
+        || input.rank() != 2
+        || input.dim(0)? != 1
+    {
+        return Ok(None);
+    }
+
+    let total_started = Instant::now();
+    let chain_route_name = q8_ffn_decode_chain_route_name();
+    let input_width = input.dim(1)?;
+    if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up_down",
+            chain_route_name,
+            "input_width_not_q8_block_multiple",
+            1,
+            input_width,
+            0,
+        );
+        return Ok(None);
+    }
+
+    let Some((gate_packed, gate_width)) = q8_0_runtime_packed_projection(gate_weight, input_width)?
+    else {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up_down",
+            chain_route_name,
+            "missing_gate_runtime_packed_rows4",
+            1,
+            input_width,
+            0,
+        );
+        return Ok(None);
+    };
+    let Some((up_packed, up_width)) = q8_0_runtime_packed_projection(up_weight, input_width)?
+    else {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up_down",
+            chain_route_name,
+            "missing_up_runtime_packed_rows4",
+            1,
+            input_width,
+            0,
+        );
+        return Ok(None);
+    };
+    if gate_width != up_width {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up_down",
+            chain_route_name,
+            "gate_up_width_mismatch",
+            1,
+            input_width,
+            gate_width,
+        );
+        return Ok(None);
+    }
+    if !gate_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up_down",
+            chain_route_name,
+            "activation_width_not_q8_block_multiple",
+            1,
+            input_width,
+            gate_width,
+        );
+        return Ok(None);
+    }
+
+    let Some((down_packed, down_width)) = q8_0_runtime_packed_projection(down_weight, gate_width)?
+    else {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up_down",
+            chain_route_name,
+            "missing_down_runtime_packed_rows4",
+            1,
+            gate_width,
+            0,
+        );
+        return Ok(None);
+    };
+
+    let mut gate = vec![0.0_f32; gate_width];
+    let mut up = vec![0.0_f32; up_width];
+    let input_quantize_started = Instant::now();
+    let quantized_input = quantize_q8_0_row(&input.data[..input_width]);
+    let input_quantize_elapsed = input_quantize_started.elapsed().as_micros();
+    add_q8_schedule_counter(
+        &Q8_SCHED_FFN_DECODE_CHAIN_INPUT_QUANTIZE_US,
+        input_quantize_elapsed as u64,
+    );
+    let gate_up_started = Instant::now();
+    q8_0_packed_rows4_single_input_projection_pair_into(
+        gate_packed,
+        up_packed,
+        &quantized_input.blocks,
+        &mut gate,
+        &mut up,
+    )?;
+    let gate_up_elapsed = gate_up_started.elapsed().as_micros();
+    record_q8_schedule_output_projection_route_call(
+        "ffn_gate_up",
+        "decode_consumer",
+        Some(activated_name),
+        1,
+        input_width,
+        gate_width,
+        gate_up_elapsed,
+    );
+    let gate_elapsed = gate_up_elapsed / 2;
+
+    let order = diagnostic_ffn_gate_up_order()?;
+    let activation_started = Instant::now();
+    let activation_blocks = quantize_gated_activation_q8_0_blocks(&gate, &up, order);
+    let activation_elapsed = activation_started.elapsed().as_micros();
+    add_q8_schedule_counter(
+        &Q8_SCHED_FFN_DECODE_CHAIN_ACTIVATION_QUANTIZE_US,
+        activation_elapsed as u64,
+    );
+
+    let down_started = Instant::now();
+    let mut output = vec![0.0_f32; down_width];
+    let decode_group_chunking = mac_q8_ffn_down_decode_group_chunking_enabled();
+    q8_0_packed_rows4_single_input_projection_into_with_decode_chunking(
+        down_packed,
+        &activation_blocks,
+        &mut output,
+        decode_group_chunking,
+    )?;
+    let output = CpuTensor::from_f32(down_name, vec![1, down_width], output)?;
+    let down_elapsed = down_started.elapsed().as_micros();
+    add_q8_schedule_counter(&Q8_SCHED_FFN_DECODE_CHAIN_TAKEN, 1);
+    add_q8_schedule_counter(
+        &Q8_SCHED_FFN_DECODE_CHAIN_TOTAL_US,
+        total_started.elapsed().as_micros() as u64,
+    );
+    add_q8_schedule_counter(&Q8_SCHED_FFN_DECODE_CHAIN_DOWN_US, down_elapsed as u64);
+    add_q8_schedule_counter(&Q8_SCHED_FFN_DOWN_DECODE_CONSUMER_TAKEN, 1);
+    record_q8_schedule_output_projection_route_call(
+        "ffn_down",
+        q8_ffn_down_decode_consumer_route_name(decode_group_chunking),
+        Some(down_name),
+        1,
+        gate_width,
+        down_width,
+        down_elapsed,
+    );
+
+    Ok(Some(FfnDecodeChainOutput {
+        tensor: output,
+        gate: gate_elapsed,
+        up: gate_up_elapsed - gate_elapsed,
+        activation: activation_elapsed,
+        down: down_elapsed,
+    }))
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+fn try_mac_q8_ffn_decode_chain_path(
+    input: &CpuTensor,
+    gate_weight: &CpuTensor,
+    up_weight: &CpuTensor,
+    down_weight: &CpuTensor,
+    activated_name: &str,
+    down_name: &str,
+    runtime_plan: &ResolvedRuntimePlan,
+) -> Result<Option<FfnDecodeChainOutput>> {
+    if !mac_q8_ffn_decode_chain_enabled() {
+        return Ok(None);
+    }
+    try_q8_ffn_decode_chain_path(
+        input,
+        gate_weight,
+        up_weight,
+        down_weight,
+        activated_name,
+        down_name,
+        runtime_plan,
+    )
+}
+
+fn quantize_gated_activation_q8_0_blocks(
+    gate: &[f32],
+    up: &[f32],
+    order: FfnGateUpOrder,
+) -> Vec<Q8_0Block> {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if x86_q8_ffn_activation_ptr_quantize_enabled()
+            && gate.len().is_multiple_of(Q8_0_BLOCK_VALUES)
+            && gate.len() == up.len()
+        {
+            // SAFETY: lengths are equal and block-aligned. The helper only reads inside
+            // those slices and writes fixed-size stack blocks before pushing owned Q8 blocks.
+            return unsafe { quantize_gated_activation_q8_0_blocks_ptr(gate, up, order) };
+        }
+    }
+    quantize_gated_activation_q8_0_blocks_safe(gate, up, order)
+}
+
+fn quantize_gated_activation_q8_0_blocks_safe(
+    gate: &[f32],
+    up: &[f32],
+    order: FfnGateUpOrder,
+) -> Vec<Q8_0Block> {
+    debug_assert_eq!(gate.len(), up.len());
+    debug_assert!(gate.len().is_multiple_of(Q8_0_BLOCK_VALUES));
+    let mut blocks = Vec::with_capacity(gate.len() / Q8_0_BLOCK_VALUES);
+    let mut block_values = [0.0_f32; Q8_0_BLOCK_VALUES];
+    for (gate_block, up_block) in gate
+        .chunks_exact(Q8_0_BLOCK_VALUES)
+        .zip(up.chunks_exact(Q8_0_BLOCK_VALUES))
+    {
+        for ((out, gate_value), up_value) in block_values
+            .iter_mut()
+            .zip(gate_block.iter())
+            .zip(up_block.iter())
+        {
+            *out = match order {
+                FfnGateUpOrder::GateUp => (*gate_value / (1.0 + (-*gate_value).exp())) * *up_value,
+                FfnGateUpOrder::UpGate => (*up_value / (1.0 + (-*up_value).exp())) * *gate_value,
+            };
+        }
+        blocks.push(quantize_q8_0_block(&block_values));
+    }
+    blocks
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe fn quantize_gated_activation_q8_0_blocks_ptr(
+    gate: &[f32],
+    up: &[f32],
+    order: FfnGateUpOrder,
+) -> Vec<Q8_0Block> {
+    debug_assert_eq!(gate.len(), up.len());
+    debug_assert!(gate.len().is_multiple_of(Q8_0_BLOCK_VALUES));
+    let block_count = gate.len() / Q8_0_BLOCK_VALUES;
+    let mut blocks = Vec::with_capacity(block_count);
+    let gate_ptr = gate.as_ptr();
+    let up_ptr = up.as_ptr();
+    let mut block_idx = 0;
+    while block_idx < block_count {
+        let base = block_idx * Q8_0_BLOCK_VALUES;
+        let mut block_values = [0.0_f32; Q8_0_BLOCK_VALUES];
+        let mut lane = 0;
+        while lane < Q8_0_BLOCK_VALUES {
+            // SAFETY: caller verified equal, block-aligned lengths; base + lane is
+            // always below gate.len()/up.len() for block_idx < block_count.
+            let gate_value = unsafe { *gate_ptr.add(base + lane) };
+            let up_value = unsafe { *up_ptr.add(base + lane) };
+            block_values[lane] = match order {
+                FfnGateUpOrder::GateUp => (gate_value / (1.0 + (-gate_value).exp())) * up_value,
+                FfnGateUpOrder::UpGate => (up_value / (1.0 + (-up_value).exp())) * gate_value,
+            };
+            lane += 1;
+        }
+        blocks.push(quantize_q8_0_block(&block_values));
+        block_idx += 1;
+    }
+    blocks
 }
 
 fn q8_0_runtime_packed_projection(
@@ -8653,6 +9061,44 @@ fn mac_q8_ffn_down_decode_consumer_enabled() -> bool {
     }
 }
 
+fn mac_q8_ffn_decode_chain_enabled() -> bool {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        q8_0_env_flag_enabled_default_off("CAMELID_MAC_Q8_FFN_DECODE_CHAIN")
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        false
+    }
+}
+
+fn x86_q8_ffn_decode_chain_enabled() -> bool {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_FFN_DECODE_CHAIN")
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        false
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn x86_q8_ffn_activation_ptr_quantize_enabled() -> bool {
+    q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_FFN_ACTIVATION_PTR_QUANTIZE")
+}
+
+fn q8_ffn_decode_chain_route_name() -> &'static str {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        "x86_decode_chain"
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        "mac_decode_chain"
+    }
+}
+
 fn mac_q8_ffn_down_single_projection_scheduler_counters_enabled() -> bool {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
@@ -8755,9 +9201,7 @@ fn q8_0_vnni_decode_1x64_projection_into(
                 let tile = &packed.tiles[tile_idx];
                 let int_sums = q8_0_vnni_tile16_dot(tile, input_block);
                 for (lane, sum) in sums.iter_mut().enumerate() {
-                    *sum += int_sums[lane] as f32
-                        * input_block.scale
-                        * f16_bits_to_f32(tile.scale_f16[lane]);
+                    *sum += int_sums[lane] as f32 * input_block.scale * tile.scale_f32[lane];
                 }
             }
             output_chunk[tile_col * 16..tile_col * 16 + 16].copy_from_slice(&sums);
@@ -11498,14 +11942,14 @@ fn x86_q8_packed_rows4_avx2_dot_enabled() -> bool {
 fn x86_q8_packed_rows4_avx2_dot_hoist_enabled() -> bool {
     #[cfg(test)]
     {
-        q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_HOIST")
+        !q8_0_env_flag_disabled("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_HOIST")
             && std::arch::is_x86_feature_detected!("avx2")
     }
     #[cfg(not(test))]
     {
         static X86_Q8_PACKED_ROWS4_AVX2_DOT_HOIST_ENABLED: OnceLock<bool> = OnceLock::new();
         *X86_Q8_PACKED_ROWS4_AVX2_DOT_HOIST_ENABLED.get_or_init(|| {
-            q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_HOIST")
+            !q8_0_env_flag_disabled("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_HOIST")
                 && std::arch::is_x86_feature_detected!("avx2")
         })
     }
@@ -11520,14 +11964,14 @@ fn x86_q8_packed_rows4_avx2_dot_hoist_enabled() -> bool {
 fn x86_q8_packed_rows4_avx2_dot_decode_hoist_enabled() -> bool {
     #[cfg(test)]
     {
-        q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_DECODE_HOIST")
+        !q8_0_env_flag_disabled("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_DECODE_HOIST")
             && std::arch::is_x86_feature_detected!("avx2")
     }
     #[cfg(not(test))]
     {
         static X86_Q8_PACKED_ROWS4_AVX2_DOT_DECODE_HOIST_ENABLED: OnceLock<bool> = OnceLock::new();
         *X86_Q8_PACKED_ROWS4_AVX2_DOT_DECODE_HOIST_ENABLED.get_or_init(|| {
-            q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_DECODE_HOIST")
+            !q8_0_env_flag_disabled("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_DECODE_HOIST")
                 && std::arch::is_x86_feature_detected!("avx2")
         })
     }
@@ -11543,28 +11987,44 @@ fn x86_q8_packed_rows4_avx2_dot_decode_hoist_enabled() -> bool {
 unsafe fn q8_0_i8_block_avx2(weight: *const i8, input: *const i8) -> i32 {
     #[cfg(target_arch = "x86")]
     use std::arch::x86::{
-        _mm256_add_epi32, _mm256_cvtepi8_epi16, _mm256_madd_epi16, _mm256_mullo_epi16,
-        _mm256_set1_epi16, _mm256_setzero_si256, _mm256_storeu_si256, _mm_loadu_si128,
+        _mm256_add_epi32, _mm256_cmpeq_epi8, _mm256_cvtepi8_epi16, _mm256_loadu_si256,
+        _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_movemask_epi8, _mm256_mullo_epi16,
+        _mm256_set1_epi16, _mm256_set1_epi8, _mm256_setzero_si256, _mm256_sign_epi8,
+        _mm256_storeu_si256, _mm_loadu_si128,
     };
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::{
-        _mm256_add_epi32, _mm256_cvtepi8_epi16, _mm256_madd_epi16, _mm256_mullo_epi16,
-        _mm256_set1_epi16, _mm256_setzero_si256, _mm256_storeu_si256, _mm_loadu_si128,
+        _mm256_add_epi32, _mm256_cmpeq_epi8, _mm256_cvtepi8_epi16, _mm256_loadu_si256,
+        _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_movemask_epi8, _mm256_mullo_epi16,
+        _mm256_set1_epi16, _mm256_set1_epi8, _mm256_setzero_si256, _mm256_sign_epi8,
+        _mm256_storeu_si256, _mm_loadu_si128,
     };
 
     let ones = _mm256_set1_epi16(1);
-    let mut acc = _mm256_setzero_si256();
-    for offset in [0usize, 16] {
-        // SAFETY: callers provide two complete 32-byte Q8_0 quant arrays; each iteration
-        // loads one unaligned 16-byte half from both arrays.
-        let weight_i8 = unsafe { _mm_loadu_si128(weight.add(offset).cast()) };
-        let input_i8 = unsafe { _mm_loadu_si128(input.add(offset).cast()) };
-        let weight_i16 = _mm256_cvtepi8_epi16(weight_i8);
-        let input_i16 = _mm256_cvtepi8_epi16(input_i8);
-        let products_i16 = _mm256_mullo_epi16(weight_i16, input_i16);
-        let pair_sums_i32 = _mm256_madd_epi16(products_i16, ones);
-        acc = _mm256_add_epi32(acc, pair_sums_i32);
-    }
+    // SAFETY: callers provide two complete 32-byte Q8_0 quant arrays.
+    let weight_i8 = unsafe { _mm256_loadu_si256(weight.cast()) };
+    let input_i8 = unsafe { _mm256_loadu_si256(input.cast()) };
+    let min_i8 = _mm256_set1_epi8(i8::MIN);
+    let has_min_i8 = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(weight_i8, min_i8))
+        | _mm256_movemask_epi8(_mm256_cmpeq_epi8(input_i8, min_i8)))
+        != 0;
+    let acc = if has_min_i8 {
+        let mut acc = _mm256_setzero_si256();
+        for offset in [0usize, 16] {
+            let weight_half = unsafe { _mm_loadu_si128(weight.add(offset).cast()) };
+            let input_half = unsafe { _mm_loadu_si128(input.add(offset).cast()) };
+            let products = _mm256_mullo_epi16(
+                _mm256_cvtepi8_epi16(weight_half),
+                _mm256_cvtepi8_epi16(input_half),
+            );
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(products, ones));
+        }
+        acc
+    } else {
+        let abs_weight = _mm256_sign_epi8(weight_i8, weight_i8);
+        let signed_input = _mm256_sign_epi8(input_i8, weight_i8);
+        _mm256_madd_epi16(_mm256_maddubs_epi16(abs_weight, signed_input), ones)
+    };
 
     let mut lanes = [0_i32; 8];
     // SAFETY: lanes has exactly 32 bytes of storage for one __m256i value.
@@ -12669,15 +13129,15 @@ fn matmul_rhs_transposed_q8_0_packed_rows4_prefill_i8mm(
     let mut output = vec![0.0_f32; rows * output_width];
     let packed_rows = rows / 4 * 4;
     let collect_q8_schedule = q8_schedule_telemetry_enabled();
+    let output_groups = packed_weight.rows / 4;
     if collect_q8_schedule {
         let row_groups = (packed_rows / 4) as u64;
         add_q8_schedule_counter(&Q8_SCHED_I8MM_SINGLE_PROJECTION_CALLS, 1);
         record_q8_schedule_i8mm_single_projection_role_call(q8_role, rows as u64, row_groups);
         if q8_role == "ffn_down" && mac_q8_ffn_down_single_projection_scheduler_counters_enabled() {
-            let output_groups = (output_width / 4) as u64;
             record_q8_schedule_i8mm_single_projection_role_scheduler(
                 q8_role,
-                output_groups,
+                output_groups as u64,
                 row_groups,
                 1,
             );
@@ -12807,6 +13267,41 @@ fn run_q8_0_packed_rows4_prefill_i8mm_kernel(
         let (row0, rest) = group_output.split_at_mut(rows);
         let (row1, rest) = rest.split_at_mut(rows);
         let (row2, row3) = rest.split_at_mut(rows);
+
+        let compute_output_group = |output_group: usize,
+                                    row0_chunk: &mut [f32],
+                                    row1_chunk: &mut [f32],
+                                    row2_chunk: &mut [f32],
+                                    row3_chunk: &mut [f32]| {
+            debug_assert_eq!(row0_chunk.len(), 4);
+            debug_assert_eq!(row1_chunk.len(), 4);
+            debug_assert_eq!(row2_chunk.len(), 4);
+            debug_assert_eq!(row3_chunk.len(), 4);
+            let weight_group = &packed_weight.blocks
+                [output_group * blocks_per_row..(output_group + 1) * blocks_per_row];
+            let mut sums = [[0.0_f32; 4]; 4];
+            for (input_block, weight_block) in input_blocks.iter().zip(weight_group) {
+                // SAFETY: mac_q8_prefill_i8mm_enabled checked runtime I8MM support before this path;
+                // both operands are q8_0_4x8 packed blocks with 4 rows/columns and 32 K values.
+                let int_sums = unsafe {
+                    q8_0_packed_4x8_gemm4_block_i8mm(
+                        input_block.quants.as_ptr(),
+                        weight_block.quants.as_ptr(),
+                    )
+                };
+                for input_lane in 0..4 {
+                    for output_lane in 0..4 {
+                        sums[input_lane][output_lane] += int_sums[input_lane][output_lane] as f32
+                            * weight_block.scales[output_lane]
+                            * input_block.scales[input_lane];
+                    }
+                }
+            }
+            row0_chunk.copy_from_slice(&sums[0]);
+            row1_chunk.copy_from_slice(&sums[1]);
+            row2_chunk.copy_from_slice(&sums[2]);
+            row3_chunk.copy_from_slice(&sums[3]);
+        };
         row0.par_chunks_mut(4)
             .zip(row1.par_chunks_mut(4))
             .zip(row2.par_chunks_mut(4))
@@ -12814,31 +13309,13 @@ fn run_q8_0_packed_rows4_prefill_i8mm_kernel(
             .enumerate()
             .for_each(
                 |(output_group, (((row0_chunk, row1_chunk), row2_chunk), row3_chunk))| {
-                    let weight_group = &packed_weight.blocks
-                        [output_group * blocks_per_row..(output_group + 1) * blocks_per_row];
-                    let mut sums = [[0.0_f32; 4]; 4];
-                    for (input_block, weight_block) in input_blocks.iter().zip(weight_group) {
-                        // SAFETY: mac_q8_prefill_i8mm_enabled checked runtime I8MM support before this path;
-                        // both operands are q8_0_4x8 packed blocks with 4 rows/columns and 32 K values.
-                        let int_sums = unsafe {
-                            q8_0_packed_4x8_gemm4_block_i8mm(
-                                input_block.quants.as_ptr(),
-                                weight_block.quants.as_ptr(),
-                            )
-                        };
-                        for input_lane in 0..4 {
-                            for output_lane in 0..4 {
-                                sums[input_lane][output_lane] += int_sums[input_lane][output_lane]
-                                    as f32
-                                    * weight_block.scales[output_lane]
-                                    * input_block.scales[input_lane];
-                            }
-                        }
-                    }
-                    row0_chunk.copy_from_slice(&sums[0]);
-                    row1_chunk.copy_from_slice(&sums[1]);
-                    row2_chunk.copy_from_slice(&sums[2]);
-                    row3_chunk.copy_from_slice(&sums[3]);
+                    compute_output_group(
+                        output_group,
+                        row0_chunk,
+                        row1_chunk,
+                        row2_chunk,
+                        row3_chunk,
+                    );
                 },
             );
     }
@@ -14799,6 +15276,21 @@ mod tests {
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[test]
+    fn x86_q8_avx2_kernel_matches_scalar_dot_for_negative_128() {
+        let _env_guard = env_lock();
+        std::env::set_var("CAMELID_X86_Q8_KERNEL", "avx2");
+        let mut weight = std::array::from_fn(|idx| (idx as i8).wrapping_mul(7).wrapping_sub(59));
+        let mut input = std::array::from_fn(|idx| (idx as i8).wrapping_mul(5).wrapping_add(17));
+        weight[3] = i8::MIN;
+        input[7] = i8::MIN;
+        let expected = q8_0_block_int_dot_horizontal_sum_scalar(&weight, &input);
+
+        assert_eq!(q8_0_block_int_dot_horizontal_sum(&weight, &input), expected);
+        std::env::remove_var("CAMELID_X86_Q8_KERNEL");
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
     fn x86_q8_packed_rows4_matmul_chunk_groups_env_override() {
         let _env_guard = env_lock();
         std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK");
@@ -14922,6 +15414,26 @@ mod tests {
         );
         assert_eq!(actual, expected);
         std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_HOIST");
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn x86_q8_packed_rows4_avx2_hoists_default_on_with_explicit_off() {
+        let _env_guard = env_lock();
+        std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_HOIST");
+        std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_DECODE_HOIST");
+
+        let avx2 = std::arch::is_x86_feature_detected!("avx2");
+        assert_eq!(x86_q8_packed_rows4_avx2_dot_hoist_enabled(), avx2);
+        assert_eq!(x86_q8_packed_rows4_avx2_dot_decode_hoist_enabled(), avx2);
+
+        std::env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_HOIST", "off");
+        std::env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_DECODE_HOIST", "off");
+        assert!(!x86_q8_packed_rows4_avx2_dot_hoist_enabled());
+        assert!(!x86_q8_packed_rows4_avx2_dot_decode_hoist_enabled());
+
+        std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_HOIST");
+        std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_DECODE_HOIST");
     }
 
     #[test]
@@ -15911,6 +16423,8 @@ mod tests {
             "CAMELID_X86_Q8_ATTENTION_PROJECTION_DECODE_CONSUMER",
             "CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER",
             "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER",
+            "CAMELID_X86_Q8_FFN_DECODE_CHAIN",
+            "CAMELID_X86_Q8_FFN_ACTIVATION_PTR_QUANTIZE",
             "CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER",
             "CAMELID_X86_Q8_OUTPUT_DECODE_OWNER",
         ] {
@@ -16232,6 +16746,7 @@ mod tests {
                 ffn_gate_up_decode_consumer: false,
                 ffn_gate_up_packed_rows4_matmul: false,
                 ffn_gate_up_single_owner: false,
+                ffn_decode_chain: false,
                 ffn_down_decode_consumer: false,
                 ffn_down_packed_rows4_matmul: false,
                 ffn_down_gemm4_prefill: false,
@@ -17038,6 +17553,7 @@ mod tests {
                 ffn_gate_up_decode_consumer: false,
                 ffn_gate_up_packed_rows4_matmul: false,
                 ffn_gate_up_single_owner: false,
+                ffn_decode_chain: false,
                 ffn_down_decode_consumer: false,
                 ffn_down_packed_rows4_matmul: false,
                 ffn_down_gemm4_prefill: false,
@@ -17586,6 +18102,7 @@ mod tests {
                 ffn_gate_up_decode_consumer: false,
                 ffn_gate_up_packed_rows4_matmul: false,
                 ffn_gate_up_single_owner: false,
+                ffn_decode_chain: false,
                 ffn_down_decode_consumer: enabled,
                 ffn_down_packed_rows4_matmul: false,
                 ffn_down_gemm4_prefill: false,
@@ -17623,6 +18140,7 @@ mod tests {
                 ffn_gate_up_decode_consumer: false,
                 ffn_gate_up_packed_rows4_matmul: false,
                 ffn_gate_up_single_owner: false,
+                ffn_decode_chain: false,
                 ffn_down_decode_consumer: false,
                 ffn_down_packed_rows4_matmul: enabled,
                 ffn_down_gemm4_prefill: false,
@@ -17666,6 +18184,7 @@ mod tests {
                 ffn_gate_up_decode_consumer: enabled,
                 ffn_gate_up_packed_rows4_matmul: false,
                 ffn_gate_up_single_owner: false,
+                ffn_decode_chain: false,
                 ffn_down_decode_consumer: false,
                 ffn_down_packed_rows4_matmul: false,
                 ffn_down_gemm4_prefill: false,
@@ -17680,6 +18199,13 @@ mod tests {
                 hybrid_gpu_percent: 10,
             },
         }
+    }
+
+    fn ffn_decode_chain_plan() -> ResolvedRuntimePlan {
+        let mut plan = ffn_gate_up_consumer_plan(true);
+        plan.q8.ffn_decode_chain = true;
+        plan.q8.ffn_down_decode_consumer = true;
+        plan
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -18003,6 +18529,207 @@ mod tests {
         std::env::set_var("CAMELID_MAC_Q8_FFN_GATE_UP_DECODE_CONSUMER", "on");
         assert!(Q8RuntimeFlags::from_env().ffn_gate_up_decode_consumer);
         std::env::remove_var("CAMELID_MAC_Q8_FFN_GATE_UP_DECODE_CONSUMER");
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn x86_q8_ffn_activation_ptr_quantize_is_default_off_and_matches_safe_reference() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        std::env::remove_var("CAMELID_X86_Q8_FFN_ACTIVATION_PTR_QUANTIZE");
+        assert!(!x86_q8_ffn_activation_ptr_quantize_enabled());
+
+        let gate = (0..Q8_0_BLOCK_VALUES * 3)
+            .map(|idx| (idx as f32 - 47.0) * 0.03125)
+            .collect::<Vec<_>>();
+        let up = (0..Q8_0_BLOCK_VALUES * 3)
+            .map(|idx| (19.0 - idx as f32) * 0.0234375)
+            .collect::<Vec<_>>();
+
+        for order in [FfnGateUpOrder::GateUp, FfnGateUpOrder::UpGate] {
+            let safe = quantize_gated_activation_q8_0_blocks_safe(&gate, &up, order);
+            let default_path = quantize_gated_activation_q8_0_blocks(&gate, &up, order);
+            assert_eq!(default_path, safe);
+
+            std::env::set_var("CAMELID_X86_Q8_FFN_ACTIVATION_PTR_QUANTIZE", "on");
+            assert!(x86_q8_ffn_activation_ptr_quantize_enabled());
+            let opted_in = quantize_gated_activation_q8_0_blocks(&gate, &up, order);
+            // SAFETY: the fixture uses equal-length, block-aligned gate/up vectors.
+            let direct_ptr =
+                unsafe { quantize_gated_activation_q8_0_blocks_ptr(&gate, &up, order) };
+            assert_eq!(opted_in, safe);
+            assert_eq!(direct_ptr, safe);
+            std::env::remove_var("CAMELID_X86_Q8_FFN_ACTIVATION_PTR_QUANTIZE");
+        }
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn x86_q8_ffn_decode_chain_is_default_off_and_matches_split_consumers() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        std::env::remove_var("CAMELID_X86_Q8_FFN_DECODE_CHAIN");
+        assert!(!x86_q8_ffn_decode_chain_enabled());
+        assert!(!Q8RuntimeFlags::from_env().ffn_decode_chain);
+
+        let (input, packed_gate, packed_up, _expected_gate_up) = runtime_packed_ffn_gate_up_case();
+        let (_down_input, packed_down, _expected_down) = runtime_packed_ffn_down_case();
+        let plan = ffn_decode_chain_plan();
+
+        assert!(try_q8_ffn_decode_chain_path(
+            &input,
+            &packed_gate,
+            &packed_up,
+            &packed_down,
+            "layer_0_ffn_activated",
+            "layer_0_ffn_down",
+            &ResolvedRuntimePlan {
+                q8: Q8RuntimeFlags {
+                    ffn_decode_chain: false,
+                    ..plan.q8
+                },
+                ..plan
+            },
+        )
+        .unwrap()
+        .is_none());
+
+        std::env::set_var("CAMELID_X86_Q8_FFN_DECODE_CHAIN", "on");
+        assert!(x86_q8_ffn_decode_chain_enabled());
+        assert!(Q8RuntimeFlags::from_env().ffn_decode_chain);
+        std::env::set_var(Q8_SCHEDULE_TELEMETRY_ENV, "on");
+        reset_q8_schedule_telemetry();
+
+        let activated = gated_ffn_activation_with_plan(
+            &input,
+            &packed_gate,
+            &packed_up,
+            "expected_activated",
+            &ffn_gate_up_consumer_plan(true),
+            false,
+        )
+        .unwrap();
+        let expected = linear_for_role_runtime_with_plan(
+            &activated.tensor,
+            &packed_down,
+            "expected_down",
+            "ffn_down",
+            &ffn_down_consumer_plan(true),
+            false,
+        )
+        .unwrap();
+
+        let actual = try_q8_ffn_decode_chain_path(
+            &input,
+            &packed_gate,
+            &packed_up,
+            &packed_down,
+            "layer_0_ffn_activated",
+            "layer_0_ffn_down",
+            &plan,
+        )
+        .unwrap()
+        .expect("x86 FFN decode chain should cover runtime-packed gate/up/down");
+
+        assert_eq!(actual.tensor.shape.dims, expected.shape.dims);
+        assert_slice_close_with_tolerance(&actual.tensor.data, &expected.data, 5e-4);
+        let telemetry = snapshot_q8_schedule_telemetry();
+        assert_eq!(telemetry.ffn_decode_chain_taken, 1);
+        assert!(telemetry.ffn_decode_chain_total_us > 0);
+        assert!(telemetry.ffn_decode_chain_input_quantize_us > 0);
+        assert!(telemetry.ffn_decode_chain_activation_quantize_us > 0);
+        assert!(telemetry.ffn_decode_chain_down_us > 0);
+        assert!(telemetry
+            .output_projection_by_route
+            .contains_key("ffn_gate_up.decode_consumer"));
+        assert!(telemetry
+            .output_projection_by_route
+            .contains_key("ffn_down.x86_decode_consumer"));
+        reset_q8_schedule_telemetry();
+        std::env::remove_var(Q8_SCHEDULE_TELEMETRY_ENV);
+        std::env::remove_var("CAMELID_X86_Q8_FFN_DECODE_CHAIN");
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn mac_q8_ffn_decode_chain_is_default_off_and_matches_split_consumers() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        std::env::remove_var("CAMELID_MAC_Q8_FFN_DECODE_CHAIN");
+        std::env::remove_var("CAMELID_MAC_Q8_FFN_DOWN_DECODE_CONSUMER");
+        assert!(!mac_q8_ffn_decode_chain_enabled());
+
+        let (input, packed_gate, packed_up, _expected_gate_up) = runtime_packed_ffn_gate_up_case();
+        let (_down_input, packed_down, _expected_down) = runtime_packed_ffn_down_case();
+        let plan = ffn_decode_chain_plan();
+
+        assert!(try_mac_q8_ffn_decode_chain_path(
+            &input,
+            &packed_gate,
+            &packed_up,
+            &packed_down,
+            "layer_0_ffn_activated",
+            "layer_0_ffn_down",
+            &plan,
+        )
+        .unwrap()
+        .is_none());
+
+        std::env::set_var("CAMELID_MAC_Q8_FFN_DECODE_CHAIN", "on");
+        std::env::set_var("CAMELID_MAC_Q8_FFN_DOWN_DECODE_CONSUMER", "on");
+        assert!(mac_q8_ffn_decode_chain_enabled());
+        std::env::set_var(Q8_SCHEDULE_TELEMETRY_ENV, "on");
+        reset_q8_schedule_telemetry();
+
+        let activated = gated_ffn_activation_with_plan(
+            &input,
+            &packed_gate,
+            &packed_up,
+            "expected_activated",
+            &ffn_gate_up_consumer_plan(true),
+            false,
+        )
+        .unwrap();
+        let expected = linear_for_role_runtime_with_plan(
+            &activated.tensor,
+            &packed_down,
+            "expected_down",
+            "ffn_down",
+            &ffn_down_consumer_plan(true),
+            false,
+        )
+        .unwrap();
+
+        let actual = try_mac_q8_ffn_decode_chain_path(
+            &input,
+            &packed_gate,
+            &packed_up,
+            &packed_down,
+            "layer_0_ffn_activated",
+            "layer_0_ffn_down",
+            &plan,
+        )
+        .unwrap()
+        .expect("Mac FFN decode chain should cover runtime-packed gate/up/down");
+
+        assert_eq!(actual.tensor.shape.dims, expected.shape.dims);
+        assert_slice_close_with_tolerance(&actual.tensor.data, &expected.data, 1e-6);
+        let telemetry = snapshot_q8_schedule_telemetry();
+        assert_eq!(telemetry.ffn_decode_chain_taken, 1);
+        assert!(telemetry.ffn_decode_chain_total_us > 0);
+        assert!(telemetry.ffn_decode_chain_input_quantize_us > 0);
+        assert!(telemetry.ffn_decode_chain_activation_quantize_us > 0);
+        assert!(telemetry.ffn_decode_chain_down_us > 0);
+        assert!(telemetry
+            .output_projection_by_route
+            .contains_key("ffn_gate_up.decode_consumer"));
+        assert!(telemetry
+            .output_projection_by_route
+            .contains_key("ffn_down.mac_decode_consumer"));
+        reset_q8_schedule_telemetry();
+        std::env::remove_var(Q8_SCHEDULE_TELEMETRY_ENV);
+        std::env::remove_var("CAMELID_MAC_Q8_FFN_DOWN_DECODE_CONSUMER");
+        std::env::remove_var("CAMELID_MAC_Q8_FFN_DECODE_CHAIN");
     }
 
     #[test]
@@ -19177,6 +19904,7 @@ mod tests {
 
         assert_eq!(actual.shape.dims, expected.shape.dims);
         assert_slice_close_with_tolerance(&actual.data, &expected.data, 1.0e-3);
+
         std::env::remove_var("CAMELID_MAC_Q8_PREFILL_I8MM");
         std::env::remove_var("CAMELID_MAC_Q8_REPACK");
         std::env::remove_var("CAMELID_Q8_0_BLOCK_DOT");

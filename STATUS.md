@@ -1,6 +1,6 @@
 # Camelid Status
 
-Last updated: 2026-05-20
+Last updated: 2026-05-22
 
 `STATUS.md` is Camelid's current release-evidence checkpoint. It records what Camelid can prove today, what moved recently, and what still blocks the next support change. Treat it as a briefing memo, not a diary. Detailed historical run logs, older validation slices, and superseded tactical notes now live in [`STATUS_ARCHIVE_2026-04.md`](STATUS_ARCHIVE_2026-04.md).
 
@@ -56,6 +56,21 @@ Two standing rules apply to every row:
 For the formal support ledger, see [`COMPATIBILITY.md`](COMPATIBILITY.md). For sequencing, see [`ROADMAP.md`](ROADMAP.md).
 
 Bottom line for reviewers: Camelid has the original TinyLlama verified support gate plus three exact Llama Q8_0 rows with verified support within validated bounds. Mixtral remains partial runtime evidence only until later-generation divergence and API/WebUI/frontend readiness blockers close.
+
+## Apple Silicon Q8 speed snapshot
+
+The Mac Q8 lane now has a narrow retained same-host speed result worth surfacing, while keeping the production-throughput boundary closed.
+
+- The strongest retained Llama 3.2 3B short-request candidate measured Camelid at about `478 ms` total wall time against llama.cpp at about `530 ms`, improving from the prior Camelid baseline of about `857 ms` total against llama.cpp at about `609 ms`.
+- That result is still default-off and narrow-envelope only. Camelid first-token latency in the same retained candidate was still slower than llama.cpp (`478 ms` vs `290 ms`), and decode-heavy evidence still shows residual first-content/TTFT gaps.
+- Current source work adds deeper post-first-token timing, layer-role timing, output-logits profiling, FFN decode-chain telemetry, and default-off FFN decode-chain route experiments so the remaining gap can be attributed precisely. This is performance instrumentation and experimental routing, not a support-contract expansion.
+
+Boundaries that remain in force:
+
+- No default-on Apple Silicon Q8 acceleration claim.
+- No broad production-throughput claim.
+- No portability claim from Mac evidence.
+- No support expansion for neighboring models, quantizations, contexts, or API/frontend readiness from speed work alone.
 
 ## Ubuntu x86 Q8 acceleration update
 

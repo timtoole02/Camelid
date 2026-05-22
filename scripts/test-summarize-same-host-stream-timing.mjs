@@ -42,6 +42,20 @@ try {
   assert.match(stdout, /q8_fused_gate_up_calls_mean=28\.000/)
   assert.match(stdout, /projection_route_calls_mean=8\.000/)
   assert.match(stdout, /q8_gate_up_decode_consumer_post_route_mean_ms=4\.650/)
+  assert.match(stdout, /q8_ffn_decode_chain_total_mean_ms=12\.000/)
+  assert.match(stdout, /q8_ffn_decode_chain_input_quantize_mean_ms=1\.000/)
+  assert.match(stdout, /q8_ffn_decode_chain_total_gap_mean_ms=1\.000/)
+  assert.match(stdout, /q8_ffn_decode_chain_accounting=stage_consistent_decode_chain_residual/)
+  assert.match(stdout, /generation_ffn_decode_chain_role_minus_total_mean_ms=201\.000/)
+  assert.match(stdout, /first_token_plus_post_first_generation_ffn_decode_chain_role_mean_ms=30\.000/)
+  assert.match(stdout, /first_token_plus_post_first_generation_ffn_decode_chain_role_minus_total_mean_ms=18\.000/)
+  assert.match(stdout, /output_logits_prompt_eval_mean_ms=12\.000/)
+  assert.match(stdout, /output_logits_decode_role_mean_ms=20\.000/)
+  assert.match(stdout, /output_logits_q8_route_mean_ms=18\.000/)
+  assert.match(stdout, /output_logits_generation_role_minus_q8_route_mean_ms=-3\.000/)
+  assert.match(stdout, /output_logits_first_token_minus_prompt_eval_mean_ms=-7\.000/)
+  assert.match(stdout, /output_logits_decode_role_minus_q8_route_mean_ms=2\.000/)
+  assert.match(stdout, /output_logits_accounting=output_logits_route_accounted/)
   assert.match(stdout, /1\. generation\.ffn_down mean=92\.000ms/)
   assert.match(stdout, /1\. ffn_down gemm_mean=70\.000ms pack_mean=7\.000ms calls_mean=28\.000/)
   assert.match(stdout, /1\. logits\.q8_0_borrowed_packed_rows4 elapsed_mean=18\.000ms calls_mean=8\.000/)
@@ -82,6 +96,11 @@ try {
   assert.equal(report.aggregate.q8_fused_gate_up_calls.mean, 28)
   assert.equal(report.aggregate.q8_gate_up_decode_consumer_activation_us.mean, 4200)
   assert.equal(report.aggregate.q8_gate_up_decode_consumer_tensor_us.mean, 450)
+  assert.equal(report.aggregate.q8_ffn_decode_chain_taken.mean, 28)
+  assert.equal(report.aggregate.q8_ffn_decode_chain_total_us.mean, 12000)
+  assert.equal(report.aggregate.q8_ffn_decode_chain_input_quantize_us.mean, 1000)
+  assert.equal(report.aggregate.q8_ffn_decode_chain_activation_quantize_us.mean, 2000)
+  assert.equal(report.aggregate.q8_ffn_decode_chain_down_us.mean, 3000)
   assert.equal(report.q8_gate_up_decode_consumer_overhead.total_ms_mean, 4.65)
   assert.equal(report.aggregate.projection_route_calls.mean, 8)
   assert.equal(report.aggregate.output_projection_calls.mean, 8)
@@ -127,6 +146,21 @@ try {
   assert.equal(report.layer_route_role_gaps[0].role_elapsed_ms.mean, 7)
   assert.equal(report.layer_route_role_gaps[0].role_minus_route_ms.mean, 1)
   assert.deepEqual(report.layer_route_role_gaps[0].matched_roles, ['ffn_down'])
+  assert.equal(report.ffn_decode_chain_gaps.q8_chain_total_ms.mean, 12)
+  assert.equal(report.ffn_decode_chain_gaps.q8_chain_total_minus_route_ms.mean, 1)
+  assert.equal(report.ffn_decode_chain_gaps.generation_role_minus_q8_chain_total_ms.mean, 201)
+  assert.equal(report.ffn_decode_chain_gaps.first_token_plus_post_first_generation_role_ms.mean, 30)
+  assert.equal(report.ffn_decode_chain_gaps.first_token_plus_post_first_generation_role_minus_q8_chain_total_ms.mean, 18)
+  assert.equal(report.ffn_decode_chain_gaps.accounting, 'stage_consistent_decode_chain_residual')
+  assert.equal(report.output_logits_profile.prompt_eval_logits_ms.mean, 12)
+  assert.equal(report.output_logits_profile.decode_logits_role_ms.mean, 20)
+  assert.equal(report.output_logits_profile.q8_logits_route_ms.mean, 18)
+  assert.equal(report.output_logits_profile.generation_logits_role_minus_q8_route_ms.mean, -3)
+  assert.equal(report.output_logits_profile.first_token_logits_minus_prompt_eval_logits_ms.mean, -7)
+  assert.equal(report.output_logits_profile.decode_logits_role_minus_q8_route_ms.mean, 2)
+  assert.equal(report.output_logits_profile.accounting, 'output_logits_route_accounted')
+  assert.equal(report.output_logits_profile.top_route_gap_runs[0].label, 'camelid-measure-1')
+  assert.equal(report.output_logits_profile.top_prompt_eval_logits_runs[0].prompt_eval_logits_ms, 13)
   assert.equal(report.role_focus[0].role, 'attention_output')
   assert.equal(report.role_focus[0].total_mean_ms, 41)
   assert.equal(report.role_focus.find((row) => row.role === 'logits').total_mean_ms, 20)
@@ -145,6 +179,8 @@ try {
   assert.equal(report.runs[1].backend_first_content_delta_vs_llama_cpp_ms, 50)
   assert.equal(report.runs[1].q8_total_gemm_us, 126000)
   assert.equal(report.runs[1].q8_fused_gate_up_calls, 28)
+  assert.equal(report.runs[1].q8_ffn_decode_chain_total_us, 12000)
+  assert.equal(report.runs[1].q8_ffn_decode_chain_input_quantize_us, 1000)
   assert.equal(report.runs[1].projection_route_calls, 8)
   assert.equal(report.runs[1].output_projection_calls, 8)
   assert.equal(report.runs[1].projection_routes['logits.q8_0_borrowed_packed_rows4'].elapsed_us, 18000)
@@ -206,6 +242,11 @@ function run(label, firstByte, backendFirstContent, clientTtft, generate, residu
         i8mm_fused_gate_up_calls: 28,
         ffn_gate_up_decode_consumer_activation_us: 4200,
         ffn_gate_up_decode_consumer_tensor_us: 450,
+        ffn_decode_chain_taken: 28,
+        ffn_decode_chain_total_us: 12000,
+        ffn_decode_chain_input_quantize_us: 1000,
+        ffn_decode_chain_activation_quantize_us: 2000,
+        ffn_decode_chain_down_us: 3000,
         q8_gemm_compute_us: 126000,
         activation_quantize_pack_us: 12600,
         i8mm_single_projection_by_role: {
@@ -217,6 +258,24 @@ function run(label, firstByte, backendFirstContent, clientTtft, generate, residu
         },
         projection_route_calls: 8,
         projection_routes: {
+          'ffn_gate_up.decode_consumer': {
+            role: 'ffn_gate_up',
+            route: 'decode_consumer',
+            calls: 28,
+            rows: 28,
+            input_width: 3072,
+            output_width: 8192,
+            elapsed_us: 6000,
+          },
+          'ffn_down.mac_decode_consumer': {
+            role: 'ffn_down',
+            route: 'mac_decode_consumer',
+            calls: 28,
+            rows: 28,
+            input_width: 8192,
+            output_width: 3072,
+            elapsed_us: 3000,
+          },
           'ffn_down.x86_vnni_decode_consumer': {
             role: 'ffn_down',
             route: 'x86_vnni_decode_consumer',
@@ -324,6 +383,12 @@ function run(label, firstByte, backendFirstContent, clientTtft, generate, residu
           ffn_up: 61,
           ffn_down: 92,
           logits: 15,
+        },
+        post_first_token_generation_role_timings: {
+          ffn_gate: 4,
+          ffn_up: 4,
+          ffn_activation: 1,
+          ffn_down: 5,
         },
         layer_role_hotspots: {
           prefill: [
