@@ -27,9 +27,8 @@ use q8_runtime::{
     q8_0_env_flag_enabled_default_on_fail_closed, Q8RuntimeFlags, ResolvedRuntimePlan,
 };
 use q8_telemetry::{
-    add_q8_schedule_counter,
-    record_q8_schedule_output_projection_route_call, record_q8_schedule_projection_route_denial,
-    record_q8_schedule_projection_route_elapsed,
+    add_q8_schedule_counter, record_q8_schedule_output_projection_route_call,
+    record_q8_schedule_projection_route_denial, record_q8_schedule_projection_route_elapsed,
     Q8_SCHED_FFN_DECODE_CHAIN_ACTIVATION_QUANTIZE_US, Q8_SCHED_FFN_DECODE_CHAIN_DOWN_US,
     Q8_SCHED_FFN_DECODE_CHAIN_INPUT_QUANTIZE_US, Q8_SCHED_FFN_DECODE_CHAIN_TAKEN,
     Q8_SCHED_FFN_DECODE_CHAIN_TOTAL_US, Q8_SCHED_FFN_DOWN_DECODE_CONSUMER_TAKEN,
@@ -49,6 +48,13 @@ use q8_telemetry::{
     Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_ACTIVATION_US,
     Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_TENSOR_US, Q8_SCHED_PREFILL_SINGLE_TOKEN_FALLBACKS,
 };
+#[cfg(test)]
+use q8_telemetry::{q8_schedule_layer_index_for_projection_name, Q8_SCHEDULE_TELEMETRY_ENV};
+pub use q8_telemetry::{
+    q8_schedule_telemetry_enabled, reset_q8_schedule_telemetry, snapshot_q8_schedule_telemetry,
+    LlamaQ8OutputProjectionLayerRouteTelemetry, LlamaQ8OutputProjectionRouteTelemetry,
+    LlamaQ8ProjectionRouteDenialTelemetry, LlamaQ8ScheduleRoleTelemetry, LlamaQ8ScheduleTelemetry,
+};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use q8_telemetry::{
     record_q8_schedule_activation_pack, record_q8_schedule_i8mm_single_projection_role_call,
@@ -58,13 +64,6 @@ use q8_telemetry::{
     record_q8_schedule_i8mm_single_projection_role_tail, Q8_SCHED_CONSERVATIVE_TAIL_ROWS,
     Q8_SCHED_I8MM_FUSED_GATE_UP_CALLS, Q8_SCHED_I8MM_SINGLE_PROJECTION_CALLS,
     Q8_SCHED_Q8_GEMM_COMPUTE_US, Q8_SCHED_RAYON_FANOUT_BOUNDARIES,
-};
-#[cfg(test)]
-use q8_telemetry::{q8_schedule_layer_index_for_projection_name, Q8_SCHEDULE_TELEMETRY_ENV};
-pub use q8_telemetry::{
-    q8_schedule_telemetry_enabled, reset_q8_schedule_telemetry, snapshot_q8_schedule_telemetry,
-    LlamaQ8OutputProjectionLayerRouteTelemetry, LlamaQ8OutputProjectionRouteTelemetry,
-    LlamaQ8ProjectionRouteDenialTelemetry, LlamaQ8ScheduleRoleTelemetry, LlamaQ8ScheduleTelemetry,
 };
 pub use rope::{
     diagnostic_rope_direction, diagnostic_rope_pairing, diagnostic_rope_position_mode,
