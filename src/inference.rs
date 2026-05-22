@@ -8887,6 +8887,16 @@ fn record_q8_ffn_down_vnni_decode_reject(
     );
 }
 
+fn q8_ffn_down_vnni_decode_route_name() -> &'static str {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        if x86_q8_vnni_decode_rawptr_enabled() {
+            return "x86_vnni_decode_rawptr_consumer";
+        }
+    }
+    "x86_vnni_decode_consumer"
+}
+
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn x86_q8_vnni_decode_cpu_supported() -> bool {
     x86_q8_vnni_decode_avx512_supported() || std::arch::is_x86_feature_detected!("avx2")
@@ -11405,7 +11415,7 @@ fn try_x86_q8_ffn_down_decode_consumer_path(
             add_q8_schedule_counter(&Q8_SCHED_FFN_DOWN_VNNI_DECODE_TAKEN, 1);
             record_q8_schedule_projection_route_elapsed(
                 "ffn_down",
-                "x86_vnni_decode_consumer",
+                q8_ffn_down_vnni_decode_route_name(),
                 name,
                 1,
                 route.input_width,

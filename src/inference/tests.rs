@@ -4107,6 +4107,45 @@ fn q8_ffn_down_vnni_decode_rawptr_matches_rows4_decode_baseline() {
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
+fn q8_ffn_down_vnni_decode_rawptr_records_selected_route() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+    if !x86_q8_vnni_decode_cpu_supported() {
+        std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE");
+        std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR");
+        return;
+    }
+    std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR", "on");
+    std::env::set_var(Q8_SCHEDULE_TELEMETRY_ENV, "on");
+    reset_q8_schedule_telemetry();
+    let (input, packed_weight, _expected) = runtime_vnni_packed_ffn_down_case();
+
+    let _ = try_x86_q8_ffn_down_decode_consumer_path(
+        &input,
+        &packed_weight,
+        "layer_11_ffn_down",
+        "ffn_down",
+        &ffn_down_vnni_decode_plan(true),
+    )
+    .unwrap()
+    .expect("rawptr VNNI FFN-down decode output");
+
+    let telemetry = snapshot_q8_schedule_telemetry();
+    assert_eq!(telemetry.ffn_down_vnni_decode_taken, 1);
+    assert!(telemetry
+        .output_projection_by_route
+        .contains_key("ffn_down.x86_vnni_decode_rawptr_consumer"));
+    assert!(telemetry
+        .output_projection_by_layer_route
+        .contains_key("layer_11.ffn_down.x86_vnni_decode_rawptr_consumer"));
+    reset_q8_schedule_telemetry();
+    std::env::remove_var(Q8_SCHEDULE_TELEMETRY_ENV);
+    std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR");
+    std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE");
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
 fn q8_ffn_down_vnni_decode_rawptr_avx2_matches_rows4_decode_baseline() {
     let _env_guard = env_lock();
     clear_dense_diagnostic_env();
