@@ -745,7 +745,19 @@ impl LlamaLoadedWeights {
         )?;
         let output_norm = store.load_cpu_f32(&binding.output_norm.name)?;
         let output = if binding.output_is_tied_embedding {
-            None
+            if auto_retain_q8_0_blocks {
+                Some(store.load_q8_0_block_backed_linear_as(
+                    &binding.token_embedding.name,
+                    "output.weight",
+                )?)
+            } else if lazy_q8_0_linear_enabled() {
+                Some(store.load_q8_0_file_backed_tensor_as(
+                    &binding.token_embedding.name,
+                    "output.weight",
+                )?)
+            } else {
+                None
+            }
         } else {
             Some(load_linear(&binding.output.name)?)
         };

@@ -2647,25 +2647,39 @@ impl TensorStore {
     }
 
     pub fn load_q8_0_block_backed_linear(&self, name: &str) -> Result<CpuTensor> {
-        let desc = self.descriptor(name)?.clone();
+        self.load_q8_0_block_backed_linear_as(name, name)
+    }
+
+    pub fn load_q8_0_block_backed_linear_as(
+        &self,
+        source_name: &str,
+        tensor_name: &str,
+    ) -> Result<CpuTensor> {
+        let desc = self.descriptor(source_name)?.clone();
         if desc.tensor_type != GgufTensorType::Q8_0 {
-            return self.load_cpu_f32(name);
+            let mut tensor = self.load_cpu_f32(source_name)?;
+            tensor.name = tensor_name.to_string();
+            return Ok(tensor);
         }
         let shape = TensorShape::from_gguf_dims(&desc.dimensions)?;
         if shape.dims.len() != 2 {
-            return self.load_cpu_f32(name);
+            let mut tensor = self.load_cpu_f32(source_name)?;
+            tensor.name = tensor_name.to_string();
+            return Ok(tensor);
         }
         let expected_elements = shape.element_count()?;
-        let bytes = self.tensor_bytes(name)?;
+        let bytes = self.tensor_bytes(source_name)?;
         if let Some(Q8_0RuntimeStorage::PackedRows4(packed)) =
-            q8_0_runtime_packed_rows4_for_tensor(name, &shape, &bytes)?
+            q8_0_runtime_packed_rows4_for_tensor(tensor_name, &shape, &bytes)?
         {
             return Ok(CpuTensor::q8_0_runtime_packed_rows4_linear(
-                name, shape, packed,
+                tensor_name,
+                shape,
+                packed,
             ));
         }
-        let blocks = decode_q8_0_blocks(name, &bytes, expected_elements)?;
-        CpuTensor::from_q8_0_blocks(name, shape, blocks)
+        let blocks = decode_q8_0_blocks(source_name, &bytes, expected_elements)?;
+        CpuTensor::from_q8_0_blocks(tensor_name, shape, blocks)
     }
 
     pub fn load_q8_0_split_file_backed_tensor(
@@ -2722,29 +2736,41 @@ impl TensorStore {
     }
 
     pub fn load_q8_0_file_backed_tensor(&self, name: &str) -> Result<CpuTensor> {
-        let desc = self.descriptor(name)?.clone();
+        self.load_q8_0_file_backed_tensor_as(name, name)
+    }
+
+    pub fn load_q8_0_file_backed_tensor_as(
+        &self,
+        source_name: &str,
+        tensor_name: &str,
+    ) -> Result<CpuTensor> {
+        let desc = self.descriptor(source_name)?.clone();
         if desc.tensor_type != GgufTensorType::Q8_0 {
-            return self.load_cpu_f32(name);
+            let mut tensor = self.load_cpu_f32(source_name)?;
+            tensor.name = tensor_name.to_string();
+            return Ok(tensor);
         }
         let shape = TensorShape::from_gguf_dims(&desc.dimensions)?;
         let expected_elements = shape.element_count()?;
         if expected_elements % 32 != 0 {
             return Err(BackendError::InvalidTensorData(format!(
-                "tensor {name} Q8_0 element count {expected_elements} is not block aligned"
+                "tensor {source_name} Q8_0 element count {expected_elements} is not block aligned"
             )));
         }
-        if q8_repack_tensor_enabled(name) {
-            let bytes = self.tensor_bytes(name)?;
+        if q8_repack_tensor_enabled(tensor_name) {
+            let bytes = self.tensor_bytes(source_name)?;
             if let Some(Q8_0RuntimeStorage::PackedRows4(packed)) =
-                q8_0_runtime_packed_rows4_for_tensor(name, &shape, &bytes)?
+                q8_0_runtime_packed_rows4_for_tensor(tensor_name, &shape, &bytes)?
             {
                 return Ok(CpuTensor::q8_0_runtime_packed_rows4_linear(
-                    name, shape, packed,
+                    tensor_name,
+                    shape,
+                    packed,
                 ));
             }
         }
         let mut tensor = CpuTensor::q8_0_file_backed_linear(
-            name,
+            tensor_name,
             shape.clone(),
             Q8_0FileBacking::new(
                 self.path.clone(),
@@ -2752,19 +2778,19 @@ impl TensorStore {
                 expected_elements / 32,
             ),
         );
-        if q8_0_packed_rows4_enabled_for_tensor(name, Q8_0PackedRows4Interleave::I4)
-            || q8_0_packed_rows4_enabled_for_tensor(name, Q8_0PackedRows4Interleave::I8)
+        if q8_0_packed_rows4_enabled_for_tensor(tensor_name, Q8_0PackedRows4Interleave::I4)
+            || q8_0_packed_rows4_enabled_for_tensor(tensor_name, Q8_0PackedRows4Interleave::I8)
         {
-            let bytes = self.tensor_bytes(name)?;
-            let blocks = decode_q8_0_blocks(name, &bytes, expected_elements)?;
+            let bytes = self.tensor_bytes(source_name)?;
+            let blocks = decode_q8_0_blocks(source_name, &bytes, expected_elements)?;
             tensor.q8_0_packed_rows4_4x4 = q8_0_packed_rows4_for_shape(
-                name,
+                tensor_name,
                 &shape,
                 Some(&blocks),
                 Q8_0PackedRows4Interleave::I4,
             )?;
             tensor.q8_0_packed_rows4_4x8 = q8_0_packed_rows4_for_shape(
-                name,
+                tensor_name,
                 &shape,
                 Some(&blocks),
                 Q8_0PackedRows4Interleave::I8,
@@ -3363,6 +3389,76 @@ mod tests {
             super::Q8_0PackedRows4Interleave::I8
         );
 
+        std::env::remove_var("CAMELID_X86_Q8_REPACK");
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn q8_x86_repack_materializes_tied_embedding_as_output_runtime_storage() {
+        let _env_guard = env_lock();
+        std::env::remove_var("CAMELID_Q8_0_BLOCK_DOT");
+        std::env::set_var("CAMELID_X86_Q8_REPACK", "on");
+
+        let source_shape = TensorShape { dims: vec![32, 64] };
+        let rows = 64;
+        let blocks_per_row = 1;
+        let mut bytes = Vec::with_capacity(rows * blocks_per_row * Q8_0_BLOCK_BYTES);
+        for row in 0..rows {
+            bytes.extend_from_slice(&(0x3000_u16 + row as u16).to_le_bytes());
+            bytes.extend((0..32).map(|idx| (idx as i8).wrapping_sub(row as i8) as u8));
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "camelid-tied-output-q8-{}-{}.bin",
+            std::process::id(),
+            rows
+        ));
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&path).unwrap();
+            file.write_all(&bytes).unwrap();
+        }
+        let gguf = crate::gguf::GgufFile {
+            path: path.clone(),
+            version: 3,
+            tensor_count: 1,
+            metadata_count: 0,
+            alignment: 32,
+            data_start_offset: 0,
+            metadata: std::collections::BTreeMap::new(),
+            tensors: vec![crate::gguf::GgufTensorDescriptor {
+                name: "token_embd.weight".to_string(),
+                dimensions: source_shape.dims.iter().map(|dim| *dim as u64).collect(),
+                tensor_type: crate::gguf::GgufTensorType::Q8_0,
+                relative_offset: 0,
+                absolute_offset: 0,
+                n_bytes: bytes.len() as u64,
+            }],
+        };
+        let store = super::TensorStore::open(&path, &gguf);
+
+        let embedding = store
+            .load_q8_0_file_backed_tensor("token_embd.weight")
+            .unwrap();
+        assert_eq!(embedding.name, "token_embd.weight");
+        assert!(embedding.q8_0_runtime_storage.is_none());
+        assert!(embedding.q8_0_file_backing.is_some());
+
+        let output = store
+            .load_q8_0_file_backed_tensor_as("token_embd.weight", "output.weight")
+            .unwrap();
+        assert_eq!(output.name, "output.weight");
+        assert_eq!(output.shape, source_shape);
+        assert!(output.q8_0_file_backing.is_none());
+        let Some(super::Q8_0RuntimeStorage::PackedRows4(packed)) = output.q8_0_runtime_storage
+        else {
+            panic!("expected tied output alias to materialize output-compatible rows4 storage");
+        };
+        assert_eq!(packed.rows, rows);
+        assert_eq!(packed.blocks_per_row, blocks_per_row);
+        assert_eq!(packed.interleave, Q8_0PackedRows4Interleave::I8);
+
+        std::fs::remove_file(path).unwrap();
         std::env::remove_var("CAMELID_X86_Q8_REPACK");
     }
 
