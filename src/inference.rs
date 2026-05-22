@@ -9501,14 +9501,14 @@ fn q8_0_packed_rows4_single_input_projection_into_with_decode_chunking(
 fn x86_q8_packed_rows4_decode_rawptr_avx2_enabled() -> bool {
     #[cfg(test)]
     {
-        q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PACKED_ROWS4_DECODE_RAWPTR_AVX2")
+        !q8_0_env_flag_disabled("CAMELID_X86_Q8_PACKED_ROWS4_DECODE_RAWPTR_AVX2")
             && std::arch::is_x86_feature_detected!("avx2")
     }
     #[cfg(not(test))]
     {
         static X86_Q8_PACKED_ROWS4_DECODE_RAWPTR_AVX2_ENABLED: OnceLock<bool> = OnceLock::new();
         *X86_Q8_PACKED_ROWS4_DECODE_RAWPTR_AVX2_ENABLED.get_or_init(|| {
-            q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PACKED_ROWS4_DECODE_RAWPTR_AVX2")
+            !q8_0_env_flag_disabled("CAMELID_X86_Q8_PACKED_ROWS4_DECODE_RAWPTR_AVX2")
                 && std::arch::is_x86_feature_detected!("avx2")
         })
     }
@@ -9635,10 +9635,12 @@ fn q8_0_packed_rows4_single_input_projection_pair_into_with_decode_chunking(
         let group_start = group_idx * blocks_per_row;
         let left_blocks = &left_packed.blocks[group_start..group_start + blocks_per_row];
         let right_blocks = &right_packed.blocks[group_start..group_start + blocks_per_row];
-        let left_sums =
-            q8_0_packed_rows4_dot_i8_matmul(left_blocks, quantized_input, use_hoisted_avx2);
-        let right_sums =
-            q8_0_packed_rows4_dot_i8_matmul(right_blocks, quantized_input, use_hoisted_avx2);
+        let (left_sums, right_sums) = q8_0_packed_rows4_dot_i8_matmul_pair(
+            left_blocks,
+            right_blocks,
+            quantized_input,
+            use_hoisted_avx2,
+        );
         left_chunk.copy_from_slice(&left_sums);
         right_chunk.copy_from_slice(&right_sums);
     };
@@ -14150,8 +14152,12 @@ fn q8_0_packed_rows4_dot_i8_matmul(
             // `x86_q8_packed_rows4_avx512vnni_dpwssd_dot_enabled` confirms support.
             return unsafe { q8_0_packed_rows4_dot_i8_avx512vnni_dpwssd(packed_blocks, input) };
         }
-        if use_hoisted_avx2 {
-            // SAFETY: `use_hoisted_avx2` is only true after runtime AVX2 detection.
+        if (use_hoisted_avx2
+            || x86_q8_packed_rows4_avx2_dot_enabled()
+            || x86_q8_kernel_avx2_enabled())
+            && std::arch::is_x86_feature_detected!("avx2")
+        {
+            // SAFETY: runtime feature detection confirms AVX2 support.
             return unsafe { q8_0_packed_rows4_dot_i8_avx2(packed_blocks, input) };
         }
     }

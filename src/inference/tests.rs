@@ -287,6 +287,15 @@ fn x86_q8_avx2_packed_rows4_hoisted_matmul_matches_scalar_dot() {
     );
     assert_eq!(actual, expected);
     std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_HOIST");
+
+    std::env::set_var("CAMELID_X86_Q8_KERNEL", "avx2");
+    let actual = q8_0_packed_rows4_dot_i8_matmul(
+        std::slice::from_ref(&packed_block),
+        std::slice::from_ref(&input_block),
+        false,
+    );
+    assert_eq!(actual, expected);
+    std::env::remove_var("CAMELID_X86_Q8_KERNEL");
 }
 
 #[test]
@@ -336,9 +345,10 @@ fn x86_q8_avx2_packed_rows4_decode_hoist_projection_matches_scalar_dot() {
 #[test]
 fn x86_q8_packed_rows4_decode_rawptr_avx2_matches_scalar_projection() {
     let _env_guard = env_lock();
-    std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_DECODE_RAWPTR_AVX2");
+    std::env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_DECODE_RAWPTR_AVX2", "off");
     assert!(!x86_q8_packed_rows4_decode_rawptr_avx2_enabled());
     if !std::arch::is_x86_feature_detected!("avx2") {
+        std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_DECODE_RAWPTR_AVX2");
         return;
     }
 
@@ -382,6 +392,9 @@ fn x86_q8_packed_rows4_decode_rawptr_avx2_matches_scalar_projection() {
     let mut expected = vec![0.0_f32; rows];
     q8_0_packed_rows4_single_input_projection_into(&packed, &quantized_input, &mut expected)
         .unwrap();
+
+    std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_DECODE_RAWPTR_AVX2");
+    assert!(x86_q8_packed_rows4_decode_rawptr_avx2_enabled());
 
     std::env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_DECODE_RAWPTR_AVX2", "on");
     assert!(x86_q8_packed_rows4_decode_rawptr_avx2_enabled());
