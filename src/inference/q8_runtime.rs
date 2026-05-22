@@ -19,6 +19,7 @@ pub(super) struct Q8RuntimeFlags {
     pub(super) ffn_gate_up_decode_group_chunking: bool,
     pub(super) ffn_gate_up_decode_fused_activation: bool,
     pub(super) ffn_gate_up_decode_paired_dot: bool,
+    pub(super) ffn_decode_chain: bool,
     pub(super) ffn_gate_up_packed_rows4_matmul: bool,
     pub(super) ffn_gate_up_single_owner: bool,
     pub(super) ffn_down_decode_consumer: bool,
@@ -96,6 +97,7 @@ impl Q8RuntimeFlags {
             ffn_gate_up_decode_paired_dot: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT",
             ),
+            ffn_decode_chain: q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_FFN_DECODE_CHAIN"),
             ffn_gate_up_packed_rows4_matmul: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL",
             ),

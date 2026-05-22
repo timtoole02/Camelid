@@ -1125,6 +1125,11 @@ static Q8_SCHED_I8MM_FUSED_GATE_UP_CALLS: AtomicU64 = AtomicU64::new(0);
 static Q8_SCHED_OUTPUT_PROJECTION_CALLS: AtomicU64 = AtomicU64::new(0);
 static Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_ACTIVATION_US: AtomicU64 = AtomicU64::new(0);
 static Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_TENSOR_US: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_FFN_DECODE_CHAIN_TAKEN: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_FFN_DECODE_CHAIN_TOTAL_US: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_FFN_DECODE_CHAIN_INPUT_QUANTIZE_US: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_FFN_DECODE_CHAIN_ACTIVATION_QUANTIZE_US: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_FFN_DECODE_CHAIN_DOWN_US: AtomicU64 = AtomicU64::new(0);
 static Q8_SCHED_ACTIVATION_PACK_CALLS: AtomicU64 = AtomicU64::new(0);
 static Q8_SCHED_ACTIVATION_PACK_ROWS: AtomicU64 = AtomicU64::new(0);
 static Q8_SCHED_ACTIVATION_PACK_BYTES_REQUESTED: AtomicU64 = AtomicU64::new(0);
@@ -1184,6 +1189,11 @@ pub fn reset_q8_schedule_telemetry() {
     Q8_SCHED_OUTPUT_PROJECTION_CALLS.store(0, Ordering::Relaxed);
     Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_ACTIVATION_US.store(0, Ordering::Relaxed);
     Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_TENSOR_US.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_DECODE_CHAIN_TAKEN.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_DECODE_CHAIN_TOTAL_US.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_DECODE_CHAIN_INPUT_QUANTIZE_US.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_DECODE_CHAIN_ACTIVATION_QUANTIZE_US.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_DECODE_CHAIN_DOWN_US.store(0, Ordering::Relaxed);
     Q8_SCHED_ACTIVATION_PACK_CALLS.store(0, Ordering::Relaxed);
     Q8_SCHED_ACTIVATION_PACK_ROWS.store(0, Ordering::Relaxed);
     Q8_SCHED_ACTIVATION_PACK_BYTES_REQUESTED.store(0, Ordering::Relaxed);
@@ -1276,6 +1286,13 @@ pub fn snapshot_q8_schedule_telemetry() -> LlamaQ8ScheduleTelemetry {
             Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_ACTIVATION_US.load(Ordering::Relaxed),
         ffn_gate_up_decode_consumer_tensor_us: Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_TENSOR_US
             .load(Ordering::Relaxed),
+        ffn_decode_chain_taken: Q8_SCHED_FFN_DECODE_CHAIN_TAKEN.load(Ordering::Relaxed),
+        ffn_decode_chain_total_us: Q8_SCHED_FFN_DECODE_CHAIN_TOTAL_US.load(Ordering::Relaxed),
+        ffn_decode_chain_input_quantize_us: Q8_SCHED_FFN_DECODE_CHAIN_INPUT_QUANTIZE_US
+            .load(Ordering::Relaxed),
+        ffn_decode_chain_activation_quantize_us: Q8_SCHED_FFN_DECODE_CHAIN_ACTIVATION_QUANTIZE_US
+            .load(Ordering::Relaxed),
+        ffn_decode_chain_down_us: Q8_SCHED_FFN_DECODE_CHAIN_DOWN_US.load(Ordering::Relaxed),
         activation_pack_calls: Q8_SCHED_ACTIVATION_PACK_CALLS.load(Ordering::Relaxed),
         activation_pack_rows: Q8_SCHED_ACTIVATION_PACK_ROWS.load(Ordering::Relaxed),
         activation_pack_bytes_requested: Q8_SCHED_ACTIVATION_PACK_BYTES_REQUESTED
@@ -3890,61 +3907,100 @@ fn forward_layer_timed(
             ffn_out, None, None, None, None, None, None, None, None, false,
         )
     } else {
-        let activated = gated_ffn_activation_with_plan(
-            &ffn_norm,
-            &layer.ffn_gate,
-            &layer.ffn_up,
-            format!("layer_{layer_idx}_ffn_activated"),
-            runtime_plan,
-            collect_diagnostics,
-        )?;
-        timings.ffn_gate = activated.gate;
-        timings.ffn_up = activated.up;
-        timings.ffn_activation = activated.activation;
-        let ffn_gate_stats = activated.gate_stats;
-        let ffn_up_stats = activated.up_stats;
-        let ffn_gate_diagnostic = activated.gate_diagnostic;
-        let ffn_up_diagnostic = activated.up_diagnostic;
-        let ffn_activation_diagnostic = activated.activation_diagnostic;
-        let activated = activated.tensor;
-        let ffn_activation_stats = collect_diagnostics
-            .then(|| LlamaTensorStats::from_tensor(&activated))
-            .transpose()?;
-        if let Some(memory) = &mut memory {
-            memory.record_after_ffn_activation(capture_memory_sample(kv_cache));
-        }
-        trace_forward_layer_memory(layer_idx, "ffn_gate_up_activation_done");
-        let started = Instant::now();
-        let ffn_out = linear_for_role_runtime_with_plan(
-            &activated,
-            &layer.ffn_down,
-            format!("layer_{layer_idx}_ffn_down"),
-            "ffn_down",
-            runtime_plan,
-            collect_diagnostics,
-        )?;
-        let ffn_out_already_residual = false;
-        let ffn_output_stats = collect_diagnostics
-            .then(|| LlamaTensorStats::from_tensor(&ffn_out))
-            .transpose()?;
-        let ffn_down_diagnostic = collect_diagnostics
+        let activated_name = format!("layer_{layer_idx}_ffn_activated");
+        let down_name = format!("layer_{layer_idx}_ffn_down");
+        if let Some(fused) = (!collect_diagnostics)
             .then(|| {
-                linear_projection_diagnostics(&activated, &layer.ffn_down, &ffn_out, "ffn_down")
+                try_x86_q8_ffn_decode_chain_path(
+                    &ffn_norm,
+                    &layer.ffn_gate,
+                    &layer.ffn_up,
+                    &layer.ffn_down,
+                    &activated_name,
+                    &down_name,
+                    runtime_plan,
+                )
             })
-            .transpose()?;
-        timings.ffn_down = started.elapsed().as_micros();
-        (
-            ffn_out,
-            ffn_gate_stats,
-            ffn_up_stats,
-            ffn_gate_diagnostic,
-            ffn_up_diagnostic,
-            ffn_activation_diagnostic,
-            ffn_activation_stats,
-            ffn_down_diagnostic,
-            ffn_output_stats,
-            ffn_out_already_residual,
-        )
+            .transpose()?
+            .flatten()
+        {
+            timings.ffn_gate = fused.gate;
+            timings.ffn_up = fused.up;
+            timings.ffn_activation = fused.activation;
+            timings.ffn_down = fused.down;
+            if let Some(memory) = &mut memory {
+                memory.record_after_ffn_activation(capture_memory_sample(kv_cache));
+            }
+            trace_forward_layer_memory(layer_idx, "ffn_gate_up_activation_done");
+            (
+                fused.tensor,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+        } else {
+            let activated = gated_ffn_activation_with_plan(
+                &ffn_norm,
+                &layer.ffn_gate,
+                &layer.ffn_up,
+                activated_name,
+                runtime_plan,
+                collect_diagnostics,
+            )?;
+            timings.ffn_gate = activated.gate;
+            timings.ffn_up = activated.up;
+            timings.ffn_activation = activated.activation;
+            let ffn_gate_stats = activated.gate_stats;
+            let ffn_up_stats = activated.up_stats;
+            let ffn_gate_diagnostic = activated.gate_diagnostic;
+            let ffn_up_diagnostic = activated.up_diagnostic;
+            let ffn_activation_diagnostic = activated.activation_diagnostic;
+            let activated = activated.tensor;
+            let ffn_activation_stats = collect_diagnostics
+                .then(|| LlamaTensorStats::from_tensor(&activated))
+                .transpose()?;
+            if let Some(memory) = &mut memory {
+                memory.record_after_ffn_activation(capture_memory_sample(kv_cache));
+            }
+            trace_forward_layer_memory(layer_idx, "ffn_gate_up_activation_done");
+            let started = Instant::now();
+            let ffn_out = linear_for_role_runtime_with_plan(
+                &activated,
+                &layer.ffn_down,
+                down_name,
+                "ffn_down",
+                runtime_plan,
+                collect_diagnostics,
+            )?;
+            let ffn_out_already_residual = false;
+            let ffn_output_stats = collect_diagnostics
+                .then(|| LlamaTensorStats::from_tensor(&ffn_out))
+                .transpose()?;
+            let ffn_down_diagnostic = collect_diagnostics
+                .then(|| {
+                    linear_projection_diagnostics(&activated, &layer.ffn_down, &ffn_out, "ffn_down")
+                })
+                .transpose()?;
+            timings.ffn_down = started.elapsed().as_micros();
+            (
+                ffn_out,
+                ffn_gate_stats,
+                ffn_up_stats,
+                ffn_gate_diagnostic,
+                ffn_up_diagnostic,
+                ffn_activation_diagnostic,
+                ffn_activation_stats,
+                ffn_down_diagnostic,
+                ffn_output_stats,
+                ffn_out_already_residual,
+            )
+        }
     };
     if collect_diagnostics && diagnostic_zero_delta(DeltaZeroTarget::Ffn, layer_idx)? {
         ffn_out = zero_like(&ffn_out, format!("layer_{layer_idx}_ffn_down_zeroed"))?;
@@ -7319,6 +7375,14 @@ struct GatedFfnActivation {
     activation_diagnostic: Option<LlamaFfnActivationDiagnostic>,
 }
 
+struct Q8FfnDecodeChainOutput {
+    tensor: CpuTensor,
+    gate: u128,
+    up: u128,
+    activation: u128,
+    down: u128,
+}
+
 fn linear_output_width(input: &CpuTensor, weight: &CpuTensor, role: &str) -> Result<usize> {
     let input_width = input.dim(1)?;
     if weight.rank() != 2 {
@@ -8275,6 +8339,169 @@ fn try_x86_q8_ffn_gate_up_decode_consumer_path(
     );
     let gate_elapsed = total_elapsed / 2;
     Ok(Some((gate_elapsed, total_elapsed - gate_elapsed)))
+}
+
+fn try_x86_q8_ffn_decode_chain_path(
+    input: &CpuTensor,
+    gate_weight: &CpuTensor,
+    up_weight: &CpuTensor,
+    down_weight: &CpuTensor,
+    activated_name: &str,
+    down_name: &str,
+    runtime_plan: &ResolvedRuntimePlan,
+) -> Result<Option<Q8FfnDecodeChainOutput>> {
+    if !runtime_plan.q8.ffn_decode_chain
+        || !runtime_plan.q8.ffn_gate_up_decode_consumer
+        || !runtime_plan.q8.ffn_down_decode_consumer
+        || input.rank() != 2
+        || input.dim(0)? != 1
+    {
+        return Ok(None);
+    }
+
+    let input_width = input.dim(1)?;
+    if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up_down",
+            "x86_decode_chain",
+            "input_width_not_q8_block_multiple",
+            1,
+            input_width,
+            0,
+        );
+        return Ok(None);
+    }
+    let Some((gate_packed, gate_width)) = q8_0_runtime_packed_projection(gate_weight, input_width)?
+    else {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up_down",
+            "x86_decode_chain",
+            "missing_gate_runtime_packed_rows4",
+            1,
+            input_width,
+            0,
+        );
+        return Ok(None);
+    };
+    let Some((up_packed, up_width)) = q8_0_runtime_packed_projection(up_weight, input_width)?
+    else {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up_down",
+            "x86_decode_chain",
+            "missing_up_runtime_packed_rows4",
+            1,
+            input_width,
+            gate_width,
+        );
+        return Ok(None);
+    };
+    if gate_width != up_width
+        || gate_packed.interleave != Q8_0PackedRows4Interleave::I8
+        || up_packed.interleave != Q8_0PackedRows4Interleave::I8
+    {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up_down",
+            "x86_decode_chain",
+            "gate_up_packed_shape_or_interleave_mismatch",
+            1,
+            input_width,
+            gate_width,
+        );
+        return Ok(None);
+    }
+
+    let total_started = Instant::now();
+    let input_quantize_started = Instant::now();
+    let quantized_input = quantize_q8_0_row(&input.data[..input_width]);
+    add_q8_schedule_counter(
+        &Q8_SCHED_FFN_DECODE_CHAIN_INPUT_QUANTIZE_US,
+        input_quantize_started.elapsed().as_micros() as u64,
+    );
+
+    let order = diagnostic_ffn_gate_up_order()?;
+    let gate_up_started = Instant::now();
+    let activated = q8_0_packed_rows4_single_input_projection_pair_activated_from_quantized(
+        gate_packed,
+        up_packed,
+        gate_width,
+        activated_name,
+        order,
+        &quantized_input.blocks,
+        runtime_plan.q8.ffn_gate_up_decode_paired_dot,
+    )?;
+    let gate_up_elapsed = gate_up_started.elapsed().as_micros();
+    record_q8_schedule_output_projection_route_call(
+        "ffn_gate_up",
+        "decode_fused_activation",
+        Some(activated_name),
+        1,
+        input_width,
+        gate_width,
+        gate_up_elapsed,
+    );
+
+    let Some(down_route) = resolve_x86_q8_ffn_down_route(
+        &activated,
+        down_weight,
+        "ffn_down",
+        runtime_plan,
+        X86Q8FfnDownRouteKind::Decode,
+    )?
+    else {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up_down",
+            "x86_decode_chain",
+            "missing_down_runtime_packed_rows4",
+            1,
+            gate_width,
+            0,
+        );
+        return Ok(None);
+    };
+
+    let activation_quantize_started = Instant::now();
+    let quantized_activated = quantize_q8_0_row(&activated.data[..down_route.input_width]);
+    add_q8_schedule_counter(
+        &Q8_SCHED_FFN_DECODE_CHAIN_ACTIVATION_QUANTIZE_US,
+        activation_quantize_started.elapsed().as_micros() as u64,
+    );
+
+    let down_started = Instant::now();
+    let decode_group_chunking = mac_q8_ffn_down_decode_group_chunking_enabled()
+        || x86_q8_ffn_down_decode_group_chunking_enabled();
+    let output = q8_0_packed_rows4_single_input_projection_with_decode_chunking(
+        down_route.packed,
+        &quantized_activated.blocks,
+        down_route.output_width,
+        down_name,
+        decode_group_chunking,
+    )?;
+    let down_elapsed = down_started.elapsed().as_micros();
+    add_q8_schedule_counter(&Q8_SCHED_FFN_DOWN_DECODE_CONSUMER_TAKEN, 1);
+    add_q8_schedule_counter(&Q8_SCHED_FFN_DECODE_CHAIN_TAKEN, 1);
+    add_q8_schedule_counter(
+        &Q8_SCHED_FFN_DECODE_CHAIN_TOTAL_US,
+        total_started.elapsed().as_micros() as u64,
+    );
+    add_q8_schedule_counter(&Q8_SCHED_FFN_DECODE_CHAIN_DOWN_US, down_elapsed as u64);
+    record_q8_schedule_output_projection_route_call(
+        "ffn_down",
+        q8_ffn_down_decode_consumer_route_name(decode_group_chunking),
+        Some(down_name),
+        1,
+        down_route.input_width,
+        down_route.output_width,
+        down_elapsed,
+    );
+
+    let gate_elapsed = gate_up_elapsed / 2;
+    Ok(Some(Q8FfnDecodeChainOutput {
+        tensor: output,
+        gate: gate_elapsed,
+        up: gate_up_elapsed - gate_elapsed,
+        activation: 0,
+        down: down_elapsed,
+    }))
 }
 
 fn q8_0_runtime_packed_projection(

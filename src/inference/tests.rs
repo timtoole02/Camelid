@@ -1330,6 +1330,7 @@ fn clear_dense_diagnostic_env() {
         "CAMELID_X86_Q8_ATTENTION_PROJECTION_DECODE_CONSUMER",
         "CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER",
         "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER",
+        "CAMELID_X86_Q8_FFN_DECODE_CHAIN",
         "CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER",
         "CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL",
         "CAMELID_X86_Q8_PACKED_ROWS4_MATMUL",
@@ -1653,6 +1654,7 @@ fn q8_0_hot_path_uses_resolved_plan_not_current_env() {
             ffn_gate_up_decode_group_chunking: false,
             ffn_gate_up_decode_fused_activation: false,
             ffn_gate_up_decode_paired_dot: false,
+            ffn_decode_chain: false,
             ffn_gate_up_packed_rows4_matmul: false,
             ffn_gate_up_single_owner: false,
             ffn_down_decode_consumer: false,
@@ -1761,6 +1763,7 @@ fn resolved_runtime_plan_captures_q8_env_once() {
     std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING", "on");
     std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION", "on");
     std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT", "on");
+    std::env::set_var("CAMELID_X86_Q8_FFN_DECODE_CHAIN", "on");
     std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL", "on");
     std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_SINGLE_OWNER", "on");
     std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER", "on");
@@ -1787,6 +1790,7 @@ fn resolved_runtime_plan_captures_q8_env_once() {
     assert!(plan.q8.ffn_gate_up_decode_group_chunking);
     assert!(plan.q8.ffn_gate_up_decode_fused_activation);
     assert!(plan.q8.ffn_gate_up_decode_paired_dot);
+    assert!(plan.q8.ffn_decode_chain);
     assert!(plan.q8.ffn_gate_up_packed_rows4_matmul);
     assert!(plan.q8.ffn_gate_up_single_owner);
     assert!(plan.q8.ffn_down_decode_consumer);
@@ -1802,6 +1806,7 @@ fn resolved_runtime_plan_captures_q8_env_once() {
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING");
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION");
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT");
+    std::env::remove_var("CAMELID_X86_Q8_FFN_DECODE_CHAIN");
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL");
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_SINGLE_OWNER");
     std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER");
@@ -1849,6 +1854,10 @@ fn resolved_runtime_plan_captures_q8_env_once() {
     assert!(
         plan.q8.ffn_gate_up_decode_paired_dot,
         "resolved plan should cache the FFN gate/up paired dot gate"
+    );
+    assert!(
+        plan.q8.ffn_decode_chain,
+        "resolved plan should cache the FFN decode-chain gate"
     );
     assert!(
         plan.q8.ffn_gate_up_packed_rows4_matmul,
@@ -1942,6 +1951,10 @@ fn runtime_profile_defaults_keep_experimental_q8_gates_closed() {
         assert!(
             !plan.q8.ffn_gate_up_decode_fused_activation,
             "{profile} should not enable FFN gate/up fused activation by default"
+        );
+        assert!(
+            !plan.q8.ffn_decode_chain,
+            "{profile} should not enable FFN decode chain by default"
         );
         assert!(
             !plan.q8.ffn_gate_up_packed_rows4_matmul,
@@ -2503,6 +2516,7 @@ fn q8_attention_consumer_plan(
             ffn_gate_up_decode_group_chunking: false,
             ffn_gate_up_decode_fused_activation: false,
             ffn_gate_up_decode_paired_dot: false,
+            ffn_decode_chain: false,
             ffn_gate_up_packed_rows4_matmul: false,
             ffn_gate_up_single_owner: false,
             ffn_down_decode_consumer: false,
@@ -3414,6 +3428,7 @@ fn ffn_down_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             ffn_gate_up_decode_group_chunking: false,
             ffn_gate_up_decode_fused_activation: false,
             ffn_gate_up_decode_paired_dot: false,
+            ffn_decode_chain: false,
             ffn_gate_up_packed_rows4_matmul: false,
             ffn_gate_up_single_owner: false,
             ffn_down_decode_consumer: enabled,
@@ -3457,6 +3472,7 @@ fn ffn_down_packed_rows4_matmul_plan(enabled: bool) -> ResolvedRuntimePlan {
             ffn_gate_up_decode_group_chunking: false,
             ffn_gate_up_decode_fused_activation: false,
             ffn_gate_up_decode_paired_dot: false,
+            ffn_decode_chain: false,
             ffn_gate_up_packed_rows4_matmul: false,
             ffn_gate_up_single_owner: false,
             ffn_down_decode_consumer: false,
@@ -3506,6 +3522,7 @@ fn ffn_gate_up_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             ffn_gate_up_decode_group_chunking: false,
             ffn_gate_up_decode_fused_activation: false,
             ffn_gate_up_decode_paired_dot: false,
+            ffn_decode_chain: false,
             ffn_gate_up_packed_rows4_matmul: false,
             ffn_gate_up_single_owner: false,
             ffn_down_decode_consumer: false,
@@ -3535,6 +3552,14 @@ fn ffn_gate_up_packed_rows4_matmul_plan(enabled: bool) -> ResolvedRuntimePlan {
 fn ffn_gate_up_single_owner_plan(enabled: bool) -> ResolvedRuntimePlan {
     let mut plan = ffn_gate_up_consumer_plan(false);
     plan.q8.ffn_gate_up_single_owner = enabled;
+    plan
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn ffn_decode_chain_plan() -> ResolvedRuntimePlan {
+    let mut plan = ffn_gate_up_consumer_plan(true);
+    plan.q8.ffn_decode_chain = true;
+    plan.q8.ffn_down_decode_consumer = true;
     plan
 }
 
@@ -3873,6 +3898,97 @@ fn mac_q8_ffn_gate_up_decode_consumer_alias_is_default_off_and_opt_in() {
     std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT", "on");
     assert!(Q8RuntimeFlags::from_env().ffn_gate_up_decode_paired_dot);
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT");
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[test]
+fn x86_q8_ffn_decode_chain_is_default_off_and_matches_split_consumers() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+    std::env::remove_var("CAMELID_X86_Q8_FFN_DECODE_CHAIN");
+    assert!(!q8_0_env_flag_enabled_default_off(
+        "CAMELID_X86_Q8_FFN_DECODE_CHAIN"
+    ));
+    assert!(!Q8RuntimeFlags::from_env().ffn_decode_chain);
+
+    let (input, packed_gate, packed_up, _expected_gate_up) = runtime_packed_ffn_gate_up_case();
+    let (_down_input, packed_down, _expected_down) = runtime_packed_ffn_down_case();
+    let plan = ffn_decode_chain_plan();
+
+    assert!(try_x86_q8_ffn_decode_chain_path(
+        &input,
+        &packed_gate,
+        &packed_up,
+        &packed_down,
+        "layer_0_ffn_activated",
+        "layer_0_ffn_down",
+        &ResolvedRuntimePlan {
+            q8: Q8RuntimeFlags {
+                ffn_decode_chain: false,
+                ..plan.q8
+            },
+            ..plan
+        },
+    )
+    .unwrap()
+    .is_none());
+
+    std::env::set_var("CAMELID_X86_Q8_FFN_DECODE_CHAIN", "on");
+    assert!(q8_0_env_flag_enabled_default_off(
+        "CAMELID_X86_Q8_FFN_DECODE_CHAIN"
+    ));
+    assert!(Q8RuntimeFlags::from_env().ffn_decode_chain);
+    std::env::set_var(Q8_SCHEDULE_TELEMETRY_ENV, "on");
+    reset_q8_schedule_telemetry();
+
+    let activated = gated_ffn_activation_with_plan(
+        &input,
+        &packed_gate,
+        &packed_up,
+        "expected_activated",
+        &ffn_gate_up_consumer_plan(true),
+        false,
+    )
+    .unwrap();
+    let expected = linear_for_role_runtime_with_plan(
+        &activated.tensor,
+        &packed_down,
+        "expected_down",
+        "ffn_down",
+        &ffn_down_consumer_plan(true),
+        false,
+    )
+    .unwrap();
+
+    let actual = try_x86_q8_ffn_decode_chain_path(
+        &input,
+        &packed_gate,
+        &packed_up,
+        &packed_down,
+        "layer_0_ffn_activated",
+        "layer_0_ffn_down",
+        &plan,
+    )
+    .unwrap()
+    .expect("x86 FFN decode chain should cover runtime-packed gate/up/down");
+
+    assert_eq!(actual.tensor.shape.dims, expected.shape.dims);
+    assert_slice_close_with_tolerance(&actual.tensor.data, &expected.data, 5e-4);
+    let telemetry = snapshot_q8_schedule_telemetry();
+    assert_eq!(telemetry.ffn_decode_chain_taken, 1);
+    assert!(telemetry.ffn_decode_chain_total_us > 0);
+    assert!(telemetry.ffn_decode_chain_input_quantize_us > 0);
+    assert!(telemetry.ffn_decode_chain_activation_quantize_us > 0);
+    assert!(telemetry.ffn_decode_chain_down_us > 0);
+    assert!(telemetry
+        .output_projection_by_route
+        .contains_key("ffn_gate_up.decode_fused_activation"));
+    assert!(telemetry
+        .output_projection_by_route
+        .contains_key("ffn_down.x86_decode_consumer"));
+    reset_q8_schedule_telemetry();
+    std::env::remove_var(Q8_SCHEDULE_TELEMETRY_ENV);
+    std::env::remove_var("CAMELID_X86_Q8_FFN_DECODE_CHAIN");
 }
 
 #[test]
