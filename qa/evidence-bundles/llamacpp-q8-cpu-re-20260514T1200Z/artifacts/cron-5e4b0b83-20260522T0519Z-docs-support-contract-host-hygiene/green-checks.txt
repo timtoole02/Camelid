@@ -1,0 +1,23 @@
+Source head: b260080f6ee9
+Run UTC: 2026-05-22T05:19Z
+Remote validation: not attempted in this run.
+
+stale host-status scan:
+- Command: focused scan over README.md, STATUS.md, ROADMAP.md, docs, CONTEXT.md, and retained audit artifacts for stale Ubuntu host-failure wording and retired host aliases.
+- Result: PASS. No matches; rg exited 1 for no matches.
+
+support scope scan:
+- Command: focused scan over public docs/context/status for supported-row, active-validation, default-off, and no-claim wording.
+- Result: REVIEWED. Matches remain exact-row/default-off/evidence-needed guard text; no support, portability, default-on, frontend/API, RSS, or throughput claim was widened.
+
+public scrub:
+- Command: bash scripts/check-public-scrub.sh
+- Result: PASS, rc=0.
+
+public evidence claim check:
+- Command: node scripts/check-public-evidence-claims.mjs
+- Result: PASS, rc=0; 96 manifest(s), 49 summary file(s).
+
+diff check:
+- Command: git diff --check
+- Result: PASS, rc=0.

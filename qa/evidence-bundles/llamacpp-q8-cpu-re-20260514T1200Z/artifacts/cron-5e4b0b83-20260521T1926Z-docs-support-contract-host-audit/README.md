@@ -23,7 +23,7 @@ Focused outputs are preserved in `green-checks.txt`.
 
 ## Result
 
-- Public docs/context scan results were rule text, prior retained-audit references, or evidence-needed/default-off support-contract guard wording; no current Ubuntu host outage, authentication, availability, support-row, throughput, API, frontend, portability, or default-on claim was added.
+- Public docs/context scan results were rule text, prior retained-audit references, or evidence-needed/default-off support-contract guard wording; no current negative Ubuntu host-access, support-row, throughput, API, frontend, portability, or default-on claim was added.
 - Evidence-summary scan results were classified as non-host-access failures, explicit historical success/evidence notes, or local-only validation caveats; no stale SSH-auth or current canonical Ubuntu host failure wording was found.
 - Guarded support-contract wording remains exact-row/default-off scoped for supported rows and developer experiments.
 - `scripts/check-public-scrub.sh` exited 0.

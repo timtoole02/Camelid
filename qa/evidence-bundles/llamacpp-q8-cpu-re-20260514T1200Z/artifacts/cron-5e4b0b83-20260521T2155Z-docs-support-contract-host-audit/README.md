@@ -25,7 +25,7 @@ Focused outputs are preserved in `green-checks.txt`.
 
 - Three historical validation notes that described validation-lane capacity were neutralized to evidence-status wording: no duplicate or additional long 8B remote validation was attempted for those local slices.
 - Historical validation-lane operator notes were reframed so operator-lane state cannot be mistaken for current evidence or support status.
-- Public docs/context stale host-status scans found no current Ubuntu host outage, authentication, availability, support-row, throughput, API, frontend, portability, or default-on claim.
+- Public docs/context stale host-status scans found no current negative Ubuntu host-access, support-row, throughput, API, frontend, portability, or default-on claim.
 - Guarded support-contract wording remains exact-row/default-off scoped for supported rows and developer experiments.
 - `scripts/check-public-scrub.sh` exited 0.
 - `node scripts/check-public-evidence-claims.mjs` exited 0.

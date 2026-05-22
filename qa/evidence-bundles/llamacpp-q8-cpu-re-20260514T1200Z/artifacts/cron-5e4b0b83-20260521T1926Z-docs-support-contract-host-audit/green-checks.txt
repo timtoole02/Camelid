@@ -4,7 +4,7 @@ Remote validation: not attempted in this run.
 
 public docs/context host-reporting wording scan:
 - Command: focused host-reporting wording scan over STATUS.md, COMPATIBILITY.md, CONTEXT.md, docs, src/api/mod.rs, and scripts/prepare-full-support-bundle.mjs.
-- Result: REVIEWED. Matches are canonical reporting-rule text, prior retained-audit references, or evidence-needed/default-off guard text. No current Ubuntu host outage/authentication/availability claim was added.
+- Result: REVIEWED. Matches are canonical reporting-rule text, prior retained-audit references, or evidence-needed/default-off guard text. No current negative Ubuntu host-access claim was added.
 
 public evidence-summary host-reporting wording scan:
 - Command: focused host-reporting wording scan over public evidence README and summary files.

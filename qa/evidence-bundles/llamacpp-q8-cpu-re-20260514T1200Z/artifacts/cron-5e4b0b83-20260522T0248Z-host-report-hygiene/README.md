@@ -17,8 +17,8 @@ Remote validation was not attempted in this run. This bundle asserts no current 
 
 Local documentation checks:
 
-- `rg -n "ssh -o IdentitiesOnly=yes -i /Users/timtoole/Documents/cert/ubuntu\\.pem|~/Documents/cert/ubuntu\\.pem|35\\.85\\.220\\.175|54\\.186\\.43\\.33|54\\.186\\.104\\.93" CONTEXT.md docs README.md` returned no matches (`rc=1`).
-- `rg -n "ssh -o BatchMode=yes -o ConnectTimeout=10 -o IdentitiesOnly=yes -i /Users/timtoole/Documents/cert/ubuntu\\.pem ubuntu@16\\.146\\.143\\.184" CONTEXT.md docs README.md` found the canonical command in `CONTEXT.md` and `docs/performance/ubuntu-x86-q8.md` (`rc=0`).
+- Legacy host/path scan over `CONTEXT.md`, `docs`, and `README.md` returned no matches (`rc=1`).
+- Canonical command scan over `CONTEXT.md`, `docs`, and `README.md` found the allowed reporting-rule entries in `CONTEXT.md` and `docs/performance/ubuntu-x86-q8.md` (`rc=0`).
 - `git diff --check` passed.
 
 ## Retain/Reject

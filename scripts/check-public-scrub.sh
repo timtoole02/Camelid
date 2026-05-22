@@ -34,7 +34,7 @@ for pattern in "${patterns[@]}"; do
   # probe command in two places so status notes can cite the one allowed check.
   # Keep this exception narrow; raw evidence/status artifacts remain scrubbed.
   matches=$(printf '%s\n' "$matches" | grep -v -E \
-    '^(CONTEXT[.]md:[0-9]+:A validation status statement about the canonical Ubuntu host is current only when this exact command was attempted|docs/performance/ubuntu-x86-q8[.]md:[0-9]+:ssh -o IdentitiesOnly=yes -i /Users/timtoole/Documents/cert/ubuntu[.]pem ubuntu@16[.]146[.]143[.]184$)' || true)
+    '^(CONTEXT[.]md:[0-9]+:A validation status statement about the canonical Ubuntu host is current only when this exact command was attempted|docs/performance/ubuntu-x86-q8[.]md:[0-9]+:ssh -o BatchMode=yes -o ConnectTimeout=10 -o IdentitiesOnly=yes -i /Users/timtoole/Documents/cert/ubuntu[.]pem ubuntu@16[.]146[.]143[.]184$)' || true)
   if [[ -n "$matches" ]]; then
     printf 'public scrub guard failed for pattern: %s\n%s\n' "$pattern" "$matches" >&2
     status=1

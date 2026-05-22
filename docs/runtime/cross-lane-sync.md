@@ -150,7 +150,7 @@ Owner: Cross-lane sync owner; Product/ExecutionPlan owner implements UX/runtime 
 
 ## What each lane should not repeat
 
-- Ubuntu: do not benchmark against wrong histories or missing gates; do not proceed without path sanity. If the canonical SSH command was not attempted in the current run, report remote validation as not attempted rather than implying host outage/auth failure.
+- Ubuntu: do not benchmark against wrong histories or missing gates; do not proceed without path sanity. If the canonical SSH command was not attempted in the current run, report remote validation as not attempted rather than implying a negative host-access state.
 - Mac: do not promote RSS-only improvements; audit env/config hot-path overhead before trusting kernel wins.
 - Product: do not let runtime path selection become an unobservable env-var pile.
 
