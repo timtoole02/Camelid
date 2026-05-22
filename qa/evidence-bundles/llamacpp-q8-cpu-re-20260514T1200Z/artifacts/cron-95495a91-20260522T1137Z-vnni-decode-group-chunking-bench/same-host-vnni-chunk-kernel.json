@@ -1,0 +1,900 @@
+{
+  "schema": "camelid.same_host_llama3_benchmark.v1",
+  "generated_utc": "2026-05-22T11:45:58.318Z",
+  "model": {
+    "row_id": "llama32_3b_instruct_q8_0",
+    "model_path": "/home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf",
+    "model_id": "llama32-3b-q8-vnni-chunk",
+    "render_mode": "compact"
+  },
+  "method": {
+    "warmup": 0,
+    "repeats": 1,
+    "max_tokens": 4,
+    "expected_marker": "CMLD-BENCH",
+    "require_marker": false,
+    "unique_prompt": true,
+    "benchmark_messages": [
+      {
+        "role": "system",
+        "content": "You are Camelid benchmark mode. Reply with the exact requested text and nothing else."
+      },
+      {
+        "role": "user",
+        "content": "Reply with exactly this single line and nothing else: CMLD-BENCH"
+      }
+    ],
+    "estimated_prompt_tokens": 99,
+    "llama_context": 512,
+    "threads": 4,
+    "commands": {
+      "harness": "node scripts/bench-llama3-same-host.mjs --model /home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf --model-id llama32-3b-q8-vnni-chunk --row-id llama32_3b_instruct_q8_0 --max-tokens 4 --warmup 0 --repeats 1 --threads 4 --unique-prompt --out /home/ubuntu/work/camelid-cron-1eeef0a5-20260522T0809Z-arch-current/qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260522T1137Z-vnni-decode-group-chunking-bench/same-host-vnni-chunk-kernel.json",
+      "camelid_serve": "/home/ubuntu/work/camelid-targets/backend-95495a91/release/camelid serve --addr 127.0.0.1:8205",
+      "llama_server": "/home/ubuntu/work/llama.cpp-clean-20260517/build/bin/llama-server --host 127.0.0.1 --port 8207 -m /home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf -ngl 0 -c 512 --no-warmup -t 4",
+      "camelid_load_request": "POST http://127.0.0.1:8205/api/models/load {\"path\":\"/home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf\",\"id\":\"llama32-3b-q8-vnni-chunk\"}",
+      "camelid_measure_request": "POST http://127.0.0.1:8205/v1/chat/completions stream=true max_tokens=4 temperature=0",
+      "llama_cpp_measure_request": "POST http://127.0.0.1:8207/completion stream=true n_predict=4 temperature=0 cache_prompt=false"
+    },
+    "outputs": {
+      "stdout": [
+        "camelid_ttft_ms=<mean first non-empty streamed content chunk over measured runs>",
+        "camelid_decode_tok_s=<mean estimated streamed chunks per second after first content>",
+        "camelid_ms_tok=<mean estimated milliseconds per streamed content chunk after first content>",
+        "llama_cpp_ttft_ms=<same metric for llama.cpp>",
+        "llama_cpp_decode_tok_s=<same metric for llama.cpp>",
+        "llama_cpp_ms_tok=<same metric for llama.cpp>",
+        "camelid_backend_generate_ms=<mean Camelid backend generate timing when CAMELID_STREAM_TIMING_DIAGNOSTICS=on>",
+        "camelid_backend_first_content_ms=<mean Camelid backend first-content timing when CAMELID_STREAM_TIMING_DIAGNOSTICS=on>",
+        "json_out=<absolute path when --out is set>"
+      ],
+      "json": "Full machine-readable report at --out, schema camelid.same_host_llama3_benchmark.v1.",
+      "guardrail": "marker_presence=CMLD-BENCH; pass/fail is recorded under guardrails and can be enforced with --require-marker",
+      "lifecycle": "Report records server startup timing, model-load timing, warmups, and whether servers were started by the harness or reused preloaded."
+    },
+    "bounded_metrics": [
+      "first_byte_ms: first network byte from each streaming response",
+      "first_event_ms: first parsed SSE event",
+      "first_content_ms / TTFT: first non-empty streamed content chunk",
+      "total_elapsed_ms: full streaming response wall time",
+      "completion_tokens_estimate: count of non-empty streamed content chunks, not tokenizer-ground-truth tokens",
+      "decode_tok_per_s and ms_per_token_after_first: derived from completion_tokens_estimate after first content",
+      "marker_presence: exact expected marker observed in measured output text, optionally enforced with --require-marker",
+      "camelid_backend_generate_ms and camelid_backend_first_content_ms: opt-in backend timings when CAMELID_STREAM_TIMING_DIAGNOSTICS=on",
+      "camelid_backend_q8_calls and q8 timing counters: opt-in Q8 scheduler diagnostics when Camelid Q8 scheduler telemetry is also enabled; call count includes single-projection, fused gate/up, FFN-down decode, and route-table counters",
+      "resource_snapshots: host memory/load/storage snapshots before start, before measured runs, and after measured runs",
+      "server_lifecycle: Camelid/llama-server startup timing, model-load timing, reuse/preloaded status, and warmup behavior"
+    ],
+    "server_lifecycle": {
+      "camelid_started_by_harness": true,
+      "llama_started_by_harness": true,
+      "camelid_startup_ms": 53.29,
+      "llama_startup_ms": 1103.11,
+      "camelid_model_load_ms": 607.76,
+      "camelid_model_preloaded": false,
+      "llama_model_preloaded": false
+    },
+    "evidence_context": {
+      "repository": {
+        "head": "ec584a84745815ed6155955da67d333df2d02f77",
+        "branch": "archaeology-1eeef0a5-20260522T0809Z",
+        "status_short": "?? qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260522T1137Z-vnni-decode-group-chunking-bench/"
+      },
+      "host_class": {
+        "os_type": "Linux",
+        "platform": "linux",
+        "release": "6.17.0-1013-aws",
+        "arch": "x64",
+        "cpu_model": "Intel(R) Xeon(R) Platinum 8488C",
+        "cpu_count": 16,
+        "total_memory_gib": 123.79
+      },
+      "binaries": {
+        "camelid": {
+          "path": "/home/ubuntu/work/camelid-targets/backend-95495a91/release/camelid",
+          "exists": true,
+          "size_bytes": 9133064,
+          "sha256": "cac5ad4e4dc9e26d2fcaf9273d695bd7bdeb473a588431ed61dc1778b1410f2d"
+        },
+        "llama_server": {
+          "path": "/home/ubuntu/work/llama.cpp-clean-20260517/build/bin/llama-server",
+          "exists": true,
+          "size_bytes": 8248216,
+          "sha256": "48868c15f527969bd7fb57f8bf522bf595b57feffe687ae8ef146df085905eef"
+        },
+        "node": "v18.19.1"
+      },
+      "model_artifact": {
+        "path": "/home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf",
+        "exists": true,
+        "size_bytes": 3421899296,
+        "sha256": "b5607b5090a8280063fff2d706bb3408ca6542341b06aab39c3eca0a28575921"
+      },
+      "privacy_note": "Host name, user name, and home-relative local paths are intentionally not recorded; scrub full artifacts before publication if absolute paths appear in commands."
+    },
+    "resource_snapshots": {
+      "pre_start": {
+        "label": "pre_start",
+        "captured_utc": "2026-05-22T11:45:46.172Z",
+        "loadavg_1m_5m_15m": [
+          2.02,
+          0.99,
+          0.6
+        ],
+        "memory": {
+          "total_gib": 123.79,
+          "free_gib": 120.77,
+          "process_rss_mib": 88.53
+        },
+        "linux_meminfo": {
+          "mem_available_gib": 120.77,
+          "swap_total_gib": 0,
+          "swap_free_gib": 0,
+          "dirty_mib": 0.05
+        },
+        "storage": {
+          "path": "/home/ubuntu/work/camelid-cron-1eeef0a5-20260522T0809Z-arch-current",
+          "total_gib": 192.69,
+          "available_gib": 133.5,
+          "used_pct": 30.72
+        }
+      },
+      "before_measured_runs": {
+        "label": "before_measured_runs",
+        "captured_utc": "2026-05-22T11:45:47.894Z",
+        "loadavg_1m_5m_15m": [
+          2.02,
+          0.99,
+          0.6
+        ],
+        "memory": {
+          "total_gib": 123.79,
+          "free_gib": 117.44,
+          "process_rss_mib": 138.91
+        },
+        "linux_meminfo": {
+          "mem_available_gib": 117.44,
+          "swap_total_gib": 0,
+          "swap_free_gib": 0,
+          "dirty_mib": 0.05
+        },
+        "storage": {
+          "path": "/home/ubuntu/work/camelid-cron-1eeef0a5-20260522T0809Z-arch-current",
+          "total_gib": 192.69,
+          "available_gib": 133.5,
+          "used_pct": 30.72
+        }
+      },
+      "after_measured_runs": {
+        "label": "after_measured_runs",
+        "captured_utc": "2026-05-22T11:45:58.318Z",
+        "loadavg_1m_5m_15m": [
+          1.86,
+          0.99,
+          0.61
+        ],
+        "memory": {
+          "total_gib": 123.79,
+          "free_gib": 109.21,
+          "process_rss_mib": 130.7
+        },
+        "linux_meminfo": {
+          "mem_available_gib": 109.21,
+          "swap_total_gib": 0,
+          "swap_free_gib": 0,
+          "dirty_mib": 0.09
+        },
+        "storage": {
+          "path": "/home/ubuntu/work/camelid-cron-1eeef0a5-20260522T0809Z-arch-current",
+          "total_gib": 192.69,
+          "available_gib": 133.5,
+          "used_pct": 30.72
+        }
+      }
+    },
+    "measured_order": [
+      {
+        "engine": "camelid",
+        "label": "camelid-measure-1"
+      },
+      {
+        "engine": "llama_cpp",
+        "label": "llama-measure-1"
+      }
+    ],
+    "note": "Same-host comparison using alternating streaming requests to Camelid /v1/chat/completions and llama.cpp /completion. TTFT is first non-empty streamed content chunk; token throughput is estimated from streamed content chunks, not tokenizer-ground-truth completion tokens."
+  },
+  "camelid": {
+    "base_url": "http://127.0.0.1:8205",
+    "warmups": [],
+    "runs": [
+      {
+        "label": "camelid-measure-1",
+        "text": "CMLD-B",
+        "first_byte_ms": 9647.53,
+        "first_event_ms": 9647.64,
+        "first_content_ms": 9647.69,
+        "total_elapsed_ms": 9648.19,
+        "completion_tokens_estimate": 4,
+        "chunk_count": 4,
+        "backend_timing": {
+          "q8_schedule": {
+            "activation_pack_bytes_requested": 0,
+            "activation_pack_calls": 0,
+            "activation_pack_rows": 0,
+            "activation_quantize_pack_us": 0,
+            "conservative_tail_rows": 0,
+            "ffn_decode_chain_activation_quantize_us": 0,
+            "ffn_decode_chain_down_us": 0,
+            "ffn_decode_chain_input_quantize_us": 0,
+            "ffn_decode_chain_taken": 0,
+            "ffn_decode_chain_total_us": 0,
+            "ffn_down_decode_consumer_taken": 0,
+            "ffn_down_gemm4_prefill_candidates": 140,
+            "ffn_down_gemm4_prefill_reject_bad_input_width": 0,
+            "ffn_down_gemm4_prefill_reject_no_runtime_packed": 0,
+            "ffn_down_gemm4_prefill_reject_non_i8_interleave": 0,
+            "ffn_down_gemm4_prefill_reject_plan_off": 140,
+            "ffn_down_gemm4_prefill_reject_rows_lt4": 0,
+            "ffn_down_vnni_decode_candidates": 420,
+            "ffn_down_vnni_decode_kernel_us": 79568,
+            "ffn_down_vnni_decode_quantize_us": 3956,
+            "ffn_down_vnni_decode_reject_bad_input_width": 0,
+            "ffn_down_vnni_decode_reject_bad_output_width": 0,
+            "ffn_down_vnni_decode_reject_cpu_feature": 0,
+            "ffn_down_vnni_decode_reject_gate_off": 0,
+            "ffn_down_vnni_decode_reject_no_vnni_pack": 0,
+            "ffn_down_vnni_decode_reject_shape_or_role": 280,
+            "ffn_down_vnni_decode_taken": 112,
+            "ffn_gate_up_decode_consumer_activation_us": 0,
+            "ffn_gate_up_decode_consumer_tensor_us": 0,
+            "i8mm_fused_gate_up_calls": 0,
+            "i8mm_single_projection_by_role": {},
+            "i8mm_single_projection_calls": 0,
+            "output_projection_by_layer_route": {
+              "layer_0.ffn_down.x86_vnni_decode_consumer": {
+                "calls": 4,
+                "elapsed_us": 2785,
+                "input_width": 8192,
+                "layer_index": 0,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 4
+              },
+              "layer_1.ffn_down.x86_vnni_decode_consumer": {
+                "calls": 4,
+                "elapsed_us": 2967,
+                "input_width": 8192,
+                "layer_index": 1,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 4
+              },
+              "layer_10.ffn_down.x86_vnni_decode_consumer": {
+                "calls": 4,
+                "elapsed_us": 3490,
+                "input_width": 8192,
+                "layer_index": 10,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 4
+              },
+              "layer_11.ffn_down.x86_vnni_decode_consumer": {
+                "calls": 4,
+                "elapsed_us": 2935,
+                "input_width": 8192,
+                "layer_index": 11,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 4
+              },
+              "layer_12.ffn_down.x86_vnni_decode_consumer": {
+                "calls": 4,
+                "elapsed_us": 3108,
+                "input_width": 8192,
+                "layer_index": 12,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 4
+              },
+              "layer_13.ffn_down.x86_vnni_decode_consumer": {
+                "calls": 4,
+                "elapsed_us": 2765,
+                "input_width": 8192,
+                "layer_index": 13,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 4
+              },
+              "layer_14.ffn_down.x86_vnni_decode_consumer": {
+                "calls": 4,
+                "elapsed_us": 3211,
+                "input_width": 8192,
+                "layer_index": 14,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 4
+              },
+              "layer_15.ffn_down.x86_vnni_decode_consumer": {
+                "calls": 4,
+                "elapsed_us": 3971,
+                "input_width": 8192,
+                "layer_index": 15,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 4
+              },
+              "layer_16.ffn_down.x86_vnni_decode_consumer": {
+                "calls": 4,
+                "elapsed_us": 2988,
+                "input_width": 8192,
+                "layer_index": 16,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 4
+              },
+              "layer_17.ffn_down.x86_vnni_decode_consumer": {
+                "calls": 4,
+                "elapsed_us": 2952,
+                "input_width": 8192,
+                "layer_index": 17,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 4
+              },
+              "layer_18.ffn_down.x86_vnni_decode_consumer": {
+                "calls": 4,
+                "elapsed_us": 2566,
+                "input_width": 8192,
+                "layer_index": 18,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 4
+              },
+              "layer_19.ffn_down.x86_vnni_decode_consumer": {
+                "calls": 4,
+                "elapsed_us": 3271,
+                "input_width": 8192,
+                "layer_index": 19,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 4
+              },
+              "layer_2.ffn_down.x86_vnni_decode_consumer": {
+                "calls": 4,
+                "elapsed_us": 3208,
+                "input_width": 8192,
+                "layer_index": 2,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 4
+              },
+              "layer_20.ffn_down.x86_vnni_decode_consumer": {
+                "calls": 4,
+                "elapsed_us": 3337,
+                "input_width": 8192,
+                "layer_index": 20,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 4
+              },
+              "layer_21.ffn_down.x86_vnni_decode_consumer": {
+                "calls": 4,
+                "elapsed_us": 3661,
+                "input_width": 8192,
+                "layer_index": 21,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 4
+              },
+              "layer_22.ffn_down.x86_vnni_decode_consumer": {
+                "calls": 4,
+                "elapsed_us": 3449,
+                "input_width": 8192,
+                "layer_index": 22,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 4
+              },
+              "layer_23.ffn_down.x86_vnni_decode_consumer": {
+                "calls": 4,
+                "elapsed_us": 3687,
+                "input_width": 8192,
+                "layer_index": 23,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 4
+              },
+              "layer_24.ffn_down.x86_vnni_decode_consumer": {
+                "calls": 4,
+                "elapsed_us": 2257,
+                "input_width": 8192,
+                "layer_index": 24,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 4
+              },
+              "layer_25.ffn_down.x86_vnni_decode_consumer": {
+                "calls": 4,
+                "elapsed_us": 2370,
+                "input_width": 8192,
+                "layer_index": 25,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 4
+              },
+              "layer_26.ffn_down.x86_vnni_decode_consumer": {
+                "calls": 4,
+                "elapsed_us": 2522,
+                "input_width": 8192,
+                "layer_index": 26,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 4
+              },
+              "layer_27.ffn_down.x86_vnni_decode_consumer": {
+                "calls": 4,
+                "elapsed_us": 3215,
+                "input_width": 8192,
+                "layer_index": 27,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 4
+              },
+              "layer_3.ffn_down.x86_vnni_decode_consumer": {
+                "calls": 4,
+                "elapsed_us": 2567,
+                "input_width": 8192,
+                "layer_index": 3,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 4
+              },
+              "layer_4.ffn_down.x86_vnni_decode_consumer": {
+                "calls": 4,
+                "elapsed_us": 3104,
+                "input_width": 8192,
+                "layer_index": 4,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 4
+              },
+              "layer_5.ffn_down.x86_vnni_decode_consumer": {
+                "calls": 4,
+                "elapsed_us": 3265,
+                "input_width": 8192,
+                "layer_index": 5,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 4
+              },
+              "layer_6.ffn_down.x86_vnni_decode_consumer": {
+                "calls": 4,
+                "elapsed_us": 2434,
+                "input_width": 8192,
+                "layer_index": 6,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 4
+              },
+              "layer_7.ffn_down.x86_vnni_decode_consumer": {
+                "calls": 4,
+                "elapsed_us": 2336,
+                "input_width": 8192,
+                "layer_index": 7,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 4
+              },
+              "layer_8.ffn_down.x86_vnni_decode_consumer": {
+                "calls": 4,
+                "elapsed_us": 2554,
+                "input_width": 8192,
+                "layer_index": 8,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 4
+              },
+              "layer_9.ffn_down.x86_vnni_decode_consumer": {
+                "calls": 4,
+                "elapsed_us": 2643,
+                "input_width": 8192,
+                "layer_index": 9,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 4
+              }
+            },
+            "output_projection_by_route": {
+              "ffn_down.x86_vnni_decode_consumer": {
+                "calls": 112,
+                "elapsed_us": 83618,
+                "input_width": 8192,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 112
+              },
+              "logits.q8_0_borrowed_packed_rows4": {
+                "calls": 4,
+                "elapsed_us": 19582,
+                "input_width": 3072,
+                "output_width": 128256,
+                "role": "logits",
+                "route": "q8_0_borrowed_packed_rows4",
+                "rows": 4
+              }
+            },
+            "output_projection_calls": 116,
+            "prefill_single_token_fallbacks": 0,
+            "projection_route_denials": {
+              "ffn_down.x86_gemm4_prefill.plan_off": {
+                "denials": 140,
+                "input_width": 8192,
+                "output_width": 0,
+                "reason": "plan_off",
+                "role": "ffn_down",
+                "route": "x86_gemm4_prefill",
+                "rows": 2212
+              },
+              "ffn_down.x86_vnni_decode_consumer.shape_or_role_mismatch": {
+                "denials": 280,
+                "input_width": 3072,
+                "output_width": 3072,
+                "reason": "shape_or_role_mismatch",
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 12712
+              },
+              "ffn_gate_up.packed_rows4_matmul_prefill.plan_off": {
+                "denials": 28,
+                "input_width": 3072,
+                "output_width": 0,
+                "reason": "plan_off",
+                "role": "ffn_gate_up",
+                "route": "packed_rows4_matmul_prefill",
+                "rows": 2100
+              }
+            },
+            "q8_gemm_compute_us": 0,
+            "rayon_fanout_boundaries": 0,
+            "scratch_allocation_count": 0,
+            "scratch_bytes_allocated": 0,
+            "scratch_bytes_reused": 0,
+            "scratch_peak_capacity_bytes": 0
+          },
+          "timings_ms": {
+            "first_content": 3832,
+            "first_content_accounting": {
+              "first_content_minus_prompt_eval_forward": 30.045000000000073,
+              "first_content_minus_prompt_eval_forward_plus_sample": 29.826000000000022,
+              "prompt_eval_forward_plus_sample": 3802.174,
+              "prompt_eval_forward_total": 3801.955,
+              "prompt_eval_logits": 5.023,
+              "prompt_eval_sample": 0.219
+            },
+            "first_token_forward_total": 82.918,
+            "first_token_role_timings": {
+              "attention_context": 6.243999999999999,
+              "attention_output": 9.661000000000003,
+              "ffn_down": 21.87,
+              "ffn_gate": 11.070000000000002,
+              "ffn_up": 11.085,
+              "logits": 5.023
+            },
+            "generate": 4082,
+            "generation_forward_total": 4051.215,
+            "generation_role_timings": {
+              "attention_context": 74.289,
+              "attention_output": 248.95699999999997,
+              "ffn_down": 1049.033,
+              "ffn_gate": 942.723,
+              "ffn_up": 957.694,
+              "logits": 19.601
+            },
+            "layer_role_hotspots": {
+              "first_token": [
+                {
+                  "elapsed_ms": 1.577,
+                  "layer_index": 19,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 1.532,
+                  "layer_index": 14,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 1.409,
+                  "layer_index": 15,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 1.219,
+                  "layer_index": 2,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 1.008,
+                  "layer_index": 16,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 0.995,
+                  "layer_index": 4,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 0.989,
+                  "layer_index": 0,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 0.989,
+                  "layer_index": 12,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 0.94,
+                  "layer_index": 27,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 0.868,
+                  "layer_index": 11,
+                  "role": "ffn_down"
+                }
+              ],
+              "generation": [
+                {
+                  "elapsed_ms": 40.907,
+                  "layer_index": 0,
+                  "role": "ffn_gate"
+                },
+                {
+                  "elapsed_ms": 40.731,
+                  "layer_index": 0,
+                  "role": "ffn_up"
+                },
+                {
+                  "elapsed_ms": 38.305,
+                  "layer_index": 20,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 38.294,
+                  "layer_index": 21,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 38.22,
+                  "layer_index": 19,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 38.178,
+                  "layer_index": 24,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 38.154,
+                  "layer_index": 23,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 38.1,
+                  "layer_index": 15,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 37.987,
+                  "layer_index": 22,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 37.852,
+                  "layer_index": 26,
+                  "role": "ffn_down"
+                }
+              ],
+              "prefill": [
+                {
+                  "elapsed_ms": 39.178,
+                  "layer_index": 0,
+                  "role": "ffn_gate"
+                },
+                {
+                  "elapsed_ms": 39.001,
+                  "layer_index": 0,
+                  "role": "ffn_up"
+                },
+                {
+                  "elapsed_ms": 35.887,
+                  "layer_index": 24,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 35.305,
+                  "layer_index": 26,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 34.931,
+                  "layer_index": 20,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 34.922,
+                  "layer_index": 19,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 34.85,
+                  "layer_index": 3,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 34.829,
+                  "layer_index": 0,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 34.761,
+                  "layer_index": 16,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 34.596,
+                  "layer_index": 21,
+                  "role": "ffn_down"
+                }
+              ]
+            },
+            "prefill_forward_total": 3719.037,
+            "prefill_role_timings": {
+              "attention_context": 48.69200000000001,
+              "attention_output": 208.74,
+              "ffn_down": 964.4840000000002,
+              "ffn_gate": 898.1930000000001,
+              "ffn_up": 913.103,
+              "logits": 0
+            },
+            "prompt_cache_hit": false,
+            "session_create": 0,
+            "stream_event_accounting": {
+              "final_yield": 4082,
+              "final_yield_minus_first_content_yield": 250,
+              "first_content_yield": 3832,
+              "first_content_yield_minus_role_yield": 3832,
+              "generate_start": 0,
+              "generate_start_minus_role_yield": 0,
+              "poll_yield_enabled": false,
+              "role_yield": 0
+            },
+            "tokenize": 46,
+            "weight_cache_hit": false,
+            "weight_load": 5486
+          }
+        },
+        "backend_generate_ms": 4082,
+        "backend_first_content_ms": 3832,
+        "backend_q8_gemm_compute_us": 0,
+        "backend_q8_pack_us": 0,
+        "backend_q8_calls": 116,
+        "decode_tok_per_s": 8020.74,
+        "ms_per_token_after_first": 0.12
+      }
+    ],
+    "summary": {
+      "count": 1,
+      "avg_first_byte_ms": 9647.53,
+      "avg_first_event_ms": 9647.64,
+      "avg_ttft_ms": 9647.69,
+      "avg_total_elapsed_ms": 9648.19,
+      "avg_backend_generate_ms": 4082,
+      "avg_backend_first_content_ms": 3832,
+      "avg_backend_q8_calls": 116,
+      "avg_backend_q8_gemm_compute_us": 0,
+      "avg_backend_q8_pack_us": 0,
+      "avg_decode_tok_per_s": 8020.74,
+      "avg_ms_per_token_after_first": 0.12,
+      "avg_completion_tokens_estimate": 4
+    }
+  },
+  "llama_cpp": {
+    "base_url": "http://127.0.0.1:8207",
+    "warmups": [],
+    "runs": [
+      {
+        "label": "llama-measure-1",
+        "text": "CMLD-B",
+        "first_byte_ms": 559.17,
+        "first_event_ms": 559.36,
+        "first_content_ms": 559.4,
+        "total_elapsed_ms": 773.47,
+        "completion_tokens_estimate": 4,
+        "chunk_count": 4,
+        "backend_timing": null,
+        "backend_generate_ms": null,
+        "backend_first_content_ms": null,
+        "backend_q8_gemm_compute_us": null,
+        "backend_q8_pack_us": null,
+        "backend_q8_calls": null,
+        "decode_tok_per_s": 18.69,
+        "ms_per_token_after_first": 53.52
+      }
+    ],
+    "summary": {
+      "count": 1,
+      "avg_first_byte_ms": 559.17,
+      "avg_first_event_ms": 559.36,
+      "avg_ttft_ms": 559.4,
+      "avg_total_elapsed_ms": 773.47,
+      "avg_backend_generate_ms": null,
+      "avg_backend_first_content_ms": null,
+      "avg_backend_q8_calls": null,
+      "avg_backend_q8_gemm_compute_us": null,
+      "avg_backend_q8_pack_us": null,
+      "avg_decode_tok_per_s": 18.69,
+      "avg_ms_per_token_after_first": 53.52,
+      "avg_completion_tokens_estimate": 4
+    },
+    "binary": "/home/ubuntu/work/llama.cpp-clean-20260517/build/bin/llama-server"
+  },
+  "comparison": {
+    "ttft_delta_pct_vs_llama_cpp": 1624.65,
+    "total_elapsed_delta_pct_vs_llama_cpp": 1147.39,
+    "decode_tok_per_s_delta_pct_vs_llama_cpp": 42814.61,
+    "ms_per_token_after_first_delta_pct_vs_llama_cpp": -99.78
+  },
+  "guardrails": {
+    "expected_marker": "CMLD-BENCH",
+    "require_marker": false,
+    "marker_presence": {
+      "camelid": [
+        {
+          "label": "camelid-measure-1",
+          "contains_expected_marker": false,
+          "nonempty_streamed_output": true
+        }
+      ],
+      "llama_cpp": [
+        {
+          "label": "llama-measure-1",
+          "contains_expected_marker": false,
+          "nonempty_streamed_output": true
+        }
+      ]
+    },
+    "passed": false,
+    "note": "Marker presence and non-empty streamed output are recorded for deterministic-output hygiene; empty measured output always fails the recorded guardrail even when marker enforcement is not requested."
+  },
+  "claim_boundary": "Same-host benchmark snapshot only for exact row llama32_3b_instruct_q8_0 with the provided GGUF, prompt, max-token budget, host, binaries, and thread settings. It is bounded timing evidence only: it does not widen support, portability, production-throughput, model-native/larger-context, neighboring-row, broad Llama-family, 1B, or Mixtral claims unless a separate row-specific evidence bundle records those exact conditions."
+}
