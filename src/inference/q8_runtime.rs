@@ -23,6 +23,7 @@ pub(super) struct Q8RuntimeFlags {
     pub(super) ffn_gate_up_packed_rows4_matmul: bool,
     pub(super) ffn_gate_up_single_owner: bool,
     pub(super) ffn_down_decode_consumer: bool,
+    pub(super) ffn_down_decode_group_chunking: bool,
     pub(super) ffn_down_packed_rows4_matmul: bool,
     pub(super) ffn_down_gemm4_prefill: bool,
     pub(super) ffn_down_gemm4_row_group_schedule: bool,
@@ -110,6 +111,11 @@ impl Q8RuntimeFlags {
                 "CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER",
             ) || q8_0_env_flag_enabled_default_off(
                 "CAMELID_MAC_Q8_FFN_DOWN_DECODE_CONSUMER",
+            ),
+            ffn_down_decode_group_chunking: q8_0_env_flag_enabled_default_off(
+                "CAMELID_X86_Q8_FFN_DOWN_DECODE_GROUP_CHUNKING",
+            ) || q8_0_env_flag_enabled_default_off(
+                "CAMELID_MAC_Q8_FFN_DOWN_DECODE_GROUP_CHUNKING",
             ),
             ffn_down_packed_rows4_matmul: x86_q8_ffn_down_packed_rows4_matmul_enabled(),
             ffn_down_gemm4_prefill: q8_0_env_flag_enabled_default_off(

@@ -8128,8 +8128,7 @@ fn try_x86_q8_ffn_decode_chain_path(
     );
 
     let down_started = Instant::now();
-    let decode_group_chunking = mac_q8_ffn_down_decode_group_chunking_enabled()
-        || x86_q8_ffn_down_decode_group_chunking_enabled();
+    let decode_group_chunking = runtime_plan.q8.ffn_down_decode_group_chunking;
     let output = q8_0_packed_rows4_single_input_projection_with_decode_chunking(
         down_route.packed,
         &quantized_activated.blocks,
@@ -8436,6 +8435,7 @@ fn x86_q8_packed_rows4_serial_decode_enabled() -> bool {
     q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE")
 }
 
+#[allow(dead_code)]
 fn mac_q8_ffn_down_decode_group_chunking_enabled() -> bool {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
@@ -8499,6 +8499,7 @@ fn q8_ffn_down_decode_consumer_route_name(decode_group_chunking: bool) -> &'stat
     }
 }
 
+#[allow(dead_code)]
 fn x86_q8_ffn_down_decode_group_chunking_enabled() -> bool {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
@@ -11098,8 +11099,7 @@ fn try_x86_q8_ffn_down_decode_consumer_path(
     let telemetry_started = q8_schedule_telemetry_enabled().then(Instant::now);
     add_q8_schedule_counter(&Q8_SCHED_FFN_DOWN_DECODE_CONSUMER_TAKEN, 1);
     let quantized_input = quantize_q8_0_row(&input.data[..route.input_width]);
-    let decode_group_chunking = mac_q8_ffn_down_decode_group_chunking_enabled()
-        || x86_q8_ffn_down_decode_group_chunking_enabled();
+    let decode_group_chunking = runtime_plan.q8.ffn_down_decode_group_chunking;
     let output = q8_0_packed_rows4_single_input_projection_with_decode_chunking(
         route.packed,
         &quantized_input.blocks,

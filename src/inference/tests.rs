@@ -1658,6 +1658,7 @@ fn q8_0_hot_path_uses_resolved_plan_not_current_env() {
             ffn_gate_up_packed_rows4_matmul: false,
             ffn_gate_up_single_owner: false,
             ffn_down_decode_consumer: false,
+            ffn_down_decode_group_chunking: false,
             ffn_down_packed_rows4_matmul: false,
             ffn_down_gemm4_prefill: false,
             ffn_down_gemm4_row_group_schedule: false,
@@ -1768,6 +1769,7 @@ fn resolved_runtime_plan_captures_q8_env_once() {
     std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL", "on");
     std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_SINGLE_OWNER", "on");
     std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER", "on");
+    std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_GROUP_CHUNKING", "on");
     std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL", "on");
     std::env::set_var("CAMELID_HYBRID_Q8_GPU_ROWS", "7");
     std::env::set_var("CAMELID_HYBRID_Q8_GPU_PERCENT", "25");
@@ -1795,6 +1797,7 @@ fn resolved_runtime_plan_captures_q8_env_once() {
     assert!(plan.q8.ffn_gate_up_packed_rows4_matmul);
     assert!(plan.q8.ffn_gate_up_single_owner);
     assert!(plan.q8.ffn_down_decode_consumer);
+    assert!(plan.q8.ffn_down_decode_group_chunking);
     assert!(plan.q8.ffn_down_packed_rows4_matmul);
     std::env::remove_var("CAMELID_X86_Q8_ATTENTION_PROJECTION_DECODE_CONSUMER");
     std::env::remove_var("CAMELID_X86_Q8_ATTENTION_OUTPUT_DECODE_CONSUMER");
@@ -1812,6 +1815,7 @@ fn resolved_runtime_plan_captures_q8_env_once() {
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL");
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_SINGLE_OWNER");
     std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER");
+    std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_GROUP_CHUNKING");
     std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL");
     assert!(
         plan.q8.attention_projection_decode_consumer,
@@ -1872,6 +1876,10 @@ fn resolved_runtime_plan_captures_q8_env_once() {
     assert!(
         plan.q8.ffn_down_decode_consumer,
         "resolved plan should cache the FFN-down consumer gate"
+    );
+    assert!(
+        plan.q8.ffn_down_decode_group_chunking,
+        "resolved plan should cache the FFN-down decode group-chunking gate"
     );
     assert!(
         plan.q8.ffn_down_packed_rows4_matmul,
@@ -2522,6 +2530,7 @@ fn q8_attention_consumer_plan(
             ffn_gate_up_packed_rows4_matmul: false,
             ffn_gate_up_single_owner: false,
             ffn_down_decode_consumer: false,
+            ffn_down_decode_group_chunking: false,
             ffn_down_packed_rows4_matmul: false,
             ffn_down_gemm4_prefill: false,
             ffn_down_gemm4_row_group_schedule: false,
@@ -3434,6 +3443,7 @@ fn ffn_down_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             ffn_gate_up_packed_rows4_matmul: false,
             ffn_gate_up_single_owner: false,
             ffn_down_decode_consumer: enabled,
+            ffn_down_decode_group_chunking: false,
             ffn_down_packed_rows4_matmul: false,
             ffn_down_gemm4_prefill: false,
             ffn_down_gemm4_row_group_schedule: false,
@@ -3478,6 +3488,7 @@ fn ffn_down_packed_rows4_matmul_plan(enabled: bool) -> ResolvedRuntimePlan {
             ffn_gate_up_packed_rows4_matmul: false,
             ffn_gate_up_single_owner: false,
             ffn_down_decode_consumer: false,
+            ffn_down_decode_group_chunking: false,
             ffn_down_packed_rows4_matmul: enabled,
             ffn_down_gemm4_prefill: false,
             ffn_down_gemm4_row_group_schedule: false,
@@ -3528,6 +3539,7 @@ fn ffn_gate_up_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             ffn_gate_up_packed_rows4_matmul: false,
             ffn_gate_up_single_owner: false,
             ffn_down_decode_consumer: false,
+            ffn_down_decode_group_chunking: false,
             ffn_down_packed_rows4_matmul: false,
             ffn_down_gemm4_prefill: false,
             ffn_down_gemm4_row_group_schedule: false,
@@ -4371,13 +4383,17 @@ fn mac_q8_ffn_down_decode_group_chunking_is_default_off_and_matches_consumer() {
     std::env::set_var("CAMELID_MAC_Q8_FFN_DOWN_DECODE_GROUPS_PER_CHUNK", "2");
     assert!(mac_q8_ffn_down_decode_group_chunking_enabled());
     assert_eq!(mac_q8_ffn_down_decode_groups_per_chunk(), 2);
+    let mut chunked_plan = plan;
+    chunked_plan.q8.ffn_down_decode_group_chunking =
+        Q8RuntimeFlags::from_env().ffn_down_decode_group_chunking;
+    assert!(chunked_plan.q8.ffn_down_decode_group_chunking);
 
     let chunked = try_x86_q8_ffn_down_decode_consumer_path(
         &input,
         &packed_weight,
         "chunked",
         "ffn_down",
-        &plan,
+        &chunked_plan,
     )
     .unwrap()
     .expect("chunked ffn_down consumer");
@@ -4412,18 +4428,22 @@ fn x86_q8_ffn_down_decode_group_chunking_is_default_off_and_matches_consumer() {
     std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_GROUP_CHUNKING", "on");
     std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_GROUPS_PER_CHUNK", "2");
     assert!(x86_q8_ffn_down_decode_group_chunking_enabled());
+    assert!(Q8RuntimeFlags::from_env().ffn_down_decode_group_chunking);
     assert_eq!(q8_ffn_down_decode_groups_per_chunk(), 2);
     assert_eq!(
         q8_ffn_down_decode_consumer_route_name(true),
         "x86_decode_consumer_group_chunking"
     );
 
+    let mut chunked_plan = plan;
+    chunked_plan.q8.ffn_down_decode_group_chunking =
+        Q8RuntimeFlags::from_env().ffn_down_decode_group_chunking;
     let chunked = try_x86_q8_ffn_down_decode_consumer_path(
         &input,
         &packed_weight,
         "chunked",
         "ffn_down",
-        &plan,
+        &chunked_plan,
     )
     .unwrap()
     .expect("chunked ffn_down consumer");
