@@ -1,4 +1,4 @@
-# Docs support-contract and host-reporting audit - 2026-05-21T21:55Z
+# Docs support-contract and host-reporting audit - 2026-05-21T23:58Z
 
 ## Scope
 
@@ -8,10 +8,10 @@ Remote validation was not attempted in this run. This audit makes no host availa
 
 ## Feedback loop
 
-Commands ran from the docs worktree at source head `9837151`:
+Commands ran from the docs worktree at source head `47895d7`:
 
 ```bash
-public docs/context host-reporting wording scan
+public docs/context and retained-audit host-reporting wording scan
 stale validation-lane availability wording scan
 guarded support-contract wording scan
 ./scripts/check-public-scrub.sh
@@ -23,9 +23,8 @@ Focused outputs are preserved in `green-checks.txt`.
 
 ## Result
 
-- Three historical validation notes that described validation-lane capacity were neutralized to evidence-status wording: no duplicate or additional long 8B remote validation was attempted for those local slices.
-- Historical validation-lane operator notes were reframed so operator-lane state cannot be mistaken for current evidence or support status.
-- Public docs/context stale host-status scans found no current Ubuntu host outage, authentication, availability, support-row, throughput, API, frontend, portability, or default-on claim.
+- One retained audit summary was neutralized from validation-lane capacity wording to evidence-status wording.
+- Public docs/context, retained audit summaries, and evidence-summary stale host-status scans found no current Ubuntu host outage, authentication, availability, support-row, throughput, API, frontend, portability, or default-on claim.
 - Guarded support-contract wording remains exact-row/default-off scoped for supported rows and developer experiments.
 - `scripts/check-public-scrub.sh` exited 0.
 - `node scripts/check-public-evidence-claims.mjs` exited 0.

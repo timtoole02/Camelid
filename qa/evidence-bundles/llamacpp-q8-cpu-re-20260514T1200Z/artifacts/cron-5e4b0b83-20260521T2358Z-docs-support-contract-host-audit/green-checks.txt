@@ -1,0 +1,41 @@
+Source head before docs slice: 47895d7
+
+Remote validation:
+- Not attempted in this run.
+- No Ubuntu host availability, outage, authentication, API, frontend, throughput, RSS, support-row, portability, or default-on claim is made by this docs-only slice.
+
+Command:
+stale Ubuntu host-failure wording scan over public docs/context/status and docs-room evidence summaries
+
+Result:
+- PASS: no current stale Ubuntu host-failure wording matches.
+
+Command:
+stale validation-lane availability wording scan over public docs/context/status and docs-room evidence summaries
+
+Result:
+- PASS after this slice: no current validation-lane availability wording remains in public docs/context/status or docs-room evidence summaries.
+
+Command:
+guarded support-contract wording scan
+
+Result:
+- PASS: reviewed exact-row/default-off support wording in README.md, COMPATIBILITY.md, STATUS.md, docs/VALIDATION_MATRIX.md, docs/CONFIGURATION.md, docs/performance/ubuntu-x86-q8.md, docs/runtime/cross-lane-sync.md, and docs-room evidence summaries. Wording remains support-contract scoped and does not widen model rows, API/WebUI readiness, portability, production throughput, RSS, or default-on acceleration.
+
+Command:
+./scripts/check-public-scrub.sh
+
+Result:
+- PASS: exit 0.
+
+Command:
+node scripts/check-public-evidence-claims.mjs
+
+Result:
+- PASS: public evidence claim check passed.
+
+Command:
+git diff --check
+
+Result:
+- PASS: exit 0.

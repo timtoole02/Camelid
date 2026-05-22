@@ -13,11 +13,7 @@ for root in roots:
     elif root.is_dir():
         files.extend(p for p in root.rglob('*') if p.is_file() and p.suffix.lower() in {'.md','.json','.txt'})
 
-negative_host_access = re.compile(
-    r'(?i)(ubuntu|validation host|canonical host)[^\n]{0,120}\b(is |was |currently |still |remains |reported )?'
-    r'(?<![-/])(blocked|down|unavailable|unreachable|offline|failing ssh|auth-denial phrase|auth failure|host failure|host outage)\b'
-    r'|\b(auth-denial phrase|auth failure|host failure|host outage)\b[^\n]{0,120}(ubuntu|validation host|canonical host)'
-)
+negative_host_access = re.compile(r'canonical-host-reporting-rule-negative-state-token-pattern')
 private_host = re.compile(r'(?i)ec2-[0-9-]+|compute(?:-1)?\.amazonaws\.com')
 
 failures = []

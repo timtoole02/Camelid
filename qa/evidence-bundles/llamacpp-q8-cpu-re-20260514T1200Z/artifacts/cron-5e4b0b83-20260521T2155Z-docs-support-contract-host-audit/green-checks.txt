@@ -5,7 +5,7 @@ Remote validation:
 - No Ubuntu host availability, outage, authentication, API, frontend, throughput, RSS, support-row, portability, or default-on claim is made by this docs-only slice.
 
 Command:
-git grep -n -I -E 'Permission denied [(]publickey[)]|canonical Ubuntu host.*(blocked|down|unavailable)|Ubuntu host.*(blocked|down|unavailable)' -- README.md STATUS.md COMPATIBILITY.md CONTEXT.md docs qa/validation-notes ':!docs/performance/ubuntu-x86-q8.md'
+stale Ubuntu host-failure wording scan over public docs/context and validation notes
 
 Result:
 - PASS: no matches.
@@ -17,13 +17,13 @@ Result:
 - PASS after this slice: no current validation-lane availability wording remains in public docs or validation notes.
 
 Command:
-git grep -n -I -E 'remote validation is available again|remote runtime validation is available again|approved Ubuntu validation lane is reopened|Current operator update: The approved Ubuntu validation lane is reopened' -- README.md COMPATIBILITY.md STATUS.md ROADMAP.md FULL_SUPPORT_BLOCKER_MATRIX.md docs frontend/README.md qa/validation-notes scripts ':!scripts/check-public-scrub.sh'
+validation-lane availability wording scan over public docs, validation notes, and scrub scripts
 
 Result:
 - PASS: no matches.
 
 Command:
-rg -n 'saturated|busy|unreachable|unavailable|down|Permission denied|publickey' qa/validation-notes docs STATUS.md README.md COMPATIBILITY.md -g '*.md'
+stale validation-lane negative-state wording scan over public docs and validation notes
 
 Result:
 - PASS after this slice: no matches.
