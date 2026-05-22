@@ -1,0 +1,194 @@
+{
+  "schema": "camelid.same_host_llama3_benchmark.v1",
+  "generated_utc": "2026-05-22T16:16:57.671Z",
+  "model": {
+    "row_id": "llama32_3b_instruct_q8_0",
+    "model_path": "/home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf",
+    "model_id": "llama32-3b-q8",
+    "render_mode": "compact"
+  },
+  "method": {
+    "warmup": 0,
+    "repeats": 2,
+    "max_tokens": 8,
+    "expected_marker": "CMLD-BENCH",
+    "require_marker": true,
+    "unique_prompt": true,
+    "estimated_prompt_tokens": 99,
+    "llama_context": 512,
+    "threads": 8,
+    "server_lifecycle": {
+      "camelid_started_by_harness": true,
+      "llama_started_by_harness": true,
+      "camelid_startup_ms": 54.29,
+      "llama_startup_ms": 1108.65,
+      "camelid_model_load_ms": 605.78,
+      "camelid_model_preloaded": false,
+      "llama_model_preloaded": false
+    },
+    "evidence_context": {
+      "repository": {
+        "head": "84a4a83bf881550f29dcea8349c2284439dfd900",
+        "branch": "main"
+      },
+      "host_class": {
+        "os_type": "Linux",
+        "platform": "linux",
+        "release": "6.17.0-1013-aws",
+        "arch": "x64",
+        "cpu_model": "Intel(R) Xeon(R) Platinum 8488C",
+        "cpu_count": 16,
+        "total_memory_gib": 123.79
+      },
+      "binaries": {
+        "camelid": {
+          "path": "/home/ubuntu/work/camelid-targets/backend-95495a91/release/camelid",
+          "exists": true,
+          "size_bytes": 9133064,
+          "sha256": "cac5ad4e4dc9e26d2fcaf9273d695bd7bdeb473a588431ed61dc1778b1410f2d"
+        },
+        "llama_server": {
+          "path": "/home/ubuntu/work/llama.cpp-clean-20260517/build/bin/llama-server",
+          "exists": true,
+          "size_bytes": 8248216,
+          "sha256": "48868c15f527969bd7fb57f8bf522bf595b57feffe687ae8ef146df085905eef"
+        },
+        "node": "v18.19.1"
+      },
+      "model_artifact": {
+        "path": "/home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf",
+        "exists": true,
+        "size_bytes": 3421899296,
+        "sha256": "b5607b5090a8280063fff2d706bb3408ca6542341b06aab39c3eca0a28575921"
+      }
+    },
+    "note": "Same-host comparison using alternating streaming requests to Camelid /v1/chat/completions and llama.cpp /completion. TTFT is first non-empty streamed content chunk; token throughput is estimated from streamed content chunks, not tokenizer-ground-truth completion tokens."
+  },
+  "camelid": {
+    "base_url": "http://127.0.0.1:8181",
+    "runs": [
+      {
+        "label": "camelid-measure-1",
+        "text": "CMLD-BENCH",
+        "first_byte_ms": 10065.72,
+        "first_event_ms": 10065.83,
+        "first_content_ms": 10065.88,
+        "total_elapsed_ms": 10066.16,
+        "completion_tokens_estimate": 5,
+        "chunk_count": 5,
+        "decode_tok_per_s": 17517.31,
+        "ms_per_token_after_first": 0.06
+      },
+      {
+        "label": "camelid-measure-2",
+        "text": "CMLD-BENCH",
+        "first_byte_ms": 7271.93,
+        "first_event_ms": 7271.97,
+        "first_content_ms": 7273.77,
+        "total_elapsed_ms": 7274.04,
+        "completion_tokens_estimate": 5,
+        "chunk_count": 5,
+        "decode_tok_per_s": 18376.14,
+        "ms_per_token_after_first": 0.05
+      }
+    ],
+    "summary": {
+      "count": 2,
+      "avg_first_byte_ms": 8668.83,
+      "avg_first_event_ms": 8668.9,
+      "avg_ttft_ms": 8669.83,
+      "avg_total_elapsed_ms": 8670.1,
+      "avg_backend_generate_ms": null,
+      "avg_backend_first_content_ms": null,
+      "avg_backend_q8_calls": null,
+      "avg_backend_q8_gemm_compute_us": null,
+      "avg_backend_q8_pack_us": null,
+      "avg_decode_tok_per_s": 17946.72,
+      "avg_ms_per_token_after_first": 0.06,
+      "avg_completion_tokens_estimate": 5
+    }
+  },
+  "llama_cpp": {
+    "base_url": "http://127.0.0.1:8183",
+    "runs": [
+      {
+        "label": "llama-measure-1",
+        "text": "CMLD-BENCH",
+        "first_byte_ms": 310.63,
+        "first_event_ms": 310.72,
+        "first_content_ms": 310.84,
+        "total_elapsed_ms": 503.41,
+        "completion_tokens_estimate": 5,
+        "chunk_count": 5,
+        "decode_tok_per_s": 25.96,
+        "ms_per_token_after_first": 38.51
+      },
+      {
+        "label": "llama-measure-2",
+        "text": "CMLD-BENCH",
+        "first_byte_ms": 308.06,
+        "first_event_ms": 308.12,
+        "first_content_ms": 308.2,
+        "total_elapsed_ms": 500.77,
+        "completion_tokens_estimate": 5,
+        "chunk_count": 5,
+        "decode_tok_per_s": 25.96,
+        "ms_per_token_after_first": 38.51
+      }
+    ],
+    "summary": {
+      "count": 2,
+      "avg_first_byte_ms": 309.35,
+      "avg_first_event_ms": 309.42,
+      "avg_ttft_ms": 309.52,
+      "avg_total_elapsed_ms": 502.09,
+      "avg_backend_generate_ms": null,
+      "avg_backend_first_content_ms": null,
+      "avg_backend_q8_calls": null,
+      "avg_backend_q8_gemm_compute_us": null,
+      "avg_backend_q8_pack_us": null,
+      "avg_decode_tok_per_s": 25.96,
+      "avg_ms_per_token_after_first": 38.51,
+      "avg_completion_tokens_estimate": 5
+    },
+    "binary": "/home/ubuntu/work/llama.cpp-clean-20260517/build/bin/llama-server"
+  },
+  "comparison": {
+    "ttft_delta_pct_vs_llama_cpp": 2701.06,
+    "total_elapsed_delta_pct_vs_llama_cpp": 1626.8,
+    "decode_tok_per_s_delta_pct_vs_llama_cpp": 69032.2,
+    "ms_per_token_after_first_delta_pct_vs_llama_cpp": -99.84
+  },
+  "guardrails": {
+    "expected_marker": "CMLD-BENCH",
+    "require_marker": true,
+    "marker_presence": {
+      "camelid": [
+        {
+          "label": "camelid-measure-1",
+          "contains_expected_marker": true,
+          "nonempty_streamed_output": true
+        },
+        {
+          "label": "camelid-measure-2",
+          "contains_expected_marker": true,
+          "nonempty_streamed_output": true
+        }
+      ],
+      "llama_cpp": [
+        {
+          "label": "llama-measure-1",
+          "contains_expected_marker": true,
+          "nonempty_streamed_output": true
+        },
+        {
+          "label": "llama-measure-2",
+          "contains_expected_marker": true,
+          "nonempty_streamed_output": true
+        }
+      ]
+    },
+    "passed": true
+  },
+  "claim_boundary": "Same-host benchmark snapshot only for exact row llama32_3b_instruct_q8_0 with the provided GGUF, prompt, max-token budget, host, binaries, and thread settings. It is bounded timing evidence only: it does not widen support, portability, production-throughput, model-native/larger-context, neighboring-row, broad Llama-family, 1B, or Mixtral claims unless a separate row-specific evidence bundle records those exact conditions."
+}
