@@ -15,4 +15,4 @@ Files:
 - `same-host-bench.json`
 - `same-host-bench.stream-summary.json`
 - `route-summary.json`
-- `logs/`
+- `logs/host.txt`

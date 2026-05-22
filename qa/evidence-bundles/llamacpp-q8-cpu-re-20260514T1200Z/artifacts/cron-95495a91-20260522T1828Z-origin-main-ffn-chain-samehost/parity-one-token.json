@@ -1,7 +1,7 @@
 {
   "backend": "http://127.0.0.1:18391",
   "llama_server": "http://127.0.0.1:18393",
-  "model": "/home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf",
+  "model": "<MODEL_DIR>/Llama-3.2-3B-Instruct-Q8_0.gguf",
   "model_id": "llama32-3b-q8-origin-main-ffn-chain",
   "message": "Reply with exactly one capital letter: C",
   "messages": [
@@ -23,7 +23,7 @@
     "--port",
     "18393",
     "-m",
-    "/home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf",
+    "<MODEL_DIR>/Llama-3.2-3B-Instruct-Q8_0.gguf",
     "-ngl",
     "0",
     "-c",

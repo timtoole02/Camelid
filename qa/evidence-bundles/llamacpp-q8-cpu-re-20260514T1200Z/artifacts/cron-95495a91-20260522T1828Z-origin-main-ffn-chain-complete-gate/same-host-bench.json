@@ -3,7 +3,7 @@
   "generated_utc": "2026-05-22T18:35:30.474Z",
   "model": {
     "row_id": "llama32_3b_instruct_q8_0",
-    "model_path": "/home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf",
+    "model_path": "<MODEL_DIR>/Llama-3.2-3B-Instruct-Q8_0.gguf",
     "model_id": "llama32-3b-q8-origin-main-ffn-chain-complete-bench",
     "render_mode": "compact"
   },
@@ -28,10 +28,10 @@
     "llama_context": 512,
     "threads": 16,
     "commands": {
-      "harness": "node scripts/bench-llama3-same-host.mjs --model /home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf --model-id llama32-3b-q8-origin-main-ffn-chain-complete-bench --row-id llama32_3b_instruct_q8_0 --max-tokens 4 --warmup 0 --repeats 1 --threads 16 --out /home/ubuntu/work/camelid-cron-95495a91-20260522T1828Z-origin-main/qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260522T1828Z-origin-main-ffn-chain-complete-gate/same-host-bench.json",
-      "camelid_serve": "/home/ubuntu/work/camelid-targets/backend-95495a91/release/camelid serve --addr 127.0.0.1:18405",
-      "llama_server": "/home/ubuntu/work/llama.cpp-fc0b298f-20260520T0325Z/build/bin/llama-server --host 127.0.0.1 --port 18407 -m /home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf -ngl 0 -c 512 --no-warmup -t 16",
-      "camelid_load_request": "POST http://127.0.0.1:18405/api/models/load {\"path\":\"/home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf\",\"id\":\"llama32-3b-q8-origin-main-ffn-chain-complete-bench\"}",
+      "harness": "node scripts/bench-llama3-same-host.mjs --model <MODEL_DIR>/Llama-3.2-3B-Instruct-Q8_0.gguf --model-id llama32-3b-q8-origin-main-ffn-chain-complete-bench --row-id llama32_3b_instruct_q8_0 --max-tokens 4 --warmup 0 --repeats 1 --threads 16 --out <CAMELID_WORKTREE>/qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260522T1828Z-origin-main-ffn-chain-complete-gate/same-host-bench.json",
+      "camelid_serve": "<CAMELID_RELEASE_BIN> serve --addr 127.0.0.1:18405",
+      "llama_server": "<LLAMACPP_ROOT>/build/bin/llama-server --host 127.0.0.1 --port 18407 -m <MODEL_DIR>/Llama-3.2-3B-Instruct-Q8_0.gguf -ngl 0 -c 512 --no-warmup -t 16",
+      "camelid_load_request": "POST http://127.0.0.1:18405/api/models/load {\"path\":\"<MODEL_DIR>/Llama-3.2-3B-Instruct-Q8_0.gguf\",\"id\":\"llama32-3b-q8-origin-main-ffn-chain-complete-bench\"}",
       "camelid_measure_request": "POST http://127.0.0.1:18405/v1/chat/completions stream=true max_tokens=4 temperature=0",
       "llama_cpp_measure_request": "POST http://127.0.0.1:18407/completion stream=true n_predict=4 temperature=0 cache_prompt=false"
     },
@@ -90,13 +90,13 @@
       },
       "binaries": {
         "camelid": {
-          "path": "/home/ubuntu/work/camelid-targets/backend-95495a91/release/camelid",
+          "path": "<CAMELID_RELEASE_BIN>",
           "exists": true,
           "size_bytes": 9133064,
           "sha256": "cac5ad4e4dc9e26d2fcaf9273d695bd7bdeb473a588431ed61dc1778b1410f2d"
         },
         "llama_server": {
-          "path": "/home/ubuntu/work/llama.cpp-fc0b298f-20260520T0325Z/build/bin/llama-server",
+          "path": "<LLAMACPP_ROOT>/build/bin/llama-server",
           "exists": true,
           "size_bytes": 47918720,
           "sha256": "545f8e63151affb94fffd2205c02b0b94a93109cd09cda60631f77b00f598517"
@@ -104,7 +104,7 @@
         "node": "v18.19.1"
       },
       "model_artifact": {
-        "path": "/home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf",
+        "path": "<MODEL_DIR>/Llama-3.2-3B-Instruct-Q8_0.gguf",
         "exists": true,
         "size_bytes": 3421899296,
         "sha256": "b5607b5090a8280063fff2d706bb3408ca6542341b06aab39c3eca0a28575921"
@@ -132,7 +132,7 @@
           "dirty_mib": 0.14
         },
         "storage": {
-          "path": "/home/ubuntu/work/camelid-cron-95495a91-20260522T1828Z-origin-main",
+          "path": "<CAMELID_WORKTREE>",
           "total_gib": 192.69,
           "available_gib": 122.26,
           "used_pct": 36.55
@@ -158,7 +158,7 @@
           "dirty_mib": 0.14
         },
         "storage": {
-          "path": "/home/ubuntu/work/camelid-cron-95495a91-20260522T1828Z-origin-main",
+          "path": "<CAMELID_WORKTREE>",
           "total_gib": 192.69,
           "available_gib": 122.26,
           "used_pct": 36.55
@@ -184,7 +184,7 @@
           "dirty_mib": 0.14
         },
         "storage": {
-          "path": "/home/ubuntu/work/camelid-cron-95495a91-20260522T1828Z-origin-main",
+          "path": "<CAMELID_WORKTREE>",
           "total_gib": 192.69,
           "available_gib": 122.26,
           "used_pct": 36.55
@@ -1155,7 +1155,7 @@
       "avg_ms_per_token_after_first": 30.45,
       "avg_completion_tokens_estimate": 4
     },
-    "binary": "/home/ubuntu/work/llama.cpp-fc0b298f-20260520T0325Z/build/bin/llama-server"
+    "binary": "<LLAMACPP_ROOT>/build/bin/llama-server"
   },
   "comparison": {
     "ttft_delta_pct_vs_llama_cpp": 3408.77,
