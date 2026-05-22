@@ -4,9 +4,9 @@ Date: 2026-05-22T02:22Z
 
 Base commit: `b95dd3051397b160f3ad1e0a464e33c14ab3c168`
 
-Ubuntu host: `ubuntu@16.146.143.184`
+Ubuntu host: `canonical-private-ubuntu-validation-host`
 
-Shared target dir: `/home/ubuntu/work/shared-targets/tied-output-logits-route`
+Shared target dir: `$CAMELID_SHARED_TARGET`
 
 Disk guard evidence:
 
@@ -18,7 +18,7 @@ Disk guard evidence:
 Commands:
 
 ```sh
-export CARGO_TARGET_DIR=/home/ubuntu/work/shared-targets/tied-output-logits-route
+export CARGO_TARGET_DIR=$CAMELID_SHARED_TARGET
 cargo fmt --all -- --check
 cargo test q8_x86_repack_materializes_tied_embedding_as_output_runtime_storage --lib
 cargo test x86_q8_output_decode_owner_path_uses_runtime_packed_storage --lib
@@ -36,9 +36,9 @@ env RAYON_NUM_THREADS=16 OMP_NUM_THREADS=16 OMP_PROC_BIND=true OMP_PLACES=cores 
   CAMELID_Q8_SCHED_TELEMETRY=on \
   CAMELID_STREAM_TIMING_DIAGNOSTICS=on \
   taskset -c 0-15 node scripts/bench-llama3-same-host.mjs \
-    --model /home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf \
-    --backend-bin /home/ubuntu/work/shared-targets/tied-output-logits-route/release/camelid \
-    --llama-server /home/ubuntu/work/llama.cpp-fc0b298f-20260520T0325Z/build/bin/llama-server \
+    --model $CAMELID_MODEL_DIR/Llama-3.2-3B-Instruct-Q8_0.gguf \
+    --backend-bin $CAMELID_SHARED_TARGET/release/camelid \
+    --llama-server $CAMELID_LLAMA_CPP_BIN/llama-server \
     --threads 16 --warmup 0 --repeats 1 --max-tokens 1 \
     --out parity-one-token-telemetry.json
 ```
@@ -62,9 +62,9 @@ env RAYON_NUM_THREADS=16 OMP_NUM_THREADS=16 OMP_PROC_BIND=true OMP_PLACES=cores 
   CAMELID_Q8_SCHED_TELEMETRY=on \
   CAMELID_STREAM_TIMING_DIAGNOSTICS=on \
   taskset -c 0-15 node scripts/bench-llama3-same-host.mjs \
-    --model /home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf \
-    --backend-bin /home/ubuntu/work/shared-targets/tied-output-logits-route/release/camelid \
-    --llama-server /home/ubuntu/work/llama.cpp-fc0b298f-20260520T0325Z/build/bin/llama-server \
+    --model $CAMELID_MODEL_DIR/Llama-3.2-3B-Instruct-Q8_0.gguf \
+    --backend-bin $CAMELID_SHARED_TARGET/release/camelid \
+    --llama-server $CAMELID_LLAMA_CPP_BIN/llama-server \
     --threads 16 --warmup 1 --repeats 3 --max-tokens 16 \
     --require-marker --expected-marker CMLD-BENCH \
     --out benchmark-r3.json

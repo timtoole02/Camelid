@@ -3,7 +3,7 @@
   "generated_utc": "2026-05-22T02:26:30.559Z",
   "model": {
     "row_id": "llama32_3b_instruct_q8_0",
-    "model_path": "/home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf",
+    "model_path": "$CAMELID_MODEL_DIR/Llama-3.2-3B-Instruct-Q8_0.gguf",
     "model_id": "llama32-3b-q8",
     "render_mode": "compact"
   },
@@ -28,10 +28,10 @@
     "llama_context": 512,
     "threads": 16,
     "commands": {
-      "harness": "node scripts/bench-llama3-same-host.mjs --model /home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf --model-id llama32-3b-q8 --row-id llama32_3b_instruct_q8_0 --max-tokens 16 --warmup 1 --repeats 3 --threads 16 --require-marker --expected-marker CMLD-BENCH --out /home/ubuntu/work/camelid-tied-output-logits-route/qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/subagent-tied-output-logits-route-20260522T0224Z/benchmark-r3.json",
-      "camelid_serve": "/home/ubuntu/work/shared-targets/tied-output-logits-route/release/camelid serve --addr 127.0.0.1:8181",
-      "llama_server": "/home/ubuntu/work/llama.cpp-fc0b298f-20260520T0325Z/build/bin/llama-server --host 127.0.0.1 --port 8183 -m /home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf -ngl 0 -c 512 --no-warmup -t 16",
-      "camelid_load_request": "POST http://127.0.0.1:8181/api/models/load {\"path\":\"/home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf\",\"id\":\"llama32-3b-q8\"}",
+      "harness": "node scripts/bench-llama3-same-host.mjs --model $CAMELID_MODEL_DIR/Llama-3.2-3B-Instruct-Q8_0.gguf --model-id llama32-3b-q8 --row-id llama32_3b_instruct_q8_0 --max-tokens 16 --warmup 1 --repeats 3 --threads 16 --require-marker --expected-marker CMLD-BENCH --out $CAMELID_WORKTREE/qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/subagent-tied-output-logits-route-20260522T0224Z/benchmark-r3.json",
+      "camelid_serve": "$CAMELID_SHARED_TARGET/release/camelid serve --addr 127.0.0.1:8181",
+      "llama_server": "$CAMELID_LLAMA_CPP_BIN/llama-server --host 127.0.0.1 --port 8183 -m $CAMELID_MODEL_DIR/Llama-3.2-3B-Instruct-Q8_0.gguf -ngl 0 -c 512 --no-warmup -t 16",
+      "camelid_load_request": "POST http://127.0.0.1:8181/api/models/load {\"path\":\"$CAMELID_MODEL_DIR/Llama-3.2-3B-Instruct-Q8_0.gguf\",\"id\":\"llama32-3b-q8\"}",
       "camelid_measure_request": "POST http://127.0.0.1:8181/v1/chat/completions stream=true max_tokens=16 temperature=0",
       "llama_cpp_measure_request": "POST http://127.0.0.1:8183/completion stream=true n_predict=16 temperature=0 cache_prompt=false"
     },
@@ -82,21 +82,19 @@
       "host_class": {
         "os_type": "Linux",
         "platform": "linux",
-        "release": "6.17.0-1013-aws",
         "arch": "x64",
-        "cpu_model": "Intel(R) Xeon(R) Platinum 8488C",
         "cpu_count": 16,
-        "total_memory_gib": 123.79
+        "host_class": "private Ubuntu x86_64 validation host"
       },
       "binaries": {
         "camelid": {
-          "path": "/home/ubuntu/work/shared-targets/tied-output-logits-route/release/camelid",
+          "path": "$CAMELID_SHARED_TARGET/release/camelid",
           "exists": true,
           "size_bytes": 9054616,
           "sha256": "dfc59980dd1e93bc2757d3ba61c94f65009a9349bca1b53f085d7be7db497f90"
         },
         "llama_server": {
-          "path": "/home/ubuntu/work/llama.cpp-fc0b298f-20260520T0325Z/build/bin/llama-server",
+          "path": "$CAMELID_LLAMA_CPP_BIN/llama-server",
           "exists": true,
           "size_bytes": 47918720,
           "sha256": "545f8e63151affb94fffd2205c02b0b94a93109cd09cda60631f77b00f598517"
@@ -104,7 +102,7 @@
         "node": "v18.19.1"
       },
       "model_artifact": {
-        "path": "/home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf",
+        "path": "$CAMELID_MODEL_DIR/Llama-3.2-3B-Instruct-Q8_0.gguf",
         "exists": true,
         "size_bytes": 3421899296,
         "sha256": "b5607b5090a8280063fff2d706bb3408ca6542341b06aab39c3eca0a28575921"
@@ -121,21 +119,13 @@
           1.04
         ],
         "memory": {
-          "total_gib": 123.79,
-          "free_gib": 120.83,
           "process_rss_mib": 89.02
         },
         "linux_meminfo": {
-          "mem_available_gib": 120.83,
-          "swap_total_gib": 0,
-          "swap_free_gib": 0,
           "dirty_mib": 0
         },
         "storage": {
-          "path": "/home/ubuntu/work/camelid-tied-output-logits-route",
-          "total_gib": 192.69,
-          "available_gib": 150.25,
-          "used_pct": 22.02
+          "path": "$CAMELID_WORKTREE"
         }
       },
       "before_measured_runs": {
@@ -147,21 +137,13 @@
           1.04
         ],
         "memory": {
-          "total_gib": 123.79,
-          "free_gib": 113.33,
           "process_rss_mib": 130.53
         },
         "linux_meminfo": {
-          "mem_available_gib": 113.33,
-          "swap_total_gib": 0,
-          "swap_free_gib": 0,
           "dirty_mib": 0.01
         },
         "storage": {
-          "path": "/home/ubuntu/work/camelid-tied-output-logits-route",
-          "total_gib": 192.69,
-          "available_gib": 150.25,
-          "used_pct": 22.02
+          "path": "$CAMELID_WORKTREE"
         }
       },
       "after_measured_runs": {
@@ -173,21 +155,13 @@
           1.03
         ],
         "memory": {
-          "total_gib": 123.79,
-          "free_gib": 113.21,
           "process_rss_mib": 130.91
         },
         "linux_meminfo": {
-          "mem_available_gib": 113.21,
-          "swap_total_gib": 0,
-          "swap_free_gib": 0,
           "dirty_mib": 3.63
         },
         "storage": {
-          "path": "/home/ubuntu/work/camelid-tied-output-logits-route",
-          "total_gib": 192.69,
-          "available_gib": 150.25,
-          "used_pct": 22.02
+          "path": "$CAMELID_WORKTREE"
         }
       }
     },
@@ -2397,7 +2371,7 @@
       "avg_ms_per_token_after_first": 46.78,
       "avg_completion_tokens_estimate": 5
     },
-    "binary": "/home/ubuntu/work/llama.cpp-fc0b298f-20260520T0325Z/build/bin/llama-server"
+    "binary": "$CAMELID_LLAMA_CPP_BIN/llama-server"
   },
   "comparison": {
     "ttft_delta_pct_vs_llama_cpp": 152.5,
