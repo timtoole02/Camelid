@@ -16,6 +16,23 @@ As of 2026-05-22, Camelid is useful but deliberately narrow:
 - **Blocked row:** `Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf` has bounded one-token backend MoE runtime evidence, but later-generation divergence and a continuation HTTP hang still block support.
 - **Performance posture:** correctness is ahead of throughput. Apple Silicon and Ubuntu x86 Q8 acceleration work exists behind default-off gates; it is not a default-on production-throughput claim.
 
+## Benchmark Highlights
+
+Camelid is working toward 1:1 behavioral parity with llama.cpp while keeping the implementation Rust-native. The first goal is verification, not speed theater: match the trusted local-inference baseline for exact rows, prove bit-perfect generated-token agreement where Camelid already agrees with it, and only then promote faster paths.
+
+Current retained highlights, ordered by product importance:
+
+| Priority | Workload / envelope | Path | Reference | Camelid | Status |
+| --- | --- | --- | ---: | ---: | --- |
+| Verification first | Exact-row generation parity for Llama 3.2 1B, Llama 3.2 3B, and Llama 3 8B Q8_0 checked envelopes | Default supported path | llama.cpp token IDs and text | **Bit-perfect generated token IDs and text** | Promoted only where exact-row parity, API, WebUI, and evidence agree. |
+| Headline win | Llama 3.2 3B Q8_0 guarded stream run | Confirmed experimental highlight | 5.60s total | **3.01s total** | **46.4% faster** with marker guards passing for both runtimes. |
+| Current target | Llama 3.2 3B Q8_0 x86 route-map run | Default-off Rust Q8 optimization lane | **374.88ms total** | 413.42ms total | Camelid trails by **10.3%**; this is the current measured optimization target. |
+| Direction probe | Llama 3.2 3B Q8_0 parallel Q8 first-token probe | Default-off parallel Q8 probe | Camelid baseline: 13.96s TTFT | **12.20s TTFT** | Rust-side Q8 work cut TTFT by **12.6%** in the retained direction probe. |
+
+> **Benchmark boundary:** these are retained highlights, not a broad production-throughput claim. Optimized paths are evidence-gated and default-off. Camelid promotes code to the default path only after exact-row parity, repeatability, portability, and support-contract checks all agree.
+
+Public evidence anchors include [`STATUS.md`](STATUS.md) and the [`Llama 3.2 3B parallel Q8 first-token manifest`](qa/evidence-bundles/llama32-3b-parallel-q8-first-token-20260505T140400Z-head-ffc22b85214f/manifest.json).
+
 ## What Works Today
 
 Camelid can:
