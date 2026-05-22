@@ -26,7 +26,7 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
   const supportedFeatures = apiFeatures.filter((feature) => isSupportedCapabilityStatus(feature.status))
   const unsupportedFeatures = apiFeatures.filter((feature) => isGuardedCapabilityStatus(feature.status))
   const selectedChatGate = getChatGateState(capabilities, selectedModel, runtime)
-  const selectedCompatibilityHint = findCompatibilityHint(capabilities, selectedModel)
+  const selectedCompatibilityHint = selectedChatGate.hint || findCompatibilityHint(capabilities, selectedModel)
   const selectedCompatibilityTarget = isExactCompatibilityHint(selectedCompatibilityHint) ? selectedCompatibilityHint.target : null
   const selectedSupportLanes = exactRowSupportLanes(selectedCompatibilityTarget, apiFeatures)
   const selectedExactRowReady = selectedChatGate.chatUnlocked
@@ -229,6 +229,7 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
                     <span>{target.family} · {target.quantization}</span>
                     <strong className={capabilityStatusTone(target.status)}>{target.id}: {formatCapabilityStatus(target.status)}</strong>
                     <small>Metadata: {formatCapabilityStatus(target.metadata_parses)} · tokenizer: {formatCapabilityStatus(target.tokenizer_works)} · tensors: {formatCapabilityStatus(target.tensors_load)} · generation: {formatCapabilityStatus(target.generation_runs)}</small>
+                    <small>{exactRowSupportLanes(target, apiFeatures).map((lane) => `${supportLaneTitle(lane).replace(' readiness', '')}: ${lane.label}`).join(' · ')}</small>
                     <small>{displayCapabilityCopy(target.next_step)}</small>
                   </div>
                 ))}
