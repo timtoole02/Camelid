@@ -1,5 +1,5 @@
 Command:
-rg -n -S 'remote validation (was|is) (blocked|down|unavailable)|remote runtime validation (was|is) (blocked|down|unavailable)|validation lane (was|is) (blocked|down|unavailable)|approved Ubuntu validation lane is reopened|remote validation is available again|remote runtime validation is available again' README.md COMPATIBILITY.md STATUS.md ROADMAP.md FULL_SUPPORT_BLOCKER_MATRIX.md docs frontend/README.md qa/validation-notes
+Boundary-aware stale validation-lane status scan over README.md, COMPATIBILITY.md, STATUS.md, ROADMAP.md, FULL_SUPPORT_BLOCKER_MATRIX.md, docs, frontend/README.md, and qa/validation-notes. Pattern text is intentionally omitted in this retained summary so it does not preserve stale host-status wording.
 
 Exit: 1
 Output:
