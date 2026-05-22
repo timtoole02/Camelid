@@ -111,19 +111,17 @@ function TopBar({ tab, setTab, selectedConversationTitle, selectedConversationUp
       </div>
       {!demoMode && tab !== 'library' && (
         <div className="topbar-status-strip" aria-label="Model status">
-          <div className={`status-pill topbar-status-pill ${runtimeChatReady ? 'ready' : runtime?.loaded_now ? 'warm' : ''}`} title={`${activeModelLabel} · ${runtimeGateDetail}`}>
+          <div className={`status-pill topbar-status-pill topbar-status-pill-compact ${runtimeChatReady ? 'ready' : runtime?.loaded_now ? 'warm' : ''}`} title={`${activeModelLabel} · ${runtimeGateDetail}`}>
             <span className="topbar-status-label">Runtime chat gate</span>
             <strong>{clampText(activeModelLabel, 32)}</strong>
-            <small>{runtimeGateDetail}</small>
           </div>
-          <div className="status-pill topbar-status-pill topbar-status-pill-wide" title={selectedModelSummary}>
-            <span className="topbar-status-label">Next chat</span>
-            <strong>{clampText(selectedModelLabel, 36)}</strong>
+          <div className="status-pill topbar-status-pill topbar-status-pill-compact topbar-status-pill-wide" title={selectedModelSummary}>
+            <span className="topbar-status-label">Model</span>
+            <strong>{clampText(selectedModelLabel, 32)}</strong>
           </div>
-          <button type="button" className={`status-pill topbar-status-pill topbar-status-pill-wide topbar-status-button ${capabilities ? 'ready' : 'warm'}`} onClick={() => setTab('api')} title={`${supportGateLabel}. ${supportGateDetail}`}>
+          <button type="button" className={`status-pill topbar-status-pill topbar-status-pill-compact topbar-status-pill-wide topbar-status-button ${capabilities ? 'ready' : 'warm'}`} onClick={() => setTab('api')} title={`${supportGateLabel}. ${supportGateDetail}`}>
             <span className="topbar-status-label">Support contract</span>
-            <strong>{clampText(supportGateLabel, 42)}</strong>
-            <small>{clampText(supportGateDetail, 58)}</small>
+            <strong>{clampText(supportGateLabel, 34)}</strong>
           </button>
         </div>
       )}

@@ -6072,3 +6072,393 @@ textarea.composer-input-gemini {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+/* Quiet premium shell pass: local-first, centered, compact, and evidence-forward. */
+.app-shell {
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--color-bg) 90%, transparent), var(--color-bg)),
+    linear-gradient(115deg, color-mix(in srgb, var(--color-spectrum-blue) 5%, transparent), transparent 30%),
+    linear-gradient(250deg, color-mix(in srgb, var(--color-spectrum-green) 4%, transparent), transparent 36%);
+}
+
+.panel,
+.history-card,
+.memory-card,
+.model-card,
+.runtime-stat,
+.api-card,
+.activity-item,
+.notice-bar {
+  border-radius: 18px;
+  border-color: color-mix(in srgb, var(--color-border-soft) 82%, transparent);
+  background: color-mix(in srgb, var(--color-surface) 92%, transparent);
+}
+
+.sidebar {
+  background: color-mix(in srgb, var(--color-bg) 86%, var(--color-surface) 14%);
+  border-right-color: color-mix(in srgb, var(--color-border-soft) 70%, transparent);
+}
+
+.sidebar-quick-action-gemini,
+.sidebar-search-inline-gemini {
+  background: color-mix(in srgb, var(--color-chip) 76%, transparent);
+  border-color: transparent;
+}
+
+.nav-item-flat {
+  gap: 10px;
+  border-radius: 12px;
+}
+
+.nav-item-flat span.nav-item-icon {
+  width: 24px;
+  height: 24px;
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 auto;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--color-chip) 72%, transparent);
+  color: color-mix(in srgb, var(--color-text-muted) 88%, var(--color-text) 12%);
+  font-size: 0.7rem;
+  font-weight: 760;
+}
+
+.nav-item-flat.active span.nav-item-icon {
+  color: var(--color-text);
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--color-spectrum-blue) 28%, transparent), color-mix(in srgb, var(--color-spectrum-green) 18%, transparent)),
+    color-mix(in srgb, var(--color-chip) 94%, transparent);
+}
+
+.sidebar-rail-button {
+  border-radius: 12px;
+  font-weight: 760;
+}
+
+.topbar-status-strip {
+  gap: 6px;
+}
+
+.topbar-status-pill-compact {
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-chip) 70%, transparent);
+}
+
+.topbar-status-pill-compact .topbar-status-label {
+  font-size: 0.62rem;
+  letter-spacing: 0;
+}
+
+.topbar-status-pill-compact strong {
+  max-width: 24ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.75rem;
+}
+
+.chat-layout-empty .chat-empty-shell-gemini {
+  min-height: calc(100dvh - 92px);
+  padding: clamp(28px, 8vh, 86px) 0 clamp(96px, 15vh, 190px);
+}
+
+.chat-layout-empty .chat-empty-stage-product {
+  width: min(100%, 900px);
+  gap: 18px;
+}
+
+.chat-layout-empty .chat-empty-hero-clean {
+  text-align: center;
+  justify-items: center;
+}
+
+.chat-layout-empty .chat-empty-hero-clean h2 {
+  max-width: 13ch;
+  font-size: clamp(3rem, 7.2vw, 6.5rem);
+  line-height: 0.96;
+  letter-spacing: 0;
+}
+
+.chat-layout-empty .chat-empty-hero-clean .hero-summary {
+  max-width: 42ch;
+  font-size: clamp(0.98rem, 1.2vw, 1.16rem);
+}
+
+.chat-readiness-pill-row {
+  width: min(100%, 860px);
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin: 0 auto;
+}
+
+.chat-readiness-pill {
+  min-width: 0;
+  max-width: min(100%, 260px);
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 11px;
+  border: 1px solid color-mix(in srgb, var(--color-border-soft) 58%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-chip) 66%, transparent);
+}
+
+.chat-readiness-pill::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: var(--color-text-muted);
+}
+
+.chat-readiness-pill-row.is-ready .chat-readiness-pill::before {
+  background: var(--color-ready);
+}
+
+.chat-readiness-pill-row.is-blocked .chat-readiness-pill::before {
+  background: var(--color-error);
+}
+
+.chat-readiness-pill-row.is-waiting .chat-readiness-pill::before {
+  background: var(--color-warning);
+}
+
+.chat-readiness-pill span {
+  color: var(--color-text-muted);
+  font-size: 0.68rem;
+  font-weight: 760;
+}
+
+.chat-readiness-pill strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-text);
+  font-size: 0.78rem;
+}
+
+.chat-readiness-pill-wide {
+  max-width: min(100%, 390px);
+}
+
+.chat-layout-empty .composer-gemini-product,
+.composer-gemini-floating {
+  border-radius: 24px;
+  border-color: color-mix(in srgb, var(--color-border-soft) 64%, transparent);
+  background: var(--color-composer-surface);
+  box-shadow: 0 20px 62px rgba(0, 0, 0, 0.28), var(--shadow-inset);
+}
+
+.composer-gemini-floating {
+  bottom: 22px;
+}
+
+.composer-gemini-floating .composer-send-button,
+.chat-layout-empty .composer-send-button {
+  min-width: 46px;
+  border-radius: 999px;
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--color-spectrum-blue) 42%, var(--color-accent) 58%), color-mix(in srgb, var(--color-spectrum-green) 22%, var(--color-accent) 78%));
+}
+
+.message-row-gemini.assistant {
+  width: min(100%, 720px);
+}
+
+.message-row-gemini.user {
+  width: min(100%, 720px);
+}
+
+.message-bubble-gemini.user {
+  border-radius: 24px;
+  background: color-mix(in srgb, var(--color-user-bubble) 88%, transparent);
+}
+
+.message-markdown {
+  line-height: 1.78;
+}
+
+.models-view {
+  gap: 16px;
+}
+
+.models-overview-hero {
+  position: relative;
+  overflow: hidden;
+  border-radius: 22px;
+  background:
+    linear-gradient(90deg, color-mix(in srgb, var(--color-spectrum-blue) 18%, transparent), color-mix(in srgb, var(--color-spectrum-green) 10%, transparent), color-mix(in srgb, var(--color-spectrum-yellow) 9%, transparent)),
+    color-mix(in srgb, var(--color-surface) 94%, transparent);
+}
+
+.models-overview-hero::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto;
+  height: 3px;
+  background: linear-gradient(90deg, var(--color-spectrum-blue), var(--color-spectrum-green), var(--color-spectrum-yellow), var(--color-spectrum-red));
+}
+
+.models-overview-hero h2 {
+  max-width: 15ch;
+  letter-spacing: 0;
+}
+
+.models-hero-ledger {
+  display: grid;
+  gap: 10px;
+}
+
+.models-hero-ledger > div,
+.models-card-capability-map > div,
+.models-card-details {
+  border: 1px solid color-mix(in srgb, var(--color-border-soft) 72%, transparent);
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--color-chip) 58%, transparent);
+}
+
+.models-hero-ledger > div {
+  display: grid;
+  gap: 5px;
+  padding: 14px 16px;
+}
+
+.models-hero-ledger span,
+.models-card-capability-map span {
+  color: var(--color-text-muted);
+  font-size: 0.68rem;
+  font-weight: 780;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.models-hero-ledger strong,
+.models-card-capability-map strong {
+  color: var(--color-text);
+  line-height: 1.24;
+}
+
+.models-hero-ledger small,
+.models-card-capability-map small {
+  color: var(--color-text-muted);
+  line-height: 1.45;
+}
+
+.models-status-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.models-status-card {
+  border-radius: 18px;
+}
+
+.models-summary-pill,
+.models-truth-strip > div,
+.models-compatibility-strip > div {
+  border-radius: 14px;
+}
+
+.models-card-grid {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr));
+}
+
+.models-model-card {
+  border-radius: 18px;
+  background: color-mix(in srgb, var(--color-surface) 94%, transparent);
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.16), var(--shadow-inset);
+}
+
+.models-card-head .status-pill,
+.pin-badge,
+.status-pill {
+  padding: 6px 9px;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  line-height: 1.2;
+}
+
+.models-card-capability-map {
+  display: grid;
+  gap: 10px;
+}
+
+.models-card-capability-map > div {
+  display: grid;
+  gap: 5px;
+  padding: 12px 14px;
+}
+
+.models-card-details {
+  padding: 0;
+  overflow: hidden;
+}
+
+.models-card-details summary {
+  min-height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 13px;
+  color: var(--color-text);
+  cursor: pointer;
+  font-size: 0.82rem;
+  font-weight: 720;
+}
+
+.models-card-details summary::after {
+  content: '+';
+  color: var(--color-text-muted);
+  font-size: 1rem;
+}
+
+.models-card-details[open] summary::after {
+  content: '-';
+}
+
+.models-card-details > .models-card-copy-stack {
+  padding: 0 13px 13px;
+}
+
+.models-definition-grid {
+  border-radius: 14px;
+}
+
+@media (max-width: 900px) {
+  .models-status-grid,
+  .models-hero-panel {
+    grid-template-columns: 1fr;
+  }
+
+  .chat-readiness-pill-row {
+    justify-content: stretch;
+  }
+
+  .chat-readiness-pill {
+    flex: 1 1 100%;
+    max-width: none;
+  }
+}
+
+@media (max-width: 640px) {
+  .topbar-status-strip {
+    display: none;
+  }
+
+  .chat-layout-empty .chat-empty-hero-clean h2 {
+    font-size: clamp(2.5rem, 15vw, 4rem);
+  }
+
+  .chat-layout-empty .composer-gemini-product {
+    padding: 16px;
+  }
+}

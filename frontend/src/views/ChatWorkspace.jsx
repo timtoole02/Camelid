@@ -3,7 +3,7 @@ import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'rea
 import { compatibilityHintCopy, compatibilityHintLabel, exactRowSupportLanes, findCompatibilityHint, isCompatibilitySupportedForModel } from '../lib/capabilities'
 import { clampText, formatDate, formatRate } from '../lib/formatters'
 import { getChatGateState } from '../lib/chatGate'
-import { describeModelState, getModelStatusLabel, isRunnableInCurrentRuntime } from '../lib/modelState'
+import { describeModelState, getModelStatusLabel } from '../lib/modelState'
 
 const isBootstrapMessage = (message) =>
   message?.role === 'assistant' &&
@@ -513,7 +513,7 @@ export default function ChatWorkspace({
   const hasRunnableChoices = runnableModels.length > 0
   const modelPickerTitle = selectedModel ? getModelStatusLabel(selectedModel) : 'Choose what Camelid should use for this chat.'
   const selectedChatGate = getChatGateState(capabilities, selectedModel, runtime)
-  const selectedRuntimeReady = selectedChatGate.runtimeReady || isRunnableInCurrentRuntime(selectedModel, runtime)
+  const selectedRuntimeReady = selectedChatGate.runtimeReady
   const selectedModelCapabilitySupported = selectedChatGate.contractSupported || isCompatibilitySupportedForModel(capabilities, selectedModel)
   const supportBlocked = selectedRuntimeReady && !selectedModelCapabilitySupported
   const selectedCompatibilityHint = selectedChatGate.hint || findCompatibilityHint(capabilities, selectedModel)
@@ -583,6 +583,24 @@ export default function ChatWorkspace({
     if (generationActive || !selectedModelRunnable) return
     setComposer(prompt)
   }
+
+  const renderReadinessPills = (extraClass = '', ariaLabel = 'Chat readiness and support boundary') => (
+    <div className={`chat-readiness-pill-row chat-readiness-strip-live ${extraClass} is-${readinessState}`} aria-label={ariaLabel}>
+      <div className="chat-readiness-pill" title={runtimeStatusCopy}>
+        <span>Runtime</span>
+        <strong>{runtimeStatusLabel}</strong>
+      </div>
+      <div className="chat-readiness-pill" title={supportStatusCopy}>
+        <span>Support</span>
+        <strong>{supportStatusLabel}</strong>
+      </div>
+      <div className="chat-readiness-pill chat-readiness-pill-wide" title={capabilityLaneStatus.copy}>
+        <span>Capabilities</span>
+        <strong>{capabilityLaneStatus.label}</strong>
+      </div>
+    </div>
+  )
+
   const renderModelPicker = () => {
     if (!hasRunnableChoices) {
       return (
@@ -638,23 +656,7 @@ export default function ChatWorkspace({
               </div>
 
               {!demoMode && (
-                <div className={`chat-readiness-strip is-${readinessState}`} aria-label="Chat readiness and support boundary">
-                  <div className="chat-readiness-card">
-                    <span>Runtime</span>
-                    <strong>{runtimeStatusLabel}</strong>
-                    <small>{runtimeStatusCopy}</small>
-                  </div>
-                  <div className="chat-readiness-card">
-                    <span>Support</span>
-                    <strong>{supportStatusLabel}</strong>
-                    <small>{supportStatusCopy}</small>
-                  </div>
-                  <div className="chat-readiness-card">
-                    <span>Capabilities</span>
-                    <strong>{capabilityLaneStatus.label}</strong>
-                    <small>{capabilityLaneStatus.copy}</small>
-                  </div>
-                </div>
+                renderReadinessPills()
               )}
 
               {selectedModelRunnable && (
@@ -695,23 +697,7 @@ export default function ChatWorkspace({
                   <small>{selectedModelRunnable ? 'Ready when you are' : readinessLabel}</small>
                 </div>
 
-                <div className={`chat-readiness-strip chat-readiness-strip-live is-${readinessState}`} aria-label="Live chat exact-row readiness">
-                  <div className="chat-readiness-card">
-                    <span>Runtime</span>
-                    <strong>{runtimeStatusLabel}</strong>
-                    <small>{runtimeStatusCopy}</small>
-                  </div>
-                  <div className="chat-readiness-card">
-                    <span>Support</span>
-                    <strong>{supportStatusLabel}</strong>
-                    <small>{supportStatusCopy}</small>
-                  </div>
-                  <div className="chat-readiness-card">
-                    <span>Capabilities</span>
-                    <strong>{capabilityLaneStatus.label}</strong>
-                    <small>{capabilityLaneStatus.copy}</small>
-                  </div>
-                </div>
+                {renderReadinessPills('chat-readiness-strip-live', 'Live chat exact-row readiness')}
               </>
             )}
 

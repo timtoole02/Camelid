@@ -121,6 +121,40 @@ function supportLaneTitle(lane) {
   return 'Throughput readiness'
 }
 
+function capabilityRowTitle(target) {
+  const names = {
+    tinyllama_1_1b_chat_q8_0: 'TinyLlama 1.1B Chat Q8_0',
+    llama32_1b_instruct_q8_0: 'Llama 3.2 1B Instruct Q8_0',
+    llama32_3b_instruct_q8_0: 'Llama 3.2 3B Instruct Q8_0',
+    llama3_8b_instruct_q8_0: 'Llama 3 8B Instruct Q8_0',
+    mistral_7b_instruct_v0_3_q8_0: 'Mistral 7B Instruct v0.3 Q8_0',
+    mixtral_8x7b_instruct_v0_1_q8_0: 'Mixtral 8x7B Instruct v0.1 Q8_0',
+    qwen25_7b_instruct_q8_0: 'Qwen 2.5 7B Instruct Q8_0',
+    gemma2_9b_it_q8_0: 'Gemma 2 9B IT Q8_0',
+  }
+  return names[target?.id] || target?.id || 'Compatibility row'
+}
+
+function supportStatusSentence(target, apiFeatures) {
+  if (!target) return 'No exact compatibility row is available yet.'
+  if (!isSupportedCapabilityStatus(target.status)) {
+    return `${formatCapabilityStatus(target.status)}. Camelid keeps this row visible but blocked until backend evidence promotes it.`
+  }
+  const lanes = exactRowSupportLanes(target, apiFeatures)
+  const greenLanes = lanes.filter((lane) => lane.ready).map((lane) => supportLaneTitle(lane).replace(' readiness', '').toLowerCase())
+  return greenLanes.length
+    ? `Supported exact row with ${greenLanes.join(', ')} evidence.`
+    : 'Supported exact row; runtime loaded_now=true and generation_ready=true are still required.'
+}
+
+function inferenceCapabilitySentence(target, apiFeatures, chatUnlocked) {
+  if (!target) return 'No inference claim is available.'
+  if (chatUnlocked) return 'Can answer in local chat now with this loaded exact row.'
+  if (!isSupportedCapabilityStatus(target.status)) return 'Cannot unlock chat yet; this is a tracked or planned row only.'
+  const nextStep = rowSupportNextStepCopy(target, apiFeatures)
+  return `Can run local inference after a matching GGUF is loaded and generation-ready. ${nextStep}`
+}
+
 function CapabilityEvidenceBlock({ capabilities, model, catalogItem }) {
   const quant = model?.quant || catalogItem?.quant || ''
   const compatibilityHint = findCompatibilityHint(capabilities, model, catalogItem)
@@ -128,13 +162,16 @@ function CapabilityEvidenceBlock({ capabilities, model, catalogItem }) {
   const supportLanes = exactTarget ? exactRowSupportLanes(exactTarget, capabilities?.api_features || []) : []
 
   return (
-    <div className="models-card-copy-stack models-capability-evidence" aria-label="Capability evidence boundary">
-      <p className="model-summary"><b>Exact-row quant evidence:</b> {exactTarget ? `${exactTarget.id}: ${exactTarget.quantization} · ${formatCapabilityStatus(exactTarget.status)}` : quant ? `${quant}: no exact compatibility row matched; do not infer support from this quant label.` : 'No quant label and no exact compatibility row matched.'}</p>
-      <p className="model-summary"><b>Exact-row support:</b> {compatibilityHintLabel(compatibilityHint, 'No exact compatibility row matched')}. {compatibilityHintCopy(compatibilityHint)}</p>
-      {supportLanes.length > 0 && (
-        <p className="model-summary"><b>Capability lanes:</b> {supportLanes.map((lane) => `${supportLaneTitle(lane)}: ${lane.label}`).join(' · ')}</p>
-      )}
-    </div>
+    <details className="models-card-details models-capability-evidence" aria-label="Capability evidence boundary">
+      <summary>Evidence details</summary>
+      <div className="models-card-copy-stack">
+        <p className="model-summary"><b>Exact-row quant evidence:</b> {exactTarget ? `${exactTarget.id}: ${exactTarget.quantization} · ${formatCapabilityStatus(exactTarget.status)}` : quant ? `${quant}: no exact compatibility row matched; do not infer support from this quant label.` : 'No quant label and no exact compatibility row matched.'}</p>
+        <p className="model-summary"><b>Exact-row support:</b> {compatibilityHintLabel(compatibilityHint, 'No exact compatibility row matched')}. {compatibilityHintCopy(compatibilityHint)}</p>
+        {supportLanes.length > 0 && (
+          <p className="model-summary"><b>Capability lanes:</b> {supportLanes.map((lane) => `${supportLaneTitle(lane)}: ${lane.label}`).join(' · ')}</p>
+        )}
+      </div>
+    </details>
   )
 }
 
@@ -270,6 +307,8 @@ export default function ModelsView({
   const supportedCompatibilitySummary = supportedCompatibilityRows.map((target) => target.id).join(' · ') || (currentCompatibilityTarget ? currentCompatibilityTarget.id : '')
   const exactQuantEvidenceSummary = compatibilityRows.map((target) => `${target.id}: ${target.quantization} (${formatCapabilityStatus(target.status)})`).join(' · ') || 'No exact rows advertised'
   const guardedCompatibilitySummary = plannedCompatibilityRows.map((target) => `${target.id}: ${formatCapabilityStatus(target.status)}`).join(' · ') || 'No guarded rows advertised'
+  const supportedRowCount = supportedCompatibilityRows.length
+  const trackedRowCount = trackedCompatibilityRows.length
 
   const refreshRuntime = async () => {
     if (!refreshDashboard || refreshingRuntime) return
@@ -445,6 +484,32 @@ export default function ModelsView({
 
   return (
     <section className="view-stack models-view view-shell-wide">
+      <section className="panel models-hero-panel models-overview-hero" aria-label="Camelid model support overview">
+        <div className="models-hero-copy">
+          <p className="panel-kicker">Model support</p>
+          <h2>Exact rows, real readiness, no inflated claims.</h2>
+          <p className="model-summary">Camelid separates model discovery from inference support. A model can appear here, but chat only unlocks when the active local GGUF matches an exact supported /api/capabilities row and the runtime reports loaded_now=true plus generation_ready=true.</p>
+        </div>
+
+        <div className="models-hero-ledger" aria-label="Support contract summary">
+          <div>
+            <span>Supported rows</span>
+            <strong>{supportedRowCount}</strong>
+            <small>{supportedCompatibilitySummary || 'No supported exact rows returned.'}</small>
+          </div>
+          <div>
+            <span>Tracked rows</span>
+            <strong>{trackedRowCount}</strong>
+            <small>{trackedRowCount ? 'Each row shows its own template, context, throughput, and runtime state.' : 'Waiting for /api/capabilities compatibility rows.'}</small>
+          </div>
+          <div>
+            <span>Chat unlock rule</span>
+            <strong>{selectedRunnable ? 'Ready' : selectedContractBlocked ? 'Contract blocked' : 'Runtime gated'}</strong>
+            <small>Requires active_model_id match, loaded_now, generation_ready, and exact supported row evidence.</small>
+          </div>
+        </div>
+      </section>
+
       <div className="panel models-toolbar-panel">
         <div className="models-toolbar-top">
           <label className="models-search-field">
@@ -658,6 +723,7 @@ export default function ModelsView({
                   <div className="models-card-head">
                     <div className="models-card-title">
                       <strong>{target.id}</strong>
+                      <span className="models-card-display-name">{capabilityRowTitle(target)}</span>
                       <span>{target.family} · {target.quantization}</span>
                     </div>
                     <div className={`status-pill ${tone}`}>{formatCapabilityStatus(target.status)}</div>
@@ -715,7 +781,27 @@ export default function ModelsView({
                     {!match.active && match.selected && <div className="pin-badge">Selected exact-row match</div>}
                   </div>
 
-                  <div className="models-card-copy-stack">
+                  <div className="models-card-capability-map" aria-label={`Inference support for ${target.id}`}>
+                    <div>
+                      <span>Why supported</span>
+                      <strong>{supportStatusSentence(target, apiFeatures)}</strong>
+                      <small>{target.evidence || 'No evidence copy returned for this row.'}</small>
+                    </div>
+                    <div>
+                      <span>What it can do</span>
+                      <strong>{inferenceCapabilitySentence(target, apiFeatures, chatUnlocked)}</strong>
+                      <small>{rowSupportBoundaryCopy(target, apiFeatures)}</small>
+                    </div>
+                    <div>
+                      <span>Runtime state</span>
+                      <strong>{chatUnlocked ? 'Chat-ready now' : runtimeReady ? 'Runtime green, support gated' : match.model ? 'Matching model found, not loaded' : 'No matching local GGUF'}</strong>
+                      <small>{match.model ? getNextStepCopy(match.model, { active: match.active, selected: match.selected, runnable: runtimeReady, generationReady: isModelGenerationReady(match.model) }) : 'Import or load a local file that matches this exact row.'}</small>
+                    </div>
+                  </div>
+
+                  <details className="models-card-details">
+                    <summary>Full row evidence</summary>
+                    <div className="models-card-copy-stack">
                     <p className="model-summary"><b>Evidence:</b> {target.evidence}</p>
                     {supportLanes.map((lane) => (
                       <p className="model-summary" key={lane.key}><b>{supportLaneTitle(lane)}:</b> {lane.copy}</p>
@@ -731,7 +817,8 @@ export default function ModelsView({
                             ? 'This row is contract-supported, but chat still requires a matching loaded_now=true + generation_ready=true local GGUF.'
                             : 'This row is not promoted yet; keep readiness and smoke expectations guarded until backend evidence advances this exact row.'}
                     </p>
-                  </div>
+                    </div>
+                  </details>
 
                   {matchedModel ? (
                     <>

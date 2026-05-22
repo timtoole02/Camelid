@@ -59,6 +59,28 @@ fn x86_q8_avx2_kernel_matches_scalar_dot() {
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[test]
+fn x86_q8_avx2_kernel_matches_scalar_dot_for_negative_128() {
+    let _env_guard = env_lock();
+    std::env::set_var("CAMELID_X86_Q8_KERNEL", "avx2");
+    let weight = std::array::from_fn(|idx| match idx % 4 {
+        0 => -128,
+        1 => 127,
+        2 => -7,
+        _ => idx as i8,
+    });
+    let input = std::array::from_fn(|idx| match idx % 5 {
+        0 => -128,
+        1 => 127,
+        2 => 5,
+        _ => (idx as i8).wrapping_mul(-3),
+    });
+    let expected = q8_0_block_int_dot_horizontal_sum_scalar(&weight, &input);
+    assert_eq!(q8_0_block_int_dot_horizontal_sum(&weight, &input), expected);
+    std::env::remove_var("CAMELID_X86_Q8_KERNEL");
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[test]
 fn x86_q8_packed_rows4_matmul_chunk_groups_env_override() {
     let _env_guard = env_lock();
     std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK");
@@ -1558,8 +1580,11 @@ fn q8_0_hot_path_uses_resolved_plan_not_current_env() {
             attention_qkv_decode_group_chunking: false,
             attention_qkv_packed_rows4_matmul: false,
             output_packed_rows4_matmul: false,
+            output_decode_owner: false,
             ffn_gate_up_decode_consumer: false,
             ffn_gate_up_decode_group_chunking: false,
+            ffn_gate_up_decode_fused_activation: false,
+            ffn_gate_up_decode_paired_dot: false,
             ffn_gate_up_packed_rows4_matmul: false,
             ffn_gate_up_single_owner: false,
             ffn_down_decode_consumer: false,
@@ -1663,8 +1688,11 @@ fn resolved_runtime_plan_captures_q8_env_once() {
     std::env::set_var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER", "yes");
     std::env::set_var("CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL", "on");
     std::env::set_var("CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL", "on");
+    std::env::set_var("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER", "on");
     std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER", "true");
     std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING", "on");
+    std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION", "on");
+    std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT", "on");
     std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL", "on");
     std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_SINGLE_OWNER", "on");
     std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER", "on");
@@ -1686,8 +1714,11 @@ fn resolved_runtime_plan_captures_q8_env_once() {
     assert!(plan.q8.attention_qkv_decode_consumer);
     assert!(plan.q8.attention_qkv_packed_rows4_matmul);
     assert!(plan.q8.output_packed_rows4_matmul);
+    assert!(plan.q8.output_decode_owner);
     assert!(plan.q8.ffn_gate_up_decode_consumer);
     assert!(plan.q8.ffn_gate_up_decode_group_chunking);
+    assert!(plan.q8.ffn_gate_up_decode_fused_activation);
+    assert!(plan.q8.ffn_gate_up_decode_paired_dot);
     assert!(plan.q8.ffn_gate_up_packed_rows4_matmul);
     assert!(plan.q8.ffn_gate_up_single_owner);
     assert!(plan.q8.ffn_down_decode_consumer);
@@ -1698,8 +1729,11 @@ fn resolved_runtime_plan_captures_q8_env_once() {
     std::env::remove_var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER");
     std::env::remove_var("CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL");
     std::env::remove_var("CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL");
+    std::env::remove_var("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER");
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER");
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING");
+    std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION");
+    std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT");
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL");
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_SINGLE_OWNER");
     std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER");
@@ -1729,12 +1763,24 @@ fn resolved_runtime_plan_captures_q8_env_once() {
         "resolved plan should cache the output packed-rows4 matmul gate"
     );
     assert!(
+        plan.q8.output_decode_owner,
+        "resolved plan should cache the output decode-owner gate"
+    );
+    assert!(
         plan.q8.ffn_gate_up_decode_consumer,
         "resolved plan should cache the FFN gate/up consumer gate"
     );
     assert!(
         plan.q8.ffn_gate_up_decode_group_chunking,
         "resolved plan should cache the FFN gate/up decode group-chunking gate"
+    );
+    assert!(
+        plan.q8.ffn_gate_up_decode_fused_activation,
+        "resolved plan should cache the FFN gate/up fused activation gate"
+    );
+    assert!(
+        plan.q8.ffn_gate_up_decode_paired_dot,
+        "resolved plan should cache the FFN gate/up paired dot gate"
     );
     assert!(
         plan.q8.ffn_gate_up_packed_rows4_matmul,
@@ -1797,12 +1843,20 @@ fn runtime_profile_defaults_keep_experimental_q8_gates_closed() {
             "{profile} should not enable output packed-rows4 matmul by default"
         );
         assert!(
+            !plan.q8.output_decode_owner,
+            "{profile} should not enable output decode owner by default"
+        );
+        assert!(
             !plan.q8.ffn_gate_up_decode_consumer,
             "{profile} should not enable FFN gate/up consumer by default"
         );
         assert!(
             !plan.q8.ffn_gate_up_decode_group_chunking,
             "{profile} should not enable FFN gate/up decode group chunking by default"
+        );
+        assert!(
+            !plan.q8.ffn_gate_up_decode_fused_activation,
+            "{profile} should not enable FFN gate/up fused activation by default"
         );
         assert!(
             !plan.q8.ffn_gate_up_packed_rows4_matmul,
@@ -2359,8 +2413,11 @@ fn q8_attention_consumer_plan(
             attention_qkv_decode_group_chunking: false,
             attention_qkv_packed_rows4_matmul: false,
             output_packed_rows4_matmul: false,
+            output_decode_owner: false,
             ffn_gate_up_decode_consumer: false,
             ffn_gate_up_decode_group_chunking: false,
+            ffn_gate_up_decode_fused_activation: false,
+            ffn_gate_up_decode_paired_dot: false,
             ffn_gate_up_packed_rows4_matmul: false,
             ffn_gate_up_single_owner: false,
             ffn_down_decode_consumer: false,
@@ -2638,6 +2695,140 @@ fn q8_ffn_gate_up_decode_group_chunking_matches_unchunked_pair_projection() {
     assert_slice_close_with_tolerance(&gate_actual, &gate_expected, 1e-6);
     assert_slice_close_with_tolerance(&up_actual, &up_expected, 1e-6);
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUPS_PER_CHUNK");
+}
+
+#[test]
+fn q8_ffn_gate_up_decode_fused_activation_matches_pair_projection() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+
+    let output_width = X86_Q8_PACKED_ROWS4_DECODE_PARALLEL_MIN_OUTPUTS;
+    let blocks_per_row = 2;
+    let input_width = blocks_per_row * Q8_0_BLOCK_VALUES;
+    let gate_blocks: Vec<Q8_0Block> = (0..output_width * blocks_per_row)
+        .map(|idx| Q8_0Block {
+            scale: 0.04 + (idx % 13) as f32 * 0.002,
+            quants: std::array::from_fn(|lane| ((idx * 11 + lane * 5) as i16 % 127 - 63) as i8),
+        })
+        .collect();
+    let up_blocks: Vec<Q8_0Block> = (0..output_width * blocks_per_row)
+        .map(|idx| Q8_0Block {
+            scale: 0.03 + (idx % 17) as f32 * 0.0025,
+            quants: std::array::from_fn(|lane| ((idx * 7 + lane * 9) as i16 % 127 - 63) as i8),
+        })
+        .collect();
+    let gate_packed = Q8_0PackedRows4::from_rows(
+        output_width,
+        blocks_per_row,
+        Q8_0PackedRows4Interleave::I8,
+        &gate_blocks,
+    )
+    .unwrap();
+    let up_packed = Q8_0PackedRows4::from_rows(
+        output_width,
+        blocks_per_row,
+        Q8_0PackedRows4Interleave::I8,
+        &up_blocks,
+    )
+    .unwrap();
+    let input: Vec<f32> = (0..input_width)
+        .map(|idx| (idx as f32 - 29.0) * 0.03125)
+        .collect();
+    let quantized_input = quantize_q8_0_row(&input);
+    let mut gate = vec![0.0_f32; output_width];
+    let mut up = vec![0.0_f32; output_width];
+    q8_0_packed_rows4_single_input_projection_pair_into_with_decode_chunking(
+        &gate_packed,
+        &up_packed,
+        &quantized_input.blocks,
+        &mut gate,
+        &mut up,
+        false,
+    )
+    .unwrap();
+    let expected: Vec<f32> = gate
+        .into_iter()
+        .zip(up)
+        .map(|(gate_value, up_value)| {
+            apply_ffn_gate_up_order(gate_value, up_value, FfnGateUpOrder::GateUp)
+        })
+        .collect();
+
+    let actual = q8_0_packed_rows4_single_input_projection_pair_activated_from_quantized(
+        &gate_packed,
+        &up_packed,
+        output_width,
+        "actual",
+        FfnGateUpOrder::GateUp,
+        &quantized_input.blocks,
+        false,
+    )
+    .unwrap();
+
+    assert_slice_close_with_tolerance(&actual.data, &expected, 1e-6);
+}
+
+#[test]
+fn q8_ffn_gate_up_decode_paired_dot_matches_separate_fused_activation() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+
+    let output_width = X86_Q8_PACKED_ROWS4_DECODE_PARALLEL_MIN_OUTPUTS;
+    let blocks_per_row = 3;
+    let input_width = blocks_per_row * Q8_0_BLOCK_VALUES;
+    let gate_blocks: Vec<Q8_0Block> = (0..output_width * blocks_per_row)
+        .map(|idx| Q8_0Block {
+            scale: 0.0275 + (idx % 11) as f32 * 0.003,
+            quants: std::array::from_fn(|lane| ((idx * 13 + lane * 3) as i16 % 127 - 63) as i8),
+        })
+        .collect();
+    let up_blocks: Vec<Q8_0Block> = (0..output_width * blocks_per_row)
+        .map(|idx| Q8_0Block {
+            scale: 0.033 + (idx % 19) as f32 * 0.0015,
+            quants: std::array::from_fn(|lane| ((idx * 5 + lane * 11) as i16 % 127 - 63) as i8),
+        })
+        .collect();
+    let gate_packed = Q8_0PackedRows4::from_rows(
+        output_width,
+        blocks_per_row,
+        Q8_0PackedRows4Interleave::I8,
+        &gate_blocks,
+    )
+    .unwrap();
+    let up_packed = Q8_0PackedRows4::from_rows(
+        output_width,
+        blocks_per_row,
+        Q8_0PackedRows4Interleave::I8,
+        &up_blocks,
+    )
+    .unwrap();
+    let input: Vec<f32> = (0..input_width)
+        .map(|idx| ((idx as i32 % 23) as f32 - 11.0) * 0.01953125)
+        .collect();
+    let quantized_input = quantize_q8_0_row(&input);
+
+    let expected = q8_0_packed_rows4_single_input_projection_pair_activated_from_quantized(
+        &gate_packed,
+        &up_packed,
+        output_width,
+        "expected",
+        FfnGateUpOrder::GateUp,
+        &quantized_input.blocks,
+        false,
+    )
+    .unwrap();
+    let actual = q8_0_packed_rows4_single_input_projection_pair_activated_from_quantized(
+        &gate_packed,
+        &up_packed,
+        output_width,
+        "actual",
+        FfnGateUpOrder::GateUp,
+        &quantized_input.blocks,
+        true,
+    )
+    .unwrap();
+
+    assert_slice_close_with_tolerance(&actual.data, &expected.data, 1e-6);
 }
 
 #[test]
@@ -3133,8 +3324,11 @@ fn ffn_down_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             attention_qkv_decode_group_chunking: false,
             attention_qkv_packed_rows4_matmul: false,
             output_packed_rows4_matmul: false,
+            output_decode_owner: false,
             ffn_gate_up_decode_consumer: false,
             ffn_gate_up_decode_group_chunking: false,
+            ffn_gate_up_decode_fused_activation: false,
+            ffn_gate_up_decode_paired_dot: false,
             ffn_gate_up_packed_rows4_matmul: false,
             ffn_gate_up_single_owner: false,
             ffn_down_decode_consumer: enabled,
@@ -3173,8 +3367,11 @@ fn ffn_down_packed_rows4_matmul_plan(enabled: bool) -> ResolvedRuntimePlan {
             attention_qkv_decode_group_chunking: false,
             attention_qkv_packed_rows4_matmul: false,
             output_packed_rows4_matmul: false,
+            output_decode_owner: false,
             ffn_gate_up_decode_consumer: false,
             ffn_gate_up_decode_group_chunking: false,
+            ffn_gate_up_decode_fused_activation: false,
+            ffn_gate_up_decode_paired_dot: false,
             ffn_gate_up_packed_rows4_matmul: false,
             ffn_gate_up_single_owner: false,
             ffn_down_decode_consumer: false,
@@ -3219,8 +3416,11 @@ fn ffn_gate_up_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             attention_qkv_decode_group_chunking: false,
             attention_qkv_packed_rows4_matmul: false,
             output_packed_rows4_matmul: false,
+            output_decode_owner: false,
             ffn_gate_up_decode_consumer: enabled,
             ffn_gate_up_decode_group_chunking: false,
+            ffn_gate_up_decode_fused_activation: false,
+            ffn_gate_up_decode_paired_dot: false,
             ffn_gate_up_packed_rows4_matmul: false,
             ffn_gate_up_single_owner: false,
             ffn_down_decode_consumer: false,
@@ -3566,8 +3766,12 @@ fn mac_q8_ffn_gate_up_decode_consumer_alias_is_default_off_and_opt_in() {
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER");
     std::env::remove_var("CAMELID_MAC_Q8_FFN_GATE_UP_DECODE_CONSUMER");
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING");
+    std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION");
+    std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT");
     assert!(!Q8RuntimeFlags::from_env().ffn_gate_up_decode_consumer);
     assert!(!Q8RuntimeFlags::from_env().ffn_gate_up_decode_group_chunking);
+    assert!(!Q8RuntimeFlags::from_env().ffn_gate_up_decode_fused_activation);
+    assert!(!Q8RuntimeFlags::from_env().ffn_gate_up_decode_paired_dot);
 
     std::env::set_var("CAMELID_MAC_Q8_FFN_GATE_UP_DECODE_CONSUMER", "on");
     assert!(Q8RuntimeFlags::from_env().ffn_gate_up_decode_consumer);
@@ -3576,6 +3780,14 @@ fn mac_q8_ffn_gate_up_decode_consumer_alias_is_default_off_and_opt_in() {
     std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING", "on");
     assert!(Q8RuntimeFlags::from_env().ffn_gate_up_decode_group_chunking);
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING");
+
+    std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION", "on");
+    assert!(Q8RuntimeFlags::from_env().ffn_gate_up_decode_fused_activation);
+    std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION");
+
+    std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT", "on");
+    assert!(Q8RuntimeFlags::from_env().ffn_gate_up_decode_paired_dot);
+    std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT");
 }
 
 #[test]
@@ -7506,6 +7718,8 @@ fn x86_q8_output_decode_owner_path_uses_runtime_packed_storage() {
     clear_dense_diagnostic_env();
     std::env::set_var("CAMELID_X86_Q8_REPACK", "on");
     std::env::set_var("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER", "on");
+    std::env::set_var(Q8_SCHEDULE_TELEMETRY_ENV, "on");
+    reset_q8_schedule_telemetry();
 
     let vocab_rows = 8;
     let input_width = Q8_0_BLOCK_VALUES * 2;
@@ -7551,7 +7765,18 @@ fn x86_q8_output_decode_owner_path_uses_runtime_packed_storage() {
         ));
     }
     assert_eq!(logits.data, expected);
+    let telemetry = snapshot_q8_schedule_telemetry();
+    let route = telemetry
+        .output_projection_by_route
+        .get("logits.x86_output_decode_owner")
+        .expect("output decode-owner route telemetry");
+    assert_eq!(route.calls, 1);
+    assert_eq!(route.rows, 1);
+    assert_eq!(route.input_width, input_width as u64);
+    assert_eq!(route.output_width, vocab_rows as u64);
 
+    reset_q8_schedule_telemetry();
+    std::env::remove_var(Q8_SCHEDULE_TELEMETRY_ENV);
     std::env::remove_var("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER");
     std::env::remove_var("CAMELID_X86_Q8_REPACK");
 }
