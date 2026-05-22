@@ -7987,6 +7987,20 @@ fn x86_q8_ffn_gate_up_decode_groups_per_chunk() -> usize {
         .unwrap_or(16)
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn x86_q8_vnni_decode_group_chunking_enabled() -> bool {
+    q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_GROUP_CHUNKING")
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn x86_q8_vnni_decode_groups_per_chunk() -> usize {
+    env::var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_GROUPS_PER_CHUNK")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(8)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum X86Q8AttentionQkvRouteKind {
     Decode,
@@ -8902,21 +8916,48 @@ unsafe fn q8_0_vnni_decode_1x64_projection_rawptr_avx512(
     let tiles_addr = packed.tiles.as_ptr() as usize;
 
     if output.len() >= 1024 && rayon::current_num_threads() > 1 {
-        output
-            .par_chunks_exact_mut(64)
-            .enumerate()
-            .for_each(|(group64, output_chunk)| {
-                // SAFETY: each parallel chunk owns one disjoint 64-wide output group.
-                // Tile indexing is bounded by the caller's shape guard.
-                unsafe {
-                    q8_0_vnni_decode_group64_rawptr_avx512(
-                        (tiles_addr as *const Q8_0VnniTile16).add(group64 * 4 * blocks_per_row),
-                        blocks_per_row,
-                        input_addr as *const Q8_0Block,
-                        output_chunk.as_mut_ptr(),
-                    );
-                }
-            });
+        if x86_q8_vnni_decode_group_chunking_enabled() {
+            let output_groups = output.len() / 64;
+            let groups_per_chunk = x86_q8_vnni_decode_groups_per_chunk().min(output_groups);
+            output
+                .par_chunks_mut(groups_per_chunk * 64)
+                .enumerate()
+                .for_each(|(chunk_idx, output_chunk)| {
+                    let first_group64 = chunk_idx * groups_per_chunk;
+                    for (local_group64, group_output) in
+                        output_chunk.chunks_exact_mut(64).enumerate()
+                    {
+                        let group64 = first_group64 + local_group64;
+                        // SAFETY: each parallel chunk owns disjoint 64-wide output groups.
+                        // Tile indexing is bounded by the caller's shape guard.
+                        unsafe {
+                            q8_0_vnni_decode_group64_rawptr_avx512(
+                                (tiles_addr as *const Q8_0VnniTile16)
+                                    .add(group64 * 4 * blocks_per_row),
+                                blocks_per_row,
+                                input_addr as *const Q8_0Block,
+                                group_output.as_mut_ptr(),
+                            );
+                        }
+                    }
+                });
+        } else {
+            output
+                .par_chunks_exact_mut(64)
+                .enumerate()
+                .for_each(|(group64, output_chunk)| {
+                    // SAFETY: each parallel chunk owns one disjoint 64-wide output group.
+                    // Tile indexing is bounded by the caller's shape guard.
+                    unsafe {
+                        q8_0_vnni_decode_group64_rawptr_avx512(
+                            (tiles_addr as *const Q8_0VnniTile16).add(group64 * 4 * blocks_per_row),
+                            blocks_per_row,
+                            input_addr as *const Q8_0Block,
+                            output_chunk.as_mut_ptr(),
+                        );
+                    }
+                });
+        }
     } else {
         for (group64, output_chunk) in output.chunks_exact_mut(64).enumerate() {
             // SAFETY: each serial chunk owns one disjoint 64-wide output group.
@@ -9007,21 +9048,48 @@ unsafe fn q8_0_vnni_decode_1x64_projection_rawptr_avx2(
     let tiles_addr = packed.tiles.as_ptr() as usize;
 
     if output.len() >= 1024 && rayon::current_num_threads() > 1 {
-        output
-            .par_chunks_exact_mut(64)
-            .enumerate()
-            .for_each(|(group64, output_chunk)| {
-                // SAFETY: each parallel chunk owns one disjoint 64-wide output group.
-                // Tile indexing is bounded by the caller's shape guard.
-                unsafe {
-                    q8_0_vnni_decode_group64_rawptr_avx2(
-                        (tiles_addr as *const Q8_0VnniTile16).add(group64 * 4 * blocks_per_row),
-                        blocks_per_row,
-                        input_addr as *const Q8_0Block,
-                        output_chunk.as_mut_ptr(),
-                    );
-                }
-            });
+        if x86_q8_vnni_decode_group_chunking_enabled() {
+            let output_groups = output.len() / 64;
+            let groups_per_chunk = x86_q8_vnni_decode_groups_per_chunk().min(output_groups);
+            output
+                .par_chunks_mut(groups_per_chunk * 64)
+                .enumerate()
+                .for_each(|(chunk_idx, output_chunk)| {
+                    let first_group64 = chunk_idx * groups_per_chunk;
+                    for (local_group64, group_output) in
+                        output_chunk.chunks_exact_mut(64).enumerate()
+                    {
+                        let group64 = first_group64 + local_group64;
+                        // SAFETY: each parallel chunk owns disjoint 64-wide output groups.
+                        // Tile indexing is bounded by the caller's shape guard.
+                        unsafe {
+                            q8_0_vnni_decode_group64_rawptr_avx2(
+                                (tiles_addr as *const Q8_0VnniTile16)
+                                    .add(group64 * 4 * blocks_per_row),
+                                blocks_per_row,
+                                input_addr as *const Q8_0Block,
+                                group_output.as_mut_ptr(),
+                            );
+                        }
+                    }
+                });
+        } else {
+            output
+                .par_chunks_exact_mut(64)
+                .enumerate()
+                .for_each(|(group64, output_chunk)| {
+                    // SAFETY: each parallel chunk owns one disjoint 64-wide output group.
+                    // Tile indexing is bounded by the caller's shape guard.
+                    unsafe {
+                        q8_0_vnni_decode_group64_rawptr_avx2(
+                            (tiles_addr as *const Q8_0VnniTile16).add(group64 * 4 * blocks_per_row),
+                            blocks_per_row,
+                            input_addr as *const Q8_0Block,
+                            output_chunk.as_mut_ptr(),
+                        );
+                    }
+                });
+        }
     } else {
         for (group64, output_chunk) in output.chunks_exact_mut(64).enumerate() {
             // SAFETY: each serial chunk owns one disjoint 64-wide output group.

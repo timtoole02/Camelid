@@ -3694,6 +3694,52 @@ fn q8_ffn_down_vnni_decode_rawptr_matches_rows4_decode_baseline() {
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
+fn q8_ffn_down_vnni_decode_rawptr_group_chunking_matches_unchunked_rawptr() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+    if !x86_q8_vnni_decode_cpu_supported() {
+        std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE");
+        std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR");
+        std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_GROUP_CHUNKING");
+        std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_GROUPS_PER_CHUNK");
+        return;
+    }
+    std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR", "on");
+    let (input, packed_weight, _expected) = runtime_vnni_packed_ffn_down_case();
+    let plan = ffn_down_vnni_decode_plan(true);
+
+    let unchunked = try_x86_q8_ffn_down_decode_consumer_path(
+        &input,
+        &packed_weight,
+        "layer_0_ffn_down",
+        "ffn_down",
+        &plan,
+    )
+    .unwrap()
+    .expect("rawptr VNNI FFN-down decode output");
+
+    std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_GROUP_CHUNKING", "on");
+    std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_GROUPS_PER_CHUNK", "3");
+    let chunked = try_x86_q8_ffn_down_decode_consumer_path(
+        &input,
+        &packed_weight,
+        "layer_0_ffn_down",
+        "ffn_down",
+        &plan,
+    )
+    .unwrap()
+    .expect("chunked rawptr VNNI FFN-down decode output");
+
+    assert_eq!(chunked.shape.dims, unchunked.shape.dims);
+    assert_slice_close_with_tolerance(&chunked.data, &unchunked.data, 5e-4);
+    std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_GROUP_CHUNKING");
+    std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_GROUPS_PER_CHUNK");
+    std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR");
+    std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE");
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
 fn q8_ffn_down_vnni_decode_rawptr_avx2_matches_rows4_decode_baseline() {
     let _env_guard = env_lock();
     clear_dense_diagnostic_env();

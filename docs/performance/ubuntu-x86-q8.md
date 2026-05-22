@@ -53,6 +53,7 @@ Current work is focused on:
 - FFN-down GEMM4 AVX2 and output-route-resolver cleanup are evidence-needed tracer bullets: keep them default-off, preserve backend-owned packed runtime storage, and require parity plus same-host guard evidence before retaining any performance claim.
 - Rust-only FFN-down VNNI decode inner-loop ownership under `CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR=on`, scoped to Ubuntu/Linux x86_64 AVX512-VNNI and backed by the current source archaeology that identifies llama.cpp decode as AMX-buffer-backed one-row VNNI. This remains evidence-needed until same-host parity and timing are recorded.
 - Default-off VNNI decode scale-cache cleanup keeps raw fp16 scale bits for layout parity while carrying decoded f32 scale lanes in the VNNI sidecar. Current proof is local Rust parity/gates only; no Ubuntu timing/profiling validation is recorded for this slice.
+- Default-off VNNI raw-pointer decode group chunking under `CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_GROUP_CHUNKING=on` reduces Rayon task fan-out across 64-output groups inside the existing raw-pointer helper. Current proof is Ubuntu x86_64 parity/control-plane coverage only, not a retained throughput/support/default-on claim.
 - FFN-down row-group scheduling now has a retained default-off min-input-groups guard for the shallow-prefill synthetic surface; model-backed same-host FFN-down timing remains evidence-needed before any measured throughput claim.
 - reducing wrapper/callback overhead in hot inference
 - keeping the default/reference path safe while experimental paths stay opt-in
@@ -156,6 +157,7 @@ Primary public evidence anchors for this lane:
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-1eeef0a5-20260521T1954Z-rust-vnni-rawptr/README.md` (default-off Rust AVX512-VNNI FFN-down decode raw-pointer implementation slice; canonical Ubuntu rawptr parity passed and a bounded same-host benchmark recorded route use, but llama.cpp remained faster on TTFT/total elapsed, so no throughput/support/default-on promotion)
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-1eeef0a5-20260521T2206Z-rust-vnni-scale-cache/README.md` (default-off Rust VNNI scale-cache implementation slice; local Rust parity/gates passed on Darwin arm64, but same-host Ubuntu x86 Camelid vs llama.cpp benchmarking was not feasible in this run, so no throughput/support/default-on promotion)
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260521T2015Z-vnni-rawptr-avx2/README.md` (default-off Rust AVX2 FFN-down VNNI decode raw-pointer implementation slice; local compile check only, with Linux x86_64 AVX2 parity coverage added for canonical host execution and no throughput/support/default-on promotion)
+- `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-1eeef0a5-20260522T0104Z-vnni-decode-chunking/README.md` (Ubuntu x86_64 parity/control-plane follow-on for default-off VNNI raw-pointer decode group chunking; no throughput/support/default-on claim)
 - the retained/reject notes for bounded Ubuntu x86 Q8 experiments kept under `qa/evidence-bundles/`
 
 ## Product/runtime note
