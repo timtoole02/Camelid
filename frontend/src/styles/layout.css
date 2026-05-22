@@ -310,7 +310,7 @@
   min-height: calc(100vh - 170px);
 }
 
-.chat-layout-gemini {
+.chat-layout-assistant {
   grid-template-rows: auto minmax(0, 1fr) auto;
   gap: 0;
   min-height: calc(100vh - 70px);
@@ -324,7 +324,7 @@
   grid-row: 2;
 }
 
-.composer-gemini-floating {
+.composer-assistant-floating {
   grid-row: 3;
   align-self: end;
 }
@@ -334,7 +334,7 @@
   min-height: calc(100vh - 108px);
 }
 
-.chat-layout-gemini.chat-layout-empty {
+.chat-layout-assistant.chat-layout-empty {
   grid-template-rows: auto minmax(0, 1fr);
   min-height: calc(100vh - 70px);
 }
@@ -588,7 +588,7 @@
     min-height: auto;
   }
 
-  .chat-layout-gemini {
+  .chat-layout-assistant {
     min-height: calc(100vh - 70px);
   }
 }

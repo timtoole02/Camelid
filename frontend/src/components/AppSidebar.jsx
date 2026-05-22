@@ -241,12 +241,12 @@ function AppSidebar({
                 </div>
               </div>
 
-              <button className="sidebar-quick-action sidebar-quick-action-gemini" onClick={showNewChatLanding}>
+              <button className="sidebar-quick-action sidebar-quick-action-assistant" onClick={showNewChatLanding}>
                 <span className="sidebar-quick-action-icon" aria-hidden="true">＋</span>
                 <strong>New chat</strong>
               </button>
 
-              <div className="sidebar-search-inline sidebar-search-inline-gemini">
+              <div className="sidebar-search-inline sidebar-search-inline-assistant">
                 <span className="sidebar-search-icon" aria-hidden="true">⌕</span>
                 <input
                   className="sidebar-input sidebar-input-search"
@@ -257,7 +257,7 @@ function AppSidebar({
                 />
               </div>
 
-              <div className="sidebar-flat-section sidebar-flat-section-gemini">
+              <div className="sidebar-flat-section sidebar-flat-section-assistant">
                 <div className="sidebar-flat-label">Workspace</div>
                 <nav className="nav-stack nav-stack-flat" aria-label="Primary navigation">
                   {tabs.map((item) => (
@@ -269,7 +269,7 @@ function AppSidebar({
               </div>
             </div>
 
-            <div className="sidebar-bottom sidebar-bottom-flat sidebar-bottom-gemini">
+            <div className="sidebar-bottom sidebar-bottom-flat sidebar-bottom-assistant">
               <div className="sidebar-list-header sidebar-list-header-flat">
                 <div>
                   <p className="panel-kicker">Chats</p>
@@ -277,7 +277,7 @@ function AppSidebar({
                 <small>{filteredConversations.length}</small>
               </div>
 
-              <div className="conversation-list conversation-list-flat conversation-list-gemini">
+              <div className="conversation-list conversation-list-flat conversation-list-assistant">
                 {groupedConversations.map((group) => (
                   <section key={group.label} className="conversation-group">
                     <div className="conversation-group-label">{group.label}</div>

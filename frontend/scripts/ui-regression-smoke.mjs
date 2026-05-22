@@ -195,7 +195,7 @@ assert.match(componentCss, /\.streaming-loader\s*{[^}]*display:\s*flex[^}]*justi
 assert.match(componentCss, /\.streaming-loader-compact\s*{[^}]*padding:\s*0 0 8px/s, 'compact streaming loader should sit above pre-token assistant content without extra copy')
 assert.match(componentCss, /\.streaming-loader-track\s*{[^}]*display:\s*inline-flex[^}]*gap:\s*10px/s, 'streaming loader should keep a compact centered track')
 assert.match(componentCss, /\.streaming-loader-dot\s*{[^}]*border-radius:\s*999px[^}]*animation:\s*camelid-streaming-dot-bounce/s, 'streaming loader dots should animate while the loader is rendered')
-assert.match(componentCss, /\.message-row-gemini\.assistant::before,[\s\S]*?\.message-row-gemini\.assistant::after\s*{[^}]*content:\s*none !important[^}]*animation:\s*none !important/s, 'assistant row pseudo Pac-Man should stay disabled after moving the loader into the bubble')
+assert.match(componentCss, /\.message-row-assistant\.assistant::before,[\s\S]*?\.message-row-assistant\.assistant::after\s*{[^}]*content:\s*none !important[^}]*animation:\s*none !important/s, 'assistant row pseudo Pac-Man should stay disabled after moving the loader into the bubble')
 assert.match(componentCss, /\.message-code-card\.is-generating\s*{/, 'incomplete streaming code cards should have an active visual treatment')
 assert.match(componentCss, /\.message-code-card\.is-generating figcaption\s*{[^}]*position:\s*sticky[^}]*top:\s*0/s, 'incomplete streaming code cards should keep their generating label anchored while code grows')
 assert.match(componentCss, /\.message-code-card-status\s*{[^}]*display:\s*inline-flex[^}]*gap:\s*6px/s, 'incomplete code badges should be compact and visibly active')
@@ -210,6 +210,6 @@ assert.match(streamingDotRule, /border-radius:\s*999px/, 'streaming dots should 
 const streamingDotKeyframes = componentCss.match(/@keyframes camelid-streaming-dot-bounce\s*{[\s\S]*?\n}/)?.[0] || ''
 assert.match(streamingDotKeyframes, /translateY\(-3px\)/, 'streaming dots should bounce subtly while active')
 assert.match(streamingDotKeyframes, /opacity:\s*1/, 'streaming dots should brighten at peak animation')
-assert.doesNotMatch(componentCss, /\.message-row-gemini\.assistant\.is-streaming::after\s*{/, 'streaming assistant rows must not keep legacy pseudo animations')
+assert.doesNotMatch(componentCss, /\.message-row-assistant\.assistant\.is-streaming::after\s*{/, 'streaming assistant rows must not keep legacy pseudo animations')
 
 console.log('UI regression smoke passed')

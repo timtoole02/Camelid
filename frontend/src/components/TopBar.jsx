@@ -40,6 +40,7 @@ function TopBar({ tab, setTab, selectedConversationTitle, selectedConversationUp
   const activeChatGate = getChatGateState(capabilities, activeModel, runtime)
   const selectedChatGate = getChatGateState(capabilities, selectedModel, runtime)
   const runtimeChatReady = activeChatGate.chatUnlocked
+  const selectedModelRunnable = selectedChatGate.chatUnlocked
   const untitledConversationLabel = selectedConversationTitle
     ? `${formatPreview(selectedConversationPreview, 42)} · ${formatSidebarDate(selectedConversationUpdatedAt) || 'New chat'}`
     : runtimeChatReady
@@ -61,6 +62,12 @@ function TopBar({ tab, setTab, selectedConversationTitle, selectedConversationUp
       ? `${currentCompatibilityTarget.id}: ${formatCapabilityStatus(currentCompatibilityTarget.status)}`
       : 'Open the API contract before treating any model family or quant as supported.')
   const runtimeGateDetail = `loaded_now=${runtime?.loaded_now ? 'true' : 'false'} · generation_ready=${runtime?.generation_ready ? 'true' : 'false'} · exact_compatibility_row=${activeChatGate.contractSupported ? 'true' : 'false'}`
+  const chatReadinessTone = selectedModelRunnable ? 'ready' : runtime?.loaded_now ? 'warm' : 'idle'
+  const chatReadinessLabel = selectedModelRunnable
+    ? 'Ready'
+    : runtime?.loaded_now
+      ? 'Checking'
+      : 'Not ready'
 
   if (tab === 'chat') {
     return (
@@ -70,7 +77,29 @@ function TopBar({ tab, setTab, selectedConversationTitle, selectedConversationUp
           <div className="topbar-chat-center" title={hasCustomConversationTitle ? rawConversationTitle : untitledConversationLabel}>
             {hasCustomConversationTitle ? clampText(rawConversationTitle, 64) : untitledConversationLabel}
           </div>
-          <div className="topbar-chat-actions" />
+          <div className="topbar-chat-actions">
+            {!demoMode && (
+              <div className={`topbar-chat-readiness ${chatReadinessTone}`} title={`${selectedModelSummary} ${runtimeGateDetail}`}>
+                <span className="topbar-chat-readiness-dot" aria-hidden="true" />
+                <select
+                  className="topbar-select topbar-select-chat"
+                  aria-label="Model for chat"
+                  value={selectedModel?.id || selectedModelId || ''}
+                  onChange={(e) => setSelectedModelId(e.target.value)}
+                  disabled={!models.length}
+                >
+                  {models.length ? models.map((model) => (
+                    <option key={model.id} value={model.id}>
+                      {model.name}
+                    </option>
+                  )) : (
+                    <option value="">No models</option>
+                  )}
+                </select>
+                <span className="topbar-chat-readiness-label">{chatReadinessLabel}</span>
+              </div>
+            )}
+          </div>
         </div>
         {!demoMode && (
           <div className="mobile-nav" aria-label="Primary navigation">
@@ -111,19 +140,17 @@ function TopBar({ tab, setTab, selectedConversationTitle, selectedConversationUp
       </div>
       {!demoMode && tab !== 'library' && (
         <div className="topbar-status-strip" aria-label="Model status">
-          <div className={`status-pill topbar-status-pill ${runtimeChatReady ? 'ready' : runtime?.loaded_now ? 'warm' : ''}`} title={`${activeModelLabel} · ${runtimeGateDetail}`}>
+          <div className={`status-pill topbar-status-pill topbar-status-pill-compact ${runtimeChatReady ? 'ready' : runtime?.loaded_now ? 'warm' : ''}`} title={`${activeModelLabel} · ${runtimeGateDetail}`}>
             <span className="topbar-status-label">Runtime chat gate</span>
             <strong>{clampText(activeModelLabel, 32)}</strong>
-            <small>{runtimeGateDetail}</small>
           </div>
-          <div className="status-pill topbar-status-pill topbar-status-pill-wide" title={selectedModelSummary}>
-            <span className="topbar-status-label">Next chat</span>
-            <strong>{clampText(selectedModelLabel, 36)}</strong>
+          <div className="status-pill topbar-status-pill topbar-status-pill-compact topbar-status-pill-wide" title={selectedModelSummary}>
+            <span className="topbar-status-label">Model</span>
+            <strong>{clampText(selectedModelLabel, 32)}</strong>
           </div>
-          <button type="button" className={`status-pill topbar-status-pill topbar-status-pill-wide topbar-status-button ${capabilities ? 'ready' : 'warm'}`} onClick={() => setTab('api')} title={`${supportGateLabel}. ${supportGateDetail}`}>
+          <button type="button" className={`status-pill topbar-status-pill topbar-status-pill-compact topbar-status-pill-wide topbar-status-button ${capabilities ? 'ready' : 'warm'}`} onClick={() => setTab('api')} title={`${supportGateLabel}. ${supportGateDetail}`}>
             <span className="topbar-status-label">Support contract</span>
-            <strong>{clampText(supportGateLabel, 42)}</strong>
-            <small>{clampText(supportGateDetail, 58)}</small>
+            <strong>{clampText(supportGateLabel, 34)}</strong>
           </button>
         </div>
       )}
