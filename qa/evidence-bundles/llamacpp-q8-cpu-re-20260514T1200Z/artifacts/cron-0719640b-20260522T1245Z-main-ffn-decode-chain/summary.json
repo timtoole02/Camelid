@@ -1,0 +1,61 @@
+{
+  "camelid": {
+    "count": 1,
+    "avg_first_byte_ms": 6799.58,
+    "avg_first_event_ms": 6799.68,
+    "avg_ttft_ms": 6799.74,
+    "avg_total_elapsed_ms": 6800.25,
+    "avg_backend_generate_ms": 3015,
+    "avg_backend_first_content_ms": 2661,
+    "avg_backend_q8_calls": 174,
+    "avg_backend_q8_gemm_compute_us": 0,
+    "avg_backend_q8_pack_us": 0,
+    "avg_decode_tok_per_s": 9864.87,
+    "avg_ms_per_token_after_first": 0.1,
+    "avg_completion_tokens_estimate": 5
+  },
+  "llama_cpp": {
+    "count": 1,
+    "avg_first_byte_ms": 575.67,
+    "avg_first_event_ms": 575.85,
+    "avg_ttft_ms": 575.91,
+    "avg_total_elapsed_ms": 934.2,
+    "avg_backend_generate_ms": null,
+    "avg_backend_first_content_ms": null,
+    "avg_backend_q8_calls": null,
+    "avg_backend_q8_gemm_compute_us": null,
+    "avg_backend_q8_pack_us": null,
+    "avg_decode_tok_per_s": 13.95,
+    "avg_ms_per_token_after_first": 71.66,
+    "avg_completion_tokens_estimate": 5
+  },
+  "comparison": {
+    "ttft_delta_pct_vs_llama_cpp": 1080.69,
+    "total_elapsed_delta_pct_vs_llama_cpp": 627.92,
+    "decode_tok_per_s_delta_pct_vs_llama_cpp": 70615.91,
+    "ms_per_token_after_first_delta_pct_vs_llama_cpp": -99.86
+  },
+  "guardrails": {
+    "expected_marker": "CMLD-BENCH",
+    "require_marker": true,
+    "marker_presence": {
+      "camelid": [
+        {
+          "label": "camelid-measure-1",
+          "contains_expected_marker": true,
+          "nonempty_streamed_output": true
+        }
+      ],
+      "llama_cpp": [
+        {
+          "label": "llama-measure-1",
+          "contains_expected_marker": true,
+          "nonempty_streamed_output": true
+        }
+      ]
+    },
+    "passed": true,
+    "note": "The harness exits non-zero if any measured run omits the expected marker; empty measured output is always treated as a failed guardrail."
+  },
+  "telemetry": {}
+}
