@@ -1265,6 +1265,8 @@ fn clear_dense_diagnostic_env() {
         "CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER",
         "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER",
         "CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER",
+        "CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL",
+        "CAMELID_X86_Q8_PACKED_ROWS4_MATMUL",
         "CAMELID_X86_Q8_OUTPUT_DECODE_OWNER",
     ] {
         std::env::remove_var(key);
@@ -1696,7 +1698,7 @@ fn resolved_runtime_plan_captures_q8_env_once() {
     std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL", "on");
     std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_SINGLE_OWNER", "on");
     std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER", "on");
-    std::env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL", "on");
+    std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL", "on");
     std::env::set_var("CAMELID_HYBRID_Q8_GPU_ROWS", "7");
     std::env::set_var("CAMELID_HYBRID_Q8_GPU_PERCENT", "25");
 
@@ -1737,7 +1739,7 @@ fn resolved_runtime_plan_captures_q8_env_once() {
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL");
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_SINGLE_OWNER");
     std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER");
-    std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL");
+    std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL");
     assert!(
         plan.q8.attention_projection_decode_consumer,
         "resolved plan should cache the attention projection consumer gate"
@@ -1801,6 +1803,23 @@ fn resolved_runtime_plan_captures_q8_env_once() {
     assert_eq!(plan.q8.hybrid_gpu_rows, Some(7));
     assert_eq!(plan.q8.hybrid_gpu_percent, 25);
     assert_eq!(plan.q8.hybrid_gpu_rows_for_output(100), 7);
+}
+
+#[test]
+fn x86_q8_ffn_down_packed_rows4_matmul_accepts_role_gate_and_legacy_alias() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+
+    assert!(!Q8RuntimeFlags::from_env().ffn_down_packed_rows4_matmul);
+
+    std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL", "on");
+    assert!(Q8RuntimeFlags::from_env().ffn_down_packed_rows4_matmul);
+
+    std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL");
+    std::env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL", "on");
+    assert!(Q8RuntimeFlags::from_env().ffn_down_packed_rows4_matmul);
+
+    std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL");
 }
 
 #[test]
