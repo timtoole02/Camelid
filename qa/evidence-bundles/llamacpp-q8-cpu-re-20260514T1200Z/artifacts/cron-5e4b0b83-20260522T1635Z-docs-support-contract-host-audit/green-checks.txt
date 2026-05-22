@@ -1,0 +1,29 @@
+source_head=2c0c5d9
+
+refined host-status wording scan:
+no matches: stale host-status substring
+no matches: stale host-status substring
+no matches: stale host-status substring
+no matches: stale host-status substring
+no matches: stale host-status word
+no matches: auth-denial phrase
+
+retired host alias and key shorthand scan:
+no matches: retired-host-or-key-shorthand item
+no matches: retired-host-or-key-shorthand item
+no matches: retired-host-or-key-shorthand item
+no matches: retired-host-or-key-shorthand item
+
+guarded support-contract wording scan:
+rc=0
+matching guarded wording lines reviewed=78
+
+public scrub:
+check-public-scrub rc=0
+
+public evidence claims:
+public evidence claim check passed: 96 manifest(s), 49 summary file(s)
+check-public-evidence-claims rc=0
+
+diff whitespace:
+git diff --check rc=0
