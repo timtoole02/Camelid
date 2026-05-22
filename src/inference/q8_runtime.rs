@@ -54,6 +54,7 @@ impl ResolvedRuntimePlan {
 
 impl Q8RuntimeFlags {
     pub(super) fn from_env() -> Self {
+        let ffn_decode_chain = q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_FFN_DECODE_CHAIN");
         Self {
             block_dot: q8_0_env_flag_enabled_default_on_fail_closed("CAMELID_Q8_0_BLOCK_DOT"),
             file_reader_block_dot: q8_0_env_flag_enabled_default_on_fail_closed(
@@ -87,7 +88,7 @@ impl Q8RuntimeFlags {
                 "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER",
             ) || q8_0_env_flag_enabled_default_off(
                 "CAMELID_MAC_Q8_FFN_GATE_UP_DECODE_CONSUMER",
-            ),
+            ) || ffn_decode_chain,
             ffn_gate_up_decode_group_chunking: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING",
             ),
@@ -99,7 +100,7 @@ impl Q8RuntimeFlags {
             ffn_gate_up_decode_paired_dot: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT",
             ),
-            ffn_decode_chain: q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_FFN_DECODE_CHAIN"),
+            ffn_decode_chain,
             ffn_gate_up_packed_rows4_matmul: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL",
             ),
@@ -110,7 +111,7 @@ impl Q8RuntimeFlags {
                 "CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER",
             ) || q8_0_env_flag_enabled_default_off(
                 "CAMELID_MAC_Q8_FFN_DOWN_DECODE_CONSUMER",
-            ),
+            ) || ffn_decode_chain,
             ffn_down_packed_rows4_matmul: x86_q8_ffn_down_packed_rows4_matmul_enabled(),
             ffn_down_gemm4_prefill: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_DOWN_GEMM4_PREFILL",

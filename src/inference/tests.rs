@@ -3907,6 +3907,30 @@ fn mac_q8_ffn_gate_up_decode_consumer_alias_is_default_off_and_opt_in() {
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT");
 }
 
+#[test]
+fn x86_q8_ffn_decode_chain_opt_in_enables_required_decode_consumers() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+    std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER");
+    std::env::remove_var("CAMELID_MAC_Q8_FFN_GATE_UP_DECODE_CONSUMER");
+    std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER");
+    std::env::remove_var("CAMELID_MAC_Q8_FFN_DOWN_DECODE_CONSUMER");
+    std::env::remove_var("CAMELID_X86_Q8_FFN_DECODE_CHAIN");
+
+    let plan = Q8RuntimeFlags::from_env();
+    assert!(!plan.ffn_decode_chain);
+    assert!(!plan.ffn_gate_up_decode_consumer);
+    assert!(!plan.ffn_down_decode_consumer);
+
+    std::env::set_var("CAMELID_X86_Q8_FFN_DECODE_CHAIN", "on");
+    let plan = Q8RuntimeFlags::from_env();
+    assert!(plan.ffn_decode_chain);
+    assert!(plan.ffn_gate_up_decode_consumer);
+    assert!(plan.ffn_down_decode_consumer);
+
+    std::env::remove_var("CAMELID_X86_Q8_FFN_DECODE_CHAIN");
+}
+
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[test]
 fn x86_q8_ffn_decode_chain_is_default_off_and_matches_split_consumers() {

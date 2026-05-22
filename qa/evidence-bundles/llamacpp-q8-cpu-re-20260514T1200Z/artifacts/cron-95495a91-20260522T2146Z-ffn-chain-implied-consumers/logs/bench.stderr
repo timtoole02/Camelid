@@ -1,0 +1,58 @@
+[llama-server] warning: no usable GPU found, --gpu-layers option will be ignored
+warning: one possible reason is that llama.cpp was compiled without GPU support
+warning: consult docs/build.md for compilation instructions
+0.00.001.967 I log_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.001.970 I device_info:
+0.00.001.977 I   - CPU     : Intel(R) Xeon(R) Platinum 8488C (126759 MiB, 126759 MiB free)
+0.00.002.023 I system_info: n_threads = 16 (n_threads_batch = 16) / 16 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX_VNNI = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | AVX512 = 1 | AVX512_VBMI = 1 | AVX512_VNNI = 1 | AVX512_BF16 = 1 | AMX_INT8 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.00.002.025 I srv          main: n_parallel is set to auto, using n_parallel = 4 and kv_unified = true
+0.00.002.052 I srv          init: running without SSL
+0.00.002.069 I srv          init: using 15 threads for HTTP server
+0.00.002.140 I srv         start: binding port with default address family
+0.00.003.269 I srv          main: loading model
+0.00.003.275 I srv    load_model: loading model '/home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf'
+0.00.003.289 I common_init_result: fitting params to device memory ...
+0.00.003.290 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+[llama-server] 0.00.311.053 I common_params_fit_impl: projected to use 718 MiB of host memory vs. 126759 MiB of total host memory
+[llama-server] 0.00.779.612 W llama_context: n_ctx_seq (512) < n_ctx_train (131072) -- the full capacity of the model will not be utilized
+[llama-server] 0.00.802.601 I srv    load_model: initializing slots, n_slots = 4
+[llama-server] 0.00.858.557 W common_speculative_init: no implementations specified for speculative decoding
+0.00.858.567 I slot   load_model: id  0 | task -1 | new slot, n_ctx = 512
+0.00.858.571 I slot   load_model: id  1 | task -1 | new slot, n_ctx = 512
+0.00.858.571 I slot   load_model: id  2 | task -1 | new slot, n_ctx = 512
+0.00.858.572 I slot   load_model: id  3 | task -1 | new slot, n_ctx = 512
+0.00.858.605 I srv    load_model: prompt cache is enabled, size limit: 8192 MiB
+0.00.858.605 I srv    load_model: use `--cache-ram 0` to disable the prompt cache
+0.00.858.606 I srv    load_model: for more info see https://github.com/ggml-org/llama.cpp/pull/16391
+0.00.858.648 I srv          init: idle slots will be saved to prompt cache and cleared upon starting a new task
+[llama-server] 0.00.863.157 I init: chat template, example_format: '<|start_header_id|>system<|end_header_id|>
+
+Cutting Knowledge Date: December 2023
+Today Date: 22 May 2026
+
+You are a helpful assistant<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+Hello<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+Hi there<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+How are you?<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+'
+[llama-server] 0.00.865.713 I srv          init: init: chat template, thinking = 0
+0.00.865.742 I srv          main: model loaded
+0.00.865.745 I srv          main: server is listening on http://127.0.0.1:18487
+0.00.865.749 I srv  update_slots: all slots are idle
+[llama-server] 0.08.332.981 I slot get_availabl: id  3 | task -1 | selected slot by LRU, t_last = -1
+0.08.332.985 I srv  get_availabl: updating prompt cache
+0.08.332.991 I srv          load:  - looking for better prompt, base f_keep = -1.000, sim = 0.000
+0.08.332.996 I srv        update:  - cache state: 0 prompts, 0.000 MiB (limits: 8192.000 MiB, 512 tokens, 8589934592 est)
+0.08.332.997 I srv  get_availabl: prompt cache update took 0.01 ms
+0.08.333.051 I slot launch_slot_: id  3 | task 0 | processing task, is_child = 0
+[llama-server] 0.08.739.698 I slot print_timing: id  3 | task 0 | prompt eval time =     280.96 ms /    75 tokens (    3.75 ms per token,   266.94 tokens per second)
+0.08.739.704 I slot print_timing: id  3 | task 0 |        eval time =     125.53 ms /     4 tokens (   31.38 ms per token,    31.86 tokens per second)
+0.08.739.705 I slot print_timing: id  3 | task 0 |       total time =     406.49 ms /    79 tokens
+0.08.739.710 I slot print_timing: id  3 | task 0 |    graphs reused =          2
+0.08.739.980 I slot      release: id  3 | task 0 | stop processing: n_tokens = 78, truncated = 0
+0.08.739.999 I srv  update_slots: all slots are idle
+[llama-server] 0.08.747.873 I srv    operator(): operator(): cleaning up before exit...

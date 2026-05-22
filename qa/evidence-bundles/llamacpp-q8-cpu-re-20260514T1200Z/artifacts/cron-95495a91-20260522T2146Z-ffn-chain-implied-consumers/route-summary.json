@@ -1,0 +1,65 @@
+{
+  "camelid_summary": {
+    "count": 1,
+    "avg_first_byte_ms": 6595.78,
+    "avg_first_event_ms": 6595.89,
+    "avg_ttft_ms": 6595.95,
+    "avg_total_elapsed_ms": 6596.59,
+    "avg_backend_generate_ms": 2835,
+    "avg_backend_first_content_ms": 2628,
+    "avg_backend_q8_calls": 228,
+    "avg_backend_q8_gemm_compute_us": 0,
+    "avg_backend_q8_pack_us": 0,
+    "avg_decode_tok_per_s": 6206.9,
+    "avg_ms_per_token_after_first": 0.16,
+    "avg_completion_tokens_estimate": 4
+  },
+  "llama_summary": {
+    "count": 1,
+    "avg_first_byte_ms": 285.63,
+    "avg_first_event_ms": 285.85,
+    "avg_ttft_ms": 285.9,
+    "avg_total_elapsed_ms": 410.2,
+    "avg_backend_generate_ms": null,
+    "avg_backend_first_content_ms": null,
+    "avg_backend_q8_calls": null,
+    "avg_backend_q8_gemm_compute_us": null,
+    "avg_backend_q8_pack_us": null,
+    "avg_decode_tok_per_s": 32.18,
+    "avg_ms_per_token_after_first": 31.08,
+    "avg_completion_tokens_estimate": 4
+  },
+  "ffn_decode_chain_taken": 112,
+  "ffn_decode_chain_total_us": 128318,
+  "ffn_decode_chain_down_us": 45948,
+  "ffn_down_decode_consumer_taken": 112,
+  "routes": {
+    "ffn_down.x86_decode_consumer": {
+      "calls": 112,
+      "elapsed_us": 45948,
+      "input_width": 8192,
+      "output_width": 3072,
+      "role": "ffn_down",
+      "route": "x86_decode_consumer",
+      "rows": 112
+    },
+    "ffn_gate_up.decode_fused_activation": {
+      "calls": 112,
+      "elapsed_us": 75715,
+      "input_width": 3072,
+      "output_width": 8192,
+      "role": "ffn_gate_up",
+      "route": "decode_fused_activation",
+      "rows": 112
+    },
+    "logits.x86_output_decode_owner": {
+      "calls": 4,
+      "elapsed_us": 19785,
+      "input_width": 3072,
+      "output_width": 128256,
+      "role": "logits",
+      "route": "x86_output_decode_owner",
+      "rows": 4
+    }
+  }
+}
