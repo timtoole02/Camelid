@@ -93,11 +93,36 @@ const exactThreeBModel = {
   generation_ready: true,
 }
 
+const retainedEvidenceThreeBModel = {
+  id: 'llama32-3b-q8-current-e9f926e',
+  name: 'llama32-3b-q8-current-e9f926e',
+  runtime_model_name: 'llama32-3b-q8-current-e9f926e',
+  provider_kind: 'local',
+  status: 'ready',
+  model_path: '/models/Llama-3.2-3B-Instruct-Q8_0.gguf',
+  quant: 'file_type 7',
+  loaded_now: true,
+  generation_ready: true,
+}
+
 const exactHint = findCompatibilityHint(capabilities, exactThreeBModel)
 assert.equal(exactHint.target.id, 'llama32_3b_instruct_q8_0', '3B closure must resolve backend run labels through the exact GGUF path plus Q8_0 file_type evidence')
 assert.equal(exactHint.exact, true, '3B closure must be an exact compatibility hint, not a family fallback')
 assert.equal(compatibilityHintLabel(exactHint), 'llama32_3b_instruct_q8_0: supported exact row smoke')
 assert.match(compatibilityHintCopy(exactHint), /runtime generation still requires loaded_now=true and generation_ready=true/)
+const retainedEvidenceRuntime = {
+  active_model_id: 'llama32-3b-q8-current-e9f926e',
+  loaded_now: true,
+  generation_ready: true,
+}
+const retainedEvidenceGate = getChatGateState(capabilities, retainedEvidenceThreeBModel, retainedEvidenceRuntime)
+assert.equal(retainedEvidenceGate.label, 'llama32_3b_instruct_q8_0: supported exact row smoke', 'retained 3B API/WebUI evidence alias must resolve to the exact 3B compatibility row')
+assert.equal(retainedEvidenceGate.chatUnlocked, true, 'retained 3B API/WebUI evidence alias must unlock only when active_model_id, loaded_now, generation_ready, exact GGUF, and Q8_0 evidence all match')
+assert.equal(
+  resolveLoadedModelDisplayName({ fallbackName: retainedEvidenceThreeBModel.name, modelPath: retainedEvidenceThreeBModel.model_path, quantLabel: retainedEvidenceThreeBModel.quant }),
+  LLAMA32_3B_ACCEPTANCE_TARGET.name,
+  'retained 3B API/WebUI evidence alias should display as the canonical exact 3B row from exact GGUF plus decoded file_type 7 evidence',
+)
 const catalogThreeBHint = findCompatibilityHint(capabilities, null, {
   name: 'Llama 3.2 3B Instruct Q8_0',
   repo_id: 'bartowski/Llama-3.2-3B-Instruct-GGUF',
