@@ -6,9 +6,9 @@ Host gate: `Linux x86_64` on the canonical Ubuntu validation host.
 
 Source: `origin/main`, head `68fa3a65edf3c70d31bd8f15108dc851d54782ec` (`perf(q8): gate x86 FFN decode chain (#82)`).
 
-Model: `/home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf`
+Model: `<ubuntu-model-dir>/Llama-3.2-3B-Instruct-Q8_0.gguf`
 
-llama.cpp: `/home/ubuntu/work/llama.cpp-clean-20260517/build/bin/llama-server`
+llama.cpp: `<ubuntu-workdir>/llama.cpp-clean-20260517/build/bin/llama-server`
 
 ## Result
 
@@ -42,7 +42,7 @@ The reported Camelid post-first-token throughput is not a promotion signal here;
 Cargo target discipline:
 
 ```bash
-export CARGO_TARGET_DIR=/home/ubuntu/work/camelid-targets/cron-0719640b-main-20260522T1245Z
+export CARGO_TARGET_DIR=<ubuntu-workdir>/camelid-targets/cron-0719640b-main-20260522T1245Z
 ```
 
 Validation/build commands:
@@ -65,7 +65,6 @@ timeout 600s node scripts/bench-llama3-same-host.mjs --backend http://127.0.0.1:
 
 ## Files
 
-- `same-host-main-ffn-decode-chain.json`: full same-host benchmark artifact.
 - `summary.json`: compact metrics summary copied from the benchmark artifact.
 - `SHA256SUMS`: artifact checksums using repository-relative filenames.
 
