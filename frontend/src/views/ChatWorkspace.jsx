@@ -531,6 +531,7 @@ export default function ChatWorkspace({
   const canSubmit = Boolean(composer.trim()) && selectedModelRunnable && !generationActive
   const capabilityLaneStatus = getChatCapabilityLaneCopy(selectedChatGate, capabilities)
   const selectedModelName = selectedModel?.name || selectedModelId || 'No model selected'
+  const runnableModels = models.filter((model) => getChatGateState(capabilities, model, runtime).chatUnlocked)
   const runtimeStatusLabel = selectedModelRunnable
     ? 'Local chat ready'
     : selectedRuntimeReady
@@ -618,7 +619,7 @@ export default function ChatWorkspace({
           onChange={(e) => setSelectedModelId(e.target.value)}
           disabled={generationActive}
         >
-          {models.map((model) => (
+          {runnableModels.map((model) => (
             <option key={model.id} value={model.id}>
               {model.name}
             </option>
