@@ -319,6 +319,28 @@ function StreamingLoader({ elapsedSeconds, label = ACTIVE_STREAMING_LABEL, compa
   )
 }
 
+function AutoResizeTextarea({ value, disabled, rows = 2, className = '', ...props }) {
+  const textareaRef = useRef(null)
+
+  useLayoutEffect(() => {
+    const textarea = textareaRef.current
+    if (!textarea) return
+    textarea.style.height = 'auto'
+    textarea.style.height = `${textarea.scrollHeight}px`
+  }, [value, disabled])
+
+  return (
+    <textarea
+      ref={textareaRef}
+      className={className}
+      value={value}
+      disabled={disabled}
+      rows={rows}
+      {...props}
+    />
+  )
+}
+
 function LiveGenerationBadge({ elapsedSeconds, label = ACTIVE_STREAMING_LABEL }) {
   return (
     <div className="message-live-generation-badge" role="status" aria-live="polite" data-live-status="active">
@@ -699,19 +721,6 @@ export default function ChatWorkspace({
                 renderReadinessPills()
               )}
 
-              {!selectedModelRunnable && (
-                <div className={`chat-empty-status-panel is-${readinessState}`} role="status" aria-live="polite">
-                  <div>
-                    <span>{readinessLabel}</span>
-                    <strong>{readinessActionLabel}</strong>
-                    <p>{readinessActionCopy}</p>
-                  </div>
-                  <button type="button" className="ghost-button ghost-button-quiet" onClick={() => setTab(apiUnavailable ? 'api' : 'library')}>
-                    {apiUnavailable ? 'Open API' : hasModels ? 'Open Models' : 'Add model'}
-                  </button>
-                </div>
-              )}
-
               {selectedModelRunnable && (
                 <div className="demo-prompt-panel" aria-label="Prompt starters">
                   <span>Starters</span>
@@ -726,7 +735,7 @@ export default function ChatWorkspace({
               )}
 
               <div className="composer composer-assistant composer-assistant-stage composer-assistant-stage-clean composer-assistant-product">
-                <textarea className="composer-input composer-input-assistant composer-input-assistant-stage" aria-label="Message Camelid" value={composer} onChange={(e) => setComposer(e.target.value)} onKeyDown={handleComposerKeyDown} rows={2} placeholder={selectedModelRunnable ? 'Message Camelid…' : apiUnavailable ? 'Connect Camelid first' : hasModels ? 'Load a model first' : 'Add a model first'} disabled={generationActive || !selectedModelRunnable} />
+                <AutoResizeTextarea className="composer-input composer-input-assistant composer-input-assistant-stage" aria-label="Message Camelid" value={composer} onChange={(e) => setComposer(e.target.value)} onKeyDown={handleComposerKeyDown} rows={2} placeholder={selectedModelRunnable ? 'Message Camelid…' : apiUnavailable ? 'Connect Camelid first' : hasModels ? 'Load a model first' : 'Add a model first'} disabled={generationActive || !selectedModelRunnable} />
                 <div className="composer-assistant-footer composer-assistant-footer-stage composer-assistant-footer-stage-clean">
                   <div className="composer-assistant-tools composer-assistant-tools-stage composer-assistant-tools-stage-clean">
                     {renderModelPicker()}
@@ -741,6 +750,19 @@ export default function ChatWorkspace({
                 </div>
                 <p id="chat-readiness-note" className={`composer-assistant-readiness-note is-${readinessState}`}>{readinessFinePrint}</p>
               </div>
+
+              {!selectedModelRunnable && (
+                <div className={`chat-empty-status-panel is-${readinessState}`} role="status" aria-live="polite">
+                  <div>
+                    <span>{readinessLabel}</span>
+                    <strong>{readinessActionLabel}</strong>
+                    <p>{readinessActionCopy}</p>
+                  </div>
+                  <button type="button" className="ghost-button ghost-button-quiet" onClick={() => setTab(apiUnavailable ? 'api' : 'library')}>
+                    {apiUnavailable ? 'Open API' : hasModels ? 'Open Models' : 'Add model'}
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         ) : (
@@ -802,7 +824,7 @@ export default function ChatWorkspace({
 
       {!isFreshThread && (
         <div className="composer composer-assistant composer-assistant-floating">
-          <textarea className="composer-input composer-input-assistant" aria-label="Message Camelid" value={composer} onChange={(e) => setComposer(e.target.value)} onKeyDown={handleComposerKeyDown} rows={3} placeholder={selectedModelRunnable ? 'Ask Camelid' : 'Choose a ready model first'} disabled={generationActive || !selectedModelRunnable} />
+          <AutoResizeTextarea className="composer-input composer-input-assistant" aria-label="Message Camelid" value={composer} onChange={(e) => setComposer(e.target.value)} onKeyDown={handleComposerKeyDown} rows={3} placeholder={selectedModelRunnable ? 'Ask Camelid' : 'Choose a ready model first'} disabled={generationActive || !selectedModelRunnable} />
           <div className="composer-assistant-footer">
             <div className="composer-assistant-tools">
               {renderModelPicker()}
