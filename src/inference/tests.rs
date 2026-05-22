@@ -3991,6 +3991,79 @@ fn x86_q8_ffn_decode_chain_is_default_off_and_matches_split_consumers() {
     std::env::remove_var("CAMELID_X86_Q8_FFN_DECODE_CHAIN");
 }
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[test]
+fn x86_q8_ffn_decode_chain_route_resolver_fails_closed_on_incomplete_inputs() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+
+    let (input, packed_gate, packed_up, _expected_gate_up) = runtime_packed_ffn_gate_up_case();
+    let (_down_input, packed_down, _expected_down) = runtime_packed_ffn_down_case();
+    let plan = ffn_decode_chain_plan();
+
+    let route = resolve_x86_q8_ffn_decode_chain_route(
+        &input,
+        &packed_gate,
+        &packed_up,
+        &packed_down,
+        &plan,
+    )
+    .unwrap()
+    .expect("complete runtime-packed chain route");
+    assert_eq!(route.route_label, "x86_decode_chain");
+    assert_eq!(route.input_width, input.dim(1).unwrap());
+    assert_eq!(route.activation_width, packed_gate.dim(1).unwrap());
+    assert_eq!(route.output_width, packed_down.dim(1).unwrap());
+
+    let mut gate_up_disabled = plan;
+    gate_up_disabled.q8.ffn_gate_up_decode_consumer = false;
+    assert!(resolve_x86_q8_ffn_decode_chain_route(
+        &input,
+        &packed_gate,
+        &packed_up,
+        &packed_down,
+        &gate_up_disabled,
+    )
+    .unwrap()
+    .is_none());
+
+    let mut down_disabled = plan;
+    down_disabled.q8.ffn_down_decode_consumer = false;
+    assert!(resolve_x86_q8_ffn_decode_chain_route(
+        &input,
+        &packed_gate,
+        &packed_up,
+        &packed_down,
+        &down_disabled,
+    )
+    .unwrap()
+    .is_none());
+
+    let mut missing_gate_storage = packed_gate.clone();
+    missing_gate_storage.q8_0_runtime_storage = None;
+    assert!(resolve_x86_q8_ffn_decode_chain_route(
+        &input,
+        &missing_gate_storage,
+        &packed_up,
+        &packed_down,
+        &plan,
+    )
+    .unwrap()
+    .is_none());
+
+    let mut mismatched_down_shape = packed_down.clone();
+    mismatched_down_shape.shape.dims = vec![Q8_0_BLOCK_VALUES, packed_down.dim(1).unwrap()];
+    assert!(resolve_x86_q8_ffn_decode_chain_route(
+        &input,
+        &packed_gate,
+        &packed_up,
+        &mismatched_down_shape,
+        &plan,
+    )
+    .unwrap()
+    .is_none());
+}
+
 #[test]
 fn q8_ffn_down_consumer_matches_runtime_packed_baseline() {
     let _env_guard = env_lock();

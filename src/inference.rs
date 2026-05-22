@@ -8350,69 +8350,21 @@ fn try_x86_q8_ffn_decode_chain_path(
     down_name: &str,
     runtime_plan: &ResolvedRuntimePlan,
 ) -> Result<Option<Q8FfnDecodeChainOutput>> {
-    if !runtime_plan.q8.ffn_decode_chain
-        || !runtime_plan.q8.ffn_gate_up_decode_consumer
-        || !runtime_plan.q8.ffn_down_decode_consumer
-        || input.rank() != 2
-        || input.dim(0)? != 1
-    {
-        return Ok(None);
-    }
-
-    let input_width = input.dim(1)?;
-    if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
-        record_q8_schedule_projection_route_denial(
-            "ffn_gate_up_down",
-            "x86_decode_chain",
-            "input_width_not_q8_block_multiple",
-            1,
-            input_width,
-            0,
-        );
-        return Ok(None);
-    }
-    let Some((gate_packed, gate_width)) = q8_0_runtime_packed_projection(gate_weight, input_width)?
+    let Some(route) = resolve_x86_q8_ffn_decode_chain_route(
+        input,
+        gate_weight,
+        up_weight,
+        down_weight,
+        runtime_plan,
+    )?
     else {
-        record_q8_schedule_projection_route_denial(
-            "ffn_gate_up_down",
-            "x86_decode_chain",
-            "missing_gate_runtime_packed_rows4",
-            1,
-            input_width,
-            0,
-        );
         return Ok(None);
     };
-    let Some((up_packed, up_width)) = q8_0_runtime_packed_projection(up_weight, input_width)?
-    else {
-        record_q8_schedule_projection_route_denial(
-            "ffn_gate_up_down",
-            "x86_decode_chain",
-            "missing_up_runtime_packed_rows4",
-            1,
-            input_width,
-            gate_width,
-        );
-        return Ok(None);
-    };
-    if gate_width != up_width
-        || gate_packed.interleave != Q8_0PackedRows4Interleave::I8
-        || up_packed.interleave != Q8_0PackedRows4Interleave::I8
-    {
-        record_q8_schedule_projection_route_denial(
-            "ffn_gate_up_down",
-            "x86_decode_chain",
-            "gate_up_packed_shape_or_interleave_mismatch",
-            1,
-            input_width,
-            gate_width,
-        );
-        return Ok(None);
-    }
+    debug_assert_eq!(route.route_label, "x86_decode_chain");
 
     let total_started = Instant::now();
     let input_quantize_started = Instant::now();
-    let quantized_input = quantize_q8_0_row(&input.data[..input_width]);
+    let quantized_input = quantize_q8_0_row(&input.data[..route.input_width]);
     add_q8_schedule_counter(
         &Q8_SCHED_FFN_DECODE_CHAIN_INPUT_QUANTIZE_US,
         input_quantize_started.elapsed().as_micros() as u64,
@@ -8421,9 +8373,9 @@ fn try_x86_q8_ffn_decode_chain_path(
     let order = diagnostic_ffn_gate_up_order()?;
     let gate_up_started = Instant::now();
     let activated = q8_0_packed_rows4_single_input_projection_pair_activated_from_quantized(
-        gate_packed,
-        up_packed,
-        gate_width,
+        route.gate,
+        route.up,
+        route.activation_width,
         activated_name,
         order,
         &quantized_input.blocks,
@@ -8435,32 +8387,13 @@ fn try_x86_q8_ffn_decode_chain_path(
         "decode_fused_activation",
         Some(activated_name),
         1,
-        input_width,
-        gate_width,
+        route.input_width,
+        route.activation_width,
         gate_up_elapsed,
     );
 
-    let Some(down_route) = resolve_x86_q8_ffn_down_route(
-        &activated,
-        down_weight,
-        "ffn_down",
-        runtime_plan,
-        X86Q8FfnDownRouteKind::Decode,
-    )?
-    else {
-        record_q8_schedule_projection_route_denial(
-            "ffn_gate_up_down",
-            "x86_decode_chain",
-            "missing_down_runtime_packed_rows4",
-            1,
-            gate_width,
-            0,
-        );
-        return Ok(None);
-    };
-
     let activation_quantize_started = Instant::now();
-    let quantized_activated = quantize_q8_0_row(&activated.data[..down_route.input_width]);
+    let quantized_activated = quantize_q8_0_row(&activated.data[..route.activation_width]);
     add_q8_schedule_counter(
         &Q8_SCHED_FFN_DECODE_CHAIN_ACTIVATION_QUANTIZE_US,
         activation_quantize_started.elapsed().as_micros() as u64,
@@ -8470,9 +8403,9 @@ fn try_x86_q8_ffn_decode_chain_path(
     let decode_group_chunking = mac_q8_ffn_down_decode_group_chunking_enabled()
         || x86_q8_ffn_down_decode_group_chunking_enabled();
     let output = q8_0_packed_rows4_single_input_projection_with_decode_chunking(
-        down_route.packed,
+        route.down,
         &quantized_activated.blocks,
-        down_route.output_width,
+        route.output_width,
         down_name,
         decode_group_chunking,
     )?;
@@ -8489,8 +8422,8 @@ fn try_x86_q8_ffn_decode_chain_path(
         q8_ffn_down_decode_consumer_route_name(decode_group_chunking),
         Some(down_name),
         1,
-        down_route.input_width,
-        down_route.output_width,
+        route.activation_width,
+        route.output_width,
         down_elapsed,
     );
 
@@ -8501,6 +8434,119 @@ fn try_x86_q8_ffn_decode_chain_path(
         up: gate_up_elapsed - gate_elapsed,
         activation: 0,
         down: down_elapsed,
+    }))
+}
+
+struct Q8FfnDecodeChainRoute<'a> {
+    gate: &'a Q8_0PackedRows4,
+    up: &'a Q8_0PackedRows4,
+    down: &'a Q8_0PackedRows4,
+    input_width: usize,
+    activation_width: usize,
+    output_width: usize,
+    route_label: &'static str,
+}
+
+fn resolve_x86_q8_ffn_decode_chain_route<'a>(
+    input: &CpuTensor,
+    gate_weight: &'a CpuTensor,
+    up_weight: &'a CpuTensor,
+    down_weight: &'a CpuTensor,
+    runtime_plan: &ResolvedRuntimePlan,
+) -> Result<Option<Q8FfnDecodeChainRoute<'a>>> {
+    const ROUTE_LABEL: &str = "x86_decode_chain";
+    if !runtime_plan.q8.ffn_decode_chain
+        || !runtime_plan.q8.ffn_gate_up_decode_consumer
+        || !runtime_plan.q8.ffn_down_decode_consumer
+        || input.rank() != 2
+        || input.dim(0)? != 1
+    {
+        return Ok(None);
+    }
+
+    let input_width = input.dim(1)?;
+    if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up_down",
+            ROUTE_LABEL,
+            "input_width_not_q8_block_multiple",
+            1,
+            input_width,
+            0,
+        );
+        return Ok(None);
+    }
+    let Some((gate_packed, gate_width)) = q8_0_runtime_packed_projection(gate_weight, input_width)?
+    else {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up_down",
+            ROUTE_LABEL,
+            "missing_gate_runtime_packed_rows4",
+            1,
+            input_width,
+            0,
+        );
+        return Ok(None);
+    };
+    let Some((up_packed, up_width)) = q8_0_runtime_packed_projection(up_weight, input_width)?
+    else {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up_down",
+            ROUTE_LABEL,
+            "missing_up_runtime_packed_rows4",
+            1,
+            input_width,
+            gate_width,
+        );
+        return Ok(None);
+    };
+    if gate_width != up_width
+        || gate_packed.interleave != Q8_0PackedRows4Interleave::I8
+        || up_packed.interleave != Q8_0PackedRows4Interleave::I8
+    {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up_down",
+            ROUTE_LABEL,
+            "gate_up_packed_shape_or_interleave_mismatch",
+            1,
+            input_width,
+            gate_width,
+        );
+        return Ok(None);
+    }
+
+    let Some((down_packed, down_width)) = q8_0_runtime_packed_projection(down_weight, gate_width)?
+    else {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up_down",
+            ROUTE_LABEL,
+            "missing_down_runtime_packed_rows4",
+            1,
+            gate_width,
+            0,
+        );
+        return Ok(None);
+    };
+    if down_packed.interleave != Q8_0PackedRows4Interleave::I8 {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up_down",
+            ROUTE_LABEL,
+            "down_packed_shape_or_interleave_mismatch",
+            1,
+            gate_width,
+            down_width,
+        );
+        return Ok(None);
+    }
+
+    Ok(Some(Q8FfnDecodeChainRoute {
+        gate: gate_packed,
+        up: up_packed,
+        down: down_packed,
+        input_width,
+        activation_width: gate_width,
+        output_width: down_width,
+        route_label: ROUTE_LABEL,
     }))
 }
 
