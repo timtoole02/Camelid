@@ -469,11 +469,14 @@ fn select_linux_x86_q8_plan(
         optional_x86_q8_gate("CAMELID_X86_Q8_FFN_GATE_UP_SINGLE_OWNER"),
     );
     env_updates.insert("CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER", Some("off"));
-    env_updates.insert("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER", Some("off"));
+    env_updates.insert(
+        "CAMELID_X86_Q8_OUTPUT_DECODE_OWNER",
+        optional_x86_q8_gate("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER"),
+    );
     reasons.push("validated Ubuntu/Linux x86_64 Rust Q8 runtime repack enabled".into());
     reasons.push("validated Rust AVX2 Q8 packed rows4 kernel selected".into());
     reasons.push(
-        "attention, FFN, and output decode-consumer experiments remain disabled by execution plan"
+        "attention, FFN, and output decode-consumer experiments remain default-off unless explicitly opted in"
             .into(),
     );
     reasons.push("experimental profile active; support claims remain unchanged".into());
@@ -1276,6 +1279,7 @@ mod tests {
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_AMX_PREFILL", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR", "on");
+        env::set_var("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER", "on");
         let outcome = plan_for_model_with_platform(
             &PathBuf::from("/tmp/Llama-3.2-3B-Instruct-Q8_0.gguf"),
             &fixture("Llama 3.2 3B Instruct"),
@@ -1327,6 +1331,12 @@ mod tests {
         assert_eq!(
             outcome
                 .env_updates
+                .get("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER"),
+            Some(&Some("on"))
+        );
+        assert_eq!(
+            outcome
+                .env_updates
                 .get("CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL"),
             Some(&Some("off"))
         );
@@ -1357,6 +1367,7 @@ mod tests {
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_SINGLE_OWNER", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR", "on");
+        env::set_var("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER", "on");
 
         PlannerEnv::capture().apply(&BTreeMap::new());
 
@@ -1380,6 +1391,7 @@ mod tests {
         assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_SINGLE_OWNER").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR").is_err());
+        assert!(env::var("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER").is_err());
         clear_profile_env();
     }
 

@@ -505,6 +505,7 @@ struct Q8RuntimeFlags {
     attention_qkv_decode_group_chunking: bool,
     attention_qkv_packed_rows4_matmul: bool,
     output_packed_rows4_matmul: bool,
+    output_decode_owner: bool,
     ffn_gate_up_decode_consumer: bool,
     ffn_gate_up_decode_group_chunking: bool,
     ffn_gate_up_packed_rows4_matmul: bool,
@@ -566,6 +567,9 @@ impl Q8RuntimeFlags {
             ),
             output_packed_rows4_matmul: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL",
+            ),
+            output_decode_owner: q8_0_env_flag_enabled_default_off(
+                "CAMELID_X86_Q8_OUTPUT_DECODE_OWNER",
             ),
             ffn_gate_up_decode_consumer: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER",
@@ -5678,7 +5682,9 @@ fn output_projection_with_layout_with_plan(
             {
                 return Ok(output);
             }
-            if let Some(output) = try_x86_q8_output_decode_owner_path(input, weight, &name)? {
+            if let Some(output) =
+                try_x86_q8_output_decode_owner_path(input, weight, &name, runtime_plan)?
+            {
                 return Ok(output);
             }
             let token_major = borrowed_linear_weight_as_transposed(weight, input_width)?;
@@ -7875,17 +7881,6 @@ impl BorrowedQuantizedQ8_0Rows<'_> {
     }
 }
 
-fn x86_q8_output_decode_owner_enabled() -> bool {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        env_flag_enabled("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER")
-    }
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-    {
-        false
-    }
-}
-
 fn try_x86_q8_output_packed_rows4_matmul_path(
     input: &CpuTensor,
     weight: &CpuTensor,
@@ -7919,31 +7914,116 @@ fn try_x86_q8_output_decode_owner_path(
     input: &CpuTensor,
     weight: &CpuTensor,
     name: &str,
+    runtime_plan: &ResolvedRuntimePlan,
 ) -> Result<Option<CpuTensor>> {
-    if !x86_q8_output_decode_owner_enabled()
-        || input.rank() != 2
-        || input.dim(0)? != 1
-        || weight.name != "output.weight"
-        || weight.source_type != Some(GgufTensorType::Q8_0)
-    {
+    if !runtime_plan.q8.output_decode_owner {
+        return Ok(None);
+    }
+    let rows_for_telemetry = input.dim(0).unwrap_or(0);
+    let input_width_for_telemetry = input.dim(1).unwrap_or(0);
+    let output_width_for_telemetry = if weight.rank() == 2 {
+        let weight_rows = weight.dim(0).unwrap_or(0);
+        let weight_cols = weight.dim(1).unwrap_or(0);
+        if weight_rows == input_width_for_telemetry {
+            weight_cols
+        } else if weight_cols == input_width_for_telemetry {
+            weight_rows
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    if input.rank() != 2 || rows_for_telemetry != 1 {
+        record_q8_schedule_projection_route_denial(
+            "logits",
+            "x86_output_decode_owner",
+            "shape_or_role_mismatch",
+            rows_for_telemetry,
+            input_width_for_telemetry,
+            output_width_for_telemetry,
+        );
+        return Ok(None);
+    }
+    if weight.name != "output.weight" {
+        record_q8_schedule_projection_route_denial(
+            "logits",
+            "x86_output_decode_owner",
+            "output_weight_not_materialized",
+            rows_for_telemetry,
+            input_width_for_telemetry,
+            output_width_for_telemetry,
+        );
+        return Ok(None);
+    }
+    if weight.source_type != Some(GgufTensorType::Q8_0) {
+        record_q8_schedule_projection_route_denial(
+            "logits",
+            "x86_output_decode_owner",
+            "source_not_q8_0",
+            rows_for_telemetry,
+            input_width_for_telemetry,
+            output_width_for_telemetry,
+        );
         return Ok(None);
     }
     let input_width = input.dim(1)?;
+    if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        record_q8_schedule_projection_route_denial(
+            "logits",
+            "x86_output_decode_owner",
+            "input_width_not_q8_block_multiple",
+            1,
+            input_width,
+            output_width_for_telemetry,
+        );
+        return Ok(None);
+    }
     let borrowed = borrowed_linear_weight_as_transposed(weight, input_width)?;
     let Some((packed, interleave)) = q8_0_selected_borrowed_packed_rows4(borrowed) else {
+        record_q8_schedule_projection_route_denial(
+            "logits",
+            "x86_output_decode_owner",
+            "missing_runtime_packed_rows4",
+            1,
+            input_width,
+            borrowed.rows,
+        );
         return Ok(None);
     };
     if interleave != Q8_0PackedRows4Interleave::I8
         || packed.rows != borrowed.rows
         || packed.blocks_per_row != input_width / Q8_0_BLOCK_VALUES
-        || !input_width.is_multiple_of(Q8_0_BLOCK_VALUES)
         || !borrowed.rows.is_multiple_of(4)
     {
+        record_q8_schedule_projection_route_denial(
+            "logits",
+            "x86_output_decode_owner",
+            "packed_projection_shape_or_interleave_mismatch",
+            1,
+            input_width,
+            borrowed.rows,
+        );
         return Ok(None);
     }
+    let telemetry_started = q8_schedule_telemetry_enabled().then(Instant::now);
     let quantized_input = quantize_q8_0_row(&input.data[..input_width]);
-    q8_0_packed_rows4_single_input_projection(packed, &quantized_input.blocks, borrowed.rows, name)
-        .map(Some)
+    let output = q8_0_packed_rows4_single_input_projection(
+        packed,
+        &quantized_input.blocks,
+        borrowed.rows,
+        name,
+    )?;
+    record_q8_schedule_projection_route_elapsed(
+        "logits",
+        "x86_output_decode_owner",
+        name,
+        1,
+        input_width,
+        borrowed.rows,
+        telemetry_started,
+    );
+    Ok(Some(output))
 }
 
 fn x86_q8_attention_qkv_prefill_consumer_enabled() -> bool {
