@@ -1,0 +1,79 @@
+schema=camelid.same_host_stream_timing_summary.v1
+input=same-host-bench.json
+runs=1
+client_first_byte_mean_ms=6595.780
+camelid_ttft_mean_ms=6595.950
+backend_first_content_mean_ms=2628.000
+backend_generate_mean_ms=2835.000
+first_content_minus_first_byte_mean_ms=0.170
+backend_generate_minus_first_byte_mean_ms=-3760.780
+backend_generate_minus_first_content_mean_ms=207.000
+prompt_eval_forward_mean_ms=2597.770
+prompt_eval_logits_mean_ms=5.060
+prompt_eval_sample_mean_ms=0.213
+first_content_minus_prompt_eval_forward_mean_ms=30.230
+first_content_minus_prompt_eval_forward_plus_sample_mean_ms=30.017
+role_yield_mean_ms=0.000
+first_content_yield_mean_ms=2628.000
+final_yield_mean_ms=2835.000
+client_first_byte_minus_role_yield_mean_ms=6595.780
+client_first_content_minus_content_yield_mean_ms=3967.950
+client_done_minus_final_yield_mean_ms=3761.590
+llama_cpp_ttft_mean_ms=285.900
+client_minus_backend_first_content_mean_ms=3967.950
+backend_first_content_delta_vs_llama_cpp_mean_ms=2342.100
+q8_calls_mean=228.000
+q8_total_gemm_mean_ms=0.000
+q8_total_pack_mean_ms=0.000
+q8_fused_gate_up_calls_mean=0.000
+q8_gate_up_decode_consumer_activation_mean_ms=0.000
+q8_gate_up_decode_consumer_tensor_mean_ms=0.000
+q8_gate_up_decode_consumer_post_route_mean_ms=0.000
+projection_route_calls_mean=228.000
+top_roles:
+1. generation.ffn_down mean=650.313ms p95=650.313ms
+2. prefill.ffn_down mean=604.365ms p95=604.365ms
+3. generation.ffn_up mean=563.262ms p95=563.262ms
+4. generation.ffn_gate mean=548.733ms p95=548.733ms
+5. prefill.ffn_up mean=525.378ms p95=525.378ms
+6. prefill.ffn_gate mean=510.902ms p95=510.902ms
+top_q8_gemm_roles:
+top_projection_routes:
+1. ffn_gate_up.decode_fused_activation elapsed_mean=75.715ms calls_mean=112.000 rows_mean=112.000 width=3072.000x8192.000
+2. ffn_down.x86_decode_consumer elapsed_mean=45.948ms calls_mean=112.000 rows_mean=112.000 width=8192.000x3072.000
+3. logits.x86_output_decode_owner elapsed_mean=19.785ms calls_mean=4.000 rows_mean=4.000 width=3072.000x128256.000
+top_projection_layer_routes:
+1. layer_21.ffn_gate_up.decode_fused_activation elapsed_mean=2.829ms calls_mean=4.000 width=3072.000x8192.000
+2. layer_17.ffn_gate_up.decode_fused_activation elapsed_mean=2.798ms calls_mean=4.000 width=3072.000x8192.000
+3. layer_6.ffn_gate_up.decode_fused_activation elapsed_mean=2.783ms calls_mean=4.000 width=3072.000x8192.000
+4. layer_12.ffn_gate_up.decode_fused_activation elapsed_mean=2.776ms calls_mean=4.000 width=3072.000x8192.000
+5. layer_1.ffn_gate_up.decode_fused_activation elapsed_mean=2.732ms calls_mean=4.000 width=3072.000x8192.000
+6. layer_16.ffn_gate_up.decode_fused_activation elapsed_mean=2.730ms calls_mean=4.000 width=3072.000x8192.000
+7. layer_10.ffn_gate_up.decode_fused_activation elapsed_mean=2.718ms calls_mean=4.000 width=3072.000x8192.000
+8. layer_25.ffn_gate_up.decode_fused_activation elapsed_mean=2.717ms calls_mean=4.000 width=3072.000x8192.000
+projection_route_denials:
+1. ffn_down.x86_vnni_decode_consumer.gate_off denials_mean=308.000 rows_mean=14812.000 reason=gate_off
+2. ffn_down.x86_gemm4_prefill.plan_off denials_mean=28.000 rows_mean=2100.000 reason=plan_off
+3. ffn_gate_up.packed_rows4_matmul_prefill.plan_off denials_mean=28.000 rows_mean=2100.000 reason=plan_off
+top_layer_role_hotspots:
+1. generation.L0.ffn_gate mean=27.074ms p95=27.074ms
+2. generation.L0.ffn_up mean=26.704ms p95=26.704ms
+3. prefill.L0.ffn_gate mean=25.724ms p95=25.724ms
+4. prefill.L0.ffn_up mean=25.353ms p95=25.353ms
+5. generation.L22.ffn_down mean=23.674ms p95=23.674ms
+6. generation.L24.ffn_down mean=23.494ms p95=23.494ms
+top_layer_route_role_gaps:
+1. generation.L0.ffn_gate_up.decode_fused_activation role_mean=53.778ms route_mean=2.701ms role_minus_route_mean=51.077ms matched=ffn_gate+ffn_up
+2. prefill.L0.ffn_gate_up.decode_fused_activation role_mean=51.077ms route_mean=2.701ms role_minus_route_mean=48.376ms matched=ffn_gate+ffn_up
+3. generation.L22.ffn_down.x86_decode_consumer role_mean=23.674ms route_mean=1.626ms role_minus_route_mean=22.048ms matched=ffn_down
+4. generation.L8.ffn_down.x86_decode_consumer role_mean=23.492ms route_mean=1.483ms role_minus_route_mean=22.009ms matched=ffn_down
+5. generation.L17.ffn_down.x86_decode_consumer role_mean=23.410ms route_mean=1.569ms role_minus_route_mean=21.841ms matched=ffn_down
+6. generation.L0.ffn_down.x86_decode_consumer role_mean=23.370ms route_mean=1.578ms role_minus_route_mean=21.792ms matched=ffn_down
+7. generation.L13.ffn_down.x86_decode_consumer role_mean=23.376ms route_mean=1.608ms role_minus_route_mean=21.768ms matched=ffn_down
+8. generation.L24.ffn_down.x86_decode_consumer role_mean=23.494ms route_mean=1.738ms role_minus_route_mean=21.756ms matched=ffn_down
+role_focus_logits_attention:
+1. attention_output total_mean=456.393ms prefill=204.001ms first_token=10.179ms generation=242.213ms
+2. attention_context total_mean=124.662ms prefill=47.832ms first_token=5.774ms generation=71.056ms
+3. logits total_mean=24.864ms prefill=0.000ms first_token=5.060ms generation=19.804ms
+top_backend_first_content_outliers:
+camelid-measure-1: backend_first_content=2628.000ms over_mean=0.000ms q8_calls=228 role_deltas=[prefill.attention_context+0.000ms, prefill.attention_output+0.000ms, prefill.ffn_down+0.000ms]
