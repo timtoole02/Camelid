@@ -310,6 +310,72 @@ fn x86_q8_avx2_packed_rows4_decode_hoist_projection_matches_scalar_dot() {
     std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_DECODE_HOIST");
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn x86_q8_packed_rows4_decode_rawptr_avx2_matches_scalar_projection() {
+    let _env_guard = env_lock();
+    std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_DECODE_RAWPTR_AVX2");
+    assert!(!x86_q8_packed_rows4_decode_rawptr_avx2_enabled());
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return;
+    }
+
+    let blocks_per_row = 3;
+    let rows = 8;
+    let packed = Q8_0PackedRows4 {
+        rows,
+        blocks_per_row,
+        interleave: Q8_0PackedRows4Interleave::I8,
+        amx_blocks: None,
+        vnni_packed: None,
+        blocks: (0..rows / 4 * blocks_per_row)
+            .map(|block_idx| Q8_0PackedRows4Block {
+                scales: [
+                    0.25 + block_idx as f32 * 0.01,
+                    0.5,
+                    0.75,
+                    1.25 - block_idx as f32 * 0.005,
+                ],
+                quants: std::array::from_fn(|idx| {
+                    (idx as i8)
+                        .wrapping_mul(7)
+                        .wrapping_add((block_idx as i8).wrapping_mul(11))
+                        .wrapping_sub(61)
+                }),
+            })
+            .collect(),
+    };
+    let quantized_input: Vec<Q8_0Block> = (0..blocks_per_row)
+        .map(|block_idx| Q8_0Block {
+            scale: 0.125 + block_idx as f32 * 0.03125,
+            quants: std::array::from_fn(|idx| {
+                (idx as i8)
+                    .wrapping_mul(5)
+                    .wrapping_sub((block_idx as i8).wrapping_mul(17))
+                    .wrapping_add(29)
+            }),
+        })
+        .collect();
+
+    let mut expected = vec![0.0_f32; rows];
+    q8_0_packed_rows4_single_input_projection_into(&packed, &quantized_input, &mut expected)
+        .unwrap();
+
+    std::env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_DECODE_RAWPTR_AVX2", "on");
+    assert!(x86_q8_packed_rows4_decode_rawptr_avx2_enabled());
+    let mut actual = vec![0.0_f32; rows];
+    q8_0_packed_rows4_single_input_projection_into_with_decode_chunking(
+        &packed,
+        &quantized_input,
+        &mut actual,
+        true,
+    )
+    .unwrap();
+
+    assert_slice_close(&actual, &expected);
+    std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_DECODE_RAWPTR_AVX2");
+}
+
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[test]
 fn x86_q8_ffn_down_decode_uses_avx2_reference_gate() {

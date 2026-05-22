@@ -9342,6 +9342,22 @@ fn q8_0_packed_rows4_single_input_projection_into_with_decode_chunking(
         )));
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if x86_q8_packed_rows4_decode_rawptr_avx2_enabled() {
+        // SAFETY: the shape guard above proves that every output group maps to
+        // `blocks_per_row` packed rows4/I8 blocks and the input has one Q8_0 block
+        // per K block. The feature gate proves AVX2 support.
+        unsafe {
+            q8_0_packed_rows4_decode_projection_rawptr_avx2(
+                packed,
+                quantized_input,
+                output,
+                decode_group_chunking,
+            );
+        }
+        return Ok(());
+    }
+
     let use_hoisted_avx2 = x86_q8_packed_rows4_avx2_dot_decode_hoist_enabled();
     let compute_group = |group_idx: usize, output_chunk: &mut [f32]| {
         let group_start = group_idx * blocks_per_row;
@@ -9376,6 +9392,102 @@ fn q8_0_packed_rows4_single_input_projection_into_with_decode_chunking(
         }
     }
     Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn x86_q8_packed_rows4_decode_rawptr_avx2_enabled() -> bool {
+    #[cfg(test)]
+    {
+        q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PACKED_ROWS4_DECODE_RAWPTR_AVX2")
+            && std::arch::is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(test))]
+    {
+        static X86_Q8_PACKED_ROWS4_DECODE_RAWPTR_AVX2_ENABLED: OnceLock<bool> = OnceLock::new();
+        *X86_Q8_PACKED_ROWS4_DECODE_RAWPTR_AVX2_ENABLED.get_or_init(|| {
+            q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PACKED_ROWS4_DECODE_RAWPTR_AVX2")
+                && std::arch::is_x86_feature_detected!("avx2")
+        })
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn q8_0_packed_rows4_decode_projection_rawptr_avx2(
+    packed: &Q8_0PackedRows4,
+    quantized_input: &[Q8_0Block],
+    output: &mut [f32],
+    decode_group_chunking: bool,
+) {
+    let blocks_per_row = packed.blocks_per_row;
+    let output_groups = output.len() / 4;
+    let packed_addr = packed.blocks.as_ptr() as usize;
+    let input_addr = quantized_input.as_ptr() as usize;
+
+    let compute_group = |group_idx: usize, output_chunk: &mut [f32]| {
+        debug_assert_eq!(output_chunk.len(), 4);
+        // SAFETY: the caller's shape guard ensures `group_idx` is in range for
+        // one output group and each group contains `blocks_per_row` blocks.
+        unsafe {
+            q8_0_packed_rows4_decode_group_rawptr_avx2(
+                (packed_addr as *const Q8_0PackedRows4Block).add(group_idx * blocks_per_row),
+                blocks_per_row,
+                input_addr as *const Q8_0Block,
+                output_chunk.as_mut_ptr(),
+            );
+        }
+    };
+
+    if output_groups > 1 && should_parallelize_x86_q8_packed_rows4_decode_output(output.len()) {
+        if decode_group_chunking {
+            let groups_per_chunk = q8_ffn_down_decode_groups_per_chunk().min(output_groups);
+            let chunk_floats = groups_per_chunk * 4;
+            output.par_chunks_mut(chunk_floats).enumerate().for_each(
+                |(chunk_idx, output_chunk)| {
+                    let first_group_idx = chunk_idx * groups_per_chunk;
+                    for (local_group_idx, output_group) in
+                        output_chunk.chunks_exact_mut(4).enumerate()
+                    {
+                        compute_group(first_group_idx + local_group_idx, output_group);
+                    }
+                },
+            );
+        } else {
+            output
+                .par_chunks_mut(4)
+                .enumerate()
+                .for_each(|(group_idx, output_chunk)| compute_group(group_idx, output_chunk));
+        }
+    } else {
+        for (group_idx, output_chunk) in output.chunks_exact_mut(4).enumerate() {
+            compute_group(group_idx, output_chunk);
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn q8_0_packed_rows4_decode_group_rawptr_avx2(
+    group_blocks: *const Q8_0PackedRows4Block,
+    blocks_per_row: usize,
+    quantized_input: *const Q8_0Block,
+    output: *mut f32,
+) {
+    let mut sums = [0.0_f32; 4];
+    for block_idx in 0..blocks_per_row {
+        let packed_block = unsafe { &*group_blocks.add(block_idx) };
+        let input_block = unsafe { &*quantized_input.add(block_idx) };
+        let int_sums = unsafe {
+            q8_0_packed_4x8_block_avx2(packed_block.quants.as_ptr(), input_block.quants.as_ptr())
+        };
+        let input_scale = input_block.scale;
+        for lane in 0..4 {
+            sums[lane] += int_sums[lane] as f32 * packed_block.scales[lane] * input_scale;
+        }
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(sums.as_ptr(), output, sums.len());
+    }
 }
 
 fn q8_0_packed_rows4_single_input_projection_pair_into_with_decode_chunking(
