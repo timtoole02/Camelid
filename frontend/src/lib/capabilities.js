@@ -123,7 +123,11 @@ function exactArtifactMissingHint(target) {
 
 function applyExactArtifactGate(hint, model, catalogItem) {
   if (!hint?.target) return hint
-  if (hint.kind === 'quant_mismatch') return hint
+  if (hint.kind === 'quant_mismatch') {
+    return hasExactArtifactIdentity(hint.target, model, catalogItem)
+      ? hint
+      : { ...hint, artifactMissing: true }
+  }
   if (!hasExactArtifactIdentity(hint.target, model, catalogItem)) return exactArtifactMissingHint(hint.target)
   return hint
 }
@@ -687,7 +691,7 @@ export function compatibilityHintCopy(hint) {
   }
   if (hint.kind === 'artifact_mismatch') return `${hint.target.id} requires the exact ${exactArtifactFilenameForRow(hint.target) || 'row GGUF'} artifact before the frontend may treat the support contract as matched. Do not unlock chat from a saved row id, model-size label, or neighboring GGUF filename alone; wait for exact artifact evidence plus loaded_now=true and generation_ready=true.`
   if (hint.kind === 'quant_missing') return `${hint.target.id} is the right model-size row, but this local record does not expose a quant label yet. Do not unlock chat from a size/name match alone; wait for GGUF quant evidence from the loaded model metadata plus generation_ready=true.`
-  if (hint.kind === 'quant_mismatch') return `${hint.target.id} is scoped to ${hint.target.quantization}, but this entry appears to be ${displayObservedQuant(hint.observedQuant) || 'a different quantization'}. Do not inherit the supported gate from a same-family row; wait for an exact COMPATIBILITY.md row plus generation_ready=true.`
+  if (hint.kind === 'quant_mismatch') return `${hint.target.id} is scoped to ${hint.target.quantization}, but this entry appears to be ${displayObservedQuant(hint.observedQuant) || 'a different quantization'}. ${hint.artifactMissing ? `It also needs the exact ${exactArtifactFilenameForRow(hint.target) || 'row GGUF'} artifact before the frontend may treat the support contract as matched. ` : ''}Do not inherit the supported gate from a same-family row; wait for an exact COMPATIBILITY.md row plus generation_ready=true.`
   return `${hint.target.family} · ${hint.target.quantization} · ${hint.target.evidence || hint.target.next_step}. Match source: ${hint.confidence}; runtime generation still requires loaded_now=true and generation_ready=true.`
 }
 

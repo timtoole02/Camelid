@@ -138,6 +138,14 @@ assert.equal(
   false,
   '3B WebUI chat must stay blocked when the active runtime row id is spoofed but artifact identity does not match',
 )
+const spoofedThreeBWrongArtifactAndQuant = {
+  ...spoofedThreeBRowIdWrongArtifact,
+  quant: 'Q4_K_M',
+}
+const spoofedThreeBWrongArtifactAndQuantHint = findCompatibilityHint(capabilities, spoofedThreeBWrongArtifactAndQuant)
+assert.equal(compatibilityHintLabel(spoofedThreeBWrongArtifactAndQuantHint), 'llama32_3b_instruct_q8_0: quant mismatch', '3B neighboring-quant artifacts should keep the quant mismatch label as the actionable blocker')
+assert.match(compatibilityHintCopy(spoofedThreeBWrongArtifactAndQuantHint), /exact Llama-3\.2-3B-Instruct-Q8_0\.gguf artifact/, '3B neighboring-quant blockers should also preserve the exact GGUF identity requirement')
+assert.equal(isCompatibilitySupportedForModel(capabilities, spoofedThreeBWrongArtifactAndQuant), false, '3B row-id spoofing with a wrong artifact plus wrong quant must fail closed')
 const spoofedThreeBNameWrongArtifact = {
   ...exactThreeBModel,
   id: 'local-wrong-artifact',
