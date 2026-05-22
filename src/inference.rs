@@ -509,6 +509,7 @@ struct Q8RuntimeFlags {
     ffn_gate_up_decode_consumer: bool,
     ffn_gate_up_decode_group_chunking: bool,
     ffn_gate_up_decode_fused_activation: bool,
+    ffn_gate_up_decode_paired_dot: bool,
     ffn_gate_up_packed_rows4_matmul: bool,
     ffn_gate_up_single_owner: bool,
     ffn_down_decode_consumer: bool,
@@ -582,6 +583,9 @@ impl Q8RuntimeFlags {
             ),
             ffn_gate_up_decode_fused_activation: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION",
+            ),
+            ffn_gate_up_decode_paired_dot: q8_0_env_flag_enabled_default_off(
+                "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT",
             ),
             ffn_gate_up_packed_rows4_matmul: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL",
@@ -6835,6 +6839,7 @@ fn try_x86_q8_ffn_gate_up_decode_fused_activation_path(
         &name,
         order,
         &quantized_input.blocks,
+        runtime_plan.q8.ffn_gate_up_decode_paired_dot,
     )?;
     let total_elapsed = started.elapsed().as_micros();
     record_q8_schedule_output_projection_route_call(
@@ -9681,6 +9686,7 @@ fn q8_0_packed_rows4_single_input_projection_pair_activated_from_quantized(
     name: &str,
     order: FfnGateUpOrder,
     quantized_input: &[Q8_0Block],
+    use_paired_dot: bool,
 ) -> Result<CpuTensor> {
     let output_groups = q8_0_packed_rows4_output_groups(output_width, "pair activated decode")?;
     let blocks_per_row = gate_packed.blocks_per_row;
@@ -9707,16 +9713,21 @@ fn q8_0_packed_rows4_single_input_projection_pair_activated_from_quantized(
     let use_hoisted_avx2 = x86_q8_packed_rows4_avx2_dot_decode_hoist_enabled();
     let compute_group = |group_idx: usize, output_chunk: &mut [f32]| {
         let group_start = group_idx * blocks_per_row;
-        let gate_sums = q8_0_packed_rows4_dot_i8_matmul(
-            &gate_packed.blocks[group_start..group_start + blocks_per_row],
-            quantized_input,
-            use_hoisted_avx2,
-        );
-        let up_sums = q8_0_packed_rows4_dot_i8_matmul(
-            &up_packed.blocks[group_start..group_start + blocks_per_row],
-            quantized_input,
-            use_hoisted_avx2,
-        );
+        let gate_blocks = &gate_packed.blocks[group_start..group_start + blocks_per_row];
+        let up_blocks = &up_packed.blocks[group_start..group_start + blocks_per_row];
+        let (gate_sums, up_sums) = if use_paired_dot {
+            q8_0_packed_rows4_dot_i8_matmul_pair(
+                gate_blocks,
+                up_blocks,
+                quantized_input,
+                use_hoisted_avx2,
+            )
+        } else {
+            (
+                q8_0_packed_rows4_dot_i8_matmul(gate_blocks, quantized_input, use_hoisted_avx2),
+                q8_0_packed_rows4_dot_i8_matmul(up_blocks, quantized_input, use_hoisted_avx2),
+            )
+        };
         for lane in 0..4 {
             output_chunk[lane] = apply_ffn_gate_up_order(gate_sums[lane], up_sums[lane], order);
         }
@@ -14142,6 +14153,110 @@ fn q8_0_packed_rows4_dot_i8_matmul(
     }
     let _ = use_hoisted_avx2;
     q8_0_packed_rows4_dot(packed_blocks, input, Q8_0PackedRows4Interleave::I8)
+}
+
+fn q8_0_packed_rows4_dot_i8_matmul_pair(
+    left_packed_blocks: &[Q8_0PackedRows4Block],
+    right_packed_blocks: &[Q8_0PackedRows4Block],
+    input: &[Q8_0Block],
+    use_hoisted_avx2: bool,
+) -> ([f32; 4], [f32; 4]) {
+    debug_assert_eq!(left_packed_blocks.len(), input.len());
+    debug_assert_eq!(right_packed_blocks.len(), input.len());
+    let mut left_sums = [0.0_f32; 4];
+    let mut right_sums = [0.0_f32; 4];
+    for ((left_block, right_block), input_block) in left_packed_blocks
+        .iter()
+        .zip(right_packed_blocks)
+        .zip(input)
+    {
+        let (left_int_sums, right_int_sums) = q8_0_packed_rows4_block_dot_i8_pair(
+            left_block,
+            right_block,
+            input_block,
+            use_hoisted_avx2,
+        );
+        let input_scale = input_block.scale;
+        for lane in 0..4 {
+            left_sums[lane] += left_int_sums[lane] as f32 * left_block.scales[lane] * input_scale;
+            right_sums[lane] +=
+                right_int_sums[lane] as f32 * right_block.scales[lane] * input_scale;
+        }
+    }
+    (left_sums, right_sums)
+}
+
+fn q8_0_packed_rows4_block_dot_i8_pair(
+    left_block: &Q8_0PackedRows4Block,
+    right_block: &Q8_0PackedRows4Block,
+    input_block: &Q8_0Block,
+    use_hoisted_avx2: bool,
+) -> ([i32; 4], [i32; 4]) {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if x86_q8_packed_rows4_avx512vnni_dpbusd_dot_enabled() {
+            // SAFETY: runtime feature detection confirms AVX512F/BW/VNNI support.
+            return unsafe {
+                (
+                    q8_0_packed_4x8_block_avx512vnni_dpbusd(
+                        left_block.quants.as_ptr(),
+                        input_block.quants.as_ptr(),
+                    ),
+                    q8_0_packed_4x8_block_avx512vnni_dpbusd(
+                        right_block.quants.as_ptr(),
+                        input_block.quants.as_ptr(),
+                    ),
+                )
+            };
+        }
+        if x86_q8_packed_rows4_avx512vnni_dpwssd_dot_enabled() {
+            // SAFETY: runtime feature detection confirms AVX512F/BW/VNNI and AVX2 support.
+            return unsafe {
+                (
+                    q8_0_packed_4x8_block_avx512vnni_dpwssd(
+                        left_block.quants.as_ptr(),
+                        input_block.quants.as_ptr(),
+                    ),
+                    q8_0_packed_4x8_block_avx512vnni_dpwssd(
+                        right_block.quants.as_ptr(),
+                        input_block.quants.as_ptr(),
+                    ),
+                )
+            };
+        }
+        if (use_hoisted_avx2
+            || x86_q8_packed_rows4_avx2_dot_enabled()
+            || x86_q8_kernel_avx2_enabled())
+            && std::arch::is_x86_feature_detected!("avx2")
+        {
+            // SAFETY: runtime feature detection confirms AVX2 support.
+            return unsafe {
+                (
+                    q8_0_packed_4x8_block_avx2(
+                        left_block.quants.as_ptr(),
+                        input_block.quants.as_ptr(),
+                    ),
+                    q8_0_packed_4x8_block_avx2(
+                        right_block.quants.as_ptr(),
+                        input_block.quants.as_ptr(),
+                    ),
+                )
+            };
+        }
+    }
+    let _ = use_hoisted_avx2;
+    (
+        q8_0_packed_rows4_block_dot_scalar(
+            &left_block.quants,
+            &input_block.quants,
+            Q8_0PackedRows4Interleave::I8,
+        ),
+        q8_0_packed_rows4_block_dot_scalar(
+            &right_block.quants,
+            &input_block.quants,
+            Q8_0PackedRows4Interleave::I8,
+        ),
+    )
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
