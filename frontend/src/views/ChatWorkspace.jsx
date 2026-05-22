@@ -552,17 +552,17 @@ export default function ChatWorkspace({
       : runtime?.loaded_now
         ? 'Wait for generation_ready=true before sending prompts.'
         : 'Load a local GGUF from Library to start the readiness check.'
-  const supportStatusLabel = apiUnavailable
-    ? 'Contract unavailable'
-    : selectedModelCapabilitySupported
+  const supportStatusLabel = selectedModelCapabilitySupported
     ? selectedCompatibilityLabel
+    : apiUnavailable
+      ? 'Contract unavailable'
     : selectedModel
       ? selectedCompatibilityLabel
       : 'Choose model first'
-  const supportStatusCopy = apiUnavailable
-    ? 'The /api/capabilities contract could not be read while the API is unavailable.'
-    : selectedModelCapabilitySupported
+  const supportStatusCopy = selectedModelCapabilitySupported
     ? `${selectedCompatibilityLabel}. COMPATIBILITY.md and /api/capabilities agree for this model and quant.`
+    : apiUnavailable
+      ? 'The /api/capabilities contract could not be read while the API is unavailable.'
     : selectedModel
       ? selectedCompatibilityCopy
       : 'Camelid does not infer broad support from filenames, families, or saved paths.'
@@ -627,6 +627,9 @@ export default function ChatWorkspace({
       )
     }
 
+    const runnableModels = models.filter((model) => getChatGateState(capabilities, model, runtime).chatUnlocked)
+    const selectedRunnableModelId = runnableModels.some((model) => model.id === selectedModel?.id) ? selectedModel.id : ''
+
     const modelOptionLabel = (model) => {
       const gate = getChatGateState(capabilities, model, runtime)
       if (gate.chatUnlocked) return `${model.name} · Ready`
@@ -642,12 +645,12 @@ export default function ChatWorkspace({
         <select
           className="composer-model-select"
           aria-label="Choose model for chat"
-          value={selectedModel?.id || selectedModelId || ''}
+          value={selectedRunnableModelId}
           onChange={(e) => setSelectedModelId(e.target.value)}
           disabled={generationActive}
         >
-          {!selectedModel && <option value="">Choose model</option>}
-          {models.map((model) => (
+          {!selectedRunnableModelId && <option value="">{selectedModel ? 'Choose exact-row ready model' : 'Choose model'}</option>}
+          {runnableModels.map((model) => (
             <option key={model.id} value={model.id}>
               {modelOptionLabel(model)}
             </option>

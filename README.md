@@ -52,7 +52,7 @@ Camelid does **not** bundle model weights. Full local chat requires a supported 
 
 ![Camelid WebUI chat surface](docs/assets/camelid-readme-chat-surface-dark.png)
 
-*Camelid WebUI chat surface with local readiness and support-contract gating.*
+*Camelid WebUI chat surface, product-forward while still reflecting the local-first runtime contract through local readiness and support-contract gating.*
 
 ## Support Matrix
 
