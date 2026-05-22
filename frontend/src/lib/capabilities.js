@@ -105,9 +105,7 @@ function hasExactArtifactIdentity(row, model, catalogItem) {
     model?.model_path,
     model?.path,
     model?.hf_filename,
-    model?.source,
     catalogItem?.filename,
-    catalogItem?.source,
   ].map(pathBasename).filter(Boolean)
   return observedFilenames.some((observed) => observed.toLowerCase() === filename.toLowerCase())
 }

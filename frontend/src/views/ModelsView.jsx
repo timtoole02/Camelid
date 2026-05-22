@@ -69,7 +69,6 @@ function hasExactLlama32ThreeBArtifact(model) {
     model?.model_path,
     model?.path,
     model?.hf_filename,
-    model?.source,
   ].map(pathBasename).filter(Boolean)
   return exactTargetPath || filenames.some((filename) => filename.toLowerCase() === LLAMA32_3B_ACCEPTANCE_FILENAME.toLowerCase())
 }

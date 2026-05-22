@@ -147,6 +147,21 @@ const spoofedThreeBNameWrongArtifact = {
   quant: 'Q8_0',
 }
 assert.equal(compatibilityHintLabel(findCompatibilityHint(capabilities, spoofedThreeBNameWrongArtifact)), 'llama32_3b_instruct_q8_0: exact GGUF not verified', '3B model-size labels still need the exact GGUF artifact identity')
+const misleadingSourceWrongArtifact = {
+  ...exactThreeBModel,
+  id: 'local-misleading-source',
+  name: 'Llama 3.2 3B Instruct Q8_0',
+  runtime_model_name: 'local-misleading-source',
+  model_path: '/models/Llama-3.2-3B-Instruct-Q8_0-neighbor.gguf',
+  source: 'bartowski/Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-Q8_0.gguf',
+  quant: 'Q8_0',
+}
+assert.equal(compatibilityHintLabel(findCompatibilityHint(capabilities, misleadingSourceWrongArtifact)), 'llama32_3b_instruct_q8_0: exact GGUF not verified', '3B provenance/source metadata must not override the loaded GGUF filename')
+assert.equal(
+  getChatGateState(capabilities, misleadingSourceWrongArtifact, { ...runtime, active_model_id: 'local-misleading-source' }).chatUnlocked,
+  false,
+  '3B WebUI chat must stay blocked when source metadata names the supported row but the loaded artifact filename is a neighbor',
+)
 assert.equal(compatibilityHintMatchesExactTarget(capabilities, exactThreeBModel, llama32ThreeBTarget), true, 'ModelsView exact-row matching must accept the canonical 3B row')
 assert.equal(modelRuntimeIdMatches(exactThreeBModel, runtime), true, '3B backend active_model_id must match the selected runtime row')
 assert.equal(isRunnableInCurrentRuntime(exactThreeBModel, runtime), true, '3B runtime readiness must require the active backend row and generation_ready=true')
@@ -277,6 +292,7 @@ assert.match(chatSource, /Row-scoped \/api\/capabilities evidence; it does not w
 assert.match(chatSource, /LiveGenerationBadge/, 'live 3B chat must keep an active streaming badge after first content arrives')
 assert.match(chatSource, /StreamingLoader/, 'live 3B chat must keep an accessible pre-token loader')
 assert.match(modelsSource, /matchesLlama32ThreeBTarget\(model, capabilities\)/, 'ModelsView 3B acceptance target must hide only on exact target match')
+assert.doesNotMatch(modelsSource, /function hasExactLlama32ThreeBArtifact[\s\S]*model\?\.source[\s\S]*function matchesLlama32ThreeBTarget/, 'ModelsView 3B acceptance target must not treat source/provenance metadata as loaded artifact identity')
 assert.match(modelsSource, /Fill import form with exact path/, 'ModelsView must provide the exact 3B import path affordance when the row is absent locally')
 assert.match(modelsSource, /Chat unlockable/, 'ModelsView must expose the retained exact-row chat-unlock state')
 assert.match(modelsSource, /matchedChatGate\s*=\s*matchedModel \? getChatGateState\(capabilities, matchedModel, runtime\) : null/, 'ModelsView retained 3B row cards must use the shared chat gate for loaded_now and generation_ready checks')

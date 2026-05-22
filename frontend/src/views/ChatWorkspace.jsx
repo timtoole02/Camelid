@@ -552,20 +552,21 @@ export default function ChatWorkspace({
       : runtime?.loaded_now
         ? 'Wait for generation_ready=true before sending prompts.'
         : 'Load a local GGUF from Library to start the readiness check.'
-  const supportStatusLabel = apiUnavailable
-    ? 'Contract unavailable'
-    : selectedModelCapabilitySupported
+  const readinessNoteId = 'camelid-chat-readiness-note'
+  const supportStatusLabel = selectedModelCapabilitySupported
     ? selectedCompatibilityLabel
-    : selectedModel
-      ? selectedCompatibilityLabel
-      : 'Choose model first'
-  const supportStatusCopy = apiUnavailable
-    ? 'The /api/capabilities contract could not be read while the API is unavailable.'
-    : selectedModelCapabilitySupported
+    : apiUnavailable
+      ? 'Contract unavailable'
+      : selectedModel
+        ? selectedCompatibilityLabel
+        : 'Choose model first'
+  const supportStatusCopy = selectedModelCapabilitySupported
     ? `${selectedCompatibilityLabel}. COMPATIBILITY.md and /api/capabilities agree for this model and quant.`
-    : selectedModel
-      ? selectedCompatibilityCopy
-      : 'Camelid does not infer broad support from filenames, families, or saved paths.'
+    : apiUnavailable
+      ? 'The /api/capabilities contract could not be read while the API is unavailable.'
+      : selectedModel
+        ? selectedCompatibilityCopy
+        : 'Camelid does not infer broad support from filenames, families, or saved paths.'
   const readinessFinePrint = selectedModelRunnable
     ? 'Ready for this loaded exact row. Broader scope details stay in /api/capabilities instead of the chat composer.'
     : apiUnavailable
@@ -596,6 +597,12 @@ export default function ChatWorkspace({
     : supportBlocked
       ? 'The runtime is available, but chat stays locked until the selected model has an exact supported row.'
       : 'Load a generation-ready GGUF model to unlock local chat. Camelid will keep showing what is missing until then.'
+  const composerPlaceholder = selectedModelRunnable
+    ? 'Message Camelid…'
+    : apiUnavailable
+      ? 'Camelid API unavailable'
+      : 'Load a model first'
+  const sendButtonLabel = generationActive ? `Generating ${generationElapsedSeconds}s…` : 'Send'
   const handleDemoPrompt = (prompt) => {
     if (generationActive || !selectedModelRunnable) return
     setComposer(prompt)
@@ -627,6 +634,10 @@ export default function ChatWorkspace({
       )
     }
 
+    const runnableModels = models.filter((model) => getChatGateState(capabilities, model, runtime).chatUnlocked)
+    const selectedRunnableModelId = runnableModels.some((model) => model.id === selectedModel?.id) ? selectedModel.id : ''
+    const readyModelCount = runnableModels.length
+
     const modelOptionLabel = (model) => {
       const gate = getChatGateState(capabilities, model, runtime)
       if (gate.chatUnlocked) return `${model.name} · Ready`
@@ -642,12 +653,13 @@ export default function ChatWorkspace({
         <select
           className="composer-model-select"
           aria-label="Choose model for chat"
-          value={selectedModel?.id || selectedModelId || ''}
+          aria-describedby={readinessNoteId}
+          value={selectedRunnableModelId}
           onChange={(e) => setSelectedModelId(e.target.value)}
-          disabled={generationActive}
+          disabled={generationActive || !readyModelCount}
         >
-          {!selectedModel && <option value="">Choose model</option>}
-          {models.map((model) => (
+          {!selectedRunnableModelId && <option value="">{readyModelCount ? 'Choose exact-row ready model' : 'No exact-row ready models'}</option>}
+          {runnableModels.map((model) => (
             <option key={model.id} value={model.id}>
               {modelOptionLabel(model)}
             </option>
@@ -700,17 +712,17 @@ export default function ChatWorkspace({
               )}
 
               <div className="composer composer-assistant composer-assistant-stage composer-assistant-stage-clean composer-assistant-product">
-                <textarea className="composer-input composer-input-assistant composer-input-assistant-stage" value={composer} onChange={(e) => setComposer(e.target.value)} onKeyDown={handleComposerKeyDown} rows={2} placeholder={selectedModelRunnable ? 'Message Camelid…' : apiUnavailable ? 'Camelid API unavailable' : 'Load a model first'} disabled={generationActive || !selectedModelRunnable} />
+                <textarea className="composer-input composer-input-assistant composer-input-assistant-stage" value={composer} onChange={(e) => setComposer(e.target.value)} onKeyDown={handleComposerKeyDown} rows={2} placeholder={composerPlaceholder} disabled={generationActive || !selectedModelRunnable} aria-describedby={readinessNoteId} aria-label="Message Camelid" />
                 <div className="composer-assistant-footer composer-assistant-footer-stage composer-assistant-footer-stage-clean">
                   <div className="composer-assistant-tools composer-assistant-tools-stage composer-assistant-tools-stage-clean">
                     {renderModelPicker()}
                     {!selectedModelRunnable && <button className="ghost-button ghost-button-quiet" onClick={() => setTab('library')}>Open Models</button>}
                   </div>
                   <div className="composer-assistant-actions composer-assistant-actions-stage">
-                    <button className="primary-button composer-send-button" onClick={sendMessage} disabled={!canSubmit}>{generationActive ? `Generating ${generationElapsedSeconds}s…` : 'Send'}</button>
+                    <button className="primary-button composer-send-button" onClick={sendMessage} disabled={!canSubmit} aria-label={canSubmit ? 'Send message' : readinessFinePrint}>{sendButtonLabel}</button>
                   </div>
                 </div>
-                <p className={`composer-assistant-readiness-note is-${readinessState}`}>{readinessFinePrint}</p>
+                <p id={readinessNoteId} className={`composer-assistant-readiness-note is-${readinessState}`} role="status" aria-live="polite">{readinessFinePrint}</p>
               </div>
             </div>
           </div>
