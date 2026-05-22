@@ -33,7 +33,7 @@ A comparison run where Camelid and the reference engine execute on the same mach
 _Avoid_: cross-machine performance claims.
 
 **Canonical Ubuntu host report**
-A validation status statement about the canonical Ubuntu host is current only when this exact command was attempted in the same run and its stderr is cited on failure: `ssh -o IdentitiesOnly=yes -i /Users/timtoole/Documents/cert/ubuntu.pem ubuntu@16.146.143.184`. If that command was not attempted in the current run, say remote validation was not attempted instead of implying a negative host reachability or authentication status.
+A validation status statement about the canonical Ubuntu host is current only when this exact command was attempted in the same run and its stderr is cited on failure: `ssh -o BatchMode=yes -o ConnectTimeout=10 -o IdentitiesOnly=yes -i /Users/timtoole/Documents/cert/ubuntu.pem ubuntu@16.146.143.184`. If that command was not attempted in the current run, say remote validation was not attempted instead of implying a negative host reachability or authentication status.
 _Avoid_: stale host-status wording copied from older summaries.
 
 **Tracer bullet**
