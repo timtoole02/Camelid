@@ -107,9 +107,7 @@ impl Q8RuntimeFlags {
             ) || q8_0_env_flag_enabled_default_off(
                 "CAMELID_MAC_Q8_FFN_DOWN_DECODE_CONSUMER",
             ),
-            ffn_down_packed_rows4_matmul: q8_0_env_flag_enabled_default_off(
-                "CAMELID_X86_Q8_PACKED_ROWS4_MATMUL",
-            ),
+            ffn_down_packed_rows4_matmul: x86_q8_ffn_down_packed_rows4_matmul_enabled(),
             ffn_down_gemm4_prefill: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_DOWN_GEMM4_PREFILL",
             ),
@@ -195,4 +193,9 @@ pub(super) fn q8_0_env_flag_disabled(key: &str) -> bool {
                 || value.eq_ignore_ascii_case("f32")
         })
         .unwrap_or(false)
+}
+
+fn x86_q8_ffn_down_packed_rows4_matmul_enabled() -> bool {
+    q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL")
+        || q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL")
 }
