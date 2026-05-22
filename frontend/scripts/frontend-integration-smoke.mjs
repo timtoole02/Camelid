@@ -657,7 +657,8 @@ try {
     setTab: noop,
   }))
 
-  assert.match(liveBackendIdChatMarkup, /How can I help\?/, 'ready 3B live-backend-id chat should render the sendable empty-state hero')
+  assert.match(liveBackendIdChatMarkup, /Camelid chat/, 'ready 3B live-backend-id chat should render the branded sendable empty-state hero')
+  assert.match(liveBackendIdChatMarkup, /composer-context-status is-ready/, 'ready 3B live-backend-id chat should show the composer readiness chip')
   assert.match(liveBackendIdChatMarkup, /Local chat ready/, 'ready 3B live-backend-id chat should show runtime-green chat UX')
   assert.match(liveBackendIdChatMarkup, /Llama 3\.2 3B Instruct Q8_0 is loaded now and generation_ready=true\./, 'ready 3B live-backend-id chat should display the exact 3B row name instead of the backend-generated runtime id')
   assert.match(liveBackendIdChatMarkup, /llama32_3b_instruct_q8_0: supported current gate/, 'ready 3B live-backend-id chat should show exact-row support in the composer surface')
@@ -753,7 +754,8 @@ try {
     setTab: noop,
   }))
 
-  assert.match(backendReadyButUnsupported3BChatMarkup, /Choose a supported model\./, 'runtime-ready 3B rows should render support-gated chat UX when the exact row is downgraded')
+  assert.match(backendReadyButUnsupported3BChatMarkup, /Camelid chat/, 'runtime-ready 3B rows should render branded support-gated chat UX when the exact row is downgraded')
+  assert.match(backendReadyButUnsupported3BChatMarkup, /Choose a supported model/, 'runtime-ready 3B rows should show the support-gated readiness state when the exact row is downgraded')
   assert.match(backendReadyButUnsupported3BChatMarkup, /Runtime ready, support gated/, 'support-gated 3B UX should still expose that loaded_now and generation_ready are green')
   assert.match(backendReadyButUnsupported3BChatMarkup, /llama32_3b_instruct_q8_0: groundwork backend evidence only/, 'support-gated 3B UX should name the exact unpromoted capabilities row rather than hiding behind generic load-first copy')
   assert.match(backendReadyButUnsupported3BChatMarkup, /Chat unlocks only after loaded_now=true, generation_ready=true, and an exact supported compatibility row all match\./, 'support-gated 3B UX should preserve the exact-row frontend readiness rule')
