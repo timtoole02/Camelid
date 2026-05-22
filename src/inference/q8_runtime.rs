@@ -93,6 +93,8 @@ impl Q8RuntimeFlags {
             ),
             ffn_gate_up_decode_fused_activation: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION",
+            ) || q8_0_env_flag_enabled_default_off(
+                "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED",
             ),
             ffn_gate_up_decode_paired_dot: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT",

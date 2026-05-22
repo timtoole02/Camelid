@@ -1762,6 +1762,7 @@ fn resolved_runtime_plan_captures_q8_env_once() {
     std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER", "true");
     std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING", "on");
     std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION", "on");
+    std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED", "on");
     std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT", "on");
     std::env::set_var("CAMELID_X86_Q8_FFN_DECODE_CHAIN", "on");
     std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL", "on");
@@ -1805,6 +1806,7 @@ fn resolved_runtime_plan_captures_q8_env_once() {
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER");
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING");
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION");
+    std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED");
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT");
     std::env::remove_var("CAMELID_X86_Q8_FFN_DECODE_CHAIN");
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL");
@@ -3877,6 +3879,7 @@ fn mac_q8_ffn_gate_up_decode_consumer_alias_is_default_off_and_opt_in() {
     std::env::remove_var("CAMELID_MAC_Q8_FFN_GATE_UP_DECODE_CONSUMER");
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING");
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION");
+    std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED");
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT");
     assert!(!Q8RuntimeFlags::from_env().ffn_gate_up_decode_consumer);
     assert!(!Q8RuntimeFlags::from_env().ffn_gate_up_decode_group_chunking);
@@ -3894,6 +3897,10 @@ fn mac_q8_ffn_gate_up_decode_consumer_alias_is_default_off_and_opt_in() {
     std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION", "on");
     assert!(Q8RuntimeFlags::from_env().ffn_gate_up_decode_fused_activation);
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION");
+
+    std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED", "on");
+    assert!(Q8RuntimeFlags::from_env().ffn_gate_up_decode_fused_activation);
+    std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED");
 
     std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT", "on");
     assert!(Q8RuntimeFlags::from_env().ffn_gate_up_decode_paired_dot);
