@@ -5,10 +5,10 @@ This bundle records a same-host Camelid versus llama.cpp Llama 3.2 3B Instruct Q
 Method:
 
 - Host gate: `uname -sm` returned `Linux x86_64`.
-- Disk guard was run before cargo; cargo used `CARGO_TARGET_DIR=/home/ubuntu/work/camelid-targets/backend-95495a91`.
-- Model: `/home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf`.
+- Disk guard was run before cargo; cargo used `CARGO_TARGET_DIR=<validation-host-home>/work/camelid-targets/backend-95495a91`.
+- Model: `<validation-host-home>/models/Llama-3.2-3B-Instruct-Q8_0.gguf`.
 - Camelid gates: `CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE=on` and `CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR=on`.
-- Harness: `node scripts/bench-llama3-same-host.mjs --backend http://127.0.0.1:19381 --llama-url http://127.0.0.1:19383 --backend-bin /home/ubuntu/work/camelid-targets/backend-95495a91/release/camelid --llama-server /home/ubuntu/work/llama.cpp-fc0b298f-20260520T0325Z/build/bin/llama-server --model /home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf --model-id llama32-3b-q8-current-main --row-id llama32_3b_instruct_q8_0 --max-tokens 4 --warmup 0 --repeats 1 --threads 16 --out same-host-vnni-rawptr-t16-n4.json`.
+- Harness: `node scripts/bench-llama3-same-host.mjs --backend http://127.0.0.1:19381 --llama-url http://127.0.0.1:19383 --backend-bin <validation-host-home>/work/camelid-targets/backend-95495a91/release/camelid --llama-server <validation-host-home>/work/llama.cpp-fc0b298f-20260520T0325Z/build/bin/llama-server --model <validation-host-home>/models/Llama-3.2-3B-Instruct-Q8_0.gguf --model-id llama32-3b-q8-current-main --row-id llama32_3b_instruct_q8_0 --max-tokens 4 --warmup 0 --repeats 1 --threads 16 --out same-host-vnni-rawptr-t16-n4.json`.
 
 Measured result:
 
