@@ -159,7 +159,7 @@ try {
   assert.match(blockedWrongArtifactMarkup, /Runtime ready, support gated/, '3B live chat should show runtime readiness while support remains artifact-gated')
   assert.match(blockedWrongArtifactMarkup, /llama32_3b_instruct_q8_0: exact GGUF not verified/, '3B live chat must name the exact artifact blocker')
   assert.match(blockedWrongArtifactMarkup, /requires the exact Llama-3\.2-3B-Instruct-Q8_0\.gguf artifact/, '3B artifact blocker must name the canonical GGUF filename')
-  assert.match(blockedWrongArtifactMarkup, /disabled="">Send</, '3B composer send must stay disabled for a runtime-ready neighboring artifact')
+  assert.match(blockedWrongArtifactMarkup, /disabled=""[^>]*>Send</, '3B composer send must stay disabled for a runtime-ready neighboring artifact')
   assert.doesNotMatch(blockedWrongArtifactMarkup, /Local chat ready/, '3B spoofed artifact must not render the supported live-chat state')
   assert.doesNotMatch(blockedWrongArtifactMarkup, /Demo starters/, '3B spoofed artifact must not expose runnable demo prompts')
 

@@ -535,7 +535,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
         apiBase: normalizedApiBase,
       })
       setDashboard(fallbackDashboard)
-      if (!silent) showNotice(`Could not reach Camelid at ${normalizedApiBase}: ${getErrorMessage(error)}`, 'error')
+      if (!silent) showNotice('Camelid API unavailable. Open System.', 'error')
     }
   }
 
