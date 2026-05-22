@@ -3,7 +3,7 @@ import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'rea
 import { compatibilityHintCopy, compatibilityHintLabel, exactRowSupportLanes, findCompatibilityHint, isCompatibilitySupportedForModel } from '../lib/capabilities'
 import { clampText, formatDate, formatRate } from '../lib/formatters'
 import { getChatGateState } from '../lib/chatGate'
-import { describeModelState, getModelStatusLabel, isRunnableInCurrentRuntime } from '../lib/modelState'
+import { describeModelState, getModelStatusLabel } from '../lib/modelState'
 
 const isBootstrapMessage = (message) =>
   message?.role === 'assistant' &&
@@ -513,7 +513,7 @@ export default function ChatWorkspace({
   const hasRunnableChoices = runnableModels.length > 0
   const modelPickerTitle = selectedModel ? getModelStatusLabel(selectedModel) : 'Choose what Camelid should use for this chat.'
   const selectedChatGate = getChatGateState(capabilities, selectedModel, runtime)
-  const selectedRuntimeReady = selectedChatGate.runtimeReady || isRunnableInCurrentRuntime(selectedModel, runtime)
+  const selectedRuntimeReady = selectedChatGate.runtimeReady
   const selectedModelCapabilitySupported = selectedChatGate.contractSupported || isCompatibilitySupportedForModel(capabilities, selectedModel)
   const supportBlocked = selectedRuntimeReady && !selectedModelCapabilitySupported
   const selectedCompatibilityHint = selectedChatGate.hint || findCompatibilityHint(capabilities, selectedModel)

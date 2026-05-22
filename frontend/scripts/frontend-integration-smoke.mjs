@@ -664,6 +664,28 @@ try {
   assert.match(liveBackendIdChatMarkup, /Message Camelid…/, 'ready 3B live-backend-id chat should enable the composer instead of showing load-first copy')
   assert.doesNotMatch(liveBackendIdChatMarkup, /Load a model first|Choose a supported model/, 'ready 3B live-backend-id chat should not fall back to blocked chat UX')
 
+  const staleLoadedNowChatMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
+    selectedConversation: null,
+    selectedModel: liveBackendIdModel,
+    selectedModelId: liveBackendIdModel.id,
+    setSelectedModelId: noop,
+    models: [liveBackendIdModel],
+    runtime: { ...liveBackendIdRuntime, loaded_now: false },
+    capabilities,
+    pendingConversation: null,
+    composer: 'This stale browser row must remain blocked',
+    setComposer: noop,
+    saveToMemory: noop,
+    sendMessage: noop,
+    sending: false,
+    selectedModelRunnable: getChatGateState(capabilities, liveBackendIdModel, { ...liveBackendIdRuntime, loaded_now: false }).chatUnlocked,
+    setTab: noop,
+  }))
+
+  assert.match(staleLoadedNowChatMarkup, /No generation-ready model/, '3B chat readiness should use the shared chat gate and stay runtime-blocked when backend loaded_now=false')
+  assert.match(staleLoadedNowChatMarkup, /Load a model first/, '3B stale loaded_now=false rows must keep the composer disabled')
+  assert.doesNotMatch(staleLoadedNowChatMarkup, /Runtime ready, support gated|Local chat ready|Message Camelid…|Demo starters/, '3B stale browser readiness must not leak into live chat UX when /v1/health says loaded_now=false')
+
   const neighboringQuantPathModel = {
     ...selectedModel,
     quant: undefined,
