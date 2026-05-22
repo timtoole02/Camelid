@@ -508,6 +508,7 @@ struct Q8RuntimeFlags {
     output_decode_owner: bool,
     ffn_gate_up_decode_consumer: bool,
     ffn_gate_up_decode_group_chunking: bool,
+    ffn_gate_up_decode_fused_activation: bool,
     ffn_gate_up_packed_rows4_matmul: bool,
     ffn_gate_up_single_owner: bool,
     ffn_down_decode_consumer: bool,
@@ -578,6 +579,9 @@ impl Q8RuntimeFlags {
             ),
             ffn_gate_up_decode_group_chunking: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING",
+            ),
+            ffn_gate_up_decode_fused_activation: q8_0_env_flag_enabled_default_off(
+                "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION",
             ),
             ffn_gate_up_packed_rows4_matmul: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL",
@@ -6557,6 +6561,15 @@ fn gated_ffn_activation_with_plan(
         )? {
             return Ok(activated);
         }
+        if let Some(activated) = try_x86_q8_ffn_gate_up_decode_fused_activation_path(
+            input,
+            gate_weight,
+            up_weight,
+            &name,
+            runtime_plan,
+        )? {
+            return Ok(activated);
+        }
     }
 
     let input_row = &input.data[..input_width];
@@ -6744,6 +6757,107 @@ fn gated_ffn_activation_with_plan(
         up_diagnostic,
         activation_diagnostic,
     })
+}
+
+fn try_x86_q8_ffn_gate_up_decode_fused_activation_path(
+    input: &CpuTensor,
+    gate_weight: &CpuTensor,
+    up_weight: &CpuTensor,
+    name: impl Into<String>,
+    runtime_plan: &ResolvedRuntimePlan,
+) -> Result<Option<GatedFfnActivation>> {
+    let name = name.into();
+    if !runtime_plan.q8.ffn_gate_up_decode_consumer
+        || !runtime_plan.q8.ffn_gate_up_decode_fused_activation
+        || input.rank() != 2
+        || input.dim(0)? != 1
+    {
+        return Ok(None);
+    }
+    let input_width = input.dim(1)?;
+    if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up",
+            "decode_fused_activation",
+            "input_width_not_q8_block_multiple",
+            1,
+            input_width,
+            0,
+        );
+        return Ok(None);
+    }
+    let Some((gate_packed, gate_width)) = q8_0_runtime_packed_projection(gate_weight, input_width)?
+    else {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up",
+            "decode_fused_activation",
+            "missing_gate_runtime_packed_rows4",
+            1,
+            input_width,
+            0,
+        );
+        return Ok(None);
+    };
+    let Some((up_packed, up_width)) = q8_0_runtime_packed_projection(up_weight, input_width)?
+    else {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up",
+            "decode_fused_activation",
+            "missing_up_runtime_packed_rows4",
+            1,
+            input_width,
+            gate_width,
+        );
+        return Ok(None);
+    };
+    if gate_width != up_width
+        || gate_packed.interleave != Q8_0PackedRows4Interleave::I8
+        || up_packed.interleave != Q8_0PackedRows4Interleave::I8
+    {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up",
+            "decode_fused_activation",
+            "packed_projection_shape_or_interleave_mismatch",
+            1,
+            input_width,
+            gate_width,
+        );
+        return Ok(None);
+    }
+
+    let order = diagnostic_ffn_gate_up_order()?;
+    let started = Instant::now();
+    let quantized_input = quantize_q8_0_row(&input.data[..input_width]);
+    let tensor = q8_0_packed_rows4_single_input_projection_pair_activated_from_quantized(
+        gate_packed,
+        up_packed,
+        gate_width,
+        &name,
+        order,
+        &quantized_input.blocks,
+    )?;
+    let total_elapsed = started.elapsed().as_micros();
+    record_q8_schedule_output_projection_route_call(
+        "ffn_gate_up",
+        "decode_fused_activation",
+        Some(&tensor.name),
+        1,
+        input_width,
+        gate_width,
+        total_elapsed,
+    );
+    let gate_elapsed = total_elapsed / 2;
+    Ok(Some(GatedFfnActivation {
+        tensor,
+        gate: gate_elapsed,
+        up: total_elapsed - gate_elapsed,
+        activation: 0,
+        gate_stats: None,
+        up_stats: None,
+        gate_diagnostic: None,
+        up_diagnostic: None,
+        activation_diagnostic: None,
+    }))
 }
 
 fn try_gated_ffn_gate_up_hybrid_q8_0(
@@ -9558,6 +9672,68 @@ fn q8_0_packed_rows4_single_input_projection_pair_into_with_decode_chunking(
         }
     }
     Ok(())
+}
+
+fn q8_0_packed_rows4_single_input_projection_pair_activated_from_quantized(
+    gate_packed: &Q8_0PackedRows4,
+    up_packed: &Q8_0PackedRows4,
+    output_width: usize,
+    name: &str,
+    order: FfnGateUpOrder,
+    quantized_input: &[Q8_0Block],
+) -> Result<CpuTensor> {
+    let output_groups = q8_0_packed_rows4_output_groups(output_width, "pair activated decode")?;
+    let blocks_per_row = gate_packed.blocks_per_row;
+    if up_packed.blocks_per_row != blocks_per_row || quantized_input.len() != blocks_per_row {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "Q8_0 packed rows4 pair activated decode blocks_per_row mismatch: gate={}, up={}, input={}",
+            gate_packed.blocks_per_row,
+            up_packed.blocks_per_row,
+            quantized_input.len()
+        )));
+    }
+    if gate_packed.interleave != Q8_0PackedRows4Interleave::I8
+        || up_packed.interleave != Q8_0PackedRows4Interleave::I8
+        || gate_packed.rows != output_width
+        || up_packed.rows != output_width
+    {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "Q8_0 packed rows4 pair activated decode requires matching I8 packed outputs, got gate {:?}/{} and up {:?}/{} for output {output_width}",
+            gate_packed.interleave, gate_packed.rows, up_packed.interleave, up_packed.rows
+        )));
+    }
+
+    let mut output = vec![0.0_f32; output_width];
+    let use_hoisted_avx2 = x86_q8_packed_rows4_avx2_dot_decode_hoist_enabled();
+    let compute_group = |group_idx: usize, output_chunk: &mut [f32]| {
+        let group_start = group_idx * blocks_per_row;
+        let gate_sums = q8_0_packed_rows4_dot_i8_matmul(
+            &gate_packed.blocks[group_start..group_start + blocks_per_row],
+            quantized_input,
+            use_hoisted_avx2,
+        );
+        let up_sums = q8_0_packed_rows4_dot_i8_matmul(
+            &up_packed.blocks[group_start..group_start + blocks_per_row],
+            quantized_input,
+            use_hoisted_avx2,
+        );
+        for lane in 0..4 {
+            output_chunk[lane] = apply_ffn_gate_up_order(gate_sums[lane], up_sums[lane], order);
+        }
+    };
+
+    if output_groups > 1 && should_parallelize_x86_q8_packed_rows4_decode_output(output_width) {
+        output
+            .par_chunks_mut(4)
+            .enumerate()
+            .for_each(|(group_idx, output_chunk)| compute_group(group_idx, output_chunk));
+    } else {
+        for (group_idx, output_chunk) in output.chunks_exact_mut(4).enumerate().take(output_groups)
+        {
+            compute_group(group_idx, output_chunk);
+        }
+    }
+    CpuTensor::from_f32(name, vec![1, output_width], output)
 }
 
 #[allow(clippy::too_many_arguments)]
