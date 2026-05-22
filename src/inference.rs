@@ -1,11 +1,7 @@
 use std::{
     cell::RefCell,
     collections::HashMap,
-    env,
-    fs::File,
-    io::{Error as IoError, ErrorKind, Result as IoResult},
-    mem,
-    os::unix::fs::FileExt,
+    env, mem,
     process::Command,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -22,15 +18,22 @@ use crate::execution_plan::MAC_Q8_PREFILL_I8MM_MIN_ROWS;
 use crate::metal;
 
 mod kv_cache;
+mod q8_block_reader;
 mod q8_runtime;
+mod q8_telemetry;
 mod rope;
 
 const Q8_SCHEDULE_TELEMETRY_ENV: &str = "CAMELID_Q8_SCHED_TELEMETRY";
 
 pub use kv_cache::{LlamaKvCache, LlamaKvCachePlan};
+pub use q8_block_reader::Q8BlockReader;
 use q8_runtime::{
     q8_0_env_flag_disabled, q8_0_env_flag_enabled_default_off,
     q8_0_env_flag_enabled_default_on_fail_closed, Q8RuntimeFlags, ResolvedRuntimePlan,
+};
+pub use q8_telemetry::{
+    LlamaQ8OutputProjectionLayerRouteTelemetry, LlamaQ8OutputProjectionRouteTelemetry,
+    LlamaQ8ProjectionRouteDenialTelemetry, LlamaQ8ScheduleRoleTelemetry, LlamaQ8ScheduleTelemetry,
 };
 pub use rope::{
     diagnostic_rope_direction, diagnostic_rope_pairing, diagnostic_rope_position_mode,
@@ -44,14 +47,16 @@ use crate::{
         LlamaTensorBinding,
     },
     tensor::{
-        dot_product, parse_byte_count_env, q8_0_file_read_stats, record_q8_0_file_read,
-        should_parallelize_linear_output, with_q8_file_cache_capacity_override, CpuTensor,
-        Q8_0Block, Q8_0FileBacking, Q8_0FileReadStats, Q8_0PackedRows4, Q8_0PackedRows4Block,
-        Q8_0PackedRows4Interleave, Q8_0RuntimeStorage, Q8_0VnniPacked, Q8_0VnniTile16, TensorShape,
-        TensorStore,
+        dot_product, parse_byte_count_env, q8_0_file_read_stats, should_parallelize_linear_output,
+        with_q8_file_cache_capacity_override, CpuTensor, Q8_0Block, Q8_0FileBacking,
+        Q8_0FileReadStats, Q8_0PackedRows4, Q8_0PackedRows4Block, Q8_0PackedRows4Interleave,
+        Q8_0RuntimeStorage, Q8_0VnniPacked, Q8_0VnniTile16, TensorShape, TensorStore,
     },
     BackendError, Result,
 };
+
+#[cfg(test)]
+use crate::tensor::record_q8_0_file_read;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use crate::tensor::Q8_0AmxPackedBlock;
@@ -88,60 +93,6 @@ impl InferenceWorkspace {
     pub fn reset(&mut self) {
         self.scratch_f32.fill(0.0);
         self.activation_f32.fill(0.0);
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Q8BlockReader {
-    offset: u64,
-    num_blocks: usize,
-}
-
-impl Q8BlockReader {
-    pub const BLOCK_SIZE_BYTES: usize = 34;
-    pub const WEIGHTS_PER_BLOCK: usize = 32;
-
-    pub fn new(offset: u64, num_blocks: usize) -> Self {
-        Self { offset, num_blocks }
-    }
-
-    pub fn dequantize_block_to_slice(
-        &self,
-        file: &File,
-        block_idx: usize,
-        dest: &mut [f32],
-    ) -> IoResult<()> {
-        if block_idx >= self.num_blocks {
-            return Err(IoError::new(
-                ErrorKind::InvalidInput,
-                "block index out of bounds",
-            ));
-        }
-
-        let dest_offset = block_idx
-            .checked_mul(Self::WEIGHTS_PER_BLOCK)
-            .ok_or_else(|| IoError::new(ErrorKind::InvalidInput, "destination offset overflow"))?;
-        if dest_offset + Self::WEIGHTS_PER_BLOCK > dest.len() {
-            return Err(IoError::new(
-                ErrorKind::InvalidInput,
-                "destination buffer too small",
-            ));
-        }
-
-        let block_offset = self
-            .offset
-            .checked_add((block_idx * Self::BLOCK_SIZE_BYTES) as u64)
-            .ok_or_else(|| IoError::new(ErrorKind::InvalidInput, "block offset overflow"))?;
-        let mut block_data = [0u8; Self::BLOCK_SIZE_BYTES];
-        file.read_exact_at(&mut block_data, block_offset)?;
-        record_q8_0_file_read(block_data.len());
-
-        let scale_bits = u16::from_le_bytes(block_data[0..2].try_into().expect("2-byte scale"));
-        let scale = f16_bits_to_f32(scale_bits);
-        for i in 0..Self::WEIGHTS_PER_BLOCK {
-            dest[dest_offset + i] = f32::from(block_data[2 + i] as i8) * scale;
-        }
-        Ok(())
     }
 }
 
@@ -1166,97 +1117,6 @@ pub struct LlamaForwardTimings {
     pub logits: u128,
     pub layers: Vec<LlamaLayerTimings>,
     pub memory: Option<LlamaForwardMemoryTimings>,
-}
-
-#[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
-pub struct LlamaQ8ScheduleTelemetry {
-    pub rayon_fanout_boundaries: u64,
-    pub i8mm_single_projection_calls: u64,
-    pub i8mm_fused_gate_up_calls: u64,
-    pub i8mm_single_projection_by_role: HashMap<String, LlamaQ8ScheduleRoleTelemetry>,
-    pub output_projection_calls: u64,
-    pub output_projection_by_route: HashMap<String, LlamaQ8OutputProjectionRouteTelemetry>,
-    pub output_projection_by_layer_route:
-        HashMap<String, LlamaQ8OutputProjectionLayerRouteTelemetry>,
-    pub projection_route_denials: HashMap<String, LlamaQ8ProjectionRouteDenialTelemetry>,
-    pub ffn_gate_up_decode_consumer_activation_us: u64,
-    pub ffn_gate_up_decode_consumer_tensor_us: u64,
-    pub activation_pack_calls: u64,
-    pub activation_pack_rows: u64,
-    pub activation_pack_bytes_requested: u64,
-    pub scratch_allocation_count: u64,
-    pub scratch_bytes_allocated: u64,
-    pub scratch_bytes_reused: u64,
-    pub scratch_peak_capacity_bytes: u64,
-    pub activation_quantize_pack_us: u64,
-    pub q8_gemm_compute_us: u64,
-    pub conservative_tail_rows: u64,
-    pub ffn_down_gemm4_prefill_candidates: u64,
-    pub ffn_down_gemm4_prefill_reject_plan_off: u64,
-    pub ffn_down_gemm4_prefill_reject_rows_lt4: u64,
-    pub ffn_down_gemm4_prefill_reject_bad_input_width: u64,
-    pub ffn_down_gemm4_prefill_reject_no_runtime_packed: u64,
-    pub ffn_down_gemm4_prefill_reject_non_i8_interleave: u64,
-    pub ffn_down_decode_consumer_taken: u64,
-    pub ffn_down_vnni_decode_candidates: u64,
-    pub ffn_down_vnni_decode_taken: u64,
-    pub ffn_down_vnni_decode_quantize_us: u64,
-    pub ffn_down_vnni_decode_kernel_us: u64,
-    pub ffn_down_vnni_decode_reject_gate_off: u64,
-    pub ffn_down_vnni_decode_reject_cpu_feature: u64,
-    pub ffn_down_vnni_decode_reject_no_vnni_pack: u64,
-    pub ffn_down_vnni_decode_reject_bad_input_width: u64,
-    pub ffn_down_vnni_decode_reject_bad_output_width: u64,
-    pub ffn_down_vnni_decode_reject_shape_or_role: u64,
-    pub prefill_single_token_fallbacks: u64,
-}
-
-#[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
-pub struct LlamaQ8ScheduleRoleTelemetry {
-    pub calls: u64,
-    pub rows: u64,
-    pub pack_us: u64,
-    pub gemm_us: u64,
-    pub tail_rows: u64,
-    pub rayon_fanout_boundaries: u64,
-    pub scheduler_chunk_calls: u64,
-    pub scheduler_output_groups: u64,
-    pub scheduler_row_groups: u64,
-    pub scheduler_groups_per_chunk: u64,
-}
-
-#[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
-pub struct LlamaQ8OutputProjectionRouteTelemetry {
-    pub role: String,
-    pub route: String,
-    pub calls: u64,
-    pub rows: u64,
-    pub input_width: u64,
-    pub output_width: u64,
-    pub elapsed_us: u64,
-}
-
-#[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
-pub struct LlamaQ8OutputProjectionLayerRouteTelemetry {
-    pub layer_index: usize,
-    pub role: String,
-    pub route: String,
-    pub calls: u64,
-    pub rows: u64,
-    pub input_width: u64,
-    pub output_width: u64,
-    pub elapsed_us: u64,
-}
-
-#[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
-pub struct LlamaQ8ProjectionRouteDenialTelemetry {
-    pub role: String,
-    pub route: String,
-    pub reason: String,
-    pub denials: u64,
-    pub rows: u64,
-    pub input_width: u64,
-    pub output_width: u64,
 }
 
 static Q8_SCHED_RAYON_FANOUT_BOUNDARIES: AtomicU64 = AtomicU64::new(0);
