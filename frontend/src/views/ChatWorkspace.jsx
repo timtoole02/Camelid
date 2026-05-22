@@ -380,12 +380,12 @@ const ChatMessageRow = memo(function ChatMessageRow({ message, generationElapsed
 
   return (
     <article
-      className={`message-row message-row-gemini ${message.role} ${assistantStreaming ? 'is-streaming' : ''}`}
+      className={`message-row message-row-assistant ${message.role} ${assistantStreaming ? 'is-streaming' : ''}`}
       aria-busy={assistantStreaming ? 'true' : undefined}
       data-streaming-state={assistantStreaming ? 'active' : undefined}
       data-streaming-code-state={isOpenStreamingCode ? 'open' : undefined}
     >
-      <div className={`message-bubble message-bubble-gemini ${message.role}`}>
+      <div className={`message-bubble message-bubble-assistant ${message.role}`}>
         {showStreamingStatus && <StreamingLoader elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} compact />}
         {message.role === 'assistant'
           ? messageContent || !assistantStreaming
@@ -509,8 +509,6 @@ export default function ChatWorkspace({
   const hasCustomConversationTitle = Boolean(rawConversationTitle && rawConversationTitle.toLowerCase() !== 'new conversation')
   const conversationLabel = clampText(hasCustomConversationTitle ? rawConversationTitle : 'Untitled chat', 30)
   const lastUpdated = selectedConversation?.updated_at ? formatDate(selectedConversation.updated_at) : null
-  const runnableModels = models.filter((model) => getChatGateState(capabilities, model, runtime).chatUnlocked)
-  const hasRunnableChoices = runnableModels.length > 0
   const modelPickerTitle = selectedModel ? getModelStatusLabel(selectedModel) : 'Choose what Camelid should use for this chat.'
   const selectedChatGate = getChatGateState(capabilities, selectedModel, runtime)
   const selectedRuntimeReady = selectedChatGate.runtimeReady || isRunnableInCurrentRuntime(selectedModel, runtime)
@@ -567,7 +565,7 @@ export default function ChatWorkspace({
     : supportBlocked
       ? 'Choose a supported model'
       : selectedModel
-        ? 'Loading model'
+        ? 'Waiting on readiness'
         : 'Choose a model to begin'
   const productHeroTitle = selectedModelRunnable
     ? 'How can I help?'
@@ -575,10 +573,10 @@ export default function ChatWorkspace({
       ? 'Choose a supported model.'
       : 'Load a model to begin.'
   const productHeroSummary = selectedModelRunnable
-    ? 'Pick a polished demo prompt or ask anything — Camelid is running the selected exact row locally.'
+    ? 'Ask anything, or start from one of the prompts below. Camelid is running the selected exact row locally.'
     : supportBlocked
-      ? 'Camelid keeps demos honest: chat unlocks only for exact supported model rows.'
-      : 'Load a generation-ready GGUF model, then run a clean local demo without cloud handoffs.'
+      ? 'The runtime is available, but chat stays locked until the selected model has an exact supported row.'
+      : 'Load a generation-ready GGUF model to unlock local chat. Camelid will keep showing what is missing until then.'
   const handleDemoPrompt = (prompt) => {
     if (generationActive || !selectedModelRunnable) return
     setComposer(prompt)
@@ -602,10 +600,10 @@ export default function ChatWorkspace({
   )
 
   const renderModelPicker = () => {
-    if (!hasRunnableChoices) {
+    if (!models.length) {
       return (
         <button className="ghost-button ghost-button-quiet" onClick={() => setTab('library')}>
-          Choose model
+          Add model
         </button>
       )
     }
@@ -616,11 +614,11 @@ export default function ChatWorkspace({
         <select
           className="composer-model-select"
           aria-label="Choose model for chat"
-          value={selectedModelId}
+          value={selectedModel?.id || selectedModelId}
           onChange={(e) => setSelectedModelId(e.target.value)}
           disabled={generationActive}
         >
-          {runnableModels.map((model) => (
+          {models.map((model) => (
             <option key={model.id} value={model.id}>
               {model.name}
             </option>
@@ -632,7 +630,7 @@ export default function ChatWorkspace({
 
 
   return (
-    <section className={`chat-layout chat-layout-gemini view-stack ${isFreshThread ? 'chat-layout-empty' : ''}`}>
+    <section className={`chat-layout chat-layout-assistant view-stack ${isFreshThread ? 'chat-layout-empty' : ''}`}>
       {!demoMode && selectedConversation && (
         <div className="mobile-conversation-bar" aria-label="Conversation navigation">
           <button className="ghost-button mobile-conversation-trigger" onClick={() => setTab('history')}>
@@ -647,9 +645,9 @@ export default function ChatWorkspace({
 
       <div className={`chat-canvas ${isFreshThread ? 'chat-canvas-empty' : ''}`}>
         {isFreshThread ? (
-          <div className="chat-empty-shell chat-empty-shell-gemini">
+          <div className="chat-empty-shell chat-empty-shell-assistant">
             <div className={`chat-empty-stage chat-empty-stage-clean chat-empty-stage-product is-${readinessState}`}>
-              <div className="chat-empty-hero chat-empty-hero-gemini chat-empty-hero-clean">
+              <div className="chat-empty-hero chat-empty-hero-assistant chat-empty-hero-clean">
                 <p className="chat-empty-greeting">{emptyHeroEyebrow}</p>
                 <h2>{productHeroTitle}</h2>
                 {productHeroSummary && <p className="hero-summary">{productHeroSummary}</p>}
@@ -660,8 +658,8 @@ export default function ChatWorkspace({
               )}
 
               {selectedModelRunnable && (
-                <div className="demo-prompt-panel" aria-label="Polished demo prompts">
-                  <span>Demo starters</span>
+                <div className="demo-prompt-panel" aria-label="Prompt starters">
+                  <span>Starters</span>
                   <div className="demo-prompt-strip">
                     {DEMO_PROMPTS.map((prompt) => (
                       <button key={prompt} type="button" className="demo-prompt-chip" onClick={() => handleDemoPrompt(prompt)} disabled={generationActive}>
@@ -672,18 +670,18 @@ export default function ChatWorkspace({
                 </div>
               )}
 
-              <div className="composer composer-gemini composer-gemini-stage composer-gemini-stage-clean composer-gemini-product">
-                <textarea className="composer-input composer-input-gemini composer-input-gemini-stage" value={composer} onChange={(e) => setComposer(e.target.value)} onKeyDown={handleComposerKeyDown} rows={2} placeholder={selectedModelRunnable ? 'Message Camelid…' : 'Load a model first'} disabled={generationActive || !selectedModelRunnable} />
-                <div className="composer-gemini-footer composer-gemini-footer-stage composer-gemini-footer-stage-clean">
-                  <div className="composer-gemini-tools composer-gemini-tools-stage composer-gemini-tools-stage-clean">
+              <div className="composer composer-assistant composer-assistant-stage composer-assistant-stage-clean composer-assistant-product">
+                <textarea className="composer-input composer-input-assistant composer-input-assistant-stage" value={composer} onChange={(e) => setComposer(e.target.value)} onKeyDown={handleComposerKeyDown} rows={2} placeholder={selectedModelRunnable ? 'Message Camelid…' : 'Load a model first'} disabled={generationActive || !selectedModelRunnable} />
+                <div className="composer-assistant-footer composer-assistant-footer-stage composer-assistant-footer-stage-clean">
+                  <div className="composer-assistant-tools composer-assistant-tools-stage composer-assistant-tools-stage-clean">
                     {renderModelPicker()}
-                    {!selectedModelRunnable && hasRunnableChoices && <button className="ghost-button ghost-button-quiet" onClick={() => setTab('library')}>Open Library</button>}
+                    {!selectedModelRunnable && <button className="ghost-button ghost-button-quiet" onClick={() => setTab('library')}>Open Models</button>}
                   </div>
-                  <div className="composer-gemini-actions composer-gemini-actions-stage">
+                  <div className="composer-assistant-actions composer-assistant-actions-stage">
                     <button className="primary-button composer-send-button" onClick={sendMessage} disabled={!canSubmit}>{generationActive ? `Generating ${generationElapsedSeconds}s…` : 'Send'}</button>
                   </div>
                 </div>
-                <p className={`composer-gemini-readiness-note is-${readinessState}`}>{readinessFinePrint}</p>
+                <p className={`composer-assistant-readiness-note is-${readinessState}`}>{readinessFinePrint}</p>
               </div>
             </div>
           </div>
@@ -702,7 +700,7 @@ export default function ChatWorkspace({
             )}
 
             {!selectedModelRunnable && (
-              <div className="setup-card setup-card-inline setup-card-gemini">
+              <div className="setup-card setup-card-inline setup-card-assistant">
                 <div>
                   <p className="panel-kicker">Before you chat</p>
                   <h2>{supportBlocked ? 'Support contract needs an exact row' : 'Choose a runnable model'}</h2>
@@ -714,7 +712,7 @@ export default function ChatWorkspace({
               </div>
             )}
 
-            <div className="chat-thread chat-thread-gemini">
+            <div className="chat-thread chat-thread-assistant">
               {visibleMessages.length === 0 && !awaitingAssistant && <div className="empty-state empty-state-chat">Pick a ready model, then send the first message when you’re ready.</div>}
               {visibleMessages.map((message, index) => {
                 const priorUserPrompt = message.role === 'assistant'
@@ -725,14 +723,14 @@ export default function ChatWorkspace({
               {awaitingAssistant && (
                 <>
                   {pendingUserPrompt && (
-                    <article className="message-row message-row-gemini user pending">
-                      <div className="message-bubble message-bubble-gemini user pending">
+                    <article className="message-row message-row-assistant user pending">
+                      <div className="message-bubble message-bubble-assistant user pending">
                         <p>{pendingUserPrompt}</p>
                       </div>
                     </article>
                   )}
-                  <article className="message-row message-row-gemini assistant pending is-streaming" aria-busy="true" data-streaming-state="active">
-                    <div className="message-bubble message-bubble-gemini assistant pending">
+                  <article className="message-row message-row-assistant assistant pending is-streaming" aria-busy="true" data-streaming-state="active">
+                    <div className="message-bubble message-bubble-assistant assistant pending">
                       <StreamingLoader elapsedSeconds={generationElapsedSeconds} label={PREPARING_STREAMING_LABEL} />
                     </div>
                   </article>
@@ -745,16 +743,16 @@ export default function ChatWorkspace({
       </div>
 
       {!isFreshThread && (
-        <div className="composer composer-gemini composer-gemini-floating">
-          <textarea className="composer-input composer-input-gemini" value={composer} onChange={(e) => setComposer(e.target.value)} onKeyDown={handleComposerKeyDown} rows={3} placeholder={selectedModelRunnable ? 'Ask Camelid' : 'Load a model first'} disabled={generationActive || !selectedModelRunnable} />
-          <div className="composer-gemini-footer">
-            <div className="composer-gemini-tools">
+        <div className="composer composer-assistant composer-assistant-floating">
+          <textarea className="composer-input composer-input-assistant" value={composer} onChange={(e) => setComposer(e.target.value)} onKeyDown={handleComposerKeyDown} rows={3} placeholder={selectedModelRunnable ? 'Ask Camelid' : 'Choose a ready model first'} disabled={generationActive || !selectedModelRunnable} />
+          <div className="composer-assistant-footer">
+            <div className="composer-assistant-tools">
               {renderModelPicker()}
               {!demoMode && <span className="composer-meta-pill">{selectedModelMeta}</span>}
               {!demoMode && selectedModelRunnable && <button className="ghost-button subtle-action" onClick={saveToMemory} disabled={generationActive}>Save to memory</button>}
             </div>
-            <div className="composer-gemini-actions">
-              {!selectedModelRunnable && hasRunnableChoices && <button className="ghost-button" onClick={() => setTab('library')}>Open Library</button>}
+            <div className="composer-assistant-actions">
+              {!selectedModelRunnable && <button className="ghost-button" onClick={() => setTab('library')}>Open Models</button>}
               <button className="primary-button composer-send-button" onClick={sendMessage} disabled={!canSubmit}>{generationActive ? `Generating ${generationElapsedSeconds}s…` : 'Send'}</button>
             </div>
           </div>
