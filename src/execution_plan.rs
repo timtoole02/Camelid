@@ -23,9 +23,12 @@ const MANAGED_ENV_KEYS: &[&str] = &[
     "CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL",
     "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER",
     "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING",
+    "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION",
+    "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT",
     "CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL",
     "CAMELID_X86_Q8_FFN_GATE_UP_SINGLE_OWNER",
     "CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER",
+    "CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL",
     "CAMELID_X86_Q8_PACKED_ROWS4_MATMUL",
     "CAMELID_X86_Q8_FFN_DOWN_GEMM4_PREFILL",
     "CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_SCHED",
@@ -425,12 +428,24 @@ fn select_linux_x86_q8_plan(
         optional_x86_q8_gate("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING"),
     );
     env_updates.insert(
+        "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION",
+        optional_x86_q8_gate("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION"),
+    );
+    env_updates.insert(
+        "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT",
+        optional_x86_q8_gate("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT"),
+    );
+    env_updates.insert(
         "CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL",
         optional_x86_q8_gate("CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL"),
     );
     env_updates.insert(
         "CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER",
         optional_x86_q8_gate("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER"),
+    );
+    env_updates.insert(
+        "CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL",
+        optional_x86_q8_gate("CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL"),
     );
     env_updates.insert(
         "CAMELID_X86_Q8_PACKED_ROWS4_MATMUL",
@@ -469,11 +484,14 @@ fn select_linux_x86_q8_plan(
         optional_x86_q8_gate("CAMELID_X86_Q8_FFN_GATE_UP_SINGLE_OWNER"),
     );
     env_updates.insert("CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER", Some("off"));
-    env_updates.insert("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER", Some("off"));
+    env_updates.insert(
+        "CAMELID_X86_Q8_OUTPUT_DECODE_OWNER",
+        optional_x86_q8_gate("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER"),
+    );
     reasons.push("validated Ubuntu/Linux x86_64 Rust Q8 runtime repack enabled".into());
     reasons.push("validated Rust AVX2 Q8 packed rows4 kernel selected".into());
     reasons.push(
-        "attention, FFN, and output decode-consumer experiments remain disabled by execution plan"
+        "attention, FFN, and output decode-consumer experiments remain default-off unless explicitly opted in"
             .into(),
     );
     reasons.push("experimental profile active; support claims remain unchanged".into());
@@ -845,9 +863,12 @@ mod tests {
             "CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL",
             "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER",
             "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING",
+            "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION",
+            "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT",
             "CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL",
             "CAMELID_X86_Q8_FFN_GATE_UP_SINGLE_OWNER",
             "CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER",
+            "CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL",
             "CAMELID_X86_Q8_PACKED_ROWS4_MATMUL",
             "CAMELID_X86_Q8_FFN_DOWN_GEMM4_PREFILL",
             "CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_SCHED",
@@ -1190,6 +1211,18 @@ mod tests {
         assert_eq!(
             outcome
                 .env_updates
+                .get("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION"),
+            Some(&Some("off"))
+        );
+        assert_eq!(
+            outcome
+                .env_updates
+                .get("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT"),
+            Some(&Some("off"))
+        );
+        assert_eq!(
+            outcome
+                .env_updates
                 .get("CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL"),
             Some(&Some("off"))
         );
@@ -1209,6 +1242,12 @@ mod tests {
             outcome
                 .env_updates
                 .get("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL"),
+            Some(&Some("off"))
+        );
+        assert_eq!(
+            outcome
+                .env_updates
+                .get("CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL"),
             Some(&Some("off"))
         );
         assert_eq!(
@@ -1270,12 +1309,15 @@ mod tests {
         env::set_var("CAMELID_X86_Q8_REPACK", "on");
         env::set_var("CAMELID_X86_Q8_KERNEL", "avx2");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER", "on");
+        env::set_var("CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_PREFILL", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_SCHED", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_AVX2", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_AMX_PREFILL", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR", "on");
+        env::set_var("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER", "on");
+        env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT", "on");
         let outcome = plan_for_model_with_platform(
             &PathBuf::from("/tmp/Llama-3.2-3B-Instruct-Q8_0.gguf"),
             &fixture("Llama 3.2 3B Instruct"),
@@ -1286,6 +1328,12 @@ mod tests {
             outcome
                 .env_updates
                 .get("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER"),
+            Some(&Some("on"))
+        );
+        assert_eq!(
+            outcome
+                .env_updates
+                .get("CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL"),
             Some(&Some("on"))
         );
         assert_eq!(
@@ -1327,6 +1375,18 @@ mod tests {
         assert_eq!(
             outcome
                 .env_updates
+                .get("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER"),
+            Some(&Some("on"))
+        );
+        assert_eq!(
+            outcome
+                .env_updates
+                .get("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT"),
+            Some(&Some("on"))
+        );
+        assert_eq!(
+            outcome
+                .env_updates
                 .get("CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL"),
             Some(&Some("off"))
         );
@@ -1346,9 +1406,12 @@ mod tests {
         env::set_var("CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL", "on");
         env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER", "on");
         env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING", "on");
+        env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION", "on");
+        env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT", "on");
         env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL", "on");
         env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_SINGLE_OWNER", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER", "on");
+        env::set_var("CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL", "on");
         env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_PREFILL", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_SCHED", "on");
@@ -1357,6 +1420,7 @@ mod tests {
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_SINGLE_OWNER", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR", "on");
+        env::set_var("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER", "on");
 
         PlannerEnv::capture().apply(&BTreeMap::new());
 
@@ -1369,9 +1433,12 @@ mod tests {
         assert!(env::var("CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING").is_err());
+        assert!(env::var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION").is_err());
+        assert!(env::var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_GATE_UP_SINGLE_OWNER").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER").is_err());
+        assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL").is_err());
         assert!(env::var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_PREFILL").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_SCHED").is_err());
@@ -1380,6 +1447,7 @@ mod tests {
         assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_SINGLE_OWNER").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR").is_err());
+        assert!(env::var("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER").is_err());
         clear_profile_env();
     }
 

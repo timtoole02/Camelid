@@ -1,0 +1,2425 @@
+{
+  "schema": "camelid.same_host_llama3_benchmark.v1",
+  "generated_utc": "2026-05-22T02:26:30.559Z",
+  "model": {
+    "row_id": "llama32_3b_instruct_q8_0",
+    "model_path": "$CAMELID_MODEL_DIR/Llama-3.2-3B-Instruct-Q8_0.gguf",
+    "model_id": "llama32-3b-q8",
+    "render_mode": "compact"
+  },
+  "method": {
+    "warmup": 1,
+    "repeats": 3,
+    "max_tokens": 16,
+    "expected_marker": "CMLD-BENCH",
+    "require_marker": true,
+    "unique_prompt": false,
+    "benchmark_messages": [
+      {
+        "role": "system",
+        "content": "You are Camelid benchmark mode. Reply with the exact requested text and nothing else."
+      },
+      {
+        "role": "user",
+        "content": "Reply with exactly this single line and nothing else: CMLD-BENCH"
+      }
+    ],
+    "estimated_prompt_tokens": 75,
+    "llama_context": 512,
+    "threads": 16,
+    "commands": {
+      "harness": "node scripts/bench-llama3-same-host.mjs --model $CAMELID_MODEL_DIR/Llama-3.2-3B-Instruct-Q8_0.gguf --model-id llama32-3b-q8 --row-id llama32_3b_instruct_q8_0 --max-tokens 16 --warmup 1 --repeats 3 --threads 16 --require-marker --expected-marker CMLD-BENCH --out $CAMELID_WORKTREE/qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/subagent-tied-output-logits-route-20260522T0224Z/benchmark-r3.json",
+      "camelid_serve": "$CAMELID_SHARED_TARGET/release/camelid serve --addr 127.0.0.1:8181",
+      "llama_server": "$CAMELID_LLAMA_CPP_BIN/llama-server --host 127.0.0.1 --port 8183 -m $CAMELID_MODEL_DIR/Llama-3.2-3B-Instruct-Q8_0.gguf -ngl 0 -c 512 --no-warmup -t 16",
+      "camelid_load_request": "POST http://127.0.0.1:8181/api/models/load {\"path\":\"$CAMELID_MODEL_DIR/Llama-3.2-3B-Instruct-Q8_0.gguf\",\"id\":\"llama32-3b-q8\"}",
+      "camelid_measure_request": "POST http://127.0.0.1:8181/v1/chat/completions stream=true max_tokens=16 temperature=0",
+      "llama_cpp_measure_request": "POST http://127.0.0.1:8183/completion stream=true n_predict=16 temperature=0 cache_prompt=false"
+    },
+    "outputs": {
+      "stdout": [
+        "camelid_ttft_ms=<mean first non-empty streamed content chunk over measured runs>",
+        "camelid_decode_tok_s=<mean estimated streamed chunks per second after first content>",
+        "camelid_ms_tok=<mean estimated milliseconds per streamed content chunk after first content>",
+        "llama_cpp_ttft_ms=<same metric for llama.cpp>",
+        "llama_cpp_decode_tok_s=<same metric for llama.cpp>",
+        "llama_cpp_ms_tok=<same metric for llama.cpp>",
+        "camelid_backend_generate_ms=<mean Camelid backend generate timing when CAMELID_STREAM_TIMING_DIAGNOSTICS=on>",
+        "camelid_backend_first_content_ms=<mean Camelid backend first-content timing when CAMELID_STREAM_TIMING_DIAGNOSTICS=on>",
+        "json_out=<absolute path when --out is set>"
+      ],
+      "json": "Full machine-readable report at --out, schema camelid.same_host_llama3_benchmark.v1.",
+      "guardrail": "marker_presence=CMLD-BENCH; pass/fail is recorded under guardrails and can be enforced with --require-marker",
+      "lifecycle": "Report records server startup timing, model-load timing, warmups, and whether servers were started by the harness or reused preloaded."
+    },
+    "bounded_metrics": [
+      "first_byte_ms: first network byte from each streaming response",
+      "first_event_ms: first parsed SSE event",
+      "first_content_ms / TTFT: first non-empty streamed content chunk",
+      "total_elapsed_ms: full streaming response wall time",
+      "completion_tokens_estimate: count of non-empty streamed content chunks, not tokenizer-ground-truth tokens",
+      "decode_tok_per_s and ms_per_token_after_first: derived from completion_tokens_estimate after first content",
+      "marker_presence: exact expected marker observed in measured output text, optionally enforced with --require-marker",
+      "camelid_backend_generate_ms and camelid_backend_first_content_ms: opt-in backend timings when CAMELID_STREAM_TIMING_DIAGNOSTICS=on",
+      "camelid_backend_q8_calls and q8 timing counters: opt-in Q8 scheduler diagnostics when Camelid Q8 scheduler telemetry is also enabled; call count includes single-projection, fused gate/up, FFN-down decode, and route-table counters",
+      "resource_snapshots: host memory/load/storage snapshots before start, before measured runs, and after measured runs",
+      "server_lifecycle: Camelid/llama-server startup timing, model-load timing, reuse/preloaded status, and warmup behavior"
+    ],
+    "server_lifecycle": {
+      "camelid_started_by_harness": true,
+      "llama_started_by_harness": true,
+      "camelid_startup_ms": 55.12,
+      "llama_startup_ms": 1108.31,
+      "camelid_model_load_ms": 625.87,
+      "camelid_model_preloaded": false,
+      "llama_model_preloaded": false
+    },
+    "evidence_context": {
+      "repository": {
+        "head": "b95dd3051397b160f3ad1e0a464e33c14ab3c168",
+        "branch": "HEAD",
+        "status_short": "M src/inference.rs\n M src/tensor/mod.rs\n?? qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/subagent-tied-output-logits-route-20260522T0224Z/"
+      },
+      "host_class": {
+        "os_type": "Linux",
+        "platform": "linux",
+        "arch": "x64",
+        "cpu_count": 16,
+        "host_class": "private Ubuntu x86_64 validation host"
+      },
+      "binaries": {
+        "camelid": {
+          "path": "$CAMELID_SHARED_TARGET/release/camelid",
+          "exists": true,
+          "size_bytes": 9054616,
+          "sha256": "dfc59980dd1e93bc2757d3ba61c94f65009a9349bca1b53f085d7be7db497f90"
+        },
+        "llama_server": {
+          "path": "$CAMELID_LLAMA_CPP_BIN/llama-server",
+          "exists": true,
+          "size_bytes": 47918720,
+          "sha256": "545f8e63151affb94fffd2205c02b0b94a93109cd09cda60631f77b00f598517"
+        },
+        "node": "v18.19.1"
+      },
+      "model_artifact": {
+        "path": "$CAMELID_MODEL_DIR/Llama-3.2-3B-Instruct-Q8_0.gguf",
+        "exists": true,
+        "size_bytes": 3421899296,
+        "sha256": "b5607b5090a8280063fff2d706bb3408ca6542341b06aab39c3eca0a28575921"
+      },
+      "privacy_note": "Host name, user name, and home-relative local paths are intentionally not recorded; scrub full artifacts before publication if absolute paths appear in commands."
+    },
+    "resource_snapshots": {
+      "pre_start": {
+        "label": "pre_start",
+        "captured_utc": "2026-05-22T02:26:19.886Z",
+        "loadavg_1m_5m_15m": [
+          1.04,
+          1,
+          1.04
+        ],
+        "memory": {
+          "process_rss_mib": 89.02
+        },
+        "linux_meminfo": {
+          "dirty_mib": 0
+        },
+        "storage": {
+          "path": "$CAMELID_WORKTREE"
+        }
+      },
+      "before_measured_runs": {
+        "label": "before_measured_runs",
+        "captured_utc": "2026-05-22T02:26:27.985Z",
+        "loadavg_1m_5m_15m": [
+          1.04,
+          1,
+          1.04
+        ],
+        "memory": {
+          "process_rss_mib": 130.53
+        },
+        "linux_meminfo": {
+          "dirty_mib": 0.01
+        },
+        "storage": {
+          "path": "$CAMELID_WORKTREE"
+        }
+      },
+      "after_measured_runs": {
+        "label": "after_measured_runs",
+        "captured_utc": "2026-05-22T02:26:30.558Z",
+        "loadavg_1m_5m_15m": [
+          1.03,
+          1,
+          1.03
+        ],
+        "memory": {
+          "process_rss_mib": 130.91
+        },
+        "linux_meminfo": {
+          "dirty_mib": 3.63
+        },
+        "storage": {
+          "path": "$CAMELID_WORKTREE"
+        }
+      }
+    },
+    "measured_order": [
+      {
+        "engine": "camelid",
+        "label": "camelid-measure-1"
+      },
+      {
+        "engine": "llama_cpp",
+        "label": "llama-measure-1"
+      },
+      {
+        "engine": "camelid",
+        "label": "camelid-measure-2"
+      },
+      {
+        "engine": "llama_cpp",
+        "label": "llama-measure-2"
+      },
+      {
+        "engine": "camelid",
+        "label": "camelid-measure-3"
+      },
+      {
+        "engine": "llama_cpp",
+        "label": "llama-measure-3"
+      }
+    ],
+    "note": "Same-host comparison using alternating streaming requests to Camelid /v1/chat/completions and llama.cpp /completion. TTFT is first non-empty streamed content chunk; token throughput is estimated from streamed content chunks, not tokenizer-ground-truth completion tokens."
+  },
+  "camelid": {
+    "base_url": "http://127.0.0.1:8181",
+    "warmups": [
+      {
+        "label": "camelid-warmup-1",
+        "text": "CMLD-BENCH",
+        "first_byte_ms": 5976.59,
+        "first_event_ms": 5976.69,
+        "first_content_ms": 5976.77,
+        "total_elapsed_ms": 5977.24,
+        "completion_tokens_estimate": 5,
+        "chunk_count": 5,
+        "backend_timing": {
+          "q8_schedule": {
+            "activation_pack_bytes_requested": 0,
+            "activation_pack_calls": 0,
+            "activation_pack_rows": 0,
+            "activation_quantize_pack_us": 0,
+            "conservative_tail_rows": 0,
+            "ffn_down_decode_consumer_taken": 168,
+            "ffn_down_gemm4_prefill_candidates": 196,
+            "ffn_down_gemm4_prefill_reject_bad_input_width": 0,
+            "ffn_down_gemm4_prefill_reject_no_runtime_packed": 0,
+            "ffn_down_gemm4_prefill_reject_non_i8_interleave": 0,
+            "ffn_down_gemm4_prefill_reject_plan_off": 196,
+            "ffn_down_gemm4_prefill_reject_rows_lt4": 0,
+            "ffn_down_vnni_decode_candidates": 532,
+            "ffn_down_vnni_decode_kernel_us": 0,
+            "ffn_down_vnni_decode_quantize_us": 0,
+            "ffn_down_vnni_decode_reject_bad_input_width": 0,
+            "ffn_down_vnni_decode_reject_bad_output_width": 0,
+            "ffn_down_vnni_decode_reject_cpu_feature": 0,
+            "ffn_down_vnni_decode_reject_gate_off": 532,
+            "ffn_down_vnni_decode_reject_no_vnni_pack": 0,
+            "ffn_down_vnni_decode_reject_shape_or_role": 0,
+            "ffn_down_vnni_decode_taken": 0,
+            "ffn_gate_up_decode_consumer_activation_us": 0,
+            "ffn_gate_up_decode_consumer_tensor_us": 0,
+            "i8mm_fused_gate_up_calls": 0,
+            "i8mm_single_projection_by_role": {},
+            "i8mm_single_projection_calls": 0,
+            "output_projection_by_layer_route": {
+              "layer_0.ffn_down.x86_decode_consumer": {
+                "calls": 6,
+                "elapsed_us": 3526,
+                "input_width": 8192,
+                "layer_index": 0,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 6
+              },
+              "layer_1.ffn_down.x86_decode_consumer": {
+                "calls": 6,
+                "elapsed_us": 3427,
+                "input_width": 8192,
+                "layer_index": 1,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 6
+              },
+              "layer_10.ffn_down.x86_decode_consumer": {
+                "calls": 6,
+                "elapsed_us": 2650,
+                "input_width": 8192,
+                "layer_index": 10,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 6
+              },
+              "layer_11.ffn_down.x86_decode_consumer": {
+                "calls": 6,
+                "elapsed_us": 2922,
+                "input_width": 8192,
+                "layer_index": 11,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 6
+              },
+              "layer_12.ffn_down.x86_decode_consumer": {
+                "calls": 6,
+                "elapsed_us": 2709,
+                "input_width": 8192,
+                "layer_index": 12,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 6
+              },
+              "layer_13.ffn_down.x86_decode_consumer": {
+                "calls": 6,
+                "elapsed_us": 2584,
+                "input_width": 8192,
+                "layer_index": 13,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 6
+              },
+              "layer_14.ffn_down.x86_decode_consumer": {
+                "calls": 6,
+                "elapsed_us": 2599,
+                "input_width": 8192,
+                "layer_index": 14,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 6
+              },
+              "layer_15.ffn_down.x86_decode_consumer": {
+                "calls": 6,
+                "elapsed_us": 2801,
+                "input_width": 8192,
+                "layer_index": 15,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 6
+              },
+              "layer_16.ffn_down.x86_decode_consumer": {
+                "calls": 6,
+                "elapsed_us": 2717,
+                "input_width": 8192,
+                "layer_index": 16,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 6
+              },
+              "layer_17.ffn_down.x86_decode_consumer": {
+                "calls": 6,
+                "elapsed_us": 2807,
+                "input_width": 8192,
+                "layer_index": 17,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 6
+              },
+              "layer_18.ffn_down.x86_decode_consumer": {
+                "calls": 6,
+                "elapsed_us": 2923,
+                "input_width": 8192,
+                "layer_index": 18,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 6
+              },
+              "layer_19.ffn_down.x86_decode_consumer": {
+                "calls": 6,
+                "elapsed_us": 2748,
+                "input_width": 8192,
+                "layer_index": 19,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 6
+              },
+              "layer_2.ffn_down.x86_decode_consumer": {
+                "calls": 6,
+                "elapsed_us": 3042,
+                "input_width": 8192,
+                "layer_index": 2,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 6
+              },
+              "layer_20.ffn_down.x86_decode_consumer": {
+                "calls": 6,
+                "elapsed_us": 3032,
+                "input_width": 8192,
+                "layer_index": 20,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 6
+              },
+              "layer_21.ffn_down.x86_decode_consumer": {
+                "calls": 6,
+                "elapsed_us": 2853,
+                "input_width": 8192,
+                "layer_index": 21,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 6
+              },
+              "layer_22.ffn_down.x86_decode_consumer": {
+                "calls": 6,
+                "elapsed_us": 2863,
+                "input_width": 8192,
+                "layer_index": 22,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 6
+              },
+              "layer_23.ffn_down.x86_decode_consumer": {
+                "calls": 6,
+                "elapsed_us": 2624,
+                "input_width": 8192,
+                "layer_index": 23,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 6
+              },
+              "layer_24.ffn_down.x86_decode_consumer": {
+                "calls": 6,
+                "elapsed_us": 2729,
+                "input_width": 8192,
+                "layer_index": 24,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 6
+              },
+              "layer_25.ffn_down.x86_decode_consumer": {
+                "calls": 6,
+                "elapsed_us": 2965,
+                "input_width": 8192,
+                "layer_index": 25,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 6
+              },
+              "layer_26.ffn_down.x86_decode_consumer": {
+                "calls": 6,
+                "elapsed_us": 2730,
+                "input_width": 8192,
+                "layer_index": 26,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 6
+              },
+              "layer_27.ffn_down.x86_decode_consumer": {
+                "calls": 6,
+                "elapsed_us": 2901,
+                "input_width": 8192,
+                "layer_index": 27,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 6
+              },
+              "layer_3.ffn_down.x86_decode_consumer": {
+                "calls": 6,
+                "elapsed_us": 2933,
+                "input_width": 8192,
+                "layer_index": 3,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 6
+              },
+              "layer_4.ffn_down.x86_decode_consumer": {
+                "calls": 6,
+                "elapsed_us": 2809,
+                "input_width": 8192,
+                "layer_index": 4,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 6
+              },
+              "layer_5.ffn_down.x86_decode_consumer": {
+                "calls": 6,
+                "elapsed_us": 2708,
+                "input_width": 8192,
+                "layer_index": 5,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 6
+              },
+              "layer_6.ffn_down.x86_decode_consumer": {
+                "calls": 6,
+                "elapsed_us": 2694,
+                "input_width": 8192,
+                "layer_index": 6,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 6
+              },
+              "layer_7.ffn_down.x86_decode_consumer": {
+                "calls": 6,
+                "elapsed_us": 2584,
+                "input_width": 8192,
+                "layer_index": 7,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 6
+              },
+              "layer_8.ffn_down.x86_decode_consumer": {
+                "calls": 6,
+                "elapsed_us": 2955,
+                "input_width": 8192,
+                "layer_index": 8,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 6
+              },
+              "layer_9.ffn_down.x86_decode_consumer": {
+                "calls": 6,
+                "elapsed_us": 2912,
+                "input_width": 8192,
+                "layer_index": 9,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 6
+              }
+            },
+            "output_projection_by_route": {
+              "ffn_down.x86_decode_consumer": {
+                "calls": 168,
+                "elapsed_us": 79747,
+                "input_width": 8192,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 168
+              },
+              "logits.x86_output_decode_owner": {
+                "calls": 6,
+                "elapsed_us": 30039,
+                "input_width": 3072,
+                "output_width": 128256,
+                "role": "logits",
+                "route": "x86_output_decode_owner",
+                "rows": 6
+              }
+            },
+            "output_projection_calls": 174,
+            "prefill_single_token_fallbacks": 0,
+            "projection_route_denials": {
+              "ffn_down.x86_gemm4_prefill.plan_off": {
+                "denials": 196,
+                "input_width": 8192,
+                "output_width": 0,
+                "reason": "plan_off",
+                "role": "ffn_down",
+                "route": "x86_gemm4_prefill",
+                "rows": 1456
+              },
+              "ffn_down.x86_vnni_decode_consumer.gate_off": {
+                "denials": 532,
+                "input_width": 8192,
+                "output_width": 3072,
+                "reason": "gate_off",
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 9352
+              },
+              "ffn_gate_up.packed_rows4_matmul_prefill.plan_off": {
+                "denials": 28,
+                "input_width": 3072,
+                "output_width": 0,
+                "reason": "plan_off",
+                "role": "ffn_gate_up",
+                "route": "packed_rows4_matmul_prefill",
+                "rows": 1288
+              }
+            },
+            "q8_gemm_compute_us": 0,
+            "rayon_fanout_boundaries": 0,
+            "scratch_allocation_count": 0,
+            "scratch_bytes_allocated": 0,
+            "scratch_bytes_reused": 0,
+            "scratch_peak_capacity_bytes": 0
+          },
+          "timings_ms": {
+            "first_content": 1866,
+            "first_content_accounting": {
+              "first_content_minus_prompt_eval_forward": 30.202999999999975,
+              "first_content_minus_prompt_eval_forward_plus_sample": 30.013999999999896,
+              "prompt_eval_forward_plus_sample": 1835.986,
+              "prompt_eval_forward_total": 1835.797,
+              "prompt_eval_logits": 5.24,
+              "prompt_eval_sample": 0.189
+            },
+            "first_token_forward_total": 68.13,
+            "first_token_role_timings": {
+              "attention_context": 2.999000000000001,
+              "attention_output": 8.554999999999998,
+              "ffn_down": 13.544999999999998,
+              "ffn_gate": 10.549999999999999,
+              "ffn_up": 10.565,
+              "logits": 5.24
+            },
+            "generate": 2205,
+            "generation_forward_total": 2173.448,
+            "generation_role_timings": {
+              "attention_context": 45.228,
+              "attention_output": 185.24599999999995,
+              "ffn_down": 503.3119999999999,
+              "ffn_gate": 435.69000000000005,
+              "ffn_up": 448.20000000000005,
+              "logits": 30.074
+            },
+            "layer_role_hotspots": {
+              "first_token": [
+                {
+                  "elapsed_ms": 0.652,
+                  "layer_index": 3,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 0.635,
+                  "layer_index": 25,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 0.629,
+                  "layer_index": 26,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 0.61,
+                  "layer_index": 18,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 0.6,
+                  "layer_index": 2,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 0.585,
+                  "layer_index": 25,
+                  "role": "attention_output"
+                },
+                {
+                  "elapsed_ms": 0.562,
+                  "layer_index": 21,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 0.559,
+                  "layer_index": 9,
+                  "role": "attention_output"
+                },
+                {
+                  "elapsed_ms": 0.549,
+                  "layer_index": 17,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 0.513,
+                  "layer_index": 15,
+                  "role": "ffn_down"
+                }
+              ],
+              "generation": [
+                {
+                  "elapsed_ms": 23.25,
+                  "layer_index": 0,
+                  "role": "ffn_gate"
+                },
+                {
+                  "elapsed_ms": 22.522,
+                  "layer_index": 0,
+                  "role": "ffn_up"
+                },
+                {
+                  "elapsed_ms": 20.663,
+                  "layer_index": 0,
+                  "role": "kv_cache_write"
+                },
+                {
+                  "elapsed_ms": 18.469,
+                  "layer_index": 22,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 18.445,
+                  "layer_index": 26,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 18.386,
+                  "layer_index": 17,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 18.36,
+                  "layer_index": 20,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 18.342,
+                  "layer_index": 18,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 18.332,
+                  "layer_index": 1,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 18.285,
+                  "layer_index": 0,
+                  "role": "ffn_down"
+                }
+              ],
+              "prefill": [
+                {
+                  "elapsed_ms": 20.596,
+                  "layer_index": 0,
+                  "role": "ffn_gate"
+                },
+                {
+                  "elapsed_ms": 20.579,
+                  "layer_index": 0,
+                  "role": "kv_cache_write"
+                },
+                {
+                  "elapsed_ms": 19.867,
+                  "layer_index": 0,
+                  "role": "ffn_up"
+                },
+                {
+                  "elapsed_ms": 15.657,
+                  "layer_index": 26,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 15.568,
+                  "layer_index": 22,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 15.536,
+                  "layer_index": 17,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 15.456,
+                  "layer_index": 16,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 15.434,
+                  "layer_index": 19,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 15.379,
+                  "layer_index": 18,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 15.356,
+                  "layer_index": 23,
+                  "role": "ffn_down"
+                }
+              ]
+            },
+            "prefill_forward_total": 1767.667,
+            "prefill_role_timings": {
+              "attention_context": 25.907999999999998,
+              "attention_output": 136.727,
+              "ffn_down": 422.3159999999999,
+              "ffn_gate": 371.631,
+              "ffn_up": 384.0549999999999,
+              "logits": 0
+            },
+            "prompt_cache_hit": false,
+            "session_create": 0,
+            "stream_event_accounting": {
+              "final_yield": 2205,
+              "final_yield_minus_first_content_yield": 339,
+              "first_content_yield": 1866,
+              "first_content_yield_minus_role_yield": 1866,
+              "generate_start": 0,
+              "generate_start_minus_role_yield": 0,
+              "poll_yield_enabled": false,
+              "role_yield": 0
+            },
+            "tokenize": 29,
+            "weight_cache_hit": false,
+            "weight_load": 3707
+          }
+        },
+        "backend_generate_ms": 2205,
+        "backend_first_content_ms": 1866,
+        "backend_q8_gemm_compute_us": 0,
+        "backend_q8_pack_us": 0,
+        "backend_q8_calls": 174,
+        "decode_tok_per_s": 10795.41,
+        "ms_per_token_after_first": 0.09
+      }
+    ],
+    "runs": [
+      {
+        "label": "camelid-measure-1",
+        "text": "CMLD-BENCH",
+        "first_byte_ms": 452.29,
+        "first_event_ms": 452.36,
+        "first_content_ms": 452.4,
+        "total_elapsed_ms": 452.61,
+        "completion_tokens_estimate": 4,
+        "chunk_count": 4,
+        "backend_timing": {
+          "q8_schedule": {
+            "activation_pack_bytes_requested": 0,
+            "activation_pack_calls": 0,
+            "activation_pack_rows": 0,
+            "activation_quantize_pack_us": 0,
+            "conservative_tail_rows": 0,
+            "ffn_down_decode_consumer_taken": 140,
+            "ffn_down_gemm4_prefill_candidates": 140,
+            "ffn_down_gemm4_prefill_reject_bad_input_width": 0,
+            "ffn_down_gemm4_prefill_reject_no_runtime_packed": 0,
+            "ffn_down_gemm4_prefill_reject_non_i8_interleave": 0,
+            "ffn_down_gemm4_prefill_reject_plan_off": 140,
+            "ffn_down_gemm4_prefill_reject_rows_lt4": 0,
+            "ffn_down_vnni_decode_candidates": 280,
+            "ffn_down_vnni_decode_kernel_us": 0,
+            "ffn_down_vnni_decode_quantize_us": 0,
+            "ffn_down_vnni_decode_reject_bad_input_width": 0,
+            "ffn_down_vnni_decode_reject_bad_output_width": 0,
+            "ffn_down_vnni_decode_reject_cpu_feature": 0,
+            "ffn_down_vnni_decode_reject_gate_off": 280,
+            "ffn_down_vnni_decode_reject_no_vnni_pack": 0,
+            "ffn_down_vnni_decode_reject_shape_or_role": 0,
+            "ffn_down_vnni_decode_taken": 0,
+            "ffn_gate_up_decode_consumer_activation_us": 0,
+            "ffn_gate_up_decode_consumer_tensor_us": 0,
+            "i8mm_fused_gate_up_calls": 0,
+            "i8mm_single_projection_by_role": {},
+            "i8mm_single_projection_calls": 0,
+            "output_projection_by_layer_route": {
+              "layer_0.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2670,
+                "input_width": 8192,
+                "layer_index": 0,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_1.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2510,
+                "input_width": 8192,
+                "layer_index": 1,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_10.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2147,
+                "input_width": 8192,
+                "layer_index": 10,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_11.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2339,
+                "input_width": 8192,
+                "layer_index": 11,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_12.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2178,
+                "input_width": 8192,
+                "layer_index": 12,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_13.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2566,
+                "input_width": 8192,
+                "layer_index": 13,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_14.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2274,
+                "input_width": 8192,
+                "layer_index": 14,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_15.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2365,
+                "input_width": 8192,
+                "layer_index": 15,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_16.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2347,
+                "input_width": 8192,
+                "layer_index": 16,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_17.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2578,
+                "input_width": 8192,
+                "layer_index": 17,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_18.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2425,
+                "input_width": 8192,
+                "layer_index": 18,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_19.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2435,
+                "input_width": 8192,
+                "layer_index": 19,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_2.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2367,
+                "input_width": 8192,
+                "layer_index": 2,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_20.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2633,
+                "input_width": 8192,
+                "layer_index": 20,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_21.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2107,
+                "input_width": 8192,
+                "layer_index": 21,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_22.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2179,
+                "input_width": 8192,
+                "layer_index": 22,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_23.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2136,
+                "input_width": 8192,
+                "layer_index": 23,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_24.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2147,
+                "input_width": 8192,
+                "layer_index": 24,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_25.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2157,
+                "input_width": 8192,
+                "layer_index": 25,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_26.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2186,
+                "input_width": 8192,
+                "layer_index": 26,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_27.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2258,
+                "input_width": 8192,
+                "layer_index": 27,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_3.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2086,
+                "input_width": 8192,
+                "layer_index": 3,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_4.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2321,
+                "input_width": 8192,
+                "layer_index": 4,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_5.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2195,
+                "input_width": 8192,
+                "layer_index": 5,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_6.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2177,
+                "input_width": 8192,
+                "layer_index": 6,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_7.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2376,
+                "input_width": 8192,
+                "layer_index": 7,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_8.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2094,
+                "input_width": 8192,
+                "layer_index": 8,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_9.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2406,
+                "input_width": 8192,
+                "layer_index": 9,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              }
+            },
+            "output_projection_by_route": {
+              "ffn_down.x86_decode_consumer": {
+                "calls": 140,
+                "elapsed_us": 64659,
+                "input_width": 8192,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 140
+              },
+              "logits.x86_output_decode_owner": {
+                "calls": 5,
+                "elapsed_us": 24839,
+                "input_width": 3072,
+                "output_width": 128256,
+                "role": "logits",
+                "route": "x86_output_decode_owner",
+                "rows": 5
+              }
+            },
+            "output_projection_calls": 145,
+            "prefill_single_token_fallbacks": 0,
+            "projection_route_denials": {
+              "ffn_down.x86_gemm4_prefill.plan_off": {
+                "denials": 140,
+                "input_width": 8192,
+                "output_width": 0,
+                "reason": "plan_off",
+                "role": "ffn_down",
+                "route": "x86_gemm4_prefill",
+                "rows": 140
+              },
+              "ffn_down.x86_vnni_decode_consumer.gate_off": {
+                "denials": 280,
+                "input_width": 8192,
+                "output_width": 3072,
+                "reason": "gate_off",
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 280
+              }
+            },
+            "q8_gemm_compute_us": 0,
+            "rayon_fanout_boundaries": 0,
+            "scratch_allocation_count": 0,
+            "scratch_bytes_allocated": 0,
+            "scratch_bytes_reused": 0,
+            "scratch_peak_capacity_bytes": 0
+          },
+          "timings_ms": {
+            "first_content": 123,
+            "first_content_accounting": {
+              "first_content_minus_prompt_eval_forward": 123,
+              "first_content_minus_prompt_eval_forward_plus_sample": 123,
+              "prompt_eval_forward_plus_sample": 0,
+              "prompt_eval_forward_total": 0,
+              "prompt_eval_logits": 0,
+              "prompt_eval_sample": 0
+            },
+            "first_token_forward_total": 0,
+            "first_token_role_timings": {
+              "attention_context": 0,
+              "attention_output": 0,
+              "ffn_down": 0,
+              "ffn_gate": 0,
+              "ffn_up": 0,
+              "logits": 0
+            },
+            "generate": 386,
+            "generation_forward_total": 328.734,
+            "generation_role_timings": {
+              "attention_context": 16.270999999999997,
+              "attention_output": 37.639,
+              "ffn_down": 65.702,
+              "ffn_gate": 52.496000000000016,
+              "ffn_up": 52.579,
+              "logits": 24.865
+            },
+            "layer_role_hotspots": {
+              "first_token": [],
+              "generation": [
+                {
+                  "elapsed_ms": 2.714,
+                  "layer_index": 0,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 2.675,
+                  "layer_index": 20,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 2.619,
+                  "layer_index": 17,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 2.6,
+                  "layer_index": 13,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 2.554,
+                  "layer_index": 1,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 2.476,
+                  "layer_index": 19,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 2.465,
+                  "layer_index": 18,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 2.442,
+                  "layer_index": 9,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 2.41,
+                  "layer_index": 7,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 2.402,
+                  "layer_index": 2,
+                  "role": "ffn_down"
+                }
+              ],
+              "prefill": []
+            },
+            "prefill_forward_total": 0,
+            "prefill_role_timings": {
+              "attention_context": 0,
+              "attention_output": 0,
+              "ffn_down": 0,
+              "ffn_gate": 0,
+              "ffn_up": 0,
+              "logits": 0
+            },
+            "prompt_cache_hit": true,
+            "session_create": 0,
+            "stream_event_accounting": {
+              "final_yield": 386,
+              "final_yield_minus_first_content_yield": 263,
+              "first_content_yield": 123,
+              "first_content_yield_minus_role_yield": 123,
+              "generate_start": 0,
+              "generate_start_minus_role_yield": 0,
+              "poll_yield_enabled": false,
+              "role_yield": 0
+            },
+            "tokenize": 29,
+            "weight_cache_hit": true,
+            "weight_load": 0
+          }
+        },
+        "backend_generate_ms": 386,
+        "backend_first_content_ms": 123,
+        "backend_q8_gemm_compute_us": 0,
+        "backend_q8_pack_us": 0,
+        "backend_q8_calls": 145,
+        "decode_tok_per_s": 19658.34,
+        "ms_per_token_after_first": 0.05
+      },
+      {
+        "label": "camelid-measure-2",
+        "text": "CMLD-BENCH",
+        "first_byte_ms": 451.28,
+        "first_event_ms": 451.32,
+        "first_content_ms": 451.36,
+        "total_elapsed_ms": 451.88,
+        "completion_tokens_estimate": 4,
+        "chunk_count": 4,
+        "backend_timing": {
+          "q8_schedule": {
+            "activation_pack_bytes_requested": 0,
+            "activation_pack_calls": 0,
+            "activation_pack_rows": 0,
+            "activation_quantize_pack_us": 0,
+            "conservative_tail_rows": 0,
+            "ffn_down_decode_consumer_taken": 140,
+            "ffn_down_gemm4_prefill_candidates": 140,
+            "ffn_down_gemm4_prefill_reject_bad_input_width": 0,
+            "ffn_down_gemm4_prefill_reject_no_runtime_packed": 0,
+            "ffn_down_gemm4_prefill_reject_non_i8_interleave": 0,
+            "ffn_down_gemm4_prefill_reject_plan_off": 140,
+            "ffn_down_gemm4_prefill_reject_rows_lt4": 0,
+            "ffn_down_vnni_decode_candidates": 280,
+            "ffn_down_vnni_decode_kernel_us": 0,
+            "ffn_down_vnni_decode_quantize_us": 0,
+            "ffn_down_vnni_decode_reject_bad_input_width": 0,
+            "ffn_down_vnni_decode_reject_bad_output_width": 0,
+            "ffn_down_vnni_decode_reject_cpu_feature": 0,
+            "ffn_down_vnni_decode_reject_gate_off": 280,
+            "ffn_down_vnni_decode_reject_no_vnni_pack": 0,
+            "ffn_down_vnni_decode_reject_shape_or_role": 0,
+            "ffn_down_vnni_decode_taken": 0,
+            "ffn_gate_up_decode_consumer_activation_us": 0,
+            "ffn_gate_up_decode_consumer_tensor_us": 0,
+            "i8mm_fused_gate_up_calls": 0,
+            "i8mm_single_projection_by_role": {},
+            "i8mm_single_projection_calls": 0,
+            "output_projection_by_layer_route": {
+              "layer_0.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2543,
+                "input_width": 8192,
+                "layer_index": 0,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_1.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2796,
+                "input_width": 8192,
+                "layer_index": 1,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_10.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2212,
+                "input_width": 8192,
+                "layer_index": 10,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_11.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2269,
+                "input_width": 8192,
+                "layer_index": 11,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_12.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2304,
+                "input_width": 8192,
+                "layer_index": 12,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_13.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2644,
+                "input_width": 8192,
+                "layer_index": 13,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_14.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2607,
+                "input_width": 8192,
+                "layer_index": 14,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_15.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2401,
+                "input_width": 8192,
+                "layer_index": 15,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_16.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2272,
+                "input_width": 8192,
+                "layer_index": 16,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_17.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2157,
+                "input_width": 8192,
+                "layer_index": 17,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_18.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2465,
+                "input_width": 8192,
+                "layer_index": 18,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_19.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2289,
+                "input_width": 8192,
+                "layer_index": 19,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_2.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2907,
+                "input_width": 8192,
+                "layer_index": 2,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_20.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2227,
+                "input_width": 8192,
+                "layer_index": 20,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_21.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2690,
+                "input_width": 8192,
+                "layer_index": 21,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_22.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2451,
+                "input_width": 8192,
+                "layer_index": 22,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_23.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2268,
+                "input_width": 8192,
+                "layer_index": 23,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_24.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2506,
+                "input_width": 8192,
+                "layer_index": 24,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_25.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2395,
+                "input_width": 8192,
+                "layer_index": 25,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_26.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2495,
+                "input_width": 8192,
+                "layer_index": 26,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_27.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2422,
+                "input_width": 8192,
+                "layer_index": 27,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_3.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2436,
+                "input_width": 8192,
+                "layer_index": 3,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_4.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2357,
+                "input_width": 8192,
+                "layer_index": 4,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_5.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2222,
+                "input_width": 8192,
+                "layer_index": 5,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_6.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2208,
+                "input_width": 8192,
+                "layer_index": 6,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_7.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2287,
+                "input_width": 8192,
+                "layer_index": 7,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_8.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2271,
+                "input_width": 8192,
+                "layer_index": 8,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_9.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2291,
+                "input_width": 8192,
+                "layer_index": 9,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              }
+            },
+            "output_projection_by_route": {
+              "ffn_down.x86_decode_consumer": {
+                "calls": 140,
+                "elapsed_us": 67392,
+                "input_width": 8192,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 140
+              },
+              "logits.x86_output_decode_owner": {
+                "calls": 5,
+                "elapsed_us": 24658,
+                "input_width": 3072,
+                "output_width": 128256,
+                "role": "logits",
+                "route": "x86_output_decode_owner",
+                "rows": 5
+              }
+            },
+            "output_projection_calls": 145,
+            "prefill_single_token_fallbacks": 0,
+            "projection_route_denials": {
+              "ffn_down.x86_gemm4_prefill.plan_off": {
+                "denials": 140,
+                "input_width": 8192,
+                "output_width": 0,
+                "reason": "plan_off",
+                "role": "ffn_down",
+                "route": "x86_gemm4_prefill",
+                "rows": 140
+              },
+              "ffn_down.x86_vnni_decode_consumer.gate_off": {
+                "denials": 280,
+                "input_width": 8192,
+                "output_width": 3072,
+                "reason": "gate_off",
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 280
+              }
+            },
+            "q8_gemm_compute_us": 0,
+            "rayon_fanout_boundaries": 0,
+            "scratch_allocation_count": 0,
+            "scratch_bytes_allocated": 0,
+            "scratch_bytes_reused": 0,
+            "scratch_peak_capacity_bytes": 0
+          },
+          "timings_ms": {
+            "first_content": 116,
+            "first_content_accounting": {
+              "first_content_minus_prompt_eval_forward": 116,
+              "first_content_minus_prompt_eval_forward_plus_sample": 116,
+              "prompt_eval_forward_plus_sample": 0,
+              "prompt_eval_forward_total": 0,
+              "prompt_eval_logits": 0,
+              "prompt_eval_sample": 0
+            },
+            "first_token_forward_total": 0,
+            "first_token_role_timings": {
+              "attention_context": 0,
+              "attention_output": 0,
+              "ffn_down": 0,
+              "ffn_gate": 0,
+              "ffn_up": 0,
+              "logits": 0
+            },
+            "generate": 389,
+            "generation_forward_total": 340.485,
+            "generation_role_timings": {
+              "attention_context": 17.182,
+              "attention_output": 39.683,
+              "ffn_down": 68.52499999999999,
+              "ffn_gate": 52.961999999999996,
+              "ffn_up": 53.036,
+              "logits": 24.686
+            },
+            "layer_role_hotspots": {
+              "first_token": [],
+              "generation": [
+                {
+                  "elapsed_ms": 2.954,
+                  "layer_index": 2,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 2.845,
+                  "layer_index": 1,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 2.729,
+                  "layer_index": 21,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 2.68,
+                  "layer_index": 13,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 2.642,
+                  "layer_index": 14,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 2.594,
+                  "layer_index": 0,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 2.546,
+                  "layer_index": 24,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 2.533,
+                  "layer_index": 26,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 2.506,
+                  "layer_index": 18,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 2.5,
+                  "layer_index": 3,
+                  "role": "ffn_down"
+                }
+              ],
+              "prefill": []
+            },
+            "prefill_forward_total": 0,
+            "prefill_role_timings": {
+              "attention_context": 0,
+              "attention_output": 0,
+              "ffn_down": 0,
+              "ffn_gate": 0,
+              "ffn_up": 0,
+              "logits": 0
+            },
+            "prompt_cache_hit": true,
+            "session_create": 0,
+            "stream_event_accounting": {
+              "final_yield": 389,
+              "final_yield_minus_first_content_yield": 273,
+              "first_content_yield": 116,
+              "first_content_yield_minus_role_yield": 116,
+              "generate_start": 0,
+              "generate_start_minus_role_yield": 0,
+              "poll_yield_enabled": false,
+              "role_yield": 0
+            },
+            "tokenize": 32,
+            "weight_cache_hit": true,
+            "weight_load": 0
+          }
+        },
+        "backend_generate_ms": 389,
+        "backend_first_content_ms": 116,
+        "backend_q8_gemm_compute_us": 0,
+        "backend_q8_pack_us": 0,
+        "backend_q8_calls": 145,
+        "decode_tok_per_s": 7650.66,
+        "ms_per_token_after_first": 0.13
+      },
+      {
+        "label": "camelid-measure-3",
+        "text": "CMLD-BENCH",
+        "first_byte_ms": 433.38,
+        "first_event_ms": 433.42,
+        "first_content_ms": 433.45,
+        "total_elapsed_ms": 433.62,
+        "completion_tokens_estimate": 4,
+        "chunk_count": 4,
+        "backend_timing": {
+          "q8_schedule": {
+            "activation_pack_bytes_requested": 0,
+            "activation_pack_calls": 0,
+            "activation_pack_rows": 0,
+            "activation_quantize_pack_us": 0,
+            "conservative_tail_rows": 0,
+            "ffn_down_decode_consumer_taken": 140,
+            "ffn_down_gemm4_prefill_candidates": 140,
+            "ffn_down_gemm4_prefill_reject_bad_input_width": 0,
+            "ffn_down_gemm4_prefill_reject_no_runtime_packed": 0,
+            "ffn_down_gemm4_prefill_reject_non_i8_interleave": 0,
+            "ffn_down_gemm4_prefill_reject_plan_off": 140,
+            "ffn_down_gemm4_prefill_reject_rows_lt4": 0,
+            "ffn_down_vnni_decode_candidates": 280,
+            "ffn_down_vnni_decode_kernel_us": 0,
+            "ffn_down_vnni_decode_quantize_us": 0,
+            "ffn_down_vnni_decode_reject_bad_input_width": 0,
+            "ffn_down_vnni_decode_reject_bad_output_width": 0,
+            "ffn_down_vnni_decode_reject_cpu_feature": 0,
+            "ffn_down_vnni_decode_reject_gate_off": 280,
+            "ffn_down_vnni_decode_reject_no_vnni_pack": 0,
+            "ffn_down_vnni_decode_reject_shape_or_role": 0,
+            "ffn_down_vnni_decode_taken": 0,
+            "ffn_gate_up_decode_consumer_activation_us": 0,
+            "ffn_gate_up_decode_consumer_tensor_us": 0,
+            "i8mm_fused_gate_up_calls": 0,
+            "i8mm_single_projection_by_role": {},
+            "i8mm_single_projection_calls": 0,
+            "output_projection_by_layer_route": {
+              "layer_0.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2351,
+                "input_width": 8192,
+                "layer_index": 0,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_1.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2437,
+                "input_width": 8192,
+                "layer_index": 1,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_10.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2042,
+                "input_width": 8192,
+                "layer_index": 10,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_11.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2241,
+                "input_width": 8192,
+                "layer_index": 11,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_12.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2553,
+                "input_width": 8192,
+                "layer_index": 12,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_13.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2184,
+                "input_width": 8192,
+                "layer_index": 13,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_14.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2257,
+                "input_width": 8192,
+                "layer_index": 14,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_15.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2319,
+                "input_width": 8192,
+                "layer_index": 15,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_16.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2125,
+                "input_width": 8192,
+                "layer_index": 16,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_17.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2230,
+                "input_width": 8192,
+                "layer_index": 17,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_18.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2191,
+                "input_width": 8192,
+                "layer_index": 18,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_19.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2383,
+                "input_width": 8192,
+                "layer_index": 19,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_2.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2210,
+                "input_width": 8192,
+                "layer_index": 2,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_20.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2357,
+                "input_width": 8192,
+                "layer_index": 20,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_21.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2334,
+                "input_width": 8192,
+                "layer_index": 21,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_22.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2526,
+                "input_width": 8192,
+                "layer_index": 22,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_23.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2259,
+                "input_width": 8192,
+                "layer_index": 23,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_24.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2285,
+                "input_width": 8192,
+                "layer_index": 24,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_25.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2305,
+                "input_width": 8192,
+                "layer_index": 25,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_26.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2076,
+                "input_width": 8192,
+                "layer_index": 26,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_27.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2079,
+                "input_width": 8192,
+                "layer_index": 27,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_3.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2315,
+                "input_width": 8192,
+                "layer_index": 3,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_4.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2117,
+                "input_width": 8192,
+                "layer_index": 4,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_5.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2337,
+                "input_width": 8192,
+                "layer_index": 5,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_6.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2103,
+                "input_width": 8192,
+                "layer_index": 6,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_7.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2376,
+                "input_width": 8192,
+                "layer_index": 7,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_8.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2175,
+                "input_width": 8192,
+                "layer_index": 8,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              },
+              "layer_9.ffn_down.x86_decode_consumer": {
+                "calls": 5,
+                "elapsed_us": 2043,
+                "input_width": 8192,
+                "layer_index": 9,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 5
+              }
+            },
+            "output_projection_by_route": {
+              "ffn_down.x86_decode_consumer": {
+                "calls": 140,
+                "elapsed_us": 63210,
+                "input_width": 8192,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 140
+              },
+              "logits.x86_output_decode_owner": {
+                "calls": 5,
+                "elapsed_us": 24498,
+                "input_width": 3072,
+                "output_width": 128256,
+                "role": "logits",
+                "route": "x86_output_decode_owner",
+                "rows": 5
+              }
+            },
+            "output_projection_calls": 145,
+            "prefill_single_token_fallbacks": 0,
+            "projection_route_denials": {
+              "ffn_down.x86_gemm4_prefill.plan_off": {
+                "denials": 140,
+                "input_width": 8192,
+                "output_width": 0,
+                "reason": "plan_off",
+                "role": "ffn_down",
+                "route": "x86_gemm4_prefill",
+                "rows": 140
+              },
+              "ffn_down.x86_vnni_decode_consumer.gate_off": {
+                "denials": 280,
+                "input_width": 8192,
+                "output_width": 3072,
+                "reason": "gate_off",
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 280
+              }
+            },
+            "q8_gemm_compute_us": 0,
+            "rayon_fanout_boundaries": 0,
+            "scratch_allocation_count": 0,
+            "scratch_bytes_allocated": 0,
+            "scratch_bytes_reused": 0,
+            "scratch_peak_capacity_bytes": 0
+          },
+          "timings_ms": {
+            "first_content": 113,
+            "first_content_accounting": {
+              "first_content_minus_prompt_eval_forward": 113,
+              "first_content_minus_prompt_eval_forward_plus_sample": 113,
+              "prompt_eval_forward_plus_sample": 0,
+              "prompt_eval_forward_total": 0,
+              "prompt_eval_logits": 0,
+              "prompt_eval_sample": 0
+            },
+            "first_token_forward_total": 0,
+            "first_token_role_timings": {
+              "attention_context": 0,
+              "attention_output": 0,
+              "ffn_down": 0,
+              "ffn_gate": 0,
+              "ffn_up": 0,
+              "logits": 0
+            },
+            "generate": 375,
+            "generation_forward_total": 327.442,
+            "generation_role_timings": {
+              "attention_context": 16.258,
+              "attention_output": 36.657,
+              "ffn_down": 64.24699999999999,
+              "ffn_gate": 53.362,
+              "ffn_up": 53.436,
+              "logits": 24.523
+            },
+            "layer_role_hotspots": {
+              "first_token": [],
+              "generation": [
+                {
+                  "elapsed_ms": 2.586,
+                  "layer_index": 12,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 2.568,
+                  "layer_index": 22,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 2.481,
+                  "layer_index": 1,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 2.421,
+                  "layer_index": 19,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 2.412,
+                  "layer_index": 7,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 2.395,
+                  "layer_index": 20,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 2.393,
+                  "layer_index": 0,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 2.375,
+                  "layer_index": 5,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 2.371,
+                  "layer_index": 21,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 2.352,
+                  "layer_index": 15,
+                  "role": "ffn_down"
+                }
+              ],
+              "prefill": []
+            },
+            "prefill_forward_total": 0,
+            "prefill_role_timings": {
+              "attention_context": 0,
+              "attention_output": 0,
+              "ffn_down": 0,
+              "ffn_gate": 0,
+              "ffn_up": 0,
+              "logits": 0
+            },
+            "prompt_cache_hit": true,
+            "session_create": 0,
+            "stream_event_accounting": {
+              "final_yield": 375,
+              "final_yield_minus_first_content_yield": 262,
+              "first_content_yield": 113,
+              "first_content_yield_minus_role_yield": 113,
+              "generate_start": 0,
+              "generate_start_minus_role_yield": 0,
+              "poll_yield_enabled": false,
+              "role_yield": 0
+            },
+            "tokenize": 29,
+            "weight_cache_hit": true,
+            "weight_load": 0
+          }
+        },
+        "backend_generate_ms": 375,
+        "backend_first_content_ms": 113,
+        "backend_q8_gemm_compute_us": 0,
+        "backend_q8_pack_us": 0,
+        "backend_q8_calls": 145,
+        "decode_tok_per_s": 23040.28,
+        "ms_per_token_after_first": 0.04
+      }
+    ],
+    "summary": {
+      "count": 3,
+      "avg_first_byte_ms": 445.65,
+      "avg_first_event_ms": 445.7,
+      "avg_ttft_ms": 445.74,
+      "avg_total_elapsed_ms": 446.04,
+      "avg_backend_generate_ms": 383.33,
+      "avg_backend_first_content_ms": 117.33,
+      "avg_backend_q8_calls": 145,
+      "avg_backend_q8_gemm_compute_us": 0,
+      "avg_backend_q8_pack_us": 0,
+      "avg_decode_tok_per_s": 16783.09,
+      "avg_ms_per_token_after_first": 0.07,
+      "avg_completion_tokens_estimate": 4
+    }
+  },
+  "llama_cpp": {
+    "base_url": "http://127.0.0.1:8183",
+    "warmups": [
+      {
+        "label": "llama-warmup-1",
+        "text": "CMLD-BENCH",
+        "first_byte_ms": 171.94,
+        "first_event_ms": 172.16,
+        "first_content_ms": 172.23,
+        "total_elapsed_ms": 378.15,
+        "completion_tokens_estimate": 5,
+        "chunk_count": 5,
+        "backend_timing": null,
+        "backend_generate_ms": null,
+        "backend_first_content_ms": null,
+        "backend_q8_gemm_compute_us": null,
+        "backend_q8_pack_us": null,
+        "backend_q8_calls": null,
+        "decode_tok_per_s": 24.28,
+        "ms_per_token_after_first": 41.18
+      }
+    ],
+    "runs": [
+      {
+        "label": "llama-measure-1",
+        "text": "CMLD-BENCH",
+        "first_byte_ms": 171.18,
+        "first_event_ms": 171.21,
+        "first_content_ms": 171.24,
+        "total_elapsed_ms": 380.48,
+        "completion_tokens_estimate": 5,
+        "chunk_count": 5,
+        "backend_timing": null,
+        "backend_generate_ms": null,
+        "backend_first_content_ms": null,
+        "backend_q8_gemm_compute_us": null,
+        "backend_q8_pack_us": null,
+        "backend_q8_calls": null,
+        "decode_tok_per_s": 23.9,
+        "ms_per_token_after_first": 41.85
+      },
+      {
+        "label": "llama-measure-2",
+        "text": "CMLD-BENCH",
+        "first_byte_ms": 186.44,
+        "first_event_ms": 186.47,
+        "first_content_ms": 186.5,
+        "total_elapsed_ms": 473.59,
+        "completion_tokens_estimate": 5,
+        "chunk_count": 5,
+        "backend_timing": null,
+        "backend_generate_ms": null,
+        "backend_first_content_ms": null,
+        "backend_q8_gemm_compute_us": null,
+        "backend_q8_pack_us": null,
+        "backend_q8_calls": null,
+        "decode_tok_per_s": 17.42,
+        "ms_per_token_after_first": 57.42
+      },
+      {
+        "label": "llama-measure-3",
+        "text": "CMLD-BENCH",
+        "first_byte_ms": 171.77,
+        "first_event_ms": 171.81,
+        "first_content_ms": 171.84,
+        "total_elapsed_ms": 377.17,
+        "completion_tokens_estimate": 5,
+        "chunk_count": 5,
+        "backend_timing": null,
+        "backend_generate_ms": null,
+        "backend_first_content_ms": null,
+        "backend_q8_gemm_compute_us": null,
+        "backend_q8_pack_us": null,
+        "backend_q8_calls": null,
+        "decode_tok_per_s": 24.35,
+        "ms_per_token_after_first": 41.07
+      }
+    ],
+    "summary": {
+      "count": 3,
+      "avg_first_byte_ms": 176.46,
+      "avg_first_event_ms": 176.5,
+      "avg_ttft_ms": 176.53,
+      "avg_total_elapsed_ms": 410.41,
+      "avg_backend_generate_ms": null,
+      "avg_backend_first_content_ms": null,
+      "avg_backend_q8_calls": null,
+      "avg_backend_q8_gemm_compute_us": null,
+      "avg_backend_q8_pack_us": null,
+      "avg_decode_tok_per_s": 21.89,
+      "avg_ms_per_token_after_first": 46.78,
+      "avg_completion_tokens_estimate": 5
+    },
+    "binary": "$CAMELID_LLAMA_CPP_BIN/llama-server"
+  },
+  "comparison": {
+    "ttft_delta_pct_vs_llama_cpp": 152.5,
+    "total_elapsed_delta_pct_vs_llama_cpp": 8.68,
+    "decode_tok_per_s_delta_pct_vs_llama_cpp": 76570.12,
+    "ms_per_token_after_first_delta_pct_vs_llama_cpp": -99.85
+  },
+  "guardrails": {
+    "expected_marker": "CMLD-BENCH",
+    "require_marker": true,
+    "marker_presence": {
+      "camelid": [
+        {
+          "label": "camelid-measure-1",
+          "contains_expected_marker": true,
+          "nonempty_streamed_output": true
+        },
+        {
+          "label": "camelid-measure-2",
+          "contains_expected_marker": true,
+          "nonempty_streamed_output": true
+        },
+        {
+          "label": "camelid-measure-3",
+          "contains_expected_marker": true,
+          "nonempty_streamed_output": true
+        }
+      ],
+      "llama_cpp": [
+        {
+          "label": "llama-measure-1",
+          "contains_expected_marker": true,
+          "nonempty_streamed_output": true
+        },
+        {
+          "label": "llama-measure-2",
+          "contains_expected_marker": true,
+          "nonempty_streamed_output": true
+        },
+        {
+          "label": "llama-measure-3",
+          "contains_expected_marker": true,
+          "nonempty_streamed_output": true
+        }
+      ]
+    },
+    "passed": true,
+    "note": "The harness exits non-zero if any measured run omits the expected marker; empty measured output is always treated as a failed guardrail."
+  },
+  "claim_boundary": "Same-host benchmark snapshot only for exact row llama32_3b_instruct_q8_0 with the provided GGUF, prompt, max-token budget, host, binaries, and thread settings. It is bounded timing evidence only: it does not widen support, portability, production-throughput, model-native/larger-context, neighboring-row, broad Llama-family, 1B, or Mixtral claims unless a separate row-specific evidence bundle records those exact conditions."
+}

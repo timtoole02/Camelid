@@ -1,0 +1,869 @@
+{
+  "schema": "camelid.same_host_llama3_benchmark.v1",
+  "generated_utc": "2026-05-22T02:25:53.280Z",
+  "model": {
+    "row_id": "llama32_3b_instruct_q8_0",
+    "model_path": "$CAMELID_MODEL_DIR/Llama-3.2-3B-Instruct-Q8_0.gguf",
+    "model_id": "llama32-3b-q8",
+    "render_mode": "compact"
+  },
+  "method": {
+    "warmup": 0,
+    "repeats": 1,
+    "max_tokens": 1,
+    "expected_marker": "CMLD-BENCH",
+    "require_marker": false,
+    "unique_prompt": false,
+    "benchmark_messages": [
+      {
+        "role": "system",
+        "content": "You are Camelid benchmark mode. Reply with the exact requested text and nothing else."
+      },
+      {
+        "role": "user",
+        "content": "Reply with exactly this single line and nothing else: CMLD-BENCH"
+      }
+    ],
+    "estimated_prompt_tokens": 75,
+    "llama_context": 512,
+    "threads": 16,
+    "commands": {
+      "harness": "node scripts/bench-llama3-same-host.mjs --model $CAMELID_MODEL_DIR/Llama-3.2-3B-Instruct-Q8_0.gguf --model-id llama32-3b-q8 --row-id llama32_3b_instruct_q8_0 --max-tokens 1 --warmup 0 --repeats 1 --threads 16 --out $CAMELID_WORKTREE/qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/subagent-tied-output-logits-route-20260522T0224Z/parity-one-token-telemetry.json",
+      "camelid_serve": "$CAMELID_SHARED_TARGET/release/camelid serve --addr 127.0.0.1:8181",
+      "llama_server": "$CAMELID_LLAMA_CPP_BIN/llama-server --host 127.0.0.1 --port 8183 -m $CAMELID_MODEL_DIR/Llama-3.2-3B-Instruct-Q8_0.gguf -ngl 0 -c 512 --no-warmup -t 16",
+      "camelid_load_request": "POST http://127.0.0.1:8181/api/models/load {\"path\":\"$CAMELID_MODEL_DIR/Llama-3.2-3B-Instruct-Q8_0.gguf\",\"id\":\"llama32-3b-q8\"}",
+      "camelid_measure_request": "POST http://127.0.0.1:8181/v1/chat/completions stream=true max_tokens=1 temperature=0",
+      "llama_cpp_measure_request": "POST http://127.0.0.1:8183/completion stream=true n_predict=1 temperature=0 cache_prompt=false"
+    },
+    "outputs": {
+      "stdout": [
+        "camelid_ttft_ms=<mean first non-empty streamed content chunk over measured runs>",
+        "camelid_decode_tok_s=<mean estimated streamed chunks per second after first content>",
+        "camelid_ms_tok=<mean estimated milliseconds per streamed content chunk after first content>",
+        "llama_cpp_ttft_ms=<same metric for llama.cpp>",
+        "llama_cpp_decode_tok_s=<same metric for llama.cpp>",
+        "llama_cpp_ms_tok=<same metric for llama.cpp>",
+        "camelid_backend_generate_ms=<mean Camelid backend generate timing when CAMELID_STREAM_TIMING_DIAGNOSTICS=on>",
+        "camelid_backend_first_content_ms=<mean Camelid backend first-content timing when CAMELID_STREAM_TIMING_DIAGNOSTICS=on>",
+        "json_out=<absolute path when --out is set>"
+      ],
+      "json": "Full machine-readable report at --out, schema camelid.same_host_llama3_benchmark.v1.",
+      "guardrail": "marker_presence=CMLD-BENCH; pass/fail is recorded under guardrails and can be enforced with --require-marker",
+      "lifecycle": "Report records server startup timing, model-load timing, warmups, and whether servers were started by the harness or reused preloaded."
+    },
+    "bounded_metrics": [
+      "first_byte_ms: first network byte from each streaming response",
+      "first_event_ms: first parsed SSE event",
+      "first_content_ms / TTFT: first non-empty streamed content chunk",
+      "total_elapsed_ms: full streaming response wall time",
+      "completion_tokens_estimate: count of non-empty streamed content chunks, not tokenizer-ground-truth tokens",
+      "decode_tok_per_s and ms_per_token_after_first: derived from completion_tokens_estimate after first content",
+      "marker_presence: exact expected marker observed in measured output text, optionally enforced with --require-marker",
+      "camelid_backend_generate_ms and camelid_backend_first_content_ms: opt-in backend timings when CAMELID_STREAM_TIMING_DIAGNOSTICS=on",
+      "camelid_backend_q8_calls and q8 timing counters: opt-in Q8 scheduler diagnostics when Camelid Q8 scheduler telemetry is also enabled; call count includes single-projection, fused gate/up, FFN-down decode, and route-table counters",
+      "resource_snapshots: host memory/load/storage snapshots before start, before measured runs, and after measured runs",
+      "server_lifecycle: Camelid/llama-server startup timing, model-load timing, reuse/preloaded status, and warmup behavior"
+    ],
+    "server_lifecycle": {
+      "camelid_started_by_harness": true,
+      "llama_started_by_harness": true,
+      "camelid_startup_ms": 55.39,
+      "llama_startup_ms": 1119.11,
+      "camelid_model_load_ms": 631.68,
+      "camelid_model_preloaded": false,
+      "llama_model_preloaded": false
+    },
+    "evidence_context": {
+      "repository": {
+        "head": "b95dd3051397b160f3ad1e0a464e33c14ab3c168",
+        "branch": "HEAD",
+        "status_short": "M src/inference.rs\n M src/tensor/mod.rs\n?? qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/subagent-tied-output-logits-route-20260522T0224Z/"
+      },
+      "host_class": {
+        "os_type": "Linux",
+        "platform": "linux",
+        "arch": "x64",
+        "cpu_count": 16,
+        "host_class": "private Ubuntu x86_64 validation host"
+      },
+      "binaries": {
+        "camelid": {
+          "path": "$CAMELID_SHARED_TARGET/release/camelid",
+          "exists": true,
+          "size_bytes": 9054616,
+          "sha256": "dfc59980dd1e93bc2757d3ba61c94f65009a9349bca1b53f085d7be7db497f90"
+        },
+        "llama_server": {
+          "path": "$CAMELID_LLAMA_CPP_BIN/llama-server",
+          "exists": true,
+          "size_bytes": 47918720,
+          "sha256": "545f8e63151affb94fffd2205c02b0b94a93109cd09cda60631f77b00f598517"
+        },
+        "node": "v18.19.1"
+      },
+      "model_artifact": {
+        "path": "$CAMELID_MODEL_DIR/Llama-3.2-3B-Instruct-Q8_0.gguf",
+        "exists": true,
+        "size_bytes": 3421899296,
+        "sha256": "b5607b5090a8280063fff2d706bb3408ca6542341b06aab39c3eca0a28575921"
+      },
+      "privacy_note": "Host name, user name, and home-relative local paths are intentionally not recorded; scrub full artifacts before publication if absolute paths appear in commands."
+    },
+    "resource_snapshots": {
+      "pre_start": {
+        "label": "pre_start",
+        "captured_utc": "2026-05-22T02:25:45.622Z",
+        "loadavg_1m_5m_15m": [
+          1.51,
+          1.07,
+          1.06
+        ],
+        "memory": {
+          "process_rss_mib": 88.93
+        },
+        "linux_meminfo": {
+          "dirty_mib": 0
+        },
+        "storage": {
+          "path": "$CAMELID_WORKTREE"
+        }
+      },
+      "before_measured_runs": {
+        "label": "before_measured_runs",
+        "captured_utc": "2026-05-22T02:25:47.384Z",
+        "loadavg_1m_5m_15m": [
+          1.51,
+          1.07,
+          1.06
+        ],
+        "memory": {
+          "process_rss_mib": 137.68
+        },
+        "linux_meminfo": {
+          "dirty_mib": 0.01
+        },
+        "storage": {
+          "path": "$CAMELID_WORKTREE"
+        }
+      },
+      "after_measured_runs": {
+        "label": "after_measured_runs",
+        "captured_utc": "2026-05-22T02:25:53.280Z",
+        "loadavg_1m_5m_15m": [
+          1.47,
+          1.07,
+          1.06
+        ],
+        "memory": {
+          "process_rss_mib": 129.5
+        },
+        "linux_meminfo": {
+          "dirty_mib": 0.01
+        },
+        "storage": {
+          "path": "$CAMELID_WORKTREE"
+        }
+      }
+    },
+    "measured_order": [
+      {
+        "engine": "camelid",
+        "label": "camelid-measure-1"
+      },
+      {
+        "engine": "llama_cpp",
+        "label": "llama-measure-1"
+      }
+    ],
+    "note": "Same-host comparison using alternating streaming requests to Camelid /v1/chat/completions and llama.cpp /completion. TTFT is first non-empty streamed content chunk; token throughput is estimated from streamed content chunks, not tokenizer-ground-truth completion tokens."
+  },
+  "camelid": {
+    "base_url": "http://127.0.0.1:8181",
+    "warmups": [],
+    "runs": [
+      {
+        "label": "camelid-measure-1",
+        "text": "C",
+        "first_byte_ms": 5719.38,
+        "first_event_ms": 5719.49,
+        "first_content_ms": 5719.54,
+        "total_elapsed_ms": 5720.03,
+        "completion_tokens_estimate": 1,
+        "chunk_count": 1,
+        "backend_timing": {
+          "q8_schedule": {
+            "activation_pack_bytes_requested": 0,
+            "activation_pack_calls": 0,
+            "activation_pack_rows": 0,
+            "activation_quantize_pack_us": 0,
+            "conservative_tail_rows": 0,
+            "ffn_down_decode_consumer_taken": 28,
+            "ffn_down_gemm4_prefill_candidates": 56,
+            "ffn_down_gemm4_prefill_reject_bad_input_width": 0,
+            "ffn_down_gemm4_prefill_reject_no_runtime_packed": 0,
+            "ffn_down_gemm4_prefill_reject_non_i8_interleave": 0,
+            "ffn_down_gemm4_prefill_reject_plan_off": 56,
+            "ffn_down_gemm4_prefill_reject_rows_lt4": 0,
+            "ffn_down_vnni_decode_candidates": 252,
+            "ffn_down_vnni_decode_kernel_us": 0,
+            "ffn_down_vnni_decode_quantize_us": 0,
+            "ffn_down_vnni_decode_reject_bad_input_width": 0,
+            "ffn_down_vnni_decode_reject_bad_output_width": 0,
+            "ffn_down_vnni_decode_reject_cpu_feature": 0,
+            "ffn_down_vnni_decode_reject_gate_off": 252,
+            "ffn_down_vnni_decode_reject_no_vnni_pack": 0,
+            "ffn_down_vnni_decode_reject_shape_or_role": 0,
+            "ffn_down_vnni_decode_taken": 0,
+            "ffn_gate_up_decode_consumer_activation_us": 0,
+            "ffn_gate_up_decode_consumer_tensor_us": 0,
+            "i8mm_fused_gate_up_calls": 0,
+            "i8mm_single_projection_by_role": {},
+            "i8mm_single_projection_calls": 0,
+            "output_projection_by_layer_route": {
+              "layer_0.ffn_down.x86_decode_consumer": {
+                "calls": 1,
+                "elapsed_us": 544,
+                "input_width": 8192,
+                "layer_index": 0,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 1
+              },
+              "layer_1.ffn_down.x86_decode_consumer": {
+                "calls": 1,
+                "elapsed_us": 544,
+                "input_width": 8192,
+                "layer_index": 1,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 1
+              },
+              "layer_10.ffn_down.x86_decode_consumer": {
+                "calls": 1,
+                "elapsed_us": 523,
+                "input_width": 8192,
+                "layer_index": 10,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 1
+              },
+              "layer_11.ffn_down.x86_decode_consumer": {
+                "calls": 1,
+                "elapsed_us": 615,
+                "input_width": 8192,
+                "layer_index": 11,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 1
+              },
+              "layer_12.ffn_down.x86_decode_consumer": {
+                "calls": 1,
+                "elapsed_us": 497,
+                "input_width": 8192,
+                "layer_index": 12,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 1
+              },
+              "layer_13.ffn_down.x86_decode_consumer": {
+                "calls": 1,
+                "elapsed_us": 537,
+                "input_width": 8192,
+                "layer_index": 13,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 1
+              },
+              "layer_14.ffn_down.x86_decode_consumer": {
+                "calls": 1,
+                "elapsed_us": 567,
+                "input_width": 8192,
+                "layer_index": 14,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 1
+              },
+              "layer_15.ffn_down.x86_decode_consumer": {
+                "calls": 1,
+                "elapsed_us": 475,
+                "input_width": 8192,
+                "layer_index": 15,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 1
+              },
+              "layer_16.ffn_down.x86_decode_consumer": {
+                "calls": 1,
+                "elapsed_us": 440,
+                "input_width": 8192,
+                "layer_index": 16,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 1
+              },
+              "layer_17.ffn_down.x86_decode_consumer": {
+                "calls": 1,
+                "elapsed_us": 442,
+                "input_width": 8192,
+                "layer_index": 17,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 1
+              },
+              "layer_18.ffn_down.x86_decode_consumer": {
+                "calls": 1,
+                "elapsed_us": 428,
+                "input_width": 8192,
+                "layer_index": 18,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 1
+              },
+              "layer_19.ffn_down.x86_decode_consumer": {
+                "calls": 1,
+                "elapsed_us": 486,
+                "input_width": 8192,
+                "layer_index": 19,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 1
+              },
+              "layer_2.ffn_down.x86_decode_consumer": {
+                "calls": 1,
+                "elapsed_us": 453,
+                "input_width": 8192,
+                "layer_index": 2,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 1
+              },
+              "layer_20.ffn_down.x86_decode_consumer": {
+                "calls": 1,
+                "elapsed_us": 444,
+                "input_width": 8192,
+                "layer_index": 20,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 1
+              },
+              "layer_21.ffn_down.x86_decode_consumer": {
+                "calls": 1,
+                "elapsed_us": 448,
+                "input_width": 8192,
+                "layer_index": 21,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 1
+              },
+              "layer_22.ffn_down.x86_decode_consumer": {
+                "calls": 1,
+                "elapsed_us": 402,
+                "input_width": 8192,
+                "layer_index": 22,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 1
+              },
+              "layer_23.ffn_down.x86_decode_consumer": {
+                "calls": 1,
+                "elapsed_us": 725,
+                "input_width": 8192,
+                "layer_index": 23,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 1
+              },
+              "layer_24.ffn_down.x86_decode_consumer": {
+                "calls": 1,
+                "elapsed_us": 609,
+                "input_width": 8192,
+                "layer_index": 24,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 1
+              },
+              "layer_25.ffn_down.x86_decode_consumer": {
+                "calls": 1,
+                "elapsed_us": 547,
+                "input_width": 8192,
+                "layer_index": 25,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 1
+              },
+              "layer_26.ffn_down.x86_decode_consumer": {
+                "calls": 1,
+                "elapsed_us": 469,
+                "input_width": 8192,
+                "layer_index": 26,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 1
+              },
+              "layer_27.ffn_down.x86_decode_consumer": {
+                "calls": 1,
+                "elapsed_us": 421,
+                "input_width": 8192,
+                "layer_index": 27,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 1
+              },
+              "layer_3.ffn_down.x86_decode_consumer": {
+                "calls": 1,
+                "elapsed_us": 601,
+                "input_width": 8192,
+                "layer_index": 3,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 1
+              },
+              "layer_4.ffn_down.x86_decode_consumer": {
+                "calls": 1,
+                "elapsed_us": 574,
+                "input_width": 8192,
+                "layer_index": 4,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 1
+              },
+              "layer_5.ffn_down.x86_decode_consumer": {
+                "calls": 1,
+                "elapsed_us": 600,
+                "input_width": 8192,
+                "layer_index": 5,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 1
+              },
+              "layer_6.ffn_down.x86_decode_consumer": {
+                "calls": 1,
+                "elapsed_us": 524,
+                "input_width": 8192,
+                "layer_index": 6,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 1
+              },
+              "layer_7.ffn_down.x86_decode_consumer": {
+                "calls": 1,
+                "elapsed_us": 477,
+                "input_width": 8192,
+                "layer_index": 7,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 1
+              },
+              "layer_8.ffn_down.x86_decode_consumer": {
+                "calls": 1,
+                "elapsed_us": 510,
+                "input_width": 8192,
+                "layer_index": 8,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 1
+              },
+              "layer_9.ffn_down.x86_decode_consumer": {
+                "calls": 1,
+                "elapsed_us": 456,
+                "input_width": 8192,
+                "layer_index": 9,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 1
+              }
+            },
+            "output_projection_by_route": {
+              "ffn_down.x86_decode_consumer": {
+                "calls": 28,
+                "elapsed_us": 14358,
+                "input_width": 8192,
+                "output_width": 3072,
+                "role": "ffn_down",
+                "route": "x86_decode_consumer",
+                "rows": 28
+              },
+              "logits.x86_output_decode_owner": {
+                "calls": 1,
+                "elapsed_us": 4958,
+                "input_width": 3072,
+                "output_width": 128256,
+                "role": "logits",
+                "route": "x86_output_decode_owner",
+                "rows": 1
+              }
+            },
+            "output_projection_calls": 29,
+            "prefill_single_token_fallbacks": 0,
+            "projection_route_denials": {
+              "ffn_down.x86_gemm4_prefill.plan_off": {
+                "denials": 56,
+                "input_width": 8192,
+                "output_width": 0,
+                "reason": "plan_off",
+                "role": "ffn_down",
+                "route": "x86_gemm4_prefill",
+                "rows": 1316
+              },
+              "ffn_down.x86_vnni_decode_consumer.gate_off": {
+                "denials": 252,
+                "input_width": 8192,
+                "output_width": 3072,
+                "reason": "gate_off",
+                "role": "ffn_down",
+                "route": "x86_vnni_decode_consumer",
+                "rows": 9072
+              },
+              "ffn_gate_up.packed_rows4_matmul_prefill.plan_off": {
+                "denials": 28,
+                "input_width": 3072,
+                "output_width": 0,
+                "reason": "plan_off",
+                "role": "ffn_gate_up",
+                "route": "packed_rows4_matmul_prefill",
+                "rows": 1288
+              }
+            },
+            "q8_gemm_compute_us": 0,
+            "rayon_fanout_boundaries": 0,
+            "scratch_allocation_count": 0,
+            "scratch_bytes_allocated": 0,
+            "scratch_bytes_reused": 0,
+            "scratch_peak_capacity_bytes": 0
+          },
+          "timings_ms": {
+            "first_content": 1894,
+            "first_content_accounting": {
+              "first_content_minus_prompt_eval_forward": 30.686999999999898,
+              "first_content_minus_prompt_eval_forward_plus_sample": 30.449999999999818,
+              "prompt_eval_forward_plus_sample": 1863.5500000000002,
+              "prompt_eval_forward_total": 1863.313,
+              "prompt_eval_logits": 4.964,
+              "prompt_eval_sample": 0.237
+            },
+            "first_token_forward_total": 71.9,
+            "first_token_role_timings": {
+              "attention_context": 3.3990000000000005,
+              "attention_output": 9.405,
+              "ffn_down": 14.613000000000001,
+              "ffn_gate": 10.993,
+              "ffn_up": 11.009000000000002,
+              "logits": 4.964
+            },
+            "generate": 1894,
+            "generation_forward_total": 1863.313,
+            "generation_role_timings": {
+              "attention_context": 31.520999999999997,
+              "attention_output": 146.802,
+              "ffn_down": 439.084,
+              "ffn_gate": 390.154,
+              "ffn_up": 402.276,
+              "logits": 4.964
+            },
+            "layer_role_hotspots": {
+              "first_token": [
+                {
+                  "elapsed_ms": 0.734,
+                  "layer_index": 23,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 0.645,
+                  "layer_index": 14,
+                  "role": "attention_output"
+                },
+                {
+                  "elapsed_ms": 0.623,
+                  "layer_index": 11,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 0.621,
+                  "layer_index": 24,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 0.614,
+                  "layer_index": 3,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 0.611,
+                  "layer_index": 5,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 0.583,
+                  "layer_index": 4,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 0.582,
+                  "layer_index": 14,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 0.558,
+                  "layer_index": 8,
+                  "role": "attention_output"
+                },
+                {
+                  "elapsed_ms": 0.556,
+                  "layer_index": 0,
+                  "role": "ffn_down"
+                }
+              ],
+              "generation": [
+                {
+                  "elapsed_ms": 21.317,
+                  "layer_index": 0,
+                  "role": "ffn_gate"
+                },
+                {
+                  "elapsed_ms": 20.822,
+                  "layer_index": 0,
+                  "role": "kv_cache_write"
+                },
+                {
+                  "elapsed_ms": 20.531,
+                  "layer_index": 0,
+                  "role": "ffn_up"
+                },
+                {
+                  "elapsed_ms": 16.848,
+                  "layer_index": 23,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 16.14,
+                  "layer_index": 22,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 16.125,
+                  "layer_index": 4,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 16.04,
+                  "layer_index": 9,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 15.862,
+                  "layer_index": 8,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 15.836,
+                  "layer_index": 20,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 15.809,
+                  "layer_index": 7,
+                  "role": "ffn_down"
+                }
+              ],
+              "prefill": [
+                {
+                  "elapsed_ms": 20.946,
+                  "layer_index": 0,
+                  "role": "ffn_gate"
+                },
+                {
+                  "elapsed_ms": 20.81,
+                  "layer_index": 0,
+                  "role": "kv_cache_write"
+                },
+                {
+                  "elapsed_ms": 20.16,
+                  "layer_index": 0,
+                  "role": "ffn_up"
+                },
+                {
+                  "elapsed_ms": 16.114,
+                  "layer_index": 23,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 15.731,
+                  "layer_index": 22,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 15.575,
+                  "layer_index": 9,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 15.542,
+                  "layer_index": 4,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 15.385,
+                  "layer_index": 20,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 15.342,
+                  "layer_index": 8,
+                  "role": "ffn_down"
+                },
+                {
+                  "elapsed_ms": 15.323,
+                  "layer_index": 7,
+                  "role": "ffn_down"
+                }
+              ]
+            },
+            "prefill_forward_total": 1791.413,
+            "prefill_role_timings": {
+              "attention_context": 28.122000000000003,
+              "attention_output": 137.397,
+              "ffn_down": 424.47099999999995,
+              "ffn_gate": 379.16099999999994,
+              "ffn_up": 391.267,
+              "logits": 0
+            },
+            "prompt_cache_hit": false,
+            "session_create": 0,
+            "stream_event_accounting": {
+              "final_yield": 1894,
+              "final_yield_minus_first_content_yield": 0,
+              "first_content_yield": 1894,
+              "first_content_yield_minus_role_yield": 1894,
+              "generate_start": 0,
+              "generate_start_minus_role_yield": 0,
+              "poll_yield_enabled": false,
+              "role_yield": 0
+            },
+            "tokenize": 32,
+            "weight_cache_hit": false,
+            "weight_load": 3761
+          }
+        },
+        "backend_generate_ms": 1894,
+        "backend_first_content_ms": 1894,
+        "backend_q8_gemm_compute_us": 0,
+        "backend_q8_pack_us": 0,
+        "backend_q8_calls": 29,
+        "decode_tok_per_s": 2030.39,
+        "ms_per_token_after_first": 0.49
+      }
+    ],
+    "summary": {
+      "count": 1,
+      "avg_first_byte_ms": 5719.38,
+      "avg_first_event_ms": 5719.49,
+      "avg_ttft_ms": 5719.54,
+      "avg_total_elapsed_ms": 5720.03,
+      "avg_backend_generate_ms": 1894,
+      "avg_backend_first_content_ms": 1894,
+      "avg_backend_q8_calls": 29,
+      "avg_backend_q8_gemm_compute_us": 0,
+      "avg_backend_q8_pack_us": 0,
+      "avg_decode_tok_per_s": 2030.39,
+      "avg_ms_per_token_after_first": 0.49,
+      "avg_completion_tokens_estimate": 1
+    }
+  },
+  "llama_cpp": {
+    "base_url": "http://127.0.0.1:8183",
+    "warmups": [],
+    "runs": [
+      {
+        "label": "llama-measure-1",
+        "text": "C",
+        "first_byte_ms": 172.46,
+        "first_event_ms": 172.69,
+        "first_content_ms": 172.74,
+        "total_elapsed_ms": 173.04,
+        "completion_tokens_estimate": 1,
+        "chunk_count": 1,
+        "backend_timing": null,
+        "backend_generate_ms": null,
+        "backend_first_content_ms": null,
+        "backend_q8_gemm_compute_us": null,
+        "backend_q8_pack_us": null,
+        "backend_q8_calls": null,
+        "decode_tok_per_s": 3323.82,
+        "ms_per_token_after_first": 0.3
+      }
+    ],
+    "summary": {
+      "count": 1,
+      "avg_first_byte_ms": 172.46,
+      "avg_first_event_ms": 172.69,
+      "avg_ttft_ms": 172.74,
+      "avg_total_elapsed_ms": 173.04,
+      "avg_backend_generate_ms": null,
+      "avg_backend_first_content_ms": null,
+      "avg_backend_q8_calls": null,
+      "avg_backend_q8_gemm_compute_us": null,
+      "avg_backend_q8_pack_us": null,
+      "avg_decode_tok_per_s": 3323.82,
+      "avg_ms_per_token_after_first": 0.3,
+      "avg_completion_tokens_estimate": 1
+    },
+    "binary": "$CAMELID_LLAMA_CPP_BIN/llama-server"
+  },
+  "comparison": {
+    "ttft_delta_pct_vs_llama_cpp": 3211.07,
+    "total_elapsed_delta_pct_vs_llama_cpp": 3205.61,
+    "decode_tok_per_s_delta_pct_vs_llama_cpp": -38.91,
+    "ms_per_token_after_first_delta_pct_vs_llama_cpp": 63.33
+  },
+  "guardrails": {
+    "expected_marker": "CMLD-BENCH",
+    "require_marker": false,
+    "marker_presence": {
+      "camelid": [
+        {
+          "label": "camelid-measure-1",
+          "contains_expected_marker": false,
+          "nonempty_streamed_output": true
+        }
+      ],
+      "llama_cpp": [
+        {
+          "label": "llama-measure-1",
+          "contains_expected_marker": false,
+          "nonempty_streamed_output": true
+        }
+      ]
+    },
+    "passed": false,
+    "note": "Marker presence and non-empty streamed output are recorded for deterministic-output hygiene; empty measured output always fails the recorded guardrail even when marker enforcement is not requested."
+  },
+  "claim_boundary": "Same-host benchmark snapshot only for exact row llama32_3b_instruct_q8_0 with the provided GGUF, prompt, max-token budget, host, binaries, and thread settings. It is bounded timing evidence only: it does not widen support, portability, production-throughput, model-native/larger-context, neighboring-row, broad Llama-family, 1B, or Mixtral claims unless a separate row-specific evidence bundle records those exact conditions."
+}
