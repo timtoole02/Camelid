@@ -1,0 +1,93 @@
+{
+  "camelid_summary": {
+    "count": 1,
+    "avg_first_byte_ms": 8747.35,
+    "avg_first_event_ms": 8747.46,
+    "avg_ttft_ms": 8747.51,
+    "avg_total_elapsed_ms": 8748.05,
+    "avg_backend_generate_ms": 3157,
+    "avg_backend_first_content_ms": 2945,
+    "avg_backend_q8_calls": 228,
+    "avg_backend_q8_gemm_compute_us": 0,
+    "avg_backend_q8_pack_us": 0,
+    "avg_decode_tok_per_s": 7345.5,
+    "avg_ms_per_token_after_first": 0.14,
+    "avg_completion_tokens_estimate": 4
+  },
+  "llama_summary": {
+    "count": 1,
+    "avg_first_byte_ms": 162.76,
+    "avg_first_event_ms": 162.82,
+    "avg_ttft_ms": 162.87,
+    "avg_total_elapsed_ms": 285.5,
+    "avg_backend_generate_ms": null,
+    "avg_backend_first_content_ms": null,
+    "avg_backend_q8_calls": null,
+    "avg_backend_q8_gemm_compute_us": null,
+    "avg_backend_q8_pack_us": null,
+    "avg_decode_tok_per_s": 32.62,
+    "avg_ms_per_token_after_first": 30.66,
+    "avg_completion_tokens_estimate": 4
+  },
+  "ffn_decode_chain_taken": 0,
+  "ffn_decode_chain_total_us": 0,
+  "ffn_decode_chain_down_us": 0,
+  "routes": {
+    "ffn_down.x86_vnni_decode_consumer": {
+      "calls": 112,
+      "elapsed_us": 67739,
+      "input_width": 8192,
+      "output_width": 3072,
+      "role": "ffn_down",
+      "route": "x86_vnni_decode_consumer",
+      "rows": 112
+    },
+    "ffn_gate_up.decode_fused_activation": {
+      "calls": 112,
+      "elapsed_us": 78554,
+      "input_width": 3072,
+      "output_width": 8192,
+      "role": "ffn_gate_up",
+      "route": "decode_fused_activation",
+      "rows": 112
+    },
+    "logits.x86_output_decode_owner": {
+      "calls": 4,
+      "elapsed_us": 19248,
+      "input_width": 3072,
+      "output_width": 128256,
+      "role": "logits",
+      "route": "x86_output_decode_owner",
+      "rows": 4
+    }
+  },
+  "denials": {
+    "ffn_down.x86_gemm4_prefill.plan_off": {
+      "denials": 140,
+      "input_width": 8192,
+      "output_width": 0,
+      "reason": "plan_off",
+      "role": "ffn_down",
+      "route": "x86_gemm4_prefill",
+      "rows": 1400
+    },
+    "ffn_down.x86_vnni_decode_consumer.shape_or_role_mismatch": {
+      "denials": 280,
+      "input_width": 3072,
+      "output_width": 3072,
+      "reason": "shape_or_role_mismatch",
+      "role": "ffn_down",
+      "route": "x86_vnni_decode_consumer",
+      "rows": 7840
+    },
+    "ffn_gate_up.packed_rows4_matmul_prefill.plan_off": {
+      "denials": 28,
+      "input_width": 3072,
+      "output_width": 0,
+      "reason": "plan_off",
+      "role": "ffn_gate_up",
+      "route": "packed_rows4_matmul_prefill",
+      "rows": 1288
+    }
+  }
+}

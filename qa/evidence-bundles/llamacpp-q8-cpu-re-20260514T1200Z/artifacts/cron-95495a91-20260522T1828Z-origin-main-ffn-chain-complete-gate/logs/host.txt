@@ -1,0 +1,10 @@
+uname:
+Linux x86_64
+head:
+dd3c7923e606bebebda8e5780fad899fba493fd7
+dd3c792 docs: restore benchmark highlights
+disk:
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       193G   71G  123G  37% /
+target_count:
+0
