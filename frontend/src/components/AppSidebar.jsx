@@ -2,13 +2,13 @@ import { memo, useEffect, useMemo, useState } from 'react'
 import { clampText, formatPreview, formatSidebarDate } from '../lib/formatters'
 
 const tabs = [
-  { id: 'chat', label: 'Chat' },
-  { id: 'library', label: 'Models' },
-  { id: 'api', label: 'API' },
-  { id: 'analytics', label: 'Analytics' },
-  { id: 'history', label: 'History' },
-  { id: 'memory', label: 'Memory' },
-  { id: 'system', label: 'System' },
+  { id: 'chat', label: 'Chat', icon: 'C' },
+  { id: 'library', label: 'Models', icon: 'M' },
+  { id: 'api', label: 'API', icon: 'A' },
+  { id: 'analytics', label: 'Analytics', icon: 'N' },
+  { id: 'history', label: 'History', icon: 'H' },
+  { id: 'memory', label: 'Memory', icon: 'R' },
+  { id: 'system', label: 'System', icon: 'S' },
 ]
 
 const recencyBuckets = ['Today', 'Yesterday', 'Previous 7 days', 'Earlier']
@@ -180,15 +180,7 @@ function AppSidebar({
             </div>
 
             <nav className="sidebar-rail-nav" aria-label="Primary navigation">
-              {[
-                { id: 'chat', label: 'Chat', glyph: '✦' },
-                { id: 'library', label: 'Models', glyph: '⌘' },
-                { id: 'api', label: 'API', glyph: '⌁' },
-                { id: 'analytics', label: 'Analytics', glyph: '◫' },
-                { id: 'history', label: 'History', glyph: '◷' },
-                { id: 'memory', label: 'Memory', glyph: '☷' },
-                { id: 'system', label: 'System', glyph: '⚙' },
-              ].map((item) => (
+              {tabs.map((item) => (
                 <button
                   key={item.id}
                   type="button"
@@ -197,7 +189,7 @@ function AppSidebar({
                   aria-current={tab === item.id ? 'page' : undefined}
                   onClick={() => setTab(item.id)}
                 >
-                  <span aria-hidden="true">{item.glyph}</span>
+                  <span aria-hidden="true">{item.icon}</span>
                 </button>
               ))}
             </nav>
@@ -262,6 +254,7 @@ function AppSidebar({
                 <nav className="nav-stack nav-stack-flat" aria-label="Primary navigation">
                   {tabs.map((item) => (
                     <button key={item.id} className={`nav-item nav-item-flat ${tab === item.id ? 'active' : ''}`} aria-current={tab === item.id ? 'page' : undefined} onClick={() => setTab(item.id)}>
+                      <span className="nav-item-icon" aria-hidden="true">{item.icon}</span>
                       <strong>{item.label}</strong>
                     </button>
                   ))}

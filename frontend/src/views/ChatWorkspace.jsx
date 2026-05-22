@@ -3,7 +3,7 @@ import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'rea
 import { compatibilityHintCopy, compatibilityHintLabel, exactRowSupportLanes, findCompatibilityHint, isCompatibilitySupportedForModel } from '../lib/capabilities'
 import { clampText, formatDate, formatRate } from '../lib/formatters'
 import { getChatGateState } from '../lib/chatGate'
-import { describeModelState, getModelStatusLabel, isRunnableInCurrentRuntime } from '../lib/modelState'
+import { describeModelState, getModelStatusLabel } from '../lib/modelState'
 
 const isBootstrapMessage = (message) =>
   message?.role === 'assistant' &&
@@ -511,7 +511,7 @@ export default function ChatWorkspace({
   const lastUpdated = selectedConversation?.updated_at ? formatDate(selectedConversation.updated_at) : null
   const modelPickerTitle = selectedModel ? getModelStatusLabel(selectedModel) : 'Choose what Camelid should use for this chat.'
   const selectedChatGate = getChatGateState(capabilities, selectedModel, runtime)
-  const selectedRuntimeReady = selectedChatGate.runtimeReady || isRunnableInCurrentRuntime(selectedModel, runtime)
+  const selectedRuntimeReady = selectedChatGate.runtimeReady
   const selectedModelCapabilitySupported = selectedChatGate.contractSupported || isCompatibilitySupportedForModel(capabilities, selectedModel)
   const supportBlocked = selectedRuntimeReady && !selectedModelCapabilitySupported
   const selectedCompatibilityHint = selectedChatGate.hint || findCompatibilityHint(capabilities, selectedModel)
@@ -709,7 +709,7 @@ export default function ChatWorkspace({
                     {!selectedModelRunnable && <button className="ghost-button ghost-button-quiet" onClick={() => setTab('library')}>Open Models</button>}
                   </div>
                   <div className="composer-assistant-actions composer-assistant-actions-stage">
-                    <button className="primary-button composer-send-button" onClick={sendMessage} disabled={!canSubmit} aria-label={generationActive ? `Camelid is generating for ${generationElapsedSeconds} seconds` : 'Send message to Camelid'}>{generationActive ? `Generating ${generationElapsedSeconds}s` : 'Send'}</button>
+                    <button className="primary-button composer-send-button" onClick={sendMessage} aria-label={generationActive ? `Camelid is generating for ${generationElapsedSeconds} seconds` : 'Send message to Camelid'} disabled={!canSubmit}>{generationActive ? `Generating ${generationElapsedSeconds}s` : 'Send'}</button>
                   </div>
                 </div>
                 <p id="chat-readiness-note" className={`composer-assistant-readiness-note is-${readinessState}`}>{readinessFinePrint}</p>
@@ -784,7 +784,7 @@ export default function ChatWorkspace({
             </div>
             <div className="composer-assistant-actions">
               {!selectedModelRunnable && <button className="ghost-button" onClick={() => setTab('library')}>Open Models</button>}
-              <button className="primary-button composer-send-button" onClick={sendMessage} disabled={!canSubmit} aria-label={generationActive ? `Camelid is generating for ${generationElapsedSeconds} seconds` : 'Send message to Camelid'}>{generationActive ? `Generating ${generationElapsedSeconds}s` : 'Send'}</button>
+              <button className="primary-button composer-send-button" onClick={sendMessage} aria-label={generationActive ? `Camelid is generating for ${generationElapsedSeconds} seconds` : 'Send message to Camelid'} disabled={!canSubmit}>{generationActive ? `Generating ${generationElapsedSeconds}s` : 'Send'}</button>
             </div>
           </div>
         </div>

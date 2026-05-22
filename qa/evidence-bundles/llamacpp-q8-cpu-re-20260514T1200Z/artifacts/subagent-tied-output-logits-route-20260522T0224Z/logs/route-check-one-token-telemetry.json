@@ -1,0 +1,17 @@
+{
+  "camelid_text": [
+    "C"
+  ],
+  "llama_text": [
+    "C"
+  ],
+  "routes": [
+    "ffn_down.x86_decode_consumer",
+    "logits.x86_output_decode_owner"
+  ],
+  "denials": [
+    "ffn_down.x86_gemm4_prefill.plan_off",
+    "ffn_down.x86_vnni_decode_consumer.gate_off",
+    "ffn_gate_up.packed_rows4_matmul_prefill.plan_off"
+  ]
+}

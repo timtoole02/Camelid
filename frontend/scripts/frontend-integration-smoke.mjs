@@ -117,6 +117,52 @@ try {
   const selectedModelRunnable = getChatGateState(capabilities, selectedModel, readyRuntime).chatUnlocked
   assert.equal(selectedModelRunnable, true, '3B Q8_0 fixture must be end-to-end runnable only when model path, runtime readiness, and exact-row support are all green')
 
+  const wrongArtifactModel = {
+    ...selectedModel,
+    id: 'llama32_3b_instruct_q8_0_spoof',
+    name: 'Llama 3.2 3B Instruct Q8_0',
+    runtime_model_name: 'llama32_3b_instruct_q8_0_spoof',
+    model_path: '<ubuntu-model-path>/Llama-3.2-3B-Instruct-Q8_0-neighbor.gguf',
+  }
+  const wrongArtifactRuntime = {
+    ...readyRuntime,
+    active_model_id: wrongArtifactModel.runtime_model_name,
+  }
+  const wrongArtifactGate = getChatGateState(capabilities, wrongArtifactModel, wrongArtifactRuntime)
+  assert.equal(wrongArtifactGate.runtimeReady, true, 'spoofed 3B artifact fixture must keep runtime readiness visible')
+  assert.equal(wrongArtifactGate.contractSupported, false, 'spoofed 3B artifact fixture must not inherit exact-row support from id/name/Q8 copy')
+  assert.equal(wrongArtifactGate.chatUnlocked, false, 'spoofed 3B artifact fixture must stay chat-blocked despite loaded_now and generation_ready')
+
+  const blockedWrongArtifactMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
+    selectedConversation: {
+      id: 'conversation-wrong-artifact',
+      title: 'Wrong artifact',
+      updated_at: '2026-05-13T04:21:00.000Z',
+      messages: [],
+    },
+    selectedModel: wrongArtifactModel,
+    selectedModelId: wrongArtifactModel.id,
+    setSelectedModelId: noop,
+    models: [wrongArtifactModel],
+    runtime: wrongArtifactRuntime,
+    capabilities,
+    pendingConversation: null,
+    composer: 'Can this chat?',
+    setComposer: noop,
+    saveToMemory: noop,
+    sendMessage: noop,
+    sending: false,
+    selectedModelRunnable: wrongArtifactGate.chatUnlocked,
+    setTab: noop,
+  }))
+
+  assert.match(blockedWrongArtifactMarkup, /Runtime ready, support gated/, '3B live chat should show runtime readiness while support remains artifact-gated')
+  assert.match(blockedWrongArtifactMarkup, /llama32_3b_instruct_q8_0: exact GGUF not verified/, '3B live chat must name the exact artifact blocker')
+  assert.match(blockedWrongArtifactMarkup, /requires the exact Llama-3\.2-3B-Instruct-Q8_0\.gguf artifact/, '3B artifact blocker must name the canonical GGUF filename')
+  assert.match(blockedWrongArtifactMarkup, /disabled="">Send</, '3B composer send must stay disabled for a runtime-ready neighboring artifact')
+  assert.doesNotMatch(blockedWrongArtifactMarkup, /Local chat ready/, '3B spoofed artifact must not render the supported live-chat state')
+  assert.doesNotMatch(blockedWrongArtifactMarkup, /Demo starters/, '3B spoofed artifact must not expose runnable demo prompts')
+
   const streamingMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
     selectedConversation: {
       id: 'conversation-streaming-code',
@@ -382,6 +428,7 @@ try {
   assert.match(modelsMarkup, /Chat unlockable/, 'Tracked 3B card should turn green only after exact row support and runtime readiness both match')
   assert.match(modelsMarkup, /Loaded exact-row match/, 'Tracked 3B card should mark the alias model as the loaded exact-row match')
   assert.match(modelsMarkup, /3B API\/WebUI smoke passed/, 'Models view should keep 3B end-to-end WebUI evidence visible on the exact row card')
+  assert.match(modelsMarkup, /Capability lanes:[\s\S]*Template\/Jinja readiness: Template rendering ready for this exact row[\s\S]*Checked context readiness: Checked context packs ready for this exact row[\s\S]*Throughput readiness: Production throughput not promoted/, 'Models exact-row evidence blocks should render 3B row-scoped capability lanes without promoting production throughput')
   assert.doesNotMatch(modelsMarkup, /This browser\/runtime list does not currently show the exact 3B row/, 'Alias runtime matches must not fall through to the missing-3B acceptance placeholder')
 
   const staleRuntimeModelsMarkup = renderToStaticMarkup(React.createElement(ModelsView, {
@@ -616,6 +663,28 @@ try {
   assert.match(liveBackendIdChatMarkup, /llama32_3b_instruct_q8_0: supported current gate/, 'ready 3B live-backend-id chat should show exact-row support in the composer surface')
   assert.match(liveBackendIdChatMarkup, /Message Camelid…/, 'ready 3B live-backend-id chat should enable the composer instead of showing load-first copy')
   assert.doesNotMatch(liveBackendIdChatMarkup, /Load a model first|Choose a supported model/, 'ready 3B live-backend-id chat should not fall back to blocked chat UX')
+
+  const staleLoadedNowChatMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
+    selectedConversation: null,
+    selectedModel: liveBackendIdModel,
+    selectedModelId: liveBackendIdModel.id,
+    setSelectedModelId: noop,
+    models: [liveBackendIdModel],
+    runtime: { ...liveBackendIdRuntime, loaded_now: false },
+    capabilities,
+    pendingConversation: null,
+    composer: 'This stale browser row must remain blocked',
+    setComposer: noop,
+    saveToMemory: noop,
+    sendMessage: noop,
+    sending: false,
+    selectedModelRunnable: getChatGateState(capabilities, liveBackendIdModel, { ...liveBackendIdRuntime, loaded_now: false }).chatUnlocked,
+    setTab: noop,
+  }))
+
+  assert.match(staleLoadedNowChatMarkup, /No generation-ready model/, '3B chat readiness should use the shared chat gate and stay runtime-blocked when backend loaded_now=false')
+  assert.match(staleLoadedNowChatMarkup, /Load a model first/, '3B stale loaded_now=false rows must keep the composer disabled')
+  assert.doesNotMatch(staleLoadedNowChatMarkup, /Runtime ready, support gated|Local chat ready|Message Camelid…|Demo starters/, '3B stale browser readiness must not leak into live chat UX when /v1/health says loaded_now=false')
 
   const neighboringQuantPathModel = {
     ...selectedModel,
