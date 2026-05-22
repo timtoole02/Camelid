@@ -469,6 +469,8 @@ export default function ModelsView({
   const selectedRuntimeReady = selectedChatGate.runtimeReady
   const selectedRunnable = selectedChatGate.chatUnlocked
   const selectedContractBlocked = selectedRuntimeReady && !selectedChatGate.contractSupported
+  const selectedExactTarget = isExactCompatibilityHint(selectedChatGate.hint) ? selectedChatGate.hint.target : null
+  const selectedSupportLanes = selectedExactTarget ? exactRowSupportLanes(selectedExactTarget, apiFeatures) : []
   const activeGenerationReady = activeLocalModel ? isModelGenerationReady(activeLocalModel) : Boolean(runtime?.generation_ready)
   const readyModels = [...groupedModels.installed].sort(compareModelsByName)
   const apiLinkModels = [...groupedModels.external].sort(compareModelsByName)
@@ -643,8 +645,28 @@ export default function ModelsView({
           <div className="models-card-tags">
             {selectedLocalModel && <div className="pin-badge">selected: {selectedLocalModel.id}</div>}
             {selectedLocalModel && <div className={`pin-badge ${selectedRunnable ? 'ready' : 'warm'}`}>{selectedRunnable ? 'chat enabled' : selectedContractBlocked ? 'contract blocked' : 'chat blocked'}</div>}
+            {selectedLocalModel && <div className={`pin-badge ${selectedChatGate.contractSupported ? 'ready' : 'warm'}`}>exact row: {selectedChatGate.label}</div>}
           </div>
           {selectedLocalModel && <ReadinessGrid model={selectedLocalModel} runtime={runtime} includePath />}
+          {selectedLocalModel && (
+            <div className="models-card-capability-map" aria-label="Selected next-chat exact-row readiness">
+              <div>
+                <span>Runtime gate</span>
+                <strong>{selectedChatGate.runtimeReady ? 'loaded_now + generation_ready match' : selectedChatGate.runtimeLoaded ? 'Loaded, not generation-ready' : 'Not loaded for this row'}</strong>
+                <small>active_model_id must match the selected local GGUF before chat can use it.</small>
+              </div>
+              <div>
+                <span>Support gate</span>
+                <strong>{selectedChatGate.label}</strong>
+                <small>{selectedChatGate.copy}</small>
+              </div>
+              <div>
+                <span>Capability lanes</span>
+                <strong>{selectedSupportLanes.length ? selectedSupportLanes.map((lane) => `${supportLaneTitle(lane)}: ${lane.label}`).join(' · ') : 'No exact row lanes available'}</strong>
+                <small>These lanes are row-scoped; they do not widen neighboring rows, broader families, or production-throughput unless the exact row says so.</small>
+              </div>
+            </div>
+          )}
         </div>
       </section>
 
