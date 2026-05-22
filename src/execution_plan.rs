@@ -21,6 +21,8 @@ const MANAGED_ENV_KEYS: &[&str] = &[
     "CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUP_CHUNKING",
     "CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL",
     "CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL",
+    "CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE",
+    "CAMELID_X86_Q8_PARALLEL_INPUT_QUANTIZE",
     "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER",
     "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING",
     "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION",
@@ -419,6 +421,14 @@ fn select_linux_x86_q8_plan(
     env_updates.insert(
         "CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL",
         optional_x86_q8_gate("CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL"),
+    );
+    env_updates.insert(
+        "CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE",
+        optional_x86_q8_gate("CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE"),
+    );
+    env_updates.insert(
+        "CAMELID_X86_Q8_PARALLEL_INPUT_QUANTIZE",
+        optional_x86_q8_gate("CAMELID_X86_Q8_PARALLEL_INPUT_QUANTIZE"),
     );
     env_updates.insert(
         "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER",
@@ -1205,6 +1215,18 @@ mod tests {
         assert_eq!(
             outcome
                 .env_updates
+                .get("CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE"),
+            Some(&Some("off"))
+        );
+        assert_eq!(
+            outcome
+                .env_updates
+                .get("CAMELID_X86_Q8_PARALLEL_INPUT_QUANTIZE"),
+            Some(&Some("off"))
+        );
+        assert_eq!(
+            outcome
+                .env_updates
                 .get("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER"),
             Some(&Some("off"))
         );
@@ -1329,6 +1351,8 @@ mod tests {
         env::set_var("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER", "on");
         env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DECODE_CHAIN", "on");
+        env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE", "on");
+        env::set_var("CAMELID_X86_Q8_PARALLEL_INPUT_QUANTIZE", "on");
         let outcome = plan_for_model_with_platform(
             &PathBuf::from("/tmp/Llama-3.2-3B-Instruct-Q8_0.gguf"),
             &fixture("Llama 3.2 3B Instruct"),
@@ -1402,6 +1426,18 @@ mod tests {
         assert_eq!(
             outcome
                 .env_updates
+                .get("CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE"),
+            Some(&Some("on"))
+        );
+        assert_eq!(
+            outcome
+                .env_updates
+                .get("CAMELID_X86_Q8_PARALLEL_INPUT_QUANTIZE"),
+            Some(&Some("on"))
+        );
+        assert_eq!(
+            outcome
+                .env_updates
                 .get("CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL"),
             Some(&Some("off"))
         );
@@ -1437,6 +1473,8 @@ mod tests {
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR", "on");
         env::set_var("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER", "on");
+        env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE", "on");
+        env::set_var("CAMELID_X86_Q8_PARALLEL_INPUT_QUANTIZE", "on");
 
         PlannerEnv::capture().apply(&BTreeMap::new());
 
@@ -1465,6 +1503,8 @@ mod tests {
         assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR").is_err());
         assert!(env::var("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER").is_err());
+        assert!(env::var("CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE").is_err());
+        assert!(env::var("CAMELID_X86_Q8_PARALLEL_INPUT_QUANTIZE").is_err());
         clear_profile_env();
     }
 
