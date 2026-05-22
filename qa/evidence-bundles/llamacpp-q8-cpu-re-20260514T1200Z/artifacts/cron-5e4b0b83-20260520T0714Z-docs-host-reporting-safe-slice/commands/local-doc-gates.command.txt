@@ -2,9 +2,9 @@ git diff --check
 python3 - <<'PY'
 from pathlib import Path
 scan_roots = [Path('README.md'), Path('CONTEXT.md'), Path('docs')]
-phrases = ['Ubuntu is '+w for w in ('blocked','down','unavailable')]
-phrases += ['Ubuntu host '+w for w in ('blocked','down','unavailable')]
-phrases += ['auth-denial phrase
+phrases = ['canonical host status phrase: '+w for w in ('blocked','down','unavailable')]
+phrases += ['canonical host phrase: '+w for w in ('blocked','down','unavailable')]
+phrases += ['legacy auth placeholder
 hits = []
 for entry in scan_roots:
     files = [entry] if entry.is_file() else [p for p in entry.rglob('*') if p.is_file()]

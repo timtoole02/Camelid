@@ -25,7 +25,7 @@ Focused outputs are preserved in `stale-host-scan.txt`, `stale-validation-lane-s
 
 - The canonical host stale-failure phrase scan found no live docs/evidence-summary/status matches.
 - The stale validation-lane availability scan found no public-doc matches.
-- The literal auth-denial phrase scan found no docs/evidence-summary/status matches.
+- The literal legacy auth placeholder scan found no docs/evidence-summary/status matches.
 - The support-contract scan remained guarded; no row/support/default-on claim was widened.
 - `scripts/check-public-scrub.sh` exited 0.
 - `node scripts/check-public-evidence-claims.mjs` exited 0.

@@ -1,0 +1,33 @@
+Source head: aee2b2e288b2
+Run UTC: 2026-05-22T13:15Z
+Remote validation: not attempted in this run.
+
+host-status wording scan:
+- Command: focused scan over README.md, COMPATIBILITY.md, STATUS.md, ROADMAP.md, FULL_SUPPORT_BLOCKER_MATRIX.md, CONTEXT.md, docs, frontend/README.md, qa/validation-notes, and retained docs-room evidence summaries for stale canonical-host status wording.
+- Result: PASS. No matches; rg exited 1 for no matches.
+- rc=1.
+
+retired host alias and key-path scan:
+- Command: focused scan over the same docs/context/status/evidence-summary set for retired Ubuntu host aliases and the disallowed tilde key path.
+- Result: PASS. No matches; rg exited 1 for no matches.
+- rc=1.
+
+support scope scan:
+- Command: focused scan over public docs/context/status for supported-row, active-validation, default-off, no-claim, RSS, throughput, portability, and broad-support wording.
+- Result: REVIEWED. 372 matches remained exact-row/default-off/evidence-needed guard text; no support, portability, default-on, frontend/API, RSS, or throughput claim was widened.
+- rc=0.
+
+public scrub:
+- Command: bash scripts/check-public-scrub.sh
+- Result: PASS.
+- rc=0.
+
+public evidence claim check:
+- Command: node scripts/check-public-evidence-claims.mjs
+- Result: PASS; 96 manifest(s), 49 summary file(s).
+- rc=0.
+
+diff check:
+- Command: git diff --check
+- Result: PASS.
+- rc=0.

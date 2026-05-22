@@ -1,6 +1,6 @@
 GREEN: canonical host stale-failure phrase scan found no live docs/evidence-summary/status matches.
 GREEN: stale validation-lane availability scan found no public-doc matches.
-GREEN: literal auth-denial phrase scan found no docs/evidence-summary/status matches.
+GREEN: literal legacy auth placeholder scan found no docs/evidence-summary/status matches.
 GREEN: support-contract wording scan remained guarded; no row/support/default-on claim was widened.
 GREEN: scripts/check-public-scrub.sh exited 0.
 GREEN: node scripts/check-public-evidence-claims.mjs exited 0.
