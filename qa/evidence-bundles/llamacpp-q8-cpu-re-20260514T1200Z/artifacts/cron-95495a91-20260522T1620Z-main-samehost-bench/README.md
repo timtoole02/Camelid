@@ -4,10 +4,11 @@
 - Host: Linux x86_64
 - Repo head: 84a4a83bf881550f29dcea8349c2284439dfd900
 - PR #74 visible on origin/main: yes
-- Model: /home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf
-- llama.cpp server: /home/ubuntu/work/llama.cpp-clean-20260517/build/bin/llama-server
+- Model: $UBUNTU_HOME/models/Llama-3.2-3B-Instruct-Q8_0.gguf
+- llama.cpp server: $UBUNTU_HOME/work/llama.cpp-clean-20260517/build/bin/llama-server
 - llama.cpp repo head: 4f0e43da6f8f6e9390d88409610098ec2d2dc5c7
-- CARGO_TARGET_DIR: /home/ubuntu/work/camelid-targets/backend-95495a91
+- CARGO_TARGET_DIR: $UBUNTU_HOME/work/camelid-targets/backend-95495a91
+- Path placeholder: `$UBUNTU_HOME` denotes the canonical Ubuntu worker home used during the retained run.
 
 ## Result
 
@@ -31,4 +32,4 @@ Retain as current-main same-host timing artifact for the Llama 3.2 3B Instruct Q
 - scripts/test-bench-llama3-same-host.mjs
 - src/inference/q8_runtime.rs
 - src/inference.rs
-- /home/ubuntu/work/llama.cpp-clean-20260517/tools/server/server.cpp
+- $UBUNTU_HOME/work/llama.cpp-clean-20260517/tools/server/server.cpp
