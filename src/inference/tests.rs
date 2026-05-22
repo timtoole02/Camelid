@@ -1665,6 +1665,7 @@ fn q8_0_hot_path_uses_resolved_plan_not_current_env() {
             ffn_down_amx_prefill: false,
             ffn_down_single_owner: false,
             ffn_down_vnni_decode: false,
+            ffn_down_vnni_decode_rawptr: false,
             metal: false,
             metal_retained: false,
             hybrid_retained: false,
@@ -1769,6 +1770,8 @@ fn resolved_runtime_plan_captures_q8_env_once() {
     std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_SINGLE_OWNER", "on");
     std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER", "on");
     std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL", "on");
+    std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE", "on");
+    std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR", "on");
     std::env::set_var("CAMELID_HYBRID_Q8_GPU_ROWS", "7");
     std::env::set_var("CAMELID_HYBRID_Q8_GPU_PERCENT", "25");
 
@@ -1796,6 +1799,8 @@ fn resolved_runtime_plan_captures_q8_env_once() {
     assert!(plan.q8.ffn_gate_up_single_owner);
     assert!(plan.q8.ffn_down_decode_consumer);
     assert!(plan.q8.ffn_down_packed_rows4_matmul);
+    assert!(plan.q8.ffn_down_vnni_decode);
+    assert!(plan.q8.ffn_down_vnni_decode_rawptr);
     std::env::remove_var("CAMELID_X86_Q8_ATTENTION_PROJECTION_DECODE_CONSUMER");
     std::env::remove_var("CAMELID_X86_Q8_ATTENTION_OUTPUT_DECODE_CONSUMER");
     std::env::remove_var("CAMELID_X86_Q8_ATTENTION_OUTPUT_PACKED_ROWS4_MATMUL");
@@ -1813,6 +1818,8 @@ fn resolved_runtime_plan_captures_q8_env_once() {
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_SINGLE_OWNER");
     std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER");
     std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL");
+    std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE");
+    std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR");
     assert!(
         plan.q8.attention_projection_decode_consumer,
         "resolved plan should cache the attention projection consumer gate"
@@ -1876,6 +1883,14 @@ fn resolved_runtime_plan_captures_q8_env_once() {
     assert!(
         plan.q8.ffn_down_packed_rows4_matmul,
         "resolved plan should cache the packed-rows4 matmul gate"
+    );
+    assert!(
+        plan.q8.ffn_down_vnni_decode,
+        "resolved plan should cache the FFN-down VNNI decode gate"
+    );
+    assert!(
+        plan.q8.ffn_down_vnni_decode_rawptr,
+        "resolved plan should cache the FFN-down VNNI rawptr decode gate"
     );
     assert_eq!(plan.q8.hybrid_gpu_rows, Some(7));
     assert_eq!(plan.q8.hybrid_gpu_percent, 25);
@@ -1973,6 +1988,14 @@ fn runtime_profile_defaults_keep_experimental_q8_gates_closed() {
         assert!(
             !plan.q8.ffn_down_packed_rows4_matmul,
             "{profile} should not enable packed-rows4 matmul by default"
+        );
+        assert!(
+            !plan.q8.ffn_down_vnni_decode,
+            "{profile} should not enable FFN-down VNNI decode by default"
+        );
+        assert!(
+            !plan.q8.ffn_down_vnni_decode_rawptr,
+            "{profile} should not enable FFN-down VNNI rawptr decode by default"
         );
         assert!(
             !plan.q8.metal,
@@ -2529,6 +2552,7 @@ fn q8_attention_consumer_plan(
             ffn_down_amx_prefill: false,
             ffn_down_single_owner: false,
             ffn_down_vnni_decode: false,
+            ffn_down_vnni_decode_rawptr: false,
             metal: false,
             metal_retained: false,
             hybrid_retained: false,
@@ -3441,6 +3465,7 @@ fn ffn_down_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             ffn_down_amx_prefill: false,
             ffn_down_single_owner: false,
             ffn_down_vnni_decode: false,
+            ffn_down_vnni_decode_rawptr: false,
             metal: false,
             metal_retained: false,
             hybrid_retained: false,
@@ -3453,6 +3478,8 @@ fn ffn_down_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
 fn ffn_down_vnni_decode_plan(enabled: bool) -> ResolvedRuntimePlan {
     let mut plan = ffn_down_consumer_plan(false);
     plan.q8.ffn_down_vnni_decode = enabled;
+    plan.q8.ffn_down_vnni_decode_rawptr =
+        q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR");
     plan
 }
 
@@ -3485,6 +3512,7 @@ fn ffn_down_packed_rows4_matmul_plan(enabled: bool) -> ResolvedRuntimePlan {
             ffn_down_amx_prefill: false,
             ffn_down_single_owner: false,
             ffn_down_vnni_decode: false,
+            ffn_down_vnni_decode_rawptr: false,
             metal: false,
             metal_retained: false,
             hybrid_retained: false,
@@ -3535,6 +3563,7 @@ fn ffn_gate_up_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             ffn_down_amx_prefill: false,
             ffn_down_single_owner: false,
             ffn_down_vnni_decode: false,
+            ffn_down_vnni_decode_rawptr: false,
             metal: false,
             metal_retained: false,
             hybrid_retained: false,

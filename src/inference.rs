@@ -8548,10 +8548,10 @@ fn record_q8_ffn_down_vnni_decode_reject(
     );
 }
 
-fn q8_ffn_down_vnni_decode_route_name() -> &'static str {
+fn q8_ffn_down_vnni_decode_route_name(use_rawptr: bool) -> &'static str {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        if x86_q8_vnni_decode_rawptr_enabled() {
+        if use_rawptr {
             return "x86_vnni_decode_rawptr_consumer";
         }
     }
@@ -8580,6 +8580,7 @@ fn q8_0_vnni_decode_1x64_projection(
     quantized_input: &[Q8_0Block],
     output_width: usize,
     name: &str,
+    use_rawptr: bool,
 ) -> Result<CpuTensor> {
     if packed.rows != output_width
         || packed.blocks_per_row != quantized_input.len()
@@ -8595,7 +8596,7 @@ fn q8_0_vnni_decode_1x64_projection(
     }
 
     let mut output = vec![0.0_f32; output_width];
-    q8_0_vnni_decode_1x64_projection_into(packed, quantized_input, &mut output)?;
+    q8_0_vnni_decode_1x64_projection_into(packed, quantized_input, &mut output, use_rawptr)?;
     CpuTensor::from_f32(name, vec![1, output_width], output)
 }
 
@@ -8603,6 +8604,7 @@ fn q8_0_vnni_decode_1x64_projection_into(
     packed: &Q8_0VnniPacked,
     quantized_input: &[Q8_0Block],
     output: &mut [f32],
+    use_rawptr: bool,
 ) -> Result<()> {
     let output_width = output.len();
     if packed.rows != output_width
@@ -8620,9 +8622,9 @@ fn q8_0_vnni_decode_1x64_projection_into(
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        if x86_q8_vnni_decode_rawptr_enabled() {
-            // SAFETY: runtime feature detection in `x86_q8_vnni_decode_rawptr_enabled`
-            // confirms the selected x86 SIMD support, and the shape guard above proves that
+        if use_rawptr && x86_q8_vnni_decode_rawptr_supported() {
+            // SAFETY: runtime feature detection confirms the selected x86 SIMD support,
+            // and the shape guard above proves that
             // `packed.tiles`, `quantized_input`, and `output` cover every 64-row group.
             unsafe {
                 if x86_q8_vnni_decode_avx512_supported() {
@@ -8664,9 +8666,8 @@ fn q8_0_vnni_decode_1x64_projection_into(
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn x86_q8_vnni_decode_rawptr_enabled() -> bool {
-    q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR")
-        && (x86_q8_vnni_decode_avx512_supported() || std::arch::is_x86_feature_detected!("avx2"))
+fn x86_q8_vnni_decode_rawptr_supported() -> bool {
+    x86_q8_vnni_decode_avx512_supported() || std::arch::is_x86_feature_detected!("avx2")
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -11061,11 +11062,13 @@ fn try_x86_q8_ffn_down_decode_consumer_path(
                 );
             }
             let kernel_started = q8_schedule_telemetry_enabled().then(Instant::now);
+            let use_rawptr = runtime_plan.q8.ffn_down_vnni_decode_rawptr;
             let output = q8_0_vnni_decode_1x64_projection(
                 vnni_packed,
                 &quantized_input.blocks,
                 route.output_width,
                 name,
+                use_rawptr,
             )?;
             if let Some(started) = kernel_started {
                 add_q8_schedule_counter(
@@ -11076,7 +11079,7 @@ fn try_x86_q8_ffn_down_decode_consumer_path(
             add_q8_schedule_counter(&Q8_SCHED_FFN_DOWN_VNNI_DECODE_TAKEN, 1);
             record_q8_schedule_projection_route_elapsed(
                 "ffn_down",
-                q8_ffn_down_vnni_decode_route_name(),
+                q8_ffn_down_vnni_decode_route_name(use_rawptr),
                 name,
                 1,
                 route.input_width,
