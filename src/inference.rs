@@ -12344,28 +12344,45 @@ fn x86_q8_packed_rows4_avx2_dot_decode_hoist_enabled() -> bool {
 unsafe fn q8_0_i8_block_avx2(weight: *const i8, input: *const i8) -> i32 {
     #[cfg(target_arch = "x86")]
     use std::arch::x86::{
-        _mm256_add_epi32, _mm256_cvtepi8_epi16, _mm256_madd_epi16, _mm256_mullo_epi16,
-        _mm256_set1_epi16, _mm256_setzero_si256, _mm256_storeu_si256, _mm_loadu_si128,
+        _mm256_add_epi32, _mm256_cmpeq_epi8, _mm256_cvtepi8_epi16, _mm256_loadu_si256,
+        _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_movemask_epi8, _mm256_mullo_epi16,
+        _mm256_set1_epi16, _mm256_set1_epi8, _mm256_setzero_si256, _mm256_sign_epi8,
+        _mm256_storeu_si256, _mm_loadu_si128,
     };
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::{
-        _mm256_add_epi32, _mm256_cvtepi8_epi16, _mm256_madd_epi16, _mm256_mullo_epi16,
-        _mm256_set1_epi16, _mm256_setzero_si256, _mm256_storeu_si256, _mm_loadu_si128,
+        _mm256_add_epi32, _mm256_cmpeq_epi8, _mm256_cvtepi8_epi16, _mm256_loadu_si256,
+        _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_movemask_epi8, _mm256_mullo_epi16,
+        _mm256_set1_epi16, _mm256_set1_epi8, _mm256_setzero_si256, _mm256_sign_epi8,
+        _mm256_storeu_si256, _mm_loadu_si128,
     };
 
     let ones = _mm256_set1_epi16(1);
-    let mut acc = _mm256_setzero_si256();
-    for offset in [0usize, 16] {
-        // SAFETY: callers provide two complete 32-byte Q8_0 quant arrays; each iteration
-        // loads one unaligned 16-byte half from both arrays.
-        let weight_i8 = unsafe { _mm_loadu_si128(weight.add(offset).cast()) };
-        let input_i8 = unsafe { _mm_loadu_si128(input.add(offset).cast()) };
-        let weight_i16 = _mm256_cvtepi8_epi16(weight_i8);
-        let input_i16 = _mm256_cvtepi8_epi16(input_i8);
-        let products_i16 = _mm256_mullo_epi16(weight_i16, input_i16);
-        let pair_sums_i32 = _mm256_madd_epi16(products_i16, ones);
-        acc = _mm256_add_epi32(acc, pair_sums_i32);
-    }
+    let weight_i8 = unsafe { _mm256_loadu_si256(weight.cast()) };
+    let input_i8 = unsafe { _mm256_loadu_si256(input.cast()) };
+    let min_i8 = _mm256_set1_epi8(i8::MIN);
+    let has_min_i8 = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(weight_i8, min_i8))
+        | _mm256_movemask_epi8(_mm256_cmpeq_epi8(input_i8, min_i8)))
+        != 0;
+    let acc = if has_min_i8 {
+        let mut acc = _mm256_setzero_si256();
+        for offset in [0usize, 16] {
+            let weight_half = unsafe { _mm_loadu_si128(weight.add(offset).cast()) };
+            let input_half = unsafe { _mm_loadu_si128(input.add(offset).cast()) };
+            let products = _mm256_mullo_epi16(
+                _mm256_cvtepi8_epi16(weight_half),
+                _mm256_cvtepi8_epi16(input_half),
+            );
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(products, ones));
+        }
+        acc
+    } else {
+        // Mirrors llama.cpp's x86 q8_0 dot for well-formed Q8_0 blocks, whose
+        // quantized values are in [-127, 127].
+        let abs_weight = _mm256_sign_epi8(weight_i8, weight_i8);
+        let signed_input = _mm256_sign_epi8(input_i8, weight_i8);
+        _mm256_madd_epi16(_mm256_maddubs_epi16(abs_weight, signed_input), ones)
+    };
 
     let mut lanes = [0_i32; 8];
     // SAFETY: lanes has exactly 32 bytes of storage for one __m256i value.

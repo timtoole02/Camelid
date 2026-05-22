@@ -59,6 +59,28 @@ fn x86_q8_avx2_kernel_matches_scalar_dot() {
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[test]
+fn x86_q8_avx2_kernel_matches_scalar_dot_for_negative_128() {
+    let _env_guard = env_lock();
+    std::env::set_var("CAMELID_X86_Q8_KERNEL", "avx2");
+    let weight = std::array::from_fn(|idx| match idx % 4 {
+        0 => -128,
+        1 => 127,
+        2 => -7,
+        _ => idx as i8,
+    });
+    let input = std::array::from_fn(|idx| match idx % 5 {
+        0 => -128,
+        1 => 127,
+        2 => 5,
+        _ => (idx as i8).wrapping_mul(-3),
+    });
+    let expected = q8_0_block_int_dot_horizontal_sum_scalar(&weight, &input);
+    assert_eq!(q8_0_block_int_dot_horizontal_sum(&weight, &input), expected);
+    std::env::remove_var("CAMELID_X86_Q8_KERNEL");
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[test]
 fn x86_q8_packed_rows4_matmul_chunk_groups_env_override() {
     let _env_guard = env_lock();
     std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK");
