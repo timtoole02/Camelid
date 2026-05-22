@@ -8469,15 +8469,98 @@ fn try_x86_q8_ffn_decode_chain_path(
     let down_started = Instant::now();
     let decode_group_chunking = mac_q8_ffn_down_decode_group_chunking_enabled()
         || x86_q8_ffn_down_decode_group_chunking_enabled();
-    let output = q8_0_packed_rows4_single_input_projection_with_decode_chunking(
-        down_route.packed,
-        &quantized_activated.blocks,
-        down_route.output_width,
-        down_name,
-        decode_group_chunking,
-    )?;
+    let mut down_route_name = q8_ffn_down_decode_consumer_route_name(decode_group_chunking);
+    let output = if runtime_plan.q8.ffn_down_vnni_decode {
+        add_q8_schedule_counter(&Q8_SCHED_FFN_DOWN_VNNI_DECODE_CANDIDATES, 1);
+        if !x86_q8_vnni_decode_cpu_supported() {
+            record_q8_ffn_down_vnni_decode_reject(
+                &Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_CPU_FEATURE,
+                "cpu_feature_missing",
+                1,
+                down_route.input_width,
+                down_route.output_width,
+            );
+            q8_0_packed_rows4_single_input_projection_with_decode_chunking(
+                down_route.packed,
+                &quantized_activated.blocks,
+                down_route.output_width,
+                down_name,
+                decode_group_chunking,
+            )?
+        } else if !down_route.input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
+            record_q8_ffn_down_vnni_decode_reject(
+                &Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_BAD_INPUT_WIDTH,
+                "bad_input_width",
+                1,
+                down_route.input_width,
+                down_route.output_width,
+            );
+            q8_0_packed_rows4_single_input_projection_with_decode_chunking(
+                down_route.packed,
+                &quantized_activated.blocks,
+                down_route.output_width,
+                down_name,
+                decode_group_chunking,
+            )?
+        } else if !down_route.output_width.is_multiple_of(64) {
+            record_q8_ffn_down_vnni_decode_reject(
+                &Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_BAD_OUTPUT_WIDTH,
+                "bad_output_width",
+                1,
+                down_route.input_width,
+                down_route.output_width,
+            );
+            q8_0_packed_rows4_single_input_projection_with_decode_chunking(
+                down_route.packed,
+                &quantized_activated.blocks,
+                down_route.output_width,
+                down_name,
+                decode_group_chunking,
+            )?
+        } else if let Some(vnni_packed) = down_route.packed.vnni_packed.as_ref() {
+            let vnni_kernel_started = Instant::now();
+            let output = q8_0_vnni_decode_1x64_projection(
+                vnni_packed,
+                &quantized_activated.blocks,
+                down_route.output_width,
+                down_name,
+            )?;
+            add_q8_schedule_counter(
+                &Q8_SCHED_FFN_DOWN_VNNI_DECODE_KERNEL_US,
+                vnni_kernel_started.elapsed().as_micros() as u64,
+            );
+            add_q8_schedule_counter(&Q8_SCHED_FFN_DOWN_VNNI_DECODE_TAKEN, 1);
+            down_route_name = "x86_vnni_decode_consumer";
+            output
+        } else {
+            record_q8_ffn_down_vnni_decode_reject(
+                &Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_NO_VNNI_PACK,
+                "no_vnni_pack",
+                1,
+                down_route.input_width,
+                down_route.output_width,
+            );
+            q8_0_packed_rows4_single_input_projection_with_decode_chunking(
+                down_route.packed,
+                &quantized_activated.blocks,
+                down_route.output_width,
+                down_name,
+                decode_group_chunking,
+            )?
+        }
+    } else {
+        q8_0_packed_rows4_single_input_projection_with_decode_chunking(
+            down_route.packed,
+            &quantized_activated.blocks,
+            down_route.output_width,
+            down_name,
+            decode_group_chunking,
+        )?
+    };
     let down_elapsed = down_started.elapsed().as_micros();
-    add_q8_schedule_counter(&Q8_SCHED_FFN_DOWN_DECODE_CONSUMER_TAKEN, 1);
+    if down_route_name != "x86_vnni_decode_consumer" {
+        add_q8_schedule_counter(&Q8_SCHED_FFN_DOWN_DECODE_CONSUMER_TAKEN, 1);
+    }
     add_q8_schedule_counter(&Q8_SCHED_FFN_DECODE_CHAIN_TAKEN, 1);
     add_q8_schedule_counter(
         &Q8_SCHED_FFN_DECODE_CHAIN_TOTAL_US,
@@ -8486,7 +8569,7 @@ fn try_x86_q8_ffn_decode_chain_path(
     add_q8_schedule_counter(&Q8_SCHED_FFN_DECODE_CHAIN_DOWN_US, down_elapsed as u64);
     record_q8_schedule_output_projection_route_call(
         "ffn_down",
-        q8_ffn_down_decode_consumer_route_name(decode_group_chunking),
+        down_route_name,
         Some(down_name),
         1,
         down_route.input_width,

@@ -3991,6 +3991,69 @@ fn x86_q8_ffn_decode_chain_is_default_off_and_matches_split_consumers() {
     std::env::remove_var("CAMELID_X86_Q8_FFN_DECODE_CHAIN");
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn x86_q8_ffn_decode_chain_can_use_vnni_down_consumer() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+    if !x86_q8_vnni_decode_cpu_supported() {
+        std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE");
+        return;
+    }
+
+    let (input, packed_gate, packed_up, _expected_gate_up) = runtime_packed_ffn_gate_up_case();
+    let (_down_input, packed_down, _expected_down) = runtime_vnni_packed_ffn_down_case();
+    let activated = gated_ffn_activation_with_plan(
+        &input,
+        &packed_gate,
+        &packed_up,
+        "expected_activated",
+        &ffn_gate_up_consumer_plan(true),
+        false,
+    )
+    .unwrap()
+    .tensor;
+    let expected = try_x86_q8_ffn_down_decode_consumer_path(
+        &activated,
+        &packed_down,
+        "expected_down",
+        "ffn_down",
+        &ffn_down_vnni_decode_plan(true),
+    )
+    .unwrap()
+    .expect("split VNNI FFN-down decode output");
+
+    let mut vnni_plan = ffn_decode_chain_plan();
+    vnni_plan.q8.ffn_down_vnni_decode = true;
+    std::env::set_var(Q8_SCHEDULE_TELEMETRY_ENV, "on");
+    reset_q8_schedule_telemetry();
+
+    let actual = try_x86_q8_ffn_decode_chain_path(
+        &input,
+        &packed_gate,
+        &packed_up,
+        &packed_down,
+        "layer_0_ffn_activated",
+        "layer_0_ffn_down",
+        &vnni_plan,
+    )
+    .unwrap()
+    .expect("VNNI FFN decode chain output");
+
+    assert_eq!(actual.tensor.shape.dims, expected.shape.dims);
+    assert_slice_close_with_tolerance(&actual.tensor.data, &expected.data, 5e-4);
+    let telemetry = snapshot_q8_schedule_telemetry();
+    assert_eq!(telemetry.ffn_decode_chain_taken, 1);
+    assert_eq!(telemetry.ffn_down_vnni_decode_taken, 1);
+    assert!(telemetry.ffn_down_vnni_decode_kernel_us > 0);
+    assert!(telemetry
+        .output_projection_by_route
+        .contains_key("ffn_down.x86_vnni_decode_consumer"));
+    reset_q8_schedule_telemetry();
+    std::env::remove_var(Q8_SCHEDULE_TELEMETRY_ENV);
+    std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE");
+}
+
 #[test]
 fn q8_ffn_down_consumer_matches_runtime_packed_baseline() {
     let _env_guard = env_lock();
