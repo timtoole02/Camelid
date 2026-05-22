@@ -9119,7 +9119,7 @@ unsafe fn q8_0_vnni_tile16_i32x4_avx2(
 ) {
     use std::arch::x86_64::{
         _mm256_add_epi32, _mm256_cvtepi8_epi16, _mm256_madd_epi16, _mm256_setzero_si256,
-        _mm256_storeu_si256, _mm_loadu_si128, _mm_set1_epi32, _mm_setr_epi32,
+        _mm_loadu_si128, _mm_set1_epi32,
     };
 
     let mut acc0 = _mm256_setzero_si256();
@@ -9145,44 +9145,39 @@ unsafe fn q8_0_vnni_tile16_i32x4_avx2(
         acc3 = _mm256_add_epi32(acc3, _mm256_madd_epi16(activation, weights3));
     }
 
-    let mut pair_sums = [0_i32; 8];
-    unsafe {
-        _mm256_storeu_si256(pair_sums.as_mut_ptr().cast(), acc0);
-    }
-    let ints0 = _mm_setr_epi32(
-        pair_sums[0] + pair_sums[1],
-        pair_sums[2] + pair_sums[3],
-        pair_sums[4] + pair_sums[5],
-        pair_sums[6] + pair_sums[7],
-    );
-    unsafe {
-        _mm256_storeu_si256(pair_sums.as_mut_ptr().cast(), acc1);
-    }
-    let ints1 = _mm_setr_epi32(
-        pair_sums[0] + pair_sums[1],
-        pair_sums[2] + pair_sums[3],
-        pair_sums[4] + pair_sums[5],
-        pair_sums[6] + pair_sums[7],
-    );
-    unsafe {
-        _mm256_storeu_si256(pair_sums.as_mut_ptr().cast(), acc2);
-    }
-    let ints2 = _mm_setr_epi32(
-        pair_sums[0] + pair_sums[1],
-        pair_sums[2] + pair_sums[3],
-        pair_sums[4] + pair_sums[5],
-        pair_sums[6] + pair_sums[7],
-    );
-    unsafe {
-        _mm256_storeu_si256(pair_sums.as_mut_ptr().cast(), acc3);
-    }
-    let ints3 = _mm_setr_epi32(
-        pair_sums[0] + pair_sums[1],
-        pair_sums[2] + pair_sums[3],
-        pair_sums[4] + pair_sums[5],
-        pair_sums[6] + pair_sums[7],
-    );
+    let ints0 = q8_0_vnni_avx2_pair_sums_i128(acc0);
+    let ints1 = q8_0_vnni_avx2_pair_sums_i128(acc1);
+    let ints2 = q8_0_vnni_avx2_pair_sums_i128(acc2);
+    let ints3 = q8_0_vnni_avx2_pair_sums_i128(acc3);
     (ints0, ints1, ints2, ints3)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::incompatible_msrv)]
+#[target_feature(enable = "avx2")]
+fn q8_0_vnni_avx2_pair_sums_i128(acc: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m128i {
+    use std::arch::x86_64::{
+        _mm256_castsi256_si128, _mm256_extracti128_si256, _mm256_hadd_epi32, _mm_unpacklo_epi64,
+    };
+
+    let pair_sums = _mm256_hadd_epi32(acc, acc);
+    let lo = _mm256_castsi256_si128(pair_sums);
+    let hi = _mm256_extracti128_si256(pair_sums, 1);
+    _mm_unpacklo_epi64(lo, hi)
+}
+
+#[cfg(target_arch = "x86")]
+#[allow(clippy::incompatible_msrv)]
+#[target_feature(enable = "avx2")]
+fn q8_0_vnni_avx2_pair_sums_i128(acc: std::arch::x86::__m256i) -> std::arch::x86::__m128i {
+    use std::arch::x86::{
+        _mm256_castsi256_si128, _mm256_extracti128_si256, _mm256_hadd_epi32, _mm_unpacklo_epi64,
+    };
+
+    let pair_sums = _mm256_hadd_epi32(acc, acc);
+    let lo = _mm256_castsi256_si128(pair_sums);
+    let hi = _mm256_extracti128_si256(pair_sums, 1);
+    _mm_unpacklo_epi64(lo, hi)
 }
 
 fn q8_0_vnni_tile16_dot(tile: &Q8_0VnniTile16, input_block: &Q8_0Block) -> [i32; 16] {
@@ -9261,12 +9256,12 @@ unsafe fn q8_0_vnni_tile16_dot_avx2(tile: &Q8_0VnniTile16, input_block: &Q8_0Blo
     #[cfg(target_arch = "x86")]
     use std::arch::x86::{
         _mm256_add_epi32, _mm256_cvtepi8_epi16, _mm256_madd_epi16, _mm256_setzero_si256,
-        _mm256_storeu_si256, _mm_loadu_si128, _mm_set1_epi32,
+        _mm_loadu_si128, _mm_set1_epi32, _mm_storeu_si128,
     };
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::{
         _mm256_add_epi32, _mm256_cvtepi8_epi16, _mm256_madd_epi16, _mm256_setzero_si256,
-        _mm256_storeu_si256, _mm_loadu_si128, _mm_set1_epi32,
+        _mm_loadu_si128, _mm_set1_epi32, _mm_storeu_si128,
     };
 
     let mut acc0 = _mm256_setzero_si256();
@@ -9292,31 +9287,30 @@ unsafe fn q8_0_vnni_tile16_dot_avx2(tile: &Q8_0VnniTile16, input_block: &Q8_0Blo
         acc3 = _mm256_add_epi32(acc3, _mm256_madd_epi16(activation, weights3));
     }
 
-    let mut pair_sums = [0_i32; 8];
     let mut lanes = [0_i32; 16];
     unsafe {
-        _mm256_storeu_si256(pair_sums.as_mut_ptr().cast(), acc0);
-    }
-    for lane in 0..4 {
-        lanes[lane] = pair_sums[lane * 2] + pair_sums[lane * 2 + 1];
-    }
-    unsafe {
-        _mm256_storeu_si256(pair_sums.as_mut_ptr().cast(), acc1);
-    }
-    for lane in 0..4 {
-        lanes[4 + lane] = pair_sums[lane * 2] + pair_sums[lane * 2 + 1];
+        _mm_storeu_si128(
+            lanes.as_mut_ptr().cast(),
+            q8_0_vnni_avx2_pair_sums_i128(acc0),
+        );
     }
     unsafe {
-        _mm256_storeu_si256(pair_sums.as_mut_ptr().cast(), acc2);
-    }
-    for lane in 0..4 {
-        lanes[8 + lane] = pair_sums[lane * 2] + pair_sums[lane * 2 + 1];
+        _mm_storeu_si128(
+            lanes.as_mut_ptr().add(4).cast(),
+            q8_0_vnni_avx2_pair_sums_i128(acc1),
+        );
     }
     unsafe {
-        _mm256_storeu_si256(pair_sums.as_mut_ptr().cast(), acc3);
+        _mm_storeu_si128(
+            lanes.as_mut_ptr().add(8).cast(),
+            q8_0_vnni_avx2_pair_sums_i128(acc2),
+        );
     }
-    for lane in 0..4 {
-        lanes[12 + lane] = pair_sums[lane * 2] + pair_sums[lane * 2 + 1];
+    unsafe {
+        _mm_storeu_si128(
+            lanes.as_mut_ptr().add(12).cast(),
+            q8_0_vnni_avx2_pair_sums_i128(acc3),
+        );
     }
     lanes
 }

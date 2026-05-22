@@ -4063,6 +4063,73 @@ fn q8_vnni_tile16_avx2_matches_scalar_for_extreme_i8_values() {
     assert_eq!(actual, expected);
 }
 
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "manual x86 Q8 VNNI AVX2 pair-reducer benchmark"]
+fn q8_vnni_avx2_pair_reducer_benchmark() {
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return;
+    }
+    // SAFETY: runtime feature detection above confirms AVX2 support.
+    unsafe { q8_vnni_avx2_pair_reducer_benchmark_impl() };
+}
+
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::incompatible_msrv)]
+#[target_feature(enable = "avx2")]
+unsafe fn q8_vnni_avx2_pair_reducer_benchmark_impl() {
+    use std::arch::x86_64::{
+        _mm256_add_epi32, _mm256_set1_epi32, _mm256_setr_epi32, _mm_storeu_si128,
+    };
+    use std::hint::black_box;
+
+    let seed = _mm256_setr_epi32(3, -7, 11, -13, 17, -19, 23, -29);
+    let iterations = 10_000_000_i32;
+
+    let started = Instant::now();
+    let mut legacy_checksum = 0_i32;
+    for idx in 0..iterations {
+        let acc = _mm256_add_epi32(seed, _mm256_set1_epi32(black_box(idx)));
+        let lanes = q8_vnni_avx2_pair_sums_legacy_store(acc);
+        legacy_checksum = legacy_checksum.wrapping_add(black_box(lanes[0]));
+    }
+    let legacy_us = started.elapsed().as_micros();
+
+    let started = Instant::now();
+    let mut register_checksum = 0_i32;
+    for idx in 0..iterations {
+        let acc = _mm256_add_epi32(seed, _mm256_set1_epi32(black_box(idx)));
+        let mut lanes = [0_i32; 4];
+        _mm_storeu_si128(
+            lanes.as_mut_ptr().cast(),
+            q8_0_vnni_avx2_pair_sums_i128(acc),
+        );
+        register_checksum = register_checksum.wrapping_add(black_box(lanes[0]));
+    }
+    let register_us = started.elapsed().as_micros();
+
+    assert_eq!(legacy_checksum, register_checksum);
+    eprintln!(
+        "q8_vnni_avx2_pair_reducer_benchmark iterations={iterations} legacy_store_us={legacy_us} register_hadd_us={register_us} checksum={register_checksum}"
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::incompatible_msrv)]
+#[target_feature(enable = "avx2")]
+unsafe fn q8_vnni_avx2_pair_sums_legacy_store(acc: std::arch::x86_64::__m256i) -> [i32; 4] {
+    use std::arch::x86_64::_mm256_storeu_si256;
+
+    let mut pair_sums = [0_i32; 8];
+    _mm256_storeu_si256(pair_sums.as_mut_ptr().cast(), acc);
+    [
+        pair_sums[0] + pair_sums[1],
+        pair_sums[2] + pair_sums[3],
+        pair_sums[4] + pair_sums[5],
+        pair_sums[6] + pair_sums[7],
+    ]
+}
+
 #[test]
 fn q8_ffn_down_vnni_decode_falls_back_when_gate_off_or_pack_missing() {
     let _env_guard = env_lock();
