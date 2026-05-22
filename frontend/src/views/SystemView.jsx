@@ -26,7 +26,7 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
   const supportedFeatures = apiFeatures.filter((feature) => isSupportedCapabilityStatus(feature.status))
   const unsupportedFeatures = apiFeatures.filter((feature) => isGuardedCapabilityStatus(feature.status))
   const selectedChatGate = getChatGateState(capabilities, selectedModel, runtime)
-  const selectedCompatibilityHint = findCompatibilityHint(capabilities, selectedModel)
+  const selectedCompatibilityHint = selectedChatGate.hint || findCompatibilityHint(capabilities, selectedModel)
   const selectedCompatibilityTarget = isExactCompatibilityHint(selectedCompatibilityHint) ? selectedCompatibilityHint.target : null
   const selectedSupportLanes = exactRowSupportLanes(selectedCompatibilityTarget, apiFeatures)
   const selectedExactRowReady = selectedChatGate.chatUnlocked
