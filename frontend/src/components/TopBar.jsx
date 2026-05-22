@@ -62,9 +62,12 @@ function TopBar({ tab, setTab, selectedConversationTitle, selectedConversationUp
       ? `${currentCompatibilityTarget.id}: ${formatCapabilityStatus(currentCompatibilityTarget.status)}`
       : 'Open the API contract before treating any model family or quant as supported.')
   const runtimeGateDetail = `loaded_now=${runtime?.loaded_now ? 'true' : 'false'} · generation_ready=${runtime?.generation_ready ? 'true' : 'false'} · exact_compatibility_row=${activeChatGate.contractSupported ? 'true' : 'false'}`
-  const chatReadinessTone = selectedModelRunnable ? 'ready' : runtime?.loaded_now ? 'warm' : 'idle'
+  const apiUnavailable = runtime?.status === 'offline'
+  const chatReadinessTone = selectedModelRunnable ? 'ready' : (apiUnavailable || runtime?.loaded_now) ? 'warm' : 'idle'
   const chatReadinessLabel = selectedModelRunnable
     ? 'Ready'
+    : apiUnavailable
+      ? 'Offline'
     : runtime?.loaded_now
       ? 'Checking'
       : 'Not ready'
