@@ -1647,9 +1647,9 @@
   inset: -62px -76px -48px;
   border-radius: 56px;
   background:
-    radial-gradient(circle at 50% -4%, color-mix(in srgb, var(--color-info) 20%, transparent), transparent 44%),
-    radial-gradient(circle at 16% 78%, rgba(255, 255, 255, 0.06), transparent 35%),
-    radial-gradient(circle at 86% 66%, color-mix(in srgb, var(--color-selected-row) 18%, transparent), transparent 38%);
+    linear-gradient(180deg, color-mix(in srgb, var(--color-info) 12%, transparent), transparent 46%),
+    linear-gradient(135deg, color-mix(in srgb, var(--color-ready) 8%, transparent), transparent 44%),
+    linear-gradient(225deg, color-mix(in srgb, var(--color-selected-row) 16%, transparent), transparent 42%);
   pointer-events: none;
 }
 
@@ -1657,9 +1657,8 @@
   inset: -54px -58px -42px;
   border-radius: 56px;
   background:
-    radial-gradient(circle at 24% 4%, color-mix(in srgb, var(--color-info) 22%, transparent), transparent 30%),
-    radial-gradient(circle at 72% 10%, color-mix(in srgb, #c58af9 16%, transparent), transparent 28%),
-    radial-gradient(circle at 50% 100%, color-mix(in srgb, var(--color-ready) 11%, transparent), transparent 38%),
+    linear-gradient(165deg, color-mix(in srgb, var(--color-info) 16%, transparent), transparent 42%),
+    linear-gradient(28deg, color-mix(in srgb, var(--color-ready) 10%, transparent), transparent 48%),
     linear-gradient(180deg, color-mix(in srgb, var(--color-bg-elevated) 38%, transparent), transparent 70%);
   filter: blur(1px);
   opacity: 0.92;
@@ -1667,8 +1666,8 @@
 
 .chat-empty-stage-product.is-blocked::before {
   background:
-    radial-gradient(circle at 50% -2%, color-mix(in srgb, var(--color-warning) 18%, transparent), transparent 42%),
-    radial-gradient(circle at 18% 74%, color-mix(in srgb, var(--color-error) 9%, transparent), transparent 34%),
+    linear-gradient(180deg, color-mix(in srgb, var(--color-warning) 14%, transparent), transparent 44%),
+    linear-gradient(28deg, color-mix(in srgb, var(--color-error) 8%, transparent), transparent 42%),
     linear-gradient(180deg, color-mix(in srgb, var(--color-bg-elevated) 44%, transparent), transparent 62%);
 }
 
@@ -2442,7 +2441,7 @@
   border-radius: 32px;
   border-color: color-mix(in srgb, var(--color-border-strong) 30%, transparent);
   background:
-    radial-gradient(circle at 18% 0%, color-mix(in srgb, var(--color-info) 9%, transparent), transparent 36%),
+    linear-gradient(135deg, color-mix(in srgb, var(--color-info) 7%, transparent), transparent 44%),
     linear-gradient(180deg, color-mix(in srgb, var(--color-surface) 98%, rgba(255, 255, 255, 0.045)), color-mix(in srgb, var(--color-bg-elevated) 88%, transparent));
   box-shadow: 0 28px 78px rgba(0, 0, 0, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.075);
   padding: 16px 18px 13px;
@@ -6513,6 +6512,11 @@ textarea.composer-input-assistant {
   width: min(100%, 720px);
 }
 
+.message-row-assistant.assistant.is-error::before {
+  color: color-mix(in srgb, var(--color-error) 78%, var(--color-text) 22%);
+  text-shadow: none;
+}
+
 .message-row-assistant.user {
   width: min(100%, 720px);
 }
@@ -6522,8 +6526,44 @@ textarea.composer-input-assistant {
   background: color-mix(in srgb, var(--color-user-bubble) 88%, transparent);
 }
 
+.message-bubble-assistant.assistant.is-error {
+  padding: 16px 18px;
+  border: 1px solid color-mix(in srgb, var(--color-error) 28%, var(--color-border-soft));
+  border-radius: 22px;
+  background: color-mix(in srgb, var(--color-error) 8%, var(--color-surface) 92%);
+}
+
 .message-markdown {
   line-height: 1.78;
+}
+
+.message-finish-warning-error {
+  border-color: color-mix(in srgb, var(--color-error) 26%, transparent);
+  background: color-mix(in srgb, var(--color-error) 10%, transparent);
+  color: color-mix(in srgb, var(--color-error) 82%, var(--color-text) 18%);
+}
+
+.composer-send-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+
+.composer-send-icon {
+  width: 22px;
+  height: 22px;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-accent-ink) 12%, transparent);
+  font-size: 1rem;
+  line-height: 1;
+}
+
+.composer-send-button:disabled .composer-send-icon {
+  opacity: 0.64;
 }
 
 .models-view {
@@ -6715,6 +6755,14 @@ textarea.composer-input-assistant {
     justify-self: start;
   }
 
+  .chat-canvas-empty,
+  .chat-empty-shell-assistant {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    overflow: hidden;
+  }
+
   .topbar-status-strip {
     display: none;
   }
@@ -6743,6 +6791,12 @@ textarea.composer-input-assistant {
     text-wrap: balance;
   }
 
+  .chat-layout-empty .chat-empty-hero-clean {
+    width: min(100%, 322px);
+    max-width: 322px;
+    justify-self: center;
+  }
+
   .chat-layout-empty .chat-empty-hero-clean .hero-summary {
     width: min(100%, 300px);
     max-width: 300px;
@@ -6757,10 +6811,15 @@ textarea.composer-input-assistant {
   .chat-layout-empty .composer-assistant-product,
   .chat-empty-status-panel {
     width: min(100%, 322px);
+    max-width: 322px;
+    justify-self: center;
+    margin-inline: auto;
   }
 
   .chat-layout-empty .chat-empty-stage-product {
-    transform: translateX(-48px);
+    transform: none;
+    padding-inline: 0;
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .chat-layout-empty .composer-assistant-product {

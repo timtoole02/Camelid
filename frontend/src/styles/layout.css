@@ -529,6 +529,10 @@
     gap: var(--space-5);
   }
 
+  .app-shell.sidebar-collapsed .main-pane-chat {
+    padding-left: var(--space-5);
+  }
+
   .sidebar,
   .sidebar-resizer,
   .sidebar-unhide-button,
@@ -597,6 +601,10 @@
   .main-pane {
     padding: 14px;
     gap: var(--space-4);
+  }
+
+  .app-shell.sidebar-collapsed .main-pane-chat {
+    padding-left: 14px;
   }
 
   .chat-thread {

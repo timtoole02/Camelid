@@ -295,9 +295,9 @@ const ACTIVE_STREAMING_LABEL = 'Streaming response'
 const OPEN_CODE_STREAMING_LABEL = 'Streaming code response'
 
 const DEMO_PROMPTS = [
-  'Draft a crisp project brief with risks and next steps',
-  'Turn these notes into an executive summary',
-  'Write a compact Python utility with tests',
+  'Draft a project brief with risks and next steps',
+  'Turn these notes into a decision memo',
+  'Write a compact utility with tests',
 ]
 
 const streamingStatusLabel = (phase, elapsedSeconds, isOpenCode = false) => {
@@ -377,15 +377,16 @@ const ChatMessageRow = memo(function ChatMessageRow({ message, generationElapsed
   const showStreamingStatus = assistantStreaming && !messageContent
   const showLiveGenerationBadge = assistantStreaming && Boolean(messageContent)
   const showLengthWarning = message.role === 'assistant' && !assistantStreaming && message.finish_reason === 'length'
+  const showErrorWarning = message.role === 'assistant' && !assistantStreaming && message.finish_reason === 'error'
 
   return (
     <article
-      className={`message-row message-row-assistant ${message.role} ${assistantStreaming ? 'is-streaming' : ''}`}
+      className={`message-row message-row-assistant ${message.role} ${assistantStreaming ? 'is-streaming' : ''} ${showErrorWarning ? 'is-error' : ''}`}
       aria-busy={assistantStreaming ? 'true' : undefined}
       data-streaming-state={assistantStreaming ? 'active' : undefined}
       data-streaming-code-state={isOpenStreamingCode ? 'open' : undefined}
     >
-      <div className={`message-bubble message-bubble-assistant ${message.role}`}>
+      <div className={`message-bubble message-bubble-assistant ${message.role} ${showErrorWarning ? 'is-error' : ''}`} aria-label={message.role === 'assistant' ? 'Camelid response' : 'Your message'}>
         {showStreamingStatus && <StreamingLoader elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} compact />}
         {message.role === 'assistant'
           ? messageContent || !assistantStreaming
@@ -396,6 +397,11 @@ const ChatMessageRow = memo(function ChatMessageRow({ message, generationElapsed
         {showLengthWarning && (
           <div className="message-finish-warning" role="status">
             Stopped before completing. Ask “continue” for a complete file.
+          </div>
+        )}
+        {showErrorWarning && (
+          <div className="message-finish-warning message-finish-warning-error" role="alert">
+            Camelid stopped this response. Check the notice above or retry after the model is ready.
           </div>
         )}
         {hasTokenMetrics && (
@@ -573,8 +579,8 @@ export default function ChatWorkspace({
     : supportBlocked
       ? 'Choose a supported model.'
       : hasModels
-        ? 'Load a model to begin.'
-        : 'Add a model to begin.'
+        ? 'Load a Camelid model.'
+        : 'Add a Camelid model.'
   const productHeroSummary = selectedModelRunnable
     ? 'Ask anything, or start from one of the prompts below. Camelid is running the selected exact row locally.'
     : supportBlocked
@@ -709,7 +715,10 @@ export default function ChatWorkspace({
                     {!selectedModelRunnable && <button className="ghost-button ghost-button-quiet" onClick={() => setTab('library')}>Open Models</button>}
                   </div>
                   <div className="composer-assistant-actions composer-assistant-actions-stage">
-                    <button className="primary-button composer-send-button" onClick={sendMessage} disabled={!canSubmit} aria-label={generationActive ? `Camelid is generating for ${generationElapsedSeconds} seconds` : 'Send message to Camelid'}>{generationActive ? `Generating ${generationElapsedSeconds}s` : 'Send'}</button>
+                    <button className="primary-button composer-send-button" onClick={sendMessage} disabled={!canSubmit} aria-label={generationActive ? `Camelid is generating for ${generationElapsedSeconds} seconds` : 'Send message to Camelid'}>
+                      <span className="composer-send-label">{generationActive ? `Generating ${generationElapsedSeconds}s` : 'Send'}</span>
+                      <span className="composer-send-icon" aria-hidden="true">↑</span>
+                    </button>
                   </div>
                 </div>
                 <p id="chat-readiness-note" className={`composer-assistant-readiness-note is-${readinessState}`}>{readinessFinePrint}</p>
@@ -738,7 +747,7 @@ export default function ChatWorkspace({
                   <p className="hero-summary">{supportBlocked ? `${selectedCompatibilityLabel}. ${selectedCompatibilityCopy}` : describeModelState(selectedModel)}</p>
                 </div>
                 <div className="composer-actions single-action-row">
-                  <button className="primary-button" onClick={() => setTab('library')}>Open Library</button>
+                  <button className="primary-button" onClick={() => setTab('library')}>Open Models</button>
                 </div>
               </div>
             )}
@@ -784,7 +793,10 @@ export default function ChatWorkspace({
             </div>
             <div className="composer-assistant-actions">
               {!selectedModelRunnable && <button className="ghost-button" onClick={() => setTab('library')}>Open Models</button>}
-              <button className="primary-button composer-send-button" onClick={sendMessage} disabled={!canSubmit} aria-label={generationActive ? `Camelid is generating for ${generationElapsedSeconds} seconds` : 'Send message to Camelid'}>{generationActive ? `Generating ${generationElapsedSeconds}s` : 'Send'}</button>
+              <button className="primary-button composer-send-button" onClick={sendMessage} disabled={!canSubmit} aria-label={generationActive ? `Camelid is generating for ${generationElapsedSeconds} seconds` : 'Send message to Camelid'}>
+                <span className="composer-send-label">{generationActive ? `Generating ${generationElapsedSeconds}s` : 'Send'}</span>
+                <span className="composer-send-icon" aria-hidden="true">↑</span>
+              </button>
             </div>
           </div>
         </div>
