@@ -1,0 +1,29 @@
+refined host-status wording scan:
+- Command: rg over CONTEXT.md, STATUS.md, ROADMAP.md, docs, and docs-room README/summary/status note files for stale negative canonical-host status wording.
+- Result: PASS. No current negative canonical Ubuntu host-access claim was found.
+- Captured rc: 1 from rg, meaning no matches.
+
+retired host/key shorthand scan:
+- Command: rg over CONTEXT.md, STATUS.md, ROADMAP.md, docs, and docs-room README/summary/status note files for retired Ubuntu host aliases and disallowed key shorthand.
+- Result: PASS. No retired host alias or disallowed key shorthand was found.
+- Captured rc: 1 from rg, meaning no matches.
+
+guarded support-contract wording scan:
+- Command: rg over STATUS.md, docs/CONFIGURATION.md, docs/performance/ubuntu-x86-q8.md, and docs/runtime/cross-lane-sync.md for support/throughput/default-on/portability/frontend/API/RSS/evidence-needed/default-off language.
+- Result: PASS. Wording remains exact-row scoped for supported rows and default-off/evidence-needed scoped for developer experiments.
+- Captured rc: 0 from rg, with reviewed support-contract guardrail matches.
+
+public scrub:
+- Command: bash scripts/check-public-scrub.sh
+- Result: PASS. Exit 0.
+
+public evidence claim check:
+- Command: node scripts/check-public-evidence-claims.mjs
+- Result: PASS. Exit 0. Output: public evidence claim check passed: 96 manifest(s), 49 summary file(s).
+
+diff check:
+- Command: git diff --check
+- Result: PASS. Exit 0.
+
+remote:
+- Remote validation was not attempted in this docs-only run.
