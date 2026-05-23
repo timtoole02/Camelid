@@ -1,0 +1,51 @@
+{
+  "artifact": "cron-0719640b-20260523T233611Z-attn-output-gemm4-samehost",
+  "benchmark_decision": "reject_benchmark",
+  "claim_boundary": "No performance, support, or default-on claim is justified by this run.",
+  "head": "8f193219362e41f6f76a8058b2053113e79c20d9",
+  "host_class": "Linux x86_64",
+  "parity": {
+    "prompt_tokens_match": true,
+    "generated_tokens_match": true,
+    "generated_text_match": true,
+    "backend_text": "c",
+    "llama_text": "c"
+  },
+  "candidate_route": {
+    "calls": 28,
+    "elapsed_us": 150332,
+    "input_width": 3072,
+    "layer_count": 28,
+    "output_width": 3072,
+    "route_name": "x86_gemm4_prefill_row_group",
+    "rows": 75
+  },
+  "same_host_unique_prompt": {
+    "baseline": {
+      "camelid_backend_first_content_ms": 2631.5,
+      "camelid_backend_generate_ms": 2877,
+      "camelid_total_elapsed_ms": 2957.43,
+      "camelid_ttft_ms": 2957.05,
+      "llama_total_elapsed_ms": 418.18,
+      "llama_ttft_ms": 305.42
+    },
+    "candidate": {
+      "camelid_backend_first_content_ms": 2656,
+      "camelid_backend_generate_ms": 2909.5,
+      "camelid_total_elapsed_ms": 2989.67,
+      "camelid_ttft_ms": 2989.27,
+      "llama_total_elapsed_ms": 419.91,
+      "llama_ttft_ms": 306.54
+    },
+    "candidate_vs_baseline": {
+      "backend_first_content_delta_ms": 24.5,
+      "backend_generate_delta_ms": 32.5,
+      "total_elapsed_delta_ms": 32.24,
+      "ttft_delta_ms": 32.22
+    }
+  },
+  "targeted_test": {
+    "name": "q8_attention_output_gemm4",
+    "status": "passed"
+  }
+}
