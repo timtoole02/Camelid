@@ -3512,6 +3512,8 @@ fn q8_attention_output_packed_rows4_matmul_is_plan_gated_and_shape_limited() {
 fn q8_attention_output_gemm4_prefill_is_plan_gated_and_matches_rows4_baseline() {
     let _env_guard = env_lock();
     clear_dense_diagnostic_env();
+    std::env::set_var(Q8_SCHEDULE_TELEMETRY_ENV, "on");
+    reset_q8_schedule_telemetry();
     let (_decode_input, packed_weight, _decode_expected) =
         runtime_packed_attention_projection_case("attention_output", "blk.0.attn_output.weight");
     let input_width = packed_weight.dim(0).unwrap();
@@ -3525,13 +3527,16 @@ fn q8_attention_output_gemm4_prefill_is_plan_gated_and_matches_rows4_baseline() 
             .collect(),
     )
     .unwrap();
+    let mut plan = attention_output_gemm4_prefill_plan(true);
+    plan.q8.attention_output_gemm4_row_group_schedule = true;
+    let route_name = "x86_gemm4_prefill_row_group";
 
     let actual = try_x86_q8_attention_output_gemm4_prefill_path(
         &prefill_input,
         &packed_weight,
-        "gemm4_attention_output",
+        "layer_3_attention_output_gemm4",
         "linear",
-        &attention_output_gemm4_prefill_plan(true),
+        &plan,
     )
     .unwrap()
     .expect("gemm4 prefill route should activate for 4-row attention output");
@@ -3547,6 +3552,21 @@ fn q8_attention_output_gemm4_prefill_is_plan_gated_and_matches_rows4_baseline() 
     .unwrap();
     assert_eq!(actual.shape.dims, vec![rows, output_width]);
     assert_slice_close_with_tolerance(&actual.data, &expected.data, 5e-4);
+    let telemetry = snapshot_q8_schedule_telemetry();
+    let by_route = telemetry
+        .output_projection_by_route
+        .get(&format!("attention_output.{route_name}"))
+        .expect("attention-output gemm4 route telemetry");
+    assert_eq!(by_route.calls, 1);
+    assert_eq!(by_route.rows, rows as u64);
+    assert_eq!(by_route.input_width, input_width as u64);
+    assert_eq!(by_route.output_width, output_width as u64);
+    let layer_route = telemetry
+        .output_projection_by_layer_route
+        .get(&format!("layer_3.attention_output.{route_name}"))
+        .expect("layer-scoped attention-output gemm4 route telemetry");
+    assert_eq!(layer_route.layer_index, 3);
+    assert_eq!(layer_route.calls, 1);
 
     let short_input = CpuTensor::from_f32(
         "short_prefill",
@@ -3581,6 +3601,8 @@ fn q8_attention_output_gemm4_prefill_is_plan_gated_and_matches_rows4_baseline() 
     )
     .unwrap()
     .is_none());
+    reset_q8_schedule_telemetry();
+    std::env::remove_var(Q8_SCHEDULE_TELEMETRY_ENV);
 }
 
 fn ffn_down_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {

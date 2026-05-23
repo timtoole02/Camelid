@@ -9698,6 +9698,14 @@ fn x86_q8_attention_output_gemm4_row_group_min_input_groups() -> usize {
     }
 }
 
+fn x86_q8_attention_output_gemm4_route_name(row_group_schedule: bool) -> &'static str {
+    if row_group_schedule {
+        "x86_gemm4_prefill_row_group"
+    } else {
+        "x86_gemm4_prefill"
+    }
+}
+
 #[cfg(test)]
 fn should_use_x86_q8_attention_output_gemm4_row_group_schedule(
     enabled: bool,
@@ -10823,26 +10831,82 @@ fn try_x86_q8_attention_output_gemm4_prefill_path(
     rectangular_role: &str,
     runtime_plan: &ResolvedRuntimePlan,
 ) -> Result<Option<CpuTensor>> {
-    if !runtime_plan.q8.attention_output_gemm4_prefill
-        || rectangular_role != "linear"
-        || input.rank() != 2
-        || input.dim(0)? < 4
-        || !weight.name.ends_with(".attn_output.weight")
-    {
+    if rectangular_role != "linear" || input.rank() != 2 {
         return Ok(None);
     }
+    let rows = input.dim(0)?;
     let input_width = input.dim(1)?;
+    let route_name =
+        x86_q8_attention_output_gemm4_route_name(runtime_plan.q8.attention_output_gemm4_row_group_schedule);
+    if !runtime_plan.q8.attention_output_gemm4_prefill {
+        record_q8_schedule_projection_route_denial(
+            "attention_output",
+            route_name,
+            "plan_off",
+            rows,
+            input_width,
+            0,
+        );
+        return Ok(None);
+    }
+    if rows < 4 {
+        record_q8_schedule_projection_route_denial(
+            "attention_output",
+            route_name,
+            "rows_lt4",
+            rows,
+            input_width,
+            0,
+        );
+        return Ok(None);
+    }
+    if !weight.name.ends_with(".attn_output.weight") {
+        record_q8_schedule_projection_route_denial(
+            "attention_output",
+            route_name,
+            "weight_name_mismatch",
+            rows,
+            input_width,
+            0,
+        );
+        return Ok(None);
+    }
     if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        record_q8_schedule_projection_route_denial(
+            "attention_output",
+            route_name,
+            "bad_input_width",
+            rows,
+            input_width,
+            0,
+        );
         return Ok(None);
     }
     let Some((packed, output_width)) = q8_0_runtime_packed_projection(weight, input_width)? else {
+        record_q8_schedule_projection_route_denial(
+            "attention_output",
+            route_name,
+            "no_runtime_packed",
+            rows,
+            input_width,
+            0,
+        );
         return Ok(None);
     };
     if packed.interleave != Q8_0PackedRows4Interleave::I8 {
+        record_q8_schedule_projection_route_denial(
+            "attention_output",
+            route_name,
+            "non_i8_interleave",
+            rows,
+            input_width,
+            output_width,
+        );
         return Ok(None);
     }
 
-    q8_0_packed_rows4_gemm4_projection_with_row_group_schedule(
+    let telemetry_started = q8_schedule_telemetry_enabled().then(Instant::now);
+    let output = q8_0_packed_rows4_gemm4_projection_with_row_group_schedule(
         input,
         packed,
         output_width,
@@ -10850,8 +10914,17 @@ fn try_x86_q8_attention_output_gemm4_prefill_path(
         runtime_plan.q8.attention_output_gemm4_row_group_schedule,
         x86_q8_attention_output_gemm4_row_group_min_input_groups(),
         runtime_plan.q8.attention_output_gemm4_avx2,
-    )
-    .map(Some)
+    )?;
+    record_q8_schedule_projection_route_elapsed(
+        "attention_output",
+        route_name,
+        name,
+        rows,
+        input_width,
+        output_width,
+        telemetry_started,
+    );
+    Ok(Some(output))
 }
 
 fn try_x86_q8_attention_projection_decode_consumer_path(
