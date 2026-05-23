@@ -9427,7 +9427,7 @@ fn kv_cache_allocates_positions_lazily_without_losing_prior_layers() {
     assert_eq!(kv_cache.keys.len(), 8);
     assert_eq!(kv_cache.values.len(), 8);
 
-    let prior_layer1_start = kv_cache_offset(&kv_cache, 1, 0, 0);
+    let prior_layer1_start = kv_cache.offset(1, 0, 0);
     assert_eq!(
         &kv_cache.keys[prior_layer1_start..prior_layer1_start + 2],
         &[5.0, 6.0]

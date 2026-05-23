@@ -40,7 +40,7 @@ pub use diagnostic_config::{
     GqaHeadMapping, LinearAccumulationPrecision, OutputProjectionLayout, RectangularLinearLayout,
     SquareLinearLayout,
 };
-pub use kv_cache::{LlamaKvCache, LlamaKvCachePlan};
+pub use kv_cache::{LlamaKvCache, LlamaKvCachePlan, LlamaKvCachePositionTrace, LlamaKvCacheTrace};
 pub use q8_block_reader::Q8BlockReader;
 use q8_runtime::{
     q8_0_env_flag_disabled, q8_0_env_flag_enabled_default_off,
@@ -569,39 +569,6 @@ pub struct LlamaLayerDiagnostics {
     pub ffn_output: LlamaTensorStats,
     pub ffn_down_reconstruction: LlamaLinearProjectionDiagnostic,
     pub ffn_residual: LlamaTensorStats,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq)]
-pub struct LlamaKvCacheTrace {
-    pub layer_index: usize,
-    pub position_count: usize,
-    pub kv_head_count: usize,
-    pub head_dim: usize,
-    pub key_value_width: usize,
-    pub key_checksum: f64,
-    pub value_checksum: f64,
-    pub key_rms: f32,
-    pub value_rms: f32,
-    pub key_max_abs: f32,
-    pub key_max_abs_position: usize,
-    pub key_max_abs_index: usize,
-    pub value_max_abs: f32,
-    pub value_max_abs_position: usize,
-    pub value_max_abs_index: usize,
-    pub sampled_positions: Vec<LlamaKvCachePositionTrace>,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq)]
-pub struct LlamaKvCachePositionTrace {
-    pub position: usize,
-    pub key_checksum: f64,
-    pub value_checksum: f64,
-    pub key_rms: f32,
-    pub value_rms: f32,
-    pub key_max_abs: f32,
-    pub value_max_abs: f32,
-    pub key_first_values: Vec<f32>,
-    pub value_first_values: Vec<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -8556,6 +8523,8 @@ fn q8_ffn_down_vnni_decode_route_name(use_rawptr: bool) -> &'static str {
             return "x86_vnni_decode_rawptr_consumer";
         }
     }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    let _ = use_rawptr;
     "x86_vnni_decode_consumer"
 }
 
@@ -8620,6 +8589,9 @@ fn q8_0_vnni_decode_1x64_projection_into(
             quantized_input.len()
         )));
     }
+
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    let _ = use_rawptr;
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
@@ -14936,7 +14908,7 @@ fn write_kv_cache(
         )));
     }
     kv_cache.ensure_position_capacity(kv_cache.position + 1)?;
-    let offset = kv_cache_offset(kv_cache, layer_idx, kv_cache.position, 0);
+    let offset = kv_cache.offset(layer_idx, kv_cache.position, 0);
     let end = offset + expected_width;
     copy_to_f16_kv_cache_storage(&mut kv_cache.keys[offset..end], &key.data);
     copy_to_f16_kv_cache_storage(&mut kv_cache.values[offset..end], &value.data);
@@ -14972,7 +14944,7 @@ fn write_kv_cache_batch(
     kv_cache.ensure_position_capacity(base_position + rows)?;
     for row in 0..rows {
         let position = base_position + row;
-        let offset = kv_cache_offset(kv_cache, layer_idx, position, 0);
+        let offset = kv_cache.offset(layer_idx, position, 0);
         let end = offset + expected_width;
         let row_start = row * expected_width;
         let row_end = row_start + expected_width;
@@ -15029,7 +15001,7 @@ fn kv_cache_trace(
     let mut value_max_abs_index = 0;
 
     for position in 0..position_count {
-        let start = kv_cache_offset(kv_cache, layer_idx, position, 0);
+        let start = kv_cache.offset(layer_idx, position, 0);
         let end = start + key_value_width;
         for (idx, (&key, &value)) in kv_cache.keys[start..end]
             .iter()
@@ -15095,7 +15067,7 @@ fn kv_cache_position_trace(
     position: usize,
     key_value_width: usize,
 ) -> Result<LlamaKvCachePositionTrace> {
-    let start = kv_cache_offset(kv_cache, layer_idx, position, 0);
+    let start = kv_cache.offset(layer_idx, position, 0);
     let end = start + key_value_width;
     let key_slice = &kv_cache.keys[start..end];
     let value_slice = &kv_cache.values[start..end];
@@ -15209,7 +15181,7 @@ fn causal_attention_context(
             let kv_head =
                 map_attention_head_to_kv_head(attention_head, repeats, kv_heads, head_mapping);
             let out_start = attention_head * head_dim;
-            let value_start = kv_cache_offset(kv_cache, layer_idx, 0, kv_head);
+            let value_start = kv_cache.offset(layer_idx, 0, kv_head);
             out[out_start..out_start + head_dim]
                 .copy_from_slice(&kv_cache.values[value_start..value_start + head_dim]);
         }
@@ -15317,7 +15289,7 @@ fn causal_attention_context_batch(
                 let kv_head =
                     map_attention_head_to_kv_head(attention_head, repeats, kv_heads, head_mapping);
                 let out_start = attention_head * head_dim;
-                let value_start = kv_cache_offset(kv_cache, layer_idx, 0, kv_head);
+                let value_start = kv_cache.offset(layer_idx, 0, kv_head);
                 out_row[out_start..out_start + head_dim]
                     .copy_from_slice(&kv_cache.values[value_start..value_start + head_dim]);
             }
@@ -15381,8 +15353,10 @@ fn attention_context_for_head_into(
     debug_assert_eq!(out_slice.len(), head_dim);
     scores.clear();
     scores.reserve(params.position_count);
-    let head_base = kv_cache_head_base_offset(params.kv_cache, params.layer_idx, params.kv_head);
-    let position_stride = kv_cache_position_stride(params.kv_cache);
+    let head_base = params
+        .kv_cache
+        .head_base_offset(params.layer_idx, params.kv_head);
+    let position_stride = params.kv_cache.position_stride();
 
     let mut key_start = head_base;
     for position in 0..params.position_count {
@@ -15420,14 +15394,6 @@ fn attention_context_for_head_into(
     }
 
     Ok(())
-}
-
-fn kv_cache_head_base_offset(kv_cache: &LlamaKvCache, layer_idx: usize, kv_head: usize) -> usize {
-    ((layer_idx * kv_cache.plan.kv_head_count) + kv_head) * kv_cache.plan.head_dim
-}
-
-fn kv_cache_position_stride(kv_cache: &LlamaKvCache) -> usize {
-    kv_cache.plan.layer_count * kv_cache.plan.kv_head_count * kv_cache.plan.head_dim
 }
 
 const PARALLEL_ATTENTION_CONTEXT_MIN_UNITS: usize = 256;
@@ -15531,7 +15497,7 @@ fn attention_trace_with_params(params: AttentionTraceParams<'_>) -> Result<Llama
         let sampled_positions = sampled_attention_trace_positions(params.position_count);
         let mut positions = Vec::with_capacity(sampled_positions.len());
         for position in sampled_positions {
-            let key_start = kv_cache_offset(params.kv_cache, params.layer_idx, position, kv_head);
+            let key_start = params.kv_cache.offset(params.layer_idx, position, kv_head);
             let key_slice = &params.kv_cache.keys[key_start..key_start + head_dim];
             let value_slice = &params.kv_cache.values[key_start..key_start + head_dim];
             let qk_products = query_slice
@@ -15596,8 +15562,8 @@ fn attention_scores_for_head(
 ) -> Vec<f32> {
     let head_dim = kv_cache.plan.head_dim;
     let mut scores = Vec::with_capacity(position_count);
-    let mut key_start = kv_cache_head_base_offset(kv_cache, layer_idx, kv_head);
-    let position_stride = kv_cache_position_stride(kv_cache);
+    let mut key_start = kv_cache.head_base_offset(layer_idx, kv_head);
+    let position_stride = kv_cache.position_stride();
     for position in 0..position_count {
         let key_slice = &kv_cache.keys[key_start..key_start + head_dim];
         let score = dot_product(query_slice, key_slice) * scale;
@@ -15646,7 +15612,7 @@ fn reconstruct_attention_context_for_head(
 ) -> Vec<f32> {
     let mut context = vec![0.0; head_dim];
     for (position, probability) in probabilities.iter().copied().enumerate() {
-        let value_start = kv_cache_offset(kv_cache, layer_idx, position, kv_head);
+        let value_start = kv_cache.offset(layer_idx, position, kv_head);
         let value_slice = &kv_cache.values[value_start..value_start + head_dim];
         for dim in 0..head_dim {
             context[dim] += probability * value_slice[dim];
@@ -15681,7 +15647,7 @@ fn top_attention_probability_positions(
         .into_iter()
         .take(ATTENTION_TRACE_TOP_PROBABILITY_LIMIT)
         .map(|(position, probability)| {
-            let key_start = kv_cache_offset(kv_cache, layer_idx, position, kv_head);
+            let key_start = kv_cache.offset(layer_idx, position, kv_head);
             let key_slice = &kv_cache.keys[key_start..key_start + head_dim];
             let value_slice = &kv_cache.values[key_start..key_start + head_dim];
             LlamaAttentionTopProbabilityTrace {
@@ -15766,16 +15732,6 @@ fn first_attention_head_for_kv_head(
             (kv_head..attention_heads).find(|attention_head| attention_head % kv_heads == kv_head)
         }
     }
-}
-
-fn kv_cache_offset(
-    kv_cache: &LlamaKvCache,
-    layer_idx: usize,
-    position: usize,
-    kv_head: usize,
-) -> usize {
-    (((position * kv_cache.plan.layer_count) + layer_idx) * kv_cache.plan.kv_head_count + kv_head)
-        * kv_cache.plan.head_dim
 }
 
 pub fn tensor_map(tensors: impl IntoIterator<Item = CpuTensor>) -> HashMap<String, CpuTensor> {

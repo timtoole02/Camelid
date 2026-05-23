@@ -38,6 +38,39 @@ impl LlamaKvCachePlan {
     }
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LlamaKvCacheTrace {
+    pub layer_index: usize,
+    pub position_count: usize,
+    pub kv_head_count: usize,
+    pub head_dim: usize,
+    pub key_value_width: usize,
+    pub key_checksum: f64,
+    pub value_checksum: f64,
+    pub key_rms: f32,
+    pub value_rms: f32,
+    pub key_max_abs: f32,
+    pub key_max_abs_position: usize,
+    pub key_max_abs_index: usize,
+    pub value_max_abs: f32,
+    pub value_max_abs_position: usize,
+    pub value_max_abs_index: usize,
+    pub sampled_positions: Vec<LlamaKvCachePositionTrace>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LlamaKvCachePositionTrace {
+    pub position: usize,
+    pub key_checksum: f64,
+    pub value_checksum: f64,
+    pub key_rms: f32,
+    pub value_rms: f32,
+    pub key_max_abs: f32,
+    pub value_max_abs: f32,
+    pub key_first_values: Vec<f32>,
+    pub value_first_values: Vec<f32>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LlamaKvCache {
     pub plan: LlamaKvCachePlan,
@@ -106,6 +139,19 @@ impl LlamaKvCache {
 
     pub fn allocated_bytes(&self) -> u64 {
         (self.allocated_elements() as u64) * (std::mem::size_of::<f32>() as u64)
+    }
+
+    pub(super) fn offset(&self, layer_idx: usize, position: usize, kv_head: usize) -> usize {
+        (((position * self.plan.layer_count) + layer_idx) * self.plan.kv_head_count + kv_head)
+            * self.plan.head_dim
+    }
+
+    pub(super) fn head_base_offset(&self, layer_idx: usize, kv_head: usize) -> usize {
+        ((layer_idx * self.plan.kv_head_count) + kv_head) * self.plan.head_dim
+    }
+
+    pub(super) fn position_stride(&self) -> usize {
+        self.plan.layer_count * self.plan.kv_head_count * self.plan.head_dim
     }
 }
 
