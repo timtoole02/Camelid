@@ -1,0 +1,37 @@
+source_head=10e706d417a0
+
+[word-bound negative canonical-host status scan]
+command: word-bound negative canonical-host status phrase scan over CONTEXT.md README.md STATUS.md COMPATIBILITY.md docs and docs-room evidence summaries
+result: no matches
+rc=1
+
+[retired Ubuntu host alias and key-shorthand scan]
+command: rg -n "35\.85\.220\.175|54\.186\.43\.33|54\.186\.104\.93|~/Documents/cert/ubuntu\.pem" CONTEXT.md README.md STATUS.md COMPATIBILITY.md docs qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts --glob '*.md' --glob '*.txt'
+result: no matches
+rc=1
+
+[raw SSH auth-failure phrase scan]
+command: exact SSH auth-failure phrase scan over CONTEXT.md README.md STATUS.md COMPATIBILITY.md docs and docs-room evidence summaries
+result: no matches
+rc=1
+
+[guarded support-contract wording scan]
+command: rg -n "supported|support contract|default-off|evidence-needed|not supported|no .*claim|must not be treated" README.md STATUS.md COMPATIBILITY.md docs/CONFIGURATION.md docs/VALIDATION_MATRIX.md docs/performance/ubuntu-x86-q8.md
+result: reviewed exact-row/default-off/evidence-needed scoped wording; no support widening retained
+rc=0
+
+[public scrub]
+command: bash scripts/check-public-scrub.sh
+rc=0
+
+[public evidence claims]
+command: node scripts/check-public-evidence-claims.mjs
+output: public evidence claim check passed: 96 manifest(s), 49 summary file(s)
+rc=0
+
+[diff check]
+command: git diff --check
+rc=0
+
+[remote validation]
+Remote validation was not attempted in this run.
