@@ -7434,7 +7434,19 @@ fn try_x86_q8_output_packed_rows4_matmul_path(
         return Ok(None);
     }
 
+    if x86_q8_output_amx_prefill_enabled() {
+        if let Some(output) =
+            try_q8_0_packed_rows4_amx_prefill_projection(input, packed, output_width, name)?
+        {
+            return Ok(Some(output));
+        }
+    }
+
     q8_0_packed_rows4_matmul_projection(input, packed, output_width, name).map(Some)
+}
+
+fn x86_q8_output_amx_prefill_enabled() -> bool {
+    q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_OUTPUT_AMX_PREFILL")
 }
 
 fn try_x86_q8_output_decode_owner_path(

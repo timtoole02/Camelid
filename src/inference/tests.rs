@@ -1334,6 +1334,8 @@ fn clear_dense_diagnostic_env() {
         "CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER",
         "CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL",
         "CAMELID_X86_Q8_PACKED_ROWS4_MATMUL",
+        "CAMELID_X86_Q8_AMX_REPACK",
+        "CAMELID_X86_Q8_OUTPUT_AMX_PREFILL",
         "CAMELID_X86_Q8_OUTPUT_DECODE_OWNER",
     ] {
         std::env::remove_var(key);
@@ -7947,6 +7949,79 @@ fn x86_q8_output_packed_rows4_matmul_matches_runtime_packed_baseline_for_prefill
 
     assert_eq!(actual.shape.dims, vec![rows, vocab_rows]);
     assert_eq!(actual.data, expected.data);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn x86_q8_output_amx_prefill_matches_rows4_matmul_when_supported() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+    if unsafe { camelid_x86_q8_amx_supported() } == 0 {
+        return;
+    }
+
+    std::env::set_var("CAMELID_X86_Q8_AMX_REPACK", "on");
+    std::env::set_var("CAMELID_X86_Q8_OUTPUT_AMX_PREFILL", "on");
+    let rows = 20;
+    let vocab_rows = 16;
+    let blocks_per_row = 2;
+    let input_width = blocks_per_row * Q8_0_BLOCK_VALUES;
+    let row_blocks: Vec<Q8_0Block> = (0..vocab_rows * blocks_per_row)
+        .map(|block_idx| Q8_0Block {
+            scale: 0.0625 + (block_idx % 13) as f32 * 0.00390625,
+            quants: std::array::from_fn(|idx| {
+                ((block_idx as i32 * 11 + idx as i32 * 5) % 67 - 33) as i8
+            }),
+        })
+        .collect();
+    let packed = Q8_0PackedRows4::from_rows(
+        vocab_rows,
+        blocks_per_row,
+        Q8_0PackedRows4Interleave::I8,
+        &row_blocks,
+    )
+    .unwrap();
+    assert!(
+        packed.amx_blocks.is_some(),
+        "explicit AMX repack gate should create AMX tile sidecar"
+    );
+    let output_weight = CpuTensor::q8_0_runtime_packed_rows4_linear(
+        "output.weight",
+        TensorShape {
+            dims: vec![input_width, vocab_rows],
+        },
+        packed.clone(),
+    );
+    let input = CpuTensor::from_f32(
+        "output_amx_prefill_hidden",
+        vec![rows, input_width],
+        (0..rows * input_width)
+            .map(|idx| ((idx % 23) as f32 - 11.0) * 0.109375)
+            .collect(),
+    )
+    .unwrap();
+    let plan = output_packed_rows4_matmul_plan(true);
+
+    let actual = output_projection_runtime_with_plan(
+        &input,
+        &output_weight,
+        "output_amx_prefill_logits",
+        &plan,
+        false,
+    )
+    .unwrap();
+    let expected = q8_0_packed_rows4_matmul_projection(
+        &input,
+        &packed,
+        vocab_rows,
+        "expected_output_prefill_logits",
+    )
+    .unwrap();
+
+    assert_eq!(actual.shape.dims, vec![rows, vocab_rows]);
+    assert_slice_close_with_tolerance(&actual.data, &expected.data, 5e-4);
+    std::env::remove_var("CAMELID_X86_Q8_OUTPUT_AMX_PREFILL");
+    std::env::remove_var("CAMELID_X86_Q8_AMX_REPACK");
 }
 
 #[test]
