@@ -1,4 +1,4 @@
-source_head=10e706d417a0
+source_head=7d286e163e7de4e0c33ee92897d5784ac0646543
 
 [word-bound negative canonical-host status scan]
 command: word-bound negative canonical-host status phrase scan over CONTEXT.md README.md STATUS.md COMPATIBILITY.md docs and docs-room evidence summaries
