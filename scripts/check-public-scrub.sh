@@ -11,6 +11,8 @@ patterns=(
   'ssh: connect to host'
   'Operation timed out'
   'rc=255'
+  'exact stderr.*evidence bundle'
+  'stderr is (captured|cited) in the evidence bundle'
   '[A-Za-z0-9._-]+@''[0-9]{1,3}([.][0-9]{1,3}){3}'
   '(^|[^0-9])10[.]([0-9]{1,3}[.]){2}[0-9]{1,3}([^0-9]|$)'
   '(^|[^0-9])192[.]168[.][0-9]{1,3}[.][0-9]{1,3}([^0-9]|$)'

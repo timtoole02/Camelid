@@ -84,7 +84,9 @@ Contaminated runs are not used as retained evidence.
 
 ## Host-status reporting
 
-Do not present any negative host-access state for the canonical Ubuntu validation host unless the canonical SSH probe was executed in the same run and the exact stderr is cited in the evidence bundle. The canonical probe is the operator-provided private SSH command for the current run. Do not publish the host address, user, key path, or full command in repository files.
+Do not present any negative host-access state for the canonical Ubuntu validation host in public repository files. Keep exact probe commands, raw stderr, return codes, host addresses, users, key paths, and working directories in private operator notes only.
+
+If remote validation is unavailable for the run, use this public-safe wording: `Remote Linux x86_64 validation was unavailable during this cycle; no fresh same-host timing/parity claim is made.`
 
 If remote validation was not attempted in the run, say that plainly instead of implying host failure.
 
