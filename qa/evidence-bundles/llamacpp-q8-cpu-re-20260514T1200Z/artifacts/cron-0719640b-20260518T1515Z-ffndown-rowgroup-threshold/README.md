@@ -15,7 +15,7 @@ Slice:
 Gates:
 - Local macOS: `cargo test -q q8_ffn_down_gemm4` -> PASS (5 passed, 1 ignored).
 - Local macOS: `cargo fmt --check` -> PASS.
-- Canonical host `16.146.143.184` (with `source ~/.cargo/env` because login PATH has Cargo 1.75 but rustup Cargo is 1.95):
+- Canonical Ubuntu x86_64 host with Rust toolchain PATH normalized:
   - `cargo test -q x86_q8_ffn_down_gemm4_row_group_schedule_respects_min_input_groups` -> PASS.
   - `CAMELID_X86_Q8_SCHED_BENCH_ITERS=30 cargo test -q q8_ffn_down_gemm4_row_group_threshold_benchmark -- --ignored --nocapture` -> PASS.
 
