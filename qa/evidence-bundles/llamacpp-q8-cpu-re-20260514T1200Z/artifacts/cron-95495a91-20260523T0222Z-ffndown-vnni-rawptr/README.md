@@ -2,7 +2,7 @@
 
 ## Scope
 
-Default-off Ubuntu/Linux x86_64 check for `CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR=on` on exact row `llama32_3b_instruct_q8_0` using `/home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf` and the local llama.cpp CPU server under `/home/ubuntu/work`.
+Default-off Ubuntu/Linux x86_64 check for `CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR=on` on exact row `llama32_3b_instruct_q8_0` using the operator-provided Llama 3.2 3B Q8_0 GGUF path and local llama.cpp CPU server path.
 
 This is bounded parity and timing evidence only. It does not promote the raw-pointer path to default-on and does not widen support, portability, or throughput claims.
 
@@ -13,19 +13,19 @@ This is bounded parity and timing evidence only. It does not promote the raw-poi
 - Disk guard before rawptr-on benchmark: `avail_kb=115575224 use_pct=43 target_count=4`
 - Disk guard before rawptr-off benchmark: `avail_kb=115575140 use_pct=43 target_count=4`
 - Disk guard before targeted tests: `avail_kb=115575052 use_pct=43 target_count=4`
-- Shared build target: `CARGO_TARGET_DIR=/home/ubuntu/work/camelid-targets/backend-95495a91`
+- Shared build target: `CARGO_TARGET_DIR=${UBUNTU_HOME}/work/camelid-targets/backend-95495a91` (`${UBUNTU_HOME}` is a redacted operator-local home path placeholder).
 
 ## Commands
 
 ```bash
-/home/ubuntu/bin/camelid-disk-guard.sh
-export CARGO_TARGET_DIR=/home/ubuntu/work/camelid-targets/backend-95495a91
+${UBUNTU_HOME}/bin/camelid-disk-guard.sh
+export CARGO_TARGET_DIR=${UBUNTU_HOME}/work/camelid-targets/backend-95495a91
 cargo build --release
 ```
 
 ```bash
-/home/ubuntu/bin/camelid-disk-guard.sh
-export CARGO_TARGET_DIR=/home/ubuntu/work/camelid-targets/backend-95495a91
+${UBUNTU_HOME}/bin/camelid-disk-guard.sh
+export CARGO_TARGET_DIR=${UBUNTU_HOME}/work/camelid-targets/backend-95495a91
 export CAMELID_PROFILE=experimental
 export CAMELID_X86_Q8_REPACK=on
 export CAMELID_X86_Q8_KERNEL=avx2
@@ -36,18 +36,18 @@ export CAMELID_Q8_SCHED_TELEMETRY=on
 node scripts/bench-llama3-same-host.mjs \
   --backend http://127.0.0.1:8191 \
   --llama-url http://127.0.0.1:8193 \
-  --model /home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf \
+  --model ${UBUNTU_HOME}/models/Llama-3.2-3B-Instruct-Q8_0.gguf \
   --model-id llama32-3b-q8 \
   --row-id llama32_3b_instruct_q8_0 \
-  --backend-bin /home/ubuntu/work/camelid-targets/backend-95495a91/release/camelid \
-  --llama-server /home/ubuntu/work/llama.cpp-clean-20260517/build/bin/llama-server \
+  --backend-bin ${UBUNTU_HOME}/work/camelid-targets/backend-95495a91/release/camelid \
+  --llama-server ${UBUNTU_HOME}/work/llama.cpp-clean-20260517/build/bin/llama-server \
   --max-tokens 8 --warmup 1 --repeats 2 --threads 8 --require-marker \
-  --out /home/ubuntu/work/artifacts/cron-95495a91-20260523T0222Z-ffndown-vnni-rawptr/rawptr-on.json
+  --out ${UBUNTU_HOME}/work/artifacts/cron-95495a91-20260523T0222Z-ffndown-vnni-rawptr/rawptr-on.json
 ```
 
 ```bash
-/home/ubuntu/bin/camelid-disk-guard.sh
-export CARGO_TARGET_DIR=/home/ubuntu/work/camelid-targets/backend-95495a91
+${UBUNTU_HOME}/bin/camelid-disk-guard.sh
+export CARGO_TARGET_DIR=${UBUNTU_HOME}/work/camelid-targets/backend-95495a91
 export CAMELID_PROFILE=experimental
 export CAMELID_X86_Q8_REPACK=on
 export CAMELID_X86_Q8_KERNEL=avx2
@@ -58,18 +58,18 @@ export CAMELID_Q8_SCHED_TELEMETRY=on
 node scripts/bench-llama3-same-host.mjs \
   --backend http://127.0.0.1:8195 \
   --llama-url http://127.0.0.1:8197 \
-  --model /home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf \
+  --model ${UBUNTU_HOME}/models/Llama-3.2-3B-Instruct-Q8_0.gguf \
   --model-id llama32-3b-q8 \
   --row-id llama32_3b_instruct_q8_0 \
-  --backend-bin /home/ubuntu/work/camelid-targets/backend-95495a91/release/camelid \
-  --llama-server /home/ubuntu/work/llama.cpp-clean-20260517/build/bin/llama-server \
+  --backend-bin ${UBUNTU_HOME}/work/camelid-targets/backend-95495a91/release/camelid \
+  --llama-server ${UBUNTU_HOME}/work/llama.cpp-clean-20260517/build/bin/llama-server \
   --max-tokens 8 --warmup 1 --repeats 2 --threads 8 --require-marker \
-  --out /home/ubuntu/work/artifacts/cron-95495a91-20260523T0222Z-ffndown-vnni-rawptr/rawptr-off.json
+  --out ${UBUNTU_HOME}/work/artifacts/cron-95495a91-20260523T0222Z-ffndown-vnni-rawptr/rawptr-off.json
 ```
 
 ```bash
-/home/ubuntu/bin/camelid-disk-guard.sh
-export CARGO_TARGET_DIR=/home/ubuntu/work/camelid-targets/backend-95495a91
+${UBUNTU_HOME}/bin/camelid-disk-guard.sh
+export CARGO_TARGET_DIR=${UBUNTU_HOME}/work/camelid-targets/backend-95495a91
 cargo test q8_ffn_down_vnni_decode_rawptr -- --nocapture
 ```
 
