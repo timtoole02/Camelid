@@ -143,6 +143,57 @@ fn x86_q8_ffn_down_gemm4_row_group_schedule_respects_min_input_groups() {
     std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS");
 }
 
+#[test]
+fn x86_q8_attention_output_gemm4_row_group_schedule_respects_min_input_groups() {
+    let _env_guard = env_lock();
+    std::env::remove_var("CAMELID_X86_Q8_ATTENTION_OUTPUT_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS");
+    assert_eq!(
+        x86_q8_attention_output_gemm4_row_group_min_input_groups(),
+        X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS
+    );
+    assert!(
+        !should_use_x86_q8_attention_output_gemm4_row_group_schedule(
+            false,
+            X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS
+        )
+    );
+    assert!(
+        !should_use_x86_q8_attention_output_gemm4_row_group_schedule(
+            true,
+            X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS - 1
+        )
+    );
+    assert_eq!(
+        should_use_x86_q8_attention_output_gemm4_row_group_schedule(
+            true,
+            X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS
+        ),
+        rayon::current_num_threads() > 1
+    );
+
+    std::env::set_var(
+        "CAMELID_X86_Q8_ATTENTION_OUTPUT_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS",
+        "2",
+    );
+    assert_eq!(
+        x86_q8_attention_output_gemm4_row_group_min_input_groups(),
+        2
+    );
+    assert_eq!(
+        should_use_x86_q8_attention_output_gemm4_row_group_schedule(true, 2),
+        rayon::current_num_threads() > 1
+    );
+    std::env::set_var(
+        "CAMELID_X86_Q8_ATTENTION_OUTPUT_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS",
+        "0",
+    );
+    assert_eq!(
+        x86_q8_attention_output_gemm4_row_group_min_input_groups(),
+        X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS
+    );
+    std::env::remove_var("CAMELID_X86_Q8_ATTENTION_OUTPUT_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS");
+}
+
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[test]
 fn x86_q8_avx2_packed_rows4_i8_matches_scalar_dot() {
@@ -1645,6 +1696,9 @@ fn q8_0_hot_path_uses_resolved_plan_not_current_env() {
             attention_projection_decode_consumer: false,
             attention_output_decode_consumer: false,
             attention_output_packed_rows4_matmul: false,
+            attention_output_gemm4_prefill: false,
+            attention_output_gemm4_row_group_schedule: false,
+            attention_output_gemm4_avx2: false,
             attention_qkv_decode_consumer: false,
             attention_qkv_decode_group_chunking: false,
             attention_qkv_packed_rows4_matmul: false,
@@ -2522,6 +2576,12 @@ fn attention_output_packed_rows4_matmul_plan(enabled: bool) -> ResolvedRuntimePl
     plan
 }
 
+fn attention_output_gemm4_prefill_plan(enabled: bool) -> ResolvedRuntimePlan {
+    let mut plan = q8_attention_consumer_plan(false, false);
+    plan.q8.attention_output_gemm4_prefill = enabled;
+    plan
+}
+
 fn output_packed_rows4_matmul_plan(enabled: bool) -> ResolvedRuntimePlan {
     let mut plan = q8_attention_consumer_plan(false, false);
     plan.q8.output_packed_rows4_matmul = enabled;
@@ -2540,6 +2600,9 @@ fn q8_attention_consumer_plan(
             attention_projection_decode_consumer,
             attention_output_decode_consumer: false,
             attention_output_packed_rows4_matmul: false,
+            attention_output_gemm4_prefill: false,
+            attention_output_gemm4_row_group_schedule: false,
+            attention_output_gemm4_avx2: false,
             attention_qkv_decode_consumer,
             attention_qkv_decode_group_chunking: false,
             attention_qkv_packed_rows4_matmul: false,
@@ -3445,6 +3508,81 @@ fn q8_attention_output_packed_rows4_matmul_is_plan_gated_and_shape_limited() {
     .is_none());
 }
 
+#[test]
+fn q8_attention_output_gemm4_prefill_is_plan_gated_and_matches_rows4_baseline() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+    let (_decode_input, packed_weight, _decode_expected) =
+        runtime_packed_attention_projection_case("attention_output", "blk.0.attn_output.weight");
+    let input_width = packed_weight.dim(0).unwrap();
+    let output_width = packed_weight.dim(1).unwrap();
+    let rows = 4;
+    let prefill_input = CpuTensor::from_f32(
+        "prefill_attention_context_gemm4",
+        vec![rows, input_width],
+        (0..rows * input_width)
+            .map(|idx| ((idx % input_width) as f32 - 7.0) * 0.0625 + (idx / input_width) as f32)
+            .collect(),
+    )
+    .unwrap();
+
+    let actual = try_x86_q8_attention_output_gemm4_prefill_path(
+        &prefill_input,
+        &packed_weight,
+        "gemm4_attention_output",
+        "linear",
+        &attention_output_gemm4_prefill_plan(true),
+    )
+    .unwrap()
+    .expect("gemm4 prefill route should activate for 4-row attention output");
+    let expected = q8_0_packed_rows4_matmul_projection(
+        &prefill_input,
+        match packed_weight.q8_0_runtime_storage.as_ref() {
+            Some(Q8_0RuntimeStorage::PackedRows4(packed)) => packed,
+            other => panic!("expected runtime-packed rows4 weight, got {other:?}"),
+        },
+        output_width,
+        "attention_output_rows4_baseline",
+    )
+    .unwrap();
+    assert_eq!(actual.shape.dims, vec![rows, output_width]);
+    assert_slice_close_with_tolerance(&actual.data, &expected.data, 5e-4);
+
+    let short_input = CpuTensor::from_f32(
+        "short_prefill",
+        vec![3, input_width],
+        vec![0.0; 3 * input_width],
+    )
+    .unwrap();
+    assert!(try_x86_q8_attention_output_gemm4_prefill_path(
+        &short_input,
+        &packed_weight,
+        "too_short",
+        "linear",
+        &attention_output_gemm4_prefill_plan(true),
+    )
+    .unwrap()
+    .is_none());
+    assert!(try_x86_q8_attention_output_gemm4_prefill_path(
+        &prefill_input,
+        &packed_weight,
+        "disabled",
+        "linear",
+        &attention_output_gemm4_prefill_plan(false),
+    )
+    .unwrap()
+    .is_none());
+    assert!(try_x86_q8_attention_output_gemm4_prefill_path(
+        &prefill_input,
+        &packed_weight,
+        "wrong_role",
+        "attention_q",
+        &attention_output_gemm4_prefill_plan(true),
+    )
+    .unwrap()
+    .is_none());
+}
+
 fn ffn_down_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
     ResolvedRuntimePlan {
         linear_accumulation_precision: LinearAccumulationPrecision::F32,
@@ -3454,6 +3592,9 @@ fn ffn_down_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             attention_projection_decode_consumer: false,
             attention_output_decode_consumer: false,
             attention_output_packed_rows4_matmul: false,
+            attention_output_gemm4_prefill: false,
+            attention_output_gemm4_row_group_schedule: false,
+            attention_output_gemm4_avx2: false,
             attention_qkv_decode_consumer: false,
             attention_qkv_decode_group_chunking: false,
             attention_qkv_packed_rows4_matmul: false,
@@ -3502,6 +3643,9 @@ fn ffn_down_packed_rows4_matmul_plan(enabled: bool) -> ResolvedRuntimePlan {
             attention_projection_decode_consumer: false,
             attention_output_decode_consumer: false,
             attention_output_packed_rows4_matmul: false,
+            attention_output_gemm4_prefill: false,
+            attention_output_gemm4_row_group_schedule: false,
+            attention_output_gemm4_avx2: false,
             attention_qkv_decode_consumer: false,
             attention_qkv_decode_group_chunking: false,
             attention_qkv_packed_rows4_matmul: false,
@@ -3554,6 +3698,9 @@ fn ffn_gate_up_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             attention_projection_decode_consumer: false,
             attention_output_decode_consumer: false,
             attention_output_packed_rows4_matmul: false,
+            attention_output_gemm4_prefill: false,
+            attention_output_gemm4_row_group_schedule: false,
+            attention_output_gemm4_avx2: false,
             attention_qkv_decode_consumer: false,
             attention_qkv_decode_group_chunking: false,
             attention_qkv_packed_rows4_matmul: false,
@@ -4771,6 +4918,7 @@ fn q8_ffn_down_gemm4_row_group_threshold_benchmark() {
                     output_width,
                     label,
                     row_group_schedule,
+                    x86_q8_ffn_down_gemm4_row_group_min_input_groups(),
                     false,
                 )
                 .unwrap(),
@@ -4975,6 +5123,7 @@ fn q8_ffn_down_amx_prefill_benchmark() {
             output_width,
             "gemm4",
             false,
+            x86_q8_ffn_down_gemm4_row_group_min_input_groups(),
             true,
         )
         .unwrap()

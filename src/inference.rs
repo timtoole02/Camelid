@@ -4535,6 +4535,15 @@ fn linear_for_role_runtime_with_plan(
         )? {
             return Ok(output);
         }
+        if let Some(output) = try_x86_q8_attention_output_gemm4_prefill_path(
+            input,
+            weight,
+            &name,
+            rectangular_role,
+            runtime_plan,
+        )? {
+            return Ok(output);
+        }
         if let Some(output) = try_x86_q8_attention_output_packed_rows4_matmul_path(
             input,
             weight,
@@ -9659,10 +9668,44 @@ fn x86_q8_ffn_down_gemm4_row_group_min_input_groups() -> usize {
     }
 }
 
+#[cfg(test)]
 fn should_use_x86_q8_ffn_down_gemm4_row_group_schedule(enabled: bool, input_groups: usize) -> bool {
     enabled
         && rayon::current_num_threads() > 1
         && input_groups >= x86_q8_ffn_down_gemm4_row_group_min_input_groups()
+}
+
+fn x86_q8_attention_output_gemm4_row_group_min_input_groups() -> usize {
+    #[cfg(test)]
+    {
+        env::var("CAMELID_X86_Q8_ATTENTION_OUTPUT_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS)
+    }
+    #[cfg(not(test))]
+    {
+        static X86_Q8_ATTENTION_OUTPUT_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS_ONCE: OnceLock<usize> =
+            OnceLock::new();
+        *X86_Q8_ATTENTION_OUTPUT_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS_ONCE.get_or_init(|| {
+            env::var("CAMELID_X86_Q8_ATTENTION_OUTPUT_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS)
+        })
+    }
+}
+
+#[cfg(test)]
+fn should_use_x86_q8_attention_output_gemm4_row_group_schedule(
+    enabled: bool,
+    input_groups: usize,
+) -> bool {
+    enabled
+        && rayon::current_num_threads() > 1
+        && input_groups >= x86_q8_attention_output_gemm4_row_group_min_input_groups()
 }
 
 fn x86_q8_packed_rows4_matmul_groups_per_chunk() -> usize {
@@ -10121,6 +10164,7 @@ fn q8_0_packed_rows4_gemm4_projection_with_row_group_schedule(
     output_width: usize,
     name: &str,
     row_group_schedule: bool,
+    row_group_min_input_groups: usize,
     use_avx2: bool,
 ) -> Result<CpuTensor> {
     let rows = input.dim(0)?;
@@ -10157,7 +10201,10 @@ fn q8_0_packed_rows4_gemm4_projection_with_row_group_schedule(
             &mut packed_inputs,
         );
         let input_groups = packed_rows / 4;
-        if should_use_x86_q8_ffn_down_gemm4_row_group_schedule(row_group_schedule, input_groups) {
+        if row_group_schedule
+            && rayon::current_num_threads() > 1
+            && input_groups >= row_group_min_input_groups
+        {
             run_q8_0_packed_rows4_prefill_gemm4_kernel_row_group_parallel(
                 packed,
                 &packed_inputs,
@@ -10769,6 +10816,44 @@ fn try_x86_q8_attention_output_packed_rows4_matmul_path(
     q8_0_packed_rows4_matmul_projection(input, packed, output_width, name).map(Some)
 }
 
+fn try_x86_q8_attention_output_gemm4_prefill_path(
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    name: &str,
+    rectangular_role: &str,
+    runtime_plan: &ResolvedRuntimePlan,
+) -> Result<Option<CpuTensor>> {
+    if !runtime_plan.q8.attention_output_gemm4_prefill
+        || rectangular_role != "linear"
+        || input.rank() != 2
+        || input.dim(0)? < 4
+        || !weight.name.ends_with(".attn_output.weight")
+    {
+        return Ok(None);
+    }
+    let input_width = input.dim(1)?;
+    if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        return Ok(None);
+    }
+    let Some((packed, output_width)) = q8_0_runtime_packed_projection(weight, input_width)? else {
+        return Ok(None);
+    };
+    if packed.interleave != Q8_0PackedRows4Interleave::I8 {
+        return Ok(None);
+    }
+
+    q8_0_packed_rows4_gemm4_projection_with_row_group_schedule(
+        input,
+        packed,
+        output_width,
+        name,
+        runtime_plan.q8.attention_output_gemm4_row_group_schedule,
+        x86_q8_attention_output_gemm4_row_group_min_input_groups(),
+        runtime_plan.q8.attention_output_gemm4_avx2,
+    )
+    .map(Some)
+}
+
 fn try_x86_q8_attention_projection_decode_consumer_path(
     input: &CpuTensor,
     weight: &CpuTensor,
@@ -10893,6 +10978,7 @@ fn try_x86_q8_ffn_down_gemm4_prefill_path(
                 route.output_width,
                 name,
                 runtime_plan.q8.ffn_down_gemm4_row_group_schedule,
+                x86_q8_ffn_down_gemm4_row_group_min_input_groups(),
                 runtime_plan.q8.ffn_down_gemm4_avx2,
             )?;
             let route_name = if runtime_plan.q8.ffn_down_gemm4_row_group_schedule {
@@ -10909,6 +10995,7 @@ fn try_x86_q8_ffn_down_gemm4_prefill_path(
             route.output_width,
             name,
             runtime_plan.q8.ffn_down_gemm4_row_group_schedule,
+            x86_q8_ffn_down_gemm4_row_group_min_input_groups(),
             runtime_plan.q8.ffn_down_gemm4_avx2,
         )?;
         let route_name = if runtime_plan.q8.ffn_down_gemm4_row_group_schedule {

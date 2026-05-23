@@ -10,6 +10,9 @@ pub(super) struct Q8RuntimeFlags {
     pub(super) attention_projection_decode_consumer: bool,
     pub(super) attention_output_decode_consumer: bool,
     pub(super) attention_output_packed_rows4_matmul: bool,
+    pub(super) attention_output_gemm4_prefill: bool,
+    pub(super) attention_output_gemm4_row_group_schedule: bool,
+    pub(super) attention_output_gemm4_avx2: bool,
     pub(super) attention_qkv_decode_consumer: bool,
     pub(super) attention_qkv_decode_group_chunking: bool,
     pub(super) attention_qkv_packed_rows4_matmul: bool,
@@ -69,6 +72,15 @@ impl Q8RuntimeFlags {
             ),
             attention_output_packed_rows4_matmul: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_ATTENTION_OUTPUT_PACKED_ROWS4_MATMUL",
+            ),
+            attention_output_gemm4_prefill: q8_0_env_flag_enabled_default_off(
+                "CAMELID_X86_Q8_ATTENTION_OUTPUT_GEMM4_PREFILL",
+            ),
+            attention_output_gemm4_row_group_schedule: q8_0_env_flag_enabled_default_off(
+                "CAMELID_X86_Q8_ATTENTION_OUTPUT_GEMM4_ROW_GROUP_SCHED",
+            ),
+            attention_output_gemm4_avx2: q8_0_env_flag_enabled_default_off(
+                "CAMELID_X86_Q8_ATTENTION_OUTPUT_GEMM4_AVX2",
             ),
             attention_qkv_decode_consumer: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER",
