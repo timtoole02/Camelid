@@ -42,6 +42,29 @@ const MANAGED_ENV_KEYS: &[&str] = &[
     "CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR",
     "CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER",
     "CAMELID_X86_Q8_OUTPUT_DECODE_OWNER",
+    "CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUPS_PER_CHUNK",
+    "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUPS_PER_CHUNK",
+    "CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS",
+];
+
+struct ManagedPassthroughEnvKey {
+    key: &'static str,
+    owner_gate: &'static str,
+}
+
+const MANAGED_PASSTHROUGH_ENV_KEYS: &[ManagedPassthroughEnvKey] = &[
+    ManagedPassthroughEnvKey {
+        key: "CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUPS_PER_CHUNK",
+        owner_gate: "CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUP_CHUNKING",
+    },
+    ManagedPassthroughEnvKey {
+        key: "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUPS_PER_CHUNK",
+        owner_gate: "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING",
+    },
+    ManagedPassthroughEnvKey {
+        key: "CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS",
+        owner_gate: "CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_SCHED",
+    },
 ];
 
 pub const MAC_Q8_PREFILL_I8MM_MIN_ROWS: usize = 4;
@@ -85,11 +108,24 @@ pub struct ExecutionPlanOutcome {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct PlannerEnv;
+pub struct PlannerEnv {
+    passthrough_env: BTreeMap<&'static str, Option<String>>,
+}
 
 impl PlannerEnv {
     pub fn capture() -> Self {
-        Self
+        let passthrough_env = MANAGED_PASSTHROUGH_ENV_KEYS
+            .iter()
+            .map(|entry| {
+                (
+                    entry.key,
+                    env::var(entry.key)
+                        .ok()
+                        .filter(|value| managed_positive_usize_value(value)),
+                )
+            })
+            .collect();
+        Self { passthrough_env }
     }
 
     pub fn apply(&self, updates: &BTreeMap<&'static str, Option<&'static str>>) {
@@ -99,7 +135,37 @@ impl PlannerEnv {
                 None => env::remove_var(key),
             }
         }
+        for entry in MANAGED_PASSTHROUGH_ENV_KEYS {
+            if env_updates_enable_gate(updates, entry.owner_gate) {
+                match self
+                    .passthrough_env
+                    .get(entry.key)
+                    .and_then(|value| value.as_deref())
+                {
+                    Some(value) => env::set_var(entry.key, value),
+                    None => env::remove_var(entry.key),
+                }
+            } else {
+                env::remove_var(entry.key);
+            }
+        }
     }
+}
+
+fn managed_positive_usize_value(value: &str) -> bool {
+    value
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|value| *value > 0)
+        .is_some()
+}
+
+fn env_updates_enable_gate(
+    updates: &BTreeMap<&'static str, Option<&'static str>>,
+    key: &'static str,
+) -> bool {
+    matches!(updates.get(key).copied().flatten(), Some("on"))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -874,12 +940,14 @@ mod tests {
             "CAMELID_X86_Q8_ATTENTION_OUTPUT_PACKED_ROWS4_MATMUL",
             "CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER",
             "CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUP_CHUNKING",
+            "CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUPS_PER_CHUNK",
             "CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL",
             "CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL",
             "CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE",
             "CAMELID_X86_Q8_PARALLEL_INPUT_QUANTIZE",
             "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER",
             "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING",
+            "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUPS_PER_CHUNK",
             "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION",
             "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT",
             "CAMELID_X86_Q8_FFN_DECODE_CHAIN",
@@ -890,6 +958,7 @@ mod tests {
             "CAMELID_X86_Q8_PACKED_ROWS4_MATMUL",
             "CAMELID_X86_Q8_FFN_DOWN_GEMM4_PREFILL",
             "CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_SCHED",
+            "CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS",
             "CAMELID_X86_Q8_FFN_DOWN_GEMM4_AVX2",
             "CAMELID_X86_Q8_FFN_DOWN_AMX_PREFILL",
             "CAMELID_X86_Q8_FFN_DOWN_SINGLE_OWNER",
@@ -1455,10 +1524,12 @@ mod tests {
         env::set_var("CAMELID_X86_Q8_ATTENTION_OUTPUT_PACKED_ROWS4_MATMUL", "on");
         env::set_var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER", "on");
         env::set_var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUP_CHUNKING", "on");
+        env::set_var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUPS_PER_CHUNK", "7");
         env::set_var("CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL", "on");
         env::set_var("CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL", "on");
         env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER", "on");
         env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING", "on");
+        env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUPS_PER_CHUNK", "5");
         env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION", "on");
         env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DECODE_CHAIN", "on");
@@ -1469,6 +1540,10 @@ mod tests {
         env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_PREFILL", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_SCHED", "on");
+        env::set_var(
+            "CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS",
+            "3",
+        );
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_AVX2", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_AMX_PREFILL", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_SINGLE_OWNER", "on");
@@ -1485,10 +1560,12 @@ mod tests {
         assert!(env::var("CAMELID_X86_Q8_ATTENTION_OUTPUT_PACKED_ROWS4_MATMUL").is_err());
         assert!(env::var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER").is_err());
         assert!(env::var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUP_CHUNKING").is_err());
+        assert!(env::var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUPS_PER_CHUNK").is_err());
         assert!(env::var("CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL").is_err());
         assert!(env::var("CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING").is_err());
+        assert!(env::var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUPS_PER_CHUNK").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_DECODE_CHAIN").is_err());
@@ -1499,6 +1576,7 @@ mod tests {
         assert!(env::var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_PREFILL").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_SCHED").is_err());
+        assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_AVX2").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_AMX_PREFILL").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_SINGLE_OWNER").is_err());
@@ -1507,6 +1585,53 @@ mod tests {
         assert!(env::var("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER").is_err());
         assert!(env::var("CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE").is_err());
         assert!(env::var("CAMELID_X86_Q8_PARALLEL_INPUT_QUANTIZE").is_err());
+        clear_profile_env();
+    }
+
+    #[test]
+    fn planner_env_apply_restores_owned_x86_q8_passthrough_knobs() {
+        let _guard = env_lock();
+        clear_profile_env();
+        env::set_var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUPS_PER_CHUNK", "7");
+        env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUPS_PER_CHUNK", "5");
+        env::set_var(
+            "CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS",
+            "3",
+        );
+        let planner_env = PlannerEnv::capture();
+
+        env::set_var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUPS_PER_CHUNK", "99");
+        env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUPS_PER_CHUNK", "99");
+        env::set_var(
+            "CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS",
+            "99",
+        );
+
+        let updates = BTreeMap::from([
+            (
+                "CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUP_CHUNKING",
+                Some("on"),
+            ),
+            (
+                "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING",
+                Some("on"),
+            ),
+            ("CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_SCHED", Some("on")),
+        ]);
+        planner_env.apply(&updates);
+
+        assert_eq!(
+            env::var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUPS_PER_CHUNK").ok(),
+            Some("7".into())
+        );
+        assert_eq!(
+            env::var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUPS_PER_CHUNK").ok(),
+            Some("5".into())
+        );
+        assert_eq!(
+            env::var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS").ok(),
+            Some("3".into())
+        );
         clear_profile_env();
     }
 
