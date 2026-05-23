@@ -37,6 +37,26 @@ const patterns = [
     description: 'Literal EC2 private hostname leaked into durable bundle content',
     regex: /\bip-(?:\d+-){3}\d+\b/g,
   },
+  {
+    id: 'raw_ssh_command',
+    description: 'Raw SSH command leaked into durable bundle content',
+    regex: /(^|[\s"'])ssh\s+(?=[^\n]*(?:-i\b|StrictHostKeyChecking|BatchMode|IdentitiesOnly))[^\n"']*/g,
+  },
+  {
+    id: 'raw_ssh_timeout',
+    description: 'Raw SSH timeout stderr leaked into durable bundle content',
+    regex: /Operation\s+timed\s+out/g,
+  },
+  {
+    id: 'raw_ssh_rc_255',
+    description: 'Raw SSH connection status leaked into durable bundle content',
+    regex: /\brc=25[5]\b/g,
+  },
+  {
+    id: 'ssh_key_path',
+    description: 'SSH private-key path leaked into durable bundle content',
+    regex: /[^\s"']*[.]pem\b/g,
+  },
 ]
 
 await walk(rootDir)
