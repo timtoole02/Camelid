@@ -155,6 +155,22 @@ const spoofedThreeBSourceWrongArtifact = {
 }
 assert.equal(compatibilityHintLabel(findCompatibilityHint(capabilities, spoofedThreeBSourceWrongArtifact)), 'llama32_3b_instruct_q8_0: exact GGUF not verified', '3B source metadata must not override the actual local GGUF filename used by runtime gating')
 assert.equal(isCompatibilitySupportedForModel(capabilities, spoofedThreeBSourceWrongArtifact), false, '3B support must fail closed when source metadata names the exact GGUF but model_path names a neighboring artifact')
+const exactCatalogItemForWrongLocalArtifact = {
+  name: 'Llama 3.2 3B Instruct Q8_0',
+  repo_id: 'bartowski/Llama-3.2-3B-Instruct-GGUF',
+  filename: 'Llama-3.2-3B-Instruct-Q8_0.gguf',
+  quant: 'Q8_0',
+}
+assert.equal(
+  compatibilityHintLabel(findCompatibilityHint(capabilities, spoofedThreeBNameWrongArtifact, exactCatalogItemForWrongLocalArtifact)),
+  'llama32_3b_instruct_q8_0: exact GGUF not verified',
+  '3B catalog metadata must not override a neighboring local/runtime GGUF path when both are present',
+)
+assert.equal(
+  isCompatibilitySupportedForModel(capabilities, spoofedThreeBNameWrongArtifact, exactCatalogItemForWrongLocalArtifact),
+  false,
+  '3B catalog cards must fail closed when the matched local GGUF path is neighboring even if the catalog filename is exact',
+)
 assert.equal(compatibilityHintMatchesExactTarget(capabilities, exactThreeBModel, llama32ThreeBTarget), true, 'ModelsView exact-row matching must accept the canonical 3B row')
 assert.equal(modelRuntimeIdMatches(exactThreeBModel, runtime), true, '3B backend active_model_id must match the selected runtime row')
 assert.equal(isRunnableInCurrentRuntime(exactThreeBModel, runtime), true, '3B runtime readiness must require the active backend row and generation_ready=true')
