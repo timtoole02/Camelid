@@ -6,7 +6,7 @@ Rules:
 - Do not mix evidence across platforms.
 - Ubuntu numbers are Ubuntu-only.
 - Mac numbers are Mac-only.
-- Report Ubuntu validation status as evidence status, not host-access status. If remote validation was not attempted for the current slice, say so; do not imply any negative host-access state unless the canonical SSH probe was run in the same slice and the stderr is captured in the evidence bundle.
+- Report Ubuntu validation status as evidence status, not host-access status. If remote validation was not attempted for the current slice, say so; do not imply any negative host-access state unless the canonical private validation probe was run in the same slice and the stderr is captured in the evidence bundle.
 - Architecture lessons can be shared.
 - Kernel implementations cannot be blindly copied.
 - Mac must not copy AVX2 assumptions.
@@ -150,7 +150,7 @@ Owner: Cross-lane sync owner; Product/ExecutionPlan owner implements UX/runtime 
 
 ## What each lane should not repeat
 
-- Ubuntu: do not benchmark against wrong histories or missing gates; do not proceed without path sanity. If the canonical SSH command was not attempted in the current run, report remote validation as not attempted rather than implying host outage/auth failure.
+- Ubuntu: do not benchmark against wrong histories or missing gates; do not proceed without path sanity. If the canonical private validation probe was not attempted in the current run, report remote validation as not attempted rather than implying host outage/auth failure.
 - Mac: do not promote RSS-only improvements; audit env/config hot-path overhead before trusting kernel wins.
 - Product: do not let runtime path selection become an unobservable env-var pile.
 

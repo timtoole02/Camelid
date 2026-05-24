@@ -135,7 +135,7 @@ The following are intentionally not public contributor requirements:
 
 Public docs may mention that some promotion-grade reruns happen on an approved Ubuntu validation lane, but they should not expose private operator details.
 
-When summarizing Ubuntu validation status, distinguish host access from evidence status. Do not report negative host-access status unless that exact validation attempt was run for the current evidence bundle and the stderr is cited in the bundle. If remote validation was not attempted, say that plainly and keep the claim scoped to the missing evidence, such as "no Ubuntu timing/profiling validation is recorded."
+When summarizing Ubuntu validation status, distinguish host access from evidence status. Do not report negative host-access status unless that exact validation attempt was run for the current evidence bundle and the stderr is cited in the bundle. Treat the operator validation probe as private workflow detail rather than public documentation content. If remote validation was not attempted, say that plainly and keep the claim scoped to the missing evidence, such as "no Ubuntu timing/profiling validation is recorded."
 
 ## Documentation rule of thumb
 

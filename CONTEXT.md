@@ -33,7 +33,7 @@ A comparison run where Camelid and the reference engine execute on the same mach
 _Avoid_: cross-machine performance claims.
 
 **Canonical Ubuntu host report**
-A validation status statement about the canonical Ubuntu host is current only when the project-private SSH command was attempted in the same run and its stderr is cited on failure. If that command was not attempted in the current run, say remote validation was not attempted instead of implying a negative host reachability or authentication status.
+A validation status statement about the canonical Ubuntu host is current only when the project-private validation probe was attempted in the same run and its stderr is cited on failure. If that probe was not attempted in the current run, say remote validation was not attempted instead of implying a negative host reachability or authentication status.
 _Avoid_: publishing private hostnames, key paths, usernames, IP addresses, or stale host-status wording copied from older summaries.
 
 **Tracer bullet**
