@@ -6827,6 +6827,8 @@ textarea.composer-input-assistant {
    while making the primary Camelid chat surface quieter and easier to scan. */
 .main-pane-chat {
   background:
+    radial-gradient(circle at top, color-mix(in srgb, var(--color-camelid-sky) 11%, transparent), transparent 34%),
+    radial-gradient(circle at 18% 12%, color-mix(in srgb, var(--color-camelid-sand) 12%, transparent), transparent 28%),
     linear-gradient(180deg, color-mix(in srgb, var(--color-bg) 92%, var(--color-surface-strong) 8%), var(--color-bg) 78%);
 }
 
@@ -6865,6 +6867,44 @@ textarea.composer-input-assistant {
   max-width: 60ch;
   font-size: 1rem;
   line-height: 1.58;
+}
+
+.chat-stage-ledger {
+  width: min(100%, 860px);
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.chat-stage-ledger-card {
+  display: grid;
+  gap: 5px;
+  padding: 14px 16px;
+  border: 1px solid color-mix(in srgb, var(--color-border-soft) 70%, transparent);
+  border-radius: 18px;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--color-surface) 84%, transparent), color-mix(in srgb, var(--color-chip) 84%, transparent));
+  box-shadow: var(--shadow-inset);
+}
+
+.chat-stage-ledger-card span,
+.composer-kicker {
+  color: var(--color-text-muted);
+  font-size: 0.68rem;
+  font-weight: 760;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.chat-stage-ledger-card strong {
+  color: var(--color-text);
+  font-size: 1rem;
+  line-height: 1.28;
+}
+
+.chat-stage-ledger-card small {
+  color: color-mix(in srgb, var(--color-text-muted) 90%, var(--color-text) 10%);
+  line-height: 1.48;
 }
 
 .chat-readiness-pill-row {
@@ -6912,6 +6952,55 @@ textarea.composer-input-assistant {
   overflow-y: auto;
 }
 
+.composer-assistant-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+
+.composer-assistant-header strong {
+  display: block;
+  color: var(--color-text);
+  font-size: 0.98rem;
+  line-height: 1.3;
+}
+
+.composer-assistant-header small {
+  color: var(--color-text-muted);
+  font-size: 0.8rem;
+  line-height: 1.45;
+  text-align: right;
+}
+
+.composer-assistant-header-stage {
+  margin-bottom: 14px;
+}
+
+.composer-input-shell {
+  border: 1px solid color-mix(in srgb, var(--color-border-soft) 72%, transparent);
+  border-radius: 20px;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--color-bg-elevated) 94%, transparent), color-mix(in srgb, var(--color-surface) 90%, transparent));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
+}
+
+.composer-input-shell:focus-within {
+  border-color: color-mix(in srgb, var(--color-camelid-sky) 62%, var(--color-border-strong) 38%);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-camelid-sky) 12%, transparent);
+}
+
+.composer-input-shell .composer-input-assistant {
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+}
+
+.composer-input-shell-stage {
+  border-radius: 24px;
+}
+
 .chat-layout-empty .composer-assistant-stage-clean .composer-input-assistant-stage,
 .composer-assistant-floating .composer-input-assistant {
   min-height: 78px;
@@ -6926,6 +7015,17 @@ textarea.composer-input-assistant {
 .composer-send-button {
   min-width: 86px;
   border-radius: 14px;
+}
+
+.composer-assistant-status-copy {
+  margin: 6px 0 0;
+  color: color-mix(in srgb, var(--color-text-muted) 88%, var(--color-text) 12%);
+  font-size: 0.84rem;
+  line-height: 1.48;
+}
+
+.composer-assistant-status-copy-floating {
+  margin-top: 4px;
 }
 
 .chat-thread-assistant {
@@ -7025,11 +7125,24 @@ textarea.composer-input-assistant {
     max-width: 36ch;
   }
 
+  .chat-stage-ledger {
+    grid-template-columns: 1fr;
+  }
+
   .chat-readiness-pill-row,
   .composer-assistant-footer,
   .composer-assistant-footer-stage-clean {
     flex-direction: column;
     align-items: stretch;
+  }
+
+  .composer-assistant-header {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .composer-assistant-header small {
+    text-align: left;
   }
 
   .composer-assistant-actions,

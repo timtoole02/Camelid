@@ -589,6 +589,7 @@ export default function ChatWorkspace({
   const canSubmit = Boolean(composer.trim()) && selectedModelRunnable && !generationActive
   const capabilityLaneStatus = getChatCapabilityLaneCopy(selectedChatGate, capabilities)
   const selectedModelName = selectedModel?.name || selectedModelId || 'No model selected'
+  const selectedModelShortName = clampText(selectedModelName, 40)
   const runtimeStatusLabel = apiUnavailable
     ? 'API unavailable'
     : selectedModelRunnable
@@ -696,6 +697,19 @@ export default function ChatWorkspace({
     blocked: supportBlocked,
     waiting: Boolean(selectedModel),
   })
+  const composerStatusLabel = selectedModelRunnable
+    ? 'Ready for Camelid chat'
+    : apiUnavailable
+      ? 'Waiting for local API'
+      : supportBlocked
+        ? 'Support contract still gated'
+        : selectedModel
+          ? 'Local model still preparing'
+          : 'Choose a model first'
+  const composerStatusCopy = selectedModelRunnable
+    ? `Using ${selectedModelShortName}.`
+    : selectedModelGateSummary
+  const composerShortcutHint = generationActive ? 'Response in progress' : 'Enter to send · Shift+Enter for a new line'
   const handleDemoPrompt = (prompt) => {
     if (generationActive || !selectedModelRunnable) return
     setComposer(prompt)
@@ -813,6 +827,19 @@ export default function ChatWorkspace({
                 />
               )}
 
+              <div className="chat-stage-ledger" aria-label="Current Camelid chat setup">
+                <div className="chat-stage-ledger-card">
+                  <span>Next chat</span>
+                  <strong>{selectedModelShortName}</strong>
+                  <small>{composerStatusLabel}</small>
+                </div>
+                <div className="chat-stage-ledger-card">
+                  <span>Boundary</span>
+                  <strong>{runtimeStatusLabel}</strong>
+                  <small>{readinessFinePrint}</small>
+                </div>
+              </div>
+
               {selectedModelRunnable && (
                 <div className="demo-prompt-panel" aria-label="Prompt starters">
                   <span>Prompt starters</span>
@@ -827,7 +854,16 @@ export default function ChatWorkspace({
               )}
 
               <div className="composer composer-assistant composer-assistant-stage composer-assistant-stage-clean composer-assistant-product">
-                <textarea ref={composerRef} className="composer-input composer-input-assistant composer-input-assistant-stage" aria-label="Message Camelid" aria-describedby={composerReadinessId} value={composer} onChange={(e) => setComposer(e.target.value)} onKeyDown={handleComposerKeyDown} rows={2} placeholder={selectedModelRunnable ? 'Message Camelid…' : apiUnavailable ? 'Camelid API unavailable' : 'Load a model first'} disabled={generationActive || !selectedModelRunnable} />
+                <div className="composer-assistant-header composer-assistant-header-stage">
+                  <div>
+                    <span className="composer-kicker">Camelid chat</span>
+                    <strong>{composerStatusLabel}</strong>
+                  </div>
+                  <small>{composerShortcutHint}</small>
+                </div>
+                <div className="composer-input-shell composer-input-shell-stage">
+                  <textarea ref={composerRef} className="composer-input composer-input-assistant composer-input-assistant-stage" aria-label="Message Camelid" aria-describedby={composerReadinessId} value={composer} onChange={(e) => setComposer(e.target.value)} onKeyDown={handleComposerKeyDown} rows={2} placeholder={selectedModelRunnable ? 'Message Camelid…' : apiUnavailable ? 'Camelid API unavailable' : 'Load a model first'} disabled={generationActive || !selectedModelRunnable} />
+                </div>
                 <div className="composer-assistant-footer composer-assistant-footer-stage composer-assistant-footer-stage-clean">
                   <div className="composer-assistant-tools composer-assistant-tools-stage composer-assistant-tools-stage-clean">
                     {renderModelPicker()}
@@ -838,6 +874,7 @@ export default function ChatWorkspace({
                   </div>
                 </div>
                 <p id={composerReadinessId} className={`composer-assistant-readiness-note is-${readinessState}`}>{readinessFinePrint}</p>
+                <p className="composer-assistant-status-copy">{composerStatusCopy}</p>
                 {!selectedModelRunnable && <p className="composer-assistant-readiness-detail">{selectedModelGateSummary}</p>}
               </div>
             </div>
@@ -898,7 +935,16 @@ export default function ChatWorkspace({
 
       {!isFreshThread && (
         <div className="composer composer-assistant composer-assistant-floating">
-          <textarea ref={composerRef} className="composer-input composer-input-assistant" aria-label="Message Camelid" aria-describedby={composerReadinessId} value={composer} onChange={(e) => setComposer(e.target.value)} onKeyDown={handleComposerKeyDown} rows={3} placeholder={selectedModelRunnable ? 'Message Camelid…' : apiUnavailable ? 'Camelid API unavailable' : 'Choose a ready model first'} disabled={generationActive || !selectedModelRunnable} />
+          <div className="composer-assistant-header">
+            <div>
+              <span className="composer-kicker">Camelid chat</span>
+              <strong>{composerStatusLabel}</strong>
+            </div>
+            <small>{composerShortcutHint}</small>
+          </div>
+          <div className="composer-input-shell">
+            <textarea ref={composerRef} className="composer-input composer-input-assistant" aria-label="Message Camelid" aria-describedby={composerReadinessId} value={composer} onChange={(e) => setComposer(e.target.value)} onKeyDown={handleComposerKeyDown} rows={3} placeholder={selectedModelRunnable ? 'Message Camelid…' : apiUnavailable ? 'Camelid API unavailable' : 'Choose a ready model first'} disabled={generationActive || !selectedModelRunnable} />
+          </div>
           <div className="composer-assistant-footer">
             <div className="composer-assistant-tools">
               {renderModelPicker()}
@@ -911,6 +957,7 @@ export default function ChatWorkspace({
             </div>
           </div>
           <p id={composerReadinessId} className={`composer-assistant-readiness-note composer-assistant-readiness-note-floating is-${readinessState}`}>{readinessFinePrint}</p>
+          <p className="composer-assistant-status-copy composer-assistant-status-copy-floating">{composerStatusCopy}</p>
           {!selectedModelRunnable && <p className="composer-assistant-readiness-detail composer-assistant-readiness-detail-floating">{selectedModelGateSummary}</p>}
         </div>
       )}
