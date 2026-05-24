@@ -13,6 +13,11 @@ use std::sync::OnceLock;
 use rayon::prelude::*;
 use serde::Serialize;
 
+#[cfg(target_arch = "x86")]
+use std::arch::x86::{__m128i, __m256i};
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::{__m128i, __m256i};
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::execution_plan::MAC_Q8_PREFILL_I8MM_MIN_ROWS;
 use crate::metal;
@@ -8734,7 +8739,7 @@ fn q8_0_packed_rows4_single_input_projection_into_with_decode_chunking(
     let compute_group = |group_idx: usize, output_chunk: &mut [f32]| {
         let group_start = group_idx * blocks_per_row;
         let group_blocks = &packed.blocks[group_start..group_start + blocks_per_row];
-        let sums = q8_0_packed_rows4_dot_i8_matmul(group_blocks, quantized_input, use_hoisted_avx2);
+        let sums = q8_0_packed_rows4_dot_i8_decode(group_blocks, quantized_input, use_hoisted_avx2);
         output_chunk.copy_from_slice(&sums);
     };
 
@@ -8905,9 +8910,9 @@ fn q8_0_packed_rows4_single_input_projection_pair_into_with_decode_chunking(
         let left_blocks = &left_packed.blocks[group_start..group_start + blocks_per_row];
         let right_blocks = &right_packed.blocks[group_start..group_start + blocks_per_row];
         let left_sums =
-            q8_0_packed_rows4_dot_i8_matmul(left_blocks, quantized_input, use_hoisted_avx2);
+            q8_0_packed_rows4_dot_i8_decode(left_blocks, quantized_input, use_hoisted_avx2);
         let right_sums =
-            q8_0_packed_rows4_dot_i8_matmul(right_blocks, quantized_input, use_hoisted_avx2);
+            q8_0_packed_rows4_dot_i8_decode(right_blocks, quantized_input, use_hoisted_avx2);
         left_chunk.copy_from_slice(&left_sums);
         right_chunk.copy_from_slice(&right_sums);
     };
@@ -9089,17 +9094,17 @@ fn q8_0_packed_rows4_single_input_projection_triplet_from_quantized(
                         .enumerate()
                     {
                         let group_start = (first_group_idx + local_group_idx) * blocks_per_row;
-                        q_group.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
+                        q_group.copy_from_slice(&q8_0_packed_rows4_dot_i8_decode(
                             &q_packed.blocks[group_start..group_start + blocks_per_row],
                             quantized_input,
                             use_hoisted_avx2,
                         ));
-                        k_group.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
+                        k_group.copy_from_slice(&q8_0_packed_rows4_dot_i8_decode(
                             &k_packed.blocks[group_start..group_start + blocks_per_row],
                             quantized_input,
                             use_hoisted_avx2,
                         ));
-                        v_group.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
+                        v_group.copy_from_slice(&q8_0_packed_rows4_dot_i8_decode(
                             &v_packed.blocks[group_start..group_start + blocks_per_row],
                             quantized_input,
                             use_hoisted_avx2,
@@ -9114,17 +9119,17 @@ fn q8_0_packed_rows4_single_input_projection_triplet_from_quantized(
                 .enumerate()
                 .for_each(|(group_idx, ((q_chunk, k_chunk), v_chunk))| {
                     let group_start = group_idx * blocks_per_row;
-                    q_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
+                    q_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_decode(
                         &q_packed.blocks[group_start..group_start + blocks_per_row],
                         quantized_input,
                         use_hoisted_avx2,
                     ));
-                    k_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
+                    k_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_decode(
                         &k_packed.blocks[group_start..group_start + blocks_per_row],
                         quantized_input,
                         use_hoisted_avx2,
                     ));
-                    v_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
+                    v_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_decode(
                         &v_packed.blocks[group_start..group_start + blocks_per_row],
                         quantized_input,
                         use_hoisted_avx2,
@@ -9139,17 +9144,17 @@ fn q8_0_packed_rows4_single_input_projection_triplet_from_quantized(
             .enumerate()
         {
             let group_start = group_idx * blocks_per_row;
-            q_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
+            q_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_decode(
                 &q_packed.blocks[group_start..group_start + blocks_per_row],
                 quantized_input,
                 use_hoisted_avx2,
             ));
-            k_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
+            k_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_decode(
                 &k_packed.blocks[group_start..group_start + blocks_per_row],
                 quantized_input,
                 use_hoisted_avx2,
             ));
-            v_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
+            v_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_decode(
                 &v_packed.blocks[group_start..group_start + blocks_per_row],
                 quantized_input,
                 use_hoisted_avx2,
@@ -9158,7 +9163,7 @@ fn q8_0_packed_rows4_single_input_projection_triplet_from_quantized(
     } else {
         for (group_idx, q_chunk) in q_output.chunks_exact_mut(4).enumerate().take(q_groups) {
             let group_start = group_idx * blocks_per_row;
-            q_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
+            q_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_decode(
                 &q_packed.blocks[group_start..group_start + blocks_per_row],
                 quantized_input,
                 use_hoisted_avx2,
@@ -9166,7 +9171,7 @@ fn q8_0_packed_rows4_single_input_projection_triplet_from_quantized(
         }
         for (group_idx, k_chunk) in k_output.chunks_exact_mut(4).enumerate().take(k_groups) {
             let group_start = group_idx * blocks_per_row;
-            k_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
+            k_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_decode(
                 &k_packed.blocks[group_start..group_start + blocks_per_row],
                 quantized_input,
                 use_hoisted_avx2,
@@ -9174,7 +9179,7 @@ fn q8_0_packed_rows4_single_input_projection_triplet_from_quantized(
         }
         for (group_idx, v_chunk) in v_output.chunks_exact_mut(4).enumerate().take(v_groups) {
             let group_start = group_idx * blocks_per_row;
-            v_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
+            v_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_decode(
                 &v_packed.blocks[group_start..group_start + blocks_per_row],
                 quantized_input,
                 use_hoisted_avx2,
@@ -13431,6 +13436,69 @@ fn q8_0_packed_rows4_dot_i8_matmul(
     q8_0_packed_rows4_dot(packed_blocks, input, Q8_0PackedRows4Interleave::I8)
 }
 
+fn q8_0_packed_rows4_dot_i8_decode(
+    packed_blocks: &[Q8_0PackedRows4Block],
+    input: &[Q8_0Block],
+    use_hoisted_avx2: bool,
+) -> [f32; 4] {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if use_hoisted_avx2 {
+            // SAFETY: `use_hoisted_avx2` is only true after runtime AVX2 detection.
+            return unsafe { q8_0_packed_rows4_dot_i8_decode_avx2(packed_blocks, input) };
+        }
+    }
+    let _ = use_hoisted_avx2;
+    q8_0_packed_rows4_dot(packed_blocks, input, Q8_0PackedRows4Interleave::I8)
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn q8_0_packed_rows4_dot_i8_decode_avx2(
+    packed_blocks: &[Q8_0PackedRows4Block],
+    input: &[Q8_0Block],
+) -> [f32; 4] {
+    unsafe { q8_0_packed_rows4_dot_i8_hoisted_avx2(packed_blocks, input) }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn q8_0_packed_rows4_dot_i8_hoisted_avx2(
+    packed_blocks: &[Q8_0PackedRows4Block],
+    input: &[Q8_0Block],
+) -> [f32; 4] {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{
+        _mm_add_ps, _mm_cvtepi32_ps, _mm_loadu_ps, _mm_mul_ps, _mm_set1_ps, _mm_setzero_ps,
+        _mm_storeu_ps,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::{
+        _mm_add_ps, _mm_cvtepi32_ps, _mm_loadu_ps, _mm_mul_ps, _mm_set1_ps, _mm_setzero_ps,
+        _mm_storeu_ps,
+    };
+
+    debug_assert_eq!(packed_blocks.len(), input.len());
+    let mut sums = _mm_setzero_ps();
+    for (packed_block, input_block) in packed_blocks.iter().zip(input) {
+        let acc = unsafe {
+            q8_0_packed_4x8_block_avx2_accumulator(
+                packed_block.quants.as_ptr(),
+                input_block.quants.as_ptr(),
+            )
+        };
+        let row_sums = unsafe { q8_0_packed_4x8_block_avx2_row_sums(acc) };
+        let scales = unsafe { _mm_loadu_ps(packed_block.scales.as_ptr()) };
+        let input_scale = _mm_set1_ps(input_block.scale);
+        let scaled = _mm_mul_ps(_mm_mul_ps(_mm_cvtepi32_ps(row_sums), scales), input_scale);
+        sums = _mm_add_ps(sums, scaled);
+    }
+
+    let mut output = [0.0_f32; 4];
+    unsafe { _mm_storeu_ps(output.as_mut_ptr(), sums) };
+    output
+}
+
 fn q8_0_packed_rows4_dot_i8_matmul_pair(
     left_packed_blocks: &[Q8_0PackedRows4Block],
     right_packed_blocks: &[Q8_0PackedRows4Block],
@@ -13587,18 +13655,7 @@ unsafe fn q8_0_packed_rows4_dot_i8_avx2(
     packed_blocks: &[Q8_0PackedRows4Block],
     input: &[Q8_0Block],
 ) -> [f32; 4] {
-    debug_assert_eq!(packed_blocks.len(), input.len());
-    let mut sums = [0.0_f32; 4];
-    for (packed_block, input_block) in packed_blocks.iter().zip(input) {
-        let int_sums = unsafe {
-            q8_0_packed_4x8_block_avx2(packed_block.quants.as_ptr(), input_block.quants.as_ptr())
-        };
-        let input_scale = input_block.scale;
-        for lane in 0..4 {
-            sums[lane] += int_sums[lane] as f32 * packed_block.scales[lane] * input_scale;
-        }
-    }
-    sums
+    unsafe { q8_0_packed_rows4_dot_i8_hoisted_avx2(packed_blocks, input) }
 }
 
 fn q8_0_packed_rows4_dot(
@@ -13808,18 +13865,18 @@ unsafe fn q8_0_packed_4x8_block_avx512vnni_dpwssd(packed: *const i8, input: *con
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-unsafe fn q8_0_packed_4x8_block_avx2(packed: *const i8, input: *const i8) -> [i32; 4] {
+unsafe fn q8_0_packed_4x8_block_avx2_accumulator(packed: *const i8, input: *const i8) -> __m256i {
     #[cfg(target_arch = "x86")]
     use std::arch::x86::{
         _mm256_add_epi32, _mm256_broadcastsi128_si256, _mm256_loadu_si256, _mm256_madd_epi16,
         _mm256_maddubs_epi16, _mm256_set1_epi16, _mm256_setzero_si256, _mm256_sign_epi8,
-        _mm256_storeu_si256, _mm_loadl_epi64, _mm_unpacklo_epi64,
+        _mm_loadl_epi64, _mm_unpacklo_epi64,
     };
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::{
         _mm256_add_epi32, _mm256_broadcastsi128_si256, _mm256_loadu_si256, _mm256_madd_epi16,
         _mm256_maddubs_epi16, _mm256_set1_epi16, _mm256_setzero_si256, _mm256_sign_epi8,
-        _mm256_storeu_si256, _mm_loadl_epi64, _mm_unpacklo_epi64,
+        _mm_loadl_epi64, _mm_unpacklo_epi64,
     };
 
     let ones = _mm256_set1_epi16(1);
@@ -13840,16 +13897,44 @@ unsafe fn q8_0_packed_4x8_block_avx2(packed: *const i8, input: *const i8) -> [i3
         );
     }
 
-    let mut lanes = [0_i32; 8];
-    unsafe {
-        _mm256_storeu_si256(lanes.as_mut_ptr().cast(), acc);
-    }
-    [
-        lanes[0] + lanes[1],
-        lanes[2] + lanes[3],
-        lanes[4] + lanes[5],
-        lanes[6] + lanes[7],
-    ]
+    acc
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn q8_0_packed_4x8_block_avx2_row_sums(acc: __m256i) -> __m128i {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{
+        _mm256_castsi256_si128, _mm256_extracti128_si256, _mm_hadd_epi32, _mm_setzero_si128,
+        _mm_unpacklo_epi64,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::{
+        _mm256_castsi256_si128, _mm256_extracti128_si256, _mm_hadd_epi32, _mm_setzero_si128,
+        _mm_unpacklo_epi64,
+    };
+
+    let zero = _mm_setzero_si128();
+    let lo = _mm256_castsi256_si128(acc);
+    let hi = _mm256_extracti128_si256::<1>(acc);
+    let lo = _mm_hadd_epi32(lo, zero);
+    let hi = _mm_hadd_epi32(hi, zero);
+    _mm_unpacklo_epi64(lo, hi)
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn q8_0_packed_4x8_block_avx2(packed: *const i8, input: *const i8) -> [i32; 4] {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::_mm_storeu_si128;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::_mm_storeu_si128;
+
+    let acc = unsafe { q8_0_packed_4x8_block_avx2_accumulator(packed, input) };
+    let rows = unsafe { q8_0_packed_4x8_block_avx2_row_sums(acc) };
+    let mut sums = [0_i32; 4];
+    unsafe { _mm_storeu_si128(sums.as_mut_ptr().cast(), rows) };
+    sums
 }
 
 fn accumulate_q8_0_block_dot_quantized_cpu(
