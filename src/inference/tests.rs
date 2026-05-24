@@ -3115,6 +3115,106 @@ fn q8_attention_qkv_prefill_consumer_gate_is_default_off() {
     std::env::remove_var("CAMELID_X86_Q8_ATTENTION_QKV_PREFILL_CONSUMER");
 }
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[test]
+fn q8_attention_qkv_prefill_route_resolver_records_route_and_denials() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+    std::env::set_var(Q8_SCHEDULE_TELEMETRY_ENV, "on");
+    reset_q8_schedule_telemetry();
+
+    let (_decode_input, q_weight, _q_expected) =
+        runtime_packed_attention_projection_case("attention_q", "blk.0.attn_q.weight");
+    let (_, k_weight, _k_expected) =
+        runtime_packed_attention_projection_case("attention_k", "blk.0.attn_k.weight");
+    let (_, v_weight, _v_expected) =
+        runtime_packed_attention_projection_case("attention_v", "blk.0.attn_v.weight");
+    let input_width = q_weight.dim(0).unwrap();
+    let output_width = q_weight.dim(1).unwrap();
+    let rows = 3;
+    let prefill_input = CpuTensor::from_f32(
+        "prefill_qkv_context",
+        vec![rows, input_width],
+        (0..rows * input_width)
+            .map(|idx| {
+                ((idx % input_width) as f32 - 13.0) * 0.078125
+                    + (idx / input_width) as f32 * 0.046875
+            })
+            .collect(),
+    )
+    .unwrap();
+    let route_name = X86Q8AttentionQkvRouteKind::PackedRows4Matmul.telemetry_name();
+
+    let route = resolve_x86_q8_attention_qkv_route(
+        &prefill_input,
+        &q_weight,
+        &k_weight,
+        &v_weight,
+        &attention_qkv_packed_rows4_matmul_plan(true),
+        X86Q8AttentionQkvRouteKind::PackedRows4Matmul,
+    )
+    .unwrap()
+    .expect("prefill route should accept multi-row runtime-packed Q/K/V weights");
+    assert_eq!(route.rows, rows);
+    assert_eq!(route.input_width, input_width);
+    assert_eq!(route.q_width, output_width);
+
+    assert!(resolve_x86_q8_attention_qkv_route(
+        &CpuTensor::from_f32(
+            "decode_qkv_context",
+            vec![1, input_width],
+            vec![0.0; input_width],
+        )
+        .unwrap(),
+        &q_weight,
+        &k_weight,
+        &v_weight,
+        &attention_qkv_packed_rows4_matmul_plan(true),
+        X86Q8AttentionQkvRouteKind::PackedRows4Matmul,
+    )
+    .unwrap()
+    .is_none());
+    assert!(resolve_x86_q8_attention_qkv_route(
+        &prefill_input,
+        &q_weight,
+        &k_weight,
+        &v_weight,
+        &attention_qkv_packed_rows4_matmul_plan(false),
+        X86Q8AttentionQkvRouteKind::PackedRows4Matmul,
+    )
+    .unwrap()
+    .is_none());
+
+    let (q, k, v) = try_x86_q8_attention_qkv_packed_rows4_matmul_path(
+        &prefill_input,
+        &q_weight,
+        &k_weight,
+        &v_weight,
+        &attention_qkv_packed_rows4_matmul_plan(true),
+    )
+    .unwrap()
+    .expect("prefill route should produce shared Q/K/V outputs");
+    assert_eq!(q.shape.dims, vec![rows, output_width]);
+    assert_eq!(k.shape.dims, q.shape.dims);
+    assert_eq!(v.shape.dims, q.shape.dims);
+
+    let telemetry = snapshot_q8_schedule_telemetry();
+    let by_route = telemetry
+        .output_projection_by_route
+        .get(&format!("attention_qkv.{route_name}"))
+        .expect("attention QKV prefill route telemetry");
+    assert_eq!(by_route.calls, 1);
+    assert_eq!(by_route.rows, rows as u64);
+    assert_eq!(by_route.input_width, input_width as u64);
+    assert_eq!(by_route.output_width, output_width as u64);
+    assert!(telemetry
+        .projection_route_denials
+        .contains_key(&format!("attention_qkv.{route_name}.decode_or_empty_input")));
+
+    reset_q8_schedule_telemetry();
+    std::env::remove_var(Q8_SCHEDULE_TELEMETRY_ENV);
+}
+
 #[test]
 fn q8_attention_qkv_packed_rows4_matmul_matches_runtime_packed_baseline_for_prefill() {
     let _env_guard = env_lock();
