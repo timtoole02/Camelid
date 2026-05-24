@@ -41,7 +41,9 @@ pub use diagnostic_config::{
 };
 pub use kv_cache::{LlamaKvCache, LlamaKvCachePlan, LlamaKvCachePositionTrace, LlamaKvCacheTrace};
 pub use q8_block_reader::Q8BlockReader;
-use q8_routes::{q8_schedule_output_projection_route_kind, q8_schedule_role_for_output_name};
+use q8_routes::q8_schedule_output_projection_route_kind;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use q8_routes::q8_schedule_role_for_output_name;
 use q8_runtime::{
     q8_0_env_flag_disabled, q8_0_env_flag_enabled_default_off,
     q8_0_env_flag_enabled_default_on_fail_closed, Q8RuntimeFlags, ResolvedRuntimePlan,
