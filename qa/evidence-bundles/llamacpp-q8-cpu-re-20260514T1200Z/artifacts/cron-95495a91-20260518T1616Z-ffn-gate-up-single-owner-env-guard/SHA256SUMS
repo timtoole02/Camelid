@@ -1,5 +1,2 @@
-9faaeb98f6a4db611a4f6c5d9b4251e9f44358b9a144096106b5dfa6e3080d59  qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260518T1616Z-ffn-gate-up-single-owner-env-guard/README.md
-7bc6d1bc76286d788a2d822f1f3aef5bbbc4e1c26f4143d59c945c12d560b4ec  qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260518T1616Z-ffn-gate-up-single-owner-env-guard/logs/dirty-diff.log
-32d66b6abb45b49dc4fcdd15935e9229ef611577196f829a64a594885646440b  qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260518T1616Z-ffn-gate-up-single-owner-env-guard/logs/local-execution-plan-gate.log
-47769c4d571101df81ff1a5a9e4158e77dad9e841f944c2d41f63abb2619def3  qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260518T1616Z-ffn-gate-up-single-owner-env-guard/logs/local-ffn-gate-up-default-off-gate.log
-0ccc17b391a68509e9522e763da3c261f8bbcd0524280105dbfe7dfa28a02e36  qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260518T1616Z-ffn-gate-up-single-owner-env-guard/logs/ubuntu-rust-version.log
+7a93bb02cb0d4355326c3b5fdc227b0e4cc9c276974c949df8fe4f536c8c6c4f  qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260518T1616Z-ffn-gate-up-single-owner-env-guard/README.md
+be06b2b4a4c2da18800f2e3abd83189f90ab749bdda762bf50bd272499adbcf8  qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260518T1616Z-ffn-gate-up-single-owner-env-guard/logs/ubuntu-rust-version.log

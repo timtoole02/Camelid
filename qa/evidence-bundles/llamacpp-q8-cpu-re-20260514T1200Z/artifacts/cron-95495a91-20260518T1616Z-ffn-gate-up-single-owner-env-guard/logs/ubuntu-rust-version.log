@@ -1,0 +1,18 @@
+Ubuntu x86_64 validation refresh: 2026-05-24
+Environment gate:
+- Linux x86_64
+
+Validated Rustup toolchain:
+- cargo 1.87.0 (99624be96 2025-05-06)
+- rustc 1.87.0 (17067e9ac 2025-05-09)
+
+Validated shared-target gates:
+- ./scripts/with-rustup-cargo.sh +1.87.0 fmt --all -- --check -> pass
+- ./scripts/with-rustup-cargo.sh +1.87.0 test --lib planner_env_apply_clears_stale_x86_q8_decode_consumer_flags -- --nocapture -> pass
+- ./scripts/with-rustup-cargo.sh +1.87.0 test --lib ubuntu_experimental_validated_gates_select_rust_avx2_q8_path -- --nocapture -> pass
+- ./scripts/with-rustup-cargo.sh +1.87.0 test --lib q8_ffn_gate_up_single_owner_is_default_off_and_requires_runtime_storage -- --nocapture -> pass
+- ./scripts/with-rustup-cargo.sh +1.87.0 build --release --bin camelid -> pass
+
+Notes:
+- The validated lane used the repo Rustup wrapper instead of the host-default cargo.
+- Shared external Cargo target storage remained in use; no per-worktree target directory was retained for the run.

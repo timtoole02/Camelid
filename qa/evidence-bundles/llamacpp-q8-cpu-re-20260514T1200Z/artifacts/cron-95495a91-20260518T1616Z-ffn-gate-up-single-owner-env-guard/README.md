@@ -17,7 +17,14 @@ Sharpen the Ubuntu/Linux x86_64 Q8 execution-plan feedback loop for active Q8 pe
 ## Gates
 - Local: `cargo fmt --check && cargo test execution_plan --lib` — pass.
 - Local: `cargo test q8_ffn_gate_up_single_owner_is_default_off_and_requires_runtime_storage --lib` — pass.
-- Ubuntu access: SSH worked with the requested exact shape. Host Rust toolchain is `rustc 1.75.0` / `cargo 1.75.0`, below repo `rust-version = 1.87`, so Rust gates were not run on Ubuntu without changing the host toolchain.
+- Ubuntu x86_64 validation refresh on 2026-05-24:
+  - `./scripts/with-rustup-cargo.sh +1.87.0 fmt --all -- --check` — pass.
+  - `./scripts/with-rustup-cargo.sh +1.87.0 test --lib planner_env_apply_clears_stale_x86_q8_decode_consumer_flags -- --nocapture` — pass.
+  - `./scripts/with-rustup-cargo.sh +1.87.0 test --lib ubuntu_experimental_validated_gates_select_rust_avx2_q8_path -- --nocapture` — pass.
+  - `./scripts/with-rustup-cargo.sh +1.87.0 test --lib q8_ffn_gate_up_single_owner_is_default_off_and_requires_runtime_storage -- --nocapture` — pass.
+  - `./scripts/with-rustup-cargo.sh +1.87.0 build --release --bin camelid` — pass.
+  - Environment gate and toolchain summary: `uname -sm` returned `Linux x86_64`; the validated wrapper reported `cargo 1.87.0` and `rustc 1.87.0`; the run stayed on the shared external target lane only.
+- Historical note: the host-default Rust installation previously observed on this lane was too old for the repo lockfile/MSRV, but the current validated path uses the repo's Rustup wrapper rather than the host-default cargo.
 
 ## Retain/reject
-Retain as a default-off backend control-plane guard. This is parity/performance-lane hygiene only: it prevents accidental gate leakage and does not claim throughput, parity-envelope expansion, frontend/API support, or public support widening.
+Retain as a default-off backend control-plane guard with fresh Ubuntu x86_64 validation. This is parity/performance-lane hygiene only: it prevents accidental gate leakage and does not claim throughput, parity-envelope expansion, frontend/API support, or public support widening.
