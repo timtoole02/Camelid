@@ -24,8 +24,20 @@ mod q8_runtime;
 mod q8_telemetry;
 mod rope;
 
-#[cfg(test)]
-use diagnostic_config::diagnostic_zero_delta_value;
+use crate::{
+    gguf::GgufTensorType,
+    model::{
+        DenseLlamaDims, LlamaFfnTensors, LlamaModelConfig, LlamaMoeExpertTensors,
+        LlamaTensorBinding,
+    },
+    tensor::{
+        dot_product, parse_byte_count_env, q8_0_file_read_stats, should_parallelize_linear_output,
+        with_q8_file_cache_capacity_override, CpuTensor, Q8_0Block, Q8_0FileBacking,
+        Q8_0FileReadStats, Q8_0PackedRows4, Q8_0PackedRows4Block, Q8_0PackedRows4Interleave,
+        Q8_0RuntimeStorage, Q8_0VnniPacked, Q8_0VnniTile16, TensorShape, TensorStore,
+    },
+    BackendError, Result,
+};
 use diagnostic_config::{
     apply_ffn_gate_up_order, attention_score_scale_value, map_attention_head_to_kv_head,
 };
@@ -58,26 +70,6 @@ pub use rope::{
     diagnostic_rope_direction, diagnostic_rope_pairing, diagnostic_rope_position_mode,
     RopeDirection, RopePairing, RopePositionMode,
 };
-#[cfg(test)]
-use rope::{RopeScaling, RopeScalingKind};
-
-use crate::{
-    gguf::GgufTensorType,
-    model::{
-        DenseLlamaDims, LlamaFfnTensors, LlamaModelConfig, LlamaMoeExpertTensors,
-        LlamaTensorBinding,
-    },
-    tensor::{
-        dot_product, parse_byte_count_env, q8_0_file_read_stats, should_parallelize_linear_output,
-        with_q8_file_cache_capacity_override, CpuTensor, Q8_0Block, Q8_0FileBacking,
-        Q8_0FileReadStats, Q8_0PackedRows4, Q8_0PackedRows4Block, Q8_0PackedRows4Interleave,
-        Q8_0RuntimeStorage, Q8_0VnniPacked, Q8_0VnniTile16, TensorShape, TensorStore,
-    },
-    BackendError, Result,
-};
-
-#[cfg(test)]
-use crate::tensor::record_q8_0_file_read;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use crate::tensor::Q8_0AmxPackedBlock;
@@ -3945,11 +3937,6 @@ fn require_matrix_shape(
     Ok(())
 }
 
-#[cfg(test)]
-fn linear(input: &CpuTensor, weight: &CpuTensor, name: impl Into<String>) -> Result<CpuTensor> {
-    linear_for_role(input, weight, name, "linear")
-}
-
 fn linear_runtime(
     input: &CpuTensor,
     weight: &CpuTensor,
@@ -6886,24 +6873,6 @@ struct QuantizedQ8_0Row {
     blocks: Vec<Q8_0Block>,
 }
 
-#[cfg(test)]
-struct BorrowedQuantizedQ8_0Rows<'a> {
-    blocks_per_row: usize,
-    blocks: &'a [Q8_0Block],
-}
-
-#[cfg(test)]
-impl BorrowedQuantizedQ8_0Rows<'_> {
-    fn row(&self, row: usize) -> &[Q8_0Block] {
-        let start = row * self.blocks_per_row;
-        &self.blocks[start..start + self.blocks_per_row]
-    }
-
-    fn rows(&self) -> impl ExactSizeIterator<Item = &[Q8_0Block]> {
-        self.blocks.chunks_exact(self.blocks_per_row)
-    }
-}
-
 fn try_x86_q8_output_packed_rows4_matmul_path(
     input: &CpuTensor,
     weight: &CpuTensor,
@@ -9303,17 +9272,6 @@ fn x86_q8_parallel_matmul_input_quantize_enabled() -> bool {
     }
 }
 
-#[cfg(test)]
-fn q8_0_quantized_matmul_input_rows(
-    input: &CpuTensor,
-    blocks_per_row: usize,
-) -> Result<Vec<Q8_0Block>> {
-    let rows = input.dim(0)?;
-    let mut quantized_inputs = Vec::with_capacity(rows * blocks_per_row);
-    q8_0_fill_quantized_matmul_input_rows(input, blocks_per_row, &mut quantized_inputs)?;
-    Ok(quantized_inputs)
-}
-
 fn with_q8_0_quantized_matmul_input_rows<T>(
     input: &CpuTensor,
     blocks_per_row: usize,
@@ -10854,25 +10812,6 @@ fn quantize_q8_0_row(input: &[f32]) -> QuantizedQ8_0Row {
     }
 }
 
-#[cfg(test)]
-fn quantize_q8_0_rows_into<'a>(
-    input: &CpuTensor,
-    input_width: usize,
-    blocks: &'a mut Vec<Q8_0Block>,
-) -> Result<BorrowedQuantizedQ8_0Rows<'a>> {
-    let rows = input.dim(0)?;
-    let blocks_per_row = input_width / Q8_0_BLOCK_VALUES;
-    blocks.clear();
-    blocks.reserve(rows * blocks_per_row);
-    for row in input.data.chunks_exact(input_width) {
-        quantize_q8_0_blocks_into(row, blocks);
-    }
-    Ok(BorrowedQuantizedQ8_0Rows {
-        blocks_per_row,
-        blocks,
-    })
-}
-
 fn quantize_q8_0_blocks(input: &[f32]) -> Vec<Q8_0Block> {
     let mut blocks = Vec::with_capacity(input.len() / Q8_0_BLOCK_VALUES);
     quantize_q8_0_blocks_into(input, &mut blocks);
@@ -11549,20 +11488,6 @@ fn matmul_rhs_transposed_q8_0_packed_rows4_f32_input(
         );
     }
     CpuTensor::from_f32(name, vec![rows, output_width], output)
-}
-
-#[cfg(test)]
-fn dot_q8_0_encoded_row(input: &[Q8_0Block], row_bytes: &[u8]) -> f32 {
-    let mut sum = 0.0_f32;
-    for (input_block, block) in input
-        .iter()
-        .zip(row_bytes.chunks_exact(Q8BlockReader::BLOCK_SIZE_BYTES))
-    {
-        let scale = f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
-        let int_sum = q8_0_block_int_dot_horizontal_sum_encoded(&block[2..], &input_block.quants);
-        sum += int_sum as f32 * scale * input_block.scale;
-    }
-    sum
 }
 
 fn decode_q8_0_encoded_row_scales(row_bytes: &[u8], scales: &mut [f32]) {
@@ -12578,15 +12503,6 @@ fn with_q8_0_file_reader_output_chunk<T>(
         cap_q8_0_file_reader_scratch(&mut output_chunk, len);
         result
     })
-}
-
-#[cfg(test)]
-fn q8_0_file_reader_scratch_capacities() -> (usize, usize, usize, usize) {
-    let row_chunk = Q8_0_FILE_READER_ROW_CHUNK.with(|cell| cell.borrow().capacity());
-    let chunk_scales = Q8_0_FILE_READER_CHUNK_SCALES.with(|cell| cell.borrow().capacity());
-    let quantized_inputs = Q8_0_FILE_READER_QUANTIZED_INPUTS.with(|cell| cell.borrow().capacity());
-    let output_chunk = Q8_0_FILE_READER_OUTPUT_CHUNK.with(|cell| cell.borrow().capacity());
-    (row_chunk, chunk_scales, quantized_inputs, output_chunk)
 }
 
 fn should_parallelize_q8_0_file_reader_output(output_width: usize) -> bool {

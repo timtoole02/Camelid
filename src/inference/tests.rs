@@ -1,4 +1,9 @@
 use super::*;
+use super::{
+    diagnostic_config::diagnostic_zero_delta_value,
+    rope::{RopeScaling, RopeScalingKind},
+};
+use crate::tensor::record_q8_0_file_read;
 use crate::test_support::env_lock;
 use std::io::Write;
 
@@ -37,6 +42,75 @@ fn no_rope_scaling() -> RopeScaling {
         low_freq_factor: None,
         high_freq_factor: None,
     }
+}
+
+fn linear(input: &CpuTensor, weight: &CpuTensor, name: impl Into<String>) -> Result<CpuTensor> {
+    linear_for_role(input, weight, name, "linear")
+}
+
+struct BorrowedQuantizedQ8_0Rows<'a> {
+    blocks_per_row: usize,
+    blocks: &'a [Q8_0Block],
+}
+
+impl BorrowedQuantizedQ8_0Rows<'_> {
+    fn row(&self, row: usize) -> &[Q8_0Block] {
+        let start = row * self.blocks_per_row;
+        &self.blocks[start..start + self.blocks_per_row]
+    }
+
+    fn rows(&self) -> impl ExactSizeIterator<Item = &[Q8_0Block]> {
+        self.blocks.chunks_exact(self.blocks_per_row)
+    }
+}
+
+fn q8_0_quantized_matmul_input_rows(
+    input: &CpuTensor,
+    blocks_per_row: usize,
+) -> Result<Vec<Q8_0Block>> {
+    let rows = input.dim(0)?;
+    let mut quantized_inputs = Vec::with_capacity(rows * blocks_per_row);
+    q8_0_fill_quantized_matmul_input_rows(input, blocks_per_row, &mut quantized_inputs)?;
+    Ok(quantized_inputs)
+}
+
+fn quantize_q8_0_rows_into<'a>(
+    input: &CpuTensor,
+    input_width: usize,
+    blocks: &'a mut Vec<Q8_0Block>,
+) -> Result<BorrowedQuantizedQ8_0Rows<'a>> {
+    let rows = input.dim(0)?;
+    let blocks_per_row = input_width / Q8_0_BLOCK_VALUES;
+    blocks.clear();
+    blocks.reserve(rows * blocks_per_row);
+    for row in input.data.chunks_exact(input_width) {
+        quantize_q8_0_blocks_into(row, blocks);
+    }
+    Ok(BorrowedQuantizedQ8_0Rows {
+        blocks_per_row,
+        blocks,
+    })
+}
+
+fn dot_q8_0_encoded_row(input: &[Q8_0Block], row_bytes: &[u8]) -> f32 {
+    let mut sum = 0.0_f32;
+    for (input_block, block) in input
+        .iter()
+        .zip(row_bytes.chunks_exact(Q8BlockReader::BLOCK_SIZE_BYTES))
+    {
+        let scale = f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let int_sum = q8_0_block_int_dot_horizontal_sum_encoded(&block[2..], &input_block.quants);
+        sum += int_sum as f32 * scale * input_block.scale;
+    }
+    sum
+}
+
+fn q8_0_file_reader_scratch_capacities() -> (usize, usize, usize, usize) {
+    let row_chunk = Q8_0_FILE_READER_ROW_CHUNK.with(|cell| cell.borrow().capacity());
+    let chunk_scales = Q8_0_FILE_READER_CHUNK_SCALES.with(|cell| cell.borrow().capacity());
+    let quantized_inputs = Q8_0_FILE_READER_QUANTIZED_INPUTS.with(|cell| cell.borrow().capacity());
+    let output_chunk = Q8_0_FILE_READER_OUTPUT_CHUNK.with(|cell| cell.borrow().capacity());
+    (row_chunk, chunk_scales, quantized_inputs, output_chunk)
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
