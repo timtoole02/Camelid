@@ -784,29 +784,6 @@ fn q8_schedule_output_projection_route_kind(
     }
 }
 
-#[allow(dead_code)]
-fn q8_schedule_role_for_output_name(name: &str) -> &'static str {
-    if name.contains("attention_q") || name.contains("attn_q") {
-        "attention_q"
-    } else if name.contains("attention_k") || name.contains("attn_k") {
-        "attention_k"
-    } else if name.contains("attention_v") || name.contains("attn_v") {
-        "attention_v"
-    } else if name.contains("attention_output") || name.contains("attn_output") {
-        "attention_output"
-    } else if name.contains("ffn_gate") {
-        "ffn_gate"
-    } else if name.contains("ffn_up") {
-        "ffn_up"
-    } else if name.contains("ffn_down") {
-        "ffn_down"
-    } else if name.contains("logits") {
-        "logits"
-    } else {
-        "unknown"
-    }
-}
-
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct LlamaLayerTimings {
     pub layer_index: usize,
@@ -7242,21 +7219,6 @@ fn try_x86_q8_attention_qkv_packed_rows4_matmul_path(
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum X86Q8FfnGateUpRouteKind {
-    PackedRows4Matmul,
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-impl X86Q8FfnGateUpRouteKind {
-    fn telemetry_name(self) -> &'static str {
-        match self {
-            Self::PackedRows4Matmul => "packed_rows4_matmul_prefill",
-        }
-    }
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 struct X86Q8FfnGateUpRoute<'a> {
     gate_packed: &'a Q8_0PackedRows4,
     up_packed: &'a Q8_0PackedRows4,
@@ -7779,25 +7741,6 @@ fn q8_0_runtime_packed_projection(
         return Ok(None);
     }
     Ok(Some((packed, output_width)))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum X86Q8FfnDownRouteKind {
-    Decode,
-    PackedRows4Matmul,
-    Gemm4Prefill,
-    SingleOwner,
-}
-
-impl X86Q8FfnDownRouteKind {
-    fn telemetry_name(self) -> &'static str {
-        match self {
-            Self::Decode => "x86_decode_consumer",
-            Self::PackedRows4Matmul => "x86_packed_rows4_matmul",
-            Self::Gemm4Prefill => "x86_gemm4_prefill",
-            Self::SingleOwner => "x86_single_owner",
-        }
-    }
 }
 
 struct X86Q8FfnDownRoute<'a> {

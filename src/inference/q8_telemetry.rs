@@ -110,6 +110,63 @@ pub struct LlamaQ8ProjectionRouteDenialTelemetry {
 
 pub(super) const Q8_SCHEDULE_TELEMETRY_ENV: &str = "CAMELID_Q8_SCHED_TELEMETRY";
 
+#[allow(dead_code)]
+pub(super) fn q8_schedule_role_for_output_name(name: &str) -> &'static str {
+    if name.contains("attention_q") || name.contains("attn_q") {
+        "attention_q"
+    } else if name.contains("attention_k") || name.contains("attn_k") {
+        "attention_k"
+    } else if name.contains("attention_v") || name.contains("attn_v") {
+        "attention_v"
+    } else if name.contains("attention_output") || name.contains("attn_output") {
+        "attention_output"
+    } else if name.contains("ffn_gate") {
+        "ffn_gate"
+    } else if name.contains("ffn_up") {
+        "ffn_up"
+    } else if name.contains("ffn_down") {
+        "ffn_down"
+    } else if name.contains("logits") {
+        "logits"
+    } else {
+        "unknown"
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum X86Q8FfnGateUpRouteKind {
+    PackedRows4Matmul,
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+impl X86Q8FfnGateUpRouteKind {
+    pub(super) fn telemetry_name(self) -> &'static str {
+        match self {
+            Self::PackedRows4Matmul => "packed_rows4_matmul_prefill",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum X86Q8FfnDownRouteKind {
+    Decode,
+    PackedRows4Matmul,
+    Gemm4Prefill,
+    SingleOwner,
+}
+
+impl X86Q8FfnDownRouteKind {
+    pub(super) fn telemetry_name(self) -> &'static str {
+        match self {
+            Self::Decode => "x86_decode_consumer",
+            Self::PackedRows4Matmul => "x86_packed_rows4_matmul",
+            Self::Gemm4Prefill => "x86_gemm4_prefill",
+            Self::SingleOwner => "x86_single_owner",
+        }
+    }
+}
+
 pub(super) static Q8_SCHED_RAYON_FANOUT_BOUNDARIES: AtomicU64 = AtomicU64::new(0);
 pub(super) static Q8_SCHED_I8MM_SINGLE_PROJECTION_CALLS: AtomicU64 = AtomicU64::new(0);
 pub(super) static Q8_SCHED_I8MM_FUSED_GATE_UP_CALLS: AtomicU64 = AtomicU64::new(0);
