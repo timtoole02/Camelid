@@ -1932,15 +1932,15 @@
   margin: 0;
   max-width: 14ch;
   font-size: clamp(2.35rem, 3.8vw, 3.45rem);
-  line-height: 1.02;
-  letter-spacing: 0;
+  line-height: 0.98;
+  letter-spacing: -0.02em;
 }
 
 .chat-empty-hero-clean h2 {
-  max-width: 15ch;
-  font-size: clamp(2.65rem, 4.35vw, 4.15rem);
-  line-height: 1;
-  letter-spacing: 0;
+  max-width: 13ch;
+  font-size: clamp(2.65rem, 4.35vw, 4.4rem);
+  line-height: 0.94;
+  letter-spacing: -0.025em;
 }
 
 .chat-empty-superwordmark {
@@ -2036,10 +2036,10 @@
 }
 
 .chat-empty-hero-clean .hero-summary {
-  max-width: 48ch;
+  max-width: 46ch;
   color: var(--color-text-muted);
-  font-size: 0.98rem;
-  line-height: 1.54;
+  font-size: 1rem;
+  line-height: 1.62;
 }
 
 .chat-empty-stage-product .chat-empty-hero-clean .hero-summary {
@@ -2332,11 +2332,64 @@
   justify-content: center;
 }
 
+.chat-active-toolbar {
+  width: min(100%, 900px);
+  margin: 0 auto 12px;
+  padding: 14px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  border: 1px solid color-mix(in srgb, var(--color-border-soft) 60%, transparent);
+  border-radius: 24px;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--color-surface) 96%, transparent), color-mix(in srgb, var(--color-surface-subtle) 92%, transparent)),
+    radial-gradient(circle at top left, color-mix(in srgb, var(--color-spectrum-yellow) 8%, transparent), transparent 38%);
+  box-shadow: var(--shadow-inset);
+}
+
+.chat-active-toolbar-copy {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.chat-active-toolbar-kicker {
+  color: var(--color-text-muted);
+  font-size: 0.68rem;
+  font-weight: 760;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.chat-active-toolbar-copy strong {
+  color: var(--color-text);
+  font-size: 1rem;
+  font-weight: 650;
+  line-height: 1.2;
+}
+
+.chat-active-toolbar-copy p {
+  margin: 0;
+  color: color-mix(in srgb, var(--color-text-muted) 88%, var(--color-text) 12%);
+  font-size: 0.83rem;
+  line-height: 1.45;
+}
+
+.chat-active-toolbar-controls {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
 .chat-thread-assistant {
   width: min(100%, 760px);
   min-height: 0;
   margin: 0 auto;
-  padding: 18px 0 220px;
+  padding: 8px 0 220px;
   background: transparent;
   overflow: visible;
 }
@@ -2414,7 +2467,7 @@
   margin: 0 auto;
   border: 1px solid color-mix(in srgb, var(--color-border-soft) 64%, transparent);
   border-radius: 24px;
-  background: rgba(36, 36, 36, 0.94);
+  background: color-mix(in srgb, var(--color-composer-surface) 98%, transparent);
   box-shadow: 0 10px 28px rgba(0, 0, 0, 0.16);
   padding: 12px 14px 10px;
 }
@@ -2437,13 +2490,14 @@
 
 .composer-assistant-product {
   width: min(100%, 800px);
-  border-radius: 32px;
+  border-radius: 34px;
   border-color: color-mix(in srgb, var(--color-border-strong) 30%, transparent);
   background:
-    radial-gradient(circle at 18% 0%, color-mix(in srgb, var(--color-info) 9%, transparent), transparent 36%),
+    radial-gradient(circle at 14% 0%, color-mix(in srgb, var(--color-spectrum-yellow) 11%, transparent), transparent 34%),
+    radial-gradient(circle at 88% 100%, color-mix(in srgb, var(--color-spectrum-blue) 8%, transparent), transparent 36%),
     linear-gradient(180deg, color-mix(in srgb, var(--color-surface) 98%, rgba(255, 255, 255, 0.045)), color-mix(in srgb, var(--color-bg-elevated) 88%, transparent));
   box-shadow: 0 28px 78px rgba(0, 0, 0, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.075);
-  padding: 16px 18px 13px;
+  padding: 18px 20px 14px;
 }
 
 .chat-empty-stage-product .composer-assistant-stage-clean {
@@ -2594,10 +2648,10 @@ textarea.composer-input-assistant {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  padding: 7px 30px 7px 12px;
+  padding: 8px 32px 8px 12px;
   border: 1px solid color-mix(in srgb, var(--color-border-soft) 62%, transparent);
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.04);
+  background: color-mix(in srgb, var(--color-chip) 84%, transparent);
 }
 
 .composer-model-picker::before {
@@ -2649,8 +2703,8 @@ textarea.composer-input-assistant {
   border: 0;
   background: transparent;
   color: var(--color-text);
-  font-size: 0.82rem;
-  font-weight: 500;
+  font-size: 0.84rem;
+  font-weight: 560;
   padding: 0;
   appearance: none;
   -webkit-appearance: none;
@@ -2667,12 +2721,15 @@ textarea.composer-input-assistant {
 .composer-meta-pill {
   display: inline-flex;
   align-items: center;
+  max-width: min(100%, 280px);
   min-height: 34px;
   padding: 6px 10px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.03);
+  background: color-mix(in srgb, var(--color-chip) 78%, transparent);
   color: var(--color-text-muted);
   font-size: 0.76rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -3031,8 +3088,12 @@ textarea.composer-input-assistant {
 }
 
 .topbar-chat-brand {
-  font-size: 0.9rem;
-  font-weight: 600;
+  color: color-mix(in srgb, var(--color-accent) 92%, white 8%);
+  font-family: var(--font-display);
+  font-size: 1rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
 }
 
 .topbar-chat-center {
@@ -6607,8 +6668,12 @@ textarea.composer-input-assistant {
   background: color-mix(in srgb, var(--color-user-bubble) 88%, transparent);
 }
 
+.message-bubble-assistant.assistant {
+  padding: 2px 0;
+}
+
 .message-markdown {
-  line-height: 1.78;
+  line-height: 1.82;
 }
 
 .models-view {
@@ -6934,6 +6999,7 @@ textarea.composer-input-assistant {
   padding: 18px 0 24px;
 }
 
+.chat-active-toolbar,
 .chat-session-strip,
 .chat-readiness-strip-live {
   width: min(100%, 900px);
@@ -7006,6 +7072,16 @@ textarea.composer-input-assistant {
     grid-template-columns: minmax(0, 1fr);
   }
 
+  .chat-active-toolbar,
+  .chat-surface-notice {
+    grid-template-columns: minmax(0, 1fr);
+    display: grid;
+  }
+
+  .chat-active-toolbar-controls {
+    justify-content: stretch;
+  }
+
   .chat-readiness-pill {
     width: 100%;
     max-width: none;
@@ -7026,6 +7102,7 @@ textarea.composer-input-assistant {
   }
 
   .chat-readiness-pill-row,
+  .chat-active-toolbar-controls,
   .composer-assistant-footer,
   .composer-assistant-footer-stage-clean {
     flex-direction: column;

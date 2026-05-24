@@ -302,9 +302,9 @@ const ACTIVE_STREAMING_LABEL = 'Streaming response'
 const OPEN_CODE_STREAMING_LABEL = 'Streaming code response'
 
 const DEMO_PROMPTS = [
-  'Summarize this implementation plan and call out the risks',
-  'Draft a concise release note from these changes',
-  'Turn this checklist into a prioritized next-step plan',
+  'Summarize this plan and call out the risks',
+  'Draft release notes from these changes',
+  'Turn these notes into a prioritized next-step plan',
 ]
 
 const streamingStatusLabel = (phase, elapsedSeconds, isOpenCode = false) => {
@@ -648,19 +648,19 @@ export default function ChatWorkspace({
         ? 'Waiting on readiness'
         : 'Choose a model to begin'
   const productHeroTitle = selectedModelRunnable
-    ? 'How can I help?'
+    ? 'What should we work on?'
     : apiUnavailable
-      ? 'Connect Camelid to begin.'
+      ? 'Camelid is offline.'
     : supportBlocked
       ? 'Choose a supported model.'
       : 'Load a model to begin.'
   const productHeroSummary = selectedModelRunnable
-    ? 'Send a prompt through the selected local model. Camelid keeps the exact-row readiness boundary visible while you work.'
+    ? 'Start a local chat with the selected model. Camelid keeps runtime and exact-row support visible without turning the screen into a dashboard.'
     : apiUnavailable
-      ? 'The frontend is ready, but the Camelid API is not responding. Start the local server and the chat surface will update automatically.'
+      ? 'The frontend is ready, but the local API is not responding yet. Start the server and this chat surface will update automatically.'
     : supportBlocked
-      ? 'The runtime is available, but chat stays locked until the selected model has an exact supported row.'
-      : 'Load a generation-ready GGUF model to unlock local chat. Camelid will keep showing what is missing until then.'
+      ? 'The runtime is available, but chat stays locked until the selected model matches an exact supported row.'
+      : 'Load a generation-ready GGUF model and Camelid will unlock chat as soon as runtime and support both agree.'
   const surfaceNoticeTitle = selectedModelRunnable
     ? ''
     : apiUnavailable
@@ -696,6 +696,15 @@ export default function ChatWorkspace({
     blocked: supportBlocked,
     waiting: Boolean(selectedModel),
   })
+  const toolbarSummary = selectedModelRunnable
+    ? 'Ready for this exact supported local chat lane.'
+    : apiUnavailable
+      ? 'Waiting for the local API to respond.'
+      : supportBlocked
+        ? 'Runtime is ready, but support is still gated.'
+        : selectedModel
+          ? 'Load and validate this model before sending prompts.'
+          : 'Choose a model for the next Camelid chat.'
   const handleDemoPrompt = (prompt) => {
     if (generationActive || !selectedModelRunnable) return
     setComposer(prompt)
@@ -774,6 +783,22 @@ export default function ChatWorkspace({
     )
   }
 
+  const renderChatToolbar = ({ live = false } = {}) => (
+    <div className={`chat-active-toolbar is-${readinessState} ${live ? 'is-live' : 'is-setup'}`} aria-label={live ? 'Current chat model and readiness' : 'Chat model and readiness'}>
+      <div className="chat-active-toolbar-copy">
+        <span className="chat-active-toolbar-kicker">{live ? 'Current chat' : 'Chat setup'}</span>
+        <strong>{selectedModelName}</strong>
+        <p>{toolbarSummary}</p>
+      </div>
+      <div className="chat-active-toolbar-controls">
+        {renderModelPicker()}
+        <span className={`composer-meta-pill composer-meta-pill-readiness is-${readinessState}`}>{readinessLabel}</span>
+        {!selectedModelRunnable && <button className="ghost-button ghost-button-quiet" onClick={() => setTab(readinessActionTab)}>{readinessActionLabel}</button>}
+        {!demoMode && live && selectedModelRunnable && <button className="ghost-button subtle-action" onClick={saveToMemory} disabled={generationActive}>Save to memory</button>}
+      </div>
+    </div>
+  )
+
 
   return (
     <section className={`chat-layout chat-layout-assistant view-stack ${isFreshThread ? 'chat-layout-empty' : ''}`}>
@@ -813,6 +838,8 @@ export default function ChatWorkspace({
                 />
               )}
 
+              {renderChatToolbar()}
+
               {selectedModelRunnable && (
                 <div className="demo-prompt-panel" aria-label="Prompt starters">
                   <span>Prompt starters</span>
@@ -846,12 +873,7 @@ export default function ChatWorkspace({
           <>
             {!demoMode && (
               <>
-                <div className={`chat-session-strip is-${readinessState}`} aria-label="Current Camelid chat status">
-                  <span className="chat-session-dot" aria-hidden="true" />
-                  <strong>{selectedModelName}</strong>
-                  <small>{selectedModelRunnable ? 'Ready when you are' : readinessLabel}</small>
-                </div>
-
+                {renderChatToolbar({ live: true })}
                 {renderReadinessPills('chat-readiness-strip-live', 'Live chat exact-row readiness')}
               </>
             )}
@@ -902,8 +924,7 @@ export default function ChatWorkspace({
           <div className="composer-assistant-footer">
             <div className="composer-assistant-tools">
               {renderModelPicker()}
-              {!demoMode && <span className="composer-meta-pill">{selectedModelMeta}</span>}
-              {!demoMode && selectedModelRunnable && <button className="ghost-button subtle-action" onClick={saveToMemory} disabled={generationActive}>Save to memory</button>}
+              {!demoMode && <span className={`composer-meta-pill composer-meta-pill-readiness is-${readinessState}`}>{selectedModelMeta}</span>}
             </div>
             <div className="composer-assistant-actions">
               {!selectedModelRunnable && <button className="ghost-button" onClick={() => setTab(readinessActionTab)}>{readinessActionLabel}</button>}

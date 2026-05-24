@@ -16,9 +16,9 @@ body {
   margin: 0;
   min-width: 320px;
   background:
-    linear-gradient(180deg, color-mix(in srgb, var(--color-bg) 96%, var(--color-surface) 4%), var(--color-bg) 64%),
-    linear-gradient(120deg, color-mix(in srgb, var(--color-spectrum-blue) 7%, transparent), transparent 28%),
-    linear-gradient(260deg, color-mix(in srgb, var(--color-spectrum-green) 5%, transparent), transparent 34%);
+    radial-gradient(circle at top, color-mix(in srgb, var(--color-spectrum-yellow) 10%, transparent), transparent 24%),
+    radial-gradient(circle at 12% 18%, color-mix(in srgb, var(--color-spectrum-blue) 7%, transparent), transparent 30%),
+    linear-gradient(180deg, color-mix(in srgb, var(--color-bg) 96%, var(--color-surface) 4%), var(--color-bg) 64%);
   color: var(--color-text);
   font-family: var(--font-ui);
   -webkit-font-smoothing: antialiased;
@@ -75,6 +75,7 @@ h1 {
   margin-bottom: 0;
   font-size: var(--text-display);
   font-weight: 600;
+  font-family: var(--font-display);
   line-height: 0.98;
   letter-spacing: 0;
 }
@@ -83,6 +84,7 @@ h2 {
   margin-bottom: var(--space-2);
   font-size: clamp(1.2rem, 2vw, 1.75rem);
   font-weight: 600;
+  font-family: var(--font-display);
   letter-spacing: 0;
   line-height: 1.1;
 }
