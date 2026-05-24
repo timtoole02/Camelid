@@ -65,13 +65,17 @@ const LLAMA32_3B_ACCEPTANCE_FILENAME = pathBasename(LLAMA32_3B_ACCEPTANCE_TARGET
 function hasExactLlama32ThreeBArtifact(model) {
   const exactTargetPath = model?.model_path === LLAMA32_3B_ACCEPTANCE_TARGET.model_path
     || model?.path === LLAMA32_3B_ACCEPTANCE_TARGET.model_path
-  const filenames = [
+  const localPathFilenames = [
     model?.model_path,
     model?.path,
-    model?.hf_filename,
-    model?.source,
   ].map(pathBasename).filter(Boolean)
-  return exactTargetPath || filenames.some((filename) => filename.toLowerCase() === LLAMA32_3B_ACCEPTANCE_FILENAME.toLowerCase())
+  if (exactTargetPath || localPathFilenames.length) {
+    return exactTargetPath || localPathFilenames.some((filename) => filename.toLowerCase() === LLAMA32_3B_ACCEPTANCE_FILENAME.toLowerCase())
+  }
+  const catalogFilenames = [
+    model?.hf_filename,
+  ].map(pathBasename).filter(Boolean)
+  return catalogFilenames.some((filename) => filename.toLowerCase() === LLAMA32_3B_ACCEPTANCE_FILENAME.toLowerCase())
 }
 
 function matchesLlama32ThreeBTarget(model, capabilities) {

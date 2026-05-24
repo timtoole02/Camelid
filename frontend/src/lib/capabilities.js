@@ -103,12 +103,16 @@ function exactArtifactFilenameForRow(row) {
 function hasExactArtifactIdentity(row, model, catalogItem) {
   const filename = exactArtifactFilenameForRow(row)
   if (!filename) return true
-  const observedFilenames = [
+  const localPathFilenames = [
     model?.model_path,
     model?.path,
-    model?.hf_filename,
-    catalogItem?.filename,
   ].map(pathBasename).filter(Boolean)
+  const observedFilenames = localPathFilenames.length
+    ? localPathFilenames
+    : [
+      model?.hf_filename,
+      catalogItem?.filename,
+    ].map(pathBasename).filter(Boolean)
   return observedFilenames.some((observed) => observed.toLowerCase() === filename.toLowerCase())
 }
 

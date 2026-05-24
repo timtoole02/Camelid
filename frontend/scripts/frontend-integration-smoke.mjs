@@ -519,6 +519,35 @@ try {
   assert.match(neighboringArtifactAcceptanceMarkup, /This browser\/runtime list does not currently show the exact 3B row/, '3B acceptance placeholder must stay visible when a same-label Q8 record lacks the exact GGUF filename')
   assert.match(neighboringArtifactAcceptanceMarkup, /llama32_3b_instruct_q8_0: exact GGUF not verified/, '3B acceptance hardening should require exact artifact identity, not just the 3B Instruct Q8 label')
 
+  const staleCatalogMetadataAcceptanceRecord = {
+    ...neighboringArtifactAcceptanceRecord,
+    id: 'stale-catalog-metadata-3b',
+    hf_filename: 'Llama-3.2-3B-Instruct-Q8_0.gguf',
+    source: 'bartowski/Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-Q8_0.gguf',
+  }
+  const staleCatalogMetadataAcceptanceMarkup = renderToStaticMarkup(React.createElement(ModelsView, {
+    runtime: { ...readyRuntime, active_model_id: staleCatalogMetadataAcceptanceRecord.runtime_model_name },
+    capabilities,
+    refreshDashboard: noop,
+    registerForm: { id: '', name: '', model_path: '', runtime_model_name: '' },
+    setRegisterForm: noop,
+    externalForm: { id: '', name: '', source: '', api_base: '', api_key: '', model_name: '' },
+    setExternalForm: noop,
+    registerModel: noop,
+    connectExternalModel: noop,
+    models: [staleCatalogMetadataAcceptanceRecord],
+    selectedModelId: staleCatalogMetadataAcceptanceRecord.id,
+    setSelectedModelId: noop,
+    loadingModelId: '',
+    activateModel: noop,
+    unloadCurrentModel: noop,
+    installModel: noop,
+    installCatalogModel: noop,
+    cancelModelDownload: noop,
+  }))
+  assert.match(staleCatalogMetadataAcceptanceMarkup, /This browser\/runtime list does not currently show the exact 3B row/, '3B acceptance placeholder must stay visible when stale source\/catalog metadata names the exact GGUF but the saved local path is a neighbor')
+  assert.match(staleCatalogMetadataAcceptanceMarkup, /llama32_3b_instruct_q8_0: exact GGUF not verified/, '3B acceptance hardening must make the local GGUF path authoritative over source\/catalog metadata')
+
   const green3BCapabilities = JSON.parse(JSON.stringify(capabilities))
   green3BCapabilities.api_features.push({ id: 'production_throughput', status: 'supported_exact_row_evidence', notes: '3B production-throughput lane validated end-to-end.' })
   green3BCapabilities.model_compatibility = green3BCapabilities.model_compatibility.map((target) => target.id === 'llama32_3b_instruct_q8_0'

@@ -155,6 +155,24 @@ const spoofedThreeBSourceWrongArtifact = {
 }
 assert.equal(compatibilityHintLabel(findCompatibilityHint(capabilities, spoofedThreeBSourceWrongArtifact)), 'llama32_3b_instruct_q8_0: exact GGUF not verified', '3B source metadata must not override the actual local GGUF filename used by runtime gating')
 assert.equal(isCompatibilitySupportedForModel(capabilities, spoofedThreeBSourceWrongArtifact), false, '3B support must fail closed when source metadata names the exact GGUF but model_path names a neighboring artifact')
+const staleCatalogMetadataWrongArtifact = {
+  ...spoofedThreeBNameWrongArtifact,
+  id: 'local-wrong-artifact-with-hf-filename',
+  runtime_model_name: 'local-wrong-artifact-with-hf-filename',
+  hf_filename: 'Llama-3.2-3B-Instruct-Q8_0.gguf',
+}
+assert.equal(compatibilityHintLabel(findCompatibilityHint(capabilities, staleCatalogMetadataWrongArtifact)), 'llama32_3b_instruct_q8_0: exact GGUF not verified', '3B stale catalog filename metadata must not override the actual local GGUF filename')
+assert.equal(isCompatibilitySupportedForModel(capabilities, staleCatalogMetadataWrongArtifact), false, '3B support must fail closed when hf_filename names the exact GGUF but model_path names a neighboring artifact')
+assert.equal(
+  compatibilityHintLabel(findCompatibilityHint(capabilities, staleCatalogMetadataWrongArtifact, {
+    name: 'Llama 3.2 3B Instruct Q8_0',
+    repo_id: 'bartowski/Llama-3.2-3B-Instruct-GGUF',
+    filename: 'Llama-3.2-3B-Instruct-Q8_0.gguf',
+    quant: 'Q8_0',
+  })),
+  'llama32_3b_instruct_q8_0: exact GGUF not verified',
+  '3B catalog-card evidence must not hide a local neighboring GGUF path behind the catalog exact filename',
+)
 assert.equal(compatibilityHintMatchesExactTarget(capabilities, exactThreeBModel, llama32ThreeBTarget), true, 'ModelsView exact-row matching must accept the canonical 3B row')
 assert.equal(modelRuntimeIdMatches(exactThreeBModel, runtime), true, '3B backend active_model_id must match the selected runtime row')
 assert.equal(isRunnableInCurrentRuntime(exactThreeBModel, runtime), true, '3B runtime readiness must require the active backend row and generation_ready=true')
