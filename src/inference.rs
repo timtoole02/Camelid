@@ -10766,7 +10766,19 @@ fn try_x86_q8_attention_output_packed_rows4_matmul_path(
         return Ok(None);
     }
 
-    q8_0_packed_rows4_matmul_projection(input, packed, output_width, name).map(Some)
+    let rows = input.dim(0)?;
+    let telemetry_started = q8_schedule_telemetry_enabled().then(Instant::now);
+    let output = q8_0_packed_rows4_matmul_projection(input, packed, output_width, name)?;
+    record_q8_schedule_projection_route_elapsed(
+        "attention_output",
+        "x86_packed_rows4_matmul",
+        name,
+        rows,
+        input_width,
+        output_width,
+        telemetry_started,
+    );
+    Ok(Some(output))
 }
 
 fn try_x86_q8_attention_projection_decode_consumer_path(

@@ -3400,6 +3400,61 @@ fn q8_attention_output_packed_rows4_matmul_matches_runtime_packed_baseline_for_p
 }
 
 #[test]
+fn q8_attention_output_packed_rows4_matmul_records_route_telemetry() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+    std::env::set_var(Q8_SCHEDULE_TELEMETRY_ENV, "on");
+    reset_q8_schedule_telemetry();
+
+    let (_decode_input, packed_weight, _decode_expected) =
+        runtime_packed_attention_projection_case("attention_output", "blk.0.attn_output.weight");
+    let input_width = packed_weight.dim(0).unwrap();
+    let output_width = packed_weight.dim(1).unwrap();
+    let rows = 3;
+    let input = CpuTensor::from_f32(
+        "prefill_attention_context_telemetry",
+        vec![rows, input_width],
+        (0..rows * input_width)
+            .map(|idx| {
+                ((idx % input_width) as f32 - 13.0) * 0.078125
+                    + (idx / input_width) as f32 * 0.046875
+            })
+            .collect(),
+    )
+    .unwrap();
+
+    let actual = linear_for_role_runtime_with_plan(
+        &input,
+        &packed_weight,
+        "layer_3_attention_output_prefill",
+        "linear",
+        &attention_output_packed_rows4_matmul_plan(true),
+        false,
+    )
+    .unwrap();
+    assert_eq!(actual.shape.dims, vec![rows, output_width]);
+
+    let telemetry = snapshot_q8_schedule_telemetry();
+    let by_route = telemetry
+        .output_projection_by_route
+        .get("attention_output.x86_packed_rows4_matmul")
+        .expect("attention-output packed rows4 matmul route telemetry");
+    assert_eq!(by_route.calls, 1);
+    assert_eq!(by_route.rows, rows as u64);
+    assert_eq!(by_route.input_width, input_width as u64);
+    assert_eq!(by_route.output_width, output_width as u64);
+    let layer_route = telemetry
+        .output_projection_by_layer_route
+        .get("layer_3.attention_output.x86_packed_rows4_matmul")
+        .expect("layer-scoped attention-output packed rows4 matmul telemetry");
+    assert_eq!(layer_route.layer_index, 3);
+    assert_eq!(layer_route.calls, 1);
+
+    reset_q8_schedule_telemetry();
+    std::env::remove_var(Q8_SCHEDULE_TELEMETRY_ENV);
+}
+
+#[test]
 fn q8_attention_output_packed_rows4_matmul_is_plan_gated_and_shape_limited() {
     let _env_guard = env_lock();
     clear_dense_diagnostic_env();
