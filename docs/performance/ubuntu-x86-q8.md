@@ -72,6 +72,8 @@ Examples already treated this way include row-dot lookalikes, tile16 hsum/lane/s
 
 The 2026-05-24 current-main AVX2 register-sum recheck also stays rejected for performance retention: exact-row one-token parity still matched llama.cpp, but the cleaned unique-prompt same-host marker run measured Camelid `8837.36 / 8837.65 ms` on `e27a4e1` versus `8823.09 / 8823.37 ms` on `214f733`, so there is no measured Ubuntu x86_64 wall-clock win to retain.
 
+The 2026-05-24 AVX2 decode-accumulator hoist same-host check is retained inside the existing default-off AVX2 lane: exact-row one-token parity matched llama.cpp on both `07c912c` current `main` and candidate `a39a493`, the warmed-cache current-`main` control stayed at `8889.41 / 8889.69 ms`, and the candidate measured `4447.75 / 4448.28 ms` under the same `CAMELID_X86_Q8_REPACK=on CAMELID_X86_Q8_KERNEL=avx2` shape. This retains only the narrow Camelid-on-Camelid Ubuntu x86_64 wall-clock win inside the existing default-off lane; llama.cpp remains much faster overall, so no default-on, portability, or broad throughput claim is made.
+
 ## Clean-host discipline
 
 Ubuntu x86 Q8 benchmarking now requires a clean host before major runs:
@@ -164,6 +166,7 @@ Primary public evidence anchors for this lane:
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260521T2015Z-vnni-rawptr-avx2/README.md` (default-off Rust AVX2 FFN-down VNNI decode raw-pointer implementation slice; local compile check only, with Linux x86_64 AVX2 parity coverage added for canonical host execution and no throughput/support/default-on promotion)
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260522T2320Z-q8-parity/README.md` (Ubuntu Linux x86_64 same-host Llama 3.2 3B Q8_0 Camelid rawptr-VNNI versus llama.cpp timing slice; llama.cpp remained much faster on TTFT/total elapsed and the deterministic marker guard failed, so no throughput/support/default-on promotion)
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260524T0535Z-avx2-register-sums/README.md` (current-main AVX2 baseline recheck on Ubuntu Linux x86_64: one-token parity stayed exact, but the cleaned unique-prompt marker run was slightly slower than `214f733`, so no measured wall-clock win or promotion is retained)
+- `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-0719640b-20260524T2358Z-avx2-decode-hoist/README.md` (Ubuntu Linux x86_64 same-host AVX2 decode-accumulator hoist validation: exact-row one-token parity stayed exact, the warmed-cache current-`main` control remained around `8.89 s`, the candidate measured about `4.45 s`, and the result is retained only as a narrow default-off Camelid-on-Camelid wall-clock win)
 - the retained/reject notes for bounded Ubuntu x86 Q8 experiments kept under `qa/evidence-bundles/`
 
 ## Product/runtime note
