@@ -1,0 +1,23 @@
+{
+  "schema": "camelid.frontend_3b_live_runtime_chat_gate.v1",
+  "source_head": "07c912cf3041cee6036403a728af973404c5bcb5",
+  "branch": "frontend-3b-end-to-end-gates-20260524",
+  "scope": "frontend 3B exact-row runtime readiness gate",
+  "support_contract": "No support widening: Llama 3.2 3B Instruct Q8_0 remains supported_exact_row_smoke only when exact GGUF identity, Q8_0 evidence, /api/capabilities row support, loaded_now=true, generation_ready=true, and active_model_id all match.",
+  "result": "retained",
+  "remote_linux_x86_64_validation": "not_attempted",
+  "checks": {
+    "git-diff-check": 0,
+    "public-scrub": 0,
+    "public-evidence-claims": 0,
+    "privacy-test": 0,
+    "frontend-npm-ci": 0,
+    "frontend-build": 0,
+    "frontend-3b-closure-smoke": 0,
+    "frontend-model-state-smoke": 0,
+    "frontend-streaming-smoke": 0,
+    "frontend-ui-smoke": 0,
+    "frontend-integration-smoke": 0,
+    "frontend-tiny-smoke-local-loopback": 0
+  }
+}
