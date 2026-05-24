@@ -1,6 +1,6 @@
 # Validation Matrix
 
-Last updated: 2026-05-13
+Last updated: 2026-05-23
 
 Run the smallest meaningful validation lane for your change. If a change affects support language, readiness behavior, or exact-row claims, update docs and evidence references together.
 
@@ -9,8 +9,9 @@ Run the smallest meaningful validation lane for your change. If a change affects
 Every public surface should tell the same four-row story:
 
 - TinyLlama 1.1B Chat Q8_0 is the supported current gate, with checked 512-context/template/RSS evidence.
-- Llama 3.2 1B Instruct Q8_0 is exact-row smoke-supported through checked 512/1024/2048/4096/8192 bounded context packs where row-specific PASS artifacts are cited, plus a supported metadata-Jinja row-template renderer path for the recognized Llama 3 template shape; the latest 8192 pack is `qa/evidence-bundles/llama32-1b-context-8192-current-head-20260513T183501Z-head-aaf9207d1669/manifest.json`. Llama 3.2 3B Instruct Q8_0 is exact-row smoke-supported through checked 512/1024/2048 bounded context packs where row-specific PASS artifacts are cited.
-- Llama 3 8B Instruct Q8_0 is exact-row smoke-supported through checked bounded 512/1024/2048-context packs where row-specific PASS artifacts are cited; the 1024/2048 buckets are backed by `qa/evidence-bundles/llama3-8b-context-1024-2048-current-head-20260509T041451Z-head-8e26be0a73c0/manifest.json` for source/runtime head `8e26be0a73c0`, and older 1024/2048 bundles remain historical source-head evidence.
+- Llama 3.2 1B Instruct Q8_0 has verified exact-row support within its checked bounded envelope: 512/1024/2048/4096/8192 context packs where row-specific PASS artifacts are cited, plus the supported metadata-Jinja row-template renderer path for the recognized Llama 3 template shape; the latest 8192 pack is `qa/evidence-bundles/llama32-1b-context-8192-current-head-20260513T183501Z-head-aaf9207d1669/manifest.json`.
+- Llama 3.2 3B Instruct Q8_0 is supported exact-row smoke through checked 512/1024/2048 bounded context packs where row-specific PASS artifacts are cited, with the canonical Ubuntu API/WebUI refresh at source head `e9f926ed1a65`.
+- Llama 3 8B Instruct Q8_0 has verified exact-row support within its checked bounded 512/1024/2048-context envelope; the 1024/2048 buckets are backed by `qa/evidence-bundles/llama3-8b-context-1024-2048-current-head-20260509T041451Z-head-8e26be0a73c0/manifest.json` for source/runtime head `8e26be0a73c0`, and older 1024/2048 bundles remain historical source-head evidence.
 - Current-head language requires a fresh canonical PASS after later runtime/source commits; broad/full support for every non-TinyLlama row still requires model-native/larger context beyond checked packs, arbitrary-template evidence, throughput, portability, and durable normalized current-head bundles.
 
 Next-family public language is locked to row-by-row evidence, not family-wide support:
