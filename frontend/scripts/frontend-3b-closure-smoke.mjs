@@ -186,6 +186,19 @@ assert.deepEqual(
   [true, true, true, true, true],
   '3B WebUI chat unlock is retained only when loaded_now, generation_ready, active_model_id, and exact supported row all pass',
 )
+const staleBrowserStateExactThreeBModel = {
+  ...exactThreeBModel,
+  status: 'registered',
+  loaded_now: false,
+  generation_ready: false,
+  camelid: { loaded_now: false, generation_ready: false },
+}
+const liveRuntimeExactGate = getChatGateState(capabilities, staleBrowserStateExactThreeBModel, runtime)
+assert.deepEqual(
+  [liveRuntimeExactGate.runtimeLoaded, liveRuntimeExactGate.runtimeGenerationReady, liveRuntimeExactGate.runtimeReady, liveRuntimeExactGate.contractSupported, liveRuntimeExactGate.chatUnlocked],
+  [true, true, true, true, true],
+  'live 3B WebUI chat readiness must trust /v1/health loaded_now/generation_ready plus active_model_id when the exact local GGUF and /api/capabilities row match, even if the saved browser record is stale',
+)
 
 const missingCapabilitiesGate = getChatGateState(null, exactThreeBModel, runtime)
 assert.equal(missingCapabilitiesGate.runtimeReady, true, '3B runtime readiness must remain visible when /api/capabilities is unavailable')
