@@ -71,6 +71,25 @@ assert.equal(getRuntimeRequestModelId(localReadyWithRuntimeName, { active_model_
 assert.equal(getRuntimeRequestModelId(localReadyWithRuntimeName, { active_model_id: 'other-runtime-id' }, 'browser-alias'), 'backend-runtime-id', 'inactive alias rows should still prefer their runtime_model_name over a browser-only id')
 assert.equal(isRunnableInCurrentRuntime(localReadyWithRuntimeName, { active_model_id: 'backend-runtime-id', generation_ready: true }), true, 'runtime-name matches keep chat/API gating tied to the exact loaded backend row')
 assert.equal(getChatGateState({ model_compatibility: [] }, localReadyWithRuntimeName, { active_model_id: 'backend-runtime-id', loaded_now: true, generation_ready: true }).runtimeReady, true, 'chat gate runtime readiness should use the same runtime id matcher as the API view')
+const staleBrowserRecordWithLiveRuntime = {
+  ...localReadyWithRuntimeName,
+  status: 'registered',
+  quant: 'Q8_0',
+  loaded_now: false,
+  generation_ready: false,
+  camelid: { loaded_now: false, generation_ready: false },
+}
+const staleBrowserRecordCapabilities = {
+  model_compatibility: [
+    { id: 'backend_runtime_id', family: 'fixture_decoder', quantization: 'Q8_0', status: 'supported_exact_row_smoke', frontend_readiness_gate: 'green only when runtime health matches this exact row', evidence: 'fixture exact-row smoke' },
+  ],
+}
+const liveRuntimeGate = getChatGateState(staleBrowserRecordCapabilities, staleBrowserRecordWithLiveRuntime, { active_model_id: 'backend-runtime-id', loaded_now: true, generation_ready: true })
+assert.deepEqual(
+  [liveRuntimeGate.runtimeReady, liveRuntimeGate.contractSupported, liveRuntimeGate.chatUnlocked],
+  [true, true, true],
+  'chat gate must trust live /v1/health loaded_now/generation_ready plus active_model_id match instead of stale browser model flags',
+)
 assert.equal(getModelStatusLabel(localLoadedReady), 'Loaded + generation-ready')
 assert.match(describeModelState(localLoadedReady), /generation_ready=true/)
 

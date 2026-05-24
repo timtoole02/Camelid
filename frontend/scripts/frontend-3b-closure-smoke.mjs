@@ -106,6 +106,30 @@ const catalogThreeBHint = findCompatibilityHint(capabilities, null, {
 })
 assert.equal(catalogThreeBHint.target.id, 'llama32_3b_instruct_q8_0', '3B catalog cards must resolve the exact supported row from catalog filename + Q8_0 evidence')
 assert.equal(catalogThreeBHint.exact, true, '3B catalog cards must not render family-level support from catalog metadata')
+const catalogThreeBFileTypeHint = findCompatibilityHint(capabilities, null, {
+  name: 'Llama 3.2 3B Instruct',
+  repo_id: 'bartowski/Llama-3.2-3B-Instruct-GGUF',
+  filename: 'Llama-3.2-3B-Instruct-Q8_0.gguf',
+  quant: 'file_type 7',
+})
+assert.equal(catalogThreeBFileTypeHint.target.id, 'llama32_3b_instruct_q8_0', '3B catalog cards must accept decoded GGUF file_type 7 as Q8_0 evidence for the exact supported row')
+assert.equal(isCompatibilitySupportedForModel(capabilities, null, {
+  name: 'Llama 3.2 3B Instruct',
+  repo_id: 'bartowski/Llama-3.2-3B-Instruct-GGUF',
+  filename: 'Llama-3.2-3B-Instruct-Q8_0.gguf',
+  quant: 'file_type 7',
+}), true, '3B catalog support may turn green only when exact filename and decoded Q8_0 file_type evidence both match')
+const catalogThreeBMissingQuantHint = findCompatibilityHint(capabilities, null, {
+  name: 'Llama 3.2 3B Instruct',
+  repo_id: 'bartowski/Llama-3.2-3B-Instruct-GGUF',
+  filename: 'Llama-3.2-3B-Instruct-Q8_0.gguf',
+})
+assert.equal(compatibilityHintLabel(catalogThreeBMissingQuantHint), 'llama32_3b_instruct_q8_0: quant not verified', '3B catalog cards must still require Q8_0/file_type 7 metadata even when the exact GGUF filename matches')
+assert.equal(isCompatibilitySupportedForModel(capabilities, null, {
+  name: 'Llama 3.2 3B Instruct',
+  repo_id: 'bartowski/Llama-3.2-3B-Instruct-GGUF',
+  filename: 'Llama-3.2-3B-Instruct-Q8_0.gguf',
+}), false, '3B catalog support must fail closed without quant evidence even for the exact supported GGUF filename')
 const catalogThreeBWrongArtifactHint = findCompatibilityHint(capabilities, null, {
   name: 'Llama 3.2 3B Instruct Q8_0',
   repo_id: 'bartowski/Llama-3.2-3B-Instruct-GGUF',
@@ -185,6 +209,19 @@ assert.deepEqual(
   [exactGate.runtimeLoaded, exactGate.runtimeGenerationReady, exactGate.runtimeReady, exactGate.contractSupported, exactGate.chatUnlocked],
   [true, true, true, true, true],
   '3B WebUI chat unlock is retained only when loaded_now, generation_ready, active_model_id, and exact supported row all pass',
+)
+const staleBrowserStateExactThreeBModel = {
+  ...exactThreeBModel,
+  status: 'registered',
+  loaded_now: false,
+  generation_ready: false,
+  camelid: { loaded_now: false, generation_ready: false },
+}
+const liveRuntimeExactGate = getChatGateState(capabilities, staleBrowserStateExactThreeBModel, runtime)
+assert.deepEqual(
+  [liveRuntimeExactGate.runtimeLoaded, liveRuntimeExactGate.runtimeGenerationReady, liveRuntimeExactGate.runtimeReady, liveRuntimeExactGate.contractSupported, liveRuntimeExactGate.chatUnlocked],
+  [true, true, true, true, true],
+  'live 3B WebUI chat readiness must trust /v1/health loaded_now/generation_ready plus active_model_id when the exact local GGUF and /api/capabilities row match, even if the saved browser record is stale',
 )
 
 const missingCapabilitiesGate = getChatGateState(null, exactThreeBModel, runtime)
