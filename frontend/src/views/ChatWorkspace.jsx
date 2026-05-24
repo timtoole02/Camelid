@@ -1,6 +1,6 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
-import { compatibilityHintCopy, compatibilityHintLabel, exactRowSupportLanes, findCompatibilityHint, isCompatibilitySupportedForModel } from '../lib/capabilities'
+import { compatibilityHintCopy, compatibilityHintLabel, exactRowSupportLanes, findCompatibilityHint } from '../lib/capabilities'
 import { clampText, formatDate, formatRate } from '../lib/formatters'
 import { getChatGateState } from '../lib/chatGate'
 import { describeModelState, getModelStatusLabel } from '../lib/modelState'
@@ -568,7 +568,7 @@ export default function ChatWorkspace({
   const selectedChatGate = getChatGateState(capabilities, selectedModel, runtime)
   const apiUnavailable = runtime?.status === 'offline'
   const selectedRuntimeReady = selectedChatGate.runtimeReady
-  const selectedModelCapabilitySupported = selectedChatGate.contractSupported || isCompatibilitySupportedForModel(capabilities, selectedModel)
+  const selectedModelCapabilitySupported = selectedChatGate.contractSupported
   const supportBlocked = selectedRuntimeReady && !selectedModelCapabilitySupported
   const selectedCompatibilityHint = selectedChatGate.hint || findCompatibilityHint(capabilities, selectedModel)
   const selectedCompatibilityLabel = selectedModel

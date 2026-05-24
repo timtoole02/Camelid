@@ -5,7 +5,7 @@ import { resolveLoadedModelDisplayName } from '../lib/loadedModelDisplay'
 import { readStreamingChatCompletion } from '../lib/chatCompletionStream'
 import { NEW_CHAT_SENTINEL, resolveSelectedConversation, shouldCreateConversationForSend } from '../lib/chatState'
 import { normalizeStoredConversations } from '../lib/conversationStorage.js'
-import { getRuntimeRequestModelId, isExternalModel, isRunnableModel, modelRuntimeIdMatches } from '../lib/modelState'
+import { getRuntimeRequestModelId, isExternalModel, modelRuntimeIdMatches } from '../lib/modelState'
 
 const TAB_STORAGE_KEY = 'camelid.activeTab'
 const SELECTED_CONVERSATION_STORAGE_KEY = 'camelid.selectedConversationId'
@@ -506,18 +506,18 @@ export function useDashboardData({ showNotice, clearNotice }) {
         if (!nextModels.length) return ''
         const currentModel = current ? nextModels.find((model) => model.id === current) : null
         const activeModel = health?.active_model_id ? nextModels.find((model) => modelRuntimeIdMatches(model, { active_model_id: health.active_model_id })) : null
-        const activeModelRunnable = activeModel && isRunnableModel(activeModel)
-        const currentModelRunnable = currentModel && isRunnableModel(currentModel)
-        const runnableModel = nextModels.find((model) => isRunnableModel(model)) || null
+        const activeModelChatGate = activeModel ? getChatGateState(capabilities, activeModel, nextDashboard.runtime) : null
+        const currentModelChatGate = currentModel ? getChatGateState(capabilities, currentModel, nextDashboard.runtime) : null
+        const chatUnlockedModel = nextModels.find((model) => getChatGateState(capabilities, model, nextDashboard.runtime).chatUnlocked) || null
 
         // The chat API can only use the backend's active model. If a previous browser
         // selection points at an inactive saved model, snap back to the runtime model
         // instead of leaving the composer looking ready for the wrong row.
-        if (activeModelRunnable && current !== activeModel.id) return activeModel.id
-        if (currentModelRunnable) return current
+        if (activeModelChatGate?.chatUnlocked && current !== activeModel.id) return activeModel.id
+        if (currentModelChatGate?.chatUnlocked) return current
         if (activeModel) return activeModel.id
         if (currentModel) return current
-        return runnableModel?.id || nextModels[0]?.id || ''
+        return chatUnlockedModel?.id || nextModels[0]?.id || ''
       })
     } catch (error) {
       const fallbackDashboard = makeDashboard({
