@@ -1,6 +1,6 @@
 # Camelid Status
 
-Last updated: 2026-05-18
+Last updated: 2026-05-24
 
 `STATUS.md` is Camelid's current release-evidence checkpoint. It records what Camelid can prove today, what moved recently, and what still blocks the next support change. Treat it as a briefing memo, not a diary. Detailed historical run logs, older validation slices, and superseded tactical notes now live in [`STATUS_ARCHIVE_2026-04.md`](STATUS_ARCHIVE_2026-04.md).
 
@@ -70,8 +70,8 @@ Current public takeaways:
 - The cold/warm split is now explicit in the evidence: `from_q8_0_bytes` is a cold/reload materialization cost on this lane, not the warm decode bottleneck.
 - The active warm-path direction has shifted from leaf row-dot tuning toward matrix-level Q8 GEMM/MUL_MAT ownership, starting with deeper FFN ownership slices.
 - Latest local-only follow-on work tightened default-off paired/triplet helpers and one-row packed-runtime decode output-group traversal so related projections reuse shared quantized inputs and wide rows4 decode projections can schedule independent output groups while consuming backend-owned packed runtime storage; Ubuntu x86_64 timing/profiling proof is still pending, so no measured-effect or support claim is added from those tweaks.
-- Latest bounded output-slice work added a default-off multi-row `output.weight` PackedRows4 matmul consumer (`CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL`) that consumes backend-owned runtime storage only and is managed off by ExecutionPlan; local parity/gate tests pass, but Ubuntu x86_64 timing/profiling is blocked by validation-host SSH timeout, so no retained measured-effect or support claim is added.
-- Latest local-only packed-rows4 matmul follow-ons chunk parallel output-group traversal and reuse bounded quantized-input scratch for existing single, paired, and triplet multi-row helpers; they keep I8/matching-layout/backend-owned-storage guards and have local fmt/clippy/unit/timing-smoke coverage only, with Ubuntu x86_64 timing/profiling still blocked.
+- Latest bounded output-slice work added a default-off multi-row `output.weight` PackedRows4 matmul consumer (`CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL`) that consumes backend-owned runtime storage only and is managed off by ExecutionPlan; local parity/gate tests pass, but Ubuntu x86_64 timing/profiling proof is still pending, so no retained measured-effect or support claim is added.
+- Latest local-only packed-rows4 matmul follow-ons chunk parallel output-group traversal and reuse bounded quantized-input scratch for existing single, paired, and triplet multi-row helpers; they keep I8/matching-layout/backend-owned-storage guards and have local fmt/clippy/unit/timing-smoke coverage only, with Ubuntu x86_64 timing/profiling proof still pending.
 - Latest docs/context guard keeps FFN-down GEMM4 AVX2 and output-route-resolver work in the evidence-needed lane: the same-host guard still rejects any Camelid speed promotion, and output route cleanup is implementation guidance only until local plus canonical Ubuntu gates prove it.
 - Latest retained default-off hygiene slices are narrow: FFN-down GEMM4 row-group scheduling has a min-input-groups guard for the shallow-prefill synthetic surface, and ExecutionPlan now clears the FFN gate/up single-owner env gate. These are scheduler/control-plane guards only; they do not widen throughput, support, portability, API/frontend readiness, or default-on claims.
 
