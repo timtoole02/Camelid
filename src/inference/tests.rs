@@ -1336,6 +1336,8 @@ fn clear_dense_diagnostic_env() {
         "CAMELID_X86_Q8_PACKED_ROWS4_MATMUL",
         "CAMELID_X86_Q8_OUTPUT_AMX_PREFILL",
         "CAMELID_X86_Q8_OUTPUT_DECODE_OWNER",
+        "CAMELID_X86_Q8_OUTPUT_VNNI_DECODE",
+        "CAMELID_X86_Q8_OUTPUT_VNNI_DECODE_RAWPTR",
     ] {
         std::env::remove_var(key);
     }
@@ -1652,6 +1654,8 @@ fn q8_0_hot_path_uses_resolved_plan_not_current_env() {
             output_packed_rows4_matmul: false,
             output_amx_prefill: false,
             output_decode_owner: false,
+            output_vnni_decode: false,
+            output_vnni_decode_rawptr: false,
             ffn_gate_up_decode_consumer: false,
             ffn_gate_up_decode_group_chunking: false,
             ffn_gate_up_decode_fused_activation: false,
@@ -1764,6 +1768,8 @@ fn resolved_runtime_plan_captures_q8_env_once() {
     std::env::set_var("CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL", "on");
     std::env::set_var("CAMELID_X86_Q8_OUTPUT_AMX_PREFILL", "on");
     std::env::set_var("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER", "on");
+    std::env::set_var("CAMELID_X86_Q8_OUTPUT_VNNI_DECODE", "on");
+    std::env::set_var("CAMELID_X86_Q8_OUTPUT_VNNI_DECODE_RAWPTR", "on");
     std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER", "true");
     std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING", "on");
     std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION", "on");
@@ -1796,6 +1802,8 @@ fn resolved_runtime_plan_captures_q8_env_once() {
     assert!(plan.q8.output_packed_rows4_matmul);
     assert!(plan.q8.output_amx_prefill);
     assert!(plan.q8.output_decode_owner);
+    assert!(plan.q8.output_vnni_decode);
+    assert!(plan.q8.output_vnni_decode_rawptr);
     assert!(plan.q8.ffn_gate_up_decode_consumer);
     assert!(plan.q8.ffn_gate_up_decode_group_chunking);
     assert!(plan.q8.ffn_gate_up_decode_fused_activation);
@@ -1816,6 +1824,8 @@ fn resolved_runtime_plan_captures_q8_env_once() {
     std::env::remove_var("CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL");
     std::env::remove_var("CAMELID_X86_Q8_OUTPUT_AMX_PREFILL");
     std::env::remove_var("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER");
+    std::env::remove_var("CAMELID_X86_Q8_OUTPUT_VNNI_DECODE");
+    std::env::remove_var("CAMELID_X86_Q8_OUTPUT_VNNI_DECODE_RAWPTR");
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER");
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING");
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION");
@@ -2541,6 +2551,16 @@ fn output_packed_rows4_matmul_plan(enabled: bool) -> ResolvedRuntimePlan {
     plan
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn output_vnni_decode_plan(enabled: bool) -> ResolvedRuntimePlan {
+    let mut plan = q8_attention_consumer_plan(false, false);
+    plan.q8.output_decode_owner = enabled;
+    plan.q8.output_vnni_decode = enabled;
+    plan.q8.output_vnni_decode_rawptr =
+        q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_OUTPUT_VNNI_DECODE_RAWPTR");
+    plan
+}
+
 fn q8_attention_consumer_plan(
     attention_projection_decode_consumer: bool,
     attention_qkv_decode_consumer: bool,
@@ -2559,6 +2579,8 @@ fn q8_attention_consumer_plan(
             output_packed_rows4_matmul: false,
             output_amx_prefill: false,
             output_decode_owner: false,
+            output_vnni_decode: false,
+            output_vnni_decode_rawptr: false,
             ffn_gate_up_decode_consumer: false,
             ffn_gate_up_decode_group_chunking: false,
             ffn_gate_up_decode_fused_activation: false,
@@ -3474,6 +3496,8 @@ fn ffn_down_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             output_packed_rows4_matmul: false,
             output_amx_prefill: false,
             output_decode_owner: false,
+            output_vnni_decode: false,
+            output_vnni_decode_rawptr: false,
             ffn_gate_up_decode_consumer: false,
             ffn_gate_up_decode_group_chunking: false,
             ffn_gate_up_decode_fused_activation: false,
@@ -3523,6 +3547,8 @@ fn ffn_down_packed_rows4_matmul_plan(enabled: bool) -> ResolvedRuntimePlan {
             output_packed_rows4_matmul: false,
             output_amx_prefill: false,
             output_decode_owner: false,
+            output_vnni_decode: false,
+            output_vnni_decode_rawptr: false,
             ffn_gate_up_decode_consumer: false,
             ffn_gate_up_decode_group_chunking: false,
             ffn_gate_up_decode_fused_activation: false,
@@ -3576,6 +3602,8 @@ fn ffn_gate_up_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             output_packed_rows4_matmul: false,
             output_amx_prefill: false,
             output_decode_owner: false,
+            output_vnni_decode: false,
+            output_vnni_decode_rawptr: false,
             ffn_gate_up_decode_consumer: enabled,
             ffn_gate_up_decode_group_chunking: false,
             ffn_gate_up_decode_fused_activation: false,
@@ -3804,6 +3832,64 @@ fn runtime_vnni_packed_ffn_down_case() -> (CpuTensor, CpuTensor, CpuTensor) {
     assert!(packed.vnni_packed.is_some());
     let packed_weight = CpuTensor::q8_0_runtime_packed_rows4_linear(
         "blk.0.ffn_down.weight",
+        TensorShape {
+            dims: vec![input_width, rows],
+        },
+        packed,
+    );
+    (input, packed_weight, expected)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn runtime_vnni_packed_output_case() -> (CpuTensor, CpuTensor, CpuTensor) {
+    const Q8_0_BLOCK_BYTES: usize = 34;
+    let rows = 64;
+    let input_width = Q8_0_BLOCK_VALUES * 2;
+    let blocks_per_row = input_width / Q8_0_BLOCK_VALUES;
+    let mut raw = Vec::with_capacity(rows * blocks_per_row * Q8_0_BLOCK_BYTES);
+    let mut row_blocks = Vec::with_capacity(rows * blocks_per_row);
+    for row in 0..rows {
+        for block_idx in 0..blocks_per_row {
+            let scale = 0.09375 + row as f32 * 0.002 + block_idx as f32 * 0.011;
+            let scale_bits = f32_to_f16_bits(scale);
+            let quants = std::array::from_fn(|idx| {
+                (idx as i8)
+                    .wrapping_mul(7)
+                    .wrapping_add((row as i8).wrapping_mul(5))
+                    .wrapping_sub((block_idx as i8).wrapping_mul(9))
+            });
+            raw.extend_from_slice(&scale_bits.to_le_bytes());
+            raw.extend(quants.iter().map(|value| *value as u8));
+            row_blocks.push(Q8_0Block {
+                scale: f16_bits_to_f32(scale_bits),
+                quants,
+            });
+        }
+    }
+    let input = CpuTensor::from_f32(
+        "output_norm",
+        vec![1, input_width],
+        (0..input_width)
+            .map(|idx| (idx as f32 - 19.0) * 0.125)
+            .collect(),
+    )
+    .unwrap();
+    let retained_weight = CpuTensor::from_f32_with_q8_0_blocks(
+        "retained_output_transposed",
+        vec![rows, input_width],
+        dequantized_q8_0_rows(&row_blocks),
+        row_blocks,
+    )
+    .unwrap();
+    let expected =
+        matmul_rhs_transposed_with_precision(&input, &retained_weight, "expected_output").unwrap();
+    std::env::set_var("CAMELID_X86_Q8_OUTPUT_VNNI_DECODE", "on");
+    let packed =
+        Q8_0PackedRows4::from_q8_0_bytes(rows, blocks_per_row, Q8_0PackedRows4Interleave::I8, &raw)
+            .unwrap();
+    assert!(packed.vnni_packed.is_some());
+    let packed_weight = CpuTensor::q8_0_runtime_packed_rows4_linear(
+        "output.weight",
         TensorShape {
             dims: vec![input_width, rows],
         },
@@ -8198,6 +8284,91 @@ fn x86_q8_output_decode_owner_path_uses_runtime_packed_storage() {
     std::env::remove_var(Q8_SCHEDULE_TELEMETRY_ENV);
     std::env::remove_var("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER");
     std::env::remove_var("CAMELID_X86_Q8_REPACK");
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn q8_output_vnni_decode_consumer_matches_rows4_decode_baseline() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+    if !x86_q8_vnni_decode_cpu_supported() {
+        std::env::remove_var("CAMELID_X86_Q8_OUTPUT_VNNI_DECODE");
+        return;
+    }
+
+    let (input, packed_weight, expected) = runtime_vnni_packed_output_case();
+    let actual = output_projection_runtime_with_plan(
+        &input,
+        &packed_weight,
+        "logits",
+        &output_vnni_decode_plan(true),
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(actual.shape.dims, expected.shape.dims);
+    assert_slice_close_with_tolerance(&actual.data, &expected.data, 5e-4);
+    std::env::remove_var("CAMELID_X86_Q8_OUTPUT_VNNI_DECODE");
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn q8_output_vnni_decode_records_selected_route() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+    if !x86_q8_vnni_decode_cpu_supported() {
+        std::env::remove_var("CAMELID_X86_Q8_OUTPUT_VNNI_DECODE");
+        return;
+    }
+
+    std::env::set_var(Q8_SCHEDULE_TELEMETRY_ENV, "on");
+    reset_q8_schedule_telemetry();
+    let (input, packed_weight, _expected) = runtime_vnni_packed_output_case();
+
+    let _ = output_projection_runtime_with_plan(
+        &input,
+        &packed_weight,
+        "logits",
+        &output_vnni_decode_plan(true),
+        false,
+    )
+    .unwrap();
+
+    let telemetry = snapshot_q8_schedule_telemetry();
+    assert!(telemetry
+        .output_projection_by_route
+        .contains_key("logits.x86_output_vnni_decode_consumer"));
+    reset_q8_schedule_telemetry();
+    std::env::remove_var(Q8_SCHEDULE_TELEMETRY_ENV);
+    std::env::remove_var("CAMELID_X86_Q8_OUTPUT_VNNI_DECODE");
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn q8_output_vnni_decode_rawptr_matches_rows4_decode_baseline() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+    if !x86_q8_vnni_decode_cpu_supported() {
+        std::env::remove_var("CAMELID_X86_Q8_OUTPUT_VNNI_DECODE");
+        std::env::remove_var("CAMELID_X86_Q8_OUTPUT_VNNI_DECODE_RAWPTR");
+        return;
+    }
+
+    std::env::set_var("CAMELID_X86_Q8_OUTPUT_VNNI_DECODE_RAWPTR", "on");
+    let (input, packed_weight, expected) = runtime_vnni_packed_output_case();
+    let actual = output_projection_runtime_with_plan(
+        &input,
+        &packed_weight,
+        "logits",
+        &output_vnni_decode_plan(true),
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(actual.shape.dims, expected.shape.dims);
+    assert_slice_close_with_tolerance(&actual.data, &expected.data, 5e-4);
+    std::env::remove_var("CAMELID_X86_Q8_OUTPUT_VNNI_DECODE_RAWPTR");
+    std::env::remove_var("CAMELID_X86_Q8_OUTPUT_VNNI_DECODE");
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]

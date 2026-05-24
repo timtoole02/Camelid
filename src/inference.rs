@@ -7038,15 +7038,51 @@ fn try_x86_q8_output_decode_owner_path(
     }
     let telemetry_started = q8_schedule_telemetry_enabled().then(Instant::now);
     let quantized_input = quantize_q8_0_row(&input.data[..input_width]);
-    let output = q8_0_packed_rows4_single_input_projection(
-        packed,
-        &quantized_input.blocks,
-        borrowed.rows,
-        name,
-    )?;
+    let use_vnni = runtime_plan.q8.output_vnni_decode
+        && borrowed.rows.is_multiple_of(64)
+        && packed.vnni_packed.is_some()
+        && x86_q8_vnni_decode_cpu_supported();
+    let output = if use_vnni {
+        q8_0_vnni_decode_1x64_projection(
+            packed.vnni_packed.as_ref().expect("checked VNNI sidecar"),
+            &quantized_input.blocks,
+            borrowed.rows,
+            name,
+            runtime_plan.q8.output_vnni_decode_rawptr,
+        )?
+    } else {
+        if runtime_plan.q8.output_vnni_decode {
+            let reason = if !x86_q8_vnni_decode_cpu_supported() {
+                "cpu_feature_missing"
+            } else if !borrowed.rows.is_multiple_of(64) {
+                "bad_output_width"
+            } else {
+                "missing_vnni_pack"
+            };
+            record_q8_schedule_projection_route_denial(
+                "logits",
+                "x86_output_vnni_decode_consumer",
+                reason,
+                1,
+                input_width,
+                borrowed.rows,
+            );
+        }
+        q8_0_packed_rows4_single_input_projection(
+            packed,
+            &quantized_input.blocks,
+            borrowed.rows,
+            name,
+        )?
+    };
+    let route_name = if use_vnni {
+        q8_output_vnni_decode_route_name(runtime_plan.q8.output_vnni_decode_rawptr)
+    } else {
+        "x86_output_decode_owner"
+    };
     record_q8_schedule_projection_route_elapsed(
         "logits",
-        "x86_output_decode_owner",
+        route_name,
         name,
         1,
         input_width,
@@ -8147,6 +8183,18 @@ fn q8_ffn_down_vnni_decode_route_name(use_rawptr: bool) -> &'static str {
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     let _ = use_rawptr;
     "x86_vnni_decode_consumer"
+}
+
+fn q8_output_vnni_decode_route_name(use_rawptr: bool) -> &'static str {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        if use_rawptr {
+            return "x86_output_vnni_decode_rawptr_consumer";
+        }
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    let _ = use_rawptr;
+    "x86_output_vnni_decode_consumer"
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]

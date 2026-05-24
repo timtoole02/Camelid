@@ -16,6 +16,8 @@ pub(super) struct Q8RuntimeFlags {
     pub(super) output_packed_rows4_matmul: bool,
     pub(super) output_amx_prefill: bool,
     pub(super) output_decode_owner: bool,
+    pub(super) output_vnni_decode: bool,
+    pub(super) output_vnni_decode_rawptr: bool,
     pub(super) ffn_gate_up_decode_consumer: bool,
     pub(super) ffn_gate_up_decode_group_chunking: bool,
     pub(super) ffn_gate_up_decode_fused_activation: bool,
@@ -88,6 +90,12 @@ impl Q8RuntimeFlags {
             ),
             output_decode_owner: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_OUTPUT_DECODE_OWNER",
+            ),
+            output_vnni_decode: q8_0_env_flag_enabled_default_off(
+                "CAMELID_X86_Q8_OUTPUT_VNNI_DECODE",
+            ),
+            output_vnni_decode_rawptr: q8_0_env_flag_enabled_default_off(
+                "CAMELID_X86_Q8_OUTPUT_VNNI_DECODE_RAWPTR",
             ),
             ffn_gate_up_decode_consumer: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER",

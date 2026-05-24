@@ -436,6 +436,7 @@ fn x86_q8_amx_repack_enabled() -> bool {
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn x86_q8_vnni_decode_repack_enabled() -> bool {
     env_flag_enabled("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE")
+        || env_flag_enabled("CAMELID_X86_Q8_OUTPUT_VNNI_DECODE")
 }
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
@@ -3261,6 +3262,32 @@ mod tests {
         }
 
         std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE");
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn q8_0_vnni_pack_allows_output_gate_to_request_sidecar() {
+        let _env_guard = env_lock();
+        std::env::set_var("CAMELID_X86_Q8_OUTPUT_VNNI_DECODE", "on");
+        let rows = 16;
+        let blocks_per_row = 1;
+        let mut bytes = Vec::with_capacity(rows * blocks_per_row * Q8_0_BLOCK_BYTES);
+        for row in 0..rows {
+            let scale_bits = 0x3200_u16 + row as u16;
+            bytes.extend_from_slice(&scale_bits.to_le_bytes());
+            bytes.extend((0..32).map(|idx| (idx as i8).wrapping_add(row as i8 * 3) as u8));
+        }
+
+        let packed = Q8_0PackedRows4::from_q8_0_bytes(
+            rows,
+            blocks_per_row,
+            Q8_0PackedRows4Interleave::I8,
+            &bytes,
+        )
+        .unwrap();
+
+        assert!(packed.vnni_packed.is_some());
+        std::env::remove_var("CAMELID_X86_Q8_OUTPUT_VNNI_DECODE");
     }
 
     #[test]
