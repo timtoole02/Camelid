@@ -7103,10 +7103,20 @@ enum X86Q8AttentionQkvRouteKind {
     PackedRows4Matmul,
 }
 
+impl X86Q8AttentionQkvRouteKind {
+    fn telemetry_name(self) -> &'static str {
+        match self {
+            Self::Decode => "decode_consumer",
+            Self::PackedRows4Matmul => "packed_rows4_matmul_prefill",
+        }
+    }
+}
+
 struct X86Q8AttentionQkvRoute<'a> {
     q_packed: &'a Q8_0PackedRows4,
     k_packed: &'a Q8_0PackedRows4,
     v_packed: &'a Q8_0PackedRows4,
+    rows: usize,
     input_width: usize,
     q_width: usize,
     k_width: usize,
@@ -7127,34 +7137,121 @@ fn resolve_x86_q8_attention_qkv_route<'a>(
             runtime_plan.q8.attention_qkv_packed_rows4_matmul
         }
     };
+    let route_name = route.telemetry_name();
     if !route_enabled || input.rank() != 2 {
+        record_q8_schedule_projection_route_denial(
+            "attention_qkv",
+            route_name,
+            if !route_enabled {
+                "plan_off"
+            } else {
+                "rank_mismatch"
+            },
+            input.dim(0).unwrap_or(0),
+            input.dim(1).unwrap_or(0),
+            0,
+        );
         return Ok(None);
     }
 
     let rows = input.dim(0)?;
     match route {
-        X86Q8AttentionQkvRouteKind::Decode if rows != 1 => return Ok(None),
-        X86Q8AttentionQkvRouteKind::PackedRows4Matmul if rows <= 1 => return Ok(None),
+        X86Q8AttentionQkvRouteKind::Decode if rows != 1 => {
+            record_q8_schedule_projection_route_denial(
+                "attention_qkv",
+                route_name,
+                "prefill_or_empty_input",
+                rows,
+                input.dim(1).unwrap_or(0),
+                0,
+            );
+            return Ok(None);
+        }
+        X86Q8AttentionQkvRouteKind::PackedRows4Matmul if rows <= 1 => {
+            record_q8_schedule_projection_route_denial(
+                "attention_qkv",
+                route_name,
+                "decode_or_empty_input",
+                rows,
+                input.dim(1).unwrap_or(0),
+                0,
+            );
+            return Ok(None);
+        }
         _ => {}
     }
 
     let input_width = input.dim(1)?;
     if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        record_q8_schedule_projection_route_denial(
+            "attention_qkv",
+            route_name,
+            "bad_input_width",
+            rows,
+            input_width,
+            0,
+        );
         return Ok(None);
     }
 
     let Some((q_packed, q_width)) = q8_0_runtime_packed_projection(q_weight, input_width)? else {
+        record_q8_schedule_projection_route_denial(
+            "attention_qkv",
+            route_name,
+            "no_runtime_packed_q",
+            rows,
+            input_width,
+            0,
+        );
         return Ok(None);
     };
     let Some((k_packed, k_width)) = q8_0_runtime_packed_projection(k_weight, input_width)? else {
+        record_q8_schedule_projection_route_denial(
+            "attention_qkv",
+            route_name,
+            "no_runtime_packed_k",
+            rows,
+            input_width,
+            q_width,
+        );
         return Ok(None);
     };
     let Some((v_packed, v_width)) = q8_0_runtime_packed_projection(v_weight, input_width)? else {
+        record_q8_schedule_projection_route_denial(
+            "attention_qkv",
+            route_name,
+            "no_runtime_packed_v",
+            rows,
+            input_width,
+            q_width,
+        );
         return Ok(None);
     };
     if q_packed.blocks_per_row != k_packed.blocks_per_row
         || q_packed.blocks_per_row != v_packed.blocks_per_row
     {
+        record_q8_schedule_projection_route_denial(
+            "attention_qkv",
+            route_name,
+            "packed_block_stride_mismatch",
+            rows,
+            input_width,
+            q_width,
+        );
+        return Ok(None);
+    }
+    if q_packed.interleave != Q8_0PackedRows4Interleave::I8
+        || k_packed.interleave != Q8_0PackedRows4Interleave::I8
+        || v_packed.interleave != Q8_0PackedRows4Interleave::I8
+    {
+        record_q8_schedule_projection_route_denial(
+            "attention_qkv",
+            route_name,
+            "non_i8_interleave",
+            rows,
+            input_width,
+            q_width,
+        );
         return Ok(None);
     }
 
@@ -7162,6 +7259,7 @@ fn resolve_x86_q8_attention_qkv_route<'a>(
         q_packed,
         k_packed,
         v_packed,
+        rows,
         input_width,
         q_width,
         k_width,
@@ -7189,6 +7287,7 @@ fn try_x86_q8_attention_qkv_decode_consumer_path(
     };
 
     let quantized_input = quantize_q8_0_row(&input.data[..route.input_width]);
+    let telemetry_started = q8_schedule_telemetry_enabled().then(Instant::now);
     let (q, k, v) = q8_0_packed_rows4_single_input_projection_triplet_from_quantized(
         route.q_packed,
         route.k_packed,
@@ -7200,6 +7299,15 @@ fn try_x86_q8_attention_qkv_decode_consumer_path(
         runtime_plan.q8.attention_qkv_decode_group_chunking
             && x86_q8_attention_qkv_decode_group_chunking_enabled(),
     )?;
+    record_q8_schedule_projection_route_elapsed(
+        "attention_qkv",
+        X86Q8AttentionQkvRouteKind::Decode.telemetry_name(),
+        &q.name,
+        route.rows,
+        route.input_width,
+        route.q_width,
+        telemetry_started,
+    );
     Ok(Some((q, k, v)))
 }
 
@@ -7222,6 +7330,7 @@ fn try_x86_q8_attention_qkv_packed_rows4_matmul_path(
         return Ok(None);
     };
 
+    let projection_started = Instant::now();
     let (q, k, v) = with_q8_0_quantized_matmul_input_rows(
         input,
         route.q_packed.blocks_per_row,
@@ -7238,6 +7347,15 @@ fn try_x86_q8_attention_qkv_packed_rows4_matmul_path(
             )
         },
     )?;
+    record_q8_schedule_output_projection_route_call(
+        "attention_qkv",
+        X86Q8AttentionQkvRouteKind::PackedRows4Matmul.telemetry_name(),
+        Some(&q.name),
+        route.rows,
+        route.input_width,
+        route.q_width,
+        projection_started.elapsed().as_micros(),
+    );
     Ok(Some((q, k, v)))
 }
 
