@@ -121,10 +121,26 @@ function exactArtifactMissingHint(target) {
   }
 }
 
+function exactArtifactQuantMissingHint(target) {
+  return {
+    kind: 'quant_missing',
+    target,
+    confidence: 'exact GGUF filename without decoded GGUF quant metadata',
+    exact: true,
+  }
+}
+
+function hasExplicitQuantEvidence(model, catalogItem) {
+  return Boolean(model?.quant || catalogItem?.quant)
+}
+
 function applyExactArtifactGate(hint, model, catalogItem) {
   if (!hint?.target) return hint
   if (hint.kind === 'quant_mismatch') return hint
   if (!hasExactArtifactIdentity(hint.target, model, catalogItem)) return exactArtifactMissingHint(hint.target)
+  if (hint.kind === 'compatibility' && exactArtifactFilenameForRow(hint.target) && !hasExplicitQuantEvidence(model, catalogItem)) {
+    return exactArtifactQuantMissingHint(hint.target)
+  }
   return hint
 }
 
