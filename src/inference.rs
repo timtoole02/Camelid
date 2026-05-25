@@ -7135,6 +7135,7 @@ fn resolve_x86_q8_attention_qkv_route<'a>(
         X86Q8AttentionQkvRouteKind::Decode => runtime_plan.q8.attention_qkv_decode_consumer,
         X86Q8AttentionQkvRouteKind::PackedRows4Matmul => {
             runtime_plan.q8.attention_qkv_packed_rows4_matmul
+                || x86_q8_attention_qkv_prefill_consumer_enabled()
         }
     };
     let route_name = route.telemetry_name();

@@ -3215,6 +3215,41 @@ fn q8_attention_qkv_prefill_route_resolver_records_route_and_denials() {
     std::env::remove_var(Q8_SCHEDULE_TELEMETRY_ENV);
 }
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[test]
+fn q8_attention_qkv_prefill_flag_enables_route_without_legacy_matmul_gate() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+    std::env::set_var("CAMELID_X86_Q8_ATTENTION_QKV_PREFILL_CONSUMER", "on");
+
+    let (_decode_input, q_weight, _q_expected) =
+        runtime_packed_attention_projection_case("attention_q", "blk.0.attn_q.weight");
+    let (_, k_weight, _k_expected) =
+        runtime_packed_attention_projection_case("attention_k", "blk.0.attn_k.weight");
+    let (_, v_weight, _v_expected) =
+        runtime_packed_attention_projection_case("attention_v", "blk.0.attn_v.weight");
+    let input_width = q_weight.dim(0).unwrap();
+    let prefill_input = CpuTensor::from_f32(
+        "prefill_qkv_context",
+        vec![3, input_width],
+        vec![0.0; 3 * input_width],
+    )
+    .unwrap();
+
+    let route = resolve_x86_q8_attention_qkv_route(
+        &prefill_input,
+        &q_weight,
+        &k_weight,
+        &v_weight,
+        &attention_qkv_packed_rows4_matmul_plan(false),
+        X86Q8AttentionQkvRouteKind::PackedRows4Matmul,
+    )
+    .unwrap();
+    assert!(route.is_some());
+
+    std::env::remove_var("CAMELID_X86_Q8_ATTENTION_QKV_PREFILL_CONSUMER");
+}
+
 #[test]
 fn q8_attention_qkv_packed_rows4_matmul_matches_runtime_packed_baseline_for_prefill() {
     let _env_guard = env_lock();
