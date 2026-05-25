@@ -1664,6 +1664,7 @@ fn q8_0_hot_path_uses_resolved_plan_not_current_env() {
             attention_output_packed_rows4_matmul: false,
             attention_qkv_decode_consumer: false,
             attention_qkv_decode_group_chunking: false,
+            attention_qkv_prefill_consumer: false,
             attention_qkv_packed_rows4_matmul: false,
             output_packed_rows4_matmul: false,
             output_amx_prefill: false,
@@ -2540,6 +2541,12 @@ fn attention_qkv_packed_rows4_matmul_plan(enabled: bool) -> ResolvedRuntimePlan 
     plan
 }
 
+fn attention_qkv_prefill_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
+    let mut plan = q8_attention_consumer_plan(false, false);
+    plan.q8.attention_qkv_prefill_consumer = enabled;
+    plan
+}
+
 fn attention_output_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
     let mut plan = q8_attention_consumer_plan(false, false);
     plan.q8.attention_output_decode_consumer = enabled;
@@ -2572,6 +2579,7 @@ fn q8_attention_consumer_plan(
             attention_output_packed_rows4_matmul: false,
             attention_qkv_decode_consumer,
             attention_qkv_decode_group_chunking: false,
+            attention_qkv_prefill_consumer: false,
             attention_qkv_packed_rows4_matmul: false,
             output_packed_rows4_matmul: false,
             output_amx_prefill: false,
@@ -3127,10 +3135,53 @@ fn q8_attention_qkv_prefill_consumer_gate_is_default_off() {
     let _env_guard = env_lock();
     clear_dense_diagnostic_env();
     std::env::remove_var("CAMELID_X86_Q8_ATTENTION_QKV_PREFILL_CONSUMER");
-    assert!(!x86_q8_attention_qkv_prefill_consumer_enabled());
+    assert!(!Q8RuntimeFlags::from_env().attention_qkv_prefill_consumer);
     std::env::set_var("CAMELID_X86_Q8_ATTENTION_QKV_PREFILL_CONSUMER", "on");
-    assert!(x86_q8_attention_qkv_prefill_consumer_enabled());
+    assert!(Q8RuntimeFlags::from_env().attention_qkv_prefill_consumer);
     std::env::remove_var("CAMELID_X86_Q8_ATTENTION_QKV_PREFILL_CONSUMER");
+}
+
+#[test]
+fn q8_attention_qkv_prefill_route_uses_resolved_plan_not_current_env() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+    let (_decode_input, q_weight, _q_expected) =
+        runtime_packed_attention_projection_case("attention_q", "blk.0.attn_q.weight");
+    let (_, k_weight, _k_expected) =
+        runtime_packed_attention_projection_case("attention_k", "blk.0.attn_k.weight");
+    let (_, v_weight, _v_expected) =
+        runtime_packed_attention_projection_case("attention_v", "blk.0.attn_v.weight");
+    let input_width = q_weight.dim(0).unwrap();
+    let prefill_input = CpuTensor::from_f32(
+        "prefill_qkv_context",
+        vec![3, input_width],
+        vec![0.0; 3 * input_width],
+    )
+    .unwrap();
+
+    std::env::set_var("CAMELID_X86_Q8_ATTENTION_QKV_PREFILL_CONSUMER", "on");
+    assert!(resolve_x86_q8_attention_qkv_route(
+        &prefill_input,
+        &q_weight,
+        &k_weight,
+        &v_weight,
+        &attention_qkv_prefill_consumer_plan(false),
+        X86Q8AttentionQkvRouteKind::PackedRows4Matmul,
+    )
+    .unwrap()
+    .is_none());
+
+    std::env::remove_var("CAMELID_X86_Q8_ATTENTION_QKV_PREFILL_CONSUMER");
+    assert!(resolve_x86_q8_attention_qkv_route(
+        &prefill_input,
+        &q_weight,
+        &k_weight,
+        &v_weight,
+        &attention_qkv_prefill_consumer_plan(true),
+        X86Q8AttentionQkvRouteKind::PackedRows4Matmul,
+    )
+    .unwrap()
+    .is_some());
 }
 
 #[test]
@@ -3491,6 +3542,7 @@ fn ffn_down_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             attention_output_packed_rows4_matmul: false,
             attention_qkv_decode_consumer: false,
             attention_qkv_decode_group_chunking: false,
+            attention_qkv_prefill_consumer: false,
             attention_qkv_packed_rows4_matmul: false,
             output_packed_rows4_matmul: false,
             output_amx_prefill: false,
@@ -3541,6 +3593,7 @@ fn ffn_down_packed_rows4_matmul_plan(enabled: bool) -> ResolvedRuntimePlan {
             attention_output_packed_rows4_matmul: false,
             attention_qkv_decode_consumer: false,
             attention_qkv_decode_group_chunking: false,
+            attention_qkv_prefill_consumer: false,
             attention_qkv_packed_rows4_matmul: false,
             output_packed_rows4_matmul: false,
             output_amx_prefill: false,
@@ -3595,6 +3648,7 @@ fn ffn_gate_up_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             attention_output_packed_rows4_matmul: false,
             attention_qkv_decode_consumer: false,
             attention_qkv_decode_group_chunking: false,
+            attention_qkv_prefill_consumer: false,
             attention_qkv_packed_rows4_matmul: false,
             output_packed_rows4_matmul: false,
             output_amx_prefill: false,

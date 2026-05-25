@@ -1142,10 +1142,12 @@ impl LlamaInferenceSession {
         trace_forward_memory("prefill_chunk_embedding_done");
         let layers_started = Instant::now();
         let rms_norm_epsilon = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
+        let runtime_plan = ResolvedRuntimePlan::from_env()?;
         for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
             let timed = forward_prefill_layer_chunk_timed(
                 &hidden,
                 layer,
+                &runtime_plan,
                 PrefillLayerChunkParams {
                     config: &self.config,
                     rope_freqs: self.weights.rope_freqs.as_ref(),
@@ -1241,6 +1243,7 @@ impl LlamaInferenceSession {
 
         let layers_started = Instant::now();
         let rms_norm_epsilon = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
+        let runtime_plan = ResolvedRuntimePlan::from_env()?;
         let hidden_width = hidden.dim(1)?;
         let hidden_dims = vec![token_ids.len(), hidden_width];
         let capture_prefill_attribution = prefill_layer_major_attribution_enabled();
@@ -1276,6 +1279,7 @@ impl LlamaInferenceSession {
                 let timed = forward_prefill_layer_chunk_timed(
                     &hidden_chunk,
                     layer,
+                    &runtime_plan,
                     PrefillLayerChunkParams {
                         config: &self.config,
                         rope_freqs: self.weights.rope_freqs.as_ref(),
@@ -3270,6 +3274,7 @@ struct LlamaTimedLayerOutput {
 fn forward_prefill_layer_chunk_timed(
     hidden: &CpuTensor,
     layer: &LlamaLayerWeights,
+    runtime_plan: &ResolvedRuntimePlan,
     params: PrefillLayerChunkParams<'_>,
     kv_cache: &mut LlamaKvCache,
 ) -> Result<LlamaTimedLayerOutput> {
@@ -3312,8 +3317,7 @@ fn forward_prefill_layer_chunk_timed(
     trace_chunk_memory("attention_norm_done");
 
     let qkv_started = Instant::now();
-    let shared_qkv = if x86_q8_attention_qkv_prefill_consumer_enabled() {
-        let runtime_plan = ResolvedRuntimePlan::from_env()?;
+    let shared_qkv = if runtime_plan.q8.attention_qkv_prefill_consumer {
         try_x86_q8_attention_qkv_packed_rows4_matmul_path(
             &attn_norm,
             &layer.attention_q,
@@ -7061,20 +7065,6 @@ fn try_x86_q8_output_decode_owner_path(
     Ok(Some(output))
 }
 
-fn x86_q8_attention_qkv_prefill_consumer_enabled() -> bool {
-    #[cfg(test)]
-    {
-        q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_ATTENTION_QKV_PREFILL_CONSUMER")
-    }
-    #[cfg(not(test))]
-    {
-        static X86_Q8_ATTENTION_QKV_PREFILL_CONSUMER: OnceLock<bool> = OnceLock::new();
-        *X86_Q8_ATTENTION_QKV_PREFILL_CONSUMER.get_or_init(|| {
-            q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_ATTENTION_QKV_PREFILL_CONSUMER")
-        })
-    }
-}
-
 fn x86_q8_attention_qkv_decode_group_chunking_enabled() -> bool {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
@@ -7130,6 +7120,7 @@ fn resolve_x86_q8_attention_qkv_route<'a>(
         X86Q8AttentionQkvRouteKind::Decode => runtime_plan.q8.attention_qkv_decode_consumer,
         X86Q8AttentionQkvRouteKind::PackedRows4Matmul => {
             runtime_plan.q8.attention_qkv_packed_rows4_matmul
+                || runtime_plan.q8.attention_qkv_prefill_consumer
         }
     };
     if !route_enabled || input.rank() != 2 {
