@@ -1,8 +1,8 @@
 {
   "schema": "camelid.metadata-jinja-llama32-1b-current-head-parity.v1",
-  "pack": "/home/ubuntu/work/camelid-sev1-current-head-20260514T113048Z-head-7ac14462bbe7/qa/prompt-packs/llama3-context-8192-smoke.json",
+  "pack": "/sanitized/work/camelid-sev1-current-head-20260514T113048Z-head-7ac14462bbe7/qa/prompt-packs/llama3-context-8192-smoke.json",
   "prompt_id": "roughly-8192-token-recall",
-  "model": "/home/ubuntu/models/Llama-3.2-1B-Instruct-Q8_0.gguf",
+  "model": "/sanitized/models/Llama-3.2-1B-Instruct-Q8_0.gguf",
   "model_id": "llama32_1b_instruct_q8_0",
   "context": 8192,
   "max_tokens": 5,

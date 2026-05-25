@@ -1,8 +1,8 @@
 schema=camelid.same_host_llama3_benchmark_plan.v1
 row_id=llama32_3b_instruct_q8_0
-harness_command=node scripts/bench-llama3-same-host.mjs --model /home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf --model-id llama32-3b-q8-throughput --row-id llama32_3b_instruct_q8_0 --max-tokens 16 --warmup 1 --repeats 3 --threads 8 --out /home/ubuntu/work/camelid-sev1-current-head-20260514T113048Z-head-7ac14462bbe7/qa/evidence-bundles/sev1-throughput-harness-plan-current-head-20260514T113631Z-head-7ac14462bbe7/plan.json
-camelid_serve=/home/ubuntu/work/camelid-sev1-current-head-20260514T113048Z-head-7ac14462bbe7/target/release/camelid serve --addr 127.0.0.1:8181
-llama_server=/home/ubuntu/work/llama.cpp/build/bin/llama-server --host 127.0.0.1 --port 8183 -m /home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf -ngl 0 -c 512 --no-warmup -t 8
+harness_command=node scripts/bench-llama3-same-host.mjs --model /sanitized/models/Llama-3.2-3B-Instruct-Q8_0.gguf --model-id llama32-3b-q8-throughput --row-id llama32_3b_instruct_q8_0 --max-tokens 16 --warmup 1 --repeats 3 --threads 8 --out /sanitized/work/camelid-sev1-current-head-20260514T113048Z-head-7ac14462bbe7/qa/evidence-bundles/sev1-throughput-harness-plan-current-head-20260514T113631Z-head-7ac14462bbe7/plan.json
+camelid_serve=/sanitized/work/camelid-sev1-current-head-20260514T113048Z-head-7ac14462bbe7/target/release/camelid serve --addr 127.0.0.1:8181
+llama_server=/sanitized/work/llama.cpp/build/bin/llama-server --host 127.0.0.1 --port 8183 -m /sanitized/models/Llama-3.2-3B-Instruct-Q8_0.gguf -ngl 0 -c 512 --no-warmup -t 8
 outputs=stdout,json
 claim_boundary=Same-host benchmark snapshot only for exact row llama32_3b_instruct_q8_0 with the provided GGUF, prompt, max-token budget, host, binaries, and thread settings. It is bounded timing evidence only: it does not widen support, portability, production-throughput, model-native/larger-context, neighboring-row, broad Llama-family, 1B, or Mixtral claims unless a separate row-specific evidence bundle records those exact conditions.
-json_out=/home/ubuntu/work/camelid-sev1-current-head-20260514T113048Z-head-7ac14462bbe7/qa/evidence-bundles/sev1-throughput-harness-plan-current-head-20260514T113631Z-head-7ac14462bbe7/plan.json
+json_out=/sanitized/work/camelid-sev1-current-head-20260514T113048Z-head-7ac14462bbe7/qa/evidence-bundles/sev1-throughput-harness-plan-current-head-20260514T113631Z-head-7ac14462bbe7/plan.json

@@ -1,7 +1,7 @@
 {
   "schema": "camelid.sev1.backend_build_recovery_current_head.v1",
   "generated_utc": "2026-05-14T12:16:20.555Z",
-  "host": "54.186.43.33",
+  "host": "sanitized-validation-host",
   "base_head": "7ac14462bbe76bacabd51d11f2370e580163291e",
   "disk_cleanup": {
     "action": "removed Ubuntu temp/cache files and cargo target artifacts via cargo clean; preserved model cache because it is required for Llama/Mixtral validation",

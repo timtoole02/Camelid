@@ -1,4 +1,4 @@
 head=7ac14462bbe76bacabd51d11f2370e580163291e
-repo=/home/ubuntu/work/camelid-sev1-current-head-20260514T113048Z-head-7ac14462bbe7
-model=/home/ubuntu/models/mixtral/mixtral-8x7b-instruct-v0.1.Q8_0.gguf
+repo=/sanitized/work/camelid-sev1-current-head-20260514T113048Z-head-7ac14462bbe7
+model=/sanitized/models/mixtral/mixtral-8x7b-instruct-v0.1.Q8_0.gguf
 started_utc=20260514T114731Z

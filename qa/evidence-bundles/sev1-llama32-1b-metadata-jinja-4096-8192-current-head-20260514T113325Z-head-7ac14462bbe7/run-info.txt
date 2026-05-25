@@ -1,4 +1,4 @@
 head=7ac14462bbe76bacabd51d11f2370e580163291e
-repo=/home/ubuntu/work/camelid-sev1-current-head-20260514T113048Z-head-7ac14462bbe7
-model=/home/ubuntu/models/Llama-3.2-1B-Instruct-Q8_0.gguf
+repo=/sanitized/work/camelid-sev1-current-head-20260514T113048Z-head-7ac14462bbe7
+model=/sanitized/models/Llama-3.2-1B-Instruct-Q8_0.gguf
 started_utc=20260514T113325Z
