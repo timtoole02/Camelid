@@ -40,9 +40,19 @@ pub use diagnostic_config::{
 };
 pub use kv_cache::{LlamaKvCache, LlamaKvCachePlan, LlamaKvCachePositionTrace, LlamaKvCacheTrace};
 pub use q8_block_reader::Q8BlockReader;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use q8_runtime::aarch64_dotprod_enabled;
 use q8_runtime::{
     q8_0_env_flag_disabled, q8_0_env_flag_enabled_default_off,
-    q8_0_env_flag_enabled_default_on_fail_closed, Q8RuntimeFlags, ResolvedRuntimePlan,
+    q8_0_env_flag_enabled_default_on_fail_closed,
+    x86_q8_packed_rows4_avx2_dot_decode_hoist_enabled, x86_q8_packed_rows4_avx2_dot_hoist_enabled,
+    Q8RuntimeFlags, ResolvedRuntimePlan,
+};
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use q8_runtime::{
+    x86_q8_kernel_avx2_enabled, x86_q8_packed_rows4_avx2_dot_enabled,
+    x86_q8_packed_rows4_avx512vnni_dpbusd_dot_enabled,
+    x86_q8_packed_rows4_avx512vnni_dpwssd_dot_enabled,
 };
 use q8_telemetry::*;
 pub use q8_telemetry::{
@@ -11769,130 +11779,6 @@ fn q8_0_dot_group4_encoded(weight: &[u8], input: &[i8; Q8_0_BLOCK_VALUES], start
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fn x86_q8_kernel_avx2_enabled() -> bool {
-    #[cfg(test)]
-    {
-        x86_q8_kernel_avx2_enabled_from_env()
-    }
-    #[cfg(not(test))]
-    {
-        static X86_Q8_KERNEL_AVX2_ENABLED: OnceLock<bool> = OnceLock::new();
-        *X86_Q8_KERNEL_AVX2_ENABLED.get_or_init(x86_q8_kernel_avx2_enabled_from_env)
-    }
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fn x86_q8_kernel_avx2_enabled_from_env() -> bool {
-    matches!(
-        env::var("CAMELID_X86_Q8_KERNEL").as_deref(),
-        Ok("avx2") | Ok("AVX2") | Ok("on") | Ok("ON") | Ok("1") | Ok("true") | Ok("TRUE")
-    )
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fn x86_q8_packed_rows4_avx2_dot_enabled() -> bool {
-    #[cfg(test)]
-    {
-        q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT")
-    }
-    #[cfg(not(test))]
-    {
-        static X86_Q8_PACKED_ROWS4_AVX2_DOT_ENABLED: OnceLock<bool> = OnceLock::new();
-        *X86_Q8_PACKED_ROWS4_AVX2_DOT_ENABLED.get_or_init(|| {
-            q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT")
-        })
-    }
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fn x86_q8_packed_rows4_avx512vnni_dpwssd_dot_enabled() -> bool {
-    #[cfg(test)]
-    {
-        q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PACKED_ROWS4_AVX512VNNI_DPWSSD_DOT")
-            && std::arch::is_x86_feature_detected!("avx2")
-            && std::arch::is_x86_feature_detected!("avx512f")
-            && std::arch::is_x86_feature_detected!("avx512bw")
-            && std::arch::is_x86_feature_detected!("avx512vnni")
-    }
-    #[cfg(not(test))]
-    {
-        static X86_Q8_PACKED_ROWS4_AVX512VNNI_DPWSSD_DOT_ENABLED: OnceLock<bool> = OnceLock::new();
-        *X86_Q8_PACKED_ROWS4_AVX512VNNI_DPWSSD_DOT_ENABLED.get_or_init(|| {
-            q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PACKED_ROWS4_AVX512VNNI_DPWSSD_DOT")
-                && std::arch::is_x86_feature_detected!("avx2")
-                && std::arch::is_x86_feature_detected!("avx512f")
-                && std::arch::is_x86_feature_detected!("avx512bw")
-                && std::arch::is_x86_feature_detected!("avx512vnni")
-        })
-    }
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fn x86_q8_packed_rows4_avx512vnni_dpbusd_dot_enabled() -> bool {
-    #[cfg(test)]
-    {
-        q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PACKED_ROWS4_AVX512VNNI_DPBUSD_DOT")
-            && std::arch::is_x86_feature_detected!("avx512f")
-            && std::arch::is_x86_feature_detected!("avx512bw")
-            && std::arch::is_x86_feature_detected!("avx512vnni")
-    }
-    #[cfg(not(test))]
-    {
-        static X86_Q8_PACKED_ROWS4_AVX512VNNI_DPBUSD_DOT_ENABLED: OnceLock<bool> = OnceLock::new();
-        *X86_Q8_PACKED_ROWS4_AVX512VNNI_DPBUSD_DOT_ENABLED.get_or_init(|| {
-            q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PACKED_ROWS4_AVX512VNNI_DPBUSD_DOT")
-                && std::arch::is_x86_feature_detected!("avx512f")
-                && std::arch::is_x86_feature_detected!("avx512bw")
-                && std::arch::is_x86_feature_detected!("avx512vnni")
-        })
-    }
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fn x86_q8_packed_rows4_avx2_dot_hoist_enabled() -> bool {
-    #[cfg(test)]
-    {
-        q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_HOIST")
-            && std::arch::is_x86_feature_detected!("avx2")
-    }
-    #[cfg(not(test))]
-    {
-        static X86_Q8_PACKED_ROWS4_AVX2_DOT_HOIST_ENABLED: OnceLock<bool> = OnceLock::new();
-        *X86_Q8_PACKED_ROWS4_AVX2_DOT_HOIST_ENABLED.get_or_init(|| {
-            q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_HOIST")
-                && std::arch::is_x86_feature_detected!("avx2")
-        })
-    }
-}
-
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-fn x86_q8_packed_rows4_avx2_dot_hoist_enabled() -> bool {
-    false
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fn x86_q8_packed_rows4_avx2_dot_decode_hoist_enabled() -> bool {
-    #[cfg(test)]
-    {
-        q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_DECODE_HOIST")
-            && std::arch::is_x86_feature_detected!("avx2")
-    }
-    #[cfg(not(test))]
-    {
-        static X86_Q8_PACKED_ROWS4_AVX2_DOT_DECODE_HOIST_ENABLED: OnceLock<bool> = OnceLock::new();
-        *X86_Q8_PACKED_ROWS4_AVX2_DOT_DECODE_HOIST_ENABLED.get_or_init(|| {
-            q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_DECODE_HOIST")
-                && std::arch::is_x86_feature_detected!("avx2")
-        })
-    }
-}
-
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-fn x86_q8_packed_rows4_avx2_dot_decode_hoist_enabled() -> bool {
-    false
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn q8_0_i8_block_avx2(weight: *const i8, input: *const i8) -> i32 {
     #[cfg(target_arch = "x86")]
@@ -11946,15 +11832,6 @@ unsafe fn q8_0_i8_block_avx2(weight: *const i8, input: *const i8) -> i32 {
     let sum64 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, 0x4E));
     let sum32 = _mm_add_epi32(sum64, _mm_shuffle_epi32(sum64, 0xB1));
     _mm_cvtsi128_si32(sum32)
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn aarch64_dotprod_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        !q8_0_env_flag_disabled("CAMELID_AARCH64_DOTPROD")
-            && std::arch::is_aarch64_feature_detected!("dotprod")
-    })
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
