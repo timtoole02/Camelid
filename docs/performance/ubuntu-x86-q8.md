@@ -72,6 +72,8 @@ Examples already treated this way include row-dot lookalikes, tile16 hsum/lane/s
 
 The 2026-05-24 current-main AVX2 register-sum recheck also stays rejected for performance retention: exact-row one-token parity still matched llama.cpp, but the cleaned unique-prompt same-host marker run measured Camelid `8837.36 / 8837.65 ms` on `e27a4e1` versus `8823.09 / 8823.37 ms` on `214f733`, so there is no measured Ubuntu x86_64 wall-clock win to retain.
 
+The 2026-05-25 shared-QKV prefill owner rerun also stays rejected for performance retention: after fixing the owner gate in `431092f`, same-host Ubuntu x86_64 route telemetry confirmed `attention_qkv.packed_rows4_matmul_prefill` ran only when `CAMELID_X86_Q8_ATTENTION_QKV_PREFILL_CONSUMER=on`, but Camelid slowed from `3260.20 / 3260.56 ms` to `4043.61 / 4043.92 ms` while llama.cpp stayed essentially flat at `319.32 / 508.83 ms` versus `319.64 / 507.68 ms`. Keep the flag default-off and treat the slice as route-attribution evidence only.
+
 ## Clean-host discipline
 
 Ubuntu x86 Q8 benchmarking now requires a clean host before major runs:
@@ -164,6 +166,7 @@ Primary public evidence anchors for this lane:
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260521T2015Z-vnni-rawptr-avx2/README.md` (default-off Rust AVX2 FFN-down VNNI decode raw-pointer implementation slice; local compile check only, with Linux x86_64 AVX2 parity coverage added for canonical host execution and no throughput/support/default-on promotion)
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260522T2320Z-q8-parity/README.md` (Ubuntu Linux x86_64 same-host Llama 3.2 3B Q8_0 Camelid rawptr-VNNI versus llama.cpp timing slice; llama.cpp remained much faster on TTFT/total elapsed and the deterministic marker guard failed, so no throughput/support/default-on promotion)
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260524T0535Z-avx2-register-sums/README.md` (current-main AVX2 baseline recheck on Ubuntu Linux x86_64: one-token parity stayed exact, but the cleaned unique-prompt marker run was slightly slower than `214f733`, so no measured wall-clock win or promotion is retained)
+- `reports/ubuntu-x86-q8/qkv-prefill-owner-benchmark-20260525T034800Z.md` (same-host Ubuntu Linux x86_64 QKV prefill owner route rerun after the owner-gate fix: telemetry proved the specialized route executed, but Camelid regressed by about `24%`, so the flag stays default-off and the slice is retained only for route-attribution evidence)
 - the retained/reject notes for bounded Ubuntu x86 Q8 experiments kept under `qa/evidence-bundles/`
 
 ## Product/runtime note
