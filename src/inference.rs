@@ -42,7 +42,8 @@ pub use kv_cache::{LlamaKvCache, LlamaKvCachePlan, LlamaKvCachePositionTrace, Ll
 pub use q8_block_reader::Q8BlockReader;
 use q8_runtime::{
     q8_0_env_flag_disabled, q8_0_env_flag_enabled_default_off,
-    q8_0_env_flag_enabled_default_on_fail_closed, Q8RuntimeFlags, ResolvedRuntimePlan,
+    q8_0_env_flag_enabled_default_on_fail_closed, Q8PackedRows4MatmulSchedule, Q8RuntimeFlags,
+    ResolvedRuntimePlan,
 };
 use q8_telemetry::*;
 pub use q8_telemetry::{
@@ -6060,6 +6061,7 @@ fn try_x86_q8_ffn_gate_up_packed_rows4_matmul_path(
                     name,
                     order,
                     quantized_inputs,
+                    runtime_plan.q8_packed_rows4_matmul_schedule,
                 )
             },
         )?;
@@ -6229,6 +6231,7 @@ fn try_gated_ffn_activation_batch_packed_prefill_i8mm(
                     "ffn_gate_mac_q8_gate_up_packed_prefill",
                     "ffn_up_mac_q8_gate_up_packed_prefill",
                     quantized_inputs,
+                    Q8PackedRows4MatmulSchedule::default(),
                 )
             },
         )?;
@@ -6660,9 +6663,11 @@ fn accumulate_linear_row(
 
 #[allow(dead_code)]
 fn should_use_q8_0_block_dot(weight: &CpuTensor, input_width: usize) -> bool {
+    let q8 = Q8RuntimeFlags::from_env();
     let runtime_plan = ResolvedRuntimePlan::from_env().unwrap_or(ResolvedRuntimePlan {
         linear_accumulation_precision: LinearAccumulationPrecision::F32,
-        q8: Q8RuntimeFlags::from_env(),
+        q8,
+        q8_packed_rows4_matmul_schedule: Q8PackedRows4MatmulSchedule::from_q8_flags(q8),
     });
     should_use_q8_0_block_dot_with_plan(weight, input_width, &runtime_plan)
 }
@@ -6683,9 +6688,11 @@ fn should_use_borrowed_q8_0_block_dot(
     weight: BorrowedLinearWeight<'_>,
     input_width: usize,
 ) -> bool {
+    let q8 = Q8RuntimeFlags::from_env();
     let runtime_plan = ResolvedRuntimePlan::from_env().unwrap_or(ResolvedRuntimePlan {
         linear_accumulation_precision: LinearAccumulationPrecision::F32,
-        q8: Q8RuntimeFlags::from_env(),
+        q8,
+        q8_packed_rows4_matmul_schedule: Q8PackedRows4MatmulSchedule::from_q8_flags(q8),
     });
     should_use_borrowed_q8_0_block_dot_with_plan(weight, input_width, &runtime_plan)
 }
@@ -6878,7 +6885,6 @@ fn lazy_q8_0_linear_enabled() -> bool {
 const Q8_0_BLOCK_VALUES: usize = 32;
 const X86_Q8_PACKED_ROWS4_DECODE_PARALLEL_MIN_OUTPUTS: usize = 1024;
 const X86_Q8_PACKED_ROWS4_MATMUL_PARALLEL_MIN_GROUPS: usize = 64;
-const X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK: usize = 8;
 const X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS: usize = 8;
 
 #[derive(Debug, Clone)]
@@ -6938,7 +6944,14 @@ fn try_x86_q8_output_packed_rows4_matmul_path(
         }
     }
 
-    q8_0_packed_rows4_matmul_projection(input, packed, output_width, name).map(Some)
+    q8_0_packed_rows4_matmul_projection(
+        input,
+        packed,
+        output_width,
+        name,
+        runtime_plan.q8_packed_rows4_matmul_schedule,
+    )
+    .map(Some)
 }
 fn try_x86_q8_output_decode_owner_path(
     input: &CpuTensor,
@@ -7235,6 +7248,7 @@ fn try_x86_q8_attention_qkv_packed_rows4_matmul_path(
                 route.k_width,
                 route.v_width,
                 quantized_inputs,
+                runtime_plan.q8_packed_rows4_matmul_schedule,
             )
         },
     )?;
@@ -9206,6 +9220,7 @@ fn q8_0_packed_rows4_matmul_projection(
     packed: &Q8_0PackedRows4,
     output_width: usize,
     name: &str,
+    schedule: Q8PackedRows4MatmulSchedule,
 ) -> Result<CpuTensor> {
     with_q8_0_quantized_matmul_input_rows(input, packed.blocks_per_row, |rows, quantized_inputs| {
         q8_0_packed_rows4_matmul_projection_from_quantized(
@@ -9214,6 +9229,7 @@ fn q8_0_packed_rows4_matmul_projection(
             output_width,
             name,
             quantized_inputs,
+            schedule,
         )
     })
 }
@@ -9261,31 +9277,11 @@ fn should_use_x86_q8_ffn_down_gemm4_row_group_schedule(enabled: bool, input_grou
         && input_groups >= x86_q8_ffn_down_gemm4_row_group_min_input_groups()
 }
 
-fn x86_q8_packed_rows4_matmul_groups_per_chunk() -> usize {
-    #[cfg(test)]
-    {
-        env::var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK)
-    }
-    #[cfg(not(test))]
-    {
-        static X86_Q8_PACKED_ROWS4_MATMUL_CHUNK_GROUPS: OnceLock<usize> = OnceLock::new();
-        *X86_Q8_PACKED_ROWS4_MATMUL_CHUNK_GROUPS.get_or_init(|| {
-            env::var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK")
-                .ok()
-                .and_then(|value| value.parse::<usize>().ok())
-                .filter(|value| *value > 0)
-                .unwrap_or(X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK)
-        })
-    }
-}
-
-fn q8_packed_rows4_matmul_parallel_chunk_floats(total_output_groups: usize) -> usize {
-    let groups_per_chunk =
-        total_output_groups.clamp(1, x86_q8_packed_rows4_matmul_groups_per_chunk());
+fn q8_packed_rows4_matmul_parallel_chunk_floats(
+    total_output_groups: usize,
+    schedule: Q8PackedRows4MatmulSchedule,
+) -> usize {
+    let groups_per_chunk = total_output_groups.clamp(1, schedule.groups_per_chunk);
     groups_per_chunk * 4
 }
 
@@ -9375,6 +9371,7 @@ fn q8_0_packed_rows4_matmul_projection_from_quantized(
     output_width: usize,
     name: &str,
     quantized_inputs: &[Q8_0Block],
+    schedule: Q8PackedRows4MatmulSchedule,
 ) -> Result<CpuTensor> {
     let blocks_per_row = packed.blocks_per_row;
     let expected_quantized_blocks = rows.checked_mul(blocks_per_row).ok_or_else(|| {
@@ -9401,7 +9398,8 @@ fn q8_0_packed_rows4_matmul_projection_from_quantized(
     let mut output = vec![0.0_f32; rows * output_width];
     let use_hoisted_avx2 = x86_q8_packed_rows4_avx2_dot_hoist_enabled();
     if should_parallelize_q8_packed_rows4_matmul(total_output_groups) {
-        let chunk_floats = q8_packed_rows4_matmul_parallel_chunk_floats(total_output_groups);
+        let chunk_floats =
+            q8_packed_rows4_matmul_parallel_chunk_floats(total_output_groups, schedule);
         output
             .par_chunks_mut(chunk_floats)
             .enumerate()
@@ -9718,6 +9716,7 @@ fn q8_0_packed_rows4_gemm4_projection_with_row_group_schedule(
     name: &str,
     row_group_schedule: bool,
     use_avx2: bool,
+    schedule: Q8PackedRows4MatmulSchedule,
 ) -> Result<CpuTensor> {
     let rows = input.dim(0)?;
     let input_width = input.dim(1)?;
@@ -9738,7 +9737,7 @@ fn q8_0_packed_rows4_gemm4_projection_with_row_group_schedule(
 
     let packed_rows = rows / 4 * 4;
     if packed_rows == 0 {
-        return q8_0_packed_rows4_matmul_projection(input, packed, output_width, name);
+        return q8_0_packed_rows4_matmul_projection(input, packed, output_width, name, schedule);
     }
 
     let mut output = vec![0.0_f32; rows * output_width];
@@ -9917,6 +9916,7 @@ fn q8_0_packed_rows4_matmul_projection_pair_from_quantized(
     left_name: &str,
     right_name: &str,
     quantized_inputs: &[Q8_0Block],
+    schedule: Q8PackedRows4MatmulSchedule,
 ) -> Result<(CpuTensor, CpuTensor)> {
     let blocks_per_row = left_packed.blocks_per_row;
     if right_packed.blocks_per_row != blocks_per_row {
@@ -9962,7 +9962,8 @@ fn q8_0_packed_rows4_matmul_projection_pair_from_quantized(
     if left_output_width == right_output_width
         && should_parallelize_q8_packed_rows4_matmul(total_left_output_groups)
     {
-        let chunk_floats = q8_packed_rows4_matmul_parallel_chunk_floats(total_left_output_groups);
+        let chunk_floats =
+            q8_packed_rows4_matmul_parallel_chunk_floats(total_left_output_groups, schedule);
         left_output
             .par_chunks_mut(chunk_floats)
             .zip(right_output.par_chunks_mut(chunk_floats))
@@ -10090,6 +10091,7 @@ fn q8_0_packed_rows4_matmul_projection_pair_activated_from_quantized(
     name: &str,
     order: FfnGateUpOrder,
     quantized_inputs: &[Q8_0Block],
+    schedule: Q8PackedRows4MatmulSchedule,
 ) -> Result<CpuTensor> {
     let (blocks_per_row, output_groups_per_row) = validate_q8_0_packed_rows4_pair_matmul_inputs(
         rows,
@@ -10125,7 +10127,8 @@ fn q8_0_packed_rows4_matmul_projection_pair_activated_from_quantized(
     };
 
     if should_parallelize_q8_packed_rows4_matmul(total_output_groups) {
-        let chunk_floats = q8_packed_rows4_matmul_parallel_chunk_floats(total_output_groups);
+        let chunk_floats =
+            q8_packed_rows4_matmul_parallel_chunk_floats(total_output_groups, schedule);
         output
             .par_chunks_mut(chunk_floats)
             .enumerate()
@@ -10155,6 +10158,7 @@ fn q8_0_packed_rows4_matmul_projection_triplet_from_quantized(
     k_width: usize,
     v_width: usize,
     quantized_inputs: &[Q8_0Block],
+    schedule: Q8PackedRows4MatmulSchedule,
 ) -> Result<(CpuTensor, CpuTensor, CpuTensor)> {
     let blocks_per_row = q_packed.blocks_per_row;
     if k_packed.blocks_per_row != blocks_per_row || v_packed.blocks_per_row != blocks_per_row {
@@ -10202,7 +10206,8 @@ fn q8_0_packed_rows4_matmul_projection_triplet_from_quantized(
         && q_width == v_width
         && should_parallelize_q8_packed_rows4_matmul(total_q_output_groups)
     {
-        let chunk_floats = q8_packed_rows4_matmul_parallel_chunk_floats(total_q_output_groups);
+        let chunk_floats =
+            q8_packed_rows4_matmul_parallel_chunk_floats(total_q_output_groups, schedule);
         q_output
             .par_chunks_mut(chunk_floats)
             .zip(k_output.par_chunks_mut(chunk_floats))
@@ -10362,7 +10367,14 @@ fn try_x86_q8_attention_output_packed_rows4_matmul_path(
         return Ok(None);
     }
 
-    q8_0_packed_rows4_matmul_projection(input, packed, output_width, name).map(Some)
+    q8_0_packed_rows4_matmul_projection(
+        input,
+        packed,
+        output_width,
+        name,
+        runtime_plan.q8_packed_rows4_matmul_schedule,
+    )
+    .map(Some)
 }
 
 fn try_x86_q8_attention_projection_decode_consumer_path(
@@ -10438,8 +10450,13 @@ fn try_x86_q8_ffn_down_packed_rows4_matmul_path(
 
     let rows = input.dim(0)?;
     let telemetry_started = q8_schedule_telemetry_enabled().then(Instant::now);
-    let output =
-        q8_0_packed_rows4_matmul_projection(input, route.packed, route.output_width, name)?;
+    let output = q8_0_packed_rows4_matmul_projection(
+        input,
+        route.packed,
+        route.output_width,
+        name,
+        runtime_plan.q8_packed_rows4_matmul_schedule,
+    )?;
     record_q8_schedule_projection_route_elapsed(
         "ffn_down",
         "x86_packed_rows4_matmul",
@@ -10490,6 +10507,7 @@ fn try_x86_q8_ffn_down_gemm4_prefill_path(
                 name,
                 runtime_plan.q8.ffn_down_gemm4_row_group_schedule,
                 runtime_plan.q8.ffn_down_gemm4_avx2,
+                runtime_plan.q8_packed_rows4_matmul_schedule,
             )?;
             let route_name = if runtime_plan.q8.ffn_down_gemm4_row_group_schedule {
                 "x86_gemm4_prefill_row_group"
@@ -10506,6 +10524,7 @@ fn try_x86_q8_ffn_down_gemm4_prefill_path(
             name,
             runtime_plan.q8.ffn_down_gemm4_row_group_schedule,
             runtime_plan.q8.ffn_down_gemm4_avx2,
+            runtime_plan.q8_packed_rows4_matmul_schedule,
         )?;
         let route_name = if runtime_plan.q8.ffn_down_gemm4_row_group_schedule {
             "x86_gemm4_prefill_row_group"
@@ -10555,7 +10574,13 @@ fn try_x86_q8_ffn_down_single_owner_path(
             name,
         )?
     } else {
-        q8_0_packed_rows4_matmul_projection(input, route.packed, route.output_width, name)?
+        q8_0_packed_rows4_matmul_projection(
+            input,
+            route.packed,
+            route.output_width,
+            name,
+            runtime_plan.q8_packed_rows4_matmul_schedule,
+        )?
     };
     let route_name = if rows == 1 {
         "x86_single_owner_decode"
@@ -12305,9 +12330,11 @@ fn accumulate_transposed_linear_row_runtime(
     output: &mut [f32],
     precision: LinearAccumulationPrecision,
 ) -> Result<()> {
+    let q8 = Q8RuntimeFlags::from_env();
     let runtime_plan = ResolvedRuntimePlan {
         linear_accumulation_precision: precision,
-        q8: Q8RuntimeFlags::from_env(),
+        q8,
+        q8_packed_rows4_matmul_schedule: Q8PackedRows4MatmulSchedule::from_q8_flags(q8),
     };
     accumulate_transposed_linear_row_runtime_with_plan(input_row, weight, output, &runtime_plan)
 }
@@ -12707,9 +12734,11 @@ fn accumulate_transposed_linear_row_with_precision(
     output: &mut [f32],
     precision: LinearAccumulationPrecision,
 ) {
+    let q8 = Q8RuntimeFlags::from_env();
     let runtime_plan = ResolvedRuntimePlan {
         linear_accumulation_precision: precision,
-        q8: Q8RuntimeFlags::from_env(),
+        q8,
+        q8_packed_rows4_matmul_schedule: Q8PackedRows4MatmulSchedule::from_q8_flags(q8),
     };
     accumulate_transposed_linear_row_with_precision_with_plan(
         input_row,

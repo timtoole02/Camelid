@@ -3,6 +3,8 @@ use std::env;
 use super::{diagnostic_linear_accumulation_precision, LinearAccumulationPrecision};
 use crate::Result;
 
+pub(super) const X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK_DEFAULT: usize = 8;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Q8RuntimeFlags {
     pub(super) block_dot: bool,
@@ -41,16 +43,24 @@ pub(super) struct Q8RuntimeFlags {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Q8PackedRows4MatmulSchedule {
+    pub(super) groups_per_chunk: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ResolvedRuntimePlan {
     pub(super) linear_accumulation_precision: LinearAccumulationPrecision,
     pub(super) q8: Q8RuntimeFlags,
+    pub(super) q8_packed_rows4_matmul_schedule: Q8PackedRows4MatmulSchedule,
 }
 
 impl ResolvedRuntimePlan {
     pub(super) fn from_env() -> Result<Self> {
+        let q8 = Q8RuntimeFlags::from_env();
         Ok(Self {
             linear_accumulation_precision: diagnostic_linear_accumulation_precision()?,
-            q8: Q8RuntimeFlags::from_env(),
+            q8,
+            q8_packed_rows4_matmul_schedule: Q8PackedRows4MatmulSchedule::from_q8_flags(q8),
         })
     }
 }
@@ -159,6 +169,14 @@ impl Q8RuntimeFlags {
         }
     }
 
+    fn any_packed_rows4_matmul_enabled(self) -> bool {
+        self.attention_output_packed_rows4_matmul
+            || self.attention_qkv_packed_rows4_matmul
+            || self.output_packed_rows4_matmul
+            || self.ffn_gate_up_packed_rows4_matmul
+            || self.ffn_down_packed_rows4_matmul
+    }
+
     pub(super) fn hybrid_gpu_rows_for_output(self, output_rows: usize) -> usize {
         if output_rows < 2 {
             return 0;
@@ -169,6 +187,29 @@ impl Q8RuntimeFlags {
         ((output_rows * self.hybrid_gpu_percent).div_ceil(100))
             .max(1)
             .min(output_rows.saturating_sub(1))
+    }
+}
+
+impl Default for Q8PackedRows4MatmulSchedule {
+    fn default() -> Self {
+        Self {
+            groups_per_chunk: X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK_DEFAULT,
+        }
+    }
+}
+
+impl Q8PackedRows4MatmulSchedule {
+    pub(super) fn from_q8_flags(q8: Q8RuntimeFlags) -> Self {
+        if !q8.any_packed_rows4_matmul_enabled() {
+            return Self::default();
+        }
+        Self {
+            groups_per_chunk: env::var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK")
+                .ok()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK_DEFAULT),
+        }
     }
 }
 

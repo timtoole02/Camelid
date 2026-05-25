@@ -46,6 +46,7 @@ const MANAGED_ENV_KEYS: &[&str] = &[
     "CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUPS_PER_CHUNK",
     "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUPS_PER_CHUNK",
     "CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS",
+    "CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK",
 ];
 
 struct ManagedPassthroughEnvKey {
@@ -65,6 +66,10 @@ const MANAGED_PASSTHROUGH_ENV_KEYS: &[ManagedPassthroughEnvKey] = &[
     ManagedPassthroughEnvKey {
         key: "CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS",
         owner_gate: "CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_SCHED",
+    },
+    ManagedPassthroughEnvKey {
+        key: "CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK",
+        owner_gate: "CAMELID_X86_Q8_PACKED_ROWS4_MATMUL",
     },
 ];
 
@@ -972,6 +977,7 @@ mod tests {
             "CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR",
             "CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER",
             "CAMELID_X86_Q8_OUTPUT_DECODE_OWNER",
+            "CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK",
         ] {
             env::remove_var(key);
         }
@@ -1561,6 +1567,7 @@ mod tests {
             "CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS",
             "3",
         );
+        env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK", "9");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_AVX2", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_AMX_PREFILL", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_SINGLE_OWNER", "on");
@@ -1595,6 +1602,7 @@ mod tests {
         assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_PREFILL").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_SCHED").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS").is_err());
+        assert!(env::var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_AVX2").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_AMX_PREFILL").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_SINGLE_OWNER").is_err());
@@ -1616,6 +1624,7 @@ mod tests {
             "CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS",
             "3",
         );
+        env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK", "9");
         let planner_env = PlannerEnv::capture();
 
         env::set_var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUPS_PER_CHUNK", "99");
@@ -1624,6 +1633,7 @@ mod tests {
             "CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS",
             "99",
         );
+        env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK", "99");
 
         let updates = BTreeMap::from([
             (
@@ -1635,6 +1645,7 @@ mod tests {
                 Some("on"),
             ),
             ("CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_SCHED", Some("on")),
+            ("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL", Some("on")),
         ]);
         planner_env.apply(&updates);
 
@@ -1650,6 +1661,25 @@ mod tests {
             env::var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS").ok(),
             Some("3".into())
         );
+        assert_eq!(
+            env::var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK").ok(),
+            Some("9".into())
+        );
+        clear_profile_env();
+    }
+
+    #[test]
+    fn planner_env_apply_does_not_restore_packed_rows4_matmul_chunk_groups_without_owner_gate() {
+        let _guard = env_lock();
+        clear_profile_env();
+        env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK", "9");
+        let planner_env = PlannerEnv::capture();
+
+        env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK", "99");
+
+        planner_env.apply(&BTreeMap::new());
+
+        assert!(env::var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK").is_err());
         clear_profile_env();
     }
 
