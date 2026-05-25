@@ -42,7 +42,8 @@ pub use kv_cache::{LlamaKvCache, LlamaKvCachePlan, LlamaKvCachePositionTrace, Ll
 pub use q8_block_reader::Q8BlockReader;
 use q8_runtime::{
     q8_0_env_flag_disabled, q8_0_env_flag_enabled_default_off,
-    q8_0_env_flag_enabled_default_on_fail_closed, Q8RuntimeFlags, ResolvedRuntimePlan,
+    q8_0_env_flag_enabled_default_on_fail_closed, Q8DecodeGroupSchedule, Q8RuntimeFlags,
+    ResolvedRuntimePlan,
 };
 use q8_telemetry::*;
 pub use q8_telemetry::{
@@ -6660,9 +6661,13 @@ fn accumulate_linear_row(
 
 #[allow(dead_code)]
 fn should_use_q8_0_block_dot(weight: &CpuTensor, input_width: usize) -> bool {
-    let runtime_plan = ResolvedRuntimePlan::from_env().unwrap_or(ResolvedRuntimePlan {
-        linear_accumulation_precision: LinearAccumulationPrecision::F32,
-        q8: Q8RuntimeFlags::from_env(),
+    let runtime_plan = ResolvedRuntimePlan::from_env().unwrap_or_else(|_| {
+        let q8 = Q8RuntimeFlags::from_env();
+        ResolvedRuntimePlan {
+            linear_accumulation_precision: LinearAccumulationPrecision::F32,
+            q8,
+            q8_decode_group_schedule: Q8DecodeGroupSchedule::from_q8_flags(q8),
+        }
     });
     should_use_q8_0_block_dot_with_plan(weight, input_width, &runtime_plan)
 }
@@ -6683,9 +6688,13 @@ fn should_use_borrowed_q8_0_block_dot(
     weight: BorrowedLinearWeight<'_>,
     input_width: usize,
 ) -> bool {
-    let runtime_plan = ResolvedRuntimePlan::from_env().unwrap_or(ResolvedRuntimePlan {
-        linear_accumulation_precision: LinearAccumulationPrecision::F32,
-        q8: Q8RuntimeFlags::from_env(),
+    let runtime_plan = ResolvedRuntimePlan::from_env().unwrap_or_else(|_| {
+        let q8 = Q8RuntimeFlags::from_env();
+        ResolvedRuntimePlan {
+            linear_accumulation_precision: LinearAccumulationPrecision::F32,
+            q8,
+            q8_decode_group_schedule: Q8DecodeGroupSchedule::from_q8_flags(q8),
+        }
     });
     should_use_borrowed_q8_0_block_dot_with_plan(weight, input_width, &runtime_plan)
 }
@@ -7081,22 +7090,6 @@ fn x86_q8_attention_qkv_decode_group_chunking_enabled() -> bool {
     }
 }
 
-fn x86_q8_attention_qkv_decode_groups_per_chunk() -> usize {
-    env::var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUPS_PER_CHUNK")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(16)
-}
-
-fn x86_q8_ffn_gate_up_decode_groups_per_chunk() -> usize {
-    env::var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUPS_PER_CHUNK")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(16)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum X86Q8AttentionQkvRouteKind {
     Decode,
@@ -7199,6 +7192,9 @@ fn try_x86_q8_attention_qkv_decode_consumer_path(
         &quantized_input.blocks,
         runtime_plan.q8.attention_qkv_decode_group_chunking
             && x86_q8_attention_qkv_decode_group_chunking_enabled(),
+        runtime_plan
+            .q8_decode_group_schedule
+            .attention_qkv_groups_per_chunk,
     )?;
     Ok(Some((q, k, v)))
 }
@@ -7490,6 +7486,9 @@ fn try_x86_q8_ffn_gate_up_decode_consumer_path(
         gate,
         up,
         runtime_plan.q8.ffn_gate_up_decode_group_chunking,
+        runtime_plan
+            .q8_decode_group_schedule
+            .ffn_gate_up_groups_per_chunk,
     )?;
     let total_elapsed = started.elapsed().as_micros();
     record_q8_schedule_output_projection_route_call(
@@ -7632,6 +7631,9 @@ fn try_x86_q8_ffn_decode_chain_path(
 
     let down_started = Instant::now();
     let decode_group_chunking = runtime_plan.q8.ffn_down_decode_group_chunking;
+    let decode_groups_per_chunk = runtime_plan
+        .q8_decode_group_schedule
+        .ffn_down_groups_per_chunk;
     let mut down_route_name = q8_ffn_down_decode_consumer_route_name(decode_group_chunking);
     let output = if runtime_plan.q8.ffn_down_vnni_decode {
         add_q8_schedule_counter(&Q8_SCHED_FFN_DOWN_VNNI_DECODE_CANDIDATES, 1);
@@ -7649,6 +7651,7 @@ fn try_x86_q8_ffn_decode_chain_path(
                 down_route.output_width,
                 down_name,
                 decode_group_chunking,
+                decode_groups_per_chunk,
             )?
         } else if !down_route.input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
             record_q8_ffn_down_vnni_decode_reject(
@@ -7664,6 +7667,7 @@ fn try_x86_q8_ffn_decode_chain_path(
                 down_route.output_width,
                 down_name,
                 decode_group_chunking,
+                decode_groups_per_chunk,
             )?
         } else if !down_route.output_width.is_multiple_of(64) {
             record_q8_ffn_down_vnni_decode_reject(
@@ -7679,6 +7683,7 @@ fn try_x86_q8_ffn_decode_chain_path(
                 down_route.output_width,
                 down_name,
                 decode_group_chunking,
+                decode_groups_per_chunk,
             )?
         } else if let Some(vnni_packed) = down_route.packed.vnni_packed.as_ref() {
             let kernel_started = q8_schedule_telemetry_enabled().then(Instant::now);
@@ -7713,6 +7718,7 @@ fn try_x86_q8_ffn_decode_chain_path(
                 down_route.output_width,
                 down_name,
                 decode_group_chunking,
+                decode_groups_per_chunk,
             )?
         }
     } else {
@@ -7722,6 +7728,7 @@ fn try_x86_q8_ffn_decode_chain_path(
             down_route.output_width,
             down_name,
             decode_group_chunking,
+            decode_groups_per_chunk,
         )?
     };
     let down_elapsed = down_started.elapsed().as_micros();
@@ -7999,6 +8006,7 @@ fn q8_0_packed_rows4_single_input_projection(
         output_width,
         name,
         false,
+        Q8DecodeGroupSchedule::default().ffn_down_groups_per_chunk,
     )
 }
 
@@ -8008,6 +8016,7 @@ fn q8_0_packed_rows4_single_input_projection_with_decode_chunking(
     output_width: usize,
     name: &str,
     decode_group_chunking: bool,
+    groups_per_chunk: usize,
 ) -> Result<CpuTensor> {
     let mut output = vec![0.0_f32; output_width];
     q8_0_packed_rows4_single_input_projection_into_with_decode_chunking(
@@ -8015,6 +8024,7 @@ fn q8_0_packed_rows4_single_input_projection_with_decode_chunking(
         quantized_input,
         &mut output,
         decode_group_chunking,
+        groups_per_chunk,
     )?;
     CpuTensor::from_f32(name, vec![1, output_width], output)
 }
@@ -8036,14 +8046,6 @@ fn mac_q8_ffn_down_decode_group_chunking_enabled() -> bool {
 }
 
 #[allow(dead_code)]
-fn mac_q8_ffn_down_decode_groups_per_chunk() -> usize {
-    env::var("CAMELID_MAC_Q8_FFN_DOWN_DECODE_GROUPS_PER_CHUNK")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(16)
-}
-
 fn mac_q8_ffn_down_decode_consumer_enabled() -> bool {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
@@ -8096,26 +8098,6 @@ fn x86_q8_ffn_down_decode_group_chunking_enabled() -> bool {
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
     {
         false
-    }
-}
-
-#[allow(dead_code)]
-fn x86_q8_ffn_down_decode_groups_per_chunk() -> usize {
-    env::var("CAMELID_X86_Q8_FFN_DOWN_DECODE_GROUPS_PER_CHUNK")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(16)
-}
-
-fn q8_ffn_down_decode_groups_per_chunk() -> usize {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    {
-        mac_q8_ffn_down_decode_groups_per_chunk()
-    }
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    {
-        x86_q8_ffn_down_decode_groups_per_chunk()
     }
 }
 
@@ -8688,6 +8670,7 @@ fn q8_0_packed_rows4_single_input_projection_into(
         quantized_input,
         output,
         false,
+        Q8DecodeGroupSchedule::default().ffn_down_groups_per_chunk,
     )
 }
 
@@ -8696,6 +8679,7 @@ fn q8_0_packed_rows4_single_input_projection_into_with_decode_chunking(
     quantized_input: &[Q8_0Block],
     output: &mut [f32],
     decode_group_chunking: bool,
+    groups_per_chunk: usize,
 ) -> Result<()> {
     let output_width = output.len();
     let output_groups = q8_0_packed_rows4_output_groups(output_width, "decode projection")?;
@@ -8725,6 +8709,7 @@ fn q8_0_packed_rows4_single_input_projection_into_with_decode_chunking(
                 quantized_input,
                 output,
                 decode_group_chunking,
+                groups_per_chunk,
             );
         }
         return Ok(());
@@ -8740,11 +8725,11 @@ fn q8_0_packed_rows4_single_input_projection_into_with_decode_chunking(
 
     if output_groups > 1 && should_parallelize_x86_q8_packed_rows4_decode_output(output_width) {
         if decode_group_chunking {
-            let groups_per_chunk = q8_ffn_down_decode_groups_per_chunk().min(output_groups);
-            let chunk_floats = groups_per_chunk * 4;
+            let chunk_groups = groups_per_chunk.min(output_groups);
+            let chunk_floats = chunk_groups * 4;
             output.par_chunks_mut(chunk_floats).enumerate().for_each(
                 |(chunk_idx, output_chunk)| {
-                    let first_group_idx = chunk_idx * groups_per_chunk;
+                    let first_group_idx = chunk_idx * chunk_groups;
                     for (local_group_idx, output_group) in
                         output_chunk.chunks_exact_mut(4).enumerate()
                     {
@@ -8790,6 +8775,7 @@ unsafe fn q8_0_packed_rows4_decode_projection_rawptr_avx2(
     quantized_input: &[Q8_0Block],
     output: &mut [f32],
     decode_group_chunking: bool,
+    groups_per_chunk: usize,
 ) {
     let blocks_per_row = packed.blocks_per_row;
     let output_groups = output.len() / 4;
@@ -8812,11 +8798,11 @@ unsafe fn q8_0_packed_rows4_decode_projection_rawptr_avx2(
 
     if output_groups > 1 && should_parallelize_x86_q8_packed_rows4_decode_output(output.len()) {
         if decode_group_chunking {
-            let groups_per_chunk = q8_ffn_down_decode_groups_per_chunk().min(output_groups);
-            let chunk_floats = groups_per_chunk * 4;
+            let chunk_groups = groups_per_chunk.min(output_groups);
+            let chunk_floats = chunk_groups * 4;
             output.par_chunks_mut(chunk_floats).enumerate().for_each(
                 |(chunk_idx, output_chunk)| {
-                    let first_group_idx = chunk_idx * groups_per_chunk;
+                    let first_group_idx = chunk_idx * chunk_groups;
                     for (local_group_idx, output_group) in
                         output_chunk.chunks_exact_mut(4).enumerate()
                     {
@@ -8869,6 +8855,7 @@ fn q8_0_packed_rows4_single_input_projection_pair_into_with_decode_chunking(
     left_output: &mut [f32],
     right_output: &mut [f32],
     decode_group_chunking: bool,
+    groups_per_chunk: usize,
 ) -> Result<()> {
     let output_width = left_output.len();
     if right_output.len() != output_width {
@@ -8914,14 +8901,14 @@ fn q8_0_packed_rows4_single_input_projection_pair_into_with_decode_chunking(
 
     if output_groups > 1 && should_parallelize_x86_q8_packed_rows4_decode_output(output_width) {
         if decode_group_chunking {
-            let groups_per_chunk = x86_q8_ffn_gate_up_decode_groups_per_chunk().min(output_groups);
-            let chunk_floats = groups_per_chunk * 4;
+            let chunk_groups = groups_per_chunk.min(output_groups);
+            let chunk_floats = chunk_groups * 4;
             left_output
                 .par_chunks_mut(chunk_floats)
                 .zip(right_output.par_chunks_mut(chunk_floats))
                 .enumerate()
                 .for_each(|(chunk_idx, (left_chunk, right_chunk))| {
-                    let first_group_idx = chunk_idx * groups_per_chunk;
+                    let first_group_idx = chunk_idx * chunk_groups;
                     for (local_group_idx, (left_group, right_group)) in left_chunk
                         .chunks_exact_mut(4)
                         .zip(right_chunk.chunks_exact_mut(4))
@@ -9030,6 +9017,7 @@ fn q8_0_packed_rows4_single_input_projection_triplet_from_quantized(
     v_width: usize,
     quantized_input: &[Q8_0Block],
     decode_group_chunking: bool,
+    groups_per_chunk: usize,
 ) -> Result<(CpuTensor, CpuTensor, CpuTensor)> {
     let blocks_per_row = q_packed.blocks_per_row;
     if k_packed.blocks_per_row != blocks_per_row
@@ -9073,15 +9061,15 @@ fn q8_0_packed_rows4_single_input_projection_triplet_from_quantized(
         && should_parallelize_x86_q8_packed_rows4_decode_output(q_width)
     {
         if decode_group_chunking {
-            let groups_per_chunk = x86_q8_attention_qkv_decode_groups_per_chunk().min(q_groups);
-            let chunk_floats = groups_per_chunk * 4;
+            let chunk_groups = groups_per_chunk.min(q_groups);
+            let chunk_floats = chunk_groups * 4;
             q_output
                 .par_chunks_mut(chunk_floats)
                 .zip(k_output.par_chunks_mut(chunk_floats))
                 .zip(v_output.par_chunks_mut(chunk_floats))
                 .enumerate()
                 .for_each(|(chunk_idx, ((q_chunk, k_chunk), v_chunk))| {
-                    let first_group_idx = chunk_idx * groups_per_chunk;
+                    let first_group_idx = chunk_idx * chunk_groups;
                     for (local_group_idx, ((q_group, k_group), v_group)) in q_chunk
                         .chunks_exact_mut(4)
                         .zip(k_chunk.chunks_exact_mut(4))
@@ -10705,6 +10693,9 @@ fn try_x86_q8_ffn_down_decode_consumer_path(
         route.output_width,
         name,
         decode_group_chunking,
+        runtime_plan
+            .q8_decode_group_schedule
+            .ffn_down_groups_per_chunk,
     )?;
     let route_name = q8_ffn_down_decode_consumer_route_name(decode_group_chunking);
     record_q8_schedule_projection_route_elapsed(
@@ -12305,9 +12296,11 @@ fn accumulate_transposed_linear_row_runtime(
     output: &mut [f32],
     precision: LinearAccumulationPrecision,
 ) -> Result<()> {
+    let q8 = Q8RuntimeFlags::from_env();
     let runtime_plan = ResolvedRuntimePlan {
         linear_accumulation_precision: precision,
-        q8: Q8RuntimeFlags::from_env(),
+        q8,
+        q8_decode_group_schedule: Q8DecodeGroupSchedule::from_q8_flags(q8),
     };
     accumulate_transposed_linear_row_runtime_with_plan(input_row, weight, output, &runtime_plan)
 }
@@ -12707,9 +12700,11 @@ fn accumulate_transposed_linear_row_with_precision(
     output: &mut [f32],
     precision: LinearAccumulationPrecision,
 ) {
+    let q8 = Q8RuntimeFlags::from_env();
     let runtime_plan = ResolvedRuntimePlan {
         linear_accumulation_precision: precision,
-        q8: Q8RuntimeFlags::from_env(),
+        q8,
+        q8_decode_group_schedule: Q8DecodeGroupSchedule::from_q8_flags(q8),
     };
     accumulate_transposed_linear_row_with_precision_with_plan(
         input_row,

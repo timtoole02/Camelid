@@ -1675,6 +1675,7 @@ fn q8_0_hot_path_uses_resolved_plan_not_current_env() {
             hybrid_gpu_rows: None,
             hybrid_gpu_percent: 10,
         },
+        q8_decode_group_schedule: Q8DecodeGroupSchedule::default(),
     };
 
     let actual =
@@ -2582,6 +2583,7 @@ fn q8_attention_consumer_plan(
             hybrid_gpu_rows: None,
             hybrid_gpu_percent: 10,
         },
+        q8_decode_group_schedule: Q8DecodeGroupSchedule::default(),
     }
 }
 
@@ -2695,7 +2697,16 @@ fn q8_attention_qkv_consumer_quantizes_once_for_runtime_packed_qkv() {
 fn q8_attention_qkv_decode_group_chunking_matches_unchunked_triplet_projection() {
     let _env_guard = env_lock();
     clear_dense_diagnostic_env();
+    std::env::set_var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUP_CHUNKING", "on");
     std::env::set_var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUPS_PER_CHUNK", "7");
+    let captured_plan = ResolvedRuntimePlan::from_env().unwrap();
+    assert!(captured_plan.q8.attention_qkv_decode_group_chunking);
+    assert_eq!(
+        captured_plan
+            .q8_decode_group_schedule
+            .attention_qkv_groups_per_chunk,
+        7
+    );
 
     let output_width = X86_Q8_PACKED_ROWS4_DECODE_PARALLEL_MIN_OUTPUTS;
     let blocks_per_row = 2;
@@ -2742,6 +2753,9 @@ fn q8_attention_qkv_decode_group_chunking_matches_unchunked_triplet_projection()
             output_width,
             &quantized_input.blocks,
             false,
+            captured_plan
+                .q8_decode_group_schedule
+                .attention_qkv_groups_per_chunk,
         )
         .unwrap();
     let pool = rayon::ThreadPoolBuilder::new()
@@ -2759,14 +2773,17 @@ fn q8_attention_qkv_decode_group_chunking_matches_unchunked_triplet_projection()
                 output_width,
                 &quantized_input.blocks,
                 true,
+                captured_plan
+                    .q8_decode_group_schedule
+                    .attention_qkv_groups_per_chunk,
             )
         })
         .unwrap();
 
-    assert_eq!(x86_q8_attention_qkv_decode_groups_per_chunk(), 7);
     assert_slice_close_with_tolerance(&q_actual.data, &q_expected.data, 1e-6);
     assert_slice_close_with_tolerance(&k_actual.data, &k_expected.data, 1e-6);
     assert_slice_close_with_tolerance(&v_actual.data, &v_expected.data, 1e-6);
+    std::env::remove_var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUP_CHUNKING");
     std::env::remove_var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUPS_PER_CHUNK");
 }
 
@@ -2774,7 +2791,16 @@ fn q8_attention_qkv_decode_group_chunking_matches_unchunked_triplet_projection()
 fn q8_ffn_gate_up_decode_group_chunking_matches_unchunked_pair_projection() {
     let _env_guard = env_lock();
     clear_dense_diagnostic_env();
+    std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING", "on");
     std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUPS_PER_CHUNK", "5");
+    let captured_plan = ResolvedRuntimePlan::from_env().unwrap();
+    assert!(captured_plan.q8.ffn_gate_up_decode_group_chunking);
+    assert_eq!(
+        captured_plan
+            .q8_decode_group_schedule
+            .ffn_gate_up_groups_per_chunk,
+        5
+    );
 
     let output_width = X86_Q8_PACKED_ROWS4_DECODE_PARALLEL_MIN_OUTPUTS;
     let blocks_per_row = 2;
@@ -2818,6 +2844,9 @@ fn q8_ffn_gate_up_decode_group_chunking_matches_unchunked_pair_projection() {
         &mut gate_expected,
         &mut up_expected,
         false,
+        captured_plan
+            .q8_decode_group_schedule
+            .ffn_gate_up_groups_per_chunk,
     )
     .unwrap();
 
@@ -2835,13 +2864,16 @@ fn q8_ffn_gate_up_decode_group_chunking_matches_unchunked_pair_projection() {
             &mut gate_actual,
             &mut up_actual,
             true,
+            captured_plan
+                .q8_decode_group_schedule
+                .ffn_gate_up_groups_per_chunk,
         )
     })
     .unwrap();
 
-    assert_eq!(x86_q8_ffn_gate_up_decode_groups_per_chunk(), 5);
     assert_slice_close_with_tolerance(&gate_actual, &gate_expected, 1e-6);
     assert_slice_close_with_tolerance(&up_actual, &up_expected, 1e-6);
+    std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING");
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUPS_PER_CHUNK");
 }
 
@@ -2892,6 +2924,7 @@ fn q8_ffn_gate_up_decode_fused_activation_matches_pair_projection() {
         &mut gate,
         &mut up,
         false,
+        Q8DecodeGroupSchedule::default().ffn_gate_up_groups_per_chunk,
     )
     .unwrap();
     let expected: Vec<f32> = gate
@@ -3497,6 +3530,7 @@ fn ffn_down_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             hybrid_gpu_rows: None,
             hybrid_gpu_percent: 10,
         },
+        q8_decode_group_schedule: Q8DecodeGroupSchedule::default(),
     }
 }
 
@@ -3546,6 +3580,7 @@ fn ffn_down_packed_rows4_matmul_plan(enabled: bool) -> ResolvedRuntimePlan {
             hybrid_gpu_rows: None,
             hybrid_gpu_percent: 10,
         },
+        q8_decode_group_schedule: Q8DecodeGroupSchedule::default(),
     }
 }
 
@@ -3599,6 +3634,7 @@ fn ffn_gate_up_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             hybrid_gpu_rows: None,
             hybrid_gpu_percent: 10,
         },
+        q8_decode_group_schedule: Q8DecodeGroupSchedule::default(),
     }
 }
 
@@ -4534,10 +4570,17 @@ fn mac_q8_ffn_down_decode_group_chunking_is_default_off_and_matches_consumer() {
     std::env::set_var("CAMELID_MAC_Q8_FFN_DOWN_DECODE_GROUP_CHUNKING", "on");
     std::env::set_var("CAMELID_MAC_Q8_FFN_DOWN_DECODE_GROUPS_PER_CHUNK", "2");
     assert!(mac_q8_ffn_down_decode_group_chunking_enabled());
-    assert_eq!(mac_q8_ffn_down_decode_groups_per_chunk(), 2);
+    let captured_plan = ResolvedRuntimePlan::from_env().unwrap();
+    assert_eq!(
+        captured_plan
+            .q8_decode_group_schedule
+            .ffn_down_groups_per_chunk,
+        2
+    );
     let mut chunked_plan = plan;
     chunked_plan.q8.ffn_down_decode_group_chunking =
-        Q8RuntimeFlags::from_env().ffn_down_decode_group_chunking;
+        captured_plan.q8.ffn_down_decode_group_chunking;
+    chunked_plan.q8_decode_group_schedule = captured_plan.q8_decode_group_schedule;
     assert!(chunked_plan.q8.ffn_down_decode_group_chunking);
 
     let chunked = try_x86_q8_ffn_down_decode_consumer_path(
@@ -4580,8 +4623,14 @@ fn x86_q8_ffn_down_decode_group_chunking_is_default_off_and_matches_consumer() {
     std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_GROUP_CHUNKING", "on");
     std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_GROUPS_PER_CHUNK", "2");
     assert!(x86_q8_ffn_down_decode_group_chunking_enabled());
-    assert!(Q8RuntimeFlags::from_env().ffn_down_decode_group_chunking);
-    assert_eq!(q8_ffn_down_decode_groups_per_chunk(), 2);
+    let captured_plan = ResolvedRuntimePlan::from_env().unwrap();
+    assert!(captured_plan.q8.ffn_down_decode_group_chunking);
+    assert_eq!(
+        captured_plan
+            .q8_decode_group_schedule
+            .ffn_down_groups_per_chunk,
+        2
+    );
     assert_eq!(
         q8_ffn_down_decode_consumer_route_name(true),
         "x86_decode_consumer_group_chunking"
@@ -4589,7 +4638,8 @@ fn x86_q8_ffn_down_decode_group_chunking_is_default_off_and_matches_consumer() {
 
     let mut chunked_plan = plan;
     chunked_plan.q8.ffn_down_decode_group_chunking =
-        Q8RuntimeFlags::from_env().ffn_down_decode_group_chunking;
+        captured_plan.q8.ffn_down_decode_group_chunking;
+    chunked_plan.q8_decode_group_schedule = captured_plan.q8_decode_group_schedule;
     let chunked = try_x86_q8_ffn_down_decode_consumer_path(
         &input,
         &packed_weight,

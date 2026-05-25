@@ -3,6 +3,8 @@ use std::env;
 use super::{diagnostic_linear_accumulation_precision, LinearAccumulationPrecision};
 use crate::Result;
 
+pub(super) const Q8_DECODE_GROUPS_PER_CHUNK_DEFAULT: usize = 16;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Q8RuntimeFlags {
     pub(super) block_dot: bool,
@@ -41,17 +43,57 @@ pub(super) struct Q8RuntimeFlags {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Q8DecodeGroupSchedule {
+    pub(super) attention_qkv_groups_per_chunk: usize,
+    pub(super) ffn_gate_up_groups_per_chunk: usize,
+    pub(super) ffn_down_groups_per_chunk: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ResolvedRuntimePlan {
     pub(super) linear_accumulation_precision: LinearAccumulationPrecision,
     pub(super) q8: Q8RuntimeFlags,
+    pub(super) q8_decode_group_schedule: Q8DecodeGroupSchedule,
 }
 
 impl ResolvedRuntimePlan {
     pub(super) fn from_env() -> Result<Self> {
+        let q8 = Q8RuntimeFlags::from_env();
         Ok(Self {
             linear_accumulation_precision: diagnostic_linear_accumulation_precision()?,
-            q8: Q8RuntimeFlags::from_env(),
+            q8,
+            q8_decode_group_schedule: Q8DecodeGroupSchedule::from_q8_flags(q8),
         })
+    }
+}
+
+impl Default for Q8DecodeGroupSchedule {
+    fn default() -> Self {
+        Self {
+            attention_qkv_groups_per_chunk: Q8_DECODE_GROUPS_PER_CHUNK_DEFAULT,
+            ffn_gate_up_groups_per_chunk: Q8_DECODE_GROUPS_PER_CHUNK_DEFAULT,
+            ffn_down_groups_per_chunk: Q8_DECODE_GROUPS_PER_CHUNK_DEFAULT,
+        }
+    }
+}
+
+impl Q8DecodeGroupSchedule {
+    pub(super) fn from_q8_flags(q8: Q8RuntimeFlags) -> Self {
+        let mut schedule = Self::default();
+        if q8.attention_qkv_decode_group_chunking {
+            schedule.attention_qkv_groups_per_chunk =
+                positive_usize_env("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUPS_PER_CHUNK")
+                    .unwrap_or(Q8_DECODE_GROUPS_PER_CHUNK_DEFAULT);
+        }
+        if q8.ffn_gate_up_decode_group_chunking {
+            schedule.ffn_gate_up_groups_per_chunk =
+                positive_usize_env("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUPS_PER_CHUNK")
+                    .unwrap_or(Q8_DECODE_GROUPS_PER_CHUNK_DEFAULT);
+        }
+        if q8.ffn_down_decode_group_chunking {
+            schedule.ffn_down_groups_per_chunk = q8_ffn_down_decode_groups_per_chunk_from_env();
+        }
+        schedule
     }
 }
 
@@ -216,4 +258,24 @@ pub(super) fn q8_0_env_flag_disabled(key: &str) -> bool {
 fn x86_q8_ffn_down_packed_rows4_matmul_enabled() -> bool {
     q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL")
         || q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL")
+}
+
+fn positive_usize_env(key: &str) -> Option<usize> {
+    env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+}
+
+fn q8_ffn_down_decode_groups_per_chunk_from_env() -> usize {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        positive_usize_env("CAMELID_MAC_Q8_FFN_DOWN_DECODE_GROUPS_PER_CHUNK")
+            .unwrap_or(Q8_DECODE_GROUPS_PER_CHUNK_DEFAULT)
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        positive_usize_env("CAMELID_X86_Q8_FFN_DOWN_DECODE_GROUPS_PER_CHUNK")
+            .unwrap_or(Q8_DECODE_GROUPS_PER_CHUNK_DEFAULT)
+    }
 }
