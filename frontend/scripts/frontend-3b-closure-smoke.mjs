@@ -353,6 +353,7 @@ assert.match(systemSource, /selectedCompatibilityHint\s*=\s*selectedChatGate\.hi
 assert.match(systemSource, /selectedExactRowReady\s*=\s*selectedChatGate\.chatUnlocked/, 'System view must not promote /v1 chat readiness from generation_ready alone')
 assert.match(systemSource, /Blocked for UX chat until selected exact row evidence and runtime readiness both match/, 'System curl copy must stay blocked until 3B exact-row support and runtime readiness both match')
 assert.match(systemSource, /Endpoint\/chat gate:/, 'System selected 3B evidence must show the retained endpoint/chat readiness gate')
+assert.match(systemSource, /rowSupportBoundaryCopy\(selectedCompatibilityTarget, apiFeatures\)/, 'System selected 3B evidence must render the filtered remaining support boundary beside live readiness lanes')
 assert.match(systemSource, /rowSupportNextStepCopy\(target, apiFeatures\)/, 'System compatibility rows must render filtered exact-row next-step copy instead of raw blocker text')
 assert.match(topBarSource, /exactHintDetail\(activeChatGate\.hint\) \|\| exactHintDetail\(selectedChatGate\.hint\)/, 'TopBar support contract detail must prioritize the active/selected exact 3B hint label, including quant-mismatch and quant-missing blockers')
 assert.match(topBarSource, /exactTargetFromHint\(activeChatGate\.hint\)[\s\S]*exactTargetFromHint\(selectedChatGate\.hint\)[\s\S]*getCurrentCompatibilityTarget/, 'TopBar support contract detail must fall back to the first current gate row only after active/selected exact-row hints')
