@@ -3105,6 +3105,183 @@ fn q8_attention_qkv_route_resolver_preserves_decode_and_prefill_guards() {
 }
 
 #[test]
+fn q8_attention_qkv_decode_route_records_route_and_denials() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+    std::env::set_var(Q8_SCHEDULE_TELEMETRY_ENV, "on");
+    reset_q8_schedule_telemetry();
+
+    let (decode_input, q_weight, q_expected) =
+        runtime_packed_attention_projection_case("attention_q", "blk.0.attn_q.weight");
+    let (_, k_weight, k_expected) =
+        runtime_packed_attention_projection_case("attention_k", "blk.0.attn_k.weight");
+    let (_, v_weight, v_expected) =
+        runtime_packed_attention_projection_case("attention_v", "blk.0.attn_v.weight");
+    let prefill_input = CpuTensor::from_f32(
+        "prefill_qkv_input",
+        vec![2, decode_input.dim(1).unwrap()],
+        vec![0.0; 2 * decode_input.dim(1).unwrap()],
+    )
+    .unwrap();
+    let route_name = X86Q8AttentionQkvRouteKind::Decode.telemetry_name();
+
+    assert!(resolve_x86_q8_attention_qkv_route(
+        &prefill_input,
+        &q_weight,
+        &k_weight,
+        &v_weight,
+        &attention_qkv_consumer_plan(true),
+        X86Q8AttentionQkvRouteKind::Decode,
+    )
+    .unwrap()
+    .is_none());
+    assert!(resolve_x86_q8_attention_qkv_route(
+        &decode_input,
+        &q_weight,
+        &k_weight,
+        &v_weight,
+        &attention_qkv_consumer_plan(false),
+        X86Q8AttentionQkvRouteKind::Decode,
+    )
+    .unwrap()
+    .is_none());
+
+    let (q, k, v) = try_x86_q8_attention_qkv_decode_consumer_path(
+        &decode_input,
+        &q_weight,
+        &k_weight,
+        &v_weight,
+        &attention_qkv_consumer_plan(true),
+    )
+    .unwrap()
+    .expect("decode route should run once telemetry is enabled");
+
+    assert_slice_close_with_tolerance(&q.data, &q_expected.data, 5e-4);
+    assert_slice_close_with_tolerance(&k.data, &k_expected.data, 5e-4);
+    assert_slice_close_with_tolerance(&v.data, &v_expected.data, 5e-4);
+
+    let telemetry = snapshot_q8_schedule_telemetry();
+    for role in ["attention_q", "attention_k", "attention_v"] {
+        let by_route = telemetry
+            .output_projection_by_route
+            .get(&format!("{role}.{route_name}"))
+            .expect("QKV decode route telemetry");
+        assert_eq!(by_route.calls, 1, "{role}");
+        assert_eq!(by_route.rows, 1, "{role}");
+        assert_eq!(
+            by_route.input_width,
+            decode_input.dim(1).unwrap() as u64,
+            "{role}"
+        );
+        let layer_route = telemetry
+            .output_projection_by_layer_route
+            .get(&format!("layer_0.{role}.{route_name}"))
+            .expect("layer-scoped QKV decode route telemetry");
+        assert_eq!(layer_route.layer_index, 0, "{role}");
+        assert_eq!(layer_route.calls, 1, "{role}");
+    }
+    assert!(telemetry.projection_route_denials.contains_key(&format!(
+        "attention_qkv.{route_name}.decode_requires_single_row"
+    )));
+    assert!(telemetry
+        .projection_route_denials
+        .contains_key(&format!("attention_qkv.{route_name}.plan_off")));
+
+    reset_q8_schedule_telemetry();
+    std::env::remove_var(Q8_SCHEDULE_TELEMETRY_ENV);
+}
+
+#[test]
+fn q8_attention_qkv_prefill_route_records_route_and_denials() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+    std::env::set_var(Q8_SCHEDULE_TELEMETRY_ENV, "on");
+    reset_q8_schedule_telemetry();
+
+    let (decode_input, q_weight, _q_expected) =
+        runtime_packed_attention_projection_case("attention_q", "blk.0.attn_q.weight");
+    let (_, k_weight, _k_expected) =
+        runtime_packed_attention_projection_case("attention_k", "blk.0.attn_k.weight");
+    let (_, v_weight, _v_expected) =
+        runtime_packed_attention_projection_case("attention_v", "blk.0.attn_v.weight");
+    let rows = 3;
+    let input_width = decode_input.dim(1).unwrap();
+    let prefill_input = CpuTensor::from_f32(
+        "prefill_qkv_input",
+        vec![rows, input_width],
+        (0..rows * input_width)
+            .map(|idx| {
+                ((idx % input_width) as f32 - 13.0) * 0.078125
+                    + (idx / input_width) as f32 * 0.046875
+            })
+            .collect(),
+    )
+    .unwrap();
+    let route_name = X86Q8AttentionQkvRouteKind::PackedRows4Matmul.telemetry_name();
+
+    assert!(resolve_x86_q8_attention_qkv_route(
+        &decode_input,
+        &q_weight,
+        &k_weight,
+        &v_weight,
+        &attention_qkv_packed_rows4_matmul_plan(true),
+        X86Q8AttentionQkvRouteKind::PackedRows4Matmul,
+    )
+    .unwrap()
+    .is_none());
+    assert!(resolve_x86_q8_attention_qkv_route(
+        &prefill_input,
+        &q_weight,
+        &k_weight,
+        &v_weight,
+        &attention_qkv_packed_rows4_matmul_plan(false),
+        X86Q8AttentionQkvRouteKind::PackedRows4Matmul,
+    )
+    .unwrap()
+    .is_none());
+
+    let (q, k, v) = try_x86_q8_attention_qkv_packed_rows4_matmul_path(
+        &prefill_input,
+        &q_weight,
+        &k_weight,
+        &v_weight,
+        &attention_qkv_packed_rows4_matmul_plan(true),
+    )
+    .unwrap()
+    .expect("prefill route should run once telemetry is enabled");
+
+    assert_eq!(q.shape.dims, vec![rows, q_weight.dim(1).unwrap()]);
+    assert_eq!(k.shape.dims, q.shape.dims);
+    assert_eq!(v.shape.dims, q.shape.dims);
+
+    let telemetry = snapshot_q8_schedule_telemetry();
+    for role in ["attention_q", "attention_k", "attention_v"] {
+        let by_route = telemetry
+            .output_projection_by_route
+            .get(&format!("{role}.{route_name}"))
+            .expect("QKV prefill route telemetry");
+        assert_eq!(by_route.calls, 1, "{role}");
+        assert_eq!(by_route.rows, rows as u64, "{role}");
+        assert_eq!(by_route.input_width, input_width as u64, "{role}");
+        let layer_route = telemetry
+            .output_projection_by_layer_route
+            .get(&format!("layer_0.{role}.{route_name}"))
+            .expect("layer-scoped QKV prefill route telemetry");
+        assert_eq!(layer_route.layer_index, 0, "{role}");
+        assert_eq!(layer_route.calls, 1, "{role}");
+    }
+    assert!(telemetry.projection_route_denials.contains_key(&format!(
+        "attention_qkv.{route_name}.prefill_requires_multi_row"
+    )));
+    assert!(telemetry
+        .projection_route_denials
+        .contains_key(&format!("attention_qkv.{route_name}.plan_off")));
+
+    reset_q8_schedule_telemetry();
+    std::env::remove_var(Q8_SCHEDULE_TELEMETRY_ENV);
+}
+
+#[test]
 fn q8_attention_qkv_prefill_consumer_gate_is_default_off() {
     let _env_guard = env_lock();
     clear_dense_diagnostic_env();
@@ -3885,6 +4062,10 @@ fn q8_projection_route_telemetry_records_layer_route_bucket() {
 
     assert_eq!(
         q8_schedule_layer_index_for_projection_name("layer_21_ffn_down"),
+        Some(21)
+    );
+    assert_eq!(
+        q8_schedule_layer_index_for_projection_name("blk.21.attn_q.weight"),
         Some(21)
     );
     assert_eq!(q8_schedule_layer_index_for_projection_name("logits"), None);

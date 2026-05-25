@@ -531,12 +531,22 @@ pub(super) fn record_q8_schedule_output_projection_route_call(
 }
 
 pub(super) fn q8_schedule_layer_index_for_projection_name(name: &str) -> Option<usize> {
-    let rest = name.strip_prefix("layer_")?;
-    let (digits, _) = rest.split_once('_')?;
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
+    fn parse_ascii_digits(digits: &str) -> Option<usize> {
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        digits.parse().ok()
     }
-    digits.parse().ok()
+
+    if let Some(rest) = name.strip_prefix("layer_") {
+        let (digits, _) = rest.split_once('_')?;
+        return parse_ascii_digits(digits);
+    }
+    if let Some(rest) = name.strip_prefix("blk.") {
+        let (digits, _) = rest.split_once('.')?;
+        return parse_ascii_digits(digits);
+    }
+    None
 }
 
 pub(super) fn record_q8_schedule_projection_route_elapsed(
