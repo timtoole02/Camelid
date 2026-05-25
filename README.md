@@ -43,9 +43,9 @@ Camelid already ships a serious local inference product surface:
 Today, four exact Q8_0 rows are public and evidence-backed:
 
 - **TinyLlama 1.1B Chat Q8_0** — verified support
-- **Llama 3.2 1B Instruct Q8_0** — verified end-to-end support at checked 512/1024/2048/4096/8192 contexts
-- **Llama 3.2 3B Instruct Q8_0** — verified support at checked 512/1024/2048 contexts
-- **Llama 3 8B Instruct Q8_0** — verified support at checked 512/1024/2048 contexts
+- **Llama 3.2 1B Instruct Q8_0** — verified support within checked 512/1024/2048/4096/8192 bounded exact-row contexts
+- **Llama 3.2 3B Instruct Q8_0** — verified support within checked 512/1024/2048 bounded exact-row contexts
+- **Llama 3 8B Instruct Q8_0** — exact-row smoke support within checked 512/1024/2048 bounded contexts
 
 Mixtral has one-token backend MoE runtime evidence but is not yet promoted to API/WebUI/frontend readiness. `Mistral-7B-Instruct-v0.3.Q8_0.gguf` is the active next exact-row bring-up lane.
 
@@ -69,7 +69,7 @@ That creates a real commercial path:
 
 ## Current support boundary
 
-Camelid achieves 1:1 parity with llama.cpp only for the supported exact GGUF rows with published validation evidence: TinyLlama at the current validated gate; Llama 3.2 1B Q8_0 with verified end-to-end support at checked 512/1024/2048/4096/8192-context packs; Llama 3.2 3B Q8_0 at checked 512/1024/2048-context packs; and Llama 3 8B Q8_0 through exact-row smoke plus checked 512/1024/2048-context packs tied to cited source/runtime-head bundles.
+Camelid achieves 1:1 parity with llama.cpp only for the supported exact GGUF rows with published validation evidence: TinyLlama at the current validated gate; Llama 3.2 1B Q8_0 with verified bounded exact-row support at checked 512/1024/2048/4096/8192-context packs; Llama 3.2 3B Q8_0 with verified bounded exact-row support at checked 512/1024/2048-context packs; and Llama 3 8B Q8_0 through exact-row smoke plus checked 512/1024/2048-context packs tied to cited source/runtime-head bundles.
 
 `Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf` has one-token backend MoE runtime evidence, but Gate 9A later-generation evidence diverges and a longer-continuation backend HTTP hang remains unresolved, so Mixtral API/WebUI/frontend readiness and broad Mixtral support are not claimed. `Mistral-7B-Instruct-v0.3.Q8_0.gguf` remains an active exact-row bring-up lane, not a supported row.
 
@@ -103,9 +103,9 @@ Camelid’s public support boundary is intentionally narrow and exact-row. Read 
 | Exact lane | Public status | Green evidence today |
 | --- | --- | --- |
 | TinyLlama 1.1B Chat Q8_0 | **Verified support** | End-to-end generation, broader five-prompt/50-token parity, template-shape checks, 512-context coverage, and backend RSS/perf sampling. |
-| Llama 3.2 1B Instruct Q8_0 | **Verified end-to-end support** | Load, completions, chat completions, WebUI validation, compact/broader parity, exact-row metadata-Jinja row-template checks, template-shape checks, unique-chat perf/RSS sampling, and checked 512/1024/2048/4096/8192-context packs. |
-| Llama 3.2 3B Instruct Q8_0 | **Verified support** | Load, completions, chat completions, WebUI validation, compact/broader 50-token parity, template-shape checks, unique-chat perf/RSS, checked 512/1024/2048-context packs, and an opt-in parallel Q8 first-token direction probe. |
-| Llama 3 8B Instruct Q8_0 | **Verified support** | Load, completions, chat completions, WebUI validation, compact parity, three-prompt 50-token parity, checked 512/1024/2048-context packs, compact chat-template-shapes pack, memory evidence, structured RSS/Q8 file-read counters, and lazy-Q8 hot-path measurements. |
+| Llama 3.2 1B Instruct Q8_0 | **Verified support (bounded exact-row)** | Load, completions, chat completions, WebUI validation, compact/broader parity, exact-row metadata-Jinja row-template checks, template-shape checks, unique-chat perf/RSS sampling, and checked 512/1024/2048/4096/8192-context packs. |
+| Llama 3.2 3B Instruct Q8_0 | **Verified support (bounded exact-row)** | Load, completions, chat completions, WebUI validation, metadata-Jinja exact-row template execution, compact/broader 50-token parity, template-shape checks, unique-chat perf/RSS, checked 512/1024/2048-context packs, and an opt-in parallel Q8 first-token direction probe. |
+| Llama 3 8B Instruct Q8_0 | **Verified support (bounded exact-row)** | Load, completions, chat completions, WebUI validation, compact parity, three-prompt 50-token parity, checked 512/1024/2048-context packs, compact chat-template-shapes pack, memory evidence, structured RSS/Q8 file-read counters, and lazy-Q8 hot-path measurements. |
 | Mistral-7B-Instruct-v0.3.Q8_0.gguf | **In active validation; not supported yet** | Source/SHA, exact tokenizer/template references, 1-token generation parity, broader five-prompt/50-token parity, checked 512/1024/2048 bring-up, checked 4096/8192 context validation, and fail-closed API/WebUI/RSS evidence are green; latest context bundle: `qa/evidence-bundles/mistral-7b-v0.3-q8-context-4096-8192-ubuntu-20260509T005229Z-head-9e3c64f2cfab/manifest.json`. |
 | Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf | **Active validation; partial backend runtime only** | One-token backend MoE runtime evidence exists, with tokenizer/template and sparse MoE metadata proof. Blocker anchors: `qa/evidence-bundles/mixtral-8x7b-v0.1-q8-gate9a-50tok-20260511/`, `qa/evidence-bundles/mixtral-8x7b-v0.1-q8-longgen-continuation-20260511/`, and `qa/evidence-bundles/mixtral-8x7b-v0.1-q8-blocker-reconciliation-20260512/`. |
 | Qwen2.5-7B-Instruct-Q8_0.gguf | **Planned exact-row candidate** | Candidate row selected for acquisition/tokenizer planning only. |
