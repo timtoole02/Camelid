@@ -4,8 +4,11 @@ use serde::Serialize;
 
 use crate::{
     model::{DenseLlamaDims, LlamaModelConfig},
+    tensor::CpuTensor,
     BackendError, Result,
 };
+
+use super::{f16_bits_to_f32, f32_to_f16_bits, TENSOR_CHECKPOINT_SAMPLE};
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct LlamaKvCachePlan {
@@ -164,4 +167,253 @@ fn kv_cache_grow_tokens(max_sequence_length: usize) -> usize {
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(256)
+}
+
+pub(super) fn write_kv_cache(
+    kv_cache: &mut LlamaKvCache,
+    layer_idx: usize,
+    key: &CpuTensor,
+    value: &CpuTensor,
+) -> Result<()> {
+    let expected_width = kv_cache.plan.kv_head_count * kv_cache.plan.head_dim;
+    if key.shape.dims != [1, expected_width] || value.shape.dims != [1, expected_width] {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "KV projection shapes must be [1, {expected_width}], got key {:?}, value {:?}",
+            key.shape.dims, value.shape.dims
+        )));
+    }
+    if layer_idx >= kv_cache.plan.layer_count {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "layer index {layer_idx} is out of range for KV cache layer count {}",
+            kv_cache.plan.layer_count
+        )));
+    }
+    kv_cache.ensure_position_capacity(kv_cache.position + 1)?;
+    let offset = kv_cache.offset(layer_idx, kv_cache.position, 0);
+    let end = offset + expected_width;
+    copy_to_f16_kv_cache_storage(&mut kv_cache.keys[offset..end], &key.data);
+    copy_to_f16_kv_cache_storage(&mut kv_cache.values[offset..end], &value.data);
+    Ok(())
+}
+
+pub(super) fn write_kv_cache_batch(
+    kv_cache: &mut LlamaKvCache,
+    layer_idx: usize,
+    base_position: usize,
+    key: &CpuTensor,
+    value: &CpuTensor,
+) -> Result<()> {
+    let expected_width = kv_cache.plan.kv_head_count * kv_cache.plan.head_dim;
+    if key.rank() != 2
+        || value.rank() != 2
+        || key.dim(1)? != expected_width
+        || value.dim(1)? != expected_width
+        || key.dim(0)? != value.dim(0)?
+    {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "KV batch projection shapes must be [rows, {expected_width}], got key {:?}, value {:?}",
+            key.shape.dims, value.shape.dims
+        )));
+    }
+    if layer_idx >= kv_cache.plan.layer_count {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "layer index {layer_idx} is out of range for KV cache layer count {}",
+            kv_cache.plan.layer_count
+        )));
+    }
+    let rows = key.dim(0)?;
+    kv_cache.ensure_position_capacity(base_position + rows)?;
+    for row in 0..rows {
+        let position = base_position + row;
+        let offset = kv_cache.offset(layer_idx, position, 0);
+        let end = offset + expected_width;
+        let row_start = row * expected_width;
+        let row_end = row_start + expected_width;
+        copy_to_f16_kv_cache_storage(
+            &mut kv_cache.keys[offset..end],
+            &key.data[row_start..row_end],
+        );
+        copy_to_f16_kv_cache_storage(
+            &mut kv_cache.values[offset..end],
+            &value.data[row_start..row_end],
+        );
+    }
+    Ok(())
+}
+
+pub(super) fn kv_cache_trace(
+    kv_cache: &LlamaKvCache,
+    layer_idx: usize,
+    position_count: usize,
+) -> Result<LlamaKvCacheTrace> {
+    if layer_idx >= kv_cache.plan.layer_count {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "layer index {layer_idx} is out of range for KV cache layer count {}",
+            kv_cache.plan.layer_count
+        )));
+    }
+    if position_count > kv_cache.plan.max_sequence_length {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "KV trace position count {position_count} exceeds cache capacity {}",
+            kv_cache.plan.max_sequence_length
+        )));
+    }
+    if position_count == 0 {
+        return Err(BackendError::RuntimeShapeMismatch(
+            "KV trace requires at least one cached position".to_string(),
+        ));
+    }
+
+    let key_value_width = kv_cache.plan.kv_head_count * kv_cache.plan.head_dim;
+    if key_value_width == 0 {
+        return Err(BackendError::RuntimeShapeMismatch(
+            "KV trace requires non-empty key/value rows".to_string(),
+        ));
+    }
+    let mut key_sum_square = 0.0_f64;
+    let mut value_sum_square = 0.0_f64;
+    let mut key_checksum = 0.0_f64;
+    let mut value_checksum = 0.0_f64;
+    let mut key_max_abs = 0.0_f32;
+    let mut key_max_abs_position = 0;
+    let mut key_max_abs_index = 0;
+    let mut value_max_abs = 0.0_f32;
+    let mut value_max_abs_position = 0;
+    let mut value_max_abs_index = 0;
+
+    for position in 0..position_count {
+        let start = kv_cache.offset(layer_idx, position, 0);
+        let end = start + key_value_width;
+        for (idx, (&key, &value)) in kv_cache.keys[start..end]
+            .iter()
+            .zip(kv_cache.values[start..end].iter())
+            .enumerate()
+        {
+            if !key.is_finite() || !value.is_finite() {
+                return Err(BackendError::RuntimeShapeMismatch(format!(
+                    "KV trace found non-finite value at layer {layer_idx} position {position} index {idx}"
+                )));
+            }
+            let ordinal = ((position * key_value_width) + idx + 1) as f64;
+            let key64 = key as f64;
+            let value64 = value as f64;
+            key_sum_square += key64 * key64;
+            value_sum_square += value64 * value64;
+            key_checksum += ordinal * key64;
+            value_checksum += ordinal * value64;
+            let key_abs = key.abs();
+            if key_abs > key_max_abs {
+                key_max_abs = key_abs;
+                key_max_abs_position = position;
+                key_max_abs_index = idx;
+            }
+            let value_abs = value.abs();
+            if value_abs > value_max_abs {
+                value_max_abs = value_abs;
+                value_max_abs_position = position;
+                value_max_abs_index = idx;
+            }
+        }
+    }
+
+    let value_count = (position_count * key_value_width) as f64;
+    let sampled_positions = sampled_kv_cache_trace_positions(position_count)
+        .into_iter()
+        .map(|position| kv_cache_position_trace(kv_cache, layer_idx, position, key_value_width))
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(LlamaKvCacheTrace {
+        layer_index: layer_idx,
+        position_count,
+        kv_head_count: kv_cache.plan.kv_head_count,
+        head_dim: kv_cache.plan.head_dim,
+        key_value_width,
+        key_checksum,
+        value_checksum,
+        key_rms: (key_sum_square / value_count).sqrt() as f32,
+        value_rms: (value_sum_square / value_count).sqrt() as f32,
+        key_max_abs,
+        key_max_abs_position,
+        key_max_abs_index,
+        value_max_abs,
+        value_max_abs_position,
+        value_max_abs_index,
+        sampled_positions,
+    })
+}
+
+fn kv_cache_position_trace(
+    kv_cache: &LlamaKvCache,
+    layer_idx: usize,
+    position: usize,
+    key_value_width: usize,
+) -> Result<LlamaKvCachePositionTrace> {
+    let start = kv_cache.offset(layer_idx, position, 0);
+    let end = start + key_value_width;
+    let key_slice = &kv_cache.keys[start..end];
+    let value_slice = &kv_cache.values[start..end];
+    let mut key_sum_square = 0.0_f64;
+    let mut value_sum_square = 0.0_f64;
+    let mut key_checksum = 0.0_f64;
+    let mut value_checksum = 0.0_f64;
+    let mut key_max_abs = 0.0_f32;
+    let mut value_max_abs = 0.0_f32;
+    for (idx, (&key, &value)) in key_slice.iter().zip(value_slice.iter()).enumerate() {
+        if !key.is_finite() || !value.is_finite() {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "KV position trace found non-finite value at layer {layer_idx} position {position} index {idx}"
+            )));
+        }
+        let ordinal = (idx + 1) as f64;
+        let key64 = key as f64;
+        let value64 = value as f64;
+        key_sum_square += key64 * key64;
+        value_sum_square += value64 * value64;
+        key_checksum += ordinal * key64;
+        value_checksum += ordinal * value64;
+        key_max_abs = key_max_abs.max(key.abs());
+        value_max_abs = value_max_abs.max(value.abs());
+    }
+    let width = key_value_width as f64;
+    Ok(LlamaKvCachePositionTrace {
+        position,
+        key_checksum,
+        value_checksum,
+        key_rms: (key_sum_square / width).sqrt() as f32,
+        value_rms: (value_sum_square / width).sqrt() as f32,
+        key_max_abs,
+        value_max_abs,
+        key_first_values: key_slice
+            .iter()
+            .take(TENSOR_CHECKPOINT_SAMPLE)
+            .copied()
+            .collect(),
+        value_first_values: value_slice
+            .iter()
+            .take(TENSOR_CHECKPOINT_SAMPLE)
+            .copied()
+            .collect(),
+    })
+}
+
+fn copy_to_f16_kv_cache_storage(dest: &mut [f32], source: &[f32]) {
+    debug_assert_eq!(dest.len(), source.len());
+    for (dest_value, source_value) in dest.iter_mut().zip(source.iter().copied()) {
+        *dest_value = f16_bits_to_f32(f32_to_f16_bits(source_value));
+    }
+}
+
+const KV_CACHE_TRACE_POSITION_LIMIT: usize = 8;
+const KV_CACHE_TRACE_EDGE_POSITION_LIMIT: usize = KV_CACHE_TRACE_POSITION_LIMIT / 2;
+
+fn sampled_kv_cache_trace_positions(position_count: usize) -> Vec<usize> {
+    if position_count <= KV_CACHE_TRACE_POSITION_LIMIT {
+        return (0..position_count).collect();
+    }
+
+    let mut positions = Vec::with_capacity(KV_CACHE_TRACE_POSITION_LIMIT);
+    positions.extend(0..KV_CACHE_TRACE_EDGE_POSITION_LIMIT);
+    positions
+        .extend(position_count.saturating_sub(KV_CACHE_TRACE_EDGE_POSITION_LIMIT)..position_count);
+    positions
 }
