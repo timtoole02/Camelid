@@ -1,6 +1,6 @@
 8a3b625146db02c0d51586e50b6b8dda2efcfaa7a91007805974e0435669e53c  ./README.md
 dddf80c457340202488f7b86b119248d9433dd1f2c54b70e52cf78950fbcbacf  ./commands/local-gates.command.txt
-64837a1e4d43c1c093f46bf100e9415ba4adc7e9505f15a6638952e45ef4fbbc  ./commands/ubuntu-gates.command.txt
+2f714cb9c0664fc88f77b63b12afb454f045627d043f71c58effcbc2ffb290b6  ./commands/ubuntu-gates.command.txt
 cc07b55ce99cdbf933fdb6c51ef0ff7feb95ab45287f0bbe3797f7dfe2f654ab  ./logs/local-gates.log
 014c27612511bd3e6187e0c2ccc59d17633666a1821e4a1cd29cd894cfcd8861  ./logs/local-repo-state.log
 63ffa457f6296e07d4307d7c407d3ed3ea6ef3ca9a596ae01ea4edab9aa22644  ./logs/ubuntu-discovery.log
