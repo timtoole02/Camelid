@@ -20,6 +20,7 @@ try {
     '--warmup', '0',
     '--repeats', '2',
     '--threads', '4',
+    '--expected-camelid-q8-policy', 'lazy_q8_linear_default_or_auto_retain',
     '--out', planPath,
   ], { encoding: 'utf8' })
 
@@ -35,6 +36,7 @@ try {
   assert.equal(plan.method.repeats, 2)
   assert.equal(plan.method.threads, 4)
   assert.equal(plan.method.expected_marker, 'CMLD-BENCH')
+  assert.equal(plan.method.expected_camelid_q8_policy, 'lazy_q8_linear_default_or_auto_retain')
   assert.equal(plan.method.require_marker, false)
   assert.equal(plan.method.unique_prompt, false)
   assert.equal(plan.method.evidence_context.model_artifact.sha256, 'not_computed_in_plan_mode')
@@ -42,12 +44,14 @@ try {
   assert.equal(plan.method.resource_snapshots.pre_start.label, 'pre_start')
   assert.match(plan.commands.harness, /--row-id llama32_1b_instruct_q8_0/)
   assert.match(plan.commands.harness, /'\/tmp\/Camelid Test\/Llama-3\.2-1B-Instruct-Q8_0\.gguf'/)
+  assert.match(plan.commands.harness, /--expected-camelid-q8-policy lazy_q8_linear_default_or_auto_retain/)
   assert.match(plan.commands.llama_server, /--no-warmup/)
   assert.ok(plan.method.bounded_metrics.some((metric) => metric.includes('not tokenizer-ground-truth tokens')))
   assert.ok(plan.method.bounded_metrics.some((metric) => metric.includes('marker_presence')))
   assert.ok(plan.method.bounded_metrics.some((metric) => metric.includes('camelid_backend_generate_ms')))
+  assert.ok(plan.method.bounded_metrics.some((metric) => metric.includes('camelid_q8_runtime_policy')))
   assert.ok(plan.method.bounded_metrics.some((metric) => metric.includes('FFN-down decode')))
-  assert.match(plan.outputs.guardrail, /--require-marker/)
+  assert.match(plan.outputs.guardrail, /--expected-camelid-q8-policy/)
   assert.match(plan.claim_boundary, /does not widen support/)
   assert.match(plan.claim_boundary, /production-throughput/)
   assert.match(plan.claim_boundary, /Mixtral claims/)
@@ -93,6 +97,7 @@ try {
   assert.equal(helpRun.status, 0, helpRun.stderr)
   assert.match(helpRun.stdout, /--print-plan/)
   assert.match(helpRun.stdout, /--unique-prompt/)
+  assert.match(helpRun.stdout, /--expected-camelid-q8-policy/)
   assert.match(helpRun.stdout, /CAMELID_STREAM_TIMING_DIAGNOSTICS=on/)
   assert.match(helpRun.stdout, /JSON report schema: camelid\.same_host_llama3_benchmark\.v1/)
   assert.match(helpRun.stdout, /does not promote production throughput/)

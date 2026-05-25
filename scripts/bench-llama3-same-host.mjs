@@ -28,6 +28,7 @@ const explicitLlamaContext = parseOptionalPositiveInt(args.get('llama-context') 
 const threads = parseOptionalPositiveInt(args.get('threads') || process.env.CAMELID_BENCH_THREADS, 'threads')
 const requireMarker = args.has('require-marker') || process.env.CAMELID_BENCH_REQUIRE_MARKER === '1'
 const expectedMarker = args.get('expected-marker') || process.env.CAMELID_BENCH_EXPECTED_MARKER || 'CMLD-BENCH'
+const expectedCamelidQ8Policy = args.get('expected-camelid-q8-policy') || process.env.CAMELID_BENCH_EXPECTED_CAMELID_Q8_POLICY || null
 const uniquePrompt = args.has('unique-prompt') || process.env.CAMELID_BENCH_UNIQUE_PROMPT === '1'
 const minMarkerTokens = parsePositiveInt(process.env.CAMELID_BENCH_MIN_MARKER_TOKENS || '8', 'CAMELID_BENCH_MIN_MARKER_TOKENS')
 
@@ -74,6 +75,8 @@ let llamaSpawnError = null
 let backendStartupMs = null
 let llamaStartupMs = null
 let camelidModelLoadMs = null
+let backendHealthReady = null
+let backendHealthAfterLoad = null
 
 try {
   const backendStart = performance.now()
@@ -96,7 +99,7 @@ try {
     llamaChild.stderr.on('data', (chunk) => process.stderr.write(`[llama-server] ${chunk}`))
   }
 
-  await waitForJson(`${backendBase}/v1/health`, {}, 'camelid', waitMs)
+  backendHealthReady = summarizeCamelidHealth(await waitForJson(`${backendBase}/v1/health`, {}, 'camelid', waitMs))
   backendStartupMs = round(performance.now() - backendStart)
   await waitForJson(`${llamaBase}/health`, {}, 'llama-server', waitMs).catch((err) => {
     if (llamaSpawnError?.code === 'ENOENT') {
@@ -115,6 +118,7 @@ try {
     body: JSON.stringify({ path: modelPath, id: modelId }),
   })
   camelidModelLoadMs = round(performance.now() - loadStarted)
+  backendHealthAfterLoad = summarizeCamelidHealth(await fetchJson(`${backendBase}/v1/health`))
 
   const camelidWarmups = []
   const llamaWarmups = []
@@ -140,7 +144,11 @@ try {
 
   const afterMeasuredSnapshot = await captureResourceSnapshot('after_measured_runs')
 
-  const guardrails = benchmarkGuardrails(camelidRuns, llamaRuns)
+  const guardrails = benchmarkGuardrails({
+    camelidRuns,
+    llamaRuns,
+    camelidHealthAfterLoad: backendHealthAfterLoad,
+  })
 
   const report = {
     schema: 'camelid.same_host_llama3_benchmark.v1',
@@ -156,6 +164,7 @@ try {
       repeats,
       max_tokens: maxTokens,
       expected_marker: expectedMarker,
+      expected_camelid_q8_policy: expectedCamelidQ8Policy,
       require_marker: requireMarker,
       unique_prompt: uniquePrompt,
       benchmark_messages: benchmarkMessages,
@@ -185,6 +194,10 @@ try {
     },
     camelid: {
       base_url: backendBase,
+      health: {
+        startup_ready: backendHealthReady,
+        after_model_load: backendHealthAfterLoad,
+      },
       warmups: camelidWarmups,
       runs: camelidRuns,
       summary: summarizeRuns(camelidRuns),
@@ -208,8 +221,13 @@ try {
     await writeFile(outPath, `${JSON.stringify(report, null, 2)}\n`)
     console.log(`json_out=${outPath}`)
   }
-  if (requireMarker && !guardrails.passed) {
-    throw new Error(`benchmark marker guard failed: expected ${JSON.stringify(expectedMarker)} in every measured run`)
+  if (!guardrails.passed) {
+    if (requireMarker && !guardrails.marker_presence.passed) {
+      throw new Error(`benchmark marker guard failed: expected ${JSON.stringify(expectedMarker)} in every measured run`)
+    }
+    if (expectedCamelidQ8Policy && !guardrails.camelid_q8_runtime_policy.matched_expected_policy) {
+      throw new Error(`benchmark Camelid Q8 runtime policy guard failed: expected ${JSON.stringify(expectedCamelidQ8Policy)}, observed ${JSON.stringify(guardrails.camelid_q8_runtime_policy.observed_policy)}`)
+    }
   }
 } finally {
   backendChild?.kill('SIGTERM')
@@ -235,6 +253,7 @@ function buildPlan() {
       repeats,
       max_tokens: maxTokens,
       expected_marker: expectedMarker,
+      expected_camelid_q8_policy: expectedCamelidQ8Policy,
       require_marker: requireMarker,
       unique_prompt: uniquePrompt,
       estimated_prompt_tokens: estimatedPromptTokens,
@@ -248,7 +267,7 @@ function buildPlan() {
       },
     },
     commands: {
-      harness: `node scripts/bench-llama3-same-host.mjs --model ${shellQuote(modelPath)} --model-id ${shellQuote(modelId)} --row-id ${shellQuote(rowId)} --max-tokens ${maxTokens} --warmup ${warmup} --repeats ${repeats}${threads ? ` --threads ${threads}` : ''}${explicitLlamaContext ? ` --llama-context ${explicitLlamaContext}` : ''}${uniquePrompt ? ' --unique-prompt' : ''}${requireMarker ? ` --require-marker --expected-marker ${shellQuote(expectedMarker)}` : ''}${out ? ` --out ${shellQuote(resolve(out))}` : ''}`,
+      harness: `node scripts/bench-llama3-same-host.mjs --model ${shellQuote(modelPath)} --model-id ${shellQuote(modelId)} --row-id ${shellQuote(rowId)} --max-tokens ${maxTokens} --warmup ${warmup} --repeats ${repeats}${threads ? ` --threads ${threads}` : ''}${explicitLlamaContext ? ` --llama-context ${explicitLlamaContext}` : ''}${uniquePrompt ? ' --unique-prompt' : ''}${requireMarker ? ` --require-marker --expected-marker ${shellQuote(expectedMarker)}` : ''}${expectedCamelidQ8Policy ? ` --expected-camelid-q8-policy ${shellQuote(expectedCamelidQ8Policy)}` : ''}${out ? ` --out ${shellQuote(resolve(out))}` : ''}`,
       camelid_serve: startBackend ? `${shellQuote(backendBin)} serve --addr ${shellQuote(`${backendUrl.hostname}:${backendUrl.port || '8181'}`)}` : 'not started by harness (--start-backend=false)',
       llama_server: startLlamaServer ? [shellQuote(llamaServerBin), ...llamaArgs.map(shellQuote)].join(' ') : 'not started by harness (--start-llama-server=false)',
       camelid_load_request: `POST ${backendBase}/api/models/load {"path":${JSON.stringify(modelPath)},"id":${JSON.stringify(modelId)}}`,
@@ -263,12 +282,15 @@ function buildPlan() {
         'llama_cpp_ttft_ms=<same metric for llama.cpp>',
         'llama_cpp_decode_tok_s=<same metric for llama.cpp>',
         'llama_cpp_ms_tok=<same metric for llama.cpp>',
+        'camelid_q8_policy=<Camelid /v1/health q8_runtime.policy after model load>',
         'camelid_backend_generate_ms=<mean Camelid backend generate timing when CAMELID_STREAM_TIMING_DIAGNOSTICS=on>',
         'camelid_backend_first_content_ms=<mean Camelid backend first-content timing when CAMELID_STREAM_TIMING_DIAGNOSTICS=on>',
         'json_out=<absolute path when --out is set>',
       ],
       json: 'Full machine-readable report at --out, schema camelid.same_host_llama3_benchmark.v1.',
-      guardrail: `marker_presence=${expectedMarker}; pass/fail is recorded under guardrails and can be enforced with --require-marker`,
+      guardrail: expectedCamelidQ8Policy
+        ? `marker_presence=${expectedMarker}; camelid_q8_policy=${expectedCamelidQ8Policy}; pass/fail is recorded under guardrails and can be enforced with --require-marker plus --expected-camelid-q8-policy`
+        : `marker_presence=${expectedMarker}; pass/fail is recorded under guardrails and can be enforced with --require-marker`,
       lifecycle: 'Report records server startup timing, model-load timing, warmups, and whether servers were started by the harness or reused preloaded.',
     },
     claim_boundary: claimBoundary(),
@@ -284,6 +306,7 @@ function boundedMetrics() {
     'completion_tokens_estimate: count of non-empty streamed content chunks, not tokenizer-ground-truth tokens',
     'decode_tok_per_s and ms_per_token_after_first: derived from completion_tokens_estimate after first content',
     'marker_presence: exact expected marker observed in measured output text, optionally enforced with --require-marker',
+    'camelid_q8_runtime_policy: /v1/health snapshot after model load records the active Q8 runtime policy, lazy-vs-retained booleans, and optional expected-policy guard',
     'camelid_backend_generate_ms and camelid_backend_first_content_ms: opt-in backend timings when CAMELID_STREAM_TIMING_DIAGNOSTICS=on',
     'camelid_backend_q8_calls and q8 timing counters: opt-in Q8 scheduler diagnostics when Camelid Q8 scheduler telemetry is also enabled; call count includes single-projection, fused gate/up, FFN-down decode, and route-table counters',
     'resource_snapshots: host memory/load/storage snapshots before start, before measured runs, and after measured runs',
@@ -323,6 +346,8 @@ Key options:
   --threads <n>                   Optional llama-server CPU threads.
   --llama-context <n>             Optional llama-server context; otherwise bounded from prompt + max tokens.
   --expected-marker <text>        Marker checked in measured output. Default: CMLD-BENCH.
+  --expected-camelid-q8-policy <policy>
+                                  Optional /v1/health q8_runtime.policy guard after model load.
   --require-marker                Fail the run after writing output unless every measured output contains the marker.
   --unique-prompt                 Add a per-run request id while preserving the expected marker; helps avoid cache-shaped timing artifacts.
   --start-backend=false           Reuse an already-running Camelid server.
@@ -338,11 +363,12 @@ Example:
     --model-id llama32-3b-q8-throughput \\
     --row-id llama32_3b_instruct_q8_0 \\
     --max-tokens 16 --warmup 1 --repeats 3 --threads 8 \\
+    --expected-camelid-q8-policy lazy_q8_linear_default_or_auto_retain \\
     --out target/bench-llama32-3b-same-host.json
 
 Outputs:
   stdout summary keys: camelid_ttft_ms, camelid_decode_tok_s, camelid_ms_tok,
-  llama_cpp_ttft_ms, llama_cpp_decode_tok_s, llama_cpp_ms_tok,
+  llama_cpp_ttft_ms, llama_cpp_decode_tok_s, llama_cpp_ms_tok, camelid_q8_policy,
   camelid_backend_first_content_ms, camelid_backend_generate_ms,
   camelid_backend_q8_calls, json_out.
   Backend timing fields are populated only when Camelid is run with CAMELID_STREAM_TIMING_DIAGNOSTICS=on.
@@ -514,12 +540,13 @@ function printHumanSummary(report) {
   console.log(`llama_cpp_ttft_ms=${l.avg_ttft_ms}`)
   console.log(`llama_cpp_decode_tok_s=${l.avg_decode_tok_per_s}`)
   console.log(`llama_cpp_ms_tok=${l.avg_ms_per_token_after_first}`)
+  console.log(`camelid_q8_policy=${report.camelid.health?.after_model_load?.q8_runtime?.policy ?? 'unknown'}`)
   console.log(`camelid_backend_first_content_ms=${c.avg_backend_first_content_ms}`)
   console.log(`camelid_backend_generate_ms=${c.avg_backend_generate_ms}`)
   console.log(`camelid_backend_q8_calls=${c.avg_backend_q8_calls}`)
 }
 
-function benchmarkGuardrails(camelidRuns, llamaRuns) {
+function benchmarkGuardrails({ camelidRuns, llamaRuns, camelidHealthAfterLoad }) {
   const runStatus = (runs) => runs.map((run) => ({
     label: run.label,
     contains_expected_marker: String(run.text || '').includes(expectedMarker),
@@ -527,18 +554,42 @@ function benchmarkGuardrails(camelidRuns, llamaRuns) {
   }))
   const camelid = runStatus(camelidRuns)
   const llamaCpp = runStatus(llamaRuns)
-  const passed = [...camelid, ...llamaCpp].every((item) => item.contains_expected_marker && item.nonempty_streamed_output)
+  const markerPassed = [...camelid, ...llamaCpp].every((item) => item.contains_expected_marker && item.nonempty_streamed_output)
+  const observedPolicy = camelidHealthAfterLoad?.q8_runtime?.policy ?? null
+  const q8PolicyPassed = expectedCamelidQ8Policy
+    ? observedPolicy === expectedCamelidQ8Policy
+    : true
   return {
     expected_marker: expectedMarker,
+    expected_camelid_q8_policy: expectedCamelidQ8Policy,
     require_marker: requireMarker,
     marker_presence: {
       camelid,
       llama_cpp: llamaCpp,
+      passed: markerPassed,
     },
-    passed,
+    camelid_q8_runtime_policy: {
+      observed_policy: observedPolicy,
+      observed_lazy_q8_linear: camelidHealthAfterLoad?.q8_runtime?.lazy_q8_linear ?? null,
+      observed_retain_q8_blocks: camelidHealthAfterLoad?.q8_runtime?.retain_q8_blocks ?? null,
+      matched_expected_policy: expectedCamelidQ8Policy ? q8PolicyPassed : null,
+      note: expectedCamelidQ8Policy
+        ? 'The harness exits non-zero after writing output if Camelid /v1/health reports a different q8_runtime.policy than the expected matrix row.'
+        : 'Observed Camelid /v1/health q8_runtime policy is recorded for same-host matrix evidence even when no explicit policy guard is requested.',
+    },
+    passed: markerPassed && q8PolicyPassed,
     note: requireMarker
       ? 'The harness exits non-zero if any measured run omits the expected marker; empty measured output is always treated as a failed guardrail.'
       : 'Marker presence and non-empty streamed output are recorded for deterministic-output hygiene; empty measured output always fails the recorded guardrail even when marker enforcement is not requested.',
+  }
+}
+
+function summarizeCamelidHealth(health) {
+  return {
+    loaded_now: Boolean(health?.loaded_now),
+    generation_ready: Boolean(health?.generation_ready),
+    active_model_id: health?.active_model_id ?? null,
+    q8_runtime: health?.q8_runtime ?? null,
   }
 }
 

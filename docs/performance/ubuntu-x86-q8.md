@@ -22,6 +22,7 @@ The current goal is production-directional runtime improvement on a narrow Ubunt
 - Row-dot micro-optimizations are not enough by themselves.
 - Matrix-level ownership remains a direction, not a support or throughput claim until a fresh Ubuntu x86_64 run proves a concrete default-off path.
 - Retain decisions require parity plus repeated wall-clock evidence on a clean host.
+- Same-host benchmark artifacts should record the post-load `/v1/health` Q8 runtime policy so default, forced-lazy, and retained-Q8 matrix rows are explicit in evidence instead of inferred from env setup alone.
 
 ## Current retained paths
 
