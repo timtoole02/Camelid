@@ -138,6 +138,15 @@ assert.equal(
   false,
   '3B WebUI chat must stay blocked when the active runtime row id is spoofed but artifact identity does not match',
 )
+const exactThreeBMetadataOnlyModel = {
+  ...exactThreeBModel,
+  model_path: '',
+  path: '',
+  hf_filename: 'Llama-3.2-3B-Instruct-Q8_0.gguf',
+}
+const metadataOnlyGate = getChatGateState(capabilities, exactThreeBMetadataOnlyModel, runtime)
+assert.equal(metadataOnlyGate.contractSupported, false, '3B support-contract chat state must fail closed when the local GGUF path is absent')
+assert.equal(metadataOnlyGate.chatUnlocked, false, '3B WebUI chat must not unlock from exact metadata without a local runtime artifact path')
 const spoofedThreeBNameWrongArtifact = {
   ...exactThreeBModel,
   id: 'local-wrong-artifact',
@@ -293,7 +302,9 @@ const modelsSource = readFileSync(new URL('../src/views/ModelsView.jsx', import.
 const apiSource = readFileSync(new URL('../src/views/ApiView.jsx', import.meta.url), 'utf8')
 const systemSource = readFileSync(new URL('../src/views/SystemView.jsx', import.meta.url), 'utf8')
 const topBarSource = readFileSync(new URL('../src/components/TopBar.jsx', import.meta.url), 'utf8')
+const chatGateSource = readFileSync(new URL('../src/lib/chatGate.js', import.meta.url), 'utf8')
 
+assert.match(chatGateSource, /artifactReady\s*=\s*Boolean\(model && \(isExternalModel\(model\) \|\| hasLocalModelPath\(model\)\)\)/, 'shared 3B live chat gate must require local artifact presence before support-contract unlock')
 assert.match(hookSource, /selectedModelChatGate\s*=\s*getChatGateState\(dashboard\?\.capabilities, selectedModel, runtime\)/, 'dashboard selectedModelRunnable must be derived from the shared exact-row chat gate')
 assert.match(hookSource, /selectedModelRunnable\s*=\s*selectedModelChatGate\.chatUnlocked/, 'dashboard must pass chatUnlocked, not runtime readiness alone, into the composer')
 assert.match(hookSource, /activeModelChatGate\s*=\s*activeModel \? getChatGateState\(capabilities, activeModel, nextDashboard\.runtime\) : null/, 'dashboard active-model selection must use the shared exact-row chat gate')
