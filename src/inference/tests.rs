@@ -3615,7 +3615,6 @@ fn ffn_gate_up_single_owner_plan(enabled: bool) -> ResolvedRuntimePlan {
     plan
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn ffn_decode_chain_plan() -> ResolvedRuntimePlan {
     let mut plan = ffn_gate_up_consumer_plan(true);
     plan.q8.ffn_decode_chain = true;
@@ -4119,6 +4118,60 @@ fn q8_ffn_decode_chain_uses_vnni_down_when_gated() {
     reset_q8_schedule_telemetry();
     std::env::remove_var(Q8_SCHEDULE_TELEMETRY_ENV);
     std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE");
+}
+
+#[test]
+fn q8_ffn_decode_chain_records_missing_component_gate_denials() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+    std::env::set_var(Q8_SCHEDULE_TELEMETRY_ENV, "on");
+    reset_q8_schedule_telemetry();
+
+    let (input, packed_gate, packed_up, _expected_gate_up) = runtime_packed_ffn_gate_up_case();
+    let (_down_input, packed_down, _expected_down) = runtime_packed_ffn_down_case();
+
+    let mut gate_up_off = ffn_decode_chain_plan();
+    gate_up_off.q8.ffn_gate_up_decode_consumer = false;
+    assert!(try_x86_q8_ffn_decode_chain_path(
+        &input,
+        &packed_gate,
+        &packed_up,
+        &packed_down,
+        "layer_0_ffn_activated",
+        "layer_0_ffn_down",
+        &gate_up_off,
+    )
+    .unwrap()
+    .is_none());
+
+    let telemetry = snapshot_q8_schedule_telemetry();
+    assert!(telemetry
+        .projection_route_denials
+        .contains_key("ffn_gate_up_down.x86_decode_chain.gate_up_decode_consumer_off"));
+
+    reset_q8_schedule_telemetry();
+
+    let mut down_off = ffn_decode_chain_plan();
+    down_off.q8.ffn_down_decode_consumer = false;
+    assert!(try_x86_q8_ffn_decode_chain_path(
+        &input,
+        &packed_gate,
+        &packed_up,
+        &packed_down,
+        "layer_0_ffn_activated",
+        "layer_0_ffn_down",
+        &down_off,
+    )
+    .unwrap()
+    .is_none());
+
+    let telemetry = snapshot_q8_schedule_telemetry();
+    assert!(telemetry
+        .projection_route_denials
+        .contains_key("ffn_gate_up_down.x86_decode_chain.ffn_down_decode_consumer_off"));
+
+    reset_q8_schedule_telemetry();
+    std::env::remove_var(Q8_SCHEDULE_TELEMETRY_ENV);
 }
 
 #[test]

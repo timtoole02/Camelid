@@ -7514,12 +7514,32 @@ fn try_x86_q8_ffn_decode_chain_path(
     down_name: &str,
     runtime_plan: &ResolvedRuntimePlan,
 ) -> Result<Option<Q8FfnDecodeChainOutput>> {
-    if !runtime_plan.q8.ffn_decode_chain
-        || !runtime_plan.q8.ffn_gate_up_decode_consumer
-        || !runtime_plan.q8.ffn_down_decode_consumer
-        || input.rank() != 2
-        || input.dim(0)? != 1
-    {
+    if !runtime_plan.q8.ffn_decode_chain {
+        return Ok(None);
+    }
+    if !runtime_plan.q8.ffn_gate_up_decode_consumer {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up_down",
+            "x86_decode_chain",
+            "gate_up_decode_consumer_off",
+            input.dim(0).unwrap_or(0),
+            input.dim(1).unwrap_or(0),
+            0,
+        );
+        return Ok(None);
+    }
+    if !runtime_plan.q8.ffn_down_decode_consumer {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up_down",
+            "x86_decode_chain",
+            "ffn_down_decode_consumer_off",
+            input.dim(0).unwrap_or(0),
+            input.dim(1).unwrap_or(0),
+            0,
+        );
+        return Ok(None);
+    }
+    if input.rank() != 2 || input.dim(0)? != 1 {
         return Ok(None);
     }
 
