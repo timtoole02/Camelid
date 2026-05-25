@@ -85,15 +85,31 @@ fn x86_q8_packed_rows4_matmul_chunk_groups_env_override() {
     let _env_guard = env_lock();
     std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK");
     assert_eq!(
-        x86_q8_packed_rows4_matmul_groups_per_chunk(),
+        ResolvedRuntimePlan::from_env()
+            .unwrap()
+            .packed_rows4_matmul_schedule
+            .groups_per_chunk,
         X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK
     );
     std::env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK", "32");
-    assert_eq!(x86_q8_packed_rows4_matmul_groups_per_chunk(), 32);
-    assert_eq!(q8_packed_rows4_matmul_parallel_chunk_floats(128), 128);
+    let runtime_plan = ResolvedRuntimePlan::from_env().unwrap();
+    assert_eq!(
+        runtime_plan.packed_rows4_matmul_schedule.groups_per_chunk,
+        32
+    );
+    assert_eq!(
+        q8_packed_rows4_matmul_parallel_chunk_floats(
+            128,
+            runtime_plan.packed_rows4_matmul_schedule.groups_per_chunk,
+        ),
+        128
+    );
     std::env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK", "0");
     assert_eq!(
-        x86_q8_packed_rows4_matmul_groups_per_chunk(),
+        ResolvedRuntimePlan::from_env()
+            .unwrap()
+            .packed_rows4_matmul_schedule
+            .groups_per_chunk,
         X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK
     );
     std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK");
@@ -1675,6 +1691,7 @@ fn q8_0_hot_path_uses_resolved_plan_not_current_env() {
             hybrid_gpu_rows: None,
             hybrid_gpu_percent: 10,
         },
+        packed_rows4_matmul_schedule: Q8PackedRows4MatmulSchedule::default(),
     };
 
     let actual =
@@ -2582,6 +2599,7 @@ fn q8_attention_consumer_plan(
             hybrid_gpu_rows: None,
             hybrid_gpu_percent: 10,
         },
+        packed_rows4_matmul_schedule: Q8PackedRows4MatmulSchedule::default(),
     }
 }
 
@@ -3162,6 +3180,7 @@ fn q8_attention_qkv_packed_rows4_matmul_matches_runtime_packed_baseline_for_pref
         },
         output_width,
         "expected_q",
+        &plan,
     )
     .unwrap();
     let expected_k = q8_0_packed_rows4_matmul_projection(
@@ -3172,6 +3191,7 @@ fn q8_attention_qkv_packed_rows4_matmul_matches_runtime_packed_baseline_for_pref
         },
         output_width,
         "expected_k",
+        &plan,
     )
     .unwrap();
     let expected_v = q8_0_packed_rows4_matmul_projection(
@@ -3182,6 +3202,7 @@ fn q8_attention_qkv_packed_rows4_matmul_matches_runtime_packed_baseline_for_pref
         },
         output_width,
         "expected_v",
+        &plan,
     )
     .unwrap();
     assert_slice_close_with_tolerance(&q.data, &expected_q.data, 5e-4);
@@ -3497,6 +3518,7 @@ fn ffn_down_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             hybrid_gpu_rows: None,
             hybrid_gpu_percent: 10,
         },
+        packed_rows4_matmul_schedule: Q8PackedRows4MatmulSchedule::default(),
     }
 }
 
@@ -3546,6 +3568,7 @@ fn ffn_down_packed_rows4_matmul_plan(enabled: bool) -> ResolvedRuntimePlan {
             hybrid_gpu_rows: None,
             hybrid_gpu_percent: 10,
         },
+        packed_rows4_matmul_schedule: Q8PackedRows4MatmulSchedule::default(),
     }
 }
 
@@ -3599,6 +3622,7 @@ fn ffn_gate_up_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             hybrid_gpu_rows: None,
             hybrid_gpu_percent: 10,
         },
+        packed_rows4_matmul_schedule: Q8PackedRows4MatmulSchedule::default(),
     }
 }
 
@@ -7839,6 +7863,7 @@ fn q8_packed_rows4_matmul_projection_chunked_prefill_matches_manual_output() {
         output_rows,
         "actual_chunked_prefill",
         &quantized_inputs,
+        Q8PackedRows4MatmulSchedule::default().groups_per_chunk,
     )
     .unwrap();
 
@@ -7916,6 +7941,7 @@ fn q8_packed_rows4_gate_up_fused_prefill_matches_separate_pair_activation() {
         "gate",
         "up",
         &quantized_inputs,
+        Q8PackedRows4MatmulSchedule::default().groups_per_chunk,
     )
     .unwrap();
     for (gate_value, up_value) in gate.data.iter_mut().zip(up.data) {
@@ -7930,6 +7956,7 @@ fn q8_packed_rows4_gate_up_fused_prefill_matches_separate_pair_activation() {
         "fused",
         FfnGateUpOrder::GateUp,
         &quantized_inputs,
+        Q8PackedRows4MatmulSchedule::default().groups_per_chunk,
     )
     .unwrap();
 
@@ -8049,6 +8076,7 @@ fn x86_q8_output_packed_rows4_matmul_matches_runtime_packed_baseline_for_prefill
         &packed,
         vocab_rows,
         "expected_output_prefill_logits",
+        &plan,
     )
     .unwrap();
 

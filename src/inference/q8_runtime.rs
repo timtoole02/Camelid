@@ -1,6 +1,9 @@
 use std::env;
 
-use super::{diagnostic_linear_accumulation_precision, LinearAccumulationPrecision};
+use super::{
+    diagnostic_linear_accumulation_precision, LinearAccumulationPrecision,
+    X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK,
+};
 use crate::Result;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +47,7 @@ pub(super) struct Q8RuntimeFlags {
 pub(super) struct ResolvedRuntimePlan {
     pub(super) linear_accumulation_precision: LinearAccumulationPrecision,
     pub(super) q8: Q8RuntimeFlags,
+    pub(super) packed_rows4_matmul_schedule: Q8PackedRows4MatmulSchedule,
 }
 
 impl ResolvedRuntimePlan {
@@ -51,7 +55,32 @@ impl ResolvedRuntimePlan {
         Ok(Self {
             linear_accumulation_precision: diagnostic_linear_accumulation_precision()?,
             q8: Q8RuntimeFlags::from_env(),
+            packed_rows4_matmul_schedule: Q8PackedRows4MatmulSchedule::from_env(),
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Q8PackedRows4MatmulSchedule {
+    pub(super) groups_per_chunk: usize,
+}
+
+impl Default for Q8PackedRows4MatmulSchedule {
+    fn default() -> Self {
+        Self {
+            groups_per_chunk: X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK,
+        }
+    }
+}
+
+impl Q8PackedRows4MatmulSchedule {
+    fn from_env() -> Self {
+        Self {
+            groups_per_chunk: positive_usize_env(
+                "CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK",
+            )
+            .unwrap_or(X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK),
+        }
     }
 }
 
@@ -211,6 +240,13 @@ pub(super) fn q8_0_env_flag_disabled(key: &str) -> bool {
                 || value.eq_ignore_ascii_case("f32")
         })
         .unwrap_or(false)
+}
+
+fn positive_usize_env(key: &str) -> Option<usize> {
+    env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
 }
 
 fn x86_q8_ffn_down_packed_rows4_matmul_enabled() -> bool {
