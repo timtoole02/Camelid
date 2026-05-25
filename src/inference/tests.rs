@@ -3105,6 +3105,91 @@ fn q8_attention_qkv_route_resolver_preserves_decode_and_prefill_guards() {
 }
 
 #[test]
+fn q8_attention_qkv_route_resolver_records_denials() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+    std::env::set_var(Q8_SCHEDULE_TELEMETRY_ENV, "on");
+    reset_q8_schedule_telemetry();
+
+    let (decode_input, q_weight, _) =
+        runtime_packed_attention_projection_case("attention_q", "blk.0.attn_q.weight");
+    let (_, k_weight, _) =
+        runtime_packed_attention_projection_case("attention_k", "blk.0.attn_k.weight");
+    let (_, v_weight, _) =
+        runtime_packed_attention_projection_case("attention_v", "blk.0.attn_v.weight");
+    let prefill_input = CpuTensor::from_f32(
+        "prefill_input",
+        vec![2, decode_input.dim(1).unwrap()],
+        vec![0.0; 2 * decode_input.dim(1).unwrap()],
+    )
+    .unwrap();
+    let dense_v = CpuTensor::from_f32(
+        "dense_v",
+        vec![12, Q8_0_BLOCK_VALUES * 2],
+        vec![0.0; 12 * Q8_0_BLOCK_VALUES * 2],
+    )
+    .unwrap();
+
+    assert!(resolve_x86_q8_attention_qkv_route(
+        &prefill_input,
+        &q_weight,
+        &k_weight,
+        &v_weight,
+        &attention_qkv_consumer_plan(true),
+        X86Q8AttentionQkvRouteKind::Decode,
+    )
+    .unwrap()
+    .is_none());
+    assert!(resolve_x86_q8_attention_qkv_route(
+        &decode_input,
+        &q_weight,
+        &k_weight,
+        &v_weight,
+        &attention_qkv_packed_rows4_matmul_plan(true),
+        X86Q8AttentionQkvRouteKind::PackedRows4Matmul,
+    )
+    .unwrap()
+    .is_none());
+    assert!(resolve_x86_q8_attention_qkv_route(
+        &prefill_input,
+        &q_weight,
+        &k_weight,
+        &v_weight,
+        &attention_qkv_packed_rows4_matmul_plan(false),
+        X86Q8AttentionQkvRouteKind::PackedRows4Matmul,
+    )
+    .unwrap()
+    .is_none());
+    assert!(resolve_x86_q8_attention_qkv_route(
+        &decode_input,
+        &q_weight,
+        &k_weight,
+        &dense_v,
+        &attention_qkv_consumer_plan(true),
+        X86Q8AttentionQkvRouteKind::Decode,
+    )
+    .unwrap()
+    .is_none());
+
+    let telemetry = snapshot_q8_schedule_telemetry();
+    assert!(telemetry
+        .projection_route_denials
+        .contains_key("attention_qkv.x86_decode_consumer.prefill_or_empty_input"));
+    assert!(telemetry
+        .projection_route_denials
+        .contains_key("attention_qkv.x86_packed_rows4_matmul.decode_or_empty_input"));
+    assert!(telemetry
+        .projection_route_denials
+        .contains_key("attention_qkv.x86_packed_rows4_matmul.plan_off"));
+    assert!(telemetry
+        .projection_route_denials
+        .contains_key("attention_qkv.x86_decode_consumer.missing_v_runtime_packed_rows4"));
+
+    reset_q8_schedule_telemetry();
+    std::env::remove_var(Q8_SCHEDULE_TELEMETRY_ENV);
+}
+
+#[test]
 fn q8_attention_qkv_prefill_consumer_gate_is_default_off() {
     let _env_guard = env_lock();
     clear_dense_diagnostic_env();
