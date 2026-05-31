@@ -1448,7 +1448,6 @@ impl CpuTensor {
         Self::from_f32(name, vec![m, n], out)
     }
 
-
     fn require_row_major_f32_data(&self, context: &str) -> Result<()> {
         let expected_len = self.shape.element_count()?;
         if self.data.len() == expected_len {
@@ -1490,7 +1489,7 @@ impl CpuTensor {
         } else {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             {
-                use std::arch::aarch64::{vld1q_f32, vaddq_f32, vst1q_f32};
+                use std::arch::aarch64::{vaddq_f32, vld1q_f32, vst1q_f32};
                 let mut i = 0;
                 unsafe {
                     while i + 4 <= len {
@@ -1605,47 +1604,48 @@ impl CpuTensor {
         Self::from_f32(name, self.shape.dims.clone(), out)
     }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[inline(always)]
-unsafe fn rms_norm_neon(input: &[f32], weight: &[f32], out: &mut [f32], cols: usize, eps: f32) {
-    use std::arch::aarch64::{
-        vld1q_f32, vmulq_f32, vaddq_f32, vdupq_n_f32, vst1q_f32, vget_low_f32, vget_high_f32, vpadd_f32, vget_lane_f32
-    };
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[inline(always)]
+    unsafe fn rms_norm_neon(input: &[f32], weight: &[f32], out: &mut [f32], cols: usize, eps: f32) {
+        use std::arch::aarch64::{
+            vaddq_f32, vdupq_n_f32, vget_high_f32, vget_lane_f32, vget_low_f32, vld1q_f32,
+            vmulq_f32, vpadd_f32, vst1q_f32,
+        };
 
-    let mut sum_sq_vec = vdupq_n_f32(0.0);
-    let mut i = 0;
-    while i + 4 <= cols {
-        let v = vld1q_f32(input.as_ptr().add(i));
-        sum_sq_vec = vaddq_f32(sum_sq_vec, vmulq_f32(v, v));
-        i += 4;
-    }
-    let low = vget_low_f32(sum_sq_vec);
-    let high = vget_high_f32(sum_sq_vec);
-    let sum_2 = vpadd_f32(low, high);
-    let mut sum_sq = vget_lane_f32::<0>(sum_2) + vget_lane_f32::<1>(sum_2);
-    while i < cols {
-        let v = input[i];
-        sum_sq += v * v;
-        i += 1;
-    }
+        let mut sum_sq_vec = vdupq_n_f32(0.0);
+        let mut i = 0;
+        while i + 4 <= cols {
+            let v = vld1q_f32(input.as_ptr().add(i));
+            sum_sq_vec = vaddq_f32(sum_sq_vec, vmulq_f32(v, v));
+            i += 4;
+        }
+        let low = vget_low_f32(sum_sq_vec);
+        let high = vget_high_f32(sum_sq_vec);
+        let sum_2 = vpadd_f32(low, high);
+        let mut sum_sq = vget_lane_f32::<0>(sum_2) + vget_lane_f32::<1>(sum_2);
+        while i < cols {
+            let v = input[i];
+            sum_sq += v * v;
+            i += 1;
+        }
 
-    let mean_square = sum_sq / cols as f32;
-    let scale = 1.0 / (mean_square + eps).sqrt();
-    let scale_vec = vdupq_n_f32(scale);
+        let mean_square = sum_sq / cols as f32;
+        let scale = 1.0 / (mean_square + eps).sqrt();
+        let scale_vec = vdupq_n_f32(scale);
 
-    i = 0;
-    while i + 4 <= cols {
-        let v_in = vld1q_f32(input.as_ptr().add(i));
-        let v_w = vld1q_f32(weight.as_ptr().add(i));
-        let v_out = vmulq_f32(vmulq_f32(v_in, scale_vec), v_w);
-        vst1q_f32(out.as_mut_ptr().add(i), v_out);
-        i += 4;
+        i = 0;
+        while i + 4 <= cols {
+            let v_in = vld1q_f32(input.as_ptr().add(i));
+            let v_w = vld1q_f32(weight.as_ptr().add(i));
+            let v_out = vmulq_f32(vmulq_f32(v_in, scale_vec), v_w);
+            vst1q_f32(out.as_mut_ptr().add(i), v_out);
+            i += 4;
+        }
+        while i < cols {
+            out[i] = input[i] * scale * weight[i];
+            i += 1;
+        }
     }
-    while i < cols {
-        out[i] = input[i] * scale * weight[i];
-        i += 1;
-    }
-}
 
     pub fn rms_norm(&self, weight: &Self, eps: f32, name: impl Into<String>) -> Result<Self> {
         require_rank(self, 2, "rms_norm input")?;
@@ -1665,10 +1665,8 @@ unsafe fn rms_norm_neon(input: &[f32], weight: &[f32], out: &mut [f32], cols: us
             if should_parallelize_linear_output(self.data.len()) {
                 out.par_chunks_mut(cols)
                     .zip(self.data.par_chunks(cols))
-                    .for_each(|(out_row, in_row)| {
-                        unsafe {
-                            Self::rms_norm_neon(in_row, &weight.data, out_row, cols, eps);
-                        }
+                    .for_each(|(out_row, in_row)| unsafe {
+                        Self::rms_norm_neon(in_row, &weight.data, out_row, cols, eps);
                     });
             } else {
                 for row in 0..rows {
@@ -1768,7 +1766,6 @@ unsafe fn rms_norm_neon(input: &[f32], weight: &[f32], out: &mut [f32], cols: us
         }
         Self::from_f32(name, self.shape.dims.clone(), out)
     }
-
 
     pub fn embedding_lookup(&self, token_ids: &[u32], name: impl Into<String>) -> Result<Self> {
         require_rank(self, 2, "embedding weight")?;
@@ -2013,7 +2010,8 @@ fn require_rank(tensor: &CpuTensor, rank: usize, op: &str) -> Result<()> {
 pub(crate) fn dot_product(lhs: &[f32], rhs: &[f32]) -> f32 {
     debug_assert_eq!(lhs.len(), rhs.len());
     use std::arch::aarch64::{
-        vld1q_f32, vmulq_f32, vaddq_f32, vdupq_n_f32, vget_low_f32, vget_high_f32, vpadd_f32, vget_lane_f32
+        vaddq_f32, vdupq_n_f32, vget_high_f32, vget_lane_f32, vget_low_f32, vld1q_f32, vmulq_f32,
+        vpadd_f32,
     };
     let len = lhs.len();
     let mut idx = 0;
@@ -4159,7 +4157,8 @@ pub fn decode_iq4_nl_blocks(bytes: &[u8]) -> Result<Vec<IQ4NLBlock>> {
 
 // Flat dequantization to f32 helpers
 fn decode_q4_0_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
-    let blocks = decode_q4_0_blocks(bytes).map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
+    let blocks = decode_q4_0_blocks(bytes)
+        .map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
     let mut out = Vec::with_capacity(expected_elements);
     for block in blocks {
         let scale = block.scale_f32();
@@ -4171,7 +4170,8 @@ fn decode_q4_0_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Res
 }
 
 fn decode_q4_1_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
-    let blocks = decode_q4_1_blocks(bytes).map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
+    let blocks = decode_q4_1_blocks(bytes)
+        .map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
     let mut out = Vec::with_capacity(expected_elements);
     for block in blocks {
         let scale = block.scale_f32();
@@ -4184,7 +4184,8 @@ fn decode_q4_1_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Res
 }
 
 fn decode_q5_0_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
-    let blocks = decode_q5_0_blocks(bytes).map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
+    let blocks = decode_q5_0_blocks(bytes)
+        .map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
     let mut out = Vec::with_capacity(expected_elements);
     for block in blocks {
         let scale = block.scale_f32();
@@ -4196,7 +4197,8 @@ fn decode_q5_0_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Res
 }
 
 fn decode_q5_1_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
-    let blocks = decode_q5_1_blocks(bytes).map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
+    let blocks = decode_q5_1_blocks(bytes)
+        .map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
     let mut out = Vec::with_capacity(expected_elements);
     for block in blocks {
         let scale = block.scale_f32();
@@ -4209,7 +4211,8 @@ fn decode_q5_1_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Res
 }
 
 fn decode_q2_k_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
-    let blocks = decode_q2_k_blocks(bytes).map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
+    let blocks = decode_q2_k_blocks(bytes)
+        .map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
     let mut out = Vec::with_capacity(expected_elements);
     for block in blocks {
         let mut values = [0.0_f32; QK_K_BLOCK_SIZE];
@@ -4220,7 +4223,8 @@ fn decode_q2_k_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Res
 }
 
 fn decode_q3_k_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
-    let blocks = decode_q3_k_blocks(bytes).map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
+    let blocks = decode_q3_k_blocks(bytes)
+        .map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
     let mut out = Vec::with_capacity(expected_elements);
     for block in blocks {
         let mut values = [0.0_f32; QK_K_BLOCK_SIZE];
@@ -4231,7 +4235,8 @@ fn decode_q3_k_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Res
 }
 
 fn decode_q4_k_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
-    let blocks = decode_q4_k_blocks(bytes).map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
+    let blocks = decode_q4_k_blocks(bytes)
+        .map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
     let mut out = Vec::with_capacity(expected_elements);
     for block in blocks {
         let mut values = [0.0_f32; QK_K_BLOCK_SIZE];
@@ -4242,7 +4247,8 @@ fn decode_q4_k_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Res
 }
 
 fn decode_q5_k_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
-    let blocks = decode_q5_k_blocks(bytes).map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
+    let blocks = decode_q5_k_blocks(bytes)
+        .map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
     let mut out = Vec::with_capacity(expected_elements);
     for block in blocks {
         let mut values = [0.0_f32; QK_K_BLOCK_SIZE];
@@ -4253,7 +4259,8 @@ fn decode_q5_k_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Res
 }
 
 fn decode_q6_k_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
-    let blocks = decode_q6_k_blocks(bytes).map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
+    let blocks = decode_q6_k_blocks(bytes)
+        .map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
     let mut out = Vec::with_capacity(expected_elements);
     for block in blocks {
         let mut values = [0.0_f32; QK_K_BLOCK_SIZE];
@@ -4264,7 +4271,8 @@ fn decode_q6_k_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Res
 }
 
 fn decode_q8_k_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
-    let blocks = decode_q8_k_blocks(bytes).map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
+    let blocks = decode_q8_k_blocks(bytes)
+        .map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
     let mut out = Vec::with_capacity(expected_elements);
     for block in blocks {
         let mut values = [0.0_f32; QK_K_BLOCK_SIZE];
@@ -4275,7 +4283,8 @@ fn decode_q8_k_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Res
 }
 
 fn decode_iq4_nl_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
-    let blocks = decode_iq4_nl_blocks(bytes).map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
+    let blocks = decode_iq4_nl_blocks(bytes)
+        .map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
     let mut out = Vec::with_capacity(expected_elements);
     for block in blocks {
         let mut values = [0.0_f32; 32];
