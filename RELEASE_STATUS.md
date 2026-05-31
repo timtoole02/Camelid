@@ -4,11 +4,11 @@ Last updated: 2026-05-31
 
 Branch: `release/v0.1-evidence`
 
-Current release SHA: release branch HEAD after this evidence-publication update
+Current release SHA: `v0.1.0-rc1` tag target after the release-captain signoff refresh
 
 Release target: `v0.1.0-rc1`
 
-Release posture: evidence release candidate in progress. A clean-head llama.cpp CPU comparator bundle now exists for one exact row, with Ollama and MLX explicitly deferred. No tag was created in this automation slice.
+Release posture: evidence release candidate signed off for `v0.1.0-rc1`. A clean-head llama.cpp CPU comparator bundle exists for one exact row, with llama.cpp Metal, Ollama, and MLX explicitly deferred. Final `v0.1.0` remains Tim-approval gated.
 
 ## Latest Release Captain Update
 
@@ -16,40 +16,42 @@ Camelid v0.1 update:
 
 Shipped:
 
-- Built Camelid from the clean release worktree using an external Cargo target directory because the local filesystem had only about 246 MiB free after an attempted llama.cpp checkout.
-- Built a pinned external llama.cpp comparator at source commit `399739d5c5978351f39e3454bfbfbab4f369088f`.
-- Captured a real v0.1 same-host llama.cpp CPU comparator bundle for `llama32_3b_instruct_q8_0`.
-- Published a scrubbed public bundle under `qa/evidence-bundles/v0.1/20260531T184150Z-real-local/`.
-- Tightened the public evidence publisher so macOS home paths and mounted model/build paths are scrubbed before publication.
-- Explicitly deferred Ollama and MLX fresh baselines with release-captain rationale and no public win claims.
+- Re-verified the clean release worktree on branch `release/v0.1-evidence`.
+- Accepted the documented comparator deferrals for `v0.1.0-rc1`: llama.cpp Metal, Ollama, and MLX remain non-claims.
+- Re-ran the lightweight release gates using an external Cargo target directory because the main filesystem had less than 1 GiB free.
+- Signed off the exact-row support matrix, correctness boundary, README, release notes, benchmark posture, and public evidence bundle as rc1-ready.
+- Approved cutting `v0.1.0-rc1` from the signed-off release branch only; final `v0.1.0` still requires Tim approval.
 
 Evidence:
 
+- Gate run timestamp: 2026-05-31 20:05-20:08 UTC.
+- Branch/remote before signoff refresh: `release/v0.1-evidence` at `ab0cbdecaff373c501a2f1383342f71cee0f4f0d`, matching `origin/release/v0.1-evidence`.
 - Real bundle: `qa/evidence-bundles/v0.1/20260531T184150Z-real-local/`.
 - Bundle source SHA: `8026339531463ade269d7be7078da331ba3e4085`; git status was clean at run time.
 - Model SHA256: `b5607b5090a8280063fff2d706bb3408ca6542341b06aab39c3eca0a28575921`.
 - llama.cpp source commit: `399739d5c5978351f39e3454bfbfbab4f369088f`; run mode was CPU-only via `-ngl 0`.
 - Marker guardrails passed for both Camelid and llama.cpp measured runs.
 - Privacy audit passed with zero findings for the scrubbed bundle.
-- Local QA passed after the evidence-publication update: Rust fmt, clippy, full tests, frontend build/model-state smoke, public evidence-claim check, public scrub guard, harness self-test, JS syntax check, privacy audit, and diff whitespace check.
+- Local QA passed after the signoff refresh: Rust fmt, clippy, full tests, release build, frontend `npm ci`, frontend build/model-state smoke, public evidence-claim check, public scrub guard, harness self-test, privacy audit, and diff whitespace check.
 
 Blocker/Risk:
 
-- `v0.1.0-rc1` was not created. The remaining risk is release-captain acceptance of documented comparator deferrals plus final pushed-branch verification.
 - llama.cpp coverage is one CPU-only exact-row run, not a full table and not Metal evidence.
 - Ollama is deferred because the only installed row observed here was `llama3.1:8b`, not an approved exact release comparator row.
 - MLX is deferred because `mlx_lm` is not installed in the default Python environment.
 - The source SHA in the benchmark bundle predates later docs/evidence-publication commits; no runtime code changes were made after that clean-head run.
+- The local machine's main filesystem had less than 1 GiB free during signoff, so Rust build artifacts were kept outside the repository.
+- Remote CI still needs normal observation after the pushed signoff commit/tag; no local gate is currently failing.
 
 Next:
 
 - Commit and push the release branch.
-- Observe remote/CI state after push.
-- Create `v0.1.0-rc1` only after the documented deferrals and final branch state are accepted.
+- Create and push annotated tag `v0.1.0-rc1` from the signed-off release branch.
+- Observe remote/CI state after the push.
 
 Need Tim:
 
-- Decide whether `v0.1.0-rc1` may proceed with one llama.cpp CPU exact-row baseline plus explicit Ollama/MLX/Metal deferrals. Final `v0.1.0` remains approval-gated.
+- Approve or reject any final `v0.1.0` tag after rc1 soak/CI review. No final tag is authorized by this release-captain signoff.
 
 ## Current Checkout
 
@@ -123,7 +125,7 @@ Every benchmark result must record:
 - [x] Release notes exist.
 - [x] Evidence bundle exists.
 - [x] Public docs contain no unsupported performance claims.
-- [ ] Release Captain signs off.
+- [x] Release Captain signs off for `v0.1.0-rc1`.
 
 ## Lane Ownership
 

@@ -1,12 +1,12 @@
 # Camelid v0.1 Release Candidate Report
 
-Current SHA: release branch HEAD after this gate-refresh commit
+Current SHA: `v0.1.0-rc1` tag target after the release-captain signoff refresh
 
 Branch: `release/v0.1-evidence`
 
 Tag candidate: `v0.1.0-rc1`
 
-Release status: not tagged. The release branch now has v0.1 docs, a benchmark harness, a clean-head same-host llama.cpp CPU evidence bundle for one exact row, and release-captain deferrals for Ollama and MLX. No final `v0.1.0` tag may be created without Tim approval.
+Release status: release-captain signed off for `v0.1.0-rc1`. The release branch has v0.1 docs, a benchmark harness, a clean-head same-host llama.cpp CPU evidence bundle for one exact row, and release-captain deferrals for llama.cpp Metal, Ollama, and MLX. No final `v0.1.0` tag may be created without Tim approval.
 
 Supported model rows:
 
@@ -53,21 +53,21 @@ Tests run: see `RELEASE_GATE_v0.1.md`. Local lightweight gates pass, including `
 
 Remaining blockers and risks:
 
-- `v0.1.0-rc1` was not created in this automation slice.
 - llama.cpp Metal, Ollama, and MLX fresh baselines are deferred; public docs must keep those non-claims explicit.
 - The clean-head evidence bundle source SHA predates later documentation/evidence-publication commits; no runtime code changes were made after the run.
+- Remote CI still needs normal observation after the pushed signoff commit/tag.
 
-Recommendation: do not create final `v0.1.0` without Tim approval. Create `v0.1.0-rc1` only after Tim or the release captain accepts the documented comparator deferrals and the final pushed branch state is checked.
+Recommendation: create and push `v0.1.0-rc1` from the signed-off release branch. Do not create final `v0.1.0` without Tim approval.
 
 ## Release Captain Signoff
 
 - [x] Evidence bundle exists and records clean source SHA.
-- [ ] Support matrix is exact-row only.
-- [ ] Correctness claims cite evidence paths.
-- [ ] Benchmark methodology is reproducible from a clean checkout.
+- [x] Support matrix is exact-row only.
+- [x] Correctness claims cite evidence paths.
+- [x] Benchmark methodology is reproducible from a clean checkout.
 - [x] llama.cpp, Ollama, and MLX are each either benchmarked or explicitly deferred with reasons.
 - [x] CPU-only, Metal, MLX, and distributed evidence are separated and labeled.
-- [ ] README contains no unsupported performance or model-family claims.
-- [ ] Release notes explain wins, losses, and unsupported areas.
+- [x] README contains no unsupported performance or model-family claims.
+- [x] Release notes explain wins, losses, and unsupported areas.
 - [x] QA gate records pass/fail for all required commands after this publication update.
-- [ ] Primary dirty checkout remains preserved or is explicitly reconciled later.
+- [x] Primary dirty checkout remains preserved; this release lane used only the clean release worktree.
