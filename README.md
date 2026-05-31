@@ -107,25 +107,25 @@ npm run dev
 
 ---
 
-## 🤝 High-Speed Cluster Commands
+## High-Speed Cluster Commands
 
-To scale across two Mac minis using direct IP-over-Thunderbolt bridges:
+To scale across two local machines using a private link or trusted LAN:
 
-#### 1. On Worker Mini (`192.168.0.2`):
+#### 1. On the worker:
 ```bash
 ./target/release/camelid serve-distributed \
     --role worker \
-    --addr 192.168.0.2:8089 \
+    --addr <worker-host>:8089 \
     --layer-range 16..32 \
     --model /path/to/model.gguf
 ```
 
-#### 2. On Coordinator Mini (`192.168.0.1`):
+#### 2. On the coordinator:
 ```bash
 ./target/release/camelid serve-distributed \
     --role coordinator \
-    --addr 192.168.0.1:8181 \
-    --worker-addr 192.168.0.2:8089 \
+    --addr <coordinator-host>:8181 \
+    --worker-addr <worker-host>:8089 \
     --layer-range 0..16 \
     --model /path/to/model.gguf
 ```
