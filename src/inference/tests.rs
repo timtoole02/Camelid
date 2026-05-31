@@ -10296,3 +10296,125 @@ fn mixtral_moe_ffn_routes_top_k_experts() {
     assert!((out.data[0] - expected).abs() < 1.0e-3, "{:?}", out.data);
     assert!((out.data[1] - expected).abs() < 1.0e-3, "{:?}", out.data);
 }
+
+#[test]
+fn mixtral_trace_disabled_by_default() {
+    let _env_guard = crate::test_support::env_lock();
+    std::env::remove_var(MIXTRAL_MOE_TRACE_ENV);
+    assert!(mixtral_moe_trace_path().is_none());
+}
+
+#[test]
+fn mixtral_trace_records_selected_experts() {
+    let _env_guard = crate::test_support::env_lock();
+    let path = std::env::temp_dir().join(format!(
+        "camelid-mixtral-trace-selected-{}.jsonl",
+        uuid::Uuid::new_v4()
+    ));
+    std::env::set_var(MIXTRAL_MOE_TRACE_ENV, &path);
+    let input = CpuTensor::from_f32("input", vec![1, 2], vec![1.0, 1.0]).unwrap();
+    let router = CpuTensor::from_f32("router", vec![2, 2], vec![10.0, 0.0, 0.0, 0.0]).unwrap();
+    let gate_experts = CpuTensor::from_f32(
+        "gate_experts",
+        vec![2, 2, 2],
+        vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+    )
+    .unwrap();
+    let up_experts = gate_experts.clone();
+    let down_experts = gate_experts.clone();
+    let _ = mixtral_moe_ffn(
+        &input,
+        &router,
+        &gate_experts,
+        &up_experts,
+        &down_experts,
+        2,
+        "layer_7_mixtral_moe_ffn",
+    )
+    .unwrap();
+    let line = std::fs::read_to_string(&path).expect("trace file should exist");
+    let value: serde_json::Value =
+        serde_json::from_str(line.trim()).expect("trace line should parse");
+    assert_eq!(value["layer_idx"], 7);
+    assert_eq!(value["selected_experts"][0], 0);
+    assert_eq!(value["selected_experts"][1], 1);
+    let _ = std::fs::remove_file(path);
+    std::env::remove_var(MIXTRAL_MOE_TRACE_ENV);
+}
+
+#[test]
+fn mixtral_trace_records_router_weight_checksums() {
+    let _env_guard = crate::test_support::env_lock();
+    let path = std::env::temp_dir().join(format!(
+        "camelid-mixtral-trace-checksums-{}.jsonl",
+        uuid::Uuid::new_v4()
+    ));
+    std::env::set_var(MIXTRAL_MOE_TRACE_ENV, &path);
+    let input = CpuTensor::from_f32("input", vec![1, 2], vec![1.0, 1.0]).unwrap();
+    let router = CpuTensor::from_f32("router", vec![2, 2], vec![10.0, 0.0, 0.0, 0.0]).unwrap();
+    let experts = CpuTensor::from_f32(
+        "experts",
+        vec![2, 2, 2],
+        vec![1.0, 0.0, 0.0, 1.0, 0.5, 0.0, 0.0, 0.5],
+    )
+    .unwrap();
+    let _ = mixtral_moe_ffn(
+        &input,
+        &router,
+        &experts,
+        &experts,
+        &experts,
+        2,
+        "layer_3_mixtral_moe_ffn",
+    )
+    .unwrap();
+    let line = std::fs::read_to_string(&path).expect("trace file should exist");
+    let value: serde_json::Value =
+        serde_json::from_str(line.trim()).expect("trace line should parse");
+    for key in [
+        "router_logits_checksum",
+        "gate_checksum",
+        "up_checksum",
+        "down_checksum",
+        "post_ffn_checksum",
+    ] {
+        assert!(value[key].as_str().is_some_and(|checksum| !checksum.is_empty()));
+    }
+    assert_eq!(value["expert_weights"].as_array().unwrap().len(), 2);
+    let _ = std::fs::remove_file(path);
+    std::env::remove_var(MIXTRAL_MOE_TRACE_ENV);
+}
+
+#[test]
+fn mixtral_trace_does_not_emit_raw_prompt_by_default() {
+    let _env_guard = crate::test_support::env_lock();
+    let path = std::env::temp_dir().join(format!(
+        "camelid-mixtral-trace-redacted-{}.jsonl",
+        uuid::Uuid::new_v4()
+    ));
+    std::env::set_var(MIXTRAL_MOE_TRACE_ENV, &path);
+    write_mixtral_moe_trace(MixtralMoeTraceRecord {
+        request_id: "req",
+        model_id: "model",
+        prompt_hash: "abc123",
+        layer_idx: 0,
+        position: 0,
+        router_logits_checksum: 1,
+        selected_experts: vec![0, 1],
+        expert_weights: vec![0.5, 0.25],
+        gate_checksum: 2,
+        up_checksum: 3,
+        down_checksum: 4,
+        post_ffn_checksum: 5,
+        token_id_before: 0,
+        token_id_after: 0,
+    });
+    let line = std::fs::read_to_string(&path).expect("trace file should exist");
+    let value: serde_json::Value =
+        serde_json::from_str(line.trim()).expect("trace line should parse");
+    assert!(value.get("prompt").is_none());
+    assert!(value.get("raw_prompt").is_none());
+    assert_eq!(value["prompt_hash"], "abc123");
+    let _ = std::fs::remove_file(path);
+    std::env::remove_var(MIXTRAL_MOE_TRACE_ENV);
+}

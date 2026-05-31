@@ -1,7 +1,11 @@
 use std::{
     cell::RefCell,
     collections::HashMap,
-    env, mem,
+    env,
+    fs::OpenOptions,
+    hash::{DefaultHasher, Hash, Hasher},
+    io::Write,
+    mem,
     process::Command,
     sync::{atomic::AtomicU64, Arc},
     time::Instant,
@@ -12,6 +16,8 @@ use std::sync::OnceLock;
 
 use rayon::prelude::*;
 use serde::Serialize;
+
+const MIXTRAL_MOE_TRACE_ENV: &str = "CAMELID_MIXTRAL_MOE_TRACE";
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::execution_plan::MAC_Q8_PREFILL_I8MM_MIN_ROWS;
@@ -6772,6 +6778,8 @@ fn mixtral_moe_ffn(
     let router_elapsed = router_started.elapsed().as_micros();
     let expert_count = logits.dim(1)?;
     let mut output = vec![0.0_f32; rows * hidden];
+    let trace_enabled = mixtral_moe_trace_path().is_some();
+    let trace_name = name.into();
     let mut gate_elapsed = 0;
     let mut up_elapsed = 0;
     let mut activation_elapsed = 0;
@@ -6786,12 +6794,21 @@ fn mixtral_moe_ffn(
             &logits.data[row * expert_count..(row + 1) * expert_count],
             expert_used_count,
         );
+        let mut selected_experts = Vec::with_capacity(top.len());
+        let mut expert_weights = Vec::with_capacity(top.len());
+        let mut gate_checksum = 0;
+        let mut up_checksum = 0;
+        let mut down_checksum = 0;
         for (expert_idx, weight) in top {
+            selected_experts.push(expert_idx);
+            expert_weights.push(weight);
             let gate =
                 expert_matrix_view(gate_experts, expert_idx, hidden, ff, "mixtral_gate_expert")?;
             let up = expert_matrix_view(up_experts, expert_idx, hidden, ff, "mixtral_up_expert")?;
             let down =
                 expert_matrix_view(down_experts, expert_idx, ff, hidden, "mixtral_down_expert")?;
+            gate_checksum ^= checksum_f32_slice(&gate.data);
+            up_checksum ^= checksum_f32_slice(&up.data);
             let activated =
                 gated_ffn_activation(&row_input, &gate, &up, "mixtral_expert_activated", false)?;
             gate_elapsed += activated.gate;
@@ -6806,18 +6823,108 @@ fn mixtral_moe_ffn(
                 false,
             )?;
             down_elapsed += started.elapsed().as_micros();
+            down_checksum ^= checksum_f32_slice(&expert_out.data);
             for col in 0..hidden {
                 output[row * hidden + col] += expert_out.data[col] * weight;
             }
         }
+        if trace_enabled {
+            write_mixtral_moe_trace(MixtralMoeTraceRecord {
+                request_id: "local",
+                model_id: "unknown",
+                prompt_hash: "unknown",
+                layer_idx: parse_trace_layer_idx(&trace_name).unwrap_or(0),
+                position: row,
+                router_logits_checksum: checksum_f32_slice(
+                    &logits.data[row * expert_count..(row + 1) * expert_count],
+                ),
+                selected_experts,
+                expert_weights,
+                gate_checksum,
+                up_checksum,
+                down_checksum,
+                post_ffn_checksum: checksum_f32_slice(&output[row * hidden..(row + 1) * hidden]),
+                token_id_before: 0,
+                token_id_after: 0,
+            });
+        }
     }
     Ok((
-        CpuTensor::from_f32(name, vec![rows, hidden], output)?,
+        CpuTensor::from_f32(trace_name, vec![rows, hidden], output)?,
         gate_elapsed + router_elapsed,
         up_elapsed,
         activation_elapsed,
         down_elapsed,
     ))
+}
+
+struct MixtralMoeTraceRecord<'a> {
+    request_id: &'a str,
+    model_id: &'a str,
+    prompt_hash: &'a str,
+    layer_idx: usize,
+    position: usize,
+    router_logits_checksum: u64,
+    selected_experts: Vec<usize>,
+    expert_weights: Vec<f32>,
+    gate_checksum: u64,
+    up_checksum: u64,
+    down_checksum: u64,
+    post_ffn_checksum: u64,
+    token_id_before: u32,
+    token_id_after: u32,
+}
+
+fn mixtral_moe_trace_path() -> Option<String> {
+    let value = env::var(MIXTRAL_MOE_TRACE_ENV).ok()?;
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn write_mixtral_moe_trace(record: MixtralMoeTraceRecord<'_>) {
+    let Some(path) = mixtral_moe_trace_path() else {
+        return;
+    };
+    let value = serde_json::json!({
+        "request_id": record.request_id,
+        "model_id": record.model_id,
+        "prompt_hash": record.prompt_hash,
+        "layer_idx": record.layer_idx,
+        "position": record.position,
+        "router_logits_checksum": format!("{:016x}", record.router_logits_checksum),
+        "selected_experts": record.selected_experts,
+        "expert_weights": record.expert_weights,
+        "gate_checksum": format!("{:016x}", record.gate_checksum),
+        "up_checksum": format!("{:016x}", record.up_checksum),
+        "down_checksum": format!("{:016x}", record.down_checksum),
+        "post_ffn_checksum": format!("{:016x}", record.post_ffn_checksum),
+        "token_id_before": record.token_id_before,
+        "token_id_after": record.token_id_after,
+    });
+    append_jsonl(&path, &value);
+}
+
+fn checksum_f32_slice(values: &[f32]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for value in values {
+        value.to_bits().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn parse_trace_layer_idx(name: &str) -> Option<usize> {
+    let start = name.find("layer_")? + "layer_".len();
+    let rest = &name[start..];
+    let end = rest.find('_').unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+fn append_jsonl(path: &str, record: &serde_json::Value) {
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let _ = serde_json::to_writer(&mut file, record);
+    let _ = file.write_all(b"\n");
 }
 
 fn ffn_activation_diagnostics(

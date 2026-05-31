@@ -1,7 +1,11 @@
 use std::{
     collections::HashMap,
     convert::Infallible,
-    env, mem,
+    env,
+    fs::OpenOptions,
+    hash::{DefaultHasher, Hash, Hasher},
+    io::Write,
+    mem,
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex, OnceLock},
@@ -50,6 +54,7 @@ const RETAIN_Q8_BLOCKS_ENV: &str = "CAMELID_RETAIN_Q8_0_BLOCKS";
 const LAZY_Q8_LINEAR_ENV: &str = "CAMELID_LAZY_Q8_0_LINEAR";
 const METADATA_CHAT_TEMPLATE_ENV: &str = "CAMELID_METADATA_CHAT_TEMPLATE";
 const GENERATION_TIMEOUT_ENV: &str = "CAMELID_GENERATION_TIMEOUT_MS";
+const API_TIMEOUT_TRACE_ENV: &str = "CAMELID_API_TIMEOUT_TRACE";
 const STREAM_TIMING_DIAGNOSTICS_ENV: &str = "CAMELID_STREAM_TIMING_DIAGNOSTICS";
 const STREAM_POLL_YIELD_ENV: &str = "CAMELID_STREAM_POLL_YIELD";
 const DEFAULT_GENERATION_TIMEOUT_MS: u64 = 15 * 60 * 1000;
@@ -664,9 +669,13 @@ pub struct CompletionStreamChoice {
 }
 
 struct PreparedGeneration {
+    request_id: String,
+    route: &'static str,
+    streaming: bool,
     model_id: String,
     model_path: PathBuf,
     token_ids: Vec<u32>,
+    prompt_hash: String,
     max_tokens: u32,
     tokenizer: Arc<Tokenizer>,
     session: LlamaInferenceSession,
@@ -677,6 +686,13 @@ struct PreparedGeneration {
     dense_metadata: DenseDiagnosticMetadata,
     timings: GenerationTimings,
     cached_prompt_prefix: Arc<Mutex<Option<CachedPromptPrefix>>>,
+    progress: Arc<Mutex<GenerationProgress>>,
+}
+
+#[derive(Debug, Default)]
+struct GenerationProgress {
+    tokens_completed: usize,
+    last_token_id: Option<u32>,
 }
 
 struct GeneratedText {
@@ -1932,7 +1948,7 @@ async fn completions(
         default_max_tokens_cap: None,
     };
     let stream = req.stream.unwrap_or(false);
-    let prepared = match prepare_generation(&state, req).await {
+    let prepared = match prepare_generation(&state, req, "/v1/completions", stream).await {
         Ok(prepared) => prepared,
         Err(response) => return response,
     };
@@ -2025,7 +2041,7 @@ async fn chat_completions(
         default_max_tokens_cap: Some(DEFAULT_PUBLIC_CHAT_MAX_TOKENS),
     };
     let stream = req.stream.unwrap_or(false);
-    let prepared = match prepare_generation(&state, req).await {
+    let prepared = match prepare_generation(&state, req, "/v1/chat/completions", stream).await {
         Ok(prepared) => prepared,
         Err(response) => return response,
     };
@@ -2077,7 +2093,7 @@ async fn validate_generation_request(
     state: &AppState,
     req: GenerationSessionRequest,
 ) -> std::result::Result<GenerationSessionSummary, Response> {
-    let prepared = prepare_generation(state, req).await?;
+    let prepared = prepare_generation(state, req, "/v1/generation_sessions", false).await?;
 
     Ok(GenerationSessionSummary {
         id: format!(
@@ -2342,6 +2358,8 @@ fn guard_cpu_weight_materialization_budget(binding: &LlamaTensorBinding) -> crat
 async fn prepare_generation(
     state: &AppState,
     req: GenerationSessionRequest,
+    route: &'static str,
+    streaming: bool,
 ) -> std::result::Result<PreparedGeneration, Response> {
     let requested_max_tokens = req.max_tokens;
     validate_choice_and_logprob_fields(&req).map_err(|response| *response)?;
@@ -2561,10 +2579,15 @@ async fn prepare_generation(
     })?;
     timings.session_create = session_create_started.elapsed().as_millis();
 
+    let prompt_hash = token_ids_hash(&token_ids);
     Ok(PreparedGeneration {
+        request_id: format!("gen-{}", uuid::Uuid::new_v4()),
+        route,
+        streaming,
         model_id: model.id,
         model_path: model.path,
         token_ids,
+        prompt_hash,
         max_tokens,
         tokenizer,
         session,
@@ -2575,6 +2598,7 @@ async fn prepare_generation(
         dense_metadata,
         timings,
         cached_prompt_prefix: state.cached_prompt_prefix.clone(),
+        progress: Arc::new(Mutex::new(GenerationProgress::default())),
     })
 }
 
@@ -2933,6 +2957,7 @@ async fn generate_decoded_tokens_blocking(
     prepared: PreparedGeneration,
 ) -> std::result::Result<GeneratedText, Box<Response>> {
     let timeout = generation_timeout_duration()?;
+    let trace = ApiTimeoutTraceContext::from_prepared(&prepared);
     let handle = tokio::task::spawn_blocking(move || generate_decoded_tokens(prepared));
     match tokio::time::timeout(timeout, handle).await {
         Ok(Ok(result)) => result,
@@ -2942,16 +2967,72 @@ async fn generate_decoded_tokens_blocking(
             format!("generation worker failed before completing the request: {err}"),
             None,
         ))),
-        Err(_) => Err(Box::new(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "generation_timeout",
-            format!(
-                "generation exceeded the configured wall-clock timeout of {} ms; reduce max_tokens, use streaming/progress instrumentation, or raise {GENERATION_TIMEOUT_ENV} for a controlled hardening run",
-                timeout.as_millis()
-            ),
-            Some("max_tokens"),
-        ))),
+        Err(_) => {
+            write_api_timeout_trace(&trace, timeout);
+            Err(Box::new(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "generation_timeout",
+                format!(
+                    "generation exceeded the configured wall-clock timeout of {} ms; reduce max_tokens, use streaming/progress instrumentation, or raise {GENERATION_TIMEOUT_ENV} for a controlled hardening run",
+                    timeout.as_millis()
+                ),
+                Some("max_tokens"),
+            )))
+        }
     }
+}
+
+struct ApiTimeoutTraceContext {
+    request_id: String,
+    route: &'static str,
+    model_id: String,
+    max_tokens: u32,
+    prompt_hash: String,
+    streaming: bool,
+    started: Instant,
+    progress: Arc<Mutex<GenerationProgress>>,
+}
+
+impl ApiTimeoutTraceContext {
+    fn from_prepared(prepared: &PreparedGeneration) -> Self {
+        Self {
+            request_id: prepared.request_id.clone(),
+            route: prepared.route,
+            model_id: prepared.model_id.clone(),
+            max_tokens: prepared.max_tokens,
+            prompt_hash: prepared.prompt_hash.clone(),
+            streaming: prepared.streaming,
+            started: Instant::now(),
+            progress: prepared.progress.clone(),
+        }
+    }
+}
+
+fn write_api_timeout_trace(trace: &ApiTimeoutTraceContext, timeout: Duration) {
+    let Ok(path) = env::var(API_TIMEOUT_TRACE_ENV) else {
+        return;
+    };
+    if path.trim().is_empty() {
+        return;
+    }
+    let (tokens_completed, last_token_id) = trace
+        .progress
+        .lock()
+        .map(|progress| (progress.tokens_completed, progress.last_token_id))
+        .unwrap_or((0, None));
+    let record = serde_json::json!({
+        "request_id": trace.request_id,
+        "route": trace.route,
+        "model_id": trace.model_id,
+        "elapsed_ms": trace.started.elapsed().max(timeout).as_millis(),
+        "max_tokens": trace.max_tokens,
+        "prompt_hash": trace.prompt_hash,
+        "tokens_completed": tokens_completed,
+        "last_token_id": last_token_id,
+        "streaming": trace.streaming,
+        "finish_reason": "timeout",
+    });
+    append_jsonl(path.trim(), &record);
 }
 
 fn generation_timeout_duration() -> std::result::Result<Duration, Box<Response>> {
@@ -3166,6 +3247,7 @@ fn consume_generation_step(
     }
     acc.generated.push(step.next_token_id);
     acc.history.push(step.next_token_id);
+    record_generation_progress(prepared, acc.generated);
     if prepared.tokenizer.special.eog.contains(&step.next_token_id) {
         *acc.finish_reason = "stop";
     } else if !prepared.stop_sequences.is_empty() {
@@ -3322,6 +3404,7 @@ fn generate_token_ids(
         }
         generated.push(step.next_token_id);
         history.push(step.next_token_id);
+        record_generation_progress(&prepared, &generated);
         if prepared.tokenizer.special.eog.contains(&step.next_token_id) {
             finish_reason = "stop";
             break;
@@ -3363,6 +3446,27 @@ fn generate_token_ids(
         finish_reason,
         timings: prepared.timings,
     })
+}
+
+fn record_generation_progress(prepared: &PreparedGeneration, generated: &[u32]) {
+    if let Ok(mut progress) = prepared.progress.lock() {
+        progress.tokens_completed = generated.len();
+        progress.last_token_id = generated.last().copied();
+    }
+}
+
+fn token_ids_hash(token_ids: &[u32]) -> String {
+    let mut hasher = DefaultHasher::new();
+    token_ids.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn append_jsonl(path: &str, record: &serde_json::Value) {
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let _ = serde_json::to_writer(&mut file, record);
+    let _ = file.write_all(b"\n");
 }
 
 fn top_logit_diagnostics(
@@ -4606,6 +4710,91 @@ mod tests {
         env::set_var(STREAM_TIMING_DIAGNOSTICS_ENV, "0");
         assert!(!stream_timing_diagnostics_enabled());
         env::remove_var(STREAM_TIMING_DIAGNOSTICS_ENV);
+    }
+
+    #[test]
+    fn api_timeout_trace_disabled_by_default() {
+        let _env_guard = crate::test_support::env_lock();
+        env::remove_var(API_TIMEOUT_TRACE_ENV);
+        let progress = Arc::new(Mutex::new(GenerationProgress {
+            tokens_completed: 1,
+            last_token_id: Some(42),
+        }));
+        let trace = ApiTimeoutTraceContext {
+            request_id: "req-test".into(),
+            route: "/v1/chat/completions",
+            model_id: "model".into(),
+            max_tokens: 4,
+            prompt_hash: "hash".into(),
+            streaming: true,
+            started: Instant::now(),
+            progress,
+        };
+        write_api_timeout_trace(&trace, Duration::from_millis(1));
+        env::remove_var(API_TIMEOUT_TRACE_ENV);
+    }
+
+    #[test]
+    fn api_timeout_trace_records_partial_generation_state() {
+        let _env_guard = crate::test_support::env_lock();
+        let path = std::env::temp_dir().join(format!(
+            "camelid-api-timeout-partial-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        env::set_var(API_TIMEOUT_TRACE_ENV, &path);
+        let progress = Arc::new(Mutex::new(GenerationProgress {
+            tokens_completed: 3,
+            last_token_id: Some(128),
+        }));
+        let trace = ApiTimeoutTraceContext {
+            request_id: "req-test".into(),
+            route: "/v1/chat/completions",
+            model_id: "model".into(),
+            max_tokens: 9,
+            prompt_hash: token_ids_hash(&[1, 2, 3]),
+            streaming: true,
+            started: Instant::now(),
+            progress,
+        };
+        write_api_timeout_trace(&trace, Duration::from_millis(1));
+        let line = std::fs::read_to_string(&path).expect("trace file should exist");
+        let value: serde_json::Value =
+            serde_json::from_str(line.trim()).expect("trace line should parse");
+        assert_eq!(value["route"], "/v1/chat/completions");
+        assert_eq!(value["tokens_completed"], 3);
+        assert_eq!(value["last_token_id"], 128);
+        assert_eq!(value["finish_reason"], "timeout");
+        let _ = std::fs::remove_file(path);
+        env::remove_var(API_TIMEOUT_TRACE_ENV);
+    }
+
+    #[test]
+    fn api_timeout_trace_redacts_prompt_by_default() {
+        let _env_guard = crate::test_support::env_lock();
+        let path = std::env::temp_dir().join(format!(
+            "camelid-api-timeout-redacted-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        env::set_var(API_TIMEOUT_TRACE_ENV, &path);
+        let trace = ApiTimeoutTraceContext {
+            request_id: "req-test".into(),
+            route: "/v1/chat/completions",
+            model_id: "model".into(),
+            max_tokens: 1,
+            prompt_hash: token_ids_hash(&[10, 11, 12]),
+            streaming: false,
+            started: Instant::now(),
+            progress: Arc::new(Mutex::new(GenerationProgress::default())),
+        };
+        write_api_timeout_trace(&trace, Duration::from_millis(1));
+        let line = std::fs::read_to_string(&path).expect("trace file should exist");
+        let value: serde_json::Value =
+            serde_json::from_str(line.trim()).expect("trace line should parse");
+        assert!(value.get("prompt").is_none());
+        assert!(value.get("raw_prompt").is_none());
+        assert!(value.get("prompt_hash").is_some());
+        let _ = std::fs::remove_file(path);
+        env::remove_var(API_TIMEOUT_TRACE_ENV);
     }
 
     #[test]
@@ -6661,10 +6850,15 @@ mod tests {
         token_ids: Vec<u32>,
         session: LlamaInferenceSession,
     ) -> PreparedGeneration {
+        let prompt_hash = token_ids_hash(&token_ids);
         PreparedGeneration {
+            request_id: "gen-test".to_string(),
+            route: "/v1/completions",
+            streaming: false,
             model_id: model_id.to_string(),
             model_path: PathBuf::from(model_path),
             token_ids,
+            prompt_hash,
             max_tokens: 1,
             tokenizer: Arc::new(test_tokenizer()),
             session,
@@ -6675,6 +6869,7 @@ mod tests {
             dense_metadata: dummy_dense_metadata(),
             timings: GenerationTimings::default(),
             cached_prompt_prefix: Arc::new(Mutex::new(None)),
+            progress: Arc::new(Mutex::new(GenerationProgress::default())),
         }
     }
 
@@ -7065,4 +7260,3 @@ async fn cancel_catalog_download(Json(req): Json<CancelDownloadRequest>) -> Resp
         (StatusCode::NOT_FOUND, "Download not found").into_response()
     }
 }
-
