@@ -59,6 +59,12 @@ function sanitizeValue(value) {
 
 function sanitizeText(input) {
   return String(input)
+    .replace(/\/Users\/[^/\n"']+\/\.openclaw\/workspace\/projects\/Camelid-v0\.1-evidence/g, '$CAMELID_WORKTREE')
+    .replace(/\/Users\/[^/\n"']+\/\.openclaw\/workspace\/projects\/Camelid/g, '$CAMELID_PRIMARY_WORKTREE')
+    .replace(/\/Users\/[^/\n"']+/g, '$HOME')
+    .replace(/\/Volumes\/[^/\n"']+\/Camelid\/models\//g, '$CAMELID_MODEL_DIR/')
+    .replace(/\/Volumes\/[^/\n"']+\/Camelid\/release-captain\/v0\.1-evidence\//g, '$CAMELID_RELEASE_BUILD_ROOT/')
+    .replace(/\/Volumes\/[^/\n"']+/g, '$EXTERNAL_VOLUME')
     .replace(/\/home\/[^/]+\/work\/Camelid[^/]*\/target\//g, 'target/')
     .replace(/\/home\/[^/]+\/work\/Camelid[^/]*\/frontend\/scripts\/smoke\.mjs/g, 'frontend/scripts/smoke.mjs')
     .replace(/\/home\/[^/]+\/work\/Camelid[^/]*\/scripts\/summarize-generation-timings\.mjs/g, 'scripts/summarize-generation-timings.mjs')
