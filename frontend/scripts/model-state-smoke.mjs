@@ -427,6 +427,21 @@ assert.equal(llama32ThreeBQ4PathHint.kind, 'quant_mismatch', 'a canonical 3B row
 assert.equal(llama32ThreeBQ4PathHint.observedQuant, 'Q40', '3B exact-row mismatch should carry the path-derived neighboring quant key')
 assert.match(compatibilityHintCopy(llama32ThreeBQ4PathHint), /appears to be Q4_0/, '3B exact-row mismatch copy should display the loaded artifact quant in GGUF-style form')
 assert.equal(isCompatibilitySupportedForModel(capabilityFixture, llama32ThreeBQ4PathModel), false, '3B exact-row support requires the loaded artifact quant to match Q8_0, not just the browser row id')
+const llama32ThreeBWrongLocalPathWithExactProvenance = {
+  name: 'Llama 3.2 3B Instruct Q8_0',
+  id: 'llama32_3b_instruct_q8_0',
+  quant: 'Q8_0',
+  model_path: '<ubuntu-model-path>/Llama-3.2-3B-Instruct-Q8_0-neighbor.gguf',
+  hf_filename: 'Llama-3.2-3B-Instruct-Q8_0.gguf',
+}
+const llama32ThreeBWrongLocalPathWithExactProvenanceHint = findCompatibilityHint(capabilityFixture, llama32ThreeBWrongLocalPathWithExactProvenance)
+assert.equal(compatibilityHintLabel(llama32ThreeBWrongLocalPathWithExactProvenanceHint), 'llama32_3b_instruct_q8_0: exact GGUF not verified', '3B provenance metadata must not override a different local GGUF path')
+assert.equal(isCompatibilitySupportedForModel(capabilityFixture, llama32ThreeBWrongLocalPathWithExactProvenance), false, '3B support requires the actual local artifact path to match when model_path/path is present')
+assert.equal(
+  getChatGateState(capabilityFixture, { ...localLoadedReady, ...llama32ThreeBWrongLocalPathWithExactProvenance }, { active_model_id: 'llama32_3b_instruct_q8_0', loaded_now: true, generation_ready: true }).chatUnlocked,
+  false,
+  'runtime-green 3B rows must fail closed when exact provenance points at a different local GGUF artifact',
+)
 assert.equal(
   getChatGateState(capabilityFixture, { ...localLoadedReady, ...llama32ThreeBQ4PathModel }, { active_model_id: 'llama32_3b_instruct_q8_0', loaded_now: true, generation_ready: true }).chatUnlocked,
   false,
