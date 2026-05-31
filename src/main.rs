@@ -1,4 +1,10 @@
-use std::{net::{SocketAddr, TcpListener, TcpStream}, path::PathBuf, time::Instant, io::Write, sync::Arc};
+use std::{
+    io::Write,
+    net::{SocketAddr, TcpListener, TcpStream},
+    path::PathBuf,
+    sync::Arc,
+    time::Instant,
+};
 
 #[cfg(target_os = "macos")]
 extern "C" {
@@ -10,12 +16,14 @@ extern "C" {
 
 use camelid::{
     api,
+    cluster::{
+        recv_activation_packet, recv_token_feedback, send_activation_packet, send_token_feedback,
+    },
     gguf::{read_metadata, GgufTensorType},
+    inference::{LlamaInferenceSession, LlamaLoadedWeights, LlamaSampler},
     metal::detect_metal_device,
     tensor::{CpuTensor, Q8_0TensorBlocks, TensorStore},
-    inference::{LlamaLoadedWeights, LlamaInferenceSession, LlamaSampler},
     tokenizer::Tokenizer,
-    cluster::{send_activation_packet, recv_activation_packet, send_token_feedback, recv_token_feedback},
 };
 use clap::{Parser, Subcommand};
 use rayon::ThreadPoolBuilder;
@@ -253,7 +261,7 @@ async fn main() -> anyhow::Result<()> {
             threads,
         } => {
             configure_rayon_threads(threads)?;
-            
+
             let parts: Vec<&str> = layer_range.split("..").collect();
             anyhow::ensure!(
                 parts.len() == 2,
@@ -265,21 +273,21 @@ async fn main() -> anyhow::Result<()> {
                 layer_start < layer_end,
                 "layer_start must be less than layer_end"
             );
-            
+
             let _ = camelid::distributed::DISTRIBUTED_RANGE.set((layer_start, layer_end));
 
             if role == "coordinator" {
                 let worker_addr_str = worker_addr.ok_or_else(|| {
                     anyhow::anyhow!("--worker-addr is required in coordinator mode")
                 })?;
-                
+
                 tracing::info!(worker_addr = %worker_addr_str, "Coordinator connecting to worker");
                 let client = camelid::distributed::DistributedClient::connect(&worker_addr_str)?;
-                camelid::distributed::DISTRIBUTED_CLIENT.set(client).map_err(|_| {
-                    anyhow::anyhow!("Failed to set global distributed client lock")
-                })?;
+                camelid::distributed::DISTRIBUTED_CLIENT
+                    .set(client)
+                    .map_err(|_| anyhow::anyhow!("Failed to set global distributed client lock"))?;
                 tracing::info!("Coordinator connected to worker successfully");
-                
+
                 #[cfg(target_os = "macos")]
                 unsafe {
                     pthread_set_qos_class_self_np(0x09, 0); // QOS_CLASS_BACKGROUND (forces network I/O onto E-cores)
@@ -290,8 +298,12 @@ async fn main() -> anyhow::Result<()> {
                 let config = camelid::model::LlamaModelConfig::from_gguf(&gguf)?;
                 let binding = camelid::model::LlamaTensorBinding::bind(&gguf, &config)?;
                 let store = camelid::tensor::TensorStore::open(&model, &gguf);
-                
-                tracing::info!("Worker loading partitioned weights (layers {}..{})", layer_start, layer_end);
+
+                tracing::info!(
+                    "Worker loading partitioned weights (layers {}..{})",
+                    layer_start,
+                    layer_end
+                );
                 let weights = camelid::inference::LlamaLoadedWeights::load_distributed(
                     &store,
                     &binding,
@@ -300,13 +312,10 @@ async fn main() -> anyhow::Result<()> {
                     false,
                     false,
                 )?;
-                
+
                 tracing::info!("Worker weights loaded successfully. Initializing session.");
-                let session = camelid::inference::LlamaInferenceSession::new(
-                    config,
-                    weights,
-                )?;
-                
+                let session = camelid::inference::LlamaInferenceSession::new(config, weights)?;
+
                 let addr_str = addr.to_string();
                 #[cfg(target_os = "macos")]
                 unsafe {
@@ -414,7 +423,8 @@ async fn main() -> anyhow::Result<()> {
             max_tokens,
             threads,
         } => {
-            run_distribute_master(path, worker_addr, layers, addr, prompt, max_tokens, threads).await?;
+            run_distribute_master(path, worker_addr, layers, addr, prompt, max_tokens, threads)
+                .await?;
         }
     }
     Ok(())
@@ -450,7 +460,10 @@ fn accept_connection(listener: &TcpListener) -> TcpStream {
 fn parse_layers_range(layers_str: &str) -> anyhow::Result<std::ops::Range<usize>> {
     let parts: Vec<&str> = layers_str.split("..").collect();
     if parts.len() != 2 {
-        return Err(anyhow::anyhow!("Invalid layers range format: {}", layers_str));
+        return Err(anyhow::anyhow!(
+            "Invalid layers range format: {}",
+            layers_str
+        ));
     }
     let start = parts[0].parse::<usize>()?;
     let end = parts[1].parse::<usize>()?;
@@ -520,7 +533,8 @@ async fn run_distribute_worker(
             ));
         }
         let rows = activations.len() / hidden_dim;
-        let hidden = CpuTensor::from_f32("activations", vec![rows, hidden_dim], activations.clone())?;
+        let hidden =
+            CpuTensor::from_f32("activations", vec![rows, hidden_dim], activations.clone())?;
 
         let out_hidden = session.forward_layer_range_from_hidden(
             &hidden,
@@ -535,8 +549,10 @@ async fn run_distribute_worker(
                 let logits = session.forward_final_norm_and_logits(&out_hidden)?;
                 let vocab_size = logits.dim(1)?;
                 let last_row_start = (header.seq_len as usize - 1) * vocab_size;
-                let last_row_data = logits.data[last_row_start..last_row_start + vocab_size].to_vec();
-                let last_row_logits = CpuTensor::from_f32("last_row_logits", vec![1, vocab_size], last_row_data)?;
+                let last_row_data =
+                    logits.data[last_row_start..last_row_start + vocab_size].to_vec();
+                let last_row_logits =
+                    CpuTensor::from_f32("last_row_logits", vec![1, vocab_size], last_row_data)?;
                 let token_id = LlamaSampler::Greedy.sample(&last_row_logits)?;
 
                 let is_finished = tokenizer.as_ref().map_or(false, |tok| {
@@ -592,10 +608,18 @@ async fn run_distribute_master(
     let mut pos = 0usize;
     let mut seq_len = token_ids.len();
 
-    let hidden = session.weights.token_embedding.embedding_lookup(&token_ids, "token_embedding_prefill")?;
+    let hidden = session
+        .weights
+        .token_embedding
+        .embedding_lookup(&token_ids, "token_embedding_prefill")?;
     let out_hidden = session.forward_layer_range_from_hidden(&hidden, pos, seq_len)?;
 
-    send_activation_packet(&mut downstream_stream, pos as u32, seq_len as u32, &out_hidden.data)?;
+    send_activation_packet(
+        &mut downstream_stream,
+        pos as u32,
+        seq_len as u32,
+        &out_hidden.data,
+    )?;
 
     let feedback = recv_token_feedback(&mut feedback_stream)?;
     let mut current_token = feedback.token_id;
@@ -609,9 +633,17 @@ async fn run_distribute_master(
 
     let mut generated = 1;
     while !is_finished && generated < max_tokens {
-        let hidden = session.weights.token_embedding.embedding_lookup(&[current_token], "token_embedding")?;
+        let hidden = session
+            .weights
+            .token_embedding
+            .embedding_lookup(&[current_token], "token_embedding")?;
         let out_hidden = session.forward_layer_range_from_hidden(&hidden, pos, seq_len)?;
-        send_activation_packet(&mut downstream_stream, pos as u32, seq_len as u32, &out_hidden.data)?;
+        send_activation_packet(
+            &mut downstream_stream,
+            pos as u32,
+            seq_len as u32,
+            &out_hidden.data,
+        )?;
 
         let feedback = recv_token_feedback(&mut feedback_stream)?;
         current_token = feedback.token_id;
@@ -1152,30 +1184,30 @@ fn log_acceleration_state() {
 }
 
 fn configure_rayon_threads(threads: Option<usize>) -> anyhow::Result<()> {
-        #[cfg(target_os = "macos")]
-        let should_configure = true;
-        #[cfg(not(target_os = "macos"))]
-        let should_configure = threads.is_some();
+    #[cfg(target_os = "macos")]
+    let should_configure = true;
+    #[cfg(not(target_os = "macos"))]
+    let should_configure = threads.is_some();
 
-        if should_configure {
-            let mut builder = ThreadPoolBuilder::new();
-            if let Some(t) = threads {
-                anyhow::ensure!(t > 0, "--threads must be greater than zero");
-                builder = builder.num_threads(t);
-            }
-            #[cfg(target_os = "macos")]
-            {
-                builder = builder.start_handler(|_| {
-                    unsafe {
-                        pthread_set_qos_class_self_np(0x21, 0); // QOS_CLASS_USER_INTERACTIVE (forces P-cores)
-                    }
-                });
-            }
-            builder
-                .build_global()
-                .map_err(|err| anyhow::anyhow!("failed to configure Rayon thread pool: {err}"))?;
+    if should_configure {
+        let mut builder = ThreadPoolBuilder::new();
+        if let Some(t) = threads {
+            anyhow::ensure!(t > 0, "--threads must be greater than zero");
+            builder = builder.num_threads(t);
         }
-        Ok(())
+        #[cfg(target_os = "macos")]
+        {
+            builder = builder.start_handler(|_| {
+                unsafe {
+                    pthread_set_qos_class_self_np(0x21, 0); // QOS_CLASS_USER_INTERACTIVE (forces P-cores)
+                }
+            });
+        }
+        builder
+            .build_global()
+            .map_err(|err| anyhow::anyhow!("failed to configure Rayon thread pool: {err}"))?;
+    }
+    Ok(())
 }
 
 fn average_timings(timings: &[DenseHotloopBenchTimings]) -> DenseHotloopBenchTimings {

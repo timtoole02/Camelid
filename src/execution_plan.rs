@@ -596,10 +596,7 @@ fn select_linux_x86_q8_plan(
     }
     reasons.push("validated Ubuntu/Linux x86_64 Rust Q8 runtime repack enabled".into());
     reasons.push("validated Rust AVX2 Q8 packed rows4 kernel selected".into());
-    reasons.push(
-        "attention, FFN, and output experiments enabled by default"
-            .into(),
-    );
+    reasons.push("attention, FFN, and output experiments enabled by default".into());
     if matches!(profile, ExecutionProfile::Experimental) {
         reasons.push("experimental profile active; support claims remain unchanged".into());
     }
@@ -1225,9 +1222,18 @@ mod tests {
         );
         assert_eq!(outcome.plan.profile, ExecutionProfile::Auto);
         assert_eq!(outcome.plan.selected_backend, "cpu_q8_runtime_repack");
-        assert_eq!(outcome.plan.selected_q8_path, "x86_experimental_q8_0_avx2_rust");
-        assert_eq!(outcome.env_updates.get("CAMELID_X86_Q8_KERNEL"), Some(&Some("avx2")));
-        assert_eq!(outcome.env_updates.get("CAMELID_X86_Q8_REPACK"), Some(&Some("on")));
+        assert_eq!(
+            outcome.plan.selected_q8_path,
+            "x86_experimental_q8_0_avx2_rust"
+        );
+        assert_eq!(
+            outcome.env_updates.get("CAMELID_X86_Q8_KERNEL"),
+            Some(&Some("avx2"))
+        );
+        assert_eq!(
+            outcome.env_updates.get("CAMELID_X86_Q8_REPACK"),
+            Some(&Some("on"))
+        );
         assert!(!outcome.env_updates.contains_key("CAMELID_MAC_Q8_REPACK"));
         assert_eq!(
             outcome
@@ -1758,7 +1764,10 @@ mod tests {
         );
         assert_eq!(outcome.plan.selected_backend, "cpu_reference");
         assert_eq!(outcome.plan.selected_q8_path, "safe_q8_0_block_dot");
-        assert_eq!(outcome.env_updates.get("CAMELID_X86_Q8_REPACK"), Some(&Some("off")));
+        assert_eq!(
+            outcome.env_updates.get("CAMELID_X86_Q8_REPACK"),
+            Some(&Some("off"))
+        );
         clear_profile_env();
     }
 

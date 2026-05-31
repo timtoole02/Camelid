@@ -437,10 +437,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         mistral["generation_runs"],
         "api_completion_and_chat_smoke_plus_broader_50_token_api_smoke"
     );
-    assert_eq!(
-        mistral["frontend_load_path_verified"],
-        "validated"
-    );
+    assert_eq!(mistral["frontend_load_path_verified"], "validated");
     assert_eq!(
         mistral["tested_context"],
         "tokenizer_template_1tok_bounded_and_checked_512_1024_2048_4096_8192_context_packs"
@@ -466,22 +463,18 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         mistral["latest_checked_bucket"],
         "current_head_api_webui_rss_fail_closed"
     );
-    assert_eq!(
-        mistral["latest_checked_result"],
-        "pass"
-    );
-    assert_eq!(
-        mistral["bounded_context_8192_pack"],
-        "validated_fifth_pack"
-    );
+    assert_eq!(mistral["latest_checked_result"], "pass");
+    assert_eq!(mistral["bounded_context_8192_pack"], "validated_fifth_pack");
     assert_eq!(
         mistral["bounded_context_8192_pack_id"],
         "mistral-context-8192-max-ladder-v1"
     );
     let mistral_evidence = mistral["evidence"].as_str().unwrap();
-    assert!(mistral_evidence.contains("exact Mistral-7B-Instruct-v0.3.Q8_0.gguf GGUF has exact-row load"));
+    assert!(mistral_evidence
+        .contains("exact Mistral-7B-Instruct-v0.3.Q8_0.gguf GGUF has exact-row load"));
     let mistral_next_step = mistral["next_step"].as_str().unwrap();
-    assert!(mistral_next_step.contains("preserve exact-row smoke plus checked 512/1024/2048/4096/8192 context support"));
+    assert!(mistral_next_step
+        .contains("preserve exact-row smoke plus checked 512/1024/2048/4096/8192 context support"));
     let mixtral = compatibility
         .iter()
         .find(|item| item["id"] == "mixtral_8x7b_instruct_v0_1_q8_0")

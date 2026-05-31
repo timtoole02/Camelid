@@ -15,7 +15,7 @@ fn test_row_dispatch_adversarial_parity() {
     let _env_guard = env_lock();
 
     let n_blocks = 4;
-    
+
     let mut weight_blocks = Vec::with_capacity(n_blocks);
     let mut input_blocks = Vec::with_capacity(n_blocks);
 
@@ -23,15 +23,35 @@ fn test_row_dispatch_adversarial_parity() {
     let mut w0 = [0_i8; 32];
     let mut in0 = [0_i8; 32];
     for idx in 0..32 {
-        w0[idx] = if idx % 2 == 0 { (idx as i8) * 3 } else { -(idx as i8) * 4 };
-        in0[idx] = if idx % 3 == 0 { 29 - (idx as i8) } else { (idx as i8) - 45 };
+        w0[idx] = if idx % 2 == 0 {
+            (idx as i8) * 3
+        } else {
+            -(idx as i8) * 4
+        };
+        in0[idx] = if idx % 3 == 0 {
+            29 - (idx as i8)
+        } else {
+            (idx as i8) - 45
+        };
     }
-    weight_blocks.push(Q8_0Block { scale: 0.125, quants: w0 });
-    input_blocks.push(Q8_0Block { scale: 0.25, quants: in0 });
+    weight_blocks.push(Q8_0Block {
+        scale: 0.125,
+        quants: w0,
+    });
+    input_blocks.push(Q8_0Block {
+        scale: 0.25,
+        quants: in0,
+    });
 
     // Block 1: Zero block (all zeros, scale 0)
-    weight_blocks.push(Q8_0Block { scale: 0.0, quants: [0_i8; 32] });
-    input_blocks.push(Q8_0Block { scale: 0.0, quants: [0_i8; 32] });
+    weight_blocks.push(Q8_0Block {
+        scale: 0.0,
+        quants: [0_i8; 32],
+    });
+    input_blocks.push(Q8_0Block {
+        scale: 0.0,
+        quants: [0_i8; 32],
+    });
 
     // Block 2: Boundary case with i8::MIN (-128) and i8::MAX (127)
     let mut w2 = [0_i8; 32];
@@ -50,8 +70,14 @@ fn test_row_dispatch_adversarial_parity() {
             _ => 13,
         };
     }
-    weight_blocks.push(Q8_0Block { scale: 1.5, quants: w2 });
-    input_blocks.push(Q8_0Block { scale: 0.75, quants: in2 });
+    weight_blocks.push(Q8_0Block {
+        scale: 1.5,
+        quants: w2,
+    });
+    input_blocks.push(Q8_0Block {
+        scale: 0.75,
+        quants: in2,
+    });
 
     // Block 3: Mixed small values/subnormal scales
     let mut w3 = [0_i8; 32];
@@ -60,8 +86,14 @@ fn test_row_dispatch_adversarial_parity() {
         w3[idx] = (idx as i8) - 16;
         in3[idx] = 16 - (idx as i8);
     }
-    weight_blocks.push(Q8_0Block { scale: 1e-37, quants: w3 });
-    input_blocks.push(Q8_0Block { scale: 1e-38, quants: in3 });
+    weight_blocks.push(Q8_0Block {
+        scale: 1e-37,
+        quants: w3,
+    });
+    input_blocks.push(Q8_0Block {
+        scale: 1e-38,
+        quants: in3,
+    });
 
     // Test single-row dot product
     std::env::set_var("CAMELID_Q8_ROW_DISPATCH", "off");
@@ -78,26 +110,38 @@ fn test_row_dispatch_adversarial_parity() {
 
     // Test two-row dot product
     let mut second_weight_blocks = Vec::with_capacity(n_blocks);
-    
+
     let mut w0_2 = [0_i8; 32];
     for idx in 0..32 {
         w0_2[idx] = if idx % 2 == 0 { -10 } else { 12 };
     }
-    second_weight_blocks.push(Q8_0Block { scale: 0.5, quants: w0_2 });
-    
-    second_weight_blocks.push(Q8_0Block { scale: 0.0, quants: [0_i8; 32] });
-    
+    second_weight_blocks.push(Q8_0Block {
+        scale: 0.5,
+        quants: w0_2,
+    });
+
+    second_weight_blocks.push(Q8_0Block {
+        scale: 0.0,
+        quants: [0_i8; 32],
+    });
+
     let mut w2_2 = [0_i8; 32];
     for idx in 0..32 {
         w2_2[idx] = if idx % 3 == 0 { i8::MIN } else { 45 };
     }
-    second_weight_blocks.push(Q8_0Block { scale: 2.25, quants: w2_2 });
+    second_weight_blocks.push(Q8_0Block {
+        scale: 2.25,
+        quants: w2_2,
+    });
 
     let mut w3_2 = [0_i8; 32];
     for idx in 0..32 {
         w3_2[idx] = -(idx as i8);
     }
-    second_weight_blocks.push(Q8_0Block { scale: 1e-35, quants: w3_2 });
+    second_weight_blocks.push(Q8_0Block {
+        scale: 1e-35,
+        quants: w3_2,
+    });
 
     std::env::set_var("CAMELID_Q8_ROW_DISPATCH", "off");
     let scalar_two_dot = q8_0_two_dot_rows(&weight_blocks, &second_weight_blocks, &input_blocks);

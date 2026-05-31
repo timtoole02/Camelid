@@ -216,8 +216,8 @@ pub(super) fn apply_rope_batch(
     };
 
     let mut data = tensor.data.clone();
-    use rayon::prelude::*;
     use crate::tensor::should_parallelize_linear_output;
+    use rayon::prelude::*;
 
     if should_parallelize_linear_output(rows * width) {
         data.par_chunks_mut(width)
@@ -398,10 +398,9 @@ fn apply_rope_to_row(data: &mut [f32], position: usize, mut params: RopeParams<'
                     let dim0 = head_start + (pair_idx * 2);
                     (dim0, dim0 + 1)
                 }
-                RopePairing::SplitHalf => (
-                    head_start + pair_idx,
-                    head_start + pair_idx + half_rope_dim,
-                ),
+                RopePairing::SplitHalf => {
+                    (head_start + pair_idx, head_start + pair_idx + half_rope_dim)
+                }
             };
             let x0 = data[dim0];
             let x1 = data[dim1];

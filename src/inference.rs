@@ -311,7 +311,9 @@ impl LlamaLoadedWeights {
 
         let mut layers = Vec::with_capacity(binding.layers.len());
         for (layer_idx, layer) in binding.layers.iter().enumerate() {
-            let is_owned = layer_range.as_ref().map_or(true, |r| r.contains(&layer_idx));
+            let is_owned = layer_range
+                .as_ref()
+                .map_or(true, |r| r.contains(&layer_idx));
             if is_owned {
                 let (ffn_gate, ffn_up, ffn_down, moe_router) = match &layer.ffn {
                     LlamaFfnTensors::Dense { gate, up, down } => (
@@ -346,36 +348,58 @@ impl LlamaLoadedWeights {
                 });
             } else {
                 layers.push(LlamaLayerWeights {
-                    attention_norm: CpuTensor::from_f32(&layer.attention_norm.name, vec![0], vec![])?,
+                    attention_norm: CpuTensor::from_f32(
+                        &layer.attention_norm.name,
+                        vec![0],
+                        vec![],
+                    )?,
                     attention_q: CpuTensor::from_f32(&layer.attention_q.name, vec![0], vec![])?,
                     attention_k: CpuTensor::from_f32(&layer.attention_k.name, vec![0], vec![])?,
                     attention_v: CpuTensor::from_f32(&layer.attention_v.name, vec![0], vec![])?,
-                    attention_output: CpuTensor::from_f32(&layer.attention_output.name, vec![0], vec![])?,
+                    attention_output: CpuTensor::from_f32(
+                        &layer.attention_output.name,
+                        vec![0],
+                        vec![],
+                    )?,
                     ffn_norm: CpuTensor::from_f32(&layer.ffn_norm.name, vec![0], vec![])?,
-                    ffn_gate: CpuTensor::from_f32(match &layer.ffn {
-                        LlamaFfnTensors::Dense { gate, .. } => &gate.name,
-                        LlamaFfnTensors::MoE { gate_experts, .. } => match gate_experts {
-                            LlamaMoeExpertTensors::Merged(desc) => &desc.name,
-                            LlamaMoeExpertTensors::Split(descs) => &descs[0].name,
+                    ffn_gate: CpuTensor::from_f32(
+                        match &layer.ffn {
+                            LlamaFfnTensors::Dense { gate, .. } => &gate.name,
+                            LlamaFfnTensors::MoE { gate_experts, .. } => match gate_experts {
+                                LlamaMoeExpertTensors::Merged(desc) => &desc.name,
+                                LlamaMoeExpertTensors::Split(descs) => &descs[0].name,
+                            },
                         },
-                    }, vec![0], vec![])?,
-                    ffn_up: CpuTensor::from_f32(match &layer.ffn {
-                        LlamaFfnTensors::Dense { up, .. } => &up.name,
-                        LlamaFfnTensors::MoE { up_experts, .. } => match up_experts {
-                            LlamaMoeExpertTensors::Merged(desc) => &desc.name,
-                            LlamaMoeExpertTensors::Split(descs) => &descs[0].name,
+                        vec![0],
+                        vec![],
+                    )?,
+                    ffn_up: CpuTensor::from_f32(
+                        match &layer.ffn {
+                            LlamaFfnTensors::Dense { up, .. } => &up.name,
+                            LlamaFfnTensors::MoE { up_experts, .. } => match up_experts {
+                                LlamaMoeExpertTensors::Merged(desc) => &desc.name,
+                                LlamaMoeExpertTensors::Split(descs) => &descs[0].name,
+                            },
                         },
-                    }, vec![0], vec![])?,
-                    ffn_down: CpuTensor::from_f32(match &layer.ffn {
-                        LlamaFfnTensors::Dense { down, .. } => &down.name,
-                        LlamaFfnTensors::MoE { down_experts, .. } => match down_experts {
-                            LlamaMoeExpertTensors::Merged(desc) => &desc.name,
-                            LlamaMoeExpertTensors::Split(descs) => &descs[0].name,
+                        vec![0],
+                        vec![],
+                    )?,
+                    ffn_down: CpuTensor::from_f32(
+                        match &layer.ffn {
+                            LlamaFfnTensors::Dense { down, .. } => &down.name,
+                            LlamaFfnTensors::MoE { down_experts, .. } => match down_experts {
+                                LlamaMoeExpertTensors::Merged(desc) => &desc.name,
+                                LlamaMoeExpertTensors::Split(descs) => &descs[0].name,
+                            },
                         },
-                    }, vec![0], vec![])?,
+                        vec![0],
+                        vec![],
+                    )?,
                     moe_router: match &layer.ffn {
                         LlamaFfnTensors::Dense { .. } => None,
-                        LlamaFfnTensors::MoE { router, .. } => Some(CpuTensor::from_f32(&router.name, vec![0], vec![])?),
+                        LlamaFfnTensors::MoE { router, .. } => {
+                            Some(CpuTensor::from_f32(&router.name, vec![0], vec![])?)
+                        }
                     },
                 });
             }
@@ -1203,11 +1227,25 @@ impl LlamaInferenceSession {
     ) -> Result<CpuTensor> {
         let runtime_plan = ResolvedRuntimePlan::from_env()?;
         let rms_norm_epsilon = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
-        let k = self.weights.layers.iter().position(|l| l.attention_norm.shape.dims[0] > 0).unwrap_or(0);
+        let k = self
+            .weights
+            .layers
+            .iter()
+            .position(|l| l.attention_norm.shape.dims[0] > 0)
+            .unwrap_or(0);
         let n = self.weights.layers.len();
-        tracing::info!("Worker forward_worker_layers: k = {}, n = {}, layers.len = {}", k, n, self.weights.layers.len());
+        tracing::info!(
+            "Worker forward_worker_layers: k = {}, n = {}, layers.len = {}",
+            k,
+            n,
+            self.weights.layers.len()
+        );
         for (i, l) in self.weights.layers.iter().enumerate() {
-            tracing::info!("  layer {}: attention_norm shape = {:?}", i, l.attention_norm.shape.dims);
+            tracing::info!(
+                "  layer {}: attention_norm shape = {:?}",
+                i,
+                l.attention_norm.shape.dims
+            );
         }
 
         if is_prefill {
@@ -1254,7 +1292,12 @@ impl LlamaInferenceSession {
                         &mut self.kv_cache,
                     )?;
                     chunk_input_buffer = hidden_chunk.data;
-                    copy_tensor_rows_into(&timed.output, &mut next_hidden, chunk_start, hidden_width)?;
+                    copy_tensor_rows_into(
+                        &timed.output,
+                        &mut next_hidden,
+                        chunk_start,
+                        hidden_width,
+                    )?;
                 }
                 std::mem::swap(&mut hidden.data, &mut next_hidden);
                 hidden.shape = TensorShape {
@@ -1349,7 +1392,8 @@ impl LlamaInferenceSession {
     pub fn forward_final_norm_and_logits(&self, out_hidden: &CpuTensor) -> Result<CpuTensor> {
         let rms_norm_epsilon = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
         let runtime_plan = ResolvedRuntimePlan::from_env()?;
-        let norm = out_hidden.rms_norm(&self.weights.output_norm, rms_norm_epsilon, "output_norm")?;
+        let norm =
+            out_hidden.rms_norm(&self.weights.output_norm, rms_norm_epsilon, "output_norm")?;
         let logits = output_projection_runtime_with_plan(
             &norm,
             self.weights.output_projection(),
@@ -1697,12 +1741,8 @@ impl LlamaInferenceSession {
             if let Some(range) = &self.weights.layer_range {
                 if !range.contains(&layer_idx) {
                     if let Some(client) = crate::distributed::DISTRIBUTED_CLIENT.get() {
-                        let worker_response = client.forward_to_worker(
-                            &hidden,
-                            false,
-                            1,
-                            self.kv_cache.position,
-                        )?;
+                        let worker_response =
+                            client.forward_to_worker(&hidden, false, 1, self.kv_cache.position)?;
                         hidden = worker_response;
                         break;
                     } else {
@@ -5089,7 +5129,10 @@ fn matmul_rhs_transposed_borrowed_with_precision_with_plan(
     }
     #[cfg(target_os = "macos")]
     {
-        if weight.source_type.is_none() && weight.q8_0_blocks.is_none() && weight.q8_0_file_backing.is_none() {
+        if weight.source_type.is_none()
+            && weight.q8_0_blocks.is_none()
+            && weight.q8_0_file_backing.is_none()
+        {
             let mut output = vec![0.0; rows * output_width];
             unsafe {
                 cblas_sgemm(
@@ -10544,18 +10587,32 @@ fn q8_0_packed_rows4_matmul_projection_pair_from_quantized(
             .for_each(|(row_idx, (left_row, right_row))| {
                 let input_start = row_idx * blocks_per_row;
                 let quantized_row = &quantized_inputs[input_start..input_start + blocks_per_row];
-                for (group_idx, output_chunk) in left_row[..left_output_width].chunks_exact_mut(4).enumerate() {
+                for (group_idx, output_chunk) in left_row[..left_output_width]
+                    .chunks_exact_mut(4)
+                    .enumerate()
+                {
                     let group_start = group_idx * blocks_per_row;
-                    let group_blocks = &left_packed.blocks[group_start..group_start + blocks_per_row];
-                    let sums =
-                        q8_0_packed_rows4_dot_i8_matmul(group_blocks, quantized_row, use_hoisted_avx2);
+                    let group_blocks =
+                        &left_packed.blocks[group_start..group_start + blocks_per_row];
+                    let sums = q8_0_packed_rows4_dot_i8_matmul(
+                        group_blocks,
+                        quantized_row,
+                        use_hoisted_avx2,
+                    );
                     output_chunk.copy_from_slice(&sums);
                 }
-                for (group_idx, output_chunk) in right_row[..right_output_groups_per_row * 4].chunks_exact_mut(4).enumerate() {
+                for (group_idx, output_chunk) in right_row[..right_output_groups_per_row * 4]
+                    .chunks_exact_mut(4)
+                    .enumerate()
+                {
                     let group_start = group_idx * blocks_per_row;
-                    let group_blocks = &right_packed.blocks[group_start..group_start + blocks_per_row];
-                    let sums =
-                        q8_0_packed_rows4_dot_i8_matmul(group_blocks, quantized_row, use_hoisted_avx2);
+                    let group_blocks =
+                        &right_packed.blocks[group_start..group_start + blocks_per_row];
+                    let sums = q8_0_packed_rows4_dot_i8_matmul(
+                        group_blocks,
+                        quantized_row,
+                        use_hoisted_avx2,
+                    );
                     output_chunk.copy_from_slice(&sums);
                 }
             });
@@ -10813,7 +10870,10 @@ fn q8_0_packed_rows4_matmul_projection_triplet_from_quantized(
             .for_each(|(row_idx, ((q_row, k_row), v_row))| {
                 let input_start = row_idx * blocks_per_row;
                 let quantized_row = &quantized_inputs[input_start..input_start + blocks_per_row];
-                for (group_idx, output_chunk) in q_row[..q_groups_per_row * 4].chunks_exact_mut(4).enumerate() {
+                for (group_idx, output_chunk) in q_row[..q_groups_per_row * 4]
+                    .chunks_exact_mut(4)
+                    .enumerate()
+                {
                     let group_start = group_idx * blocks_per_row;
                     output_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
                         &q_packed.blocks[group_start..group_start + blocks_per_row],
@@ -10821,7 +10881,10 @@ fn q8_0_packed_rows4_matmul_projection_triplet_from_quantized(
                         use_hoisted_avx2,
                     ));
                 }
-                for (group_idx, output_chunk) in k_row[..k_groups_per_row * 4].chunks_exact_mut(4).enumerate() {
+                for (group_idx, output_chunk) in k_row[..k_groups_per_row * 4]
+                    .chunks_exact_mut(4)
+                    .enumerate()
+                {
                     let group_start = group_idx * blocks_per_row;
                     output_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
                         &k_packed.blocks[group_start..group_start + blocks_per_row],
@@ -10829,7 +10892,10 @@ fn q8_0_packed_rows4_matmul_projection_triplet_from_quantized(
                         use_hoisted_avx2,
                     ));
                 }
-                for (group_idx, output_chunk) in v_row[..v_groups_per_row * 4].chunks_exact_mut(4).enumerate() {
+                for (group_idx, output_chunk) in v_row[..v_groups_per_row * 4]
+                    .chunks_exact_mut(4)
+                    .enumerate()
+                {
                     let group_start = group_idx * blocks_per_row;
                     output_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
                         &v_packed.blocks[group_start..group_start + blocks_per_row],
@@ -11543,8 +11609,9 @@ fn quantize_q8_0_blocks_into(input: &[f32], blocks: &mut Vec<Q8_0Block>) {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn quantize_q8_0_block(block: &[f32]) -> Q8_0Block {
     use std::arch::aarch64::{
-        vld1q_f32, vabsq_f32, vmaxq_f32, vmax_f32, vget_low_f32, vget_high_f32, vdupq_n_f32, vmulq_f32,
-        vcvtaq_s32_f32, vmovn_s32, vcombine_s16, vqmovn_s16, vcombine_s8, vst1q_s8, vget_lane_f32,
+        vabsq_f32, vcombine_s16, vcombine_s8, vcvtaq_s32_f32, vdupq_n_f32, vget_high_f32,
+        vget_lane_f32, vget_low_f32, vld1q_f32, vmax_f32, vmaxq_f32, vmovn_s32, vmulq_f32,
+        vqmovn_s16, vst1q_s8,
     };
 
     debug_assert_eq!(block.len(), Q8_0_BLOCK_VALUES);
@@ -11677,9 +11744,8 @@ fn q8_row_dispatch_enabled() -> bool {
         #[cfg(not(test))]
         {
             static Q8_ROW_DISPATCH_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *Q8_ROW_DISPATCH_ENABLED.get_or_init(|| {
-                q8_0_env_flag_enabled_default_off("CAMELID_Q8_ROW_DISPATCH")
-            })
+            *Q8_ROW_DISPATCH_ENABLED
+                .get_or_init(|| q8_0_env_flag_enabled_default_off("CAMELID_Q8_ROW_DISPATCH"))
         }
     }
 }
@@ -11901,8 +11967,11 @@ unsafe fn q8_0_two_dot_rows_neon_dotprod(
     let mut first_sum = 0.0_f32;
     let mut second_sum = 0.0_f32;
 
-    for (idx, ((first_block, second_block), input_block)) in
-        first_weight.iter().zip(second_weight).zip(input).enumerate()
+    for (idx, ((first_block, second_block), input_block)) in first_weight
+        .iter()
+        .zip(second_weight)
+        .zip(input)
+        .enumerate()
     {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
@@ -12004,7 +12073,9 @@ fn q8_0_two_dot_rows(
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
             if aarch64_dotprod_enabled() {
-                return unsafe { q8_0_two_dot_rows_neon_dotprod(first_weight, second_weight, input) };
+                return unsafe {
+                    q8_0_two_dot_rows_neon_dotprod(first_weight, second_weight, input)
+                };
             }
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -15115,14 +15186,7 @@ fn dot_product_row(lhs: &[f32], rhs: &[f32]) -> f32 {
     {
         let mut sum = 0.0;
         unsafe {
-            vDSP_dotpr(
-                lhs.as_ptr(),
-                1,
-                rhs.as_ptr(),
-                1,
-                &mut sum,
-                lhs.len() as u64,
-            );
+            vDSP_dotpr(lhs.as_ptr(), 1, rhs.as_ptr(), 1, &mut sum, lhs.len() as u64);
         }
         sum
     }

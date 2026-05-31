@@ -3,22 +3,22 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use crate::error::{Result, BackendError};
-use crate::tensor::{CpuTensor, TensorShape, RuntimeDType};
+use crate::error::{BackendError, Result};
 use crate::inference::LlamaInferenceSession;
+use crate::tensor::{CpuTensor, RuntimeDType, TensorShape};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct DistributedHeader {
     pub magic: u32,
-    pub is_prefill: u32,  // 0 = decode, 1 = prefill
+    pub is_prefill: u32, // 0 = decode, 1 = prefill
     pub seq_len: u32,
     pub position: u32,
 }
 
 impl DistributedHeader {
     pub const MAGIC: u32 = 0xCA9E111D;
-    
+
     pub fn to_bytes(self) -> [u8; 16] {
         let mut buf = [0u8; 16];
         buf[0..4].copy_from_slice(&self.magic.to_le_bytes());
@@ -27,7 +27,7 @@ impl DistributedHeader {
         buf[12..16].copy_from_slice(&self.position.to_le_bytes());
         buf
     }
-    
+
     pub fn from_bytes(buf: [u8; 16]) -> Self {
         Self {
             magic: u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
@@ -47,7 +47,7 @@ pub fn serialize_tensor<W: Write>(writer: &mut W, tensor: &CpuTensor) -> std::io
     }
     let data_len = tensor.data.len() as u32;
     writer.write_all(&data_len.to_le_bytes())?;
-    
+
     // Write data as raw bytes (Apple Silicon to Apple Silicon is safe)
     let byte_slice = unsafe {
         std::slice::from_raw_parts(
@@ -71,7 +71,7 @@ pub fn deserialize_tensor<R: Read>(reader: &mut R, name: String) -> std::io::Res
     reader.read_exact(&mut buf)?;
     let data_len = u32::from_le_bytes(buf) as usize;
     let mut data = vec![0.0f32; data_len];
-    
+
     // Read data as raw bytes
     let byte_slice = unsafe {
         std::slice::from_raw_parts_mut(
@@ -80,7 +80,7 @@ pub fn deserialize_tensor<R: Read>(reader: &mut R, name: String) -> std::io::Res
         )
     };
     reader.read_exact(byte_slice)?;
-    
+
     Ok(CpuTensor {
         name,
         shape: TensorShape { dims },
@@ -108,7 +108,7 @@ impl DistributedClient {
             stream: Mutex::new(stream),
         })
     }
-    
+
     pub fn forward_to_worker(
         &self,
         hidden: &CpuTensor,
@@ -119,45 +119,40 @@ impl DistributedClient {
         let mut stream = self.stream.lock().map_err(|_| {
             BackendError::RuntimeShapeMismatch("Failed to lock TCP stream mutex".to_string())
         })?;
-        
+
         let header = DistributedHeader {
             magic: DistributedHeader::MAGIC,
             is_prefill: if is_prefill { 1 } else { 0 },
             seq_len: seq_len as u32,
             position: position as u32,
         };
-        
+
         // Send header
-        stream.write_all(&header.to_bytes()).map_err(|source| {
-            BackendError::Io {
+        stream
+            .write_all(&header.to_bytes())
+            .map_err(|source| BackendError::Io {
                 path: PathBuf::from("distributed_tcp_client_write"),
                 source,
-            }
-        })?;
-        
+            })?;
+
         // Send tensor
-        serialize_tensor(&mut *stream, hidden).map_err(|source| {
-            BackendError::Io {
-                path: PathBuf::from("distributed_tcp_client_write_tensor"),
-                source,
-            }
+        serialize_tensor(&mut *stream, hidden).map_err(|source| BackendError::Io {
+            path: PathBuf::from("distributed_tcp_client_write_tensor"),
+            source,
         })?;
-        
-        stream.flush().map_err(|source| {
-            BackendError::Io {
-                path: PathBuf::from("distributed_tcp_client_flush"),
-                source,
-            }
+
+        stream.flush().map_err(|source| BackendError::Io {
+            path: PathBuf::from("distributed_tcp_client_flush"),
+            source,
         })?;
-        
+
         // Read response tensor
-        let response = deserialize_tensor(&mut *stream, "worker_response_tensor".to_string()).map_err(|source| {
-            BackendError::Io {
+        let response = deserialize_tensor(&mut *stream, "worker_response_tensor".to_string())
+            .map_err(|source| BackendError::Io {
                 path: PathBuf::from("distributed_tcp_client_read_response"),
                 source,
-            }
-        })?;
-        
+            })?;
+
         Ok(response)
     }
 }
@@ -168,7 +163,7 @@ pub static DISTRIBUTED_RANGE: OnceLock<(usize, usize)> = OnceLock::new();
 pub fn run_worker_loop(addr: &str, mut session: LlamaInferenceSession) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr)?;
     tracing::info!(addr = %addr, "Distributed Worker TCP server listening");
-    
+
     for stream in listener.incoming() {
         let mut stream = match stream {
             Ok(s) => s,
@@ -177,10 +172,10 @@ pub fn run_worker_loop(addr: &str, mut session: LlamaInferenceSession) -> anyhow
                 continue;
             }
         };
-        
+
         let _ = stream.set_nodelay(true);
         tracing::info!("Worker accepted connection from coordinator");
-        
+
         loop {
             let mut header_buf = [0u8; 16];
             if let Err(e) = stream.read_exact(&mut header_buf) {
@@ -191,23 +186,24 @@ pub fn run_worker_loop(addr: &str, mut session: LlamaInferenceSession) -> anyhow
                 }
                 break;
             }
-            
+
             let header = DistributedHeader::from_bytes(header_buf);
             if header.magic != DistributedHeader::MAGIC {
                 tracing::error!(magic = ?header.magic, "Received invalid magic header");
                 break;
             }
-            
-            let input_tensor = match deserialize_tensor(&mut stream, "coordinator_tensor".to_string()) {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to deserialize input tensor");
-                    break;
-                }
-            };
-            
+
+            let input_tensor =
+                match deserialize_tensor(&mut stream, "coordinator_tensor".to_string()) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to deserialize input tensor");
+                        break;
+                    }
+                };
+
             let is_prefill = header.is_prefill == 1;
-            
+
             let output_tensor = match session.forward_worker_layers(
                 input_tensor,
                 is_prefill,
@@ -220,7 +216,7 @@ pub fn run_worker_loop(addr: &str, mut session: LlamaInferenceSession) -> anyhow
                     break;
                 }
             };
-            
+
             if let Err(e) = serialize_tensor(&mut stream, &output_tensor) {
                 tracing::error!(error = %e, "Failed to serialize response tensor");
                 break;
@@ -260,7 +256,8 @@ pub fn run_network_benchmark_worker(addr: &str) -> anyhow::Result<()> {
             let magic = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
             let test_type = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
             let count = u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
-            let size = u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as usize;
+            let size =
+                u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as usize;
 
             if magic != DistributedHeader::MAGIC {
                 tracing::error!(magic = ?magic, "Received invalid magic benchmark header");
@@ -274,7 +271,11 @@ pub fn run_network_benchmark_worker(addr: &str) -> anyhow::Result<()> {
                 }
                 1 => {
                     // Latency Test
-                    tracing::info!(count = count, size = size, "Starting Latency Test loop as receiver");
+                    tracing::info!(
+                        count = count,
+                        size = size,
+                        "Starting Latency Test loop as receiver"
+                    );
                     let mut buf = vec![0u8; size];
                     for _ in 0..count {
                         stream.read_exact(&mut buf)?;
@@ -286,7 +287,11 @@ pub fn run_network_benchmark_worker(addr: &str) -> anyhow::Result<()> {
                 2 => {
                     // Bandwidth Test
                     let total_bytes = count * 1024 * 1024; // count is in MB
-                    tracing::info!(total_mb = count, chunk_size = size, "Starting Bandwidth Test loop as receiver");
+                    tracing::info!(
+                        total_mb = count,
+                        chunk_size = size,
+                        "Starting Bandwidth Test loop as receiver"
+                    );
                     let mut buf = vec![0u8; size];
                     let mut bytes_received = 0;
                     while bytes_received < total_bytes {
@@ -297,7 +302,10 @@ pub fn run_network_benchmark_worker(addr: &str) -> anyhow::Result<()> {
                     // Send 1-byte ACK
                     stream.write_all(&[1u8])?;
                     stream.flush()?;
-                    tracing::info!(bytes_received = bytes_received, "Bandwidth Test loop completed");
+                    tracing::info!(
+                        bytes_received = bytes_received,
+                        "Bandwidth Test loop completed"
+                    );
                 }
                 _ => {
                     tracing::error!(test_type = test_type, "Received unknown test type");
@@ -330,7 +338,8 @@ pub fn run_network_benchmark_coordinator(
         &1u32.to_le_bytes()[..], // test_type = 1
         &(ping_count as u32).to_le_bytes()[..],
         &(payload_size as u32).to_le_bytes()[..],
-    ].concat();
+    ]
+    .concat();
 
     stream.write_all(&header)?;
     stream.flush()?;
@@ -374,7 +383,8 @@ pub fn run_network_benchmark_coordinator(
         &2u32.to_le_bytes()[..], // test_type = 2
         &(total_mb as u32).to_le_bytes()[..],
         &(chunk_size as u32).to_le_bytes()[..],
-    ].concat();
+    ]
+    .concat();
 
     stream.write_all(&header)?;
     stream.flush()?;
@@ -402,8 +412,14 @@ pub fn run_network_benchmark_coordinator(
     let bandwidth_gbps = (bytes_sent as f64 * 8.0) / (duration_secs * 1_000_000_000.0);
 
     println!("--- Bandwidth Results ---");
-    println!("  Total Transferred: {:.2} MB in {:.4} seconds", mb_sent, duration_secs);
-    println!("  Throughput: {:.2} MB/s ({:.2} Gbps)", bandwidth_mb_s, bandwidth_gbps);
+    println!(
+        "  Total Transferred: {:.2} MB in {:.4} seconds",
+        mb_sent, duration_secs
+    );
+    println!(
+        "  Throughput: {:.2} MB/s ({:.2} Gbps)",
+        bandwidth_mb_s, bandwidth_gbps
+    );
 
     // --- Terminate Session ---
     let header = [
@@ -411,7 +427,8 @@ pub fn run_network_benchmark_coordinator(
         &0u32.to_le_bytes()[..], // test_type = 0 (Terminate)
         &0u32.to_le_bytes()[..],
         &0u32.to_le_bytes()[..],
-    ].concat();
+    ]
+    .concat();
     let _ = stream.write_all(&header);
     let _ = stream.flush();
 

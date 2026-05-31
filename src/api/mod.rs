@@ -787,7 +787,10 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     let loaded_now = !loaded_models.is_empty();
     let generation_ready = model.is_some_and(|m| loaded_model_generation_ready(m));
     let execution_plans = state.execution_plans.read().await;
-    let execution_plan = active_id_lock.as_ref().and_then(|id| execution_plans.get(id)).cloned();
+    let execution_plan = active_id_lock
+        .as_ref()
+        .and_then(|id| execution_plans.get(id))
+        .cloned();
     Json(HealthResponse {
         ok: true,
         engine: "camelid",
@@ -811,14 +814,20 @@ fn loaded_model_generation_ready(model: &LoadedModel) -> bool {
 async fn capabilities(State(state): State<AppState>) -> Json<CapabilitiesResponse> {
     let active_id_lock = state.active_model_id.read().await;
     let execution_plans = state.execution_plans.read().await;
-    let execution_plan = active_id_lock.as_ref().and_then(|id| execution_plans.get(id)).cloned();
+    let execution_plan = active_id_lock
+        .as_ref()
+        .and_then(|id| execution_plans.get(id))
+        .cloned();
     Json(capabilities_response_with_plan(execution_plan))
 }
 
 async fn execution_plan(State(state): State<AppState>) -> Json<Option<ExecutionPlan>> {
     let active_id_lock = state.active_model_id.read().await;
     let execution_plans = state.execution_plans.read().await;
-    let execution_plan = active_id_lock.as_ref().and_then(|id| execution_plans.get(id)).cloned();
+    let execution_plan = active_id_lock
+        .as_ref()
+        .and_then(|id| execution_plans.get(id))
+        .cloned();
     Json(execution_plan)
 }
 
@@ -1415,12 +1424,24 @@ async fn load_model_from_path(
         tokenizer,
         tokenizer_runtime,
     };
-    
-    state.loaded_models.write().await.insert(id.clone(), loaded.clone());
-    state.execution_plans.write().await.insert(id.clone(), outcome.plan);
-    state.model_last_used.write().await.insert(id.clone(), std::time::Instant::now());
+
+    state
+        .loaded_models
+        .write()
+        .await
+        .insert(id.clone(), loaded.clone());
+    state
+        .execution_plans
+        .write()
+        .await
+        .insert(id.clone(), outcome.plan);
+    state
+        .model_last_used
+        .write()
+        .await
+        .insert(id.clone(), std::time::Instant::now());
     *state.active_model_id.write().await = Some(id.clone());
-    
+
     clear_prompt_prefix_cache(state);
     Ok(loaded)
 }
@@ -1451,7 +1472,10 @@ pub struct UnloadModelRequest {
     pub id: Option<String>,
 }
 
-async fn unload_model(State(state): State<AppState>, payload: Option<Json<UnloadModelRequest>>) -> Response {
+async fn unload_model(
+    State(state): State<AppState>,
+    payload: Option<Json<UnloadModelRequest>>,
+) -> Response {
     let model_id = if let Some(Json(req)) = payload {
         req.id
     } else {
@@ -1469,7 +1493,7 @@ async fn unload_model(State(state): State<AppState>, payload: Option<Json<Unload
         state.execution_plans.write().await.remove(&id);
         state.cached_weights.write().await.remove(&id);
         state.model_last_used.write().await.remove(&id);
-        
+
         let mut active = state.active_model_id.write().await;
         if active.as_ref() == Some(&id) {
             *active = state.loaded_models.read().await.keys().next().cloned();
@@ -1481,7 +1505,7 @@ async fn unload_model(State(state): State<AppState>, payload: Option<Json<Unload
         state.model_last_used.write().await.clear();
         *state.active_model_id.write().await = None;
     }
-    
+
     clear_prompt_prefix_cache(&state);
     StatusCode::NO_CONTENT.into_response()
 }
@@ -1543,9 +1567,12 @@ async fn model_tokenizer(State(state): State<AppState>) -> Response {
     )
 }
 
-async fn get_or_load_model(state: &AppState, model_id: Option<&str>) -> Result<LoadedModel, Response> {
+async fn get_or_load_model(
+    state: &AppState,
+    model_id: Option<&str>,
+) -> Result<LoadedModel, Response> {
     let loaded_models = state.loaded_models.read().await;
-    
+
     let target_id = if let Some(id) = model_id {
         id.to_string()
     } else {
@@ -1564,14 +1591,28 @@ async fn get_or_load_model(state: &AppState, model_id: Option<&str>) -> Result<L
     };
 
     if let Some(loaded) = loaded_models.get(&target_id) {
-        state.model_last_used.write().await.insert(target_id.clone(), std::time::Instant::now());
+        state
+            .model_last_used
+            .write()
+            .await
+            .insert(target_id.clone(), std::time::Instant::now());
         *state.active_model_id.write().await = Some(target_id.clone());
         return Ok(loaded.clone());
     }
 
     for (id, loaded) in loaded_models.iter() {
-        if id == &target_id || loaded.id == target_id || loaded.path.file_name().is_some_and(|f| f.to_string_lossy() == target_id) {
-            state.model_last_used.write().await.insert(id.clone(), std::time::Instant::now());
+        if id == &target_id
+            || loaded.id == target_id
+            || loaded
+                .path
+                .file_name()
+                .is_some_and(|f| f.to_string_lossy() == target_id)
+        {
+            state
+                .model_last_used
+                .write()
+                .await
+                .insert(id.clone(), std::time::Instant::now());
             *state.active_model_id.write().await = Some(id.clone());
             return Ok(loaded.clone());
         }
@@ -1584,12 +1625,14 @@ async fn get_or_load_model(state: &AppState, model_id: Option<&str>) -> Result<L
             drop(loaded_models);
             match load_model_from_path(state, path, Some(target_id.clone())).await {
                 Ok(loaded) => return Ok(loaded),
-                Err(err) => return Err(api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "model_load_failed",
-                    format!("Failed to load model {target_id} on-demand: {err}"),
-                    None,
-                )),
+                Err(err) => {
+                    return Err(api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "model_load_failed",
+                        format!("Failed to load model {target_id} on-demand: {err}"),
+                        None,
+                    ))
+                }
             }
         }
     }
@@ -1651,11 +1694,19 @@ fn resolve_model_path(model_id: &str) -> Option<PathBuf> {
     None
 }
 
-async fn load_weights_lru(state: &AppState, model: &LoadedModel, binding: &LlamaTensorBinding) -> Result<Arc<LlamaLoadedWeights>, Response> {
+async fn load_weights_lru(
+    state: &AppState,
+    model: &LoadedModel,
+    binding: &LlamaTensorBinding,
+) -> Result<Arc<LlamaLoadedWeights>, Response> {
     {
         let cached = state.cached_weights.read().await;
         if let Some(weights) = cached.get(&model.id) {
-            state.model_last_used.write().await.insert(model.id.clone(), std::time::Instant::now());
+            state
+                .model_last_used
+                .write()
+                .await
+                .insert(model.id.clone(), std::time::Instant::now());
             return Ok(weights.clone());
         }
     }
@@ -1674,7 +1725,7 @@ async fn load_weights_lru(state: &AppState, model: &LoadedModel, binding: &Llama
     loop {
         let loaded = state.loaded_models.read().await;
         let cached = state.cached_weights.read().await;
-        
+
         let mut current_sum = 0u64;
         for (id, _) in cached.iter() {
             if id != &model.id {
@@ -1698,7 +1749,10 @@ async fn load_weights_lru(state: &AppState, model: &LoadedModel, binding: &Llama
 
         for (id, _) in cached.iter() {
             if id != &model.id {
-                let time = last_used.get(id).cloned().unwrap_or_else(std::time::Instant::now);
+                let time = last_used
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(std::time::Instant::now);
                 if time < oldest_time {
                     oldest_time = time;
                     lru_id = Some(id.clone());
@@ -1720,23 +1774,38 @@ async fn load_weights_lru(state: &AppState, model: &LoadedModel, binding: &Llama
     }
 
     let store = TensorStore::open(&model.path, &model.gguf);
-    let range = if let Some(&(layer_start, layer_end)) = crate::distributed::DISTRIBUTED_RANGE.get() {
-        tracing::info!("API loader running in distributed coordinator mode; loading layers {}..{}", layer_start, layer_end);
+    let range = if let Some(&(layer_start, layer_end)) = crate::distributed::DISTRIBUTED_RANGE.get()
+    {
+        tracing::info!(
+            "API loader running in distributed coordinator mode; loading layers {}..{}",
+            layer_start,
+            layer_end
+        );
         Some(layer_start..layer_end)
     } else {
         None
     };
-    let weights = Arc::new(LlamaLoadedWeights::load(&store, binding, range).map_err(|err| {
-        api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "loaded_cpu_weights_unavailable",
-            err.to_string(),
-            Some("model"),
-        )
-    })?);
+    let weights = Arc::new(
+        LlamaLoadedWeights::load(&store, binding, range).map_err(|err| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "loaded_cpu_weights_unavailable",
+                err.to_string(),
+                Some("model"),
+            )
+        })?,
+    );
 
-    state.cached_weights.write().await.insert(model.id.clone(), weights.clone());
-    state.model_last_used.write().await.insert(model.id.clone(), std::time::Instant::now());
+    state
+        .cached_weights
+        .write()
+        .await
+        .insert(model.id.clone(), weights.clone());
+    state
+        .model_last_used
+        .write()
+        .await
+        .insert(model.id.clone(), std::time::Instant::now());
 
     Ok(weights)
 }
@@ -4453,14 +4522,17 @@ fn render_role_colon_prompt(messages: &[ChatMessage]) -> String {
 async fn loaded_tokenizer(state: &AppState) -> std::result::Result<Tokenizer, Response> {
     let active_id = state.active_model_id.read().await;
     let loaded_models = state.loaded_models.read().await;
-    let model = active_id.as_ref().and_then(|id| loaded_models.get(id)).ok_or_else(|| {
-        api_error(
-            StatusCode::NOT_FOUND,
-            "model_not_loaded",
-            BackendError::ModelNotLoaded.to_string(),
-            None,
-        )
-    })?;
+    let model = active_id
+        .as_ref()
+        .and_then(|id| loaded_models.get(id))
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                "model_not_loaded",
+                BackendError::ModelNotLoaded.to_string(),
+                None,
+            )
+        })?;
     Tokenizer::from_gguf(&model.gguf).map_err(|err| {
         api_error(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -5052,11 +5124,11 @@ mod tests {
             .expect("Mistral exact-row bring-up lane should stay advertised");
         assert_eq!(mistral.status, "supported_exact_row_smoke");
         assert_eq!(mistral.support_scope, "exact_row_smoke_only");
-        assert_eq!(mistral.full_support_status, "blocked_pending_normalized_full_support");
         assert_eq!(
-            mistral.frontend_load_path_verified,
-            "validated"
+            mistral.full_support_status,
+            "blocked_pending_normalized_full_support"
         );
+        assert_eq!(mistral.frontend_load_path_verified, "validated");
         assert_eq!(
             mistral.performance_measured,
             "bounded_unique_chat_perf_rss_validated"
@@ -5065,16 +5137,12 @@ mod tests {
             mistral.latest_checked_bucket,
             "current_head_api_webui_rss_fail_closed"
         );
-        assert_eq!(
-            mistral.latest_checked_result,
-            "pass"
-        );
+        assert_eq!(mistral.latest_checked_result, "pass");
         assert_eq!(mistral.latest_checked_output, "CMLD-M7B");
-        assert!(mistral.frontend_readiness_gate.contains("green only when this exact GGUF row"));
-        assert_eq!(
-            mistral.bounded_context_8192_pack,
-            "validated_fifth_pack"
-        );
+        assert!(mistral
+            .frontend_readiness_gate
+            .contains("green only when this exact GGUF row"));
+        assert_eq!(mistral.bounded_context_8192_pack, "validated_fifth_pack");
         assert_eq!(
             mistral.bounded_context_8192_pack_id,
             "mistral-context-8192-max-ladder-v1"
@@ -5111,7 +5179,11 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(
             supported_family_ids,
-            BTreeSet::from(["llama_bpe_decoder_exact_1b_3b_8b_q8_0", "llama_spm_decoder", "mistral",])
+            BTreeSet::from([
+                "llama_bpe_decoder_exact_1b_3b_8b_q8_0",
+                "llama_spm_decoder",
+                "mistral",
+            ])
         );
 
         for id in [
@@ -6912,11 +6984,14 @@ pub struct CatalogQuery {
     pub query: Option<String>,
 }
 
-async fn get_catalog(axum::extract::Query(q): axum::extract::Query<CatalogQuery>) -> Json<CatalogResponse> {
+async fn get_catalog(
+    axum::extract::Query(q): axum::extract::Query<CatalogQuery>,
+) -> Json<CatalogResponse> {
     let items = curated_catalog();
     let filtered = if let Some(query_str) = q.query {
         let qs = query_str.to_lowercase();
-        items.into_iter()
+        items
+            .into_iter()
             .filter(|item| {
                 item.name.to_lowercase().contains(&qs)
                     || item.repo_id.to_lowercase().contains(&qs)
@@ -6966,17 +7041,13 @@ async fn install_catalog_model(Json(req): Json<InstallCatalogRequest>) -> Respon
 
     std::fs::create_dir_all("models").ok();
     let dest_path = format!("models/{}", req.filename);
-    let url = format!("https://huggingface.co/{}/resolve/main/{}", req.repo_id, req.filename);
+    let url = format!(
+        "https://huggingface.co/{}/resolve/main/{}",
+        req.repo_id, req.filename
+    );
 
     match std::process::Command::new("curl")
-        .args(&[
-            "-L",
-            "-C",
-            "-",
-            "-o",
-            &dest_path,
-            &url,
-        ])
+        .args(&["-L", "-C", "-", "-o", &dest_path, &url])
         .spawn()
     {
         Ok(child) => {
@@ -7065,4 +7136,3 @@ async fn cancel_catalog_download(Json(req): Json<CancelDownloadRequest>) -> Resp
         (StatusCode::NOT_FOUND, "Download not found").into_response()
     }
 }
-
