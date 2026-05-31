@@ -1,0 +1,66 @@
+{
+  "schema": "camelid.v0_1.machine.v1",
+  "generated_utc": "2026-05-31T18:42:23.188Z",
+  "hostname": "Tims-Mac-mini.local",
+  "platform": "darwin",
+  "release": "25.5.0",
+  "arch": "arm64",
+  "type": "Darwin",
+  "cpus": [
+    {
+      "model": "Apple M4",
+      "speed_mhz": 2400
+    },
+    {
+      "model": "Apple M4",
+      "speed_mhz": 2400
+    },
+    {
+      "model": "Apple M4",
+      "speed_mhz": 2400
+    },
+    {
+      "model": "Apple M4",
+      "speed_mhz": 2400
+    },
+    {
+      "model": "Apple M4",
+      "speed_mhz": 2400
+    },
+    {
+      "model": "Apple M4",
+      "speed_mhz": 2400
+    },
+    {
+      "model": "Apple M4",
+      "speed_mhz": 2400
+    },
+    {
+      "model": "Apple M4",
+      "speed_mhz": 2400
+    },
+    {
+      "model": "Apple M4",
+      "speed_mhz": 2400
+    },
+    {
+      "model": "Apple M4",
+      "speed_mhz": 2400
+    }
+  ],
+  "cpu_count": 10,
+  "memory": {
+    "total_bytes": 17179869184,
+    "free_bytes": 5133484032,
+    "process_rss_bytes": 41353216
+  },
+  "node": {
+    "version": "v22.22.2",
+    "exec_path": "/opt/homebrew/Cellar/node@22/22.22.2_2/bin/node"
+  },
+  "git": {
+    "branch": "release/v0.1-evidence",
+    "commit": "8026339531463ade269d7be7078da331ba3e4085",
+    "status_short": ""
+  }
+}

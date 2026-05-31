@@ -1,0 +1,23 @@
+{
+  "schema": "camelid.v0_1.model_manifest.v1",
+  "generated_utc": "2026-05-31T18:42:31.916Z",
+  "hash_models": true,
+  "models": [
+    {
+      "id": "llama32-3b-instruct-q8-local",
+      "label": "Llama 3.2 3B Instruct Q8_0 local GGUF",
+      "family": "Llama",
+      "parameters": "3B",
+      "quantization": "Q8_0",
+      "artifact_uri": "$CAMELID_MODEL_DIR/llama-3.2-3b-instruct/Llama-3.2-3B-Instruct-Q8_0.gguf",
+      "artifact_sha256": "b5607b5090a8280063fff2d706bb3408ca6542341b06aab39c3eca0a28575921",
+      "artifact_file": {
+        "path": "$CAMELID_MODEL_DIR/llama-3.2-3b-instruct/Llama-3.2-3B-Instruct-Q8_0.gguf",
+        "exists": true,
+        "size_bytes": 3421899296,
+        "mtime_utc": "2026-04-29T14:44:25.860Z",
+        "sha256": "b5607b5090a8280063fff2d706bb3408ca6542341b06aab39c3eca0a28575921"
+      }
+    }
+  ]
+}

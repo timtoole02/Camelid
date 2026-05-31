@@ -1,0 +1,48 @@
+{
+  "entry_id": "llamacpp-cpu-samehost-llama32-3b",
+  "run_index": 1,
+  "command": {
+    "display": "node scripts/bench-llama3-same-host.mjs --backend http://canonical-private-ubuntu-validation-host:19781 --llama-url http://canonical-private-ubuntu-validation-host:19783 --model '$CAMELID_MODEL_DIR/llama-3.2-3b-instruct/Llama-3.2-3B-Instruct-Q8_0.gguf' --model-id llama32-3b-q8-v01-rc1-20260531T184150Z --row-id llama32_3b_instruct_q8_0 --backend-bin '$CAMELID_RELEASE_BUILD_ROOT/cargo-target/release/camelid' --llama-server '$CAMELID_RELEASE_BUILD_ROOT/llama.cpp-v0.1-rc1/build/bin/llama-server' --max-tokens 16 --warmup 1 --repeats 3 --threads 8 --llama-context 512 --unique-prompt --require-marker --expected-marker CMLD-BENCH --out qa/evidence-bundles/v0.1/20260531T184150Z-real-local-raw/same-host-llama32-3b-q8.json",
+    "file": "node",
+    "args": [
+      "scripts/bench-llama3-same-host.mjs",
+      "--backend",
+      "http://canonical-private-ubuntu-validation-host:19781",
+      "--llama-url",
+      "http://canonical-private-ubuntu-validation-host:19783",
+      "--model",
+      "$CAMELID_MODEL_DIR/llama-3.2-3b-instruct/Llama-3.2-3B-Instruct-Q8_0.gguf",
+      "--model-id",
+      "llama32-3b-q8-v01-rc1-20260531T184150Z",
+      "--row-id",
+      "llama32_3b_instruct_q8_0",
+      "--backend-bin",
+      "$CAMELID_RELEASE_BUILD_ROOT/cargo-target/release/camelid",
+      "--llama-server",
+      "$CAMELID_RELEASE_BUILD_ROOT/llama.cpp-v0.1-rc1/build/bin/llama-server",
+      "--max-tokens",
+      "16",
+      "--warmup",
+      "1",
+      "--repeats",
+      "3",
+      "--threads",
+      "8",
+      "--llama-context",
+      "512",
+      "--unique-prompt",
+      "--require-marker",
+      "--expected-marker",
+      "CMLD-BENCH",
+      "--out",
+      "qa/evidence-bundles/v0.1/20260531T184150Z-real-local-raw/same-host-llama32-3b-q8.json"
+    ],
+    "shell": false,
+    "cwd": "$CAMELID_WORKTREE",
+    "env": {
+      "CAMELID_STREAM_TIMING_DIAGNOSTICS": "on"
+    },
+    "timeout_ms": 1200000
+  },
+  "started_utc": "2026-05-31T18:42:31.918Z"
+}

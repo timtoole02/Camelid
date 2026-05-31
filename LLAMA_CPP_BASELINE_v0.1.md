@@ -1,10 +1,30 @@
 # llama.cpp Baseline for Camelid v0.1
 
-Status: pending for `v0.1.0-rc1`.
+Status: CPU-only v0.1 baseline captured for one exact row; Metal mode deferred.
 
-This file defines the reproducible llama.cpp comparator baseline required by the v0.1 evidence release. It separates CPU-only and Metal modes because the release directive requires backend-mode separation. Historical same-host llama.cpp evidence exists, but it was not captured at the the current release branch SHA, so it is prior context only.
+This file defines the reproducible llama.cpp comparator baseline required by the v0.1 evidence release. It separates CPU-only and Metal modes because the release directive requires backend-mode separation. Historical same-host llama.cpp evidence exists, but it was not captured at the current release branch SHA, so it is prior context only.
 
 ## Current Evidence
+
+v0.1 CPU-only release artifact:
+
+- Bundle: `qa/evidence-bundles/v0.1/20260531T184150Z-real-local/`
+- Camelid source SHA in bundle: `8026339531463ade269d7be7078da331ba3e4085`
+- Release worktree status at run time: clean `release/v0.1-evidence`
+- llama.cpp source commit: `399739d5c5978351f39e3454bfbfbab4f369088f`
+- llama.cpp version output: `version: 1 (399739d)`, built with AppleClang `17.0.0.17000404`
+- Mode: CPU-only llama.cpp server (`-ngl 0`); the binary had Metal support available, but this row is not Metal evidence
+- Host class: macOS Darwin `25.5.0`, Apple M4, arm64, 10 logical CPUs, 16 GiB RAM
+- Row: `llama32_3b_instruct_q8_0`
+- Model: `Llama-3.2-3B-Instruct-Q8_0.gguf`
+- Model SHA256: `b5607b5090a8280063fff2d706bb3408ca6542341b06aab39c3eca0a28575921`
+- Prompt contract: marker prompt requiring `CMLD-BENCH`
+- Context: 512
+- Max generated tokens: 16
+- Threads: 8
+- Warmup/repeats: 1 warmup, 3 measured repeats
+- Guardrails: passed for both Camelid and llama.cpp measured runs
+- Result boundary: Camelid lost this bounded row on TTFT and total elapsed; do not use streamed chunk estimates as tokenizer-ground-truth throughput
 
 Historical retained artifact:
 
@@ -26,7 +46,7 @@ Historical retained artifact:
 
 Release boundary: this historical artifact is not the v0.1 baseline because the release SHA is different and the run predates the v0.1 evidence worktree.
 
-## v0.1 Required Runs
+## v0.1 Reproduction Commands
 
 ### CPU-only
 
@@ -51,7 +71,7 @@ node scripts/bench-llama3-same-host.mjs \
   --out "qa/evidence-bundles/v0.1/$(date -u +%Y%m%dT%H%M%SZ)/llamacpp-cpu-only.json"
 ```
 
-The harness starts llama.cpp with `-ngl 0`, so this is the CPU-only comparator.
+The harness starts llama.cpp with `-ngl 0`, so this is the CPU-only comparator. The committed v0.1 bundle above was captured with an external Cargo target directory and an external llama.cpp build directory because the local release worktree filesystem had only about 246 MiB free after an attempted checkout; the source worktree itself remained clean.
 
 ### Metal
 
@@ -87,34 +107,27 @@ node scripts/bench-llama3-same-host.mjs \
 
 The Metal run must record the llama.cpp build flags proving Metal support is enabled. If `llama-server` reports no Metal backend, mark the Metal baseline deferred rather than treating CPU fallback as Metal evidence.
 
-## Required Evidence Field Ledger
+## Evidence Field Ledger
 
-Each v0.1 llama.cpp baseline must record:
+The v0.1 CPU-only bundle records:
 
-- Camelid commit SHA: pending for current release run; expected release branch HEAD
-- Comparator commit or version: pending; record llama.cpp commit and `llama-server --version` output
-- Model name: pending; expected exact row `Llama 3.2 3B Instruct Q8_0`
-- Model path: pending; use a sanitized placeholder such as `$CAMELID_MODEL_DIR/Llama-3.2-3B-Instruct-Q8_0.gguf`
-- Model SHA256 hash: pending; expected `shasum -a 256 "$CAMELID_MODEL_DIR/Llama-3.2-3B-Instruct-Q8_0.gguf"`
-- Quantization: pending; expected `GGUF Q8_0`
-- Prompt: pending; record the exact benchmark messages and rendered prompt mode
-- Context size: pending; expected 512 unless release captain changes the row
-- Max generated tokens: pending; expected 16 for the release baseline
-- Thread count: pending; expected 8 unless release captain changes it
-- Batch settings: pending; record llama.cpp context/batch flags and Camelid defaults
-- Runtime flags: pending; CPU-only must include `-ngl 0`; Metal must include the exact `-ngl` and Metal build flag evidence
-- Environment variables: pending; record `CAMELID_BIN`, `LLAMA3_LLAMA_SERVER`, `CAMELID_MODEL_DIR`, and any Camelid runtime flags
-- Hardware details: pending; record `uname -a`, CPU model, logical CPU count, memory, and GPU/Metal device for Metal mode
-- OS version: pending; record `sw_vers` on macOS or `/etc/os-release` on Linux
-- Raw command: pending; preserve the exact shell command
-- Raw output: pending; preserve stdout/stderr or JSON artifact paths
-- Timing data: pending; use harness TTFT, total elapsed, and streamed decode estimates
-- Memory data: pending; record process RSS snapshots if available
-- Pass/fail status: pending; require marker guard pass and no unexpected server fallback
+- Camelid commit SHA: `8026339531463ade269d7be7078da331ba3e4085`
+- Comparator commit or version: `399739d5c5978351f39e3454bfbfbab4f369088f` and `llama-server --version`
+- Model name/path/hash: exact 3B Q8_0 row with sanitized `$CAMELID_MODEL_DIR` path and SHA256 above
+- Quantization: GGUF Q8_0
+- Prompt: exact marker prompt and compact chat rendering in `same-host-llama32-3b-q8.json`
+- Context size: 512
+- Max generated tokens: 16
+- Thread count: 8
+- Batch settings/runtime flags: raw command and `-ngl 0` are in `commands.md` and `raw_logs/`
+- Environment variables: `CAMELID_STREAM_TIMING_DIAGNOSTICS=on` is recorded in the command metadata
+- Hardware/OS details: `machine.json`
+- Raw command/output: `commands.md`, `raw_logs/`, and `results.json`
+- Timing/memory data: `results.json` and `same-host-llama32-3b-q8.json`
+- Pass/fail status: `entries_ok: 1`, marker guardrails passed
 
-## Blockers
+## Remaining Gaps
 
-- No `target/reference/llama.cpp/build/bin/llama-server` exists in this release worktree.
-- No GGUF model files are present inside this release worktree.
-- Existing retained same-host artifact is from source head `84a4a83bf881550f29dcea8349c2284439dfd900`, not the v0.1 release SHA.
-- Metal comparison needs a Metal-enabled llama.cpp build and an explicit manually-started server because the default harness path starts llama.cpp in CPU-only mode.
+- Metal comparison remains deferred; the captured v0.1 row is CPU-only even though the binary reported Metal support.
+- Only the Llama 3.2 3B Instruct Q8_0 row was captured for v0.1. This is not a full comparator table for every public support row.
+- GGUF model files and comparator build artifacts are not vendored in the release worktree; the committed bundle uses sanitized placeholders for local paths.

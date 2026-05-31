@@ -30,7 +30,7 @@ Camelid v0.1 is a release candidate for reviewers who care about reproducible lo
 - explicit unsupported states for partial or blocked rows
 - small local gates that contributors can run before changing support-sensitive code
 
-The benchmark story is similarly bounded. Camelid publishes memory and timing snapshots that are already committed in evidence bundles. It does not yet publish a complete apples-to-apples throughput table against llama.cpp for every headline row.
+The benchmark story is similarly bounded. Camelid publishes memory and timing snapshots that are already committed in evidence bundles. The v0.1 release lane includes one same-host llama.cpp CPU comparator row for Llama 3.2 3B Instruct Q8_0, where Camelid is slower on the bounded TTFT/total-elapsed measurements; it does not publish a complete apples-to-apples throughput table against llama.cpp for every headline row.
 
 ## Quickstart
 

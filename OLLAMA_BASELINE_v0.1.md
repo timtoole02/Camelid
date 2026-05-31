@@ -1,6 +1,6 @@
 # Ollama Baseline for Camelid v0.1
 
-Status: deferred pending release-captain acceptance of the exact Ollama row.
+Status: deferred for `v0.1.0-rc1` by release-captain rationale.
 
 Ollama is a practical user-experience comparator, not a CPU-only, Metal, MLX, or quant-equivalent runtime comparator. It should answer: how does a local user-facing runtime behave on the same host for a comparable prompt budget?
 
@@ -15,6 +15,8 @@ Observed in this environment on 2026-05-31:
 - Host: macOS 26.5, Apple M4, arm64, 10 logical CPUs, 16 GiB RAM
 
 This is not enough for a v0.1 release baseline because the installed Ollama row is not one of Camelid's exact GGUF Q8_0 release rows, and the release evidence contract requires model path/hash, raw command/output, timing, memory, and pass/fail status.
+
+Release-captain deferral: v0.1 may cite no Ollama win, parity, or replacement claim. The installed `llama3.1:8b` row can be used later as a user-experience comparator only after a run records the selected tag/blob, prompt budget, raw output, timing, memory, and pass/fail status. This deferral is acceptable for `v0.1.0-rc1` only because the public docs do not claim Ollama equivalence.
 
 ## Required Baseline Shape
 
@@ -102,7 +104,7 @@ shasum -a 256 "$OLLAMA_MODEL_BLOB"
 
 ## Blockers
 
-- No release-captain-approved Ollama row is named.
+- No release-captain-approved Ollama row is named for a committed v0.1 run.
 - The installed `llama3.1:8b` row is not quant-equivalent to Camelid's GGUF Q8_0 rows.
 - No v0.1 Ollama artifact exists under `qa/evidence-bundles/v0.1/`.
 - This comparison should stay in the user-experience lane and must not be used as CPU-only, Metal, MLX, or parity evidence.

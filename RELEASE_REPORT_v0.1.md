@@ -6,7 +6,7 @@ Branch: `release/v0.1-evidence`
 
 Tag candidate: `v0.1.0-rc1`
 
-Release status: not ready to tag. The release branch now has v0.1 docs, a benchmark harness, comparator baseline plans, a dry-run evidence bundle, and passing lightweight gates. Real comparator evidence is still missing.
+Release status: not tagged. The release branch now has v0.1 docs, a benchmark harness, a clean-head same-host llama.cpp CPU evidence bundle for one exact row, and release-captain deferrals for Ollama and MLX. No final `v0.1.0` tag may be created without Tim approval.
 
 Supported model rows:
 
@@ -17,11 +17,11 @@ Supported model rows:
 
 Correctness summary: `SUPPORT_MATRIX_v0.1.md` and `CORRECTNESS_v0.1.md` define the v0.1 boundary. Mistral is downgraded to evidence-only bring-up because the current API/WebUI support-surface evidence is fail-closed. Mixtral remains unsupported beyond bounded one-token backend MoE runtime evidence.
 
-Benchmark summary: `tools/bench/v0.1-benchmark-harness.mjs` can emit the required bundle layout and passed its synthetic self-test. `qa/evidence-bundles/v0.1/dryrun-release-captain/` proves output shape only; it is not runtime benchmark evidence. No real v0.1 comparator bundle has been created yet.
+Benchmark summary: `tools/bench/v0.1-benchmark-harness.mjs` emitted a real local v0.1 bundle at `qa/evidence-bundles/v0.1/20260531T184150Z-real-local/`. The bundle records clean source SHA `8026339531463ade269d7be7078da331ba3e4085`, model SHA `b5607b5090a8280063fff2d706bb3408ca6542341b06aab39c3eca0a28575921`, llama.cpp commit `399739d5c5978351f39e3454bfbfbab4f369088f`, and passing `CMLD-BENCH` marker guardrails for Camelid and llama.cpp. `qa/evidence-bundles/v0.1/dryrun-release-captain/` remains dry-run shape evidence only.
 
-Where Camelid wins: not claimed for v0.1 yet. Real comparator benchmark evidence is still missing.
+Where Camelid wins: no speed win is claimed for v0.1.
 
-Where Camelid loses: historical docs already record known losses against llama.cpp/MLX in scoped settings, but this release branch has not generated fresh v0.1 comparator results.
+Where Camelid loses: the v0.1 same-host llama.cpp CPU row shows Camelid slower on bounded TTFT and total elapsed for Llama 3.2 3B Instruct Q8_0. Historical docs also record scoped MLX speed losses; those remain prior context only.
 
 Known limitations:
 
@@ -29,9 +29,9 @@ Known limitations:
 - Mistral support is not promoted in v0.1.
 - Mixtral later-generation parity and continuation remain blocked.
 - Production throughput, portability, arbitrary templates, and distributed inference are not v0.1 support claims.
-- Real llama.cpp/Ollama/MLX comparator baselines are not complete.
+- Full comparator coverage is not complete: llama.cpp has one CPU-only exact-row baseline, Metal is deferred, Ollama is deferred because no approved exact row is installed, and MLX is deferred because `mlx_lm` is not installed.
 
-Evidence bundle path: `qa/evidence-bundles/v0.1/dryrun-release-captain/` exists as dry-run harness evidence only.
+Evidence bundle path: `qa/evidence-bundles/v0.1/20260531T184150Z-real-local/`.
 
 Docs changed:
 
@@ -51,22 +51,23 @@ Docs changed:
 
 Tests run: see `RELEASE_GATE_v0.1.md`. Local lightweight gates pass, including `cargo fmt --all -- --check`, clippy, cargo check, full Rust tests, release build, frontend build/model-state smoke, harness self-test, public evidence-claim check, and public scrub guard.
 
-Remaining blockers:
+Remaining blockers and risks:
 
-- Real v0.1 comparator benchmark evidence has not been generated.
-- Comparator baselines have not been finalized or explicitly release-captain-deferred.
+- `v0.1.0-rc1` was not created in this automation slice.
+- llama.cpp Metal, Ollama, and MLX fresh baselines are deferred; public docs must keep those non-claims explicit.
+- The clean-head evidence bundle source SHA predates later documentation/evidence-publication commits; no runtime code changes were made after the run.
 
-Recommendation: do not tag `v0.1.0-rc1` until the release gate checklist in `RELEASE_STATUS.md` is complete.
+Recommendation: do not create final `v0.1.0` without Tim approval. Create `v0.1.0-rc1` only after Tim or the release captain accepts the documented comparator deferrals and the final pushed branch state is checked.
 
 ## Release Captain Signoff
 
-- [ ] Evidence bundle exists and is tied to the release branch SHA.
+- [x] Evidence bundle exists and records clean source SHA.
 - [ ] Support matrix is exact-row only.
 - [ ] Correctness claims cite evidence paths.
 - [ ] Benchmark methodology is reproducible from a clean checkout.
-- [ ] llama.cpp, Ollama, and MLX are each either benchmarked or explicitly deferred with reasons.
-- [ ] CPU-only, Metal, MLX, and distributed evidence are separated and labeled.
+- [x] llama.cpp, Ollama, and MLX are each either benchmarked or explicitly deferred with reasons.
+- [x] CPU-only, Metal, MLX, and distributed evidence are separated and labeled.
 - [ ] README contains no unsupported performance or model-family claims.
 - [ ] Release notes explain wins, losses, and unsupported areas.
-- [ ] QA gate records pass/fail for all required commands.
+- [x] QA gate records pass/fail for all required commands after this publication update.
 - [ ] Primary dirty checkout remains preserved or is explicitly reconciled later.

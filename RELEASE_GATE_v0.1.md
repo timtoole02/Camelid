@@ -4,15 +4,15 @@ Date: 2026-05-31
 
 Branch: `release/v0.1-evidence`
 
-Release candidate SHA: release branch HEAD after this gate-refresh commit
+Release candidate SHA: release branch HEAD after this evidence-publication update
 
 Tag status: no tag created.
 
 ## Gate Summary
 
-Current status: gate-refresh blockers cleared locally; not ready to tag because real comparator evidence is still missing.
+Current status: evidence-publication validation passed locally; no tag was created.
 
-The runtime/API/frontend contract now treats Mistral as evidence-only and fail-closed for v0.1. Lightweight code gates pass locally on this branch. This file records the commands that ran, their results, and the remaining release blockers.
+The runtime/API/frontend contract treats Mistral as evidence-only and fail-closed for v0.1. A real llama.cpp CPU same-host comparator row now exists for Llama 3.2 3B Instruct Q8_0. Ollama, MLX, and llama.cpp Metal are explicitly deferred and must remain non-claims.
 
 ## Required Lightweight Gates
 
@@ -32,32 +32,35 @@ cd frontend && npm ci && npm run build && npm run smoke:model-state
 | Gate | Command | Status | Notes |
 | --- | --- | --- | --- |
 | Branch/SHA | `git status --short --branch && git rev-parse HEAD` | PASS | Confirmed `release/v0.1-evidence`; final SHA will be recorded after this gate-refresh commit. |
-| Rust format | `cargo fmt --all -- --check` | PASS | Source tree is formatted after applying the Mistral contract and clippy fixes. |
-| Rust clippy | `CARGO_TERM_COLOR=never cargo clippy --all-targets --all-features -- -D warnings` | PASS | Clippy passed. Cargo emitted build-script hardlink warnings from the external target cache only. |
-| Rust check | `CARGO_TERM_COLOR=never cargo check --all-targets --all-features` | PASS | Cargo check passed with external target-cache hardlink warnings only. |
-| Rust tests | `CARGO_TERM_COLOR=never cargo test --all-targets --all-features --no-fail-fast` | PASS | Full suite passed: lib tests 310 passed / 1 ignored, main tests 12 passed, integration/example tests passed. Metal unit tests passed after test-only command-buffer reuse was disabled. |
+| Rust format | `CARGO_TARGET_DIR="$EXTERNAL_VOLUME/Camelid/release-captain/v0.1-evidence/cargo-target" cargo fmt --all -- --check` | PASS | Source tree is formatted. |
+| Rust clippy | `CARGO_TARGET_DIR="$EXTERNAL_VOLUME/Camelid/release-captain/v0.1-evidence/cargo-target" CARGO_TERM_COLOR=never cargo clippy --all-targets --all-features -- -D warnings` | PASS | Clippy passed. |
+| Rust check | `CARGO_TERM_COLOR=never cargo check --all-targets --all-features` | PASS | Earlier gate-refresh check passed; no Rust source changed in this evidence-publication update. |
+| Rust tests | `CARGO_TARGET_DIR="$EXTERNAL_VOLUME/Camelid/release-captain/v0.1-evidence/cargo-target" CARGO_TERM_COLOR=never cargo test --all-targets --all-features --no-fail-fast` | PASS | Full suite passed: lib tests 310 passed / 1 ignored, main tests 12 passed, integration/example tests passed, tokenizer tests passed, and Metal unit tests passed. |
 | Release build | `CARGO_TERM_COLOR=never cargo build --release --bin camelid` | PASS | Release binary built successfully. |
-| Public evidence claims | `node scripts/check-public-evidence-claims.mjs --root qa/evidence-bundles` | PASS | Checked 96 manifest files and 49 summary files. |
+| External release build for comparator run | `CARGO_TARGET_DIR="$EXTERNAL_VOLUME/Camelid/release-captain/v0.1-evidence/cargo-target" CARGO_TERM_COLOR=never cargo build --release --bin camelid` | PASS | Built from release worktree SHA `8026339531463ade269d7be7078da331ba3e4085`; local filesystem had insufficient free space for normal in-worktree build artifacts. |
+| Public evidence claims | `node scripts/check-public-evidence-claims.mjs --root qa/evidence-bundles` | PASS | Checked 98 manifest files and 49 summary files after adding the v0.1 public bundle manifest. |
 | Public scrub | `bash scripts/check-public-scrub.sh` | PASS | No public scrub violations reported. |
-| Frontend build/model-state smoke | `cd frontend && npm run build && npm run smoke:model-state` | PASS | Vite build passed and model-state smoke passed after removing Mistral from tracked full-support rows. |
-| Benchmark harness self-test | `node tools/bench/test-v0.1-benchmark-harness.mjs` | PASS | Synthetic self-test passed; this is harness validation only, not real comparator evidence. |
+| Frontend build/model-state smoke | `cd frontend && npm run build && npm run smoke:model-state` | PASS | Vite build passed and model-state smoke passed. |
+| Benchmark harness self-test | `node tools/bench/test-v0.1-benchmark-harness.mjs` | PASS | Synthetic self-test passed; this is harness validation only. |
+| Benchmark harness real run | `node tools/bench/v0.1-benchmark-harness.mjs --config target/v0.1-20260531T184150Z.config.json --timestamp 20260531T184150Z-real-local-raw --hash-models` | PASS | Clean-head source SHA `8026339531463ade269d7be7078da331ba3e4085`, marker guardrails passed, scrubbed bundle published at `qa/evidence-bundles/v0.1/20260531T184150Z-real-local/`. |
+| Evidence privacy audit | `node scripts/audit-evidence-bundle-privacy.mjs --root qa/evidence-bundles/v0.1/20260531T184150Z-real-local --strict` | PASS | Zero findings after macOS path-scrub update. |
 
 ## Comparator and Evidence Gates
 
 | Gate | Status | Required before tag |
 | --- | --- | --- |
-| v0.1 evidence bundle | PARTIAL / BLOCKED | Dry-run bundle `qa/evidence-bundles/v0.1/dryrun-release-captain/` proves harness output shape only. Real Camelid/comparator benchmark entries are still required or must be explicitly deferred. No new real bundle was created in this gate-refresh slice. |
-| llama.cpp baseline | BLOCKED | Run a pinned same-host baseline or explicitly defer with rationale. |
-| MLX-LM baseline | PARTIAL | Memory comparison evidence exists; v0.1 speed baseline must be run or explicitly deferred. |
-| Ollama baseline | BLOCKED | Run baseline or explicitly defer with rationale. |
+| v0.1 evidence bundle | PASS | Real bundle `qa/evidence-bundles/v0.1/20260531T184150Z-real-local/`; dry-run bundle remains shape evidence only. |
+| llama.cpp baseline | PARTIAL / ACCEPTED FOR CPU | Pinned CPU-only same-host baseline exists for `llama32_3b_instruct_q8_0`; Metal is deferred and must not be implied. |
+| MLX-LM baseline | DEFERRED | `mlx_lm` is not installed in the default Python environment; historical MLX memory comparison remains context only. |
+| Ollama baseline | DEFERRED | Installed `llama3.1:8b` is not an approved exact-row/quant-equivalent v0.1 comparator. |
 | Support matrix | Out of scope for this lane | Owned by another lane; do not edit here. |
 | Correctness matrix | Out of scope for this lane | Owned by another lane; do not edit here. |
 
 ## Current Blocking Failures
 
-- Only a dry-run v0.1 evidence bundle exists; real benchmark evidence is missing.
-- llama.cpp, Ollama, and MLX comparator baselines still need real runs or explicit release-captain deferrals.
-- No rc tag is allowed yet.
+- No command failure is currently recorded for the real llama.cpp CPU bundle.
+- `v0.1.0-rc1` was not created in this automation slice because the remaining decision is whether to accept one llama.cpp CPU row plus explicit Metal/Ollama/MLX deferrals.
+- Local validation passed after the evidence-publication update; pushed branch state still needs normal remote/CI observation before any rc tag.
 
 ## Tag Rule
 

@@ -1,0 +1,14 @@
+{
+  "schema": "camelid.v0_1.comparator_build.v1",
+  "generated_utc": "2026-05-31T18:43:58Z",
+  "comparator": "llama.cpp",
+  "source_commit": "399739d5c5978351f39e3454bfbfbab4f369088f",
+  "source_status": "## master...origin/master",
+  "server_version": "version: 1 (399739d)\nbuilt with AppleClang 17.0.0.17000404 for Darwin arm64",
+  "build_mode": "Release",
+  "cmake_args": [
+    "-DCMAKE_BUILD_TYPE=Release"
+  ],
+  "server_binary_sha256": "1ad1eabe52e8a83982ec5d91509583da1f1910b42199ffd65a5b6f172d8a931f",
+  "runtime_backend_mode": "CPU-only comparator at run time via llama-server -ngl 0. The binary reports Metal support in device_info, but this row is not Metal evidence."
+}

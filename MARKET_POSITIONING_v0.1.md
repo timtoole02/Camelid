@@ -58,7 +58,8 @@ Use:
 
 - "Camelid checks parity against llama.cpp for cited exact rows."
 - "Camelid publishes bounded benchmark and memory snapshots where committed artifacts exist."
-- "A complete same-host throughput table versus comparator runtimes is still pending."
+- "Camelid has one v0.1 same-host llama.cpp CPU comparator row; a complete same-host throughput table versus comparator runtimes is still pending."
+- "In the v0.1 llama.cpp CPU row, Camelid is slower on bounded TTFT and total elapsed."
 
 Avoid:
 
@@ -97,4 +98,4 @@ The v0.1 story should read like this:
 2. Each supported row has a bounded evidence trail.
 3. Partial rows are named honestly and kept blocked where evidence fails.
 4. Benchmarks are useful but narrow.
-5. The next release work is fresh v0.1 evidence bundles and comparator baselines, not louder copy.
+5. The next release work is broader comparator coverage and fresh deferred baselines, not louder copy.

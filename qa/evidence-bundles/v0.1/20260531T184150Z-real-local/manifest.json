@@ -1,0 +1,52 @@
+{
+  "schema": "camelid.v0_1.local_llamacpp_cpu_comparator.v1",
+  "bundle": "qa/evidence-bundles/v0.1/20260531T184150Z-real-local/",
+  "generated_utc": "2026-05-31T18:44:15Z",
+  "source_commit": "8026339531463ade269d7be7078da331ba3e4085",
+  "source_branch": "release/v0.1-evidence",
+  "source_status_short": "",
+  "model": {
+    "row_id": "llama32_3b_instruct_q8_0",
+    "name": "Llama 3.2 3B Instruct Q8_0",
+    "path": "$CAMELID_MODEL_DIR/llama-3.2-3b-instruct/Llama-3.2-3B-Instruct-Q8_0.gguf",
+    "sha256": "b5607b5090a8280063fff2d706bb3408ca6542341b06aab39c3eca0a28575921"
+  },
+  "comparator": {
+    "name": "llama.cpp",
+    "source_commit": "399739d5c5978351f39e3454bfbfbab4f369088f",
+    "version": "version: 1 (399739d)",
+    "runtime_mode": "CPU-only via -ngl 0"
+  },
+  "method": {
+    "host_class": "macOS Darwin 25.5.0, Apple M4, arm64, 10 logical CPUs, 16 GiB RAM",
+    "context_size": 512,
+    "max_generated_tokens": 16,
+    "threads": 8,
+    "warmup_runs": 1,
+    "measured_repeats": 3,
+    "prompt_marker": "CMLD-BENCH",
+    "temperature": 0
+  },
+  "result": {
+    "status": "pass",
+    "guardrails_passed": true,
+    "camelid_avg_ttft_ms": 2496.83,
+    "camelid_avg_total_elapsed_ms": 2496.94,
+    "llamacpp_avg_ttft_ms": 1342.94,
+    "llamacpp_avg_total_elapsed_ms": 1814.77,
+    "interpretation": "Camelid lost this bounded same-host CPU row on TTFT and total elapsed. Streamed decode estimates are chunk estimates, not tokenizer-ground-truth throughput."
+  },
+  "claim_boundary": "Exact-row bounded same-host timing evidence only. This is not Metal, MLX, Ollama, production-throughput, portability, broad-family, neighboring-row, or speed-win evidence.",
+  "files": [
+    "machine.json",
+    "model_manifest.json",
+    "commands.md",
+    "results.json",
+    "results.csv",
+    "same-host-llama32-3b-q8.json",
+    "comparator-build.json",
+    "raw_logs/llamacpp-cpu-samehost-llama32-3b-run-1.command.json",
+    "raw_logs/llamacpp-cpu-samehost-llama32-3b-run-1.stdout.log",
+    "raw_logs/llamacpp-cpu-samehost-llama32-3b-run-1.stderr.log"
+  ]
+}

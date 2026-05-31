@@ -1,0 +1,10 @@
+camelid_ttft_ms=2496.83
+camelid_decode_tok_s=76678.81
+camelid_ms_tok=0.02
+llama_cpp_ttft_ms=1342.94
+llama_cpp_decode_tok_s=16.38
+llama_cpp_ms_tok=94.37
+camelid_backend_first_content_ms=2112.67
+camelid_backend_generate_ms=2464
+camelid_backend_q8_calls=null
+json_out=$CAMELID_WORKTREE/qa/evidence-bundles/v0.1/20260531T184150Z-real-local-raw/same-host-llama32-3b-q8.json

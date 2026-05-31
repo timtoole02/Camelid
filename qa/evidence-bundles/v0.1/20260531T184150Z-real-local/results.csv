@@ -1,0 +1,2 @@
+entry_id,engine,model_id,run_index,status,exit_code,signal,duration_ms,timeout_ms,timed_out,peak_rss_kb,stdout_bytes,stderr_bytes,stdout_log,stderr_log
+llamacpp-cpu-samehost-llama32-3b,llama.cpp,llama32-3b-instruct-q8-local,1,ok,0,,35658.57,1200000,false,109632,418,7260,qa/evidence-bundles/v0.1/20260531T184150Z-real-local-raw/raw_logs/llamacpp-cpu-samehost-llama32-3b-run-1.stdout.log,qa/evidence-bundles/v0.1/20260531T184150Z-real-local-raw/raw_logs/llamacpp-cpu-samehost-llama32-3b-run-1.stderr.log

@@ -21,6 +21,7 @@ No tag should be cut from this branch until the release gate in [`RELEASE_GATE_v
 - Exact-row v0.1 support ledger in [`SUPPORT_MATRIX_v0.1.md`](SUPPORT_MATRIX_v0.1.md), with broader background in [`COMPATIBILITY.md`](COMPATIBILITY.md).
 - Current support and blocker snapshot in [`STATUS.md`](STATUS.md).
 - Committed benchmark snapshot in [`BENCHMARKS.md`](BENCHMARKS.md).
+- A v0.1 same-host llama.cpp CPU comparator bundle for the exact Llama 3.2 3B Instruct Q8_0 row, with Camelid slower on bounded TTFT and total elapsed.
 - Public evidence-bundle checks for support-sensitive JSON artifacts.
 - Public scrub guard for private paths, host details, and legacy branding.
 
@@ -72,10 +73,11 @@ Representative evidence bundles cited by the public docs include:
 - `qa/evidence-bundles/mistral-7b-v0.3-q8-context-4096-8192-ubuntu-20260509T005229Z-head-9e3c64f2cfab/manifest.json`
 - `qa/evidence-bundles/mistral-7b-v0.3-q8-api-webui-rss-current-head-20260513T1935Z-head-9a296ea/manifest.json`
 - `qa/evidence-bundles/mixtral-8x7b-v0.1-q8-blocker-reconciliation-20260512/manifest.json`
+- `qa/evidence-bundles/v0.1/20260531T184150Z-real-local/`
 
 ## Release Blockers
 
-- A fresh v0.1 evidence bundle under `qa/evidence-bundles/v0.1/` is still required.
-- Comparator baselines for llama.cpp, MLX, and Ollama must either be run or explicitly deferred by the release captain.
+- A fresh v0.1 llama.cpp CPU evidence bundle exists under `qa/evidence-bundles/v0.1/`; broader comparator coverage remains intentionally narrow.
+- llama.cpp Metal, MLX, and Ollama fresh baselines are deferred with release-captain rationale and must not be claimed.
 - Full lightweight gate results must be recorded in [`RELEASE_GATE_v0.1.md`](RELEASE_GATE_v0.1.md).
 - No release tag has been created.

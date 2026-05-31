@@ -1,0 +1,860 @@
+{
+  "schema": "camelid.v0_1.benchmark_bundle.v1",
+  "generated_utc": "2026-05-31T18:43:07.581Z",
+  "harness": {
+    "schema": "camelid.v0_1.benchmark_harness.config.v1",
+    "name": "Camelid v0.1 benchmark harness",
+    "script": "tools/bench/v0.1-benchmark-harness.mjs",
+    "supported_engines": [
+      "camelid",
+      "llama.cpp",
+      "ollama",
+      "mlx"
+    ],
+    "required_outputs": [
+      "machine.json",
+      "model_manifest.json",
+      "commands.md",
+      "raw_logs/",
+      "results.json",
+      "results.csv",
+      "summary.md"
+    ]
+  },
+  "bundle_dir": "$CAMELID_WORKTREE/qa/evidence-bundles/v0.1/20260531T184150Z-real-local-raw",
+  "metadata": {
+    "release_version": "v0.1.0-rc1",
+    "benchmark_name": "v0.1 local same-host llama.cpp comparator",
+    "operator": "Release Captain",
+    "purpose": "Capture a bounded same-host Camelid versus llama.cpp CPU comparator row for the exact Llama 3.2 3B Instruct Q8_0 model."
+  },
+  "machine": {
+    "schema": "camelid.v0_1.machine.v1",
+    "generated_utc": "2026-05-31T18:42:23.188Z",
+    "hostname": "Tims-Mac-mini.local",
+    "platform": "darwin",
+    "release": "25.5.0",
+    "arch": "arm64",
+    "type": "Darwin",
+    "cpus": [
+      {
+        "model": "Apple M4",
+        "speed_mhz": 2400
+      },
+      {
+        "model": "Apple M4",
+        "speed_mhz": 2400
+      },
+      {
+        "model": "Apple M4",
+        "speed_mhz": 2400
+      },
+      {
+        "model": "Apple M4",
+        "speed_mhz": 2400
+      },
+      {
+        "model": "Apple M4",
+        "speed_mhz": 2400
+      },
+      {
+        "model": "Apple M4",
+        "speed_mhz": 2400
+      },
+      {
+        "model": "Apple M4",
+        "speed_mhz": 2400
+      },
+      {
+        "model": "Apple M4",
+        "speed_mhz": 2400
+      },
+      {
+        "model": "Apple M4",
+        "speed_mhz": 2400
+      },
+      {
+        "model": "Apple M4",
+        "speed_mhz": 2400
+      }
+    ],
+    "cpu_count": 10,
+    "memory": {
+      "total_bytes": 17179869184,
+      "free_bytes": 5133484032,
+      "process_rss_bytes": 41353216
+    },
+    "node": {
+      "version": "v22.22.2",
+      "exec_path": "/opt/homebrew/Cellar/node@22/22.22.2_2/bin/node"
+    },
+    "git": {
+      "branch": "release/v0.1-evidence",
+      "commit": "8026339531463ade269d7be7078da331ba3e4085",
+      "status_short": ""
+    }
+  },
+  "model_manifest": {
+    "schema": "camelid.v0_1.model_manifest.v1",
+    "generated_utc": "2026-05-31T18:42:31.916Z",
+    "hash_models": true,
+    "models": [
+      {
+        "id": "llama32-3b-instruct-q8-local",
+        "label": "Llama 3.2 3B Instruct Q8_0 local GGUF",
+        "family": "Llama",
+        "parameters": "3B",
+        "quantization": "Q8_0",
+        "artifact_uri": "$CAMELID_MODEL_DIR/llama-3.2-3b-instruct/Llama-3.2-3B-Instruct-Q8_0.gguf",
+        "artifact_sha256": "b5607b5090a8280063fff2d706bb3408ca6542341b06aab39c3eca0a28575921",
+        "artifact_file": {
+          "path": "$CAMELID_MODEL_DIR/llama-3.2-3b-instruct/Llama-3.2-3B-Instruct-Q8_0.gguf",
+          "exists": true,
+          "size_bytes": 3421899296,
+          "mtime_utc": "2026-04-29T14:44:25.860Z",
+          "sha256": "b5607b5090a8280063fff2d706bb3408ca6542341b06aab39c3eca0a28575921"
+        }
+      }
+    ]
+  },
+  "dry_run": false,
+  "entries": [
+    {
+      "id": "llamacpp-cpu-samehost-llama32-3b",
+      "label": "Camelid vs llama.cpp CPU same-host Llama 3.2 3B Q8_0",
+      "engine": "llama.cpp",
+      "model_id": "llama32-3b-instruct-q8-local",
+      "prompt_sha256": "0298e45dbc2f8ca975e49ba4ef0cb1222686c1e45b8a24342048ed921ccfb106",
+      "repetitions": 1,
+      "tags": [
+        "same-host",
+        "cpu-only-llamacpp",
+        "exact-row",
+        "bounded-timing"
+      ],
+      "expected": {
+        "marker": "CMLD-BENCH",
+        "claim_boundary": "Exact-row bounded same-host timing evidence only; does not widen support or establish production throughput."
+      },
+      "command": {
+        "display": "node scripts/bench-llama3-same-host.mjs --backend http://canonical-private-ubuntu-validation-host:19781 --llama-url http://canonical-private-ubuntu-validation-host:19783 --model '$CAMELID_MODEL_DIR/llama-3.2-3b-instruct/Llama-3.2-3B-Instruct-Q8_0.gguf' --model-id llama32-3b-q8-v01-rc1-20260531T184150Z --row-id llama32_3b_instruct_q8_0 --backend-bin '$CAMELID_RELEASE_BUILD_ROOT/cargo-target/release/camelid' --llama-server '$CAMELID_RELEASE_BUILD_ROOT/llama.cpp-v0.1-rc1/build/bin/llama-server' --max-tokens 16 --warmup 1 --repeats 3 --threads 8 --llama-context 512 --unique-prompt --require-marker --expected-marker CMLD-BENCH --out qa/evidence-bundles/v0.1/20260531T184150Z-real-local-raw/same-host-llama32-3b-q8.json",
+        "file": "node",
+        "args": [
+          "scripts/bench-llama3-same-host.mjs",
+          "--backend",
+          "http://canonical-private-ubuntu-validation-host:19781",
+          "--llama-url",
+          "http://canonical-private-ubuntu-validation-host:19783",
+          "--model",
+          "$CAMELID_MODEL_DIR/llama-3.2-3b-instruct/Llama-3.2-3B-Instruct-Q8_0.gguf",
+          "--model-id",
+          "llama32-3b-q8-v01-rc1-20260531T184150Z",
+          "--row-id",
+          "llama32_3b_instruct_q8_0",
+          "--backend-bin",
+          "$CAMELID_RELEASE_BUILD_ROOT/cargo-target/release/camelid",
+          "--llama-server",
+          "$CAMELID_RELEASE_BUILD_ROOT/llama.cpp-v0.1-rc1/build/bin/llama-server",
+          "--max-tokens",
+          "16",
+          "--warmup",
+          "1",
+          "--repeats",
+          "3",
+          "--threads",
+          "8",
+          "--llama-context",
+          "512",
+          "--unique-prompt",
+          "--require-marker",
+          "--expected-marker",
+          "CMLD-BENCH",
+          "--out",
+          "qa/evidence-bundles/v0.1/20260531T184150Z-real-local-raw/same-host-llama32-3b-q8.json"
+        ],
+        "shell": false,
+        "cwd": "$CAMELID_WORKTREE",
+        "env": {
+          "CAMELID_STREAM_TIMING_DIAGNOSTICS": "on"
+        },
+        "timeout_ms": 1200000
+      }
+    }
+  ],
+  "results": [
+    {
+      "entry_id": "llamacpp-cpu-samehost-llama32-3b",
+      "label": "Camelid vs llama.cpp CPU same-host Llama 3.2 3B Q8_0",
+      "engine": "llama.cpp",
+      "model_id": "llama32-3b-instruct-q8-local",
+      "prompt_sha256": "0298e45dbc2f8ca975e49ba4ef0cb1222686c1e45b8a24342048ed921ccfb106",
+      "repetitions": 1,
+      "status": "ok",
+      "runs": [
+        {
+          "run_index": 1,
+          "status": "ok",
+          "command": {
+            "display": "node scripts/bench-llama3-same-host.mjs --backend http://canonical-private-ubuntu-validation-host:19781 --llama-url http://canonical-private-ubuntu-validation-host:19783 --model '$CAMELID_MODEL_DIR/llama-3.2-3b-instruct/Llama-3.2-3B-Instruct-Q8_0.gguf' --model-id llama32-3b-q8-v01-rc1-20260531T184150Z --row-id llama32_3b_instruct_q8_0 --backend-bin '$CAMELID_RELEASE_BUILD_ROOT/cargo-target/release/camelid' --llama-server '$CAMELID_RELEASE_BUILD_ROOT/llama.cpp-v0.1-rc1/build/bin/llama-server' --max-tokens 16 --warmup 1 --repeats 3 --threads 8 --llama-context 512 --unique-prompt --require-marker --expected-marker CMLD-BENCH --out qa/evidence-bundles/v0.1/20260531T184150Z-real-local-raw/same-host-llama32-3b-q8.json",
+            "file": "node",
+            "args": [
+              "scripts/bench-llama3-same-host.mjs",
+              "--backend",
+              "http://canonical-private-ubuntu-validation-host:19781",
+              "--llama-url",
+              "http://canonical-private-ubuntu-validation-host:19783",
+              "--model",
+              "$CAMELID_MODEL_DIR/llama-3.2-3b-instruct/Llama-3.2-3B-Instruct-Q8_0.gguf",
+              "--model-id",
+              "llama32-3b-q8-v01-rc1-20260531T184150Z",
+              "--row-id",
+              "llama32_3b_instruct_q8_0",
+              "--backend-bin",
+              "$CAMELID_RELEASE_BUILD_ROOT/cargo-target/release/camelid",
+              "--llama-server",
+              "$CAMELID_RELEASE_BUILD_ROOT/llama.cpp-v0.1-rc1/build/bin/llama-server",
+              "--max-tokens",
+              "16",
+              "--warmup",
+              "1",
+              "--repeats",
+              "3",
+              "--threads",
+              "8",
+              "--llama-context",
+              "512",
+              "--unique-prompt",
+              "--require-marker",
+              "--expected-marker",
+              "CMLD-BENCH",
+              "--out",
+              "qa/evidence-bundles/v0.1/20260531T184150Z-real-local-raw/same-host-llama32-3b-q8.json"
+            ],
+            "shell": false,
+            "cwd": "$CAMELID_WORKTREE",
+            "env": {
+              "CAMELID_STREAM_TIMING_DIAGNOSTICS": "on"
+            },
+            "timeout_ms": 1200000
+          },
+          "timing": {
+            "started_utc": "2026-05-31T18:42:31.918Z",
+            "ended_utc": "2026-05-31T18:43:07.576Z",
+            "duration_ms": 35658.57,
+            "timeout_ms": 1200000,
+            "timed_out": false
+          },
+          "memory": {
+            "before": {
+              "total_bytes": 17179869184,
+              "free_bytes": 608944128,
+              "process_rss_bytes": 103841792
+            },
+            "after": {
+              "total_bytes": 17179869184,
+              "free_bytes": 7495811072,
+              "process_rss_bytes": 20611072
+            },
+            "peak_rss_kb": 109632,
+            "rss_samples": [
+              {
+                "t_ms": 254,
+                "rss_kb": 88784
+              },
+              {
+                "t_ms": 505,
+                "rss_kb": 88816
+              },
+              {
+                "t_ms": 754,
+                "rss_kb": 88832
+              },
+              {
+                "t_ms": 1004,
+                "rss_kb": 91136
+              },
+              {
+                "t_ms": 1263,
+                "rss_kb": 103280
+              },
+              {
+                "t_ms": 1508,
+                "rss_kb": 103568
+              },
+              {
+                "t_ms": 1759,
+                "rss_kb": 103568
+              },
+              {
+                "t_ms": 2007,
+                "rss_kb": 103568
+              },
+              {
+                "t_ms": 2259,
+                "rss_kb": 109392
+              },
+              {
+                "t_ms": 2510,
+                "rss_kb": 109392
+              },
+              {
+                "t_ms": 2761,
+                "rss_kb": 109632
+              },
+              {
+                "t_ms": 3012,
+                "rss_kb": 109600
+              },
+              {
+                "t_ms": 3264,
+                "rss_kb": 77296
+              },
+              {
+                "t_ms": 3514,
+                "rss_kb": 77296
+              },
+              {
+                "t_ms": 3767,
+                "rss_kb": 77648
+              },
+              {
+                "t_ms": 4016,
+                "rss_kb": 77648
+              },
+              {
+                "t_ms": 4269,
+                "rss_kb": 77856
+              },
+              {
+                "t_ms": 4520,
+                "rss_kb": 77856
+              },
+              {
+                "t_ms": 4769,
+                "rss_kb": 71088
+              },
+              {
+                "t_ms": 5021,
+                "rss_kb": 71088
+              },
+              {
+                "t_ms": 5271,
+                "rss_kb": 71264
+              },
+              {
+                "t_ms": 5522,
+                "rss_kb": 71264
+              },
+              {
+                "t_ms": 5776,
+                "rss_kb": 71840
+              },
+              {
+                "t_ms": 6026,
+                "rss_kb": 71856
+              },
+              {
+                "t_ms": 6289,
+                "rss_kb": 72320
+              },
+              {
+                "t_ms": 6557,
+                "rss_kb": 72320
+              },
+              {
+                "t_ms": 6794,
+                "rss_kb": 72480
+              },
+              {
+                "t_ms": 7044,
+                "rss_kb": 72480
+              },
+              {
+                "t_ms": 7292,
+                "rss_kb": 74992
+              },
+              {
+                "t_ms": 7543,
+                "rss_kb": 74992
+              },
+              {
+                "t_ms": 7794,
+                "rss_kb": 90304
+              },
+              {
+                "t_ms": 8044,
+                "rss_kb": 39984
+              },
+              {
+                "t_ms": 8329,
+                "rss_kb": 40208
+              },
+              {
+                "t_ms": 8558,
+                "rss_kb": 37408
+              },
+              {
+                "t_ms": 8797,
+                "rss_kb": 37056
+              },
+              {
+                "t_ms": 9048,
+                "rss_kb": 37056
+              },
+              {
+                "t_ms": 9312,
+                "rss_kb": 35648
+              },
+              {
+                "t_ms": 9570,
+                "rss_kb": 35584
+              },
+              {
+                "t_ms": 9800,
+                "rss_kb": 24544
+              },
+              {
+                "t_ms": 10052,
+                "rss_kb": 23776
+              },
+              {
+                "t_ms": 10302,
+                "rss_kb": 27536
+              },
+              {
+                "t_ms": 10554,
+                "rss_kb": 27424
+              },
+              {
+                "t_ms": 10805,
+                "rss_kb": 27424
+              },
+              {
+                "t_ms": 11056,
+                "rss_kb": 27408
+              },
+              {
+                "t_ms": 11307,
+                "rss_kb": 26944
+              },
+              {
+                "t_ms": 11557,
+                "rss_kb": 26624
+              },
+              {
+                "t_ms": 11809,
+                "rss_kb": 26480
+              },
+              {
+                "t_ms": 12060,
+                "rss_kb": 26288
+              },
+              {
+                "t_ms": 12312,
+                "rss_kb": 26288
+              },
+              {
+                "t_ms": 12562,
+                "rss_kb": 26288
+              },
+              {
+                "t_ms": 12814,
+                "rss_kb": 26256
+              },
+              {
+                "t_ms": 13066,
+                "rss_kb": 26176
+              },
+              {
+                "t_ms": 13317,
+                "rss_kb": 26176
+              },
+              {
+                "t_ms": 13567,
+                "rss_kb": 26176
+              },
+              {
+                "t_ms": 13819,
+                "rss_kb": 26176
+              },
+              {
+                "t_ms": 14069,
+                "rss_kb": 26176
+              },
+              {
+                "t_ms": 14322,
+                "rss_kb": 26064
+              },
+              {
+                "t_ms": 14572,
+                "rss_kb": 26064
+              },
+              {
+                "t_ms": 14824,
+                "rss_kb": 18048
+              },
+              {
+                "t_ms": 15074,
+                "rss_kb": 18048
+              },
+              {
+                "t_ms": 15326,
+                "rss_kb": 18048
+              },
+              {
+                "t_ms": 15574,
+                "rss_kb": 18048
+              },
+              {
+                "t_ms": 15825,
+                "rss_kb": 24096
+              },
+              {
+                "t_ms": 16076,
+                "rss_kb": 24096
+              },
+              {
+                "t_ms": 16328,
+                "rss_kb": 24096
+              },
+              {
+                "t_ms": 16580,
+                "rss_kb": 24032
+              },
+              {
+                "t_ms": 16832,
+                "rss_kb": 24032
+              },
+              {
+                "t_ms": 17088,
+                "rss_kb": 24032
+              },
+              {
+                "t_ms": 17333,
+                "rss_kb": 24032
+              },
+              {
+                "t_ms": 17599,
+                "rss_kb": 23984
+              },
+              {
+                "t_ms": 17846,
+                "rss_kb": 24000
+              },
+              {
+                "t_ms": 18098,
+                "rss_kb": 25328
+              },
+              {
+                "t_ms": 18346,
+                "rss_kb": 25056
+              },
+              {
+                "t_ms": 18599,
+                "rss_kb": 25024
+              },
+              {
+                "t_ms": 18850,
+                "rss_kb": 25024
+              },
+              {
+                "t_ms": 19103,
+                "rss_kb": 24896
+              },
+              {
+                "t_ms": 19354,
+                "rss_kb": 24896
+              },
+              {
+                "t_ms": 19602,
+                "rss_kb": 25072
+              },
+              {
+                "t_ms": 19851,
+                "rss_kb": 27680
+              },
+              {
+                "t_ms": 20107,
+                "rss_kb": 27600
+              },
+              {
+                "t_ms": 20355,
+                "rss_kb": 27600
+              },
+              {
+                "t_ms": 20635,
+                "rss_kb": 27392
+              },
+              {
+                "t_ms": 20870,
+                "rss_kb": 26832
+              },
+              {
+                "t_ms": 21107,
+                "rss_kb": 26832
+              },
+              {
+                "t_ms": 21358,
+                "rss_kb": 23632
+              },
+              {
+                "t_ms": 21607,
+                "rss_kb": 23600
+              },
+              {
+                "t_ms": 21864,
+                "rss_kb": 23216
+              },
+              {
+                "t_ms": 22110,
+                "rss_kb": 27312
+              },
+              {
+                "t_ms": 22363,
+                "rss_kb": 27472
+              },
+              {
+                "t_ms": 22615,
+                "rss_kb": 25552
+              },
+              {
+                "t_ms": 22868,
+                "rss_kb": 25552
+              },
+              {
+                "t_ms": 23115,
+                "rss_kb": 25536
+              },
+              {
+                "t_ms": 23366,
+                "rss_kb": 26800
+              },
+              {
+                "t_ms": 23617,
+                "rss_kb": 26800
+              },
+              {
+                "t_ms": 23871,
+                "rss_kb": 26800
+              },
+              {
+                "t_ms": 24121,
+                "rss_kb": 26800
+              },
+              {
+                "t_ms": 24375,
+                "rss_kb": 26800
+              },
+              {
+                "t_ms": 24624,
+                "rss_kb": 26800
+              },
+              {
+                "t_ms": 24874,
+                "rss_kb": 26944
+              },
+              {
+                "t_ms": 25132,
+                "rss_kb": 26880
+              },
+              {
+                "t_ms": 25388,
+                "rss_kb": 26800
+              },
+              {
+                "t_ms": 25635,
+                "rss_kb": 27248
+              },
+              {
+                "t_ms": 25901,
+                "rss_kb": 25792
+              },
+              {
+                "t_ms": 26128,
+                "rss_kb": 24704
+              },
+              {
+                "t_ms": 26378,
+                "rss_kb": 24656
+              },
+              {
+                "t_ms": 26630,
+                "rss_kb": 21680
+              },
+              {
+                "t_ms": 26880,
+                "rss_kb": 20960
+              },
+              {
+                "t_ms": 27130,
+                "rss_kb": 17200
+              },
+              {
+                "t_ms": 27385,
+                "rss_kb": 17200
+              },
+              {
+                "t_ms": 27636,
+                "rss_kb": 17200
+              },
+              {
+                "t_ms": 27887,
+                "rss_kb": 17200
+              },
+              {
+                "t_ms": 28137,
+                "rss_kb": 17200
+              },
+              {
+                "t_ms": 28385,
+                "rss_kb": 17200
+              },
+              {
+                "t_ms": 28658,
+                "rss_kb": 17200
+              },
+              {
+                "t_ms": 28898,
+                "rss_kb": 17184
+              },
+              {
+                "t_ms": 29153,
+                "rss_kb": 17200
+              },
+              {
+                "t_ms": 29409,
+                "rss_kb": 25232
+              },
+              {
+                "t_ms": 29659,
+                "rss_kb": 25264
+              },
+              {
+                "t_ms": 29903,
+                "rss_kb": 25248
+              },
+              {
+                "t_ms": 30173,
+                "rss_kb": 24416
+              },
+              {
+                "t_ms": 30412,
+                "rss_kb": 25120
+              },
+              {
+                "t_ms": 30656,
+                "rss_kb": 17248
+              },
+              {
+                "t_ms": 31161,
+                "rss_kb": 17152
+              },
+              {
+                "t_ms": 31302,
+                "rss_kb": 17216
+              },
+              {
+                "t_ms": 31555,
+                "rss_kb": 17216
+              },
+              {
+                "t_ms": 31803,
+                "rss_kb": 21152
+              },
+              {
+                "t_ms": 32060,
+                "rss_kb": 21152
+              },
+              {
+                "t_ms": 32306,
+                "rss_kb": 21152
+              },
+              {
+                "t_ms": 32554,
+                "rss_kb": 21232
+              },
+              {
+                "t_ms": 32804,
+                "rss_kb": 26736
+              },
+              {
+                "t_ms": 33054,
+                "rss_kb": 26832
+              },
+              {
+                "t_ms": 33308,
+                "rss_kb": 27504
+              },
+              {
+                "t_ms": 33563,
+                "rss_kb": 27504
+              },
+              {
+                "t_ms": 33810,
+                "rss_kb": 27504
+              },
+              {
+                "t_ms": 34065,
+                "rss_kb": 27504
+              },
+              {
+                "t_ms": 34315,
+                "rss_kb": 27504
+              },
+              {
+                "t_ms": 34564,
+                "rss_kb": 27504
+              },
+              {
+                "t_ms": 34818,
+                "rss_kb": 27504
+              },
+              {
+                "t_ms": 35068,
+                "rss_kb": 27504
+              },
+              {
+                "t_ms": 35317,
+                "rss_kb": 27504
+              },
+              {
+                "t_ms": 35568,
+                "rss_kb": 27504
+              }
+            ]
+          },
+          "output": {
+            "stdout_log": "qa/evidence-bundles/v0.1/20260531T184150Z-real-local-raw/raw_logs/llamacpp-cpu-samehost-llama32-3b-run-1.stdout.log",
+            "stderr_log": "qa/evidence-bundles/v0.1/20260531T184150Z-real-local-raw/raw_logs/llamacpp-cpu-samehost-llama32-3b-run-1.stderr.log",
+            "command_log": "qa/evidence-bundles/v0.1/20260531T184150Z-real-local-raw/raw_logs/llamacpp-cpu-samehost-llama32-3b-run-1.command.json",
+            "stdout_bytes": 418,
+            "stderr_bytes": 7260,
+            "stdout_preview": "camelid_ttft_ms=2496.83\ncamelid_decode_tok_s=76678.81\ncamelid_ms_tok=0.02\nllama_cpp_ttft_ms=1342.94\nllama_cpp_decode_tok_s=16.38\nllama_cpp_ms_tok=94.37\ncamelid_backend_first_content_ms=2112.67\ncamelid_backend_generate_ms=2464\ncamelid_backend_q8_calls=null\njson_out=$CAMELID_WORKTREE/qa/evidence-bundles/v0.1/20260531T184150Z-real-local-raw/same-host-llama32-3b-q8.json\n",
+            "stderr_preview": "[llama-server] canonical-private-ubuntu-validation-host I log_info: verbosity = 3 (adjust with the `-lv N` CLI arg)\ncanonical-private-ubuntu-validation-host I device_info:\ncanonical-private-ubuntu-validation-host I   - MTL0    : Apple M4 (12124 MiB, 12123 MiB free)\ncanonical-private-ubuntu-validation-host I   - BLAS    : Accelerate (0 MiB, 0 MiB free)\ncanonical-private-ubuntu-validation-host I   - CPU     : Apple M4 (16384 MiB, 16384 MiB free)\n[llama-server] canonical-private-ubuntu-validation-host I system_info: n_threads = 8 (n_threads_batch = 8) / 10 | MTL : EMBED_LIBRARY = 1 | CPU : NEON = 1 | ARM_FMA = 1 | FP16_VA = 1 | MATMUL_INT8 = 1 | DOTPROD = 1 | SME = 1 | ACCELERATE = 1 | REPACK = 1 |\ncanonical-private-ubuntu-validation-host I srv  llama_server: n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n[llama-server] canonical-private-ubuntu-validation-host I srv          init: running without SSL\n[llama-server] canonical-private-ubuntu-validation-host I srv          init: using 9 threads for HTTP server\n[llama-server] canonical-private-ubuntu-validation-host I srv         start: binding port with default address family\n[llama-server] canonical-private-ubuntu-validation-host I srv  llama_server: loading model\ncanonical-private-ubuntu-validation-host I srv    load_model: loading model '$CAMELID_MODEL_DIR/llama-3.2-3b-instruct/Llama-3.2-3B-Instruct-Q8_0.gguf'\n[llama-server] canonical-private-ubuntu-validation-host I common_init_result: fitting params to device memory ...\ncanonical-private-ubuntu-validation-host I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n[llama-server] canonical-private-ubuntu-validation-host W llama_context: n_ctx_seq (512) < n_ctx_train (131072) -- the full capacity of the model will not be utilized\n[llama-server] canonical-private-ubuntu-validation-host I srv    load_model: initializing slots, n_slots = 4\n[llama-server] canonical-private-ubuntu-validation-host W common_speculative_init: no implementations specified for speculative decoding\ncanonical-private-ubuntu-validation-host I slot   load_model: id  0 | task -1 | new slot, n_ctx = 512\ncanonical-private-ubuntu-validation-host I slot   load_model: id  1 | task -1 | new slot, n_ctx = 512\ncanonical-private-ubuntu-validation-host I slot   load_model: id  2 | task -1 | new slot, n_ctx = 512\ncanonical-private-ubuntu-validation-host I slot   load_model: id  3 | task -1 | new slot, n_ctx = 512\ncanonical-private-ubuntu-validation-host I srv    load_model: prompt cache is enabled, size limit: 8192 MiB\ncanonical-private-ubuntu-validation-host\n...[truncated 5212 chars]"
+          },
+          "exit": {
+            "code": 0,
+            "signal": null,
+            "error": null
+          }
+        }
+      ],
+      "summary": {
+        "completed": 1,
+        "failed": 0,
+        "skipped": 0,
+        "duration_ms_min": 35658.57,
+        "duration_ms_avg": 35658.57,
+        "duration_ms_max": 35658.57,
+        "peak_rss_kb_max": 109632
+      }
+    }
+  ],
+  "summary": {
+    "entries_total": 1,
+    "entries_ok": 1,
+    "entries_failed": 0,
+    "entries_skipped": 0,
+    "runs_total": 1
+  }
+}

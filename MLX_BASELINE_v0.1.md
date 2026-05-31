@@ -1,6 +1,6 @@
 # MLX Baseline for Camelid v0.1
 
-Status: pending for `v0.1.0-rc1`; historical memory-only context exists.
+Status: deferred for `v0.1.0-rc1`; historical memory-only context exists.
 
 MLX is an Apple Silicon market-context comparator. It should be reported separately from CPU-only, Metal llama.cpp, Ollama user experience, and distributed Mac comparisons. MLX-LM uses MLX-format weights and Apple Silicon acceleration, so it is not a strict quant-equivalent comparison against Camelid GGUF Q8_0.
 
@@ -32,6 +32,8 @@ Observed in this environment on 2026-05-31:
 - Python module probe: `mlx_lm` is not installed in the default `python3` environment
 
 Because `mlx_lm` is missing, no fresh v0.1 MLX run was performed.
+
+Release-captain deferral: v0.1 may cite the historical MLX memory comparison only as prior context with its source head and scope. It must not claim a fresh v0.1 MLX speed baseline, a quant-equivalent comparison, or a Camelid speed win. This deferral is acceptable for `v0.1.0-rc1` only while public docs keep MLX separated from CPU-only llama.cpp and avoid MLX performance overclaims.
 
 ## Reproduction Commands
 

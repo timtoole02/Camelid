@@ -102,15 +102,37 @@ Method:
 
 These are release-audit timing snapshots. They are not a broad runtime-speed claim.
 
+### v0.1 Same-Host llama.cpp CPU Comparator
+
+Evidence: `qa/evidence-bundles/v0.1/20260531T184150Z-real-local/`
+
+Method:
+
+- release worktree source SHA: `8026339531463ade269d7be7078da331ba3e4085`
+- exact row: Llama 3.2 3B Instruct Q8_0
+- model SHA256: `b5607b5090a8280063fff2d706bb3408ca6542341b06aab39c3eca0a28575921`
+- comparator: llama.cpp source `399739d5c5978351f39e3454bfbfbab4f369088f`, `llama-server` `version: 1 (399739d)`
+- mode: same-host Apple M4, llama.cpp CPU-only runtime via `-ngl 0`, context 512, 8 threads
+- prompt: exact `CMLD-BENCH` marker prompt, compact chat render, max tokens 16
+- repetitions: 1 warmup plus 3 measured alternating Camelid/llama.cpp runs
+- guardrail: both engines produced the expected marker in every measured run
+
+| Engine | Avg TTFT ms | Avg total elapsed ms | Boundary |
+| --- | ---: | ---: | --- |
+| Camelid | 2496.83 | 2496.94 | Bounded same-host exact-row timing only. |
+| llama.cpp CPU | 1342.94 | 1814.77 | Same prompt/model/context/thread budget, CPU-only comparator mode. |
+
+This row is a loss for Camelid on TTFT and total elapsed. The streamed decode estimates in the raw JSON are chunk estimates, not tokenizer-ground-truth completion-token throughput, so they are not used as a public speed claim.
+
 ## Comparator Baseline Status
 
 `BENCHMARKS.md` states that Camelid does not yet publish a fully normalized same-host throughput table versus llama.cpp for every headline row. That remains true for v0.1.
 
 Current comparator status:
 
-- llama.cpp: bounded parity evidence exists for cited exact rows; a full same-host v0.1 throughput table is still required or must be explicitly deferred.
-- MLX-LM: memory comparison evidence exists for two Apple Silicon rows; it is not a speed-win claim.
-- Ollama: no v0.1 comparator result is recorded in this document.
+- llama.cpp: a v0.1 CPU-only same-host row now exists for Llama 3.2 3B Instruct Q8_0. It is not a complete table for every headline row, and Metal mode remains deferred.
+- MLX-LM: memory comparison evidence exists for two Apple Silicon rows; fresh v0.1 speed/memory recapture is deferred because `mlx_lm` is not installed in the default Python environment.
+- Ollama: v0.1 user-experience comparison is deferred because the only installed row observed here was `llama3.1:8b`, not a release-captain-approved exact comparison row.
 
 ## Next Benchmark Work
 
@@ -125,4 +147,4 @@ The next release-useful benchmark bundle should record:
 - wall time, TTFT where available, decode estimate where available, and memory
 - pass/fail status
 
-Until that bundle exists, v0.1 should use the committed bounded snapshots above and avoid broader throughput positioning.
+Until broader bundles exist, v0.1 should use the committed bounded snapshots above and avoid broader throughput positioning.
