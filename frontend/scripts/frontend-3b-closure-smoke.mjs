@@ -170,6 +170,16 @@ assert.equal(
   'loaded backend aliases should also accept direct GGUF file_type 7 quant evidence for the exact 3B Q8_0 row',
 )
 assert.equal(
+  resolveLoadedModelDisplayName({ fallbackName: 'scalar_default_rerun', modelPath: exactThreeBModel.model_path, quantLabel: 'general.file_type: 7' }),
+  LLAMA32_3B_ACCEPTANCE_TARGET.name,
+  'loaded backend aliases should accept metadata-shaped GGUF general.file_type: 7 quant evidence for the exact 3B Q8_0 row',
+)
+assert.equal(
+  isCompatibilitySupportedForModel(capabilities, { ...exactThreeBModel, quant: 'general.file_type=7' }),
+  true,
+  '3B exact-row support should accept metadata-shaped GGUF general.file_type=7 quant evidence without weakening the artifact gate',
+)
+assert.equal(
   resolveLoadedModelDisplayName({ fallbackName: 'scalar_default_rerun', modelPath: exactThreeBModel.model_path, quantLabel: 'Q4_K_M' }),
   'scalar_default_rerun',
   'loaded backend aliases must not render as the 3B supported row when quant evidence is not Q8_0',
@@ -272,7 +282,7 @@ assert.match(hookSource, /chatUnlockedModel\s*=\s*nextModels\.find\(\(model\) =>
 assert.doesNotMatch(hookSource, /activeModelRunnable|currentModelRunnable|nextModels\.find\(\(model\) => isRunnableModel\(model\)\)/, 'dashboard selection must not use runtime-only model readiness as chat readiness')
 assert.match(hookSource, /const quantLabel = active \? getLoadedModelQuantLabel\(currentModel\) : record\.quant[\s\S]*const modelPath = active \? getModelPath\(currentModel\) \|\| record\.model_path : record\.model_path[\s\S]*name: resolveLoadedModelDisplayName\(\{ fallbackName: record\.name, modelPath, quantLabel \}\)/, 'dashboard local-record merge must preserve /api/models/current 3B GGUF filename plus decoded Q8_0 file_type evidence before canonical display/gating')
 assert.match(hookSource, /const quantLabel = active \? getLoadedModelQuantLabel\(currentModel\) : null[\s\S]*const modelPath = active \? getModelPath\(currentModel\) \|\| localRecord\?\.model_path \|\| '' : localRecord\?\.model_path \|\| ''[\s\S]*name: resolveLoadedModelDisplayName\(\{ fallbackName, modelPath, quantLabel \}\)/, 'dashboard backend-row merge must preserve exact 3B loaded-model path and quant metadata even when /v1/models exposes a run-label id')
-assert.match(loadedModelDisplaySource, /quantLabelFromGgufFileType[\s\S]*file\[_\\s-\]\*type[\s\S]*LLAMA32_3B_ACCEPTANCE_FILENAME[\s\S]*normalizeQuantLabel\(quantLabel\) === 'Q8_0'/, 'backend 3B display aliasing must stay exact-filename plus decoded Q8_0/file_type 7 gated')
+assert.match(loadedModelDisplaySource, /ggufFileTypeValueFromLabel[\s\S]*quantLabelFromGgufFileType[\s\S]*LLAMA32_3B_ACCEPTANCE_FILENAME[\s\S]*normalizeQuantLabel\(quantLabel\) === 'Q8_0'/, 'backend 3B display aliasing must stay exact-filename plus decoded Q8_0/file_type 7 gated')
 assert.match(hookSource, /resolveLoadedModelDisplayName/, 'dashboard model merge must use the shared exact-filename plus Q8_0 loaded-model display gate')
 assert.match(chatSource, /runnableModels\s*=\s*models\.filter\(\(model\) => getChatGateState\(capabilities, model, runtime\)\.chatUnlocked\)/, 'chat model picker must list only exact-row unlocked models')
 assert.match(chatSource, /canSubmit\s*=\s*Boolean\(composer\.trim\(\)\) && selectedModelRunnable && !generationActive/, 'composer send button must be blocked unless the exact-row chat gate unlocked')

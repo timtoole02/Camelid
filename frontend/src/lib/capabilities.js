@@ -46,6 +46,10 @@ export function quantLabelFromGgufFileType(fileType) {
   return GGUF_FILE_TYPE_QUANT_LABELS[value] || null
 }
 
+export function ggufFileTypeValueFromLabel(value) {
+  return String(value || '').match(/\b(?:general[._\s-]*)?file[_\s-]*type\s*[:=]?\s*(\d+)\b/i)?.[1] || null
+}
+
 function normalizeCapabilityKey(value) {
   return (value || '').toString().trim().toUpperCase().replace(/[^A-Z0-9]+/g, '')
 }
@@ -56,7 +60,7 @@ function splitCapabilityKeys(value) {
 
 function extractQuantKey(model, catalogItem, subject) {
   const explicitLabel = model?.quant || catalogItem?.quant
-  const explicitFileType = explicitLabel?.toString().match(/\bfile[_\s-]*type\s*(\d+)\b/i)?.[1]
+  const explicitFileType = ggufFileTypeValueFromLabel(explicitLabel)
   const explicit = normalizeCapabilityKey(explicitFileType ? quantLabelFromGgufFileType(explicitFileType) : explicitLabel)
   if (explicit) return explicit
 

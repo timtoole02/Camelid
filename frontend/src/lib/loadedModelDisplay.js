@@ -1,5 +1,5 @@
 import { LLAMA32_3B_ACCEPTANCE_TARGET } from './acceptanceTargets.js'
-import { quantLabelFromGgufFileType } from './capabilities.js'
+import { ggufFileTypeValueFromLabel, quantLabelFromGgufFileType } from './capabilities.js'
 
 function pathBasename(value) {
   return String(value || '').split(/[\\/]/).filter(Boolean).pop() || ''
@@ -7,7 +7,7 @@ function pathBasename(value) {
 
 function normalizeQuantLabel(value) {
   const text = String(value || '').trim()
-  const fileType = text.match(/\bfile[_\s-]*type\s*(\d+)\b/i)?.[1]
+  const fileType = ggufFileTypeValueFromLabel(text)
   return String(fileType ? quantLabelFromGgufFileType(fileType) : text).trim().toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_+|_+$/g, '')
 }
 
