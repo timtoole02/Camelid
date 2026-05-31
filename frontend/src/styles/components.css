@@ -8135,7 +8135,7 @@ textarea.composer-input-assistant {
   box-shadow: var(--shadow-2), 0 0 0 1px var(--color-ready) inset !important;
 }
 
-/* Premium Gemini-style Hero Banner */
+/* Premium Camelid-style hero banner */
 .models-overview-hero {
   position: relative;
   overflow: hidden;
@@ -8206,7 +8206,7 @@ select:focus {
   box-shadow: var(--shadow-focus) !important;
 }
 
-/* Clean Gemini Pill-style Buttons */
+/* Clean Camelid pill-style buttons */
 .primary-button {
   background: var(--color-accent) !important;
   color: var(--color-accent-ink) !important;
@@ -8306,7 +8306,7 @@ select:focus {
 }
 
 /* ==========================================================================
-   Gemini-Inspired Clean Landing View Styling
+   Camelid clean landing view styling
    ========================================================================== */
 
 .chat-empty-clean-view {
@@ -8600,7 +8600,7 @@ select:focus {
 
 
 /* ==========================================================================
-   Gemini-Inspired Clean Landing View Styling (100% Safe CSS Overrides)
+   Camelid clean landing view styling (100% Safe CSS Overrides)
    ========================================================================== */
 
 /* 1. Hide TopBar and brand row when ChatWorkspace is empty */
@@ -8898,7 +8898,7 @@ select:focus {
 }
 
 /* ==========================================================================
-   Google Gemini Premium Redesign Styles
+   Camelid premium redesign styles
    ========================================================================== */
 
 /* Animated Sparkle Icon */
@@ -9556,6 +9556,5 @@ select:focus {
   transition: width 0.35s cubic-bezier(0.4, 0, 0.2, 1) !important;
   box-shadow: 0 0 8px rgba(96, 165, 250, 0.5) !important;
 }
-
 
 

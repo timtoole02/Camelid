@@ -1,7 +1,7 @@
 import { memo, useEffect, useMemo, useState } from 'react'
 import { clampText, formatPreview, formatSidebarDate } from '../lib/formatters'
 
-const GeminiSparkle = ({ className = '', size = 18 }) => (
+const CamelidSparkle = ({ className = '', size = 18 }) => (
   <svg
     className={`gemini-sparkle-icon ${className}`}
     width={size}
@@ -250,7 +250,7 @@ function AppSidebar({
                   aria-label="Go to the front page"
                   title="Go to the front page"
                 >
-                  <strong className="sidebar-brand-with-sparkle"><GeminiSparkle size={18} className="sidebar-brand-sparkle-icon" /> Camelid</strong>
+                  <strong className="sidebar-brand-with-sparkle"><CamelidSparkle size={18} className="sidebar-brand-sparkle-icon" /> Camelid</strong>
                 </button>
                 <div className="sidebar-utility-actions">
                   <button type="button" className="sidebar-utility-button" aria-label="Start a new chat" onClick={showNewChatLanding}>

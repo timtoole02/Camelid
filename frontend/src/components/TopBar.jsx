@@ -4,7 +4,7 @@ import { compatibilityHintLabel, formatCapabilityStatus, frontendSupportContract
 import { getChatGateState } from '../lib/chatGate'
 import { describeModelState, getModelStatusLabel, modelRuntimeIdMatches } from '../lib/modelState'
 
-const GeminiSparkle = ({ className = '', size = 20 }) => (
+const CamelidSparkle = ({ className = '', size = 20 }) => (
   <svg
     className={`gemini-sparkle-icon ${className}`}
     width={size}
@@ -120,7 +120,7 @@ function TopBar({ tab, setTab, selectedConversationTitle, selectedConversationUp
         <div className="topbar-chat-row">
           <div className="topbar-chat-brand topbar-chat-brand-stack topbar-chat-brand-elevated">
             <span className="topbar-chat-brand-kicker">Camelid chat</span>
-            <strong className="topbar-brand-with-sparkle"><GeminiSparkle size={18} className="topbar-brand-sparkle-icon" /> Camelid</strong>
+            <strong className="topbar-brand-with-sparkle"><CamelidSparkle size={18} className="topbar-brand-sparkle-icon" /> Camelid</strong>
             <span>{chatSupportLabel}</span>
           </div>
           <div className="topbar-chat-center topbar-chat-center-stack topbar-chat-center-elevated" title={hasCustomConversationTitle ? rawConversationTitle : untitledConversationLabel}>
@@ -190,7 +190,7 @@ function TopBar({ tab, setTab, selectedConversationTitle, selectedConversationUp
   return (
     <header className={`topbar topbar-page ${demoMode ? 'topbar-demo' : ''}`}>
       <div className="topbar-page-row">
-        <div className="topbar-chat-brand topbar-brand-with-sparkle"><GeminiSparkle size={18} className="topbar-brand-sparkle-icon" /> Camelid</div>
+        <div className="topbar-chat-brand topbar-brand-with-sparkle"><CamelidSparkle size={18} className="topbar-brand-sparkle-icon" /> Camelid</div>
         <div className="topbar-chat-center topbar-page-center" title={heading}>{heading}</div>
         <div className="topbar-chat-actions">
           {demoMode ? (
