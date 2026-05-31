@@ -661,7 +661,7 @@ try {
     setTab: noop,
   }))
 
-  assert.match(liveBackendIdChatMarkup, /How can I help\?/, 'ready 3B live-backend-id chat should render the sendable empty-state hero')
+  assert.match(liveBackendIdChatMarkup, /Ready for local chat/, 'ready 3B live-backend-id chat should render the sendable empty-state hero')
   assert.match(liveBackendIdChatMarkup, /Local chat ready/, 'ready 3B live-backend-id chat should show runtime-green chat UX')
   assert.match(liveBackendIdChatMarkup, /Llama 3\.2 3B Instruct Q8_0 is loaded now and generation_ready=true\./, 'ready 3B live-backend-id chat should display the exact 3B row name instead of the backend-generated runtime id')
   assert.match(liveBackendIdChatMarkup, /llama32_3b_instruct_q8_0: supported current gate/, 'ready 3B live-backend-id chat should show exact-row support in the composer surface')

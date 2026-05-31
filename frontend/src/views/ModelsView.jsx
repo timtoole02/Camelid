@@ -693,8 +693,13 @@ export default function ModelsView({
                 <p className="model-summary">{LLAMA32_3B_ACCEPTANCE_GATING_NOTE}</p>
               </div>
 
-              <CapabilityEvidenceBlock capabilities={capabilities} model={LLAMA32_3B_ACCEPTANCE_TARGET} />
-              <ReadinessGrid model={LLAMA32_3B_ACCEPTANCE_TARGET} runtime={runtime} includePath />
+              <details className="models-advanced-specs-toggle">
+                <summary className="models-advanced-specs-summary">Technical Specifications & Evidence</summary>
+                <div className="models-advanced-specs-content">
+                  <CapabilityEvidenceBlock capabilities={capabilities} model={LLAMA32_3B_ACCEPTANCE_TARGET} />
+                  <ReadinessGrid model={LLAMA32_3B_ACCEPTANCE_TARGET} runtime={runtime} includePath />
+                </div>
+              </details>
               <p className="model-summary">Do not infer readiness from the 1B row, the 8B row, or any neighboring quant; this exact 3B row still needs runtime-green loaded_now=true + generation_ready=true before chat unlocks.</p>
 
               <div className="models-card-actions">
@@ -902,9 +907,13 @@ export default function ModelsView({
                     <p className="model-summary">{formatModelOrigin(model)}</p>
                   </div>
 
-                  {!external && <CapabilityEvidenceBlock capabilities={capabilities} model={model} />}
-
-                  {!external && <ReadinessGrid model={model} runtime={runtime} includePath />}
+                  <details className="models-advanced-specs-toggle">
+                    <summary className="models-advanced-specs-summary">Technical Specifications & Evidence</summary>
+                    <div className="models-advanced-specs-content">
+                      {!external && <CapabilityEvidenceBlock capabilities={capabilities} model={model} />}
+                      {!external && <ReadinessGrid model={model} runtime={runtime} includePath />}
+                    </div>
+                  </details>
 
                   {errorCopy && <p className="library-error-copy">{errorCopy}</p>}
 
@@ -982,8 +991,6 @@ export default function ModelsView({
                       </div>
                     </dl>
 
-                    <CapabilityEvidenceBlock capabilities={capabilities} model={localMatch} catalogItem={item} />
-
                     {localMatch && (localMatch.status === 'downloading' || localMatch.status === 'canceling' || localMatch.progress) && (
                       <div className="progress-wrap" style={{ marginBlock: '12px' }}>
                         <div className="progress-bar"><div style={{ width: `${localMatch.progress || 0}%` }} /></div>
@@ -993,7 +1000,13 @@ export default function ModelsView({
                       </div>
                     )}
 
-                    {localMatch && <ReadinessGrid model={localMatch} runtime={runtime} />}
+                    <details className="models-advanced-specs-toggle">
+                      <summary className="models-advanced-specs-summary">Technical Specifications & Evidence</summary>
+                      <div className="models-advanced-specs-content">
+                        <CapabilityEvidenceBlock capabilities={capabilities} model={localMatch} catalogItem={item} />
+                        {localMatch && <ReadinessGrid model={localMatch} runtime={runtime} />}
+                      </div>
+                    </details>
 
                     {errorCopy && <p className="library-error-copy">{errorCopy}</p>}
 
@@ -1164,8 +1177,6 @@ export default function ModelsView({
                     <p className="model-summary">{formatModelOrigin(model)}</p>
                   </div>
 
-                  {!external && <CapabilityEvidenceBlock capabilities={capabilities} model={model} />}
-
                   {!external && (model.status === 'downloading' || model.status === 'canceling' || model.progress) && (
                     <div className="progress-wrap">
                       <div className="progress-bar"><div style={{ width: `${model.progress || 0}%` }} /></div>
@@ -1173,7 +1184,13 @@ export default function ModelsView({
                     </div>
                   )}
 
-                  {!external && <ReadinessGrid model={model} runtime={runtime} includePath />}
+                  <details className="models-advanced-specs-toggle">
+                    <summary className="models-advanced-specs-summary">Technical Specifications & Evidence</summary>
+                    <div className="models-advanced-specs-content">
+                      {!external && <CapabilityEvidenceBlock capabilities={capabilities} model={model} />}
+                      {!external && <ReadinessGrid model={model} runtime={runtime} includePath />}
+                    </div>
+                  </details>
 
                   {errorCopy && <p className="library-error-copy">{errorCopy}</p>}
 

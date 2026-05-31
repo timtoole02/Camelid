@@ -1,13 +1,21 @@
-use std::{net::{SocketAddr, TcpListener, TcpStream}, path::PathBuf, time::Instant, io::Write, sync::Arc};
+use std::{
+    io::Write,
+    net::{SocketAddr, TcpListener, TcpStream},
+    path::PathBuf,
+    sync::Arc,
+    time::Instant,
+};
 
 use camelid::{
     api,
+    cluster::{
+        recv_activation_packet, recv_token_feedback, send_activation_packet, send_token_feedback,
+    },
     gguf::{read_metadata, GgufTensorType},
+    inference::{LlamaInferenceSession, LlamaLoadedWeights, LlamaSampler},
     metal::detect_metal_device,
     tensor::{CpuTensor, Q8_0TensorBlocks, TensorStore},
-    inference::{LlamaLoadedWeights, LlamaInferenceSession, LlamaSampler},
     tokenizer::Tokenizer,
-    cluster::{send_activation_packet, recv_activation_packet, send_token_feedback, recv_token_feedback},
 };
 use clap::{Parser, Subcommand};
 use rayon::ThreadPoolBuilder;
@@ -270,7 +278,8 @@ async fn main() -> anyhow::Result<()> {
             max_tokens,
             threads,
         } => {
-            run_distribute_master(path, worker_addr, layers, addr, prompt, max_tokens, threads).await?;
+            run_distribute_master(path, worker_addr, layers, addr, prompt, max_tokens, threads)
+                .await?;
         }
     }
     Ok(())
@@ -306,7 +315,10 @@ fn accept_connection(listener: &TcpListener) -> TcpStream {
 fn parse_layers_range(layers_str: &str) -> anyhow::Result<std::ops::Range<usize>> {
     let parts: Vec<&str> = layers_str.split("..").collect();
     if parts.len() != 2 {
-        return Err(anyhow::anyhow!("Invalid layers range format: {}", layers_str));
+        return Err(anyhow::anyhow!(
+            "Invalid layers range format: {}",
+            layers_str
+        ));
     }
     let start = parts[0].parse::<usize>()?;
     let end = parts[1].parse::<usize>()?;
@@ -345,10 +357,8 @@ async fn run_distribute_worker(
 
     let mut downstream_stream = if let Some(faddr) = forward_addr {
         Some(connect_with_retry(faddr))
-    } else if let Some(maddr) = master_addr {
-        Some(connect_with_retry(maddr))
     } else {
-        None
+        master_addr.map(connect_with_retry)
     };
 
     let mut client_stream = accept_connection(&listener);
@@ -376,7 +386,8 @@ async fn run_distribute_worker(
             ));
         }
         let rows = activations.len() / hidden_dim;
-        let hidden = CpuTensor::from_f32("activations", vec![rows, hidden_dim], activations.clone())?;
+        let hidden =
+            CpuTensor::from_f32("activations", vec![rows, hidden_dim], activations.clone())?;
 
         let out_hidden = session.forward_layer_range_from_hidden(
             &hidden,
@@ -391,11 +402,13 @@ async fn run_distribute_worker(
                 let logits = session.forward_final_norm_and_logits(&out_hidden)?;
                 let vocab_size = logits.dim(1)?;
                 let last_row_start = (header.seq_len as usize - 1) * vocab_size;
-                let last_row_data = logits.data[last_row_start..last_row_start + vocab_size].to_vec();
-                let last_row_logits = CpuTensor::from_f32("last_row_logits", vec![1, vocab_size], last_row_data)?;
+                let last_row_data =
+                    logits.data[last_row_start..last_row_start + vocab_size].to_vec();
+                let last_row_logits =
+                    CpuTensor::from_f32("last_row_logits", vec![1, vocab_size], last_row_data)?;
                 let token_id = LlamaSampler::Greedy.sample(&last_row_logits)?;
 
-                let is_finished = tokenizer.as_ref().map_or(false, |tok| {
+                let is_finished = tokenizer.as_ref().is_some_and(|tok| {
                     tok.special.eos == Some(token_id) || tok.special.eot == Some(token_id)
                 });
 
@@ -448,10 +461,18 @@ async fn run_distribute_master(
     let mut pos = 0usize;
     let mut seq_len = token_ids.len();
 
-    let hidden = session.weights.token_embedding.embedding_lookup(&token_ids, "token_embedding_prefill")?;
+    let hidden = session
+        .weights
+        .token_embedding
+        .embedding_lookup(&token_ids, "token_embedding_prefill")?;
     let out_hidden = session.forward_layer_range_from_hidden(&hidden, pos, seq_len)?;
 
-    send_activation_packet(&mut downstream_stream, pos as u32, seq_len as u32, &out_hidden.data)?;
+    send_activation_packet(
+        &mut downstream_stream,
+        pos as u32,
+        seq_len as u32,
+        &out_hidden.data,
+    )?;
 
     let feedback = recv_token_feedback(&mut feedback_stream)?;
     let mut current_token = feedback.token_id;
@@ -465,9 +486,17 @@ async fn run_distribute_master(
 
     let mut generated = 1;
     while !is_finished && generated < max_tokens {
-        let hidden = session.weights.token_embedding.embedding_lookup(&[current_token], "token_embedding")?;
+        let hidden = session
+            .weights
+            .token_embedding
+            .embedding_lookup(&[current_token], "token_embedding")?;
         let out_hidden = session.forward_layer_range_from_hidden(&hidden, pos, seq_len)?;
-        send_activation_packet(&mut downstream_stream, pos as u32, seq_len as u32, &out_hidden.data)?;
+        send_activation_packet(
+            &mut downstream_stream,
+            pos as u32,
+            seq_len as u32,
+            &out_hidden.data,
+        )?;
 
         let feedback = recv_token_feedback(&mut feedback_stream)?;
         current_token = feedback.token_id;

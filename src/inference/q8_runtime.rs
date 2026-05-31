@@ -14,6 +14,7 @@ pub(super) struct Q8RuntimeFlags {
     pub(super) attention_output_packed_rows4_matmul: bool,
     pub(super) attention_qkv_decode_consumer: bool,
     pub(super) attention_qkv_decode_group_chunking: bool,
+    pub(super) attention_qkv_prefill_consumer: bool,
     pub(super) attention_qkv_packed_rows4_matmul: bool,
     pub(super) output_packed_rows4_matmul: bool,
     pub(super) output_amx_prefill: bool,
@@ -86,6 +87,9 @@ impl Q8RuntimeFlags {
             ),
             attention_qkv_decode_group_chunking: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUP_CHUNKING",
+            ),
+            attention_qkv_prefill_consumer: q8_0_env_flag_enabled_default_off(
+                "CAMELID_X86_Q8_ATTENTION_QKV_PREFILL_CONSUMER",
             ),
             attention_qkv_packed_rows4_matmul: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL",

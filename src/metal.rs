@@ -84,7 +84,8 @@ impl MetalLinearCache {
         } else {
             let buffer = &self.scalar_buffers[self.scalar_index];
             if buffer.length() < needed as u64 {
-                self.scalar_buffers[self.scalar_index] = device.new_buffer(needed as u64, MTLResourceOptions::StorageModeShared);
+                self.scalar_buffers[self.scalar_index] =
+                    device.new_buffer(needed as u64, MTLResourceOptions::StorageModeShared);
             }
         }
         let buf = self.scalar_buffers[self.scalar_index].to_owned();
@@ -108,7 +109,12 @@ impl MetalLinearCache {
         self.get_scalar_buffer(device, needed)
     }
 
-    fn q8_input_scales_buffer(&mut self, device: &Device, needed: usize, ptr: *const f32) -> Buffer {
+    fn q8_input_scales_buffer(
+        &mut self,
+        device: &Device,
+        needed: usize,
+        ptr: *const f32,
+    ) -> Buffer {
         self.get_activation_buffer(device, needed, ptr.cast())
     }
 
@@ -120,7 +126,12 @@ impl MetalLinearCache {
         self.get_activation_buffer(device, needed, ptr.cast())
     }
 
-    fn q8_weight_scales_buffer(&mut self, device: &Device, needed: usize, ptr: *const f32) -> Buffer {
+    fn q8_weight_scales_buffer(
+        &mut self,
+        device: &Device,
+        needed: usize,
+        ptr: *const f32,
+    ) -> Buffer {
         self.get_activation_buffer(device, needed, ptr.cast())
     }
 
@@ -371,14 +382,15 @@ pub fn synchronize_active_session() {
         cb.commit();
         cb.wait_until_completed();
     }
-    
+
     let mut cache = metal_linear_cache()
         .lock()
         .expect("metal linear cache poisoned");
     let deferred = std::mem::take(&mut cache.deferred_reads);
     for read in deferred {
         unsafe {
-            let dest_slice = std::slice::from_raw_parts_mut(read.dest_ptr as *mut f32, read.dest_len);
+            let dest_slice =
+                std::slice::from_raw_parts_mut(read.dest_ptr as *mut f32, read.dest_len);
             read_buffer_f32(&read.buffer, dest_slice);
         }
     }
@@ -479,9 +491,17 @@ fn try_linear_row_impl(
     let mut cache = metal_linear_cache()
         .lock()
         .expect("metal linear cache poisoned");
-    let input_buffer = cache.input_buffer(&kernel.device, std::mem::size_of_val(input_row), input_row.as_ptr());
+    let input_buffer = cache.input_buffer(
+        &kernel.device,
+        std::mem::size_of_val(input_row),
+        input_row.as_ptr(),
+    );
     let weight_buffer = cache.weight_buffer(&kernel.device, weights);
-    let output_buffer = cache.output_buffer(&kernel.device, std::mem::size_of_val(output), output.as_mut_ptr());
+    let output_buffer = cache.output_buffer(
+        &kernel.device,
+        std::mem::size_of_val(output),
+        output.as_mut_ptr(),
+    );
     let scalar_buffer = cache.scalar_buffer(&kernel.device, 2 * std::mem::size_of::<u32>());
     write_buffer_f32(&input_buffer, input_row);
     write_buffer_f32(&output_buffer, output);
@@ -570,15 +590,31 @@ pub fn try_q8_0_encoded_linear_row(
     let mut cache = metal_linear_cache()
         .lock()
         .expect("metal linear cache poisoned");
-    let input_scales_buffer =
-        cache.q8_input_scales_buffer(&kernel.device, std::mem::size_of_val(input_scales), input_scales.as_ptr());
-    let input_quants_buffer =
-        cache.q8_input_quants_buffer(&kernel.device, std::mem::size_of_val(input_quants), input_quants.as_ptr());
-    let encoded_rows_buffer =
-        cache.q8_encoded_rows_buffer(&kernel.device, std::mem::size_of_val(encoded_rows), encoded_rows.as_ptr());
-    let weight_scales_buffer =
-        cache.q8_weight_scales_buffer(&kernel.device, std::mem::size_of_val(weight_scales), weight_scales.as_ptr());
-    let output_buffer = cache.output_buffer(&kernel.device, std::mem::size_of_val(output), output.as_mut_ptr());
+    let input_scales_buffer = cache.q8_input_scales_buffer(
+        &kernel.device,
+        std::mem::size_of_val(input_scales),
+        input_scales.as_ptr(),
+    );
+    let input_quants_buffer = cache.q8_input_quants_buffer(
+        &kernel.device,
+        std::mem::size_of_val(input_quants),
+        input_quants.as_ptr(),
+    );
+    let encoded_rows_buffer = cache.q8_encoded_rows_buffer(
+        &kernel.device,
+        std::mem::size_of_val(encoded_rows),
+        encoded_rows.as_ptr(),
+    );
+    let weight_scales_buffer = cache.q8_weight_scales_buffer(
+        &kernel.device,
+        std::mem::size_of_val(weight_scales),
+        weight_scales.as_ptr(),
+    );
+    let output_buffer = cache.output_buffer(
+        &kernel.device,
+        std::mem::size_of_val(output),
+        output.as_mut_ptr(),
+    );
     let scalar_buffer = cache.scalar_buffer(&kernel.device, 2 * std::mem::size_of::<u32>());
     write_buffer_f32(&input_scales_buffer, input_scales);
     write_buffer_i8(&input_quants_buffer, input_quants);
@@ -668,15 +704,31 @@ pub fn try_q8_0_encoded_linear_rows(
     let mut cache = metal_linear_cache()
         .lock()
         .expect("metal linear cache poisoned");
-    let input_scales_buffer =
-        cache.q8_input_scales_buffer(&kernel.device, std::mem::size_of_val(input_scales), input_scales.as_ptr());
-    let input_quants_buffer =
-        cache.q8_input_quants_buffer(&kernel.device, std::mem::size_of_val(input_quants), input_quants.as_ptr());
-    let encoded_rows_buffer =
-        cache.q8_encoded_rows_buffer(&kernel.device, std::mem::size_of_val(encoded_rows), encoded_rows.as_ptr());
-    let weight_scales_buffer =
-        cache.q8_weight_scales_buffer(&kernel.device, std::mem::size_of_val(weight_scales), weight_scales.as_ptr());
-    let output_buffer = cache.output_buffer(&kernel.device, std::mem::size_of_val(output), output.as_mut_ptr());
+    let input_scales_buffer = cache.q8_input_scales_buffer(
+        &kernel.device,
+        std::mem::size_of_val(input_scales),
+        input_scales.as_ptr(),
+    );
+    let input_quants_buffer = cache.q8_input_quants_buffer(
+        &kernel.device,
+        std::mem::size_of_val(input_quants),
+        input_quants.as_ptr(),
+    );
+    let encoded_rows_buffer = cache.q8_encoded_rows_buffer(
+        &kernel.device,
+        std::mem::size_of_val(encoded_rows),
+        encoded_rows.as_ptr(),
+    );
+    let weight_scales_buffer = cache.q8_weight_scales_buffer(
+        &kernel.device,
+        std::mem::size_of_val(weight_scales),
+        weight_scales.as_ptr(),
+    );
+    let output_buffer = cache.output_buffer(
+        &kernel.device,
+        std::mem::size_of_val(output),
+        output.as_mut_ptr(),
+    );
     let scalar_buffer = cache.scalar_buffer(&kernel.device, 3 * std::mem::size_of::<u32>());
     write_buffer_f32(&input_scales_buffer, input_scales);
     write_buffer_i8(&input_quants_buffer, input_quants);
@@ -768,12 +820,22 @@ pub fn try_q8_0_block_linear_row(
     let mut cache = metal_linear_cache()
         .lock()
         .expect("metal linear cache poisoned");
-    let input_scales_buffer =
-        cache.q8_input_scales_buffer(&kernel.device, std::mem::size_of_val(input_scales), input_scales.as_ptr());
-    let input_quants_buffer =
-        cache.q8_input_quants_buffer(&kernel.device, std::mem::size_of_val(input_quants), input_quants.as_ptr());
+    let input_scales_buffer = cache.q8_input_scales_buffer(
+        &kernel.device,
+        std::mem::size_of_val(input_scales),
+        input_scales.as_ptr(),
+    );
+    let input_quants_buffer = cache.q8_input_quants_buffer(
+        &kernel.device,
+        std::mem::size_of_val(input_quants),
+        input_quants.as_ptr(),
+    );
     let weight_blocks_buffer = cache.q8_block_weight_buffer(&kernel.device, weight_blocks);
-    let output_buffer = cache.output_buffer(&kernel.device, std::mem::size_of_val(output), output.as_mut_ptr());
+    let output_buffer = cache.output_buffer(
+        &kernel.device,
+        std::mem::size_of_val(output),
+        output.as_mut_ptr(),
+    );
     let scalar_buffer = cache.scalar_buffer(&kernel.device, 2 * std::mem::size_of::<u32>());
     write_buffer_f32(&input_scales_buffer, input_scales);
     write_buffer_i8(&input_quants_buffer, input_quants);
@@ -856,12 +918,22 @@ where
     let mut cache = metal_linear_cache()
         .lock()
         .expect("metal linear cache poisoned");
-    let input_scales_buffer =
-        cache.q8_input_scales_buffer(&kernel.device, std::mem::size_of_val(input_scales), input_scales.as_ptr());
-    let input_quants_buffer =
-        cache.q8_input_quants_buffer(&kernel.device, std::mem::size_of_val(input_quants), input_quants.as_ptr());
+    let input_scales_buffer = cache.q8_input_scales_buffer(
+        &kernel.device,
+        std::mem::size_of_val(input_scales),
+        input_scales.as_ptr(),
+    );
+    let input_quants_buffer = cache.q8_input_quants_buffer(
+        &kernel.device,
+        std::mem::size_of_val(input_quants),
+        input_quants.as_ptr(),
+    );
     let weight_blocks_buffer = cache.q8_block_weight_buffer(&kernel.device, weight_blocks);
-    let output_buffer = cache.output_buffer(&kernel.device, std::mem::size_of_val(output), output.as_mut_ptr());
+    let output_buffer = cache.output_buffer(
+        &kernel.device,
+        std::mem::size_of_val(output),
+        output.as_mut_ptr(),
+    );
     let scalar_buffer = cache.scalar_buffer(&kernel.device, 2 * std::mem::size_of::<u32>());
     write_buffer_f32(&input_scales_buffer, input_scales);
     write_buffer_i8(&input_quants_buffer, input_quants);
@@ -951,18 +1023,30 @@ where
     let mut cache = metal_linear_cache()
         .lock()
         .expect("metal linear cache poisoned");
-    let input_scales_buffer =
-        cache.q8_input_scales_buffer(&kernel.device, std::mem::size_of_val(input_scales), input_scales.as_ptr());
-    let input_quants_buffer =
-        cache.q8_input_quants_buffer(&kernel.device, std::mem::size_of_val(input_quants), input_quants.as_ptr());
+    let input_scales_buffer = cache.q8_input_scales_buffer(
+        &kernel.device,
+        std::mem::size_of_val(input_scales),
+        input_scales.as_ptr(),
+    );
+    let input_quants_buffer = cache.q8_input_quants_buffer(
+        &kernel.device,
+        std::mem::size_of_val(input_quants),
+        input_quants.as_ptr(),
+    );
     let first_weight_blocks_buffer =
         cache.q8_block_weight_buffer(&kernel.device, first_weight_blocks);
     let second_weight_blocks_buffer =
         cache.q8_block_weight_buffer(&kernel.device, second_weight_blocks);
-    let first_output_buffer =
-        cache.output_buffer(&kernel.device, std::mem::size_of_val(first_output), first_output.as_mut_ptr());
-    let second_output_buffer =
-        cache.aux_output_buffer(&kernel.device, std::mem::size_of_val(second_output), second_output.as_mut_ptr());
+    let first_output_buffer = cache.output_buffer(
+        &kernel.device,
+        std::mem::size_of_val(first_output),
+        first_output.as_mut_ptr(),
+    );
+    let second_output_buffer = cache.aux_output_buffer(
+        &kernel.device,
+        std::mem::size_of_val(second_output),
+        second_output.as_mut_ptr(),
+    );
     let scalar_buffer = cache.scalar_buffer(&kernel.device, 2 * std::mem::size_of::<u32>());
     write_buffer_f32(&input_scales_buffer, input_scales);
     write_buffer_i8(&input_quants_buffer, input_quants);

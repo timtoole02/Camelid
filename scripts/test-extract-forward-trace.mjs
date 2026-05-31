@@ -29,14 +29,16 @@ try {
   assert.match(stdout, /selected_layers=0,1/)
   assert.match(stdout, /first_stage=embedding/)
   assert.match(stdout, /last_stage=logits/)
-  assert.match(stdout, /stage_count=43/)
+  assert.match(stdout, /stage_count=44/)
 
   const trace = JSON.parse(await readFile(outputPath, 'utf8'))
   assert.equal(trace.schema, 'camelid.forward-trace.v1')
   assert.deepEqual(trace.selected_layers, [0, 1])
-  assert.equal(trace.stage_count, 43)
+  assert.equal(trace.stage_count, 44)
   assert.deepEqual(trace.prompt_token_ids, [1, 529, 29989])
   assert.deepEqual(trace.generated_token_ids, [16301])
+  assert.deepEqual(trace.input_token_ids, [16301])
+  assert.deepEqual(trace.position_ids, [17])
   assert.deepEqual(trace.source.known_good_token_ids, [29907])
   assert.deepEqual(trace.source.known_good_token_ids_from_text, [315])
   assert.deepEqual(trace.source.known_good_top_logprobs, [
@@ -61,8 +63,9 @@ try {
     'layers.0.attention_k_rope',
   ])
   assert.deepEqual(paths.slice(-4), ['final_hidden', 'final_norm', 'output_norm', 'logits'])
-  assert.equal(paths.indexOf('layers.1.attention_input'), 20)
+  assert.equal(paths.indexOf('layers.1.attention_input'), 21)
   assert.ok(paths.indexOf('layers.0.ffn_gate') < paths.indexOf('layers.0.ffn_activation'))
+  assert.ok(paths.indexOf('layers.0.moe_router') < paths.indexOf('layers.0.ffn_gate'))
   assert.ok(paths.indexOf('layers.0.attention_q_rope') < paths.indexOf('layers.0.kv_cache_trace'))
   assert.ok(paths.indexOf('layers.0.kv_cache_trace') < paths.indexOf('layers.0.attention_trace'))
   assert.ok(paths.indexOf('layers.0.attention_trace') < paths.indexOf('layers.0.attention_context'))
@@ -95,6 +98,14 @@ try {
   const residualStage = trace.stages.find(stage => stage.path === 'layers.0.ffn_residual')
   assert.equal(residualStage.residual_delta.delta_to_input_rms_ratio, 0.25)
   assert.equal(residualStage.residual_delta.delta_input_cosine_similarity, -0.1)
+
+  const moeStage = trace.stages.find(stage => stage.path === 'layers.0.moe_router')
+  assert.equal(moeStage.kind, 'moe_router')
+  assert.equal(moeStage.moe_router.expert_count, 4)
+  assert.equal(moeStage.moe_router.expert_used_count, 2)
+  assert.deepEqual(moeStage.moe_router.rows[0].router_logits, [0.1, 0.2, 0.3, 0.4])
+  assert.deepEqual(moeStage.moe_router.rows[0].selected_experts.map(expert => expert.expert_id), [3, 2])
+  assert.equal(moeStage.moe_router.rows[0].selected_experts[0].selected_weight, 0.55)
 
   const finalNorm = trace.stages.find(stage => stage.path === 'final_norm')
   assert.equal(finalNorm.kind, 'reconstruction')
@@ -166,6 +177,8 @@ function capture() {
         outputProjectionRow({ tokenId: 315, maxIndex: 945, positiveComponent: 0.35, negativeComponent: -0.37 }),
       ],
       dense: {
+        input_token_ids: [16301],
+        position_ids: [17],
         embedding: stats([0.25, -0.5]),
         layers: [layer(0), layer(1)],
         final_hidden: stats([0.9, -0.7]),
@@ -206,6 +219,7 @@ function layer(layerIndex) {
     attention_residual: stats([0.32 + layerIndex, -0.58]),
     ffn_norm: stats([0.32 + layerIndex, -0.58]),
     ffn_norm_reconstruction: reconstruction({ epsilon: 0.00001, scale: 1.25 }),
+    moe_router: layerIndex === 0 ? moeRouter() : undefined,
     ffn_gate: stats([0.7 + layerIndex, -0.8]),
     ffn_gate_reconstruction: reconstruction({ layout: 'descriptor', role: 'ffn_gate' }),
     ffn_up: stats([0.9 + layerIndex, -1]),
@@ -352,6 +366,35 @@ function kvCacheTrace(layerIndex) {
         value_max_abs: 0.6,
         key_first_values: [0.3 + layerIndex, -0.4],
         value_first_values: [0.5, -0.6],
+      },
+    ],
+  }
+}
+
+function moeRouter() {
+  return {
+    expert_count: 4,
+    expert_used_count: 2,
+    rows: [
+      {
+        row_index: 0,
+        router_logits: [0.1, 0.2, 0.3, 0.4],
+        selected_experts: [
+          {
+            expert_id: 3,
+            selected_rank: 1,
+            router_logit: 0.4,
+            router_probability: 0.29,
+            selected_weight: 0.55,
+          },
+          {
+            expert_id: 2,
+            selected_rank: 2,
+            router_logit: 0.3,
+            router_probability: 0.26,
+            selected_weight: 0.45,
+          },
+        ],
       },
     ],
   }

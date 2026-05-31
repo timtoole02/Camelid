@@ -265,6 +265,7 @@ function buildPlan() {
         'llama_cpp_ms_tok=<same metric for llama.cpp>',
         'camelid_backend_generate_ms=<mean Camelid backend generate timing when CAMELID_STREAM_TIMING_DIAGNOSTICS=on>',
         'camelid_backend_first_content_ms=<mean Camelid backend first-content timing when CAMELID_STREAM_TIMING_DIAGNOSTICS=on>',
+        'camelid_backend_q8_calls=<mean Q8 route calls when CAMELID_STREAM_TIMING_DIAGNOSTICS=on and CAMELID_Q8_SCHED_TELEMETRY=on>',
         'json_out=<absolute path when --out is set>',
       ],
       json: 'Full machine-readable report at --out, schema camelid.same_host_llama3_benchmark.v1.',
@@ -285,7 +286,7 @@ function boundedMetrics() {
     'decode_tok_per_s and ms_per_token_after_first: derived from completion_tokens_estimate after first content',
     'marker_presence: exact expected marker observed in measured output text, optionally enforced with --require-marker',
     'camelid_backend_generate_ms and camelid_backend_first_content_ms: opt-in backend timings when CAMELID_STREAM_TIMING_DIAGNOSTICS=on',
-    'camelid_backend_q8_calls and q8 timing counters: opt-in Q8 scheduler diagnostics when Camelid Q8 scheduler telemetry is also enabled; call count includes single-projection, fused gate/up, FFN-down decode, and route-table counters',
+    'camelid_backend_q8_calls, top projection routes, top route denials, and q8 timing counters: opt-in Q8 scheduler diagnostics when Camelid Q8 scheduler telemetry is also enabled; call count includes single-projection, fused gate/up, FFN-down decode, and route-table counters',
     'resource_snapshots: host memory/load/storage snapshots before start, before measured runs, and after measured runs',
     'server_lifecycle: Camelid/llama-server startup timing, model-load timing, reuse/preloaded status, and warmup behavior',
   ]
@@ -471,6 +472,8 @@ async function consumeSseResponse({ response, started, label }) {
     backend_q8_gemm_compute_us: round(Number(backendTiming?.q8_schedule?.q8_gemm_compute_us)),
     backend_q8_pack_us: round(Number(backendTiming?.q8_schedule?.activation_quantize_pack_us)),
     backend_q8_calls: q8ScheduleCallCount(backendTiming?.q8_schedule),
+    backend_q8_top_projection_routes: q8ScheduleTopBuckets(backendTiming?.q8_schedule?.output_projection_by_route, 'elapsed_us', 5),
+    backend_q8_top_projection_route_denials: q8ScheduleTopBuckets(backendTiming?.q8_schedule?.projection_route_denials, 'denials', 5),
     decode_tok_per_s: decodeWindowMs && completionTokens > 0 ? round((completionTokens / decodeWindowMs) * 1000) : null,
     ms_per_token_after_first: decodeWindowMs && completionTokens > 0 ? round(decodeWindowMs / completionTokens) : null,
   }
@@ -731,6 +734,26 @@ function q8ScheduleCallCount(q8Schedule) {
   }
   const total = Math.max(directTotal, routeTotal)
   return total > 0 ? round(total) : null
+}
+
+function q8ScheduleTopBuckets(buckets, valueField, limit) {
+  if (!buckets || typeof buckets !== 'object') return []
+  return Object.entries(buckets)
+    .map(([key, bucket]) => {
+      const value = Number(bucket?.[valueField])
+      const calls = Number(bucket?.calls ?? bucket?.denials)
+      return {
+        key,
+        role: bucket?.role ?? null,
+        route: bucket?.route ?? null,
+        reason: bucket?.reason ?? null,
+        [valueField]: Number.isFinite(value) ? round(value) : null,
+        calls: Number.isFinite(calls) ? round(calls) : null,
+      }
+    })
+    .filter((bucket) => Number.isFinite(bucket[valueField]) && bucket[valueField] > 0)
+    .sort((left, right) => right[valueField] - left[valueField])
+    .slice(0, limit)
 }
 
 function round(value) {

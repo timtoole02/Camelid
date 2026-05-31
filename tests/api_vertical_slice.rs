@@ -3,7 +3,28 @@ use axum::{
     http::{Request, StatusCode},
 };
 use serde_json::{json, Value};
+use std::time::Duration;
 use tower::ServiceExt;
+
+async fn post_json(uri: &str, body: &'static str) -> (StatusCode, Value) {
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    (status, body)
+}
 
 #[tokio::test]
 async fn health_reports_not_generation_ready() {
@@ -80,7 +101,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(
         body["support_contract"]["current_gate"],
-        "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048 packs; Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist; and Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke with checked bounded 512/1024/2048/4096/8192 packs. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied."
+        "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048 packs; and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral-7B-Instruct-v0.3.Q8_0.gguf has tokenizer/template, 1-token, broader 50-token, bounded 512/1024/2048, checked 4096/8192 context, and fail-closed API/WebUI/RSS evidence, but remains active_validation_unsupported until the support contract is explicitly promoted. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied."
     );
     let q8 = body["supported_quantization"]
         .as_array()
@@ -136,16 +157,16 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     assert!(llama_bpe_notes.contains("Broader 50-token"));
     assert!(!llama_bpe_notes.contains("conditional"));
     assert!(!llama_bpe_notes.contains("gated"));
-    assert!(body["supported_model_families"]
+    assert!(body["planned_model_families"]
         .as_array()
         .unwrap()
         .iter()
         .any(|item| item["id"] == "mistral"
-            && item["status"] == "supported_exact_row_smoke"
+            && item["status"] == "active_validation_unsupported"
             && item["notes"]
                 .as_str()
                 .unwrap()
-                .contains("supported for Mistral-7B-Instruct-v0.3.Q8_0.gguf only")));
+                .contains("in active validation for Mistral-7B-Instruct-v0.3.Q8_0.gguf only; not supported yet")));
     assert!(body["planned_model_families"]
         .as_array()
         .unwrap()
@@ -429,17 +450,17 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         .iter()
         .find(|item| item["id"] == "mistral_7b_instruct_v0_3_q8_0")
         .unwrap();
-    assert_eq!(mistral["status"], "supported_exact_row_smoke");
+    assert_eq!(mistral["status"], "active_validation_unsupported");
     assert_eq!(mistral["metadata_parses"], "validated");
     assert_eq!(mistral["tokenizer_works"], "validated");
     assert_eq!(mistral["tensors_load"], "validated");
     assert_eq!(
         mistral["generation_runs"],
-        "api_completion_and_chat_smoke_plus_broader_50_token_api_smoke"
+        "runtime_generation_ready_but_fail_closed_by_support_contract"
     );
     assert_eq!(
         mistral["frontend_load_path_verified"],
-        "validated"
+        "validated_fail_closed"
     );
     assert_eq!(
         mistral["tested_context"],
@@ -466,22 +487,16 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         mistral["latest_checked_bucket"],
         "current_head_api_webui_rss_fail_closed"
     );
-    assert_eq!(
-        mistral["latest_checked_result"],
-        "pass"
-    );
-    assert_eq!(
-        mistral["bounded_context_8192_pack"],
-        "validated_fifth_pack"
-    );
+    assert_eq!(mistral["latest_checked_result"], "pass");
+    assert_eq!(mistral["bounded_context_8192_pack"], "validated_fifth_pack");
     assert_eq!(
         mistral["bounded_context_8192_pack_id"],
         "mistral-context-8192-max-ladder-v1"
     );
     let mistral_evidence = mistral["evidence"].as_str().unwrap();
-    assert!(mistral_evidence.contains("exact Mistral-7B-Instruct-v0.3.Q8_0.gguf GGUF has exact-row load"));
+    assert!(mistral_evidence.contains("compatibility_status=active_validation_unsupported"));
     let mistral_next_step = mistral["next_step"].as_str().unwrap();
-    assert!(mistral_next_step.contains("preserve exact-row smoke plus checked 512/1024/2048/4096/8192 context support"));
+    assert!(mistral_next_step.contains("explicit support-contract promotion evidence"));
     let mixtral = compatibility
         .iter()
         .find(|item| item["id"] == "mixtral_8x7b_instruct_v0_1_q8_0")
@@ -1081,6 +1096,92 @@ async fn chat_completion_rejects_top_logprobs_without_logprobs_before_runtime() 
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["error"]["code"], "unsupported_parameter");
     assert_eq!(body["error"]["param"], "top_logprobs");
+}
+
+#[tokio::test]
+async fn chat_completion_rejects_tool_fields_before_runtime() {
+    let (status, body) = post_json(
+        "/v1/chat/completions",
+        r#"{"model":"tiny","messages":[{"role":"user","content":"hello"}],"max_tokens":1,"tools":[{"type":"function","function":{"name":"lookup"}}]}"#,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert_eq!(body["error"]["param"], "tools");
+}
+
+#[tokio::test]
+async fn chat_completion_rejects_response_format_before_runtime() {
+    let (status, body) = post_json(
+        "/v1/chat/completions",
+        r#"{"model":"tiny","messages":[{"role":"user","content":"hello"}],"max_tokens":1,"response_format":{"type":"json_object"}}"#,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert_eq!(body["error"]["param"], "response_format");
+}
+
+#[tokio::test]
+async fn completion_rejects_llama_server_sampler_fields_before_runtime() {
+    let (status, body) = post_json(
+        "/v1/completions",
+        r#"{"model":"tiny","prompt":"hello","max_tokens":1,"mirostat":2}"#,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert_eq!(body["error"]["param"], "mirostat");
+}
+
+#[tokio::test]
+async fn completion_rejects_unknown_fields_before_runtime() {
+    let (status, body) = post_json(
+        "/v1/completions",
+        r#"{"model":"tiny","prompt":"hello","max_tokens":1,"llama_server_only":true}"#,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "malformed_json");
+}
+
+#[tokio::test]
+async fn chat_completion_rejects_multimodal_content_parts_before_runtime() {
+    let (status, body) = post_json(
+        "/v1/chat/completions",
+        r#"{"model":"tiny","messages":[{"role":"user","content":[{"type":"text","text":"hello"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}],"max_tokens":1}"#,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert_eq!(body["error"]["param"], "messages[].content");
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("multimodal chat content parts are not supported"));
+}
+
+#[tokio::test]
+async fn completion_rejects_public_prompt_array_variants_before_runtime() {
+    for body in [
+        r#"{"model":"tiny","prompt":["hello","there"],"max_tokens":1}"#,
+        r#"{"model":"tiny","prompt":[1,2,3],"max_tokens":1}"#,
+        r#"{"model":"tiny","prompt":[[1,2],[3,4]],"max_tokens":1}"#,
+    ] {
+        let (status, body) = post_json("/v1/completions", body).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "unsupported_parameter");
+        assert_eq!(body["error"]["param"], "prompt");
+        assert!(body["error"]["message"].as_str().unwrap().contains(
+            "prompt array, batched prompt, and token-id prompt variants are not supported"
+        ));
+    }
 }
 
 #[tokio::test]
@@ -2329,6 +2430,61 @@ async fn chat_completion_streams_openai_compatible_sse_chunks() {
     assert!(body.contains("\"delta\":{\"content\":\"<unk>\"}"));
     assert!(body.contains("\"finish_reason\":\"length\""));
     assert!(body.contains("data: [DONE]"));
+}
+
+#[tokio::test]
+async fn chat_completion_stream_timeout_returns_error_event_and_done() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tiny-generation.gguf");
+    write_generation_gguf(&path);
+
+    let app = camelid::api::router_with_generation_timeout_override(Duration::from_millis(1));
+    let load_body = serde_json::json!({"path": path, "id": "tiny-generation-timeout"});
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/models/load")
+                .header("content-type", "application/json")
+                .body(Body::from(load_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"tiny-generation-timeout","messages":[{"role":"user","content":"hello"}],"max_tokens":16,"stream":true}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body_bytes.to_vec()).unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("event: error"), "{body}");
+    assert!(body.contains("\"code\":\"generation_timeout\""), "{body}");
+    assert!(body.contains("\"timeout_trace\""), "{body}");
+    assert!(body.contains("\"timeout_ms\":1"), "{body}");
+    assert!(body.contains("\"elapsed_ms\":"), "{body}");
+    assert!(body.contains("\"generated_tokens\":"), "{body}");
+    assert!(
+        body.contains("\"timeout_env\":\"CAMELID_GENERATION_TIMEOUT_MS\""),
+        "{body}"
+    );
+    let error_offset = body.find("event: error").expect("error event in {body}");
+    let done_offset = body.find("data: [DONE]").expect("done event in {body}");
+    assert!(error_offset < done_offset, "{body}");
 }
 
 #[tokio::test]

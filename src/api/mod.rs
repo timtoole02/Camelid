@@ -71,6 +71,7 @@ pub struct AppState {
     generation_sessions: Arc<RwLock<HashMap<String, GenerationSessionSummary>>>,
     planner_env: PlannerEnv,
     configured_threads: Option<usize>,
+    generation_timeout_override: Option<Duration>,
 }
 
 impl Default for AppState {
@@ -85,6 +86,7 @@ impl Default for AppState {
             generation_sessions: Arc::new(RwLock::new(HashMap::new())),
             planner_env: PlannerEnv::capture(),
             configured_threads: None,
+            generation_timeout_override: None,
         }
     }
 }
@@ -93,6 +95,13 @@ impl AppState {
     pub fn with_configured_threads(configured_threads: Option<usize>) -> Self {
         Self {
             configured_threads,
+            ..Self::default()
+        }
+    }
+
+    pub fn with_generation_timeout_override(timeout: Duration) -> Self {
+        Self {
+            generation_timeout_override: Some(timeout),
             ..Self::default()
         }
     }
@@ -294,6 +303,7 @@ pub struct ModelListItem {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChatCompletionRequest {
     pub model: Option<String>,
     pub messages: Option<Vec<ChatMessage>>,
@@ -312,9 +322,29 @@ pub struct ChatCompletionRequest {
     pub top_logprobs: Option<u32>,
     pub camelid_logit_token_ids: Option<Vec<u32>>,
     pub camelid_dense_diagnostics: Option<bool>,
+    pub response_format: Option<serde_json::Value>,
+    pub json_schema: Option<serde_json::Value>,
+    pub schema: Option<serde_json::Value>,
+    pub grammar: Option<serde_json::Value>,
+    pub tools: Option<serde_json::Value>,
+    pub tool_choice: Option<serde_json::Value>,
+    pub parallel_tool_calls: Option<serde_json::Value>,
+    pub parse_tool_calls: Option<serde_json::Value>,
+    pub chat_template_kwargs: Option<serde_json::Value>,
+    pub reasoning_format: Option<serde_json::Value>,
+    pub generation_prompt: Option<serde_json::Value>,
+    pub mirostat: Option<serde_json::Value>,
+    pub mirostat_tau: Option<serde_json::Value>,
+    pub mirostat_eta: Option<serde_json::Value>,
+    pub min_p: Option<serde_json::Value>,
+    pub typical_p: Option<serde_json::Value>,
+    pub tfs_z: Option<serde_json::Value>,
+    pub repeat_penalty: Option<serde_json::Value>,
+    pub stream_options: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompletionRequest {
     pub model: Option<String>,
     pub prompt: Option<String>,
@@ -334,6 +364,27 @@ pub struct CompletionRequest {
     pub camelid_logit_token_ids: Option<Vec<u32>>,
     pub camelid_prompt_token_ids: Option<Vec<u32>>,
     pub camelid_dense_diagnostics: Option<bool>,
+    pub response_format: Option<serde_json::Value>,
+    pub json_schema: Option<serde_json::Value>,
+    pub schema: Option<serde_json::Value>,
+    pub grammar: Option<serde_json::Value>,
+    pub tools: Option<serde_json::Value>,
+    pub tool_choice: Option<serde_json::Value>,
+    pub parallel_tool_calls: Option<serde_json::Value>,
+    pub parse_tool_calls: Option<serde_json::Value>,
+    pub chat_template_kwargs: Option<serde_json::Value>,
+    pub reasoning_format: Option<serde_json::Value>,
+    pub generation_prompt: Option<serde_json::Value>,
+    pub mirostat: Option<serde_json::Value>,
+    pub mirostat_tau: Option<serde_json::Value>,
+    pub mirostat_eta: Option<serde_json::Value>,
+    pub min_p: Option<serde_json::Value>,
+    pub typical_p: Option<serde_json::Value>,
+    pub tfs_z: Option<serde_json::Value>,
+    pub repeat_penalty: Option<serde_json::Value>,
+    pub echo: Option<serde_json::Value>,
+    pub suffix: Option<serde_json::Value>,
+    pub stream_options: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -344,6 +395,7 @@ pub enum StopSpec {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
@@ -677,6 +729,7 @@ struct PreparedGeneration {
     dense_metadata: DenseDiagnosticMetadata,
     timings: GenerationTimings,
     cached_prompt_prefix: Arc<Mutex<Option<CachedPromptPrefix>>>,
+    generation_timeout_override: Option<Duration>,
 }
 
 struct GeneratedText {
@@ -732,6 +785,10 @@ pub fn router() -> Router {
     router_with_state(AppState::default())
 }
 
+pub fn router_with_generation_timeout_override(timeout: Duration) -> Router {
+    router_with_state(AppState::with_generation_timeout_override(timeout))
+}
+
 pub fn router_with_state(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -785,9 +842,12 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     let loaded_models = state.loaded_models.read().await;
     let model = active_id_lock.as_ref().and_then(|id| loaded_models.get(id));
     let loaded_now = !loaded_models.is_empty();
-    let generation_ready = model.is_some_and(|m| loaded_model_generation_ready(m));
+    let generation_ready = model.is_some_and(loaded_model_generation_ready);
     let execution_plans = state.execution_plans.read().await;
-    let execution_plan = active_id_lock.as_ref().and_then(|id| execution_plans.get(id)).cloned();
+    let execution_plan = active_id_lock
+        .as_ref()
+        .and_then(|id| execution_plans.get(id))
+        .cloned();
     Json(HealthResponse {
         ok: true,
         engine: "camelid",
@@ -811,14 +871,20 @@ fn loaded_model_generation_ready(model: &LoadedModel) -> bool {
 async fn capabilities(State(state): State<AppState>) -> Json<CapabilitiesResponse> {
     let active_id_lock = state.active_model_id.read().await;
     let execution_plans = state.execution_plans.read().await;
-    let execution_plan = active_id_lock.as_ref().and_then(|id| execution_plans.get(id)).cloned();
+    let execution_plan = active_id_lock
+        .as_ref()
+        .and_then(|id| execution_plans.get(id))
+        .cloned();
     Json(capabilities_response_with_plan(execution_plan))
 }
 
 async fn execution_plan(State(state): State<AppState>) -> Json<Option<ExecutionPlan>> {
     let active_id_lock = state.active_model_id.read().await;
     let execution_plans = state.execution_plans.read().await;
-    let execution_plan = active_id_lock.as_ref().and_then(|id| execution_plans.get(id)).cloned();
+    let execution_plan = active_id_lock
+        .as_ref()
+        .and_then(|id| execution_plans.get(id))
+        .cloned();
     Json(execution_plan)
 }
 
@@ -839,7 +905,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
         hf_catalog_install: true,
         execution_plan,
         support_contract: SupportContract {
-            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048 packs; Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist; and Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke with checked bounded 512/1024/2048/4096/8192 packs. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied.",
+            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048 packs; and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral-7B-Instruct-v0.3.Q8_0.gguf has tokenizer/template, 1-token, broader 50-token, bounded 512/1024/2048, checked 4096/8192 context, and fail-closed API/WebUI/RSS evidence, but remains active_validation_unsupported until the support contract is explicitly promoted. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied.",
             support_policy: "A model, tokenizer, quantization, API feature, or context length is supported only after tests, docs, and real-model evidence exist for that lane.",
             unsupported_policy: "Unsupported combinations should return typed errors instead of silently falling back to best-effort behavior.",
         },
@@ -888,17 +954,17 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 status: "supported_exact_row_smoke_lanes",
                 notes: "exact Llama 3.2 1B Instruct Q8_0 has row-specific smoke support with checked bounded 512/1024/2048/4096/8192-context packs; exact Llama 3.2 3B Instruct Q8_0 has supported_exact_row_smoke canonical Ubuntu main-lane API/WebUI evidence at source head e9f926ed1a65 plus checked bounded 512/1024/2048-context packs; exact Llama 3 8B Instruct Q8_0 has row-specific smoke support with checked bounded 512/1024/2048-context packs, including the published source/runtime-head 8B 1024/2048 PASS bundle at 8e26be0a73c0. Broader 50-token, compact chat-template-shapes, and retained-block lazy-Q8 hot-path evidence remain exact-row bounded pack/measurement evidence only, and broad/full support still needs separate proof.",
             },
-            SupportItem {
-                id: "mistral",
-                status: "supported_exact_row_smoke",
-                notes: "public readiness: supported for Mistral-7B-Instruct-v0.3.Q8_0.gguf only. Exact tokenizer/template references plus 1-token, bounded-context, broader 50-token parity, checked 4096/8192 context, and fail-closed current-head API/WebUI/RSS evidence are fully verified, and support is promoted and synchronized across support surfaces",
-            },
         ],
         planned_model_families: vec![
             SupportItem {
                 id: "larger_llama_instruct",
                 status: "planned",
                 notes: "broader LLaMA-family instruct support after row-specific parity, API, WebUI, memory/perf, and portability evidence",
+            },
+            SupportItem {
+                id: "mistral",
+                status: "active_validation_unsupported",
+                notes: "public readiness: in active validation for Mistral-7B-Instruct-v0.3.Q8_0.gguf only; not supported yet. Exact tokenizer/template references plus 1-token, bounded-context, broader 50-token parity, checked 4096/8192 context, and current-head API/WebUI/RSS fail-closed evidence exist for the selected row, but the published support contract still blocks WebUI chat until explicit promotion evidence exists",
             },
             SupportItem {
                 id: "mixtral_moe",
@@ -1172,18 +1238,18 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 id: "mistral_7b_instruct_v0_3_q8_0",
                 family: "mistral",
                 quantization: "Q8_0",
-                status: "supported_exact_row_smoke",
-                support_scope: "exact_row_smoke_only",
-                full_support_status: "blocked_pending_normalized_full_support",
-                full_support_blockers: "model-native/larger context beyond the checked 512/1024/2048/4096/8192 packs, arbitrary/Jinja templates beyond row-scoped renderer and shape evidence, production throughput, and portability remain missing",
+                status: "active_validation_unsupported",
+                support_scope: "bringup_exact_row_unsupported",
+                full_support_status: "blocked_unsupported_bringup",
+                full_support_blockers: "support-contract promotion, WebUI chat enablement, synchronized /api/capabilities support status, production throughput, portability, broader arbitrary/Jinja template evidence, and durable promotion bundle evidence remain incomplete",
                 metadata_parses: "validated",
                 tokenizer_works: "validated",
                 tensors_load: "validated",
-                generation_runs: "api_completion_and_chat_smoke_plus_broader_50_token_api_smoke",
+                generation_runs: "runtime_generation_ready_but_fail_closed_by_support_contract",
                 parity_audited: "tokenizer_template_1tok_bounded_and_broader_50_token_parity_pass",
-                performance_measured: "bounded_unique_chat_perf_rss_validated",
-                frontend_load_path_verified: "validated",
-                frontend_readiness_gate: "green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id",
+                performance_measured: "api_webui_rss_fail_closed_evidence_only",
+                frontend_load_path_verified: "validated_fail_closed",
+                frontend_readiness_gate: "fail-closed: generation_ready=true is not enough; WebUI chat remains blocked until this exact GGUF row is explicitly promoted in /api/capabilities with contract_supported=true",
                 tested_context: "tokenizer_template_1tok_bounded_and_checked_512_1024_2048_4096_8192_context_packs",
                 chat_template_renderer: "mistral_instruct",
                 chat_template_shape_pack: "validated_bounded_pack",
@@ -1206,8 +1272,8 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 latest_checked_bucket: "current_head_api_webui_rss_fail_closed",
                 latest_checked_result: "pass",
                 latest_checked_output: "CMLD-M7B",
-                evidence: "the exact Mistral-7B-Instruct-v0.3.Q8_0.gguf GGUF has exact-row load, completion, chat-completion, frontend-smoke, 50-prompt API smoke evidence, compact prompt-token/deterministic 1-token/5-token/bounded 50-token parity, broader parity, bounded context 512/1024/2048/4096/8192 context packs, bounded compact template-shape coverage, and bounded unique-chat perf/RSS evidence; Camelid supports exact-row smoke and the checked 512/1024/2048/4096/8192 context packs for this row only",
-                next_step: "preserve exact-row smoke plus checked 512/1024/2048/4096/8192 context support while normalizing model-native/larger context, broader arbitrary/Jinja template behavior, production throughput, and durability evidence",
+                evidence: "the exact Mistral-7B-Instruct-v0.3.Q8_0.gguf GGUF has tokenizer/template, 1-token, broader five-prompt 50-token, bounded 512/1024/2048, and checked 4096/8192 context parity evidence. The current-head API/WebUI/RSS bundle passed as fail-closed evidence with compatibility_status=active_validation_unsupported, contract_supported=false, and webui_chat=blocked, so it does not promote support.",
+                next_step: "add explicit support-contract promotion evidence with /api/capabilities reporting supported status, WebUI chat enabled, RSS/timing, scrubbed manifest, and checksums before any support wording changes",
             },
             ModelCompatibilityTarget {
                 id: "mixtral_8x7b_instruct_v0_1_q8_0",
@@ -1415,12 +1481,24 @@ async fn load_model_from_path(
         tokenizer,
         tokenizer_runtime,
     };
-    
-    state.loaded_models.write().await.insert(id.clone(), loaded.clone());
-    state.execution_plans.write().await.insert(id.clone(), outcome.plan);
-    state.model_last_used.write().await.insert(id.clone(), std::time::Instant::now());
+
+    state
+        .loaded_models
+        .write()
+        .await
+        .insert(id.clone(), loaded.clone());
+    state
+        .execution_plans
+        .write()
+        .await
+        .insert(id.clone(), outcome.plan);
+    state
+        .model_last_used
+        .write()
+        .await
+        .insert(id.clone(), std::time::Instant::now());
     *state.active_model_id.write().await = Some(id.clone());
-    
+
     clear_prompt_prefix_cache(state);
     Ok(loaded)
 }
@@ -1451,7 +1529,10 @@ pub struct UnloadModelRequest {
     pub id: Option<String>,
 }
 
-async fn unload_model(State(state): State<AppState>, payload: Option<Json<UnloadModelRequest>>) -> Response {
+async fn unload_model(
+    State(state): State<AppState>,
+    payload: Option<Json<UnloadModelRequest>>,
+) -> Response {
     let model_id = if let Some(Json(req)) = payload {
         req.id
     } else {
@@ -1469,7 +1550,7 @@ async fn unload_model(State(state): State<AppState>, payload: Option<Json<Unload
         state.execution_plans.write().await.remove(&id);
         state.cached_weights.write().await.remove(&id);
         state.model_last_used.write().await.remove(&id);
-        
+
         let mut active = state.active_model_id.write().await;
         if active.as_ref() == Some(&id) {
             *active = state.loaded_models.read().await.keys().next().cloned();
@@ -1481,7 +1562,7 @@ async fn unload_model(State(state): State<AppState>, payload: Option<Json<Unload
         state.model_last_used.write().await.clear();
         *state.active_model_id.write().await = None;
     }
-    
+
     clear_prompt_prefix_cache(&state);
     StatusCode::NO_CONTENT.into_response()
 }
@@ -1543,9 +1624,12 @@ async fn model_tokenizer(State(state): State<AppState>) -> Response {
     )
 }
 
-async fn get_or_load_model(state: &AppState, model_id: Option<&str>) -> Result<LoadedModel, Response> {
+async fn get_or_load_model(
+    state: &AppState,
+    model_id: Option<&str>,
+) -> Result<LoadedModel, Response> {
     let loaded_models = state.loaded_models.read().await;
-    
+
     let target_id = if let Some(id) = model_id {
         id.to_string()
     } else {
@@ -1564,14 +1648,28 @@ async fn get_or_load_model(state: &AppState, model_id: Option<&str>) -> Result<L
     };
 
     if let Some(loaded) = loaded_models.get(&target_id) {
-        state.model_last_used.write().await.insert(target_id.clone(), std::time::Instant::now());
+        state
+            .model_last_used
+            .write()
+            .await
+            .insert(target_id.clone(), std::time::Instant::now());
         *state.active_model_id.write().await = Some(target_id.clone());
         return Ok(loaded.clone());
     }
 
     for (id, loaded) in loaded_models.iter() {
-        if id == &target_id || loaded.id == target_id || loaded.path.file_name().is_some_and(|f| f.to_string_lossy() == target_id) {
-            state.model_last_used.write().await.insert(id.clone(), std::time::Instant::now());
+        if id == &target_id
+            || loaded.id == target_id
+            || loaded
+                .path
+                .file_name()
+                .is_some_and(|f| f.to_string_lossy() == target_id)
+        {
+            state
+                .model_last_used
+                .write()
+                .await
+                .insert(id.clone(), std::time::Instant::now());
             *state.active_model_id.write().await = Some(id.clone());
             return Ok(loaded.clone());
         }
@@ -1584,12 +1682,14 @@ async fn get_or_load_model(state: &AppState, model_id: Option<&str>) -> Result<L
             drop(loaded_models);
             match load_model_from_path(state, path, Some(target_id.clone())).await {
                 Ok(loaded) => return Ok(loaded),
-                Err(err) => return Err(api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "model_load_failed",
-                    format!("Failed to load model {target_id} on-demand: {err}"),
-                    None,
-                )),
+                Err(err) => {
+                    return Err(api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "model_load_failed",
+                        format!("Failed to load model {target_id} on-demand: {err}"),
+                        None,
+                    ))
+                }
             }
         }
     }
@@ -1651,11 +1751,19 @@ fn resolve_model_path(model_id: &str) -> Option<PathBuf> {
     None
 }
 
-async fn load_weights_lru(state: &AppState, model: &LoadedModel, binding: &LlamaTensorBinding) -> Result<Arc<LlamaLoadedWeights>, Response> {
+async fn load_weights_lru(
+    state: &AppState,
+    model: &LoadedModel,
+    binding: &LlamaTensorBinding,
+) -> Result<Arc<LlamaLoadedWeights>, Response> {
     {
         let cached = state.cached_weights.read().await;
         if let Some(weights) = cached.get(&model.id) {
-            state.model_last_used.write().await.insert(model.id.clone(), std::time::Instant::now());
+            state
+                .model_last_used
+                .write()
+                .await
+                .insert(model.id.clone(), std::time::Instant::now());
             return Ok(weights.clone());
         }
     }
@@ -1674,7 +1782,7 @@ async fn load_weights_lru(state: &AppState, model: &LoadedModel, binding: &Llama
     loop {
         let loaded = state.loaded_models.read().await;
         let cached = state.cached_weights.read().await;
-        
+
         let mut current_sum = 0u64;
         for (id, _) in cached.iter() {
             if id != &model.id {
@@ -1698,7 +1806,10 @@ async fn load_weights_lru(state: &AppState, model: &LoadedModel, binding: &Llama
 
         for (id, _) in cached.iter() {
             if id != &model.id {
-                let time = last_used.get(id).cloned().unwrap_or_else(std::time::Instant::now);
+                let time = last_used
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(std::time::Instant::now);
                 if time < oldest_time {
                     oldest_time = time;
                     lru_id = Some(id.clone());
@@ -1720,17 +1831,27 @@ async fn load_weights_lru(state: &AppState, model: &LoadedModel, binding: &Llama
     }
 
     let store = TensorStore::open(&model.path, &model.gguf);
-    let weights = Arc::new(LlamaLoadedWeights::load(&store, binding, None).map_err(|err| {
-        api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "loaded_cpu_weights_unavailable",
-            err.to_string(),
-            Some("model"),
-        )
-    })?);
+    let weights = Arc::new(
+        LlamaLoadedWeights::load(&store, binding, None).map_err(|err| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "loaded_cpu_weights_unavailable",
+                err.to_string(),
+                Some("model"),
+            )
+        })?,
+    );
 
-    state.cached_weights.write().await.insert(model.id.clone(), weights.clone());
-    state.model_last_used.write().await.insert(model.id.clone(), std::time::Instant::now());
+    state
+        .cached_weights
+        .write()
+        .await
+        .insert(model.id.clone(), weights.clone());
+    state
+        .model_last_used
+        .write()
+        .await
+        .insert(model.id.clone(), std::time::Instant::now());
 
     Ok(weights)
 }
@@ -1895,12 +2016,25 @@ async fn create_generation_session(
 
 async fn completions(
     State(state): State<AppState>,
-    payload: std::result::Result<Json<CompletionRequest>, JsonRejection>,
+    payload: std::result::Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
-    let Json(req) = match payload {
+    let Json(raw) = match payload {
         Ok(payload) => payload,
         Err(err) => return malformed_json_error(err),
     };
+    if completion_prompt_has_unsupported_shape(&raw) {
+        return unsupported_openai_parameter_shape_error(
+            "prompt",
+            "prompt array, batched prompt, and token-id prompt variants are not supported by Camelid on /v1/completions; send one text prompt string or use camelid_prompt_token_ids for explicit token IDs",
+        );
+    }
+    let req: CompletionRequest = match serde_json::from_value(raw) {
+        Ok(req) => req,
+        Err(err) => return malformed_json_value_error(err),
+    };
+    if let Some(param) = unsupported_completion_parameter(&req) {
+        return unsupported_openai_parameter_error(param, "/v1/completions");
+    }
     let req = GenerationSessionRequest {
         model: req.model,
         prompt: req.prompt,
@@ -1988,12 +2122,25 @@ async fn completions(
 
 async fn chat_completions(
     State(state): State<AppState>,
-    payload: std::result::Result<Json<ChatCompletionRequest>, JsonRejection>,
+    payload: std::result::Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
-    let Json(req) = match payload {
+    let Json(raw) = match payload {
         Ok(payload) => payload,
         Err(err) => return malformed_json_error(err),
     };
+    if chat_messages_have_unsupported_content_parts(&raw) {
+        return unsupported_openai_parameter_shape_error(
+            "messages[].content",
+            "multimodal chat content parts are not supported by Camelid on /v1/chat/completions; send each message content as a single text string",
+        );
+    }
+    let req: ChatCompletionRequest = match serde_json::from_value(raw) {
+        Ok(req) => req,
+        Err(err) => return malformed_json_value_error(err),
+    };
+    if let Some(param) = unsupported_chat_completion_parameter(&req) {
+        return unsupported_openai_parameter_error(param, "/v1/chat/completions");
+    }
     let req = GenerationSessionRequest {
         model: req.model,
         prompt: None,
@@ -2569,6 +2716,7 @@ async fn prepare_generation(
         dense_metadata,
         timings,
         cached_prompt_prefix: state.cached_prompt_prefix.clone(),
+        generation_timeout_override: state.generation_timeout_override,
     })
 }
 
@@ -2811,6 +2959,171 @@ fn validate_choice_and_logprob_fields(
     Ok(())
 }
 
+fn unsupported_completion_parameter(req: &CompletionRequest) -> Option<&'static str> {
+    if req.response_format.is_some() {
+        return Some("response_format");
+    }
+    if req.json_schema.is_some() {
+        return Some("json_schema");
+    }
+    if req.schema.is_some() {
+        return Some("schema");
+    }
+    if req.grammar.is_some() {
+        return Some("grammar");
+    }
+    if req.tools.is_some() {
+        return Some("tools");
+    }
+    if req.tool_choice.is_some() {
+        return Some("tool_choice");
+    }
+    if req.parallel_tool_calls.is_some() {
+        return Some("parallel_tool_calls");
+    }
+    if req.parse_tool_calls.is_some() {
+        return Some("parse_tool_calls");
+    }
+    if req.chat_template_kwargs.is_some() {
+        return Some("chat_template_kwargs");
+    }
+    if req.reasoning_format.is_some() {
+        return Some("reasoning_format");
+    }
+    if req.generation_prompt.is_some() {
+        return Some("generation_prompt");
+    }
+    if req.mirostat.is_some() {
+        return Some("mirostat");
+    }
+    if req.mirostat_tau.is_some() {
+        return Some("mirostat_tau");
+    }
+    if req.mirostat_eta.is_some() {
+        return Some("mirostat_eta");
+    }
+    if req.min_p.is_some() {
+        return Some("min_p");
+    }
+    if req.typical_p.is_some() {
+        return Some("typical_p");
+    }
+    if req.tfs_z.is_some() {
+        return Some("tfs_z");
+    }
+    if req.repeat_penalty.is_some() {
+        return Some("repeat_penalty");
+    }
+    if req.echo.is_some() {
+        return Some("echo");
+    }
+    if req.suffix.is_some() {
+        return Some("suffix");
+    }
+    if req.stream_options.is_some() {
+        return Some("stream_options");
+    }
+    None
+}
+
+fn unsupported_chat_completion_parameter(req: &ChatCompletionRequest) -> Option<&'static str> {
+    if req.response_format.is_some() {
+        return Some("response_format");
+    }
+    if req.json_schema.is_some() {
+        return Some("json_schema");
+    }
+    if req.schema.is_some() {
+        return Some("schema");
+    }
+    if req.grammar.is_some() {
+        return Some("grammar");
+    }
+    if req.tools.is_some() {
+        return Some("tools");
+    }
+    if req.tool_choice.is_some() {
+        return Some("tool_choice");
+    }
+    if req.parallel_tool_calls.is_some() {
+        return Some("parallel_tool_calls");
+    }
+    if req.parse_tool_calls.is_some() {
+        return Some("parse_tool_calls");
+    }
+    if req.chat_template_kwargs.is_some() {
+        return Some("chat_template_kwargs");
+    }
+    if req.reasoning_format.is_some() {
+        return Some("reasoning_format");
+    }
+    if req.generation_prompt.is_some() {
+        return Some("generation_prompt");
+    }
+    if req.mirostat.is_some() {
+        return Some("mirostat");
+    }
+    if req.mirostat_tau.is_some() {
+        return Some("mirostat_tau");
+    }
+    if req.mirostat_eta.is_some() {
+        return Some("mirostat_eta");
+    }
+    if req.min_p.is_some() {
+        return Some("min_p");
+    }
+    if req.typical_p.is_some() {
+        return Some("typical_p");
+    }
+    if req.tfs_z.is_some() {
+        return Some("tfs_z");
+    }
+    if req.repeat_penalty.is_some() {
+        return Some("repeat_penalty");
+    }
+    if req.stream_options.is_some() {
+        return Some("stream_options");
+    }
+    None
+}
+
+fn completion_prompt_has_unsupported_shape(raw: &serde_json::Value) -> bool {
+    raw.get("prompt").is_some_and(serde_json::Value::is_array)
+}
+
+fn chat_messages_have_unsupported_content_parts(raw: &serde_json::Value) -> bool {
+    raw.get("messages")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message
+                    .get("content")
+                    .is_some_and(serde_json::Value::is_array)
+            })
+        })
+}
+
+fn unsupported_openai_parameter_error(param: &'static str, endpoint: &'static str) -> Response {
+    api_error(
+        StatusCode::BAD_REQUEST,
+        "unsupported_parameter",
+        format!("{param} is not supported by Camelid on {endpoint}; omit it instead of relying on a silent downgrade"),
+        Some(param),
+    )
+}
+
+fn unsupported_openai_parameter_shape_error(
+    param: &'static str,
+    message: &'static str,
+) -> Response {
+    api_error(
+        StatusCode::BAD_REQUEST,
+        "unsupported_parameter",
+        message.to_string(),
+        Some(param),
+    )
+}
+
 fn stop_sequences_from_request(
     stop: Option<&StopSpec>,
 ) -> std::result::Result<Vec<String>, Box<Response>> {
@@ -2926,7 +3239,8 @@ fn parse_logit_bias(
 async fn generate_decoded_tokens_blocking(
     prepared: PreparedGeneration,
 ) -> std::result::Result<GeneratedText, Box<Response>> {
-    let timeout = generation_timeout_duration()?;
+    let timeout = generation_timeout_duration(prepared.generation_timeout_override)?;
+    let started = Instant::now();
     let handle = tokio::task::spawn_blocking(move || generate_decoded_tokens(prepared));
     match tokio::time::timeout(timeout, handle).await {
         Ok(Ok(result)) => result,
@@ -2936,19 +3250,19 @@ async fn generate_decoded_tokens_blocking(
             format!("generation worker failed before completing the request: {err}"),
             None,
         ))),
-        Err(_) => Err(Box::new(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "generation_timeout",
-            format!(
-                "generation exceeded the configured wall-clock timeout of {} ms; reduce max_tokens, use streaming/progress instrumentation, or raise {GENERATION_TIMEOUT_ENV} for a controlled hardening run",
-                timeout.as_millis()
-            ),
-            Some("max_tokens"),
+        Err(_) => Err(Box::new(generation_timeout_api_error(
+            timeout,
+            started.elapsed(),
         ))),
     }
 }
 
-fn generation_timeout_duration() -> std::result::Result<Duration, Box<Response>> {
+fn generation_timeout_duration(
+    override_timeout: Option<Duration>,
+) -> std::result::Result<Duration, Box<Response>> {
+    if let Some(timeout) = override_timeout {
+        return Ok(timeout);
+    }
     match env::var(GENERATION_TIMEOUT_ENV) {
         Ok(value) if value.trim().is_empty() => {
             Ok(Duration::from_millis(DEFAULT_GENERATION_TIMEOUT_MS))
@@ -2976,6 +3290,34 @@ fn generation_timeout_duration() -> std::result::Result<Duration, Box<Response>>
             None,
         ))),
     }
+}
+
+fn generation_timeout_api_error(timeout: Duration, elapsed: Duration) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(generation_timeout_api_error_payload(timeout, elapsed)),
+    )
+        .into_response()
+}
+
+fn generation_timeout_api_error_payload(timeout: Duration, elapsed: Duration) -> serde_json::Value {
+    serde_json::json!({
+        "error": {
+            "message": format!(
+                "generation exceeded the configured wall-clock timeout of {} ms; reduce max_tokens, use streaming/progress instrumentation, or raise {GENERATION_TIMEOUT_ENV} for a controlled hardening run",
+                timeout.as_millis()
+            ),
+            "type": "runtime_unavailable",
+            "code": "generation_timeout",
+            "param": "max_tokens",
+            "timeout_trace": {
+                "timeout_ms": timeout.as_millis(),
+                "elapsed_ms": elapsed.as_millis(),
+                "generated_tokens": null,
+                "timeout_env": GENERATION_TIMEOUT_ENV
+            }
+        }
+    })
 }
 
 fn generate_decoded_tokens(
@@ -3671,6 +4013,10 @@ fn stream_first_content_accounting_json(
 }
 
 fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
+    let timeout = match generation_timeout_duration(prepared.generation_timeout_override) {
+        Ok(timeout) => timeout,
+        Err(response) => return *response,
+    };
     let model_id = prepared.model_id.clone();
     let stream_timing_diagnostics = stream_timing_diagnostics_enabled();
     let stream_poll_yield = stream_poll_yield_enabled();
@@ -3681,6 +4027,8 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
     };
     let events = async_stream::stream! {
         let stream_started = Instant::now();
+        let generation_deadline = (timeout.as_millis() != u128::from(u64::MAX))
+            .then(|| stream_started + timeout);
         let mut stream_event_timings = StreamEventTimings {
             poll_yield_enabled: stream_poll_yield,
             ..StreamEventTimings::default()
@@ -3766,9 +4114,15 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
             }
         }
 
+        let mut stream_session = prepared.session.clone();
         for _ in generated.len() as u32..prepared.max_tokens {
             if finish_reason != "length" {
                 break;
+            }
+            if generation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                yield stream_timeout_event(timeout, stream_started.elapsed(), generated.len());
+                yield Ok(Event::default().data("[DONE]"));
+                return;
             }
             let mut sampling = prepared.sampling.clone();
             if let Some(seed) = sampling.seed {
@@ -3779,31 +4133,52 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
             } else {
                 LlamaSampler::Sampling(sampling)
             };
-            let step = match prepared
-                .session
-                .generate_next_token_with_history_diagnostics(
-                    &input,
-                    sampler,
-                    &history,
-                    prepared.collect_dense_diagnostics,
-                ) {
-                    Ok(step) => step,
-                    Err(err) => {
-                        yield stream_error_message_event("generation_step_failed", err.to_string());
-                        yield Ok(Event::default().data("[DONE]"));
-                        return;
-                    }
-                };
+            let step_timeout = generation_deadline
+                .and_then(|deadline| deadline.checked_duration_since(Instant::now()));
+            let (session, step) = match generate_stream_step_blocking(
+                stream_session,
+                input.clone(),
+                sampler,
+                history.clone(),
+                prepared.collect_dense_diagnostics,
+                step_timeout,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(StreamStepError::GenerationFailed(message)) => {
+                    yield stream_error_message_event("generation_step_failed", message);
+                    yield Ok(Event::default().data("[DONE]"));
+                    return;
+                }
+                Err(StreamStepError::WorkerFailed(message)) => {
+                    yield stream_error_message_event("generation_worker_failed", message);
+                    yield Ok(Event::default().data("[DONE]"));
+                    return;
+                }
+                Err(StreamStepError::Timeout) => {
+                    yield stream_timeout_event(timeout, stream_started.elapsed(), generated.len());
+                    yield Ok(Event::default().data("[DONE]"));
+                    return;
+                }
+            };
+            if generation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                yield stream_timeout_event(timeout, stream_started.elapsed(), generated.len());
+                yield Ok(Event::default().data("[DONE]"));
+                return;
+            }
             if !reused_prompt_prefix
                 && generated.is_empty()
                 && !prepared.collect_dense_diagnostics
                 && step.diagnostics.is_none()
             {
+                prepared.session = session.clone();
                 store_prompt_prefix_cache(&prepared, &step);
             }
             if generated.is_empty() && !reused_prompt_prefix {
                 prepared.timings.prompt_evaluation = prompt_evaluation_timings_from_step(&step);
             }
+            stream_session = session;
             forward_timings.add_assign(&step.timings);
             sample += step.sample;
             if let Err(response) = consume_generation_step(
@@ -3941,6 +4316,49 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
     Sse::new(events).into_response()
 }
 
+enum StreamStepError {
+    GenerationFailed(String),
+    WorkerFailed(String),
+    Timeout,
+}
+
+async fn generate_stream_step_blocking(
+    mut session: LlamaInferenceSession,
+    input: Vec<u32>,
+    sampler: LlamaSampler,
+    history: Vec<u32>,
+    collect_dense_diagnostics: bool,
+    timeout: Option<Duration>,
+) -> std::result::Result<(LlamaInferenceSession, LlamaGenerationStep), StreamStepError> {
+    let handle = tokio::task::spawn_blocking(move || {
+        let step = session
+            .generate_next_token_with_history_diagnostics(
+                &input,
+                sampler,
+                &history,
+                collect_dense_diagnostics,
+            )
+            .map_err(|err| err.to_string())?;
+        Ok::<_, String>((session, step))
+    });
+
+    let result = match timeout {
+        Some(timeout) => match tokio::time::timeout(timeout, handle).await {
+            Ok(result) => result,
+            Err(_) => return Err(StreamStepError::Timeout),
+        },
+        None => handle.await,
+    };
+
+    match result {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(message)) => Err(StreamStepError::GenerationFailed(message)),
+        Err(err) => Err(StreamStepError::WorkerFailed(format!(
+            "generation worker failed before completing the stream step: {err}"
+        ))),
+    }
+}
+
 fn stream_error_event(response: Response) -> Result<Event, Infallible> {
     stream_error_message_event(
         "stream_error",
@@ -3958,6 +4376,40 @@ fn stream_error_message_event(code: &str, message: String) -> Result<Event, Infa
         })
         .to_string(),
     ))
+}
+
+fn stream_timeout_event(
+    timeout: Duration,
+    elapsed: Duration,
+    generated_tokens: usize,
+) -> Result<Event, Infallible> {
+    Ok(Event::default()
+        .event("error")
+        .data(stream_timeout_payload(timeout, elapsed, generated_tokens).to_string()))
+}
+
+fn stream_timeout_payload(
+    timeout: Duration,
+    elapsed: Duration,
+    generated_tokens: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "error": {
+            "code": "generation_timeout",
+            "message": format!(
+                "streaming generation exceeded the configured wall-clock timeout of {} ms after {} generated token(s)",
+                timeout.as_millis(),
+                generated_tokens
+            ),
+            "param": "max_tokens",
+            "timeout_trace": {
+                "timeout_ms": timeout.as_millis(),
+                "elapsed_ms": elapsed.as_millis(),
+                "generated_tokens": generated_tokens,
+                "timeout_env": GENERATION_TIMEOUT_ENV
+            }
+        }
+    })
 }
 
 fn sse_json_event<T: Serialize>(value: &T) -> Result<Event, Infallible> {
@@ -4447,14 +4899,17 @@ fn render_role_colon_prompt(messages: &[ChatMessage]) -> String {
 async fn loaded_tokenizer(state: &AppState) -> std::result::Result<Tokenizer, Response> {
     let active_id = state.active_model_id.read().await;
     let loaded_models = state.loaded_models.read().await;
-    let model = active_id.as_ref().and_then(|id| loaded_models.get(id)).ok_or_else(|| {
-        api_error(
-            StatusCode::NOT_FOUND,
-            "model_not_loaded",
-            BackendError::ModelNotLoaded.to_string(),
-            None,
-        )
-    })?;
+    let model = active_id
+        .as_ref()
+        .and_then(|id| loaded_models.get(id))
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                "model_not_loaded",
+                BackendError::ModelNotLoaded.to_string(),
+                None,
+            )
+        })?;
     Tokenizer::from_gguf(&model.gguf).map_err(|err| {
         api_error(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -4466,6 +4921,15 @@ async fn loaded_tokenizer(state: &AppState) -> std::result::Result<Tokenizer, Re
 }
 
 fn malformed_json_error(err: JsonRejection) -> Response {
+    api_error(
+        StatusCode::BAD_REQUEST,
+        "malformed_json",
+        err.to_string(),
+        None,
+    )
+}
+
+fn malformed_json_value_error(err: serde_json::Error) -> Response {
     api_error(
         StatusCode::BAD_REQUEST,
         "malformed_json",
@@ -4622,6 +5086,62 @@ mod tests {
 
         let value = serde_json::to_value(chunk).expect("stream chunk should serialize");
         assert!(value.get("camelid").is_none());
+    }
+
+    #[test]
+    fn streaming_timeout_payload_includes_trace_without_private_context() {
+        let payload =
+            stream_timeout_payload(Duration::from_millis(25), Duration::from_millis(31), 2);
+
+        assert_eq!(payload["error"]["code"], "generation_timeout");
+        assert_eq!(payload["error"]["param"], "max_tokens");
+        assert_eq!(payload["error"]["timeout_trace"]["timeout_ms"], 25);
+        assert_eq!(payload["error"]["timeout_trace"]["elapsed_ms"], 31);
+        assert_eq!(payload["error"]["timeout_trace"]["generated_tokens"], 2);
+        assert_eq!(
+            payload["error"]["timeout_trace"]["timeout_env"],
+            GENERATION_TIMEOUT_ENV
+        );
+        let serialized = payload.to_string();
+        let forbidden = [
+            format!("{}{}", "/Users", "/"),
+            format!("{}{}", "/home", "/"),
+            format!("{}{}", "/Volumes", "/"),
+            format!("{}{}", "http", "://"),
+            format!("{}{}", "https", "://"),
+        ];
+        for forbidden in forbidden {
+            assert!(!serialized.contains(&forbidden));
+        }
+    }
+
+    #[test]
+    fn blocking_timeout_payload_includes_trace_without_private_context() {
+        let payload = generation_timeout_api_error_payload(
+            Duration::from_millis(25),
+            Duration::from_millis(31),
+        );
+
+        assert_eq!(payload["error"]["code"], "generation_timeout");
+        assert_eq!(payload["error"]["param"], "max_tokens");
+        assert_eq!(payload["error"]["timeout_trace"]["timeout_ms"], 25);
+        assert_eq!(payload["error"]["timeout_trace"]["elapsed_ms"], 31);
+        assert!(payload["error"]["timeout_trace"]["generated_tokens"].is_null());
+        assert_eq!(
+            payload["error"]["timeout_trace"]["timeout_env"],
+            GENERATION_TIMEOUT_ENV
+        );
+        let serialized = payload.to_string();
+        let forbidden = [
+            format!("{}{}", "/Users", "/"),
+            format!("{}{}", "/home", "/"),
+            format!("{}{}", "/Volumes", "/"),
+            format!("{}{}", "http", "://"),
+            format!("{}{}", "https", "://"),
+        ];
+        for forbidden in forbidden {
+            assert!(!serialized.contains(&forbidden));
+        }
     }
 
     #[test]
@@ -5044,38 +5564,29 @@ mod tests {
             .iter()
             .find(|target| target.id == "mistral_7b_instruct_v0_3_q8_0")
             .expect("Mistral exact-row bring-up lane should stay advertised");
-        assert_eq!(mistral.status, "supported_exact_row_smoke");
-        assert_eq!(mistral.support_scope, "exact_row_smoke_only");
-        assert_eq!(mistral.full_support_status, "blocked_pending_normalized_full_support");
-        assert_eq!(
-            mistral.frontend_load_path_verified,
-            "validated"
-        );
+        assert_eq!(mistral.status, "active_validation_unsupported");
+        assert_eq!(mistral.support_scope, "bringup_exact_row_unsupported");
+        assert_eq!(mistral.full_support_status, "blocked_unsupported_bringup");
+        assert_eq!(mistral.frontend_load_path_verified, "validated_fail_closed");
         assert_eq!(
             mistral.performance_measured,
-            "bounded_unique_chat_perf_rss_validated"
+            "api_webui_rss_fail_closed_evidence_only"
         );
         assert_eq!(
             mistral.latest_checked_bucket,
             "current_head_api_webui_rss_fail_closed"
         );
-        assert_eq!(
-            mistral.latest_checked_result,
-            "pass"
-        );
+        assert_eq!(mistral.latest_checked_result, "pass");
         assert_eq!(mistral.latest_checked_output, "CMLD-M7B");
-        assert!(mistral.frontend_readiness_gate.contains("green only when this exact GGUF row"));
-        assert_eq!(
-            mistral.bounded_context_8192_pack,
-            "validated_fifth_pack"
-        );
+        assert!(mistral.frontend_readiness_gate.contains("fail-closed"));
+        assert_eq!(mistral.bounded_context_8192_pack, "validated_fifth_pack");
         assert_eq!(
             mistral.bounded_context_8192_pack_id,
             "mistral-context-8192-max-ladder-v1"
         );
         assert!(mistral
             .evidence
-            .contains("exact Mistral-7B-Instruct-v0.3.Q8_0.gguf GGUF has exact-row load"));
+            .contains("compatibility_status=active_validation_unsupported"));
     }
 
     #[test]
@@ -5093,7 +5604,6 @@ mod tests {
                 "llama32_1b_instruct_q8_0",
                 "llama32_3b_instruct_q8_0",
                 "llama3_8b_instruct_q8_0",
-                "mistral_7b_instruct_v0_3_q8_0",
                 "tinyllama_1_1b_chat_q8_0",
             ])
         );
@@ -5105,10 +5615,11 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(
             supported_family_ids,
-            BTreeSet::from(["llama_bpe_decoder_exact_1b_3b_8b_q8_0", "llama_spm_decoder", "mistral",])
+            BTreeSet::from(["llama_bpe_decoder_exact_1b_3b_8b_q8_0", "llama_spm_decoder"])
         );
 
         for id in [
+            "mistral_7b_instruct_v0_3_q8_0",
             "mixtral_8x7b_instruct_v0_1_q8_0",
             "qwen25_7b_instruct_q8_0",
             "gemma2_9b_it_q8_0",
@@ -6669,6 +7180,7 @@ mod tests {
             dense_metadata: dummy_dense_metadata(),
             timings: GenerationTimings::default(),
             cached_prompt_prefix: Arc::new(Mutex::new(None)),
+            generation_timeout_override: None,
         }
     }
 
@@ -6853,7 +7365,7 @@ fn curated_catalog() -> Vec<CatalogItem> {
             name: "Llama 3.2 1B Instruct Q8_0",
             repo_id: "unsloth/Llama-3.2-1B-Instruct-GGUF",
             filename: "Llama-3.2-1B-Instruct-Q8_0.gguf",
-            size_bytes: 1346203104,
+            size_bytes: 1321082528,
             downloads: 142000,
             likes: 540,
             quant: "Q8_0",
@@ -6906,11 +7418,14 @@ pub struct CatalogQuery {
     pub query: Option<String>,
 }
 
-async fn get_catalog(axum::extract::Query(q): axum::extract::Query<CatalogQuery>) -> Json<CatalogResponse> {
+async fn get_catalog(
+    axum::extract::Query(q): axum::extract::Query<CatalogQuery>,
+) -> Json<CatalogResponse> {
     let items = curated_catalog();
     let filtered = if let Some(query_str) = q.query {
         let qs = query_str.to_lowercase();
-        items.into_iter()
+        items
+            .into_iter()
             .filter(|item| {
                 item.name.to_lowercase().contains(&qs)
                     || item.repo_id.to_lowercase().contains(&qs)
@@ -6954,23 +7469,21 @@ fn active_downloads_map() -> &'static Mutex<HashMap<String, ActiveDownload>> {
 
 async fn install_catalog_model(Json(req): Json<InstallCatalogRequest>) -> Response {
     let mut map = active_downloads_map().lock().unwrap();
-    if map.contains_key(&req.catalog_id) {
-        return (StatusCode::BAD_REQUEST, "Download already running").into_response();
+    if let Some(dl) = map.get(&req.catalog_id) {
+        if dl.status == "downloading" {
+            return (StatusCode::BAD_REQUEST, "Download already running").into_response();
+        }
     }
 
     std::fs::create_dir_all("models").ok();
     let dest_path = format!("models/{}", req.filename);
-    let url = format!("https://huggingface.co/{}/resolve/main/{}", req.repo_id, req.filename);
+    let url = format!(
+        "https://huggingface.co/{}/resolve/main/{}",
+        req.repo_id, req.filename
+    );
 
     match std::process::Command::new("curl")
-        .args(&[
-            "-L",
-            "-C",
-            "-",
-            "-o",
-            &dest_path,
-            &url,
-        ])
+        .args(["-L", "-C", "-", "-o", &dest_path, &url])
         .spawn()
     {
         Ok(child) => {
@@ -7013,10 +7526,8 @@ async fn install_catalog_model(Json(req): Json<InstallCatalogRequest>) -> Respon
 
 async fn get_catalog_downloads() -> Json<Vec<ActiveDownload>> {
     let mut map = active_downloads_map().lock().unwrap();
-    let mut to_remove = Vec::new();
-    for (id, dl) in map.iter_mut() {
+    for (_id, dl) in map.iter_mut() {
         if dl.status == "completed" || dl.status == "failed" {
-            to_remove.push(id.clone());
             continue;
         }
 
@@ -7030,11 +7541,6 @@ async fn get_catalog_downloads() -> Json<Vec<ActiveDownload>> {
     }
 
     let result = map.values().cloned().collect::<Vec<_>>();
-
-    for id in to_remove {
-        map.remove(&id);
-    }
-
     Json(result)
 }
 
@@ -7059,4 +7565,3 @@ async fn cancel_catalog_download(Json(req): Json<CancelDownloadRequest>) -> Resp
         (StatusCode::NOT_FOUND, "Download not found").into_response()
     }
 }
-

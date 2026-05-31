@@ -1662,6 +1662,7 @@ fn q8_0_hot_path_uses_resolved_plan_not_current_env() {
             attention_output_packed_rows4_matmul: false,
             attention_qkv_decode_consumer: false,
             attention_qkv_decode_group_chunking: false,
+            attention_qkv_prefill_consumer: false,
             attention_qkv_packed_rows4_matmul: false,
             output_packed_rows4_matmul: false,
             output_amx_prefill: false,
@@ -2570,6 +2571,7 @@ fn q8_attention_consumer_plan(
             attention_output_packed_rows4_matmul: false,
             attention_qkv_decode_consumer,
             attention_qkv_decode_group_chunking: false,
+            attention_qkv_prefill_consumer: false,
             attention_qkv_packed_rows4_matmul: false,
             output_packed_rows4_matmul: false,
             output_amx_prefill: false,
@@ -3220,8 +3222,10 @@ fn q8_attention_qkv_prefill_consumer_gate_is_default_off() {
     let _env_guard = env_lock();
     clear_dense_diagnostic_env();
     std::env::remove_var("CAMELID_X86_Q8_ATTENTION_QKV_PREFILL_CONSUMER");
+    assert!(!Q8RuntimeFlags::from_env().attention_qkv_prefill_consumer);
     assert!(!x86_q8_attention_qkv_prefill_consumer_enabled());
     std::env::set_var("CAMELID_X86_Q8_ATTENTION_QKV_PREFILL_CONSUMER", "on");
+    assert!(Q8RuntimeFlags::from_env().attention_qkv_prefill_consumer);
     assert!(x86_q8_attention_qkv_prefill_consumer_enabled());
     std::env::remove_var("CAMELID_X86_Q8_ATTENTION_QKV_PREFILL_CONSUMER");
 }
@@ -3584,6 +3588,7 @@ fn ffn_down_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             attention_output_packed_rows4_matmul: false,
             attention_qkv_decode_consumer: false,
             attention_qkv_decode_group_chunking: false,
+            attention_qkv_prefill_consumer: false,
             attention_qkv_packed_rows4_matmul: false,
             output_packed_rows4_matmul: false,
             output_amx_prefill: false,
@@ -3634,6 +3639,7 @@ fn ffn_down_packed_rows4_matmul_plan(enabled: bool) -> ResolvedRuntimePlan {
             attention_output_packed_rows4_matmul: false,
             attention_qkv_decode_consumer: false,
             attention_qkv_decode_group_chunking: false,
+            attention_qkv_prefill_consumer: false,
             attention_qkv_packed_rows4_matmul: false,
             output_packed_rows4_matmul: false,
             output_amx_prefill: false,
@@ -3688,6 +3694,7 @@ fn ffn_gate_up_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             attention_output_packed_rows4_matmul: false,
             attention_qkv_decode_consumer: false,
             attention_qkv_decode_group_chunking: false,
+            attention_qkv_prefill_consumer: false,
             attention_qkv_packed_rows4_matmul: false,
             output_packed_rows4_matmul: false,
             output_amx_prefill: false,
@@ -9049,20 +9056,42 @@ fn single_token_forward_diagnostics_follow_llama_stage_order() {
     assert_close(layer.residual_flow.attention_delta.max_abs_delta, 0.0);
 
     assert_slice_close(&layer.ffn_norm.checkpoint.first_values, &[1.0, 1.0]);
-    assert_slice_close(&layer.ffn_gate.checkpoint.first_values, &[1.0, 2.0]);
-    assert_slice_close(&layer.ffn_up.checkpoint.first_values, &[3.0, 4.0]);
+    assert_slice_close(
+        &layer.ffn_gate.as_ref().unwrap().checkpoint.first_values,
+        &[1.0, 2.0],
+    );
+    assert_slice_close(
+        &layer.ffn_up.as_ref().unwrap().checkpoint.first_values,
+        &[3.0, 4.0],
+    );
     let expected_activation = vec![silu(1.0) * 3.0, silu(2.0) * 4.0];
     assert_slice_close(
-        &layer.ffn_activation.checkpoint.first_values,
+        &layer
+            .ffn_activation
+            .as_ref()
+            .unwrap()
+            .checkpoint
+            .first_values,
         &expected_activation,
     );
     assert_eq!(
-        layer.ffn_activation_reconstruction.activation_order,
+        layer
+            .ffn_activation_reconstruction
+            .as_ref()
+            .unwrap()
+            .activation_order,
         "gate_up"
     );
-    assert_close(layer.ffn_activation_reconstruction.max_abs_delta, 0.0);
+    assert_close(
+        layer
+            .ffn_activation_reconstruction
+            .as_ref()
+            .unwrap()
+            .max_abs_delta,
+        0.0,
+    );
     assert_slice_close(
-        &layer.ffn_output.checkpoint.first_values,
+        &layer.ffn_output.as_ref().unwrap().checkpoint.first_values,
         &expected_activation,
     );
 
@@ -10142,15 +10171,41 @@ fn attention_trace_samples_gqa_kv_group_anchors_and_tail_heads() {
 }
 
 #[test]
-fn softmax_top_k_preserves_full_router_softmax_weights() {
+fn softmax_top_k_preserves_full_router_softmax_probabilities() {
     let top = softmax_top_k(&[0.0, 1.0, 2.0], 2);
-    assert_eq!(top[0].0, 2);
-    assert_eq!(top[1].0, 1);
-    let selected_sum = top.iter().map(|(_, weight)| *weight).sum::<f32>();
-    assert!(selected_sum < 1.0, "{top:?}");
+    assert_eq!(top[0].expert_idx, 2);
+    assert_eq!(top[1].expert_idx, 1);
+    let probability_sum = top
+        .iter()
+        .map(|selection| selection.router_probability)
+        .sum::<f32>();
+    assert!(probability_sum < 1.0, "{top:?}");
     let full_sum = 0.0_f32.exp() + 1.0_f32.exp() + 2.0_f32.exp();
     let expected_first = 2.0_f32.exp() / full_sum;
-    assert!((top[0].1 - expected_first).abs() < 1.0e-6, "{top:?}");
+    assert!(
+        (top[0].router_probability - expected_first).abs() < 1.0e-6,
+        "{top:?}"
+    );
+}
+
+#[test]
+fn softmax_top_k_renormalizes_selected_expert_weights() {
+    let top = softmax_top_k(&[0.0, 1.0, 2.0], 2);
+
+    assert_eq!(top[0].expert_idx, 2);
+    assert_eq!(top[1].expert_idx, 1);
+    let full_sum = 0.0_f32.exp() + 1.0_f32.exp() + 2.0_f32.exp();
+    let expected_probability = 2.0_f32.exp() / full_sum;
+    assert!(
+        (top[0].router_probability - expected_probability).abs() < 1.0e-6,
+        "{top:?}"
+    );
+    let selected_sum = top
+        .iter()
+        .map(|selection| selection.selected_weight)
+        .sum::<f32>();
+    assert!((selected_sum - 1.0).abs() < 1.0e-6, "{top:?}");
+    assert!(top[0].selected_weight > top[0].router_probability);
 }
 
 #[test]
@@ -10176,7 +10231,7 @@ fn mixtral_moe_ffn_routes_top_k_experts() {
     )
     .unwrap();
 
-    let (out, ..) = mixtral_moe_ffn(
+    let out = mixtral_moe_ffn(
         &input,
         &router,
         &gate_experts,
@@ -10184,10 +10239,25 @@ fn mixtral_moe_ffn_routes_top_k_experts() {
         &down_experts,
         2,
         "out",
+        true,
     )
     .unwrap();
 
     let expected = 1.0 / (1.0 + (-1.0_f32).exp());
-    assert!((out.data[0] - expected).abs() < 1.0e-3, "{:?}", out.data);
-    assert!((out.data[1] - expected).abs() < 1.0e-3, "{:?}", out.data);
+    assert!(
+        (out.tensor.data[0] - expected).abs() < 1.0e-3,
+        "{:?}",
+        out.tensor.data
+    );
+    assert!(
+        (out.tensor.data[1] - expected).abs() < 1.0e-3,
+        "{:?}",
+        out.tensor.data
+    );
+    let diagnostic = out.router_diagnostic.unwrap();
+    assert_eq!(diagnostic.expert_count, 2);
+    assert_eq!(diagnostic.expert_used_count, 2);
+    assert_eq!(diagnostic.rows[0].router_logits, vec![10.0, 0.0]);
+    assert_eq!(diagnostic.rows[0].selected_experts[0].expert_id, 0);
+    assert_eq!(diagnostic.rows[0].selected_experts[1].expert_id, 1);
 }

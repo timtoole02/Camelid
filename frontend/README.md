@@ -33,6 +33,8 @@ The frontend should make these shipped wins easy to see without turning them int
 
 All three rows still fail closed in the WebUI unless the active local GGUF matches the exact row and `/v1/health` reports `loaded_now=true` plus `generation_ready=true`. When `/api/capabilities` reports bounded template-shape, exact-row renderer, or perf/RSS fields, the frontend may show those as row-scoped evidence only; those fields do **not** establish broad arbitrary/Jinja-template readiness or production-throughput readiness. For the 3B row specifically, the canonical Ubuntu main-lane refresh at `../qa/evidence-bundles/llama32-3b-api-webui-current-head-20260513T2005Z-head-e9f926e/manifest.json` keeps chat green only for the exact `supported_exact_row_smoke` contract and does not widen context, production-throughput, portability, neighboring-row, or broad-family claims. The cards still do not infer neighboring sizes, base variants, other quantizations, larger contexts beyond checked packs, or portability.
 
+Mistral 7B Instruct v0.3 Q8_0 is visible as active validation only. The fail-closed current-head API/WebUI/RSS bundle expected `active_validation_unsupported`, `contract_supported=false`, and `webui_chat=blocked`, so the frontend must keep local chat blocked for that row until `/api/capabilities` and docs are explicitly promoted by a new support-contract bundle.
+
 ## Run locally
 
 Start Camelid first, usually on `127.0.0.1:8181`:

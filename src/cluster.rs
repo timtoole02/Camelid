@@ -47,7 +47,7 @@ pub fn send_activation_packet<W: Write>(
     let payload = unsafe {
         std::slice::from_raw_parts(
             activations.as_ptr() as *const u8,
-            activations.len() * std::mem::size_of::<f32>(),
+            std::mem::size_of_val(activations),
         )
     };
     writer.write_all(payload)?;
@@ -94,10 +94,7 @@ pub fn recv_activation_packet_limited<R: Read>(
     // Interpret the float vector buffer as a mutable byte buffer and read directly into it in one system call.
     let byte_count = float_count_usize * std::mem::size_of::<f32>();
     let payload_slice = unsafe {
-        std::slice::from_raw_parts_mut(
-            out_activations.as_mut_ptr() as *mut u8,
-            byte_count,
-        )
+        std::slice::from_raw_parts_mut(out_activations.as_mut_ptr() as *mut u8, byte_count)
     };
     reader.read_exact(payload_slice)?;
 
@@ -152,9 +149,8 @@ mod tests {
     use std::io::Cursor;
 
     use super::{
-        ACTIVATION_MAGIC, TOKEN_FEEDBACK_MAGIC, recv_activation_packet,
-        recv_activation_packet_limited, recv_token_feedback, send_activation_packet,
-        send_token_feedback,
+        recv_activation_packet, recv_activation_packet_limited, recv_token_feedback,
+        send_activation_packet, send_token_feedback, ACTIVATION_MAGIC, TOKEN_FEEDBACK_MAGIC,
     };
 
     #[test]

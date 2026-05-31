@@ -9142,5 +9142,149 @@ select:focus {
   background: #6b7280;
 }
 
+/* ==========================================================================
+   Premium Slate-Gray Glassmorphic Models Page Styles
+   ========================================================================== */
+
+.models-overview-hero {
+  position: relative;
+  overflow: hidden;
+  background: rgba(19, 19, 20, 0.9) !important;
+  border: 1px solid rgba(255, 255, 255, 0.05) !important;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3) !important;
+}
+
+.models-overview-hero::before {
+  content: '';
+  position: absolute;
+  top: -50%;
+  left: -20%;
+  width: 140%;
+  height: 200%;
+  background: radial-gradient(circle, rgba(100, 180, 255, 0.05) 0%, rgba(19, 19, 20, 0) 60%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+.models-hero-copy, .models-hero-ledger {
+  position: relative;
+  z-index: 1;
+}
+
+.models-model-card, .models-status-card {
+  border-radius: 20px !important;
+  border: 1px solid rgba(255, 255, 255, 0.05) !important;
+  background: rgba(30, 31, 32, 0.55) !important;
+  backdrop-filter: blur(14px);
+  box-shadow: 0 4px 30px rgba(0, 0, 0, 0.2);
+  transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1), box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1), border-color 0.25s cubic-bezier(0.4, 0, 0.2, 1) !important;
+}
+
+.models-model-card:hover, .models-status-card:hover {
+  transform: translateY(-2px);
+  border-color: rgba(255, 255, 255, 0.12) !important;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4), 0 0 16px rgba(255, 255, 255, 0.03);
+}
+
+.models-model-card.active-model-card {
+  border-color: rgba(100, 180, 255, 0.32) !important;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4), 0 0 20px rgba(100, 180, 255, 0.06);
+}
+
+.models-model-card.selected-model-card {
+  border-color: rgba(100, 180, 255, 0.22) !important;
+}
+
+.models-advanced-specs-toggle {
+  margin-top: 14px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  padding-top: 12px;
+}
+
+.models-advanced-specs-summary {
+  font-size: 0.8rem;
+  font-weight: 500;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  user-select: none;
+  transition: color 0.2s ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  outline: none;
+  font-family: 'Inter', sans-serif;
+}
+
+.models-advanced-specs-summary:hover {
+  color: var(--color-text);
+}
+
+.models-advanced-specs-toggle[open] .models-advanced-specs-summary {
+  margin-bottom: 12px;
+  color: var(--color-text);
+}
+
+.models-advanced-specs-content {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+  background: rgba(0, 0, 0, 0.22);
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.03);
+  animation: specsFadeIn 0.22s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+@keyframes specsFadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.models-toolbar-panel, .models-section-panel {
+  border-radius: 24px !important;
+  border: 1px solid rgba(255, 255, 255, 0.04) !important;
+  background: rgba(20, 20, 21, 0.45) !important;
+  backdrop-filter: blur(10px);
+}
+
+.models-search-field input, .models-filter-field select {
+  border-radius: 14px !important;
+  border: 1px solid rgba(255, 255, 255, 0.08) !important;
+  background: rgba(15, 15, 16, 0.7) !important;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.models-search-field input:focus, .models-filter-field select:focus {
+  border-color: rgba(100, 180, 255, 0.4) !important;
+  box-shadow: 0 0 10px rgba(100, 180, 255, 0.08) !important;
+}
+
+.progress-wrap {
+  margin-block: 14px;
+}
+
+.progress-bar {
+  background: rgba(255, 255, 255, 0.04) !important;
+  border-radius: 99px !important;
+  overflow: hidden;
+  height: 4px !important;
+  border: none !important;
+  width: 100% !important;
+  box-shadow: inset 0 1px 2px rgba(0,0,0,0.4) !important;
+}
+
+.progress-bar > div {
+  background: linear-gradient(90deg, #3b82f6, #60a5fa) !important;
+  height: 100% !important;
+  border-radius: 99px !important;
+  transition: width 0.35s cubic-bezier(0.4, 0, 0.2, 1) !important;
+  box-shadow: 0 0 8px rgba(96, 165, 250, 0.5) !important;
+}
+
 
 

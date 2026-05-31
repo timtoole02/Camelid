@@ -492,7 +492,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
                 newStatus = 'registered'
               } else if (dl.status === 'failed') {
                 newStatus = 'failed'
-                installError = 'Download failed'
+                installError = 'Download failed on the backend.'
               }
               return {
                 ...model,
@@ -505,13 +505,12 @@ export function useDashboardData({ showNotice, clearNotice }) {
               }
             }
           } else {
-            // If the download has vanished from the active list without explicitly transitioning to failed,
-            // assume it completed successfully.
+            // Do not assume success if the download record vanishes from the active downloads list
             modelsUpdated = true
             return {
               ...model,
-              status: 'registered',
-              progress: 100,
+              status: 'failed',
+              install_error: 'Download process was interrupted (e.g., server restarted). Please retry.',
               updated_at: nowIso(),
             }
           }
