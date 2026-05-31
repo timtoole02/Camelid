@@ -80,7 +80,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(
         body["support_contract"]["current_gate"],
-        "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048 packs; and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 has evidence-only bring-up with checked tokenizer/template, parity, and bounded 512/1024/2048/4096/8192 context artifacts, but support remains fail-closed until API/WebUI support-surface proof is synchronized. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied."
+        "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096 packs, while the previously cited 8192 pack is blocked pending a clean rerun after the 2026-05-31 local fallback timeout; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048 packs; and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 has evidence-only bring-up with checked tokenizer/template, parity, and bounded 512/1024/2048/4096/8192 context artifacts, but support remains fail-closed until API/WebUI support-surface proof is synchronized. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied."
     );
     let q8 = body["supported_quantization"]
         .as_array()
@@ -91,8 +91,9 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     assert_eq!(q8["status"], "supported_current_gate");
     let q8_notes = q8["notes"].as_str().unwrap();
     assert!(q8_notes.contains(
-        "exact Llama 3.2 1B Instruct Q8_0 now has checked bounded 512/1024/2048/4096/8192-context packs"
+        "exact Llama 3.2 1B Instruct Q8_0 now has checked bounded 512/1024/2048/4096-context packs"
     ));
+    assert!(q8_notes.contains("8192 blocked pending a clean rerun"));
     assert!(q8_notes.contains(
         "exact Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048-context packs"
     ));
@@ -121,8 +122,9 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     );
     let llama_bpe_notes = llama_bpe_family["notes"].as_str().unwrap();
     assert!(llama_bpe_notes.contains(
-        "exact Llama 3.2 1B Instruct Q8_0 has row-specific smoke support with checked bounded 512/1024/2048/4096/8192-context packs"
+        "exact Llama 3.2 1B Instruct Q8_0 has row-specific smoke support with checked bounded 512/1024/2048/4096-context packs"
     ));
+    assert!(llama_bpe_notes.contains("8192 blocked pending a clean rerun"));
     assert!(llama_bpe_notes.contains(
         "exact Llama 3.2 3B Instruct Q8_0 has supported_exact_row_smoke canonical Ubuntu main-lane API/WebUI evidence at source head e9f926ed1a65 plus checked bounded 512/1024/2048-context packs"
     ));
@@ -224,7 +226,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     assert_eq!(llama32_1b["frontend_load_path_verified"], "validated");
     assert_eq!(
         llama32_1b["tested_context"],
-        "short_api_webui_smoke_plus_first_512_second_1024_third_2048_fourth_4096_and_fifth_8192_context_packs"
+        "short_api_webui_smoke_plus_first_512_second_1024_third_2048_and_fourth_4096_context_packs; 8192 blocked pending clean rerun"
     );
     assert_eq!(
         llama32_1b["chat_template_renderer"],
@@ -276,23 +278,30 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     assert_eq!(llama32_1b["bounded_context_4096_window"], 4096);
     assert_eq!(
         llama32_1b["bounded_context_8192_pack"],
-        "validated_fifth_pack"
+        "blocked_pending_rerun"
     );
     assert_eq!(
         llama32_1b["bounded_context_8192_pack_id"],
-        "llama3-context-8192-smoke-v1"
+        "llama3-context-8192-local-timeout-20260531T1545"
     );
     assert_eq!(llama32_1b["bounded_context_8192_window"], 8192);
     assert_eq!(
         llama32_1b["latest_checked_bucket"],
-        "llama3-context-8192-smoke-v1"
+        "llama3-context-8192-local-timeout-20260531T1545"
     );
-    assert_eq!(llama32_1b["latest_checked_result"], "pass");
-    assert_eq!(llama32_1b["latest_checked_output"], "CMLD-819");
+    assert_eq!(llama32_1b["latest_checked_result"], "blocked_timeout");
+    assert_eq!(
+        llama32_1b["latest_checked_output"],
+        "timeout_after_120000_ms"
+    );
     assert!(llama32_1b["evidence"]
         .as_str()
         .unwrap()
-        .contains("fifth bounded 8192-context parity on current head"));
+        .contains("prior fifth bounded 8192-context pass"));
+    assert!(llama32_1b["evidence"]
+        .as_str()
+        .unwrap()
+        .contains("timed out after 120000 ms"));
     let llama32_3b = compatibility
         .iter()
         .find(|item| item["id"] == "llama32_3b_instruct_q8_0")
@@ -630,6 +639,54 @@ async fn completion_rejects_ambiguous_prompt_and_prompt_token_ids() {
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["error"]["code"], "ambiguous_generation_input");
+}
+
+#[tokio::test]
+async fn completion_rejects_prompt_arrays_with_typed_shape_error_before_runtime() {
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"tiny","prompt":[1,2,3],"stream":false}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "unsupported_prompt_shape");
+    assert_eq!(body["error"]["param"], "prompt");
+}
+
+#[tokio::test]
+async fn chat_completion_rejects_content_parts_with_typed_error_before_runtime() {
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"tiny","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"stream":false}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "unsupported_content_type");
+    assert_eq!(body["error"]["param"], "messages");
 }
 
 #[tokio::test]
@@ -1986,7 +2043,7 @@ async fn chat_completion_generates_one_decoded_token_from_loaded_dense_model() {
     assert_eq!(body["choices"][0]["message"]["role"], "assistant");
     assert_eq!(body["choices"][0]["message"]["content"], "<unk>");
     assert_eq!(body["choices"][0]["finish_reason"], "length");
-    assert!(body["choices"][0].get("logprobs").is_none());
+    assert!(body["choices"][0]["logprobs"].is_null());
     assert_eq!(body["usage"]["completion_tokens"], 1);
     assert!(body["camelid"]["prompt_token_ids"]
         .as_array()
@@ -2460,7 +2517,7 @@ async fn completion_endpoint_generates_multiple_greedy_tokens() {
     assert_eq!(body["choices"][0]["index"], 0);
     assert_eq!(body["choices"][0]["text"], "<unk><unk>");
     assert_eq!(body["choices"][0]["finish_reason"], "length");
-    assert!(body["choices"][0].get("logprobs").is_none());
+    assert!(body["choices"][0]["logprobs"].is_null());
     assert_eq!(body["usage"]["completion_tokens"], 2);
     assert!(body["camelid"]["prompt_token_ids"]
         .as_array()

@@ -15,7 +15,7 @@ The current WebUI is product-forward while still reflecting the local-first runt
 | Exact row | v0.1 public status | Checked boundary |
 | --- | --- | --- |
 | TinyLlama 1.1B Chat Q8_0 | Verified support gate | Parity, API/WebUI, template-shape, bounded 512-context, and RSS/perf evidence. |
-| Llama 3.2 1B Instruct Q8_0 | Verified bounded support | Load, completions, chat completions, WebUI, parity, row-scoped template evidence, unique-chat RSS/perf, and checked bounded context packs through 8192 where cited. |
+| Llama 3.2 1B Instruct Q8_0 | Verified bounded support | Load, completions, chat completions, WebUI, parity, row-scoped template evidence, unique-chat RSS/perf, and checked bounded context packs through 4096 where cited; the previously cited 8192 pack is blocked pending a clean rerun after the 2026-05-31 local fallback timeout. |
 | Llama 3.2 3B Instruct Q8_0 | Supported exact-row smoke | Canonical API/WebUI support-gate refresh, compact/broader parity, template evidence, bounded RSS/perf, and checked 512/1024/2048 context packs where cited. |
 | Llama 3 8B Instruct Q8_0 | Verified bounded support | Compact/broader parity, API/WebUI, bounded memory evidence, and checked 512/1024/2048 context packs where cited. |
 | Mistral-7B-Instruct-v0.3 Q8_0 | Evidence-only bring-up | Load, tokenizer/template, one-token parity, broader 50-token parity, and checked 512/1024/2048/4096/8192 context evidence exist, but the API/WebUI support contract is still fail-closed for v0.1. |

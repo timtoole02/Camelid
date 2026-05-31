@@ -3,7 +3,8 @@ import assert from 'node:assert/strict'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
+import { createServer } from 'node:http'
 
 const script = 'scripts/bench-llama3-same-host.mjs'
 const tmp = await mkdtemp(join(tmpdir(), 'camelid-bench-plan-'))
@@ -76,6 +77,74 @@ try {
   assert.match(uniquePlan.commands.harness, /--unique-prompt/)
   assert.match(uniquePlan.commands.harness, /--require-marker --expected-marker CMLD-UNIQUE/)
 
+  const scrubbedPlanPath = join(tmp, 'scrubbed-plan.json')
+  const scrubbedPlanRun = spawnSync(process.execPath, [
+    script,
+    '--print-plan',
+    '--model', '/tmp/Camelid Test/private-models/Llama-3.2-3B-Instruct-Q8_0.gguf',
+    '--backend-bin', '/tmp/Camelid Test/private-build/camelid',
+    '--llama-server', '/tmp/Camelid Test/private-reference/llama-server',
+    '--model-id', 'llama32-3b-q8-plan',
+    '--row-id', 'llama32_3b_instruct_q8_0',
+    '--max-tokens', '8',
+    '--warmup', '0',
+    '--repeats', '1',
+    '--out', scrubbedPlanPath,
+    '--scrub-local-paths',
+  ], { encoding: 'utf8' })
+
+  assert.equal(scrubbedPlanRun.status, 0, scrubbedPlanRun.stderr)
+  assert.doesNotMatch(scrubbedPlanRun.stdout, /\/tmp\/Camelid Test/)
+  assert.match(scrubbedPlanRun.stdout, /--scrub-local-paths/)
+  const scrubbedPlan = JSON.parse(await readFile(scrubbedPlanPath, 'utf8'))
+  const scrubbedPlanText = JSON.stringify(scrubbedPlan)
+  assert.doesNotMatch(scrubbedPlanText, /\/tmp\/Camelid Test/)
+  assert.doesNotMatch(scrubbedPlanText, /\/Users\/|\/home\//)
+  assert.equal(scrubbedPlan.model.model_path, '<redacted-model>/Llama-3.2-3B-Instruct-Q8_0.gguf')
+  assert.equal(scrubbedPlan.model.model_path_redacted, true)
+  assert.equal(scrubbedPlan.method.evidence_context.model_artifact.path_redacted, true)
+  assert.equal(scrubbedPlan.method.resource_snapshots.pre_start.storage.path_redacted, true)
+  assert.match(scrubbedPlan.commands.harness, /--model '<redacted-model>\/Llama-3\.2-3B-Instruct-Q8_0\.gguf'/)
+  assert.match(scrubbedPlan.commands.camelid_serve, /^camelid serve --addr/)
+  assert.match(scrubbedPlan.commands.llama_server, /^llama-server /)
+  assert.match(scrubbedPlan.method.evidence_context.privacy_note, /redacted for public-safe evidence/)
+
+  const camelidServer = await startFakeCamelidServer()
+  const llamaServer = await startFakeLlamaServer()
+  try {
+    const scrubbedReportPath = join(tmp, 'scrubbed-report.json')
+    const reportRun = await spawnNode([
+      script,
+      '--model', '/tmp/Camelid Test/private-models/Llama-3.2-3B-Instruct-Q8_0.gguf',
+      '--backend-bin', '/tmp/Camelid Test/private-build/camelid',
+      '--llama-server', '/tmp/Camelid Test/private-reference/llama-server',
+      '--backend', camelidServer.url,
+      '--llama-url', llamaServer.url,
+      '--model-id', 'llama32-3b-q8-report',
+      '--row-id', 'llama32_3b_instruct_q8_0',
+      '--max-tokens', '8',
+      '--warmup', '0',
+      '--repeats', '1',
+      '--start-backend=false',
+      '--start-llama-server=false',
+      '--require-marker',
+      '--out', scrubbedReportPath,
+      '--scrub-local-paths',
+    ])
+
+    assert.equal(reportRun.status, 0, reportRun.stderr)
+    const scrubbedReport = JSON.parse(await readFile(scrubbedReportPath, 'utf8'))
+    const scrubbedReportText = JSON.stringify(scrubbedReport)
+    assert.equal(scrubbedReport.schema, 'camelid.same_host_llama3_benchmark.v1')
+    assert.equal(scrubbedReport.guardrails.passed, true)
+    assert.equal(scrubbedReport.llama_cpp.binary, '<redacted-binary>/llama-server')
+    assert.equal(scrubbedReport.llama_cpp.binary_path_redacted, true)
+    assert.doesNotMatch(scrubbedReportText, /\/tmp\/Camelid Test/)
+    assert.doesNotMatch(scrubbedReportText, /\/Users\/|\/home\//)
+  } finally {
+    await Promise.all([camelidServer.close(), llamaServer.close()])
+  }
+
   const truncatedMarkerRun = spawnSync(process.execPath, [
     script,
     '--print-plan',
@@ -93,9 +162,83 @@ try {
   assert.equal(helpRun.status, 0, helpRun.stderr)
   assert.match(helpRun.stdout, /--print-plan/)
   assert.match(helpRun.stdout, /--unique-prompt/)
+  assert.match(helpRun.stdout, /--scrub-local-paths/)
   assert.match(helpRun.stdout, /CAMELID_STREAM_TIMING_DIAGNOSTICS=on/)
   assert.match(helpRun.stdout, /JSON report schema: camelid\.same_host_llama3_benchmark\.v1/)
   assert.match(helpRun.stdout, /does not promote production throughput/)
 } finally {
   await rm(tmp, { recursive: true, force: true })
+}
+
+function spawnNode(argv) {
+  return new Promise((resolvePromise) => {
+    const child = spawn(process.execPath, argv, {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.on('data', (chunk) => { stdout += chunk })
+    child.stderr.on('data', (chunk) => { stderr += chunk })
+    child.on('close', (status) => resolvePromise({ status, stdout, stderr }))
+  })
+}
+
+async function startFakeCamelidServer() {
+  return startServer((request, response) => {
+    if (request.url === '/v1/health') return json(response, { ok: true })
+    if (request.url === '/api/models/load') return json(response, { ok: true })
+    if (request.url === '/v1/chat/completions') {
+      return sse(response, [
+        { choices: [{ delta: { content: 'CMLD-' } }] },
+        {
+          choices: [{ delta: { content: 'BENCH' } }],
+          camelid: {
+            stream_timing_diagnostics: {
+              timings_ms: { generate: 12, first_content: 3 },
+              q8_schedule: { i8mm_single_projection_calls: 2 },
+            },
+          },
+        },
+      ])
+    }
+    response.writeHead(404).end()
+  })
+}
+
+async function startFakeLlamaServer() {
+  return startServer((request, response) => {
+    if (request.url === '/health') return json(response, { status: 'ok' })
+    if (request.url === '/completion') return sse(response, [
+      { content: 'CMLD-' },
+      { content: 'BENCH' },
+    ])
+    response.writeHead(404).end()
+  })
+}
+
+function startServer(handler) {
+  const server = createServer(handler)
+  return new Promise((resolvePromise, rejectPromise) => {
+    server.once('error', rejectPromise)
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address()
+      resolvePromise({
+        url: `http://127.0.0.1:${address.port}`,
+        close: () => new Promise((resolveClose) => server.close(resolveClose)),
+      })
+    })
+  })
+}
+
+function json(response, body) {
+  response.writeHead(200, { 'content-type': 'application/json' })
+  response.end(`${JSON.stringify(body)}\n`)
+}
+
+function sse(response, payloads) {
+  response.writeHead(200, { 'content-type': 'text/event-stream' })
+  for (const payload of payloads) response.write(`data: ${JSON.stringify(payload)}\n\n`)
+  response.end('data: [DONE]\n\n')
 }

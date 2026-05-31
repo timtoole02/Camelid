@@ -4,7 +4,7 @@ import { createReadStream } from 'node:fs'
 import { mkdir, readFile, stat, statfs, writeFile } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import os from 'node:os'
-import { dirname, resolve } from 'node:path'
+import { basename, dirname, resolve } from 'node:path'
 
 import { renderExpectedPrompt, resolveReferenceContext } from './lib/chat-parity-harness.mjs'
 
@@ -30,6 +30,7 @@ const requireMarker = args.has('require-marker') || process.env.CAMELID_BENCH_RE
 const expectedMarker = args.get('expected-marker') || process.env.CAMELID_BENCH_EXPECTED_MARKER || 'CMLD-BENCH'
 const uniquePrompt = args.has('unique-prompt') || process.env.CAMELID_BENCH_UNIQUE_PROMPT === '1'
 const minMarkerTokens = parsePositiveInt(process.env.CAMELID_BENCH_MIN_MARKER_TOKENS || '8', 'CAMELID_BENCH_MIN_MARKER_TOKENS')
+const scrubLocalPaths = args.has('scrub-local-paths') || process.env.CAMELID_BENCH_SCRUB_LOCAL_PATHS === '1'
 
 if (args.has('help') || args.has('h')) {
   console.log(usage())
@@ -62,7 +63,7 @@ if (args.has('print-plan')) {
     const outPath = resolve(out)
     await mkdir(dirname(outPath), { recursive: true })
     await writeFile(outPath, `${JSON.stringify(plan, null, 2)}\n`)
-    console.log(`json_out=${outPath}`)
+    console.log(`json_out=${scrubbedPath(outPath, 'output')}`)
   }
   process.exit(0)
 }
@@ -147,7 +148,8 @@ try {
     generated_utc: new Date().toISOString(),
     model: {
       row_id: rowId,
-      model_path: modelPath,
+      model_path: scrubbedPath(modelPath, 'model'),
+      model_path_redacted: scrubLocalPaths,
       model_id: modelId,
       render_mode: renderMode,
     },
@@ -194,7 +196,8 @@ try {
       warmups: llamaWarmups,
       runs: llamaRuns,
       summary: summarizeRuns(llamaRuns),
-      binary: llamaServerBin,
+      binary: scrubbedPath(llamaServerBin, 'binary'),
+      binary_path_redacted: scrubLocalPaths,
     },
     comparison: compareSummaries(summarizeRuns(camelidRuns), summarizeRuns(llamaRuns)),
     guardrails,
@@ -206,7 +209,7 @@ try {
     const outPath = resolve(out)
     await mkdir(dirname(outPath), { recursive: true })
     await writeFile(outPath, `${JSON.stringify(report, null, 2)}\n`)
-    console.log(`json_out=${outPath}`)
+    console.log(`json_out=${scrubbedPath(outPath, 'output')}`)
   }
   if (requireMarker && !guardrails.passed) {
     throw new Error(`benchmark marker guard failed: expected ${JSON.stringify(expectedMarker)} in every measured run`)
@@ -219,14 +222,19 @@ try {
 function buildPlan() {
   const backendUrl = new URL(backendBase)
   const llamaUrl = new URL(llamaBase)
-  const llamaArgs = ['--host', llamaUrl.hostname, '--port', llamaUrl.port || '8183', '-m', modelPath, '-ngl', '0', '-c', String(llamaContext), '--no-warmup']
+  const modelPathForOutput = scrubbedPath(modelPath, 'model')
+  const outPathForOutput = out ? scrubbedPath(resolve(out), 'output') : null
+  const backendBinForOutput = scrubLocalPaths ? 'camelid' : shellQuote(backendBin)
+  const llamaServerForOutput = scrubLocalPaths ? 'llama-server' : shellQuote(llamaServerBin)
+  const llamaArgs = ['--host', llamaUrl.hostname, '--port', llamaUrl.port || '8183', '-m', modelPathForOutput, '-ngl', '0', '-c', String(llamaContext), '--no-warmup']
   if (threads) llamaArgs.push('-t', String(threads))
   return {
     schema: 'camelid.same_host_llama3_benchmark_plan.v1',
     generated_utc: new Date().toISOString(),
     model: {
       row_id: rowId,
-      model_path: modelPath,
+      model_path: modelPathForOutput,
+      model_path_redacted: scrubLocalPaths,
       model_id: modelId,
       render_mode: renderMode,
     },
@@ -248,10 +256,10 @@ function buildPlan() {
       },
     },
     commands: {
-      harness: `node scripts/bench-llama3-same-host.mjs --model ${shellQuote(modelPath)} --model-id ${shellQuote(modelId)} --row-id ${shellQuote(rowId)} --max-tokens ${maxTokens} --warmup ${warmup} --repeats ${repeats}${threads ? ` --threads ${threads}` : ''}${explicitLlamaContext ? ` --llama-context ${explicitLlamaContext}` : ''}${uniquePrompt ? ' --unique-prompt' : ''}${requireMarker ? ` --require-marker --expected-marker ${shellQuote(expectedMarker)}` : ''}${out ? ` --out ${shellQuote(resolve(out))}` : ''}`,
-      camelid_serve: startBackend ? `${shellQuote(backendBin)} serve --addr ${shellQuote(`${backendUrl.hostname}:${backendUrl.port || '8181'}`)}` : 'not started by harness (--start-backend=false)',
-      llama_server: startLlamaServer ? [shellQuote(llamaServerBin), ...llamaArgs.map(shellQuote)].join(' ') : 'not started by harness (--start-llama-server=false)',
-      camelid_load_request: `POST ${backendBase}/api/models/load {"path":${JSON.stringify(modelPath)},"id":${JSON.stringify(modelId)}}`,
+      harness: `node scripts/bench-llama3-same-host.mjs --model ${shellQuote(modelPathForOutput)} --model-id ${shellQuote(modelId)} --row-id ${shellQuote(rowId)} --max-tokens ${maxTokens} --warmup ${warmup} --repeats ${repeats}${threads ? ` --threads ${threads}` : ''}${explicitLlamaContext ? ` --llama-context ${explicitLlamaContext}` : ''}${uniquePrompt ? ' --unique-prompt' : ''}${requireMarker ? ` --require-marker --expected-marker ${shellQuote(expectedMarker)}` : ''}${scrubLocalPaths ? ' --scrub-local-paths' : ''}${outPathForOutput ? ` --out ${shellQuote(outPathForOutput)}` : ''}`,
+      camelid_serve: startBackend ? `${backendBinForOutput} serve --addr ${shellQuote(`${backendUrl.hostname}:${backendUrl.port || '8181'}`)}` : 'not started by harness (--start-backend=false)',
+      llama_server: startLlamaServer ? [llamaServerForOutput, ...llamaArgs.map(shellQuote)].join(' ') : 'not started by harness (--start-llama-server=false)',
+      camelid_load_request: `POST ${backendBase}/api/models/load {"path":${JSON.stringify(modelPathForOutput)},"id":${JSON.stringify(modelId)}}`,
       camelid_measure_request: `POST ${backendBase}/v1/chat/completions stream=true max_tokens=${maxTokens} temperature=0`,
       llama_cpp_measure_request: `POST ${llamaBase}/completion stream=true n_predict=${maxTokens} temperature=0 cache_prompt=false`,
     },
@@ -329,6 +337,7 @@ Key options:
   --start-llama-server=false      Reuse an already-running llama-server.
   --out <path>                    Write the JSON report or --print-plan JSON.
   --print-plan                    Print exact commands/outputs/metric bounds without starting servers.
+  --scrub-local-paths             Redact local filesystem paths in JSON/plan output for public-safe artifacts.
 
 Example:
   CAMELID_BIN=target/release/camelid \\
@@ -347,6 +356,7 @@ Outputs:
   camelid_backend_q8_calls, json_out.
   Backend timing fields are populated only when Camelid is run with CAMELID_STREAM_TIMING_DIAGNOSTICS=on.
   JSON report schema: camelid.same_host_llama3_benchmark.v1.
+  Use --scrub-local-paths for public artifacts; leave it off for private operator reruns.
 
 Claim boundary:
   Bounded same-host timing evidence only. This does not promote production throughput,
@@ -559,7 +569,9 @@ async function collectEvidenceContext({ includeFileHashes }) {
       node: process.version,
     },
     model_artifact: modelInfo,
-    privacy_note: 'Host name, user name, and home-relative local paths are intentionally not recorded; scrub full artifacts before publication if absolute paths appear in commands.',
+    privacy_note: scrubLocalPaths
+      ? 'Local filesystem paths were redacted for public-safe evidence. Keep raw operator commands, host/IP details, key paths, and private paths out of durable public artifacts.'
+      : 'Host name and user name are not recorded, but local filesystem paths are present for private operator reproducibility. Do not publish without --scrub-local-paths redaction.',
   }
 }
 
@@ -589,7 +601,9 @@ function hostClass() {
 async function fileEvidence(path, { includeHash }) {
   const resolved = resolve(path)
   const info = {
-    path: resolved,
+    path: scrubbedPath(resolved, 'path'),
+    path_redacted: scrubLocalPaths,
+    file_name: basename(resolved),
     exists: false,
     size_bytes: null,
     sha256: includeHash ? null : 'not_computed_in_plan_mode',
@@ -659,13 +673,14 @@ async function filesystemSnapshot(path) {
     const totalBytes = Number(fs.blocks || 0) * blockSize
     const availableBytes = Number(fs.bavail || 0) * blockSize
     return {
-      path: resolve(path),
+      path: scrubbedPath(path, 'working_tree'),
+      path_redacted: scrubLocalPaths,
       total_gib: round(totalBytes / 1024 / 1024 / 1024),
       available_gib: round(availableBytes / 1024 / 1024 / 1024),
       used_pct: totalBytes > 0 ? round(((totalBytes - availableBytes) / totalBytes) * 100) : null,
     }
   } catch (error) {
-    return { path: resolve(path), error: error.code || error.message }
+    return { path: scrubbedPath(path, 'working_tree'), path_redacted: scrubLocalPaths, error: error.code || error.message }
   }
 }
 
@@ -775,4 +790,10 @@ function shellQuote(value) {
   const text = String(value)
   if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(text)) return text
   return `'${text.replaceAll("'", `'"'"'`)}'`
+}
+
+function scrubbedPath(path, label) {
+  if (!scrubLocalPaths) return resolve(path)
+  const name = basename(String(path || ''))
+  return name ? `<redacted-${label}>/${name}` : `<redacted-${label}>`
 }

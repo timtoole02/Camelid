@@ -591,6 +591,7 @@ pub struct GenerationLayerTimings {
 pub struct ChatCompletionChoice {
     pub index: u32,
     pub message: ChatCompletionMessage,
+    pub logprobs: Option<serde_json::Value>,
     pub finish_reason: &'static str,
 }
 
@@ -615,6 +616,7 @@ pub struct CompletionResponse {
 pub struct CompletionChoice {
     pub index: u32,
     pub text: String,
+    pub logprobs: Option<serde_json::Value>,
     pub finish_reason: &'static str,
 }
 
@@ -640,6 +642,7 @@ pub struct ChatCompletionStreamChunk {
 pub struct ChatCompletionStreamChoice {
     pub index: u32,
     pub delta: ChatCompletionDelta,
+    pub logprobs: Option<serde_json::Value>,
     pub finish_reason: Option<&'static str>,
 }
 
@@ -666,6 +669,7 @@ pub struct CompletionStreamChunk {
 pub struct CompletionStreamChoice {
     pub index: u32,
     pub text: String,
+    pub logprobs: Option<serde_json::Value>,
     pub finish_reason: Option<&'static str>,
 }
 
@@ -854,7 +858,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
         hf_catalog_install: true,
         execution_plan,
         support_contract: SupportContract {
-            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048 packs; and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 has evidence-only bring-up with checked tokenizer/template, parity, and bounded 512/1024/2048/4096/8192 context artifacts, but support remains fail-closed until API/WebUI support-surface proof is synchronized. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied.",
+            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096 packs, while the previously cited 8192 pack is blocked pending a clean rerun after the 2026-05-31 local fallback timeout; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048 packs; and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 has evidence-only bring-up with checked tokenizer/template, parity, and bounded 512/1024/2048/4096/8192 context artifacts, but support remains fail-closed until API/WebUI support-surface proof is synchronized. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied.",
             support_policy: "A model, tokenizer, quantization, API feature, or context length is supported only after tests, docs, and real-model evidence exist for that lane.",
             unsupported_policy: "Unsupported combinations should return typed errors instead of silently falling back to best-effort behavior.",
         },
@@ -877,7 +881,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "Q8_0",
                 status: "supported_current_gate",
-                notes: "TinyLlama remains the current support gate; exact Llama 3.2 1B Instruct Q8_0 now has checked bounded 512/1024/2048/4096/8192-context packs; exact Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048-context packs; and exact Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048-context packs where row-specific PASS artifacts exist. These are exact bounded-pack lanes only; no model-native/larger-context beyond the checked packs, arbitrary-template, production-throughput, portability, neighboring-row, or broad-family support is implied.",
+                notes: "TinyLlama remains the current support gate; exact Llama 3.2 1B Instruct Q8_0 now has checked bounded 512/1024/2048/4096-context packs, with 8192 blocked pending a clean rerun after the 2026-05-31 local fallback timeout; exact Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048-context packs; and exact Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048-context packs where row-specific PASS artifacts exist. These are exact bounded-pack lanes only; no model-native/larger-context beyond the checked packs, arbitrary-template, production-throughput, portability, neighboring-row, or broad-family support is implied.",
             },
         ],
         planned_quantization: vec![
@@ -901,7 +905,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "llama_bpe_decoder_exact_1b_3b_8b_q8_0",
                 status: "supported_exact_row_smoke_lanes",
-                notes: "exact Llama 3.2 1B Instruct Q8_0 has row-specific smoke support with checked bounded 512/1024/2048/4096/8192-context packs; exact Llama 3.2 3B Instruct Q8_0 has supported_exact_row_smoke canonical Ubuntu main-lane API/WebUI evidence at source head e9f926ed1a65 plus checked bounded 512/1024/2048-context packs; exact Llama 3 8B Instruct Q8_0 has row-specific smoke support with checked bounded 512/1024/2048-context packs, including the published source/runtime-head 8B 1024/2048 PASS bundle at 8e26be0a73c0. Broader 50-token, compact chat-template-shapes, and retained-block lazy-Q8 hot-path evidence remain exact-row bounded pack/measurement evidence only, and broad/full support still needs separate proof.",
+                notes: "exact Llama 3.2 1B Instruct Q8_0 has row-specific smoke support with checked bounded 512/1024/2048/4096-context packs, with 8192 blocked pending a clean rerun after the 2026-05-31 local fallback timeout; exact Llama 3.2 3B Instruct Q8_0 has supported_exact_row_smoke canonical Ubuntu main-lane API/WebUI evidence at source head e9f926ed1a65 plus checked bounded 512/1024/2048-context packs; exact Llama 3 8B Instruct Q8_0 has row-specific smoke support with checked bounded 512/1024/2048-context packs, including the published source/runtime-head 8B 1024/2048 PASS bundle at 8e26be0a73c0. Broader 50-token, compact chat-template-shapes, and retained-block lazy-Q8 hot-path evidence remain exact-row bounded pack/measurement evidence only, and broad/full support still needs separate proof.",
             },
         ],
         planned_model_families: vec![
@@ -994,7 +998,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 performance_measured: "bounded_unique_chat_perf_rss_validated",
                 frontend_load_path_verified: "validated",
                 frontend_readiness_gate: "green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id",
-                tested_context: "short_api_webui_smoke_plus_first_512_second_1024_third_2048_fourth_4096_and_fifth_8192_context_packs",
+                tested_context: "short_api_webui_smoke_plus_first_512_second_1024_third_2048_and_fourth_4096_context_packs; 8192 blocked pending clean rerun",
                 chat_template_renderer: "metadata_jinja_supported_for_exact_row",
                 chat_template_shape_pack: "validated_bounded_pack",
                 chat_template_shape_pack_id: "llama3-chat-template-shapes-v1",
@@ -1010,14 +1014,14 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 bounded_context_4096_pack: "validated_fourth_pack",
                 bounded_context_4096_pack_id: "llama3-context-4096-smoke-v1",
                 bounded_context_4096_window: 4096,
-                bounded_context_8192_pack: "validated_fifth_pack",
-                bounded_context_8192_pack_id: "llama3-context-8192-smoke-v1",
+                bounded_context_8192_pack: "blocked_pending_rerun",
+                bounded_context_8192_pack_id: "llama3-context-8192-local-timeout-20260531T1545",
                 bounded_context_8192_window: 8192,
-                latest_checked_bucket: "llama3-context-8192-smoke-v1",
-                latest_checked_result: "pass",
-                latest_checked_output: "CMLD-819",
-                evidence: "the exact bartowski Llama-3.2-1B-Instruct-Q8_0 GGUF has exact-row load, completion, chat-completion, frontend-smoke evidence, compact/prompt-pack parity, first bounded 512-context parity, second bounded 1024-context parity, third bounded 2048-context parity after the RoPE frequency-factor fix, fourth bounded 4096-context parity, and fifth bounded 8192-context parity on current head aaf9207d166999a21f4fde2a3f2ac5631f2fcecb, bounded compact template-shape coverage, metadata-Jinja renderer parity for the row template shapes, and bounded unique-chat perf/RSS evidence; Camelid supports exact-row smoke and the checked 512/1024/2048/4096/8192 context packs for this row only, not model-native/larger context beyond checked packs or broader/full support",
-                next_step: "preserve exact-row smoke plus checked 512/1024/2048/4096/8192 context support while normalizing model-native/larger context beyond checked packs, broader arbitrary-template behavior beyond the supported 1B metadata-Jinja row template, production throughput, portability, and durable full-support bundle evidence before any broader/full-support claim",
+                latest_checked_bucket: "llama3-context-8192-local-timeout-20260531T1545",
+                latest_checked_result: "blocked_timeout",
+                latest_checked_output: "timeout_after_120000_ms",
+                evidence: "the exact bartowski Llama-3.2-1B-Instruct-Q8_0 GGUF has exact-row load, completion, chat-completion, frontend-smoke evidence, compact/prompt-pack parity, first bounded 512-context parity, second bounded 1024-context parity, third bounded 2048-context parity after the RoPE frequency-factor fix, fourth bounded 4096-context parity, bounded compact template-shape coverage, metadata-Jinja renderer parity for the row template shapes, and bounded unique-chat perf/RSS evidence. The prior fifth bounded 8192-context pass on source/runtime head aaf9207d166999a21f4fde2a3f2ac5631f2fcecb is retained as historical evidence, but a 2026-05-31 local fallback rerun timed out after 120000 ms before Camelid diagnostics; Camelid supports exact-row smoke and the checked 512/1024/2048/4096 context packs for this row only until a clean 8192 rerun resolves the blocker",
+                next_step: "preserve exact-row smoke plus checked 512/1024/2048/4096 context support while rerunning or narrowing the blocked 8192 pack, then normalize model-native/larger context beyond checked packs, broader arbitrary-template behavior beyond the supported 1B metadata-Jinja row template, production throughput, portability, and durable full-support bundle evidence before any broader/full-support claim",
             },
             ModelCompatibilityTarget {
                 id: "llama32_3b_instruct_q8_0",
@@ -1976,10 +1980,13 @@ async fn create_generation_session(
 
 async fn completions(
     State(state): State<AppState>,
-    payload: std::result::Result<Json<CompletionRequest>, JsonRejection>,
+    payload: std::result::Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
-    let Json(req) = match payload {
-        Ok(payload) => payload,
+    let req = match payload {
+        Ok(Json(value)) => match completion_request_from_value(value) {
+            Ok(req) => req,
+            Err(response) => return response,
+        },
         Err(err) => return malformed_json_error(err),
     };
     let req = GenerationSessionRequest {
@@ -2043,6 +2050,7 @@ async fn completions(
                     choices: vec![CompletionChoice {
                         index: 0,
                         text,
+                        logprobs: None,
                         finish_reason,
                     }],
                     usage: CompletionUsage {
@@ -2070,10 +2078,13 @@ async fn completions(
 
 async fn chat_completions(
     State(state): State<AppState>,
-    payload: std::result::Result<Json<ChatCompletionRequest>, JsonRejection>,
+    payload: std::result::Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
-    let Json(req) = match payload {
-        Ok(payload) => payload,
+    let req = match payload {
+        Ok(Json(value)) => match chat_completion_request_from_value(value) {
+            Ok(req) => req,
+            Err(response) => return response,
+        },
         Err(err) => return malformed_json_error(err),
     };
     let req = GenerationSessionRequest {
@@ -2126,6 +2137,7 @@ async fn chat_completions(
                         role: "assistant",
                         content: generated.text,
                     },
+                    logprobs: None,
                     finish_reason: generated.finish_reason,
                 }],
                 usage: CompletionUsage {
@@ -2148,6 +2160,56 @@ async fn chat_completions(
             .into_response(),
         Err(response) => *response,
     }
+}
+
+fn completion_request_from_value(
+    value: serde_json::Value,
+) -> std::result::Result<CompletionRequest, Response> {
+    if let Some(prompt) = value.get("prompt") {
+        if !prompt.is_string() && !prompt.is_null() {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "unsupported_prompt_shape",
+                "/v1/completions currently supports prompt as one string; token arrays, mixed arrays, and batch prompt arrays are unsupported. Use camelid_prompt_token_ids only for Camelid diagnostic token input.".to_string(),
+                Some("prompt"),
+            ));
+        }
+    }
+    serde_json::from_value(value).map_err(|err| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "malformed_json",
+            err.to_string(),
+            None,
+        )
+    })
+}
+
+fn chat_completion_request_from_value(
+    value: serde_json::Value,
+) -> std::result::Result<ChatCompletionRequest, Response> {
+    if let Some(messages) = value.get("messages").and_then(serde_json::Value::as_array) {
+        for message in messages {
+            if let Some(content) = message.get("content") {
+                if !content.is_string() {
+                    return Err(api_error(
+                        StatusCode::BAD_REQUEST,
+                        "unsupported_content_type",
+                        "Camelid chat generation is text-only today; OpenAI content parts, image_url payloads, and other multimodal message content are unsupported.".to_string(),
+                        Some("messages"),
+                    ));
+                }
+            }
+        }
+    }
+    serde_json::from_value(value).map_err(|err| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "malformed_json",
+            err.to_string(),
+            None,
+        )
+    })
 }
 
 async fn validate_generation_request(
@@ -3072,6 +3134,7 @@ async fn generate_decoded_tokens_blocking(
     prepared: PreparedGeneration,
 ) -> std::result::Result<GeneratedText, Box<Response>> {
     let timeout = generation_timeout_duration()?;
+    let started = Instant::now();
     let handle = tokio::task::spawn_blocking(move || generate_decoded_tokens(prepared));
     match tokio::time::timeout(timeout, handle).await {
         Ok(Ok(result)) => result,
@@ -3081,16 +3144,147 @@ async fn generate_decoded_tokens_blocking(
             format!("generation worker failed before completing the request: {err}"),
             None,
         ))),
-        Err(_) => Err(Box::new(api_error(
+        Err(_) => Err(generation_timeout_response(
+            timeout,
+            started.elapsed(),
+            None,
+        )),
+    }
+}
+
+struct TimedGenerationStep {
+    session: LlamaInferenceSession,
+    step: LlamaGenerationStep,
+}
+
+enum GenerationStepBlockingError {
+    Response(Box<Response>),
+    Timeout {
+        timeout: Duration,
+        elapsed: Duration,
+        generated_tokens: usize,
+    },
+}
+
+struct StreamGenerationStepRequest {
+    session: LlamaInferenceSession,
+    input: Vec<u32>,
+    sampler: LlamaSampler,
+    history: Vec<u32>,
+    collect_dense_diagnostics: bool,
+    step_timeout: Duration,
+    request_timeout: Duration,
+    request_started: Instant,
+    generated_tokens: usize,
+}
+
+async fn generate_stream_step_blocking(
+    request: StreamGenerationStepRequest,
+) -> std::result::Result<TimedGenerationStep, GenerationStepBlockingError> {
+    let StreamGenerationStepRequest {
+        session,
+        input,
+        sampler,
+        history,
+        collect_dense_diagnostics,
+        step_timeout,
+        request_timeout,
+        request_started,
+        generated_tokens,
+    } = request;
+    let test_sleep = generation_step_test_sleep_duration();
+    let handle = tokio::task::spawn_blocking(move || {
+        if let Some(duration) = test_sleep {
+            std::thread::sleep(duration);
+        }
+        let mut session = session;
+        let step = session
+            .generate_next_token_with_history_diagnostics(
+                &input,
+                sampler,
+                &history,
+                collect_dense_diagnostics,
+            )
+            .map_err(|err| {
+                Box::new(api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "generation_step_failed",
+                    err.to_string(),
+                    None,
+                ))
+            })?;
+        Ok(TimedGenerationStep { session, step })
+    });
+    match tokio::time::timeout(step_timeout, handle).await {
+        Ok(Ok(result)) => result.map_err(GenerationStepBlockingError::Response),
+        Ok(Err(err)) => Err(GenerationStepBlockingError::Response(Box::new(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "generation_timeout",
-            format!(
+            "generation_worker_failed",
+            format!("generation worker failed before completing the stream step: {err}"),
+            None,
+        )))),
+        Err(_) => Err(GenerationStepBlockingError::Timeout {
+            timeout: request_timeout,
+            elapsed: request_started.elapsed(),
+            generated_tokens,
+        }),
+    }
+}
+
+fn generation_timeout_response(
+    timeout: Duration,
+    elapsed: Duration,
+    generated_tokens: Option<usize>,
+) -> Box<Response> {
+    Box::new(
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(generation_timeout_error_json(
+                timeout,
+                elapsed,
+                generated_tokens,
+            )),
+        )
+            .into_response(),
+    )
+}
+
+fn generation_timeout_error_json(
+    timeout: Duration,
+    elapsed: Duration,
+    generated_tokens: Option<usize>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "error": {
+            "message": format!(
                 "generation exceeded the configured wall-clock timeout of {} ms; reduce max_tokens, use streaming/progress instrumentation, or raise {GENERATION_TIMEOUT_ENV} for a controlled hardening run",
                 timeout.as_millis()
             ),
-            Some("max_tokens"),
-        ))),
-    }
+            "type": "runtime_unavailable",
+            "code": "generation_timeout",
+            "param": "max_tokens",
+            "timeout_trace": {
+                "timeout_ms": timeout.as_millis(),
+                "elapsed_ms": elapsed.as_millis(),
+                "generated_tokens": generated_tokens,
+                "timeout_env": GENERATION_TIMEOUT_ENV,
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+fn generation_step_test_sleep_duration() -> Option<Duration> {
+    env::var("CAMELID_TEST_GENERATION_STEP_SLEEP_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(Duration::from_millis)
+}
+
+#[cfg(not(test))]
+fn generation_step_test_sleep_duration() -> Option<Duration> {
+    None
 }
 
 fn generation_timeout_duration() -> std::result::Result<Duration, Box<Response>> {
@@ -3843,6 +4037,7 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
                         role: Some("assistant"),
                         content: None,
                     },
+                    logprobs: None,
                     finish_reason: None,
                 }],
                 camelid: None,
@@ -3855,6 +4050,14 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
 
         stream_event_timings.generate_start = Some(stream_started.elapsed().as_millis());
         let generation_started = Instant::now();
+        let request_timeout = match generation_timeout_duration() {
+            Ok(timeout) => timeout,
+            Err(response) => {
+                yield stream_error_event(*response);
+                yield Ok(Event::default().data("[DONE]"));
+                return;
+            }
+        };
         let collect_q8_schedule = stream_timing_diagnostics && q8_schedule_telemetry_enabled();
         if collect_q8_schedule {
             reset_q8_schedule_telemetry();
@@ -3924,21 +4127,39 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
             } else {
                 LlamaSampler::Sampling(sampling)
             };
-            let step = match prepared
-                .session
-                .generate_next_token_with_history_diagnostics(
-                    &input,
+            let Some(remaining_timeout) = request_timeout.checked_sub(stream_started.elapsed()) else {
+                yield generation_timeout_stream_event(request_timeout, stream_started.elapsed(), generated.len());
+                yield Ok(Event::default().data("[DONE]"));
+                return;
+            };
+            let TimedGenerationStep { session, step } = match generate_stream_step_blocking(
+                StreamGenerationStepRequest {
+                    session: prepared.session.clone(),
+                    input: input.clone(),
                     sampler,
-                    &history,
-                    prepared.collect_dense_diagnostics,
-                ) {
-                    Ok(step) => step,
-                    Err(err) => {
-                        yield stream_error_message_event("generation_step_failed", err.to_string());
-                        yield Ok(Event::default().data("[DONE]"));
-                        return;
-                    }
-                };
+                    history: history.clone(),
+                    collect_dense_diagnostics: prepared.collect_dense_diagnostics,
+                    step_timeout: remaining_timeout,
+                    request_timeout,
+                    request_started: stream_started,
+                    generated_tokens: generated.len(),
+                },
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(GenerationStepBlockingError::Response(response)) => {
+                    yield stream_error_event(*response);
+                    yield Ok(Event::default().data("[DONE]"));
+                    return;
+                }
+                Err(GenerationStepBlockingError::Timeout { timeout, elapsed, generated_tokens }) => {
+                    yield generation_timeout_stream_event(timeout, elapsed, generated_tokens);
+                    yield Ok(Event::default().data("[DONE]"));
+                    return;
+                }
+            };
+            prepared.session = session;
             if !reused_prompt_prefix
                 && generated.is_empty()
                 && !prepared.collect_dense_diagnostics
@@ -4001,6 +4222,7 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
                                 role: None,
                                 content: Some(delta),
                             },
+                            logprobs: None,
                             finish_reason: None,
                         }],
                         camelid: None,
@@ -4018,6 +4240,7 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
                         choices: vec![CompletionStreamChoice {
                             index: 0,
                             text: delta,
+                            logprobs: None,
                             finish_reason: None,
                         }],
                         camelid: None,
@@ -4060,6 +4283,7 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
                         role: None,
                         content: None,
                     },
+                    logprobs: None,
                     finish_reason: Some(finish_reason),
                 }],
                 camelid: camelid_diagnostics.clone(),
@@ -4074,6 +4298,7 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
                 choices: vec![CompletionStreamChoice {
                     index: 0,
                     text: String::new(),
+                    logprobs: None,
                     finish_reason: Some(finish_reason),
                 }],
                 camelid: camelid_diagnostics,
@@ -4091,6 +4316,16 @@ fn stream_error_event(response: Response) -> Result<Event, Infallible> {
         "stream_error",
         format!("stream failed after headers: HTTP {}", response.status()),
     )
+}
+
+fn generation_timeout_stream_event(
+    timeout: Duration,
+    elapsed: Duration,
+    generated_tokens: usize,
+) -> Result<Event, Infallible> {
+    Ok(Event::default()
+        .event("error")
+        .data(generation_timeout_error_json(timeout, elapsed, Some(generated_tokens)).to_string()))
 }
 
 fn stream_error_message_event(code: &str, message: String) -> Result<Event, Infallible> {
@@ -4763,6 +4998,7 @@ mod tests {
                     role: Some("assistant"),
                     content: None,
                 },
+                logprobs: None,
                 finish_reason: None,
             }],
             camelid: None,
@@ -4770,6 +5006,45 @@ mod tests {
 
         let value = serde_json::to_value(chunk).expect("stream chunk should serialize");
         assert!(value.get("camelid").is_none());
+    }
+
+    #[test]
+    fn openai_choice_shapes_include_null_logprobs_when_unrequested() {
+        let completion = CompletionChoice {
+            index: 0,
+            text: "hello".into(),
+            logprobs: None,
+            finish_reason: "stop",
+        };
+        let chat = ChatCompletionChoice {
+            index: 0,
+            message: ChatCompletionMessage {
+                role: "assistant",
+                content: "hello".into(),
+            },
+            logprobs: None,
+            finish_reason: "stop",
+        };
+        let completion_stream = CompletionStreamChoice {
+            index: 0,
+            text: "h".into(),
+            logprobs: None,
+            finish_reason: None,
+        };
+        let chat_stream = ChatCompletionStreamChoice {
+            index: 0,
+            delta: ChatCompletionDelta {
+                role: None,
+                content: Some("h".into()),
+            },
+            logprobs: None,
+            finish_reason: None,
+        };
+
+        assert!(serde_json::to_value(completion).unwrap()["logprobs"].is_null());
+        assert!(serde_json::to_value(chat).unwrap()["logprobs"].is_null());
+        assert!(serde_json::to_value(completion_stream).unwrap()["logprobs"].is_null());
+        assert!(serde_json::to_value(chat_stream).unwrap()["logprobs"].is_null());
     }
 
     #[test]
@@ -4986,15 +5261,22 @@ mod tests {
             "llama3-context-4096-smoke-v1"
         );
         assert_eq!(one_b.bounded_context_4096_window, 4096);
-        assert_eq!(one_b.bounded_context_8192_pack, "validated_fifth_pack");
+        assert_eq!(one_b.bounded_context_8192_pack, "blocked_pending_rerun");
         assert_eq!(
             one_b.bounded_context_8192_pack_id,
-            "llama3-context-8192-smoke-v1"
+            "llama3-context-8192-local-timeout-20260531T1545"
         );
         assert_eq!(one_b.bounded_context_8192_window, 8192);
-        assert_eq!(one_b.latest_checked_bucket, "llama3-context-8192-smoke-v1");
-        assert_eq!(one_b.latest_checked_output, "CMLD-819");
-        assert!(one_b.evidence.contains("fifth bounded 8192-context parity"));
+        assert_eq!(
+            one_b.latest_checked_bucket,
+            "llama3-context-8192-local-timeout-20260531T1545"
+        );
+        assert_eq!(one_b.latest_checked_result, "blocked_timeout");
+        assert_eq!(one_b.latest_checked_output, "timeout_after_120000_ms");
+        assert!(one_b
+            .evidence
+            .contains("prior fifth bounded 8192-context pass"));
+        assert!(one_b.evidence.contains("timed out after 120000 ms"));
 
         let three_b = response
             .model_compatibility
@@ -5050,9 +5332,14 @@ mod tests {
     #[test]
     fn capabilities_report_exact_8b_1024_2048_after_current_head_alignment() {
         let response = capabilities_response();
-        assert!(response.support_contract.current_gate.contains(
-            "Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs"
-        ));
+        assert!(response
+            .support_contract
+            .current_gate
+            .contains("Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096 packs"));
+        assert!(response
+            .support_contract
+            .current_gate
+            .contains("8192 pack is blocked pending a clean rerun"));
         assert!(response.support_contract.current_gate.contains(
             "Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048 packs"
         ));
@@ -5075,8 +5362,9 @@ mod tests {
             .find(|item| item.id == "Q8_0")
             .expect("Q8_0 row should stay advertised");
         assert!(q8.notes.contains(
-            "exact Llama 3.2 1B Instruct Q8_0 now has checked bounded 512/1024/2048/4096/8192-context packs"
+            "exact Llama 3.2 1B Instruct Q8_0 now has checked bounded 512/1024/2048/4096-context packs"
         ));
+        assert!(q8.notes.contains("8192 blocked pending a clean rerun"));
         assert!(q8.notes.contains(
             "exact Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048-context packs"
         ));
@@ -5092,8 +5380,11 @@ mod tests {
             .find(|item| item.id == "llama_bpe_decoder_exact_1b_3b_8b_q8_0")
             .expect("Llama BPE exact-row family should stay advertised");
         assert!(llama_bpe.notes.contains(
-            "exact Llama 3.2 1B Instruct Q8_0 has row-specific smoke support with checked bounded 512/1024/2048/4096/8192-context packs"
+            "exact Llama 3.2 1B Instruct Q8_0 has row-specific smoke support with checked bounded 512/1024/2048/4096-context packs"
         ));
+        assert!(llama_bpe
+            .notes
+            .contains("8192 blocked pending a clean rerun"));
         assert!(llama_bpe.notes.contains(
             "exact Llama 3.2 3B Instruct Q8_0 has supported_exact_row_smoke canonical Ubuntu main-lane API/WebUI evidence at source head e9f926ed1a65 plus checked bounded 512/1024/2048-context packs"
         ));
@@ -5357,6 +5648,64 @@ mod tests {
         assert!(diagnostics[2].probability > 0.0);
         assert!(diagnostics[2].probability < diagnostics[1].probability);
         assert!(diagnostics[2].selected);
+    }
+
+    #[test]
+    fn timeout_payload_is_scrubbed_and_records_trace_fields() {
+        let payload = generation_timeout_error_json(
+            Duration::from_millis(7),
+            Duration::from_millis(11),
+            Some(3),
+        );
+
+        let error = &payload["error"];
+        assert_eq!(error["code"], "generation_timeout");
+        assert_eq!(error["param"], "max_tokens");
+        assert_eq!(error["timeout_trace"]["timeout_ms"], 7);
+        assert_eq!(error["timeout_trace"]["elapsed_ms"], 11);
+        assert_eq!(error["timeout_trace"]["generated_tokens"], 3);
+        assert_eq!(
+            error["timeout_trace"]["timeout_env"],
+            GENERATION_TIMEOUT_ENV
+        );
+        let serialized = payload.to_string();
+        assert!(!serialized.contains("://"));
+        assert!(!serialized.contains(&["/Users", "/"].concat()));
+        assert!(!serialized.contains("models/"));
+    }
+
+    #[tokio::test]
+    async fn stream_step_blocking_timeout_reports_generated_count() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var("CAMELID_TEST_GENERATION_STEP_SLEEP_MS", "25");
+        let session = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+
+        let result = generate_stream_step_blocking(StreamGenerationStepRequest {
+            session,
+            input: vec![1, 2],
+            sampler: LlamaSampler::Greedy,
+            history: vec![1, 2],
+            collect_dense_diagnostics: false,
+            step_timeout: Duration::from_millis(1),
+            request_timeout: Duration::from_millis(1),
+            request_started: Instant::now(),
+            generated_tokens: 4,
+        })
+        .await;
+
+        std::env::remove_var("CAMELID_TEST_GENERATION_STEP_SLEEP_MS");
+        match result {
+            Err(GenerationStepBlockingError::Timeout {
+                timeout,
+                generated_tokens,
+                ..
+            }) => {
+                assert_eq!(timeout.as_millis(), 1);
+                assert_eq!(generated_tokens, 4);
+            }
+            Err(GenerationStepBlockingError::Response(_)) => panic!("expected timeout error"),
+            Ok(_) => panic!("expected stream step to time out"),
+        }
     }
 
     #[test]

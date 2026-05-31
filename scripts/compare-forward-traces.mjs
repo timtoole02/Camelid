@@ -18,6 +18,8 @@ console.log(`right=${args.right}`)
 console.log(`schema=${report.schema}`)
 console.log(`tolerance=${report.tolerance}`)
 console.log(`prompt_tokens_match=${report.prompt_tokens_match}`)
+console.log(`input_token_delta=${JSON.stringify(report.input_token_delta)}`)
+console.log(`position_id_delta=${JSON.stringify(report.position_id_delta)}`)
 console.log(`generated_token_delta=${JSON.stringify(report.generated_token_delta)}`)
 console.log(`known_good_token_delta=${JSON.stringify(report.known_good_token_delta)}`)
 console.log(`stage_paths_match=${report.stage_path_alignment.match}`)
@@ -90,6 +92,16 @@ function compareForwardTraces(left, right, { tolerance, topN }) {
     left: summarizeTrace(left),
     right: summarizeTrace(right),
     prompt_tokens_match: arraysEqual(left.trace.prompt_token_ids, right.trace.prompt_token_ids),
+    input_token_delta: {
+      left: left.trace.input_token_ids ?? [],
+      right: right.trace.input_token_ids ?? [],
+      match: arraysEqual(left.trace.input_token_ids, right.trace.input_token_ids),
+    },
+    position_id_delta: {
+      left: left.trace.position_ids ?? [],
+      right: right.trace.position_ids ?? [],
+      match: arraysEqual(left.trace.position_ids, right.trace.position_ids),
+    },
     generated_token_delta: {
       left: left.trace.generated_token_ids ?? [],
       right: right.trace.generated_token_ids ?? [],

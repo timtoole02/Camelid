@@ -35,6 +35,8 @@ const extracted = {
   },
   prompt_token_ids: diagnostics.prompt_token_ids ?? null,
   generated_token_ids: diagnostics.generated_token_ids ?? null,
+  input_token_ids: dense.input_token_ids ?? null,
+  position_ids: dense.position_ids ?? null,
   dense_metadata: diagnostics.dense_metadata ?? null,
   layer_count: dense.layers?.length ?? 0,
   selected_layers: layers,
@@ -104,6 +106,10 @@ function buildStages(dense, layers) {
   const addTrace = (pathName, trace, extra = {}) => stages.push(stage(pathName, 'attention_trace', { ...extra, attention_trace: compactAttentionTrace(trace) }))
   const addKvTrace = (pathName, trace, extra = {}) => stages.push(stage(pathName, 'kv_cache_trace', { ...extra, kv_cache_trace: compactKvCacheTrace(trace) }))
   const addReconstruction = (pathName, reconstruction, extra = {}) => stages.push(stage(pathName, 'reconstruction', { ...extra, reconstruction: compactReconstruction(reconstruction) }))
+  const addMoeRouter = (pathName, router, extra = {}) => {
+    const compacted = compactMoeRouter(router)
+    if (compacted) stages.push(stage(pathName, 'moe_router', { ...extra, moe_router: compacted }))
+  }
 
   addStats('embedding', dense.embedding)
   for (const layerIndex of layers) {
@@ -124,6 +130,7 @@ function buildStages(dense, layers) {
     addStats(`layers.${layerIndex}.attention_residual`, layer.attention_residual, { ...layerExtra, residual_delta: compactReconstruction(layer.residual_flow?.attention_delta) })
     addStats(`layers.${layerIndex}.ffn_input`, layer.residual_flow?.ffn_input, layerExtra)
     addStats(`layers.${layerIndex}.ffn_norm`, layer.ffn_norm, { ...layerExtra, reconstruction: compactReconstruction(layer.ffn_norm_reconstruction) })
+    addMoeRouter(`layers.${layerIndex}.moe_router`, layer.moe_router, layerExtra)
     addStats(`layers.${layerIndex}.ffn_gate`, layer.ffn_gate, { ...layerExtra, reconstruction: compactReconstruction(layer.ffn_gate_reconstruction) })
     addStats(`layers.${layerIndex}.ffn_up`, layer.ffn_up, { ...layerExtra, reconstruction: compactReconstruction(layer.ffn_up_reconstruction) })
     addStats(`layers.${layerIndex}.ffn_activation`, layer.ffn_activation, { ...layerExtra, reconstruction: compactReconstruction(layer.ffn_activation_reconstruction) })
@@ -277,6 +284,26 @@ function compactKvCacheTrace(trace) {
       key_first_values: numericArray(position.key_first_values),
       value_first_values: numericArray(position.value_first_values),
     })),
+  }
+}
+
+function compactMoeRouter(router) {
+  if (!router || typeof router !== 'object') return null
+  const rows = (router.rows ?? []).map(row => ({
+    row_index: integerOrNull(row.row_index),
+    router_logits: numericArray(row.router_logits),
+    router_probabilities: numericArray(row.router_probabilities),
+    selected_experts: (row.selected_experts ?? []).map(expert => ({
+      expert_id: integerOrNull(expert.expert_id),
+      selected_rank: integerOrNull(expert.selected_rank),
+      router_logit: numberOrNull(expert.router_logit),
+      router_probability: numberOrNull(expert.router_probability),
+      selected_weight: numberOrNull(expert.selected_weight),
+    })),
+  }))
+  return {
+    shape: router.shape ?? null,
+    rows,
   }
 }
 

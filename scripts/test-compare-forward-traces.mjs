@@ -29,6 +29,8 @@ try {
   right.top_logits[0].logit = 9.5
   right.output_projection[0].top_positive_components[0].component = 1.5
   right.generated_token_ids = [315]
+  right.input_token_ids = [1047]
+  right.position_ids = [9]
 
   await writeFile(leftPath, `${JSON.stringify(left, null, 2)}\n`)
   await writeFile(rightPath, `${JSON.stringify(right, null, 2)}\n`)
@@ -42,6 +44,8 @@ try {
   ], { cwd: resolve(scriptDir, '..') })
 
   assert.match(stdout, /schema=camelid\.forward-trace-comparison\.v1/)
+  assert.match(stdout, /input_token_delta=\{"left":\[1691\],"right":\[1047\],"match":false\}/)
+  assert.match(stdout, /position_id_delta=\{"left":\[8\],"right":\[9\],"match":false\}/)
   assert.match(stdout, /known_good_token_delta=\{"left":\[29907\],"right":\[29907\],"match":true\}/)
   assert.match(stdout, /stage_paths_match=true/)
   assert.match(stdout, /first_changed_stage=layers\.0\.attention_q/)
@@ -53,6 +57,12 @@ try {
   assert.deepEqual(report.generated_token_delta.left, [16301])
   assert.deepEqual(report.generated_token_delta.right, [315])
   assert.equal(report.generated_token_delta.match, false)
+  assert.deepEqual(report.input_token_delta.left, [1691])
+  assert.deepEqual(report.input_token_delta.right, [1047])
+  assert.equal(report.input_token_delta.match, false)
+  assert.deepEqual(report.position_id_delta.left, [8])
+  assert.deepEqual(report.position_id_delta.right, [9])
+  assert.equal(report.position_id_delta.match, false)
   assert.deepEqual(report.known_good_token_delta.left, [29907])
   assert.deepEqual(report.known_good_token_delta.right, [29907])
   assert.equal(report.known_good_token_delta.match, true)
@@ -211,6 +221,8 @@ function trace() {
     },
     prompt_token_ids: [1, 529, 29989, 13],
     generated_token_ids: [16301],
+    input_token_ids: [1691],
+    position_ids: [8],
     dense_metadata: {
       attention_head_count: 32,
       attention_head_count_kv: 4,

@@ -80,10 +80,10 @@ use crate::{
 #[cfg(test)]
 use crate::tensor::record_q8_0_file_read;
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(target_os = "linux", target_arch = "x86_64", camelid_x86_amx_shim))]
 use crate::tensor::Q8_0AmxPackedBlock;
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(target_os = "linux", target_arch = "x86_64", camelid_x86_amx_shim))]
 #[allow(dead_code)]
 unsafe extern "C" {
     fn camelid_x86_q8_amx_supported() -> std::os::raw::c_int;
@@ -601,6 +601,8 @@ impl LlamaTensorStats {
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct LlamaForwardDiagnostics {
+    pub input_token_ids: Vec<u32>,
+    pub position_ids: Vec<usize>,
     pub embedding: LlamaTensorStats,
     pub final_hidden: LlamaTensorStats,
     pub final_norm: LlamaFinalNormDiagnostic,
@@ -700,15 +702,39 @@ pub struct LlamaLayerDiagnostics {
     pub attention_residual: LlamaTensorStats,
     pub ffn_norm: LlamaTensorStats,
     pub ffn_norm_reconstruction: LlamaRmsNormDiagnostic,
-    pub ffn_gate: LlamaTensorStats,
-    pub ffn_gate_reconstruction: LlamaLinearProjectionDiagnostic,
-    pub ffn_up: LlamaTensorStats,
-    pub ffn_up_reconstruction: LlamaLinearProjectionDiagnostic,
-    pub ffn_activation: LlamaTensorStats,
-    pub ffn_activation_reconstruction: LlamaFfnActivationDiagnostic,
-    pub ffn_output: LlamaTensorStats,
-    pub ffn_down_reconstruction: LlamaLinearProjectionDiagnostic,
+    pub moe_router: Option<LlamaMoeRouterDiagnostic>,
+    pub ffn_gate: Option<LlamaTensorStats>,
+    pub ffn_gate_reconstruction: Option<LlamaLinearProjectionDiagnostic>,
+    pub ffn_up: Option<LlamaTensorStats>,
+    pub ffn_up_reconstruction: Option<LlamaLinearProjectionDiagnostic>,
+    pub ffn_activation: Option<LlamaTensorStats>,
+    pub ffn_activation_reconstruction: Option<LlamaFfnActivationDiagnostic>,
+    pub ffn_output: Option<LlamaTensorStats>,
+    pub ffn_down_reconstruction: Option<LlamaLinearProjectionDiagnostic>,
     pub ffn_residual: LlamaTensorStats,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LlamaMoeRouterDiagnostic {
+    pub shape: Vec<usize>,
+    pub rows: Vec<LlamaMoeRouterRowDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LlamaMoeRouterRowDiagnostic {
+    pub row_index: usize,
+    pub router_logits: Vec<f32>,
+    pub router_probabilities: Vec<f32>,
+    pub selected_experts: Vec<LlamaMoeSelectedExpertDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LlamaMoeSelectedExpertDiagnostic {
+    pub expert_id: usize,
+    pub selected_rank: usize,
+    pub router_logit: f32,
+    pub router_probability: f32,
+    pub selected_weight: f32,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -1850,6 +1876,8 @@ impl LlamaInferenceSession {
         timings.memory = memory;
         let diagnostics = if collect_diagnostics {
             Some(LlamaForwardDiagnostics {
+                input_token_ids: Vec::new(),
+                position_ids: Vec::new(),
                 embedding: embedding_stats.expect("embedding diagnostics collected"),
                 final_hidden: final_hidden_stats.expect("final hidden diagnostics collected"),
                 final_norm: final_norm_diagnostic.expect("final norm diagnostics collected"),
@@ -1943,11 +1971,14 @@ impl LlamaInferenceSession {
         }
 
         let last_token_id = *token_ids.last().expect("non-empty token_ids checked above");
+        let last_position = self.kv_cache.position;
         let timed =
             self.forward_single_token_timed_internal(last_token_id, collect_diagnostics, true)?;
         timings.add_assign(&timed.timings);
         first_token_timings.add_assign(&timed.timings);
-        if let Some(step_diagnostics) = timed.diagnostics {
+        if let Some(mut step_diagnostics) = timed.diagnostics {
+            step_diagnostics.input_token_ids = vec![last_token_id];
+            step_diagnostics.position_ids = vec![last_position];
             diagnostics = Some(step_diagnostics);
         }
 
@@ -3405,13 +3436,9 @@ fn forward_layer_timed(
         ffn_down_diagnostic,
         ffn_output_stats,
         ffn_out_already_residual,
+        moe_router_diagnostic,
     ) = if let (Some(moe), Some(router)) = (&params.config.moe, &layer.moe_router) {
-        if collect_diagnostics {
-            return Err(BackendError::UnsupportedModelArchitecture(
-                    "Mixtral MoE diagnostics are not implemented yet; generation remains runtime-only until parity evidence is collected".to_string(),
-                ));
-        }
-        let (ffn_out, gate, up, activation, down) = mixtral_moe_ffn(
+        let moe_out = mixtral_moe_ffn(
             &ffn_norm,
             router,
             &layer.ffn_gate,
@@ -3420,12 +3447,25 @@ fn forward_layer_timed(
             moe.expert_used_count as usize,
             format!("layer_{layer_idx}_mixtral_moe_ffn"),
         )?;
-        timings.ffn_gate = gate;
-        timings.ffn_up = up;
-        timings.ffn_activation = activation;
-        timings.ffn_down = down;
+        let ffn_output_stats = collect_diagnostics
+            .then(|| LlamaTensorStats::from_tensor(&moe_out.tensor))
+            .transpose()?;
+        timings.ffn_gate = moe_out.gate_elapsed;
+        timings.ffn_up = moe_out.up_elapsed;
+        timings.ffn_activation = moe_out.activation_elapsed;
+        timings.ffn_down = moe_out.down_elapsed;
         (
-            ffn_out, None, None, None, None, None, None, None, None, false,
+            moe_out.tensor,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ffn_output_stats,
+            false,
+            collect_diagnostics.then_some(moe_out.router),
         )
     } else {
         let activated_name = format!("layer_{layer_idx}_ffn_activated");
@@ -3464,6 +3504,7 @@ fn forward_layer_timed(
                 None,
                 None,
                 false,
+                None,
             )
         } else {
             let activated = gated_ffn_activation_with_plan(
@@ -3520,6 +3561,7 @@ fn forward_layer_timed(
                 ffn_down_diagnostic,
                 ffn_output_stats,
                 ffn_out_already_residual,
+                None,
             )
         }
     };
@@ -3599,18 +3641,15 @@ fn forward_layer_timed(
             ffn_norm: ffn_norm_stats.expect("ffn norm diagnostics collected"),
             ffn_norm_reconstruction: ffn_norm_diagnostic
                 .expect("ffn norm reconstruction diagnostics collected"),
-            ffn_gate: ffn_gate_stats.expect("ffn gate diagnostics collected"),
-            ffn_gate_reconstruction: ffn_gate_diagnostic
-                .expect("ffn gate reconstruction diagnostics collected"),
-            ffn_up: ffn_up_stats.expect("ffn up diagnostics collected"),
-            ffn_up_reconstruction: ffn_up_diagnostic
-                .expect("ffn up reconstruction diagnostics collected"),
-            ffn_activation: ffn_activation_stats.expect("ffn activation diagnostics collected"),
-            ffn_activation_reconstruction: ffn_activation_diagnostic
-                .expect("ffn activation reconstruction diagnostics collected"),
-            ffn_output: ffn_output_stats.expect("ffn output diagnostics collected"),
-            ffn_down_reconstruction: ffn_down_diagnostic
-                .expect("ffn down reconstruction diagnostics collected"),
+            moe_router: moe_router_diagnostic,
+            ffn_gate: ffn_gate_stats,
+            ffn_gate_reconstruction: ffn_gate_diagnostic,
+            ffn_up: ffn_up_stats,
+            ffn_up_reconstruction: ffn_up_diagnostic,
+            ffn_activation: ffn_activation_stats,
+            ffn_activation_reconstruction: ffn_activation_diagnostic,
+            ffn_output: ffn_output_stats,
+            ffn_down_reconstruction: ffn_down_diagnostic,
             ffn_residual: ffn_residual_stats.expect("ffn residual diagnostics collected"),
         })
     } else {
@@ -3829,7 +3868,7 @@ fn forward_prefill_layer_chunk_timed(
     trace_chunk_memory("ffn_norm_done");
 
     let ffn_out = if let (Some(moe), Some(router)) = (&params.config.moe, &layer.moe_router) {
-        let (ffn_out, gate, up, activation, down) = mixtral_moe_ffn(
+        let moe_out = mixtral_moe_ffn(
             &ffn_norm,
             router,
             &layer.ffn_gate,
@@ -3838,11 +3877,11 @@ fn forward_prefill_layer_chunk_timed(
             moe.expert_used_count as usize,
             format!("layer_{layer_idx}_prefill_mixtral_moe_ffn"),
         )?;
-        timings.ffn_gate = gate;
-        timings.ffn_up = up;
-        timings.ffn_activation = activation;
-        timings.ffn_down = down;
-        ffn_out
+        timings.ffn_gate = moe_out.gate_elapsed;
+        timings.ffn_up = moe_out.up_elapsed;
+        timings.ffn_activation = moe_out.activation_elapsed;
+        timings.ffn_down = moe_out.down_elapsed;
+        moe_out.tensor
     } else {
         let activated = gated_ffn_activation_batch(
             &ffn_norm,
@@ -6741,17 +6780,22 @@ fn try_gated_ffn_activation_batch_packed_prefill_i8mm(
     }))
 }
 
-fn softmax_top_k(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
+fn softmax_probabilities(logits: &[f32]) -> Vec<f32> {
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut scored = logits
         .iter()
-        .enumerate()
-        .map(|(idx, value)| (idx, (*value - max).exp()))
+        .map(|value| (*value - max).exp())
         .collect::<Vec<_>>();
-    let sum = scored.iter().map(|(_, value)| *value).sum::<f32>();
-    for (_, value) in &mut scored {
+    let sum = scored.iter().sum::<f32>();
+    for value in &mut scored {
         *value /= sum;
     }
+    scored
+}
+
+fn softmax_top_k(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
+    let probabilities = softmax_probabilities(logits);
+    let mut scored = probabilities.into_iter().enumerate().collect::<Vec<_>>();
     scored.sort_by(|left, right| {
         right
             .1
@@ -6759,12 +6803,10 @@ fn softmax_top_k(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     scored.truncate(k);
-    if env_flag_enabled("CAMELID_MOE_RENORMALIZE_TOP_K") {
-        let selected_sum = scored.iter().map(|(_, value)| *value).sum::<f32>();
-        if selected_sum > 0.0 {
-            for (_, value) in &mut scored {
-                *value /= selected_sum;
-            }
+    let selected_sum = scored.iter().map(|(_, value)| *value).sum::<f32>();
+    if selected_sum > 0.0 {
+        for (_, value) in &mut scored {
+            *value /= selected_sum;
         }
     }
     scored
@@ -6857,6 +6899,15 @@ fn expert_matrix_view(
     Ok(tensor)
 }
 
+struct MixtralMoeFfnOutput {
+    tensor: CpuTensor,
+    gate_elapsed: u128,
+    up_elapsed: u128,
+    activation_elapsed: u128,
+    down_elapsed: u128,
+    router: LlamaMoeRouterDiagnostic,
+}
+
 fn mixtral_moe_ffn(
     input: &CpuTensor,
     router: &CpuTensor,
@@ -6865,7 +6916,7 @@ fn mixtral_moe_ffn(
     down_experts: &CpuTensor,
     expert_used_count: usize,
     name: impl Into<String>,
-) -> Result<(CpuTensor, u128, u128, u128, u128)> {
+) -> Result<MixtralMoeFfnOutput> {
     if input.rank() != 2 {
         return Err(BackendError::RuntimeShapeMismatch(format!(
             "Mixtral MoE FFN expects rank-2 input, got {:?}",
@@ -6880,6 +6931,7 @@ fn mixtral_moe_ffn(
     let router_elapsed = router_started.elapsed().as_micros();
     let expert_count = logits.dim(1)?;
     let mut output = vec![0.0_f32; rows * hidden];
+    let mut router_rows = Vec::with_capacity(rows);
     let mut gate_elapsed = 0;
     let mut up_elapsed = 0;
     let mut activation_elapsed = 0;
@@ -6890,10 +6942,27 @@ fn mixtral_moe_ffn(
             vec![1, hidden],
             input.data[row * hidden..(row + 1) * hidden].to_vec(),
         )?;
-        let top = softmax_top_k(
-            &logits.data[row * expert_count..(row + 1) * expert_count],
-            expert_used_count,
-        );
+        let row_logits = &logits.data[row * expert_count..(row + 1) * expert_count];
+        let router_probabilities = softmax_probabilities(row_logits);
+        let top = softmax_top_k(row_logits, expert_used_count);
+        router_rows.push(LlamaMoeRouterRowDiagnostic {
+            row_index: row,
+            router_logits: row_logits.to_vec(),
+            router_probabilities: router_probabilities.clone(),
+            selected_experts: top
+                .iter()
+                .enumerate()
+                .map(|(selected_rank, (expert_id, selected_weight))| {
+                    LlamaMoeSelectedExpertDiagnostic {
+                        expert_id: *expert_id,
+                        selected_rank,
+                        router_logit: row_logits[*expert_id],
+                        router_probability: router_probabilities[*expert_id],
+                        selected_weight: *selected_weight,
+                    }
+                })
+                .collect(),
+        });
         for (expert_idx, weight) in top {
             let gate =
                 expert_matrix_view(gate_experts, expert_idx, hidden, ff, "mixtral_gate_expert")?;
@@ -6919,13 +6988,17 @@ fn mixtral_moe_ffn(
             }
         }
     }
-    Ok((
-        CpuTensor::from_f32(name, vec![rows, hidden], output)?,
-        gate_elapsed + router_elapsed,
+    Ok(MixtralMoeFfnOutput {
+        tensor: CpuTensor::from_f32(name, vec![rows, hidden], output)?,
+        gate_elapsed: gate_elapsed + router_elapsed,
         up_elapsed,
         activation_elapsed,
         down_elapsed,
-    ))
+        router: LlamaMoeRouterDiagnostic {
+            shape: logits.shape.dims.clone(),
+            rows: router_rows,
+        },
+    })
 }
 
 fn ffn_activation_diagnostics(
@@ -10184,7 +10257,7 @@ fn run_q8_0_packed_rows4_prefill_gemm4_kernel(
     }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(target_os = "linux", target_arch = "x86_64", camelid_x86_amx_shim))]
 fn try_q8_0_packed_rows4_amx_prefill_projection(
     input: &CpuTensor,
     packed: &Q8_0PackedRows4,
@@ -10275,7 +10348,7 @@ fn try_q8_0_packed_rows4_amx_prefill_projection(
     CpuTensor::from_f32(name, vec![rows, output_width], output).map(Some)
 }
 
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64", camelid_x86_amx_shim)))]
 fn try_q8_0_packed_rows4_amx_prefill_projection(
     _input: &CpuTensor,
     _packed: &Q8_0PackedRows4,
@@ -11753,19 +11826,17 @@ fn q8_row_dispatch_enabled() -> bool {
 unsafe fn q8_0_dot_rows_avx2(weight: &[Q8_0Block], input: &[Q8_0Block]) -> f32 {
     #[cfg(target_arch = "x86")]
     use std::arch::x86::{
-        _mm256_add_epi32, _mm256_castsi256_si128, _mm256_cmpeq_epi8, _mm256_cvtepi8_epi16,
-        _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16,
-        _mm256_movemask_epi8, _mm256_mullo_epi16, _mm256_set1_epi16, _mm256_set1_epi8,
-        _mm256_setzero_si256, _mm256_sign_epi8, _mm_add_epi32, _mm_cvtsi128_si32, _mm_loadu_si128,
-        _mm_shuffle_epi32,
+        _mm256_add_epi32, _mm256_cmpeq_epi8, _mm256_cvtepi8_epi16, _mm256_loadu_si256,
+        _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_movemask_epi8, _mm256_mullo_epi16,
+        _mm256_set1_epi16, _mm256_set1_epi8, _mm256_setzero_si256, _mm256_sign_epi8,
+        _mm256_storeu_si256, _mm_loadu_si128,
     };
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::{
-        _mm256_add_epi32, _mm256_castsi256_si128, _mm256_cmpeq_epi8, _mm256_cvtepi8_epi16,
-        _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16,
-        _mm256_movemask_epi8, _mm256_mullo_epi16, _mm256_set1_epi16, _mm256_set1_epi8,
-        _mm256_setzero_si256, _mm256_sign_epi8, _mm_add_epi32, _mm_cvtsi128_si32, _mm_loadu_si128,
-        _mm_shuffle_epi32,
+        _mm256_add_epi32, _mm256_cmpeq_epi8, _mm256_cvtepi8_epi16, _mm256_loadu_si256,
+        _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_movemask_epi8, _mm256_mullo_epi16,
+        _mm256_set1_epi16, _mm256_set1_epi8, _mm256_setzero_si256, _mm256_sign_epi8,
+        _mm256_storeu_si256, _mm_loadu_si128,
     };
 
     let ones = _mm256_set1_epi16(1);
@@ -14779,6 +14850,7 @@ fn q8_0_packed_rows4_dot(
     debug_assert_eq!(packed_blocks.len(), input.len());
     let mut sums = [0.0_f32; 4];
     for (idx, (packed_block, input_block)) in packed_blocks.iter().zip(input).enumerate() {
+        let _ = idx;
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
             if let Some(next_block) = packed_blocks.get(idx + 2) {

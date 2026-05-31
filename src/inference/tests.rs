@@ -5362,7 +5362,14 @@ fn q8_ffn_down_amx_prefill_benchmark() {
     };
 
     let (rows4_us, rows4) = bench(Box::new(|| {
-        q8_0_packed_rows4_matmul_projection(&input, packed, output_width, "rows4").unwrap()
+        q8_0_packed_rows4_matmul_projection(
+            &input,
+            packed,
+            output_width,
+            "rows4",
+            Q8PackedRows4MatmulSchedule::default(),
+        )
+        .unwrap()
     }));
     let (gemm4_us, gemm4) = bench(Box::new(|| {
         q8_0_packed_rows4_gemm4_projection_with_row_group_schedule(
@@ -5372,6 +5379,7 @@ fn q8_ffn_down_amx_prefill_benchmark() {
             "gemm4",
             false,
             true,
+            Q8PackedRows4MatmulSchedule::default(),
         )
         .unwrap()
     }));
@@ -5739,11 +5747,22 @@ fn q8_ffn_gate_up_packed_rows4_matmul_matches_runtime_packed_baseline_for_prefil
         Some(Q8_0RuntimeStorage::PackedRows4(packed)) => packed,
         other => panic!("expected runtime-packed up weight, got {other:?}"),
     };
-    let mut gate =
-        q8_0_packed_rows4_matmul_projection(&input, gate_packed, output_width, "expected_gate")
-            .unwrap();
-    let up = q8_0_packed_rows4_matmul_projection(&input, up_packed, output_width, "expected_up")
-        .unwrap();
+    let mut gate = q8_0_packed_rows4_matmul_projection(
+        &input,
+        gate_packed,
+        output_width,
+        "expected_gate",
+        Q8PackedRows4MatmulSchedule::default(),
+    )
+    .unwrap();
+    let up = q8_0_packed_rows4_matmul_projection(
+        &input,
+        up_packed,
+        output_width,
+        "expected_up",
+        Q8PackedRows4MatmulSchedule::default(),
+    )
+    .unwrap();
     for (gate_value, up_value) in gate.data.iter_mut().zip(up.data) {
         *gate_value = (*gate_value / (1.0 + (-*gate_value).exp())) * up_value;
     }
@@ -9285,20 +9304,42 @@ fn single_token_forward_diagnostics_follow_llama_stage_order() {
     assert_close(layer.residual_flow.attention_delta.max_abs_delta, 0.0);
 
     assert_slice_close(&layer.ffn_norm.checkpoint.first_values, &[1.0, 1.0]);
-    assert_slice_close(&layer.ffn_gate.checkpoint.first_values, &[1.0, 2.0]);
-    assert_slice_close(&layer.ffn_up.checkpoint.first_values, &[3.0, 4.0]);
+    assert_slice_close(
+        &layer.ffn_gate.as_ref().unwrap().checkpoint.first_values,
+        &[1.0, 2.0],
+    );
+    assert_slice_close(
+        &layer.ffn_up.as_ref().unwrap().checkpoint.first_values,
+        &[3.0, 4.0],
+    );
     let expected_activation = vec![silu(1.0) * 3.0, silu(2.0) * 4.0];
     assert_slice_close(
-        &layer.ffn_activation.checkpoint.first_values,
+        &layer
+            .ffn_activation
+            .as_ref()
+            .unwrap()
+            .checkpoint
+            .first_values,
         &expected_activation,
     );
     assert_eq!(
-        layer.ffn_activation_reconstruction.activation_order,
+        layer
+            .ffn_activation_reconstruction
+            .as_ref()
+            .unwrap()
+            .activation_order,
         "gate_up"
     );
-    assert_close(layer.ffn_activation_reconstruction.max_abs_delta, 0.0);
+    assert_close(
+        layer
+            .ffn_activation_reconstruction
+            .as_ref()
+            .unwrap()
+            .max_abs_delta,
+        0.0,
+    );
     assert_slice_close(
-        &layer.ffn_output.checkpoint.first_values,
+        &layer.ffn_output.as_ref().unwrap().checkpoint.first_values,
         &expected_activation,
     );
 
@@ -10378,41 +10419,43 @@ fn attention_trace_samples_gqa_kv_group_anchors_and_tail_heads() {
 }
 
 #[test]
-fn softmax_top_k_preserves_full_router_softmax_weights() {
+fn softmax_top_k_normalizes_selected_mixture_weights() {
     let top = softmax_top_k(&[0.0, 1.0, 2.0], 2);
     assert_eq!(top[0].0, 2);
     assert_eq!(top[1].0, 1);
     let selected_sum = top.iter().map(|(_, weight)| *weight).sum::<f32>();
-    assert!(selected_sum < 1.0, "{top:?}");
+    assert!((selected_sum - 1.0).abs() < 1.0e-6, "{top:?}");
     let full_sum = 0.0_f32.exp() + 1.0_f32.exp() + 2.0_f32.exp();
-    let expected_first = 2.0_f32.exp() / full_sum;
+    let selected_full_sum = (1.0_f32.exp() + 2.0_f32.exp()) / full_sum;
+    let expected_first = (2.0_f32.exp() / full_sum) / selected_full_sum;
     assert!((top[0].1 - expected_first).abs() < 1.0e-6, "{top:?}");
 }
 
 #[test]
 fn mixtral_moe_ffn_routes_top_k_experts() {
     let input = CpuTensor::from_f32("input", vec![1, 2], vec![1.0, 1.0]).unwrap();
-    let router = CpuTensor::from_f32("router", vec![2, 2], vec![10.0, 0.0, 0.0, 0.0]).unwrap();
+    let router =
+        CpuTensor::from_f32("router", vec![3, 2], vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0]).unwrap();
     let gate_experts = CpuTensor::from_f32(
         "gate_experts",
-        vec![2, 2, 2],
-        vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+        vec![2, 2, 3],
+        vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0],
     )
     .unwrap();
     let up_experts = CpuTensor::from_f32(
         "up_experts",
-        vec![2, 2, 2],
-        vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+        vec![2, 2, 3],
+        vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0],
     )
     .unwrap();
     let down_experts = CpuTensor::from_f32(
         "down_experts",
-        vec![2, 2, 2],
-        vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+        vec![2, 2, 3],
+        vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0],
     )
     .unwrap();
 
-    let (out, ..) = mixtral_moe_ffn(
+    let out = mixtral_moe_ffn(
         &input,
         &router,
         &gate_experts,
@@ -10423,7 +10466,29 @@ fn mixtral_moe_ffn_routes_top_k_experts() {
     )
     .unwrap();
 
-    let expected = 1.0 / (1.0 + (-1.0_f32).exp());
-    assert!((out.data[0] - expected).abs() < 1.0e-3, "{:?}", out.data);
-    assert!((out.data[1] - expected).abs() < 1.0e-3, "{:?}", out.data);
+    let selected_weight = 4.0_f32.exp() / (2.0_f32.exp() + 4.0_f32.exp());
+    let expected = selected_weight * (1.0 / (1.0 + (-1.0_f32).exp()));
+    assert!(
+        (out.tensor.data[0] - expected).abs() < 1.0e-3,
+        "{:?}",
+        out.tensor.data
+    );
+    assert!(
+        (out.tensor.data[1] - expected).abs() < 1.0e-3,
+        "{:?}",
+        out.tensor.data
+    );
+    assert_eq!(out.router.shape, vec![1, 3]);
+    assert_eq!(out.router.rows[0].selected_experts[0].expert_id, 2);
+    assert_eq!(out.router.rows[0].selected_experts[1].expert_id, 1);
+    assert_eq!(out.router.rows[0].selected_experts[0].router_logit, 4.0);
+    assert!(
+        (out.router.rows[0].selected_experts[0].selected_weight - selected_weight).abs() < 1.0e-6
+    );
+    let selected_sum = out.router.rows[0]
+        .selected_experts
+        .iter()
+        .map(|expert| expert.selected_weight)
+        .sum::<f32>();
+    assert!((selected_sum - 1.0).abs() < 1.0e-6);
 }
