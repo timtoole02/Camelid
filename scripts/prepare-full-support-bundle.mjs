@@ -16,7 +16,7 @@ Options:
   --repo-root <path>                 Repository root (default: current directory)
   --out-dir <path>                   Output bundle root (default: target/full-support-<utc>-head-<sha>)
   --utc <stamp>                      UTC stamp for the default output directory
-  --validation-host-status <status>  available | blocked_by_operator_shutdown (default: blocked_by_operator_shutdown)
+  --validation-host-status <status>  available | unavailable (default: unavailable)
   --help, -h                         Print this help without writing files
 `)
   process.exit(0)
@@ -30,9 +30,9 @@ const originMain = git(['rev-parse', 'origin/main'], repoRoot)
 const branch = git(['branch', '--show-current'], repoRoot)
 const outDir = resolve(args.get('out-dir') || join(repoRoot, 'target', `full-support-${utcStamp}-head-${gitHeadShort}`))
 const outDirRelative = relative(repoRoot, outDir) || '.'
-const validationHostStatus = args.get('validation-host-status') || 'blocked_by_operator_shutdown'
-if (!['available', 'blocked_by_operator_shutdown'].includes(validationHostStatus)) {
-  console.error(`unknown --validation-host-status ${JSON.stringify(validationHostStatus)}; expected available or blocked_by_operator_shutdown`)
+const validationHostStatus = args.get('validation-host-status') || 'unavailable'
+if (!['available', 'unavailable'].includes(validationHostStatus)) {
+  console.error(`unknown --validation-host-status ${JSON.stringify(validationHostStatus)}; expected available or unavailable`)
   process.exit(2)
 }
 const runtimeValidationAvailable = validationHostStatus === 'available'
@@ -148,7 +148,7 @@ const rows = [
     ],
     blockers: [
       'No durable current-head target/full-support evidence root exists yet for compact/broader/template/512/API-WebUI/perf together.',
-      ...hostShutdownBlockers('Promotion-grade 1B runtime evidence is blocked while Tim’s Ubuntu validation host is shut down.'),
+      ...hostShutdownBlockers('Promotion-grade 1B runtime evidence is blocked until a current Tim-authorized validation/runtime lane is attached to this bundle.'),
       'Do not imply neighboring Llama 3.2 rows or other quantizations are supported.'
     ],
     tracks: llamaTracks({
@@ -182,7 +182,7 @@ const rows = [
     ],
     blockers: [
       'Current public posture is exact-row smoke support only, not broader/full support.',
-      ...hostShutdownBlockers('Promotion-grade 3B runtime evidence is blocked while Tim’s Ubuntu validation host is shut down.'),
+      ...hostShutdownBlockers('Promotion-grade 3B runtime evidence is blocked until a current Tim-authorized validation/runtime lane is attached to this bundle.'),
       'Do not broaden beyond the exact 3B Instruct Q8_0 row without fresh Ubuntu artifacts and synchronized docs/API/frontend changes.'
     ],
     tracks: llamaTracks({
@@ -217,7 +217,7 @@ const rows = [
     blockers: [
       'Do not widen the single passing 512-context pack into broader context/full-support language; rerun broader context and performance/RSS evidence durably before promotion.',
       'Do not widen the chat-template-shapes pass into arbitrary GGUF/Jinja template support; it validates only the checked compact Llama 3 prompt shapes for the exact 8B row.',
-      ...hostShutdownBlockers('Promotion-grade 8B runtime evidence is blocked while Tim’s Ubuntu validation host is shut down.'),
+      ...hostShutdownBlockers('Promotion-grade 8B runtime evidence is blocked until a current Tim-authorized validation/runtime lane is attached to this bundle.'),
       'Do not broaden to neighboring Llama sizes, quantizations, longer contexts, or other template families.'
     ],
     tracks: llamaTracks({
@@ -271,7 +271,7 @@ const manifest = {
   },
   ubuntu_validation_guardrail: runtimeValidationAvailable
     ? 'Runtime tracks are runnable only on an approved Tim-authorized validation/runtime lane; keep Local Mac work to docs/recon/light prep unless Tim explicitly authorizes otherwise.'
-    : 'Validation lane paused by operator instruction: do not SSH to validation hosts, do not substitute a local Mac runtime rerun, and keep this scaffold blocked until Tim explicitly reopens an approved lane.',
+    : 'Runtime tracks are intentionally blocked in the default public scaffold. Generate runnable commands only for a current Tim-authorized validation/runtime lane, and do not substitute a local Mac runtime rerun.',
   validation_host_status: {
     status: validationHostStatus,
     runtime_validation_available: runtimeValidationAvailable,
@@ -279,7 +279,7 @@ const manifest = {
     blocked_rows: runtimeValidationAvailable ? [] : ['tinyllama_1_1b_chat_q8_0 recency rerun', 'llama32_1b_instruct_q8_0', 'llama32_3b_instruct_q8_0', 'llama3_8b_instruct_q8_0'],
     operator_instruction: runtimeValidationAvailable
       ? 'Runtime tracks were generated as runnable; execute only on the approved validation host or another Tim-authorized runtime lane.'
-      : 'Tim has shut down the Ubuntu validation server. Do not SSH to validation hosts and do not substitute local Mac llama-server/reference workloads until Tim explicitly reopens that lane.',
+      : 'No current Tim-authorized runtime validation lane is attached to this bundle. Generate runnable tracks only for a current approved lane, and do not substitute local Mac llama-server/reference workloads.',
   },
   required_tracks: ['compact-parity', 'broader-parity', 'chat-template-shapes', 'context-512', 'api-webui-smoke', 'perf-rss-portability'],
   prerequisites: {
@@ -406,7 +406,7 @@ function llamaTracks({ modelFile, modelId, compatibilityRow, compatibilityStatus
         ? contextTrackStatus
         : contextTrackStatus === 'known_blocker'
           ? 'known_blocker_and_validation_host_shutdown'
-          : 'blocked_by_validation_host_shutdown',
+          : 'blocked_without_current_validation_lane',
       description: 'Run the bounded 512-context pack and preserve success or failure durably.',
       pack_path: 'qa/prompt-packs/llama3-context-512-smoke.json',
       notes: contextTrackNotes,
@@ -430,10 +430,10 @@ function llamaTracks({ modelFile, modelId, compatibilityRow, compatibilityStatus
 }
 
 function runtimeTrackStatus() {
-  return runtimeValidationAvailable ? 'ready_to_run' : 'blocked_by_validation_host_shutdown'
+  return runtimeValidationAvailable ? 'ready_to_run' : 'blocked_without_current_validation_lane'
 }
 
-function hostShutdownBlockers(message = 'Fresh normalized runtime evidence is blocked while Tim’s Ubuntu validation host is shut down.') {
+function hostShutdownBlockers(message = 'Fresh normalized runtime evidence is blocked until a current Tim-authorized validation/runtime lane is attached to this bundle.') {
   return runtimeValidationAvailable ? [] : [message]
 }
 
@@ -442,10 +442,10 @@ function runtimeCommand(command) {
   return [
     'cat >&2 <<\'CAMELID_RUNTIME_VALIDATION_BLOCKED\'',
     'Camelid runtime validation is blocked for this generated bundle.',
-    'Tim has shut down the Ubuntu validation server; do not SSH to validation hosts and do not substitute local Mac llama-server/reference workloads until Tim explicitly reopens that lane.',
+    'No current Tim-authorized runtime validation lane is attached to this bundle; generate runnable tracks only for a current approved lane and do not substitute local Mac llama-server/reference workloads.',
     `Validation note: ${validationNotePath}`,
     '',
-    'Regenerate this bundle with --validation-host-status available only after Tim says the host/runtime lane is back.',
+    'Regenerate this bundle with --validation-host-status available only after a current approved runtime lane is available.',
     '',
     'Original command preserved for review only:',
     command,
@@ -568,8 +568,8 @@ function renderReadme(manifest) {
         'Preserve known blockers durably instead of deleting them; the 8B 512-context and chat-template-shapes passes are bounded packs only and broader performance/RSS evidence is still required.',
       ]
     : [
-        'Tim has shut down the Ubuntu validation server when this default bundle is generated; runtime command scripts exit blocked unless regenerated with `--validation-host-status available` after Tim explicitly says the lane is back.',
-        'Do not SSH to validation hosts, and do not substitute local Mac llama-server/reference workloads while the host-shutdown blocker is active.',
+        'The default public scaffold keeps runtime command scripts blocked unless regenerated with `--validation-host-status available` for a current approved runtime lane.',
+        'Do not substitute local Mac llama-server/reference workloads while the runtime-lane blocker is active.',
         'Keep claims exact-row only unless docs, API, frontend, and artifacts all agree.',
         'Preserve known blockers durably instead of deleting them; the 8B 512-context and chat-template-shapes passes are bounded packs only and broader performance/RSS evidence is still required.',
       ]

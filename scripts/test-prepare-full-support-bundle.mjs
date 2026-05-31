@@ -12,7 +12,7 @@ const help = spawnSync(process.execPath, ['scripts/prepare-full-support-bundle.m
   encoding: 'utf8',
 })
 assert.equal(help.status, 0, help.stderr || help.stdout)
-assert.match(help.stdout, /default: blocked_by_operator_shutdown/)
+assert.match(help.stdout, /default: unavailable/)
 
 const blockedRoot = await mkdtemp(join(tmpdir(), 'camelid-full-support-blocked-'))
 const blockedOut = join(blockedRoot, 'bundle')
@@ -23,9 +23,9 @@ const blocked = spawnSync(process.execPath, ['scripts/prepare-full-support-bundl
 assert.equal(blocked.status, 0, blocked.stderr || blocked.stdout)
 
 const blockedManifest = JSON.parse(await readFile(join(blockedOut, 'manifest.json'), 'utf8'))
-assert.equal(blockedManifest.validation_host_status.status, 'blocked_by_operator_shutdown')
+assert.equal(blockedManifest.validation_host_status.status, 'unavailable')
 assert.equal(blockedManifest.validation_host_status.runtime_validation_available, false)
-assert.match(blockedManifest.ubuntu_validation_guardrail, /Validation lane paused by operator instruction/)
+assert.match(blockedManifest.ubuntu_validation_guardrail, /default public scaffold/)
 assert.doesNotMatch(blockedManifest.ubuntu_validation_guardrail, /Use the canonical Ubuntu validation host/)
 assert.equal(
   blockedManifest.carry_forward_public_refs.validation_note,
@@ -41,13 +41,13 @@ for (const row of blockedManifest.rows) {
   assert.ok(row.tracks.length >= 6)
   for (const track of row.tracks) {
     if (track.status === 'carry_forward_only') continue
-    assert.match(track.status, /blocked_by_validation_host_shutdown/)
+    assert.match(track.status, /blocked_without_current_validation_lane/)
   }
 }
 
 const blockedReadme = await readFile(join(blockedOut, 'README.md'), 'utf8')
 assert.match(blockedReadme, /Runtime validation available: `false`/)
-assert.match(blockedReadme, /do not substitute local Mac llama-server\/reference workloads/)
+assert.match(blockedReadme, /default public scaffold keeps runtime command scripts blocked/)
 
 const blockedRuntimeScript = await readFile(
   join(blockedOut, 'llama3_8b_instruct_q8_0', 'commands', '01-compact-parity.sh'),
@@ -64,7 +64,7 @@ assert.ok(blockedRuntimeScripts.length >= 23)
 for (const scriptPath of blockedRuntimeScripts) {
   const script = await readFile(scriptPath, 'utf8')
   assert.match(script, /Camelid runtime validation is blocked/)
-  assert.match(script, /do not SSH to validation hosts/)
+  assert.match(script, /No current Tim-authorized runtime validation lane is attached/)
   assert.match(script, /do not substitute local Mac llama-server\/reference workloads/)
   assert.match(script, /qa\/validation-notes\/2026-05-12-local-only-validation-lane-paused\.md/)
   assert.match(script, /exit 86/)
