@@ -445,10 +445,10 @@ fn select_linux_x86_q8_plan(
     env_updates.insert("CAMELID_X86_Q8_REPACK", Some("on"));
     env_updates.insert("CAMELID_X86_Q8_KERNEL", Some("avx2"));
     let optional_x86_q8_gate = |name| {
-        if env_flag_disabled(name) {
-            Some("off")
-        } else {
+        if matches!(profile, ExecutionProfile::Experimental) && !env_flag_disabled(name) {
             Some("on")
+        } else {
+            Some("off")
         }
     };
     env_updates.insert(
@@ -566,17 +566,23 @@ fn select_linux_x86_q8_plan(
     );
     reasons.push("validated Ubuntu/Linux x86_64 Rust Q8 runtime repack enabled".into());
     reasons.push("validated Rust AVX2 Q8 packed rows4 kernel selected".into());
-    reasons.push(
-        "attention, FFN, and output experiments enabled by default"
-            .into(),
-    );
+    if matches!(profile, ExecutionProfile::Experimental) {
+        reasons
+            .push("attention, FFN, and output experiments enabled for experimental profile".into());
+    } else {
+        reasons.push("experimental x86 Q8 gates kept default-off for this profile".into());
+    }
     if matches!(profile, ExecutionProfile::Experimental) {
         reasons.push("experimental profile active; support claims remain unchanged".into());
     }
 
     (
         "cpu_q8_runtime_repack",
-        "x86_experimental_q8_0_avx2_rust",
+        if matches!(profile, ExecutionProfile::Experimental) {
+            "x86_experimental_q8_0_avx2_rust"
+        } else {
+            "x86_baseline_q8_0_avx2_rust"
+        },
         "q8_0_runtime_packed_rows4_prefill_avx2_available",
         "enabled_when_q8_runtime_storage_active",
         "q8_0_decode_packed_rows4_avx2",
@@ -885,6 +891,47 @@ mod tests {
     };
     use std::{collections::BTreeMap, path::PathBuf};
 
+    const OPTIONAL_X86_Q8_EXPERIMENT_GATES: &[&str] = &[
+        "CAMELID_X86_Q8_ATTENTION_PROJECTION_DECODE_CONSUMER",
+        "CAMELID_X86_Q8_ATTENTION_OUTPUT_DECODE_CONSUMER",
+        "CAMELID_X86_Q8_ATTENTION_OUTPUT_PACKED_ROWS4_MATMUL",
+        "CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER",
+        "CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUP_CHUNKING",
+        "CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL",
+        "CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL",
+        "CAMELID_X86_Q8_OUTPUT_AMX_PREFILL",
+        "CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE",
+        "CAMELID_X86_Q8_PARALLEL_INPUT_QUANTIZE",
+        "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER",
+        "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING",
+        "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION",
+        "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT",
+        "CAMELID_X86_Q8_FFN_DECODE_CHAIN",
+        "CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL",
+        "CAMELID_X86_Q8_FFN_GATE_UP_SINGLE_OWNER",
+        "CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER",
+        "CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL",
+        "CAMELID_X86_Q8_PACKED_ROWS4_MATMUL",
+        "CAMELID_X86_Q8_FFN_DOWN_GEMM4_PREFILL",
+        "CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_SCHED",
+        "CAMELID_X86_Q8_FFN_DOWN_GEMM4_AVX2",
+        "CAMELID_X86_Q8_FFN_DOWN_AMX_PREFILL",
+        "CAMELID_X86_Q8_FFN_DOWN_SINGLE_OWNER",
+        "CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE",
+        "CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR",
+        "CAMELID_X86_Q8_OUTPUT_DECODE_OWNER",
+    ];
+
+    fn assert_optional_x86_q8_gates(outcome: &ExecutionPlanOutcome, expected: &'static str) {
+        for gate in OPTIONAL_X86_Q8_EXPERIMENT_GATES {
+            assert_eq!(
+                outcome.env_updates.get(gate),
+                Some(&Some(expected)),
+                "{gate} should be {expected}"
+            );
+        }
+    }
+
     fn platform(os: &str, arch: &str, features: &[&str]) -> PlanPlatform {
         PlanPlatform {
             operating_system: os.into(),
@@ -1180,7 +1227,7 @@ mod tests {
     }
 
     #[test]
-    fn ubuntu_auto_enables_x86_optimizations_by_default() {
+    fn linux_x86_auto_profile_keeps_experimental_q8_gates_off() {
         let _guard = env_lock();
         clear_profile_env();
         let outcome = plan_for_model_with_platform(
@@ -1195,21 +1242,22 @@ mod tests {
         );
         assert_eq!(outcome.plan.profile, ExecutionProfile::Auto);
         assert_eq!(outcome.plan.selected_backend, "cpu_q8_runtime_repack");
-        assert_eq!(outcome.plan.selected_q8_path, "x86_experimental_q8_0_avx2_rust");
-        assert_eq!(outcome.env_updates.get("CAMELID_X86_Q8_KERNEL"), Some(&Some("avx2")));
-        assert_eq!(outcome.env_updates.get("CAMELID_X86_Q8_REPACK"), Some(&Some("on")));
-        assert!(!outcome.env_updates.contains_key("CAMELID_MAC_Q8_REPACK"));
+        assert_eq!(outcome.plan.selected_q8_path, "x86_baseline_q8_0_avx2_rust");
         assert_eq!(
-            outcome
-                .env_updates
-                .get("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER"),
+            outcome.env_updates.get("CAMELID_X86_Q8_KERNEL"),
+            Some(&Some("avx2"))
+        );
+        assert_eq!(
+            outcome.env_updates.get("CAMELID_X86_Q8_REPACK"),
             Some(&Some("on"))
         );
+        assert!(!outcome.env_updates.contains_key("CAMELID_MAC_Q8_REPACK"));
+        assert_optional_x86_q8_gates(&outcome, "off");
         clear_profile_env();
     }
 
     #[test]
-    fn ubuntu_experimental_validated_gates_select_rust_avx2_q8_path() {
+    fn linux_x86_experimental_profile_can_enable_q8_experiment_gates() {
         let _guard = env_lock();
         clear_profile_env();
         env::set_var("CAMELID_PROFILE", "experimental");
@@ -1243,164 +1291,7 @@ mod tests {
             outcome.env_updates.get("CAMELID_X86_Q8_KERNEL"),
             Some(&Some("avx2"))
         );
-        assert_eq!(
-            outcome
-                .env_updates
-                .get("CAMELID_X86_Q8_ATTENTION_PROJECTION_DECODE_CONSUMER"),
-            Some(&Some("on"))
-        );
-        assert_eq!(
-            outcome
-                .env_updates
-                .get("CAMELID_X86_Q8_ATTENTION_OUTPUT_DECODE_CONSUMER"),
-            Some(&Some("on"))
-        );
-        assert_eq!(
-            outcome
-                .env_updates
-                .get("CAMELID_X86_Q8_ATTENTION_OUTPUT_PACKED_ROWS4_MATMUL"),
-            Some(&Some("on"))
-        );
-        assert_eq!(
-            outcome
-                .env_updates
-                .get("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER"),
-            Some(&Some("on"))
-        );
-        assert_eq!(
-            outcome
-                .env_updates
-                .get("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUP_CHUNKING"),
-            Some(&Some("on"))
-        );
-        assert_eq!(
-            outcome
-                .env_updates
-                .get("CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL"),
-            Some(&Some("on"))
-        );
-        assert_eq!(
-            outcome
-                .env_updates
-                .get("CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL"),
-            Some(&Some("on"))
-        );
-        assert_eq!(
-            outcome.env_updates.get("CAMELID_X86_Q8_OUTPUT_AMX_PREFILL"),
-            Some(&Some("on"))
-        );
-        assert_eq!(
-            outcome
-                .env_updates
-                .get("CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE"),
-            Some(&Some("on"))
-        );
-        assert_eq!(
-            outcome
-                .env_updates
-                .get("CAMELID_X86_Q8_PARALLEL_INPUT_QUANTIZE"),
-            Some(&Some("on"))
-        );
-        assert_eq!(
-            outcome
-                .env_updates
-                .get("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER"),
-            Some(&Some("on"))
-        );
-        assert_eq!(
-            outcome
-                .env_updates
-                .get("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING"),
-            Some(&Some("on"))
-        );
-        assert_eq!(
-            outcome
-                .env_updates
-                .get("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_FUSED_ACTIVATION"),
-            Some(&Some("on"))
-        );
-        assert_eq!(
-            outcome
-                .env_updates
-                .get("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_PAIRED_DOT"),
-            Some(&Some("on"))
-        );
-        assert_eq!(
-            outcome.env_updates.get("CAMELID_X86_Q8_FFN_DECODE_CHAIN"),
-            Some(&Some("on"))
-        );
-        assert_eq!(
-            outcome
-                .env_updates
-                .get("CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL"),
-            Some(&Some("on"))
-        );
-        assert_eq!(
-            outcome
-                .env_updates
-                .get("CAMELID_X86_Q8_FFN_GATE_UP_SINGLE_OWNER"),
-            Some(&Some("on"))
-        );
-        assert_eq!(
-            outcome
-                .env_updates
-                .get("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER"),
-            Some(&Some("on"))
-        );
-        assert_eq!(
-            outcome
-                .env_updates
-                .get("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL"),
-            Some(&Some("on"))
-        );
-        assert_eq!(
-            outcome
-                .env_updates
-                .get("CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL"),
-            Some(&Some("on"))
-        );
-        assert_eq!(
-            outcome
-                .env_updates
-                .get("CAMELID_X86_Q8_FFN_DOWN_GEMM4_PREFILL"),
-            Some(&Some("on"))
-        );
-        assert_eq!(
-            outcome
-                .env_updates
-                .get("CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_SCHED"),
-            Some(&Some("on"))
-        );
-        assert_eq!(
-            outcome
-                .env_updates
-                .get("CAMELID_X86_Q8_FFN_DOWN_GEMM4_AVX2"),
-            Some(&Some("on"))
-        );
-        assert_eq!(
-            outcome
-                .env_updates
-                .get("CAMELID_X86_Q8_FFN_DOWN_AMX_PREFILL"),
-            Some(&Some("on"))
-        );
-        assert_eq!(
-            outcome
-                .env_updates
-                .get("CAMELID_X86_Q8_FFN_DOWN_SINGLE_OWNER"),
-            Some(&Some("on"))
-        );
-        assert_eq!(
-            outcome
-                .env_updates
-                .get("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE"),
-            Some(&Some("on"))
-        );
-        assert_eq!(
-            outcome
-                .env_updates
-                .get("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR"),
-            Some(&Some("on"))
-        );
+        assert_optional_x86_q8_gates(&outcome, "on");
         assert_eq!(
             outcome
                 .env_updates
@@ -1413,6 +1304,35 @@ mod tests {
                 .get("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER"),
             Some(&Some("on"))
         );
+        clear_profile_env();
+    }
+
+    #[test]
+    fn linux_x86_debug_profile_keeps_experiments_off_but_enables_diagnostics() {
+        let _guard = env_lock();
+        clear_profile_env();
+        env::set_var("CAMELID_PROFILE", "debug");
+        let outcome = plan_for_model_with_platform(
+            &PathBuf::from("/tmp/Llama-3.2-3B-Instruct-Q8_0.gguf"),
+            &fixture("Llama 3.2 3B Instruct"),
+            Some(16),
+            platform(
+                "linux",
+                "x86_64",
+                &["avx2", "avx512f", "avx512_vnni", "amx_int8"],
+            ),
+        );
+        assert_eq!(outcome.plan.profile, ExecutionProfile::Debug);
+        assert!(outcome
+            .plan
+            .diagnostics_status
+            .contains("debug diagnostics"));
+        assert_eq!(
+            outcome.env_updates.get("CAMELID_FORWARD_RSS_TIMINGS"),
+            Some(&Some("on"))
+        );
+        assert_eq!(outcome.plan.selected_q8_path, "x86_baseline_q8_0_avx2_rust");
+        assert_optional_x86_q8_gates(&outcome, "off");
         clear_profile_env();
     }
 
@@ -1689,7 +1609,10 @@ mod tests {
         );
         assert_eq!(outcome.plan.selected_backend, "cpu_reference");
         assert_eq!(outcome.plan.selected_q8_path, "safe_q8_0_block_dot");
-        assert_eq!(outcome.env_updates.get("CAMELID_X86_Q8_REPACK"), Some(&Some("off")));
+        assert_eq!(
+            outcome.env_updates.get("CAMELID_X86_Q8_REPACK"),
+            Some(&Some("off"))
+        );
         clear_profile_env();
     }
 

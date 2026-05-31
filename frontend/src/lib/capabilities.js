@@ -542,7 +542,6 @@ export const TRACKED_FULL_SUPPORT_ROW_IDS = [
   'llama32_1b_instruct_q8_0',
   'llama32_3b_instruct_q8_0',
   'llama3_8b_instruct_q8_0',
-  'mistral_7b_instruct_v0_3_q8_0',
 ]
 
 export const TRACKED_LLAMA_PROMOTION_ROW_IDS = TRACKED_FULL_SUPPORT_ROW_IDS
