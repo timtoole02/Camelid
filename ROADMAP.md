@@ -1,12 +1,12 @@
 # Camelid Roadmap
 
-Last updated: 2026-05-21
+Last updated: 2026-05-31
 
 `ROADMAP.md` is Camelid's delivery plan of record. It is not a backlog and it is not a feature wish list. It answers one product question: **what must happen next for Camelid to widen its support boundary without weakening credibility?** The sequencing is intentional: protect the supported lane, remove the next exact blocker, and widen claims only when the resulting evidence can survive scrutiny.
 
 [`COMPATIBILITY.md`](COMPATIBILITY.md) defines what Camelid can honestly support today. [`STATUS.md`](STATUS.md) records the artifacts, evidence boundaries, and blocker state behind that posture. Detailed completed-phase history lives in `ROADMAP_ARCHIVE.md` and `STATUS.md`. Read this file as operating sequence, not aspiration.
 
-Executive summary: Camelid has one full verified gate, three bounded Llama exact-row lanes, and one Mistral exact-row smoke lane. TinyLlama 1.1B Chat Q8_0 remains the trusted gate. Llama 3.2 1B Instruct Q8_0 is verified through checked 512/1024/2048/4096/8192 context packs. Llama 3.2 3B Instruct Q8_0 is supported as exact-row smoke with canonical Ubuntu API/WebUI evidence plus checked 512/1024/2048 context packs. Llama 3 8B Instruct Q8_0 is verified within checked 512/1024/2048 packs. Mistral 7B Instruct v0.3 Q8_0 is supported as exact-row smoke with checked bounded 512/1024/2048/4096/8192 context packs. Mixtral remains partial backend runtime evidence only and is blocked by later-generation divergence plus a continuation HTTP hang. Ubuntu x86 Q8 acceleration is active default-off performance work, not a support, portability, or throughput claim.
+Executive summary: Camelid has one full verified gate, three bounded Llama exact-row lanes, and one Mistral evidence-only bring-up lane. TinyLlama 1.1B Chat Q8_0 remains the trusted gate. Llama 3.2 1B Instruct Q8_0 is verified through checked 512/1024/2048/4096/8192 context packs. Llama 3.2 3B Instruct Q8_0 is supported as exact-row smoke with canonical Ubuntu API/WebUI evidence plus checked 512/1024/2048 context packs. Llama 3 8B Instruct Q8_0 is verified within checked 512/1024/2048 packs. Mistral 7B Instruct v0.3 Q8_0 has exact-row tokenizer/template, parity, and bounded 512/1024/2048/4096/8192 context evidence, but the support contract remains fail-closed until API/WebUI/RSS readiness is synchronized. Mixtral remains partial backend runtime evidence only and is blocked by later-generation divergence plus a continuation HTTP hang. Ubuntu x86 Q8 acceleration is active default-off performance work, not a support, portability, or throughput claim.
 
 Practical reading rule: if a task does not protect the current gate, remove the next exact blocker, or prepare aligned support-language updates, it is secondary to this roadmap.
 
@@ -21,13 +21,13 @@ Current program posture:
 - **1B promoted lane:** Llama 3.2 1B Instruct Q8_0 is verified through checked bounded 512/1024/2048/4096/8192 packs where row-specific PASS artifacts exist; this does not promote model-native/larger context, neighboring rows, production throughput, or portability.
 - **3B promoted lane:** Llama 3.2 3B Instruct Q8_0 is supported as exact-row smoke with canonical Ubuntu API/WebUI refresh at source head `e9f926ed1a65`, compact/broader parity, bounded unique-chat RSS/perf, and checked 512/1024/2048 packs; broader/full support remains gated.
 - **8B promoted lane:** Llama 3 8B Instruct Q8_0 has verified bounded support through compact parity, a three-prompt 50-token Ubuntu parity run, API/frontend smoke, bounded memory evidence, checked bounded 512/1024/2048 context packs, and one bounded compact chat-template-shapes pack for the exact tracked Q8_0 GGUF; broader/full 8B support remains gated.
-- **Next-family posture:** Mistral 7B Instruct v0.3 Q8_0 is supported as exact-row smoke, Mixtral 8x7B Instruct v0.1 Q8_0 is blocked partial runtime evidence only, and Qwen/Gemma remain planned exact-row candidates.
+- **Next-family posture:** Mistral 7B Instruct v0.3 Q8_0 remains evidence-only bring-up with the support contract fail-closed, Mixtral 8x7B Instruct v0.1 Q8_0 is blocked partial runtime evidence only, and Qwen/Gemma remain planned exact-row candidates.
 - **Performance posture:** Ubuntu x86 Q8 work remains default-off and evidence-gated. It may guide runtime architecture, but it does not widen support language or promise user-visible speed until same-host parity and repeated timing evidence justify it.
 - **Explicit non-claim:** no broad Llama-family support exists today; neighboring variants remain unsupported unless they have their own exact row and evidence.
 
 Nothing inherits support from a nearby size, quantization, family, tokenizer lane, API surface, or UI state.
 
-Near-term thesis: protect the trusted TinyLlama gate, the exact Llama 3.2 1B/3B and Llama 3 8B bounded rows, and the promoted Mistral 7B Instruct v0.3 Q8_0 exact-row smoke lane; keep Mixtral fail-closed until its blockers are fixed; and advance Ubuntu x86 performance only through default-off, measured, parity-preserving slices.
+Near-term thesis: protect the trusted TinyLlama gate, the exact Llama 3.2 1B/3B and Llama 3 8B bounded rows, keep Mistral fail-closed until its support-surface blockers are cleared, keep Mixtral fail-closed until its blockers are fixed, and advance Ubuntu x86 performance only through default-off, measured, parity-preserving slices.
 
 ## Roadmap operating rules
 
@@ -47,11 +47,11 @@ Recent work moved the release ledger only where the evidence, API, frontend, and
 - Llama 3.2 3B Q8_0 is now a supported exact-row smoke lane after exact-GGUF load, compact prompt-token/1-token/5-token/50-token parity, canonical Ubuntu API/WebUI refresh, frontend evidence, bounded unique-chat RSS/perf, and bounded 512/1024/2048 context-pack evidence aligned.
 - Llama 3.2 3B no longer has the JSON-shaped broader prompt-pack blocker; the post-Q8-dot clean three-prompt 50-token rerun now passes against llama.cpp.
 - Llama 3 8B Q8_0 moved from groundwork-only to verified bounded support after Ubuntu three-prompt parity, API/frontend smoke, bounded memory evidence, checked bounded 512/1024/2048 context packs, and compact chat-template-shapes packs aligned for that exact row only.
-- Mistral 7B Instruct v0.3 Q8_0 is supported as exact-row smoke with tokenizer/template, 1-token generation, broader five-prompt/50-token parity, checked bounded 512/1024/2048/4096/8192 context, and synchronized API/WebUI/RSS evidence fully verified.
+- Mistral 7B Instruct v0.3 Q8_0 remains evidence-only bring-up: tokenizer/template, 1-token generation, broader five-prompt/50-token parity, and checked bounded 512/1024/2048/4096/8192 context evidence are green, but API/WebUI/RSS support-surface proof remains fail-closed.
 - Mixtral 8x7B Instruct v0.1 Q8_0 remains blocked partial runtime evidence only: bounded one-token MoE evidence exists, but Gate 9A later-generation divergence and a continuation backend HTTP hang block API/WebUI/frontend readiness and support promotion.
 - Ubuntu x86 Q8 performance work has produced default-off route/control-plane/kernel slices and retained/rejected evidence, but the current roadmap treats it as evidence-gated performance work, not a support or throughput milestone.
 
-Near-term objective: preserve the supported TinyLlama gate, exact Llama 3.2 1B/3B and Llama 3 8B bounded lanes, and the Mistral 7B Instruct v0.3 Q8_0 exact-row smoke lane; fix Mixtral blockers before any support wording; and keep performance claims default-off until same-host evidence moves the whole-model result.
+Near-term objective: preserve the supported TinyLlama gate and exact Llama 3.2 1B/3B plus Llama 3 8B bounded lanes, keep Mistral evidence-only until a scrubbed support-surface bundle promotes it, fix Mixtral blockers before any support wording, and keep performance claims default-off until same-host evidence moves the whole-model result.
 
 ## Delivery sequence: now, next, later
 
@@ -66,7 +66,7 @@ Protect the supported lanes and clear the next blocker before widening claims.
 - Protect the exact Llama 3.2 3B and Llama 3 8B bounded 512/1024/2048 rows.
 - Preserve the Llama 3.2 1B/3B broader prompt-pack plus bounded context-pack wins while expanding only after model-native/larger-context, stronger performance/portability, and broader chat-template evidence land.
 - Preserve the Llama 3 8B exact-row promotion through the checked 512/1024/2048-context packs on current `main`; older 1024/2048 bundles remain historical source-head evidence only.
-- Protect the Mistral 7B Instruct v0.3 Q8_0 exact-row smoke lane across all support surfaces.
+- Keep Mistral 7B Instruct v0.3 Q8_0 evidence-only across all support surfaces until the support contract is promoted.
 - Keep Mixtral fail-closed until later-generation divergence and the continuation hang are fixed and rerun through API/WebUI/RSS/frontend evidence.
 - Keep Ubuntu x86 Q8 acceleration default-off while the team proves route hit, parity, repeated same-host timing, and whole-model impact.
 - Keep README, `COMPATIBILITY.md`, `ROADMAP.md`, `STATUS.md`, `/api/capabilities`, and frontend readiness copy aligned.
@@ -75,7 +75,7 @@ Protect the supported lanes and clear the next blocker before widening claims.
 
 Promote only what can be defended row by row.
 
-- Close the active next-model bring-up set as exact-row evidence lanes first, never as family-wide support claims. **Mistral 7B Instruct v0.3 Q8_0** is the immediate validation lane; **Mixtral 8x7B Instruct v0.1 Q8_0** remains blocked until later-generation divergence and continuation hang are fixed and rerun.
+- Close the active next-model bring-up set as exact-row evidence lanes first, never as family-wide support claims. **Mistral 7B Instruct v0.3 Q8_0** remains the immediate fail-closed validation lane; **Mixtral 8x7B Instruct v0.1 Q8_0** remains blocked until later-generation divergence and continuation hang are fixed and rerun.
 - Widen Llama 3.2 3B Q8_0 beyond exact-row smoke only if broader prompt/chat-template, memory/performance, API, and WebUI evidence all land.
 - Retain an Ubuntu x86 Q8 performance slice only when it is default-off, parity-preserving, measured on the canonical same-host lane, and improves the whole-model result or narrows the proven bottleneck.
 - Broaden quantization support beyond Q8_0 with tests, docs, and exact-row evidence.
@@ -102,7 +102,7 @@ Broaden the product surface only after correctness and release discipline are st
 | Llama 3.2 1B Instruct Q8_0 exact-row bounded support | Complete / bounded support | Compact parity, broader prompt-pack parity, API smoke, frontend smoke, exact-row metadata-Jinja row-template evidence, bounded template-shapes, unique-chat RSS/perf, and bounded 512/1024/2048/4096/8192 context packs agree for this exact 1B Q8_0 row. |
 | Llama 3.2 3B Instruct Q8_0 exact-row smoke | Complete / narrow support | Exact GGUF load, compact prompt-token/1-token/5-token/50-token parity, broader three-prompt parity, canonical Ubuntu API/WebUI refresh, bounded unique-chat RSS/perf, and bounded 512/1024/2048 context packs agree for this exact 3B Q8_0 row. |
 | Llama 3 8B Instruct Q8_0 exact-row bounded support | Complete / bounded support through checked 512/1024/2048 packs | Compact prompt-token/1-token/5-token/50-token parity, the three-prompt 50-token pack, API smoke, frontend smoke, bounded memory evidence, checked bounded 512/1024/2048 context packs, and the compact chat-template-shapes pack support this exact 8B Q8_0 row only. |
-| Mistral 7B Instruct v0.3 Q8_0 exact-row validation | Complete / supported exact-row smoke | Tokenizer/template, 1-token generation, broader five-prompt/50-token parity, bounded 512/1024/2048, and checked 4096/8192 context evidence are fully verified, and support is promoted and synchronized across support surfaces. |
+| Mistral 7B Instruct v0.3 Q8_0 exact-row validation | Active / evidence-only bring-up | Tokenizer/template, 1-token generation, broader five-prompt/50-token parity, bounded 512/1024/2048, and checked 4096/8192 context evidence are green, but support promotion remains blocked until API/WebUI/RSS readiness and `/api/capabilities` synchronize on the same fail-closed contract. |
 | Mixtral 8x7B Instruct v0.1 Q8_0 runtime bring-up | Blocked / partial runtime evidence | Bounded one-token backend MoE evidence exists; Gate 9A later-generation divergence and continuation backend HTTP hang must be fixed before API/WebUI/frontend readiness or support promotion. |
 | Quantization breadth beyond Q8_0 | Planned | Each quant format has loader/runtime tests, docs, and at least one row-specific real-model artifact. |
 | Longer-context correctness | Planned | Context-length claims are backed by model-specific audits and documented limits. |
@@ -121,7 +121,7 @@ Current required discipline:
 - Llama 3.2 1B Q8_0 is verified for this exact row with compact/broader parity, API/WebUI evidence, exact-row metadata-Jinja row-template evidence, bounded template-shapes, unique-chat RSS/perf, and bounded 512/1024/2048/4096/8192 context-pack evidence; model-native/larger-context beyond checked packs, production throughput, portability, and broader arbitrary-template expansion remain gated.
 - Llama 3.2 3B Q8_0 is supported as an exact-row smoke lane with compact and broader three-prompt parity, canonical Ubuntu API/WebUI refresh at source head `e9f926ed1a65`, bounded unique-chat RSS/perf, row-scoped metadata-Jinja/template-shape evidence, and bounded 512/1024/2048 context-pack evidence; model-native/larger-context and broader arbitrary-template expansion remain gated.
 - Llama 3 8B Q8_0 has verified bounded support with compact parity, the three-prompt 50-token pass, API/frontend smoke, bounded memory evidence, checked bounded 512/1024/2048 context packs, and one compact chat-template-shapes pack; model-native/larger context beyond checked packs, broader chat-template, production performance, and portability expansion remain gated.
-- Mistral 7B Instruct v0.3 Q8_0 is supported exact-row smoke. Tokenizer/template, generation, context, and API/WebUI/RSS evidence are fully promoted and synchronized across README, compatibility, status, API, and frontend surfaces.
+- Mistral 7B Instruct v0.3 Q8_0 remains evidence-only bring-up. Tokenizer/template, generation, and checked context evidence exist, but API/WebUI/RSS evidence still keeps the support contract fail-closed across README, compatibility, status, API, and frontend surfaces.
 - Mixtral 8x7B Instruct v0.1 Q8_0 is active validation / partial backend runtime only. Later-generation divergence and the continuation hang block readiness.
 - Qwen 2.5 7B and Gemma 2 9B remain planned exact-row candidates only.
 - Frontend readiness must remain exact-row and exact-quant aware.
@@ -182,7 +182,7 @@ Tokenizer support remains part of the release contract, not a side detail.
 Near-term expectations:
 
 - preserve the current LLaMA/SPM and Llama 3 template behavior
-- preserve and protect Mistral tokenizer/template evidence for the supported exact-row smoke lane
+- preserve and protect Mistral tokenizer/template evidence for the evidence-only bring-up lane
 - keep Mixtral tokenizer/template and sparse-MoE evidence scoped as partial runtime evidence until later-generation and API/WebUI blockers close
 - treat Qwen/Gemma tokenizer and chat-template work as planned exact-row fixture work, not readiness
 - add fixtures for whitespace, multiline prompts, control tokens, EOS behavior, and prompt-shape edge cases
