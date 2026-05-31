@@ -1,6 +1,31 @@
 import { memo, useEffect, useMemo, useState } from 'react'
 import { clampText, formatPreview, formatSidebarDate } from '../lib/formatters'
 
+const GeminiSparkle = ({ className = '', size = 18 }) => (
+  <svg
+    className={`gemini-sparkle-icon ${className}`}
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    fill="none"
+    xmlns="http://www.w3.org/2000/svg"
+  >
+    <path
+      d="M12 3C12 3 12.3 8.3 15.5 11.5C18.7 14.7 24 15 24 15C24 15 18.7 15.3 15.5 18.5C12.3 21.7 12 27 12 27C12 27 11.7 21.7 8.5 18.5C5.3 15.3 0 15 0 15C0 15 5.3 14.7 8.5 11.5C11.7 8.3 12 3 12 3Z"
+      fill="url(#gemini-sparkle-grad)"
+    />
+    <defs>
+      <linearGradient id="gemini-sparkle-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+        <stop offset="0%" stopColor="#4285f4" />
+        <stop offset="35%" stopColor="#9b51e0" />
+        <stop offset="70%" stopColor="#e289f2" />
+        <stop offset="100%" stopColor="#fa9085" />
+      </linearGradient>
+    </defs>
+  </svg>
+)
+
+
 const tabs = [
   { id: 'chat', label: 'Chat' },
   { id: 'library', label: 'Models' },
@@ -225,7 +250,7 @@ function AppSidebar({
                   aria-label="Go to the front page"
                   title="Go to the front page"
                 >
-                  <strong>Camelid</strong>
+                  <strong className="sidebar-brand-with-sparkle"><GeminiSparkle size={18} className="sidebar-brand-sparkle-icon" /> Camelid</strong>
                 </button>
                 <div className="sidebar-utility-actions">
                   <button type="button" className="sidebar-utility-button" aria-label="Start a new chat" onClick={showNewChatLanding}>

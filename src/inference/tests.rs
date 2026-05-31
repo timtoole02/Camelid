@@ -9,6 +9,155 @@ fn assert_close(actual: f32, expected: f32) {
     );
 }
 
+#[test]
+#[allow(clippy::needless_range_loop)]
+fn test_row_dispatch_adversarial_parity() {
+    let _env_guard = env_lock();
+
+    let n_blocks = 4;
+
+    let mut weight_blocks = Vec::with_capacity(n_blocks);
+    let mut input_blocks = Vec::with_capacity(n_blocks);
+
+    // Block 0: Mixed signs & normal values
+    let mut w0 = [0_i8; 32];
+    let mut in0 = [0_i8; 32];
+    for idx in 0..32 {
+        w0[idx] = if idx % 2 == 0 {
+            (idx as i8) * 3
+        } else {
+            -(idx as i8) * 4
+        };
+        in0[idx] = if idx % 3 == 0 {
+            29 - (idx as i8)
+        } else {
+            (idx as i8) - 45
+        };
+    }
+    weight_blocks.push(Q8_0Block {
+        scale: 0.125,
+        quants: w0,
+    });
+    input_blocks.push(Q8_0Block {
+        scale: 0.25,
+        quants: in0,
+    });
+
+    // Block 1: Zero block (all zeros, scale 0)
+    weight_blocks.push(Q8_0Block {
+        scale: 0.0,
+        quants: [0_i8; 32],
+    });
+    input_blocks.push(Q8_0Block {
+        scale: 0.0,
+        quants: [0_i8; 32],
+    });
+
+    // Block 2: Boundary case with i8::MIN (-128) and i8::MAX (127)
+    let mut w2 = [0_i8; 32];
+    let mut in2 = [0_i8; 32];
+    for idx in 0..32 {
+        w2[idx] = match idx % 4 {
+            0 => i8::MIN,
+            1 => i8::MAX,
+            2 => 0,
+            _ => -7,
+        };
+        in2[idx] = match idx % 5 {
+            0 => i8::MIN,
+            1 => i8::MAX,
+            2 => 5,
+            _ => 13,
+        };
+    }
+    weight_blocks.push(Q8_0Block {
+        scale: 1.5,
+        quants: w2,
+    });
+    input_blocks.push(Q8_0Block {
+        scale: 0.75,
+        quants: in2,
+    });
+
+    // Block 3: Mixed small values/subnormal scales
+    let mut w3 = [0_i8; 32];
+    let mut in3 = [0_i8; 32];
+    for idx in 0..32 {
+        w3[idx] = (idx as i8) - 16;
+        in3[idx] = 16 - (idx as i8);
+    }
+    weight_blocks.push(Q8_0Block {
+        scale: 1e-37,
+        quants: w3,
+    });
+    input_blocks.push(Q8_0Block {
+        scale: 1e-38,
+        quants: in3,
+    });
+
+    // Test single-row dot product
+    std::env::set_var("CAMELID_Q8_ROW_DISPATCH", "off");
+    let scalar_dot = q8_0_dot_rows(&weight_blocks, &input_blocks);
+
+    std::env::set_var("CAMELID_Q8_ROW_DISPATCH", "on");
+    let simd_dot = q8_0_dot_rows(&weight_blocks, &input_blocks);
+
+    assert_eq!(
+        scalar_dot, simd_dot,
+        "Single-row dot product mismatch (scalar: {}, simd: {})",
+        scalar_dot, simd_dot
+    );
+
+    // Test two-row dot product
+    let mut second_weight_blocks = Vec::with_capacity(n_blocks);
+
+    let mut w0_2 = [0_i8; 32];
+    for idx in 0..32 {
+        w0_2[idx] = if idx % 2 == 0 { -10 } else { 12 };
+    }
+    second_weight_blocks.push(Q8_0Block {
+        scale: 0.5,
+        quants: w0_2,
+    });
+
+    second_weight_blocks.push(Q8_0Block {
+        scale: 0.0,
+        quants: [0_i8; 32],
+    });
+
+    let mut w2_2 = [0_i8; 32];
+    for idx in 0..32 {
+        w2_2[idx] = if idx % 3 == 0 { i8::MIN } else { 45 };
+    }
+    second_weight_blocks.push(Q8_0Block {
+        scale: 2.25,
+        quants: w2_2,
+    });
+
+    let mut w3_2 = [0_i8; 32];
+    for idx in 0..32 {
+        w3_2[idx] = -(idx as i8);
+    }
+    second_weight_blocks.push(Q8_0Block {
+        scale: 1e-35,
+        quants: w3_2,
+    });
+
+    std::env::set_var("CAMELID_Q8_ROW_DISPATCH", "off");
+    let scalar_two_dot = q8_0_two_dot_rows(&weight_blocks, &second_weight_blocks, &input_blocks);
+
+    std::env::set_var("CAMELID_Q8_ROW_DISPATCH", "on");
+    let simd_two_dot = q8_0_two_dot_rows(&weight_blocks, &second_weight_blocks, &input_blocks);
+
+    assert_eq!(
+        scalar_two_dot, simd_two_dot,
+        "Two-row dot product mismatch (scalar: {:?}, simd: {:?})",
+        scalar_two_dot, simd_two_dot
+    );
+
+    std::env::remove_var("CAMELID_Q8_ROW_DISPATCH");
+}
+
 fn assert_slice_close(actual: &[f32], expected: &[f32]) {
     assert_eq!(actual.len(), expected.len(), "slice length mismatch");
     for (idx, (actual, expected)) in actual.iter().zip(expected).enumerate() {
@@ -4034,6 +4183,8 @@ fn q8_projection_route_telemetry_records_layer_route_bucket() {
 
     let telemetry = snapshot_q8_schedule_telemetry();
     assert_eq!(telemetry.output_projection_calls, 2);
+    assert_eq!(telemetry.ffn_gate_up_decode_consumer_taken, 0);
+    assert_eq!(telemetry.ffn_gate_up_decode_fused_activation_taken, 0);
     assert_eq!(telemetry.ffn_gate_up_decode_consumer_activation_us, 0);
     assert_eq!(telemetry.ffn_gate_up_decode_consumer_tensor_us, 0);
     assert!(telemetry
@@ -4148,6 +4299,7 @@ fn x86_q8_ffn_decode_chain_is_default_off_and_matches_split_consumers() {
         false,
     )
     .unwrap();
+    reset_q8_schedule_telemetry();
 
     let actual = try_x86_q8_ffn_decode_chain_path(
         &input,
@@ -4164,7 +4316,10 @@ fn x86_q8_ffn_decode_chain_is_default_off_and_matches_split_consumers() {
     assert_eq!(actual.tensor.shape.dims, expected.shape.dims);
     assert_slice_close_with_tolerance(&actual.tensor.data, &expected.data, 5e-4);
     let telemetry = snapshot_q8_schedule_telemetry();
+    assert_eq!(telemetry.ffn_gate_up_decode_consumer_taken, 0);
+    assert_eq!(telemetry.ffn_gate_up_decode_fused_activation_taken, 1);
     assert_eq!(telemetry.ffn_decode_chain_taken, 1);
+    assert_eq!(telemetry.ffn_down_decode_consumer_taken, 1);
     assert!(telemetry.ffn_decode_chain_total_us > 0);
     assert!(telemetry.ffn_decode_chain_input_quantize_us > 0);
     assert!(telemetry.ffn_decode_chain_activation_quantize_us > 0);
@@ -5464,6 +5619,8 @@ fn q8_ffn_down_single_owner_is_plan_gated_and_role_limited() {
 fn q8_ffn_gate_up_consumer_matches_runtime_packed_baseline() {
     let _env_guard = env_lock();
     clear_dense_diagnostic_env();
+    std::env::set_var(Q8_SCHEDULE_TELEMETRY_ENV, "on");
+    reset_q8_schedule_telemetry();
     let (input, packed_gate, packed_up, expected) = runtime_packed_ffn_gate_up_case();
 
     let actual = gated_ffn_activation_with_plan(
@@ -5487,6 +5644,11 @@ fn q8_ffn_gate_up_consumer_matches_runtime_packed_baseline() {
         packed_up.q8_0_runtime_storage.as_ref(),
         Some(Q8_0RuntimeStorage::PackedRows4(_))
     ));
+    let telemetry = snapshot_q8_schedule_telemetry();
+    assert_eq!(telemetry.ffn_gate_up_decode_consumer_taken, 1);
+    assert_eq!(telemetry.ffn_gate_up_decode_fused_activation_taken, 0);
+    reset_q8_schedule_telemetry();
+    std::env::remove_var(Q8_SCHEDULE_TELEMETRY_ENV);
 }
 
 #[test]
@@ -7757,6 +7919,80 @@ fn output_projection_diagnostics_support_q8_0_file_backed_token_major_rows() {
         reads.read_bytes,
         (Q8BlockReader::BLOCK_SIZE_BYTES * 2) as u64
     );
+}
+
+#[test]
+fn output_projection_diagnostics_support_runtime_packed_tied_output_rows() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+
+    let output_norm_values = (0..32)
+        .map(|idx| idx as f32 * 0.125 - 1.5)
+        .collect::<Vec<_>>();
+    let output_norm =
+        CpuTensor::from_f32("output_norm", vec![1, 32], output_norm_values.clone()).unwrap();
+    let row_blocks = vec![
+        Q8_0Block {
+            scale: 0.125,
+            quants: std::array::from_fn(|idx| idx as i8 - 8),
+        },
+        Q8_0Block {
+            scale: 0.0625,
+            quants: std::array::from_fn(|idx| if idx.is_multiple_of(2) { 6 } else { -5 }),
+        },
+        Q8_0Block {
+            scale: 0.09375,
+            quants: std::array::from_fn(|idx| (idx as i8 % 9) - 4),
+        },
+        Q8_0Block {
+            scale: 0.15625,
+            quants: std::array::from_fn(|idx| if idx.is_multiple_of(3) { 7 } else { -3 }),
+        },
+    ];
+    let packed =
+        Q8_0PackedRows4::from_rows(4, 1, Q8_0PackedRows4Interleave::I8, &row_blocks).unwrap();
+    let output_weight = CpuTensor::q8_0_runtime_packed_rows4_linear(
+        "output.weight",
+        TensorShape { dims: vec![32, 4] },
+        packed,
+    );
+
+    let logits = row_blocks
+        .iter()
+        .map(|block| {
+            output_norm_values
+                .iter()
+                .zip(block.quants.iter())
+                .map(|(input, quant)| *input * block.scale * f32::from(*quant))
+                .sum::<f32>()
+        })
+        .collect::<Vec<_>>();
+    let logits = CpuTensor::from_f32("logits", vec![1, 4], logits).unwrap();
+
+    let diagnostics = output_projection_diagnostics(
+        &output_norm,
+        &output_weight,
+        &logits,
+        &[0, 1],
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(diagnostics.len(), 2);
+    for (idx, diagnostic) in diagnostics.iter().enumerate() {
+        assert_eq!(diagnostic.token_id as usize, idx);
+        assert_eq!(diagnostic.layout, "token_major");
+        assert_close(diagnostic.reconstructed_logit, diagnostic.reported_logit);
+        assert_close(
+            diagnostic.decoded_component_reconstructed_logit,
+            diagnostic.reported_logit,
+        );
+        assert_eq!(diagnostic.q8_direct_reconstructed_logit, None);
+        assert_eq!(diagnostic.q8_direct_absolute_delta, None);
+        assert_eq!(diagnostic.q8_direct_decoded_component_delta, None);
+    }
 }
 
 #[test]

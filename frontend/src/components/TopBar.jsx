@@ -4,6 +4,31 @@ import { compatibilityHintLabel, formatCapabilityStatus, frontendSupportContract
 import { getChatGateState } from '../lib/chatGate'
 import { describeModelState, getModelStatusLabel, modelRuntimeIdMatches } from '../lib/modelState'
 
+const GeminiSparkle = ({ className = '', size = 20 }) => (
+  <svg
+    className={`gemini-sparkle-icon ${className}`}
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    fill="none"
+    xmlns="http://www.w3.org/2000/svg"
+  >
+    <path
+      d="M12 3C12 3 12.3 8.3 15.5 11.5C18.7 14.7 24 15 24 15C24 15 18.7 15.3 15.5 18.5C12.3 21.7 12 27 12 27C12 27 11.7 21.7 8.5 18.5C5.3 15.3 0 15 0 15C0 15 5.3 14.7 8.5 11.5C11.7 8.3 12 3 12 3Z"
+      fill="url(#gemini-sparkle-grad)"
+    />
+    <defs>
+      <linearGradient id="gemini-sparkle-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+        <stop offset="0%" stopColor="#4285f4" />
+        <stop offset="35%" stopColor="#9b51e0" />
+        <stop offset="70%" stopColor="#e289f2" />
+        <stop offset="100%" stopColor="#fa9085" />
+      </linearGradient>
+    </defs>
+  </svg>
+)
+
+
 const titles = {
   chat: 'Chat',
   library: 'Models',
@@ -95,7 +120,7 @@ function TopBar({ tab, setTab, selectedConversationTitle, selectedConversationUp
         <div className="topbar-chat-row">
           <div className="topbar-chat-brand topbar-chat-brand-stack topbar-chat-brand-elevated">
             <span className="topbar-chat-brand-kicker">Camelid chat</span>
-            <strong>Camelid</strong>
+            <strong className="topbar-brand-with-sparkle"><GeminiSparkle size={18} className="topbar-brand-sparkle-icon" /> Camelid</strong>
             <span>{chatSupportLabel}</span>
           </div>
           <div className="topbar-chat-center topbar-chat-center-stack topbar-chat-center-elevated" title={hasCustomConversationTitle ? rawConversationTitle : untitledConversationLabel}>
@@ -165,7 +190,7 @@ function TopBar({ tab, setTab, selectedConversationTitle, selectedConversationUp
   return (
     <header className={`topbar topbar-page ${demoMode ? 'topbar-demo' : ''}`}>
       <div className="topbar-page-row">
-        <div className="topbar-chat-brand">Camelid</div>
+        <div className="topbar-chat-brand topbar-brand-with-sparkle"><GeminiSparkle size={18} className="topbar-brand-sparkle-icon" /> Camelid</div>
         <div className="topbar-chat-center topbar-page-center" title={heading}>{heading}</div>
         <div className="topbar-chat-actions">
           {demoMode ? (

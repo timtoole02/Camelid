@@ -6,6 +6,14 @@ use std::{
     time::Instant,
 };
 
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn pthread_set_qos_class_self_np(
+        qos_class: u32,
+        relative_priority: std::os::raw::c_int,
+    ) -> std::os::raw::c_int;
+}
+
 use camelid::{
     api,
     cluster::{
@@ -57,6 +65,45 @@ enum Command {
         /// Log the current acceleration/runtime discovery state at startup.
         #[arg(long, default_value_t = true)]
         log_acceleration: bool,
+    },
+    /// Start the distributed HTTP API server or TCP Worker.
+    ServeDistributed {
+        /// Mode to run: coordinator or worker
+        #[arg(long, default_value = "coordinator")]
+        role: String,
+        /// Address to listen on (worker TCP listener or coordinator HTTP server)
+        #[arg(long, default_value = "127.0.0.1:8181")]
+        addr: SocketAddr,
+        /// Address of the worker TCP listener (required for coordinator)
+        #[arg(long)]
+        worker_addr: Option<String>,
+        /// Partition range of layers to evaluate on this node (e.g. 0..16 or 16..32)
+        #[arg(long)]
+        layer_range: String,
+        /// Load a GGUF model at startup
+        #[arg(long, env = "CAMELID_MODEL")]
+        model: PathBuf,
+        /// Override Rayon worker threads
+        #[arg(long, env = "CAMELID_THREADS")]
+        threads: Option<usize>,
+    },
+    /// Benchmark raw TCP latency and bandwidth between Coordinator and Worker.
+    BenchNetwork {
+        /// Mode to run: coordinator or worker
+        #[arg(long, default_value = "coordinator")]
+        role: String,
+        /// Address to bind to or connect to
+        #[arg(long, default_value = "127.0.0.1:8182")]
+        addr: String,
+        /// Number of round-trips to perform for latency test
+        #[arg(long, default_value_t = 1000)]
+        ping_count: usize,
+        /// Payload size in bytes for the latency test (default: 16KB hidden state size)
+        #[arg(long, default_value_t = 16384)]
+        payload_size: usize,
+        /// Amount of megabytes to stream for throughput testing (default: 100 MB)
+        #[arg(long, default_value_t = 100)]
+        bandwidth_mb: usize,
     },
     /// Inspect GGUF metadata and tensor descriptors.
     Inspect { path: PathBuf },
@@ -199,7 +246,105 @@ async fn main() -> anyhow::Result<()> {
             if log_acceleration {
                 log_acceleration_state();
             }
+            #[cfg(target_os = "macos")]
+            unsafe {
+                pthread_set_qos_class_self_np(0x09, 0); // QOS_CLASS_BACKGROUND (forces network I/O onto E-cores)
+            }
             api::serve(addr, threads, model).await?
+        }
+        Command::ServeDistributed {
+            role,
+            addr,
+            worker_addr,
+            layer_range,
+            model,
+            threads,
+        } => {
+            configure_rayon_threads(threads)?;
+
+            let parts: Vec<&str> = layer_range.split("..").collect();
+            anyhow::ensure!(
+                parts.len() == 2,
+                "Layer range must be in format START..END (e.g. 0..16)"
+            );
+            let layer_start = parts[0].parse::<usize>()?;
+            let layer_end = parts[1].parse::<usize>()?;
+            anyhow::ensure!(
+                layer_start < layer_end,
+                "layer_start must be less than layer_end"
+            );
+
+            let _ = camelid::distributed::DISTRIBUTED_RANGE.set((layer_start, layer_end));
+
+            if role == "coordinator" {
+                let worker_addr_str = worker_addr.ok_or_else(|| {
+                    anyhow::anyhow!("--worker-addr is required in coordinator mode")
+                })?;
+
+                tracing::info!(worker_addr = %worker_addr_str, "Coordinator connecting to worker");
+                let client = camelid::distributed::DistributedClient::connect(&worker_addr_str)?;
+                camelid::distributed::DISTRIBUTED_CLIENT
+                    .set(client)
+                    .map_err(|_| anyhow::anyhow!("Failed to set global distributed client lock"))?;
+                tracing::info!("Coordinator connected to worker successfully");
+
+                #[cfg(target_os = "macos")]
+                unsafe {
+                    pthread_set_qos_class_self_np(0x09, 0); // QOS_CLASS_BACKGROUND (forces network I/O onto E-cores)
+                }
+                api::serve(addr, threads, Some(model)).await?
+            } else if role == "worker" {
+                let gguf = camelid::gguf::read_metadata(&model)?;
+                let config = camelid::model::LlamaModelConfig::from_gguf(&gguf)?;
+                let binding = camelid::model::LlamaTensorBinding::bind(&gguf, &config)?;
+                let store = camelid::tensor::TensorStore::open(&model, &gguf);
+
+                tracing::info!(
+                    "Worker loading partitioned weights (layers {}..{})",
+                    layer_start,
+                    layer_end
+                );
+                let weights = camelid::inference::LlamaLoadedWeights::load_distributed(
+                    &store,
+                    &binding,
+                    layer_start,
+                    layer_end,
+                    false,
+                    false,
+                )?;
+
+                tracing::info!("Worker weights loaded successfully. Initializing session.");
+                let session = camelid::inference::LlamaInferenceSession::new(config, weights)?;
+
+                let addr_str = addr.to_string();
+                #[cfg(target_os = "macos")]
+                unsafe {
+                    pthread_set_qos_class_self_np(0x09, 0); // QOS_CLASS_BACKGROUND (forces network I/O onto E-cores)
+                }
+                camelid::distributed::run_worker_loop(&addr_str, session)?;
+            } else {
+                anyhow::bail!("Invalid role: {role}. Must be 'coordinator' or 'worker'");
+            }
+        }
+        Command::BenchNetwork {
+            role,
+            addr,
+            ping_count,
+            payload_size,
+            bandwidth_mb,
+        } => {
+            if role == "coordinator" {
+                camelid::distributed::run_network_benchmark_coordinator(
+                    &addr,
+                    ping_count,
+                    payload_size,
+                    bandwidth_mb,
+                )?;
+            } else if role == "worker" {
+                camelid::distributed::run_network_benchmark_worker(&addr)?;
+            } else {
+                anyhow::bail!("Invalid role: {role}. Must be 'coordinator' or 'worker'");
+            }
         }
         Command::Inspect { path } => {
             let gguf = read_metadata(path)?;
@@ -1037,10 +1182,26 @@ fn log_acceleration_state() {
 }
 
 fn configure_rayon_threads(threads: Option<usize>) -> anyhow::Result<()> {
-    if let Some(threads) = threads {
-        anyhow::ensure!(threads > 0, "--threads must be greater than zero");
-        ThreadPoolBuilder::new()
-            .num_threads(threads)
+    #[cfg(target_os = "macos")]
+    let should_configure = true;
+    #[cfg(not(target_os = "macos"))]
+    let should_configure = threads.is_some();
+
+    if should_configure {
+        let mut builder = ThreadPoolBuilder::new();
+        if let Some(t) = threads {
+            anyhow::ensure!(t > 0, "--threads must be greater than zero");
+            builder = builder.num_threads(t);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            builder = builder.start_handler(|_| {
+                unsafe {
+                    pthread_set_qos_class_self_np(0x21, 0); // QOS_CLASS_USER_INTERACTIVE (forces P-cores)
+                }
+            });
+        }
+        builder
             .build_global()
             .map_err(|err| anyhow::anyhow!("failed to configure Rayon thread pool: {err}"))?;
     }

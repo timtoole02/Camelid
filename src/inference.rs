@@ -236,10 +236,41 @@ impl LlamaLoadedWeights {
             .unwrap_or(0)
     }
 
+    pub fn load_distributed(
+        store: &TensorStore,
+        binding: &LlamaTensorBinding,
+        layer_start: usize,
+        layer_end: usize,
+        load_embedding: bool,
+        load_output: bool,
+    ) -> Result<Self> {
+        Self::load_with_options(
+            store,
+            binding,
+            Some(layer_start..layer_end),
+            load_embedding,
+            load_output,
+        )
+    }
+
     pub fn load(
         store: &TensorStore,
         binding: &LlamaTensorBinding,
         layer_range: Option<std::ops::Range<usize>>,
+    ) -> Result<Self> {
+        let load_embedding = layer_range.as_ref().is_none_or(|r| r.start == 0);
+        let load_output = layer_range
+            .as_ref()
+            .is_none_or(|r| r.start == 0 || r.end == binding.layers.len());
+        Self::load_with_options(store, binding, layer_range, load_embedding, load_output)
+    }
+
+    fn load_with_options(
+        store: &TensorStore,
+        binding: &LlamaTensorBinding,
+        layer_range: Option<std::ops::Range<usize>>,
+        load_embedding: bool,
+        load_output: bool,
     ) -> Result<Self> {
         let auto_retain_q8_0_blocks = auto_retain_q8_0_blocks_for_fast_local_chat(binding);
         let load_linear = |name: &str| {
@@ -269,13 +300,7 @@ impl LlamaLoadedWeights {
                 )
             }
         };
-
-        let is_first_node = layer_range.as_ref().is_none_or(|r| r.start == 0);
-        let is_last_node = layer_range
-            .as_ref()
-            .is_none_or(|r| r.end == binding.layers.len());
-
-        let token_embedding = if is_first_node {
+        let token_embedding = if load_embedding {
             normalize_token_embedding_shape(
                 load_linear(&binding.token_embedding.name)?,
                 &binding.token_embedding.name,
@@ -284,13 +309,13 @@ impl LlamaLoadedWeights {
             CpuTensor::from_f32(&binding.token_embedding.name, vec![0], vec![])?
         };
 
-        let output_norm = if is_last_node {
+        let output_norm = if load_output {
             store.load_cpu_f32(&binding.output_norm.name)?
         } else {
             CpuTensor::from_f32(&binding.output_norm.name, vec![0], vec![])?
         };
 
-        let output = if is_last_node {
+        let output = if load_output {
             if binding.output_is_tied_embedding {
                 if auto_retain_q8_0_blocks {
                     Some(store.load_q8_0_block_backed_linear_as(
@@ -423,20 +448,17 @@ impl LlamaLoadedWeights {
 
     pub fn validate_dense_shapes(&self, config: &LlamaModelConfig) -> Result<()> {
         let dims = DenseLlamaDims::from_config(config)?;
-        let is_first_node = self.layer_range.as_ref().is_none_or(|r| r.start == 0);
-        let is_last_node = self
-            .layer_range
-            .as_ref()
-            .is_none_or(|r| r.end == dims.block_count);
+        let has_embedding = self.token_embedding.shape.dims.as_slice() != [0];
+        let has_output = self.output_norm.shape.dims.as_slice() != [0];
 
-        if is_first_node {
+        if has_embedding {
             require_tensor_shape(
                 &self.token_embedding,
                 &[dims.vocab_size, dims.embedding_length],
                 "token embedding",
             )?;
         }
-        if is_last_node {
+        if has_output {
             require_tensor_shape(&self.output_norm, &[dims.embedding_length], "output norm")?;
             require_matrix_shape(
                 self.output_projection(),
@@ -1266,6 +1288,118 @@ impl LlamaInferenceSession {
         })
     }
 
+    pub fn forward_worker_layers(
+        &mut self,
+        mut hidden: CpuTensor,
+        is_prefill: bool,
+        seq_len: usize,
+        position: usize,
+    ) -> Result<CpuTensor> {
+        let runtime_plan = ResolvedRuntimePlan::from_env()?;
+        let rms_norm_epsilon = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
+        let k = self
+            .weights
+            .layers
+            .iter()
+            .position(|l| l.attention_norm.shape.dims[0] > 0)
+            .unwrap_or(0);
+        let n = self.weights.layers.len();
+        tracing::info!(
+            "Worker forward_worker_layers: k = {}, n = {}, layers.len = {}",
+            k,
+            n,
+            self.weights.layers.len()
+        );
+        for (i, l) in self.weights.layers.iter().enumerate() {
+            tracing::info!(
+                "  layer {}: attention_norm shape = {:?}",
+                i,
+                l.attention_norm.shape.dims
+            );
+        }
+
+        if is_prefill {
+            let prefill_base_position = position;
+            let chunk_tokens = 512;
+            let hidden_width = hidden.dim(1)?;
+            let hidden_dims = vec![seq_len, hidden_width];
+            let mut next_hidden = vec![0.0_f32; hidden.data.len()];
+            let mut chunk_input_buffer = Vec::with_capacity(chunk_tokens * hidden_width);
+
+            for layer_idx in k..n {
+                if next_hidden.len() != hidden.data.len() {
+                    next_hidden.resize(hidden.data.len(), 0.0);
+                }
+                let layer = &self.weights.layers[layer_idx];
+                for chunk_start in (0..seq_len).step_by(chunk_tokens) {
+                    let rows_this_chunk = chunk_tokens.min(seq_len - chunk_start);
+                    let chunk_base_position = prefill_base_position + chunk_start;
+                    copy_tensor_rows_into_buffer(
+                        &hidden,
+                        chunk_start,
+                        rows_this_chunk,
+                        &mut chunk_input_buffer,
+                    )?;
+                    let hidden_chunk = CpuTensor::from_f32(
+                        format!("layer_{layer_idx}_prefill_worker_input_{chunk_start}"),
+                        vec![rows_this_chunk, hidden_width],
+                        std::mem::take(&mut chunk_input_buffer),
+                    )?;
+
+                    self.kv_cache.position = chunk_base_position;
+                    let timed = forward_prefill_layer_chunk_timed(
+                        &hidden_chunk,
+                        layer,
+                        PrefillLayerChunkParams {
+                            config: &self.config,
+                            rope_freqs: self.weights.rope_freqs.as_ref(),
+                            rms_norm_epsilon,
+                            layer_idx,
+                            base_position: chunk_base_position,
+                            chunk_start,
+                            chunk_rows: rows_this_chunk,
+                        },
+                        &mut self.kv_cache,
+                    )?;
+                    chunk_input_buffer = hidden_chunk.data;
+                    copy_tensor_rows_into(
+                        &timed.output,
+                        &mut next_hidden,
+                        chunk_start,
+                        hidden_width,
+                    )?;
+                }
+                std::mem::swap(&mut hidden.data, &mut next_hidden);
+                hidden.shape = TensorShape {
+                    dims: hidden_dims.clone(),
+                };
+            }
+            self.kv_cache.position = prefill_base_position + seq_len;
+        } else {
+            self.kv_cache.position = position;
+            for layer_idx in k..n {
+                let layer = &self.weights.layers[layer_idx];
+                let timed = forward_layer_timed(
+                    &hidden,
+                    layer,
+                    ForwardLayerParams {
+                        config: &self.config,
+                        rope_freqs: self.weights.rope_freqs.as_ref(),
+                        rms_norm_epsilon,
+                        layer_idx,
+                        collect_diagnostics: false,
+                        runtime_plan: &runtime_plan,
+                    },
+                    &mut self.kv_cache,
+                )?;
+                hidden = timed.output;
+            }
+            self.kv_cache.position = position + 1;
+        }
+
+        Ok(hidden)
+    }
+
     pub fn forward_single_token(&mut self, token_id: u32) -> Result<LlamaForwardOutput> {
         Ok(self.forward_single_token_timed_fast(token_id)?.output)
     }
@@ -1388,7 +1522,18 @@ impl LlamaInferenceSession {
         for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
             if let Some(range) = &self.weights.layer_range {
                 if !range.contains(&layer_idx) {
-                    continue;
+                    if let Some(client) = crate::distributed::DISTRIBUTED_CLIENT.get() {
+                        let worker_response = client.forward_to_worker(
+                            &hidden,
+                            true,
+                            token_ids.len(),
+                            self.kv_cache.position,
+                        )?;
+                        hidden = worker_response;
+                        break;
+                    } else {
+                        continue;
+                    }
                 }
             }
             let timed = forward_prefill_layer_chunk_timed(
@@ -1444,11 +1589,13 @@ impl LlamaInferenceSession {
         })
     }
 
+    #[allow(unused_assignments)]
     fn forward_prefill_layer_major_timed_fast_inner(
         &mut self,
         token_ids: &[u32],
         chunk_tokens: usize,
     ) -> Result<LlamaForwardTimings> {
+        tracing::info!("Coordinator forward_prefill_layer_major_timed_fast_inner: token_ids = {}, DISTRIBUTED_CLIENT set = {}", token_ids.len(), crate::distributed::DISTRIBUTED_CLIENT.get().is_some());
         if token_ids.is_empty() {
             return Ok(LlamaForwardTimings::default());
         }
@@ -1498,7 +1645,18 @@ impl LlamaInferenceSession {
         for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
             if let Some(range) = &self.weights.layer_range {
                 if !range.contains(&layer_idx) {
-                    continue;
+                    if let Some(client) = crate::distributed::DISTRIBUTED_CLIENT.get() {
+                        let worker_response = client.forward_to_worker(
+                            &hidden,
+                            true,
+                            token_ids.len(),
+                            self.kv_cache.position,
+                        )?;
+                        hidden = worker_response;
+                        break;
+                    } else {
+                        continue;
+                    }
                 }
             }
             let hidden_bytes = tensor_f32_bytes(&hidden);
@@ -1602,6 +1760,7 @@ impl LlamaInferenceSession {
         Ok(timings)
     }
 
+    #[allow(unused_assignments)]
     fn forward_single_token_timed_internal(
         &mut self,
         token_id: u32,
@@ -1652,7 +1811,14 @@ impl LlamaInferenceSession {
         for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
             if let Some(range) = &self.weights.layer_range {
                 if !range.contains(&layer_idx) {
-                    continue;
+                    if let Some(client) = crate::distributed::DISTRIBUTED_CLIENT.get() {
+                        let worker_response =
+                            client.forward_to_worker(&hidden, false, 1, self.kv_cache.position)?;
+                        hidden = worker_response;
+                        break;
+                    } else {
+                        continue;
+                    }
                 }
             }
             trace_forward_memory(&format!("layer_{layer_idx}_start"));
@@ -1691,8 +1857,11 @@ impl LlamaInferenceSession {
         let (norm, logits, final_norm_diagnostic, output_norm_stats, logits_stats) =
             if compute_logits {
                 let final_norm_started = Instant::now();
-                let norm =
-                    hidden.rms_norm(&self.weights.output_norm, rms_norm_epsilon, "output_norm")?;
+                let norm = if self.weights.output_norm.shape.dims[0] == 0 {
+                    hidden.clone()
+                } else {
+                    hidden.rms_norm(&self.weights.output_norm, rms_norm_epsilon, "output_norm")?
+                };
                 trace_forward_memory("output_norm_done");
                 let final_norm_diagnostic = collect_diagnostics
                     .then(|| {
@@ -5070,15 +5239,31 @@ fn matmul_rhs_transposed_borrowed_with_precision_with_plan(
         }
     }
     let mut output = vec![0.0; rows * output_width];
-    for row in 0..rows {
-        let input_start = row * input_width;
-        let output_start = row * output_width;
-        accumulate_transposed_linear_row_runtime_with_plan(
-            &input.data[input_start..input_start + input_width],
-            weight,
-            &mut output[output_start..output_start + output_width],
-            runtime_plan,
-        )?;
+    use rayon::prelude::*;
+    if should_parallelize_linear_output(rows * output_width) {
+        output
+            .par_chunks_mut(output_width)
+            .enumerate()
+            .try_for_each(|(row, output_row)| {
+                let input_start = row * input_width;
+                accumulate_transposed_linear_row_runtime_with_plan(
+                    &input.data[input_start..input_start + input_width],
+                    weight,
+                    output_row,
+                    runtime_plan,
+                )
+            })?;
+    } else {
+        for row in 0..rows {
+            let input_start = row * input_width;
+            let output_start = row * output_width;
+            accumulate_transposed_linear_row_runtime_with_plan(
+                &input.data[input_start..input_start + input_width],
+                weight,
+                &mut output[output_start..output_start + output_width],
+                runtime_plan,
+            )?;
+        }
     }
     CpuTensor::from_f32(name, vec![rows, output_width], output)
 }
@@ -5287,7 +5472,8 @@ fn validate_output_projection_row_layout(
             } else if rows == hidden_width
                 && cols == vocab_size
                 && (output_weight.data.len() == hidden_width * vocab_size
-                    || output_weight.q8_0_file_backing.is_some())
+                    || output_weight.q8_0_file_backing.is_some()
+                    || output_weight.q8_0_runtime_storage.is_some())
             {
                 Ok(EffectiveOutputProjectionRowLayout::TokenMajorReinterpret)
             } else {
@@ -5323,6 +5509,49 @@ struct OutputProjectionTokenRow {
     q8_0_row_bytes: Option<Vec<u8>>,
 }
 
+fn output_projection_runtime_packed_row(
+    packed: &Q8_0PackedRows4,
+    hidden_width: usize,
+    token_index: usize,
+) -> Result<Vec<f32>> {
+    if token_index >= packed.rows {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "output projection runtime-packed row {token_index} exceeds packed row count {}",
+            packed.rows
+        )));
+    }
+    if !hidden_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "output projection runtime-packed hidden width {hidden_width} is not block aligned"
+        )));
+    }
+    let blocks_per_row = hidden_width / Q8_0_BLOCK_VALUES;
+    if packed.blocks_per_row != blocks_per_row {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "output projection runtime-packed rows expected {blocks_per_row} blocks per row, got {}",
+            packed.blocks_per_row
+        )));
+    }
+    let row_group = token_index / 4;
+    let lane = token_index % 4;
+    let block_len = packed.interleave.block_len();
+    let chunks_per_block = Q8_0_BLOCK_VALUES / block_len;
+    let mut values = Vec::with_capacity(hidden_width);
+    for block_idx in 0..blocks_per_row {
+        let packed_block = &packed.blocks[row_group * blocks_per_row + block_idx];
+        let scale = packed_block.scales[lane];
+        for chunk in 0..chunks_per_block {
+            let start = chunk * 4 * block_len + lane * block_len;
+            values.extend(
+                packed_block.quants[start..start + block_len]
+                    .iter()
+                    .map(|value| scale * f32::from(*value)),
+            );
+        }
+    }
+    Ok(values)
+}
+
 fn output_projection_token_row(
     output_weight: &CpuTensor,
     hidden_width: usize,
@@ -5351,6 +5580,30 @@ fn output_projection_token_row(
         };
         return Ok(OutputProjectionTokenRow {
             values,
+            q8_0_row_bytes: None,
+        });
+    }
+
+    if let Some(Q8_0RuntimeStorage::PackedRows4(packed)) =
+        output_weight.q8_0_runtime_storage.as_ref()
+    {
+        if output_weight.source_type != Some(GgufTensorType::Q8_0) {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "output projection diagnostics only support runtime-packed q8_0 rows, got {:?}",
+                output_weight.source_type
+            )));
+        }
+        if layout != EffectiveOutputProjectionRowLayout::TokenMajorReinterpret
+            && layout != EffectiveOutputProjectionRowLayout::DescriptorOutputInput
+        {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "output projection diagnostics cannot decode runtime-packed {} layout for tensor {}",
+                layout.label(),
+                output_weight.name
+            )));
+        }
+        return Ok(OutputProjectionTokenRow {
+            values: output_projection_runtime_packed_row(packed, hidden_width, token_index)?,
             q8_0_row_bytes: None,
         });
     }
@@ -7967,6 +8220,7 @@ fn try_x86_q8_ffn_gate_up_decode_consumer_path(
         up,
         runtime_plan.q8.ffn_gate_up_decode_group_chunking,
     )?;
+    add_q8_schedule_counter(&Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_TAKEN, 1);
     let total_elapsed = started.elapsed().as_micros();
     record_q8_schedule_output_projection_route_call(
         "ffn_gate_up",
@@ -8069,6 +8323,7 @@ fn try_x86_q8_ffn_decode_chain_path(
         &quantized_input.blocks,
         runtime_plan.q8.ffn_gate_up_decode_paired_dot,
     )?;
+    add_q8_schedule_counter(&Q8_SCHED_FFN_GATE_UP_DECODE_FUSED_ACTIVATION_TAKEN, 1);
     let gate_up_elapsed = gate_up_started.elapsed().as_micros();
     record_q8_schedule_output_projection_route_call(
         "ffn_gate_up",
@@ -10462,6 +10717,43 @@ fn q8_0_packed_rows4_matmul_projection_pair_from_quantized(
                     right_group.copy_from_slice(&right_sums);
                 }
             });
+    } else if should_parallelize_q8_packed_rows4_matmul(total_left_output_groups) {
+        left_output
+            .par_chunks_mut(left_output_width)
+            .zip(right_output.par_chunks_mut(right_output_width))
+            .enumerate()
+            .for_each(|(row_idx, (left_row, right_row))| {
+                let input_start = row_idx * blocks_per_row;
+                let quantized_row = &quantized_inputs[input_start..input_start + blocks_per_row];
+                for (group_idx, output_chunk) in left_row[..left_output_width]
+                    .chunks_exact_mut(4)
+                    .enumerate()
+                {
+                    let group_start = group_idx * blocks_per_row;
+                    let group_blocks =
+                        &left_packed.blocks[group_start..group_start + blocks_per_row];
+                    let sums = q8_0_packed_rows4_dot_i8_matmul(
+                        group_blocks,
+                        quantized_row,
+                        use_hoisted_avx2,
+                    );
+                    output_chunk.copy_from_slice(&sums);
+                }
+                for (group_idx, output_chunk) in right_row[..right_output_groups_per_row * 4]
+                    .chunks_exact_mut(4)
+                    .enumerate()
+                {
+                    let group_start = group_idx * blocks_per_row;
+                    let group_blocks =
+                        &right_packed.blocks[group_start..group_start + blocks_per_row];
+                    let sums = q8_0_packed_rows4_dot_i8_matmul(
+                        group_blocks,
+                        quantized_row,
+                        use_hoisted_avx2,
+                    );
+                    output_chunk.copy_from_slice(&sums);
+                }
+            });
     } else {
         for row_idx in 0..rows {
             let input_start = row_idx * blocks_per_row;
@@ -10702,6 +10994,49 @@ fn q8_0_packed_rows4_matmul_projection_triplet_from_quantized(
                         use_hoisted_avx2,
                     ));
                     v_group.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
+                        &v_packed.blocks[group_start..group_start + blocks_per_row],
+                        quantized_row,
+                        use_hoisted_avx2,
+                    ));
+                }
+            });
+    } else if should_parallelize_q8_packed_rows4_matmul(total_q_output_groups) {
+        q_output
+            .par_chunks_mut(q_width)
+            .zip(k_output.par_chunks_mut(k_width))
+            .zip(v_output.par_chunks_mut(v_width))
+            .enumerate()
+            .for_each(|(row_idx, ((q_row, k_row), v_row))| {
+                let input_start = row_idx * blocks_per_row;
+                let quantized_row = &quantized_inputs[input_start..input_start + blocks_per_row];
+                for (group_idx, output_chunk) in q_row[..q_groups_per_row * 4]
+                    .chunks_exact_mut(4)
+                    .enumerate()
+                {
+                    let group_start = group_idx * blocks_per_row;
+                    output_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
+                        &q_packed.blocks[group_start..group_start + blocks_per_row],
+                        quantized_row,
+                        use_hoisted_avx2,
+                    ));
+                }
+                for (group_idx, output_chunk) in k_row[..k_groups_per_row * 4]
+                    .chunks_exact_mut(4)
+                    .enumerate()
+                {
+                    let group_start = group_idx * blocks_per_row;
+                    output_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
+                        &k_packed.blocks[group_start..group_start + blocks_per_row],
+                        quantized_row,
+                        use_hoisted_avx2,
+                    ));
+                }
+                for (group_idx, output_chunk) in v_row[..v_groups_per_row * 4]
+                    .chunks_exact_mut(4)
+                    .enumerate()
+                {
+                    let group_start = group_idx * blocks_per_row;
+                    output_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
                         &v_packed.blocks[group_start..group_start + blocks_per_row],
                         quantized_row,
                         use_hoisted_avx2,
@@ -11273,63 +11608,97 @@ fn matmul_rhs_transposed_q8_0_block_dot_with_plan(
     }
 
     let mut output = vec![0.0_f32; rows * output_width];
-    for row in 0..rows {
-        let input_start = row * input_width;
-        let quantized_input =
-            quantize_q8_0_row(&input.data[input_start..input_start + input_width]);
-        let out_start = row * output_width;
-        let output_row = &mut output[out_start..out_start + output_width];
-        if let Some((packed, interleave)) = q8_0_selected_packed_rows4(weight) {
-            if packed.rows == output_width && packed.blocks_per_row == blocks_per_row {
-                accumulate_q8_0_packed_rows4_dot_quantized_cpu(
-                    &quantized_input.blocks,
-                    packed,
-                    interleave,
-                    output_row,
-                );
-                continue;
-            }
-        }
-        let weight_blocks = weight
-            .q8_0_blocks
-            .as_ref()
-            .expect("q8_0 block-dot precondition checked");
-        if runtime_plan.q8.metal_retained {
-            let weight_bytes = q8_0_blocks_as_bytes(weight_blocks);
-            if with_q8_0_block_scales_and_quants(
-                &quantized_input.blocks,
-                |input_scales, input_quants| {
-                    metal::try_q8_0_block_linear_row(
-                        input_scales,
-                        input_quants,
-                        weight_bytes,
-                        output_width,
-                        blocks_per_row,
-                        output_row,
-                    )
-                },
-            ) {
-                continue;
-            }
-        }
-        if should_parallelize_q8_0_file_reader_output(output_width) {
-            output_row
-                .par_iter_mut()
-                .enumerate()
-                .for_each(|(output_idx, out_value)| {
+    use rayon::prelude::*;
+    if should_parallelize_linear_output(rows * output_width) {
+        output
+            .par_chunks_mut(output_width)
+            .enumerate()
+            .for_each(|(row, output_row)| {
+                let input_start = row * input_width;
+                let quantized_input =
+                    quantize_q8_0_row(&input.data[input_start..input_start + input_width]);
+                if let Some((packed, interleave)) = q8_0_selected_packed_rows4(weight) {
+                    if packed.rows == output_width && packed.blocks_per_row == blocks_per_row {
+                        accumulate_q8_0_packed_rows4_dot_quantized_cpu(
+                            &quantized_input.blocks,
+                            packed,
+                            interleave,
+                            output_row,
+                        );
+                        return;
+                    }
+                }
+                let weight_blocks = weight
+                    .q8_0_blocks
+                    .as_ref()
+                    .expect("q8_0 block-dot precondition checked");
+                for (output_idx, out_value) in output_row.iter_mut().enumerate() {
                     let weight_start = output_idx * blocks_per_row;
                     *out_value = q8_0_dot_rows(
                         &weight_blocks[weight_start..weight_start + blocks_per_row],
                         &quantized_input.blocks,
                     );
-                });
-        } else {
-            for (output_idx, out_value) in output_row.iter_mut().enumerate() {
-                let weight_start = output_idx * blocks_per_row;
-                *out_value = q8_0_dot_rows(
-                    &weight_blocks[weight_start..weight_start + blocks_per_row],
+                }
+            });
+    } else {
+        for row in 0..rows {
+            let input_start = row * input_width;
+            let quantized_input =
+                quantize_q8_0_row(&input.data[input_start..input_start + input_width]);
+            let out_start = row * output_width;
+            let output_row = &mut output[out_start..out_start + output_width];
+            if let Some((packed, interleave)) = q8_0_selected_packed_rows4(weight) {
+                if packed.rows == output_width && packed.blocks_per_row == blocks_per_row {
+                    accumulate_q8_0_packed_rows4_dot_quantized_cpu(
+                        &quantized_input.blocks,
+                        packed,
+                        interleave,
+                        output_row,
+                    );
+                    continue;
+                }
+            }
+            let weight_blocks = weight
+                .q8_0_blocks
+                .as_ref()
+                .expect("q8_0 block-dot precondition checked");
+            if runtime_plan.q8.metal_retained {
+                let weight_bytes = q8_0_blocks_as_bytes(weight_blocks);
+                if with_q8_0_block_scales_and_quants(
                     &quantized_input.blocks,
-                );
+                    |input_scales, input_quants| {
+                        metal::try_q8_0_block_linear_row(
+                            input_scales,
+                            input_quants,
+                            weight_bytes,
+                            output_width,
+                            blocks_per_row,
+                            output_row,
+                        )
+                    },
+                ) {
+                    continue;
+                }
+            }
+            if should_parallelize_q8_0_file_reader_output(output_width) {
+                output_row
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(output_idx, out_value)| {
+                        let weight_start = output_idx * blocks_per_row;
+                        *out_value = q8_0_dot_rows(
+                            &weight_blocks[weight_start..weight_start + blocks_per_row],
+                            &quantized_input.blocks,
+                        );
+                    });
+            } else {
+                for (output_idx, out_value) in output_row.iter_mut().enumerate() {
+                    let weight_start = output_idx * blocks_per_row;
+                    *out_value = q8_0_dot_rows(
+                        &weight_blocks[weight_start..weight_start + blocks_per_row],
+                        &quantized_input.blocks,
+                    );
+                }
             }
         }
     }
@@ -11376,6 +11745,110 @@ fn quantize_q8_0_blocks_into(input: &[f32], blocks: &mut Vec<Q8_0Block>) {
     );
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn quantize_q8_0_block(block: &[f32]) -> Q8_0Block {
+    use std::arch::aarch64::{
+        vabsq_f32, vcombine_s16, vcombine_s8, vcvtaq_s32_f32, vdupq_n_f32, vget_high_f32,
+        vget_lane_f32, vget_low_f32, vld1q_f32, vmax_f32, vmaxq_f32, vmovn_s32, vmulq_f32,
+        vqmovn_s16, vst1q_s8,
+    };
+
+    debug_assert_eq!(block.len(), Q8_0_BLOCK_VALUES);
+
+    // SAFETY: block slice has exactly 32 values, so loading 8 consecutive 4-float vectors is safe.
+    unsafe {
+        let v0 = vld1q_f32(block.as_ptr());
+        let v1 = vld1q_f32(block.as_ptr().add(4));
+        let v2 = vld1q_f32(block.as_ptr().add(8));
+        let v3 = vld1q_f32(block.as_ptr().add(12));
+        let v4 = vld1q_f32(block.as_ptr().add(16));
+        let v5 = vld1q_f32(block.as_ptr().add(20));
+        let v6 = vld1q_f32(block.as_ptr().add(24));
+        let v7 = vld1q_f32(block.as_ptr().add(28));
+
+        let abs0 = vabsq_f32(v0);
+        let abs1 = vabsq_f32(v1);
+        let abs2 = vabsq_f32(v2);
+        let abs3 = vabsq_f32(v3);
+        let abs4 = vabsq_f32(v4);
+        let abs5 = vabsq_f32(v5);
+        let abs6 = vabsq_f32(v6);
+        let abs7 = vabsq_f32(v7);
+
+        let max01 = vmaxq_f32(abs0, abs1);
+        let max23 = vmaxq_f32(abs2, abs3);
+        let max45 = vmaxq_f32(abs4, abs5);
+        let max67 = vmaxq_f32(abs6, abs7);
+
+        let max03 = vmaxq_f32(max01, max23);
+        let max47 = vmaxq_f32(max45, max67);
+
+        let max_vec = vmaxq_f32(max03, max47);
+        let max_half = vmax_f32(vget_low_f32(max_vec), vget_high_f32(max_vec));
+        let max_abs = vget_lane_f32::<0>(max_half).max(vget_lane_f32::<1>(max_half));
+
+        let unrounded_scale = max_abs / 127.0;
+        let scale_bits = f32_to_f16_bits(unrounded_scale);
+        let scale = f16_bits_to_f32(scale_bits);
+
+        let inv_scale = if unrounded_scale == 0.0 {
+            0.0
+        } else {
+            1.0 / unrounded_scale
+        };
+
+        let v_inv_scale = vdupq_n_f32(inv_scale);
+        let scaled0 = vmulq_f32(v0, v_inv_scale);
+        let scaled1 = vmulq_f32(v1, v_inv_scale);
+        let scaled2 = vmulq_f32(v2, v_inv_scale);
+        let scaled3 = vmulq_f32(v3, v_inv_scale);
+        let scaled4 = vmulq_f32(v4, v_inv_scale);
+        let scaled5 = vmulq_f32(v5, v_inv_scale);
+        let scaled6 = vmulq_f32(v6, v_inv_scale);
+        let scaled7 = vmulq_f32(v7, v_inv_scale);
+
+        let int0 = vcvtaq_s32_f32(scaled0);
+        let int1 = vcvtaq_s32_f32(scaled1);
+        let int2 = vcvtaq_s32_f32(scaled2);
+        let int3 = vcvtaq_s32_f32(scaled3);
+        let int4 = vcvtaq_s32_f32(scaled4);
+        let int5 = vcvtaq_s32_f32(scaled5);
+        let int6 = vcvtaq_s32_f32(scaled6);
+        let int7 = vcvtaq_s32_f32(scaled7);
+
+        let i16_0 = vmovn_s32(int0);
+        let i16_1 = vmovn_s32(int1);
+        let i16_01 = vcombine_s16(i16_0, i16_1);
+
+        let i16_2 = vmovn_s32(int2);
+        let i16_3 = vmovn_s32(int3);
+        let i16_23 = vcombine_s16(i16_2, i16_3);
+
+        let i16_4 = vmovn_s32(int4);
+        let i16_5 = vmovn_s32(int5);
+        let i16_45 = vcombine_s16(i16_4, i16_5);
+
+        let i16_6 = vmovn_s32(int6);
+        let i16_7 = vmovn_s32(int7);
+        let i16_67 = vcombine_s16(i16_6, i16_7);
+
+        let i8_01 = vqmovn_s16(i16_01);
+        let i8_23 = vqmovn_s16(i16_23);
+        let i8_45 = vqmovn_s16(i16_45);
+        let i8_67 = vqmovn_s16(i16_67);
+
+        let i8_03 = vcombine_s8(i8_01, i8_23);
+        let i8_47 = vcombine_s8(i8_45, i8_67);
+
+        let mut quants = [0_i8; Q8_0_BLOCK_VALUES];
+        vst1q_s8(quants.as_mut_ptr(), i8_03);
+        vst1q_s8(quants.as_mut_ptr().add(16), i8_47);
+
+        Q8_0Block { scale, quants }
+    }
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 fn quantize_q8_0_block(block: &[f32]) -> Q8_0Block {
     debug_assert_eq!(block.len(), Q8_0_BLOCK_VALUES);
     let max_abs = block
@@ -11396,7 +11869,320 @@ fn quantize_q8_0_block(block: &[f32]) -> Q8_0Block {
     Q8_0Block { scale, quants }
 }
 
+fn q8_row_dispatch_enabled() -> bool {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        !q8_0_env_flag_disabled("CAMELID_Q8_ROW_DISPATCH")
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        #[cfg(test)]
+        {
+            q8_0_env_flag_enabled_default_off("CAMELID_Q8_ROW_DISPATCH")
+        }
+        #[cfg(not(test))]
+        {
+            static Q8_ROW_DISPATCH_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *Q8_ROW_DISPATCH_ENABLED
+                .get_or_init(|| q8_0_env_flag_enabled_default_off("CAMELID_Q8_ROW_DISPATCH"))
+        }
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn q8_0_dot_rows_avx2(weight: &[Q8_0Block], input: &[Q8_0Block]) -> f32 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{
+        _mm256_add_epi32, _mm256_castsi256_si128, _mm256_cmpeq_epi8, _mm256_cvtepi8_epi16,
+        _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16,
+        _mm256_movemask_epi8, _mm256_mullo_epi16, _mm256_set1_epi16, _mm256_set1_epi8,
+        _mm256_setzero_si256, _mm256_sign_epi8, _mm_add_epi32, _mm_cvtsi128_si32, _mm_loadu_si128,
+        _mm_shuffle_epi32,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::{
+        _mm256_add_epi32, _mm256_castsi256_si128, _mm256_cmpeq_epi8, _mm256_cvtepi8_epi16,
+        _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16,
+        _mm256_movemask_epi8, _mm256_mullo_epi16, _mm256_set1_epi16, _mm256_set1_epi8,
+        _mm256_setzero_si256, _mm256_sign_epi8, _mm_add_epi32, _mm_cvtsi128_si32, _mm_loadu_si128,
+        _mm_shuffle_epi32,
+    };
+
+    let ones = _mm256_set1_epi16(1);
+    let min_i8 = _mm256_set1_epi8(i8::MIN);
+    let mut total_sum = 0.0_f32;
+
+    for (w_block, i_block) in weight.iter().zip(input) {
+        let weight_i8 = _mm256_loadu_si256(w_block.quants.as_ptr().cast());
+        let input_i8 = _mm256_loadu_si256(i_block.quants.as_ptr().cast());
+
+        let has_min_i8 = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(weight_i8, min_i8))
+            | _mm256_movemask_epi8(_mm256_cmpeq_epi8(input_i8, min_i8)))
+            != 0;
+
+        let acc = if has_min_i8 {
+            let mut acc = _mm256_setzero_si256();
+            for offset in [0usize, 16] {
+                let weight_half = _mm_loadu_si128(w_block.quants.as_ptr().add(offset).cast());
+                let input_half = _mm_loadu_si128(i_block.quants.as_ptr().add(offset).cast());
+                let products = _mm256_mullo_epi16(
+                    _mm256_cvtepi8_epi16(weight_half),
+                    _mm256_cvtepi8_epi16(input_half),
+                );
+                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(products, ones));
+            }
+            acc
+        } else {
+            let abs_weight = _mm256_sign_epi8(weight_i8, weight_i8);
+            let signed_input = _mm256_sign_epi8(input_i8, weight_i8);
+            _mm256_madd_epi16(_mm256_maddubs_epi16(abs_weight, signed_input), ones)
+        };
+
+        // Horizontal sum in registers (matches q8_0_i8_block_avx2 exactly)
+        let sum128 = _mm_add_epi32(
+            _mm256_castsi256_si128(acc),
+            _mm256_extracti128_si256(acc, 1),
+        );
+        let sum64 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, 0x4E));
+        let sum32 = _mm_add_epi32(sum64, _mm_shuffle_epi32(sum64, 0xB1));
+        let block_sum = _mm_cvtsi128_si32(sum32);
+
+        total_sum += block_sum as f32 * w_block.scale * i_block.scale;
+    }
+
+    total_sum
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn q8_0_two_dot_rows_avx2(
+    first_weight: &[Q8_0Block],
+    second_weight: &[Q8_0Block],
+    input: &[Q8_0Block],
+) -> (f32, f32) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{
+        _mm256_add_epi32, _mm256_castsi256_si128, _mm256_cmpeq_epi8, _mm256_cvtepi8_epi16,
+        _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16,
+        _mm256_movemask_epi8, _mm256_mullo_epi16, _mm256_set1_epi16, _mm256_set1_epi8,
+        _mm256_setzero_si256, _mm256_sign_epi8, _mm_add_epi32, _mm_cvtsi128_si32, _mm_loadu_si128,
+        _mm_shuffle_epi32,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::{
+        _mm256_add_epi32, _mm256_castsi256_si128, _mm256_cmpeq_epi8, _mm256_cvtepi8_epi16,
+        _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16,
+        _mm256_movemask_epi8, _mm256_mullo_epi16, _mm256_set1_epi16, _mm256_set1_epi8,
+        _mm256_setzero_si256, _mm256_sign_epi8, _mm_add_epi32, _mm_cvtsi128_si32, _mm_loadu_si128,
+        _mm_shuffle_epi32,
+    };
+
+    let ones = _mm256_set1_epi16(1);
+    let min_i8 = _mm256_set1_epi8(i8::MIN);
+    let mut first_sum = 0.0_f32;
+    let mut second_sum = 0.0_f32;
+
+    for ((first_block, second_block), input_block) in
+        first_weight.iter().zip(second_weight).zip(input)
+    {
+        let input_i8 = _mm256_loadu_si256(input_block.quants.as_ptr().cast());
+        let w1_i8 = _mm256_loadu_si256(first_block.quants.as_ptr().cast());
+        let w2_i8 = _mm256_loadu_si256(second_block.quants.as_ptr().cast());
+
+        let has_min_w1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(w1_i8, min_i8));
+        let has_min_w2 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(w2_i8, min_i8));
+        let has_min_input = _mm256_movemask_epi8(_mm256_cmpeq_epi8(input_i8, min_i8));
+
+        // first sum
+        let has_min_i8_1 = (has_min_w1 | has_min_input) != 0;
+        let acc1 = if has_min_i8_1 {
+            let mut acc = _mm256_setzero_si256();
+            for offset in [0usize, 16] {
+                let w1_half = _mm_loadu_si128(first_block.quants.as_ptr().add(offset).cast());
+                let input_half = _mm_loadu_si128(input_block.quants.as_ptr().add(offset).cast());
+                let products = _mm256_mullo_epi16(
+                    _mm256_cvtepi8_epi16(w1_half),
+                    _mm256_cvtepi8_epi16(input_half),
+                );
+                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(products, ones));
+            }
+            acc
+        } else {
+            let abs_weight = _mm256_sign_epi8(w1_i8, w1_i8);
+            let signed_input = _mm256_sign_epi8(input_i8, w1_i8);
+            _mm256_madd_epi16(_mm256_maddubs_epi16(abs_weight, signed_input), ones)
+        };
+
+        // second sum
+        let has_min_i8_2 = (has_min_w2 | has_min_input) != 0;
+        let acc2 = if has_min_i8_2 {
+            let mut acc = _mm256_setzero_si256();
+            for offset in [0usize, 16] {
+                let w2_half = _mm_loadu_si128(second_block.quants.as_ptr().add(offset).cast());
+                let input_half = _mm_loadu_si128(input_block.quants.as_ptr().add(offset).cast());
+                let products = _mm256_mullo_epi16(
+                    _mm256_cvtepi8_epi16(w2_half),
+                    _mm256_cvtepi8_epi16(input_half),
+                );
+                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(products, ones));
+            }
+            acc
+        } else {
+            let abs_weight = _mm256_sign_epi8(w2_i8, w2_i8);
+            let signed_input = _mm256_sign_epi8(input_i8, w2_i8);
+            _mm256_madd_epi16(_mm256_maddubs_epi16(abs_weight, signed_input), ones)
+        };
+
+        let mut lanes1 = [0_i32; 8];
+        let mut lanes2 = [0_i32; 8];
+        _mm256_storeu_si256(lanes1.as_mut_ptr().cast(), acc1);
+        _mm256_storeu_si256(lanes2.as_mut_ptr().cast(), acc2);
+
+        let block_sum1: i32 = lanes1.iter().sum();
+        let block_sum2: i32 = lanes2.iter().sum();
+
+        first_sum += block_sum1 as f32 * first_block.scale * input_block.scale;
+        second_sum += block_sum2 as f32 * second_block.scale * input_block.scale;
+    }
+
+    (first_sum, second_sum)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[target_feature(enable = "dotprod")]
+unsafe fn q8_0_dot_rows_neon_dotprod(weight: &[Q8_0Block], input: &[Q8_0Block]) -> f32 {
+    use std::arch::aarch64::{vdupq_n_s32, vld1q_s8};
+    use std::arch::asm;
+
+    let mut total_sum = 0.0_f32;
+
+    for (idx, (w_block, i_block)) in weight.iter().zip(input).enumerate() {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            if let Some(next_block) = weight.get(idx + 2) {
+                asm!(
+                    "prfm pldl1keep, [{ptr}]",
+                    ptr = in(reg) next_block.quants.as_ptr(),
+                    options(nostack, preserves_flags, readonly)
+                );
+            }
+        }
+        let weight_lo = vld1q_s8(w_block.quants.as_ptr());
+        let input_lo = vld1q_s8(i_block.quants.as_ptr());
+        let weight_hi = vld1q_s8(w_block.quants.as_ptr().add(16));
+        let input_hi = vld1q_s8(i_block.quants.as_ptr().add(16));
+
+        let mut acc = vdupq_n_s32(0);
+        asm!(
+            "sdot {acc:v}.4s, {weight_lo:v}.16b, {input_lo:v}.16b",
+            "sdot {acc:v}.4s, {weight_hi:v}.16b, {input_hi:v}.16b",
+            acc = inout(vreg) acc,
+            weight_lo = in(vreg) weight_lo,
+            input_lo = in(vreg) input_lo,
+            weight_hi = in(vreg) weight_hi,
+            input_hi = in(vreg) input_hi,
+            options(nostack, preserves_flags)
+        );
+
+        // Keep horizontal sum exactly identical to existing register horizontal sum
+        let int_sum = horizontal_sum_i32x4(acc);
+        total_sum += int_sum as f32 * w_block.scale * i_block.scale;
+    }
+
+    total_sum
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[target_feature(enable = "dotprod")]
+unsafe fn q8_0_two_dot_rows_neon_dotprod(
+    first_weight: &[Q8_0Block],
+    second_weight: &[Q8_0Block],
+    input: &[Q8_0Block],
+) -> (f32, f32) {
+    use std::arch::aarch64::{vdupq_n_s32, vld1q_s8};
+    use std::arch::asm;
+
+    let mut first_sum = 0.0_f32;
+    let mut second_sum = 0.0_f32;
+
+    for (idx, ((first_block, second_block), input_block)) in first_weight
+        .iter()
+        .zip(second_weight)
+        .zip(input)
+        .enumerate()
+    {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            if let Some(next_block) = first_weight.get(idx + 2) {
+                asm!(
+                    "prfm pldl1keep, [{ptr}]",
+                    ptr = in(reg) next_block.quants.as_ptr(),
+                    options(nostack, preserves_flags, readonly)
+                );
+            }
+            if let Some(next_block) = second_weight.get(idx + 2) {
+                asm!(
+                    "prfm pldl1keep, [{ptr}]",
+                    ptr = in(reg) next_block.quants.as_ptr(),
+                    options(nostack, preserves_flags, readonly)
+                );
+            }
+        }
+        let input_lo = vld1q_s8(input_block.quants.as_ptr());
+        let input_hi = vld1q_s8(input_block.quants.as_ptr().add(16));
+
+        let w1_lo = vld1q_s8(first_block.quants.as_ptr());
+        let w1_hi = vld1q_s8(first_block.quants.as_ptr().add(16));
+
+        let w2_lo = vld1q_s8(second_block.quants.as_ptr());
+        let w2_hi = vld1q_s8(second_block.quants.as_ptr().add(16));
+
+        let mut acc1 = vdupq_n_s32(0);
+        let mut acc2 = vdupq_n_s32(0);
+
+        asm!(
+            "sdot {acc1:v}.4s, {w1_lo:v}.16b, {input_lo:v}.16b",
+            "sdot {acc1:v}.4s, {w1_hi:v}.16b, {input_hi:v}.16b",
+            "sdot {acc2:v}.4s, {w2_lo:v}.16b, {input_lo:v}.16b",
+            "sdot {acc2:v}.4s, {w2_hi:v}.16b, {input_hi:v}.16b",
+            acc1 = inout(vreg) acc1,
+            acc2 = inout(vreg) acc2,
+            w1_lo = in(vreg) w1_lo,
+            w1_hi = in(vreg) w1_hi,
+            w2_lo = in(vreg) w2_lo,
+            w2_hi = in(vreg) w2_hi,
+            input_lo = in(vreg) input_lo,
+            input_hi = in(vreg) input_hi,
+            options(nostack, preserves_flags)
+        );
+
+        let int_sum1 = horizontal_sum_i32x4(acc1);
+        let int_sum2 = horizontal_sum_i32x4(acc2);
+
+        first_sum += int_sum1 as f32 * first_block.scale * input_block.scale;
+        second_sum += int_sum2 as f32 * second_block.scale * input_block.scale;
+    }
+
+    (first_sum, second_sum)
+}
+
 fn q8_0_dot_rows(weight: &[Q8_0Block], input: &[Q8_0Block]) -> f32 {
+    if q8_row_dispatch_enabled() {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            if aarch64_dotprod_enabled() {
+                return unsafe { q8_0_dot_rows_neon_dotprod(weight, input) };
+            }
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            if std::arch::is_x86_feature_detected!("avx2") {
+                return unsafe { q8_0_dot_rows_avx2(weight, input) };
+            }
+        }
+    }
+
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         if aarch64_dotprod_enabled() {
@@ -11422,6 +12208,23 @@ fn q8_0_two_dot_rows(
     second_weight: &[Q8_0Block],
     input: &[Q8_0Block],
 ) -> (f32, f32) {
+    if q8_row_dispatch_enabled() {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            if aarch64_dotprod_enabled() {
+                return unsafe {
+                    q8_0_two_dot_rows_neon_dotprod(first_weight, second_weight, input)
+                };
+            }
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            if std::arch::is_x86_feature_detected!("avx2") {
+                return unsafe { q8_0_two_dot_rows_avx2(first_weight, second_weight, input) };
+            }
+        }
+    }
+
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         if aarch64_dotprod_enabled() {
@@ -12026,15 +12829,31 @@ fn matmul_rhs_transposed_q8_0_packed_rows4_f32_input(
         )));
     }
     let mut output = vec![0.0_f32; rows * output_width];
-    for row in 0..rows {
-        let input_start = row * input_width;
-        let output_start = row * output_width;
-        accumulate_q8_0_packed_rows4_f32_input(
-            &input.data[input_start..input_start + input_width],
-            packed,
-            interleave,
-            &mut output[output_start..output_start + output_width],
-        );
+    use rayon::prelude::*;
+    if should_parallelize_linear_output(rows * output_width) {
+        output
+            .par_chunks_mut(output_width)
+            .enumerate()
+            .for_each(|(row, output_row)| {
+                let input_start = row * input_width;
+                accumulate_q8_0_packed_rows4_f32_input(
+                    &input.data[input_start..input_start + input_width],
+                    packed,
+                    interleave,
+                    output_row,
+                );
+            });
+    } else {
+        for row in 0..rows {
+            let input_start = row * input_width;
+            let output_start = row * output_width;
+            accumulate_q8_0_packed_rows4_f32_input(
+                &input.data[input_start..input_start + input_width],
+                packed,
+                interleave,
+                &mut output[output_start..output_start + output_width],
+            );
+        }
     }
     CpuTensor::from_f32(name, vec![rows, output_width], output)
 }
@@ -14100,7 +14919,19 @@ fn q8_0_packed_rows4_dot(
 ) -> [f32; 4] {
     debug_assert_eq!(packed_blocks.len(), input.len());
     let mut sums = [0.0_f32; 4];
-    for (packed_block, input_block) in packed_blocks.iter().zip(input) {
+    for (idx, (packed_block, input_block)) in packed_blocks.iter().zip(input).enumerate() {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            if let Some(next_block) = packed_blocks.get(idx + 2) {
+                unsafe {
+                    std::arch::asm!(
+                        "prfm pldl1keep, [{ptr}]",
+                        ptr = in(reg) next_block.quants.as_ptr(),
+                        options(nostack, preserves_flags, readonly)
+                    );
+                }
+            }
+        }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let int_sums = if aarch64_dotprod_enabled() {
             // SAFETY: runtime feature detection confirms dot-product support; packed quants

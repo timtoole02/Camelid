@@ -49,6 +49,27 @@ pub(crate) fn disable_file_cache_best_effort(file: &File) {
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn disable_file_cache_best_effort(_file: &File) {}
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[link(name = "Accelerate", kind = "framework")]
+extern "C" {
+    fn cblas_sgemm(
+        order: i32,
+        trans_a: i32,
+        trans_b: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        a: *const f32,
+        lda: i32,
+        b: *const f32,
+        ldb: i32,
+        beta: f32,
+        c: *mut f32,
+        ldc: i32,
+    );
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TensorShape {
     pub dims: Vec<usize>,
@@ -1257,31 +1278,73 @@ impl CpuTensor {
             )));
         }
         let mut out = vec![0.0; m * n];
-        if should_parallelize_linear_output(n) {
-            for row in 0..m {
-                let lhs_start = row * k;
-                let out_start = row * n;
-                let out_row = &mut out[out_start..out_start + n];
-                out_row
-                    .par_iter_mut()
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            unsafe {
+                cblas_sgemm(
+                    101, // CBLAS_ROW_MAJOR
+                    111, // CBLAS_NO_TRANS
+                    111, // CBLAS_NO_TRANS
+                    m as i32,
+                    n as i32,
+                    k as i32,
+                    1.0,
+                    self.data.as_ptr(),
+                    k as i32,
+                    rhs.data.as_ptr(),
+                    n as i32,
+                    0.0,
+                    out.as_mut_ptr(),
+                    n as i32,
+                );
+            }
+        }
+
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            if should_parallelize_linear_output(n) {
+                for row in 0..m {
+                    let lhs_start = row * k;
+                    let out_start = row * n;
+                    let out_row = &mut out[out_start..out_start + n];
+                    out_row
+                        .par_iter_mut()
+                        .enumerate()
+                        .for_each(|(col, out_value)| {
+                            let mut sum = 0.0;
+                            for inner in 0..k {
+                                let lhs_value = self.data[lhs_start + inner];
+                                if lhs_value == 0.0 {
+                                    continue;
+                                }
+                                sum += lhs_value * rhs.data[inner * n + col];
+                            }
+                            *out_value = sum;
+                        });
+                }
+            } else if should_parallelize_linear_output(m * n) {
+                out.par_chunks_mut(n)
                     .enumerate()
-                    .for_each(|(col, out_value)| {
-                        let mut sum = 0.0;
+                    .for_each(|(row, out_row)| {
+                        let lhs_start = row * k;
                         for inner in 0..k {
                             let lhs_value = self.data[lhs_start + inner];
                             if lhs_value == 0.0 {
                                 continue;
                             }
-                            sum += lhs_value * rhs.data[inner * n + col];
+                            let rhs_start = inner * n;
+                            let rhs_row = &rhs.data[rhs_start..rhs_start + n];
+                            for col in 0..n {
+                                out_row[col] += lhs_value * rhs_row[col];
+                            }
                         }
-                        *out_value = sum;
                     });
-            }
-        } else if should_parallelize_linear_output(m * n) {
-            out.par_chunks_mut(n)
-                .enumerate()
-                .for_each(|(row, out_row)| {
+            } else {
+                for row in 0..m {
                     let lhs_start = row * k;
+                    let out_start = row * n;
+                    let out_row = &mut out[out_start..out_start + n];
                     for inner in 0..k {
                         let lhs_value = self.data[lhs_start + inner];
                         if lhs_value == 0.0 {
@@ -1293,25 +1356,10 @@ impl CpuTensor {
                             out_row[col] += lhs_value * rhs_row[col];
                         }
                     }
-                });
-        } else {
-            for row in 0..m {
-                let lhs_start = row * k;
-                let out_start = row * n;
-                let out_row = &mut out[out_start..out_start + n];
-                for inner in 0..k {
-                    let lhs_value = self.data[lhs_start + inner];
-                    if lhs_value == 0.0 {
-                        continue;
-                    }
-                    let rhs_start = inner * n;
-                    let rhs_row = &rhs.data[rhs_start..rhs_start + n];
-                    for col in 0..n {
-                        out_row[col] += lhs_value * rhs_row[col];
-                    }
                 }
             }
         }
+
         Self::from_f32(name, vec![m, n], out)
     }
 
@@ -1330,48 +1378,76 @@ impl CpuTensor {
             )));
         }
         let mut out = vec![0.0; m * n];
-        if should_parallelize_linear_output(n) {
-            for row in 0..m {
-                let lhs_start = row * k;
-                let lhs_row = &self.data[lhs_start..lhs_start + k];
-                let out_start = row * n;
-                let out_row = &mut out[out_start..out_start + n];
-                out_row
-                    .par_iter_mut()
-                    .enumerate()
-                    .for_each(|(col, out_value)| {
-                        let rhs_start = col * k;
-                        let rhs_row = &rhs.data[rhs_start..rhs_start + k];
-                        *out_value = dot_product(lhs_row, rhs_row);
-                    });
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            unsafe {
+                cblas_sgemm(
+                    101, // CBLAS_ROW_MAJOR
+                    111, // CBLAS_NO_TRANS
+                    112, // CBLAS_TRANS
+                    m as i32,
+                    n as i32,
+                    k as i32,
+                    1.0,
+                    self.data.as_ptr(),
+                    k as i32,
+                    rhs.data.as_ptr(),
+                    k as i32,
+                    0.0,
+                    out.as_mut_ptr(),
+                    n as i32,
+                );
             }
-        } else if should_parallelize_linear_output(m * n) {
-            out.par_chunks_mut(n)
-                .enumerate()
-                .for_each(|(row, out_row)| {
+        }
+
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            if should_parallelize_linear_output(n) {
+                for row in 0..m {
                     let lhs_start = row * k;
                     let lhs_row = &self.data[lhs_start..lhs_start + k];
+                    let out_start = row * n;
+                    let out_row = &mut out[out_start..out_start + n];
+                    out_row
+                        .par_iter_mut()
+                        .enumerate()
+                        .for_each(|(col, out_value)| {
+                            let rhs_start = col * k;
+                            let rhs_row = &rhs.data[rhs_start..rhs_start + k];
+                            *out_value = dot_product(lhs_row, rhs_row);
+                        });
+                }
+            } else if should_parallelize_linear_output(m * n) {
+                out.par_chunks_mut(n)
+                    .enumerate()
+                    .for_each(|(row, out_row)| {
+                        let lhs_start = row * k;
+                        let lhs_row = &self.data[lhs_start..lhs_start + k];
+                        for (col, out_value) in out_row.iter_mut().enumerate() {
+                            let rhs_start = col * k;
+                            let rhs_row = &rhs.data[rhs_start..rhs_start + k];
+                            *out_value = dot_product(lhs_row, rhs_row);
+                        }
+                    });
+            } else {
+                for row in 0..m {
+                    let lhs_start = row * k;
+                    let lhs_row = &self.data[lhs_start..lhs_start + k];
+                    let out_start = row * n;
+                    let out_row = &mut out[out_start..out_start + n];
                     for (col, out_value) in out_row.iter_mut().enumerate() {
                         let rhs_start = col * k;
                         let rhs_row = &rhs.data[rhs_start..rhs_start + k];
                         *out_value = dot_product(lhs_row, rhs_row);
                     }
-                });
-        } else {
-            for row in 0..m {
-                let lhs_start = row * k;
-                let lhs_row = &self.data[lhs_start..lhs_start + k];
-                let out_start = row * n;
-                let out_row = &mut out[out_start..out_start + n];
-                for (col, out_value) in out_row.iter_mut().enumerate() {
-                    let rhs_start = col * k;
-                    let rhs_row = &rhs.data[rhs_start..rhs_start + k];
-                    *out_value = dot_product(lhs_row, rhs_row);
                 }
             }
         }
+
         Self::from_f32(name, vec![m, n], out)
     }
+
 
     fn require_row_major_f32_data(&self, context: &str) -> Result<()> {
         let expected_len = self.shape.element_count()?;
@@ -1396,24 +1472,180 @@ impl CpuTensor {
     }
 
     pub fn add(&self, rhs: &Self, name: impl Into<String>) -> Result<Self> {
-        self.zip_same_shape(rhs, name, |a, b| a + b)
+        if self.shape != rhs.shape {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "shape mismatch: lhs {:?}, rhs {:?}",
+                self.shape.dims, rhs.shape.dims
+            )));
+        }
+        let mut out = vec![0.0; self.data.len()];
+        let len = self.data.len();
+        if should_parallelize_linear_output(len) {
+            out.par_iter_mut()
+                .zip(self.data.par_iter())
+                .zip(rhs.data.par_iter())
+                .for_each(|((o, &a), &b)| {
+                    *o = a + b;
+                });
+        } else {
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            {
+                use std::arch::aarch64::{vld1q_f32, vaddq_f32, vst1q_f32};
+                let mut i = 0;
+                unsafe {
+                    while i + 4 <= len {
+                        let va = vld1q_f32(self.data.as_ptr().add(i));
+                        let vb = vld1q_f32(rhs.data.as_ptr().add(i));
+                        let vout = vaddq_f32(va, vb);
+                        vst1q_f32(out.as_mut_ptr().add(i), vout);
+                        i += 4;
+                    }
+                    while i < len {
+                        out[i] = self.data[i] + rhs.data[i];
+                        i += 1;
+                    }
+                }
+            }
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            {
+                for i in 0..len {
+                    out[i] = self.data[i] + rhs.data[i];
+                }
+            }
+        }
+        Self::from_f32(name, self.shape.dims.clone(), out)
     }
 
     pub fn mul(&self, rhs: &Self, name: impl Into<String>) -> Result<Self> {
-        self.zip_same_shape(rhs, name, |a, b| a * b)
+        if self.shape != rhs.shape {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "shape mismatch: lhs {:?}, rhs {:?}",
+                self.shape.dims, rhs.shape.dims
+            )));
+        }
+        let mut out = vec![0.0; self.data.len()];
+        let len = self.data.len();
+        if should_parallelize_linear_output(len) {
+            out.par_iter_mut()
+                .zip(self.data.par_iter())
+                .zip(rhs.data.par_iter())
+                .for_each(|((o, &a), &b)| {
+                    *o = a * b;
+                });
+        } else {
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            {
+                use std::arch::aarch64::{vld1q_f32, vmulq_f32, vst1q_f32};
+                let mut i = 0;
+                unsafe {
+                    while i + 4 <= len {
+                        let va = vld1q_f32(self.data.as_ptr().add(i));
+                        let vb = vld1q_f32(rhs.data.as_ptr().add(i));
+                        let vout = vmulq_f32(va, vb);
+                        vst1q_f32(out.as_mut_ptr().add(i), vout);
+                        i += 4;
+                    }
+                    while i < len {
+                        out[i] = self.data[i] * rhs.data[i];
+                        i += 1;
+                    }
+                }
+            }
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            {
+                for i in 0..len {
+                    out[i] = self.data[i] * rhs.data[i];
+                }
+            }
+        }
+        Self::from_f32(name, self.shape.dims.clone(), out)
     }
 
     pub fn silu_mul(&self, rhs: &Self, name: impl Into<String>) -> Result<Self> {
-        self.zip_same_shape(rhs, name, |a, b| (a / (1.0 + (-a).exp())) * b)
+        if self.shape != rhs.shape {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "shape mismatch: lhs {:?}, rhs {:?}",
+                self.shape.dims, rhs.shape.dims
+            )));
+        }
+        let len = self.data.len();
+        let mut out = vec![0.0; len];
+        if should_parallelize_linear_output(len) {
+            out.par_iter_mut()
+                .zip(self.data.par_iter())
+                .zip(rhs.data.par_iter())
+                .for_each(|((o, &a), &b)| {
+                    *o = (a / (1.0 + (-a).exp())) * b;
+                });
+        } else {
+            for i in 0..len {
+                let a = self.data[i];
+                let b = rhs.data[i];
+                out[i] = (a / (1.0 + (-a).exp())) * b;
+            }
+        }
+        Self::from_f32(name, self.shape.dims.clone(), out)
     }
 
     pub fn silu(&self, name: impl Into<String>) -> Result<Self> {
-        Self::from_f32(
-            name,
-            self.shape.dims.clone(),
-            self.data.iter().map(|x| x / (1.0 + (-x).exp())).collect(),
-        )
+        let len = self.data.len();
+        let mut out = vec![0.0; len];
+        if should_parallelize_linear_output(len) {
+            out.par_iter_mut()
+                .zip(self.data.par_iter())
+                .for_each(|(o, &x)| {
+                    *o = x / (1.0 + (-x).exp());
+                });
+        } else {
+            for i in 0..len {
+                let x = self.data[i];
+                out[i] = x / (1.0 + (-x).exp());
+            }
+        }
+        Self::from_f32(name, self.shape.dims.clone(), out)
     }
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[inline(always)]
+unsafe fn rms_norm_neon(input: &[f32], weight: &[f32], out: &mut [f32], cols: usize, eps: f32) {
+    use std::arch::aarch64::{
+        vld1q_f32, vmulq_f32, vaddq_f32, vdupq_n_f32, vst1q_f32, vget_low_f32, vget_high_f32, vpadd_f32, vget_lane_f32
+    };
+
+    let mut sum_sq_vec = vdupq_n_f32(0.0);
+    let mut i = 0;
+    while i + 4 <= cols {
+        let v = vld1q_f32(input.as_ptr().add(i));
+        sum_sq_vec = vaddq_f32(sum_sq_vec, vmulq_f32(v, v));
+        i += 4;
+    }
+    let low = vget_low_f32(sum_sq_vec);
+    let high = vget_high_f32(sum_sq_vec);
+    let sum_2 = vpadd_f32(low, high);
+    let mut sum_sq = vget_lane_f32::<0>(sum_2) + vget_lane_f32::<1>(sum_2);
+    while i < cols {
+        let v = input[i];
+        sum_sq += v * v;
+        i += 1;
+    }
+
+    let mean_square = sum_sq / cols as f32;
+    let scale = 1.0 / (mean_square + eps).sqrt();
+    let scale_vec = vdupq_n_f32(scale);
+
+    i = 0;
+    while i + 4 <= cols {
+        let v_in = vld1q_f32(input.as_ptr().add(i));
+        let v_w = vld1q_f32(weight.as_ptr().add(i));
+        let v_out = vmulq_f32(vmulq_f32(v_in, scale_vec), v_w);
+        vst1q_f32(out.as_mut_ptr().add(i), v_out);
+        i += 4;
+    }
+    while i < cols {
+        out[i] = input[i] * scale * weight[i];
+        i += 1;
+    }
+}
 
     pub fn rms_norm(&self, weight: &Self, eps: f32, name: impl Into<String>) -> Result<Self> {
         require_rank(self, 2, "rms_norm input")?;
@@ -1427,16 +1659,55 @@ impl CpuTensor {
             )));
         }
         let mut out = vec![0.0; self.data.len()];
-        for row in 0..rows {
-            let start = row * cols;
-            let end = start + cols;
-            let mean_square =
-                self.data[start..end].iter().map(|v| v * v).sum::<f32>() / cols as f32;
-            let scale = 1.0 / (mean_square + eps).sqrt();
-            for col in 0..cols {
-                out[start + col] = self.data[start + col] * scale * weight.data[col];
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            if should_parallelize_linear_output(self.data.len()) {
+                out.par_chunks_mut(cols)
+                    .zip(self.data.par_chunks(cols))
+                    .for_each(|(out_row, in_row)| {
+                        unsafe {
+                            Self::rms_norm_neon(in_row, &weight.data, out_row, cols, eps);
+                        }
+                    });
+            } else {
+                for row in 0..rows {
+                    let start = row * cols;
+                    let in_row = &self.data[start..start + cols];
+                    let out_row = &mut out[start..start + cols];
+                    unsafe {
+                        Self::rms_norm_neon(in_row, &weight.data, out_row, cols, eps);
+                    }
+                }
             }
         }
+
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            if should_parallelize_linear_output(self.data.len()) {
+                out.par_chunks_mut(cols)
+                    .zip(self.data.par_chunks(cols))
+                    .for_each(|(out_row, in_row)| {
+                        let mean_square = in_row.iter().map(|v| v * v).sum::<f32>() / cols as f32;
+                        let scale = 1.0 / (mean_square + eps).sqrt();
+                        for col in 0..cols {
+                            out_row[col] = in_row[col] * scale * weight.data[col];
+                        }
+                    });
+            } else {
+                for row in 0..rows {
+                    let start = row * cols;
+                    let end = start + cols;
+                    let mean_square =
+                        self.data[start..end].iter().map(|v| v * v).sum::<f32>() / cols as f32;
+                    let scale = 1.0 / (mean_square + eps).sqrt();
+                    for col in 0..cols {
+                        out[start + col] = self.data[start + col] * scale * weight.data[col];
+                    }
+                }
+            }
+        }
+
         Self::from_f32(name, self.shape.dims.clone(), out)
     }
 
@@ -1455,24 +1726,49 @@ impl CpuTensor {
             )));
         }
         let mut out = self.data.clone();
-        for row in out.chunks_exact_mut(cols) {
-            let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut sum = 0.0;
-            for v in row.iter_mut() {
-                *v = (*v - max).exp();
-                sum += *v;
-            }
-            if sum == 0.0 || !sum.is_finite() {
-                return Err(BackendError::RuntimeShapeMismatch(
-                    "softmax produced invalid normalization sum".to_string(),
-                ));
-            }
-            for v in row.iter_mut() {
-                *v /= sum;
+        if should_parallelize_linear_output(out.len()) {
+            out.par_chunks_exact_mut(cols)
+                .map(|row| {
+                    let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let mut sum = 0.0;
+                    for v in row.iter_mut() {
+                        *v = (*v - max).exp();
+                        sum += *v;
+                    }
+                    (row, sum)
+                })
+                .try_for_each(|(row, sum)| {
+                    if sum == 0.0 || !sum.is_finite() {
+                        return Err(BackendError::RuntimeShapeMismatch(
+                            "softmax produced invalid normalization sum".to_string(),
+                        ));
+                    }
+                    for v in row.iter_mut() {
+                        *v /= sum;
+                    }
+                    Ok(())
+                })?;
+        } else {
+            for row in out.chunks_exact_mut(cols) {
+                let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0;
+                for v in row.iter_mut() {
+                    *v = (*v - max).exp();
+                    sum += *v;
+                }
+                if sum == 0.0 || !sum.is_finite() {
+                    return Err(BackendError::RuntimeShapeMismatch(
+                        "softmax produced invalid normalization sum".to_string(),
+                    ));
+                }
+                for v in row.iter_mut() {
+                    *v /= sum;
+                }
             }
         }
         Self::from_f32(name, self.shape.dims.clone(), out)
     }
+
 
     pub fn embedding_lookup(&self, token_ids: &[u32], name: impl Into<String>) -> Result<Self> {
         require_rank(self, 2, "embedding weight")?;
@@ -1678,6 +1974,7 @@ impl CpuTensor {
         Self::from_f32(name, vec![cols, rows], out)
     }
 
+    #[allow(dead_code)]
     fn zip_same_shape(
         &self,
         rhs: &Self,
@@ -1712,6 +2009,56 @@ fn require_rank(tensor: &CpuTensor, rank: usize, op: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn dot_product(lhs: &[f32], rhs: &[f32]) -> f32 {
+    debug_assert_eq!(lhs.len(), rhs.len());
+    use std::arch::aarch64::{
+        vld1q_f32, vmulq_f32, vaddq_f32, vdupq_n_f32, vget_low_f32, vget_high_f32, vpadd_f32, vget_lane_f32
+    };
+    let len = lhs.len();
+    let mut idx = 0;
+    unsafe {
+        let mut sum_vec = vdupq_n_f32(0.0);
+        // Unroll 4x (16 floats per iteration) for maximum instruction pipelining and data throughput
+        while idx + 16 <= len {
+            let l0 = vld1q_f32(lhs.as_ptr().add(idx));
+            let r0 = vld1q_f32(rhs.as_ptr().add(idx));
+            let l1 = vld1q_f32(lhs.as_ptr().add(idx + 4));
+            let r1 = vld1q_f32(rhs.as_ptr().add(idx + 4));
+            let l2 = vld1q_f32(lhs.as_ptr().add(idx + 8));
+            let r2 = vld1q_f32(rhs.as_ptr().add(idx + 8));
+            let l3 = vld1q_f32(lhs.as_ptr().add(idx + 12));
+            let r3 = vld1q_f32(rhs.as_ptr().add(idx + 12));
+
+            let m0 = vmulq_f32(l0, r0);
+            let m1 = vmulq_f32(l1, r1);
+            let m2 = vmulq_f32(l2, r2);
+            let m3 = vmulq_f32(l3, r3);
+
+            let s01 = vaddq_f32(m0, m1);
+            let s23 = vaddq_f32(m2, m3);
+            sum_vec = vaddq_f32(sum_vec, vaddq_f32(s01, s23));
+            idx += 16;
+        }
+        while idx + 4 <= len {
+            let l = vld1q_f32(lhs.as_ptr().add(idx));
+            let r = vld1q_f32(rhs.as_ptr().add(idx));
+            sum_vec = vaddq_f32(sum_vec, vmulq_f32(l, r));
+            idx += 4;
+        }
+        let low = vget_low_f32(sum_vec);
+        let high = vget_high_f32(sum_vec);
+        let sum_2 = vpadd_f32(low, high);
+        let mut sum = vget_lane_f32::<0>(sum_2) + vget_lane_f32::<1>(sum_2);
+        while idx < len {
+            sum += lhs[idx] * rhs[idx];
+            idx += 1;
+        }
+        sum
+    }
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 pub(crate) fn dot_product(lhs: &[f32], rhs: &[f32]) -> f32 {
     debug_assert_eq!(lhs.len(), rhs.len());
     let mut sum = 0.0;
@@ -2835,9 +3182,20 @@ impl TensorStore {
                 }
                 decoded
             }
+            GgufTensorType::Q4_0 => decode_q4_0_tensor(name, &bytes, expected_elements)?,
+            GgufTensorType::Q4_1 => decode_q4_1_tensor(name, &bytes, expected_elements)?,
+            GgufTensorType::Q5_0 => decode_q5_0_tensor(name, &bytes, expected_elements)?,
+            GgufTensorType::Q5_1 => decode_q5_1_tensor(name, &bytes, expected_elements)?,
+            GgufTensorType::Q2K => decode_q2_k_tensor(name, &bytes, expected_elements)?,
+            GgufTensorType::Q3K => decode_q3_k_tensor(name, &bytes, expected_elements)?,
+            GgufTensorType::Q4K => decode_q4_k_tensor(name, &bytes, expected_elements)?,
+            GgufTensorType::Q5K => decode_q5_k_tensor(name, &bytes, expected_elements)?,
+            GgufTensorType::Q6K => decode_q6_k_tensor(name, &bytes, expected_elements)?,
+            GgufTensorType::Q8K => decode_q8_k_tensor(name, &bytes, expected_elements)?,
+            GgufTensorType::IQ4NL => decode_iq4_nl_tensor(name, &bytes, expected_elements)?,
             other => {
                 return Err(BackendError::UnsupportedTensorType(format!(
-                    "tensor {name} has unsupported storage type {other:?}; supported for CPU f32 load: F32, F16, BF16, Q8_0"
+                    "tensor {name} has unsupported storage type {other:?}; supported for CPU f32 load: F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, IQ4_NL"
                 )))
             }
         };
@@ -2991,6 +3349,940 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
         }
     };
     f32::from_bits(out)
+}
+
+// Quantization Constants
+pub const Q8_BLOCK_SIZE: usize = 32;
+pub const Q4_0_BLOCK_BYTES: usize = 2 + (Q8_BLOCK_SIZE / 2);
+pub const Q4_1_BLOCK_BYTES: usize = 4 + (Q8_BLOCK_SIZE / 2);
+pub const Q5_0_BLOCK_BYTES: usize = 2 + 4 + (Q8_BLOCK_SIZE / 2);
+pub const Q5_1_BLOCK_BYTES: usize = 4 + 4 + (Q8_BLOCK_SIZE / 2);
+pub const QK_K_BLOCK_SIZE: usize = 256;
+pub const Q2_K_BLOCK_BYTES: usize = 16 + 64 + 4;
+pub const Q3_K_BLOCK_BYTES: usize = 32 + 64 + 12 + 2;
+pub const Q4_K_BLOCK_BYTES: usize = 4 + 12 + 128;
+pub const Q5_K_BLOCK_BYTES: usize = 4 + 12 + 32 + 128;
+pub const Q6_K_BLOCK_BYTES: usize = 128 + 64 + 16 + 2;
+pub const Q8_K_BLOCK_BYTES: usize = 292;
+pub const IQ4_NL_BLOCK_BYTES: usize = 18;
+
+#[inline(always)]
+pub fn fast_f16_to_f32(bits: u16) -> f32 {
+    let sign = (u32::from(bits & 0x8000)) << 16;
+    let exponent = u32::from(bits & 0x7c00) >> 10;
+    let fraction = u32::from(bits & 0x03ff);
+
+    if exponent == 0 {
+        if fraction == 0 {
+            return f32::from_bits(sign);
+        }
+        f16_bits_to_f32(bits)
+    } else if exponent == 0x1f {
+        f32::from_bits(sign | 0x7f80_0000 | (fraction << 13))
+    } else {
+        f32::from_bits(sign | ((exponent + 112) << 23) | (fraction << 13))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Q4_0Block {
+    scale_bits: u16,
+    values: [u8; Q8_BLOCK_SIZE / 2],
+}
+
+impl Q4_0Block {
+    pub fn from_bytes(bytes: &[u8; Q4_0_BLOCK_BYTES]) -> Self {
+        let scale_bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+        let mut values = [0_u8; Q8_BLOCK_SIZE / 2];
+        values.copy_from_slice(&bytes[2..]);
+        Self { scale_bits, values }
+    }
+
+    pub fn scale_f32(&self) -> f32 {
+        fast_f16_to_f32(self.scale_bits)
+    }
+
+    pub fn unpack_values(&self) -> [i8; Q8_BLOCK_SIZE] {
+        let mut out = [0_i8; Q8_BLOCK_SIZE];
+        for (idx, &byte) in self.values.iter().enumerate() {
+            out[idx] = ((byte & 0x0f) as i8) - 8;
+            out[idx + 16] = ((byte >> 4) as i8) - 8;
+        }
+        out
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Q4_1Block {
+    scale_bits: u16,
+    min_bits: u16,
+    values: [u8; Q8_BLOCK_SIZE / 2],
+}
+
+impl Q4_1Block {
+    pub fn from_bytes(bytes: &[u8; Q4_1_BLOCK_BYTES]) -> Self {
+        let scale_bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+        let min_bits = u16::from_le_bytes([bytes[2], bytes[3]]);
+        let mut values = [0_u8; Q8_BLOCK_SIZE / 2];
+        values.copy_from_slice(&bytes[4..]);
+        Self {
+            scale_bits,
+            min_bits,
+            values,
+        }
+    }
+
+    pub fn scale_f32(&self) -> f32 {
+        fast_f16_to_f32(self.scale_bits)
+    }
+
+    pub fn min_f32(&self) -> f32 {
+        fast_f16_to_f32(self.min_bits)
+    }
+
+    pub fn unpack_values(&self) -> [u8; Q8_BLOCK_SIZE] {
+        let mut out = [0_u8; Q8_BLOCK_SIZE];
+        for (idx, &byte) in self.values.iter().enumerate() {
+            out[idx] = byte & 0x0f;
+            out[idx + 16] = byte >> 4;
+        }
+        out
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Q5_0Block {
+    scale_bits: u16,
+    high_bits: u32,
+    values: [u8; Q8_BLOCK_SIZE / 2],
+}
+
+impl Q5_0Block {
+    pub fn from_bytes(bytes: &[u8; Q5_0_BLOCK_BYTES]) -> Self {
+        let scale_bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+        let high_bits = u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
+        let mut values = [0_u8; Q8_BLOCK_SIZE / 2];
+        values.copy_from_slice(&bytes[6..]);
+        Self {
+            scale_bits,
+            high_bits,
+            values,
+        }
+    }
+
+    pub fn scale_f32(&self) -> f32 {
+        fast_f16_to_f32(self.scale_bits)
+    }
+
+    pub fn unpack_values(&self) -> [i8; Q8_BLOCK_SIZE] {
+        let mut out = [0_i8; Q8_BLOCK_SIZE];
+        for (idx, &byte) in self.values.iter().enumerate() {
+            let low_high = (((self.high_bits >> idx) & 1) as u8) << 4;
+            let high_high = (((self.high_bits >> (idx + 16)) & 1) as u8) << 4;
+            out[idx] = ((byte & 0x0f) | low_high) as i8 - 16;
+            out[idx + 16] = ((byte >> 4) | high_high) as i8 - 16;
+        }
+        out
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Q5_1Block {
+    scale_bits: u16,
+    min_bits: u16,
+    high_bits: u32,
+    values: [u8; Q8_BLOCK_SIZE / 2],
+}
+
+impl Q5_1Block {
+    pub fn from_bytes(bytes: &[u8; Q5_1_BLOCK_BYTES]) -> Self {
+        let scale_bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+        let min_bits = u16::from_le_bytes([bytes[2], bytes[3]]);
+        let high_bits = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let mut values = [0_u8; Q8_BLOCK_SIZE / 2];
+        values.copy_from_slice(&bytes[8..]);
+        Self {
+            scale_bits,
+            min_bits,
+            high_bits,
+            values,
+        }
+    }
+
+    pub fn scale_f32(&self) -> f32 {
+        fast_f16_to_f32(self.scale_bits)
+    }
+
+    pub fn min_f32(&self) -> f32 {
+        fast_f16_to_f32(self.min_bits)
+    }
+
+    pub fn unpack_values(&self) -> [u8; Q8_BLOCK_SIZE] {
+        let mut out = [0_u8; Q8_BLOCK_SIZE];
+        for (idx, &byte) in self.values.iter().enumerate() {
+            let low_high = (((self.high_bits >> idx) & 1) as u8) << 4;
+            let high_high = (((self.high_bits >> (idx + 16)) & 1) as u8) << 4;
+            out[idx] = (byte & 0x0f) | low_high;
+            out[idx + 16] = (byte >> 4) | high_high;
+        }
+        out
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Q2KBlock {
+    scales: [u8; QK_K_BLOCK_SIZE / 16],
+    values: [u8; QK_K_BLOCK_SIZE / 4],
+    scale_bits: u16,
+    min_bits: u16,
+}
+
+impl Q2KBlock {
+    pub fn from_bytes(bytes: &[u8; Q2_K_BLOCK_BYTES]) -> Self {
+        let mut scales = [0_u8; QK_K_BLOCK_SIZE / 16];
+        let mut values = [0_u8; QK_K_BLOCK_SIZE / 4];
+        scales.copy_from_slice(&bytes[0..16]);
+        values.copy_from_slice(&bytes[16..80]);
+        let scale_bits = u16::from_le_bytes([bytes[80], bytes[81]]);
+        let min_bits = u16::from_le_bytes([bytes[82], bytes[83]]);
+        Self {
+            scales,
+            values,
+            scale_bits,
+            min_bits,
+        }
+    }
+
+    pub fn scale_f32(&self) -> f32 {
+        fast_f16_to_f32(self.scale_bits)
+    }
+
+    pub fn min_f32(&self) -> f32 {
+        fast_f16_to_f32(self.min_bits)
+    }
+
+    pub fn dequantize(&self, out: &mut [f32; QK_K_BLOCK_SIZE]) {
+        let d = self.scale_f32();
+        let d_min = self.min_f32();
+        let mut scale_idx = 0;
+
+        for super_idx in 0..2 {
+            let value_base = super_idx * 32;
+            let out_base = super_idx * 128;
+            let mut shift = 0;
+            for group_idx in 0..4 {
+                let low_scale = self.scales[scale_idx];
+                scale_idx += 1;
+                let low_d = d * (low_scale & 0x0f) as f32;
+                let low_min = d_min * (low_scale >> 4) as f32;
+                for l in 0..16 {
+                    out[out_base + group_idx * 32 + l] =
+                        low_d * ((self.values[value_base + l] >> shift) & 3) as f32 - low_min;
+                }
+
+                let high_scale = self.scales[scale_idx];
+                scale_idx += 1;
+                let high_d = d * (high_scale & 0x0f) as f32;
+                let high_min = d_min * (high_scale >> 4) as f32;
+                for l in 0..16 {
+                    out[out_base + group_idx * 32 + 16 + l] = high_d
+                        * ((self.values[value_base + 16 + l] >> shift) & 3) as f32
+                        - high_min;
+                }
+
+                shift += 2;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Q3KBlock {
+    high_bits: [u8; QK_K_BLOCK_SIZE / 8],
+    values: [u8; QK_K_BLOCK_SIZE / 4],
+    scales: [u8; 12],
+    scale_bits: u16,
+}
+
+impl Q3KBlock {
+    pub fn from_bytes(bytes: &[u8; Q3_K_BLOCK_BYTES]) -> Self {
+        let mut high_bits = [0_u8; QK_K_BLOCK_SIZE / 8];
+        let mut values = [0_u8; QK_K_BLOCK_SIZE / 4];
+        let mut scales = [0_u8; 12];
+        high_bits.copy_from_slice(&bytes[0..32]);
+        values.copy_from_slice(&bytes[32..96]);
+        scales.copy_from_slice(&bytes[96..108]);
+        let scale_bits = u16::from_le_bytes([bytes[108], bytes[109]]);
+        Self {
+            high_bits,
+            values,
+            scales,
+            scale_bits,
+        }
+    }
+
+    pub fn scale_f32(&self) -> f32 {
+        fast_f16_to_f32(self.scale_bits)
+    }
+
+    fn expanded_scales(&self) -> [i8; 16] {
+        const KMASK1: u32 = 0x0303_0303;
+        const KMASK2: u32 = 0x0f0f_0f0f;
+
+        let mut aux = [
+            u32::from_le_bytes([
+                self.scales[0],
+                self.scales[1],
+                self.scales[2],
+                self.scales[3],
+            ]),
+            u32::from_le_bytes([
+                self.scales[4],
+                self.scales[5],
+                self.scales[6],
+                self.scales[7],
+            ]),
+            u32::from_le_bytes([
+                self.scales[8],
+                self.scales[9],
+                self.scales[10],
+                self.scales[11],
+            ]),
+            0,
+        ];
+
+        let tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
+        aux[3] = ((aux[1] >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
+        aux[0] = (aux[0] & KMASK2) | (((tmp) & KMASK1) << 4);
+        aux[1] = (aux[1] & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
+
+        let mut out = [0_i8; 16];
+        for (chunk_idx, chunk) in aux.iter().enumerate() {
+            for (byte_idx, byte) in chunk.to_le_bytes().iter().enumerate() {
+                out[chunk_idx * 4 + byte_idx] = i8::from_le_bytes([*byte]);
+            }
+        }
+        out
+    }
+
+    pub fn dequantize(&self, out: &mut [f32; QK_K_BLOCK_SIZE]) {
+        let d = self.scale_f32();
+        let scales = self.expanded_scales();
+        let mut scale_idx = 0;
+        let mut high_mask = 1_u8;
+
+        for super_idx in 0..2 {
+            let value_base = super_idx * 32;
+            let out_base = super_idx * 128;
+            let mut shift = 0;
+            for group_idx in 0..4 {
+                let low_d = d * (scales[scale_idx] - 32) as f32;
+                scale_idx += 1;
+                for l in 0..16 {
+                    let high = if self.high_bits[l] & high_mask != 0 {
+                        0
+                    } else {
+                        4
+                    };
+                    let value = ((self.values[value_base + l] >> shift) & 3) as i8 - high;
+                    out[out_base + group_idx * 32 + l] = low_d * value as f32;
+                }
+
+                let high_d = d * (scales[scale_idx] - 32) as f32;
+                scale_idx += 1;
+                for l in 0..16 {
+                    let idx = 16 + l;
+                    let high = if self.high_bits[idx] & high_mask != 0 {
+                        0
+                    } else {
+                        4
+                    };
+                    let value = ((self.values[value_base + idx] >> shift) & 3) as i8 - high;
+                    out[out_base + group_idx * 32 + 16 + l] = high_d * value as f32;
+                }
+
+                shift += 2;
+                high_mask <<= 1;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Q4KBlock {
+    scale_bits: u16,
+    min_bits: u16,
+    scales: [u8; 12],
+    values: [u8; QK_K_BLOCK_SIZE / 2],
+}
+
+impl Q4KBlock {
+    pub fn from_bytes(bytes: &[u8; Q4_K_BLOCK_BYTES]) -> Self {
+        let scale_bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+        let min_bits = u16::from_le_bytes([bytes[2], bytes[3]]);
+        let mut scales = [0_u8; 12];
+        let mut values = [0_u8; QK_K_BLOCK_SIZE / 2];
+        scales.copy_from_slice(&bytes[4..16]);
+        values.copy_from_slice(&bytes[16..]);
+        Self {
+            scale_bits,
+            min_bits,
+            scales,
+            values,
+        }
+    }
+
+    pub fn scale_f32(&self) -> f32 {
+        fast_f16_to_f32(self.scale_bits)
+    }
+
+    pub fn min_f32(&self) -> f32 {
+        fast_f16_to_f32(self.min_bits)
+    }
+
+    pub fn dequantize(&self, out: &mut [f32; QK_K_BLOCK_SIZE]) {
+        let d = self.scale_f32();
+        let d_min = self.min_f32();
+        for pair_idx in 0..4 {
+            let low_scale_idx = pair_idx * 2;
+            let high_scale_idx = low_scale_idx + 1;
+            let (low_scale, low_min) = q4_k_scale_min(low_scale_idx, &self.scales);
+            let (high_scale, high_min) = q4_k_scale_min(high_scale_idx, &self.scales);
+            let low_scale = d * low_scale as f32;
+            let high_scale = d * high_scale as f32;
+            let low_min = d_min * low_min as f32;
+            let high_min = d_min * high_min as f32;
+            let value_base = pair_idx * 32;
+            let out_base = pair_idx * 64;
+
+            for l in 0..32 {
+                let byte = self.values[value_base + l];
+                out[out_base + l] = low_scale * (byte & 0x0f) as f32 - low_min;
+                out[out_base + 32 + l] = high_scale * (byte >> 4) as f32 - high_min;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Q5KBlock {
+    scale_bits: u16,
+    min_bits: u16,
+    scales: [u8; 12],
+    high_bits: [u8; QK_K_BLOCK_SIZE / 8],
+    values: [u8; QK_K_BLOCK_SIZE / 2],
+}
+
+impl Q5KBlock {
+    pub fn from_bytes(bytes: &[u8; Q5_K_BLOCK_BYTES]) -> Self {
+        let scale_bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+        let min_bits = u16::from_le_bytes([bytes[2], bytes[3]]);
+        let mut scales = [0_u8; 12];
+        let mut high_bits = [0_u8; QK_K_BLOCK_SIZE / 8];
+        let mut values = [0_u8; QK_K_BLOCK_SIZE / 2];
+        scales.copy_from_slice(&bytes[4..16]);
+        high_bits.copy_from_slice(&bytes[16..48]);
+        values.copy_from_slice(&bytes[48..]);
+        Self {
+            scale_bits,
+            min_bits,
+            scales,
+            high_bits,
+            values,
+        }
+    }
+
+    pub fn scale_f32(&self) -> f32 {
+        fast_f16_to_f32(self.scale_bits)
+    }
+
+    pub fn min_f32(&self) -> f32 {
+        fast_f16_to_f32(self.min_bits)
+    }
+
+    pub fn dequantize(&self, out: &mut [f32; QK_K_BLOCK_SIZE]) {
+        let d = self.scale_f32();
+        let d_min = self.min_f32();
+        let mut u1 = 1_u8;
+        let mut u2 = 2_u8;
+
+        for pair_idx in 0..4 {
+            let low_scale_idx = pair_idx * 2;
+            let high_scale_idx = low_scale_idx + 1;
+            let (low_scale, low_min) = q4_k_scale_min(low_scale_idx, &self.scales);
+            let (high_scale, high_min) = q4_k_scale_min(high_scale_idx, &self.scales);
+            let low_scale = d * low_scale as f32;
+            let high_scale = d * high_scale as f32;
+            let low_min = d_min * low_min as f32;
+            let high_min = d_min * high_min as f32;
+            let value_base = pair_idx * 32;
+            let out_base = pair_idx * 64;
+
+            for l in 0..32 {
+                let byte = self.values[value_base + l];
+                let qh = self.high_bits[l];
+                let low = (byte & 0x0f) + if qh & u1 != 0 { 16 } else { 0 };
+                let high = (byte >> 4) + if qh & u2 != 0 { 16 } else { 0 };
+                out[out_base + l] = low_scale * low as f32 - low_min;
+                out[out_base + 32 + l] = high_scale * high as f32 - high_min;
+            }
+
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+}
+
+#[inline]
+fn q4_k_scale_min(idx: usize, scales: &[u8; 12]) -> (u8, u8) {
+    if idx < 4 {
+        (scales[idx] & 63, scales[idx + 4] & 63)
+    } else {
+        (
+            (scales[idx + 4] & 0x0f) | ((scales[idx - 4] >> 6) << 4),
+            (scales[idx + 4] >> 4) | ((scales[idx] >> 6) << 4),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Q6KBlock {
+    ql: [u8; 128],
+    qh: [u8; 64],
+    scales: [i8; 16],
+    scale_bits: u16,
+}
+
+impl Q6KBlock {
+    pub fn from_bytes(bytes: &[u8; Q6_K_BLOCK_BYTES]) -> Self {
+        let mut ql = [0_u8; 128];
+        let mut qh = [0_u8; 64];
+        let mut scales = [0_i8; 16];
+        ql.copy_from_slice(&bytes[0..128]);
+        qh.copy_from_slice(&bytes[128..192]);
+        for (scale, &byte) in scales.iter_mut().zip(&bytes[192..208]) {
+            *scale = i8::from_le_bytes([byte]);
+        }
+        let scale_bits = u16::from_le_bytes([bytes[208], bytes[209]]);
+        Self {
+            ql,
+            qh,
+            scales,
+            scale_bits,
+        }
+    }
+
+    pub fn scale_f32(&self) -> f32 {
+        fast_f16_to_f32(self.scale_bits)
+    }
+
+    pub fn dequantize(&self, out: &mut [f32; QK_K_BLOCK_SIZE]) {
+        let d = self.scale_f32();
+        let mut ql_offset = 0;
+        let mut qh_offset = 0;
+        let mut scale_offset = 0;
+
+        for n in (0..QK_K_BLOCK_SIZE).step_by(128) {
+            for l in 0..32 {
+                let is = l / 16;
+                let qh = self.qh[qh_offset + l];
+                let q1 = ((self.ql[ql_offset + l] & 0x0f) | ((qh & 0x03) << 4)) as i8 - 32;
+                let q2 =
+                    ((self.ql[ql_offset + l + 32] & 0x0f) | (((qh >> 2) & 0x03) << 4)) as i8 - 32;
+                let q3 = ((self.ql[ql_offset + l] >> 4) | (((qh >> 4) & 0x03) << 4)) as i8 - 32;
+                let q4 =
+                    ((self.ql[ql_offset + l + 32] >> 4) | (((qh >> 6) & 0x03) << 4)) as i8 - 32;
+
+                out[n + l] = d * self.scales[scale_offset + is] as f32 * q1 as f32;
+                out[n + l + 32] = d * self.scales[scale_offset + is + 2] as f32 * q2 as f32;
+                out[n + l + 64] = d * self.scales[scale_offset + is + 4] as f32 * q3 as f32;
+                out[n + l + 96] = d * self.scales[scale_offset + is + 6] as f32 * q4 as f32;
+            }
+
+            ql_offset += 64;
+            qh_offset += 32;
+            scale_offset += 8;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Q8KBlock {
+    d: f32,
+    qs: [i8; QK_K_BLOCK_SIZE],
+    bsums: [i16; QK_K_BLOCK_SIZE / 16],
+}
+
+impl Q8KBlock {
+    pub fn from_bytes(bytes: &[u8; Q8_K_BLOCK_BYTES]) -> Self {
+        let d = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let mut qs = [0_i8; 256];
+        for (i, &byte) in qs.iter_mut().zip(&bytes[4..260]) {
+            *i = byte as i8;
+        }
+        let mut bsums = [0_i16; 16];
+        for (i, bsum) in bsums.iter_mut().enumerate() {
+            let offset = 260 + i * 2;
+            *bsum = i16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
+        }
+        Self { d, qs, bsums }
+    }
+
+    pub fn dequantize(&self, out: &mut [f32; QK_K_BLOCK_SIZE]) {
+        let d = self.d;
+        for (out_value, &q) in out.iter_mut().zip(&self.qs) {
+            *out_value = d * q as f32;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IQ4NLBlock {
+    d: u16,
+    qs: [u8; 16],
+}
+
+impl IQ4NLBlock {
+    pub fn from_bytes(bytes: &[u8; IQ4_NL_BLOCK_BYTES]) -> Self {
+        let d = u16::from_le_bytes([bytes[0], bytes[1]]);
+        let mut qs = [0_u8; 16];
+        qs.copy_from_slice(&bytes[2..18]);
+        Self { d, qs }
+    }
+
+    pub fn scale_f32(&self) -> f32 {
+        fast_f16_to_f32(self.d)
+    }
+
+    pub fn dequantize(&self, out: &mut [f32; 32]) {
+        let d = self.scale_f32();
+        const KVALUES: [f32; 16] = [
+            -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0, 53.0,
+            69.0, 89.0, 113.0,
+        ];
+        for j in 0..16 {
+            let byte = self.qs[j];
+            out[j] = d * KVALUES[(byte & 0x0F) as usize];
+            out[j + 16] = d * KVALUES[(byte >> 4) as usize];
+        }
+    }
+}
+
+// Decoding Block Helpers
+pub fn decode_q4_0_blocks(bytes: &[u8]) -> Result<Vec<Q4_0Block>> {
+    if !bytes.len().is_multiple_of(Q4_0_BLOCK_BYTES) {
+        return Err(BackendError::InvalidTensorData(format!(
+            "Q4_0 byte length {} is not aligned to {}-byte blocks",
+            bytes.len(),
+            Q4_0_BLOCK_BYTES
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(Q4_0_BLOCK_BYTES)
+        .map(|chunk| {
+            let chunk_bytes: &[u8; Q4_0_BLOCK_BYTES] = chunk.try_into().unwrap();
+            Q4_0Block::from_bytes(chunk_bytes)
+        })
+        .collect())
+}
+
+pub fn decode_q4_1_blocks(bytes: &[u8]) -> Result<Vec<Q4_1Block>> {
+    if !bytes.len().is_multiple_of(Q4_1_BLOCK_BYTES) {
+        return Err(BackendError::InvalidTensorData(format!(
+            "Q4_1 byte length {} is not aligned to {}-byte blocks",
+            bytes.len(),
+            Q4_1_BLOCK_BYTES
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(Q4_1_BLOCK_BYTES)
+        .map(|chunk| {
+            let chunk_bytes: &[u8; Q4_1_BLOCK_BYTES] = chunk.try_into().unwrap();
+            Q4_1Block::from_bytes(chunk_bytes)
+        })
+        .collect())
+}
+
+pub fn decode_q5_0_blocks(bytes: &[u8]) -> Result<Vec<Q5_0Block>> {
+    if !bytes.len().is_multiple_of(Q5_0_BLOCK_BYTES) {
+        return Err(BackendError::InvalidTensorData(format!(
+            "Q5_0 byte length {} is not aligned to {}-byte blocks",
+            bytes.len(),
+            Q5_0_BLOCK_BYTES
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(Q5_0_BLOCK_BYTES)
+        .map(|chunk| {
+            let chunk_bytes: &[u8; Q5_0_BLOCK_BYTES] = chunk.try_into().unwrap();
+            Q5_0Block::from_bytes(chunk_bytes)
+        })
+        .collect())
+}
+
+pub fn decode_q5_1_blocks(bytes: &[u8]) -> Result<Vec<Q5_1Block>> {
+    if !bytes.len().is_multiple_of(Q5_1_BLOCK_BYTES) {
+        return Err(BackendError::InvalidTensorData(format!(
+            "Q5_1 byte length {} is not aligned to {}-byte blocks",
+            bytes.len(),
+            Q5_1_BLOCK_BYTES
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(Q5_1_BLOCK_BYTES)
+        .map(|chunk| {
+            let chunk_bytes: &[u8; Q5_1_BLOCK_BYTES] = chunk.try_into().unwrap();
+            Q5_1Block::from_bytes(chunk_bytes)
+        })
+        .collect())
+}
+
+pub fn decode_q2_k_blocks(bytes: &[u8]) -> Result<Vec<Q2KBlock>> {
+    if !bytes.len().is_multiple_of(Q2_K_BLOCK_BYTES) {
+        return Err(BackendError::InvalidTensorData(format!(
+            "Q2_K byte length {} is not aligned to {}-byte blocks",
+            bytes.len(),
+            Q2_K_BLOCK_BYTES
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(Q2_K_BLOCK_BYTES)
+        .map(|chunk| {
+            let chunk_bytes: &[u8; Q2_K_BLOCK_BYTES] = chunk.try_into().unwrap();
+            Q2KBlock::from_bytes(chunk_bytes)
+        })
+        .collect())
+}
+
+pub fn decode_q3_k_blocks(bytes: &[u8]) -> Result<Vec<Q3KBlock>> {
+    if !bytes.len().is_multiple_of(Q3_K_BLOCK_BYTES) {
+        return Err(BackendError::InvalidTensorData(format!(
+            "Q3_K byte length {} is not aligned to {}-byte blocks",
+            bytes.len(),
+            Q3_K_BLOCK_BYTES
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(Q3_K_BLOCK_BYTES)
+        .map(|chunk| {
+            let chunk_bytes: &[u8; Q3_K_BLOCK_BYTES] = chunk.try_into().unwrap();
+            Q3KBlock::from_bytes(chunk_bytes)
+        })
+        .collect())
+}
+
+pub fn decode_q4_k_blocks(bytes: &[u8]) -> Result<Vec<Q4KBlock>> {
+    if !bytes.len().is_multiple_of(Q4_K_BLOCK_BYTES) {
+        return Err(BackendError::InvalidTensorData(format!(
+            "Q4_K byte length {} is not aligned to {}-byte blocks",
+            bytes.len(),
+            Q4_K_BLOCK_BYTES
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(Q4_K_BLOCK_BYTES)
+        .map(|chunk| {
+            let chunk_bytes: &[u8; Q4_K_BLOCK_BYTES] = chunk.try_into().unwrap();
+            Q4KBlock::from_bytes(chunk_bytes)
+        })
+        .collect())
+}
+
+pub fn decode_q5_k_blocks(bytes: &[u8]) -> Result<Vec<Q5KBlock>> {
+    if !bytes.len().is_multiple_of(Q5_K_BLOCK_BYTES) {
+        return Err(BackendError::InvalidTensorData(format!(
+            "Q5_K byte length {} is not aligned to {}-byte blocks",
+            bytes.len(),
+            Q5_K_BLOCK_BYTES
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(Q5_K_BLOCK_BYTES)
+        .map(|chunk| {
+            let chunk_bytes: &[u8; Q5_K_BLOCK_BYTES] = chunk.try_into().unwrap();
+            Q5KBlock::from_bytes(chunk_bytes)
+        })
+        .collect())
+}
+
+pub fn decode_q6_k_blocks(bytes: &[u8]) -> Result<Vec<Q6KBlock>> {
+    if !bytes.len().is_multiple_of(Q6_K_BLOCK_BYTES) {
+        return Err(BackendError::InvalidTensorData(format!(
+            "Q6_K byte length {} is not aligned to {}-byte blocks",
+            bytes.len(),
+            Q6_K_BLOCK_BYTES
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(Q6_K_BLOCK_BYTES)
+        .map(|chunk| {
+            let chunk_bytes: &[u8; Q6_K_BLOCK_BYTES] = chunk.try_into().unwrap();
+            Q6KBlock::from_bytes(chunk_bytes)
+        })
+        .collect())
+}
+
+pub fn decode_q8_k_blocks(bytes: &[u8]) -> Result<Vec<Q8KBlock>> {
+    if !bytes.len().is_multiple_of(Q8_K_BLOCK_BYTES) {
+        return Err(BackendError::InvalidTensorData(format!(
+            "Q8_K byte length {} is not aligned to {}-byte blocks",
+            bytes.len(),
+            Q8_K_BLOCK_BYTES
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(Q8_K_BLOCK_BYTES)
+        .map(|chunk| {
+            let chunk_bytes: &[u8; Q8_K_BLOCK_BYTES] = chunk.try_into().unwrap();
+            Q8KBlock::from_bytes(chunk_bytes)
+        })
+        .collect())
+}
+
+pub fn decode_iq4_nl_blocks(bytes: &[u8]) -> Result<Vec<IQ4NLBlock>> {
+    if !bytes.len().is_multiple_of(IQ4_NL_BLOCK_BYTES) {
+        return Err(BackendError::InvalidTensorData(format!(
+            "IQ4_NL byte length {} is not aligned to {}-byte blocks",
+            bytes.len(),
+            IQ4_NL_BLOCK_BYTES
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(IQ4_NL_BLOCK_BYTES)
+        .map(|chunk| {
+            let chunk_bytes: &[u8; IQ4_NL_BLOCK_BYTES] = chunk.try_into().unwrap();
+            IQ4NLBlock::from_bytes(chunk_bytes)
+        })
+        .collect())
+}
+
+// Flat dequantization to f32 helpers
+fn decode_q4_0_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
+    let blocks = decode_q4_0_blocks(bytes).map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
+    let mut out = Vec::with_capacity(expected_elements);
+    for block in blocks {
+        let scale = block.scale_f32();
+        for val in block.unpack_values() {
+            out.push(val as f32 * scale);
+        }
+    }
+    Ok(out)
+}
+
+fn decode_q4_1_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
+    let blocks = decode_q4_1_blocks(bytes).map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
+    let mut out = Vec::with_capacity(expected_elements);
+    for block in blocks {
+        let scale = block.scale_f32();
+        let min = block.min_f32();
+        for val in block.unpack_values() {
+            out.push(val as f32 * scale + min);
+        }
+    }
+    Ok(out)
+}
+
+fn decode_q5_0_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
+    let blocks = decode_q5_0_blocks(bytes).map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
+    let mut out = Vec::with_capacity(expected_elements);
+    for block in blocks {
+        let scale = block.scale_f32();
+        for val in block.unpack_values() {
+            out.push(val as f32 * scale);
+        }
+    }
+    Ok(out)
+}
+
+fn decode_q5_1_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
+    let blocks = decode_q5_1_blocks(bytes).map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
+    let mut out = Vec::with_capacity(expected_elements);
+    for block in blocks {
+        let scale = block.scale_f32();
+        let min = block.min_f32();
+        for val in block.unpack_values() {
+            out.push(val as f32 * scale + min);
+        }
+    }
+    Ok(out)
+}
+
+fn decode_q2_k_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
+    let blocks = decode_q2_k_blocks(bytes).map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
+    let mut out = Vec::with_capacity(expected_elements);
+    for block in blocks {
+        let mut values = [0.0_f32; QK_K_BLOCK_SIZE];
+        block.dequantize(&mut values);
+        out.extend_from_slice(&values);
+    }
+    Ok(out)
+}
+
+fn decode_q3_k_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
+    let blocks = decode_q3_k_blocks(bytes).map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
+    let mut out = Vec::with_capacity(expected_elements);
+    for block in blocks {
+        let mut values = [0.0_f32; QK_K_BLOCK_SIZE];
+        block.dequantize(&mut values);
+        out.extend_from_slice(&values);
+    }
+    Ok(out)
+}
+
+fn decode_q4_k_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
+    let blocks = decode_q4_k_blocks(bytes).map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
+    let mut out = Vec::with_capacity(expected_elements);
+    for block in blocks {
+        let mut values = [0.0_f32; QK_K_BLOCK_SIZE];
+        block.dequantize(&mut values);
+        out.extend_from_slice(&values);
+    }
+    Ok(out)
+}
+
+fn decode_q5_k_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
+    let blocks = decode_q5_k_blocks(bytes).map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
+    let mut out = Vec::with_capacity(expected_elements);
+    for block in blocks {
+        let mut values = [0.0_f32; QK_K_BLOCK_SIZE];
+        block.dequantize(&mut values);
+        out.extend_from_slice(&values);
+    }
+    Ok(out)
+}
+
+fn decode_q6_k_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
+    let blocks = decode_q6_k_blocks(bytes).map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
+    let mut out = Vec::with_capacity(expected_elements);
+    for block in blocks {
+        let mut values = [0.0_f32; QK_K_BLOCK_SIZE];
+        block.dequantize(&mut values);
+        out.extend_from_slice(&values);
+    }
+    Ok(out)
+}
+
+fn decode_q8_k_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
+    let blocks = decode_q8_k_blocks(bytes).map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
+    let mut out = Vec::with_capacity(expected_elements);
+    for block in blocks {
+        let mut values = [0.0_f32; QK_K_BLOCK_SIZE];
+        block.dequantize(&mut values);
+        out.extend_from_slice(&values);
+    }
+    Ok(out)
+}
+
+fn decode_iq4_nl_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
+    let blocks = decode_iq4_nl_blocks(bytes).map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
+    let mut out = Vec::with_capacity(expected_elements);
+    for block in blocks {
+        let mut values = [0.0_f32; 32];
+        block.dequantize(&mut values);
+        out.extend_from_slice(&values);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -4237,7 +5529,13 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(actual.shape.dims, vec![1, output_width]);
-        assert_eq!(actual.data, expected);
+        for (idx, &actual_val) in actual.data.iter().enumerate() {
+            let expected_val = expected[idx];
+            assert!(
+                (actual_val - expected_val).abs() < 1e-4,
+                "mismatch at index {idx}: actual {actual_val}, expected {expected_val}"
+            );
+        }
     }
 
     #[test]
@@ -4269,7 +5567,13 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(actual.shape.dims, vec![1, output_width]);
-        assert_eq!(actual.data, expected);
+        for (idx, &actual_val) in actual.data.iter().enumerate() {
+            let expected_val = expected[idx];
+            assert!(
+                (actual_val - expected_val).abs() < 1e-4,
+                "mismatch at index {idx}: actual {actual_val}, expected {expected_val}"
+            );
+        }
     }
 
     #[test]

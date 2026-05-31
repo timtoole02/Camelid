@@ -29,7 +29,7 @@ pub struct LlamaModelConfig {
 impl LlamaModelConfig {
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
         let architecture = match gguf.architecture() {
-            Some(architecture @ ("llama" | "mistral")) => architecture,
+            Some(architecture @ ("llama" | "mistral" | "qwen2" | "qwen3" | "smollm3" | "gemma3" | "phi3" | "lfm2")) => architecture,
             Some(other) => return Err(BackendError::UnsupportedModelArchitecture(other.into())),
             None => {
                 return Err(BackendError::InvalidModelMetadata(

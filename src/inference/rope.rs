@@ -216,12 +216,23 @@ pub(super) fn apply_rope_batch(
     };
 
     let mut data = tensor.data.clone();
-    for row in 0..rows {
-        apply_rope_to_row(
-            &mut data[row * width..(row + 1) * width],
-            base_position + row,
-            params,
-        );
+    use crate::tensor::should_parallelize_linear_output;
+    use rayon::prelude::*;
+
+    if should_parallelize_linear_output(rows * width) {
+        data.par_chunks_mut(width)
+            .enumerate()
+            .for_each(|(row, row_data)| {
+                apply_rope_to_row(row_data, base_position + row, params);
+            });
+    } else {
+        for row in 0..rows {
+            apply_rope_to_row(
+                &mut data[row * width..(row + 1) * width],
+                base_position + row,
+                params,
+            );
+        }
     }
     CpuTensor::from_f32(name, tensor.shape.dims.clone(), data)
 }
@@ -375,22 +386,22 @@ pub(super) fn apply_rope_with_pairing(
 
 fn apply_rope_to_row(data: &mut [f32], position: usize, mut params: RopeParams<'_>) {
     params.position = position;
-    for head in 0..params.head_count {
-        let head_start = head * params.head_dim;
-        for pair_idx in 0..(params.rope_dim / 2) {
+    let half_rope_dim = params.rope_dim / 2;
+    for pair_idx in 0..half_rope_dim {
+        let theta = rope_pair_frequency(pair_idx, &params);
+        let angle = params.position_mode.effective_position(params.position) as f32 * theta;
+        let (sin, cos) = angle.sin_cos();
+        for head in 0..params.head_count {
+            let head_start = head * params.head_dim;
             let (dim0, dim1) = match params.pairing {
                 RopePairing::AdjacentEvenOdd => {
                     let dim0 = head_start + (pair_idx * 2);
                     (dim0, dim0 + 1)
                 }
-                RopePairing::SplitHalf => (
-                    head_start + pair_idx,
-                    head_start + pair_idx + (params.rope_dim / 2),
-                ),
+                RopePairing::SplitHalf => {
+                    (head_start + pair_idx, head_start + pair_idx + half_rope_dim)
+                }
             };
-            let theta = rope_pair_frequency(pair_idx, &params);
-            let angle = params.position_mode.effective_position(params.position) as f32 * theta;
-            let (sin, cos) = angle.sin_cos();
             let x0 = data[dim0];
             let x1 = data[dim1];
             match params.direction {

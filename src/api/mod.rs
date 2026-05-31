@@ -1831,8 +1831,19 @@ async fn load_weights_lru(
     }
 
     let store = TensorStore::open(&model.path, &model.gguf);
+    let range = if let Some(&(layer_start, layer_end)) = crate::distributed::DISTRIBUTED_RANGE.get()
+    {
+        tracing::info!(
+            "API loader running in distributed coordinator mode; loading layers {}..{}",
+            layer_start,
+            layer_end
+        );
+        Some(layer_start..layer_end)
+    } else {
+        None
+    };
     let weights = Arc::new(
-        LlamaLoadedWeights::load(&store, binding, None).map_err(|err| {
+        LlamaLoadedWeights::load(&store, binding, range).map_err(|err| {
             api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "loaded_cpu_weights_unavailable",

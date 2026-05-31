@@ -5,6 +5,31 @@ import { clampText, formatDate, formatRate } from '../lib/formatters'
 import { getChatGateState } from '../lib/chatGate'
 import { describeModelState, getModelStatusLabel } from '../lib/modelState'
 
+export const GeminiSparkle = ({ className = '', size = 24 }) => (
+  <svg
+    className={`gemini-sparkle-icon ${className}`}
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    fill="none"
+    xmlns="http://www.w3.org/2000/svg"
+  >
+    <path
+      d="M12 3C12 3 12.3 8.3 15.5 11.5C18.7 14.7 24 15 24 15C24 15 18.7 15.3 15.5 18.5C12.3 21.7 12 27 12 27C12 27 11.7 21.7 8.5 18.5C5.3 15.3 0 15 0 15C0 15 5.3 14.7 8.5 11.5C11.7 8.3 12 3 12 3Z"
+      fill="url(#gemini-sparkle-grad)"
+    />
+    <defs>
+      <linearGradient id="gemini-sparkle-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+        <stop offset="0%" stopColor="#4285f4" />
+        <stop offset="35%" stopColor="#9b51e0" />
+        <stop offset="70%" stopColor="#e289f2" />
+        <stop offset="100%" stopColor="#fa9085" />
+      </linearGradient>
+    </defs>
+  </svg>
+)
+
+
 const isBootstrapMessage = (message) =>
   message?.role === 'assistant' &&
   typeof message?.content === 'string' &&
@@ -576,21 +601,27 @@ const ChatMessageRow = memo(function ChatMessageRow({ message, generationElapsed
       data-streaming-state={assistantStreaming ? 'active' : undefined}
       data-streaming-code-state={isOpenStreamingCode ? 'open' : undefined}
     >
-      <div className={`message-bubble message-bubble-assistant ${message.role}`}>
-        {showStreamingStatus && <StreamingLoader elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} compact />}
-        {message.role === 'assistant'
-          ? messageContent || !assistantStreaming
-            ? <AssistantMarkdown content={messageContent} streaming={assistantStreaming} />
-            : null
-          : <p>{messageContent}</p>}
-        {showLiveGenerationBadge && <LiveGenerationBadge elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} />}
-        {showMessageActions && (
-          <div className="message-actions" aria-label="Message actions">
-            <button type="button" className="message-action-button" onClick={handleCopyMessage}>
-              {copied ? 'Copied' : 'Copy'}
-            </button>
+      <div className="message-row-inner">
+        {message.role === 'assistant' && (
+          <div className="gemini-assistant-avatar-wrapper" aria-hidden="true">
+            <GeminiSparkle size={22} className="gemini-assistant-avatar-sparkle" />
           </div>
         )}
+        <div className={`message-bubble message-bubble-assistant ${message.role}`}>
+          {showStreamingStatus && <StreamingLoader elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} compact />}
+          {message.role === 'assistant'
+            ? messageContent || !assistantStreaming
+              ? <AssistantMarkdown content={messageContent} streaming={assistantStreaming} />
+              : null
+            : <p>{messageContent}</p>}
+          {showLiveGenerationBadge && <LiveGenerationBadge elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} />}
+          {showMessageActions && (
+            <div className="message-actions" aria-label="Message actions">
+              <button type="button" className="message-action-button" onClick={handleCopyMessage}>
+                {copied ? 'Copied' : 'Copy'}
+              </button>
+            </div>
+          )}
         {showLengthWarning && (
           <div className="message-finish-warning" role="status">
             Stopped before completing. Ask “continue” for a complete file.
@@ -615,7 +646,8 @@ const ChatMessageRow = memo(function ChatMessageRow({ message, generationElapsed
         )}
         <DeveloperDiagnosticsBlock message={message} />
       </div>
-    </article>
+    </div>
+  </article>
   )
 })
 
@@ -1123,115 +1155,105 @@ export default function ChatWorkspace({
       <div className={`chat-canvas chat-canvas-modern ${isFreshThread ? 'chat-canvas-empty' : ''}`}>
         {isFreshThread ? (
           <div className="chat-empty-shell chat-empty-shell-assistant chat-empty-shell-modern">
-              <div className={`chat-empty-stage chat-empty-stage-clean chat-empty-stage-product is-${readinessState}`}>
-                <div className="chat-stage-grid">
-                  <div className="chat-stage-main">
-                    <div className="chat-empty-readiness chat-empty-readiness-ledger" aria-label="Chat readiness summary">
-                      {readinessCardItems.map((item) => (
-                        <div key={item.label} className={`chat-empty-readiness-card is-${item.tone}`}>
+            <div className="chat-empty-clean-glow" />
+            <div className={`chat-empty-stage chat-empty-stage-clean chat-empty-stage-product is-${readinessState}`}>
+              <div className="chat-stage-grid">
+                <div className="chat-stage-main">
+                  {/* Premium Gemini-style Hero Banner */}
+                  <div className="chat-empty-hero chat-empty-hero-assistant chat-empty-hero-clean">
+                    <div className="gemini-sparkle-greeting-wrapper">
+                      <GeminiSparkle size={56} className="gemini-sparkle-greeting-icon" />
+                    </div>
+                    <h2 className="aurora-text-gradient">{productHeroTitle}</h2>
+                    {productHeroSummary && <p className="hero-summary">{productHeroSummary}</p>}
+                  </div>
+
+                  {/* Suggestion Cards */}
+                  {showPromptStarters && (
+                    <div className="gemini-suggestion-section" aria-label="Prompt starters">
+                      <div className="gemini-suggestion-grid">
+                        {DEMO_PROMPTS.map((prompt, idx) => {
+                          const icons = [
+                            <svg key="0" className="gemini-card-icon" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>,
+                            <svg key="1" className="gemini-card-icon" viewBox="0 0 24 24" fill="currentColor"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-5 14H7v-2h7v2zm3-4H7v-2h10v2zm0-4H7V7h10v2z"/></svg>,
+                            <svg key="2" className="gemini-card-icon" viewBox="0 0 24 24" fill="currentColor"><path d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7z"/></svg>,
+                            <svg key="3" className="gemini-card-icon" viewBox="0 0 24 24" fill="currentColor"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>
+                          ];
+                          return (
+                            <button
+                              key={prompt}
+                              type="button"
+                              className="gemini-suggestion-card"
+                              onClick={() => handleDemoPrompt(prompt)}
+                              disabled={!composerDraftUnlocked}
+                            >
+                              <span className="suggestion-text">{prompt}</span>
+                              <div className="suggestion-icon-wrapper">
+                                {icons[idx] || icons[0]}
+                              </div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Compact Status Indicator Ribbon */}
+                  <div className="gemini-readiness-row">
+                    <span className="readiness-label">Camelid state:</span>
+                    <span className={`readiness-status-badge is-${readinessState}`}>
+                      <span className="status-dot"></span>
+                      {selectedModelRunnable ? 'Ready for local chat' : readinessLabel}
+                    </span>
+                    <span className="readiness-model-name">({selectedModelName})</span>
+                    {!selectedModelRunnable && (
+                      <button type="button" className="readiness-action-btn" onClick={() => setTab(apiUnavailable ? 'api' : 'library')}>
+                        {apiUnavailable ? 'API Dashboard' : 'Manage Models'}
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                <div className="chat-stage-side">
+                  <div className={`composer composer-assistant composer-assistant-stage composer-assistant-stage-clean composer-assistant-product composer-assistant-stage-modern is-${readinessState}`}>
+                    <div className="composer-status-bar" aria-label="Composer status">
+                      {composerStatusItems.map((item) => (
+                        <div key={item.label} className="composer-status-chip">
                           <span>{item.label}</span>
                           <strong>{item.value}</strong>
-                          <small>{item.copy}</small>
                         </div>
                       ))}
                     </div>
-                    <div className="chat-empty-hero chat-empty-hero-assistant chat-empty-hero-clean">
-                      <p className="chat-empty-greeting">{emptyHeroEyebrow}</p>
-                      <h2>{productHeroTitle}</h2>
-                      {productHeroSummary && <p className="hero-summary">{productHeroSummary}</p>}
-                    </div>
-                    <div className="chat-empty-actions-row" aria-label="Chat actions">
-                      <button type="button" className="primary-button" onClick={primaryEmptyAction}>
-                        {primaryEmptyActionLabel}
-                      </button>
-                      {!selectedModelRunnable && (
-                        <button type="button" className="ghost-button ghost-button-quiet" onClick={() => setTab('api')}>
-                          View support contract
-                        </button>
-                      )}
-                    </div>
-                    <div className="chat-hero-grid">
-                      <div className="chat-hero-facts" aria-label="Camelid chat highlights">
-                        {heroFactItems.map((item) => (
-                          <div key={item.label} className={`chat-hero-fact ${item.wide ? 'chat-hero-fact-wide' : ''} ${item.tone ? `is-${item.tone}` : ''}`.trim()}>
-                            <span>{item.label}</span>
-                            <strong>{item.value}</strong>
-                            <small>{item.copy}</small>
-                          </div>
-                        ))}
+                    <textarea ref={composerRef} className="composer-input composer-input-assistant composer-input-assistant-stage" aria-label="Message Camelid" aria-describedby={composerReadinessId} value={composer} onChange={(e) => setComposer(e.target.value)} onKeyDown={handleComposerKeyDown} rows={2} placeholder={composerPlaceholder} disabled={composerDisabled} />
+                    <div className="composer-assistant-footer composer-assistant-footer-stage composer-assistant-footer-stage-clean">
+                      <div className="composer-assistant-tools composer-assistant-tools-stage composer-assistant-tools-stage-clean">
+                        {renderModelPicker()}
+                        <button className="ghost-button ghost-button-quiet" onClick={secondaryAction} disabled={secondaryActionDisabled}>{secondaryActionLabel}</button>
                       </div>
-
-                      <aside className={`chat-hero-aside is-${readinessState}`} aria-label="Current chat readiness">
-                        <div className="chat-hero-aside-header">
-                          <span>Chat readiness</span>
-                          <strong>{selectedModelRunnable ? 'Ready for local chat' : readinessLabel}</strong>
-                        </div>
-                        {!demoMode && renderReadinessPills()}
-                        {!selectedModelRunnable && (
-                          <ChatSurfaceNotice
-                            state={readinessState}
-                            title={surfaceNoticeTitle}
-                            copy={surfaceNoticeCopy}
-                            actionLabel={readinessActionLabel}
-                            onAction={() => setTab(readinessActionTab)}
-                          />
+                      <div className="composer-assistant-actions composer-assistant-actions-stage">
+                        {generationActive && (
+                          <button
+                            className="ghost-button composer-stop-button"
+                            aria-label="Stop Camelid generation"
+                            onClick={stopGeneration}
+                            disabled={stoppingGeneration}
+                          >
+                            {composerStopLabel}
+                          </button>
                         )}
-                      </aside>
+                        <button className="primary-button composer-send-button" aria-label="Send message to Camelid" title={!canSubmit ? sendDisabledReason : 'Send message to Camelid'} onClick={sendMessage} disabled={!canSubmit}>{composerSendLabel}</button>
+                      </div>
                     </div>
-
-                    {showPromptStarters && (
-                      <div className="demo-prompt-panel demo-prompt-panel-stage" aria-label="Prompt starters">
-                        <span>Prompt starters</span>
-                        <div className="demo-prompt-strip">
-                          {DEMO_PROMPTS.map((prompt) => (
-                            <button key={prompt} type="button" className="demo-prompt-chip" onClick={() => handleDemoPrompt(prompt)} disabled={!composerDraftUnlocked}>
-                              {prompt}
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-
-                  <div className="chat-stage-side">
-                    <div className={`composer composer-assistant composer-assistant-stage composer-assistant-stage-clean composer-assistant-product composer-assistant-stage-modern is-${readinessState}`}>
-                      <div className="composer-status-bar" aria-label="Composer status">
-                        {composerStatusItems.map((item) => (
-                          <div key={item.label} className="composer-status-chip">
-                            <span>{item.label}</span>
-                            <strong>{item.value}</strong>
-                          </div>
-                        ))}
-                      </div>
-                      <textarea ref={composerRef} className="composer-input composer-input-assistant composer-input-assistant-stage" aria-label="Message Camelid" aria-describedby={composerReadinessId} value={composer} onChange={(e) => setComposer(e.target.value)} onKeyDown={handleComposerKeyDown} rows={2} placeholder={composerPlaceholder} disabled={composerDisabled} />
-                      <div className="composer-assistant-footer composer-assistant-footer-stage composer-assistant-footer-stage-clean">
-                        <div className="composer-assistant-tools composer-assistant-tools-stage composer-assistant-tools-stage-clean">
-                          {renderModelPicker()}
-                          <button className="ghost-button ghost-button-quiet" onClick={secondaryAction} disabled={secondaryActionDisabled}>{secondaryActionLabel}</button>
-                        </div>
-                        <div className="composer-assistant-actions composer-assistant-actions-stage">
-                          {generationActive && (
-                            <button
-                              className="ghost-button composer-stop-button"
-                              aria-label="Stop Camelid generation"
-                              onClick={stopGeneration}
-                              disabled={stoppingGeneration}
-                            >
-                              {composerStopLabel}
-                            </button>
-                          )}
-                          <button className="primary-button composer-send-button" aria-label="Send message to Camelid" title={!canSubmit ? sendDisabledReason : 'Send message to Camelid'} onClick={sendMessage} disabled={!canSubmit}>{composerSendLabel}</button>
-                        </div>
-                      </div>
-                      {renderComposerModelSummary('composer-model-summary-stage')}
-                      <p id={composerReadinessId} className={`composer-assistant-readiness-note is-${readinessState}`}>{readinessFinePrint}</p>
-                      <p className={`composer-assistant-hint is-${canSubmit ? 'ready' : readinessState}`}>{composerHintCopy}</p>
-                      {!selectedModelRunnable && <p className="composer-assistant-readiness-detail">{selectedModelGateSummary}</p>}
-                    </div>
+                    {renderComposerModelSummary('composer-model-summary-stage')}
+                    <p id={composerReadinessId} className={`composer-assistant-readiness-note is-${readinessState}`}>{readinessFinePrint}</p>
+                    <p className={`composer-assistant-hint is-${canSubmit ? 'ready' : readinessState}`}>{composerHintCopy}</p>
+                    {!selectedModelRunnable && <p className="composer-assistant-readiness-detail">{selectedModelGateSummary}</p>}
                   </div>
                 </div>
+              </div>
             </div>
           </div>
+
         ) : (
           <div className="chat-thread-shell">
             {!demoMode && (

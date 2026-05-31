@@ -8118,9 +8118,10 @@ textarea.composer-input-assistant {
 
 .model-card:hover, 
 .models-status-card:hover {
-  border-color: var(--color-border-strong) !important;
-  box-shadow: var(--shadow-2) !important;
-  transform: none !important;
+  border-color: rgba(168, 199, 250, 0.3) !important;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.3), 0 0 1px 1px rgba(168, 199, 250, 0.05) inset !important;
+  transform: translateY(-2px) !important;
+  transition: all 0.25s cubic-bezier(0.2, 0.8, 0.2, 1) !important;
 }
 
 /* Selected/Active States */
@@ -8894,6 +8895,276 @@ select:focus {
 
 .chat-layout-empty .composer-send-button:disabled::after {
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23444746' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cline x1='22' y1='2' x2='11' y2='13'%3E%3C/line%3E%3Cpolygon points='22 2 15 22 11 13 2 9 22 2'%3E%3C/polygon%3E%3C/svg%3E") !important;
+}
+
+/* ==========================================================================
+   Google Gemini Premium Redesign Styles
+   ========================================================================== */
+
+/* Animated Sparkle Icon */
+.gemini-sparkle-icon {
+  animation: pulseSparkle 3.5s ease-in-out infinite;
+  display: inline-block;
+  vertical-align: middle;
+}
+
+.gemini-sparkle-greeting-wrapper {
+  margin-bottom: 20px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+/* Beautiful Animated Aurora Text Gradient */
+.aurora-text-gradient {
+  background: var(--gemini-aurora) !important;
+  background-size: 200% 200% !important;
+  -webkit-background-clip: text !important;
+  -webkit-text-fill-color: transparent !important;
+  background-clip: text !important;
+  animation: auroraGlow 6s ease infinite !important;
+  text-align: center !important;
+  display: inline-block !important;
+}
+
+/* Suggestion Grid & Cards */
+.gemini-suggestion-section {
+  width: 100%;
+  margin-bottom: 32px;
+  animation: fadeInUp 0.8s cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation-delay: 0.25s;
+}
+
+.gemini-suggestion-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 16px;
+  width: 100%;
+  max-width: 820px;
+  margin: 0 auto;
+}
+
+@media (max-width: 600px) {
+  .gemini-suggestion-grid {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+}
+
+.gemini-suggestion-card {
+  background: var(--color-bg-elevated) !important;
+  border: 1px solid var(--color-border-soft) !important;
+  border-radius: 16px !important;
+  padding: 20px !important;
+  min-height: 120px !important;
+  display: flex !important;
+  flex-direction: column !important;
+  justify-content: space-between !important;
+  align-items: flex-start !important;
+  text-align: left !important;
+  cursor: pointer !important;
+  transition: all 0.25s cubic-bezier(0.2, 0.8, 0.2, 1) !important;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1) !important;
+  position: relative !important;
+  overflow: hidden !important;
+  font-family: inherit !important;
+  width: 100% !important;
+}
+
+.gemini-suggestion-card:hover:not(:disabled) {
+  border-color: rgba(168, 199, 250, 0.3) !important;
+  background: rgba(255, 255, 255, 0.02) !important;
+  transform: translateY(-2px) !important;
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.2), 0 0 1px 1px rgba(168, 199, 250, 0.05) inset !important;
+}
+
+.gemini-suggestion-card .suggestion-text {
+  color: var(--color-text) !important;
+  font-size: 0.94rem !important;
+  font-weight: 450 !important;
+  line-height: 1.45 !important;
+  margin-bottom: 24px !important;
+}
+
+.gemini-suggestion-card .suggestion-icon-wrapper {
+  align-self: flex-end !important;
+  background: var(--color-surface-strong) !important;
+  border-radius: 50% !important;
+  width: 32px !important;
+  height: 32px !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  color: var(--color-accent) !important;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15) !important;
+  transition: all 0.2s ease !important;
+}
+
+.gemini-suggestion-card:hover .suggestion-icon-wrapper {
+  background: var(--color-accent) !important;
+  color: var(--color-accent-ink) !important;
+  transform: scale(1.06) !important;
+}
+
+.gemini-card-icon {
+  width: 16px;
+  height: 16px;
+}
+
+/* Compact Status Ribbon Indicator */
+.gemini-readiness-row {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px 16px;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid rgba(255, 255, 255, 0.04);
+  border-radius: 20px;
+  font-size: 0.8rem;
+  color: var(--color-text-muted);
+  margin-top: 12px;
+  animation: fadeInUp 0.8s cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation-delay: 0.35s;
+}
+
+.gemini-readiness-row .readiness-label {
+  font-weight: 550;
+}
+
+.gemini-readiness-row .readiness-status-badge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+}
+
+.gemini-readiness-row .readiness-status-badge .status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #ea4335;
+}
+
+.gemini-readiness-row .readiness-status-badge.is-ready {
+  color: var(--color-ready) !important;
+}
+.gemini-readiness-row .readiness-status-badge.is-ready .status-dot {
+  background: var(--color-ready) !important;
+  box-shadow: 0 0 8px var(--color-ready) !important;
+}
+
+.gemini-readiness-row .readiness-status-badge.is-waiting {
+  color: var(--color-warning) !important;
+}
+.gemini-readiness-row .readiness-status-badge.is-waiting .status-dot {
+  background: var(--color-warning) !important;
+  box-shadow: 0 0 8px var(--color-warning) !important;
+}
+
+.gemini-readiness-row .readiness-status-badge.is-blocked {
+  color: var(--color-error) !important;
+}
+.gemini-readiness-row .readiness-status-badge.is-blocked .status-dot {
+  background: var(--color-error) !important;
+  box-shadow: 0 0 8px var(--color-error) !important;
+}
+
+.gemini-readiness-row .readiness-model-name {
+  font-family: monospace;
+  opacity: 0.8;
+}
+
+.gemini-readiness-row .readiness-action-btn {
+  background: transparent;
+  border: none;
+  color: var(--color-accent);
+  cursor: pointer;
+  text-decoration: underline;
+  font-weight: 500;
+  padding: 0 4px;
+}
+
+.gemini-readiness-row .readiness-action-btn:hover {
+  color: white;
+}
+
+/* Ambient Backdrop Radial Glow Overlay */
+.chat-empty-clean-glow {
+  position: absolute !important;
+  top: 50% !important;
+  left: 50% !important;
+  transform: translate(-50%, -50%) !important;
+  width: 900px !important;
+  height: 700px !important;
+  background: var(--gemini-aurora-glow) !important;
+  z-index: 1 !important;
+  pointer-events: none !important;
+  animation: ambientBreathing 12s ease-in-out infinite !important;
+}
+
+/* Chat Thread Layout Enhancements - Clean Direct-on-Glass Response */
+.message-row-inner {
+  display: flex !important;
+  align-items: flex-start !important;
+  gap: 16px !important;
+  max-width: var(--content-max) !important;
+  margin: 0 auto !important;
+  width: 100% !important;
+}
+
+.gemini-assistant-avatar-wrapper {
+  flex-shrink: 0 !important;
+  width: 32px !important;
+  height: 32px !important;
+  border-radius: 50% !important;
+  background: #161619 !important;
+  border: 1px solid rgba(255, 255, 255, 0.05) !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2) !important;
+  margin-top: 4px !important;
+  align-self: flex-start !important;
+}
+
+.message-row.assistant {
+  padding: 24px 16px !important;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.02) !important;
+}
+
+.message-row.user {
+  padding: 16px 16px !important;
+}
+
+.message-row.user .message-row-inner {
+  justify-content: flex-end !important;
+}
+
+.message-row.user .message-bubble {
+  max-width: 70% !important;
+  background: var(--color-user-bubble) !important;
+  padding: 12px 20px !important;
+  border-radius: 20px !important;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15) !important;
+}
+
+.message-row.assistant .message-bubble {
+  flex-grow: 1 !important;
+  padding: 0 !important;
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+}
+
+/* Pulsing Loading Track During Prompt Response Generation */
+.progress-bar > div,
+.download-progress-fill,
+.streaming-loader {
+  background: var(--gemini-aurora) !important;
+  background-size: 200% 200% !important;
+  animation: geminiLoadingWave 2s linear infinite !important;
 }
 
 /* ==========================================================================

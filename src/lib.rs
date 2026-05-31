@@ -1,5 +1,6 @@
 pub mod api;
 pub mod cluster;
+pub mod distributed;
 pub mod error;
 pub mod execution_plan;
 pub mod gguf;
