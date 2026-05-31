@@ -3072,6 +3072,7 @@ async fn generate_decoded_tokens_blocking(
     prepared: PreparedGeneration,
 ) -> std::result::Result<GeneratedText, Box<Response>> {
     let timeout = generation_timeout_duration()?;
+    let started = Instant::now();
     let handle = tokio::task::spawn_blocking(move || generate_decoded_tokens(prepared));
     match tokio::time::timeout(timeout, handle).await {
         Ok(Ok(result)) => result,
@@ -3081,16 +3082,147 @@ async fn generate_decoded_tokens_blocking(
             format!("generation worker failed before completing the request: {err}"),
             None,
         ))),
-        Err(_) => Err(Box::new(api_error(
+        Err(_) => Err(generation_timeout_response(
+            timeout,
+            started.elapsed(),
+            None,
+        )),
+    }
+}
+
+struct TimedGenerationStep {
+    session: LlamaInferenceSession,
+    step: LlamaGenerationStep,
+}
+
+enum GenerationStepBlockingError {
+    Response(Box<Response>),
+    Timeout {
+        timeout: Duration,
+        elapsed: Duration,
+        generated_tokens: usize,
+    },
+}
+
+struct StreamGenerationStepRequest {
+    session: LlamaInferenceSession,
+    input: Vec<u32>,
+    sampler: LlamaSampler,
+    history: Vec<u32>,
+    collect_dense_diagnostics: bool,
+    step_timeout: Duration,
+    request_timeout: Duration,
+    request_started: Instant,
+    generated_tokens: usize,
+}
+
+async fn generate_stream_step_blocking(
+    request: StreamGenerationStepRequest,
+) -> std::result::Result<TimedGenerationStep, GenerationStepBlockingError> {
+    let StreamGenerationStepRequest {
+        session,
+        input,
+        sampler,
+        history,
+        collect_dense_diagnostics,
+        step_timeout,
+        request_timeout,
+        request_started,
+        generated_tokens,
+    } = request;
+    let test_sleep = generation_step_test_sleep_duration();
+    let handle = tokio::task::spawn_blocking(move || {
+        if let Some(duration) = test_sleep {
+            std::thread::sleep(duration);
+        }
+        let mut session = session;
+        let step = session
+            .generate_next_token_with_history_diagnostics(
+                &input,
+                sampler,
+                &history,
+                collect_dense_diagnostics,
+            )
+            .map_err(|err| {
+                Box::new(api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "generation_step_failed",
+                    err.to_string(),
+                    None,
+                ))
+            })?;
+        Ok(TimedGenerationStep { session, step })
+    });
+    match tokio::time::timeout(step_timeout, handle).await {
+        Ok(Ok(result)) => result.map_err(GenerationStepBlockingError::Response),
+        Ok(Err(err)) => Err(GenerationStepBlockingError::Response(Box::new(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "generation_timeout",
-            format!(
+            "generation_worker_failed",
+            format!("generation worker failed before completing the stream step: {err}"),
+            None,
+        )))),
+        Err(_) => Err(GenerationStepBlockingError::Timeout {
+            timeout: request_timeout,
+            elapsed: request_started.elapsed(),
+            generated_tokens,
+        }),
+    }
+}
+
+fn generation_timeout_response(
+    timeout: Duration,
+    elapsed: Duration,
+    generated_tokens: Option<usize>,
+) -> Box<Response> {
+    Box::new(
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(generation_timeout_error_json(
+                timeout,
+                elapsed,
+                generated_tokens,
+            )),
+        )
+            .into_response(),
+    )
+}
+
+fn generation_timeout_error_json(
+    timeout: Duration,
+    elapsed: Duration,
+    generated_tokens: Option<usize>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "error": {
+            "message": format!(
                 "generation exceeded the configured wall-clock timeout of {} ms; reduce max_tokens, use streaming/progress instrumentation, or raise {GENERATION_TIMEOUT_ENV} for a controlled hardening run",
                 timeout.as_millis()
             ),
-            Some("max_tokens"),
-        ))),
-    }
+            "type": "runtime_unavailable",
+            "code": "generation_timeout",
+            "param": "max_tokens",
+            "timeout_trace": {
+                "timeout_ms": timeout.as_millis(),
+                "elapsed_ms": elapsed.as_millis(),
+                "generated_tokens": generated_tokens,
+                "timeout_env": GENERATION_TIMEOUT_ENV,
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+fn generation_step_test_sleep_duration() -> Option<Duration> {
+    env::var("CAMELID_TEST_GENERATION_STEP_SLEEP_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(Duration::from_millis)
+}
+
+#[cfg(not(test))]
+fn generation_step_test_sleep_duration() -> Option<Duration> {
+    None
 }
 
 fn generation_timeout_duration() -> std::result::Result<Duration, Box<Response>> {
@@ -3855,6 +3987,14 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
 
         stream_event_timings.generate_start = Some(stream_started.elapsed().as_millis());
         let generation_started = Instant::now();
+        let request_timeout = match generation_timeout_duration() {
+            Ok(timeout) => timeout,
+            Err(response) => {
+                yield stream_error_event(*response);
+                yield Ok(Event::default().data("[DONE]"));
+                return;
+            }
+        };
         let collect_q8_schedule = stream_timing_diagnostics && q8_schedule_telemetry_enabled();
         if collect_q8_schedule {
             reset_q8_schedule_telemetry();
@@ -3924,21 +4064,39 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
             } else {
                 LlamaSampler::Sampling(sampling)
             };
-            let step = match prepared
-                .session
-                .generate_next_token_with_history_diagnostics(
-                    &input,
+            let Some(remaining_timeout) = request_timeout.checked_sub(stream_started.elapsed()) else {
+                yield generation_timeout_stream_event(request_timeout, stream_started.elapsed(), generated.len());
+                yield Ok(Event::default().data("[DONE]"));
+                return;
+            };
+            let TimedGenerationStep { session, step } = match generate_stream_step_blocking(
+                StreamGenerationStepRequest {
+                    session: prepared.session.clone(),
+                    input: input.clone(),
                     sampler,
-                    &history,
-                    prepared.collect_dense_diagnostics,
-                ) {
-                    Ok(step) => step,
-                    Err(err) => {
-                        yield stream_error_message_event("generation_step_failed", err.to_string());
-                        yield Ok(Event::default().data("[DONE]"));
-                        return;
-                    }
-                };
+                    history: history.clone(),
+                    collect_dense_diagnostics: prepared.collect_dense_diagnostics,
+                    step_timeout: remaining_timeout,
+                    request_timeout,
+                    request_started: stream_started,
+                    generated_tokens: generated.len(),
+                },
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(GenerationStepBlockingError::Response(response)) => {
+                    yield stream_error_event(*response);
+                    yield Ok(Event::default().data("[DONE]"));
+                    return;
+                }
+                Err(GenerationStepBlockingError::Timeout { timeout, elapsed, generated_tokens }) => {
+                    yield generation_timeout_stream_event(timeout, elapsed, generated_tokens);
+                    yield Ok(Event::default().data("[DONE]"));
+                    return;
+                }
+            };
+            prepared.session = session;
             if !reused_prompt_prefix
                 && generated.is_empty()
                 && !prepared.collect_dense_diagnostics
@@ -4091,6 +4249,16 @@ fn stream_error_event(response: Response) -> Result<Event, Infallible> {
         "stream_error",
         format!("stream failed after headers: HTTP {}", response.status()),
     )
+}
+
+fn generation_timeout_stream_event(
+    timeout: Duration,
+    elapsed: Duration,
+    generated_tokens: usize,
+) -> Result<Event, Infallible> {
+    Ok(Event::default()
+        .event("error")
+        .data(generation_timeout_error_json(timeout, elapsed, Some(generated_tokens)).to_string()))
 }
 
 fn stream_error_message_event(code: &str, message: String) -> Result<Event, Infallible> {
@@ -5357,6 +5525,64 @@ mod tests {
         assert!(diagnostics[2].probability > 0.0);
         assert!(diagnostics[2].probability < diagnostics[1].probability);
         assert!(diagnostics[2].selected);
+    }
+
+    #[test]
+    fn timeout_payload_is_scrubbed_and_records_trace_fields() {
+        let payload = generation_timeout_error_json(
+            Duration::from_millis(7),
+            Duration::from_millis(11),
+            Some(3),
+        );
+
+        let error = &payload["error"];
+        assert_eq!(error["code"], "generation_timeout");
+        assert_eq!(error["param"], "max_tokens");
+        assert_eq!(error["timeout_trace"]["timeout_ms"], 7);
+        assert_eq!(error["timeout_trace"]["elapsed_ms"], 11);
+        assert_eq!(error["timeout_trace"]["generated_tokens"], 3);
+        assert_eq!(
+            error["timeout_trace"]["timeout_env"],
+            GENERATION_TIMEOUT_ENV
+        );
+        let serialized = payload.to_string();
+        assert!(!serialized.contains("://"));
+        assert!(!serialized.contains(&["/Users", "/"].concat()));
+        assert!(!serialized.contains("models/"));
+    }
+
+    #[tokio::test]
+    async fn stream_step_blocking_timeout_reports_generated_count() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var("CAMELID_TEST_GENERATION_STEP_SLEEP_MS", "25");
+        let session = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+
+        let result = generate_stream_step_blocking(StreamGenerationStepRequest {
+            session,
+            input: vec![1, 2],
+            sampler: LlamaSampler::Greedy,
+            history: vec![1, 2],
+            collect_dense_diagnostics: false,
+            step_timeout: Duration::from_millis(1),
+            request_timeout: Duration::from_millis(1),
+            request_started: Instant::now(),
+            generated_tokens: 4,
+        })
+        .await;
+
+        std::env::remove_var("CAMELID_TEST_GENERATION_STEP_SLEEP_MS");
+        match result {
+            Err(GenerationStepBlockingError::Timeout {
+                timeout,
+                generated_tokens,
+                ..
+            }) => {
+                assert_eq!(timeout.as_millis(), 1);
+                assert_eq!(generated_tokens, 4);
+            }
+            Err(GenerationStepBlockingError::Response(_)) => panic!("expected timeout error"),
+            Ok(_) => panic!("expected stream step to time out"),
+        }
     }
 
     #[test]
