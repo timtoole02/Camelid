@@ -973,6 +973,7 @@ pub fn router_with_state(state: AppState) -> Router {
             "/slots",
             get(llama_server_slots).post(unsupported_llama_server_slots),
         )
+        .route("/metrics", get(unsupported_llama_server_metrics))
         .route("/completion", post(llama_server_completion))
         .route("/infill", post(unsupported_llama_server_infill))
         .route("/embedding", post(unsupported_embeddings))
@@ -1254,6 +1255,14 @@ async fn unsupported_llama_server_slots() -> Response {
         "unsupported_llama_server_slots",
         "POST /slots and llama-server slot cache actions are not supported yet; Camelid exposes GET /slots as a read-only compatibility snapshot",
         Some("slots"),
+    )
+}
+
+async fn unsupported_llama_server_metrics() -> Response {
+    unsupported_route(
+        "unsupported_llama_server_metrics",
+        "GET /metrics is not supported yet; Camelid has no llama-server metrics compatibility contract, prompt-cache metrics, or continuous batching telemetry surface for this route",
+        Some("metrics"),
     )
 }
 
@@ -1884,7 +1893,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "fail_closed_native_compatibility_routes",
                 status: "unsupported",
-                notes: "Native /completion, /infill, /embedding, /embeddings, /v1/embeddings, /v1/messages, /rerank, /reranking, /v1/rerank, /v1/reranking, /v1/responses, POST /models/load, POST /models/unload, POST /slots, and slot cache actions return typed not_implemented errors until real route semantics and backend support exist.",
+                notes: "Native /completion, /infill, /metrics, /embedding, /embeddings, /v1/embeddings, /v1/messages, /rerank, /reranking, /v1/rerank, /v1/reranking, /v1/responses, POST /models/load, POST /models/unload, POST /slots, and slot cache actions return typed not_implemented errors until real route semantics and backend support exist.",
             },
             SupportItem {
                 id: "multi_choice_generation",

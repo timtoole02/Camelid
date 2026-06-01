@@ -194,6 +194,12 @@ async fn native_compatibility_routes_fail_closed_with_typed_errors() {
             "completion",
         ),
         (
+            "GET",
+            "/metrics",
+            "unsupported_llama_server_metrics",
+            "metrics",
+        ),
+        (
             "POST",
             "/infill",
             "unsupported_llama_server_infill",
@@ -468,6 +474,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
             && item["status"] == "unsupported"
             && item["notes"].as_str().unwrap().contains("/completion")
             && item["notes"].as_str().unwrap().contains("/infill")
+            && item["notes"].as_str().unwrap().contains("/metrics")
             && item["notes"].as_str().unwrap().contains("/v1/embeddings")
             && item["notes"].as_str().unwrap().contains("/v1/responses")
             && item["notes"].as_str().unwrap().contains("/v1/messages")
