@@ -6,6 +6,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 
 import { renderExpectedPrompt, resolveReferenceContext } from './lib/chat-parity-harness.mjs'
+import { sanitizeMessages, sanitizePath, sanitizeText, sanitizeUrl } from './lib/privacy-sanitize.mjs'
 
 const args = parseArgs(process.argv.slice(2))
 const backendBase = (args.get('backend') || process.env.CAMELID_API_BASE || 'http://127.0.0.1:8181').replace(/\/$/, '')
@@ -24,6 +25,7 @@ const requirePromptMatch = args.has('require-prompt-match') || process.env.LLAMA
 const requireGeneratedMatch = args.has('require-generated-match') || process.env.LLAMA3_CHAT_REQUIRE_GENERATED_MATCH === '1'
 const collectBackendDenseDiagnostics = args.has('backend-dense-diagnostics') || process.env.LLAMA3_CHAT_BACKEND_DENSE_DIAGNOSTICS === '1'
 const backendDenseDiagnosticGeneratedIndex = parseOptionalNonNegativeInt(args.get('backend-dense-diagnostic-generated-index') || process.env.LLAMA3_CHAT_BACKEND_DENSE_DIAGNOSTIC_GENERATED_INDEX, 'backend-dense-diagnostic-generated-index')
+const sanitizeDiagnostics = args.has('sanitize-diagnostics') || process.env.LLAMA3_CHAT_SANITIZE_DIAGNOSTICS === '1'
 const waitMs = Number.parseInt(args.get('wait-ms') || process.env.LLAMA3_WAIT_MS || '120000', 10)
 const explicitLlamaContext = parseOptionalPositiveInt(args.get('llama-context') || process.env.LLAMA3_LLAMA_CONTEXT, 'llama-context')
 const llamaFlashAttn = args.get('llama-flash-attn') || process.env.LLAMA3_LLAMA_FLASH_ATTN || 'off'
@@ -183,13 +185,13 @@ try {
     camelid: backendChat.camelid,
   }
 
-  console.log(`backend=${backendBase}`)
-  console.log(`llama_server=${llamaBase}`)
-  console.log(`model=${modelPath}`)
-  console.log(`message=${JSON.stringify(userMessage)}`)
-  console.log(`messages=${JSON.stringify(messages)}`)
+  console.log(`backend=${sanitizeDiagnostics ? 'redacted' : backendBase}`)
+  console.log(`llama_server=${sanitizeDiagnostics ? 'redacted' : llamaBase}`)
+  console.log(`model=${sanitizeDiagnostics ? JSON.stringify(sanitizePath(modelPath)) : modelPath}`)
+  console.log(`message=${sanitizeDiagnostics ? JSON.stringify(sanitizeText(userMessage)) : JSON.stringify(userMessage)}`)
+  console.log(`messages=${sanitizeDiagnostics ? JSON.stringify(sanitizeMessages(messages)) : JSON.stringify(messages)}`)
   console.log(`render_mode=${renderMode}`)
-  console.log(`expected_prompt=${JSON.stringify(expectedPrompt)}`)
+  console.log(`expected_prompt=${sanitizeDiagnostics ? JSON.stringify(sanitizeText(expectedPrompt)) : JSON.stringify(expectedPrompt)}`)
   console.log(`expected_prompt_char_count=${expectedPrompt.length}`)
   console.log(`reference_prompt_token_count=${referencePromptTokens.length}`)
   console.log(`reference_context=${referenceContext}`)
@@ -202,9 +204,9 @@ try {
   console.log(`llama_generated_tokens=${JSON.stringify(llamaGeneratedTokens)}`)
   console.log(`generated_tokens_match=${generatedTokensMatch}`)
   console.log(`backend_dense_diagnostic_generated_index=${backendChat.camelid?.dense_diagnostic_generated_index ?? null}`)
-  console.log(`first_generated_token_logit_comparison=${JSON.stringify(firstGeneratedTokenLogitComparison)}`)
-  console.log(`backend_text=${JSON.stringify(backendText)}`)
-  console.log(`llama_text=${JSON.stringify(llamaText)}`)
+  console.log(`first_generated_token_logit_comparison=${JSON.stringify(sanitizeDiagnostics ? stripComparisonTokenText(firstGeneratedTokenLogitComparison) : firstGeneratedTokenLogitComparison)}`)
+  console.log(`backend_text=${sanitizeDiagnostics ? JSON.stringify(sanitizeText(backendText)) : JSON.stringify(backendText)}`)
+  console.log(`llama_text=${sanitizeDiagnostics ? JSON.stringify(sanitizeText(llamaText)) : JSON.stringify(llamaText)}`)
   console.log(`generated_text_match=${textMatch}`)
   console.log(`backend_usage=${JSON.stringify(backendChat.usage)}`)
   console.log(`llama_usage=${JSON.stringify(llamaCompletion.timings)}`)
@@ -212,8 +214,8 @@ try {
   if (diagnosticsOut) {
     const diagnosticsPath = resolve(diagnosticsOut)
     await mkdir(dirname(diagnosticsPath), { recursive: true })
-    await writeFile(diagnosticsPath, `${JSON.stringify(report, null, 2)}\n`)
-    console.log(`diagnostics_out=${diagnosticsPath}`)
+    await writeFile(diagnosticsPath, `${JSON.stringify(sanitizeDiagnostics ? sanitizeParityReport(report) : report, null, 2)}\n`)
+    console.log(`diagnostics_out=${sanitizeDiagnostics ? JSON.stringify(sanitizePath(diagnosticsPath)) : diagnosticsPath}`)
   }
 
   if (requirePromptMatch && !promptMatch) process.exitCode = 1
@@ -407,6 +409,79 @@ function compareFirstGeneratedTokenLogits({ backendGeneratedTokens, backendTopLo
     backend_rows: [backendForBackendToken, backendForLlamaToken].filter(Boolean),
     llama_rows: [llamaForBackendToken, llamaForLlamaToken].filter(Boolean),
   }
+}
+
+function sanitizeParityReport(report) {
+  const camelid = report.camelid ? {
+    prompt_token_ids: report.camelid.prompt_token_ids ?? [],
+    generated_token_ids: report.camelid.generated_token_ids ?? [],
+    dense_metadata: report.camelid.dense_metadata ?? null,
+    dense_diagnostic_generated_index: report.camelid.dense_diagnostic_generated_index ?? null,
+    top_logits: stripDiagnosticTokenText(report.camelid.top_logits ?? []),
+    step_top_logits: (report.camelid.step_top_logits ?? []).map(stripDiagnosticTokenText),
+    output_projection: report.camelid.output_projection ?? [],
+    dense: report.camelid.dense ?? null,
+  } : null
+  return {
+    schema: 'camelid.chat-parity-sanitized.v1',
+    backend: sanitizeUrl(report.backend),
+    llama_server: sanitizeUrl(report.llama_server),
+    model: sanitizePath(report.model),
+    model_id: 'redacted',
+    message: sanitizeText(report.message),
+    messages: sanitizeMessages(report.messages),
+    render_mode: report.render_mode,
+    expected_prompt: sanitizeText(report.expected_prompt),
+    expected_prompt_char_count: report.expected_prompt_char_count,
+    reference_prompt_token_count: report.reference_prompt_token_count,
+    reference_context: report.reference_context,
+    llama_flash_attn: report.llama_flash_attn,
+    llama_completion_prompt_kind: report.llama_completion_prompt_kind,
+    prompt_tokens_match: report.prompt_tokens_match,
+    generated_tokens_match: report.generated_tokens_match,
+    generated_text_match: report.generated_text_match,
+    first_generated_token_diff_index: report.first_generated_token_diff_index,
+    first_generated_text_diff_index: report.first_generated_text_diff_index,
+    backend_dense_diagnostic_generated_index: report.backend_dense_diagnostic_generated_index,
+    first_generated_token_logit_comparison: stripComparisonTokenText(report.first_generated_token_logit_comparison),
+    backend_prompt_tokens: report.backend_prompt_tokens,
+    reference_prompt_tokens: report.reference_prompt_tokens,
+    prompt_position_ids: positionIds(report.backend_prompt_tokens),
+    backend_generated_tokens: report.backend_generated_tokens,
+    llama_generated_tokens: report.llama_generated_tokens,
+    generated_position_ids: positionIds(
+      report.backend_generated_tokens,
+      Array.isArray(report.backend_prompt_tokens) ? report.backend_prompt_tokens.length : 0,
+    ),
+    llama_top_logprobs: stripLogprobTokenText(report.llama_top_logprobs),
+    backend_diagnostic_token_ids: report.backend_diagnostic_token_ids,
+    backend_text: sanitizeText(report.backend_text),
+    llama_text: sanitizeText(report.llama_text),
+    backend_usage: report.backend_usage,
+    llama_usage: report.llama_usage,
+    camelid,
+  }
+}
+
+function stripComparisonTokenText(value) {
+  if (!value) return null
+  return {
+    ...value,
+    backend_rows: stripDiagnosticTokenText(value.backend_rows ?? []),
+    llama_rows: stripLogprobTokenText(value.llama_rows ?? []),
+  }
+}
+
+function stripDiagnosticTokenText(rows) {
+  return rows.map(({ text, ...row }) => row)
+}
+
+function stripLogprobTokenText(rows) {
+  return rows.map(({ token, ...row }) => row)
+}
+
+function positionIds(tokens, start = 0) {
+  return Array.isArray(tokens) ? tokens.map((_, index) => start + index) : null
 }
 
 function firstStringDifference(left, right) {
