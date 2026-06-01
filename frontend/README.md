@@ -21,6 +21,8 @@ The backend data hook is adapted for Camelid's current API surface:
 - sends readiness-gated streaming chat requests to `POST /v1/chat/completions` with `stream: true`, preserves backend usage when provided, treats structured SSE `event: error` payloads as failures instead of empty assistant replies, and keeps the non-streaming JSON parser only as a response-shape fallback
 - blocks chat until `/v1/health` reports the selected `active_model_id` with `loaded_now: true` and `generation_ready: true` and `/api/capabilities` has an exact supported model/quant compatibility row; streaming transport behavior is UI reliability evidence only, not support evidence for any additional model row; the exact Llama 3.2 1B/3B Instruct Q8_0 plus Llama 3 8B Instruct Q8_0 rows are supported only for their bounded local-chat smoke/parity envelopes
 
+For claim-source order and public evidence policy, see [`../docs/WAR_ROOM_EVIDENCE_INDEX.md`](../docs/WAR_ROOM_EVIDENCE_INDEX.md). That file keeps WebUI readiness copy aligned with `COMPATIBILITY.md`, `/api/capabilities`, and scrubbed evidence; it does not add any supported row or frontend unlock condition.
+
 Server features Camelid does not expose yet are kept honest: catalog downloads, external-provider setup, planned or blocked quantization lanes, and unsupported or partial API parameters show disabled or typed-guardrail copy instead of pretending to work. The analytics view treats conversation telemetry as usage only, not compatibility evidence. The UI mirrors the compatibility contract documented in `../COMPATIBILITY.md`; filenames, catalog metadata, saved browser paths, and prior usage are not treated as support evidence by themselves.
 
 ## Exact-row smoke wins shown in the UI

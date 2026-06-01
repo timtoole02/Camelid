@@ -1,6 +1,6 @@
 # Camelid Documentation Index
 
-Last updated: 2026-05-06
+Last updated: 2026-05-31
 
 This index helps readers navigate the public Markdown set.
 
@@ -18,6 +18,7 @@ Read these first:
 - [`COMPATIBILITY.md`](COMPATIBILITY.md) — authoritative support ledger and at-a-glance release contract
 - [`STATUS.md`](STATUS.md) — current milestone/evidence snapshot and exact blockers
 - [`BENCHMARKS.md`](BENCHMARKS.md) — public performance snapshot and benchmark-claim rules
+- [`docs/WAR_ROOM_EVIDENCE_INDEX.md`](docs/WAR_ROOM_EVIDENCE_INDEX.md) — war-room claim-source order, evidence index, and public wording policy
 - [`PARITY.md`](PARITY.md) — exact-row parity proof map and audit trail
 - [`ROADMAP.md`](ROADMAP.md) — phase-level plan of record
 
