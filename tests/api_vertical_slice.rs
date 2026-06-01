@@ -419,6 +419,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
                 .as_str()
                 .unwrap()
                 .contains("POST /tokenize and POST /detokenize")
+            && item["notes"].as_str().unwrap().contains("with_pieces=true")
     }));
     assert!(body["api_features"].as_array().unwrap().iter().any(|item| {
         item["id"] == "llama_server_models"
@@ -2323,6 +2324,30 @@ async fn llama_server_tokenize_detokenize_aliases_use_loaded_tokenizer() {
     );
 
     let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tokenize")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"content":" hello!","with_pieces":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        body["tokens"].as_array().unwrap(),
+        &[
+            serde_json::json!({"id":6,"piece":" "}),
+            serde_json::json!({"id":4,"piece":"hello"}),
+            serde_json::json!({"id":5,"piece":"!"})
+        ]
+    );
+
+    let response = app
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -2340,7 +2365,7 @@ async fn llama_server_tokenize_detokenize_aliases_use_loaded_tokenizer() {
 }
 
 #[tokio::test]
-async fn llama_server_tokenize_alias_fails_closed_for_piece_metadata() {
+async fn llama_server_tokenize_alias_requires_loaded_model_for_piece_metadata() {
     let app = camelid::api::router();
     let response = app
         .oneshot(
@@ -2354,11 +2379,32 @@ async fn llama_server_tokenize_alias_fails_closed_for_piece_metadata() {
         .await
         .unwrap();
 
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "model_not_loaded");
+}
+
+#[tokio::test]
+async fn llama_server_tokenize_alias_rejects_unknown_fields_before_runtime() {
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tokenize")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"content":"hello","pieces":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["error"]["code"], "unsupported_parameter");
-    assert_eq!(body["error"]["param"], "with_pieces");
+    assert_eq!(body["error"]["param"], "request");
 }
 
 #[tokio::test]

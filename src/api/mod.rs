@@ -409,11 +409,33 @@ pub struct LlamaServerTokenizeRequest {
     pub add_special: Option<bool>,
     pub parse_special: Option<bool>,
     pub with_pieces: Option<bool>,
+    #[serde(flatten)]
+    pub unsupported_fields: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct LlamaServerTokenizeResponse {
-    pub tokens: Vec<u32>,
+    pub tokens: Vec<LlamaServerTokenizeToken>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum LlamaServerTokenizeToken {
+    Id(u32),
+    Piece(LlamaServerTokenPiece),
+}
+
+#[derive(Debug, Serialize)]
+pub struct LlamaServerTokenPiece {
+    pub id: u32,
+    pub piece: LlamaServerTokenPieceValue,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum LlamaServerTokenPieceValue {
+    Text(String),
+    Bytes(Vec<u8>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -2096,7 +2118,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "llama_server_tokenizer_aliases",
                 status: "partial",
-                notes: "POST /tokenize and POST /detokenize are bounded loaded-model tokenizer aliases that return token ids/text only; piece metadata remains unsupported",
+                notes: "POST /tokenize and POST /detokenize are bounded loaded-model tokenizer aliases that return token ids/text, with /tokenize with_pieces=true exposing id/piece objects for supported tokenizer lanes. Arbitrary tokenizer kwargs and broader tokenizer parity remain unsupported.",
             },
             SupportItem {
                 id: "llama_server_models",
@@ -2691,15 +2713,24 @@ async fn llama_server_tokenize(
         Ok(payload) => payload,
         Err(err) => return malformed_json_error(err),
     };
-    if req.with_pieces.unwrap_or(false) {
+    if !req.unsupported_fields.is_empty() {
+        let mut fields = req
+            .unsupported_fields
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        fields.sort_unstable();
         return api_error(
             StatusCode::BAD_REQUEST,
             "unsupported_parameter",
-            "/tokenize with_pieces=true is not supported yet; Camelid currently returns token ids only"
-                .to_string(),
-            Some("with_pieces"),
+            format!(
+                "/tokenize unsupported request field(s): {}",
+                fields.join(", ")
+            ),
+            Some("request"),
         );
     }
+    let with_pieces = req.with_pieces.unwrap_or(false);
     let content = match req.content {
         Some(content) => content,
         None => {
@@ -2720,9 +2751,17 @@ async fn llama_server_tokenize(
         req.add_special.unwrap_or(false),
         req.parse_special.unwrap_or(true),
     ) {
-        Ok(tokens) => {
-            (StatusCode::OK, Json(LlamaServerTokenizeResponse { tokens })).into_response()
-        }
+        Ok(tokens) => match llama_server_tokenize_tokens(&tokenizer, tokens, with_pieces) {
+            Ok(tokens) => {
+                (StatusCode::OK, Json(LlamaServerTokenizeResponse { tokens })).into_response()
+            }
+            Err(err) => api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "token_piece_failed",
+                err.to_string(),
+                Some("tokens"),
+            ),
+        },
         Err(err) => api_error(
             StatusCode::UNPROCESSABLE_ENTITY,
             "tokenization_failed",
@@ -2730,6 +2769,56 @@ async fn llama_server_tokenize(
             Some("content"),
         ),
     }
+}
+
+fn llama_server_tokenize_tokens(
+    tokenizer: &Tokenizer,
+    token_ids: Vec<u32>,
+    with_pieces: bool,
+) -> std::result::Result<Vec<LlamaServerTokenizeToken>, BackendError> {
+    if !with_pieces {
+        return Ok(token_ids
+            .into_iter()
+            .map(LlamaServerTokenizeToken::Id)
+            .collect());
+    }
+
+    token_ids
+        .into_iter()
+        .map(|id| {
+            let piece = llama_server_token_piece(tokenizer, id)?;
+            Ok(LlamaServerTokenizeToken::Piece(LlamaServerTokenPiece {
+                id,
+                piece,
+            }))
+        })
+        .collect()
+}
+
+fn llama_server_token_piece(
+    tokenizer: &Tokenizer,
+    token_id: u32,
+) -> std::result::Result<LlamaServerTokenPieceValue, BackendError> {
+    match tokenizer.decode(&[token_id], false) {
+        Ok(text) => Ok(LlamaServerTokenPieceValue::Text(text)),
+        Err(err) => {
+            let Some(raw_piece) = tokenizer.token_text(Some(token_id)) else {
+                return Err(err);
+            };
+            let Some(byte) = parse_llama_server_byte_token(raw_piece) else {
+                return Err(err);
+            };
+            Ok(LlamaServerTokenPieceValue::Bytes(vec![byte]))
+        }
+    }
+}
+
+fn parse_llama_server_byte_token(text: &str) -> Option<u8> {
+    let hex = text.strip_prefix("<0x")?.strip_suffix('>')?;
+    if hex.len() != 2 {
+        return None;
+    }
+    u8::from_str_radix(hex, 16).ok()
 }
 
 async fn llama_server_detokenize(
