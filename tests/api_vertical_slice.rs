@@ -241,6 +241,14 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
                 .unwrap()
                 .contains("Local model paths are intentionally redacted")
     }));
+    assert!(body["api_features"].as_array().unwrap().iter().any(|item| {
+        item["id"] == "llama_server_apply_template"
+            && item["status"] == "partial"
+            && item["notes"]
+                .as_str()
+                .unwrap()
+                .contains("without inference")
+    }));
     let compatibility = body["model_compatibility"].as_array().unwrap();
     let tinyllama = compatibility
         .iter()
@@ -1945,6 +1953,74 @@ async fn llama_server_tokenize_alias_fails_closed_for_piece_metadata() {
 }
 
 #[tokio::test]
+async fn llama_server_apply_template_renders_loaded_model_chat_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tokenizer.gguf");
+    write_tokenizer_gguf_with_chat_template(
+        &path,
+        "llama",
+        true,
+        false,
+        true,
+        "<|system|>{{ system }}<|user|>{{ user }}<|assistant|>{{ assistant }}",
+    );
+
+    let app = camelid::api::router();
+    let body = serde_json::json!({"path": path, "id": "tiny-tokenizer"});
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/models/load")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/apply-template")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"messages":[{"role":"user","content":"hello"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["prompt"], "<|user|>\nhello</s>\n<|assistant|>\n");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/apply-template")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"messages":[{"role":"user","content":"hello"}],"template":"custom"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert_eq!(body["error"]["param"], "request");
+}
+
+#[tokio::test]
 async fn tokenizer_encode_requires_loaded_model() {
     let app = camelid::api::router();
     let response = app
@@ -3204,6 +3280,42 @@ fn write_tokenizer_gguf(
     add_eos: bool,
     add_space_prefix: bool,
 ) {
+    write_tokenizer_gguf_with_optional_chat_template(
+        path,
+        model,
+        add_bos,
+        add_eos,
+        add_space_prefix,
+        None,
+    );
+}
+
+fn write_tokenizer_gguf_with_chat_template(
+    path: &std::path::Path,
+    model: &str,
+    add_bos: bool,
+    add_eos: bool,
+    add_space_prefix: bool,
+    chat_template: &str,
+) {
+    write_tokenizer_gguf_with_optional_chat_template(
+        path,
+        model,
+        add_bos,
+        add_eos,
+        add_space_prefix,
+        Some(chat_template),
+    );
+}
+
+fn write_tokenizer_gguf_with_optional_chat_template(
+    path: &std::path::Path,
+    model: &str,
+    add_bos: bool,
+    add_eos: bool,
+    add_space_prefix: bool,
+    chat_template: Option<&str>,
+) {
     let tokens = ["<unk>", "<s>", "</s>", "▁hello", "hello", "<0x21>", "▁"];
     let scores = [0.0, 0.0, 0.0, 10.0, 2.0, 0.0, 1.0];
     let token_types = [2, 3, 3, 1, 1, 6, 1];
@@ -3212,7 +3324,7 @@ fn write_tokenizer_gguf(
     b.extend_from_slice(b"GGUF");
     push_u32(&mut b, 3);
     push_i64(&mut b, 0);
-    push_i64(&mut b, 10);
+    push_i64(&mut b, if chat_template.is_some() { 11 } else { 10 });
 
     push_kv_string(&mut b, "general.architecture", "llama");
     push_kv_string(&mut b, "tokenizer.ggml.model", model);
@@ -3224,6 +3336,9 @@ fn write_tokenizer_gguf(
     push_kv_bool(&mut b, "tokenizer.ggml.add_bos_token", add_bos);
     push_kv_bool(&mut b, "tokenizer.ggml.add_eos_token", add_eos);
     push_kv_bool(&mut b, "tokenizer.ggml.add_space_prefix", add_space_prefix);
+    if let Some(chat_template) = chat_template {
+        push_kv_string(&mut b, "tokenizer.chat_template", chat_template);
+    }
 
     while !b.len().is_multiple_of(32) {
         b.push(0);

@@ -407,6 +407,18 @@ pub struct LlamaServerDetokenizeResponse {
     pub content: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct LlamaServerApplyTemplateRequest {
+    pub messages: Option<Vec<ChatMessage>>,
+    #[serde(flatten)]
+    pub unsupported_fields: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LlamaServerApplyTemplateResponse {
+    pub prompt: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct LlamaServerPropsResponse {
     pub default_generation_settings: LlamaServerDefaultGenerationSettings,
@@ -842,6 +854,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/api/models/tokenizer/decode", post(tokenizer_decode))
         .route("/tokenize", post(llama_server_tokenize))
         .route("/detokenize", post(llama_server_detokenize))
+        .route("/apply-template", post(llama_server_apply_template))
         .route("/props", get(llama_server_props))
         .route(
             "/api/generation/sessions",
@@ -1530,6 +1543,11 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 notes: "GET /props returns read-only public server properties, default generation settings, chat-template metadata when a model is loaded, and fail-closed Camelid readiness notes. Local model paths are intentionally redacted, POST /props is unsupported, and this does not imply /slots, /completion, embeddings, or full llama-server WebUI parity.",
             },
             SupportItem {
+                id: "llama_server_apply_template",
+                status: "partial",
+                notes: "POST /apply-template renders loaded-model chat messages to a prompt string without inference. It is scoped to Camelid's supported tokenizer/template renderers and returns typed unsupported errors for unknown request fields or unsupported templates.",
+            },
+            SupportItem {
                 id: "multi_choice_generation",
                 status: "unsupported",
                 notes: "typed unsupported until implemented and tested",
@@ -2169,6 +2187,100 @@ async fn llama_server_detokenize(
             Some("tokens"),
         ),
     }
+}
+
+async fn llama_server_apply_template(
+    State(state): State<AppState>,
+    payload: std::result::Result<Json<LlamaServerApplyTemplateRequest>, JsonRejection>,
+) -> Response {
+    let Json(req) = match payload {
+        Ok(payload) => payload,
+        Err(err) => return malformed_json_error(err),
+    };
+    if !req.unsupported_fields.is_empty() {
+        let mut fields = req
+            .unsupported_fields
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        fields.sort_unstable();
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_parameter",
+            format!(
+                "/apply-template unsupported request field(s): {}",
+                fields.join(", ")
+            ),
+            Some("request"),
+        );
+    }
+    let messages = match req.messages {
+        Some(messages) if !messages.is_empty() => messages,
+        Some(_) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "empty_chat_messages",
+                "/apply-template messages must contain at least one chat message".to_string(),
+                Some("messages"),
+            )
+        }
+        None => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "missing_chat_messages",
+                "/apply-template request requires a messages field".to_string(),
+                Some("messages"),
+            )
+        }
+    };
+    if let Err(response) = validate_chat_messages(&messages) {
+        return *response;
+    }
+
+    let model = match get_or_load_model(&state, None).await {
+        Ok(model) => model,
+        Err(response) => return response,
+    };
+    let tokenizer = match model.tokenizer_runtime.clone() {
+        Some(tokenizer) => tokenizer,
+        None => match Tokenizer::from_gguf(&model.gguf) {
+            Ok(tokenizer) => Arc::new(tokenizer),
+            Err(err) => {
+                return api_error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    tokenizer_error_code(&err),
+                    err.to_string(),
+                    None,
+                )
+            }
+        },
+    };
+    let rendered = match render_chat_prompt_for_tokenization_for_model_result(
+        &messages,
+        &tokenizer,
+        Some(&model.id),
+    ) {
+        Ok(rendered) => rendered,
+        Err(err) => {
+            return api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unsupported_chat_template",
+                format!(
+                    "chat template rendering failed for loaded model {:?}: {err}",
+                    model.id
+                ),
+                Some("messages"),
+            )
+        }
+    };
+
+    (
+        StatusCode::OK,
+        Json(LlamaServerApplyTemplateResponse {
+            prompt: rendered.text,
+        }),
+    )
+        .into_response()
 }
 
 async fn v1_models(State(state): State<AppState>) -> Json<ModelListResponse> {
@@ -3330,7 +3442,13 @@ async fn generate_decoded_tokens_blocking(
 ) -> std::result::Result<GeneratedText, Box<Response>> {
     let timeout = generation_timeout_duration()?;
     let started = Instant::now();
-    let handle = tokio::task::spawn_blocking(move || generate_decoded_tokens(prepared));
+    let test_sleep = generation_step_test_sleep_duration();
+    let handle = tokio::task::spawn_blocking(move || {
+        if let Some(duration) = test_sleep {
+            std::thread::sleep(duration);
+        }
+        generate_decoded_tokens(prepared)
+    });
     match tokio::time::timeout(timeout, handle).await {
         Ok(Ok(result)) => result,
         Ok(Err(err)) => Err(Box::new(api_error(
@@ -5840,6 +5958,43 @@ mod tests {
             Err(GenerationStepBlockingError::Response(_)) => panic!("expected timeout error"),
             Ok(_) => panic!("expected stream step to time out"),
         }
+    }
+
+    #[tokio::test]
+    async fn non_streaming_generation_timeout_returns_scrubbed_trace() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var(GENERATION_TIMEOUT_ENV, "1");
+        std::env::set_var("CAMELID_TEST_GENERATION_STEP_SLEEP_MS", "25");
+        let session = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        let prepared = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
+
+        let result = generate_decoded_tokens_blocking(prepared).await;
+
+        std::env::remove_var(GENERATION_TIMEOUT_ENV);
+        std::env::remove_var("CAMELID_TEST_GENERATION_STEP_SLEEP_MS");
+        let response = match result {
+            Err(response) => *response,
+            Ok(_) => panic!("expected non-streaming generation timeout"),
+        };
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["error"]["code"], "generation_timeout");
+        assert_eq!(body["error"]["param"], "max_tokens");
+        assert_eq!(body["error"]["timeout_trace"]["timeout_ms"], 1);
+        assert_eq!(
+            body["error"]["timeout_trace"]["timeout_env"],
+            GENERATION_TIMEOUT_ENV
+        );
+        assert!(body["error"]["timeout_trace"]["generated_tokens"].is_null());
+        let serialized = body.to_string();
+        assert!(!serialized.contains("://"));
+        assert!(!serialized.contains(&["/Users", "/"].concat()));
+        assert!(!serialized.contains("models/"));
     }
 
     #[test]

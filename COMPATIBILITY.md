@@ -247,7 +247,7 @@ For **Llama 3 8B** specifically, the durable citation anchors are the current-he
 | `/props` | Partial llama-server control-plane compatibility | Read-only public properties are available for WebUI/client discovery: default generation settings, slot count, chat-template metadata when a model is loaded, and fail-closed Camelid readiness notes. Local model paths are intentionally redacted, `POST /props` is unsupported, and this does not imply `/slots`, native `/completion`, embeddings, reranking, multimodal, or full llama-server WebUI parity. |
 | `/slots` | Unsupported | Add only after Camelid has explicit slot/session lifecycle semantics, cancellation behavior, prompt-cache visibility rules, and privacy-safe fields. |
 | Native `/completion` | Unsupported | Implement only after mapping llama-server `prompt` shapes, sampler aliases, streaming shape, cancellation, and typed unsupported fields without weakening the stable `/v1/completions` path. |
-| `/apply-template` | Planned | Useful next bounded route because it can expose chat-template rendering without inference; must stay loaded-model and exact-row scoped, with unsupported template behavior typed. |
+| `/apply-template` | Partial llama-server utility compatibility | Loaded-model chat-template rendering is available as a no-inference utility returning a `prompt` string. It is scoped to Camelid's supported tokenizer/template renderers, rejects unknown request fields with typed unsupported errors, and does not imply native `/completion`, `/slots`, arbitrary-template support, or WebUI readiness. |
 | Embeddings and reranking | Unsupported | No embeddings/reranking support claim until model/runtime support, OpenAI `/v1/embeddings` shape, native `/embedding` shape, and fail-closed capability rows are implemented and tested. |
 | Multi-choice generation | Unsupported | Keep typed unsupported until implemented/tested. |
 | Rich OpenAI-compatible logprobs | Partial/planned | Diagnostic logit surfaces exist; complete API parity remains Phase 14 work. |
@@ -258,7 +258,7 @@ For **Llama 3 8B** specifically, the durable citation anchors are the current-he
 Camelid should keep the OpenAI-style subset stable while adding llama-server compatibility in this order:
 
 1. **Discovery/control-plane:** `/props`, then privacy-safe health/model metadata refinements, then `/slots` only after slot semantics exist.
-2. **Template utilities:** `/apply-template` for loaded supported rows, with exact renderer/source metadata and typed unsupported errors for arbitrary templates.
+2. **Template utilities:** `/apply-template` now has a bounded loaded-model no-inference route; next hardening is renderer/source metadata and broader negative fixtures for arbitrary template inputs.
 3. **Native generation aliases:** `/completion` as a thin, tested mapping onto the existing generation path, preserving honest unsupported responses for llama-server sampler/control fields.
 4. **Embeddings/reranking:** implement only after backend support and separate capability rows exist; keep `/v1/embeddings`, `/embedding`, `/embeddings`, `/rerank`, and `/v1/reranking` fail-closed until then.
 5. **WebUI readiness:** keep frontend chat enabled only from `/api/capabilities` exact-row support plus `/v1/health loaded_now=true generation_ready=true`; native route presence alone must never unlock readiness.
