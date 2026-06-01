@@ -438,6 +438,44 @@ pub struct LlamaServerApplyTemplateResponse {
     pub prompt: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct LlamaServerCompletionRequest {
+    pub model: Option<String>,
+    pub prompt: Option<String>,
+    pub n_predict: Option<i32>,
+    pub max_tokens: Option<u32>,
+    pub stream: Option<bool>,
+    pub temperature: Option<f32>,
+    pub temp: Option<f32>,
+    pub top_k: Option<u32>,
+    pub top_p: Option<f32>,
+    pub seed: Option<u64>,
+    pub presence_penalty: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    pub logit_bias: Option<HashMap<String, f32>>,
+    pub stop: Option<StopSpec>,
+    #[serde(flatten)]
+    pub unsupported_fields: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LlamaServerCompletionResponse {
+    pub content: String,
+    pub model: String,
+    pub stop: bool,
+    pub stopped_limit: bool,
+    pub tokens_predicted: usize,
+    pub tokens_evaluated: usize,
+    pub camelid: LlamaServerCompletionCamelid,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LlamaServerCompletionCamelid {
+    pub compatibility: &'static str,
+    pub finish_reason: &'static str,
+    pub unsupported: Vec<&'static str>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct LlamaServerModelListResponse {
     pub data: Vec<LlamaServerModelListItem>,
@@ -1266,12 +1304,129 @@ async fn unsupported_llama_server_metrics() -> Response {
     )
 }
 
-async fn llama_server_completion() -> Response {
-    unsupported_route(
-        "unsupported_llama_server_completion",
-        "/completion is not supported yet; use /v1/completions or /v1/chat/completions for Camelid's stable generation path",
-        Some("completion"),
-    )
+async fn llama_server_completion(
+    State(state): State<AppState>,
+    payload: std::result::Result<Json<LlamaServerCompletionRequest>, JsonRejection>,
+) -> Response {
+    let Json(req) = match payload {
+        Ok(payload) => payload,
+        Err(err) => return malformed_json_error(err),
+    };
+    if req.stream.unwrap_or(false) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_parameter",
+            "/completion stream=true is not supported yet; use /v1/completions with stream=true for Camelid's stable SSE stream path".to_string(),
+            Some("stream"),
+        );
+    }
+
+    let max_tokens = match llama_server_completion_max_tokens(req.n_predict, req.max_tokens) {
+        Ok(max_tokens) => max_tokens,
+        Err(response) => return *response,
+    };
+    let req = GenerationSessionRequest {
+        model: req.model,
+        prompt: req.prompt,
+        messages: None,
+        max_tokens,
+        stream: Some(false),
+        temperature: req.temp.or(req.temperature),
+        top_k: req.top_k,
+        top_p: req.top_p,
+        seed: req.seed,
+        presence_penalty: req.presence_penalty,
+        frequency_penalty: req.frequency_penalty,
+        logit_bias: req.logit_bias,
+        stop: req.stop,
+        n: None,
+        best_of: None,
+        completion_logprobs: None,
+        chat_logprobs: None,
+        top_logprobs: None,
+        camelid_logit_token_ids: None,
+        camelid_prompt_token_ids: None,
+        camelid_dense_diagnostics: None,
+        camelid_dense_diagnostic_generated_index: None,
+        unsupported_fields: req.unsupported_fields,
+        default_max_tokens_cap: Some(DEFAULT_PUBLIC_CHAT_MAX_TOKENS),
+    };
+    let prepared = match prepare_generation(&state, req).await {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
+    };
+
+    let model_id = prepared.model_id.clone();
+    let prompt_token_count = prepared.token_ids.len();
+    match generate_decoded_tokens_blocking(prepared).await {
+        Ok(generated) => {
+            let finish_reason = generated.finish_reason;
+            (
+                StatusCode::OK,
+                Json(LlamaServerCompletionResponse {
+                    content: generated.text,
+                    model: model_id,
+                    stop: finish_reason != "length",
+                    stopped_limit: finish_reason == "length",
+                    tokens_predicted: generated.completion_tokens,
+                    tokens_evaluated: prompt_token_count,
+                    camelid: LlamaServerCompletionCamelid {
+                        compatibility: "partial_llama_server_completion_non_streaming",
+                        finish_reason,
+                        unsupported: vec![
+                            "streaming_completion_shape",
+                            "slot_selection",
+                            "cache_prompt_controls",
+                            "llama_server_timings_shape",
+                            "rich_token_probabilities",
+                        ],
+                    },
+                }),
+            )
+                .into_response()
+        }
+        Err(response) => *response,
+    }
+}
+
+fn llama_server_completion_max_tokens(
+    n_predict: Option<i32>,
+    max_tokens: Option<u32>,
+) -> std::result::Result<Option<u32>, Box<Response>> {
+    let n_predict_max_tokens =
+        match n_predict {
+            Some(-1) | None => None,
+            Some(0) => return Err(Box::new(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_n_predict",
+                "n_predict must be greater than zero, or -1 to use Camelid's bounded default cap"
+                    .to_string(),
+                Some("n_predict"),
+            ))),
+            Some(value) if value < -1 => {
+                return Err(Box::new(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_n_predict",
+                    "n_predict values below -1 are not supported".to_string(),
+                    Some("n_predict"),
+                )))
+            }
+            Some(value) => Some(value as u32),
+        };
+
+    if let (Some(from_n_predict), Some(from_max_tokens)) = (n_predict_max_tokens, max_tokens) {
+        if from_n_predict != from_max_tokens {
+            return Err(Box::new(api_error(
+                StatusCode::BAD_REQUEST,
+                "ambiguous_generation_length",
+                "send only one generation length field, or make n_predict and max_tokens match"
+                    .to_string(),
+                Some("n_predict"),
+            )));
+        }
+    }
+
+    Ok(n_predict_max_tokens.or(max_tokens))
 }
 
 async fn unsupported_llama_server_infill() -> Response {
@@ -1891,9 +2046,14 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 notes: "POST /apply-template renders loaded-model chat messages to a prompt string without inference. It is scoped to Camelid's supported tokenizer/template renderers and returns typed unsupported errors for unknown request fields or unsupported templates.",
             },
             SupportItem {
+                id: "llama_server_completion",
+                status: "partial",
+                notes: "POST /completion accepts a narrow non-streaming text-generation subset: prompt, n_predict/max_tokens, supported sampler fields, and stop sequences are mapped onto Camelid's existing generation path. Native stream=true chunks, slot selection, cache_prompt controls, llama-server timings shape, rich token probabilities, and full llama-server generation parity remain unsupported.",
+            },
+            SupportItem {
                 id: "fail_closed_native_compatibility_routes",
                 status: "unsupported",
-                notes: "Native /completion, /infill, /metrics, /embedding, /embeddings, /v1/embeddings, /v1/messages, /rerank, /reranking, /v1/rerank, /v1/reranking, /v1/responses, POST /models/load, POST /models/unload, POST /slots, and slot cache actions return typed not_implemented errors until real route semantics and backend support exist.",
+                notes: "Native /infill, /metrics, /embedding, /embeddings, /v1/embeddings, /v1/messages, /rerank, /reranking, /v1/rerank, /v1/reranking, /v1/responses, POST /models/load, POST /models/unload, POST /slots, and slot cache actions return typed not_implemented errors until real route semantics and backend support exist. Unsupported /completion modes remain typed parameter errors.",
             },
             SupportItem {
                 id: "multi_choice_generation",
@@ -3680,6 +3840,9 @@ fn validate_unsupported_generation_fields(
         | "repeat_penalty" | "ignore_eos" | "n_keep" => {
             "this llama-server sampler/control field is not supported yet"
         }
+        "cache_prompt" | "id_slot" | "id_task" | "slot_id" => {
+            "llama-server slot/cache controls are not supported by this compatibility route yet"
+        }
         "input" => {
             "embeddings/Responses-style input payloads are not supported on generation routes"
         }
@@ -3715,6 +3878,10 @@ fn static_param_name(param: &str) -> &'static str {
         "repeat_penalty" => "repeat_penalty",
         "ignore_eos" => "ignore_eos",
         "n_keep" => "n_keep",
+        "cache_prompt" => "cache_prompt",
+        "id_slot" => "id_slot",
+        "id_task" => "id_task",
+        "slot_id" => "slot_id",
         "input" => "input",
         _ => "request",
     }

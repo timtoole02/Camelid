@@ -188,12 +188,6 @@ async fn native_compatibility_routes_fail_closed_with_typed_errors() {
         ("POST", "/props", "unsupported_llama_server_props", "props"),
         ("POST", "/slots", "unsupported_llama_server_slots", "slots"),
         (
-            "POST",
-            "/completion",
-            "unsupported_llama_server_completion",
-            "completion",
-        ),
-        (
             "GET",
             "/metrics",
             "unsupported_llama_server_metrics",
@@ -470,9 +464,16 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
                 .contains("without inference")
     }));
     assert!(body["api_features"].as_array().unwrap().iter().any(|item| {
+        item["id"] == "llama_server_completion"
+            && item["status"] == "partial"
+            && item["notes"].as_str().unwrap().contains("POST /completion")
+            && item["notes"].as_str().unwrap().contains("n_predict")
+            && item["notes"].as_str().unwrap().contains("non-streaming")
+            && item["notes"].as_str().unwrap().contains("stream=true")
+    }));
+    assert!(body["api_features"].as_array().unwrap().iter().any(|item| {
         item["id"] == "fail_closed_native_compatibility_routes"
             && item["status"] == "unsupported"
-            && item["notes"].as_str().unwrap().contains("/completion")
             && item["notes"].as_str().unwrap().contains("/infill")
             && item["notes"].as_str().unwrap().contains("/metrics")
             && item["notes"].as_str().unwrap().contains("/v1/embeddings")
@@ -927,6 +928,101 @@ async fn completion_accepts_prompt_token_ids_before_runtime() {
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["error"]["code"], "model_not_loaded");
+}
+
+#[tokio::test]
+async fn llama_server_completion_maps_n_predict_before_runtime() {
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/completion")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"tiny","prompt":"hello","n_predict":1}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "model_not_loaded");
+}
+
+#[tokio::test]
+async fn llama_server_completion_rejects_streaming_shape_until_implemented() {
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/completion")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"tiny","prompt":"hello","n_predict":1,"stream":true}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert_eq!(body["error"]["param"], "stream");
+}
+
+#[tokio::test]
+async fn llama_server_completion_rejects_invalid_n_predict_before_runtime() {
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/completion")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"tiny","prompt":"hello","n_predict":0}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "invalid_n_predict");
+    assert_eq!(body["error"]["param"], "n_predict");
+}
+
+#[tokio::test]
+async fn llama_server_completion_rejects_cache_controls_before_runtime() {
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/completion")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"tiny","prompt":"hello","n_predict":1,"cache_prompt":true}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert_eq!(body["error"]["param"], "cache_prompt");
 }
 
 #[tokio::test]
@@ -3001,6 +3097,69 @@ async fn completion_endpoint_generates_multiple_greedy_tokens() {
     assert_eq!(body["camelid"]["generated_token_ids"], json!([0, 0]));
     assert!(body["camelid"]["timings_ms"]["generation"]["forward_total"].is_number());
     assert!(body["camelid"]["timings_ms"]["layers"].is_array());
+}
+
+#[tokio::test]
+async fn llama_server_completion_generates_non_streaming_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tiny-generation.gguf");
+    write_generation_gguf(&path);
+
+    let app = camelid::api::router();
+    let load_body = serde_json::json!({"path": path, "id": "tiny-generation"});
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/models/load")
+                .header("content-type", "application/json")
+                .body(Body::from(load_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/completion")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"tiny-generation","prompt":"hello","n_predict":2}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&body_bytes)
+    );
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(body["content"], "<unk><unk>");
+    assert_eq!(body["model"], "tiny-generation");
+    assert_eq!(body["stop"], false);
+    assert_eq!(body["stopped_limit"], true);
+    assert_eq!(body["tokens_predicted"], 2);
+    assert!(body["tokens_evaluated"].as_u64().unwrap() > 0);
+    assert_eq!(
+        body["camelid"]["compatibility"],
+        "partial_llama_server_completion_non_streaming"
+    );
+    assert_eq!(body["camelid"]["finish_reason"], "length");
+    assert!(body["camelid"]["unsupported"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item == "streaming_completion_shape"));
 }
 
 #[tokio::test]
