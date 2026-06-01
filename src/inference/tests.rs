@@ -9304,20 +9304,42 @@ fn single_token_forward_diagnostics_follow_llama_stage_order() {
     assert_close(layer.residual_flow.attention_delta.max_abs_delta, 0.0);
 
     assert_slice_close(&layer.ffn_norm.checkpoint.first_values, &[1.0, 1.0]);
-    assert_slice_close(&layer.ffn_gate.checkpoint.first_values, &[1.0, 2.0]);
-    assert_slice_close(&layer.ffn_up.checkpoint.first_values, &[3.0, 4.0]);
+    assert_slice_close(
+        &layer.ffn_gate.as_ref().unwrap().checkpoint.first_values,
+        &[1.0, 2.0],
+    );
+    assert_slice_close(
+        &layer.ffn_up.as_ref().unwrap().checkpoint.first_values,
+        &[3.0, 4.0],
+    );
     let expected_activation = vec![silu(1.0) * 3.0, silu(2.0) * 4.0];
     assert_slice_close(
-        &layer.ffn_activation.checkpoint.first_values,
+        &layer
+            .ffn_activation
+            .as_ref()
+            .unwrap()
+            .checkpoint
+            .first_values,
         &expected_activation,
     );
     assert_eq!(
-        layer.ffn_activation_reconstruction.activation_order,
+        layer
+            .ffn_activation_reconstruction
+            .as_ref()
+            .unwrap()
+            .activation_order,
         "gate_up"
     );
-    assert_close(layer.ffn_activation_reconstruction.max_abs_delta, 0.0);
+    assert_close(
+        layer
+            .ffn_activation_reconstruction
+            .as_ref()
+            .unwrap()
+            .max_abs_delta,
+        0.0,
+    );
     assert_slice_close(
-        &layer.ffn_output.checkpoint.first_values,
+        &layer.ffn_output.as_ref().unwrap().checkpoint.first_values,
         &expected_activation,
     );
 
@@ -10397,14 +10419,15 @@ fn attention_trace_samples_gqa_kv_group_anchors_and_tail_heads() {
 }
 
 #[test]
-fn softmax_top_k_preserves_full_router_softmax_weights() {
+fn softmax_top_k_renormalizes_selected_router_weights() {
     let top = softmax_top_k(&[0.0, 1.0, 2.0], 2);
     assert_eq!(top[0].0, 2);
     assert_eq!(top[1].0, 1);
     let selected_sum = top.iter().map(|(_, weight)| *weight).sum::<f32>();
-    assert!(selected_sum < 1.0, "{top:?}");
+    assert!((selected_sum - 1.0).abs() < 1.0e-6, "{top:?}");
     let full_sum = 0.0_f32.exp() + 1.0_f32.exp() + 2.0_f32.exp();
-    let expected_first = 2.0_f32.exp() / full_sum;
+    let expected_first =
+        (2.0_f32.exp() / full_sum) / ((2.0_f32.exp() / full_sum) + (1.0_f32.exp() / full_sum));
     assert!((top[0].1 - expected_first).abs() < 1.0e-6, "{top:?}");
 }
 
@@ -10438,11 +10461,51 @@ fn mixtral_moe_ffn_routes_top_k_experts() {
         &up_experts,
         &down_experts,
         2,
-        "out",
+        MixtralMoeFfnOptions::new("out", false),
     )
     .unwrap();
 
     let expected = 1.0 / (1.0 + (-1.0_f32).exp());
     assert!((out.data[0] - expected).abs() < 1.0e-3, "{:?}", out.data);
     assert!((out.data[1] - expected).abs() < 1.0e-3, "{:?}", out.data);
+}
+
+#[test]
+fn mixtral_moe_ffn_captures_router_logits_and_selected_experts() {
+    let input = CpuTensor::from_f32("input", vec![1, 2], vec![1.0, 1.0]).unwrap();
+    let router =
+        CpuTensor::from_f32("router", vec![2, 3], vec![3.0, 0.0, 2.0, 0.0, 0.0, 0.0]).unwrap();
+    let gate_experts = CpuTensor::from_f32(
+        "gate_experts",
+        vec![2, 2, 3],
+        vec![1.0, 0.0, 0.0, 1.0, 0.5, 0.0, 0.0, 0.5, 0.25, 0.0, 0.0, 0.25],
+    )
+    .unwrap();
+    let up_experts = gate_experts.clone();
+    let down_experts = CpuTensor::from_f32(
+        "down_experts",
+        vec![2, 2, 3],
+        vec![1.0, 0.0, 0.0, 1.0, 0.5, 0.0, 0.0, 0.5, 0.25, 0.0, 0.0, 0.25],
+    )
+    .unwrap();
+
+    let (_, _, _, _, _, trace) = mixtral_moe_ffn(
+        &input,
+        &router,
+        &gate_experts,
+        &up_experts,
+        &down_experts,
+        2,
+        MixtralMoeFfnOptions::new("out", true),
+    )
+    .unwrap();
+
+    let trace = trace.expect("trace should be captured");
+    assert_eq!(trace.expert_used_count, 2);
+    assert_eq!(trace.rows.len(), 1);
+    assert_eq!(trace.rows[0].row_index, 0);
+    assert_eq!(trace.rows[0].router_logits, vec![3.0, 2.0, 0.0]);
+    assert_eq!(trace.rows[0].selected_experts, vec![0, 1]);
+    let selected_sum = trace.rows[0].selected_weights.iter().sum::<f32>();
+    assert!((selected_sum - 1.0).abs() < 1.0e-6, "{trace:?}");
 }
