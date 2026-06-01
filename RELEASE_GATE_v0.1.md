@@ -74,6 +74,7 @@ cd frontend && npm ci && npm run build && npm run smoke:model-state
 - Branch-head validation passed after the post-rc1 QA repair at `3001fa48e3d5fa41dbeca417dd511164a3bacc80`; the existing rc1 tag predates that repair and has not been moved.
 - No GitHub workflow run or commit status was visible for the rc1 commit at observation time; this is an observability gap, not a reported CI failure.
 - Hosted CI is not automatically triggered by release-branch pushes because the workflow only runs on `push` to `main`, `pull_request`, and `workflow_dispatch`.
+- Local hosted-CI dispatch was not available in this lane: `gh workflow run ci.yml --ref release/v0.1-evidence` failed with `zsh:1: command not found: gh`.
 
 ## Tag Rule
 

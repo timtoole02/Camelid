@@ -54,13 +54,14 @@ Blocker/Risk:
 - The source SHA in the benchmark bundle predates later docs/evidence-publication commits; no runtime code changes were made after that clean-head run.
 - No GitHub workflow run or commit status was visible for the rc1 commit at observation time; this is an observability gap, not a reported CI failure.
 - Remote CI is not configured to run automatically on release-branch pushes; a manual `workflow_dispatch` or PR-based run is needed for hosted CI evidence on this branch.
+- Hosted CI dispatch attempt after pushing the QA repair was blocked locally: `gh workflow run ci.yml --ref release/v0.1-evidence` failed with `zsh:1: command not found: gh`.
 - No local gate is currently failing at the QA repair commit `3001fa48e3d5fa41dbeca417dd511164a3bacc80`; subsequent release-status edits are documentation-only.
 
 Next:
 
-- Ensure the post-rc1 QA repair and release-status commits are pushed to `origin/release/v0.1-evidence`.
+- The post-rc1 QA repair and release-status commits are pushed to `origin/release/v0.1-evidence`.
 - Continue soak on the release branch head and monitor for any later remote CI/status signal.
-- Run or request a manual GitHub Actions dispatch on `release/v0.1-evidence` if hosted CI evidence is required before any final approval.
+- Request a manual GitHub Actions dispatch on `release/v0.1-evidence` from an environment with workflow-dispatch credentials/tooling if hosted CI evidence is required before any final approval.
 - Keep comparator deferrals explicit in any downstream notes: llama.cpp Metal, Ollama, and MLX are non-claims for rc1.
 - Do not create `v0.1.0` final without Tim approval.
 

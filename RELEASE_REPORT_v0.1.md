@@ -66,7 +66,7 @@ Remaining blockers and risks:
 - The existing `v0.1.0-rc1` tag predates the branch-head frontend/README QA repair; Tim needs to decide whether to cut a new candidate, retag rc1, or keep rc1 as known-pre-fix.
 - The clean-head evidence bundle source SHA predates later documentation/evidence-publication commits; no runtime code changes were made after the run.
 - Remote CI/status observation returned no runs or statuses for the rc1 commit; this is an observability gap, not a reported CI failure.
-- Hosted CI is not automatically triggered by release-branch pushes; use `workflow_dispatch` or PR-based CI if remote hosted evidence is required for final approval.
+- Hosted CI is not automatically triggered by release-branch pushes; the local dispatch attempt was blocked because `gh` is not installed, so use `workflow_dispatch` or PR-based CI from an environment with the required tooling/credentials if remote hosted evidence is required for final approval.
 
 Recommendation: push and soak the repaired release branch head, then have Tim choose the candidate strategy before final approval. Run or request a manual hosted CI dispatch if remote CI evidence is required. Do not create final `v0.1.0` without Tim approval.
 
