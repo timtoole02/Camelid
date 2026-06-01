@@ -31,6 +31,8 @@ Evidence:
 - Remote tag observation: `git ls-remote --tags origin 'v0.1.0-rc1^{}'` returned `d9fb294f47e3ae80291f969499e2240c6cd640c3`.
 - Local annotated tag object: `v0.1.0-rc1`, tagger date 2026-05-31 13:09:59 -0700, target `d9fb294f47e3ae80291f969499e2240c6cd640c3`.
 - GitHub connector observation for `d9fb294f47e3ae80291f969499e2240c6cd640c3`: zero workflow runs and zero commit statuses returned.
+- Workflow trigger audit: `.github/workflows/ci.yml` runs on `push` to `main`, `pull_request`, and `workflow_dispatch`; release-branch pushes do not automatically start CI.
+- Public Actions API observation for branch `release/v0.1-evidence`: one older pull-request run, `26719718160`, failed at `069b4e205b1392a94af610d2450b76af8010851e`; no run was reported for the rc1 tag target or the post-rc1 status-note commits.
 - Real bundle: `qa/evidence-bundles/v0.1/20260531T184150Z-real-local/`.
 - Bundle source SHA: `8026339531463ade269d7be7078da331ba3e4085`; git status was clean at run time.
 - Model SHA256: `b5607b5090a8280063fff2d706bb3408ca6542341b06aab39c3eca0a28575921`.
@@ -47,11 +49,13 @@ Blocker/Risk:
 - The source SHA in the benchmark bundle predates later docs/evidence-publication commits; no runtime code changes were made after that clean-head run.
 - The local machine's main filesystem had less than 1 GiB free during signoff, so Rust build artifacts were kept outside the repository.
 - No GitHub workflow run or commit status was visible for the rc1 commit at observation time; this is an observability gap, not a reported CI failure.
+- Remote CI is not configured to run automatically on release-branch pushes; a manual `workflow_dispatch` or PR-based run is needed for hosted CI evidence on this branch.
 - No local gate is currently failing.
 
 Next:
 
 - Continue rc1 soak and monitor for any later remote CI/status signal on `d9fb294f47e3ae80291f969499e2240c6cd640c3`.
+- Run or request a manual GitHub Actions dispatch on `release/v0.1-evidence` if hosted CI evidence is required before final approval.
 - Keep comparator deferrals explicit in any downstream notes: llama.cpp Metal, Ollama, and MLX are non-claims for rc1.
 - Do not create `v0.1.0` final without Tim approval.
 

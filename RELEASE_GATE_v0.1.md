@@ -32,7 +32,7 @@ cd frontend && npm ci && npm run build && npm run smoke:model-state
 | Gate | Command | Status | Notes |
 | --- | --- | --- | --- |
 | Branch/SHA | `git status --short --branch`; `git rev-parse HEAD`; `git ls-remote --heads origin release/v0.1-evidence` | PASS | Confirmed clean `release/v0.1-evidence`; branch matched `origin/release/v0.1-evidence` at `ab0cbdecaff373c501a2f1383342f71cee0f4f0d` before the signoff docs refresh. |
-| Remote rc1 branch/tag | `git ls-remote --heads origin release/v0.1-evidence`; `git ls-remote --tags origin 'v0.1.0-rc1^{}'`; GitHub connector workflow/status checks | PASS / OBSERVED | At 2026-06-01 00:09 UTC, branch and dereferenced tag both pointed to `d9fb294f47e3ae80291f969499e2240c6cd640c3`; GitHub returned zero workflow runs and zero commit statuses for that commit. This status-only follow-up update does not retarget the rc1 tag. |
+| Remote rc1 branch/tag | `git ls-remote --heads origin release/v0.1-evidence`; `git ls-remote --tags origin 'v0.1.0-rc1^{}'`; GitHub connector workflow/status checks; public Actions API branch query | PASS / OBSERVED | At 2026-06-01 00:09 UTC, branch and dereferenced tag both pointed to `d9fb294f47e3ae80291f969499e2240c6cd640c3`; GitHub returned zero workflow runs and zero commit statuses for that commit. `.github/workflows/ci.yml` does not trigger on release-branch pushes. The public Actions API showed one older failed pull-request run on `069b4e205b1392a94af610d2450b76af8010851e`, not on the rc1 tag target. This status-only follow-up update does not retarget the rc1 tag. |
 | Rust format | `CARGO_TARGET_DIR="$EXTERNAL_VOLUME/Camelid/release-captain/v0.1-evidence/cargo-target" cargo fmt --all -- --check` | PASS | Source tree is formatted. |
 | Rust clippy | `CARGO_TARGET_DIR="$EXTERNAL_VOLUME/Camelid/release-captain/v0.1-evidence/cargo-target" CARGO_TERM_COLOR=never cargo clippy --all-targets --all-features -- -D warnings` | PASS | Clippy passed. |
 | Rust check | `CARGO_TERM_COLOR=never cargo check --all-targets --all-features` | PASS | Earlier gate-refresh check passed; no Rust source changed in this evidence-publication update. |
@@ -64,6 +64,7 @@ cd frontend && npm ci && npm run build && npm run smoke:model-state
 - The release captain accepts one llama.cpp CPU row plus explicit Metal/Ollama/MLX deferrals for `v0.1.0-rc1` because public docs make no comparator win or parity claims.
 - Local validation passed after the signoff refresh; the pushed rc1 tag target is observed at `d9fb294f47e3ae80291f969499e2240c6cd640c3`.
 - No GitHub workflow run or commit status was visible for the rc1 commit at observation time; this is an observability gap, not a reported CI failure.
+- Hosted CI is not automatically triggered by release-branch pushes because the workflow only runs on `push` to `main`, `pull_request`, and `workflow_dispatch`.
 
 ## Tag Rule
 
