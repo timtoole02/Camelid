@@ -8,6 +8,8 @@ Use this document to answer one release question: **may Camelid honestly say thi
 
 Practical reading rule: if a statement cannot be reduced to an exact row in this file, Camelid should not publish that statement as product truth.
 
+War-room claim discipline lives in [`docs/WAR_ROOM_EVIDENCE_INDEX.md`](docs/WAR_ROOM_EVIDENCE_INDEX.md). That policy is an index and checklist only; it does not promote support, benchmark, API capability, or WebUI readiness beyond the exact rows and evidence recorded here.
+
 ## Release-language definitions
 
 Treat the labels below as release language, not implementation optimism:
@@ -242,9 +244,24 @@ For **Llama 3 8B** specifically, the durable citation anchors are the current-he
 | `/v1/models`, `/api/models/load`, `/api/models/current` | Supported current gate; row-scoped Llama support | Local GGUF load/list/readiness path used by the frontend; exact Llama 3.2 1B and Llama 3 8B rows are verified within bounded envelopes, while the exact 3B row remains smoke-supported and all broader/full-support language still waits on normalized current-head reruns. |
 | `/api/capabilities` | Supported contract surface | Exposes explicit support contract, supported/planned quants, model families, and API features; row statuses must distinguish TinyLlama current-gate support, Llama 3.2 1B and Llama 3 8B bounded support, and Llama 3.2 3B exact-row smoke support. |
 | `/tokenize`, `/detokenize` | Partial llama-server utility compatibility | Bounded loaded-model tokenizer aliases are available for token-id encode/decode only. `/tokenize` does not yet support `with_pieces=true`, and tokenizer availability still depends on a loaded exact-row/tokenizer-supported GGUF. |
+| `/props` | Partial llama-server control-plane compatibility | Read-only public properties are available for WebUI/client discovery: default generation settings, slot count, chat-template metadata when a model is loaded, and fail-closed Camelid readiness notes. Local model paths are intentionally redacted, `POST /props` is unsupported, and this does not imply `/slots`, native `/completion`, embeddings, reranking, multimodal, or full llama-server WebUI parity. |
+| `/slots` | Unsupported | Add only after Camelid has explicit slot/session lifecycle semantics, cancellation behavior, prompt-cache visibility rules, and privacy-safe fields. |
+| Native `/completion` | Unsupported | Implement only after mapping llama-server `prompt` shapes, sampler aliases, streaming shape, cancellation, and typed unsupported fields without weakening the stable `/v1/completions` path. |
+| `/apply-template` | Planned | Useful next bounded route because it can expose chat-template rendering without inference; must stay loaded-model and exact-row scoped, with unsupported template behavior typed. |
+| Embeddings and reranking | Unsupported | No embeddings/reranking support claim until model/runtime support, OpenAI `/v1/embeddings` shape, native `/embedding` shape, and fail-closed capability rows are implemented and tested. |
 | Multi-choice generation | Unsupported | Keep typed unsupported until implemented/tested. |
 | Rich OpenAI-compatible logprobs | Partial/planned | Diagnostic logit surfaces exist; complete API parity remains Phase 14 work. |
 | Local OpenAI-compatible provider registration | Open integration verification | Verify registration/use by the target local client surface before calling integration complete. |
+
+### Llama-server compatibility sequence
+
+Camelid should keep the OpenAI-style subset stable while adding llama-server compatibility in this order:
+
+1. **Discovery/control-plane:** `/props`, then privacy-safe health/model metadata refinements, then `/slots` only after slot semantics exist.
+2. **Template utilities:** `/apply-template` for loaded supported rows, with exact renderer/source metadata and typed unsupported errors for arbitrary templates.
+3. **Native generation aliases:** `/completion` as a thin, tested mapping onto the existing generation path, preserving honest unsupported responses for llama-server sampler/control fields.
+4. **Embeddings/reranking:** implement only after backend support and separate capability rows exist; keep `/v1/embeddings`, `/embedding`, `/embeddings`, `/rerank`, and `/v1/reranking` fail-closed until then.
+5. **WebUI readiness:** keep frontend chat enabled only from `/api/capabilities` exact-row support plus `/v1/health loaded_now=true generation_ready=true`; native route presence alone must never unlock readiness.
 
 ## Phase 9-15 next actions and owners
 
