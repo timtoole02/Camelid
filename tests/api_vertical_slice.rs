@@ -170,6 +170,14 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         .unwrap()
         .iter()
         .any(|item| item["id"] == "multi_choice_generation" && item["status"] == "unsupported"));
+    assert!(body["api_features"].as_array().unwrap().iter().any(|item| {
+        item["id"] == "llama_server_props"
+            && item["status"] == "partial_control_plane"
+            && item["notes"]
+                .as_str()
+                .unwrap()
+                .contains("unsupported until implemented and tested")
+    }));
     let compatibility = body["model_compatibility"].as_array().unwrap();
     let tinyllama = compatibility
         .iter()
@@ -1428,6 +1436,95 @@ async fn v1_model_retrieve_reports_loaded_dense_model_shape() {
     assert_eq!(body["object"], "model");
     assert_eq!(body["owned_by"], "camelid");
     assert_eq!(body["created"], 0);
+}
+
+#[tokio::test]
+async fn llama_server_props_reports_partial_fail_closed_control_plane() {
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/props")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["object"], "camelid.llama_server.props");
+    assert_eq!(body["compatibility_status"], "partial_control_plane");
+    assert_eq!(body["generation_ready"], false);
+    assert!(body["active_model_id"].is_null());
+    assert_eq!(body["total_slots"], 0);
+    assert_eq!(body["default_generation_settings"]["stream"], false);
+    assert_eq!(body["default_generation_settings"]["n_predict"], 800);
+    assert!(body["supported_routes"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("/props")));
+    assert!(body["unsupported_routes"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("/completion")));
+    assert!(body["unsupported_routes"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("/v1/embeddings")));
+    assert!(body["note"]
+        .as_str()
+        .unwrap()
+        .contains("unsupported native llama-server routes remain unavailable"));
+    let serialized = body.to_string();
+    for forbidden in ["/Users/", "/home/", "file://", "C:\\Users\\", "C:/Users/"] {
+        assert!(
+            !serialized.contains(forbidden),
+            "/props must not expose local/private path marker {forbidden:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn llama_server_props_reflects_loaded_model_without_claiming_slots() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tokenizer.gguf");
+    write_tokenizer_gguf(&path, "llama", true, false, true);
+
+    let app = camelid::api::router();
+    let body = serde_json::json!({"path": path, "id": "tiny-tokenizer"});
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/models/load")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/props")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["active_model_id"], "tiny-tokenizer");
+    assert_eq!(body["generation_ready"], false);
+    assert_eq!(body["total_slots"], 0);
+    assert_eq!(body["compatibility_status"], "partial_control_plane");
 }
 
 #[tokio::test]

@@ -293,6 +293,25 @@ pub struct ModelListItem {
     pub owned_by: &'static str,
 }
 
+#[derive(Debug, Serialize)]
+pub struct LlamaServerPropsResponse {
+    pub object: &'static str,
+    pub compatibility_status: &'static str,
+    pub generation_ready: bool,
+    pub active_model_id: Option<String>,
+    pub total_slots: u32,
+    pub default_generation_settings: LlamaServerDefaultGenerationSettings,
+    pub supported_routes: Vec<&'static str>,
+    pub unsupported_routes: Vec<&'static str>,
+    pub note: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LlamaServerDefaultGenerationSettings {
+    pub stream: bool,
+    pub n_predict: u32,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
     pub model: Option<String>,
@@ -768,6 +787,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/v1/models/:model", get(v1_model))
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/props", get(llama_server_props))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -1373,6 +1393,11 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 status: "partial",
                 notes: "diagnostic logit surfaces exist; full OpenAI-compatible logprobs remain planned",
             },
+            SupportItem {
+                id: "llama_server_props",
+                status: "partial_control_plane",
+                notes: "GET /props exposes a read-only, fail-closed compatibility summary for llama-server-style clients; native generation/session routes such as /completion, /slots, /tokenize, /detokenize, /apply-template, and embeddings remain unsupported until implemented and tested",
+            },
         ],
         notes: vec![
             "GGUF metadata, tokenizer metadata, tensor loading, Camelid dense config extraction, and tensor binding are available",
@@ -1947,6 +1972,39 @@ fn model_list_item(model: &LoadedModel) -> ModelListItem {
         created: 0,
         owned_by: "camelid",
     }
+}
+
+async fn llama_server_props(State(state): State<AppState>) -> Json<LlamaServerPropsResponse> {
+    let active_id = state.active_model_id.read().await.clone();
+    let loaded_models = state.loaded_models.read().await;
+    let generation_ready = active_id
+        .as_ref()
+        .and_then(|id| loaded_models.get(id))
+        .is_some_and(loaded_model_generation_ready);
+
+    Json(LlamaServerPropsResponse {
+        object: "camelid.llama_server.props",
+        compatibility_status: "partial_control_plane",
+        generation_ready,
+        active_model_id: active_id,
+        total_slots: 0,
+        default_generation_settings: LlamaServerDefaultGenerationSettings {
+            stream: false,
+            n_predict: DEFAULT_PUBLIC_CHAT_MAX_TOKENS,
+        },
+        supported_routes: vec!["/props", "/v1/models", "/v1/completions", "/v1/chat/completions"],
+        unsupported_routes: vec![
+            "/completion",
+            "/slots",
+            "/tokenize",
+            "/detokenize",
+            "/apply-template",
+            "/embedding",
+            "/embeddings",
+            "/v1/embeddings",
+        ],
+        note: "This is a bounded llama-server control-plane compatibility surface. Generation readiness still requires Camelid's exact-row support contract and loaded-model runtime readiness; unsupported native llama-server routes remain unavailable.",
+    })
 }
 
 async fn generation_sessions(State(state): State<AppState>) -> Json<GenerationSessionListResponse> {
