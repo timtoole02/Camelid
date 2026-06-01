@@ -385,6 +385,29 @@ pub struct TokenizerDecodeResponse {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct LlamaServerTokenizeRequest {
+    pub content: Option<String>,
+    pub add_special: Option<bool>,
+    pub parse_special: Option<bool>,
+    pub with_pieces: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LlamaServerTokenizeResponse {
+    pub tokens: Vec<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LlamaServerDetokenizeRequest {
+    pub tokens: Option<Vec<u32>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LlamaServerDetokenizeResponse {
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct GenerationSessionRequest {
     pub model: Option<String>,
     pub prompt: Option<String>,
@@ -752,6 +775,8 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/api/models/tokenizer", get(model_tokenizer))
         .route("/api/models/tokenizer/encode", post(tokenizer_encode))
         .route("/api/models/tokenizer/decode", post(tokenizer_decode))
+        .route("/tokenize", post(llama_server_tokenize))
+        .route("/detokenize", post(llama_server_detokenize))
         .route(
             "/api/generation/sessions",
             get(generation_sessions).post(create_generation_session),
@@ -1360,6 +1385,11 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 notes: "loaded-model tokenizer APIs for supported tokenizer families",
             },
             SupportItem {
+                id: "llama_server_tokenizer_aliases",
+                status: "partial",
+                notes: "POST /tokenize and POST /detokenize are bounded loaded-model tokenizer aliases that return token ids/text only; piece metadata remains unsupported",
+            },
+            SupportItem {
                 id: "multi_choice_generation",
                 status: "unsupported",
                 notes: "typed unsupported until implemented and tested",
@@ -1903,6 +1933,93 @@ async fn tokenizer_decode(
         Ok(text) => (
             StatusCode::OK,
             Json(TokenizerDecodeResponse { text, token_count }),
+        )
+            .into_response(),
+        Err(err) => api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "token_decode_failed",
+            err.to_string(),
+            Some("tokens"),
+        ),
+    }
+}
+
+async fn llama_server_tokenize(
+    State(state): State<AppState>,
+    payload: std::result::Result<Json<LlamaServerTokenizeRequest>, JsonRejection>,
+) -> Response {
+    let Json(req) = match payload {
+        Ok(payload) => payload,
+        Err(err) => return malformed_json_error(err),
+    };
+    if req.with_pieces.unwrap_or(false) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_parameter",
+            "/tokenize with_pieces=true is not supported yet; Camelid currently returns token ids only"
+                .to_string(),
+            Some("with_pieces"),
+        );
+    }
+    let content = match req.content {
+        Some(content) => content,
+        None => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "missing_tokenizer_content",
+                "/tokenize request requires a content field".to_string(),
+                Some("content"),
+            )
+        }
+    };
+    let tokenizer = match loaded_tokenizer(&state).await {
+        Ok(tokenizer) => tokenizer,
+        Err(response) => return response,
+    };
+    match tokenizer.encode(
+        &content,
+        req.add_special.unwrap_or(false),
+        req.parse_special.unwrap_or(true),
+    ) {
+        Ok(tokens) => {
+            (StatusCode::OK, Json(LlamaServerTokenizeResponse { tokens })).into_response()
+        }
+        Err(err) => api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "tokenization_failed",
+            err.to_string(),
+            Some("content"),
+        ),
+    }
+}
+
+async fn llama_server_detokenize(
+    State(state): State<AppState>,
+    payload: std::result::Result<Json<LlamaServerDetokenizeRequest>, JsonRejection>,
+) -> Response {
+    let Json(req) = match payload {
+        Ok(payload) => payload,
+        Err(err) => return malformed_json_error(err),
+    };
+    let tokens = match req.tokens {
+        Some(tokens) => tokens,
+        None => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "missing_tokenizer_tokens",
+                "/detokenize request requires a tokens field".to_string(),
+                Some("tokens"),
+            )
+        }
+    };
+    let tokenizer = match loaded_tokenizer(&state).await {
+        Ok(tokenizer) => tokenizer,
+        Err(response) => return response,
+    };
+    match tokenizer.decode(&tokens, false) {
+        Ok(content) => (
+            StatusCode::OK,
+            Json(LlamaServerDetokenizeResponse { content }),
         )
             .into_response(),
         Err(err) => api_error(

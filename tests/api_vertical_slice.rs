@@ -168,6 +168,14 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         .unwrap()
         .iter()
         .any(|item| item["id"] == "multi_choice_generation" && item["status"] == "unsupported"));
+    assert!(body["api_features"].as_array().unwrap().iter().any(|item| {
+        item["id"] == "llama_server_tokenizer_aliases"
+            && item["status"] == "partial"
+            && item["notes"]
+                .as_str()
+                .unwrap()
+                .contains("POST /tokenize and POST /detokenize")
+    }));
     let compatibility = body["model_compatibility"].as_array().unwrap();
     let tinyllama = compatibility
         .iter()
@@ -1784,6 +1792,91 @@ async fn tokenizer_encode_decode_endpoints_use_loaded_tokenizer() {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["text"], " hello!");
     assert_eq!(body["token_count"], 2);
+}
+
+#[tokio::test]
+async fn llama_server_tokenize_detokenize_aliases_use_loaded_tokenizer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tokenizer.gguf");
+    write_tokenizer_gguf(&path, "llama", true, false, true);
+
+    let app = camelid::api::router();
+    let body = serde_json::json!({"path": path, "id": "tiny-tokenizer"});
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/models/load")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tokenize")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"content":" hello!"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        body["tokens"].as_array().unwrap(),
+        &[
+            serde_json::json!(6),
+            serde_json::json!(4),
+            serde_json::json!(5)
+        ]
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/detokenize")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"tokens":[3,5]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["content"], " hello!");
+}
+
+#[tokio::test]
+async fn llama_server_tokenize_alias_fails_closed_for_piece_metadata() {
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tokenize")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"content":"hello","with_pieces":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert_eq!(body["error"]["param"], "with_pieces");
 }
 
 #[tokio::test]
