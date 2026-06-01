@@ -5,7 +5,7 @@ import { clampText, formatDate, formatRate } from '../lib/formatters'
 import { getChatGateState } from '../lib/chatGate'
 import { describeModelState, getModelStatusLabel } from '../lib/modelState'
 
-export const GeminiSparkle = ({ className = '', size = 24 }) => (
+export const SparkleIcon = ({ className = '', size = 24 }) => (
   <svg
     className={`gemini-sparkle-icon ${className}`}
     width={size}
@@ -604,7 +604,7 @@ const ChatMessageRow = memo(function ChatMessageRow({ message, generationElapsed
       <div className="message-row-inner">
         {message.role === 'assistant' && (
           <div className="gemini-assistant-avatar-wrapper" aria-hidden="true">
-            <GeminiSparkle size={22} className="gemini-assistant-avatar-sparkle" />
+            <SparkleIcon size={22} className="gemini-assistant-avatar-sparkle" />
           </div>
         )}
         <div className={`message-bubble message-bubble-assistant ${message.role}`}>
@@ -1159,10 +1159,10 @@ export default function ChatWorkspace({
             <div className={`chat-empty-stage chat-empty-stage-clean chat-empty-stage-product is-${readinessState}`}>
               <div className="chat-stage-grid">
                 <div className="chat-stage-main">
-                  {/* Premium Gemini-style Hero Banner */}
+                  {/* Product hero banner */}
                   <div className="chat-empty-hero chat-empty-hero-assistant chat-empty-hero-clean">
                     <div className="gemini-sparkle-greeting-wrapper">
-                      <GeminiSparkle size={56} className="gemini-sparkle-greeting-icon" />
+                      <SparkleIcon size={56} className="gemini-sparkle-greeting-icon" />
                     </div>
                     <h2 className="aurora-text-gradient">{productHeroTitle}</h2>
                     {productHeroSummary && <p className="hero-summary">{productHeroSummary}</p>}
@@ -1212,6 +1212,7 @@ export default function ChatWorkspace({
                       </button>
                     )}
                   </div>
+                  {renderReadinessPills('chat-readiness-empty-stage', 'Fresh chat exact-row readiness')}
                 </div>
 
                 <div className="chat-stage-side">

@@ -9090,6 +9090,10 @@ select:focus {
   color: white;
 }
 
+.chat-readiness-empty-stage {
+  margin-top: 12px;
+}
+
 /* Ambient Backdrop Radial Glow Overlay */
 .chat-empty-clean-glow {
   position: absolute !important;
@@ -9412,6 +9416,5 @@ select:focus {
 .legend-dot.dot-other {
   background: #6b7280;
 }
-
 
 

@@ -4,6 +4,10 @@ Camelid is a Rust-native local GGUF inference backend with an evidence-gated sup
 
 Camelid is not presented as broad Llama, Mistral, Mixtral, distributed, production-throughput, or universal frontend support. If a model row, quantization, context window, comparator result, or UI readiness state is not backed by a cited artifact, it is outside the public v0.1 claim.
 
+![Camelid WebUI chat surface](docs/assets/camelid-readme-chat-surface-dark.png)
+
+The dark, collapsed-rail chat surface is product-forward while still reflecting the local-first runtime contract: chat readiness is exact-row gated by `loaded_now=true`, `generation_ready=true`, and the current compatibility contract.
+
 ## Current Release Boundary
 
 [`SUPPORT_MATRIX_v0.1.md`](SUPPORT_MATRIX_v0.1.md) is the v0.1 release-candidate support contract. It is stricter than the broader repository docs where those docs conflict with current evidence. The short version is:
