@@ -1,12 +1,12 @@
 # Camelid v0.1 Release Candidate Report
 
-Current SHA: `v0.1.0-rc1` tag target after the release-captain signoff refresh
+Current SHA: `d9fb294f47e3ae80291f969499e2240c6cd640c3`
 
 Branch: `release/v0.1-evidence`
 
-Tag candidate: `v0.1.0-rc1`
+Tag: `v0.1.0-rc1`
 
-Release status: release-captain signed off for `v0.1.0-rc1`. The release branch has v0.1 docs, a benchmark harness, a clean-head same-host llama.cpp CPU evidence bundle for one exact row, and release-captain deferrals for llama.cpp Metal, Ollama, and MLX. No final `v0.1.0` tag may be created without Tim approval.
+Release status: release-captain signed off for `v0.1.0-rc1`, and the annotated rc1 tag is pushed. The release branch has v0.1 docs, a benchmark harness, a clean-head same-host llama.cpp CPU evidence bundle for one exact row, and release-captain deferrals for llama.cpp Metal, Ollama, and MLX. No final `v0.1.0` tag may be created without Tim approval.
 
 Supported model rows:
 
@@ -51,13 +51,15 @@ Docs changed:
 
 Tests run: see `RELEASE_GATE_v0.1.md`. Local lightweight gates pass, including `cargo fmt --all -- --check`, clippy, cargo check, full Rust tests, release build, frontend build/model-state smoke, harness self-test, public evidence-claim check, and public scrub guard.
 
+Remote release state: at the 2026-06-01 00:09 UTC observation, `origin/release/v0.1-evidence` and the dereferenced remote tag `v0.1.0-rc1^{}` both pointed to `d9fb294f47e3ae80291f969499e2240c6cd640c3`. This status-only follow-up update does not retarget the rc1 tag. GitHub reported no workflow runs and no commit statuses for that commit at the same observation.
+
 Remaining blockers and risks:
 
 - llama.cpp Metal, Ollama, and MLX fresh baselines are deferred; public docs must keep those non-claims explicit.
 - The clean-head evidence bundle source SHA predates later documentation/evidence-publication commits; no runtime code changes were made after the run.
-- Remote CI still needs normal observation after the pushed signoff commit/tag.
+- Remote CI/status observation returned no runs or statuses for the rc1 commit; this is an observability gap, not a reported CI failure.
 
-Recommendation: create and push `v0.1.0-rc1` from the signed-off release branch. Do not create final `v0.1.0` without Tim approval.
+Recommendation: keep `v0.1.0-rc1` in soak/review and continue remote observation if status signals appear. Do not create final `v0.1.0` without Tim approval.
 
 ## Release Captain Signoff
 
