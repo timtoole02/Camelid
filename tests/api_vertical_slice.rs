@@ -119,8 +119,72 @@ async fn props_reports_public_fail_closed_llama_server_shape() {
 }
 
 #[tokio::test]
+async fn models_reports_public_loaded_model_list_shape() {
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["data"], json!([]));
+    assert_eq!(
+        body["camelid"]["compatibility"],
+        "partial_llama_server_models_read_only"
+    );
+    assert_eq!(body["camelid"]["scope"], "loaded_models_only");
+    assert!(body["camelid"]["unsupported"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item == "models_load"));
+    assert!(body["camelid"]["unsupported"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item == "router_model_cache_listing"));
+
+    let serialized = body.to_string();
+    for forbidden in [
+        "/Users/",
+        "/home/",
+        "file://",
+        "file:\\",
+        "/Volumes/",
+        "/private/tmp/",
+        "C:\\Users\\",
+        "C:/Users/",
+        "\\Users\\",
+    ] {
+        assert!(
+            !serialized.contains(forbidden),
+            "/models must not expose local/private path marker {forbidden:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn native_compatibility_routes_fail_closed_with_typed_errors() {
     let cases = [
+        (
+            "POST",
+            "/models/load",
+            "unsupported_llama_server_models_load",
+            "model",
+        ),
+        (
+            "POST",
+            "/models/unload",
+            "unsupported_llama_server_models_unload",
+            "model",
+        ),
         ("POST", "/props", "unsupported_llama_server_props", "props"),
         ("POST", "/slots", "unsupported_llama_server_slots", "slots"),
         (
@@ -351,6 +415,19 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
                 .contains("POST /tokenize and POST /detokenize")
     }));
     assert!(body["api_features"].as_array().unwrap().iter().any(|item| {
+        item["id"] == "llama_server_models"
+            && item["status"] == "partial"
+            && item["notes"].as_str().unwrap().contains("GET /models")
+            && item["notes"]
+                .as_str()
+                .unwrap()
+                .contains("currently loaded Camelid models")
+            && item["notes"]
+                .as_str()
+                .unwrap()
+                .contains("POST /models/load")
+    }));
+    assert!(body["api_features"].as_array().unwrap().iter().any(|item| {
         item["id"] == "llama_server_props"
             && item["status"] == "partial"
             && item["notes"].as_str().unwrap().contains("GET /props")
@@ -387,6 +464,14 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
             && item["notes"].as_str().unwrap().contains("/v1/embeddings")
             && item["notes"].as_str().unwrap().contains("/v1/responses")
             && item["notes"].as_str().unwrap().contains("/v1/messages")
+            && item["notes"]
+                .as_str()
+                .unwrap()
+                .contains("POST /models/load")
+            && item["notes"]
+                .as_str()
+                .unwrap()
+                .contains("POST /models/unload")
             && item["notes"].as_str().unwrap().contains("POST /slots")
     }));
     let compatibility = body["model_compatibility"].as_array().unwrap();

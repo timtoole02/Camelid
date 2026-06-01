@@ -25,6 +25,8 @@ The current WebUI is product-forward while still reflecting the local-first runt
 
 Nothing adjacent inherits support across size, quantization, tokenizer, context, API surface, or frontend state.
 
+Read-only compatibility discovery routes, including partial llama-server-style model discovery, are not support promotions. They must stay privacy-safe, list only currently loaded public state, and leave router-mode model management, native load/unload, and WebUI readiness locked to the evidence-backed compatibility contract.
+
 ## What v0.1 Is For
 
 Camelid v0.1 is a release candidate for reviewers who care about reproducible local-inference evidence:

@@ -241,10 +241,18 @@ Tim's 2026-05-31 product decision is to do both: preserve Camelid's honest OpenA
 Sequenced plan:
 
 1. Keep `/v1/models`, `/v1/completions`, `/v1/chat/completions`, streaming, cancellation behavior, errors, `/api/capabilities`, docs, and frontend readiness as the stable contract. Unsupported OpenAI fields stay typed errors until implemented and tested.
-2. Grow read-only llama-server discovery first: `/props`, `/slots`, health/model metadata, and WebUI probes may expose public readiness state, but local paths stay redacted and readiness fails closed unless the loaded exact row is contract-supported and generation-ready.
+2. Grow read-only llama-server discovery first: `/props`, `/slots`, `/models`, health/model metadata, and WebUI probes may expose public readiness state, but local paths stay redacted and readiness fails closed unless the loaded exact row is contract-supported and generation-ready. `/models` is limited to currently loaded Camelid models until router-mode cache listing, reload/autoload, native load/unload, and model-source metadata are designed.
 3. Keep tokenizer/control-plane utilities bounded: `/tokenize`, `/detokenize`, and `/apply-template` may work for loaded supported tokenizer/template lanes only; piece metadata, arbitrary template kwargs, prompt-cache metadata, and slot lifecycle actions remain unsupported until real semantics exist.
 4. Add native generation compatibility only after request mapping is explicit: `/completion` must translate supported llama-server parameters onto Camelid's generation path without weakening the OpenAI subset, and unsupported sampler, cache, image, infill, and tool fields must remain typed errors.
 5. Defer embeddings, reranking, Responses, Messages, multimodal routes, LoRA, metrics, router-mode model management, and full WebUI parity until backend support, route semantics, tests, capabilities text, docs, and frontend gates all move together.
+
+Current gap sequence as of 2026-06-01:
+
+1. Discovery parity: keep `/health`, `/v1/health`, `/props`, `/slots`, `/models`, `/v1/models`, `/v1/models/:model`, `/api/capabilities`, and frontend readiness fail-closed, privacy-safe, and tested before expanding writable control routes.
+2. Tokenizer/template utilities: preserve loaded-model-only `/tokenize`, `/detokenize`, and `/apply-template`; add piece metadata, template kwargs, and richer error mapping only with tokenizer fixtures and capability text.
+3. Native generation: map a narrow `/completion` request subset to the existing Camelid generation path only after sampler/stop/stream/timing/cancellation behavior is specified and unsupported fields stay typed.
+4. WebUI control plane: add only probes that are read-only and support-contract-aware; keep slot cache actions, prompt-cache metadata, metrics, sleep/idle, router reload/autoload, and native model load/unload unsupported until semantics and tests exist.
+5. Deferred runtime surfaces: embeddings, reranking, infill, multimodal inputs, LoRA adapters, router-mode model management, Responses/Messages, and broad llama-server WebUI parity remain blocked until backend support, docs, capabilities, and frontend gates move together.
 
 ### Performance, packaging, and portability
 

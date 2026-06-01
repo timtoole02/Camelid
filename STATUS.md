@@ -1,12 +1,14 @@
 # Camelid Status
 
-Last updated: 2026-05-31
+Last updated: 2026-06-01
 
 `STATUS.md` is Camelid's current release-evidence checkpoint. It records what Camelid can prove today, what moved recently, and what still blocks the next support change. Treat it as a briefing memo, not a diary. Detailed historical run logs, older validation slices, and superseded tactical notes now live in [`STATUS_ARCHIVE_2026-04.md`](STATUS_ARCHIVE_2026-04.md).
 
 Use this file to answer three practical questions: what is supported now, what changed recently, and what still blocks the next support move?
 
 War-room claim discipline: [`docs/WAR_ROOM_EVIDENCE_INDEX.md`](docs/WAR_ROOM_EVIDENCE_INDEX.md) records the public source-of-truth order and minimum evidence checklist for support, benchmark, API capability, and WebUI readiness wording. It does not promote any row or feature by itself; it keeps this status memo, `COMPATIBILITY.md`, `BENCHMARKS.md`, `/api/capabilities`, and frontend readiness copy tied to scrubbed evidence.
+
+Current API capability guard: read-only llama-server model discovery may be described only as partial when focused tests prove `GET /models` returns currently loaded Camelid models with local paths redacted. Router-mode cache listing, reload/autoload, native `POST /models/load`, native `POST /models/unload`, multimodal architecture metadata, and full llama-server model-management parity remain unsupported, and this discovery route does not change WebUI readiness or exact-row support status.
 
 Executive summary: Camelid has API + frontend exact-row validation for the Llama 3.2 1B, Llama 3.2 3B, and Llama 3 8B Q8_0 rows within their checked envelopes, with TinyLlama Q8_0 still the baseline gate. Llama 3.2 1B retains bounded 512/1024/2048/4096/8192-context packs where row-specific PASS bundles are cited; Llama 3.2 3B is supported only as exact-row smoke, with canonical Ubuntu API/WebUI refresh at source head `e9f926ed1a65` plus bounded 512/1024/2048-context packs where row-specific PASS bundles are cited; Llama 3 8B is promoted through exact-row smoke plus checked bounded 512/1024/2048-context packs where row-specific PASS artifacts are cited; Mistral 7B Instruct v0.3 remains active validation only, with tokenizer/template, 1-token, broader 50-token, checked 512/1024/2048/4096/8192-context, and fail-closed API/WebUI/RSS evidence, but no support promotion. Mixtral-8x7B-Instruct-v0.1 Q8_0 has bounded one-token backend MoE runtime evidence only; Gate 9A later-generation evidence diverges and the continuation lane recorded a backend HTTP hang, so no Mixtral API/WebUI/frontend readiness or broad support claim is active. The public support boundary moves only for supported exact rows and only for validated local-chat/parity envelopes; broad-family support, model-native/larger contexts beyond checked packs, arbitrary template execution beyond row-scoped renderer/template evidence, production throughput, and portability remain outside the support claim.
 

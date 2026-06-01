@@ -437,6 +437,46 @@ pub struct LlamaServerApplyTemplateResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub struct LlamaServerModelListResponse {
+    pub data: Vec<LlamaServerModelListItem>,
+    pub camelid: LlamaServerModelListCamelid,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LlamaServerModelListItem {
+    pub id: String,
+    pub path: Option<String>,
+    pub status: LlamaServerModelStatus,
+    pub architecture: LlamaServerModelArchitecture,
+    pub camelid: LlamaServerModelCamelid,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LlamaServerModelStatus {
+    pub value: &'static str,
+    pub args: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LlamaServerModelArchitecture {
+    pub input_modalities: Vec<&'static str>,
+    pub output_modalities: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LlamaServerModelCamelid {
+    pub generation_ready: bool,
+    pub model_path_redacted: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LlamaServerModelListCamelid {
+    pub compatibility: &'static str,
+    pub scope: &'static str,
+    pub unsupported: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct LlamaServerPropsResponse {
     pub default_generation_settings: LlamaServerDefaultGenerationSettings,
     pub total_slots: u32,
@@ -898,6 +938,12 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/tokenize", post(llama_server_tokenize))
         .route("/detokenize", post(llama_server_detokenize))
         .route("/apply-template", post(llama_server_apply_template))
+        .route("/models", get(llama_server_models))
+        .route("/models/load", post(unsupported_llama_server_models_load))
+        .route(
+            "/models/unload",
+            post(unsupported_llama_server_models_unload),
+        )
         .route(
             "/props",
             get(llama_server_props).post(unsupported_llama_server_props),
@@ -970,6 +1016,61 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         q8_runtime: q8_runtime_health(),
         execution_plan,
     })
+}
+
+async fn llama_server_models(State(state): State<AppState>) -> Json<LlamaServerModelListResponse> {
+    let loaded = state.loaded_models.read().await;
+    let data = loaded
+        .values()
+        .map(|model| LlamaServerModelListItem {
+            id: model.id.clone(),
+            path: None,
+            status: LlamaServerModelStatus {
+                value: "loaded",
+                args: Vec::new(),
+            },
+            architecture: LlamaServerModelArchitecture {
+                input_modalities: vec!["text"],
+                output_modalities: vec!["text"],
+            },
+            camelid: LlamaServerModelCamelid {
+                generation_ready: loaded_model_generation_ready(model),
+                model_path_redacted: true,
+            },
+        })
+        .collect();
+
+    Json(LlamaServerModelListResponse {
+        data,
+        camelid: LlamaServerModelListCamelid {
+            compatibility: "partial_llama_server_models_read_only",
+            scope: "loaded_models_only",
+            unsupported: vec![
+                "router_model_cache_listing",
+                "models_reload",
+                "models_autoload",
+                "models_load",
+                "models_unload",
+                "multimodal_architecture_metadata",
+            ],
+        },
+    })
+}
+
+async fn unsupported_llama_server_models_load() -> Response {
+    unsupported_route(
+        "unsupported_llama_server_models_load",
+        "POST /models/load is not supported yet; Camelid keeps native llama-server router-mode model loading separate from the stable /api/models/load path until cache listing, autoload, and support-contract behavior are implemented and tested",
+        Some("model"),
+    )
+}
+
+async fn unsupported_llama_server_models_unload() -> Response {
+    unsupported_route(
+        "unsupported_llama_server_models_unload",
+        "POST /models/unload is not supported yet; Camelid keeps native llama-server router-mode model unloading separate from the stable /api/models/unload path until router semantics and support-contract behavior are implemented and tested",
+        Some("model"),
+    )
 }
 
 async fn llama_server_props(State(state): State<AppState>) -> Json<LlamaServerPropsResponse> {
@@ -1731,6 +1832,11 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 notes: "POST /tokenize and POST /detokenize are bounded loaded-model tokenizer aliases that return token ids/text only; piece metadata remains unsupported",
             },
             SupportItem {
+                id: "llama_server_models",
+                status: "partial",
+                notes: "GET /models returns a privacy-safe read-only list of currently loaded Camelid models with redacted paths and text-only architecture metadata. Router-mode cache listing, reload/autoload, POST /models/load, POST /models/unload, multimodal metadata, and full llama-server model-management parity remain unsupported.",
+            },
+            SupportItem {
                 id: "llama_server_props",
                 status: "partial",
                 notes: "GET /props returns read-only public server properties, default generation settings, chat-template metadata when a model is loaded, and fail-closed Camelid readiness notes. Local model paths are intentionally redacted, POST /props is unsupported, and this does not imply slot lifecycle, /completion, embeddings, or full llama-server WebUI parity.",
@@ -1748,7 +1854,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "fail_closed_native_compatibility_routes",
                 status: "unsupported",
-                notes: "Native /completion, /embedding, /embeddings, /v1/embeddings, /v1/messages, /rerank, /reranking, /v1/rerank, /v1/reranking, /v1/responses, POST /slots, and slot cache actions return typed not_implemented errors until real route semantics and backend support exist.",
+                notes: "Native /completion, /embedding, /embeddings, /v1/embeddings, /v1/messages, /rerank, /reranking, /v1/rerank, /v1/reranking, /v1/responses, POST /models/load, POST /models/unload, POST /slots, and slot cache actions return typed not_implemented errors until real route semantics and backend support exist.",
             },
             SupportItem {
                 id: "multi_choice_generation",
