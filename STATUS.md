@@ -1,6 +1,6 @@
 # Camelid Status
 
-Last updated: 2026-05-23
+Last updated: 2026-06-01
 
 `STATUS.md` is Camelid's current release-evidence checkpoint. It records what Camelid can prove today, what moved recently, and what still blocks the next support change. Treat it as a briefing memo, not a diary. Detailed historical run logs, older validation slices, and superseded tactical notes now live in [`STATUS_ARCHIVE_2026-04.md`](STATUS_ARCHIVE_2026-04.md).
 
@@ -13,7 +13,7 @@ Executive summary: Camelid has API + frontend exact-row validation for the Llama
 | Exact row | What is now worth showing off | Highest checked context story | Hard stop / missing proof |
 | --- | --- | --- | --- |
 | TinyLlama 1.1B Chat Q8_0 | The full current gate is refreshed with parity, template-shape, context, API/WebUI, and RSS/perf evidence. | Bounded 512-context pack is green for this exact row. | No blocker for the current supported claim; keep rerunning on support-contract changes. |
-| Llama 3.2 1B Instruct Q8_0 | Exact-row verified support moved beyond a demo: API, WebUI, compact/broader parity, exact-row metadata-Jinja row-template parity, bounded template-shapes, unique-chat RSS/perf, and post-fix 2048 evidence all agree. | 512, 1024, 2048, 4096, and 8192 bounded packs are green; 2048 is green only after the RoPE frequency-factor fix, 4096 is green on source/runtime head `470388f8165b`, and 8192 is green on source/runtime head `aaf9207d1669` for the compact-template recall pack. | Broader/full support still needs model-native/larger context, broader arbitrary-template coverage beyond the supported 1B metadata-Jinja row template, production throughput, portability, and durable full-support normalization. |
+| Llama 3.2 1B Instruct Q8_0 | Exact-row smoke support moved beyond a demo: API, WebUI, compact/broader parity, exact-row metadata-Jinja row-template parity, bounded template-shapes, unique-chat RSS/perf, and post-fix 2048 evidence all agree. | 512, 1024, 2048, 4096, and 8192 bounded packs are green; 2048 is green only after the RoPE frequency-factor fix, 4096 is green on source/runtime head `470388f8165b`, and 8192 is green on source/runtime head `aaf9207d1669` for the compact-template recall pack. | Broader/full support still needs model-native/larger context, broader arbitrary-template coverage beyond the supported 1B metadata-Jinja row template, production throughput, portability, and durable full-support normalization. |
 | Llama 3.2 3B Instruct Q8_0 | Exact-row smoke support is refreshed by the canonical Ubuntu source-head API/WebUI artifact: load, `/v1/completions`, `/v1/chat/completions`, `/api/capabilities`, frontend smoke, compact/broader parity, five-prompt API smoke, row-scoped metadata-Jinja/template-shape evidence, bounded unique-chat perf/RSS, and the opt-in parallel Q8 first-token direction probe all agree inside the documented envelope. | 512, 1024, and 2048 bounded packs are green for this exact row; the canonical Ubuntu API/WebUI support-gate refresh is `qa/evidence-bundles/llama32-3b-api-webui-current-head-20260513T2005Z-head-e9f926e/manifest.json`. | Broader/full support still needs model-native/larger context beyond checked packs, broader arbitrary/Jinja template coverage beyond the row-scoped renderer/template-shape evidence, production throughput beyond bounded perf/RSS and the direction probe, portability, and durable full-support normalization. |
 | Llama 3 8B Instruct Q8_0 | The 8B row is no longer groundwork-only: compact parity, broader 50-token parity, API/WebUI, checked 512/1024/2048-context packs, compact template-shapes, memory evidence, structured Q8 read counters, and hot-path measurements are public. | 512/1024/2048 bounded packs are green for this exact row where row-specific PASS artifacts are cited, with 1024/2048 tied to source/runtime head `8e26be0a73c0`. | Hard boundary: no model-native/larger context beyond checked packs, broad 8B/Llama support, arbitrary templates, production throughput, portability, or neighboring-row/context promotion without row-specific evidence. |
 | Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf | Active validation / partial backend runtime only: bounded one-token MoE evidence exists, but Gate 9A 50-token evidence diverges and the longer-continuation backend HTTP hang remains unresolved. | One-token backend runtime only; no API/WebUI/RSS/frontend readiness or context bucket is promoted. | Hard blocker: fix later-generation divergence and continuation hang before any Mixtral support/readiness claim. |
@@ -22,7 +22,7 @@ This is the repo story in one sentence: Camelid preserves one trusted small-mode
 
 Active work now splits into two explicit tracks:
 
-- **Four-row hardening:** keep TinyLlama as the current full gate, keep Llama 3.2 1B/3B and Llama 3 8B labeled as exact-row verified support within validated bounds until they meet the harder normalized bar, and treat CI reliability as a release blocker rather than a best-effort signal.
+- **Four-row hardening:** keep TinyLlama as the current full gate, keep Llama 3.2 1B/3B and Llama 3 8B labeled as supported exact-row smoke within validated bounds until they meet the harder normalized bar, and treat CI reliability as a release blocker rather than a best-effort signal.
 - **Active next-model bring-up set:** Camelid is publicly working on exact next-family rows, with Mistral still fail-closed and Qwen/Gemma as follow-on candidates.
   - `Mistral-7B-Instruct-v0.3.Q8_0.gguf` — immediate closure lane; tokenizer/template, 1-token generation, broader five-prompt/50-token parity, bounded 512/1024/2048, checked 4096/8192 context evidence, and fail-closed API/WebUI/RSS evidence are green, but support remains fail-closed pending explicit contract promotion and synchronized support surfaces.
   - `Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf` — active validation / partial backend runtime only; bounded one-token MoE evidence exists, but Gate 9A later-generation divergence and the continuation backend HTTP hang block API/WebUI/frontend readiness and support promotion.
@@ -43,7 +43,7 @@ Reading rule for the matrix: each row should answer three questions in plain Eng
 
 For a fast read, the current answer is:
 
-- **Verified support gates:** TinyLlama 1.1B Chat Q8_0 remains verified, and the exact Llama 3.2 1B plus Llama 3 8B Instruct Q8_0 rows have verified support within their validated bounds. Llama 3.2 3B Instruct Q8_0 is supported as exact-row smoke only after canonical Ubuntu source-head load, completion, chat-completion, frontend validation, API capability, and parity evidence aligned.
+- **Support gates:** TinyLlama 1.1B Chat Q8_0 remains the verified full gate, and the exact Llama 3.2 1B, Llama 3.2 3B, and Llama 3 8B Instruct Q8_0 rows are supported as exact-row smoke only within their validated bounds.
 - **Scope boundary:** Llama support is exact-row only: model version/size, Instruct variant, Q8_0 quantization, loaded runtime readiness, and the tested smoke/parity envelope all matter.
 - **8B promotion:** Llama 3 8B Instruct Q8_0 has end-to-end bounded generation parity artifacts for compact parity, a three-prompt 50-token Ubuntu parity run, the bounded compact chat-template-shapes pack, API/frontend smoke, bounded-memory evidence, and checked 512/1024/2048-context packs for the exact tracked Q8_0 GGUF. The current-head 1024/2048 canonical pass at `qa/evidence-bundles/llama3-8b-context-1024-2048-current-head-20260509T041451Z-head-8e26be0a73c0/manifest.json` matched prompt tokens, generated token IDs, and generated text (`CMLD-102` / `CMLD-204`) for source/runtime head `8e26be0a73c0`; earlier `b49034007f2e`, `9e3c64f2cfab`, `160348118d44`, `9f8588bb4a4e`, `844e8d4709d1`, `86081876d01e`, and `e203d3cf3ea5` passes remain historical source-head evidence.
 - **Explicit non-claim:** no broad Llama-family support exists today; neighboring variants remain unsupported unless they have their own exact row and evidence.
@@ -55,7 +55,7 @@ Two standing rules apply to every row:
 
 For the formal support ledger, see [`COMPATIBILITY.md`](COMPATIBILITY.md). For sequencing, see [`ROADMAP.md`](ROADMAP.md).
 
-Bottom line for reviewers: Camelid has the original TinyLlama verified support gate plus three exact Llama Q8_0 rows with verified support within validated bounds. Mixtral remains partial runtime evidence only until later-generation divergence and API/WebUI/frontend readiness blockers close.
+Bottom line for reviewers: Camelid has the original TinyLlama verified support gate plus three exact Llama Q8_0 rows supported as exact-row smoke within validated bounds. Mixtral remains partial runtime evidence only until later-generation divergence and API/WebUI/frontend readiness blockers close.
 
 ## Apple Silicon Q8 speed snapshot
 
