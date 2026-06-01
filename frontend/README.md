@@ -12,6 +12,7 @@ The backend data hook is adapted for Camelid's current API surface:
 - lists `GET /v1/models`
 - treats `/v1/models` public `meta` fields as descriptive model-shape and quant metadata only; those fields must not expose local paths and must not unlock support or chat readiness by themselves
 - does not use native llama-server `/models` discovery, router-mode load/unload route presence, or model-management metadata to unlock chat; WebUI readiness still comes only from the exact `/api/capabilities` row plus `/v1/health` runtime state
+- treats native llama-server `/completion` compatibility as an API capability row only; the frontend chat path remains `/v1/chat/completions` and native route presence does not unlock WebUI readiness
 - loads local GGUF paths through `POST /api/models/load`
 - reads the support contract from `GET /api/capabilities`
 - shows the support gate, current compatibility row, model-family/quantization evidence, and guarded API feature rows directly in chat, model setup, per-model/catalog cards, API, analytics, and system surfaces

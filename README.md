@@ -25,7 +25,7 @@ The current WebUI is product-forward while still reflecting the local-first runt
 
 Nothing adjacent inherits support across size, quantization, tokenizer, context, API surface, or frontend state.
 
-Read-only compatibility discovery routes, including partial llama-server-style model discovery, are not support promotions. They must stay privacy-safe, list only currently loaded public state, and leave router-mode model management, native load/unload, and WebUI readiness locked to the evidence-backed compatibility contract.
+Compatibility routes, including partial llama-server-style model discovery and the narrow non-streaming native `/completion` alias, are not support promotions. They must stay privacy-safe where they expose public state, leave router-mode model management, native load/unload, streaming native completion, and WebUI readiness locked to the evidence-backed compatibility contract, and never broaden exact-row support by route presence alone.
 
 ## What v0.1 Is For
 
