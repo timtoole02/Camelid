@@ -1985,7 +1985,7 @@ async fn completions(
     let req = match payload {
         Ok(Json(value)) => match completion_request_from_value(value) {
             Ok(req) => req,
-            Err(response) => return response,
+            Err(response) => return *response,
         },
         Err(err) => return malformed_json_error(err),
     };
@@ -2083,7 +2083,7 @@ async fn chat_completions(
     let req = match payload {
         Ok(Json(value)) => match chat_completion_request_from_value(value) {
             Ok(req) => req,
-            Err(response) => return response,
+            Err(response) => return *response,
         },
         Err(err) => return malformed_json_error(err),
     };
@@ -2164,51 +2164,51 @@ async fn chat_completions(
 
 fn completion_request_from_value(
     value: serde_json::Value,
-) -> std::result::Result<CompletionRequest, Response> {
+) -> std::result::Result<CompletionRequest, Box<Response>> {
     if let Some(prompt) = value.get("prompt") {
         if !prompt.is_string() && !prompt.is_null() {
-            return Err(api_error(
+            return Err(Box::new(api_error(
                 StatusCode::BAD_REQUEST,
                 "unsupported_prompt_shape",
                 "/v1/completions currently supports prompt as one string; token arrays, mixed arrays, and batch prompt arrays are unsupported. Use camelid_prompt_token_ids only for Camelid diagnostic token input.".to_string(),
                 Some("prompt"),
-            ));
+            )));
         }
     }
     serde_json::from_value(value).map_err(|err| {
-        api_error(
+        Box::new(api_error(
             StatusCode::BAD_REQUEST,
             "malformed_json",
             err.to_string(),
             None,
-        )
+        ))
     })
 }
 
 fn chat_completion_request_from_value(
     value: serde_json::Value,
-) -> std::result::Result<ChatCompletionRequest, Response> {
+) -> std::result::Result<ChatCompletionRequest, Box<Response>> {
     if let Some(messages) = value.get("messages").and_then(serde_json::Value::as_array) {
         for message in messages {
             if let Some(content) = message.get("content") {
                 if !content.is_string() {
-                    return Err(api_error(
+                    return Err(Box::new(api_error(
                         StatusCode::BAD_REQUEST,
                         "unsupported_content_type",
                         "Camelid chat generation is text-only today; OpenAI content parts, image_url payloads, and other multimodal message content are unsupported.".to_string(),
                         Some("messages"),
-                    ));
+                    )));
                 }
             }
         }
     }
     serde_json::from_value(value).map_err(|err| {
-        api_error(
+        Box::new(api_error(
             StatusCode::BAD_REQUEST,
             "malformed_json",
             err.to_string(),
             None,
-        )
+        ))
     })
 }
 

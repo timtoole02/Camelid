@@ -4175,14 +4175,20 @@ fn q8_projection_route_telemetry_records_layer_route_bucket() {
     );
 
     let telemetry = snapshot_q8_schedule_telemetry();
-    assert_eq!(telemetry.output_projection_calls, 2);
     assert_eq!(telemetry.ffn_gate_up_decode_consumer_taken, 0);
     assert_eq!(telemetry.ffn_gate_up_decode_fused_activation_taken, 0);
     assert_eq!(telemetry.ffn_gate_up_decode_consumer_activation_us, 0);
     assert_eq!(telemetry.ffn_gate_up_decode_consumer_tensor_us, 0);
-    assert!(telemetry
+    let route = telemetry
         .output_projection_by_route
-        .contains_key("ffn_down.mac_decode_consumer"));
+        .get("ffn_down.mac_decode_consumer")
+        .expect("route telemetry");
+    assert_eq!(route.calls, 1);
+    let logits_route = telemetry
+        .output_projection_by_route
+        .get("logits.q8_0_retained_blocks")
+        .expect("logits route telemetry");
+    assert_eq!(logits_route.calls, 1);
     let layer_route = telemetry
         .output_projection_by_layer_route
         .get("layer_21.ffn_down.mac_decode_consumer")
