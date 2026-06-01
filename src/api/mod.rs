@@ -407,6 +407,71 @@ pub struct LlamaServerDetokenizeResponse {
     pub content: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct LlamaServerPropsResponse {
+    pub default_generation_settings: LlamaServerDefaultGenerationSettings,
+    pub total_slots: u32,
+    pub model_path: Option<String>,
+    pub model_id: Option<String>,
+    pub chat_template: Option<String>,
+    pub chat_template_caps: serde_json::Value,
+    pub modalities: LlamaServerModalities,
+    pub build_info: &'static str,
+    pub is_sleeping: bool,
+    pub camelid: LlamaServerPropsCamelid,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LlamaServerDefaultGenerationSettings {
+    pub id: u32,
+    pub id_task: i32,
+    pub n_ctx: u32,
+    pub speculative: bool,
+    pub is_processing: bool,
+    pub params: LlamaServerDefaultGenerationParams,
+    pub prompt: &'static str,
+    pub next_token: LlamaServerNextTokenProps,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LlamaServerDefaultGenerationParams {
+    pub n_predict: i32,
+    pub seed: u32,
+    pub temperature: f32,
+    pub top_k: u32,
+    pub top_p: f32,
+    pub presence_penalty: f32,
+    pub frequency_penalty: f32,
+    pub stop: Vec<String>,
+    pub max_tokens: i32,
+    pub ignore_eos: bool,
+    pub stream: bool,
+    pub n_probs: u32,
+    pub samplers: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LlamaServerNextTokenProps {
+    pub has_next_token: bool,
+    pub has_new_line: bool,
+    pub n_remain: i32,
+    pub n_decoded: u32,
+    pub stopping_word: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LlamaServerModalities {
+    pub vision: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LlamaServerPropsCamelid {
+    pub compatibility: &'static str,
+    pub generation_ready: bool,
+    pub model_path_redacted: bool,
+    pub unsupported: Vec<&'static str>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct GenerationSessionRequest {
     pub model: Option<String>,
@@ -777,6 +842,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/api/models/tokenizer/decode", post(tokenizer_decode))
         .route("/tokenize", post(llama_server_tokenize))
         .route("/detokenize", post(llama_server_detokenize))
+        .route("/props", get(llama_server_props))
         .route(
             "/api/generation/sessions",
             get(generation_sessions).post(create_generation_session),
@@ -830,6 +896,75 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         active_model_id: active_id_lock.clone(),
         q8_runtime: q8_runtime_health(),
         execution_plan,
+    })
+}
+
+async fn llama_server_props(State(state): State<AppState>) -> Json<LlamaServerPropsResponse> {
+    let active_id_lock = state.active_model_id.read().await;
+    let loaded_models = state.loaded_models.read().await;
+    let model = active_id_lock.as_ref().and_then(|id| loaded_models.get(id));
+    let generation_ready = model.is_some_and(loaded_model_generation_ready);
+    let n_ctx = model
+        .and_then(|model| model.llama_config.as_ref())
+        .map(|config| config.context_length)
+        .unwrap_or(0);
+    let chat_template = model
+        .and_then(|model| model.tokenizer_runtime.as_ref())
+        .and_then(|tokenizer| tokenizer.chat_template.clone());
+    let model_id = model.map(|model| model.id.clone());
+
+    Json(LlamaServerPropsResponse {
+        default_generation_settings: LlamaServerDefaultGenerationSettings {
+            id: 0,
+            id_task: -1,
+            n_ctx,
+            speculative: false,
+            is_processing: false,
+            params: LlamaServerDefaultGenerationParams {
+                n_predict: -1,
+                seed: u32::MAX,
+                temperature: 0.0,
+                top_k: 0,
+                top_p: 1.0,
+                presence_penalty: 0.0,
+                frequency_penalty: 0.0,
+                stop: Vec::new(),
+                max_tokens: -1,
+                ignore_eos: false,
+                stream: true,
+                n_probs: 0,
+                samplers: vec!["greedy"],
+            },
+            prompt: "",
+            next_token: LlamaServerNextTokenProps {
+                has_next_token: generation_ready,
+                has_new_line: false,
+                n_remain: -1,
+                n_decoded: 0,
+                stopping_word: "",
+            },
+        },
+        total_slots: 1,
+        model_path: None,
+        model_id,
+        chat_template,
+        chat_template_caps: serde_json::json!({}),
+        modalities: LlamaServerModalities { vision: false },
+        build_info: "camelid",
+        is_sleeping: false,
+        camelid: LlamaServerPropsCamelid {
+            compatibility: "partial_llama_server_props_read_only",
+            generation_ready,
+            model_path_redacted: true,
+            unsupported: vec![
+                "post_props",
+                "slots",
+                "native_completion",
+                "embeddings",
+                "reranking",
+                "multimodal",
+            ],
+        },
     })
 }
 
@@ -1388,6 +1523,11 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 id: "llama_server_tokenizer_aliases",
                 status: "partial",
                 notes: "POST /tokenize and POST /detokenize are bounded loaded-model tokenizer aliases that return token ids/text only; piece metadata remains unsupported",
+            },
+            SupportItem {
+                id: "llama_server_props",
+                status: "partial",
+                notes: "GET /props returns read-only public server properties, default generation settings, chat-template metadata when a model is loaded, and fail-closed Camelid readiness notes. Local model paths are intentionally redacted, POST /props is unsupported, and this does not imply /slots, /completion, embeddings, or full llama-server WebUI parity.",
             },
             SupportItem {
                 id: "multi_choice_generation",

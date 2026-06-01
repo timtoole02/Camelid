@@ -63,6 +63,62 @@ async fn capabilities_public_contract_omits_local_private_paths() {
 }
 
 #[tokio::test]
+async fn props_reports_public_fail_closed_llama_server_shape() {
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/props")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["total_slots"], 1);
+    assert_eq!(body["model_path"], Value::Null);
+    assert_eq!(body["model_id"], Value::Null);
+    assert_eq!(body["chat_template"], Value::Null);
+    assert_eq!(body["default_generation_settings"]["n_ctx"], 0);
+    assert_eq!(
+        body["default_generation_settings"]["next_token"]["has_next_token"],
+        false
+    );
+    assert_eq!(
+        body["camelid"]["compatibility"],
+        "partial_llama_server_props_read_only"
+    );
+    assert_eq!(body["camelid"]["generation_ready"], false);
+    assert_eq!(body["camelid"]["model_path_redacted"], true);
+    assert!(body["camelid"]["unsupported"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item == "native_completion"));
+
+    let serialized = body.to_string();
+    for forbidden in [
+        "/Users/",
+        "/home/",
+        "file://",
+        "file:\\",
+        "/Volumes/",
+        "/private/tmp/",
+        "C:\\Users\\",
+        "C:/Users/",
+        "\\Users\\",
+    ] {
+        assert!(
+            !serialized.contains(forbidden),
+            "/props must not expose local/private path marker {forbidden:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn capabilities_report_support_contract_and_planned_lanes() {
     let app = camelid::api::router();
     let response = app
@@ -175,6 +231,15 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
                 .as_str()
                 .unwrap()
                 .contains("POST /tokenize and POST /detokenize")
+    }));
+    assert!(body["api_features"].as_array().unwrap().iter().any(|item| {
+        item["id"] == "llama_server_props"
+            && item["status"] == "partial"
+            && item["notes"].as_str().unwrap().contains("GET /props")
+            && item["notes"]
+                .as_str()
+                .unwrap()
+                .contains("Local model paths are intentionally redacted")
     }));
     let compatibility = body["model_compatibility"].as_array().unwrap();
     let tinyllama = compatibility
