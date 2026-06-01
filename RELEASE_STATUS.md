@@ -1,16 +1,18 @@
 # Camelid v0.1 Release Status
 
-Last updated: 2026-05-31
+Last updated: 2026-05-31 local / 2026-06-01 UTC
 
 Branch: `release/v0.1-evidence`
 
 Current QA repair SHA: `3001fa48e3d5fa41dbeca417dd511164a3bacc80`
 
+Current release branch head SHA: `5017ff28568dc1898fa490b4492848a1b3c022f0`
+
 Current `v0.1.0-rc1` tag target: `d9fb294f47e3ae80291f969499e2240c6cd640c3`
 
 Release target: `v0.1.0-rc1`
 
-Release posture: the release branch now contains a post-rc1 QA repair at `3001fa48e3d5fa41dbeca417dd511164a3bacc80`. The existing `v0.1.0-rc1` tag still points to `d9fb294f47e3ae80291f969499e2240c6cd640c3` and has not been moved. A clean-head llama.cpp CPU comparator bundle exists for one exact row, with llama.cpp Metal, Ollama, and MLX explicitly deferred. Final `v0.1.0` remains Tim-approval gated, and a Tim decision is needed before treating the post-rc1 branch head as the final release candidate.
+Release posture: the release branch head is `5017ff28568dc1898fa490b4492848a1b3c022f0` and includes the post-rc1 QA repair at `3001fa48e3d5fa41dbeca417dd511164a3bacc80` plus release-status blocker documentation. The existing `v0.1.0-rc1` tag still points to `d9fb294f47e3ae80291f969499e2240c6cd640c3` and has not been moved. A clean-head llama.cpp CPU comparator bundle exists for one exact row, with llama.cpp Metal, Ollama, and MLX explicitly deferred. Final `v0.1.0` remains Tim-approval gated, and a Tim decision is needed before treating the repaired branch head as the active release candidate.
 
 ## Latest Release Captain Update
 
@@ -19,25 +21,21 @@ Camelid v0.1 update:
 Shipped:
 
 - Re-verified the clean release worktree on branch `release/v0.1-evidence`; the dirty primary checkout was not modified.
-- Found real QA drift after `v0.1.0-rc1`: the frontend integration smoke no longer saw the runtime-ready/support-gated empty-state blocker, and the README screenshot guard failed because the v0.1 README rewrite had dropped the approved screenshot.
-- Restored the fresh-chat exact-row readiness pills so runtime-ready-but-support-gated rows visibly show `Runtime ready, support gated` plus the exact artifact blocker.
-- Restored the approved README chat screenshot with boundary-safe caption text.
-- Updated the frontend integration smoke to assert the current sendable empty-state hero copy and removed competitor-branded component/comment source text caught by the UI smoke.
-- Committed the QA repair as `3001fa48e3d5fa41dbeca417dd511164a3bacc80`.
+- Confirmed local branch head and `origin/release/v0.1-evidence` at `5017ff28568dc1898fa490b4492848a1b3c022f0`.
+- Re-ran the branch-head release gate refresh after the post-rc1 QA repair and hosted-CI blocker note.
 - Kept comparator deferrals unchanged: llama.cpp Metal, Ollama, and MLX remain non-claims.
 - Did not move the existing annotated `v0.1.0-rc1` tag and did not create final `v0.1.0`.
 
 Evidence:
 
-- Gate-refresh timestamp: 2026-06-01 00:43-00:50 UTC.
-- Branch/remote observation before the QA repair: `release/v0.1-evidence` and `origin/release/v0.1-evidence` at `4b6787c2d51788cd7839f0ac462d1b2767aa82c9`.
+- Gate-refresh timestamp: 2026-06-01 01:17-01:22 UTC.
+- Branch/remote observation: `release/v0.1-evidence` and `origin/release/v0.1-evidence` at `5017ff28568dc1898fa490b4492848a1b3c022f0`.
 - Remote tag observation: `git ls-remote --tags origin 'v0.1.0-rc1^{}'` returned `d9fb294f47e3ae80291f969499e2240c6cd640c3`.
 - Local annotated tag object: `v0.1.0-rc1`, tagger date 2026-05-31 13:09:59 -0700, target `d9fb294f47e3ae80291f969499e2240c6cd640c3`.
-- GitHub connector observation for `d9fb294f47e3ae80291f969499e2240c6cd640c3` and `4b6787c2d51788cd7839f0ac462d1b2767aa82c9`: zero workflow runs and zero commit statuses returned.
+- `git describe --tags --exact-match HEAD` failed with `fatal: no tag exactly matches '5017ff28568dc1898fa490b4492848a1b3c022f0'`, confirming branch head is not tagged.
+- GitHub connector observation for `5017ff28568dc1898fa490b4492848a1b3c022f0` and `d9fb294f47e3ae80291f969499e2240c6cd640c3`: zero workflow runs and zero commit statuses returned.
 - Workflow trigger audit: `.github/workflows/ci.yml` runs on `push` to `main`, `pull_request`, and `workflow_dispatch`; release-branch pushes do not automatically start CI.
-- Public Actions API observation for branch `release/v0.1-evidence`: one older pull-request run, `26719718160`, failed at `069b4e205b1392a94af610d2450b76af8010851e`; no run was reported for the rc1 tag target or the post-rc1 status-note commits.
-- Pre-fix local failures reproduced: `npm run smoke:integration` failed at `frontend/scripts/frontend-integration-smoke.mjs:159`, `node scripts/test-readme-screenshot.mjs` failed because README did not reference `docs/assets/camelid-readme-chat-surface-dark.png`, and `npm run smoke:ui` failed on competitor-branded source text in `ChatWorkspace.jsx`.
-- Post-fix local QA passed: Rust fmt, clippy, full tests, release build, cargo doc, frontend `npm ci`, frontend build, frontend model-state smoke, frontend 3B closure smoke, frontend integration smoke, frontend streaming smoke, frontend UI smoke, public evidence-claim check, public scrub guard, README screenshot guard, all `scripts/test-*.mjs`, benchmark harness self-test, privacy audit, evidence checksum check, and diff whitespace check.
+- Local QA refresh passed at branch head: Rust fmt, clippy, full tests, release build, cargo doc, frontend `npm ci`, frontend build, frontend model-state smoke, frontend 3B closure smoke, frontend integration smoke, frontend streaming smoke, frontend UI smoke, public evidence-claim check, public scrub guard, README screenshot guard, all `scripts/test-*.mjs`, benchmark harness self-test, privacy audit, evidence checksum check, and diff whitespace check.
 - Real bundle: `qa/evidence-bundles/v0.1/20260531T184150Z-real-local/`.
 - Bundle source SHA: `8026339531463ade269d7be7078da331ba3e4085`; git status was clean at run time.
 - Model SHA256: `b5607b5090a8280063fff2d706bb3408ca6542341b06aab39c3eca0a28575921`.
@@ -52,14 +50,14 @@ Blocker/Risk:
 - Ollama is deferred because the only installed row observed here was `llama3.1:8b`, not an approved exact release comparator row.
 - MLX is deferred because `mlx_lm` is not installed in the default Python environment.
 - The source SHA in the benchmark bundle predates later docs/evidence-publication commits; no runtime code changes were made after that clean-head run.
-- No GitHub workflow run or commit status was visible for the rc1 commit at observation time; this is an observability gap, not a reported CI failure.
+- No GitHub workflow run or commit status was visible for either the current branch head or the rc1 tag target at observation time; this is an observability gap, not a reported CI failure.
 - Remote CI is not configured to run automatically on release-branch pushes; a manual `workflow_dispatch` or PR-based run is needed for hosted CI evidence on this branch.
 - Hosted CI dispatch attempt after pushing the QA repair was blocked locally: `gh workflow run ci.yml --ref release/v0.1-evidence` failed with `zsh:1: command not found: gh`.
-- No local gate is currently failing at the QA repair commit `3001fa48e3d5fa41dbeca417dd511164a3bacc80`; subsequent release-status edits are documentation-only.
+- No local gate is currently failing at branch head `5017ff28568dc1898fa490b4492848a1b3c022f0`; this update is documentation-only.
 
 Next:
 
-- The post-rc1 QA repair and release-status commits are pushed to `origin/release/v0.1-evidence`.
+- Keep this refreshed release-status/gate observation on `origin/release/v0.1-evidence`.
 - Continue soak on the release branch head and monitor for any later remote CI/status signal.
 - Request a manual GitHub Actions dispatch on `release/v0.1-evidence` from an environment with workflow-dispatch credentials/tooling if hosted CI evidence is required before any final approval.
 - Keep comparator deferrals explicit in any downstream notes: llama.cpp Metal, Ollama, and MLX are non-claims for rc1.
@@ -67,7 +65,7 @@ Next:
 
 Need Tim:
 
-- Decide whether the post-rc1 QA repair should become a new release candidate, a retagged rc1, or remain only on the release branch. No final `v0.1.0` tag is authorized by this release-captain update.
+- Decide whether branch head `5017ff28568dc1898fa490b4492848a1b3c022f0` should become a new release candidate, a retagged rc1, or remain only on the release branch. No final `v0.1.0` tag is authorized by this release-captain update.
 
 ## Current Checkout
 
