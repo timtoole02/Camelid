@@ -171,6 +171,32 @@ async fn models_reports_public_loaded_model_list_shape() {
 }
 
 #[tokio::test]
+async fn llama_server_read_only_routes_reject_router_mode_query_params() {
+    for uri in [
+        "/models?reload=1",
+        "/props?model=tiny&autoload=true",
+        "/slots?model=tiny",
+    ] {
+        let app = camelid::api::router();
+        let response = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "unsupported_parameter", "{uri}");
+        assert_eq!(body["error"]["param"], "query", "{uri}");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("active-model read-only discovery"));
+    }
+}
+
+#[tokio::test]
 async fn native_compatibility_routes_fail_closed_with_typed_errors() {
     let cases = [
         (

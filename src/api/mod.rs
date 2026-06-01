@@ -613,8 +613,16 @@ pub struct LlamaServerPropsCamelid {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct LlamaServerReadOnlyQuery {
+    #[serde(flatten)]
+    pub unsupported_fields: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct LlamaServerSlotsQuery {
     pub fail_on_no_slot: Option<String>,
+    #[serde(flatten)]
+    pub unsupported_fields: HashMap<String, String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1110,7 +1118,16 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
-async fn llama_server_models(State(state): State<AppState>) -> Json<LlamaServerModelListResponse> {
+async fn llama_server_models(
+    State(state): State<AppState>,
+    Query(query): Query<LlamaServerReadOnlyQuery>,
+) -> Response {
+    if let Some(response) =
+        unsupported_llama_server_query_params("/models", &query.unsupported_fields)
+    {
+        return response;
+    }
+
     let loaded = state.loaded_models.read().await;
     let data = loaded
         .values()
@@ -1147,6 +1164,7 @@ async fn llama_server_models(State(state): State<AppState>) -> Json<LlamaServerM
             ],
         },
     })
+    .into_response()
 }
 
 async fn unsupported_llama_server_models_load() -> Response {
@@ -1165,7 +1183,37 @@ async fn unsupported_llama_server_models_unload() -> Response {
     )
 }
 
-async fn llama_server_props(State(state): State<AppState>) -> Json<LlamaServerPropsResponse> {
+fn unsupported_llama_server_query_params(
+    route: &'static str,
+    fields: &HashMap<String, String>,
+) -> Option<Response> {
+    if fields.is_empty() {
+        return None;
+    }
+
+    let mut fields = fields.keys().map(String::as_str).collect::<Vec<_>>();
+    fields.sort_unstable();
+    Some(api_error(
+        StatusCode::BAD_REQUEST,
+        "unsupported_parameter",
+        format!(
+            "{route} query parameter(s) are not supported yet: {}; Camelid exposes this route as active-model read-only discovery, not llama-server router-mode autoload/reload/model selection",
+            fields.join(", ")
+        ),
+        Some("query"),
+    ))
+}
+
+async fn llama_server_props(
+    State(state): State<AppState>,
+    Query(query): Query<LlamaServerReadOnlyQuery>,
+) -> Response {
+    if let Some(response) =
+        unsupported_llama_server_query_params("/props", &query.unsupported_fields)
+    {
+        return response;
+    }
+
     let active_id_lock = state.active_model_id.read().await;
     let loaded_models = state.loaded_models.read().await;
     let model = active_id_lock.as_ref().and_then(|id| loaded_models.get(id));
@@ -1236,6 +1284,7 @@ async fn llama_server_props(State(state): State<AppState>) -> Json<LlamaServerPr
             ],
         },
     })
+    .into_response()
 }
 
 fn llama_server_chat_template_caps(model: Option<&LoadedModel>) -> serde_json::Value {
@@ -1289,6 +1338,12 @@ async fn llama_server_slots(
     State(state): State<AppState>,
     Query(query): Query<LlamaServerSlotsQuery>,
 ) -> Response {
+    if let Some(response) =
+        unsupported_llama_server_query_params("/slots", &query.unsupported_fields)
+    {
+        return response;
+    }
+
     let active_id_lock = state.active_model_id.read().await;
     let loaded_models = state.loaded_models.read().await;
     let model = active_id_lock.as_ref().and_then(|id| loaded_models.get(id));
@@ -2123,17 +2178,17 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "llama_server_models",
                 status: "partial",
-                notes: "GET /models returns a privacy-safe read-only list of currently loaded Camelid models with redacted paths and text-only architecture metadata. Router-mode cache listing, reload/autoload, POST /models/load, POST /models/unload, multimodal metadata, and full llama-server model-management parity remain unsupported.",
+                notes: "GET /models returns a privacy-safe read-only list of currently loaded Camelid models with redacted paths and text-only architecture metadata. Router-mode query params such as reload/autoload/model selection, cache listing, POST /models/load, POST /models/unload, multimodal metadata, and full llama-server model-management parity remain unsupported.",
             },
             SupportItem {
                 id: "llama_server_props",
                 status: "partial",
-                notes: "GET /props returns read-only public server properties, default generation settings, explicit fail-closed chat_template_caps, chat-template metadata when a model is loaded, and Camelid readiness notes. Local model paths are intentionally redacted, POST /props is unsupported, and this does not imply slot lifecycle, native /completion streaming, embeddings, or full llama-server WebUI parity.",
+                notes: "GET /props returns read-only public server properties, default generation settings, explicit fail-closed chat_template_caps, chat-template metadata when a model is loaded, and Camelid readiness notes. Local model paths are intentionally redacted, router-mode model/autoload query params and POST /props are unsupported, and this does not imply slot lifecycle, native /completion streaming, embeddings, or full llama-server WebUI parity.",
             },
             SupportItem {
                 id: "llama_server_slots",
                 status: "partial",
-                notes: "GET /slots returns a single read-only, privacy-safe slot snapshot with generation readiness and fail_on_no_slot=1 handling. POST /slots, slot save/restore/erase actions, prompt-cache metadata, cancellation metadata, and continuous batching metrics remain unsupported.",
+                notes: "GET /slots returns a single read-only, privacy-safe slot snapshot with generation readiness and fail_on_no_slot=1 handling. Router-mode model/autoload query params, POST /slots, slot save/restore/erase actions, prompt-cache metadata, cancellation metadata, and continuous batching metrics remain unsupported.",
             },
             SupportItem {
                 id: "llama_server_apply_template",
