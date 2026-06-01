@@ -717,15 +717,39 @@ pub struct LlamaLayerDiagnostics {
     pub attention_residual: LlamaTensorStats,
     pub ffn_norm: LlamaTensorStats,
     pub ffn_norm_reconstruction: LlamaRmsNormDiagnostic,
-    pub ffn_gate: LlamaTensorStats,
-    pub ffn_gate_reconstruction: LlamaLinearProjectionDiagnostic,
-    pub ffn_up: LlamaTensorStats,
-    pub ffn_up_reconstruction: LlamaLinearProjectionDiagnostic,
-    pub ffn_activation: LlamaTensorStats,
-    pub ffn_activation_reconstruction: LlamaFfnActivationDiagnostic,
-    pub ffn_output: LlamaTensorStats,
-    pub ffn_down_reconstruction: LlamaLinearProjectionDiagnostic,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mixtral_moe: Option<LlamaMixtralMoeTrace>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ffn_gate: Option<LlamaTensorStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ffn_gate_reconstruction: Option<LlamaLinearProjectionDiagnostic>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ffn_up: Option<LlamaTensorStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ffn_up_reconstruction: Option<LlamaLinearProjectionDiagnostic>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ffn_activation: Option<LlamaTensorStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ffn_activation_reconstruction: Option<LlamaFfnActivationDiagnostic>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ffn_output: Option<LlamaTensorStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ffn_down_reconstruction: Option<LlamaLinearProjectionDiagnostic>,
     pub ffn_residual: LlamaTensorStats,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LlamaMixtralMoeTrace {
+    pub expert_used_count: usize,
+    pub rows: Vec<LlamaMixtralMoeRowTrace>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LlamaMixtralMoeRowTrace {
+    pub row_index: usize,
+    pub router_logits: Vec<f32>,
+    pub selected_experts: Vec<usize>,
+    pub selected_weights: Vec<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -3421,28 +3445,27 @@ fn forward_layer_timed(
         ffn_activation_stats,
         ffn_down_diagnostic,
         ffn_output_stats,
+        mixtral_moe_trace,
         ffn_out_already_residual,
     ) = if let (Some(moe), Some(router)) = (&params.config.moe, &layer.moe_router) {
-        if collect_diagnostics {
-            return Err(BackendError::UnsupportedModelArchitecture(
-                    "Mixtral MoE diagnostics are not implemented yet; generation remains runtime-only until parity evidence is collected".to_string(),
-                ));
-        }
-        let (ffn_out, gate, up, activation, down) = mixtral_moe_ffn(
+        let (ffn_out, gate, up, activation, down, trace) = mixtral_moe_ffn(
             &ffn_norm,
             router,
             &layer.ffn_gate,
             &layer.ffn_up,
             &layer.ffn_down,
             moe.expert_used_count as usize,
-            format!("layer_{layer_idx}_mixtral_moe_ffn"),
+            MixtralMoeFfnOptions::new(
+                format!("layer_{layer_idx}_mixtral_moe_ffn"),
+                collect_diagnostics,
+            ),
         )?;
         timings.ffn_gate = gate;
         timings.ffn_up = up;
         timings.ffn_activation = activation;
         timings.ffn_down = down;
         (
-            ffn_out, None, None, None, None, None, None, None, None, false,
+            ffn_out, None, None, None, None, None, None, None, None, trace, false,
         )
     } else {
         let activated_name = format!("layer_{layer_idx}_ffn_activated");
@@ -3472,6 +3495,7 @@ fn forward_layer_timed(
             trace_forward_layer_memory(layer_idx, "ffn_gate_up_activation_done");
             (
                 fused.tensor,
+                None,
                 None,
                 None,
                 None,
@@ -3536,6 +3560,7 @@ fn forward_layer_timed(
                 ffn_activation_stats,
                 ffn_down_diagnostic,
                 ffn_output_stats,
+                None,
                 ffn_out_already_residual,
             )
         }
@@ -3616,18 +3641,15 @@ fn forward_layer_timed(
             ffn_norm: ffn_norm_stats.expect("ffn norm diagnostics collected"),
             ffn_norm_reconstruction: ffn_norm_diagnostic
                 .expect("ffn norm reconstruction diagnostics collected"),
-            ffn_gate: ffn_gate_stats.expect("ffn gate diagnostics collected"),
-            ffn_gate_reconstruction: ffn_gate_diagnostic
-                .expect("ffn gate reconstruction diagnostics collected"),
-            ffn_up: ffn_up_stats.expect("ffn up diagnostics collected"),
-            ffn_up_reconstruction: ffn_up_diagnostic
-                .expect("ffn up reconstruction diagnostics collected"),
-            ffn_activation: ffn_activation_stats.expect("ffn activation diagnostics collected"),
-            ffn_activation_reconstruction: ffn_activation_diagnostic
-                .expect("ffn activation reconstruction diagnostics collected"),
-            ffn_output: ffn_output_stats.expect("ffn output diagnostics collected"),
-            ffn_down_reconstruction: ffn_down_diagnostic
-                .expect("ffn down reconstruction diagnostics collected"),
+            mixtral_moe: mixtral_moe_trace,
+            ffn_gate: ffn_gate_stats,
+            ffn_gate_reconstruction: ffn_gate_diagnostic,
+            ffn_up: ffn_up_stats,
+            ffn_up_reconstruction: ffn_up_diagnostic,
+            ffn_activation: ffn_activation_stats,
+            ffn_activation_reconstruction: ffn_activation_diagnostic,
+            ffn_output: ffn_output_stats,
+            ffn_down_reconstruction: ffn_down_diagnostic,
             ffn_residual: ffn_residual_stats.expect("ffn residual diagnostics collected"),
         })
     } else {
@@ -3846,14 +3868,14 @@ fn forward_prefill_layer_chunk_timed(
     trace_chunk_memory("ffn_norm_done");
 
     let ffn_out = if let (Some(moe), Some(router)) = (&params.config.moe, &layer.moe_router) {
-        let (ffn_out, gate, up, activation, down) = mixtral_moe_ffn(
+        let (ffn_out, gate, up, activation, down, _) = mixtral_moe_ffn(
             &ffn_norm,
             router,
             &layer.ffn_gate,
             &layer.ffn_up,
             &layer.ffn_down,
             moe.expert_used_count as usize,
-            format!("layer_{layer_idx}_prefill_mixtral_moe_ffn"),
+            MixtralMoeFfnOptions::new(format!("layer_{layer_idx}_prefill_mixtral_moe_ffn"), false),
         )?;
         timings.ffn_gate = gate;
         timings.ffn_up = up;
@@ -6776,12 +6798,10 @@ fn softmax_top_k(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     scored.truncate(k);
-    if env_flag_enabled("CAMELID_MOE_RENORMALIZE_TOP_K") {
-        let selected_sum = scored.iter().map(|(_, value)| *value).sum::<f32>();
-        if selected_sum > 0.0 {
-            for (_, value) in &mut scored {
-                *value /= selected_sum;
-            }
+    let selected_sum = scored.iter().map(|(_, value)| *value).sum::<f32>();
+    if selected_sum > 0.0 {
+        for (_, value) in &mut scored {
+            *value /= selected_sum;
         }
     }
     scored
@@ -6874,6 +6894,20 @@ fn expert_matrix_view(
     Ok(tensor)
 }
 
+struct MixtralMoeFfnOptions {
+    name: String,
+    collect_trace: bool,
+}
+
+impl MixtralMoeFfnOptions {
+    fn new(name: impl Into<String>, collect_trace: bool) -> Self {
+        Self {
+            name: name.into(),
+            collect_trace,
+        }
+    }
+}
+
 fn mixtral_moe_ffn(
     input: &CpuTensor,
     router: &CpuTensor,
@@ -6881,8 +6915,15 @@ fn mixtral_moe_ffn(
     up_experts: &CpuTensor,
     down_experts: &CpuTensor,
     expert_used_count: usize,
-    name: impl Into<String>,
-) -> Result<(CpuTensor, u128, u128, u128, u128)> {
+    options: MixtralMoeFfnOptions,
+) -> Result<(
+    CpuTensor,
+    u128,
+    u128,
+    u128,
+    u128,
+    Option<LlamaMixtralMoeTrace>,
+)> {
     if input.rank() != 2 {
         return Err(BackendError::RuntimeShapeMismatch(format!(
             "Mixtral MoE FFN expects rank-2 input, got {:?}",
@@ -6901,6 +6942,10 @@ fn mixtral_moe_ffn(
     let mut up_elapsed = 0;
     let mut activation_elapsed = 0;
     let mut down_elapsed = 0;
+    let mut trace = options.collect_trace.then(|| LlamaMixtralMoeTrace {
+        expert_used_count,
+        rows: Vec::with_capacity(rows),
+    });
     for row in 0..rows {
         let row_input = CpuTensor::from_f32(
             "mixtral_moe_row",
@@ -6911,6 +6956,14 @@ fn mixtral_moe_ffn(
             &logits.data[row * expert_count..(row + 1) * expert_count],
             expert_used_count,
         );
+        if let Some(trace) = &mut trace {
+            trace.rows.push(LlamaMixtralMoeRowTrace {
+                row_index: row,
+                router_logits: logits.data[row * expert_count..(row + 1) * expert_count].to_vec(),
+                selected_experts: top.iter().map(|(expert_idx, _)| *expert_idx).collect(),
+                selected_weights: top.iter().map(|(_, weight)| *weight).collect(),
+            });
+        }
         for (expert_idx, weight) in top {
             let gate =
                 expert_matrix_view(gate_experts, expert_idx, hidden, ff, "mixtral_gate_expert")?;
@@ -6937,11 +6990,12 @@ fn mixtral_moe_ffn(
         }
     }
     Ok((
-        CpuTensor::from_f32(name, vec![rows, hidden], output)?,
+        CpuTensor::from_f32(options.name, vec![rows, hidden], output)?,
         gate_elapsed + router_elapsed,
         up_elapsed,
         activation_elapsed,
         down_elapsed,
+        trace,
     ))
 }
 

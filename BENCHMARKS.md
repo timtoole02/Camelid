@@ -160,7 +160,7 @@ The next benchmark slice worth publishing is:
    - same thread settings
    - report TTFT, decode tok/s, and ms/token
 2. **Mac benchmark snapshot**
-   - especially the exact Llama 3.2 3B Instruct Q8_0 row that Tim is actively feeling in the UI
+   - especially the exact Llama 3.2 3B Instruct Q8_0 row that is actively exercised in the UI
 3. **8B bounded same-host comparison**
    - only after the same-host run is reproducible and repo-safe
 

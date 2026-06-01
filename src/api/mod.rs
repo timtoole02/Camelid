@@ -856,6 +856,11 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/detokenize", post(llama_server_detokenize))
         .route("/apply-template", post(llama_server_apply_template))
         .route("/props", get(llama_server_props))
+        .route("/slots", get(llama_server_slots).post(llama_server_slots))
+        .route("/completion", post(llama_server_completion))
+        .route("/embedding", post(unsupported_embeddings))
+        .route("/embeddings", post(unsupported_embeddings))
+        .route("/rerank", post(unsupported_reranking))
         .route(
             "/api/generation/sessions",
             get(generation_sessions).post(create_generation_session),
@@ -868,6 +873,8 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/v1/models/:model", get(v1_model))
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/embeddings", post(unsupported_embeddings))
+        .route("/v1/reranking", post(unsupported_reranking))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -979,6 +986,38 @@ async fn llama_server_props(State(state): State<AppState>) -> Json<LlamaServerPr
             ],
         },
     })
+}
+
+async fn llama_server_slots() -> Response {
+    unsupported_route(
+        "unsupported_llama_server_slots",
+        "/slots is not supported yet; Camelid does not expose llama-server slot lifecycle, prompt-cache, or cancellation metadata",
+        Some("slots"),
+    )
+}
+
+async fn llama_server_completion() -> Response {
+    unsupported_route(
+        "unsupported_llama_server_completion",
+        "/completion is not supported yet; use /v1/completions or /v1/chat/completions for Camelid's stable generation path",
+        Some("completion"),
+    )
+}
+
+async fn unsupported_embeddings() -> Response {
+    unsupported_route(
+        "unsupported_embeddings",
+        "embeddings are not supported yet; Camelid has no embeddings runtime or compatibility contract for this route",
+        Some("input"),
+    )
+}
+
+async fn unsupported_reranking() -> Response {
+    unsupported_route(
+        "unsupported_reranking",
+        "reranking is not supported yet; Camelid has no reranking runtime or compatibility contract for this route",
+        Some("input"),
+    )
 }
 
 fn loaded_model_generation_ready(model: &LoadedModel) -> bool {
@@ -1546,6 +1585,11 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 id: "llama_server_apply_template",
                 status: "partial",
                 notes: "POST /apply-template renders loaded-model chat messages to a prompt string without inference. It is scoped to Camelid's supported tokenizer/template renderers and returns typed unsupported errors for unknown request fields or unsupported templates.",
+            },
+            SupportItem {
+                id: "fail_closed_native_compatibility_routes",
+                status: "unsupported",
+                notes: "Native /slots, /completion, /embedding, /embeddings, /v1/embeddings, /rerank, and /v1/reranking compatibility routes return typed not_implemented errors until real route semantics and backend support exist.",
             },
             SupportItem {
                 id: "multi_choice_generation",
@@ -5162,6 +5206,19 @@ fn malformed_json_error(err: JsonRejection) -> Response {
         "malformed_json",
         err.to_string(),
         None,
+    )
+}
+
+fn unsupported_route(
+    code: &'static str,
+    message: &'static str,
+    param: Option<&'static str>,
+) -> Response {
+    api_error(
+        StatusCode::NOT_IMPLEMENTED,
+        code,
+        message.to_string(),
+        param,
     )
 }
 

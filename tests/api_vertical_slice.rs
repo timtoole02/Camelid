@@ -119,6 +119,43 @@ async fn props_reports_public_fail_closed_llama_server_shape() {
 }
 
 #[tokio::test]
+async fn native_compatibility_routes_fail_closed_with_typed_errors() {
+    let cases = [
+        ("GET", "/slots", "unsupported_llama_server_slots", "slots"),
+        (
+            "POST",
+            "/completion",
+            "unsupported_llama_server_completion",
+            "completion",
+        ),
+        ("POST", "/embedding", "unsupported_embeddings", "input"),
+        ("POST", "/embeddings", "unsupported_embeddings", "input"),
+        ("POST", "/v1/embeddings", "unsupported_embeddings", "input"),
+        ("POST", "/rerank", "unsupported_reranking", "input"),
+        ("POST", "/v1/reranking", "unsupported_reranking", "input"),
+    ];
+
+    for (method, uri, code, param) in cases {
+        let app = camelid::api::router();
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED, "{uri}");
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["type"], "not_implemented", "{uri}");
+        assert_eq!(body["error"]["code"], code, "{uri}");
+        assert_eq!(body["error"]["param"], param, "{uri}");
+    }
+}
+
+#[tokio::test]
 async fn capabilities_report_support_contract_and_planned_lanes() {
     let app = camelid::api::router();
     let response = app
@@ -248,6 +285,12 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
                 .as_str()
                 .unwrap()
                 .contains("without inference")
+    }));
+    assert!(body["api_features"].as_array().unwrap().iter().any(|item| {
+        item["id"] == "fail_closed_native_compatibility_routes"
+            && item["status"] == "unsupported"
+            && item["notes"].as_str().unwrap().contains("/completion")
+            && item["notes"].as_str().unwrap().contains("/v1/embeddings")
     }));
     let compatibility = body["model_compatibility"].as_array().unwrap();
     let tinyllama = compatibility

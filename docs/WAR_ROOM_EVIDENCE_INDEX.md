@@ -16,6 +16,8 @@ When surfaces disagree, use this order:
 
 Working notes, agent briefs, local validation notes, draft plans, and unreviewed logs are not public claim sources unless a public source above cites a scrubbed bundle and states the exact supported boundary.
 
+If the source-of-truth files are dirty, treat the on-disk text as the review target and avoid widening claims until the diff is understood. If a dirty diff changes `COMPATIBILITY.md`, `/api/capabilities`, or frontend readiness behavior, update the other public surfaces in the same change or leave an explicit blocker instead of publishing a partial promotion.
+
 ## Evidence index
 
 Use these anchors before changing public copy:
@@ -38,6 +40,8 @@ Use these anchors before changing public copy:
 - Do not publish local/private paths, hostnames, key paths, private IPs, raw operator commands, raw stderr, or model-library locations. Public evidence should use repo-relative paths, hashes, row IDs, timestamps, command names, and summarized pass/fail outcomes.
 - Keep llama.cpp / ggml credit visible where parity or comparator evidence is cited. Phrase comparisons as bounded parity or measured same-host results only.
 - If a capability is present for discovery or compatibility, label it precisely. For example, a read-only partial control-plane route must not imply native generation aliases, slots, embeddings, reranking, multimodal support, production throughput, or full WebUI parity.
+- API/WebUI readiness copy must state both sides of the gate: exact compatibility-row support from `/api/capabilities` and runtime readiness from `/v1/health` (`loaded_now=true` plus `generation_ready=true`). One without the other is not chat readiness evidence.
+- Benchmark copy must keep negative, blocked, or slower same-host results when they are the current retained evidence. Do not replace an unfavorable retained result with a direction probe, local-only optimization, or future benchmark plan.
 
 ## Minimum safe update checklist
 
