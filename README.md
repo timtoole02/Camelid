@@ -95,6 +95,7 @@ Real-model parity, comparator baselines, and full v0.1 evidence bundles require 
 - [`CORRECTNESS_v0.1.md`](CORRECTNESS_v0.1.md) - v0.1 correctness boundary
 - [`STATUS.md`](STATUS.md) - current evidence snapshot and blockers
 - [`BENCHMARKS.md`](BENCHMARKS.md) - committed benchmark snapshot and claim rules
+- [`docs/WAR_ROOM_EVIDENCE_INDEX.md`](docs/WAR_ROOM_EVIDENCE_INDEX.md) - claim-source order, evidence index, and public wording policy
 - [`RELEASE_NOTES_v0.1.md`](RELEASE_NOTES_v0.1.md) - v0.1 release candidate notes
 - [`BENCHMARKS_v0.1.md`](BENCHMARKS_v0.1.md) - v0.1 benchmark posture
 - [`MARKET_POSITIONING_v0.1.md`](MARKET_POSITIONING_v0.1.md) - public positioning guardrails

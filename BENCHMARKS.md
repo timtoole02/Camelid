@@ -12,6 +12,8 @@ It is intentionally narrower than a marketing benchmark page:
 
 If a row or host is not listed here, Camelid is not claiming a benchmark result for it yet.
 
+For cross-surface wording discipline, see [`docs/WAR_ROOM_EVIDENCE_INDEX.md`](docs/WAR_ROOM_EVIDENCE_INDEX.md). That policy keeps benchmark copy tied to scrubbed evidence and prevents timing probes from becoming support, API, or WebUI readiness claims.
+
 ## Reading rules
 
 - **Exact row only.** Numbers apply only to the exact GGUF row named in the table.
