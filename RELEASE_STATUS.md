@@ -1,8 +1,10 @@
 # Camelid v0.1 Release Status
 
-Last updated: 2026-05-31 local / 2026-06-01 UTC
+Last updated: 2026-05-31 18:50 PDT / 2026-06-01 01:50 UTC
 
 Branch: `release/v0.1-evidence`
+
+Current release branch head SHA before this status update: `52eda9092631818ae868ad65e35ab8bb7ec6fddb`
 
 Current QA repair SHA: `3001fa48e3d5fa41dbeca417dd511164a3bacc80`
 
@@ -12,7 +14,7 @@ Current `v0.1.0-rc1` tag target: `d9fb294f47e3ae80291f969499e2240c6cd640c3`
 
 Release target: `v0.1.0-rc1`
 
-Release posture: the release branch includes the post-rc1 QA repair at `3001fa48e3d5fa41dbeca417dd511164a3bacc80`, a validated pre-doc-refresh head at `5017ff28568dc1898fa490b4492848a1b3c022f0`, and later release-status blocker documentation. The existing `v0.1.0-rc1` tag still points to `d9fb294f47e3ae80291f969499e2240c6cd640c3` and has not been moved. A clean-head llama.cpp CPU comparator bundle exists for one exact row, with llama.cpp Metal, Ollama, and MLX explicitly deferred. Final `v0.1.0` remains Tim-approval gated, and a Tim decision is needed before treating the repaired release branch as the active release candidate.
+Release posture: the release branch includes the post-rc1 QA repair at `3001fa48e3d5fa41dbeca417dd511164a3bacc80`, a validated pre-doc-refresh head at `5017ff28568dc1898fa490b4492848a1b3c022f0`, and later status-only blocker documentation through `52eda9092631818ae868ad65e35ab8bb7ec6fddb`. The existing `v0.1.0-rc1` tag still points to `d9fb294f47e3ae80291f969499e2240c6cd640c3` and has not been moved. A clean-head llama.cpp CPU comparator bundle exists for one exact row, with llama.cpp Metal, Ollama, and MLX explicitly deferred. Final `v0.1.0` remains Tim-approval gated, and a Tim decision is needed before treating the repaired release branch as the active release candidate.
 
 ## Latest Release Captain Update
 
@@ -21,21 +23,25 @@ Camelid v0.1 update:
 Shipped:
 
 - Re-verified the clean release worktree on branch `release/v0.1-evidence`; the dirty primary checkout was not modified.
-- Confirmed local branch head and `origin/release/v0.1-evidence` at `5017ff28568dc1898fa490b4492848a1b3c022f0` before this documentation-only refresh.
-- Re-ran the branch-head release gate refresh after the post-rc1 QA repair and hosted-CI blocker note.
+- Confirmed local branch head and `origin/release/v0.1-evidence` at `52eda9092631818ae868ad65e35ab8bb7ec6fddb` before this status-only refresh.
+- Re-recorded the active release blocker with current branch, remote, and tag evidence.
+- Ran lightweight public-doc/evidence guards for this status refresh.
 - Kept comparator deferrals unchanged: llama.cpp Metal, Ollama, and MLX remain non-claims.
 - Did not move the existing annotated `v0.1.0-rc1` tag and did not create final `v0.1.0`.
 
 Evidence:
 
-- Gate-refresh timestamp: 2026-06-01 01:17-01:22 UTC.
-- Branch/remote observation: `release/v0.1-evidence` and `origin/release/v0.1-evidence` at `5017ff28568dc1898fa490b4492848a1b3c022f0`.
+- Status observation timestamp: 2026-05-31 18:50 PDT / 2026-06-01 01:50 UTC.
+- `git status --short --branch` returned `## release/v0.1-evidence...origin/release/v0.1-evidence` with no file changes.
+- Branch/remote observation: `release/v0.1-evidence` and `origin/release/v0.1-evidence` both resolved to `52eda9092631818ae868ad65e35ab8bb7ec6fddb`.
+- Recent release-history observation: `52eda90 chore(release): clarify validated gate sha`; `4248f55 chore(release): refresh branch-head gate observation`; `5017ff2 chore(release): record hosted ci dispatch blocker`; `3001fa4 fix(release): restore frontend qa gates`; `d9fb294 (tag: v0.1.0-rc1) chore(release): sign off v0.1 rc1`.
 - Remote tag observation: `git ls-remote --tags origin 'v0.1.0-rc1^{}'` returned `d9fb294f47e3ae80291f969499e2240c6cd640c3`.
 - Local annotated tag object: `v0.1.0-rc1`, tagger date 2026-05-31 13:09:59 -0700, target `d9fb294f47e3ae80291f969499e2240c6cd640c3`.
-- `git describe --tags --exact-match HEAD` failed with `fatal: no tag exactly matches '5017ff28568dc1898fa490b4492848a1b3c022f0'`, confirming the validated pre-doc-refresh head is not tagged.
-- GitHub connector observation for `5017ff28568dc1898fa490b4492848a1b3c022f0` and `d9fb294f47e3ae80291f969499e2240c6cd640c3`: zero workflow runs and zero commit statuses returned.
+- `git describe --tags --exact-match HEAD` failed with `fatal: no tag exactly matches '52eda9092631818ae868ad65e35ab8bb7ec6fddb'`, confirming the current release branch head is not tagged.
 - Workflow trigger audit: `.github/workflows/ci.yml` runs on `push` to `main`, `pull_request`, and `workflow_dispatch`; release-branch pushes do not automatically start CI.
-- Local QA refresh passed at branch head: Rust fmt, clippy, full tests, release build, cargo doc, frontend `npm ci`, frontend build, frontend model-state smoke, frontend 3B closure smoke, frontend integration smoke, frontend streaming smoke, frontend UI smoke, public evidence-claim check, public scrub guard, README screenshot guard, all `scripts/test-*.mjs`, benchmark harness self-test, privacy audit, evidence checksum check, and diff whitespace check.
+- Local QA refresh previously passed at `5017ff28568dc1898fa490b4492848a1b3c022f0`: Rust fmt, clippy, full tests, release build, cargo doc, frontend `npm ci`, frontend build, frontend model-state smoke, frontend 3B closure smoke, frontend integration smoke, frontend streaming smoke, frontend UI smoke, public evidence-claim check, public scrub guard, README screenshot guard, all `scripts/test-*.mjs`, benchmark harness self-test, privacy audit, evidence checksum check, and diff whitespace check.
+- Status-refresh validation passed: `node scripts/check-public-evidence-claims.mjs --root qa/evidence-bundles`, `bash scripts/check-public-scrub.sh`, `node scripts/test-readme-screenshot.mjs`, and `git diff --check`.
+- Commits after `5017ff28568dc1898fa490b4492848a1b3c022f0` through `52eda9092631818ae868ad65e35ab8bb7ec6fddb` are release documentation/status updates to `RELEASE_GATE_v0.1.md`, `RELEASE_REPORT_v0.1.md`, and `RELEASE_STATUS.md`.
 - Real bundle: `qa/evidence-bundles/v0.1/20260531T184150Z-real-local/`.
 - Bundle source SHA: `8026339531463ade269d7be7078da331ba3e4085`; git status was clean at run time.
 - Model SHA256: `b5607b5090a8280063fff2d706bb3408ca6542341b06aab39c3eca0a28575921`.
@@ -45,19 +51,19 @@ Evidence:
 
 Blocker/Risk:
 
-- The existing `v0.1.0-rc1` tag target predates the frontend/README QA repair. The tag was not moved; Tim needs to decide whether to cut a new candidate, retag, or keep rc1 as a known-pre-fix candidate.
+- The existing `v0.1.0-rc1` tag target predates the frontend/README QA repair at `3001fa48e3d5fa41dbeca417dd511164a3bacc80` and the current status-only branch head at `52eda9092631818ae868ad65e35ab8bb7ec6fddb`. The tag was not moved; Tim needs to decide whether to cut a new candidate, retag, or keep rc1 as a known-pre-fix candidate.
 - llama.cpp coverage is one CPU-only exact-row run, not a full table and not Metal evidence.
 - Ollama is deferred because the only installed row observed here was `llama3.1:8b`, not an approved exact release comparator row.
 - MLX is deferred because `mlx_lm` is not installed in the default Python environment.
 - The source SHA in the benchmark bundle predates later docs/evidence-publication commits; no runtime code changes were made after that clean-head run.
-- No GitHub workflow run or commit status was visible for either the validated pre-doc-refresh head or the rc1 tag target at observation time; this is an observability gap, not a reported CI failure.
+- No GitHub workflow run or commit status was visible for either the validated pre-doc-refresh head or the rc1 tag target at the prior observation time; this is an observability gap, not a reported CI failure.
 - Remote CI is not configured to run automatically on release-branch pushes; a manual `workflow_dispatch` or PR-based run is needed for hosted CI evidence on this branch.
 - Hosted CI dispatch attempt after pushing the QA repair was blocked locally: `gh workflow run ci.yml --ref release/v0.1-evidence` failed with `zsh:1: command not found: gh`.
-- No local gate is currently failing at validated pre-doc-refresh head `5017ff28568dc1898fa490b4492848a1b3c022f0`; this update is documentation-only.
+- No local gate is currently recorded failing at validated pre-doc-refresh head `5017ff28568dc1898fa490b4492848a1b3c022f0`; this update is documentation-only.
 
 Next:
 
-- Keep this refreshed release-status/gate observation on `origin/release/v0.1-evidence`.
+- Keep this refreshed release-status observation on `origin/release/v0.1-evidence`.
 - Continue soak on the release branch head and monitor for any later remote CI/status signal.
 - Request a manual GitHub Actions dispatch on `release/v0.1-evidence` from an environment with workflow-dispatch credentials/tooling if hosted CI evidence is required before any final approval.
 - Keep comparator deferrals explicit in any downstream notes: llama.cpp Metal, Ollama, and MLX are non-claims for rc1.
@@ -65,7 +71,7 @@ Next:
 
 Need Tim:
 
-- Decide whether the repaired release branch, including validated pre-doc-refresh head `5017ff28568dc1898fa490b4492848a1b3c022f0` and later documentation-only status commits, should become a new release candidate, a retagged rc1, or remain only on the release branch. No final `v0.1.0` tag is authorized by this release-captain update.
+- Decide whether the repaired release branch, including validated pre-doc-refresh head `5017ff28568dc1898fa490b4492848a1b3c022f0`, current status-only head `52eda9092631818ae868ad65e35ab8bb7ec6fddb`, and this status-only follow-up, should become a new release candidate, a retagged rc1, or remain only on the release branch. No final `v0.1.0` tag is authorized by this release-captain update.
 
 ## Current Checkout
 
