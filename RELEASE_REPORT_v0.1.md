@@ -4,13 +4,13 @@ Current QA repair SHA: `3001fa48e3d5fa41dbeca417dd511164a3bacc80`
 
 Validated pre-doc-refresh branch head SHA: `5017ff28568dc1898fa490b4492848a1b3c022f0`
 
-Current status-only branch head SHA before the latest report refresh: `a94eabb241f662ac328c02f6f5bb47dc33a9a14e`
+Current status-only branch head SHA before the latest report refresh: `82331e3326f67e091c79eda48db02c63f30f84c4`
 
 Branch: `release/v0.1-evidence`
 
 Tag: `v0.1.0-rc1` at `d9fb294f47e3ae80291f969499e2240c6cd640c3`
 
-Release status: the annotated `v0.1.0-rc1` tag is pushed, but it predates a post-rc1 frontend/README QA repair now present on the release branch at `3001fa48e3d5fa41dbeca417dd511164a3bacc80`. The validated pre-doc-refresh branch head is `5017ff28568dc1898fa490b4492848a1b3c022f0`; later release-status commits through `a94eabb241f662ac328c02f6f5bb47dc33a9a14e` are documentation-only, and local branch-head gates passed again there on 2026-06-01 04:33-04:39 UTC. The rc1 tag has not been moved. The release branch has v0.1 docs, a benchmark harness, a clean-head same-host llama.cpp CPU evidence bundle for one exact row, and release-captain deferrals for llama.cpp Metal, Ollama, and MLX. No final `v0.1.0` tag may be created without Tim approval.
+Release status: the annotated `v0.1.0-rc1` tag is pushed, but it predates a post-rc1 frontend/README QA repair now present on the release branch at `3001fa48e3d5fa41dbeca417dd511164a3bacc80`. The validated pre-doc-refresh branch head is `5017ff28568dc1898fa490b4492848a1b3c022f0`; later release-status commits through `82331e3326f67e091c79eda48db02c63f30f84c4` are documentation-only, and local branch-head gates passed again at `a94eabb241f662ac328c02f6f5bb47dc33a9a14e` on 2026-06-01 04:33-04:39 UTC. The rc1 tag has not been moved. The release branch has v0.1 docs, a benchmark harness, a clean-head same-host llama.cpp CPU evidence bundle for one exact row, and release-captain deferrals for llama.cpp Metal, Ollama, and MLX. No final `v0.1.0` tag may be created without Tim approval.
 
 Supported model rows:
 
@@ -60,14 +60,14 @@ Docs changed:
 - `DISTRIBUTED_MAC_v0.1.md`
 - `RELEASE_GATE_v0.1.md`
 
-Tests run: see `RELEASE_GATE_v0.1.md`. Branch-head gates passed locally again at `5017ff28568dc1898fa490b4492848a1b3c022f0` on 2026-06-01 01:17-01:22 UTC and at `a94eabb241f662ac328c02f6f5bb47dc33a9a14e` on 2026-06-01 04:33-04:39 UTC, including `cargo fmt --all -- --check`, clippy, `cargo check`, full Rust tests, release build, cargo doc, frontend `npm ci`, frontend build, frontend model-state/3B-closure/integration/streaming/UI smokes, root validation self-tests, harness self-test, README screenshot guard, public evidence-claim check, public scrub guard, evidence checksum check, and v0.1 privacy audit.
+Tests run: see `RELEASE_GATE_v0.1.md`. Branch-head gates passed locally again at `5017ff28568dc1898fa490b4492848a1b3c022f0` on 2026-06-01 01:17-01:22 UTC and at `a94eabb241f662ac328c02f6f5bb47dc33a9a14e` on 2026-06-01 04:33-04:39 UTC, including `cargo fmt --all -- --check`, clippy, `cargo check`, full Rust tests, release build, cargo doc, frontend `npm ci`, frontend build, frontend model-state/3B-closure/integration/streaming/UI smokes, root validation self-tests, harness self-test, README screenshot guard, public evidence-claim check, public scrub guard, evidence checksum check, and v0.1 privacy audit. Later commits through `82331e3326f67e091c79eda48db02c63f30f84c4` are release documentation/status updates only.
 
-Remote release state: at the 2026-06-01 04:39 UTC observation, `origin/release/v0.1-evidence` was at `a94eabb241f662ac328c02f6f5bb47dc33a9a14e`, and the dereferenced remote tag `v0.1.0-rc1^{}` pointed to `d9fb294f47e3ae80291f969499e2240c6cd640c3`. `git describe --tags --exact-match HEAD` failed, confirming the current status-only branch head is not tagged. GitHub reported no workflow runs and no commit statuses for either the branch head or the rc1 tag target. The workflow file runs on `push` to `main`, `pull_request`, and `workflow_dispatch`, so release-branch pushes do not automatically start hosted CI. Later release-status commits are documentation-only and do not move the rc1 tag.
+Remote release state: at the 2026-06-01 05:50 UTC observation, `origin/release/v0.1-evidence` was at `82331e3326f67e091c79eda48db02c63f30f84c4`, and the dereferenced remote tag `v0.1.0-rc1^{}` pointed to `d9fb294f47e3ae80291f969499e2240c6cd640c3`. `git describe --tags --exact-match HEAD` failed, confirming the current status-only branch head is not tagged. GitHub reported no workflow runs and no commit statuses for either the branch head or the rc1 tag target. The workflow file runs on `push` to `main`, `pull_request`, and `workflow_dispatch`, so release-branch pushes do not automatically start hosted CI. Later release-status commits are documentation-only and do not move the rc1 tag.
 
 Remaining blockers and risks:
 
 - llama.cpp Metal, Ollama, and MLX fresh baselines are deferred; public docs must keep those non-claims explicit.
-- The existing `v0.1.0-rc1` tag predates the branch-head frontend/README QA repair; Tim needs to decide whether the repaired release branch, including validated pre-doc-refresh head `5017ff28568dc1898fa490b4492848a1b3c022f0` and later documentation-only status commits, should become a new candidate, a retagged rc1, or remain only on the release branch.
+- The existing `v0.1.0-rc1` tag predates the branch-head frontend/README QA repair; Tim needs to decide whether the repaired release branch, including validated pre-doc-refresh head `5017ff28568dc1898fa490b4492848a1b3c022f0` and later documentation-only status commits through `82331e3326f67e091c79eda48db02c63f30f84c4`, should become a new candidate, a retagged rc1, or remain only on the release branch.
 - The clean-head evidence bundle source SHA predates later documentation/evidence-publication commits; no runtime code changes were made after the run.
 - Remote CI/status observation returned no runs or statuses for the rc1 commit; this is an observability gap, not a reported CI failure.
 - Hosted CI is not automatically triggered by release-branch pushes; the local dispatch attempt was blocked because `gh` is not installed, so use `workflow_dispatch` or PR-based CI from an environment with the required tooling/credentials if remote hosted evidence is required for final approval.
