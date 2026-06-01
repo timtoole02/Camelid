@@ -1,12 +1,12 @@
 # Camelid v0.1 Release Candidate Report
 
-Current SHA: `d9fb294f47e3ae80291f969499e2240c6cd640c3`
+Current QA repair SHA: `3001fa48e3d5fa41dbeca417dd511164a3bacc80`
 
 Branch: `release/v0.1-evidence`
 
-Tag: `v0.1.0-rc1`
+Tag: `v0.1.0-rc1` at `d9fb294f47e3ae80291f969499e2240c6cd640c3`
 
-Release status: release-captain signed off for `v0.1.0-rc1`, and the annotated rc1 tag is pushed. The release branch has v0.1 docs, a benchmark harness, a clean-head same-host llama.cpp CPU evidence bundle for one exact row, and release-captain deferrals for llama.cpp Metal, Ollama, and MLX. No final `v0.1.0` tag may be created without Tim approval.
+Release status: the annotated `v0.1.0-rc1` tag is pushed, but it predates a post-rc1 frontend/README QA repair now present on the release branch at `3001fa48e3d5fa41dbeca417dd511164a3bacc80`. The rc1 tag has not been moved. The release branch has v0.1 docs, a benchmark harness, a clean-head same-host llama.cpp CPU evidence bundle for one exact row, and release-captain deferrals for llama.cpp Metal, Ollama, and MLX. No final `v0.1.0` tag may be created without Tim approval.
 
 Supported model rows:
 
@@ -33,6 +33,13 @@ Known limitations:
 
 Evidence bundle path: `qa/evidence-bundles/v0.1/20260531T184150Z-real-local/`.
 
+Post-rc1 QA repair:
+
+- Restored fresh-chat exact-row readiness pills so runtime-ready-but-support-gated models expose the runtime/support/capability blocker text.
+- Restored the approved README chat screenshot with a boundary-safe local-first readiness caption.
+- Updated the frontend integration smoke for the current empty-state hero and cleaned competitor-branded source copy covered by the UI smoke.
+- Post-fix branch-head QA passed locally; the existing rc1 tag still points to the pre-fix commit.
+
 Docs changed:
 
 - `README.md`
@@ -49,18 +56,19 @@ Docs changed:
 - `DISTRIBUTED_MAC_v0.1.md`
 - `RELEASE_GATE_v0.1.md`
 
-Tests run: see `RELEASE_GATE_v0.1.md`. Local lightweight gates pass, including `cargo fmt --all -- --check`, clippy, cargo check, full Rust tests, release build, frontend build/model-state smoke, harness self-test, public evidence-claim check, and public scrub guard.
+Tests run: see `RELEASE_GATE_v0.1.md`. Branch-head gates pass locally after the post-rc1 repair, including `cargo fmt --all -- --check`, clippy, full Rust tests, release build, cargo doc, frontend `npm ci`, frontend build, frontend model-state/3B-closure/integration/streaming/UI smokes, root validation self-tests, harness self-test, README screenshot guard, public evidence-claim check, public scrub guard, evidence checksum check, and v0.1 privacy audit.
 
-Remote release state: at the 2026-06-01 00:09 UTC observation, `origin/release/v0.1-evidence` and the dereferenced remote tag `v0.1.0-rc1^{}` both pointed to `d9fb294f47e3ae80291f969499e2240c6cd640c3`. This status-only follow-up update does not retarget the rc1 tag. GitHub reported no workflow runs and no commit statuses for that commit at the same observation. The workflow file runs on `push` to `main`, `pull_request`, and `workflow_dispatch`, so release-branch pushes do not automatically start hosted CI. The public Actions API showed one older failed pull-request run on `069b4e205b1392a94af610d2450b76af8010851e`, not on the rc1 tag target.
+Remote release state: at the 2026-06-01 00:43 UTC observation, `origin/release/v0.1-evidence` was at `4b6787c2d51788cd7839f0ac462d1b2767aa82c9`, and the dereferenced remote tag `v0.1.0-rc1^{}` pointed to `d9fb294f47e3ae80291f969499e2240c6cd640c3`. GitHub reported no workflow runs and no commit statuses for those commits at the same observation. The workflow file runs on `push` to `main`, `pull_request`, and `workflow_dispatch`, so release-branch pushes do not automatically start hosted CI. The public Actions API showed one older failed pull-request run on `069b4e205b1392a94af610d2450b76af8010851e`, not on the rc1 tag target.
 
 Remaining blockers and risks:
 
 - llama.cpp Metal, Ollama, and MLX fresh baselines are deferred; public docs must keep those non-claims explicit.
+- The existing `v0.1.0-rc1` tag predates the branch-head frontend/README QA repair; Tim needs to decide whether to cut a new candidate, retag rc1, or keep rc1 as known-pre-fix.
 - The clean-head evidence bundle source SHA predates later documentation/evidence-publication commits; no runtime code changes were made after the run.
 - Remote CI/status observation returned no runs or statuses for the rc1 commit; this is an observability gap, not a reported CI failure.
 - Hosted CI is not automatically triggered by release-branch pushes; use `workflow_dispatch` or PR-based CI if remote hosted evidence is required for final approval.
 
-Recommendation: keep `v0.1.0-rc1` in soak/review and run or request a manual hosted CI dispatch if remote CI evidence is required. Do not create final `v0.1.0` without Tim approval.
+Recommendation: push and soak the repaired release branch head, then have Tim choose the candidate strategy before final approval. Run or request a manual hosted CI dispatch if remote CI evidence is required. Do not create final `v0.1.0` without Tim approval.
 
 ## Release Captain Signoff
 
