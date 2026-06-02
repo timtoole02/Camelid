@@ -4972,6 +4972,12 @@ fn q8_ffn_down_consumer_fails_closed_for_non_runtime_or_mismatched_storage() {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn mac_q8_ffn_down_single_projection_counter_probe_records_scheduler_shape() {
+    // i8mm is ARMv8.6; Apple M1 (and virtualized CI runners) lack it. This test
+    // executes the i8mm kernel directly, so skip when the feature is absent
+    // rather than SIGILL on an illegal instruction.
+    if !std::arch::is_aarch64_feature_detected!("i8mm") {
+        return;
+    }
     let _env_guard = env_lock();
     clear_dense_diagnostic_env();
     std::env::set_var(Q8_SCHEDULE_TELEMETRY_ENV, "on");
@@ -6089,6 +6095,12 @@ fn q8_0_runtime_packed_ffn_gate_up_activation_matches_retained_blocks() {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn q8_0_runtime_packed_prefill_i8mm_matches_current_gemv_path() {
+    // i8mm is ARMv8.6; Apple M1 (and virtualized CI runners) lack it. This test
+    // executes the i8mm kernel directly, so skip when the feature is absent
+    // rather than SIGILL on an illegal instruction.
+    if !std::arch::is_aarch64_feature_detected!("i8mm") {
+        return;
+    }
     let _env_guard = env_lock();
     clear_dense_diagnostic_env();
     std::env::set_var("CAMELID_Q8_0_BLOCK_DOT", "on");
