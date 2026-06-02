@@ -111,6 +111,50 @@ fn header(tensor_count: i64, metadata_count: i64) -> Vec<u8> {
     b
 }
 
+/// Regression: in a pipeline-parallel layer split, the first node owns the token
+/// embedding and the LAST node owns output_norm + the output projection (it computes
+/// the final norm and logits). A 2-node CLI pipeline was previously broken because the
+/// output weights were loaded on the first node, leaving the last node unable to
+/// produce logits (`rms_norm weight shape [0]`).
+#[test]
+fn pipeline_load_puts_output_weights_on_last_node() {
+    let dir = tempdir().unwrap();
+    let model_path = dir.path().join("tiny_model.gguf");
+    write_tiny_llama_gguf(&model_path);
+    let gguf = read_metadata(&model_path).unwrap();
+    let config = LlamaModelConfig::from_gguf(&gguf).unwrap();
+    let binding = LlamaTensorBinding::bind(&gguf, &config).unwrap();
+    let store = TensorStore::open(&model_path, &gguf);
+
+    // First node (layers 0..1): owns the embedding, not the output weights.
+    let first = LlamaLoadedWeights::load(&store, &binding, Some(0..1)).unwrap();
+    assert_ne!(
+        first.token_embedding.shape.dims,
+        vec![0],
+        "first node loads embedding"
+    );
+    assert_eq!(
+        first.output_norm.shape.dims,
+        vec![0],
+        "first node has no output_norm"
+    );
+    first.validate_dense_shapes(&config).unwrap();
+
+    // Last node (layers 1..2): owns output_norm + output, not the embedding.
+    let last = LlamaLoadedWeights::load(&store, &binding, Some(1..2)).unwrap();
+    assert_eq!(
+        last.token_embedding.shape.dims,
+        vec![0],
+        "last node has no embedding"
+    );
+    assert_ne!(
+        last.output_norm.shape.dims,
+        vec![0],
+        "last node loads output_norm"
+    );
+    last.validate_dense_shapes(&config).unwrap();
+}
+
 fn write_tiny_llama_gguf(path: &Path) {
     // 2 layers, tiny dimensions: hidden=8, vocab=16, ffn=16, heads=2, kv_heads=2
     // We have exactly 21 tensors: token_embedding, output_norm, output + 9 tensors per layer (18 total) = 21 tensors.

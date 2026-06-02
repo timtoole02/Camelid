@@ -242,16 +242,41 @@ impl LlamaLoadedWeights {
         binding: &LlamaTensorBinding,
         layer_start: usize,
         layer_end: usize,
-        _load_embedding: bool,
-        _load_output: bool,
+        load_embedding: bool,
+        load_output: bool,
     ) -> Result<Self> {
-        Self::load(store, binding, Some(layer_start..layer_end))
+        // The distributed module's coordinator computes logits on the FIRST node, so
+        // ownership of the embedding/output weights is explicit here rather than
+        // positional. Honor the flags directly.
+        Self::load_with_ownership(
+            store,
+            binding,
+            Some(layer_start..layer_end),
+            load_embedding,
+            load_output,
+        )
     }
 
     pub fn load(
         store: &TensorStore,
         binding: &LlamaTensorBinding,
         layer_range: Option<std::ops::Range<usize>>,
+    ) -> Result<Self> {
+        // Single node (no range) is both first and last. In a pipeline-parallel split,
+        // the first node owns the token embedding and the last node owns output_norm +
+        // the output projection (it computes the final norm and logits).
+        let load_embedding = layer_range.as_ref().is_none_or(|r| r.start == 0);
+        let total_layers = binding.layers.len();
+        let load_output = layer_range.as_ref().is_none_or(|r| r.end >= total_layers);
+        Self::load_with_ownership(store, binding, layer_range, load_embedding, load_output)
+    }
+
+    fn load_with_ownership(
+        store: &TensorStore,
+        binding: &LlamaTensorBinding,
+        layer_range: Option<std::ops::Range<usize>>,
+        load_embedding: bool,
+        load_output: bool,
     ) -> Result<Self> {
         let auto_retain_q8_0_blocks = auto_retain_q8_0_blocks_for_fast_local_chat(binding);
         let load_linear = |name: &str| {
@@ -281,9 +306,7 @@ impl LlamaLoadedWeights {
                 )
             }
         };
-        let is_first_node = layer_range.as_ref().is_none_or(|r| r.start == 0);
-
-        let token_embedding = if is_first_node {
+        let token_embedding = if load_embedding {
             normalize_token_embedding_shape(
                 load_linear(&binding.token_embedding.name)?,
                 &binding.token_embedding.name,
@@ -292,13 +315,13 @@ impl LlamaLoadedWeights {
             CpuTensor::from_f32(&binding.token_embedding.name, vec![0], vec![])?
         };
 
-        let output_norm = if is_first_node {
+        let output_norm = if load_output {
             store.load_cpu_f32(&binding.output_norm.name)?
         } else {
             CpuTensor::from_f32(&binding.output_norm.name, vec![0], vec![])?
         };
 
-        let output = if is_first_node {
+        let output = if load_output {
             if binding.output_is_tied_embedding {
                 if auto_retain_q8_0_blocks {
                     Some(store.load_q8_0_block_backed_linear_as(
@@ -431,14 +454,19 @@ impl LlamaLoadedWeights {
 
     pub fn validate_dense_shapes(&self, config: &LlamaModelConfig) -> Result<()> {
         let dims = DenseLlamaDims::from_config(config)?;
-        let is_first_node = self.layer_range.as_ref().is_none_or(|r| r.start == 0);
+        // Validate whatever weights this node actually loaded. In a pipeline-parallel
+        // split, a node leaves the weights it does not own as empty (rank-0) tensors,
+        // and the owning node validates them. A single node loads/validates everything.
+        let is_loaded = |t: &CpuTensor| t.shape.dims != [0] && !t.shape.dims.is_empty();
 
-        if is_first_node {
+        if is_loaded(&self.token_embedding) {
             require_tensor_shape(
                 &self.token_embedding,
                 &[dims.vocab_size, dims.embedding_length],
                 "token embedding",
             )?;
+        }
+        if is_loaded(&self.output_norm) {
             require_tensor_shape(&self.output_norm, &[dims.embedding_length], "output norm")?;
             require_matrix_shape(
                 self.output_projection(),
