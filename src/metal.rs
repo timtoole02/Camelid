@@ -31,6 +31,7 @@ struct MetalLinearKernel {
     q8_0_encoded_pipeline: ComputePipelineState,
     q8_0_encoded_rows_pipeline: ComputePipelineState,
     q8_0_block_pipeline: ComputePipelineState,
+    q8_0_block_simd_pipeline: ComputePipelineState,
     active_command_buffer: Mutex<Option<metal::CommandBuffer>>,
 }
 
@@ -297,6 +298,42 @@ kernel void q8_0_block_linear_row(
     }
     output[gid] = sum;
 }
+
+// One SIMD-group (32 lanes) per output row: lanes stride over the row's blocks
+// and a simd_sum reduces their partials. Parallelizes the contraction loop 32x
+// versus the one-thread-per-row kernel above, which is bandwidth-bound on the
+// long ffn_down rows. Dispatch with 32 threads/threadgroup, one group per row.
+kernel void q8_0_block_linear_row_simd(
+    device const float* input_scales [[buffer(0)]],
+    device const char* input_quants [[buffer(1)]],
+    device const char* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& blocks_per_row [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    if (row >= rows) return;
+    constexpr uint block_values = 32;
+    constexpr uint q8_block_bytes = 36;
+    uint row_base = row * blocks_per_row * q8_block_bytes;
+    float partial = 0.0;
+    for (uint block_idx = lane; block_idx < blocks_per_row; block_idx += 32) {
+        uint block_base = row_base + block_idx * q8_block_bytes;
+        device const float* weight_scale = reinterpret_cast<device const float*>(weight_blocks + block_base);
+        uint weight_quant_base = block_base + 4;
+        uint input_base = block_idx * block_values;
+        int int_sum = 0;
+        for (uint l = 0; l < block_values; ++l) {
+            int_sum += int(weight_blocks[weight_quant_base + l]) * int(input_quants[input_base + l]);
+        }
+        partial += float(int_sum) * (*weight_scale) * input_scales[block_idx];
+    }
+    float total = simd_sum(partial);
+    if (lane == 0) {
+        output[row] = total;
+    }
+}
 "#;
 
 #[cfg(target_os = "macos")]
@@ -333,6 +370,12 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let q8_0_block_pipeline = device
                 .new_compute_pipeline_state_with_function(&q8_0_block_function)
                 .ok()?;
+            let q8_0_block_simd_function = library
+                .get_function("q8_0_block_linear_row_simd", None)
+                .ok()?;
+            let q8_0_block_simd_pipeline = device
+                .new_compute_pipeline_state_with_function(&q8_0_block_simd_function)
+                .ok()?;
             let queue = device.new_command_queue();
             Some(MetalLinearKernel {
                 device,
@@ -342,6 +385,7 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 q8_0_encoded_pipeline,
                 q8_0_encoded_rows_pipeline,
                 q8_0_block_pipeline,
+                q8_0_block_simd_pipeline,
                 active_command_buffer: Mutex::new(None),
             })
         })
@@ -883,6 +927,123 @@ pub fn try_q8_0_block_linear_row(
         read_buffer_f32(&output_buffer, output);
     }
     true
+}
+
+/// Encode `dispatches` back-to-back Q8_0 GEMV dispatches into a SINGLE command
+/// buffer (one commit + one wait), with a memory barrier between each so they
+/// serialize like a real dependent forward pass. `simd` selects the
+/// SIMD-group-per-row kernel. Returns the wall-clock seconds for the whole
+/// batch, or None if Metal is unavailable.
+///
+/// Diagnostic for the GPU-port decision: comparing per-dispatch cost here against
+/// the per-call cost of `try_q8_0_block_linear_row` isolates fixed commit/wait
+/// round-trip overhead from actual GPU work.
+#[cfg(target_os = "macos")]
+pub fn bench_q8_0_block_linear_row_batched(
+    input_scales: &[f32],
+    input_quants: &[i8],
+    weight_blocks: &[u8],
+    rows: usize,
+    blocks_per_row: usize,
+    output: &mut [f32],
+    dispatches: usize,
+    simd: bool,
+) -> Option<f64> {
+    const Q8_0_BLOCK_VALUES: usize = 32;
+    const Q8_0_BLOCK_BYTES: usize = 36;
+    if rows == 0 || blocks_per_row == 0 || dispatches == 0 || output.len() != rows {
+        return None;
+    }
+    if input_scales.len() != blocks_per_row
+        || input_quants.len() != blocks_per_row * Q8_0_BLOCK_VALUES
+        || weight_blocks.len() != rows * blocks_per_row * Q8_0_BLOCK_BYTES
+    {
+        return None;
+    }
+    let kernel = metal_linear_kernel()?;
+    let mut cache = metal_linear_cache().lock().ok()?;
+    let input_scales_buffer = cache.q8_input_scales_buffer(
+        &kernel.device,
+        std::mem::size_of_val(input_scales),
+        input_scales.as_ptr(),
+    );
+    let input_quants_buffer = cache.q8_input_quants_buffer(
+        &kernel.device,
+        std::mem::size_of_val(input_quants),
+        input_quants.as_ptr(),
+    );
+    let weight_blocks_buffer = cache.q8_block_weight_buffer(&kernel.device, weight_blocks);
+    let output_buffer = cache.output_buffer(
+        &kernel.device,
+        std::mem::size_of_val(output),
+        output.as_mut_ptr(),
+    );
+    let scalar_buffer = cache.scalar_buffer(&kernel.device, 2 * std::mem::size_of::<u32>());
+    write_buffer_f32(&input_scales_buffer, input_scales);
+    write_buffer_i8(&input_quants_buffer, input_quants);
+    unsafe {
+        let scalars = scalar_buffer.contents() as *mut u32;
+        *scalars = blocks_per_row as u32;
+        *scalars.add(1) = rows as u32;
+    }
+
+    let pipeline = if simd {
+        &kernel.q8_0_block_simd_pipeline
+    } else {
+        &kernel.q8_0_block_pipeline
+    };
+    let (threads_per_group, threadgroups) = if simd {
+        (
+            metal::MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: rows as u64,
+                height: 1,
+                depth: 1,
+            },
+        )
+    } else {
+        let width = pipeline.thread_execution_width().max(1);
+        (
+            metal::MTLSize {
+                width,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: (rows as u64).div_ceil(width),
+                height: 1,
+                depth: 1,
+            },
+        )
+    };
+
+    let started = std::time::Instant::now();
+    let command_buffer = kernel.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(&input_scales_buffer), 0);
+    encoder.set_buffer(1, Some(&input_quants_buffer), 0);
+    encoder.set_buffer(2, Some(&weight_blocks_buffer), 0);
+    encoder.set_buffer(3, Some(&output_buffer), 0);
+    encoder.set_buffer(4, Some(&scalar_buffer), 0);
+    encoder.set_buffer(5, Some(&scalar_buffer), std::mem::size_of::<u32>() as u64);
+    for i in 0..dispatches {
+        encoder.dispatch_thread_groups(threadgroups, threads_per_group);
+        if i + 1 < dispatches {
+            encoder.memory_barrier_with_resources(&[&output_buffer]);
+        }
+    }
+    encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    let elapsed = started.elapsed().as_secs_f64();
+    drop(cache);
+    read_buffer_f32(&output_buffer, output);
+    Some(elapsed)
 }
 
 #[cfg(target_os = "macos")]
@@ -1527,6 +1688,65 @@ mod tests {
         ));
         for (actual, expected) in output.into_iter().zip(expected) {
             assert!((actual - expected).abs() < 1.0e-4, "{actual} != {expected}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_q8_0_block_linear_row_simd_matches_cpu_multi_block() {
+        if !detect_metal_device().available {
+            return;
+        }
+        // Multi-block rows exercise the SIMD kernel's strided lane loop + simd_sum.
+        let blocks_per_row = 4_usize;
+        let rows = 8_usize;
+        let input_scales: Vec<f32> = (0..blocks_per_row).map(|b| 0.1 + b as f32 * 0.05).collect();
+        let input_quants: Vec<i8> = (0..blocks_per_row * 32)
+            .map(|j| ((j as i32 % 17) - 8) as i8)
+            .collect();
+        let mut weight_blocks = Vec::new();
+        for r in 0..rows {
+            for b in 0..blocks_per_row {
+                let scale = 0.2_f32 + (r * blocks_per_row + b) as f32 * 0.01;
+                weight_blocks.extend_from_slice(&scale.to_le_bytes());
+                for l in 0..32 {
+                    weight_blocks.push((((r * 7 + b * 3 + l) as i32 % 19) - 9) as i8 as u8);
+                }
+            }
+        }
+        let mut expected = vec![0.0_f32; rows];
+        for (r, slot) in expected.iter_mut().enumerate() {
+            let mut sum = 0.0_f32;
+            for b in 0..blocks_per_row {
+                let base = (r * blocks_per_row + b) * 36;
+                let scale = f32::from_le_bytes([
+                    weight_blocks[base],
+                    weight_blocks[base + 1],
+                    weight_blocks[base + 2],
+                    weight_blocks[base + 3],
+                ]);
+                let mut isum = 0i32;
+                for l in 0..32 {
+                    isum += (weight_blocks[base + 4 + l] as i8 as i32) * input_quants[b * 32 + l] as i32;
+                }
+                sum += isum as f32 * scale * input_scales[b];
+            }
+            *slot = sum;
+        }
+        let mut out = vec![0.0_f32; rows];
+        let elapsed = bench_q8_0_block_linear_row_batched(
+            &input_scales,
+            &input_quants,
+            &weight_blocks,
+            rows,
+            blocks_per_row,
+            &mut out,
+            1,
+            true,
+        );
+        assert!(elapsed.is_some(), "SIMD kernel unavailable");
+        for (actual, expected) in out.iter().zip(&expected) {
+            assert!((actual - expected).abs() < 1.0e-3, "{actual} != {expected}");
         }
     }
 
