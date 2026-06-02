@@ -39,8 +39,15 @@ jobs:
           ! grep -n -E '^(## Current Status|As of 2026-05-22, Camelid is useful but deliberately narrow:|- \\*\\*(Working product surface|Supported exact rows|Next row|Blocked row|Performance posture):\\*\\*)' README.md
 
   rust:
-    runs-on: ubuntu-latest
     needs: public-scrub
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-latest is Apple Silicon, so it compiles and lints the
+        # cfg(target_os = "macos") Metal path that ubuntu never sees. The Metal
+        # tests self-skip when no GPU device is reported by the runner.
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
