@@ -55,8 +55,9 @@ activation packets per token are small, so the link is not the bottleneck.
 
 1. **Connect** both Macs with a TB4 cable. Each gets a Thunderbolt Bridge interface.
 2. **Assign IPs** on the Thunderbolt Bridge (System Settings → Network → Thunderbolt Bridge →
-   Details → TCP/IP → Configure manually), e.g. Mac-A `10.0.0.1`, Mac-B `10.0.0.2`
-   (`/24`). Verify with `ifconfig bridge0` and `ping 10.0.0.2`.
+   Details → TCP/IP → Configure manually) — pick two addresses on a private `/24` of your
+   choice; call them `MAC_A_IP` and `MAC_B_IP`. Verify with `ifconfig bridge0` and
+   `ping "$MAC_B_IP"`.
 3. **Stage** the `camelid` binary and the GGUF model on both Macs. (Build on each Mac, or
    copy a binary built for the same Apple-Silicon generation — note the i8mm prefill path is
    opt-in and M2+ only; default decode uses dotprod, present on all Apple Silicon.)
@@ -68,12 +69,12 @@ activation packets per token are small, so the link is not the bottleneck.
    On **Mac-B** (worker, last node):
    ```bash
    camelid distribute-worker <model>.gguf \
-     --addr 10.0.0.2:5005 --layers 14..28 --master-addr 10.0.0.1:5006
+     --addr "$MAC_B_IP:5005" --layers 14..28 --master-addr "$MAC_A_IP:5006"
    ```
    On **Mac-A** (master, first node):
    ```bash
    camelid distribute-master <model>.gguf \
-     --worker-addr 10.0.0.2:5005 --layers 0..14 --addr 10.0.0.1:5006 \
+     --worker-addr "$MAC_B_IP:5005" --layers 0..14 --addr "$MAC_A_IP:5006" \
      --prompt "Explain what a Rust borrow checker does." --max-tokens 64
    ```
 6. **Network overhead**: `camelid bench-network` (coordinator/worker) measures per-hop RTT and
