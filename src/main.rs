@@ -20,8 +20,9 @@ use camelid::{
         recv_activation_packet, recv_token_feedback, send_activation_packet, send_token_feedback,
     },
     gguf::{read_metadata, GgufTensorType},
-    inference::{LlamaInferenceSession, LlamaLoadedWeights, LlamaSampler},
+    inference::{LlamaInferenceSession, LlamaLoadedWeights, LlamaSampler, SamplingConfig},
     metal::detect_metal_device,
+    model::{LlamaModelConfig, LlamaTensorBinding},
     tensor::{CpuTensor, Q8_0TensorBlocks, TensorStore},
     tokenizer::Tokenizer,
 };
@@ -216,6 +217,38 @@ enum Command {
         /// Override Rayon worker threads.
         #[arg(long)]
         threads: Option<usize>,
+    },
+    /// Single-node generation microbenchmark. Loads a GGUF model once, generates
+    /// from a prompt, and emits one JSON metrics object per measured iteration
+    /// (load/prefill/TTFT/decode timings, decode tok/s, peak RSS). For runtime
+    /// comparison harnesses.
+    BenchGenerate {
+        /// GGUF model path.
+        model: PathBuf,
+        /// Read the prompt from this UTF-8 file. Takes precedence over --prompt.
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
+        /// Inline prompt text (used when --prompt-file is absent).
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Maximum tokens to generate per iteration.
+        #[arg(long, default_value_t = 128)]
+        max_tokens: usize,
+        /// Sampling temperature (0 = greedy/argmax, deterministic).
+        #[arg(long, default_value_t = 0.0)]
+        temperature: f32,
+        /// Number of measured iterations (one JSON object per iteration).
+        #[arg(long, default_value_t = 1)]
+        iterations: usize,
+        /// Run one unmeasured warmup generation before the measured iterations.
+        #[arg(long, default_value_t = false)]
+        warmup: bool,
+        /// Override Rayon worker threads.
+        #[arg(long)]
+        threads: Option<usize>,
+        /// Accepted for compatibility; JSON is always emitted to stdout.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 
@@ -426,8 +459,264 @@ async fn main() -> anyhow::Result<()> {
             run_distribute_master(path, worker_addr, layers, addr, prompt, max_tokens, threads)
                 .await?;
         }
+        Command::BenchGenerate {
+            model,
+            prompt_file,
+            prompt,
+            max_tokens,
+            temperature,
+            iterations,
+            warmup,
+            threads,
+            json: _,
+        } => {
+            run_bench_generate(
+                model,
+                prompt_file,
+                prompt,
+                max_tokens,
+                temperature,
+                iterations,
+                warmup,
+                threads,
+            )?;
+        }
     }
     Ok(())
+}
+
+/// One JSON metrics record per measured generation iteration (stdout, JSONL).
+#[derive(Serialize)]
+struct BenchGenerateRecord {
+    runtime: &'static str,
+    commit: String,
+    model: String,
+    quantization: String,
+    iteration: usize,
+    prompt_tokens: usize,
+    generated_tokens: usize,
+    load_ms: f64,
+    prefill_ms: f64,
+    ttft_ms: f64,
+    decode_ms: f64,
+    tokens_per_second: f64,
+    peak_memory_bytes: u64,
+    output_text: String,
+    output_token_ids: Vec<u32>,
+}
+
+struct GenerationRun {
+    generated: Vec<u32>,
+    prefill_ms: f64,
+    ttft_ms: f64,
+    decode_ms: f64,
+}
+
+/// One full single-node generation with a fresh KV cache (weights are reused).
+fn generate_run(
+    config: &LlamaModelConfig,
+    weights: &Arc<LlamaLoadedWeights>,
+    tokenizer: &Tokenizer,
+    prompt_tokens: &[u32],
+    sampler: &LlamaSampler,
+    max_tokens: usize,
+) -> anyhow::Result<GenerationRun> {
+    let mut session = LlamaInferenceSession::new(config.clone(), weights.clone())?;
+    let mut history: Vec<u32> = prompt_tokens.to_vec();
+    let mut input: Vec<u32> = prompt_tokens.to_vec();
+    let mut generated: Vec<u32> = Vec::new();
+
+    // Prefill + first token: this whole span is time-to-first-token.
+    let ttft_start = Instant::now();
+    let step = session.generate_next_token_with_history_diagnostics(
+        &input,
+        sampler.clone(),
+        &history,
+        false,
+    )?;
+    let ttft_ms = ttft_start.elapsed().as_secs_f64() * 1000.0;
+    let prefill_ms = step.prefill_timings.total as f64 / 1000.0; // microseconds -> ms
+    let first = step.next_token_id;
+    generated.push(first);
+    history.push(first);
+    let mut finished = tokenizer.special.eog.contains(&first);
+    input.clear();
+    input.push(first);
+
+    // Decode the remaining tokens (pure decode throughput).
+    let decode_start = Instant::now();
+    while !finished && generated.len() < max_tokens {
+        let step = session.generate_next_token_with_history_diagnostics(
+            &input,
+            sampler.clone(),
+            &history,
+            false,
+        )?;
+        let next = step.next_token_id;
+        generated.push(next);
+        history.push(next);
+        finished = tokenizer.special.eog.contains(&next);
+        input.clear();
+        input.push(next);
+    }
+    let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+
+    Ok(GenerationRun {
+        generated,
+        prefill_ms,
+        ttft_ms,
+        decode_ms,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_bench_generate(
+    model: PathBuf,
+    prompt_file: Option<PathBuf>,
+    prompt: Option<String>,
+    max_tokens: usize,
+    temperature: f32,
+    iterations: usize,
+    warmup: bool,
+    threads: Option<usize>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(max_tokens >= 1, "--max-tokens must be at least 1");
+    anyhow::ensure!(iterations >= 1, "--iterations must be at least 1");
+    configure_rayon_threads(threads)?;
+
+    let prompt_text = match (&prompt_file, &prompt) {
+        (Some(path), _) => std::fs::read_to_string(path)?,
+        (None, Some(text)) => text.clone(),
+        (None, None) => anyhow::bail!("provide --prompt-file <path> or --prompt <text>"),
+    };
+
+    // Load the model once; this cost is measured separately from generation.
+    let load_start = Instant::now();
+    let gguf = read_metadata(&model)?;
+    let config = LlamaModelConfig::from_gguf(&gguf)?;
+    let binding = LlamaTensorBinding::bind(&gguf, &config)?;
+    let store = TensorStore::open(&model, &gguf);
+    let tokenizer = Tokenizer::from_gguf(&gguf)?;
+    let weights = Arc::new(LlamaLoadedWeights::load(&store, &binding, None)?);
+    let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
+
+    let prompt_token_ids = tokenizer.encode(&prompt_text, true, false)?;
+    let prompt_tokens = prompt_token_ids.len();
+    anyhow::ensure!(prompt_tokens >= 1, "prompt encoded to zero tokens");
+
+    let sampler = if temperature <= 0.0 {
+        LlamaSampler::Greedy
+    } else {
+        LlamaSampler::Sampling(SamplingConfig {
+            temperature,
+            ..Default::default()
+        })
+    };
+
+    let commit = std::env::var("CAMELID_COMMIT").unwrap_or_else(|_| "unknown".to_string());
+    let quantization = infer_quantization(&model);
+    let model_label = model.display().to_string();
+
+    if warmup {
+        eprintln!("[bench-generate] warmup iteration (unmeasured)...");
+        let _ = generate_run(
+            &config,
+            &weights,
+            &tokenizer,
+            &prompt_token_ids,
+            &sampler,
+            max_tokens,
+        )?;
+    }
+
+    let stdout = std::io::stdout();
+    for iteration in 0..iterations {
+        let run = generate_run(
+            &config,
+            &weights,
+            &tokenizer,
+            &prompt_token_ids,
+            &sampler,
+            max_tokens,
+        )?;
+        let generated_tokens = run.generated.len();
+        let decode_tokens = generated_tokens.saturating_sub(1);
+        let tokens_per_second = if run.decode_ms > 0.0 && decode_tokens > 0 {
+            decode_tokens as f64 / (run.decode_ms / 1000.0)
+        } else {
+            0.0
+        };
+        let output_text = tokenizer.decode(&run.generated, true).unwrap_or_default();
+        let record = BenchGenerateRecord {
+            runtime: "camelid",
+            commit: commit.clone(),
+            model: model_label.clone(),
+            quantization: quantization.clone(),
+            iteration,
+            prompt_tokens,
+            generated_tokens,
+            load_ms,
+            prefill_ms: run.prefill_ms,
+            ttft_ms: run.ttft_ms,
+            decode_ms: run.decode_ms,
+            tokens_per_second,
+            peak_memory_bytes: peak_rss_bytes(),
+            output_text,
+            output_token_ids: run.generated,
+        };
+        {
+            let mut handle = stdout.lock();
+            writeln!(handle, "{}", serde_json::to_string(&record)?)?;
+            handle.flush()?;
+        }
+        eprintln!(
+            "[bench-generate] iter {} | prompt {} tok | gen {} tok | ttft {:.1} ms | decode {:.1} ms | {:.2} tok/s | peak {:.2} GB",
+            iteration,
+            prompt_tokens,
+            generated_tokens,
+            record.ttft_ms,
+            record.decode_ms,
+            record.tokens_per_second,
+            record.peak_memory_bytes as f64 / 1.073_741_824e9,
+        );
+    }
+    Ok(())
+}
+
+/// Best-effort quantization label from the GGUF filename.
+fn infer_quantization(path: &std::path::Path) -> String {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_uppercase();
+    for q in [
+        "Q8_0", "Q6_K", "Q5_K_M", "Q5_K_S", "Q5_0", "Q4_K_M", "Q4_K_S", "Q4_0", "Q3_K_M", "Q2_K",
+        "BF16", "F16", "F32",
+    ] {
+        if name.contains(q) {
+            return q.to_string();
+        }
+    }
+    "unknown".to_string()
+}
+
+/// Peak resident set size of this process. macOS reports bytes; Linux kilobytes.
+fn peak_rss_bytes() -> u64 {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+    if ret != 0 {
+        return 0;
+    }
+    let max = usage.ru_maxrss.max(0) as u64;
+    #[cfg(target_os = "macos")]
+    {
+        max
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        max * 1024
+    }
 }
 
 fn connect_with_retry(addr: SocketAddr) -> TcpStream {

@@ -18,6 +18,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 minijinja = { version = "2", features = ["json"] }
+libc = "0.2"
 rayon = "1"
 thiserror = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
