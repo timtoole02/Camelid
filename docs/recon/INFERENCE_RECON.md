@@ -1,7 +1,7 @@
 # Inference Engine Reverse Engineering
 
 > [!NOTE]
-> This document is a design or recon note, not the public support ledger. For current support truth and release status, use [`COMPATIBILITY.md`](COMPATIBILITY.md) and [`STATUS.md`](STATUS.md).
+> This document is a design or recon note, not the public support ledger. For current support truth and release status, use [`COMPATIBILITY.md`](../../COMPATIBILITY.md) and [`STATUS.md`](../../STATUS.md).
 
 Source: inference architecture recon focused on LLaMA-family model structure, GGUF naming conventions, KV-cache behavior, and decoder-only graph execution.
 

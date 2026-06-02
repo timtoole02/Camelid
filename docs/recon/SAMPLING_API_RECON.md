@@ -1,7 +1,7 @@
 # Sampling and API Reverse Engineering
 
 > [!NOTE]
-> This document is a design or recon note, not the public support ledger. For current support truth and release status, use [`COMPATIBILITY.md`](COMPATIBILITY.md) and [`STATUS.md`](STATUS.md).
+> This document is a design or recon note, not the public support ledger. For current support truth and release status, use [`COMPATIBILITY.md`](../../COMPATIBILITY.md) and [`STATUS.md`](../../STATUS.md).
 
 Source: sampling/API behavior recon focused on common OpenAI-compatible local-runtime behavior and ForgeLocal's current integration needs.
 

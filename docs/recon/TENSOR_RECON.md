@@ -1,7 +1,7 @@
 # Tensor Runtime Reverse Engineering
 
 > [!NOTE]
-> This document is a design or recon note, not the public support ledger. For current support truth and release status, use [`COMPATIBILITY.md`](COMPATIBILITY.md) and [`STATUS.md`](STATUS.md).
+> This document is a design or recon note, not the public support ledger. For current support truth and release status, use [`COMPATIBILITY.md`](../../COMPATIBILITY.md) and [`STATUS.md`](../../STATUS.md).
 
 Source: GGUF/GGML-format recon focused on tensor descriptors, tensor type metadata, tensor byte-size validation, and the first CPU reference runtime needed by camelid.
 

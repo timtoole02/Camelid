@@ -1,7 +1,7 @@
 # Camelid SafeTensors Plan
 
 > [!NOTE]
-> This document is a design or recon note, not the public support ledger. For current support truth and release status, use [`COMPATIBILITY.md`](COMPATIBILITY.md) and [`STATUS.md`](STATUS.md).
+> This document is a design or recon note, not the public support ledger. For current support truth and release status, use [`COMPATIBILITY.md`](../../COMPATIBILITY.md) and [`STATUS.md`](../../STATUS.md).
 
 Camelid's active runtime path remains GGUF/TinyLlama parity. SafeTensors support is a parallel architecture lane: design the seams now, avoid GGUF-only assumptions, and do not add loader/runtime churn until the current real-model correctness gate is stable.
 

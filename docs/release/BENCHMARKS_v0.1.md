@@ -20,7 +20,7 @@ If a number is not backed by a committed evidence bundle or a release-captain-ap
 
 ## Committed Snapshot
 
-The current public benchmark source of truth is [`BENCHMARKS.md`](BENCHMARKS.md). This v0.1 file restates the release-safe subset.
+The current public benchmark source of truth is [`BENCHMARKS.md`](../benchmarks/BENCHMARKS.md). This v0.1 file restates the release-safe subset.
 
 ### Ubuntu Bounded Unique-Chat Envelope
 

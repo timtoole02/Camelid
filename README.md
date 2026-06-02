@@ -94,16 +94,16 @@ Real-model parity, comparator baselines, and full v0.1 evidence bundles require 
 
 - [`COMPATIBILITY.md`](COMPATIBILITY.md) - authoritative support contract
 - [`SUPPORT_MATRIX_v0.1.md`](SUPPORT_MATRIX_v0.1.md) - v0.1 release-candidate support boundary
-- [`CORRECTNESS_v0.1.md`](CORRECTNESS_v0.1.md) - v0.1 correctness boundary
+- [`CORRECTNESS_v0.1.md`](docs/release/CORRECTNESS_v0.1.md) - v0.1 correctness boundary
 - [`STATUS.md`](STATUS.md) - current evidence snapshot and blockers
-- [`BENCHMARKS.md`](BENCHMARKS.md) - committed benchmark snapshot and claim rules
+- [`BENCHMARKS.md`](docs/benchmarks/BENCHMARKS.md) - committed benchmark snapshot and claim rules
 - [`docs/WAR_ROOM_EVIDENCE_INDEX.md`](docs/WAR_ROOM_EVIDENCE_INDEX.md) - claim-source order, evidence index, and public wording policy
-- [`RELEASE_NOTES_v0.1.md`](RELEASE_NOTES_v0.1.md) - v0.1 release candidate notes
-- [`BENCHMARKS_v0.1.md`](BENCHMARKS_v0.1.md) - v0.1 benchmark posture
-- [`MARKET_POSITIONING_v0.1.md`](MARKET_POSITIONING_v0.1.md) - public positioning guardrails
-- [`RELEASE_GATE_v0.1.md`](RELEASE_GATE_v0.1.md) - release gate commands and status
+- [`RELEASE_NOTES_v0.1.md`](docs/release/RELEASE_NOTES_v0.1.md) - v0.1 release candidate notes
+- [`BENCHMARKS_v0.1.md`](docs/release/BENCHMARKS_v0.1.md) - v0.1 benchmark posture
+- [`MARKET_POSITIONING_v0.1.md`](docs/release/MARKET_POSITIONING_v0.1.md) - public positioning guardrails
+- [`RELEASE_GATE_v0.1.md`](docs/release/RELEASE_GATE_v0.1.md) - release gate commands and status
 - [`ROADMAP.md`](ROADMAP.md) - planned engineering sequence
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) - implementation architecture
+- [`ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md) - implementation architecture
 
 ## License and Reference Credits
 

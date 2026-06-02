@@ -1,7 +1,7 @@
 # Tokenizer Reverse Engineering
 
 > [!NOTE]
-> This document is a design or recon note, not the public support ledger. For current support truth and release status, use [`COMPATIBILITY.md`](COMPATIBILITY.md) and [`STATUS.md`](STATUS.md).
+> This document is a design or recon note, not the public support ledger. For current support truth and release status, use [`COMPATIBILITY.md`](../../COMPATIBILITY.md) and [`STATUS.md`](../../STATUS.md).
 
 Source: tokenizer recon focused on GGUF tokenizer metadata keys and common LLaMA-family tokenizer behavior.
 

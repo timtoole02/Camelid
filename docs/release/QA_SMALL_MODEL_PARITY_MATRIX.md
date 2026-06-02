@@ -4,8 +4,8 @@ Last updated: 2026-05-24
 
 > [!NOTE]
 > This matrix is a QA evidence summary, not the public support ledger. For current support truth,
-> use [`COMPATIBILITY.md`](COMPATIBILITY.md), [`STATUS.md`](STATUS.md), and the owner matrix in
-> [`FULL_SUPPORT_BLOCKER_MATRIX.md`](FULL_SUPPORT_BLOCKER_MATRIX.md).
+> use [`COMPATIBILITY.md`](../../COMPATIBILITY.md), [`STATUS.md`](../../STATUS.md), and the owner matrix in
+> [`FULL_SUPPORT_BLOCKER_MATRIX.md`](../../FULL_SUPPORT_BLOCKER_MATRIX.md).
 
 ## Scope
 

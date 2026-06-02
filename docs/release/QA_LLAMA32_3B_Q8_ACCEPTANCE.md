@@ -4,8 +4,8 @@ Last updated: 2026-05-05
 
 > [!NOTE]
 > This QA checklist is an acceptance document for one exact model row. It does not change the
-> public support contract by itself. For current support truth, use [`COMPATIBILITY.md`](COMPATIBILITY.md)
-> and [`STATUS.md`](STATUS.md).
+> public support contract by itself. For current support truth, use [`COMPATIBILITY.md`](../../COMPATIBILITY.md)
+> and [`STATUS.md`](../../STATUS.md).
 
 QA checklist for the exact Llama 3.2 3B WebUI real-chat acceptance gate. The short local-chat
 smoke gate is now accepted for this exact row; this file remains the QA boundary for preserving
