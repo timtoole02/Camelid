@@ -939,6 +939,7 @@ pub fn try_q8_0_block_linear_row(
 /// the per-call cost of `try_q8_0_block_linear_row` isolates fixed commit/wait
 /// round-trip overhead from actual GPU work.
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)] // bench helper: explicit tensor/shape params are clearer than a struct here
 pub fn bench_q8_0_block_linear_row_batched(
     input_scales: &[f32],
     input_quants: &[i8],
@@ -1727,7 +1728,8 @@ mod tests {
                 ]);
                 let mut isum = 0i32;
                 for l in 0..32 {
-                    isum += (weight_blocks[base + 4 + l] as i8 as i32) * input_quants[b * 32 + l] as i32;
+                    isum += (weight_blocks[base + 4 + l] as i8 as i32)
+                        * input_quants[b * 32 + l] as i32;
                 }
                 sum += isum as f32 * scale * input_scales[b];
             }
