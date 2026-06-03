@@ -36,6 +36,7 @@ struct MetalLinearKernel {
     residual_add_pipeline: ComputePipelineState,
     silu_mul_pipeline: ComputePipelineState,
     rope_rotate_pipeline: ComputePipelineState,
+    attention_decode_pipeline: ComputePipelineState,
     active_command_buffer: Mutex<Option<metal::CommandBuffer>>,
 }
 
@@ -436,6 +437,60 @@ kernel void rope_rotate_f32(
     data[dim0] = x0 * c - x1 * s;
     data[dim1] = x0 * s + x1 * c;
 }
+
+// Single-query (decode) causal attention over a contiguous KV cache, one thread per
+// query head. Mirrors attention_context_for_head_into: score = dot(q, k_p) * scale,
+// softmax over positions (max-shift), then out = sum_p prob_p * v_p. GQA maps query
+// head -> kv head by integer group (group = n_heads / n_kv_heads). Keys/values are
+// laid out [kv_head][position][head_dim]; scores is scratch [n_heads*position_count].
+kernel void attention_decode_f32(
+    device const float* query [[buffer(0)]],
+    device const float* keys [[buffer(1)]],
+    device const float* values [[buffer(2)]],
+    device float* scores [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& n_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& position_count [[buffer(7)]],
+    constant uint& group [[buffer(8)]],
+    constant float& scale [[buffer(9)]],
+    uint head [[thread_position_in_grid]]
+) {
+    if (head >= n_heads) return;
+    uint kv_head = head / group;
+    uint q_base = head * head_dim;
+    uint kv_base = kv_head * position_count * head_dim;
+    uint score_base = head * position_count;
+
+    float max_score = -INFINITY;
+    for (uint p = 0; p < position_count; ++p) {
+        float s = 0.0;
+        uint k_base = kv_base + p * head_dim;
+        for (uint d = 0; d < head_dim; ++d) {
+            s += query[q_base + d] * keys[k_base + d];
+        }
+        s *= scale;
+        scores[score_base + p] = s;
+        max_score = max(max_score, s);
+    }
+    float sum = 0.0;
+    for (uint p = 0; p < position_count; ++p) {
+        float e = exp(scores[score_base + p] - max_score);
+        scores[score_base + p] = e;
+        sum += e;
+    }
+    float inv = 1.0 / sum;
+    for (uint d = 0; d < head_dim; ++d) {
+        output[q_base + d] = 0.0;
+    }
+    for (uint p = 0; p < position_count; ++p) {
+        float prob = scores[score_base + p] * inv;
+        uint v_base = kv_base + p * head_dim;
+        for (uint d = 0; d < head_dim; ++d) {
+            output[q_base + d] += prob * values[v_base + d];
+        }
+    }
+}
 "#;
 
 #[cfg(target_os = "macos")]
@@ -473,6 +528,12 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 .ok()?;
             let rope_rotate_pipeline = device
                 .new_compute_pipeline_state_with_function(&rope_rotate_function)
+                .ok()?;
+            let attention_decode_function = elementwise_library
+                .get_function("attention_decode_f32", None)
+                .ok()?;
+            let attention_decode_pipeline = device
+                .new_compute_pipeline_state_with_function(&attention_decode_function)
                 .ok()?;
             let descriptor_function = library.get_function("linear_row_f32", None).ok()?;
             let descriptor_pipeline = device
@@ -519,6 +580,7 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 residual_add_pipeline,
                 silu_mul_pipeline,
                 rope_rotate_pipeline,
+                attention_decode_pipeline,
                 active_command_buffer: Mutex::new(None),
             })
         })
@@ -1613,8 +1675,110 @@ pub fn try_rope_rotate_f32(
     Some(out)
 }
 
+/// GPU single-query (decode) causal attention over a contiguous KV cache laid out
+/// [kv_head][position][head_dim]. GQA via `group = n_heads / n_kv_heads`. Returns the
+/// per-head context [n_heads*head_dim], or None if Metal is unavailable. Mirrors
+/// attention_context_for_head_into.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+pub fn try_attention_decode_f32(
+    query: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    position_count: usize,
+    scale: f32,
+) -> Option<Vec<f32>> {
+    if n_heads == 0
+        || n_kv_heads == 0
+        || head_dim == 0
+        || position_count == 0
+        || !n_heads.is_multiple_of(n_kv_heads)
+        || query.len() != n_heads * head_dim
+        || keys.len() != n_kv_heads * position_count * head_dim
+        || values.len() != keys.len()
+    {
+        return None;
+    }
+    let kernel = metal_linear_kernel()?;
+    let group = (n_heads / n_kv_heads) as u32;
+    let new = |bytes: u64| {
+        kernel
+            .device
+            .new_buffer(bytes, MTLResourceOptions::StorageModeShared)
+    };
+    let query_buf = new(std::mem::size_of_val(query) as u64);
+    let keys_buf = new(std::mem::size_of_val(keys) as u64);
+    let values_buf = new(std::mem::size_of_val(values) as u64);
+    let scores_buf = new((n_heads * position_count * 4) as u64);
+    let output_buf = new((n_heads * head_dim * 4) as u64);
+    let scalar_buf = new(20);
+    write_buffer_f32(&query_buf, query);
+    write_buffer_f32(&keys_buf, keys);
+    write_buffer_f32(&values_buf, values);
+    unsafe {
+        let p = scalar_buf.contents() as *mut u8;
+        *(p as *mut u32) = n_heads as u32;
+        *(p.add(4) as *mut u32) = head_dim as u32;
+        *(p.add(8) as *mut u32) = position_count as u32;
+        *(p.add(12) as *mut u32) = group;
+        *(p.add(16) as *mut f32) = scale;
+    }
+    let command_buffer = kernel.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&kernel.attention_decode_pipeline);
+    encoder.set_buffer(0, Some(&query_buf), 0);
+    encoder.set_buffer(1, Some(&keys_buf), 0);
+    encoder.set_buffer(2, Some(&values_buf), 0);
+    encoder.set_buffer(3, Some(&scores_buf), 0);
+    encoder.set_buffer(4, Some(&output_buf), 0);
+    encoder.set_buffer(5, Some(&scalar_buf), 0);
+    encoder.set_buffer(6, Some(&scalar_buf), 4);
+    encoder.set_buffer(7, Some(&scalar_buf), 8);
+    encoder.set_buffer(8, Some(&scalar_buf), 12);
+    encoder.set_buffer(9, Some(&scalar_buf), 16);
+    let width = kernel
+        .attention_decode_pipeline
+        .thread_execution_width()
+        .max(1);
+    let threads_per_group = metal::MTLSize {
+        width,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroups = metal::MTLSize {
+        width: (n_heads as u64).div_ceil(width),
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(threadgroups, threads_per_group);
+    encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    let mut out = vec![0.0f32; n_heads * head_dim];
+    read_buffer_f32(&output_buf, &mut out);
+    Some(out)
+}
+
 #[cfg(not(target_os = "macos"))]
 pub fn try_rms_norm_f32(_input: &[f32], _weight: &[f32], _eps: f32) -> Option<Vec<f32>> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+pub fn try_attention_decode_f32(
+    _query: &[f32],
+    _keys: &[f32],
+    _values: &[f32],
+    _n_heads: usize,
+    _n_kv_heads: usize,
+    _head_dim: usize,
+    _position_count: usize,
+    _scale: f32,
+) -> Option<Vec<f32>> {
     None
 }
 
@@ -1847,6 +2011,63 @@ mod tests {
         let got = try_silu_mul_f32(&gate, &up).expect("metal silu_mul");
         for (a, b) in got.iter().zip(&expected) {
             assert!((a - b).abs() < 1.0e-3, "{a} != {b}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_attention_decode_matches_reference() {
+        if !detect_metal_device().available {
+            return;
+        }
+        // MHA (n_kv_heads == n_heads), contiguous KV cache.
+        let n_heads = 2usize;
+        let head_dim = 4usize;
+        let positions = 3usize;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let query: Vec<f32> = (0..n_heads * head_dim)
+            .map(|i| ((i as f32 % 5.0) - 2.0) * 0.3)
+            .collect();
+        let keys: Vec<f32> = (0..n_heads * positions * head_dim)
+            .map(|i| ((i as f32 % 7.0) - 3.0) * 0.2)
+            .collect();
+        let values: Vec<f32> = (0..n_heads * positions * head_dim)
+            .map(|i| ((i as f32 % 4.0) - 1.0) * 0.5)
+            .collect();
+        // Reference: per head, softmax(dot(q,k)*scale) then weighted V sum.
+        let mut expected = vec![0.0f32; n_heads * head_dim];
+        for h in 0..n_heads {
+            let qb = h * head_dim;
+            let kvb = h * positions * head_dim;
+            let mut scores = vec![0.0f32; positions];
+            for (p, score) in scores.iter_mut().enumerate() {
+                let kb = kvb + p * head_dim;
+                let mut s = 0.0;
+                for d in 0..head_dim {
+                    s += query[qb + d] * keys[kb + d];
+                }
+                *score = s * scale;
+            }
+            let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0;
+            for s in scores.iter_mut() {
+                *s = (*s - m).exp();
+                sum += *s;
+            }
+            for (p, s) in scores.iter().enumerate() {
+                let prob = s / sum;
+                let vb = kvb + p * head_dim;
+                for d in 0..head_dim {
+                    expected[qb + d] += prob * values[vb + d];
+                }
+            }
+        }
+        let got = try_attention_decode_f32(
+            &query, &keys, &values, n_heads, n_heads, head_dim, positions, scale,
+        )
+        .expect("metal attention");
+        for (a, b) in got.iter().zip(&expected) {
+            assert!((a - b).abs() < 1.0e-4, "{a} != {b}");
         }
     }
 
