@@ -2122,14 +2122,28 @@ fn encode_q8_matmul(
     rows: usize,
 ) {
     let e = cb.new_compute_command_encoder();
-    e.set_compute_pipeline_state(&k.q8_0_block_pipeline);
+    // Use the SIMD-group GEMV (one threadgroup per output row, a 32-lane simd_sum reduction)
+    // rather than the scalar one-thread-per-row kernel: same bindings, far higher memory
+    // throughput, which dominates resident decode (one matmul per projection per layer).
+    e.set_compute_pipeline_state(&k.q8_0_block_simd_pipeline);
     e.set_buffer(0, Some(scales), 0);
     e.set_buffer(1, Some(quants), 0);
     e.set_buffer(2, Some(weight), 0);
     e.set_buffer(3, Some(out), 0);
     e.set_buffer(4, Some(scalar), 0);
     e.set_buffer(5, Some(scalar), 4);
-    dispatch_1d(e, &k.q8_0_block_pipeline, rows);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: rows as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
+    );
     e.end_encoding();
 }
 
@@ -3127,7 +3141,10 @@ pub struct ResidentDecodeState {
     head_dim: usize,
     hidden: usize,
     ffn_dim: usize,
+    /// Positions the KV cache is currently allocated for; grown on demand toward `cap`.
     max_positions: usize,
+    /// Hard ceiling on `max_positions` (the model context length): growth never exceeds it.
+    cap: usize,
     eps: f32,
     split_half_pairing: bool,
     cache_k: Vec<Buffer>,
@@ -3142,8 +3159,9 @@ pub struct ResidentDecodeState {
 
 #[cfg(target_os = "macos")]
 impl ResidentDecodeState {
-    /// Allocate the session. `max_positions` is the context length the KV cache is sized for.
-    /// Returns None if Metal is unavailable or the dimensions are invalid.
+    /// Allocate the session. `max_positions` is the initial KV-cache capacity (grown on demand
+    /// up to `cap`, the model context length). Returns None if Metal is unavailable or the
+    /// dimensions are invalid.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         n_layers: usize,
@@ -3153,6 +3171,7 @@ impl ResidentDecodeState {
         hidden: usize,
         ffn_dim: usize,
         max_positions: usize,
+        cap: usize,
         eps: f32,
         split_half_pairing: bool,
     ) -> Option<Self> {
@@ -3169,6 +3188,7 @@ impl ResidentDecodeState {
             || ffn_dim == 0
             || !ffn_dim.is_multiple_of(32)
             || max_positions == 0
+            || cap < max_positions
         {
             return None;
         }
@@ -3188,6 +3208,7 @@ impl ResidentDecodeState {
             hidden,
             ffn_dim,
             max_positions,
+            cap,
             eps,
             split_half_pairing,
             cache_k,
@@ -3197,6 +3218,57 @@ impl ResidentDecodeState {
             mid: nb(hidden),
             filled: 0,
         })
+    }
+
+    /// Grow the KV cache to at least `needed` positions (capped at `self.cap`) by allocating
+    /// larger per-layer buffers and blitting the `filled` materialized slots across (the
+    /// per-head position stride changes with `max_positions`). GPU-to-GPU, no CPU readback.
+    /// Returns false if `needed` exceeds the cap or Metal is unavailable.
+    fn ensure_capacity(&mut self, needed: usize) -> bool {
+        if needed <= self.max_positions {
+            return true;
+        }
+        if needed > self.cap {
+            return false;
+        }
+        let new_max = (self.max_positions * 2).max(needed).min(self.cap);
+        let k = match metal_linear_kernel() {
+            Some(k) => k,
+            None => return false,
+        };
+        let kv_slots = self.n_kv_heads * new_max * self.head_dim;
+        let new_k: Vec<Buffer> = (0..self.n_layers)
+            .map(|_| {
+                k.device
+                    .new_buffer((kv_slots * 4) as u64, MTLResourceOptions::StorageModeShared)
+            })
+            .collect();
+        let new_v: Vec<Buffer> = (0..self.n_layers)
+            .map(|_| {
+                k.device
+                    .new_buffer((kv_slots * 4) as u64, MTLResourceOptions::StorageModeShared)
+            })
+            .collect();
+        if self.filled > 0 {
+            let run = (self.filled * self.head_dim * 4) as u64;
+            let cb = k.queue.new_command_buffer();
+            let blit = cb.new_blit_command_encoder();
+            for layer in 0..self.n_layers {
+                for h in 0..self.n_kv_heads {
+                    let src = (h * self.max_positions * self.head_dim * 4) as u64;
+                    let dst = (h * new_max * self.head_dim * 4) as u64;
+                    blit.copy_from_buffer(&self.cache_k[layer], src, &new_k[layer], dst, run);
+                    blit.copy_from_buffer(&self.cache_v[layer], src, &new_v[layer], dst, run);
+                }
+            }
+            blit.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+        }
+        self.cache_k = new_k;
+        self.cache_v = new_v;
+        self.max_positions = new_max;
+        true
     }
 
     /// Positions currently materialized in the KV cache (seeded + appended).
@@ -3225,9 +3297,12 @@ impl ResidentDecodeState {
         scale: f32,
     ) -> Option<Vec<f32>> {
         let half_rope = cos_t.len();
+        // Grow the on-GPU KV cache if this token's position is past the current capacity.
+        if !self.ensure_capacity(position + 1) {
+            return None;
+        }
         if embedding.len() != self.hidden
             || layers.len() != self.n_layers
-            || position >= self.max_positions
             || sin_t.len() != half_rope
             || half_rope * 2 > self.head_dim
         {
@@ -3434,6 +3509,7 @@ impl ResidentDecodeState {
         _hidden: usize,
         _ffn_dim: usize,
         _max_positions: usize,
+        _cap: usize,
         _eps: f32,
         _split_half_pairing: bool,
     ) -> Option<Self> {
@@ -4498,6 +4574,9 @@ mod tests {
             head_dim,
             hidden,
             ffn,
+            // Tiny initial capacity with a larger cap so the multi-token loop exercises the
+            // on-demand growth (GPU->GPU blit of materialized slots) as well as appends.
+            2,
             max_positions,
             eps,
             false,

@@ -1380,11 +1380,13 @@ impl LlamaInferenceSession {
         let hidden = dims.embedding_length;
         let ffn_dim = dims.feed_forward_length;
         let n_layers = dims.block_count;
-        let max_positions = self.config.context_length as usize;
+        // The on-GPU KV cache grows on demand up to `kv_cap` (the model context length); sizing
+        // it to the full (often 128K) context up front would allocate tens of GB and thrash
+        // unified memory. Start sized to the current need plus a chunk and let the session grow.
+        let kv_cap = self.config.context_length as usize;
         let position = self.kv_cache.position;
-        if position >= max_positions
-            || embedding.data.len() != hidden
-            || weights.layers.len() != n_layers
+        let initial_positions = ((position + 1).max(512)).next_multiple_of(512).min(kv_cap);
+        if position >= kv_cap || embedding.data.len() != hidden || weights.layers.len() != n_layers
         {
             return Ok(None);
         }
@@ -1415,7 +1417,8 @@ impl LlamaInferenceSession {
                 head_dim,
                 hidden,
                 ffn_dim,
-                max_positions,
+                initial_positions,
+                kv_cap,
                 rms_eps,
                 tables.split_half_pairing,
             ) {
