@@ -35,6 +35,7 @@ struct MetalLinearKernel {
     rms_norm_pipeline: ComputePipelineState,
     residual_add_pipeline: ComputePipelineState,
     silu_mul_pipeline: ComputePipelineState,
+    rope_rotate_pipeline: ComputePipelineState,
     active_command_buffer: Mutex<Option<metal::CommandBuffer>>,
 }
 
@@ -399,6 +400,42 @@ kernel void silu_mul_f32(
     float g = gate[gid];
     output[gid] = (g / (1.0 + exp(-g))) * up[gid];
 }
+
+// Forward RoPE rotation in-place across all heads. The per-pair cos/sin tables are
+// computed on the CPU (which owns the freq/scaling math) and passed in, so this
+// kernel only does the rotation. One thread per (head, pair).
+// pairing: 0 = adjacent even/odd, 1 = split-half.
+kernel void rope_rotate_f32(
+    device float* data [[buffer(0)]],
+    device const float* cos_table [[buffer(1)]],
+    device const float* sin_table [[buffer(2)]],
+    constant uint& head_count [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    constant uint& half_rope [[buffer(5)]],
+    constant uint& pairing [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = head_count * half_rope;
+    if (gid >= total) return;
+    uint head = gid / half_rope;
+    uint pair = gid - head * half_rope;
+    float c = cos_table[pair];
+    float s = sin_table[pair];
+    uint head_start = head * head_dim;
+    uint dim0;
+    uint dim1;
+    if (pairing == 0u) {
+        dim0 = head_start + pair * 2u;
+        dim1 = dim0 + 1u;
+    } else {
+        dim0 = head_start + pair;
+        dim1 = head_start + pair + half_rope;
+    }
+    float x0 = data[dim0];
+    float x1 = data[dim1];
+    data[dim0] = x0 * c - x1 * s;
+    data[dim1] = x0 * s + x1 * c;
+}
 "#;
 
 #[cfg(target_os = "macos")]
@@ -430,6 +467,12 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 .ok()?;
             let silu_mul_pipeline = device
                 .new_compute_pipeline_state_with_function(&silu_mul_function)
+                .ok()?;
+            let rope_rotate_function = elementwise_library
+                .get_function("rope_rotate_f32", None)
+                .ok()?;
+            let rope_rotate_pipeline = device
+                .new_compute_pipeline_state_with_function(&rope_rotate_function)
                 .ok()?;
             let descriptor_function = library.get_function("linear_row_f32", None).ok()?;
             let descriptor_pipeline = device
@@ -475,6 +518,7 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 rms_norm_pipeline,
                 residual_add_pipeline,
                 silu_mul_pipeline,
+                rope_rotate_pipeline,
                 active_command_buffer: Mutex::new(None),
             })
         })
@@ -1489,8 +1533,102 @@ pub fn try_silu_mul_f32(gate: &[f32], up: &[f32]) -> Option<Vec<f32>> {
     try_binary_elementwise_f32(&kernel.silu_mul_pipeline, gate, up)
 }
 
+/// GPU forward RoPE rotation across all heads, applied to a copy of `data`. The
+/// cos/sin tables (one entry per rotated pair) come from the CPU's frequency/scaling
+/// math; this only performs the rotation. `split_half_pairing` selects split-half vs
+/// adjacent even/odd. None if Metal is unavailable.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+pub fn try_rope_rotate_f32(
+    data: &[f32],
+    cos_table: &[f32],
+    sin_table: &[f32],
+    head_count: usize,
+    head_dim: usize,
+    half_rope: usize,
+    split_half_pairing: bool,
+) -> Option<Vec<f32>> {
+    if head_count == 0
+        || half_rope == 0
+        || data.len() != head_count * head_dim
+        || cos_table.len() != half_rope
+        || sin_table.len() != half_rope
+        || half_rope * 2 > head_dim
+    {
+        return None;
+    }
+    let kernel = metal_linear_kernel()?;
+    let data_bytes = std::mem::size_of_val(data) as u64;
+    let table_bytes = std::mem::size_of_val(cos_table) as u64;
+    let data_buf = kernel
+        .device
+        .new_buffer(data_bytes, MTLResourceOptions::StorageModeShared);
+    let cos_buf = kernel
+        .device
+        .new_buffer(table_bytes, MTLResourceOptions::StorageModeShared);
+    let sin_buf = kernel
+        .device
+        .new_buffer(table_bytes, MTLResourceOptions::StorageModeShared);
+    let scalar_buf = kernel
+        .device
+        .new_buffer(16, MTLResourceOptions::StorageModeShared);
+    write_buffer_f32(&data_buf, data);
+    write_buffer_f32(&cos_buf, cos_table);
+    write_buffer_f32(&sin_buf, sin_table);
+    unsafe {
+        let p = scalar_buf.contents() as *mut u32;
+        *p = head_count as u32;
+        *p.add(1) = head_dim as u32;
+        *p.add(2) = half_rope as u32;
+        *p.add(3) = u32::from(split_half_pairing);
+    }
+    let command_buffer = kernel.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&kernel.rope_rotate_pipeline);
+    encoder.set_buffer(0, Some(&data_buf), 0);
+    encoder.set_buffer(1, Some(&cos_buf), 0);
+    encoder.set_buffer(2, Some(&sin_buf), 0);
+    encoder.set_buffer(3, Some(&scalar_buf), 0);
+    encoder.set_buffer(4, Some(&scalar_buf), 4);
+    encoder.set_buffer(5, Some(&scalar_buf), 8);
+    encoder.set_buffer(6, Some(&scalar_buf), 12);
+    let total = (head_count * half_rope) as u64;
+    let width = kernel.rope_rotate_pipeline.thread_execution_width().max(1);
+    let threads_per_group = metal::MTLSize {
+        width,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroups = metal::MTLSize {
+        width: total.div_ceil(width),
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(threadgroups, threads_per_group);
+    encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    let mut out = vec![0.0f32; data.len()];
+    read_buffer_f32(&data_buf, &mut out);
+    Some(out)
+}
+
 #[cfg(not(target_os = "macos"))]
 pub fn try_rms_norm_f32(_input: &[f32], _weight: &[f32], _eps: f32) -> Option<Vec<f32>> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+pub fn try_rope_rotate_f32(
+    _data: &[f32],
+    _cos_table: &[f32],
+    _sin_table: &[f32],
+    _head_count: usize,
+    _head_dim: usize,
+    _half_rope: usize,
+    _split_half_pairing: bool,
+) -> Option<Vec<f32>> {
     None
 }
 
@@ -1709,6 +1847,39 @@ mod tests {
         let got = try_silu_mul_f32(&gate, &up).expect("metal silu_mul");
         for (a, b) in got.iter().zip(&expected) {
             assert!((a - b).abs() < 1.0e-3, "{a} != {b}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_rope_rotate_matches_reference() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let head_count = 4usize;
+        let head_dim = 8usize;
+        let half = head_dim / 2;
+        let data: Vec<f32> = (0..head_count * head_dim)
+            .map(|i| (i as f32 % 9.0) - 4.0)
+            .collect();
+        let cos_t: Vec<f32> = (0..half).map(|p| (0.3 + p as f32 * 0.2).cos()).collect();
+        let sin_t: Vec<f32> = (0..half).map(|p| (0.3 + p as f32 * 0.2).sin()).collect();
+        // Reference: adjacent even/odd forward rotation, same as apply_rope_to_row.
+        let mut expected = data.clone();
+        for head in 0..head_count {
+            let hs = head * head_dim;
+            for pair in 0..half {
+                let d0 = hs + pair * 2;
+                let d1 = d0 + 1;
+                let (x0, x1) = (data[d0], data[d1]);
+                expected[d0] = x0 * cos_t[pair] - x1 * sin_t[pair];
+                expected[d1] = x0 * sin_t[pair] + x1 * cos_t[pair];
+            }
+        }
+        let got = try_rope_rotate_f32(&data, &cos_t, &sin_t, head_count, head_dim, half, false)
+            .expect("metal rope");
+        for (a, b) in got.iter().zip(&expected) {
+            assert!((a - b).abs() < 1.0e-4, "{a} != {b}");
         }
     }
 
