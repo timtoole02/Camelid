@@ -442,8 +442,13 @@ kernel void rope_rotate_f32(
 // Single-query (decode) causal attention over a contiguous KV cache, one thread per
 // query head. Mirrors attention_context_for_head_into: score = dot(q, k_p) * scale,
 // softmax over positions (max-shift), then out = sum_p prob_p * v_p. GQA maps query
-// head -> kv head by integer group (group = n_heads / n_kv_heads). Keys/values are
-// laid out [kv_head][position][head_dim]; scores is scratch [n_heads*position_count].
+// head -> kv head by integer group (group = n_heads / n_kv_heads). The K/V element at
+// (kv_head, position, d) lives at kv_base_offset + kv_head*kv_head_stride +
+// position*position_stride + d (strides in floats). The contiguous [kv_head][position]
+// [head_dim] layout is kv_head_stride=position_count*head_dim, position_stride=head_dim,
+// kv_base_offset=0; an interleaved per-layer slice of a [position][layer][kv_head]
+// [head_dim] cache uses position_stride=layer_count*n_kv*head_dim, kv_head_stride=head_dim,
+// kv_base_offset=layer*n_kv*head_dim. scores is scratch [n_heads*position_count].
 kernel void attention_decode_f32(
     device const float* query [[buffer(0)]],
     device const float* keys [[buffer(1)]],
@@ -455,18 +460,21 @@ kernel void attention_decode_f32(
     constant uint& position_count [[buffer(7)]],
     constant uint& group [[buffer(8)]],
     constant float& scale [[buffer(9)]],
+    constant uint& position_stride [[buffer(10)]],
+    constant uint& kv_head_stride [[buffer(11)]],
+    constant uint& kv_base_offset [[buffer(12)]],
     uint head [[thread_position_in_grid]]
 ) {
     if (head >= n_heads) return;
     uint kv_head = head / group;
     uint q_base = head * head_dim;
-    uint kv_base = kv_head * position_count * head_dim;
+    uint kv_base = kv_base_offset + kv_head * kv_head_stride;
     uint score_base = head * position_count;
 
     float max_score = -INFINITY;
     for (uint p = 0; p < position_count; ++p) {
         float s = 0.0;
-        uint k_base = kv_base + p * head_dim;
+        uint k_base = kv_base + p * position_stride;
         for (uint d = 0; d < head_dim; ++d) {
             s += query[q_base + d] * keys[k_base + d];
         }
@@ -486,7 +494,7 @@ kernel void attention_decode_f32(
     }
     for (uint p = 0; p < position_count; ++p) {
         float prob = scores[score_base + p] * inv;
-        uint v_base = kv_base + p * head_dim;
+        uint v_base = kv_base + p * position_stride;
         for (uint d = 0; d < head_dim; ++d) {
             output[q_base + d] += prob * values[v_base + d];
         }
@@ -1727,7 +1735,7 @@ pub fn try_rope_rotate_f32(
 /// GPU single-query (decode) causal attention over a contiguous KV cache laid out
 /// [kv_head][position][head_dim]. GQA via `group = n_heads / n_kv_heads`. Returns the
 /// per-head context [n_heads*head_dim], or None if Metal is unavailable. Mirrors
-/// attention_context_for_head_into.
+/// attention_context_for_head_into. Thin wrapper over `try_attention_decode_strided_f32`.
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 pub fn try_attention_decode_f32(
@@ -1740,14 +1748,63 @@ pub fn try_attention_decode_f32(
     position_count: usize,
     scale: f32,
 ) -> Option<Vec<f32>> {
+    if head_dim == 0
+        || position_count == 0
+        || keys.len() != n_kv_heads * position_count * head_dim
+        || values.len() != keys.len()
+    {
+        return None;
+    }
+    try_attention_decode_strided_f32(
+        query,
+        keys,
+        values,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        position_count,
+        scale,
+        head_dim,
+        position_count * head_dim,
+        0,
+    )
+}
+
+/// GPU single-query (decode) causal attention reading the KV cache with explicit strides:
+/// the K/V element at (kv_head, position, d) is at `kv_base_offset + kv_head*kv_head_stride
+/// + position*position_stride + d` (strides in floats) in `keys`/`values`. This lets the
+/// kernel read a per-layer slice of an interleaved `[position][layer][kv_head][head_dim]`
+/// cache directly, with no CPU repack. GQA via `group = n_heads / n_kv_heads`. Returns the
+/// per-head context `[n_heads*head_dim]`, or None if Metal is unavailable / inputs invalid.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+pub fn try_attention_decode_strided_f32(
+    query: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    position_count: usize,
+    scale: f32,
+    position_stride: usize,
+    kv_head_stride: usize,
+    kv_base_offset: usize,
+) -> Option<Vec<f32>> {
+    // Largest float index the kernel will touch in keys/values (last head, last position).
+    // saturating_sub keeps this panic-free for zero inputs, which the checks below reject.
+    let max_index = kv_base_offset
+        + n_kv_heads.saturating_sub(1) * kv_head_stride
+        + position_count.saturating_sub(1) * position_stride
+        + head_dim.saturating_sub(1);
     if n_heads == 0
         || n_kv_heads == 0
         || head_dim == 0
         || position_count == 0
         || !n_heads.is_multiple_of(n_kv_heads)
         || query.len() != n_heads * head_dim
-        || keys.len() != n_kv_heads * position_count * head_dim
         || values.len() != keys.len()
+        || keys.len() <= max_index
     {
         return None;
     }
@@ -1763,7 +1820,7 @@ pub fn try_attention_decode_f32(
     let values_buf = new(std::mem::size_of_val(values) as u64);
     let scores_buf = new((n_heads * position_count * 4) as u64);
     let output_buf = new((n_heads * head_dim * 4) as u64);
-    let scalar_buf = new(20);
+    let scalar_buf = new(32);
     write_buffer_f32(&query_buf, query);
     write_buffer_f32(&keys_buf, keys);
     write_buffer_f32(&values_buf, values);
@@ -1774,6 +1831,9 @@ pub fn try_attention_decode_f32(
         *(p.add(8) as *mut u32) = position_count as u32;
         *(p.add(12) as *mut u32) = group;
         *(p.add(16) as *mut f32) = scale;
+        *(p.add(20) as *mut u32) = position_stride as u32;
+        *(p.add(24) as *mut u32) = kv_head_stride as u32;
+        *(p.add(28) as *mut u32) = kv_base_offset as u32;
     }
     let command_buffer = kernel.queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
@@ -1788,6 +1848,9 @@ pub fn try_attention_decode_f32(
     encoder.set_buffer(7, Some(&scalar_buf), 8);
     encoder.set_buffer(8, Some(&scalar_buf), 12);
     encoder.set_buffer(9, Some(&scalar_buf), 16);
+    encoder.set_buffer(10, Some(&scalar_buf), 20);
+    encoder.set_buffer(11, Some(&scalar_buf), 24);
+    encoder.set_buffer(12, Some(&scalar_buf), 28);
     let width = kernel
         .attention_decode_pipeline
         .thread_execution_width()
@@ -2140,6 +2203,9 @@ fn encode_attention(
     e.set_buffer(7, Some(scalar), 8); // position_count
     e.set_buffer(8, Some(scalar), 12); // group
     e.set_buffer(9, Some(scalar), 16); // scale (f32)
+    e.set_buffer(10, Some(scalar), 20); // position_stride
+    e.set_buffer(11, Some(scalar), 24); // kv_head_stride
+    e.set_buffer(12, Some(scalar), 28); // kv_base_offset
     dispatch_1d(e, &k.attention_decode_pipeline, n_heads);
     e.end_encoding();
 }
@@ -2346,7 +2412,7 @@ fn encode_attention_block(
     let cache_v_buf = f32b(cache_v.len());
     let scores_buf = f32b(n_heads * position_count);
     let ctx_buf = f32b(q_dim);
-    let attn_scalar = nb(20);
+    let attn_scalar = nb(32);
     let scales_ctx = f32b(bpr_q);
     let quants_ctx = nb(q_dim as u64);
     let nblocks_ctx = nb(4);
@@ -2385,6 +2451,12 @@ fn encode_attention_block(
         *(a.add(8) as *mut u32) = position_count as u32;
         *(a.add(12) as *mut u32) = group;
         *(a.add(16) as *mut f32) = scale;
+        // Contiguous per-layer cache [kv_head][position][head_dim]: head stride spans all
+        // positions, position stride is one head_dim, no base offset. (The interleaved
+        // real-cache layout overrides these when the resident KV cache lands.)
+        *(a.add(20) as *mut u32) = head_dim as u32;
+        *(a.add(24) as *mut u32) = (position_count * head_dim) as u32;
+        *(a.add(28) as *mut u32) = 0u32;
         *(nblocks_ctx.contents() as *mut u32) = bpr_q as u32;
         let o = o_mm_scalar.contents() as *mut u32;
         *o = bpr_q as u32;
@@ -3122,6 +3194,24 @@ pub fn try_attention_decode_f32(
 
 #[cfg(not(target_os = "macos"))]
 #[allow(clippy::too_many_arguments)]
+pub fn try_attention_decode_strided_f32(
+    _query: &[f32],
+    _keys: &[f32],
+    _values: &[f32],
+    _n_heads: usize,
+    _n_kv_heads: usize,
+    _head_dim: usize,
+    _position_count: usize,
+    _scale: f32,
+    _position_stride: usize,
+    _kv_head_stride: usize,
+    _kv_base_offset: usize,
+) -> Option<Vec<f32>> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
 pub fn try_rope_rotate_f32(
     _data: &[f32],
     _cos_table: &[f32],
@@ -3826,6 +3916,96 @@ mod tests {
         )
         .unwrap();
         assert_eq!(got, got2);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_attention_decode_strided_matches_contiguous() {
+        if !detect_metal_device().available {
+            return;
+        }
+        // Reading a per-layer slice of an interleaved [position][layer][kv_head][head_dim]
+        // cache via explicit strides must match the contiguous [kv_head][position][head_dim]
+        // result for the same logical K/V. Surrounding layers are filled with noise, so a
+        // wrong stride or base offset would read the wrong layer and corrupt the output.
+        let n_heads = 4usize;
+        let n_kv = 2usize;
+        let head_dim = 8usize;
+        let position_count = 5usize;
+        let layer_count = 3usize;
+        let target_layer = 1usize;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv * head_dim;
+
+        let query: Vec<f32> = (0..q_dim).map(|i| ((i as f32 % 7.0) - 3.0) * 0.2).collect();
+        let logical = |kvh: usize, p: usize, d: usize, base: f32| {
+            (((kvh * 131 + p * 17 + d) as f32 % 19.0) - 9.0) * 0.1 + base
+        };
+
+        // Contiguous [kv_head][position][head_dim] reference.
+        let mut contig_k = vec![0.0f32; kv_dim * position_count];
+        let mut contig_v = vec![0.0f32; kv_dim * position_count];
+        for kvh in 0..n_kv {
+            for p in 0..position_count {
+                for d in 0..head_dim {
+                    let idx = (kvh * position_count + p) * head_dim + d;
+                    contig_k[idx] = logical(kvh, p, d, 0.0);
+                    contig_v[idx] = logical(kvh, p, d, 0.5);
+                }
+            }
+        }
+
+        // Interleaved [position][layer][kv_head][head_dim]; only `target_layer` holds the
+        // logical values, the other layers hold noise.
+        let mut inter_k = vec![0.0f32; position_count * layer_count * kv_dim];
+        let mut inter_v = vec![0.0f32; position_count * layer_count * kv_dim];
+        for p in 0..position_count {
+            for l in 0..layer_count {
+                for kvh in 0..n_kv {
+                    for d in 0..head_dim {
+                        let idx = ((p * layer_count + l) * n_kv + kvh) * head_dim + d;
+                        if l == target_layer {
+                            inter_k[idx] = logical(kvh, p, d, 0.0);
+                            inter_v[idx] = logical(kvh, p, d, 0.5);
+                        } else {
+                            inter_k[idx] = 7.0 + idx as f32;
+                            inter_v[idx] = -3.0 - idx as f32;
+                        }
+                    }
+                }
+            }
+        }
+
+        let expected = try_attention_decode_f32(
+            &query,
+            &contig_k,
+            &contig_v,
+            n_heads,
+            n_kv,
+            head_dim,
+            position_count,
+            scale,
+        )
+        .unwrap();
+        let got = try_attention_decode_strided_f32(
+            &query,
+            &inter_k,
+            &inter_v,
+            n_heads,
+            n_kv,
+            head_dim,
+            position_count,
+            scale,
+            layer_count * n_kv * head_dim,  // position_stride
+            head_dim,                       // kv_head_stride
+            target_layer * n_kv * head_dim, // kv_base_offset
+        )
+        .unwrap();
+        assert_eq!(got.len(), q_dim);
+        for (a, b) in got.iter().zip(&expected) {
+            assert!((a - b).abs() < 1.0e-5, "{a} != {b}");
+        }
     }
 
     #[cfg(target_os = "macos")]
