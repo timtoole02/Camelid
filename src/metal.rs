@@ -40,6 +40,8 @@ struct MetalLinearKernel {
     attention_decode_pipeline: ComputePipelineState,
     quantize_q8_0_pipeline: ComputePipelineState,
     kv_scatter_pipeline: ComputePipelineState,
+    rms_norm_quantize_pipeline: ComputePipelineState,
+    silu_mul_quantize_pipeline: ComputePipelineState,
     active_command_buffer: Mutex<Option<metal::CommandBuffer>>,
 }
 
@@ -582,6 +584,87 @@ kernel void quantize_q8_0_f32(
     }
 }
 
+// Fused rms_norm + Q8_0 quantize: one threadgroup reduces the row's sum of squares, then
+// each thread quantizes whole 32-value blocks of the normed row (value = input*inv*weight).
+// Identical arithmetic to rms_norm_f32 followed by quantize_q8_0_f32, with no intermediate
+// normed buffer round-trip and one dispatch instead of two.
+kernel void rms_norm_quantize_f32(
+    device const float* input [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device float* out_scales [[buffer(2)]],
+    device char* out_quants [[buffer(3)]],
+    constant uint& width [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgsize [[threads_per_threadgroup]]
+) {
+    threadgroup float partial[256];
+    float local = 0.0;
+    for (uint i = tid; i < width; i += tgsize) {
+        float v = input[i];
+        local += v * v;
+    }
+    partial[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgsize >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            partial[tid] += partial[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = 1.0 / sqrt(partial[0] / float(width) + eps);
+    uint n_blocks = width / 32u;
+    for (uint b = tid; b < n_blocks; b += tgsize) {
+        uint base = b * 32u;
+        float v[32];
+        float max_abs = 0.0;
+        for (uint i = 0; i < 32u; ++i) {
+            v[i] = input[base + i] * inv * weight[base + i];
+            max_abs = max(max_abs, fabs(v[i]));
+        }
+        float unrounded = max_abs / 127.0;
+        float stored = float(half(unrounded));
+        float qinv = (unrounded == 0.0) ? 0.0 : 1.0 / unrounded;
+        out_scales[b] = stored;
+        for (uint i = 0; i < 32u; ++i) {
+            int q = int(round(v[i] * qinv));
+            q = clamp(q, -127, 127);
+            out_quants[base + i] = char(q);
+        }
+    }
+}
+
+// Fused SiLU-mul + Q8_0 quantize, one thread per 32-value block: value =
+// (g / (1 + e^-g)) * u. Identical arithmetic to silu_mul_f32 followed by
+// quantize_q8_0_f32, with no intermediate activation buffer and one dispatch.
+kernel void silu_mul_quantize_f32(
+    device const float* gate [[buffer(0)]],
+    device const float* up [[buffer(1)]],
+    device float* out_scales [[buffer(2)]],
+    device char* out_quants [[buffer(3)]],
+    constant uint& n_blocks [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n_blocks) return;
+    uint base = gid * 32u;
+    float v[32];
+    float max_abs = 0.0;
+    for (uint i = 0; i < 32u; ++i) {
+        float g = gate[base + i];
+        v[i] = (g / (1.0 + exp(-g))) * up[base + i];
+        max_abs = max(max_abs, fabs(v[i]));
+    }
+    float unrounded = max_abs / 127.0;
+    float stored = float(half(unrounded));
+    float inv = (unrounded == 0.0) ? 0.0 : 1.0 / unrounded;
+    out_scales[gid] = stored;
+    for (uint i = 0; i < 32u; ++i) {
+        int q = int(round(v[i] * inv));
+        q = clamp(q, -127, 127);
+        out_quants[base + i] = char(q);
+    }
+}
+
 // Scatter the current token's K/V ([n_kv_heads * head_dim] contiguous) into the persistent
 // cache buffers at slot `write_position` of a [kv_head][max_positions][head_dim] layout.
 // Compute-encoder replacement for the previous blit, so a whole decode token can stay inside
@@ -660,6 +743,18 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let kv_scatter_pipeline = device
                 .new_compute_pipeline_state_with_function(&kv_scatter_function)
                 .ok()?;
+            let rms_norm_quantize_function = elementwise_library
+                .get_function("rms_norm_quantize_f32", None)
+                .ok()?;
+            let rms_norm_quantize_pipeline = device
+                .new_compute_pipeline_state_with_function(&rms_norm_quantize_function)
+                .ok()?;
+            let silu_mul_quantize_function = elementwise_library
+                .get_function("silu_mul_quantize_f32", None)
+                .ok()?;
+            let silu_mul_quantize_pipeline = device
+                .new_compute_pipeline_state_with_function(&silu_mul_quantize_function)
+                .ok()?;
             let descriptor_function = library.get_function("linear_row_f32", None).ok()?;
             let descriptor_pipeline = device
                 .new_compute_pipeline_state_with_function(&descriptor_function)
@@ -715,6 +810,8 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 attention_decode_pipeline,
                 quantize_q8_0_pipeline,
                 kv_scatter_pipeline,
+                rms_norm_quantize_pipeline,
+                silu_mul_quantize_pipeline,
                 active_command_buffer: Mutex::new(None),
             })
         })
@@ -2174,6 +2271,63 @@ fn encode_rms_norm(
     );
 }
 
+/// Fused rms_norm + Q8_0 quantize: reads `input`, emits the quantized normed row directly
+/// into `scales`/`quants` (one dispatch, no intermediate normed buffer). `scalar` holds
+/// width (u32) then eps (f32), like `encode_rms_norm`.
+#[cfg(target_os = "macos")]
+fn encode_rms_norm_quantize(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    input: &Buffer,
+    weight: &Buffer,
+    scales: &Buffer,
+    quants: &Buffer,
+    scalar: &Buffer,
+) {
+    e.set_compute_pipeline_state(&k.rms_norm_quantize_pipeline);
+    e.set_buffer(0, Some(input), 0);
+    e.set_buffer(1, Some(weight), 0);
+    e.set_buffer(2, Some(scales), 0);
+    e.set_buffer(3, Some(quants), 0);
+    e.set_buffer(4, Some(scalar), 0);
+    e.set_buffer(5, Some(scalar), 4);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+/// Fused SiLU-mul + Q8_0 quantize: reads `gate`/`up`, emits the quantized activation row
+/// directly into `scales`/`quants` (one dispatch, no intermediate activation buffer).
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_silu_mul_quantize(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    gate: &Buffer,
+    up: &Buffer,
+    scales: &Buffer,
+    quants: &Buffer,
+    nblocks_buf: &Buffer,
+    n_blocks: usize,
+) {
+    e.set_compute_pipeline_state(&k.silu_mul_quantize_pipeline);
+    e.set_buffer(0, Some(gate), 0);
+    e.set_buffer(1, Some(up), 0);
+    e.set_buffer(2, Some(scales), 0);
+    e.set_buffer(3, Some(quants), 0);
+    e.set_buffer(4, Some(nblocks_buf), 0);
+    dispatch_1d(e, &k.silu_mul_quantize_pipeline, n_blocks);
+}
+
 #[cfg(target_os = "macos")]
 fn encode_quantize(
     e: &metal::ComputeCommandEncoderRef,
@@ -2342,16 +2496,12 @@ fn encode_ffn_block(
             .new_buffer(bytes, MTLResourceOptions::StorageModeShared)
     };
     let norm_w_buf = nb((hidden * 4) as u64);
-    let norm_buf = nb((hidden * 4) as u64);
     let rms_scalar = nb(8);
     let scales1 = nb((bpr_hidden * 4) as u64);
     let quants1 = nb(hidden as u64);
-    let nblocks1 = nb(4);
     let gate_buf = nb((ffn_dim * 4) as u64);
     let up_buf = nb((ffn_dim * 4) as u64);
     let gateup_scalar = nb(8);
-    let act_buf = nb((ffn_dim * 4) as u64);
-    let silu_n = nb(4);
     let scales2 = nb((bpr_ffn * 4) as u64);
     let quants2 = nb(ffn_dim as u64);
     let nblocks2 = nb(4);
@@ -2364,11 +2514,9 @@ fn encode_ffn_block(
         let p = rms_scalar.contents() as *mut u8;
         *(p as *mut u32) = hidden as u32;
         *(p.add(4) as *mut f32) = eps;
-        *(nblocks1.contents() as *mut u32) = bpr_hidden as u32;
         let g = gateup_scalar.contents() as *mut u32;
         *g = bpr_hidden as u32;
         *g.add(1) = ffn_dim as u32;
-        *(silu_n.contents() as *mut u32) = ffn_dim as u32;
         *(nblocks2.contents() as *mut u32) = bpr_ffn as u32;
         let d = down_scalar.contents() as *mut u32;
         *d = bpr_ffn as u32;
@@ -2376,8 +2524,7 @@ fn encode_ffn_block(
         *(resid_n.contents() as *mut u32) = hidden as u32;
     }
 
-    encode_rms_norm(e, k, in_buf, &norm_w_buf, &norm_buf, &rms_scalar);
-    encode_quantize(e, k, &norm_buf, &scales1, &quants1, &nblocks1, bpr_hidden);
+    encode_rms_norm_quantize(e, k, in_buf, &norm_w_buf, &scales1, &quants1, &rms_scalar);
     encode_q8_matmul(
         e,
         k,
@@ -2398,16 +2545,9 @@ fn encode_ffn_block(
         &gateup_scalar,
         ffn_dim,
     );
-    encode_binary(
-        e,
-        &k.silu_mul_pipeline,
-        &gate_buf,
-        &up_buf,
-        &act_buf,
-        &silu_n,
-        ffn_dim,
+    encode_silu_mul_quantize(
+        e, k, &gate_buf, &up_buf, &scales2, &quants2, &nblocks2, bpr_ffn,
     );
-    encode_quantize(e, k, &act_buf, &scales2, &quants2, &nblocks2, bpr_ffn);
     encode_q8_matmul(
         e,
         k,
@@ -2430,16 +2570,12 @@ fn encode_ffn_block(
 
     keep.extend([
         norm_w_buf,
-        norm_buf,
         rms_scalar,
         scales1,
         quants1,
-        nblocks1,
         gate_buf,
         up_buf,
         gateup_scalar,
-        act_buf,
-        silu_n,
         scales2,
         quants2,
         nblocks2,
@@ -2499,11 +2635,9 @@ fn encode_attention_block(
     };
     let f32b = |n: usize| nb((n * 4) as u64);
     let norm_w_buf = f32b(hidden);
-    let norm_buf = f32b(hidden);
     let rms_scalar = nb(8);
     let scales_norm = f32b(bpr_hidden);
     let quants_norm = nb(hidden as u64);
-    let nblocks_norm = nb(4);
     let query_buf = f32b(q_dim);
     let key_buf = f32b(kv_dim);
     let val_buf = f32b(kv_dim);
@@ -2530,7 +2664,6 @@ fn encode_attention_block(
         let p = rms_scalar.contents() as *mut u8;
         *(p as *mut u32) = hidden as u32;
         *(p.add(4) as *mut f32) = eps;
-        *(nblocks_norm.contents() as *mut u32) = bpr_hidden as u32;
         let q = q_mm_scalar.contents() as *mut u32;
         *q = bpr_hidden as u32;
         *q.add(1) = q_dim as u32;
@@ -2564,15 +2697,14 @@ fn encode_attention_block(
         *(resid_n.contents() as *mut u32) = hidden as u32;
     }
 
-    encode_rms_norm(e, k, in_buf, &norm_w_buf, &norm_buf, &rms_scalar);
-    encode_quantize(
+    encode_rms_norm_quantize(
         e,
         k,
-        &norm_buf,
+        in_buf,
+        &norm_w_buf,
         &scales_norm,
         &quants_norm,
-        &nblocks_norm,
-        bpr_hidden,
+        &rms_scalar,
     );
     encode_q8_matmul(
         e,
@@ -2688,11 +2820,9 @@ fn encode_attention_block(
 
     keep.extend([
         norm_w_buf,
-        norm_buf,
         rms_scalar,
         scales_norm,
         quants_norm,
-        nblocks_norm,
         query_buf,
         key_buf,
         val_buf,
@@ -3550,20 +3680,18 @@ impl ResidentDecodeState {
             let rms_scalar = nb(8);
             let lscales = nb((bpr_hidden * 4) as u64);
             let lquants = nb(self.hidden as u64);
-            let lnblocks = nb(4);
+
             let lmm_scalar = nb(8);
             let logits_buf = nb((s.vocab_size * 4) as u64);
             unsafe {
                 let p = rms_scalar.contents() as *mut u8;
                 *(p as *mut u32) = self.hidden as u32;
                 *(p.add(4) as *mut f32) = self.eps;
-                *(lnblocks.contents() as *mut u32) = bpr_hidden as u32;
                 let m = lmm_scalar.contents() as *mut u32;
                 *m = bpr_hidden as u32;
                 *m.add(1) = s.vocab_size as u32;
             }
-            encode_rms_norm(e, k, final_buf, fnorm_buf, &self.mid, &rms_scalar);
-            encode_quantize(e, k, &self.mid, &lscales, &lquants, &lnblocks, bpr_hidden);
+            encode_rms_norm_quantize(e, k, final_buf, fnorm_buf, &lscales, &lquants, &rms_scalar);
             encode_q8_matmul(
                 e,
                 k,
@@ -3574,7 +3702,7 @@ impl ResidentDecodeState {
                 &lmm_scalar,
                 s.vocab_size,
             );
-            keep.extend([rms_scalar, lscales, lquants, lnblocks, lmm_scalar]);
+            keep.extend([rms_scalar, lscales, lquants, lmm_scalar]);
             Some(logits_buf)
         } else {
             None
