@@ -1263,6 +1263,14 @@ pub struct LlamaGenerationStep {
     pub diagnostics: Option<LlamaForwardDiagnostics>,
 }
 
+/// Result of a GPU-resident decode step: either the post-layers hidden state (when logits
+/// weren't requested) or the `[1, vocab]` logits (when the final norm + output projection ran
+/// on the GPU too).
+enum ResidentForward {
+    Hidden(CpuTensor),
+    Logits(CpuTensor),
+}
+
 pub struct LlamaInferenceSession {
     pub config: LlamaModelConfig,
     pub weights: Arc<LlamaLoadedWeights>,
@@ -1350,7 +1358,24 @@ impl LlamaInferenceSession {
                 return Ok(false);
             }
         }
+        // The final stage (RMSNorm + output projection) also runs on the GPU, so the output
+        // weight must be plain Q8_0 and a real output_norm must be present.
+        if !is_q8(self.weights.output_projection()) {
+            return Ok(false);
+        }
         let dims = DenseLlamaDims::from_config(&self.config)?;
+        if self
+            .weights
+            .output_norm
+            .shape
+            .dims
+            .first()
+            .copied()
+            .unwrap_or(0)
+            != dims.embedding_length
+        {
+            return Ok(false);
+        }
         let n_heads = self.config.attention_head_count as usize;
         let q_dim = n_heads * dims.head_dim;
         Ok(dims.embedding_length != 0
@@ -1368,7 +1393,11 @@ impl LlamaInferenceSession {
     /// Run the whole token forward on the GPU resident-decode session. Returns Some(hidden) on
     /// success (the caller applies the existing final norm + output projection), or None to fall
     /// back to the CPU layer loop (ineligible config, unsupported RoPE, or Metal unavailable).
-    fn try_resident_decode_forward(&mut self, embedding: &CpuTensor) -> Result<Option<CpuTensor>> {
+    fn try_resident_decode_forward(
+        &mut self,
+        embedding: &CpuTensor,
+        compute_logits: bool,
+    ) -> Result<Option<ResidentForward>> {
         if !self.resident_decode_eligible()? {
             return Ok(None);
         }
@@ -1380,6 +1409,7 @@ impl LlamaInferenceSession {
         let hidden = dims.embedding_length;
         let ffn_dim = dims.feed_forward_length;
         let n_layers = dims.block_count;
+        let vocab = dims.vocab_size;
         // The on-GPU KV cache grows on demand up to `kv_cap` (the model context length); sizing
         // it to the full (often 128K) context up front would allocate tens of GB and thrash
         // unified memory. Start sized to the current need plus a chunk and let the session grow.
@@ -1467,6 +1497,20 @@ impl LlamaInferenceSession {
             })
             .collect();
 
+        // When logits are wanted, run the final RMSNorm + output projection on the GPU too
+        // (in the same command buffer) so the large vocab matmul stays off the CPU.
+        let logits_stage = if compute_logits {
+            Some(metal::LogitsStage {
+                final_norm: &weights.output_norm.data,
+                output_weight_blocks: q8_0_blocks_as_bytes(
+                    weights.output_projection().q8_0_blocks.as_ref().unwrap(),
+                ),
+                vocab_size: vocab,
+            })
+        } else {
+            None
+        };
+
         let session = self
             .resident_decode
             .as_mut()
@@ -1478,15 +1522,24 @@ impl LlamaInferenceSession {
             &tables.sin,
             position,
             scale,
+            logits_stage,
         ) {
             Some(o) => o,
             None => return Ok(None),
         };
-        Ok(Some(CpuTensor::from_f32(
-            "resident_hidden",
-            vec![1, hidden],
-            out,
-        )?))
+        if compute_logits {
+            Ok(Some(ResidentForward::Logits(CpuTensor::from_f32(
+                "resident_logits",
+                vec![1, vocab],
+                out,
+            )?)))
+        } else {
+            Ok(Some(ResidentForward::Hidden(CpuTensor::from_f32(
+                "resident_hidden",
+                vec![1, hidden],
+                out,
+            )?)))
+        }
     }
 
     pub fn forward_worker_layers(
@@ -2010,13 +2063,19 @@ impl LlamaInferenceSession {
         // GPU-resident decode: run all layers on the Metal GPU in one command buffer with the
         // KV cache resident across tokens. Only when not collecting diagnostics; falls back to
         // the CPU layer loop below when ineligible (returns None).
-        let resident_hidden = if collect_diagnostics {
+        let resident_out = if collect_diagnostics {
             None
         } else {
-            self.try_resident_decode_forward(&hidden)?
+            self.try_resident_decode_forward(&hidden, compute_logits)?
         };
-        if let Some(resident) = resident_hidden {
-            hidden = resident;
+        // When the resident path also produced logits on the GPU, carry them here and skip the
+        // CPU final norm + output projection below.
+        let mut resident_logits: Option<CpuTensor> = None;
+        if let Some(resident) = resident_out {
+            match resident {
+                ResidentForward::Logits(l) => resident_logits = Some(l),
+                ResidentForward::Hidden(h) => hidden = h,
+            }
         } else {
             for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
                 if let Some(range) = &self.weights.layer_range {
@@ -2070,7 +2129,11 @@ impl LlamaInferenceSession {
             .then(|| LlamaTensorStats::from_tensor(&hidden))
             .transpose()?;
         let (norm, logits, final_norm_diagnostic, output_norm_stats, logits_stats) =
-            if compute_logits {
+            if let Some(resident_logits) = resident_logits {
+                // Logits already computed on the GPU; reuse the embedding tensor as the (unused,
+                // diagnostics-only) norm placeholder and skip the CPU final stage entirely.
+                (resident_logits.clone(), resident_logits, None, None, None)
+            } else if compute_logits {
                 let final_norm_started = Instant::now();
                 let norm = if self.weights.output_norm.shape.dims[0] == 0 {
                     hidden.clone()

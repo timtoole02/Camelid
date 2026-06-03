@@ -3149,6 +3149,16 @@ pub struct ResidentLayerWeights<'a> {
     pub down_weight_blocks: &'a [u8],
 }
 
+/// Optional final stage for `forward_token`: when present, the session also runs the final
+/// RMSNorm + output (vocab) projection on the GPU in the same command buffer and returns the
+/// `[vocab_size]` logits instead of the hidden state — keeping the large output matmul off the
+/// CPU. `output_weight_blocks` is the Q8_0 output/embedding projection.
+pub struct LogitsStage<'a> {
+    pub final_norm: &'a [f32],
+    pub output_weight_blocks: &'a [u8],
+    pub vocab_size: usize,
+}
+
 /// A resident decode session that owns the on-GPU KV cache (per layer, sized to
 /// `max_positions`) and the reused hidden ping-pong buffers. A multi-token greedy decode runs
 /// each token in ONE command buffer with the KV cache persisting on the GPU across tokens --
@@ -3317,6 +3327,7 @@ impl ResidentDecodeState {
         sin_t: &[f32],
         position: usize,
         scale: f32,
+        logits_stage: Option<LogitsStage>,
     ) -> Option<Vec<f32>> {
         let half_rope = cos_t.len();
         // Grow the on-GPU KV cache if this token's position is past the current capacity.
@@ -3349,10 +3360,22 @@ impl ResidentDecodeState {
                 return None;
             }
         }
+        if let Some(s) = &logits_stage {
+            if s.vocab_size == 0
+                || s.final_norm.len() != self.hidden
+                || s.output_weight_blocks.len() != s.vocab_size * bpr_hidden * 36
+            {
+                return None;
+            }
+        }
         let k = metal_linear_kernel()?;
-        let resident: Vec<[Buffer; 7]> = {
+        // Resolve all resident weight buffers (layer weights + optional output stage) under one
+        // cache lock. They are keyed by (pointer, len), so they upload once and persist.
+        let resident: Vec<[Buffer; 7]>;
+        let stage_bufs: Option<(Buffer, Buffer)>;
+        {
             let mut cache = metal_linear_cache().lock().ok()?;
-            layers
+            resident = layers
                 .iter()
                 .map(|l| {
                     [
@@ -3365,11 +3388,19 @@ impl ResidentDecodeState {
                         cache.q8_block_weight_buffer(&k.device, l.down_weight_blocks),
                     ]
                 })
-                .collect()
-        };
+                .collect();
+            stage_bufs = logits_stage.as_ref().map(|s| {
+                (
+                    cache.q8_block_weight_buffer(&k.device, s.output_weight_blocks),
+                    cache.weight_buffer(&k.device, s.final_norm),
+                )
+            });
+        }
         let position_count = position + 1;
         write_buffer_f32(&self.buf_a, embedding);
         let mut keep = Vec::new();
+        let trace = std::env::var_os("CAMELID_RESIDENT_TRACE").is_some();
+        let encode_started = std::time::Instant::now();
         let cb = k.queue.new_command_buffer();
         let mut from_a = true;
         for (i, layer) in layers.iter().enumerate() {
@@ -3419,12 +3450,67 @@ impl ResidentDecodeState {
             );
             from_a = !from_a;
         }
+        let final_buf = if from_a { &self.buf_a } else { &self.buf_b };
+        // Optional final stage: RMSNorm + output (vocab) projection in the SAME command buffer,
+        // so the large logits matmul runs on the GPU instead of falling to the slow CPU path.
+        let logits_buf = if let (Some(s), Some((ow_buf, fnorm_buf))) = (&logits_stage, &stage_bufs)
+        {
+            let nb = |bytes: u64| {
+                k.device
+                    .new_buffer(bytes, MTLResourceOptions::StorageModeShared)
+            };
+            let rms_scalar = nb(8);
+            let lscales = nb((bpr_hidden * 4) as u64);
+            let lquants = nb(self.hidden as u64);
+            let lnblocks = nb(4);
+            let lmm_scalar = nb(8);
+            let logits_buf = nb((s.vocab_size * 4) as u64);
+            unsafe {
+                let p = rms_scalar.contents() as *mut u8;
+                *(p as *mut u32) = self.hidden as u32;
+                *(p.add(4) as *mut f32) = self.eps;
+                *(lnblocks.contents() as *mut u32) = bpr_hidden as u32;
+                let m = lmm_scalar.contents() as *mut u32;
+                *m = bpr_hidden as u32;
+                *m.add(1) = s.vocab_size as u32;
+            }
+            encode_rms_norm(cb, k, final_buf, fnorm_buf, &self.mid, &rms_scalar);
+            encode_quantize(cb, k, &self.mid, &lscales, &lquants, &lnblocks, bpr_hidden);
+            encode_q8_matmul(
+                cb,
+                k,
+                &lscales,
+                &lquants,
+                ow_buf,
+                &logits_buf,
+                &lmm_scalar,
+                s.vocab_size,
+            );
+            keep.extend([rms_scalar, lscales, lquants, lnblocks, lmm_scalar]);
+            Some(logits_buf)
+        } else {
+            None
+        };
+        let encode_us = encode_started.elapsed().as_micros();
+        let gpu_started = std::time::Instant::now();
         cb.commit();
         cb.wait_until_completed();
-        let final_buf = if from_a { &self.buf_a } else { &self.buf_b };
+        if trace {
+            let gpu_us = gpu_started.elapsed().as_micros();
+            eprintln!(
+                "[resident] pos={position} layers={} encode={encode_us}us commit_wait={gpu_us}us",
+                self.n_layers
+            );
+        }
+        self.filled = position + 1;
+        if let Some(logits_buf) = logits_buf {
+            let vocab = logits_stage.as_ref().map(|s| s.vocab_size).unwrap_or(0);
+            let mut out = vec![0.0f32; vocab];
+            read_buffer_f32(&logits_buf, &mut out);
+            return Some(out);
+        }
         let mut out = vec![0.0f32; self.hidden];
         read_buffer_f32(final_buf, &mut out);
-        self.filled = position + 1;
         Some(out)
     }
 
@@ -3547,6 +3633,7 @@ impl ResidentDecodeState {
         _sin_t: &[f32],
         _position: usize,
         _scale: f32,
+        _logits_stage: Option<LogitsStage>,
     ) -> Option<Vec<f32>> {
         None
     }
@@ -4670,7 +4757,7 @@ mod tests {
             .unwrap();
 
             let got = session
-                .forward_token(&emb, &weights, &cos_t, &sin_t, t, scale)
+                .forward_token(&emb, &weights, &cos_t, &sin_t, t, scale, None)
                 .unwrap();
             assert_eq!(got.len(), hidden);
             for (a, b) in got.iter().zip(&expected) {
