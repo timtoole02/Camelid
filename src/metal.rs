@@ -37,6 +37,7 @@ struct MetalLinearKernel {
     silu_mul_pipeline: ComputePipelineState,
     rope_rotate_pipeline: ComputePipelineState,
     attention_decode_pipeline: ComputePipelineState,
+    quantize_q8_0_pipeline: ComputePipelineState,
     active_command_buffer: Mutex<Option<metal::CommandBuffer>>,
 }
 
@@ -491,6 +492,35 @@ kernel void attention_decode_f32(
         }
     }
 }
+
+// Quantize an f32 activation row to Q8_0 (32-value blocks), one thread per block.
+// Mirrors quantize_q8_0_block: scale = f16(max|v|/127) stored as f32, quant =
+// round-ties-away(v / (max|v|/127)) clamped to [-127, 127]. Emits separate scale
+// (f32) and quant (i8) arrays in the layout the Q8 block matmul consumes.
+kernel void quantize_q8_0_f32(
+    device const float* input [[buffer(0)]],
+    device float* out_scales [[buffer(1)]],
+    device char* out_quants [[buffer(2)]],
+    constant uint& n_blocks [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n_blocks) return;
+    uint base = gid * 32u;
+    float max_abs = 0.0;
+    for (uint i = 0; i < 32u; ++i) {
+        max_abs = max(max_abs, fabs(input[base + i]));
+    }
+    float unrounded = max_abs / 127.0;
+    float stored = float(half(unrounded));
+    float inv = (unrounded == 0.0) ? 0.0 : 1.0 / unrounded;
+    out_scales[gid] = stored;
+    for (uint i = 0; i < 32u; ++i) {
+        float scaled = input[base + i] * inv;
+        int q = int(round(scaled));
+        q = clamp(q, -127, 127);
+        out_quants[base + i] = char(q);
+    }
+}
 "#;
 
 #[cfg(target_os = "macos")]
@@ -534,6 +564,12 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 .ok()?;
             let attention_decode_pipeline = device
                 .new_compute_pipeline_state_with_function(&attention_decode_function)
+                .ok()?;
+            let quantize_q8_0_function = elementwise_library
+                .get_function("quantize_q8_0_f32", None)
+                .ok()?;
+            let quantize_q8_0_pipeline = device
+                .new_compute_pipeline_state_with_function(&quantize_q8_0_function)
                 .ok()?;
             let descriptor_function = library.get_function("linear_row_f32", None).ok()?;
             let descriptor_pipeline = device
@@ -581,6 +617,7 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 silu_mul_pipeline,
                 rope_rotate_pipeline,
                 attention_decode_pipeline,
+                quantize_q8_0_pipeline,
                 active_command_buffer: Mutex::new(None),
             })
         })
@@ -679,6 +716,18 @@ fn write_buffer_bytes<T>(buffer: &Buffer, values: &[T]) {
 
 #[cfg(target_os = "macos")]
 fn read_buffer_f32(buffer: &Buffer, out: &mut [f32]) {
+    let len = std::mem::size_of_val(out);
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            buffer.contents().cast::<u8>(),
+            out.as_mut_ptr().cast::<u8>(),
+            len,
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn read_buffer_i8(buffer: &Buffer, out: &mut [i8]) {
     let len = std::mem::size_of_val(out);
     unsafe {
         std::ptr::copy_nonoverlapping(
@@ -1762,6 +1811,71 @@ pub fn try_attention_decode_f32(
     Some(out)
 }
 
+/// GPU Q8_0 quantization of an f32 row (length a multiple of 32). Returns the per-block
+/// scales (f32) and quants (i8) in the layout the Q8 block matmul consumes — the
+/// on-GPU equivalent of the CPU activation quantizer, so activations produced on-GPU
+/// can feed the matmul without a CPU round-trip. None if Metal is unavailable.
+#[cfg(target_os = "macos")]
+pub fn try_quantize_q8_0_f32(input: &[f32]) -> Option<(Vec<f32>, Vec<i8>)> {
+    if input.is_empty() || !input.len().is_multiple_of(32) {
+        return None;
+    }
+    let kernel = metal_linear_kernel()?;
+    let n_blocks = input.len() / 32;
+    let in_buf = kernel.device.new_buffer(
+        std::mem::size_of_val(input) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let scales_buf = kernel
+        .device
+        .new_buffer((n_blocks * 4) as u64, MTLResourceOptions::StorageModeShared);
+    let quants_buf = kernel
+        .device
+        .new_buffer(input.len() as u64, MTLResourceOptions::StorageModeShared);
+    let n_buf = kernel
+        .device
+        .new_buffer(4, MTLResourceOptions::StorageModeShared);
+    write_buffer_f32(&in_buf, input);
+    unsafe {
+        *(n_buf.contents() as *mut u32) = n_blocks as u32;
+    }
+    let command_buffer = kernel.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&kernel.quantize_q8_0_pipeline);
+    encoder.set_buffer(0, Some(&in_buf), 0);
+    encoder.set_buffer(1, Some(&scales_buf), 0);
+    encoder.set_buffer(2, Some(&quants_buf), 0);
+    encoder.set_buffer(3, Some(&n_buf), 0);
+    let width = kernel
+        .quantize_q8_0_pipeline
+        .thread_execution_width()
+        .max(1);
+    let threads_per_group = metal::MTLSize {
+        width,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroups = metal::MTLSize {
+        width: (n_blocks as u64).div_ceil(width),
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(threadgroups, threads_per_group);
+    encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    let mut scales = vec![0.0f32; n_blocks];
+    read_buffer_f32(&scales_buf, &mut scales);
+    let mut quants = vec![0i8; input.len()];
+    read_buffer_i8(&quants_buf, &mut quants);
+    Some((scales, quants))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn try_quantize_q8_0_f32(_input: &[f32]) -> Option<(Vec<f32>, Vec<i8>)> {
+    None
+}
+
 #[cfg(not(target_os = "macos"))]
 pub fn try_rms_norm_f32(_input: &[f32], _weight: &[f32], _eps: f32) -> Option<Vec<f32>> {
     None
@@ -2012,6 +2126,48 @@ mod tests {
         for (a, b) in got.iter().zip(&expected) {
             assert!((a - b).abs() < 1.0e-3, "{a} != {b}");
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_quantize_q8_0_matches_reference() {
+        if !detect_metal_device().available {
+            return;
+        }
+        // Two blocks chosen so max|v|/127 is f16-exact (127 -> 1.0, 254 -> 2.0),
+        // isolating the kernel's max/round/clamp logic from f16-rounding subtleties.
+        let mut input = vec![0.0f32; 64];
+        for (i, v) in input.iter_mut().enumerate().take(32) {
+            *v = ((i as i32 % 9) - 4) as f32; // small ints
+        }
+        input[7] = 127.0; // sets block-0 max_abs to 127 -> scale 1.0
+        for (i, v) in input.iter_mut().enumerate().skip(32) {
+            *v = (((i as i32) % 5) * 2 - 4) as f32; // even ints
+        }
+        input[40] = 254.0; // block-1 max_abs 254 -> scale 2.0
+                           // Reference
+        let mut exp_scales = [0.0f32; 2];
+        let mut exp_quants = [0i8; 64];
+        for b in 0..2 {
+            let blk = &input[b * 32..b * 32 + 32];
+            let max_abs = blk.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let unrounded = max_abs / 127.0; // f16-exact here (1.0 / 2.0)
+            exp_scales[b] = unrounded;
+            let inv = if unrounded == 0.0 {
+                0.0
+            } else {
+                1.0 / unrounded
+            };
+            for (i, v) in blk.iter().enumerate() {
+                let q = (v * inv).round() as i32;
+                exp_quants[b * 32 + i] = q.clamp(-127, 127) as i8;
+            }
+        }
+        let (scales, quants) = try_quantize_q8_0_f32(&input).expect("metal quantize");
+        for (a, b) in scales.iter().zip(&exp_scales) {
+            assert!((a - b).abs() < 1.0e-6, "scale {a} != {b}");
+        }
+        assert_eq!(quants.as_slice(), &exp_quants[..], "quants mismatch");
     }
 
     #[cfg(target_os = "macos")]
