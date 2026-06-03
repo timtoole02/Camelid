@@ -209,6 +209,20 @@ pub struct GhostFile {
 }
 
 impl GhostFile {
+    /// Open with optional strict-ceiling mode: `evict_page_cache` sets `F_NOCACHE` on the
+    /// handle (macOS) so streamed reads bypass the page cache entirely. For models that fit
+    /// in RAM the cache is a free win (leave this off); for the over-RAM models ghost mode
+    /// targets, the cache can only thrash and the OS must not accumulate the file's pages.
+    /// (`posix_madvise(DONTNEED)` does not apply here — that is for mmap'd ranges, and the
+    /// streamer uses positioned reads.)
+    pub fn open_with_options(path: &Path, evict_page_cache: bool) -> Result<Self> {
+        let this = Self::open(path)?;
+        if evict_page_cache {
+            crate::tensor::disable_file_cache_best_effort(&this.file);
+        }
+        Ok(this)
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         let mut file = File::open(path).map_err(|e| io_err(path, e))?;
         let mut magic = [0u8; 8];
@@ -320,5 +334,95 @@ impl GhostFile {
             .map(|g| g.span().1)
             .max()
             .unwrap_or(0)
+    }
+}
+
+/// One layer's weights, read + decoded off the critical path by [`GhostPrefetcher`].
+pub struct PrefetchedLayer {
+    pub layer_idx: usize,
+    pub weights: LlamaLayerWeights,
+    /// Bytes read from disk for this layer's group.
+    pub bytes: u64,
+    /// Wall time the worker spent reading + decoding (overlapped with the main thread's
+    /// forward, so it only shows up in token latency when it exceeds the compute time).
+    pub worker_us: u128,
+}
+
+/// Double-buffered streaming: a background worker reads + decodes layer N+1 from the
+/// `.cghost` file while the main thread runs layer N's forward. The result channel is a
+/// rendezvous (capacity 0), so at most TWO layer windows exist at any instant — one in the
+/// session being computed, one finished in the worker's hand awaiting handoff. The worker
+/// fulfills requests strictly in order; the main thread queues each chunk's layer indices
+/// ahead of consuming them (and primes the next chunk before the current one finishes, so
+/// the disk is already rewinding to layer 0 of token N+1 during the last forwards of
+/// token N).
+pub struct GhostPrefetcher {
+    request_tx: Option<std::sync::mpsc::Sender<usize>>,
+    result_rx: Option<std::sync::mpsc::Receiver<Result<PrefetchedLayer>>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl GhostPrefetcher {
+    pub fn spawn(ghost: std::sync::Arc<GhostFile>) -> Self {
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<usize>();
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<Result<PrefetchedLayer>>(0);
+        let worker = std::thread::Builder::new()
+            .name("ghost-prefetch".to_string())
+            .spawn(move || {
+                let mut buf: Vec<u8> = Vec::with_capacity(ghost.max_layer_span() as usize);
+                while let Ok(layer_idx) = request_rx.recv() {
+                    let started = std::time::Instant::now();
+                    let result = ghost
+                        .read_layer(layer_idx, &mut buf)
+                        .map(|(weights, bytes)| PrefetchedLayer {
+                            layer_idx,
+                            weights,
+                            bytes,
+                            worker_us: started.elapsed().as_micros(),
+                        });
+                    // The receiver dropping mid-stream (generation ended) is a normal exit.
+                    if result_tx.send(result).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("failed to spawn ghost-prefetch thread");
+        Self {
+            request_tx: Some(request_tx),
+            result_rx: Some(result_rx),
+            worker: Some(worker),
+        }
+    }
+
+    /// Queue a layer to be read + decoded. Requests are fulfilled strictly in order.
+    pub fn request(&self, layer_idx: usize) -> Result<()> {
+        self.request_tx
+            .as_ref()
+            .expect("prefetcher closed")
+            .send(layer_idx)
+            .map_err(|_| invalid("ghost-prefetch worker exited unexpectedly".to_string()))
+    }
+
+    /// Block until the next requested layer is ready (instant when the worker finished
+    /// while the previous layer was computing — the double-buffered steady state).
+    pub fn next(&self) -> Result<PrefetchedLayer> {
+        self.result_rx
+            .as_ref()
+            .expect("prefetcher closed")
+            .recv()
+            .map_err(|_| invalid("ghost-prefetch worker exited unexpectedly".to_string()))?
+    }
+}
+
+impl Drop for GhostPrefetcher {
+    fn drop(&mut self) {
+        // Close BOTH channel ends before joining: dropping the request sender ends the
+        // worker's request loop, and dropping the result receiver releases a worker that
+        // is blocked mid-handoff on the rendezvous send (otherwise the join deadlocks).
+        drop(self.request_tx.take());
+        drop(self.result_rx.take());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }

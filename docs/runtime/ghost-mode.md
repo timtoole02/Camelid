@@ -47,10 +47,20 @@ loader/kernels; that support is a prerequisite for the v2 map.
   position; the runner advances once per chunk) → swap the placeholder back in, dropping
   the weights. The weight working window is exactly one layer.
 - Greedy sampling via the existing final-norm/logits path.
-- Reads block the forward in v1. Double-buffered async prefetch (read layer N+1 while layer
-  N computes), explicit page eviction (`posix_madvise(DONTNEED)`), and the two-node pipeline
-  variant (each node hosts half the `.cghost` and overlaps its disk window with the other
-  node's compute) are the planned next phases.
+- v1 (`--sync-stream`) blocks the forward on each read. v2 (the default) double-buffers:
+  a background worker reads + decodes layer N+1 while the main thread runs layer N's
+  forward, handing off over a rendezvous channel so at most TWO layer windows exist at any
+  instant. The worker is also primed with the next chunk before the current one finishes,
+  so the disk is already rewinding to layer 0 of token N+1 during the last forwards (and
+  the sampling) of token N. The trace reports the residual stall ("blocked") separately
+  from forward time.
+- Strict memory ceiling mode: `--evict-page-cache` sets `F_NOCACHE` on the `.cghost`
+  handle so streamed pages bypass the page cache entirely. Off by default — when the model
+  fits in RAM the cache is a free win; for the over-RAM models ghost targets, the cache can
+  only thrash. (`posix_madvise(DONTNEED)` does not apply to this design — that is for
+  mmap'd ranges, and the streamer uses positioned reads.)
+- The two-node pipeline variant (each node hosts half the `.cghost` and overlaps its disk
+  window with the other node's compute) is the next phase.
 
 ## Step-1 measurements (Llama-3.2-3B-Instruct Q8_0, M4 16GB)
 

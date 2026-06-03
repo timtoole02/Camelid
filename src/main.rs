@@ -20,7 +20,7 @@ use camelid::{
         recv_activation_packet, recv_token_feedback, send_activation_packet, send_token_feedback,
     },
     gguf::{read_metadata, GgufTensorType},
-    ghost::GhostFile,
+    ghost::{GhostFile, GhostPrefetcher},
     inference::{
         LlamaInferenceSession, LlamaLayerWeights, LlamaLoadedWeights, LlamaSampler,
         Q8ResidencyReport, SamplingConfig,
@@ -274,6 +274,15 @@ enum Command {
         /// Override Rayon worker threads.
         #[arg(long)]
         threads: Option<usize>,
+        /// Disable the double-buffered prefetch worker and read each layer synchronously
+        /// on the critical path (the v1 behavior; useful for A/B comparison).
+        #[arg(long, default_value_t = false)]
+        sync_stream: bool,
+        /// Strict memory ceiling mode: bypass the OS page cache for `.cghost` reads
+        /// (F_NOCACHE) so streamed pages never accumulate. Leave off when the model fits
+        /// in RAM — the cache is a free win there.
+        #[arg(long, default_value_t = false)]
+        evict_page_cache: bool,
     },
 }
 
@@ -512,23 +521,103 @@ async fn main() -> anyhow::Result<()> {
             prompt,
             max_tokens,
             threads,
+            sync_stream,
+            evict_page_cache,
         } => {
-            run_ghost(model, cghost, prompt, max_tokens, threads)?;
+            run_ghost(
+                model,
+                cghost,
+                prompt,
+                max_tokens,
+                threads,
+                sync_stream,
+                evict_page_cache,
+            )?;
         }
     }
     Ok(())
 }
 
+/// How ghost mode gets each layer's weights off disk.
+enum GhostStreamer {
+    /// v1: the read + decode happens on the critical path, before each layer's forward.
+    Sync { ghost: Arc<GhostFile>, buf: Vec<u8> },
+    /// v2 double-buffered: a background worker reads + decodes layer N+1 while layer N's
+    /// forward runs; the reported time is only the STALL waiting for the handoff. The
+    /// rendezvous handoff bounds the weight working set to two layer windows.
+    Prefetched {
+        prefetcher: GhostPrefetcher,
+        n_layers: usize,
+    },
+}
+
+impl GhostStreamer {
+    /// Queue the first chunk's layer reads (prefetched mode; no-op for sync).
+    fn prime(&self) -> anyhow::Result<()> {
+        if let GhostStreamer::Prefetched {
+            prefetcher,
+            n_layers,
+        } = self
+        {
+            for layer_idx in 0..*n_layers {
+                prefetcher.request(layer_idx)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Produce layer `layer_idx`'s decoded weights: (weights, bytes streamed, blocked µs).
+    /// On the chunk's last layer the prefetched mode queues the ENTIRE next chunk first, so
+    /// the worker is already rewinding to layer 0 of the next token while this layer's
+    /// forward (and the sampling between chunks) runs. The trailing chunk queued after the
+    /// final token is never consumed — the worker reads at most one extra layer, blocks on
+    /// the rendezvous, and is released by Drop.
+    fn fetch(
+        &mut self,
+        layer_idx: usize,
+        last_in_chunk: bool,
+    ) -> anyhow::Result<(LlamaLayerWeights, u64, u128)> {
+        match self {
+            GhostStreamer::Sync { ghost, buf } => {
+                let started = Instant::now();
+                let (layer, span) = ghost.read_layer(layer_idx, buf)?;
+                Ok((layer, span, started.elapsed().as_micros()))
+            }
+            GhostStreamer::Prefetched {
+                prefetcher,
+                n_layers,
+            } => {
+                if last_in_chunk {
+                    for next_idx in 0..*n_layers {
+                        prefetcher.request(next_idx)?;
+                    }
+                }
+                let started = Instant::now();
+                let prefetched = prefetcher.next()?;
+                anyhow::ensure!(
+                    prefetched.layer_idx == layer_idx,
+                    "prefetcher returned layer {} but layer {layer_idx} was expected",
+                    prefetched.layer_idx
+                );
+                Ok((
+                    prefetched.weights,
+                    prefetched.bytes,
+                    started.elapsed().as_micros(),
+                ))
+            }
+        }
+    }
+}
+
 /// Ghost mode: run every transformer layer of one chunk (prefill or a single decoded
-/// token), streaming each layer's weights from the `.cghost` file right before its forward
-/// and dropping them right after — the weight working window is exactly one layer. Returns
-/// the chunk's output hidden state plus (bytes streamed, stream time, forward time).
-#[allow(clippy::too_many_arguments)]
+/// token), streaming each layer's weights from the `.cghost` file and dropping them right
+/// after the layer's forward — the weight working window is one layer (sync) or two
+/// (prefetched). Returns the chunk's output hidden state plus (bytes streamed, time blocked
+/// on streaming, forward time).
 fn ghost_stream_layers(
     session: &mut LlamaInferenceSession,
-    ghost: &GhostFile,
+    streamer: &mut GhostStreamer,
     placeholder: &LlamaLayerWeights,
-    buf: &mut Vec<u8>,
     hidden: CpuTensor,
     pos: usize,
     seq_len: usize,
@@ -537,45 +626,44 @@ fn ghost_stream_layers(
     let n_layers = session.weights.layers.len();
     let mut hidden = hidden;
     let mut bytes_total = 0u64;
-    let mut stream_us_total = 0u128;
+    let mut wait_us_total = 0u128;
     let mut forward_us_total = 0u128;
     for layer_idx in 0..n_layers {
-        let stream_started = Instant::now();
-        let (layer, span) = ghost.read_layer(layer_idx, buf)?;
+        let (layer, span, wait_us) = streamer.fetch(layer_idx, layer_idx + 1 == n_layers)?;
         Arc::make_mut(&mut session.weights).layers[layer_idx] = layer;
-        let stream_us = stream_started.elapsed().as_micros();
         let forward_started = Instant::now();
         hidden = session.ghost_forward_one_layer(&hidden, layer_idx, pos, seq_len)?;
         let forward_us = forward_started.elapsed().as_micros();
-        // Drop the streamed weights immediately; only the one-layer window is ever held.
+        // Drop the streamed weights immediately; the window never accumulates.
         Arc::make_mut(&mut session.weights).layers[layer_idx] = placeholder.clone();
         bytes_total += span;
-        stream_us_total += stream_us;
+        wait_us_total += wait_us;
         forward_us_total += forward_us;
         if log_layers {
             eprintln!(
-                "[ghost] layer {layer_idx:>3}: stream {:7.1} ms ({:6.1} MiB @ {:5.0} MB/s)  \
-                 forward {:7.1} ms",
-                stream_us as f64 / 1000.0,
+                "[ghost] layer {layer_idx:>3}: wait {:7.1} ms ({:6.1} MiB)  forward {:7.1} ms",
+                wait_us as f64 / 1000.0,
                 span as f64 / (1024.0 * 1024.0),
-                span as f64 / (stream_us.max(1) as f64), // bytes/us == MB/s
                 forward_us as f64 / 1000.0,
             );
         }
     }
     session.ghost_advance_position(seq_len);
-    Ok((hidden, bytes_total, stream_us_total, forward_us_total))
+    Ok((hidden, bytes_total, wait_us_total, forward_us_total))
 }
 
-/// EXPERIMENTAL ghost (layer-streaming) mode, synchronous v1: greedy generation with the
-/// model executed one transformer block at a time from a `.cghost` file. RAM holds the
-/// embedding/output ends + KV cache + ONE layer's weights; everything else stays on disk.
+/// EXPERIMENTAL ghost (layer-streaming) mode: greedy generation with the model executed one
+/// transformer block at a time from a `.cghost` file. RAM holds the embedding/output ends +
+/// KV cache + the streaming window (one layer sync, two prefetched); everything else stays
+/// on disk.
 fn run_ghost(
     model: PathBuf,
     cghost: PathBuf,
     prompt: String,
     max_tokens: usize,
     threads: Option<usize>,
+    sync_stream: bool,
+    evict_page_cache: bool,
 ) -> anyhow::Result<()> {
     configure_rayon_threads(threads)?;
     let gib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0 * 1024.0);
@@ -587,7 +675,7 @@ fn run_ghost(
     let store = TensorStore::open(&model, &gguf);
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
 
-    let ghost = GhostFile::open(&cghost)?;
+    let ghost = Arc::new(GhostFile::open_with_options(&cghost, evict_page_cache)?);
     let n_layers = config.block_count as usize;
     anyhow::ensure!(
         ghost.index.block_count == n_layers,
@@ -601,13 +689,29 @@ fn run_ghost(
     let weights = LlamaLoadedWeights::load_distributed(&store, &binding, 0, 0, true, true)?;
     let mut session = LlamaInferenceSession::new(config.clone(), Arc::new(weights))?;
     let placeholder = session.weights.layers[0].clone();
-    let mut buf: Vec<u8> = Vec::with_capacity(ghost.max_layer_span() as usize);
+    let mut streamer = if sync_stream {
+        GhostStreamer::Sync {
+            buf: Vec::with_capacity(ghost.max_layer_span() as usize),
+            ghost: Arc::clone(&ghost),
+        }
+    } else {
+        GhostStreamer::Prefetched {
+            prefetcher: GhostPrefetcher::spawn(Arc::clone(&ghost)),
+            n_layers,
+        }
+    };
     println!(
-        "[ghost] resident ends loaded in {:.1}s; {} layers x {:.1} MiB max streaming window; \
-         footprint {:.2} GiB",
+        "[ghost] resident ends loaded in {:.1}s; {} layers x {:.1} MiB max streaming window \
+         ({}, page cache {}); footprint {:.2} GiB",
         load_started.elapsed().as_secs_f64(),
         n_layers,
         ghost.max_layer_span() as f64 / (1024.0 * 1024.0),
+        if sync_stream {
+            "sync"
+        } else {
+            "double-buffered prefetch"
+        },
+        if evict_page_cache { "evicted" } else { "on" },
         gib(phys_footprint_bytes()),
     );
 
@@ -616,15 +720,15 @@ fn run_ghost(
     let mut pos = 0usize;
 
     let prefill_started = Instant::now();
+    streamer.prime()?;
     let hidden = session
         .weights
         .token_embedding
         .embedding_lookup(&token_ids, "token_embedding_ghost")?;
-    let (mut hidden, bytes, stream_us, forward_us) = ghost_stream_layers(
+    let (mut hidden, bytes, wait_us, forward_us) = ghost_stream_layers(
         &mut session,
-        &ghost,
+        &mut streamer,
         &placeholder,
-        &mut buf,
         hidden,
         pos,
         token_ids.len(),
@@ -632,11 +736,11 @@ fn run_ghost(
     )?;
     pos += token_ids.len();
     println!(
-        "[ghost] prefill: {:.1}s ({:.2} GiB streamed @ {:.0} MB/s, forward {:.1}s); \
+        "[ghost] prefill: {:.1}s ({:.2} GiB streamed, blocked {:.1}s, forward {:.1}s); \
          footprint {:.2} GiB",
         prefill_started.elapsed().as_secs_f64(),
         gib(bytes),
-        bytes as f64 / (stream_us.max(1) as f64),
+        wait_us as f64 / 1_000_000.0,
         forward_us as f64 / 1_000_000.0,
         gib(phys_footprint_bytes()),
     );
@@ -668,11 +772,10 @@ fn run_ghost(
             .weights
             .token_embedding
             .embedding_lookup(&[token], "token_embedding_ghost")?;
-        let (next_hidden, bytes, stream_us, forward_us) = ghost_stream_layers(
+        let (next_hidden, bytes, wait_us, forward_us) = ghost_stream_layers(
             &mut session,
-            &ghost,
+            &mut streamer,
             &placeholder,
-            &mut buf,
             embedding,
             pos,
             1,
@@ -683,12 +786,12 @@ fn run_ghost(
         let token_us = token_started.elapsed().as_micros();
         decode_us_total += token_us;
         eprintln!(
-            "[ghost] token {:>3}: {:6.0} ms ({:.2} GiB streamed @ {:4.0} MB/s, forward \
+            "[ghost] token {:>3}: {:6.0} ms ({:.2} GiB streamed, blocked {:5.0} ms, forward \
              {:5.0} ms)",
             step + 1,
             token_us as f64 / 1000.0,
             gib(bytes),
-            bytes as f64 / (stream_us.max(1) as f64),
+            wait_us as f64 / 1000.0,
             forward_us as f64 / 1000.0,
         );
     }
