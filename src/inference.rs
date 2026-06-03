@@ -1263,11 +1263,42 @@ pub struct LlamaGenerationStep {
     pub diagnostics: Option<LlamaForwardDiagnostics>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
 pub struct LlamaInferenceSession {
     pub config: LlamaModelConfig,
     pub weights: Arc<LlamaLoadedWeights>,
     pub kv_cache: LlamaKvCache,
+    /// Lazily-built GPU resident-decode session (a transient on-GPU cache; rebuilt on demand
+    /// and not part of the session's logical identity, so it is skipped by Clone/PartialEq/Debug).
+    resident_decode: Option<metal::ResidentDecodeState>,
+}
+
+impl Clone for LlamaInferenceSession {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            weights: self.weights.clone(),
+            kv_cache: self.kv_cache.clone(),
+            resident_decode: None,
+        }
+    }
+}
+
+impl PartialEq for LlamaInferenceSession {
+    fn eq(&self, other: &Self) -> bool {
+        self.config == other.config
+            && self.weights == other.weights
+            && self.kv_cache == other.kv_cache
+    }
+}
+
+impl std::fmt::Debug for LlamaInferenceSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlamaInferenceSession")
+            .field("config", &self.config)
+            .field("weights", &self.weights)
+            .field("kv_cache", &self.kv_cache)
+            .finish_non_exhaustive()
+    }
 }
 
 impl LlamaInferenceSession {
@@ -1282,7 +1313,177 @@ impl LlamaInferenceSession {
             config,
             weights,
             kv_cache: LlamaKvCache::new(plan)?,
+            resident_decode: None,
         })
+    }
+
+    /// Whether the GPU-resident decode forward may run for this model+config: flag on, dense
+    /// (no MoE), not distributed-sharded, all default diagnostic modes the kernel implements
+    /// (Grouped GQA, 1/sqrt(head_dim) scale, gate*swish(up) order), every layer a plain Q8_0
+    /// row-major weight, and dims satisfying the kernel's modulo constraints. Anything else
+    /// keeps the unchanged CPU layer loop.
+    fn resident_decode_eligible(&self) -> Result<bool> {
+        if !resident_decode_metal_enabled() {
+            return Ok(false);
+        }
+        if self.weights.layer_range.is_some() || self.config.moe.is_some() {
+            return Ok(false);
+        }
+        if diagnostic_gqa_head_mapping()? != GqaHeadMapping::Grouped
+            || diagnostic_attention_score_scale()? != AttentionScoreScale::HeadDim
+            || diagnostic_ffn_gate_up_order()? != FfnGateUpOrder::GateUp
+        {
+            return Ok(false);
+        }
+        let is_q8 =
+            |t: &CpuTensor| t.source_type == Some(GgufTensorType::Q8_0) && t.q8_0_blocks.is_some();
+        for layer in &self.weights.layers {
+            if layer.moe_router.is_some()
+                || !is_q8(&layer.attention_q)
+                || !is_q8(&layer.attention_k)
+                || !is_q8(&layer.attention_v)
+                || !is_q8(&layer.attention_output)
+                || !is_q8(&layer.ffn_gate)
+                || !is_q8(&layer.ffn_up)
+                || !is_q8(&layer.ffn_down)
+            {
+                return Ok(false);
+            }
+        }
+        let dims = DenseLlamaDims::from_config(&self.config)?;
+        let n_heads = self.config.attention_head_count as usize;
+        let q_dim = n_heads * dims.head_dim;
+        Ok(dims.embedding_length != 0
+            && dims.embedding_length.is_multiple_of(32)
+            && q_dim.is_multiple_of(32)
+            && dims.head_dim != 0
+            && dims.head_dim.is_multiple_of(2)
+            && dims.feed_forward_length != 0
+            && dims.feed_forward_length.is_multiple_of(32)
+            && n_heads != 0
+            && dims.attention_head_count_kv != 0
+            && n_heads.is_multiple_of(dims.attention_head_count_kv))
+    }
+
+    /// Run the whole token forward on the GPU resident-decode session. Returns Some(hidden) on
+    /// success (the caller applies the existing final norm + output projection), or None to fall
+    /// back to the CPU layer loop (ineligible config, unsupported RoPE, or Metal unavailable).
+    fn try_resident_decode_forward(&mut self, embedding: &CpuTensor) -> Result<Option<CpuTensor>> {
+        if !self.resident_decode_eligible()? {
+            return Ok(None);
+        }
+        let weights = Arc::clone(&self.weights);
+        let dims = DenseLlamaDims::from_config(&self.config)?;
+        let n_heads = self.config.attention_head_count as usize;
+        let n_kv = dims.attention_head_count_kv;
+        let head_dim = dims.head_dim;
+        let hidden = dims.embedding_length;
+        let ffn_dim = dims.feed_forward_length;
+        let n_layers = dims.block_count;
+        let max_positions = self.config.context_length as usize;
+        let position = self.kv_cache.position;
+        if position >= max_positions
+            || embedding.data.len() != hidden
+            || weights.layers.len() != n_layers
+        {
+            return Ok(None);
+        }
+        let rms_eps = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
+        let tables = match rope::resident_decode_rope_tables(
+            position,
+            head_dim,
+            &self.config,
+            weights.rope_freqs.as_ref(),
+        )? {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+        let scale = attention_score_scale_value(head_dim, diagnostic_attention_score_scale()?);
+
+        // (Re)build + seed the session when starting a sequence (or resuming at a position the
+        // session has not materialized): copy the CPU KV history [0, position) into the GPU
+        // cache so resident decode can take over after the batched CPU prefill.
+        let rebuild = match &self.resident_decode {
+            Some(s) => s.filled() != position,
+            None => true,
+        };
+        if rebuild {
+            let mut session = match metal::ResidentDecodeState::new(
+                n_layers,
+                n_heads,
+                n_kv,
+                head_dim,
+                hidden,
+                ffn_dim,
+                max_positions,
+                rms_eps,
+                tables.split_half_pairing,
+            ) {
+                Some(s) => s,
+                None => return Ok(None),
+            };
+            if position > 0 {
+                let kv_dim = n_kv * head_dim;
+                for layer in 0..n_layers {
+                    let mut ck = vec![0.0f32; kv_dim * position];
+                    let mut cv = vec![0.0f32; kv_dim * position];
+                    for p in 0..position {
+                        for h in 0..n_kv {
+                            let src = self.kv_cache.offset(layer, p, h);
+                            let dst = (h * position + p) * head_dim;
+                            ck[dst..dst + head_dim]
+                                .copy_from_slice(&self.kv_cache.keys[src..src + head_dim]);
+                            cv[dst..dst + head_dim]
+                                .copy_from_slice(&self.kv_cache.values[src..src + head_dim]);
+                        }
+                    }
+                    if !session.seed_layer(layer, &ck, &cv, position) {
+                        return Ok(None);
+                    }
+                }
+            }
+            session.set_filled(position);
+            self.resident_decode = Some(session);
+        }
+
+        let layer_views: Vec<metal::ResidentLayerWeights> = weights
+            .layers
+            .iter()
+            .map(|l| metal::ResidentLayerWeights {
+                attn_norm: &l.attention_norm.data,
+                ffn_norm: &l.ffn_norm.data,
+                q_weight_blocks: q8_0_blocks_as_bytes(l.attention_q.q8_0_blocks.as_ref().unwrap()),
+                k_weight_blocks: q8_0_blocks_as_bytes(l.attention_k.q8_0_blocks.as_ref().unwrap()),
+                v_weight_blocks: q8_0_blocks_as_bytes(l.attention_v.q8_0_blocks.as_ref().unwrap()),
+                o_weight_blocks: q8_0_blocks_as_bytes(
+                    l.attention_output.q8_0_blocks.as_ref().unwrap(),
+                ),
+                gate_weight_blocks: q8_0_blocks_as_bytes(l.ffn_gate.q8_0_blocks.as_ref().unwrap()),
+                up_weight_blocks: q8_0_blocks_as_bytes(l.ffn_up.q8_0_blocks.as_ref().unwrap()),
+                down_weight_blocks: q8_0_blocks_as_bytes(l.ffn_down.q8_0_blocks.as_ref().unwrap()),
+            })
+            .collect();
+
+        let session = self
+            .resident_decode
+            .as_mut()
+            .expect("resident session built above");
+        let out = match session.forward_token(
+            &embedding.data,
+            &layer_views,
+            &tables.cos,
+            &tables.sin,
+            position,
+            scale,
+        ) {
+            Some(o) => o,
+            None => return Ok(None),
+        };
+        Ok(Some(CpuTensor::from_f32(
+            "resident_hidden",
+            vec![1, hidden],
+            out,
+        )?))
     }
 
     pub fn forward_worker_layers(
@@ -1803,43 +2004,59 @@ impl LlamaInferenceSession {
             collect_diagnostics.then(|| Vec::with_capacity(self.weights.layers.len()));
         let layers_started = Instant::now();
         let rms_norm_epsilon = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
-        for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
-            if let Some(range) = &self.weights.layer_range {
-                if !range.contains(&layer_idx) {
-                    if let Some(client) = crate::distributed::DISTRIBUTED_CLIENT.get() {
-                        let worker_response =
-                            client.forward_to_worker(&hidden, false, 1, self.kv_cache.position)?;
-                        hidden = worker_response;
-                        break;
-                    } else {
-                        continue;
+        // GPU-resident decode: run all layers on the Metal GPU in one command buffer with the
+        // KV cache resident across tokens. Only when not collecting diagnostics; falls back to
+        // the CPU layer loop below when ineligible (returns None).
+        let resident_hidden = if collect_diagnostics {
+            None
+        } else {
+            self.try_resident_decode_forward(&hidden)?
+        };
+        if let Some(resident) = resident_hidden {
+            hidden = resident;
+        } else {
+            for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
+                if let Some(range) = &self.weights.layer_range {
+                    if !range.contains(&layer_idx) {
+                        if let Some(client) = crate::distributed::DISTRIBUTED_CLIENT.get() {
+                            let worker_response = client.forward_to_worker(
+                                &hidden,
+                                false,
+                                1,
+                                self.kv_cache.position,
+                            )?;
+                            hidden = worker_response;
+                            break;
+                        } else {
+                            continue;
+                        }
                     }
                 }
-            }
-            trace_forward_memory(&format!("layer_{layer_idx}_start"));
-            let timed = forward_layer_timed(
-                &hidden,
-                layer,
-                ForwardLayerParams {
-                    config: &self.config,
-                    rope_freqs: self.weights.rope_freqs.as_ref(),
-                    rms_norm_epsilon,
-                    layer_idx,
-                    collect_diagnostics,
-                    runtime_plan: &runtime_plan,
-                },
-                &mut self.kv_cache,
-            )?;
-            hidden = timed.output;
-            trace_forward_memory(&format!("layer_{layer_idx}_done"));
-            if let (Some(memory), Some(layer_memory)) = (&mut memory, &timed.timings.memory) {
-                memory.record_layer(layer_memory.clone());
-            }
-            timings.layers.push(timed.timings);
-            if let (Some(layer_diagnostics), Some(diagnostics)) =
-                (&mut layer_diagnostics, timed.diagnostics)
-            {
-                layer_diagnostics.push(diagnostics);
+                trace_forward_memory(&format!("layer_{layer_idx}_start"));
+                let timed = forward_layer_timed(
+                    &hidden,
+                    layer,
+                    ForwardLayerParams {
+                        config: &self.config,
+                        rope_freqs: self.weights.rope_freqs.as_ref(),
+                        rms_norm_epsilon,
+                        layer_idx,
+                        collect_diagnostics,
+                        runtime_plan: &runtime_plan,
+                    },
+                    &mut self.kv_cache,
+                )?;
+                hidden = timed.output;
+                trace_forward_memory(&format!("layer_{layer_idx}_done"));
+                if let (Some(memory), Some(layer_memory)) = (&mut memory, &timed.timings.memory) {
+                    memory.record_layer(layer_memory.clone());
+                }
+                timings.layers.push(timed.timings);
+                if let (Some(layer_diagnostics), Some(diagnostics)) =
+                    (&mut layer_diagnostics, timed.diagnostics)
+                {
+                    layer_diagnostics.push(diagnostics);
+                }
             }
         }
         timings.layers_total = layers_started.elapsed().as_micros();
@@ -7327,6 +7544,12 @@ fn q8_0_file_reader_block_dot_enabled() -> bool {
 #[allow(dead_code)]
 fn q8_0_metal_enabled() -> bool {
     q8_0_env_flag_enabled_default_off("CAMELID_METAL_Q8")
+}
+
+/// Gate for the GPU-resident decode forward (whole token on the Metal GPU, KV cache resident
+/// across tokens). Default off; opt in with `CAMELID_METAL_RESIDENT_DECODE`.
+fn resident_decode_metal_enabled() -> bool {
+    q8_0_env_flag_enabled_default_off("CAMELID_METAL_RESIDENT_DECODE")
 }
 
 #[allow(dead_code)]

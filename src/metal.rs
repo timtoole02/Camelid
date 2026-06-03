@@ -3135,6 +3135,9 @@ pub struct ResidentDecodeState {
     buf_a: Buffer,
     buf_b: Buffer,
     mid: Buffer,
+    /// Number of KV positions currently materialized in the cache (seeded history + appended
+    /// tokens). The caller uses this to detect a new sequence and reseed.
+    filled: usize,
 }
 
 #[cfg(target_os = "macos")]
@@ -3192,7 +3195,18 @@ impl ResidentDecodeState {
             buf_a: nb(hidden),
             buf_b: nb(hidden),
             mid: nb(hidden),
+            filled: 0,
         })
+    }
+
+    /// Positions currently materialized in the KV cache (seeded + appended).
+    pub fn filled(&self) -> usize {
+        self.filled
+    }
+
+    /// Mark `n` positions as materialized (called after seeding history from a CPU cache).
+    pub fn set_filled(&mut self, n: usize) {
+        self.filled = n;
     }
 
     /// Decode one token at sequence position `position` (0-based): append this token's K/V to
@@ -3313,7 +3327,68 @@ impl ResidentDecodeState {
         let final_buf = if from_a { &self.buf_a } else { &self.buf_b };
         let mut out = vec![0.0f32; self.hidden];
         read_buffer_f32(final_buf, &mut out);
+        self.filled = position + 1;
         Some(out)
+    }
+
+    /// Seed `seed_positions` history slots of layer `layer` from contiguous
+    /// `[kv_head][seed_positions][head_dim]` (already-roped) K and (raw) V — e.g. the prompt's
+    /// K/V copied out of a CPU KV cache after a batched prefill, so resident decode can take
+    /// over with the history already on the GPU. Returns false on dimension mismatch.
+    pub fn seed_layer(
+        &mut self,
+        layer: usize,
+        keys: &[f32],
+        values: &[f32],
+        seed_positions: usize,
+    ) -> bool {
+        if layer >= self.n_layers
+            || seed_positions > self.max_positions
+            || keys.len() != self.n_kv_heads * seed_positions * self.head_dim
+            || values.len() != keys.len()
+        {
+            return false;
+        }
+        Self::seed_into(
+            &self.cache_k[layer],
+            keys,
+            self.n_kv_heads,
+            self.max_positions,
+            self.head_dim,
+            seed_positions,
+        );
+        Self::seed_into(
+            &self.cache_v[layer],
+            values,
+            self.n_kv_heads,
+            self.max_positions,
+            self.head_dim,
+            seed_positions,
+        );
+        true
+    }
+
+    /// Scatter contiguous `[kv_head][seed_positions][head_dim]` source data into a persistent
+    /// `[kv_head][max_positions][head_dim]` cache buffer (the per-head position stride differs).
+    fn seed_into(
+        buf: &Buffer,
+        src: &[f32],
+        n_kv_heads: usize,
+        max_positions: usize,
+        head_dim: usize,
+        seed_positions: usize,
+    ) {
+        let run = seed_positions * head_dim;
+        // SAFETY: shared-storage buffer of n_kv_heads*max_positions*head_dim f32; each head's
+        // `run` floats land at a disjoint slot well within that capacity.
+        unsafe {
+            let dst = buf.contents() as *mut f32;
+            for h in 0..n_kv_heads {
+                let s = h * seed_positions * head_dim;
+                let d = h * max_positions * head_dim;
+                std::ptr::copy_nonoverlapping(src[s..s + run].as_ptr(), dst.add(d), run);
+            }
+        }
     }
 
     /// Read back layer `layer`'s first `position_count` cached K positions as a contiguous
@@ -3377,6 +3452,22 @@ impl ResidentDecodeState {
     ) -> Option<Vec<f32>> {
         None
     }
+
+    pub fn seed_layer(
+        &mut self,
+        _layer: usize,
+        _keys: &[f32],
+        _values: &[f32],
+        _seed_positions: usize,
+    ) -> bool {
+        false
+    }
+
+    pub fn filled(&self) -> usize {
+        0
+    }
+
+    pub fn set_filled(&mut self, _n: usize) {}
 }
 
 #[cfg(not(target_os = "macos"))]

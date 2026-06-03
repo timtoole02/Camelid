@@ -439,6 +439,73 @@ fn rope_pair_frequency(pair_idx: usize, params: &RopeParams<'_>) -> f32 {
     }
 }
 
+/// RoPE cos/sin tables for a single position, for the GPU resident-decode kernel (which
+/// consumes per-pair cos/sin and applies the rotation itself). Mirrors `apply_rope_to_row`'s
+/// angle math exactly — same `rope_pair_frequency` (incl. llama3 scaling and `rope_freqs`)
+/// and `effective_position` — so the GPU rotation matches the CPU path bit-for-bit given the
+/// same projected K/Q. Returns Ok(None) when the configured RoPE direction is Inverse (the
+/// kernel is forward-only), signalling the caller to fall back to the CPU path.
+pub(super) struct ResidentRopeTables {
+    pub(super) cos: Vec<f32>,
+    pub(super) sin: Vec<f32>,
+    pub(super) split_half_pairing: bool,
+}
+
+pub(super) fn resident_decode_rope_tables(
+    position: usize,
+    head_dim: usize,
+    config: &LlamaModelConfig,
+    rope_freqs: Option<&CpuTensor>,
+) -> Result<Option<ResidentRopeTables>> {
+    let rope_dim = config.rope_dimension_count.unwrap_or(head_dim as u32) as usize;
+    if rope_dim == 0 || rope_dim > head_dim || !rope_dim.is_multiple_of(2) {
+        return Err(BackendError::InvalidModelMetadata(format!(
+            "RoPE dimension count {rope_dim} must be even and within head dimension {head_dim}"
+        )));
+    }
+    let freq_base = config.rope_freq_base.unwrap_or(10_000.0);
+    if freq_base <= 0.0 || !freq_base.is_finite() {
+        return Err(BackendError::InvalidModelMetadata(format!(
+            "RoPE frequency base {freq_base} must be finite and positive"
+        )));
+    }
+    if diagnostic_rope_direction()? != RopeDirection::Forward {
+        return Ok(None);
+    }
+    let pairing = diagnostic_rope_pairing()?;
+    let position_mode = diagnostic_rope_position_mode()?;
+    let scaling = rope_scaling_from_config(config)?;
+    let rope_freqs = rope_freqs
+        .map(|freqs| validate_rope_frequency_tensor(freqs, rope_dim))
+        .transpose()?;
+    let params = RopeParams {
+        position,
+        head_count: 1,
+        head_dim,
+        rope_dim,
+        freq_base,
+        pairing,
+        direction: RopeDirection::Forward,
+        position_mode,
+        scaling,
+        rope_freqs,
+    };
+    let half = rope_dim / 2;
+    let eff = position_mode.effective_position(position) as f32;
+    let mut cos = Vec::with_capacity(half);
+    let mut sin = Vec::with_capacity(half);
+    for pair in 0..half {
+        let (s, c) = (eff * rope_pair_frequency(pair, &params)).sin_cos();
+        cos.push(c);
+        sin.push(s);
+    }
+    Ok(Some(ResidentRopeTables {
+        cos,
+        sin,
+        split_half_pairing: matches!(pairing, RopePairing::SplitHalf),
+    }))
+}
+
 fn llama3_scaled_rope_frequency(frequency: f32, scaling: RopeScaling) -> f32 {
     let original_context_length = scaling
         .original_context_length
