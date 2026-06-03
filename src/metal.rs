@@ -1970,11 +1970,286 @@ pub fn try_quantized_matmul_resident(
     Some(out)
 }
 
+// --- Resident-buffer encode helpers: encode one kernel into a shared command buffer,
+// operating on GPU buffers with no readback. Reusable building blocks for the
+// GPU-resident forward pass (KV cache + per-token chaining build on these). ---
+
+#[cfg(target_os = "macos")]
+fn dispatch_1d(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    n: usize,
+) {
+    let w = pipeline.thread_execution_width().max(1);
+    encoder.dispatch_thread_groups(
+        metal::MTLSize {
+            width: (n as u64).div_ceil(w),
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: w,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn encode_rms_norm(
+    cb: &metal::CommandBufferRef,
+    k: &MetalLinearKernel,
+    input: &Buffer,
+    weight: &Buffer,
+    out: &Buffer,
+    scalar: &Buffer,
+) {
+    let e = cb.new_compute_command_encoder();
+    e.set_compute_pipeline_state(&k.rms_norm_pipeline);
+    e.set_buffer(0, Some(input), 0);
+    e.set_buffer(1, Some(weight), 0);
+    e.set_buffer(2, Some(out), 0);
+    e.set_buffer(3, Some(scalar), 0);
+    e.set_buffer(4, Some(scalar), 4);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
+    e.end_encoding();
+}
+
+#[cfg(target_os = "macos")]
+fn encode_quantize(
+    cb: &metal::CommandBufferRef,
+    k: &MetalLinearKernel,
+    input: &Buffer,
+    scales: &Buffer,
+    quants: &Buffer,
+    nblocks_buf: &Buffer,
+    n_blocks: usize,
+) {
+    let e = cb.new_compute_command_encoder();
+    e.set_compute_pipeline_state(&k.quantize_q8_0_pipeline);
+    e.set_buffer(0, Some(input), 0);
+    e.set_buffer(1, Some(scales), 0);
+    e.set_buffer(2, Some(quants), 0);
+    e.set_buffer(3, Some(nblocks_buf), 0);
+    dispatch_1d(e, &k.quantize_q8_0_pipeline, n_blocks);
+    e.end_encoding();
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_q8_matmul(
+    cb: &metal::CommandBufferRef,
+    k: &MetalLinearKernel,
+    scales: &Buffer,
+    quants: &Buffer,
+    weight: &Buffer,
+    out: &Buffer,
+    scalar: &Buffer,
+    rows: usize,
+) {
+    let e = cb.new_compute_command_encoder();
+    e.set_compute_pipeline_state(&k.q8_0_block_pipeline);
+    e.set_buffer(0, Some(scales), 0);
+    e.set_buffer(1, Some(quants), 0);
+    e.set_buffer(2, Some(weight), 0);
+    e.set_buffer(3, Some(out), 0);
+    e.set_buffer(4, Some(scalar), 0);
+    e.set_buffer(5, Some(scalar), 4);
+    dispatch_1d(e, &k.q8_0_block_pipeline, rows);
+    e.end_encoding();
+}
+
+#[cfg(target_os = "macos")]
+fn encode_binary(
+    cb: &metal::CommandBufferRef,
+    pipeline: &ComputePipelineState,
+    a: &Buffer,
+    b: &Buffer,
+    out: &Buffer,
+    n_buf: &Buffer,
+    n: usize,
+) {
+    let e = cb.new_compute_command_encoder();
+    e.set_compute_pipeline_state(pipeline);
+    e.set_buffer(0, Some(a), 0);
+    e.set_buffer(1, Some(b), 0);
+    e.set_buffer(2, Some(out), 0);
+    e.set_buffer(3, Some(n_buf), 0);
+    dispatch_1d(e, pipeline, n);
+    e.end_encoding();
+}
+
+/// GPU-resident FFN block in a single command buffer (no CPU readback between ops):
+/// rms_norm -> quantize -> gate & up matmul -> silu_mul -> quantize -> down matmul ->
+/// residual add with the input. Weights are Q8_0 36-byte blocks (gate/up are
+/// [ffn_dim x hidden/32], down is [hidden x ffn_dim/32]). Returns [hidden]; None if
+/// Metal is unavailable. Bit-identical to running the standalone kernels in sequence.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+pub fn try_ffn_block_resident(
+    input: &[f32],
+    ffn_norm: &[f32],
+    eps: f32,
+    gate_weight_blocks: &[u8],
+    up_weight_blocks: &[u8],
+    down_weight_blocks: &[u8],
+    ffn_dim: usize,
+) -> Option<Vec<f32>> {
+    let hidden = input.len();
+    if hidden == 0
+        || !hidden.is_multiple_of(32)
+        || ffn_dim == 0
+        || !ffn_dim.is_multiple_of(32)
+        || ffn_norm.len() != hidden
+    {
+        return None;
+    }
+    let bpr_hidden = hidden / 32;
+    let bpr_ffn = ffn_dim / 32;
+    if gate_weight_blocks.len() != ffn_dim * bpr_hidden * 36
+        || up_weight_blocks.len() != ffn_dim * bpr_hidden * 36
+        || down_weight_blocks.len() != hidden * bpr_ffn * 36
+    {
+        return None;
+    }
+    let k = metal_linear_kernel()?;
+    let nb = |bytes: u64| {
+        k.device
+            .new_buffer(bytes, MTLResourceOptions::StorageModeShared)
+    };
+    let in_buf = nb((hidden * 4) as u64);
+    let norm_w_buf = nb((hidden * 4) as u64);
+    let norm_buf = nb((hidden * 4) as u64);
+    let rms_scalar = nb(8);
+    let scales1 = nb((bpr_hidden * 4) as u64);
+    let quants1 = nb(hidden as u64);
+    let nblocks1 = nb(4);
+    let gate_w = nb(gate_weight_blocks.len() as u64);
+    let up_w = nb(up_weight_blocks.len() as u64);
+    let gate_buf = nb((ffn_dim * 4) as u64);
+    let up_buf = nb((ffn_dim * 4) as u64);
+    let gateup_scalar = nb(8);
+    let act_buf = nb((ffn_dim * 4) as u64);
+    let silu_n = nb(4);
+    let scales2 = nb((bpr_ffn * 4) as u64);
+    let quants2 = nb(ffn_dim as u64);
+    let nblocks2 = nb(4);
+    let down_w = nb(down_weight_blocks.len() as u64);
+    let down_buf = nb((hidden * 4) as u64);
+    let down_scalar = nb(8);
+    let out_buf = nb((hidden * 4) as u64);
+    let resid_n = nb(4);
+
+    write_buffer_f32(&in_buf, input);
+    write_buffer_f32(&norm_w_buf, ffn_norm);
+    write_buffer_u8(&gate_w, gate_weight_blocks);
+    write_buffer_u8(&up_w, up_weight_blocks);
+    write_buffer_u8(&down_w, down_weight_blocks);
+    unsafe {
+        let p = rms_scalar.contents() as *mut u8;
+        *(p as *mut u32) = hidden as u32;
+        *(p.add(4) as *mut f32) = eps;
+        *(nblocks1.contents() as *mut u32) = bpr_hidden as u32;
+        let g = gateup_scalar.contents() as *mut u32;
+        *g = bpr_hidden as u32;
+        *g.add(1) = ffn_dim as u32;
+        *(silu_n.contents() as *mut u32) = ffn_dim as u32;
+        *(nblocks2.contents() as *mut u32) = bpr_ffn as u32;
+        let d = down_scalar.contents() as *mut u32;
+        *d = bpr_ffn as u32;
+        *d.add(1) = hidden as u32;
+        *(resid_n.contents() as *mut u32) = hidden as u32;
+    }
+
+    let cb = k.queue.new_command_buffer();
+    encode_rms_norm(cb, k, &in_buf, &norm_w_buf, &norm_buf, &rms_scalar);
+    encode_quantize(cb, k, &norm_buf, &scales1, &quants1, &nblocks1, bpr_hidden);
+    encode_q8_matmul(
+        cb,
+        k,
+        &scales1,
+        &quants1,
+        &gate_w,
+        &gate_buf,
+        &gateup_scalar,
+        ffn_dim,
+    );
+    encode_q8_matmul(
+        cb,
+        k,
+        &scales1,
+        &quants1,
+        &up_w,
+        &up_buf,
+        &gateup_scalar,
+        ffn_dim,
+    );
+    encode_binary(
+        cb,
+        &k.silu_mul_pipeline,
+        &gate_buf,
+        &up_buf,
+        &act_buf,
+        &silu_n,
+        ffn_dim,
+    );
+    encode_quantize(cb, k, &act_buf, &scales2, &quants2, &nblocks2, bpr_ffn);
+    encode_q8_matmul(
+        cb,
+        k,
+        &scales2,
+        &quants2,
+        &down_w,
+        &down_buf,
+        &down_scalar,
+        hidden,
+    );
+    encode_binary(
+        cb,
+        &k.residual_add_pipeline,
+        &in_buf,
+        &down_buf,
+        &out_buf,
+        &resid_n,
+        hidden,
+    );
+    cb.commit();
+    cb.wait_until_completed();
+    let mut out = vec![0.0f32; hidden];
+    read_buffer_f32(&out_buf, &mut out);
+    Some(out)
+}
+
 #[cfg(not(target_os = "macos"))]
 pub fn try_quantized_matmul_resident(
     _input: &[f32],
     _weight_blocks: &[u8],
     _output_width: usize,
+) -> Option<Vec<f32>> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+pub fn try_ffn_block_resident(
+    _input: &[f32],
+    _ffn_norm: &[f32],
+    _eps: f32,
+    _gate_weight_blocks: &[u8],
+    _up_weight_blocks: &[u8],
+    _down_weight_blocks: &[u8],
+    _ffn_dim: usize,
 ) -> Option<Vec<f32>> {
     None
 }
@@ -2231,6 +2506,64 @@ mod tests {
             .map(|(g, u)| (g / (1.0 + (-g).exp())) * u)
             .collect();
         let got = try_silu_mul_f32(&gate, &up).expect("metal silu_mul");
+        for (a, b) in got.iter().zip(&expected) {
+            assert!((a - b).abs() < 1.0e-3, "{a} != {b}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_ffn_block_resident_matches_standalone() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let hidden = 64usize;
+        let ffn = 128usize;
+        let eps = 1.0e-5f32;
+        let bpr_hidden = hidden / 32;
+        let bpr_ffn = ffn / 32;
+        let input: Vec<f32> = (0..hidden)
+            .map(|i| ((i as f32 % 11.0) - 5.0) * 0.2)
+            .collect();
+        let ffn_norm: Vec<f32> = (0..hidden).map(|i| 0.5 + (i as f32 % 3.0) * 0.1).collect();
+        let mkw = |rows: usize, bpr: usize, seed: usize| {
+            let mut w: Vec<u8> = Vec::new();
+            for r in 0..rows {
+                for b in 0..bpr {
+                    let scale = 0.05 + ((r * bpr + b + seed) as f32 % 7.0) * 0.01;
+                    w.extend_from_slice(&scale.to_le_bytes());
+                    for l in 0..32 {
+                        w.push((((r * 5 + b * 3 + l + seed) as i32 % 17) - 8) as i8 as u8);
+                    }
+                }
+            }
+            w
+        };
+        let gate_w = mkw(ffn, bpr_hidden, 1);
+        let up_w = mkw(ffn, bpr_hidden, 2);
+        let down_w = mkw(hidden, bpr_ffn, 3);
+
+        // Reference: the standalone (CPU-verified) kernels run in sequence.
+        let norm = try_rms_norm_f32(&input, &ffn_norm, eps).unwrap();
+        let (s1, q1) = try_quantize_q8_0_f32(&norm).unwrap();
+        let mut gate = vec![0.0f32; ffn];
+        assert!(try_q8_0_block_linear_row(
+            &s1, &q1, &gate_w, ffn, bpr_hidden, &mut gate
+        ));
+        let mut up = vec![0.0f32; ffn];
+        assert!(try_q8_0_block_linear_row(
+            &s1, &q1, &up_w, ffn, bpr_hidden, &mut up
+        ));
+        let act = try_silu_mul_f32(&gate, &up).unwrap();
+        let (s2, q2) = try_quantize_q8_0_f32(&act).unwrap();
+        let mut down = vec![0.0f32; hidden];
+        assert!(try_q8_0_block_linear_row(
+            &s2, &q2, &down_w, hidden, bpr_ffn, &mut down
+        ));
+        let expected = try_residual_add_f32(&input, &down).unwrap();
+
+        let got =
+            try_ffn_block_resident(&input, &ffn_norm, eps, &gate_w, &up_w, &down_w, ffn).unwrap();
         for (a, b) in got.iter().zip(&expected) {
             assert!((a - b).abs() < 1.0e-3, "{a} != {b}");
         }
