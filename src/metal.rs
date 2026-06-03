@@ -2836,6 +2836,159 @@ pub fn try_decode_layer_resident(
     Some(out)
 }
 
+/// Borrowed per-layer inputs for `try_decode_forward_resident`: the layer's two RMSNorm
+/// weights, its seven Q8_0 weight-block buffers (q/k/v/o gate/up/down), and its K/V caches
+/// (each `[n_kv_heads * position_count * head_dim]`, positions `0..position_count-1`
+/// caller-filled; the current token is written at the last position).
+pub struct ResidentDecodeLayer<'a> {
+    pub attn_norm: &'a [f32],
+    pub ffn_norm: &'a [f32],
+    pub q_weight_blocks: &'a [u8],
+    pub k_weight_blocks: &'a [u8],
+    pub v_weight_blocks: &'a [u8],
+    pub o_weight_blocks: &'a [u8],
+    pub gate_weight_blocks: &'a [u8],
+    pub up_weight_blocks: &'a [u8],
+    pub down_weight_blocks: &'a [u8],
+    pub cache_k: &'a [f32],
+    pub cache_v: &'a [f32],
+}
+
+/// GPU-resident per-token decode over ALL transformer layers in a SINGLE command buffer: for
+/// each layer the attention block then the FFN block are encoded back-to-back with the hidden
+/// state staying in GPU buffers, so the whole token costs exactly ONE commit/wait (vs one per
+/// layer for `try_decode_layer_resident`, or one per op for the standalone kernels). RoPE
+/// tables and the per-token attention `scale` are shared across layers. `embedding` is the
+/// input hidden state `[hidden]`; the returned `[hidden]` is the post-final-layer hidden state
+/// (the final norm + output projection are applied by the caller). Bit-identical to feeding
+/// each layer's output into the next via `try_decode_layer_resident`. Returns None if Metal is
+/// unavailable, `layers` is empty, or any layer's dimensions are invalid.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+pub fn try_decode_forward_resident(
+    embedding: &[f32],
+    layers: &[ResidentDecodeLayer],
+    cos_t: &[f32],
+    sin_t: &[f32],
+    eps: f32,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    position_count: usize,
+    ffn_dim: usize,
+    scale: f32,
+    split_half_pairing: bool,
+) -> Option<Vec<f32>> {
+    let hidden = embedding.len();
+    let q_dim = n_heads * head_dim;
+    let kv_dim = n_kv_heads * head_dim;
+    let half_rope = cos_t.len();
+    if hidden == 0
+        || !hidden.is_multiple_of(32)
+        || !q_dim.is_multiple_of(32)
+        || head_dim == 0
+        || !head_dim.is_multiple_of(2)
+        || n_heads == 0
+        || n_kv_heads == 0
+        || !n_heads.is_multiple_of(n_kv_heads)
+        || position_count == 0
+        || sin_t.len() != half_rope
+        || half_rope * 2 > head_dim
+        || ffn_dim == 0
+        || !ffn_dim.is_multiple_of(32)
+        || layers.is_empty()
+    {
+        return None;
+    }
+    let bpr_hidden = hidden / 32;
+    let bpr_q = q_dim / 32;
+    let bpr_ffn = ffn_dim / 32;
+    for l in layers {
+        if l.attn_norm.len() != hidden
+            || l.ffn_norm.len() != hidden
+            || l.cache_k.len() != kv_dim * position_count
+            || l.cache_v.len() != l.cache_k.len()
+            || l.q_weight_blocks.len() != q_dim * bpr_hidden * 36
+            || l.k_weight_blocks.len() != kv_dim * bpr_hidden * 36
+            || l.v_weight_blocks.len() != kv_dim * bpr_hidden * 36
+            || l.o_weight_blocks.len() != hidden * bpr_q * 36
+            || l.gate_weight_blocks.len() != ffn_dim * bpr_hidden * 36
+            || l.up_weight_blocks.len() != ffn_dim * bpr_hidden * 36
+            || l.down_weight_blocks.len() != hidden * bpr_ffn * 36
+        {
+            return None;
+        }
+    }
+    let k = metal_linear_kernel()?;
+    let nb = |n: usize| {
+        k.device
+            .new_buffer((n * 4) as u64, MTLResourceOptions::StorageModeShared)
+    };
+    // `buf_a`/`buf_b` ping-pong as each layer's in/out hidden; `mid` carries the attention
+    // output into the FFN block within a layer. All three are reused across layers: compute
+    // encoders execute in submission order with coherency between them, so the sequential
+    // reuse is hazard-free (no encoder reads a buffer a later encoder in the same layer step
+    // is still writing).
+    let buf_a = nb(hidden);
+    let buf_b = nb(hidden);
+    let mid = nb(hidden);
+    write_buffer_f32(&buf_a, embedding);
+    let mut keep = Vec::new();
+    let cb = k.queue.new_command_buffer();
+    let mut from_a = true;
+    for layer in layers {
+        let (in_buf, out_buf) = if from_a {
+            (&buf_a, &buf_b)
+        } else {
+            (&buf_b, &buf_a)
+        };
+        encode_attention_block(
+            cb,
+            k,
+            &mut keep,
+            in_buf,
+            &mid,
+            layer.attn_norm,
+            eps,
+            layer.q_weight_blocks,
+            layer.k_weight_blocks,
+            layer.v_weight_blocks,
+            layer.o_weight_blocks,
+            cos_t,
+            sin_t,
+            layer.cache_k,
+            layer.cache_v,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            position_count,
+            scale,
+            split_half_pairing,
+        );
+        encode_ffn_block(
+            cb,
+            k,
+            &mut keep,
+            &mid,
+            out_buf,
+            layer.ffn_norm,
+            eps,
+            layer.gate_weight_blocks,
+            layer.up_weight_blocks,
+            layer.down_weight_blocks,
+            ffn_dim,
+        );
+        from_a = !from_a;
+    }
+    cb.commit();
+    cb.wait_until_completed();
+    // After N flips, the last layer's output sits in `buf_a` iff N is even (`from_a` true).
+    let final_buf = if from_a { &buf_a } else { &buf_b };
+    let mut out = vec![0.0f32; hidden];
+    read_buffer_f32(final_buf, &mut out);
+    Some(out)
+}
+
 #[cfg(not(target_os = "macos"))]
 pub fn try_quantized_matmul_resident(
     _input: &[f32],
@@ -2901,6 +3054,25 @@ pub fn try_decode_layer_resident(
     _sin_t: &[f32],
     _cache_k: &[f32],
     _cache_v: &[f32],
+    _n_heads: usize,
+    _n_kv_heads: usize,
+    _head_dim: usize,
+    _position_count: usize,
+    _ffn_dim: usize,
+    _scale: f32,
+    _split_half_pairing: bool,
+) -> Option<Vec<f32>> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+pub fn try_decode_forward_resident(
+    _embedding: &[f32],
+    _layers: &[ResidentDecodeLayer],
+    _cos_t: &[f32],
+    _sin_t: &[f32],
+    _eps: f32,
     _n_heads: usize,
     _n_kv_heads: usize,
     _head_dim: usize,
@@ -3443,6 +3615,159 @@ mod tests {
             &sin_t,
             &cache_k,
             &cache_v,
+            n_heads,
+            n_kv,
+            head_dim,
+            position_count,
+            ffn,
+            scale,
+            false,
+        )
+        .unwrap();
+        assert_eq!(got.len(), hidden);
+        for (a, b) in got.iter().zip(&expected) {
+            assert!((a - b).abs() < 1.0e-4, "{a} != {b}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_decode_forward_resident_matches_per_layer() {
+        if !detect_metal_device().available {
+            return;
+        }
+        // Running all layers in ONE command buffer must equal feeding each layer's output
+        // into the next via the single-layer fused path. Same kernels + inputs, so it should
+        // be bit-identical; this guards the cross-LAYER ping-pong buffering and the
+        // single-commit lifetime over many encoders.
+        let n_heads = 2usize;
+        let n_kv = 2usize;
+        let head_dim = 32usize;
+        let hidden = 64usize;
+        let ffn = 128usize;
+        let position_count = 3usize;
+        let n_layers = 3usize;
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv * head_dim;
+        let half = head_dim / 2;
+        let eps = 1.0e-5f32;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let bpr_hidden = hidden / 32;
+        let bpr_q = q_dim / 32;
+        let bpr_ffn = ffn / 32;
+        let embedding: Vec<f32> = (0..hidden)
+            .map(|i| ((i as f32 % 11.0) - 5.0) * 0.2)
+            .collect();
+        let cos_t: Vec<f32> = (0..half).map(|p| (0.2 + p as f32 * 0.1).cos()).collect();
+        let sin_t: Vec<f32> = (0..half).map(|p| (0.2 + p as f32 * 0.1).sin()).collect();
+        let mkw = |rows: usize, bpr: usize, seed: usize| {
+            let mut w: Vec<u8> = Vec::new();
+            for r in 0..rows {
+                for b in 0..bpr {
+                    let s = 0.05 + ((r * bpr + b + seed) as f32 % 7.0) * 0.01;
+                    w.extend_from_slice(&s.to_le_bytes());
+                    for l in 0..32 {
+                        w.push((((r * 5 + b * 3 + l + seed) as i32 % 17) - 8) as i8 as u8);
+                    }
+                }
+            }
+            w
+        };
+
+        struct LayerData {
+            attn_norm: Vec<f32>,
+            ffn_norm: Vec<f32>,
+            q: Vec<u8>,
+            k: Vec<u8>,
+            v: Vec<u8>,
+            o: Vec<u8>,
+            gate: Vec<u8>,
+            up: Vec<u8>,
+            down: Vec<u8>,
+            cache_k: Vec<f32>,
+            cache_v: Vec<f32>,
+        }
+        // Seeds vary by layer so each layer has distinct weights/norms/cache.
+        let data: Vec<LayerData> = (0..n_layers)
+            .map(|li| {
+                let s = li * 100;
+                LayerData {
+                    attn_norm: (0..hidden)
+                        .map(|i| 0.5 + ((i + li) as f32 % 3.0) * 0.1)
+                        .collect(),
+                    ffn_norm: (0..hidden)
+                        .map(|i| 0.4 + ((i + li) as f32 % 5.0) * 0.07)
+                        .collect(),
+                    q: mkw(q_dim, bpr_hidden, s + 1),
+                    k: mkw(kv_dim, bpr_hidden, s + 2),
+                    v: mkw(kv_dim, bpr_hidden, s + 3),
+                    o: mkw(hidden, bpr_q, s + 4),
+                    gate: mkw(ffn, bpr_hidden, s + 5),
+                    up: mkw(ffn, bpr_hidden, s + 6),
+                    down: mkw(hidden, bpr_ffn, s + 7),
+                    cache_k: (0..kv_dim * position_count)
+                        .map(|i| (((i + li) as f32 % 13.0) - 6.0) * 0.1)
+                        .collect(),
+                    cache_v: (0..kv_dim * position_count)
+                        .map(|i| (((i + li) as f32 % 7.0) - 3.0) * 0.15)
+                        .collect(),
+                }
+            })
+            .collect();
+
+        // Reference: loop the single-layer fused path, feeding each output into the next.
+        let mut hidden_state = embedding.clone();
+        for d in &data {
+            hidden_state = try_decode_layer_resident(
+                &hidden_state,
+                &d.attn_norm,
+                &d.ffn_norm,
+                eps,
+                &d.q,
+                &d.k,
+                &d.v,
+                &d.o,
+                &d.gate,
+                &d.up,
+                &d.down,
+                &cos_t,
+                &sin_t,
+                &d.cache_k,
+                &d.cache_v,
+                n_heads,
+                n_kv,
+                head_dim,
+                position_count,
+                ffn,
+                scale,
+                false,
+            )
+            .unwrap();
+        }
+        let expected = hidden_state;
+
+        let layers: Vec<ResidentDecodeLayer> = data
+            .iter()
+            .map(|d| ResidentDecodeLayer {
+                attn_norm: &d.attn_norm,
+                ffn_norm: &d.ffn_norm,
+                q_weight_blocks: &d.q,
+                k_weight_blocks: &d.k,
+                v_weight_blocks: &d.v,
+                o_weight_blocks: &d.o,
+                gate_weight_blocks: &d.gate,
+                up_weight_blocks: &d.up,
+                down_weight_blocks: &d.down,
+                cache_k: &d.cache_k,
+                cache_v: &d.cache_v,
+            })
+            .collect();
+        let got = try_decode_forward_resident(
+            &embedding,
+            &layers,
+            &cos_t,
+            &sin_t,
+            eps,
             n_heads,
             n_kv,
             head_dim,
