@@ -1871,6 +1871,114 @@ pub fn try_quantize_q8_0_f32(input: &[f32]) -> Option<(Vec<f32>, Vec<i8>)> {
     Some((scales, quants))
 }
 
+/// GPU-resident `quantize -> Q8 matmul` chain in a single command buffer: quantize the
+/// f32 input activation and matmul it against a Q8_0 weight (36-byte blocks), passing
+/// the quantized scales/quants between the two kernels via GPU buffers with no CPU
+/// readback. This is the core decode primitive and the proof that resident buffer
+/// chaining works; it is bit-identical to running the two standalone kernels. None if
+/// Metal is unavailable. `weight_blocks` is [output_width * blocks_per_row * 36] bytes.
+#[cfg(target_os = "macos")]
+pub fn try_quantized_matmul_resident(
+    input: &[f32],
+    weight_blocks: &[u8],
+    output_width: usize,
+) -> Option<Vec<f32>> {
+    if input.is_empty() || !input.len().is_multiple_of(32) || output_width == 0 {
+        return None;
+    }
+    let blocks_per_row = input.len() / 32;
+    if weight_blocks.len() != output_width * blocks_per_row * 36 {
+        return None;
+    }
+    let kernel = metal_linear_kernel()?;
+    let new = |bytes: u64| {
+        kernel
+            .device
+            .new_buffer(bytes, MTLResourceOptions::StorageModeShared)
+    };
+    let in_buf = new(std::mem::size_of_val(input) as u64);
+    let scales_buf = new((blocks_per_row * 4) as u64);
+    let quants_buf = new(input.len() as u64);
+    let weight_buf = new(weight_blocks.len() as u64);
+    let out_buf = new((output_width * 4) as u64);
+    let n_blocks_buf = new(4);
+    let mm_scalar_buf = new(8);
+    write_buffer_f32(&in_buf, input);
+    write_buffer_u8(&weight_buf, weight_blocks);
+    unsafe {
+        *(n_blocks_buf.contents() as *mut u32) = blocks_per_row as u32;
+        let p = mm_scalar_buf.contents() as *mut u32;
+        *p = blocks_per_row as u32;
+        *p.add(1) = output_width as u32;
+    }
+    let command_buffer = kernel.queue.new_command_buffer();
+
+    // Stage 1: quantize the activation into scales_buf / quants_buf.
+    let q_enc = command_buffer.new_compute_command_encoder();
+    q_enc.set_compute_pipeline_state(&kernel.quantize_q8_0_pipeline);
+    q_enc.set_buffer(0, Some(&in_buf), 0);
+    q_enc.set_buffer(1, Some(&scales_buf), 0);
+    q_enc.set_buffer(2, Some(&quants_buf), 0);
+    q_enc.set_buffer(3, Some(&n_blocks_buf), 0);
+    let qw = kernel
+        .quantize_q8_0_pipeline
+        .thread_execution_width()
+        .max(1);
+    q_enc.dispatch_thread_groups(
+        metal::MTLSize {
+            width: (blocks_per_row as u64).div_ceil(qw),
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: qw,
+            height: 1,
+            depth: 1,
+        },
+    );
+    q_enc.end_encoding();
+
+    // Stage 2: matmul reads the quantized buffers stage 1 just wrote (same command
+    // buffer; ordered, hazard-tracked for shared buffers).
+    let m_enc = command_buffer.new_compute_command_encoder();
+    m_enc.set_compute_pipeline_state(&kernel.q8_0_block_pipeline);
+    m_enc.set_buffer(0, Some(&scales_buf), 0);
+    m_enc.set_buffer(1, Some(&quants_buf), 0);
+    m_enc.set_buffer(2, Some(&weight_buf), 0);
+    m_enc.set_buffer(3, Some(&out_buf), 0);
+    m_enc.set_buffer(4, Some(&mm_scalar_buf), 0);
+    m_enc.set_buffer(5, Some(&mm_scalar_buf), 4);
+    let mw = kernel.q8_0_block_pipeline.thread_execution_width().max(1);
+    m_enc.dispatch_thread_groups(
+        metal::MTLSize {
+            width: (output_width as u64).div_ceil(mw),
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: mw,
+            height: 1,
+            depth: 1,
+        },
+    );
+    m_enc.end_encoding();
+
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    let mut out = vec![0.0f32; output_width];
+    read_buffer_f32(&out_buf, &mut out);
+    Some(out)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn try_quantized_matmul_resident(
+    _input: &[f32],
+    _weight_blocks: &[u8],
+    _output_width: usize,
+) -> Option<Vec<f32>> {
+    None
+}
+
 #[cfg(not(target_os = "macos"))]
 pub fn try_quantize_q8_0_f32(_input: &[f32]) -> Option<(Vec<f32>, Vec<i8>)> {
     None
@@ -2125,6 +2233,48 @@ mod tests {
         let got = try_silu_mul_f32(&gate, &up).expect("metal silu_mul");
         for (a, b) in got.iter().zip(&expected) {
             assert!((a - b).abs() < 1.0e-3, "{a} != {b}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_quantized_matmul_resident_matches_two_step() {
+        if !detect_metal_device().available {
+            return;
+        }
+        // The resident quantize->matmul chain (one command buffer, GPU buffers passed
+        // between kernels) must equal running the two standalone kernels separately
+        // (each already parity-checked vs CPU). This validates resident buffer chaining.
+        let input_width = 64usize; // 2 blocks
+        let output_width = 5usize;
+        let blocks_per_row = input_width / 32;
+        let input: Vec<f32> = (0..input_width)
+            .map(|i| ((i as f32 % 13.0) - 6.0) * 0.3)
+            .collect();
+        let mut weight_blocks: Vec<u8> = Vec::new();
+        for r in 0..output_width {
+            for b in 0..blocks_per_row {
+                let scale = 0.1 + (r * blocks_per_row + b) as f32 * 0.02;
+                weight_blocks.extend_from_slice(&scale.to_le_bytes());
+                for l in 0..32 {
+                    weight_blocks.push((((r * 7 + b * 3 + l) as i32 % 19) - 9) as i8 as u8);
+                }
+            }
+        }
+        let (scales, quants) = try_quantize_q8_0_f32(&input).expect("quantize");
+        let mut expected = vec![0.0f32; output_width];
+        assert!(try_q8_0_block_linear_row(
+            &scales,
+            &quants,
+            &weight_blocks,
+            output_width,
+            blocks_per_row,
+            &mut expected,
+        ));
+        let got = try_quantized_matmul_resident(&input, &weight_blocks, output_width)
+            .expect("resident chain");
+        for (a, b) in got.iter().zip(&expected) {
+            assert!((a - b).abs() < 1.0e-4, "{a} != {b}");
         }
     }
 
