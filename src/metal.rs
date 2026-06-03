@@ -2146,9 +2146,11 @@ fn encode_attention(
 
 /// Encode the FFN block op-chain into `cb` with no commit/readback: reads `in_buf`, writes
 /// the residual sum into `out_buf` (rms_norm -> quantize -> gate & up matmul -> silu_mul ->
-/// quantize -> down matmul -> residual add with `in_buf`). Allocates its own scratch/weight
-/// buffers and pushes them into `keep` so they outlive the command buffer. Dimensions are
-/// taken from the slice lengths; callers must pre-validate (see `try_ffn_block_resident`).
+/// quantize -> down matmul -> residual add with `in_buf`). The `gate_w`/`up_w`/`down_w` Q8_0
+/// weight buffers are caller-owned (so callers can keep them resident across tokens); this
+/// allocates only its own scratch buffers and pushes them into `keep` so they outlive the
+/// command buffer. Dimensions come from `ffn_norm.len()` and `ffn_dim`; callers must
+/// pre-validate (see `try_ffn_block_resident`).
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn encode_ffn_block(
@@ -2159,9 +2161,9 @@ fn encode_ffn_block(
     out_buf: &Buffer,
     ffn_norm: &[f32],
     eps: f32,
-    gate_weight_blocks: &[u8],
-    up_weight_blocks: &[u8],
-    down_weight_blocks: &[u8],
+    gate_w: &Buffer,
+    up_w: &Buffer,
+    down_w: &Buffer,
     ffn_dim: usize,
 ) {
     let hidden = ffn_norm.len();
@@ -2177,8 +2179,6 @@ fn encode_ffn_block(
     let scales1 = nb((bpr_hidden * 4) as u64);
     let quants1 = nb(hidden as u64);
     let nblocks1 = nb(4);
-    let gate_w = nb(gate_weight_blocks.len() as u64);
-    let up_w = nb(up_weight_blocks.len() as u64);
     let gate_buf = nb((ffn_dim * 4) as u64);
     let up_buf = nb((ffn_dim * 4) as u64);
     let gateup_scalar = nb(8);
@@ -2187,15 +2187,11 @@ fn encode_ffn_block(
     let scales2 = nb((bpr_ffn * 4) as u64);
     let quants2 = nb(ffn_dim as u64);
     let nblocks2 = nb(4);
-    let down_w = nb(down_weight_blocks.len() as u64);
     let down_buf = nb((hidden * 4) as u64);
     let down_scalar = nb(8);
     let resid_n = nb(4);
 
     write_buffer_f32(&norm_w_buf, ffn_norm);
-    write_buffer_u8(&gate_w, gate_weight_blocks);
-    write_buffer_u8(&up_w, up_weight_blocks);
-    write_buffer_u8(&down_w, down_weight_blocks);
     unsafe {
         let p = rms_scalar.contents() as *mut u8;
         *(p as *mut u32) = hidden as u32;
@@ -2219,7 +2215,7 @@ fn encode_ffn_block(
         k,
         &scales1,
         &quants1,
-        &gate_w,
+        gate_w,
         &gate_buf,
         &gateup_scalar,
         ffn_dim,
@@ -2229,7 +2225,7 @@ fn encode_ffn_block(
         k,
         &scales1,
         &quants1,
-        &up_w,
+        up_w,
         &up_buf,
         &gateup_scalar,
         ffn_dim,
@@ -2249,7 +2245,7 @@ fn encode_ffn_block(
         k,
         &scales2,
         &quants2,
-        &down_w,
+        down_w,
         &down_buf,
         &down_scalar,
         hidden,
@@ -2271,8 +2267,6 @@ fn encode_ffn_block(
         scales1,
         quants1,
         nblocks1,
-        gate_w,
-        up_w,
         gate_buf,
         up_buf,
         gateup_scalar,
@@ -2281,7 +2275,6 @@ fn encode_ffn_block(
         scales2,
         quants2,
         nblocks2,
-        down_w,
         down_buf,
         down_scalar,
         resid_n,
@@ -2291,9 +2284,11 @@ fn encode_ffn_block(
 /// Encode the attention block op-chain into `cb` with no commit/readback: reads `in_buf`,
 /// writes the residual sum into `out_buf` (rms_norm -> quantize -> q/k/v matmul -> RoPE(q,k)
 /// -> blit current k/v into the KV cache at the last position -> decode attention ->
-/// quantize -> o matmul -> residual add with `in_buf`). Allocates its own scratch/weight/
-/// cache buffers and pushes them into `keep` so they outlive the command buffer. Dimensions
-/// are taken from the slice lengths; callers must pre-validate.
+/// quantize -> o matmul -> residual add with `in_buf`). The `q_w_buf`/`k_w_buf`/`v_w_buf`/
+/// `o_w_buf` Q8_0 weight buffers are caller-owned (so callers can keep them resident across
+/// tokens); this allocates only its own scratch/cache buffers and pushes them into `keep` so
+/// they outlive the command buffer. Dimensions come from `attn_norm.len()` and the head
+/// params; callers must pre-validate.
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn encode_attention_block(
@@ -2304,10 +2299,10 @@ fn encode_attention_block(
     out_buf: &Buffer,
     attn_norm: &[f32],
     eps: f32,
-    q_weight_blocks: &[u8],
-    k_weight_blocks: &[u8],
-    v_weight_blocks: &[u8],
-    o_weight_blocks: &[u8],
+    q_w_buf: &Buffer,
+    k_w_buf: &Buffer,
+    v_w_buf: &Buffer,
+    o_w_buf: &Buffer,
     cos_t: &[f32],
     sin_t: &[f32],
     cache_k: &[f32],
@@ -2338,10 +2333,6 @@ fn encode_attention_block(
     let scales_norm = f32b(bpr_hidden);
     let quants_norm = nb(hidden as u64);
     let nblocks_norm = nb(4);
-    let q_w_buf = nb(q_weight_blocks.len() as u64);
-    let k_w_buf = nb(k_weight_blocks.len() as u64);
-    let v_w_buf = nb(v_weight_blocks.len() as u64);
-    let o_w_buf = nb(o_weight_blocks.len() as u64);
     let query_buf = f32b(q_dim);
     let key_buf = f32b(kv_dim);
     let val_buf = f32b(kv_dim);
@@ -2364,10 +2355,6 @@ fn encode_attention_block(
     let resid_n = nb(4);
 
     write_buffer_f32(&norm_w_buf, attn_norm);
-    write_buffer_u8(&q_w_buf, q_weight_blocks);
-    write_buffer_u8(&k_w_buf, k_weight_blocks);
-    write_buffer_u8(&v_w_buf, v_weight_blocks);
-    write_buffer_u8(&o_w_buf, o_weight_blocks);
     write_buffer_f32(&cos_buf, cos_t);
     write_buffer_f32(&sin_buf, sin_t);
     write_buffer_f32(&cache_k_buf, cache_k);
@@ -2420,7 +2407,7 @@ fn encode_attention_block(
         k,
         &scales_norm,
         &quants_norm,
-        &q_w_buf,
+        q_w_buf,
         &query_buf,
         &q_mm_scalar,
         q_dim,
@@ -2430,7 +2417,7 @@ fn encode_attention_block(
         k,
         &scales_norm,
         &quants_norm,
-        &k_w_buf,
+        k_w_buf,
         &key_buf,
         &kv_mm_scalar,
         kv_dim,
@@ -2440,7 +2427,7 @@ fn encode_attention_block(
         k,
         &scales_norm,
         &quants_norm,
-        &v_w_buf,
+        v_w_buf,
         &val_buf,
         &kv_mm_scalar,
         kv_dim,
@@ -2500,7 +2487,7 @@ fn encode_attention_block(
         k,
         &scales_ctx,
         &quants_ctx,
-        &o_w_buf,
+        o_w_buf,
         &o_buf,
         &o_mm_scalar,
         hidden,
@@ -2522,10 +2509,6 @@ fn encode_attention_block(
         scales_norm,
         quants_norm,
         nblocks_norm,
-        q_w_buf,
-        k_w_buf,
-        v_w_buf,
-        o_w_buf,
         query_buf,
         key_buf,
         val_buf,
@@ -2547,6 +2530,19 @@ fn encode_attention_block(
         o_mm_scalar,
         resid_n,
     ]);
+}
+
+/// Allocate a fresh GPU buffer for a Q8_0 weight-block slice and upload it. Used by the
+/// standalone block helpers, which (unlike the resident decode forward) do not keep weights
+/// cached across calls.
+#[cfg(target_os = "macos")]
+fn upload_weight_buffer(k: &MetalLinearKernel, weight_blocks: &[u8]) -> Buffer {
+    let buf = k.device.new_buffer(
+        weight_blocks.len() as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    write_buffer_u8(&buf, weight_blocks);
+    buf
 }
 
 /// GPU-resident FFN block in a single command buffer (no CPU readback between ops):
@@ -2590,20 +2586,13 @@ pub fn try_ffn_block_resident(
     let in_buf = nb(hidden);
     let out_buf = nb(hidden);
     write_buffer_f32(&in_buf, input);
+    let gate_w = upload_weight_buffer(k, gate_weight_blocks);
+    let up_w = upload_weight_buffer(k, up_weight_blocks);
+    let down_w = upload_weight_buffer(k, down_weight_blocks);
     let mut keep = Vec::new();
     let cb = k.queue.new_command_buffer();
     encode_ffn_block(
-        cb,
-        k,
-        &mut keep,
-        &in_buf,
-        &out_buf,
-        ffn_norm,
-        eps,
-        gate_weight_blocks,
-        up_weight_blocks,
-        down_weight_blocks,
-        ffn_dim,
+        cb, k, &mut keep, &in_buf, &out_buf, ffn_norm, eps, &gate_w, &up_w, &down_w, ffn_dim,
     );
     cb.commit();
     cb.wait_until_completed();
@@ -2679,6 +2668,10 @@ pub fn try_attention_block_resident(
     let in_buf = nb(hidden);
     let out_buf = nb(hidden);
     write_buffer_f32(&in_buf, input);
+    let q_w = upload_weight_buffer(k, q_weight_blocks);
+    let k_w = upload_weight_buffer(k, k_weight_blocks);
+    let v_w = upload_weight_buffer(k, v_weight_blocks);
+    let o_w = upload_weight_buffer(k, o_weight_blocks);
     let mut keep = Vec::new();
     let cb = k.queue.new_command_buffer();
     encode_attention_block(
@@ -2689,10 +2682,10 @@ pub fn try_attention_block_resident(
         &out_buf,
         attn_norm,
         eps,
-        q_weight_blocks,
-        k_weight_blocks,
-        v_weight_blocks,
-        o_weight_blocks,
+        &q_w,
+        &k_w,
+        &v_w,
+        &o_w,
         cos_t,
         sin_t,
         cache_k,
@@ -2791,6 +2784,13 @@ pub fn try_decode_layer_resident(
     let attn_buf = nb(hidden);
     let out_buf = nb(hidden);
     write_buffer_f32(&in_buf, input);
+    let q_w = upload_weight_buffer(k, q_weight_blocks);
+    let k_w = upload_weight_buffer(k, k_weight_blocks);
+    let v_w = upload_weight_buffer(k, v_weight_blocks);
+    let o_w = upload_weight_buffer(k, o_weight_blocks);
+    let gate_w = upload_weight_buffer(k, gate_weight_blocks);
+    let up_w = upload_weight_buffer(k, up_weight_blocks);
+    let down_w = upload_weight_buffer(k, down_weight_blocks);
     let mut keep = Vec::new();
     let cb = k.queue.new_command_buffer();
     encode_attention_block(
@@ -2801,10 +2801,10 @@ pub fn try_decode_layer_resident(
         &attn_buf,
         attn_norm,
         eps,
-        q_weight_blocks,
-        k_weight_blocks,
-        v_weight_blocks,
-        o_weight_blocks,
+        &q_w,
+        &k_w,
+        &v_w,
+        &o_w,
         cos_t,
         sin_t,
         cache_k,
@@ -2817,17 +2817,7 @@ pub fn try_decode_layer_resident(
         split_half_pairing,
     );
     encode_ffn_block(
-        cb,
-        k,
-        &mut keep,
-        &attn_buf,
-        &out_buf,
-        ffn_norm,
-        eps,
-        gate_weight_blocks,
-        up_weight_blocks,
-        down_weight_blocks,
-        ffn_dim,
+        cb, k, &mut keep, &attn_buf, &out_buf, ffn_norm, eps, &gate_w, &up_w, &down_w, ffn_dim,
     );
     cb.commit();
     cb.wait_until_completed();
@@ -2933,15 +2923,36 @@ pub fn try_decode_forward_resident(
     let buf_b = nb(hidden);
     let mid = nb(hidden);
     write_buffer_f32(&buf_a, embedding);
+    // Resolve every layer's Q8_0 weights to cache-resident GPU buffers up front. They are
+    // keyed by (pointer, len) in `MetalLinearCache`, so the first decode of a model uploads
+    // them and every subsequent token reuses the same on-GPU buffers -- the upload-once win.
+    let resident: Vec<[Buffer; 7]> = {
+        let mut cache = metal_linear_cache().lock().ok()?;
+        layers
+            .iter()
+            .map(|l| {
+                [
+                    cache.q8_block_weight_buffer(&k.device, l.q_weight_blocks),
+                    cache.q8_block_weight_buffer(&k.device, l.k_weight_blocks),
+                    cache.q8_block_weight_buffer(&k.device, l.v_weight_blocks),
+                    cache.q8_block_weight_buffer(&k.device, l.o_weight_blocks),
+                    cache.q8_block_weight_buffer(&k.device, l.gate_weight_blocks),
+                    cache.q8_block_weight_buffer(&k.device, l.up_weight_blocks),
+                    cache.q8_block_weight_buffer(&k.device, l.down_weight_blocks),
+                ]
+            })
+            .collect()
+    };
     let mut keep = Vec::new();
     let cb = k.queue.new_command_buffer();
     let mut from_a = true;
-    for layer in layers {
+    for (i, layer) in layers.iter().enumerate() {
         let (in_buf, out_buf) = if from_a {
             (&buf_a, &buf_b)
         } else {
             (&buf_b, &buf_a)
         };
+        let w = &resident[i];
         encode_attention_block(
             cb,
             k,
@@ -2950,10 +2961,10 @@ pub fn try_decode_forward_resident(
             &mid,
             layer.attn_norm,
             eps,
-            layer.q_weight_blocks,
-            layer.k_weight_blocks,
-            layer.v_weight_blocks,
-            layer.o_weight_blocks,
+            &w[0],
+            &w[1],
+            &w[2],
+            &w[3],
             cos_t,
             sin_t,
             layer.cache_k,
@@ -2973,9 +2984,9 @@ pub fn try_decode_forward_resident(
             out_buf,
             layer.ffn_norm,
             eps,
-            layer.gate_weight_blocks,
-            layer.up_weight_blocks,
-            layer.down_weight_blocks,
+            &w[4],
+            &w[5],
+            &w[6],
             ffn_dim,
         );
         from_a = !from_a;
@@ -3781,6 +3792,40 @@ mod tests {
         for (a, b) in got.iter().zip(&expected) {
             assert!((a - b).abs() < 1.0e-4, "{a} != {b}");
         }
+
+        // Upload-once: after that decode every layer's Q8 weights are resident in the
+        // process-global cache (keyed by pointer+len), so subsequent tokens reuse the same
+        // on-GPU buffers rather than re-uploading. Checked on this test's own pointers, so
+        // it is race-free under parallel test execution.
+        {
+            let cache = metal_linear_cache().lock().unwrap();
+            let resident = |b: &[u8]| {
+                cache
+                    .q8_block_weight_buffers
+                    .contains_key(&(b.as_ptr() as usize, b.len()))
+            };
+            for d in &data {
+                assert!(resident(&d.q) && resident(&d.k) && resident(&d.v) && resident(&d.o));
+                assert!(resident(&d.gate) && resident(&d.up) && resident(&d.down));
+            }
+        }
+        // A second decode reusing the same weight slices (now cache hits) must be identical.
+        let got2 = try_decode_forward_resident(
+            &embedding,
+            &layers,
+            &cos_t,
+            &sin_t,
+            eps,
+            n_heads,
+            n_kv,
+            head_dim,
+            position_count,
+            ffn,
+            scale,
+            false,
+        )
+        .unwrap();
+        assert_eq!(got, got2);
     }
 
     #[cfg(target_os = "macos")]
