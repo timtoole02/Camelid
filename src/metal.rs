@@ -32,6 +32,9 @@ struct MetalLinearKernel {
     q8_0_encoded_rows_pipeline: ComputePipelineState,
     q8_0_block_pipeline: ComputePipelineState,
     q8_0_block_simd_pipeline: ComputePipelineState,
+    rms_norm_pipeline: ComputePipelineState,
+    residual_add_pipeline: ComputePipelineState,
+    silu_mul_pipeline: ComputePipelineState,
     active_command_buffer: Mutex<Option<metal::CommandBuffer>>,
 }
 
@@ -337,6 +340,68 @@ kernel void q8_0_block_linear_row_simd(
 "#;
 
 #[cfg(target_os = "macos")]
+// Elementwise / norm building blocks for a GPU-resident forward pass. Each mirrors
+// the CPU reference exactly (rms_norm: x / sqrt(mean(x^2) + eps) * w; silu_mul:
+// (g / (1 + e^-g)) * u; residual: a + b) and is parity-checked in tests.
+#[cfg(target_os = "macos")]
+const ELEMENTWISE_SHADER: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// One threadgroup of 256 threads reduces the row's sum of squares, then scales.
+kernel void rms_norm_f32(
+    device const float* input [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& width [[buffer(3)]],
+    constant float& eps [[buffer(4)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgsize [[threads_per_threadgroup]]
+) {
+    threadgroup float partial[256];
+    float local = 0.0;
+    for (uint i = tid; i < width; i += tgsize) {
+        float v = input[i];
+        local += v * v;
+    }
+    partial[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgsize >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            partial[tid] += partial[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = 1.0 / sqrt(partial[0] / float(width) + eps);
+    for (uint i = tid; i < width; i += tgsize) {
+        output[i] = input[i] * inv * weight[i];
+    }
+}
+
+kernel void residual_add_f32(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    output[gid] = a[gid] + b[gid];
+}
+
+kernel void silu_mul_f32(
+    device const float* gate [[buffer(0)]],
+    device const float* up [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    float g = gate[gid];
+    output[gid] = (g / (1.0 + exp(-g))) * up[gid];
+}
+"#;
+
 fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
     METAL_LINEAR_KERNEL
         .get_or_init(|| {
@@ -344,6 +409,27 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let options = CompileOptions::new();
             let library = device
                 .new_library_with_source(LINEAR_ROW_SHADER, &options)
+                .ok()?;
+            let elementwise_library = device
+                .new_library_with_source(ELEMENTWISE_SHADER, &options)
+                .ok()?;
+            let rms_norm_function = elementwise_library
+                .get_function("rms_norm_f32", None)
+                .ok()?;
+            let rms_norm_pipeline = device
+                .new_compute_pipeline_state_with_function(&rms_norm_function)
+                .ok()?;
+            let residual_add_function = elementwise_library
+                .get_function("residual_add_f32", None)
+                .ok()?;
+            let residual_add_pipeline = device
+                .new_compute_pipeline_state_with_function(&residual_add_function)
+                .ok()?;
+            let silu_mul_function = elementwise_library
+                .get_function("silu_mul_f32", None)
+                .ok()?;
+            let silu_mul_pipeline = device
+                .new_compute_pipeline_state_with_function(&silu_mul_function)
                 .ok()?;
             let descriptor_function = library.get_function("linear_row_f32", None).ok()?;
             let descriptor_pipeline = device
@@ -386,6 +472,9 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 q8_0_encoded_rows_pipeline,
                 q8_0_block_pipeline,
                 q8_0_block_simd_pipeline,
+                rms_norm_pipeline,
+                residual_add_pipeline,
+                silu_mul_pipeline,
                 active_command_buffer: Mutex::new(None),
             })
         })
@@ -1272,6 +1361,149 @@ where
     true
 }
 
+/// GPU RMSNorm of a single row: output = input / sqrt(mean(input^2) + eps) * weight.
+/// Returns None if Metal is unavailable (caller falls back to CPU). Building block for
+/// the GPU-resident forward pass; parity-checked against the CPU rms_norm.
+#[cfg(target_os = "macos")]
+pub fn try_rms_norm_f32(input: &[f32], weight: &[f32], eps: f32) -> Option<Vec<f32>> {
+    if input.is_empty() || input.len() != weight.len() {
+        return None;
+    }
+    let kernel = metal_linear_kernel()?;
+    let width = input.len();
+    let byte_len = std::mem::size_of_val(input) as u64;
+    let in_buf = kernel
+        .device
+        .new_buffer(byte_len, MTLResourceOptions::StorageModeShared);
+    let weight_buf = kernel
+        .device
+        .new_buffer(byte_len, MTLResourceOptions::StorageModeShared);
+    let out_buf = kernel
+        .device
+        .new_buffer(byte_len, MTLResourceOptions::StorageModeShared);
+    let scalar_buf = kernel
+        .device
+        .new_buffer(8, MTLResourceOptions::StorageModeShared);
+    write_buffer_f32(&in_buf, input);
+    write_buffer_f32(&weight_buf, weight);
+    unsafe {
+        let p = scalar_buf.contents() as *mut u8;
+        *(p as *mut u32) = width as u32;
+        *(p.add(4) as *mut f32) = eps;
+    }
+    let command_buffer = kernel.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&kernel.rms_norm_pipeline);
+    encoder.set_buffer(0, Some(&in_buf), 0);
+    encoder.set_buffer(1, Some(&weight_buf), 0);
+    encoder.set_buffer(2, Some(&out_buf), 0);
+    encoder.set_buffer(3, Some(&scalar_buf), 0);
+    encoder.set_buffer(4, Some(&scalar_buf), 4);
+    let threads = metal::MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+    let one_group = metal::MTLSize {
+        width: 1,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(one_group, threads);
+    encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    let mut out = vec![0.0f32; width];
+    read_buffer_f32(&out_buf, &mut out);
+    Some(out)
+}
+
+/// GPU elementwise binary op helper for residual add / silu-mul (same buffer shape).
+#[cfg(target_os = "macos")]
+fn try_binary_elementwise_f32(
+    pipeline: &ComputePipelineState,
+    lhs: &[f32],
+    rhs: &[f32],
+) -> Option<Vec<f32>> {
+    if lhs.is_empty() || lhs.len() != rhs.len() {
+        return None;
+    }
+    let kernel = metal_linear_kernel()?;
+    let n = lhs.len();
+    let byte_len = std::mem::size_of_val(lhs) as u64;
+    let lhs_buf = kernel
+        .device
+        .new_buffer(byte_len, MTLResourceOptions::StorageModeShared);
+    let rhs_buf = kernel
+        .device
+        .new_buffer(byte_len, MTLResourceOptions::StorageModeShared);
+    let out_buf = kernel
+        .device
+        .new_buffer(byte_len, MTLResourceOptions::StorageModeShared);
+    let n_buf = kernel
+        .device
+        .new_buffer(4, MTLResourceOptions::StorageModeShared);
+    write_buffer_f32(&lhs_buf, lhs);
+    write_buffer_f32(&rhs_buf, rhs);
+    unsafe {
+        *(n_buf.contents() as *mut u32) = n as u32;
+    }
+    let command_buffer = kernel.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(&lhs_buf), 0);
+    encoder.set_buffer(1, Some(&rhs_buf), 0);
+    encoder.set_buffer(2, Some(&out_buf), 0);
+    encoder.set_buffer(3, Some(&n_buf), 0);
+    let width = pipeline.thread_execution_width().max(1);
+    let threads_per_group = metal::MTLSize {
+        width,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroups = metal::MTLSize {
+        width: (n as u64).div_ceil(width),
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(threadgroups, threads_per_group);
+    encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    let mut out = vec![0.0f32; n];
+    read_buffer_f32(&out_buf, &mut out);
+    Some(out)
+}
+
+/// GPU residual add: output = a + b. None if Metal unavailable.
+#[cfg(target_os = "macos")]
+pub fn try_residual_add_f32(a: &[f32], b: &[f32]) -> Option<Vec<f32>> {
+    let kernel = metal_linear_kernel()?;
+    try_binary_elementwise_f32(&kernel.residual_add_pipeline, a, b)
+}
+
+/// GPU gated activation: output = (gate / (1 + e^-gate)) * up. None if Metal unavailable.
+#[cfg(target_os = "macos")]
+pub fn try_silu_mul_f32(gate: &[f32], up: &[f32]) -> Option<Vec<f32>> {
+    let kernel = metal_linear_kernel()?;
+    try_binary_elementwise_f32(&kernel.silu_mul_pipeline, gate, up)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn try_rms_norm_f32(_input: &[f32], _weight: &[f32], _eps: f32) -> Option<Vec<f32>> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn try_residual_add_f32(_a: &[f32], _b: &[f32]) -> Option<Vec<f32>> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn try_silu_mul_f32(_gate: &[f32], _up: &[f32]) -> Option<Vec<f32>> {
+    None
+}
+
 #[cfg(not(target_os = "macos"))]
 pub fn start_inference_session() {}
 
@@ -1433,6 +1665,68 @@ pub fn detect_metal_device() -> MetalDeviceInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_rms_norm_matches_cpu() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let width = 320usize;
+        let input: Vec<f32> = (0..width)
+            .map(|i| ((i as f32 % 11.0) - 5.0) * 0.3)
+            .collect();
+        let weight: Vec<f32> = (0..width).map(|i| 0.5 + (i as f32 % 7.0) * 0.1).collect();
+        let eps = 1.0e-5f32;
+        let mean_sq = input.iter().map(|v| v * v).sum::<f32>() / width as f32;
+        let inv = 1.0 / (mean_sq + eps).sqrt();
+        let expected: Vec<f32> = input
+            .iter()
+            .zip(&weight)
+            .map(|(x, w)| x * inv * w)
+            .collect();
+        let got = try_rms_norm_f32(&input, &weight, eps).expect("metal rms_norm");
+        assert_eq!(got.len(), width);
+        for (a, b) in got.iter().zip(&expected) {
+            assert!((a - b).abs() < 1.0e-3, "{a} != {b}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_silu_mul_matches_cpu() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let n = 257usize; // non-multiple of the execution width
+        let gate: Vec<f32> = (0..n).map(|i| ((i as f32 % 13.0) - 6.0) * 0.4).collect();
+        let up: Vec<f32> = (0..n).map(|i| ((i as f32 % 5.0) - 2.0) * 0.5).collect();
+        let expected: Vec<f32> = gate
+            .iter()
+            .zip(&up)
+            .map(|(g, u)| (g / (1.0 + (-g).exp())) * u)
+            .collect();
+        let got = try_silu_mul_f32(&gate, &up).expect("metal silu_mul");
+        for (a, b) in got.iter().zip(&expected) {
+            assert!((a - b).abs() < 1.0e-3, "{a} != {b}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_residual_add_matches_cpu() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let n = 300usize;
+        let a: Vec<f32> = (0..n).map(|i| i as f32 * 0.25).collect();
+        let b: Vec<f32> = (0..n).map(|i| (n - i) as f32 * -0.1).collect();
+        let expected: Vec<f32> = a.iter().zip(&b).map(|(x, y)| x + y).collect();
+        let got = try_residual_add_f32(&a, &b).expect("metal residual_add");
+        for (x, y) in got.iter().zip(&expected) {
+            assert!((x - y).abs() < 1.0e-4, "{x} != {y}");
+        }
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
