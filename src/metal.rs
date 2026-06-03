@@ -150,6 +150,11 @@ impl MetalLinearCache {
     fn weight_buffer(&mut self, device: &Device, weights: &[f32]) -> Buffer {
         let key = (weights.as_ptr() as usize, weights.len());
         if let Some(buffer) = self.weight_buffers.get(&key) {
+            if cached_weight_contents_match(buffer, weights.as_ptr().cast(), key.1 * 4) {
+                return buffer.to_owned();
+            }
+            // (ptr,len) collided with a freed allocation — refresh the contents in place.
+            write_buffer_f32(buffer, weights);
             return buffer.to_owned();
         }
         let buffer = device.new_buffer(
@@ -164,6 +169,11 @@ impl MetalLinearCache {
     fn q8_block_weight_buffer(&mut self, device: &Device, weight_blocks: &[u8]) -> Buffer {
         let key = (weight_blocks.as_ptr() as usize, weight_blocks.len());
         if let Some(buffer) = self.q8_block_weight_buffers.get(&key) {
+            if cached_weight_contents_match(buffer, weight_blocks.as_ptr(), weight_blocks.len()) {
+                return buffer.to_owned();
+            }
+            // (ptr,len) collided with a freed allocation — refresh the contents in place.
+            write_buffer_u8(buffer, weight_blocks);
             return buffer.to_owned();
         }
         let buffer = device.new_buffer(
@@ -173,6 +183,29 @@ impl MetalLinearCache {
         write_buffer_u8(&buffer, weight_blocks);
         self.q8_block_weight_buffers.insert(key, buffer.to_owned());
         buffer
+    }
+}
+
+/// Guard for the permanent weight-buffer caches, which key cached GPU copies by the CPU
+/// slice's (pointer, length). That identity is unsound across an allocation's lifetime: when
+/// a weight slice is freed and a different one of the same length is later allocated at the
+/// same address (allocator reuse — routinely triggered by the test suite, and by reloading a
+/// model in a long-lived process), a stale cache hit would silently serve the OLD weights.
+/// Probe the first and last 32 bytes of the cached copy against the live slice (Q8_0 blocks
+/// start with their f32 scale, so distinct real weights diverge immediately); on mismatch
+/// the caller rewrites the buffer contents in place. Cost: a <=64-byte compare per cache
+/// hit, noise next to the dispatch itself.
+#[cfg(target_os = "macos")]
+fn cached_weight_contents_match(buffer: &Buffer, bytes: *const u8, len: usize) -> bool {
+    if buffer.length() as usize != len || len == 0 {
+        return false;
+    }
+    let probe = len.min(32);
+    unsafe {
+        let gpu = buffer.contents() as *const u8;
+        std::slice::from_raw_parts(gpu, probe) == std::slice::from_raw_parts(bytes, probe)
+            && std::slice::from_raw_parts(gpu.add(len - probe), probe)
+                == std::slice::from_raw_parts(bytes.add(len - probe), probe)
     }
 }
 
