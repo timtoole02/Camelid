@@ -240,6 +240,12 @@ pub(super) fn q8_0_env_flag_enabled_default_off(key: &str) -> bool {
         .unwrap_or(false)
 }
 
+// All callers are arch/OS-gated (aarch64 dotprod dispatch, Apple Accelerate), so this is
+// dead code on other targets.
+#[cfg_attr(
+    not(any(target_arch = "aarch64", target_os = "macos")),
+    allow(dead_code)
+)]
 pub(super) fn q8_0_env_flag_disabled(key: &str) -> bool {
     env::var(key)
         .map(|value| {
