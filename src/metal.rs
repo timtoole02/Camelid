@@ -2242,35 +2242,6 @@ fn dispatch_1d(
     );
 }
 
-#[cfg(target_os = "macos")]
-fn encode_rms_norm(
-    e: &metal::ComputeCommandEncoderRef,
-    k: &MetalLinearKernel,
-    input: &Buffer,
-    weight: &Buffer,
-    out: &Buffer,
-    scalar: &Buffer,
-) {
-    e.set_compute_pipeline_state(&k.rms_norm_pipeline);
-    e.set_buffer(0, Some(input), 0);
-    e.set_buffer(1, Some(weight), 0);
-    e.set_buffer(2, Some(out), 0);
-    e.set_buffer(3, Some(scalar), 0);
-    e.set_buffer(4, Some(scalar), 4);
-    e.dispatch_thread_groups(
-        metal::MTLSize {
-            width: 1,
-            height: 1,
-            depth: 1,
-        },
-        metal::MTLSize {
-            width: 256,
-            height: 1,
-            depth: 1,
-        },
-    );
-}
-
 /// Fused rms_norm + Q8_0 quantize: reads `input`, emits the quantized normed row directly
 /// into `scales`/`quants` (one dispatch, no intermediate normed buffer). `scalar` holds
 /// width (u32) then eps (f32), like `encode_rms_norm`.
