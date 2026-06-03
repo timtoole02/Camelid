@@ -730,8 +730,11 @@ fn connect_with_retry(addr: SocketAddr) -> TcpStream {
                 return stream;
             }
             Err(e) => {
-                if start.elapsed().as_secs() > 30 {
-                    panic!("Failed to connect to {} after 30 seconds: {}", addr, e);
+                // Pipeline nodes bind their sockets only after loading their weight
+                // shard, which can take minutes for large models (especially when one
+                // node streams from slower storage). Keep retrying well past that.
+                if start.elapsed().as_secs() > 600 {
+                    panic!("Failed to connect to {} after 600 seconds: {}", addr, e);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
@@ -918,6 +921,7 @@ async fn run_distribute_master(
     pos += seq_len;
     seq_len = 1;
 
+    let decode_start = Instant::now();
     let mut generated = 1;
     while !is_finished && generated < max_tokens {
         let hidden = session
@@ -943,6 +947,17 @@ async fn run_distribute_master(
         generated += 1;
     }
     println!();
+
+    let decode_secs = decode_start.elapsed().as_secs_f64();
+    let decode_tokens = generated.saturating_sub(1);
+    if decode_tokens > 0 && decode_secs > 0.0 {
+        println!(
+            "[distributed] decode: {} tokens in {:.2}s = {:.2} tok/s",
+            decode_tokens,
+            decode_secs,
+            decode_tokens as f64 / decode_secs
+        );
+    }
 
     Ok(())
 }

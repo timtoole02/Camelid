@@ -87,9 +87,57 @@ activation packets per token are small, so the link is not the bottleneck.
 - Compare against single-node MLX on the same model on one Mac (which must swap or cannot load
   it) — that is the defensible, distinct claim: *Camelid runs locally what one machine can't.*
 
+## Two-Mac result (real hardware, 2026-06-03)
+
+Two **Mac mini M4 (16 GB)** connected over a **Thunderbolt bridge** (~1 ms RTT, all traffic
+on `169.254.x`, verified to egress the TB interface — no Wi-Fi). Model:
+**Llama-2-13B-chat Q8_0** (13 GB, 40 layers, llama/SPM), split `0..20` (master) / `20..40`
+(worker). Driven by `tools/bench/distributed/two-mac-run.sh`, decode path
+`CAMELID_MAC_Q8_REPACK=1`.
+
+**The win — a single 16 GB mini cannot run this model at all:**
+
+| | Llama-2-13B **Q8** (13 GB) on one 16 GB mini | Two minis (Camelid, Thunderbolt) |
+| --- | --- | --- |
+| llama.cpp (Metal) | ❌ **fails to load** | — |
+| MLX | ❌ only ships this 13B at 4-bit (same ceiling) | — |
+| **Camelid** | — | ✅ **runs at full Q8** |
+| Peak RAM / node | n/a (fails) | **master 7.23 GB · worker 7.33 GB** |
+| Decode | 0 (can't) | **1.48 tok/s** |
+
+llama.cpp on one mini reports `recommendedMaxWorkingSetSize = 12713 MB` and then
+`test_prompt: failed to decode prompt batch, res = -3` — Metal's working-set ceiling on a
+16 GB mini (~12.7 GB) is below the 13 GB model. MLX hits the same unified-memory ceiling,
+which is why mlx-community publishes this 13B only at 4-bit.
+
+Camelid split the model across the two minis (≈7.2–7.3 GB resident per node — **neither node
+holds the full 13 GB**) and produced correct, coherent output over Thunderbolt:
+
+> "The sky appears blue because of a phenomenon called Rayleigh scattering, in which shorter
+> (blue) wavelengths of light are scattered more than longer (red) wavelengths by the tiny
+> molecules of gases in the atmosphere…"
+
+**The honest claim:** *Camelid runs, at full Q8 precision across two commodity 16 GB Macs, a
+model that a single mini (and therefore single-node MLX/llama.cpp) physically cannot load.*
+
+Decode (1.48 tok/s) is latency-bound: the pipeline runs one request in flight, so master and
+worker execute serially per token over two TB hops. That is a throughput lever (microbatching
+to overlap the stages, or the GPU-resident forward pass), not a correctness limit — the
+capability (running the otherwise-unrunnable model) is the result.
+
+### Reproduce
+
+```bash
+MODEL=<13B-Q8>.gguf REMOTE_MODEL=<path-on-worker>.gguf \
+CAMELID_BIN=<local camelid> REMOTE_BIN=/tmp/camelid WORKER_HOST=<ssh host> \
+MASTER_TB_IP=<this TB ip> WORKER_TB_IP=<worker TB ip> TOTAL_LAYERS=40 SPLIT=20 \
+MAX_TOKENS=64 bash tools/bench/distributed/two-mac-run.sh
+```
+
 ## Status
 
 - Loopback 2-node pipeline parallel: **correct** (matches single-node) and **memory-split
   confirmed**, after the last-node weight-loading fix.
-- Real two-Mac TB4 measurement: **pending hardware run** (needs the second Mac and, for a
-  meaningful win, a model larger than one Mac's RAM).
+- Real two-Mac TB4 run: **done** — Llama-2-13B Q8 runs across two 16 GB minis (7.2 GB/node)
+  that a single mini cannot load. Decode 1.48 tok/s (serial pipeline; throughput optimization
+  is the next lever).
