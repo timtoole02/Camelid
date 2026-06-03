@@ -99,23 +99,41 @@ fn io_err(path: &Path, source: std::io::Error) -> BackendError {
 
 /// Write a `.cghost` re-layout of `store`'s GGUF. Dense models only — ghost v1 refuses MoE
 /// (the streaming window assumes one fixed-size group per block).
+///
+/// `layer_range` selects a pipeline shard: only those "blk.N" groups are written, the "pre"
+/// group (embedding) only when the range starts at layer 0, and the "post" group
+/// (output norm/projection) only when it ends at the last layer — so each mesh node hosts
+/// just its own half of the payload on local disk. `None` writes the whole model.
 pub fn write_cghost(
     store: &TensorStore,
     binding: &LlamaTensorBinding,
     source_model: &str,
     out_path: &Path,
+    layer_range: Option<std::ops::Range<usize>>,
 ) -> Result<CghostIndex> {
+    let total_layers = binding.layers.len();
+    let range = layer_range.unwrap_or(0..total_layers);
+    if range.start >= range.end || range.end > total_layers {
+        return Err(invalid(format!(
+            "layer range {range:?} is invalid for a {total_layers}-layer model"
+        )));
+    }
     // Plan the group contents (names + roles) first.
     let mut planned: Vec<(String, Vec<(String, String)>)> = Vec::new();
-    let mut pre = vec![(
-        "token_embedding".to_string(),
-        binding.token_embedding.name.clone(),
-    )];
-    if let Some(rope) = &binding.rope_freqs {
-        pre.push(("rope_freqs".to_string(), rope.name.clone()));
+    if range.start == 0 {
+        let mut pre = vec![(
+            "token_embedding".to_string(),
+            binding.token_embedding.name.clone(),
+        )];
+        if let Some(rope) = &binding.rope_freqs {
+            pre.push(("rope_freqs".to_string(), rope.name.clone()));
+        }
+        planned.push(("pre".to_string(), pre));
     }
-    planned.push(("pre".to_string(), pre));
     for (layer_idx, layer) in binding.layers.iter().enumerate() {
+        if !range.contains(&layer_idx) {
+            continue;
+        }
         let (gate, up, down) = match &layer.ffn {
             LlamaFfnTensors::Dense { gate, up, down } => (gate, up, down),
             LlamaFfnTensors::MoE { .. } => {
@@ -140,11 +158,13 @@ pub fn write_cghost(
         ];
         planned.push((format!("blk.{layer_idx}"), tensors));
     }
-    let mut post = vec![("output_norm".to_string(), binding.output_norm.name.clone())];
-    if !binding.output_is_tied_embedding {
-        post.push(("output".to_string(), binding.output.name.clone()));
+    if range.end == total_layers {
+        let mut post = vec![("output_norm".to_string(), binding.output_norm.name.clone())];
+        if !binding.output_is_tied_embedding {
+            post.push(("output".to_string(), binding.output.name.clone()));
+        }
+        planned.push(("post".to_string(), post));
     }
-    planned.push(("post".to_string(), post));
 
     // Stream the payload out group by group, page-aligning each group start.
     let mut file = File::create(out_path).map_err(|e| io_err(out_path, e))?;

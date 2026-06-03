@@ -24,6 +24,12 @@ EXTRA_ENV="${EXTRA_ENV:-}"   # extra VAR=VAL pairs exported on BOTH nodes (e.g. 
 # Repack OFF by default: the GPU-resident decode path needs plain (un-packed) Q8_0 blocks,
 # and the nodes' residency gate hard-fails on repacked storage. Set REPACK=1 for CPU-decode runs.
 REPACK="${REPACK:-0}"
+# Ghost mesh: when set, each node streams its layer shard per token from its local .cghost
+# (made with `repack-ghost --layers a..b`) instead of holding it resident.
+MASTER_CGHOST="${MASTER_CGHOST:-}"   # local .cghost path for the master's 0..SPLIT shard
+WORKER_CGHOST="${WORKER_CGHOST:-}"   # REMOTE .cghost path for the worker's SPLIT..TOTAL shard
+MASTER_GHOST_ARGS=""; [ -n "$MASTER_CGHOST" ] && MASTER_GHOST_ARGS="--cghost $MASTER_CGHOST"
+WORKER_GHOST_ARGS=""; [ -n "$WORKER_CGHOST" ] && WORKER_GHOST_ARGS="--cghost $WORKER_CGHOST"
 REMOTE_MODEL="${REMOTE_MODEL:-$MODEL}"
 PORT_W=5005
 PORT_M=5006
@@ -52,7 +58,7 @@ fi
 # 2) Launch the worker (last node) on the remote, bound to its TB IP.
 echo "[two-mac] starting remote worker..."
 ssh "$WORKER_HOST" "CAMELID_MAC_Q8_REPACK=$REPACK $EXTRA_ENV /usr/bin/time -l '$REMOTE_BIN' distribute-worker '$REMOTE_MODEL' \
-  --addr $WORKER_TB_IP:$PORT_W --layers $SPLIT..$TOTAL_LAYERS --master-addr $MASTER_TB_IP:$PORT_M" \
+  --addr $WORKER_TB_IP:$PORT_W --layers $SPLIT..$TOTAL_LAYERS --master-addr $MASTER_TB_IP:$PORT_M $WORKER_GHOST_ARGS" \
   >/tmp/two_mac_worker.out 2>&1 &
 SSH_PID=$!
 
@@ -61,7 +67,8 @@ echo "[two-mac] starting master..."
 START=$(python3 -c 'import time;print(time.time())')
 env CAMELID_MAC_Q8_REPACK=$REPACK $EXTRA_ENV /usr/bin/time -l "$CAMELID_BIN" distribute-master "$MODEL" \
   --worker-addr "$WORKER_TB_IP:$PORT_W" --layers "0..$SPLIT" --addr "$MASTER_TB_IP:$PORT_M" \
-  --prompt "$PROMPT" --max-tokens "$MAX_TOKENS" >/tmp/two_mac_master.out 2>/tmp/two_mac_master.time || true
+  --prompt "$PROMPT" --max-tokens "$MAX_TOKENS" $MASTER_GHOST_ARGS \
+  >/tmp/two_mac_master.out 2>/tmp/two_mac_master.time || true
 END=$(python3 -c 'import time;print(time.time())')
 
 # 4) Clean up the remote worker.

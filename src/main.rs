@@ -198,6 +198,12 @@ enum Command {
         /// Override Rayon worker threads.
         #[arg(long)]
         threads: Option<usize>,
+        /// EXPERIMENTAL ghost mesh: stream this node's layer shard per token from a
+        /// `.cghost` file (double-buffered) instead of holding it resident. Only the
+        /// embedding/output ends stay in RAM; the shard's disk window overlaps the other
+        /// node's compute.
+        #[arg(long)]
+        cghost: Option<PathBuf>,
     },
     /// Start a distributed pipeline master node.
     DistributeMaster {
@@ -221,6 +227,12 @@ enum Command {
         /// Override Rayon worker threads.
         #[arg(long)]
         threads: Option<usize>,
+        /// EXPERIMENTAL ghost mesh: stream this node's layer shard per token from a
+        /// `.cghost` file (double-buffered) instead of holding it resident. Only the
+        /// embedding/output ends stay in RAM; the shard's disk window overlaps the other
+        /// node's compute.
+        #[arg(long)]
+        cghost: Option<PathBuf>,
     },
     /// Single-node generation microbenchmark. Loads a GGUF model once, generates
     /// from a prompt, and emits one JSON metrics object per measured iteration
@@ -478,8 +490,18 @@ async fn main() -> anyhow::Result<()> {
             layers,
             master_addr,
             threads,
+            cghost,
         } => {
-            run_distribute_worker(path, addr, forward_addr, layers, master_addr, threads).await?;
+            run_distribute_worker(
+                path,
+                addr,
+                forward_addr,
+                layers,
+                master_addr,
+                threads,
+                cghost,
+            )
+            .await?;
         }
         Command::DistributeMaster {
             path,
@@ -489,9 +511,19 @@ async fn main() -> anyhow::Result<()> {
             prompt,
             max_tokens,
             threads,
+            cghost,
         } => {
-            run_distribute_master(path, worker_addr, layers, addr, prompt, max_tokens, threads)
-                .await?;
+            run_distribute_master(
+                path,
+                worker_addr,
+                layers,
+                addr,
+                prompt,
+                max_tokens,
+                threads,
+                cghost,
+            )
+            .await?;
         }
         Command::BenchGenerate {
             model,
@@ -538,28 +570,46 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// How ghost mode gets each layer's weights off disk.
-enum GhostStreamer {
+/// How ghost mode gets each layer's weights off disk. `range` is the node's pipeline shard
+/// (the whole model on a single node); streaming cycles over it chunk after chunk.
+struct GhostStreamer {
+    range: std::ops::Range<usize>,
+    kind: GhostStreamerKind,
+}
+
+enum GhostStreamerKind {
     /// v1: the read + decode happens on the critical path, before each layer's forward.
     Sync { ghost: Arc<GhostFile>, buf: Vec<u8> },
     /// v2 double-buffered: a background worker reads + decodes layer N+1 while layer N's
     /// forward runs; the reported time is only the STALL waiting for the handoff. The
     /// rendezvous handoff bounds the weight working set to two layer windows.
-    Prefetched {
-        prefetcher: GhostPrefetcher,
-        n_layers: usize,
-    },
+    Prefetched { prefetcher: GhostPrefetcher },
 }
 
 impl GhostStreamer {
+    fn new_sync(ghost: Arc<GhostFile>, range: std::ops::Range<usize>) -> Self {
+        Self {
+            range,
+            kind: GhostStreamerKind::Sync {
+                buf: Vec::with_capacity(ghost.max_layer_span() as usize),
+                ghost,
+            },
+        }
+    }
+
+    fn new_prefetched(ghost: Arc<GhostFile>, range: std::ops::Range<usize>) -> Self {
+        Self {
+            range,
+            kind: GhostStreamerKind::Prefetched {
+                prefetcher: GhostPrefetcher::spawn(ghost),
+            },
+        }
+    }
+
     /// Queue the first chunk's layer reads (prefetched mode; no-op for sync).
     fn prime(&self) -> anyhow::Result<()> {
-        if let GhostStreamer::Prefetched {
-            prefetcher,
-            n_layers,
-        } = self
-        {
-            for layer_idx in 0..*n_layers {
+        if let GhostStreamerKind::Prefetched { prefetcher } = &self.kind {
+            for layer_idx in self.range.clone() {
                 prefetcher.request(layer_idx)?;
             }
         }
@@ -568,27 +618,26 @@ impl GhostStreamer {
 
     /// Produce layer `layer_idx`'s decoded weights: (weights, bytes streamed, blocked µs).
     /// On the chunk's last layer the prefetched mode queues the ENTIRE next chunk first, so
-    /// the worker is already rewinding to layer 0 of the next token while this layer's
-    /// forward (and the sampling between chunks) runs. The trailing chunk queued after the
-    /// final token is never consumed — the worker reads at most one extra layer, blocks on
-    /// the rendezvous, and is released by Drop.
+    /// the worker is already rewinding to the shard's first layer for the next token while
+    /// this layer's forward runs — on a mesh node that disk window overlaps the OTHER
+    /// node's compute and the network hops. The trailing chunk queued after the final token
+    /// is never consumed — the worker reads at most one extra layer, blocks on the
+    /// rendezvous, and is released by Drop.
     fn fetch(
         &mut self,
         layer_idx: usize,
         last_in_chunk: bool,
     ) -> anyhow::Result<(LlamaLayerWeights, u64, u128)> {
-        match self {
-            GhostStreamer::Sync { ghost, buf } => {
+        let range = self.range.clone();
+        match &mut self.kind {
+            GhostStreamerKind::Sync { ghost, buf } => {
                 let started = Instant::now();
                 let (layer, span) = ghost.read_layer(layer_idx, buf)?;
                 Ok((layer, span, started.elapsed().as_micros()))
             }
-            GhostStreamer::Prefetched {
-                prefetcher,
-                n_layers,
-            } => {
+            GhostStreamerKind::Prefetched { prefetcher } => {
                 if last_in_chunk {
-                    for next_idx in 0..*n_layers {
+                    for next_idx in range {
                         prefetcher.request(next_idx)?;
                     }
                 }
@@ -609,6 +658,36 @@ impl GhostStreamer {
     }
 }
 
+/// Build the ghost-mesh streaming context for a pipeline node: open the node's `.cghost`
+/// shard, spawn the double-buffered prefetcher over the node's layer range, and prime the
+/// first chunk. Returns None when the node runs the resident path. While this node waits on
+/// the network (the other node computing), its prefetch worker is already streaming the
+/// next token's layers — the disk window overlaps the peer's compute.
+fn make_ghost_node_ctx(
+    session: &LlamaInferenceSession,
+    cghost: Option<&std::path::Path>,
+    layer_range: std::ops::Range<usize>,
+) -> anyhow::Result<Option<(GhostStreamer, LlamaLayerWeights)>> {
+    let Some(path) = cghost else { return Ok(None) };
+    let ghost = Arc::new(GhostFile::open(path)?);
+    let n_layers = session.weights.layers.len();
+    anyhow::ensure!(
+        ghost.index.block_count == n_layers,
+        ".cghost block_count {} does not match model block_count {n_layers}",
+        ghost.index.block_count
+    );
+    let placeholder = session.weights.layers[0].clone();
+    let streamer = GhostStreamer::new_prefetched(Arc::clone(&ghost), layer_range.clone());
+    streamer.prime()?;
+    println!(
+        "[ghost] mesh node streams layers {:?} from {:?} ({:.1} MiB window, double-buffered)",
+        layer_range,
+        path,
+        ghost.max_layer_span() as f64 / (1024.0 * 1024.0),
+    );
+    Ok(Some((streamer, placeholder)))
+}
+
 /// Ghost mode: run every transformer layer of one chunk (prefill or a single decoded
 /// token), streaming each layer's weights from the `.cghost` file and dropping them right
 /// after the layer's forward — the weight working window is one layer (sync) or two
@@ -623,13 +702,13 @@ fn ghost_stream_layers(
     seq_len: usize,
     log_layers: bool,
 ) -> anyhow::Result<(CpuTensor, u64, u128, u128)> {
-    let n_layers = session.weights.layers.len();
+    let range = streamer.range.clone();
     let mut hidden = hidden;
     let mut bytes_total = 0u64;
     let mut wait_us_total = 0u128;
     let mut forward_us_total = 0u128;
-    for layer_idx in 0..n_layers {
-        let (layer, span, wait_us) = streamer.fetch(layer_idx, layer_idx + 1 == n_layers)?;
+    for layer_idx in range.clone() {
+        let (layer, span, wait_us) = streamer.fetch(layer_idx, layer_idx + 1 == range.end)?;
         Arc::make_mut(&mut session.weights).layers[layer_idx] = layer;
         let forward_started = Instant::now();
         hidden = session.ghost_forward_one_layer(&hidden, layer_idx, pos, seq_len)?;
@@ -690,15 +769,9 @@ fn run_ghost(
     let mut session = LlamaInferenceSession::new(config.clone(), Arc::new(weights))?;
     let placeholder = session.weights.layers[0].clone();
     let mut streamer = if sync_stream {
-        GhostStreamer::Sync {
-            buf: Vec::with_capacity(ghost.max_layer_span() as usize),
-            ghost: Arc::clone(&ghost),
-        }
+        GhostStreamer::new_sync(Arc::clone(&ghost), 0..n_layers)
     } else {
-        GhostStreamer::Prefetched {
-            prefetcher: GhostPrefetcher::spawn(Arc::clone(&ghost)),
-            n_layers,
-        }
+        GhostStreamer::new_prefetched(Arc::clone(&ghost), 0..n_layers)
     };
     println!(
         "[ghost] resident ends loaded in {:.1}s; {} layers x {:.1} MiB max streaming window \
@@ -1156,6 +1229,7 @@ fn parse_layers_range(layers_str: &str) -> anyhow::Result<std::ops::Range<usize>
     Ok(start..end)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_distribute_worker(
     path: PathBuf,
     addr: SocketAddr,
@@ -1163,6 +1237,7 @@ async fn run_distribute_worker(
     layers: String,
     master_addr: Option<SocketAddr>,
     threads: Option<usize>,
+    cghost: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     configure_rayon_threads(threads)?;
 
@@ -1176,13 +1251,16 @@ async fn run_distribute_worker(
     let layer_range = parse_layers_range(&layers)?;
     println!("Initializing worker session for layers {:?}", layer_range);
 
-    let weights = Arc::new(LlamaLoadedWeights::load(
-        &store,
-        &binding,
-        Some(layer_range.clone()),
-    )?);
+    let weights = Arc::new(if cghost.is_some() {
+        // Ghost mesh: only the output ends stay resident (this is the LAST node when it has
+        // no forward_addr); the layer shard streams from the .cghost per token.
+        LlamaLoadedWeights::load_distributed(&store, &binding, 0, 0, false, true)?
+    } else {
+        LlamaLoadedWeights::load(&store, &binding, Some(layer_range.clone()))?
+    });
     let mut session = LlamaInferenceSession::new(config.clone(), weights)?;
     assert_q8_0_weight_residency(&session.weights, "dist-worker");
+    let mut ghost_ctx = make_ghost_node_ctx(&session, cghost.as_deref(), layer_range.clone())?;
 
     let listener = TcpListener::bind(addr)?;
     println!("Worker listening on {}...", addr);
@@ -1225,11 +1303,24 @@ async fn run_distribute_worker(
             CpuTensor::from_f32("activations", vec![rows, hidden_dim], activations.clone())?;
 
         let forward_started = Instant::now();
-        let out_hidden = session.forward_layer_range_from_hidden(
-            &hidden,
-            header.pos as usize,
-            header.seq_len as usize,
-        )?;
+        let out_hidden = if let Some((streamer, placeholder)) = ghost_ctx.as_mut() {
+            let (out, _bytes, _wait_us, _forward_us) = ghost_stream_layers(
+                &mut session,
+                streamer,
+                placeholder,
+                hidden,
+                header.pos as usize,
+                header.seq_len as usize,
+                false,
+            )?;
+            out
+        } else {
+            session.forward_layer_range_from_hidden(
+                &hidden,
+                header.pos as usize,
+                header.seq_len as usize,
+            )?
+        };
         let forward_us = forward_started.elapsed().as_micros();
         let tail_started = Instant::now();
 
@@ -1268,6 +1359,7 @@ async fn run_distribute_worker(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_distribute_master(
     path: PathBuf,
     worker_addr: SocketAddr,
@@ -1276,6 +1368,7 @@ async fn run_distribute_master(
     prompt: String,
     max_tokens: usize,
     threads: Option<usize>,
+    cghost: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     configure_rayon_threads(threads)?;
 
@@ -1289,13 +1382,16 @@ async fn run_distribute_master(
     let layer_range = parse_layers_range(&layers)?;
     println!("Initializing master session for layers {:?}", layer_range);
 
-    let weights = Arc::new(LlamaLoadedWeights::load(
-        &store,
-        &binding,
-        Some(layer_range.clone()),
-    )?);
+    let weights = Arc::new(if cghost.is_some() {
+        // Ghost mesh: only the token embedding stays resident (the master is the FIRST
+        // node); the layer shard streams from the .cghost per token.
+        LlamaLoadedWeights::load_distributed(&store, &binding, 0, 0, true, false)?
+    } else {
+        LlamaLoadedWeights::load(&store, &binding, Some(layer_range.clone()))?
+    });
     let mut session = LlamaInferenceSession::new(config.clone(), weights)?;
     assert_q8_0_weight_residency(&session.weights, "dist-master");
+    let mut ghost_ctx = make_ghost_node_ctx(&session, cghost.as_deref(), layer_range.clone())?;
 
     let listener = TcpListener::bind(addr)?;
     println!("Master listening for feedback on {}...", addr);
@@ -1314,7 +1410,20 @@ async fn run_distribute_master(
         .weights
         .token_embedding
         .embedding_lookup(&token_ids, "token_embedding_prefill")?;
-    let out_hidden = session.forward_layer_range_from_hidden(&hidden, pos, seq_len)?;
+    let out_hidden = if let Some((streamer, placeholder)) = ghost_ctx.as_mut() {
+        ghost_stream_layers(
+            &mut session,
+            streamer,
+            placeholder,
+            hidden,
+            pos,
+            seq_len,
+            false,
+        )?
+        .0
+    } else {
+        session.forward_layer_range_from_hidden(&hidden, pos, seq_len)?
+    };
 
     send_activation_packet(
         &mut downstream_stream,
@@ -1342,7 +1451,20 @@ async fn run_distribute_master(
             .weights
             .token_embedding
             .embedding_lookup(&[current_token], "token_embedding")?;
-        let out_hidden = session.forward_layer_range_from_hidden(&hidden, pos, seq_len)?;
+        let out_hidden = if let Some((streamer, placeholder)) = ghost_ctx.as_mut() {
+            ghost_stream_layers(
+                &mut session,
+                streamer,
+                placeholder,
+                hidden,
+                pos,
+                seq_len,
+                false,
+            )?
+            .0
+        } else {
+            session.forward_layer_range_from_hidden(&hidden, pos, seq_len)?
+        };
         let compute_us = compute_started.elapsed().as_micros();
         let send_started = Instant::now();
         send_activation_packet(

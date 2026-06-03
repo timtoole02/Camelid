@@ -72,3 +72,31 @@ loader/kernels; that support is a prerequisite for the v2 map.
   loads see there), i.e. ~2.8 s/layer. On internal NVMe-class storage the same read is
   projected at tens of milliseconds. Throughput numbers for ghost mode are therefore quoted
   per storage tier; the PoC gate is correctness + the memory ceiling, not speed.
+
+## Task 3: the two-node ghost mesh (2026-06-03)
+
+`distribute-master --cghost <shard>` / `distribute-worker --cghost <shard>`: each pipeline
+node streams its own layer shard per token from a node-local `.cghost` (made with
+`repack-ghost --layers a..b`), double-buffered, holding only the embedding (first node) or
+output ends (last node) resident. The cross-node overlap falls out of chunk priming: a node
+queues its next chunk during its own last layer, so its disk window runs while the OTHER
+node computes and the activations cross the bridge.
+
+Measured — Llama-2-13B Q8, two M4 16 GB minis over Thunderbolt, split 0..20 / 20..40, each
+shard 6.44 GiB on the node's internal NVMe (321.4 MiB/layer window):
+
+- **Peak RSS 1.80 GB per node** (resident pipeline needs 7.2–7.8 GB/node) — the fit story:
+  the mesh runs a model whose resident form nearly fills both machines, in ~an eighth of
+  the memory.
+- Greedy output identical to the resident pipeline's stream.
+- Steady state ~4.05 s/token = **0.24 tok/s**: master ~3.0 s (disk-bound: 6.44 GiB at
+  ~2.15 GB/s; its own window cannot hide behind anything), worker ~1.04 s visible (about
+  two-thirds of its window streams during its idle while the master computes), feedback
+  ~5 ms. Without the cross-node overlap the same token would cost ~6 s.
+- Split tuning is an open lever: the first node's window is unhideable, so giving it fewer
+  layers (e.g. 14/26) should shrink the critical path until the last node's residual
+  window surfaces.
+
+This is the throughput-for-memory trade at mesh scale: per-storage-tier numbers as always —
+faster NVMe (or smaller shards from a future low-bit map) moves the disk-bound term
+directly.

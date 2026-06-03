@@ -26,6 +26,17 @@ struct Args {
     /// Output path (default: <model>.cghost)
     #[arg(long)]
     out: Option<PathBuf>,
+    /// Pipeline shard: only write these transformer blocks (e.g. "0..20" or "20..40"),
+    /// plus the embedding group when starting at 0 and the output group when ending at the
+    /// last layer. Default: the whole model.
+    #[arg(long)]
+    layers: Option<String>,
+}
+
+fn parse_layers_range(layers: &str) -> anyhow::Result<std::ops::Range<usize>> {
+    let parts: Vec<&str> = layers.split("..").collect();
+    anyhow::ensure!(parts.len() == 2, "invalid layers range format: {layers}");
+    Ok(parts[0].parse::<usize>()?..parts[1].parse::<usize>()?)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -50,12 +61,14 @@ fn main() -> anyhow::Result<()> {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
 
+    let layer_range = args.layers.as_deref().map(parse_layers_range).transpose()?;
     println!(
-        "[repack-ghost] repacking {} transformer blocks -> {:?}",
+        "[repack-ghost] repacking blocks {:?} of {} -> {:?}",
+        layer_range.clone().unwrap_or(0..binding.layers.len()),
         binding.layers.len(),
         out
     );
-    let index = write_cghost(&store, &binding, &source, &out)?;
+    let index = write_cghost(&store, &binding, &source, &out, layer_range)?;
 
     let total: u64 = index.groups.iter().map(|g| g.span().1).sum();
     let max_layer = index
