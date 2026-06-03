@@ -449,6 +449,10 @@ kernel void rope_rotate_f32(
 // kv_base_offset=0; an interleaved per-layer slice of a [position][layer][kv_head]
 // [head_dim] cache uses position_stride=layer_count*n_kv*head_dim, kv_head_stride=head_dim,
 // kv_base_offset=layer*n_kv*head_dim. scores is scratch [n_heads*position_count].
+// One threadgroup (a single 32-lane SIMD group) per query head. The lanes cooperate over
+// positions for the score dot-products + online softmax reductions (simd_max / simd_sum),
+// then split the output dimensions for the weighted-value sum so the per-token cost is
+// parallelised across the SIMD group instead of running serially in one thread per head.
 kernel void attention_decode_f32(
     device const float* query [[buffer(0)]],
     device const float* keys [[buffer(1)]],
@@ -463,7 +467,8 @@ kernel void attention_decode_f32(
     constant uint& position_stride [[buffer(10)]],
     constant uint& kv_head_stride [[buffer(11)]],
     constant uint& kv_base_offset [[buffer(12)]],
-    uint head [[thread_position_in_grid]]
+    uint head [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]
 ) {
     if (head >= n_heads) return;
     uint kv_head = head / group;
@@ -471,33 +476,40 @@ kernel void attention_decode_f32(
     uint kv_base = kv_base_offset + kv_head * kv_head_stride;
     uint score_base = head * position_count;
 
-    float max_score = -INFINITY;
-    for (uint p = 0; p < position_count; ++p) {
-        float s = 0.0;
+    // Phase 1: scaled q.k scores, lanes striding over positions; reduce the row max.
+    float local_max = -INFINITY;
+    for (uint p = lane; p < position_count; p += 32) {
         uint k_base = kv_base + p * position_stride;
+        float s = 0.0;
         for (uint d = 0; d < head_dim; ++d) {
             s += query[q_base + d] * keys[k_base + d];
         }
         s *= scale;
         scores[score_base + p] = s;
-        max_score = max(max_score, s);
+        local_max = max(local_max, s);
     }
-    float sum = 0.0;
-    for (uint p = 0; p < position_count; ++p) {
+    float max_score = simd_max(local_max);
+
+    // Phase 2: exp(score - max) in place, reduce the denominator.
+    float local_sum = 0.0;
+    for (uint p = lane; p < position_count; p += 32) {
         float e = exp(scores[score_base + p] - max_score);
         scores[score_base + p] = e;
-        sum += e;
+        local_sum += e;
     }
-    float inv = 1.0 / sum;
-    for (uint d = 0; d < head_dim; ++d) {
-        output[q_base + d] = 0.0;
-    }
-    for (uint p = 0; p < position_count; ++p) {
-        float prob = scores[score_base + p] * inv;
-        uint v_base = kv_base + p * position_stride;
-        for (uint d = 0; d < head_dim; ++d) {
-            output[q_base + d] += prob * values[v_base + d];
+    float inv = 1.0 / simd_sum(local_sum);
+
+    // Ensure every lane's score writes are visible before the weighted-value sum reads them.
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // Phase 3: out[d] = sum_p prob_p * v_p[d], lanes striding over the output dimensions so
+    // each lane owns a disjoint set of dims and writes them directly (no cross-lane reduce).
+    for (uint d = lane; d < head_dim; d += 32) {
+        float acc = 0.0;
+        for (uint p = 0; p < position_count; ++p) {
+            acc += scores[score_base + p] * inv * values[kv_base + p * position_stride + d];
         }
+        output[q_base + d] = acc;
     }
 }
 
@@ -1851,21 +1863,19 @@ pub fn try_attention_decode_strided_f32(
     encoder.set_buffer(10, Some(&scalar_buf), 20);
     encoder.set_buffer(11, Some(&scalar_buf), 24);
     encoder.set_buffer(12, Some(&scalar_buf), 28);
-    let width = kernel
-        .attention_decode_pipeline
-        .thread_execution_width()
-        .max(1);
-    let threads_per_group = metal::MTLSize {
-        width,
-        height: 1,
-        depth: 1,
-    };
-    let threadgroups = metal::MTLSize {
-        width: (n_heads as u64).div_ceil(width),
-        height: 1,
-        depth: 1,
-    };
-    encoder.dispatch_thread_groups(threadgroups, threads_per_group);
+    // One threadgroup per head, a single 32-lane SIMD group cooperating within it.
+    encoder.dispatch_thread_groups(
+        metal::MTLSize {
+            width: n_heads as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
+    );
     encoder.end_encoding();
     command_buffer.commit();
     command_buffer.wait_until_completed();
@@ -2220,7 +2230,19 @@ fn encode_attention(
     e.set_buffer(10, Some(scalar), 20); // position_stride
     e.set_buffer(11, Some(scalar), 24); // kv_head_stride
     e.set_buffer(12, Some(scalar), 28); // kv_base_offset
-    dispatch_1d(e, &k.attention_decode_pipeline, n_heads);
+                                        // One threadgroup per head, a single 32-lane SIMD group cooperating within it.
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: n_heads as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
+    );
     e.end_encoding();
 }
 
