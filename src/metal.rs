@@ -2349,12 +2349,14 @@ fn encode_ffn_block(
 
 /// Encode the attention block op-chain into `cb` with no commit/readback: reads `in_buf`,
 /// writes the residual sum into `out_buf` (rms_norm -> quantize -> q/k/v matmul -> RoPE(q,k)
-/// -> blit current k/v into the KV cache at the last position -> decode attention ->
-/// quantize -> o matmul -> residual add with `in_buf`). The `q_w_buf`/`k_w_buf`/`v_w_buf`/
-/// `o_w_buf` Q8_0 weight buffers are caller-owned (so callers can keep them resident across
-/// tokens); this allocates only its own scratch/cache buffers and pushes them into `keep` so
-/// they outlive the command buffer. Dimensions come from `attn_norm.len()` and the head
-/// params; callers must pre-validate.
+/// -> blit current k/v into `cache_k_buf`/`cache_v_buf` at slot `write_position` -> decode
+/// attention over the first `position_count` slots -> quantize -> o matmul -> residual add
+/// with `in_buf`). The weight buffers AND the K/V cache buffers are caller-owned, so callers
+/// can keep them resident across tokens (a persistent cache simply grows by one slot per
+/// token). The cache buffers are laid out `[kv_head][max_positions][head_dim]`; this allocates
+/// only its own scratch buffers and pushes them into `keep` so they outlive the command
+/// buffer. Dimensions come from `attn_norm.len()` and the head params; callers must
+/// pre-validate (including that `write_position < position_count <= max_positions`).
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn encode_attention_block(
@@ -2371,8 +2373,10 @@ fn encode_attention_block(
     o_w_buf: &Buffer,
     cos_t: &[f32],
     sin_t: &[f32],
-    cache_k: &[f32],
-    cache_v: &[f32],
+    cache_k_buf: &Buffer,
+    cache_v_buf: &Buffer,
+    max_positions: usize,
+    write_position: usize,
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
@@ -2386,7 +2390,6 @@ fn encode_attention_block(
     let half_rope = cos_t.len();
     let bpr_hidden = hidden / 32;
     let bpr_q = q_dim / 32;
-    let pos = position_count - 1;
     let group = (n_heads / n_kv_heads) as u32;
     let nb = |bytes: u64| {
         k.device
@@ -2408,8 +2411,6 @@ fn encode_attention_block(
     let sin_buf = f32b(half_rope);
     let rope_q_scalar = nb(16);
     let rope_k_scalar = nb(16);
-    let cache_k_buf = f32b(cache_k.len());
-    let cache_v_buf = f32b(cache_v.len());
     let scores_buf = f32b(n_heads * position_count);
     let ctx_buf = f32b(q_dim);
     let attn_scalar = nb(32);
@@ -2423,8 +2424,6 @@ fn encode_attention_block(
     write_buffer_f32(&norm_w_buf, attn_norm);
     write_buffer_f32(&cos_buf, cos_t);
     write_buffer_f32(&sin_buf, sin_t);
-    write_buffer_f32(&cache_k_buf, cache_k);
-    write_buffer_f32(&cache_v_buf, cache_v);
     unsafe {
         let p = rms_scalar.contents() as *mut u8;
         *(p as *mut u32) = hidden as u32;
@@ -2451,11 +2450,10 @@ fn encode_attention_block(
         *(a.add(8) as *mut u32) = position_count as u32;
         *(a.add(12) as *mut u32) = group;
         *(a.add(16) as *mut f32) = scale;
-        // Contiguous per-layer cache [kv_head][position][head_dim]: head stride spans all
-        // positions, position stride is one head_dim, no base offset. (The interleaved
-        // real-cache layout overrides these when the resident KV cache lands.)
+        // Per-layer cache [kv_head][max_positions][head_dim]: position stride is one head_dim,
+        // head stride spans the full allocated position capacity, no base offset.
         *(a.add(20) as *mut u32) = head_dim as u32;
-        *(a.add(24) as *mut u32) = (position_count * head_dim) as u32;
+        *(a.add(24) as *mut u32) = (max_positions * head_dim) as u32;
         *(a.add(28) as *mut u32) = 0u32;
         *(nblocks_ctx.contents() as *mut u32) = bpr_q as u32;
         let o = o_mm_scalar.contents() as *mut u32;
@@ -2524,22 +2522,22 @@ fn encode_attention_block(
         n_kv_heads,
         half_rope,
     );
-    // Write the current token's (roped) K and (raw) V into the cache at `pos`.
+    // Write the current token's (roped) K and (raw) V into the cache at `write_position`.
     let blit = cb.new_blit_command_encoder();
     for h in 0..n_kv_heads {
         let src_off = (h * head_dim * 4) as u64;
-        let dst_off = ((h * position_count + pos) * head_dim * 4) as u64;
+        let dst_off = ((h * max_positions + write_position) * head_dim * 4) as u64;
         let size = (head_dim * 4) as u64;
-        blit.copy_from_buffer(&key_buf, src_off, &cache_k_buf, dst_off, size);
-        blit.copy_from_buffer(&val_buf, src_off, &cache_v_buf, dst_off, size);
+        blit.copy_from_buffer(&key_buf, src_off, cache_k_buf, dst_off, size);
+        blit.copy_from_buffer(&val_buf, src_off, cache_v_buf, dst_off, size);
     }
     blit.end_encoding();
     encode_attention(
         cb,
         k,
         &query_buf,
-        &cache_k_buf,
-        &cache_v_buf,
+        cache_k_buf,
+        cache_v_buf,
         &scores_buf,
         &ctx_buf,
         &attn_scalar,
@@ -2590,8 +2588,6 @@ fn encode_attention_block(
         sin_buf,
         rope_q_scalar,
         rope_k_scalar,
-        cache_k_buf,
-        cache_v_buf,
         scores_buf,
         ctx_buf,
         attn_scalar,
@@ -2614,6 +2610,20 @@ fn upload_weight_buffer(k: &MetalLinearKernel, weight_blocks: &[u8]) -> Buffer {
         MTLResourceOptions::StorageModeShared,
     );
     write_buffer_u8(&buf, weight_blocks);
+    buf
+}
+
+/// Allocate a fresh f32 GPU buffer sized to `cache` and upload it. Used by the standalone
+/// block helpers to hand `encode_attention_block` a transient per-call KV cache buffer
+/// (`max_positions == position_count`); the resident decode session passes persistent
+/// buffers instead.
+#[cfg(target_os = "macos")]
+fn upload_cache_buffer(k: &MetalLinearKernel, cache: &[f32]) -> Buffer {
+    let buf = k.device.new_buffer(
+        (cache.len() * 4) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    write_buffer_f32(&buf, cache);
     buf
 }
 
@@ -2744,6 +2754,8 @@ pub fn try_attention_block_resident(
     let k_w = upload_weight_buffer(k, k_weight_blocks);
     let v_w = upload_weight_buffer(k, v_weight_blocks);
     let o_w = upload_weight_buffer(k, o_weight_blocks);
+    let cache_k_buf = upload_cache_buffer(k, cache_k);
+    let cache_v_buf = upload_cache_buffer(k, cache_v);
     let mut keep = Vec::new();
     let cb = k.queue.new_command_buffer();
     encode_attention_block(
@@ -2760,8 +2772,10 @@ pub fn try_attention_block_resident(
         &o_w,
         cos_t,
         sin_t,
-        cache_k,
-        cache_v,
+        &cache_k_buf,
+        &cache_v_buf,
+        position_count,
+        position_count - 1,
         n_heads,
         n_kv_heads,
         head_dim,
@@ -2863,6 +2877,8 @@ pub fn try_decode_layer_resident(
     let gate_w = upload_weight_buffer(k, gate_weight_blocks);
     let up_w = upload_weight_buffer(k, up_weight_blocks);
     let down_w = upload_weight_buffer(k, down_weight_blocks);
+    let cache_k_buf = upload_cache_buffer(k, cache_k);
+    let cache_v_buf = upload_cache_buffer(k, cache_v);
     let mut keep = Vec::new();
     let cb = k.queue.new_command_buffer();
     encode_attention_block(
@@ -2879,8 +2895,10 @@ pub fn try_decode_layer_resident(
         &o_w,
         cos_t,
         sin_t,
-        cache_k,
-        cache_v,
+        &cache_k_buf,
+        &cache_v_buf,
+        position_count,
+        position_count - 1,
         n_heads,
         n_kv_heads,
         head_dim,
@@ -3025,6 +3043,8 @@ pub fn try_decode_forward_resident(
             (&buf_b, &buf_a)
         };
         let w = &resident[i];
+        let cache_k_buf = upload_cache_buffer(k, layer.cache_k);
+        let cache_v_buf = upload_cache_buffer(k, layer.cache_v);
         encode_attention_block(
             cb,
             k,
@@ -3039,8 +3059,10 @@ pub fn try_decode_forward_resident(
             &w[3],
             cos_t,
             sin_t,
-            layer.cache_k,
-            layer.cache_v,
+            &cache_k_buf,
+            &cache_v_buf,
+            position_count,
+            position_count - 1,
             n_heads,
             n_kv_heads,
             head_dim,
@@ -3061,6 +3083,9 @@ pub fn try_decode_forward_resident(
             &w[6],
             ffn_dim,
         );
+        // Keep the transient per-layer cache buffers alive until the command buffer completes.
+        keep.push(cache_k_buf);
+        keep.push(cache_v_buf);
         from_a = !from_a;
     }
     cb.commit();
@@ -3070,6 +3095,288 @@ pub fn try_decode_forward_resident(
     let mut out = vec![0.0f32; hidden];
     read_buffer_f32(final_buf, &mut out);
     Some(out)
+}
+
+/// Per-layer weights/norms for `ResidentDecodeState::forward_token`. Unlike
+/// `ResidentDecodeLayer`, the K/V cache is NOT here -- it lives in the session and persists
+/// across tokens. Holds the seven Q8_0 weight-block byte buffers and the two RMSNorm f32
+/// weights.
+pub struct ResidentLayerWeights<'a> {
+    pub attn_norm: &'a [f32],
+    pub ffn_norm: &'a [f32],
+    pub q_weight_blocks: &'a [u8],
+    pub k_weight_blocks: &'a [u8],
+    pub v_weight_blocks: &'a [u8],
+    pub o_weight_blocks: &'a [u8],
+    pub gate_weight_blocks: &'a [u8],
+    pub up_weight_blocks: &'a [u8],
+    pub down_weight_blocks: &'a [u8],
+}
+
+/// A resident decode session that owns the on-GPU KV cache (per layer, sized to
+/// `max_positions`) and the reused hidden ping-pong buffers. A multi-token greedy decode runs
+/// each token in ONE command buffer with the KV cache persisting on the GPU across tokens --
+/// only the new token's K/V is blitted in each step, never re-uploaded -- and Q8 weights stay
+/// resident via the global `MetalLinearCache`. For its sequence the session is the
+/// authoritative KV store (the kernel computes and appends each token's K/V at `position`).
+#[cfg(target_os = "macos")]
+pub struct ResidentDecodeState {
+    n_layers: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    hidden: usize,
+    ffn_dim: usize,
+    max_positions: usize,
+    eps: f32,
+    split_half_pairing: bool,
+    cache_k: Vec<Buffer>,
+    cache_v: Vec<Buffer>,
+    buf_a: Buffer,
+    buf_b: Buffer,
+    mid: Buffer,
+}
+
+#[cfg(target_os = "macos")]
+impl ResidentDecodeState {
+    /// Allocate the session. `max_positions` is the context length the KV cache is sized for.
+    /// Returns None if Metal is unavailable or the dimensions are invalid.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        n_layers: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        hidden: usize,
+        ffn_dim: usize,
+        max_positions: usize,
+        eps: f32,
+        split_half_pairing: bool,
+    ) -> Option<Self> {
+        let q_dim = n_heads * head_dim;
+        if n_layers == 0
+            || hidden == 0
+            || !hidden.is_multiple_of(32)
+            || !q_dim.is_multiple_of(32)
+            || head_dim == 0
+            || !head_dim.is_multiple_of(2)
+            || n_heads == 0
+            || n_kv_heads == 0
+            || !n_heads.is_multiple_of(n_kv_heads)
+            || ffn_dim == 0
+            || !ffn_dim.is_multiple_of(32)
+            || max_positions == 0
+        {
+            return None;
+        }
+        let k = metal_linear_kernel()?;
+        let nb = |n: usize| {
+            k.device
+                .new_buffer((n * 4) as u64, MTLResourceOptions::StorageModeShared)
+        };
+        let kv_slots = n_kv_heads * max_positions * head_dim;
+        let cache_k = (0..n_layers).map(|_| nb(kv_slots)).collect();
+        let cache_v = (0..n_layers).map(|_| nb(kv_slots)).collect();
+        Some(Self {
+            n_layers,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            hidden,
+            ffn_dim,
+            max_positions,
+            eps,
+            split_half_pairing,
+            cache_k,
+            cache_v,
+            buf_a: nb(hidden),
+            buf_b: nb(hidden),
+            mid: nb(hidden),
+        })
+    }
+
+    /// Decode one token at sequence position `position` (0-based): append this token's K/V to
+    /// the persistent GPU cache and attend over positions `0..=position`, all layers in one
+    /// command buffer. `cos_t`/`sin_t` are the RoPE tables for `position`; `scale` is the
+    /// attention scale. Returns the post-final-layer hidden state `[hidden]` (the caller
+    /// applies the final norm + output projection), or None on dimension mismatch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_token(
+        &mut self,
+        embedding: &[f32],
+        layers: &[ResidentLayerWeights],
+        cos_t: &[f32],
+        sin_t: &[f32],
+        position: usize,
+        scale: f32,
+    ) -> Option<Vec<f32>> {
+        let half_rope = cos_t.len();
+        if embedding.len() != self.hidden
+            || layers.len() != self.n_layers
+            || position >= self.max_positions
+            || sin_t.len() != half_rope
+            || half_rope * 2 > self.head_dim
+        {
+            return None;
+        }
+        let q_dim = self.n_heads * self.head_dim;
+        let kv_dim = self.n_kv_heads * self.head_dim;
+        let bpr_hidden = self.hidden / 32;
+        let bpr_q = q_dim / 32;
+        let bpr_ffn = self.ffn_dim / 32;
+        for l in layers {
+            if l.attn_norm.len() != self.hidden
+                || l.ffn_norm.len() != self.hidden
+                || l.q_weight_blocks.len() != q_dim * bpr_hidden * 36
+                || l.k_weight_blocks.len() != kv_dim * bpr_hidden * 36
+                || l.v_weight_blocks.len() != kv_dim * bpr_hidden * 36
+                || l.o_weight_blocks.len() != self.hidden * bpr_q * 36
+                || l.gate_weight_blocks.len() != self.ffn_dim * bpr_hidden * 36
+                || l.up_weight_blocks.len() != self.ffn_dim * bpr_hidden * 36
+                || l.down_weight_blocks.len() != self.hidden * bpr_ffn * 36
+            {
+                return None;
+            }
+        }
+        let k = metal_linear_kernel()?;
+        let resident: Vec<[Buffer; 7]> = {
+            let mut cache = metal_linear_cache().lock().ok()?;
+            layers
+                .iter()
+                .map(|l| {
+                    [
+                        cache.q8_block_weight_buffer(&k.device, l.q_weight_blocks),
+                        cache.q8_block_weight_buffer(&k.device, l.k_weight_blocks),
+                        cache.q8_block_weight_buffer(&k.device, l.v_weight_blocks),
+                        cache.q8_block_weight_buffer(&k.device, l.o_weight_blocks),
+                        cache.q8_block_weight_buffer(&k.device, l.gate_weight_blocks),
+                        cache.q8_block_weight_buffer(&k.device, l.up_weight_blocks),
+                        cache.q8_block_weight_buffer(&k.device, l.down_weight_blocks),
+                    ]
+                })
+                .collect()
+        };
+        let position_count = position + 1;
+        write_buffer_f32(&self.buf_a, embedding);
+        let mut keep = Vec::new();
+        let cb = k.queue.new_command_buffer();
+        let mut from_a = true;
+        for (i, layer) in layers.iter().enumerate() {
+            let (in_buf, out_buf) = if from_a {
+                (&self.buf_a, &self.buf_b)
+            } else {
+                (&self.buf_b, &self.buf_a)
+            };
+            let w = &resident[i];
+            encode_attention_block(
+                cb,
+                k,
+                &mut keep,
+                in_buf,
+                &self.mid,
+                layer.attn_norm,
+                self.eps,
+                &w[0],
+                &w[1],
+                &w[2],
+                &w[3],
+                cos_t,
+                sin_t,
+                &self.cache_k[i],
+                &self.cache_v[i],
+                self.max_positions,
+                position,
+                self.n_heads,
+                self.n_kv_heads,
+                self.head_dim,
+                position_count,
+                scale,
+                self.split_half_pairing,
+            );
+            encode_ffn_block(
+                cb,
+                k,
+                &mut keep,
+                &self.mid,
+                out_buf,
+                layer.ffn_norm,
+                self.eps,
+                &w[4],
+                &w[5],
+                &w[6],
+                self.ffn_dim,
+            );
+            from_a = !from_a;
+        }
+        cb.commit();
+        cb.wait_until_completed();
+        let final_buf = if from_a { &self.buf_a } else { &self.buf_b };
+        let mut out = vec![0.0f32; self.hidden];
+        read_buffer_f32(final_buf, &mut out);
+        Some(out)
+    }
+
+    /// Read back layer `layer`'s first `position_count` cached K positions as a contiguous
+    /// `[kv_head][position_count][head_dim]` buffer (test-only; used to build a reference cache
+    /// for the persistent-vs-full-upload parity check).
+    #[cfg(test)]
+    fn cache_k_contiguous(&self, layer: usize, position_count: usize) -> Vec<f32> {
+        self.read_cache(&self.cache_k[layer], position_count)
+    }
+
+    #[cfg(test)]
+    fn cache_v_contiguous(&self, layer: usize, position_count: usize) -> Vec<f32> {
+        self.read_cache(&self.cache_v[layer], position_count)
+    }
+
+    #[cfg(test)]
+    fn read_cache(&self, buf: &Buffer, position_count: usize) -> Vec<f32> {
+        let mut full = vec![0.0f32; self.n_kv_heads * self.max_positions * self.head_dim];
+        read_buffer_f32(buf, &mut full);
+        let mut out = vec![0.0f32; self.n_kv_heads * position_count * self.head_dim];
+        for h in 0..self.n_kv_heads {
+            for p in 0..position_count {
+                let src = (h * self.max_positions + p) * self.head_dim;
+                let dst = (h * position_count + p) * self.head_dim;
+                out[dst..dst + self.head_dim].copy_from_slice(&full[src..src + self.head_dim]);
+            }
+        }
+        out
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub struct ResidentDecodeState;
+
+#[cfg(not(target_os = "macos"))]
+impl ResidentDecodeState {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        _n_layers: usize,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _hidden: usize,
+        _ffn_dim: usize,
+        _max_positions: usize,
+        _eps: f32,
+        _split_half_pairing: bool,
+    ) -> Option<Self> {
+        None
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_token(
+        &mut self,
+        _embedding: &[f32],
+        _layers: &[ResidentLayerWeights],
+        _cos_t: &[f32],
+        _sin_t: &[f32],
+        _position: usize,
+        _scale: f32,
+    ) -> Option<Vec<f32>> {
+        None
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -4005,6 +4312,178 @@ mod tests {
         assert_eq!(got.len(), q_dim);
         for (a, b) in got.iter().zip(&expected) {
             assert!((a - b).abs() < 1.0e-5, "{a} != {b}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_resident_decode_state_matches_full_upload() {
+        if !detect_metal_device().available {
+            return;
+        }
+        // The persistent on-GPU KV session (append one slot per token, never re-upload) must,
+        // at each token, equal the full-upload try_decode_forward_resident fed the same
+        // accumulated history. Same kernels + inputs => identical; this guards the persistent
+        // cache append/stride bookkeeping across many tokens.
+        let n_layers = 2usize;
+        let n_heads = 2usize;
+        let n_kv = 2usize;
+        let head_dim = 32usize;
+        let hidden = 64usize;
+        let ffn = 128usize;
+        let max_positions = 8usize;
+        let tokens = 4usize;
+        let eps = 1.0e-5f32;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv * head_dim;
+        let half = head_dim / 2;
+        let bpr_hidden = hidden / 32;
+        let bpr_q = q_dim / 32;
+        let bpr_ffn = ffn / 32;
+        let mkw = |rows: usize, bpr: usize, seed: usize| {
+            let mut w: Vec<u8> = Vec::new();
+            for r in 0..rows {
+                for b in 0..bpr {
+                    let s = 0.05 + ((r * bpr + b + seed) as f32 % 7.0) * 0.01;
+                    w.extend_from_slice(&s.to_le_bytes());
+                    for l in 0..32 {
+                        w.push((((r * 5 + b * 3 + l + seed) as i32 % 17) - 8) as i8 as u8);
+                    }
+                }
+            }
+            w
+        };
+        struct LW {
+            attn_norm: Vec<f32>,
+            ffn_norm: Vec<f32>,
+            q: Vec<u8>,
+            k: Vec<u8>,
+            v: Vec<u8>,
+            o: Vec<u8>,
+            gate: Vec<u8>,
+            up: Vec<u8>,
+            down: Vec<u8>,
+        }
+        let data: Vec<LW> = (0..n_layers)
+            .map(|li| {
+                let s = li * 100;
+                LW {
+                    attn_norm: (0..hidden)
+                        .map(|i| 0.5 + ((i + li) as f32 % 3.0) * 0.1)
+                        .collect(),
+                    ffn_norm: (0..hidden)
+                        .map(|i| 0.4 + ((i + li) as f32 % 5.0) * 0.07)
+                        .collect(),
+                    q: mkw(q_dim, bpr_hidden, s + 1),
+                    k: mkw(kv_dim, bpr_hidden, s + 2),
+                    v: mkw(kv_dim, bpr_hidden, s + 3),
+                    o: mkw(hidden, bpr_q, s + 4),
+                    gate: mkw(ffn, bpr_hidden, s + 5),
+                    up: mkw(ffn, bpr_hidden, s + 6),
+                    down: mkw(hidden, bpr_ffn, s + 7),
+                }
+            })
+            .collect();
+        let weights: Vec<ResidentLayerWeights> = data
+            .iter()
+            .map(|d| ResidentLayerWeights {
+                attn_norm: &d.attn_norm,
+                ffn_norm: &d.ffn_norm,
+                q_weight_blocks: &d.q,
+                k_weight_blocks: &d.k,
+                v_weight_blocks: &d.v,
+                o_weight_blocks: &d.o,
+                gate_weight_blocks: &d.gate,
+                up_weight_blocks: &d.up,
+                down_weight_blocks: &d.down,
+            })
+            .collect();
+
+        let mut session = ResidentDecodeState::new(
+            n_layers,
+            n_heads,
+            n_kv,
+            head_dim,
+            hidden,
+            ffn,
+            max_positions,
+            eps,
+            false,
+        )
+        .unwrap();
+
+        for t in 0..tokens {
+            let emb: Vec<f32> = (0..hidden)
+                .map(|i| (((i + t) as f32 % 11.0) - 5.0) * 0.2)
+                .collect();
+            let cos_t: Vec<f32> = (0..half)
+                .map(|p| (0.2 + (p + t) as f32 * 0.1).cos())
+                .collect();
+            let sin_t: Vec<f32> = (0..half)
+                .map(|p| (0.2 + (p + t) as f32 * 0.1).sin())
+                .collect();
+            let position_count = t + 1;
+
+            // Reference history = the session's accumulated slots 0..t-1, re-laid into a
+            // [kv_head][position_count][head_dim] buffer with slot t left for the kernel.
+            let ref_caches: Vec<(Vec<f32>, Vec<f32>)> = (0..n_layers)
+                .map(|layer| {
+                    let hist_k = session.cache_k_contiguous(layer, t);
+                    let hist_v = session.cache_v_contiguous(layer, t);
+                    let mut ck = vec![0.0f32; kv_dim * position_count];
+                    let mut cv = vec![0.0f32; kv_dim * position_count];
+                    for h in 0..n_kv {
+                        for p in 0..t {
+                            let src = (h * t + p) * head_dim;
+                            let dst = (h * position_count + p) * head_dim;
+                            ck[dst..dst + head_dim].copy_from_slice(&hist_k[src..src + head_dim]);
+                            cv[dst..dst + head_dim].copy_from_slice(&hist_v[src..src + head_dim]);
+                        }
+                    }
+                    (ck, cv)
+                })
+                .collect();
+            let ref_layers: Vec<ResidentDecodeLayer> = data
+                .iter()
+                .zip(&ref_caches)
+                .map(|(d, (ck, cv))| ResidentDecodeLayer {
+                    attn_norm: &d.attn_norm,
+                    ffn_norm: &d.ffn_norm,
+                    q_weight_blocks: &d.q,
+                    k_weight_blocks: &d.k,
+                    v_weight_blocks: &d.v,
+                    o_weight_blocks: &d.o,
+                    gate_weight_blocks: &d.gate,
+                    up_weight_blocks: &d.up,
+                    down_weight_blocks: &d.down,
+                    cache_k: ck,
+                    cache_v: cv,
+                })
+                .collect();
+            let expected = try_decode_forward_resident(
+                &emb,
+                &ref_layers,
+                &cos_t,
+                &sin_t,
+                eps,
+                n_heads,
+                n_kv,
+                head_dim,
+                position_count,
+                ffn,
+                scale,
+                false,
+            )
+            .unwrap();
+
+            let got = session
+                .forward_token(&emb, &weights, &cos_t, &sin_t, t, scale)
+                .unwrap();
+            assert_eq!(got.len(), hidden);
+            for (a, b) in got.iter().zip(&expected) {
+                assert!((a - b).abs() < 1.0e-4, "token {t}: {a} != {b}");
+            }
         }
     }
 
