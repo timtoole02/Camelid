@@ -339,7 +339,6 @@ kernel void q8_0_block_linear_row_simd(
 }
 "#;
 
-#[cfg(target_os = "macos")]
 // Elementwise / norm building blocks for a GPU-resident forward pass. Each mirrors
 // the CPU reference exactly (rms_norm: x / sqrt(mean(x^2) + eps) * w; silu_mul:
 // (g / (1 + e^-g)) * u; residual: a + b) and is parity-checked in tests.
@@ -402,6 +401,7 @@ kernel void silu_mul_f32(
 }
 "#;
 
+#[cfg(target_os = "macos")]
 fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
     METAL_LINEAR_KERNEL
         .get_or_init(|| {
