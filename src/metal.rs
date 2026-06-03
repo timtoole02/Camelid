@@ -32,12 +32,14 @@ struct MetalLinearKernel {
     q8_0_encoded_rows_pipeline: ComputePipelineState,
     q8_0_block_pipeline: ComputePipelineState,
     q8_0_block_simd_pipeline: ComputePipelineState,
+    q8_0_block_simd_mr_pipeline: ComputePipelineState,
     rms_norm_pipeline: ComputePipelineState,
     residual_add_pipeline: ComputePipelineState,
     silu_mul_pipeline: ComputePipelineState,
     rope_rotate_pipeline: ComputePipelineState,
     attention_decode_pipeline: ComputePipelineState,
     quantize_q8_0_pipeline: ComputePipelineState,
+    kv_scatter_pipeline: ComputePipelineState,
     active_command_buffer: Mutex<Option<metal::CommandBuffer>>,
 }
 
@@ -340,6 +342,44 @@ kernel void q8_0_block_linear_row_simd(
         output[row] = total;
     }
 }
+
+// Multi-row variant: several SIMD groups per threadgroup, one output row per SIMD group.
+// More rows' weight reads are in flight per threadgroup, which improves memory-latency
+// hiding on the bandwidth-bound decode GEMV. Same per-row math as the single-row kernel.
+kernel void q8_0_block_linear_row_simd_mr(
+    device const float* input_scales [[buffer(0)]],
+    device const char* input_quants [[buffer(1)]],
+    device const char* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& blocks_per_row [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint sgs [[simdgroups_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    uint row = tg * sgs + sg;
+    if (row >= rows) return;
+    constexpr uint block_values = 32;
+    constexpr uint q8_block_bytes = 36;
+    uint row_base = row * blocks_per_row * q8_block_bytes;
+    float partial = 0.0;
+    for (uint block_idx = lane; block_idx < blocks_per_row; block_idx += 32) {
+        uint block_base = row_base + block_idx * q8_block_bytes;
+        device const float* weight_scale = reinterpret_cast<device const float*>(weight_blocks + block_base);
+        uint weight_quant_base = block_base + 4;
+        uint input_base = block_idx * block_values;
+        int int_sum = 0;
+        for (uint l = 0; l < block_values; ++l) {
+            int_sum += int(weight_blocks[weight_quant_base + l]) * int(input_quants[input_base + l]);
+        }
+        partial += float(int_sum) * (*weight_scale) * input_scales[block_idx];
+    }
+    float total = simd_sum(partial);
+    if (lane == 0) {
+        output[row] = total;
+    }
+}
 "#;
 
 // Elementwise / norm building blocks for a GPU-resident forward pass. Each mirrors
@@ -541,6 +581,29 @@ kernel void quantize_q8_0_f32(
         out_quants[base + i] = char(q);
     }
 }
+
+// Scatter the current token's K/V ([n_kv_heads * head_dim] contiguous) into the persistent
+// cache buffers at slot `write_position` of a [kv_head][max_positions][head_dim] layout.
+// Compute-encoder replacement for the previous blit, so a whole decode token can stay inside
+// ONE compute command encoder.
+kernel void kv_scatter_f32(
+    device const float* src_k [[buffer(0)]],
+    device const float* src_v [[buffer(1)]],
+    device float* cache_k [[buffer(2)]],
+    device float* cache_v [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    constant uint& max_positions [[buffer(5)]],
+    constant uint& write_position [[buffer(6)]],
+    constant uint& total [[buffer(7)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= total) return;
+    uint h = i / head_dim;
+    uint d = i % head_dim;
+    uint dst = (h * max_positions + write_position) * head_dim + d;
+    cache_k[dst] = src_k[i];
+    cache_v[dst] = src_v[i];
+}
 "#;
 
 #[cfg(target_os = "macos")]
@@ -591,6 +654,12 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let quantize_q8_0_pipeline = device
                 .new_compute_pipeline_state_with_function(&quantize_q8_0_function)
                 .ok()?;
+            let kv_scatter_function = elementwise_library
+                .get_function("kv_scatter_f32", None)
+                .ok()?;
+            let kv_scatter_pipeline = device
+                .new_compute_pipeline_state_with_function(&kv_scatter_function)
+                .ok()?;
             let descriptor_function = library.get_function("linear_row_f32", None).ok()?;
             let descriptor_pipeline = device
                 .new_compute_pipeline_state_with_function(&descriptor_function)
@@ -622,6 +691,12 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let q8_0_block_simd_pipeline = device
                 .new_compute_pipeline_state_with_function(&q8_0_block_simd_function)
                 .ok()?;
+            let q8_0_block_simd_mr_function = library
+                .get_function("q8_0_block_linear_row_simd_mr", None)
+                .ok()?;
+            let q8_0_block_simd_mr_pipeline = device
+                .new_compute_pipeline_state_with_function(&q8_0_block_simd_mr_function)
+                .ok()?;
             let queue = device.new_command_queue();
             Some(MetalLinearKernel {
                 device,
@@ -632,12 +707,14 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 q8_0_encoded_rows_pipeline,
                 q8_0_block_pipeline,
                 q8_0_block_simd_pipeline,
+                q8_0_block_simd_mr_pipeline,
                 rms_norm_pipeline,
                 residual_add_pipeline,
                 silu_mul_pipeline,
                 rope_rotate_pipeline,
                 attention_decode_pipeline,
                 quantize_q8_0_pipeline,
+                kv_scatter_pipeline,
                 active_command_buffer: Mutex::new(None),
             })
         })
@@ -2070,14 +2147,13 @@ fn dispatch_1d(
 
 #[cfg(target_os = "macos")]
 fn encode_rms_norm(
-    cb: &metal::CommandBufferRef,
+    e: &metal::ComputeCommandEncoderRef,
     k: &MetalLinearKernel,
     input: &Buffer,
     weight: &Buffer,
     out: &Buffer,
     scalar: &Buffer,
 ) {
-    let e = cb.new_compute_command_encoder();
     e.set_compute_pipeline_state(&k.rms_norm_pipeline);
     e.set_buffer(0, Some(input), 0);
     e.set_buffer(1, Some(weight), 0);
@@ -2096,12 +2172,11 @@ fn encode_rms_norm(
             depth: 1,
         },
     );
-    e.end_encoding();
 }
 
 #[cfg(target_os = "macos")]
 fn encode_quantize(
-    cb: &metal::CommandBufferRef,
+    e: &metal::ComputeCommandEncoderRef,
     k: &MetalLinearKernel,
     input: &Buffer,
     scales: &Buffer,
@@ -2109,20 +2184,18 @@ fn encode_quantize(
     nblocks_buf: &Buffer,
     n_blocks: usize,
 ) {
-    let e = cb.new_compute_command_encoder();
     e.set_compute_pipeline_state(&k.quantize_q8_0_pipeline);
     e.set_buffer(0, Some(input), 0);
     e.set_buffer(1, Some(scales), 0);
     e.set_buffer(2, Some(quants), 0);
     e.set_buffer(3, Some(nblocks_buf), 0);
     dispatch_1d(e, &k.quantize_q8_0_pipeline, n_blocks);
-    e.end_encoding();
 }
 
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn encode_q8_matmul(
-    cb: &metal::CommandBufferRef,
+    e: &metal::ComputeCommandEncoderRef,
     k: &MetalLinearKernel,
     scales: &Buffer,
     quants: &Buffer,
@@ -2131,11 +2204,11 @@ fn encode_q8_matmul(
     scalar: &Buffer,
     rows: usize,
 ) {
-    let e = cb.new_compute_command_encoder();
-    // Use the SIMD-group GEMV (one threadgroup per output row, a 32-lane simd_sum reduction)
-    // rather than the scalar one-thread-per-row kernel: same bindings, far higher memory
-    // throughput, which dominates resident decode (one matmul per projection per layer).
-    e.set_compute_pipeline_state(&k.q8_0_block_simd_pipeline);
+    // SIMD-group GEMV with several rows per threadgroup (one row per SIMD group): keeps more
+    // weight reads in flight per threadgroup for better memory-latency hiding on the
+    // bandwidth-bound decode path.
+    const SIMD_GROUPS_PER_TG: u64 = 2;
+    e.set_compute_pipeline_state(&k.q8_0_block_simd_mr_pipeline);
     e.set_buffer(0, Some(scales), 0);
     e.set_buffer(1, Some(quants), 0);
     e.set_buffer(2, Some(weight), 0);
@@ -2144,22 +2217,21 @@ fn encode_q8_matmul(
     e.set_buffer(5, Some(scalar), 4);
     e.dispatch_thread_groups(
         metal::MTLSize {
-            width: rows as u64,
+            width: (rows as u64).div_ceil(SIMD_GROUPS_PER_TG),
             height: 1,
             depth: 1,
         },
         metal::MTLSize {
-            width: 32,
+            width: SIMD_GROUPS_PER_TG * 32,
             height: 1,
             depth: 1,
         },
     );
-    e.end_encoding();
 }
 
 #[cfg(target_os = "macos")]
 fn encode_binary(
-    cb: &metal::CommandBufferRef,
+    e: &metal::ComputeCommandEncoderRef,
     pipeline: &ComputePipelineState,
     a: &Buffer,
     b: &Buffer,
@@ -2167,20 +2239,18 @@ fn encode_binary(
     n_buf: &Buffer,
     n: usize,
 ) {
-    let e = cb.new_compute_command_encoder();
     e.set_compute_pipeline_state(pipeline);
     e.set_buffer(0, Some(a), 0);
     e.set_buffer(1, Some(b), 0);
     e.set_buffer(2, Some(out), 0);
     e.set_buffer(3, Some(n_buf), 0);
     dispatch_1d(e, pipeline, n);
-    e.end_encoding();
 }
 
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn encode_rope(
-    cb: &metal::CommandBufferRef,
+    e: &metal::ComputeCommandEncoderRef,
     k: &MetalLinearKernel,
     data: &Buffer,
     cos_t: &Buffer,
@@ -2189,7 +2259,6 @@ fn encode_rope(
     head_count: usize,
     half_rope: usize,
 ) {
-    let e = cb.new_compute_command_encoder();
     e.set_compute_pipeline_state(&k.rope_rotate_pipeline);
     e.set_buffer(0, Some(data), 0);
     e.set_buffer(1, Some(cos_t), 0);
@@ -2199,13 +2268,12 @@ fn encode_rope(
     e.set_buffer(5, Some(scalar), 8); // half_rope
     e.set_buffer(6, Some(scalar), 12); // pairing
     dispatch_1d(e, &k.rope_rotate_pipeline, head_count * half_rope);
-    e.end_encoding();
 }
 
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn encode_attention(
-    cb: &metal::CommandBufferRef,
+    e: &metal::ComputeCommandEncoderRef,
     k: &MetalLinearKernel,
     query: &Buffer,
     keys: &Buffer,
@@ -2215,7 +2283,6 @@ fn encode_attention(
     scalar: &Buffer,
     n_heads: usize,
 ) {
-    let e = cb.new_compute_command_encoder();
     e.set_compute_pipeline_state(&k.attention_decode_pipeline);
     e.set_buffer(0, Some(query), 0);
     e.set_buffer(1, Some(keys), 0);
@@ -2243,7 +2310,6 @@ fn encode_attention(
             depth: 1,
         },
     );
-    e.end_encoding();
 }
 
 /// Encode the FFN block op-chain into `cb` with no commit/readback: reads `in_buf`, writes
@@ -2256,7 +2322,7 @@ fn encode_attention(
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn encode_ffn_block(
-    cb: &metal::CommandBufferRef,
+    e: &metal::ComputeCommandEncoderRef,
     k: &MetalLinearKernel,
     keep: &mut Vec<Buffer>,
     in_buf: &Buffer,
@@ -2310,10 +2376,10 @@ fn encode_ffn_block(
         *(resid_n.contents() as *mut u32) = hidden as u32;
     }
 
-    encode_rms_norm(cb, k, in_buf, &norm_w_buf, &norm_buf, &rms_scalar);
-    encode_quantize(cb, k, &norm_buf, &scales1, &quants1, &nblocks1, bpr_hidden);
+    encode_rms_norm(e, k, in_buf, &norm_w_buf, &norm_buf, &rms_scalar);
+    encode_quantize(e, k, &norm_buf, &scales1, &quants1, &nblocks1, bpr_hidden);
     encode_q8_matmul(
-        cb,
+        e,
         k,
         &scales1,
         &quants1,
@@ -2323,7 +2389,7 @@ fn encode_ffn_block(
         ffn_dim,
     );
     encode_q8_matmul(
-        cb,
+        e,
         k,
         &scales1,
         &quants1,
@@ -2333,7 +2399,7 @@ fn encode_ffn_block(
         ffn_dim,
     );
     encode_binary(
-        cb,
+        e,
         &k.silu_mul_pipeline,
         &gate_buf,
         &up_buf,
@@ -2341,9 +2407,9 @@ fn encode_ffn_block(
         &silu_n,
         ffn_dim,
     );
-    encode_quantize(cb, k, &act_buf, &scales2, &quants2, &nblocks2, bpr_ffn);
+    encode_quantize(e, k, &act_buf, &scales2, &quants2, &nblocks2, bpr_ffn);
     encode_q8_matmul(
-        cb,
+        e,
         k,
         &scales2,
         &quants2,
@@ -2353,7 +2419,7 @@ fn encode_ffn_block(
         hidden,
     );
     encode_binary(
-        cb,
+        e,
         &k.residual_add_pipeline,
         in_buf,
         &down_buf,
@@ -2396,7 +2462,7 @@ fn encode_ffn_block(
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn encode_attention_block(
-    cb: &metal::CommandBufferRef,
+    e: &metal::ComputeCommandEncoderRef,
     k: &MetalLinearKernel,
     keep: &mut Vec<Buffer>,
     in_buf: &Buffer,
@@ -2498,9 +2564,9 @@ fn encode_attention_block(
         *(resid_n.contents() as *mut u32) = hidden as u32;
     }
 
-    encode_rms_norm(cb, k, in_buf, &norm_w_buf, &norm_buf, &rms_scalar);
+    encode_rms_norm(e, k, in_buf, &norm_w_buf, &norm_buf, &rms_scalar);
     encode_quantize(
-        cb,
+        e,
         k,
         &norm_buf,
         &scales_norm,
@@ -2509,7 +2575,7 @@ fn encode_attention_block(
         bpr_hidden,
     );
     encode_q8_matmul(
-        cb,
+        e,
         k,
         &scales_norm,
         &quants_norm,
@@ -2519,7 +2585,7 @@ fn encode_attention_block(
         q_dim,
     );
     encode_q8_matmul(
-        cb,
+        e,
         k,
         &scales_norm,
         &quants_norm,
@@ -2529,7 +2595,7 @@ fn encode_attention_block(
         kv_dim,
     );
     encode_q8_matmul(
-        cb,
+        e,
         k,
         &scales_norm,
         &quants_norm,
@@ -2539,7 +2605,7 @@ fn encode_attention_block(
         kv_dim,
     );
     encode_rope(
-        cb,
+        e,
         k,
         &query_buf,
         &cos_buf,
@@ -2549,7 +2615,7 @@ fn encode_attention_block(
         half_rope,
     );
     encode_rope(
-        cb,
+        e,
         k,
         &key_buf,
         &cos_buf,
@@ -2558,18 +2624,30 @@ fn encode_attention_block(
         n_kv_heads,
         half_rope,
     );
-    // Write the current token's (roped) K and (raw) V into the cache at `write_position`.
-    let blit = cb.new_blit_command_encoder();
-    for h in 0..n_kv_heads {
-        let src_off = (h * head_dim * 4) as u64;
-        let dst_off = ((h * max_positions + write_position) * head_dim * 4) as u64;
-        let size = (head_dim * 4) as u64;
-        blit.copy_from_buffer(&key_buf, src_off, cache_k_buf, dst_off, size);
-        blit.copy_from_buffer(&val_buf, src_off, cache_v_buf, dst_off, size);
+    // Write the current token's (roped) K and (raw) V into the cache at `write_position` via
+    // a compute scatter, so the whole token stays inside ONE compute command encoder (encoder
+    // boundaries force full GPU serialization; within one serial encoder Metal's hazard
+    // tracking orders dependent dispatches and overlaps independent ones).
+    let scatter_scalar = nb(16);
+    unsafe {
+        let p = scatter_scalar.contents() as *mut u32;
+        *p = head_dim as u32;
+        *p.add(1) = max_positions as u32;
+        *p.add(2) = write_position as u32;
+        *p.add(3) = kv_dim as u32;
     }
-    blit.end_encoding();
+    e.set_compute_pipeline_state(&k.kv_scatter_pipeline);
+    e.set_buffer(0, Some(&key_buf), 0);
+    e.set_buffer(1, Some(&val_buf), 0);
+    e.set_buffer(2, Some(cache_k_buf), 0);
+    e.set_buffer(3, Some(cache_v_buf), 0);
+    e.set_buffer(4, Some(&scatter_scalar), 0);
+    e.set_buffer(5, Some(&scatter_scalar), 4);
+    e.set_buffer(6, Some(&scatter_scalar), 8);
+    e.set_buffer(7, Some(&scatter_scalar), 12);
+    dispatch_1d(e, &k.kv_scatter_pipeline, kv_dim);
     encode_attention(
-        cb,
+        e,
         k,
         &query_buf,
         cache_k_buf,
@@ -2580,7 +2658,7 @@ fn encode_attention_block(
         n_heads,
     );
     encode_quantize(
-        cb,
+        e,
         k,
         &ctx_buf,
         &scales_ctx,
@@ -2589,7 +2667,7 @@ fn encode_attention_block(
         bpr_q,
     );
     encode_q8_matmul(
-        cb,
+        e,
         k,
         &scales_ctx,
         &quants_ctx,
@@ -2599,7 +2677,7 @@ fn encode_attention_block(
         hidden,
     );
     encode_binary(
-        cb,
+        e,
         &k.residual_add_pipeline,
         in_buf,
         &o_buf,
@@ -2633,6 +2711,7 @@ fn encode_attention_block(
         o_buf,
         o_mm_scalar,
         resid_n,
+        scatter_scalar,
     ]);
 }
 
@@ -2709,9 +2788,11 @@ pub fn try_ffn_block_resident(
     let down_w = upload_weight_buffer(k, down_weight_blocks);
     let mut keep = Vec::new();
     let cb = k.queue.new_command_buffer();
+    let e = cb.new_compute_command_encoder();
     encode_ffn_block(
-        cb, k, &mut keep, &in_buf, &out_buf, ffn_norm, eps, &gate_w, &up_w, &down_w, ffn_dim,
+        e, k, &mut keep, &in_buf, &out_buf, ffn_norm, eps, &gate_w, &up_w, &down_w, ffn_dim,
     );
+    e.end_encoding();
     cb.commit();
     cb.wait_until_completed();
     let mut out = vec![0.0f32; hidden];
@@ -2794,8 +2875,9 @@ pub fn try_attention_block_resident(
     let cache_v_buf = upload_cache_buffer(k, cache_v);
     let mut keep = Vec::new();
     let cb = k.queue.new_command_buffer();
+    let e = cb.new_compute_command_encoder();
     encode_attention_block(
-        cb,
+        e,
         k,
         &mut keep,
         &in_buf,
@@ -2819,6 +2901,7 @@ pub fn try_attention_block_resident(
         scale,
         split_half_pairing,
     );
+    e.end_encoding();
     cb.commit();
     cb.wait_until_completed();
     let mut out = vec![0.0f32; hidden];
@@ -2917,8 +3000,9 @@ pub fn try_decode_layer_resident(
     let cache_v_buf = upload_cache_buffer(k, cache_v);
     let mut keep = Vec::new();
     let cb = k.queue.new_command_buffer();
+    let e = cb.new_compute_command_encoder();
     encode_attention_block(
-        cb,
+        e,
         k,
         &mut keep,
         &in_buf,
@@ -2943,8 +3027,9 @@ pub fn try_decode_layer_resident(
         split_half_pairing,
     );
     encode_ffn_block(
-        cb, k, &mut keep, &attn_buf, &out_buf, ffn_norm, eps, &gate_w, &up_w, &down_w, ffn_dim,
+        e, k, &mut keep, &attn_buf, &out_buf, ffn_norm, eps, &gate_w, &up_w, &down_w, ffn_dim,
     );
+    e.end_encoding();
     cb.commit();
     cb.wait_until_completed();
     let mut out = vec![0.0f32; hidden];
@@ -3071,6 +3156,7 @@ pub fn try_decode_forward_resident(
     };
     let mut keep = Vec::new();
     let cb = k.queue.new_command_buffer();
+    let e = cb.new_compute_command_encoder();
     let mut from_a = true;
     for (i, layer) in layers.iter().enumerate() {
         let (in_buf, out_buf) = if from_a {
@@ -3082,7 +3168,7 @@ pub fn try_decode_forward_resident(
         let cache_k_buf = upload_cache_buffer(k, layer.cache_k);
         let cache_v_buf = upload_cache_buffer(k, layer.cache_v);
         encode_attention_block(
-            cb,
+            e,
             k,
             &mut keep,
             in_buf,
@@ -3107,7 +3193,7 @@ pub fn try_decode_forward_resident(
             split_half_pairing,
         );
         encode_ffn_block(
-            cb,
+            e,
             k,
             &mut keep,
             &mid,
@@ -3124,6 +3210,7 @@ pub fn try_decode_forward_resident(
         keep.push(cache_v_buf);
         from_a = !from_a;
     }
+    e.end_encoding();
     cb.commit();
     cb.wait_until_completed();
     // After N flips, the last layer's output sits in `buf_a` iff N is even (`from_a` true).
@@ -3402,6 +3489,7 @@ impl ResidentDecodeState {
         let trace = std::env::var_os("CAMELID_RESIDENT_TRACE").is_some();
         let encode_started = std::time::Instant::now();
         let cb = k.queue.new_command_buffer();
+        let e = cb.new_compute_command_encoder();
         let mut from_a = true;
         for (i, layer) in layers.iter().enumerate() {
             let (in_buf, out_buf) = if from_a {
@@ -3411,7 +3499,7 @@ impl ResidentDecodeState {
             };
             let w = &resident[i];
             encode_attention_block(
-                cb,
+                e,
                 k,
                 &mut keep,
                 in_buf,
@@ -3436,7 +3524,7 @@ impl ResidentDecodeState {
                 self.split_half_pairing,
             );
             encode_ffn_block(
-                cb,
+                e,
                 k,
                 &mut keep,
                 &self.mid,
@@ -3474,10 +3562,10 @@ impl ResidentDecodeState {
                 *m = bpr_hidden as u32;
                 *m.add(1) = s.vocab_size as u32;
             }
-            encode_rms_norm(cb, k, final_buf, fnorm_buf, &self.mid, &rms_scalar);
-            encode_quantize(cb, k, &self.mid, &lscales, &lquants, &lnblocks, bpr_hidden);
+            encode_rms_norm(e, k, final_buf, fnorm_buf, &self.mid, &rms_scalar);
+            encode_quantize(e, k, &self.mid, &lscales, &lquants, &lnblocks, bpr_hidden);
             encode_q8_matmul(
-                cb,
+                e,
                 k,
                 &lscales,
                 &lquants,
@@ -3493,6 +3581,7 @@ impl ResidentDecodeState {
         };
         let encode_us = encode_started.elapsed().as_micros();
         let gpu_started = std::time::Instant::now();
+        e.end_encoding();
         cb.commit();
         cb.wait_until_completed();
         if trace {
