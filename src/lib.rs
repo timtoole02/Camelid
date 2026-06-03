@@ -4,6 +4,7 @@ pub mod distributed;
 pub mod error;
 pub mod execution_plan;
 pub mod gguf;
+pub mod ghost;
 pub mod inference;
 pub mod metal;
 pub mod model;

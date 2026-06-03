@@ -1813,6 +1813,56 @@ impl LlamaInferenceSession {
         Ok(current_hidden)
     }
 
+    /// Ghost (layer-streaming) mode support: run exactly ONE transformer layer over `hidden`
+    /// WITHOUT advancing the KV position. The ghost runner streams each layer's weights into
+    /// `self.weights.layers[layer_idx]` from a `.cghost` file right before this call and
+    /// swaps placeholders back in right after, so only one layer's weights are materialized
+    /// at a time; it advances the position once per chunk via
+    /// [`Self::ghost_advance_position`] after all layers ran.
+    pub fn ghost_forward_one_layer(
+        &mut self,
+        hidden: &CpuTensor,
+        layer_idx: usize,
+        start_pos: usize,
+        seq_len: usize,
+    ) -> Result<CpuTensor> {
+        if start_pos != self.kv_cache.position {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "ghost layer {layer_idx}: activation start position {start_pos} does not \
+                 match KV cache position {}",
+                self.kv_cache.position
+            )));
+        }
+        let rms_norm_epsilon = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
+        let layer = self.weights.layers.get(layer_idx).ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch(format!(
+                "ghost layer index {layer_idx} out of range ({} layers)",
+                self.weights.layers.len()
+            ))
+        })?;
+        let timed = forward_prefill_layer_chunk_timed(
+            hidden,
+            layer,
+            PrefillLayerChunkParams {
+                config: &self.config,
+                rope_freqs: self.weights.rope_freqs.as_ref(),
+                rms_norm_epsilon,
+                layer_idx,
+                chunk_start: 0,
+                chunk_rows: seq_len,
+                base_position: start_pos,
+            },
+            &mut self.kv_cache,
+        )?;
+        Ok(timed.output)
+    }
+
+    /// Ghost mode: advance the KV position once after all of a chunk's layers ran via
+    /// [`Self::ghost_forward_one_layer`].
+    pub fn ghost_advance_position(&mut self, seq_len: usize) {
+        self.kv_cache.position += seq_len;
+    }
+
     pub fn forward_final_norm_and_logits(&self, out_hidden: &CpuTensor) -> Result<CpuTensor> {
         let rms_norm_epsilon = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
         let runtime_plan = ResolvedRuntimePlan::from_env()?;

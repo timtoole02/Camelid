@@ -41,3 +41,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "camelid"
 path = "src/main.rs"
+
+[[bin]]
+name = "repack-ghost"
+path = "tools/repack_ghost.rs"

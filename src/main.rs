@@ -20,8 +20,10 @@ use camelid::{
         recv_activation_packet, recv_token_feedback, send_activation_packet, send_token_feedback,
     },
     gguf::{read_metadata, GgufTensorType},
+    ghost::GhostFile,
     inference::{
-        LlamaInferenceSession, LlamaLoadedWeights, LlamaSampler, Q8ResidencyReport, SamplingConfig,
+        LlamaInferenceSession, LlamaLayerWeights, LlamaLoadedWeights, LlamaSampler,
+        Q8ResidencyReport, SamplingConfig,
     },
     metal::detect_metal_device,
     model::{LlamaModelConfig, LlamaTensorBinding},
@@ -251,6 +253,27 @@ enum Command {
         /// Accepted for compatibility; JSON is always emitted to stdout.
         #[arg(long, default_value_t = false)]
         json: bool,
+    },
+    /// EXPERIMENTAL ghost (layer-streaming) mode: execute a model one transformer block at
+    /// a time, streaming each block's weights from a layer-contiguous `.cghost` file
+    /// (see the `repack-ghost` tool) and holding only a one-layer working window plus the
+    /// embedding/output ends in RAM. Trades throughput for a strict memory ceiling.
+    /// Synchronous v1: each layer's read blocks the forward (no prefetch yet).
+    GhostRun {
+        /// GGUF model path (metadata, tokenizer, and resident embedding/output ends).
+        model: PathBuf,
+        /// Layer-contiguous .cghost file produced by `repack-ghost` from the same model.
+        #[arg(long)]
+        cghost: PathBuf,
+        /// Prompt to execute (greedy decode).
+        #[arg(long, default_value = "Write a quick Rust hello-world function:")]
+        prompt: String,
+        /// Maximum tokens to generate.
+        #[arg(long, default_value_t = 32)]
+        max_tokens: usize,
+        /// Override Rayon worker threads.
+        #[arg(long)]
+        threads: Option<usize>,
     },
 }
 
@@ -483,7 +506,208 @@ async fn main() -> anyhow::Result<()> {
                 threads,
             )?;
         }
+        Command::GhostRun {
+            model,
+            cghost,
+            prompt,
+            max_tokens,
+            threads,
+        } => {
+            run_ghost(model, cghost, prompt, max_tokens, threads)?;
+        }
     }
+    Ok(())
+}
+
+/// Ghost mode: run every transformer layer of one chunk (prefill or a single decoded
+/// token), streaming each layer's weights from the `.cghost` file right before its forward
+/// and dropping them right after — the weight working window is exactly one layer. Returns
+/// the chunk's output hidden state plus (bytes streamed, stream time, forward time).
+#[allow(clippy::too_many_arguments)]
+fn ghost_stream_layers(
+    session: &mut LlamaInferenceSession,
+    ghost: &GhostFile,
+    placeholder: &LlamaLayerWeights,
+    buf: &mut Vec<u8>,
+    hidden: CpuTensor,
+    pos: usize,
+    seq_len: usize,
+    log_layers: bool,
+) -> anyhow::Result<(CpuTensor, u64, u128, u128)> {
+    let n_layers = session.weights.layers.len();
+    let mut hidden = hidden;
+    let mut bytes_total = 0u64;
+    let mut stream_us_total = 0u128;
+    let mut forward_us_total = 0u128;
+    for layer_idx in 0..n_layers {
+        let stream_started = Instant::now();
+        let (layer, span) = ghost.read_layer(layer_idx, buf)?;
+        Arc::make_mut(&mut session.weights).layers[layer_idx] = layer;
+        let stream_us = stream_started.elapsed().as_micros();
+        let forward_started = Instant::now();
+        hidden = session.ghost_forward_one_layer(&hidden, layer_idx, pos, seq_len)?;
+        let forward_us = forward_started.elapsed().as_micros();
+        // Drop the streamed weights immediately; only the one-layer window is ever held.
+        Arc::make_mut(&mut session.weights).layers[layer_idx] = placeholder.clone();
+        bytes_total += span;
+        stream_us_total += stream_us;
+        forward_us_total += forward_us;
+        if log_layers {
+            eprintln!(
+                "[ghost] layer {layer_idx:>3}: stream {:7.1} ms ({:6.1} MiB @ {:5.0} MB/s)  \
+                 forward {:7.1} ms",
+                stream_us as f64 / 1000.0,
+                span as f64 / (1024.0 * 1024.0),
+                span as f64 / (stream_us.max(1) as f64), // bytes/us == MB/s
+                forward_us as f64 / 1000.0,
+            );
+        }
+    }
+    session.ghost_advance_position(seq_len);
+    Ok((hidden, bytes_total, stream_us_total, forward_us_total))
+}
+
+/// EXPERIMENTAL ghost (layer-streaming) mode, synchronous v1: greedy generation with the
+/// model executed one transformer block at a time from a `.cghost` file. RAM holds the
+/// embedding/output ends + KV cache + ONE layer's weights; everything else stays on disk.
+fn run_ghost(
+    model: PathBuf,
+    cghost: PathBuf,
+    prompt: String,
+    max_tokens: usize,
+    threads: Option<usize>,
+) -> anyhow::Result<()> {
+    configure_rayon_threads(threads)?;
+    let gib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+
+    println!("[ghost] loading GGUF metadata from {:?}...", model);
+    let gguf = read_metadata(&model)?;
+    let config = camelid::model::LlamaModelConfig::from_gguf(&gguf)?;
+    let binding = camelid::model::LlamaTensorBinding::bind(&gguf, &config)?;
+    let store = TensorStore::open(&model, &gguf);
+    let tokenizer = Tokenizer::from_gguf(&gguf)?;
+
+    let ghost = GhostFile::open(&cghost)?;
+    let n_layers = config.block_count as usize;
+    anyhow::ensure!(
+        ghost.index.block_count == n_layers,
+        ".cghost block_count {} does not match model block_count {n_layers}",
+        ghost.index.block_count
+    );
+
+    // Resident ends only (embedding + output projection); every transformer layer is a
+    // placeholder that ghost_stream_layers swaps real weights into, one at a time.
+    let load_started = Instant::now();
+    let weights = LlamaLoadedWeights::load_distributed(&store, &binding, 0, 0, true, true)?;
+    let mut session = LlamaInferenceSession::new(config.clone(), Arc::new(weights))?;
+    let placeholder = session.weights.layers[0].clone();
+    let mut buf: Vec<u8> = Vec::with_capacity(ghost.max_layer_span() as usize);
+    println!(
+        "[ghost] resident ends loaded in {:.1}s; {} layers x {:.1} MiB max streaming window; \
+         footprint {:.2} GiB",
+        load_started.elapsed().as_secs_f64(),
+        n_layers,
+        ghost.max_layer_span() as f64 / (1024.0 * 1024.0),
+        gib(phys_footprint_bytes()),
+    );
+
+    let token_ids = tokenizer.encode(&prompt, true, false)?;
+    println!("[ghost] prompt tokens: {:?}", token_ids);
+    let mut pos = 0usize;
+
+    let prefill_started = Instant::now();
+    let hidden = session
+        .weights
+        .token_embedding
+        .embedding_lookup(&token_ids, "token_embedding_ghost")?;
+    let (mut hidden, bytes, stream_us, forward_us) = ghost_stream_layers(
+        &mut session,
+        &ghost,
+        &placeholder,
+        &mut buf,
+        hidden,
+        pos,
+        token_ids.len(),
+        true,
+    )?;
+    pos += token_ids.len();
+    println!(
+        "[ghost] prefill: {:.1}s ({:.2} GiB streamed @ {:.0} MB/s, forward {:.1}s); \
+         footprint {:.2} GiB",
+        prefill_started.elapsed().as_secs_f64(),
+        gib(bytes),
+        bytes as f64 / (stream_us.max(1) as f64),
+        forward_us as f64 / 1_000_000.0,
+        gib(phys_footprint_bytes()),
+    );
+
+    let mut generated: Vec<u32> = Vec::new();
+    let mut decode_us_total: u128 = 0;
+    for step in 0..max_tokens {
+        let logits = session.forward_final_norm_and_logits(&hidden)?;
+        let vocab = logits.dim(1)?;
+        let rows = logits.dim(0)?;
+        let last_row_start = (rows - 1) * vocab;
+        let last_row = CpuTensor::from_f32(
+            "ghost_last_logits",
+            vec![1, vocab],
+            logits.data[last_row_start..last_row_start + vocab].to_vec(),
+        )?;
+        let token = LlamaSampler::Greedy.sample(&last_row)?;
+        generated.push(token);
+        print!("{}", tokenizer.decode(&[token], true)?);
+        std::io::stdout().flush()?;
+        if tokenizer.special.eos == Some(token) || tokenizer.special.eot == Some(token) {
+            break;
+        }
+        if step + 1 == max_tokens {
+            break;
+        }
+        let token_started = Instant::now();
+        let embedding = session
+            .weights
+            .token_embedding
+            .embedding_lookup(&[token], "token_embedding_ghost")?;
+        let (next_hidden, bytes, stream_us, forward_us) = ghost_stream_layers(
+            &mut session,
+            &ghost,
+            &placeholder,
+            &mut buf,
+            embedding,
+            pos,
+            1,
+            false,
+        )?;
+        hidden = next_hidden;
+        pos += 1;
+        let token_us = token_started.elapsed().as_micros();
+        decode_us_total += token_us;
+        eprintln!(
+            "[ghost] token {:>3}: {:6.0} ms ({:.2} GiB streamed @ {:4.0} MB/s, forward \
+             {:5.0} ms)",
+            step + 1,
+            token_us as f64 / 1000.0,
+            gib(bytes),
+            bytes as f64 / (stream_us.max(1) as f64),
+            forward_us as f64 / 1000.0,
+        );
+    }
+    println!();
+
+    let streamed_tokens = generated.len().saturating_sub(1);
+    if streamed_tokens > 0 {
+        println!(
+            "[ghost] decode: {} tokens in {:.1}s = {:.3} tok/s",
+            streamed_tokens,
+            decode_us_total as f64 / 1_000_000.0,
+            streamed_tokens as f64 / (decode_us_total as f64 / 1_000_000.0),
+        );
+    }
+    println!(
+        "[ghost] final footprint {:.2} GiB, peak RSS {:.2} GiB",
+        gib(phys_footprint_bytes()),
+        gib(peak_rss_bytes()),
+    );
     Ok(())
 }
 

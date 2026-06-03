@@ -3225,6 +3225,51 @@ impl TensorStore {
     }
 }
 
+/// Ghost (layer-streaming) mode support: materialize a `CpuTensor` from raw GGUF tensor
+/// bytes that were already read from a `.cghost` layer group. 2-D Q8_0 linears come back as
+/// plain RAM-resident blocks (the same storage the block-backed loader produces, so the
+/// existing CPU forward path runs unchanged); float tensors decode to f32. Ghost v1 supports
+/// the tensor types dense Llama models actually ship — anything else is a loud error, never
+/// a silent fallback.
+pub fn cpu_tensor_from_gguf_bytes(
+    name: &str,
+    tensor_type: GgufTensorType,
+    dims: &[u64],
+    bytes: &[u8],
+) -> Result<CpuTensor> {
+    let shape = TensorShape::from_gguf_dims(dims)?;
+    let expected_elements = shape.element_count()?;
+    match tensor_type {
+        GgufTensorType::F32 => CpuTensor::from_f32(
+            name,
+            shape.dims.clone(),
+            decode_f32_tensor(name, bytes, expected_elements)?,
+        ),
+        GgufTensorType::F16 => CpuTensor::from_f32(
+            name,
+            shape.dims.clone(),
+            decode_f16_tensor(name, bytes, expected_elements)?,
+        ),
+        GgufTensorType::BF16 => CpuTensor::from_f32(
+            name,
+            shape.dims.clone(),
+            decode_bf16_tensor(name, bytes, expected_elements)?,
+        ),
+        GgufTensorType::Q8_0 if shape.dims.len() == 2 => {
+            let blocks = decode_q8_0_blocks(name, bytes, expected_elements)?;
+            CpuTensor::from_q8_0_blocks(name, shape, blocks)
+        }
+        GgufTensorType::Q8_0 => CpuTensor::from_f32(
+            name,
+            shape.dims.clone(),
+            decode_q8_0_tensor(name, bytes, expected_elements)?,
+        ),
+        other => Err(BackendError::UnsupportedTensorType(format!(
+            "tensor {name} has storage type {other:?}; ghost v1 supports F32, F16, BF16, Q8_0"
+        ))),
+    }
+}
+
 fn decode_f32_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
     if bytes.len() != expected_elements * 4 {
         return Err(BackendError::InvalidTensorData(format!(
