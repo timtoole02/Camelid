@@ -41,10 +41,16 @@ pub use diagnostic_config::{
 pub use kv_cache::{LlamaKvCache, LlamaKvCachePlan, LlamaKvCachePositionTrace, LlamaKvCacheTrace};
 pub use q8_block_reader::Q8BlockReader;
 use q8_runtime::{
-    q8_0_env_flag_disabled, q8_0_env_flag_enabled_default_off,
-    q8_0_env_flag_enabled_default_on_fail_closed, Q8PackedRows4MatmulSchedule, Q8RuntimeFlags,
-    ResolvedRuntimePlan,
+    q8_0_env_flag_enabled_default_off, q8_0_env_flag_enabled_default_on_fail_closed,
+    Q8PackedRows4MatmulSchedule, Q8RuntimeFlags, ResolvedRuntimePlan,
 };
+// All remaining callers are arch/OS-gated (aarch64 dotprod dispatch, Apple Accelerate), so
+// this import is unused on other targets.
+#[cfg_attr(
+    not(any(target_arch = "aarch64", target_os = "macos")),
+    allow(unused_imports)
+)]
+use q8_runtime::q8_0_env_flag_disabled;
 use q8_telemetry::*;
 pub use q8_telemetry::{
     q8_schedule_telemetry_enabled, reset_q8_schedule_telemetry, snapshot_q8_schedule_telemetry,
