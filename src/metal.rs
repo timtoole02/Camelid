@@ -1842,6 +1842,7 @@ fn write_buffer_bytes<T>(buffer: &Buffer, values: &[T]) {
 }
 
 #[cfg(target_os = "macos")]
+#[cfg(target_os = "macos")]
 fn read_buffer_f32_off(buffer: &Buffer, start_elems: usize, out: &mut [f32]) {
     unsafe {
         let ptr = (buffer.contents() as *const f32).add(start_elems);
