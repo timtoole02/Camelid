@@ -43,8 +43,10 @@ struct MetalLinearKernel {
     silu_mul_pipeline: ComputePipelineState,
     rope_rotate_pipeline: ComputePipelineState,
     attention_decode_pipeline: ComputePipelineState,
+    attention_decode_kv16_pipeline: ComputePipelineState,
     quantize_q8_0_pipeline: ComputePipelineState,
     kv_scatter_pipeline: ComputePipelineState,
+    kv_scatter_kv16_pipeline: ComputePipelineState,
     rms_norm_quantize_pipeline: ComputePipelineState,
     silu_mul_quantize_pipeline: ComputePipelineState,
     active_command_buffer: Mutex<Option<metal::CommandBuffer>>,
@@ -1069,6 +1071,63 @@ kernel void attention_decode_f32(
     }
 }
 
+// f16-KV variant of attention_decode_f32: identical math, K/V read as half and converted
+// per element (the scores/output stay f32).
+kernel void attention_decode_kv16(
+    device const float* query [[buffer(0)]],
+    device const half* keys [[buffer(1)]],
+    device const half* values [[buffer(2)]],
+    device float* scores [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& n_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& position_count [[buffer(7)]],
+    constant uint& group [[buffer(8)]],
+    constant float& scale [[buffer(9)]],
+    constant uint& position_stride [[buffer(10)]],
+    constant uint& kv_head_stride [[buffer(11)]],
+    constant uint& kv_base_offset [[buffer(12)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    if (head >= n_heads) return;
+    uint kv_head = head / group;
+    uint q_base = head * head_dim;
+    uint kv_base = kv_base_offset + kv_head * kv_head_stride;
+    uint score_base = head * position_count;
+
+    float local_max = -INFINITY;
+    for (uint p = lane; p < position_count; p += 32) {
+        uint k_base = kv_base + p * position_stride;
+        float s = 0.0;
+        for (uint d = 0; d < head_dim; ++d) {
+            s += query[q_base + d] * float(keys[k_base + d]);
+        }
+        s *= scale;
+        scores[score_base + p] = s;
+        local_max = max(local_max, s);
+    }
+    float max_score = simd_max(local_max);
+
+    float local_sum = 0.0;
+    for (uint p = lane; p < position_count; p += 32) {
+        float e = exp(scores[score_base + p] - max_score);
+        scores[score_base + p] = e;
+        local_sum += e;
+    }
+    float inv = 1.0 / simd_sum(local_sum);
+
+    threadgroup_barrier(mem_flags::mem_device);
+
+    for (uint d = lane; d < head_dim; d += 32) {
+        float acc = 0.0;
+        for (uint p = 0; p < position_count; ++p) {
+            acc += scores[score_base + p] * inv * float(values[kv_base + p * position_stride + d]);
+        }
+        output[q_base + d] = acc;
+    }
+}
+
 // Quantize an f32 activation row to Q8_0 (32-value blocks), one thread per block.
 // Mirrors quantize_q8_0_block: scale = f16(max|v|/127) stored as f32, quant =
 // round-ties-away(v / (max|v|/127)) clamped to [-127, 127]. Emits separate scale
@@ -1201,6 +1260,27 @@ kernel void kv_scatter_f32(
     cache_k[dst] = src_k[i];
     cache_v[dst] = src_v[i];
 }
+
+// f16-KV variant: the cache stores half-precision K/V (half the bytes per token read back
+// during attention, the dominant growing cost at long context).
+kernel void kv_scatter_kv16(
+    device const float* src_k [[buffer(0)]],
+    device const float* src_v [[buffer(1)]],
+    device half* cache_k [[buffer(2)]],
+    device half* cache_v [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    constant uint& max_positions [[buffer(5)]],
+    constant uint& write_position [[buffer(6)]],
+    constant uint& total [[buffer(7)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= total) return;
+    uint h = i / head_dim;
+    uint d = i % head_dim;
+    uint dst = (h * max_positions + write_position) * head_dim + d;
+    cache_k[dst] = half(src_k[i]);
+    cache_v[dst] = half(src_v[i]);
+}
 "#;
 
 #[cfg(target_os = "macos")]
@@ -1245,6 +1325,12 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let attention_decode_pipeline = device
                 .new_compute_pipeline_state_with_function(&attention_decode_function)
                 .ok()?;
+            let attention_decode_kv16_function = elementwise_library
+                .get_function("attention_decode_kv16", None)
+                .ok()?;
+            let attention_decode_kv16_pipeline = device
+                .new_compute_pipeline_state_with_function(&attention_decode_kv16_function)
+                .ok()?;
             let quantize_q8_0_function = elementwise_library
                 .get_function("quantize_q8_0_f32", None)
                 .ok()?;
@@ -1256,6 +1342,12 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 .ok()?;
             let kv_scatter_pipeline = device
                 .new_compute_pipeline_state_with_function(&kv_scatter_function)
+                .ok()?;
+            let kv_scatter_kv16_function = elementwise_library
+                .get_function("kv_scatter_kv16", None)
+                .ok()?;
+            let kv_scatter_kv16_pipeline = device
+                .new_compute_pipeline_state_with_function(&kv_scatter_kv16_function)
                 .ok()?;
             let rms_norm_quantize_function = elementwise_library
                 .get_function("rms_norm_quantize_f32", None)
@@ -1359,8 +1451,10 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 silu_mul_pipeline,
                 rope_rotate_pipeline,
                 attention_decode_pipeline,
+                attention_decode_kv16_pipeline,
                 quantize_q8_0_pipeline,
                 kv_scatter_pipeline,
+                kv_scatter_kv16_pipeline,
                 rms_norm_quantize_pipeline,
                 silu_mul_quantize_pipeline,
                 active_command_buffer: Mutex::new(None),
@@ -3039,6 +3133,18 @@ fn encode_q8_matmul_f32y(
     );
 }
 
+/// Opt-in: store the resident KV cache in f16 (half the KV bytes read per token at
+/// context; K/V are converted on write and read back to f32 inside the attention kernel).
+/// Changes numerics slightly vs the f32 cache.
+#[cfg(target_os = "macos")]
+fn kv16_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_METAL_KV16")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
 /// Experiment flag: NSG=8 wire GEMV (256 threads/TG).
 #[cfg(target_os = "macos")]
 fn wire_nsg8_enabled() -> bool {
@@ -3161,7 +3267,12 @@ fn encode_attention(
     scalar: &Buffer,
     n_heads: usize,
 ) {
-    e.set_compute_pipeline_state(&k.attention_decode_pipeline);
+    let attn_pipeline = if kv16_enabled() {
+        &k.attention_decode_kv16_pipeline
+    } else {
+        &k.attention_decode_pipeline
+    };
+    e.set_compute_pipeline_state(attn_pipeline);
     e.set_buffer(0, Some(query), 0);
     e.set_buffer(1, Some(keys), 0);
     e.set_buffer(2, Some(values), 0);
@@ -3527,7 +3638,12 @@ fn encode_attention_block(
         *p.add(2) = write_position as u32;
         *p.add(3) = kv_dim as u32;
     }
-    e.set_compute_pipeline_state(&k.kv_scatter_pipeline);
+    let scatter_pipeline = if kv16_enabled() {
+        &k.kv_scatter_kv16_pipeline
+    } else {
+        &k.kv_scatter_pipeline
+    };
+    e.set_compute_pipeline_state(scatter_pipeline);
     e.set_buffer(0, Some(&key_buf), 0);
     e.set_buffer(1, Some(&val_buf), 0);
     e.set_buffer(2, Some(cache_k_buf), 0);
@@ -3536,7 +3652,7 @@ fn encode_attention_block(
     e.set_buffer(5, Some(&scatter_scalar), 4);
     e.set_buffer(6, Some(&scatter_scalar), 8);
     e.set_buffer(7, Some(&scatter_scalar), 12);
-    dispatch_1d(e, &k.kv_scatter_pipeline, kv_dim);
+    dispatch_1d(e, scatter_pipeline, kv_dim);
     encode_attention(
         e,
         k,
@@ -4180,6 +4296,8 @@ pub struct ResidentDecodeState {
     /// Gates pre-committed token graphs; monotonically increasing values.
     gate_event: metal::SharedEvent,
     event_counter: u64,
+    /// KV cache element width: f16 when CAMELID_METAL_KV16 is set, else f32.
+    kv16: bool,
 }
 
 /// A fully-encoded, uncommitted per-token command buffer. The input embedding is written
@@ -4238,9 +4356,17 @@ impl ResidentDecodeState {
             k.device
                 .new_buffer((n * 4) as u64, MTLResourceOptions::StorageModeShared)
         };
+        let kv16 = kv16_enabled();
+        let kv_elem = if kv16 { 2 } else { 4 };
         let kv_slots = n_kv_heads * max_positions * head_dim;
-        let cache_k = (0..n_layers).map(|_| nb(kv_slots)).collect();
-        let cache_v = (0..n_layers).map(|_| nb(kv_slots)).collect();
+        let kvb = |slots: usize| {
+            k.device.new_buffer(
+                (slots * kv_elem) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        };
+        let cache_k = (0..n_layers).map(|_| kvb(kv_slots)).collect();
+        let cache_v = (0..n_layers).map(|_| kvb(kv_slots)).collect();
         Some(Self {
             n_layers,
             n_heads,
@@ -4261,6 +4387,7 @@ impl ResidentDecodeState {
             pending: None,
             gate_event: k.device.new_shared_event(),
             event_counter: 0,
+            kv16,
         })
     }
 
@@ -4280,27 +4407,32 @@ impl ResidentDecodeState {
             Some(k) => k,
             None => return false,
         };
+        let kv_elem = if self.kv16 { 2 } else { 4 };
         let kv_slots = self.n_kv_heads * new_max * self.head_dim;
         let new_k: Vec<Buffer> = (0..self.n_layers)
             .map(|_| {
-                k.device
-                    .new_buffer((kv_slots * 4) as u64, MTLResourceOptions::StorageModeShared)
+                k.device.new_buffer(
+                    (kv_slots * kv_elem) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
             })
             .collect();
         let new_v: Vec<Buffer> = (0..self.n_layers)
             .map(|_| {
-                k.device
-                    .new_buffer((kv_slots * 4) as u64, MTLResourceOptions::StorageModeShared)
+                k.device.new_buffer(
+                    (kv_slots * kv_elem) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
             })
             .collect();
         if self.filled > 0 {
-            let run = (self.filled * self.head_dim * 4) as u64;
+            let run = (self.filled * self.head_dim * kv_elem) as u64;
             let cb = k.queue.new_command_buffer();
             let blit = cb.new_blit_command_encoder();
             for layer in 0..self.n_layers {
                 for h in 0..self.n_kv_heads {
-                    let src = (h * self.max_positions * self.head_dim * 4) as u64;
-                    let dst = (h * new_max * self.head_dim * 4) as u64;
+                    let src = (h * self.max_positions * self.head_dim * kv_elem) as u64;
+                    let dst = (h * new_max * self.head_dim * kv_elem) as u64;
                     blit.copy_from_buffer(&self.cache_k[layer], src, &new_k[layer], dst, run);
                     blit.copy_from_buffer(&self.cache_v[layer], src, &new_v[layer], dst, run);
                 }
@@ -4682,6 +4814,7 @@ impl ResidentDecodeState {
             self.max_positions,
             self.head_dim,
             seed_positions,
+            self.kv16,
         );
         Self::seed_into(
             &self.cache_v[layer],
@@ -4690,6 +4823,7 @@ impl ResidentDecodeState {
             self.max_positions,
             self.head_dim,
             seed_positions,
+            self.kv16,
         );
         true
     }
@@ -4703,16 +4837,28 @@ impl ResidentDecodeState {
         max_positions: usize,
         head_dim: usize,
         seed_positions: usize,
+        kv16: bool,
     ) {
         let run = seed_positions * head_dim;
-        // SAFETY: shared-storage buffer of n_kv_heads*max_positions*head_dim f32; each head's
-        // `run` floats land at a disjoint slot well within that capacity.
+        // SAFETY: shared-storage buffer of n_kv_heads*max_positions*head_dim elements (f32 or
+        // f16); each head's `run` values land at a disjoint slot well within that capacity.
         unsafe {
-            let dst = buf.contents() as *mut f32;
-            for h in 0..n_kv_heads {
-                let s = h * seed_positions * head_dim;
-                let d = h * max_positions * head_dim;
-                std::ptr::copy_nonoverlapping(src[s..s + run].as_ptr(), dst.add(d), run);
+            if kv16 {
+                let dst = buf.contents() as *mut u16;
+                for h in 0..n_kv_heads {
+                    let s = h * seed_positions * head_dim;
+                    let d = h * max_positions * head_dim;
+                    for i in 0..run {
+                        *dst.add(d + i) = f32_to_f16_bits(src[s + i]);
+                    }
+                }
+            } else {
+                let dst = buf.contents() as *mut f32;
+                for h in 0..n_kv_heads {
+                    let s = h * seed_positions * head_dim;
+                    let d = h * max_positions * head_dim;
+                    std::ptr::copy_nonoverlapping(src[s..s + run].as_ptr(), dst.add(d), run);
+                }
             }
         }
     }
