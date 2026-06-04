@@ -1850,6 +1850,7 @@ fn read_buffer_f32_off(buffer: &Buffer, start_elems: usize, out: &mut [f32]) {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn read_buffer_f32(buffer: &Buffer, out: &mut [f32]) {
     let len = std::mem::size_of_val(out);
     unsafe {
@@ -3666,6 +3667,7 @@ fn encode_rope_off(
     dispatch_1d(e, &k.rope_rotate_pipeline, head_count * half_rope);
 }
 
+#[cfg(target_os = "macos")]
 fn encode_binary(
     e: &metal::ComputeCommandEncoderRef,
     pipeline: &ComputePipelineState,
@@ -5726,6 +5728,19 @@ impl ResidentDecodeState {
         _scale: f32,
         _logits_stage: Option<LogitsStage>,
         _next_rope: Option<(&[f32], &[f32])>,
+    ) -> Option<Vec<f32>> {
+        None
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_tokens(
+        &mut self,
+        _embeddings: &[f32],
+        _n_tokens: usize,
+        _layers: &[ResidentLayerWeights],
+        _cos_all: &[f32],
+        _sin_all: &[f32],
+        _scale: f32,
     ) -> Option<Vec<f32>> {
         None
     }
