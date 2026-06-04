@@ -57,7 +57,6 @@ struct MetalLinearKernel {
     silu_mul_f16o_pipeline: ComputePipelineState,
     rope_rotate_batch_pipeline: ComputePipelineState,
     kv_scatter_batch_pipeline: ComputePipelineState,
-    attention_prefill_v2_pipeline: ComputePipelineState,
     attention_prefill_v3_pipeline: ComputePipelineState,
     attention_prefill_flash_pipeline: ComputePipelineState,
     half_mm_batched_pipeline: ComputePipelineState,
@@ -2650,12 +2649,6 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let kv_scatter_batch_pipeline = device
                 .new_compute_pipeline_state_with_function(&kv_scatter_batch_function)
                 .ok()?;
-            let attention_prefill_v2_function = elementwise_library
-                .get_function("attention_prefill_v2_f32", None)
-                .ok()?;
-            let attention_prefill_v2_pipeline = device
-                .new_compute_pipeline_state_with_function(&attention_prefill_v2_function)
-                .ok()?;
             let attention_prefill_v3_function = elementwise_library
                 .get_function("attention_prefill_v3_f32", None)
                 .ok()?;
@@ -2769,9 +2762,8 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                     &q8_0_block_ksplit_f32y_wire_gemm_function,
                 )
                 .ok()?;
-            let q8_0_block_wire_mm_function = library
-                .get_function("q8_0_block_wire_mm", None)
-                .ok()?;
+            let q8_0_block_wire_mm_function =
+                library.get_function("q8_0_block_wire_mm", None).ok()?;
             let q8_0_block_wire_mm_pipeline = device
                 .new_compute_pipeline_state_with_function(&q8_0_block_wire_mm_function)
                 .ok()?;
@@ -2810,7 +2802,6 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 silu_mul_f16o_pipeline,
                 rope_rotate_batch_pipeline,
                 kv_scatter_batch_pipeline,
-                attention_prefill_v2_pipeline,
                 attention_prefill_v3_pipeline,
                 attention_prefill_flash_pipeline,
                 half_mm_batched_pipeline,
@@ -4462,8 +4453,7 @@ fn wire_weights_enabled() -> bool {
 fn mm_prefill_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("CAMELID_METAL_MM")
-            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        std::env::var("CAMELID_METAL_MM").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
     })
 }
 
@@ -6461,8 +6451,16 @@ impl ResidentDecodeState {
             }
         }
         let q_h = nb(if use_attn_mm { n_pad * q_dim * 2 } else { 2 });
-        let s_big = nb(if use_attn_mm { self.n_heads * n_pad * n_pad * 4 } else { 4 });
-        let p_big = nb(if use_attn_mm { self.n_heads * n_pad * n_pad * 2 } else { 2 });
+        let s_big = nb(if use_attn_mm {
+            self.n_heads * n_pad * n_pad * 4
+        } else {
+            4
+        });
+        let p_big = nb(if use_attn_mm {
+            self.n_heads * n_pad * n_pad * 2
+        } else {
+            2
+        });
         let attn_mm_scalar = nb(48);
         unsafe {
             let p = attn_mm_scalar.contents() as *mut u32;
@@ -6813,43 +6811,43 @@ impl ResidentDecodeState {
                 e.set_compute_pipeline_state(&k.attention_prefill_v3_pipeline);
             }
             if !use_attn_mm {
-            e.set_buffer(0, Some(&q_buf), 0);
-            e.set_buffer(1, Some(&self.cache_k[i]), 0);
-            e.set_buffer(2, Some(&self.cache_v[i]), 0);
-            e.set_buffer(4, Some(&ctx_buf), 0);
-            for j in 0..8u64 {
-                e.set_buffer(5 + j, Some(&attn_scalar), j * 4);
-            }
-            if use_flash_attn {
-                // Q + K/V half tiles (32 x head_dim each) | S 32x32 f32 | P 32x32 half
-                // | 4 x 8x8 half diag | 32 f32 inv-l.
-                e.set_threadgroup_memory_length(0, (128 * self.head_dim + 6784) as u64);
-                e.dispatch_thread_groups(
-                    metal::MTLSize {
-                        width: self.n_heads as u64,
-                        height: (n_tokens as u64).div_ceil(32),
-                        depth: 1,
-                    },
-                    metal::MTLSize {
-                        width: 128,
-                        height: 1,
-                        depth: 1,
-                    },
-                );
-            } else {
-                e.dispatch_thread_groups(
-                    metal::MTLSize {
-                        width: self.n_heads as u64,
-                        height: (n_tokens as u64).div_ceil(4),
-                        depth: 1,
-                    },
-                    metal::MTLSize {
-                        width: 128,
-                        height: 1,
-                        depth: 1,
-                    },
-                );
-            }
+                e.set_buffer(0, Some(&q_buf), 0);
+                e.set_buffer(1, Some(&self.cache_k[i]), 0);
+                e.set_buffer(2, Some(&self.cache_v[i]), 0);
+                e.set_buffer(4, Some(&ctx_buf), 0);
+                for j in 0..8u64 {
+                    e.set_buffer(5 + j, Some(&attn_scalar), j * 4);
+                }
+                if use_flash_attn {
+                    // Q + K/V half tiles (32 x head_dim each) | S 32x32 f32 | P 32x32 half
+                    // | 4 x 8x8 half diag | 32 f32 inv-l.
+                    e.set_threadgroup_memory_length(0, (128 * self.head_dim + 6784) as u64);
+                    e.dispatch_thread_groups(
+                        metal::MTLSize {
+                            width: self.n_heads as u64,
+                            height: (n_tokens as u64).div_ceil(32),
+                            depth: 1,
+                        },
+                        metal::MTLSize {
+                            width: 128,
+                            height: 1,
+                            depth: 1,
+                        },
+                    );
+                } else {
+                    e.dispatch_thread_groups(
+                        metal::MTLSize {
+                            width: self.n_heads as u64,
+                            height: (n_tokens as u64).div_ceil(4),
+                            depth: 1,
+                        },
+                        metal::MTLSize {
+                            width: 128,
+                            height: 1,
+                            depth: 1,
+                        },
+                    );
+                }
             }
             let o_y: &Buffer = if use_mm {
                 convert(&e, &ctx_buf, &ctx_h, &n_elems, 8, n_tokens * q_dim);
@@ -6941,11 +6939,7 @@ impl ResidentDecodeState {
                     n_tokens * self.ffn_dim,
                 );
             }
-            let down_y: &Buffer = if use_mm {
-                &silu_h
-            } else {
-                &silu_buf
-            };
+            let down_y: &Buffer = if use_mm { &silu_h } else { &silu_buf };
             gemm(
                 &e,
                 down_y,
@@ -6968,7 +6962,7 @@ impl ResidentDecodeState {
                 0,
                 n_tokens * self.hidden,
             );
-stage!("9:resid+silu");
+            stage!("9:resid+silu");
             // Attention residual wrote cur -> nxt; FFN residual wrote nxt -> cur, so this
             // layer's output is back in `cur` for the next layer.
         }
@@ -6977,7 +6971,10 @@ stage!("9:resid+silu");
         cb.wait_until_completed();
         if trace {
             let total: u128 = stage_us.values().sum();
-            eprintln!("[prefill-trace] n_tokens={n_tokens} total_gpu_busy={}ms", total / 1000);
+            eprintln!(
+                "[prefill-trace] n_tokens={n_tokens} total_gpu_busy={}ms",
+                total / 1000
+            );
             for (label, us) in &stage_us {
                 eprintln!("[prefill-trace]   {label}: {}ms", us / 1000);
             }
@@ -9103,8 +9100,16 @@ kernel void mma_probe(
             e.set_buffer(1, Some(&iters_buf), 0);
             e.set_threadgroup_memory_length(0, 3072 * 2);
             e.dispatch_thread_groups(
-                metal::MTLSize { width: tgs, height: 1, depth: 1 },
-                metal::MTLSize { width: 128, height: 1, depth: 1 },
+                metal::MTLSize {
+                    width: tgs,
+                    height: 1,
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 128,
+                    height: 1,
+                    depth: 1,
+                },
             );
             e.end_encoding();
             cb.commit();
@@ -9563,15 +9568,23 @@ kernel void half_mm_batched(
         let p = device.new_compute_pipeline_state_with_function(&f).unwrap();
 
         let heads: usize = 24;
-        let n: usize = 601;
         let n_pad: usize = 640;
         let hd: usize = 128;
         // S shape: rows = positions(n_pad), cols = queries(n_pad), k = 128
         // PV shape: rows = head_dim(128), cols = queries(n_pad), k = n_pad
         let big = heads * n_pad * hd.max(n_pad);
-        let a_buf = device.new_buffer((heads * n_pad * n_pad.max(hd) * 2) as u64, MTLResourceOptions::StorageModeShared);
-        let b_buf = device.new_buffer((heads * n_pad * n_pad.max(hd) * 2) as u64, MTLResourceOptions::StorageModeShared);
-        let c_buf = device.new_buffer((heads * n_pad * n_pad * 4) as u64, MTLResourceOptions::StorageModeShared);
+        let a_buf = device.new_buffer(
+            (heads * n_pad * n_pad.max(hd) * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let b_buf = device.new_buffer(
+            (heads * n_pad * n_pad.max(hd) * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let c_buf = device.new_buffer(
+            (heads * n_pad * n_pad * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
         let _ = big;
         let scalar = device.new_buffer(44, MTLResourceOptions::StorageModeShared);
         let run = |label: &str, kdim: usize, rows: usize, cols: usize, a_rs: usize, b_rs: usize| {
@@ -9602,7 +9615,11 @@ kernel void half_mm_batched(
                         height: (cols as u64).div_ceil(64),
                         depth: heads as u64,
                     },
-                    metal::MTLSize { width: 128, height: 1, depth: 1 },
+                    metal::MTLSize {
+                        width: 128,
+                        height: 1,
+                        depth: 1,
+                    },
                 );
                 e.end_encoding();
                 cb.commit();
@@ -9767,10 +9784,8 @@ mod attn_mm_parity {
             *p.add(1) = n as u32;
             *(p.add(2) as *mut f32) = scale;
         }
-        let ctx_buf = device.new_buffer(
-            (n * qdim * 4) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let ctx_buf =
+            device.new_buffer((n * qdim * 4) as u64, MTLResourceOptions::StorageModeShared);
         let pv_scalar = device.new_buffer(64, MTLResourceOptions::StorageModeShared);
         unsafe {
             let p = pv_scalar.contents() as *mut u32;
@@ -9808,7 +9823,11 @@ mod attn_mm_parity {
                 height: (n_pad as u64).div_ceil(8),
                 depth: 1,
             },
-            metal::MTLSize { width: 256, height: 1, depth: 1 },
+            metal::MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
         );
         e.set_compute_pipeline_state(&k_ref.half_mm_batched_pipeline);
         e.set_buffer(0, Some(&v_buf), 0);
@@ -9824,15 +9843,17 @@ mod attn_mm_parity {
                 height: (n as u64).div_ceil(64),
                 depth: heads as u64,
             },
-            metal::MTLSize { width: 128, height: 1, depth: 1 },
+            metal::MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            },
         );
         e.end_encoding();
         cb.commit();
         cb.wait_until_completed();
 
-        let ctx = unsafe {
-            std::slice::from_raw_parts(ctx_buf.contents() as *const f32, n * qdim)
-        };
+        let ctx = unsafe { std::slice::from_raw_parts(ctx_buf.contents() as *const f32, n * qdim) };
         let mut max_err2 = 0f32;
         let mut worst2 = (0, 0, 0, 0f32, 0f32);
         for z in 0..heads {
