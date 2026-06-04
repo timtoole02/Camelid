@@ -57,6 +57,7 @@ struct MetalLinearKernel {
     kv_scatter_batch_pipeline: ComputePipelineState,
     attention_prefill_v2_pipeline: ComputePipelineState,
     attention_prefill_v3_pipeline: ComputePipelineState,
+    attention_prefill_flash_pipeline: ComputePipelineState,
     rms_norm_quantize_pipeline: ComputePipelineState,
     silu_mul_quantize_pipeline: ComputePipelineState,
     active_command_buffer: Mutex<Option<metal::CommandBuffer>>,
@@ -1811,6 +1812,276 @@ kernel void kv_scatter_batch_f32(
     cache_v[dst] = src_v[src];
 }
 
+// Flash-tiled causal prefill attention: threadgroup (q_head, 32-query tile), simdgroup
+// matrices for BOTH score and value matmuls. The query-tiled scalar kernel above still
+// re-reads K/V once per 4-query group (~30GB on a 600-token prompt = the dominant
+// prefill attention cost); here each K/V tile stages ONCE per 32-query tile (~4GB) and
+// the dot products ride the MMA pipeline. Each simdgroup owns 8 queries across the
+// whole 32-position tile, so the online-softmax state (m/l) is simdgroup-private —
+// no cross-simdgroup merge. Accumulator rescaling uses a diagonal-matrix multiply
+// (simdgroup fragments cannot be scaled per-row directly). K and V share one staging
+// region (K is consumed by the score matmul before V stages into the same bytes).
+// Not byte-exact with the per-query kernel (tile MMA + tile-at-a-time softmax order);
+// numerically equivalent — gated with the same CAMELID_METAL_MM stack and verified by
+// greedy-token parity. Requires head_dim % 8 == 0 and head_dim <= 128.
+//
+// Threadgroup memory (8*head_dim*2*2 + 32*32*4 + 4*64*2 + 64*4 bytes; 21KB at
+// head_dim=128): Q 32 x head_dim half | K/V 32 x head_dim half (shared) | S 32x32 f32
+// (low half doubles as P 32x32 half) | 4 x 8x8 half diag | 32 f32 inv-l scratch.
+kernel void attention_prefill_flash_f32(
+    device const float* query [[buffer(0)]],
+    device const float* keys [[buffer(1)]],
+    device const float* values [[buffer(2)]],
+    device float* output [[buffer(4)]],
+    constant uint& n_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& group [[buffer(7)]],
+    constant float& scale [[buffer(8)]],
+    constant uint& position_stride [[buffer(9)]],
+    constant uint& kv_head_stride [[buffer(10)]],
+    constant uint& kv_base_offset [[buffer(11)]],
+    constant uint& n_tokens [[buffer(12)]],
+    threadgroup half* shmem [[threadgroup(0)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint QT = 32;     // queries per threadgroup
+    constexpr uint PT = 32;     // kv positions per tile
+    constexpr uint MAX_DOCT = 16; // head_dim <= 128 -> at most 16 d-octets
+    const uint tid = sg * 32 + lane;
+    const uint head = tg.x;
+    if (head >= n_heads) return;
+    const uint tq0 = tg.y * QT;
+    if (tq0 >= n_tokens) return;
+    const uint d_oct = head_dim / 8;
+    const uint q_stride = n_heads * head_dim;
+    const uint kv_base = kv_base_offset + (head / group) * kv_head_stride;
+
+    // Shmem layout (half units).
+    threadgroup half* q_s = shmem;                      // QT x head_dim, q-major 8x8 blocks
+    threadgroup half* kv_s = shmem + QT * head_dim;     // PT x head_dim, shared K/V tile
+    threadgroup float* s_s =
+        reinterpret_cast<threadgroup float*>(shmem + 2 * QT * head_dim); // QT x PT scores
+    threadgroup half* p_s = shmem + 2 * QT * head_dim + QT * PT * 2; // QT x PT half
+    threadgroup half* diag_s = p_s + QT * PT; // 4 x 64
+    threadgroup float* linv_s =
+        reinterpret_cast<threadgroup float*>(diag_s + 4 * 64); // QT inv-l values
+
+    // Stage Q once: B-style q-major 8x8 blocks (block(sx=d-octet, sy=q-octet); row of
+    // a block = one query's 8 contiguous d). Pre-scaled. Thread = (q, 32-d segment).
+    {
+        const uint q = tid / 4;
+        const uint dseg = (tid % 4) * 32;
+        const uint qq = tq0 + q;
+        const uint sy = q / 8;
+        const uint ly = q % 8;
+        for (uint d = dseg; d < min(dseg + 32u, head_dim); d += 8) {
+            const uint sx = d / 8;
+            threadgroup half* dst = q_s + 64 * (4 * sx + sy) + 8 * ly;
+            if (qq < n_tokens) {
+                device const float* src = query + qq * q_stride + head * head_dim + d;
+                for (uint i = 0; i < 8; ++i) {
+                    dst[i] = half(src[i] * scale);
+                }
+            } else {
+                for (uint i = 0; i < 8; ++i) {
+                    dst[i] = half(0.0f);
+                }
+            }
+        }
+    }
+
+    // Per-simdgroup flash state: this sg owns queries [tq0 + sg*8, +8).
+    float m_state = -INFINITY; // lane l < 8 carries row l's m/l
+    float l_state = 0.0f;
+    simdgroup_float8x8 o_acc[MAX_DOCT];
+    for (uint i = 0; i < d_oct; ++i) {
+        o_acc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    const uint p_end = min(tq0 + QT, n_tokens); // last query of the tile is causal limit
+    for (uint kp0 = 0; kp0 < p_end; kp0 += PT) {
+        // Stage K tile transposed (d-major 8x8 blocks: block(sx=d-octet, sy=p-octet),
+        // in-block [d%8][p%8]) for the score MMA. Thread = (p, 32-d segment).
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            const uint p = tid / 4;
+            const uint dseg = (tid % 4) * 32;
+            const uint pp = kp0 + p;
+            const uint sy = p / 8;
+            const uint lx = p % 8;
+            if (pp < n_tokens) {
+                device const float* src = keys + kv_base + pp * position_stride + dseg;
+                for (uint i = 0; i < min(32u, head_dim - dseg); ++i) {
+                    const uint d = dseg + i;
+                    kv_s[64 * (4 * (d / 8) + sy) + 8 * (d % 8) + lx] = half(src[i]);
+                }
+            } else {
+                for (uint i = 0; i < min(32u, head_dim - dseg); ++i) {
+                    const uint d = dseg + i;
+                    kv_s[64 * (4 * (d / 8) + sy) + 8 * (d % 8) + lx] = half(0.0f);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // S = Q K^T for this sg's 8 queries x 32 positions: 4 p-octet fragments.
+        {
+            simdgroup_float8x8 s_frag[4];
+            for (uint j = 0; j < 4; ++j) {
+                s_frag[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            }
+            for (uint dx = 0; dx < d_oct; ++dx) {
+                simdgroup_half8x8 qf;
+                simdgroup_load(qf, q_s + 64 * (4 * dx + sg), 8, 0, false);
+                for (uint j = 0; j < 4; ++j) {
+                    simdgroup_half8x8 kf;
+                    simdgroup_load(kf, kv_s + 64 * (4 * dx + j), 8, 0, false);
+                    simdgroup_multiply_accumulate(s_frag[j], qf, kf, s_frag[j]);
+                }
+            }
+            for (uint j = 0; j < 4; ++j) {
+                simdgroup_store(s_frag[j], s_s + (sg * 8) * PT + j * 8, PT, 0, false);
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Online softmax for this sg's 8 rows (lane l < 8 owns row l): causal mask,
+        // running max/sum, P = exp(S - m_new) written back as half, diag(corr) built.
+        float corr = 1.0f;
+        if (lane < 8) {
+            const uint q_global = tq0 + sg * 8 + lane;
+            threadgroup float* row = s_s + (sg * 8 + lane) * PT;
+            float m_new = m_state;
+            for (uint j = 0; j < PT; ++j) {
+                const uint p = kp0 + j;
+                const float s = (p <= q_global && p < n_tokens) ? row[j] : -INFINITY;
+                row[j] = s;
+                m_new = max(m_new, s);
+            }
+            corr = (m_state == -INFINITY) ? 1.0f : exp(m_state - m_new);
+            float l_add = 0.0f;
+            threadgroup half* prow = p_s + (sg * 8 + lane) * PT;
+            for (uint j = 0; j < PT; ++j) {
+                const float w = (row[j] == -INFINITY) ? 0.0f : exp(row[j] - m_new);
+                prow[j] = half(w);
+                l_add += w;
+            }
+            l_state = l_state * corr + l_add;
+            m_state = m_new;
+            diag_s[sg * 64 + lane * 8 + lane] = half(corr);
+        }
+        // Zero the off-diagonal entries once per tile (8x8 minus diagonal).
+        if (lane >= 8 && lane < 16) {
+            const uint r = lane - 8;
+            for (uint c2 = 0; c2 < 8; ++c2) {
+                if (c2 != r) {
+                    diag_s[sg * 64 + r * 8 + c2] = half(0.0f);
+                }
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Rescale O by diag(corr).
+        {
+            simdgroup_half8x8 dg;
+            simdgroup_load(dg, diag_s + sg * 64, 8, 0, false);
+            for (uint i = 0; i < d_oct; ++i) {
+                simdgroup_float8x8 tmp;
+                simdgroup_multiply(tmp, dg, o_acc[i]);
+                o_acc[i] = tmp;
+            }
+        }
+
+        // Stage V into the SAME region as K (scores already consumed K): natural-order
+        // 8x8 blocks (block(sx=p-octet, sy=d-octet), in-block [p%8][d%8]) so the PV
+        // MMA's right operand loads contiguously. Thread = (p, 32-d segment).
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            const uint p = tid / 4;
+            const uint dseg = (tid % 4) * 32;
+            const uint pp = kp0 + p;
+            const uint sx = p / 8;
+            const uint ly = p % 8;
+            for (uint d = dseg; d < min(dseg + 32u, head_dim); d += 8) {
+                threadgroup half* dst = kv_s + 64 * (sx * d_oct + d / 8) + 8 * ly;
+                if (pp < n_tokens) {
+                    device const float* src = values + kv_base + pp * position_stride + d;
+                    for (uint i = 0; i < 8; ++i) {
+                        dst[i] = half(src[i]);
+                    }
+                } else {
+                    for (uint i = 0; i < 8; ++i) {
+                        dst[i] = half(0.0f);
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // O += P V for this sg's 8 queries: P fragments along 4 p-octets.
+        for (uint px = 0; px < 4; ++px) {
+            simdgroup_half8x8 pf;
+            simdgroup_load(pf, p_s + (sg * 8) * PT + px * 8, PT, 0, false);
+            for (uint i = 0; i < d_oct; ++i) {
+                simdgroup_half8x8 vf;
+                simdgroup_load(vf, kv_s + 64 * (px * d_oct + i), 8, 0, false);
+                simdgroup_multiply_accumulate(o_acc[i], pf, vf, o_acc[i]);
+            }
+        }
+    }
+
+    // Final 1/l scaling via the diagonal trick, then store this sg's 8 query rows.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane < 8) {
+        const float inv = (l_state > 0.0f) ? (1.0f / l_state) : 0.0f;
+        diag_s[sg * 64 + lane * 8 + lane] = half(1.0f);
+        linv_s[sg * 8 + lane] = inv;
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    // half cannot represent tiny inv-l accurately enough for long rows; scale via a
+    // f32 diagonal staged through the score region instead.
+    {
+        threadgroup float* fdiag = s_s + sg * 64;
+        for (uint e2 = lane; e2 < 64; e2 += 32) {
+            const uint r = e2 / 8;
+            const uint c2 = e2 % 8;
+            fdiag[e2] = (r == c2) ? linv_s[sg * 8 + r] : 0.0f;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 dg;
+        simdgroup_load(dg, fdiag, 8, 0, false);
+        for (uint i = 0; i < d_oct; ++i) {
+            simdgroup_float8x8 tmp;
+            simdgroup_multiply(tmp, dg, o_acc[i]);
+            o_acc[i] = tmp;
+        }
+    }
+    const uint q_base = tq0 + sg * 8;
+    if (q_base + 8 <= n_tokens) {
+        device float* out = output + q_base * q_stride + head * head_dim;
+        for (uint i = 0; i < d_oct; ++i) {
+            simdgroup_store(o_acc[i], out + i * 8, q_stride, 0, false);
+        }
+    } else if (q_base < n_tokens) {
+        // Ragged tail: stage each fragment through the score region, write guarded.
+        for (uint i = 0; i < d_oct; ++i) {
+            simdgroup_store(o_acc[i], s_s + sg * 64, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint e2 = lane; e2 < 64; e2 += 32) {
+                const uint r = e2 / 8;
+                const uint c2 = e2 % 8;
+                if (q_base + r < n_tokens) {
+                    output[(q_base + r) * q_stride + head * head_dim + i * 8 + c2] =
+                        s_s[sg * 64 + r * 8 + c2];
+                }
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
 // Query-TILED causal prefill attention: threadgroup (head, 8-query tile). The dominant
 // prefill attention cost is K/V traffic — one threadgroup per query re-reads every K/V
 // row, Sum(t) over 600 queries x 24 heads ~ 100+ GB. Here each K/V row is loaded ONCE
@@ -2135,6 +2406,12 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let attention_prefill_v3_pipeline = device
                 .new_compute_pipeline_state_with_function(&attention_prefill_v3_function)
                 .ok()?;
+            let attention_prefill_flash_function = elementwise_library
+                .get_function("attention_prefill_flash_f32", None)
+                .ok()?;
+            let attention_prefill_flash_pipeline = device
+                .new_compute_pipeline_state_with_function(&attention_prefill_flash_function)
+                .ok()?;
             let rms_norm_quantize_function = elementwise_library
                 .get_function("rms_norm_quantize_f32", None)
                 .ok()?;
@@ -2265,6 +2542,7 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 kv_scatter_batch_pipeline,
                 attention_prefill_v2_pipeline,
                 attention_prefill_v3_pipeline,
+                attention_prefill_flash_pipeline,
                 rms_norm_quantize_pipeline,
                 silu_mul_quantize_pipeline,
                 active_command_buffer: Mutex::new(None),
@@ -6078,7 +6356,14 @@ impl ResidentDecodeState {
             }
             dispatch_rows(&e, &k.kv_scatter_batch_pipeline, kv_dim, n_tokens);
             stage!("3:rope+scatter");
-            e.set_compute_pipeline_state(&k.attention_prefill_v3_pipeline);
+            let use_flash_attn = use_mm && self.head_dim.is_multiple_of(8) && self.head_dim <= 128;
+            if use_flash_attn {
+                // Flash-tiled attention: K/V tiles stage once per 32-query tile and the
+                // score/value matmuls ride the simdgroup matrix units.
+                e.set_compute_pipeline_state(&k.attention_prefill_flash_pipeline);
+            } else {
+                e.set_compute_pipeline_state(&k.attention_prefill_v3_pipeline);
+            }
             e.set_buffer(0, Some(&q_buf), 0);
             e.set_buffer(1, Some(&self.cache_k[i]), 0);
             e.set_buffer(2, Some(&self.cache_v[i]), 0);
@@ -6086,18 +6371,36 @@ impl ResidentDecodeState {
             for j in 0..8u64 {
                 e.set_buffer(5 + j, Some(&attn_scalar), j * 4);
             }
-            e.dispatch_thread_groups(
-                metal::MTLSize {
-                    width: self.n_heads as u64,
-                    height: (n_tokens as u64).div_ceil(4),
-                    depth: 1,
-                },
-                metal::MTLSize {
-                    width: 128,
-                    height: 1,
-                    depth: 1,
-                },
-            );
+            if use_flash_attn {
+                // Q + K/V half tiles (32 x head_dim each) | S 32x32 f32 | P 32x32 half
+                // | 4 x 8x8 half diag | 32 f32 inv-l.
+                e.set_threadgroup_memory_length(0, (128 * self.head_dim + 6784) as u64);
+                e.dispatch_thread_groups(
+                    metal::MTLSize {
+                        width: self.n_heads as u64,
+                        height: (n_tokens as u64).div_ceil(32),
+                        depth: 1,
+                    },
+                    metal::MTLSize {
+                        width: 128,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            } else {
+                e.dispatch_thread_groups(
+                    metal::MTLSize {
+                        width: self.n_heads as u64,
+                        height: (n_tokens as u64).div_ceil(4),
+                        depth: 1,
+                    },
+                    metal::MTLSize {
+                        width: 128,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            }
             let o_y: &Buffer = if use_mm {
                 convert(&e, &ctx_buf, &ctx_h, &n_elems, 8, n_tokens * q_dim);
                 &ctx_h
