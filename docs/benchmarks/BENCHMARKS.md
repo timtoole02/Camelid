@@ -1,6 +1,6 @@
 # Camelid Benchmarks
 
-Last updated: 2026-05-14
+Last updated: 2026-06-04
 
 This file is Camelid's public performance snapshot.
 
@@ -22,6 +22,33 @@ For cross-surface wording discipline, see [`docs/WAR_ROOM_EVIDENCE_INDEX.md`](..
 - **Parity first.** Camelid treats 1:1 token parity with llama.cpp as the prerequisite for performance claims, not a substitute for them.
 
 ## Benchmark snapshot: current committed numbers
+
+### Apple Silicon same-host throughput: Camelid vs llama.cpp vs MLX-LM
+
+These results come from `qa/evidence-bundles/apple-silicon-m4-3b-q8-throughput-camelid-llamacpp-mlx-20260604T154728Z-head-b131f1a/manifest.json`.
+
+Method summary:
+
+- host: one Apple M4 (10-core GPU, 16GB unified memory), warm
+- exact row: Llama 3.2 3B Instruct Q8_0 (GGUF for Camelid and llama.cpp; `mlx-community` 8-bit weights for MLX-LM)
+- workload: 601-token prompt, greedy sampling, bounded iterations
+- comparators: llama.cpp `llama-bench` (brew build d48a56eff/9430, Metal), MLX-LM 0.31.3
+- method: three same-session rounds with alternating runtime order; the headline number is the per-runtime median across rounds (single rounds on this host swing roughly +/-4% for both Camelid and llama.cpp)
+
+| Lane | Camelid | llama.cpp | MLX-LM (8-bit) |
+| --- | ---: | ---: | ---: |
+| Prefill, 601-token prompt (tok/s, median of rounds) | 536.7 | 536.5 | 578.3 |
+| Decode, short context (tok/s) | 25.3 (128 tokens) | 28.7 (tg128) | 28.7 (two-point, 64) |
+| Time to first token, 601-token prompt (ms, median) | 1194 | - | - |
+| Peak process memory during the run (GB) | 4.28 | - | - |
+
+Reading boundary:
+
+- Prefill on this row and host is parity-level between Camelid and llama.cpp: the cross-round medians differ by less than the observed inter-round variance, so this table does not claim either runtime is faster.
+- MLX-LM prompt processing is faster than both on this host in this snapshot.
+- Camelid decode in this bundle reads below both comparators; decode tuning is tracked separately and this table makes no decode-speed claim.
+- This is one exact row on one host. Nothing here transfers to other models, quantizations, context shapes, or hosts.
+
 
 ### Ubuntu bounded unique-chat envelope
 

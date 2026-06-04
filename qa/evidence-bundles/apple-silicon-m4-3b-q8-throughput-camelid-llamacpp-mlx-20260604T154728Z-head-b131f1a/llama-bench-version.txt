@@ -1,0 +1,1 @@
+load_backend: loaded BLAS backend from /opt/homebrew/Cellar/ggml/0.13.1/libexec/libggml-blas.so

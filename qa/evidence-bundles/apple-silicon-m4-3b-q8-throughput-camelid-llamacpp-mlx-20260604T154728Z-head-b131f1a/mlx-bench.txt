@@ -1,0 +1,10 @@
+loading model (once)...
+DECODE: 28.74 tok/s
+=== prefill (verbose) ===
+==========
+The
+==========
+Prompt: 601 tokens, 578.333 tokens-per-sec
+Generation: 1 tokens, 39734.563 tokens-per-sec
+Peak memory: 3.920 GB
+peak mem: 3.92 GB

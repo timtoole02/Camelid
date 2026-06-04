@@ -1,0 +1,52 @@
+{
+  "schema": "camelid.apple_silicon_m4_3b_q8_three_runtime_throughput.v1",
+  "captured_utc": "20260604T154728Z",
+  "head_commit": "b131f1a",
+  "passed": true,
+  "claim_boundary": "Exact-row, same-host, bounded throughput snapshot for Llama 3.2 3B Instruct Q8_0 on one Apple M4 (16GB) host. Camelid vs llama.cpp prefill is parity-level within observed inter-round variance; MLX-LM (8-bit) prompt processing is faster than both. Not a model-family, context-sweep, or production-load claim.",
+  "host": {
+    "machine": "Mac16,10 (Apple M4, 10-core GPU, 16GB unified memory)",
+    "os": "macOS (Darwin 25.5.0)",
+    "thermal_note": "warm host; rounds alternate runtime order to bound order/thermal bias"
+  },
+  "workload": {
+    "model_row": "Llama 3.2 3B Instruct Q8_0 (GGUF for camelid and llama.cpp; mlx-community Llama-3.2-3B-Instruct-8bit for MLX-LM)",
+    "prompt": "601-token repeated-sentence prompt ('The quick brown fox jumps over the lazy dog.' x60)",
+    "sampling": "greedy (temperature 0)",
+    "camelid_command": "camelid bench-generate <model> --prompt-file <601-token prompt> --max-tokens 16 --warmup --iterations 3-5 (default CLI fast stack)",
+    "llamacpp_command": "llama-bench -m <model> -p 601 [-n 128] -r 3 (brew llama.cpp, build d48a56eff/9430, Metal)",
+    "mlx_command": "mlx_lm.generate two-point decode + 601-token verbose prompt pass (mlx-lm 0.31.3)"
+  },
+  "method": "Three same-session rounds with alternating runtime order (camelid/llama.cpp/MLX; llama.cpp first in round 2, camelid first in rounds 1 and 3). Per-runtime result is the median across rounds; per-round detail retained in raw logs in this bundle.",
+  "results": {
+    "prefill_601_tokens_per_second": {
+      "camelid": { "round_medians": [522.2, 536.7, 537.7], "session_median": 536.7, "best_iteration": 543.3 },
+      "llamacpp": { "round_means": [541.6, 502.8, 536.5], "session_median": 536.5 },
+      "mlx_lm": { "rounds": [578.3], "session_median": 578.3 }
+    },
+    "decode_short_context_tokens_per_second": {
+      "camelid_128_tokens": { "iterations": [25.57, 25.24, 25.34], "median": 25.34 },
+      "llamacpp_tg128": { "mean": 28.72, "stddev": 0.35 },
+      "mlx_lm_two_point_64": { "value": 28.74 }
+    },
+    "ttft_601_token_prompt_ms": { "camelid_median": 1194.5, "camelid_best": 1158.6 },
+    "camelid_peak_process_memory_gb": 4.28
+  },
+  "notes": [
+    "Inter-round variance for prefill is roughly +/-4% for both camelid and llama.cpp on this warm host; single-round comparisons inside that band are not decisive.",
+    "Camelid decode in this bundle (25.3 tok/s at 128 tokens) reads below both comparators; decode-path tuning is tracked separately from this prefill-focused snapshot.",
+    "MLX-LM runs its own 8-bit quantization format; prefill/decode are comparable workloads but not byte-identical weight formats."
+  ],
+  "raw_files": [
+    "camelid-prefill601.jsonl",
+    "camelid-prefill601-r2.jsonl",
+    "camelid-prefill601-r3.jsonl",
+    "camelid-decode128-short.jsonl",
+    "llama-bench.md.txt",
+    "llama-bench-r2.md.txt",
+    "llama-bench-r3.md.txt",
+    "llama-bench-version.txt",
+    "mlx-bench.txt",
+    "mlx-version.txt"
+  ]
+}

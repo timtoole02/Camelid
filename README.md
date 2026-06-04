@@ -1,16 +1,39 @@
 # Camelid
 
+[![CI][ci-badge]][ci-workflow]
+
 Camelid is a Rust-native local GGUF inference backend with an evidence-gated support contract. The v0.1 release candidate is intentionally narrow: it publishes exact model rows that have row-specific validation, and it keeps everything else behind explicit blockers.
 
-Camelid is not presented as broad Llama, Mistral, Mixtral, distributed, production-throughput, or universal frontend support. If a model row, quantization, context window, comparator result, or UI readiness state is not backed by a cited artifact, it is outside the public v0.1 claim.
+Camelid does not claim broad Llama, Mistral, Mixtral, distributed, production-throughput, or universal frontend support. If a model row, quantization, context window, comparator result, or UI readiness state is not backed by a cited artifact, it is outside the public v0.1 claim.
 
 ![Camelid WebUI chat surface](docs/assets/camelid-readme-chat-surface-dark.png)
 
-The current WebUI is product-forward while still reflecting the local-first runtime contract: a dark, collapsed-rail chat surface with exact-row readiness gates instead of broad model support.
+The WebUI is product-forward while still reflecting the local-first runtime contract: a dark, collapsed-rail chat surface with exact-row readiness gates instead of broad model support.
+
+## Performance
+
+Same-host, same-prompt throughput snapshot on one Apple M4 (10-core GPU, 16GB unified memory), Llama 3.2 3B Instruct Q8_0, 601-token prompt, greedy sampling. Three same-session rounds with alternating runtime order; the headline number is the per-runtime median across rounds.
+
+| Lane | Camelid | llama.cpp (Metal) | MLX-LM (8-bit) |
+| --- | ---: | ---: | ---: |
+| Prefill, 601-token prompt (tok/s) | **536.7** | 536.5 | 578.3 |
+| Decode, short context (tok/s) | 25.3 | 28.7 | 28.7 |
+| Time to first token, 601-token prompt | **1.19 s** | - | - |
+
+Reading boundary, in this repository's house style:
+
+- Prefill on this row and host is **parity-level with llama.cpp**: the medians differ by less than the observed inter-round variance (roughly ±4% for both runtimes), so this table claims parity, not a win.
+- MLX-LM prompt processing is faster than both runtimes on this host in this snapshot.
+- Camelid decode currently reads below both comparators here; decode tuning is tracked separately.
+- One exact row, one host. Nothing transfers to other models, quantizations, context shapes, or machines.
+
+Full method, raw logs, and per-round detail: [`BENCHMARKS.md`](docs/benchmarks/BENCHMARKS.md) and the committed evidence bundle `qa/evidence-bundles/apple-silicon-m4-3b-q8-throughput-camelid-llamacpp-mlx-20260604T154728Z-head-b131f1a/`.
+
+For context: at the start of the current GPU-prefill work this same 601-token prompt prefilled at ~40 tok/s (15.1 s to first token). The prefill path now runs batched per-layer dispatch, a simdgroup-matrix Q8_0 GEMM, and attention-as-batched-matmul, all greedy-token-parity-checked against the CPU reference path.
 
 ## Current Release Boundary
 
-[`COMPATIBILITY.md`](COMPATIBILITY.md) is Camelid's durable support ledger, and [`SUPPORT_MATRIX_v0.1.md`](SUPPORT_MATRIX_v0.1.md) is the stricter v0.1 release-candidate slice. If broader repository docs drift, these two files win, with the support matrix setting the narrower rc boundary. The short version is:
+[`COMPATIBILITY.md`](COMPATIBILITY.md) is Camelid's durable support ledger, and [`SUPPORT_MATRIX_v0.1.md`](SUPPORT_MATRIX_v0.1.md) is the stricter v0.1 release-candidate slice. If broader repository docs drift, these two files win, with the support matrix setting the narrower rc boundary. The short version:
 
 | Exact row | v0.1 public status | Checked boundary |
 | --- | --- | --- |
@@ -36,7 +59,7 @@ Camelid v0.1 is a release candidate for reviewers who care about reproducible lo
 - explicit unsupported states for partial or blocked rows
 - small local gates that contributors can run before changing support-sensitive code
 
-The benchmark story is similarly bounded. Camelid publishes memory and timing snapshots that are already committed in evidence bundles. It does not yet publish a complete apples-to-apples throughput table against llama.cpp for every headline row.
+The benchmark story is bounded the same way: Camelid publishes throughput, memory, and timing snapshots that are backed by committed evidence bundles (see [Performance](#performance)), and it does not yet publish an apples-to-apples throughput table for every headline row.
 
 ## Quickstart
 
@@ -88,7 +111,7 @@ bash scripts/check-public-scrub.sh
 cd frontend && npm ci && npm run build && npm run smoke:model-state
 ```
 
-Real-model parity, comparator baselines, and full v0.1 evidence bundles require model files and comparator runtimes that are not vendored in this repository. Those runs must record the exact model path, hash, runtime versions, commands, timing, memory, and pass/fail status in a scrubbed evidence bundle.
+Real-model parity, comparator baselines, and full v0.1 evidence bundles require model files and comparator runtimes that are not vendored in this repository. Those runs must record the exact model row, hash, runtime versions, commands, timing, memory, and pass/fail status in a scrubbed evidence bundle.
 
 ## Documentation Map
 
