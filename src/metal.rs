@@ -1060,9 +1060,12 @@ kernel void q8_0_block_wire_mm(
     device const char* x = weight_blocks + (r0 + lr0) * row_stride;
     device const half* yp = y + (t0 + lr1) * k_width + iy;
 
-    // This simdgroup's quadrant: 32 rows (sg % 4) x 32 tokens (sg / 4).
+    // This simdgroup's quadrant: 32 rows (sg % 4) x 32 tokens (sg / 4). A quadrant
+    // entirely past n_rows_in only sees zero-padding — skip its loads and MMAs
+    // (staging and barriers stay uniform across the threadgroup).
     const uint sg_row_oct = (sg % 4) * 4;
     const uint sg_tok_oct = (sg / 4) * 4;
+    const bool sg_active = t0 + 8 * sg_tok_oct < n_rows_in;
 
     simdgroup_half8x8 ma[4];
     simdgroup_half8x8 mb[4];
@@ -1098,20 +1101,22 @@ kernel void q8_0_block_wire_mm(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        threadgroup const half* lsma = sa + 64 * sg_row_oct;
-        threadgroup const half* lsmb = sb + 64 * sg_tok_oct;
-        for (uint ik = 0; ik < NK / 8; ++ik) {
-            for (uint i = 0; i < 4; ++i) {
-                simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
+        if (sg_active) {
+            threadgroup const half* lsma = sa + 64 * sg_row_oct;
+            threadgroup const half* lsmb = sb + 64 * sg_tok_oct;
+            for (uint ik = 0; ik < NK / 8; ++ik) {
+                for (uint i = 0; i < 4; ++i) {
+                    simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
+                }
+                for (uint i = 0; i < 4; ++i) {
+                    simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
+                }
+                for (uint i = 0; i < 16; ++i) {
+                    simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+                }
+                lsma += 64 * 16;
+                lsmb += 64 * 8;
             }
-            for (uint i = 0; i < 4; ++i) {
-                simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
-            }
-            for (uint i = 0; i < 16; ++i) {
-                simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
-            }
-            lsma += 64 * 16;
-            lsmb += 64 * 8;
         }
     }
 
