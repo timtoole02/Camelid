@@ -1479,6 +1479,109 @@ impl LlamaInferenceSession {
             && n_heads.is_multiple_of(dims.attention_head_count_kv))
     }
 
+    /// GPU prefill (CAMELID_METAL_RESIDENT_PREFILL=1): run the prompt's first N tokens
+    /// through the resident session in ONE command buffer (weights stream once, attention
+    /// per position). On success the GPU KV cache holds positions 0..N, the CPU KV cache is
+    /// advanced (positions left empty — only the resident path continues this sequence),
+    /// and the caller skips its CPU prefill loop entirely; the last prompt token then runs
+    /// through the resident decode for logits.
+    fn try_resident_prefill(&mut self, token_ids: &[u32]) -> Result<bool> {
+        if std::env::var("CAMELID_METAL_RESIDENT_PREFILL")
+            .map(|v| v != "1" && !v.eq_ignore_ascii_case("true"))
+            .unwrap_or(true)
+            || token_ids.len() < 2
+            || token_ids.len() > 4096
+            || self.kv_cache.position != 0
+            || self.weights.layer_range.is_some()
+            || !self.resident_decode_eligible(false)?
+        {
+            return Ok(false);
+        }
+        let weights = Arc::clone(&self.weights);
+        let dims = DenseLlamaDims::from_config(&self.config)?;
+        let n_layers = dims.block_count;
+        let n_heads = self.config.attention_head_count as usize;
+        let n_kv = dims.attention_head_count_kv;
+        let head_dim = dims.head_dim;
+        let kv_cap = self.config.context_length as usize;
+        let n = token_ids.len();
+        if n >= kv_cap {
+            return Ok(false);
+        }
+        let rms_eps = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
+        let scale = attention_score_scale_value(head_dim, diagnostic_attention_score_scale()?);
+
+        // Rope tables for every prefill position, flattened.
+        let mut cos_all = Vec::new();
+        let mut sin_all = Vec::new();
+        let mut split_half_pairing = false;
+        for pos in 0..n {
+            match rope::resident_decode_rope_tables(
+                pos,
+                head_dim,
+                &self.config,
+                weights.rope_freqs.as_ref(),
+            )? {
+                Some(t) => {
+                    cos_all.extend_from_slice(&t.cos);
+                    sin_all.extend_from_slice(&t.sin);
+                    split_half_pairing = t.split_half_pairing;
+                }
+                None => return Ok(false),
+            }
+        }
+
+        let initial_positions = (n + 1).next_multiple_of(512).min(kv_cap);
+        let mut session = match metal::ResidentDecodeState::new(
+            n_layers,
+            n_heads,
+            n_kv,
+            head_dim,
+            dims.embedding_length,
+            dims.feed_forward_length,
+            initial_positions,
+            kv_cap,
+            rms_eps,
+            split_half_pairing,
+        ) {
+            Some(s) => s,
+            None => return Ok(false),
+        };
+
+        let embeddings = self
+            .weights
+            .token_embedding
+            .embedding_lookup(token_ids, "token_embedding_resident_prefill")?;
+        let layer_views: Vec<metal::ResidentLayerWeights> = weights
+            .layers
+            .iter()
+            .map(|l| metal::ResidentLayerWeights {
+                attn_norm: &l.attention_norm.data,
+                ffn_norm: &l.ffn_norm.data,
+                q_weight_blocks: q8_0_blocks_as_bytes(l.attention_q.q8_0_blocks.as_ref().unwrap()),
+                k_weight_blocks: q8_0_blocks_as_bytes(l.attention_k.q8_0_blocks.as_ref().unwrap()),
+                v_weight_blocks: q8_0_blocks_as_bytes(l.attention_v.q8_0_blocks.as_ref().unwrap()),
+                o_weight_blocks: q8_0_blocks_as_bytes(
+                    l.attention_output.q8_0_blocks.as_ref().unwrap(),
+                ),
+                gate_weight_blocks: q8_0_blocks_as_bytes(l.ffn_gate.q8_0_blocks.as_ref().unwrap()),
+                up_weight_blocks: q8_0_blocks_as_bytes(l.ffn_up.q8_0_blocks.as_ref().unwrap()),
+                down_weight_blocks: q8_0_blocks_as_bytes(l.ffn_down.q8_0_blocks.as_ref().unwrap()),
+            })
+            .collect();
+
+        if session
+            .prefill_tokens(&embeddings.data, n, &layer_views, &cos_all, &sin_all, scale)
+            .is_none()
+        {
+            return Ok(false);
+        }
+        // GPU cache now holds positions 0..n; the resident decode continues this sequence.
+        self.kv_cache.position = n;
+        self.resident_decode = Some(session);
+        Ok(true)
+    }
+
     /// Run the whole token forward on the GPU resident-decode session. Returns Some(hidden) on
     /// success (the caller applies the existing final norm + output projection), or None to fall
     /// back to the CPU layer loop (ineligible config, unsupported RoPE, or Metal unavailable).
@@ -2438,7 +2541,10 @@ impl LlamaInferenceSession {
         let mut first_token_timings = LlamaForwardTimings::default();
         let prefill_count = token_ids.len().saturating_sub(1);
         let prefill_chunk_tokens = prefill_chunk_token_count(prefill_count);
-        if prefill_count > 0
+        if prefill_count > 1 && self.try_resident_prefill(&token_ids[..prefill_count])? {
+            // Whole prompt prefilled on the GPU in one command buffer; the last prompt
+            // token below decodes through the resident session.
+        } else if prefill_count > 0
             && prefill_chunk_tokens > 1
             && prefill_layer_major_enabled(&self.weights)
         {
