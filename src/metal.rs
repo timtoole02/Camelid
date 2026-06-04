@@ -63,6 +63,7 @@ struct MetalLinearKernel {
     half_mm_batched_pipeline: ComputePipelineState,
     half_mm_batched_f16o_pipeline: ComputePipelineState,
     transpose_v16_pipeline: ComputePipelineState,
+    rope_scatter_qh_pipeline: ComputePipelineState,
     softmax_causal_rows_pipeline: ComputePipelineState,
     rms_norm_quantize_pipeline: ComputePipelineState,
     silu_mul_quantize_pipeline: ComputePipelineState,
@@ -1879,6 +1880,104 @@ kernel void kv_scatter_batch_f32(
 }
 
 
+// Fused per-layer RoPE + KV scatter + Q half-convert for the attention-as-matmul
+// prefill path (requires full rotary coverage: half_rope * 2 == head_dim). One
+// dispatch replaces rope(Q), rope(K), kv-scatter, and the Q f32->f16 convert: Q pairs
+// rotate straight into the half Q panel the score matmul consumes (the f32 Q buffer
+// is not written back), K pairs rotate straight into the f32 and f16 caches, and V
+// elements scatter into both caches. Grid x lanes: [0, nq_pairs) Q pairs,
+// [nq_pairs, nq_pairs + nk_pairs) K pairs, then kv_dim V elements; grid y = token.
+kernel void rope_scatter_qh_batch(
+    device const float* q_in [[buffer(0)]],
+    device const float* k_in [[buffer(1)]],
+    device const float* v_in [[buffer(2)]],
+    device half* q_h [[buffer(3)]],
+    device float* cache_k [[buffer(4)]],
+    device float* cache_v [[buffer(5)]],
+    device half* cache_k16 [[buffer(6)]],
+    device half* cache_v16 [[buffer(7)]],
+    device const float* cos_table [[buffer(8)]],
+    device const float* sin_table [[buffer(9)]],
+    constant uint& n_heads [[buffer(10)]],
+    constant uint& n_kv_heads [[buffer(11)]],
+    constant uint& head_dim [[buffer(12)]],
+    constant uint& half_rope [[buffer(13)]],
+    constant uint& pairing [[buffer(14)]],
+    constant uint& max_positions [[buffer(15)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint t = gid.y;
+    const uint q_dim = n_heads * head_dim;
+    const uint kv_dim = n_kv_heads * head_dim;
+    const uint nq_pairs = n_heads * half_rope;
+    const uint nk_pairs = n_kv_heads * half_rope;
+    device const float* ct = cos_table + t * half_rope;
+    device const float* st = sin_table + t * half_rope;
+    uint x = gid.x;
+    if (x < nq_pairs) {
+        const uint head = x / half_rope;
+        const uint pair = x - head * half_rope;
+        const float c = ct[pair];
+        const float s = st[pair];
+        const uint head_start = head * head_dim;
+        uint dim0;
+        uint dim1;
+        if (pairing == 0u) {
+            dim0 = head_start + pair * 2u;
+            dim1 = dim0 + 1u;
+        } else {
+            dim0 = head_start + pair;
+            dim1 = head_start + pair + half_rope;
+        }
+        const float x0 = q_in[t * q_dim + dim0];
+        const float x1 = q_in[t * q_dim + dim1];
+        q_h[t * q_dim + dim0] = half(x0 * c - x1 * s);
+        q_h[t * q_dim + dim1] = half(x0 * s + x1 * c);
+        return;
+    }
+    x -= nq_pairs;
+    if (x < nk_pairs) {
+        const uint head = x / half_rope;
+        const uint pair = x - head * half_rope;
+        const float c = ct[pair];
+        const float s = st[pair];
+        const uint head_start = head * head_dim;
+        uint dim0;
+        uint dim1;
+        if (pairing == 0u) {
+            dim0 = head_start + pair * 2u;
+            dim1 = dim0 + 1u;
+        } else {
+            dim0 = head_start + pair;
+            dim1 = head_start + pair + half_rope;
+        }
+        const float x0 = k_in[t * kv_dim + dim0];
+        const float x1 = k_in[t * kv_dim + dim1];
+        const float r0 = x0 * c - x1 * s;
+        const float r1 = x0 * s + x1 * c;
+        const uint h0 = dim0 / head_dim;
+        const uint d0 = dim0 % head_dim;
+        const uint h1 = dim1 / head_dim;
+        const uint d1 = dim1 % head_dim;
+        const uint dst0 = (h0 * max_positions + t) * head_dim + d0;
+        const uint dst1 = (h1 * max_positions + t) * head_dim + d1;
+        cache_k[dst0] = r0;
+        cache_k[dst1] = r1;
+        cache_k16[dst0] = half(r0);
+        cache_k16[dst1] = half(r1);
+        return;
+    }
+    x -= nk_pairs;
+    if (x < kv_dim) {
+        const uint h = x / head_dim;
+        const uint d = x % head_dim;
+        const float v = v_in[t * kv_dim + x];
+        const uint dst = (h * max_positions + t) * head_dim + d;
+        cache_v[dst] = v;
+        cache_v16[dst] = half(v);
+    }
+}
+
 // Transpose one layer's half V cache slice per KV head ([position][head_dim] ->
 // [head_dim][position]) so the PV matmul's A-operand staging reads contiguously —
 // strided V^T staging measured at roughly half the staged-GEMM rate. ~1MB per layer.
@@ -2838,6 +2937,12 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let transpose_v16_pipeline = device
                 .new_compute_pipeline_state_with_function(&transpose_v16_function)
                 .ok()?;
+            let rope_scatter_qh_function = elementwise_library
+                .get_function("rope_scatter_qh_batch", None)
+                .ok()?;
+            let rope_scatter_qh_pipeline = device
+                .new_compute_pipeline_state_with_function(&rope_scatter_qh_function)
+                .ok()?;
             let softmax_causal_rows_function = elementwise_library
                 .get_function("softmax_causal_rows", None)
                 .ok()?;
@@ -2978,6 +3083,7 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 half_mm_batched_pipeline,
                 half_mm_batched_f16o_pipeline,
                 transpose_v16_pipeline,
+                rope_scatter_qh_pipeline,
                 softmax_causal_rows_pipeline,
                 rms_norm_quantize_pipeline,
                 silu_mul_quantize_pipeline,
@@ -6639,7 +6745,17 @@ impl ResidentDecodeState {
         } else {
             2
         });
+        let fused_rope_scalar = nb(24);
         let vt_scalar = nb(16);
+        unsafe {
+            let p = fused_rope_scalar.contents() as *mut u32;
+            *p = self.n_heads as u32;
+            *p.add(1) = self.n_kv_heads as u32;
+            *p.add(2) = self.head_dim as u32;
+            *p.add(3) = half_rope as u32;
+            *p.add(4) = u32::from(self.split_half_pairing);
+            *p.add(5) = self.max_positions as u32;
+        }
         unsafe {
             let p = vt_scalar.contents() as *mut u32;
             *p = self.head_dim as u32;
@@ -6832,43 +6948,68 @@ impl ResidentDecodeState {
             gemm(&e, qkv_y, &w[1], &k_buf, &qkv_scalar, 0, 8, 12, kv_dim);
             gemm(&e, qkv_y, &w[2], &v_buf, &qkv_scalar, 0, 8, 12, kv_dim);
             stage!("2:gemm_qkv");
-            e.set_compute_pipeline_state(&k.rope_rotate_batch_pipeline);
-            e.set_buffer(0, Some(&q_buf), 0);
-            e.set_buffer(1, Some(&cos_buf), 0);
-            e.set_buffer(2, Some(&sin_buf), 0);
-            for j in 0..4u64 {
-                e.set_buffer(3 + j, Some(&rope_q_scalar), j * 4);
+            let use_fused_rope = use_attn_mm && half_rope * 2 == self.head_dim;
+            if use_fused_rope {
+                // Fused rope(Q)->half panel + rope(K)->caches + V scatter, one dispatch.
+                e.set_compute_pipeline_state(&k.rope_scatter_qh_pipeline);
+                e.set_buffer(0, Some(&q_buf), 0);
+                e.set_buffer(1, Some(&k_buf), 0);
+                e.set_buffer(2, Some(&v_buf), 0);
+                e.set_buffer(3, Some(&q_h), 0);
+                e.set_buffer(4, Some(&self.cache_k[i]), 0);
+                e.set_buffer(5, Some(&self.cache_v[i]), 0);
+                e.set_buffer(6, Some(&cache_k16), 0);
+                e.set_buffer(7, Some(&cache_v16), 0);
+                e.set_buffer(8, Some(&cos_buf), 0);
+                e.set_buffer(9, Some(&sin_buf), 0);
+                for j in 0..6u64 {
+                    e.set_buffer(10 + j, Some(&fused_rope_scalar), j * 4);
+                }
+                dispatch_rows(
+                    &e,
+                    &k.rope_scatter_qh_pipeline,
+                    (self.n_heads + self.n_kv_heads) * half_rope + kv_dim,
+                    n_tokens,
+                );
+            } else {
+                e.set_compute_pipeline_state(&k.rope_rotate_batch_pipeline);
+                e.set_buffer(0, Some(&q_buf), 0);
+                e.set_buffer(1, Some(&cos_buf), 0);
+                e.set_buffer(2, Some(&sin_buf), 0);
+                for j in 0..4u64 {
+                    e.set_buffer(3 + j, Some(&rope_q_scalar), j * 4);
+                }
+                dispatch_rows(
+                    &e,
+                    &k.rope_rotate_batch_pipeline,
+                    self.n_heads * half_rope,
+                    n_tokens,
+                );
+                e.set_compute_pipeline_state(&k.rope_rotate_batch_pipeline);
+                e.set_buffer(0, Some(&k_buf), 0);
+                e.set_buffer(1, Some(&cos_buf), 0);
+                e.set_buffer(2, Some(&sin_buf), 0);
+                for j in 0..4u64 {
+                    e.set_buffer(3 + j, Some(&rope_k_scalar), j * 4);
+                }
+                dispatch_rows(
+                    &e,
+                    &k.rope_rotate_batch_pipeline,
+                    self.n_kv_heads * half_rope,
+                    n_tokens,
+                );
+                e.set_compute_pipeline_state(&k.kv_scatter_batch_pipeline);
+                e.set_buffer(0, Some(&k_buf), 0);
+                e.set_buffer(1, Some(&v_buf), 0);
+                e.set_buffer(2, Some(&self.cache_k[i]), 0);
+                e.set_buffer(3, Some(&self.cache_v[i]), 0);
+                for j in 0..4u64 {
+                    e.set_buffer(4 + j, Some(&scatter_scalar), j * 4);
+                }
+                e.set_buffer(8, Some(&cache_k16), 0);
+                e.set_buffer(9, Some(&cache_v16), 0);
+                dispatch_rows(&e, &k.kv_scatter_batch_pipeline, kv_dim, n_tokens);
             }
-            dispatch_rows(
-                &e,
-                &k.rope_rotate_batch_pipeline,
-                self.n_heads * half_rope,
-                n_tokens,
-            );
-            e.set_compute_pipeline_state(&k.rope_rotate_batch_pipeline);
-            e.set_buffer(0, Some(&k_buf), 0);
-            e.set_buffer(1, Some(&cos_buf), 0);
-            e.set_buffer(2, Some(&sin_buf), 0);
-            for j in 0..4u64 {
-                e.set_buffer(3 + j, Some(&rope_k_scalar), j * 4);
-            }
-            dispatch_rows(
-                &e,
-                &k.rope_rotate_batch_pipeline,
-                self.n_kv_heads * half_rope,
-                n_tokens,
-            );
-            e.set_compute_pipeline_state(&k.kv_scatter_batch_pipeline);
-            e.set_buffer(0, Some(&k_buf), 0);
-            e.set_buffer(1, Some(&v_buf), 0);
-            e.set_buffer(2, Some(&self.cache_k[i]), 0);
-            e.set_buffer(3, Some(&self.cache_v[i]), 0);
-            for j in 0..4u64 {
-                e.set_buffer(4 + j, Some(&scatter_scalar), j * 4);
-            }
-            e.set_buffer(8, Some(&cache_k16), 0);
-            e.set_buffer(9, Some(&cache_v16), 0);
-            dispatch_rows(&e, &k.kv_scatter_batch_pipeline, kv_dim, n_tokens);
             stage!("3:rope+scatter");
             let use_flash_attn = use_mm && self.head_dim.is_multiple_of(8) && self.head_dim <= 128;
             if use_attn_mm {
@@ -6876,8 +7017,10 @@ impl ResidentDecodeState {
                 // matmuls ride the same staged simdgroup-tile structure as the
                 // weight GEMMs, with upper-triangle S tiles culled and the PV k-range
                 // clamped to the causal limit.
-                // q -> half
-                convert(&e, &q_buf, &q_h, &n_elems, 8, n_tokens * q_dim);
+                // q -> half (already produced by the fused rope pass when eligible)
+                if !use_fused_rope {
+                    convert(&e, &q_buf, &q_h, &n_elems, 8, n_tokens * q_dim);
+                }
                 // S = Q K^T (per query head; K shared per KV head)
                 let smm = |e: &metal::ComputeCommandEncoderRef,
                            a: &Buffer,
@@ -10399,5 +10542,254 @@ kernel void steel_q8_mm(
         }
         eprintln!("[steel-probe] rel max_err vs CPU: {max_err}");
         assert!(max_err < 2e-2, "steel mm mismatch");
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod steel_dual_probe {
+    use super::*;
+
+    /// Dual interleaved steel-shape GEMM: two weight matrices (gate+up) against ONE
+    /// shared activation tile per staging round — doubles MMA work per barrier.
+    /// cargo test --release steel_dual_probe_gate -- --nocapture --ignored
+    #[test]
+    #[ignore]
+    fn steel_dual_probe_gate() {
+        let k_ref = metal_linear_kernel().expect("metal");
+        let device = &k_ref.device;
+        let src = r#"
+#include <metal_stdlib>
+using namespace metal;
+static inline short2 frag_coord(ushort lane) {
+    const short qid = lane / 4;
+    const short fm = (qid & 4) + ((lane / 2) % 4);
+    const short fn = (qid & 2) * 2 + (lane % 2) * 2;
+    return short2(fn, fm);
+}
+kernel void steel_q8_mm_dual(
+    device const half* x [[buffer(0)]],
+    device const char* w0 [[buffer(1)]],
+    device const char* w1 [[buffer(2)]],
+    device float* y0 [[buffer(3)]],
+    device float* y1 [[buffer(4)]],
+    constant uint& kdim [[buffer(5)]],
+    constant uint& n_rows [[buffer(6)]],
+    constant uint& m_tokens [[buffer(7)]],
+    uint3 tid3 [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint BM = 32;
+    constexpr uint BN = 32;
+    constexpr uint BK = 32;
+    constexpr uint LD = BK + 8;
+    const uint tid = sg * 32 + lane;
+
+    threadgroup half Xs[BM * LD];
+    threadgroup half Ws0[BN * LD];
+    threadgroup half Ws1[BN * LD];
+
+    const uint n0 = tid3.x * BN;
+    const uint m0 = tid3.y * BM;
+    const uint row_stride = (kdim / 32) * 34;
+
+    const uint bi = tid / 4;
+    const uint bj = (tid % 4) * 8;
+    device const half* xs_src = x + (m0 + bi) * kdim + bj;
+    device const char* w0_row = w0 + (ulong)(n0 + bi) * row_stride;
+    device const char* w1_row = w1 + (ulong)(n0 + bi) * row_stride;
+
+    const short tm = 8 * (short)(sg / 2);
+    const short tn = 8 * (short)(sg % 2);
+    const short2 c = frag_coord((ushort)lane);
+    const short sm = c.y;
+    const short sn = c.x;
+    const uint a_off = (uint)(tm + sm) * LD + (uint)sn;
+    const uint b_off = (uint)sm + (uint)(tn + sn) * LD;
+
+    simdgroup_half8x8 a_frag[2];
+    simdgroup_half8x8 b_frag0[2];
+    simdgroup_half8x8 b_frag1[2];
+    simdgroup_float8x8 c0[2][2];
+    simdgroup_float8x8 c1[2][2];
+    for (uint i = 0; i < 2; ++i) {
+        for (uint j = 0; j < 2; ++j) {
+            c0[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            c1[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+
+    for (uint kb = 0; kb < kdim; kb += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        *reinterpret_cast<threadgroup half4*>(&Xs[bi * LD + bj]) =
+            *reinterpret_cast<device const half4*>(xs_src + kb);
+        *reinterpret_cast<threadgroup half4*>(&Xs[bi * LD + bj + 4]) =
+            *reinterpret_cast<device const half4*>(xs_src + kb + 4);
+        {
+            device const char* wb = w0_row + (kb / 32) * 34;
+            const float scale = float(*reinterpret_cast<device const half*>(wb));
+            device const packed_char4* q =
+                reinterpret_cast<device const packed_char4*>(wb + 2 + bj);
+            *reinterpret_cast<threadgroup half4*>(&Ws0[bi * LD + bj]) =
+                half4(float4(q[0]) * scale);
+            *reinterpret_cast<threadgroup half4*>(&Ws0[bi * LD + bj + 4]) =
+                half4(float4(q[1]) * scale);
+        }
+        {
+            device const char* wb = w1_row + (kb / 32) * 34;
+            const float scale = float(*reinterpret_cast<device const half*>(wb));
+            device const packed_char4* q =
+                reinterpret_cast<device const packed_char4*>(wb + 2 + bj);
+            *reinterpret_cast<threadgroup half4*>(&Ws1[bi * LD + bj]) =
+                half4(float4(q[0]) * scale);
+            *reinterpret_cast<threadgroup half4*>(&Ws1[bi * LD + bj + 4]) =
+                half4(float4(q[1]) * scale);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kk = 0; kk < BK; kk += 8) {
+            simdgroup_barrier(mem_flags::mem_none);
+            {
+                threadgroup const half* a0 = &Xs[a_off + kk];
+                a_frag[0].thread_elements()[0] = a0[0];
+                a_frag[0].thread_elements()[1] = a0[1];
+                threadgroup const half* a1 = a0 + 16 * LD;
+                a_frag[1].thread_elements()[0] = a1[0];
+                a_frag[1].thread_elements()[1] = a1[1];
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            {
+                threadgroup const half* p0 = &Ws0[b_off + kk];
+                b_frag0[0].thread_elements()[0] = p0[0];
+                b_frag0[0].thread_elements()[1] = p0[LD];
+                threadgroup const half* p1 = p0 + 16 * LD;
+                b_frag0[1].thread_elements()[0] = p1[0];
+                b_frag0[1].thread_elements()[1] = p1[LD];
+                threadgroup const half* q0 = &Ws1[b_off + kk];
+                b_frag1[0].thread_elements()[0] = q0[0];
+                b_frag1[0].thread_elements()[1] = q0[LD];
+                threadgroup const half* q1 = q0 + 16 * LD;
+                b_frag1[1].thread_elements()[0] = q1[0];
+                b_frag1[1].thread_elements()[1] = q1[LD];
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(c0[0][0], a_frag[0], b_frag0[0], c0[0][0]);
+            simdgroup_multiply_accumulate(c0[0][1], a_frag[0], b_frag0[1], c0[0][1]);
+            simdgroup_multiply_accumulate(c0[1][0], a_frag[1], b_frag0[0], c0[1][0]);
+            simdgroup_multiply_accumulate(c0[1][1], a_frag[1], b_frag0[1], c0[1][1]);
+            simdgroup_multiply_accumulate(c1[0][0], a_frag[0], b_frag1[0], c1[0][0]);
+            simdgroup_multiply_accumulate(c1[0][1], a_frag[0], b_frag1[1], c1[0][1]);
+            simdgroup_multiply_accumulate(c1[1][0], a_frag[1], b_frag1[0], c1[1][0]);
+            simdgroup_multiply_accumulate(c1[1][1], a_frag[1], b_frag1[1], c1[1][1]);
+        }
+    }
+
+    for (uint i = 0; i < 2; ++i) {
+        for (uint j = 0; j < 2; ++j) {
+            const uint m = m0 + (uint)(tm + sm) + 16 * i;
+            const uint n = n0 + (uint)(tn + sn) + 16 * j;
+            if (m < m_tokens) {
+                device float* d0 = y0 + (ulong)m * n_rows + n;
+                d0[0] = c0[i][j].thread_elements()[0];
+                d0[1] = c0[i][j].thread_elements()[1];
+                device float* d1 = y1 + (ulong)m * n_rows + n;
+                d1[0] = c1[i][j].thread_elements()[0];
+                d1[1] = c1[i][j].thread_elements()[1];
+            }
+        }
+    }
+}
+"#;
+        let options = CompileOptions::new();
+        let lib = device
+            .new_library_with_source(src, &options)
+            .map_err(|e| panic!("dual probe compile: {e}"))
+            .unwrap();
+        let f = lib.get_function("steel_q8_mm_dual", None).unwrap();
+        let p = device.new_compute_pipeline_state_with_function(&f).unwrap();
+
+        let rows: usize = 8192;
+        let k: usize = 3072;
+        let m: usize = 601;
+        let m_pad: usize = m.next_multiple_of(32);
+        let bpr = k / 32;
+        let mut wire = vec![0u8; rows * bpr * 34];
+        for (i, chunk) in wire.chunks_mut(34).enumerate() {
+            let scale = f32_to_f16_bits(0.01 + (i % 7) as f32 * 0.001);
+            chunk[..2].copy_from_slice(&scale.to_le_bytes());
+            for (j, q) in chunk[2..].iter_mut().enumerate() {
+                *q = (((i + j * 3) % 255) as i32 - 127) as i8 as u8;
+            }
+        }
+        let w0 = device.new_buffer_with_data(
+            wire.as_ptr() as *const _,
+            wire.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let w1 = device.new_buffer_with_data(
+            wire.as_ptr() as *const _,
+            wire.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let mut xv = vec![0u16; m_pad * k];
+        for (i, v) in xv.iter_mut().enumerate() {
+            *v = f32_to_f16_bits(((i % 31) as f32 - 15.0) * 0.05);
+        }
+        let x_buf = device.new_buffer_with_data(
+            xv.as_ptr() as *const _,
+            (xv.len() * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let y0 = device.new_buffer(
+            (m_pad * rows * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let y1 = device.new_buffer(
+            (m_pad * rows * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let scalar = device.new_buffer(12, MTLResourceOptions::StorageModeShared);
+        unsafe {
+            let s = scalar.contents() as *mut u32;
+            *s = k as u32;
+            *s.add(1) = rows as u32;
+            *s.add(2) = m as u32;
+        }
+        for round in 0..4 {
+            let cb = k_ref.queue.new_command_buffer();
+            let e = cb.new_compute_command_encoder();
+            e.set_compute_pipeline_state(&p);
+            e.set_buffer(0, Some(&x_buf), 0);
+            e.set_buffer(1, Some(&w0), 0);
+            e.set_buffer(2, Some(&w1), 0);
+            e.set_buffer(3, Some(&y0), 0);
+            e.set_buffer(4, Some(&y1), 0);
+            e.set_buffer(5, Some(&scalar), 0);
+            e.set_buffer(6, Some(&scalar), 4);
+            e.set_buffer(7, Some(&scalar), 8);
+            e.dispatch_thread_groups(
+                metal::MTLSize {
+                    width: (rows / 32) as u64,
+                    height: (m_pad / 32) as u64,
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 128,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            e.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            let (busy_us, _) = command_buffer_gpu_times_us(&cb.to_owned());
+            // flops for BOTH matmuls
+            let flops = 2.0 * 2.0 * rows as f64 * k as f64 * m as f64;
+            eprintln!(
+                "[dual-probe] round {round}: {busy_us}us  {:.2} TFLOPS combined ({:.1}ms vs 2x single ~17.7ms)",
+                flops / (busy_us as f64 * 1e-6) / 1e12,
+                busy_us as f64 / 1000.0
+            );
+        }
     }
 }
