@@ -3398,8 +3398,8 @@ fn try_attention_v2_for_test(
     e.set_buffer(1, Some(&k), 0);
     e.set_buffer(2, Some(&v), 0);
     e.set_buffer(4, Some(&out), 0);
-    for i in 0..8 {
-        e.set_buffer(5 + i, Some(&scalar), (i * 4) as u64);
+    for i in 0..8u64 {
+        e.set_buffer(5 + i, Some(&scalar), i * 4);
     }
     e.dispatch_thread_groups(
         metal::MTLSize {
@@ -3536,7 +3536,7 @@ fn encode_attention(
 ) {
     // Tiled kernel (4 simdgroups/head, online softmax, no scores buffer) when enabled and
     // the head geometry allows; otherwise the one-simdgroup-per-head fallback.
-    let v2 = attn2_enabled() && head_dim % 32 == 0 && head_dim <= 128;
+    let v2 = attn2_enabled() && head_dim.is_multiple_of(32) && head_dim <= 128;
     let attn_pipeline = match (v2, kv16_enabled()) {
         (true, true) => &k.attention_decode_v2_kv16_pipeline,
         (true, false) => &k.attention_decode_v2_pipeline,
