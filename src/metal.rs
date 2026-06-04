@@ -44,6 +44,8 @@ struct MetalLinearKernel {
     rope_rotate_pipeline: ComputePipelineState,
     attention_decode_pipeline: ComputePipelineState,
     attention_decode_kv16_pipeline: ComputePipelineState,
+    attention_decode_v2_pipeline: ComputePipelineState,
+    attention_decode_v2_kv16_pipeline: ComputePipelineState,
     quantize_q8_0_pipeline: ComputePipelineState,
     kv_scatter_pipeline: ComputePipelineState,
     kv_scatter_kv16_pipeline: ComputePipelineState,
@@ -1128,6 +1130,180 @@ kernel void attention_decode_kv16(
     }
 }
 
+// Tiled decode attention with online softmax. One threadgroup per query head, FOUR
+// simdgroups; positions stride across simdgroups, lanes split head_dim, so K/V reads are
+// coalesced across lanes (the v1 kernels read one full K row per lane). Each simdgroup
+// keeps a flash-style running (max, denominator, weighted-V accumulator); the four partial
+// states merge in threadgroup memory. No scores buffer, no device-memory barrier.
+// Requires: head_dim % 32 == 0, head_dim <= 128.
+kernel void attention_decode_v2_f32(
+    device const float* query [[buffer(0)]],
+    device const float* keys [[buffer(1)]],
+    device const float* values [[buffer(2)]],
+    device float* output [[buffer(4)]],
+    constant uint& n_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& position_count [[buffer(7)]],
+    constant uint& group [[buffer(8)]],
+    constant float& scale [[buffer(9)]],
+    constant uint& position_stride [[buffer(10)]],
+    constant uint& kv_head_stride [[buffer(11)]],
+    constant uint& kv_base_offset [[buffer(12)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint NSG = 4;
+    constexpr uint MAX_DPL = 4; // head_dim <= 128 -> at most 4 dims per lane
+    if (head >= n_heads) return;
+    const uint dpl = head_dim / 32;
+    const uint q_base = head * head_dim;
+    const uint kv_base = kv_base_offset + (head / group) * kv_head_stride;
+
+    // Query slice for this lane's dims, scaled once.
+    float q[MAX_DPL];
+    for (uint i = 0; i < dpl; ++i) {
+        q[i] = query[q_base + lane + i * 32] * scale;
+    }
+
+    // Flash-style running state for this simdgroup's positions.
+    float m = -INFINITY;
+    float l = 0.0;
+    float acc[MAX_DPL] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (uint p = sg; p < position_count; p += NSG) {
+        device const float* kr = keys + kv_base + p * position_stride;
+        float s = 0.0;
+        for (uint i = 0; i < dpl; ++i) {
+            s += q[i] * kr[lane + i * 32];
+        }
+        s = simd_sum(s);
+        float m_new = max(m, s);
+        float w = exp(s - m_new);
+        float corr = exp(m - m_new);
+        device const float* vr = values + kv_base + p * position_stride;
+        for (uint i = 0; i < dpl; ++i) {
+            acc[i] = acc[i] * corr + w * vr[lane + i * 32];
+        }
+        l = l * corr + w;
+        m = m_new;
+    }
+
+    // Merge the four simdgroup states: out = sum_i acc_i * exp(m_i - M) / sum_i l_i * exp(m_i - M).
+    threadgroup float sh_m[NSG];
+    threadgroup float sh_l[NSG];
+    threadgroup float sh_acc[NSG * 128];
+    if (lane == 0) {
+        sh_m[sg] = m;
+        sh_l[sg] = l;
+    }
+    for (uint i = 0; i < dpl; ++i) {
+        sh_acc[sg * 128 + lane + i * 32] = acc[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        float m_tot = max(max(sh_m[0], sh_m[1]), max(sh_m[2], sh_m[3]));
+        float l_tot = 0.0;
+        float w[NSG];
+        for (uint i = 0; i < NSG; ++i) {
+            w[i] = exp(sh_m[i] - m_tot);
+            l_tot += sh_l[i] * w[i];
+        }
+        float inv = 1.0 / l_tot;
+        for (uint i = 0; i < dpl; ++i) {
+            uint d = lane + i * 32;
+            float o = 0.0;
+            for (uint g2 = 0; g2 < NSG; ++g2) {
+                o += sh_acc[g2 * 128 + d] * w[g2];
+            }
+            output[q_base + d] = o * inv;
+        }
+    }
+}
+
+// f16-KV twin of attention_decode_v2_f32.
+kernel void attention_decode_v2_kv16(
+    device const float* query [[buffer(0)]],
+    device const half* keys [[buffer(1)]],
+    device const half* values [[buffer(2)]],
+    device float* output [[buffer(4)]],
+    constant uint& n_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& position_count [[buffer(7)]],
+    constant uint& group [[buffer(8)]],
+    constant float& scale [[buffer(9)]],
+    constant uint& position_stride [[buffer(10)]],
+    constant uint& kv_head_stride [[buffer(11)]],
+    constant uint& kv_base_offset [[buffer(12)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint NSG = 4;
+    constexpr uint MAX_DPL = 4;
+    if (head >= n_heads) return;
+    const uint dpl = head_dim / 32;
+    const uint q_base = head * head_dim;
+    const uint kv_base = kv_base_offset + (head / group) * kv_head_stride;
+
+    float q[MAX_DPL];
+    for (uint i = 0; i < dpl; ++i) {
+        q[i] = query[q_base + lane + i * 32] * scale;
+    }
+
+    float m = -INFINITY;
+    float l = 0.0;
+    float acc[MAX_DPL] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (uint p = sg; p < position_count; p += NSG) {
+        device const half* kr = keys + kv_base + p * position_stride;
+        float s = 0.0;
+        for (uint i = 0; i < dpl; ++i) {
+            s += q[i] * float(kr[lane + i * 32]);
+        }
+        s = simd_sum(s);
+        float m_new = max(m, s);
+        float w = exp(s - m_new);
+        float corr = exp(m - m_new);
+        device const half* vr = values + kv_base + p * position_stride;
+        for (uint i = 0; i < dpl; ++i) {
+            acc[i] = acc[i] * corr + w * float(vr[lane + i * 32]);
+        }
+        l = l * corr + w;
+        m = m_new;
+    }
+
+    threadgroup float sh_m[NSG];
+    threadgroup float sh_l[NSG];
+    threadgroup float sh_acc[NSG * 128];
+    if (lane == 0) {
+        sh_m[sg] = m;
+        sh_l[sg] = l;
+    }
+    for (uint i = 0; i < dpl; ++i) {
+        sh_acc[sg * 128 + lane + i * 32] = acc[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        float m_tot = max(max(sh_m[0], sh_m[1]), max(sh_m[2], sh_m[3]));
+        float l_tot = 0.0;
+        float w[NSG];
+        for (uint i = 0; i < NSG; ++i) {
+            w[i] = exp(sh_m[i] - m_tot);
+            l_tot += sh_l[i] * w[i];
+        }
+        float inv = 1.0 / l_tot;
+        for (uint i = 0; i < dpl; ++i) {
+            uint d = lane + i * 32;
+            float o = 0.0;
+            for (uint g2 = 0; g2 < NSG; ++g2) {
+                o += sh_acc[g2 * 128 + d] * w[g2];
+            }
+            output[q_base + d] = o * inv;
+        }
+    }
+}
+
 // Quantize an f32 activation row to Q8_0 (32-value blocks), one thread per block.
 // Mirrors quantize_q8_0_block: scale = f16(max|v|/127) stored as f32, quant =
 // round-ties-away(v / (max|v|/127)) clamped to [-127, 127]. Emits separate scale
@@ -1331,6 +1507,18 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let attention_decode_kv16_pipeline = device
                 .new_compute_pipeline_state_with_function(&attention_decode_kv16_function)
                 .ok()?;
+            let attention_decode_v2_function = elementwise_library
+                .get_function("attention_decode_v2_f32", None)
+                .ok()?;
+            let attention_decode_v2_pipeline = device
+                .new_compute_pipeline_state_with_function(&attention_decode_v2_function)
+                .ok()?;
+            let attention_decode_v2_kv16_function = elementwise_library
+                .get_function("attention_decode_v2_kv16", None)
+                .ok()?;
+            let attention_decode_v2_kv16_pipeline = device
+                .new_compute_pipeline_state_with_function(&attention_decode_v2_kv16_function)
+                .ok()?;
             let quantize_q8_0_function = elementwise_library
                 .get_function("quantize_q8_0_f32", None)
                 .ok()?;
@@ -1452,6 +1640,8 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 rope_rotate_pipeline,
                 attention_decode_pipeline,
                 attention_decode_kv16_pipeline,
+                attention_decode_v2_pipeline,
+                attention_decode_v2_kv16_pipeline,
                 quantize_q8_0_pipeline,
                 kv_scatter_pipeline,
                 kv_scatter_kv16_pipeline,
@@ -3145,6 +3335,17 @@ fn kv16_enabled() -> bool {
     })
 }
 
+/// Opt-in: tiled decode attention with online softmax (4 simdgroups per head, coalesced
+/// K/V reads, no scores buffer). Requires head_dim % 32 == 0 and <= 128.
+#[cfg(target_os = "macos")]
+fn attn2_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_METAL_ATTN2")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
 /// Experiment flag: NSG=8 wire GEMV (256 threads/TG).
 #[cfg(target_os = "macos")]
 fn wire_nsg8_enabled() -> bool {
@@ -3153,6 +3354,71 @@ fn wire_nsg8_enabled() -> bool {
         std::env::var("CAMELID_METAL_WIRE_NSG8")
             .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
     })
+}
+
+/// Test-only direct driver for the tiled (v2) decode attention pipeline.
+#[cfg(all(test, target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+fn try_attention_v2_for_test(
+    query: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    positions: usize,
+    scale: f32,
+) -> Option<Vec<f32>> {
+    let kernel = metal_linear_kernel()?;
+    let device = &kernel.device;
+    let opts = MTLResourceOptions::StorageModeShared;
+    let q = device.new_buffer(std::mem::size_of_val(query) as u64, opts);
+    let k = device.new_buffer(std::mem::size_of_val(keys) as u64, opts);
+    let v = device.new_buffer(std::mem::size_of_val(values) as u64, opts);
+    let out = device.new_buffer((n_heads * head_dim * 4) as u64, opts);
+    let scalar = device.new_buffer(32, opts);
+    write_buffer_f32(&q, query);
+    write_buffer_f32(&k, keys);
+    write_buffer_f32(&v, values);
+    unsafe {
+        let p = scalar.contents() as *mut u32;
+        *p = n_heads as u32;
+        *p.add(1) = head_dim as u32;
+        *p.add(2) = positions as u32;
+        *p.add(3) = (n_heads / n_kv_heads) as u32;
+        *(p.add(4) as *mut f32) = scale;
+        *p.add(5) = head_dim as u32; // position_stride (contiguous)
+        *p.add(6) = (positions * head_dim) as u32; // kv_head_stride
+        *p.add(7) = 0; // kv_base_offset
+    }
+    let cb = kernel.queue.new_command_buffer();
+    let e = cb.new_compute_command_encoder();
+    e.set_compute_pipeline_state(&kernel.attention_decode_v2_pipeline);
+    e.set_buffer(0, Some(&q), 0);
+    e.set_buffer(1, Some(&k), 0);
+    e.set_buffer(2, Some(&v), 0);
+    e.set_buffer(4, Some(&out), 0);
+    for i in 0..8 {
+        e.set_buffer(5 + i, Some(&scalar), (i * 4) as u64);
+    }
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: n_heads as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        },
+    );
+    e.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+    let mut result = vec![0.0f32; n_heads * head_dim];
+    read_buffer_f32(&out, &mut result);
+    Some(result)
 }
 
 /// Test-only direct driver for the K-split GEMV pipeline (bypasses the env gate and the
@@ -3266,17 +3532,24 @@ fn encode_attention(
     out: &Buffer,
     scalar: &Buffer,
     n_heads: usize,
+    head_dim: usize,
 ) {
-    let attn_pipeline = if kv16_enabled() {
-        &k.attention_decode_kv16_pipeline
-    } else {
-        &k.attention_decode_pipeline
+    // Tiled kernel (4 simdgroups/head, online softmax, no scores buffer) when enabled and
+    // the head geometry allows; otherwise the one-simdgroup-per-head fallback.
+    let v2 = attn2_enabled() && head_dim % 32 == 0 && head_dim <= 128;
+    let attn_pipeline = match (v2, kv16_enabled()) {
+        (true, true) => &k.attention_decode_v2_kv16_pipeline,
+        (true, false) => &k.attention_decode_v2_pipeline,
+        (false, true) => &k.attention_decode_kv16_pipeline,
+        (false, false) => &k.attention_decode_pipeline,
     };
     e.set_compute_pipeline_state(attn_pipeline);
     e.set_buffer(0, Some(query), 0);
     e.set_buffer(1, Some(keys), 0);
     e.set_buffer(2, Some(values), 0);
-    e.set_buffer(3, Some(scores), 0);
+    if !v2 {
+        e.set_buffer(3, Some(scores), 0);
+    }
     e.set_buffer(4, Some(out), 0);
     e.set_buffer(5, Some(scalar), 0); // n_heads
     e.set_buffer(6, Some(scalar), 4); // head_dim
@@ -3286,7 +3559,6 @@ fn encode_attention(
     e.set_buffer(10, Some(scalar), 20); // position_stride
     e.set_buffer(11, Some(scalar), 24); // kv_head_stride
     e.set_buffer(12, Some(scalar), 28); // kv_base_offset
-                                        // One threadgroup per head, a single 32-lane SIMD group cooperating within it.
     e.dispatch_thread_groups(
         metal::MTLSize {
             width: n_heads as u64,
@@ -3294,7 +3566,7 @@ fn encode_attention(
             depth: 1,
         },
         metal::MTLSize {
-            width: 32,
+            width: if v2 { 128 } else { 32 },
             height: 1,
             depth: 1,
         },
@@ -3663,6 +3935,7 @@ fn encode_attention_block(
         &ctx_buf,
         &attn_scalar,
         n_heads,
+        head_dim,
     );
     if f32y_gemv_enabled() {
         encode_q8_matmul_f32y(e, k, &ctx_buf, o_w_buf, &o_buf, &o_mm_scalar, hidden);
@@ -5345,6 +5618,65 @@ mod tests {
                 (actual - expected).abs() < 1.0e-2_f32.max(expected.abs() * 1.0e-5),
                 "row {row}: {actual} != {expected}"
             );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_attention_decode_v2_matches_cpu_reference() {
+        if !detect_metal_device().available {
+            return;
+        }
+        // GQA (4 query heads over 2 KV heads), head_dim 32, 7 positions (prime, so all four
+        // position-striding simdgroups see uneven work).
+        let n_heads = 4usize;
+        let n_kv_heads = 2usize;
+        let head_dim = 32usize;
+        let positions = 7usize;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let query: Vec<f32> = (0..n_heads * head_dim)
+            .map(|i| ((i as f32 % 5.0) - 2.0) * 0.3)
+            .collect();
+        let keys: Vec<f32> = (0..n_kv_heads * positions * head_dim)
+            .map(|i| ((i as f32 % 7.0) - 3.0) * 0.2)
+            .collect();
+        let values: Vec<f32> = (0..n_kv_heads * positions * head_dim)
+            .map(|i| ((i as f32 % 4.0) - 1.0) * 0.5)
+            .collect();
+        let group = n_heads / n_kv_heads;
+        let mut expected = vec![0.0f32; n_heads * head_dim];
+        for h in 0..n_heads {
+            let qb = h * head_dim;
+            let kvb = (h / group) * positions * head_dim;
+            let mut scores = vec![0.0f32; positions];
+            for (p, score) in scores.iter_mut().enumerate() {
+                let kb = kvb + p * head_dim;
+                let mut s = 0.0;
+                for d in 0..head_dim {
+                    s += query[qb + d] * keys[kb + d];
+                }
+                *score = s * scale;
+            }
+            let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0;
+            for s in scores.iter_mut() {
+                *s = (*s - m).exp();
+                sum += *s;
+            }
+            for d in 0..head_dim {
+                let mut acc = 0.0;
+                for (p, s) in scores.iter().enumerate() {
+                    acc += (s / sum) * values[kvb + p * head_dim + d];
+                }
+                expected[qb + d] = acc;
+            }
+        }
+        let got = try_attention_v2_for_test(
+            &query, &keys, &values, n_heads, n_kv_heads, head_dim, positions, scale,
+        )
+        .expect("v2 attention");
+        for (i, (a, b)) in got.iter().zip(&expected).enumerate() {
+            assert!((a - b).abs() < 1.0e-4, "dim {i}: {a} != {b}");
         }
     }
     use super::*;
