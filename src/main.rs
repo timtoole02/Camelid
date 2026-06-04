@@ -304,6 +304,8 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    apply_default_fast_stack();
+
     match Cli::parse().command {
         Command::Serve {
             addr,
@@ -1101,6 +1103,27 @@ fn infer_quantization(path: &std::path::Path) -> String {
         }
     }
     "unknown".to_string()
+}
+
+/// The measured-fastest Metal configuration is on by default for the CLI: Q8_0 weights
+/// upload in wire format, NSG=8 GEMV dispatch, f32-activation GEMV chain, tiled decode
+/// attention, and the one-command-buffer GPU prefill. Each remains overridable: set the
+/// variable to 0 to opt out, and the resident decode itself stays opt-in via
+/// CAMELID_METAL_RESIDENT_DECODE. (Library defaults are unchanged: this runs only in the
+/// CLI entry, so test suites and embedders see the conservative paths unless they enable.)
+fn apply_default_fast_stack() {
+    for key in [
+        "CAMELID_METAL_RESIDENT_DECODE",
+        "CAMELID_METAL_F32Y",
+        "CAMELID_METAL_WIRE",
+        "CAMELID_METAL_WIRE_NSG8",
+        "CAMELID_METAL_ATTN2",
+        "CAMELID_METAL_RESIDENT_PREFILL",
+    ] {
+        if std::env::var_os(key).is_none() {
+            std::env::set_var(key, "1");
+        }
+    }
 }
 
 /// Hard residency gate for pipeline nodes: every owned Q8_0 linear must hold plain
