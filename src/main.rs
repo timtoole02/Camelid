@@ -1119,6 +1119,7 @@ fn apply_default_fast_stack() {
         "CAMELID_METAL_WIRE_NSG8",
         "CAMELID_METAL_ATTN2",
         "CAMELID_METAL_RESIDENT_PREFILL",
+        "CAMELID_METAL_MM",
     ] {
         if std::env::var_os(key).is_none() {
             std::env::set_var(key, "1");

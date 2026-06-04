@@ -2541,9 +2541,14 @@ impl LlamaInferenceSession {
         let mut first_token_timings = LlamaForwardTimings::default();
         let prefill_count = token_ids.len().saturating_sub(1);
         let prefill_chunk_tokens = prefill_chunk_token_count(prefill_count);
+        let resident_prefill_started = Instant::now();
         if prefill_count > 1 && self.try_resident_prefill(&token_ids[..prefill_count])? {
             // Whole prompt prefilled on the GPU in one command buffer; the last prompt
-            // token below decodes through the resident session.
+            // token below decodes through the resident session. The wall-clock covers
+            // session setup + the command buffer; per-stage GPU splits aren't available.
+            let resident_prefill_us = resident_prefill_started.elapsed().as_micros();
+            timings.total += resident_prefill_us;
+            prefill_timings.total += resident_prefill_us;
         } else if prefill_count > 0
             && prefill_chunk_tokens > 1
             && prefill_layer_major_enabled(&self.weights)
