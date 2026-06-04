@@ -53,6 +53,8 @@ struct MetalLinearKernel {
     kv_scatter_kv16_pipeline: ComputePipelineState,
     f32_to_f16_pipeline: ComputePipelineState,
     rms_norm_batch_pipeline: ComputePipelineState,
+    rms_norm_batch_f16o_pipeline: ComputePipelineState,
+    silu_mul_f16o_pipeline: ComputePipelineState,
     rope_rotate_batch_pipeline: ComputePipelineState,
     kv_scatter_batch_pipeline: ComputePipelineState,
     attention_prefill_v2_pipeline: ComputePipelineState,
@@ -1750,6 +1752,53 @@ kernel void rms_norm_batch_f32(
     }
 }
 
+// rms_norm_batch_f32 with a half output — feeds the simdgroup-MM prefill GEMM
+// directly (same rounding point as the separate f32_to_f16 pass it replaces).
+kernel void rms_norm_batch_f16o(
+    device const float* input [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device half* output [[buffer(2)]],
+    constant uint& width [[buffer(3)]],
+    constant float& eps [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgsize [[threads_per_threadgroup]]
+) {
+    threadgroup float partial[256];
+    device const float* in_row = input + row * width;
+    device half* out_row = output + row * width;
+    float local = 0.0;
+    for (uint i = tid; i < width; i += tgsize) {
+        float v = in_row[i];
+        local += v * v;
+    }
+    partial[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgsize >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            partial[tid] += partial[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = 1.0 / sqrt(partial[0] / float(width) + eps);
+    for (uint i = tid; i < width; i += tgsize) {
+        out_row[i] = half(in_row[i] * inv * weight[i]);
+    }
+}
+
+// silu_mul_f32 with a half output — same rounding as silu then f32_to_f16.
+kernel void silu_mul_f16o(
+    device const float* gate [[buffer(0)]],
+    device const float* up [[buffer(1)]],
+    device half* output [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    float g = gate[gid];
+    output[gid] = half((g / (1.0 + exp(-g))) * up[gid]);
+}
+
 // rope_rotate_f32 over n_tokens rows: gid.y = token. The data row stride is
 // head_count*head_dim (the packed Q or K row) and the cos/sin tables are flattened
 // per-token (half_rope floats each).
@@ -2378,6 +2427,18 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let rms_norm_batch_pipeline = device
                 .new_compute_pipeline_state_with_function(&rms_norm_batch_function)
                 .ok()?;
+            let rms_norm_batch_f16o_function = elementwise_library
+                .get_function("rms_norm_batch_f16o", None)
+                .ok()?;
+            let rms_norm_batch_f16o_pipeline = device
+                .new_compute_pipeline_state_with_function(&rms_norm_batch_f16o_function)
+                .ok()?;
+            let silu_mul_f16o_function = elementwise_library
+                .get_function("silu_mul_f16o", None)
+                .ok()?;
+            let silu_mul_f16o_pipeline = device
+                .new_compute_pipeline_state_with_function(&silu_mul_f16o_function)
+                .ok()?;
             let rope_rotate_batch_function = elementwise_library
                 .get_function("rope_rotate_batch_f32", None)
                 .ok()?;
@@ -2534,6 +2595,8 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 kv_scatter_kv16_pipeline,
                 f32_to_f16_pipeline,
                 rms_norm_batch_pipeline,
+                rms_norm_batch_f16o_pipeline,
+                silu_mul_f16o_pipeline,
                 rope_rotate_batch_pipeline,
                 kv_scatter_batch_pipeline,
                 attention_prefill_v2_pipeline,
@@ -6296,19 +6359,27 @@ impl ResidentDecodeState {
             // Attention half: batched norm -> batched QKV GEMM -> batched rope/scatter ->
             // causal prefill attention (one dispatch, grid (n_heads, n_tokens)) -> O GEMM
             // -> residual.
-            norm_rows(
-                &e,
-                &k.rms_norm_batch_pipeline,
-                cur,
-                &attn_norm_buf,
-                &normf,
-                &rms_scalar,
-                n_tokens,
-            );
             let qkv_y: &Buffer = if use_mm {
-                convert(&e, &normf, &normf_h, &n_elems, 0, n_tokens * self.hidden);
+                norm_rows(
+                    &e,
+                    &k.rms_norm_batch_f16o_pipeline,
+                    cur,
+                    &attn_norm_buf,
+                    &normf_h,
+                    &rms_scalar,
+                    n_tokens,
+                );
                 &normf_h
             } else {
+                norm_rows(
+                    &e,
+                    &k.rms_norm_batch_pipeline,
+                    cur,
+                    &attn_norm_buf,
+                    &normf,
+                    &rms_scalar,
+                    n_tokens,
+                );
                 &normf
             };
             stage!("1:norm+cvt");
@@ -6417,19 +6488,27 @@ impl ResidentDecodeState {
                 n_tokens * self.hidden,
             );
             // FFN half.
-            norm_rows(
-                &e,
-                &k.rms_norm_batch_pipeline,
-                nxt,
-                &ffn_norm_buf,
-                &normf,
-                &rms_scalar,
-                n_tokens,
-            );
             let ffn_y: &Buffer = if use_mm {
-                convert(&e, &normf, &normf_h, &n_elems, 0, n_tokens * self.hidden);
+                norm_rows(
+                    &e,
+                    &k.rms_norm_batch_f16o_pipeline,
+                    nxt,
+                    &ffn_norm_buf,
+                    &normf_h,
+                    &rms_scalar,
+                    n_tokens,
+                );
                 &normf_h
             } else {
+                norm_rows(
+                    &e,
+                    &k.rms_norm_batch_pipeline,
+                    nxt,
+                    &ffn_norm_buf,
+                    &normf,
+                    &rms_scalar,
+                    n_tokens,
+                );
                 &normf
             };
             stage!("6:norm2+cvt");
@@ -6456,18 +6535,30 @@ impl ResidentDecodeState {
                 self.ffn_dim,
             );
             stage!("7:gemm_gateup");
-            encode_binary_off(
-                &e,
-                &k.silu_mul_pipeline,
-                &gate_buf,
-                &up_buf,
-                &silu_buf,
-                &n_elems,
-                4,
-                n_tokens * self.ffn_dim,
-            );
+            if use_mm {
+                encode_binary_off(
+                    &e,
+                    &k.silu_mul_f16o_pipeline,
+                    &gate_buf,
+                    &up_buf,
+                    &silu_h,
+                    &n_elems,
+                    4,
+                    n_tokens * self.ffn_dim,
+                );
+            } else {
+                encode_binary_off(
+                    &e,
+                    &k.silu_mul_pipeline,
+                    &gate_buf,
+                    &up_buf,
+                    &silu_buf,
+                    &n_elems,
+                    4,
+                    n_tokens * self.ffn_dim,
+                );
+            }
             let down_y: &Buffer = if use_mm {
-                convert(&e, &silu_buf, &silu_h, &n_elems, 4, n_tokens * self.ffn_dim);
                 &silu_h
             } else {
                 &silu_buf
