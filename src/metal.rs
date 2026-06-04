@@ -60,6 +60,8 @@ struct MetalLinearKernel {
     attention_prefill_v2_pipeline: ComputePipelineState,
     attention_prefill_v3_pipeline: ComputePipelineState,
     attention_prefill_flash_pipeline: ComputePipelineState,
+    half_mm_batched_pipeline: ComputePipelineState,
+    softmax_causal_rows_pipeline: ComputePipelineState,
     rms_norm_quantize_pipeline: ComputePipelineState,
     silu_mul_quantize_pipeline: ComputePipelineState,
     active_command_buffer: Mutex<Option<metal::CommandBuffer>>,
@@ -1846,6 +1848,8 @@ kernel void rope_rotate_batch_f32(
 }
 
 // kv_scatter_f32 over n_tokens rows: gid.y = token, written at base_position + token.
+// Also writes half copies (same layout) for the attention-as-matmul prefill path,
+// whose batched GEMMs consume K and V as half operands.
 kernel void kv_scatter_batch_f32(
     device const float* src_k [[buffer(0)]],
     device const float* src_v [[buffer(1)]],
@@ -1855,6 +1859,8 @@ kernel void kv_scatter_batch_f32(
     constant uint& max_positions [[buffer(5)]],
     constant uint& base_position [[buffer(6)]],
     constant uint& total [[buffer(7)]],
+    device half* cache_k16 [[buffer(8)]],
+    device half* cache_v16 [[buffer(9)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     if (gid.x >= total) return;
@@ -1866,6 +1872,193 @@ kernel void kv_scatter_batch_f32(
     uint dst = (h * max_positions + base_position + t) * head_dim + d;
     cache_k[dst] = src_k[src];
     cache_v[dst] = src_v[src];
+    cache_k16[dst] = half(src_k[src]);
+    cache_v16[dst] = half(src_v[src]);
+}
+
+
+// Batched half-precision GEMM for prefill attention-as-matmul:
+//   C[z][t][r] = sum_k A[z][r][k] * B[z][t][k]
+// with the same staged swizzled-8x8-tile structure as the Q8 prefill GEMM (A staged
+// TRANSPOSED k-major in-block, B token-major, 64x64 tiles, 4 simdgroups of 32x32
+// quadrants). A supports an element stride so V can be consumed as V^T without a
+// repack (a_elem_stride = head_dim picks V columns), and A's batch index is z /
+// group_a so GQA query heads share their KV head's K/V. causal_mode 1 (the S = Q K^T
+// pass) skips tiles whose positions all exceed the tile's last query; causal_mode 2
+// (the O = P V pass) clamps k to the tile's last query + 1 (P beyond is zero).
+// Ragged column tails stage through the A region and store guarded.
+kernel void half_mm_batched(
+    device const half* a [[buffer(0)]],
+    device const half* b [[buffer(1)]],
+    device float* c [[buffer(2)]],
+    constant uint& kdim [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant uint& cols [[buffer(5)]],
+    constant uint& a_batch_stride [[buffer(6)]],
+    constant uint& b_batch_stride [[buffer(7)]],
+    constant uint& c_batch_stride [[buffer(8)]],
+    constant uint& a_row_stride [[buffer(9)]],
+    constant uint& b_row_stride [[buffer(10)]],
+    constant uint& c_row_stride [[buffer(11)]],
+    constant uint& a_elem_stride [[buffer(12)]],
+    constant uint& group_a [[buffer(13)]],
+    constant uint& causal_mode [[buffer(14)]],
+    threadgroup half* shmem [[threadgroup(0)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint NR0 = 64; // A rows per tile
+    constexpr uint NR1 = 64; // B rows (tokens/queries) per tile
+    constexpr uint NK = 32;
+    const uint tid = sg * 32 + lane;
+    threadgroup half* sa = shmem;        // 64 x 32, swizzled, k-major in-block
+    threadgroup half* sb = shmem + 2048; // 64 x 32, swizzled, token-major
+    const uint r0 = tg.x * NR0;
+    const uint t0 = tg.y * NR1;
+    if (causal_mode == 1 && r0 > t0 + NR1 - 1) {
+        return; // S tile entirely above the causal diagonal: never read
+    }
+    const uint k_end = (causal_mode == 2) ? min(kdim, t0 + NR1) : kdim;
+    device const half* ab = a + (tg.z / group_a) * a_batch_stride;
+    device const half* bb = b + tg.z * b_batch_stride;
+    device float* cb = c + tg.z * c_batch_stride;
+
+    const uint lr0 = tid / 2;
+    const uint k0 = (tid % 2) * 16;
+    const uint lr1 = tid / 2;
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[4];
+    simdgroup_float8x8 mc[16];
+    for (uint i = 0; i < 16; ++i) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+    const uint sg_row_oct = (sg % 2) * 4;
+    const uint sg_tok_oct = (sg / 2) * 4;
+    // Skip quadrants that are entirely padding (tokens past cols) or, in the causal
+    // score pass, entirely above the diagonal. Staging and barriers stay uniform.
+    const uint quad_t0 = t0 + 8 * sg_tok_oct;
+    const uint quad_r0 = r0 + 32 * (sg % 2);
+    const bool sg_active = quad_t0 < cols
+        && !(causal_mode == 1 && quad_r0 > quad_t0 + 31);
+
+    for (uint kk0 = 0; kk0 < k_end; kk0 += NK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // A: 64 rows x 32 k staged TRANSPOSED (k-major in-block); zero-pad past kdim.
+        {
+            device const half* arow =
+                ab + (r0 + lr0) * a_row_stride + (kk0 + k0) * a_elem_stride;
+            const uint sy = lr0 / 8;
+            const uint lx = lr0 % 8;
+            for (uint i = 0; i < 16; ++i) {
+                const uint kg = k0 + i;
+                sa[64 * (8 * (kg / 8) + sy) + 8 * (kg % 8) + lx] =
+                    (kk0 + kg < kdim) ? arow[i * a_elem_stride] : half(0.0f);
+            }
+        }
+        // B: 64 rows x 32 k, token-major vector stores (B is padded past cols).
+        {
+            device const half* brow = bb + (t0 + lr1) * b_row_stride + kk0 + k0;
+            const uint sy = lr1 / 8;
+            const uint ly = lr1 % 8;
+            for (uint s = 0; s < 2; ++s) {
+                *reinterpret_cast<threadgroup half2x4*>(
+                    sb + 64 * (8 * (k0 / 8 + s) + sy) + 8 * ly) =
+                    *reinterpret_cast<device const half2x4*>(brow + 8 * s);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sg_active) {
+            threadgroup const half* lsma = sa + 64 * sg_row_oct;
+            threadgroup const half* lsmb = sb + 64 * sg_tok_oct;
+            for (uint ik = 0; ik < NK / 8; ++ik) {
+                for (uint i = 0; i < 4; ++i) {
+                    simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
+                }
+                for (uint i = 0; i < 4; ++i) {
+                    simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
+                }
+                for (uint i = 0; i < 16; ++i) {
+                    simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+                }
+                lsma += 64 * 8;
+                lsmb += 64 * 8;
+            }
+        }
+    }
+
+    if (t0 + NR1 <= cols) {
+        device float* cq = cb + (r0 + 32 * (sg % 2)) + (t0 + 32 * (sg / 2)) * c_row_stride;
+        for (uint i = 0; i < 16; ++i) {
+            simdgroup_store(mc[i], cq + 8 * (i % 4) + 8 * c_row_stride * (i / 4),
+                            c_row_stride, 0, false);
+        }
+    } else {
+        // Ragged token tail: stage each fragment through the A region, write guarded.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float* scratch = reinterpret_cast<threadgroup float*>(shmem);
+        for (uint i = 0; i < 16; ++i) {
+            simdgroup_store(mc[i], scratch + sg * 64, 8);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            const uint t_oct = t0 + 32 * (sg / 2) + 8 * (i / 4);
+            const uint r_oct = r0 + 32 * (sg % 2) + 8 * (i % 4);
+            for (uint e2 = lane; e2 < 64; e2 += 32) {
+                const uint ft = e2 / 8;
+                const uint fr = e2 % 8;
+                if (t_oct + ft < cols) {
+                    cb[(t_oct + ft) * c_row_stride + r_oct + fr] =
+                        scratch[sg * 64 + ft * 8 + fr];
+                }
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
+// Causal softmax over one score row per simdgroup: P[q][p] = exp(scale*S - m) / l for
+// p <= q (zero otherwise, including the whole row when q >= n_tokens, so the PV pass
+// can consume padded rows safely). Grid: (n_heads, n_pad rows), 32 threads.
+kernel void softmax_causal_rows(
+    device const float* s [[buffer(0)]],
+    device half* p_out [[buffer(1)]],
+    constant uint& n_pad [[buffer(2)]],
+    constant uint& n_tokens [[buffer(3)]],
+    constant float& scale [[buffer(4)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    // 8 rows per 256-thread threadgroup, one simdgroup per row. P is written only up
+    // to the 64-aligned causal boundary the PV pass reads (its k-range is clamped to
+    // ((q/64)+1)*64), except padded rows which zero their full span for safety.
+    const uint q = tg.y * 8 + sg;
+    if (q >= n_pad) return;
+    const ulong base = (ulong)tg.x * n_pad * n_pad + (ulong)q * n_pad;
+    device const float* srow = s + base;
+    device half* prow = p_out + base;
+    if (q >= n_tokens) {
+        for (uint j = lane; j < n_pad; j += 32) {
+            prow[j] = half(0.0f);
+        }
+        return;
+    }
+    const uint write_end = min(n_pad, ((q / 64) + 1) * 64);
+    float m = -INFINITY;
+    for (uint j = lane; j <= q; j += 32) {
+        m = max(m, srow[j] * scale);
+    }
+    m = simd_max(m);
+    float l = 0.0f;
+    for (uint j = lane; j <= q; j += 32) {
+        l += exp(srow[j] * scale - m);
+    }
+    l = simd_sum(l);
+    const float inv = 1.0f / l;
+    for (uint j = lane; j < write_end; j += 32) {
+        prow[j] = (j <= q) ? half(exp(srow[j] * scale - m) * inv) : half(0.0f);
+    }
 }
 
 // Flash-tiled causal prefill attention: threadgroup (q_head, 32-query tile), simdgroup
@@ -2475,6 +2668,18 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let attention_prefill_flash_pipeline = device
                 .new_compute_pipeline_state_with_function(&attention_prefill_flash_function)
                 .ok()?;
+            let half_mm_batched_function = elementwise_library
+                .get_function("half_mm_batched", None)
+                .ok()?;
+            let half_mm_batched_pipeline = device
+                .new_compute_pipeline_state_with_function(&half_mm_batched_function)
+                .ok()?;
+            let softmax_causal_rows_function = elementwise_library
+                .get_function("softmax_causal_rows", None)
+                .ok()?;
+            let softmax_causal_rows_pipeline = device
+                .new_compute_pipeline_state_with_function(&softmax_causal_rows_function)
+                .ok()?;
             let rms_norm_quantize_function = elementwise_library
                 .get_function("rms_norm_quantize_f32", None)
                 .ok()?;
@@ -2608,6 +2813,8 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 attention_prefill_v2_pipeline,
                 attention_prefill_v3_pipeline,
                 attention_prefill_flash_pipeline,
+                half_mm_batched_pipeline,
+                softmax_causal_rows_pipeline,
                 rms_norm_quantize_pipeline,
                 silu_mul_quantize_pipeline,
                 active_command_buffer: Mutex::new(None),
@@ -6234,6 +6441,54 @@ impl ResidentDecodeState {
         // direct device B loads never run off the end (padding rows are garbage; they
         // only feed output columns past n_tokens, which are never stored).
         let n_pad = n_tokens.next_multiple_of(128);
+        // Attention-as-matmul scratch (prompts short enough to materialize S):
+        // half K/V copies, half Q, S scores f32 and P probabilities half per head.
+        let gqa_group = self.n_heads / self.n_kv_heads;
+        let use_attn_mm = use_mm
+            && self.head_dim.is_multiple_of(8)
+            && self.head_dim <= 128
+            && self.n_heads * n_pad * n_pad * 4 <= 256 * 1024 * 1024;
+        let kv16_len = self.n_kv_heads * self.max_positions * self.head_dim * 2;
+        let cache_k16 = nb(if use_attn_mm { kv16_len } else { 2 });
+        let cache_v16 = nb(if use_attn_mm { kv16_len } else { 2 });
+        if use_attn_mm {
+            // Zero-fill: the PV pass's k-range covers padded positions the scatter
+            // never writes; uninitialized halfs there can be NaN/Inf and 0 x NaN
+            // poisons the MMA accumulators.
+            unsafe {
+                std::ptr::write_bytes(cache_k16.contents() as *mut u8, 0, kv16_len);
+                std::ptr::write_bytes(cache_v16.contents() as *mut u8, 0, kv16_len);
+            }
+        }
+        let q_h = nb(if use_attn_mm { n_pad * q_dim * 2 } else { 2 });
+        let s_big = nb(if use_attn_mm { self.n_heads * n_pad * n_pad * 4 } else { 4 });
+        let p_big = nb(if use_attn_mm { self.n_heads * n_pad * n_pad * 2 } else { 2 });
+        let attn_mm_scalar = nb(48);
+        unsafe {
+            let p = attn_mm_scalar.contents() as *mut u32;
+            // S pass: kdim=head_dim, rows=n_pad (positions), cols=n_tokens (queries)
+            *p = self.head_dim as u32;
+            *p.add(1) = n_pad as u32;
+            *p.add(2) = n_tokens as u32;
+            // PV pass: kdim=n_pad, rows=head_dim, cols=n_tokens
+            *p.add(3) = n_pad as u32;
+            *p.add(4) = self.head_dim as u32;
+            *p.add(5) = n_tokens as u32;
+            // shared strides and modes filled per-dispatch below
+            *p.add(6) = (self.max_positions * self.head_dim) as u32; // kv batch stride
+            *p.add(7) = (n_pad * n_pad) as u32; // S/P batch stride
+            *p.add(8) = self.head_dim as u32; // q batch stride / kv row stride
+            *p.add(9) = q_dim as u32; // q row stride (also ctx row stride)
+            *p.add(10) = 1u32; // group=1 placeholder (real group below)
+            *p.add(11) = gqa_group as u32;
+        }
+        let softmax_scalar = nb(12);
+        unsafe {
+            let p = softmax_scalar.contents() as *mut u32;
+            *p = n_pad as u32;
+            *p.add(1) = n_tokens as u32;
+            *(p.add(2) as *mut f32) = scale;
+        }
         let normf_h = nb(if use_mm { n_pad * self.hidden * 2 } else { 2 });
         let ctx_h = nb(if use_mm { n_pad * q_dim * 2 } else { 2 });
         let silu_h = nb(if use_mm { n_pad * self.ffn_dim * 2 } else { 2 });
@@ -6427,16 +6682,137 @@ impl ResidentDecodeState {
             for j in 0..4u64 {
                 e.set_buffer(4 + j, Some(&scatter_scalar), j * 4);
             }
+            e.set_buffer(8, Some(&cache_k16), 0);
+            e.set_buffer(9, Some(&cache_v16), 0);
             dispatch_rows(&e, &k.kv_scatter_batch_pipeline, kv_dim, n_tokens);
             stage!("3:rope+scatter");
             let use_flash_attn = use_mm && self.head_dim.is_multiple_of(8) && self.head_dim <= 128;
-            if use_flash_attn {
+            if use_attn_mm {
+                // Attention as two batched half GEMMs + a causal row softmax: the
+                // matmuls ride the same staged simdgroup-tile structure as the
+                // weight GEMMs, with upper-triangle S tiles culled and the PV k-range
+                // clamped to the causal limit.
+                // q -> half
+                convert(&e, &q_buf, &q_h, &n_elems, 8, n_tokens * q_dim);
+                // S = Q K^T (per query head; K shared per KV head)
+                let smm = |e: &metal::ComputeCommandEncoderRef,
+                           a: &Buffer,
+                           b_buf2: &Buffer,
+                           c_buf2: &Buffer,
+                           kdim_off: u64,
+                           a_bs: u32,
+                           b_bs: u32,
+                           c_bs: u32,
+                           a_rs: u32,
+                           b_rs: u32,
+                           c_rs: u32,
+                           a_es: u32,
+                           grp: u32,
+                           mode: u32,
+                           rows: usize,
+                           cols: usize| {
+                    e.set_compute_pipeline_state(&k.half_mm_batched_pipeline);
+                    e.set_buffer(0, Some(a), 0);
+                    e.set_buffer(1, Some(b_buf2), 0);
+                    e.set_buffer(2, Some(c_buf2), 0);
+                    e.set_buffer(3, Some(&attn_mm_scalar), kdim_off);
+                    e.set_buffer(4, Some(&attn_mm_scalar), kdim_off + 4);
+                    e.set_buffer(5, Some(&attn_mm_scalar), kdim_off + 8);
+                    // dynamic scalars in a transient buffer
+                    let dyn_buf = nb(36);
+                    unsafe {
+                        let p = dyn_buf.contents() as *mut u32;
+                        *p = a_bs;
+                        *p.add(1) = b_bs;
+                        *p.add(2) = c_bs;
+                        *p.add(3) = a_rs;
+                        *p.add(4) = b_rs;
+                        *p.add(5) = c_rs;
+                        *p.add(6) = a_es;
+                        *p.add(7) = grp;
+                        *p.add(8) = mode;
+                    }
+                    for j in 0..9u64 {
+                        e.set_buffer(6 + j, Some(&dyn_buf), j * 4);
+                    }
+                    e.set_threadgroup_memory_length(0, 8192);
+                    e.dispatch_thread_groups(
+                        metal::MTLSize {
+                            width: (rows as u64).div_ceil(64),
+                            height: (cols as u64).div_ceil(64),
+                            depth: self.n_heads as u64,
+                        },
+                        metal::MTLSize {
+                            width: 128,
+                            height: 1,
+                            depth: 1,
+                        },
+                    );
+                };
+                smm(
+                    &e,
+                    &cache_k16,
+                    &q_h,
+                    &s_big,
+                    0,
+                    (self.max_positions * self.head_dim) as u32,
+                    self.head_dim as u32,
+                    (n_pad * n_pad) as u32,
+                    self.head_dim as u32,
+                    q_dim as u32,
+                    n_pad as u32,
+                    1,
+                    gqa_group as u32,
+                    1,
+                    n_pad,
+                    n_tokens,
+                );
+                // causal softmax rows -> P
+                e.set_compute_pipeline_state(&k.softmax_causal_rows_pipeline);
+                e.set_buffer(0, Some(&s_big), 0);
+                e.set_buffer(1, Some(&p_big), 0);
+                e.set_buffer(2, Some(&softmax_scalar), 0);
+                e.set_buffer(3, Some(&softmax_scalar), 4);
+                e.set_buffer(4, Some(&softmax_scalar), 8);
+                e.dispatch_thread_groups(
+                    metal::MTLSize {
+                        width: self.n_heads as u64,
+                        height: (n_pad as u64).div_ceil(8),
+                        depth: 1,
+                    },
+                    metal::MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+                // O = P V into ctx_buf [token][q_dim] (head offset via c batch stride)
+                smm(
+                    &e,
+                    &cache_v16,
+                    &p_big,
+                    &ctx_buf,
+                    12,
+                    (self.max_positions * self.head_dim) as u32,
+                    (n_pad * n_pad) as u32,
+                    self.head_dim as u32,
+                    1,
+                    n_pad as u32,
+                    q_dim as u32,
+                    self.head_dim as u32,
+                    gqa_group as u32,
+                    2,
+                    self.head_dim,
+                    n_tokens,
+                );
+            } else if use_flash_attn {
                 // Flash-tiled attention: K/V tiles stage once per 32-query tile and the
                 // score/value matmuls ride the simdgroup matrix units.
                 e.set_compute_pipeline_state(&k.attention_prefill_flash_pipeline);
             } else {
                 e.set_compute_pipeline_state(&k.attention_prefill_v3_pipeline);
             }
+            if !use_attn_mm {
             e.set_buffer(0, Some(&q_buf), 0);
             e.set_buffer(1, Some(&self.cache_k[i]), 0);
             e.set_buffer(2, Some(&self.cache_v[i]), 0);
@@ -6473,6 +6849,7 @@ impl ResidentDecodeState {
                         depth: 1,
                     },
                 );
+            }
             }
             let o_y: &Buffer = if use_mm {
                 convert(&e, &ctx_buf, &ctx_h, &n_elems, 8, n_tokens * q_dim);
@@ -9069,5 +9446,429 @@ kernel void kernel_mul_mm_q8_0_f32(
                 flops / (busy_us as f64 * 1e-6) / 1e12,
             );
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod attn_mm_probe {
+    use super::*;
+
+    /// Batched f16 GEMM probe on the prefill-attention shapes (S = Q K^T and O = P V,
+    /// 24 heads, 601 tokens, head_dim 128) using the staged swizzled-tile structure.
+    /// cargo test --release attn_mm_probe_shapes -- --nocapture --ignored
+    #[test]
+    #[ignore]
+    fn attn_mm_probe_shapes() {
+        let k_ref = metal_linear_kernel().expect("metal");
+        let device = &k_ref.device;
+        let src = r#"
+#include <metal_stdlib>
+using namespace metal;
+// C[b][t][r] = sum_k A[b][r][k] * B[b][t][k] — both operands half, staged in swizzled
+// 8x8 blocks like the Q8 prefill GEMM (A k-major transposed in-block, B token-major).
+// 64-row x 64-token tiles, 128 threads, 4 simdgroups of 32x32 quadrants.
+kernel void half_mm_batched(
+    device const half* a [[buffer(0)]],
+    device const half* b [[buffer(1)]],
+    device float* c [[buffer(2)]],
+    constant uint& kdim [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant uint& cols [[buffer(5)]],      // tokens
+    constant uint& a_batch_stride [[buffer(6)]],
+    constant uint& b_batch_stride [[buffer(7)]],
+    constant uint& c_batch_stride [[buffer(8)]],
+    constant uint& a_row_stride [[buffer(9)]],
+    constant uint& b_row_stride [[buffer(10)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint NR0 = 64;
+    constexpr uint NR1 = 64;
+    constexpr uint NK = 32;
+    const uint tid = sg * 32 + lane;
+    threadgroup half sa[64 * 32];
+    threadgroup half sb[64 * 32];
+    const uint r0 = tg.x * NR0;
+    const uint t0 = tg.y * NR1;
+    device const half* ab = a + tg.z * a_batch_stride;
+    device const half* bb = b + tg.z * b_batch_stride;
+    device float* cb = c + tg.z * c_batch_stride;
+
+    const uint lr0 = tid / 2;
+    const uint k0 = (tid % 2) * 16;
+    const uint lr1 = tid / 2;
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[4];
+    simdgroup_float8x8 mc[16];
+    for (uint i = 0; i < 16; ++i) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+    const uint sg_row_oct = (sg % 2) * 4;
+    const uint sg_tok_oct = (sg / 2) * 4;
+
+    for (uint kk0 = 0; kk0 < kdim; kk0 += NK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // A: 64 rows x 32 k staged TRANSPOSED (k-major in-block).
+        {
+            device const half* arow = ab + (r0 + lr0) * a_row_stride + kk0 + k0;
+            const uint sy = lr0 / 8;
+            const uint lx = lr0 % 8;
+            for (uint i = 0; i < 16; ++i) {
+                const uint kg = k0 + i;
+                sa[64 * (8 * (kg / 8) + sy) + 8 * (kg % 8) + lx] = arow[i];
+            }
+        }
+        // B: 64 tokens x 32 k, token-major vector stores.
+        {
+            device const half* brow = bb + (t0 + lr1) * b_row_stride + kk0 + k0;
+            const uint sy = lr1 / 8;
+            const uint ly = lr1 % 8;
+            for (uint s = 0; s < 2; ++s) {
+                *reinterpret_cast<threadgroup half2x4*>(sb + 64 * (8 * (k0 / 8 + s) + sy) + 8 * ly) =
+                    *reinterpret_cast<device const half2x4*>(brow + 8 * s);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half* lsma = sa + 64 * sg_row_oct;
+        threadgroup const half* lsmb = sb + 64 * sg_tok_oct;
+        for (uint ik = 0; ik < NK / 8; ++ik) {
+            for (uint i = 0; i < 4; ++i) {
+                simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
+            }
+            for (uint i = 0; i < 4; ++i) {
+                simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
+            }
+            for (uint i = 0; i < 16; ++i) {
+                simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+            }
+            lsma += 64 * 8;
+            lsmb += 64 * 8;
+        }
+    }
+    device float* cq = cb + (r0 + 32 * (sg % 2)) + (t0 + 32 * (sg / 2)) * rows;
+    for (uint i = 0; i < 16; ++i) {
+        simdgroup_store(mc[i], cq + 8 * (i % 4) + 8 * rows * (i / 4), rows, 0, false);
+    }
+}
+"#;
+        let options = CompileOptions::new();
+        let lib = device
+            .new_library_with_source(src, &options)
+            .map_err(|e| panic!("attn mm compile: {e}"))
+            .unwrap();
+        let f = lib.get_function("half_mm_batched", None).unwrap();
+        let p = device.new_compute_pipeline_state_with_function(&f).unwrap();
+
+        let heads: usize = 24;
+        let n: usize = 601;
+        let n_pad: usize = 640;
+        let hd: usize = 128;
+        // S shape: rows = positions(n_pad), cols = queries(n_pad), k = 128
+        // PV shape: rows = head_dim(128), cols = queries(n_pad), k = n_pad
+        let big = heads * n_pad * hd.max(n_pad);
+        let a_buf = device.new_buffer((heads * n_pad * n_pad.max(hd) * 2) as u64, MTLResourceOptions::StorageModeShared);
+        let b_buf = device.new_buffer((heads * n_pad * n_pad.max(hd) * 2) as u64, MTLResourceOptions::StorageModeShared);
+        let c_buf = device.new_buffer((heads * n_pad * n_pad * 4) as u64, MTLResourceOptions::StorageModeShared);
+        let _ = big;
+        let scalar = device.new_buffer(44, MTLResourceOptions::StorageModeShared);
+        let run = |label: &str, kdim: usize, rows: usize, cols: usize, a_rs: usize, b_rs: usize| {
+            unsafe {
+                let s = scalar.contents() as *mut u32;
+                *s = kdim as u32;
+                *s.add(1) = rows as u32;
+                *s.add(2) = cols as u32;
+                *s.add(3) = (n_pad * a_rs.max(1)) as u32; // a batch stride (elems)
+                *s.add(4) = (n_pad * b_rs.max(1)) as u32;
+                *s.add(5) = (rows * n_pad) as u32; // c batch stride
+                *s.add(6) = a_rs as u32;
+                *s.add(7) = b_rs as u32;
+            }
+            for round in 0..3 {
+                let cb = k_ref.queue.new_command_buffer();
+                let e = cb.new_compute_command_encoder();
+                e.set_compute_pipeline_state(&p);
+                e.set_buffer(0, Some(&a_buf), 0);
+                e.set_buffer(1, Some(&b_buf), 0);
+                e.set_buffer(2, Some(&c_buf), 0);
+                for j in 0..8u64 {
+                    e.set_buffer(3 + j, Some(&scalar), j * 4);
+                }
+                e.dispatch_thread_groups(
+                    metal::MTLSize {
+                        width: (rows as u64).div_ceil(64),
+                        height: (cols as u64).div_ceil(64),
+                        depth: heads as u64,
+                    },
+                    metal::MTLSize { width: 128, height: 1, depth: 1 },
+                );
+                e.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                let (busy_us, _) = command_buffer_gpu_times_us(&cb.to_owned());
+                let flops = 2.0 * heads as f64 * rows as f64 * cols as f64 * kdim as f64;
+                eprintln!(
+                    "[attn-mm] {label} round {round}: {busy_us}us  {:.2} TFLOPS",
+                    flops / (busy_us as f64 * 1e-6) / 1e12
+                );
+            }
+        };
+        // S = Q K^T: A = K [n_pad x 128], B = Q [n_pad x 128], C [n_pad x n_pad]
+        run("S(QK^T)", hd, n_pad, n_pad, hd, hd);
+        // O = P V: A = V^T-ish [128 x n_pad] (row stride n_pad), B = P [n_pad x n_pad]
+        run("O(PV)", n_pad, hd, n_pad, n_pad, n_pad);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod attn_mm_parity {
+    use super::*;
+
+    fn h(x: f32) -> u16 {
+        f32_to_f16_bits(x)
+    }
+    fn fh(b: u16) -> f32 {
+        // f16 bits -> f32 (sufficient for test values)
+        let s = ((b >> 15) & 1) as i32;
+        let e = ((b >> 10) & 0x1f) as i32;
+        let m = (b & 0x3ff) as i32;
+        let v = if e == 0 {
+            (m as f32) * 2f32.powi(-24)
+        } else {
+            (1.0 + m as f32 / 1024.0) * 2f32.powi(e - 15)
+        };
+        if s == 1 {
+            -v
+        } else {
+            v
+        }
+    }
+
+    /// half_mm_batched S-shape parity vs CPU: C[z][t][r] = sum_k A[z/g][r][k]*B[z][t][k].
+    /// cargo test --release attn_mm_small_parity -- --nocapture --ignored
+    #[test]
+    #[ignore]
+    fn attn_mm_small_parity() {
+        let k_ref = metal_linear_kernel().expect("metal");
+        let device = &k_ref.device;
+        let heads = 4usize;
+        let group = 2usize;
+        let kv_heads = heads / group;
+        let n = 70usize; // ragged
+        let n_pad = 128usize;
+        let hd = 64usize; // PV rows must be 64-aligned (model head_dim = 128)
+        let max_pos = 256usize;
+
+        // A = "K": [kv_head][max_pos][hd]
+        let mut a = vec![0u16; kv_heads * max_pos * hd];
+        for (i, v) in a.iter_mut().enumerate() {
+            *v = h(((i % 23) as f32 - 11.0) * 0.07);
+        }
+        // B = "Q": [token][heads*hd]
+        let qdim = heads * hd;
+        let mut b = vec![0u16; n_pad * qdim];
+        for (i, v) in b.iter_mut().enumerate() {
+            *v = h(((i % 19) as f32 - 9.0) * 0.05);
+        }
+        let a_buf = device.new_buffer_with_data(
+            a.as_ptr() as *const _,
+            (a.len() * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let b_buf = device.new_buffer_with_data(
+            b.as_ptr() as *const _,
+            (b.len() * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let c_buf = device.new_buffer(
+            (heads * n_pad * n_pad * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let scalar = device.new_buffer(64, MTLResourceOptions::StorageModeShared);
+        unsafe {
+            let p = scalar.contents() as *mut u32;
+            *p = hd as u32; // kdim
+            *p.add(1) = n_pad as u32; // rows
+            *p.add(2) = n_pad as u32; // cols
+            *p.add(3) = (max_pos * hd) as u32; // a batch stride
+            *p.add(4) = hd as u32; // b batch stride
+            *p.add(5) = (n_pad * n_pad) as u32; // c batch stride
+            *p.add(6) = hd as u32; // a row stride
+            *p.add(7) = qdim as u32; // b row stride
+            *p.add(8) = n_pad as u32; // c row stride
+            *p.add(9) = 1u32; // a elem stride
+            *p.add(10) = group as u32;
+            *p.add(11) = 0u32; // no causal culling for the parity check
+        }
+        let cb = k_ref.queue.new_command_buffer();
+        let e = cb.new_compute_command_encoder();
+        e.set_compute_pipeline_state(&k_ref.half_mm_batched_pipeline);
+        e.set_buffer(0, Some(&a_buf), 0);
+        e.set_buffer(1, Some(&b_buf), 0);
+        e.set_buffer(2, Some(&c_buf), 0);
+        for j in 0..12u64 {
+            e.set_buffer(3 + j, Some(&scalar), j * 4);
+        }
+        e.set_threadgroup_memory_length(0, 8192);
+        e.dispatch_thread_groups(
+            metal::MTLSize {
+                width: (n_pad as u64).div_ceil(64),
+                height: (n_pad as u64).div_ceil(64),
+                depth: heads as u64,
+            },
+            metal::MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            },
+        );
+        e.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let c = unsafe {
+            std::slice::from_raw_parts(c_buf.contents() as *const f32, heads * n_pad * n_pad)
+        };
+        let mut max_err = 0f32;
+        let mut worst = (0, 0, 0, 0f32, 0f32);
+        for z in 0..heads {
+            for t in (0..n).step_by(7) {
+                for r in (0..n).step_by(11) {
+                    let mut acc = 0f32;
+                    for kk in 0..hd {
+                        let av = fh(a[(z / group) * max_pos * hd + r * hd + kk]);
+                        let bv = fh(b[t * qdim + z * hd + kk]);
+                        acc += av * bv;
+                    }
+                    let got = c[z * n_pad * n_pad + t * n_pad + r];
+                    let err = (got - acc).abs();
+                    if err > max_err {
+                        max_err = err;
+                        worst = (z, t, r, got, acc);
+                    }
+                }
+            }
+        }
+        eprintln!("[attn-mm-parity] max_err={max_err} worst={worst:?}");
+        assert!(max_err < 1e-2, "half_mm_batched mismatch: {worst:?}");
+
+        // ---- full chain: causal softmax + PV vs CPU attention reference ----
+        let scale = 0.25f32;
+        let p_buf = device.new_buffer(
+            (heads * n_pad * n_pad * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let sm_scalar = device.new_buffer(12, MTLResourceOptions::StorageModeShared);
+        unsafe {
+            let p = sm_scalar.contents() as *mut u32;
+            *p = n_pad as u32;
+            *p.add(1) = n as u32;
+            *(p.add(2) as *mut f32) = scale;
+        }
+        let ctx_buf = device.new_buffer(
+            (n * qdim * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let pv_scalar = device.new_buffer(64, MTLResourceOptions::StorageModeShared);
+        unsafe {
+            let p = pv_scalar.contents() as *mut u32;
+            *p = n_pad as u32; // kdim
+            *p.add(1) = hd as u32; // rows
+            *p.add(2) = n as u32; // cols
+            *p.add(3) = (max_pos * hd) as u32; // a batch (V)
+            *p.add(4) = (n_pad * n_pad) as u32; // b batch (P)
+            *p.add(5) = hd as u32; // c batch (ctx head offset)
+            *p.add(6) = 1u32; // a row stride (V^T)
+            *p.add(7) = n_pad as u32; // b row stride
+            *p.add(8) = qdim as u32; // c row stride
+            *p.add(9) = hd as u32; // a elem stride (V^T)
+            *p.add(10) = group as u32;
+            *p.add(11) = 2u32; // causal k-clamp
+        }
+        // V: reuse `a` pattern as V too (separate buffer to be explicit)
+        let v = a.clone();
+        let v_buf = device.new_buffer_with_data(
+            v.as_ptr() as *const _,
+            (v.len() * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let cb = k_ref.queue.new_command_buffer();
+        let e = cb.new_compute_command_encoder();
+        e.set_compute_pipeline_state(&k_ref.softmax_causal_rows_pipeline);
+        e.set_buffer(0, Some(&c_buf), 0);
+        e.set_buffer(1, Some(&p_buf), 0);
+        e.set_buffer(2, Some(&sm_scalar), 0);
+        e.set_buffer(3, Some(&sm_scalar), 4);
+        e.set_buffer(4, Some(&sm_scalar), 8);
+        e.dispatch_thread_groups(
+            metal::MTLSize {
+                width: heads as u64,
+                height: (n_pad as u64).div_ceil(8),
+                depth: 1,
+            },
+            metal::MTLSize { width: 256, height: 1, depth: 1 },
+        );
+        e.set_compute_pipeline_state(&k_ref.half_mm_batched_pipeline);
+        e.set_buffer(0, Some(&v_buf), 0);
+        e.set_buffer(1, Some(&p_buf), 0);
+        e.set_buffer(2, Some(&ctx_buf), 0);
+        for j in 0..12u64 {
+            e.set_buffer(3 + j, Some(&pv_scalar), j * 4);
+        }
+        e.set_threadgroup_memory_length(0, 8192);
+        e.dispatch_thread_groups(
+            metal::MTLSize {
+                width: (hd as u64).div_ceil(64),
+                height: (n as u64).div_ceil(64),
+                depth: heads as u64,
+            },
+            metal::MTLSize { width: 128, height: 1, depth: 1 },
+        );
+        e.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let ctx = unsafe {
+            std::slice::from_raw_parts(ctx_buf.contents() as *const f32, n * qdim)
+        };
+        let mut max_err2 = 0f32;
+        let mut worst2 = (0, 0, 0, 0f32, 0f32);
+        for z in 0..heads {
+            for q in (0..n).step_by(5) {
+                // CPU reference attention for row q
+                let mut scores = vec![0f32; q + 1];
+                let mut m = f32::NEG_INFINITY;
+                for p2 in 0..=q {
+                    let mut acc = 0f32;
+                    for kk in 0..hd {
+                        let kv = fh(a[(z / group) * max_pos * hd + p2 * hd + kk]);
+                        let qv = fh(b[q * qdim + z * hd + kk]);
+                        acc += kv * qv;
+                    }
+                    scores[p2] = acc * scale;
+                    m = m.max(scores[p2]);
+                }
+                let l: f32 = scores.iter().map(|s| (s - m).exp()).sum();
+                for d in (0..hd).step_by(3) {
+                    let mut o = 0f32;
+                    for p2 in 0..=q {
+                        let pw = ((scores[p2] - m).exp() / l) as f32;
+                        // kernel rounds P to half
+                        let pw = fh(h(pw));
+                        o += pw * fh(v[(z / group) * max_pos * hd + p2 * hd + d]);
+                    }
+                    let got = ctx[q * qdim + z * hd + d];
+                    let err = (got - o).abs();
+                    if err > max_err2 {
+                        max_err2 = err;
+                        worst2 = (z, q, d, got, o);
+                    }
+                }
+            }
+        }
+        eprintln!("[attn-chain-parity] max_err={max_err2} worst={worst2:?}");
+        assert!(max_err2 < 5e-2, "chain mismatch: {worst2:?}");
     }
 }
