@@ -1966,33 +1966,31 @@ kernel void attention_prefill_flash_f32(
             const uint p = tid / 4;
             const uint dseg = (tid % 4) * 32;
             const uint pp = kp0 + p;
-            const uint k_sy = p / 8;
-            const uint k_lx = p % 8;
             const uint v_sx = p / 8;
             const uint v_ly = p % 8;
+            // Both tiles stage natural-order (vector-friendly); the score MMA loads K
+            // fragments with transpose=true — cheap from threadgroup memory, unlike
+            // the catastrophic device transpose loads.
             if (pp < n_tokens) {
                 device const float* ks = keys + kv_base + pp * position_stride + dseg;
                 device const float* vs = values + kv_base + pp * position_stride + dseg;
-                for (uint i = 0; i < min(32u, head_dim - dseg); ++i) {
-                    const uint d = dseg + i;
-                    k_s[64 * (4 * (d / 8) + k_sy) + 8 * (d % 8) + k_lx] = half(ks[i]);
-                }
                 for (uint d = dseg; d < min(dseg + 32u, head_dim); d += 8) {
-                    threadgroup half* dst = qv_s + 64 * (v_sx * d_oct + d / 8) + 8 * v_ly;
+                    threadgroup half* kd = k_s + 64 * (v_sx * d_oct + d / 8) + 8 * v_ly;
+                    threadgroup half* vd = qv_s + 64 * (v_sx * d_oct + d / 8) + 8 * v_ly;
+                    device const float* sk = ks + (d - dseg);
                     device const float* sv = vs + (d - dseg);
                     for (uint i = 0; i < 8; ++i) {
-                        dst[i] = half(sv[i]);
+                        kd[i] = half(sk[i]);
+                        vd[i] = half(sv[i]);
                     }
                 }
             } else {
-                for (uint i = 0; i < min(32u, head_dim - dseg); ++i) {
-                    const uint d = dseg + i;
-                    k_s[64 * (4 * (d / 8) + k_sy) + 8 * (d % 8) + k_lx] = half(0.0f);
-                }
                 for (uint d = dseg; d < min(dseg + 32u, head_dim); d += 8) {
-                    threadgroup half* dst = qv_s + 64 * (v_sx * d_oct + d / 8) + 8 * v_ly;
+                    threadgroup half* kd = k_s + 64 * (v_sx * d_oct + d / 8) + 8 * v_ly;
+                    threadgroup half* vd = qv_s + 64 * (v_sx * d_oct + d / 8) + 8 * v_ly;
                     for (uint i = 0; i < 8; ++i) {
-                        dst[i] = half(0.0f);
+                        kd[i] = half(0.0f);
+                        vd[i] = half(0.0f);
                     }
                 }
             }
@@ -2008,7 +2006,8 @@ kernel void attention_prefill_flash_f32(
             for (uint dx = 0; dx < d_oct; ++dx) {
                 for (uint j = 0; j < 4; ++j) {
                     simdgroup_half8x8 kf;
-                    simdgroup_load(kf, k_s + 64 * (4 * dx + j), 8, 0, false);
+                    // K tile is [p][d] natural order; transpose-load gives K^T = [d][p].
+                    simdgroup_load(kf, k_s + 64 * (j * d_oct + dx), 8, 0, true);
                     simdgroup_multiply_accumulate(s_frag[j], q_frag[dx], kf, s_frag[j]);
                 }
             }
