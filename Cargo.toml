@@ -34,6 +34,12 @@ metal = "0.31"
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
 
+[lints.rust]
+# The objc crate's msg_send!/sel_impl! macros (used for Metal command-buffer GPU
+# timestamps) internally probe the legacy `feature = "cargo-clippy"` cfg; register it so
+# check-cfg does not error under -D warnings.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+
 [lib]
 name = "camelid"
 path = "src/lib.rs"

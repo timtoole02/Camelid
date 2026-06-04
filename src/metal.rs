@@ -34,6 +34,10 @@ struct MetalLinearKernel {
     q8_0_block_simd_pipeline: ComputePipelineState,
     q8_0_block_simd_mr_pipeline: ComputePipelineState,
     q8_0_block_simd_qmv4_pipeline: ComputePipelineState,
+    q8_0_block_ksplit_pipeline: ComputePipelineState,
+    q8_0_block_ksplit_f32y_pipeline: ComputePipelineState,
+    q8_0_block_ksplit_f32y_wire_pipeline: ComputePipelineState,
+    q8_0_block_ksplit_f32y_wire_nsg8_pipeline: ComputePipelineState,
     rms_norm_pipeline: ComputePipelineState,
     residual_add_pipeline: ComputePipelineState,
     silu_mul_pipeline: ComputePipelineState,
@@ -58,6 +62,10 @@ struct MetalLinearCache {
     // Permanent caches
     weight_buffers: HashMap<(usize, usize), Buffer>,
     q8_block_weight_buffers: HashMap<(usize, usize), Buffer>,
+    /// Wire-format (34-byte f16-scale) conversions of 36-byte block slices, keyed by the
+    /// SOURCE slice identity; the first source block is stored for the aliasing guard
+    /// (the GPU contents are converted, so they cannot be probed against the source).
+    q8_wire_weight_buffers: HashMap<(usize, usize), (Buffer, [u8; 36])>,
 
     // Transient caches (activation buffers, scalars, deferred reads)
     activation_buffers: HashMap<(usize, usize), Buffer>,
@@ -72,6 +80,7 @@ impl MetalLinearCache {
         Self {
             weight_buffers: HashMap::new(),
             q8_block_weight_buffers: HashMap::new(),
+            q8_wire_weight_buffers: HashMap::new(),
             activation_buffers: HashMap::new(),
             scalar_buffers: Vec::new(),
             scalar_index: 0,
@@ -184,6 +193,111 @@ impl MetalLinearCache {
         self.q8_block_weight_buffers.insert(key, buffer.to_owned());
         buffer
     }
+
+    /// Wire-format weight buffer: converts decoded 36-byte f32-scale Q8_0 blocks back to
+    /// the raw GGUF 34-byte f16-scale layout at upload time (exact: the f32 scales are
+    /// themselves f16 round-trips from the file), cutting the GPU's weight-byte traffic by
+    /// ~5.9%. Cached permanently keyed on the source slice, with the first source block
+    /// stored for the aliasing guard.
+    fn q8_wire_weight_buffer(&mut self, device: &Device, weight_blocks_36: &[u8]) -> Buffer {
+        let key = (weight_blocks_36.as_ptr() as usize, weight_blocks_36.len());
+        let n_blocks = weight_blocks_36.len() / 36;
+        let mut probe = [0u8; 36];
+        let probe_len = weight_blocks_36.len().min(36);
+        probe[..probe_len].copy_from_slice(&weight_blocks_36[..probe_len]);
+        if let Some((buffer, cached_probe)) = self.q8_wire_weight_buffers.get(&key) {
+            if *cached_probe == probe {
+                return buffer.to_owned();
+            }
+        }
+        let buffer = device.new_buffer(
+            (n_blocks * 34) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        unsafe {
+            let dst = buffer.contents() as *mut u8;
+            for b in 0..n_blocks {
+                let src = &weight_blocks_36[b * 36..b * 36 + 36];
+                let scale = f32::from_le_bytes(src[..4].try_into().unwrap());
+                let half_bits = f32_to_f16_bits(scale).to_le_bytes();
+                std::ptr::copy_nonoverlapping(half_bits.as_ptr(), dst.add(b * 34), 2);
+                std::ptr::copy_nonoverlapping(src[4..].as_ptr(), dst.add(b * 34 + 2), 32);
+            }
+        }
+        self.q8_wire_weight_buffers
+            .insert(key, (buffer.to_owned(), probe));
+        buffer
+    }
+}
+
+/// Hardware GPU timestamps from a completed command buffer: (GPU busy window µs,
+/// kernel-prep window µs). Uses objc selectors not surfaced by the metal crate.
+#[cfg(target_os = "macos")]
+fn command_buffer_gpu_times_us(cb: &metal::CommandBuffer) -> (u128, u128) {
+    use metal::foreign_types::ForeignType;
+    use metal::objc::{msg_send, sel, sel_impl};
+    unsafe {
+        let p = cb.as_ptr();
+        let gstart: f64 = msg_send![p, GPUStartTime];
+        let gend: f64 = msg_send![p, GPUEndTime];
+        let kstart: f64 = msg_send![p, kernelStartTime];
+        let kend: f64 = msg_send![p, kernelEndTime];
+        (
+            ((gend - gstart) * 1e6) as u128,
+            ((kend - kstart) * 1e6) as u128,
+        )
+    }
+}
+
+/// f32 -> IEEE 754 binary16 bits, round-to-nearest-even (exact for values that started as
+/// f16, which all GGUF Q8_0 scales did).
+#[cfg(target_os = "macos")]
+fn f32_to_f16_bits(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let mant = bits & 0x007f_ffff;
+    if exp == 0xff {
+        // Inf/NaN
+        return sign | 0x7c00 | if mant != 0 { 0x0200 } else { 0 };
+    }
+    let unbiased = exp - 127;
+    if unbiased > 15 {
+        return sign | 0x7c00; // overflow -> inf
+    }
+    if unbiased >= -14 {
+        // Normal half. Round mantissa from 23 to 10 bits, nearest-even.
+        let mut half_exp = (unbiased + 15) as u32;
+        let mut half_mant = mant >> 13;
+        let rem = mant & 0x1fff;
+        if rem > 0x1000 || (rem == 0x1000 && (half_mant & 1) == 1) {
+            half_mant += 1;
+            if half_mant == 0x400 {
+                half_mant = 0;
+                half_exp += 1;
+                if half_exp >= 31 {
+                    return sign | 0x7c00;
+                }
+            }
+        }
+        return sign | ((half_exp as u16) << 10) | (half_mant as u16);
+    }
+    // Subnormal half (or zero).
+    if unbiased < -25 {
+        return sign;
+    }
+    let full_mant = mant | 0x0080_0000;
+    // Subnormal path: shift with round-to-nearest-even.
+    let total_shift = 13 + (-14 - unbiased) as u32;
+    let shifted = full_mant >> total_shift;
+    let rem_mask = (1u32 << total_shift) - 1;
+    let rem = full_mant & rem_mask;
+    let halfway = 1u32 << (total_shift - 1);
+    let mut out = shifted;
+    if rem > halfway || (rem == halfway && (out & 1) == 1) {
+        out += 1;
+    }
+    sign | (out as u16)
 }
 
 /// Guard for the permanent weight-buffer caches, which key cached GPU copies by the CPU
@@ -504,6 +618,282 @@ kernel void q8_0_block_linear_row_simd_qmv4(
         output[row0 + 1u] = t1;
         output[row0 + 2u] = t2;
         output[row0 + 3u] = t3;
+    }
+}
+
+// K-split cooperative GEMV: each threadgroup produces TWO output rows, with FOUR
+// simdgroups partitioning the contraction dimension. Each thread owns an 8-quant slice
+// of a block and strides 32 block-slots per threadgroup iteration, so one output row has
+// 32 concurrent weight streams in flight (vs one sequential walk in the row-owned layouts
+// above) — more memory-level parallelism per row at the cost of one threadgroup-memory
+// reduction. Same int-dot arithmetic per block; partial order differs.
+kernel void q8_0_block_linear_row_ksplit(
+    device const float* input_scales [[buffer(0)]],
+    device const char* input_quants [[buffer(1)]],
+    device const char* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& blocks_per_row [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    threadgroup float* shmem [[threadgroup(0)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint NSG = 4;
+    constexpr uint NR0 = 2;
+    constexpr uint NQ = 8;
+    constexpr uint q8_block_bytes = 36;
+    const uint r0 = tg * NR0;
+    const uint row_stride = blocks_per_row * q8_block_bytes;
+
+    const uint ix = lane / 4;        // 8 block slots per simdgroup
+    const uint il = (lane % 4) * NQ; // this thread's 8-quant slice within the block
+
+    float sumf[NR0] = {0.0f, 0.0f};
+    for (uint ib = sg * NQ + ix; ib < blocks_per_row; ib += NSG * NQ) {
+        device const char* iq = input_quants + ib * 32 + il;
+        const float in_scale = input_scales[ib];
+        for (uint row = 0; row < NR0; ++row) {
+            const uint rr = r0 + row;
+            if (rr >= rows) {
+                break;
+            }
+            device const char* wb = weight_blocks + rr * row_stride + ib * q8_block_bytes;
+            const float w_scale = *reinterpret_cast<device const float*>(wb);
+            device const char* wq = wb + 4 + il;
+            int isum = 0;
+            for (uint i = 0; i < NQ; ++i) {
+                isum += int(wq[i]) * int(iq[i]);
+            }
+            sumf[row] += float(isum) * w_scale * in_scale;
+        }
+    }
+    for (uint row = 0; row < NR0; ++row) {
+        if (sg == 0) {
+            shmem[row * 32 + lane] = 0.0f;
+        }
+        sumf[row] = simd_sum(sumf[row]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint row = 0; row < NR0; ++row) {
+        if (lane == 0) {
+            shmem[row * 32 + sg] = sumf[row];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint row = 0; row < NR0 && r0 + row < rows; ++row) {
+        const float tot = simd_sum(shmem[row * 32 + lane]);
+        if (lane == 0 && sg == 0) {
+            output[r0 + row] = tot;
+        }
+    }
+}
+
+// K-split cooperative GEMV over an UNQUANTIZED f32 activation vector: the weights stay
+// Q8_0 (the bandwidth that matters), but the input is read as float and the inner product
+// runs on the float-FMA pipes (int8 weight -> float convert, fused multiply-add) with no
+// input-quantize dispatch anywhere in the chain. Slightly more accurate than the
+// quantized-activation path (no activation rounding), so it is parity-tested against an
+// f32 reference rather than the int-dot reference.
+kernel void q8_0_block_linear_row_ksplit_f32y(
+    device const float* y [[buffer(0)]],
+    device const char* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& blocks_per_row [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    threadgroup float* shmem [[threadgroup(0)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint NSG = 4;
+    constexpr uint NR0 = 2;
+    constexpr uint NQ = 8;
+    constexpr uint q8_block_bytes = 36;
+    const uint r0 = tg * NR0;
+    const uint row_stride = blocks_per_row * q8_block_bytes;
+
+    const uint ix = lane / 4;
+    const uint il = (lane % 4) * NQ;
+
+    float sumf[NR0] = {0.0f, 0.0f};
+    for (uint ib = sg * NQ + ix; ib < blocks_per_row; ib += NSG * NQ) {
+        float yl[NQ];
+        device const float* yb = y + ib * 32 + il;
+        for (uint i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+        for (uint row = 0; row < NR0; ++row) {
+            const uint rr = r0 + row;
+            if (rr >= rows) {
+                break;
+            }
+            device const char* wb = weight_blocks + rr * row_stride + ib * q8_block_bytes;
+            const float w_scale = *reinterpret_cast<device const float*>(wb);
+            device const char* wq = wb + 4 + il;
+            float sumq = 0.0f;
+            for (uint i = 0; i < NQ; ++i) {
+                sumq += float(wq[i]) * yl[i];
+            }
+            sumf[row] += sumq * w_scale;
+        }
+    }
+    for (uint row = 0; row < NR0; ++row) {
+        if (sg == 0) {
+            shmem[row * 32 + lane] = 0.0f;
+        }
+        sumf[row] = simd_sum(sumf[row]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint row = 0; row < NR0; ++row) {
+        if (lane == 0) {
+            shmem[row * 32 + sg] = sumf[row];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint row = 0; row < NR0 && r0 + row < rows; ++row) {
+        const float tot = simd_sum(shmem[row * 32 + lane]);
+        if (lane == 0 && sg == 0) {
+            output[r0 + row] = tot;
+        }
+    }
+}
+
+// Wire-format variant of the f32y K-split GEMV: weights are the raw GGUF Q8_0 wire layout
+// (34-byte blocks: f16 scale + 32 int8 quants) instead of the decoded 36-byte f32-scale
+// blocks — ~5.9% fewer weight bytes per token, which is the whole cost of a
+// bandwidth-bound decode. Block offsets are multiples of 34, so the f16 scale is always
+// 2-byte aligned.
+kernel void q8_0_block_linear_row_ksplit_f32y_wire(
+    device const float* y [[buffer(0)]],
+    device const char* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& blocks_per_row [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    threadgroup float* shmem [[threadgroup(0)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint NSG = 4;
+    constexpr uint NR0 = 2;
+    constexpr uint NQ = 8;
+    constexpr uint q8_block_bytes = 34;
+    const uint r0 = tg * NR0;
+    const uint row_stride = blocks_per_row * q8_block_bytes;
+
+    const uint ix = lane / 4;
+    const uint il = (lane % 4) * NQ;
+
+    float sumf[NR0] = {0.0f, 0.0f};
+    for (uint ib = sg * NQ + ix; ib < blocks_per_row; ib += NSG * NQ) {
+        float yl[NQ];
+        device const float* yb = y + ib * 32 + il;
+        for (uint i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+        for (uint row = 0; row < NR0; ++row) {
+            const uint rr = r0 + row;
+            if (rr >= rows) {
+                break;
+            }
+            device const char* wb = weight_blocks + rr * row_stride + ib * q8_block_bytes;
+            const float w_scale = float(*reinterpret_cast<device const half*>(wb));
+            device const char* wq = wb + 2 + il;
+            float sumq = 0.0f;
+            for (uint i = 0; i < NQ; ++i) {
+                sumq += float(wq[i]) * yl[i];
+            }
+            sumf[row] += sumq * w_scale;
+        }
+    }
+    for (uint row = 0; row < NR0; ++row) {
+        if (sg == 0) {
+            shmem[row * 32 + lane] = 0.0f;
+        }
+        sumf[row] = simd_sum(sumf[row]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint row = 0; row < NR0; ++row) {
+        if (lane == 0) {
+            shmem[row * 32 + sg] = sumf[row];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint row = 0; row < NR0 && r0 + row < rows; ++row) {
+        const float tot = simd_sum(shmem[row * 32 + lane]);
+        if (lane == 0 && sg == 0) {
+            output[r0 + row] = tot;
+        }
+    }
+}
+
+// NSG=8 variant of the wire-format GEMV (256 threads/TG, 64 block slots in flight): weights are the raw GGUF Q8_0 wire layout
+// (34-byte blocks: f16 scale + 32 int8 quants) instead of the decoded 36-byte f32-scale
+// blocks — ~5.9% fewer weight bytes per token, which is the whole cost of a
+// bandwidth-bound decode. Block offsets are multiples of 34, so the f16 scale is always
+// 2-byte aligned.
+kernel void q8_0_block_linear_row_ksplit_f32y_wire_nsg8(
+    device const float* y [[buffer(0)]],
+    device const char* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& blocks_per_row [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    threadgroup float* shmem [[threadgroup(0)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint NSG = 8;
+    constexpr uint NR0 = 2;
+    constexpr uint NQ = 8;
+    constexpr uint q8_block_bytes = 34;
+    const uint r0 = tg * NR0;
+    const uint row_stride = blocks_per_row * q8_block_bytes;
+
+    const uint ix = lane / 4;
+    const uint il = (lane % 4) * NQ;
+
+    float sumf[NR0] = {0.0f, 0.0f};
+    for (uint ib = sg * NQ + ix; ib < blocks_per_row; ib += NSG * NQ) {
+        float yl[NQ];
+        device const float* yb = y + ib * 32 + il;
+        for (uint i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+        for (uint row = 0; row < NR0; ++row) {
+            const uint rr = r0 + row;
+            if (rr >= rows) {
+                break;
+            }
+            device const char* wb = weight_blocks + rr * row_stride + ib * q8_block_bytes;
+            const float w_scale = float(*reinterpret_cast<device const half*>(wb));
+            device const char* wq = wb + 2 + il;
+            float sumq = 0.0f;
+            for (uint i = 0; i < NQ; ++i) {
+                sumq += float(wq[i]) * yl[i];
+            }
+            sumf[row] += sumq * w_scale;
+        }
+    }
+    for (uint row = 0; row < NR0; ++row) {
+        if (sg == 0) {
+            shmem[row * 32 + lane] = 0.0f;
+        }
+        sumf[row] = simd_sum(sumf[row]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint row = 0; row < NR0; ++row) {
+        if (lane == 0) {
+            shmem[row * 32 + sg] = sumf[row];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint row = 0; row < NR0 && r0 + row < rows; ++row) {
+        const float tot = simd_sum(shmem[row * 32 + lane]);
+        if (lane == 0 && sg == 0) {
+            output[r0 + row] = tot;
+        }
     }
 }
 "#;
@@ -922,6 +1312,32 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let q8_0_block_simd_qmv4_pipeline = device
                 .new_compute_pipeline_state_with_function(&q8_0_block_simd_qmv4_function)
                 .ok()?;
+            let q8_0_block_ksplit_function = library
+                .get_function("q8_0_block_linear_row_ksplit", None)
+                .ok()?;
+            let q8_0_block_ksplit_pipeline = device
+                .new_compute_pipeline_state_with_function(&q8_0_block_ksplit_function)
+                .ok()?;
+            let q8_0_block_ksplit_f32y_function = library
+                .get_function("q8_0_block_linear_row_ksplit_f32y", None)
+                .ok()?;
+            let q8_0_block_ksplit_f32y_pipeline = device
+                .new_compute_pipeline_state_with_function(&q8_0_block_ksplit_f32y_function)
+                .ok()?;
+            let q8_0_block_ksplit_f32y_wire_function = library
+                .get_function("q8_0_block_linear_row_ksplit_f32y_wire", None)
+                .ok()?;
+            let q8_0_block_ksplit_f32y_wire_pipeline = device
+                .new_compute_pipeline_state_with_function(&q8_0_block_ksplit_f32y_wire_function)
+                .ok()?;
+            let q8_0_block_ksplit_f32y_wire_nsg8_function = library
+                .get_function("q8_0_block_linear_row_ksplit_f32y_wire_nsg8", None)
+                .ok()?;
+            let q8_0_block_ksplit_f32y_wire_nsg8_pipeline = device
+                .new_compute_pipeline_state_with_function(
+                    &q8_0_block_ksplit_f32y_wire_nsg8_function,
+                )
+                .ok()?;
             let queue = device.new_command_queue();
             Some(MetalLinearKernel {
                 device,
@@ -934,6 +1350,10 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 q8_0_block_simd_pipeline,
                 q8_0_block_simd_mr_pipeline,
                 q8_0_block_simd_qmv4_pipeline,
+                q8_0_block_ksplit_pipeline,
+                q8_0_block_ksplit_f32y_pipeline,
+                q8_0_block_ksplit_f32y_wire_pipeline,
+                q8_0_block_ksplit_f32y_wire_nsg8_pipeline,
                 rms_norm_pipeline,
                 residual_add_pipeline,
                 silu_mul_pipeline,
@@ -2460,20 +2880,30 @@ fn encode_q8_matmul(
     scalar: &Buffer,
     rows: usize,
 ) {
-    // MLX-layout GEMV (two simdgroups per TG, four rows per simdgroup, input cached in
-    // registers, four independent accumulator chains) when rows divide evenly; otherwise the
-    // one-row-per-simdgroup kernel. Both are parity-identical per row.
+    // Three GEMV layouts, selected per dispatch:
+    // - ksplit (opt-in via CAMELID_METAL_KSPLIT): two rows per threadgroup, four simdgroups
+    //   partitioning the contraction with a threadgroup-memory reduction — maximizes
+    //   concurrent weight streams per output row.
+    // - qmv4 (rows % 4 == 0): two simdgroups per TG, four rows per simdgroup, input cached
+    //   in registers, four independent accumulator chains.
+    // - one-row-per-simdgroup fallback for other row counts.
     const SIMD_GROUPS_PER_TG: u64 = 2;
+    let ksplit = ksplit_gemv_enabled();
     let qmv4 = rows.is_multiple_of(4);
-    let pipeline = if qmv4 {
-        &k.q8_0_block_simd_qmv4_pipeline
+    let (pipeline, rows_per_tg, threads_per_tg) = if ksplit {
+        (&k.q8_0_block_ksplit_pipeline, 2, 128)
+    } else if qmv4 {
+        (
+            &k.q8_0_block_simd_qmv4_pipeline,
+            SIMD_GROUPS_PER_TG * 4,
+            SIMD_GROUPS_PER_TG * 32,
+        )
     } else {
-        &k.q8_0_block_simd_mr_pipeline
-    };
-    let rows_per_tg = if qmv4 {
-        SIMD_GROUPS_PER_TG * 4
-    } else {
-        SIMD_GROUPS_PER_TG
+        (
+            &k.q8_0_block_simd_mr_pipeline,
+            SIMD_GROUPS_PER_TG,
+            SIMD_GROUPS_PER_TG * 32,
+        )
     };
     e.set_compute_pipeline_state(pipeline);
     e.set_buffer(0, Some(scales), 0);
@@ -2482,6 +2912,10 @@ fn encode_q8_matmul(
     e.set_buffer(3, Some(out), 0);
     e.set_buffer(4, Some(scalar), 0);
     e.set_buffer(5, Some(scalar), 4);
+    if ksplit {
+        // Two rows x 32 lanes of f32 partials for the cross-simdgroup reduction.
+        e.set_threadgroup_memory_length(0, 2 * 32 * 4);
+    }
     e.dispatch_thread_groups(
         metal::MTLSize {
             width: (rows as u64).div_ceil(rows_per_tg),
@@ -2489,11 +2923,188 @@ fn encode_q8_matmul(
             depth: 1,
         },
         metal::MTLSize {
-            width: SIMD_GROUPS_PER_TG * 32,
+            width: threads_per_tg,
             height: 1,
             depth: 1,
         },
     );
+}
+
+/// Opt-in experiment flag for the K-split cooperative GEMV layout in the resident decode.
+#[cfg(target_os = "macos")]
+fn ksplit_gemv_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_METAL_KSPLIT")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
+/// Opt-in experiment flag: route the resident decode through the f32-activation GEMV
+/// (no input-quantize dispatches; float-FMA inner product). See the kernel comment.
+#[cfg(target_os = "macos")]
+fn f32y_gemv_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_METAL_F32Y")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
+/// Unfused RMSNorm to an f32 output buffer. Scalar layout: width (u32) then eps (f32).
+#[cfg(target_os = "macos")]
+fn encode_rms_norm_f32(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    input: &Buffer,
+    weight: &Buffer,
+    output: &Buffer,
+    scalar: &Buffer,
+) {
+    e.set_compute_pipeline_state(&k.rms_norm_pipeline);
+    e.set_buffer(0, Some(input), 0);
+    e.set_buffer(1, Some(weight), 0);
+    e.set_buffer(2, Some(output), 0);
+    e.set_buffer(3, Some(scalar), 0);
+    e.set_buffer(4, Some(scalar), 4);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+/// Opt-in: with CAMELID_METAL_F32Y also set, weights upload in the raw GGUF 34-byte
+/// f16-scale wire layout (~5.9% fewer weight bytes per token).
+#[cfg(target_os = "macos")]
+fn wire_weights_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_METAL_WIRE")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
+/// K-split GEMV over an f32 activation vector (see q8_0_block_linear_row_ksplit_f32y).
+/// The weight buffer must match the active format: decoded 36-byte blocks normally, wire
+/// 34-byte blocks when CAMELID_METAL_WIRE is on (prepare_token resolves accordingly).
+#[cfg(target_os = "macos")]
+fn encode_q8_matmul_f32y(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    y: &Buffer,
+    weight: &Buffer,
+    out: &Buffer,
+    scalar: &Buffer,
+    rows: usize,
+) {
+    let nsg8 = wire_nsg8_enabled();
+    let pipeline = if wire_weights_enabled() && nsg8 {
+        &k.q8_0_block_ksplit_f32y_wire_nsg8_pipeline
+    } else if wire_weights_enabled() {
+        &k.q8_0_block_ksplit_f32y_wire_pipeline
+    } else {
+        &k.q8_0_block_ksplit_f32y_pipeline
+    };
+    let threads_per_tg = if wire_weights_enabled() && nsg8 {
+        256
+    } else {
+        128
+    };
+    e.set_compute_pipeline_state(pipeline);
+    e.set_buffer(0, Some(y), 0);
+    e.set_buffer(2, Some(weight), 0);
+    e.set_buffer(3, Some(out), 0);
+    e.set_buffer(4, Some(scalar), 0);
+    e.set_buffer(5, Some(scalar), 4);
+    e.set_threadgroup_memory_length(0, 2 * 32 * 4);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: (rows as u64).div_ceil(2),
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: threads_per_tg,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+/// Experiment flag: NSG=8 wire GEMV (256 threads/TG).
+#[cfg(target_os = "macos")]
+fn wire_nsg8_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_METAL_WIRE_NSG8")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
+/// Test-only direct driver for the K-split GEMV pipeline (bypasses the env gate and the
+/// weight-buffer cache so parity tests control exactly what runs).
+#[cfg(all(test, target_os = "macos"))]
+fn try_q8_0_ksplit_linear_for_test(
+    input_scales: &[f32],
+    input_quants: &[i8],
+    weight_blocks: &[u8],
+    rows: usize,
+    blocks_per_row: usize,
+    output: &mut [f32],
+) -> bool {
+    let Some(kernel) = metal_linear_kernel() else {
+        return false;
+    };
+    let device = &kernel.device;
+    let opts = MTLResourceOptions::StorageModeShared;
+    let scales = device.new_buffer(std::mem::size_of_val(input_scales) as u64, opts);
+    let quants = device.new_buffer(input_quants.len() as u64, opts);
+    let weight = device.new_buffer(weight_blocks.len() as u64, opts);
+    let out = device.new_buffer(std::mem::size_of_val(&*output) as u64, opts);
+    let scalar = device.new_buffer(8, opts);
+    write_buffer_f32(&scales, input_scales);
+    write_buffer_i8(&quants, input_quants);
+    write_buffer_u8(&weight, weight_blocks);
+    unsafe {
+        let s = scalar.contents() as *mut u32;
+        *s = blocks_per_row as u32;
+        *s.add(1) = rows as u32;
+    }
+    let command_buffer = kernel.queue.new_command_buffer();
+    let e = command_buffer.new_compute_command_encoder();
+    e.set_compute_pipeline_state(&kernel.q8_0_block_ksplit_pipeline);
+    e.set_buffer(0, Some(&scales), 0);
+    e.set_buffer(1, Some(&quants), 0);
+    e.set_buffer(2, Some(&weight), 0);
+    e.set_buffer(3, Some(&out), 0);
+    e.set_buffer(4, Some(&scalar), 0);
+    e.set_buffer(5, Some(&scalar), 4);
+    e.set_threadgroup_memory_length(0, 2 * 32 * 4);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: (rows as u64).div_ceil(2),
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        },
+    );
+    e.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    read_buffer_f32(&out, output);
+    true
 }
 
 #[cfg(target_os = "macos")]
@@ -2637,40 +3248,65 @@ fn encode_ffn_block(
         *(resid_n.contents() as *mut u32) = hidden as u32;
     }
 
-    encode_rms_norm_quantize(e, k, in_buf, &norm_w_buf, &scales1, &quants1, &rms_scalar);
-    encode_q8_matmul(
-        e,
-        k,
-        &scales1,
-        &quants1,
-        gate_w,
-        &gate_buf,
-        &gateup_scalar,
-        ffn_dim,
-    );
-    encode_q8_matmul(
-        e,
-        k,
-        &scales1,
-        &quants1,
-        up_w,
-        &up_buf,
-        &gateup_scalar,
-        ffn_dim,
-    );
-    encode_silu_mul_quantize(
-        e, k, &gate_buf, &up_buf, &scales2, &quants2, &nblocks2, bpr_ffn,
-    );
-    encode_q8_matmul(
-        e,
-        k,
-        &scales2,
-        &quants2,
-        down_w,
-        &down_buf,
-        &down_scalar,
-        hidden,
-    );
+    if f32y_gemv_enabled() {
+        // f32-activation chain: no quantize anywhere — norm and silu outputs feed the
+        // float-FMA GEMV directly.
+        let normf = nb((hidden * 4) as u64);
+        let siluf = nb((ffn_dim * 4) as u64);
+        let silu_n = nb(4);
+        unsafe {
+            *(silu_n.contents() as *mut u32) = ffn_dim as u32;
+        }
+        encode_rms_norm_f32(e, k, in_buf, &norm_w_buf, &normf, &rms_scalar);
+        encode_q8_matmul_f32y(e, k, &normf, gate_w, &gate_buf, &gateup_scalar, ffn_dim);
+        encode_q8_matmul_f32y(e, k, &normf, up_w, &up_buf, &gateup_scalar, ffn_dim);
+        encode_binary(
+            e,
+            &k.silu_mul_pipeline,
+            &gate_buf,
+            &up_buf,
+            &siluf,
+            &silu_n,
+            ffn_dim,
+        );
+        encode_q8_matmul_f32y(e, k, &siluf, down_w, &down_buf, &down_scalar, hidden);
+        keep.extend([normf, siluf, silu_n]);
+    } else {
+        encode_rms_norm_quantize(e, k, in_buf, &norm_w_buf, &scales1, &quants1, &rms_scalar);
+        encode_q8_matmul(
+            e,
+            k,
+            &scales1,
+            &quants1,
+            gate_w,
+            &gate_buf,
+            &gateup_scalar,
+            ffn_dim,
+        );
+        encode_q8_matmul(
+            e,
+            k,
+            &scales1,
+            &quants1,
+            up_w,
+            &up_buf,
+            &gateup_scalar,
+            ffn_dim,
+        );
+        encode_silu_mul_quantize(
+            e, k, &gate_buf, &up_buf, &scales2, &quants2, &nblocks2, bpr_ffn,
+        );
+        encode_q8_matmul(
+            e,
+            k,
+            &scales2,
+            &quants2,
+            down_w,
+            &down_buf,
+            &down_scalar,
+            hidden,
+        );
+    }
     encode_binary(
         e,
         &k.residual_add_pipeline,
@@ -2810,45 +3446,55 @@ fn encode_attention_block(
         *(resid_n.contents() as *mut u32) = hidden as u32;
     }
 
-    encode_rms_norm_quantize(
-        e,
-        k,
-        in_buf,
-        &norm_w_buf,
-        &scales_norm,
-        &quants_norm,
-        &rms_scalar,
-    );
-    encode_q8_matmul(
-        e,
-        k,
-        &scales_norm,
-        &quants_norm,
-        q_w_buf,
-        &query_buf,
-        &q_mm_scalar,
-        q_dim,
-    );
-    encode_q8_matmul(
-        e,
-        k,
-        &scales_norm,
-        &quants_norm,
-        k_w_buf,
-        &key_buf,
-        &kv_mm_scalar,
-        kv_dim,
-    );
-    encode_q8_matmul(
-        e,
-        k,
-        &scales_norm,
-        &quants_norm,
-        v_w_buf,
-        &val_buf,
-        &kv_mm_scalar,
-        kv_dim,
-    );
+    let normf_attn = if f32y_gemv_enabled() {
+        let normf = nb((hidden * 4) as u64);
+        encode_rms_norm_f32(e, k, in_buf, &norm_w_buf, &normf, &rms_scalar);
+        encode_q8_matmul_f32y(e, k, &normf, q_w_buf, &query_buf, &q_mm_scalar, q_dim);
+        encode_q8_matmul_f32y(e, k, &normf, k_w_buf, &key_buf, &kv_mm_scalar, kv_dim);
+        encode_q8_matmul_f32y(e, k, &normf, v_w_buf, &val_buf, &kv_mm_scalar, kv_dim);
+        Some(normf)
+    } else {
+        encode_rms_norm_quantize(
+            e,
+            k,
+            in_buf,
+            &norm_w_buf,
+            &scales_norm,
+            &quants_norm,
+            &rms_scalar,
+        );
+        encode_q8_matmul(
+            e,
+            k,
+            &scales_norm,
+            &quants_norm,
+            q_w_buf,
+            &query_buf,
+            &q_mm_scalar,
+            q_dim,
+        );
+        encode_q8_matmul(
+            e,
+            k,
+            &scales_norm,
+            &quants_norm,
+            k_w_buf,
+            &key_buf,
+            &kv_mm_scalar,
+            kv_dim,
+        );
+        encode_q8_matmul(
+            e,
+            k,
+            &scales_norm,
+            &quants_norm,
+            v_w_buf,
+            &val_buf,
+            &kv_mm_scalar,
+            kv_dim,
+        );
+        None
+    };
     encode_rope(
         e,
         k,
@@ -2902,25 +3548,32 @@ fn encode_attention_block(
         &attn_scalar,
         n_heads,
     );
-    encode_quantize(
-        e,
-        k,
-        &ctx_buf,
-        &scales_ctx,
-        &quants_ctx,
-        &nblocks_ctx,
-        bpr_q,
-    );
-    encode_q8_matmul(
-        e,
-        k,
-        &scales_ctx,
-        &quants_ctx,
-        o_w_buf,
-        &o_buf,
-        &o_mm_scalar,
-        hidden,
-    );
+    if f32y_gemv_enabled() {
+        encode_q8_matmul_f32y(e, k, &ctx_buf, o_w_buf, &o_buf, &o_mm_scalar, hidden);
+    } else {
+        encode_quantize(
+            e,
+            k,
+            &ctx_buf,
+            &scales_ctx,
+            &quants_ctx,
+            &nblocks_ctx,
+            bpr_q,
+        );
+        encode_q8_matmul(
+            e,
+            k,
+            &scales_ctx,
+            &quants_ctx,
+            o_w_buf,
+            &o_buf,
+            &o_mm_scalar,
+            hidden,
+        );
+    }
+    if let Some(normf) = normf_attn {
+        keep.push(normf);
+    }
     encode_binary(
         e,
         &k.residual_add_pipeline,
@@ -3517,6 +4170,32 @@ pub struct ResidentDecodeState {
     /// Number of KV positions currently materialized in the cache (seeded history + appended
     /// tokens). The caller uses this to detect a new sequence and reseed.
     filled: usize,
+    /// Encode-ahead pipeline: the NEXT token's fully-encoded AND committed command buffer,
+    /// built on the CPU while the previous token executed on the GPU. Execution is gated on
+    /// `gate_event`, signaled only after the token's input embedding is written — so by
+    /// signal time, scheduling cost is already paid. Invalidated whenever the KV cache
+    /// reallocates (the encoded graph references the old buffers); a committed-but-ungated
+    /// stale graph MUST be released via `release_stale` or it deadlocks the serial queue.
+    pending: Option<PreparedToken>,
+    /// Gates pre-committed token graphs; monotonically increasing values.
+    gate_event: metal::SharedEvent,
+    event_counter: u64,
+}
+
+/// A fully-encoded, uncommitted per-token command buffer. The input embedding is written
+/// into the session's input buffer just before commit (the graph reads it first), so the
+/// expensive encode happens off the critical path.
+#[cfg(target_os = "macos")]
+struct PreparedToken {
+    position: usize,
+    has_logits: bool,
+    event_value: u64,
+    cb: metal::CommandBuffer,
+    logits_buf: Option<Buffer>,
+    final_from_a: bool,
+    /// Scratch buffers the encoded graph references; kept alive until completion.
+    _keep: Vec<Buffer>,
+    encode_us: u128,
 }
 
 #[cfg(target_os = "macos")]
@@ -3579,6 +4258,9 @@ impl ResidentDecodeState {
             buf_b: nb(hidden),
             mid: nb(hidden),
             filled: 0,
+            pending: None,
+            gate_event: k.device.new_shared_event(),
+            event_counter: 0,
         })
     }
 
@@ -3649,6 +4331,7 @@ impl ResidentDecodeState {
     /// attention scale. Returns the post-final-layer hidden state `[hidden]` (the caller
     /// applies the final norm + output projection), or None on dimension mismatch.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_token(
         &mut self,
         embedding: &[f32],
@@ -3658,11 +4341,20 @@ impl ResidentDecodeState {
         position: usize,
         scale: f32,
         logits_stage: Option<LogitsStage>,
+        next_rope: Option<(&[f32], &[f32])>,
     ) -> Option<Vec<f32>> {
         let half_rope = cos_t.len();
         // Grow the on-GPU KV cache if this token's position is past the current capacity.
+        // Growth reallocates the cache buffers, so any pre-encoded pending graph (which
+        // references the old buffers) must be dropped.
+        let before_growth = self.max_positions;
         if !self.ensure_capacity(position + 1) {
             return None;
+        }
+        if self.max_positions != before_growth {
+            if let Some(stale) = self.pending.take() {
+                self.release_stale(stale);
+            }
         }
         if embedding.len() != self.hidden
             || layers.len() != self.n_layers
@@ -3699,39 +4391,144 @@ impl ResidentDecodeState {
             }
         }
         let k = metal_linear_kernel()?;
+        let trace = std::env::var_os("CAMELID_RESIDENT_TRACE").is_some();
+        // Take the pre-encoded, pre-committed graph for this position (built and committed
+        // while the PREVIOUS token was executing on the GPU, scheduling already paid), or
+        // encode inline on the first token / after invalidation. A stale pending graph is
+        // committed on the serial queue gated behind its event and MUST be released.
+        let pending = self.pending.take();
+        let usable = matches!(
+            &pending,
+            Some(p) if p.position == position && p.has_logits == logits_stage.is_some()
+        );
+        let prepared = if usable {
+            pending.unwrap()
+        } else {
+            if let Some(stale) = pending {
+                self.release_stale(stale);
+            }
+            self.prepare_token(
+                k,
+                layers,
+                cos_t,
+                sin_t,
+                position,
+                scale,
+                logits_stage.as_ref(),
+            )?
+        };
+        // The graph's first op reads the embedding from buf_a; it is gated on the shared
+        // event, so writing the embedding and then signaling releases it instantly.
+        write_buffer_f32(&self.buf_a, embedding);
+        let gpu_started = std::time::Instant::now();
+        self.gate_event.set_signaled_value(prepared.event_value);
+        // Encode-ahead: build the NEXT token's command buffer on the CPU while this one
+        // executes on the GPU (greedy decode advances one position at a time). Skipped at
+        // the KV-capacity edge — growth would invalidate the encoded graph, so the next
+        // call grows first and encodes inline once.
+        let mut next_encode_us = 0u128;
+        if let Some((cos_n, sin_n)) = next_rope {
+            if position + 2 <= self.max_positions {
+                if let Some(next) = self.prepare_token(
+                    k,
+                    layers,
+                    cos_n,
+                    sin_n,
+                    position + 1,
+                    scale,
+                    logits_stage.as_ref(),
+                ) {
+                    next_encode_us = next.encode_us;
+                    self.pending = Some(next);
+                }
+            }
+        }
+        prepared.cb.wait_until_completed();
+        if trace {
+            let gpu_us = gpu_started.elapsed().as_micros();
+            // True GPU-busy window from the command buffer's hardware timestamps: splits
+            // "kernel executing" from submission/scheduling gaps inside commit_wait.
+            let (gpu_busy_us, kernel_total_us) = command_buffer_gpu_times_us(&prepared.cb);
+            eprintln!(
+                "[resident] pos={position} layers={} encode={}us next_encode={next_encode_us}us commit_wait={gpu_us}us gpu_busy={gpu_busy_us}us kernel_window={kernel_total_us}us",
+                self.n_layers, prepared.encode_us,
+            );
+        }
+        self.filled = position + 1;
+        if let Some(logits_buf) = prepared.logits_buf {
+            let vocab = logits_stage.as_ref().map(|s| s.vocab_size).unwrap_or(0);
+            let mut out = vec![0.0f32; vocab];
+            read_buffer_f32(&logits_buf, &mut out);
+            return Some(out);
+        }
+        let final_buf = if prepared.final_from_a {
+            &self.buf_a
+        } else {
+            &self.buf_b
+        };
+        let mut out = vec![0.0f32; self.hidden];
+        read_buffer_f32(final_buf, &mut out);
+        Some(out)
+    }
+
+    /// Encode one token's full graph into an uncommitted command buffer. Everything here is
+    /// CPU work (buffer allocs + encoder calls) — callable while the GPU executes the
+    /// previous token. The graph reads its input embedding from `buf_a` at execution time.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_token(
+        &mut self,
+        k: &'static MetalLinearKernel,
+        layers: &[ResidentLayerWeights],
+        cos_t: &[f32],
+        sin_t: &[f32],
+        position: usize,
+        scale: f32,
+        logits_stage: Option<&LogitsStage>,
+    ) -> Option<PreparedToken> {
+        let bpr_hidden = self.hidden / 32;
         // Resolve all resident weight buffers (layer weights + optional output stage) under one
         // cache lock. They are keyed by (pointer, len), so they upload once and persist.
         let resident: Vec<[Buffer; 7]>;
         let stage_bufs: Option<(Buffer, Buffer)>;
         {
             let mut cache = metal_linear_cache().lock().ok()?;
+            let wire = f32y_gemv_enabled() && wire_weights_enabled();
+            let mut wb = |blocks: &[u8]| {
+                if wire {
+                    cache.q8_wire_weight_buffer(&k.device, blocks)
+                } else {
+                    cache.q8_block_weight_buffer(&k.device, blocks)
+                }
+            };
             resident = layers
                 .iter()
                 .map(|l| {
                     [
-                        cache.q8_block_weight_buffer(&k.device, l.q_weight_blocks),
-                        cache.q8_block_weight_buffer(&k.device, l.k_weight_blocks),
-                        cache.q8_block_weight_buffer(&k.device, l.v_weight_blocks),
-                        cache.q8_block_weight_buffer(&k.device, l.o_weight_blocks),
-                        cache.q8_block_weight_buffer(&k.device, l.gate_weight_blocks),
-                        cache.q8_block_weight_buffer(&k.device, l.up_weight_blocks),
-                        cache.q8_block_weight_buffer(&k.device, l.down_weight_blocks),
+                        wb(l.q_weight_blocks),
+                        wb(l.k_weight_blocks),
+                        wb(l.v_weight_blocks),
+                        wb(l.o_weight_blocks),
+                        wb(l.gate_weight_blocks),
+                        wb(l.up_weight_blocks),
+                        wb(l.down_weight_blocks),
                     ]
                 })
                 .collect();
-            stage_bufs = logits_stage.as_ref().map(|s| {
-                (
-                    cache.q8_block_weight_buffer(&k.device, s.output_weight_blocks),
-                    cache.weight_buffer(&k.device, s.final_norm),
-                )
-            });
+            stage_bufs = match logits_stage {
+                Some(s) => {
+                    let ow = wb(s.output_weight_blocks);
+                    Some((ow, cache.weight_buffer(&k.device, s.final_norm)))
+                }
+                None => None,
+            };
         }
         let position_count = position + 1;
-        write_buffer_f32(&self.buf_a, embedding);
         let mut keep = Vec::new();
-        let trace = std::env::var_os("CAMELID_RESIDENT_TRACE").is_some();
         let encode_started = std::time::Instant::now();
+        self.event_counter += 1;
+        let event_value = self.event_counter;
         let cb = k.queue.new_command_buffer();
+        cb.encode_wait_for_event(&self.gate_event, event_value);
         let e = cb.new_compute_command_encoder();
         let mut from_a = true;
         for (i, layer) in layers.iter().enumerate() {
@@ -3784,8 +4581,7 @@ impl ResidentDecodeState {
         let final_buf = if from_a { &self.buf_a } else { &self.buf_b };
         // Optional final stage: RMSNorm + output (vocab) projection in the SAME command buffer,
         // so the large logits matmul runs on the GPU instead of falling to the slow CPU path.
-        let logits_buf = if let (Some(s), Some((ow_buf, fnorm_buf))) = (&logits_stage, &stage_bufs)
-        {
+        let logits_buf = if let (Some(s), Some((ow_buf, fnorm_buf))) = (logits_stage, &stage_bufs) {
             let nb = |bytes: u64| {
                 k.device
                     .new_buffer(bytes, MTLResourceOptions::StorageModeShared)
@@ -3804,44 +4600,61 @@ impl ResidentDecodeState {
                 *m = bpr_hidden as u32;
                 *m.add(1) = s.vocab_size as u32;
             }
-            encode_rms_norm_quantize(e, k, final_buf, fnorm_buf, &lscales, &lquants, &rms_scalar);
-            encode_q8_matmul(
-                e,
-                k,
-                &lscales,
-                &lquants,
-                ow_buf,
-                &logits_buf,
-                &lmm_scalar,
-                s.vocab_size,
-            );
+            if f32y_gemv_enabled() {
+                let normf = nb((self.hidden * 4) as u64);
+                encode_rms_norm_f32(e, k, final_buf, fnorm_buf, &normf, &rms_scalar);
+                encode_q8_matmul_f32y(e, k, &normf, ow_buf, &logits_buf, &lmm_scalar, s.vocab_size);
+                keep.push(normf);
+            } else {
+                encode_rms_norm_quantize(
+                    e,
+                    k,
+                    final_buf,
+                    fnorm_buf,
+                    &lscales,
+                    &lquants,
+                    &rms_scalar,
+                );
+                encode_q8_matmul(
+                    e,
+                    k,
+                    &lscales,
+                    &lquants,
+                    ow_buf,
+                    &logits_buf,
+                    &lmm_scalar,
+                    s.vocab_size,
+                );
+            }
             keep.extend([rms_scalar, lscales, lquants, lmm_scalar]);
             Some(logits_buf)
         } else {
             None
         };
-        let encode_us = encode_started.elapsed().as_micros();
-        let gpu_started = std::time::Instant::now();
         e.end_encoding();
+        // Commit NOW (still gated on the event): commandBuffer scheduling happens while the
+        // previous token executes, so signaling the event later starts the GPU immediately.
         cb.commit();
-        cb.wait_until_completed();
-        if trace {
-            let gpu_us = gpu_started.elapsed().as_micros();
-            eprintln!(
-                "[resident] pos={position} layers={} encode={encode_us}us commit_wait={gpu_us}us",
-                self.n_layers
-            );
-        }
-        self.filled = position + 1;
-        if let Some(logits_buf) = logits_buf {
-            let vocab = logits_stage.as_ref().map(|s| s.vocab_size).unwrap_or(0);
-            let mut out = vec![0.0f32; vocab];
-            read_buffer_f32(&logits_buf, &mut out);
-            return Some(out);
-        }
-        let mut out = vec![0.0f32; self.hidden];
-        read_buffer_f32(final_buf, &mut out);
-        Some(out)
+        let encode_us = encode_started.elapsed().as_micros();
+        Some(PreparedToken {
+            position,
+            has_logits: logits_stage.is_some(),
+            event_value,
+            cb: cb.to_owned(),
+            logits_buf,
+            final_from_a: from_a,
+            _keep: keep,
+            encode_us,
+        })
+    }
+
+    /// Release a stale pre-committed token graph: it sits on the serial queue gated behind
+    /// its event, so signal it and let it run once against the old buffers (its outputs go
+    /// to scratch that the next real token overwrites). Skipping this would deadlock the
+    /// queue. Happens at most once per KV growth or sequence restart.
+    fn release_stale(&mut self, stale: PreparedToken) {
+        self.gate_event.set_signaled_value(stale.event_value);
+        stale.cb.wait_until_completed();
     }
 
     /// Seed `seed_positions` history slots of layer `layer` from contiguous
@@ -3933,6 +4746,17 @@ impl ResidentDecodeState {
     }
 }
 
+#[cfg(target_os = "macos")]
+impl Drop for ResidentDecodeState {
+    fn drop(&mut self) {
+        // A pre-committed pending graph left gated on the queue would block every future
+        // commit on the shared serial queue; release it before the session goes away.
+        if let Some(stale) = self.pending.take() {
+            self.release_stale(stale);
+        }
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
 pub struct ResidentDecodeState;
 
@@ -3955,6 +4779,7 @@ impl ResidentDecodeState {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_token(
         &mut self,
         _embedding: &[f32],
@@ -3964,6 +4789,7 @@ impl ResidentDecodeState {
         _position: usize,
         _scale: f32,
         _logits_stage: Option<LogitsStage>,
+        _next_rope: Option<(&[f32], &[f32])>,
     ) -> Option<Vec<f32>> {
         None
     }
@@ -4307,6 +5133,74 @@ pub fn detect_metal_device() -> MetalDeviceInfo {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_q8_0_ksplit_gemv_matches_cpu_reference() {
+        if !detect_metal_device().available {
+            return;
+        }
+        // 5 rows x 7 blocks: odd row count exercises the two-rows-per-threadgroup tail
+        // guard, and 7 blocks exercises the K-split stride (4 simdgroups x 8 block slots
+        // with most slots idle on the last pass).
+        let rows = 5usize;
+        let blocks_per_row = 7usize;
+        let mut input_scales = Vec::new();
+        let mut input_quants: Vec<i8> = Vec::new();
+        for block in 0..blocks_per_row {
+            input_scales.push(0.05 + block as f32 * 0.01);
+            for lane in 0..32 {
+                input_quants.push((((block * 37 + lane * 11) % 251) as i32 - 125) as i8);
+            }
+        }
+        let mut weight_blocks = Vec::new();
+        let mut weight_quants: Vec<Vec<i8>> = Vec::new();
+        for row in 0..rows {
+            let mut row_quants = Vec::new();
+            for block in 0..blocks_per_row {
+                let scale = 0.5 - row as f32 * 0.07 + block as f32 * 0.013;
+                weight_blocks.extend_from_slice(&scale.to_le_bytes());
+                for lane in 0..32 {
+                    let q = (((row * 53 + block * 29 + lane * 7) % 255) as i32 - 127) as i8;
+                    weight_blocks.push(q as u8);
+                    row_quants.push(q);
+                }
+            }
+            weight_quants.push(row_quants);
+        }
+        let mut expected = vec![0.0f32; rows];
+        for row in 0..rows {
+            for block in 0..blocks_per_row {
+                let scale_bytes: [u8; 4] = weight_blocks
+                    [(row * blocks_per_row + block) * 36..(row * blocks_per_row + block) * 36 + 4]
+                    .try_into()
+                    .unwrap();
+                let w_scale = f32::from_le_bytes(scale_bytes);
+                let isum: i32 = (0..32)
+                    .map(|lane| {
+                        i32::from(weight_quants[row][block * 32 + lane])
+                            * i32::from(input_quants[block * 32 + lane])
+                    })
+                    .sum();
+                expected[row] += isum as f32 * w_scale * input_scales[block];
+            }
+        }
+        let mut output = vec![0.0f32; rows];
+        assert!(try_q8_0_ksplit_linear_for_test(
+            &input_scales,
+            &input_quants,
+            &weight_blocks,
+            rows,
+            blocks_per_row,
+            &mut output,
+        ));
+        for (row, (actual, expected)) in output.iter().zip(&expected).enumerate() {
+            assert!(
+                (actual - expected).abs() < 1.0e-2_f32.max(expected.abs() * 1.0e-5),
+                "row {row}: {actual} != {expected}"
+            );
+        }
+    }
     use super::*;
 
     #[cfg(target_os = "macos")]
@@ -5087,7 +5981,7 @@ mod tests {
             .unwrap();
 
             let got = session
-                .forward_token(&emb, &weights, &cos_t, &sin_t, t, scale, None)
+                .forward_token(&emb, &weights, &cos_t, &sin_t, t, scale, None, None)
                 .unwrap();
             assert_eq!(got.len(), hidden);
             for (a, b) in got.iter().zip(&expected) {

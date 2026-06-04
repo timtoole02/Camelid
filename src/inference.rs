@@ -1605,6 +1605,14 @@ impl LlamaInferenceSession {
             None
         };
 
+        // Rope tables for position+1 feed the encode-ahead pipeline: the session encodes
+        // the NEXT token's command buffer while this token executes on the GPU.
+        let next_tables = rope::resident_decode_rope_tables(
+            position + 1,
+            head_dim,
+            &self.config,
+            weights.rope_freqs.as_ref(),
+        )?;
         let session = self
             .resident_decode
             .as_mut()
@@ -1617,6 +1625,9 @@ impl LlamaInferenceSession {
             position,
             scale,
             logits_stage,
+            next_tables
+                .as_ref()
+                .map(|t| (t.cos.as_slice(), t.sin.as_slice())),
         ) {
             Some(o) => o,
             None => return Ok(None),
