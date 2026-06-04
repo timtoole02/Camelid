@@ -1813,21 +1813,22 @@ kernel void kv_scatter_batch_f32(
 }
 
 // Flash-tiled causal prefill attention: threadgroup (q_head, 32-query tile), simdgroup
-// matrices for BOTH score and value matmuls. The query-tiled scalar kernel above still
+// matrices for BOTH score and value matmuls. The query-tiled scalar kernel below still
 // re-reads K/V once per 4-query group (~30GB on a 600-token prompt = the dominant
 // prefill attention cost); here each K/V tile stages ONCE per 32-query tile (~4GB) and
 // the dot products ride the MMA pipeline. Each simdgroup owns 8 queries across the
 // whole 32-position tile, so the online-softmax state (m/l) is simdgroup-private —
-// no cross-simdgroup merge. Accumulator rescaling uses a diagonal-matrix multiply
-// (simdgroup fragments cannot be scaled per-row directly). K and V share one staging
-// region (K is consumed by the score matmul before V stages into the same bytes).
+// no cross-simdgroup merge; softmax rows are reduced by quads (4 lanes per row, 8
+// columns each, quad_shuffle_xor combines). Q fragments are loaded into registers
+// once and their staging region is reused as the V tile, so a kv-tile iteration costs
+// two threadgroup barriers (stage K+V | consume). Accumulator rescaling uses a
+// diagonal-matrix multiply (simdgroup fragments cannot be scaled per-row directly).
 // Not byte-exact with the per-query kernel (tile MMA + tile-at-a-time softmax order);
 // numerically equivalent — gated with the same CAMELID_METAL_MM stack and verified by
 // greedy-token parity. Requires head_dim % 8 == 0 and head_dim <= 128.
 //
-// Threadgroup memory (8*head_dim*2*2 + 32*32*4 + 4*64*2 + 64*4 bytes; 21KB at
-// head_dim=128): Q 32 x head_dim half | K/V 32 x head_dim half (shared) | S 32x32 f32
-// (low half doubles as P 32x32 half) | 4 x 8x8 half diag | 32 f32 inv-l scratch.
+// Threadgroup memory (Q/V + K half tiles, S f32, P half, diag, inv-l; 23KB at
+// head_dim=128).
 kernel void attention_prefill_flash_f32(
     device const float* query [[buffer(0)]],
     device const float* keys [[buffer(1)]],
@@ -1846,8 +1847,8 @@ kernel void attention_prefill_flash_f32(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
 ) {
-    constexpr uint QT = 32;     // queries per threadgroup
-    constexpr uint PT = 32;     // kv positions per tile
+    constexpr uint QT = 32;       // queries per threadgroup
+    constexpr uint PT = 32;       // kv positions per tile
     constexpr uint MAX_DOCT = 16; // head_dim <= 128 -> at most 16 d-octets
     const uint tid = sg * 32 + lane;
     const uint head = tg.x;
@@ -1858,9 +1859,10 @@ kernel void attention_prefill_flash_f32(
     const uint q_stride = n_heads * head_dim;
     const uint kv_base = kv_base_offset + (head / group) * kv_head_stride;
 
-    // Shmem layout (half units).
-    threadgroup half* q_s = shmem;                      // QT x head_dim, q-major 8x8 blocks
-    threadgroup half* kv_s = shmem + QT * head_dim;     // PT x head_dim, shared K/V tile
+    // Shmem layout (half units). The Q staging region is consumed into register
+    // fragments before the kv loop and then reused as the V tile.
+    threadgroup half* qv_s = shmem;                  // QT x head_dim: Q staging, then V
+    threadgroup half* k_s = shmem + QT * head_dim;   // PT x head_dim K tile
     threadgroup float* s_s =
         reinterpret_cast<threadgroup float*>(shmem + 2 * QT * head_dim); // QT x PT scores
     threadgroup half* p_s = shmem + 2 * QT * head_dim + QT * PT * 2; // QT x PT half
@@ -1868,8 +1870,8 @@ kernel void attention_prefill_flash_f32(
     threadgroup float* linv_s =
         reinterpret_cast<threadgroup float*>(diag_s + 4 * 64); // QT inv-l values
 
-    // Stage Q once: B-style q-major 8x8 blocks (block(sx=d-octet, sy=q-octet); row of
-    // a block = one query's 8 contiguous d). Pre-scaled. Thread = (q, 32-d segment).
+    // Stage Q (q-major 8x8 blocks, pre-scaled), then pull this simdgroup's q-octet
+    // into register fragments.
     {
         const uint q = tid / 4;
         const uint dseg = (tid % 4) * 32;
@@ -1878,7 +1880,7 @@ kernel void attention_prefill_flash_f32(
         const uint ly = q % 8;
         for (uint d = dseg; d < min(dseg + 32u, head_dim); d += 8) {
             const uint sx = d / 8;
-            threadgroup half* dst = q_s + 64 * (4 * sx + sy) + 8 * ly;
+            threadgroup half* dst = qv_s + 64 * (4 * sx + sy) + 8 * ly;
             if (qq < n_tokens) {
                 device const float* src = query + qq * q_stride + head * head_dim + d;
                 for (uint i = 0; i < 8; ++i) {
@@ -1891,9 +1893,15 @@ kernel void attention_prefill_flash_f32(
             }
         }
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_half8x8 q_frag[MAX_DOCT];
+    for (uint dx = 0; dx < d_oct; ++dx) {
+        simdgroup_load(q_frag[dx], qv_s + 64 * (4 * dx + sg), 8, 0, false);
+    }
 
-    // Per-simdgroup flash state: this sg owns queries [tq0 + sg*8, +8).
-    float m_state = -INFINITY; // lane l < 8 carries row l's m/l
+    // Per-simdgroup flash state: this sg owns queries [tq0 + sg*8, +8). Each quad of
+    // lanes carries one row's m/l (replicated across the quad's 4 lanes).
+    float m_state = -INFINITY;
     float l_state = 0.0f;
     simdgroup_float8x8 o_acc[MAX_DOCT];
     for (uint i = 0; i < d_oct; ++i) {
@@ -1902,25 +1910,41 @@ kernel void attention_prefill_flash_f32(
 
     const uint p_end = min(tq0 + QT, n_tokens); // last query of the tile is causal limit
     for (uint kp0 = 0; kp0 < p_end; kp0 += PT) {
-        // Stage K tile transposed (d-major 8x8 blocks: block(sx=d-octet, sy=p-octet),
-        // in-block [d%8][p%8]) for the score MMA. Thread = (p, 32-d segment).
+        // Stage K (transposed d-major blocks for the score MMA) and V (natural-order
+        // blocks for the value MMA) together: one barrier pair per kv tile.
         threadgroup_barrier(mem_flags::mem_threadgroup);
         {
             const uint p = tid / 4;
             const uint dseg = (tid % 4) * 32;
             const uint pp = kp0 + p;
-            const uint sy = p / 8;
-            const uint lx = p % 8;
+            const uint k_sy = p / 8;
+            const uint k_lx = p % 8;
+            const uint v_sx = p / 8;
+            const uint v_ly = p % 8;
             if (pp < n_tokens) {
-                device const float* src = keys + kv_base + pp * position_stride + dseg;
+                device const float* ks = keys + kv_base + pp * position_stride + dseg;
+                device const float* vs = values + kv_base + pp * position_stride + dseg;
                 for (uint i = 0; i < min(32u, head_dim - dseg); ++i) {
                     const uint d = dseg + i;
-                    kv_s[64 * (4 * (d / 8) + sy) + 8 * (d % 8) + lx] = half(src[i]);
+                    k_s[64 * (4 * (d / 8) + k_sy) + 8 * (d % 8) + k_lx] = half(ks[i]);
+                }
+                for (uint d = dseg; d < min(dseg + 32u, head_dim); d += 8) {
+                    threadgroup half* dst = qv_s + 64 * (v_sx * d_oct + d / 8) + 8 * v_ly;
+                    device const float* sv = vs + (d - dseg);
+                    for (uint i = 0; i < 8; ++i) {
+                        dst[i] = half(sv[i]);
+                    }
                 }
             } else {
                 for (uint i = 0; i < min(32u, head_dim - dseg); ++i) {
                     const uint d = dseg + i;
-                    kv_s[64 * (4 * (d / 8) + sy) + 8 * (d % 8) + lx] = half(0.0f);
+                    k_s[64 * (4 * (d / 8) + k_sy) + 8 * (d % 8) + k_lx] = half(0.0f);
+                }
+                for (uint d = dseg; d < min(dseg + 32u, head_dim); d += 8) {
+                    threadgroup half* dst = qv_s + 64 * (v_sx * d_oct + d / 8) + 8 * v_ly;
+                    for (uint i = 0; i < 8; ++i) {
+                        dst[i] = half(0.0f);
+                    }
                 }
             }
         }
@@ -1933,12 +1957,10 @@ kernel void attention_prefill_flash_f32(
                 s_frag[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
             }
             for (uint dx = 0; dx < d_oct; ++dx) {
-                simdgroup_half8x8 qf;
-                simdgroup_load(qf, q_s + 64 * (4 * dx + sg), 8, 0, false);
                 for (uint j = 0; j < 4; ++j) {
                     simdgroup_half8x8 kf;
-                    simdgroup_load(kf, kv_s + 64 * (4 * dx + j), 8, 0, false);
-                    simdgroup_multiply_accumulate(s_frag[j], qf, kf, s_frag[j]);
+                    simdgroup_load(kf, k_s + 64 * (4 * dx + j), 8, 0, false);
+                    simdgroup_multiply_accumulate(s_frag[j], q_frag[dx], kf, s_frag[j]);
                 }
             }
             for (uint j = 0; j < 4; ++j) {
@@ -1947,43 +1969,49 @@ kernel void attention_prefill_flash_f32(
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Online softmax for this sg's 8 rows (lane l < 8 owns row l): causal mask,
-        // running max/sum, P = exp(S - m_new) written back as half, diag(corr) built.
-        float corr = 1.0f;
-        if (lane < 8) {
-            const uint q_global = tq0 + sg * 8 + lane;
-            threadgroup float* row = s_s + (sg * 8 + lane) * PT;
+        // Online softmax, one quad per row (lane = 4*row_in_octet + quarter): each lane
+        // scans 8 columns, quad_shuffle_xor combines; m/l replicate across the quad.
+        {
+            const uint row = lane / 4;
+            const uint quarter = lane % 4;
+            const uint q_global = tq0 + sg * 8 + row;
+            threadgroup float* srow = s_s + (sg * 8 + row) * PT + quarter * 8;
             float m_new = m_state;
-            for (uint j = 0; j < PT; ++j) {
-                const uint p = kp0 + j;
-                const float s = (p <= q_global && p < n_tokens) ? row[j] : -INFINITY;
-                row[j] = s;
+            for (uint j = 0; j < 8; ++j) {
+                const uint p = kp0 + quarter * 8 + j;
+                const float s = (p <= q_global && p < n_tokens) ? srow[j] : -INFINITY;
+                srow[j] = s;
                 m_new = max(m_new, s);
             }
-            corr = (m_state == -INFINITY) ? 1.0f : exp(m_state - m_new);
+            m_new = max(m_new, quad_shuffle_xor(m_new, 1));
+            m_new = max(m_new, quad_shuffle_xor(m_new, 2));
+            const float corr = (m_state == -INFINITY) ? 1.0f : exp(m_state - m_new);
             float l_add = 0.0f;
-            threadgroup half* prow = p_s + (sg * 8 + lane) * PT;
-            for (uint j = 0; j < PT; ++j) {
-                const float w = (row[j] == -INFINITY) ? 0.0f : exp(row[j] - m_new);
+            threadgroup half* prow = p_s + (sg * 8 + row) * PT + quarter * 8;
+            for (uint j = 0; j < 8; ++j) {
+                const float w = (srow[j] == -INFINITY) ? 0.0f : exp(srow[j] - m_new);
                 prow[j] = half(w);
                 l_add += w;
             }
+            l_add += quad_shuffle_xor(l_add, 1);
+            l_add += quad_shuffle_xor(l_add, 2);
             l_state = l_state * corr + l_add;
             m_state = m_new;
-            diag_s[sg * 64 + lane * 8 + lane] = half(corr);
-        }
-        // Zero the off-diagonal entries once per tile (8x8 minus diagonal).
-        if (lane >= 8 && lane < 16) {
-            const uint r = lane - 8;
-            for (uint c2 = 0; c2 < 8; ++c2) {
-                if (c2 != r) {
-                    diag_s[sg * 64 + r * 8 + c2] = half(0.0f);
+            if (quarter == 0) {
+                diag_s[sg * 64 + row * 8 + row] = half(corr);
+            }
+            // Zero off-diagonals once (they are never overwritten afterwards).
+            if (kp0 == 0 && quarter != 0) {
+                for (uint c2 = quarter - 1; c2 < 8; c2 += 3) {
+                    if (c2 != row) {
+                        diag_s[sg * 64 + row * 8 + c2] = half(0.0f);
+                    }
                 }
             }
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Rescale O by diag(corr).
+        // Rescale O by diag(corr), then O += P V.
         {
             simdgroup_half8x8 dg;
             simdgroup_load(dg, diag_s + sg * 64, 8, 0, false);
@@ -1993,55 +2021,23 @@ kernel void attention_prefill_flash_f32(
                 o_acc[i] = tmp;
             }
         }
-
-        // Stage V into the SAME region as K (scores already consumed K): natural-order
-        // 8x8 blocks (block(sx=p-octet, sy=d-octet), in-block [p%8][d%8]) so the PV
-        // MMA's right operand loads contiguously. Thread = (p, 32-d segment).
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        {
-            const uint p = tid / 4;
-            const uint dseg = (tid % 4) * 32;
-            const uint pp = kp0 + p;
-            const uint sx = p / 8;
-            const uint ly = p % 8;
-            for (uint d = dseg; d < min(dseg + 32u, head_dim); d += 8) {
-                threadgroup half* dst = kv_s + 64 * (sx * d_oct + d / 8) + 8 * ly;
-                if (pp < n_tokens) {
-                    device const float* src = values + kv_base + pp * position_stride + d;
-                    for (uint i = 0; i < 8; ++i) {
-                        dst[i] = half(src[i]);
-                    }
-                } else {
-                    for (uint i = 0; i < 8; ++i) {
-                        dst[i] = half(0.0f);
-                    }
-                }
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // O += P V for this sg's 8 queries: P fragments along 4 p-octets.
         for (uint px = 0; px < 4; ++px) {
             simdgroup_half8x8 pf;
             simdgroup_load(pf, p_s + (sg * 8) * PT + px * 8, PT, 0, false);
             for (uint i = 0; i < d_oct; ++i) {
                 simdgroup_half8x8 vf;
-                simdgroup_load(vf, kv_s + 64 * (px * d_oct + i), 8, 0, false);
+                simdgroup_load(vf, qv_s + 64 * (px * d_oct + i), 8, 0, false);
                 simdgroup_multiply_accumulate(o_acc[i], pf, vf, o_acc[i]);
             }
         }
     }
 
-    // Final 1/l scaling via the diagonal trick, then store this sg's 8 query rows.
+    // Final 1/l scaling via an f32 diagonal staged through the score region.
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lane < 8) {
-        const float inv = (l_state > 0.0f) ? (1.0f / l_state) : 0.0f;
-        diag_s[sg * 64 + lane * 8 + lane] = half(1.0f);
-        linv_s[sg * 8 + lane] = inv;
+        linv_s[sg * 8 + lane] = (l_state > 0.0f) ? (1.0f / l_state) : 0.0f;
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
-    // half cannot represent tiny inv-l accurately enough for long rows; scale via a
-    // f32 diagonal staged through the score region instead.
     {
         threadgroup float* fdiag = s_s + sg * 64;
         for (uint e2 = lane; e2 < 64; e2 += 32) {
