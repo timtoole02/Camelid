@@ -1036,35 +1036,34 @@ kernel void q8_0_block_wire_mm(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
 ) {
-    constexpr uint NR0 = 128; // weight rows per tile
-    constexpr uint NR1 = 64;  // tokens per tile
+    constexpr uint NR0 = 64;  // weight rows per tile
+    constexpr uint NR1 = 128; // tokens per tile (weights stream once per 128 tokens)
     constexpr uint NK = 32;   // k per step = one Q8_0 block
     constexpr uint q8_block_bytes = 34;
     // All position attributes must share one dimensionality; tg is uint2, so derive the
     // flat thread id from the (always-scalar) simdgroup/lane indices instead.
     const uint tid = sg * 32 + lane;
 
-    threadgroup half* sa = shmem;        // A: 16 row-octets x 4 k-octets of 8x8 blocks
-    threadgroup half* sb = shmem + 4096; // B: 8 token-octets x 4 k-octets of 8x8 blocks
+    threadgroup half* sa = shmem;        // A: 8 row-octets x 4 k-octets of 8x8 blocks
+    threadgroup half* sb = shmem + 2048; // B: 16 token-octets x 4 k-octets of 8x8 blocks
     threadgroup float* scratch = reinterpret_cast<threadgroup float*>(shmem);
     const uint r0 = tg.x * NR0; // weight-row tile
     const uint t0 = tg.y * NR1; // token tile
     const uint row_stride = blocks_per_row * q8_block_bytes;
     const uint k_width = blocks_per_row * 32;
 
-    const uint lr0 = tid / 2;      // weight row in tile (0..127)
-    const uint il0 = tid % 2;      // which 16-value half of the Q8_0 block
-    const uint lr1 = tid / 4;      // token in tile (0..63)
-    const uint iy = 8 * (tid % 4); // k-octet offset within the block
+    const uint lr0 = tid / 4;      // weight row in tile (0..63)
+    const uint il0 = (tid / 2) % 2; // which 16-value half of the Q8_0 block
+    const uint lr1 = tid / 2;      // token in tile (0..127)
 
     device const char* x = weight_blocks + (r0 + lr0) * row_stride;
-    device const half* yp = y + (t0 + lr1) * k_width + iy;
+    device const half* yp = y + (t0 + lr1) * k_width;
 
-    // This simdgroup's quadrant: 32 rows (sg % 4) x 32 tokens (sg / 4). A quadrant
+    // This simdgroup's quadrant: 32 rows (sg % 2) x 32 tokens (sg / 2). A quadrant
     // entirely past n_rows_in only sees zero-padding — skip its loads and MMAs
     // (staging and barriers stay uniform across the threadgroup).
-    const uint sg_row_oct = (sg % 4) * 4;
-    const uint sg_tok_oct = (sg / 4) * 4;
+    const uint sg_row_oct = (sg % 2) * 4;
+    const uint sg_tok_oct = (sg / 2) * 4;
     const bool sg_active = t0 + 8 * sg_tok_oct < n_rows_in;
 
     simdgroup_half8x8 ma[4];
@@ -1076,28 +1075,31 @@ kernel void q8_0_block_wire_mm(
 
     for (uint ib = 0; ib < blocks_per_row; ++ib) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        // A: dequantize one 16-value half-block per thread; store TRANSPOSED (k-major
-        // inside each 8x8 block) so the MMA's A operand loads contiguously.
+        // A: dequantize 8 values per thread (half of a 16-value half-block); store
+        // TRANSPOSED (k-major inside each 8x8 block) so the A operand loads contiguously.
         {
             device const char* wb = x + ib * q8_block_bytes;
             const float w_scale = float(*reinterpret_cast<device const half*>(wb));
+            const uint q8 = tid % 2; // which 8 of the 16-value half-block
             device const packed_char4* wq =
-                reinterpret_cast<device const packed_char4*>(wb + 2 + il0 * 16);
+                reinterpret_cast<device const packed_char4*>(wb + 2 + il0 * 16 + q8 * 8);
             const uint sy = lr0 / 8;
             const uint lx = lr0 % 8;
-            for (uint i = 0; i < 16; ++i) {
-                const uint sx = 2 * il0 + i / 8;
-                sa[64 * (16 * sx + sy) + 8 * (i % 8) + lx] =
+            const uint sx = 2 * il0 + q8;
+            for (uint i = 0; i < 8; ++i) {
+                sa[64 * (8 * sx + sy) + 8 * i + lx] =
                     half(float(wq[i / 4][i % 4]) * w_scale);
             }
         }
-        // B: one vectorized 8-half store per thread, token-major blocks.
+        // B: one vectorized 8-half store per thread x 2 k-octets, token-major blocks.
         {
             const uint sy = lr1 / 8;
             const uint ly = lr1 % 8;
-            const uint sx = tid % 4;
-            *reinterpret_cast<threadgroup half2x4*>(sb + 64 * (8 * sx + sy) + 8 * ly) =
-                *reinterpret_cast<device const half2x4*>(yp + ib * NK);
+            for (uint s = 0; s < 2; ++s) {
+                const uint sx = (tid % 2) * 2 + s;
+                *reinterpret_cast<threadgroup half2x4*>(sb + 64 * (16 * sx + sy) + 8 * ly) =
+                    *reinterpret_cast<device const half2x4*>(yp + ib * NK + 16 * (tid % 2) + 8 * s);
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1114,15 +1116,15 @@ kernel void q8_0_block_wire_mm(
                 for (uint i = 0; i < 16; ++i) {
                     simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
                 }
-                lsma += 64 * 16;
-                lsmb += 64 * 8;
+                lsma += 64 * 8;
+                lsmb += 64 * 16;
             }
         }
     }
 
     if (t0 + NR1 <= n_rows_in) {
         // Full tile: store fragments straight to device memory.
-        device float* c = output + (r0 + 32 * (sg % 4)) + (t0 + 32 * (sg / 4)) * rows;
+        device float* c = output + (r0 + 32 * (sg % 2)) + (t0 + 32 * (sg / 2)) * rows;
         for (uint i = 0; i < 16; ++i) {
             simdgroup_store(mc[i], c + 8 * (i % 4) + 8 * rows * (i / 4), rows, 0, false);
         }
@@ -1134,8 +1136,8 @@ kernel void q8_0_block_wire_mm(
         for (uint i = 0; i < 16; ++i) {
             simdgroup_store(mc[i], scratch + sg * 64, 8);
             simdgroup_barrier(mem_flags::mem_threadgroup);
-            const uint t_oct = t0 + 32 * (sg / 4) + 8 * (i / 4);
-            const uint r_oct = r0 + 32 * (sg % 4) + 8 * (i % 4);
+            const uint t_oct = t0 + 32 * (sg / 2) + 8 * (i / 4);
+            const uint r_oct = r0 + 32 * (sg % 2) + 8 * (i % 4);
             for (uint e2 = lane; e2 < 64; e2 += 32) {
                 const uint ft = e2 / 8;
                 const uint fr = e2 % 8;
@@ -6231,7 +6233,7 @@ impl ResidentDecodeState {
         // Half-precision GEMM inputs, padded to a 64-token multiple so the MM kernel's
         // direct device B loads never run off the end (padding rows are garbage; they
         // only feed output columns past n_tokens, which are never stored).
-        let n_pad = n_tokens.next_multiple_of(64);
+        let n_pad = n_tokens.next_multiple_of(128);
         let normf_h = nb(if use_mm { n_pad * self.hidden * 2 } else { 2 });
         let ctx_h = nb(if use_mm { n_pad * q_dim * 2 } else { 2 });
         let silu_h = nb(if use_mm { n_pad * self.ffn_dim * 2 } else { 2 });
@@ -6270,8 +6272,8 @@ impl ResidentDecodeState {
                 e.set_threadgroup_memory_length(0, 12288);
                 e.dispatch_thread_groups(
                     metal::MTLSize {
-                        width: (rows / 128) as u64,
-                        height: (n_tokens as u64).div_ceil(64),
+                        width: (rows / 64) as u64,
+                        height: (n_tokens as u64).div_ceil(128),
                         depth: 1,
                     },
                     metal::MTLSize {
@@ -8756,7 +8758,7 @@ mod gemm_probe {
         let rows: usize = 8192;
         let k: usize = 3072;
         let n_tokens: usize = 601;
-        let n_pad: usize = n_tokens.next_multiple_of(64);
+        let n_pad: usize = n_tokens.next_multiple_of(128);
         let bpr = k / 32;
         let k_ref = metal_linear_kernel().expect("metal");
         let device = &k_ref.device;
@@ -8810,8 +8812,8 @@ mod gemm_probe {
             e.set_threadgroup_memory_length(0, 12288);
             e.dispatch_thread_groups(
                 metal::MTLSize {
-                    width: (rows / 128) as u64,
-                    height: (n_tokens as u64).div_ceil(64),
+                    width: (rows / 64) as u64,
+                    height: (n_tokens as u64).div_ceil(128),
                     depth: 1,
                 },
                 metal::MTLSize {
