@@ -40,6 +40,7 @@ struct MetalLinearKernel {
     q8_0_block_ksplit_f32y_wire_nsg8_pipeline: ComputePipelineState,
     q8_0_block_ksplit_f32y_wire_gemm_pipeline: ComputePipelineState,
     q8_0_block_wire_mm_pipeline: ComputePipelineState,
+    q8_0_block_wire_mm_f16o_pipeline: ComputePipelineState,
     rms_norm_pipeline: ComputePipelineState,
     residual_add_pipeline: ComputePipelineState,
     silu_mul_pipeline: ComputePipelineState,
@@ -64,6 +65,10 @@ struct MetalLinearKernel {
     half_mm_batched_f16o_pipeline: ComputePipelineState,
     transpose_v16_pipeline: ComputePipelineState,
     rope_scatter_qh_pipeline: ComputePipelineState,
+    rope_scatter_qh_h_pipeline: ComputePipelineState,
+    rms_norm_batch_h_pipeline: ComputePipelineState,
+    residual_add_h_pipeline: ComputePipelineState,
+    silu_mul_h2_pipeline: ComputePipelineState,
     softmax_causal_rows_pipeline: ComputePipelineState,
     rms_norm_quantize_pipeline: ComputePipelineState,
     silu_mul_quantize_pipeline: ComputePipelineState,
@@ -267,6 +272,26 @@ fn command_buffer_gpu_times_us(cb: &metal::CommandBuffer) -> (u128, u128) {
             ((kend - kstart) * 1e6) as u128,
         )
     }
+}
+
+/// IEEE 754 binary16 bits -> f32 (for reading half GPU buffers on the host).
+#[cfg(target_os = "macos")]
+fn f16_bits_to_f32(b: u16) -> f32 {
+    let sign = if b >> 15 == 1 { -1.0f32 } else { 1.0 };
+    let e = ((b >> 10) & 0x1f) as i32;
+    let m = (b & 0x3ff) as i32;
+    let v = if e == 0 {
+        (m as f32) * 2f32.powi(-24)
+    } else if e == 0x1f {
+        if m == 0 {
+            f32::INFINITY
+        } else {
+            f32::NAN
+        }
+    } else {
+        (1.0 + m as f32 / 1024.0) * 2f32.powi(e - 15)
+    };
+    sign * v
 }
 
 /// f32 -> IEEE 754 binary16 bits, round-to-nearest-even (exact for values that started as
@@ -1154,6 +1179,141 @@ kernel void q8_0_block_wire_mm(
         }
     }
 }
+
+// Half-output twin of q8_0_block_wire_mm for the all-half prefill
+// activation stream (same accumulation; rounding at the store).
+kernel void q8_0_block_wire_mm_f16o(
+    device const half* y [[buffer(0)]],
+    device const char* weight_blocks [[buffer(2)]],
+    device half* output [[buffer(3)]],
+    constant uint& blocks_per_row [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& n_rows_in [[buffer(6)]],
+    threadgroup half* shmem [[threadgroup(0)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint NR0 = 64;  // weight rows per tile
+    constexpr uint NR1 = 128; // tokens per tile (weights stream once per 128 tokens)
+    constexpr uint NK = 32;   // k per step = one Q8_0 block
+    constexpr uint q8_block_bytes = 34;
+    // All position attributes must share one dimensionality; tg is uint2, so derive the
+    // flat thread id from the (always-scalar) simdgroup/lane indices instead.
+    const uint tid = sg * 32 + lane;
+
+    threadgroup half* sa = shmem;        // A: 8 row-octets x 4 k-octets of 8x8 blocks
+    threadgroup half* sb = shmem + 2048; // B: 16 token-octets x 4 k-octets of 8x8 blocks
+    threadgroup float* scratch = reinterpret_cast<threadgroup float*>(shmem);
+    const uint r0 = tg.x * NR0; // weight-row tile
+    const uint t0 = tg.y * NR1; // token tile
+    const uint row_stride = blocks_per_row * q8_block_bytes;
+    const uint k_width = blocks_per_row * 32;
+
+    const uint lr0 = tid / 4;      // weight row in tile (0..63)
+    const uint il0 = (tid / 2) % 2; // which 16-value half of the Q8_0 block
+    const uint lr1 = tid / 2;      // token in tile (0..127)
+
+    device const char* x = weight_blocks + (r0 + lr0) * row_stride;
+    device const half* yp = y + (t0 + lr1) * k_width;
+
+    // This simdgroup's quadrant: 32 rows (sg % 2) x 32 tokens (sg / 2). A quadrant
+    // entirely past n_rows_in only sees zero-padding — skip its loads and MMAs
+    // (staging and barriers stay uniform across the threadgroup).
+    const uint sg_row_oct = (sg % 2) * 4;
+    const uint sg_tok_oct = (sg / 2) * 4;
+    const bool sg_active = t0 + 8 * sg_tok_oct < n_rows_in;
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[4];
+    simdgroup_float8x8 mc[16];
+    for (uint i = 0; i < 16; ++i) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    for (uint ib = 0; ib < blocks_per_row; ++ib) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // A: dequantize 8 values per thread (half of a 16-value half-block); store
+        // TRANSPOSED (k-major inside each 8x8 block) so the A operand loads contiguously.
+        {
+            device const char* wb = x + ib * q8_block_bytes;
+            const float w_scale = float(*reinterpret_cast<device const half*>(wb));
+            const uint q8 = tid % 2; // which 8 of the 16-value half-block
+            device const packed_char4* wq =
+                reinterpret_cast<device const packed_char4*>(wb + 2 + il0 * 16 + q8 * 8);
+            const uint sy = lr0 / 8;
+            const uint lx = lr0 % 8;
+            const uint sx = 2 * il0 + q8;
+            for (uint i = 0; i < 8; ++i) {
+                sa[64 * (8 * sx + sy) + 8 * i + lx] =
+                    half(float(wq[i / 4][i % 4]) * w_scale);
+            }
+        }
+        // B: one vectorized 8-half store per thread x 2 k-octets, token-major blocks.
+        {
+            const uint sy = lr1 / 8;
+            const uint ly = lr1 % 8;
+            for (uint s = 0; s < 2; ++s) {
+                const uint sx = (tid % 2) * 2 + s;
+                *reinterpret_cast<threadgroup half2x4*>(sb + 64 * (16 * sx + sy) + 8 * ly) =
+                    *reinterpret_cast<device const half2x4*>(yp + ib * NK + 16 * (tid % 2) + 8 * s);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sg_active) {
+            threadgroup const half* lsma = sa + 64 * sg_row_oct;
+            threadgroup const half* lsmb = sb + 64 * sg_tok_oct;
+            for (uint ik = 0; ik < NK / 8; ++ik) {
+                for (uint i = 0; i < 4; ++i) {
+                    simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
+                }
+                for (uint i = 0; i < 4; ++i) {
+                    simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
+                }
+                for (uint i = 0; i < 16; ++i) {
+                    simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+                }
+                lsma += 64 * 8;
+                lsmb += 64 * 16;
+            }
+        }
+    }
+
+    if (t0 + NR1 <= n_rows_in) {
+        // Full tile, half output: per-lane element stores from the accumulators.
+        device half* c = output + (r0 + 32 * (sg % 2)) + (t0 + 32 * (sg / 2)) * rows;
+        const short qid = (short)(lane / 4);
+        const short fm = (qid & 4) + (((short)lane / 2) % 4);
+        const short fn = (qid & 2) * 2 + ((short)lane % 2) * 2;
+        for (uint i = 0; i < 16; ++i) {
+            device half* d2 =
+                c + 8 * (i % 4) + 8 * rows * (i / 4) + (uint)fm * rows + (uint)fn;
+            d2[0] = (half)mc[i].thread_elements()[0];
+            d2[1] = (half)mc[i].thread_elements()[1];
+        }
+    } else {
+        // Ragged token tail: stage each 8x8 fragment through per-simdgroup scratch
+        // (reusing the consumed A region) and write guarded. Slow, but only the final
+        // token tile takes this path.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = 0; i < 16; ++i) {
+            simdgroup_store(mc[i], scratch + sg * 64, 8);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            const uint t_oct = t0 + 32 * (sg / 2) + 8 * (i / 4);
+            const uint r_oct = r0 + 32 * (sg % 2) + 8 * (i % 4);
+            for (uint e2 = lane; e2 < 64; e2 += 32) {
+                const uint ft = e2 / 8;
+                const uint fr = e2 % 8;
+                if (t_oct + ft < n_rows_in) {
+                    output[(t_oct + ft) * rows + r_oct + fr] =
+                        half(scratch[sg * 64 + ft * 8 + fr]);
+                }
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
 "#;
 
 // Elementwise / norm building blocks for a GPU-resident forward pass. Each mirrors
@@ -1811,6 +1971,62 @@ kernel void silu_mul_f16o(
     output[gid] = half((g / (1.0 + exp(-g))) * up[gid]);
 }
 
+// All-half elementwise twins for the attention-matmul prefill stream.
+kernel void rms_norm_batch_h(
+    device const half* input [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device half* output [[buffer(2)]],
+    constant uint& width [[buffer(3)]],
+    constant float& eps [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgsize [[threads_per_threadgroup]]
+) {
+    threadgroup float partial[256];
+    device const half* in_row = input + row * width;
+    device half* out_row = output + row * width;
+    float local = 0.0;
+    for (uint i = tid; i < width; i += tgsize) {
+        float v = float(in_row[i]);
+        local += v * v;
+    }
+    partial[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgsize >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            partial[tid] += partial[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = 1.0 / sqrt(partial[0] / float(width) + eps);
+    for (uint i = tid; i < width; i += tgsize) {
+        out_row[i] = half(float(in_row[i]) * inv * weight[i]);
+    }
+}
+
+kernel void residual_add_h(
+    device const half* a [[buffer(0)]],
+    device const half* b [[buffer(1)]],
+    device half* output [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    output[gid] = half(float(a[gid]) + float(b[gid]));
+}
+
+kernel void silu_mul_h2(
+    device const half* gate [[buffer(0)]],
+    device const half* up [[buffer(1)]],
+    device half* output [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    float g = float(gate[gid]);
+    output[gid] = half((g / (1.0 + exp(-g))) * float(up[gid]));
+}
+
 // rope_rotate_f32 over n_tokens rows: gid.y = token. The data row stride is
 // head_count*head_dim (the packed Q or K row) and the cos/sin tables are flattened
 // per-token (half_rope floats each).
@@ -1972,6 +2188,98 @@ kernel void rope_scatter_qh_batch(
         const uint h = x / head_dim;
         const uint d = x % head_dim;
         const float v = v_in[t * kv_dim + x];
+        const uint dst = (h * max_positions + t) * head_dim + d;
+        cache_v[dst] = v;
+        cache_v16[dst] = half(v);
+    }
+}
+
+// Half-input twin of rope_scatter_qh_batch for the all-half stream.
+kernel void rope_scatter_qh_batch_h(
+    device const half* q_in [[buffer(0)]],
+    device const half* k_in [[buffer(1)]],
+    device const half* v_in [[buffer(2)]],
+    device half* q_h [[buffer(3)]],
+    device float* cache_k [[buffer(4)]],
+    device float* cache_v [[buffer(5)]],
+    device half* cache_k16 [[buffer(6)]],
+    device half* cache_v16 [[buffer(7)]],
+    device const float* cos_table [[buffer(8)]],
+    device const float* sin_table [[buffer(9)]],
+    constant uint& n_heads [[buffer(10)]],
+    constant uint& n_kv_heads [[buffer(11)]],
+    constant uint& head_dim [[buffer(12)]],
+    constant uint& half_rope [[buffer(13)]],
+    constant uint& pairing [[buffer(14)]],
+    constant uint& max_positions [[buffer(15)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint t = gid.y;
+    const uint q_dim = n_heads * head_dim;
+    const uint kv_dim = n_kv_heads * head_dim;
+    const uint nq_pairs = n_heads * half_rope;
+    const uint nk_pairs = n_kv_heads * half_rope;
+    device const float* ct = cos_table + t * half_rope;
+    device const float* st = sin_table + t * half_rope;
+    uint x = gid.x;
+    if (x < nq_pairs) {
+        const uint head = x / half_rope;
+        const uint pair = x - head * half_rope;
+        const float c = ct[pair];
+        const float s = st[pair];
+        const uint head_start = head * head_dim;
+        uint dim0;
+        uint dim1;
+        if (pairing == 0u) {
+            dim0 = head_start + pair * 2u;
+            dim1 = dim0 + 1u;
+        } else {
+            dim0 = head_start + pair;
+            dim1 = head_start + pair + half_rope;
+        }
+        const float x0 = float(q_in[t * q_dim + dim0]);
+        const float x1 = float(q_in[t * q_dim + dim1]);
+        q_h[t * q_dim + dim0] = half(x0 * c - x1 * s);
+        q_h[t * q_dim + dim1] = half(x0 * s + x1 * c);
+        return;
+    }
+    x -= nq_pairs;
+    if (x < nk_pairs) {
+        const uint head = x / half_rope;
+        const uint pair = x - head * half_rope;
+        const float c = ct[pair];
+        const float s = st[pair];
+        const uint head_start = head * head_dim;
+        uint dim0;
+        uint dim1;
+        if (pairing == 0u) {
+            dim0 = head_start + pair * 2u;
+            dim1 = dim0 + 1u;
+        } else {
+            dim0 = head_start + pair;
+            dim1 = head_start + pair + half_rope;
+        }
+        const float x0 = float(k_in[t * kv_dim + dim0]);
+        const float x1 = float(k_in[t * kv_dim + dim1]);
+        const float r0 = x0 * c - x1 * s;
+        const float r1 = x0 * s + x1 * c;
+        const uint h0 = dim0 / head_dim;
+        const uint d0 = dim0 % head_dim;
+        const uint h1 = dim1 / head_dim;
+        const uint d1 = dim1 % head_dim;
+        const uint dst0 = (h0 * max_positions + t) * head_dim + d0;
+        const uint dst1 = (h1 * max_positions + t) * head_dim + d1;
+        cache_k[dst0] = r0;
+        cache_k[dst1] = r1;
+        cache_k16[dst0] = half(r0);
+        cache_k16[dst1] = half(r1);
+        return;
+    }
+    x -= nk_pairs;
+    if (x < kv_dim) {
+        const uint h = x / head_dim;
+        const uint d = x % head_dim;
+        const float v = float(v_in[t * kv_dim + x]);
         const uint dst = (h * max_positions + t) * head_dim + d;
         cache_v[dst] = v;
         cache_v16[dst] = half(v);
@@ -2943,6 +3251,29 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let rope_scatter_qh_pipeline = device
                 .new_compute_pipeline_state_with_function(&rope_scatter_qh_function)
                 .ok()?;
+            let rope_scatter_qh_h_function = elementwise_library
+                .get_function("rope_scatter_qh_batch_h", None)
+                .ok()?;
+            let rope_scatter_qh_h_pipeline = device
+                .new_compute_pipeline_state_with_function(&rope_scatter_qh_h_function)
+                .ok()?;
+            let rms_norm_batch_h_function = elementwise_library
+                .get_function("rms_norm_batch_h", None)
+                .ok()?;
+            let rms_norm_batch_h_pipeline = device
+                .new_compute_pipeline_state_with_function(&rms_norm_batch_h_function)
+                .ok()?;
+            let residual_add_h_function = elementwise_library
+                .get_function("residual_add_h", None)
+                .ok()?;
+            let residual_add_h_pipeline = device
+                .new_compute_pipeline_state_with_function(&residual_add_h_function)
+                .ok()?;
+            let silu_mul_h2_function =
+                elementwise_library.get_function("silu_mul_h2", None).ok()?;
+            let silu_mul_h2_pipeline = device
+                .new_compute_pipeline_state_with_function(&silu_mul_h2_function)
+                .ok()?;
             let softmax_causal_rows_function = elementwise_library
                 .get_function("softmax_causal_rows", None)
                 .ok()?;
@@ -3043,6 +3374,11 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let q8_0_block_wire_mm_pipeline = device
                 .new_compute_pipeline_state_with_function(&q8_0_block_wire_mm_function)
                 .ok()?;
+            let q8_0_block_wire_mm_f16o_function =
+                library.get_function("q8_0_block_wire_mm_f16o", None).ok()?;
+            let q8_0_block_wire_mm_f16o_pipeline = device
+                .new_compute_pipeline_state_with_function(&q8_0_block_wire_mm_f16o_function)
+                .ok()?;
             let queue = device.new_command_queue();
             Some(MetalLinearKernel {
                 device,
@@ -3061,6 +3397,7 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 q8_0_block_ksplit_f32y_wire_nsg8_pipeline,
                 q8_0_block_ksplit_f32y_wire_gemm_pipeline,
                 q8_0_block_wire_mm_pipeline,
+                q8_0_block_wire_mm_f16o_pipeline,
                 rms_norm_pipeline,
                 residual_add_pipeline,
                 silu_mul_pipeline,
@@ -3084,6 +3421,10 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 half_mm_batched_f16o_pipeline,
                 transpose_v16_pipeline,
                 rope_scatter_qh_pipeline,
+                rope_scatter_qh_h_pipeline,
+                rms_norm_batch_h_pipeline,
+                residual_add_h_pipeline,
+                silu_mul_h2_pipeline,
                 softmax_causal_rows_pipeline,
                 rms_norm_quantize_pipeline,
                 silu_mul_quantize_pipeline,
@@ -6596,21 +6937,48 @@ impl ResidentDecodeState {
             k.device
                 .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
         };
-        let seq = nb(n_tokens * self.hidden * 4);
-        let seq_out = nb(n_tokens * self.hidden * 4);
+        // The attention-as-matmul gate and the all-half activation-stream gate are
+        // decided before buffer allocation: when active, the layer chain's working
+        // buffers are half-precision end to end (GEMM outputs, residual stream,
+        // norms, silu), halving activation traffic.
+        let n_pad = n_tokens.next_multiple_of(128);
+        let gqa_group = self.n_heads / self.n_kv_heads;
+        let use_attn_mm = mm_prefill_enabled()
+            && q_dim.is_multiple_of(128)
+            && kv_dim.is_multiple_of(128)
+            && self.hidden.is_multiple_of(128)
+            && self.ffn_dim.is_multiple_of(128)
+            && self.head_dim.is_multiple_of(8)
+            && self.head_dim <= 128
+            && self.n_heads * n_pad * n_pad * 4 <= 256 * 1024 * 1024;
+        let use_h16 = use_attn_mm && half_rope * 2 == self.head_dim;
+        let es = if use_h16 { 2 } else { 4 }; // element size of the activation stream
+        let seq = nb(n_tokens * self.hidden * es);
+        let seq_out = nb(n_tokens * self.hidden * es);
         let normf = nb(n_tokens * self.hidden * 4);
-        let q_buf = nb(n_tokens * q_dim * 4);
-        let k_buf = nb(n_tokens * kv_dim * 4);
-        let v_buf = nb(n_tokens * kv_dim * 4);
+        let q_buf = nb(n_tokens * q_dim * es);
+        let k_buf = nb(n_tokens * kv_dim * es);
+        let v_buf = nb(n_tokens * kv_dim * es);
         let ctx_buf = nb(n_tokens * q_dim * 4);
-        let o_buf = nb(n_tokens * self.hidden * 4);
-        let gate_buf = nb(n_tokens * self.ffn_dim * 4);
-        let up_buf = nb(n_tokens * self.ffn_dim * 4);
+        let o_buf = nb(n_tokens * self.hidden * es);
+        let gate_buf = nb(n_tokens * self.ffn_dim * es);
+        let up_buf = nb(n_tokens * self.ffn_dim * es);
         let silu_buf = nb(n_tokens * self.ffn_dim * 4);
-        let down_buf = nb(n_tokens * self.hidden * 4);
+        let down_buf = nb(n_tokens * self.hidden * es);
         let cos_buf = nb(cos_all.len() * 4);
         let sin_buf = nb(sin_all.len() * 4);
-        write_buffer_f32(&seq, embeddings);
+        if use_h16 {
+            let bits: Vec<u16> = embeddings.iter().map(|&v| f32_to_f16_bits(v)).collect();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bits.as_ptr() as *const u8,
+                    seq.contents() as *mut u8,
+                    bits.len() * 2,
+                );
+            }
+        } else {
+            write_buffer_f32(&seq, embeddings);
+        }
         write_buffer_f32(&cos_buf, cos_all);
         write_buffer_f32(&sin_buf, sin_all);
 
@@ -6709,14 +7077,8 @@ impl ResidentDecodeState {
         // Half-precision GEMM inputs, padded to a 64-token multiple so the MM kernel's
         // direct device B loads never run off the end (padding rows are garbage; they
         // only feed output columns past n_tokens, which are never stored).
-        let n_pad = n_tokens.next_multiple_of(128);
         // Attention-as-matmul scratch (prompts short enough to materialize S):
-        // half K/V copies, half Q, S scores f32 and P probabilities half per head.
-        let gqa_group = self.n_heads / self.n_kv_heads;
-        let use_attn_mm = use_mm
-            && self.head_dim.is_multiple_of(8)
-            && self.head_dim <= 128
-            && self.n_heads * n_pad * n_pad * 4 <= 256 * 1024 * 1024;
+        // half K/V copies, half Q, half S scores and P probabilities per head.
         let kv16_len = self.n_kv_heads * self.max_positions * self.head_dim * 2;
         let cache_k16 = nb(if use_attn_mm { kv16_len } else { 2 });
         let cache_v16 = nb(if use_attn_mm { kv16_len } else { 2 });
@@ -6816,7 +7178,11 @@ impl ResidentDecodeState {
             if use_mm {
                 // Simdgroup-matrix tiles: 64-row x 64-token output per threadgroup, so
                 // weights stream once per 64 tokens instead of once per 8.
-                e.set_compute_pipeline_state(&k.q8_0_block_wire_mm_pipeline);
+                e.set_compute_pipeline_state(if use_h16 {
+                    &k.q8_0_block_wire_mm_f16o_pipeline
+                } else {
+                    &k.q8_0_block_wire_mm_pipeline
+                });
                 e.set_buffer(0, Some(y), 0);
                 e.set_buffer(2, Some(w), 0);
                 e.set_buffer(3, Some(out), 0);
@@ -6923,7 +7289,11 @@ impl ResidentDecodeState {
             let qkv_y: &Buffer = if use_mm {
                 norm_rows(
                     &e,
-                    &k.rms_norm_batch_f16o_pipeline,
+                    if use_h16 {
+                        &k.rms_norm_batch_h_pipeline
+                    } else {
+                        &k.rms_norm_batch_f16o_pipeline
+                    },
                     cur,
                     &attn_norm_buf,
                     &normf_h,
@@ -6951,7 +7321,11 @@ impl ResidentDecodeState {
             let use_fused_rope = use_attn_mm && half_rope * 2 == self.head_dim;
             if use_fused_rope {
                 // Fused rope(Q)->half panel + rope(K)->caches + V scatter, one dispatch.
-                e.set_compute_pipeline_state(&k.rope_scatter_qh_pipeline);
+                e.set_compute_pipeline_state(if use_h16 {
+                    &k.rope_scatter_qh_h_pipeline
+                } else {
+                    &k.rope_scatter_qh_pipeline
+                });
                 e.set_buffer(0, Some(&q_buf), 0);
                 e.set_buffer(1, Some(&k_buf), 0);
                 e.set_buffer(2, Some(&v_buf), 0);
@@ -6967,7 +7341,11 @@ impl ResidentDecodeState {
                 }
                 dispatch_rows(
                     &e,
-                    &k.rope_scatter_qh_pipeline,
+                    if use_h16 {
+                        &k.rope_scatter_qh_h_pipeline
+                    } else {
+                        &k.rope_scatter_qh_pipeline
+                    },
                     (self.n_heads + self.n_kv_heads) * half_rope + kv_dim,
                     n_tokens,
                 );
@@ -7211,7 +7589,11 @@ impl ResidentDecodeState {
             stage!("5:gemm_o");
             encode_binary_off(
                 &e,
-                &k.residual_add_pipeline,
+                if use_h16 {
+                    &k.residual_add_h_pipeline
+                } else {
+                    &k.residual_add_pipeline
+                },
                 cur,
                 &o_buf,
                 nxt,
@@ -7223,7 +7605,11 @@ impl ResidentDecodeState {
             let ffn_y: &Buffer = if use_mm {
                 norm_rows(
                     &e,
-                    &k.rms_norm_batch_f16o_pipeline,
+                    if use_h16 {
+                        &k.rms_norm_batch_h_pipeline
+                    } else {
+                        &k.rms_norm_batch_f16o_pipeline
+                    },
                     nxt,
                     &ffn_norm_buf,
                     &normf_h,
@@ -7270,7 +7656,11 @@ impl ResidentDecodeState {
             if use_mm {
                 encode_binary_off(
                     &e,
-                    &k.silu_mul_f16o_pipeline,
+                    if use_h16 {
+                        &k.silu_mul_h2_pipeline
+                    } else {
+                        &k.silu_mul_f16o_pipeline
+                    },
                     &gate_buf,
                     &up_buf,
                     &silu_h,
@@ -7305,7 +7695,11 @@ impl ResidentDecodeState {
             stage!("8:gemm_down");
             encode_binary_off(
                 &e,
-                &k.residual_add_pipeline,
+                if use_h16 {
+                    &k.residual_add_h_pipeline
+                } else {
+                    &k.residual_add_pipeline
+                },
                 nxt,
                 &down_buf,
                 cur,
@@ -7332,7 +7726,16 @@ impl ResidentDecodeState {
         }
         self.filled = n_tokens;
         let mut hidden_last = vec![0.0f32; self.hidden];
-        read_buffer_f32_off(&seq, (n_tokens - 1) * self.hidden, &mut hidden_last);
+        if use_h16 {
+            unsafe {
+                let p = (seq.contents() as *const u16).add((n_tokens - 1) * self.hidden);
+                for (idx, out) in hidden_last.iter_mut().enumerate() {
+                    *out = f16_bits_to_f32(*p.add(idx));
+                }
+            }
+        } else {
+            read_buffer_f32_off(&seq, (n_tokens - 1) * self.hidden, &mut hidden_last);
+        }
         Some(hidden_last)
     }
 
