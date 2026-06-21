@@ -1,0 +1,11 @@
+# llama.cpp CPU backend system_info (captured from CPU-only run, CUDA_VISIBLE_DEVICES=-1)
+# Source: cpu-prefill-matrix run, llama-server startup.
+
+ggml_cuda_init: failed to initialize CUDA: no CUDA-capable device is detected
+- CPU : 11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz (16122 MiB, 9244 MiB free)
+system_info: n_threads = 8 (n_threads_batch = 8) / 16 | CUDA : ARCHS = 860 | USE_GRAPHS = 1 | PEER_MAX_BATCH_SIZE = 128 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | AVX512 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 |
+
+# Camelid CPU backend (same run, startup banner):
+[hw] GPU: none detected — CPU backend is the inference path
+[hw] CPU: 16 logical cores | SIMD AVX-512 (avx2=true avx512f=true fma=true neon=false)
+# => llama.cpp CPU uses AVX-512 + FMA + LLAMAFILE(tinyBLAS) + REPACK; Camelid targets AVX2 (x86-64-v3) by choice.
