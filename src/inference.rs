@@ -23,6 +23,9 @@ mod diagnostic_config;
 pub(crate) mod gemma4;
 mod kv_cache;
 mod q8_block_reader;
+mod metal_seam;
+#[cfg(target_arch = "aarch64")]
+mod cpu_neon;
 mod q8_runtime;
 mod q8_telemetry;
 mod rope;
@@ -3300,7 +3303,7 @@ impl LlamaInferenceSession {
 
         let chunk_base_position = self.kv_cache.position;
         let total_started = Instant::now();
-        metal::start_inference_session();
+        metal_seam::start_inference_session();
         let mut memory = structured_forward_memory_enabled().then(|| {
             LlamaForwardMemoryTimings::new(
                 capture_memory_sample(&self.kv_cache),
@@ -3372,7 +3375,7 @@ impl LlamaInferenceSession {
         }
         trace_forward_memory("prefill_chunk_end");
         timings.memory = memory;
-        metal::end_inference_session();
+        metal_seam::end_inference_session();
         Ok(timings)
     }
 
@@ -3409,7 +3412,7 @@ impl LlamaInferenceSession {
         let runtime_plan = ResolvedRuntimePlan::from_env()?;
         let chunk_base_position = self.kv_cache.position;
         let total_started = Instant::now();
-        metal::start_inference_session();
+        metal_seam::start_inference_session();
         let embedding_started = Instant::now();
         let mut hidden = self
             .weights
@@ -3465,7 +3468,7 @@ impl LlamaInferenceSession {
         let predictions = greedy_sample_rows(&logits)?;
         self.kv_cache.position += token_ids.len();
         timings.total = total_started.elapsed().as_micros();
-        metal::end_inference_session();
+        metal_seam::end_inference_session();
         Ok((predictions, timings))
     }
 
@@ -3691,7 +3694,7 @@ impl LlamaInferenceSession {
         let runtime_plan = ResolvedRuntimePlan::from_env()?;
         let total_started = Instant::now();
         if !collect_diagnostics {
-            metal::start_inference_session();
+            metal_seam::start_inference_session();
         }
         let mut memory = structured_forward_memory_enabled().then(|| {
             LlamaForwardMemoryTimings::new(
@@ -3883,7 +3886,7 @@ impl LlamaInferenceSession {
         self.execution_trace = execution_trace;
         self.kv_cache.position += 1;
         if !collect_diagnostics {
-            metal::end_inference_session();
+            metal_seam::end_inference_session();
         }
         timings.total = total_started.elapsed().as_micros();
         if let Some(memory) = &mut memory {
@@ -5470,7 +5473,7 @@ fn forward_layer_timed(
     trace_forward_layer_memory(layer_idx, "attention_k_done");
 
     let started = Instant::now();
-    metal::synchronize_active_session();
+    metal_seam::synchronize_active_session();
     // Qwen3 QK-norm: per-head RMSNorm on Q/K after the projections (reshaped to
     // heads) and BEFORE RoPE. No-op for plain Llama-family rows (norm is None).
     let q = match &layer.attention_q_norm {
@@ -5619,7 +5622,7 @@ fn forward_layer_timed(
     trace_forward_layer_memory(layer_idx, "attention_output_done");
 
     let started = Instant::now();
-    metal::synchronize_active_session();
+    metal_seam::synchronize_active_session();
     let residual = hidden.add(&attn_out, format!("layer_{layer_idx}_attention_residual"))?;
     let attention_residual_stats = collect_diagnostics
         .then(|| LlamaTensorStats::from_tensor(&residual))
@@ -5793,7 +5796,7 @@ fn forward_layer_timed(
     trace_forward_layer_memory(layer_idx, "ffn_down_done");
 
     let started = Instant::now();
-    metal::synchronize_active_session();
+    metal_seam::synchronize_active_session();
     let output = if ffn_out_already_residual {
         ffn_out.clone()
     } else {
@@ -8441,7 +8444,7 @@ fn gated_ffn_activation_with_plan(
         .map(|tensor| linear_projection_diagnostics(input, up_weight, tensor, "ffn up"))
         .transpose()?;
 
-    metal::synchronize_active_session();
+    metal_seam::synchronize_active_session();
     let order = diagnostic_ffn_gate_up_order()?;
     let started = Instant::now();
     for (gate_value, up_value) in gate.iter_mut().zip(up) {
@@ -8634,7 +8637,7 @@ fn try_gated_ffn_gate_up_hybrid_q8_0(
 
     let started = Instant::now();
     if with_q8_0_block_scales_and_quants(quantized_input, |input_scales, input_quants| {
-        metal::try_q8_0_block_two_linear_rows_with_cpu(
+        metal_seam::try_block_two_linear_rows_with_cpu(
             input_scales,
             input_quants,
             gate_gpu_weight_bytes,
@@ -14801,64 +14804,20 @@ unsafe fn q8_0_two_dot_rows_avx2(
     (first_sum, second_sum)
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[target_feature(enable = "dotprod")]
-unsafe fn q8_0_dot_rows_neon_dotprod(weight: &[Q8_0Block], input: &[Q8_0Block]) -> f32 {
-    use std::arch::aarch64::{vdupq_n_s32, vld1q_s8};
-    use std::arch::asm;
-
-    let mut total_sum = 0.0_f32;
-
-    for (idx, (w_block, i_block)) in weight.iter().zip(input).enumerate() {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            if let Some(next_block) = weight.get(idx + 2) {
-                asm!(
-                    "prfm pldl1keep, [{ptr}]",
-                    ptr = in(reg) next_block.quants.as_ptr(),
-                    options(nostack, preserves_flags, readonly)
-                );
-            }
-        }
-        let weight_lo = vld1q_s8(w_block.quants.as_ptr());
-        let input_lo = vld1q_s8(i_block.quants.as_ptr());
-        let weight_hi = vld1q_s8(w_block.quants.as_ptr().add(16));
-        let input_hi = vld1q_s8(i_block.quants.as_ptr().add(16));
-
-        let mut acc = vdupq_n_s32(0);
-        asm!(
-            "sdot {acc:v}.4s, {weight_lo:v}.16b, {input_lo:v}.16b",
-            "sdot {acc:v}.4s, {weight_hi:v}.16b, {input_hi:v}.16b",
-            acc = inout(vreg) acc,
-            weight_lo = in(vreg) weight_lo,
-            input_lo = in(vreg) input_lo,
-            weight_hi = in(vreg) weight_hi,
-            input_hi = in(vreg) input_hi,
-            options(nostack, preserves_flags)
-        );
-
-        // Keep horizontal sum exactly identical to existing register horizontal sum
-        let int_sum = horizontal_sum_i32x4(acc);
-        total_sum += int_sum as f32 * w_block.scale * i_block.scale;
-    }
-
-    total_sum
-}
-
 /// Q8×Q8 dot of one weight row read straight from the GGUF **wire** bytes (34-byte
 /// blocks: a little-endian f16 scale + 32 i8 quants) against a pre-quantized
 /// activation row, dispatching to the same NEON `sdot` path as
-/// [`q8_0_dot_rows_neon_dotprod`]. This lets the gemma4 wire-mmap runtime share
+/// `cpu_neon::q8_0_dot_rows_neon_dotprod`. This lets the gemma4 wire-mmap runtime share
 /// the fast i8 dot without first materializing weights as 36-byte `Q8_0Block`
 /// structs (which would mean an 8GB second resident copy). Reduction order and
 /// per-block `int_sum * w_scale * x_scale` accumulation match the block kernel.
 pub(crate) fn q8_0_wire_row_dot(weight_wire: &[u8], input: &[Q8_0Block]) -> f32 {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        if aarch64_dotprod_enabled() {
+        if cpu_neon::aarch64_dotprod_enabled() {
             // SAFETY: dotprod feature confirmed at runtime; the caller passes a
             // row of `input.len()` 34-byte wire blocks (bounds-checked indexing).
-            return unsafe { q8_0_wire_row_dot_neon_dotprod(weight_wire, input) };
+            return unsafe { cpu_neon::q8_0_wire_row_dot_neon_dotprod(weight_wire, input) };
         }
     }
     q8_0_wire_row_dot_scalar(weight_wire, input)
@@ -14884,55 +14843,6 @@ pub(crate) fn q8_0_wire_row_dot_scalar(weight_wire: &[u8], input: &[Q8_0Block]) 
     total
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[target_feature(enable = "dotprod")]
-unsafe fn q8_0_wire_row_dot_neon_dotprod(weight_wire: &[u8], input: &[Q8_0Block]) -> f32 {
-    use std::arch::aarch64::{vdupq_n_s32, vld1q_s8};
-    use std::arch::asm;
-    const WIRE: usize = 34;
-
-    let mut total = 0.0_f32;
-    for (b, i_block) in input.iter().enumerate() {
-        let base = b * WIRE;
-        let scale = f16_bits_to_f32(u16::from_le_bytes([
-            weight_wire[base],
-            weight_wire[base + 1],
-        ]));
-        let qptr = weight_wire.as_ptr().add(base + 2) as *const i8;
-
-        if let Some(next) = input.get(b + 2) {
-            let _ = next; // prefetch the weight bytes two blocks ahead
-            asm!(
-                "prfm pldl1keep, [{ptr}]",
-                ptr = in(reg) weight_wire.as_ptr().add((b + 2) * WIRE),
-                options(nostack, preserves_flags, readonly)
-            );
-        }
-
-        let weight_lo = vld1q_s8(qptr);
-        let weight_hi = vld1q_s8(qptr.add(16));
-        let input_lo = vld1q_s8(i_block.quants.as_ptr());
-        let input_hi = vld1q_s8(i_block.quants.as_ptr().add(16));
-
-        let mut acc = vdupq_n_s32(0);
-        asm!(
-            "sdot {acc:v}.4s, {weight_lo:v}.16b, {input_lo:v}.16b",
-            "sdot {acc:v}.4s, {weight_hi:v}.16b, {input_hi:v}.16b",
-            acc = inout(vreg) acc,
-            weight_lo = in(vreg) weight_lo,
-            input_lo = in(vreg) input_lo,
-            weight_hi = in(vreg) weight_hi,
-            input_hi = in(vreg) input_hi,
-            options(nostack, preserves_flags)
-        );
-
-        let int_sum = horizontal_sum_i32x4(acc);
-        total += int_sum as f32 * scale * i_block.scale;
-    }
-
-    total
-}
-
 // ---------------------------------------------------------------------------
 // Gemma 4 QAT (Q4_0 / Q6_K) wire kernels — groundwork for the QAT exact rows
 // (gemma-4-E4B_q4_0-it.gguf de-risk row, then 26B A4B). Marked allow(dead_code)
@@ -14953,10 +14863,10 @@ pub(crate) const Q4_0_WIRE_BYTES_PER_BLOCK: usize = 18;
 pub(crate) fn q4_0_wire_row_dot(weight_wire: &[u8], input: &[Q8_0Block]) -> f32 {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        if aarch64_dotprod_enabled() {
+        if cpu_neon::aarch64_dotprod_enabled() {
             // SAFETY: dotprod feature confirmed at runtime; the caller passes a
             // row of `input.len()` 18-byte wire blocks (bounds-checked indexing).
-            return unsafe { q4_0_wire_row_dot_neon_dotprod(weight_wire, input) };
+            return unsafe { cpu_neon::q4_0_wire_row_dot_neon_dotprod(weight_wire, input) };
         }
     }
     q4_0_wire_row_dot_scalar(weight_wire, input)
@@ -14983,61 +14893,6 @@ pub(crate) fn q4_0_wire_row_dot_scalar(weight_wire: &[u8], input: &[Q8_0Block]) 
         }
         total += isum as f32 * scale * i_block.scale;
     }
-    total
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[target_feature(enable = "dotprod")]
-unsafe fn q4_0_wire_row_dot_neon_dotprod(weight_wire: &[u8], input: &[Q8_0Block]) -> f32 {
-    use std::arch::aarch64::{
-        vandq_u8, vdupq_n_s32, vdupq_n_s8, vdupq_n_u8, vld1q_s8, vld1q_u8, vreinterpretq_s8_u8,
-        vshrq_n_u8, vsubq_s8,
-    };
-    use std::arch::asm;
-    const WIRE: usize = Q4_0_WIRE_BYTES_PER_BLOCK;
-
-    let mask = vdupq_n_u8(0x0F);
-    let bias = vdupq_n_s8(8);
-    let mut total = 0.0_f32;
-    for (b, i_block) in input.iter().enumerate() {
-        let base = b * WIRE;
-        let scale = f16_bits_to_f32(u16::from_le_bytes([
-            weight_wire[base],
-            weight_wire[base + 1],
-        ]));
-
-        if input.get(b + 2).is_some() {
-            asm!(
-                "prfm pldl1keep, [{ptr}]",
-                ptr = in(reg) weight_wire.as_ptr().add((b + 2) * WIRE),
-                options(nostack, preserves_flags, readonly)
-            );
-        }
-
-        let packed = vld1q_u8(weight_wire.as_ptr().add(base + 2));
-        // 4-bit -> 8-bit with the -8 bias, low nibbles = weights 0..16,
-        // high nibbles = weights 16..32 (the GGUF q4_0 packing).
-        let weight_lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(packed, mask)), bias);
-        let weight_hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(packed, 4)), bias);
-        let input_lo = vld1q_s8(i_block.quants.as_ptr());
-        let input_hi = vld1q_s8(i_block.quants.as_ptr().add(16));
-
-        let mut acc = vdupq_n_s32(0);
-        asm!(
-            "sdot {acc:v}.4s, {weight_lo:v}.16b, {input_lo:v}.16b",
-            "sdot {acc:v}.4s, {weight_hi:v}.16b, {input_hi:v}.16b",
-            acc = inout(vreg) acc,
-            weight_lo = in(vreg) weight_lo,
-            input_lo = in(vreg) input_lo,
-            weight_hi = in(vreg) weight_hi,
-            input_hi = in(vreg) input_hi,
-            options(nostack, preserves_flags)
-        );
-
-        let int_sum = horizontal_sum_i32x4(acc);
-        total += int_sum as f32 * scale * i_block.scale;
-    }
-
     total
 }
 
@@ -15339,86 +15194,12 @@ pub(crate) fn q5_0_wire_row_dot(weight_wire: &[u8], input: &[Q8_0Block]) -> f32 
     sumf
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[target_feature(enable = "dotprod")]
-unsafe fn q8_0_two_dot_rows_neon_dotprod(
-    first_weight: &[Q8_0Block],
-    second_weight: &[Q8_0Block],
-    input: &[Q8_0Block],
-) -> (f32, f32) {
-    use std::arch::aarch64::{vdupq_n_s32, vld1q_s8};
-    use std::arch::asm;
-
-    let mut first_sum = 0.0_f32;
-    let mut second_sum = 0.0_f32;
-
-    for (idx, ((first_block, second_block), input_block)) in first_weight
-        .iter()
-        .zip(second_weight)
-        .zip(input)
-        .enumerate()
-    {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            if let Some(next_block) = first_weight.get(idx + 2) {
-                asm!(
-                    "prfm pldl1keep, [{ptr}]",
-                    ptr = in(reg) next_block.quants.as_ptr(),
-                    options(nostack, preserves_flags, readonly)
-                );
-            }
-            if let Some(next_block) = second_weight.get(idx + 2) {
-                asm!(
-                    "prfm pldl1keep, [{ptr}]",
-                    ptr = in(reg) next_block.quants.as_ptr(),
-                    options(nostack, preserves_flags, readonly)
-                );
-            }
-        }
-        let input_lo = vld1q_s8(input_block.quants.as_ptr());
-        let input_hi = vld1q_s8(input_block.quants.as_ptr().add(16));
-
-        let w1_lo = vld1q_s8(first_block.quants.as_ptr());
-        let w1_hi = vld1q_s8(first_block.quants.as_ptr().add(16));
-
-        let w2_lo = vld1q_s8(second_block.quants.as_ptr());
-        let w2_hi = vld1q_s8(second_block.quants.as_ptr().add(16));
-
-        let mut acc1 = vdupq_n_s32(0);
-        let mut acc2 = vdupq_n_s32(0);
-
-        asm!(
-            "sdot {acc1:v}.4s, {w1_lo:v}.16b, {input_lo:v}.16b",
-            "sdot {acc1:v}.4s, {w1_hi:v}.16b, {input_hi:v}.16b",
-            "sdot {acc2:v}.4s, {w2_lo:v}.16b, {input_lo:v}.16b",
-            "sdot {acc2:v}.4s, {w2_hi:v}.16b, {input_hi:v}.16b",
-            acc1 = inout(vreg) acc1,
-            acc2 = inout(vreg) acc2,
-            w1_lo = in(vreg) w1_lo,
-            w1_hi = in(vreg) w1_hi,
-            w2_lo = in(vreg) w2_lo,
-            w2_hi = in(vreg) w2_hi,
-            input_lo = in(vreg) input_lo,
-            input_hi = in(vreg) input_hi,
-            options(nostack, preserves_flags)
-        );
-
-        let int_sum1 = horizontal_sum_i32x4(acc1);
-        let int_sum2 = horizontal_sum_i32x4(acc2);
-
-        first_sum += int_sum1 as f32 * first_block.scale * input_block.scale;
-        second_sum += int_sum2 as f32 * second_block.scale * input_block.scale;
-    }
-
-    (first_sum, second_sum)
-}
-
 fn q8_0_dot_rows(weight: &[Q8_0Block], input: &[Q8_0Block]) -> f32 {
     if q8_row_dispatch_enabled() {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            if aarch64_dotprod_enabled() {
-                return unsafe { q8_0_dot_rows_neon_dotprod(weight, input) };
+            if cpu_neon::aarch64_dotprod_enabled() {
+                return unsafe { cpu_neon::q8_0_dot_rows_neon_dotprod(weight, input) };
             }
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -15431,10 +15212,10 @@ fn q8_0_dot_rows(weight: &[Q8_0Block], input: &[Q8_0Block]) -> f32 {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        if aarch64_dotprod_enabled() {
+        if cpu_neon::aarch64_dotprod_enabled() {
             // SAFETY: runtime feature detection confirms dot-product support; the slice
             // iterator only passes complete Q8_0 blocks.
-            return unsafe { q8_0_dot_rows_dotprod(weight, input) };
+            return unsafe { cpu_neon::q8_0_dot_rows_dotprod(weight, input) };
         }
     }
 
@@ -15457,9 +15238,9 @@ fn q8_0_two_dot_rows(
     if q8_row_dispatch_enabled() {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            if aarch64_dotprod_enabled() {
+            if cpu_neon::aarch64_dotprod_enabled() {
                 return unsafe {
-                    q8_0_two_dot_rows_neon_dotprod(first_weight, second_weight, input)
+                    cpu_neon::q8_0_two_dot_rows_neon_dotprod(first_weight, second_weight, input)
                 };
             }
         }
@@ -15473,10 +15254,10 @@ fn q8_0_two_dot_rows(
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        if aarch64_dotprod_enabled() {
+        if cpu_neon::aarch64_dotprod_enabled() {
             // SAFETY: runtime feature detection confirms dot-product support; the slice
             // iterator only passes complete Q8_0 blocks.
-            return unsafe { q8_0_two_dot_rows_dotprod(first_weight, second_weight, input) };
+            return unsafe { cpu_neon::q8_0_two_dot_rows_dotprod(first_weight, second_weight, input) };
         }
     }
 
@@ -15495,6 +15276,9 @@ fn q8_0_two_dot_rows(
     (first_sum, second_sum)
 }
 
+// Only the Metal seam consumes this now (macOS); other targets reach Q8 via the
+// block-dot path, so silence the non-macOS dead-code lint without cfg-removing it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn q8_0_block_scales_and_quants(blocks: &[Q8_0Block]) -> (Vec<f32>, Vec<i8>) {
     let mut scales = Vec::with_capacity(blocks.len());
     let mut quants = Vec::with_capacity(blocks.len() * Q8_0_BLOCK_VALUES);
@@ -15548,169 +15332,6 @@ fn resident_weight_bytes(tensor: &CpuTensor) -> metal::ResidentWeightBytes<'_> {
             tensor.q8_0_blocks.as_ref().unwrap(),
         )),
     }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[target_feature(enable = "dotprod")]
-unsafe fn q8_0_dot_rows_dotprod(weight: &[Q8_0Block], input: &[Q8_0Block]) -> f32 {
-    weight
-        .iter()
-        .zip(input)
-        .map(|(weight_block, input_block)| {
-            // SAFETY: each Q8_0Block contains exactly 32 contiguous i8 values.
-            let int_sum = unsafe {
-                q8_0_i8_block_dotprod(weight_block.quants.as_ptr(), input_block.quants.as_ptr())
-            };
-            int_sum as f32 * weight_block.scale * input_block.scale
-        })
-        .sum()
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[target_feature(enable = "dotprod")]
-unsafe fn q8_0_two_dot_rows_dotprod(
-    first_weight: &[Q8_0Block],
-    second_weight: &[Q8_0Block],
-    input: &[Q8_0Block],
-) -> (f32, f32) {
-    let mut first_sum = 0.0_f32;
-    let mut second_sum = 0.0_f32;
-    for ((first_block, second_block), input_block) in
-        first_weight.iter().zip(second_weight).zip(input)
-    {
-        // SAFETY: each Q8_0Block contains exactly 32 contiguous i8 values.
-        let first_int_sum = unsafe {
-            q8_0_i8_block_dotprod(first_block.quants.as_ptr(), input_block.quants.as_ptr())
-        };
-        // SAFETY: each Q8_0Block contains exactly 32 contiguous i8 values.
-        let second_int_sum = unsafe {
-            q8_0_i8_block_dotprod(second_block.quants.as_ptr(), input_block.quants.as_ptr())
-        };
-        first_sum += first_int_sum as f32 * first_block.scale * input_block.scale;
-        second_sum += second_int_sum as f32 * second_block.scale * input_block.scale;
-    }
-    (first_sum, second_sum)
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[target_feature(enable = "dotprod")]
-unsafe fn q8_0_packed_4x4_block_dotprod(
-    packed_quants: *const i8,
-    input_quants: *const i8,
-) -> [i32; 4] {
-    use std::arch::aarch64::{vdupq_n_s32, vld1q_s8};
-    use std::arch::asm;
-
-    // SAFETY: callers provide a packed 128-i8 block and a 32-i8 input block.
-    let b0 = unsafe { vld1q_s8(packed_quants) };
-    let b1 = unsafe { vld1q_s8(packed_quants.add(16)) };
-    let b2 = unsafe { vld1q_s8(packed_quants.add(32)) };
-    let b3 = unsafe { vld1q_s8(packed_quants.add(48)) };
-    let b4 = unsafe { vld1q_s8(packed_quants.add(64)) };
-    let b5 = unsafe { vld1q_s8(packed_quants.add(80)) };
-    let b6 = unsafe { vld1q_s8(packed_quants.add(96)) };
-    let b7 = unsafe { vld1q_s8(packed_quants.add(112)) };
-    let a0 = unsafe { vld1q_s8(input_quants) };
-    let a1 = unsafe { vld1q_s8(input_quants.add(16)) };
-
-    let mut acc = vdupq_n_s32(0);
-    // SAFETY: target_feature(dotprod) enables SDOT. This mirrors llama.cpp's q8_0 4x4
-    // GEMV lane-dot shape: one output row per accumulator lane.
-    unsafe {
-        asm!(
-            "sdot {acc:v}.4s, {b0:v}.16b, {a0:v}.4b[0]",
-            "sdot {acc:v}.4s, {b1:v}.16b, {a0:v}.4b[1]",
-            "sdot {acc:v}.4s, {b2:v}.16b, {a0:v}.4b[2]",
-            "sdot {acc:v}.4s, {b3:v}.16b, {a0:v}.4b[3]",
-            "sdot {acc:v}.4s, {b4:v}.16b, {a1:v}.4b[0]",
-            "sdot {acc:v}.4s, {b5:v}.16b, {a1:v}.4b[1]",
-            "sdot {acc:v}.4s, {b6:v}.16b, {a1:v}.4b[2]",
-            "sdot {acc:v}.4s, {b7:v}.16b, {a1:v}.4b[3]",
-            acc = inout(vreg) acc,
-            b0 = in(vreg) b0,
-            b1 = in(vreg) b1,
-            b2 = in(vreg) b2,
-            b3 = in(vreg) b3,
-            b4 = in(vreg) b4,
-            b5 = in(vreg) b5,
-            b6 = in(vreg) b6,
-            b7 = in(vreg) b7,
-            a0 = in(vreg) a0,
-            a1 = in(vreg) a1,
-            options(nostack, preserves_flags)
-        );
-    }
-    // SAFETY: int32x4_t is a four-lane i32 vector; lane order is output-row order.
-    unsafe { std::mem::transmute::<std::arch::aarch64::int32x4_t, [i32; 4]>(acc) }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[target_feature(enable = "dotprod")]
-unsafe fn q8_0_packed_4x8_block_dotprod(
-    packed_quants: *const i8,
-    input_quants: *const i8,
-) -> [i32; 4] {
-    use std::arch::aarch64::{vcombine_s8, vdupq_n_s32, vld1_s8, vld1q_s8};
-    use std::arch::asm;
-
-    // SAFETY: callers provide a packed 128-i8 block and a 32-i8 input block.
-    let b0 = unsafe { vld1q_s8(packed_quants) };
-    let b1 = unsafe { vld1q_s8(packed_quants.add(16)) };
-    let b2 = unsafe { vld1q_s8(packed_quants.add(32)) };
-    let b3 = unsafe { vld1q_s8(packed_quants.add(48)) };
-    let b4 = unsafe { vld1q_s8(packed_quants.add(64)) };
-    let b5 = unsafe { vld1q_s8(packed_quants.add(80)) };
-    let b6 = unsafe { vld1q_s8(packed_quants.add(96)) };
-    let b7 = unsafe { vld1q_s8(packed_quants.add(112)) };
-    let a0_half = unsafe { vld1_s8(input_quants) };
-    let a1_half = unsafe { vld1_s8(input_quants.add(8)) };
-    let a2_half = unsafe { vld1_s8(input_quants.add(16)) };
-    let a3_half = unsafe { vld1_s8(input_quants.add(24)) };
-    let a0 = vcombine_s8(a0_half, a0_half);
-    let a1 = vcombine_s8(a1_half, a1_half);
-    let a2 = vcombine_s8(a2_half, a2_half);
-    let a3 = vcombine_s8(a3_half, a3_half);
-
-    let mut acc0 = vdupq_n_s32(0);
-    let mut acc1 = vdupq_n_s32(0);
-    // SAFETY: target_feature(dotprod) enables SDOT. This mirrors llama.cpp's q8_0 4x8
-    // GEMV dot shape; pairwise lane sums below mirror vpaddq_s32(ret0, ret1).
-    unsafe {
-        asm!(
-            "sdot {acc0:v}.4s, {b0:v}.16b, {a0:v}.16b",
-            "sdot {acc1:v}.4s, {b1:v}.16b, {a0:v}.16b",
-            "sdot {acc0:v}.4s, {b2:v}.16b, {a1:v}.16b",
-            "sdot {acc1:v}.4s, {b3:v}.16b, {a1:v}.16b",
-            "sdot {acc0:v}.4s, {b4:v}.16b, {a2:v}.16b",
-            "sdot {acc1:v}.4s, {b5:v}.16b, {a2:v}.16b",
-            "sdot {acc0:v}.4s, {b6:v}.16b, {a3:v}.16b",
-            "sdot {acc1:v}.4s, {b7:v}.16b, {a3:v}.16b",
-            acc0 = inout(vreg) acc0,
-            acc1 = inout(vreg) acc1,
-            b0 = in(vreg) b0,
-            b1 = in(vreg) b1,
-            b2 = in(vreg) b2,
-            b3 = in(vreg) b3,
-            b4 = in(vreg) b4,
-            b5 = in(vreg) b5,
-            b6 = in(vreg) b6,
-            b7 = in(vreg) b7,
-            a0 = in(vreg) a0,
-            a1 = in(vreg) a1,
-            a2 = in(vreg) a2,
-            a3 = in(vreg) a3,
-            options(nostack, preserves_flags)
-        );
-    }
-    // SAFETY: int32x4_t is a four-lane i32 vector.
-    let lanes0 = unsafe { std::mem::transmute::<std::arch::aarch64::int32x4_t, [i32; 4]>(acc0) };
-    let lanes1 = unsafe { std::mem::transmute::<std::arch::aarch64::int32x4_t, [i32; 4]>(acc1) };
-    [
-        lanes0[0] + lanes0[1],
-        lanes0[2] + lanes0[3],
-        lanes1[0] + lanes1[1],
-        lanes1[2] + lanes1[3],
-    ]
 }
 
 fn q8_0_reader_backing(weight: &CpuTensor, input_width: usize) -> Result<Option<&Q8_0FileBacking>> {
@@ -15865,22 +15486,16 @@ fn matmul_rhs_transposed_q8_0_block_reader_with_flags(
                             scales,
                         )?;
                         let output_chunk = &mut output[output_idx..output_idx + rows_this_chunk];
-                        let completed_with_metal = if use_q8_0_block_dot && q8_flags.metal {
-                            let (input_scales, input_quants) = q8_0_block_scales_and_quants(
-                                &quantized_input_blocks[..blocks_per_row],
-                            );
-                            metal::try_q8_0_encoded_linear_row(
-                                &input_scales,
-                                &input_quants,
-                                chunk,
-                                scales,
-                                rows_this_chunk,
-                                blocks_per_row,
-                                output_chunk,
-                            )
-                        } else {
-                            false
-                        };
+                        let completed_with_metal = metal_seam::try_encoded_row(
+                            q8_flags,
+                            use_q8_0_block_dot,
+                            &quantized_input_blocks[..blocks_per_row],
+                            chunk,
+                            scales,
+                            rows_this_chunk,
+                            blocks_per_row,
+                            output_chunk,
+                        );
                         if completed_with_metal {
                             // Opt-in experimental Metal Q8 path completed this chunk.
                         } else if parallelize_output {
@@ -15971,22 +15586,17 @@ fn matmul_rhs_transposed_q8_0_block_reader_with_flags(
                             )
                         })?;
                         with_q8_0_file_reader_output_chunk(scratch_len, |output_chunk_scratch| {
-                            let completed_with_metal = if use_q8_0_block_dot && q8_flags.metal {
-                                let (input_scales, input_quants) =
-                                    q8_0_block_scales_and_quants(quantized_input_blocks);
-                                metal::try_q8_0_encoded_linear_rows(
-                                    &input_scales,
-                                    &input_quants,
-                                    chunk,
-                                    scales,
-                                    rows,
-                                    rows_this_chunk,
-                                    blocks_per_row,
-                                    output_chunk_scratch,
-                                )
-                            } else {
-                                false
-                            };
+                            let completed_with_metal = metal_seam::try_encoded_rows(
+                                q8_flags,
+                                use_q8_0_block_dot,
+                                quantized_input_blocks,
+                                chunk,
+                                scales,
+                                rows,
+                                rows_this_chunk,
+                                blocks_per_row,
+                                output_chunk_scratch,
+                            );
                             if !completed_with_metal {
                                 output_chunk_scratch
                                     .par_chunks_mut(rows)
@@ -16147,10 +15757,10 @@ fn dot_q8_0_encoded_row_with_scales(input: &[Q8_0Block], row_bytes: &[u8], scale
     debug_assert_eq!(input.len(), scales.len());
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        if aarch64_dotprod_enabled() {
+        if cpu_neon::aarch64_dotprod_enabled() {
             // SAFETY: runtime feature detection confirms dot-product support; row_bytes is
             // traversed as exact Q8_0 encoded blocks.
-            return unsafe { dot_q8_0_encoded_row_with_scales_dotprod(input, row_bytes, scales) };
+            return unsafe { cpu_neon::dot_q8_0_encoded_row_with_scales_dotprod(input, row_bytes, scales) };
         }
     }
 
@@ -16161,32 +15771,6 @@ fn dot_q8_0_encoded_row_with_scales(input: &[Q8_0Block], row_bytes: &[u8], scale
         .zip(scales)
     {
         let int_sum = q8_0_block_int_dot_horizontal_sum_encoded(&block[2..], &input_block.quants);
-        sum += int_sum as f32 * *scale * input_block.scale;
-    }
-    sum
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[target_feature(enable = "dotprod")]
-unsafe fn dot_q8_0_encoded_row_with_scales_dotprod(
-    input: &[Q8_0Block],
-    row_bytes: &[u8],
-    scales: &[f32],
-) -> f32 {
-    let mut sum = 0.0_f32;
-    for ((input_block, block), scale) in input
-        .iter()
-        .zip(row_bytes.chunks_exact(Q8BlockReader::BLOCK_SIZE_BYTES))
-        .zip(scales)
-    {
-        // SAFETY: each encoded Q8_0 block stores 32 contiguous signed quant bytes after
-        // the two-byte f16 scale header.
-        let int_sum = unsafe {
-            q8_0_i8_block_dotprod(
-                block[2..].as_ptr().cast::<i8>(),
-                input_block.quants.as_ptr(),
-            )
-        };
         sum += int_sum as f32 * *scale * input_block.scale;
     }
     sum
@@ -16233,7 +15817,7 @@ fn q8_0_block_int_dot_horizontal_sum_encoded_impl(
     input: &[i8; Q8_0_BLOCK_VALUES],
 ) -> i32 {
     // SAFETY: both pointers address one complete Q8_0 block (32 signed bytes).
-    unsafe { q8_0_i8_block_neon(weight.as_ptr().cast::<i8>(), input.as_ptr()) }
+    unsafe { cpu_neon::q8_0_i8_block_neon(weight.as_ptr().cast::<i8>(), input.as_ptr()) }
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -16265,7 +15849,7 @@ fn q8_0_block_int_dot_horizontal_sum_impl(
     input: &[i8; Q8_0_BLOCK_VALUES],
 ) -> i32 {
     // SAFETY: both pointers address one complete Q8_0 block (32 signed bytes).
-    unsafe { q8_0_i8_block_neon(weight.as_ptr(), input.as_ptr()) }
+    unsafe { cpu_neon::q8_0_i8_block_neon(weight.as_ptr(), input.as_ptr()) }
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -16511,96 +16095,6 @@ unsafe fn q8_0_i8_block_avx2(weight: *const i8, input: *const i8) -> i32 {
     let sum64 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, 0x4E));
     let sum32 = _mm_add_epi32(sum64, _mm_shuffle_epi32(sum64, 0xB1));
     _mm_cvtsi128_si32(sum32)
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn aarch64_dotprod_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        !q8_0_env_flag_disabled("CAMELID_AARCH64_DOTPROD")
-            && std::arch::is_aarch64_feature_detected!("dotprod")
-    })
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-unsafe fn q8_0_i8_block_neon(weight: *const i8, input: *const i8) -> i32 {
-    if aarch64_dotprod_enabled() {
-        // SAFETY: feature detection above guarantees the dot-product instructions are
-        // available, and callers pass pointers to at least 32 contiguous i8 values.
-        return unsafe { q8_0_i8_block_dotprod(weight, input) };
-    }
-
-    // SAFETY: callers pass pointers to at least 32 contiguous i8 values.
-    unsafe { q8_0_i8_block_neon_mul(weight, input) }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[target_feature(enable = "dotprod")]
-unsafe fn q8_0_i8_block_dotprod(weight: *const i8, input: *const i8) -> i32 {
-    use std::arch::aarch64::{vdupq_n_s32, vld1q_s8};
-    use std::arch::asm;
-
-    // SAFETY: callers pass pointers to at least 32 contiguous i8 values.
-    let weight_lo = unsafe { vld1q_s8(weight) };
-    let input_lo = unsafe { vld1q_s8(input) };
-    let weight_hi = unsafe { vld1q_s8(weight.add(16)) };
-    let input_hi = unsafe { vld1q_s8(input.add(16)) };
-
-    let mut acc = vdupq_n_s32(0);
-    // SAFETY: target_feature(dotprod) enables SDOT for this function. The operands are full
-    // 128-bit vector registers loaded above, and the instruction only updates `acc`.
-    unsafe {
-        asm!(
-            "sdot {acc:v}.4s, {weight_lo:v}.16b, {input_lo:v}.16b",
-            "sdot {acc:v}.4s, {weight_hi:v}.16b, {input_hi:v}.16b",
-            acc = inout(vreg) acc,
-            weight_lo = in(vreg) weight_lo,
-            input_lo = in(vreg) input_lo,
-            weight_hi = in(vreg) weight_hi,
-            input_hi = in(vreg) input_hi,
-            options(nostack, preserves_flags)
-        );
-    }
-    horizontal_sum_i32x4(acc)
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[inline(always)]
-unsafe fn q8_0_i8_block_neon_mul(weight: *const i8, input: *const i8) -> i32 {
-    use std::arch::aarch64::{
-        vaddq_s32, vdupq_n_s32, vget_high_s8, vget_low_s8, vld1q_s8, vmull_s8, vpaddlq_s16,
-    };
-
-    // SAFETY: callers pass pointers to at least 32 contiguous i8 values.
-    let weight_lo = unsafe { vld1q_s8(weight) };
-    let input_lo = unsafe { vld1q_s8(input) };
-    let weight_hi = unsafe { vld1q_s8(weight.add(16)) };
-    let input_hi = unsafe { vld1q_s8(input.add(16)) };
-
-    let mut acc = vdupq_n_s32(0);
-    acc = vaddq_s32(
-        acc,
-        vpaddlq_s16(vmull_s8(vget_low_s8(weight_lo), vget_low_s8(input_lo))),
-    );
-    acc = vaddq_s32(
-        acc,
-        vpaddlq_s16(vmull_s8(vget_high_s8(weight_lo), vget_high_s8(input_lo))),
-    );
-    acc = vaddq_s32(
-        acc,
-        vpaddlq_s16(vmull_s8(vget_low_s8(weight_hi), vget_low_s8(input_hi))),
-    );
-    acc = vaddq_s32(
-        acc,
-        vpaddlq_s16(vmull_s8(vget_high_s8(weight_hi), vget_high_s8(input_hi))),
-    );
-    horizontal_sum_i32x4(acc)
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[inline(always)]
-fn horizontal_sum_i32x4(acc: std::arch::aarch64::int32x4_t) -> i32 {
-    unsafe { std::arch::aarch64::vaddvq_s32(acc) }
 }
 
 pub(crate) fn f32_to_f16_bits(value: f32) -> u16 {
@@ -17403,51 +16897,14 @@ fn accumulate_transposed_linear_row_q8_0_block_dot_quantized_with_flags(
         .q8_0_blocks
         .expect("q8_0 block-dot precondition checked");
     debug_assert_eq!(weight_blocks.len(), output.len() * blocks_per_row);
-    if q8_flags.hybrid_retained {
-        let gpu_rows = q8_flags.hybrid_gpu_rows_for_output(output.len());
-        if gpu_rows > 0 && gpu_rows < output.len() {
-            let cpu_rows = output.len() - gpu_rows;
-            let gpu_block_start = cpu_rows * blocks_per_row;
-            let (cpu_output, gpu_output) = output.split_at_mut(cpu_rows);
-            let cpu_weight_blocks = &weight_blocks[..gpu_block_start];
-            let gpu_weight_blocks = &weight_blocks[gpu_block_start..];
-            let gpu_weight_bytes = q8_0_blocks_as_bytes(gpu_weight_blocks);
-            if with_q8_0_block_scales_and_quants(quantized_input, |input_scales, input_quants| {
-                metal::try_q8_0_block_linear_row_with_cpu(
-                    input_scales,
-                    input_quants,
-                    gpu_weight_bytes,
-                    gpu_rows,
-                    blocks_per_row,
-                    gpu_output,
-                    || {
-                        accumulate_q8_0_block_dot_quantized_cpu(
-                            quantized_input,
-                            cpu_weight_blocks,
-                            cpu_output,
-                        )
-                    },
-                )
-            }) {
-                trace_q8_0_hybrid_retained_success(cpu_rows, gpu_rows, blocks_per_row);
-                return;
-            }
-        }
-    }
-    if q8_flags.metal_retained {
-        let weight_bytes = q8_0_blocks_as_bytes(weight_blocks);
-        if with_q8_0_block_scales_and_quants(quantized_input, |input_scales, input_quants| {
-            metal::try_q8_0_block_linear_row(
-                input_scales,
-                input_quants,
-                weight_bytes,
-                output.len(),
-                blocks_per_row,
-                output,
-            )
-        }) {
-            return;
-        }
+    if metal_seam::try_transposed_block_offload(
+        q8_flags,
+        quantized_input,
+        weight_blocks,
+        blocks_per_row,
+        output,
+    ) {
+        return;
     }
     if q8_flags.cuda {
         // Opt-in CUDA Q8 hybrid decode over the retained block layout. The
@@ -18471,16 +17928,16 @@ fn q8_0_packed_rows4_dot(
             }
         }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        let int_sums = if aarch64_dotprod_enabled() {
+        let int_sums = if cpu_neon::aarch64_dotprod_enabled() {
             // SAFETY: runtime feature detection confirms dot-product support; packed quants
             // contain 128 i8 values and input quants contain 32 contiguous i8 values.
             unsafe {
                 match interleave {
-                    Q8_0PackedRows4Interleave::I4 => q8_0_packed_4x4_block_dotprod(
+                    Q8_0PackedRows4Interleave::I4 => cpu_neon::q8_0_packed_4x4_block_dotprod(
                         packed_block.quants.as_ptr(),
                         input_block.quants.as_ptr(),
                     ),
-                    Q8_0PackedRows4Interleave::I8 => q8_0_packed_4x8_block_dotprod(
+                    Q8_0PackedRows4Interleave::I8 => cpu_neon::q8_0_packed_4x8_block_dotprod(
                         packed_block.quants.as_ptr(),
                         input_block.quants.as_ptr(),
                     ),
