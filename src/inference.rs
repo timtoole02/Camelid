@@ -2340,7 +2340,15 @@ impl LlamaInferenceSession {
         token_id: u32,
         config: &SamplingConfig,
     ) -> Result<Option<(u32, u128)>> {
-        if !resident_decode_cuda_enabled()
+        // The resident GPU Gumbel-max temperature-sampling fast lane produces
+        // corrupted output in the streaming decode path (garbled, off-topic
+        // tokens for any temperature > 0; greedy/argmax and the CPU temperature
+        // sampler are unaffected). Disabled by default until the GPU
+        // sampling-state interaction is root-caused; opt back in with
+        // CAMELID_GPU_TEMP_SAMPLING. Declining here routes temperature sampling
+        // through the correct CPU sampler (one logits copy per token).
+        if !resident_gpu_temperature_sampling_enabled()
+            || !resident_decode_cuda_enabled()
             || config.temperature <= 0.0
             || config.top_k.is_some()
             || config.top_p.is_some_and(|p| p < 1.0)
@@ -10103,6 +10111,25 @@ fn build_resident_cuda_engine(
         .set_output(&weights.output_norm.data, raw(weights.output_projection())?)
         .ok()?;
     Some(engine)
+}
+
+/// Opt-in gate for the resident GPU Gumbel-max temperature-sampling fast lane.
+/// Default OFF: the fast lane corrupts output in the streaming decode path, so
+/// temperature sampling falls back to the (correct) CPU sampler. Set
+/// `CAMELID_GPU_TEMP_SAMPLING=1/true/on/yes` to re-enable for debugging once the
+/// GPU sampling-state interaction is fixed.
+fn resident_gpu_temperature_sampling_enabled() -> bool {
+    match std::env::var_os("CAMELID_GPU_TEMP_SAMPLING") {
+        Some(value) => {
+            let value = value.to_string_lossy();
+            let value = value.trim();
+            value.eq_ignore_ascii_case("1")
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("on")
+                || value.eq_ignore_ascii_case("yes")
+        }
+        None => false,
+    }
 }
 
 /// CUDA GPU-resident decode gate (the NVIDIA analog of the Metal one). On

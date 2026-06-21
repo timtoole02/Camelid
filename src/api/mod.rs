@@ -8028,7 +8028,15 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
         let mut forward_timings = LlamaForwardTimings::default();
         let mut sample = 0;
 
-        if !prepared.collect_dense_diagnostics {
+        // Bypass the prompt-prefix cache when the CUDA-resident engine drives
+        // decode: reusing a cached session reseeds the GPU KV from f16-rounded
+        // host history (a different reduction order than a clean GPU prefill),
+        // which corrupts the resumed decode — mild for greedy (a few near-tie
+        // flips) but catastrophic under temperature sampling, where it produces
+        // garbled, off-topic output. The non-streaming path already gates the
+        // cache this way (see resident_decode_cuda_active); the streaming path
+        // must too. The CPU lane is reduction-order-stable and keeps the cache.
+        if !prepared.collect_dense_diagnostics && !crate::inference::resident_decode_cuda_active() {
             if let Some(cached) = lookup_prompt_prefix_cache(&prepared) {
                 prepared.session = cached.session.clone();
                 input.clear();
