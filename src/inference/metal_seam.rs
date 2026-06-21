@@ -46,6 +46,17 @@ pub(super) fn synchronize_active_session() {
 #[inline]
 pub(super) fn synchronize_active_session() {}
 
+#[cfg(target_os = "macos")]
+#[inline]
+pub(super) fn wire_mode_active() -> bool {
+    crate::metal::wire_mode_active()
+}
+#[cfg(not(target_os = "macos"))]
+#[inline]
+pub(super) fn wire_mode_active() -> bool {
+    false
+}
+
 // ---- Per-matmul Q8_0 offload (block reader, encoded single row) ----
 // Was inline in `matmul_rhs_transposed_q8_0_block_reader_with_flags` (~15868).
 
@@ -256,6 +267,39 @@ pub(super) fn try_block_two_linear_rows_with_cpu<F: FnOnce()>(
     _first_output: &mut [f32],
     _second_output: &mut [f32],
     _cpu_work: F,
+) -> bool {
+    false
+}
+
+// ---- Retained-block single-row decode offload (file-reader block-dot path) ----
+// 1:1 passthrough of metal::try_q8_0_block_linear_row, runtime-gated by metal_retained.
+
+#[cfg(target_os = "macos")]
+pub(super) fn try_block_linear_row(
+    input_scales: &[f32],
+    input_quants: &[i8],
+    weight_bytes: &[u8],
+    rows: usize,
+    blocks_per_row: usize,
+    output: &mut [f32],
+) -> bool {
+    crate::metal::try_q8_0_block_linear_row(
+        input_scales,
+        input_quants,
+        weight_bytes,
+        rows,
+        blocks_per_row,
+        output,
+    )
+}
+#[cfg(not(target_os = "macos"))]
+pub(super) fn try_block_linear_row(
+    _input_scales: &[f32],
+    _input_quants: &[i8],
+    _weight_bytes: &[u8],
+    _rows: usize,
+    _blocks_per_row: usize,
+    _output: &mut [f32],
 ) -> bool {
     false
 }
