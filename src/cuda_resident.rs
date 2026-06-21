@@ -461,9 +461,11 @@ extern "C" __global__ void attention_decode(
     const unsigned short* vbase = cache_v + (long)kv_head * max_pos * head_dim;
 
     extern __shared__ float shared[];
-    float* qsh = shared;                 // head_dim
-    float* scores = shared + head_dim;   // position_count
     int tid = threadIdx.x;
+    int G = blockDim.x / head_dim;       // weighted-V groups per dim (blockDim is a multiple of head_dim)
+    float* qsh = shared;                 // head_dim
+    float* vpart = shared + head_dim;    // G * head_dim (per-dim partials, fixed-order combine)
+    float* scores = shared + head_dim + (long)G * head_dim;   // position_count
     for (int d = tid; d < head_dim; d += blockDim.x) qsh[d] = qh[d];
     __syncthreads();
 
@@ -494,12 +496,30 @@ extern "C" __global__ void attention_decode(
     }
     __syncthreads();
     float inv = 1.0f / s_sum;
-    // weighted V: each thread handles a subset of output dims
-    for (int d = tid; d < head_dim; d += blockDim.x) {
-        float acc = 0.0f;
-        for (int p = 0; p < position_count; p++)
-            acc += (scores[p] * inv) * f16_bits_to_f32(vbase[(long)p * head_dim + d]);
-        out[(long)head * head_dim + d] = acc;
+    // weighted V (parallelized; TOKEN-PARITY, *not* bit-identical to CPU): G threads
+    // cooperate per output dim. Thread (gid,did) sums the CONTIGUOUS key range
+    // [gid*pc/G, (gid+1)*pc/G) in p-order into vpart[did*G+gid]; group gid==0 then sums
+    // the G partials in g-order into out[did]. Same math as the sequential p=0..pc-1
+    // sum but FP-REASSOCIATED (each partial restarts at 0), so logits differ in the low
+    // bits. This is the lever that fixes the O(context) weighted-V collapse at depth
+    // (the sequential reduction caps parallelism at head_dim threads). Greedy tokens
+    // are verified identical (parity gate first_divergent==-1 vs llama.cpp acd79d603).
+    // CAVEAT: attention_batched (spec-decode verify) is still the sequential reduction;
+    // for spec-decode losslessness it must get the identical reorder so decode==batched
+    // stays exact. Greedy single-token decode (this path / the benchmark) is unaffected.
+    int gid = tid / head_dim;            // 0..G-1
+    int did = tid % head_dim;            // 0..head_dim-1
+    int p_lo = (int)((long)gid * position_count / G);
+    int p_hi = (int)((long)(gid + 1) * position_count / G);
+    float acc = 0.0f;
+    for (int p = p_lo; p < p_hi; p++)
+        acc += (scores[p] * inv) * f16_bits_to_f32(vbase[(long)p * head_dim + did]);
+    vpart[(long)did * G + gid] = acc;
+    __syncthreads();
+    if (gid == 0) {
+        float sum = 0.0f;
+        for (int g = 0; g < G; g++) sum += vpart[(long)did * G + g];
+        out[(long)head * head_dim + did] = sum;
     }
 }
 
@@ -1335,10 +1355,25 @@ fn launch_attention(
     max_pos: usize,
     scale: f32,
 ) -> Result<(), cudarc::driver::DriverError> {
+    // Adaptive launch (occupancy/latency fix). attention_decode was starved at
+    // batch-1 (ncu @ block 64: 4.4% occupancy, 0.07 waves/SM, 0.44% DRAM) — too few
+    // warps to hide the K/V f16 read latency, and its cost is O(context) so decode
+    // collapses at depth. Size the block to the key count in units of head_dim (G
+    // weighted-V groups), capped at 1024 threads. G = block/head_dim is passed
+    // implicitly via blockDim so the kernel parallelizes the weighted-V across G
+    // contiguous key ranges. The strided score/exp loops and the tid==0 softmax
+    // reductions stay bit-identical; the weighted-V is FP-reassociated for parallelism
+    // (token-parity, not bit-identical to CPU — see the kernel body). Verified token-id.
+    let max_groups = (1024 / head_dim as u32).max(1);
+    let groups = (shared_positions.max(1) as u32)
+        .div_ceil(head_dim as u32)
+        .clamp(1, max_groups);
+    let block = groups * head_dim as u32;
     let cfg = LaunchConfig {
         grid_dim: (n_heads as u32, 1, 1),
-        block_dim: (64, 1, 1),
-        shared_mem_bytes: ((head_dim + shared_positions) * 4) as u32,
+        block_dim: (block, 1, 1),
+        // qsh[head_dim] + vpart[groups*head_dim] + scores[shared_positions]
+        shared_mem_bytes: ((head_dim as u32 * (1 + groups)) + shared_positions as u32) * 4,
     };
     let (nh, nkv, hd, mp) = (
         n_heads as i32,
