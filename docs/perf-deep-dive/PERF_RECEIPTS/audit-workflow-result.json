@@ -9,8 +9,8 @@
         {
           "title": "Chunk Scheduler & Atomic Work Distribution",
           "file_refs": [
-            "C:/Users/timto/llama.cpp/ggml/src/ggml-cpu/ggml-cpu.c:1350-1352",
-            "C:/Users/timto/llama.cpp/ggml/src/ggml-cpu/ggml-cpu.c:1415-1441"
+            "<home>/llama.cpp/ggml/src/ggml-cpu/ggml-cpu.c:1350-1352",
+            "<home>/llama.cpp/ggml/src/ggml-cpu/ggml-cpu.c:1415-1441"
           ],
           "what_it_does": "Work-stealing scheduler coordinates N threads across M×N output tiles. atomic_store_explicit(&params->threadpool->current_chunk, nth) initializes with thread count. Each thread fetches next chunk via atomic_fetch_add_explicit(&params->threadpool->current_chunk, 1). Chunks are 16×16-sized blocks.",
           "why_it_matters": "Single atomic per chunk eliminates false sharing and synchronization bottlenecks. Adapts to variable chunk costs (prefill vs decode). Critical for NUMA systems.",
@@ -19,8 +19,8 @@
         {
           "title": "Single-Pass Input Quantization into wdata",
           "file_refs": [
-            "C:/Users/timto/llama.cpp/ggml/src/ggml-cpu/ggml-cpu.c:1313-1348",
-            "C:/Users/timto/llama.cpp/ggml/src/ggml-quants.c:238-261"
+            "<home>/llama.cpp/ggml/src/ggml-cpu/ggml-cpu.c:1313-1348",
+            "<home>/llama.cpp/ggml/src/ggml-quants.c:238-261"
           ],
           "what_it_does": "F32 activations quantized once into params->wdata before chunk dispatch. Block-parallel quantize over K dimension by QK8_0=32-element blocks. Finds amax per block, scales to i8 by amax/127, stores FP16 delta + 32×int8 quants to contiguous buffer.",
           "why_it_matters": "Quantization amortized over all M×N outputs vs per-output. For 4K prefill, reduces activation traffic 4×. K-parallelism avoids false sharing.",
@@ -29,8 +29,8 @@
         {
           "title": "Register-Blocked GEMM with K-loop Streaming",
           "file_refs": [
-            "C:/Users/timto/llama.cpp/ggml/src/ggml-cpu/llamafile/sgemm.cpp:1353-1520",
-            "C:/Users/timto/llama.cpp/ggml/src/ggml-cpu/llamafile/sgemm.cpp:1635-1682"
+            "<home>/llama.cpp/ggml/src/ggml-cpu/llamafile/sgemm.cpp:1353-1520",
+            "<home>/llama.cpp/ggml/src/ggml-cpu/llamafile/sgemm.cpp:1635-1682"
           ],
           "what_it_does": "tinyBLAS_Q0_AVX partitions M×N into RM×RN register tiles via recursive mnpack(). gemm<RM,RN> allocates C[RN][RM] registers, loops K once per tile, computes all RN×RM outputs per K-block. gemm4xN specializes 4×N by packing 4 FP16 scales into 64-bit, converting via _mm_cvtph_ps.",
           "why_it_matters": "RM×RN accumulators in registers avoid memory traffic. K-loop once, not N times. Scale products amortized via FP16 4-pack. B-column stays cached in L1 for RM multiply-accumulates.",
@@ -39,7 +39,7 @@
         {
           "title": "AVX2 Int8 Dot-Product Kernel",
           "file_refs": [
-            "C:/Users/timto/llama.cpp/ggml/src/ggml-cpu/arch/x86/quants.c:1170-1204"
+            "<home>/llama.cpp/ggml/src/ggml-cpu/arch/x86/quants.c:1170-1204"
           ],
           "what_it_does": "Int8×int8 Q8_0 dot product via AVX2. Loops QK8_0 blocks (32-element groups). Per block: loads scales, multiplies to get scale d, loads 32×int8 quants, computes dot via mul_sum_i8_pairs_float converting pairs to int16, sums to 8 floats, multiplies by scale, FMAs into __m256 accumulator.",
           "why_it_matters": "8 parallel accumulators process 256 int8 muls per iteration. Saturating arithmetic avoids overflow. Register accumulation reduces L1 pressure. AVX-512/VNNI use wider vectors for 2× throughput.",
@@ -48,8 +48,8 @@
         {
           "title": "Weight-Reuse: Specialized Dispatch for Prefill vs Decode",
           "file_refs": [
-            "C:/Users/timto/llama.cpp/ggml/src/ggml-cpu/llamafile/sgemm.cpp:1376-1520",
-            "C:/Users/timto/llama.cpp/ggml/src/ggml-cpu/llamafile/sgemm.cpp:3928-3938"
+            "<home>/llama.cpp/ggml/src/ggml-cpu/llamafile/sgemm.cpp:1376-1520",
+            "<home>/llama.cpp/ggml/src/ggml-cpu/llamafile/sgemm.cpp:3928-3938"
           ],
           "what_it_does": "llamafile_sgemm dispatches Q8_0×Q8_0 via tinyBLAS_Q0_AVX. gemm1xN specializes 1×N prefill: full row in one pass, weights accessed sequentially. gemm4xN specializes 4×N, gemmMx4 specializes M×4 for decode. Within each tile, K streamed once; for each K-block, RN B-columns consumed by RM A-rows before next K-block.",
           "why_it_matters": "K-loop once avoids weight reload. Prefill 1×4K: weight 4K×4K loaded to L3 once, amortized over 4K outputs. Matmul-intensity 0.25 = memory-bound; single pass critical. Specialized shapes tune cache locality.",
@@ -58,8 +58,8 @@
         {
           "title": "Input Quantization Format: block_q8_0",
           "file_refs": [
-            "C:/Users/timto/llama.cpp/ggml/src/ggml-common.h:241-246",
-            "C:/Users/timto/llama.cpp/ggml/src/ggml-quants.c:238-261"
+            "<home>/llama.cpp/ggml/src/ggml-common.h:241-246",
+            "<home>/llama.cpp/ggml/src/ggml-quants.c:238-261"
           ],
           "what_it_does": "block_q8_0: [FP16 delta (2B) | int8 quants (32B)] = 34B per 32-element block. Forward quantize: d = amax / 127, id = 1/d, qs[j] = round(value × id). Inverse: value = qs[j] × d. Symmetric format, 6.25× compression. Cache-efficient: 8×Q8_0 blocks = 272B fit in 4 cache lines.",
           "why_it_matters": "Symmetric eliminates per-activation overhead vs Q8_1. FP16 delta small for broadcast. 32-element block matches AVX2 width (256 bits / 8 = 32), single SIMD load.",
@@ -72,27 +72,27 @@
       "hotspots": [
         {
           "name": "gated_ffn_activation_with_plan (single-token decode)",
-          "file_ref": "/c/Users/timto/Camelid/src/inference.rs:8264",
+          "file_ref": "<home>/Camelid/src/inference.rs:8264",
           "why_hot": "Called once per layer per decode token. Allocates gate/up buffers at lines 8311–8312 per token (heap churn). Quantizes input at line 8370. Quantized blocks consumed without reuse opportunity."
         },
         {
           "name": "try_x86_q8_ffn_decode_chain_path (fused gate/up/down)",
-          "file_ref": "/c/Users/timto/Camelid/src/inference.rs:10992",
+          "file_ref": "<home>/Camelid/src/inference.rs:10992",
           "why_hot": "Quantizes input at line 11063, calls gate_up projection (line 11071), then quantizes activated output AGAIN at line 11112. Second quantize_q8_0_row on activated data is mandatory but creates opportunity to verify no defensive re-quantization in projection functions."
         },
         {
           "name": "try_x86_q8_attention_qkv_decode_consumer_path",
-          "file_ref": "/c/Users/timto/Camelid/src/inference.rs:10654",
+          "file_ref": "<home>/Camelid/src/inference.rs:10654",
           "why_hot": "Quantizes input once at line 10673, passes to triplet projection. Already efficient pattern, validates correct reuse."
         },
         {
           "name": "output_projection_runtime_with_plan (logits)",
-          "file_ref": "/c/Users/timto/Camelid/src/inference.rs:7200",
+          "file_ref": "<home>/Camelid/src/inference.rs:7200",
           "why_hot": "Called once per decode token. Line 3818 contains resident_logits.clone() for fallback—allocates [1, vocab_size] tensor (~128k floats)."
         },
         {
           "name": "forward_single_token_timed_internal (decode main loop)",
-          "file_ref": "/c/Users/timto/Camelid/src/inference.rs:3671",
+          "file_ref": "<home>/Camelid/src/inference.rs:3671",
           "why_hot": "Entry point for single-token decode. Iterates 80 layers, calling forward_layer_timed once per layer. Each layer FFN path is quantization bottleneck."
         }
       ],
@@ -100,7 +100,7 @@
         {
           "title": "Pre-allocate and reuse gate/up output buffers to avoid per-token heap allocation",
           "file_refs": [
-            "/c/Users/timto/Camelid/src/inference.rs:8310-8312, src/inference.rs:8793-8794"
+            "<home>/Camelid/src/inference.rs:8310-8312, src/inference.rs:8793-8794"
           ],
           "change": "Move vec![0.0; gate_width] and vec![0.0; up_width] allocation from inside gated_ffn_activation_with_plan into the decode loop in forward_single_token_timed_internal (before line 3751). Pre-allocate two buffers once. Thread as &mut [f32] parameters through forward_layer_timed → gated_ffn_activation_with_plan → try_x86_q8_ffn_gate_up_decode_consumer_path. Inside gated_ffn_activation_with_plan, replace vec![0.0] with buffer.clear(); buffer.reserve(). Reuse across all 80 layers.",
           "expected_impact": "Eliminate 2 Vec allocations per token × 80 layers/token. Typical gate/up width ~4096 floats = 32 KB freed per token. Amortized cost: ~0.5–1% latency reduction.",
@@ -111,7 +111,7 @@
         {
           "title": "Avoid tensor clone in resident logits fallback path",
           "file_refs": [
-            "/c/Users/timto/Camelid/src/inference.rs:3818"
+            "<home>/Camelid/src/inference.rs:3818"
           ],
           "change": "Replace resident_logits.clone() at line 3818 with a reference-based approach. Store logits directly without clone; use conditional logic to skip CPU norm/projection when GPU path succeeded. Alternatively, use Cow<CpuTensor> or defer materialization to caller to avoid allocating [1, 128k] per token.",
           "expected_impact": "Eliminate [1, 128k] f32 tensor allocation (512 KB) per decode token when resident GPU path is taken. Saves ~0.2–0.5% decode latency.",
@@ -122,7 +122,7 @@
         {
           "title": "Verify no defensive re-quantization in Q/K/V triplet projection function",
           "file_refs": [
-            "/c/Users/timto/Camelid/src/inference.rs:12509-12650"
+            "<home>/Camelid/src/inference.rs:12509-12650"
           ],
           "change": "Inspect q8_0_packed_rows4_single_input_projection_triplet_from_quantized: confirm quantized_input parameter (line 12516) is used as-is in q8_0_packed_rows4_dot_i8_matmul calls (lines 12577, 12582, 12587) without re-quantizing. Ensure no Vec::with_capacity or unnecessary allocations of quantized blocks. Pattern is already correct; document as validated.",
           "expected_impact": "Validates correct caching; prevents future regressions if function is modified. No direct latency gain (path already optimal).",
@@ -133,7 +133,7 @@
         {
           "title": "Verify no defensive re-quantization in fused FFN decode chain down-projection",
           "file_refs": [
-            "/c/Users/timto/Camelid/src/inference.rs:11112, src/inference.rs:11131, src/inference.rs:11204"
+            "<home>/Camelid/src/inference.rs:11112, src/inference.rs:11131, src/inference.rs:11204"
           ],
           "change": "Inspect q8_0_packed_rows4_single_input_projection_with_decode_chunking calls (lines 11131, 11146, 11161, 11195, 11204): confirm quantized_activated parameter is used as-is without internal re-quantization or defensive block copying. Line 11112's quantize_q8_0_row is mandatory (different data from input); ensure downstream does not re-quantize it.",
           "expected_impact": "Validates FFN decode chain correctness; prevents redundant quantization in projection functions. No direct latency gain (second quantization at line 11112 is required).",
@@ -144,7 +144,7 @@
         {
           "title": "Cache quantized FFN norm across gate/up/down decode chain (safety validation only—no change needed)",
           "file_refs": [
-            "/c/Users/timto/Camelid/src/inference.rs:8370, src/inference.rs:11063"
+            "<home>/Camelid/src/inference.rs:8370, src/inference.rs:11063"
           ],
           "change": "Code already caches quantized_input correctly: line 8370 in gated_ffn_activation quantizes once, line 11063 in ffn_decode_chain quantizes input once, line 11112 quantizes activated once (different data). No optimization needed; pattern is correct. Document as validated.",
           "expected_impact": "No change. Confirms quantization is already cached per distinct hidden state. Prevents future incorrect re-quantization.",

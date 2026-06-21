@@ -1,6 +1,6 @@
 {
   "generated_utc": "2026-06-21T16:13:16.106Z",
-  "model": "C:/Users/timto/models/Llama-3.2-3B-Instruct-Q8_0.gguf",
+  "model": "<home>/models/Llama-3.2-3B-Instruct-Q8_0.gguf",
   "model_id": "llama32-3b-q8-cpu",
   "facts": 16,
   "decode_tokens": 64,

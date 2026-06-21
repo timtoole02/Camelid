@@ -1,6 +1,6 @@
 {
   "generated_utc": "2026-06-21T16:26:09.601Z",
-  "model": "C:/Users/timto/models/Llama-3.2-3B-Instruct-Q8_0.gguf",
+  "model": "<home>/models/Llama-3.2-3B-Instruct-Q8_0.gguf",
   "facts": 16,
   "runs": {
     "A_default": {
