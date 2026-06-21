@@ -15491,7 +15491,7 @@ fn matmul_rhs_transposed_q8_0_block_reader_with_flags(
                         let completed_with_metal = metal_seam::try_encoded_row(
                             q8_flags,
                             use_q8_0_block_dot,
-                            &quantized_input_blocks[..blocks_per_row],
+                            quantized_input_blocks,
                             chunk,
                             scales,
                             rows_this_chunk,
