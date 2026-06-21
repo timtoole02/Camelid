@@ -62,7 +62,10 @@ pub(super) fn try_encoded_row(
     output: &mut [f32],
 ) -> bool {
     if use_q8_0_block_dot && q8_flags.metal {
-        let (input_scales, input_quants) = q8_0_block_scales_and_quants(quantized_input_blocks);
+        // Slice INSIDE the gate: when block-dot is off, quantized_input_blocks is
+        // empty, so this slice would panic if hoisted to the (unconditional) call site.
+        let (input_scales, input_quants) =
+            q8_0_block_scales_and_quants(&quantized_input_blocks[..blocks_per_row]);
         crate::metal::try_q8_0_encoded_linear_row(
             &input_scales,
             &input_quants,
