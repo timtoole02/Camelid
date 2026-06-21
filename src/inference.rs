@@ -19,13 +19,13 @@ use crate::execution_plan::MAC_Q8_PREFILL_I8MM_MIN_ROWS;
 use crate::metal;
 use crate::telemetry;
 
+#[cfg(target_arch = "aarch64")]
+mod cpu_neon;
 mod diagnostic_config;
 pub(crate) mod gemma4;
 mod kv_cache;
-mod q8_block_reader;
 mod metal_seam;
-#[cfg(target_arch = "aarch64")]
-mod cpu_neon;
+mod q8_block_reader;
 mod q8_runtime;
 mod q8_telemetry;
 mod rope;
@@ -15257,7 +15257,9 @@ fn q8_0_two_dot_rows(
         if cpu_neon::aarch64_dotprod_enabled() {
             // SAFETY: runtime feature detection confirms dot-product support; the slice
             // iterator only passes complete Q8_0 blocks.
-            return unsafe { cpu_neon::q8_0_two_dot_rows_dotprod(first_weight, second_weight, input) };
+            return unsafe {
+                cpu_neon::q8_0_two_dot_rows_dotprod(first_weight, second_weight, input)
+            };
         }
     }
 
@@ -15760,7 +15762,9 @@ fn dot_q8_0_encoded_row_with_scales(input: &[Q8_0Block], row_bytes: &[u8], scale
         if cpu_neon::aarch64_dotprod_enabled() {
             // SAFETY: runtime feature detection confirms dot-product support; row_bytes is
             // traversed as exact Q8_0 encoded blocks.
-            return unsafe { cpu_neon::dot_q8_0_encoded_row_with_scales_dotprod(input, row_bytes, scales) };
+            return unsafe {
+                cpu_neon::dot_q8_0_encoded_row_with_scales_dotprod(input, row_bytes, scales)
+            };
         }
     }
 

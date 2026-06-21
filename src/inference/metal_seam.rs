@@ -12,9 +12,9 @@
 
 // The macOS bodies reference inference.rs helpers via the glob; the non-macOS
 // stubs need only the explicit type imports below for their signatures.
+use super::q8_runtime::Q8RuntimeFlags;
 #[cfg(target_os = "macos")]
 use super::*;
-use super::q8_runtime::Q8RuntimeFlags;
 use crate::tensor::Q8_0Block;
 
 // ---- Inference session lifecycle (no-ops off macOS) ----
