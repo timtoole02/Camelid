@@ -5,8 +5,8 @@
 //! macOS these are unused (dead_code allowed). Bodies are byte-for-byte the
 //! originals — reduction order and accumulation are unchanged.
 
-use super::*;
 use super::q8_runtime::q8_0_env_flag_disabled;
+use super::*;
 use crate::tensor::Q8_0Block;
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code, unused_variables))]
@@ -55,7 +55,10 @@ pub(super) unsafe fn q8_0_dot_rows_neon_dotprod(weight: &[Q8_0Block], input: &[Q
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code, unused_variables))]
 #[target_feature(enable = "dotprod")]
-pub(super) unsafe fn q8_0_wire_row_dot_neon_dotprod(weight_wire: &[u8], input: &[Q8_0Block]) -> f32 {
+pub(super) unsafe fn q8_0_wire_row_dot_neon_dotprod(
+    weight_wire: &[u8],
+    input: &[Q8_0Block],
+) -> f32 {
     use std::arch::aarch64::{vdupq_n_s32, vld1q_s8};
     use std::arch::asm;
     const WIRE: usize = 34;
@@ -104,7 +107,10 @@ pub(super) unsafe fn q8_0_wire_row_dot_neon_dotprod(weight_wire: &[u8], input: &
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code, unused_variables))]
 #[target_feature(enable = "dotprod")]
-pub(super) unsafe fn q4_0_wire_row_dot_neon_dotprod(weight_wire: &[u8], input: &[Q8_0Block]) -> f32 {
+pub(super) unsafe fn q4_0_wire_row_dot_neon_dotprod(
+    weight_wire: &[u8],
+    input: &[Q8_0Block],
+) -> f32 {
     use std::arch::aarch64::{
         vandq_u8, vdupq_n_s32, vdupq_n_s8, vdupq_n_u8, vld1q_s8, vld1q_u8, vreinterpretq_s8_u8,
         vshrq_n_u8, vsubq_s8,
