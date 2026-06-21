@@ -1,0 +1,24 @@
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 6143 MiB):
+  Device 0: NVIDIA GeForce RTX 3060 Laptop GPU, compute capability 8.6, VMM: yes, VRAM: 6143 MiB
+| model                          |       size |     params | backend    | ngl |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | --------------: | -------------------: |
+| llama 3B Q8_0                  |   3.18 GiB |     3.21 B | CUDA       |  99 |           pp512 |      3603.56 ± 25.78 |
+| llama 3B Q8_0                  |   3.18 GiB |     3.21 B | CUDA       |  99 |           tg128 |         69.29 ± 0.07 |
+
+build: acd79d6 (1)
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 6143 MiB):
+  Device 0: NVIDIA GeForce RTX 3060 Laptop GPU, compute capability 8.6, VMM: yes, VRAM: 6143 MiB
+| model                          |       size |     params | backend    | ngl |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | --------------: | -------------------: |
+| qwen3 4B Q8_0                  |   3.98 GiB |     4.02 B | CUDA       |  99 |           pp512 |      2652.67 ± 10.62 |
+| qwen3 4B Q8_0                  |   3.98 GiB |     4.02 B | CUDA       |  99 |           tg128 |         54.41 ± 0.22 |
+
+build: acd79d6 (1)
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 6143 MiB):
+  Device 0: NVIDIA GeForce RTX 3060 Laptop GPU, compute capability 8.6, VMM: yes, VRAM: 6143 MiB
+| model                          |       size |     params | backend    | ngl |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | --------------: | -------------------: |
+| qwen3 0.6B Q8_0                | 604.15 MiB |   596.05 M | CUDA       |  99 |           pp512 |    11476.05 ± 783.26 |
+| qwen3 0.6B Q8_0                | 604.15 MiB |   596.05 M | CUDA       |  99 |           tg128 |        243.76 ± 2.81 |
+
+build: acd79d6 (1)

@@ -1,0 +1,250 @@
+{
+  "summary": "Verify llama.cpp CPU/GPU kernel archaeology and adversarially audit Camelid CPU hot path for parity-safe wins",
+  "agentCount": 8,
+  "logs": [],
+  "result": {
+    "llama_cpu_kernels": {
+      "summary": "llama.cpp's CPU Q8_0 matmul achieves speed through atomic work-stealing, amortized input quantization, and tiled register-blocked GEMM with K-loop streaming and FP16 scale packing.",
+      "findings": [
+        {
+          "title": "Chunk Scheduler & Atomic Work Distribution",
+          "file_refs": [
+            "<home>/llama.cpp/ggml/src/ggml-cpu/ggml-cpu.c:1350-1352",
+            "<home>/llama.cpp/ggml/src/ggml-cpu/ggml-cpu.c:1415-1441"
+          ],
+          "what_it_does": "Work-stealing scheduler coordinates N threads across M×N output tiles. atomic_store_explicit(&params->threadpool->current_chunk, nth) initializes with thread count. Each thread fetches next chunk via atomic_fetch_add_explicit(&params->threadpool->current_chunk, 1). Chunks are 16×16-sized blocks.",
+          "why_it_matters": "Single atomic per chunk eliminates false sharing and synchronization bottlenecks. Adapts to variable chunk costs (prefill vs decode). Critical for NUMA systems.",
+          "camelid_status": "missing"
+        },
+        {
+          "title": "Single-Pass Input Quantization into wdata",
+          "file_refs": [
+            "<home>/llama.cpp/ggml/src/ggml-cpu/ggml-cpu.c:1313-1348",
+            "<home>/llama.cpp/ggml/src/ggml-quants.c:238-261"
+          ],
+          "what_it_does": "F32 activations quantized once into params->wdata before chunk dispatch. Block-parallel quantize over K dimension by QK8_0=32-element blocks. Finds amax per block, scales to i8 by amax/127, stores FP16 delta + 32×int8 quants to contiguous buffer.",
+          "why_it_matters": "Quantization amortized over all M×N outputs vs per-output. For 4K prefill, reduces activation traffic 4×. K-parallelism avoids false sharing.",
+          "camelid_status": "partial"
+        },
+        {
+          "title": "Register-Blocked GEMM with K-loop Streaming",
+          "file_refs": [
+            "<home>/llama.cpp/ggml/src/ggml-cpu/llamafile/sgemm.cpp:1353-1520",
+            "<home>/llama.cpp/ggml/src/ggml-cpu/llamafile/sgemm.cpp:1635-1682"
+          ],
+          "what_it_does": "tinyBLAS_Q0_AVX partitions M×N into RM×RN register tiles via recursive mnpack(). gemm<RM,RN> allocates C[RN][RM] registers, loops K once per tile, computes all RN×RM outputs per K-block. gemm4xN specializes 4×N by packing 4 FP16 scales into 64-bit, converting via _mm_cvtph_ps.",
+          "why_it_matters": "RM×RN accumulators in registers avoid memory traffic. K-loop once, not N times. Scale products amortized via FP16 4-pack. B-column stays cached in L1 for RM multiply-accumulates.",
+          "camelid_status": "has-equivalent"
+        },
+        {
+          "title": "AVX2 Int8 Dot-Product Kernel",
+          "file_refs": [
+            "<home>/llama.cpp/ggml/src/ggml-cpu/arch/x86/quants.c:1170-1204"
+          ],
+          "what_it_does": "Int8×int8 Q8_0 dot product via AVX2. Loops QK8_0 blocks (32-element groups). Per block: loads scales, multiplies to get scale d, loads 32×int8 quants, computes dot via mul_sum_i8_pairs_float converting pairs to int16, sums to 8 floats, multiplies by scale, FMAs into __m256 accumulator.",
+          "why_it_matters": "8 parallel accumulators process 256 int8 muls per iteration. Saturating arithmetic avoids overflow. Register accumulation reduces L1 pressure. AVX-512/VNNI use wider vectors for 2× throughput.",
+          "camelid_status": "has-equivalent"
+        },
+        {
+          "title": "Weight-Reuse: Specialized Dispatch for Prefill vs Decode",
+          "file_refs": [
+            "<home>/llama.cpp/ggml/src/ggml-cpu/llamafile/sgemm.cpp:1376-1520",
+            "<home>/llama.cpp/ggml/src/ggml-cpu/llamafile/sgemm.cpp:3928-3938"
+          ],
+          "what_it_does": "llamafile_sgemm dispatches Q8_0×Q8_0 via tinyBLAS_Q0_AVX. gemm1xN specializes 1×N prefill: full row in one pass, weights accessed sequentially. gemm4xN specializes 4×N, gemmMx4 specializes M×4 for decode. Within each tile, K streamed once; for each K-block, RN B-columns consumed by RM A-rows before next K-block.",
+          "why_it_matters": "K-loop once avoids weight reload. Prefill 1×4K: weight 4K×4K loaded to L3 once, amortized over 4K outputs. Matmul-intensity 0.25 = memory-bound; single pass critical. Specialized shapes tune cache locality.",
+          "camelid_status": "has-equivalent"
+        },
+        {
+          "title": "Input Quantization Format: block_q8_0",
+          "file_refs": [
+            "<home>/llama.cpp/ggml/src/ggml-common.h:241-246",
+            "<home>/llama.cpp/ggml/src/ggml-quants.c:238-261"
+          ],
+          "what_it_does": "block_q8_0: [FP16 delta (2B) | int8 quants (32B)] = 34B per 32-element block. Forward quantize: d = amax / 127, id = 1/d, qs[j] = round(value × id). Inverse: value = qs[j] × d. Symmetric format, 6.25× compression. Cache-efficient: 8×Q8_0 blocks = 272B fit in 4 cache lines.",
+          "why_it_matters": "Symmetric eliminates per-activation overhead vs Q8_1. FP16 delta small for broadcast. 32-element block matches AVX2 width (256 bits / 8 = 32), single SIMD load.",
+          "camelid_status": "has-equivalent"
+        }
+      ]
+    },
+    "camelid_hotpath": {
+      "summary": "Camelid CPU decode/prefill is constrained by redundant quantization, preventable heap allocations, and tensor clones in the inner loop. The hot path forward_single_token_timed_internal calls forward_layer_timed once per layer, which invokes gated_ffn_activation_with_plan and projection routines that each independently quantize the same hidden-state row. The Q/K/V decode path is efficient (one quantization for three projections). But the FFN path quantizes the norm once for gate/up, then when the fused decode-chain path is taken, the activation is quantized AGAIN. Further, per-token heap allocations for gate/up buffers occur inside the decode loop. All five identified fixes are bit-identical (quantization order and arithmetic unchanged), safe (no FP re-association), and together address 0.5–2% of decode latency.",
+      "hotspots": [
+        {
+          "name": "gated_ffn_activation_with_plan (single-token decode)",
+          "file_ref": "<home>/Camelid/src/inference.rs:8264",
+          "why_hot": "Called once per layer per decode token. Allocates gate/up buffers at lines 8311–8312 per token (heap churn). Quantizes input at line 8370. Quantized blocks consumed without reuse opportunity."
+        },
+        {
+          "name": "try_x86_q8_ffn_decode_chain_path (fused gate/up/down)",
+          "file_ref": "<home>/Camelid/src/inference.rs:10992",
+          "why_hot": "Quantizes input at line 11063, calls gate_up projection (line 11071), then quantizes activated output AGAIN at line 11112. Second quantize_q8_0_row on activated data is mandatory but creates opportunity to verify no defensive re-quantization in projection functions."
+        },
+        {
+          "name": "try_x86_q8_attention_qkv_decode_consumer_path",
+          "file_ref": "<home>/Camelid/src/inference.rs:10654",
+          "why_hot": "Quantizes input once at line 10673, passes to triplet projection. Already efficient pattern, validates correct reuse."
+        },
+        {
+          "name": "output_projection_runtime_with_plan (logits)",
+          "file_ref": "<home>/Camelid/src/inference.rs:7200",
+          "why_hot": "Called once per decode token. Line 3818 contains resident_logits.clone() for fallback—allocates [1, vocab_size] tensor (~128k floats)."
+        },
+        {
+          "name": "forward_single_token_timed_internal (decode main loop)",
+          "file_ref": "<home>/Camelid/src/inference.rs:3671",
+          "why_hot": "Entry point for single-token decode. Iterates 80 layers, calling forward_layer_timed once per layer. Each layer FFN path is quantization bottleneck."
+        }
+      ],
+      "candidate_fixes": [
+        {
+          "title": "Pre-allocate and reuse gate/up output buffers to avoid per-token heap allocation",
+          "file_refs": [
+            "<home>/Camelid/src/inference.rs:8310-8312, src/inference.rs:8793-8794"
+          ],
+          "change": "Move vec![0.0; gate_width] and vec![0.0; up_width] allocation from inside gated_ffn_activation_with_plan into the decode loop in forward_single_token_timed_internal (before line 3751). Pre-allocate two buffers once. Thread as &mut [f32] parameters through forward_layer_timed → gated_ffn_activation_with_plan → try_x86_q8_ffn_gate_up_decode_consumer_path. Inside gated_ffn_activation_with_plan, replace vec![0.0] with buffer.clear(); buffer.reserve(). Reuse across all 80 layers.",
+          "expected_impact": "Eliminate 2 Vec allocations per token × 80 layers/token. Typical gate/up width ~4096 floats = 32 KB freed per token. Amortized cost: ~0.5–1% latency reduction.",
+          "parity_risk": "low",
+          "difficulty": "medium",
+          "rust_only": true
+        },
+        {
+          "title": "Avoid tensor clone in resident logits fallback path",
+          "file_refs": [
+            "<home>/Camelid/src/inference.rs:3818"
+          ],
+          "change": "Replace resident_logits.clone() at line 3818 with a reference-based approach. Store logits directly without clone; use conditional logic to skip CPU norm/projection when GPU path succeeded. Alternatively, use Cow<CpuTensor> or defer materialization to caller to avoid allocating [1, 128k] per token.",
+          "expected_impact": "Eliminate [1, 128k] f32 tensor allocation (512 KB) per decode token when resident GPU path is taken. Saves ~0.2–0.5% decode latency.",
+          "parity_risk": "low",
+          "difficulty": "small",
+          "rust_only": true
+        },
+        {
+          "title": "Verify no defensive re-quantization in Q/K/V triplet projection function",
+          "file_refs": [
+            "<home>/Camelid/src/inference.rs:12509-12650"
+          ],
+          "change": "Inspect q8_0_packed_rows4_single_input_projection_triplet_from_quantized: confirm quantized_input parameter (line 12516) is used as-is in q8_0_packed_rows4_dot_i8_matmul calls (lines 12577, 12582, 12587) without re-quantizing. Ensure no Vec::with_capacity or unnecessary allocations of quantized blocks. Pattern is already correct; document as validated.",
+          "expected_impact": "Validates correct caching; prevents future regressions if function is modified. No direct latency gain (path already optimal).",
+          "parity_risk": "none",
+          "difficulty": "trivial",
+          "rust_only": true
+        },
+        {
+          "title": "Verify no defensive re-quantization in fused FFN decode chain down-projection",
+          "file_refs": [
+            "<home>/Camelid/src/inference.rs:11112, src/inference.rs:11131, src/inference.rs:11204"
+          ],
+          "change": "Inspect q8_0_packed_rows4_single_input_projection_with_decode_chunking calls (lines 11131, 11146, 11161, 11195, 11204): confirm quantized_activated parameter is used as-is without internal re-quantization or defensive block copying. Line 11112's quantize_q8_0_row is mandatory (different data from input); ensure downstream does not re-quantize it.",
+          "expected_impact": "Validates FFN decode chain correctness; prevents redundant quantization in projection functions. No direct latency gain (second quantization at line 11112 is required).",
+          "parity_risk": "none",
+          "difficulty": "trivial",
+          "rust_only": true
+        },
+        {
+          "title": "Cache quantized FFN norm across gate/up/down decode chain (safety validation only—no change needed)",
+          "file_refs": [
+            "<home>/Camelid/src/inference.rs:8370, src/inference.rs:11063"
+          ],
+          "change": "Code already caches quantized_input correctly: line 8370 in gated_ffn_activation quantizes once, line 11063 in ffn_decode_chain quantizes input once, line 11112 quantizes activated once (different data). No optimization needed; pattern is correct. Document as validated.",
+          "expected_impact": "No change. Confirms quantization is already cached per distinct hidden state. Prevents future incorrect re-quantization.",
+          "parity_risk": "none",
+          "difficulty": "trivial",
+          "rust_only": true
+        }
+      ]
+    },
+    "camelid_gpu_paritylock": {
+      "summary": "Camelid GPU decode parity-lock claim CONFIRMED. Split-K flash-decode achieves token-identical greedy decode by keeping attention dot and global max bit-identical while fixing occupancy. Uncoalesced K/V bandwidth is parity-locked (Stage 3 coalescing flipped token 26). q8_gemv saturated at 76% DRAM. Batched prefill (3.16x speedup) shipped default-on. One deferred low-risk win: multi-stream QKV/GU overlap (10-15% potential).",
+      "findings": [
+        {
+          "title": "Split-K attention parity-locked decode gap",
+          "file_refs": [
+            "src/cuda_resident.rs:1466-1554",
+            "qa/perf/decode-attention-campaign.md:63-89"
+          ],
+          "what_it_does": "n_heads x n_splits grid fills SM occupancy at depth, keeps dot and max bit-identical",
+          "why_it_matters": "0.51x vs llama.cpp at ctx1881 due to uncoalesced K/V bandwidth; coalescing re-associates dot near-ties",
+          "camelid_status": "has-equivalent"
+        },
+        {
+          "title": "q8_gemv at 76% DRAM saturation",
+          "file_refs": [
+            "src/cuda_resident.rs:213-309",
+            "qa/perf/decode-attention-campaign.md:20-24"
+          ],
+          "what_it_does": "__dp4a with U=4 unrolled loads, repacked SoA layout, shared input staging",
+          "why_it_matters": "Memory-latency-bound at batch-1; block-size sweep flat; needs structural work",
+          "camelid_status": "has-equivalent"
+        },
+        {
+          "title": "Batched GPU prefill 3.16x speedup shipped default-on",
+          "file_refs": [
+            "src/cuda_resident.rs:3555-3620",
+            "src/inference.rs:2202-2220"
+          ],
+          "what_it_does": "MAX_VERIFY_K=4 chunks, GEMM not serial GEMV, skips output projection",
+          "why_it_matters": "0.6B 125.9→397.5 tok/s (3.16x); default; env var overridable",
+          "camelid_status": "has-equivalent"
+        },
+        {
+          "title": "attention_batched sequential weighted-V vs decode parallel",
+          "file_refs": [
+            "src/cuda_resident.rs:692-744",
+            "qa/perf/decode-attention-campaign.md:115-116"
+          ],
+          "what_it_does": "Spec-verify uses sequential loop, greedy uses parallel split",
+          "why_it_matters": "Affects spec-decode acceptance logic, not greedy measured path",
+          "camelid_status": "partial"
+        },
+        {
+          "title": "Multi-stream QKV/GU overlap deferred low-risk win",
+          "file_refs": [
+            "qa/perf/qwen3-cuda-resident-phase3-findings.md:131-139"
+          ],
+          "what_it_does": "Overlap independent projections on separate streams to hide DRAM latency",
+          "why_it_matters": "Potential 10-15% decode lift; parity-safe; deferred post-Phase 3",
+          "camelid_status": "missing"
+        }
+      ]
+    },
+    "verified_candidates": [
+      {
+        "title": "Pre-allocate gate/up FFN buffers - PARITY UNSAFE, Ineffective Implementation",
+        "is_real_parity_safe_win": false,
+        "confidence": "high",
+        "reasoning": "CRITICAL FLAWS FOUND:\n\n1. **Vector Ownership/Lifetime Problem (IMPLEMENTATION BLOCKER)**: \n   - Line 8461 in gated_ffn_activation_with_plan: `let tensor = CpuTensor::from_f32(name, vec![1, gate_width], gate)?;`\n   - The `gate` vector is MOVED into the tensor, transferring ownership. You cannot reuse a moved buffer across loop iterations.\n   - The proposal claims \"buffer.clear(); buffer.reserve()\" but this requires the buffer to remain owned by the function across iterations. Once moved into CpuTensor, you cannot reacquire it.\n   - This would require significant refactoring of CpuTensor API or extracting data back (which defeats the purpose).\n\n2. **Width Computation Dependency**:\n   - gate_width and up_width are computed per-call from gate_weight and up_weight (lines 8281-8282), which are layer-specific tensors.\n   - While Llama models typically have constant hidden_size across layers, the widths are NOT known at the start of forward_single_token_timed_internal.\n   - Pre-allocating with a hardcoded size before line 3751 would require assuming a fixed width, making the code model-specific and brittle.\n\n3. **Diagnostic Path Complexity**:\n   - Lines 8428 and 8431: When collect_diagnostics=true, gate and up are CLONED for diagnostic tensors.\n   - This creates separate allocations that the buffer-reuse scheme cannot eliminate.\n   - The proposal doesn't account for this code path at all.\n\n4. **NOT in the Primary Hot Path**:\n   - Lines 5692-5706: The fused path try_x86_q8_ffn_decode_chain_path (when enabled) short-circuits gated_ffn_activation_with_plan entirely.\n   - Lines 8289-8307: Two additional fastpaths (single_owner, fused_activation) return before reaching the allocation lines.\n   - On models with optimized q8 paths enabled, this allocation may NOT be hit at all.\n   - When it IS hit, the matvul operations (accumulate_linear_row, accumulate_two_q8_0_block_dot_quantized_cpu) dominate timing, not the 32KB allocation.\n\n5. **No FP Accumulation Order Change**:\n   - The buffer is zero-initialized and filled via in-place operations (accumulate_*).\n   - The activation loop (lines 8447-8452) reads both gate and up with identical iteration order.\n   - Reusing the same buffer would not change FP order—good for parity but doesn't validate the optimization.\n\n6. **Claimed Impact Vs Reality**:\n   - Proposal: \"0.5–1% latency reduction\"\n   - Reality: Allocating a 32KB vector and zeroing it is <1 microsecond on modern hardware. A matvul on 4096 floats is hundreds of microseconds.\n   - The allocation is negligible noise compared to the actual computation. This is a classic micro-optimization pursuing sub-percent gains with implementation risk.\n\nVERDICT: The proposal is UNSAFE to implement as stated because the `gate` vector cannot be reused across loop iterations (ownership violation). Even if that were solved via API changes, the optimization targets a negligible bottleneck and would break diagnostic paths and model-specific width assumptions.",
+        "recommendation": "reject"
+      },
+      {
+        "title": "GPU Residents Logits Clone Optimization - Parity Risk",
+        "is_real_parity_safe_win": false,
+        "confidence": "high",
+        "reasoning": "The proposal to eliminate the clone at line 3818 is not parity-safe. While the clone appears redundant (both `norm` and `logits` reference the same GPU-computed logits tensor), removing it exposes a latent bug: when the GPU residents path is taken, `output_norm_state` would contain logits ([1, vocab]) instead of an actual norm tensor ([1, hidden]). Downstream API-level diagnostic code (when `collect_dense_diagnostics=true`) passes this to `output_projection_diagnostics`, which reads it as if it were the RMS-normalized hidden state, producing incorrect diagnostics and potential out-of-bounds reads. The GPU residents path is disabled when `collect_diagnostics=true` (line 3727), so it's only reachable when inference-level diagnostics are disabled. However, API-level dense diagnostics are an independent flag that can be true regardless. The correct fix is to return a proper dummy tensor (e.g., empty [1,0] tensor) instead of cloning logits, not to remove the assignment entirely.",
+        "recommendation": "reject"
+      },
+      {
+        "title": "Q8_0 QKV Triplet: Validation of Pre-Quantized Input Usage (Not an Optimization)",
+        "is_real_parity_safe_win": false,
+        "confidence": "high",
+        "reasoning": "This proposal is inspection/documentation work claiming to \"validate\" that a function already operates optimally, not a new optimization. Analysis confirms: (1) The quantized_input parameter (&[Q8_0Block]) is indeed used directly without re-quantization—no Vec allocations or quantize() calls exist in the triplet function (lines 12509-12687). (2) However, the claimed \"win\" is illusory: the proposal explicitly states \"No direct latency gain (path already optimal),\" meaning no new optimization is being introduced. (3) The real parity concern is unaddressed: the function has multiple code paths (parallel at lines 12560-12618 vs. serial at lines 12619-12642) that compute the same three dot products. These paths use different parallelization strategies but process identical quantized blocks and accumulate into separate output vectors via copy_from_slice(). (4) Floating-point accumulation sensitivity: the dot function (lines 18416-18429) accumulates with sequential += operations; reordering Q/K/V computation or parallelizing differently could theoretically affect FP precision, but this is not validated. (5) This is retrospective validation of existing correctness, not a performance or correctness win—the proposal offers zero latency benefit and no new safeguard beyond what already exists (the parameters are compile-time typed as pre-quantized slices).",
+        "recommendation": "reject"
+      },
+      {
+        "title": "FFN Decode Chain Quantization Verification - Correct But No Win",
+        "is_real_parity_safe_win": false,
+        "confidence": "high",
+        "reasoning": "The proposal asks to verify no defensive re-quantization in the FFN decode chain down-projection. After thorough code analysis:\n\n1. VERIFIED CORRECT: Line 11112's `quantize_q8_0_row(&activated.data[..down_route.input_width])` is the sole quantization of the activated output, mandatory because it quantizes different data (the gate+up projection output) than the input quantization at line 11063.\n\n2. NO RE-QUANTIZATION: All downstream calls (lines 11131, 11146, 11161, 11171, 11195, 11204) pass `&quantized_activated.blocks` by reference without any re-quantization or copying.\n\n3. CALL SITES VERIFIED:\n   - q8_0_packed_rows4_single_input_projection_with_decode_chunking (4 calls): Uses quantized_input directly, no copies/re-quant\n   - q8_0_vnni_decode_1x64_projection (1 call): Uses quantized_input directly, no copies/re-quant\n\n4. NO LATENCY OPPORTUNITY: The quantization at line 11112 cannot be eliminated (down projection requires quantized blocks). Caching is impossible (activated is computed fresh each call). No defensive copies detected.\n\n5. NOT A WIN: Code is already optimal in this aspect. This is a verification confirming existing correctness, not an optimization. Proposal itself states \"NO DIRECT LATENCY GAIN.\"\n\n6. HOT PATH CONFIRMED: This is in the main FFN decode loop, runs per-layer during decoding.\n\nCONCLUSION: The code is correct as-is. The proposal is verification-only, confirming the code doesn't have a latent redundant-quantization bug. No changes needed, no parity risk, but also no improvement possible here.",
+        "recommendation": "reject"
+      },
+      {
+        "title": "FFN Quantization Caching: Already Optimal, But Not Negligible",
+        "is_real_parity_safe_win": false,
+        "confidence": "high",
+        "reasoning": "The proposal claims the code already caches quantized_input correctly with no changes needed. Analysis confirms: (1) Line 8370 quantizes input once, feeds both gate/up via variable scope - correct; (2) Line 11063 quantizes fresh FFN norm for fused gate_up - correct; (3) Line 11112 quantizes different data (activated output) for down - correct. NO redundant quantization detected in current hot path. HOWEVER: (1) Quantization cost is ~20-30% of FFN time (128 blocks × 20-30 SIMD instructions vs dot products with 100+ instructions per block), NOT negligible as proposal implies; (2) Quantization involves f16 rounding (lines 14545-14546: scale_bits → scale conversion), making it precision-sensitive; (3) No further optimization possible without risking parity: quantization output is lossy and input-dependent, cannot be cached across different activations; (4) Implicit caching through variable scope is correct but fragile - any refactoring that changes when quantized_input goes out of scope could break it. The proposal's claim of \"no parity risk\" is slightly optimistic: f16 rounding behavior in quantization could theoretically affect downstream accumulation if quantization timing changes.",
+        "recommendation": "reject"
+      }
+    ],
+    "confirmed_wins": []
+  }
+}

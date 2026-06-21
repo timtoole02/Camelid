@@ -1,0 +1,3 @@
+f34112a11b7dad74ab517dedf6dcf00d624c9adac2dc0c72c719ca0478554ef2 *<home>/models/Llama-3.2-3B-Instruct-Q8_0.gguf
+8c2f07f26af9747e41988551106f149b03eb9b5cb6df636027b6bf6278473300 *<home>/models/Qwen3-4B-Q8_0.gguf
+9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031 *<home>/camelid-dltest/models/Qwen3-0.6B-Q8_0.gguf

@@ -1,0 +1,18 @@
+{
+  "generated_utc": "2026-06-21T18:37:37.787Z",
+  "model": "<home>/models/Llama-3.2-3B-Instruct-Q8_0.gguf",
+  "runs": {
+    "threads_default": {
+      "decode_tok_s": 4.96,
+      "decode_completion_tokens": 48,
+      "decode_text": "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, ",
+      "prefill_tok_s": 19.81,
+      "prefill_prompt_tokens": 365,
+      "rayon_threads": "default"
+    }
+  },
+  "parity": {
+    "threads_default": true
+  },
+  "all_parity_identical": true
+}

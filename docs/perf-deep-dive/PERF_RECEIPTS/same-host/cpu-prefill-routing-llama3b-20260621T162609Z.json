@@ -1,0 +1,106 @@
+{
+  "generated_utc": "2026-06-21T16:26:09.601Z",
+  "model": "<home>/models/Llama-3.2-3B-Instruct-Q8_0.gguf",
+  "facts": 16,
+  "runs": {
+    "A_default": {
+      "prompt_tokens": 365,
+      "prefill_ms_runs": [
+        19812.97,
+        20894.55
+      ],
+      "prefill_ms_best": 19812.97,
+      "prefill_tok_s": 18.42,
+      "parity_text": "1, 2, 3, 4, 5, 6, 7, 8, ",
+      "config_env": {
+        "CAMELID_CUDA_RESIDENT_DECODE": "0",
+        "CAMELID_CUDA_RESIDENT_PREFILL": "0"
+      }
+    },
+    "layer_major_on": {
+      "prompt_tokens": 365,
+      "prefill_ms_runs": [
+        20006.89,
+        19321.03
+      ],
+      "prefill_ms_best": 19321.03,
+      "prefill_tok_s": 18.89,
+      "parity_text": "1, 2, 3, 4, 5, 6, 7, 8, ",
+      "config_env": {
+        "CAMELID_CUDA_RESIDENT_DECODE": "0",
+        "CAMELID_CUDA_RESIDENT_PREFILL": "0",
+        "CAMELID_PREFILL_LAYER_MAJOR": "1"
+      }
+    },
+    "layer_major_off": {
+      "prompt_tokens": 365,
+      "prefill_ms_runs": [
+        19445.8,
+        19371.25
+      ],
+      "prefill_ms_best": 19371.25,
+      "prefill_tok_s": 18.84,
+      "parity_text": "1, 2, 3, 4, 5, 6, 7, 8, ",
+      "config_env": {
+        "CAMELID_CUDA_RESIDENT_DECODE": "0",
+        "CAMELID_CUDA_RESIDENT_PREFILL": "0",
+        "CAMELID_PREFILL_LAYER_MAJOR": "0"
+      }
+    },
+    "chunk_all": {
+      "prompt_tokens": 365,
+      "prefill_ms_runs": [
+        19801.15,
+        20090.38
+      ],
+      "prefill_ms_best": 19801.15,
+      "prefill_tok_s": 18.43,
+      "parity_text": "1, 2, 3, 4, 5, 6, 7, 8, ",
+      "config_env": {
+        "CAMELID_CUDA_RESIDENT_DECODE": "0",
+        "CAMELID_CUDA_RESIDENT_PREFILL": "0",
+        "CAMELID_PREFILL_CHUNK_TOKENS": "all"
+      }
+    },
+    "chunk_64": {
+      "prompt_tokens": 365,
+      "prefill_ms_runs": [
+        21228.41,
+        20932.95
+      ],
+      "prefill_ms_best": 20932.95,
+      "prefill_tok_s": 17.44,
+      "parity_text": "1, 2, 3, 4, 5, 6, 7, 8, ",
+      "config_env": {
+        "CAMELID_CUDA_RESIDENT_DECODE": "0",
+        "CAMELID_CUDA_RESIDENT_PREFILL": "0",
+        "CAMELID_PREFILL_CHUNK_TOKENS": "64"
+      }
+    },
+    "lm_on_chunk_all": {
+      "prompt_tokens": 365,
+      "prefill_ms_runs": [
+        20072.02,
+        20645.28
+      ],
+      "prefill_ms_best": 20072.02,
+      "prefill_tok_s": 18.18,
+      "parity_text": "1, 2, 3, 4, 5, 6, 7, 8, ",
+      "config_env": {
+        "CAMELID_CUDA_RESIDENT_DECODE": "0",
+        "CAMELID_CUDA_RESIDENT_PREFILL": "0",
+        "CAMELID_PREFILL_LAYER_MAJOR": "1",
+        "CAMELID_PREFILL_LAYER_MAJOR_CHUNK_TOKENS": "all"
+      }
+    }
+  },
+  "parity": {
+    "A_default": true,
+    "layer_major_on": true,
+    "layer_major_off": true,
+    "chunk_all": true,
+    "chunk_64": true,
+    "lm_on_chunk_all": true
+  },
+  "all_parity_identical": true
+}

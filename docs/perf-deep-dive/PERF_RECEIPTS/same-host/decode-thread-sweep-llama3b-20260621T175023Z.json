@@ -1,0 +1,54 @@
+{
+  "generated_utc": "2026-06-21T17:50:24.951Z",
+  "model": "<home>/models/Llama-3.2-3B-Instruct-Q8_0.gguf",
+  "runs": {
+    "threads_default": {
+      "decode_tok_s": 5.14,
+      "decode_completion_tokens": 48,
+      "decode_text": "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, ",
+      "prefill_tok_s": 19.14,
+      "prefill_prompt_tokens": 365,
+      "rayon_threads": "default"
+    },
+    "threads_1": {
+      "decode_tok_s": 6.16,
+      "decode_completion_tokens": 48,
+      "decode_text": "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, ",
+      "prefill_tok_s": 19.24,
+      "prefill_prompt_tokens": 365,
+      "rayon_threads": "1"
+    },
+    "threads_2": {
+      "decode_tok_s": 6.11,
+      "decode_completion_tokens": 48,
+      "decode_text": "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, ",
+      "prefill_tok_s": 18.45,
+      "prefill_prompt_tokens": 365,
+      "rayon_threads": "2"
+    },
+    "threads_4": {
+      "decode_tok_s": 5.84,
+      "decode_completion_tokens": 48,
+      "decode_text": "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, ",
+      "prefill_tok_s": 18.94,
+      "prefill_prompt_tokens": 365,
+      "rayon_threads": "4"
+    },
+    "threads_8": {
+      "decode_tok_s": 3.26,
+      "decode_completion_tokens": 48,
+      "decode_text": "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, ",
+      "prefill_tok_s": 15.45,
+      "prefill_prompt_tokens": 365,
+      "rayon_threads": "8"
+    }
+  },
+  "parity": {
+    "threads_default": true,
+    "threads_1": true,
+    "threads_2": true,
+    "threads_4": true,
+    "threads_8": true
+  },
+  "all_parity_identical": true
+}
