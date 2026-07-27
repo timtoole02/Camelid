@@ -117,8 +117,8 @@ try {
   check('view: honest no-traffic state renders with no requests', () => {
     const html = renderToStaticMarkup(React.createElement(InferenceObservatoryView, { apiBase: 'http://127.0.0.1:1' }))
     assert.ok(html.includes('No session traffic yet'), 'honest empty copy missing')
-    assert.ok(html.includes('The Flow Bench'), 'title missing')
-    assert.ok(html.includes('flowbench'), 'bench stage missing')
+    assert.ok(html.includes('The Neural Field'), 'default renderer title missing')
+    assert.ok(html.includes('neuralfield'), 'default renderer stage missing')
     assert.ok(html.includes('operational telemetry'), 'not-evidence affordance missing')
   })
   check('view: never-fake-motion promise exists in source', () => {

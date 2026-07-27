@@ -129,7 +129,7 @@ function ActivityRow({ event }) {
   return <li className="workspace-event workspace-event--system"><IconBolt size={16} /><div><strong>Workspace</strong><span>{event.content || kind}</span></div></li>
 }
 
-function FolderPicker({ apiBase, initialPath, onClose, onPick }) {
+export function FolderPicker({ apiBase, initialPath, onClose, onPick }) {
   const [view, setView] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')

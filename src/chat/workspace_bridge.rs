@@ -27,6 +27,34 @@ const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 pub(crate) const WORKSPACE_CONTEXT_BUDGET_TOKENS: u32 = 4_096;
 const WORKSPACE_MODEL_STEP_TIMEOUT: Duration = Duration::from_secs(90);
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorkspaceRunMode {
+    #[default]
+    ReadOnly,
+    Code,
+}
+
+impl WorkspaceRunMode {
+    pub(crate) fn is_code(self) -> bool {
+        self == Self::Code
+    }
+
+    fn tool_profile(self) -> ToolProfile {
+        match self {
+            Self::ReadOnly => ToolProfile::WorkspaceReadOnly,
+            Self::Code => ToolProfile::WebCode,
+        }
+    }
+
+    fn shell_sandbox(self) -> ShellSandbox {
+        match self {
+            Self::ReadOnly => ShellSandbox::Disabled,
+            Self::Code => ShellSandbox::Sandboxed,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub(crate) enum WorkspaceEvent {
@@ -130,6 +158,7 @@ pub(crate) struct WorkspaceRunConfig {
     pub max_steps: usize,
     pub max_tokens: u32,
     pub temperature: f32,
+    pub mode: WorkspaceRunMode,
 }
 
 impl WorkspaceBridgeClient {
@@ -400,8 +429,10 @@ pub(crate) fn run_live(
     config: WorkspaceRunConfig,
     mut worker: WorkspaceBridgeWorker,
 ) -> Result<LoopEnd, String> {
+    let shell_sandbox = config.mode.shell_sandbox();
+    let tool_profile = config.mode.tool_profile();
     let sandbox = match Sandbox::new(&config.workspace, false, Duration::from_secs(30)) {
-        Ok(sandbox) => sandbox.with_shell_mode(ShellSandbox::Disabled),
+        Ok(sandbox) => sandbox.with_shell_mode(shell_sandbox),
         Err(error) => {
             let message = error.to_string();
             worker.reporter.send(WorkspaceEvent::Error {
@@ -421,7 +452,13 @@ pub(crate) fn run_live(
         turn_index: config.turn_index,
     });
 
-    let system = super::agent::workspace_system_prompt(&sandbox);
+    let system = if config.mode.is_code() {
+        let specs = super::tools::specs_for(tool_profile, false, shell_sandbox);
+        let project = super::agent::load_project_context(&sandbox);
+        super::agent::system_prompt_with_project(&sandbox, &specs, project.as_ref())
+    } else {
+        super::agent::workspace_system_prompt(&sandbox)
+    };
     let mut history = vec![AgentMsg::System(system)];
     if let Some(memory) = render_relevant_memory(&config.memory.relevant) {
         history.push(AgentMsg::Memory(memory));
@@ -458,8 +495,8 @@ pub(crate) fn run_live(
         max_tokens: config.max_tokens,
         temperature: config.temperature,
         audit: Box::new(NoopSink),
-        shell_sandbox: ShellSandbox::Disabled,
-        tool_profile: ToolProfile::WorkspaceReadOnly,
+        shell_sandbox,
+        tool_profile,
         ctx_budget: None,
     };
     let end = run_loop(

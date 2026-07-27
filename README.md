@@ -109,6 +109,7 @@ Every interface talks to the same local engine — pick whichever fits your work
 | **Terminal UI** | `camelid chat` — full-screen; `--plain` for a line REPL over SSH | Working entirely in the shell |
 | **HTTP API** | OpenAI-style `/v1/*`, served alongside the UI on the same port | Wiring Camelid into your own apps |
 | **Agent mode** | `camelid chat --agent --model <gguf>` — approval-gated tool calls | Coding-agent work in your own repo |
+| **Code** (preview) | Open **Code** in the Web UI or Desktop app | Approval-gated coding with activity, diffs, undo, and history |
 | **Workspace** (preview) | Open **Workspace** in the Web UI | Read-only, resumable analysis of a local folder |
 
 **Agent mode — Supported (experimental).** `camelid chat --agent` is an approval-gated
@@ -121,6 +122,15 @@ only models the compatibility ledger marks `tool_capable` are eligible (promoted
 explicitly not claimed — is pinned in [COMPATIBILITY.md](COMPATIBILITY.md), backed by the live-lane
 bundle `qa/evidence-bundles/agent-mode-supported-experimental-20260722/`. Review every requested
 action: approval is the contract.
+
+**Code (preview).** Switch from Chat to Code in the Web UI or Desktop app, choose one local
+workspace, and give Camelid a coding task. Code uses the terminal agent loop with a deliberately
+scoped tool profile: read, list, literal search, plan, write, edit, and sandboxed shell. Every file
+mutation and shell command pauses for an exact-action approval; network, GUI control, MCP tools,
+subagents, and unattended execution remain unavailable. Automatic checkpoints power the Changes
+view and guarded single-step undo without touching git. Completed turns are stored in the local
+Workspace SQLite store and appear as coding history in the left rail. Code fails closed unless the
+loaded exact model row is supported and has earned `tool_capable: true`.
 
 **Workspace (preview).** Choose one local directory and ask follow-up questions across a durable
 conversation. Workspace can only list, read, and search within that canonical root; writes, shell,

@@ -10,6 +10,7 @@ import {
 } from '../ui/icons'
 
 const NAV = [
+  { tab: 'code', label: 'Code', Icon: IconBolt },
   { tab: 'workspace', label: 'Workspace', Icon: IconBolt },
   { tab: 'library', label: 'Models', Icon: IconModels },
   { tab: 'history', label: 'Chat history', Icon: IconHistory },
@@ -28,7 +29,8 @@ const BUCKETS = ['Today', 'Yesterday', 'Previous 7 days', 'Earlier']
 function startOfDay(d) { return new Date(d.getFullYear(), d.getMonth(), d.getDate()) }
 function bucketFor(value) {
   if (!value) return 'Earlier'
-  const diff = Math.floor((startOfDay(new Date()) - startOfDay(new Date(value))) / 86400000)
+  const normalized = typeof value === 'number' && value < 10_000_000_000 ? value * 1000 : value
+  const diff = Math.floor((startOfDay(new Date()) - startOfDay(new Date(normalized))) / 86400000)
   if (diff <= 0) return 'Today'
   if (diff === 1) return 'Yesterday'
   if (diff <= 7) return 'Previous 7 days'
@@ -48,6 +50,10 @@ export function SidebarRail({
   onSelectConversation,
   renameConversation,
   requestDeleteConversation,
+  codeThreads = [],
+  selectedCodeThreadId = '',
+  onSelectCodeThread,
+  onNewCodeSession,
   runtime,
   themePreference,
   themeResolved,
@@ -58,6 +64,16 @@ export function SidebarRail({
     filteredConversations.forEach((c) => groups.get(bucketFor(c.updated_at))?.push(c))
     return BUCKETS.map((label) => ({ label, items: groups.get(label) || [] })).filter((g) => g.items.length)
   }, [filteredConversations])
+  const groupedCodeThreads = useMemo(() => {
+    const needle = String(search || '').trim().toLowerCase()
+    const groups = new Map(BUCKETS.map((b) => [b, []]))
+    codeThreads
+      .filter((thread) => !needle || `${thread.title} ${thread.canonical_root}`.toLowerCase().includes(needle))
+      .forEach((thread) => groups.get(bucketFor(thread.updated_at))?.push(thread))
+    return BUCKETS.map((label) => ({ label, items: groups.get(label) || [] })).filter((group) => group.items.length)
+  }, [codeThreads, search])
+  const showingCode = tab === 'code'
+  const visibleGroups = showingCode ? groupedCodeThreads : grouped
 
   const online = runtime?.status === 'online'
   const statusTone = online ? 'ready' : 'offline'
@@ -72,8 +88,8 @@ export function SidebarRail({
               <IconSidebar size={20} />
             </button>
           </Tooltip>
-          <Tooltip content="New chat" placement="right">
-            <button type="button" className="rail__icon-btn rail__icon-btn--accent" aria-label="New chat" onClick={showNewChatLanding}>
+          <Tooltip content={showingCode ? 'New coding session' : 'New chat'} placement="right">
+            <button type="button" className="rail__icon-btn rail__icon-btn--accent" aria-label={showingCode ? 'New coding session' : 'New chat'} onClick={showingCode ? onNewCodeSession : showNewChatLanding}>
               <IconNewChat size={20} />
             </button>
           </Tooltip>
@@ -114,30 +130,41 @@ export function SidebarRail({
         </button>
       </div>
 
-      <button type="button" className="rail__new-chat" onClick={showNewChatLanding}>
+      <button type="button" className="rail__new-chat" onClick={showingCode ? onNewCodeSession : showNewChatLanding}>
         <IconNewChat size={18} />
-        <span>New chat</span>
+        <span>{showingCode ? 'New coding session' : 'New chat'}</span>
       </button>
 
       <div className="rail__search">
         <IconSearch size={16} />
         <input
           className="rail__search-input"
-          aria-label="Search conversations"
+          aria-label={showingCode ? 'Search coding sessions' : 'Search conversations'}
           value={search}
           onChange={(e) => setSearch(e.target.value)}
-          placeholder="Search chats"
+          placeholder={showingCode ? 'Search code history' : 'Search chats'}
         />
       </div>
 
       <div className="rail__scroll">
         <div className="rail__section">
-          <div className="rail__section-label">Recent</div>
-          {grouped.length === 0 && <p className="rail__empty">No conversations yet</p>}
-          {grouped.map((group) => (
+          <div className="rail__section-label">{showingCode ? 'Code history' : 'Recent'}</div>
+          {visibleGroups.length === 0 && <p className="rail__empty">{showingCode ? 'No coding sessions yet' : 'No conversations yet'}</p>}
+          {visibleGroups.map((group) => (
             <div key={group.label} className="rail__group">
               <div className="rail__group-label">{group.label}</div>
-              {group.items.map((conversation) => (
+              {showingCode ? group.items.map((thread) => (
+                <button
+                  type="button"
+                  key={thread.id}
+                  className={`rail-code-thread ${thread.id === selectedCodeThreadId ? 'is-selected' : ''}`}
+                  onClick={() => onSelectCodeThread?.(thread)}
+                  title={thread.canonical_root}
+                >
+                  <IconBolt size={15} />
+                  <span><strong>{thread.title || 'Coding session'}</strong><small>{thread.canonical_root}</small></span>
+                </button>
+              )) : group.items.map((conversation) => (
                 <ConversationListItem
                   key={conversation.id}
                   conversation={conversation}

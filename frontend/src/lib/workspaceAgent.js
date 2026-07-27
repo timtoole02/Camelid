@@ -6,6 +6,7 @@ export const WORKSPACE_IDLE_STATE = Object.freeze({
   turns: [],
   totalTurns: 0,
   error: '',
+  approval: null,
 })
 
 function appendActivity(events, event) {
@@ -15,7 +16,7 @@ function appendActivity(events, event) {
     : next
 }
 
-export function reduceWorkspaceEvent(state, envelope) {
+function reduceAgentEvent(state, envelope, allowApprovals) {
   const event = envelope?.event
   if (!event) return state
   if (event === 'session.reset') return { ...WORKSPACE_IDLE_STATE, events: [], turns: [], totalTurns: 0 }
@@ -34,8 +35,8 @@ export function reduceWorkspaceEvent(state, envelope) {
       error: '',
     }
   }
-  if (event === 'session.starting') return { ...state, phase: 'starting', error: '' }
-  if (event === 'turn.starting') return { ...state, phase: 'starting', error: '' }
+  if (event === 'session.starting') return { ...state, phase: 'starting', error: '', approval: null }
+  if (event === 'turn.starting') return { ...state, phase: 'starting', error: '', approval: null }
   if (event === 'turn.stopping') return { ...state, phase: 'cancelling', error: '' }
   if (event === 'turn.stop_failed') {
     return { ...state, phase: 'cancel_error', error: String(envelope.message || 'Workspace could not confirm that the turn stopped.') }
@@ -85,17 +86,23 @@ export function reduceWorkspaceEvent(state, envelope) {
   }
 
   if (event === 'approval.required') {
+    if (allowApprovals) {
+      return { ...state, phase: 'awaiting_approval', events, turns, approval: envelope, error: '' }
+    }
     return { ...state, phase: 'error', events, turns, error: 'Read-only Workspace received an unexpected approval request.' }
   }
+  if (event === 'approval.resolved') {
+    return { ...state, phase: 'running', approval: null, error: '' }
+  }
   if (event === 'tool.result') {
-    return { ...state, phase: state.phase === 'cancel_error' ? state.phase : 'running', events, turns }
+    return { ...state, phase: state.phase === 'cancel_error' ? state.phase : 'running', events, turns, approval: null }
   }
   if (event === 'session.finished') {
     if (envelope.outcome !== 'answered' && turns.length) {
       turns = [...turns]
       turns[turns.length - 1] = { ...turns.at(-1), outcome: envelope.outcome }
     }
-    return { ...state, phase: envelope.outcome === 'answered' ? 'finished' : envelope.outcome, events, turns }
+    return { ...state, phase: envelope.outcome === 'answered' ? 'finished' : envelope.outcome, events, turns, approval: null }
   }
   if (event === 'session.error') {
     return { ...state, phase: 'error', events, turns, error: String(envelope.message || 'Workspace stopped.') }
@@ -108,6 +115,14 @@ export function reduceWorkspaceEvent(state, envelope) {
   }
 }
 
+export function reduceWorkspaceEvent(state, envelope) {
+  return reduceAgentEvent(state, envelope, false)
+}
+
+export function reduceCodeEvent(state, envelope) {
+  return reduceAgentEvent(state, envelope, true)
+}
+
 export function workspaceEndpoint(apiBase, suffix = '') {
   const base = String(apiBase || '').replace(/\/$/, '')
   return `${base}/api/agent/workspace/sessions${suffix}`
@@ -118,10 +133,11 @@ export function workspaceModelsEndpoint(apiBase) {
   return `${base}/api/agent/workspace/models`
 }
 
-export function workspaceThreadsEndpoint(apiBase, workspace, threadId = '') {
+export function workspaceThreadsEndpoint(apiBase, workspace, threadId = '', mode = 'read_only') {
   const base = String(apiBase || '').replace(/\/$/, '')
   const suffix = threadId ? `/${encodeURIComponent(threadId)}` : ''
-  return `${base}/api/agent/workspace/threads${suffix}?workspace=${encodeURIComponent(workspace)}`
+  const modeQuery = mode === 'read_only' ? '' : `&mode=${encodeURIComponent(mode)}`
+  return `${base}/api/agent/workspace/threads${suffix}?workspace=${encodeURIComponent(workspace)}${modeQuery}`
 }
 
 export function workspaceCompactionEndpoint(apiBase, workspace, threadId) {
@@ -129,9 +145,17 @@ export function workspaceCompactionEndpoint(apiBase, workspace, threadId) {
   return `${base}/api/agent/workspace/threads/${encodeURIComponent(threadId)}/compact?workspace=${encodeURIComponent(workspace)}`
 }
 
-export async function getWorkspaceThreads(apiBase, workspace, { signal } = {}) {
-  const response = await fetch(workspaceThreadsEndpoint(apiBase, workspace), { signal })
+export async function getWorkspaceThreads(apiBase, workspace, { signal, mode = 'read_only' } = {}) {
+  const response = await fetch(workspaceThreadsEndpoint(apiBase, workspace, '', mode), { signal })
   if (!response.ok) throw new Error(await readError(response, `Saved Workspace threads failed (${response.status}).`))
+  const payload = await response.json()
+  return Array.isArray(payload?.threads) ? payload.threads : []
+}
+
+export async function getRecentCodeThreads(apiBase, { signal } = {}) {
+  const base = String(apiBase || '').replace(/\/$/, '')
+  const response = await fetch(`${base}/api/agent/workspace/threads/recent?mode=code`, { signal })
+  if (!response.ok) throw new Error(await readError(response, `Coding history failed (${response.status}).`))
   const payload = await response.json()
   return Array.isArray(payload?.threads) ? payload.threads : []
 }
@@ -237,4 +261,29 @@ export async function cancelWorkspaceSession(apiBase, sessionId) {
   const response = await fetch(workspaceEndpoint(apiBase, `/${encodeURIComponent(sessionId)}`), { method: 'DELETE' })
   if (!response.ok && response.status !== 404) throw new Error(await readError(response, `Stop failed (${response.status}).`))
   return response.status
+}
+
+export async function decideWorkspaceApproval(apiBase, sessionId, approvalId, decision) {
+  const response = await fetch(workspaceEndpoint(apiBase, `/${encodeURIComponent(sessionId)}/decisions`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ approval_id: approvalId, decision }),
+  })
+  if (!response.ok) throw new Error(await readError(response, `Approval decision failed (${response.status}).`))
+}
+
+export async function getWorkspaceChanges(apiBase, sessionId) {
+  const response = await fetch(workspaceEndpoint(apiBase, `/${encodeURIComponent(sessionId)}/changes`))
+  if (!response.ok) throw new Error(await readError(response, `File changes failed (${response.status}).`))
+  return response.json()
+}
+
+export async function undoWorkspaceChange(apiBase, sessionId, force = false) {
+  const response = await fetch(workspaceEndpoint(apiBase, `/${encodeURIComponent(sessionId)}/undo`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ force }),
+  })
+  if (!response.ok) throw new Error(await readError(response, `Undo failed (${response.status}).`))
+  return response.json()
 }

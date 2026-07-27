@@ -23,7 +23,7 @@ mod agent_syscap;
 mod agent_tui;
 mod audit;
 mod banner;
-mod checkpoint;
+pub(crate) mod checkpoint;
 mod client;
 mod clipboard;
 mod inline;
@@ -39,7 +39,7 @@ mod subagent;
 mod term_guard;
 mod theme;
 mod tool_parse;
-mod tools;
+pub(crate) mod tools;
 mod tui;
 #[cfg(windows)]
 mod win_clipboard;

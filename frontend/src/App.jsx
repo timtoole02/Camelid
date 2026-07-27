@@ -13,6 +13,7 @@ import { ensureInferenceTelemetryConnected } from './hooks/useInferenceTelemetry
 import ChatWorkspace from './views/ChatWorkspace'
 import { CommandPalette } from './components/CommandPalette'
 import { ShortcutsOverlay } from './components/ShortcutsOverlay'
+import { getRecentCodeThreads } from './lib/workspaceAgent'
 
 /* Route-level code splitting (Phase 7): chat is the default surface and stays
    eager; every other view loads on first visit. */
@@ -28,9 +29,10 @@ const CompatibilityView = lazy(() => import('./views/CompatibilityView'))
 const TelemetryView = lazy(() => import('./views/TelemetryView'))
 const InferenceObservatoryView = lazy(() => import('./views/InferenceObservatoryView'))
 const WorkspaceView = lazy(() => import('./views/WorkspaceView'))
+const CodeWorkspace = lazy(() => import('./views/CodeWorkspace'))
 
 const DEMO_UI = import.meta.env?.VITE_CAMELID_DEMO_UI === 'true'
-const HASH_TABS = new Set(['chat', 'workspace', 'library', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory', 'compatibility', 'telemetry'])
+const HASH_TABS = new Set(['chat', 'code', 'workspace', 'library', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory', 'compatibility', 'telemetry'])
 
 function App() {
   const { notice, noticeTone, showNotice, clearNotice } = useNotice()
@@ -51,6 +53,9 @@ function App() {
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
   const [deleteBusy, setDeleteBusy] = useState(false)
   const [modelsVisited, setModelsVisited] = useState(false)
+  const [codeThreads, setCodeThreads] = useState([])
+  const [requestedCodeThread, setRequestedCodeThread] = useState(null)
+  const [codeWorkspaceKey, setCodeWorkspaceKey] = useState(0)
 
   useEffect(() => {
     if (typeof window === 'undefined' || !window.matchMedia) return undefined
@@ -77,6 +82,23 @@ function App() {
   } = dash
 
   const backend = useBackendLauncher({ showNotice, loadDashboard })
+
+  useEffect(() => {
+    const controller = new AbortController()
+    const refresh = () => {
+      getRecentCodeThreads(apiBase, { signal: controller.signal })
+        .then(setCodeThreads)
+        .catch((error) => {
+          if (error.name !== 'AbortError') setCodeThreads([])
+        })
+    }
+    refresh()
+    window.addEventListener('camelid:code-history-changed', refresh)
+    return () => {
+      controller.abort()
+      window.removeEventListener('camelid:code-history-changed', refresh)
+    }
+  }, [apiBase])
 
   useEffect(() => {
     if (tab === 'library') setModelsVisited(true)
@@ -155,6 +177,18 @@ function App() {
     closeMobileNav()
   }
 
+  const startNewCodeSession = () => {
+    setRequestedCodeThread(null)
+    setCodeWorkspaceKey((value) => value + 1)
+    navigateTab('code')
+  }
+
+  const selectCodeThread = (thread) => {
+    setRequestedCodeThread(thread)
+    setCodeWorkspaceKey((value) => value + 1)
+    navigateTab('code')
+  }
+
   const requestDeleteConversation = (id) => {
     setPendingDeleteConversationId(id)
     setDeleteBusy(false)
@@ -222,6 +256,10 @@ function App() {
           onSelectConversation={selectConversation}
           renameConversation={renameConversation}
           requestDeleteConversation={requestDeleteConversation}
+          codeThreads={codeThreads}
+          selectedCodeThreadId={requestedCodeThread?.id || ''}
+          onSelectCodeThread={selectCodeThread}
+          onNewCodeSession={startNewCodeSession}
           runtime={runtime}
           themePreference={preference}
           themeResolved={resolved}
@@ -256,7 +294,7 @@ function App() {
           <BackendBanner backend={backend} onOpenSettings={() => navigateTab('settings')} />
         )}
 
-        <div className={`camelid-view ${(tab === 'chat' || tab === 'workspace' || tab === 'cluster' || tab === 'observatory') ? 'camelid-view--chat' : 'camelid-view--page'}`}>
+        <div className={`camelid-view ${(tab === 'chat' || tab === 'code' || tab === 'workspace' || tab === 'cluster' || tab === 'observatory') ? 'camelid-view--chat' : 'camelid-view--page'}`}>
           <Suspense fallback={<div className="view-loading" role="status" aria-label="Loading view">Loading view…</div>}>
           {tab === 'chat' && (
             <ChatWorkspace
@@ -298,6 +336,19 @@ function App() {
               selectedModel={selectedModel}
               runtime={runtime}
               setTab={navigateTab}
+            />
+          )}
+
+          {tab === 'code' && (
+            <CodeWorkspace
+              key={codeWorkspaceKey}
+              apiBase={apiBase}
+              capabilities={dashboard?.capabilities}
+              selectedModel={selectedModel}
+              runtime={runtime}
+              setTab={navigateTab}
+              requestedThread={requestedCodeThread}
+              onHistoryChanged={() => {}}
             />
           )}
 

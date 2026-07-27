@@ -17,7 +17,7 @@ use super::{
 use crate::chat::agent::LoopEnd;
 use crate::chat::workspace_bridge::{
     bridge, run_live, WorkspaceBridgeControl, WorkspaceBridgeWorker, WorkspaceDecisionKind,
-    WorkspaceEvent, WorkspaceRunConfig,
+    WorkspaceEvent, WorkspaceRunConfig, WorkspaceRunMode,
 };
 use crate::chat::workspace_memory::{
     default_store_path, EvidenceInput, StoredThread, WorkspaceMemoryStore,
@@ -77,6 +77,7 @@ struct ActiveWorkspaceSession {
     max_tokens: u32,
     temperature: f32,
     allow_writes: bool,
+    mode: WorkspaceRunMode,
     memory: WorkspaceMemoryStore,
     state: StdMutex<WorkspaceSessionState>,
     events: StdMutex<Option<std::sync::mpsc::Receiver<WorkspaceEvent>>>,
@@ -351,6 +352,8 @@ pub(super) struct CreateWorkspaceSessionRequest {
     temperature: Option<f32>,
     #[serde(default)]
     allow_writes: Option<bool>,
+    #[serde(default)]
+    mode: WorkspaceRunMode,
 }
 
 #[derive(Debug, Deserialize)]
@@ -368,6 +371,7 @@ struct WorkspaceSessionResponse {
     max_steps: usize,
     max_tokens: u32,
     allow_writes: bool,
+    mode: WorkspaceRunMode,
 }
 
 #[derive(Debug, Serialize)]
@@ -379,6 +383,7 @@ struct WorkspaceSessionStatusResponse {
     context_budget_tokens: u32,
     resident_cuda: Option<crate::inference::ResidentCudaStatus>,
     allow_writes: bool,
+    mode: WorkspaceRunMode,
 }
 
 #[derive(Debug, Serialize)]
@@ -409,6 +414,14 @@ struct WorkspaceModelsResponse {
 #[derive(Debug, Deserialize)]
 pub(super) struct WorkspaceThreadsQuery {
     workspace: PathBuf,
+    #[serde(default)]
+    mode: WorkspaceRunMode,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct WorkspaceRecentThreadsQuery {
+    #[serde(default)]
+    mode: WorkspaceRunMode,
 }
 
 #[derive(Debug, Serialize)]
@@ -468,6 +481,7 @@ pub(super) async fn list_threads(
         return response;
     }
     let requested_workspace = query.workspace;
+    let mode = query.mode;
     let workspace = match run_workspace_blocking(move || {
         std::fs::canonicalize(requested_workspace)
             .ok()
@@ -498,9 +512,77 @@ pub(super) async fn list_threads(
         let threads = store
             .threads_for_root(&workspace, 20)?
             .into_iter()
-            .filter(|thread| thread.model_id == model_id && thread.model_sha256 == model_sha256)
+            .filter(|thread| {
+                let mode_matches = if mode.is_code() {
+                    thread.id.starts_with("code-")
+                } else {
+                    thread.id.starts_with("workspace-")
+                };
+                mode_matches && thread.model_id == model_id && thread.model_sha256 == model_sha256
+            })
             .collect();
         Ok(threads)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+    match result {
+        Ok(threads) => Json(WorkspaceThreadsResponse { threads }).into_response(),
+        Err(error) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "workspace_memory_unavailable",
+            format!("Workspace threads could not be listed: {error}"),
+            None,
+        ),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct WorkspaceChangesResponse {
+    summary: String,
+    diff: String,
+    files: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct WorkspaceUndoRequest {
+    #[serde(default)]
+    force: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkspaceUndoResponse {
+    result: String,
+    summary: String,
+    diff: String,
+    files: Vec<String>,
+}
+
+pub(super) async fn list_recent_threads(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<WorkspaceRecentThreadsQuery>,
+) -> Response {
+    if let Some(response) = authorize(&state, &headers) {
+        return response;
+    }
+    let mode = query.mode;
+    let result = match run_workspace_blocking(move || -> anyhow::Result<_> {
+        let store = WorkspaceMemoryStore::open(default_store_path())?;
+        Ok(store
+            .recent_threads(100)?
+            .into_iter()
+            .filter(|thread| {
+                if mode.is_code() {
+                    thread.id.starts_with("code-")
+                } else {
+                    thread.id.starts_with("workspace-")
+                }
+            })
+            .take(40)
+            .collect::<Vec<_>>())
     })
     .await
     {
@@ -1014,7 +1096,8 @@ pub(super) async fn create_session(
             Some("temperature"),
         );
     }
-    if request.allow_writes.unwrap_or(false) {
+    let mode = request.mode;
+    if request.allow_writes.unwrap_or(false) && !mode.is_code() {
         return api_error(
             StatusCode::BAD_REQUEST,
             "workspace_read_only",
@@ -1022,7 +1105,7 @@ pub(super) async fn create_session(
             Some("allow_writes"),
         );
     }
-    let allow_writes = false;
+    let allow_writes = mode.is_code();
 
     let requested_workspace = request.workspace;
     let workspace =
@@ -1082,6 +1165,14 @@ pub(super) async fn create_session(
     let prepared = match run_workspace_blocking(move || -> anyhow::Result<_> {
         let memory = WorkspaceMemoryStore::open(default_store_path())?;
         let prepared = if let Some(thread_id) = resume_id {
+            let expected_prefix = if mode.is_code() {
+                "code-"
+            } else {
+                "workspace-"
+            };
+            if !thread_id.starts_with(expected_prefix) {
+                return Ok(Err("mode_mismatch"));
+            }
             let Some(stored) = memory.thread(&thread_id)? else {
                 return Ok(Err("not_found"));
             };
@@ -1094,7 +1185,8 @@ pub(super) async fn create_session(
             let context = memory.context_for(&thread_id, &memory_goal, 2 * 1024)?;
             (memory, thread_id, context, stored.turn_count)
         } else {
-            let id = format!("workspace-{}", uuid::Uuid::new_v4());
+            let prefix = if mode.is_code() { "code" } else { "workspace" };
+            let id = format!("{prefix}-{}", uuid::Uuid::new_v4());
             memory.create_thread_for_model(
                 &id,
                 &memory_root,
@@ -1123,6 +1215,14 @@ pub(super) async fn create_session(
                 None,
             )
         }
+        Ok(Err("mode_mismatch")) => {
+            return api_error(
+                StatusCode::CONFLICT,
+                "workspace_thread_mode_mismatch",
+                "the saved thread belongs to a different Workspace mode".to_string(),
+                None,
+            )
+        }
         Ok(Err(_)) => unreachable!("fixed Workspace preparation error"),
         Err(error) => {
             return api_error(
@@ -1148,7 +1248,11 @@ pub(super) async fn create_session(
         max_steps,
         max_tokens,
         temperature,
+        mode,
     };
+    if mode.is_code() {
+        crate::chat::checkpoint::clear();
+    }
     let session = Arc::new(ActiveWorkspaceSession {
         id: id.clone(),
         workspace: workspace.clone(),
@@ -1157,6 +1261,7 @@ pub(super) async fn create_session(
         max_tokens,
         temperature,
         allow_writes,
+        mode,
         memory,
         state: StdMutex::new(WorkspaceSessionState::WaitingForEvents),
         events: StdMutex::new(Some(events)),
@@ -1178,9 +1283,133 @@ pub(super) async fn create_session(
             max_steps,
             max_tokens,
             allow_writes,
+            mode,
         }),
     )
         .into_response()
+}
+
+pub(super) async fn session_changes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Some(response) = authorize(&state, &headers) {
+        return response;
+    }
+    let session = match find_session(&state, &id).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    if !session.mode.is_code() {
+        return api_error(
+            StatusCode::CONFLICT,
+            "workspace_read_only",
+            "File changes are available only in Code mode".to_string(),
+            None,
+        );
+    }
+    let workspace = session.workspace.clone();
+    match run_workspace_blocking(move || workspace_changes_response(&workspace)).await {
+        Ok(Ok(changes)) => Json(changes).into_response(),
+        Ok(Err(error)) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "workspace_changes_unavailable",
+            error.to_string(),
+            None,
+        ),
+        Err(response) => response,
+    }
+}
+
+pub(super) async fn undo_session_change(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<WorkspaceUndoRequest>,
+) -> Response {
+    if let Some(response) = authorize(&state, &headers) {
+        return response;
+    }
+    let session = match find_session(&state, &id).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    if !session.mode.is_code() {
+        return api_error(
+            StatusCode::CONFLICT,
+            "workspace_read_only",
+            "Undo is available only in Code mode".to_string(),
+            None,
+        );
+    }
+    if session
+        .state
+        .lock()
+        .map(|status| status.blocks_model_transition())
+        .unwrap_or(true)
+    {
+        return api_error(
+            StatusCode::CONFLICT,
+            "workspace_turn_active",
+            "stop or finish the active turn before undoing a file change".to_string(),
+            None,
+        );
+    }
+    let workspace = session.workspace.clone();
+    let changes_workspace = workspace.clone();
+    let result = match run_workspace_blocking(move || {
+        let sandbox = crate::chat::tools::Sandbox::new(
+            &workspace,
+            false,
+            std::time::Duration::from_secs(30),
+        )?;
+        crate::chat::checkpoint::undo(&sandbox, request.force).map_err(anyhow::Error::msg)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+    match result {
+        Ok(result) => match workspace_changes_response(&changes_workspace) {
+            Ok(changes) => Json(WorkspaceUndoResponse {
+                result,
+                summary: changes.summary,
+                diff: changes.diff,
+                files: changes.files,
+            })
+            .into_response(),
+            Err(error) => api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "workspace_changes_unavailable",
+                error.to_string(),
+                None,
+            ),
+        },
+        Err(error) => api_error(
+            StatusCode::CONFLICT,
+            "workspace_undo_refused",
+            error.to_string(),
+            None,
+        ),
+    }
+}
+
+fn workspace_changes_response(
+    workspace: &std::path::Path,
+) -> anyhow::Result<WorkspaceChangesResponse> {
+    let sandbox =
+        crate::chat::tools::Sandbox::new(workspace, false, std::time::Duration::from_secs(30))?;
+    let checkpoints = crate::chat::checkpoint::all();
+    Ok(WorkspaceChangesResponse {
+        summary: crate::chat::checkpoint::summary(),
+        diff: crate::chat::checkpoint::diff(&sandbox),
+        files: checkpoints
+            .into_iter()
+            .map(|checkpoint| checkpoint.rel)
+            .collect(),
+    })
 }
 
 pub(super) async fn session_events(
@@ -1484,6 +1713,7 @@ pub(super) async fn session_status(
             &session.model_id,
         )),
         allow_writes: session.allow_writes,
+        mode: session.mode,
     })
     .into_response()
 }
@@ -1623,6 +1853,7 @@ pub(super) async fn send_message(
         max_steps: session.max_steps,
         max_tokens: session.max_tokens,
         temperature: session.temperature,
+        mode: session.mode,
     };
     match session.install_turn(events, worker, run_config, control) {
         Ok(InstallTurn::Installed) => {}
@@ -2070,6 +2301,7 @@ mod tests {
                 max_tokens: 1,
                 temperature: 0.0,
                 allow_writes: true,
+                mode: WorkspaceRunMode::ReadOnly,
                 memory: WorkspaceMemoryStore::open(std::env::temp_dir().join(format!(
                     "camelid-workspace-state-test-{}.sqlite3",
                     uuid::Uuid::new_v4()
@@ -2117,6 +2349,7 @@ mod tests {
             max_tokens: 1,
             temperature: 0.0,
             allow_writes: true,
+            mode: WorkspaceRunMode::ReadOnly,
             memory,
             state: StdMutex::new(WorkspaceSessionState::Idle),
             events: StdMutex::new(None),
@@ -2137,6 +2370,7 @@ mod tests {
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
+            mode: WorkspaceRunMode::ReadOnly,
         };
         let (worker, client) = bridge(1);
         let (events, control) = client.into_parts();
@@ -2180,6 +2414,7 @@ mod tests {
             max_tokens: 1,
             temperature: 0.0,
             allow_writes: false,
+            mode: WorkspaceRunMode::ReadOnly,
             memory,
             state: StdMutex::new(WorkspaceSessionState::Cancelled),
             events: StdMutex::new(None),
@@ -2208,6 +2443,7 @@ mod tests {
             max_tokens: 1,
             temperature: 0.0,
             allow_writes: false,
+            mode: WorkspaceRunMode::ReadOnly,
             memory,
             state: StdMutex::new(WorkspaceSessionState::Cancelling),
             events: StdMutex::new(None),
@@ -2228,6 +2464,7 @@ mod tests {
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
+            mode: WorkspaceRunMode::ReadOnly,
         };
 
         assert!(session
@@ -2264,6 +2501,7 @@ mod tests {
                 max_tokens: 1,
                 temperature: 0.0,
                 allow_writes: false,
+                mode: WorkspaceRunMode::ReadOnly,
                 memory,
                 state: StdMutex::new(terminal_state),
                 events: StdMutex::new(Some(stale_events)),
@@ -2284,6 +2522,7 @@ mod tests {
                 max_steps: 1,
                 max_tokens: 1,
                 temperature: 0.0,
+                mode: WorkspaceRunMode::ReadOnly,
             };
             let (worker, client) = bridge(1);
             let (events, control) = client.into_parts();
@@ -2316,6 +2555,7 @@ mod tests {
             max_tokens: 1,
             temperature: 0.0,
             allow_writes: false,
+            mode: WorkspaceRunMode::ReadOnly,
             memory,
             state: StdMutex::new(WorkspaceSessionState::WaitingForEvents),
             events: StdMutex::new(Some(events)),
@@ -2332,6 +2572,7 @@ mod tests {
                 max_steps: 1,
                 max_tokens: 1,
                 temperature: 0.0,
+                mode: WorkspaceRunMode::ReadOnly,
             })),
             control: StdMutex::new(Some(control)),
             current_turn: StdMutex::new(Some(("message-1".into(), 0))),

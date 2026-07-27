@@ -122,6 +122,44 @@ async fn workspace_create_requires_a_loaded_tool_capable_model_after_root_valida
 }
 
 #[tokio::test]
+async fn code_mode_accepts_the_explicit_write_surface_then_requires_a_model() {
+    let root = tempfile::tempdir().unwrap();
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(workspace_request(
+            "/api/agent/workspace/sessions",
+            json!({
+                "workspace": root.path(),
+                "goal": "edit and test the project",
+                "mode": "code",
+                "allow_writes": true
+            }),
+            true,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response_json(response).await["error"]["code"],
+        "model_not_loaded"
+    );
+}
+
+#[tokio::test]
+async fn code_history_requires_same_origin_browser_provenance() {
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(workspace_get(
+            "/api/agent/workspace/threads/recent?mode=code",
+            false,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn workspace_decision_for_an_unknown_session_is_typed_not_found() {
     let app = camelid::api::router();
     let response = app

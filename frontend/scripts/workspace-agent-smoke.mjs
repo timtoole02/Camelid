@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { reduceWorkspaceEvent, waitForWorkspaceSessionTerminal, WORKSPACE_IDLE_STATE, workspaceEndpoint, workspaceModelsEndpoint, workspaceBrowseEndpoint, workspaceThreadsEndpoint, workspaceCompactionEndpoint } from '../src/lib/workspaceAgent.js'
+import { reduceCodeEvent, reduceWorkspaceEvent, waitForWorkspaceSessionTerminal, WORKSPACE_IDLE_STATE, workspaceEndpoint, workspaceModelsEndpoint, workspaceBrowseEndpoint, workspaceThreadsEndpoint, workspaceCompactionEndpoint } from '../src/lib/workspaceAgent.js'
 
 let state = { ...WORKSPACE_IDLE_STATE, events: [] }
 state = reduceWorkspaceEvent(state, { event: 'session.started', model_id: 'tool-model', sequence: 1 })
@@ -33,6 +33,16 @@ const impossibleApproval = reduceWorkspaceEvent(
 )
 assert.equal(impossibleApproval.phase, 'error')
 assert.match(impossibleApproval.error, /unexpected approval request/)
+
+let codeState = reduceCodeEvent(
+  { ...WORKSPACE_IDLE_STATE, events: [] },
+  { event: 'approval.required', approval_id: 'approval-1', tool: 'write_file', risk: 'write', detail: 'write_file → src/a.rs' },
+)
+assert.equal(codeState.phase, 'awaiting_approval')
+assert.equal(codeState.approval.approval_id, 'approval-1')
+codeState = reduceCodeEvent(codeState, { event: 'approval.resolved' })
+assert.equal(codeState.phase, 'running')
+assert.equal(codeState.approval, null)
 
 state = reduceWorkspaceEvent(state, { event: 'session.reset' })
 assert.deepEqual(state, { ...WORKSPACE_IDLE_STATE, events: [] })
@@ -84,6 +94,7 @@ assert.equal(workspaceModelsEndpoint('http://127.0.0.1:8181/'), 'http://127.0.0.
 assert.equal(workspaceBrowseEndpoint('http://127.0.0.1:8181/'), 'http://127.0.0.1:8181/api/agent/workspace/browse')
 assert.equal(workspaceBrowseEndpoint('http://127.0.0.1:8181/', 'C:/data'), 'http://127.0.0.1:8181/api/agent/workspace/browse?path=C%3A%2Fdata')
 assert.equal(workspaceThreadsEndpoint('http://127.0.0.1:8181/', 'C:/data', 'thread/1'), 'http://127.0.0.1:8181/api/agent/workspace/threads/thread%2F1?workspace=C%3A%2Fdata')
+assert.equal(workspaceThreadsEndpoint('http://127.0.0.1:8181/', 'C:/data', '', 'code'), 'http://127.0.0.1:8181/api/agent/workspace/threads?workspace=C%3A%2Fdata&mode=code')
 assert.equal(workspaceCompactionEndpoint('http://127.0.0.1:8181/', 'C:/data', 'thread/1'), 'http://127.0.0.1:8181/api/agent/workspace/threads/thread%2F1/compact?workspace=C%3A%2Fdata')
 
 console.log('workspace-agent-smoke: PASS')

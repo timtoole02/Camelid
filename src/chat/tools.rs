@@ -385,23 +385,39 @@ impl Sandbox {
 pub enum ToolProfile {
     Full,
     WorkspaceReadOnly,
+    /// Browser/Desktop coding surface. Deliberately narrower than `Full`: it
+    /// can inspect and modify the selected workspace and run a sandboxed shell,
+    /// but it never inherits GUI, MCP, network, or subagent tools.
+    WebCode,
 }
 
 impl ToolProfile {
     pub fn allows(self, tool: &str) -> bool {
-        self == ToolProfile::Full
-            || (self == ToolProfile::WorkspaceReadOnly
-                && matches!(tool, "read_file" | "list_dir" | "search"))
+        match self {
+            Self::Full => true,
+            Self::WorkspaceReadOnly => matches!(tool, "read_file" | "list_dir" | "search"),
+            Self::WebCode => matches!(
+                tool,
+                "read_file"
+                    | "list_dir"
+                    | "search"
+                    | "update_plan"
+                    | "write_file"
+                    | "edit_file"
+                    | "run_shell"
+            ),
+        }
     }
 
     pub fn is_workspace(self) -> bool {
-        self == Self::WorkspaceReadOnly
+        matches!(self, Self::WorkspaceReadOnly | Self::WebCode)
     }
 
     pub fn observation_limit(self) -> Option<usize> {
         match self {
             Self::Full => None,
             Self::WorkspaceReadOnly => Some(2 * 1024),
+            Self::WebCode => None,
         }
     }
 
@@ -482,6 +498,10 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
             risk: Risk::Exec,
             params: json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}),
         });
+    }
+    if profile == ToolProfile::WebCode {
+        tools.retain(|tool| profile.allows(&tool.name));
+        return tools;
     }
     if allow_net {
         tools.push(ToolSpec {
@@ -2675,6 +2695,35 @@ mod tests {
         .collect::<Vec<_>>();
         assert_eq!(read_only, vec!["read_file", "list_dir", "search"]);
         assert!(!ToolProfile::WorkspaceReadOnly.allows("write_file"));
+    }
+
+    #[test]
+    fn web_code_profile_is_coding_scoped_not_full_computer_control() {
+        let code = specs_for(ToolProfile::WebCode, true, ShellSandbox::Sandboxed)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            code,
+            vec![
+                "read_file",
+                "list_dir",
+                "search",
+                "update_plan",
+                "write_file",
+                "edit_file",
+                "run_shell",
+            ]
+        );
+        for forbidden in [
+            "http_fetch",
+            "web_search",
+            "spawn_subagent",
+            "run_windows_command",
+            "gui_input",
+        ] {
+            assert!(!ToolProfile::WebCode.allows(forbidden), "{forbidden}");
+        }
     }
 
     #[test]
