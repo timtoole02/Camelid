@@ -30,7 +30,7 @@ use camelid::{
         LlamaSampler, Q8ResidencyReport, SamplingConfig,
     },
     metal::detect_metal_device,
-    model::{LlamaModelConfig, LlamaTensorBinding},
+    model::{KvCacheQuantization, LlamaModelConfig, LlamaTensorBinding},
     tensor::{CpuTensor, Q8_0TensorBlocks, TensorStore},
     tokenizer::Tokenizer,
 };
@@ -83,6 +83,10 @@ fn default_launch_command() -> Command {
         // arg does not apply here; read CAMELID_GPU explicitly, like the sibling
         // env-backed fields above. Default (and any unrecognised value) is Auto.
         gpu: GpuMode::from_env(),
+        kv_quant: std::env::var("CAMELID_KV_QUANT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_default(),
     }
 }
 
@@ -604,6 +608,10 @@ enum Command {
         /// env seed, and the Settings toggle can still flip state live after startup.
         #[arg(long = "gpu", value_enum, default_value_t = GpuMode::Auto, env = "CAMELID_GPU")]
         gpu: GpuMode,
+        /// KV cache quantization format: "f16" (default, unquantized), "q8_0"
+        /// (50% memory savings), or "q4_0" (75% memory savings).
+        #[arg(long, env = "CAMELID_KV_QUANT", default_value_t = KvCacheQuantization::F16)]
+        kv_quant: KvCacheQuantization,
     },
     /// Interactive terminal chat REPL over the local Camelid API.
     ///
@@ -1550,7 +1558,9 @@ async fn main() -> anyhow::Result<()> {
             enable_thinking,
             models_dir,
             gpu,
+            kv_quant,
         } => {
+            std::env::set_var("CAMELID_KV_QUANT", kv_quant.to_string());
             configure_rayon_threads(threads)?;
             camelid::capability::HardwareProfile::detect().log();
             // In deterministic mode the engine fails every Metal gate closed (see
@@ -4302,6 +4312,7 @@ fn known_arch_config(arch: &str) -> anyhow::Result<LlamaModelConfig> {
         feed_forward_length,
         attention_head_count: heads,
         attention_head_count_kv: kv_heads,
+        kv_quant: camelid::model::KvCacheQuantization::F16,
         rope_dimension_count: None,
         rope_freq_base: None,
         rope_scaling_type: None,

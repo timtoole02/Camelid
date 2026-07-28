@@ -558,6 +558,7 @@ fn tiny_config() -> LlamaModelConfig {
         rope_scaling_low_freq_factor: None,
         rope_scaling_high_freq_factor: None,
         rms_norm_epsilon: 1e-6,
+        kv_quant: camelid::model::KvCacheQuantization::F16,
         vocab_size: Some(3),
         file_type: Some(0),
         rope_neox_pairing: false,

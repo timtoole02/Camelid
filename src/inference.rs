@@ -97,7 +97,11 @@ use crate::{
         LlamaMoeExpertTensors, LlamaTensorBinding,
     },
     tensor::{
-        dot_product, parse_byte_count_env, q8_0_file_read_stats, should_parallelize_linear_output,
+        dot_product,
+        kv_quant::{
+            axpy_row_q4_0, axpy_row_q8_0, vec_dot_row_q4_0, vec_dot_row_q8_0, KV_QUANT_BLOCK_VALUES,
+        },
+        parse_byte_count_env, q8_0_file_read_stats, should_parallelize_linear_output,
         with_q8_file_cache_capacity_override, CpuTensor, Q8_0Block, Q8_0FileBacking,
         Q8_0FileReadStats, Q8_0PackedRows4, Q8_0PackedRows4Block, Q8_0PackedRows4Interleave,
         Q8_0RuntimeStorage, Q8_0VnniPacked, Q8_0VnniTile16, TensorShape, TensorStore,
@@ -2186,6 +2190,10 @@ impl LlamaInferenceSession {
                     values: Vec::new(),
                     keys_f16: Vec::new(),
                     values_f16: Vec::new(),
+                    keys_q8_0: Vec::new(),
+                    values_q8_0: Vec::new(),
+                    keys_q4_0: Vec::new(),
+                    values_q4_0: Vec::new(),
                     allocated_sequence_length: 0,
                     position: 0,
                     materialized_through: 0,
@@ -2317,10 +2325,11 @@ impl LlamaInferenceSession {
         let weights = weights.into();
         weights.validate_dense_shapes(&config)?;
         let plan = LlamaKvCachePlan::from_config(&config)?;
+        let kv_quant = config.kv_quant;
         Ok(Self {
             config,
             weights,
-            kv_cache: LlamaKvCache::new(plan)?,
+            kv_cache: LlamaKvCache::new(plan, kv_quant)?,
             resident_decode: None,
             resident_paths_disabled: false,
             execution_trace: None,
@@ -3574,9 +3583,8 @@ impl LlamaInferenceSession {
                 // (engine evicted or rebuilt for another model); declining routes to the CPU
                 // path, which warns, instead of laundering zeros through the GPU cache.
                 //
-                // The watermark alone, not `f32_history_materialized`: the loop below reads via
-                // `copy_key_row_into`, which serves an F16 cache too, so pairing it with a probe
-                // over the (legitimately empty) f32 buffers would decline a readable history.
+                // The watermark is sufficient because the loop below reads via the
+                // dtype-neutral `copy_key_row_into` / `copy_value_row_into` accessors.
                 if !self.kv_cache.history_materialized(position) {
                     if trace {
                         eprintln!(
@@ -24964,6 +24972,15 @@ fn attention_context_for_head_into_with_kernels(
         .kv_cache
         .head_base_offset(params.layer_idx, params.kv_head);
     let position_stride = params.kv_cache.head_position_stride();
+    let key_blocks_per_row = k_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
+    let mut key_block_start = params.kv_cache.quantized_head_base_offset(
+        params.layer_idx,
+        params.kv_head,
+        key_blocks_per_row,
+    );
+    let key_block_position_stride = params
+        .kv_cache
+        .quantized_head_position_stride(key_blocks_per_row);
 
     let mut key_start = head_base;
     for position in 0..params.position_count {
@@ -24984,10 +25001,21 @@ fn attention_context_for_head_into_with_kernels(
                 let key_slice = &params.kv_cache.keys_f16[key_start..key_start + k_head_dim];
                 attn_f32_dot::dot_blocked_f16(params.query_slice, key_slice) * params.scale
             }
+            KvDtype::Q8_0 => {
+                let key_blocks = &params.kv_cache.keys_q8_0
+                    [key_block_start..key_block_start + key_blocks_per_row];
+                vec_dot_row_q8_0(params.query_slice, key_blocks) * params.scale
+            }
+            KvDtype::Q4_0 => {
+                let key_blocks = &params.kv_cache.keys_q4_0
+                    [key_block_start..key_block_start + key_blocks_per_row];
+                vec_dot_row_q4_0(params.query_slice, key_blocks) * params.scale
+            }
         };
         scores.push(score);
         if position + 1 < params.position_count {
             key_start += position_stride;
+            key_block_start += key_block_position_stride;
         }
     }
 
@@ -25006,6 +25034,23 @@ fn attention_context_for_head_into_with_kernels(
     let inv_score_sum = 1.0 / score_sum;
     let mut value_start = head_base;
     let is_mla = params.kv_cache.plan.value_shape[3] == 0;
+    let value_blocks_per_row = v_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
+    let mut quantized_key_value_start = params.kv_cache.quantized_head_base_offset(
+        params.layer_idx,
+        params.kv_head,
+        key_blocks_per_row,
+    );
+    let quantized_key_value_stride = params
+        .kv_cache
+        .quantized_head_position_stride(key_blocks_per_row);
+    let mut quantized_value_start = params.kv_cache.quantized_head_base_offset(
+        params.layer_idx,
+        params.kv_head,
+        value_blocks_per_row,
+    );
+    let quantized_value_stride = params
+        .kv_cache
+        .quantized_head_position_stride(value_blocks_per_row);
     for (position, score) in scores.iter().copied().enumerate() {
         let probability = score * inv_score_sum;
         match params.kv_cache.dtype {
@@ -25031,9 +25076,31 @@ fn attention_context_for_head_into_with_kernels(
                 };
                 attn_f32_dot::axpy_blocked_f16(out_slice, probability, value_slice);
             }
+            KvDtype::Q8_0 => {
+                let value_blocks = if is_mla {
+                    &params.kv_cache.keys_q8_0[quantized_key_value_start
+                        ..quantized_key_value_start + value_blocks_per_row]
+                } else {
+                    &params.kv_cache.values_q8_0
+                        [quantized_value_start..quantized_value_start + value_blocks_per_row]
+                };
+                axpy_row_q8_0(out_slice, probability, value_blocks);
+            }
+            KvDtype::Q4_0 => {
+                let value_blocks = if is_mla {
+                    &params.kv_cache.keys_q4_0[quantized_key_value_start
+                        ..quantized_key_value_start + value_blocks_per_row]
+                } else {
+                    &params.kv_cache.values_q4_0
+                        [quantized_value_start..quantized_value_start + value_blocks_per_row]
+                };
+                axpy_row_q4_0(out_slice, probability, value_blocks);
+            }
         }
         if position + 1 < params.position_count {
             value_start += position_stride;
+            quantized_key_value_start += quantized_key_value_stride;
+            quantized_value_start += quantized_value_stride;
         }
     }
 

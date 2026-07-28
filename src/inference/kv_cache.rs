@@ -4,6 +4,10 @@ use serde::Serialize;
 
 use crate::{
     model::{DenseLlamaDims, LlamaModelConfig},
+    tensor::kv_quant::{
+        dequantize_row_q4_0, dequantize_row_q8_0, quantize_row_q4_0, quantize_row_q8_0, BlockQ4_0,
+        BlockQ8_0, KV_QUANT_BLOCK_VALUES,
+    },
     BackendError, Result,
 };
 
@@ -118,6 +122,10 @@ pub struct LlamaKvCache {
     /// f16 storage (bit patterns), live only when `dtype == KvDtype::F16`.
     pub keys_f16: Vec<u16>,
     pub values_f16: Vec<u16>,
+    pub keys_q8_0: Vec<BlockQ8_0>,
+    pub values_q8_0: Vec<BlockQ8_0>,
+    pub keys_q4_0: Vec<BlockQ4_0>,
+    pub values_q4_0: Vec<BlockQ4_0>,
     pub allocated_sequence_length: usize,
     pub position: usize,
     /// Materialized-through watermark: positions `[0, materialized_through)` have had
@@ -157,6 +165,10 @@ impl PartialEq for LlamaKvCache {
             && self.values == other.values
             && self.keys_f16 == other.keys_f16
             && self.values_f16 == other.values_f16
+            && self.keys_q8_0 == other.keys_q8_0
+            && self.values_q8_0 == other.values_q8_0
+            && self.keys_q4_0 == other.keys_q4_0
+            && self.values_q4_0 == other.values_q4_0
             && self.allocated_sequence_length == other.allocated_sequence_length
             && self.position == other.position
             && self.materialized_through == other.materialized_through
@@ -204,6 +216,8 @@ fn kv_layout_head_major_enabled() -> bool {
 pub enum KvDtype {
     F32,
     F16,
+    Q8_0,
+    Q4_0,
 }
 
 /// Env gate for f16 storage, read once per cache construction. Requires the
@@ -228,7 +242,7 @@ fn kv_f16_enabled() -> bool {
 }
 
 impl LlamaKvCache {
-    pub fn new(plan: LlamaKvCachePlan) -> Result<Self> {
+    pub fn new(plan: LlamaKvCachePlan, quant: crate::model::KvCacheQuantization) -> Result<Self> {
         #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
         let (layout, dtype) = (
             if kv_layout_head_major_enabled() {
@@ -236,14 +250,27 @@ impl LlamaKvCache {
             } else {
                 KvLayout::PositionMajor
             },
-            if kv_f16_enabled() {
-                KvDtype::F16
-            } else {
-                KvDtype::F32
+            match quant {
+                crate::model::KvCacheQuantization::Q8_0 => KvDtype::Q8_0,
+                crate::model::KvCacheQuantization::Q4_0 => KvDtype::Q4_0,
+                crate::model::KvCacheQuantization::F16 => {
+                    if kv_f16_enabled() {
+                        KvDtype::F16
+                    } else {
+                        KvDtype::F32
+                    }
+                }
             },
         );
         #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
-        let (layout, dtype) = (KvLayout::PositionMajor, KvDtype::F32);
+        let (layout, dtype) = (
+            KvLayout::PositionMajor,
+            match quant {
+                crate::model::KvCacheQuantization::Q8_0 => KvDtype::Q8_0,
+                crate::model::KvCacheQuantization::Q4_0 => KvDtype::Q4_0,
+                _ => KvDtype::F32,
+            },
+        );
         Self::new_with_layout_and_dtype(plan, layout, dtype)
     }
 
@@ -267,6 +294,10 @@ impl LlamaKvCache {
             values: Vec::new(),
             keys_f16: Vec::new(),
             values_f16: Vec::new(),
+            keys_q8_0: Vec::new(),
+            values_q8_0: Vec::new(),
+            keys_q4_0: Vec::new(),
+            values_q4_0: Vec::new(),
             allocated_sequence_length: 0,
             position: 0,
             materialized_through: 0,
@@ -328,19 +359,25 @@ impl LlamaKvCache {
                 budget_bytes: self.kv_budget_bytes,
             });
         }
-        let k_elements = target_sequence_length
+        let row_count = target_sequence_length
             .checked_mul(self.plan.layer_count)
             .and_then(|value| value.checked_mul(self.plan.kv_head_count))
-            .and_then(|value| value.checked_mul(self.plan.key_shape[3]))
             .ok_or_else(|| {
-                BackendError::RuntimeShapeMismatch("KV cache element count overflow".to_string())
+                BackendError::RuntimeShapeMismatch("KV cache row count overflow".to_string())
             })?;
-        let v_elements = target_sequence_length
-            .checked_mul(self.plan.layer_count)
-            .and_then(|value| value.checked_mul(self.plan.kv_head_count))
-            .and_then(|value| value.checked_mul(self.plan.value_shape[3]))
+        let k_elements = row_count
+            .checked_mul(self.plan.key_shape[3])
             .ok_or_else(|| {
-                BackendError::RuntimeShapeMismatch("KV cache element count overflow".to_string())
+                BackendError::RuntimeShapeMismatch(
+                    "KV cache key element count overflow".to_string(),
+                )
+            })?;
+        let v_elements = row_count
+            .checked_mul(self.plan.value_shape[3])
+            .ok_or_else(|| {
+                BackendError::RuntimeShapeMismatch(
+                    "KV cache value element count overflow".to_string(),
+                )
             })?;
 
         #[allow(clippy::too_many_arguments)]
@@ -423,6 +460,30 @@ impl LlamaKvCache {
                 v_head_dim,
                 streams,
             ),
+            KvDtype::Q8_0 => grow_buffers(
+                &mut self.keys_q8_0,
+                &mut self.values_q8_0,
+                self.layout,
+                row_count * k_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES),
+                row_count * v_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES),
+                self.allocated_sequence_length,
+                target_sequence_length,
+                k_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES),
+                v_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES),
+                streams,
+            ),
+            KvDtype::Q4_0 => grow_buffers(
+                &mut self.keys_q4_0,
+                &mut self.values_q4_0,
+                self.layout,
+                row_count * k_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES),
+                row_count * v_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES),
+                self.allocated_sequence_length,
+                target_sequence_length,
+                k_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES),
+                v_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES),
+                streams,
+            ),
         }
         self.allocated_sequence_length = target_sequence_length;
         Ok(())
@@ -440,17 +501,26 @@ impl LlamaKvCache {
     }
 
     pub fn allocated_elements(&self) -> usize {
-        self.keys.len() + self.values.len() + self.keys_f16.len() + self.values_f16.len()
+        self.allocated_sequence_length
+            .saturating_mul(self.position_stride() + self.value_position_stride())
     }
 
     pub fn allocated_bytes(&self) -> u64 {
-        (self.allocated_elements() as u64) * self.element_bytes()
-    }
-
-    fn element_bytes(&self) -> u64 {
         match self.dtype {
-            KvDtype::F32 => std::mem::size_of::<f32>() as u64,
-            KvDtype::F16 => std::mem::size_of::<u16>() as u64,
+            KvDtype::F32 => {
+                ((self.keys.len() + self.values.len()) * std::mem::size_of::<f32>()) as u64
+            }
+            KvDtype::F16 => {
+                ((self.keys_f16.len() + self.values_f16.len()) * std::mem::size_of::<u16>()) as u64
+            }
+            KvDtype::Q8_0 => {
+                ((self.keys_q8_0.len() + self.values_q8_0.len()) * std::mem::size_of::<BlockQ8_0>())
+                    as u64
+            }
+            KvDtype::Q4_0 => {
+                ((self.keys_q4_0.len() + self.values_q4_0.len()) * std::mem::size_of::<BlockQ4_0>())
+                    as u64
+            }
         }
     }
 
@@ -471,8 +541,8 @@ impl LlamaKvCache {
     /// actually written — so a range this accepts may still be zero-filled for positions the
     /// GPU produced and the CPU never wrote.
     ///
-    /// Anything that READS the history (rather than merely indexing it) must therefore use
-    /// [`f32_history_materialized`](Self::f32_history_materialized) instead.
+    /// This remains as a regression-test probe for hollow resident-session buffers.
+    #[cfg(test)]
     pub(super) fn f32_history_addressable(&self, last_layer: usize, position: usize) -> bool {
         if position == 0 {
             return true;
@@ -489,29 +559,12 @@ impl LlamaKvCache {
         self.keys.len() >= end && self.values.len() >= end
     }
 
-    /// Whether `[0, position)` is both addressable AND actually written — the check any
-    /// consumer that READS the f32 history needs (GPU reseeding, resumption from CPU state).
+    /// Has `[0, position)` actually been written?
     ///
-    /// This is the strict form of [`f32_history_addressable`](Self::f32_history_addressable).
-    /// The bounds probe alone cannot tell "grown and written" from "grown and zero", and the
-    /// two become indistinguishable the moment a single CPU fallback fires mid-sequence on a
-    /// GPU-resident run: that one step grows the buffers for its own position and leaves every
-    /// earlier position zero-filled, after which the probe passes and a reseed copies a zeroed
-    /// prompt onto the GPU. The watermark is what separates them.
-    pub(super) fn f32_history_materialized(&self, last_layer: usize, position: usize) -> bool {
-        self.materialized_through >= position && self.f32_history_addressable(last_layer, position)
-    }
-
-    /// Dtype-neutral form of the same question: has `[0, position)` actually been written?
-    ///
-    /// [`f32_history_materialized`](Self::f32_history_materialized) pairs the watermark with a
-    /// bounds probe over the f32 buffers, which is right for a reader that indexes `keys` /
-    /// `values` directly (the Metal seed does) but wrong for one that goes through
-    /// [`copy_key_row_into`](Self::copy_key_row_into) / `copy_value_row_into` (the CUDA seed
-    /// does): those serve both dtypes, so on an F16 cache — where the f32 buffers are empty by
-    /// design — the probe would decline a history that is perfectly readable. The watermark
-    /// alone is the correct predicate there, and it is not weaker: it only ever advances from
-    /// `store_kv_head_row`, which cannot have written a position without capacity for it.
+    /// GPU seed paths read through [`copy_key_row_into`](Self::copy_key_row_into) and
+    /// [`copy_value_row_into`](Self::copy_value_row_into), which serve every cache dtype.
+    /// The watermark is therefore the correct predicate, and it only advances from
+    /// [`store_kv_head_row`](Self::store_kv_head_row), which cannot write without capacity.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(super) fn history_materialized(&self, position: usize) -> bool {
         self.materialized_through >= position
@@ -605,8 +658,41 @@ impl LlamaKvCache {
         }
     }
 
+    /// Block offset for a quantized row. Quantized rows are padded independently
+    /// to a block boundary, so deriving this from the logical element offset is
+    /// incorrect when a head dimension is not a multiple of 32.
+    pub(super) fn quantized_offset(
+        &self,
+        layer_idx: usize,
+        position: usize,
+        kv_head: usize,
+        blocks_per_row: usize,
+    ) -> usize {
+        match self.layout {
+            KvLayout::PositionMajor => {
+                (((position * self.plan.layer_count) + layer_idx) * self.plan.kv_head_count
+                    + kv_head)
+                    * blocks_per_row
+            }
+            KvLayout::HeadMajor => {
+                (((layer_idx * self.plan.kv_head_count) + kv_head) * self.allocated_sequence_length
+                    + position)
+                    * blocks_per_row
+            }
+        }
+    }
+
     pub(super) fn head_base_offset(&self, layer_idx: usize, kv_head: usize) -> usize {
         self.offset(layer_idx, 0, kv_head)
+    }
+
+    pub(super) fn quantized_head_base_offset(
+        &self,
+        layer_idx: usize,
+        kv_head: usize,
+        blocks_per_row: usize,
+    ) -> usize {
+        self.quantized_offset(layer_idx, 0, kv_head, blocks_per_row)
     }
 
     /// Element step between one head's consecutive positions — the stride the
@@ -616,6 +702,15 @@ impl LlamaKvCache {
         match self.layout {
             KvLayout::PositionMajor => self.position_stride(),
             KvLayout::HeadMajor => self.plan.k_head_dim,
+        }
+    }
+
+    pub(super) fn quantized_head_position_stride(&self, blocks_per_row: usize) -> usize {
+        match self.layout {
+            KvLayout::PositionMajor => {
+                self.plan.layer_count * self.plan.kv_head_count * blocks_per_row
+            }
+            KvLayout::HeadMajor => blocks_per_row,
         }
     }
 
@@ -634,8 +729,27 @@ impl LlamaKvCache {
     /// dtype, counting both the K and V buffers — the per-token cost the
     /// predict-and-abort guard projects.
     fn kv_bytes_per_token(&self) -> u64 {
-        ((self.position_stride() + self.value_position_stride()) as u64)
-            .saturating_mul(self.element_bytes())
+        let total_elements = (self.position_stride() + self.value_position_stride()) as u64;
+        match self.dtype {
+            KvDtype::F32 => total_elements * 4,
+            KvDtype::F16 => total_elements * 2,
+            KvDtype::Q8_0 => {
+                let blocks_per_stream = self.plan.k_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES)
+                    + self.plan.v_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
+                (self.plan.layer_count
+                    * self.plan.kv_head_count
+                    * blocks_per_stream
+                    * std::mem::size_of::<BlockQ8_0>()) as u64
+            }
+            KvDtype::Q4_0 => {
+                let blocks_per_stream = self.plan.k_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES)
+                    + self.plan.v_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
+                (self.plan.layer_count
+                    * self.plan.kv_head_count
+                    * blocks_per_stream
+                    * std::mem::size_of::<BlockQ4_0>()) as u64
+            }
+        }
     }
 
     /// THE canonical KV store: one (layer, position, kv_head) row of K and V,
@@ -688,6 +802,34 @@ impl LlamaKvCache {
                     );
                 }
             }
+            KvDtype::Q8_0 => {
+                let key_blocks = k_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
+                let key_dst = self.quantized_offset(layer_idx, position, kv_head, key_blocks);
+                quantize_row_q8_0(key_row, &mut self.keys_q8_0[key_dst..key_dst + key_blocks]);
+                if v_dim > 0 {
+                    let value_blocks = v_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
+                    let value_dst =
+                        self.quantized_offset(layer_idx, position, kv_head, value_blocks);
+                    quantize_row_q8_0(
+                        value_row,
+                        &mut self.values_q8_0[value_dst..value_dst + value_blocks],
+                    );
+                }
+            }
+            KvDtype::Q4_0 => {
+                let key_blocks = k_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
+                let key_dst = self.quantized_offset(layer_idx, position, kv_head, key_blocks);
+                quantize_row_q4_0(key_row, &mut self.keys_q4_0[key_dst..key_dst + key_blocks]);
+                if v_dim > 0 {
+                    let value_blocks = v_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
+                    let value_dst =
+                        self.quantized_offset(layer_idx, position, kv_head, value_blocks);
+                    quantize_row_q4_0(
+                        value_row,
+                        &mut self.values_q4_0[value_dst..value_dst + value_blocks],
+                    );
+                }
+            }
         }
     }
 
@@ -710,6 +852,16 @@ impl LlamaKvCache {
                 for (slot, &bits) in out.iter_mut().zip(&self.keys_f16[src..src + k_head_dim]) {
                     *slot = super::kv_f16::f16_to_f32_kv(bits);
                 }
+            }
+            KvDtype::Q8_0 => {
+                let block_count = k_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
+                let block_src = self.quantized_offset(layer_idx, position, kv_head, block_count);
+                dequantize_row_q8_0(&self.keys_q8_0[block_src..block_src + block_count], out);
+            }
+            KvDtype::Q4_0 => {
+                let block_count = k_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
+                let block_src = self.quantized_offset(layer_idx, position, kv_head, block_count);
+                dequantize_row_q4_0(&self.keys_q4_0[block_src..block_src + block_count], out);
             }
         }
     }
@@ -747,6 +899,36 @@ impl LlamaKvCache {
                 for (slot, &bits) in out.iter_mut().zip(src_slice) {
                     *slot = super::kv_f16::f16_to_f32_kv(bits);
                 }
+            }
+            KvDtype::Q8_0 => {
+                let blocks = if is_mla {
+                    let key_block_count = k_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
+                    let block_src =
+                        self.quantized_offset(layer_idx, position, kv_head, key_block_count);
+                    &self.keys_q8_0
+                        [block_src..block_src + v_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES)]
+                } else {
+                    let block_count = v_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
+                    let block_src =
+                        self.quantized_offset(layer_idx, position, kv_head, block_count);
+                    &self.values_q8_0[block_src..block_src + block_count]
+                };
+                dequantize_row_q8_0(blocks, out);
+            }
+            KvDtype::Q4_0 => {
+                let blocks = if is_mla {
+                    let key_block_count = k_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
+                    let block_src =
+                        self.quantized_offset(layer_idx, position, kv_head, key_block_count);
+                    &self.keys_q4_0
+                        [block_src..block_src + v_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES)]
+                } else {
+                    let block_count = v_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
+                    let block_src =
+                        self.quantized_offset(layer_idx, position, kv_head, block_count);
+                    &self.values_q4_0[block_src..block_src + block_count]
+                };
+                dequantize_row_q4_0(blocks, out);
             }
         }
     }
@@ -838,10 +1020,18 @@ mod tests {
     fn kv_bytes_per_token_counts_k_and_v_f32() {
         // Llama 3.2 3B shape: 28 layers * 8 kv-heads * 128 head_dim = 28672 stride;
         // *2 (K+V) *4 (f32) = 229376 bytes/token.
-        let cache = LlamaKvCache::new(plan_with(131072, 28, 8, 128)).unwrap();
+        let cache = LlamaKvCache::new(
+            plan_with(131072, 28, 8, 128),
+            crate::model::KvCacheQuantization::F16,
+        )
+        .unwrap();
         assert_eq!(cache.kv_bytes_per_token(), 229_376);
         // TinyLlama shape: 22 * 4 * 64 = 5632 stride; *8 = 45056 bytes/token.
-        let cache = LlamaKvCache::new(plan_with(2048, 22, 4, 64)).unwrap();
+        let cache = LlamaKvCache::new(
+            plan_with(2048, 22, 4, 64),
+            crate::model::KvCacheQuantization::F16,
+        )
+        .unwrap();
         assert_eq!(cache.kv_bytes_per_token(), 45_056);
     }
 
@@ -849,7 +1039,11 @@ mod tests {
     fn predict_and_abort_refuses_over_budget_before_allocating() {
         // max_seq < 512 => grow_tokens == 1, so target == required (no chunk rounding) —
         // deterministic regardless of CAMELID_KV_CACHE_GROW_TOKENS.
-        let mut cache = LlamaKvCache::new(plan_with(400, 16, 8, 64)).unwrap();
+        let mut cache = LlamaKvCache::new(
+            plan_with(400, 16, 8, 64),
+            crate::model::KvCacheQuantization::F16,
+        )
+        .unwrap();
         let per_token = cache.kv_bytes_per_token(); // 16*8*64*8 = 65536
         cache.kv_budget_bytes = 100 * per_token; // budget for exactly 100 tokens
                                                  // At budget: allowed, allocates exactly 100.
@@ -875,7 +1069,11 @@ mod tests {
 
     #[test]
     fn unbounded_budget_allows_normal_growth() {
-        let mut cache = LlamaKvCache::new(plan_with(4096, 16, 8, 64)).unwrap();
+        let mut cache = LlamaKvCache::new(
+            plan_with(4096, 16, 8, 64),
+            crate::model::KvCacheQuantization::F16,
+        )
+        .unwrap();
         cache.kv_budget_bytes = u64::MAX;
         assert!(cache.ensure_position_capacity(2048).is_ok());
         assert!(cache.allocated_sequence_length >= 2048);
@@ -959,11 +1157,101 @@ mod tests {
 
     #[test]
     fn budget_excluded_from_state_equality() {
-        let mut a = LlamaKvCache::new(plan_with(2048, 22, 4, 64)).unwrap();
-        let mut b = LlamaKvCache::new(plan_with(2048, 22, 4, 64)).unwrap();
+        let mut a = LlamaKvCache::new(
+            plan_with(2048, 22, 4, 64),
+            crate::model::KvCacheQuantization::F16,
+        )
+        .unwrap();
+        let mut b = LlamaKvCache::new(
+            plan_with(2048, 22, 4, 64),
+            crate::model::KvCacheQuantization::F16,
+        )
+        .unwrap();
         a.kv_budget_bytes = 1 << 20;
         b.kv_budget_bytes = 1 << 40;
         // Different host budgets, identical state -> still equal.
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn quantized_cache_byte_accounting_includes_per_row_padding() {
+        let plan = plan_with(100, 2, 3, 33);
+        for (dtype, expected_per_token) in [(KvDtype::Q8_0, 816), (KvDtype::Q4_0, 432)] {
+            let mut cache = LlamaKvCache::new_with_layout_and_dtype(
+                plan.clone(),
+                KvLayout::PositionMajor,
+                dtype,
+            )
+            .unwrap();
+            assert_eq!(cache.kv_bytes_per_token(), expected_per_token);
+            cache.kv_budget_bytes = expected_per_token;
+            cache.ensure_position_capacity(1).unwrap();
+            assert_eq!(cache.allocated_bytes(), expected_per_token);
+            assert_eq!(cache.allocated_elements(), 2 * 3 * 33 * 2);
+
+            let error = cache.ensure_position_capacity(2).unwrap_err();
+            assert!(matches!(error, BackendError::KvCacheBudgetExceeded { .. }));
+            assert_eq!(cache.allocated_sequence_length, 1);
+        }
+    }
+
+    #[test]
+    fn quantized_cache_preserves_tail_rows_across_layout_growth() {
+        let plan = plan_with(600, 2, 2, 40);
+        for dtype in [KvDtype::Q8_0, KvDtype::Q4_0] {
+            for layout in [KvLayout::PositionMajor, KvLayout::HeadMajor] {
+                let mut cache =
+                    LlamaKvCache::new_with_layout_and_dtype(plan.clone(), layout, dtype).unwrap();
+                cache.kv_budget_bytes = u64::MAX;
+                cache.ensure_position_capacity(1).unwrap();
+
+                let key: Vec<f32> = (0..40).map(|i| (i as f32 - 17.0) * 0.125).collect();
+                let value: Vec<f32> = (0..40).map(|i| (11.0 - i as f32) * 0.0625).collect();
+                cache.store_kv_head_row(1, 0, 1, &key, &value);
+
+                // Crossing the 256-position growth boundary re-lays head-major
+                // storage and must preserve every padded quantized row.
+                cache.ensure_position_capacity(257).unwrap();
+                let mut actual_key = vec![0.0; 40];
+                let mut actual_value = vec![0.0; 40];
+                cache.copy_key_row_into(1, 0, 1, &mut actual_key);
+                cache.copy_value_row_into(1, 0, 1, &mut actual_value);
+
+                let tolerance = if dtype == KvDtype::Q8_0 { 0.02 } else { 0.2 };
+                for (index, (actual, expected)) in actual_key.iter().zip(&key).enumerate() {
+                    assert!(
+                        (actual - expected).abs() <= tolerance,
+                        "{dtype:?}/{layout:?} key tail mismatch at {index}: {actual} vs {expected}"
+                    );
+                }
+                for (index, (actual, expected)) in actual_value.iter().zip(&value).enumerate() {
+                    assert!(
+                        (actual - expected).abs() <= tolerance,
+                        "{dtype:?}/{layout:?} value tail mismatch at {index}: {actual} vs {expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quantized_storage_participates_in_cache_equality() {
+        for dtype in [KvDtype::Q8_0, KvDtype::Q4_0] {
+            let mut cache = LlamaKvCache::new_with_layout_and_dtype(
+                plan_with(1, 1, 1, 32),
+                KvLayout::PositionMajor,
+                dtype,
+            )
+            .unwrap();
+            cache.ensure_position_capacity(1).unwrap();
+            cache.store_kv_head_row(0, 0, 0, &[1.0; 32], &[2.0; 32]);
+            let mut different = cache.clone();
+            match dtype {
+                KvDtype::Q8_0 => different.keys_q8_0[0].qs[0] ^= 1,
+                KvDtype::Q4_0 => different.keys_q4_0[0].qs[0] ^= 1,
+                _ => unreachable!(),
+            }
+            assert_ne!(cache, different);
+        }
     }
 }

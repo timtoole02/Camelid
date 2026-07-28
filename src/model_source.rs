@@ -94,6 +94,10 @@ impl HfLlamaConfigSummary {
             feed_forward_length: self.intermediate_size,
             attention_head_count: self.num_attention_heads,
             attention_head_count_kv: self.num_key_value_heads,
+            kv_quant: std::env::var("CAMELID_KV_QUANT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_default(),
             // LLaMA rotates the full per-head dimension.
             rope_dimension_count: Some(head_dim),
             rope_freq_base: Some(self.rope_theta),

@@ -18523,6 +18523,7 @@ mod tests {
             feed_forward_length: 6,
             attention_head_count: 2,
             attention_head_count_kv: 1,
+            kv_quant: crate::model::KvCacheQuantization::F16,
             rope_dimension_count: Some(2),
             rope_freq_base: Some(10_000.0),
             rope_scaling_type: None,

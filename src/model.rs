@@ -1,5 +1,7 @@
 use serde::Serialize;
 
+pub use crate::tensor::kv_quant::KvCacheQuantization;
+
 use crate::{
     gguf::{GgufFile, GgufTensorDescriptor},
     BackendError, Result,
@@ -13,6 +15,7 @@ pub struct LlamaModelConfig {
     pub feed_forward_length: u32,
     pub attention_head_count: u32,
     pub attention_head_count_kv: u32,
+    pub kv_quant: KvCacheQuantization,
     pub rope_dimension_count: Option<u32>,
     pub rope_freq_base: Option<f32>,
     pub rope_scaling_type: Option<String>,
@@ -166,6 +169,10 @@ impl LlamaModelConfig {
             feed_forward_length,
             attention_head_count,
             attention_head_count_kv,
+            kv_quant: std::env::var("CAMELID_KV_QUANT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_default(),
             rope_dimension_count: gguf
                 .metadata_u32(&architecture_key(architecture, "rope.dimension_count")),
             rope_freq_base: gguf.metadata_f32(&architecture_key(architecture, "rope.freq_base")),

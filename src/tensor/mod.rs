@@ -29,6 +29,7 @@ use crate::{
     BackendError, Result,
 };
 
+pub mod kv_quant;
 pub mod wire_dequant;
 
 #[cfg(target_os = "macos")]

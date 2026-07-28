@@ -1358,6 +1358,7 @@ fn prefill_layer_major_scoped_q8_cache_reuses_file_reads_across_chunks() {
         feed_forward_length: 32,
         attention_head_count: 1,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(32),
         rope_freq_base: Some(10_000.0),
         rope_scaling_type: None,
@@ -1467,6 +1468,7 @@ fn tiny_kv_budget_session(context_length: u32) -> (LlamaInferenceSession, tempfi
         feed_forward_length: 32,
         attention_head_count: 1,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(32),
         rope_freq_base: Some(10_000.0),
         rope_scaling_type: None,
@@ -8533,6 +8535,7 @@ fn applies_rope_to_each_attention_head() {
         feed_forward_length: 8,
         attention_head_count: 2,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(2),
         rope_freq_base: Some(10_000.0),
         rope_scaling_type: None,
@@ -8575,6 +8578,7 @@ fn apply_rope_uses_configured_frequency_base() {
         feed_forward_length: 8,
         attention_head_count: 1,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(4),
         rope_freq_base: Some(500_000.0),
         rope_scaling_type: None,
@@ -8627,6 +8631,7 @@ fn apply_rope_uses_llama3_frequency_scaling_metadata() {
         feed_forward_length: 8,
         attention_head_count: 1,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(4),
         rope_freq_base: Some(10_000.0),
         rope_scaling_type: Some("llama3".to_string()),
@@ -8683,6 +8688,7 @@ fn apply_rope_uses_gguf_rope_frequency_factors() {
         feed_forward_length: 8,
         attention_head_count: 1,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(4),
         rope_freq_base: Some(10_000.0),
         rope_scaling_type: None,
@@ -8746,6 +8752,7 @@ fn rope_diagnostics_reconstruct_reported_rotation() {
         feed_forward_length: 8,
         attention_head_count: 2,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(2),
         rope_freq_base: Some(10_000.0),
         rope_scaling_type: None,
@@ -8814,6 +8821,7 @@ fn split_half_rope_pairing_is_available_for_diagnostics() {
         feed_forward_length: 8,
         attention_head_count: 1,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(4),
         rope_freq_base: Some(10_000.0),
         rope_scaling_type: None,
@@ -8896,6 +8904,7 @@ fn inverse_rope_direction_is_available_for_diagnostics() {
         feed_forward_length: 8,
         attention_head_count: 1,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(2),
         rope_freq_base: Some(10_000.0),
         rope_scaling_type: None,
@@ -8977,6 +8986,7 @@ fn one_based_rope_position_mode_is_available_for_diagnostics() {
         feed_forward_length: 8,
         attention_head_count: 1,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(2),
         rope_freq_base: Some(10_000.0),
         rope_scaling_type: None,
@@ -10594,6 +10604,7 @@ fn single_token_forward_diagnostics_follow_llama_stage_order() {
         feed_forward_length: 2,
         attention_head_count: 1,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(2),
         rope_freq_base: Some(10_000.0),
         rope_scaling_type: None,
@@ -10883,6 +10894,7 @@ fn chunked_prefill_matches_sequential_prefill_outputs_and_cache() {
         feed_forward_length: 2,
         attention_head_count: 1,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(2),
         rope_freq_base: Some(10_000.0),
         rope_scaling_type: None,
@@ -11112,6 +11124,7 @@ fn prefill_layer_rejects_misaligned_kv_cache_cursor() {
         feed_forward_length: 2,
         attention_head_count: 1,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(2),
         rope_freq_base: Some(10_000.0),
         rope_scaling_type: None,
@@ -11189,7 +11202,7 @@ fn prefill_layer_rejects_misaligned_kv_cache_cursor() {
     };
     let hidden = CpuTensor::from_f32("hidden", vec![2, 2], vec![0.1, 0.2, 0.3, 0.4]).unwrap();
     let plan = LlamaKvCachePlan::from_config(&config).unwrap();
-    let mut kv_cache = LlamaKvCache::new(plan).unwrap();
+    let mut kv_cache = LlamaKvCache::new(plan, crate::model::KvCacheQuantization::F16).unwrap();
     kv_cache.position = 1;
 
     let err = forward_prefill_layer_chunk_timed(
@@ -11225,6 +11238,7 @@ fn batch_attention_rejects_reads_beyond_allocated_kv_cache() {
         feed_forward_length: 2,
         attention_head_count: 1,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(2),
         rope_freq_base: Some(10_000.0),
         rope_scaling_type: None,
@@ -11243,7 +11257,11 @@ fn batch_attention_rejects_reads_beyond_allocated_kv_cache() {
         qwen35: None,
         mla: None,
     };
-    let kv_cache = LlamaKvCache::new(LlamaKvCachePlan::from_config(&config).unwrap()).unwrap();
+    let kv_cache = LlamaKvCache::new(
+        LlamaKvCachePlan::from_config(&config).unwrap(),
+        crate::model::KvCacheQuantization::F16,
+    )
+    .unwrap();
     let query = CpuTensor::from_f32("query", vec![1, 2], vec![0.1, 0.2]).unwrap();
 
     let err = causal_attention_context_batch(&kv_cache, 0, 0, &query, 1, 1, "context").unwrap_err();
@@ -11274,7 +11292,8 @@ fn batch_attention_parallel_context_matches_serial() {
         key_shape: vec![1, rows, kv_heads, head_dim],
         value_shape: vec![1, rows, kv_heads, head_dim],
     };
-    let mut kv_cache = LlamaKvCache::new(plan).expect("KV cache");
+    let mut kv_cache =
+        LlamaKvCache::new(plan, crate::model::KvCacheQuantization::F16).expect("KV cache");
     let key_data: Vec<f32> = (0..rows * kv_width)
         .map(|idx| ((idx % 11) as f32 - 5.0) * 0.125)
         .collect();
@@ -11372,6 +11391,7 @@ fn zero_prefill_chunk_env_falls_back_without_panicking() {
         feed_forward_length: 2,
         attention_head_count: 1,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(2),
         rope_freq_base: Some(10_000.0),
         rope_scaling_type: None,
@@ -11503,7 +11523,8 @@ fn kv_cache_allocates_positions_lazily_without_losing_prior_layers() {
         key_shape: vec![2, 10, 1, 2],
         value_shape: vec![2, 10, 1, 2],
     };
-    let mut kv_cache = LlamaKvCache::new(plan).expect("KV cache");
+    let mut kv_cache =
+        LlamaKvCache::new(plan, crate::model::KvCacheQuantization::F16).expect("KV cache");
     assert_eq!(kv_cache.allocated_sequence_length, 0);
     assert!(kv_cache.keys.is_empty());
     assert!(kv_cache.values.is_empty());
@@ -11552,7 +11573,8 @@ fn kv_cache_uses_paged_growth_for_model_sized_contexts() {
         key_shape: vec![2, 1024, 1, 2],
         value_shape: vec![2, 1024, 1, 2],
     };
-    let mut kv_cache = LlamaKvCache::new(plan).expect("KV cache");
+    let mut kv_cache =
+        LlamaKvCache::new(plan, crate::model::KvCacheQuantization::F16).expect("KV cache");
     let key = CpuTensor::from_f32("key", vec![1, 2], vec![1.0, 2.0]).unwrap();
     let value = CpuTensor::from_f32("value", vec![1, 2], vec![3.0, 4.0]).unwrap();
 
@@ -11575,7 +11597,8 @@ fn kv_cache_storage_matches_llama_cpp_f16_rounding() {
         key_shape: vec![1, 1, 1, 2],
         value_shape: vec![1, 1, 1, 2],
     };
-    let mut kv_cache = LlamaKvCache::new(plan).expect("KV cache");
+    let mut kv_cache =
+        LlamaKvCache::new(plan, crate::model::KvCacheQuantization::F16).expect("KV cache");
     let key = CpuTensor::from_f32("key", vec![1, 2], vec![1.0001, -2.0003]).unwrap();
     let value = CpuTensor::from_f32("value", vec![1, 2], vec![3.0007, -4.0009]).unwrap();
 
@@ -11603,6 +11626,79 @@ fn kv_cache_storage_matches_llama_cpp_f16_rounding() {
 }
 
 #[test]
+fn quantized_attention_matches_its_dequantized_cache_for_tail_rows() {
+    let _env_guard = env_lock();
+    std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
+    std::env::remove_var("CAMELID_GQA_HEAD_MAPPING");
+
+    let head_dim = 40;
+    let plan = LlamaKvCachePlan {
+        max_sequence_length: 3,
+        layer_count: 1,
+        kv_head_count: 1,
+        head_dim,
+        k_head_dim: head_dim,
+        v_head_dim: head_dim,
+        key_shape: vec![1, 3, 1, head_dim],
+        value_shape: vec![1, 3, 1, head_dim],
+    };
+    let query_data: Vec<f32> = (0..head_dim)
+        .map(|index| (index as f32 - 13.0) * 0.03125)
+        .collect();
+    let query = CpuTensor::from_f32("query", vec![1, head_dim], query_data.clone()).unwrap();
+
+    for dtype in [KvDtype::Q8_0, KvDtype::Q4_0] {
+        for layout in [KvLayout::PositionMajor, KvLayout::HeadMajor] {
+            let mut cache =
+                LlamaKvCache::new_with_layout_and_dtype(plan.clone(), layout, dtype).unwrap();
+            cache.ensure_position_capacity(3).unwrap();
+            for position in 0..3 {
+                let key: Vec<f32> = (0..head_dim)
+                    .map(|index| (index as f32 - 17.0) * 0.025 + position as f32 * 0.0625)
+                    .collect();
+                let value: Vec<f32> = (0..head_dim)
+                    .map(|index| (9.0 - index as f32) * 0.04 + position as f32 * 0.125)
+                    .collect();
+                cache.store_kv_head_row(0, position, 0, &key, &value);
+            }
+            cache.position = 2;
+
+            let actual = causal_attention_context(&cache, 0, &query, 1, 1, "context", false)
+                .unwrap()
+                .tensor;
+
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            let mut scores = Vec::new();
+            let mut values = Vec::new();
+            for position in 0..3 {
+                let mut key = vec![0.0; head_dim];
+                let mut value = vec![0.0; head_dim];
+                cache.copy_key_row_into(0, position, 0, &mut key);
+                cache.copy_value_row_into(0, position, 0, &mut value);
+                scores.push(dot_product(&query_data, &key) * scale);
+                values.push(value);
+            }
+            let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let denominator: f32 = scores.iter().map(|score| (score - max_score).exp()).sum();
+            let mut expected = vec![0.0; head_dim];
+            for (score, value) in scores.iter().zip(values) {
+                let probability = (*score - max_score).exp() / denominator;
+                for (out, value) in expected.iter_mut().zip(value) {
+                    *out += probability * value;
+                }
+            }
+
+            for (index, (actual, expected)) in actual.data.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    (actual - expected).abs() < 1e-5,
+                    "{dtype:?}/{layout:?} attention mismatch at {index}: {actual} vs {expected}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn causal_attention_context_attends_over_prior_and_current_positions() {
     let _env_guard = env_lock();
     std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
@@ -11618,7 +11714,8 @@ fn causal_attention_context_attends_over_prior_and_current_positions() {
         key_shape: vec![1, 3, 1, 2],
         value_shape: vec![1, 3, 1, 2],
     };
-    let mut kv_cache = LlamaKvCache::new(plan).expect("KV cache");
+    let mut kv_cache =
+        LlamaKvCache::new(plan, crate::model::KvCacheQuantization::F16).expect("KV cache");
 
     let prior_key = CpuTensor::from_f32("prior_key", vec![1, 2], vec![1.0, 0.0]).unwrap();
     let prior_value = CpuTensor::from_f32("prior_value", vec![1, 2], vec![10.0, 0.0]).unwrap();
@@ -11716,7 +11813,8 @@ fn causal_attention_context_repeats_grouped_kv_heads_for_single_position() {
         key_shape: vec![1, 1, 2, 2],
         value_shape: vec![1, 1, 2, 2],
     };
-    let mut kv_cache = LlamaKvCache::new(plan).expect("KV cache");
+    let mut kv_cache =
+        LlamaKvCache::new(plan, crate::model::KvCacheQuantization::F16).expect("KV cache");
 
     let key = CpuTensor::from_f32("key", vec![1, 4], vec![1.0, 0.0, 0.0, 1.0]).unwrap();
     let value = CpuTensor::from_f32("value", vec![1, 4], vec![10.0, 11.0, 20.0, 21.0]).unwrap();
@@ -11776,7 +11874,8 @@ fn causal_attention_context_repeats_grouped_kv_heads_across_positions() {
         key_shape: vec![1, 2, 2, 2],
         value_shape: vec![1, 2, 2, 2],
     };
-    let mut kv_cache = LlamaKvCache::new(plan).expect("KV cache");
+    let mut kv_cache =
+        LlamaKvCache::new(plan, crate::model::KvCacheQuantization::F16).expect("KV cache");
 
     let prior_key = CpuTensor::from_f32("prior_key", vec![1, 4], vec![1.0, 0.0, 0.0, 1.0]).unwrap();
     let prior_value =
@@ -11860,7 +11959,8 @@ fn attention_trace_reports_top_probability_positions_outside_edge_samples() {
         key_shape: vec![1, 10, 1, 2],
         value_shape: vec![1, 10, 1, 2],
     };
-    let mut kv_cache = LlamaKvCache::new(plan).expect("KV cache");
+    let mut kv_cache =
+        LlamaKvCache::new(plan, crate::model::KvCacheQuantization::F16).expect("KV cache");
 
     for position in 0..10 {
         kv_cache.position = position;
@@ -12162,6 +12262,7 @@ fn resident_prefill_rope_tables_match_per_position_builder() {
         feed_forward_length: 16,
         attention_head_count: 2,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(8),
         rope_freq_base: Some(500_000.0),
         rope_scaling_type: Some("llama3".to_string()),
@@ -13044,7 +13145,8 @@ fn decode_attention_parallel_lane_is_bitwise_identical_to_serial() {
                     key_shape: vec![1, position_count, kv_heads, head_dim],
                     value_shape: vec![1, position_count, kv_heads, head_dim],
                 };
-                let mut kv_cache = LlamaKvCache::new(plan).expect("kv cache");
+                let mut kv_cache = LlamaKvCache::new(plan, crate::model::KvCacheQuantization::F16)
+                    .expect("kv cache");
                 let kv_len = position_count * kv_heads * head_dim;
                 kv_cache.keys = rng.fill(kv_len);
                 kv_cache.values = rng.fill(kv_len);
