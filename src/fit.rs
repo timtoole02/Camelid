@@ -149,10 +149,10 @@ impl FitInputs {
 /// total)` formula as the KV-cache budget in `kv_cache.rs`, but is an independent
 /// reimplementation, not the same guard. Two intentional differences:
 ///
-/// - Source: the advisor reads [`HardwareProfile`] RAM (probed on Windows and Linux;
-///   `(0, 0)` / unknown on macOS), whereas the KV guard reads `gait::host_ram_status`
-///   (probed on Windows and macOS; unprobed on Linux). So on Linux the advisor
-///   enforces a budget while the KV guard is unbounded; on macOS it is the reverse.
+/// - Source: the advisor reads [`HardwareProfile`] RAM (probed on Windows, Linux,
+///   and macOS), whereas the KV guard reads `gait::host_ram_status` (probed on
+///   Windows and macOS; unprobed on Linux). On Linux the advisor enforces a budget
+///   while the KV guard is unbounded.
 /// - Unprobed RAM: the KV guard fails *open* (unbounded); the advisor abstains here
 ///   with `None` (surfaced as [`FitVerdict::Unknown`]) rather than assert a capacity
 ///   it cannot measure.
@@ -566,7 +566,7 @@ mod tests {
 
     #[test]
     fn unknown_when_ram_unprobed_and_no_gpu() {
-        // macOS-style: RAM probe returns 0 and no CUDA. No honest claim possible.
+        // An unprobed host with no CUDA has no capacity signal. No honest claim possible.
         let hw = profile(false, 0, 0, 0);
         let m = inputs(3_421_898_816, 256 * MIB);
         assert_eq!(assess_with_headroom(&hw, &m, H), FitVerdict::Unknown);

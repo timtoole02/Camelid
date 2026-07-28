@@ -42,7 +42,9 @@ ready to use.
 > roughly 1–8 GB each. Give yourself some free disk space and a few minutes for the first model
 > to download.
 
-### Option A — Windows desktop app (easiest)
+### Option A — Desktop app (easiest)
+
+#### Windows
 
 1. Download the signed installer from the [latest release][latest-release]:
    - `Camelid.Desktop_<version>_x64-setup.exe` — signed installer; installs per-user, no admin rights.
@@ -53,6 +55,29 @@ ready to use.
   engine as everything below. Windows CUDA evidence is limited to the exact rows and recorded GPU,
   driver, and CUDA versions in [COMPATIBILITY.md](COMPATIBILITY.md); it makes no general
   token-parity or throughput claim.
+
+#### macOS Apple Silicon — command-line install
+
+The macOS desktop app currently uses an ad-hoc signature and is **not notarized**. Until a
+notarized release is available, the simplest honest installation path is to build the current
+source and install it from Terminal. It requires macOS 12 or newer on Apple Silicon, the Xcode
+Command Line Tools, [Rust](https://rustup.rs/), and Node.js 22 with npm.
+
+```bash
+git clone https://github.com/timtoole02/Camelid.git
+cd Camelid
+./scripts/install-macos-desktop.sh
+```
+
+The install script builds the web UI and Metal-enabled engine, creates an ad-hoc-signed app,
+installs it as `/Applications/Camelid Desktop.app`, and launches it. If `/Applications` requires
+administrator access, macOS asks for your password through `sudo`. To update later, run
+`git pull` followed by `./scripts/install-macos-desktop.sh` again.
+
+Downloaded models live in
+`~/Library/Application Support/app.camelid.desktop/models` and are preserved when the app is
+rebuilt or reinstalled. See [Camelid Desktop](camelid-desktop/README.md) for the sidecar design
+and manual packaging details.
 
 ### Option B — Prebuilt engine (Windows, macOS, or Linux)
 
@@ -172,7 +197,7 @@ Every interface talks to the same local engine — pick whichever fits your work
 
 | Interface | How to start it | Best for |
 |---|---|---|
-| **Desktop app** | Install `Camelid.Desktop_<version>_x64-setup.exe` (Windows) | A one-click, no-terminal setup |
+| **Desktop app** | Windows installer, or `./scripts/install-macos-desktop.sh` on Apple Silicon | A native app with the engine bundled as a local sidecar |
 | **Browser chat** | `camelid serve --model <gguf>` opens the web UI automatically | Everyday chatting in a familiar UI |
 | **Terminal UI** | `camelid chat` — full-screen; `--plain` for a line REPL over SSH | Working entirely in the shell |
 | **HTTP API** | OpenAI-style `/v1/*`, served alongside the UI on the same port | Wiring Camelid into your own apps |
@@ -331,7 +356,7 @@ Camelid ships for three platforms today.
 | Platform | Distribution | Acceleration |
 |---|---|---|
 | Windows x86_64 | Desktop installer, portable desktop ZIP, engine ZIP | Experimental CUDA on named exact rows and recorded NVIDIA configurations; CPU fallback |
-| macOS Apple Silicon | Engine archive (`.tar.gz`) | Metal and CPU |
+| macOS Apple Silicon | Source-installed desktop app (ad-hoc signed), engine archive (`.tar.gz`) | Metal and CPU |
 | Linux x86_64 | Engine archive (`.tar.gz`) | NVIDIA CUDA compiled in by default; CPU fallback |
 
 CUDA is compiled into the default build on Windows and x86_64 Linux. On Windows, the GPU path is

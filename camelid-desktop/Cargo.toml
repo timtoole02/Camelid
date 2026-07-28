@@ -3,10 +3,10 @@ name = "camelid-desktop"
 version = "0.4.4"
 edition = "2021"
 rust-version = "1.89"
-description = "Camelid Desktop — additive native Windows chat app that embeds the camelid engine as a loopback sidecar"
+description = "Camelid Desktop — native chat app that embeds the Camelid engine as a loopback sidecar"
 license = "MIT"
 repository = "https://github.com/timtoole02/Camelid"
-# Never published to crates.io; it is shipped only as a bundled Windows artifact.
+# Never published to crates.io; it is shipped only as a bundled desktop artifact.
 publish = false
 
 [[bin]]
@@ -14,11 +14,11 @@ name = "camelid-desktop"
 path = "src/main.rs"
 
 [build-dependencies]
-# Embeds the splash assets + Windows icon resource and validates tauri.conf.json.
+# Embeds the splash assets and platform icon resources, and validates tauri.conf.json.
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-# WebView2-hosted shell. No extra features for v1: the window simply navigates to the
+# Native-webview shell. No extra features for v1: the window simply navigates to the
 # sidecar's already-embedded UI, so we need neither the HTTP plugin nor remote IPC.
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }

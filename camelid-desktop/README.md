@@ -1,9 +1,9 @@
-# Camelid Desktop (add-on, Windows)
+# Camelid Desktop (add-on, Windows and macOS)
 
-**Camelid Desktop is an additive native Windows app.** It gives users a desktop chat
+**Camelid Desktop is an additive native app.** It gives users a desktop chat
 experience with no web browser, by embedding the **same `camelid` engine** that ships as the
-server binary and hosting the existing web UI in a native [WebView2](https://developer.microsoft.com/microsoft-edge/webview2/)
-window via [Tauri v2](https://v2.tauri.app/).
+server binary and hosting the existing web UI in a native WebView2 window on Windows or
+WebKit window on macOS via [Tauri v2](https://v2.tauri.app/).
 
 It is an add-on only. It does **not** modify, gate, or relax any existing support claim,
 parity contract, or the `camelid` server binary. **The web path remains the canonical path.**
@@ -34,17 +34,17 @@ performance, or compatibility.
 ## Architecture (sidecar; see `../DECISIONS.md` D11)
 
 ```
-camelid-desktop.exe ──spawns──▶ camelid.exe serve --addr 127.0.0.1:<ephemeral> --no-open
+camelid-desktop ──spawns──▶ camelid serve --addr 127.0.0.1:<ephemeral> --no-open
         │                                  │  (loopback only)
         │  poll /v1/health (backoff)       │
         ▼                                  ▼
-   WebView2 window  ──navigates to──▶  http://127.0.0.1:<ephemeral>/
+   Native webview   ──navigates to──▶  http://127.0.0.1:<ephemeral>/
    (splash first)                      (UI + API are same-origin; the engine serves the
                                         embedded React UI from its `*` fallback route)
 ```
 
-On window close the sidecar is terminated cleanly; a Windows **job object** with
-`KILL_ON_JOB_CLOSE` is the backstop so a desktop crash cannot orphan a `camelid` process.
+On window close the sidecar is terminated cleanly. On Windows, a **job object** with
+`KILL_ON_JOB_CLOSE` also prevents a desktop crash from orphaning a `camelid` process.
 
 ## Startup failures
 
@@ -56,7 +56,7 @@ error and captured stderr under **Technical details**; it never navigates to a f
 
 | Splash error | Meaning | Next step |
 | --- | --- | --- |
-| **Camelid engine is missing** | `camelid.exe` was not found beside the desktop executable, in the bundled sidecar resources, or on `PATH`. | Reinstall Camelid Desktop or restore `camelid.exe` beside `camelid-desktop.exe`, then retry. |
+| **Camelid engine is missing** | The platform engine was not found beside the desktop executable, in the bundled sidecar resources, or on `PATH`. | Reinstall Camelid Desktop or restore its bundled Camelid engine, then retry. |
 | **Sidecar port unavailable** | The engine reported that it could not bind Camelid's selected ephemeral loopback port. This is not a fixed `8181` port conflict. | Close the conflicting local process and retry. |
 | **Engine startup timed out** | The sidecar did not pass the 40-second `/v1/health` gate. | Retry, then use the visible technical details to diagnose a persistent failure. |
 | **Engine startup failed** | The sidecar exited before it became healthy for another reason. | Review the visible technical details and retry. |
@@ -68,9 +68,29 @@ on the splash.
 
 ## Requirements
 
-- Windows 10/11 with the **WebView2 runtime** (preinstalled on current Windows 10/11; the
+- **Windows:** Windows 10/11 with the **WebView2 runtime** (preinstalled on current Windows 10/11; the
   Tauri bundle ships the bootstrapper otherwise).
-- A `camelid.exe` next to `camelid-desktop.exe` (the portable zip and installer bundle it).
+- **macOS:** Apple Silicon running macOS 12 or newer. The current macOS desktop bundle is
+  ad-hoc signed for local/developer distribution and is not notarized.
+- A bundled platform engine. The portable ZIP, Windows installer, and macOS app bundle
+  include it automatically.
+
+## macOS command-line install
+
+From the repository root on an Apple Silicon Mac:
+
+```sh
+./scripts/install-macos-desktop.sh
+```
+
+This builds the frontend, release engine, app bundle, and DMG; closes an existing Camelid Desktop
+instance cleanly; installs the new app at `/Applications/Camelid Desktop.app`; verifies its
+ad-hoc signature; and launches it. The script uses `sudo` only when `/Applications` is not writable.
+The model directory under the user's Application Support folder is not replaced.
+
+Prerequisites are macOS 12 or newer, the Xcode Command Line Tools, Rust, and Node.js 22 with npm.
+The app is not notarized yet, so this path is intended for local testing and developer
+distribution.
 
 ## Building (developers)
 
@@ -99,6 +119,22 @@ does not pull `camelid-desktop` into its graph (workspace `resolver = "2"`,
 
 For a bundled installer + portable zip, see the additive `desktop-windows` job in
 `../.github/workflows/release.yml`.
+
+### Building the macOS app and DMG
+
+On an Apple Silicon Mac:
+
+```sh
+./scripts/build-macos-desktop.sh
+```
+
+The script builds the real frontend, the release Metal-enabled `camelid` sidecar, and the
+Tauri `.app` and `.dmg`. It uses an ad-hoc signature (`-`), not a Developer ID signature,
+and performs no notarization. macOS may therefore require the user to approve the app in
+**System Settings → Privacy & Security** after downloading it.
+
+Downloaded models are stored under the app's per-user Application Support directory rather
+than inside the app bundle.
 
 ## Scope notes (intentionally deferred)
 

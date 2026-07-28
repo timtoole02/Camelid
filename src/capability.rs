@@ -196,7 +196,30 @@ fn host_ram_bytes() -> (u64, u64) {
     (field("MemTotal:"), field("MemAvailable:"))
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(target_os = "macos")]
+fn host_ram_bytes() -> (u64, u64) {
+    // Reuse the Mach-backed probe that also protects KV-cache admission so the
+    // catalog fit advisor and runtime safety gate agree on host-memory capacity.
+    crate::gait::host_ram_status().unwrap_or((0, 0))
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn host_ram_bytes() -> (u64, u64) {
     (0, 0)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::host_ram_bytes;
+
+    #[test]
+    fn host_ram_probe_reports_live_physical_ram() {
+        let (total, available) = host_ram_bytes();
+        assert!(total > 0, "total physical RAM must be positive");
+        assert!(available > 0, "available physical RAM must be positive");
+        assert!(
+            available <= total,
+            "available {available} must not exceed total {total}"
+        );
+    }
 }

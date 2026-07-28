@@ -1,4 +1,4 @@
-# `camelid-desktop` (a Tauri v2 native Windows app) is an ADDITIVE workspace member.
+# `camelid-desktop` (a Tauri v2 native desktop app) is an ADDITIVE workspace member.
 # resolver = "2" keeps this root package's feature resolution identical to the standalone
 # edition-2021 default it had before the workspace existed. default-members = ["."] scopes
 # bare `cargo build`/`cargo test` to the `camelid` server exactly as before — the desktop

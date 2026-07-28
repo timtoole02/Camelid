@@ -1,13 +1,13 @@
-// Camelid Desktop — additive native Windows shell around the camelid engine.
+// Camelid Desktop — additive native shell around the camelid engine.
 //
-// Lifecycle: open the WebView2 window on a bundled splash, spawn `camelid serve` on a
+// Lifecycle: open the native webview on a bundled splash, spawn `camelid serve` on a
 // loopback ephemeral port as a sidecar, health-gate `/v1/health`, then navigate the window
 // to the engine's already-embedded UI (UI + API same-origin). The sidecar is killed on exit;
-// a kill-on-close job object backstops crashes. See DECISIONS.md D11 and engine.rs.
+// a Windows kill-on-close job object backstops crashes. See DECISIONS.md D11 and engine.rs.
 //
 // `windows_subsystem = "windows"` suppresses the console window in release builds; debug
 // builds keep the console so engine stderr is visible while developing.
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod engine;
 
@@ -145,8 +145,28 @@ fn start_engine(app: tauri::AppHandle) {
         }
     };
 
+    // A signed macOS app bundle is immutable application code. Keep downloaded GGUFs in
+    // the per-user Application Support directory instead of beside the bundled sidecar
+    // under `Camelid Desktop.app/Contents/Resources`. Windows deliberately retains its
+    // existing per-user installer layout with `models/` beside `camelid.exe`.
+    #[cfg(target_os = "macos")]
+    let models_dir = match app.path().app_data_dir() {
+        Ok(path) => Some(path.join("models")),
+        Err(e) => {
+            emit_error(
+                &app,
+                "Model storage is unavailable",
+                "Check access to your user Library folder, then retry.",
+                &format!("could not resolve the Application Support directory: {e}"),
+            );
+            return;
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let models_dir: Option<std::path::PathBuf> = None;
+
     emit_status(&app, "Starting engine\u{2026}");
-    match engine::spawn(&engine_path) {
+    match engine::spawn(&engine_path, models_dir.as_deref()) {
         Ok(eng) => {
             let url = eng.base_url();
             if let Some(state) = app.try_state::<EngineState>() {

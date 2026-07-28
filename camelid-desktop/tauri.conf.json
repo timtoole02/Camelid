@@ -28,8 +28,8 @@
     "targets": ["nsis"],
     "publisher": "Camelid",
     "category": "DeveloperTool",
-    "shortDescription": "Native Windows chat app for the camelid local inference engine.",
-    "longDescription": "Camelid Desktop is an additive native Windows app that embeds the same camelid engine shipped as the server binary, run as a loopback sidecar. It inherits the identical model-support contract; it makes no broader claims.",
+    "shortDescription": "Native chat app for the Camelid local inference engine.",
+    "longDescription": "Camelid Desktop embeds the same Camelid engine shipped as the server binary and runs it as a loopback sidecar. It inherits the identical model-support contract; it makes no broader claims.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

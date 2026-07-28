@@ -21704,7 +21704,7 @@ mod catalog_fit_tests {
 
     #[test]
     fn unknown_host_never_reports_wont_fit_for_any_curated_row() {
-        // macOS-style: RAM unprobed (0) and no CUDA → advisory-blind, never WontFit.
+        // An unprobed host with no CUDA is advisory-blind and never claims WontFit.
         let hw = host(false, 0, 0, 0);
         for item in curated_catalog() {
             let view = CatalogItemView::from_curated(&item, &hw);

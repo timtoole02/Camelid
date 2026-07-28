@@ -82,7 +82,7 @@ impl EngineError {
     pub fn splash_guidance(&self) -> &'static str {
         match self.kind {
             EngineErrorKind::MissingBinary => {
-                "Reinstall Camelid Desktop or place camelid.exe beside camelid-desktop.exe, then retry."
+                "Reinstall Camelid Desktop or restore its bundled Camelid engine, then retry."
             }
             EngineErrorKind::PortUnavailable => {
                 "Another local process claimed Camelid's selected loopback port. Close it and retry."
@@ -139,7 +139,7 @@ impl Drop for Engine {
 /// Locate the `camelid` engine binary. Resolution order:
 /// 1. Beside the desktop executable (the bundled/portable case — and the dev case, since both
 ///    workspace binaries land in `target/<profile>/`).
-/// 2. An explicit `resource_dir/sidecar/camelid.exe` (Tauri-bundled resource layout).
+/// 2. An explicit `resource_dir/sidecar/<platform engine>` (Tauri-bundled resource layout).
 /// 3. Bare name on `PATH` (developer convenience).
 pub fn resolve_engine_path(resource_dir: Option<PathBuf>) -> Result<PathBuf, EngineError> {
     let file = engine_binary_file();
@@ -218,14 +218,19 @@ pub fn pick_ephemeral_port() -> Result<u16, EngineError> {
 }
 
 /// Spawn `camelid serve --addr 127.0.0.1:<port> --no-open --models-dir <abs>`, bound to
-/// loopback only, and health-gate it. Returns a running [`Engine`] or an [`EngineError`]
-/// carrying engine stderr.
-pub fn spawn(engine_path: &Path) -> Result<Engine, EngineError> {
+/// loopback only, and health-gate it. An explicit models directory lets packaged platforms
+/// keep mutable model data outside the signed application bundle; Windows retains its
+/// existing engine-adjacent directory when no override is supplied.
+pub fn spawn(engine_path: &Path, models_dir: Option<&Path>) -> Result<Engine, EngineError> {
     let port = pick_ephemeral_port()?;
-    spawn_on_port(engine_path, port)
+    spawn_on_port(engine_path, models_dir, port)
 }
 
-fn spawn_on_port(engine_path: &Path, port: u16) -> Result<Engine, EngineError> {
+fn spawn_on_port(
+    engine_path: &Path,
+    models_dir: Option<&Path>,
+    port: u16,
+) -> Result<Engine, EngineError> {
     let addr = format!("127.0.0.1:{port}");
 
     let mut command = Command::new(engine_path);
@@ -240,7 +245,10 @@ fn spawn_on_port(engine_path: &Path, port: u16) -> Result<Engine, EngineError> {
     // the shell), so pin the directory explicitly as an ABSOLUTE path — otherwise the
     // engine's local-models scan, catalog downloads, and relative /api/models/load paths
     // resolve against whatever directory Windows happened to launch the app from.
-    if let Some(models_dir) = sidecar_models_dir(engine_path) {
+    let models_dir = models_dir
+        .map(Path::to_path_buf)
+        .or_else(|| sidecar_models_dir(engine_path));
+    if let Some(models_dir) = models_dir {
         command.arg("--models-dir").arg(models_dir);
     }
     command
@@ -499,7 +507,7 @@ mod tests {
             (
                 EngineErrorKind::MissingBinary,
                 "Camelid engine is missing",
-                "place camelid.exe beside camelid-desktop.exe",
+                "restore its bundled Camelid engine",
             ),
             (
                 EngineErrorKind::PortUnavailable,
@@ -533,7 +541,7 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&missing);
 
-        let error = match spawn(&missing) {
+        let error = match spawn(&missing, None) {
             Ok(_) => panic!("a missing sidecar unexpectedly launched"),
             Err(error) => error,
         };
