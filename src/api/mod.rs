@@ -40,8 +40,9 @@ use crate::{
         output_projection_diagnostics, q8_schedule_telemetry_enabled, reset_q8_schedule_telemetry,
         rope_pairing_for_config, snapshot_q8_schedule_telemetry,
         speculative::{
-            accepted_draft_prefix, ModelDrafter, NGramDrafter, SpeculativeDrafter,
-            DEFAULT_MODEL_DRAFT_TOKENS, DEFAULT_NGRAM_DRAFT_TOKENS,
+            accepted_draft_prefix, ModelDrafter, NGramDrafter, SpecLatch, SpeculativeDrafter,
+            DEFAULT_MODEL_DRAFT_TOKENS, DEFAULT_NGRAM_DRAFT_TOKENS, DEFAULT_NGRAM_MAX_MATCH,
+            DEFAULT_NGRAM_MIN_MATCH,
         },
         DeltaZeroTarget, LlamaForwardDiagnostics, LlamaForwardTimings, LlamaGenerationStep,
         LlamaInferenceSession, LlamaLayerMemoryTimings, LlamaLayerTimings, LlamaLoadedWeights,
@@ -74,6 +75,12 @@ const STREAM_TIMING_DIAGNOSTICS_ENV: &str = "CAMELID_STREAM_TIMING_DIAGNOSTICS";
 const SPEC_DECODE_ENV: &str = "CAMELID_SPEC_DECODE";
 const SPEC_DRAFT_MODEL_ENV: &str = "CAMELID_SPEC_DRAFT_MODEL";
 const SPEC_DRAFT_TOKENS_ENV: &str = "CAMELID_SPEC_DRAFT_TOKENS";
+const SPEC_NGRAM_MIN_ENV: &str = "CAMELID_SPEC_NGRAM_MIN";
+const SPEC_NGRAM_MAX_ENV: &str = "CAMELID_SPEC_NGRAM_MAX";
+const PROMPT_PREFIX_CACHE_CAPACITY_ENV: &str = "CAMELID_PREFIX_CACHE_CAPACITY";
+const PROMPT_PREFIX_CACHE_MIN_TOKENS_ENV: &str = "CAMELID_PREFIX_CACHE_MIN_TOKENS";
+const DEFAULT_PROMPT_PREFIX_CACHE_CAPACITY: usize = 1;
+const DEFAULT_PROMPT_PREFIX_CACHE_MIN_TOKENS: usize = 16;
 /// Reserved model id for the speculative draft model; loaded without becoming
 /// the active model.
 const SPEC_DRAFT_MODEL_ID: &str = "spec-draft";
@@ -108,7 +115,7 @@ pub struct AppState {
     cached_weights: Arc<RwLock<HashMap<String, Arc<LlamaLoadedWeights>>>>,
     active_model_id: Arc<RwLock<Option<String>>>,
     model_last_used: Arc<RwLock<HashMap<String, std::time::Instant>>>,
-    cached_prompt_prefix: Arc<Mutex<Option<CachedPromptPrefix>>>,
+    cached_prompt_prefix: Arc<Mutex<PromptPrefixCachePool>>,
     /// Shared leases cover every local GGUF reader and download transition;
     /// deletion takes the exclusive lease before re-validating file identity.
     model_file_lifecycle: Arc<RwLock<()>>,
@@ -165,7 +172,7 @@ impl Default for AppState {
             cached_weights: Arc::new(RwLock::new(HashMap::new())),
             active_model_id: Arc::new(RwLock::new(None)),
             model_last_used: Arc::new(RwLock::new(HashMap::new())),
-            cached_prompt_prefix: Arc::new(Mutex::new(None)),
+            cached_prompt_prefix: Arc::new(Mutex::new(PromptPrefixCachePool::from_env())),
             model_file_lifecycle: Arc::new(RwLock::new(())),
             model_transition: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(windows)]
@@ -268,6 +275,79 @@ struct CachedPromptPrefix {
     logits: CpuTensor,
     hidden_state: CpuTensor,
     output_norm_state: CpuTensor,
+}
+
+#[derive(Clone)]
+struct PromptPrefixCacheEntry {
+    cached: Arc<CachedPromptPrefix>,
+    last_used: std::time::Instant,
+}
+
+struct PromptPrefixCachePool {
+    entries: Vec<PromptPrefixCacheEntry>,
+    capacity: usize,
+}
+
+impl PromptPrefixCachePool {
+    fn from_env() -> Self {
+        let capacity = env::var(PROMPT_PREFIX_CACHE_CAPACITY_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_PROMPT_PREFIX_CACHE_CAPACITY);
+        Self::with_capacity(capacity)
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    fn insert(&mut self, cached: CachedPromptPrefix) {
+        let cached = Arc::new(cached);
+        let now = std::time::Instant::now();
+
+        if let Some(existing) = self.entries.iter_mut().find(|entry| {
+            entry.cached.model_id == cached.model_id
+                && entry.cached.model_path == cached.model_path
+                && entry.cached.token_ids == cached.token_ids
+                && entry.cached.sampling == cached.sampling
+        }) {
+            existing.cached = cached;
+            existing.last_used = now;
+            return;
+        }
+
+        if self.entries.len() >= self.capacity {
+            if let Some(lru_idx) = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(index, _)| index)
+            {
+                self.entries.remove(lru_idx);
+            }
+        }
+
+        self.entries.push(PromptPrefixCacheEntry {
+            cached,
+            last_used: now,
+        });
+    }
+}
+
+#[derive(Clone)]
+struct PrefixMatchResult {
+    cached: Arc<CachedPromptPrefix>,
+    prefix_len: usize,
+    is_exact_match: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1500,7 +1580,7 @@ struct PreparedGeneration {
     dense_diagnostic_generated_index: Option<usize>,
     dense_metadata: DenseDiagnosticMetadata,
     timings: GenerationTimings,
-    cached_prompt_prefix: Arc<Mutex<Option<CachedPromptPrefix>>>,
+    cached_prompt_prefix: Arc<Mutex<PromptPrefixCachePool>>,
     speculative: Option<PreparedSpeculative>,
     /// Captured request identity for the live telemetry stream; taken by the
     /// generation path that actually runs (streaming or blocking).
@@ -1542,11 +1622,36 @@ fn spec_draft_tokens_from_env(default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn spec_ngram_min_from_env() -> usize {
+    env::var(SPEC_NGRAM_MIN_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_NGRAM_MIN_MATCH)
+}
+
+fn spec_ngram_max_from_env() -> usize {
+    env::var(SPEC_NGRAM_MAX_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_NGRAM_MAX_MATCH)
+}
+
+fn prompt_prefix_cache_min_tokens_from_env() -> usize {
+    env::var(PROMPT_PREFIX_CACHE_MIN_TOKENS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_PROMPT_PREFIX_CACHE_MIN_TOKENS)
+}
+
 /// Per-request speculative decoding state: the drafter plus round counters
 /// for the end-of-request acceptance summary.
 struct PreparedSpeculative {
     drafter: SpeculativeDrafter,
     draft_tokens: usize,
+    latch: SpecLatch,
     rounds: u64,
     drafted: u64,
     accepted_drafts: u64,
@@ -10530,8 +10635,12 @@ async fn prepare_generation(
             None
         }
         Some(SpecDecodeMode::NGram) => Some(PreparedSpeculative {
-            drafter: SpeculativeDrafter::NGram(NGramDrafter::default()),
+            drafter: SpeculativeDrafter::NGram(NGramDrafter::new(
+                spec_ngram_min_from_env(),
+                spec_ngram_max_from_env(),
+            )),
             draft_tokens: spec_draft_tokens_from_env(DEFAULT_NGRAM_DRAFT_TOKENS),
+            latch: SpecLatch::default(),
             rounds: 0,
             drafted: 0,
             accepted_drafts: 0,
@@ -10539,6 +10648,7 @@ async fn prepare_generation(
         Some(SpecDecodeMode::DraftModel) => Some(PreparedSpeculative {
             drafter: build_model_drafter(state, &model, &tokenizer).await?,
             draft_tokens: spec_draft_tokens_from_env(DEFAULT_MODEL_DRAFT_TOKENS),
+            latch: SpecLatch::default(),
             rounds: 0,
             drafted: 0,
             accepted_drafts: 0,
@@ -11573,53 +11683,95 @@ fn generate_decoded_tokens(
 }
 
 fn clear_prompt_prefix_cache(state: &AppState) {
-    if let Ok(mut cached) = state.cached_prompt_prefix.lock() {
-        *cached = None;
+    if let Ok(mut pool) = state.cached_prompt_prefix.lock() {
+        pool.clear();
     }
 }
 
-fn lookup_prompt_prefix_cache(prepared: &PreparedGeneration) -> Option<CachedPromptPrefix> {
-    // The prompt-prefix cache never interacts with constrained decoding. The
-    // cache key is (model, path, tokens, sampling) -- the constraint is not in
-    // it -- and a warm hit samples the first token from raw cached logits with
-    // no grammar mask, with the grammar state never advanced over it. The gate
-    // lives here (and in store, below) rather than at the call sites so every
-    // decode path inherits it; re-prefill is the honest cost of the guarantee.
+fn lookup_prompt_prefix_cache(prepared: &PreparedGeneration) -> Option<PrefixMatchResult> {
     if prepared.constraint.is_some() {
         return None;
     }
-    let cached = prepared.cached_prompt_prefix.lock().ok()?.clone()?;
-    (cached.model_id == prepared.model_id
-        && cached.model_path == prepared.model_path
-        && cached.token_ids == prepared.token_ids
-        && cached.sampling == prepared.sampling)
-        .then_some(cached)
+    let mut pool = prepared.cached_prompt_prefix.lock().ok()?;
+    let min_prefix = prompt_prefix_cache_min_tokens_from_env();
+    let mut best: Option<(usize, bool, usize, std::time::Instant)> = None;
+
+    for (index, entry) in pool.entries.iter().enumerate() {
+        let cached = &entry.cached;
+        let same_cache_key = cached.model_id == prepared.model_id
+            && cached.model_path == prepared.model_path
+            && cached.sampling == prepared.sampling;
+        if !same_cache_key || cached.session.kv_position() != cached.token_ids.len() {
+            continue;
+        }
+
+        let common_len = common_prefix_len(&cached.token_ids, &prepared.token_ids);
+        let is_exact_match = cached.token_ids == prepared.token_ids;
+        if !is_exact_match && common_len < min_prefix {
+            continue;
+        }
+
+        let candidate_rank = (is_exact_match, common_len, entry.last_used);
+        let should_replace = best
+            .as_ref()
+            .map(|(_, exact, prefix_len, last_used)| {
+                candidate_rank > (*exact, *prefix_len, *last_used)
+            })
+            .unwrap_or(true);
+        if should_replace {
+            best = Some((index, is_exact_match, common_len, entry.last_used));
+        }
+    }
+
+    if let Some((index, is_exact_match, common_len, _)) = best {
+        let entry = &mut pool.entries[index];
+        entry.last_used = std::time::Instant::now();
+        let cached = Arc::clone(&entry.cached);
+        let prefix_len = if is_exact_match {
+            common_len
+        } else {
+            common_len.min(prepared.token_ids.len().saturating_sub(1))
+        };
+        Some(PrefixMatchResult {
+            cached,
+            prefix_len,
+            is_exact_match,
+        })
+    } else {
+        None
+    }
+}
+
+fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b.iter()).take_while(|(&x, &y)| x == y).count()
 }
 
 fn store_prompt_prefix_cache(prepared: &PreparedGeneration, step: &LlamaGenerationStep) {
-    // The prompt-prefix cache never interacts with constrained decoding (see
-    // lookup_prompt_prefix_cache). Storing raw prefill logits would arguably be
-    // safe, but skipping both directions keeps the invariant one sentence.
     if prepared.constraint.is_some() {
         return;
     }
-    // A resident-GPU-prefilled session keeps its K/V history on the GPU only; the cached
-    // clone would drop it and resume from empty CPU buffers. Skip caching those sessions â€”
-    // a cache miss just re-runs the (fast, resident) prefill.
-    if !prepared.session.cpu_kv_authoritative() {
+    if !prepared.session.cpu_kv_authoritative()
+        || prepared.session.kv_position() != prepared.token_ids.len()
+    {
         return;
     }
-    if let Ok(mut cached) = prepared.cached_prompt_prefix.lock() {
-        *cached = Some(CachedPromptPrefix {
-            model_id: prepared.model_id.clone(),
-            model_path: prepared.model_path.clone(),
-            token_ids: prepared.token_ids.clone(),
-            sampling: prepared.sampling.clone(),
-            session: prepared.session.clone(),
-            logits: step.logits.clone(),
-            hidden_state: step.hidden_state.clone(),
-            output_norm_state: step.output_norm_state.clone(),
-        });
+
+    // Cloning a populated session can copy hundreds of MiB of KV data. Do that
+    // outside the global cache lock so concurrent requests can still look up
+    // their own prefixes.
+    let cached = CachedPromptPrefix {
+        model_id: prepared.model_id.clone(),
+        model_path: prepared.model_path.clone(),
+        token_ids: prepared.token_ids.clone(),
+        sampling: prepared.sampling.clone(),
+        session: prepared.session.clone(),
+        logits: step.logits.clone(),
+        hidden_state: step.hidden_state.clone(),
+        output_norm_state: step.output_norm_state.clone(),
+    };
+
+    if let Ok(mut pool) = prepared.cached_prompt_prefix.lock() {
+        pool.insert(cached);
     }
 }
 
@@ -11780,7 +11932,6 @@ fn generate_token_ids(
     let mut finish_reason = "length";
     let mut forward_timings = LlamaForwardTimings::default();
     let mut sample = 0;
-    let mut reused_prompt_prefix = false;
 
     // The execution-trace rollup is captured only on the deterministic CPU lane (the only lane
     // where it is reduction-order-stable). When it will be armed, bypass the prompt-prefix cache
@@ -11796,33 +11947,45 @@ fn generate_token_ids(
     let resident_cuda_active = crate::inference::resident_decode_cuda_active();
 
     if !prepared.collect_dense_diagnostics && !want_execution_trace && !resident_cuda_active {
-        if let Some(cached) = lookup_prompt_prefix_cache(&prepared) {
-            prepared.session = cached.session.clone();
+        if let Some(match_res) = lookup_prompt_prefix_cache(&prepared) {
+            let mut cached_session = match_res.cached.session.clone();
             // The cached session's resident-path pin reflects the request
             // that stored it; re-pin for this request's mode.
-            prepared
-                .session
+            cached_session
                 .set_resident_paths_disabled(prepared.speculative.is_some() && !spec_gpu_enabled());
-            input.clear();
-            let first_step = sample_cached_prompt_prefix(&cached, &history)?;
-            let cached_next_token = first_step.next_token_id;
-            sample += first_step.sample;
-            reused_prompt_prefix = true;
-            prepared.timings.prompt_cache_hit = true;
-            consume_generation_step(
-                &prepared,
-                first_step,
-                GenerationStepAccumulator {
-                    generated: &mut generated,
-                    history: &mut history,
-                    top_logits: &mut top_logits,
-                    output_projection: &mut output_projection,
-                    dense: &mut dense,
-                    finish_reason: &mut finish_reason,
-                },
-            )?;
-            if finish_reason == "length" {
-                input.push(cached_next_token);
+
+            if match_res.is_exact_match {
+                prepared.session = cached_session;
+                input.clear();
+                let first_step = sample_cached_prompt_prefix(&match_res.cached, &history)?;
+                let cached_next_token = first_step.next_token_id;
+                sample += first_step.sample;
+                prepared.timings.prompt_cache_hit = true;
+                consume_generation_step(
+                    &prepared,
+                    first_step,
+                    GenerationStepAccumulator {
+                        generated: &mut generated,
+                        history: &mut history,
+                        top_logits: &mut top_logits,
+                        output_projection: &mut output_projection,
+                        dense: &mut dense,
+                        finish_reason: &mut finish_reason,
+                    },
+                )?;
+                if finish_reason == "length" {
+                    input.push(cached_next_token);
+                }
+            } else {
+                let k = match_res.prefix_len;
+                // A malformed/stale cache entry must never make generation fail:
+                // retain the fresh session and perform a cold prefill if rollback
+                // cannot establish the requested prefix position.
+                if cached_session.rollback_to_position(k).is_ok() {
+                    prepared.session = cached_session;
+                    input = prepared.token_ids[k..].to_vec();
+                    prepared.timings.prompt_cache_hit = true;
+                }
             }
         }
     }
@@ -11887,116 +12050,127 @@ fn generate_token_ids(
                 && grammar.is_none()
                 && !top_logits.is_empty()
         }) {
-            let remaining = (prepared.max_tokens as usize).saturating_sub(generated.len());
-            let context_room = prepared.session.remaining_context();
-            let drafts = if remaining > 0 && context_room > 0 {
-                let draft_budget = spec
-                    .draft_tokens
-                    .min(remaining.saturating_sub(1))
-                    .min(context_room.saturating_sub(1));
-                spec.drafter.draft(&history, draft_budget).map_err(|err| {
-                    Box::new(api_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "speculative_draft_failed",
-                        err.to_string(),
-                        None,
-                    ))
-                })?
+            if !spec.latch.should_speculate() {
+                spec.latch.note_skip();
             } else {
-                Vec::new()
-            };
-            // No drafts (e.g. no n-gram match) â†’ fall through to the plain
-            // single-token step below; a one-token verify chunk would only
-            // add chunk-path overhead over the tuned decode step.
-            if !drafts.is_empty() {
-                // GPU speculative decode (CAMELID_SPEC_GPU=1): verify all drafts in one
-                // batched forward on the target's resident engine, which manages the KV
-                // itself (accept the longest matching prefix, advance position). Falls
-                // back to the CPU chunk verify when the engine isn't resident-ready.
-                // Lossless either way â€” the emitted tokens are the target's own greedy
-                // argmax given the accepted prefix.
-                let gpu_accepted = if spec_gpu_enabled() {
-                    prepared
-                        .session
-                        .verify_drafts_gpu(input[0], &drafts)
-                        .map_err(|err| {
-                            Box::new(api_error(
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                "speculative_verify_failed",
-                                err.to_string(),
-                                None,
-                            ))
-                        })?
+                let remaining = (prepared.max_tokens as usize).saturating_sub(generated.len());
+                let context_room = prepared.session.remaining_context();
+                let drafts = if remaining > 0 && context_room > 0 {
+                    let draft_budget = spec
+                        .draft_tokens
+                        .min(remaining.saturating_sub(1))
+                        .min(context_room.saturating_sub(1));
+                    spec.drafter.draft(&history, draft_budget).map_err(|err| {
+                        Box::new(api_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "speculative_draft_failed",
+                            err.to_string(),
+                            None,
+                        ))
+                    })?
                 } else {
-                    None
+                    Vec::new()
                 };
-                let emitted: Vec<u32> = if let Some(acc) = gpu_accepted {
-                    spec.rounds += 1;
-                    spec.drafted += drafts.len() as u64;
-                    spec.accepted_drafts += (acc.len() as u64).saturating_sub(1);
-                    acc
-                } else {
-                    let base_position = prepared.session.kv_position();
-                    let mut batch = Vec::with_capacity(1 + drafts.len());
-                    batch.push(input[0]);
-                    batch.extend_from_slice(&drafts);
-                    let (predictions, round_timings) = prepared
-                        .session
-                        .forward_greedy_verify_chunk(&batch)
-                        .map_err(|err| {
-                            Box::new(api_error(
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                "speculative_verify_failed",
-                                err.to_string(),
-                                None,
-                            ))
-                        })?;
-                    let accepted = accepted_draft_prefix(&drafts, &predictions);
-                    prepared
-                        .session
-                        .rollback_to_position(base_position + 1 + accepted)
-                        .map_err(|err| {
-                            Box::new(api_error(
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                "speculative_rollback_failed",
-                                err.to_string(),
-                                None,
-                            ))
-                        })?;
-                    spec.rounds += 1;
-                    spec.drafted += drafts.len() as u64;
-                    spec.accepted_drafts += accepted as u64;
-                    forward_timings.add_assign(&round_timings);
-                    predictions[..=accepted].to_vec()
-                };
-                for &token in &emitted {
-                    generated.push(token);
-                    history.push(token);
-                    if prepared.tokenizer.special.eog.contains(&token) {
-                        finish_reason = "stop";
-                        break;
-                    }
-                    if !prepared.stop_sequences.is_empty() {
-                        let text = prepared.tokenizer.decode(&generated, true).map_err(|err| {
-                            Box::new(api_error(
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                "token_decode_failed",
-                                err.to_string(),
-                                None,
-                            ))
-                        })?;
-                        if contains_stop_sequence(&text, &prepared.stop_sequences) {
+                // No drafts (e.g. no n-gram match) -> fall through to the plain
+                // single-token step below; a one-token verify chunk would only
+                // add chunk-path overhead over the tuned decode step. This is an
+                // anchor miss, not a latch-directed skip or an acceptance
+                // measurement, so it must not advance the re-probe cooldown.
+                if !drafts.is_empty() {
+                    // GPU speculative decode (CAMELID_SPEC_GPU=1): verify all drafts in one
+                    // batched forward on the target's resident engine, which manages the KV
+                    // itself (accept the longest matching prefix, advance position). Falls
+                    // back to the CPU chunk verify when the engine isn't resident-ready.
+                    // Lossless either way — the emitted tokens are the target's own greedy
+                    // argmax given the accepted prefix.
+                    let gpu_accepted = if spec_gpu_enabled() {
+                        prepared
+                            .session
+                            .verify_drafts_gpu(input[0], &drafts)
+                            .map_err(|err| {
+                                Box::new(api_error(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    "speculative_verify_failed",
+                                    err.to_string(),
+                                    None,
+                                ))
+                            })?
+                    } else {
+                        None
+                    };
+                    let emitted: Vec<u32> = if let Some(acc) = gpu_accepted {
+                        let accepted_count = (acc.len() as u64).saturating_sub(1);
+                        spec.rounds += 1;
+                        spec.drafted += drafts.len() as u64;
+                        spec.accepted_drafts += accepted_count;
+                        spec.latch.note_verified(accepted_count as u32);
+                        acc
+                    } else {
+                        let base_position = prepared.session.kv_position();
+                        let mut batch = Vec::with_capacity(1 + drafts.len());
+                        batch.push(input[0]);
+                        batch.extend_from_slice(&drafts);
+                        let (predictions, round_timings) = prepared
+                            .session
+                            .forward_greedy_verify_chunk(&batch)
+                            .map_err(|err| {
+                                Box::new(api_error(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    "speculative_verify_failed",
+                                    err.to_string(),
+                                    None,
+                                ))
+                            })?;
+                        let accepted = accepted_draft_prefix(&drafts, &predictions);
+                        prepared
+                            .session
+                            .rollback_to_position(base_position + 1 + accepted)
+                            .map_err(|err| {
+                                Box::new(api_error(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    "speculative_rollback_failed",
+                                    err.to_string(),
+                                    None,
+                                ))
+                            })?;
+                        spec.rounds += 1;
+                        spec.drafted += drafts.len() as u64;
+                        spec.accepted_drafts += accepted as u64;
+                        spec.latch.note_verified(accepted as u32);
+                        forward_timings.add_assign(&round_timings);
+                        predictions[..=accepted].to_vec()
+                    };
+                    for &token in &emitted {
+                        generated.push(token);
+                        history.push(token);
+                        if prepared.tokenizer.special.eog.contains(&token) {
                             finish_reason = "stop";
                             break;
                         }
+                        if !prepared.stop_sequences.is_empty() {
+                            let text =
+                                prepared.tokenizer.decode(&generated, true).map_err(|err| {
+                                    Box::new(api_error(
+                                        StatusCode::SERVICE_UNAVAILABLE,
+                                        "token_decode_failed",
+                                        err.to_string(),
+                                        None,
+                                    ))
+                                })?;
+                            if contains_stop_sequence(&text, &prepared.stop_sequences) {
+                                finish_reason = "stop";
+                                break;
+                            }
+                        }
                     }
+                    if finish_reason != "length" || generated.len() >= prepared.max_tokens as usize
+                    {
+                        break;
+                    }
+                    input.clear();
+                    input.push(*history.last().expect("history grows every round"));
+                    continue;
                 }
-                if finish_reason != "length" || generated.len() >= prepared.max_tokens as usize {
-                    break;
-                }
-                input.clear();
-                input.push(*history.last().expect("history grows every round"));
-                continue;
             }
         }
         // JSON-grammar mask for this step: a token is allowed iff its bytes keep a
@@ -12113,8 +12287,7 @@ fn generate_token_ids(
                     ))
                 })?,
         };
-        if !reused_prompt_prefix
-            && generated.is_empty()
+        if generated.is_empty()
             && !prepared.collect_dense_diagnostics
             && step.diagnostics.is_none()
             && !resident_cuda_active
@@ -12125,7 +12298,7 @@ fn generate_token_ids(
             // (after a GPU-off toggle) reusing a GPU-built (f16-seeded) session.
             store_prompt_prefix_cache(&prepared, &step);
         }
-        if generated.is_empty() && !reused_prompt_prefix {
+        if generated.is_empty() {
             prepared.timings.prompt_evaluation = prompt_evaluation_timings_from_step(&step);
         }
         forward_timings.add_assign(&step.timings);
@@ -12919,7 +13092,6 @@ fn run_stream_decode_job(
     let mut dense = None;
     let mut finish_reason = "length";
     let mut streamed_text = String::new();
-    let mut reused_prompt_prefix = false;
     let mut first_content_ms = None;
     let mut forward_timings = LlamaForwardTimings::default();
     let mut sample = 0;
@@ -12933,39 +13105,50 @@ fn run_stream_decode_job(
     // cache this way (see resident_decode_cuda_active); the streaming path
     // must too. The CPU lane is reduction-order-stable and keeps the cache.
     if !prepared.collect_dense_diagnostics && !crate::inference::resident_decode_cuda_active() {
-        if let Some(cached) = lookup_prompt_prefix_cache(&prepared) {
-            prepared.session = cached.session.clone();
-            input.clear();
-            match sample_cached_prompt_prefix(&cached, &history) {
-                Ok(first_step) => {
-                    let cached_next_token = first_step.next_token_id;
-                    reused_prompt_prefix = true;
-                    prepared.timings.prompt_cache_hit = true;
-                    sample += first_step.sample;
-                    if let Err(response) = consume_generation_step(
-                        &prepared,
-                        first_step,
-                        GenerationStepAccumulator {
-                            generated: &mut generated,
-                            history: &mut history,
-                            top_logits: &mut top_logits,
-                            output_projection: &mut output_projection,
-                            dense: &mut dense,
-                            finish_reason: &mut finish_reason,
-                        },
-                    ) {
+        if let Some(match_res) = lookup_prompt_prefix_cache(&prepared) {
+            let mut cached_session = match_res.cached.session.clone();
+            cached_session
+                .set_resident_paths_disabled(prepared.speculative.is_some() && !spec_gpu_enabled());
+            if match_res.is_exact_match {
+                prepared.session = cached_session;
+                input.clear();
+                match sample_cached_prompt_prefix(&match_res.cached, &history) {
+                    Ok(first_step) => {
+                        let cached_next_token = first_step.next_token_id;
+                        prepared.timings.prompt_cache_hit = true;
+                        sample += first_step.sample;
+                        if let Err(response) = consume_generation_step(
+                            &prepared,
+                            first_step,
+                            GenerationStepAccumulator {
+                                generated: &mut generated,
+                                history: &mut history,
+                                top_logits: &mut top_logits,
+                                output_projection: &mut output_projection,
+                                dense: &mut dense,
+                                finish_reason: &mut finish_reason,
+                            },
+                        ) {
+                            let (code, message) = stream_error_parts(&response);
+                            send(StreamDecodeEvent::Failed { code, message });
+                            return;
+                        }
+                        if finish_reason == "length" {
+                            input.push(cached_next_token);
+                        }
+                    }
+                    Err(response) => {
                         let (code, message) = stream_error_parts(&response);
                         send(StreamDecodeEvent::Failed { code, message });
                         return;
                     }
-                    if finish_reason == "length" {
-                        input.push(cached_next_token);
-                    }
                 }
-                Err(response) => {
-                    let (code, message) = stream_error_parts(&response);
-                    send(StreamDecodeEvent::Failed { code, message });
-                    return;
+            } else {
+                let k = match_res.prefix_len;
+                if cached_session.rollback_to_position(k).is_ok() {
+                    prepared.session = cached_session;
+                    input = prepared.token_ids[k..].to_vec();
+                    prepared.timings.prompt_cache_hit = true;
                 }
             }
         }
@@ -13027,14 +13210,11 @@ fn run_stream_decode_job(
                 return;
             }
         };
-        if !reused_prompt_prefix
-            && generated.is_empty()
-            && !prepared.collect_dense_diagnostics
-            && step.diagnostics.is_none()
+        if generated.is_empty() && !prepared.collect_dense_diagnostics && step.diagnostics.is_none()
         {
             store_prompt_prefix_cache(&prepared, &step);
         }
-        if generated.is_empty() && !reused_prompt_prefix {
+        if generated.is_empty() {
             prepared.timings.prompt_evaluation = prompt_evaluation_timings_from_step(&step);
         }
         forward_timings.add_assign(&step.timings);
@@ -16724,31 +16904,250 @@ mod tests {
         assert!(lookup_prompt_prefix_cache(&prepared).is_none());
         store_prompt_prefix_cache(&prepared, &step);
 
-        let cached = lookup_prompt_prefix_cache(&prepared).expect("exact key cache hit");
-        assert_eq!(cached.session.kv_cache.position, 2);
-        assert_eq!(cached.logits, step.logits);
+        let match_res = lookup_prompt_prefix_cache(&prepared).expect("exact key cache hit");
+        assert_eq!(match_res.cached.session.kv_cache.position, 2);
+        assert_eq!(match_res.cached.logits, step.logits);
         assert_eq!(
-            sample_cached_prompt_prefix(&cached, &[1, 2])
+            sample_cached_prompt_prefix(&match_res.cached, &[1, 2])
                 .unwrap()
                 .next_token_id,
             step.next_token_id
         );
 
-        let mut different_prompt =
-            prepared_for_cache("tiny", "model-a.gguf", vec![1], cached.session.clone());
+        // An exact entry must beat a newer, longer entry with the same common
+        // prefix. Otherwise the fast cached-logits path is needlessly degraded
+        // to a rollback plus one-token prefill.
+        let mut longer_session = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        let longer_step = longer_session
+            .generate_next_token_with_history_diagnostics(
+                &[1, 2, 0],
+                crate::inference::LlamaSampler::Greedy,
+                &[1, 2, 0],
+                false,
+                None,
+            )
+            .unwrap();
+        let mut longer = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2, 0], longer_session);
+        longer.cached_prompt_prefix = prepared.cached_prompt_prefix.clone();
+        store_prompt_prefix_cache(&longer, &longer_step);
+        let exact = lookup_prompt_prefix_cache(&prepared).expect("exact entry still wins");
+        assert!(exact.is_exact_match);
+        assert_eq!(exact.cached.token_ids, vec![1, 2]);
+
+        let mut different_prompt = prepared_for_cache(
+            "tiny",
+            "model-a.gguf",
+            vec![99, 98],
+            match_res.cached.session.clone(),
+        );
         different_prompt.cached_prompt_prefix = prepared.cached_prompt_prefix.clone();
         assert!(lookup_prompt_prefix_cache(&different_prompt).is_none());
 
-        let mut different_sampling =
-            prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], cached.session.clone());
+        let mut different_sampling = prepared_for_cache(
+            "tiny",
+            "model-a.gguf",
+            vec![1, 2],
+            match_res.cached.session.clone(),
+        );
         different_sampling.cached_prompt_prefix = prepared.cached_prompt_prefix.clone();
         different_sampling.sampling.temperature = 0.7;
         assert!(lookup_prompt_prefix_cache(&different_sampling).is_none());
 
-        let mut different_model =
-            prepared_for_cache("tiny", "model-b.gguf", vec![1, 2], cached.session);
+        let mut different_model = prepared_for_cache(
+            "tiny",
+            "model-b.gguf",
+            vec![1, 2],
+            match_res.cached.session.clone(),
+        );
         different_model.cached_prompt_prefix = prepared.cached_prompt_prefix.clone();
         assert!(lookup_prompt_prefix_cache(&different_model).is_none());
+    }
+
+    #[test]
+    fn prompt_prefix_cache_partial_match_and_lru_eviction() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var(PROMPT_PREFIX_CACHE_MIN_TOKENS_ENV, "2");
+        std::env::set_var("CAMELID_CUDA_RESIDENT_DECODE", "0");
+        std::env::remove_var("CAMELID_DETERMINISTIC");
+
+        let config = tiny_spec_config();
+        let weights = tiny_weights();
+        let mut session = LlamaInferenceSession::new(config, weights).unwrap();
+        let step = session
+            .generate_next_token_with_history_diagnostics(
+                &[0, 1, 2],
+                crate::inference::LlamaSampler::Greedy,
+                &[0, 1, 2],
+                false,
+                None,
+            )
+            .unwrap();
+        let prepared = prepared_for_cache("tiny", "model-a.gguf", vec![0, 1, 2], session);
+        store_prompt_prefix_cache(&prepared, &step);
+
+        let mut extended = prepared_for_cache(
+            "tiny",
+            "model-a.gguf",
+            vec![0, 1, 2, 0, 1],
+            prepared.session.clone(),
+        );
+        extended.cached_prompt_prefix = prepared.cached_prompt_prefix.clone();
+
+        let hit = lookup_prompt_prefix_cache(&extended).expect("partial prefix cache hit");
+        assert!(!hit.is_exact_match);
+        assert_eq!(hit.prefix_len, 3);
+
+        let mut warm = prepared_for_cache(
+            "tiny",
+            "model-a.gguf",
+            vec![0, 1, 0, 1],
+            LlamaInferenceSession::new(tiny_spec_config(), tiny_weights()).unwrap(),
+        );
+        warm.max_tokens = 3;
+        warm.cached_prompt_prefix = prepared.cached_prompt_prefix.clone();
+        let mut cold = prepared_for_cache(
+            "tiny",
+            "model-a.gguf",
+            vec![0, 1, 0, 1],
+            LlamaInferenceSession::new(tiny_spec_config(), tiny_weights()).unwrap(),
+        );
+        cold.max_tokens = 3;
+
+        let warm_output = generate_token_ids(warm).expect("warm partial generation");
+        let cold_output = generate_token_ids(cold).expect("cold generation");
+        assert_eq!(warm_output.token_ids, cold_output.token_ids);
+        assert!(warm_output.timings.prompt_cache_hit);
+        assert!(
+            warm_output.timings.prompt_evaluation.prefill.forward_total
+                + warm_output
+                    .timings
+                    .prompt_evaluation
+                    .first_token
+                    .forward_total
+                > 0.0,
+            "partial hits must report the suffix prefill instead of zeroing prompt timing"
+        );
+
+        let pool_ref = prepared.cached_prompt_prefix.clone();
+        {
+            let mut pool = pool_ref.lock().unwrap();
+            pool.clear();
+            pool.capacity = 2;
+        }
+
+        let mut session1 = LlamaInferenceSession::new(tiny_spec_config(), tiny_weights()).unwrap();
+        let step1 = session1
+            .generate_next_token_with_history_diagnostics(
+                &[0, 1],
+                crate::inference::LlamaSampler::Greedy,
+                &[0, 1],
+                false,
+                None,
+            )
+            .unwrap();
+        let mut prep1 = prepared_for_cache("tiny", "model-a.gguf", vec![0, 1], session1);
+        prep1.cached_prompt_prefix = pool_ref.clone();
+
+        let mut session2 = LlamaInferenceSession::new(tiny_spec_config(), tiny_weights()).unwrap();
+        let step2 = session2
+            .generate_next_token_with_history_diagnostics(
+                &[0, 2],
+                crate::inference::LlamaSampler::Greedy,
+                &[0, 2],
+                false,
+                None,
+            )
+            .unwrap();
+        let mut prep2 = prepared_for_cache("tiny", "model-a.gguf", vec![0, 2], session2);
+        prep2.cached_prompt_prefix = pool_ref.clone();
+
+        let mut session3 = LlamaInferenceSession::new(tiny_spec_config(), tiny_weights()).unwrap();
+        let step3 = session3
+            .generate_next_token_with_history_diagnostics(
+                &[1, 2],
+                crate::inference::LlamaSampler::Greedy,
+                &[1, 2],
+                false,
+                None,
+            )
+            .unwrap();
+        let mut prep3 = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session3);
+        prep3.cached_prompt_prefix = pool_ref.clone();
+
+        store_prompt_prefix_cache(&prep1, &step1);
+        store_prompt_prefix_cache(&prep2, &step2);
+        assert!(lookup_prompt_prefix_cache(&prep1).is_some());
+        {
+            let mut pool = pool_ref.lock().unwrap();
+            let newest = std::time::Instant::now();
+            for entry in &mut pool.entries {
+                entry.last_used = if entry.cached.token_ids == prep1.token_ids {
+                    newest
+                } else {
+                    newest - std::time::Duration::from_secs(1)
+                };
+            }
+        }
+
+        store_prompt_prefix_cache(&prep3, &step3);
+        let remaining = pool_ref
+            .lock()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|entry| entry.cached.token_ids.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.contains(&prep1.token_ids));
+        assert!(remaining.contains(&prep3.token_ids));
+        assert!(!remaining.contains(&prep2.token_ids));
+
+        std::env::remove_var(PROMPT_PREFIX_CACHE_MIN_TOKENS_ENV);
+        std::env::remove_var("CAMELID_CUDA_RESIDENT_DECODE");
+    }
+
+    #[test]
+    fn prompt_prefix_cache_defaults_to_one_session_and_rejects_invalid_capacity() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::remove_var(PROMPT_PREFIX_CACHE_CAPACITY_ENV);
+        assert_eq!(
+            PromptPrefixCachePool::from_env().capacity,
+            DEFAULT_PROMPT_PREFIX_CACHE_CAPACITY
+        );
+
+        std::env::set_var(PROMPT_PREFIX_CACHE_CAPACITY_ENV, "3");
+        assert_eq!(PromptPrefixCachePool::from_env().capacity, 3);
+
+        for invalid in ["0", "not-a-number"] {
+            std::env::set_var(PROMPT_PREFIX_CACHE_CAPACITY_ENV, invalid);
+            assert_eq!(
+                PromptPrefixCachePool::from_env().capacity,
+                DEFAULT_PROMPT_PREFIX_CACHE_CAPACITY
+            );
+        }
+        std::env::remove_var(PROMPT_PREFIX_CACHE_CAPACITY_ENV);
+    }
+
+    #[test]
+    fn prompt_prefix_cache_rejects_session_position_mismatch() {
+        let mut session = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        let step = session
+            .generate_next_token_with_history_diagnostics(
+                &[0, 1],
+                crate::inference::LlamaSampler::Greedy,
+                &[0, 1],
+                false,
+                None,
+            )
+            .unwrap();
+        let prepared = prepared_for_cache("tiny", "model-a.gguf", vec![0, 1, 2], session);
+        store_prompt_prefix_cache(&prepared, &step);
+        assert!(prepared
+            .cached_prompt_prefix
+            .lock()
+            .unwrap()
+            .entries
+            .is_empty());
     }
 
     #[test]
@@ -16781,7 +17180,11 @@ mod tests {
             "tiny",
             "model-a.gguf",
             vec![1, 2],
-            lookup_prompt_prefix_cache(&unconstrained).unwrap().session,
+            lookup_prompt_prefix_cache(&unconstrained)
+                .unwrap()
+                .cached
+                .session
+                .clone(),
         );
         constrained.cached_prompt_prefix = unconstrained.cached_prompt_prefix.clone();
         constrained.constraint = Some(crate::grammar::ConstraintSpec::json_object());
@@ -18303,7 +18706,7 @@ mod tests {
             dense_diagnostic_generated_index: None,
             dense_metadata: dummy_dense_metadata(),
             timings: GenerationTimings::default(),
-            cached_prompt_prefix: Arc::new(Mutex::new(None)),
+            cached_prompt_prefix: Arc::new(Mutex::new(PromptPrefixCachePool::with_capacity(8))),
             speculative: None,
             telemetry: None,
             cancel: GenerationCancel::unbounded(),
@@ -18445,17 +18848,45 @@ mod tests {
         generated.push(first.next_token_id);
         history.push(first.next_token_id);
         let mut accepted_total = 0usize;
+        let mut latch = SpecLatch::default();
         while generated.len() < count {
             let pending = *history.last().unwrap();
-            let drafts = drafter.draft(&history, 3).unwrap();
-            let base = session.kv_position();
-            let mut batch = vec![pending];
-            batch.extend_from_slice(&drafts);
-            let (predictions, _timings) = session.forward_greedy_verify_chunk(&batch).unwrap();
-            let accepted = accepted_draft_prefix(&drafts, &predictions);
-            session.rollback_to_position(base + 1 + accepted).unwrap();
-            accepted_total += accepted;
-            for &token in &predictions[..=accepted] {
+            let mut emitted = Vec::new();
+            if latch.should_speculate() {
+                let drafts = drafter.draft(&history, 3).unwrap();
+                if !drafts.is_empty() {
+                    let base = session.kv_position();
+                    let mut batch = vec![pending];
+                    batch.extend_from_slice(&drafts);
+                    let (predictions, _timings) =
+                        session.forward_greedy_verify_chunk(&batch).unwrap();
+                    let accepted = accepted_draft_prefix(&drafts, &predictions);
+                    session.rollback_to_position(base + 1 + accepted).unwrap();
+                    latch.note_verified(accepted as u32);
+                    accepted_total += accepted;
+                    emitted.extend_from_slice(&predictions[..=accepted]);
+                }
+            } else {
+                latch.note_skip();
+            }
+
+            // An n-gram anchor miss is neither a verified acceptance result nor
+            // a latch-directed skip. It takes one plain step without mutating
+            // the latch, exactly like the production loop.
+            if emitted.is_empty() {
+                let step = session
+                    .generate_next_token_with_history_diagnostics(
+                        &[pending],
+                        LlamaSampler::Greedy,
+                        &history,
+                        false,
+                        None,
+                    )
+                    .unwrap();
+                emitted.push(step.next_token_id);
+            }
+
+            for token in emitted {
                 if generated.len() >= count {
                     break;
                 }
@@ -18472,6 +18903,29 @@ mod tests {
             accepted_total > 0,
             "speculation accepted no drafts; the test did not exercise the accept path"
         );
+    }
+
+    #[test]
+    fn speculative_ngram_env_bounds_are_positive_and_normalized() {
+        let _guard = crate::test_support::env_lock();
+        std::env::remove_var(SPEC_NGRAM_MIN_ENV);
+        std::env::remove_var(SPEC_NGRAM_MAX_ENV);
+        assert_eq!(spec_ngram_min_from_env(), DEFAULT_NGRAM_MIN_MATCH);
+        assert_eq!(spec_ngram_max_from_env(), DEFAULT_NGRAM_MAX_MATCH);
+
+        std::env::set_var(SPEC_NGRAM_MIN_ENV, "0");
+        std::env::set_var(SPEC_NGRAM_MAX_ENV, "invalid");
+        assert_eq!(spec_ngram_min_from_env(), DEFAULT_NGRAM_MIN_MATCH);
+        assert_eq!(spec_ngram_max_from_env(), DEFAULT_NGRAM_MAX_MATCH);
+
+        std::env::set_var(SPEC_NGRAM_MIN_ENV, "5");
+        std::env::set_var(SPEC_NGRAM_MAX_ENV, "2");
+        let normalized = NGramDrafter::new(spec_ngram_min_from_env(), spec_ngram_max_from_env());
+        assert_eq!(normalized.min_ngram, 5);
+        assert_eq!(normalized.max_ngram, 5);
+
+        std::env::remove_var(SPEC_NGRAM_MIN_ENV);
+        std::env::remove_var(SPEC_NGRAM_MAX_ENV);
     }
 
     #[test]

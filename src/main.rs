@@ -570,8 +570,7 @@ enum Command {
         /// exact token mapping).
         #[arg(long, env = "CAMELID_SPEC_DRAFT_MODEL")]
         spec_draft_model: Option<PathBuf>,
-        /// Draft tokens proposed per speculation round (default: 8 for
-        /// ngram, 5 for draft).
+        /// Draft tokens proposed per speculation round (default: 5).
         #[arg(long, env = "CAMELID_SPEC_DRAFT_TOKENS")]
         spec_draft_tokens: Option<usize>,
         /// Do not open the web UI in a browser on startup. By default, when run

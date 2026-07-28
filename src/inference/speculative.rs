@@ -33,6 +33,8 @@ use crate::Result;
 /// repetitive code (~1.20x), where 7 drafts regress to ~1.09x. Bounded by
 /// `cuda_resident::MAX_VERIFY_K - 1`.
 pub const DEFAULT_NGRAM_DRAFT_TOKENS: usize = 5;
+pub const DEFAULT_NGRAM_MIN_MATCH: usize = 3;
+pub const DEFAULT_NGRAM_MAX_MATCH: usize = 4;
 
 /// Default drafted tokens per round for the draft-model drafter. Each draft
 /// token costs a sequential forward through the draft model, so the window
@@ -86,17 +88,21 @@ pub struct NGramDrafter {
 
 impl Default for NGramDrafter {
     fn default() -> Self {
-        Self {
-            max_ngram: 4,
-            // Two-token patterns (e.g. ", " pairs) recur with unrelated
-            // continuations and mostly waste verify rows; three-token
-            // matches measure far higher acceptance.
-            min_ngram: 3,
-        }
+        // Two-token patterns (e.g. ", " pairs) recur with unrelated
+        // continuations and mostly waste verify rows; three-token matches
+        // measure far higher acceptance.
+        Self::new(DEFAULT_NGRAM_MIN_MATCH, DEFAULT_NGRAM_MAX_MATCH)
     }
 }
 
 impl NGramDrafter {
+    pub fn new(min_ngram: usize, max_ngram: usize) -> Self {
+        Self {
+            min_ngram: min_ngram.max(1),
+            max_ngram: max_ngram.max(min_ngram.max(1)),
+        }
+    }
+
     pub fn draft(&self, history: &[u32], max_tokens: usize) -> Vec<u32> {
         if max_tokens == 0 || self.min_ngram == 0 || history.len() <= self.min_ngram {
             return Vec::new();
@@ -449,6 +455,22 @@ mod tests {
         let history = vec![1, 2, 9, 8, 7, 6, 1, 2];
         assert_eq!(drafter.draft(&history, 2), vec![9, 8]);
         assert_eq!(drafter.draft(&history, 10), vec![9, 8, 7, 6, 1, 2]);
+    }
+
+    #[test]
+    fn ngram_constructor_normalizes_bounds() {
+        let drafter = NGramDrafter::new(2, 5);
+        assert_eq!(drafter.min_ngram, 2);
+        assert_eq!(drafter.max_ngram, 5);
+        assert_eq!(drafter.draft(&[1, 2, 9, 8, 7, 6, 1, 2], 3), vec![9, 8, 7]);
+
+        let zero = NGramDrafter::new(0, 0);
+        assert_eq!(zero.min_ngram, 1);
+        assert_eq!(zero.max_ngram, 1);
+
+        let inverted = NGramDrafter::new(5, 2);
+        assert_eq!(inverted.min_ngram, 5);
+        assert_eq!(inverted.max_ngram, 5);
     }
 
     #[test]
