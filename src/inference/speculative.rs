@@ -23,6 +23,10 @@
 
 use crate::inference::{LlamaInferenceSession, LlamaSampler};
 use crate::Result;
+use std::{
+    cell::RefCell,
+    collections::{HashMap, VecDeque},
+};
 
 /// Default drafted tokens per round for the n-gram drafter. The n-gram lookup
 /// itself is nearly free, but each extra draft widens the batched verify GEMM, so
@@ -80,10 +84,50 @@ impl SpeculativeDrafter {
 /// Prompt-lookup drafting: find the longest n-gram suffix of `history`
 /// (between `min_ngram` and `max_ngram`) that occurred earlier, preferring
 /// the most recent occurrence, and propose the tokens that followed it.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct NGramDrafter {
     pub max_ngram: usize,
     pub min_ngram: usize,
+    index: RefCell<BoundedNGramIndex>,
+}
+
+impl Clone for NGramDrafter {
+    fn clone(&self) -> Self {
+        // A clone is a new drafting stream. Copying a long prompt index is
+        // expensive and can also couple two unrelated histories; preserve the
+        // policy/capacity and let the clone index its own first history.
+        Self::new_with_index_capacity(
+            self.min_ngram,
+            self.max_ngram,
+            self.index.borrow().max_entries,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NGramIndexStats {
+    pub indexed_tokens: usize,
+    pub records: usize,
+    pub rebuilds: u64,
+    pub appended_tokens: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct NGramKey {
+    len: usize,
+    hash: u64,
+}
+
+#[derive(Debug, Clone)]
+struct BoundedNGramIndex {
+    history: Vec<u32>,
+    occurrences: HashMap<NGramKey, VecDeque<usize>>,
+    insertion_order: VecDeque<(NGramKey, usize)>,
+    max_entries: usize,
+    min_ngram: usize,
+    max_ngram: usize,
+    rebuilds: u64,
+    appended_tokens: u64,
 }
 
 impl Default for NGramDrafter {
@@ -97,9 +141,20 @@ impl Default for NGramDrafter {
 
 impl NGramDrafter {
     pub fn new(min_ngram: usize, max_ngram: usize) -> Self {
+        Self::new_with_index_capacity(
+            min_ngram,
+            max_ngram,
+            crate::runtime_config::ngram_index_max_entries(),
+        )
+    }
+
+    pub fn new_with_index_capacity(min_ngram: usize, max_ngram: usize, max_entries: usize) -> Self {
+        let min_ngram = min_ngram.max(1);
+        let max_ngram = max_ngram.max(min_ngram);
         Self {
-            min_ngram: min_ngram.max(1),
-            max_ngram: max_ngram.max(min_ngram.max(1)),
+            min_ngram,
+            max_ngram,
+            index: RefCell::new(BoundedNGramIndex::new(min_ngram, max_ngram, max_entries)),
         }
     }
 
@@ -107,25 +162,132 @@ impl NGramDrafter {
         if max_tokens == 0 || self.min_ngram == 0 || history.len() <= self.min_ngram {
             return Vec::new();
         }
-        let len = history.len();
+        let mut index = self.index.borrow_mut();
+        index.sync(history);
+        index.draft(max_tokens)
+    }
+
+    pub fn index_stats(&self) -> NGramIndexStats {
+        self.index.borrow().stats()
+    }
+}
+
+impl BoundedNGramIndex {
+    fn new(min_ngram: usize, max_ngram: usize, max_entries: usize) -> Self {
+        Self {
+            history: Vec::new(),
+            occurrences: HashMap::new(),
+            insertion_order: VecDeque::new(),
+            max_entries: max_entries.max(1),
+            min_ngram,
+            max_ngram,
+            rebuilds: 0,
+            appended_tokens: 0,
+        }
+    }
+
+    fn sync(&mut self, history: &[u32]) {
+        let append_only = self.history.len() <= history.len() && history.starts_with(&self.history);
+        if !append_only {
+            self.history.clear();
+            self.occurrences.clear();
+            self.insertion_order.clear();
+            self.rebuilds = self.rebuilds.saturating_add(1);
+        }
+        let old_len = self.history.len();
+        for &token in &history[old_len..] {
+            self.history.push(token);
+            self.index_new_tail();
+        }
+        self.appended_tokens = self
+            .appended_tokens
+            .saturating_add((history.len() - old_len) as u64);
+    }
+
+    fn index_new_tail(&mut self) {
+        let end = self.history.len();
+        for len in self.min_ngram..=self.max_ngram.min(end) {
+            let start = end - len;
+            let key = NGramKey {
+                len,
+                hash: hash_ngram(&self.history[start..end]),
+            };
+            self.occurrences.entry(key).or_default().push_back(start);
+            self.insertion_order.push_back((key, start));
+        }
+        while self.insertion_order.len() > self.max_entries {
+            let (key, start) = self
+                .insertion_order
+                .pop_front()
+                .expect("length checked above");
+            let remove_key = if let Some(starts) = self.occurrences.get_mut(&key) {
+                if starts.front() == Some(&start) {
+                    starts.pop_front();
+                } else if let Some(index) = starts.iter().position(|candidate| *candidate == start)
+                {
+                    starts.remove(index);
+                }
+                starts.is_empty()
+            } else {
+                false
+            };
+            if remove_key {
+                self.occurrences.remove(&key);
+            }
+        }
+    }
+
+    fn draft(&self, max_tokens: usize) -> Vec<u32> {
+        let len = self.history.len();
         let max_n = self.max_ngram.min(len.saturating_sub(1));
         for n in (self.min_ngram..=max_n).rev() {
-            let pattern = &history[len - n..];
-            // Most recent earlier occurrence; the window at len-n is the
-            // suffix itself and is excluded.
-            for start in (0..len - n).rev() {
-                if &history[start..start + n] == pattern {
-                    let continuation_start = start + n;
-                    let continuation_end = (continuation_start + max_tokens).min(len);
-                    if continuation_start < continuation_end {
-                        return history[continuation_start..continuation_end].to_vec();
-                    }
-                    break;
+            let suffix_start = len - n;
+            let pattern = &self.history[suffix_start..];
+            let key = NGramKey {
+                len: n,
+                hash: hash_ngram(pattern),
+            };
+            let Some(starts) = self.occurrences.get(&key) else {
+                continue;
+            };
+            for &start in starts.iter().rev() {
+                // Exclude the suffix itself and token-verify every hash hit.
+                // A collision can cost lookup work, never change a draft.
+                if start >= suffix_start
+                    || &self.history[start..start + n] != pattern
+                    || start + n >= len
+                {
+                    continue;
                 }
+                let continuation_start = start + n;
+                let continuation_end = (continuation_start + max_tokens).min(len);
+                return self.history[continuation_start..continuation_end].to_vec();
             }
         }
         Vec::new()
     }
+
+    fn stats(&self) -> NGramIndexStats {
+        NGramIndexStats {
+            indexed_tokens: self.history.len(),
+            records: self.insertion_order.len(),
+            rebuilds: self.rebuilds,
+            appended_tokens: self.appended_tokens,
+        }
+    }
+}
+
+fn hash_ngram(tokens: &[u32]) -> u64 {
+    // Stable FNV-1a over token bytes. Hashes are lookup accelerators only:
+    // every candidate is compared token-for-token before it can draft.
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for token in tokens {
+        for byte in token.to_le_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    hash
 }
 
 /// Draft-model drafting: a smaller model with the SAME token mapping runs
@@ -448,10 +610,7 @@ mod tests {
 
     #[test]
     fn ngram_caps_at_requested_tokens() {
-        let drafter = NGramDrafter {
-            max_ngram: 3,
-            min_ngram: 2,
-        };
+        let drafter = NGramDrafter::new(2, 3);
         let history = vec![1, 2, 9, 8, 7, 6, 1, 2];
         assert_eq!(drafter.draft(&history, 2), vec![9, 8]);
         assert_eq!(drafter.draft(&history, 10), vec![9, 8, 7, 6, 1, 2]);
@@ -471,6 +630,131 @@ mod tests {
         let inverted = NGramDrafter::new(5, 2);
         assert_eq!(inverted.min_ngram, 5);
         assert_eq!(inverted.max_ngram, 5);
+    }
+
+    fn reference_ngram_draft(
+        history: &[u32],
+        min_ngram: usize,
+        max_ngram: usize,
+        max_tokens: usize,
+    ) -> Vec<u32> {
+        if max_tokens == 0 || history.len() <= min_ngram {
+            return Vec::new();
+        }
+        let len = history.len();
+        let max_n = max_ngram.min(len.saturating_sub(1));
+        for n in (min_ngram..=max_n).rev() {
+            let pattern = &history[len - n..];
+            for start in (0..len - n).rev() {
+                if &history[start..start + n] == pattern {
+                    let continuation_start = start + n;
+                    let continuation_end = (continuation_start + max_tokens).min(len);
+                    if continuation_start < continuation_end {
+                        return history[continuation_start..continuation_end].to_vec();
+                    }
+                    break;
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    #[test]
+    fn indexed_ngram_matches_reference_scanner() {
+        let drafter = NGramDrafter::new_with_index_capacity(2, 6, 1_000_000);
+        let mut history = Vec::new();
+        let mut state = 0x9e37_79b9u32;
+        for step in 0..1200usize {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            // Small alphabet creates matches; occasional copied runs exercise
+            // longest-match and most-recent tie-breaking.
+            let token = if step > 32 && step % 17 < 5 {
+                history[step - 17]
+            } else {
+                state % 23
+            };
+            history.push(token);
+            for max_tokens in [1usize, 3, 7] {
+                assert_eq!(
+                    drafter.draft(&history, max_tokens),
+                    reference_ngram_draft(&history, 2, 6, max_tokens),
+                    "indexed/reference mismatch at history length {}",
+                    history.len()
+                );
+            }
+        }
+        let stats = drafter.index_stats();
+        assert_eq!(stats.indexed_tokens, history.len());
+        assert_eq!(
+            stats.rebuilds, 0,
+            "append-only history must stay incremental"
+        );
+    }
+
+    #[test]
+    fn ngram_index_is_bounded_and_survives_rollback() {
+        let drafter = NGramDrafter::new_with_index_capacity(2, 5, 48);
+        let mut history: Vec<u32> = (0..400).map(|i| (i % 19) as u32).collect();
+        let _ = drafter.draft(&history, 5);
+        assert!(drafter.index_stats().records <= 48);
+
+        history.truncate(220);
+        let indexed = drafter.draft(&history, 5);
+        let reference = reference_ngram_draft(&history, 2, 5, 5);
+        // The bounded index may intentionally miss an evicted old pattern,
+        // but any proposal it does return must retain exact scan semantics.
+        assert!(indexed.is_empty() || indexed == reference);
+        let stats = drafter.index_stats();
+        assert_eq!(stats.indexed_tokens, history.len());
+        assert!(stats.records <= 48);
+        assert_eq!(stats.rebuilds, 1);
+
+        history.extend([7, 8, 9, 7, 8, 9]);
+        let _ = drafter.draft(&history, 3);
+        assert_eq!(
+            drafter.index_stats().rebuilds,
+            1,
+            "append after rollback rebuild must be incremental"
+        );
+    }
+
+    #[test]
+    #[ignore = "microbenchmark; run explicitly with --release --nocapture"]
+    fn indexed_ngram_microbench_against_reference_scan() {
+        use std::{hint::black_box, time::Instant};
+
+        const BASE_TOKENS: usize = 16_384;
+        const ROUNDS: usize = 512;
+        let appended: Vec<u32> = (BASE_TOKENS..BASE_TOKENS + ROUNDS)
+            .map(|token| token as u32)
+            .collect();
+
+        let drafter = NGramDrafter::new_with_index_capacity(3, 4, 100_000);
+        let mut indexed_history: Vec<u32> = (0..BASE_TOKENS as u32).collect();
+        assert!(drafter.draft(&indexed_history, 5).is_empty());
+        let indexed_start = Instant::now();
+        for token in &appended {
+            indexed_history.push(*token);
+            black_box(drafter.draft(black_box(&indexed_history), 5));
+        }
+        let indexed_elapsed = indexed_start.elapsed();
+
+        let mut reference_history: Vec<u32> = (0..BASE_TOKENS as u32).collect();
+        let reference_start = Instant::now();
+        for token in &appended {
+            reference_history.push(*token);
+            black_box(reference_ngram_draft(
+                black_box(&reference_history),
+                3,
+                4,
+                5,
+            ));
+        }
+        let reference_elapsed = reference_start.elapsed();
+        println!(
+            "ngram lookup: indexed={indexed_elapsed:?}, scan={reference_elapsed:?}, speedup={:.2}x",
+            reference_elapsed.as_secs_f64() / indexed_elapsed.as_secs_f64()
+        );
     }
 
     #[test]

@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "projects": [
+    {
+      "id": "runtime-capability-registry",
+      "project": 2,
+      "status": "implemented",
+      "default_enabled": true,
+      "configuration": [],
+      "dependencies": [],
+      "evidence": [
+        "runtime_manifest::tests::bundled_runtime_manifest_is_valid_and_covers_selected_projects",
+        "api::tests::capabilities_expose_runtime_project_registry"
+      ],
+      "safety_contract": "Runtime project status is distinct from exact model support and cannot promote model compatibility rows."
+    },
+    {
+      "id": "cpu-kquant-prefill-owner",
+      "project": 4,
+      "status": "parity_gated",
+      "default_enabled": false,
+      "configuration": [
+        "CAMELID_X86_KQUANT_MATMUL_OWNER"
+      ],
+      "dependencies": [
+        "runtime-capability-registry"
+      ],
+      "evidence": [
+        "inference::tests::q4_k_owner_prefill_bitwise_matches_block_dot_core",
+        "inference::tests::q6_k_owner_prefill_bitwise_matches_block_dot_core"
+      ],
+      "safety_contract": "Owner dispatch remains opt-in until repeatable end-to-end prefill receipts show a win; outputs must remain bit-identical to block-dot."
+    },
+    {
+      "id": "indexed-ngram-speculation",
+      "project": 5,
+      "status": "implemented_default_when_ngram_selected",
+      "default_enabled": false,
+      "configuration": [
+        "CAMELID_SPEC_DECODE=ngram",
+        "CAMELID_NGRAM_INDEX_MAX_ENTRIES"
+      ],
+      "dependencies": [
+        "runtime-capability-registry"
+      ],
+      "evidence": [
+        "inference::speculative::tests::indexed_ngram_matches_reference_scanner",
+        "inference::speculative::tests::ngram_index_is_bounded_and_survives_rollback"
+      ],
+      "safety_contract": "Candidate hashes are always token-verified and retained candidates preserve longest-then-most-recent scan semantics; bounded eviction may suppress a draft but can never alter target-model output."
+    },
+    {
+      "id": "unified-kv-sequence-pool",
+      "project": 6,
+      "status": "foundation_default_off",
+      "default_enabled": false,
+      "configuration": [
+        "CAMELID_KV_POOL_BUDGET_BYTES"
+      ],
+      "dependencies": [
+        "runtime-capability-registry"
+      ],
+      "evidence": [
+        "inference::kv_pool::tests::pool_enforces_global_budget_and_evicts_only_idle_sequences",
+        "inference::kv_pool::tests::checkpoint_rollback_is_sequence_local"
+      ],
+      "safety_contract": "Sequence IDs isolate cache state; active leases are never evicted; global allocation is checked before admission."
+    },
+    {
+      "id": "continuous-batch-scheduler",
+      "project": 7,
+      "status": "foundation_default_one_slot",
+      "default_enabled": false,
+      "configuration": [
+        "CAMELID_CONTINUOUS_BATCH_SLOTS"
+      ],
+      "dependencies": [
+        "runtime-capability-registry",
+        "unified-kv-sequence-pool"
+      ],
+      "evidence": [
+        "api::continuous_batch::tests::round_robin_is_fair_and_slot_bounded",
+        "api::engine::tests::slot_snapshot_tracks_real_active_task"
+      ],
+      "safety_contract": "The production engine remains single-owner by default; multi-slot token stepping is not advertised as production-ready until inference integration and throughput/parity receipts land."
+    }
+  ]
+}

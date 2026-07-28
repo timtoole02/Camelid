@@ -25,6 +25,8 @@ use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
+#[allow(dead_code)]
+mod continuous_batch;
 mod engine;
 mod workspace;
 
@@ -484,6 +486,9 @@ pub struct CapabilitiesResponse {
     pub supported_model_families: Vec<SupportItem>,
     pub planned_model_families: Vec<SupportItem>,
     pub model_compatibility: Vec<ModelCompatibilityTarget>,
+    /// Machine-readable implementation/evidence state for runtime projects.
+    /// This registry is intentionally separate from model support rows.
+    pub runtime_projects: Vec<crate::runtime_manifest::RuntimeProjectCapability>,
     pub api_features: Vec<SupportItem>,
     pub notes: Vec<&'static str>,
 }
@@ -1083,6 +1088,7 @@ pub struct LlamaServerSlotCamelid {
     /// Engine-queue backpressure gauge: generation jobs accepted and not yet
     /// finished (queued + running). See `HealthResponse::engine_queue_depth`.
     pub engine_queue_depth: usize,
+    pub queued_tasks: usize,
     pub unsupported: Vec<&'static str>,
 }
 
@@ -2641,8 +2647,10 @@ async fn llama_server_slots(
     let loaded_models = state.loaded_models.read().await;
     let model = active_id_lock.as_ref().and_then(|id| loaded_models.get(id));
     let generation_ready = model.is_some_and(loaded_model_generation_ready);
+    let slot = state.engine.slot_snapshot();
 
-    if query.fail_on_no_slot.as_deref() == Some("1") && !generation_ready {
+    if query.fail_on_no_slot.as_deref() == Some("1") && (!generation_ready || slot.is_processing())
+    {
         return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "no_available_slot",
@@ -2655,20 +2663,26 @@ async fn llama_server_slots(
         .and_then(|model| model.llama_config.as_ref())
         .map(|config| config.context_length)
         .unwrap_or(0);
-    let status = if generation_ready {
-        "idle_generation_ready"
-    } else {
+    let status = if !generation_ready {
         "unavailable"
+    } else if slot.is_processing() {
+        "processing"
+    } else {
+        "idle_generation_ready"
     };
+    let id_task = slot
+        .active_task_id
+        .map(|id| id.min(i32::MAX as u64) as i32)
+        .unwrap_or(-1);
 
     (
         StatusCode::OK,
         Json(vec![LlamaServerSlotResponse {
             id: 0,
-            id_task: -1,
+            id_task,
             n_ctx,
             speculative: false,
-            is_processing: false,
+            is_processing: slot.is_processing(),
             params: LlamaServerDefaultGenerationParams {
                 n_predict: -1,
                 seed: u32::MAX,
@@ -2697,6 +2711,7 @@ async fn llama_server_slots(
                 generation_ready,
                 status,
                 engine_queue_depth: state.engine.depth(),
+                queued_tasks: slot.queued_tasks,
                 unsupported: vec![
                     "post_slots",
                     "slot_cache_save_restore_erase",
@@ -4690,6 +4705,9 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 next_step: "capture acquisition path, model SHA and license/access notes, then add tokenizer/chat-template fixtures and bounded metadata/load checks before any runtime-support wording",
             },
         ],
+        runtime_projects: crate::runtime_manifest::runtime_capability_manifest()
+            .projects
+            .clone(),
         api_features: vec![
             SupportItem {
                 id: "camelid_verify",
@@ -15608,6 +15626,34 @@ mod tests {
         let response = capabilities_response_with_plan(Some(plan.clone()));
 
         assert_eq!(response.execution_plan, Some(plan));
+    }
+
+    #[test]
+    fn capabilities_expose_runtime_project_registry() {
+        let response = capabilities_response();
+        let projects: HashMap<_, _> = response
+            .runtime_projects
+            .iter()
+            .map(|item| (item.project, item))
+            .collect();
+        assert_eq!(projects.len(), 5);
+        for project in [2u32, 4, 5, 6, 7] {
+            let item = projects
+                .get(&project)
+                .unwrap_or_else(|| panic!("project {project} missing"));
+            assert!(!item.id.is_empty());
+            assert!(!item.status.is_empty());
+            assert!(!item.evidence.is_empty());
+            assert!(!item.safety_contract.is_empty());
+        }
+        assert!(
+            !projects[&4].default_enabled,
+            "CPU prefill promotion remains evidence-gated"
+        );
+        assert!(
+            !projects[&7].default_enabled,
+            "continuous batching remains default-neutral until integrated"
+        );
     }
 
     #[test]

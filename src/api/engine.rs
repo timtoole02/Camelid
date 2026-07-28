@@ -17,15 +17,14 @@
 //! and queued jobs from dropped handlers return immediately when they run.
 
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc,
 };
 
 /// Bounded queue depth (queued jobs, not counting the one running).
 /// Overridable for hardening runs; the default keeps a small, honest queue —
 /// beyond it the server answers 503 rather than parking unbounded waiters.
-pub(crate) const QUEUE_DEPTH_ENV: &str = "CAMELID_QUEUE_DEPTH";
-const DEFAULT_QUEUE_DEPTH: usize = 8;
+pub(crate) const QUEUE_DEPTH_ENV: &str = crate::runtime_config::ENGINE_QUEUE_DEPTH_ENV;
 
 type ExclusiveJob = Box<dyn FnOnce() + Send + 'static>;
 
@@ -57,14 +56,36 @@ pub(crate) struct EngineHandle {
     /// Jobs accepted but not yet finished (queued + running). Surfaced in
     /// `/v1/health` and `/v1/slots` so backpressure is observable.
     depth: Arc<AtomicUsize>,
+    /// Real task currently executing on the single-owner engine. Zero means
+    /// idle; public snapshots convert the sentinel to `None`.
+    active_task_id: Arc<AtomicU64>,
+    next_task_id: Arc<AtomicU64>,
 }
 
 fn queue_depth_from_env() -> usize {
-    std::env::var(QUEUE_DEPTH_ENV)
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|depth| *depth >= 1)
-        .unwrap_or(DEFAULT_QUEUE_DEPTH)
+    crate::runtime_config::engine_queue_depth()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EngineSlotSnapshot {
+    pub(crate) active_task_id: Option<u64>,
+    pub(crate) queued_tasks: usize,
+}
+
+impl EngineSlotSnapshot {
+    pub(crate) fn is_processing(self) -> bool {
+        self.active_task_id.is_some()
+    }
+}
+
+struct ActiveTaskGuard {
+    active_task_id: Arc<AtomicU64>,
+}
+
+impl Drop for ActiveTaskGuard {
+    fn drop(&mut self) {
+        self.active_task_id.store(0, Ordering::SeqCst);
+    }
 }
 
 impl EngineHandle {
@@ -73,6 +94,7 @@ impl EngineHandle {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<EngineTask>(queue_depth_from_env());
         let depth = Arc::new(AtomicUsize::new(0));
         let worker_depth = Arc::clone(&depth);
+        let active_task_id = Arc::new(AtomicU64::new(0));
         std::thread::Builder::new()
             .name("camelid-engine".to_string())
             .spawn(move || {
@@ -92,7 +114,12 @@ impl EngineHandle {
                 }
             })
             .expect("spawn camelid-engine worker thread");
-        Self { tx, depth }
+        Self {
+            tx,
+            depth,
+            active_task_id,
+            next_task_id: Arc::new(AtomicU64::new(1)),
+        }
     }
 
     /// Jobs accepted and not yet finished.
@@ -100,10 +127,30 @@ impl EngineHandle {
         self.depth.load(Ordering::SeqCst)
     }
 
+    /// Privacy-safe, read-only state for the production engine's real slot.
+    /// Queue depth remains separate because queued jobs do not own a slot.
+    pub(crate) fn slot_snapshot(&self) -> EngineSlotSnapshot {
+        let active = self.active_task_id.load(Ordering::SeqCst);
+        let depth = self.depth();
+        EngineSlotSnapshot {
+            active_task_id: (active != 0).then_some(active),
+            queued_tasks: depth.saturating_sub(usize::from(active != 0)),
+        }
+    }
+
     /// Post a job without waiting for queue room: full queue is an explicit,
     /// typed condition (503 + Retry-After at the HTTP layer), never an
     /// invisible pile of waiters.
     pub(crate) fn post(&self, task: EngineTask) -> Result<(), EnginePostError> {
+        let task_id = self.next_task_id.fetch_add(1, Ordering::SeqCst);
+        let active_task_id = Arc::clone(&self.active_task_id);
+        let task = match task {
+            EngineTask::Exclusive(job) => EngineTask::Exclusive(Box::new(move || {
+                active_task_id.store(task_id, Ordering::SeqCst);
+                let _guard = ActiveTaskGuard { active_task_id };
+                job();
+            })),
+        };
         self.depth.fetch_add(1, Ordering::SeqCst);
         match self.tx.try_send(task) {
             Ok(()) => Ok(()),
@@ -228,5 +275,40 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "depth never drained");
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn slot_snapshot_tracks_real_active_task() {
+        let engine = EngineHandle::spawn();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        engine
+            .post(EngineTask::Exclusive(Box::new(move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })))
+            .unwrap();
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("engine starts task");
+
+        let busy = engine.slot_snapshot();
+        assert!(busy.is_processing());
+        assert!(busy.active_task_id.is_some());
+        assert_eq!(busy.queued_tasks, 0);
+
+        release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while engine.depth() != 0 {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            engine.slot_snapshot(),
+            EngineSlotSnapshot {
+                active_task_id: None,
+                queued_tasks: 0,
+            }
+        );
     }
 }

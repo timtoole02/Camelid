@@ -31,6 +31,8 @@ pub mod offload;
 pub mod platform_fs;
 pub mod receipt;
 pub mod runnable;
+pub mod runtime_config;
+pub mod runtime_manifest;
 pub mod telemetry;
 pub mod tensor;
 pub mod tokenizer;

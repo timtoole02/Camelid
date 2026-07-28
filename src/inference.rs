@@ -31,6 +31,7 @@ pub mod draft_merge;
 pub(crate) mod gemma4;
 mod kv_cache;
 mod kv_f16;
+pub mod kv_pool;
 mod metal_resident;
 mod metal_seam;
 mod q8_block_reader;
@@ -61,6 +62,10 @@ pub use diagnostic_config::{
 };
 pub use kv_cache::{
     KvDtype, KvLayout, LlamaKvCache, LlamaKvCachePlan, LlamaKvCachePositionTrace, LlamaKvCacheTrace,
+};
+pub use kv_pool::{
+    KvPoolError, KvPoolSnapshot, KvSequenceCheckpoint, KvSequenceId, KvSequenceState,
+    UnifiedKvCachePool,
 };
 pub use q8_block_reader::Q8BlockReader;
 use q8_runtime::{
@@ -18864,16 +18869,15 @@ fn matmul_rhs_transposed_q4_k_block_dot(
 fn x86_kquant_matmul_owner_enabled() -> bool {
     #[cfg(test)]
     {
-        q8_0_env_flag_enabled_default_off("CAMELID_X86_KQUANT_MATMUL_OWNER")
+        crate::runtime_config::kquant_prefill_owner_enabled()
     }
     #[cfg(not(test))]
     {
         if q8_runtime::bench_uncached_runtime_plan() {
-            return q8_0_env_flag_enabled_default_off("CAMELID_X86_KQUANT_MATMUL_OWNER");
+            return crate::runtime_config::kquant_prefill_owner_enabled();
         }
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED
-            .get_or_init(|| q8_0_env_flag_enabled_default_off("CAMELID_X86_KQUANT_MATMUL_OWNER"))
+        *ENABLED.get_or_init(crate::runtime_config::kquant_prefill_owner_enabled)
     }
 }
 
@@ -19714,78 +19718,86 @@ fn q6_k_owner_prefill_tiled(
     let chunks = out_dim.div_ceil(WEIGHT_CHUNK);
     for row_start in (0..n_rows).step_by(ROW_BLOCK) {
         let row_end = (row_start + ROW_BLOCK).min(n_rows);
-        (0..chunks).into_par_iter().for_each(|chunk_idx| {
-            let o_start = chunk_idx * WEIGHT_CHUNK;
-            let o_end = (o_start + WEIGHT_CHUNK).min(out_dim);
-            // Per-task hoist scratch: rebuilt weights + scales + super-scale
-            // per superblock, reused across the chunk's weight rows.
-            let mut a_all = vec![0i8; superblocks * Q6_K_VALUES_PER_BLOCK];
-            let mut wsc = vec![0u8; superblocks * 16];
-            let mut wd = vec![0f32; superblocks];
-            for o in o_start..o_end {
-                let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
-                for i in 0..superblocks {
-                    let block =
-                        &w_row[i * Q6_K_WIRE_BYTES_PER_BLOCK..(i + 1) * Q6_K_WIRE_BYTES_PER_BLOCK];
-                    wd[i] = f16_bits_to_f32(u16::from_le_bytes([block[208], block[209]]));
-                    wsc[i * 16..(i + 1) * 16].copy_from_slice(&block[192..208]);
-                    let a_slice = &mut a_all[i * Q6_K_VALUES_PER_BLOCK..];
-                    // SAFETY-free reborrow into the fixed-size rebuild target.
-                    let a_arr: &mut [i8; Q6_K_VALUES_PER_BLOCK] = (&mut a_slice
-                        [..Q6_K_VALUES_PER_BLOCK])
-                        .try_into()
-                        .expect("owner rebuild slice is exactly one superblock");
-                    q6_k_owner_rebuild_superblock(block, a_arr);
-                }
-                let block_rows = row_end - row_start;
-                let mut sumf_block = [0f32; ROW_BLOCK];
-                for (r, blocks) in preps[row_start..row_end].iter().enumerate() {
-                    // Load-bearing f32 shape: 8 lane accumulators per CELL,
-                    // reduced once after all superblocks — verbatim
-                    // `q6_k_wire_row_dot`.
-                    let mut sums = [0f32; 8];
-                    for (i, y) in blocks.iter().enumerate().take(superblocks) {
-                        let d = wd[i] * y.d;
-                        let a: &[i8; Q6_K_VALUES_PER_BLOCK] = a_all
-                            [i * Q6_K_VALUES_PER_BLOCK..(i + 1) * Q6_K_VALUES_PER_BLOCK]
+        (0..chunks).into_par_iter().for_each_init(
+            // Reuse scratch for every chunk executed by one Rayon worker.
+            // The old per-chunk allocation repeated for each 64-row prompt
+            // block on wide projections.
+            || {
+                (
+                    vec![0i8; superblocks * Q6_K_VALUES_PER_BLOCK],
+                    vec![0u8; superblocks * 16],
+                    vec![0f32; superblocks],
+                )
+            },
+            |scratch, chunk_idx| {
+                let (a_all, wsc, wd) = scratch;
+                let o_start = chunk_idx * WEIGHT_CHUNK;
+                let o_end = (o_start + WEIGHT_CHUNK).min(out_dim);
+                for o in o_start..o_end {
+                    let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
+                    for i in 0..superblocks {
+                        let block = &w_row
+                            [i * Q6_K_WIRE_BYTES_PER_BLOCK..(i + 1) * Q6_K_WIRE_BYTES_PER_BLOCK];
+                        wd[i] = f16_bits_to_f32(u16::from_le_bytes([block[208], block[209]]));
+                        wsc[i * 16..(i + 1) * 16].copy_from_slice(&block[192..208]);
+                        let a_slice = &mut a_all[i * Q6_K_VALUES_PER_BLOCK..];
+                        // SAFETY-free reborrow into the fixed-size rebuild target.
+                        let a_arr: &mut [i8; Q6_K_VALUES_PER_BLOCK] = (&mut a_slice
+                            [..Q6_K_VALUES_PER_BLOCK])
                             .try_into()
-                            .expect("owner superblock slice is exactly 256 weights");
-                        let scales: &[u8; 16] = wsc[i * 16..(i + 1) * 16]
-                            .try_into()
-                            .expect("owner scale slice is exactly 16 bytes");
-                        // `use_avx2` is read on every target (the cfg split is
-                        // inside the arm), so non-x86 builds see no unused
-                        // binding.
-                        let aux32 = if use_avx2 {
-                            #[cfg(target_arch = "x86_64")]
-                            // SAFETY: avx2 confirmed present at dispatch; the
-                            // fixed-size array refs guarantee the 256/16-byte
-                            // reads are in bounds.
-                            unsafe {
-                                q6_k_owner_aux32_avx2(a, scales, &y.qs)
+                            .expect("owner rebuild slice is exactly one superblock");
+                        q6_k_owner_rebuild_superblock(block, a_arr);
+                    }
+                    let block_rows = row_end - row_start;
+                    let mut sumf_block = [0f32; ROW_BLOCK];
+                    for (r, blocks) in preps[row_start..row_end].iter().enumerate() {
+                        // Load-bearing f32 shape: 8 lane accumulators per CELL,
+                        // reduced once after all superblocks — verbatim
+                        // `q6_k_wire_row_dot`.
+                        let mut sums = [0f32; 8];
+                        for (i, y) in blocks.iter().enumerate().take(superblocks) {
+                            let d = wd[i] * y.d;
+                            let a: &[i8; Q6_K_VALUES_PER_BLOCK] = a_all
+                                [i * Q6_K_VALUES_PER_BLOCK..(i + 1) * Q6_K_VALUES_PER_BLOCK]
+                                .try_into()
+                                .expect("owner superblock slice is exactly 256 weights");
+                            let scales: &[u8; 16] = wsc[i * 16..(i + 1) * 16]
+                                .try_into()
+                                .expect("owner scale slice is exactly 16 bytes");
+                            // `use_avx2` is read on every target (the cfg split is
+                            // inside the arm), so non-x86 builds see no unused
+                            // binding.
+                            let aux32 = if use_avx2 {
+                                #[cfg(target_arch = "x86_64")]
+                                // SAFETY: avx2 confirmed present at dispatch; the
+                                // fixed-size array refs guarantee the 256/16-byte
+                                // reads are in bounds.
+                                unsafe {
+                                    q6_k_owner_aux32_avx2(a, scales, &y.qs)
+                                }
+                                #[cfg(not(target_arch = "x86_64"))]
+                                q6_k_owner_aux32_scalar(a, scales, &y.qs)
+                            } else {
+                                q6_k_owner_aux32_scalar(a, scales, &y.qs)
+                            };
+                            for l in 0..8 {
+                                sums[l] += d * aux32[l] as f32;
                             }
-                            #[cfg(not(target_arch = "x86_64"))]
-                            q6_k_owner_aux32_scalar(a, scales, &y.qs)
-                        } else {
-                            q6_k_owner_aux32_scalar(a, scales, &y.qs)
-                        };
-                        for l in 0..8 {
-                            sums[l] += d * aux32[l] as f32;
+                        }
+                        sumf_block[r] = sums.iter().sum();
+                    }
+                    let ptr = out_ptr;
+                    for (r, sumf) in sumf_block[..block_rows].iter().enumerate() {
+                        // SAFETY: (row, o) cells are disjoint across tasks — this
+                        // task exclusively owns channels [o_start, o_end) and the
+                        // row loop is serial within the task.
+                        unsafe {
+                            *ptr.0.add((row_start + r) * out_dim + o) = *sumf;
                         }
                     }
-                    sumf_block[r] = sums.iter().sum();
                 }
-                let ptr = out_ptr;
-                for (r, sumf) in sumf_block[..block_rows].iter().enumerate() {
-                    // SAFETY: (row, o) cells are disjoint across tasks — this
-                    // task exclusively owns channels [o_start, o_end) and the
-                    // row loop is serial within the task.
-                    unsafe {
-                        *ptr.0.add((row_start + r) * out_dim + o) = *sumf;
-                    }
-                }
-            }
-        });
+            },
+        );
     }
     CpuTensor::from_f32(name, vec![n_rows, out_dim], out)
 }

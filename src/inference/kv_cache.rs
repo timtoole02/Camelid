@@ -524,6 +524,24 @@ impl LlamaKvCache {
         }
     }
 
+    /// Allocation size after reserving `required_sequence_length`, without
+    /// mutating or allocating. The unified multi-sequence pool uses this to
+    /// enforce its global budget before any individual cache grows.
+    pub(crate) fn projected_allocated_bytes(&self, required_sequence_length: usize) -> Result<u64> {
+        if required_sequence_length > self.plan.max_sequence_length {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "KV cache position {required_sequence_length} exceeds context length {}",
+                self.plan.max_sequence_length
+            )));
+        }
+        let target = if required_sequence_length <= self.allocated_sequence_length {
+            self.allocated_sequence_length
+        } else {
+            self.grow_sequence_length(required_sequence_length)
+        };
+        Ok((target as u64).saturating_mul(self.kv_bytes_per_token()))
+    }
+
     /// Whether the f32 `keys`/`values` buffers are ADDRESSABLE over `[0, position)` for every
     /// layer through `last_layer` — i.e. whether a reader may index them with
     /// [`offset`](Self::offset) over that range without going out of bounds.
