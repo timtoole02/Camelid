@@ -2,7 +2,7 @@
 
 Date: 2026-07-28
 
-Repository: `C:\Users\timto\Documents\GitHub\Camelid`
+Repository: Camelid repository root
 
 Baseline: clean `origin/main` at `f8649c6294aac0ab742890328320e80cc0434085`
 
