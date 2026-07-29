@@ -46,6 +46,21 @@ const MAX_GOAL_BYTES: usize = 4 * 1024;
 const EVENT_CLAIM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const AUTO_COMPACT_TRIGGER_PERCENT: u32 = 75;
 
+/// Whether a stored thread belongs to `mode`, by its id prefix.
+///
+/// The prefix is the whole cross-mode boundary: a read-only Workspace thread
+/// resumed as Code would inherit write tools it was never approved for, and a
+/// Code thread resumed read-only would silently lose them. One function so the
+/// resume gate and both thread listings cannot drift apart.
+fn thread_id_belongs_to_mode(thread_id: &str, mode: WorkspaceRunMode) -> bool {
+    let expected = if mode.is_code() {
+        "code-"
+    } else {
+        "workspace-"
+    };
+    thread_id.starts_with(expected)
+}
+
 fn workspace_max_steps(mode: WorkspaceRunMode, requested: Option<usize>) -> Result<usize, ()> {
     if mode.is_code() {
         return Ok(0);
@@ -97,6 +112,11 @@ struct ActiveWorkspaceSession {
     id: String,
     workspace: PathBuf,
     model_id: String,
+    /// Digest of the artifact that opened the session. An id alone does not
+    /// identify a model: a re-pulled or replaced GGUF keeps its filename, and
+    /// an idle session survives an unload/reload, so follow-up turns check this
+    /// too — the same exactness `create_session`'s resume path applies.
+    model_sha256: String,
     max_steps: usize,
     max_tokens: u32,
     temperature: f32,
@@ -554,11 +574,7 @@ pub(super) async fn list_threads(
             .threads_for_root(&workspace, 20)?
             .into_iter()
             .filter(|thread| {
-                let mode_matches = if mode.is_code() {
-                    thread.id.starts_with("code-")
-                } else {
-                    thread.id.starts_with("workspace-")
-                };
+                let mode_matches = thread_id_belongs_to_mode(&thread.id, mode);
                 mode_matches && thread.model_id == model_id && thread.model_sha256 == model_sha256
             })
             .collect();
@@ -615,13 +631,7 @@ pub(super) async fn list_recent_threads(
         Ok(store
             .recent_threads(100)?
             .into_iter()
-            .filter(|thread| {
-                if mode.is_code() {
-                    thread.id.starts_with("code-")
-                } else {
-                    thread.id.starts_with("workspace-")
-                }
-            })
+            .filter(|thread| thread_id_belongs_to_mode(&thread.id, mode))
             .take(40)
             .collect::<Vec<_>>())
     })
@@ -1237,7 +1247,13 @@ pub(super) async fn create_session(
                 None,
             );
         }
-        *active = None;
+        // The finished session is NOT evicted here. Everything below can still
+        // fail — wrong mode, wrong artifact, unknown thread, memory store — and
+        // a refused request must not destroy the session it refused to replace:
+        // that session still owns the Changes view and the guarded undo for work
+        // already applied to the user's files, both of which resolve through the
+        // active slot. It is replaced wholesale on success (`*active = Some(..)`),
+        // and this lock is held throughout, so nothing observes a stale slot.
     }
 
     let canonical_root = simplify_path(&workspace);
@@ -1254,12 +1270,7 @@ pub(super) async fn create_session(
     let prepared = match run_workspace_blocking(move || -> anyhow::Result<_> {
         let memory = WorkspaceMemoryStore::open(default_store_path())?;
         let prepared = if let Some(thread_id) = resume_id {
-            let expected_prefix = if mode.is_code() {
-                "code-"
-            } else {
-                "workspace-"
-            };
-            if !thread_id.starts_with(expected_prefix) {
+            if !thread_id_belongs_to_mode(&thread_id, mode) {
                 return Ok(Err("mode_mismatch"));
             }
             let Some(stored) = memory.thread(&thread_id)? else {
@@ -1343,12 +1354,15 @@ pub(super) async fn create_session(
         semantic_retriever: semantic_retriever.clone(),
     };
     if mode.is_code() {
-        crate::chat::checkpoint::clear();
+        // Clears the workspace journal too, so this session's first undo cannot
+        // walk back into a previous session's (or its subagents') changes.
+        crate::chat::checkpoint::clear_for_workspace(&workspace);
     }
     let session = Arc::new(ActiveWorkspaceSession {
         id: id.clone(),
         workspace: workspace.clone(),
         model_id: model.id.clone(),
+        model_sha256: model.lane.gguf_sha256.to_string(),
         max_steps,
         max_tokens,
         temperature,
@@ -1463,6 +1477,9 @@ pub(super) async fn undo_session_change(
             false,
             std::time::Duration::from_secs(30),
         )?;
+        // Undo must walk back the newest change in the WORKSPACE, which may be a
+        // subagent's — see `workspace_changes_response`.
+        crate::chat::checkpoint::sync_from_store(sandbox.root());
         crate::chat::checkpoint::undo(&sandbox, request.force).map_err(anyhow::Error::msg)
     })
     .await
@@ -1500,6 +1517,10 @@ fn workspace_changes_response(
 ) -> anyhow::Result<WorkspaceChangesResponse> {
     let sandbox =
         crate::chat::tools::Sandbox::new(workspace, false, std::time::Duration::from_secs(30))?;
+    // Subagents write from their own processes, so their checkpoints live only
+    // in the workspace journal until this pulls them in. Without it the change
+    // set silently omits every file a delegated child touched.
+    crate::chat::checkpoint::sync_from_store(sandbox.root());
     let checkpoints = crate::chat::checkpoint::all();
     Ok(WorkspaceChangesResponse {
         summary: crate::chat::checkpoint::summary(),
@@ -1910,7 +1931,7 @@ pub(super) async fn send_message(
         Ok(value) => value,
         Err(response) => return response,
     };
-    if model.id != session.model_id {
+    if model.id != session.model_id || model.lane.gguf_sha256 != session.model_sha256 {
         return api_error(
             StatusCode::CONFLICT,
             "workspace_model_changed",
@@ -2407,6 +2428,37 @@ mod tests {
     }
 
     #[test]
+    fn thread_id_mode_boundary_is_a_single_rule() {
+        // Resuming across modes must fail closed in BOTH directions: a read-only
+        // thread must not gain write tools by being reopened as Code, and a Code
+        // thread must not be silently downgraded. The listings and the resume
+        // gate share this rule, so a fix to one cannot leave the other behind.
+        assert!(thread_id_belongs_to_mode(
+            "code-1111",
+            WorkspaceRunMode::Code
+        ));
+        assert!(!thread_id_belongs_to_mode(
+            "workspace-1111",
+            WorkspaceRunMode::Code
+        ));
+        assert!(thread_id_belongs_to_mode(
+            "workspace-1111",
+            WorkspaceRunMode::ReadOnly
+        ));
+        assert!(!thread_id_belongs_to_mode(
+            "code-1111",
+            WorkspaceRunMode::ReadOnly
+        ));
+        // Neither prefix is a prefix of the other, and an unprefixed id belongs
+        // to no mode at all.
+        assert!(!thread_id_belongs_to_mode("1111", WorkspaceRunMode::Code));
+        assert!(!thread_id_belongs_to_mode(
+            "1111",
+            WorkspaceRunMode::ReadOnly
+        ));
+    }
+
+    #[test]
     fn cancellation_stays_blocking_until_a_running_worker_exits() {
         let requested = WorkspaceSessionState::Running.after_cancel_request();
         assert_eq!(requested, WorkspaceSessionState::Cancelling);
@@ -2461,6 +2513,7 @@ mod tests {
                 id: "session-test".to_string(),
                 workspace: PathBuf::from("."),
                 model_id: "model-test".to_string(),
+                model_sha256: "sha-test".to_string(),
                 max_steps: 1,
                 max_tokens: 1,
                 temperature: 0.0,
@@ -2512,6 +2565,7 @@ mod tests {
             id: "thread".into(),
             workspace: dir.path().to_path_buf(),
             model_id: "model".into(),
+            model_sha256: "sha-test".to_string(),
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
@@ -2583,6 +2637,7 @@ mod tests {
             id: "thread".into(),
             workspace: dir.path().to_path_buf(),
             model_id: "model".into(),
+            model_sha256: "sha-test".to_string(),
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
@@ -2615,6 +2670,7 @@ mod tests {
             id: "thread".into(),
             workspace: dir.path().to_path_buf(),
             model_id: "model".into(),
+            model_sha256: "sha-test".to_string(),
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
@@ -2679,6 +2735,7 @@ mod tests {
                 id: "thread".into(),
                 workspace: dir.path().to_path_buf(),
                 model_id: "model".into(),
+                model_sha256: "sha-test".to_string(),
                 max_steps: 1,
                 max_tokens: 1,
                 temperature: 0.0,
@@ -2739,6 +2796,7 @@ mod tests {
             id: "thread".into(),
             workspace: dir.path().to_path_buf(),
             model_id: "model".into(),
+            model_sha256: "sha-test".to_string(),
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
