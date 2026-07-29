@@ -302,6 +302,18 @@ const REPEAT_LIMIT: usize = 3;
 /// How many times a step may be re-run after being cut off at `max_tokens`
 /// before the loop gives up and surfaces the incomplete text with a disclosure.
 const CAPPED_RETRY_LIMIT: usize = 2;
+/// How many times a workspace turn may be sent back for missing evidence before
+/// the loop stops insisting and answers with a disclosure instead.
+///
+/// The evidence guards below assume `read_file` is the only way to observe a
+/// file. In Code mode that is no longer true — a model can `cat`, `wc` or `grep`
+/// through `run_shell`, or learn a file by editing it — so a model that answered
+/// correctly from a shell observation was re-prompted forever. Code has no step
+/// cap, so "forever" was literal: the turn only ended when the user pressed
+/// Stop. Insisting a bounded number of times keeps the guard's value (a model
+/// that invents file contents gets pushed to look) without letting it own the
+/// turn.
+const EVIDENCE_REPROMPT_LIMIT: usize = 3;
 const MAX_WORKSPACE_TOOL_CALLS_PER_STEP: usize = 8;
 
 /// Result-aware no-progress guard. Records the outcome for a call signature and
@@ -379,6 +391,7 @@ pub fn run_loop(
 
     let mut completed_steps = 0usize;
     let mut capped_retries = 0usize;
+    let mut evidence_reprompts = 0usize;
     loop {
         if cfg.max_steps != 0 && completed_steps >= cfg.max_steps {
             break;
@@ -507,7 +520,8 @@ pub fn run_loop(
                     .difference(&successful_workspace_reads)
                     .cloned()
                     .collect::<BTreeSet<_>>();
-                if !missing_reads.is_empty() {
+                if !missing_reads.is_empty() && evidence_reprompts < EVIDENCE_REPROMPT_LIMIT {
+                    evidence_reprompts += 1;
                     reporter.notice("Workspace must read each named file before answering");
                     history.push(AgentMsg::System(format!(
                         "Use read_file on these exact relative paths before answering: {}. Then \
@@ -517,7 +531,20 @@ pub fn run_loop(
                     )));
                     continue;
                 }
-                if require_workspace_observation && !observed_workspace {
+                if !missing_reads.is_empty() {
+                    // Said once, plainly, instead of asking again: the model has
+                    // had its chances, and the user needs to know the answer is
+                    // not backed by a read of these paths.
+                    reporter.notice(&format!(
+                        "answering without a read_file observation of: {}",
+                        missing_reads.into_iter().collect::<Vec<_>>().join(", ")
+                    ));
+                }
+                if require_workspace_observation
+                    && !observed_workspace
+                    && evidence_reprompts < EVIDENCE_REPROMPT_LIMIT
+                {
+                    evidence_reprompts += 1;
                     reporter.notice(
                         "Workspace inspection is required before answering this file request",
                     );
@@ -3403,6 +3430,66 @@ mod tests {
         assert_eq!(reporter.text.len(), 1);
         assert!(reporter.text[0].contains("Found 1 Markdown file"));
         assert!(reporter.text[0].contains("- `README.md`"));
+    }
+
+    #[test]
+    fn the_evidence_guard_stops_insisting_instead_of_owning_the_turn() {
+        // Regression: the guard assumed read_file was the only way to observe a
+        // file and re-prompted with no limit. Code mode has no step cap, so a
+        // model that had genuinely observed notes.txt another way (run_shell
+        // `wc -l`, an edit, a search) was sent back forever and the turn only
+        // ended when the user pressed Stop. Measured live on macOS once the shell
+        // became enforceable: 22 identical notices and no terminal event.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "alpha\nbeta\ngamma\n").unwrap();
+        let sandbox = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        // The model answers from a shell observation every time and never calls
+        // read_file — exactly the live failure.
+        let mut driver = MockDriver {
+            steps: (0..12)
+                .map(|_| ModelStep::Text("notes.txt has 3 lines.".into()))
+                .collect(),
+            idx: 0,
+        };
+        let mut approver = ScriptApprover(vec![], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(
+            "Run the shell command: wc -l < notes.txt . Then tell me the count.".into(),
+        )];
+        let mut config = cfg(dir.path(), false);
+        config.tool_profile = tools::ToolProfile::WebCode;
+        // No step cap, as Code mode runs.
+        config.max_steps = 0;
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sandbox,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Answered, "the turn must terminate on its own");
+        let insisted = reporter
+            .notices
+            .iter()
+            .filter(|n| n.contains("must read each named file"))
+            .count();
+        assert!(
+            insisted <= EVIDENCE_REPROMPT_LIMIT,
+            "the guard may insist at most {EVIDENCE_REPROMPT_LIMIT}×, got {insisted}: {:?}",
+            reporter.notices
+        );
+        assert!(
+            reporter
+                .notices
+                .iter()
+                .any(|n| n.contains("without a read_file observation")),
+            "the user must be told the answer was not backed by a read: {:?}",
+            reporter.notices
+        );
     }
 
     #[test]
