@@ -1063,7 +1063,7 @@ export default function CodeWorkspace({
       <ConfirmDialog
         open={fullAutoConfirmOpen}
         title="Enable full auto?"
-        detail="Today is a good day to die mode lets Camelid edit files and run shell commands without asking. File tools stay confined to the selected workspace. On Windows, shell commands are working-directory pinned and hard-timed but are not filesystem- or network-isolated. Stop remains available; the network switch separately controls Camelid's built-in web tools."
+        detail="Today is a good day to die mode lets Camelid edit files and run shell commands without asking. File tools stay confined to the selected workspace. How far shell commands are confined depends on your OS: on Linux and macOS they run under a kernel sandbox with no network and writes limited to the workspace and the temp directory, while on Windows they are working-directory pinned and hard-timed but are not filesystem- or network-isolated. Stop remains available; the network switch separately controls Camelid's built-in web tools."
         confirmLabel="Enable full auto"
         cancelLabel="Keep approval gated"
         onCancel={() => setFullAutoConfirmOpen(false)}

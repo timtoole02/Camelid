@@ -33,9 +33,9 @@ The server, not the browser, owns the boundary:
    `read_file`, `list_dir`, literal-content `search`, `update_plan`, `write_file`, `edit_file`, and
    sandboxed `run_shell`; bounded `spawn_subagent`/`check_subagent_status` are added only while the
    Code subagent runtime is active. `run_shell` is offered only where the sandbox can actually be
-   enforced — Linux x86_64/aarch64 and Windows. On any other host (macOS included) the session
-   resolves the shell to `disabled`, so the tool is never advertised, and says so in the transcript;
-   a Code session there is a read/write coding surface without command execution.
+   enforced — Linux x86_64/aarch64, macOS, and Windows. On any other host the session resolves the
+   shell to `disabled`, so the tool is never advertised, and says so in the transcript; a Code
+   session there is a read/write coding surface without command execution.
 5. `allow_network: true` adds only the built-in `web_search` and `http_fetch` tools. The sandbox
    rejects both when the switch is off. This is not an OS egress firewall for `run_shell`.
 6. `approval_mode: "approval_gated"` sends exact write/Exec/network decisions through the approval
@@ -45,12 +45,20 @@ The server, not the browser, owns the boundary:
    They cannot spawn grandchildren and are killed when the parent turn ends or is stopped.
 8. GUI, Windows computer-control, and MCP tools are never advertised or accepted by WebCode.
    General shell execution is nevertheless general process execution, and what confinement means
-   depends on the host: on Linux it is seccomp + uid-drop + rlimits + cwd-pin; on Windows the
-   existing `ShellSandbox::Sandboxed` contract is cwd-pin + hard timeout, not filesystem or network
-   isolation; elsewhere the shell is not offered at all (item 4). The full-auto confirmation states
-   this explicitly. Timeout teardown reaches the whole process tree on Windows (job object) and for
-   delegated work on Unix (the worker's process group); a command the server itself runs on Unix is
-   killed as a single process, so a descendant build tree can outlive its deadline.
+   depends on the host:
+   - **Linux**: seccomp (blocking the `socket` family, so no egress) + uid-drop + rlimits + cwd-pin.
+   - **macOS**: kernel Sandbox (Seatbelt) via `sandbox-exec` — writes confined to the workspace plus
+     the process temp directory, network denied, credential stores denied for read and write. Reads
+     elsewhere are still permitted; the workspace read jail belongs to the file tools, not the
+     profile. The temp-directory allowance is required for compilers and is the jail's one widening.
+   - **Windows**: the existing `ShellSandbox::Sandboxed` contract is cwd-pin + hard timeout, not
+     filesystem or network isolation.
+   - Elsewhere the shell is not offered at all (item 4).
+
+   The full-auto confirmation states this explicitly. Timeout teardown reaches the whole process tree
+   on Windows (job object) and for delegated work on Unix (the worker's process group); a command the
+   server itself runs on Unix is killed as a single process, so a descendant build tree can outlive
+   its deadline.
 9. Starting another workspace session is refused while a turn is active.
 10. The existing read-only mode remains the default. A legacy `allow_writes: true` request without
    `mode: "code"` still fails with `400 workspace_read_only`.

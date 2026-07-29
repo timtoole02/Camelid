@@ -66,8 +66,37 @@ tests plus every integration target across 60 binaries, the frontend production 
 component and visual smokes, `npm audit` at zero, and the scrub/ledger/fit-verdict validators. Four
 visual smokes could not run here at all until their Chrome detection learned the macOS path, and the
 code-workbench harness was never wired into CI — both fixed. No model, quantization, backend,
-context, latency, throughput, or production-support claim widens; macOS Code sessions are a
-read/write coding surface without command execution.
+context, latency, throughput, or production-support claim widens.
+
+macOS shell enforcement (2026-07-29, same branch): `run_shell` now WORKS on macOS instead of being
+withheld. Confinement is the kernel Sandbox (Seatbelt) applied through `/usr/bin/sandbox-exec` with an
+SBPL profile: writes confined to the workspace plus the process temp directory, network denied
+(matching the Linux profile, whose seccomp filter blocks the `socket` family), and credential stores
+(`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.docker`, `~/.kube`, keychains) denied for read
+and write — skipped when they sit inside the chosen workspace, so the profile never jails the agent
+out of its own project. Reads elsewhere on the filesystem remain permitted; the workspace read jail
+belongs to the file tools, not this profile. The workspace root is passed as a sandbox parameter
+rather than interpolated into the profile text, so a path containing a quote, backslash or paren
+cannot reshape the rules, and the root is canonicalised because the kernel matches resolved paths.
+The temp-directory allowance is the jail's one widening and is required: clang fails with "unable to
+make temporary file" without it. Unlike the Linux leg, this path is **measured on the platform it
+protects** — ten enforcement tests run real commands through the real wrapper and assert the kernel
+refused them (write outside the root, `$HOME`, network, credential read), that in-workspace writes and
+`mktemp` still work, that a symlinked root still permits its own writes, and that the wrapper is
+actually on the command line rather than merely reported. `confined_command` now builds the command
+and returns what was enforced in one call, because macOS confines by wrapping argv: a two-step API
+would have let a caller collect the layer report without the wrapper ever being applied.
+The live shell turn also exposed an unrelated defect and fixed it: the evidence-first guard assumed
+`read_file` was the only way to observe a file and re-prompted with **no limit**, so a model that had
+correctly answered from a `run_shell` observation was sent back forever — and Code has no step cap, so
+the turn only ended when the user pressed Stop (measured: 22 identical notices, no terminal event). It
+now insists at most three times, then answers and discloses that no `read_file` observation backed it.
+Live verification on this Mac against Qwen3-4B-Q8_0: a full-auto Code turn ran `wc -l < notes.txt`
+(exit 0, stdout 3) through the sandbox, wrote the count, finished `answered` after exactly three
+guard notices, and guarded undo removed the file. Gates: fmt/Clippy/doc clean, 1,331 core tests across
+60 binaries, frontend build plus all nineteen smokes, scrub/ledger/fit-verdict validators. macOS Code
+sessions therefore now include command execution; no model, backend, context, latency, throughput, or
+production-support claim widens.
 
 HARDPAN note (2026-07-23): the Windows agent-terminal parity campaign (`qa/hardpan/REPRO.md`) closed with seven findings fixed, one struck, one measured-null — all with before/after receipts on the Windows reference box. Exec surface: `run_shell` now drains stdout/stderr on reader threads (pre-fix, any command emitting more than the 64 KiB per-pipe buffer — e.g. `git log` — was falsely reported as a timeout with its output discarded), assigns a kill-on-close job object so a timeout tears down the whole process tree (the negative control showed the orphan otherwise also wedges teardown for its full lifetime), and resolves `cmd` through System32 (hardening only, no security delta — std already searched System32 before parent-`PATH`). `run_windows_command` now feeds PowerShell a base64-inside-ASCII stdin preamble (a windowless child sits on OEM CP437; non-ASCII round-trips byte-identical both ways where it was mojibake'd) and re-raises `$LASTEXITCODE` (a failing native command followed by a successful statement previously reported exit 0 → Ok to the model). Terminal front ends: a shared RAII teardown guard + chaining panic hook covers both TUIs (a TUI-thread fault can no longer strand the console in raw mode — cmd.exe has no `reset`); a Windows paste path (Ctrl+V clipboard read + a pasted-Enter guard, since terminals inject paste as keystrokes) makes a multi-line paste create exactly one goal instead of firing one goal per interior newline; and AltGr compositions (CONTROL|ALT) now insert instead of being silently swallowed — on a German layout `@ € [ ]` were previously untypeable. Struck at GATE 0 on live evidence: W7 (`/copy`/OSC 52 — honoured by this host's terminals, so the tool told the truth) and W9 downgraded to a measured null (`qa/evidence-bundles/hardpan-windows-terminal-20260723/`). No agent-loop, tool-schema, approval-policy, or parity-lane change; Unix behavior preserved throughout. Decision record: DECISIONS.md D19. Remaining owed: the real-TUI CERT rows of `qa/hardpan/MANUAL_CHECKLIST.md` (merge-ahead authorized 2026-07-23) and the A11/A12 follow-ups in the REPRO.md amendment log.
 

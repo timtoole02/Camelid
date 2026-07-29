@@ -457,8 +457,14 @@ try {
   await page.click('.code-access-menu > button.is-danger')
   await page.waitForSelector('.cx-modal')
   const confirmation = await page.$eval('.cx-modal', (node) => node.textContent)
+  // The warning must state what full auto grants AND how far confinement
+  // actually goes on each OS. It said "on Windows ..." only, which read as a
+  // sandbox claim on hosts where none applied; the kernel-sandbox clause and the
+  // Windows caveat are both load-bearing, so both are pinned here.
   if (!confirmation.includes('edit files and run shell commands without asking')
-    || !confirmation.includes('not filesystem- or network-isolated')) {
+    || !confirmation.includes('not filesystem- or network-isolated')
+    || !confirmation.includes('kernel sandbox')
+    || !confirmation.includes('on Windows')) {
     throw new Error(`full-auto warning mismatch: ${confirmation}`)
   }
   await page.click('.cx-modal .cx-btn--danger')

@@ -273,10 +273,12 @@ checkpoints power the Changes view and guarded single-step undo without touching
 turns are stored in the local Workspace SQLite store and appear as coding history in the left rail.
 Code fails closed unless the loaded exact model row is supported and has earned
 `tool_capable: true`. File tools are canonical-root confined. Shell enforcement remains
-platform-specific: on Linux it is seccomp + uid-drop + rlimits, on Windows it is working-directory
-pinned and hard-timed — not a filesystem or network jail, so the full-auto warning must be taken
-literally. Where no sandbox can be enforced, including macOS, Code does not offer `run_shell` at all
-and says so in the session: you get the read/write coding surface without command execution.
+platform-specific: on Linux it is seccomp + uid-drop + rlimits; on macOS it is the kernel Sandbox via
+`sandbox-exec`, confining writes to the workspace plus the process temp directory and denying network
+and credential stores; on Windows it is working-directory pinned and hard-timed — not a filesystem or
+network jail, so the full-auto warning must be taken literally there. Where no sandbox can be
+enforced, Code does not offer `run_shell` at all and says so in the session: you get the read/write
+coding surface without command execution.
 
 **Workspace (preview).** Choose one local directory and ask follow-up questions across a durable
 conversation. Workspace can only list, read, and search within that canonical root; writes, shell,
