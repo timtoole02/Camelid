@@ -1,0 +1,40 @@
+{
+  "schema": "camelid.tokenizer_oracle/v1",
+  "pack_id": "phi4-mini-gpt4o-tokenizer-oracle-v1",
+  "purpose": "Pinned llama.cpp GPT4O tokenizer regression for the exact Phi-4-mini-instruct Q4_K_M GGUF. The segment shapes are derived from the executed LLAMA_VOCAB_PRE_TYPE_GPT4O regex at llama-vocab.cpp:433 and unicode_regex_split's collapsed-category path; token IDs are the raw llama-tokenize capture below.",
+  "oracle": {
+    "implementation": "llama.cpp",
+    "commit": "acd79d603cb2e1c84c0886137b80f1ad649b6857",
+    "build": "9632",
+    "command": "llama-tokenize --model Phi-4-mini-instruct-Q4_K_M.gguf --ids --no-bos --prompt <case-input> --log-disable",
+    "captured_utc": "2026-07-27"
+  },
+  "artifact": {
+    "filename": "Phi-4-mini-instruct-Q4_K_M.gguf",
+    "sha256": "88c00229914083cd112853aab84ed51b87bdf6b9ce42f532d8c85c7c63b1730a",
+    "size_bytes": 2491874272,
+    "architecture": "phi3",
+    "tokenizer_pre": "gpt-4o"
+  },
+  "cases": [
+    {"id":"ascii_contraction","input":"it's NASA's turn","input_utf8_hex":"69742773204e4153412773207475726e","expected_segments":["it's"," NASA's"," turn"],"expected_token_ids":[64190,42606,885,3716]},
+    {"id":"camel_case","input":"camelCase HTTPServer","input_utf8_hex":"63616d656c436173652048545450536572766572","expected_segments":["camel","Case"," HTTPServer"],"expected_token_ids":[178067,6187,21929,6444]},
+    {"id":"digits","input":"1234","input_utf8_hex":"31323334","expected_segments":["123","4"],"expected_token_ids":[7633,19]},
+    {"id":"newline","input":"!Hello\r\nnext","input_utf8_hex":"2148656c6c6f0d0a6e657874","expected_segments":["!Hello","\r\n","next"],"expected_token_ids":[0,13225,370,7311]},
+    {"id":"nfd_mark","input":"cafe\u0301 bar","input_utf8_hex":"63616665cc8120626172","expected_segments":["cafe","\u0301"," bar"],"expected_token_ids":[66,6903,13430,3608]},
+    {"id":"mark_between_letters","input":"aE\u0301b","input_utf8_hex":"6145cc8162","expected_segments":["a","E","\u0301b"],"expected_token_ids":[64,36,13430,65]},
+    {"id":"non_ascii_letter","input":"aÉb","input_utf8_hex":"61c38962","expected_segments":["aÉb"],"expected_token_ids":[64,5859,65]},
+    {"id":"cyrillic_case_boundary","input":"ПриветМир","input_utf8_hex":"d09fd180d0b8d0b2d0b5d182d09cd0b8d180","expected_segments":["ПриветМир"],"expected_token_ids":[23881,131903,4474,2479]},
+    {"id":"newline_slash","input":"a.\n/b","input_utf8_hex":"612e0a2f62","expected_segments":["a",".\n/","b"],"expected_token_ids":[64,118550,65]},
+    {"id":"precomposed","input":"café naïve","input_utf8_hex":"636166c3a9206e61c3af7665","expected_segments":["café"," naïve"],"expected_token_ids":[66,103112,153475,737]},
+    {"id":"indic_marks","input":"नमस्ते world","input_utf8_hex":"e0a4a8e0a4aee0a4b8e0a58de0a4a4e0a58720776f726c64","expected_segments":["नमस","्त","े"," world"],"expected_token_ids":[998,1637,1496,4385,628,2375]},
+    {"id":"whitespace_symbol","input":" spaces and\ttabs🙂","input_utf8_hex":"2073706163657320616e640974616273f09f9982","expected_segments":[" spaces"," and","\ttabs","🙂"],"expected_token_ids":[18608,326,6264,6071,37459]},
+    {"id":"uber","input":"ÜBER","input_utf8_hex":"c39c424552","expected_segments":["Ü","BER"],"expected_token_ids":[8858,16712]},
+    {"id":"uber_x","input":"ÜBER x","input_utf8_hex":"c39c4245522078","expected_segments":["Ü","BER"," x"],"expected_token_ids":[8858,16712,1215]},
+    {"id":"a_e_acute_b","input":"AÉB","input_utf8_hex":"41c38942","expected_segments":["AÉ","B"],"expected_token_ids":[32,5859,33]},
+    {"id":"etat","input":"ÉTAT français","input_utf8_hex":"c389544154206672616ec3a7616973","expected_segments":["É","TAT"," français"],"expected_token_ids":[5859,51,1228,30450]},
+    {"id":"uber_contraction","input":"ÜBER's","input_utf8_hex":"c39c4245522773","expected_segments":["Ü","BER's"],"expected_token_ids":[8858,16712,885]},
+    {"id":"angstrom","input":"ÅNGSTROM unit","input_utf8_hex":"c3854e475354524f4d20756e6974","expected_segments":["Å","NGSTROM"," unit"],"expected_token_ids":[13631,19236,1117,6443,7670]},
+    {"id":"x_e_y_z_e","input":"XÉYZÉ","input_utf8_hex":"58c389595ac389","expected_segments":["XÉYZÉ"],"expected_token_ids":[55,5859,118480,5859]}
+  ]
+}

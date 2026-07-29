@@ -3,7 +3,7 @@
 #
 # Usage:  qa/capability/smoke.sh <model.gguf> [port] [out-suffix]
 #   CAMELID_EXE        camelid binary (default: target/release/camelid.exe).
-#                      A RELEASE build is required — debug `serve` overflows the stack.
+#                      Set this to run the smoke test against another build.
 #   CAMELID_SMOKE_OUT  output dir (default: qa/capability/smoke_out<out-suffix>).
 #
 # Evidence captured: sampling lane (min_p/repeat_penalty accepted + seed

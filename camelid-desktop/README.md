@@ -1,9 +1,9 @@
-# Camelid Desktop (add-on, Windows)
+# Camelid Desktop (add-on, Windows and macOS)
 
-**Camelid Desktop is an additive native Windows app.** It gives users a desktop chat
+**Camelid Desktop is an additive native app.** It gives users a desktop chat
 experience with no web browser, by embedding the **same `camelid` engine** that ships as the
-server binary and hosting the existing web UI in a native [WebView2](https://developer.microsoft.com/microsoft-edge/webview2/)
-window via [Tauri v2](https://v2.tauri.app/).
+server binary and hosting the existing web UI in a native WebView2 window on Windows or
+WebKit window on macOS via [Tauri v2](https://v2.tauri.app/).
 
 It is an add-on only. It does **not** modify, gate, or relax any existing support claim,
 parity contract, or the `camelid` server binary. **The web path remains the canonical path.**
@@ -34,52 +34,127 @@ performance, or compatibility.
 ## Architecture (sidecar; see `../DECISIONS.md` D11)
 
 ```
-camelid-desktop.exe ──spawns──▶ camelid.exe serve --addr 127.0.0.1:<ephemeral> --no-open
+camelid-desktop ──spawns──▶ camelid serve --addr 127.0.0.1:<ephemeral> --no-open
         │                                  │  (loopback only)
         │  poll /v1/health (backoff)       │
         ▼                                  ▼
-   WebView2 window  ──navigates to──▶  http://127.0.0.1:<ephemeral>/
+   Native webview   ──navigates to──▶  http://127.0.0.1:<ephemeral>/
    (splash first)                      (UI + API are same-origin; the engine serves the
                                         embedded React UI from its `*` fallback route)
 ```
 
-On window close the sidecar is terminated cleanly; a Windows **job object** with
-`KILL_ON_JOB_CLOSE` is the backstop so a desktop crash cannot orphan a `camelid` process.
+On window close the sidecar is terminated cleanly. On Windows, a **job object** with
+`KILL_ON_JOB_CLOSE` also prevents a desktop crash from orphaning a `camelid` process.
+
+## Startup failures
+
+The splash is fail-closed: it stays visible until the sidecar returns `200` from
+`/v1/health`. It polls every 350 ms for up to 40 seconds. Native startup state is retained and
+replayed after the splash listener registers, so a fast failure cannot be lost before the page
+loads. A failure shows an actionable title and next step first, followed by the engine's actual
+error and captured stderr under **Technical details**; it never navigates to a fake-ready UI.
+
+| Splash error | Meaning | Next step |
+| --- | --- | --- |
+| **Camelid engine is missing** | The platform engine was not found beside the desktop executable, in the bundled sidecar resources, or on `PATH`. | Reinstall Camelid Desktop or restore its bundled Camelid engine, then retry. |
+| **Sidecar port unavailable** | The engine reported that it could not bind Camelid's selected ephemeral loopback port. This is not a fixed `8181` port conflict. | Close the conflicting local process and retry. |
+| **Engine startup timed out** | The sidecar did not pass the 40-second `/v1/health` gate. | Retry, then use the visible technical details to diagnose a persistent failure. |
+| **Engine startup failed** | The sidecar exited before it became healthy for another reason. | Review the visible technical details and retry. |
+
+Model readiness is separate from sidecar startup. Once `/v1/health` passes, Desktop navigates to
+the engine's existing UI. If local GGUFs exist, the sidecar loads the saved default from the
+configured models directory; without a saved preference, it loads the first local GGUF. The Models
+page labels that row **Starts automatically** and offers **Make default** on other loadable rows.
+If no eligible model exists, the UI remains the authority and shows its normal model-required
+state. Desktop does not claim a ready model or manufacture a model error on the splash.
 
 ## Requirements
 
-- Windows 10/11 with the **WebView2 runtime** (preinstalled on current Windows 10/11; the
+- **Windows:** Windows 10/11 with the **WebView2 runtime** (preinstalled on current Windows 10/11; the
   Tauri bundle ships the bootstrapper otherwise).
-- A `camelid.exe` next to `camelid-desktop.exe` (the portable zip and installer bundle it).
+- **macOS:** Apple Silicon running macOS 12 or newer. The current macOS desktop bundle is
+  ad-hoc signed and not notarized; it ships prebuilt as the release DMG (see
+  [macOS install](#macos-install)).
+- A bundled platform engine. The portable ZIP, Windows installer, and macOS app bundle
+  include it automatically.
+
+## macOS install
+
+**Prebuilt (recommended).** On an Apple Silicon Mac, one command downloads the release DMG
+(`camelid-desktop-macos-arm64.dmg`, built by the additive `desktop-macos` release job), verifies
+its published SHA-256, installs `/Applications/Camelid Desktop.app`, and launches it — no
+toolchain required:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/timtoole02/Camelid/main/scripts/get-desktop-macos.sh | bash
+```
+
+The app is ad-hoc signed and not notarized, so a browser-downloaded DMG is quarantined and
+Gatekeeper blocks the first launch (approve under **System Settings → Privacy & Security** — on
+macOS 12, **System Preferences → Security & Privacy → General** — or
+`xattr -cr` the installed app). The script path avoids that: command-line downloads carry no
+quarantine attribute. Pass a tag to pin a version (`... | bash -s -- v0.4.5`).
+
+**From source.** From the repository root on an Apple Silicon Mac:
+
+```sh
+./scripts/install-macos-desktop.sh
+```
+
+This builds the frontend, release engine, app bundle, and DMG; closes an existing Camelid Desktop
+instance cleanly; installs the new app at `/Applications/Camelid Desktop.app`; verifies its
+ad-hoc signature; and launches it. The script uses `sudo` only when `/Applications` is not writable.
+Prerequisites are macOS 12 or newer, the Xcode Command Line Tools, Rust, and Node.js 22 with npm.
+
+Neither path replaces the default Application Support model directory or a custom model
+directory: installed models survive updates and reinstalls.
 
 ## Building (developers)
 
 ```sh
-# From the workspace root. Build the server in RELEASE so a working camelid.exe lands in
-# target/release/ (see the debug caveat below), then build + run the desktop app:
-cargo build --release --locked --bin camelid
+# From the workspace root. Build the debug server sidecar, then build and run
+# the desktop app. Both executables land in target/debug/:
+cargo build --locked --bin camelid
 cargo build -p camelid-desktop
-
-# Run the desktop app, pointing it at the release sidecar that sits beside it. In dev the
-# desktop exe is in target/debug/, so place (or symlink/copy) the release camelid.exe there:
-cp target/release/camelid.exe target/debug/camelid.exe   # one-time, for dev
 cargo run -p camelid-desktop
 ```
 
-> **Debug-server caveat (pre-existing, server-side).** The *debug* `camelid.exe` overflows
-> its main-thread stack on startup (it crashes even on `camelid --version`) — a large stack
-> frame in the server's `main.rs` that release optimization elides. This is unrelated to the
-> desktop app and out of scope here (the brief forbids modifying the server). Always pair the
-> desktop app with a **release** `camelid.exe`; the shipped artifact does exactly that. When
-> the sidecar fails to come up, the desktop surfaces the real error + engine stderr on the
-> splash rather than faking a ready state — which is the intended fail-closed behavior.
+For packaging, build the release sidecar explicitly:
+
+```sh
+cargo build --release --locked --bin camelid
+```
+
+The debug `camelid.exe` is supported for local desktop development. On Windows, the server's
+link configuration reserves sufficient stack for the large CLI parser; CI exercises its
+`--version` startup path directly. When the sidecar fails to come up, the desktop surfaces the
+real error and engine stderr on the splash rather than faking a ready state.
 
 The server build is unaffected by this crate: `cargo build --release --locked --bin camelid`
 does not pull `camelid-desktop` into its graph (workspace `resolver = "2"`,
 `default-members = ["."]`).
 
-For a bundled installer + portable zip, see the additive `desktop-windows` job in
-`../.github/workflows/release.yml`.
+For the shipped bundles — Windows installer + portable zip, and the macOS DMG — see the
+additive `desktop-windows` and `desktop-macos` jobs in `../.github/workflows/release.yml`.
+
+### Building the macOS app and DMG
+
+On an Apple Silicon Mac:
+
+```sh
+./scripts/build-macos-desktop.sh
+```
+
+The script builds the real frontend, the release Metal-enabled `camelid` sidecar, and the
+Tauri `.app` and `.dmg`. It uses an ad-hoc signature (`-`), not a Developer ID signature,
+and performs no notarization. macOS may therefore require the user to approve the app in
+**System Settings → Privacy & Security** (on macOS 12, **System Preferences → Security &
+Privacy → General**) after downloading it.
+
+Downloaded models are stored under the app's per-user Application Support directory rather
+than inside the app bundle by default. The **Downloaded models** tab can save a different local
+folder for the next launch. Existing GGUFs are never moved automatically, so changing the folder
+does not risk an implicit multi-gigabyte copy or deletion.
 
 ## Scope notes (intentionally deferred)
 
@@ -88,8 +163,6 @@ v1 deliberately keeps the native shell thin and ships the engine's real UI as-is
 - **No fabricated metrics, by construction.** The splash shows only real lifecycle status;
   all chat metrics (e.g. tokens/sec) come from the embedded UI rendering the engine's real
   generation/telemetry events. Nothing in this crate computes or smooths a metric.
-- **Native tray / native GGUF file-picker are deferred.** Both would require granting Tauri
-  IPC to the loopback-origin page, widening the attack surface this design intentionally
-  avoids — and the embedded UI already loads local/catalog models via the existing
-  `/api/models/load` path, so a native picker adds no capability. They can be added later
-  behind a scoped capability if desired.
+- **Native tray / arbitrary GGUF file-picker are deferred.** The loopback-origin page receives
+  only a scoped native folder chooser for configuring model storage; it does not receive broad
+  filesystem access. Local/catalog model loading still goes through the engine's existing API.

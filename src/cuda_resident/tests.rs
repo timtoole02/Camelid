@@ -61,6 +61,29 @@ fn quantize_blocks(w: &[f32], k: usize) -> Vec<u8> {
     out
 }
 
+#[test]
+fn q8_soa_repack_restores_wire_scale_footprint() {
+    let weights = [
+        -0.75f32, -0.5, -0.25, -0.125, 0.0, 0.125, 0.25, 0.5, 0.75, 1.0, -1.0, 0.33, -0.66, 0.1,
+        -0.2, 0.3, -0.4, 0.6, -0.8, 0.9, -0.95, 0.42, -0.37, 0.73, -0.81, 0.12, -0.13, 0.14, -0.15,
+        0.16, -0.17, 0.18, 0.2, -0.3, 0.4, -0.5, 0.6, -0.7, 0.8, -0.9, 1.1, -1.2, 0.23, -0.34,
+        0.45, -0.56, 0.67, -0.78, 0.89, -1.0, 0.11, -0.22, 0.44, -0.55, 0.77, -0.88, 0.99, -1.01,
+        0.31, -0.41, 0.51, -0.61, 0.71, -0.91,
+    ];
+    let aos = quantize_blocks(&weights, 64);
+    let soa = super::repack_q8_soa(&aos);
+    assert_eq!(aos.len(), 2 * 36);
+    assert_eq!(soa.len(), 2 * 34);
+    for b in 0..2 {
+        assert_eq!(&soa[b * 32..b * 32 + 32], &aos[b * 36 + 4..b * 36 + 36]);
+        let f32_scale = f32::from_le_bytes(aos[b * 36..b * 36 + 4].try_into().expect("scale"));
+        assert_eq!(
+            &soa[64 + b * 2..64 + b * 2 + 2],
+            &crate::inference::f32_to_f16_bits(f32_scale).to_le_bytes()
+        );
+    }
+}
+
 // Quantize an activation row to per-block (scale, quants).
 fn quantize_row(x: &[f32]) -> (Vec<f32>, Vec<i8>) {
     let nb = x.len() / 32;
@@ -1021,6 +1044,51 @@ fn argmax_matches_cpu() {
     k.stream.memcpy_dtoh(&didx, &mut got).unwrap();
     k.ctx.synchronize().unwrap();
     assert_eq!(got[0] as usize, besti, "argmax diverged");
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn gumbel_sampler_matches_stateless_reference() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    // With identical logits Gumbel-max selects the largest uniform draw. Compare
+    // the exact 24-bit SplitMix64 value instead of CPU/GPU log implementations,
+    // which proves the RNG, seed plumbing, reduction, and tie-break independently
+    // of libm approximation differences.
+    let n = 4096usize;
+    let logits = vec![0.0f32; n];
+    let dl = k.stream.clone_htod(&logits).unwrap();
+    let mut didx = k.stream.alloc_zeros::<u32>(1).unwrap();
+    let mut sampled = Vec::new();
+    for seed in [0u64, 1, 7, 42, u32::MAX as u64, u64::MAX] {
+        let mut best_uniform = 0u32;
+        let mut expected = 0usize;
+        for idx in 0..n {
+            let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(idx as u64 + 1));
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            let uniform = (z >> 40) as u32;
+            if uniform > best_uniform {
+                best_uniform = uniform;
+                expected = idx;
+            }
+        }
+        super::launch_sample_gumbel(&k.stream, &k.sample_gumbel, &dl, n, 1.0, seed, &mut didx)
+            .unwrap();
+        let mut got = [0u32; 1];
+        k.stream.memcpy_dtoh(&didx, &mut got).unwrap();
+        k.ctx.synchronize().unwrap();
+        assert_eq!(got[0] as usize, expected, "seed {seed}");
+        sampled.push(got[0]);
+    }
+    sampled.sort_unstable();
+    sampled.dedup();
+    assert!(
+        sampled.len() > 1,
+        "different seeds should not collapse to one sampled token"
+    );
 }
 
 #[test]
@@ -2242,6 +2310,73 @@ fn q4k_gemv_matches_oracle() {
     );
 }
 
+/// Batched Q4_K receipt: every token-major output must match the same CPU
+/// oracle used to validate the single-token GEMV. This specifically exercises
+/// the upload-swizzled weights against natural-order batched Q8_K activations.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn q4k_gemm_batched_matches_oracle() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let (rows, n_sb, k_tokens) = (64usize, 3usize, 4usize);
+    let kdim = n_sb * 256;
+    let mut rng = Lcg(0x4b_47_45_4d_4d);
+    let wire = synth_q4k_wire(rows, n_sb, &mut rng);
+    let weights = super::swz_q4k_blocks(&wire);
+    let mut in_scales = Vec::with_capacity(k_tokens * n_sb);
+    let mut in_quants = Vec::with_capacity(k_tokens * kdim);
+    let mut expected = vec![0f32; k_tokens * rows];
+    for t in 0..k_tokens {
+        let act: Vec<f32> = (0..kdim).map(|_| rng.next_f32()).collect();
+        let q8k = crate::inference::quantize_q8_k_blocks(&act);
+        for block in &q8k {
+            in_scales.push(block.d);
+            in_quants.extend_from_slice(&block.qs);
+        }
+        for row in 0..rows {
+            let lo = row * n_sb * 144;
+            expected[t * rows + row] =
+                crate::inference::q4_k_wire_row_dot(&wire[lo..lo + n_sb * 144], &q8k);
+        }
+    }
+
+    let d_is = k.stream.clone_htod(&in_scales).unwrap();
+    let d_iq = k.stream.clone_htod(&in_quants).unwrap();
+    let d_w = k.stream.clone_htod(&weights).unwrap();
+    let mut d_out = k.stream.alloc_zeros::<f32>(k_tokens * rows).unwrap();
+    super::launch_kquant_gemm_batched(
+        &k.stream,
+        &k.q4k_gemm_batched,
+        &d_is,
+        &d_iq,
+        &d_w,
+        rows,
+        n_sb,
+        k_tokens,
+        9,
+        &mut d_out,
+    )
+    .unwrap();
+    let mut got = vec![0f32; k_tokens * rows];
+    k.stream.memcpy_dtoh(&d_out, &mut got).unwrap();
+    k.ctx.synchronize().unwrap();
+
+    let exact = got
+        .iter()
+        .zip(&expected)
+        .filter(|(g, e)| g.to_bits() == e.to_bits())
+        .count();
+    eprintln!(
+        "q4k_gemm_batched_matches_oracle: {exact}/{} outputs bit-identical",
+        got.len()
+    );
+    assert!(
+        close(&got, &expected, 1e-4),
+        "batched Q4_K diverged from q4_k_wire_row_dot"
+    );
+}
+
 // Build `rows*n_sb` synthetic Q5_K_M super-blocks (176 bytes each, row-major):
 // d(f16), dmin(f16), scales[12], qh[32], qs[128]. Like synth_q4k_wire the bytes need
 // not be a real quantization — the kernel and the oracle read the SAME bytes — so the
@@ -3096,6 +3231,71 @@ fn q6k_gemv_matches_oracle() {
     assert!(
         close(&got, &expected, 1e-4),
         "q6k_gemv diverged from q6_k_wire_row_dot oracle (worst rel {worst:.3e})"
+    );
+}
+
+/// Batched Q6_K receipt over several independent Q8_K activation rows.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn q6k_gemm_batched_matches_oracle() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let (rows, n_sb, k_tokens) = (64usize, 3usize, 4usize);
+    let kdim = n_sb * 256;
+    let mut rng = Lcg(0x6b_47_45_4d_4d);
+    let wire = synth_q6k_wire(rows, n_sb, &mut rng);
+    let weights = super::pad_q6k_blocks(&wire);
+    let mut in_scales = Vec::with_capacity(k_tokens * n_sb);
+    let mut in_quants = Vec::with_capacity(k_tokens * kdim);
+    let mut expected = vec![0f32; k_tokens * rows];
+    for t in 0..k_tokens {
+        let act: Vec<f32> = (0..kdim).map(|_| rng.next_f32()).collect();
+        let q8k = crate::inference::quantize_q8_k_blocks(&act);
+        for block in &q8k {
+            in_scales.push(block.d);
+            in_quants.extend_from_slice(&block.qs);
+        }
+        for row in 0..rows {
+            let lo = row * n_sb * 210;
+            expected[t * rows + row] =
+                crate::inference::q6_k_wire_row_dot(&wire[lo..lo + n_sb * 210], &q8k);
+        }
+    }
+
+    let d_is = k.stream.clone_htod(&in_scales).unwrap();
+    let d_iq = k.stream.clone_htod(&in_quants).unwrap();
+    let d_w = k.stream.clone_htod(&weights).unwrap();
+    let mut d_out = k.stream.alloc_zeros::<f32>(k_tokens * rows).unwrap();
+    super::launch_kquant_gemm_batched(
+        &k.stream,
+        &k.q6k_gemm_batched,
+        &d_is,
+        &d_iq,
+        &d_w,
+        rows,
+        n_sb,
+        k_tokens,
+        8,
+        &mut d_out,
+    )
+    .unwrap();
+    let mut got = vec![0f32; k_tokens * rows];
+    k.stream.memcpy_dtoh(&d_out, &mut got).unwrap();
+    k.ctx.synchronize().unwrap();
+
+    let exact = got
+        .iter()
+        .zip(&expected)
+        .filter(|(g, e)| g.to_bits() == e.to_bits())
+        .count();
+    eprintln!(
+        "q6k_gemm_batched_matches_oracle: {exact}/{} outputs bit-identical",
+        got.len()
+    );
+    assert!(
+        close(&got, &expected, 1e-4),
+        "batched Q6_K diverged from q6_k_wire_row_dot"
     );
 }
 

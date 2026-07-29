@@ -1,0 +1,64 @@
+{
+ "schema": "camelid.phi3.generation_divergence.v1",
+ "artifact": "Phi-3-mini-4k-instruct-Q8_0.gguf",
+ "comparator": "llama.cpp 9632 (acd79d603) CPU (llama-server, -ngl 0 -ctk f32 -ctv f32 -fa off --no-repack)",
+ "camelid_execution_plan": {
+  "selected_backend": "cpu_reference",
+  "decode_path": "safe_cpu_decode"
+ },
+ "all_pass": false,
+ "note": "Prompt tokens are byte-identical (see prompt-token-parity-q8-20260727.json); the divergence is in the forward pass, not the tokenizer.",
+ "prefix_token_ids": [
+  1,
+  450,
+  7483,
+  310,
+  3444,
+  338,
+  3681,
+  29889,
+  13
+ ],
+ "prefix_text": "The capital of France is Paris.\n",
+ "reference_next_token": {
+  "id": 32001,
+  "token": "<|assistant|>",
+  "logprob": -0.009130490012466908
+ },
+ "reference_top_alternatives": [
+  {
+   "id": 28400,
+   "token": "----------",
+   "logprob": -5.87416934967041
+  },
+  {
+   "id": 25512,
+   "token": "===",
+   "logprob": -6.402482032775879
+  }
+ ],
+ "camelid_fresh_prefill_next_token": {
+  "id": 25512,
+  "token": "===",
+  "logprob": -0.4914248
+ },
+ "camelid_fresh_prefill_top_logprobs": {
+  "===": -0.4914248,
+  "\n": -1.2467997,
+  "B": -3.0508215,
+  "-": -4.525173,
+  "<|assistant|>": -4.9440594
+ },
+ "camelid_incremental_decode_next_token": {
+  "id": 13,
+  "token": "\\n"
+ },
+ "findings": [
+  "The reference assigns <|assistant|> ~99.1% (logprob -0.0091); camelid assigns it -4.944. Not a near-tie: ~4.9 nat apart on the reference's near-certain token.",
+  "camelid is INTERNALLY INCONSISTENT at this position: a fresh 9-token prefill yields 25512 while incremental decode to the same position yields 13. Identical prompt_token_ids in both cases.  [SUPERSEDED \u2014 see 'correction']",
+  "Ruled out: tokenizer (prompt tokens byte-identical), RoPE pairing (dense_metadata reports rope_pairing=split_half, the pairing the committed rope probes show is correct for phi3), padded vocab (n_vocab=32064 and output.weight is [3072,32064], so 32001 is reachable), sampling policy (greedy_sample is a plain argmax with no special-token masking), and detokenization (this is a token-id comparison).",
+  "Remaining suspect: the attention / KV-cache path, given prefill and decode disagree with each other. Needs layer-level activation tracing against the reference to localize.  [SUPERSEDED \u2014 see 'correction']"
+ ],
+ "SUPERSEDED": "This file's structural reading is WRONG. See nondeterminism-q8-20260727.json.",
+ "correction": "The 'fresh prefill (25512) vs incremental decode (13)' disagreement recorded below was two samples of a NON-DETERMINISTIC engine, not evidence of a prefill/decode split. Repeatability was not tested before concluding. camelid returns different logits for identical requests on phi3 at temperature 0, and produces the reference token 32001 on a majority of runs. The 'attention/KV path' suspect named below is not supported by this data."
+}

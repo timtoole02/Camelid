@@ -1,7 +1,7 @@
 {
   "ledger_version": "camelid.ledger/v1",
   "provenance": {
-    "source_head": "7d0098f7",
+    "source_head": "e32790ee",
     "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
   },
   "capabilities": {
@@ -80,6 +80,11 @@
     ],
     "supported_model_families": [
       {
+        "id": "nomic_bert_encoder_exact_v1_5_q8_0",
+        "status": "supported_exact_row_embedding_lane",
+        "notes": "exact nomic-embed-text-v1.5.Q8_0.gguf only: BERT WordPiece tokenization, bidirectional split-half-RoPE attention, gated-SiLU FFN execution, mean/CLS/last pooling primitives, L2 normalization, Matryoshka truncation, OpenAI embeddings, cosine reranking, and optional Workspace semantic retrieval. Generic BERT, other Nomic files/quants, classifier-head rank pooling, GPU execution, and family-wide support are not implied."
+      },
+      {
         "id": "llama_spm_decoder",
         "status": "supported_current_gate",
         "notes": "LLaMA-style decoder path validated on TinyLlama Q8_0 gate"
@@ -144,9 +149,24 @@
         "notes": "non-streaming and SSE streaming for loaded supported dense GGUF models"
       },
       {
+        "id": "llguidance_structured_outputs",
+        "status": "supported_current_gate_nonstreaming",
+        "notes": "non-streaming /v1/chat/completions constrained decoding through LLGuidance 1.7.6 for JSON object, supported JSON Schema, and LLGuidance/Lark CFG requests. Request forms are mutually exclusive, unsupported schemas/grammars fail closed before generation, and token masks use the loaded tokenizer's exact byte vocabulary. Streaming and non-chat generation lanes remain typed unsupported."
+      },
+      {
+        "id": "openai_embeddings",
+        "status": "supported_exact_model_row",
+        "notes": "POST /v1/embeddings plus /embedding and /embeddings aliases accept one string or a bounded string batch, return finite unit-normalized float vectors and exact tokenizer usage, and support Nomic Matryoshka dimensions. The current gate is the exact Nomic Embed Text v1.5 Q8_0 catalog row; base64 encoding, token-id input, arbitrary encoder families/quants, and GPU execution are unsupported."
+      },
+      {
+        "id": "embedding_similarity_reranking",
+        "status": "supported_exact_model_row",
+        "notes": "POST /rerank, /reranking, /v1/rerank, and /v1/reranking rank bounded string/object documents by cosine similarity using Nomic search_query/search_document prefixes, stable score ordering, optional top_n, and optional returned documents. This is bi-encoder embedding-similarity reranking, not a classifier-head cross-encoder claim."
+      },
+      {
         "id": "web_workspace",
         "status": "supported_current_gate",
-        "notes": "loopback WebUI only: durable conversations over exactly read_file/list_dir/literal-content search inside one canonical workspace root; allow_writes=true is rejected. Evidence-first extension inventories are derived from successful list_dir observations. Exact prompt-plus-generation budgeting, SQLite/FTS5 retrieval, reversible automatic compaction, turn-scoped cancellation, a 90-second model-step deadline, and model-transition exclusion fail closed. Available only to supported exact rows with tool_capable=true. The historical Qwen3-4B-Q4_K_M bundle validates the underlying tool-call and sandbox path, but its write scenarios no longer describe the current read-only surface. No write, shell, network, GUI, subagent, unattended, neighboring-model, portability, or throughput claim."
+        "notes": "loopback WebUI only: durable conversations over exactly read_file/list_dir/literal-content search inside one canonical workspace root; allow_writes=true is rejected. When the exact supported Nomic embedding row is also loaded, each session lazily builds a bounded read-only in-memory source index and injects semantically relevant, explicitly untrusted excerpts before model execution; absence/failure degrades to the existing lexical path. Evidence-first extension inventories are derived from successful list_dir observations. Exact prompt-plus-generation budgeting, SQLite/FTS5 retrieval, reversible automatic compaction, turn-scoped cancellation, a 90-second model-step deadline, and model-transition exclusion fail closed. Generation remains available only to supported exact rows with tool_capable=true. No write, shell, network, GUI, subagent, unattended, neighboring-model, persistent vector database, broad retrieval-quality, portability, or throughput claim."
       },
       {
         "id": "stream_options.include_usage",
@@ -171,12 +191,17 @@
       {
         "id": "llama_server_props",
         "status": "partial",
-        "notes": "GET /props returns read-only public server properties, default generation settings, explicit fail-closed chat_template_caps, chat-template metadata when a model is loaded, and Camelid readiness notes. Local model paths are intentionally redacted, router-mode model/autoload query params and POST /props are unsupported, and this does not imply slot lifecycle, native /completion streaming, embeddings, or full llama-server WebUI parity."
+        "notes": "GET /props returns read-only public server properties, default generation settings, explicit fail-closed chat_template_caps, chat-template metadata when a model is loaded, and Camelid readiness notes. Local model paths are intentionally redacted, router-mode model/autoload query params and POST /props are unsupported, and this does not imply slot lifecycle, native /completion streaming, generic embedding-model compatibility, or full llama-server WebUI parity."
       },
       {
         "id": "llama_server_slots",
         "status": "partial",
-        "notes": "GET /slots returns a single read-only, privacy-safe slot snapshot with generation readiness and fail_on_no_slot=1 handling. Router-mode model/autoload query params, POST /slots, slot save/restore/erase actions, prompt-cache metadata, cancellation metadata, and continuous batching metrics remain unsupported."
+        "notes": "GET /slots returns a single read-only, privacy-safe slot snapshot with generation readiness, queue depth, decoded-token progress, elapsed/stalled time, and fail_on_no_slot=1 handling. Router-mode model/autoload query params, POST /slots, slot save/restore/erase actions, prompt-cache metadata, and cancellation actions remain unsupported."
+      },
+      {
+        "id": "production_server_hardening",
+        "status": "supported",
+        "notes": "Startup-resolved bearer/X-API-Key authentication with key-file support, fail-closed non-loopback binding, explicit CORS origin allowlists, optional rustls TLS, request/prompt/generation/download ceilings, and a Prometheus /metrics surface for HTTP/generation/token/cache/queue/slot/RSS/VRAM telemetry. Anonymous same-origin loopback remains the default."
       },
       {
         "id": "llama_server_apply_template",
@@ -191,7 +216,7 @@
       {
         "id": "fail_closed_native_compatibility_routes",
         "status": "unsupported",
-        "notes": "Native /infill, /metrics, /embedding, /embeddings, /v1/embeddings, /v1/messages, /rerank, /reranking, /v1/rerank, /v1/reranking, /v1/responses, POST /models/unload, POST /slots, and slot cache actions return typed not_implemented errors until real route semantics and backend support exist. Unsupported /models/load router-mode fields and /completion modes remain typed parameter errors."
+        "notes": "Native /infill, /v1/messages, /v1/responses, POST /models/unload, POST /slots, and slot cache actions return typed not_implemented errors until real route semantics and backend support exist. Unsupported /models/load router-mode fields and /completion modes remain typed parameter errors. Embedding and reranking routes are separately supported only for the exact evidence-gated Nomic row."
       },
       {
         "id": "multi_choice_generation",
@@ -211,6 +236,57 @@
     ]
   },
   "model_rows": [
+    {
+      "identity": {
+        "id": "nomic_embed_text_v1_5_q8_0",
+        "family": "nomic-bert",
+        "quantization": "Q8_0",
+        "gguf_filename": "nomic-embed-text-v1.5.Q8_0.gguf",
+        "sha256": "3e24342164b3d94991ba9692fdc0dd08e3fd7362e0aacc396a9a5c54a544c3b7"
+      },
+      "contract": {
+        "id": "nomic_embed_text_v1_5_q8_0",
+        "family": "nomic-bert",
+        "quantization": "Q8_0",
+        "status": "supported_exact_row_embedding",
+        "tool_capable": false,
+        "support_scope": "exact_row_embeddings_rerank_and_workspace_semantic_retrieval_only",
+        "full_support_status": "blocked_pending_broader_encoder_evidence",
+        "full_support_blockers": "generic BERT/Nomic variants, other quants, classifier-head rank models, GPU execution, long-context retrieval quality, portability, and a production retrieval benchmark remain unproven",
+        "metadata_parses": "validated_exact_nomic_bert_encoder_metadata",
+        "tokenizer_works": "validated_bert_wordpiece_three_prompt_token_id_oracle",
+        "tensors_load": "validated_61_q8_0_matrices_plus_51_f32_vectors_exact_shapes",
+        "generation_runs": "not_applicable_encoder_embeddings_execute",
+        "parity_audited": "three_768d_vectors_cosine_above_0_9997_and_max_abs_delta_below_0_003_vs_llama_cpp_b10173",
+        "performance_measured": "windows_release_cpu_4_vector_batch_median_265ms_at_8_workers_14_7pct_throughput_uplift_vs_4_workers_peak_rss_flat",
+        "frontend_load_path_verified": "real_api_sidecar_load_v1_embeddings_and_v1_rerank_validated_frontend_readiness_probe_wired",
+        "frontend_readiness_gate": "green only for the exact catalog artifact nomic-embed-text-v1.5.Q8_0.gguf; embedding readiness is independent of generation_ready",
+        "tested_context": "three_short_semantic_oracle_prompts_plus_256d_matryoshka_probe",
+        "chat_template_renderer": "not_applicable_encoder_uses_nomic_search_prefixes",
+        "chat_template_shape_pack": "not_applicable",
+        "chat_template_shape_pack_id": "not_applicable",
+        "bounded_context_512_pack": "not_applicable",
+        "bounded_context_512_pack_id": "not_applicable",
+        "bounded_context_window": 0,
+        "bounded_context_1024_pack": "not_applicable",
+        "bounded_context_1024_pack_id": "not_applicable",
+        "bounded_context_1024_window": 0,
+        "bounded_context_2048_pack": "not_applicable",
+        "bounded_context_2048_pack_id": "not_applicable",
+        "bounded_context_2048_window": 0,
+        "bounded_context_4096_pack": "not_applicable",
+        "bounded_context_4096_pack_id": "not_applicable",
+        "bounded_context_4096_window": 0,
+        "bounded_context_8192_pack": "not_applicable",
+        "bounded_context_8192_pack_id": "not_applicable",
+        "bounded_context_8192_window": 0,
+        "latest_checked_bucket": "embedding_semantic_oracle",
+        "latest_checked_result": "pass",
+        "latest_checked_output": "deterministic_unit_norm_768d_and_256d_embeddings_with_relevant_document_ranked_first",
+        "evidence": "exact row nomic-embed-text-v1.5.Q8_0.gguf (146,146,432 bytes; sha256 3e24342164b3d94991ba9692fdc0dd08e3fd7362e0aacc396a9a5c54a544c3b7; Hugging Face revision 18d1044f4866e224159fce8c6fc5c4f3920176e7): 112 tensors (61 Q8_0 matrices retained quantized + 51 F32 vectors), 12 layers, width 768, mean pooling. Exact WordPiece token IDs match llama.cpp b10173 for three fixed query/document prompts. Camelid relevant/irrelevant cosine scores are 0.860397/0.473693 versus llama.cpp 0.859971/0.472697; all three 768d vectors pass cosine >0.9997 and max absolute delta <0.003, are finite/unit-normalized, and repeated input is bit-deterministic. A 256d Matryoshka embedding is re-normalized. Real HTTP sidecar load (`set_active=false`), `/v1/embeddings`, and `/v1/rerank` pass on the exact artifact. On this Windows host, controlled release medians for four short vectors are 304ms at 4 workers and 265ms at 8 workers (13.16 -> 15.09 embeddings/s, +14.7% throughput); observed peak working set stays effectively flat at 162.4 vs 162.8 MiB, while tokenizer/metadata-only baseline is 9.2 MiB. Host-specific measurements, not a portable SLA. This supports only embeddings, embedding-similarity reranking, and bounded in-memory Workspace semantic retrieval for this exact artifact; it is not a generative or cross-encoder-reranker claim.",
+        "next_step": "add GPU encoder kernels, separately evidence a classifier-head cross-encoder reranker, and run retrieval recall/long-context/portable-host packs before broadening support"
+      }
+    },
     {
       "identity": {
         "id": "ornith_1_0_9b_q4_k_m",
@@ -1539,7 +1615,7 @@
         "full_support_blockers": "later short-prompt generation still diverges from llama.cpp; API/WebUI readiness, long-context evidence, production throughput, portability, and durable broad prompt coverage are missing",
         "metadata_parses": "validated_sparse_header",
         "tokenizer_works": "validated_against_llama_cpp_reference",
-        "tensors_load": "validated_lazy_file_backed_rank3_q8_experts",
+        "tensors_load": "validated_lazy_file_backed_rank3_q8_experts_resident_q8_path_unit_validated_only",
         "generation_runs": "bounded_one_token_runtime_smoke_observed",
         "parity_audited": "prompt_tokens_and_bounded_one_token_match_only",
         "performance_measured": "not_promoted",
@@ -1567,8 +1643,8 @@
         "latest_checked_bucket": "mixtral_8x7b_q8_gate9a_50tok_divergence_20260511",
         "latest_checked_result": "blocked_later_generation_divergence",
         "latest_checked_output": "qa/evidence-bundles/mixtral-8x7b-v0.1-q8-blocker-reconciliation-20260512/README.md",
-        "evidence": "exact row Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf: sparse-header metadata parses with llama.expert_count=8 and expert_used_count=2 plus rank-3 expert tensors; tokenizer/template prompts match llama.cpp reference pack fixtures/tokenizer/mixtral-8x7b-instruct-v0.1-reference-pack.json; MoE top-k expert routing runs with default full-router softmax weights and lazy/file-backed Q8 experts; bounded one-token backend MoE runtime evidence exists, but Gate 9A 50-token evidence diverged at generated token index 9 and qa/evidence-bundles/mixtral-8x7b-v0.1-q8-longgen-continuation-20260511 records partial_failure plus a backend HTTP hang. No broad Mixtral, API/WebUI/frontend readiness, long-context, production, neighboring-row, or full-support claim is made.",
-        "next_step": "fix later-generation divergence and rerun row-specific parity/API/WebUI/RSS evidence before any Mixtral support/readiness promotion"
+        "evidence": "exact row Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf: sparse-header metadata parses with llama.expert_count=8 and expert_used_count=2 plus rank-3 expert tensors; tokenizer/template prompts match llama.cpp reference pack fixtures/tokenizer/mixtral-8x7b-instruct-v0.1-reference-pack.json; MoE top-k routing now exposes per-layer router logits, selected expert IDs/weights, and per-expert gate/up/activation/down/weighted-down checkpoints. The existing lazy/file-backed Q8 path remains the default; an opt-in zero-copy resident-Q8 expert path is live-RAM gated but has only synthetic/unit validation on this checkout. Bounded one-token backend evidence exists, but Gate 9A 50-token evidence diverged at generated token index 9. Multi-token requests now fail closed by default, and scripts/diagnose-mixtral-watchdog.ps1 separates forward progress from a stalled engine during explicit diagnostic runs. No broad Mixtral, API/WebUI/frontend readiness, long-context, production, neighboring-row, or full-support claim is made.",
+        "next_step": "acquire the exact GGUF and compatible pinned llama.cpp oracle, then rerun generated-index-9 parity plus continuation/API/WebUI/RSS/throughput gates before any Mixtral support/readiness promotion"
       }
     },
     {
@@ -1625,7 +1701,8 @@
       "identity": {
         "id": "phi3_mini_4k_instruct_q8_0",
         "family": "phi3",
-        "quantization": "Q8_0"
+        "quantization": "Q8_0",
+        "gguf_filename": "Phi-3-mini-4k-instruct-Q8_0.gguf"
       },
       "contract": {
         "id": "phi3_mini_4k_instruct_q8_0",
@@ -1634,18 +1711,18 @@
         "quantization": "Q8_0",
         "status": "active_validation_blocked_parity",
         "support_scope": "exact_row_validation_only",
-        "full_support_status": "blocked_prompt_and_generation_parity",
-        "full_support_blockers": "committed prompt-token and raw-generation parity receipts fail; API/WebUI readiness, context, performance, and portability evidence are also missing",
+        "full_support_status": "blocked_generation_parity",
+        "full_support_blockers": "generation parity is not certified: prefill and incremental decode disagree from the 3rd generated token (deterministically, since the Metal PV row-tail fix); API/WebUI readiness, context, performance, and portability evidence are also missing. Prompt-token parity and the temperature-0 non-determinism no longer block",
         "metadata_parses": "observed",
-        "tokenizer_works": "blocked_prompt_token_parity",
+        "tokenizer_works": "validated_raw_8_of_8_and_chat_3_of_3_prompt_token_parity",
         "tensors_load": "observed",
         "generation_runs": "observed_but_not_parity_certified",
         "parity_audited": "failed",
         "performance_measured": "not_started",
         "frontend_load_path_verified": "fail_closed_blocked_parity",
-        "frontend_readiness_gate": "fail-closed until prompt-token and generation parity pass for this exact artifact",
-        "tested_context": "short_prompt_failed_parity_probe",
-        "chat_template_renderer": "phi3_metadata_template_under_validation",
+        "frontend_readiness_gate": "fail-closed until generation parity passes for this exact artifact",
+        "tested_context": "prompt_token_parity_to_2180_tokens_single_token_decode_reference_matched_multi_token_diverges_at_index_2",
+        "chat_template_renderer": "phi3_metadata_template_prompt_tokens_reference_matched",
         "chat_template_shape_pack": "failed_reference_parity",
         "chat_template_shape_pack_id": "phi3-chat-template-pack-v1",
         "bounded_context_512_pack": "not_started",
@@ -1664,10 +1741,60 @@
         "bounded_context_8192_pack_id": "not_selected",
         "bounded_context_8192_window": 8192,
         "latest_checked_bucket": "phi3_hold_evidence",
-        "latest_checked_result": "blocked_prompt_and_generation_parity",
+        "latest_checked_result": "blocked_generation_parity",
         "latest_checked_output": "qa/muster/phi3-hold-evidence/README.md",
-        "evidence": "exact-row work exists, but qa/muster/phi3-hold-evidence records all_match=false for prompt-token parity and all_pass=false for raw/chat generation parity; this row is intentionally not advertised as supported",
-        "next_step": "fix Phi-3 tokenizer/template and generation parity, then capture exact-row API/WebUI and bounded-context evidence before promotion"
+        "evidence": "prompt-token parity PASSES on the exact artifact Phi-3-mini-4k-instruct-Q8_0.gguf: all_match=true over the committed 8-prompt pack (to a 2180-token prompt) and over the 3 rendered chat prompts, against pinned llama.cpp acd79d603 — qa/muster/phi3-hold-evidence/{prompt-token-parity-q8-20260727.json,chat-prompt-token-parity-q8-20260727.json}. The temperature-0 NON-DETERMINISM that previously blocked this row is FIXED: half_mm_batched_f16o ignored its `rows` argument, so at head_dim=96 the prefill PV pass's partial 64-row tile read past each head V slab and wrote into the next head's columns, racing it; bounding the three unguarded sites by `rows` makes the default path bit-stable (6/6 identical single-token, 3/3 identical multi-token) and returns the reference token 32001 — qa/muster/phi3-hold-evidence/nondeterminism-fixed-q8-20260728.json, which also records Llama-3.2-3B and Mistral-7B bit-identical pre/post patch. Generation parity STILL blocks the row for a separate and now-DETERMINISTIC reason: on 'The capital of France is' the reference emits [3681,29889,13,32001,3869] while camelid emits [3681,29889,3681,338,2998], diverging at index 2, and a fresh prefill of the 8-token prefix returns the reference 13 where incremental decode returns 3681. This row is intentionally not advertised as supported",
+        "next_step": "reconcile phi3 incremental decode with prefill — a fresh prefill of the same prefix matches the reference while decode does not, so compare the decode KV-cache read against the prefill path for head_dim=96 (the same non-multiple-of-64 shape that broke the PV row tile). Then re-run generation parity and capture exact-row API/WebUI and bounded-context evidence before promotion"
+      }
+    },
+    {
+      "identity": {
+        "id": "phi4_mini_instruct_q4_k_m",
+        "family": "phi3",
+        "quantization": "Q4_K_M",
+        "sha256": "88c00229914083cd112853aab84ed51b87bdf6b9ce42f532d8c85c7c63b1730a"
+      },
+      "contract": {
+        "id": "phi4_mini_instruct_q4_k_m",
+        "tool_capable": false,
+        "family": "phi3",
+        "quantization": "Q4_K_M",
+        "status": "active_validation_blocked_parity",
+        "support_scope": "exact_row_validation_only",
+        "full_support_status": "blocked_prompt_and_generation_parity",
+        "full_support_blockers": "the exact artifact has a documented Windows CUDA raw-decode divergence; CPU parity is inconclusive; forward-path isolation, API/WebUI, context, performance, and portability evidence are all missing",
+        "metadata_parses": "observed",
+        "tokenizer_works": "observed_exact_artifact_gpt4o_only",
+        "tensors_load": "observed_cuda_resident_only",
+        "generation_runs": "observed_but_not_parity_certified",
+        "parity_audited": "failed",
+        "performance_measured": "not_started",
+        "frontend_load_path_verified": "fail_closed_blocked_parity",
+        "frontend_readiness_gate": "fail-closed until prompt-token and generation parity pass for this exact artifact",
+        "tested_context": "short_raw_prompt_cuda_diverged_cpu_inconclusive",
+        "chat_template_renderer": "phi4_metadata_template_under_validation",
+        "chat_template_shape_pack": "ordinary_message_shape_locked_not_generation_certified",
+        "chat_template_shape_pack_id": "phi4-mini-chat-template-shapes-v1",
+        "bounded_context_512_pack": "not_started",
+        "bounded_context_512_pack_id": "phi4-context-512-smoke-v1",
+        "bounded_context_window": 512,
+        "bounded_context_1024_pack": "not_started",
+        "bounded_context_1024_pack_id": "phi4-context-1024-smoke-v1",
+        "bounded_context_1024_window": 1024,
+        "bounded_context_2048_pack": "not_started",
+        "bounded_context_2048_pack_id": "phi4-context-2048-smoke-v1",
+        "bounded_context_2048_window": 2048,
+        "bounded_context_4096_pack": "not_started",
+        "bounded_context_4096_pack_id": "phi4-context-4096-smoke-v1",
+        "bounded_context_4096_window": 4096,
+        "bounded_context_8192_pack": "not_promoted",
+        "bounded_context_8192_pack_id": "not_selected",
+        "bounded_context_8192_window": 8192,
+        "latest_checked_bucket": "phi4_hold_raw_cuda_divergence",
+        "latest_checked_result": "blocked_prompt_and_generation_parity",
+        "latest_checked_output": "qa/muster/HOLD-phi4-mini-instruct-q4_k_m.json",
+        "evidence": "exact artifact SHA-256 88c00229914083cd112853aab84ed51b87bdf6b9ce42f532d8c85c7c63b1730a is held in qa/muster/HOLD-phi4-mini-instruct-q4_k_m.json after an unattributed Windows CUDA raw-decode divergence and an inconclusive CPU matrix; it is intentionally absent from curated_catalog and not advertised as supported",
+        "next_step": "isolate the first divergent token across the Phi-4 forward path, then rerun complete tokenizer, generation, API/WebUI, determinism, and bounded-context evidence before any catalog or support promotion"
       }
     },
     {

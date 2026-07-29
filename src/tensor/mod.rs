@@ -29,6 +29,7 @@ use crate::{
     BackendError, Result,
 };
 
+pub mod kv_quant;
 pub mod wire_dequant;
 
 #[cfg(target_os = "macos")]
@@ -109,6 +110,28 @@ pub enum RuntimeDType {
 pub struct Q8_0Block {
     pub scale: f32,
     pub quants: [i8; 32],
+}
+
+/// Cheap view into an immutable resident Q8_0 block allocation.
+///
+/// MoE expert packs are much larger than ordinary linears. Expert selection
+/// uses this range view so each token can borrow one expert without cloning
+/// hundreds of MiB of quantized blocks.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Q8_0SharedBlocks {
+    // Keep the Vec allocation itself behind Arc. `Arc<[T]>::from(Vec<T>)`
+    // allocates and moves into an Arc slice, which briefly doubles multi-GiB
+    // MoE resident storage during promotion. Arc<Vec<T>> retains the loader's
+    // existing allocation and still gives every expert view immutable sharing.
+    pub(crate) blocks: std::sync::Arc<Vec<Q8_0Block>>,
+    pub(crate) start: usize,
+    pub(crate) len: usize,
+}
+
+impl Q8_0SharedBlocks {
+    pub(crate) fn as_slice(&self) -> &[Q8_0Block] {
+        &self.blocks[self.start..self.start + self.len]
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1150,6 +1173,7 @@ pub struct CpuTensor {
     pub dtype: RuntimeDType,
     pub source_type: Option<GgufTensorType>,
     pub q8_0_blocks: Option<Vec<Q8_0Block>>,
+    pub(crate) q8_0_shared_blocks: Option<Q8_0SharedBlocks>,
     pub q8_0_packed_rows4_4x4: Option<Q8_0PackedRows4>,
     pub q8_0_packed_rows4_4x8: Option<Q8_0PackedRows4>,
     pub q8_0_runtime_storage: Option<Q8_0RuntimeStorage>,
@@ -1342,6 +1366,7 @@ impl Q8_0TensorBlocks {
             dtype: RuntimeDType::F32,
             source_type: None,
             q8_0_blocks: None,
+            q8_0_shared_blocks: None,
             q8_0_packed_rows4_4x4: None,
             q8_0_packed_rows4_4x8: None,
             q8_0_runtime_storage: None,
@@ -1425,6 +1450,7 @@ impl CpuTensor {
             dtype: RuntimeDType::F32,
             source_type: None,
             q8_0_blocks: None,
+            q8_0_shared_blocks: None,
             q8_0_packed_rows4_4x4: None,
             q8_0_packed_rows4_4x8: None,
             q8_0_runtime_storage: None,
@@ -1516,6 +1542,7 @@ impl CpuTensor {
             dtype: RuntimeDType::F32,
             source_type: Some(GgufTensorType::Q8_0),
             q8_0_blocks: Some(q8_0_blocks),
+            q8_0_shared_blocks: None,
             q8_0_packed_rows4_4x4,
             q8_0_packed_rows4_4x8,
             q8_0_runtime_storage: None,
@@ -1535,6 +1562,60 @@ impl CpuTensor {
         })
     }
 
+    pub(crate) fn from_q8_0_shared_blocks(
+        name: impl Into<String>,
+        shape: TensorShape,
+        blocks: std::sync::Arc<Vec<Q8_0Block>>,
+        start: usize,
+        len: usize,
+    ) -> Result<Self> {
+        let expected_elements = shape.element_count()?;
+        if !expected_elements.is_multiple_of(32) {
+            return Err(BackendError::InvalidTensorData(format!(
+                "shared q8_0 tensor element count {expected_elements} is not block aligned"
+            )));
+        }
+        let expected_blocks = expected_elements / 32;
+        if len != expected_blocks || start.saturating_add(len) > blocks.len() {
+            return Err(BackendError::InvalidTensorData(format!(
+                "shared q8_0 tensor expected {expected_blocks} blocks at {start}, got range length {len} over {} blocks",
+                blocks.len()
+            )));
+        }
+        Ok(Self {
+            name: name.into(),
+            shape,
+            dtype: RuntimeDType::F32,
+            source_type: Some(GgufTensorType::Q8_0),
+            q8_0_blocks: None,
+            q8_0_shared_blocks: Some(Q8_0SharedBlocks { blocks, start, len }),
+            q8_0_packed_rows4_4x4: None,
+            q8_0_packed_rows4_4x8: None,
+            q8_0_runtime_storage: None,
+            q8_0_file_backing: None,
+            q8_0_wire_mmap: None,
+            q8_0_wire_pages: None,
+            q8_0_split_file_backing: None,
+            q4_k_wire_bytes: None,
+            q4_k_repack8: Q4KRepack8Cell::default(),
+            q5_k_wire_bytes: None,
+            q6_k_wire_bytes: None,
+            q2_k_wire_bytes: None,
+            q3_k_wire_bytes: None,
+            tq2_0_wire_bytes: None,
+            iq4_xs_wire_bytes: None,
+            data: Vec::new(),
+        })
+    }
+
+    pub(crate) fn q8_0_block_slice(&self) -> Option<&[Q8_0Block]> {
+        self.q8_0_blocks.as_deref().or_else(|| {
+            self.q8_0_shared_blocks
+                .as_ref()
+                .map(Q8_0SharedBlocks::as_slice)
+        })
+    }
+
     pub fn with_q8_0_file_backing(mut self, backing: Q8_0FileBacking) -> Self {
         self.q8_0_file_backing = Some(backing);
         self
@@ -1551,6 +1632,7 @@ impl CpuTensor {
             dtype: RuntimeDType::F32,
             source_type: Some(GgufTensorType::Q8_0),
             q8_0_blocks: None,
+            q8_0_shared_blocks: None,
             q8_0_packed_rows4_4x4: None,
             q8_0_packed_rows4_4x8: None,
             q8_0_runtime_storage: None,
@@ -1581,6 +1663,7 @@ impl CpuTensor {
             dtype: RuntimeDType::F32,
             source_type: Some(GgufTensorType::Q8_0),
             q8_0_blocks: None,
+            q8_0_shared_blocks: None,
             q8_0_packed_rows4_4x4: None,
             q8_0_packed_rows4_4x8: None,
             q8_0_runtime_storage: Some(Q8_0RuntimeStorage::PackedRows4(packed)),
@@ -1611,6 +1694,7 @@ impl CpuTensor {
             dtype: RuntimeDType::F32,
             source_type: Some(GgufTensorType::Q8_0),
             q8_0_blocks: None,
+            q8_0_shared_blocks: None,
             q8_0_packed_rows4_4x4: None,
             q8_0_packed_rows4_4x8: None,
             q8_0_runtime_storage: None,
@@ -2799,6 +2883,23 @@ fn record_q8_file_cache_decoded_scale_reuse(blocks: usize) {
     Q8_0_FILE_CACHE_DECODED_SCALE_HIT_BLOCKS.fetch_add(blocks as u64, Ordering::Relaxed);
 }
 
+/// Serializes every test that measures the process-global Q8 file-read counters
+/// or mutates the process-global Q8 file cache.
+///
+/// Those tests span two modules (`tensor::tests` and `inference::tests`), so the
+/// lock has to live beside the state it guards rather than inside either test
+/// module. Concurrent runs corrupt each other's `saturating_delta_since` deltas —
+/// typically an off-by-one read count — which made them intermittently red under
+/// `cargo test`'s default parallelism.
+///
+/// Poisoning is deliberately ignored: one genuinely failing test must not cascade
+/// into spurious failures across the rest of the family.
+#[cfg(test)]
+pub(crate) fn q8_stats_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub fn q8_0_file_read_stats() -> Q8_0FileReadStats {
     let cache_capacity_bytes = q8_file_cache_capacity_bytes();
     let (cache_entries, cache_bytes) = q8_file_cache_snapshot(cache_capacity_bytes);
@@ -3655,6 +3756,24 @@ impl TensorStore {
         self.load_q8_0_block_backed_linear_as(name, name)
     }
 
+    /// Load a Q8_0 tensor of any rank into resident quantized blocks.
+    ///
+    /// Unlike `load_q8_0_block_backed_linear`, this never materializes f32 and
+    /// intentionally rejects non-Q8 storage. It exists for rank-3 MoE expert
+    /// packs, where keeping the quantized bytes resident removes repeated disk
+    /// reads without multiplying memory by four.
+    pub fn load_q8_0_block_backed_tensor(&self, name: &str) -> Result<CpuTensor> {
+        let tensor = self.load_q8_0_blocks(name)?;
+        let len = tensor.blocks.len();
+        CpuTensor::from_q8_0_shared_blocks(
+            tensor.name,
+            tensor.shape,
+            std::sync::Arc::new(tensor.blocks),
+            0,
+            len,
+        )
+    }
+
     /// Fast-load: read the tensor's wire-format bytes once into a page-aligned
     /// allocation (page cache enabled, no decode) that the Metal stack wraps with
     /// an offset-0 NoCopy buffer — the only resident copy of the weight. The
@@ -3771,6 +3890,7 @@ impl TensorStore {
             dtype: RuntimeDType::F32,
             source_type: Some(desc.tensor_type),
             q8_0_blocks: None,
+            q8_0_shared_blocks: None,
             q8_0_packed_rows4_4x4: None,
             q8_0_packed_rows4_4x8: None,
             q8_0_runtime_storage: None,
@@ -3806,6 +3926,7 @@ impl TensorStore {
             dtype: RuntimeDType::F32,
             source_type: Some(desc.tensor_type),
             q8_0_blocks: None,
+            q8_0_shared_blocks: None,
             q8_0_packed_rows4_4x4: None,
             q8_0_packed_rows4_4x8: None,
             q8_0_runtime_storage: None,
@@ -3841,6 +3962,7 @@ impl TensorStore {
             dtype: RuntimeDType::F32,
             source_type: Some(desc.tensor_type),
             q8_0_blocks: None,
+            q8_0_shared_blocks: None,
             q8_0_packed_rows4_4x4: None,
             q8_0_packed_rows4_4x8: None,
             q8_0_runtime_storage: None,
@@ -3911,6 +4033,66 @@ impl TensorStore {
         Ok(CpuTensor::q8_0_split_file_backed_tensor(
             name, shape, backings,
         ))
+    }
+
+    /// Join individually named Q8_0 experts into one resident rank-3 tensor.
+    ///
+    /// GGUF split-expert files store each expert contiguously. Appending their
+    /// decoded block records in descriptor order therefore produces the same
+    /// expert-major layout as a merged expert tensor.
+    pub fn load_q8_0_split_block_backed_tensor(
+        &self,
+        name: impl Into<String>,
+        dims: Vec<usize>,
+        experts: &[GgufTensorDescriptor],
+    ) -> Result<CpuTensor> {
+        let name = name.into();
+        let shape = TensorShape { dims };
+        let expected_elements = shape.element_count()?;
+        if expected_elements % Q8_0_BLOCK_VALUES != 0 {
+            return Err(BackendError::InvalidTensorData(format!(
+                "split tensor {name} Q8_0 element count {expected_elements} is not block aligned"
+            )));
+        }
+        let expert_count = experts.len();
+        if expert_count == 0 {
+            return Err(BackendError::InvalidTensorData(
+                "split MoE tensor requires at least one expert".to_string(),
+            ));
+        }
+        if !expected_elements.is_multiple_of(expert_count) {
+            return Err(BackendError::InvalidTensorData(format!(
+                "split tensor {name} element count {expected_elements} is not divisible by {expert_count} experts"
+            )));
+        }
+        let per_expert_elements = expected_elements / expert_count;
+        let mut blocks = Vec::with_capacity(expected_elements / Q8_0_BLOCK_VALUES);
+        for desc in experts {
+            if desc.tensor_type != GgufTensorType::Q8_0 {
+                return Err(BackendError::UnsupportedTensorType(format!(
+                    "split MoE tensor {} has storage type {:?}; resident experts require Q8_0",
+                    desc.name, desc.tensor_type
+                )));
+            }
+            let expert = self.load_q8_0_blocks(&desc.name)?;
+            let actual_elements = expert.shape.element_count()?;
+            if actual_elements != per_expert_elements {
+                return Err(BackendError::InvalidTensorData(format!(
+                    "split MoE tensor {} has {actual_elements} elements, expected {per_expert_elements}",
+                    desc.name
+                )));
+            }
+            blocks.extend(expert.blocks);
+        }
+        if blocks.len() != expected_elements / Q8_0_BLOCK_VALUES {
+            return Err(BackendError::InvalidTensorData(format!(
+                "split tensor {name} decoded {} Q8_0 blocks, expected {}",
+                blocks.len(),
+                expected_elements / Q8_0_BLOCK_VALUES
+            )));
+        }
+        let len = blocks.len();
+        CpuTensor::from_q8_0_shared_blocks(name, shape, std::sync::Arc::new(blocks), 0, len)
     }
 
     pub fn load_q8_0_file_backed_tensor(&self, name: &str) -> Result<CpuTensor> {
@@ -4075,6 +4257,7 @@ impl TensorStore {
             dtype: RuntimeDType::F32,
             source_type: Some(desc.tensor_type),
             q8_0_blocks,
+            q8_0_shared_blocks: None,
             q8_0_packed_rows4_4x4,
             q8_0_packed_rows4_4x8,
             q8_0_runtime_storage: None,
@@ -6276,6 +6459,204 @@ mod bf16_dequant_parity_tests {
 
 #[cfg(test)]
 mod tests {
+    /// Serializes the `q8_file_*` tests against each other.
+    ///
+    /// They assert on DELTAS of the process-global `q8_0_file_read_stats()` counter
+    /// and share the process-global Q8 file cache, so any two running concurrently
+    /// corrupt each other's measurements — typically surfacing as an off-by-one
+    /// read count (`left: 2, right: 1`). That made them intermittently red under
+    /// `cargo test`'s default parallelism.
+    ///
+    /// The flakiness is latent and order-dependent, not random: adding unrelated
+    /// tests to this module changed the scheduling enough to make it fire on almost
+    /// every run, which is what motivated fixing it here rather than deferring.
+    ///
+    /// Poisoning is deliberately ignored — one genuinely failing test must not
+    /// cascade into spurious failures across the rest of the family.
+    fn q8_stats_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::tensor::q8_stats_test_lock()
+    }
+
+    /// Dequant-parity receipts for the four legacy block formats, each hand-derived
+    /// from its `dequantize_row_*` in llama.cpp `ggml/src/ggml-quants.c`.
+    ///
+    /// The shared trap in all four is the SPLIT-HALF nibble order: the low nibble
+    /// of `qs[j]` is element `j` and the high nibble is element `j + 16`, NOT
+    /// `j*2` and `j*2+1`. A decoder that emits them adjacently produces the right
+    /// multiset in the wrong order — plausible-looking, entirely wrong weights.
+    /// Every case below therefore asserts an element from each half.
+    #[test]
+    fn legacy_quant_dequant_matches_the_reference_layout() {
+        use super::{
+            decode_iq4_nl_tensor, decode_q4_1_tensor, decode_q5_0_tensor, decode_q5_1_tensor,
+        };
+
+        // ---- Q4_1: d = 0.5 (f16 0x3800), m = -4.0 (f16 0xC400), value = q*d + m,
+        // q unsigned 0..15 with no bias. qs sweeps low nibbles 0..15 forward while
+        // the high nibbles sweep 15..0 backward.
+        let mut q4_1 = vec![0x00u8, 0x38, 0x00, 0xC4];
+        q4_1.extend([
+            0xF0, 0xE1, 0xD2, 0xC3, 0xB4, 0xA5, 0x96, 0x87, 0x78, 0x69, 0x5A, 0x4B, 0x3C, 0x2D,
+            0x1E, 0x0F,
+        ]);
+        let out = decode_q4_1_tensor("q4_1", &q4_1, 32).unwrap();
+        assert_eq!(out.len(), 32);
+        // element 0 = low nibble 0 -> 0*0.5 - 4.0; element 16 = high nibble 15 -> 3.5
+        assert_eq!(out[0], -4.0);
+        assert_eq!(out[16], 3.5);
+        assert_eq!(out[15], 3.5);
+        assert_eq!(out[31], -4.0);
+
+        // ---- Q5_0: d = 1.5 (f16 0x3E00), 5th bit from qh, value = (q - 16)*d.
+        let mut q5_0 = vec![0x00u8, 0x3E, 0xAA, 0xAA, 0x53, 0xAA];
+        q5_0.extend([
+            0x00, 0xFF, 0x0F, 0xF0, 0x81, 0x18, 0x77, 0x8E, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC,
+            0xDE, 0xF0,
+        ]);
+        let out = decode_q5_0_tensor("q5_0", &q5_0, 32).unwrap();
+        assert_eq!(out.len(), 32);
+        // element 0: low nibble 0, qh bit 0 of 0x53AAAAAA = 0 -> (0-16)*1.5
+        assert_eq!(out[0], -24.0);
+        // element 1: low nibble 15, qh bit 1 = 1 -> q = 31 -> (31-16)*1.5
+        assert_eq!(out[1], 22.5);
+
+        // ---- Q5_1: d = f16 0x2E66, m = -1.5 (f16 0xBE00), value = q*d + m with
+        // NO -16 bias (that is Q5_0's). This is the format whose 24-byte block was
+        // mis-sized as 22 in the reader; see the layout test in gguf::reader.
+        let mut q5_1 = vec![0x66u8, 0x2E, 0x00, 0xBE, 0xAA, 0xAA, 0x55, 0x55];
+        q5_1.extend([
+            0xF0, 0x0F, 0x0F, 0xF0, 0xE1, 0x1E, 0x1E, 0xE1, 0xD2, 0x2D, 0x2D, 0xD2, 0xC3, 0x3C,
+            0x3C, 0xC3,
+        ]);
+        assert_eq!(q5_1.len(), 24, "Q5_1 block is 24 bytes, not 22");
+        let out = decode_q5_1_tensor("q5_1", &q5_1, 32).unwrap();
+        assert_eq!(out.len(), 32);
+        // element 0: low nibble 0, qh bit 0 = 0 -> q = 0 -> 0*d + m = -1.5
+        assert_eq!(out[0], -1.5);
+        // element 1: low nibble 15, qh bit 1 = 1 -> q = 31 -> 31*d - 1.5
+        let d = super::f16_bits_to_f32(0x2E66);
+        assert_eq!(out[1], 31.0 * d - 1.5);
+
+        // ---- IQ4_NL: d = 0.25 (f16 0x3400); the nibble INDEXES kvalues_iq4nl
+        // rather than scaling linearly, so a transposed or sign-flipped table is
+        // the silent failure mode. kv = [-127,-104,-83,-65,-49,-35,-22,-10,
+        //                                  1,  13, 25, 38, 53, 69, 89,113]
+        let mut iq4_nl = vec![0x00u8, 0x34];
+        iq4_nl.extend([
+            0xF0, 0xE1, 0xD2, 0xC3, 0xB4, 0xA5, 0x96, 0x87, 0x78, 0x69, 0x5A, 0x4B, 0x3C, 0x2D,
+            0x1E, 0x0F,
+        ]);
+        let out = decode_iq4_nl_tensor("iq4_nl", &iq4_nl, 32).unwrap();
+        assert_eq!(out.len(), 32);
+        assert_eq!(out[0], -127.0 * 0.25); // kv[0]
+        assert_eq!(out[1], -104.0 * 0.25); // kv[1]
+        assert_eq!(out[15], 113.0 * 0.25); // kv[15], last low nibble
+        assert_eq!(out[16], 113.0 * 0.25); // kv[15], first high nibble
+        assert_eq!(out[31], -127.0 * 0.25); // kv[0], last high nibble
+    }
+
+    /// Dequant-parity receipt for TQ2_0, hand-derived from llama.cpp
+    /// `ggml/src/ggml-quants.c` `dequantize_row_tq2_0`:
+    ///
+    /// ```text
+    /// for j in {0, 32}: for l in 0..4: for m in 0..32:
+    ///     q = (qs[j + m] >> (l * 2)) & 3;  out = (q - 1) * d
+    /// ```
+    ///
+    /// The ORDERING is the part most likely to be silently wrong: the four 2-bit
+    /// codes packed into one byte do NOT decode to four adjacent outputs, they
+    /// decode 32 apart. A decoder that emits the right multiset in the wrong
+    /// order produces plausible-looking garbage, so this pins exact indices.
+    #[test]
+    fn tq2_0_dequant_matches_the_reference_layout() {
+        use super::{decode_tq2_0_tensor, TQ2_0_BLOCK_BYTES};
+
+        let mut block = vec![0x55u8; TQ2_0_BLOCK_BYTES]; // 0b01_01_01_01 -> all codes 1 -> 0.0
+                                                         // 0xE4 = 0b11_10_01_00, so codes low->high are 0, 1, 2, 3.
+        block[0] = 0xE4;
+        // 0x1B = 0b00_01_10_11, so codes low->high are 3, 2, 1, 0.
+        block[32] = 0x1B;
+        // d = 2.0  (f16 0x4000), so (q - 1) * d yields -2, 0, 2, 4.
+        block[64] = 0x00;
+        block[65] = 0x40;
+
+        let out = decode_tq2_0_tensor("t", &block, 256).unwrap();
+        assert_eq!(
+            out.len(),
+            256,
+            "one TQ2_0 block decodes QK_K = 256 elements"
+        );
+
+        // qs[0], planes l = 0..4, at stride 32 within the j = 0 half.
+        assert_eq!([out[0], out[32], out[64], out[96]], [-2.0, 0.0, 2.0, 4.0]);
+        // qs[32], same planes, in the j = 32 half which starts at element 128.
+        assert_eq!(
+            [out[128], out[160], out[192], out[224]],
+            [4.0, 2.0, 0.0, -2.0]
+        );
+
+        // Every other byte is 0x55 -> code 1 -> exactly zero, including the last.
+        assert_eq!(out[1], 0.0);
+        assert_eq!(out[255], 0.0);
+        assert_eq!(out.iter().filter(|v| **v != 0.0).count(), 6);
+    }
+
+    /// Dequant-parity receipt for TQ1_0, hand-derived from llama.cpp
+    /// `dequantize_row_tq1_0`. TQ1_0 packs five base-3 trits per byte and
+    /// recovers each with `xi = ((u8(qs * pow3[n]) as u16) * 3) >> 8`, then
+    /// `(xi - 1) * d`. The `u8` truncation of `qs * pow3[n]` is load-bearing —
+    /// doing that multiply in a wider type silently changes the trit.
+    ///
+    /// Layout: qs[0..32] -> 5 planes x 32 (elements 0..160), qs[32..48] -> 5
+    /// planes x 16 (elements 160..240), qh[0..4] -> 4 planes x 4 (elements
+    /// 240..256). Total 160 + 80 + 16 = 256 = QK_K.
+    #[test]
+    fn tq1_0_dequant_matches_the_reference_layout() {
+        use super::{decode_tq1_0_tensor, TQ1_0_BLOCK_BYTES};
+
+        let mut block = vec![0u8; TQ1_0_BLOCK_BYTES];
+        block[0] = 200;
+        block[1] = 121;
+        // d = 1.0 (f16 0x3C00) so the output is the raw trit.
+        block[52] = 0x00;
+        block[53] = 0x3C;
+
+        let out = decode_tq1_0_tensor("t", &block, 256).unwrap();
+        assert_eq!(
+            out.len(),
+            256,
+            "one TQ1_0 block decodes QK_K = 256 elements"
+        );
+
+        // qs[0] = 200. Per plane n, q = u8(200 * pow3[n]), xi = (q * 3) >> 8:
+        //   n=0: 200      -> 600  >> 8 = 2 -> trit  1
+        //   n=1: u8(600)  =  88 -> 264 >> 8 = 1 -> trit  0
+        //   n=2: u8(1800) =   8 ->  24 >> 8 = 0 -> trit -1
+        //   n=3: u8(5400) =  24 ->  72 >> 8 = 0 -> trit -1
+        //   n=4: u8(16200) = 72 -> 216 >> 8 = 0 -> trit -1
+        assert_eq!(
+            [out[0], out[32], out[64], out[96], out[128]],
+            [1.0, 0.0, -1.0, -1.0, -1.0]
+        );
+
+        // qs[1] = 121:
+        //   n=0: 121      -> 363 >> 8 = 1 -> trit  0
+        //   n=1: u8(363)  = 107 -> 321 >> 8 = 1 -> trit  0
+        //   n=2: u8(1089) =  65 -> 195 >> 8 = 0 -> trit -1
+        //   n=3: u8(3267) = 195 -> 585 >> 8 = 2 -> trit  1
+        //   n=4: u8(9801) =  73 -> 219 >> 8 = 0 -> trit -1
+        assert_eq!(
+            [out[1], out[33], out[65], out[97], out[129]],
+            [0.0, 0.0, -1.0, 1.0, -1.0]
+        );
+
+        // qs and qh bytes left at 0 decode to trit -1 (0 * 3 >> 8 = 0, minus 1),
+        // so the tail planes are all -1 rather than 0 — a decoder that zero-fills
+        // instead of decoding would pass a laxer test but fail this.
+        assert_eq!(out[240], -1.0);
+        assert_eq!(out[255], -1.0);
+    }
+
     #[test]
     fn f32_f16_roundtrip_matches_ieee_rne() {
         use super::{f16_bits_to_f32, f32_to_f16_bits};
@@ -6472,6 +6853,7 @@ mod tests {
 
     #[test]
     fn q8_file_cache_disabled_path_does_not_store_or_hit() {
+        let _q8_stats_guard = q8_stats_test_lock();
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "0");
@@ -6494,6 +6876,7 @@ mod tests {
 
     #[test]
     fn q8_file_cache_disabled_scale_read_decodes_from_direct_read() {
+        let _q8_stats_guard = q8_stats_test_lock();
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "0");
@@ -6533,6 +6916,7 @@ mod tests {
 
     #[test]
     fn q8_file_backing_subviews_share_one_cached_file_handle() {
+        let _q8_stats_guard = q8_stats_test_lock();
         let path = std::env::temp_dir().join(format!(
             "camelid-q8-shared-backing-handle-{}",
             std::process::id()
@@ -6562,6 +6946,7 @@ mod tests {
 
     #[test]
     fn q8_file_backed_embedding_rejects_absolute_row_offset_overflow() {
+        let _q8_stats_guard = q8_stats_test_lock();
         let _env_guard = env_lock();
         let tensor = CpuTensor::q8_0_file_backed_linear(
             "token_embd.weight",
@@ -7064,6 +7449,7 @@ mod tests {
 
     #[test]
     fn q8_file_cache_zero_capacity_clears_retained_entries_on_use() {
+        let _q8_stats_guard = q8_stats_test_lock();
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "16");
@@ -7088,6 +7474,7 @@ mod tests {
 
     #[test]
     fn q8_file_cache_scoped_capacity_override_is_bounded_and_restored() {
+        let _q8_stats_guard = q8_stats_test_lock();
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
@@ -7128,6 +7515,7 @@ mod tests {
 
     #[test]
     fn q8_file_cache_serves_matching_chunks_and_evicts_to_capacity() {
+        let _q8_stats_guard = q8_stats_test_lock();
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "8");
@@ -7162,6 +7550,7 @@ mod tests {
 
     #[test]
     fn q8_file_cache_serves_subranges_from_retained_chunks() {
+        let _q8_stats_guard = q8_stats_test_lock();
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "16");
@@ -7182,6 +7571,7 @@ mod tests {
 
     #[test]
     fn q8_file_cache_coalesces_adjacent_chunks_for_cross_boundary_reuse() {
+        let _q8_stats_guard = q8_stats_test_lock();
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "16");
@@ -7205,6 +7595,7 @@ mod tests {
 
     #[test]
     fn q8_file_cache_reports_miss_insert_merge_and_eviction_stats() {
+        let _q8_stats_guard = q8_stats_test_lock();
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "0");
@@ -7246,6 +7637,7 @@ mod tests {
 
     #[test]
     fn q8_file_cache_trims_coalesced_stream_to_newest_capacity_window() {
+        let _q8_stats_guard = q8_stats_test_lock();
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "16");
@@ -7274,6 +7666,7 @@ mod tests {
 
     #[test]
     fn q8_file_cache_coalesces_overlapping_chunks_with_newest_bytes() {
+        let _q8_stats_guard = q8_stats_test_lock();
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "12");
@@ -7297,6 +7690,7 @@ mod tests {
 
     #[test]
     fn q8_file_cache_skips_reinserting_identical_fully_covered_subranges() {
+        let _q8_stats_guard = q8_stats_test_lock();
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "16");
@@ -7320,6 +7714,7 @@ mod tests {
 
     #[test]
     fn q8_file_cache_keeps_newest_bytes_for_conflicting_covered_subranges() {
+        let _q8_stats_guard = q8_stats_test_lock();
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "16");
@@ -7345,6 +7740,7 @@ mod tests {
 
     #[test]
     fn q8_file_cache_file_read_reuses_partial_overlap_and_reads_gaps() {
+        let _q8_stats_guard = q8_stats_test_lock();
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "0");
@@ -7399,6 +7795,7 @@ mod tests {
 
     #[test]
     fn q8_file_cache_reuses_decoded_scales_on_full_block_hits() {
+        let _q8_stats_guard = q8_stats_test_lock();
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "128");
@@ -7452,6 +7849,7 @@ mod tests {
 
     #[test]
     fn q8_file_cache_reuses_decoded_scales_on_partial_block_hits() {
+        let _q8_stats_guard = q8_stats_test_lock();
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "256");
@@ -7535,6 +7933,7 @@ mod tests {
 
     #[test]
     fn q8_file_cache_retains_decoded_scales_after_coalesced_trim() {
+        let _q8_stats_guard = q8_stats_test_lock();
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var(
@@ -7607,6 +8006,7 @@ mod tests {
 
     #[test]
     fn q8_file_cache_promotes_decoded_scales_after_byte_only_hit() {
+        let _q8_stats_guard = q8_stats_test_lock();
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "128");
@@ -7673,6 +8073,7 @@ mod tests {
 
     #[test]
     fn q8_file_backing_rejects_reads_outside_declared_storage_before_file_io() {
+        let _q8_stats_guard = q8_stats_test_lock();
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "0");
@@ -7713,6 +8114,7 @@ mod tests {
 
     #[test]
     fn q8_file_backing_rejects_nonempty_zero_block_reads_before_file_io() {
+        let _q8_stats_guard = q8_stats_test_lock();
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "32");

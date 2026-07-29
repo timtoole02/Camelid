@@ -12,7 +12,7 @@ on:
         description: 'Release tag to publish (e.g. v0.1.1)'
         required: true
       skip_desktop:
-        description: 'Skip the additive camelid-desktop (Windows) build'
+        description: 'Skip the additive camelid-desktop (Windows + macOS) builds'
         required: false
         default: 'false'
 
@@ -20,6 +20,11 @@ permissions:
   contents: write
 
 env:
+  # The single release identity for this run. A tag push resolves to the pushed
+  # tag; a workflow_dispatch resolves to the tag the operator asked to publish.
+  # Every job checks THIS out and asserts the binary reports it, so a dispatch
+  # cannot build one ref and attach those bytes to a different tag.
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
   # Any CUDA 12.x works: the NVRTC soname (nvrtc64_120_0.dll) is stable across the
   # 12.x series and cudarc is pinned to the 12.x ABI (`cuda-12090`). The matching
   # nvrtc-builtins ship in the same component, so the pair is always self-consistent.
@@ -37,8 +42,13 @@ jobs:
             label: linux-x86_64
     runs-on: ${{ matrix.os }}
     steps:
+      # Pinned to RELEASE_TAG, not the triggering ref: a workflow_dispatch must
+      # build the tag it is going to publish under, or the attached bytes are
+      # not the tag's bytes.
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       # The web UI is embedded into the binary at compile time, so it must be
       # built before cargo build.
@@ -101,6 +111,40 @@ jobs:
           tar -czf "$dist.tar.gz" "$dist"
           shasum -a 256 "$dist.tar.gz" > "$dist.tar.gz.sha256"
 
+      # Open the box that actually ships. Everything above this point verifies
+      # the STAGING directory (scripts/package-linux-cuda.sh) or the source tree
+      # (ci.yml); nothing has ever inspected or executed the archive itself.
+      # Extracting with the same tar a user runs also proves the archive is
+      # readable and that symlinks survived packaging.
+      - name: Verify the packaged artifact
+        run: |
+          set -euo pipefail
+          dist="camelid-${{ matrix.label }}"
+          rm -rf verify && mkdir -p verify
+          tar -xzf "$dist.tar.gz" -C verify
+
+          # NVRTC is staged into the Linux tarball only; macOS has no CUDA lane.
+          nvrtc_flag=""
+          if [ "${{ matrix.label }}" = "linux-x86_64" ]; then nvrtc_flag="--require-nvrtc"; fi
+
+          node scripts/check-release-artifact.mjs \
+            --dir verify \
+            --label "${{ matrix.label }}" \
+            --archive "$dist.tar.gz" \
+            --checksum "$dist.tar.gz.sha256" \
+            $nvrtc_flag \
+            --out "$dist-check-receipt.json"
+
+          # Asserted unconditionally. The checkout above pinned this job to
+          # RELEASE_TAG, so the binary must report it whether this run came
+          # from a tag push or a manual dispatch -- the release is published
+          # under that same tag either way.
+          node scripts/smoke-release-artifact.mjs \
+            --dir "verify/$dist" \
+            --label "${{ matrix.label }}" \
+            --expect-version "${{ env.RELEASE_TAG }}" \
+            --out "$dist-smoke-receipt.json"
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -108,6 +152,17 @@ jobs:
           path: |
             camelid-${{ matrix.label }}.tar.gz
             camelid-${{ matrix.label }}.tar.gz.sha256
+
+      # Receipts are diagnostic only: they are attached to the CI run, never to
+      # the release and never committed (qa/evidence-bundles is a scrubbed,
+      # checksum-audited tree and this is not one of its bundles).
+      - name: Upload verification receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification-receipts-${{ matrix.label }}
+          path: camelid-${{ matrix.label }}-*-receipt.json
+          if-no-files-found: ignore
 
   # Windows is built separately: its packaging differs from the unix matrix above
   # because a self-contained Windows download must ship the NVRTC redistributable
@@ -127,6 +182,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Setup Node
         uses: actions/setup-node@v6
@@ -206,6 +263,29 @@ jobs:
           $hash = (Get-FileHash -Algorithm SHA256 "$dist.zip").Hash.ToLower()
           "$hash  $dist.zip" | Out-File -Encoding ascii -NoNewline "$dist.zip.sha256"
 
+      # Verify the SIGNED, zipped artifact — after signing on purpose, so the
+      # smoke proves the exe users actually receive still boots.
+      - name: Verify the packaged artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dist = 'camelid-windows-x64'
+          Remove-Item -Recurse -Force verify -ErrorAction SilentlyContinue
+          Expand-Archive -Path "$dist.zip" -DestinationPath verify -Force
+
+          node scripts/check-release-artifact.mjs `
+            --dir verify `
+            --label windows-x64 `
+            --archive "$dist.zip" `
+            --checksum "$dist.zip.sha256" `
+            --require-nvrtc `
+            --out "$dist-check-receipt.json"
+          if ($LASTEXITCODE -ne 0) { throw "check-release-artifact failed ($LASTEXITCODE)" }
+
+          # Compress-Archive packs the CONTENTS, so the payload is at the root.
+          node scripts/smoke-release-artifact.mjs --dir verify --label windows-x64 --expect-version '${{ env.RELEASE_TAG }}' --out "$dist-smoke-receipt.json"
+          if ($LASTEXITCODE -ne 0) { throw "smoke-release-artifact failed ($LASTEXITCODE)" }
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -213,6 +293,14 @@ jobs:
           path: |
             camelid-windows-x64.zip
             camelid-windows-x64.zip.sha256
+
+      - name: Upload verification receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification-receipts-windows-x64
+          path: camelid-windows-x64-*-receipt.json
+          if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------------
   # ADDITIVE: native Windows desktop app (camelid-desktop). Fully independent of the
@@ -245,6 +333,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Setup Node
         uses: actions/setup-node@v6
@@ -370,6 +460,39 @@ jobs:
           $hash = (Get-FileHash -Algorithm SHA256 "$dist.zip").Hash.ToLower()
           "$hash  $dist.zip" | Out-File -Encoding ascii -NoNewline "$dist.zip.sha256"
 
+      # The portable layout depends on beside-exe resolution, so the contract
+      # check also proves the sidecar and its NVRTC pair travelled with the
+      # desktop exe, and that the NSIS installer was moved OUT before zipping.
+      # The boot smoke drives the SIDECAR: launching a Tauri GUI headless on a
+      # runner proves nothing, whereas the engine it bundles is the thing that
+      # must serve. A failure here still cannot block the server release — this
+      # job is in no other job's `needs`.
+      - name: Verify the packaged desktop artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dist = 'camelid-desktop-windows-x64'
+          Remove-Item -Recurse -Force verify-desktop -ErrorAction SilentlyContinue
+          Expand-Archive -Path "$dist.zip" -DestinationPath verify-desktop -Force
+
+          node scripts/check-release-artifact.mjs `
+            --dir verify-desktop `
+            --label desktop-windows-x64 `
+            --archive "$dist.zip" `
+            --checksum "$dist.zip.sha256" `
+            --require-nvrtc `
+            --out "$dist-check-receipt.json"
+          if ($LASTEXITCODE -ne 0) { throw "check-release-artifact failed ($LASTEXITCODE)" }
+
+          node scripts/smoke-release-artifact.mjs --dir verify-desktop --label desktop-windows-x64 --expect-version '${{ env.RELEASE_TAG }}' --out "$dist-smoke-receipt.json"
+          if ($LASTEXITCODE -ne 0) { throw "smoke-release-artifact failed ($LASTEXITCODE)" }
+
+          # The installer is published separately and must exist as its own file.
+          $setup = Get-ChildItem -Filter '*-setup.exe' | Select-Object -First 1
+          if (-not $setup) { throw 'no NSIS installer was produced' }
+          if ($setup.Length -le 0) { throw "installer $($setup.Name) is zero bytes" }
+          Write-Host "installer: $($setup.Name) ($([math]::Round($setup.Length / 1MB, 1)) MB)"
+
       - name: Upload desktop artifacts (CI)
         uses: actions/upload-artifact@v4
         with:
@@ -379,6 +502,14 @@ jobs:
             camelid-desktop-windows-x64.zip.sha256
             *-setup.exe
 
+      - name: Upload verification receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification-receipts-desktop-windows-x64
+          path: camelid-desktop-windows-x64-*-receipt.json
+          if-no-files-found: ignore
+
       # Publish the SIGNED desktop artifacts to the SAME GitHub release, independently of the
       # server `release` job (which is left untouched and is in no way gated by this job).
       # softprops is idempotent: it creates the release if absent, or appends these files if
@@ -387,27 +518,210 @@ jobs:
       - name: Publish signed desktop artifacts to the release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
           files: |
             camelid-desktop-windows-x64.zip
             camelid-desktop-windows-x64.zip.sha256
             *-setup.exe
           fail_on_unmatched_files: true
 
+  # ---------------------------------------------------------------------------------
+  # ADDITIVE: native macOS desktop app (camelid-desktop on Apple Silicon). Same
+  # independence contract as desktop-windows: it is in NO job's `needs`, so it cannot
+  # change or gate the server artifacts, their checksums, or the server publish step,
+  # and it is skippable via the same `skip_desktop` dispatch input. It reuses
+  # scripts/build-macos-desktop.sh — the exact path a developer runs locally — which
+  # builds the web UI, the release Metal-enabled `camelid` sidecar, the ad-hoc-signed
+  # .app, and a drag-to-Applications DMG. There is no Developer ID identity yet, so
+  # the bundle is ad-hoc signed and NOT notarized; scripts/get-desktop-macos.sh is
+  # the documented quarantine-free install path. See camelid-desktop/README.md.
+  desktop-macos:
+    if: ${{ github.event.inputs.skip_desktop != 'true' }}
+    runs-on: macos-14 # Apple Silicon; build-macos-desktop.sh refuses non-arm64 hosts
+    permissions:
+      contents: write # attach the DMG to the release (no signing secrets involved)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.87.0
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # One build path for CI and developers: the script builds the frontend, the
+      # release sidecar, the Tauri .app, and the DMG (ad-hoc signature). Invoked
+      # through `bash` like every other repo script in CI, so it does not depend
+      # on the executable bit surviving in the index.
+      - name: Build the app bundle and DMG
+        run: bash scripts/build-macos-desktop.sh
+
+      # The DMG is renamed to a STABLE, versionless asset name so
+      # `releases/latest/download/camelid-desktop-macos-arm64.dmg` — the URL
+      # scripts/get-desktop-macos.sh and the README rely on — is the same for
+      # every release. (GitHub also rewrites the space in the Tauri file name
+      # on upload, so the built name could not be published verbatim anyway.)
+      - name: Stage the DMG under its release name
+        run: |
+          set -euo pipefail
+          version="$(node -e 'const fs = require("fs"); process.stdout.write(JSON.parse(fs.readFileSync("camelid-desktop/tauri.conf.json", "utf8")).version)')"
+          src="target/release/bundle/dmg/Camelid Desktop_${version}_aarch64.dmg"
+          if [ ! -f "$src" ]; then
+            echo "expected DMG not found: $src" >&2
+            exit 1
+          fi
+          cp "$src" camelid-desktop-macos-arm64.dmg
+          shasum -a 256 camelid-desktop-macos-arm64.dmg > camelid-desktop-macos-arm64.dmg.sha256
+
+      # Open the box that ships, like the server jobs: mount the DMG a user would
+      # mount, copy the app out the way the installer copies it, verify the ad-hoc
+      # signature survived the round-trip, and boot the BUNDLED sidecar model-less.
+      # The sidecar is the engine that must serve — launching the Tauri GUI
+      # headless on a runner proves nothing (same reasoning as desktop-windows).
+      # The smoke reuses the macos-arm64 spec: the bundled sidecar directory holds
+      # the same single `camelid` binary the server tarball ships.
+      - name: Verify the packaged desktop artifact
+        run: |
+          set -euo pipefail
+          # The published .sha256 must name and match the exact bytes being
+          # uploaded — proven with the SAME parser the other jobs' gates use
+          # (a one-record sidecar the user's own `shasum -c` also consumes),
+          # plus that literal user command itself.
+          shasum -a 256 -c camelid-desktop-macos-arm64.dmg.sha256
+          node --input-type=module -e '
+            import { readFile } from "node:fs/promises"
+            import { parseChecksumFile, sha256File } from "./scripts/check-release-artifact.mjs"
+            const record = parseChecksumFile(await readFile("camelid-desktop-macos-arm64.dmg.sha256", "utf8"))
+            if (record.name !== "camelid-desktop-macos-arm64.dmg") throw new Error(`sidecar names ${record.name}`)
+            const hash = await sha256File("camelid-desktop-macos-arm64.dmg")
+            if (hash !== record.hash) throw new Error(`sidecar hash ${record.hash} != actual ${hash}`)
+            console.log("checksum sidecar round-trip OK")
+          '
+          rm -rf verify-desktop dmg-mount && mkdir -p verify-desktop dmg-mount
+          hdiutil attach camelid-desktop-macos-arm64.dmg -nobrowse -readonly -mountpoint dmg-mount -quiet
+          test -d "dmg-mount/Camelid Desktop.app"
+          test -L "dmg-mount/Applications"
+          ditto --noextattr --noqtn "dmg-mount/Camelid Desktop.app" "verify-desktop/Camelid Desktop.app"
+          # Freshly attached volumes can be transiently busy on runners
+          # (Spotlight/XProtect scan new mounts), so detach with retries and a
+          # -force fallback. Everything below runs on the copied-out bundle,
+          # not the mount.
+          detached=0
+          for attempt in 1 2 3 4 5; do
+            if hdiutil detach dmg-mount -quiet 2>/dev/null; then detached=1; break; fi
+            sleep 2
+          done
+          if [ "$detached" -eq 0 ]; then hdiutil detach dmg-mount -force; fi
+          codesign --verify --deep --strict "verify-desktop/Camelid Desktop.app"
+          # The bundled sidecar payload is a closed set: exactly the engine binary.
+          [ "$(ls -A "verify-desktop/Camelid Desktop.app/Contents/Resources/sidecar")" = "camelid" ]
+          node scripts/smoke-release-artifact.mjs \
+            --dir "verify-desktop/Camelid Desktop.app/Contents/Resources/sidecar" \
+            --label macos-arm64 \
+            --expect-version "${{ env.RELEASE_TAG }}" \
+            --out camelid-desktop-macos-arm64-smoke-receipt.json
+
+      - name: Upload desktop artifacts (CI)
+        uses: actions/upload-artifact@v4
+        with:
+          name: camelid-desktop-macos-arm64
+          path: |
+            camelid-desktop-macos-arm64.dmg
+            camelid-desktop-macos-arm64.dmg.sha256
+
+      - name: Upload verification receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification-receipts-desktop-macos-arm64
+          path: camelid-desktop-macos-arm64-*-receipt.json
+          if-no-files-found: ignore
+
+      # Publish to the SAME GitHub release, independently of the server `release`
+      # job (identical pattern to desktop-windows: softprops is idempotent, and a
+      # desktop failure never blocks the server release — the DMG is just absent).
+      - name: Publish the desktop DMG to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: |
+            camelid-desktop-macos-arm64.dmg
+            camelid-desktop-macos-arm64.dmg.sha256
+          fail_on_unmatched_files: true
+
   release:
     needs: [build, build-windows]
     runs-on: ubuntu-latest
     steps:
-      - name: Download build artifacts
+      # Checkout FIRST, before anything is downloaded into the workspace.
+      # actions/checkout finds no .git here, so it takes its "Deleting the
+      # contents of ..." path and rmRF's the whole workspace -- which would
+      # remove a `dist` populated by earlier steps, leaving the verify step to
+      # fail on a missing directory and publishing nothing. The scripts this job
+      # runs live in the repo, so the checkout has to happen either way; it just
+      # has to happen before `dist` exists.
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      # Download BY NAME, one step per artifact this job is responsible for.
+      # `download-artifact` with neither `name` nor `pattern` fetches every
+      # artifact in the run, and `merge-multiple: true` flattens them all into
+      # one directory -- so a bare download would sweep the diagnostic
+      # verification receipts (and whatever the independent desktop job had
+      # finished uploading) into `dist`, and `files: dist/*` below would attach
+      # them to the public release. Naming each artifact keeps the published
+      # set exact and fails closed if one is missing.
+      - name: Download the macOS artifact
         uses: actions/download-artifact@v4
         with:
+          name: camelid-macos-arm64
           path: dist
-          merge-multiple: true
+
+      - name: Download the Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: camelid-linux-x86_64
+          path: dist
+
+      - name: Download the Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: camelid-windows-x64
+          path: dist
+
+      # Nothing but the three server archives and their sidecars may reach the
+      # release, and every sidecar must be one record naming its own archive.
+      # This reuses the same parser the build-time check uses, so the two gates
+      # cannot drift and a `shasum -c` run by a user verifies what CI verified.
+      - name: Verify checksums after the artifact round-trip
+        run: |
+          node scripts/verify-release-checksums.mjs \
+            --dir dist \
+            --expect camelid-macos-arm64.tar.gz \
+            --expect camelid-linux-x86_64.tar.gz \
+            --expect camelid-windows-x64.zip
 
       - name: Publish to the GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
           files: dist/*
           fail_on_unmatched_files: true
           generate_release_notes: true

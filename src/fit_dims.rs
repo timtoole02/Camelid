@@ -61,6 +61,7 @@ fn now_secs() -> u64 {
 }
 
 /// Outcome of a single header fetch+parse.
+#[derive(Clone, Copy)]
 enum FetchOutcome {
     /// Parsed real dense dims.
     Resolved(ModelDims),
@@ -69,6 +70,45 @@ enum FetchOutcome {
     Unparseable,
     /// The fetch itself failed (offline, HTTP error, unsafe input). Retried later.
     FetchError,
+}
+
+/// The answer to an explicit "resolve this model's dimensions" request.
+///
+/// Distinguishing the two no-dims cases is load-bearing for any caller that offers
+/// the user a "check this" action. Collapsing them to `Option<ModelDims>` means a
+/// settled negative and a failed attempt are indistinguishable, so the action can
+/// never be retired and pressing it looks like a no-op — which is exactly what a
+/// flattened first version of this API produced in the Models tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DimsResolution {
+    /// Real dimensions, from a fresh fetch or the cache.
+    Resolved(ModelDims),
+    /// Settled negative: the header was fetched and parsed, and this is not a model
+    /// whose KV dimensions can be derived. Asking again cannot change the answer.
+    Unresolvable,
+    /// The attempt did not settle — offline, an HTTP error, rate-limited, remote
+    /// dims disabled, or another resolution for the same model already running.
+    /// A later attempt may succeed.
+    Retryable,
+}
+
+impl DimsResolution {
+    /// Whether the question is answered for good. `true` for a resolution **and**
+    /// for a settled negative; `false` only when retrying could still help.
+    pub fn is_settled(self) -> bool {
+        match self {
+            DimsResolution::Resolved(_) | DimsResolution::Unresolvable => true,
+            DimsResolution::Retryable => false,
+        }
+    }
+
+    /// The dimensions, if any were resolved.
+    pub fn dims(self) -> Option<ModelDims> {
+        match self {
+            DimsResolution::Resolved(dims) => Some(dims),
+            DimsResolution::Unresolvable | DimsResolution::Retryable => None,
+        }
+    }
 }
 
 /// A persisted cache entry. `dims: None` is a *negative* (fetched, parsed, but not a
@@ -246,6 +286,87 @@ impl DimsResolver {
     pub fn warm(&'static self, models: Vec<(String, String, u64)>) {
         for (repo, file, size) in models {
             self.schedule(repo, file, size);
+        }
+    }
+
+    /// Resolve one model's dims **now**, awaiting the header fetch.
+    ///
+    /// This is the explicit, user-initiated counterpart to [`schedule`](Self::schedule):
+    /// the background warm is bounded (a page can only ever warm a handful of rows),
+    /// so a user looking at a specific model needs a way to ask about *that* one.
+    /// It deliberately goes through the same [`should_fetch`](Self::should_fetch)
+    /// gate, permit pool, cache and backoff — an interactive check must not be able
+    /// to bypass the rate limit or re-fetch a known negative.
+    ///
+    /// The three-way [`DimsResolution`] is the point: a caller that only learns
+    /// "no dims" cannot tell a settled answer from a failed attempt, so a UI built
+    /// on it offers "check this" forever and the check appears to do nothing. See
+    /// [`DimsResolution::is_settled`].
+    pub async fn resolve_now(
+        &'static self,
+        repo_id: String,
+        filename: String,
+        size: u64,
+    ) -> DimsResolution {
+        let key = key_of(&repo_id, &filename);
+        // Already resolved, a fresh negative, backed off, in flight, or disabled:
+        // answer from the cache instead of issuing a duplicate fetch.
+        if !self.should_fetch(&key) {
+            return self.cached_resolution(&key);
+        }
+        {
+            let Ok(mut guard) = self.inner.lock() else {
+                return DimsResolution::Retryable;
+            };
+            if !guard.in_flight.insert(key.clone()) {
+                // Another resolution for this exact model is already running; its
+                // result will be cached, so this caller should simply ask again.
+                return DimsResolution::Retryable;
+            }
+        }
+        // Held across the await and the record below, so the slot is released
+        // however this returns — including a cancelled request future.
+        let _slot = InFlightGuard {
+            resolver: self,
+            key: key.clone(),
+        };
+        let Ok(permit) = Arc::clone(&self.permits).acquire_owned().await else {
+            return DimsResolution::Retryable;
+        };
+        let fetched = tokio::task::spawn_blocking(move || {
+            let outcome = fetch_header_dims(&repo_id, &filename, size);
+            drop(permit);
+            outcome
+        })
+        .await;
+        let Ok(outcome) = fetched else {
+            return DimsResolution::Retryable;
+        };
+        self.record(&key, outcome);
+        match outcome {
+            FetchOutcome::Resolved(dims) => DimsResolution::Resolved(dims),
+            // Fetched and parsed, but not a model we can size. Re-asking cannot help.
+            FetchOutcome::Unparseable => DimsResolution::Unresolvable,
+            FetchOutcome::FetchError => DimsResolution::Retryable,
+        }
+    }
+
+    /// The resolution implied by the cache alone, for the paths that must not
+    /// fetch. A fresh entry is final either way (dims, or a known negative);
+    /// anything else — expired, absent, in flight, backed off, disabled — is a
+    /// state a later attempt could change.
+    fn cached_resolution(&self, key: &str) -> DimsResolution {
+        let Ok(guard) = self.inner.lock() else {
+            return DimsResolution::Retryable;
+        };
+        match guard.entries.get(key) {
+            Some(entry) if now_secs().saturating_sub(entry.fetched_at) <= ENTRY_TTL_SECS => {
+                match entry.dims {
+                    Some(dims) => DimsResolution::Resolved(dims),
+                    None => DimsResolution::Unresolvable,
+                }
+            }
+            _ => DimsResolution::Retryable,
         }
     }
 
@@ -816,6 +937,57 @@ mod tests {
                 kv_heads: 2,
                 head_dim: 64
             })
+        );
+    }
+
+    #[test]
+    fn a_settled_negative_is_distinguishable_from_a_failed_attempt() {
+        // This distinction is the whole reason `resolve_now` does not return
+        // `Option<ModelDims>`. A caller that only sees "no dims" cannot retire a
+        // "check this" affordance, so pressing it looks like a no-op forever.
+        let resolver = global();
+        let dims = ModelDims {
+            layers: 8,
+            kv_heads: 2,
+            head_dim: 64,
+        };
+
+        // Nothing cached: a later attempt could still succeed.
+        let unknown = key_of("test-fitdims/resolution", "never-seen.gguf");
+        assert_eq!(
+            resolver.cached_resolution(&unknown),
+            DimsResolution::Retryable
+        );
+        assert!(!DimsResolution::Retryable.is_settled());
+        assert_eq!(DimsResolution::Retryable.dims(), None);
+
+        // A cached NEGATIVE (fetched, parsed, not a model we can size) is final.
+        let negative = key_of("test-fitdims/resolution", "negative.gguf");
+        resolver.record(&negative, FetchOutcome::Unparseable);
+        assert_eq!(
+            resolver.cached_resolution(&negative),
+            DimsResolution::Unresolvable
+        );
+        assert!(DimsResolution::Unresolvable.is_settled());
+        assert_eq!(DimsResolution::Unresolvable.dims(), None);
+
+        // A cached POSITIVE is final too, and carries the dims.
+        let positive = key_of("test-fitdims/resolution", "positive.gguf");
+        resolver.record(&positive, FetchOutcome::Resolved(dims));
+        assert_eq!(
+            resolver.cached_resolution(&positive),
+            DimsResolution::Resolved(dims)
+        );
+        assert!(DimsResolution::Resolved(dims).is_settled());
+        assert_eq!(DimsResolution::Resolved(dims).dims(), Some(dims));
+
+        // A transient fetch error must NOT be cached as a negative: it only backs
+        // off, so the question stays open and the caller may retry.
+        let transient = key_of("test-fitdims/resolution", "transient.gguf");
+        resolver.record(&transient, FetchOutcome::FetchError);
+        assert_eq!(
+            resolver.cached_resolution(&transient),
+            DimsResolution::Retryable
         );
     }
 

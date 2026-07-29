@@ -69,6 +69,7 @@ export default function ChatWorkspace({
   selectedModelExperimental = false,
   setTab,
   showNewChatLanding = null,
+  firstRunActive = false,
   demoMode = false,
 }) {
   // Chat is allowed on the supported lane (full gate) OR the weaker experimental
@@ -170,7 +171,11 @@ export default function ChatWorkspace({
       ? 'Drafts stay editable while the Camelid API reconnects.'
       : selectedModel
         ? 'Chat unlocks only after loaded_now=true, generation_ready=true, and an exact supported compatibility row all match.'
-        : 'Choose a model, then Camelid will show what still needs to pass before send unlocks.'
+        // The activation card above owns the instruction during first run; repeating
+        // it here is the third copy of the same sentence on one screen.
+        : firstRunActive
+          ? 'Send unlocks as soon as the model above finishes setting up.'
+          : 'Choose a model, then Camelid will show what still needs to pass before send unlocks.'
   const selectedModelReadinessCopy = selectedModelRunnable
     ? 'Selected model is ready for Camelid chat.'
     : apiUnavailable
@@ -199,7 +204,11 @@ export default function ChatWorkspace({
         ? 'The runtime is up, but chat still needs an exact supported row before send unlocks.'
         : selectedModel
           ? 'Your draft is ready now. Send unlocks as soon as this model is ready.'
-          : 'Pick a local GGUF model first. Camelid will show the readiness path here.'
+          // The activation card above already names the one thing to do; repeating
+          // "pick a model" here would offer a second, vaguer instruction.
+          : firstRunActive
+            ? 'Camelid answers with a model running on this machine. Set one up above and this becomes a chat.'
+            : 'Pick a local GGUF model first. Camelid will show the readiness path here.'
 
   const readinessState = selectedModelRunnable ? 'ready' : apiUnavailable ? 'offline' : supportBlocked ? 'blocked' : selectedModel ? 'waiting' : 'idle'
   const runtimeTone = readinessTone({ ready: selectedModelRunnable, offline: apiUnavailable, waiting: Boolean(runtime?.loaded_now || selectedModel) })
@@ -238,7 +247,13 @@ export default function ChatWorkspace({
         : selectedModel
           ? 'Draft now · send unlocks after readiness passes'
           : 'Choose a model to unlock sending'
-  const composerHintCopy = canSubmit ? promptHintCopy : sendDisabledReason || promptHintCopy
+  /* During first run the activation card is the instruction. The send button keeps its
+     own tooltip, but this line would be the fourth restatement on one screen. */
+  const composerHintCopy = canSubmit
+    ? promptHintCopy
+    : firstRunActive && !selectedModel
+      ? ''
+      : sendDisabledReason || promptHintCopy
 
   const composerDraftUnlocked = Boolean(selectedModel || apiUnavailable)
   const composerDisabled = !composerDraftUnlocked
@@ -248,9 +263,11 @@ export default function ChatWorkspace({
       ? 'Draft a prompt while the Camelid API comes back'
       : composerDraftUnlocked
         ? 'Draft a prompt while Camelid finishes getting ready'
-        : isFreshThread
-          ? 'Load a model first'
-          : 'Choose a ready model first'
+        : firstRunActive
+          ? 'Set up the model above, then chat here'
+          : isFreshThread
+            ? 'Load a model first'
+            : 'Choose a ready model first'
   const composerStopLabel = stoppingGeneration ? 'Stopping…' : 'Stop'
   const secondaryActionLabel = selectedModelRunnable ? 'Save to memory' : (apiUnavailable ? 'Open API' : 'Open Models')
   const secondaryAction = selectedModelRunnable ? saveToMemory : () => setTab(apiUnavailable ? 'api' : 'library')
@@ -508,7 +525,7 @@ export default function ChatWorkspace({
         )}
       </div>
       <p id={composerReadinessId} className="cxcomposer__detail">{detailCopy}</p>
-      <p className="cxcomposer__hint">{composerHintCopy}</p>
+      {composerHintCopy ? <p className="cxcomposer__hint">{composerHintCopy}</p> : null}
     </div>
   )
 

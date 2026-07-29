@@ -1,6 +1,18 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { isCompatibilitySupportedForModel } from '../../lib/capabilities'
 import { beginCatalogSettlement, catalogDownloadSettlement, completeCatalogAcquisition, reserveCatalogAcquisition } from '../../lib/catalogActivation'
+import {
+  defaultFileIndex,
+  fitDetail,
+  fitIsRecheckable,
+  fitIsSettled,
+  fitLabel,
+  groupHfFilesByRepo,
+  isRefusingFit,
+  partitionByArchSupport,
+  partitionCuratedByFit,
+  quantAdvice,
+} from '../../lib/catalogBrowse'
 import { SUPPORTED_MODELS } from '../../lib/supportedModels'
 import { EvidenceChip } from '../ui/EvidenceChip'
 
@@ -12,7 +24,13 @@ import { EvidenceChip } from '../ui/EvidenceChip'
    rows here only reflect their own acquisition state, read from the shared
    downloads poll + the live /api/models/local scan (never localStorage). After a
    download lands, smoke-admission runs for oracle-qualified combos and the model
-   appears in its derived local section. */
+   appears in its derived local section.
+
+   Hugging Face results are grouped into one card per repo with a quantization
+   picker. The Hub returns files, and a single repo routinely ships 20-27 quants of
+   the same weights, so rendering them flat turned a 15-repo search into a 250-row
+   wall. Grouping is presentation only: a download is still one exact file,
+   confirmed by name. */
 
 const GB = 1024 * 1024 * 1024
 function prettySize(bytes) {
@@ -24,6 +42,11 @@ function prettySize(bytes) {
 /* Curated download suggestions (blurbs, "Recommended") may DECORATE catalog rows,
    never place them: lane membership and outcome chips stay derived. */
 const CURATED_DECORATION = new Map(SUPPORTED_MODELS.map((item) => [item.catalog_id, item]))
+
+/* Why a live Hugging Face row can never imply support — said once per section and
+   in a tooltip on the guessed value, rather than as a paragraph on all 150 rows. */
+const HF_GUESS_EXPLANATION =
+  'Architecture and quantization are read from the filename, not the model. The real lane is only known after the file loads.'
 
 /* Predicted lane for a catalog entry — derived, never a hand-authored label. */
 function predictedLane(item, capabilities) {
@@ -42,27 +65,8 @@ function laneChip(lane) {
   return <EvidenceChip state="unsupported" asText>Experimental · unverified</EvidenceChip>
 }
 
-/* Capacity advisory for THIS host (fit axis, NOT a support claim — kept on its own
-   line, never merged into the lane/support chip). `item.fit` is the backend
-   FitVerdict; `unknown`/missing (e.g. unprobed host, experimental rows) shows
-   nothing rather than guessing. */
-function fitLabel(fit) {
-  switch (fit) {
-    case 'fits_resident':
-      return 'Fits your machine'
-    case 'fits_with_offload':
-      return 'Fits (GPU + RAM offload)'
-    case 'cpu_only_ok':
-      return 'Fits (CPU)'
-    case 'wont_fit':
-      return 'Too big for this machine'
-    default:
-      return null
-  }
-}
-
 /* A small CPU/chip glyph so the capacity chip reads as "your hardware" — distinct
-   from the support/lane chips. A check (fits) or cross (too big) sits in the die. */
+   from the support/lane chips. A check (fits) or cross (refused) sits in the die. */
 function FitIcon({ bad }) {
   const stroke = 'currentColor'
   return (
@@ -80,6 +84,111 @@ function FitIcon({ bad }) {
         strokeLinecap="round"
       />
     </svg>
+  )
+}
+
+/* Capacity advisory for THIS host (fit axis, NOT a support claim — kept on its own
+   line, never merged into the lane/support chip).
+
+   Four shapes, because they mean four different things: a positive fit; a refusal
+   that names WHY (too big for the machine vs. the machine is merely busy); a row
+   nobody has measured yet, which gets an explicit "check this one" affordance
+   instead of silence; and a row whose question is settled with no answer possible.
+
+   The last two both arrive as `fit: 'unknown'`. Rendering them the same put the
+   button in a loop — press, get `unknown` back, see the same button — which is why
+   the backend reports whether the check settled. */
+function FitAdvisory({ item, onCheckFit, checking }) {
+  const label = fitLabel(item.fit)
+  const detail = fitDetail(item.fit)
+  const refused = isRefusingFit(item.fit)
+  const transient = item.fit === 'insufficient_free_memory'
+
+  if (!label) {
+    if (fitIsSettled(item)) {
+      return (
+        <div className="catalog-fit-row">
+          <span
+            className="catalog-fit-chip catalog-fit-chip--unknown"
+            title="Camelid looked at this model and will not promise a verdict here — either its dimensions cannot be read, this machine's memory cannot be probed, or the GPU has room while free system memory is too low to stage the weights."
+          >
+            <FitIcon />
+            Fit can’t be determined here
+          </span>
+          <span className="catalog-fit-detail">
+            The download is not blocked — Camelid just will not claim a fit it cannot verify.
+          </span>
+        </div>
+      )
+    }
+    if (!onCheckFit) return null
+    return (
+      <div className="catalog-fit-row">
+        <span className="catalog-fit-chip catalog-fit-chip--unknown">
+          <FitIcon />
+          Fit unknown until checked
+        </span>
+        <button
+          type="button"
+          className="catalog-fit-check"
+          onClick={onCheckFit}
+          disabled={checking}
+          aria-busy={checking || undefined}
+        >
+          {checking ? 'Checking…' : item.fit_checked === false ? 'Try again' : 'Check if it fits'}
+        </button>
+        {item.fit_checked === false ? (
+          <span className="catalog-fit-detail">
+            Could not reach Hugging Face for this model’s header. Retrying may work.
+          </span>
+        ) : null}
+      </div>
+    )
+  }
+
+  return (
+    <div className="catalog-fit-row">
+      <span
+        className={`catalog-fit-chip catalog-fit-chip--${transient ? 'warn' : refused ? 'bad' : 'good'}${
+          item.fit_confidence === 'approx' ? ' catalog-fit-chip--estimate' : ''
+        }`}
+        title={
+          item.fit_confidence === 'exact'
+            ? "Sized from the model's real dimensions (KV cache computed exactly)"
+            : 'Estimate — upgrades to exact once the model header has been read'
+        }
+      >
+        <FitIcon bad={refused} />
+        {item.fit_confidence === 'approx' ? '~ ' : ''}
+        {label}
+      </span>
+      {/* Memory pressure is the one refusal a user can act on, and acting on it
+          needs a live re-probe: the listing's verdicts come from a startup
+          snapshot, so reloading the page cannot pick up freed memory. */}
+      {transient && onCheckFit ? (
+        <button
+          type="button"
+          className="catalog-fit-check"
+          onClick={onCheckFit}
+          disabled={checking}
+          aria-busy={checking || undefined}
+          title="Re-read this machine's free memory and this model's size, right now"
+        >
+          {checking ? 'Re-checking…' : 'Re-check'}
+        </button>
+      ) : null}
+      {Array.isArray(item.task_tags) && item.task_tags.length ? (
+        <span className="catalog-fit-tags">
+          <span className="catalog-fit-tags-label">best for</span>
+          {item.task_tags.map((tag) => (
+            <span key={tag} className="catalog-fit-tag">
+              {tag}
+            </span>
+          ))}
+        </span>
+      ) : null}
+      {detail ? <span className="catalog-fit-detail">{detail}</span> : null}
+    </div>
   )
 }
 
@@ -102,6 +211,12 @@ function CatalogRow({
   onStartModel,
   onModelStarted,
   onOperationBusy,
+  onCheckFit,
+  checkingFit,
+  /* Rendered inside a Hugging Face model card, which already owns the title,
+     provenance and quantization picker. Suppresses the row's own head so the two
+     do not repeat each other. */
+  compact = false,
 }) {
   // phase: idle | confirm | starting | waiting | checking | loading | failed | done
   const [phase, setPhase] = useState('idle')
@@ -117,9 +232,12 @@ function CatalogRow({
   const settlementInFlightRef = useRef(false)
   const lane = predictedLane(item, capabilities)
   const decoration = item.group === 'experimental' ? null : CURATED_DECORATION.get(item.catalog_id)
-  const downloadAndStart = lane === 'supported' && item.fit !== 'wont_fit'
+  // ANY load-refusing verdict must stop the auto-start chain, not just `wont_fit`:
+  // the load-time guard refuses both, so chaining into it would end in a 422.
+  const refusedByFit = isRefusingFit(item.fit)
+  const downloadAndStart = lane === 'supported' && !refusedByFit
   const smokeAfterDownload = item.group !== 'experimental'
-    && item.fit !== 'wont_fit'
+    && !refusedByFit
     && !downloadAndStart
     && item.oracle_qualified
   const acquisitionMode = downloadAndStart ? 'start' : smokeAfterDownload ? 'smoke' : 'download'
@@ -296,48 +414,27 @@ function CatalogRow({
   const showProgress = ['starting', 'waiting', 'checking', 'loading'].includes(phase)
 
   return (
-    <article className={`catalog-row${lane === 'not_anchored' ? ' catalog-row--advisory' : ''}`}>
-      <div className="catalog-row-head">
-        <div className="catalog-row-id">
-          <span className="catalog-row-name">
-            {item.name}
-            {decoration?.recommended ? <span className="catalog-row-recommended">Recommended</span> : null}
-          </span>
-          <span className="catalog-row-meta">
-            {item.repo_id} · {item.filename} · {prettySize(item.size_bytes)}
-            {item.architecture ? ` · ${item.architecture}` : ''}
-          </span>
-        </div>
-        {laneChip(lane)}
-      </div>
-      {fitLabel(item.fit) ? (
-        <div className="catalog-fit-row">
-          <span
-            className={`catalog-fit-chip catalog-fit-chip--${item.fit === 'wont_fit' ? 'bad' : 'good'}${
-              item.fit_confidence === 'approx' ? ' catalog-fit-chip--estimate' : ''
-            }`}
-            title={
-              item.fit_confidence === 'exact'
-                ? "Sized from the model's real dimensions (KV cache computed exactly)"
-                : 'Estimate — upgrades to exact once the model header has been read'
-            }
-          >
-            <FitIcon bad={item.fit === 'wont_fit'} />
-            {item.fit_confidence === 'approx' ? '~ ' : ''}
-            {fitLabel(item.fit)}
-          </span>
-          {Array.isArray(item.task_tags) && item.task_tags.length ? (
-            <span className="catalog-fit-tags">
-              <span className="catalog-fit-tags-label">best for</span>
-              {item.task_tags.map((tag) => (
-                <span key={tag} className="catalog-fit-tag">
-                  {tag}
-                </span>
-              ))}
+    <article
+      className={`catalog-row${lane === 'not_anchored' ? ' catalog-row--advisory' : ''}${
+        compact ? ' catalog-row--compact' : ''
+      }`}
+    >
+      {compact ? null : (
+        <div className="catalog-row-head">
+          <div className="catalog-row-id">
+            <span className="catalog-row-name">
+              {item.name}
+              {decoration?.recommended ? <span className="catalog-row-recommended">Recommended</span> : null}
             </span>
-          ) : null}
+            <span className="catalog-row-meta">
+              {item.repo_id} · {item.filename} · {prettySize(item.size_bytes)}
+              {item.architecture ? ` · ${item.architecture}` : ''}
+            </span>
+          </div>
+          {laneChip(lane)}
         </div>
-      ) : null}
+      )}
+      <FitAdvisory item={item} onCheckFit={onCheckFit} checking={checkingFit} />
       {decoration?.blurb ? <p className="catalog-row-blurb">{decoration.blurb}</p> : null}
 
       {showProgress ? (
@@ -385,13 +482,7 @@ function CatalogRow({
         <p className="catalog-row-faint">Already on disk — shown in its section above.</p>
       ) : phase === 'idle' ? (
         <>
-          {item.group === 'experimental' ? (
-            <p className="catalog-row-faint">
-              From Hugging Face — unverified, no parity claim. Architecture/quant
-              {item.architecture || item.quant ? ` (guessed ${[item.architecture, item.quant].filter(Boolean).join(' / ')})` : ''}{' '}
-              are read from the filename, not the model; the real lane is only known after it loads.
-            </p>
-          ) : lane === 'not_anchored' ? (
+          {item.group !== 'experimental' && lane === 'not_anchored' ? (
             <p className="catalog-row-faint">
               Its {item.architecture}/{item.quant} combo is not yet in the runnable lane — still
               downloadable; it lands in Experimental and loads through the experimental chat path.
@@ -445,17 +536,93 @@ function CatalogRow({
   )
 }
 
-/* Persistent, non-dismissible marker for the experimental group. Reuses the
-   unsupported EvidenceChip so it can never read as an endorsement. */
-function ExperimentalMarker() {
+/* One live Hugging Face repo, with its quantizations behind a picker.
+
+   A repo is one model; its `.gguf` files are size/quality variants of the same
+   weights. Selecting a variant swaps which exact file the row below will download —
+   the confirmation still names that file, so grouping never blurs what is fetched. */
+function HfModelCard({ group, renderRow, onCheckFit, isCheckingFit }) {
+  /* The selection is the chosen FILE, not its position. "Load more" can append
+     quantizations to a repo already on screen, and the list is re-sorted by
+     quality on every render — holding an index would silently slide the user's
+     choice onto a different file (and a different download) underneath them.
+     `null` means "never chosen", which is what lets the default track incoming
+     fit verdicts instead of freezing at first paint. */
+  const [selectedId, setSelectedId] = useState(null)
+  const fallback = group.files[Math.max(0, defaultFileIndex(group.files))]
+  const file = group.files.find((candidate) => candidate.catalog_id === selectedId) || fallback
+
+  if (!file) return null
+
   return (
-    <span className="catalog-experimental-marker">
-      <EvidenceChip state="unsupported" asText>Experimental — unverified, no parity claim</EvidenceChip>
-    </span>
+    <article className="hf-model-card">
+      <div className="hf-model-head">
+        <div className="hf-model-id">
+          <h4 className="hf-model-title">{group.title}</h4>
+          <p className="hf-model-meta">
+            {group.owner ? <span className="hf-model-owner">{group.owner}</span> : null}
+            {group.architecture ? (
+              <span className="hf-model-arch" title={`Guessed from the filename. ${HF_GUESS_EXPLANATION}`}>
+                {group.architecture} (guessed)
+              </span>
+            ) : null}
+            <span>
+              {group.files.length} quantization{group.files.length === 1 ? '' : 's'}
+            </span>
+            {group.archSupport === 'not_implemented' ? (
+              <span className="hf-model-unsupported">Camelid does not implement this architecture</span>
+            ) : null}
+          </p>
+        </div>
+        <EvidenceChip state="unsupported" asText>Experimental · unverified</EvidenceChip>
+      </div>
+
+      <div className="hf-quant-picker">
+        <label className="hf-quant-label" htmlFor={`quant-${group.repoId}`}>
+          Quantization
+        </label>
+        <select
+          id={`quant-${group.repoId}`}
+          className="hf-quant-select"
+          value={file.catalog_id}
+          onChange={(event) => setSelectedId(event.target.value)}
+        >
+          {group.files.map((candidate) => (
+            <option key={candidate.catalog_id} value={candidate.catalog_id}>
+              {candidate.quant || 'unlabelled'} · {prettySize(candidate.size_bytes)}
+              {quantAdvice(candidate.quant).note ? ` · ${quantAdvice(candidate.quant).note}` : ''}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      {renderRow(file, {
+        compact: true,
+        onCheckFit: () => onCheckFit(file),
+        checkingFit: isCheckingFit(file),
+      })}
+    </article>
   )
 }
 
-function CatalogGroup({ title, marker, items, emptyText, renderRow }) {
+/* Placeholder rows while a live Hugging Face search is in flight. A search costs
+   real network round-trips; leaving the previous results on screen with no
+   indicator is what made it read as a hang rather than as work in progress. */
+function SearchSkeleton() {
+  return (
+    <div className="catalog-skeleton" role="status" aria-live="polite" aria-busy="true">
+      <p className="lane-empty">Searching Hugging Face…</p>
+      {[0, 1, 2].map((row) => (
+        <div key={row} className="catalog-skeleton-row" aria-hidden="true">
+          <span className="catalog-skeleton-bar catalog-skeleton-bar--title" />
+          <span className="catalog-skeleton-bar catalog-skeleton-bar--meta" />
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function CatalogGroup({ title, marker, count, emptyText, children }) {
   return (
     <section className="catalog-group">
       <div className="catalog-group-head">
@@ -463,8 +630,7 @@ function CatalogGroup({ title, marker, items, emptyText, renderRow }) {
         {marker}
       </div>
       <div className="catalog-list">
-        {items.map(renderRow)}
-        {items.length === 0 ? <p className="lane-empty">{emptyText}</p> : null}
+        {count === 0 ? <p className="lane-empty">{emptyText}</p> : children}
       </div>
     </section>
   )
@@ -491,39 +657,58 @@ export function CatalogLaneBrowse({
   const [query, setQuery] = useState('')
   const [debouncedQuery, setDebouncedQuery] = useState('')
   const [nextCursor, setNextCursor] = useState(null)
+  const [loading, setLoading] = useState(false)
   const [loadingMore, setLoadingMore] = useState(false)
   const [error, setError] = useState('')
   const [pendingCatalogId, setPendingCatalogId] = useState('')
   const [pendingItem, setPendingItem] = useState(null)
+  const [checkingFitIds, setCheckingFitIds] = useState(() => new Set())
   const pendingCatalogIdRef = useRef('')
   const requestSequenceRef = useRef(0)
+  const inFlightRef = useRef(null)
 
   // Debounce the query so each keystroke doesn't fire a live Hugging Face search.
+  // A search is one Hub round-trip plus one per repo, so it costs a noticeable
+  // fraction of a second even warm; a shorter debounce only queues work that the
+  // next keystroke throws away.
   useEffect(() => {
-    const t = setTimeout(() => setDebouncedQuery(query.trim()), 350)
+    const t = setTimeout(() => setDebouncedQuery(query.trim()), 500)
     return () => clearTimeout(t)
   }, [query])
 
   const load = useCallback(async () => {
     const sequence = ++requestSequenceRef.current
+    // Abort the previous search instead of letting it run to completion and be
+    // discarded: it holds a Hub connection and a server-side fetch worker.
+    inFlightRef.current?.abort()
+    const controller = new AbortController()
+    inFlightRef.current = controller
     setError('')
+    setLoading(true)
     try {
       const params = debouncedQuery ? `?query=${encodeURIComponent(debouncedQuery)}` : ''
-      const res = await fetch(`${base}/api/models/catalog${params}`)
+      const res = await fetch(`${base}/api/models/catalog${params}`, { signal: controller.signal })
       if (!res.ok) throw new Error(`catalog HTTP ${res.status}`)
       const body = await res.json()
       if (sequence !== requestSequenceRef.current) return
       setItems(body.items || [])
       setNextCursor(body.next_cursor || null)
     } catch (err) {
+      if (err?.name === 'AbortError') return
       if (sequence !== requestSequenceRef.current) return
       setError(String(err?.message || err))
+    } finally {
+      if (sequence === requestSequenceRef.current) setLoading(false)
     }
   }, [base, debouncedQuery])
 
   useEffect(() => {
     load()
   }, [load])
+
+  // Unmounting mid-search must not leave the request (and its server-side work)
+  // running.
+  useEffect(() => () => inFlightRef.current?.abort(), [])
 
   const reserveAcquisition = useCallback((item) => {
     const catalogId = item.catalog_id
@@ -567,7 +752,52 @@ export function CatalogLaneBrowse({
     }
   }, [base, debouncedQuery, nextCursor])
 
-  const renderRow = (item) => (
+  /* Resolve one model's real GGUF dimensions on demand and fold the verdict back
+     into its row. Explicit and per-row on purpose: the background warm is capped
+     precisely to avoid a header-fetch storm, so the fix for "most rows say unknown"
+     is a user-driven check, not a bigger fan-out. */
+  const checkFit = useCallback(async (item) => {
+    setCheckingFitIds((prev) => new Set(prev).add(item.catalog_id))
+    try {
+      const res = await fetch(`${base}/api/models/catalog/fit`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          repo_id: item.repo_id,
+          filename: item.filename,
+          size_bytes: item.size_bytes,
+        }),
+      })
+      if (!res.ok) throw new Error(`fit check HTTP ${res.status}`)
+      const body = await res.json()
+      setItems((prev) =>
+        (prev || []).map((row) =>
+          row.catalog_id === item.catalog_id
+            ? {
+                ...row,
+                fit: body.fit,
+                fit_confidence: body.fit_confidence,
+                // Whether the question is settled. Without it an unresolvable model
+                // keeps offering a check that can never change anything.
+                fit_checked: body.checked,
+              }
+            : row,
+        ),
+      )
+    } catch (err) {
+      setError(String(err?.message || err))
+    } finally {
+      setCheckingFitIds((prev) => {
+        const next = new Set(prev)
+        next.delete(item.catalog_id)
+        return next
+      })
+    }
+  }, [base])
+
+  const isCheckingFit = useCallback((item) => checkingFitIds.has(item.catalog_id), [checkingFitIds])
+
+  const renderRow = useCallback((item, extra) => (
     <CatalogRow
       key={item.catalog_id}
       item={item}
@@ -588,15 +818,57 @@ export function CatalogLaneBrowse({
       onStartModel={onStartModel}
       onModelStarted={onModelStarted}
       onOperationBusy={onOperationBusy}
+      // Curated rows get the re-check path too, and it matters more for them:
+      // the landing view now FOLDS AWAY rows the catalog thinks cannot load, so a
+      // stale "not enough memory" would hide a model that has since become
+      // runnable, with no way to bring it back.
+      onCheckFit={fitIsRecheckable(item.fit) ? () => checkFit(item) : undefined}
+      checkingFit={isCheckingFit(item)}
+      {...extra}
     />
+  ), [
+    base, canceledCatalogIds, capabilities, checkFit, downloads, installAvailable,
+    installBlockedReason, isCheckingFit, localFilenames, onAcquired, onDownloadAcknowledged,
+    onDownloadRetry, onInstallStarted, onModelStarted, onOperationBusy, onStartModel,
+    pendingCatalogId, reserveAcquisition, settleAcquisition,
+  ])
+
+  // A row whose acquisition is in flight must keep rendering even if a newer
+  // search no longer returns it, or the user loses sight of their own download.
+  const visibleItems = useMemo(() => {
+    const rows = items || []
+    return pendingItem && !rows.some((item) => item.catalog_id === pendingItem.catalog_id)
+      ? [pendingItem, ...rows]
+      : rows
+  }, [items, pendingItem])
+  const curated = useMemo(
+    () => visibleItems.filter((it) => it.group !== 'experimental'),
+    [visibleItems],
+  )
+  const experimental = useMemo(
+    () => visibleItems.filter((it) => it.group === 'experimental'),
+    [visibleItems],
+  )
+  const searching = debouncedQuery.length >= 2
+
+  const hfGroups = useMemo(() => groupHfFilesByRepo(experimental), [experimental])
+  const { loadable, unimplemented } = useMemo(() => partitionByArchSupport(hfGroups), [hfGroups])
+  // Landing state only: with no query, lead with what this machine can actually
+  // run rather than a wall of rows the user cannot use.
+  const { runnable: curatedRunnable, blocked: curatedBlocked } = useMemo(
+    () => partitionCuratedByFit(curated),
+    [curated],
   )
 
-  const visibleItems = pendingItem && !(items || []).some((item) => item.catalog_id === pendingItem.catalog_id)
-    ? [pendingItem, ...(items || [])]
-    : (items || [])
-  const curated = visibleItems.filter((it) => it.group !== 'experimental')
-  const experimental = visibleItems.filter((it) => it.group === 'experimental')
-  const searching = debouncedQuery.length >= 2
+  const renderHfCard = (group) => (
+    <HfModelCard
+      key={group.repoId}
+      group={group}
+      renderRow={renderRow}
+      onCheckFit={checkFit}
+      isCheckingFit={isCheckingFit}
+    />
+  )
 
   return (
     <div className="catalog-lane-browse">
@@ -624,26 +896,69 @@ export function CatalogLaneBrowse({
       ) : null}
       {items === null && !error ? <p className="lane-empty">Loading catalog…</p> : null}
 
-      {items !== null || error ? (
+      {items === null && !error ? null : searching ? (
         <CatalogGroup
           title="Curated"
           marker={null}
-          items={curated}
-          emptyText={debouncedQuery ? 'No curated entries match.' : 'No curated entries available.'}
-          renderRow={renderRow}
-        />
-      ) : null}
+          count={curated.length}
+          emptyText="No curated entries match."
+        >
+          {curated.map((item) => renderRow(item))}
+        </CatalogGroup>
+      ) : (
+        <>
+          <CatalogGroup
+            title="Curated — runs on this machine"
+            marker={null}
+            count={curatedRunnable.length}
+            emptyText="No curated model fits the memory free right now. Close some applications, then use Re-check on one of the rows below."
+          >
+            {curatedRunnable.map((item) => renderRow(item))}
+          </CatalogGroup>
+          {curatedBlocked.length ? (
+            <details className="catalog-collapsed">
+              <summary>
+                {curatedBlocked.length} more curated model{curatedBlocked.length === 1 ? '' : 's'} this
+                machine cannot load right now
+              </summary>
+              <div className="catalog-list">{curatedBlocked.map((item) => renderRow(item))}</div>
+            </details>
+          ) : null}
+        </>
+      )}
 
       {searching && items !== null ? (
         <>
           <CatalogGroup
             title="Experimental (Hugging Face)"
-            marker={<ExperimentalMarker />}
-            items={experimental}
-            emptyText="No live Hugging Face GGUFs match (or the Hub is unreachable)."
-            renderRow={renderRow}
-          />
-          {nextCursor ? (
+            marker={
+              <span className="catalog-experimental-marker">
+                <EvidenceChip state="unsupported" asText>Experimental — unverified, no parity claim</EvidenceChip>
+              </span>
+            }
+            count={loading ? 1 : loadable.length}
+            emptyText={
+              // Saying "nothing matched" when results DID match and were merely
+              // folded into the section below would be false, and it hides the one
+              // place the user should look next.
+              unimplemented.length
+                ? `Every match (${unimplemented.length}) uses an architecture Camelid does not implement — see below.`
+                : 'No live Hugging Face GGUFs match (or the Hub is unreachable).'
+            }
+          >
+            {loading ? <SearchSkeleton /> : loadable.map(renderHfCard)}
+          </CatalogGroup>
+          {!loading && unimplemented.length ? (
+            <details className="catalog-collapsed">
+              <summary>
+                {unimplemented.length} result{unimplemented.length === 1 ? '' : 's'} whose architecture
+                Camelid does not implement
+              </summary>
+              <p className="catalog-row-faint">{HF_GUESS_EXPLANATION}</p>
+              <div className="catalog-list">{unimplemented.map(renderHfCard)}</div>
+            </details>
+          ) : null}
+          {nextCursor && !loading ? (
             <button
               type="button"
               className="catalog-row-action"

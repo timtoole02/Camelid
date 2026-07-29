@@ -94,6 +94,60 @@ fn metal_resident_weight_gate_rejects_kquant_wire_storage() {
 }
 
 #[test]
+fn resident_q8_moe_expert_view_slices_blocks_without_f32_materialization() {
+    let blocks: Vec<_> = (0..4)
+        .map(|index| Q8_0Block {
+            scale: index as f32 + 1.0,
+            quants: [index as i8; 32],
+        })
+        .collect();
+    let blocks = Arc::new(blocks);
+    let experts = CpuTensor::from_q8_0_shared_blocks(
+        "experts",
+        TensorShape {
+            dims: vec![32, 2, 2],
+        },
+        Arc::clone(&blocks),
+        0,
+        4,
+    )
+    .unwrap();
+
+    let second = expert_matrix_view(&experts, 1, 32, 2, "expert.1").unwrap();
+
+    assert_eq!(second.shape.dims, vec![2, 32]);
+    assert!(second.data.is_empty());
+    assert!(
+        second.q8_0_blocks.is_none(),
+        "expert selection must not clone"
+    );
+    let shared = second
+        .q8_0_shared_blocks
+        .expect("shared resident Q8 blocks");
+    assert!(Arc::ptr_eq(&shared.blocks, &blocks));
+    assert_eq!(shared.as_slice().len(), 2);
+    assert_eq!(shared.as_slice()[0].scale, 3.0);
+    assert_eq!(shared.as_slice()[1].scale, 4.0);
+}
+
+#[test]
+fn resident_moe_preflight_preserves_host_headroom() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let empty = MoeResidentMemoryEstimate::default();
+    assert!(resident_moe_preflight_error(empty, Some((16 * GIB, 0))).is_none());
+    let estimate = MoeResidentMemoryEstimate {
+        resident_bytes: 2 * GIB,
+        transient_bytes: GIB,
+    };
+    assert!(resident_moe_preflight_error(estimate, Some((16 * GIB, 7 * GIB))).is_none());
+    let error = resident_moe_preflight_error(estimate, Some((16 * GIB, 6 * GIB)))
+        .expect("resident blocks, loader scratch, and headroom should require seven GiB");
+    assert!(error.contains("only 6.00 GiB is currently available"));
+    assert!(error.contains("1.00 GiB loader scratch"));
+    assert!(error.contains(crate::runtime_config::MOE_EXPERT_STORAGE_ENV));
+}
+
+#[test]
 fn q3_k_wire_linear_routes_through_cpu_block_dot_without_dense_data() {
     let _env_guard = env_lock();
     std::env::set_var("CAMELID_X86_Q4K_DECODE", "1");
@@ -818,6 +872,7 @@ fn write_q8_0_test_block(
 
 #[test]
 fn q8_file_backed_output_projection_reuses_weight_read_across_batch_rows() {
+    let _q8_stats_guard = crate::tensor::q8_stats_test_lock();
     let _env_guard = env_lock();
     let _q8_guard = crate::test_support::q8_file_state_lock();
     clear_dense_diagnostic_env();
@@ -878,6 +933,7 @@ fn q8_file_backed_output_projection_reuses_weight_read_across_batch_rows() {
 
 #[test]
 fn q8_file_backed_output_projection_empty_batch_skips_weight_reads() {
+    let _q8_stats_guard = crate::tensor::q8_stats_test_lock();
     let _env_guard = env_lock();
     let _q8_guard = crate::test_support::q8_file_state_lock();
     clear_dense_diagnostic_env();
@@ -1269,6 +1325,7 @@ fn prefill_layer_major_defaults_only_for_lazy_q8_backing() {
 
 #[test]
 fn prefill_layer_major_q8_cache_uses_scoped_default_only_for_lazy_q8() {
+    let _q8_stats_guard = crate::tensor::q8_stats_test_lock();
     let _env_guard = env_lock();
     clear_dense_diagnostic_env();
 
@@ -1337,6 +1394,7 @@ fn prefill_layer_major_q8_cache_uses_scoped_default_only_for_lazy_q8() {
 
 #[test]
 fn prefill_layer_major_scoped_q8_cache_reuses_file_reads_across_chunks() {
+    let _q8_stats_guard = crate::tensor::q8_stats_test_lock();
     let _env_guard = env_lock();
     let _q8_guard = crate::test_support::q8_file_state_lock();
     clear_dense_diagnostic_env();
@@ -1358,6 +1416,7 @@ fn prefill_layer_major_scoped_q8_cache_reuses_file_reads_across_chunks() {
         feed_forward_length: 32,
         attention_head_count: 1,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(32),
         rope_freq_base: Some(10_000.0),
         rope_scaling_type: None,
@@ -1369,6 +1428,7 @@ fn prefill_layer_major_scoped_q8_cache_reuses_file_reads_across_chunks() {
         vocab_size: Some(2),
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,
@@ -1467,6 +1527,7 @@ fn tiny_kv_budget_session(context_length: u32) -> (LlamaInferenceSession, tempfi
         feed_forward_length: 32,
         attention_head_count: 1,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(32),
         rope_freq_base: Some(10_000.0),
         rope_scaling_type: None,
@@ -1478,6 +1539,7 @@ fn tiny_kv_budget_session(context_length: u32) -> (LlamaInferenceSession, tempfi
         vocab_size: Some(2),
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,
@@ -1533,6 +1595,35 @@ fn tiny_kv_budget_session(context_length: u32) -> (LlamaInferenceSession, tempfi
     };
     let session = LlamaInferenceSession::new(config, weights).unwrap();
     (session, temp_file)
+}
+
+/// A NoPE model must never reach the resident GPU engines. They build ONE cos/sin
+/// table for the whole forward and rope every layer unconditionally
+/// (`cuda_resident` launch_rope / launch_rope_batched and the Metal equivalents),
+/// so they cannot express the per-layer skip — a smollm3 file on a CUDA build
+/// would silently produce different, wrong tokens from the fixed CPU path.
+///
+/// The gate is checked before the backend-enabled test, so this holds on a
+/// CPU-only host too. Note that on a host where the resident path is not eligible
+/// for some *other* reason this assertion is satisfied but not causal; the
+/// ordering of the check in `resident_decode_eligible` is what makes it load-bearing.
+#[test]
+fn nope_config_disqualifies_the_resident_gpu_path() {
+    let (mut session, _temp) = tiny_kv_budget_session(64);
+
+    session.config.no_rope_layer_step = Some(4);
+    assert!(
+        !session
+            .resident_decode_eligible(false)
+            .expect("eligibility check should not error"),
+        "a NoPE config must be refused by the resident GPU gate"
+    );
+    assert!(
+        !session
+            .resident_decode_eligible(true)
+            .expect("eligibility check should not error"),
+        "a NoPE config must be refused for the want-logits path too"
+    );
 }
 
 /// End-to-end proof that the KV predict-and-abort budget guard fires through the
@@ -8533,6 +8624,7 @@ fn applies_rope_to_each_attention_head() {
         feed_forward_length: 8,
         attention_head_count: 2,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(2),
         rope_freq_base: Some(10_000.0),
         rope_scaling_type: None,
@@ -8544,6 +8636,7 @@ fn applies_rope_to_each_attention_head() {
         vocab_size: None,
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,
@@ -8575,6 +8668,7 @@ fn apply_rope_uses_configured_frequency_base() {
         feed_forward_length: 8,
         attention_head_count: 1,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(4),
         rope_freq_base: Some(500_000.0),
         rope_scaling_type: None,
@@ -8586,6 +8680,7 @@ fn apply_rope_uses_configured_frequency_base() {
         vocab_size: None,
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,
@@ -8627,6 +8722,7 @@ fn apply_rope_uses_llama3_frequency_scaling_metadata() {
         feed_forward_length: 8,
         attention_head_count: 1,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(4),
         rope_freq_base: Some(10_000.0),
         rope_scaling_type: Some("llama3".to_string()),
@@ -8638,6 +8734,7 @@ fn apply_rope_uses_llama3_frequency_scaling_metadata() {
         vocab_size: None,
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,
@@ -8683,6 +8780,7 @@ fn apply_rope_uses_gguf_rope_frequency_factors() {
         feed_forward_length: 8,
         attention_head_count: 1,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(4),
         rope_freq_base: Some(10_000.0),
         rope_scaling_type: None,
@@ -8694,6 +8792,7 @@ fn apply_rope_uses_gguf_rope_frequency_factors() {
         vocab_size: None,
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,
@@ -8746,6 +8845,7 @@ fn rope_diagnostics_reconstruct_reported_rotation() {
         feed_forward_length: 8,
         attention_head_count: 2,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(2),
         rope_freq_base: Some(10_000.0),
         rope_scaling_type: None,
@@ -8757,6 +8857,7 @@ fn rope_diagnostics_reconstruct_reported_rotation() {
         vocab_size: None,
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,
@@ -8814,6 +8915,7 @@ fn split_half_rope_pairing_is_available_for_diagnostics() {
         feed_forward_length: 8,
         attention_head_count: 1,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(4),
         rope_freq_base: Some(10_000.0),
         rope_scaling_type: None,
@@ -8825,6 +8927,7 @@ fn split_half_rope_pairing_is_available_for_diagnostics() {
         vocab_size: None,
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,
@@ -8896,6 +8999,7 @@ fn inverse_rope_direction_is_available_for_diagnostics() {
         feed_forward_length: 8,
         attention_head_count: 1,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(2),
         rope_freq_base: Some(10_000.0),
         rope_scaling_type: None,
@@ -8907,6 +9011,7 @@ fn inverse_rope_direction_is_available_for_diagnostics() {
         vocab_size: None,
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,
@@ -8977,6 +9082,7 @@ fn one_based_rope_position_mode_is_available_for_diagnostics() {
         feed_forward_length: 8,
         attention_head_count: 1,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(2),
         rope_freq_base: Some(10_000.0),
         rope_scaling_type: None,
@@ -8988,6 +9094,7 @@ fn one_based_rope_position_mode_is_available_for_diagnostics() {
         vocab_size: None,
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,
@@ -10594,6 +10701,7 @@ fn single_token_forward_diagnostics_follow_llama_stage_order() {
         feed_forward_length: 2,
         attention_head_count: 1,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(2),
         rope_freq_base: Some(10_000.0),
         rope_scaling_type: None,
@@ -10605,6 +10713,7 @@ fn single_token_forward_diagnostics_follow_llama_stage_order() {
         vocab_size: Some(3),
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,
@@ -10883,6 +10992,7 @@ fn chunked_prefill_matches_sequential_prefill_outputs_and_cache() {
         feed_forward_length: 2,
         attention_head_count: 1,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(2),
         rope_freq_base: Some(10_000.0),
         rope_scaling_type: None,
@@ -10894,6 +11004,7 @@ fn chunked_prefill_matches_sequential_prefill_outputs_and_cache() {
         vocab_size: Some(4),
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,
@@ -11112,6 +11223,7 @@ fn prefill_layer_rejects_misaligned_kv_cache_cursor() {
         feed_forward_length: 2,
         attention_head_count: 1,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(2),
         rope_freq_base: Some(10_000.0),
         rope_scaling_type: None,
@@ -11123,6 +11235,7 @@ fn prefill_layer_rejects_misaligned_kv_cache_cursor() {
         vocab_size: Some(4),
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,
@@ -11189,7 +11302,7 @@ fn prefill_layer_rejects_misaligned_kv_cache_cursor() {
     };
     let hidden = CpuTensor::from_f32("hidden", vec![2, 2], vec![0.1, 0.2, 0.3, 0.4]).unwrap();
     let plan = LlamaKvCachePlan::from_config(&config).unwrap();
-    let mut kv_cache = LlamaKvCache::new(plan).unwrap();
+    let mut kv_cache = LlamaKvCache::new(plan, crate::model::KvCacheQuantization::F16).unwrap();
     kv_cache.position = 1;
 
     let err = forward_prefill_layer_chunk_timed(
@@ -11225,6 +11338,7 @@ fn batch_attention_rejects_reads_beyond_allocated_kv_cache() {
         feed_forward_length: 2,
         attention_head_count: 1,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(2),
         rope_freq_base: Some(10_000.0),
         rope_scaling_type: None,
@@ -11236,6 +11350,7 @@ fn batch_attention_rejects_reads_beyond_allocated_kv_cache() {
         vocab_size: Some(4),
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,
@@ -11243,7 +11358,11 @@ fn batch_attention_rejects_reads_beyond_allocated_kv_cache() {
         qwen35: None,
         mla: None,
     };
-    let kv_cache = LlamaKvCache::new(LlamaKvCachePlan::from_config(&config).unwrap()).unwrap();
+    let kv_cache = LlamaKvCache::new(
+        LlamaKvCachePlan::from_config(&config).unwrap(),
+        crate::model::KvCacheQuantization::F16,
+    )
+    .unwrap();
     let query = CpuTensor::from_f32("query", vec![1, 2], vec![0.1, 0.2]).unwrap();
 
     let err = causal_attention_context_batch(&kv_cache, 0, 0, &query, 1, 1, "context").unwrap_err();
@@ -11274,7 +11393,8 @@ fn batch_attention_parallel_context_matches_serial() {
         key_shape: vec![1, rows, kv_heads, head_dim],
         value_shape: vec![1, rows, kv_heads, head_dim],
     };
-    let mut kv_cache = LlamaKvCache::new(plan).expect("KV cache");
+    let mut kv_cache =
+        LlamaKvCache::new(plan, crate::model::KvCacheQuantization::F16).expect("KV cache");
     let key_data: Vec<f32> = (0..rows * kv_width)
         .map(|idx| ((idx % 11) as f32 - 5.0) * 0.125)
         .collect();
@@ -11372,6 +11492,7 @@ fn zero_prefill_chunk_env_falls_back_without_panicking() {
         feed_forward_length: 2,
         attention_head_count: 1,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(2),
         rope_freq_base: Some(10_000.0),
         rope_scaling_type: None,
@@ -11383,6 +11504,7 @@ fn zero_prefill_chunk_env_falls_back_without_panicking() {
         vocab_size: Some(4),
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,
@@ -11503,7 +11625,8 @@ fn kv_cache_allocates_positions_lazily_without_losing_prior_layers() {
         key_shape: vec![2, 10, 1, 2],
         value_shape: vec![2, 10, 1, 2],
     };
-    let mut kv_cache = LlamaKvCache::new(plan).expect("KV cache");
+    let mut kv_cache =
+        LlamaKvCache::new(plan, crate::model::KvCacheQuantization::F16).expect("KV cache");
     assert_eq!(kv_cache.allocated_sequence_length, 0);
     assert!(kv_cache.keys.is_empty());
     assert!(kv_cache.values.is_empty());
@@ -11552,7 +11675,8 @@ fn kv_cache_uses_paged_growth_for_model_sized_contexts() {
         key_shape: vec![2, 1024, 1, 2],
         value_shape: vec![2, 1024, 1, 2],
     };
-    let mut kv_cache = LlamaKvCache::new(plan).expect("KV cache");
+    let mut kv_cache =
+        LlamaKvCache::new(plan, crate::model::KvCacheQuantization::F16).expect("KV cache");
     let key = CpuTensor::from_f32("key", vec![1, 2], vec![1.0, 2.0]).unwrap();
     let value = CpuTensor::from_f32("value", vec![1, 2], vec![3.0, 4.0]).unwrap();
 
@@ -11575,7 +11699,8 @@ fn kv_cache_storage_matches_llama_cpp_f16_rounding() {
         key_shape: vec![1, 1, 1, 2],
         value_shape: vec![1, 1, 1, 2],
     };
-    let mut kv_cache = LlamaKvCache::new(plan).expect("KV cache");
+    let mut kv_cache =
+        LlamaKvCache::new(plan, crate::model::KvCacheQuantization::F16).expect("KV cache");
     let key = CpuTensor::from_f32("key", vec![1, 2], vec![1.0001, -2.0003]).unwrap();
     let value = CpuTensor::from_f32("value", vec![1, 2], vec![3.0007, -4.0009]).unwrap();
 
@@ -11603,6 +11728,79 @@ fn kv_cache_storage_matches_llama_cpp_f16_rounding() {
 }
 
 #[test]
+fn quantized_attention_matches_its_dequantized_cache_for_tail_rows() {
+    let _env_guard = env_lock();
+    std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
+    std::env::remove_var("CAMELID_GQA_HEAD_MAPPING");
+
+    let head_dim = 40;
+    let plan = LlamaKvCachePlan {
+        max_sequence_length: 3,
+        layer_count: 1,
+        kv_head_count: 1,
+        head_dim,
+        k_head_dim: head_dim,
+        v_head_dim: head_dim,
+        key_shape: vec![1, 3, 1, head_dim],
+        value_shape: vec![1, 3, 1, head_dim],
+    };
+    let query_data: Vec<f32> = (0..head_dim)
+        .map(|index| (index as f32 - 13.0) * 0.03125)
+        .collect();
+    let query = CpuTensor::from_f32("query", vec![1, head_dim], query_data.clone()).unwrap();
+
+    for dtype in [KvDtype::Q8_0, KvDtype::Q4_0] {
+        for layout in [KvLayout::PositionMajor, KvLayout::HeadMajor] {
+            let mut cache =
+                LlamaKvCache::new_with_layout_and_dtype(plan.clone(), layout, dtype).unwrap();
+            cache.ensure_position_capacity(3).unwrap();
+            for position in 0..3 {
+                let key: Vec<f32> = (0..head_dim)
+                    .map(|index| (index as f32 - 17.0) * 0.025 + position as f32 * 0.0625)
+                    .collect();
+                let value: Vec<f32> = (0..head_dim)
+                    .map(|index| (9.0 - index as f32) * 0.04 + position as f32 * 0.125)
+                    .collect();
+                cache.store_kv_head_row(0, position, 0, &key, &value);
+            }
+            cache.position = 2;
+
+            let actual = causal_attention_context(&cache, 0, &query, 1, 1, "context", false)
+                .unwrap()
+                .tensor;
+
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            let mut scores = Vec::new();
+            let mut values = Vec::new();
+            for position in 0..3 {
+                let mut key = vec![0.0; head_dim];
+                let mut value = vec![0.0; head_dim];
+                cache.copy_key_row_into(0, position, 0, &mut key);
+                cache.copy_value_row_into(0, position, 0, &mut value);
+                scores.push(dot_product(&query_data, &key) * scale);
+                values.push(value);
+            }
+            let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let denominator: f32 = scores.iter().map(|score| (score - max_score).exp()).sum();
+            let mut expected = vec![0.0; head_dim];
+            for (score, value) in scores.iter().zip(values) {
+                let probability = (*score - max_score).exp() / denominator;
+                for (out, value) in expected.iter_mut().zip(value) {
+                    *out += probability * value;
+                }
+            }
+
+            for (index, (actual, expected)) in actual.data.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    (actual - expected).abs() < 1e-5,
+                    "{dtype:?}/{layout:?} attention mismatch at {index}: {actual} vs {expected}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn causal_attention_context_attends_over_prior_and_current_positions() {
     let _env_guard = env_lock();
     std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
@@ -11618,7 +11816,8 @@ fn causal_attention_context_attends_over_prior_and_current_positions() {
         key_shape: vec![1, 3, 1, 2],
         value_shape: vec![1, 3, 1, 2],
     };
-    let mut kv_cache = LlamaKvCache::new(plan).expect("KV cache");
+    let mut kv_cache =
+        LlamaKvCache::new(plan, crate::model::KvCacheQuantization::F16).expect("KV cache");
 
     let prior_key = CpuTensor::from_f32("prior_key", vec![1, 2], vec![1.0, 0.0]).unwrap();
     let prior_value = CpuTensor::from_f32("prior_value", vec![1, 2], vec![10.0, 0.0]).unwrap();
@@ -11716,7 +11915,8 @@ fn causal_attention_context_repeats_grouped_kv_heads_for_single_position() {
         key_shape: vec![1, 1, 2, 2],
         value_shape: vec![1, 1, 2, 2],
     };
-    let mut kv_cache = LlamaKvCache::new(plan).expect("KV cache");
+    let mut kv_cache =
+        LlamaKvCache::new(plan, crate::model::KvCacheQuantization::F16).expect("KV cache");
 
     let key = CpuTensor::from_f32("key", vec![1, 4], vec![1.0, 0.0, 0.0, 1.0]).unwrap();
     let value = CpuTensor::from_f32("value", vec![1, 4], vec![10.0, 11.0, 20.0, 21.0]).unwrap();
@@ -11776,7 +11976,8 @@ fn causal_attention_context_repeats_grouped_kv_heads_across_positions() {
         key_shape: vec![1, 2, 2, 2],
         value_shape: vec![1, 2, 2, 2],
     };
-    let mut kv_cache = LlamaKvCache::new(plan).expect("KV cache");
+    let mut kv_cache =
+        LlamaKvCache::new(plan, crate::model::KvCacheQuantization::F16).expect("KV cache");
 
     let prior_key = CpuTensor::from_f32("prior_key", vec![1, 4], vec![1.0, 0.0, 0.0, 1.0]).unwrap();
     let prior_value =
@@ -11860,7 +12061,8 @@ fn attention_trace_reports_top_probability_positions_outside_edge_samples() {
         key_shape: vec![1, 10, 1, 2],
         value_shape: vec![1, 10, 1, 2],
     };
-    let mut kv_cache = LlamaKvCache::new(plan).expect("KV cache");
+    let mut kv_cache =
+        LlamaKvCache::new(plan, crate::model::KvCacheQuantization::F16).expect("KV cache");
 
     for position in 0..10 {
         kv_cache.position = position;
@@ -12087,7 +12289,7 @@ fn mixtral_moe_ffn_captures_router_logits_and_selected_experts() {
     )
     .unwrap();
 
-    let (_, _, _, _, _, trace) = mixtral_moe_ffn(
+    let (out, _, _, _, _, trace) = mixtral_moe_ffn(
         &input,
         &router,
         &gate_experts,
@@ -12106,6 +12308,20 @@ fn mixtral_moe_ffn_captures_router_logits_and_selected_experts() {
     assert_eq!(trace.rows[0].selected_experts, vec![0, 1]);
     let selected_sum = trace.rows[0].selected_weights.iter().sum::<f32>();
     assert!((selected_sum - 1.0).abs() < 1.0e-6, "{trace:?}");
+    assert_eq!(trace.rows[0].experts.len(), 2);
+    assert_eq!(trace.rows[0].experts[0].expert_index, 0);
+    assert_eq!(trace.rows[0].experts[1].expert_index, 1);
+    for column in 0..out.data.len() {
+        let reconstructed = trace.rows[0]
+            .experts
+            .iter()
+            .map(|expert| expert.weighted_down.checkpoint.first_values[column])
+            .sum::<f32>();
+        assert!(
+            (reconstructed - out.data[column]).abs() < 1.0e-6,
+            "weighted expert checkpoints must reconstruct MoE output column {column}"
+        );
+    }
 }
 
 #[test]
@@ -12162,6 +12378,7 @@ fn resident_prefill_rope_tables_match_per_position_builder() {
         feed_forward_length: 16,
         attention_head_count: 2,
         attention_head_count_kv: 1,
+        kv_quant: crate::model::KvCacheQuantization::F16,
         rope_dimension_count: Some(8),
         rope_freq_base: Some(500_000.0),
         rope_scaling_type: Some("llama3".to_string()),
@@ -12173,6 +12390,7 @@ fn resident_prefill_rope_tables_match_per_position_builder() {
         vocab_size: None,
         file_type: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         attention_key_length: None,
         logit_scale: None,
         moe: None,
@@ -13044,7 +13262,8 @@ fn decode_attention_parallel_lane_is_bitwise_identical_to_serial() {
                     key_shape: vec![1, position_count, kv_heads, head_dim],
                     value_shape: vec![1, position_count, kv_heads, head_dim],
                 };
-                let mut kv_cache = LlamaKvCache::new(plan).expect("kv cache");
+                let mut kv_cache = LlamaKvCache::new(plan, crate::model::KvCacheQuantization::F16)
+                    .expect("kv cache");
                 let kv_len = position_count * kv_heads * head_dim;
                 kv_cache.keys = rng.fill(kv_len);
                 kv_cache.values = rng.fill(kv_len);

@@ -14,11 +14,20 @@ export const normalizeCodeLanguage = (value) => {
   return language.toUpperCase()
 }
 
+/* Returns whether the text actually reached the clipboard. `navigator.clipboard`
+   is undefined outside secure contexts — which includes reaching a Camelid served
+   with `--addr 0.0.0.0` over a plain-http LAN address — and optional chaining
+   would otherwise make that indistinguishable from success, letting a caller show
+   a "Copied" confirmation for a copy that never happened. Callers that ignore the
+   result behave exactly as before. */
 export const copyText = async (text) => {
   try {
-    await navigator.clipboard?.writeText(text)
+    if (!navigator.clipboard?.writeText) return false
+    await navigator.clipboard.writeText(text)
+    return true
   } catch {
-    // Clipboard access can be denied outside secure browser contexts; rendering still works.
+    // Clipboard access can be denied even in a secure context; rendering still works.
+    return false
   }
 }
 

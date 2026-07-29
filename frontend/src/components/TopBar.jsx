@@ -12,6 +12,7 @@ const TITLES = {
   code: 'Code',
   workspace: 'Workspace',
   library: 'Models',
+  downloads: 'Downloaded models',
   api: 'API',
   compatibility: 'Compatibility ledger',
   analytics: 'Analytics',

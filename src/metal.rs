@@ -3210,20 +3210,28 @@ kernel void half_mm_batched(
     const uint quad_t0 = t0 + 8 * sg_tok_oct;
     const uint quad_r0 = r0 + 32 * (sg % 2);
     const bool sg_active = quad_t0 < cols
+        && quad_r0 < rows
         && !(causal_mode == 1 && quad_r0 > quad_t0 + q_offset + 31);
 
     for (uint kk0 = 0; kk0 < k_end; kk0 += NK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // A: 64 rows x 32 k staged TRANSPOSED (k-major in-block); zero-pad past kdim.
+        // ROW TAIL: `rows` need not be a multiple of NR0, so the last row tile is
+        // partial. A row past `rows` does not exist in A -- the attention PV pass hands
+        // this kernel rows = head_dim over a slab allocated to exactly head_dim rows --
+        // so reading it walks into the NEXT head's slab, or off the end of the buffer
+        // for the last head. Zero-pad it, exactly as the k tail is already zero-padded.
         {
-            device const half* arow =
-                ab + (r0 + lr0) * a_row_stride + (kk0 + k0) * a_elem_stride;
+            const bool a_row_valid = (r0 + lr0) < rows;
+            device const half* arow = a_row_valid
+                ? ab + (r0 + lr0) * a_row_stride + (kk0 + k0) * a_elem_stride
+                : ab;
             const uint sy = lr0 / 8;
             const uint lx = lr0 % 8;
             for (uint i = 0; i < 16; ++i) {
                 const uint kg = k0 + i;
                 sa[64 * (8 * (kg / 8) + sy) + 8 * (kg % 8) + lx] =
-                    (kk0 + kg < kdim) ? arow[i * a_elem_stride] : half(0.0f);
+                    (a_row_valid && kk0 + kg < kdim) ? arow[i * a_elem_stride] : half(0.0f);
             }
         }
         // B: 64 rows x 32 k, token-major vector stores (B is padded past cols).
@@ -3258,7 +3266,7 @@ kernel void half_mm_batched(
         }
     }
 
-    if (t0 + NR1 <= cols) {
+    if (t0 + NR1 <= cols && r0 + NR0 <= rows) {
         device float* cq = cb + (r0 + 32 * (sg % 2)) + (t0 + 32 * (sg / 2)) * c_row_stride;
         for (uint i = 0; i < 16; ++i) {
             simdgroup_store(mc[i], cq + 8 * (i % 4) + 8 * c_row_stride * (i / 4),
@@ -3276,7 +3284,7 @@ kernel void half_mm_batched(
             for (uint e2 = lane; e2 < 64; e2 += 32) {
                 const uint ft = e2 / 8;
                 const uint fr = e2 % 8;
-                if (t_oct + ft < cols) {
+                if (t_oct + ft < cols && r_oct + fr < rows) {
                     cb[(t_oct + ft) * c_row_stride + r_oct + fr] =
                         scratch[sg * 64 + ft * 8 + fr];
                 }
@@ -3343,20 +3351,28 @@ kernel void half_mm_batched_f16o(
     const uint quad_t0 = t0 + 8 * sg_tok_oct;
     const uint quad_r0 = r0 + 32 * (sg % 2);
     const bool sg_active = quad_t0 < cols
+        && quad_r0 < rows
         && !(causal_mode == 1 && quad_r0 > quad_t0 + q_offset + 31);
 
     for (uint kk0 = 0; kk0 < k_end; kk0 += NK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // A: 64 rows x 32 k staged TRANSPOSED (k-major in-block); zero-pad past kdim.
+        // ROW TAIL: `rows` need not be a multiple of NR0, so the last row tile is
+        // partial. A row past `rows` does not exist in A -- the attention PV pass hands
+        // this kernel rows = head_dim over a slab allocated to exactly head_dim rows --
+        // so reading it walks into the NEXT head's slab, or off the end of the buffer
+        // for the last head. Zero-pad it, exactly as the k tail is already zero-padded.
         {
-            device const half* arow =
-                ab + (r0 + lr0) * a_row_stride + (kk0 + k0) * a_elem_stride;
+            const bool a_row_valid = (r0 + lr0) < rows;
+            device const half* arow = a_row_valid
+                ? ab + (r0 + lr0) * a_row_stride + (kk0 + k0) * a_elem_stride
+                : ab;
             const uint sy = lr0 / 8;
             const uint lx = lr0 % 8;
             for (uint i = 0; i < 16; ++i) {
                 const uint kg = k0 + i;
                 sa[64 * (8 * (kg / 8) + sy) + 8 * (kg % 8) + lx] =
-                    (kk0 + kg < kdim) ? arow[i * a_elem_stride] : half(0.0f);
+                    (a_row_valid && kk0 + kg < kdim) ? arow[i * a_elem_stride] : half(0.0f);
             }
         }
         // B: 64 rows x 32 k, token-major vector stores (B is padded past cols).
@@ -3391,7 +3407,7 @@ kernel void half_mm_batched_f16o(
         }
     }
 
-    if (t0 + NR1 <= cols) {
+    if (t0 + NR1 <= cols && r0 + NR0 <= rows) {
         // Half output: per-lane element stores from the accumulator fragments.
         device half* cq = cb + (r0 + 32 * (sg % 2)) + (t0 + 32 * (sg / 2)) * c_row_stride;
         const short qid = (short)(lane / 4);
@@ -3415,7 +3431,7 @@ kernel void half_mm_batched_f16o(
             for (uint e2 = lane; e2 < 64; e2 += 32) {
                 const uint ft = e2 / 8;
                 const uint fr = e2 % 8;
-                if (t_oct + ft < cols) {
+                if (t_oct + ft < cols && r_oct + fr < rows) {
                     cb[(t_oct + ft) * c_row_stride + r_oct + fr] =
                         half(scratch[sg * 64 + ft * 8 + fr]);
                 }

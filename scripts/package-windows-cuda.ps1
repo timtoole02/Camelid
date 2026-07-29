@@ -73,15 +73,21 @@ if (-not $CudaBin -or -not (Test-Path $CudaBin)) {
 Write-Host "CUDA bin:  $CudaBin"
 
 # --- Resolve the NVRTC redistributable DLLs -----------------------------------
-# nvrtc64_*.dll      -> the runtime compiler (e.g. nvrtc64_120_0.dll [+ .alt])
+# nvrtc64_*.dll      -> the runtime compiler (e.g. nvrtc64_120_0.dll)
 # nvrtc-builtins64_* -> its required builtins (e.g. nvrtc-builtins64_129.dll)
+#
+# `.alt.` variants are an alternate JIT backend cudarc never asks for; skipping
+# them keeps ~86 MB out of every download. Mirrors the same skip in
+# scripts/package-linux-cuda.sh -- without it the staged set trips the
+# `.alt.dll` forbidden rule in scripts/check-release-artifact.mjs.
 $patterns = @('nvrtc64_*.dll', 'nvrtc-builtins64_*.dll')
 $dlls = foreach ($p in $patterns) {
-    $matches = Get-ChildItem -Path (Join-Path $CudaBin $p) -ErrorAction SilentlyContinue
-    if (-not $matches) {
+    $found = Get-ChildItem -Path (Join-Path $CudaBin $p) -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notlike '*.alt.dll' }
+    if (-not $found) {
         Write-Warning "No files matched '$p' in $CudaBin"
     }
-    $matches
+    $found
 }
 $dlls = $dlls | Where-Object { $_ } | Sort-Object FullName -Unique
 if (-not $dlls) {

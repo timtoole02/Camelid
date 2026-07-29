@@ -106,7 +106,20 @@ export async function completeCatalogAcquisition({
         ok: false,
         started: false,
         stage: loaded?.stage || 'loading',
+        // The loader's typed `error.code` (e.g. `model_too_large_for_host`) travels
+        // with the message so a caller can distinguish a permanent refusal from a
+        // retryable one instead of parsing prose.
+        code: loaded?.code || '',
         message: loaded?.message || 'Downloaded and checked, but Camelid could not load the model.',
+      }
+    }
+    if (loaded.embedding) {
+      return {
+        ok: true,
+        started: false,
+        embedding: true,
+        stage: 'ready',
+        message: 'Embedding model ready — the current Chat model was left active.',
       }
     }
   } catch (error) {

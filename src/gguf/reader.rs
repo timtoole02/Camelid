@@ -106,7 +106,17 @@ impl GgufTensorType {
             Self::Q4_0 => Some((32, 18)),
             // block_q4_1 = f16 d + f16 m + 16 nibble bytes = 20 (NOT 18 like Q4_0).
             Self::Q4_1 => Some((32, 20)),
-            Self::Q5_0 | Self::Q5_1 => Some((32, 22)),
+            // block_q5_0 = f16 d(2) + qh u32(4) + 16 nibble bytes = 22.
+            Self::Q5_0 => Some((32, 22)),
+            // block_q5_1 = f16 d(2) + f16 m(2) + qh u32(4) + 16 nibble bytes = 24.
+            // These two were previously folded together at 22, which silently
+            // dropped Q5_1's `m` field — the same trap the Q4_1 comment above
+            // calls out, and the reason Q5_1 files could not be opened: the
+            // 2-bytes-per-block shortfall accumulates, so the NEXT tensor's
+            // offset fails the contiguity check in `parse` with a misleading
+            // "not contiguous" error. Where a Q5_1 tensor was last in the file
+            // nothing re-checked the offset and the tail was silently truncated.
+            Self::Q5_1 => Some((32, 24)),
             Self::Q8_0 => Some((32, 34)),
             Self::Q8_1 => Some((32, 36)),
             Self::Q2K => Some((256, 84)),
@@ -687,5 +697,74 @@ mod nvfp4_wire_facts {
         assert_eq!(format!("{:?}", GgufTensorType::NVFP4), "NVFP4");
         // Unknown ids still fall through to the fail-closed catch-all.
         assert_eq!(GgufTensorType::from_id(41), GgufTensorType::Unknown(41));
+    }
+
+    /// Pin EVERY quantized block layout against the reference struct definitions
+    /// in llama.cpp `ggml/src/ggml-common.h`, each of which carries a
+    /// `static_assert` on its own size.
+    ///
+    /// This exists because Q5_0 and Q5_1 were folded into one arm at 22 bytes.
+    /// Q5_1 carries an extra f16 `m` (min) field that Q5_0 does not, so its block
+    /// is 24 bytes. A 2-byte-per-block shortfall accumulates across a tensor, so
+    /// the next tensor's stored offset no longer matches the computed one and the
+    /// contiguity check rejects the whole file with a misleading error — i.e. Q5_1
+    /// GGUFs could not be opened at all. When a Q5_1 tensor was last in the file
+    /// nothing re-checked the offset, and the read was silently truncated instead.
+    ///
+    /// A single wrong entry here is not a crash, it is an unreadable or silently
+    /// short tensor, so the whole table is pinned rather than just the fixed row.
+    #[test]
+    fn quant_block_layouts_match_the_reference_struct_sizes() {
+        use super::GgufTensorType as T;
+
+        // (type, block elements, block bytes) — derived from the reference structs:
+        //   q4_0   = d(2)                       + qs[16]            = 18
+        //   q4_1   = d(2) + m(2)                + qs[16]            = 20
+        //   q5_0   = d(2)         + qh(4)       + qs[16]            = 22
+        //   q5_1   = d(2) + m(2)  + qh(4)       + qs[16]            = 24
+        //   q8_0   = d(2)                       + qs[32]            = 34
+        //   q8_1   = ds(4)                      + qs[32]            = 36
+        //   q2_K   = scales[16] + qs[64] + d(2) + dmin(2)           = 84
+        //   q3_K   = hmask[32] + qs[64] + scales[12] + d(2)         = 110
+        //   q4_K   = d(2) + dmin(2) + scales[12] + qs[128]          = 144
+        //   q5_K   = d(2) + dmin(2) + scales[12] + qh[32] + qs[128] = 176
+        //   q6_K   = ql[128] + qh[64] + scales[16] + d(2)           = 210
+        //   q8_K   = d(4) + qs[256] + bsums[16*2]                   = 292
+        //   iq4_nl = d(2)                       + qs[16]            = 18
+        //   iq4_xs = d(2) + scales_h(2) + scales_l[4] + qs[128]     = 136
+        //   tq1_0  = qs[48] + qh[4] + d(2)                          = 54
+        //   tq2_0  = qs[64] + d(2)                                  = 66
+        let expected = [
+            (T::Q4_0, 32, 18),
+            (T::Q4_1, 32, 20),
+            (T::Q5_0, 32, 22),
+            (T::Q5_1, 32, 24),
+            (T::Q8_0, 32, 34),
+            (T::Q8_1, 32, 36),
+            (T::Q2K, 256, 84),
+            (T::Q3K, 256, 110),
+            (T::Q4K, 256, 144),
+            (T::Q5K, 256, 176),
+            (T::Q6K, 256, 210),
+            (T::Q8K, 256, 292),
+            (T::IQ4NL, 32, 18),
+            (T::IQ4XS, 256, 136),
+            (T::Tq1_0, 256, 54),
+            (T::Tq2_0, 256, 66),
+            (T::NVFP4, 64, 36),
+        ];
+
+        for (tt, block, bytes) in expected {
+            assert_eq!(
+                tt.layout(),
+                Some((block, bytes)),
+                "{tt:?} block layout must match the reference struct size"
+            );
+        }
+
+        // Q5_1 is two bytes wider than Q5_0 for exactly one reason: the `m` field.
+        let (_, q5_0) = T::Q5_0.layout().unwrap();
+        let (_, q5_1) = T::Q5_1.layout().unwrap();
+        assert_eq!(q5_1 - q5_0, 2, "Q5_1 adds one f16 min over Q5_0");
     }
 }

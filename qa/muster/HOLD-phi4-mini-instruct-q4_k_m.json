@@ -1,0 +1,38 @@
+{
+  "schema": "camelid.muster_hold_receipt/v1",
+  "campaign": "post-MUSTER exact-artifact validation",
+  "verdict": "HOLD",
+  "sealed_at_phase": "tokenizer admission and raw-decode parity review, 2026-07-27",
+  "file": {
+    "filename": "Phi-4-mini-instruct-Q4_K_M.gguf",
+    "sha256": "88c00229914083cd112853aab84ed51b87bdf6b9ce42f532d8c85c7c63b1730a",
+    "size_bytes": 2491874272,
+    "arch": "phi3",
+    "quant": "Q4_K_M",
+    "provenance": "unsloth/Phi-4-mini-instruct-GGUF revision 78eb92a46fc37e6b524df991ed9aca9bc6aa7b80; upstream microsoft/Phi-4-mini-instruct is MIT"
+  },
+  "observed_engine_facts_not_support": [
+    "The exact artifact uses tokenizer.ggml.pre=gpt-4o and a compact metadata chat template. GPT4O tokenization is gated to this exact filename, model name, and phi3 architecture until broader artifact coverage is independently earned.",
+    "The GPT4O pre-tokenizer is pinned to llama.cpp acd79d603's executed collapsed-regex path, with raw llama-tokenize --ids --no-bos captures committed in qa/prompt-packs/phi4-mini-gpt4o-tokenizer-oracle-v1.json.",
+    "The ordinary-message compact chat template is locked against the exact GGUF metadata template in qa/prompt-packs/phi4-mini-chat-template-shapes-v1.json; tool-bearing requests fail closed until independently validated."
+  ],
+  "named_blockers": [
+    {
+      "id": "windows_cuda_raw_decode_divergence",
+      "kind": "exact_artifact_parity_failure",
+      "statement": "A two-phase raw greedy-decode comparison against pinned llama.cpp acd79d603 matched the first generated token for 'The capital of France is' but diverged at generated index 3 at depth 5 (reference ' Paris. Paris is the', Camelid ' Paris. What is the'). This is not attributed as a near-tie and blocks any CUDA or supported-row claim."
+    },
+    {
+      "id": "cpu_parity_inconclusive",
+      "kind": "environment_bounded_inconclusive",
+      "statement": "The same 8-prompt x 1/5/50 CPU comparison was stopped after prolonged active non-resident computation without an atomic report. It is neither a pass nor a failure and cannot substitute for a CPU parity certificate."
+    },
+    {
+      "id": "forward_path_not_isolated",
+      "kind": "unresolved_engine_investigation",
+      "statement": "Phi-4-mini differs materially from the held Phi-3 row (200k vocabulary, partial rotary, fused QKV/FFN geometry). The short raw divergence has not been isolated between forward-path geometry, quantized execution, or other engine causes."
+    }
+  ],
+  "exit_condition": "Reproduce and isolate the first non-matching generated token with an exact artifact forward-path investigation, then rerun a complete two-phase parity matrix with current-source tokenizer prompt parity, determinism control, API/WebUI evidence, and bounded CPU/CUDA context evidence before any catalog or supported-row promotion.",
+  "date": "2026-07-27"
+}

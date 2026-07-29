@@ -51,6 +51,17 @@ pub enum FitVerdict {
     FitsWithOffload,
     /// No usable GPU, but the footprint fits the host RAM budget (CPU backend).
     CpuOnlyOk,
+    /// The footprint fits what this machine could offer **if nothing else were
+    /// resident**, but not what is free right now. The remedy is to free memory
+    /// (close applications, unload another model), not to pick a smaller model.
+    ///
+    /// Kept distinct from [`FitVerdict::WontFit`] because collapsing the two is a
+    /// factual error with a real cost: on a 16 GB host with 1.5 GB free, every row
+    /// down to a 1 GB model reported "too big for this machine", which is untrue and
+    /// reads as "this product does not work here". Both verdicts still refuse a load
+    /// (see [`FitVerdict::refuses_load`]) — the distinction is in the explanation,
+    /// never in the permission.
+    InsufficientFreeMemory,
     /// Exceeds every available budget on this host. The pick would fail at load or
     /// generation time; the UI should steer the user to a smaller/quantized row.
     WontFit,
@@ -66,6 +77,7 @@ impl FitVerdict {
             FitVerdict::FitsResident => "fits_resident",
             FitVerdict::FitsWithOffload => "fits_with_offload",
             FitVerdict::CpuOnlyOk => "cpu_only_ok",
+            FitVerdict::InsufficientFreeMemory => "insufficient_free_memory",
             FitVerdict::WontFit => "wont_fit",
             FitVerdict::Unknown => "unknown",
         }
@@ -74,12 +86,29 @@ impl FitVerdict {
     /// Whether the verdict says the model can run *somehow* on this host. `Unknown`
     /// is **not** runnable-negative — it is the absence of a claim — so it returns
     /// `false` here only in the sense of "no positive fit was proven". Callers that
-    /// must not block on unknowns should test `!= WontFit` instead.
+    /// must not block on unknowns should test [`FitVerdict::refuses_load`] instead.
     pub fn is_positive_fit(self) -> bool {
         matches!(
             self,
             FitVerdict::FitsResident | FitVerdict::FitsWithOffload | FitVerdict::CpuOnlyOk
         )
+    }
+
+    /// Whether a pre-load guard should refuse on this verdict. True for both
+    /// negative verdicts and false for every positive one **and** for `Unknown`
+    /// (an unprobed host must never be blocked on a claim we cannot make).
+    ///
+    /// This is the exact complement of "proceed" and exists so that adding a
+    /// negative verdict cannot silently widen what the load guard permits: a new
+    /// variant must be classified here or the match fails to compile.
+    pub fn refuses_load(self) -> bool {
+        match self {
+            FitVerdict::WontFit | FitVerdict::InsufficientFreeMemory => true,
+            FitVerdict::FitsResident
+            | FitVerdict::FitsWithOffload
+            | FitVerdict::CpuOnlyOk
+            | FitVerdict::Unknown => false,
+        }
     }
 
     /// Short human label for a CLI column or terse log. UI surfaces (WebUI) author
@@ -89,6 +118,7 @@ impl FitVerdict {
             FitVerdict::FitsResident => "fits",
             FitVerdict::FitsWithOffload => "fits (offload)",
             FitVerdict::CpuOnlyOk => "fits (CPU)",
+            FitVerdict::InsufficientFreeMemory => "needs free memory",
             FitVerdict::WontFit => "too big",
             FitVerdict::Unknown => "unknown",
         }
@@ -119,10 +149,10 @@ impl FitInputs {
 /// total)` formula as the KV-cache budget in `kv_cache.rs`, but is an independent
 /// reimplementation, not the same guard. Two intentional differences:
 ///
-/// - Source: the advisor reads [`HardwareProfile`] RAM (probed on Windows and Linux;
-///   `(0, 0)` / unknown on macOS), whereas the KV guard reads `gait::host_ram_status`
-///   (probed on Windows and macOS; unprobed on Linux). So on Linux the advisor
-///   enforces a budget while the KV guard is unbounded; on macOS it is the reverse.
+/// - Source: the advisor reads [`HardwareProfile`] RAM (probed on Windows, Linux,
+///   and macOS), whereas the KV guard reads `gait::host_ram_status` (probed on
+///   Windows and macOS; unprobed on Linux). On Linux the advisor enforces a budget
+///   while the KV guard is unbounded.
 /// - Unprobed RAM: the KV guard fails *open* (unbounded); the advisor abstains here
 ///   with `None` (surfaced as [`FitVerdict::Unknown`]) rather than assert a capacity
 ///   it cannot measure.
@@ -144,6 +174,36 @@ fn has_usable_gpu(hw: &HardwareProfile) -> bool {
     hw.cuda_available && hw.cuda_vram_free_bytes > 0
 }
 
+/// The host-RAM budget an *idle* machine would offer: the same
+/// [`USABLE_RAM_AVAILABLE_PERCENT`] policy applied to **total** rather than
+/// available RAM. `None` when RAM is unprobed.
+///
+/// This is diagnostic only — it explains why a footprint does not fit right now and
+/// never authorizes a load. [`usable_host_ram_bytes`] (available RAM, no floor)
+/// remains the sole capacity gate, so this cannot become an overcommit vector.
+fn idle_host_ram_bytes(hw: &HardwareProfile) -> Option<u64> {
+    if hw.host_ram_total_bytes == 0 {
+        return None;
+    }
+    Some(
+        hw.host_ram_total_bytes
+            .saturating_mul(USABLE_RAM_AVAILABLE_PERCENT)
+            / 100,
+    )
+}
+
+/// Classify a footprint that does not fit the *current* budget: transient pressure
+/// ([`FitVerdict::InsufficientFreeMemory`]) when an idle machine would have held it,
+/// otherwise a genuine [`FitVerdict::WontFit`]. `capacity_when_idle` is the matching
+/// idle budget for whichever branch (GPU-offload or CPU) is refusing.
+fn negative_verdict(footprint: u64, capacity_when_idle: u64) -> FitVerdict {
+    if footprint <= capacity_when_idle {
+        FitVerdict::InsufficientFreeMemory
+    } else {
+        FitVerdict::WontFit
+    }
+}
+
 /// Pure fit decision with an explicit VRAM headroom (in MiB), so the whole thing
 /// is deterministic and unit-testable without touching process env or a GPU.
 ///
@@ -151,9 +211,16 @@ fn has_usable_gpu(hw: &HardwareProfile) -> bool {
 /// 1. Usable GPU present → try VRAM-resident via [`crate::cuda_vram::evaluate`].
 ///    - Ok → [`FitVerdict::FitsResident`].
 ///    - Shortfall → offload: fits VRAM + usable host RAM → [`FitVerdict::FitsWithOffload`];
-///      RAM known but too small → [`FitVerdict::WontFit`]; RAM unknown → [`FitVerdict::Unknown`].
-/// 2. No usable GPU → fits host RAM → [`FitVerdict::CpuOnlyOk`]; too small →
-///    [`FitVerdict::WontFit`]; RAM unknown → [`FitVerdict::Unknown`].
+///      RAM known but too small → a negative verdict (see below); RAM unknown →
+///      [`FitVerdict::Unknown`].
+/// 2. No usable GPU → fits host RAM → [`FitVerdict::CpuOnlyOk`]; too small → a
+///    negative verdict; RAM unknown → [`FitVerdict::Unknown`].
+///
+/// Negative verdicts are split by [`negative_verdict`]: a footprint an *idle* host
+/// would have held is [`FitVerdict::InsufficientFreeMemory`], anything larger is
+/// [`FitVerdict::WontFit`]. Both refuse a load; only the explanation differs. The
+/// gate itself still reads **available** memory only, so the split cannot make the
+/// advisor optimistic.
 fn assess_with_headroom(hw: &HardwareProfile, m: &FitInputs, vram_headroom_mib: u64) -> FitVerdict {
     let footprint = m.footprint_bytes();
     let usable_ram = usable_host_ram_bytes(hw);
@@ -179,7 +246,14 @@ fn assess_with_headroom(hw: &HardwareProfile, m: &FitInputs, vram_headroom_mib: 
                     Some(ram) if footprint <= hw.cuda_vram_free_bytes.saturating_add(ram) => {
                         FitVerdict::FitsWithOffload
                     }
-                    Some(_) => FitVerdict::WontFit,
+                    // Idle capacity for the offload split is total VRAM plus the
+                    // idle host-RAM budget: what the machine could offer with
+                    // nothing else resident.
+                    Some(_) => negative_verdict(
+                        footprint,
+                        hw.cuda_vram_total_bytes
+                            .saturating_add(idle_host_ram_bytes(hw).unwrap_or(0)),
+                    ),
                     None => FitVerdict::Unknown,
                 };
             }
@@ -188,7 +262,7 @@ fn assess_with_headroom(hw: &HardwareProfile, m: &FitInputs, vram_headroom_mib: 
 
     match usable_ram {
         Some(ram) if footprint <= ram => FitVerdict::CpuOnlyOk,
-        Some(_) => FitVerdict::WontFit,
+        Some(_) => negative_verdict(footprint, idle_host_ram_bytes(hw).unwrap_or(0)),
         None => FitVerdict::Unknown,
     }
 }
@@ -407,14 +481,66 @@ mod tests {
     }
 
     #[test]
-    fn starved_host_wont_fit_despite_large_total_ram() {
+    fn starved_host_reports_insufficient_free_memory_not_wont_fit() {
         // 32 GB total but only 2 GB actually free. A PRE-LOAD advisor must NOT
         // floor up to 25% of total (8 GB) and claim a 3.4 GB model fits — the
         // weights are not resident yet, so that would overcommit and OOM the
-        // load. Conservative: budget = 80% of 2 GB = 1.6 GB → WontFit.
+        // load. Conservative: budget = 80% of 2 GB = 1.6 GB → refused.
+        //
+        // But the refusal reason matters: this machine plainly *can* hold a 3.4 GB
+        // model, it just cannot right now. Reporting "too big for this machine"
+        // here is false and tells the user to buy hardware they already own.
         let hw = profile(false, 0, 32 * GIB, 2 * GIB);
         let m = inputs(3_421_898_816, 256 * MIB);
+        let verdict = assess_with_headroom(&hw, &m, H);
+        assert_eq!(verdict, FitVerdict::InsufficientFreeMemory);
+        // The permission is unchanged — only the explanation differs.
+        assert!(!verdict.is_positive_fit());
+        assert!(verdict.refuses_load());
+    }
+
+    #[test]
+    fn freeing_memory_on_the_same_host_turns_the_refusal_into_a_fit() {
+        // Same host and same model as above, but idle: the verdict flips to a
+        // positive fit. This is what makes `InsufficientFreeMemory` the honest
+        // label rather than `WontFit` — the shortage is a state, not a property.
+        let m = inputs(3_421_898_816, 256 * MIB);
+        assert_eq!(
+            assess_with_headroom(&profile(false, 0, 32 * GIB, 2 * GIB), &m, H),
+            FitVerdict::InsufficientFreeMemory
+        );
+        assert_eq!(
+            assess_with_headroom(&profile(false, 0, 32 * GIB, 28 * GIB), &m, H),
+            FitVerdict::CpuOnlyOk
+        );
+    }
+
+    #[test]
+    fn a_model_bigger_than_the_whole_machine_stays_wont_fit_even_when_idle() {
+        // 8 GB host, fully idle (7.9 GB free), asked for a 40 GB model. Freeing
+        // memory cannot help, so the verdict must stay the permanent one.
+        let hw = profile(false, 0, 8 * GIB, 7 * GIB + 900 * MIB);
+        let m = inputs(40 * GIB, 512 * MIB);
         assert_eq!(assess_with_headroom(&hw, &m, H), FitVerdict::WontFit);
+    }
+
+    #[test]
+    fn offload_shortfall_distinguishes_transient_pressure_from_a_small_host() {
+        // GPU too small for the footprint in both cases, so the offload branch
+        // decides. 8.5 GB model + 512 MiB KV = ~9.05 GB.
+        let m = inputs(8_541_283_552, 512 * MIB);
+        // 2 GB card + 32 GB host that is momentarily starved (1 GB free):
+        // idle capacity = 2 + 25.6 = 27.6 GB → transient.
+        assert_eq!(
+            assess_with_headroom(&profile(true, 2 * GIB, 32 * GIB, GIB), &m, H),
+            FitVerdict::InsufficientFreeMemory
+        );
+        // 2 GB card + a genuinely small 4 GB host: idle capacity = 2 + 3.2 =
+        // 5.2 GB → permanent.
+        assert_eq!(
+            assess_with_headroom(&profile(true, 2 * GIB, 4 * GIB, 3 * GIB), &m, H),
+            FitVerdict::WontFit
+        );
     }
 
     #[test]
@@ -440,7 +566,7 @@ mod tests {
 
     #[test]
     fn unknown_when_ram_unprobed_and_no_gpu() {
-        // macOS-style: RAM probe returns 0 and no CUDA. No honest claim possible.
+        // An unprobed host with no CUDA has no capacity signal. No honest claim possible.
         let hw = profile(false, 0, 0, 0);
         let m = inputs(3_421_898_816, 256 * MIB);
         assert_eq!(assess_with_headroom(&hw, &m, H), FitVerdict::Unknown);
@@ -476,13 +602,30 @@ mod tests {
         assert_eq!(FitVerdict::FitsResident.as_str(), "fits_resident");
         assert_eq!(FitVerdict::FitsWithOffload.as_str(), "fits_with_offload");
         assert_eq!(FitVerdict::CpuOnlyOk.as_str(), "cpu_only_ok");
+        assert_eq!(
+            FitVerdict::InsufficientFreeMemory.as_str(),
+            "insufficient_free_memory"
+        );
         assert_eq!(FitVerdict::WontFit.as_str(), "wont_fit");
         assert_eq!(FitVerdict::Unknown.as_str(), "unknown");
         assert!(FitVerdict::FitsResident.is_positive_fit());
         assert!(FitVerdict::FitsWithOffload.is_positive_fit());
         assert!(FitVerdict::CpuOnlyOk.is_positive_fit());
+        assert!(!FitVerdict::InsufficientFreeMemory.is_positive_fit());
         assert!(!FitVerdict::WontFit.is_positive_fit());
         assert!(!FitVerdict::Unknown.is_positive_fit());
+    }
+
+    #[test]
+    fn only_the_negative_verdicts_refuse_a_load() {
+        // An unprobed host must never be blocked: `Unknown` is the absence of a
+        // claim, not a negative one.
+        assert!(FitVerdict::WontFit.refuses_load());
+        assert!(FitVerdict::InsufficientFreeMemory.refuses_load());
+        assert!(!FitVerdict::Unknown.refuses_load());
+        assert!(!FitVerdict::FitsResident.refuses_load());
+        assert!(!FitVerdict::FitsWithOffload.refuses_load());
+        assert!(!FitVerdict::CpuOnlyOk.refuses_load());
     }
 
     #[test]

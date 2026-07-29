@@ -317,10 +317,16 @@ assert.equal((chatSource.match(/aria-label="Message Camelid"/g) || []).length, 1
 // Row-scoped capability-lane copy stays asserted on the System/API views below.
 const modelLanesSource = readFileSync(new URL('../src/lib/modelLanes.js', import.meta.url), 'utf8')
 const catalogSource = readFileSync(new URL('../src/components/models/CatalogLaneBrowse.jsx', import.meta.url), 'utf8')
+const modelActivationSource = readFileSync(new URL('../src/lib/modelActivation.js', import.meta.url), 'utf8')
 assert.match(modelLanesSource, /isCompatibilitySupportedForModel\(capabilities, matchModel\(entry\)\)/, 'Models lane derivation must ask the shared contract matcher — the supported gate stays the contract voice')
 assert.match(modelsSource, /bucketByLane\(spine\.local\.models, capabilities\)/, 'ModelsView section membership must be derived from the live scan + capabilities at render time')
 assert.doesNotMatch(modelsSource, /SUPPORTED_MODELS/, 'ModelsView must not place models from a hand-authored array')
-assert.match(modelsSource, /api\/models\/inspect[\s\S]*setBlocker\(inspect\.blocker\)[\s\S]*return[\s\S]*api\/models\/load/, 'ModelsView load flow must inspect first and stop on typed blockers before any load attempt')
+/* Inspect-first fail-closed loading now lives in lib/modelActivation.js, shared by
+   the Models page and the first-run activation card; the invariant is unchanged and
+   is asserted where it is defined. Both callers must route through it. */
+assert.match(modelActivationSource, /api\/models\/inspect[\s\S]*blocker[\s\S]*return[\s\S]*api\/models\/load/, 'the shared load flow must inspect first and stop on typed blockers before any load attempt')
+assert.match(modelsSource, /loadLocalModelForChat\(/, 'ModelsView must load through the shared activation protocol')
+assert.doesNotMatch(modelsSource, /api\/models\/load/, 'ModelsView must not hand-roll a second load path')
 assert.doesNotMatch(modelsSource, /runtimeReady\s*=\s*isRunnableModel\(model\)/, 'ModelsView must not label runtime readiness from stale model-only readiness')
 assert.match(catalogSource, /isCompatibilitySupportedForModel\(capabilities, null, item\)/, 'catalog rows must resolve their landing lane through the shared capability matcher')
 assert.match(catalogSource, /if \(item\.group === 'experimental'\) return 'not_anchored'/, 'live Hugging Face rows must never anchor a lane or imply support')

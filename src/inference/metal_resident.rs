@@ -401,28 +401,19 @@ impl super::LlamaInferenceSession {
                 None => return Ok(None),
             };
             if position > 0 {
-                // Seeding reads the CPU KV history [0, position) out of `kv_cache.keys` /
-                // `.values`, so that range must be both addressable AND actually written.
+                // Seeding reads the CPU KV history [0, position) through the
+                // dtype-neutral row accessors, so that range must actually be written.
                 //
-                // Addressability alone is not enough, and the difference is the whole bug this
-                // guard exists for. Those buffers are grown only by `ensure_position_capacity`,
-                // so a session whose positions were all produced by this resident engine
-                // carries a non-zero `position` over empty buffers (and an F16 cache keeps its
-                // entries elsewhere entirely) — a bounds probe catches that and declines. But
-                // ONE CPU fallback mid-sequence grows the buffers for its own position and
-                // leaves every earlier position zero-filled; from then on a bounds probe passes
-                // and this loop would copy a zeroed prompt onto the GPU, so the model attends
-                // over nothing for the rest of the generation. Wrong output, no error.
+                // Capacity alone is not enough: one CPU fallback can grow buffers for its own
+                // position while earlier GPU-produced positions remain zero-filled. Seeding
+                // from that hollow history would silently erase the prompt context.
                 //
-                // `f32_history_materialized` adds the materialized-through watermark, which
-                // distinguishes the two. Reaching it with a hollow history should now be
-                // impossible — `ensure_cpu_kv_materialized` mirrors the GPU history back before
+                // The materialized-through watermark distinguishes the two. Reaching this
+                // point with a hollow history should now be impossible —
+                // `ensure_cpu_kv_materialized` mirrors the GPU history back before
                 // any CPU fallback runs — so this is the backstop, not the fix; declining is
                 // lossless and the caller takes the CPU path.
-                if !self
-                    .kv_cache
-                    .f32_history_materialized(range.end.saturating_sub(1), position)
-                {
+                if !self.kv_cache.history_materialized(position) {
                     return Ok(None);
                 }
                 let kv_dim = n_kv * head_dim;
@@ -431,12 +422,19 @@ impl super::LlamaInferenceSession {
                     let mut cv = vec![0.0f32; kv_dim * position];
                     for p in 0..position {
                         for h in 0..n_kv {
-                            let src = self.kv_cache.offset(range.start + layer, p, h);
                             let dst = (h * position + p) * head_dim;
-                            ck[dst..dst + head_dim]
-                                .copy_from_slice(&self.kv_cache.keys[src..src + head_dim]);
-                            cv[dst..dst + head_dim]
-                                .copy_from_slice(&self.kv_cache.values[src..src + head_dim]);
+                            self.kv_cache.copy_key_row_into(
+                                range.start + layer,
+                                p,
+                                h,
+                                &mut ck[dst..dst + head_dim],
+                            );
+                            self.kv_cache.copy_value_row_into(
+                                range.start + layer,
+                                p,
+                                h,
+                                &mut cv[dst..dst + head_dim],
+                            );
                         }
                     }
                     if !session.seed_layer(layer, &ck, &cv, position) {

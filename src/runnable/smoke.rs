@@ -70,7 +70,11 @@ fn oracle_qualification_gate(arch: &str, tok: TokenizerFamily, quant: &str) -> R
 pub fn oracle_qualified(architecture: &str, quant: &str) -> bool {
     matches!(
         (architecture, quant),
-        ("llama", "Q8_0") | ("qwen3", "Q8_0") | ("gemma3", "Q8_0") | ("phi3", "Q8_0")
+        ("llama", "Q8_0")
+            | ("qwen3", "Q8_0")
+            | ("gemma3", "Q8_0")
+            | ("phi3", "Q8_0")
+            | ("nomic-bert", "Q8_0")
     )
 }
 
@@ -343,6 +347,7 @@ mod tests {
         assert!(is_oracle_qualified("qwen3", TokenizerFamily::Bpe, "Q8_0"));
         assert!(is_oracle_qualified("gemma3", TokenizerFamily::Spm, "Q8_0"));
         assert!(is_oracle_qualified("phi3", TokenizerFamily::Spm, "Q8_0"));
+        assert!(super::oracle_qualified("nomic-bert", "Q8_0"));
         // Not anchored: a covered architecture we have not HF-anchored.
         assert!(!is_oracle_qualified("gemma2", TokenizerFamily::Spm, "Q8_0"));
         // Not anchored: anchored arch but a quant we did not anchor.

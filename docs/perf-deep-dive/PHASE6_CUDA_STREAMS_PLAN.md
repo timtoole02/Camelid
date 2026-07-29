@@ -69,7 +69,7 @@ side_a:            wait ev_ffn ──► up gemv ──rec ev_up
 
 ## 6. Validation (token-identical)
 
-1. Existing device tests: `cargo test --release --all-features` cuda_resident suite (13/13 + ignored device tests run locally). `--release` (debug overflows Win main stack). Clippy `--all-targets --all-features -D warnings` + fmt before push.
+1. Existing device tests: `cargo test --release --all-features` cuda_resident suite (13/13 + ignored device tests run locally). Clippy `--all-targets --all-features -D warnings` + fmt before push.
 2. New `scripts/validate-cuda-streams.sh`, cloned from `scripts/validate-cuda-prefill-row.sh` (the established env-flag A/B pattern): sequential server restarts — **never two engines resident at once** (bench-memory-safety hard rule), free-RAM check (model+3GB) before each leg, kill orphans by PID after each leg. Byte-identical greedy diff, OFF vs ON, on:
    - Llama-3.2-3B Q8_0 GPU-resident (the gate model), low-ctx prompts + the long multi-chunk depth prompt from `scripts/qwen3-cuda-prefill-ab.mjs` (~1881 tok);
    - Qwen3-4B Q8_0 (second arch, QK-norm path exercises k-norm on side_a);

@@ -212,8 +212,8 @@ extern "C" __global__ void rms_norm_quantize(
 
 // ---- Q8_0 GEMV: one warp per output row, __dp4a dot, ordered float sum -------
 // weight_bytes is the repacked SoA layout (see repack_q8_soa): all quants first
-// (rows*blocks_per_row*32 i8, 16-byte aligned), then all scales (rows*blocks_per_row
-// f32). Quants-first means each block's 32 i8 are read as two aligned int4 loads
+// (rows*blocks_per_row*32 i8, 16-byte aligned), then the original f16 scale bits
+// (rows*blocks_per_row u16). Quants-first means each block's 32 i8 are read as two aligned int4 loads
 // instead of eight scalar int loads off a 36-byte stride, which lifts the kernel
 // off ~52% of memory bandwidth. The math is unchanged: the integer block dot
 // (__dp4a) is exact regardless of order, and the per-block float terms are still
@@ -251,8 +251,8 @@ extern "C" __global__ void q8_gemv(
     if (row < rows) {
         long total_blocks = (long)rows * blocks_per_row;
         const signed char* quants = reinterpret_cast<const signed char*>(weight_bytes);
-        const float* scales =
-            reinterpret_cast<const float*>(weight_bytes + total_blocks * 32);
+        const unsigned short* scales =
+            reinterpret_cast<const unsigned short*>(weight_bytes + total_blocks * 32);
         long row_block0 = (long)row * blocks_per_row;
         const int4* siq = reinterpret_cast<const int4*>(s_iq);
         // Process U blocks per lane-iteration: issue all U weight loads FIRST, then do the
@@ -274,7 +274,7 @@ extern "C" __global__ void q8_gemv(
                         reinterpret_cast<const int4*>(quants + (row_block0 + b) * 32);
                     w0[u] = wq[0];
                     w1[u] = wq[1];
-                    ws[u] = scales[row_block0 + b];
+                    ws[u] = f16_bits_to_f32(scales[row_block0 + b]);
                     present |= (1 << u);
                 }
             }
@@ -1505,11 +1505,11 @@ extern "C" __global__ void q8_gemm_batched(
     if (row < rows) {
         long total_blocks = (long)rows * blocks_per_row;
         const signed char* quants = reinterpret_cast<const signed char*>(weight_bytes);
-        const float* scales =
-            reinterpret_cast<const float*>(weight_bytes + total_blocks * 32);
+        const unsigned short* scales =
+            reinterpret_cast<const unsigned short*>(weight_bytes + total_blocks * 32);
         long row_block0 = (long)row * blocks_per_row;
         for (int b = lane; b < blocks_per_row; b += 32) {
-            float w_scale = scales[row_block0 + b];
+            float w_scale = f16_bits_to_f32(scales[row_block0 + b]);
             const int4* wq = reinterpret_cast<const int4*>(quants + (row_block0 + b) * 32);
             int4 w0 = wq[0], w1 = wq[1]; // weight block read once, reused for all K
             for (int t = 0; t < k_tokens; t++) {
@@ -1535,6 +1535,284 @@ extern "C" __global__ void q8_gemm_batched(
         for (int t = 0; t < k_tokens; t++) {
             float acc = 0.0f;
             for (int b = 0; b < blocks_per_row; b++) acc += myterms[t * blocks_per_row + b];
+            output[(long)t * rows + row] = acc;
+        }
+    }
+}
+
+// ---- Batched Q4_K GEMM: K Q8_K inputs against M weight rows ----------------
+// Mirrors q4k_gemv's integer decomposition and ordered f32 tail, but keeps each
+// 144-byte weight super-block in registers while applying it to every token in
+// the chunk. Four full Q8_K activation rows are staged once per thread block:
+// for the 3B FFN contraction this is 32.5 KiB, leaving enough shared memory for
+// three warps' ordered integer partials under the portable 46 KiB budget.
+extern "C" __global__ void q4k_gemm_batched(
+    const float* __restrict__ input_scales,
+    const signed char* __restrict__ input_quants,
+    const unsigned char* __restrict__ weight_bytes,
+    int rows, int n_sb, int k_tokens, float* __restrict__ output
+) {
+    extern __shared__ unsigned char smem4b[];
+    signed char* s_iq = (signed char*)smem4b;
+    float* s_is = (float*)(smem4b + (long)k_tokens * n_sb * 256);
+    int* aux = (int*)(smem4b + (long)k_tokens * n_sb * 260);
+    int tid = threadIdx.x;
+    // Stage each token's activation in the same stride-8 swizzle used by the
+    // resident Q4_K weights, so the hot dot loop stays at two dp4a operations
+    // per aux lane rather than scattered scalar global loads.
+    for (int i = tid; i < k_tokens * n_sb * 256; i += blockDim.x) {
+        int block = i >> 8;
+        int p = i & 255;
+        int group = p >> 5;
+        int pg = p & 31;
+        int l = pg & 7;
+        int kk = pg >> 3;
+        s_iq[(long)block * 256 + group * 32 + l * 4 + kk] = input_quants[i];
+    }
+    for (int i = tid; i < k_tokens * n_sb; i += blockDim.x)
+        s_is[i] = input_scales[i];
+    __syncthreads();
+
+    const unsigned int KMASK1 = 0x3f3f3f3fu;
+    const unsigned int KMASK2 = 0x0f0f0f0fu;
+    const unsigned int KMASK3 = 0x03030303u;
+    const int WIRE = 144;
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    int* myaux = aux + (long)warp * k_tokens * n_sb * 9;
+    long row_sb0 = (long)row * n_sb;
+    int units = n_sb * 4;
+
+    for (int u0 = 0; u0 < units; u0 += 32) {
+        int u = u0 + lane;
+        bool active = (u < units) && (row < rows);
+        int sb = u >> 2;
+        int g = u & 3;
+        int slo = 0, shi = 0, mnlo = 0, mnhi = 0;
+        int qwords[8];
+        #pragma unroll
+        for (int l = 0; l < 8; l++) qwords[l] = 0;
+        if (active) {
+            const unsigned char* blk = weight_bytes + (long)(row_sb0 + sb) * WIRE;
+            uint4 hdr = *reinterpret_cast<const uint4*>(blk);
+            unsigned int u0w = hdr.y;
+            unsigned int u1 = hdr.z;
+            unsigned int u2 = hdr.w;
+            unsigned int u3 = ((u2 >> 4) & KMASK2) | (((u1 >> 6) & KMASK3) << 4);
+            unsigned int uaux = u1 & KMASK1;
+            u1 = (u2 & KMASK2) | (((u0w >> 6) & KMASK3) << 4);
+            u2 = uaux;
+            u0w &= KMASK1;
+            unsigned char sc[8], mn[8];
+            sc[0] = u0w & 0xff; sc[1] = (u0w >> 8) & 0xff;
+            sc[2] = (u0w >> 16) & 0xff; sc[3] = (u0w >> 24) & 0xff;
+            sc[4] = u1 & 0xff; sc[5] = (u1 >> 8) & 0xff;
+            sc[6] = (u1 >> 16) & 0xff; sc[7] = (u1 >> 24) & 0xff;
+            mn[0] = u2 & 0xff; mn[1] = (u2 >> 8) & 0xff;
+            mn[2] = (u2 >> 16) & 0xff; mn[3] = (u2 >> 24) & 0xff;
+            mn[4] = u3 & 0xff; mn[5] = (u3 >> 8) & 0xff;
+            mn[6] = (u3 >> 16) & 0xff; mn[7] = (u3 >> 24) & 0xff;
+            slo = (int)sc[2 * g];
+            shi = (int)sc[2 * g + 1];
+            mnlo = (int)mn[2 * g];
+            mnhi = (int)mn[2 * g + 1];
+            const int* qw = reinterpret_cast<const int*>(blk + 16 + g * 32);
+            #pragma unroll
+            for (int l = 0; l < 8; l++) qwords[l] = qw[l];
+        }
+
+        for (int t = 0; t < k_tokens; t++) {
+            int partial[8];
+            #pragma unroll
+            for (int l = 0; l < 8; l++) partial[l] = 0;
+            int sumi = 0;
+            if (active) {
+                const signed char* y256 =
+                    s_iq + ((long)t * n_sb + sb) * 256;
+                const int* ylo =
+                    reinterpret_cast<const int*>(y256 + (2 * g) * 32);
+                const int* yhi =
+                    reinterpret_cast<const int*>(y256 + (2 * g + 1) * 32);
+                int sum_lo = 0, sum_hi = 0;
+                #pragma unroll
+                for (int l = 0; l < 8; l++) {
+                    int q = qwords[l];
+                    int yl = ylo[l];
+                    int yh = yhi[l];
+                    partial[l] +=
+                        slo * __dp4a(q & 0x0F0F0F0F, yl, 0)
+                        + shi * __dp4a((q >> 4) & 0x0F0F0F0F, yh, 0);
+                    sum_lo = __dp4a(yl, 0x01010101, sum_lo);
+                    sum_hi = __dp4a(yh, 0x01010101, sum_hi);
+                }
+                sumi = mnlo * sum_lo + mnhi * sum_hi;
+            }
+            #pragma unroll
+            for (int off = 2; off >= 1; off >>= 1) {
+                #pragma unroll
+                for (int l = 0; l < 8; l++)
+                    partial[l] += __shfl_down_sync(0xffffffffu, partial[l], off);
+                sumi += __shfl_down_sync(0xffffffffu, sumi, off);
+            }
+            if (active && g == 0) {
+                int* dst = myaux + ((long)t * n_sb + sb) * 9;
+                #pragma unroll
+                for (int l = 0; l < 8; l++) dst[l] = partial[l];
+                dst[8] = sumi;
+            }
+        }
+    }
+    __syncwarp();
+    if (row < rows && lane == 0) {
+        for (int t = 0; t < k_tokens; t++) {
+            float sums[8];
+            #pragma unroll
+            for (int l = 0; l < 8; l++) sums[l] = 0.0f;
+            float sumf = 0.0f;
+            for (int sb = 0; sb < n_sb; sb++) {
+                const unsigned char* blk =
+                    weight_bytes + (long)(row_sb0 + sb) * WIRE;
+                float d = f16_bits_to_f32(
+                    (unsigned short)blk[0] | ((unsigned short)blk[1] << 8));
+                float dmin = f16_bits_to_f32(
+                    (unsigned short)blk[2] | ((unsigned short)blk[3] << 8));
+                float dact = s_is[(long)t * n_sb + sb];
+                float dd = d * dact;
+                int* src = myaux + ((long)t * n_sb + sb) * 9;
+                #pragma unroll
+                for (int l = 0; l < 8; l++) sums[l] += dd * (float)src[l];
+                sumf -= dmin * dact * (float)src[8];
+            }
+            float smain = 0.0f;
+            #pragma unroll
+            for (int l = 0; l < 8; l++) smain += sums[l];
+            output[(long)t * rows + row] = sumf + smain;
+        }
+    }
+}
+
+// ---- Batched Q6_K GEMM: K Q8_K inputs against M weight rows ----------------
+// Same strategy and parity contract as q4k_gemm_batched. Q8_K activations are
+// staged in natural order; the padded 224-byte weight block is loaded once per
+// row/super-block work unit and reused across every token.
+extern "C" __global__ void q6k_gemm_batched(
+    const float* __restrict__ input_scales,
+    const signed char* __restrict__ input_quants,
+    const unsigned char* __restrict__ weight_bytes,
+    int rows, int n_sb, int k_tokens, float* __restrict__ output
+) {
+    extern __shared__ unsigned char smem6b[];
+    signed char* s_iq = (signed char*)smem6b;
+    float* s_is = (float*)(smem6b + (long)k_tokens * n_sb * 256);
+    int* aux = (int*)(smem6b + (long)k_tokens * n_sb * 260);
+    int tid = threadIdx.x;
+    for (int i = tid; i < k_tokens * n_sb * 64; i += blockDim.x)
+        ((int*)s_iq)[i] = ((const int*)input_quants)[i];
+    for (int i = tid; i < k_tokens * n_sb; i += blockDim.x)
+        s_is[i] = input_scales[i];
+    __syncthreads();
+
+    const int WIRE = 224;
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    int* myaux = aux + (long)warp * k_tokens * n_sb * 8;
+    long row_sb0 = (long)row * n_sb;
+    int units = n_sb * 4;
+
+    for (int u0 = 0; u0 < units; u0 += 32) {
+        int u = u0 + lane;
+        bool active = (u < units) && (row < rows);
+        int sb = u >> 2;
+        int quarter = u & 3;
+        int s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+        int base = 0;
+        uint4 qlo = make_uint4(0, 0, 0, 0);
+        uint4 qhi = make_uint4(0, 0, 0, 0);
+        uint4 qhv = make_uint4(0, 0, 0, 0);
+        if (active) {
+            const unsigned char* blk =
+                weight_bytes + (long)(row_sb0 + sb) * WIRE;
+            int h = quarter >> 1;
+            int ss = quarter & 1;
+            int qlb = h * 64;
+            int qhb = 128 + h * 32;
+            int wbase = h * 128;
+            uint4 scv = *reinterpret_cast<const uint4*>(blk + 192);
+            const signed char* sc = (const signed char*)&scv;
+            qlo = *reinterpret_cast<const uint4*>(blk + qlb + ss * 16);
+            qhi = *reinterpret_cast<const uint4*>(blk + qlb + 32 + ss * 16);
+            qhv = *reinterpret_cast<const uint4*>(blk + qhb + ss * 16);
+            base = wbase + ss * 16;
+            int j0 = 8 * h + ss;
+            s0 = (int)sc[j0];
+            s1 = (int)sc[j0 + 2];
+            s2 = (int)sc[j0 + 4];
+            s3 = (int)sc[j0 + 6];
+        }
+        const unsigned char* ql_lo = (const unsigned char*)&qlo;
+        const unsigned char* ql_hi = (const unsigned char*)&qhi;
+        const unsigned char* qh = (const unsigned char*)&qhv;
+
+        for (int t = 0; t < k_tokens; t++) {
+            int partial[8];
+            #pragma unroll
+            for (int l = 0; l < 8; l++) partial[l] = 0;
+            if (active) {
+                const signed char* y256 =
+                    s_iq + ((long)t * n_sb + sb) * 256;
+                #pragma unroll
+                for (int l = 0; l < 16; l++) {
+                    int albyte = (int)ql_lo[l];
+                    int ahbyte = (int)ql_hi[l];
+                    int hbyte = (int)qh[l];
+                    int a0 = ((albyte & 0xF) | ((hbyte & 3) << 4)) - 32;
+                    int a1 = ((ahbyte & 0xF) | (((hbyte >> 2) & 3) << 4)) - 32;
+                    int a2 = ((albyte >> 4) | (((hbyte >> 4) & 3) << 4)) - 32;
+                    int a3 = ((ahbyte >> 4) | (((hbyte >> 6) & 3) << 4)) - 32;
+                    int al = l & 7;
+                    partial[al] += s0 * (int)y256[base + l] * a0;
+                    partial[al] += s1 * (int)y256[base + l + 32] * a1;
+                    partial[al] += s2 * (int)y256[base + l + 64] * a2;
+                    partial[al] += s3 * (int)y256[base + l + 96] * a3;
+                }
+            }
+            #pragma unroll
+            for (int off = 2; off >= 1; off >>= 1) {
+                #pragma unroll
+                for (int l = 0; l < 8; l++)
+                    partial[l] += __shfl_down_sync(0xffffffffu, partial[l], off);
+            }
+            if (active && quarter == 0) {
+                int* dst = myaux + ((long)t * n_sb + sb) * 8;
+                #pragma unroll
+                for (int l = 0; l < 8; l++) dst[l] = partial[l];
+            }
+        }
+    }
+    __syncwarp();
+    if (row < rows && lane == 0) {
+        for (int t = 0; t < k_tokens; t++) {
+            float sums[8];
+            #pragma unroll
+            for (int l = 0; l < 8; l++) sums[l] = 0.0f;
+            for (int sb = 0; sb < n_sb; sb++) {
+                const unsigned char* blk =
+                    weight_bytes + (long)(row_sb0 + sb) * WIRE;
+                unsigned short d_bits = (unsigned short)blk[208]
+                    | ((unsigned short)blk[209] << 8);
+                float d = f16_bits_to_f32(d_bits)
+                    * s_is[(long)t * n_sb + sb];
+                int* src = myaux + ((long)t * n_sb + sb) * 8;
+                #pragma unroll
+                for (int l = 0; l < 8; l++) sums[l] += d * (float)src[l];
+            }
+            float acc = 0.0f;
+            #pragma unroll
+            for (int l = 0; l < 8; l++) acc += sums[l];
             output[(long)t * rows + row] = acc;
         }
     }
@@ -3075,6 +3353,8 @@ pub struct CudaResidentKernels {
     pub(crate) q2k_gemv: CudaFunction,
     pub(crate) q3k_gemv: CudaFunction,
     pub(crate) iq4xs_gemv: CudaFunction,
+    pub(crate) q4k_gemm_batched: CudaFunction,
+    pub(crate) q6k_gemm_batched: CudaFunction,
     pub(crate) quantize_q8k: CudaFunction,
     pub(crate) rms_norm_quantize_q8k: CudaFunction,
     pub(crate) silu_mul_quantize_q8k: CudaFunction,
@@ -3176,6 +3456,8 @@ impl CudaResidentKernels {
             q2k_gemv: f("q2k_gemv")?,
             iq4xs_gemv: f("iq4xs_gemv")?,
             q3k_gemv: f("q3k_gemv")?,
+            q4k_gemm_batched: f("q4k_gemm_batched")?,
+            q6k_gemm_batched: f("q6k_gemm_batched")?,
             quantize_q8k: f("quantize_q8k")?,
             rms_norm_quantize_q8k: f("rms_norm_quantize_q8k")?,
             silu_mul_quantize_q8k: f("silu_mul_quantize_q8k")?,
@@ -3234,17 +3516,9 @@ use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 // ---- Free launch helpers (take explicit refs so callers can pass disjoint
 // fields of the resident state without the `&self` whole-struct borrow). ----
 
-#[allow(clippy::too_many_arguments)]
-/// Repack Q8_0 weight bytes from the on-disk AoS block layout (interleaved
-/// 36-byte blocks: f32 scale + 32 i8) into the GPU SoA layout the resident
-/// `q8_gemv` reads: all quants first (`n_blocks * 32` i8), then all scales
-/// (`n_blocks` f32). Quants-first keeps every block's 32 i8 16-byte aligned so
-/// the kernel can issue `int4` loads. Done once per weight at upload; the values
-/// are unchanged, only their arrangement.
 /// Widen Q8_0 GGUF wire blocks (34 bytes: f16 scale + 32 i8) to the 36-byte layout
-/// (f32 scale + 32 i8) that [`repack_q8_soa`] expects. The runnable lane holds Q8_0
-/// weights as raw 34-byte GGUF blocks; the resident GEMV reads 36-byte (f32-scale)
-/// blocks, so the qwen35 builder widens before repacking.
+/// (f32 scale + 32 i8) used at the existing CPU-facing resident upload seam.
+/// [`repack_q8_soa`] restores the original f16-scale footprint before GPU upload.
 // Used by build_qwen35_resident (model.rs) — dead in a lib-only build until the M4
 // generate_qwen35_cuda driver calls the builder from lib code (next).
 #[allow(dead_code)]
@@ -3261,13 +3535,20 @@ pub(crate) fn widen_q8(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Repack CPU Q8_0 weight bytes (36-byte blocks: f32 scale + 32 i8) into the
+/// compact GPU SoA layout the resident `q8_gemv` reads: all quants first
+/// (`n_blocks * 32` i8), then all scales (`n_blocks` f16 bit patterns).
+/// Quants-first keeps every block's 32 i8 16-byte aligned for `int4` loads;
+/// compact scales restore the GGUF block's 34-byte footprint in VRAM.
 pub(crate) fn repack_q8_soa(bytes: &[u8]) -> Vec<u8> {
     let n = bytes.len() / 36;
-    let mut out = vec![0u8; n * 32 + n * 4];
+    let mut out = vec![0u8; n * 32 + n * 2];
     let (quants, scales) = out.split_at_mut(n * 32);
     for b in 0..n {
         let blk = &bytes[b * 36..b * 36 + 36];
-        scales[b * 4..b * 4 + 4].copy_from_slice(&blk[0..4]);
+        let scale = f32::from_le_bytes(blk[0..4].try_into().expect("four-byte scale"));
+        scales[b * 2..b * 2 + 2]
+            .copy_from_slice(&crate::inference::f32_to_f16_bits(scale).to_le_bytes());
         quants[b * 32..b * 32 + 32].copy_from_slice(&blk[4..36]);
     }
     out
@@ -3862,7 +4143,7 @@ pub(crate) fn launch_nvfp4_gemv(
 
 /// Per-projection GEMV dispatch: picks the kernel + activation buffers + contraction
 /// unit by the projection's quant lane. `cols` is the contraction dimension (input
-/// width); Q8_0 reads `cols/32` 36-byte blocks from `q8_0_*`, the K-quant lanes read
+/// width); Q8_0 reads `cols/32` compact 34-byte blocks from `q8_0_*`, the K-quant lanes read
 /// `cols/256` super-blocks from `q8k_*`. `residual != 0` fuses the post-projection
 /// residual add into the GEMV (only valid when `out` is the residual/hidden buffer).
 #[allow(clippy::too_many_arguments)]
@@ -3973,6 +4254,99 @@ fn dispatch_gemv(
             residual,
         ),
     }
+}
+
+/// Per-projection batched GEMM dispatch. The activation buffers are token-major:
+/// Q8_0 uses 32-value blocks, while Q4_K/Q6_K consume Q8_K super-blocks.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_gemm_batched(
+    s: &Arc<CudaStream>,
+    kern: &CudaResidentKernels,
+    lane: ProjQuant,
+    q8_0_scales: &CudaSlice<f32>,
+    q8_0_quants: &CudaSlice<i8>,
+    q8k_scales: &CudaSlice<f32>,
+    q8k_quants: &CudaSlice<i8>,
+    weight: &CudaSlice<u8>,
+    rows: usize,
+    cols: usize,
+    k_tokens: usize,
+    out: &mut CudaSlice<f32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    match lane {
+        ProjQuant::Q8_0 => launch_gemm_batched(
+            s,
+            &kern.gemm_batched,
+            q8_0_scales,
+            q8_0_quants,
+            weight,
+            rows,
+            cols / 32,
+            k_tokens,
+            out,
+        ),
+        ProjQuant::Q4K => launch_kquant_gemm_batched(
+            s,
+            &kern.q4k_gemm_batched,
+            q8k_scales,
+            q8k_quants,
+            weight,
+            rows,
+            cols / 256,
+            k_tokens,
+            9,
+            out,
+        ),
+        ProjQuant::Q6K => launch_kquant_gemm_batched(
+            s,
+            &kern.q6k_gemm_batched,
+            q8k_scales,
+            q8k_quants,
+            weight,
+            rows,
+            cols / 256,
+            k_tokens,
+            8,
+            out,
+        ),
+        _ => unreachable!("unsupported batched projection lane: {lane:?}"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn quantize_batched_for_lanes(
+    s: &Arc<CudaStream>,
+    kern: &CudaResidentKernels,
+    x: &CudaSlice<f32>,
+    q8_0_quants: &mut CudaSlice<i8>,
+    q8_0_scales: &mut CudaSlice<f32>,
+    q8k_quants: &mut CudaSlice<i8>,
+    q8k_scales: &mut CudaSlice<f32>,
+    cols: usize,
+    k_tokens: usize,
+    lanes: &[ProjQuant],
+) -> Result<(), cudarc::driver::DriverError> {
+    if lanes.contains(&ProjQuant::Q8_0) {
+        launch_quantize(
+            s,
+            &kern.quantize,
+            x,
+            q8_0_quants,
+            q8_0_scales,
+            k_tokens * (cols / 32),
+        )?;
+    }
+    if lanes.iter().any(|q| q.needs_q8k()) {
+        launch_quantize_q8k(
+            s,
+            &kern.quantize_q8k,
+            x,
+            q8k_quants,
+            q8k_scales,
+            k_tokens * (cols / 256),
+        )?;
+    }
+    Ok(())
 }
 
 /// Standalone Q8_K activation quantize: f32 row `[n_sb*256]` -> `n_sb` Q8_K blocks
@@ -4109,6 +4483,47 @@ pub(crate) fn launch_gemm_batched(
         .arg(weight)
         .arg(&r)
         .arg(&bpr)
+        .arg(&kt)
+        .arg(out);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Batched Q4_K/Q6_K GEMM. Each warp owns one output row and keeps the
+/// per-(token,super-block) integer partials in shared memory so lane 0 can
+/// reproduce the corresponding GEMV's ordered f32 accumulation exactly.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_kquant_gemm_batched(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    in_scales: &CudaSlice<f32>,
+    in_quants: &CudaSlice<i8>,
+    weight: &CudaSlice<u8>,
+    rows: usize,
+    n_sb: usize,
+    k_tokens: usize,
+    aux_lanes: usize,
+    out: &mut CudaSlice<f32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    const SHARED_BUDGET: u32 = 46 * 1024;
+    let input_bytes = (k_tokens as u32) * (n_sb as u32) * 260;
+    let per_warp_bytes = (k_tokens as u32) * (n_sb as u32) * (aux_lanes as u32) * 4;
+    assert!(
+        input_bytes + per_warp_bytes <= SHARED_BUDGET,
+        "K-quant batch does not fit the shared-memory budget"
+    );
+    let warps_per_block = ((SHARED_BUDGET - input_bytes) / per_warp_bytes.max(1)).clamp(1, 8);
+    let cfg = LaunchConfig {
+        grid_dim: ((rows as u32).div_ceil(warps_per_block), 1, 1),
+        block_dim: (warps_per_block * 32, 1, 1),
+        shared_mem_bytes: input_bytes + warps_per_block * per_warp_bytes,
+    };
+    let (r, ns, kt) = (rows as i32, n_sb as i32, k_tokens as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(in_scales)
+        .arg(in_quants)
+        .arg(weight)
+        .arg(&r)
+        .arg(&ns)
         .arg(&kt)
         .arg(out);
     unsafe { b.launch(cfg) }.map(|_| ())
@@ -5290,6 +5705,13 @@ impl ProjQuant {
         )
     }
 
+    /// Whether this lane has a resident K-token GEMM. Other K-quant families
+    /// retain the proven serial prefill path until they receive parity-checked
+    /// batched kernels of their own.
+    fn supports_batched(self) -> bool {
+        matches!(self, ProjQuant::Q8_0 | ProjQuant::Q4K | ProjQuant::Q6K)
+    }
+
     /// Whether a device-side `embed_gather_*` kernel exists for this family. The
     /// qwen35 device-decode loop gathers the embedding row on the GPU, so a family
     /// without a gather kernel (Q5_K / Q2_K / IQ4_XS) must NOT be installed for
@@ -5422,10 +5844,6 @@ pub struct CudaResidentDecode {
     output_weight: CudaSlice<u8>,
     /// Quant lane of the output (lm_head) projection. Q6_K for Q4_K_M models.
     output_quant: ProjQuant,
-    /// True if any projection in the model is a K-quant lane (Q4K/Q6K). Lets the
-    /// caller force the serial (per-token `forward_pass`) prefill, which dispatches
-    /// K-quant kernels — the batched prefill GEMM is Q8-only.
-    uses_kquant: bool,
     // KV cache stored as f16 bits (u16) — half the VRAM of f32, bit-identical because the
     // stored values are f16-rounded either way (see the kv_scatter / attention kernels).
     cache_k: Vec<CudaSlice<u16>>,
@@ -5536,6 +5954,8 @@ struct VerifyScratch {
     vn: CudaSlice<f32>,
     viq: CudaSlice<i8>,
     vis: CudaSlice<f32>,
+    viqk: CudaSlice<i8>,
+    visk: CudaSlice<f32>,
     vq: CudaSlice<f32>,
     vk: CudaSlice<f32>,
     vv: CudaSlice<f32>,
@@ -5699,7 +6119,6 @@ impl CudaResidentDecode {
             final_norm: alloc_f(hidden)?,
             output_weight: s.alloc_zeros::<u8>(1).map_err(|e| format!("alloc: {e}"))?,
             output_quant: ProjQuant::Q8_0,
-            uses_kquant: false,
             cache_k,
             cache_v,
             filled: 0,
@@ -5768,7 +6187,7 @@ impl CudaResidentDecode {
         })
     }
 
-    /// Upload one layer's resident weights (Q8_0 36-byte block bytes) + norms.
+    /// Upload one layer's weights (CPU Q8_0 36-byte blocks, compacted on upload) + norms.
     #[allow(clippy::too_many_arguments)]
     pub fn set_layer(
         &mut self,
@@ -5821,9 +6240,6 @@ impl CudaResidentDecode {
         resident: bool,
         quants: LayerQuants,
     ) -> Result<(), String> {
-        if quants.iter().any(|q| q.needs_q8k()) {
-            self.uses_kquant = true;
-        }
         let ctx = &self.k.ctx;
         let s = &self.k.stream;
         let up_f = |b: &[f32]| s.clone_htod(b).map_err(|e| format!("htod: {e}"));
@@ -6024,9 +6440,6 @@ impl CudaResidentDecode {
             .clone_htod(&repack_for_lane(output_weight, output_quant))
             .map_err(|e| format!("htod: {e}"))?;
         self.output_quant = output_quant;
-        if output_quant.needs_q8k() {
-            self.uses_kquant = true;
-        }
         Ok(())
     }
 
@@ -6127,8 +6540,9 @@ impl CudaResidentDecode {
     }
 
     /// Upload one qwen35 gated-delta-net (SSM) layer plus its persistent conv ring and
-    /// recurrent state. Q8_0 weight bytes must already be the 36-byte (f32-scale)
-    /// layout (`widen_q8`); K-quant bytes are raw GGUF super-blocks. `quants` order is
+    /// recurrent state. Q8_0 source bytes use the 36-byte CPU layout (`widen_q8`)
+    /// and are compacted back to f16-scale SoA at upload; K-quant bytes are raw
+    /// GGUF super-blocks. `quants` order is
     /// wqkv, wqkv_gate, beta, alpha, ssm_out; `ffn_quants` is gate, up, down.
     #[allow(clippy::too_many_arguments)]
     pub fn set_layer_ssm_qwen35(
@@ -6191,9 +6605,6 @@ impl CudaResidentDecode {
             ffn_quants[1],
             ffn_quants[2],
         ];
-        if quants.iter().any(|q| q.needs_q8k()) {
-            self.uses_kquant = true;
-        }
         self.layers.push(ResidentLayer {
             q: ph()?,
             k: ph()?,
@@ -6221,11 +6632,98 @@ impl CudaResidentDecode {
         Ok(())
     }
 
-    /// Whether this engine has any K-quant (Q4_K/Q6_K) projection. The caller forces
-    /// the serial per-token prefill for such models (the batched prefill GEMM is
-    /// Q8-only).
-    pub fn uses_kquant(&self) -> bool {
-        self.uses_kquant
+    fn supports_batched_layer_stack(&self) -> bool {
+        !self.is_offloaded()
+            && self.layers.iter().all(|layer| {
+                matches!(&layer.kind, LayerKind::Full)
+                    && layer.quants.iter().all(|q| q.supports_batched())
+            })
+    }
+
+    fn batched_layer_token_cap(&self) -> usize {
+        let has_kquant = self
+            .layers
+            .iter()
+            .any(|layer| layer.quants.iter().any(|q| *q != ProjQuant::Q8_0));
+        if !has_kquant {
+            return MAX_VERIFY_K;
+        }
+        // Two tokens leave enough of the portable 46 KiB shared-memory
+        // budget for eight warps on the 8192-wide 3B FFN. Four-token tiles
+        // remain available for same-binary diagnostics where the dimensions
+        // fit; larger models are clamped down instead of panicking at launch.
+        let requested = std::env::var("CAMELID_CUDA_KQUANT_BATCH_TOKENS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2)
+            .clamp(1, 4);
+        let max_cols = self.hidden.max(self.q_width).max(self.ffn_dim);
+        let n_sb = max_cols / 256;
+        let aux_lanes = if self
+            .layers
+            .iter()
+            .any(|layer| layer.quants.contains(&ProjQuant::Q4K))
+        {
+            9
+        } else {
+            8
+        };
+        (1..=requested)
+            .rev()
+            .find(|&k| k * n_sb * (260 + aux_lanes * 4) <= 46 * 1024)
+            .unwrap_or(1)
+    }
+
+    fn batched_verify_token_cap(&self) -> usize {
+        let layer_cap = self.batched_layer_token_cap();
+        if self.output_quant == ProjQuant::Q8_0 {
+            return layer_cap;
+        }
+        let aux_lanes = if self.output_quant == ProjQuant::Q4K {
+            9
+        } else {
+            8
+        };
+        let n_sb = self.hidden / 256;
+        let output_cap = (1..=4)
+            .rev()
+            .find(|&k| k * n_sb * (260 + aux_lanes * 4) <= 46 * 1024)
+            .unwrap_or(1);
+        layer_cap.min(output_cap)
+    }
+
+    /// Whether prompt prefill can use the resident K-token layer stack. Q8_0,
+    /// Q4_K, and Q6_K projections are supported; offloaded, SSM, and other
+    /// quant families safely retain serial prefill.
+    pub fn supports_batched_prefill(&self) -> bool {
+        self.supports_batched_layer_stack()
+    }
+
+    /// Default policy after same-host Windows/WDDM benchmarking. Q8_0 batching
+    /// remains a clear win; the parity-correct Q4_K/Q6_K tiles stay opt-in until
+    /// a device shows a sustained gain over the mature serial GEMVs.
+    pub fn prefers_batched_prefill(&self) -> bool {
+        self.supports_batched_layer_stack()
+            && self
+                .layers
+                .iter()
+                .all(|layer| layer.quants.iter().all(|q| *q == ProjQuant::Q8_0))
+    }
+
+    /// Whether linear speculative verification can use the batched stack,
+    /// including its final vocabulary projection.
+    pub fn supports_batched_verify(&self) -> bool {
+        self.supports_batched_layer_stack() && self.output_quant.supports_batched()
+    }
+
+    /// Tree verification still uses the legacy Q8-only layer stack.
+    pub fn supports_tree_verify(&self) -> bool {
+        !self.is_offloaded()
+            && self.output_quant == ProjQuant::Q8_0
+            && self.layers.iter().all(|layer| {
+                matches!(&layer.kind, LayerKind::Full)
+                    && layer.quants.iter().all(|q| *q == ProjQuant::Q8_0)
+            })
     }
 
     /// Diagnostic: time `iters` back-to-back host->device transfers of the largest
@@ -7818,8 +8316,8 @@ impl CudaResidentDecode {
     /// Speculative-verify forward: run `k` tokens at consecutive positions
     /// `[base_position, base_position+k)` through the whole model in one batched
     /// pass and return the greedy argmax at each position. Each weight is read
-    /// once and reused across the `k` tokens (via `q8_gemm_batched`), so this is
-    /// much cheaper than `k` separate `forward_token` calls. The K tokens' K/V are
+    /// once and reused across the `k` tokens (via the quant lane's batched GEMM),
+    /// so this is much cheaper than `k` separate `forward_token` calls. The K tokens' K/V are
     /// written to the cache at their positions; the caller decides how many to
     /// keep (accepted prefix) and rewinds `filled`/position accordingly. One sync.
     /// `embeddings` is `k*hidden`; `cos_all`/`sin_all` are per-token RoPE tables
@@ -7837,13 +8335,21 @@ impl CudaResidentDecode {
         if k == 0 || k > MAX_VERIFY_K {
             return Err(format!("verify_batch: k={k} out of 1..={MAX_VERIFY_K}"));
         }
+        if !self.supports_batched_verify() {
+            return Err("verify_batch: model has no resident batched projection path".into());
+        }
+        if k > self.batched_verify_token_cap() {
+            return Err(format!(
+                "verify_batch: k={k} exceeds this quant lane's shared-memory cap of {}",
+                self.batched_verify_token_cap()
+            ));
+        }
         let map = |e: cudarc::driver::DriverError| format!("cuda verify: {e}");
         // The per-layer batched stack lives in `run_batched_layer_stack` (shared with
         // batched prefill); here we only need the dims for input staging and the final
         // logits projection.
         let (hidden, vocab, eps) = (self.hidden, self.vocab, self.eps);
         let half = self.rope_dim / 2;
-        let hb = hidden / 32;
         if embeddings.len() < k * hidden || cos_all.len() < k * half || sin_all.len() < k * half {
             return Err("verify_batch: input slices too short".into());
         }
@@ -7873,23 +8379,30 @@ impl CudaResidentDecode {
             k,
         )
         .map_err(map)?;
-        launch_quantize(
+        quantize_batched_for_lanes(
             &s,
-            &self.k.quantize,
+            &self.k,
             &sc.vn,
             &mut sc.viq,
             &mut sc.vis,
-            k * hb,
+            &mut sc.viqk,
+            &mut sc.visk,
+            hidden,
+            k,
+            std::slice::from_ref(&self.output_quant),
         )
         .map_err(map)?;
-        launch_gemm_batched(
+        dispatch_gemm_batched(
             &s,
-            &self.k.gemm_batched,
+            &self.k,
+            self.output_quant,
             &sc.vis,
             &sc.viq,
+            &sc.visk,
+            &sc.viqk,
             &self.output_weight,
             vocab,
-            hb,
+            hidden,
             k,
             &mut sc.vlogits,
         )
@@ -7948,6 +8461,10 @@ impl CudaResidentDecode {
                 .alloc_zeros::<i8>(mk * max_in)
                 .map_err(|e| format!("verify alloc: {e}"))?,
             vis: af(mk * (max_in / 32))?,
+            viqk: st
+                .alloc_zeros::<i8>(mk * max_in)
+                .map_err(|e| format!("verify alloc: {e}"))?,
+            visk: af(mk * max_in.div_ceil(256))?,
             vq: af(mk * q_width)?,
             vk: af(mk * kv_width)?,
             vv: af(mk * kv_width)?,
@@ -7973,9 +8490,9 @@ impl CudaResidentDecode {
     ///
     /// This is the single source of truth for the batched forward, shared by
     /// `verify_batch` (speculative decode) and `prefill_batched`. It is bit-identical
-    /// to the serial `forward_pass` per token: `q8_gemm_batched` reproduces the same
-    /// per-block integer dot and block-ordered fp32 sum as the decode `q8_gemv`, and
-    /// the batched norm/RoPE/scatter/attention kernels match their serial counterparts.
+    /// to the serial `forward_pass` per token: each supported batched projection
+    /// reproduces its decode GEMV's integer decomposition and ordered fp32 sum, and the
+    /// batched norm/RoPE/scatter/attention kernels match their serial counterparts.
     /// All K/V of the current chunk are scattered before attention reads them, so a
     /// token attends to every earlier position (prior chunks + earlier tokens in this
     /// chunk) exactly as sequential decoding would.
@@ -8003,9 +8520,9 @@ impl CudaResidentDecode {
             self.max_pos,
             self.eps,
         );
-        let (hb, qb, fb) = (hidden / 32, q_width / 32, ffn_dim / 32);
         for li in 0..self.n_layers {
             let layer = &self.layers[li];
+            let lq = layer.quants;
             launch_rms_norm_batched(
                 &s,
                 &self.k.rms_norm_batched,
@@ -8017,49 +8534,32 @@ impl CudaResidentDecode {
                 k,
             )
             .map_err(map)?;
-            launch_quantize(
+            quantize_batched_for_lanes(
                 &s,
-                &self.k.quantize,
+                &self.k,
                 &sc.vn,
                 &mut sc.viq,
                 &mut sc.vis,
-                k * hb,
+                &mut sc.viqk,
+                &mut sc.visk,
+                hidden,
+                k,
+                &lq[..3],
             )
             .map_err(map)?;
-            launch_gemm_batched(
-                &s,
-                &self.k.gemm_batched,
-                &sc.vis,
-                &sc.viq,
-                &layer.q,
-                q_width,
-                hb,
-                k,
-                &mut sc.vq,
+            dispatch_gemm_batched(
+                &s, &self.k, lq[0], &sc.vis, &sc.viq, &sc.visk, &sc.viqk, &layer.q, q_width,
+                hidden, k, &mut sc.vq,
             )
             .map_err(map)?;
-            launch_gemm_batched(
-                &s,
-                &self.k.gemm_batched,
-                &sc.vis,
-                &sc.viq,
-                &layer.k,
-                kv_width,
-                hb,
-                k,
-                &mut sc.vk,
+            dispatch_gemm_batched(
+                &s, &self.k, lq[1], &sc.vis, &sc.viq, &sc.visk, &sc.viqk, &layer.k, kv_width,
+                hidden, k, &mut sc.vk,
             )
             .map_err(map)?;
-            launch_gemm_batched(
-                &s,
-                &self.k.gemm_batched,
-                &sc.vis,
-                &sc.viq,
-                &layer.v,
-                kv_width,
-                hb,
-                k,
-                &mut sc.vv,
+            dispatch_gemm_batched(
+                &s, &self.k, lq[2], &sc.vis, &sc.viq, &sc.visk, &sc.viqk, &layer.v, kv_width,
+                hidden, k, &mut sc.vv,
             )
             .map_err(map)?;
             // Qwen3 QK-norm (batched): per-head RMSNorm on Q and K
@@ -8190,23 +8690,30 @@ impl CudaResidentDecode {
                 )
                 .map_err(map)?;
             }
-            launch_quantize(
+            quantize_batched_for_lanes(
                 &s,
-                &self.k.quantize,
+                &self.k,
                 &sc.vattn,
                 &mut sc.viq,
                 &mut sc.vis,
-                k * qb,
+                &mut sc.viqk,
+                &mut sc.visk,
+                q_width,
+                k,
+                &lq[3..4],
             )
             .map_err(map)?;
-            launch_gemm_batched(
+            dispatch_gemm_batched(
                 &s,
-                &self.k.gemm_batched,
+                &self.k,
+                lq[3],
                 &sc.vis,
                 &sc.viq,
+                &sc.visk,
+                &sc.viqk,
                 &layer.o,
                 hidden,
-                qb,
+                q_width,
                 k,
                 &mut sc.vproj,
             )
@@ -8224,35 +8731,45 @@ impl CudaResidentDecode {
                 k,
             )
             .map_err(map)?;
-            launch_quantize(
+            quantize_batched_for_lanes(
                 &s,
-                &self.k.quantize,
+                &self.k,
                 &sc.vn,
                 &mut sc.viq,
                 &mut sc.vis,
-                k * hb,
+                &mut sc.viqk,
+                &mut sc.visk,
+                hidden,
+                k,
+                &lq[4..6],
             )
             .map_err(map)?;
-            launch_gemm_batched(
+            dispatch_gemm_batched(
                 &s,
-                &self.k.gemm_batched,
+                &self.k,
+                lq[4],
                 &sc.vis,
                 &sc.viq,
+                &sc.visk,
+                &sc.viqk,
                 &layer.gate,
                 ffn_dim,
-                hb,
+                hidden,
                 k,
                 &mut sc.vgate,
             )
             .map_err(map)?;
-            launch_gemm_batched(
+            dispatch_gemm_batched(
                 &s,
-                &self.k.gemm_batched,
+                &self.k,
+                lq[5],
                 &sc.vis,
                 &sc.viq,
+                &sc.visk,
+                &sc.viqk,
                 &layer.up,
                 ffn_dim,
-                hb,
+                hidden,
                 k,
                 &mut sc.vup,
             )
@@ -8266,23 +8783,30 @@ impl CudaResidentDecode {
                 k * ffn_dim,
             )
             .map_err(map)?;
-            launch_quantize(
+            quantize_batched_for_lanes(
                 &s,
-                &self.k.quantize,
+                &self.k,
                 &sc.vact,
                 &mut sc.viq,
                 &mut sc.vis,
-                k * fb,
+                &mut sc.viqk,
+                &mut sc.visk,
+                ffn_dim,
+                k,
+                &lq[6..7],
             )
             .map_err(map)?;
-            launch_gemm_batched(
+            dispatch_gemm_batched(
                 &s,
-                &self.k.gemm_batched,
+                &self.k,
+                lq[6],
                 &sc.vis,
                 &sc.viq,
+                &sc.visk,
+                &sc.viqk,
                 &layer.down,
                 hidden,
-                fb,
+                ffn_dim,
                 k,
                 &mut sc.vproj,
             )
@@ -8646,6 +9170,9 @@ impl CudaResidentDecode {
         if n == 0 || n > cap {
             return Err(format!("verify_tree: n={n} out of 1..={cap}"));
         }
+        if !self.supports_tree_verify() {
+            return Err("verify_tree: model is not eligible for the Q8-only tree path".into());
+        }
         if node_kvslot.len() < n || ancestor_bits.len() < n * words {
             return Err("verify_tree: index slices too short".into());
         }
@@ -8793,8 +9320,8 @@ impl CudaResidentDecode {
     }
 
     /// Batched GPU prefill: ingest `n` prompt tokens at positions `[0, n)` through the
-    /// batched layer stack in chunks of `MAX_VERIFY_K`, reading each weight once per
-    /// chunk instead of once per prompt token. The serial `prefill` re-streams every
+    /// batched layer stack in quant-aware chunks, reading each weight once per chunk
+    /// instead of once per prompt token. The serial `prefill` re-streams every
     /// weight from VRAM once per token (a memory-bound, device-under-filling GEMV per
     /// token); batching turns each weight read into a GEMM amortized over the chunk's
     /// tokens. Writes the KV cache identically to the serial path (same per-block dot
@@ -8814,7 +9341,7 @@ impl CudaResidentDecode {
         // (e.g. 8B on a 6 GiB card) it would read placeholder bytes. Fall back to the
         // serial prefill, which streams offloaded weights correctly. Batching is a
         // resident-only fast path.
-        if self.is_offloaded() {
+        if !self.supports_batched_prefill() {
             return self.prefill(embeddings, cos_all, sin_all, n, scale);
         }
         let map = |e: cudarc::driver::DriverError| format!("cuda prefill: {e}");
@@ -8827,8 +9354,9 @@ impl CudaResidentDecode {
         let s = self.k.stream.clone();
         let mut sc = self.verify_scratch.take().expect("allocated above");
         let mut base = 0usize;
+        let batch_cap = self.batched_layer_token_cap();
         while base < n {
-            let kk = (n - base).min(MAX_VERIFY_K);
+            let kk = (n - base).min(batch_cap);
             // Stage this chunk's embeddings + RoPE tables into the shared scratch at
             // offset 0; the layer stack reads [0, kk) and scatters K/V at [base, base+kk).
             s.memcpy_htod(

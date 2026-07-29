@@ -1,9 +1,11 @@
-import { lazy, Suspense, useEffect, useMemo, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react'
 import SidebarRail from './components/layout/SidebarRail'
 import TopBar from './components/TopBar'
-import { BackendBanner } from './components/layout/BackendBanner'
+import { BackendBanner, ENGINE_PATH_STORAGE_KEY, ENGINE_ADDR_STORAGE_KEY } from './components/layout/BackendBanner'
+import { FirstRunCard } from './components/onboarding/FirstRunCard'
 import { Notice } from './components/ui/Notice'
 import { ConfirmDialog } from './components/ui/ConfirmDialog'
+import { isFirstRunHost } from './lib/firstRunActivation'
 import { formatPreview, formatSidebarDate } from './lib/formatters'
 import { useDashboardData } from './hooks/useDashboardData'
 import { useBackendLauncher } from './hooks/useBackendLauncher'
@@ -21,6 +23,7 @@ const AnalyticsView = lazy(() => import('./views/AnalyticsView'))
 const HistoryView = lazy(() => import('./views/HistoryView'))
 const MemoryView = lazy(() => import('./views/MemoryView'))
 const ModelsView = lazy(() => import('./views/ModelsView'))
+const DownloadedModelsView = lazy(() => import('./views/DownloadedModelsView'))
 const ApiView = lazy(() => import('./views/ApiView'))
 const SystemView = lazy(() => import('./views/SystemView'))
 const SettingsView = lazy(() => import('./views/SettingsView'))
@@ -32,7 +35,7 @@ const WorkspaceView = lazy(() => import('./views/WorkspaceView'))
 const CodeWorkspace = lazy(() => import('./views/CodeWorkspace'))
 
 const DEMO_UI = import.meta.env?.VITE_CAMELID_DEMO_UI === 'true'
-const HASH_TABS = new Set(['chat', 'code', 'workspace', 'library', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory', 'compatibility', 'telemetry'])
+const HASH_TABS = new Set(['chat', 'code', 'workspace', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory', 'compatibility', 'telemetry'])
 
 function App() {
   const { notice, noticeTone, showNotice, clearNotice } = useNotice()
@@ -59,6 +62,7 @@ function App() {
   const [codeThreads, setCodeThreads] = useState([])
   const [requestedCodeThread, setRequestedCodeThread] = useState(null)
   const [codeWorkspaceKey, setCodeWorkspaceKey] = useState(0)
+  const [firstRunCardActive, setFirstRunCardActive] = useState(false)
 
   useEffect(() => {
     if (typeof window === 'undefined' || !window.matchMedia) return undefined
@@ -135,6 +139,19 @@ function App() {
   useEffect(() => {
     if (apiBase) ensureInferenceTelemetryConnected(apiBase)
   }, [apiBase])
+
+  /* Remember where the engine lives while it is still answering. Once it stops,
+     the offline banner needs this to offer a command that actually runs, and by
+     then there is nobody left to ask. Loopback servers only — a remote engine
+     reports no path, so nothing is stored and the banner stays generic. */
+  useEffect(() => {
+    const executable = runtime?.executable
+    if (!executable || typeof window === 'undefined') return
+    try {
+      window.localStorage.setItem(ENGINE_PATH_STORAGE_KEY, executable)
+      if (runtime?.listen_addr) window.localStorage.setItem(ENGINE_ADDR_STORAGE_KEY, runtime.listen_addr)
+    } catch { /* private mode */ }
+  }, [runtime?.executable, runtime?.listen_addr])
 
   /* Evidence Chips anywhere in the app deep-link to their ledger row through
      this event — no prop drilling through every chip call site. */
@@ -232,6 +249,20 @@ function App() {
     setDeleteBusy(false)
   }
 
+  /* First-run activation. Mounted here rather than inside the chat view so an
+     in-flight download keeps its watcher when the user navigates away, and kept
+     mounted while the card still owns the flow: the moment the file lands the host
+     stops looking like a fresh install, so `firstRun` alone would drop the card on
+     the next refresh -- abandoning the load, or deleting a failure's Retry button
+     while the downloaded artifact sits there unused. */
+  const firstRun = isFirstRunHost({ runtime, models })
+  const firstRunActive = firstRun || firstRunCardActive
+  const handleFirstRunActivated = useCallback(async () => {
+    await loadDashboard({ silent: true })
+    navigateTab('chat')
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loadDashboard])
+
   if (!dashboard) {
     return (
       <div className="loading-shell">
@@ -301,10 +332,25 @@ function App() {
         )}
 
         {!DEMO_UI && runtime?.status === 'offline' && tab !== 'settings' && (
-          <BackendBanner backend={backend} onOpenSettings={() => navigateTab('settings')} />
+          <BackendBanner backend={backend} apiBase={apiBase} onOpenSettings={() => navigateTab('settings')} />
         )}
 
-        <div className={`camelid-view ${(tab === 'chat' || tab === 'code' || tab === 'workspace' || tab === 'cluster' || tab === 'observatory') ? 'camelid-view--chat' : 'camelid-view--page'}`}>
+        {!DEMO_UI && firstRunActive && (
+          <div className="camelid-firstrun-slot" hidden={tab !== 'chat'}>
+            <FirstRunCard
+              apiBase={apiBase}
+              capabilities={dashboard?.capabilities}
+              onActivated={handleFirstRunActivated}
+              onActiveChange={setFirstRunCardActive}
+              onOpenModels={() => navigateTab('library')}
+            />
+          </div>
+        )}
+
+        {/* --chat is the full-bleed frame for views that own their own edges and
+           manage their own height (chat, code, workspace, cluster canvas). Every
+           other view is a .cxv page and needs the padded page frame. */}
+        <div className={`camelid-view ${(tab === 'chat' || tab === 'code' || tab === 'workspace' || tab === 'cluster') ? 'camelid-view--chat' : 'camelid-view--page'}`}>
           <Suspense fallback={<div className="view-loading" role="status" aria-label="Loading view">Loading view…</div>}>
           {tab === 'chat' && (
             <ChatWorkspace
@@ -335,6 +381,7 @@ function App() {
               selectedModelExperimental={selectedModelExperimental}
               setTab={navigateTab}
               showNewChatLanding={startNewChat}
+              firstRunActive={firstRunActive}
               demoMode={DEMO_UI}
             />
           )}
@@ -407,6 +454,15 @@ function App() {
                 apiBase={apiBase}
               />
             </div>
+          )}
+
+          {tab === 'downloads' && (
+            <DownloadedModelsView
+              runtime={runtime}
+              apiBase={apiBase}
+              unloadCurrentModel={unloadCurrentModel}
+              onOpenModels={() => navigateTab('library')}
+            />
           )}
 
           {tab === 'api' && <ApiView runtime={runtime} selectedModel={selectedModel} capabilities={dashboard?.capabilities} />}

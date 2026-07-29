@@ -1,0 +1,122 @@
+{
+ "schema": "camelid.phi3.nondeterminism.v1",
+ "supersedes": "generation-divergence-q8-20260727.json (its prefill-vs-decode reading was WRONG \u2014 see corrects_prior_finding)",
+ "artifact": "Phi-3-mini-4k-instruct-Q8_0.gguf",
+ "comparator": "llama.cpp 9632 (acd79d603) CPU (llama-server, -ngl 0 -ctk f32 -ctv f32 -fa off --no-repack)",
+ "camelid_execution_plan": {
+  "selected_backend": "cpu_reference",
+  "decode_path": "safe_cpu_decode"
+ },
+ "finding": "camelid is NON-DETERMINISTIC on phi3 at temperature 0: identical requests return different logits, and the argmax flips between the reference token 32001 (<|assistant|>) and 13 (newline).",
+ "prefix_token_ids": [
+  1,
+  450,
+  7483,
+  310,
+  3444,
+  338,
+  3681,
+  29889,
+  13
+ ],
+ "prefix_text": "The capital of France is Paris.\n",
+ "reference_next_token": {
+  "id": 32001,
+  "token": "<|assistant|>",
+  "logprob": -0.009130490012466908
+ },
+ "identical_requests": [
+  {
+   "run": 0,
+   "generated_token_ids": [
+    13
+   ],
+   "top_logprobs": {
+    "\n": -0.18846,
+    "<|assistant|>": -2.00594,
+    "B": -3.98493
+   }
+  },
+  {
+   "run": 1,
+   "generated_token_ids": [
+    32001
+   ],
+   "top_logprobs": {
+    "<|assistant|>": -0.00597,
+    "*)": -6.22334,
+    "===": -6.4234
+   }
+  },
+  {
+   "run": 2,
+   "generated_token_ids": [
+    13
+   ],
+   "top_logprobs": {
+    "\n": -0.29317,
+    "===": -2.61782,
+    "B": -2.68714
+   }
+  },
+  {
+   "run": 3,
+   "generated_token_ids": [
+    13
+   ],
+   "top_logprobs": {
+    "\n": -0.08171,
+    "<|assistant|>": -3.02506,
+    "===": -3.98173
+   }
+  },
+  {
+   "run": 4,
+   "generated_token_ids": [
+    32001
+   ],
+   "top_logprobs": {
+    "<|assistant|>": -0.5115,
+    "===": -0.92457,
+    "*": -6.51456
+   }
+  },
+  {
+   "run": 5,
+   "generated_token_ids": [
+    13
+   ],
+   "top_logprobs": {
+    "\n": -0.0511,
+    "===": -3.62706,
+    "<|assistant|>": -4.499
+   }
+  }
+ ],
+ "distinct_outputs_across_6_identical_requests": 2,
+ "corrects_prior_finding": "generation-divergence-q8-20260727.json concluded the forward pass diverges structurally, citing a fresh prefill (25512) disagreeing with incremental decode (13) and naming the attention/KV path as the suspect. That was drawn from two samples of a noisy process WITHOUT testing repeatability, and is wrong: prefill and decode do not structurally disagree, the engine simply does not repeat itself. The reference token is produced on a majority of runs.",
+ "scoping_experiments": [
+  {
+   "test": "Llama-3.2-3B-Instruct-Q8_0 on metal_resident_q8_runtime, 4 identical requests",
+   "result": "bit-identical (-0.91886 every run)",
+   "conclusion": "not engine-wide"
+  },
+  {
+   "test": "Mistral-7B-Instruct-v0.3.Q8_0 on the SAME cpu_reference/safe_cpu_decode path, 4 identical requests",
+   "result": "bit-identical (-0.0096 every run)",
+   "conclusion": "not the cpu_reference path; phi3-specific"
+  },
+  {
+   "test": "phi3 with --threads 1",
+   "result": "still non-deterministic",
+   "conclusion": "not a rayon/parallel-reduction race"
+  },
+  {
+   "test": "phi3 with CAMELID_LAZY_Q8_0_LINEAR=0 (eager weights)",
+   "result": "still non-deterministic",
+   "conclusion": "not lazy Q8 linear materialization"
+  }
+ ],
+ "open_suspect": "Single-threaded and eager-weighted non-determinism is the signature of reading uninitialized or stale memory. Structural outlier: phi3 is the only local architecture with head_dim=96 (llama/mistral/qwen3 rows are all 128). 96 is a multiple of 32 but not 64, which is where a fixed-width kernel tail would leave part of a buffer unwritten. phi3 also ships FUSED attn_qkv [3072,9216] and ffn_up [3072,16384] expanded into sub-row descriptor slices (src/model.rs), a phi3-only code path.",
+ "consequence": "Generation parity cannot be certified while the engine does not repeat itself. Note the row is CLOSER than the superseded receipt implied: the reference token wins on a majority of runs."
+}

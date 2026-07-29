@@ -32,6 +32,7 @@ mod mcp;
 mod models;
 mod palette;
 mod plan;
+pub(crate) mod semantic_search;
 mod server;
 mod session;
 mod shell_sandbox;

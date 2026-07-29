@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { localModelDeleteRequest } from '../lib/modelDeletion'
 
-/* Single data spine for the Models page. Owns fetch + refresh for the three
+/* Single data spine for the Models page. Owns fetch + refresh for the four
    backend truths the page renders from — /api/models/local (disk scan with lane
    facts), /api/models/current (loaded model), /api/models/catalog/downloads
-   (live download progress) — so every zone reads the same snapshot instead of
-   fetching privately. Capabilities stay a prop (already lifted in
+   (live download progress), and /api/models/default (next-launch selection) —
+   so every zone reads the same snapshot instead of fetching privately.
+   Capabilities stay a prop (already lifted in
    useDashboardData); this hook never touches localStorage: "downloaded" is only
    ever the live disk scan.
 
@@ -26,6 +27,7 @@ export function useModelsPageData({ apiBase = '' } = {}) {
   const [localLoading, setLocalLoading] = useState(false)
   const [localError, setLocalError] = useState('')
   const [current, setCurrent] = useState(null) // { path } from /api/models/current
+  const [startupDefault, setStartupDefault] = useState(null) // { filename, configured }
   const [downloads, setDownloads] = useState([])
   const [polling, setPolling] = useState(true) // one initial pass on mount
 
@@ -107,6 +109,41 @@ export function useModelsPageData({ apiBase = '' } = {}) {
     }
   }, [base])
 
+  const refreshDefault = useCallback(async () => {
+    try {
+      const res = await fetch(`${base}/api/models/default`)
+      if (!res.ok) return null
+      const next = await res.json()
+      if (baseRef.current !== base) return null
+      setStartupDefault(next)
+      return next
+    } catch {
+      return null
+    }
+  }, [base])
+
+  const setDefaultModel = useCallback(
+    async (filename) => {
+      const res = await fetch(`${base}/api/models/default`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename }),
+      })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        throw new Error(body?.error?.message || `default model update failed (HTTP ${res.status})`)
+      }
+      if (baseRef.current === base) setStartupDefault(body)
+      return body
+    },
+    [base],
+  )
+
+  const refreshLocalAndDefault = useCallback(async () => {
+    const [nextLocal] = await Promise.all([refreshLocal(), refreshDefault()])
+    return nextLocal
+  }, [refreshDefault, refreshLocal])
+
   /* Wake the downloads poller — call right after starting an install. */
   const kickDownloadsPoll = useCallback(() => {
     idleTicksRef.current = 0
@@ -141,13 +178,17 @@ export function useModelsPageData({ apiBase = '' } = {}) {
         await Promise.all([
           refreshLocal({ force: true }),
           refreshCurrent(),
+          refreshDefault(),
           refreshDownloads(),
         ])
         const error = new Error(body?.error?.message || `delete failed (HTTP ${res.status})`)
         error.code = body?.error?.code || 'model_delete_failed'
         throw error
       }
-      const verified = await refreshLocal({ force: true })
+      const [verified] = await Promise.all([
+        refreshLocal({ force: true }),
+        refreshDefault(),
+      ])
       if (!verified) {
         setLocal((current) => current
           ? { ...current, models: current.models.filter((model) => model.filename !== entry.filename) }
@@ -155,16 +196,17 @@ export function useModelsPageData({ apiBase = '' } = {}) {
       }
       return body
     },
-    [base, refreshCurrent, refreshDownloads, refreshLocal],
+    [base, refreshCurrent, refreshDefault, refreshDownloads, refreshLocal],
   )
 
   const refreshAll = useCallback(async () => {
-    await Promise.all([refreshLocal(), refreshCurrent(), refreshDownloads()])
-  }, [refreshLocal, refreshCurrent, refreshDownloads])
+    await Promise.all([refreshLocal(), refreshCurrent(), refreshDefault(), refreshDownloads()])
+  }, [refreshLocal, refreshCurrent, refreshDefault, refreshDownloads])
 
   useEffect(() => {
     setLocal(null)
     setCurrent(null)
+    setStartupDefault(null)
     setDownloads([])
     setLocalLoading(false)
     refreshLocalPromiseRef.current = null
@@ -175,7 +217,8 @@ export function useModelsPageData({ apiBase = '' } = {}) {
     setPolling(true)
     refreshLocal()
     refreshCurrent()
-  }, [base, refreshLocal, refreshCurrent])
+    refreshDefault()
+  }, [base, refreshLocal, refreshCurrent, refreshDefault])
 
   useEffect(() => {
     if (!polling) return undefined
@@ -189,7 +232,7 @@ export function useModelsPageData({ apiBase = '' } = {}) {
       const settled = [...prevDownloadIdsRef.current].some((id) => !ids.has(id))
       prevDownloadIdsRef.current = ids
       if (settled) {
-        refreshLocal()
+        refreshLocalAndDefault()
       }
       if (ids.size === 0) {
         idleTicksRef.current += 1
@@ -204,7 +247,7 @@ export function useModelsPageData({ apiBase = '' } = {}) {
       cancelled = true
       clearInterval(timer)
     }
-  }, [polling, refreshDownloads, refreshLocal])
+  }, [polling, refreshDownloads, refreshLocalAndDefault])
 
   const activeFilename = String(current?.path || '').split(/[\\/]/).pop() || ''
   const localFilenames = new Set((local?.models || []).map((m) => m.filename))
@@ -216,14 +259,19 @@ export function useModelsPageData({ apiBase = '' } = {}) {
     localError,
     current,
     activeFilename,
+    defaultFilename: startupDefault?.filename || '',
+    defaultConfigured: Boolean(startupDefault?.configured),
     localFilenames,
     downloads,
     refreshLocal,
+    refreshLocalAndDefault,
     refreshCurrent,
+    refreshDefault,
     refreshDownloads,
     refreshAll,
     kickDownloadsPoll,
     cancelDownload,
     deleteLocalModel,
+    setDefaultModel,
   }
 }

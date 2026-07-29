@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Core permissions for the Camelid Desktop main window. The window only displays a splash and is then navigated by the Rust side to the loopback sidecar UI; the embedded UI is a plain same-origin web app and needs no Tauri IPC, so no broad capabilities are granted.",
+  "description": "Core permissions for the Camelid Desktop main window. The window displays the local splash (which polls startup_snapshot) and is then navigated by the Rust side to the loopback sidecar UI; the embedded UI's own grants live in the remote sidecar-ui capability.",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "allow-startup-snapshot"]
 }

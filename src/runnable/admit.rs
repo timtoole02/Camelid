@@ -218,6 +218,34 @@ fn check_tokenizer(file: &GgufFile) -> Result<TokenizerFamily, AdmissionReject> 
 /// code, and definitionally identical to the pin's `ggml_bf16_to_fp32`. This admits
 /// legitimate mixed-type files (the gemma4-E4B pilot's single `per_layer_model_proj`
 /// BF16 tensor) under the existing whole-file coverage model.
+/// P1 loadability (2026-07-29): six formats the CPU tensor path already decoded
+/// join the covered set — Q4_1, Q5_0, Q5_1, IQ4_NL, TQ1_0 and TQ2_0.
+///
+/// Every one had a working decoder in `crate::tensor` (`decode_q4_1_tensor`,
+/// `decode_q5_0_tensor`, `decode_q5_1_tensor`, `decode_iq4_nl_tensor`,
+/// `decode_tq1_0_tensor`, `decode_tq2_0_tensor`), and TQ2_0 additionally has a
+/// wire-streaming block-dot lane. The gate refused them anyway, so files whose
+/// only uncovered axis was a format this engine already reads were rejected.
+///
+/// Each is admitted behind a per-format dequant-parity receipt pinning the
+/// decoder against llama.cpp `ggml/src/ggml-quants.c`:
+/// `tensor::tests::legacy_quant_dequant_matches_the_reference_layout` and
+/// `tensor::tests::tq{1,2}_0_dequant_matches_the_reference_layout`. Both cover the
+/// element ORDER, which is the silent-corruption surface here — the legacy formats
+/// interleave split-half (low nibble of `qs[j]` is element `j`, high nibble is
+/// element `j + 16`), and TQ2_0's four 2-bit codes decode 32 apart.
+///
+/// **Q5_1 additionally required a reader fix**: `GgufTensorType::layout` folded it
+/// in with Q5_0 at 22 bytes, but Q5_1 carries an extra f16 `m` and its block is 24.
+/// Until that was corrected, admitting Q5_1 would have turned an honest parse-time
+/// refusal into a broken load. See `gguf::reader` and its layout table test.
+///
+/// **Q8_K is deliberately NOT admitted**, despite `decode_q8_k_tensor` existing.
+/// It is not a weight storage type: ggml documents it as "only used for
+/// intermediate quantization and dot products" (`ggml/src/ggml-common.h`) and it
+/// appears zero times in `tools/quantize/quantize.cpp`'s target list, so no real
+/// GGUF stores weights as Q8_K. Admitting it would be a claim with no artifact
+/// that could ever validate it. Having a decoder is not grounds for admission.
 fn is_covered_quant(tt: GgufTensorType) -> bool {
     matches!(
         tt,
@@ -232,6 +260,12 @@ fn is_covered_quant(tt: GgufTensorType) -> bool {
             | GgufTensorType::Q4_0
             | GgufTensorType::IQ4XS
             | GgufTensorType::BF16
+            | GgufTensorType::Q4_1
+            | GgufTensorType::Q5_0
+            | GgufTensorType::Q5_1
+            | GgufTensorType::IQ4NL
+            | GgufTensorType::Tq1_0
+            | GgufTensorType::Tq2_0
     )
 }
 
@@ -268,7 +302,8 @@ fn check_quants(
                 tensor: Some(tensor.name.clone()),
                 message: format!(
                     "unsupported quant {:?} in tensor {}; runnable v1 covers \
-                     F32, F16, Q8_0, Q4_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS, BF16",
+                     F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, \
+                     Q5_K, Q6_K, IQ4_NL, IQ4_XS, TQ1_0, TQ2_0",
                     tensor.tensor_type, tensor.name
                 ),
             });
@@ -456,6 +491,72 @@ mod tests {
             .push(tensor("blk.0.ffn_down.weight", GgufTensorType::IQ4XS));
         let ok = admit(&file).expect("IQ4_XS must admit");
         assert!(ok.quants.contains(&GgufTensorType::IQ4XS));
+    }
+
+    #[test]
+    fn accepts_legacy_block_quants() {
+        // Q4_1/Q5_0/Q5_1/IQ4_NL all had working decoders while the gate refused
+        // them. Pinned by tensor::tests::legacy_quant_dequant_matches_the_reference_layout.
+        for tt in [
+            GgufTensorType::Q4_1,
+            GgufTensorType::Q5_0,
+            GgufTensorType::Q5_1,
+            GgufTensorType::IQ4NL,
+        ] {
+            let mut file = base_fixture();
+            file.tensors.push(tensor("blk.0.ffn_down.weight", tt));
+            let ok = admit(&file).unwrap_or_else(|e| panic!("{tt:?} must admit: {e}"));
+            assert!(ok.quants.contains(&tt));
+        }
+    }
+
+    #[test]
+    fn accepts_ternary_quants() {
+        // TQ1_0/TQ2_0 have had CPU decoders (decode_tq{1,2}_0_tensor) and, for
+        // TQ2_0, a wire-streaming block-dot lane, while the gate still refused
+        // them. Pinned by the dequant-parity receipts in tensor::tests.
+        for tt in [GgufTensorType::Tq1_0, GgufTensorType::Tq2_0] {
+            let mut file = base_fixture();
+            file.tensors.push(tensor("blk.0.ffn_down.weight", tt));
+            let ok = admit(&file).unwrap_or_else(|e| panic!("{tt:?} must admit: {e}"));
+            assert!(ok.quants.contains(&tt));
+        }
+    }
+
+    #[test]
+    fn rejects_q8_k_because_it_is_not_a_storage_type() {
+        // decode_q8_k_tensor exists, but Q8_K is an intermediate dot-product type
+        // in ggml ("only used for intermediate quantization and dot products",
+        // ggml-common.h) and is not a quantize target, so no real GGUF stores
+        // weights as Q8_K. Having a decoder is NOT sufficient grounds to admit.
+        let mut file = base_fixture();
+        file.tensors
+            .push(tensor("blk.0.ffn_down.weight", GgufTensorType::Q8K));
+        assert!(
+            admit(&file).is_err(),
+            "Q8_K must stay refused: it is not a weight storage type"
+        );
+    }
+
+    #[test]
+    fn ternary_bonsai_tensor_type_mix_admits() {
+        // Regression for the real artifact that motivated this change:
+        // Ternary-Bonsai-4B-TQ2_0.gguf is architecture `qwen3` with tokenizer
+        // `gpt2`, and carries 252 Tq2_0 + 145 F32 + 1 Q6K tensors. Every axis but
+        // the quant axis already passed, so the file was refused purely on a
+        // format the engine already decodes.
+        let mut file = base_fixture();
+        set_meta(&mut file, "general.architecture", "qwen3");
+        set_meta(&mut file, "tokenizer.ggml.model", "gpt2");
+        file.tensors
+            .push(tensor("blk.0.ffn_down.weight", GgufTensorType::Tq2_0));
+        file.tensors
+            .push(tensor("blk.0.attn_output.weight", GgufTensorType::Q6K));
+
+        let ok = admit(&file).expect("the Ternary-Bonsai tensor mix must admit");
+        assert!(ok.quants.contains(&GgufTensorType::Tq2_0));
+        assert!(ok.quants.contains(&GgufTensorType::Q6K));
+        assert!(ok.quants.contains(&GgufTensorType::F32));
     }
 
     // --- BASALT D-B3 pilot scoping + D-B2 sidecar fail-closed ---
@@ -723,15 +824,18 @@ mod tests {
 
     #[test]
     fn rejects_unknown_quant_naming_tensor() {
+        // Q8_K stands in for "decodable but not a storage type" — see
+        // rejects_q8_k_because_it_is_not_a_storage_type. Q4_1 used to be the
+        // example here; it is now covered.
         let mut file = base_fixture();
         file.tensors
-            .push(tensor("blk.12.ffn_down.weight", GgufTensorType::Q4_1));
-        let reject = admit(&file).expect_err("Q4_1 must reject");
+            .push(tensor("blk.12.ffn_down.weight", GgufTensorType::Q8K));
+        let reject = admit(&file).expect_err("Q8_K must reject");
         assert_eq!(reject.axis, AdmissionAxis::Quant);
-        assert_eq!(reject.offending_value, "Q4_1");
+        assert_eq!(reject.offending_value, "Q8K");
         assert_eq!(reject.tensor.as_deref(), Some("blk.12.ffn_down.weight"));
         assert!(
-            reject.message.ends_with("IQ4_XS, BF16"),
+            reject.message.ends_with("TQ1_0, TQ2_0"),
             "generic covered-set message must name its complete supported tail: {}",
             reject.message
         );
@@ -739,13 +843,14 @@ mod tests {
 
     #[test]
     fn rejects_iquant_naming_tensor() {
+        // IQ4_NL is now covered; the remaining i-quant family (IQ2_*, IQ3_*,
+        // IQ1_*) has no decoder at all and parses as an Unknown type id.
+        // ggml type ids: IQ2_XXS = 16, per ggml.h.
         let mut file = base_fixture();
-        // i-quants (IQ4_NL here) are an explicit v1 gap.
         file.tensors
-            .push(tensor("blk.3.attn_k.weight", GgufTensorType::IQ4NL));
-        let reject = admit(&file).expect_err("IQ4_NL must reject");
+            .push(tensor("blk.3.attn_k.weight", GgufTensorType::from_id(16)));
+        let reject = admit(&file).expect_err("an undecodable i-quant must reject");
         assert_eq!(reject.axis, AdmissionAxis::Quant);
-        assert_eq!(reject.offending_value, "IQ4NL");
         assert_eq!(reject.tensor.as_deref(), Some("blk.3.attn_k.weight"));
     }
 
@@ -783,11 +888,11 @@ mod tests {
     fn reject_serializes_to_machine_readable_json() {
         let mut file = base_fixture();
         file.tensors
-            .push(tensor("blk.12.ffn_down.weight", GgufTensorType::IQ4NL));
-        let reject = admit(&file).expect_err("IQ4_NL must reject");
+            .push(tensor("blk.12.ffn_down.weight", GgufTensorType::Q8K));
+        let reject = admit(&file).expect_err("Q8_K must reject");
         let json = serde_json::to_value(&reject).expect("reject serializes");
         assert_eq!(json["axis"], "quant");
-        assert_eq!(json["offending_value"], "IQ4NL");
+        assert_eq!(json["offending_value"], "Q8K");
         assert_eq!(json["tensor"], "blk.12.ffn_down.weight");
     }
 

@@ -30,7 +30,10 @@ const checks = [
       // stack reads VRAM slices directly and has no offload streaming — 8B would read
       // placeholder bytes otherwise).
       'fn is_offloaded',
-      'if self.is_offloaded() {',
+      'fn supports_batched_layer_stack',
+      '!self.is_offloaded()',
+      'pub fn supports_batched_prefill',
+      'if !self.supports_batched_prefill() {',
     ],
   },
   {

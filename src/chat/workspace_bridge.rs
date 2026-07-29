@@ -196,6 +196,9 @@ pub(crate) struct WorkspaceRunConfig {
     pub mode: WorkspaceRunMode,
     pub approval_mode: WorkspaceApprovalMode,
     pub allow_network: bool,
+    /// Optional session-scoped semantic index. When present, each turn gets a
+    /// bounded set of relevant workspace excerpts before the model runs.
+    pub semantic_retriever: Option<Arc<super::semantic_search::WorkspaceSemanticRetriever>>,
 }
 
 /// Makes delegated work share the exact lifetime of one Web Code turn, including
@@ -551,6 +554,19 @@ pub(crate) fn run_live(
         super::agent::workspace_system_prompt(&sandbox)
     };
     let mut history = vec![AgentMsg::System(system)];
+    if let Some(retriever) = config.semantic_retriever.as_ref() {
+        worker.reporter.notice(&format!(
+            "retrieving semantically relevant workspace excerpts with {}",
+            retriever.model_id()
+        ));
+        match retriever.retrieve_context(&config.goal, 5) {
+            Ok(Some(context)) => history.push(AgentMsg::Memory(context)),
+            Ok(None) => {}
+            Err(error) => worker
+                .reporter
+                .notice(&format!("semantic retrieval was unavailable: {error}")),
+        }
+    }
     if let Some(memory) = render_relevant_memory(&config.memory.relevant) {
         history.push(AgentMsg::Memory(memory));
     }

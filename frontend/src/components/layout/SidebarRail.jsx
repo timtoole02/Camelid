@@ -6,13 +6,14 @@ import { Tooltip } from '../ui/Tooltip'
 import { ConversationListItem } from './ConversationListItem'
 import {
   IconAnalytics, IconApi, IconBolt, IconChart, IconChat, IconHistory, IconMemory, IconModels,
-  IconNetwork, IconNewChat, IconObservatory, IconReceipt, IconSearch, IconSettings, IconSidebar, IconSystem,
+  IconDownload, IconNetwork, IconNewChat, IconObservatory, IconReceipt, IconSearch, IconSettings, IconSidebar, IconSystem,
 } from '../ui/icons'
 
 const NAV = [
   { tab: 'code', label: 'Code', Icon: IconBolt },
   { tab: 'workspace', label: 'Workspace', Icon: IconBolt },
   { tab: 'library', label: 'Models', Icon: IconModels },
+  { tab: 'downloads', label: 'Downloaded models', Icon: IconDownload },
   { tab: 'history', label: 'Chat history', Icon: IconHistory },
   { tab: 'analytics', label: 'Analytics', Icon: IconAnalytics },
   { tab: 'telemetry', label: 'Telemetry', Icon: IconChart },

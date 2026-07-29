@@ -11,8 +11,41 @@
 //! HTTP egress reuses the same `curl` subprocess pattern as `catalog.rs` (no new
 //! dependency); every call tolerates offline by returning a typed error rather than
 //! panicking, so the catalog endpoint can degrade to curated-only.
+//!
+//! Latency is the design constraint here: one search is 1 repo-search round-trip
+//! plus one file-tree round-trip *per repo*. Serially that is
+//! `1 + HF_SEARCH_LIMIT` sequential requests (measured ~5.3 s for 15 repos), which
+//! reads to the user as a hung UI. Two bounded mitigations, both dependency-free:
+//! the per-repo trees are fetched by a small scoped thread pool
+//! ([`REPO_FETCH_CONCURRENCY`]), and identical `(query, cursor)` pages are served
+//! from a short-lived in-process cache ([`SEARCH_CACHE_TTL`]) so retyping,
+//! back-navigation, and two clients on the same box do not re-pay the round-trips.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+/// Number of repo file-tree requests in flight at once. Each is an independent
+/// `curl` subprocess blocked on network IO, so this trades a handful of short-lived
+/// threads for a near-linear latency reduction. Kept small deliberately: the Hub
+/// rate-limits, and a page only ever inspects `HF_SEARCH_LIMIT` repos.
+const REPO_FETCH_CONCURRENCY: usize = 8;
+
+/// curl connect timeout — a stalled TCP/TLS handshake must not pin a worker thread.
+const CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// curl overall timeout — a slow or hung transfer must release its worker in bounded
+/// time. One repo timing out costs that repo's files, never the whole page.
+const REQUEST_MAX_TIME_SECS: u64 = 30;
+
+/// How long a fetched page stays servable. Short on purpose: the Hub is live data
+/// and a stale catalog would be a correctness problem, but a human refining a query
+/// (or re-opening the tab) acts well inside this window.
+const SEARCH_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Max cached pages. Bounds memory for a pathological typist; oldest evicted first.
+const SEARCH_CACHE_MAX_ENTRIES: usize = 32;
 
 /// One GGUF file discovered on the Hub. `size_bytes` is the real content size
 /// (LFS-aware). `architecture`/`quant` are filename guesses — advisory only, empty
@@ -42,17 +75,91 @@ pub struct HfSearchPage {
 /// `*.gguf` files with real sizes. `limit` bounds the number of repos inspected;
 /// `cursor` resumes a previous page. Network failure → typed `Err` (never panic),
 /// so callers can fall back to curated-only.
+///
+/// Identical `(query, cursor)` pages are served from the in-process cache for
+/// [`SEARCH_CACHE_TTL`]. Only successes are cached — an offline blip must not pin a
+/// failure for a minute.
 pub async fn search_gguf(
     query: &str,
     limit: usize,
     cursor: Option<&str>,
 ) -> anyhow::Result<HfSearchPage> {
+    let key = cache_key(query, limit, cursor);
+    if let Some(hit) = search_cache().get(&key, Instant::now()) {
+        return Ok(hit);
+    }
     let query = query.to_string();
     let cursor = cursor.map(|c| c.to_string());
     // curl is blocking; keep it off the async executor.
-    tokio::task::spawn_blocking(move || search_gguf_blocking(&query, limit, cursor.as_deref()))
-        .await
-        .map_err(|err| anyhow::anyhow!("hugging face search task panicked: {err}"))?
+    let page =
+        tokio::task::spawn_blocking(move || search_gguf_blocking(&query, limit, cursor.as_deref()))
+            .await
+            .map_err(|err| anyhow::anyhow!("hugging face search task panicked: {err}"))??;
+    search_cache().insert(key, page.clone(), Instant::now());
+    Ok(page)
+}
+
+/// Cache identity for a page. `limit` is part of it because it bounds how many
+/// repos the page inspects: serving a 5-repo page to a caller that asked for 15
+/// would silently truncate results. The NUL separators cannot appear in a URL-safe
+/// cursor or a user query, so no two distinct triples can collide.
+fn cache_key(query: &str, limit: usize, cursor: Option<&str>) -> String {
+    format!("{query}\u{0}{limit}\u{0}{}", cursor.unwrap_or_default())
+}
+
+/// Bounded, TTL'd page cache. Insertion-ordered `Vec` rather than a `HashMap` +
+/// separate ordering structure: at [`SEARCH_CACHE_MAX_ENTRIES`] a linear scan is
+/// cheaper than the bookkeeping, and eviction is a single `remove(0)`.
+#[derive(Default)]
+struct SearchCache {
+    entries: Mutex<Vec<CacheEntry>>,
+}
+
+struct CacheEntry {
+    key: String,
+    stored_at: Instant,
+    page: HfSearchPage,
+}
+
+impl SearchCache {
+    /// The cached page for `key` if it has not expired as of `now`. Expired entries
+    /// are dropped on the way past, so the cache self-trims without a timer.
+    ///
+    /// `now` is a parameter rather than read from the clock so expiry and eviction
+    /// are deterministically testable.
+    fn get(&self, key: &str, now: Instant) -> Option<HfSearchPage> {
+        let mut entries = self.lock();
+        entries.retain(|e| now.duration_since(e.stored_at) < SEARCH_CACHE_TTL);
+        entries
+            .iter()
+            .find(|e| e.key == key)
+            .map(|e| e.page.clone())
+    }
+
+    /// Store `page` under `key`, replacing any previous entry for the same key and
+    /// evicting the oldest entries past [`SEARCH_CACHE_MAX_ENTRIES`].
+    fn insert(&self, key: String, page: HfSearchPage, now: Instant) {
+        let mut entries = self.lock();
+        entries.retain(|e| e.key != key && now.duration_since(e.stored_at) < SEARCH_CACHE_TTL);
+        entries.push(CacheEntry {
+            key,
+            stored_at: now,
+            page,
+        });
+        let overflow = entries.len().saturating_sub(SEARCH_CACHE_MAX_ENTRIES);
+        entries.drain(..overflow);
+    }
+
+    /// A poisoned cache mutex must not take down a search: recover the guard and
+    /// carry on (the worst case is a stale-but-bounded entry).
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<CacheEntry>> {
+        self.entries.lock().unwrap_or_else(|err| err.into_inner())
+    }
+}
+
+fn search_cache() -> &'static SearchCache {
+    static CACHE: OnceLock<SearchCache> = OnceLock::new();
+    CACHE.get_or_init(SearchCache::default)
 }
 
 struct RepoMeta {
@@ -101,16 +208,53 @@ fn search_gguf_blocking(
         })
         .unwrap_or_default();
 
-    // 2. For each repo, read its file tree for the real `*.gguf` sizes. One repo
-    //    failing (private, renamed, transient) must not drop the whole page.
-    let mut files = Vec::new();
-    for repo in &repos {
-        if let Ok(mut repo_files) = repo_gguf_files(repo) {
-            files.append(&mut repo_files);
-        }
-    }
+    // 2. For each repo, read its file tree for the real `*.gguf` sizes.
+    let files = fetch_repo_files_parallel(&repos);
 
     Ok(HfSearchPage { files, next_cursor })
+}
+
+/// Fetch every repo's file tree with at most [`REPO_FETCH_CONCURRENCY`] requests in
+/// flight, preserving the Hub's repo ordering in the output.
+///
+/// Ordering matters: the Hub returns repos in relevance order and the Models tab
+/// renders them in the order received, so this is the ranking. Workers therefore
+/// tag their results with the repo index and the page is re-sorted before flatten;
+/// completion order never leaks into the UI.
+///
+/// One repo failing (private, renamed, rate-limited, timed out) drops only that
+/// repo's files, never the page — same tolerance the sequential version had.
+fn fetch_repo_files_parallel(repos: &[RepoMeta]) -> Vec<HfGgufFile> {
+    if repos.is_empty() {
+        return Vec::new();
+    }
+    let worker_count = REPO_FETCH_CONCURRENCY.min(repos.len());
+    let next = AtomicUsize::new(0);
+    let collected: Mutex<Vec<(usize, Vec<HfGgufFile>)>> =
+        Mutex::new(Vec::with_capacity(repos.len()));
+
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            scope.spawn(|| loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(repo) = repos.get(index) else {
+                    break;
+                };
+                let Ok(files) = repo_gguf_files(repo) else {
+                    continue;
+                };
+                if let Ok(mut out) = collected.lock() {
+                    out.push((index, files));
+                }
+            });
+        }
+    });
+
+    let mut collected = collected
+        .into_inner()
+        .unwrap_or_else(|err| err.into_inner());
+    collected.sort_unstable_by_key(|(index, _)| *index);
+    collected.into_iter().flat_map(|(_, files)| files).collect()
 }
 
 /// Enumerate the top-level `*.gguf` files in a repo with LFS-aware sizes, mirroring
@@ -162,11 +306,22 @@ fn repo_gguf_files(repo: &RepoMeta) -> anyhow::Result<Vec<HfGgufFile>> {
 
 /// Run `curl -fsSL <url>` returning `(body, raw_response_headers)`. Headers are
 /// dumped to a temp file (`-D`) so the body stays clean JSON regardless of
-/// redirects. Offline / HTTP error → typed `Err`.
+/// redirects. Offline / HTTP error / timeout → typed `Err`.
+///
+/// The timeouts are load-bearing, not defensive dressing: these calls run on a
+/// fixed-size worker pool, so an untimed hung connection would retire a worker for
+/// the life of the process and eventually starve every search.
 fn curl_get_with_headers(url: &str) -> anyhow::Result<(Vec<u8>, String)> {
     let header_path = unique_temp_path("camelid-hf-hdr");
     let output = std::process::Command::new("curl")
-        .args(["-fsSL", "-D"])
+        .args([
+            "-fsSL",
+            "--connect-timeout",
+            &CONNECT_TIMEOUT_SECS.to_string(),
+            "--max-time",
+            &REQUEST_MAX_TIME_SECS.to_string(),
+            "-D",
+        ])
         .arg(&header_path)
         .arg(url)
         .output()
@@ -364,5 +519,79 @@ mod tests {
             parse_next_cursor("HTTP/2 200\r\ncontent-type: application/json\r\n"),
             None
         );
+    }
+
+    /// A one-file page tagged by `marker`, so tests can tell cached pages apart.
+    fn page(marker: &str) -> HfSearchPage {
+        HfSearchPage {
+            files: vec![HfGgufFile {
+                repo_id: format!("owner/{marker}"),
+                filename: format!("{marker}.gguf"),
+                size_bytes: 1,
+                downloads: 0,
+                likes: 0,
+                architecture: String::new(),
+                quant: String::new(),
+            }],
+            next_cursor: None,
+        }
+    }
+
+    fn only_repo(page: &HfSearchPage) -> &str {
+        &page.files[0].repo_id
+    }
+
+    #[test]
+    fn cache_key_separates_query_limit_and_cursor() {
+        // Without separators, ("a\0b", None) and ("a", Some("b")) would collide.
+        assert_ne!(
+            cache_key("a\u{0}b", 15, None),
+            cache_key("a", 15, Some("b"))
+        );
+        assert_eq!(cache_key("phi", 15, None), cache_key("phi", 15, Some("")));
+        // A page sized for 15 repos must not be served to a caller asking for 5.
+        assert_ne!(cache_key("phi", 15, None), cache_key("phi", 5, None));
+    }
+
+    #[test]
+    fn cache_serves_a_hit_within_the_ttl_and_expires_after_it() {
+        let cache = SearchCache::default();
+        let t0 = Instant::now();
+        cache.insert("phi".to_string(), page("a"), t0);
+
+        let fresh = cache.get("phi", t0 + SEARCH_CACHE_TTL - Duration::from_millis(1));
+        assert_eq!(only_repo(&fresh.expect("within ttl")), "owner/a");
+
+        assert!(cache.get("phi", t0 + SEARCH_CACHE_TTL).is_none());
+        assert!(cache.get("qwen", t0).is_none());
+    }
+
+    #[test]
+    fn cache_replaces_rather_than_duplicates_the_same_key() {
+        let cache = SearchCache::default();
+        let t0 = Instant::now();
+        cache.insert("phi".to_string(), page("old"), t0);
+        cache.insert("phi".to_string(), page("new"), t0 + Duration::from_secs(1));
+
+        assert_eq!(cache.lock().len(), 1);
+        let hit = cache.get("phi", t0 + Duration::from_secs(1)).expect("hit");
+        assert_eq!(only_repo(&hit), "owner/new");
+    }
+
+    #[test]
+    fn cache_evicts_the_oldest_entries_past_the_cap() {
+        let cache = SearchCache::default();
+        let t0 = Instant::now();
+        for i in 0..SEARCH_CACHE_MAX_ENTRIES + 3 {
+            cache.insert(format!("q{i}"), page(&format!("m{i}")), t0);
+        }
+        assert_eq!(cache.lock().len(), SEARCH_CACHE_MAX_ENTRIES);
+        // The three oldest keys are gone; the newest survive.
+        assert!(cache.get("q0", t0).is_none());
+        assert!(cache.get("q2", t0).is_none());
+        assert!(cache.get("q3", t0).is_some());
+        assert!(cache
+            .get(&format!("q{}", SEARCH_CACHE_MAX_ENTRIES + 2), t0)
+            .is_some());
     }
 }

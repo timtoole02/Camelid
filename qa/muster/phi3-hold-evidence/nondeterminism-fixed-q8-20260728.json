@@ -1,0 +1,68 @@
+{
+ "schema": "camelid.phi3.nondeterminism_fixed.v1",
+ "supersedes": "nondeterminism-q8-20260727.json (the non-determinism it records is FIXED; its scoping experiments remain valid)",
+ "artifact": "Phi-3-mini-4k-instruct-Q8_0.gguf",
+ "comparator": "llama.cpp 9632 (acd79d603) CPU (llama-server, -ngl 0 -ctk f32 -ctv f32 -fa off --no-repack)",
+ "root_cause": "half_mm_batched_f16o (src/metal.rs) tiles its A-row dimension in fixed 64-row blocks and ignored its `rows` argument entirely -- the parameter was declared at buffer(4) and never read. The prefill attention-as-matmul PV pass drives it with rows = head_dim. At head_dim=96 the host dispatches ceil(96/64)=2 row tiles, so the second tile's 32-row overhang (a) READ past each head's V-transpose slab, which transpose_v16 only ever fills for d < head_dim, and off the end of vt_scratch entirely for the last head, and (b) WROTE into the next head's columns 0..31, racing that head's own legitimate write from a different threadgroup with no ordering. Every other local architecture has head_dim=128, which tiles evenly, so nothing else was affected.",
+ "fix": "Bound all three unguarded sites by the `rows` argument that was already being passed: zero-pad A rows past `rows` exactly as the k tail was already zero-padded; add `quad_r0 < rows` to sg_active; route a partial row tile to the guarded ragged store by requiring r0 + NR0 <= rows; and bound the ragged store's row index (r_oct + fr < rows). Applied to both the f16-output kernel and its f32 twin, which carried the identical latent defect.",
+ "fixed_non_determinism": {
+  "single_token_6_identical_requests": {
+   "all_runs": "(32001,) logprob -0.009686",
+   "distinct": 1,
+   "stable": true
+  },
+  "multi_token_3_identical_requests": {
+   "all_runs": [
+    3681,
+    29889,
+    3681,
+    338,
+    2998
+   ],
+   "distinct": 1,
+   "stable": true
+  },
+  "reference_single_token": {
+   "id": 32001,
+   "token": "<|assistant|>",
+   "logprob": -0.00913
+  },
+  "note": "camelid now returns the reference token 32001 on the 9-token prefix, deterministically, on the DEFAULT path with no flags."
+ },
+ "no_regression": {
+  "Llama-3.2-3B-Instruct-Q8_0.gguf": {
+   "pre_patch": "'The' -0.91886",
+   "post_patch": "'The' -0.91886",
+   "bit_identical": true
+  },
+  "Mistral-7B-Instruct-v0.3.Q8_0.gguf": {
+   "pre_patch": "'\\n' -0.0096",
+   "post_patch": "'\\n' -0.0096",
+   "bit_identical": true
+  },
+  "note": "head_dim=128 rows tile evenly, so both row tiles still take the fast store path and the guards are a no-op."
+ },
+ "STILL_BLOCKING": {
+  "finding": "A SEPARATE, now-DETERMINISTIC correctness bug remains in phi3 multi-token decode.",
+  "prompt": "The capital of France is",
+  "reference_tokens": [
+   3681,
+   29889,
+   13,
+   32001,
+   3869
+  ],
+  "camelid_tokens": [
+   3681,
+   29889,
+   3681,
+   338,
+   2998
+  ],
+  "first_divergence_index": 2,
+  "repeatability": "3/3 identical runs -- deterministic, unlike before the kernel fix",
+  "detail": "A FRESH prefill of the 8-token prefix 'The capital of France is Paris.' returns 13, matching the reference; incremental decode to the same position returns 3681. So prefill and decode genuinely disagree. NOTE: an earlier receipt asserted this same prefill-vs-decode split from two samples of a then-non-deterministic engine and was rightly retracted; it is now measurable and repeatable, which is what makes it assertable.",
+  "next": "Compare the decode path's KV-cache read against the prefill path's for phi3 (head_dim=96) -- the same non-multiple-of-64 shape that broke the PV tile is the obvious place to look next."
+ },
+ "consequence": "The row stays active_validation_blocked_parity. Generation parity is still not certified. But the engine now produces the same answer twice, and phi3 is usable on the default path with no flags."
+}

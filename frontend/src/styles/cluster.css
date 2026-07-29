@@ -17,7 +17,12 @@
 }
 .cluster-header__copy h1 { font-size: var(--text-2xl); letter-spacing: -0.02em; }
 .cluster-header__copy p { color: var(--color-text-muted); margin-top: var(--space-1); max-width: 60ch; font-size: var(--text-sm); }
-.cluster-header__actions { display: flex; flex-direction: column; align-items: flex-end; gap: var(--space-2); }
+/* `justify-content: space-between` only right-aligns the actions while copy and
+   actions share a line. Once .cluster-header wraps them onto separate lines the
+   block shrink-wraps to its widest row, so the narrow secondary row hangs in
+   open space and neither row lines up with anything. Growing it keeps both rows
+   resolving `flex-end` against the real header edge in both states. */
+.cluster-header__actions { display: flex; flex: 1 1 auto; flex-direction: column; align-items: flex-end; gap: var(--space-2); }
 .cluster-header__primary { display: flex; flex-wrap: wrap; gap: var(--space-2); justify-content: flex-end; }
 .cluster-header__secondary { display: flex; flex-wrap: wrap; gap: var(--space-1); justify-content: flex-end; }
 

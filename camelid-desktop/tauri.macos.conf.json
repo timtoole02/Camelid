@@ -1,0 +1,12 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "targets": ["app"],
+    "shortDescription": "Native macOS chat app for the Camelid local inference engine.",
+    "longDescription": "Camelid Desktop embeds the same Metal-enabled Camelid engine shipped for Apple Silicon and runs it as a loopback-only sidecar.",
+    "macOS": {
+      "minimumSystemVersion": "12.0",
+      "signingIdentity": "-"
+    }
+  }
+}

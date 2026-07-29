@@ -73,3 +73,38 @@ runnable lane (`RUNNABLE_LANE_SPEC.md`). Each entry: what's needed, why, blockin
   `COVERED_ARCHITECTURES`) keys off `{llama, qwen2, qwen3, gemma2, gemma3, phi3}`,
   intentionally independent of `model.rs`'s optimized-lane allowlist. Revisit only if
   a model the supported lane handles (e.g. mistral) must also run runnable.
+
+## RA-5 — `smollm3` is a NoPE architecture — **IMPLEMENTED (CPU), EVIDENCE OWED**
+- **What:** `smollm3` sat in the optimized-lane allowlist (`src/model.rs`
+  `is_implemented_architecture` / `from_gguf`) while the engine applied RoPE to every
+  layer. llama.cpp hardcodes `n_no_rope_layer_step = 4` (`src/models/smollm3.cpp:5` —
+  there is **no GGUF key** for it, so it cannot be read from the file) and its graph at
+  `:69` skips `ggml_rope_ext` on **both Q and K** whenever `(il + 1) % 4 == 0`. Because
+  SmolLM3 is llama-shaped it bound cleanly and then mis-roped: **silently wrong output
+  under a claimed-implemented architecture**, not a clean refusal. For a 36-layer
+  SmolLM3-3B the affected layers are 3, 7, 11, 15, 19, 23, 27, 31, 35 — 9 of 36,
+  including the final layer.
+- **Fixed:** `LlamaModelConfig::no_rope_layer_step` + `layer_uses_rope`, applied at both
+  CPU RoPE call sites (single-token decode and batched prefill). The resident GPU
+  engines **fail closed** to CPU for NoPE models (`resident_decode_eligible`): they
+  build one cos/sin table per forward and rope every layer unconditionally, so they
+  cannot express the skip and would diverge from the CPU path.
+- **Audit:** the other nine admitted architectures were each checked against their
+  llama.cpp graph builder and rope unconditionally (`models/llama.cpp:146,152`,
+  `qwen2.cpp:86,92`, `qwen3.cpp:91,100`, `phi3.cpp:107,113`, `mistral3.cpp:137,143`).
+  `gemma3`/`gemma4`/`qwen35` carry per-layer rope **bases**, not skips, and those are
+  modelled elsewhere. `smollm3` was the only silent-wrong-output case.
+- **OWED:** no SmolLM3 GGUF exists on the dev host, so there is **no greedy-parity
+  receipt** against the pinned llama.cpp. The tests prove the layer-skip logic and its
+  wiring into both CPU forward paths, and nothing more. Specifically unproven:
+  end-to-end token identity on real weights, tokenizer/chat-template fidelity, the
+  interaction of NoPE layers with SmolLM3's long-context rope scaling, and every GPU
+  lane (deliberately refused). **No ledger row claims `smollm3`, and none should be
+  added until a receipt exists.**
+- **Follow-ups found during the same audit (NOT fixed here):** (a) `gemma3` is accepted
+  by the dense `from_gguf` path but its per-layer dual rope base is only modelled in the
+  runnable lane (`src/runnable/model.rs`), so a gemma3 file reaching the dense path
+  would use one base for all layers; (b) `lfm2` is claimed implemented but its recurrent
+  layers carry `shortconv.in_proj/out_proj` and no `attn_q/k/v`, so the dense binding
+  fails to bind — a load-time error rather than silent wrongness, but still a claim
+  with no path that can run it.

@@ -1,4 +1,4 @@
-# `camelid-desktop` (a Tauri v2 native Windows app) is an ADDITIVE workspace member.
+# `camelid-desktop` (a Tauri v2 native desktop app) is an ADDITIVE workspace member.
 # resolver = "2" keeps this root package's feature resolution identical to the standalone
 # edition-2021 default it had before the workspace existed. default-members = ["."] scopes
 # bare `cargo build`/`cargo test` to the `camelid` server exactly as before — the desktop
@@ -12,7 +12,7 @@ resolver = "2"
 
 [package]
 name = "camelid"
-version = "0.4.4"
+version = "0.4.6"
 edition = "2021"
 rust-version = "1.89"
 description = "Camelid: a Rust-native local GGUF inference backend with evidence-gated model compatibility"
@@ -26,8 +26,11 @@ categories = ["api-bindings", "command-line-utilities"]
 anyhow = "1"
 async-stream = "0.3"
 axum = "0.7"
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 getrandom = "0.4"
+llguidance = "=1.7.6"
+toktrie = "=1.7.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -47,6 +50,10 @@ tower-http = { version = "0.5", features = ["trace", "cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+# unicode-general-category 1.1.0 vendors Unicode 16.0 General Category tables.
+# Pin it exactly so GPT4O's `\p{L}`/`\p{N}` port cannot drift with a UCD update.
+unicode-general-category = "=1.1.0"
+unicode-normalization = "0.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.31"

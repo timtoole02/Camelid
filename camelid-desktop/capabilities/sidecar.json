@@ -1,0 +1,14 @@
+{
+  "$schema": "../gen/schemas/remote-schema.json",
+  "identifier": "sidecar-ui",
+  "description": "Allows the Camelid loopback sidecar UI to call the desktop shell's narrow model-directory commands. No arbitrary filesystem permission is granted: choose_models_directory opens a native scoped folder picker on the Rust side, and reset_models_directory clears the saved preference.",
+  "windows": ["main"],
+  "remote": {
+    "urls": ["http://127.0.0.1:*", "http://localhost:*"]
+  },
+  "permissions": [
+    "core:default",
+    "allow-choose-models-directory",
+    "allow-reset-models-directory"
+  ]
+}

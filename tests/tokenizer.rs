@@ -15,7 +15,7 @@ fn loads_llama_spm_tokenizer_metadata() {
     assert_eq!(tokenizer.special.eos, Some(2));
     assert!(tokenizer.config.add_bos);
     assert!(!tokenizer.config.add_eos);
-    assert_eq!(tokenizer.tokens.len(), 7);
+    assert_eq!(tokenizer.tokens.len(), 14);
 }
 
 #[test]
@@ -475,12 +475,17 @@ fn encodes_known_piece_with_space_prefix() {
 }
 
 #[test]
-fn parse_special_spm_uses_vocab_piece_after_control_dummy_prefix() {
+fn parse_special_spm_merges_dummy_prefix_into_the_following_piece() {
     let tokenizer = load_fixture(false, false, true);
 
+    // The dummy prefix after a control token belongs to the NEXT fragment, not to
+    // a token of its own: the reference prepends a space to the fragment and lets
+    // SPM merge it, yielding `▁hello` (3). Emitting the bare `▁` (6) followed by
+    // `hello` (4) is the divergence this asserts against — it split `▁What` into
+    // `▁` + `What` on every real prompt that followed a special.
     assert_eq!(
         tokenizer.encode("<s>hello", false, true).unwrap(),
-        vec![1, 6, 4]
+        vec![1, 3]
     );
 }
 
@@ -494,10 +499,14 @@ fn falls_back_to_byte_tokens() {
 fn applies_tokenizer_merges_when_present() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tokenizer-merges.gguf");
+    // A merge-driven tokenizer model. `llama` is SPM proper: the reference
+    // segments it by token score and ignores any merge list the converter
+    // embedded, so asserting merge behaviour under `llama` asserted the bug that
+    // switched TinyLlama (which ships 61k merges) onto rank-based BPE.
     write_tokenizer_gguf_with_overrides(
         &path,
         TokenizerFixtureOverrides {
-            model: "llama",
+            model: "gemma4",
             merges: &["h e", "he l", "hel l", "hell o"],
             ..TokenizerFixtureOverrides::default()
         },
@@ -512,8 +521,12 @@ fn applies_tokenizer_merges_when_present() {
 #[test]
 fn adds_dummy_prefix_after_control_token_before_newline() {
     let tokenizer = load_fixture(false, false, true);
+    // parse_special=true: a control token is only recognised as a token when
+    // specials are being parsed. This previously passed with parse_special=false
+    // because longest-match happened to swallow the literal text `</s>` as its own
+    // id — something the reference never does with specials off.
     assert_eq!(
-        tokenizer.encode("hello</s>\nhello", false, false).unwrap(),
+        tokenizer.encode("hello</s>\nhello", false, true).unwrap(),
         vec![3, 2, 6, 0, 4]
     );
 }
@@ -521,8 +534,9 @@ fn adds_dummy_prefix_after_control_token_before_newline() {
 #[test]
 fn does_not_duplicate_dummy_prefix_after_control_token_before_space() {
     let tokenizer = load_fixture(false, false, true);
+    // parse_special=true for the same reason as the newline case above.
     assert_eq!(
-        tokenizer.encode("hello</s> hello", false, false).unwrap(),
+        tokenizer.encode("hello</s> hello", false, true).unwrap(),
         vec![3, 2, 3]
     );
 }
@@ -552,7 +566,7 @@ fn rejects_special_token_id_outside_vocab() {
     let err = Tokenizer::from_gguf(&gguf).unwrap_err().to_string();
 
     assert!(err.contains("bos token id 99"));
-    assert!(err.contains("out of range for vocab size 7"));
+    assert!(err.contains("out of range for vocab size 14"));
 }
 
 #[test]
@@ -574,7 +588,7 @@ fn rejects_score_array_shorter_than_tokens() {
     let err = Tokenizer::from_gguf(&gguf).unwrap_err().to_string();
 
     assert!(err.contains("tokenizer.ggml.scores length 3"));
-    assert!(err.contains("shorter than token count 7"));
+    assert!(err.contains("shorter than token count 14"));
 }
 
 #[test]
@@ -801,9 +815,22 @@ struct TokenizerFixtureOverrides<'a> {
 }
 
 fn write_tokenizer_gguf_with_overrides(path: &Path, overrides: TokenizerFixtureOverrides<'_>) {
-    let tokens = ["<unk>", "<s>", "</s>", "▁hello", "hello", "<0x21>", "▁"];
-    let all_scores = [0.0, 0.0, 0.0, 10.0, 2.0, 0.0, 1.0];
-    let mut token_types = [2, 3, 3, 1, 1, 6, 1];
+    // SPM reaches a token only through successive pairwise merges in which every
+    // intermediate is ITSELF in the vocab. Without the single-step pieces below,
+    // `▁hello` and `hello` are unreachable and every character falls back to
+    // <unk> — the original 7-entry vocab was only tokenizable by a longest-match
+    // encoder, not by the reference algorithm. Appended (never reordered) so the
+    // ids every other test asserts stay put.
+    let tokens = [
+        "<unk>", "<s>", "</s>", "▁hello", "hello", "<0x21>", "▁", "▁h", "▁he", "▁hel", "▁hell",
+        "he", "hel", "hell",
+    ];
+    // The `▁`-prefixed chain outscores the bare chain so each step has a single
+    // best candidate and the merge order is deterministic.
+    let all_scores = [
+        0.0, 0.0, 0.0, 10.0, 2.0, 0.0, 1.0, 3.0, 4.0, 5.0, 6.0, 2.5, 2.6, 2.7,
+    ];
+    let mut token_types = [2, 3, 3, 1, 1, 6, 1, 1, 1, 1, 1, 1, 1, 1];
     if let Some(token_type) = overrides.token_type {
         token_types[3] = token_type;
     }

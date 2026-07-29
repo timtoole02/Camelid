@@ -120,7 +120,7 @@ export default function SettingsView({
                 ? 'The launched process is running — waiting for it to bind the port…'
                 : status.available
                   ? 'Not running yet. Start it below — Camelid finds the built binary for you.'
-                  : 'Not running. The one-click launcher needs the dev server (npm run dev).'}
+                  : 'Not running. Start it from a terminal with the command below.'}
           </p>
 
           {status.available ? (
@@ -159,16 +159,14 @@ export default function SettingsView({
             </>
           ) : (
             <>
-              <Field label="Launch command">
-                <input type="text" value={command} spellCheck={false} placeholder="camelid serve" onChange={(e) => setCommand(e.target.value)} />
-              </Field>
               <div className="settings-actions">
-                <Button variant="ghost" icon={copied ? <IconCheck size={16} /> : <IconCopy size={16} />} onClick={handleCopy}>
-                  {copied ? 'Copied' : 'Copy command'}
+                <Button variant="primary" icon={copied ? <IconCheck size={16} /> : <IconCopy size={16} />} onClick={handleCopy}>
+                  {copied ? 'Copied' : 'Copy restart command'}
                 </Button>
               </div>
               <p className="settings-help settings-help--muted">
-                Run <code>{resolvedCommand || 'camelid serve'}</code> in a terminal from the repo root, then this turns Online automatically.
+                Run <code>{resolvedCommand || 'camelid serve'}</code> in a terminal, then this turns Online
+                automatically. This page is served by the engine itself, so it cannot start one for you.
               </p>
             </>
           )}

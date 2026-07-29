@@ -24,11 +24,15 @@ const CAPABILITIES = {
       quantization: 'Q8_0',
       status: 'supported_exact_row_smoke',
     },
+    // Real /api/capabilities row id: it carries the model's `general.finetune`
+    // token ("Instruct"), which the canonical release filename
+    // (Qwen3-4B-Q8_0.gguf) does NOT. The fixture must mirror the shipped row id,
+    // or this file silently tests an identity match that production never makes.
     {
-      id: 'qwen3_4b_q8_0',
-      family: 'qwen_decoder',
+      id: 'qwen3_4b_instruct_q8_0',
+      family: 'qwen3',
       quantization: 'Q8_0',
-      status: 'supported',
+      status: 'supported_exact_row_smoke',
     },
     {
       id: 'gemma2_9b_it_q8_0',
@@ -55,11 +59,30 @@ check(
   'supported',
 )
 
-// Exact row id match without family heuristics (row id == normalized filename).
+// The shipped row id carries a `general.finetune` token the canonical release
+// filename omits (qwen3_4b_instruct_q8_0 vs Qwen3-4B-Q8_0.gguf), so the
+// identity match cannot resolve it from the filename alone. The backend's
+// exact-artifact verdict must still place it in the supported lane — otherwise
+// a loadable, generation-ready model is demoted to Experimental and the UI
+// offers no "Use for chat".
 check(
-  'supported: exact row id identity match',
-  laneOf(entry('Qwen3-4B-Q8_0.gguf'), CAPABILITIES),
+  'supported: backend exact-artifact verdict when the row id carries a finetune token',
+  laneOf(entry('Qwen3-4B-Q8_0.gguf', { lane_class: 'supported' }), CAPABILITIES),
   'supported',
+)
+
+// The backend verdict only ever promotes on an exact `supported`. An
+// implemented-but-uncertified artifact keeps its evidence-derived lane.
+check(
+  'compatible: backend experimental verdict never promotes',
+  laneOf(
+    entry('Qwen3-4B-Q4_K_M.gguf', {
+      lane_class: 'experimental_implemented',
+      runnable_receipt_present: true,
+    }),
+    CAPABILITIES,
+  ),
+  'compatible',
 )
 
 // The artifact gate must hold: same model row, wrong GGUF filename punctuation

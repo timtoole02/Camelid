@@ -26,8 +26,12 @@
       }
       .title { font-size: 20px; font-weight: 600; letter-spacing: 0.2px; }
       .status { color: #9aa6b2; min-height: 1.4em; }
-      .err { color: #f0a3a3; white-space: pre-wrap; text-align: left; max-width: 90%;
-             font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 12.5px; }
+      .err { color: #f0a3a3; text-align: left; max-width: min(90%, 680px); }
+      .err-title { font-size: 16px; font-weight: 600; }
+      .err-guidance { color: #d8dee6; margin-top: 6px; }
+      .err-details { margin-top: 12px; }
+      .err-detail { margin: 8px 0 0; max-height: 15rem; overflow: auto; white-space: pre-wrap;
+            font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 12.5px; }
       .spinner {
         width: 26px; height: 26px; border-radius: 50%;
         border: 3px solid #2a323c; border-top-color: #6ea8fe;
@@ -41,26 +45,55 @@
     <div class="wrap">
       <div id="spinner" class="spinner"></div>
       <div class="title">Camelid Desktop</div>
-      <!-- Updated by the Rust side via emit("engine-status", ...). Never shows a fake
-           "ready" state: it reflects real sidecar spawn + /v1/health progress only. -->
+       <!-- Updated by the Rust side via emit("engine-status", ...), then replayed from native
+         state after listener registration. Never shows a fake ready state. -->
       <div id="status" class="status">Starting engine&hellip;</div>
-      <div id="error" class="err hidden"></div>
+      <div id="error" class="err hidden" role="alert">
+        <div id="error-title" class="err-title"></div>
+        <div id="error-guidance" class="err-guidance"></div>
+        <details id="error-details" class="err-details" open>
+          <summary>Technical details</summary>
+          <pre id="error-detail" class="err-detail"></pre>
+        </details>
+      </div>
     </div>
     <script>
-      // Listen for real lifecycle events emitted by the Rust backend. This page does no
-      // IPC commands of its own; it only renders status the engine reports.
+      // Render real lifecycle events emitted by the Rust backend and the durable native
+      // snapshot that closes the gap before this page has installed its listener.
       const statusEl = document.getElementById("status");
       const errEl = document.getElementById("error");
+      const errTitleEl = document.getElementById("error-title");
+      const errGuidanceEl = document.getElementById("error-guidance");
+      const errDetailsEl = document.getElementById("error-details");
+      const errDetailEl = document.getElementById("error-detail");
       const spinnerEl = document.getElementById("spinner");
-      if (window.__TAURI__ && window.__TAURI__.event) {
+      function renderStartupState(payload) {
+        const p = payload || {};
+        if (p.message) statusEl.textContent = p.message;
+        if (p.error) {
+          const error = typeof p.error === "string"
+            ? { title: "Engine startup failed", detail: p.error }
+            : p.error;
+          spinnerEl.classList.add("hidden");
+          errEl.classList.remove("hidden");
+          statusEl.textContent = "Engine could not start.";
+          errTitleEl.textContent = error.title || "Engine startup failed";
+          errGuidanceEl.textContent = error.guidance || "Review the technical details and retry.";
+          errDetailEl.textContent = error.detail || "No additional diagnostics were available.";
+          errDetailsEl.open = true;
+        }
+      }
+      // Requires `app.withGlobalTauri` in tauri.conf.json. This page has no bundler and no
+      // npm dependency, so the API has to arrive as a global; without that flag __TAURI__ is
+      // undefined, this guard is false, and every startup failure -- including a missing
+      // sidecar -- renders as a spinner that turns forever.
+      if (window.__TAURI__ && window.__TAURI__.event && window.__TAURI__.core) {
         window.__TAURI__.event.listen("engine-status", (e) => {
-          const p = e.payload || {};
-          if (p.message) statusEl.textContent = p.message;
-          if (p.error) {
-            spinnerEl.classList.add("hidden");
-            errEl.classList.remove("hidden");
-            errEl.textContent = p.error;
-          }
+          renderStartupState(e.payload);
+        }).then(() => {
+          window.__TAURI__.core.invoke("startup_snapshot")
+            .then(renderStartupState)
+            .catch(() => {});
         });
       }
     </script>

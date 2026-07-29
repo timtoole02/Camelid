@@ -99,15 +99,13 @@ pub fn offload_run_status() -> Option<OffloadRunStatus> {
         .clone()
 }
 
-/// GPU-resident byte cost of one GGUF tensor. Q8_0 is stored on disk as 34-byte
-/// blocks (f16 scale + 32 i8) but the engine holds/uploads it as 36-byte blocks
-/// (f32 scale + 32 i8), so VRAM accounting must use 36. Other dtypes are the same
-/// in memory as on disk.
+/// GPU-resident byte cost of one GGUF tensor. Q8_0 keeps its 34-byte footprint
+/// (32 i8 quants plus f16 scale bits) in the resident SoA layout.
 fn tensor_gpu_bytes(desc: &crate::gguf::GgufTensorDescriptor) -> u64 {
     use crate::gguf::GgufTensorType;
     let elements: u64 = desc.dimensions.iter().product();
     match desc.tensor_type {
-        GgufTensorType::Q8_0 => elements.div_ceil(32) * 36,
+        GgufTensorType::Q8_0 => elements.div_ceil(32) * 34,
         _ => desc.n_bytes,
     }
 }
@@ -189,8 +187,8 @@ impl OffloadPlan {
         let vocab = config.vocab_size.unwrap_or(0) as u64;
         let q_width = n_heads * head_dim;
         let kv_width = n_kv * head_dim;
-        // Q8_0: 36 bytes per 32-element block = 1.125 B/elem. Norms are f32.
-        let q8 = |params: u64| params.div_ceil(32) * 36;
+        // Q8_0: 34 bytes per 32-element block = 1.0625 B/elem. Norms are f32.
+        let q8 = |params: u64| params.div_ceil(32) * 34;
         let attn = 2 * hidden * q_width + 2 * hidden * kv_width; // q,o + k,v
         let ffn_p = 3 * hidden * ffn; // gate,up,down
         let per_layer = q8(attn + ffn_p) + 2 * hidden * 4 /*attn_norm + ffn_norm, f32*/;

@@ -2129,8 +2129,9 @@ fn qwen35_rope_tables(pos: usize, rope_base: f32, rope_dim: usize) -> (Vec<f32>,
 impl RunnableModel {
     /// Build a GPU resident decode engine for this qwen35 (Ornith) model: upload every
     /// layer (SSM or full-attn) + the LM head, mirroring the proven per-layer GPU
-    /// sequences. Maps each tensor's quant per-tensor (Q8_0 widened 34->36; K-quants
-    /// including q5_K raw passthrough), so the Q8_0, Q4_K_M, and Q3_K_M rows all
+    /// sequences. Maps each tensor's quant per-tensor (Q8_0 widened for the CPU seam,
+    /// then compacted to f16-scale SoA on upload; K-quants including q5_K raw
+    /// passthrough), so the Q8_0, Q4_K_M, and Q3_K_M rows all
     /// build.
     pub(crate) fn build_qwen35_resident(
         &self,
@@ -2139,8 +2140,9 @@ impl RunnableModel {
         use crate::cuda_resident::{widen_q8, CudaResidentDecode, ProjQuant};
         let rt = self.qwen35.as_ref().ok_or("not a qwen35 model")?;
         let ffn_dim = rt.layers[0].ffn_gate.out_features;
-        // Per-tensor quant: Q8_0 weights are widened 34->36 (set_*'s repack_for_lane
-        // then runs repack_q8_soa); K-quant (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K) bytes pass
+        // Per-tensor quant: Q8_0 weights are widened for the CPU seam (set_*'s
+        // repack_for_lane then compacts them to f16-scale SoA); K-quant
+        // (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K) bytes pass
         // through raw (the q2k/q3k/q4k/q5k/q6k GEMV kernels expand them on the fly).
         // Q5_K previously had no resident GEMV and was upcast to Q8_0 blocks at load
         // (~+40 MiB on stock Q3_K_M's four q5_K tensors); with `q5k_gemv` in-tree it
@@ -2666,7 +2668,7 @@ mod gpu_ssm_layer_tests {
             .map(|_| (0..hidden_dim).map(|_| nextf()).collect())
             .collect();
 
-        // ---- GPU: upload Q8_0 weights once (SoA-repacked, 34->36 widened) ----
+        // ---- GPU: upload Q8_0 weights once (compact f16-scale SoA) ----
         let s = &k.stream;
         let up = |m: &RawMat| s.clone_htod(&repack_q8_soa(&widen_q8(&m.bytes))).unwrap();
         let d_wq = up(wq);

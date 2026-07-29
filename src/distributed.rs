@@ -87,6 +87,7 @@ pub fn deserialize_tensor<R: Read>(reader: &mut R, name: String) -> std::io::Res
         dtype: RuntimeDType::F32,
         source_type: None,
         q8_0_blocks: None,
+        q8_0_shared_blocks: None,
         q8_0_packed_rows4_4x4: None,
         q8_0_packed_rows4_4x8: None,
         q8_0_runtime_storage: None,

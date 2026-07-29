@@ -19,7 +19,7 @@ const LOCAL_MODELS_STORAGE_KEY = 'camelid.localModels'
 const CONVERSATIONS_STORAGE_KEY = 'camelid.conversations'
 const MEMORIES_STORAGE_KEY = 'camelid.memories'
 const API_BASE_STORAGE_KEY = 'camelid.apiBase'
-const VALID_TABS = new Set(['chat', 'workspace', 'library', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'compatibility', 'telemetry'])
+const VALID_TABS = new Set(['chat', 'workspace', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'compatibility', 'telemetry'])
 // Where the UI looks for the camelid API by default:
 //   1. an explicit VITE_CAMELID_API_BASE override always wins;
 //   2. otherwise use the page origin. Production is served by Camelid directly;
@@ -283,6 +283,37 @@ function localRecordMatchesBackendId(record, backendModelId) {
   return backendModelId === record.id || backendModelId === record.runtime_model_name
 }
 
+/* The backend's own exact-artifact lane verdict for a model, looked up by the GGUF
+   filename it resolves to.
+
+   `/api/models/local` reports `lane_class`, which `classify_model_lane()` computes
+   from BOTH the real header architecture AND `filename_is_supported_exact_row()`.
+   The Models page has trusted it since lib/modelLanes.js, for a documented reason:
+   a compatibility row id concatenates the model's `general.finetune` token that the
+   release filename may omit (`qwen3_0_6b_instruct_q8_0` vs `Qwen3-0.6B-Q8_0.gguf`),
+   so filename-based identity matching demotes genuinely supported rows.
+
+   Carrying it here is what lets the chat gate reach the same verdict. Without it the
+   SAME FILE read as "Local chat ready" when the engine auto-loaded it at startup
+   (the id comes from GGUF metadata and matches the row) but "Runtime ready, support
+   gated" plus an "unverified, no parity guarantee" banner when the app loaded it
+   (the id is the filename, which does not) — one file, two contradictory claims,
+   decided by nothing more than which code path issued the load. */
+function laneClassByFilename(localList) {
+  const byFilename = new Map()
+  for (const entry of localList?.models || []) {
+    if (entry?.filename && entry?.lane_class) byFilename.set(entry.filename, entry.lane_class)
+  }
+  return byFilename
+}
+
+function modelFilename(model) {
+  return String(model?.model_path || model?.hf_filename || model?.id || '')
+    .split(/[\\/]/)
+    .filter(Boolean)
+    .pop() || ''
+}
+
 function modelMatchesHealthActive(model, health) {
   return modelRuntimeIdMatches(model, { active_model_id: health?.active_model_id })
 }
@@ -342,7 +373,7 @@ function modelFromBackend(item, health, currentModel, localRecord, apiBase) {
   }
 }
 
-function mergeModelLists({ modelItems, health, currentModel, localModels, apiBase }) {
+function mergeModelLists({ modelItems, health, currentModel, localModels, apiBase, laneClasses }) {
   const localRecords = localModels.map(normalizeLocalModelRecord).filter(Boolean)
   const byId = new Map()
   localRecords.forEach((record) => {
@@ -353,7 +384,14 @@ function mergeModelLists({ modelItems, health, currentModel, localModels, apiBas
     const mergedModel = modelFromBackend(item, health, currentModel, localRecord, apiBase)
     byId.set(mergedModel.id, mergedModel)
   })
-  return [...byId.values()].sort(compareModelsByName)
+  // Stamp the backend's lane verdict onto whichever record resolves to that file.
+  const lanes = laneClasses || new Map()
+  return [...byId.values()]
+    .map((model) => {
+      const laneClass = lanes.get(modelFilename(model))
+      return laneClass ? { ...model, lane_class: laneClass } : model
+    })
+    .sort(compareModelsByName)
 }
 
 function nowIso() {
@@ -434,6 +472,14 @@ function makeDashboard({ health, models, currentModel, capabilities, conversatio
       q8_runtime: health?.q8_runtime || null,
       ...executionRuntimeFields(health),
       status: health?.ok ? 'online' : 'offline',
+      // Absolute path of the running binary, disclosed by loopback servers only.
+      // Captured while the engine is UP so the offline banner can still name a
+      // command that actually runs after it goes down.
+      executable: health?.executable || null,
+      // Address the engine is really bound to. A restart command without this
+      // falls back to the default port, which either collides with whatever
+      // owns it or comes up somewhere this tab is not looking.
+      listen_addr: health?.listen_addr || null,
       api_base: apiBase,
       current_model: currentModel || null,
     },
@@ -668,6 +714,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
         currentModel,
         localModels: activeLocalModels,
         apiBase: normalizedApiBase,
+        laneClasses: laneClassByFilename(localList),
       })
       const nextDashboard = makeDashboard({
         health,

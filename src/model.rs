@@ -1,5 +1,7 @@
 use serde::Serialize;
 
+pub use crate::tensor::kv_quant::KvCacheQuantization;
+
 use crate::{
     gguf::{GgufFile, GgufTensorDescriptor},
     BackendError, Result,
@@ -13,6 +15,7 @@ pub struct LlamaModelConfig {
     pub feed_forward_length: u32,
     pub attention_head_count: u32,
     pub attention_head_count_kv: u32,
+    pub kv_quant: KvCacheQuantization,
     pub rope_dimension_count: Option<u32>,
     pub rope_freq_base: Option<f32>,
     pub rope_scaling_type: Option<String>,
@@ -38,6 +41,25 @@ pub struct LlamaModelConfig {
     /// against llama.cpp); `false` for llama/mistral/etc. The env override
     /// `CAMELID_ROPE_PAIRING` still takes precedence for diagnostics.
     pub rope_neox_pairing: bool,
+    /// NoPE (no-positional-encoding) layer step. When `Some(step)` with `step > 0`,
+    /// decoder layer `il` (0-based) SKIPS RoPE on BOTH Q and K whenever
+    /// `(il + 1) % step == 0`; every other layer ropes normally. `None` means every
+    /// layer is roped, which is the case for every admitted architecture except
+    /// `smollm3` (each verified against its llama.cpp graph builder).
+    ///
+    /// Hardcoded per architecture because llama.cpp hardcodes it too:
+    /// `hparams.n_no_rope_layer_step` has NO GGUF key backing it — llama.cpp
+    /// `src/models/smollm3.cpp:5` assigns the literal `4` in `load_arch_hparams`,
+    /// `src/llama-hparams.h:203` is only the struct default, and
+    /// `tests/test-llama-archs.cpp:93` records it as "hard-coded to 4". There is no
+    /// `LLM_KV_*` enum and no writer, so it cannot be inferred from the file.
+    ///
+    /// (HuggingFace's `SmolLM3Config` does carry a `no_rope_layers` array, but
+    /// llama.cpp ignores it. The parity target here is llama.cpp, so hardcoding 4
+    /// is the only parity-faithful choice — disclosed rather than hidden.)
+    ///
+    /// See [`LlamaModelConfig::layer_uses_rope`].
+    pub no_rope_layer_step: Option<u32>,
     /// Logit scale — applied before softmax, commonly in Command R models.
     pub logit_scale: Option<f32>,
     pub moe: Option<MixtralMoeMetadata>,
@@ -61,6 +83,23 @@ pub struct LlamaModelConfig {
 /// two against drift). It is a pure architecture-string check for classification
 /// (e.g. labeling a loaded model's lane); it makes NO support/parity claim — an
 /// implemented architecture is only *attemptable*, never automatically supported.
+///
+/// NOTE on `smollm3`: it is a **NoPE** architecture — every 4th layer (0-based
+/// `il` with `(il + 1) % 4 == 0`) skips RoPE on Q and K, per llama.cpp
+/// `src/models/smollm3.cpp:5,69`. Before that schedule was implemented this
+/// function claimed `smollm3` while the engine roped every layer, which is
+/// silently wrong output rather than a clean refusal. The skip now matches the
+/// reference graph on the **CPU path only**; the resident GPU engines fail closed
+/// to CPU for NoPE models (see `resident_decode_eligible`).
+///
+/// EVIDENCE OWED: no SmolLM3 GGUF has been run against the pinned llama.cpp
+/// reference, so there is no greedy-parity receipt. Unproven specifically:
+/// end-to-end token identity on real weights, tokenizer/chat-template fidelity,
+/// the interaction of NoPE layers with SmolLM3's long-context rope scaling, and
+/// every GPU lane (deliberately refused). The correct claim today is "smollm3 is
+/// attemptable and its NoPE schedule matches the reference graph" — NOT that
+/// smollm3 is supported. No ledger row claims it, and none should be added until
+/// a receipt exists.
 pub fn is_implemented_architecture(architecture: &str) -> bool {
     matches!(
         architecture,
@@ -78,6 +117,28 @@ pub fn is_implemented_architecture(architecture: &str) -> bool {
 }
 
 impl LlamaModelConfig {
+    /// True when decoder layer `layer_idx` (0-based) applies RoPE to Q and K.
+    ///
+    /// Verbatim llama.cpp `src/models/smollm3.cpp:69`:
+    /// `use_rope = (il + 1) % n_no_rope_layer_step != 0`.
+    ///
+    /// The `(il + 1)` is load-bearing and NOT interchangeable with `il % step`:
+    /// llama.cpp uses the `il % step` convention elsewhere
+    /// (`src/models/smallthinker.cpp:109`), and the two disagree on which layers
+    /// are skipped. For a 36-layer SmolLM3-3B this formula skips layers
+    /// 3, 7, 11, 15, 19, 23, 27, 31, 35 — including the final layer.
+    ///
+    /// A step of 0 is treated as "rope every layer", mirroring the `step > 0 &&`
+    /// guard in llama.cpp `src/models/afmoe.cpp:137` and keeping the modulo total.
+    pub fn layer_uses_rope(&self, layer_idx: usize) -> bool {
+        match self.no_rope_layer_step {
+            // `!x.is_multiple_of(step)` is exactly `x % step != 0`; spelled this
+            // way because clippy rejects the manual modulo under `-D warnings`.
+            Some(step) if step > 0 => !(layer_idx + 1).is_multiple_of(step as usize),
+            _ => true,
+        }
+    }
+
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
         let architecture = match gguf.architecture() {
             Some(
@@ -166,6 +227,10 @@ impl LlamaModelConfig {
             feed_forward_length,
             attention_head_count,
             attention_head_count_kv,
+            kv_quant: std::env::var("CAMELID_KV_QUANT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_default(),
             rope_dimension_count: gguf
                 .metadata_u32(&architecture_key(architecture, "rope.dimension_count")),
             rope_freq_base: gguf.metadata_f32(&architecture_key(architecture, "rope.freq_base")),
@@ -227,6 +292,7 @@ impl LlamaModelConfig {
             // with partial RoPE over the first `rope.dimension_count` (64) of the
             // 256-wide head — handled in the runnable qwen35 path.
             rope_neox_pairing: arch_uses_neox_rope_pairing(architecture),
+            no_rope_layer_step: arch_no_rope_layer_step(architecture),
             logit_scale: gguf.metadata_f32(&architecture_key(architecture, "logit_scale")),
             moe,
             gemma4,
@@ -745,6 +811,27 @@ impl Qwen35Metadata {
 /// conversions). Pure so the gate is unit-testable.
 fn arch_uses_neox_rope_pairing(architecture: &str) -> bool {
     matches!(architecture, "qwen2" | "qwen3" | "qwen35" | "phi3")
+}
+
+/// NoPE layer step per architecture.
+///
+/// `smollm3` is the only NoPE architecture in the admitted set: llama.cpp
+/// `src/models/smollm3.cpp:5` sets `n_no_rope_layer_step = 4` and its graph at
+/// `:69` gates both `ggml_rope_ext` calls on `(il + 1) % step != 0`.
+///
+/// Every other admitted architecture ropes unconditionally — verified against
+/// llama.cpp `models/llama.cpp:146,152`, `qwen2.cpp:86,92`, `qwen3.cpp:91,100`,
+/// `phi3.cpp:107,113` and `mistral3.cpp:137,143`. `gemma3`/`gemma4`/`qwen35`
+/// carry per-layer rope *bases* or schedules rather than skips, and those are
+/// modelled elsewhere (`Gemma4Metadata`, `Qwen35Metadata`,
+/// `runnable::model::layer_rope_base`), not here.
+///
+/// Pure so the gate is unit-testable without a model file.
+fn arch_no_rope_layer_step(architecture: &str) -> Option<u32> {
+    match architecture {
+        "smollm3" => Some(4),
+        _ => None,
+    }
 }
 
 fn architecture_key(architecture: &str, suffix: &str) -> String {
@@ -2036,6 +2123,29 @@ mod tests {
         assert!(!super::arch_uses_neox_rope_pairing("mistral"));
         assert!(!super::arch_uses_neox_rope_pairing("gemma3"));
         assert!(!super::arch_uses_neox_rope_pairing("gemma4"));
+    }
+
+    #[test]
+    fn no_rope_layer_step_covers_exactly_smollm3() {
+        // smollm3 is the ONLY NoPE architecture in the admitted set. llama.cpp
+        // `src/models/smollm3.cpp:5` hardcodes n_no_rope_layer_step = 4 (there is
+        // no GGUF key for it) and `:69` skips rotary on both Q and K when
+        // (il + 1) % 4 == 0.
+        assert_eq!(super::arch_no_rope_layer_step("smollm3"), Some(4));
+
+        // Every other admitted architecture ropes unconditionally, verified
+        // against its llama.cpp graph builder: models/llama.cpp:146,152 ·
+        // qwen2.cpp:86,92 · qwen3.cpp:91,100 · phi3.cpp:107,113 ·
+        // mistral3.cpp:137,143. gemma3/gemma4/qwen35 carry per-layer rope BASES
+        // or schedules — not skips — and those live in their own metadata.
+        for arch in [
+            "llama", "mistral", "qwen2", "qwen3", "qwen35", "gemma3", "gemma4", "phi3", "lfm2",
+        ] {
+            assert!(
+                super::arch_no_rope_layer_step(arch).is_none(),
+                "{arch} must not be treated as a NoPE architecture"
+            );
+        }
     }
 
     #[test]

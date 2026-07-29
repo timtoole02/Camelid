@@ -1,0 +1,91 @@
+{
+ "schema": "camelid.phi3.chat_prompt_token_parity.v1",
+ "all_match": true,
+ "cases": [
+  {
+   "prompt": "What is the capital of France?",
+   "rendered": "<|user|>\nWhat is the capital of France?<|end|>\n<|assistant|>\n",
+   "camelid_prompt_tokens": [
+    1,
+    32010,
+    1724,
+    338,
+    278,
+    7483,
+    310,
+    3444,
+    29973,
+    32007,
+    32001
+   ],
+   "reference_prompt_tokens": [
+    1,
+    32010,
+    1724,
+    338,
+    278,
+    7483,
+    310,
+    3444,
+    29973,
+    32007,
+    32001
+   ],
+   "prompt_token_match": true
+  },
+  {
+   "prompt": "Say hello.",
+   "rendered": "<|user|>\nSay hello.<|end|>\n<|assistant|>\n",
+   "camelid_prompt_tokens": [
+    1,
+    32010,
+    14891,
+    22172,
+    29889,
+    32007,
+    32001
+   ],
+   "reference_prompt_tokens": [
+    1,
+    32010,
+    14891,
+    22172,
+    29889,
+    32007,
+    32001
+   ],
+   "prompt_token_match": true
+  },
+  {
+   "prompt": "What is 2+2?",
+   "rendered": "<|user|>\nWhat is 2+2?<|end|>\n<|assistant|>\n",
+   "camelid_prompt_tokens": [
+    1,
+    32010,
+    1724,
+    338,
+    29871,
+    29906,
+    29974,
+    29906,
+    29973,
+    32007,
+    32001
+   ],
+   "reference_prompt_tokens": [
+    1,
+    32010,
+    1724,
+    338,
+    29871,
+    29906,
+    29974,
+    29906,
+    29973,
+    32007,
+    32001
+   ],
+   "prompt_token_match": true
+  }
+ ]
+}

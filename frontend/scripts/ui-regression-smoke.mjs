@@ -277,11 +277,22 @@ const modelLanesSource = read('../src/lib/modelLanes.js')
 const laneRowsSource = read('../src/components/models/LaneRows.jsx')
 const catalogBrowseSource = read('../src/components/models/CatalogLaneBrowse.jsx')
 const downloadsPanelSource = read('../src/components/models/DownloadsPanel.jsx')
+const modelActivationSource = read('../src/lib/modelActivation.js')
+const firstRunCardSource = read('../src/components/onboarding/FirstRunCard.jsx')
 assert.match(modelsViewSource, /bucketByLane\(spine\.local\.models, capabilities\)/, 'Models section membership must be derived from the live scan + contract at render time')
 assert.match(modelLanesSource, /isCompatibilitySupportedForModel\(capabilities, matchModel\(entry\)\)/, 'Models lane derivation must ask the shared contract matcher — the supported gate stays the contract voice')
 assert.doesNotMatch(modelsViewSource, /SUPPORTED_MODELS/, 'Models view must not place models from a hand-authored array')
 assert.doesNotMatch(modelsViewSource, /localStorage\.(get|set|remove)Item/, 'Models view must not read or write localStorage truth')
-assert.match(modelsViewSource, /api\/models\/inspect[\s\S]*setBlocker\(inspect\.blocker\)[\s\S]*return[\s\S]*api\/models\/load/, 'Models loads must inspect first and stop on typed blockers before any load attempt')
+/* The inspect-first load protocol moved into lib/modelActivation.js when the
+   first-run card became a second caller: two hand-written copies of an ordered
+   fail-closed sequence is how one of them loses a step. The invariant is unchanged
+   and now has one home, so it is asserted there — and both surfaces must route
+   through it rather than reach for the load endpoint directly.
+   (frontend/scripts/first-run-activation-smoke.mjs proves the ordering by
+   execution; this only pins that nobody re-forks the protocol.) */
+assert.match(modelActivationSource, /api\/models\/inspect[\s\S]*blocker[\s\S]*return[\s\S]*api\/models\/load/, 'Models loads must inspect first and stop on typed blockers before any load attempt')
+assert.match(modelsViewSource, /loadLocalModelForChat\(/, 'Models view must load through the shared activation protocol')
+assert.doesNotMatch(modelsViewSource, /api\/models\/load/, 'Models view must not hand-roll a second load path')
 assert.match(modelsViewSource, /UnsupportedBlocker/, 'typed fail-closed blockers must render verbatim through UnsupportedBlocker')
 assert.doesNotMatch(modelsViewSource, /supported_quantization|planned_quantization|supported_model_families|planned_model_families|getQuantCapability|quantCapabilityLabel|quantCapabilityCopy/, 'Models view should not render broad quant/family capability lists as support evidence')
 assert.match(laneRowsSource, /<EvidenceChip/, 'Models lane rows must render their status claims through the Evidence Chip')
@@ -292,12 +303,40 @@ assert.match(catalogBrowseSource, /Download and start/, 'curated catalog rows sh
 assert.match(catalogBrowseSource, /settlementInFlightRef\.current/, 'catalog settlement must be single-flight across polling ticks')
 assert.match(catalogBrowseSource, /canceledCatalogIds\.has\(item\.catalog_id\)/, 'catalog cancellation must be keyed by catalog identity, not filename')
 assert.match(catalogBrowseSource, /aria-label="Search model catalog"/, 'catalog search must have an explicit accessible name')
-assert.match(catalogBrowseSource, /downloadAndStart = lane === 'supported' && item\.fit !== 'wont_fit'/, 'automatic start must be limited to supported rows that are not known to exceed this host')
-assert.match(catalogBrowseSource, /item\.fit !== 'wont_fit'[\s\S]*item\.oracle_qualified/, 'known-wont-fit rows must not automatically run generic smoke admission')
-assert.match(modelsViewSource, /if \(!inspectRes\.ok\)[\s\S]*return \{ ok: false, stage: 'checking', message \}/, 'automatic activation must fail closed on an HTTP-level inspect failure')
-assert.match(modelsViewSource, /refreshCurrent\(\)[\s\S]*current\?\.path[\s\S]*active model/, 'automatic navigation must wait for current-model confirmation')
-assert.match(modelsViewSource, /v1\/health[\s\S]*health\.loaded_now[\s\S]*health\.generation_ready[\s\S]*health\.active_model_id !== filename/, 'automatic navigation must wait for live generation readiness and active-model identity')
+assert.match(catalogBrowseSource, /downloadAndStart = lane === 'supported' && !refusedByFit/, 'automatic start must be limited to supported rows that are not known to exceed this host')
+assert.match(catalogBrowseSource, /refusedByFit[\s\S]*item\.oracle_qualified/, 'rows this host cannot load must not automatically run generic smoke admission')
+// The refusal set must stay the FULL one. Testing `fit !== 'wont_fit'` alone was a
+// real defect: an `insufficient_free_memory` row would chain into a load that the
+// 422 preload guard refuses, since that guard blocks on both negative verdicts.
+assert.match(catalogBrowseSource, /const refusedByFit = isRefusingFit\(item\.fit\)/, 'auto-start must gate on every load-refusing verdict, not just wont_fit')
+assert.match(modelActivationSource, /if \(!inspectRes\.ok\)[\s\S]*return \{ ok: false, stage: CHECKING, message, code, blocker/, 'automatic activation must fail closed on an HTTP-level inspect failure')
+assert.match(modelActivationSource, /activeFilename !== filename[\s\S]*did not confirm/, 'automatic navigation must wait for current-model confirmation')
+assert.match(modelActivationSource, /v1\/health[\s\S]*health\.loaded_now[\s\S]*health\.generation_ready[\s\S]*health\.active_model_id !== filename/, 'automatic navigation must wait for live generation readiness and active-model identity')
+assert.match(modelsViewSource, /readActiveFilename: async \(\) => modelFilenameFromPath\(\(await spine\.refreshCurrent\(\)\)\?\.path\)/, 'the Models page must answer the identity check from its own current-model refresh')
 assert.match(appSource, /modelsVisited[\s\S]*hidden=\{tab !== 'library'\}/, 'Models must remain mounted after first visit so active downloads retain their activation coordinator')
+/* First-run activation, same rule for the same reason: an in-flight install must keep
+   its watcher when the user navigates, and it must not be unmounted the moment the
+   landed file stops making the host look like a fresh install. */
+assert.match(appSource, /firstRunActive = firstRun \|\| firstRunCardActive/, 'the first-run card must survive the host no longer looking fresh, for as long as it still owns the flow')
+assert.match(appSource, /firstRunActive &&[\s\S]*hidden=\{tab !== 'chat'\}/, 'the first-run card must stay mounted across navigation and for the whole activation')
+assert.match(firstRunCardSource, /RETAINED_PHASES = new Set\(\[\.\.\.IN_FLIGHT_PHASES, 'failed'\]\)/, "a failure still owns the flow: its retry is the only route to an artifact that already downloaded")
+assert.match(appSource, /isFirstRunHost\(\{ runtime, models \}\)/, 'first-run state must be derived from live runtime state, never from a stored onboarding flag')
+assert.doesNotMatch(firstRunCardSource, /localStorage/, 'first-run onboarding must not record itself in localStorage')
+assert.match(firstRunCardSource, /recommendFirstRunModel\(catalogItems, capabilities\)/, 'the first-run offer must be derived from the live catalog and the support contract')
+assert.match(firstRunCardSource, /settlementInFlightRef/, 'first-run settlement must be single-flight across polling ticks')
+assert.match(firstRunCardSource, /catalog\/cancel/, 'a first-run download must stay cancellable')
+assert.match(firstRunCardSource, /warmGenerationPath/, 'the first message after activation must not pay the cold engine build')
+/* A failure AFTER the artifact landed must retry the check/load, never the download:
+   re-installing refetches the whole file and drops the completed record, and the new
+   download's rename onto the existing GGUF can fail. */
+assert.match(firstRunCardSource, /firstRunRetryAction\(\{ artifactInstalled \}\)/, 'the retry target must be decided by whether the artifact landed')
+assert.match(firstRunCardSource, /retryTarget === 'activate' \? retryActivation : startDownload/, 'a landed artifact must retry activation instead of re-downloading')
+/* Cancelling is a request, not a fact: 200 stopped a download, 409 means it finished
+   first and KEPT its file, 404 can mean the install has not registered yet. */
+assert.match(firstRunCardSource, /confirmed = res\.ok/, 'only a successful cancel counts as a confirmed stop')
+assert.match(firstRunCardSource, /observeAfterCancel\(\)/, 'the cancel outcome must be decided by re-reading downloads plus the local scan')
+assert.match(firstRunCardSource, /firstRunCancelOutcome\(\{ confirmed, \.\.\.observed \}\)/, 'and routed through the shared outcome rule')
+assert.doesNotMatch(firstRunCardSource, /finally \{[\s\S]{0,200}fail\('Download canceled/, 'cancellation must never be reported unconditionally from a finally block')
 assert.match(modelsViewSource, /loadInFlightRef\.current[\s\S]*(already loading|finish loading, then retry)/, 'model loading must be single-flight across catalog completions')
 assert.match(modelsViewSource, /deleteLocalModel\(entry\)/, 'local deletion must submit the scanned entry identity rather than filename alone')
 assert.match(modelsViewSource, /Delete model from disk\?/, 'local model deletion must require destructive confirmation')
@@ -534,5 +573,15 @@ assert.match(chatCss, /\.message-live-generation-badge\s*\{/, 'streaming assista
 assert.match(chatCss, /\.message-live-dot\s*\{[^}]*animation:\s*cxPulse/s, 'live generation badges should visibly pulse only while the badge is rendered')
 assert.match(uiCss, /@keyframes cxPulse/, 'the live pulse keyframes must exist')
 assert.match(tokensCss, /@keyframes camelidDotBounce/, 'the streaming dot bounce keyframes must exist')
+
+/* ---- Catalog browse logic ----
+   Runs the unit smoke for src/lib/catalogBrowse.js (quantization ordering and
+   advice, repo grouping, default-quantization rules, the architecture partition,
+   and the unchecked/settled/retryable split) inside this job.
+
+   Imported here rather than added to the workflow because that is the frontend
+   suite CI already gates; a behavioural module with no gate is a regression
+   waiting to happen. The module asserts at import time and throws on failure. */
+await import('./catalog-browse-smoke.mjs')
 
 console.log('UI regression smoke passed (re-baselined Phase 2 pre-work)')

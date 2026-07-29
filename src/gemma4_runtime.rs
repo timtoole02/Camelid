@@ -3058,20 +3058,19 @@ fn cu(e: cudarc::driver::DriverError) -> BackendError {
 }
 
 /// Repack a GGUF Q8_0 weight tensor (34-byte blocks: f16 scale + 32 i8) into the
-/// SoA layout `q8_gemv` reads: all 32-i8 quant groups first, then all f32 scales
-/// (the f16 scale widened). Mirrors `cuda_resident::repack_q8_soa` but consumes
+/// compact SoA layout `q8_gemv` reads: all 32-i8 quant groups first, then the
+/// original f16 scale bits. Mirrors `cuda_resident::repack_q8_soa` but consumes
 /// the raw GGUF wire directly (that helper expects an already-f32-scale 36B block).
 #[cfg(feature = "cuda")]
 fn q8_wire_to_soa(wire: &[u8]) -> Vec<u8> {
     const W: usize = 34;
     let n = wire.len() / W;
-    let mut out = vec![0u8; n * 32 + n * 4];
+    let mut out = vec![0u8; n * 32 + n * 2];
     let (quants, scales) = out.split_at_mut(n * 32);
     for b in 0..n {
         let blk = &wire[b * W..b * W + W];
-        let sc = crate::inference::f16_bits_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
         quants[b * 32..b * 32 + 32].copy_from_slice(&blk[2..34]);
-        scales[b * 4..b * 4 + 4].copy_from_slice(&sc.to_le_bytes());
+        scales[b * 2..b * 2 + 2].copy_from_slice(&blk[0..2]);
     }
     out
 }

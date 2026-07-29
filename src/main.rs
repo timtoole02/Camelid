@@ -30,11 +30,11 @@ use camelid::{
         LlamaSampler, Q8ResidencyReport, SamplingConfig,
     },
     metal::detect_metal_device,
-    model::{LlamaModelConfig, LlamaTensorBinding},
+    model::{KvCacheQuantization, LlamaModelConfig, LlamaTensorBinding},
     tensor::{CpuTensor, Q8_0TensorBlocks, TensorStore},
     tokenizer::Tokenizer,
 };
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use rayon::ThreadPoolBuilder;
 use serde::Serialize;
 
@@ -83,15 +83,138 @@ fn default_launch_command() -> Command {
         // arg does not apply here; read CAMELID_GPU explicitly, like the sibling
         // env-backed fields above. Default (and any unrecognised value) is Auto.
         gpu: GpuMode::from_env(),
+        kv_quant: std::env::var("CAMELID_KV_QUANT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_default(),
+        server: ServerPolicyArgs::from_env(),
     }
 }
 
-/// Find a GGUF to load when `serve` is started without an explicit `--model`,
-/// so the open-and-use launch lands directly in a usable chat. Looks next to the
-/// executable (the shipped layout: `camelid.exe` beside a `models/` folder) and
-/// in the working directory; returns the first `*.gguf` found.
-fn auto_select_model() -> Option<PathBuf> {
+#[derive(Clone, Debug, Args)]
+struct ServerPolicyArgs {
+    /// Require this bearer/API key on network API routes. Prefer
+    /// --api-key-file on shared machines so the secret is not present in the
+    /// process command line.
+    #[arg(long, env = "CAMELID_API_KEY", conflicts_with = "api_key_file")]
+    api_key: Option<String>,
+    /// Read the bearer/API key from a text file (one trailing newline is
+    /// ignored). Mutually exclusive with --api-key.
+    #[arg(long, env = "CAMELID_API_KEY_FILE")]
+    api_key_file: Option<PathBuf>,
+    /// Browser origin allowed to make cross-origin requests. Repeat the flag
+    /// or use a comma-separated CAMELID_CORS_ORIGINS value. No origins are
+    /// allowed by default; the embedded same-origin UI remains available.
+    #[arg(
+        long = "cors-origin",
+        env = "CAMELID_CORS_ORIGINS",
+        value_delimiter = ','
+    )]
+    cors_origins: Vec<String>,
+    /// Explicitly permit an unauthenticated non-loopback listener. Without
+    /// this acknowledgement or an API key, Camelid refuses the bind.
+    #[arg(
+        long,
+        env = "CAMELID_ALLOW_UNAUTHENTICATED_REMOTE",
+        default_value_t = false
+    )]
+    allow_unauthenticated_remote: bool,
+    /// PEM certificate chain for HTTPS. Requires --tls-key.
+    #[arg(long, env = "CAMELID_TLS_CERT", requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+    /// PEM private key for HTTPS. Requires --tls-cert.
+    #[arg(long, env = "CAMELID_TLS_KEY", requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
+    /// Maximum decoded HTTP request body.
+    #[arg(
+        long,
+        env = "CAMELID_MAX_REQUEST_BODY_BYTES",
+        default_value_t = 16 * 1024 * 1024
+    )]
+    max_request_body_bytes: usize,
+    /// Maximum number of prompt tokens accepted by generation endpoints.
+    #[arg(long, env = "CAMELID_MAX_PROMPT_TOKENS", default_value_t = 131_072)]
+    max_prompt_tokens: usize,
+    /// Maximum max_tokens allowance accepted per generation request.
+    #[arg(long, env = "CAMELID_MAX_GENERATION_TOKENS", default_value_t = 8_192)]
+    max_generation_tokens: u32,
+    /// Maximum model download size accepted by the catalog installer.
+    #[arg(
+        long,
+        env = "CAMELID_MAX_DOWNLOAD_BYTES",
+        default_value_t = 64 * 1024 * 1024 * 1024
+    )]
+    max_download_bytes: u64,
+}
+
+impl ServerPolicyArgs {
+    fn from_env() -> Self {
+        fn parsed<T: std::str::FromStr>(name: &str, default: T) -> T {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(default)
+        }
+        fn enabled(name: &str) -> bool {
+            std::env::var(name)
+                .map(|value| {
+                    matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+                .unwrap_or(false)
+        }
+        Self {
+            api_key: std::env::var("CAMELID_API_KEY").ok(),
+            api_key_file: std::env::var_os("CAMELID_API_KEY_FILE").map(PathBuf::from),
+            cors_origins: std::env::var("CAMELID_CORS_ORIGINS")
+                .ok()
+                .map(|origins| {
+                    origins
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|origin| !origin.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            allow_unauthenticated_remote: enabled("CAMELID_ALLOW_UNAUTHENTICATED_REMOTE"),
+            tls_cert: std::env::var_os("CAMELID_TLS_CERT").map(PathBuf::from),
+            tls_key: std::env::var_os("CAMELID_TLS_KEY").map(PathBuf::from),
+            max_request_body_bytes: parsed("CAMELID_MAX_REQUEST_BODY_BYTES", 16 * 1024 * 1024),
+            max_prompt_tokens: parsed("CAMELID_MAX_PROMPT_TOKENS", 131_072),
+            max_generation_tokens: parsed("CAMELID_MAX_GENERATION_TOKENS", 8_192),
+            max_download_bytes: parsed("CAMELID_MAX_DOWNLOAD_BYTES", 64 * 1024 * 1024 * 1024),
+        }
+    }
+
+    fn into_serve_options(self) -> api::ServeOptions {
+        api::ServeOptions {
+            api_key: self.api_key,
+            api_key_file: self.api_key_file,
+            cors_origins: self.cors_origins,
+            allow_unauthenticated_remote: self.allow_unauthenticated_remote,
+            tls_cert: self.tls_cert,
+            tls_key: self.tls_key,
+            max_request_body_bytes: self.max_request_body_bytes,
+            max_prompt_tokens: self.max_prompt_tokens,
+            max_generation_tokens: self.max_generation_tokens,
+            max_download_bytes: self.max_download_bytes,
+        }
+    }
+}
+
+/// Find the effective default GGUF when `serve` starts without an explicit
+/// `--model`. The configured models directory wins (this is where the desktop
+/// sidecar stores downloads), followed by the historical shipped/CWD layouts.
+/// Within each directory an explicit saved preference wins; otherwise the first
+/// local GGUF is the zero-configuration default.
+fn auto_select_model(configured_models_dir: Option<&std::path::Path>) -> Option<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = configured_models_dir {
+        dirs.push(dir.to_path_buf());
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
             dirs.push(parent.join("models"));
@@ -101,22 +224,29 @@ fn auto_select_model() -> Option<PathBuf> {
     dirs.push(PathBuf::from("models"));
     dirs.push(PathBuf::from("."));
     for dir in dirs {
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            let mut ggufs: Vec<PathBuf> = entries
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| {
-                    path.extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
-                })
-                .collect();
-            ggufs.sort();
-            if let Some(first) = ggufs.into_iter().next() {
-                return Some(first);
-            }
+        if let Some(choice) = camelid::model_default::effective_default_model(&dir) {
+            return Some(choice.path);
         }
     }
     None
+}
+
+#[cfg(test)]
+mod auto_select_model_tests {
+    use super::auto_select_model;
+
+    #[test]
+    fn configured_desktop_models_directory_wins_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("first.gguf"), []).unwrap();
+        std::fs::write(dir.path().join("preferred.gguf"), []).unwrap();
+        camelid::model_default::set_default_model(dir.path(), "preferred.gguf").unwrap();
+
+        assert_eq!(
+            auto_select_model(Some(dir.path())),
+            Some(dir.path().join("preferred.gguf"))
+        );
+    }
 }
 
 /// Windows + CUDA: make the NVIDIA runtime DLLs (NVRTC etc.) loadable without the
@@ -566,8 +696,7 @@ enum Command {
         /// exact token mapping).
         #[arg(long, env = "CAMELID_SPEC_DRAFT_MODEL")]
         spec_draft_model: Option<PathBuf>,
-        /// Draft tokens proposed per speculation round (default: 8 for
-        /// ngram, 5 for draft).
+        /// Draft tokens proposed per speculation round (default: 5).
         #[arg(long, env = "CAMELID_SPEC_DRAFT_TOKENS")]
         spec_draft_tokens: Option<usize>,
         /// Do not open the web UI in a browser on startup. By default, when run
@@ -604,6 +733,12 @@ enum Command {
         /// env seed, and the Settings toggle can still flip state live after startup.
         #[arg(long = "gpu", value_enum, default_value_t = GpuMode::Auto, env = "CAMELID_GPU")]
         gpu: GpuMode,
+        /// KV cache quantization format: "f16" (default, unquantized), "q8_0"
+        /// (50% memory savings), or "q4_0" (75% memory savings).
+        #[arg(long, env = "CAMELID_KV_QUANT", default_value_t = KvCacheQuantization::F16)]
+        kv_quant: KvCacheQuantization,
+        #[command(flatten)]
+        server: ServerPolicyArgs,
     },
     /// Interactive terminal chat REPL over the local Camelid API.
     ///
@@ -799,6 +934,8 @@ enum Command {
         /// Override Rayon worker threads
         #[arg(long, env = "CAMELID_THREADS")]
         threads: Option<usize>,
+        #[command(flatten)]
+        server: ServerPolicyArgs,
     },
     /// Benchmark raw TCP latency and bandwidth between Coordinator and Worker.
     #[command(hide = true)]
@@ -1550,7 +1687,10 @@ async fn main() -> anyhow::Result<()> {
             enable_thinking,
             models_dir,
             gpu,
+            kv_quant,
+            server,
         } => {
+            std::env::set_var("CAMELID_KV_QUANT", kv_quant.to_string());
             configure_rayon_threads(threads)?;
             camelid::capability::HardwareProfile::detect().log();
             // In deterministic mode the engine fails every Metal gate closed (see
@@ -1598,12 +1738,22 @@ async fn main() -> anyhow::Result<()> {
             unsafe {
                 pthread_set_qos_class_self_np(0x09, 0); // QOS_CLASS_BACKGROUND (forces network I/O onto E-cores)
             }
-            // Open-and-use launch: if no model was named, load the first GGUF we
-            // can find (beside the exe or in ./models) so the UI lands in a chat.
-            let model = model.or_else(auto_select_model);
+            // Open-and-use launch: if no model was named, load the user's saved
+            // default from the configured model library. With no saved choice,
+            // the first local GGUF is the zero-configuration default.
+            let model = model.or_else(|| auto_select_model(models_dir.as_deref()));
             // Open the browser only when run interactively and not opted out.
             let open_ui = !no_open && std::io::IsTerminal::is_terminal(&std::io::stdout());
-            api::serve(addr, threads, model, open_ui, enable_thinking, models_dir).await?
+            api::serve(
+                addr,
+                threads,
+                model,
+                open_ui,
+                enable_thinking,
+                models_dir,
+                server.into_serve_options(),
+            )
+            .await?
         }
         Command::Chat {
             model,
@@ -1721,6 +1871,7 @@ async fn main() -> anyhow::Result<()> {
             layer_range,
             model,
             threads,
+            server,
         } => {
             configure_rayon_threads(threads)?;
 
@@ -1754,7 +1905,16 @@ async fn main() -> anyhow::Result<()> {
                 unsafe {
                     pthread_set_qos_class_self_np(0x09, 0); // QOS_CLASS_BACKGROUND (forces network I/O onto E-cores)
                 }
-                api::serve(addr, threads, Some(model), false, false, None).await?
+                api::serve(
+                    addr,
+                    threads,
+                    Some(model),
+                    false,
+                    false,
+                    None,
+                    server.into_serve_options(),
+                )
+                .await?
             } else if role == "worker" {
                 let gguf = camelid::gguf::read_metadata(&model)?;
                 let config = camelid::model::LlamaModelConfig::from_gguf(&gguf)?;
@@ -4302,6 +4462,7 @@ fn known_arch_config(arch: &str) -> anyhow::Result<LlamaModelConfig> {
         feed_forward_length,
         attention_head_count: heads,
         attention_head_count_kv: kv_heads,
+        kv_quant: camelid::model::KvCacheQuantization::F16,
         rope_dimension_count: None,
         rope_freq_base: None,
         rope_scaling_type: None,
@@ -4314,6 +4475,7 @@ fn known_arch_config(arch: &str) -> anyhow::Result<LlamaModelConfig> {
         file_type: Some(7), // Q8_0
         attention_key_length: None,
         rope_neox_pairing: false,
+        no_rope_layer_step: None,
         moe: None,
         gemma4: None,
         qwen35: None,

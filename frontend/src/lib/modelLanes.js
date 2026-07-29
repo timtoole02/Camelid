@@ -19,7 +19,27 @@ export function matchModel(entry) {
   }
 }
 
+/* The backend's own exact-artifact verdict for this local file. `lane_class`
+   comes from /api/models/local, where classify_model_lane() requires BOTH an
+   implemented `general.architecture` (parsed from the real header, never a
+   filename guess) AND filename_is_supported_exact_row() — an exact filename
+   equality against the curated catalog whose row id must also be in
+   supported_compatibility_row_ids(). That conjunction is strictly stronger
+   evidence than the frontend's subject-string matching, and it is the same
+   support contract resolved where the curated catalog actually lives.
+
+   It is needed because a compatibility row id concatenates the model's
+   `general.finetune` token, which the canonical release filename may omit:
+   `qwen3_4b_instruct_q8_0` vs `Qwen3-4B-Q8_0.gguf`. The local-lane record
+   carries only the filename, so the identity match cannot see "instruct" and
+   the file falls to a non-exact family match — demoting a genuinely supported,
+   loadable model into Experimental, where no "Use for chat" is offered. */
+function backendMarksSupported(entry) {
+  return entry?.lane_class === 'supported'
+}
+
 export function laneOf(entry, capabilities) {
+  if (backendMarksSupported(entry)) return 'supported'
   if (isCompatibilitySupportedForModel(capabilities, matchModel(entry))) return 'supported'
   if (entry.runnable_receipt_present) return 'compatible'
   if (entry.admitted && entry.oracle_qualified) return 'eligible'

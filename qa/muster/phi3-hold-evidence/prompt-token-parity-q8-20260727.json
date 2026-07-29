@@ -1,0 +1,65 @@
+{
+ "schema": "camelid.muster_prompt_token_parity/v1",
+ "method": "camelid tokenize --file (add_special=true, parse_special=false) vs pinned llama-server /tokenize add_special=true, raw text (no chat specials), same committed 8-prompt pack",
+ "artifact": "Phi-3-mini-4k-instruct-Q8_0.gguf",
+ "comparator": "llama.cpp 9632 (acd79d603) CPU (llama-server, -ngl 0 -ctk f32 -ctv f32 -fa off --no-repack)",
+ "all_match": true,
+ "prompts": [
+  {
+   "i": 0,
+   "camelid_n": 6,
+   "oracle_n": 6,
+   "match": true,
+   "first_diff": null
+  },
+  {
+   "i": 1,
+   "camelid_n": 71,
+   "oracle_n": 71,
+   "match": true,
+   "first_diff": null
+  },
+  {
+   "i": 2,
+   "camelid_n": 97,
+   "oracle_n": 97,
+   "match": true,
+   "first_diff": null
+  },
+  {
+   "i": 3,
+   "camelid_n": 119,
+   "oracle_n": 119,
+   "match": true,
+   "first_diff": null
+  },
+  {
+   "i": 4,
+   "camelid_n": 29,
+   "oracle_n": 29,
+   "match": true,
+   "first_diff": null
+  },
+  {
+   "i": 5,
+   "camelid_n": 38,
+   "oracle_n": 38,
+   "match": true,
+   "first_diff": null
+  },
+  {
+   "i": 6,
+   "camelid_n": 54,
+   "oracle_n": 54,
+   "match": true,
+   "first_diff": null
+  },
+  {
+   "i": 7,
+   "camelid_n": 2180,
+   "oracle_n": 2180,
+   "match": true,
+   "first_diff": null
+  }
+ ]
+}

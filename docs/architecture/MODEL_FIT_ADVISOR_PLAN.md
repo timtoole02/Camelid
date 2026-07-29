@@ -44,7 +44,7 @@ Every item below was read in-tree on branch `feat/model-fit-advisor` at
 
 | Concern | Location | What it gives us | Reused for |
 | --- | --- | --- | --- |
-| Host hardware probe | `src/capability.rs` → `HardwareProfile::detect()` | `cuda_available`, `cuda_vram_total_bytes`, `cuda_vram_free_bytes`, `cuda_compute_capability`, `cuda_tensor_cores`, `cpu_logical_cores`, `host_ram_total_bytes`, `host_ram_free_bytes`, `simd`. RAM probed on Windows (`GlobalMemoryStatusEx`) + Linux (`/proc/meminfo`); **returns `(0, 0)` = "unknown" elsewhere (incl. macOS)** | The complete input to the fit function |
+| Host hardware probe | `src/capability.rs` → `HardwareProfile::detect()` | `cuda_available`, `cuda_vram_total_bytes`, `cuda_vram_free_bytes`, `cuda_compute_capability`, `cuda_tensor_cores`, `cpu_logical_cores`, `host_ram_total_bytes`, `host_ram_free_bytes`, `simd`. RAM probed on Windows (`GlobalMemoryStatusEx`), Linux (`/proc/meminfo`), and macOS (`hw.memsize` + Mach VM statistics); returns `(0, 0)` = "unknown" on platforms without a probe | The complete input to the fit function |
 | VRAM headroom policy | `src/cuda_vram.rs` → `evaluate(free_bytes, alloc_bytes, min_headroom_mib) -> Result<VramPlan, VramShortfall>` | Pure, GPU-free, unit-tested arithmetic; default headroom `512 MiB` (env `CAMELID_MIN_VRAM_HEADROOM_MIB`) | Direct call for the VRAM branch of the verdict |
 | RAM/KV budget | `src/inference/kv_cache.rs::ensure_position_capacity` + `kv_bytes_per_token()` | KV projection; budget = `CAMELID_MAX_KV_CACHE_BYTES` else `max(80% avail, 25% total)` RAM | Reference for the KV term + the hard safety net that stays in place |
 | Curated catalog | `src/api/mod.rs` → `curated_catalog() -> Vec<CatalogItem>` (~16 rows) | `CatalogItem { catalog_id, name, repo_id, filename, size_bytes, downloads, likes, quant, architecture, license }` | The rows to annotate; `size_bytes` **is** the on-disk weight footprint |
@@ -70,7 +70,7 @@ Every item below was read in-tree on branch `feat/model-fit-advisor` at
 - **Advisory, not authoritative.** The estimate is a heuristic. The existing
   `VramShortfall` (mid-load) and `KvCacheBudgetExceeded` (mid-gen) guards remain
   the hard safety net and are the source of truth.
-- **Degrade to silence on unknowns.** When `host_ram_total_bytes == 0` (macOS) or
+- **Degrade to silence on unknowns.** When `host_ram_total_bytes == 0` or
   VRAM is unknown, the verdict is `Unknown` and the UI shows nothing scary — it
   **never blocks** a download on an unknown.
 - **Pure and testable.** All math lives in a GPU-free, unit-tested function, in
@@ -86,7 +86,7 @@ enum FitVerdict {
     FitsWithOffload,   // weights exceed VRAM but fit VRAM+host-RAM offload split (CUDA lane)
     CpuOnlyOk,         // no usable GPU, but fits host RAM
     WontFit,           // exceeds every available budget
-    Unknown,           // hardware unknown (e.g. macOS RAM probe returns 0) — advisory-blind
+    Unknown,           // hardware unknown or unavailable — advisory-blind
 }
 ```
 
@@ -353,11 +353,10 @@ tree):
 - **Honest RAM-budget docs (`fit.rs`).** The advisor's `max(80% available, 25% of
   total)` mirrors the *values* of the KV-cache budget constants but is an
   independent reimplementation over `HardwareProfile`. Documented the two real,
-  intentional divergences from the KV runtime guard: (1) different RAM source —
-  advisor probes Windows+Linux (unknown on macOS), the KV guard probes
-  Windows+macOS (unprobed on Linux), so the two enforce on *opposite* non-Windows
-  platforms; (2) on unprobed RAM the KV guard fails open (unbounded) while the
-  advisor abstains (`Unknown`).
+  intentional divergences from the KV runtime guard: (1) the advisor additionally
+  probes Linux, where the KV guard is unprobed; (2) on unprobed RAM the KV guard
+  fails open (unbounded) while the advisor abstains (`Unknown`). On macOS both
+  consumers reuse the same `hw.memsize` + Mach VM-statistics probe.
 - **Cached badge vs live guard (documented).** The catalog badge uses the cached
   startup hardware snapshot; the load guard re-probes live. After a model loads
   and consumes VRAM a badge may still read "fits" while the guard returns 422. The

@@ -1,19 +1,27 @@
-//! Quality-tier instrument (Lane B): in-Rust perplexity + format-routing policy.
+//! Quality-tier instrument (Lane B): in-Rust perplexity scoring.
 //!
 //! So lossy formats (Q4_K, Q5_K, …) can ship HONESTLY, we need a numeric
 //! fidelity measurement that does not depend on a GPU and whose methodology is
 //! validated against the established comparator (`llama-perplexity`). This
 //! module provides:
 //!
-//! - [`log_softmax_logprob`] / [`Perplexity`]: streaming negative-log-likelihood
+//! - [`negative_log_prob`] / [`Perplexity`]: streaming negative-log-likelihood
 //!   accumulation in `f64` over a model's per-position logits, exponentiated to
 //!   a perplexity. Pure math, unit-testable with synthetic logits (no model).
 //! - [`PerplexityConvention`]: documents and pins the scoring convention
 //!   (stride, BOS, which positions are scored) so it mirrors `llama-perplexity`.
-//! - [`routing`]: a default-format recommendation policy (e.g. prefer Q5_K for
-//!   small quant-sensitive models when the Q4_K perplexity delta is too large).
-
-pub mod routing;
+//!
+//! NOT provided: a format-routing policy. An earlier version of this doc listed a
+//! `routing` submodule ("prefer Q5_K for small quant-sensitive models when the
+//! Q4_K perplexity delta is too large") and the module declared `pub mod routing;`
+//! for a `routing.rs` that was never written and never tracked. Combined with the
+//! module never being declared in `lib.rs`, that made the declaration invisible
+//! rather than a build error. Both claims are now removed; if a routing policy is
+//! wanted, it should be added with its own evidence rather than re-declared here.
+//!
+//! SCOPE: this instrument computes perplexity from logits you hand it. It has no
+//! model-driving loop of its own yet, so it does not by itself replace the pinned
+//! external `llama-perplexity` comparator — see `basalt_eval_protocol.md`.
 
 /// The perplexity scoring convention, pinned to mirror `llama-perplexity`.
 ///
@@ -66,7 +74,7 @@ impl PerplexityConvention {
 /// max-subtraction trick so it never overflows. `logits` are the raw
 /// pre-softmax scores for the full vocabulary; `target` indexes the actual next
 /// token.
-pub fn log_softmax_logprob(logits: &[f32], target: usize) -> f64 {
+pub fn negative_log_prob(logits: &[f32], target: usize) -> f64 {
     debug_assert!(target < logits.len(), "target token out of vocab range");
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
     let mut sum_exp = 0.0f64;
@@ -94,7 +102,7 @@ impl Perplexity {
 
     /// Score one position: add `-log p(target | logits)`.
     pub fn observe(&mut self, logits: &[f32], target: usize) {
-        self.sum_nll += log_softmax_logprob(logits, target);
+        self.sum_nll += negative_log_prob(logits, target);
         self.scored += 1;
     }
 
@@ -170,15 +178,15 @@ mod tests {
     fn confident_correct_prediction_perplexity_near_one() {
         let mut logits = vec![0.0f32; 100];
         logits[42] = 50.0; // overwhelmingly confident
-        let nll = log_softmax_logprob(&logits, 42);
+        let nll = negative_log_prob(&logits, 42);
         assert!(nll < 1e-6, "confident-correct NLL should be ~0, got {nll}");
     }
 
-    /// log_softmax_logprob is numerically stable for large logits (no overflow).
+    /// negative_log_prob is numerically stable for large logits (no overflow).
     #[test]
     fn logprob_stable_for_large_logits() {
         let logits = vec![1000.0f32, 1000.0, 1000.0, 1000.0];
-        let nll = log_softmax_logprob(&logits, 0);
+        let nll = negative_log_prob(&logits, 0);
         // Uniform over 4 ⇒ -log(1/4) = ln(4).
         assert!((nll - 4.0f64.ln()).abs() < 1e-9, "got {nll}");
     }
@@ -188,8 +196,17 @@ mod tests {
     #[test]
     fn matches_hand_computed_softmax() {
         let logits = [0.0f32, 3.0f32.ln()];
-        let nll = log_softmax_logprob(&logits, 1);
-        assert!((nll - (-(0.75f64).ln())).abs() < 1e-9, "got {nll}");
+        let nll = negative_log_prob(&logits, 1);
+        // exp(0) : exp(ln 3) = 1 : 3, so p(target=1) = 3/4 and NLL = -ln(0.75).
+        //
+        // Tolerance is 1e-6, not 1e-9: the logits are f32, and `3.0f32.ln()`
+        // rounds to 1.09861230850219727 against a true ln(3) of
+        // 1.09861228866810970. That ~2e-8 input error propagates to ~5e-9 in the
+        // result, so a 1e-9 bound is unsatisfiable by construction no matter how
+        // exact the f64 arithmetic is. (This test had never been executed — the
+        // module was never declared in lib.rs — so the impossible bound went
+        // unnoticed. The function itself is correct.)
+        assert!((nll - (-(0.75f64).ln())).abs() < 1e-6, "got {nll}");
     }
 
     /// Order independence: scoring the same positions in a different order
@@ -244,7 +261,11 @@ mod tests {
             ppl.observe(l, *t);
             // independent reference
             let max = l.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
-            let lse = max + l.iter().map(|&x| ((x as f64) - max).exp()).sum::<f64>().ln();
+            let lse = max
+                + l.iter()
+                    .map(|&x| ((x as f64) - max).exp())
+                    .sum::<f64>()
+                    .ln();
             expected_sum += lse - l[*t] as f64;
         }
         assert_eq!(ppl.scored(), 3);

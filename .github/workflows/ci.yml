@@ -149,6 +149,14 @@ jobs:
       - name: Check ledger drift (ledger == code contract; surfaces consistent)
         run: node scripts/check-ledger-drift.mjs
 
+      # FitVerdict is serialized onto the catalog endpoints and the Models tab
+      # branches on those exact strings, which it re-declares as JS literals. No
+      # compiler links the two, and a frontend smoke asserting the frontend's own
+      # literals passes either way — so a renamed variant would reach users as a
+      # blank badge. Tie the vocabulary to src/fit.rs.
+      - name: Check fit-verdict vocabulary (WebUI == src/fit.rs)
+        run: node scripts/check-fit-verdict-vocabulary.mjs
+
       - name: Check CUDA batched-prefill parity gate wiring
         run: node scripts/check-cuda-prefill-parity-gate.mjs
 
@@ -226,6 +234,38 @@ jobs:
           RUST_MIN_STACK: 8388608
         run: cargo test --all-targets ${{ matrix.features }}
 
+      # The Windows linker reserves an 8 MiB stack for camelid.exe because the
+      # debug Clap parser needs it. Unit tests exercise a libtest executable,
+      # so they cannot prove the shipped debug binary starts. Keep this direct
+      # check adjacent to the standard test gate to catch a lost linker setting.
+      - name: Debug CLI startup (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Windows uses its default feature set here: build.rs enables CUDA for
+          # this target, matching the empty matrix.features value on this leg.
+          cargo build --bin camelid
+          if ($LASTEXITCODE -ne 0) {
+            throw "cargo build --bin camelid exited with $LASTEXITCODE"
+          }
+
+          # These were the historical overflowing entrypoints. Each constructs
+          # the full Clap command tree before producing its respective output.
+          $version = & .\target\debug\camelid.exe --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "debug camelid --version exited with $LASTEXITCODE"
+          }
+          if ($version -notmatch '^camelid\s+\S+') {
+            throw "unexpected debug version output: $version"
+          }
+          foreach ($arguments in @(@("--help"), @("serve", "--help"))) {
+            $display = $arguments -join " "
+            & .\target\debug\camelid.exe @arguments > $null
+            if ($LASTEXITCODE -ne 0) {
+              throw "debug camelid $display exited with $LASTEXITCODE"
+            }
+          }
+
       # Report, in the log, whether this runner can actually execute the macOS Metal test
       # lane. 56 device-gated tests in src/metal.rs and the draft-rollback regression guard
       # in src/inference/tests.rs all self-skip on a host with no usable GPU session, and a
@@ -242,10 +282,11 @@ jobs:
       - name: Docs
         run: cargo doc --no-deps ${{ matrix.features }}
 
-  # Windows-only build / lint / test of the additive camelid-desktop crate. The `rust`
+  # Windows build / lint / test of the additive camelid-desktop crate. The `rust`
   # job above scopes clippy/test/doc to default-members (the server), so without this the
-  # desktop crate would only be fmt-checked. Tauri/WebView2 is Windows-only and the crate
-  # is Windows-only, so this lives on its own leg rather than in the cross-OS `rust` matrix.
+  # desktop crate would only be fmt-checked. WebView2 is Windows-only, but the crate itself
+  # also builds on macOS (WKWebView), where the release `desktop-macos` job packages it;
+  # this leg covers the Windows build rather than joining the cross-OS `rust` matrix.
   # It needs no frontend build: the desktop app bundles only its static splash; the embedded
   # web UI lives in camelid.exe, which this job does not build. The base tauri.conf.json
   # declares no sidecar resources (those are in the bundle-only overlay), so the crate builds
@@ -326,6 +367,37 @@ jobs:
 
       - name: Frontend catalog activation smoke
         run: npm run smoke:catalog-activation
+
+      # Covers frontend/src/lib/firstRunActivation.js and lib/modelActivation.js:
+      # which model a fresh install is offered (supported_* rows only, fit-filtered,
+      # smallest first) and the inspect -> load -> readiness protocol behind the one
+      # click. Also asserts the shipped ledger row and the shipped catalog id still
+      # join, which is what makes the offer derived rather than hard-coded.
+      - name: Frontend first-run activation smoke
+        run: npm run smoke:first-run
+
+      # Component-level: mounts the real first-run card in a browser against a
+      # scripted backend and drives the two transitions that cannot be proved by
+      # rendering markup -- retrying AFTER the artifact landed (which must not
+      # re-download it) and cancelling when the backend disagrees that anything was
+      # cancelled (404 mid-start, 409 after completion, unreadable probes).
+      - name: Frontend first-run card component smoke
+        run: npm run smoke:first-run-card
+
+      # Component-level: the offline banner is the only surface a user sees when
+      # the engine dies with the tab still open, and its branch is chosen from a
+      # live probe of the dev-server launch hook. Drives both server shapes so the
+      # packaged build can never regress to offering a control it cannot honour,
+      # and the dev-server one-click Start keeps working.
+      - name: Frontend offline banner smoke
+        run: npm run smoke:offline-banner
+
+      # Covers frontend/src/lib/catalogBrowse.js: fit labels/details, the
+      # settled-vs-retryable `unknown` split, grouping and search ranking. The
+      # script shipped with the lane but was never wired here, so none of that
+      # logic was gated.
+      - name: Frontend catalog browse smoke
+        run: npm run smoke:catalog-browse
 
       - name: Frontend model deletion smoke
         run: npm run smoke:model-deletion

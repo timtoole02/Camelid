@@ -35,6 +35,14 @@ export function tokenizerEncodeBody() {
   return { text: 'Hello Camelid', add_special: true }
 }
 
+export function embeddingsBody(modelId) {
+  return {
+    model: modelId,
+    input: 'search_query: Which Camelid files implement semantic retrieval?',
+    dimensions: 256,
+  }
+}
+
 function curlGet(apiBase, path) {
   return `curl ${apiBase}${path}`
 }
@@ -81,6 +89,19 @@ function pythonSdk(apiBase, modelId, kind) {
       `client = OpenAI(base_url="${apiBase}/v1", api_key="not-needed-locally")`,
       'for model in client.models.list():',
       '    print(model.id)',
+    ].join('\n')
+  }
+  if (kind === 'embeddings') {
+    return [
+      'from openai import OpenAI',
+      '',
+      `client = OpenAI(base_url="${apiBase}/v1", api_key="not-needed-locally")`,
+      'result = client.embeddings.create(',
+      `    model="${modelId}",`,
+      '    input="search_query: Which Camelid files implement semantic retrieval?",',
+      '    dimensions=256,',
+      ')',
+      'print(len(result.data[0].embedding))',
     ].join('\n')
   }
   return null
@@ -221,9 +242,15 @@ export function workbenchEndpoints({ apiBase, modelId }) {
       id: 'v1_embeddings',
       method: 'POST',
       path: '/v1/embeddings',
-      gate: 'blocked',
-      featureRowId: 'fail_closed_native_compatibility_routes',
-      summary: 'Fail-closed: no embeddings runtime or compatibility contract exists. The route answers with a typed not_implemented error by design.',
+      gate: 'none',
+      featureRowId: 'openai_embeddings',
+      summary: 'Float embeddings for the exact supported Nomic encoder row. A typed model_not_loaded response is expected until that row is registered.',
+      body: embeddingsBody(model),
+      examples: {
+        curl: curlPost(base, '/v1/embeddings', embeddingsBody(model)),
+        python: pythonSdk(base, model, 'embeddings'),
+        js: jsFetch(base, '/v1/embeddings', embeddingsBody(model)),
+      },
     },
     {
       id: 'v1_responses',

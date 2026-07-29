@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, mem,
     process::Command,
     sync::{atomic::AtomicU64, Arc},
@@ -31,6 +31,7 @@ pub mod draft_merge;
 pub(crate) mod gemma4;
 mod kv_cache;
 mod kv_f16;
+pub mod kv_pool;
 mod metal_resident;
 mod metal_seam;
 mod q8_block_reader;
@@ -61,6 +62,10 @@ pub use diagnostic_config::{
 };
 pub use kv_cache::{
     KvDtype, KvLayout, LlamaKvCache, LlamaKvCachePlan, LlamaKvCachePositionTrace, LlamaKvCacheTrace,
+};
+pub use kv_pool::{
+    KvPoolError, KvPoolSnapshot, KvSequenceCheckpoint, KvSequenceId, KvSequenceState,
+    UnifiedKvCachePool,
 };
 pub use q8_block_reader::Q8BlockReader;
 use q8_runtime::{
@@ -97,7 +102,11 @@ use crate::{
         LlamaMoeExpertTensors, LlamaTensorBinding,
     },
     tensor::{
-        dot_product, parse_byte_count_env, q8_0_file_read_stats, should_parallelize_linear_output,
+        dot_product,
+        kv_quant::{
+            axpy_row_q4_0, axpy_row_q8_0, vec_dot_row_q4_0, vec_dot_row_q8_0, KV_QUANT_BLOCK_VALUES,
+        },
+        parse_byte_count_env, q8_0_file_read_stats, should_parallelize_linear_output,
         with_q8_file_cache_capacity_override, CpuTensor, Q8_0Block, Q8_0FileBacking,
         Q8_0FileReadStats, Q8_0PackedRows4, Q8_0PackedRows4Block, Q8_0PackedRows4Interleave,
         Q8_0RuntimeStorage, Q8_0VnniPacked, Q8_0VnniTile16, TensorShape, TensorStore,
@@ -333,6 +342,141 @@ pub struct Q8ResidencyReport {
     pub violations: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MoeResidentMemoryEstimate {
+    resident_bytes: u64,
+    transient_bytes: u64,
+}
+
+fn q8_0_descriptor_resident_bytes(desc: &crate::gguf::GgufTensorDescriptor) -> Result<u64> {
+    if desc.tensor_type != GgufTensorType::Q8_0 {
+        return Err(BackendError::UnsupportedTensorType(format!(
+            "resident MoE tensor {} has storage type {:?}; resident_q8 requires Q8_0",
+            desc.name, desc.tensor_type
+        )));
+    }
+    let elements = desc.dimensions.iter().try_fold(1u64, |count, dim| {
+        count.checked_mul(*dim).ok_or_else(|| {
+            BackendError::InvalidModelMetadata(format!(
+                "MoE expert tensor {} element count overflowed u64",
+                desc.name
+            ))
+        })
+    })?;
+    if !elements.is_multiple_of(Q8_0_BLOCK_VALUES as u64) {
+        return Err(BackendError::InvalidTensorData(format!(
+            "MoE expert tensor {} has {elements} elements, not Q8_0 block aligned",
+            desc.name
+        )));
+    }
+    (elements / Q8_0_BLOCK_VALUES as u64)
+        .checked_mul(mem::size_of::<Q8_0Block>() as u64)
+        .ok_or_else(|| {
+            BackendError::InvalidModelMetadata(format!(
+                "MoE expert tensor {} resident-byte estimate overflowed u64",
+                desc.name
+            ))
+        })
+}
+
+fn selected_moe_expert_storage_bytes(
+    binding: &LlamaTensorBinding,
+    layer_range: Option<&std::ops::Range<usize>>,
+) -> Result<MoeResidentMemoryEstimate> {
+    let mut names = HashSet::new();
+    let mut estimate = MoeResidentMemoryEstimate::default();
+    for (layer_idx, layer) in binding.layers.iter().enumerate() {
+        if layer_range.is_some_and(|range| !range.contains(&layer_idx)) {
+            continue;
+        }
+        let expert_sets = match &layer.ffn {
+            LlamaFfnTensors::Dense { .. } => continue,
+            LlamaFfnTensors::MoE {
+                gate_experts,
+                up_experts,
+                down_experts,
+                ..
+            }
+            | LlamaFfnTensors::DeepSeekMoE {
+                gate_experts,
+                up_experts,
+                down_experts,
+                ..
+            } => [gate_experts, up_experts, down_experts],
+        };
+        for expert_set in expert_sets {
+            let mut split_transient = 0u64;
+            for desc in expert_set.descriptors() {
+                let resident_bytes = q8_0_descriptor_resident_bytes(desc)?;
+                if names.insert(desc.name.as_str()) {
+                    estimate.resident_bytes = estimate
+                        .resident_bytes
+                        .checked_add(resident_bytes)
+                        .ok_or_else(|| {
+                        BackendError::InvalidModelMetadata(
+                            "MoE expert resident-byte estimate overflowed u64".to_string(),
+                        )
+                    })?;
+                }
+                let descriptor_transient = match expert_set {
+                    LlamaMoeExpertTensors::Merged(_) => desc.n_bytes,
+                    LlamaMoeExpertTensors::Split(_) => {
+                        desc.n_bytes.checked_add(resident_bytes).ok_or_else(|| {
+                            BackendError::InvalidModelMetadata(
+                                "MoE expert transient-byte estimate overflowed u64".to_string(),
+                            )
+                        })?
+                    }
+                };
+                split_transient = split_transient.max(descriptor_transient);
+            }
+            estimate.transient_bytes = estimate.transient_bytes.max(split_transient);
+        }
+    }
+    Ok(estimate)
+}
+
+fn resident_moe_preflight_error(
+    estimate: MoeResidentMemoryEstimate,
+    ram_status: Option<(u64, u64)>,
+) -> Option<String> {
+    if estimate.resident_bytes == 0 {
+        return None;
+    }
+    let (total, available) = ram_status?;
+    let headroom = crate::gait::ram_headroom_floor(total);
+    let required_available = estimate
+        .resident_bytes
+        .saturating_add(estimate.transient_bytes)
+        .saturating_add(headroom);
+    (available < required_available).then(|| {
+        format!(
+            "resident MoE experts require {:.2} GiB resident plus {:.2} GiB loader scratch and {:.2} GiB host headroom, but only {:.2} GiB is currently available; use {}=file_backed or free RAM",
+            estimate.resident_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            estimate.transient_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            headroom as f64 / (1024.0 * 1024.0 * 1024.0),
+            available as f64 / (1024.0 * 1024.0 * 1024.0),
+            crate::runtime_config::MOE_EXPERT_STORAGE_ENV,
+        )
+    })
+}
+
+fn preflight_resident_moe_experts(estimate: MoeResidentMemoryEstimate) -> Result<()> {
+    if estimate.resident_bytes == 0 {
+        return Ok(());
+    }
+    let ram_status = crate::gait::host_ram_status().ok_or_else(|| {
+        BackendError::UnsupportedTensorType(format!(
+            "{}=resident_q8 requires a live physical-RAM probe on this platform",
+            crate::runtime_config::MOE_EXPERT_STORAGE_ENV
+        ))
+    })?;
+    if let Some(message) = resident_moe_preflight_error(estimate, Some(ram_status)) {
+        return Err(BackendError::UnsupportedTensorType(message));
+    }
+    Ok(())
+}
+
 impl LlamaLoadedWeights {
     pub fn output_projection(&self) -> &CpuTensor {
         self.output.as_ref().unwrap_or(&self.token_embedding)
@@ -343,8 +487,9 @@ impl LlamaLoadedWeights {
     /// runtime-repacked-without-blocks is reported as a violation so callers (the
     /// distributed CLI nodes) can hard-fail instead of silently streaming weights from disk
     /// per token. Unowned pipeline layers are zero-element placeholders with no
-    /// `source_type` and are skipped naturally. MoE expert tensors are file-backed by
-    /// design and are excluded (the resident decode path rejects MoE models anyway).
+    /// `source_type` and are skipped naturally. MoE expert tensors are excluded because
+    /// the dense resident-decode path rejects MoE models; their residency is governed by
+    /// the separate, live-memory-gated MoE expert storage policy.
     pub fn q8_0_residency_report(&self) -> Q8ResidencyReport {
         let mut report = Q8ResidencyReport::default();
         let mut audit = |tensor: &CpuTensor| {
@@ -501,6 +646,19 @@ impl LlamaLoadedWeights {
                  from disk per token instead of residing in RAM (expect ~100x slower decode)"
             );
         }
+        let moe_expert_storage = crate::runtime_config::moe_expert_storage();
+        if moe_expert_storage == crate::runtime_config::MoeExpertStorage::ResidentQ8 {
+            let estimate = selected_moe_expert_storage_bytes(binding, layer_range.as_ref())?;
+            preflight_resident_moe_experts(estimate)?;
+            if estimate.resident_bytes > 0 {
+                eprintln!(
+                    "[camelid] {}=resident_q8: retaining {:.2} GiB of MoE expert blocks in RAM ({:.2} GiB peak loader scratch)",
+                    crate::runtime_config::MOE_EXPERT_STORAGE_ENV,
+                    estimate.resident_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                    estimate.transient_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                );
+            }
+        }
         let load_linear = |name: &str| {
             // K-quant (Q4_K / Q6_K) 2-D linears: retain only the raw super-block wire
             // bytes (no f32 materialization ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â an 8B model fully decoded to f32 is ~32 GB
@@ -537,7 +695,14 @@ impl LlamaLoadedWeights {
             }
         };
         let load_moe_experts = |experts: &LlamaMoeExpertTensors| match experts {
-            LlamaMoeExpertTensors::Merged(desc) => store.load_q8_0_file_backed_tensor(&desc.name),
+            LlamaMoeExpertTensors::Merged(desc) => match moe_expert_storage {
+                crate::runtime_config::MoeExpertStorage::FileBacked => {
+                    store.load_q8_0_file_backed_tensor(&desc.name)
+                }
+                crate::runtime_config::MoeExpertStorage::ResidentQ8 => {
+                    store.load_q8_0_block_backed_tensor(&desc.name)
+                }
+            },
             LlamaMoeExpertTensors::Split(descs) => {
                 let first = descs.first().ok_or_else(|| {
                     BackendError::InvalidModelMetadata(
@@ -547,11 +712,15 @@ impl LlamaLoadedWeights {
                 let mut dims: Vec<usize> =
                     first.dimensions.iter().map(|dim| *dim as usize).collect();
                 dims.push(descs.len());
-                store.load_q8_0_split_file_backed_tensor(
-                    format!("{}..{} split experts", first.name, descs.len()),
-                    dims,
-                    descs,
-                )
+                let name = format!("{}..{} split experts", first.name, descs.len());
+                match moe_expert_storage {
+                    crate::runtime_config::MoeExpertStorage::FileBacked => {
+                        store.load_q8_0_split_file_backed_tensor(name, dims, descs)
+                    }
+                    crate::runtime_config::MoeExpertStorage::ResidentQ8 => {
+                        store.load_q8_0_split_block_backed_tensor(name, dims, descs)
+                    }
+                }
             }
         };
         let token_embedding = if load_embedding {
@@ -1361,6 +1530,21 @@ pub struct LlamaMixtralMoeRowTrace {
     pub router_logits: Vec<f32>,
     pub selected_experts: Vec<usize>,
     pub selected_weights: Vec<f32>,
+    /// Per-selected-expert checkpoints at the exact diagnostic token. These
+    /// distinguish routing drift from expert projection/combine drift without
+    /// retaining full hidden or FFN vectors.
+    pub experts: Vec<LlamaMixtralMoeExpertTrace>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LlamaMixtralMoeExpertTrace {
+    pub expert_index: usize,
+    pub normalized_weight: f32,
+    pub gate: LlamaTensorStats,
+    pub up: LlamaTensorStats,
+    pub activation: LlamaTensorStats,
+    pub down: LlamaTensorStats,
+    pub weighted_down: LlamaTensorStats,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -2039,8 +2223,36 @@ pub struct SamplingConfig {
     pub top_p: Option<f32>,
     /// Minimum-probability filter: keep only tokens whose probability is at
     /// least `min_p * max_probability`. `None`/`0.0` disables it; `1.0` keeps
-    /// only the argmax. Applied after softmax, before `top_p`.
+    /// only the argmax.
+    ///
+    /// Applied *after* `top_p` and *before* temperature, matching the reference
+    /// chain order in llama.cpp `common/common.h`. Because it is a ratio test
+    /// against the peak, it is invariant to renormalization — but not to
+    /// temperature, which is why temperature must stay last.
     pub min_p: Option<f32>,
+    /// Locally-typical sampling (llama.cpp `typical_p`): keep the tokens whose
+    /// surprisal `-ln p` is closest to the distribution's entropy, smallest
+    /// difference first, until their mass exceeds `typical_p`. `None`/`1.0`
+    /// disables it. Runs between `top_k` and `top_p`.
+    ///
+    /// Unlike every other filter here it is not a prefix of the logit ordering —
+    /// it can drop the argmax and keep a middling token.
+    pub typical_p: Option<f32>,
+    /// Keep only tokens whose logit is within `n` population standard deviations
+    /// of the maximum logit (llama.cpp `top_n_sigma`). `None`/`<= 0.0` disables it.
+    ///
+    /// Runs FIRST, before `top_k`, because the mean and standard deviation are
+    /// taken over the full candidate set. Operates in logit space, so it is
+    /// unaffected by temperature regardless of chain position.
+    pub top_n_sigma: Option<f32>,
+    /// Floor on how many candidates the truncating filters may leave
+    /// (llama.cpp `min_keep`). Defaults to 1 — never empty the set.
+    ///
+    /// llama.cpp's own default is 0, which its samplers treat as "no floor" via
+    /// explicit `min_keep == 0` guards; 1 is the same behaviour spelled without
+    /// the sentinel, since every one of those samplers already refuses to return
+    /// an empty set.
+    pub min_keep: Option<usize>,
     pub seed: Option<u64>,
     pub presence_penalty: f32,
     pub frequency_penalty: f32,
@@ -2050,6 +2262,24 @@ pub struct SamplingConfig {
     /// discourage repetition. Applied over the same history as the additive
     /// presence/frequency penalties.
     pub repeat_penalty: f32,
+    /// How many of the most recent history tokens the three penalties above are
+    /// measured over.
+    ///
+    /// `None` (the default) means the **entire** history, which is what OpenAI's
+    /// `presence_penalty`/`frequency_penalty` specify and what this engine has
+    /// always done — so the default is a no-op for existing callers. `Some(0)`
+    /// disables the penalties outright. `Some(n)` measures only the last `n`
+    /// tokens, which is llama.cpp's `--repeat-last-n` (its own default is 64).
+    ///
+    /// Deliberate divergence: llama.cpp windows to 64 by default, but this API is
+    /// OpenAI-shaped and OpenAI counts over the whole context, so adopting 64 as
+    /// the default here would silently change every existing caller's output.
+    /// The capability is offered; the default is not changed.
+    ///
+    /// Note llama.cpp's own `-1` sentinel is a trap worth not copying: on the CLI
+    /// path `std::max(-1, 0)` turns it into `0`, silently *disabling* penalties,
+    /// while only the server maps `-1` to the context length.
+    pub penalty_last_n: Option<usize>,
     pub logit_bias: Vec<(usize, f32)>,
 }
 
@@ -2060,10 +2290,14 @@ impl Default for SamplingConfig {
             top_k: None,
             top_p: None,
             min_p: None,
+            typical_p: None,
+            top_n_sigma: None,
+            min_keep: None,
             seed: None,
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
             repeat_penalty: 1.0,
+            penalty_last_n: None,
             logit_bias: Vec::new(),
         }
     }
@@ -2186,6 +2420,10 @@ impl LlamaInferenceSession {
                     values: Vec::new(),
                     keys_f16: Vec::new(),
                     values_f16: Vec::new(),
+                    keys_q8_0: Vec::new(),
+                    values_q8_0: Vec::new(),
+                    keys_q4_0: Vec::new(),
+                    values_q4_0: Vec::new(),
                     allocated_sequence_length: 0,
                     position: 0,
                     materialized_through: 0,
@@ -2317,10 +2555,11 @@ impl LlamaInferenceSession {
         let weights = weights.into();
         weights.validate_dense_shapes(&config)?;
         let plan = LlamaKvCachePlan::from_config(&config)?;
+        let kv_quant = config.kv_quant;
         Ok(Self {
             config,
             weights,
-            kv_cache: LlamaKvCache::new(plan)?,
+            kv_cache: LlamaKvCache::new(plan, kv_quant)?,
             resident_decode: None,
             resident_paths_disabled: false,
             execution_trace: None,
@@ -2450,6 +2689,19 @@ impl LlamaInferenceSession {
         }
         if self.resident_paths_disabled {
             bail!("resident paths disabled for this session (CPU-authoritative KV required)");
+        }
+        // NoPE architectures (smollm3) must stay on the CPU reference path. The
+        // resident engines build ONE cos/sin table for the whole forward and rope
+        // every layer unconditionally (cuda_resident launch_rope / launch_rope_batched,
+        // and the Metal equivalents), so they cannot express a per-layer skip — a
+        // NoPE model on a resident lane would silently produce different, wrong
+        // tokens from the fixed CPU path. Checked before the backend-enabled gate
+        // because this is a property of the model, not of the available backends.
+        if self.config.no_rope_layer_step.is_some() {
+            bail!(
+                "NoPE architecture (per-layer RoPE skip): the resident GPU engines rope every \
+                 layer from a single cos/sin table and cannot express the skip; CPU reference"
+            );
         }
         // GPU-runnable tier: an uncurated model is admitted to the resident path only after
         // it passes the one-time parity self-check. A recorded FAIL forbids the resident
@@ -2785,23 +3037,17 @@ impl LlamaInferenceSession {
         if n > slot.engine.max_pos() {
             return Ok(false);
         }
-        // Default to the batched prefill (each weight read once per MAX_VERIFY_K-token
-        // chunk instead of once per token). `CAMELID_CUDA_RESIDENT_PREFILL_BATCHED=0`
-        // forces the serial per-token loop ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â an A/B switch for parity bisection. Both
-        // write bit-identical KV (the batched stack reuses the same per-block dot and
-        // block-ordered sum), so decode after either is token-identical.
+        // Default to batched prefill on the benchmark-promoted Q8 lane. The
+        // parity-correct Q4_K/Q6_K tiles remain explicit opt-ins because they
+        // regress sustained WDDM throughput on the RTX 3060 Laptop reference.
+        // `CAMELID_CUDA_RESIDENT_PREFILL_BATCHED=0/1` remains the A/B override.
         let serial_prefill = std::env::var_os("CAMELID_CUDA_RESIDENT_PREFILL_BATCHED")
             .map(|v| {
                 let v = v.to_string_lossy();
                 let v = v.trim();
                 v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
             })
-            // K-quant (Q4_K/Q6_K) models MUST use the serial per-token prefill: the
-            // batched prefill GEMM (`q8_gemm_batched`) is Q8_0-only, while the serial
-            // `prefill` shares the per-token `forward_pass`, which dispatches the K-quant
-            // kernels. (Decode after either is token-identical for Q8_0; for K-quant only
-            // the serial path exists.)
-            .unwrap_or_else(|| slot.engine.uses_kquant());
+            .unwrap_or_else(|| !slot.engine.prefers_batched_prefill());
         let prefill_result = if serial_prefill {
             slot.engine
                 .prefill(&embeddings.data, &tables.cos, &tables.sin, n, scale)
@@ -3022,9 +3268,8 @@ impl LlamaInferenceSession {
     /// Temperature-sampling analog of the greedy resident fast lane: when the
     /// sampler is plain temperature (no filtering, penalties, or logit bias),
     /// draw the next token on the GPU via Gumbel-max — no full-vocabulary host
-    /// copy and no CPU sort. Metal is enabled by default with an explicit escape
-    /// hatch; CUDA retains its opt-in gate until its older streaming-state issue
-    /// is separately resolved.
+    /// copy and no CPU sort. Metal and CUDA are enabled by default after their
+    /// device/reference and seeded-streaming gates, with explicit escape hatches.
     pub fn generate_next_token_sampled_resident(
         &mut self,
         token_id: u32,
@@ -3175,7 +3420,7 @@ impl LlamaInferenceSession {
             slot.key == key
                 && slot.engine.weights_ready()
                 && slot.engine.filled() == position
-                && !slot.engine.is_offloaded()
+                && slot.engine.supports_batched_verify()
         });
         if !ready {
             return Ok(None);
@@ -3278,7 +3523,7 @@ impl LlamaInferenceSession {
             slot.key == key
                 && slot.engine.weights_ready()
                 && slot.engine.filled() == position
-                && !slot.engine.is_offloaded()
+                && slot.engine.supports_tree_verify()
         });
         if !ready {
             return Ok(None);
@@ -3581,9 +3826,8 @@ impl LlamaInferenceSession {
                 // (engine evicted or rebuilt for another model); declining routes to the CPU
                 // path, which warns, instead of laundering zeros through the GPU cache.
                 //
-                // The watermark alone, not `f32_history_materialized`: the loop below reads via
-                // `copy_key_row_into`, which serves an F16 cache too, so pairing it with a probe
-                // over the (legitimately empty) f32 buffers would decline a readable history.
+                // The watermark is sufficient because the loop below reads via the
+                // dtype-neutral `copy_key_row_into` / `copy_value_row_into` accessors.
                 if !self.kv_cache.history_materialized(position) {
                     if trace {
                         eprintln!(
@@ -6192,6 +6436,25 @@ impl SamplingConfig {
                 )));
             }
         }
+        if let Some(typical_p) = self.typical_p {
+            if !typical_p.is_finite() || !(0.0..=1.0).contains(&typical_p) {
+                return Err(BackendError::RuntimeShapeMismatch(format!(
+                    "typical_p must be finite and in [0, 1], got {typical_p}"
+                )));
+            }
+        }
+        if let Some(top_n_sigma) = self.top_n_sigma {
+            if !top_n_sigma.is_finite() || top_n_sigma < 0.0 {
+                return Err(BackendError::RuntimeShapeMismatch(format!(
+                    "top_n_sigma must be finite and non-negative, got {top_n_sigma}"
+                )));
+            }
+        }
+        if matches!(self.min_keep, Some(0)) {
+            return Err(BackendError::RuntimeShapeMismatch(
+                "min_keep must be greater than zero when provided".to_string(),
+            ));
+        }
         if !self.repeat_penalty.is_finite() || self.repeat_penalty <= 0.0 {
             return Err(BackendError::RuntimeShapeMismatch(format!(
                 "repeat_penalty must be finite and greater than zero, got {}",
@@ -6322,6 +6585,34 @@ fn apply_token_mask(logits: &mut CpuTensor, allowed: &[bool]) -> Result<()> {
     Ok(())
 }
 
+/// Numerically-stable softmax over `(token index, logit)` candidates, dividing
+/// each logit by `temperature` first. Returns probabilities positionally aligned
+/// with `candidates`.
+///
+/// `temperature == 1.0` divides by exactly one, which IEEE-754 leaves bit-exact,
+/// so the reordered chain reproduces the previous output token-for-token at unit
+/// temperature.
+fn softmax_candidates(candidates: &[(usize, f32)], temperature: f32) -> Result<Vec<f32>> {
+    let max_logit = candidates
+        .iter()
+        .map(|(_, logit)| *logit / temperature)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut weights: Vec<f32> = candidates
+        .iter()
+        .map(|(_, logit)| ((*logit / temperature) - max_logit).exp())
+        .collect();
+    let sum: f32 = weights.iter().sum();
+    if sum == 0.0 || !sum.is_finite() {
+        return Err(BackendError::RuntimeShapeMismatch(
+            "sampler softmax produced invalid normalization sum".to_string(),
+        ));
+    }
+    for weight in &mut weights {
+        *weight /= sum;
+    }
+    Ok(weights)
+}
+
 fn sample_with_config(
     logits: &CpuTensor,
     config: &SamplingConfig,
@@ -6335,6 +6626,36 @@ fn sample_with_config(
     }
 
     let mut candidates: Vec<(usize, f32)> = adjusted.data.iter().copied().enumerate().collect();
+    let min_keep = config.min_keep.unwrap_or(1).max(1);
+
+    // top_n_sigma runs FIRST in the reference chain (before top_k) and works in
+    // logit space, not probability space: keep every token whose logit is within
+    // `n` population standard deviations of the max. llama.cpp
+    // `llama_sampler_top_n_sigma_apply` masks to -INFINITY; truncating the set is
+    // equivalent here because a masked token can never be drawn.
+    //
+    // The mean and std are taken over the FULL candidate set, which is why this
+    // must run before top_k narrows it.
+    if let Some(n_sigma) = config.top_n_sigma.filter(|n| *n > 0.0) {
+        if candidates.len() > 1 {
+            let valid: Vec<f32> = candidates
+                .iter()
+                .map(|(_, logit)| *logit)
+                .filter(|logit| logit.is_finite())
+                .collect();
+            if !valid.is_empty() {
+                let max = valid.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mean = valid.iter().sum::<f32>() / valid.len() as f32;
+                let variance =
+                    valid.iter().map(|l| (l - mean).powi(2)).sum::<f32>() / valid.len() as f32;
+                let threshold = max - n_sigma * variance.sqrt();
+                // Keep at least the argmax: the max itself always clears the
+                // threshold for any n >= 0, so this cannot empty the set.
+                candidates.retain(|(_, logit)| *logit >= threshold);
+            }
+        }
+    }
+
     if let Some(top_k) = config.top_k {
         // Partition around K before ordering the survivors. The comparator is a
         // total order (token id breaks equal-logit ties), so sorting the selected
@@ -6351,67 +6672,100 @@ fn sample_with_config(
         right.total_cmp(left).then_with(|| left_idx.cmp(right_idx))
     });
 
-    let max_logit = candidates
-        .iter()
-        .map(|(_, logit)| *logit / config.temperature)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let mut weighted: Vec<(usize, f32)> = candidates
-        .into_iter()
-        .map(|(idx, logit)| (idx, ((logit / config.temperature) - max_logit).exp()))
-        .collect();
-    let weight_sum: f32 = weighted.iter().map(|(_, weight)| *weight).sum();
-    if weight_sum == 0.0 || !weight_sum.is_finite() {
-        return Err(BackendError::RuntimeShapeMismatch(
-            "sampler softmax produced invalid normalization sum".to_string(),
-        ));
-    }
-    for (_, weight) in &mut weighted {
-        *weight /= weight_sum;
-    }
-
-    if let Some(min_p) = config.min_p.filter(|min_p| *min_p > 0.0) {
-        let max_probability = weighted
+    // Reference chain order — llama.cpp `common/common.h` default `samplers`:
+    // penalties → top_k → typical_p → top_p → min_p → TEMPERATURE → dist. The
+    // reference applies temperature LAST, so every probability-based truncation
+    // measures the *un-tempered* distribution. Dividing by temperature before
+    // top_p/min_p (as this sampler previously did) sharpens or flattens the
+    // distribution those filters measure, so the same (top_p, min_p) keeps a
+    // different candidate set than the reference at any temperature != 1.0.
+    //
+    // top_k is unaffected by the move: temperature scaling is monotonic, so it
+    // cannot reorder logits. At temperature == 1.0 the two orders are bit-exact
+    // (division by one is exact), which is why every existing sampler test —
+    // all of which pin temperature to 0.0 or 1.0 — is untouched by this change.
+    // typical_p sits between top_k and top_p. It keeps the tokens whose surprisal
+    // is CLOSEST to the distribution's entropy — locally typical sampling — rather
+    // than the most probable ones, so unlike every other filter here its survivors
+    // are not a prefix of the logit ordering.
+    //
+    // llama.cpp `llama_sampler_typical_apply` leaves the array reordered by
+    // shifted score and sets `sorted = false`, letting a later sampler re-sort.
+    // This engine's top_p/min_p stages rely on descending-logit order, so the
+    // survivors are re-sorted here instead. The retained SET is identical.
+    if let Some(typical_p) = config.typical_p.filter(|p| *p < 1.0) {
+        let probabilities = softmax_candidates(&candidates, 1.0)?;
+        let entropy: f32 = probabilities
             .iter()
-            .map(|(_, weight)| *weight)
-            .fold(0.0_f32, f32::max);
-        let threshold = min_p * max_probability;
-        weighted.retain(|(_, weight)| *weight >= threshold);
-        let renorm: f32 = weighted.iter().map(|(_, weight)| *weight).sum();
-        if weighted.is_empty() || renorm == 0.0 || !renorm.is_finite() {
-            return Err(BackendError::RuntimeShapeMismatch(
-                "min_p filtering removed all sampler candidates".to_string(),
-            ));
-        }
-        for (_, weight) in &mut weighted {
-            *weight /= renorm;
-        }
-    }
+            .map(|p| if *p > 0.0 { -*p * p.ln() } else { 0.0 })
+            .sum();
+        let mut order: Vec<usize> = (0..candidates.len()).collect();
+        order.sort_by(|a, b| {
+            let score = |i: usize| (-probabilities[i].ln() - entropy).abs();
+            score(*a).total_cmp(&score(*b)).then_with(|| a.cmp(b))
+        });
 
-    if let Some(top_p) = config.top_p.filter(|top_p| *top_p < 1.0) {
-        // `weighted` still has the descending-logit order established above:
-        // exp/logit scaling and normalization are monotonic, and min-p retains
-        // elements without reordering them. Sorting by probability again was a
-        // redundant O(n log n) pass over the vocabulary.
-        let mut cumulative = 0.0;
-        let mut keep = 0usize;
-        for (_, probability) in &weighted {
-            cumulative += *probability;
-            keep += 1;
-            if cumulative >= top_p {
+        let mut cumulative = 0.0f32;
+        let mut keep = order.len();
+        for (rank, idx) in order.iter().enumerate() {
+            cumulative += probabilities[*idx];
+            if cumulative > typical_p && rank + 1 >= min_keep {
+                keep = rank + 1;
                 break;
             }
         }
-        weighted.truncate(keep.max(1));
-        let renorm: f32 = weighted.iter().map(|(_, weight)| *weight).sum();
-        if renorm == 0.0 || !renorm.is_finite() {
-            return Err(BackendError::RuntimeShapeMismatch(
-                "top_p filtering removed all sampler candidates".to_string(),
-            ));
+        let mut survivors: Vec<(usize, f32)> =
+            order.iter().take(keep).map(|i| candidates[*i]).collect();
+        survivors.sort_by(|(left_idx, left), (right_idx, right)| {
+            right.total_cmp(left).then_with(|| left_idx.cmp(right_idx))
+        });
+        candidates = survivors;
+    }
+
+    if config.top_p.is_some_and(|top_p| top_p < 1.0)
+        || config.min_p.is_some_and(|min_p| min_p > 0.0)
+    {
+        let mut probabilities = softmax_candidates(&candidates, 1.0)?;
+
+        if let Some(top_p) = config.top_p.filter(|top_p| *top_p < 1.0) {
+            // `candidates` is in descending-logit order and softmax is monotonic,
+            // so `probabilities` is descending too and the survivors are a prefix.
+            let mut cumulative = 0.0;
+            let mut keep = 0usize;
+            for probability in &probabilities {
+                cumulative += *probability;
+                keep += 1;
+                if cumulative >= top_p && keep >= min_keep {
+                    break;
+                }
+            }
+            let keep = keep.max(min_keep).min(candidates.len());
+            candidates.truncate(keep);
+            probabilities.truncate(keep);
         }
-        for (_, weight) in &mut weighted {
-            *weight /= renorm;
+
+        if let Some(min_p) = config.min_p.filter(|min_p| *min_p > 0.0) {
+            // Ratio test against the peak, so the result is invariant to whether
+            // the survivors were renormalized after top_p — which is why this
+            // stage does not need to renormalize before measuring.
+            let max_probability = probabilities.iter().copied().fold(0.0_f32, f32::max);
+            let threshold = min_p * max_probability;
+            let keep = probabilities
+                .iter()
+                .take_while(|probability| **probability >= threshold)
+                .count()
+                .max(min_keep)
+                .min(candidates.len());
+            candidates.truncate(keep);
         }
     }
+
+    // Temperature last, over the survivors only.
+    let weighted: Vec<(usize, f32)> = candidates
+        .iter()
+        .map(|(idx, _)| *idx)
+        .zip(softmax_candidates(&candidates, config.temperature)?)
+        .collect();
 
     // Advance the RNG per decode step: `token_history.len()` is the deterministic
     // stream position, so each step draws a fresh uniform while a fixed seed still
@@ -6462,8 +6816,17 @@ fn apply_sampling_adjustments<'a>(
         || config.frequency_penalty != 0.0
         || config.repeat_penalty != 1.0
     {
+        // Penalties are measured over the last `penalty_last_n` history tokens.
+        // `None` keeps the whole history, which is both this engine's historical
+        // behaviour and OpenAI's specified semantics — see the field docs on
+        // `SamplingConfig::penalty_last_n` for why the default is not llama.cpp's 64.
+        let window: &[u32] = match config.penalty_last_n {
+            Some(0) => &[],
+            Some(last_n) => &token_history[token_history.len().saturating_sub(last_n)..],
+            None => token_history,
+        };
         let mut counts = std::collections::HashMap::<usize, usize>::new();
-        for token_id in token_history {
+        for token_id in window {
             let token_idx = usize::try_from(*token_id).map_err(|_| {
                 BackendError::RuntimeShapeMismatch(format!(
                     "token id {token_id} does not fit sampler index space"
@@ -6840,20 +7203,34 @@ fn forward_layer_timed(
     };
     let q_before_rope = q;
     let k_before_rope = k;
-    let q = apply_rope(
-        &q_before_rope,
-        kv_cache.position,
-        config.attention_head_count as usize,
-        config,
-        rope_freqs,
-        config
-            .mla
-            .as_ref()
-            .map_or(0, |mla| mla.nope_head_dim as usize),
-        &cached_layer_label!(layer_idx, "attention_q_rope"),
-    )?;
-    let k = if config.mla.is_some() {
-        // k is already RoPE'd and in the exact cached layout (1 head of [c_kv, k_pe])
+    // NoPE layers (smollm3): llama.cpp `models/smollm3.cpp:69` skips ggml_rope_ext
+    // on BOTH Q and K when `(il + 1) % n_no_rope_layer_step == 0`. The un-roped K
+    // is what goes into the cache, exactly as in the reference graph.
+    //
+    // The `.clone()` on the skip branch is required, not incidental: the scratch
+    // pool below recycles `q_before_rope`/`k_before_rope` alongside `q`/`k`, so
+    // the two must be distinct buffers. This is the same shape the MLA branch
+    // already uses.
+    let layer_ropes = config.layer_uses_rope(layer_idx);
+    let q = if layer_ropes {
+        apply_rope(
+            &q_before_rope,
+            kv_cache.position,
+            config.attention_head_count as usize,
+            config,
+            rope_freqs,
+            config
+                .mla
+                .as_ref()
+                .map_or(0, |mla| mla.nope_head_dim as usize),
+            &cached_layer_label!(layer_idx, "attention_q_rope"),
+        )?
+    } else {
+        q_before_rope.clone()
+    };
+    let k = if config.mla.is_some() || !layer_ropes {
+        // MLA: k is already RoPE'd and in the exact cached layout (1 head of
+        // [c_kv, k_pe]). NoPE layer: k is carried through un-roped.
         k_before_rope.clone()
     } else {
         apply_rope(
@@ -6869,12 +7246,19 @@ fn forward_layer_timed(
     let attention_q_rope_stats = collect_diagnostics
         .then(|| LlamaTensorStats::from_tensor(&q))
         .transpose()?;
+    // On a NoPE layer the expected rotation is the IDENTITY, so the reconstruction
+    // is taken at position 0 (angle 0 => cos 1, sin 0). A zero delta then positively
+    // asserts "this layer correctly applied no rotation", instead of reporting a
+    // spurious divergence against a rotation that was deliberately skipped.
+    // The diagnostic is still produced either way: the consumer field is not
+    // optional (see the `.expect` on attention_q_rope_reconstruction).
+    let rope_diagnostic_position = if layer_ropes { kv_cache.position } else { 0 };
     let attention_q_rope_diagnostic = collect_diagnostics
         .then(|| {
             rope_diagnostics(
                 &q_before_rope,
                 &q,
-                kv_cache.position,
+                rope_diagnostic_position,
                 config.attention_head_count as usize,
                 config,
                 rope_freqs,
@@ -6890,7 +7274,7 @@ fn forward_layer_timed(
             rope_diagnostics(
                 &k_before_rope,
                 &k,
-                kv_cache.position,
+                rope_diagnostic_position,
                 config.attention_head_count_kv as usize,
                 config,
                 rope_freqs,
@@ -7449,24 +7833,36 @@ fn forward_prefill_layer_chunk_timed(
         )?,
         None => k,
     };
-    let q = apply_rope_batch(
-        &q,
-        params.base_position,
-        config.attention_head_count as usize,
-        config,
-        params.rope_freqs,
-        0,
-        cached_layer_label!(layer_idx, "prefill_attention_q_rope"),
-    )?;
-    let k = apply_rope_batch(
-        &k,
-        params.base_position,
-        config.attention_head_count_kv as usize,
-        config,
-        params.rope_freqs,
-        0,
-        cached_layer_label!(layer_idx, "prefill_attention_k_rope"),
-    )?;
+    // NoPE layers (smollm3): same predicate as the single-token decode path in
+    // `forward_layer_timed`, applied to the batched prefill. Both paths must agree
+    // or the KV written during prefill would not match what decode expects.
+    let layer_ropes = config.layer_uses_rope(layer_idx);
+    let q = if layer_ropes {
+        apply_rope_batch(
+            &q,
+            params.base_position,
+            config.attention_head_count as usize,
+            config,
+            params.rope_freqs,
+            0,
+            cached_layer_label!(layer_idx, "prefill_attention_q_rope"),
+        )?
+    } else {
+        q
+    };
+    let k = if layer_ropes {
+        apply_rope_batch(
+            &k,
+            params.base_position,
+            config.attention_head_count_kv as usize,
+            config,
+            params.rope_freqs,
+            0,
+            cached_layer_label!(layer_idx, "prefill_attention_k_rope"),
+        )?
+    } else {
+        k
+    };
     timings.attention_rope = started.elapsed().as_micros();
     if let Some(memory) = &mut memory {
         memory.record_after_attention_rope(capture_memory_sample(kv_cache));
@@ -8101,7 +8497,7 @@ fn linear_for_role(
     )
 }
 
-fn linear_for_role_runtime(
+pub(crate) fn linear_for_role_runtime(
     input: &CpuTensor,
     weight: &CpuTensor,
     name: impl Into<String>,
@@ -8801,7 +9197,7 @@ impl<'a> BorrowedLinearWeight<'a> {
             cols: weight.dim(1)?,
             data: &weight.data,
             source_type: weight.source_type,
-            q8_0_blocks: weight.q8_0_blocks.as_deref(),
+            q8_0_blocks: weight.q8_0_block_slice(),
             q8_0_packed_rows4_4x4: weight.q8_0_packed_rows4_4x4.as_ref(),
             q8_0_packed_rows4_4x8: weight.q8_0_packed_rows4_4x8.as_ref(),
             q8_0_runtime_storage: weight.q8_0_runtime_storage.as_ref(),
@@ -11055,6 +11451,15 @@ fn expert_matrix_view(
     let expert_elements = input_width.checked_mul(output_width).ok_or_else(|| {
         BackendError::RuntimeShapeMismatch("MoE expert element count overflow".to_string())
     })?;
+    let uses_q8_storage = weight.q8_0_shared_blocks.is_some()
+        || weight.q8_0_blocks.is_some()
+        || weight.q8_0_file_backing.is_some()
+        || weight.q8_0_split_file_backing.is_some();
+    if uses_q8_storage && !expert_elements.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "MoE expert element count {expert_elements} is not Q8_0 block aligned"
+        )));
+    }
     if weight.dim(0)? != input_width || weight.dim(1)? != output_width {
         return Err(BackendError::RuntimeShapeMismatch(format!(
             "MoE expert tensor {} expected per-expert dims [{input_width}, {output_width}], got {:?}",
@@ -11096,6 +11501,35 @@ fn expert_matrix_view(
                 block_count,
             ),
         )
+    } else if let Some(shared) = &weight.q8_0_shared_blocks {
+        CpuTensor::from_q8_0_shared_blocks(
+            name,
+            TensorShape {
+                dims: vec![output_width, input_width],
+            },
+            Arc::clone(&shared.blocks),
+            shared.start + block_offset,
+            block_count,
+        )?
+    } else if let Some(blocks) = &weight.q8_0_blocks {
+        let expert_blocks = blocks
+            .get(block_offset..block_offset + block_count)
+            .ok_or_else(|| {
+                BackendError::RuntimeShapeMismatch(format!(
+                    "MoE expert block slice {}..{} missing from {}",
+                    block_offset,
+                    block_offset + block_count,
+                    weight.name
+                ))
+            })?
+            .to_vec();
+        CpuTensor::from_q8_0_blocks(
+            name,
+            TensorShape {
+                dims: vec![output_width, input_width],
+            },
+            expert_blocks,
+        )?
     } else {
         let start = expert_elements * expert_idx;
         let end = start + expert_elements;
@@ -11112,9 +11546,6 @@ fn expert_matrix_view(
         CpuTensor::from_f32(name, vec![output_width, input_width], data)?
     };
     tensor.source_type = weight.source_type;
-    if let Some(blocks) = &weight.q8_0_blocks {
-        tensor.q8_0_blocks = Some(blocks[block_offset..block_offset + block_count].to_vec());
-    }
     Ok(tensor)
 }
 
@@ -11180,25 +11611,37 @@ fn mixtral_moe_ffn(
             &logits.data[row * expert_count..(row + 1) * expert_count],
             expert_used_count,
         );
-        if let Some(trace) = &mut trace {
-            trace.rows.push(LlamaMixtralMoeRowTrace {
-                row_index: row,
-                router_logits: logits.data[row * expert_count..(row + 1) * expert_count].to_vec(),
-                selected_experts: top.iter().map(|(expert_idx, _)| *expert_idx).collect(),
-                selected_weights: top.iter().map(|(_, weight)| *weight).collect(),
-            });
-        }
+        // Keep diagnostics allocation-free when tracing is disabled. This
+        // function is on every MoE token/layer, so even two tiny Vecs per row
+        // would be a measurable regression on the unchanged default path.
+        let selected = options.collect_trace.then(|| {
+            (
+                top.iter().map(|(expert_idx, _)| *expert_idx).collect(),
+                top.iter().map(|(_, weight)| *weight).collect(),
+            )
+        });
+        let mut expert_traces =
+            Vec::with_capacity(if options.collect_trace { top.len() } else { 0 });
         for (expert_idx, weight) in top {
             let gate =
                 expert_matrix_view(gate_experts, expert_idx, hidden, ff, "mixtral_gate_expert")?;
             let up = expert_matrix_view(up_experts, expert_idx, hidden, ff, "mixtral_up_expert")?;
             let down =
                 expert_matrix_view(down_experts, expert_idx, ff, hidden, "mixtral_down_expert")?;
-            let activated =
-                gated_ffn_activation(&row_input, &gate, &up, "mixtral_expert_activated", false)?;
+            let mut activated = gated_ffn_activation(
+                &row_input,
+                &gate,
+                &up,
+                "mixtral_expert_activated",
+                options.collect_trace,
+            )?;
             gate_elapsed += activated.gate;
             up_elapsed += activated.up;
             activation_elapsed += activated.activation;
+            let activation_stats = options
+                .collect_trace
+                .then(|| LlamaTensorStats::from_tensor(&activated.tensor))
+                .transpose()?;
             let started = Instant::now();
             let expert_out = linear_for_role_runtime(
                 &activated.tensor,
@@ -11208,9 +11651,46 @@ fn mixtral_moe_ffn(
                 false,
             )?;
             down_elapsed += started.elapsed().as_micros();
-            for col in 0..hidden {
-                output[row * hidden + col] += expert_out.data[col] * weight;
+            if options.collect_trace {
+                let contribution = CpuTensor::from_f32(
+                    "mixtral_expert_weighted_down",
+                    vec![1, hidden],
+                    expert_out.data.iter().map(|value| value * weight).collect(),
+                )?;
+                for col in 0..hidden {
+                    output[row * hidden + col] += contribution.data[col];
+                }
+                expert_traces.push(LlamaMixtralMoeExpertTrace {
+                    expert_index: expert_idx,
+                    normalized_weight: weight,
+                    gate: activated
+                        .gate_stats
+                        .take()
+                        .expect("MoE gate statistics requested"),
+                    up: activated
+                        .up_stats
+                        .take()
+                        .expect("MoE up statistics requested"),
+                    activation: activation_stats.expect("MoE activation statistics requested"),
+                    down: LlamaTensorStats::from_tensor(&expert_out)?,
+                    weighted_down: LlamaTensorStats::from_tensor(&contribution)?,
+                });
+            } else {
+                for col in 0..hidden {
+                    output[row * hidden + col] += expert_out.data[col] * weight;
+                }
             }
+        }
+        if let Some(trace) = &mut trace {
+            let (selected_experts, selected_weights) =
+                selected.expect("MoE selection trace requested");
+            trace.rows.push(LlamaMixtralMoeRowTrace {
+                row_index: row,
+                router_logits: logits.data[row * expert_count..(row + 1) * expert_count].to_vec(),
+                selected_experts,
+                selected_weights,
+                experts: expert_traces,
+            });
         }
     }
     Ok((
@@ -11374,6 +11854,7 @@ fn deepseek_moe_ffn(
                 router_logits: logits.data[row * expert_count..(row + 1) * expert_count].to_vec(),
                 selected_experts: top.iter().map(|(expert_idx, _)| *expert_idx).collect(),
                 selected_weights: top.iter().map(|(_, weight)| *weight).collect(),
+                experts: Vec::new(),
             });
         }
         for (expert_idx, weight) in top {
@@ -11637,7 +12118,7 @@ fn should_use_q8_0_block_dot_with_plan(
 ) -> bool {
     runtime_plan.q8.block_dot
         && weight.source_type == Some(GgufTensorType::Q8_0)
-        && (weight.q8_0_blocks.is_some() || q8_0_selected_packed_rows4(weight).is_some())
+        && (weight.q8_0_block_slice().is_some() || q8_0_selected_packed_rows4(weight).is_some())
         && input_width.is_multiple_of(Q8_0_BLOCK_VALUES)
 }
 
@@ -11706,7 +12187,8 @@ fn resident_decode_metal_enabled() -> bool {
 
 fn metal_resident_weight_eligible(tensor: &CpuTensor, wire_mode_active: bool) -> bool {
     tensor.source_type == Some(GgufTensorType::Q8_0)
-        && (tensor.q8_0_blocks.is_some() || (wire_mode_active && tensor.q8_0_wire_pages.is_some()))
+        && (tensor.q8_0_block_slice().is_some()
+            || (wire_mode_active && tensor.q8_0_wire_pages.is_some()))
 }
 
 /// Process-global resident CUDA engine, keyed by the model's weight identity.
@@ -12063,7 +12545,7 @@ fn build_resident_cuda_engine(
     is_drafter: bool,
 ) -> Option<crate::cuda_resident::CudaResidentDecode> {
     use crate::cuda_resident::ProjQuant;
-    // The resident upload byte source for a projection: Q8_0 36-byte blocks, or the
+    // The resident upload byte source for a projection: CPU Q8_0 36-byte blocks, or the
     // raw K-quant super-block wire bytes (144 B for Q4_K, 210 B for Q6_K). These are
     // the bytes `set_layer_located`/`set_output` repack per lane.
     fn raw(t: &CpuTensor) -> Option<&[u8]> {
@@ -12493,19 +12975,21 @@ fn resident_metal_temperature_sampling_enabled() -> bool {
     }
 }
 
-/// Opt-in gate for the CUDA Gumbel-max temperature-sampling lane. Its prior
-/// streaming-state corruption remains isolated behind this default-OFF switch.
+/// CUDA's resident Gumbel-max sampling lane. Default ON after the streaming
+/// prompt-cache bypass, sampler-eligibility hardening, device-level stateless-RNG
+/// parity test, and repeated seeded streaming validation. Keep an explicit
+/// default-safe escape hatch for driver or model-specific diagnosis.
 fn resident_gpu_temperature_sampling_enabled() -> bool {
     match std::env::var_os("CAMELID_GPU_TEMP_SAMPLING") {
         Some(value) => {
             let value = value.to_string_lossy();
             let value = value.trim();
-            value.eq_ignore_ascii_case("1")
-                || value.eq_ignore_ascii_case("true")
-                || value.eq_ignore_ascii_case("on")
-                || value.eq_ignore_ascii_case("yes")
+            !(value == "0"
+                || value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("off")
+                || value.eq_ignore_ascii_case("no"))
         }
-        None => false,
+        None => true,
     }
 }
 
@@ -17330,7 +17814,8 @@ fn matmul_rhs_transposed_q8_0_block_dot_with_plan(
     }
     let blocks_per_row = input_width / Q8_0_BLOCK_VALUES;
     let expected_blocks = output_width * blocks_per_row;
-    if let Some(weight_blocks) = weight.q8_0_blocks.as_ref() {
+    let retained_blocks = weight.q8_0_block_slice();
+    if let Some(weight_blocks) = retained_blocks {
         if weight_blocks.len() != expected_blocks {
             return Err(BackendError::RuntimeShapeMismatch(format!(
                 "q8_0 block-dot expected {expected_blocks} blocks for weight {} shape {:?}, got {}",
@@ -17387,10 +17872,7 @@ fn matmul_rhs_transposed_q8_0_block_dot_with_plan(
                         return;
                     }
                 }
-                let weight_blocks = weight
-                    .q8_0_blocks
-                    .as_ref()
-                    .expect("q8_0 block-dot precondition checked");
+                let weight_blocks = retained_blocks.expect("q8_0 block-dot precondition checked");
                 for (output_idx, out_value) in output_row.iter_mut().enumerate() {
                     let weight_start = output_idx * blocks_per_row;
                     *out_value = q8_0_dot_rows(
@@ -17417,10 +17899,7 @@ fn matmul_rhs_transposed_q8_0_block_dot_with_plan(
                     continue;
                 }
             }
-            let weight_blocks = weight
-                .q8_0_blocks
-                .as_ref()
-                .expect("q8_0 block-dot precondition checked");
+            let weight_blocks = retained_blocks.expect("q8_0 block-dot precondition checked");
             if runtime_plan.q8.metal_retained {
                 let weight_bytes = q8_0_blocks_as_bytes(weight_blocks);
                 if with_q8_0_block_scales_and_quants(
@@ -18861,16 +19340,15 @@ fn matmul_rhs_transposed_q4_k_block_dot(
 fn x86_kquant_matmul_owner_enabled() -> bool {
     #[cfg(test)]
     {
-        q8_0_env_flag_enabled_default_off("CAMELID_X86_KQUANT_MATMUL_OWNER")
+        crate::runtime_config::kquant_prefill_owner_enabled()
     }
     #[cfg(not(test))]
     {
         if q8_runtime::bench_uncached_runtime_plan() {
-            return q8_0_env_flag_enabled_default_off("CAMELID_X86_KQUANT_MATMUL_OWNER");
+            return crate::runtime_config::kquant_prefill_owner_enabled();
         }
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED
-            .get_or_init(|| q8_0_env_flag_enabled_default_off("CAMELID_X86_KQUANT_MATMUL_OWNER"))
+        *ENABLED.get_or_init(crate::runtime_config::kquant_prefill_owner_enabled)
     }
 }
 
@@ -19711,78 +20189,86 @@ fn q6_k_owner_prefill_tiled(
     let chunks = out_dim.div_ceil(WEIGHT_CHUNK);
     for row_start in (0..n_rows).step_by(ROW_BLOCK) {
         let row_end = (row_start + ROW_BLOCK).min(n_rows);
-        (0..chunks).into_par_iter().for_each(|chunk_idx| {
-            let o_start = chunk_idx * WEIGHT_CHUNK;
-            let o_end = (o_start + WEIGHT_CHUNK).min(out_dim);
-            // Per-task hoist scratch: rebuilt weights + scales + super-scale
-            // per superblock, reused across the chunk's weight rows.
-            let mut a_all = vec![0i8; superblocks * Q6_K_VALUES_PER_BLOCK];
-            let mut wsc = vec![0u8; superblocks * 16];
-            let mut wd = vec![0f32; superblocks];
-            for o in o_start..o_end {
-                let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
-                for i in 0..superblocks {
-                    let block =
-                        &w_row[i * Q6_K_WIRE_BYTES_PER_BLOCK..(i + 1) * Q6_K_WIRE_BYTES_PER_BLOCK];
-                    wd[i] = f16_bits_to_f32(u16::from_le_bytes([block[208], block[209]]));
-                    wsc[i * 16..(i + 1) * 16].copy_from_slice(&block[192..208]);
-                    let a_slice = &mut a_all[i * Q6_K_VALUES_PER_BLOCK..];
-                    // SAFETY-free reborrow into the fixed-size rebuild target.
-                    let a_arr: &mut [i8; Q6_K_VALUES_PER_BLOCK] = (&mut a_slice
-                        [..Q6_K_VALUES_PER_BLOCK])
-                        .try_into()
-                        .expect("owner rebuild slice is exactly one superblock");
-                    q6_k_owner_rebuild_superblock(block, a_arr);
-                }
-                let block_rows = row_end - row_start;
-                let mut sumf_block = [0f32; ROW_BLOCK];
-                for (r, blocks) in preps[row_start..row_end].iter().enumerate() {
-                    // Load-bearing f32 shape: 8 lane accumulators per CELL,
-                    // reduced once after all superblocks — verbatim
-                    // `q6_k_wire_row_dot`.
-                    let mut sums = [0f32; 8];
-                    for (i, y) in blocks.iter().enumerate().take(superblocks) {
-                        let d = wd[i] * y.d;
-                        let a: &[i8; Q6_K_VALUES_PER_BLOCK] = a_all
-                            [i * Q6_K_VALUES_PER_BLOCK..(i + 1) * Q6_K_VALUES_PER_BLOCK]
+        (0..chunks).into_par_iter().for_each_init(
+            // Reuse scratch for every chunk executed by one Rayon worker.
+            // The old per-chunk allocation repeated for each 64-row prompt
+            // block on wide projections.
+            || {
+                (
+                    vec![0i8; superblocks * Q6_K_VALUES_PER_BLOCK],
+                    vec![0u8; superblocks * 16],
+                    vec![0f32; superblocks],
+                )
+            },
+            |scratch, chunk_idx| {
+                let (a_all, wsc, wd) = scratch;
+                let o_start = chunk_idx * WEIGHT_CHUNK;
+                let o_end = (o_start + WEIGHT_CHUNK).min(out_dim);
+                for o in o_start..o_end {
+                    let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
+                    for i in 0..superblocks {
+                        let block = &w_row
+                            [i * Q6_K_WIRE_BYTES_PER_BLOCK..(i + 1) * Q6_K_WIRE_BYTES_PER_BLOCK];
+                        wd[i] = f16_bits_to_f32(u16::from_le_bytes([block[208], block[209]]));
+                        wsc[i * 16..(i + 1) * 16].copy_from_slice(&block[192..208]);
+                        let a_slice = &mut a_all[i * Q6_K_VALUES_PER_BLOCK..];
+                        // SAFETY-free reborrow into the fixed-size rebuild target.
+                        let a_arr: &mut [i8; Q6_K_VALUES_PER_BLOCK] = (&mut a_slice
+                            [..Q6_K_VALUES_PER_BLOCK])
                             .try_into()
-                            .expect("owner superblock slice is exactly 256 weights");
-                        let scales: &[u8; 16] = wsc[i * 16..(i + 1) * 16]
-                            .try_into()
-                            .expect("owner scale slice is exactly 16 bytes");
-                        // `use_avx2` is read on every target (the cfg split is
-                        // inside the arm), so non-x86 builds see no unused
-                        // binding.
-                        let aux32 = if use_avx2 {
-                            #[cfg(target_arch = "x86_64")]
-                            // SAFETY: avx2 confirmed present at dispatch; the
-                            // fixed-size array refs guarantee the 256/16-byte
-                            // reads are in bounds.
-                            unsafe {
-                                q6_k_owner_aux32_avx2(a, scales, &y.qs)
+                            .expect("owner rebuild slice is exactly one superblock");
+                        q6_k_owner_rebuild_superblock(block, a_arr);
+                    }
+                    let block_rows = row_end - row_start;
+                    let mut sumf_block = [0f32; ROW_BLOCK];
+                    for (r, blocks) in preps[row_start..row_end].iter().enumerate() {
+                        // Load-bearing f32 shape: 8 lane accumulators per CELL,
+                        // reduced once after all superblocks — verbatim
+                        // `q6_k_wire_row_dot`.
+                        let mut sums = [0f32; 8];
+                        for (i, y) in blocks.iter().enumerate().take(superblocks) {
+                            let d = wd[i] * y.d;
+                            let a: &[i8; Q6_K_VALUES_PER_BLOCK] = a_all
+                                [i * Q6_K_VALUES_PER_BLOCK..(i + 1) * Q6_K_VALUES_PER_BLOCK]
+                                .try_into()
+                                .expect("owner superblock slice is exactly 256 weights");
+                            let scales: &[u8; 16] = wsc[i * 16..(i + 1) * 16]
+                                .try_into()
+                                .expect("owner scale slice is exactly 16 bytes");
+                            // `use_avx2` is read on every target (the cfg split is
+                            // inside the arm), so non-x86 builds see no unused
+                            // binding.
+                            let aux32 = if use_avx2 {
+                                #[cfg(target_arch = "x86_64")]
+                                // SAFETY: avx2 confirmed present at dispatch; the
+                                // fixed-size array refs guarantee the 256/16-byte
+                                // reads are in bounds.
+                                unsafe {
+                                    q6_k_owner_aux32_avx2(a, scales, &y.qs)
+                                }
+                                #[cfg(not(target_arch = "x86_64"))]
+                                q6_k_owner_aux32_scalar(a, scales, &y.qs)
+                            } else {
+                                q6_k_owner_aux32_scalar(a, scales, &y.qs)
+                            };
+                            for l in 0..8 {
+                                sums[l] += d * aux32[l] as f32;
                             }
-                            #[cfg(not(target_arch = "x86_64"))]
-                            q6_k_owner_aux32_scalar(a, scales, &y.qs)
-                        } else {
-                            q6_k_owner_aux32_scalar(a, scales, &y.qs)
-                        };
-                        for l in 0..8 {
-                            sums[l] += d * aux32[l] as f32;
+                        }
+                        sumf_block[r] = sums.iter().sum();
+                    }
+                    let ptr = out_ptr;
+                    for (r, sumf) in sumf_block[..block_rows].iter().enumerate() {
+                        // SAFETY: (row, o) cells are disjoint across tasks — this
+                        // task exclusively owns channels [o_start, o_end) and the
+                        // row loop is serial within the task.
+                        unsafe {
+                            *ptr.0.add((row_start + r) * out_dim + o) = *sumf;
                         }
                     }
-                    sumf_block[r] = sums.iter().sum();
                 }
-                let ptr = out_ptr;
-                for (r, sumf) in sumf_block[..block_rows].iter().enumerate() {
-                    // SAFETY: (row, o) cells are disjoint across tasks — this
-                    // task exclusively owns channels [o_start, o_end) and the
-                    // row loop is serial within the task.
-                    unsafe {
-                        *ptr.0.add((row_start + r) * out_dim + o) = *sumf;
-                    }
-                }
-            }
-        });
+            },
+        );
     }
     CpuTensor::from_f32(name, vec![n_rows, out_dim], out)
 }
@@ -24969,6 +25455,15 @@ fn attention_context_for_head_into_with_kernels(
         .kv_cache
         .head_base_offset(params.layer_idx, params.kv_head);
     let position_stride = params.kv_cache.head_position_stride();
+    let key_blocks_per_row = k_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
+    let mut key_block_start = params.kv_cache.quantized_head_base_offset(
+        params.layer_idx,
+        params.kv_head,
+        key_blocks_per_row,
+    );
+    let key_block_position_stride = params
+        .kv_cache
+        .quantized_head_position_stride(key_blocks_per_row);
 
     let mut key_start = head_base;
     for position in 0..params.position_count {
@@ -24989,10 +25484,21 @@ fn attention_context_for_head_into_with_kernels(
                 let key_slice = &params.kv_cache.keys_f16[key_start..key_start + k_head_dim];
                 attn_f32_dot::dot_blocked_f16(params.query_slice, key_slice) * params.scale
             }
+            KvDtype::Q8_0 => {
+                let key_blocks = &params.kv_cache.keys_q8_0
+                    [key_block_start..key_block_start + key_blocks_per_row];
+                vec_dot_row_q8_0(params.query_slice, key_blocks) * params.scale
+            }
+            KvDtype::Q4_0 => {
+                let key_blocks = &params.kv_cache.keys_q4_0
+                    [key_block_start..key_block_start + key_blocks_per_row];
+                vec_dot_row_q4_0(params.query_slice, key_blocks) * params.scale
+            }
         };
         scores.push(score);
         if position + 1 < params.position_count {
             key_start += position_stride;
+            key_block_start += key_block_position_stride;
         }
     }
 
@@ -25011,6 +25517,23 @@ fn attention_context_for_head_into_with_kernels(
     let inv_score_sum = 1.0 / score_sum;
     let mut value_start = head_base;
     let is_mla = params.kv_cache.plan.value_shape[3] == 0;
+    let value_blocks_per_row = v_head_dim.div_ceil(KV_QUANT_BLOCK_VALUES);
+    let mut quantized_key_value_start = params.kv_cache.quantized_head_base_offset(
+        params.layer_idx,
+        params.kv_head,
+        key_blocks_per_row,
+    );
+    let quantized_key_value_stride = params
+        .kv_cache
+        .quantized_head_position_stride(key_blocks_per_row);
+    let mut quantized_value_start = params.kv_cache.quantized_head_base_offset(
+        params.layer_idx,
+        params.kv_head,
+        value_blocks_per_row,
+    );
+    let quantized_value_stride = params
+        .kv_cache
+        .quantized_head_position_stride(value_blocks_per_row);
     for (position, score) in scores.iter().copied().enumerate() {
         let probability = score * inv_score_sum;
         match params.kv_cache.dtype {
@@ -25036,9 +25559,31 @@ fn attention_context_for_head_into_with_kernels(
                 };
                 attn_f32_dot::axpy_blocked_f16(out_slice, probability, value_slice);
             }
+            KvDtype::Q8_0 => {
+                let value_blocks = if is_mla {
+                    &params.kv_cache.keys_q8_0[quantized_key_value_start
+                        ..quantized_key_value_start + value_blocks_per_row]
+                } else {
+                    &params.kv_cache.values_q8_0
+                        [quantized_value_start..quantized_value_start + value_blocks_per_row]
+                };
+                axpy_row_q8_0(out_slice, probability, value_blocks);
+            }
+            KvDtype::Q4_0 => {
+                let value_blocks = if is_mla {
+                    &params.kv_cache.keys_q4_0[quantized_key_value_start
+                        ..quantized_key_value_start + value_blocks_per_row]
+                } else {
+                    &params.kv_cache.values_q4_0
+                        [quantized_value_start..quantized_value_start + value_blocks_per_row]
+                };
+                axpy_row_q4_0(out_slice, probability, value_blocks);
+            }
         }
         if position + 1 < params.position_count {
             value_start += position_stride;
+            quantized_key_value_start += quantized_key_value_stride;
+            quantized_value_start += quantized_value_stride;
         }
     }
 

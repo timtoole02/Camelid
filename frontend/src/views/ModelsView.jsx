@@ -9,6 +9,7 @@ import { Section, SupportedRow, CompatibleRow, EligibleRow, NotAnchoredRow, pret
 import { ConfirmDialog } from '../components/ui/ConfirmDialog'
 import { useModelsPageData } from '../hooks/useModelsPageData'
 import { bucketByLane } from '../lib/modelLanes'
+import { loadLocalModelForChat, modelFilenameFromPath } from '../lib/modelActivation'
 import { modelDeleteBlockedReason } from '../lib/modelDeletion'
 import { IconModels } from '../components/ui/icons'
 
@@ -60,6 +61,7 @@ export default function ModelsView({
   const [importing, setImporting] = useState(false)
   const [pendingDeleteEntry, setPendingDeleteEntry] = useState(null)
   const [deletingFilename, setDeletingFilename] = useState('')
+  const [defaultingFilename, setDefaultingFilename] = useState('')
   const [deleteNotice, setDeleteNotice] = useState('')
   const [catalogOperations, setCatalogOperations] = useState(new Set())
   const loadInFlightRef = useRef('')
@@ -91,12 +93,11 @@ export default function ModelsView({
     })
   }, [])
 
-  const filenameFromPath = (value) => String(value || '').split(/[\\/]/).pop() || ''
-
-  // Load a local model into the chat backend. First predict the lane with a
-  // header-only inspect (no multi-GB read): if the architecture is not implemented,
-  // surface the exact typed blocker and stop — never attempt to run it. Implemented
-  // architectures (supported or experimental) load as before.
+  // Load a local model into the chat backend. The HTTP sequence itself (header-only
+  // inspect -> authoritative load -> identity + readiness confirmation) lives in
+  // lib/modelActivation so this page and the first-run card cannot drift; what stays
+  // here is the page's own state wiring. The spine's `/api/models/current` refresh
+  // answers the identity check, so the confirmation costs no extra request.
   const loadModelForChat = async (filename, { onStage } = {}) => {
     if (loadInFlightRef.current) {
       const message = loadInFlightRef.current === filename
@@ -109,71 +110,20 @@ export default function ModelsView({
     setUsingFilename(filename)
     setLaneError('')
     setBlocker(null)
-    // Send a models-relative path, NOT the engine's absolute models_dir joined
-    // with '/'. On Windows the reported models_dir can be a `\\?\` verbatim path,
-    // and Win32 does not normalize a '/' inside a verbatim path, so the old
-    // concatenation produced an invalid name (os error 123). The backend resolves
-    // this relative path against its configured models directory.
-    const path = `models/${filename}`
-    let activeStage = 'checking'
     try {
-      onStage?.('checking')
-      const inspectRes = await fetch(`${spine.base}/api/models/inspect`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path }),
+      const result = await loadLocalModelForChat({
+        apiBase: spine.base,
+        filename,
+        onStage,
+        readActiveFilename: async () => modelFilenameFromPath((await spine.refreshCurrent())?.path),
       })
-      const inspect = await inspectRes.json().catch(() => ({}))
-      if (!inspectRes.ok) {
-        const message = inspect?.error?.message || `model inspection failed (HTTP ${inspectRes.status})`
-        if (inspect?.error?.code) setBlocker({ code: inspect.error.code, message })
-        setLaneError(message)
-        return { ok: false, stage: 'checking', message }
-      }
-      if (inspect?.blocker) {
-        setBlocker(inspect.blocker)
-        setLaneError(inspect.blocker.message)
-        return { ok: false, stage: 'checking', message: inspect.blocker.message }
-      }
-      // Only an inspected, implemented model reaches the authoritative load.
-      activeStage = 'loading'
-      onStage?.('loading')
-      // replace: picking a model in the app is a SWAP, not a second resident
-      // copy. Without it the previous model keeps its RAM and VRAM, and the
-      // fit preflight refuses the new one on a host that could hold it alone.
-      // The engine releases the old model first, then re-probes live memory.
-      const res = await fetch(`${spine.base}/api/models/load`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: filename, path, replace: true }),
-      })
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}))
-        // A typed fail-closed load error (e.g. invalid metadata) becomes a blocker.
-        if (body?.error?.code && body.error.code !== 'invalid_model') {
-          setBlocker({ code: body.error.code, message: body.error.message })
-          return { ok: false, stage: 'loading', message: body.error.message }
-        }
-        throw new Error(body?.error?.message || `load failed (HTTP ${res.status})`)
-      }
-      const current = await spine.refreshCurrent()
-      if (filenameFromPath(current?.path) !== filename) {
-        throw new Error(`Camelid loaded the request but did not confirm ${filename} as the active model.`)
-      }
-      const healthRes = await fetch(`${spine.base}/v1/health`)
-      const health = await healthRes.json().catch(() => ({}))
-      if (!healthRes.ok) {
-        throw new Error(health?.error?.message || `readiness check failed (HTTP ${healthRes.status})`)
-      }
-      if (!health.loaded_now || !health.generation_ready || health.active_model_id !== filename) {
-        throw new Error(`Camelid loaded ${filename}, but it is not generation-ready yet.`)
+      if (!result.ok) {
+        if (result.blocker) setBlocker(result.blocker)
+        setLaneError(result.message)
+        return result
       }
       await refreshDashboard?.({ silent: true })
-      return { ok: true }
-    } catch (err) {
-      const message = String(err?.message || err)
-      setLaneError(message)
-      return { ok: false, stage: activeStage, message }
+      return result
     } finally {
       if (loadInFlightRef.current === filename) loadInFlightRef.current = ''
       setUsingFilename('')
@@ -257,6 +207,20 @@ export default function ModelsView({
     setLaneError('')
     setDeleteNotice('')
     setPendingDeleteEntry(entry)
+  }
+
+  const makeDefaultModel = async (filename) => {
+    setDefaultingFilename(filename)
+    setLaneError('')
+    setDeleteNotice('')
+    try {
+      await spine.setDefaultModel(filename)
+      setDeleteNotice(`${filename} will load automatically the next time Camelid starts.`)
+    } catch (error) {
+      setLaneError(String(error?.message || error))
+    } finally {
+      setDefaultingFilename('')
+    }
   }
 
   useEffect(() => {
@@ -409,9 +373,12 @@ export default function ModelsView({
               active={m.filename === spine.activeFilename}
               busy={usingFilename === m.filename}
               deleteBusy={deletingFilename === m.filename}
+              defaultBusy={defaultingFilename === m.filename}
+              isDefault={spine.defaultFilename === m.filename}
               blockedReason={deleteBlockedReason}
               onUse={() => loadModelForChat(m.filename)}
               onDelete={requestDeleteModel}
+              onMakeDefault={makeDefaultModel}
             />
           ))
         ) : (
@@ -437,9 +404,14 @@ export default function ModelsView({
                 key={m.filename}
                 entry={m}
                 receipt={receipts[m.filename]}
+                busy={usingFilename === m.filename}
                 deleteBusy={deletingFilename === m.filename}
+                defaultBusy={defaultingFilename === m.filename}
+                isDefault={spine.defaultFilename === m.filename}
                 blockedReason={deleteBlockedReason}
+                onUse={() => loadModelForChat(m.filename)}
                 onDelete={requestDeleteModel}
+                onMakeDefault={makeDefaultModel}
               />
             ))}
             {laneBuckets.eligible.map((m) => (
@@ -459,9 +431,12 @@ export default function ModelsView({
                 entry={m}
                 busy={usingFilename === m.filename}
                 deleteBusy={deletingFilename === m.filename}
+                defaultBusy={defaultingFilename === m.filename}
+                isDefault={spine.defaultFilename === m.filename}
                 blockedReason={deleteBlockedReason}
                 onUse={() => loadModelForChat(m.filename)}
                 onDelete={requestDeleteModel}
+                onMakeDefault={makeDefaultModel}
               />
             ))}
           </>
@@ -491,7 +466,7 @@ export default function ModelsView({
         }
         onInstallStarted={spine.kickDownloadsPoll}
         onDownloadAcknowledged={spine.refreshDownloads}
-        onAcquired={spine.refreshLocal}
+        onAcquired={spine.refreshLocalAndDefault}
         canceledCatalogIds={canceledCatalogIds}
         onDownloadRetry={clearCanceledDownload}
         onStartModel={loadModelForChat}

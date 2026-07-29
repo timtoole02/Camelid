@@ -599,4 +599,43 @@ assert.doesNotMatch(LLAMA32_3B_ACCEPTANCE_AVAILABILITY, /not present locally yet
 assert.match(LLAMA32_3B_ACCEPTANCE_GATING_NOTE, /loaded_now=true and generation_ready=true/)
 assert.match(LLAMA32_3B_ACCEPTANCE_GATING_NOTE, /exact supported Llama 3\.2 3B Q8_0 compatibility row/)
 
+/* A family fallback must never name a row of a different model size. Several Qwen3
+   sizes are certified under one family, and the fallback used to take the FIRST row
+   whose id merely contains "qwen" — so a 4B file inherited the 0.6B row's id, status
+   and evidence copy purely from array order. */
+const multiSizeQwenFixture = {
+  model_compatibility: [
+    { id: 'qwen3_0_6b_instruct_q8_0', family: 'qwen3', quantization: 'Q8_0', status: 'supported_exact_row_smoke' },
+    { id: 'qwen3_4b_instruct_q8_0', family: 'qwen3', quantization: 'Q8_0', status: 'supported_exact_row_smoke' },
+    { id: 'qwen3_8b_instruct_q8_0', family: 'qwen3', quantization: 'Q8_0', status: 'supported_exact_row_smoke' },
+  ],
+}
+const qwen4bFamilyHint = findCompatibilityHint(multiSizeQwenFixture, {
+  id: 'Qwen3-4B-Q8_0.gguf',
+  name: 'Qwen3-4B-Q8_0.gguf',
+  model_path: 'Qwen3-4B-Q8_0.gguf',
+  quant: 'Q8_0',
+})
+assert.equal(qwen4bFamilyHint.kind, 'family', 'a row id carrying a finetune token the filename omits stays a non-exact family hint')
+assert.equal(
+  qwen4bFamilyHint.target.id,
+  'qwen3_4b_instruct_q8_0',
+  'the family fallback must select the row matching the subject size, not the first same-family row in array order',
+)
+assert.equal(
+  isCompatibilitySupportedForModel(multiSizeQwenFixture, { id: 'Qwen3-4B-Q8_0.gguf', quant: 'Q8_0' }),
+  false,
+  'a size-matched family hint is still advisory and must never unlock chat on its own',
+)
+
+/* When the subject states a size that no row covers, decline the row-specific hint
+   rather than naming a confidently wrong neighbour. */
+const qwen32bFamilyHint = findCompatibilityHint(multiSizeQwenFixture, {
+  id: 'Qwen3-32B-Q8_0.gguf',
+  name: 'Qwen3-32B-Q8_0.gguf',
+  model_path: 'Qwen3-32B-Q8_0.gguf',
+  quant: 'Q8_0',
+})
+assert.equal(qwen32bFamilyHint, null, 'an uncertified model size must not inherit a different size row as evidence')
+
 console.log('✓ model-state smoke passed')

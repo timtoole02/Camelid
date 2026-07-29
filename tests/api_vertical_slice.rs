@@ -438,24 +438,11 @@ async fn native_compatibility_routes_fail_closed_with_typed_errors() {
         ("POST", "/props", "unsupported_llama_server_props", "props"),
         ("POST", "/slots", "unsupported_llama_server_slots", "slots"),
         (
-            "GET",
-            "/metrics",
-            "unsupported_llama_server_metrics",
-            "metrics",
-        ),
-        (
             "POST",
             "/infill",
             "unsupported_llama_server_infill",
             "input",
         ),
-        ("POST", "/embedding", "unsupported_embeddings", "input"),
-        ("POST", "/embeddings", "unsupported_embeddings", "input"),
-        ("POST", "/v1/embeddings", "unsupported_embeddings", "input"),
-        ("POST", "/rerank", "unsupported_reranking", "input"),
-        ("POST", "/reranking", "unsupported_reranking", "input"),
-        ("POST", "/v1/rerank", "unsupported_reranking", "input"),
-        ("POST", "/v1/reranking", "unsupported_reranking", "input"),
         ("POST", "/v1/responses", "unsupported_responses", "input"),
         ("POST", "/v1/messages", "unsupported_messages", "input"),
     ];
@@ -478,6 +465,34 @@ async fn native_compatibility_routes_fail_closed_with_typed_errors() {
         assert_eq!(body["error"]["code"], code, "{uri}");
         assert_eq!(body["error"]["param"], param, "{uri}");
     }
+}
+
+#[tokio::test]
+async fn metrics_exposes_prometheus_runtime_counters() {
+    let response = camelid::api::router()
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-type"],
+        "text/plain; version=0.0.4; charset=utf-8"
+    );
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("# TYPE camelid_prompt_tokens_total counter"));
+    assert!(body.contains("# TYPE camelid_engine_queue_depth gauge"));
+    assert!(body.contains("# TYPE camelid_process_resident_memory_bytes gauge"));
 }
 
 #[tokio::test]
@@ -732,22 +747,39 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
             && item["notes"].as_str().unwrap().contains("stream=true")
     }));
     assert!(body["api_features"].as_array().unwrap().iter().any(|item| {
+        item["id"] == "production_server_hardening"
+            && item["status"] == "supported"
+            && item["notes"]
+                .as_str()
+                .unwrap()
+                .contains("Prometheus /metrics")
+            && item["notes"]
+                .as_str()
+                .unwrap()
+                .contains("fail-closed non-loopback")
+    }));
+    let api_features = body["api_features"].as_array().unwrap();
+    assert!(api_features.iter().any(|item| {
+        item["id"] == "openai_embeddings"
+            && item["status"] == "supported_exact_model_row"
+            && item["notes"].as_str().unwrap().contains("Nomic")
+    }));
+    assert!(api_features.iter().any(|item| {
+        item["id"] == "embedding_similarity_reranking"
+            && item["status"] == "supported_exact_model_row"
+            && item["notes"].as_str().unwrap().contains("bi-encoder")
+    }));
+    assert!(api_features.iter().any(|item| {
+        let notes = item["notes"].as_str().unwrap();
         item["id"] == "fail_closed_native_compatibility_routes"
             && item["status"] == "unsupported"
-            && item["notes"].as_str().unwrap().contains("/infill")
-            && item["notes"].as_str().unwrap().contains("/metrics")
-            && item["notes"].as_str().unwrap().contains("/v1/embeddings")
-            && item["notes"].as_str().unwrap().contains("/v1/responses")
-            && item["notes"].as_str().unwrap().contains("/v1/messages")
-            && item["notes"]
-                .as_str()
-                .unwrap()
-                .contains("Unsupported /models/load router-mode fields")
-            && item["notes"]
-                .as_str()
-                .unwrap()
-                .contains("POST /models/unload")
-            && item["notes"].as_str().unwrap().contains("POST /slots")
+            && notes.contains("/infill")
+            && notes.contains("/v1/responses")
+            && notes.contains("/v1/messages")
+            && notes.contains("Unsupported /models/load router-mode fields")
+            && notes.contains("POST /models/unload")
+            && notes.contains("POST /slots")
+            && !notes.contains("/v1/embeddings")
     }));
     let compatibility = body["model_compatibility"].as_array().unwrap();
     let tinyllama = compatibility
@@ -1121,7 +1153,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     assert!(mixtral["evidence"]
         .as_str()
         .unwrap()
-        .contains("backend HTTP hang"));
+        .contains("separates forward progress from a stalled engine"));
     assert!(mixtral["evidence"]
         .as_str()
         .unwrap()
@@ -1964,11 +1996,9 @@ async fn chat_completion_accepts_tools_but_rejects_other_tool_fields() {
 }
 
 #[tokio::test]
-async fn chat_completion_rejects_unsupported_response_format_before_runtime() {
-    // response_format json_object and a supported json_schema are honored (JSON /
-    // JSON-Schema constrained decoding). A json_schema whose schema falls outside
-    // the enforceable subset (here a top-level `string`, which must be an object or
-    // array) is still rejected before runtime with a typed error naming the param.
+async fn chat_completion_rejects_invalid_json_schema_before_runtime() {
+    // LLGuidance supports scalar roots and a broad JSON Schema surface. A schema
+    // it cannot compile still fails before runtime with a typed, named error.
     let app = camelid::api::router();
     let response = app
         .oneshot(
@@ -1977,7 +2007,7 @@ async fn chat_completion_rejects_unsupported_response_format_before_runtime() {
                 .uri("/v1/chat/completions")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"model":"tiny","messages":[{"role":"user","content":"hello"}],"max_tokens":1,"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"string"}}}}"#,
+                    r#"{"model":"tiny","messages":[{"role":"user","content":"hello"}],"max_tokens":1,"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"camel"}}}}"#,
                 ))
                 .unwrap(),
         )
@@ -1988,6 +2018,153 @@ async fn chat_completion_rejects_unsupported_response_format_before_runtime() {
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert_eq!(body["error"]["param"], "response_format");
+}
+
+#[tokio::test]
+async fn embedding_routes_validate_payload_and_require_a_loaded_encoder() {
+    for uri in ["/embedding", "/embeddings", "/v1/embeddings"] {
+        let response = camelid::api::router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"input":"hello"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "model_not_loaded", "{uri}");
+        assert_eq!(body["error"]["param"], "model", "{uri}");
+    }
+
+    let response = camelid::api::router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/embeddings")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"input":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "empty_embedding_input");
+
+    let response = camelid::api::router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/embeddings")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"input":"hello","encoding_format":"base64"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "unsupported_embedding_encoding");
+}
+
+#[tokio::test]
+async fn reranking_routes_validate_payload_and_require_a_loaded_encoder() {
+    for uri in ["/rerank", "/reranking", "/v1/rerank", "/v1/reranking"] {
+        let response = camelid::api::router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"query":"camel","documents":["camelid","database"]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "model_not_loaded", "{uri}");
+    }
+
+    let response = camelid::api::router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/rerank")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":"camel","documents":["one"],"top_n":2}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "invalid_rerank_top_n");
+}
+
+#[tokio::test]
+async fn chat_completion_rejects_invalid_llguidance_grammar_before_runtime() {
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"tiny","messages":[{"role":"user","content":"hello"}],"max_tokens":1,"grammar":"start: ("}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert_eq!(body["error"]["param"], "grammar");
+}
+
+#[tokio::test]
+async fn chat_completion_rejects_ambiguous_constraint_fields() {
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"tiny","messages":[{"role":"user","content":"hello"}],"max_tokens":1,"response_format":{"type":"json_object"},"grammar":"start: \"ok\""}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "invalid_request_error");
     assert_eq!(body["error"]["param"], "response_format");
 }
 
@@ -2365,7 +2542,7 @@ async fn load_model_reports_tokenizer_summary() {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["tokenizer"]["status"], "available");
     assert_eq!(body["tokenizer"]["model"], "llama_spm");
-    assert_eq!(body["tokenizer"]["token_count"], 7);
+    assert_eq!(body["tokenizer"]["token_count"], 14);
     assert_eq!(body["tokenizer"]["byte_token_count"], 1);
     assert_eq!(body["tokenizer"]["special"]["bos"], 1);
     assert_eq!(body["tokenizer"]["special"]["eos"], 2);
@@ -2628,7 +2805,7 @@ async fn tokenizer_endpoint_returns_current_model_tokenizer_summary() {
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["model"], "llama_spm");
-    assert_eq!(body["token_count"], 7);
+    assert_eq!(body["token_count"], 14);
     assert_eq!(
         body["special"]["eog"].as_array().unwrap(),
         &[serde_json::json!(2)]
@@ -2791,13 +2968,16 @@ async fn llama_server_tokenize_detokenize_aliases_use_loaded_tokenizer() {
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     // `add_space_prefix=true` unconditionally prepends a space, so the already
-    // space-led " hello!" tokenizes with a leading double-space (id 6 twice).
+    // space-led " hello!" normalizes to `▁▁hello!`. `▁▁` is not in this vocab, so
+    // the first `▁` stands alone (6) and the second merges into `▁hello` (3) —
+    // the reference merges the dummy prefix into the following word rather than
+    // leaving it as a bare piece. The previous `6,6,4,5` came from the old
+    // longest-match encoder plus its `▁▁` deferral, not from the reference.
     assert_eq!(
         body["tokens"].as_array().unwrap(),
         &[
             serde_json::json!(6),
-            serde_json::json!(6),
-            serde_json::json!(4),
+            serde_json::json!(3),
             serde_json::json!(5)
         ]
     );
@@ -2820,9 +3000,9 @@ async fn llama_server_tokenize_detokenize_aliases_use_loaded_tokenizer() {
     assert_eq!(
         body["tokens"].as_array().unwrap(),
         &[
+            // Same `▁▁hello!` segmentation as the id-only assertion above.
             serde_json::json!({"id":6,"piece":" "}),
-            serde_json::json!({"id":6,"piece":" "}),
-            serde_json::json!({"id":4,"piece":"hello"}),
+            serde_json::json!({"id":3,"piece":" hello"}),
             serde_json::json!({"id":5,"piece":"!"})
         ]
     );
@@ -4088,7 +4268,14 @@ async fn streaming_completion_accepts_advanced_sampling_controls() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(content_type.starts_with("text/event-stream"));
     assert!(body.contains("\"object\":\"text_completion\""));
-    assert!(body.contains("\"text\":\"<unk>\""));
+    // What this test is for is that presence_penalty / frequency_penalty /
+    // logit_bias are ACCEPTED and still stream a well-formed completion. The
+    // emitted token is incidental and fixture-specific: this vocab cannot build
+    // `▁hello` by pairwise merge, so the prompt is a run of byte-fallback <unk>s,
+    // and penalising that repeat (plus the logit_bias) makes the sampler pick EOS
+    // immediately — hence an empty delta and finish_reason=stop. The sibling
+    // `streaming_completion_*` test covers the unpenalised <unk> emission.
+    assert!(body.contains("\"finish_reason\":\"stop\""), "{body}");
     assert!(body.contains("data: [DONE]"));
 }
 
@@ -4156,7 +4343,13 @@ async fn completion_clamps_over_limit_max_tokens_to_context() {
     write_generation_gguf_with_options(
         &path,
         GenerationFixtureOptions {
-            context_length: 8,
+            // 16, not 8: this fixture's 4-token vocab holds `▁hello` but none of the
+            // single-step pieces SPM needs to build it, so `"hello"` byte-falls-back
+            // (and `▁` is 3 UTF-8 bytes) to a 9-token prompt. A longest-match encoder
+            // could jump straight to `▁hello`; the reference algorithm cannot. The
+            // clamp path under test needs a context with room left over, which is
+            // what this widens — the assertion below is unchanged.
+            context_length: 16,
             include_tokenizer: true,
             truncate_payload: false,
         },
@@ -4203,10 +4396,11 @@ async fn completion_clamps_over_limit_max_tokens_to_context() {
         StatusCode::OK,
         "an over-limit max_tokens must clamp and generate, not reject: {body}"
     );
+    // 9-token prompt in a 16-token context leaves room for 7.
     let completion_tokens = body["usage"]["completion_tokens"].as_u64().unwrap_or(0);
     assert!(
-        (1..=6).contains(&completion_tokens),
-        "generation must be clamped to the room left in the context (<=6), got {completion_tokens}: {body}"
+        (1..=7).contains(&completion_tokens),
+        "generation must be clamped to the room left in the context (<=7), got {completion_tokens}: {body}"
     );
 }
 
@@ -4440,9 +4634,18 @@ fn write_tokenizer_gguf_with_optional_chat_template(
     add_space_prefix: bool,
     chat_template: Option<&str>,
 ) {
-    let tokens = ["<unk>", "<s>", "</s>", "▁hello", "hello", "<0x21>", "▁"];
-    let scores = [0.0, 0.0, 0.0, 10.0, 2.0, 0.0, 1.0];
-    let token_types = [2, 3, 3, 1, 1, 6, 1];
+    // SPM reaches a token only through successive pairwise merges whose every
+    // intermediate is itself in the vocab, so the single-step pieces are required
+    // for `▁hello`/`hello` to be reachable at all. Appended (never reordered) so
+    // the ids these tests assert stay put. Mirrors tests/tokenizer.rs.
+    let tokens = [
+        "<unk>", "<s>", "</s>", "▁hello", "hello", "<0x21>", "▁", "▁h", "▁he", "▁hel", "▁hell",
+        "he", "hel", "hell",
+    ];
+    let scores = [
+        0.0, 0.0, 0.0, 10.0, 2.0, 0.0, 1.0, 3.0, 4.0, 5.0, 6.0, 2.5, 2.6, 2.7,
+    ];
+    let token_types = [2, 3, 3, 1, 1, 6, 1, 1, 1, 1, 1, 1, 1, 1];
 
     let mut b = Vec::new();
     b.extend_from_slice(b"GGUF");
