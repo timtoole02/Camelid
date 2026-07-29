@@ -943,19 +943,36 @@ mod tests {
             );
             assert!(plan.enforced.layers.contains(&"credential-deny"));
 
-            // Then the live check, which only means something where the path
-            // exists: the kernel reports EPERM for a denied read, but a path that
-            // is simply absent reports ENOENT and would prove nothing. CI runners
-            // have no ~/.ssh, so this half is conditional by necessity — either
-            // way the read must not succeed.
-            let (ok, out) = run_confined(dir.path(), "cat \"$HOME/.ssh/id_rsa\" 2>&1");
-            assert!(!ok, "reading a credential store must never succeed: {out}");
-            if std::path::Path::new(&ssh).is_dir() {
+            // Then the live check, on every denied directory this host actually
+            // has. Probe DIRECTORIES, not files inside them: the kernel resolves
+            // existence before the deny rule, so reading an absent file reports
+            // ENOENT and proves nothing either way — which is how this test first
+            // failed on a CI runner that has ~/.ssh but no id_rsa in it. Listing
+            // a directory that does exist is refused deterministically.
+            let mut verified = 0;
+            for candidate in [
+                ssh.clone(),
+                format!("{home}/Library/Keychains"),
+                "/Library/Keychains".to_string(),
+            ] {
+                if !std::path::Path::new(&candidate).is_dir() {
+                    continue;
+                }
+                let (ok, out) = run_confined(dir.path(), &format!("ls \"{candidate}\" 2>&1"));
+                assert!(!ok, "listing {candidate} must not succeed: {out}");
                 assert!(
                     out.contains("Operation not permitted"),
-                    "the ~/.ssh deny rule must be in force (got: {out})"
+                    "the deny rule for {candidate} must be in force (got: {out})"
                 );
+                verified += 1;
             }
+            // Never let this test pass vacuously: if no candidate existed, the
+            // live half proved nothing and the host needs a different probe.
+            assert!(
+                verified > 0,
+                "no credential directory was available to probe; the live half of \
+                 this test would otherwise assert nothing"
+            );
         }
 
         #[test]
