@@ -32,10 +32,18 @@ use super::workspace_memory::MemoryContext;
 /// "too slow", it reads to the model as a FAILING command, which sends it off
 /// fixing a defect that does not exist.
 ///
-/// Kept finite because a hung command must not own the turn forever; that is
-/// safe because timeout teardown kills the whole process tree (see
-/// `run_shell_timeout_tears_down_the_process_tree`) and Stop stays live.
+/// Kept finite because a hung command must not own the turn forever, and Stop
+/// stays live throughout. Teardown at the deadline kills the whole process tree
+/// on Windows (the job object; see `run_shell_timeout_tears_down_the_process_tree`)
+/// and, for delegated work, on Unix too (the worker's process group). A command
+/// the server itself runs on Unix is killed as a single process, so a descendant
+/// build tree can outlive the deadline — `run_shell` in `tools.rs` records why.
 const WEB_CODE_SHELL_TIMEOUT: Duration = Duration::from_secs(120);
+/// Absolute wall-clock deadline for one model step in the read-only Workspace
+/// lane: it starts at the first prompt preflight and covers every fitting
+/// retry, the wait for generation headers, and the SSE body. Documented in
+/// WORKSPACE_MEMORY_SPEC.md as a fail-closed guarantee of that surface.
+const WORKSPACE_MODEL_STEP_TIMEOUT: Duration = Duration::from_secs(90);
 const APPROVAL_POLL: Duration = Duration::from_millis(25);
 const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 pub(crate) const WORKSPACE_CONTEXT_BUDGET_TOKENS: u32 = 4_096;
@@ -485,7 +493,14 @@ pub(crate) fn run_live(
     } else {
         None
     };
-    let shell_sandbox = config.mode.shell_sandbox();
+    // What this host can actually enforce, not what the mode asks for. On a host
+    // where sandboxed confinement is unenforceable (macOS, unsupported arch) this
+    // drops to `Disabled` so `run_shell` is never advertised to the model — see
+    // `shell_sandbox::resolve_for_unattended_surface`.
+    let (shell_sandbox, shell_unavailable) = super::shell_sandbox::resolve_for_unattended_surface(
+        config.mode.shell_sandbox(),
+        &config.workspace,
+    );
     let tool_profile = config.mode.tool_profile();
     let sandbox = match Sandbox::new(
         &config.workspace,
@@ -524,6 +539,15 @@ pub(crate) fn run_live(
         workspace: sandbox.root_display(),
         model_id: config.model_id.clone(),
     });
+    // Say so when this host cannot run commands at all. The terminal lane prints
+    // the same fact in its startup banner; without it a Code user on macOS just
+    // sees the model never build or test anything, with no stated reason.
+    if let Some(why) = shell_unavailable.as_deref() {
+        worker.reporter.notice(&format!(
+            "shell commands are unavailable on this host, so run_shell is not offered to the \
+             model: {why}"
+        ));
+    }
     worker.reporter.send(WorkspaceEvent::TurnStarted {
         turn_index: config.turn_index,
     });
@@ -586,7 +610,16 @@ pub(crate) fn run_live(
     );
     driver.set_context_budget(Some(config.mode.context_budget_tokens()));
     driver.set_native_tool_history(true);
-    driver.set_stream_cancel(Arc::clone(&worker.cancel));
+    // Code drops the wall-clock model-step deadline (a coding turn can sit in a
+    // long prefill, and Stop stays authoritative), but the read-only lane keeps
+    // it: a bounded turn that fails closed on a stalled server is its published
+    // contract, and it did not ask to be changed.
+    match config.mode {
+        WorkspaceRunMode::Code => driver.set_stream_cancel(Arc::clone(&worker.cancel)),
+        WorkspaceRunMode::ReadOnly => {
+            driver.set_stream_control(Arc::clone(&worker.cancel), WORKSPACE_MODEL_STEP_TIMEOUT)
+        }
+    }
     let delta_reporter = worker.reporter.clone();
     driver.set_delta_sink(Some(Box::new(move |delta| {
         delta_reporter.model_delta(delta);
@@ -690,6 +723,9 @@ mod tests {
     /// impossible on this surface while the CLI lane had it all along.
     #[test]
     fn code_mode_advertises_the_subagent_tools_once_the_runtime_is_configured() {
+        // Serializes with the tool-set pins in `tools`, which assert on the
+        // unconfigured baseline of the same process-global registry.
+        let _lock = crate::chat::mcp::tests::registry_lock();
         let profile = WorkspaceRunMode::Code.tool_profile();
         assert!(profile.allows("spawn_subagent"));
         assert!(profile.allows("check_subagent_status"));
@@ -720,7 +756,7 @@ mod tests {
             ShellSandbox::Sandboxed,
             "the child must never widen the parent's shell confinement"
         );
-        crate::chat::subagent::configure(config);
+        let _configured = crate::chat::subagent::configure_for_test(config);
         let advertised =
             crate::chat::tools::specs_for(profile, false, WorkspaceRunMode::Code.shell_sandbox())
                 .into_iter()

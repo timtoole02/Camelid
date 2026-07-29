@@ -156,6 +156,30 @@ pub fn describe_sandboxed(root: &Path) -> Result<EnforcedShell, String> {
     configure_sandboxed(&mut probe, root)
 }
 
+/// Resolve a *requested* mode down to what this host can honour, for surfaces
+/// that cannot ask the user to pick another mode.
+///
+/// The terminal lane prints the unenforceable-here warning and lets the operator
+/// re-run with `--shell-sandbox`. A web session has neither: the flags do not
+/// exist there, so an unenforceable `Sandboxed` would advertise `run_shell` to
+/// the model and then refuse every single call — the model burns the turn on a
+/// tool that cannot work, and in approval-gated mode the user approves exec
+/// actions that are already doomed. Resolve to [`ShellSandbox::Disabled`] so the
+/// tool is simply not offered, which is what "fail closed" means for a surface
+/// with no opt-out. Returns the refusal text so callers can disclose *why*.
+pub fn resolve_for_unattended_surface(
+    requested: ShellSandbox,
+    root: &Path,
+) -> (ShellSandbox, Option<String>) {
+    match requested {
+        ShellSandbox::Sandboxed => match describe_sandboxed(root) {
+            Ok(_) => (ShellSandbox::Sandboxed, None),
+            Err(why) => (ShellSandbox::Disabled, Some(why)),
+        },
+        other => (other, None),
+    }
+}
+
 // ===========================================================================
 // Linux enforcement (x86_64 / aarch64). Built-and-gated; validated by Linux CI.
 // ===========================================================================
@@ -453,6 +477,46 @@ fn configure_sandboxed(_builder: &mut Command, _root: &Path) -> Result<EnforcedS
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unattended_surface_drops_an_unenforceable_sandbox_to_disabled() {
+        // A web Code session has no `--shell-sandbox` to fall back on. Leaving
+        // the mode at Sandboxed where it cannot be enforced would advertise
+        // run_shell to the model and then refuse every call — the model spends
+        // the turn on a tool that cannot work, and in approval-gated mode the
+        // user is asked to approve commands that are already doomed. Disabled
+        // means the tool is simply never offered, which is what fail-closed has
+        // to mean when there is no opt-out.
+        let dir = std::env::temp_dir();
+        let (resolved, why) = resolve_for_unattended_surface(ShellSandbox::Sandboxed, &dir);
+        if describe_sandboxed(&dir).is_ok() {
+            assert_eq!(resolved, ShellSandbox::Sandboxed);
+            assert!(why.is_none());
+        } else {
+            assert_eq!(resolved, ShellSandbox::Disabled);
+            let why = why.expect("an unenforceable host must say why");
+            assert!(
+                why.contains("not enforceable"),
+                "the reason is shown to the user: {why}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolving_never_widens_a_mode() {
+        // Only the sandboxed→disabled narrowing is in scope. An explicit
+        // unrestricted opt-in must not be silently upgraded or downgraded here,
+        // and disabled must stay disabled.
+        let dir = std::env::temp_dir();
+        assert_eq!(
+            resolve_for_unattended_surface(ShellSandbox::Unrestricted, &dir).0,
+            ShellSandbox::Unrestricted
+        );
+        assert_eq!(
+            resolve_for_unattended_surface(ShellSandbox::Disabled, &dir).0,
+            ShellSandbox::Disabled
+        );
+    }
 
     #[test]
     fn mode_parses_and_round_trips() {
