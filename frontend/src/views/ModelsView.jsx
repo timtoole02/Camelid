@@ -136,6 +136,7 @@ export default function ModelsView({
         setLaneError(inspect.blocker.message)
         return { ok: false, stage: 'checking', message: inspect.blocker.message }
       }
+      const embeddingModel = inspect?.architecture === 'nomic-bert'
       // Only an inspected, implemented model reaches the authoritative load.
       activeStage = 'loading'
       onStage?.('loading')
@@ -146,7 +147,12 @@ export default function ModelsView({
       const res = await fetch(`${spine.base}/api/models/load`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: filename, path, replace: true }),
+        body: JSON.stringify({
+          id: filename,
+          path,
+          replace: !embeddingModel,
+          set_active: !embeddingModel,
+        }),
       })
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
@@ -156,6 +162,26 @@ export default function ModelsView({
           return { ok: false, stage: 'loading', message: body.error.message }
         }
         throw new Error(body?.error?.message || `load failed (HTTP ${res.status})`)
+      }
+      if (embeddingModel) {
+        const probeRes = await fetch(`${spine.base}/v1/embeddings`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: filename,
+            input: 'search_query: Camelid embedding readiness probe',
+            dimensions: 256,
+          }),
+        })
+        const probe = await probeRes.json().catch(() => ({}))
+        if (!probeRes.ok || probe?.data?.[0]?.embedding?.length !== 256) {
+          throw new Error(
+            probe?.error?.message
+              || `Camelid registered ${filename}, but its embedding runtime did not pass readiness.`,
+          )
+        }
+        await refreshDashboard?.({ silent: true })
+        return { ok: true, embedding: true }
       }
       const current = await spine.refreshCurrent()
       if (filenameFromPath(current?.path) !== filename) {

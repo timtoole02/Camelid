@@ -29,6 +29,8 @@ axum = "0.7"
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 getrandom = "0.4"
+llguidance = "=1.7.6"
+toktrie = "=1.7.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -51,6 +53,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # unicode-general-category 1.1.0 vendors Unicode 16.0 General Category tables.
 # Pin it exactly so GPT4O's `\p{L}`/`\p{N}` port cannot drift with a UCD update.
 unicode-general-category = "=1.1.0"
+unicode-normalization = "0.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.31"

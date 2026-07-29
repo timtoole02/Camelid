@@ -111,6 +111,22 @@ const curated = {
 }
 
 {
+  const result = await completeCatalogAcquisition({
+    item: {
+      group: 'curated',
+      filename: 'nomic-embed-text-v1.5.Q8_0.gguf',
+      oracle_qualified: true,
+    },
+    mode: 'start',
+    loadModelForChat: async () => ({ ok: true, embedding: true }),
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.started, false, 'an encoder sidecar must not navigate to Chat')
+  assert.equal(result.embedding, true)
+  assert.match(result.message, /current Chat model was left active/)
+}
+
+{
   let loadCalled = false
   const result = await completeCatalogAcquisition({
     item: { ...curated, group: 'curated' },

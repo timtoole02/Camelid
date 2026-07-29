@@ -6,6 +6,7 @@ use std::{
 
 use sha2::Digest;
 use unicode_general_category::{get_general_category, GeneralCategory};
+use unicode_normalization::UnicodeNormalization;
 
 use crate::{gguf::GgufFile, BackendError, Result};
 
@@ -17,6 +18,7 @@ const SPM_SPACE: char = '▁';
 pub enum TokenizerModel {
     LlamaSpm,
     Gpt2Bpe,
+    BertWordPiece,
 }
 
 impl TokenizerModel {
@@ -24,6 +26,7 @@ impl TokenizerModel {
         match self {
             Self::LlamaSpm => "llama_spm",
             Self::Gpt2Bpe => "gpt2_bpe",
+            Self::BertWordPiece => "bert_wordpiece",
         }
     }
 }
@@ -331,9 +334,10 @@ impl Tokenizer {
             // leading-space parity is a follow-up, construction works on the SPM path.)
             "llama" | "gemma2" | "gemma3" | "gemma4" => TokenizerModel::LlamaSpm,
             "gpt2" => TokenizerModel::Gpt2Bpe,
+            "bert" => TokenizerModel::BertWordPiece,
             other => {
                 return Err(BackendError::UnsupportedTokenizer(format!(
-                    "unsupported tokenizer model {other:?}; currently supported: llama/SPM, gemma2/SPM, gemma3/SPM, gemma4/SPM, and GPT-2/BPE llama-bpe"
+                    "unsupported tokenizer model {other:?}; currently supported: llama/SPM, gemma2/SPM, gemma3/SPM, gemma4/SPM, GPT-2/BPE llama-bpe, and BERT WordPiece"
                 )))
             }
         };
@@ -419,14 +423,17 @@ impl Tokenizer {
         let default_bos = match model {
             TokenizerModel::LlamaSpm => Some(1),
             TokenizerModel::Gpt2Bpe => token_to_id.get("<|begin_of_text|>").copied(),
+            TokenizerModel::BertWordPiece => token_to_id.get("[CLS]").copied().or(Some(101)),
         };
         let default_eos = match model {
             TokenizerModel::LlamaSpm => Some(2),
             TokenizerModel::Gpt2Bpe => token_to_id.get("<|end_of_text|>").copied(),
+            TokenizerModel::BertWordPiece => token_to_id.get("[SEP]").copied().or(Some(102)),
         };
         let default_unk = match model {
             TokenizerModel::LlamaSpm => Some(0),
             TokenizerModel::Gpt2Bpe => None,
+            TokenizerModel::BertWordPiece => token_to_id.get("[UNK]").copied().or(Some(100)),
         };
 
         let bos = file
@@ -517,7 +524,7 @@ impl Tokenizer {
                     .unwrap_or(false),
                 add_sep: file
                     .metadata_bool("tokenizer.ggml.add_sep_token")
-                    .unwrap_or(false),
+                    .unwrap_or(model == TokenizerModel::BertWordPiece),
                 add_space_prefix: file
                     .metadata_bool("tokenizer.ggml.add_space_prefix")
                     .unwrap_or(true),
@@ -565,11 +572,22 @@ impl Tokenizer {
                     out.extend(self.encode_bpe_text(text, parse_special)?);
                 }
             }
+            TokenizerModel::BertWordPiece => {
+                if !text.is_empty() {
+                    out.extend(self.encode_wordpiece_text(text)?);
+                }
+            }
         }
 
-        if add_special && self.config.add_eos {
-            if let Some(eos) = self.special.eos {
-                out.push(eos);
+        if add_special {
+            if self.config.add_sep {
+                if let Some(sep) = self.special.sep.or(self.special.eos) {
+                    out.push(sep);
+                }
+            } else if self.config.add_eos {
+                if let Some(eos) = self.special.eos {
+                    out.push(eos);
+                }
             }
         }
         Ok(out)
@@ -578,6 +596,9 @@ impl Tokenizer {
     pub fn decode(&self, token_ids: &[TokenId], remove_special: bool) -> Result<String> {
         if self.model == TokenizerModel::Gpt2Bpe {
             return self.decode_bpe(token_ids, remove_special);
+        }
+        if self.model == TokenizerModel::BertWordPiece {
+            return self.decode_wordpiece(token_ids, remove_special);
         }
 
         let mut bytes = Vec::new();
@@ -605,6 +626,64 @@ impl Tokenizer {
         Ok(text)
     }
 
+    /// Return the exact byte piece LLGuidance must associate with one token.
+    ///
+    /// This deliberately does not round-trip through [`Self::decode`]. A
+    /// byte-fallback or byte-level BPE token may contain only one byte of a
+    /// multi-byte UTF-8 scalar, which is valid tokenizer state but not a valid
+    /// standalone Rust `String`. Decoding tokens one at a time therefore loses
+    /// precisely the fragments a token-trie constraint engine needs.
+    ///
+    /// Control/EOG tokens use toktrie's `0xff` marker, matching llama.cpp's
+    /// LLGuidance adapter: normal detokenization is attempted first; tokens that
+    /// exist only when special-token rendering is enabled are marker-prefixed.
+    pub(crate) fn constraint_token_bytes(&self, id: TokenId) -> Result<Vec<u8>> {
+        let token = self.tokens.get(id as usize).ok_or_else(|| {
+            BackendError::InvalidTokenizerMetadata(format!("token id {id} out of range"))
+        })?;
+
+        if token.kind == TokenKind::Control
+            || self.special.eog.contains(&id)
+            || self.is_special(id)
+            || is_chat_control_marker(token)
+        {
+            let mut bytes = Vec::with_capacity(token.text.len() + 1);
+            bytes.push(toktrie::TokTrie::SPECIAL_TOKEN_MARKER);
+            bytes.extend_from_slice(token.text.as_bytes());
+            return Ok(bytes);
+        }
+
+        match self.model {
+            TokenizerModel::LlamaSpm => {
+                if let Some(byte) = parse_byte_token(&token.text) {
+                    Ok(vec![byte])
+                } else {
+                    Ok(token.text.replace(SPM_SPACE, " ").into_bytes())
+                }
+            }
+            TokenizerModel::Gpt2Bpe => token
+                .text
+                .chars()
+                .map(|ch| {
+                    bpe_char_to_byte(ch).ok_or_else(|| {
+                        BackendError::InvalidTokenizerMetadata(format!(
+                            "GPT-2/BPE token {:?} contains non-byte character {ch:?}",
+                            token.text
+                        ))
+                    })
+                })
+                .collect(),
+            TokenizerModel::BertWordPiece => {
+                let piece = token.text.strip_prefix("##").unwrap_or(&token.text);
+                Ok(piece
+                    .strip_prefix(SPM_SPACE)
+                    .unwrap_or(piece)
+                    .as_bytes()
+                    .to_vec())
+            }
+        }
+    }
+
     /// Chat prompts are tokenized with special-token parsing for every model:
     /// llama-server tokenizes rendered chat templates with specials enabled,
     /// so a template's control markers (e.g. SPM `</s>` between turns) must
@@ -614,6 +693,158 @@ impl Tokenizer {
     /// `parse_special: false` — special parsing does not spread to raw text.
     pub fn chat_prompt_parse_special(&self) -> bool {
         true
+    }
+
+    fn encode_wordpiece_text(&self, text: &str) -> Result<Vec<TokenId>> {
+        let normalized: String = text
+            .nfd()
+            .flat_map(char::to_lowercase)
+            .filter(|ch| {
+                !matches!(
+                    get_general_category(*ch),
+                    GeneralCategory::NonspacingMark
+                        | GeneralCategory::SpacingMark
+                        | GeneralCategory::EnclosingMark
+                )
+            })
+            .collect();
+
+        let mut basic = Vec::new();
+        let mut current = String::new();
+        for ch in normalized.chars() {
+            if ch.is_whitespace() || ch.is_control() {
+                if !current.is_empty() {
+                    basic.push(std::mem::take(&mut current));
+                }
+            } else if is_bert_punctuation(ch) || is_cjk(ch) {
+                if !current.is_empty() {
+                    basic.push(std::mem::take(&mut current));
+                }
+                basic.push(ch.to_string());
+            } else {
+                current.push(ch);
+            }
+        }
+        if !current.is_empty() {
+            basic.push(current);
+        }
+
+        let unk = self.special.unk.ok_or_else(|| {
+            BackendError::InvalidTokenizerMetadata(
+                "BERT WordPiece tokenizer has no unknown token".to_string(),
+            )
+        })?;
+        // llama.cpp's GGUF BERT conversion uses a SentencePiece-like leading
+        // `▁` for the first piece of every basic token and stores continuation
+        // pieces without Hugging Face's textual `##` prefix. Keep a fallback
+        // to ordinary `piece`/`##piece` vocabularies for older GGUFs and unit
+        // fixtures, but prefer the representation this vocabulary proves.
+        let uses_gguf_word_start = self
+            .tokens
+            .iter()
+            .any(|token| token.text.starts_with(SPM_SPACE));
+        let mut output = Vec::new();
+        for word in basic {
+            let chars = word.chars().collect::<Vec<_>>();
+            if chars.len() > 100 {
+                output.push(unk);
+                continue;
+            }
+            let mut start = 0;
+            let mut pieces = Vec::new();
+            let mut failed = false;
+            while start < chars.len() {
+                let mut end = chars.len();
+                let mut found = None;
+                while start < end {
+                    let body = chars[start..end].iter().collect::<String>();
+                    let primary = if uses_gguf_word_start {
+                        if start == 0 {
+                            format!("{SPM_SPACE}{body}")
+                        } else {
+                            body.clone()
+                        }
+                    } else if start == 0 {
+                        body.clone()
+                    } else {
+                        format!("##{body}")
+                    };
+                    let fallback = if start == 0 {
+                        body
+                    } else {
+                        format!("##{body}")
+                    };
+                    if let Some(id) = self
+                        .token_to_id
+                        .get(&primary)
+                        .or_else(|| self.token_to_id.get(&fallback))
+                        .copied()
+                    {
+                        found = Some((id, end));
+                        break;
+                    }
+                    end -= 1;
+                }
+                match found {
+                    Some((id, next)) => {
+                        pieces.push(id);
+                        start = next;
+                    }
+                    None => {
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+            if failed {
+                output.push(unk);
+            } else {
+                output.extend(pieces);
+            }
+        }
+        Ok(output)
+    }
+
+    fn decode_wordpiece(&self, token_ids: &[TokenId], remove_special: bool) -> Result<String> {
+        let mut text = String::new();
+        let uses_gguf_word_start = self
+            .tokens
+            .iter()
+            .any(|token| token.text.starts_with(SPM_SPACE));
+        for &id in token_ids {
+            let token = self.tokens.get(id as usize).ok_or_else(|| {
+                BackendError::InvalidTokenizerMetadata(format!("token id {id} out of range"))
+            })?;
+            if remove_special
+                && (self.is_special(id)
+                    || token.kind == TokenKind::Control
+                    || token.text.starts_with('[') && token.text.ends_with(']'))
+            {
+                continue;
+            }
+            if let Some(suffix) = token.text.strip_prefix("##") {
+                text.push_str(suffix);
+            } else if let Some(word) = token.text.strip_prefix(SPM_SPACE) {
+                if is_single_bert_punctuation(word) {
+                    text.push_str(word);
+                } else {
+                    if !text.is_empty() {
+                        text.push(' ');
+                    }
+                    text.push_str(word);
+                }
+            } else if is_single_bert_punctuation(&token.text) {
+                text.push_str(&token.text);
+            } else if uses_gguf_word_start {
+                text.push_str(&token.text);
+            } else {
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(&token.text);
+            }
+        }
+        Ok(text)
     }
 
     fn encode_bpe_text(&self, text: &str, parse_special: bool) -> Result<Vec<TokenId>> {
@@ -1613,6 +1844,39 @@ fn is_whitespace(ch: char) -> bool {
     ch.is_whitespace()
 }
 
+fn is_bert_punctuation(ch: char) -> bool {
+    ch.is_ascii_punctuation()
+        || matches!(
+            get_general_category(ch),
+            GeneralCategory::ConnectorPunctuation
+                | GeneralCategory::DashPunctuation
+                | GeneralCategory::OpenPunctuation
+                | GeneralCategory::ClosePunctuation
+                | GeneralCategory::InitialPunctuation
+                | GeneralCategory::FinalPunctuation
+                | GeneralCategory::OtherPunctuation
+        )
+}
+
+fn is_single_bert_punctuation(text: &str) -> bool {
+    let mut chars = text.chars();
+    matches!((chars.next(), chars.next()), (Some(ch), None) if is_bert_punctuation(ch))
+}
+
+fn is_cjk(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x3400..=0x4dbf
+            | 0x4e00..=0x9fff
+            | 0x20000..=0x2a6df
+            | 0x2a700..=0x2b73f
+            | 0x2b740..=0x2b81f
+            | 0x2b820..=0x2ceaf
+            | 0xf900..=0xfaff
+            | 0x2f800..=0x2fa1f
+    )
+}
+
 /// Unicode `\p{M}` (Mn | Mc | Me) via a generated inclusive-range table — the
 /// qwen35 pre-tokenizer folds these into the letter class. NOTE `is_letter`
 /// (Rust `is_alphabetic` = derived Alphabetic) already covers the
@@ -1740,9 +2004,11 @@ fn flush_bytes(bytes: &mut Vec<u8>, text: &mut String) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bpe_pretokenize, bpe_pretokenize_gpt4o, bpe_pretokenize_with, is_chat_control_marker,
-        is_exact_phi4_mini_q4km, is_mark, BpePreTokenizer, BpeRegistry, Token, TokenKind,
+        bpe_byte_to_char, bpe_pretokenize, bpe_pretokenize_gpt4o, bpe_pretokenize_with,
+        is_chat_control_marker, is_exact_phi4_mini_q4km, is_mark, BpePreTokenizer, BpeRegistry,
+        SpecialTokens, Token, TokenKind, Tokenizer, TokenizerConfig, TokenizerModel, SPM_SPACE,
     };
+    use std::collections::{BTreeSet, HashMap};
 
     fn tok(text: &str, kind: TokenKind) -> Token {
         Token {
@@ -1751,6 +2017,116 @@ mod tests {
             score: 0.0,
             kind,
         }
+    }
+
+    fn tokenizer_with(
+        model: TokenizerModel,
+        tokens: Vec<Token>,
+        special: SpecialTokens,
+    ) -> Tokenizer {
+        Tokenizer {
+            model,
+            bpe_pre_tokenizer: BpePreTokenizer::Llama3,
+            token_to_id: tokens
+                .iter()
+                .map(|token| (token.text.clone(), token.id))
+                .collect(),
+            tokens,
+            byte_token_to_id: HashMap::new(),
+            bpe_ranks: HashMap::new(),
+            bpe_registry: BpeRegistry::default(),
+            special,
+            config: TokenizerConfig {
+                add_bos: false,
+                add_eos: false,
+                add_sep: false,
+                add_space_prefix: false,
+                remove_extra_whitespaces: false,
+            },
+            chat_template: None,
+        }
+    }
+
+    #[test]
+    fn constraint_token_bytes_preserve_fragments_spaces_and_specials() {
+        let spm_tokens = vec![
+            Token {
+                id: 0,
+                text: "<0xC3>".to_string(),
+                score: 0.0,
+                kind: TokenKind::Byte,
+            },
+            Token {
+                id: 1,
+                text: format!("{SPM_SPACE}hello"),
+                score: 0.0,
+                kind: TokenKind::Normal,
+            },
+            Token {
+                id: 2,
+                text: "</s>".to_string(),
+                score: 0.0,
+                kind: TokenKind::Control,
+            },
+        ];
+        let special = SpecialTokens {
+            eos: Some(2),
+            eog: BTreeSet::from([2]),
+            ..SpecialTokens::default()
+        };
+        let spm = tokenizer_with(TokenizerModel::LlamaSpm, spm_tokens, special);
+        assert_eq!(spm.constraint_token_bytes(0).unwrap(), vec![0xc3]);
+        assert_eq!(spm.constraint_token_bytes(1).unwrap(), b" hello");
+        assert_eq!(spm.constraint_token_bytes(2).unwrap(), b"\xff</s>".to_vec());
+
+        let bpe = tokenizer_with(
+            TokenizerModel::Gpt2Bpe,
+            vec![Token {
+                id: 0,
+                text: bpe_byte_to_char(0xa9).to_string(),
+                score: 0.0,
+                kind: TokenKind::Normal,
+            }],
+            SpecialTokens::default(),
+        );
+        assert_eq!(bpe.constraint_token_bytes(0).unwrap(), vec![0xa9]);
+    }
+
+    #[test]
+    fn bert_wordpiece_normalizes_splits_and_wraps_special_tokens() {
+        let texts = [
+            "[PAD]", "[UNK]", "[CLS]", "[SEP]", "cafe", ",", "camel", "##ids",
+        ];
+        let tokens = texts
+            .iter()
+            .enumerate()
+            .map(|(id, text)| Token {
+                id: id as u32,
+                text: (*text).to_string(),
+                score: 0.0,
+                kind: if id < 4 {
+                    TokenKind::Control
+                } else {
+                    TokenKind::Normal
+                },
+            })
+            .collect();
+        let special = SpecialTokens {
+            bos: Some(2),
+            eos: Some(3),
+            sep: Some(3),
+            unk: Some(1),
+            pad: Some(0),
+            eog: BTreeSet::from([3]),
+            ..SpecialTokens::default()
+        };
+        let mut tokenizer = tokenizer_with(TokenizerModel::BertWordPiece, tokens, special);
+        tokenizer.config.add_bos = true;
+        tokenizer.config.add_sep = true;
+
+        let encoded = tokenizer.encode("Café, camelids", true, false).unwrap();
+        assert_eq!(encoded, vec![2, 4, 5, 6, 7, 3]);
+        assert_eq!(tokenizer.decode(&encoded, true).unwrap(), "cafe, camelids");
     }
 
     #[test]

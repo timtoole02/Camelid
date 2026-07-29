@@ -130,6 +130,9 @@ pub(crate) struct WorkspaceRunConfig {
     pub max_steps: usize,
     pub max_tokens: u32,
     pub temperature: f32,
+    /// Optional session-scoped semantic index. When present, each turn gets a
+    /// bounded set of relevant workspace excerpts before the model runs.
+    pub semantic_retriever: Option<Arc<super::semantic_search::WorkspaceSemanticRetriever>>,
 }
 
 impl WorkspaceBridgeClient {
@@ -423,6 +426,19 @@ pub(crate) fn run_live(
 
     let system = super::agent::workspace_system_prompt(&sandbox);
     let mut history = vec![AgentMsg::System(system)];
+    if let Some(retriever) = config.semantic_retriever.as_ref() {
+        worker.reporter.notice(&format!(
+            "retrieving semantically relevant workspace excerpts with {}",
+            retriever.model_id()
+        ));
+        match retriever.retrieve_context(&config.goal, 5) {
+            Ok(Some(context)) => history.push(AgentMsg::Memory(context)),
+            Ok(None) => {}
+            Err(error) => worker
+                .reporter
+                .notice(&format!("semantic retrieval was unavailable: {error}")),
+        }
+    }
     if let Some(memory) = render_relevant_memory(&config.memory.relevant) {
         history.push(AgentMsg::Memory(memory));
     }

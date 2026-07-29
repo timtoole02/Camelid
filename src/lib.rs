@@ -12,6 +12,7 @@ pub mod cuda_resident;
 pub mod cuda_vram;
 pub mod diffusion_gemma;
 pub mod distributed;
+pub mod embedding;
 pub mod error;
 pub mod execution_plan;
 pub mod fit;

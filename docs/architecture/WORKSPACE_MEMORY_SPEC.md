@@ -42,12 +42,16 @@ The implemented candidate is a **thread-scoped episodic context compiler**, not 
 - Final-artifact sustained receipt: `target/workspace-memory-final-artifact-sustained/summary.json`. One initial exact-model file read plus 10 follow-ups produced 11 persisted turns. Every follow-up recalled the code without tools, stayed within budget, and returned the session to `idle`. Follow-up elapsed p50 was 15.110 s and p95/max was 18.299 s; model-call p95 was 17.894 s and TTFT p95 was 17.593 s. Prompt size ranged from 576 to 846 tokens.
 - Historical final-artifact cancellation receipt: `target/workspace-memory-final-cancel-races/summary.json`. At the time of that run, DELETE after a real `model.delta` produced `aborted` in 21 ms and DELETE before event-stream claim produced `aborted` in 26 ms; neither path persisted a turn in that pre-schema-v5 implementation. Current schema-v5 behavior supersedes only that persistence detail: each terminal attempt is durable with outcome `aborted`, while partial assistant text remains discarded and unsuccessful attempts remain outside future model context. Focused tests cover the claim deadline, preflight/stream deadline, and cancellation during a model step.
 
+### Current implementation update (2026-07-28)
+
+The original proposal below predates Camelid's embedding lane. Workspace now has an optional semantic assist: if the exact supported `nomic-embed-text-v1.5.Q8_0.gguf` row is registered, a session lazily indexes a bounded set of UTF-8 source/document chunks in memory, embeds them with `search_document:` prefixes, and injects the top cosine-ranked excerpts as untrusted memory. It never writes an index into the workspace, skips symlinks/build/vendor/model data, and fails soft to the existing lexical/tool path. The historical design statements below remain useful proposal context but no longer establish the current absence of embeddings.
+
 ### Production promotion blockers
 
 - The 4,096-token application envelope is below the observed authoritative 29,946-position resident capacity, but is not yet dynamically selected from capacity plus a population-level latency profile.
 - Runtime responses do not yet expose per-request resident-prefill/decode versus CPU-fallback counters, so no-fallback must not be claimed.
 - There is no appendable GPU KV session; every agent step still re-prefills its compiled prompt.
-- Lexical retrieval has deterministic unit coverage but no measured production recall benchmark. There is no embeddings service.
+- Lexical retrieval has deterministic unit coverage and an optional exact-row semantic assist, but neither has a measured production recall benchmark.
 - Prompt/tool reduction and bounded memory keep the final 10-follow-up run correct, but measured elapsed p95 is still 18.299 seconds and TTFT p95 is 17.593 seconds. This is one host/run, not a production SLA, and is too slow to claim an interactive production experience. Repeated prefill dominates; prefix/KV reuse remains the likely next engine lever.
 
 Do not describe this candidate as production-ready until those gates have receipts.
@@ -94,7 +98,7 @@ On a constrained device (reference box: **RTX 4060 Laptop, 8 GB VRAM, ~16 GB RAM
 
 - **No cross‑request prefix/KV cache** in the serving path. **[VERIFIED]** (grep of `src/api`, `src/inference/kv_cache.rs` for prefix/prompt/kv reuse returned nothing.) → **every model call re‑processes the full prompt**, so per‑turn cost grows with conversation length.
 - **No KV‑cache quantization** (no 8/4‑bit KV). **[DOCUMENTED]** (memory note "No 8/4‑bit KV"; `CAMELID_KV_F16` is an opt‑in CPU f16 KV path only.)
-- **No semantic embeddings service.** **[VERIFIED]** (grep for `embedding`/`/v1/embeddings` only matched the model's intrinsic `embed_tokens` layer and unrelated files; there is no embedding endpoint.)
+- **Semantic embeddings service now exists.** **[UPDATED 2026-07-28]** The exact Nomic v1.5 Q8_0 row serves `/v1/embeddings` and an optional bounded Workspace semantic index; generic embedding models and a persistent vector database remain unsupported.
 - Reference model **Qwen3‑4B‑Q4_K_M**: native context **40,960** (KV) / single‑shot prefill ceiling **16,384**. **[DOCUMENTED]** (`COMPATIBILITY.md`). Fully GPU‑resident model peak ≈ **4.9 GB** VRAM. **[DOCUMENTED]**
 - Exact resident **token** capacity on this device is **[TO‑VERIFY]** (estimated low‑five‑figures but not measured — do not rely on a number until §16‑1 is done).
 
@@ -188,7 +192,7 @@ EVENT_CLAIM_TIMEOUT = 30 seconds
 - Becoming an IDE (no editor, diff view, run/debug).
 - **RoPE context extension (YaRN/NTK/linear scaling)** — rejected: it *increases* KV memory (wrong direction on 8 GB) and going past native context is not parity‑validated (Camelid is parity‑strict).
 - **KV‑cache quantization** and **prefix/KV reuse** — high value but **engine work**; deferred to a later phase (§15 Phase 4). v1 must not depend on them.
-- **Semantic embeddings / vector DB** — deferred; v1 uses lexical + agent‑driven retrieval.
+- **Semantic embeddings / vector DB** — historical v1 non-goal. The current exact-row in-memory semantic assist is implemented; a persistent vector database remains deferred.
 - Multi‑folder, multiple concurrent sessions, unattended/background execution.
 
 ---
@@ -336,7 +340,7 @@ A function invoked (a) before generation and (b) whenever the agent tries to *re
 ## 7. Retrieval design **[PROPOSED]**
 
 ### 7.1 Primary: agent‑driven retrieval + governor
-Because there are **no embeddings**, do not build a separate vector RAG pipeline for v1. Instead:
+The original v1 path assumed no embeddings. Its agent-driven retrieval remains the mandatory fallback and is now optionally preceded by the bounded in-memory semantic assist described at the top of this document:
 - Put the **folder map** (or a relevant slice of it) in front of the model as the retrieval menu.
 - The model uses the existing `search` / `read_file` / `list_dir` tools to pull what it needs (this already works in the current loop).
 - The **budget guard governs retention**: retrieved/tool content that would exceed `Q` is reduced (§7.3) or dropped.
@@ -460,7 +464,7 @@ Implication: even with a modest resident window, ~3,500 tokens of *relevant* ret
 - **Phase 1 — Multi‑turn + budget guard (no summarizer, no persistence).** Keep session alive; add `POST /messages`; `recent` buffer + budget guard + retrieve‑don't‑retain; frontend composer + budget meter. Ships the core "chat with your folder" with in‑session memory bounded to the window.
 - **Phase 2 — Rolling memo + cross‑session persistence.** Add `memo` (summary + pinned facts), lazy incremental summarization, persistence store (§9), resume.
 - **Phase 3 — Folder map + lexical pre‑rank.** Build the map on attach; lexical pre‑rank to cut retrieval steps; staleness refresh.
-- **Phase 4 — Engine ceiling‑raisers (separate, higher‑cost).** KV‑cache quantization (≈2× resident window) → prefix/KV reuse (cheap follow‑ups) → optional local embeddings for semantic retrieval. Each needs its own parity validation; none are required for Phases 1–3.
+- **Phase 4 — Engine ceiling-raisers (separate, higher-cost).** KV-cache quantization, prefix/KV reuse, and exact-row local embeddings are now implemented; semantic retrieval remains optional and separately evidence-gated. Broader retrieval quality, portability, and encoder support still require their own validation.
 
 ---
 

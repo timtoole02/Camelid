@@ -443,13 +443,6 @@ async fn native_compatibility_routes_fail_closed_with_typed_errors() {
             "unsupported_llama_server_infill",
             "input",
         ),
-        ("POST", "/embedding", "unsupported_embeddings", "input"),
-        ("POST", "/embeddings", "unsupported_embeddings", "input"),
-        ("POST", "/v1/embeddings", "unsupported_embeddings", "input"),
-        ("POST", "/rerank", "unsupported_reranking", "input"),
-        ("POST", "/reranking", "unsupported_reranking", "input"),
-        ("POST", "/v1/rerank", "unsupported_reranking", "input"),
-        ("POST", "/v1/reranking", "unsupported_reranking", "input"),
         ("POST", "/v1/responses", "unsupported_responses", "input"),
         ("POST", "/v1/messages", "unsupported_messages", "input"),
     ];
@@ -765,22 +758,28 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
                 .unwrap()
                 .contains("fail-closed non-loopback")
     }));
-    assert!(body["api_features"].as_array().unwrap().iter().any(|item| {
+    let api_features = body["api_features"].as_array().unwrap();
+    assert!(api_features.iter().any(|item| {
+        item["id"] == "openai_embeddings"
+            && item["status"] == "supported_exact_model_row"
+            && item["notes"].as_str().unwrap().contains("Nomic")
+    }));
+    assert!(api_features.iter().any(|item| {
+        item["id"] == "embedding_similarity_reranking"
+            && item["status"] == "supported_exact_model_row"
+            && item["notes"].as_str().unwrap().contains("bi-encoder")
+    }));
+    assert!(api_features.iter().any(|item| {
+        let notes = item["notes"].as_str().unwrap();
         item["id"] == "fail_closed_native_compatibility_routes"
             && item["status"] == "unsupported"
-            && item["notes"].as_str().unwrap().contains("/infill")
-            && item["notes"].as_str().unwrap().contains("/v1/embeddings")
-            && item["notes"].as_str().unwrap().contains("/v1/responses")
-            && item["notes"].as_str().unwrap().contains("/v1/messages")
-            && item["notes"]
-                .as_str()
-                .unwrap()
-                .contains("Unsupported /models/load router-mode fields")
-            && item["notes"]
-                .as_str()
-                .unwrap()
-                .contains("POST /models/unload")
-            && item["notes"].as_str().unwrap().contains("POST /slots")
+            && notes.contains("/infill")
+            && notes.contains("/v1/responses")
+            && notes.contains("/v1/messages")
+            && notes.contains("Unsupported /models/load router-mode fields")
+            && notes.contains("POST /models/unload")
+            && notes.contains("POST /slots")
+            && !notes.contains("/v1/embeddings")
     }));
     let compatibility = body["model_compatibility"].as_array().unwrap();
     let tinyllama = compatibility
@@ -1997,11 +1996,9 @@ async fn chat_completion_accepts_tools_but_rejects_other_tool_fields() {
 }
 
 #[tokio::test]
-async fn chat_completion_rejects_unsupported_response_format_before_runtime() {
-    // response_format json_object and a supported json_schema are honored (JSON /
-    // JSON-Schema constrained decoding). A json_schema whose schema falls outside
-    // the enforceable subset (here a top-level `string`, which must be an object or
-    // array) is still rejected before runtime with a typed error naming the param.
+async fn chat_completion_rejects_invalid_json_schema_before_runtime() {
+    // LLGuidance supports scalar roots and a broad JSON Schema surface. A schema
+    // it cannot compile still fails before runtime with a typed, named error.
     let app = camelid::api::router();
     let response = app
         .oneshot(
@@ -2010,7 +2007,7 @@ async fn chat_completion_rejects_unsupported_response_format_before_runtime() {
                 .uri("/v1/chat/completions")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"model":"tiny","messages":[{"role":"user","content":"hello"}],"max_tokens":1,"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"string"}}}}"#,
+                    r#"{"model":"tiny","messages":[{"role":"user","content":"hello"}],"max_tokens":1,"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"camel"}}}}"#,
                 ))
                 .unwrap(),
         )
@@ -2021,6 +2018,153 @@ async fn chat_completion_rejects_unsupported_response_format_before_runtime() {
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert_eq!(body["error"]["param"], "response_format");
+}
+
+#[tokio::test]
+async fn embedding_routes_validate_payload_and_require_a_loaded_encoder() {
+    for uri in ["/embedding", "/embeddings", "/v1/embeddings"] {
+        let response = camelid::api::router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"input":"hello"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "model_not_loaded", "{uri}");
+        assert_eq!(body["error"]["param"], "model", "{uri}");
+    }
+
+    let response = camelid::api::router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/embeddings")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"input":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "empty_embedding_input");
+
+    let response = camelid::api::router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/embeddings")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"input":"hello","encoding_format":"base64"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "unsupported_embedding_encoding");
+}
+
+#[tokio::test]
+async fn reranking_routes_validate_payload_and_require_a_loaded_encoder() {
+    for uri in ["/rerank", "/reranking", "/v1/rerank", "/v1/reranking"] {
+        let response = camelid::api::router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"query":"camel","documents":["camelid","database"]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "model_not_loaded", "{uri}");
+    }
+
+    let response = camelid::api::router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/rerank")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":"camel","documents":["one"],"top_n":2}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "invalid_rerank_top_n");
+}
+
+#[tokio::test]
+async fn chat_completion_rejects_invalid_llguidance_grammar_before_runtime() {
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"tiny","messages":[{"role":"user","content":"hello"}],"max_tokens":1,"grammar":"start: ("}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert_eq!(body["error"]["param"], "grammar");
+}
+
+#[tokio::test]
+async fn chat_completion_rejects_ambiguous_constraint_fields() {
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"tiny","messages":[{"role":"user","content":"hello"}],"max_tokens":1,"response_format":{"type":"json_object"},"grammar":"start: \"ok\""}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "invalid_request_error");
     assert_eq!(body["error"]["param"], "response_format");
 }
 

@@ -109,6 +109,15 @@ export async function completeCatalogAcquisition({
         message: loaded?.message || 'Downloaded and checked, but Camelid could not load the model.',
       }
     }
+    if (loaded.embedding) {
+      return {
+        ok: true,
+        started: false,
+        embedding: true,
+        stage: 'ready',
+        message: 'Embedding model ready — the current Chat model was left active.',
+      }
+    }
   } catch (error) {
     return {
       ok: false,

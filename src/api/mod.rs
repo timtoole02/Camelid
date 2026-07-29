@@ -36,6 +36,7 @@ mod workspace;
 pub use server::ServeOptions;
 
 use crate::{
+    embedding::{cosine_similarity, EncoderConfig, NomicBertRuntime},
     execution_plan::{plan_for_model, ExecutionPlan, PlannerEnv},
     gguf::{read_metadata, GgufFile, GgufTensorDescriptor, GgufTensorType},
     inference::{
@@ -119,6 +120,12 @@ pub struct AppState {
     /// parallel to the optimized engine (which keeps failing closed for this
     /// arch by design) — see the bridge near `dg_chat_nonstreaming`.
     dg_runtimes: Arc<RwLock<HashMap<String, Arc<DgServeRuntime>>>>,
+    /// Bidirectional encoder runtimes, loaded lazily on the first embeddings or
+    /// reranking request and released with the owning model.
+    embedding_runtimes: Arc<RwLock<HashMap<String, Arc<NomicBertRuntime>>>>,
+    /// Prevent concurrent first-use requests from loading the same encoder
+    /// weights more than once and temporarily doubling resident memory.
+    embedding_runtime_load: Arc<tokio::sync::Mutex<()>>,
     execution_plans: Arc<RwLock<HashMap<String, ExecutionPlan>>>,
     cached_weights: Arc<RwLock<HashMap<String, Arc<LlamaLoadedWeights>>>>,
     active_model_id: Arc<RwLock<Option<String>>>,
@@ -180,6 +187,8 @@ impl Default for AppState {
             gemma4_runtimes: Arc::new(RwLock::new(HashMap::new())),
             runnable_runtimes: Arc::new(RwLock::new(HashMap::new())),
             dg_runtimes: Arc::new(RwLock::new(HashMap::new())),
+            embedding_runtimes: Arc::new(RwLock::new(HashMap::new())),
+            embedding_runtime_load: Arc::new(tokio::sync::Mutex::new(())),
             execution_plans: Arc::new(RwLock::new(HashMap::new())),
             cached_weights: Arc::new(RwLock::new(HashMap::new())),
             active_model_id: Arc::new(RwLock::new(None)),
@@ -452,6 +461,11 @@ pub struct LoadModelRequest {
     /// second resident copy that the fit guard then refuses.
     #[serde(default)]
     pub replace: bool,
+    /// Keep the current generation model active while registering this model.
+    /// Useful for sidecar encoders that Workspace and `/v1/embeddings` address
+    /// explicitly. Omitted preserves the historical activate-on-load behavior.
+    #[serde(default)]
+    pub set_active: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -657,14 +671,17 @@ pub struct ChatCompletionRequest {
     /// OpenAI `parallel_tool_calls`: accepted and ignored (Camelid surfaces the
     /// tool calls the model actually emits). Declared here so it is not rejected.
     pub parallel_tool_calls: Option<bool>,
-    /// OpenAI `response_format`. `{"type":"json_object"}` turns on JSON-grammar-
-    /// constrained decoding (output guaranteed valid JSON). `{"type":"json_schema",
-    /// "json_schema":{"schema":{...}}}` constrains the output to a supported JSON
-    /// Schema subset -- see `docs/architecture/STRUCTURED_OUTPUTS.md` for the exact
-    /// contract; schemas outside the subset are a typed 400 naming the keyword.
-    /// `{"type":"text"}`/absent is normal decoding; other types are rejected.
-    /// Non-streaming only. Declared here so it is not in `unsupported_fields`.
+    /// OpenAI `response_format`. JSON object and JSON Schema constraints are
+    /// compiled by LLGuidance and enforced token-by-token. Camelid additionally
+    /// accepts `{"type":"grammar","grammar":"..."}` for a Lark/LLGuidance CFG.
+    /// Unsupported schemas/grammars fail closed with a typed 400.
     pub response_format: Option<serde_json::Value>,
+    /// llama.cpp-compatible top-level JSON Schema extension. Mutually exclusive
+    /// with `response_format` and `grammar`.
+    pub json_schema: Option<serde_json::Value>,
+    /// llama.cpp-compatible LLGuidance/Lark grammar extension. Mutually exclusive
+    /// with `response_format` and `json_schema`.
+    pub grammar: Option<String>,
     /// OpenAI `stream_options`. The only honored subfield is `include_usage`
     /// (bool); any other shape or subfield is tolerated silently and ignored,
     /// matching the permissive llama-server oracle. Parsed as a raw value so a
@@ -2026,10 +2043,10 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
         .route("/metrics", get(metrics::prometheus))
         .route("/completion", post(llama_server_completion))
         .route("/infill", post(unsupported_llama_server_infill))
-        .route("/embedding", post(unsupported_embeddings))
-        .route("/embeddings", post(unsupported_embeddings))
-        .route("/rerank", post(unsupported_reranking))
-        .route("/reranking", post(unsupported_reranking))
+        .route("/embedding", post(embeddings))
+        .route("/embeddings", post(embeddings))
+        .route("/rerank", post(rerank))
+        .route("/reranking", post(rerank))
         .route(
             "/api/generation/sessions",
             get(generation_sessions).post(create_generation_session),
@@ -2090,11 +2107,11 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
         .route("/v1/models/:model", get(v1_model))
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
-        .route("/v1/embeddings", post(unsupported_embeddings))
+        .route("/v1/embeddings", post(embeddings))
         .route("/v1/responses", post(unsupported_responses))
         .route("/v1/messages", post(unsupported_messages))
-        .route("/v1/rerank", post(unsupported_reranking))
-        .route("/v1/reranking", post(unsupported_reranking))
+        .route("/v1/rerank", post(rerank))
+        .route("/v1/reranking", post(rerank))
         // Anything not matched above is served from the embedded web UI (the
         // chat surface and its static assets), with a client-side-route
         // fallback to the app shell. API routes are matched first.
@@ -2129,7 +2146,7 @@ pub async fn serve(
         .with_serve_addr(addr)
         .with_server_policy(&policy);
     if let Some(model_path) = initial_model {
-        if let Err(err) = load_model_from_path(&state, model_path, None).await {
+        if let Err(err) = load_model_from_path(&state, model_path, None, true).await {
             tracing::error!(error=%err, "failed to load startup model");
             eprintln!("\n  Could not load that model: {err}");
             eprintln!("  Camelid serves specific validated Q8_0 rows. To get one:");
@@ -2520,7 +2537,7 @@ async fn llama_server_models_load(
         );
     };
 
-    match load_model_from_path(&state, path, req.id).await {
+    match load_model_from_path(&state, path, req.id, true).await {
         Ok(loaded) => {
             let item = LlamaServerModelListItem {
                 id: loaded.id.clone(),
@@ -3003,20 +3020,458 @@ async fn unsupported_llama_server_infill() -> Response {
     )
 }
 
-async fn unsupported_embeddings() -> Response {
-    unsupported_route(
-        "unsupported_embeddings",
-        "embeddings are not supported yet; Camelid has no embeddings runtime or compatibility contract for this route",
-        Some("input"),
-    )
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum EmbeddingInput {
+    Text(String),
+    Batch(Vec<String>),
 }
 
-async fn unsupported_reranking() -> Response {
-    unsupported_route(
-        "unsupported_reranking",
-        "reranking is not supported yet; Camelid has no reranking runtime or compatibility contract for this route",
-        Some("input"),
+impl EmbeddingInput {
+    fn into_batch(self) -> Vec<String> {
+        match self {
+            Self::Text(text) => vec![text],
+            Self::Batch(batch) => batch,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct EmbeddingRequest {
+    #[serde(default)]
+    model: Option<String>,
+    input: EmbeddingInput,
+    #[serde(default)]
+    encoding_format: Option<String>,
+    #[serde(default)]
+    dimensions: Option<usize>,
+    #[serde(default)]
+    user: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct EmbeddingData {
+    object: &'static str,
+    embedding: Vec<f32>,
+    index: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct EmbeddingUsage {
+    prompt_tokens: usize,
+    total_tokens: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct EmbeddingResponse {
+    object: &'static str,
+    data: Vec<EmbeddingData>,
+    model: String,
+    usage: EmbeddingUsage,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RerankDocument {
+    Text(String),
+    Object { text: String },
+}
+
+impl RerankDocument {
+    fn text(&self) -> &str {
+        match self {
+            Self::Text(text) | Self::Object { text } => text,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RerankRequest {
+    #[serde(default)]
+    model: Option<String>,
+    query: String,
+    documents: Vec<RerankDocument>,
+    #[serde(default)]
+    top_n: Option<usize>,
+    #[serde(default)]
+    return_documents: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct RerankResultDocument<'a> {
+    text: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct RerankResult<'a> {
+    index: usize,
+    relevance_score: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    document: Option<RerankResultDocument<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+struct RerankResponse<'a> {
+    id: String,
+    model: String,
+    results: Vec<RerankResult<'a>>,
+    usage: EmbeddingUsage,
+}
+
+async fn resolve_embedding_runtime(
+    state: &AppState,
+    requested_model: Option<&str>,
+) -> std::result::Result<(String, Arc<NomicBertRuntime>), Response> {
+    let model_id = match requested_model
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(model_id) => model_id.to_string(),
+        None => {
+            let active = state.active_model_id.read().await.clone();
+            let loaded = state.loaded_models.read().await;
+            let active_embedding = active.filter(|id| {
+                loaded
+                    .get(id)
+                    .is_some_and(|model| model.gguf.architecture() == Some("nomic-bert"))
+            });
+            active_embedding
+                .or_else(|| {
+                    let mut candidates = loaded
+                        .values()
+                        .filter(|model| model.gguf.architecture() == Some("nomic-bert"))
+                        .map(|model| model.id.clone())
+                        .collect::<Vec<_>>();
+                    candidates.sort();
+                    candidates.into_iter().next()
+                })
+                .ok_or_else(|| {
+                    api_error(
+                        StatusCode::NOT_FOUND,
+                        "model_not_loaded",
+                        "load a supported embedding model before requesting embeddings".to_string(),
+                        Some("model"),
+                    )
+                })?
+        }
+    };
+    if let Some(runtime) = state
+        .embedding_runtimes
+        .read()
+        .await
+        .get(&model_id)
+        .cloned()
+    {
+        return Ok((model_id, runtime));
+    }
+    let _load = state.embedding_runtime_load.lock().await;
+    if let Some(runtime) = state
+        .embedding_runtimes
+        .read()
+        .await
+        .get(&model_id)
+        .cloned()
+    {
+        return Ok((model_id, runtime));
+    }
+
+    let model = state
+        .loaded_models
+        .read()
+        .await
+        .get(&model_id)
+        .cloned()
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                "model_not_found",
+                format!("model {model_id:?} is not loaded"),
+                Some("model"),
+            )
+        })?;
+    if model.gguf.architecture() != Some("nomic-bert") {
+        return Err(api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "model_not_embedding_capable",
+            format!(
+                "model {model_id:?} uses architecture {:?}; the current embedding runtime requires \"nomic-bert\"",
+                model.gguf.architecture().unwrap_or("unknown")
+            ),
+            Some("model"),
+        ));
+    }
+
+    let path = model.path.clone();
+    let _reader = state.model_file_lifecycle.read().await;
+    let loaded = tokio::task::spawn_blocking(move || NomicBertRuntime::load(path)).await;
+    let runtime = match loaded {
+        Ok(Ok(runtime)) => Arc::new(runtime),
+        Ok(Err(error)) => {
+            return Err(api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                backend_error_code(&error),
+                error.to_string(),
+                Some("model"),
+            ))
+        }
+        Err(error) => {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "embedding_runtime_task_failed",
+                format!("embedding runtime load task failed: {error}"),
+                Some("model"),
+            ))
+        }
+    };
+    let runtime = {
+        let mut runtimes = state.embedding_runtimes.write().await;
+        runtimes
+            .entry(model_id.clone())
+            .or_insert_with(|| runtime.clone())
+            .clone()
+    };
+    Ok((model_id, runtime))
+}
+
+async fn embeddings(
+    State(state): State<AppState>,
+    payload: std::result::Result<Json<EmbeddingRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(request) => request,
+        Err(error) => return malformed_json_error(error),
+    };
+    if let Some(format) = request.encoding_format.as_deref() {
+        if format != "float" {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "unsupported_embedding_encoding",
+                "encoding_format must be \"float\"; base64 output is not implemented".to_string(),
+                Some("encoding_format"),
+            );
+        }
+    }
+    let _ = request.user;
+    let inputs = request.input.into_batch();
+    if inputs.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "empty_embedding_input",
+            "input must contain at least one string".to_string(),
+            Some("input"),
+        );
+    }
+    let (model_id, runtime) =
+        match resolve_embedding_runtime(&state, request.model.as_deref()).await {
+            Ok(resolved) => resolved,
+            Err(response) => return response,
+        };
+    let dimensions = request.dimensions;
+    let result = tokio::task::spawn_blocking(move || {
+        let embeddings = runtime.embed_batch(&inputs, dimensions)?;
+        let prompt_tokens = inputs
+            .iter()
+            .map(|input| {
+                runtime
+                    .tokenizer()
+                    .encode(input, true, false)
+                    .map(|ids| ids.len())
+            })
+            .collect::<crate::Result<Vec<_>>>()?
+            .into_iter()
+            .sum();
+        Ok::<_, BackendError>((embeddings, prompt_tokens))
+    })
+    .await;
+    let (embeddings, prompt_tokens) = match result {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            return api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                backend_error_code(&error),
+                error.to_string(),
+                Some("input"),
+            )
+        }
+        Err(error) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "embedding_task_failed",
+                format!("embedding task failed: {error}"),
+                None,
+            )
+        }
+    };
+    (
+        StatusCode::OK,
+        Json(EmbeddingResponse {
+            object: "list",
+            data: embeddings
+                .into_iter()
+                .enumerate()
+                .map(|(index, embedding)| EmbeddingData {
+                    object: "embedding",
+                    embedding,
+                    index,
+                })
+                .collect(),
+            model: model_id,
+            usage: EmbeddingUsage {
+                prompt_tokens,
+                total_tokens: prompt_tokens,
+            },
+        }),
     )
+        .into_response()
+}
+
+fn with_embedding_prefix(text: &str, prefix: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.starts_with("search_query:")
+        || trimmed.starts_with("search_document:")
+        || trimmed.starts_with("clustering:")
+        || trimmed.starts_with("classification:")
+    {
+        trimmed.to_string()
+    } else {
+        format!("{prefix}{trimmed}")
+    }
+}
+
+async fn rerank(
+    State(state): State<AppState>,
+    payload: std::result::Result<Json<RerankRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(request) => request,
+        Err(error) => return malformed_json_error(error),
+    };
+    if request.query.trim().is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "empty_rerank_query",
+            "query must not be empty".to_string(),
+            Some("query"),
+        );
+    }
+    if request.documents.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "empty_rerank_documents",
+            "documents must contain at least one item".to_string(),
+            Some("documents"),
+        );
+    }
+    let top_n = request.top_n.unwrap_or(request.documents.len());
+    if top_n == 0 || top_n > request.documents.len() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_rerank_top_n",
+            format!(
+                "top_n must be between 1 and the document count ({}), got {top_n}",
+                request.documents.len()
+            ),
+            Some("top_n"),
+        );
+    }
+    let (model_id, runtime) =
+        match resolve_embedding_runtime(&state, request.model.as_deref()).await {
+            Ok(resolved) => resolved,
+            Err(response) => return response,
+        };
+
+    let mut inputs = Vec::with_capacity(request.documents.len() + 1);
+    inputs.push(with_embedding_prefix(&request.query, "search_query: "));
+    inputs.extend(
+        request
+            .documents
+            .iter()
+            .map(|document| with_embedding_prefix(document.text(), "search_document: ")),
+    );
+    let result = tokio::task::spawn_blocking(move || {
+        let embeddings = runtime.embed_batch(&inputs, None)?;
+        let prompt_tokens = inputs
+            .iter()
+            .map(|input| {
+                runtime
+                    .tokenizer()
+                    .encode(input, true, false)
+                    .map(|ids| ids.len())
+            })
+            .collect::<crate::Result<Vec<_>>>()?
+            .into_iter()
+            .sum();
+        Ok::<_, BackendError>((embeddings, prompt_tokens))
+    })
+    .await;
+    let (embeddings, prompt_tokens) = match result {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            return api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                backend_error_code(&error),
+                error.to_string(),
+                Some("documents"),
+            )
+        }
+        Err(error) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "rerank_task_failed",
+                format!("rerank task failed: {error}"),
+                None,
+            )
+        }
+    };
+    let query = &embeddings[0];
+    let mut ranked = embeddings[1..]
+        .iter()
+        .enumerate()
+        .map(|(index, document)| cosine_similarity(query, document).map(|score| (index, score)))
+        .collect::<crate::Result<Vec<_>>>();
+    let ranked = match ranked.as_mut() {
+        Ok(ranked) => {
+            ranked.sort_by(|left, right| {
+                right
+                    .1
+                    .total_cmp(&left.1)
+                    .then_with(|| left.0.cmp(&right.0))
+            });
+            ranked
+        }
+        Err(error) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                backend_error_code(error),
+                error.to_string(),
+                None,
+            )
+        }
+    };
+    let results = ranked
+        .iter()
+        .take(top_n)
+        .map(|(index, relevance_score)| RerankResult {
+            index: *index,
+            relevance_score: *relevance_score,
+            document: request.return_documents.then(|| RerankResultDocument {
+                text: request.documents[*index].text(),
+            }),
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(RerankResponse {
+            id: format!("rerank-{}", uuid::Uuid::new_v4()),
+            model: model_id,
+            results,
+            usage: EmbeddingUsage {
+                prompt_tokens,
+                total_tokens: prompt_tokens,
+            },
+        }),
+    )
+        .into_response()
 }
 
 async fn unsupported_responses() -> Response {
@@ -3195,6 +3650,11 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
         ],
         supported_model_families: vec![
             SupportItem {
+                id: "nomic_bert_encoder_exact_v1_5_q8_0",
+                status: "supported_exact_row_embedding_lane",
+                notes: "exact nomic-embed-text-v1.5.Q8_0.gguf only: BERT WordPiece tokenization, bidirectional split-half-RoPE attention, gated-SiLU FFN execution, mean/CLS/last pooling primitives, L2 normalization, Matryoshka truncation, OpenAI embeddings, cosine reranking, and optional Workspace semantic retrieval. Generic BERT, other Nomic files/quants, classifier-head rank pooling, GPU execution, and family-wide support are not implied.",
+            },
+            SupportItem {
                 id: "llama_spm_decoder",
                 status: "supported_current_gate",
                 notes: "LLaMA-style decoder path validated on TinyLlama Q8_0 gate",
@@ -3248,6 +3708,48 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
         ],
         model_compatibility: vec![
+            ModelCompatibilityTarget {
+                id: "nomic_embed_text_v1_5_q8_0",
+                family: "nomic-bert",
+                quantization: "Q8_0",
+                status: "supported_exact_row_embedding",
+                tool_capable: false,
+                support_scope: "exact_row_embeddings_rerank_and_workspace_semantic_retrieval_only",
+                full_support_status: "blocked_pending_broader_encoder_evidence",
+                full_support_blockers: "generic BERT/Nomic variants, other quants, classifier-head rank models, GPU execution, long-context retrieval quality, portability, and a production retrieval benchmark remain unproven",
+                metadata_parses: "validated_exact_nomic_bert_encoder_metadata",
+                tokenizer_works: "validated_bert_wordpiece_three_prompt_token_id_oracle",
+                tensors_load: "validated_61_q8_0_matrices_plus_51_f32_vectors_exact_shapes",
+                generation_runs: "not_applicable_encoder_embeddings_execute",
+                parity_audited: "three_768d_vectors_cosine_above_0_9997_and_max_abs_delta_below_0_003_vs_llama_cpp_b10173",
+                performance_measured: "windows_release_cpu_4_vector_batch_median_265ms_at_8_workers_14_7pct_throughput_uplift_vs_4_workers_peak_rss_flat",
+                frontend_load_path_verified: "real_api_sidecar_load_v1_embeddings_and_v1_rerank_validated_frontend_readiness_probe_wired",
+                frontend_readiness_gate: "green only for the exact catalog artifact nomic-embed-text-v1.5.Q8_0.gguf; embedding readiness is independent of generation_ready",
+                tested_context: "three_short_semantic_oracle_prompts_plus_256d_matryoshka_probe",
+                chat_template_renderer: "not_applicable_encoder_uses_nomic_search_prefixes",
+                chat_template_shape_pack: "not_applicable",
+                chat_template_shape_pack_id: "not_applicable",
+                bounded_context_512_pack: "not_applicable",
+                bounded_context_512_pack_id: "not_applicable",
+                bounded_context_window: 0,
+                bounded_context_1024_pack: "not_applicable",
+                bounded_context_1024_pack_id: "not_applicable",
+                bounded_context_1024_window: 0,
+                bounded_context_2048_pack: "not_applicable",
+                bounded_context_2048_pack_id: "not_applicable",
+                bounded_context_2048_window: 0,
+                bounded_context_4096_pack: "not_applicable",
+                bounded_context_4096_pack_id: "not_applicable",
+                bounded_context_4096_window: 0,
+                bounded_context_8192_pack: "not_applicable",
+                bounded_context_8192_pack_id: "not_applicable",
+                bounded_context_8192_window: 0,
+                latest_checked_bucket: "embedding_semantic_oracle",
+                latest_checked_result: "pass",
+                latest_checked_output: "deterministic_unit_norm_768d_and_256d_embeddings_with_relevant_document_ranked_first",
+                evidence: "exact row nomic-embed-text-v1.5.Q8_0.gguf (146,146,432 bytes; sha256 3e24342164b3d94991ba9692fdc0dd08e3fd7362e0aacc396a9a5c54a544c3b7; Hugging Face revision 18d1044f4866e224159fce8c6fc5c4f3920176e7): 112 tensors (61 Q8_0 matrices retained quantized + 51 F32 vectors), 12 layers, width 768, mean pooling. Exact WordPiece token IDs match llama.cpp b10173 for three fixed query/document prompts. Camelid relevant/irrelevant cosine scores are 0.860397/0.473693 versus llama.cpp 0.859971/0.472697; all three 768d vectors pass cosine >0.9997 and max absolute delta <0.003, are finite/unit-normalized, and repeated input is bit-deterministic. A 256d Matryoshka embedding is re-normalized. Real HTTP sidecar load (`set_active=false`), `/v1/embeddings`, and `/v1/rerank` pass on the exact artifact. On this Windows host, controlled release medians for four short vectors are 304ms at 4 workers and 265ms at 8 workers (13.16 -> 15.09 embeddings/s, +14.7% throughput); observed peak working set stays effectively flat at 162.4 vs 162.8 MiB, while tokenizer/metadata-only baseline is 9.2 MiB. Host-specific measurements, not a portable SLA. This supports only embeddings, embedding-similarity reranking, and bounded in-memory Workspace semantic retrieval for this exact artifact; it is not a generative or cross-encoder-reranker claim.",
+                next_step: "add GPU encoder kernels, separately evidence a classifier-head cross-encoder reranker, and run retrieval recall/long-context/portable-host packs before broadening support",
+            },
             // Ornith-1.0-9B CUDA-resident quant rows (constrained-VRAM lane).
             // ORDER CONTRACT: these quant-suffixed rows MUST stay ahead of the
             // bare-name "Ornith 1.0 9B" Q8_0 row below. The frontend exact-row
@@ -4819,9 +5321,24 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 notes: "non-streaming and SSE streaming for loaded supported dense GGUF models",
             },
             SupportItem {
+                id: "llguidance_structured_outputs",
+                status: "supported_current_gate_nonstreaming",
+                notes: "non-streaming /v1/chat/completions constrained decoding through LLGuidance 1.7.6 for JSON object, supported JSON Schema, and LLGuidance/Lark CFG requests. Request forms are mutually exclusive, unsupported schemas/grammars fail closed before generation, and token masks use the loaded tokenizer's exact byte vocabulary. Streaming and non-chat generation lanes remain typed unsupported.",
+            },
+            SupportItem {
+                id: "openai_embeddings",
+                status: "supported_exact_model_row",
+                notes: "POST /v1/embeddings plus /embedding and /embeddings aliases accept one string or a bounded string batch, return finite unit-normalized float vectors and exact tokenizer usage, and support Nomic Matryoshka dimensions. The current gate is the exact Nomic Embed Text v1.5 Q8_0 catalog row; base64 encoding, token-id input, arbitrary encoder families/quants, and GPU execution are unsupported.",
+            },
+            SupportItem {
+                id: "embedding_similarity_reranking",
+                status: "supported_exact_model_row",
+                notes: "POST /rerank, /reranking, /v1/rerank, and /v1/reranking rank bounded string/object documents by cosine similarity using Nomic search_query/search_document prefixes, stable score ordering, optional top_n, and optional returned documents. This is bi-encoder embedding-similarity reranking, not a classifier-head cross-encoder claim.",
+            },
+            SupportItem {
                 id: "web_workspace",
                 status: "supported_current_gate",
-                notes: "loopback WebUI only: durable conversations over exactly read_file/list_dir/literal-content search inside one canonical workspace root; allow_writes=true is rejected. Evidence-first extension inventories are derived from successful list_dir observations. Exact prompt-plus-generation budgeting, SQLite/FTS5 retrieval, reversible automatic compaction, turn-scoped cancellation, a 90-second model-step deadline, and model-transition exclusion fail closed. Available only to supported exact rows with tool_capable=true. The historical Qwen3-4B-Q4_K_M bundle validates the underlying tool-call and sandbox path, but its write scenarios no longer describe the current read-only surface. No write, shell, network, GUI, subagent, unattended, neighboring-model, portability, or throughput claim.",
+                notes: "loopback WebUI only: durable conversations over exactly read_file/list_dir/literal-content search inside one canonical workspace root; allow_writes=true is rejected. When the exact supported Nomic embedding row is also loaded, each session lazily builds a bounded read-only in-memory source index and injects semantically relevant, explicitly untrusted excerpts before model execution; absence/failure degrades to the existing lexical path. Evidence-first extension inventories are derived from successful list_dir observations. Exact prompt-plus-generation budgeting, SQLite/FTS5 retrieval, reversible automatic compaction, turn-scoped cancellation, a 90-second model-step deadline, and model-transition exclusion fail closed. Generation remains available only to supported exact rows with tool_capable=true. No write, shell, network, GUI, subagent, unattended, neighboring-model, persistent vector database, broad retrieval-quality, portability, or throughput claim.",
             },
             SupportItem {
                 id: "stream_options.include_usage",
@@ -4846,7 +5363,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "llama_server_props",
                 status: "partial",
-                notes: "GET /props returns read-only public server properties, default generation settings, explicit fail-closed chat_template_caps, chat-template metadata when a model is loaded, and Camelid readiness notes. Local model paths are intentionally redacted, router-mode model/autoload query params and POST /props are unsupported, and this does not imply slot lifecycle, native /completion streaming, embeddings, or full llama-server WebUI parity.",
+                notes: "GET /props returns read-only public server properties, default generation settings, explicit fail-closed chat_template_caps, chat-template metadata when a model is loaded, and Camelid readiness notes. Local model paths are intentionally redacted, router-mode model/autoload query params and POST /props are unsupported, and this does not imply slot lifecycle, native /completion streaming, generic embedding-model compatibility, or full llama-server WebUI parity.",
             },
             SupportItem {
                 id: "llama_server_slots",
@@ -4871,7 +5388,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "fail_closed_native_compatibility_routes",
                 status: "unsupported",
-                notes: "Native /infill, /embedding, /embeddings, /v1/embeddings, /v1/messages, /rerank, /reranking, /v1/rerank, /v1/reranking, /v1/responses, POST /models/unload, POST /slots, and slot cache actions return typed not_implemented errors until real route semantics and backend support exist. Unsupported /models/load router-mode fields and /completion modes remain typed parameter errors.",
+                notes: "Native /infill, /v1/messages, /v1/responses, POST /models/unload, POST /slots, and slot cache actions return typed not_implemented errors until real route semantics and backend support exist. Unsupported /models/load router-mode fields and /completion modes remain typed parameter errors. Embedding and reranking routes are separately supported only for the exact evidence-gated Nomic row.",
             },
             SupportItem {
                 id: "multi_choice_generation",
@@ -5126,7 +5643,7 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
             return resp;
         }
     }
-    match load_model_from_path(&state, path, req.id).await {
+    match load_model_from_path(&state, path, req.id, req.set_active.unwrap_or(true)).await {
         Ok(loaded) => (StatusCode::OK, Json(loaded)).into_response(),
         // Fail closed with the exact typed reason and a stable, switchable code.
         // The message already carries the offending architecture/quant and any
@@ -5151,8 +5668,9 @@ async fn load_model_from_path(
     state: &AppState,
     path: PathBuf,
     id: Option<String>,
+    set_active: bool,
 ) -> Result<LoadedModel, BackendError> {
-    load_model_from_path_with_activation(state, path, id, true).await
+    load_model_from_path_with_activation(state, path, id, set_active).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -5266,7 +5784,12 @@ async fn inspect_model(
 
     // Parse the config header (no tensor bind, no weight load). Ok â‡’ it would load;
     // Err â‡’ it would fail closed with this exact typed reason.
-    let (lane_class, blocker) = match LlamaModelConfig::from_gguf(&gguf) {
+    let config_result = if architecture.as_deref() == Some("nomic-bert") {
+        EncoderConfig::from_gguf(&gguf).map(|_| ())
+    } else {
+        LlamaModelConfig::from_gguf(&gguf).map(|_| ())
+    };
+    let (lane_class, blocker) = match config_result {
         Ok(_) => (
             classify_model_lane(architecture.as_deref(), &filename),
             None,
@@ -5317,6 +5840,7 @@ fn gemma4_cuda_enabled() -> bool {
 fn model_family(gguf: &GgufFile) -> &'static str {
     match gguf.architecture() {
         Some("gemma4") => "gemma4",
+        Some("nomic-bert") => "embedding",
         Some("llama" | "mistral" | "qwen2" | "qwen3" | "smollm3" | "gemma3" | "phi3" | "lfm2") => {
             "llama-family"
         }
@@ -7906,6 +8430,7 @@ async fn release_model(state: &AppState, target: Option<String>) -> Result<(), B
         state.gemma4_runtimes.write().await.remove(&id);
         state.runnable_runtimes.write().await.remove(&id);
         state.dg_runtimes.write().await.remove(&id);
+        state.embedding_runtimes.write().await.remove(&id);
         state.execution_plans.write().await.remove(&id);
         state.cached_weights.write().await.remove(&id);
         state.model_last_used.write().await.remove(&id);
@@ -7919,6 +8444,7 @@ async fn release_model(state: &AppState, target: Option<String>) -> Result<(), B
         state.gemma4_runtimes.write().await.clear();
         state.runnable_runtimes.write().await.clear();
         state.dg_runtimes.write().await.clear();
+        state.embedding_runtimes.write().await.clear();
         state.execution_plans.write().await.clear();
         state.cached_weights.write().await.clear();
         state.model_last_used.write().await.clear();
@@ -8203,7 +8729,7 @@ async fn get_or_load_model(
     if let Some(path) = path {
         if path.exists() {
             drop(loaded_models);
-            match load_model_from_path(state, path, Some(target_id.clone())).await {
+            match load_model_from_path(state, path, Some(target_id.clone()), true).await {
                 Ok(loaded) => return Ok(loaded),
                 Err(err) => {
                     return Err(api_error(
@@ -9327,13 +9853,13 @@ async fn chat_completions(
             return response;
         }
     }
-    // response_format -> constrained decoding (json_object / json_schema,
-    // non-streaming). Parsed BEFORE lane dispatch -- it is pure request-shape
-    // validation with no model access -- so a malformed schema 400s uniformly on
-    // every lane, and the env-gated serve lanes below (which do not enforce
-    // constraints) can reject a constrained request instead of silently
-    // returning unconstrained output with a 200.
-    let constraint = match constraint_from_response_format(req.response_format.as_ref()) {
+    // Structured-output constraints are parsed BEFORE lane dispatch so malformed
+    // schemas/CFGs fail uniformly and no lane can silently drop one.
+    let constraint = match constraint_from_request(
+        req.response_format.as_ref(),
+        req.json_schema.as_ref(),
+        req.grammar.as_deref(),
+    ) {
         Ok(constraint) => constraint,
         Err(response) => return *response,
     };
@@ -9341,7 +9867,7 @@ async fn chat_completions(
         api_error(
             StatusCode::BAD_REQUEST,
             "unsupported_parameter",
-            "response_format constrained decoding is not supported on this model's serve lane yet"
+            "structured-output constrained decoding is not supported on this model's serve lane yet"
                 .to_string(),
             Some("response_format"),
         )
@@ -9464,7 +9990,7 @@ async fn chat_completions(
         return api_error(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
-            "response_format constrained decoding is not supported with stream:true; request it without streaming".to_string(),
+            "structured-output constrained decoding is not supported with stream:true; request it without streaming".to_string(),
             Some("response_format"),
         );
     }
@@ -9682,8 +10208,26 @@ fn receipt_request_stamp(
         req.top_k,
         req.seed,
         stop_spec_to_vec(req.stop.as_ref()),
-        req.response_format.clone().filter(|v| !v.is_null()),
+        normalized_constraint_receipt(req),
     ))
+}
+
+fn normalized_constraint_receipt(req: &ChatCompletionRequest) -> Option<serde_json::Value> {
+    if let Some(value) = req.response_format.clone().filter(|value| !value.is_null()) {
+        return Some(value);
+    }
+    if let Some(schema) = req.json_schema.clone().filter(|value| !value.is_null()) {
+        return Some(serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {"schema": schema}
+        }));
+    }
+    req.grammar.as_ref().map(|grammar| {
+        serde_json::json!({
+            "type": "grammar",
+            "grammar": grammar
+        })
+    })
 }
 
 /// Receipt stamp for the raw `/v1/completions` endpoint. The receipt records the
@@ -9849,7 +10393,7 @@ pub async fn replay_receipt_request(
     request: &receipt::ReceiptRequest,
 ) -> std::result::Result<ReceiptReplay, String> {
     let state = AppState::with_configured_threads(configured_threads);
-    let loaded = load_model_from_path(&state, gguf_path.to_path_buf(), None)
+    let loaded = load_model_from_path(&state, gguf_path.to_path_buf(), None, true)
         .await
         .map_err(|err| format!("model load failed: {err}"))?;
     replay_loaded_receipt_request(&state, &loaded.id, request).await
@@ -12084,28 +12628,22 @@ fn generate_token_ids(
     let mut top_logits = Vec::new();
     let mut step_top_logits = Vec::new();
     let mut step_logprobs: Vec<StepLogprob> = Vec::new();
-    // Constrained-decoding setup (response_format json_object / json_schema). Cache
-    // each token's output bytes once; mask the logits to tokens that keep a valid
-    // prefix of the constrained value each step; stop as soon as it completes.
+    // Structured-decoding setup (JSON Schema / LLGuidance Lark). Build the
+    // token trie from exact tokenizer bytes before any forward pass. This retains
+    // byte-fallback fragments that are not standalone UTF-8 strings.
     let constraint_active = prepared.constraint.is_some();
     let grammar_vocab = prepared.tokenizer.tokens.len();
-    let grammar_token_bytes: Vec<Vec<u8>> = if constraint_active {
-        (0..grammar_vocab as u32)
-            .map(|id| {
-                prepared
-                    .tokenizer
-                    .decode(&[id], false)
-                    .unwrap_or_default()
-                    .into_bytes()
-            })
-            .collect()
-    } else {
-        Vec::new()
+    let mut grammar: Option<crate::grammar::ConstraintState> = match prepared.constraint.as_ref() {
+        Some(spec) => Some(spec.build(&prepared.tokenizer).map_err(|err| {
+            Box::new(api_error(
+                StatusCode::BAD_REQUEST,
+                "unsupported_parameter",
+                format!("structured-output constraint is not supported by this tokenizer: {err}"),
+                Some("response_format"),
+            ))
+        })?),
+        None => None,
     };
-    let mut grammar: Option<crate::grammar::ConstraintState> = prepared
-        .constraint
-        .as_ref()
-        .map(crate::grammar::ConstraintSpec::build);
     let mut grammar_mask: Vec<bool> =
         vec![false; if constraint_active { grammar_vocab } else { 0 }];
     let collect_step_top_logits = !prepared.logit_diagnostic_token_ids.is_empty();
@@ -12357,47 +12895,28 @@ fn generate_token_ids(
                 }
             }
         }
-        // JSON-grammar mask for this step: a token is allowed iff its bytes keep a
-        // valid JSON-object prefix; EOG only once the object is complete.
-        let grammar_allowed: Option<&[bool]> = match grammar.as_ref() {
+        // LLGuidance computes the allowed-token set by walking its token trie.
+        // Converting the compact bitset to the sampler's bool slice is linear,
+        // but grammar evaluation no longer clones an automaton per vocab entry.
+        let grammar_allowed: Option<&[bool]> = match grammar.as_mut() {
             Some(state) => {
-                // `done` gates whether EOG is allowed this step. With the current loop
-                // structure it is always false here (the loop breaks the moment a token
-                // drives the state to done, below); it is kept defensive so the mask
-                // stays correct if that stop/advance ordering ever changes.
-                let done = state.is_done();
-                let mut any_allowed = false;
-                for (id, slot) in grammar_mask.iter_mut().enumerate() {
-                    let bytes = grammar_token_bytes
-                        .get(id)
-                        .map(|v| v.as_slice())
-                        .unwrap_or_default();
-                    *slot = if prepared.tokenizer.special.eog.contains(&(id as u32)) {
-                        done
-                    } else if bytes.is_empty() {
-                        false
-                    } else {
-                        state.accepts(bytes)
-                    };
-                    any_allowed |= *slot;
+                let stopped = state.compute_mask(&mut grammar_mask).map_err(|err| {
+                    Box::new(api_error(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "constraint_evaluation_failed",
+                        format!("LLGuidance could not compute the next-token mask: {err}"),
+                        Some("response_format"),
+                    ))
+                })?;
+                if stopped {
+                    finish_reason = "stop";
+                    break;
                 }
-                // Fail closed if no token can extend the constrained value and
-                // stopping is not yet allowed. This arises when the next required byte
-                // is only reachable through a multibyte-UTF-8 fragment token:
-                // `grammar_token_bytes` decodes each token in isolation and drops
-                // incomplete UTF-8, so a byte-level-BPE / byte-fallback fragment decodes
-                // to "" and is masked out above (having a byte token is not enough — it
-                // must survive an in-isolation decode). Non-ASCII `enum`/`const` literals,
-                // which would force exactly such a byte, are rejected at schema-compile
-                // time (a request-time 400), so in practice this only guards free-form
-                // values on pathological tokenizers; sampling a fully-masked (all -inf)
-                // distribution would otherwise emit an invalid token or NaN, so we
-                // surface a typed error instead.
-                if !any_allowed {
+                if !grammar_mask.iter().any(|allowed| *allowed) {
                     return Err(Box::new(api_error(
                         StatusCode::UNPROCESSABLE_ENTITY,
                         "constraint_unsatisfiable",
-                        "the response_format constraint cannot be satisfied by this model's tokenizer (no token can produce the next required byte)".to_string(),
+                        "the structured-output constraint cannot be extended by any token in this model's vocabulary".to_string(),
                         Some("response_format"),
                     )));
                 }
@@ -12552,23 +13071,17 @@ fn generate_token_ids(
         }
         generated.push(step.next_token_id);
         history.push(step.next_token_id);
-        // Advance the JSON grammar by the chosen token's bytes; stop the moment the
-        // top-level object closes (the mask guaranteed the bytes are acceptable).
+        // Commit exactly the token LLGuidance allowed. No lossy token
+        // decode/re-encode round trip is involved.
         if let Some(state) = grammar.as_mut() {
-            if let Some(bytes) = grammar_token_bytes.get(step.next_token_id as usize) {
-                for &b in bytes {
-                    // The mask guaranteed every byte of the chosen token is acceptable.
-                    // Advance in all builds (the grammar must consume the emitted bytes)
-                    // and assert acceptance in debug, so a mask/advance divergence fails
-                    // a test instead of silently emitting invalid output.
-                    let accepted = state.advance(b).is_ok();
-                    debug_assert!(
-                        accepted,
-                        "constrained-decode mask allowed a token whose bytes the grammar rejects"
-                    );
-                }
-            }
-            if state.is_done() {
+            if state.commit_token(step.next_token_id).map_err(|err| {
+                Box::new(api_error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "constraint_commit_failed",
+                    format!("LLGuidance rejected the sampled token: {err}"),
+                    Some("response_format"),
+                ))
+            })? {
                 finish_reason = "stop";
                 break;
             }
@@ -12786,11 +13299,58 @@ fn build_completion_logprobs(steps: &[StepLogprob]) -> CompletionLogprobs {
     }
 }
 
+/// Resolve the OpenAI response format and llama.cpp-compatible top-level
+/// extensions into one fail-closed constraint. Supplying more than one is
+/// ambiguous and therefore rejected rather than applying precedence.
+fn constraint_from_request(
+    response_format: Option<&serde_json::Value>,
+    json_schema: Option<&serde_json::Value>,
+    grammar: Option<&str>,
+) -> std::result::Result<Option<crate::grammar::ConstraintSpec>, Box<Response>> {
+    let response_format = response_format.filter(|value| !value.is_null());
+    let json_schema = json_schema.filter(|value| !value.is_null());
+    let active = usize::from(response_format.is_some())
+        + usize::from(json_schema.is_some())
+        + usize::from(grammar.is_some());
+    if active > 1 {
+        return Err(Box::new(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "response_format, json_schema, and grammar are mutually exclusive".to_string(),
+            Some("response_format"),
+        )));
+    }
+    if let Some(schema) = json_schema {
+        return crate::grammar::ConstraintSpec::from_schema(schema)
+            .map(Some)
+            .map_err(|err| {
+                Box::new(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "unsupported_parameter",
+                    format!("json_schema is not supported by LLGuidance: {err}"),
+                    Some("json_schema"),
+                ))
+            });
+    }
+    if let Some(grammar) = grammar {
+        return crate::grammar::ConstraintSpec::from_lark(grammar)
+            .map(Some)
+            .map_err(|err| {
+                Box::new(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "unsupported_parameter",
+                    format!("grammar is not supported by LLGuidance: {err}"),
+                    Some("grammar"),
+                ))
+            });
+    }
+    constraint_from_response_format(response_format)
+}
+
 /// Interpret OpenAI `response_format` into an optional output constraint.
 /// `Ok(None)` = normal decoding (text / absent); `Ok(Some(_))` = constrained
-/// decoding (`json_object`, or `json_schema` whose schema is inside the supported
-/// subset); `Err` = a typed 400 for an unsupported shape or a schema Camelid cannot
-/// enforce byte-for-byte.
+/// decoding (`json_object`, broad `json_schema`, or LLGuidance/Lark `grammar`);
+/// `Err` = a typed 400 for an unsupported shape or constraint.
 fn constraint_from_response_format(
     response_format: Option<&serde_json::Value>,
 ) -> std::result::Result<Option<crate::grammar::ConstraintSpec>, Box<Response>> {
@@ -12807,7 +13367,7 @@ fn constraint_from_response_format(
                     Box::new(api_error(
                         StatusCode::BAD_REQUEST,
                         "invalid_request_error",
-                        "response_format json_schema requires a `json_schema.schema` object"
+                        "response_format json_schema requires a `json_schema.schema` value"
                             .to_string(),
                         Some("response_format"),
                     ))
@@ -12818,7 +13378,34 @@ fn constraint_from_response_format(
                     Box::new(api_error(
                         StatusCode::BAD_REQUEST,
                         "unsupported_parameter",
-                        format!("response_format json_schema is not supported: {err}"),
+                        format!(
+                            "response_format json_schema is not supported by LLGuidance: {err}"
+                        ),
+                        Some("response_format"),
+                    ))
+                })
+        }
+        Some("grammar") => {
+            let grammar = value
+                .get("grammar")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    Box::new(api_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        "response_format grammar requires a string `grammar` field".to_string(),
+                        Some("response_format"),
+                    ))
+                })?;
+            crate::grammar::ConstraintSpec::from_lark(grammar)
+                .map(Some)
+                .map_err(|err| {
+                    Box::new(api_error(
+                        StatusCode::BAD_REQUEST,
+                        "unsupported_parameter",
+                        format!(
+                            "response_format grammar is not supported by LLGuidance: {err}"
+                        ),
                         Some("response_format"),
                     ))
                 })
@@ -12828,7 +13415,7 @@ fn constraint_from_response_format(
             StatusCode::BAD_REQUEST,
             "unsupported_parameter",
             format!(
-                "response_format type {other:?} is not supported; only json_object, json_schema, and text are honored"
+                "response_format type {other:?} is not supported; only json_object, json_schema, grammar, and text are honored"
             ),
             Some("response_format"),
         ))),
@@ -15612,9 +16199,39 @@ mod tests {
         assert!(constraint_from_response_format(Some(&good))
             .unwrap()
             .is_some());
-        // A schema outside the subset is a typed error, not silently ignored.
-        let bad = json!({"type": "json_schema", "json_schema": {"schema": {"type": "string"}}});
+        // Scalar roots and advanced keywords are supported by LLGuidance.
+        let broad = json!({
+            "type": "json_schema",
+            "json_schema": {"schema": {
+                "type": "string", "pattern": "^[a-z]+$", "minLength": 2
+            }}
+        });
+        assert!(constraint_from_response_format(Some(&broad))
+            .unwrap()
+            .is_some());
+        // A schema LLGuidance cannot compile is a typed error, not ignored.
+        let bad = json!({"type": "json_schema", "json_schema": {"schema": {"type": "camel"}}});
         assert!(constraint_from_response_format(Some(&bad)).is_err());
+        // Lark CFGs are accepted through response_format and the llama.cpp-style
+        // top-level field; malformed grammars fail closed.
+        assert!(constraint_from_response_format(Some(
+            &json!({"type": "grammar", "grammar": "start: \"yes\" | \"no\""})
+        ))
+        .unwrap()
+        .is_some());
+        assert!(constraint_from_response_format(Some(
+            &json!({"type": "grammar", "grammar": "start: ("})
+        ))
+        .is_err());
+        assert!(constraint_from_request(None, None, Some("start: \"ok\""))
+            .unwrap()
+            .is_some());
+        assert!(constraint_from_request(
+            Some(&json!({"type": "json_object"})),
+            Some(&json!({"type": "string"})),
+            None,
+        )
+        .is_err());
         // A json_schema without the schema payload is an error.
         assert!(constraint_from_response_format(Some(&json!({"type": "json_schema"}))).is_err());
         // Unknown response_format types remain errors.
@@ -16059,7 +16676,54 @@ mod tests {
     }
 
     #[test]
+    fn capabilities_and_catalog_expose_the_exact_nomic_embedding_row() {
+        let capabilities = capabilities_response();
+        let row = capabilities
+            .model_compatibility
+            .iter()
+            .find(|row| row.id == "nomic_embed_text_v1_5_q8_0")
+            .expect("exact Nomic embedding compatibility row");
+        assert_eq!(row.status, "supported_exact_row_embedding");
+        assert_eq!(row.family, "nomic-bert");
+        assert_eq!(row.quantization, "Q8_0");
+        assert!(!row.tool_capable);
+        assert_eq!(row.latest_checked_result, "pass");
+        for feature in [
+            "openai_embeddings",
+            "embedding_similarity_reranking",
+            "llguidance_structured_outputs",
+        ] {
+            assert!(
+                capabilities
+                    .api_features
+                    .iter()
+                    .any(|item| item.id == feature),
+                "missing capability feature {feature}"
+            );
+        }
+        let catalog = curated_catalog();
+        let item = catalog
+            .iter()
+            .find(|item| item.catalog_id == row.id)
+            .expect("exact Nomic catalog row");
+        assert_eq!(item.filename, "nomic-embed-text-v1.5.Q8_0.gguf");
+        assert_eq!(item.size_bytes, 146_146_432);
+        assert!(crate::runnable::oracle_qualified(
+            item.architecture,
+            item.quant
+        ));
+    }
+
+    #[test]
     fn classify_model_lane_separates_supported_experimental_and_unsupported() {
+        assert_eq!(
+            classify_model_lane(Some("nomic-bert"), "nomic-embed-text-v1.5.Q8_0.gguf"),
+            ModelLaneClass::Supported,
+        );
+        assert_eq!(
+            classify_model_lane(Some("nomic-bert"), "other-nomic-model.Q8_0.gguf"),
+            ModelLaneClass::ExperimentalImplemented,
+        );
         // Exact supported curated artifact â†’ Supported.
         assert_eq!(
             classify_model_lane(Some("llama"), "tinyllama-1.1b-chat-v1.0.Q8_0.gguf"),
@@ -16377,6 +17041,9 @@ mod tests {
                 "llama3_2_1b_instruct_iq4_xs",
                 "llama3_8b_instruct_q8_0",
                 "mistral_7b_instruct_v0_3_q8_0",
+                // Nomic v1.5 Q8_0 bidirectional encoder: exact-row embeddings,
+                // embedding-similarity reranking, and Workspace semantic retrieval.
+                "nomic_embed_text_v1_5_q8_0",
                 // Dense Qwen3 Q8_0 ChatML rows (thinking disabled): exact-row
                 // token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on
                 // Windows x86_64 CPU (cpu_reference + x86_q8 AVX2, bit-identical).
@@ -16419,6 +17086,7 @@ mod tests {
                 "llama_bpe_decoder_exact_1b_3b_8b_q8_0",
                 "llama_spm_decoder",
                 "mistral_instruct_exact_7b_v0_3_q8_0",
+                "nomic_bert_encoder_exact_v1_5_q8_0",
                 "qwen3_chatml_exact_0_6b_1_7b_4b_8b_q8_0",
             ])
         );
@@ -19369,7 +20037,8 @@ pub struct CatalogItem {
     pub architecture: &'static str,
     pub license: &'static str,
     /// Advisory "best for" positioning for the Models tab (curated, not
-    /// benchmarked). Constrained to: `general`, `reasoning`, `coding`, `tools`.
+    /// benchmarked). Constrained to: `general`, `reasoning`, `coding`, `tools`,
+    /// `embeddings`, `retrieval`.
     pub task_tags: &'static [&'static str],
 }
 
@@ -19601,6 +20270,19 @@ impl CatalogItemView {
 
 pub fn curated_catalog() -> Vec<CatalogItem> {
     vec![
+        CatalogItem {
+            catalog_id: "nomic_embed_text_v1_5_q8_0",
+            name: "Nomic Embed Text v1.5 Q8_0",
+            repo_id: "nomic-ai/nomic-embed-text-v1.5-GGUF",
+            filename: "nomic-embed-text-v1.5.Q8_0.gguf",
+            size_bytes: 146146432,
+            downloads: 0,
+            likes: 0,
+            quant: "Q8_0",
+            architecture: "nomic-bert",
+            license: "apache-2.0",
+            task_tags: &["embeddings", "retrieval"],
+        },
         CatalogItem {
             catalog_id: "llama32_1b_instruct_q8_0",
             name: "Llama 3.2 1B Instruct Q8_0",
@@ -21103,7 +21785,7 @@ fn filename_is_supported_exact_row(filename: &str) -> bool {
 /// artifact for the supported-row check.
 fn classify_model_lane(architecture: Option<&str>, filename: &str) -> ModelLaneClass {
     match architecture {
-        Some(arch) if crate::model::is_implemented_architecture(arch) => {
+        Some(arch) if crate::model::is_implemented_architecture(arch) || arch == "nomic-bert" => {
             if filename_is_supported_exact_row(filename) {
                 ModelLaneClass::Supported
             } else {
@@ -22300,7 +22982,10 @@ mod catalog_fit_tests {
             );
             for tag in item.task_tags {
                 assert!(
-                    matches!(*tag, "general" | "reasoning" | "coding" | "tools"),
+                    matches!(
+                        *tag,
+                        "general" | "reasoning" | "coding" | "tools" | "embeddings" | "retrieval"
+                    ),
                     "row {} has unexpected task tag {tag}",
                     item.catalog_id
                 );

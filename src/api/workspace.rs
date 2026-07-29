@@ -77,6 +77,7 @@ struct ActiveWorkspaceSession {
     max_tokens: u32,
     temperature: f32,
     allow_writes: bool,
+    semantic_retriever: Option<Arc<crate::chat::semantic_search::WorkspaceSemanticRetriever>>,
     memory: WorkspaceMemoryStore,
     state: StdMutex<WorkspaceSessionState>,
     events: StdMutex<Option<std::sync::mpsc::Receiver<WorkspaceEvent>>>,
@@ -368,6 +369,9 @@ struct WorkspaceSessionResponse {
     max_steps: usize,
     max_tokens: u32,
     allow_writes: bool,
+    semantic_retrieval: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    embedding_model_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -379,6 +383,9 @@ struct WorkspaceSessionStatusResponse {
     context_budget_tokens: u32,
     resident_cuda: Option<crate::inference::ResidentCudaStatus>,
     allow_writes: bool,
+    semantic_retrieval: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    embedding_model_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1056,6 +1063,10 @@ pub(super) async fn create_session(
         Ok(value) => value,
         Err(response) => return response,
     };
+    let semantic_retriever = workspace_semantic_retriever(&state, &workspace).await;
+    let embedding_model_id = semantic_retriever
+        .as_ref()
+        .map(|retriever| retriever.model_id().to_string());
 
     let mut active = state.workspace_sessions.active.lock().await;
     if let Some(existing_state) = WorkspaceSessionManager::active_state(&active) {
@@ -1152,6 +1163,7 @@ pub(super) async fn create_session(
         max_steps,
         max_tokens,
         temperature,
+        semantic_retriever: semantic_retriever.clone(),
     };
     let session = Arc::new(ActiveWorkspaceSession {
         id: id.clone(),
@@ -1161,6 +1173,7 @@ pub(super) async fn create_session(
         max_tokens,
         temperature,
         allow_writes,
+        semantic_retriever,
         memory,
         state: StdMutex::new(WorkspaceSessionState::WaitingForEvents),
         events: StdMutex::new(Some(events)),
@@ -1182,6 +1195,8 @@ pub(super) async fn create_session(
             max_steps,
             max_tokens,
             allow_writes,
+            semantic_retrieval: embedding_model_id.is_some(),
+            embedding_model_id,
         }),
     )
         .into_response()
@@ -1488,6 +1503,11 @@ pub(super) async fn session_status(
             &session.model_id,
         )),
         allow_writes: session.allow_writes,
+        semantic_retrieval: session.semantic_retriever.is_some(),
+        embedding_model_id: session
+            .semantic_retriever
+            .as_ref()
+            .map(|retriever| retriever.model_id().to_string()),
     })
     .into_response()
 }
@@ -1627,6 +1647,7 @@ pub(super) async fn send_message(
         max_steps: session.max_steps,
         max_tokens: session.max_tokens,
         temperature: session.temperature,
+        semantic_retriever: session.semantic_retriever.clone(),
     };
     match session.install_turn(events, worker, run_config, control) {
         Ok(InstallTurn::Installed) => {}
@@ -1827,6 +1848,38 @@ fn loopback_host(host: &str) -> bool {
         || host
             .parse::<IpAddr>()
             .is_ok_and(|address| address.is_loopback())
+}
+
+async fn workspace_semantic_retriever(
+    state: &AppState,
+    workspace: &std::path::Path,
+) -> Option<Arc<crate::chat::semantic_search::WorkspaceSemanticRetriever>> {
+    let mut candidates = state
+        .loaded_models
+        .read()
+        .await
+        .values()
+        .filter(|model| model.gguf.architecture() == Some("nomic-bert"))
+        .map(|model| model.id.clone())
+        .collect::<Vec<_>>();
+    candidates.sort();
+    if candidates.is_empty() {
+        return None;
+    }
+    let cached = state.embedding_runtimes.read().await;
+    candidates.sort_by_key(|id| !cached.contains_key(id));
+    drop(cached);
+    let model_id = candidates.into_iter().next()?;
+    match super::resolve_embedding_runtime(state, Some(&model_id)).await {
+        Ok((model_id, runtime)) => Some(Arc::new(
+            crate::chat::semantic_search::WorkspaceSemanticRetriever::new(
+                workspace.to_path_buf(),
+                model_id,
+                runtime,
+            ),
+        )),
+        Err(_) => None,
+    }
 }
 
 async fn active_tool_capable_model(state: &AppState) -> Result<(LoadedModel, String), Response> {
@@ -2074,6 +2127,7 @@ mod tests {
                 max_tokens: 1,
                 temperature: 0.0,
                 allow_writes: true,
+                semantic_retriever: None,
                 memory: WorkspaceMemoryStore::open(std::env::temp_dir().join(format!(
                     "camelid-workspace-state-test-{}.sqlite3",
                     uuid::Uuid::new_v4()
@@ -2121,6 +2175,7 @@ mod tests {
             max_tokens: 1,
             temperature: 0.0,
             allow_writes: true,
+            semantic_retriever: None,
             memory,
             state: StdMutex::new(WorkspaceSessionState::Idle),
             events: StdMutex::new(None),
@@ -2141,6 +2196,7 @@ mod tests {
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
+            semantic_retriever: None,
         };
         let (worker, client) = bridge(1);
         let (events, control) = client.into_parts();
@@ -2184,6 +2240,7 @@ mod tests {
             max_tokens: 1,
             temperature: 0.0,
             allow_writes: false,
+            semantic_retriever: None,
             memory,
             state: StdMutex::new(WorkspaceSessionState::Cancelled),
             events: StdMutex::new(None),
@@ -2212,6 +2269,7 @@ mod tests {
             max_tokens: 1,
             temperature: 0.0,
             allow_writes: false,
+            semantic_retriever: None,
             memory,
             state: StdMutex::new(WorkspaceSessionState::Cancelling),
             events: StdMutex::new(None),
@@ -2232,6 +2290,7 @@ mod tests {
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
+            semantic_retriever: None,
         };
 
         assert!(session
@@ -2268,6 +2327,7 @@ mod tests {
                 max_tokens: 1,
                 temperature: 0.0,
                 allow_writes: false,
+                semantic_retriever: None,
                 memory,
                 state: StdMutex::new(terminal_state),
                 events: StdMutex::new(Some(stale_events)),
@@ -2288,6 +2348,7 @@ mod tests {
                 max_steps: 1,
                 max_tokens: 1,
                 temperature: 0.0,
+                semantic_retriever: None,
             };
             let (worker, client) = bridge(1);
             let (events, control) = client.into_parts();
@@ -2320,6 +2381,7 @@ mod tests {
             max_tokens: 1,
             temperature: 0.0,
             allow_writes: false,
+            semantic_retriever: None,
             memory,
             state: StdMutex::new(WorkspaceSessionState::WaitingForEvents),
             events: StdMutex::new(Some(events)),
@@ -2336,6 +2398,7 @@ mod tests {
                 max_steps: 1,
                 max_tokens: 1,
                 temperature: 0.0,
+                semantic_retriever: None,
             })),
             control: StdMutex::new(Some(control)),
             current_turn: StdMutex::new(Some(("message-1".into(), 0))),

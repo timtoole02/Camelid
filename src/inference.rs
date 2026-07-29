@@ -8282,7 +8282,7 @@ fn linear_for_role(
     )
 }
 
-fn linear_for_role_runtime(
+pub(crate) fn linear_for_role_runtime(
     input: &CpuTensor,
     weight: &CpuTensor,
     name: impl Into<String>,
