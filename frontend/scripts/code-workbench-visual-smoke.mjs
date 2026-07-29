@@ -10,9 +10,11 @@ const executablePath = [
   process.env.PUPPETEER_EXECUTABLE_PATH,
   'C:/Program Files/Google/Chrome/Application/chrome.exe',
   'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
   '/usr/bin/google-chrome',
   '/usr/bin/google-chrome-stable',
   '/usr/bin/chromium',
+  '/usr/bin/chromium-browser',
 ].filter(Boolean).find(existsSync)
 if (!executablePath) throw new Error('Chrome or Edge is required for Code workbench visual smoke')
 
@@ -88,15 +90,25 @@ try {
     localStorage.setItem('camelid.codeWorkspacePath', 'C:/projects/camelid-demo')
     localStorage.setItem('camelid.codeInspectorOpen', 'true')
 
+    // Counted per Code session stream only — the app also opens an observatory
+    // telemetry EventSource at startup, which must not consume a turn script.
+    let streamsOpened = 0
     class MockEventSource {
-      constructor() {
+      constructor(url) {
         this.listeners = new Map()
         this.closed = false
-        globalThis.__codeEventSource = this
+        this.stream = 0
+        if (String(url || '').includes('/api/agent/workspace/sessions/')) {
+          streamsOpened += 1
+          this.stream = streamsOpened
+          globalThis.__codeStreamsOpened = streamsOpened
+          globalThis.__codeEventSource = this
+        }
       }
       addEventListener(type, callback) {
         this.listeners.set(type, callback)
-        if (type !== 'workspace') return
+        if (type !== 'workspace' || this.stream === 0) return
+        if (this.stream > 1) return this.followUpTurn()
         this.emitAfter(20, { sequence: 1, event: 'session.started', workspace: 'C:/projects/camelid-demo', model_id: 'Qwen3-4B-Q4_K_M.gguf' })
         this.emitAfter(40, { sequence: 2, event: 'turn.started', turn_index: 0 })
         this.emitAfter(70, { sequence: 3, event: 'model.delta', content: 'I will inspect the existing component before changing it.' })
@@ -114,6 +126,15 @@ try {
           detail: 'Create frontend/src/components/InteractiveAgent.jsx inside C:/projects/camelid-demo',
         })
       }
+      // A follow-up opens a SECOND stream, and the server counts sequences per
+      // stream — so these low numbers collide with turn one's, which is exactly
+      // the state that used to give two rendered cards the same React key.
+      followUpTurn() {
+        this.emitAfter(20, { sequence: 1, event: 'session.started', workspace: 'C:/projects/camelid-demo', model_id: 'Qwen3-4B-Q4_K_M.gguf' })
+        this.emitAfter(40, { sequence: 2, event: 'tool.call', detail: 'read_file(frontend/src/components/InteractiveAgent.jsx, offset=0, limit=80)' })
+        this.emitAfter(60, { sequence: 3, event: 'tool.result', tool: 'read_file', outcome: 'ok', content: 'export function InteractiveAgent() { return null }' })
+        this.emitAfter(80, { sequence: 4, event: 'model.delta', content: 'Writing focused tests for the component now.' })
+      }
       emitAfter(delay, payload) { setTimeout(() => this.emit(payload), delay) }
       emit(payload) {
         const callback = this.listeners.get('workspace')
@@ -129,10 +150,31 @@ try {
       source?.emit({ sequence: 12, event: 'model.timing', total_ms: 2480, ttft_ms: 165, output_tokens: 92 })
       source?.emit({ sequence: 13, event: 'session.finished', outcome: 'answered' })
     }
+    // The terminal event a Stop really produces: the still-open stream delivers
+    // the server's own `aborted` before the DELETE poll settles.
+    globalThis.__abortCodeTurn = () => {
+      globalThis.__codeEventSource?.emit({ sequence: 5, event: 'session.finished', outcome: 'aborted' })
+    }
+    // Pushes the oldest entries out of the client's 240-entry activity ring.
+    globalThis.__floodCodeEvents = (count) => {
+      const source = globalThis.__codeEventSource
+      for (let index = 0; index < count; index += 1) {
+        source?.emit({ sequence: 100 + index, event: 'session.notice', content: `Checkpoint ${index}` })
+      }
+    }
   })
 
   const decisions = []
   const sessionBodies = []
+  const followUps = []
+  const cancels = []
+  const railThreads = [{
+    id: 'saved-code-thread',
+    title: 'Earlier coding session',
+    canonical_root: 'C:/projects/camelid-demo',
+    turn_count: 3,
+    updated_at: Date.now(),
+  }]
   await page.setRequestInterception(true)
   page.on('request', async (request) => {
     const url = request.url()
@@ -153,11 +195,25 @@ try {
     if (url.endsWith('/api/models/catalog/downloads')) return respondJson(request, [])
     if (url.endsWith('/api/models/current')) return respondJson(request, currentModel)
     if (url.endsWith('/api/models/local')) return respondJson(request, localModels)
-    if (url.includes('/api/agent/workspace/threads/recent?')) return respondJson(request, { threads: [] })
+    if (url.includes('/api/agent/workspace/threads/recent?')) return respondJson(request, { threads: railThreads })
     if (url.includes('/api/agent/workspace/threads?')) return respondJson(request, { threads: [] })
+    if (url.endsWith('/api/agent/workspace/sessions/code-workbench-smoke/messages')) {
+      followUps.push(JSON.parse(request.postData() || '{}'))
+      return respondJson(request, { session_id: 'code-workbench-smoke', turn_index: 1, state: 'waiting_for_events', duplicate: false })
+    }
+    if (url.endsWith('/api/agent/workspace/sessions/code-workbench-smoke')) {
+      if (request.method() === 'DELETE') {
+        cancels.push(Date.now())
+        return request.respond({ status: 204, body: '' })
+      }
+      return respondJson(request, { id: 'code-workbench-smoke', state: cancels.length ? 'cancelled' : 'running' })
+    }
     if (url.endsWith('/api/agent/workspace/sessions') && request.method() === 'POST') {
       const body = JSON.parse(request.postData() || '{}')
       sessionBodies.push(body)
+      // The third start answers slowly on purpose: the composer offers Stop from
+      // the moment it is submitted, which is before any session id exists.
+      if (sessionBodies.length === 3) await new Promise((resolve) => setTimeout(resolve, 500))
       return respondJson(request, {
         id: 'code-workbench-smoke',
         workspace: 'C:/projects/camelid-demo',
@@ -245,6 +301,29 @@ try {
   }
   await page.screenshot({ path: join(outputDir, 'code-workbench-approval.png'), fullPage: true })
 
+  // Opening a rail entry remounts the Code surface, and the remount cancels the
+  // live turn on the server. A run only ends when it finishes or the user stops
+  // it, so the rail has to ask — and declining must leave the run untouched.
+  await page.click('.rail-code-thread')
+  await page.waitForSelector('.cx-modal', { timeout: 5000 })
+  const railGuard = await page.evaluate(() => ({
+    text: document.querySelector('.cx-modal')?.textContent,
+    confirmLabel: document.querySelector('.cx-modal .cx-btn--danger')?.textContent.trim(),
+  }))
+  if (!railGuard.text?.includes('stops that turn on the server')
+    || railGuard.confirmLabel !== 'Stop and switch') {
+    throw new Error(`rail navigation did not warn about the live run: ${JSON.stringify(railGuard)}`)
+  }
+  await page.click('.cx-modal .cx-btn--ghost')
+  await page.waitForSelector('.cx-modal', { hidden: true })
+  const railDeclined = await page.evaluate(() => ({
+    sourceClosed: Boolean(globalThis.__codeEventSource?.closed),
+    approvalStillPending: Boolean(document.querySelector('.code-inline-approval.is-pending')),
+  }))
+  if (railDeclined.sourceClosed || !railDeclined.approvalStillPending || cancels.length !== 0) {
+    throw new Error(`declining the rail switch still killed the run: ${JSON.stringify({ ...railDeclined, cancels: cancels.length })}`)
+  }
+
   // Switching to ordinary Chat is a view change, not a cancellation command.
   // The live Code component must remain mounted and resume exactly where it was.
   await page.click('.topbar__mode-switch button:first-child')
@@ -272,6 +351,27 @@ try {
     throw new Error(`Approval decision mismatch: ${JSON.stringify(decisions)}`)
   }
 
+  // An approval-gated write puts `approval.required` between the call and its
+  // result. The card must still resolve to Done, and the result must not also
+  // appear as a second, orphaned card. `update_plan` renders as a plan card, so
+  // the two tool cards here are read_file and write_file.
+  const pairedState = await page.evaluate(() => ({
+    toolCards: [...document.querySelectorAll('.code-tool-card')].map((node) => ({
+      title: node.querySelector('summary strong')?.textContent,
+      state: node.querySelector('.code-tool-card__state')?.textContent,
+    })),
+    dividers: [...document.querySelectorAll('.code-worked-divider')].map((node) => node.textContent.trim()),
+  }))
+  if (pairedState.toolCards.length !== 2
+    || pairedState.toolCards.some((card) => card.state !== 'Done')
+    || !pairedState.toolCards.some((card) => card.title === 'Write File')) {
+    throw new Error(`approval-gated tool call did not pair with its result: ${JSON.stringify(pairedState)}`)
+  }
+  // The server reports a normal completion as `answered`; the divider labels it.
+  if (pairedState.dividers.length !== 1 || pairedState.dividers[0] !== 'Complete') {
+    throw new Error(`terminal divider mismatch: ${JSON.stringify(pairedState)}`)
+  }
+
   const completedState = await page.evaluate(() => ({
     status: document.querySelector('.code-stage__status')?.textContent.trim(),
     assistant: document.querySelector('.code-message--assistant')?.textContent.trim(),
@@ -290,6 +390,54 @@ try {
     throw new Error(`follow-up or layout state mismatch: ${JSON.stringify(completedState)}`)
   }
   await page.screenshot({ path: join(outputDir, 'code-workbench-complete.png'), fullPage: true })
+
+  // A follow-up turn opens a second stream whose sequence numbers repeat turn
+  // one's. Both turns' activity has to survive in one feed.
+  await page.click('.code-composer__send')
+  await page.waitForFunction(() => document.body.textContent.includes('Writing focused tests'), { timeout: 5000 })
+  const followUpState = await page.evaluate(() => ({
+    toolCards: [...document.querySelectorAll('.code-tool-card summary strong')].map((node) => node.textContent),
+    userMessages: [...document.querySelectorAll('.code-message--user')].map((node) => node.textContent),
+  }))
+  if (followUps.length !== 1
+    || followUpState.toolCards.length !== 3
+    || followUpState.userMessages.length !== 2
+    || !followUpState.userMessages[1]?.includes('focused tests')) {
+    throw new Error(`follow-up turn did not render alongside the first: ${JSON.stringify({ ...followUpState, followUps })}`)
+  }
+
+  // Overflow the 240-entry activity ring. The two turns above hold 18 entries,
+  // so 225 more evicts the first three — including turn one's `turn.user`, the
+  // marker the view used to count live turns by. Losing it promoted a turn whose
+  // answer is still buffered into the finished-history list, printing that
+  // answer a second time. Code turns have no step cap, so this is reachable.
+  await page.evaluate(() => globalThis.__floodCodeEvents(225))
+  await page.waitForFunction(() => document.body.textContent.includes('Checkpoint 224'), { timeout: 5000 })
+  const evictedState = await page.evaluate(() => ({
+    answers: [...document.querySelectorAll('.code-message--assistant')]
+      .filter((node) => node.textContent.includes('Implemented the interactive agent component')).length,
+    historyPairs: document.querySelectorAll('.code-turn-pair').length,
+    notices: document.querySelectorAll('.code-session-notice').length,
+  }))
+  if (evictedState.answers !== 1 || evictedState.historyPairs !== 0) {
+    throw new Error(`evicted activity duplicated a live turn: ${JSON.stringify(evictedState)}`)
+  }
+
+  // Stop while the stream is still open: the server sends its own `aborted`
+  // terminal event, so the client must not append a second ending of its own.
+  await page.click('.code-composer__send.is-stop')
+  await page.evaluate(() => globalThis.__abortCodeTurn())
+  await page.waitForFunction(() => !document.querySelector('.code-composer__send.is-stop'), { timeout: 8000 })
+  const stoppedState = await page.evaluate(() => ({
+    dividers: [...document.querySelectorAll('.code-worked-divider')].map((node) => node.textContent.trim()),
+    status: document.querySelector('.code-stage__status')?.textContent.trim(),
+  }))
+  if (stoppedState.dividers.length !== 2
+    || stoppedState.dividers[1] !== 'Stopped'
+    || stoppedState.status !== 'Stopped'
+    || cancels.length !== 1) {
+    throw new Error(`Stop reported the turn ending twice: ${JSON.stringify({ ...stoppedState, cancels: cancels.length })}`)
+  }
 
   await page.click('button[aria-label="New coding session"]')
   await page.click('.code-access-chip')
@@ -331,7 +479,32 @@ try {
     throw new Error(`full-auto session contract mismatch: ${JSON.stringify(sessionBodies)}`)
   }
 
-  console.log(`code-workbench: PASS ${JSON.stringify({ pendingState, backgroundSwitchState, completedState, menuState, fullAutoBody: sessionBodies[1] })}`)
+  // Stop pressed while the create request is still in flight has to be real: the
+  // session the server hands back is cancelled instead of adopted, and no event
+  // stream is ever opened for it.
+  await page.click('button[aria-label="New coding session"]')
+  await page.click('.code-composer textarea')
+  await page.type('.code-composer textarea', 'Draft a migration plan for the workspace.')
+  await page.click('.code-composer__send')
+  await page.waitForSelector('.code-composer__send.is-stop', { timeout: 3000 })
+  await page.click('.code-composer__send.is-stop')
+  await page.waitForFunction(
+    () => document.querySelector('.code-stage__status')?.textContent.trim() === 'Stopped',
+    { timeout: 8000 },
+  )
+  const abandonedStart = await page.evaluate(() => ({
+    status: document.querySelector('.code-stage__status')?.textContent.trim(),
+    streamsOpened: globalThis.__codeStreamsOpened,
+    composerPlaceholder: document.querySelector('.code-composer textarea')?.placeholder,
+  }))
+  if (sessionBodies.length !== 3
+    || cancels.length !== 4
+    || abandonedStart.streamsOpened !== 3
+    || !abandonedStart.composerPlaceholder?.includes('Describe the change')) {
+    throw new Error(`Stop during session creation did not take: ${JSON.stringify({ ...abandonedStart, sessions: sessionBodies.length, cancels: cancels.length })}`)
+  }
+
+  console.log(`code-workbench: PASS ${JSON.stringify({ pendingState, railGuard, backgroundSwitchState, pairedState, completedState, followUpState, evictedState, stoppedState, menuState, fullAutoBody: sessionBodies[1], abandonedStart })}`)
 } finally {
   await browser.close()
 }

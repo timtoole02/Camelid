@@ -62,6 +62,8 @@ function App() {
   const [codeThreads, setCodeThreads] = useState([])
   const [requestedCodeThread, setRequestedCodeThread] = useState(null)
   const [codeWorkspaceKey, setCodeWorkspaceKey] = useState(0)
+  const [codeRunning, setCodeRunning] = useState(false)
+  const [pendingCodeNav, setPendingCodeNav] = useState(null)
   const [firstRunCardActive, setFirstRunCardActive] = useState(false)
 
   useEffect(() => {
@@ -204,17 +206,25 @@ function App() {
     closeMobileNav()
   }
 
-  const startNewCodeSession = () => {
-    setRequestedCodeThread(null)
+  /* Both rail actions swap the Code surface by bumping its React key, and that
+     remount runs CodeWorkspace's unmount cleanup — a real DELETE that aborts the
+     turn on the server. Same contract as the Chat/Code switch above: a coding
+     run ends when it finishes or when the user stops it, so a live one is worth
+     a question first. */
+  const applyCodeNav = (nav) => {
+    setRequestedCodeThread(nav.thread || null)
     setCodeWorkspaceKey((value) => value + 1)
     navigateTab('code')
   }
 
-  const selectCodeThread = (thread) => {
-    setRequestedCodeThread(thread)
-    setCodeWorkspaceKey((value) => value + 1)
-    navigateTab('code')
+  const requestCodeNav = (nav) => {
+    if (codeRunning) setPendingCodeNav(nav)
+    else applyCodeNav(nav)
   }
+
+  const startNewCodeSession = () => requestCodeNav({ thread: null })
+
+  const selectCodeThread = (thread) => requestCodeNav({ thread })
 
   const requestDeleteConversation = (id) => {
     setPendingDeleteConversationId(id)
@@ -407,6 +417,7 @@ function App() {
                 setTab={navigateTab}
                 requestedThread={requestedCodeThread}
                 onHistoryChanged={() => {}}
+                onRunningChange={setCodeRunning}
               />
             </div>
           )}
@@ -514,6 +525,20 @@ function App() {
         setSelectedModelId={setSelectedModelId}
       />
       <ShortcutsOverlay open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
+
+      <ConfirmDialog
+        open={Boolean(pendingCodeNav)}
+        title="Stop the coding session that is running?"
+        detail={`Camelid is still working in the open coding session. ${pendingCodeNav?.thread ? 'Opening this saved session' : 'Starting a new session'} stops that turn on the server. Files it has already written stay on disk.`}
+        confirmLabel="Stop and switch"
+        cancelLabel="Keep working"
+        onCancel={() => setPendingCodeNav(null)}
+        onConfirm={() => {
+          const nav = pendingCodeNav
+          setPendingCodeNav(null)
+          if (nav) applyCodeNav(nav)
+        }}
+      />
 
             <ConfirmDialog
         open={Boolean(pendingDeleteConversation)}

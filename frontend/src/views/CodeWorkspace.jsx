@@ -29,6 +29,10 @@ import {
 // left the composer dead and the only control a Stop button that had already
 // failed, so the conversation could never be resumed.
 const RUNNING_PHASES = new Set(['starting', 'running', 'awaiting_approval', 'cancelling'])
+// Keyed by BOTH the reducer's phase and the server's terminal outcome string:
+// the end-of-turn divider labels an outcome, and a normal completion reports
+// `answered` while the phase it produces is `finished`. A missing key renders
+// the raw token, which is how the commonest divider used to read "answered".
 const PHASE_LABEL = {
   idle: 'Ready',
   starting: 'Starting',
@@ -36,12 +40,14 @@ const PHASE_LABEL = {
   awaiting_approval: 'Approval needed',
   cancelling: 'Stopping',
   cancel_error: 'Stop unconfirmed',
+  answered: 'Complete',
   finished: 'Complete',
   aborted: 'Stopped',
   cancelled: 'Stopped',
   step_capped: 'Step limit reached',
   repeated: 'No progress',
   driver_error: 'Model error',
+  failed: 'Error',
   error: 'Error',
 }
 
@@ -94,22 +100,50 @@ function compactPath(path) {
   return `…${value.slice(-51)}`
 }
 
+// Events that mean this tool call will never get a result: another call started,
+// the model answered, or the turn ended. Anything else — above all the
+// `approval.required` card the default policy inserts — is scanned past.
+const PAIRING_BARRIERS = new Set(['tool.call', 'model.answer', 'session.finished', 'session.error'])
+
+function toolNameOf(detail) {
+  const match = /^([a-zA-Z0-9_]+)\s*\(/.exec(String(detail || '').trim())
+  return match ? match[1] : ''
+}
+
+// The agent runs one tool at a time, so the next `tool.result` before a barrier
+// is this call's own. It is NOT necessarily the adjacent entry: in the default
+// approval-gated mode the server emits `approval.required` between the call and
+// its result, and pairing only on adjacency left every gated write showing a
+// permanently 'Running' card beside a second, orphaned result card.
+function findPairedResult(events, callIndex) {
+  const tool = toolNameOf(events[callIndex].detail)
+  for (let index = callIndex + 1; index < events.length; index += 1) {
+    const candidate = events[index]
+    if (candidate.event === 'tool.result') {
+      return !tool || candidate.tool === tool ? index : -1
+    }
+    if (PAIRING_BARRIERS.has(candidate.event)) return -1
+  }
+  return -1
+}
+
 // Pair each tool call with its result, and stamp a key that survives the
 // pairing. Grouping consumes two entries as one, so a raw array index shifts
 // for every later item the moment a result lands — which remounts the rendered
-// <details> cards and silently collapses whatever the user had expanded.
+// <details> cards and silently collapses whatever the user had expanded. The
+// key is the reducer's per-arrival `uid`, not the envelope's `sequence`: the
+// server counts sequences per event stream and every follow-up turn opens a new
+// one, so sequences collide between the turns held in the same feed.
 function groupActivityEvents(events) {
   const grouped = []
+  const paired = new Set()
   for (let index = 0; index < events.length; index += 1) {
+    if (paired.has(index)) continue
     const event = events[index]
-    const next = events[index + 1]
-    const key = event.sequence != null ? `seq-${event.sequence}` : `pos-${index}-${event.event}`
-    if (event.event === 'tool.call' && next?.event === 'tool.result') {
-      grouped.push({ key, event, pairedResult: next })
-      index += 1
-    } else {
-      grouped.push({ key, event, pairedResult: null })
-    }
+    const key = event.uid != null ? `uid-${event.uid}` : `pos-${index}-${event.event}`
+    const resultIndex = event.event === 'tool.call' ? findPairedResult(events, index) : -1
+    if (resultIndex !== -1) paired.add(resultIndex)
+    grouped.push({ key, event, pairedResult: resultIndex === -1 ? null : events[resultIndex] })
   }
   return grouped
 }
@@ -356,6 +390,7 @@ export default function CodeWorkspace({
   setTab,
   requestedThread,
   onHistoryChanged,
+  onRunningChange,
 }) {
   const [workspacePath, setWorkspacePath] = useState(() => window.localStorage.getItem('camelid.codeWorkspacePath') || '')
   const [goal, setGoal] = useState('')
@@ -379,6 +414,17 @@ export default function CodeWorkspace({
   const eventSourceRef = useRef(null)
   const sessionRef = useRef(null)
   const intentionalClosuresRef = useRef(new WeakSet())
+  // Set once a terminal event for the current turn has been delivered, so a
+  // Stop that lands alongside the server's own `aborted` does not append a
+  // second divider for the same ending.
+  const terminalHandledRef = useRef(false)
+  // The rail request is applied ONCE. The effect that applies it re-runs
+  // whenever `session` drops back to null, so re-applying there is what made
+  // the header's New session button restore the thread it had just cleared.
+  const consumedThreadRef = useRef('')
+  // Identifies the create request a Stop can abandon while it is still in
+  // flight — before there is any session id to cancel.
+  const pendingStartRef = useRef(null)
   const threadRef = useRef(null)
   const accessMenuRef = useRef(null)
   const stickToBottomRef = useRef(true)
@@ -406,17 +452,23 @@ export default function CodeWorkspace({
   // render. Streamed deltas re-render this component on every token, and the
   // agent's event channel blocks on the consumer — an unmemoized scan here is
   // backpressure on the model's decode loop, not just UI jank.
-  const historicalTurns = useMemo(() => {
-    const liveUserTurns = state.events.reduce(
-      (count, event) => (event.event === 'turn.user' ? count + 1 : count),
-      0,
-    )
-    return state.turns.slice(0, Math.max(0, state.turns.length - liveUserTurns))
-  }, [state.events, state.turns])
+  // `state.liveTurns` is counted by the reducer rather than recovered from the
+  // event list: the activity buffer is a ring, `turn.user` is the first entry it
+  // evicts, and a Code turn has no step cap to bound how long it runs. Inferring
+  // it leaked a still-live turn into the history list, where its answer rendered
+  // a second time beside the one still in the buffer.
+  const historicalTurns = useMemo(
+    () => state.turns.slice(0, Math.max(0, state.turns.length - (state.liveTurns || 0))),
+    [state.liveTurns, state.turns],
+  )
   const latestTool = state.latestTool
   const latestResult = state.latestResult
   const feedEvents = useMemo(() => groupActivityEvents(state.events), [state.events])
-  const selectedThread = savedThreads.find((thread) => thread.id === selectedThreadId) || requestedThread || null
+  // Gated on `selectedThreadId` so a cleared session stops borrowing the title
+  // of the rail entry App is still holding.
+  const selectedThread = selectedThreadId
+    ? savedThreads.find((thread) => thread.id === selectedThreadId) || requestedThread || null
+    : null
   const title = selectedThread?.title
     || state.turns.find((turn) => turn.user)?.user?.slice(0, 72)
     || 'New coding session'
@@ -511,9 +563,19 @@ export default function CodeWorkspace({
 
   useEffect(() => {
     if (!requestedThread?.id || session) return
+    if (consumedThreadRef.current === requestedThread.id) return
+    consumedThreadRef.current = requestedThread.id
     setWorkspacePath(requestedThread.canonical_root || '')
     setSelectedThreadId(requestedThread.id)
   }, [requestedThread, session])
+
+  // App owns the rail actions that remount this component, and a remount runs
+  // the unmount cleanup below — a real server-side cancel. It has to know a turn
+  // is live so it can ask before ending one.
+  useEffect(() => {
+    onRunningChange?.(running)
+    return () => onRunningChange?.(false)
+  }, [onRunningChange, running])
 
   useEffect(() => {
     if (!selectedThreadId || !workspacePath.trim() || session) return
@@ -556,6 +618,7 @@ export default function CodeWorkspace({
   }
 
   const openEventStream = (created) => {
+    terminalHandledRef.current = false
     const source = new EventSource(workspaceEndpoint(apiBase, `/${encodeURIComponent(created.id)}/events`))
     eventSourceRef.current = source
     source.addEventListener('workspace', (message) => {
@@ -565,6 +628,7 @@ export default function CodeWorkspace({
         dispatch(envelope)
         if (envelope.event === 'tool.result') scheduleChangesRefresh(created.id)
         if (['session.finished', 'session.error'].includes(envelope.event)) {
+          terminalHandledRef.current = true
           if (changesTimerRef.current) {
             window.clearTimeout(changesTimerRef.current)
             changesTimerRef.current = null
@@ -584,10 +648,11 @@ export default function CodeWorkspace({
     source.onerror = () => {
       if (intentionalClosuresRef.current.has(source) || eventSourceRef.current !== source) return
       // The server's /events claim is one-shot: an EventSource that reconnects
-      // after any blip gets a 409, which is fatal to the EventSource. The RUN is
-      // unaffected and keeps going. Declaring session.error here used to both
-      // report a failure that had not happened and orphan a live agent that
-      // nothing was left watching. Fall back to polling for the real outcome.
+      // after any blip gets a 409, which is fatal to the EventSource. Closing it
+      // here keeps that 409 out of the picture, but it does not save the run —
+      // the response carries a cancel-on-drop guard, so losing the stream
+      // cancels the turn server-side. All that is left to do is find out what it
+      // managed to finish first.
       intentionalClosuresRef.current.add(source)
       source.close()
       eventSourceRef.current = null
@@ -595,21 +660,33 @@ export default function CodeWorkspace({
     }
   }
 
+  // The outcome the SERVER recorded for the turn, which is the only account of a
+  // run whose event stream we lost. It is written before the session leaves its
+  // running state, and a Code session id is also its thread id.
+  const readRecordedOutcome = async (created) => {
+    try {
+      const restored = await getWorkspaceThread(apiBase, workspacePath.trim(), created.id)
+      const last = Array.isArray(restored?.turns) ? restored.turns.at(-1) : null
+      return String(last?.terminal_outcome || 'aborted')
+    } catch {
+      return 'aborted'
+    }
+  }
+
   const followDetachedSession = async (created) => {
     dispatch({
       event: 'session.notice',
-      content: 'Live activity view disconnected. The run is still going — following its status instead.',
+      content: 'Lost the live activity stream. Camelid stops a run whose stream drops, so this turn is ending — reading the outcome it recorded.',
     })
     try {
-      const settled = await waitForWorkspaceSessionTerminal(apiBase, created.id, {
+      await waitForWorkspaceSessionTerminal(apiBase, created.id, {
         timeoutMs: DETACHED_FOLLOW_TIMEOUT_MS,
         pollMs: DETACHED_FOLLOW_POLL_MS,
       })
-      dispatch({
-        event: 'session.finished',
-        outcome: settled.state === 'idle' ? 'answered' : settled.state,
-      })
+      terminalHandledRef.current = true
+      dispatch({ event: 'session.finished', outcome: await readRecordedOutcome(created) })
     } catch (error) {
+      terminalHandledRef.current = true
       dispatch({ event: 'session.error', message: error.message })
     }
     refreshChanges(created.id)
@@ -618,6 +695,8 @@ export default function CodeWorkspace({
 
   const start = async () => {
     if (!canStart) return
+    const pending = { abandoned: false }
+    pendingStartRef.current = pending
     dispatch({ event: 'session.starting' })
     setStartedAt(Date.now())
     setClock(Date.now())
@@ -637,6 +716,15 @@ export default function CodeWorkspace({
         approval_mode: approvalMode,
         allow_network: allowNetwork,
       })
+      if (pending.abandoned) {
+        // Stop was pressed while this request was in flight. The session exists
+        // now, so cancel it rather than adopting a run the user has already
+        // walked away from — and never open a stream for it.
+        try { await cancelWorkspaceSession(apiBase, created.id) } catch {}
+        dispatch({ event: 'session.finished', outcome: 'cancelled' })
+        signalHistoryChanged()
+        return
+      }
       setAccessMenuOpen(false)
       setSession(created)
       dispatch({ event: 'turn.user', content: goal.trim() })
@@ -645,6 +733,9 @@ export default function CodeWorkspace({
       signalHistoryChanged()
     } catch (error) {
       dispatch({ event: 'session.error', message: error.message })
+    } finally {
+      if (pendingStartRef.current === pending) pendingStartRef.current = null
+      if (pending.abandoned) setStopPending(false)
     }
   }
 
@@ -665,14 +756,32 @@ export default function CodeWorkspace({
   }
 
   const stop = async () => {
-    if (!session || stopPending) return
+    if (stopPending) return
+    // Stop offered during the starting phase used to be dead: the composer shows
+    // it as soon as `session.starting` is dispatched, but the session id it
+    // needs only exists once the create request comes back. Mark the pending
+    // start abandoned and let `start` cancel the session the server hands over.
+    if (!session) {
+      if (!pendingStartRef.current || pendingStartRef.current.abandoned) return
+      pendingStartRef.current.abandoned = true
+      setStopPending(true)
+      dispatch({ event: 'turn.stopping' })
+      return
+    }
     setStopPending(true)
     dispatch({ event: 'turn.stopping' })
     try {
       await cancelWorkspaceSession(apiBase, session.id)
       await waitForWorkspaceSessionTerminal(apiBase, session.id)
-      dispatch({ event: 'session.finished', outcome: 'cancelled' })
-      signalHistoryChanged()
+      // An open stream still owes this turn the server's own terminal event
+      // (`aborted`), and it refreshes the history when it lands. Dispatching a
+      // second ending here appended a duplicate "Stopped" divider, flipped the
+      // turn outcome and double-fired the history refresh.
+      if (!terminalHandledRef.current && !eventSourceRef.current) {
+        terminalHandledRef.current = true
+        dispatch({ event: 'session.finished', outcome: 'cancelled' })
+        signalHistoryChanged()
+      }
     } catch (error) {
       dispatch({ event: 'turn.stop_failed', message: error.message })
     } finally {
