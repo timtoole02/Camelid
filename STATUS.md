@@ -37,6 +37,38 @@ nineteen component and visual smokes including the new code-workbench harness, a
 zero findings. The 2026-07-26 live-model and Flow Bench receipts predate the merge and were not
 re-run; no claim widens.
 
+macOS pass (2026-07-29): the lane had only ever been built and validated on Windows. Merged to main
+at `2b3eff9c` and validated on an M4 Mac, which surfaced defects the Windows box could not:
+**`run_shell` was advertised but dead here** — Code hardcoded the sandboxed shell, macOS cannot
+enforce it, and the web surface has no `--shell-sandbox` escape, so every call was refused after the
+model (and, in approval-gated mode, the user) had committed to it. The session now resolves the mode
+against what the host can enforce, does not advertise a shell it cannot run, and states the reason in
+the transcript. **Polling a running subagent killed the turn**: the status text was byte-identical
+while a child worked, so the repetition guard — Code's main terminator, since it has no step cap —
+read healthy delegated work as a stall and the turn guard then killed the child. Waiting on a child
+is now exempt and the status carries elapsed time. **Unix teardown reaped only the direct worker**,
+orphaning its shell tree after Stop; workers now run in their own process group, the Unix counterpart
+of the Windows job object. **Subagent writes were invisible to Changes and to undo** (the checkpoint
+log is per process); committed checkpoints are now journaled beside the backups and read back in
+commit order, so a delegated write is as visible and revertible as the server's own. Also: a refused
+resume no longer evicts the completed session it declined to replace (which had severed that
+session's undo and diff), follow-up turns check the artifact digest and not just the model id, and
+undo refuses rather than popping a checkpoint a concurrent turn pushed. Separately, the read-only
+Workspace lane had silently lost its documented 90-second model-step deadline as collateral of the
+Code change while two architecture docs still promised it — restored for read-only only; Code keeps
+its deliberate no-deadline stream. Frontend: approval-gated tool cards now pair with their results
+instead of sticking on "Running", feed keys are unique across turns, a rail click during a live run
+asks before stopping it, the stream-drop notice no longer claims a killed run is still going (or
+reports it as answered), and Stop is honest during session creation. Live verification on this Mac
+against Qwen3-4B-Q8_0: a full-auto Code turn read a file, wrote another, answered, and the Changes
+diff and guarded undo both behaved. Gates: `cargo fmt`/Clippy (`-D warnings`)/doc clean, 1,321 core
+tests plus every integration target across 60 binaries, the frontend production build, all nineteen
+component and visual smokes, `npm audit` at zero, and the scrub/ledger/fit-verdict validators. Four
+visual smokes could not run here at all until their Chrome detection learned the macOS path, and the
+code-workbench harness was never wired into CI — both fixed. No model, quantization, backend,
+context, latency, throughput, or production-support claim widens; macOS Code sessions are a
+read/write coding surface without command execution.
+
 HARDPAN note (2026-07-23): the Windows agent-terminal parity campaign (`qa/hardpan/REPRO.md`) closed with seven findings fixed, one struck, one measured-null — all with before/after receipts on the Windows reference box. Exec surface: `run_shell` now drains stdout/stderr on reader threads (pre-fix, any command emitting more than the 64 KiB per-pipe buffer — e.g. `git log` — was falsely reported as a timeout with its output discarded), assigns a kill-on-close job object so a timeout tears down the whole process tree (the negative control showed the orphan otherwise also wedges teardown for its full lifetime), and resolves `cmd` through System32 (hardening only, no security delta — std already searched System32 before parent-`PATH`). `run_windows_command` now feeds PowerShell a base64-inside-ASCII stdin preamble (a windowless child sits on OEM CP437; non-ASCII round-trips byte-identical both ways where it was mojibake'd) and re-raises `$LASTEXITCODE` (a failing native command followed by a successful statement previously reported exit 0 → Ok to the model). Terminal front ends: a shared RAII teardown guard + chaining panic hook covers both TUIs (a TUI-thread fault can no longer strand the console in raw mode — cmd.exe has no `reset`); a Windows paste path (Ctrl+V clipboard read + a pasted-Enter guard, since terminals inject paste as keystrokes) makes a multi-line paste create exactly one goal instead of firing one goal per interior newline; and AltGr compositions (CONTROL|ALT) now insert instead of being silently swallowed — on a German layout `@ € [ ]` were previously untypeable. Struck at GATE 0 on live evidence: W7 (`/copy`/OSC 52 — honoured by this host's terminals, so the tool told the truth) and W9 downgraded to a measured null (`qa/evidence-bundles/hardpan-windows-terminal-20260723/`). No agent-loop, tool-schema, approval-policy, or parity-lane change; Unix behavior preserved throughout. Decision record: DECISIONS.md D19. Remaining owed: the real-TUI CERT rows of `qa/hardpan/MANUAL_CHECKLIST.md` (merge-ahead authorized 2026-07-23) and the A11/A12 follow-ups in the REPRO.md amendment log.
 
 Web Workspace note (2026-07-22): the loopback WebUI Workspace is an implemented, not-production-promoted read-only preview. Its exact tool surface is `read_file`, `list_dir`, and literal-content `search`; server validation rejects every other tool. The server owns exact-origin authorization, canonical-root confinement, exact `tool_capable` model admission, durable terminal attempts, turn-scoped recovery, a bounded event-claim deadline, prompt fitting, and model-transition exclusion only while a turn is active. The 2026-07-17 Qwen bundle under `qa/evidence-bundles/workspace-qwen3-4b-q4km-20260717T165404Z-head-8c2a2b74/` certifies the superseded write-capable prototype only; its approval screenshots and write scenarios are historical and are not current read-only evidence. Current model-free logic, security, integration, and desktop/mobile visual smokes are CI-gated. The final narrowed exact-Qwen rerun remains blocked by local Code Integrity policy and must not be claimed. No shell, network, GUI, subagent, unattended, neighboring-model, portability, context, latency, or throughput claim moves.

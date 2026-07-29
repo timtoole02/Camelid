@@ -160,7 +160,7 @@ Directory listing retains at most 4,096 observed entries and explicitly says whe
 
 ## Cancellation and Deadlines
 
-Cancellation is turn-scoped rather than process-global. The model client uses one absolute 90-second deadline starting with the first prompt preflight and covering every fitting retry, HTTP header wait, and SSE body stream, with periodic wakeups to observe cancellation.
+Cancellation is turn-scoped rather than process-global. The model client uses one absolute 90-second deadline starting with the first prompt preflight and covering every fitting retry, HTTP header wait, and SSE body stream, with periodic wakeups to observe cancellation. This is the read-only Workspace lane described by this document; the separate Code surface runs the same stream cancellable but without the wall-clock deadline (see `WEB_CODE_MODE.md`).
 
 The agent checks cancellation before work and again after each model step. If cancellation arrives during streaming, partial text is discarded before reporting a final answer or committing a turn. The API also protects cancellation state from stale worker completion and event-claim races.
 
