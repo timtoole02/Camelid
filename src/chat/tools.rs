@@ -1867,13 +1867,13 @@ fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
     // the shell-sandbox layer (Task 1), which fails closed when the configured
     // mode can't be enforced on this host.
     #[cfg(unix)]
-    let mut builder = {
-        let mut c = Command::new("/bin/sh");
-        c.arg("-c").arg(command);
-        c
-    };
+    let shell_argv: Vec<std::ffi::OsString> = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        std::ffi::OsString::from(command),
+    ];
     #[cfg(windows)]
-    let mut builder = {
+    let shell_argv: Vec<std::ffi::OsString> = {
         // Absolute interpreter path (W4), matching run_windows_command's
         // system32() discipline. Defense-in-depth only: std's process search
         // already consults System32 *before* the parent PATH and never the
@@ -1891,21 +1891,26 @@ fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
         // mismatch is not exploitable — std only emits `\` immediately before a
         // `"`, which is an illegal Windows filename character, so a mangled path
         // errors out rather than escaping the cwd pin (verified Phase 0, W4).
-        let mut c = Command::new(system32("cmd.exe"));
-        c.arg("/C").arg(command);
-        c
+        vec![
+            system32("cmd.exe").into(),
+            "/C".into(),
+            std::ffi::OsString::from(command),
+        ]
     };
+    // Build the confined command. A sandboxed mode that can't be enforced here
+    // returns an error → refuse to run, never a silent unconfined fallback. The
+    // confinement and the report of it come from this one call, so the layers
+    // shown to the user cannot describe something that was not applied.
+    let argv: Vec<&std::ffi::OsStr> = shell_argv.iter().map(|a| a.as_os_str()).collect();
+    let mut builder =
+        match shell_sandbox::confined_command(&argv, &sandbox.root, sandbox.shell_mode) {
+            Ok((builder, _enforced)) => builder,
+            Err(e) => return ToolOutcome::Err(format!("run_shell refused: {e}")),
+        };
     builder
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // Apply confinement. A sandboxed mode that can't be enforced here returns an
-    // error → refuse to run, never a silent unconfined fallback.
-    if let Err(e) =
-        shell_sandbox::configure_command(&mut builder, &sandbox.root, sandbox.shell_mode)
-    {
-        return ToolOutcome::Err(format!("run_shell refused: {e}"));
-    }
     let mut child = match builder.spawn() {
         Ok(c) => c,
         Err(e) => return ToolOutcome::Err(format!("spawn failed: {e}")),
@@ -3419,13 +3424,41 @@ mod tests {
         assert!(matches!(out, ToolOutcome::Ok(ref s) if s.contains("hi")));
     }
 
-    // On other unenforceable hosts (macOS, unsupported arch), the default mode is
-    // not kernel-enforceable, so run_shell must refuse rather than run unconfined.
+    // On macOS the default mode IS enforceable (sandbox-exec), so run_shell runs
+    // — confined. Proving the confinement is the job of the enforcement tests in
+    // shell_sandbox; here we prove the tool is reachable and its writes land.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandboxed_run_shell_runs_confined_on_macos() {
+        use super::ShellSandbox;
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path()); // default = Sandboxed
+        assert_eq!(sb.shell_mode(), ShellSandbox::Sandboxed);
+        let action = validate(
+            &call("run_shell", json!({"command":"echo shell-works > out.txt"})),
+            &sb,
+        )
+        .unwrap();
+        let out = action.execute(&sb);
+        assert!(
+            !out.is_err(),
+            "run_shell must work on macOS: {}",
+            out.text()
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("out.txt")).unwrap(),
+            "shell-works\n"
+        );
+    }
+
+    // On any other unenforceable host (unsupported arch), the default mode is not
+    // kernel-enforceable, so run_shell must refuse rather than run unconfined.
     #[cfg(not(any(
         all(
             target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64")
         ),
+        target_os = "macos",
         windows
     )))]
     #[test]
