@@ -7,8 +7,9 @@ import { ClusterDrawer } from '../components/cluster/ClusterDrawer'
 import { AddServerWizard } from '../components/cluster/AddServerWizard'
 import { DiscoverDevices } from '../components/cluster/DiscoverDevices'
 import { Button } from '../components/ui/Button'
+import { ConfirmDialog } from '../components/ui/ConfirmDialog'
 import {
-  IconPlus, IconNetwork, IconCheckCircle, IconCheck, IconDownload, IconGrid, IconChart,
+  IconPlus, IconNetwork, IconCheckCircle, IconCheck, IconDownload, IconGrid, IconChart, IconTrash,
 } from '../components/ui/icons'
 
 export default function ClusterView({ showNotice }) {
@@ -17,6 +18,7 @@ export default function ClusterView({ showNotice }) {
   const [wizardOpen, setWizardOpen] = useState(false)
   const [discoverOpen, setDiscoverOpen] = useState(false)
   const [drawerOpen, setDrawerOpen] = useState(false)
+  const [clearOpen, setClearOpen] = useState(false)
 
   const resetLayout = () => { cluster.applyAutoLayout(); window.setTimeout(() => canvasRef.current?.fit(), 60) }
 
@@ -50,6 +52,9 @@ export default function ClusterView({ showNotice }) {
             <Button variant="ghost" size="sm" icon={<IconDownload size={15} />} onClick={cluster.exportTopology}>Export Diagram</Button>
             <Button variant="ghost" size="sm" icon={<IconGrid size={15} />} onClick={resetLayout}>Reset Layout</Button>
             <Button variant="ghost" size="sm" icon={<IconChart size={15} />} onClick={() => setDrawerOpen(true)}>View Logs</Button>
+            {cluster.nodes.length > 0 && (
+              <Button variant="ghost" size="sm" icon={<IconTrash size={15} />} onClick={() => setClearOpen(true)}>Clear Cluster</Button>
+            )}
           </div>
         </div>
       </header>
@@ -96,6 +101,15 @@ export default function ClusterView({ showNotice }) {
 
       <AddServerWizard open={wizardOpen} onClose={() => setWizardOpen(false)} onAdd={(node) => { cluster.addNode(node); setWizardOpen(false) }} />
       <DiscoverDevices open={discoverOpen} onClose={() => setDiscoverOpen(false)} onDiscover={cluster.discover} onAdd={(partial) => cluster.addNode(partial)} />
+
+      <ConfirmDialog
+        open={clearOpen}
+        title="Clear the cluster topology?"
+        detail={`This removes all ${cluster.nodes.length} node${cluster.nodes.length === 1 ? '' : 's'} and ${cluster.connections.length} link${cluster.connections.length === 1 ? '' : 's'} from this diagram, including the sample fabric. It only clears what is drawn here — no machine is touched and nothing is uninstalled. Export the diagram first if you want a copy.`}
+        confirmLabel="Clear topology"
+        onCancel={() => setClearOpen(false)}
+        onConfirm={() => { cluster.resetTopology(); setClearOpen(false); showNotice?.('Cluster topology cleared.', 'info') }}
+      />
     </div>
   )
 }

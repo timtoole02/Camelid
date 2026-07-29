@@ -1642,6 +1642,11 @@ async fn main() -> anyhow::Result<()> {
     // Both before ANY CUDA probe: the hook must be in place before cudarc's lazy
     // loaders can panic, or the first (caught, handled) miss still prints.
     quiet_cudarc_loader_panics();
+    // Installed AFTER the cudarc filter so this is the OUTER hook: every panic is
+    // recorded to disk first, then the filter decides what reaches the console.
+    // A packaged install that panics used to leave nothing behind anywhere — the
+    // console window was the only sink. See src/diagnostics.rs.
+    camelid::diagnostics::install_panic_hook();
     // Make the GPU runtime discoverable before anything probes for a device, so
     // the shipped app needs no PATH setup (no-op off Windows / without CUDA).
     ensure_cuda_runtime_on_path();
@@ -1744,7 +1749,17 @@ async fn main() -> anyhow::Result<()> {
             let model = model.or_else(|| auto_select_model(models_dir.as_deref()));
             // Open the browser only when run interactively and not opted out.
             let open_ui = !no_open && std::io::IsTerminal::is_terminal(&std::io::stdout());
-            api::serve(
+            // Journal the run. A `session_start` with no matching `session_exit`
+            // means the process did not leave through the failure path. That
+            // includes an ordinary Ctrl-C as well as an external kill — `serve`
+            // installs no signal handler — so read it as "did not fail on the
+            // way out", never as proof of a kill. See src/diagnostics.rs.
+            camelid::diagnostics::record_session_start(VERSION, &addr.to_string());
+            eprintln!(
+                "  Diagnostics log: {}",
+                camelid::diagnostics::log_path().display()
+            );
+            let served = api::serve(
                 addr,
                 threads,
                 model,
@@ -1753,7 +1768,14 @@ async fn main() -> anyhow::Result<()> {
                 models_dir,
                 server.into_serve_options(),
             )
-            .await?
+            .await;
+            match &served {
+                Ok(()) => camelid::diagnostics::record_session_exit("ok", None),
+                Err(err) => {
+                    camelid::diagnostics::record_session_exit("error", Some(&err.to_string()));
+                }
+            }
+            served?
         }
         Command::Chat {
             model,

@@ -156,6 +156,31 @@ Prefer the terminal? Run `camelid chat` instead for a full-screen chat UI over t
 > deployments should use an API client or an authenticating reverse proxy. Anonymous loopback keeps
 > the existing frictionless UI behavior.
 
+### If the engine stops unexpectedly
+
+`camelid serve` keeps a small journal of process lifecycle events, so a crash is still explainable
+after the console window is gone. The path is printed at startup:
+
+| Platform | Path |
+|---|---|
+| Windows | `%LOCALAPPDATA%\Camelid\logs\camelid.log` |
+| macOS / Linux | `$XDG_STATE_HOME/Camelid/logs/camelid.log` (default `~/.local/state/Camelid/logs/camelid.log`) |
+
+One JSON object per line. A `panic` record says what failed, on which thread and where; set
+`RUST_BACKTRACE=1` beforehand to get a backtrace with it. Records marked `"expected": true` are the
+routine "no CUDA runtime here, using the CPU" probe and are safe to ignore — a panic record does not
+by itself mean the engine died, because some panics are caught and handled. A `session_exit` record
+means the run ended by failing on the way up or out, and carries the reason.
+
+A `session_start` with **no** matching `session_exit` means the process did not leave through that
+path. Read that as "it did not fail on the way out" rather than as proof of a kill: `camelid serve`
+installs no signal handler, so an ordinary Ctrl-C ends the process exactly as abruptly as an
+out-of-memory kill and neither is recorded.
+
+The journal holds process facts only. Prompts and generated text never enter it, it is size-capped
+with a single retained predecessor, and nothing is ever uploaded anywhere — it is a file on your
+disk that you choose to share.
+
 ## Supported models
 
 > [!IMPORTANT]

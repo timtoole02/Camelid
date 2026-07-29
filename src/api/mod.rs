@@ -110,10 +110,11 @@ pub struct AppState {
     /// (`CAMELID_GEMMA4_SERVE`) and a gemma4 model is loaded. This is an
     /// additive, parallel path: the Llama/3B backend is untouched.
     gemma4_runtimes: Arc<RwLock<HashMap<String, Arc<Gemma4ServeRuntime>>>>,
-    /// Runnable-lane serve runtimes (qwen35/Ornith), keyed by model id. Populated
-    /// only when `CAMELID_RUNNABLE_SERVE` is set and a runnable-served arch is
-    /// loaded. Additive, parallel to the optimized engine â€” see the runnable serve
-    /// bridge near `runnable_chat_nonstreaming`.
+    /// Runnable-lane serve runtimes (qwen35/Ornith, gemma3), keyed by model id.
+    /// Populated when a runnable-served arch is loaded (lane on by default;
+    /// opt out with `CAMELID_RUNNABLE_SERVE=0`). Additive, parallel to the
+    /// optimized engine â€” see the runnable serve bridge near
+    /// `runnable_chat_nonstreaming`.
     runnable_runtimes: Arc<RwLock<HashMap<String, Arc<RunnableServeRuntime>>>>,
     /// DiffusionGemma serve runtimes, keyed by model id. Populated only when
     /// `CAMELID_DG_SERVE` is set and a diffusion-gemma model is loaded. Additive,
@@ -3927,7 +3928,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 parity_audited: "cuda_5_prompt_pass_cross_backend_tolerance_attributed_near_ties_vs_llamacpp_acd79d6",
                 performance_measured: "cuda_device_decode_loop_18_8_toks_median_measured",
                 frontend_load_path_verified: "not_promoted",
-                frontend_readiness_gate: "green only when this exact qwen35 Q4_K_M row (ornith-1.0-9b-Q4_K_M.gguf, sha256 2711bf1e...) is loaded_now=true, generation_ready=true, matching active_model_id, served with CAMELID_RUNNABLE_SERVE=1 and CAMELID_QWEN35_CUDA=1",
+                frontend_readiness_gate: "green only when this exact qwen35 Q4_K_M row (ornith-1.0-9b-Q4_K_M.gguf, sha256 2711bf1e...) is loaded_now=true, generation_ready=true, matching active_model_id, served with the runnable serve lane enabled (on by default; opt-out CAMELID_RUNNABLE_SERVE=0) and CAMELID_QWEN35_CUDA=1",
                 tested_context: "short_serve_smoke_plus_agent_eval_read_list_write",
                 chat_template_renderer: "ornith-chatml-native",
                 chat_template_shape_pack: "not_promoted",
@@ -3969,7 +3970,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 parity_audited: "gpu_greedy_matches_certified_cpu_oracle_solo_at_16k_maxpos",
                 performance_measured: "cuda_device_decode_loop_15_4_toks_median_measured",
                 frontend_load_path_verified: "not_promoted",
-                frontend_readiness_gate: "green only when this exact qwen35 Q3_K_M row (ornith-1.0-9b-Q3_K_M.gguf, sha256 16f54df5...) is loaded_now=true, generation_ready=true, matching active_model_id, served with CAMELID_RUNNABLE_SERVE=1 and CAMELID_QWEN35_CUDA=1",
+                frontend_readiness_gate: "green only when this exact qwen35 Q3_K_M row (ornith-1.0-9b-Q3_K_M.gguf, sha256 16f54df5...) is loaded_now=true, generation_ready=true, matching active_model_id, served with the runnable serve lane enabled (on by default; opt-out CAMELID_RUNNABLE_SERVE=0) and CAMELID_QWEN35_CUDA=1",
                 tested_context: "single_session_16k_maxpos_residency_smoke",
                 chat_template_renderer: "ornith-chatml-native",
                 chat_template_shape_pack: "not_promoted",
@@ -4017,7 +4018,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 parity_audited: "greedy_token_identical_4_prompt_vs_llamacpp_acd79d6",
                 performance_measured: "avx2_q8_dot_plus_batched_prefill_measured",
                 frontend_load_path_verified: "not_promoted",
-                frontend_readiness_gate: "green only when this exact qwen35 Q8_0 row is loaded_now=true, generation_ready=true, matching active_model_id, served with CAMELID_RUNNABLE_SERVE=1",
+                frontend_readiness_gate: "green only when this exact qwen35 Q8_0 row is loaded_now=true, generation_ready=true, matching active_model_id, served with the runnable serve lane enabled (on by default; opt-out CAMELID_RUNNABLE_SERVE=0)",
                 tested_context: "short_serve_smoke_plus_agent_eval_read_list_write",
                 chat_template_renderer: "ornith-chatml-native",
                 chat_template_shape_pack: "not_promoted",
@@ -4066,7 +4067,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 parity_audited: "gemma3_marker_chat_token_and_text_parity_1_5_50_four_of_five_prompts_all_depths_fifth_identical_at_1_5_single_flip_at_50_index_16_gap_stated_vs_llamacpp_acd79d6",
                 performance_measured: "observed_about_5_s_per_token_cpu_runnable_recorded_not_a_perf_claim",
                 frontend_load_path_verified: "not_promoted",
-                frontend_readiness_gate: "green only when this exact gemma3 Q8_0 row (gemma-3-1b-it-Q8_0.gguf, sha256 b205840c...) is loaded_now=true, generation_ready=true, matching active_model_id, served with CAMELID_RUNNABLE_SERVE=1",
+                frontend_readiness_gate: "green only when this exact gemma3 Q8_0 row (gemma-3-1b-it-Q8_0.gguf, sha256 b205840c...) is loaded_now=true, generation_ready=true, matching active_model_id, served with the runnable serve lane enabled (on by default; opt-out CAMELID_RUNNABLE_SERVE=0)",
                 tested_context: "gemma3_marker_chat_1_5_50_smoke_total_sequence_well_under_the_512_token_sliding_window",
                 chat_template_renderer: "gemma3_marker_native_byte_locked_by_shapes_pack",
                 chat_template_shape_pack: "validated_in_src_pack_lock_test",
@@ -6294,6 +6295,26 @@ mod gemma4_template_tests {
     }
 
     #[test]
+    fn runnable_serve_lane_defaults_on_with_explicit_opt_out() {
+        // The runnable serve lane must work out of the box: supported rows like
+        // gemma-3-1b-it Q8_0 (MUSTER M-A1) have no other serve path, and the
+        // desktop sets no env vars. Unset — and every non-disable value — is ON.
+        assert!(runnable_serve_flag(None));
+        assert!(runnable_serve_flag(Some("1")));
+        assert!(runnable_serve_flag(Some("true")));
+        assert!(runnable_serve_flag(Some("yes")));
+        assert!(runnable_serve_flag(Some("")));
+        // Explicit opt-out restores the metadata-only load (typed 503 on chat).
+        assert!(!runnable_serve_flag(Some("0")));
+        assert!(!runnable_serve_flag(Some("off")));
+        assert!(!runnable_serve_flag(Some("false")));
+        assert!(!runnable_serve_flag(Some("no")));
+        assert!(!runnable_serve_flag(Some("disabled")));
+        assert!(!runnable_serve_flag(Some(" 0 ")));
+        assert!(!runnable_serve_flag(Some("OFF")));
+    }
+
+    #[test]
     fn phi3_chat_template_pack_locks_renderer() {
         #[derive(serde::Deserialize)]
         struct Shape {
@@ -7040,7 +7061,7 @@ fn gemma4_telemetry_error(message: String) -> telemetry::RequestFinish {
 }
 
 // ===================================================================================
-// Runnable-lane serve bridge (additive, gated by CAMELID_RUNNABLE_SERVE).
+// Runnable-lane serve bridge (additive, on by default; opt-out CAMELID_RUNNABLE_SERVE=0).
 //
 // Architectures implemented only in the runnable (pure-f32 oracle) lane â€” currently
 // `qwen35` (Ornith) â€” are not in the optimized inference engine, so the Llama serve
@@ -7056,21 +7077,38 @@ fn gemma4_telemetry_error(message: String) -> telemetry::RequestFinish {
 /// was trained on). Rendering anything else makes the model emit the wrong format.
 const ORNITH_TOOL_INSTRUCTIONS: &str = "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>";
 
-/// The runnable serve lane is gated behind `CAMELID_RUNNABLE_SERVE` (1/true/yes).
-/// When off, a qwen35 model load is metadata-only (no serve runtime) exactly as today.
+/// The runnable serve lane is ON by default: the archs in [`is_runnable_serve_arch`]
+/// have no other correct serve path, so a supported row (e.g. the promoted
+/// gemma-3-1b-it Q8_0, MUSTER M-A1) must chat out of the box instead of demanding
+/// an env var the desktop never sets. Opt out with `CAMELID_RUNNABLE_SERVE=0`
+/// (0/off/false/no/disabled), which restores the old metadata-only load; any other
+/// value — including unset — enables the lane. Mirrors the GPU-runnable-tier
+/// opt-out precedent (`CAMELID_GPU_RUNNABLE_TIER=0`).
 fn runnable_serve_enabled() -> bool {
-    matches!(
-        std::env::var("CAMELID_RUNNABLE_SERVE").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
-    )
+    runnable_serve_flag(std::env::var("CAMELID_RUNNABLE_SERVE").ok().as_deref())
+}
+
+/// Pure decision half of [`runnable_serve_enabled`] so the default-on/opt-out
+/// contract is unit-testable without touching process env.
+fn runnable_serve_flag(value: Option<&str>) -> bool {
+    !value
+        .map(|v| {
+            let v = v.trim();
+            v.eq_ignore_ascii_case("0")
+                || v.eq_ignore_ascii_case("off")
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("no")
+                || v.eq_ignore_ascii_case("disabled")
+        })
+        .unwrap_or(false)
 }
 
 /// True for architectures served through the runnable bridge (qwen35, and — since
 /// MUSTER M-A1 — gemma3, whose only correct forward lives in the runnable lane; the
 /// optimized dense binder silently drops gemma3's QK/post norms and has no GeGLU).
-/// Deliberate side effect of listing an arch here: WITHOUT `CAMELID_RUNNABLE_SERVE=1`
-/// its chat requests get a typed 503 instead of falling through to the mis-bound
-/// optimized engine — fail-closed by design.
+/// Deliberate side effect of listing an arch here: when the lane is opted out
+/// (`CAMELID_RUNNABLE_SERVE=0`) its chat requests get a typed 503 instead of
+/// falling through to the mis-bound optimized engine — fail-closed by design.
 fn is_runnable_serve_arch(arch: &str) -> bool {
     matches!(arch, "qwen35" | "gemma2" | "gemma3")
 }
@@ -7370,7 +7408,8 @@ async fn resolve_runnable_runtime(
             "model_not_ready",
             format!(
                 "model '{id}' (runnable-lane architecture) is loaded but its serve runtime \
-                 is unavailable; set CAMELID_RUNNABLE_SERVE=1 and reload the model"
+                 is unavailable; the runnable serve lane is on by default — if \
+                 CAMELID_RUNNABLE_SERVE=0 is set, unset it, then reload the model"
             ),
             None,
         ));
@@ -7545,7 +7584,15 @@ async fn runnable_chat_nonstreaming(
             "completion_tokens": ids.len(),
             "total_tokens": prompt_token_count + ids.len(),
         },
-        "camelid": { "generated_token_ids": ids, "lane": "runnable_qwen35" },
+        // Lane is the neutral "runnable" (the bridge serves qwen35, gemma2, and
+        // gemma3); the actual model architecture is disclosed separately so the
+        // label never misreports one arch as another (matches the parity-artifact
+        // shape in tests/runnable_parity.rs).
+        "camelid": {
+            "generated_token_ids": ids,
+            "lane": "runnable",
+            "architecture": runtime.architecture.as_str(),
+        },
     });
     (StatusCode::OK, Json(body)).into_response()
 }
@@ -8432,8 +8479,8 @@ async fn load_model_from_path_with_activation(
         load_gemma4_serve_runtime(state, &id, &loaded.path).await?;
     }
 
-    // Runnable serve path (additive, gated by CAMELID_RUNNABLE_SERVE): load a
-    // runnable-lane runtime (qwen35/Ornith) so /v1/chat can route to it.
+    // Runnable serve path (additive, on by default; opt-out CAMELID_RUNNABLE_SERVE=0):
+    // load a runnable-lane runtime (qwen35/Ornith, gemma3) so /v1/chat can route to it.
     if runnable_serve_enabled()
         && is_runnable_serve_arch(loaded.gguf.architecture().unwrap_or_default())
     {
@@ -10044,9 +10091,9 @@ async fn chat_completions(
         Ok(None) => {}
         Err(resp) => return resp,
     }
-    // Runnable serve path (additive, gated by CAMELID_RUNNABLE_SERVE): short-circuits
-    // a qwen35/Ornith model to the runnable lane. Streaming mirrors the OpenAI
-    // chunk shape with think tokens as `reasoning_content` deltas.
+    // Runnable serve path (additive, on by default; opt-out CAMELID_RUNNABLE_SERVE=0):
+    // short-circuits a qwen35/Ornith or gemma3 model to the runnable lane. Streaming
+    // mirrors the OpenAI chunk shape with think tokens as `reasoning_content` deltas.
     match resolve_runnable_runtime(&state, &req.model).await {
         Ok(Some((id, runtime))) => {
             if constraint.is_some() {

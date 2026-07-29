@@ -10,6 +10,7 @@ pub mod cuda_parity;
 #[cfg(feature = "cuda")]
 pub mod cuda_resident;
 pub mod cuda_vram;
+pub mod diagnostics;
 pub mod diffusion_gemma;
 pub mod distributed;
 pub mod embedding;

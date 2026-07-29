@@ -1,7 +1,7 @@
 {
   "ledger_version": "camelid.ledger/v1",
   "provenance": {
-    "source_head": "f4d1f42e",
+    "source_head": "e2d85ce3",
     "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
   },
   "capabilities": {
@@ -310,7 +310,7 @@
         "parity_audited": "cuda_5_prompt_pass_cross_backend_tolerance_attributed_near_ties_vs_llamacpp_acd79d6",
         "performance_measured": "cuda_device_decode_loop_18_8_toks_median_measured",
         "frontend_load_path_verified": "not_promoted",
-        "frontend_readiness_gate": "green only when this exact qwen35 Q4_K_M row (ornith-1.0-9b-Q4_K_M.gguf, sha256 2711bf1e...) is loaded_now=true, generation_ready=true, matching active_model_id, served with CAMELID_RUNNABLE_SERVE=1 and CAMELID_QWEN35_CUDA=1",
+        "frontend_readiness_gate": "green only when this exact qwen35 Q4_K_M row (ornith-1.0-9b-Q4_K_M.gguf, sha256 2711bf1e...) is loaded_now=true, generation_ready=true, matching active_model_id, served with the runnable serve lane enabled (on by default; opt-out CAMELID_RUNNABLE_SERVE=0) and CAMELID_QWEN35_CUDA=1",
         "tested_context": "short_serve_smoke_plus_agent_eval_read_list_write",
         "chat_template_renderer": "ornith-chatml-native",
         "chat_template_shape_pack": "not_promoted",
@@ -360,7 +360,7 @@
         "parity_audited": "gpu_greedy_matches_certified_cpu_oracle_solo_at_16k_maxpos",
         "performance_measured": "cuda_device_decode_loop_15_4_toks_median_measured",
         "frontend_load_path_verified": "not_promoted",
-        "frontend_readiness_gate": "green only when this exact qwen35 Q3_K_M row (ornith-1.0-9b-Q3_K_M.gguf, sha256 16f54df5...) is loaded_now=true, generation_ready=true, matching active_model_id, served with CAMELID_RUNNABLE_SERVE=1 and CAMELID_QWEN35_CUDA=1",
+        "frontend_readiness_gate": "green only when this exact qwen35 Q3_K_M row (ornith-1.0-9b-Q3_K_M.gguf, sha256 16f54df5...) is loaded_now=true, generation_ready=true, matching active_model_id, served with the runnable serve lane enabled (on by default; opt-out CAMELID_RUNNABLE_SERVE=0) and CAMELID_QWEN35_CUDA=1",
         "tested_context": "single_session_16k_maxpos_residency_smoke",
         "chat_template_renderer": "ornith-chatml-native",
         "chat_template_shape_pack": "not_promoted",
@@ -409,7 +409,7 @@
         "parity_audited": "greedy_token_identical_4_prompt_vs_llamacpp_acd79d6",
         "performance_measured": "avx2_q8_dot_plus_batched_prefill_measured",
         "frontend_load_path_verified": "not_promoted",
-        "frontend_readiness_gate": "green only when this exact qwen35 Q8_0 row is loaded_now=true, generation_ready=true, matching active_model_id, served with CAMELID_RUNNABLE_SERVE=1",
+        "frontend_readiness_gate": "green only when this exact qwen35 Q8_0 row is loaded_now=true, generation_ready=true, matching active_model_id, served with the runnable serve lane enabled (on by default; opt-out CAMELID_RUNNABLE_SERVE=0)",
         "tested_context": "short_serve_smoke_plus_agent_eval_read_list_write",
         "chat_template_renderer": "ornith-chatml-native",
         "chat_template_shape_pack": "not_promoted",
@@ -460,7 +460,7 @@
         "parity_audited": "gemma3_marker_chat_token_and_text_parity_1_5_50_four_of_five_prompts_all_depths_fifth_identical_at_1_5_single_flip_at_50_index_16_gap_stated_vs_llamacpp_acd79d6",
         "performance_measured": "observed_about_5_s_per_token_cpu_runnable_recorded_not_a_perf_claim",
         "frontend_load_path_verified": "not_promoted",
-        "frontend_readiness_gate": "green only when this exact gemma3 Q8_0 row (gemma-3-1b-it-Q8_0.gguf, sha256 b205840c...) is loaded_now=true, generation_ready=true, matching active_model_id, served with CAMELID_RUNNABLE_SERVE=1",
+        "frontend_readiness_gate": "green only when this exact gemma3 Q8_0 row (gemma-3-1b-it-Q8_0.gguf, sha256 b205840c...) is loaded_now=true, generation_ready=true, matching active_model_id, served with the runnable serve lane enabled (on by default; opt-out CAMELID_RUNNABLE_SERVE=0)",
         "tested_context": "gemma3_marker_chat_1_5_50_smoke_total_sequence_well_under_the_512_token_sliding_window",
         "chat_template_renderer": "gemma3_marker_native_byte_locked_by_shapes_pack",
         "chat_template_shape_pack": "validated_in_src_pack_lock_test",
