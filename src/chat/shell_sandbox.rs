@@ -929,14 +929,33 @@ mod tests {
         #[test]
         fn credential_stores_are_not_readable() {
             let dir = tempfile::tempdir().unwrap();
-            // Probe with a path that need not exist: a denied read reports
-            // "Operation not permitted", a merely-absent one reports "No such
-            // file". Only the former proves the deny rule is live.
-            let (_, out) = run_confined(dir.path(), "cat \"$HOME/.ssh/id_rsa\" 2>&1");
+
+            // The rule must be generated, whatever this host happens to have on
+            // disk. Assert that first: it is the part that cannot be
+            // environment-dependent.
+            let plan = super::super::macos::Plan::build(dir.path()).unwrap();
+            let home = std::env::var("HOME").expect("HOME is set");
+            let ssh = format!("{home}/.ssh");
             assert!(
-                out.contains("Operation not permitted"),
-                "the ~/.ssh deny rule must be in force (got: {out})"
+                plan.params.iter().any(|(_, value)| *value == *ssh.as_str()),
+                "~/.ssh must be among the denied paths: {:?}",
+                plan.params
             );
+            assert!(plan.enforced.layers.contains(&"credential-deny"));
+
+            // Then the live check, which only means something where the path
+            // exists: the kernel reports EPERM for a denied read, but a path that
+            // is simply absent reports ENOENT and would prove nothing. CI runners
+            // have no ~/.ssh, so this half is conditional by necessity — either
+            // way the read must not succeed.
+            let (ok, out) = run_confined(dir.path(), "cat \"$HOME/.ssh/id_rsa\" 2>&1");
+            assert!(!ok, "reading a credential store must never succeed: {out}");
+            if std::path::Path::new(&ssh).is_dir() {
+                assert!(
+                    out.contains("Operation not permitted"),
+                    "the ~/.ssh deny rule must be in force (got: {out})"
+                );
+            }
         }
 
         #[test]
@@ -1044,16 +1063,19 @@ mod tests {
         // is what we are asserting. Use a C one-liner via `sh -c`+`perl`? Keep it
         // dependency-free: use `python3` if present, else skip the assertion body.
         let dir = std::env::temp_dir();
-        let mut builder = Command::new("/bin/sh");
+        // Exit 0 only if creating an AF_INET raw socket is refused.
+        let probe = "python3 - <<'PY'\nimport socket,sys\ntry:\n s=socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)\n sys.exit(1)\nexcept OSError:\n sys.exit(0)\nPY";
+        let owned: Vec<std::ffi::OsString> = ["/bin/sh", "-c", probe]
+            .iter()
+            .map(std::ffi::OsString::from)
+            .collect();
+        let borrowed: Vec<&std::ffi::OsStr> = owned.iter().map(|a| a.as_os_str()).collect();
+        let (mut builder, enforced) = confined_command(&borrowed, &dir, ShellSandbox::Sandboxed)
+            .expect("seccomp must be available on the Linux CI host");
         builder
-            .arg("-c")
-            // Exit 0 only if creating an AF_INET raw socket is refused.
-            .arg("python3 - <<'PY'\nimport socket,sys\ntry:\n s=socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)\n sys.exit(1)\nexcept OSError:\n sys.exit(0)\nPY")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let enforced = configure_command(&mut builder, &dir, ShellSandbox::Sandboxed)
-            .expect("seccomp must be available on the Linux CI host");
         assert!(enforced.layers.contains(&"seccomp"));
         let status = builder.status().expect("spawn sandboxed shell");
         // 0 = socket() was refused (blocked); anything else means it succeeded or
