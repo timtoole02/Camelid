@@ -15,21 +15,27 @@ import {
   workspaceEndpoint,
 } from '../lib/workspaceAgent'
 import { Button } from '../components/ui/Button'
-import { Modal } from '../components/ui/Modal'
+import { ConfirmDialog } from '../components/ui/ConfirmDialog'
 import { AssistantMarkdown } from '../lib/markdown'
 import { FolderPicker } from './WorkspaceView'
 import {
-  IconBolt, IconCheckCircle, IconClose, IconEdit, IconError, IconPlay, IconSearch,
-  IconSend, IconStop, IconWarning,
+  IconBolt, IconCheckCircle, IconChevronDown, IconChevronRight, IconClose, IconEdit,
+  IconError, IconHistory, IconNetwork, IconPlay, IconRefresh, IconSearch, IconSend, IconSidebar,
+  IconStop, IconWarning,
 } from '../components/ui/icons'
 
-const RUNNING_PHASES = new Set(['starting', 'running', 'awaiting_approval', 'cancelling', 'cancel_error'])
+// `cancel_error` is deliberately NOT here. It means a Stop could not be
+// CONFIRMED, which is a warning, not a running turn — treating it as running
+// left the composer dead and the only control a Stop button that had already
+// failed, so the conversation could never be resumed.
+const RUNNING_PHASES = new Set(['starting', 'running', 'awaiting_approval', 'cancelling'])
 const PHASE_LABEL = {
   idle: 'Ready',
   starting: 'Starting',
   running: 'Working',
   awaiting_approval: 'Approval needed',
   cancelling: 'Stopping',
+  cancel_error: 'Stop unconfirmed',
   finished: 'Complete',
   aborted: 'Stopped',
   cancelled: 'Stopped',
@@ -39,34 +45,307 @@ const PHASE_LABEL = {
   error: 'Error',
 }
 
+/// How far from the bottom still counts as "following the stream".
+const SCROLL_STICK_SLACK_PX = 96
+/// Tool results can land in bursts; coalesce the /changes refetch they trigger.
+const CHANGES_REFRESH_DEBOUNCE_MS = 400
+/// How long to keep following a run whose live event stream dropped. Generous:
+/// a local coding turn on a small GPU can legitimately run for many minutes.
+const DETACHED_FOLLOW_TIMEOUT_MS = 30 * 60 * 1000
+const DETACHED_FOLLOW_POLL_MS = 1500
+/// Tail of the in-flight model output kept on screen while a step streams.
+const LIVE_TAIL_CHARS = 2000
+
+const EMPTY_CHANGES = Object.freeze({
+  summary: 'No checkpoints this session',
+  diff: 'No changes this session',
+  files: [],
+})
+
 function initialCodeState() {
   return { ...WORKSPACE_IDLE_STATE, events: [], turns: [], approval: null }
 }
 
-function ActivityEvent({ event }) {
+function formatToolName(tool) {
+  return String(tool || 'tool')
+    .replaceAll('_', ' ')
+    .replace(/\b\w/g, (letter) => letter.toUpperCase())
+}
+
+function toolCallLabel(detail) {
+  const value = String(detail || '').trim()
+  const match = /^([a-zA-Z0-9_]+)\s*\(/.exec(value)
+  return match ? formatToolName(match[1]) : 'Agent action'
+}
+
+function formatElapsed(milliseconds) {
+  const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000))
+  if (totalSeconds < 60) return `${totalSeconds}s`
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  if (minutes < 60) return `${minutes}m ${seconds}s`
+  const hours = Math.floor(minutes / 60)
+  return `${hours}h ${minutes % 60}m`
+}
+
+function compactPath(path) {
+  const value = String(path || '')
+  if (value.length <= 54) return value
+  return `…${value.slice(-51)}`
+}
+
+// Pair each tool call with its result, and stamp a key that survives the
+// pairing. Grouping consumes two entries as one, so a raw array index shifts
+// for every later item the moment a result lands — which remounts the rendered
+// <details> cards and silently collapses whatever the user had expanded.
+function groupActivityEvents(events) {
+  const grouped = []
+  for (let index = 0; index < events.length; index += 1) {
+    const event = events[index]
+    const next = events[index + 1]
+    const key = event.sequence != null ? `seq-${event.sequence}` : `pos-${index}-${event.event}`
+    if (event.event === 'tool.call' && next?.event === 'tool.result') {
+      grouped.push({ key, event, pairedResult: next })
+      index += 1
+    } else {
+      grouped.push({ key, event, pairedResult: null })
+    }
+  }
+  return grouped
+}
+
+function HistoricalTurn({ turn }) {
+  return (
+    <div className="code-turn-pair">
+      {turn.user ? <article className="code-message code-message--user">{turn.user}</article> : null}
+      {turn.assistant ? (
+        <article className="code-message code-message--assistant">
+          <div className="code-message__mark"><IconBolt size={16} /></div>
+          <div className="code-message__content"><AssistantMarkdown content={turn.assistant} /></div>
+        </article>
+      ) : null}
+    </div>
+  )
+}
+
+function PlanUpdate({ content }) {
+  const steps = String(content || '')
+    .split(/\r?\n/)
+    .map((line) => {
+      const match = /^\[([x~ ])\]\s+(.+)$/.exec(line.trim())
+      if (!match) return null
+      return {
+        status: match[1] === 'x' ? 'done' : match[1] === '~' ? 'active' : 'pending',
+        text: match[2],
+      }
+    })
+    .filter(Boolean)
+  const active = steps.find((step) => step.status === 'active')
+  const done = steps.filter((step) => step.status === 'done').length
+
+  return (
+    <article className="code-plan-update" aria-label="Camelid plan">
+      <header>
+        <span className="code-plan-update__icon"><IconHistory size={16} /></span>
+        <span>
+          <strong>Camelid&apos;s plan</strong>
+          <small>{active ? `Working on: ${active.text}` : `${done} of ${steps.length} complete`}</small>
+        </span>
+      </header>
+      {steps.length ? (
+        <ol>
+          {steps.map((step, index) => (
+            <li className={`is-${step.status}`} key={`${index}-${step.text}`}>
+              <span>{step.status === 'done' ? <IconCheckCircle size={14} /> : step.status === 'active' ? <IconPlay size={13} /> : index + 1}</span>
+              <span>{step.text}</span>
+            </li>
+          ))}
+        </ol>
+      ) : <pre>{content}</pre>}
+    </article>
+  )
+}
+
+function ActivityEvent({ event, pairedResult, activeApproval, decisionBusy, onDecision }) {
+  if (event.event === 'turn.user') {
+    return <article className="code-message code-message--user">{event.content}</article>
+  }
+
+  if (event.event === 'model.live') {
+    // Only the tail is rendered. This node re-renders on every generated token,
+    // and a long step (a whole file inside a write_file argument) otherwise
+    // grows an ever-taller <pre> that costs more to lay out with each token.
+    const live = String(event.content || '')
+    const tail = live.length > LIVE_TAIL_CHARS ? `…${live.slice(-LIVE_TAIL_CHARS)}` : live
+    return (
+      <article className="code-thinking-card" aria-live="polite">
+        <header><span className="code-live-dot" /><strong>Camelid is working</strong></header>
+        <pre>{tail}</pre>
+      </article>
+    )
+  }
+
+  if (event.event === 'model.answer') {
+    return (
+      <article className="code-message code-message--assistant">
+        <div className="code-message__mark"><IconBolt size={16} /></div>
+        <div className="code-message__content"><AssistantMarkdown content={event.content} /></div>
+      </article>
+    )
+  }
+
   if (event.event === 'tool.call') {
-    return <li className="workspace-event workspace-event--tool"><IconBolt size={16} /><div><strong>Tool requested</strong><code>{event.detail}</code></div></li>
+    const result = pairedResult || null
+    if (result && String(event.detail || '').startsWith('update_plan(') && result.outcome !== 'error') {
+      return <PlanUpdate content={result.content} />
+    }
+    const failed = result?.outcome === 'error'
+    return (
+      <details className={`code-tool-card ${result ? (failed ? 'is-error' : 'is-complete') : ''}`} open={failed}>
+        <summary>
+          <span className="code-tool-card__icon">{result ? (failed ? <IconError size={15} /> : <IconCheckCircle size={15} />) : <IconChevronRight size={15} />}</span>
+          <span><strong>{toolCallLabel(event.detail)}</strong><small>{result ? (failed ? 'Tool failed' : 'Tool completed') : 'Tool requested'}</small></span>
+          <span className={`code-tool-card__state ${result ? (failed ? 'is-error' : 'is-complete') : 'is-running'}`}>{result ? (failed ? 'Failed' : 'Done') : 'Running'}</span>
+        </summary>
+        <pre>{result ? `${event.detail}\n\n${result.content}` : event.detail}</pre>
+      </details>
+    )
   }
-  if (event.event === 'approval.required') {
-    return <li className="workspace-event workspace-event--approval"><IconWarning size={16} /><div><strong>Waiting for approval</strong><span>{event.tool} · {event.risk}</span><pre>{event.detail}</pre></div></li>
-  }
+
   if (event.event === 'tool.result') {
     const failed = event.outcome === 'error'
-    return <li className={`workspace-event ${failed ? 'workspace-event--error' : 'workspace-event--result'}`}>{failed ? <IconError size={16} /> : <IconCheckCircle size={16} />}<div><strong>{failed ? 'Tool failed' : 'Tool complete'}</strong><span>{event.tool}</span><pre>{event.content}</pre></div></li>
+    return (
+      <details className={`code-tool-card ${failed ? 'is-error' : 'is-complete'}`} open={failed}>
+        <summary>
+          <span className="code-tool-card__icon">{failed ? <IconError size={15} /> : <IconCheckCircle size={15} />}</span>
+          <span><strong>{formatToolName(event.tool)}</strong><small>{failed ? 'Tool failed' : 'Tool completed'}</small></span>
+          <span className={`code-tool-card__state ${failed ? 'is-error' : 'is-complete'}`}>{failed ? 'Failed' : 'Done'}</span>
+        </summary>
+        <pre>{event.content}</pre>
+      </details>
+    )
   }
-  if (event.event === 'model.live' || event.event === 'model.answer') {
-    return <li className={`workspace-event workspace-event--model ${event.event === 'model.live' ? 'is-live' : ''}`}><IconBolt size={16} /><div><strong>{event.event === 'model.live' ? 'Camelid is working' : 'Camelid answered'}</strong><pre>{event.content}</pre></div></li>
+
+  if (event.event === 'approval.required') {
+    const pending = activeApproval?.approval_id === event.approval_id
+    return (
+      <article className={`code-inline-approval ${pending ? 'is-pending' : 'is-resolved'}`}>
+        <header>
+          <span><IconWarning size={17} /></span>
+          <div><strong>Review {formatToolName(event.tool)}</strong><small>{event.risk} action</small></div>
+        </header>
+        <pre>{event.detail}</pre>
+        {pending ? (
+          <div className="code-inline-approval__actions">
+            <Button variant="ghost" size="sm" onClick={() => onDecision('abort')} disabled={decisionBusy}>Stop</Button>
+            <Button variant="ghost" size="sm" onClick={() => onDecision('deny')} disabled={decisionBusy}>Deny</Button>
+            <Button variant="outline" size="sm" onClick={() => onDecision('always_tool')} disabled={decisionBusy}>Always allow</Button>
+            <Button variant="primary" size="sm" onClick={() => onDecision('allow_once')} loading={decisionBusy}>Allow once</Button>
+          </div>
+        ) : <p>Decision sent</p>}
+      </article>
+    )
   }
-  if (event.event === 'session.error') {
-    return <li className="workspace-event workspace-event--error"><IconError size={16} /><div><strong>Session error</strong><span>{event.message}</span></div></li>
+
+  if (event.event === 'model.timing') {
+    const bits = [
+      Number.isFinite(event.total_ms) ? `${(event.total_ms / 1000).toFixed(1)}s` : null,
+      Number.isFinite(event.output_tokens) ? `${event.output_tokens} tokens` : null,
+      Number.isFinite(event.ttft_ms) ? `${event.ttft_ms}ms to first token` : null,
+    ].filter(Boolean)
+    return <div className="code-meta-event"><IconBolt size={13} /><span>{bits.join(' · ')}</span></div>
   }
-  if (event.event === 'session.finished') {
-    return <li className="workspace-event workspace-event--system"><IconCheckCircle size={16} /><div><strong>Session finished</strong><span>{PHASE_LABEL[event.outcome] || event.outcome}</span></div></li>
+
+  if (event.event === 'memory.compacted') {
+    return <div className="code-meta-event"><IconHistory size={13} /><span>Context compacted · {event.archived_turns || 0} turns archived</span></div>
   }
+
   if (event.event === 'session.notice') {
-    return <li className="workspace-event workspace-event--system"><IconBolt size={16} /><div><strong>Agent notice</strong><span>{event.content}</span></div></li>
+    return <div className="code-session-notice"><IconCheckCircle size={15} /><span>{event.content}</span></div>
   }
+
+  if (event.event === 'session.error') {
+    return <div className="code-session-notice is-error"><IconError size={15} /><span>{event.message}</span></div>
+  }
+
+  if (event.event === 'session.finished') {
+    return (
+      <div className="code-worked-divider">
+        <span>{PHASE_LABEL[event.outcome] || event.outcome}</span>
+      </div>
+    )
+  }
+
   return null
+}
+
+function CodeInspector({
+  approvalMode,
+  allowNetwork,
+  changes,
+  latestTool,
+  latestResult,
+  modelName,
+  running,
+  session,
+  workspacePath,
+  undoBusy,
+  onClose,
+  onRefreshChanges,
+  onUndo,
+}) {
+  return (
+    <aside className="code-inspector" aria-label="Coding session details">
+      <header className="code-inspector__header">
+        <div><span>Session</span><strong>Work details</strong></div>
+        <button type="button" aria-label="Close work details" onClick={onClose}><IconClose size={18} /></button>
+      </header>
+
+      <section className="code-inspector__section">
+        <div className="code-inspector__section-head">
+          <h3>Changes <span>{changes.files?.length || 0}</span></h3>
+          <button type="button" aria-label="Refresh changes" onClick={onRefreshChanges} disabled={!session}><IconRefresh size={15} /></button>
+        </div>
+        {changes.files?.length ? (
+          <>
+            <ul className="code-file-list">
+              {changes.files.map((file) => <li key={file}><IconEdit size={14} /><span>{file}</span></li>)}
+            </ul>
+            <details className="code-patch">
+              <summary><IconChevronRight size={14} /> View patch</summary>
+              <pre>{changes.diff}</pre>
+            </details>
+            <Button variant="ghost" size="sm" onClick={onUndo} loading={undoBusy} disabled={running}>Undo last change</Button>
+          </>
+        ) : <p className="code-inspector__empty">No file changes yet.</p>}
+      </section>
+
+      <section className="code-inspector__section">
+        <div className="code-inspector__section-head"><h3>Active work</h3></div>
+        {running && latestTool ? (
+          <div className="code-process-row is-running">
+            <span className="code-live-dot" />
+            <div><strong>{toolCallLabel(latestTool.detail)}</strong><small>{String(latestTool.detail || '').slice(0, 110)}</small></div>
+          </div>
+        ) : latestResult ? (
+          <div className="code-process-row">
+            <IconCheckCircle size={15} />
+            <div><strong>{formatToolName(latestResult.tool)}</strong><small>Last tool completed</small></div>
+          </div>
+        ) : <p className="code-inspector__empty">No active tool or command.</p>}
+      </section>
+
+      <section className="code-inspector__section">
+        <div className="code-inspector__section-head"><h3>Context</h3></div>
+        <dl className="code-context-list">
+          <div><dt>Workspace</dt><dd title={workspacePath}>{workspacePath ? compactPath(workspacePath) : 'Not selected'}</dd></div>
+          <div><dt>Model</dt><dd>{modelName || 'No model loaded'}</dd></div>
+          <div><dt>Access</dt><dd>{approvalMode === 'full_auto' ? 'Full auto' : 'Approval gated'}</dd></div>
+          <div><dt>Web tools</dt><dd>{allowNetwork ? 'On · search and fetch enabled' : 'Off'}</dd></div>
+        </dl>
+      </section>
+    </aside>
+  )
 }
 
 export default function CodeWorkspace({
@@ -86,14 +365,24 @@ export default function CodeWorkspace({
   const [session, setSession] = useState(null)
   const [state, dispatch] = useReducer(reduceCodeEvent, undefined, initialCodeState)
   const [browseOpen, setBrowseOpen] = useState(false)
-  const [changes, setChanges] = useState({ summary: 'no checkpoints this session', diff: 'no changes this session', files: [] })
-  const [changesOpen, setChangesOpen] = useState(false)
+  const [changes, setChanges] = useState({ ...EMPTY_CHANGES })
   const [undoBusy, setUndoBusy] = useState(false)
   const [decisionBusy, setDecisionBusy] = useState(false)
   const [stopPending, setStopPending] = useState(false)
+  const [approvalMode, setApprovalMode] = useState('approval_gated')
+  const [allowNetwork, setAllowNetwork] = useState(false)
+  const [accessMenuOpen, setAccessMenuOpen] = useState(false)
+  const [fullAutoConfirmOpen, setFullAutoConfirmOpen] = useState(false)
+  const [inspectorOpen, setInspectorOpen] = useState(() => window.localStorage.getItem('camelid.codeInspectorOpen') !== 'false')
+  const [startedAt, setStartedAt] = useState(null)
+  const [clock, setClock] = useState(Date.now())
   const eventSourceRef = useRef(null)
   const sessionRef = useRef(null)
   const intentionalClosuresRef = useRef(new WeakSet())
+  const threadRef = useRef(null)
+  const accessMenuRef = useRef(null)
+  const stickToBottomRef = useRef(true)
+  const changesTimerRef = useRef(null)
 
   const hasLoadedModel = Boolean(runtime?.loaded_now)
   const compatibility = useMemo(
@@ -104,8 +393,34 @@ export default function CodeWorkspace({
   const toolCapable = Boolean(hasLoadedModel && compatibility?.exact && target?.tool_capable && String(target.status || '').startsWith('supported'))
   const runtimeReady = runtime?.status === 'online' && runtime?.loaded_now && runtime?.generation_ready
   const running = stopPending || RUNNING_PHASES.has(state.phase)
+  // A Stop that could not be CONFIRMED: the composer is usable again, but the
+  // run may still be executing server-side, so Stop stays offered as a retry.
+  const stopUnconfirmed = state.phase === 'cancel_error' && !running
   const canStart = Boolean(workspacePath.trim() && goal.trim() && toolCapable && runtimeReady && !running && !session)
-  const finalAnswer = [...state.turns].reverse().find((turn) => turn.assistant)?.assistant || ''
+  const modelName = hasLoadedModel ? runtime?.active_model_id || selectedModel?.name || 'Loaded model' : ''
+  const composerValue = session ? followUp : goal
+  const canSubmit = session
+    ? Boolean(followUp.trim() && !running)
+    : canStart
+  // Everything derived from the event list is computed ONCE per event, not per
+  // render. Streamed deltas re-render this component on every token, and the
+  // agent's event channel blocks on the consumer — an unmemoized scan here is
+  // backpressure on the model's decode loop, not just UI jank.
+  const historicalTurns = useMemo(() => {
+    const liveUserTurns = state.events.reduce(
+      (count, event) => (event.event === 'turn.user' ? count + 1 : count),
+      0,
+    )
+    return state.turns.slice(0, Math.max(0, state.turns.length - liveUserTurns))
+  }, [state.events, state.turns])
+  const latestTool = state.latestTool
+  const latestResult = state.latestResult
+  const feedEvents = useMemo(() => groupActivityEvents(state.events), [state.events])
+  const selectedThread = savedThreads.find((thread) => thread.id === selectedThreadId) || requestedThread || null
+  const title = selectedThread?.title
+    || state.turns.find((turn) => turn.user)?.user?.slice(0, 72)
+    || 'New coding session'
+  const elapsed = startedAt ? formatElapsed(clock - startedAt) : ''
 
   useEffect(() => {
     sessionRef.current = session
@@ -115,18 +430,84 @@ export default function CodeWorkspace({
     if (workspacePath) window.localStorage.setItem('camelid.codeWorkspacePath', workspacePath)
   }, [workspacePath])
 
-  const refreshThreads = () => {
+  useEffect(() => {
+    window.localStorage.setItem('camelid.codeInspectorOpen', String(inspectorOpen))
+  }, [inspectorOpen])
+
+  useEffect(() => {
+    if (!accessMenuOpen) return undefined
+    const close = (event) => {
+      if (!accessMenuRef.current?.contains(event.target)) setAccessMenuOpen(false)
+    }
+    const closeOnEscape = (event) => {
+      if (event.key === 'Escape') setAccessMenuOpen(false)
+    }
+    window.addEventListener('pointerdown', close)
+    window.addEventListener('keydown', closeOnEscape)
+    return () => {
+      window.removeEventListener('pointerdown', close)
+      window.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [accessMenuOpen])
+
+  useEffect(() => {
+    if (!running || !startedAt) return undefined
+    const timer = window.setInterval(() => setClock(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [running, startedAt])
+
+  // Track whether the user is parked at the bottom. Auto-scrolling someone who
+  // has deliberately scrolled up to read an earlier tool result is worse than
+  // not scrolling at all, so a scroll away from the bottom detaches the follow
+  // and returning to the bottom re-attaches it.
+  useEffect(() => {
+    const thread = threadRef.current
+    if (!thread) return undefined
+    const onScroll = () => {
+      const distance = thread.scrollHeight - thread.scrollTop - thread.clientHeight
+      stickToBottomRef.current = distance <= SCROLL_STICK_SLACK_PX
+    }
+    thread.addEventListener('scroll', onScroll, { passive: true })
+    return () => thread.removeEventListener('scroll', onScroll)
+  }, [])
+
+  // Keyed on `state.revision`, NOT `state.events.length`: a streamed delta is
+  // merged into the existing tail entry, so the length never changes while text
+  // is arriving and this effect used to sit out the entire stream. `auto` — not
+  // `smooth` — because a smooth scroll retargeted every few milliseconds never
+  // reaches the bottom.
+  useEffect(() => {
+    if (!threadRef.current || !stickToBottomRef.current) return undefined
+    const frame = window.requestAnimationFrame(() => {
+      const thread = threadRef.current
+      if (thread) thread.scrollTo({ top: thread.scrollHeight, behavior: 'auto' })
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [state.revision, historicalTurns.length])
+
+  const refreshThreads = (signal) => {
     const path = workspacePath.trim()
     if (!path) {
       setSavedThreads([])
       return
     }
-    getWorkspaceThreads(apiBase, path, { mode: 'code' })
-      .then(setSavedThreads)
-      .catch(() => setSavedThreads([]))
+    getWorkspaceThreads(apiBase, path, { mode: 'code', signal })
+      .then((threads) => {
+        if (!signal?.aborted) setSavedThreads(threads)
+      })
+      .catch(() => {
+        if (!signal?.aborted) setSavedThreads([])
+      })
   }
 
-  useEffect(refreshThreads, [apiBase, workspacePath])
+  // Aborted on change: the path is a text input, so typing fires one request
+  // per keystroke and a slow early response could otherwise land last and
+  // overwrite the list for the path the user actually settled on.
+  useEffect(() => {
+    const controller = new AbortController()
+    refreshThreads(controller.signal)
+    return () => controller.abort()
+  }, [apiBase, workspacePath])
 
   useEffect(() => {
     if (!requestedThread?.id || session) return
@@ -149,11 +530,23 @@ export default function CodeWorkspace({
       intentionalClosuresRef.current.add(eventSourceRef.current)
       eventSourceRef.current.close()
     }
+    if (changesTimerRef.current) window.clearTimeout(changesTimerRef.current)
   }, [apiBase])
 
   const refreshChanges = (sessionId = session?.id) => {
-    if (!sessionId) return
-    getWorkspaceChanges(apiBase, sessionId).then(setChanges).catch(() => {})
+    if (!sessionId) return Promise.resolve()
+    return getWorkspaceChanges(apiBase, sessionId).then(setChanges).catch(() => {})
+  }
+
+  // A run that touches many files emits a tool.result per edit, and each one
+  // used to trigger a full /changes fetch that re-serializes the entire diff.
+  // Coalesce the bursts; the trailing call still reflects the final state.
+  const scheduleChangesRefresh = (sessionId) => {
+    if (changesTimerRef.current) window.clearTimeout(changesTimerRef.current)
+    changesTimerRef.current = window.setTimeout(() => {
+      changesTimerRef.current = null
+      refreshChanges(sessionId)
+    }, CHANGES_REFRESH_DEBOUNCE_MS)
   }
 
   const signalHistoryChanged = () => {
@@ -170,8 +563,12 @@ export default function CodeWorkspace({
       try {
         const envelope = JSON.parse(message.data)
         dispatch(envelope)
-        if (envelope.event === 'tool.result') refreshChanges(created.id)
+        if (envelope.event === 'tool.result') scheduleChangesRefresh(created.id)
         if (['session.finished', 'session.error'].includes(envelope.event)) {
+          if (changesTimerRef.current) {
+            window.clearTimeout(changesTimerRef.current)
+            changesTimerRef.current = null
+          }
           refreshChanges(created.id)
           signalHistoryChanged()
           intentionalClosuresRef.current.add(source)
@@ -186,26 +583,61 @@ export default function CodeWorkspace({
     })
     source.onerror = () => {
       if (intentionalClosuresRef.current.has(source) || eventSourceRef.current !== source) return
-      dispatch({ event: 'session.error', message: 'The Code-mode event stream disconnected.' })
+      // The server's /events claim is one-shot: an EventSource that reconnects
+      // after any blip gets a 409, which is fatal to the EventSource. The RUN is
+      // unaffected and keeps going. Declaring session.error here used to both
+      // report a failure that had not happened and orphan a live agent that
+      // nothing was left watching. Fall back to polling for the real outcome.
+      intentionalClosuresRef.current.add(source)
       source.close()
       eventSourceRef.current = null
+      followDetachedSession(created)
     }
+  }
+
+  const followDetachedSession = async (created) => {
+    dispatch({
+      event: 'session.notice',
+      content: 'Live activity view disconnected. The run is still going — following its status instead.',
+    })
+    try {
+      const settled = await waitForWorkspaceSessionTerminal(apiBase, created.id, {
+        timeoutMs: DETACHED_FOLLOW_TIMEOUT_MS,
+        pollMs: DETACHED_FOLLOW_POLL_MS,
+      })
+      dispatch({
+        event: 'session.finished',
+        outcome: settled.state === 'idle' ? 'answered' : settled.state,
+      })
+    } catch (error) {
+      dispatch({ event: 'session.error', message: error.message })
+    }
+    refreshChanges(created.id)
+    signalHistoryChanged()
   }
 
   const start = async () => {
     if (!canStart) return
     dispatch({ event: 'session.starting' })
+    setStartedAt(Date.now())
+    setClock(Date.now())
     try {
       const created = await createWorkspaceSession(apiBase, {
         workspace: workspacePath.trim(),
         goal: goal.trim(),
         thread_id: selectedThreadId || undefined,
-        max_steps: 20,
-        max_tokens: 768,
+        // A single write_file argument routinely carries a whole source file.
+        // At the old 768 the call was cut off mid-JSON, parsed as no call, and
+        // surfaced as a mangled "answer" while the write was silently dropped.
+        // The backend clamps this down to whatever context headroom is left.
+        max_tokens: 2048,
         temperature: 0,
         mode: 'code',
         allow_writes: true,
+        approval_mode: approvalMode,
+        allow_network: allowNetwork,
       })
+      setAccessMenuOpen(false)
       setSession(created)
       dispatch({ event: 'turn.user', content: goal.trim() })
       setGoal('')
@@ -220,6 +652,8 @@ export default function CodeWorkspace({
     const text = followUp.trim()
     if (!session || !text || running) return
     dispatch({ event: 'turn.starting' })
+    setStartedAt(Date.now())
+    setClock(Date.now())
     try {
       await sendWorkspaceMessage(apiBase, session.id, text, window.crypto.randomUUID())
       dispatch({ event: 'turn.user', content: text })
@@ -286,136 +720,249 @@ export default function CodeWorkspace({
     setSelectedThreadId('')
     setGoal('')
     setFollowUp('')
-    setChanges({ summary: 'no checkpoints this session', diff: 'no changes this session', files: [] })
+    setStartedAt(null)
+    setChanges({ ...EMPTY_CHANGES })
+    setApprovalMode('approval_gated')
+    setAllowNetwork(false)
+    setAccessMenuOpen(false)
+    setFullAutoConfirmOpen(false)
     dispatch({ event: 'session.reset' })
     signalHistoryChanged()
   }
 
+  const submitComposer = (event) => {
+    event?.preventDefault()
+    if (running) return
+    if (session) sendFollowUp()
+    else start()
+  }
+
+  const composerKeyDown = (event) => {
+    if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent?.isComposing) {
+      event.preventDefault()
+      submitComposer()
+    }
+  }
+
   const status = stopPending ? 'Stopping' : PHASE_LABEL[state.phase] || state.phase
+  const empty = !historicalTurns.length && !state.events.length
 
   return (
-    <div className="workspace-view code-workspace">
-      <section className="workspace-setup" aria-labelledby="code-heading">
-        <div className="workspace-setup__heading">
-          <div>
-            <p className="workspace-kicker">Agent coding</p>
-            <h2 id="code-heading">Work in a local codebase</h2>
+    <div className={`code-workbench ${inspectorOpen ? '' : 'is-inspector-closed'}`}>
+      <section className="code-stage" aria-labelledby="code-session-title">
+        <header className="code-stage__header">
+          <div className="code-stage__title">
+            <span className={`code-stage__status is-${state.phase}`}><span />{status}</span>
+            <h2 id="code-session-title">{title}</h2>
+            {workspacePath ? <small title={workspacePath}>{compactPath(workspacePath)}</small> : null}
           </div>
-          <span className={`workspace-status is-${state.phase}`}>{status}</span>
-        </div>
-
-        <div className="workspace-model-line">
-          <div className="workspace-model-line__identity">
-            <span>Active model</span>
-            <strong>{hasLoadedModel ? runtime?.active_model_id || selectedModel?.name || 'Loaded model' : 'No model loaded'}</strong>
+          <div className="code-stage__actions">
+            {elapsed ? <span className="code-elapsed">{running ? 'Working' : 'Worked'} for {elapsed}</span> : null}
+            {!inspectorOpen ? <button type="button" aria-label="Open work details" onClick={() => setInspectorOpen(true)}><IconSidebar size={18} /></button> : null}
+            <button type="button" aria-label="New coding session" onClick={reset}><IconEdit size={17} /><span>New session</span></button>
           </div>
-          <span className={`workspace-model-eligibility ${toolCapable ? 'is-ready' : 'is-blocked'}`}>
-            {toolCapable ? <IconCheckCircle size={14} /> : <IconError size={14} />}
-            {toolCapable ? 'Agent evaluated' : 'Code mode unavailable'}
-          </span>
-        </div>
+        </header>
 
-        {!toolCapable ? (
-          <section className="workspace-prerequisite" role="status">
-            <div className="workspace-prerequisite__head"><IconError size={18} /><div><h3>Load an agent-evaluated model</h3><p>Code mode fails closed unless the exact active model row has a passing tool-capability receipt.</p></div></div>
-            <div className="workspace-prerequisite__actions"><Button variant="outline" onClick={() => setTab('library')}>Open Models</Button></div>
-          </section>
-        ) : null}
-
-        <div className="workspace-field">
-          <span>Workspace folder</span>
-          <div className="workspace-field__control">
-            <input value={workspacePath} onChange={(event) => { setWorkspacePath(event.target.value); setSelectedThreadId('') }} disabled={running || Boolean(session)} spellCheck="false" placeholder={navigator.platform?.startsWith('Win') ? 'C:\\projects\\example' : '/workspace/example'} />
-            <Button variant="outline" icon={<IconSearch size={16} />} onClick={() => setBrowseOpen(true)} disabled={running || Boolean(session)}>Browse…</Button>
-          </div>
-          <small>Reads and edits stay inside this canonical root. Network, GUI, MCP, and subagents are off.</small>
-        </div>
-
-        {savedThreads.length > 0 && !session ? (
-          <label className="workspace-field workspace-thread-picker">
-            <span>Coding session</span>
-            <select value={selectedThreadId} onChange={(event) => setSelectedThreadId(event.target.value)}>
-              <option value="">Start a new coding session</option>
-              {savedThreads.map((thread) => <option key={thread.id} value={thread.id}>{thread.title} · {thread.turn_count} turns</option>)}
-            </select>
-          </label>
-        ) : null}
-
-        {browseOpen ? <FolderPicker apiBase={apiBase} initialPath={workspacePath.trim() || null} onClose={() => setBrowseOpen(false)} onPick={(path) => { if (path) setWorkspacePath(path); setBrowseOpen(false) }} /> : null}
-
-        {!session ? (
-          <label className="workspace-field workspace-field--goal">
-            <span>{selectedThreadId ? 'Next task' : 'Task'}</span>
-            <textarea value={goal} onChange={(event) => setGoal(event.target.value)} rows={6} placeholder="Inspect the project, implement the requested change, and run the relevant tests." disabled={running} />
-          </label>
-        ) : null}
-
-        <div className="workspace-setup__actions">
-          {running ? <Button variant="outline" onClick={stop} disabled={stopPending} loading={stopPending}><IconStop size={17} /> Stop</Button>
-            : !session ? <Button variant="primary" onClick={start} disabled={!canStart}><IconPlay size={17} /> {selectedThreadId ? 'Resume session' : 'Start coding'}</Button>
-              : <Button variant="ghost" onClick={reset}><IconClose size={17} /> New session</Button>}
-          <span>20 steps · every write and shell command requires approval · checkpoints are automatic</span>
-        </div>
-      </section>
-
-      <section className="workspace-activity code-activity" aria-labelledby="code-activity-heading">
-        <div className="workspace-activity__header">
-          <div><p className="workspace-kicker">Coding session</p><h2 id="code-activity-heading">Agent activity</h2></div>
-          <div className="code-change-actions">
-            <Button variant="ghost" size="sm" icon={<IconEdit size={15} />} onClick={() => { refreshChanges(); setChangesOpen(true) }} disabled={!session}>Changes ({changes.files?.length || 0})</Button>
-            <Button variant="ghost" size="sm" onClick={undo} disabled={!session || running || !changes.files?.length || undoBusy} loading={undoBusy}>Undo last</Button>
-          </div>
-        </div>
-
-        <div className="workspace-result code-session-body">
-          {!state.turns.length && !state.events.length ? (
-            <div className="workspace-result__empty"><IconBolt size={28} /><strong>Ready for a coding task</strong><span>Select a folder and describe the outcome you want. Camelid will inspect before editing and ask before every mutation.</span></div>
+        <div className="code-thread" ref={threadRef}>
+          {empty ? (
+            <div className="code-landing">
+              <span className="code-landing__mark"><IconBolt size={25} /></span>
+              <h1>What should Camelid build?</h1>
+              <p>Describe an outcome. Camelid will inspect the workspace, show each action as it happens, and follow the access policy you choose.</p>
+              {!toolCapable ? (
+                <section className="workspace-prerequisite" role="status">
+                  <div className="workspace-prerequisite__head"><IconError size={18} /><div><h3>Load an agent-evaluated model</h3><p>Code mode fails closed unless the exact active model row has a passing tool-capability receipt.</p></div></div>
+                  <div className="workspace-prerequisite__actions"><Button variant="outline" onClick={() => setTab('library')}>Open Models</Button></div>
+                </section>
+              ) : null}
+              {savedThreads.length ? (
+                <div className="code-recent">
+                  <span>Continue in this workspace</span>
+                  {savedThreads.slice(0, 3).map((thread) => (
+                    <button type="button" key={thread.id} onClick={() => setSelectedThreadId(thread.id)}>
+                      <IconHistory size={15} /><span><strong>{thread.title}</strong><small>{thread.turn_count} turns</small></span><IconChevronRight size={15} />
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+            </div>
           ) : (
-            <>
-              <div className="code-conversation">
-                {state.turns.map((turn, index) => (
-                  <article className="workspace-answer" key={`${index}-${turn.user}`}>
-                    {turn.user ? <p className="workspace-answer__question">{turn.user}</p> : null}
-                    {turn.assistant ? <div className="workspace-answer__body"><AssistantMarkdown content={turn.assistant} /></div> : null}
-                  </article>
-                ))}
-                {session && !running ? (
-                  <form className="workspace-follow-up" onSubmit={(event) => { event.preventDefault(); sendFollowUp() }}>
-                    <label htmlFor="code-follow-up">Follow up</label>
-                    <div className="workspace-follow-up__control"><textarea id="code-follow-up" value={followUp} onChange={(event) => setFollowUp(event.target.value)} /><Button variant="primary" type="submit" disabled={!followUp.trim()}><IconSend size={16} /> Send</Button></div>
-                  </form>
-                ) : null}
-              </div>
-              <details className="workspace-activity-details" open={running || !finalAnswer}>
-                <summary className="workspace-activity-summary"><IconBolt size={16} /> Activity <span className="workspace-activity-count">{state.events.length} events</span></summary>
-                <div className="workspace-activity__scroll"><ol className="workspace-timeline">{state.events.map((event, index) => <ActivityEvent event={event} key={`${event.event}-${index}`} />)}</ol></div>
-              </details>
-            </>
+            <div className="code-feed">
+              {historicalTurns.map((turn, index) => <HistoricalTurn turn={turn} key={`history-${index}-${turn.user}`} />)}
+              {feedEvents.map((entry) => (
+                <ActivityEvent
+                  event={entry.event}
+                  pairedResult={entry.pairedResult}
+                  activeApproval={state.approval}
+                  decisionBusy={decisionBusy}
+                  onDecision={decide}
+                  key={entry.key}
+                />
+              ))}
+              {running && !state.events.some((event) => event.event === 'model.live') ? (
+                <div className="code-agent-working"><span className="code-live-dot" /><span>Camelid is working…</span></div>
+              ) : null}
+            </div>
           )}
         </div>
+
+        <footer className="code-composer-shell">
+          {!session ? (
+            <div className="code-workspace-picker">
+              <IconSearch size={15} />
+              <input
+                value={workspacePath}
+                onChange={(event) => { setWorkspacePath(event.target.value); setSelectedThreadId('') }}
+                spellCheck="false"
+                placeholder={navigator.platform?.startsWith('Win') ? 'Choose a workspace, for example C:\\projects\\app' : 'Choose a workspace, for example /workspace/app'}
+                aria-label="Workspace folder"
+              />
+              <Button variant="ghost" size="sm" onClick={() => setBrowseOpen(true)}>Browse…</Button>
+            </div>
+          ) : null}
+          <form className="code-composer" onSubmit={submitComposer}>
+            <textarea
+              value={composerValue}
+              onChange={(event) => session ? setFollowUp(event.target.value) : setGoal(event.target.value)}
+              onKeyDown={composerKeyDown}
+              placeholder={session ? 'Ask for a follow-up or adjustment' : 'Describe the change you want Camelid to make'}
+              rows={3}
+              // Deliberately NOT gated on toolCapable/runtimeReady. Those depend
+              // on which model happens to be loaded, and disabling the textarea
+              // left a dead box you could not even draft a task in while going
+              // to load a different model. The send button carries the gate.
+              aria-label={session ? 'Follow-up instruction' : 'Coding task'}
+            />
+            <div className="code-composer__footer">
+              <div className="code-composer__chips">
+                <div className="code-access-control" ref={accessMenuRef}>
+                  <button
+                    type="button"
+                    className={`code-access-chip ${approvalMode === 'full_auto' ? 'is-full-auto' : ''}`}
+                    aria-haspopup="menu"
+                    aria-expanded={accessMenuOpen}
+                    onClick={() => setAccessMenuOpen((open) => !open)}
+                    disabled={Boolean(session)}
+                    title={session ? 'Start a new session to change access' : 'Choose approval and network access'}
+                  >
+                    <IconWarning size={14} />
+                    {approvalMode === 'full_auto' ? 'Full auto' : 'Approval gated'}
+                    {allowNetwork ? <IconNetwork size={13} /> : null}
+                    <IconChevronDown size={12} />
+                  </button>
+                  {accessMenuOpen && !session ? (
+                    <div className="code-access-menu" role="menu" aria-label="Agent access">
+                      <div className="code-access-menu__heading">
+                        <strong>Agent access</strong>
+                        <small>Applies to this coding session only</small>
+                      </div>
+                      <button
+                        type="button"
+                        role="menuitemradio"
+                        aria-checked={approvalMode === 'approval_gated'}
+                        className={approvalMode === 'approval_gated' ? 'is-selected' : ''}
+                        onClick={() => { setApprovalMode('approval_gated'); setAccessMenuOpen(false) }}
+                      >
+                        <span className="code-access-menu__icon"><IconWarning size={16} /></span>
+                        <span><strong>Approval gated</strong><small>Ask before writes, commands, and network actions.</small></span>
+                        <span className="code-access-menu__check">{approvalMode === 'approval_gated' ? '✓' : ''}</span>
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitemradio"
+                        aria-checked={approvalMode === 'full_auto'}
+                        className={`is-danger ${approvalMode === 'full_auto' ? 'is-selected' : ''}`}
+                        onClick={() => { setAccessMenuOpen(false); setFullAutoConfirmOpen(true) }}
+                      >
+                        <span className="code-access-menu__icon"><IconBolt size={16} /></span>
+                        <span><strong>Today is a good day to die</strong><small>Full auto: run writes and shell commands without asking.</small></span>
+                        <span className="code-access-menu__check">{approvalMode === 'full_auto' ? '✓' : ''}</span>
+                      </button>
+                      <div className="code-access-menu__divider" />
+                      <button
+                        type="button"
+                        role="menuitemcheckbox"
+                        aria-checked={allowNetwork}
+                        className={allowNetwork ? 'is-selected' : ''}
+                        onClick={() => setAllowNetwork((enabled) => !enabled)}
+                      >
+                        <span className="code-access-menu__icon"><IconNetwork size={16} /></span>
+                        <span><strong>Network and web search</strong><small>Give the agent built-in web_search and http_fetch tools.</small></span>
+                        <span className={`code-access-switch ${allowNetwork ? 'is-on' : ''}`}><span /></span>
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
+                <span title={modelName}><IconBolt size={14} /> {modelName || 'No model'}</span>
+              </div>
+              {running ? (
+                <button type="button" className="code-composer__send is-stop" aria-label="Stop coding task" onClick={stop} disabled={stopPending}><IconStop size={17} /></button>
+              ) : (
+                <>
+                  {/* An unconfirmed Stop means the run MAY still be alive, so the
+                      Stop control has to survive alongside Send — dropping it
+                      would leave the one state that needs a retry without one. */}
+                  {stopUnconfirmed ? (
+                    <button type="button" className="code-composer__send is-stop" aria-label="Retry stopping the coding task" onClick={stop} disabled={stopPending}><IconStop size={17} /></button>
+                  ) : null}
+                  <button type="submit" className="code-composer__send" aria-label={session ? 'Send follow-up' : 'Start coding'} disabled={!canSubmit}><IconSend size={18} /></button>
+                </>
+              )}
+            </div>
+          </form>
+          <small className="code-composer-hint">
+            Enter to send · Shift+Enter for a new line · {approvalMode === 'full_auto'
+              ? `full auto can write and run commands without stopping${allowNetwork ? ' · web search on' : ''}`
+              : `writes and commands require approval${allowNetwork ? ' · web search on' : ''}`}
+          </small>
+        </footer>
       </section>
 
-      <Modal
-        open={Boolean(state.approval)}
-        onClose={() => decide('deny')}
-        title="Review agent action"
-        labelledById="code-approval-title"
-        className="code-approval-modal"
-        footer={<><Button variant="ghost" onClick={() => decide('abort')} disabled={decisionBusy}>Stop session</Button><Button variant="ghost" onClick={() => decide('deny')} disabled={decisionBusy}>Deny</Button><Button variant="outline" onClick={() => decide('always_tool')} disabled={decisionBusy}>Always allow {state.approval?.tool}</Button><Button variant="primary" onClick={() => decide('allow_once')} disabled={decisionBusy} loading={decisionBusy}>Allow once</Button></>}
-      >
-        <div className="code-approval">
-          <div className="code-approval__risk"><IconWarning size={18} /><strong>{state.approval?.risk} action</strong></div>
-          <pre>{state.approval?.detail}</pre>
-          <p>This is the validated action resolved against the selected workspace. The browser cannot change its target.</p>
-        </div>
-      </Modal>
+      {inspectorOpen ? (
+        <CodeInspector
+          approvalMode={session?.approval_mode || approvalMode}
+          allowNetwork={session?.allow_network ?? allowNetwork}
+          changes={changes}
+          latestTool={latestTool}
+          latestResult={latestResult}
+          modelName={modelName}
+          running={running}
+          session={session}
+          workspacePath={workspacePath}
+          undoBusy={undoBusy}
+          onClose={() => setInspectorOpen(false)}
+          onRefreshChanges={() => refreshChanges()}
+          onUndo={undo}
+        />
+      ) : null}
 
-      <Modal open={changesOpen} onClose={() => setChangesOpen(false)} title="Session changes" labelledById="code-changes-title" size="lg">
-        <div className="code-changes">
-          <strong>{changes.summary}</strong>
-          <pre>{changes.diff}</pre>
-        </div>
-      </Modal>
+      {browseOpen ? (
+        <FolderPicker
+          apiBase={apiBase}
+          initialPath={workspacePath.trim() || null}
+          onClose={() => setBrowseOpen(false)}
+          onPick={(path) => {
+            if (path) {
+              setWorkspacePath(path)
+              setSelectedThreadId('')
+            }
+            setBrowseOpen(false)
+          }}
+        />
+      ) : null}
+
+      <ConfirmDialog
+        open={fullAutoConfirmOpen}
+        title="Enable full auto?"
+        detail="Today is a good day to die mode lets Camelid edit files and run shell commands without asking. File tools stay confined to the selected workspace. On Windows, shell commands are working-directory pinned and hard-timed but are not filesystem- or network-isolated. Stop remains available; the network switch separately controls Camelid's built-in web tools."
+        confirmLabel="Enable full auto"
+        cancelLabel="Keep approval gated"
+        onCancel={() => setFullAutoConfirmOpen(false)}
+        onConfirm={() => {
+          setApprovalMode('full_auto')
+          setFullAutoConfirmOpen(false)
+        }}
+      />
     </div>
   )
 }

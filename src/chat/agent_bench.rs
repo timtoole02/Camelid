@@ -283,6 +283,9 @@ fn canned_config(concurrency: usize) -> SubagentConfig {
         timeout: Duration::from_secs(120),
         auto_approve: false,
         shell_mode: super::shell_sandbox::ShellSandbox::Sandboxed,
+        allow_net: false,
+        yolo: false,
+        web_code: false,
     }
 }
 
@@ -303,6 +306,9 @@ fn real_config(
         timeout: Duration::from_secs(180),
         auto_approve: false,
         shell_mode: super::shell_sandbox::ShellSandbox::Sandboxed,
+        allow_net: false,
+        yolo: false,
+        web_code: false,
     }
 }
 

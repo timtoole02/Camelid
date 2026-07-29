@@ -5,16 +5,26 @@ Last updated: 2026-07-26
 Web Code mode note (2026-07-26): the WebUI and Windows Desktop shell now expose a separate
 not-production-promoted **Code** surface alongside Chat and the read-only Workspace. Code reuses the
 terminal agent loop with an explicit `WebCode` allowlist (`read_file`, `list_dir`, literal-content
-`search`, `update_plan`, `write_file`, `edit_file`, and sandboxed `run_shell`). Every mutation and
-shell command stays approval-gated; canonical-root confinement and same-origin loopback
-authorization remain server-owned; network, GUI, MCP, subagent, and unattended tools are not
-advertised or accepted. The left rail lists durable `code-*` threads separately from chat and
-read-only `workspace-*` history. Changes and guarded undo use the existing checkpoint mechanism.
+`search`, `update_plan`, `write_file`, `edit_file`, sandboxed `run_shell`, and bounded subagent
+delegation). Approval-gated remains the default; a separately confirmed full-auto session may run
+writes and sandboxed commands unattended, and an independent network switch adds only
+`web_search` and `http_fetch`. Children inherit the exact Code/network/approval boundary and stop
+with the parent. Canonical-root confinement and same-origin loopback authorization remain
+server-owned for file tools; GUI, Windows computer-control, and MCP tools are not advertised or
+accepted by WebCode. Shell enforcement is not overstated: on Windows it is cwd-pinned and
+hard-timed, not filesystem- or network-isolated, and the network switch governs built-in web tools
+rather than arbitrary shell egress. The workbench streams readable plan/tool/model activity,
+survives a temporary switch back to Chat, and
+keeps a user-controlled Stop without an arbitrary Code step count or model-step deadline. The left
+rail lists durable `code-*` threads separately from chat and read-only `workspace-*` history.
+Changes and guarded undo use the existing checkpoint mechanism.
 Local QA on the Windows reference machine covered a live Qwen3-4B-Q4_K_M read/write/approval/diff/
-history/undo turn, desktop and 390px WebUI layouts, all 1,263 core tests, Desktop tests/build/Clippy,
-frontend production build and smoke suites, and zero npm audit findings after Vite 8.1.5. This does
-not widen any model, context, backend, portability, latency, throughput, or production-support
-claim; the macOS-only Flow Bench visual harness was not runnable on Windows.
+history/undo turn, a second real Desktop-spawned Code session through tool call/result/final answer,
+desktop and 390px WebUI layouts, all 1,277 core tests plus every integration target, Desktop
+tests/build/Clippy, frontend production build and smoke suites, and zero npm audit findings after
+Vite 8.1.5. The Flow Bench harness is now Chrome/Edge portable and passed on Windows against the
+live CUDA-resident model in both themes, including its full 60-second stillness check. This does not
+widen any model, context, backend, portability, latency, throughput, or production-support claim.
 
 HARDPAN note (2026-07-23): the Windows agent-terminal parity campaign (`qa/hardpan/REPRO.md`) closed with seven findings fixed, one struck, one measured-null — all with before/after receipts on the Windows reference box. Exec surface: `run_shell` now drains stdout/stderr on reader threads (pre-fix, any command emitting more than the 64 KiB per-pipe buffer — e.g. `git log` — was falsely reported as a timeout with its output discarded), assigns a kill-on-close job object so a timeout tears down the whole process tree (the negative control showed the orphan otherwise also wedges teardown for its full lifetime), and resolves `cmd` through System32 (hardening only, no security delta — std already searched System32 before parent-`PATH`). `run_windows_command` now feeds PowerShell a base64-inside-ASCII stdin preamble (a windowless child sits on OEM CP437; non-ASCII round-trips byte-identical both ways where it was mojibake'd) and re-raises `$LASTEXITCODE` (a failing native command followed by a successful statement previously reported exit 0 → Ok to the model). Terminal front ends: a shared RAII teardown guard + chaining panic hook covers both TUIs (a TUI-thread fault can no longer strand the console in raw mode — cmd.exe has no `reset`); a Windows paste path (Ctrl+V clipboard read + a pasted-Enter guard, since terminals inject paste as keystrokes) makes a multi-line paste create exactly one goal instead of firing one goal per interior newline; and AltGr compositions (CONTROL|ALT) now insert instead of being silently swallowed — on a German layout `@ € [ ]` were previously untypeable. Struck at GATE 0 on live evidence: W7 (`/copy`/OSC 52 — honoured by this host's terminals, so the tool told the truth) and W9 downgraded to a measured null (`qa/evidence-bundles/hardpan-windows-terminal-20260723/`). No agent-loop, tool-schema, approval-policy, or parity-lane change; Unix behavior preserved throughout. Decision record: DECISIONS.md D19. Remaining owed: the real-TUI CERT rows of `qa/hardpan/MANUAL_CHECKLIST.md` (merge-ahead authorized 2026-07-23) and the A11/A12 follow-ups in the REPRO.md amendment log.
 

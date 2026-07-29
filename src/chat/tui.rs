@@ -42,7 +42,7 @@ const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧
 
 enum StreamMsg {
     Delta(String),
-    Done(u32),
+    Done { tokens: u32, capped: bool },
     Cancelled,
     Error(String),
 }
@@ -200,7 +200,14 @@ impl<'a> App<'a> {
                 let _ = forward.send(StreamMsg::Delta(delta.to_string()));
             });
             let _ = match result {
-                Ok((StreamEnd::Done, n)) => tx.send(StreamMsg::Done(n)),
+                Ok((StreamEnd::Done, n)) => tx.send(StreamMsg::Done {
+                    tokens: n,
+                    capped: false,
+                }),
+                Ok((StreamEnd::Length, n)) => tx.send(StreamMsg::Done {
+                    tokens: n,
+                    capped: true,
+                }),
                 Ok((StreamEnd::Cancelled, _)) => tx.send(StreamMsg::Cancelled),
                 Err(err) => tx.send(StreamMsg::Error(err.to_string())),
             };
@@ -224,7 +231,7 @@ impl<'a> App<'a> {
                 Ok(msg) => msg,
                 Err(TryRecvError::Empty) => return,
                 Err(TryRecvError::Disconnected) => {
-                    self.finish(None);
+                    self.finish(None, false);
                     return;
                 }
             };
@@ -236,8 +243,8 @@ impl<'a> App<'a> {
                         self.scroll = usize::MAX;
                     }
                 }
-                StreamMsg::Done(n) => {
-                    self.finish(Some(n));
+                StreamMsg::Done { tokens, capped } => {
+                    self.finish(Some(tokens), capped);
                     return;
                 }
                 StreamMsg::Cancelled => {
@@ -263,7 +270,7 @@ impl<'a> App<'a> {
         self.live_tokens = 0;
     }
 
-    fn finish(&mut self, completion: Option<u32>) {
+    fn finish(&mut self, completion: Option<u32>, capped: bool) {
         let text = std::mem::take(&mut self.live);
         let secs = self
             .started
@@ -278,6 +285,10 @@ impl<'a> App<'a> {
             None => format!("{secs:.1}s"),
         });
         self.end_stream();
+        if capped {
+            self.status =
+                "answer cut off at max_tokens — raise it to finish this response".to_string();
+        }
     }
 
     // ---- input / commands ------------------------------------------------

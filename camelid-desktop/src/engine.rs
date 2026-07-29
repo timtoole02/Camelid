@@ -27,9 +27,11 @@ pub fn engine_binary_file() -> String {
 }
 
 /// Health-gate budget: poll `/v1/health` for up to this long before declaring failure.
-const HEALTH_TIMEOUT: Duration = Duration::from_secs(40);
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(120);
 /// Backoff between health polls (model load can dominate; keep polls cheap and patient).
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(350);
+/// A single accepted socket must never be able to defeat the overall health deadline.
+const HEALTH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A fatal error during sidecar startup, carrying any captured engine stderr so the splash
 /// can surface the *real* failure rather than a fake "ready" state.
@@ -270,20 +272,35 @@ fn http_health_ok(port: u16) -> bool {
     let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(750)) else {
         return false;
     };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(2000)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(2000)));
+    let _ = stream.set_write_timeout(Some(HEALTH_RESPONSE_TIMEOUT));
     let req =
         format!("GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
     if stream.write_all(req.as_bytes()).is_err() {
         return false;
     }
+    // On Windows a blocking read can outlive SO_RCVTIMEO while the server has accepted the
+    // connection but is still loading a model. Use nonblocking reads and our own monotonic
+    // deadline so the outer health budget always gets control back.
+    if stream.set_nonblocking(true).is_err() {
+        return false;
+    }
     let mut buf = [0u8; 256];
-    match stream.read(&mut buf) {
-        Ok(n) if n > 0 => {
-            let head = String::from_utf8_lossy(&buf[..n]);
-            head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200")
+    let deadline = Instant::now() + HEALTH_RESPONSE_TIMEOUT;
+    loop {
+        match stream.read(&mut buf) {
+            Ok(n) if n > 0 => {
+                let head = String::from_utf8_lossy(&buf[..n]);
+                return head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200");
+            }
+            Ok(_) => return false,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => return false,
         }
-        _ => false,
     }
 }
 
@@ -375,8 +392,33 @@ impl Drop for JobObject {
 
 #[cfg(test)]
 mod tests {
-    use super::sidecar_models_dir;
-    use std::path::{Path, PathBuf};
+    use super::{http_health_ok, sidecar_models_dir, HEALTH_RESPONSE_TIMEOUT};
+    use std::{
+        io::Read,
+        net::TcpListener,
+        path::{Path, PathBuf},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn health_probe_deadlines_an_accepted_connection_that_never_responds() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let port = listener.local_addr().expect("test listener address").port();
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept health probe");
+            let mut request = [0_u8; 256];
+            let _ = socket.read(&mut request);
+            thread::sleep(HEALTH_RESPONSE_TIMEOUT + Duration::from_secs(2));
+        });
+
+        let started = Instant::now();
+        assert!(!http_health_ok(port));
+        assert!(
+            started.elapsed() < HEALTH_RESPONSE_TIMEOUT + Duration::from_secs(1),
+            "health probe exceeded its hard response deadline"
+        );
+    }
 
     #[test]
     fn models_dir_sits_beside_an_absolute_engine_path() {

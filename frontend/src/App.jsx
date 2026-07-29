@@ -53,6 +53,9 @@ function App() {
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
   const [deleteBusy, setDeleteBusy] = useState(false)
   const [modelsVisited, setModelsVisited] = useState(false)
+  const [codeVisited, setCodeVisited] = useState(
+    () => typeof window !== 'undefined' && window.location.hash === '#code',
+  )
   const [codeThreads, setCodeThreads] = useState([])
   const [requestedCodeThread, setRequestedCodeThread] = useState(null)
   const [codeWorkspaceKey, setCodeWorkspaceKey] = useState(0)
@@ -102,6 +105,13 @@ function App() {
 
   useEffect(() => {
     if (tab === 'library') setModelsVisited(true)
+  }, [tab])
+
+  // Keep Code mounted after its first visit. A local coding turn may run for
+  // minutes; switching to Chat must not trigger CodeWorkspace's unmount cleanup
+  // and silently cancel the agent.
+  useEffect(() => {
+    if (tab === 'code') setCodeVisited(true)
   }, [tab])
 
   useEffect(() => {
@@ -339,17 +349,19 @@ function App() {
             />
           )}
 
-          {tab === 'code' && (
-            <CodeWorkspace
-              key={codeWorkspaceKey}
-              apiBase={apiBase}
-              capabilities={dashboard?.capabilities}
-              selectedModel={selectedModel}
-              runtime={runtime}
-              setTab={navigateTab}
-              requestedThread={requestedCodeThread}
-              onHistoryChanged={() => {}}
-            />
+          {codeVisited && (
+            <div className="camelid-code-slot" hidden={tab !== 'code'}>
+              <CodeWorkspace
+                key={codeWorkspaceKey}
+                apiBase={apiBase}
+                capabilities={dashboard?.capabilities}
+                selectedModel={selectedModel}
+                runtime={runtime}
+                setTab={navigateTab}
+                requestedThread={requestedCodeThread}
+                onHistoryChanged={() => {}}
+              />
+            </div>
           )}
 
           {tab === 'analytics' && (

@@ -125,12 +125,19 @@ action: approval is the contract.
 
 **Code (preview).** Switch from Chat to Code in the Web UI or Desktop app, choose one local
 workspace, and give Camelid a coding task. Code uses the terminal agent loop with a deliberately
-scoped tool profile: read, list, literal search, plan, write, edit, and sandboxed shell. Every file
-mutation and shell command pauses for an exact-action approval; network, GUI control, MCP tools,
-subagents, and unattended execution remain unavailable. Automatic checkpoints power the Changes
-view and guarded single-step undo without touching git. Completed turns are stored in the local
-Workspace SQLite store and appear as coding history in the left rail. Code fails closed unless the
-loaded exact model row is supported and has earned `tool_capable: true`.
+scoped tool profile: read, list, literal search, plan, write, edit, sandboxed shell, and bounded
+subagent delegation. Approval-gated is the default. A per-session **Full auto** choice (shown in the
+UI as “Today is a good day to die”) can run writes and sandboxed commands without asking after an
+explicit warning; a separate switch adds `web_search` and `http_fetch`. Child agents inherit that
+same Code allowlist, network choice, and approval posture and are stopped with the parent turn.
+GUI control and MCP tools remain unavailable. Live plans, model output, tool results, approvals,
+and file changes are shown in the thread; switching to Chat does not cancel the run. Automatic
+checkpoints power the Changes view and guarded single-step undo without touching git. Completed
+turns are stored in the local Workspace SQLite store and appear as coding history in the left rail.
+Code fails closed unless the loaded exact model row is supported and has earned
+`tool_capable: true`. File tools are canonical-root confined. Shell enforcement remains
+platform-specific: on Windows it is working-directory pinned and hard-timed, not a filesystem or
+network jail, so the full-auto warning must be taken literally.
 
 **Workspace (preview).** Choose one local directory and ask follow-up questions across a durable
 conversation. Workspace can only list, read, and search within that canonical root; writes, shell,

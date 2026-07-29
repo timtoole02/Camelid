@@ -112,12 +112,16 @@ pub enum LoadOutcome {
 }
 
 /// How a finished/halted chat stream ended.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum StreamEnd {
     /// `[DONE]` (or a clean close) was reached.
     Done,
     /// Aborted because the cancel flag was set (Ctrl-C mid-stream).
     Cancelled,
+    /// The server stopped at `max_tokens` (`finish_reason: "length"`). The text
+    /// is CUT OFF mid-thought — a tool call in it may be unparseable JSON — so
+    /// callers must distinguish it from a normally completed answer.
+    Length,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -267,23 +271,25 @@ impl Client {
         path: &str,
         body: Option<&Value>,
         cancel: &AtomicBool,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> anyhow::Result<(u16, Value)> {
-        let deadline = Instant::now() + timeout;
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
         if cancel.load(Ordering::Relaxed) {
             anyhow::bail!("request cancelled");
         }
-        let connect_timeout = timeout.min(Duration::from_secs(2));
+        let connect_timeout = timeout
+            .unwrap_or(Duration::from_secs(2))
+            .min(Duration::from_secs(2));
         if connect_timeout.is_zero() {
             anyhow::bail!("request exceeded its deadline");
         }
         let mut stream = TcpStream::connect_timeout(&self.addr, connect_timeout)?;
         stream.set_read_timeout(Some(Duration::from_millis(100)))?;
-        stream.set_write_timeout(Some(
-            deadline
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_secs(30)),
-        ))?;
+        let write_timeout = deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::from_secs(30))
+            .min(Duration::from_secs(30));
+        stream.set_write_timeout(Some(write_timeout))?;
         let raw_request = encode_request(
             method,
             path,
@@ -303,7 +309,7 @@ impl Client {
             if cancel.load(Ordering::Relaxed) {
                 anyhow::bail!("request cancelled");
             }
-            if Instant::now() >= deadline {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 anyhow::bail!("request exceeded its deadline");
             }
             match stream.read(&mut chunk) {
@@ -467,6 +473,10 @@ impl Client {
         // From the terminal usage chunk, when the request opted in via
         // stream_options.include_usage (agent lane); absent otherwise.
         let mut prompt_tokens: Option<u32> = None;
+        // `finish_reason: "length"` is the ONLY signal that the model was cut
+        // off at max_tokens. Without it a capped step is indistinguishable from
+        // a finished one, and half-written tool calls get committed as answers.
+        let mut length_capped = false;
         let end = reader.stream(cancel, deadline, |line| {
             if let Some(payload) = line.strip_prefix("data:") {
                 let payload = payload.trim();
@@ -486,6 +496,13 @@ impl Client {
                             on_delta(content);
                         }
                     }
+                    if chunk
+                        .pointer("/choices/0/finish_reason")
+                        .and_then(Value::as_str)
+                        == Some("length")
+                    {
+                        length_capped = true;
+                    }
                     if let Some(pt) = chunk
                         .pointer("/usage/prompt_tokens")
                         .and_then(Value::as_u64)
@@ -496,6 +513,12 @@ impl Client {
             }
             SseControl::Continue
         })?;
+        // A cancel outranks the cap: the user stopped it, whatever the server said.
+        let end = if length_capped && end == StreamEnd::Done {
+            StreamEnd::Length
+        } else {
+            end
+        };
         Ok(StreamStats {
             end,
             deltas,
@@ -553,7 +576,29 @@ impl Client {
             "/api/generation/preflight",
             Some(request),
             cancel,
-            timeout,
+            Some(timeout),
+        )?;
+        if status != 200 {
+            anyhow::bail!(envelope_message(&body).unwrap_or_else(|| format!("HTTP {status}")));
+        }
+        let count = body
+            .get("prompt_token_count")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("generation preflight omitted prompt_token_count"))?;
+        u32::try_from(count).map_err(|_| anyhow::anyhow!("prompt token count exceeds u32"))
+    }
+
+    pub fn generation_preflight_with_cancel(
+        &self,
+        request: &Value,
+        cancel: &AtomicBool,
+    ) -> anyhow::Result<u32> {
+        let (status, body) = self.request_with_control(
+            "POST",
+            "/api/generation/preflight",
+            Some(request),
+            cancel,
+            None,
         )?;
         if status != 200 {
             anyhow::bail!(envelope_message(&body).unwrap_or_else(|| format!("HTTP {status}")));
@@ -1091,6 +1136,61 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["outcome"], "answered");
         server.join().unwrap();
+    }
+
+    /// `finish_reason: "length"` is the only way to tell a reply that FINISHED
+    /// from one the token cap cut off. Reporting it as `Done` is what let a
+    /// half-written tool call reach the transcript as a settled answer.
+    #[test]
+    fn a_stream_stopped_at_the_token_cap_reports_length_not_done() {
+        for (finish_reason, expected) in [("length", StreamEnd::Length), ("stop", StreamEnd::Done)]
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                // Read the headers AND the POST body. Closing a socket that
+                // still has unread bytes queued sends RST rather than FIN on
+                // Windows, which discards the response the client is reading.
+                loop {
+                    let read = stream.read(&mut buffer).unwrap();
+                    request.extend_from_slice(&buffer[..read]);
+                    let Some(head) = find(&request, b"\r\n\r\n").map(|at| at + 4) else {
+                        assert!(read > 0, "the client closed before sending headers");
+                        continue;
+                    };
+                    let declared = String::from_utf8_lossy(&request[..head])
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("Content-Length: ")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if read == 0 || request.len() >= head + declared {
+                        break;
+                    }
+                }
+                let events = format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"fn main() {{\"}}}}]}}\n\n\
+                     data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"{finish_reason}\"}}]}}\n\n\
+                     data: [DONE]\n\n"
+                );
+                let body = format!("{:X}\r\n{events}\r\n0\r\n\r\n", events.len());
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+                );
+            });
+
+            let stats = Client::new(addr)
+                .chat_stream_timed(&json!({"model": "m"}), &AtomicBool::new(false), |_| {})
+                .unwrap();
+            assert_eq!(stats.end, expected, "finish_reason {finish_reason}");
+            assert_eq!(stats.deltas, 1);
+            server.join().unwrap();
+        }
     }
 
     #[test]

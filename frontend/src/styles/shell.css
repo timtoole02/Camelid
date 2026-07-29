@@ -24,6 +24,8 @@
   background: var(--color-canvas);
 }
 .camelid-view { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; }
+.camelid-code-slot { display: flex; flex: 1; min-height: 0; }
+.camelid-code-slot[hidden] { display: none; }
 .camelid-notice-slot { padding: var(--space-2) var(--space-5) 0; }
 
 /* ---- Top bar ---- */

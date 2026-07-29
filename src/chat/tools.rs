@@ -262,6 +262,12 @@ const MAX_SEARCH_FILES: usize = 5_000;
 const MAX_SEARCH_DURATION: Duration = Duration::from_secs(2);
 const FULL_SEARCH_HITS: u64 = 100;
 const WORKSPACE_SEARCH_HITS: u64 = 20;
+/// Per-observation ceiling for the browser/desktop coding surface. Generous —
+/// 8x the read-only cap, so ordinary test output and file reads pass through
+/// whole — but FINITE, because this ships to machines whose RAM and context
+/// budget are unknown here. ~4k tokens, i.e. half an 8192-token budget, so a
+/// single runaway command cannot on its own force a context trim.
+const WEB_CODE_OBSERVATION_LIMIT: usize = 16 * 1024;
 const SEARCH_SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".camelid"];
 
 impl Sandbox {
@@ -386,8 +392,11 @@ pub enum ToolProfile {
     Full,
     WorkspaceReadOnly,
     /// Browser/Desktop coding surface. Deliberately narrower than `Full`: it
-    /// can inspect and modify the selected workspace and run a sandboxed shell,
-    /// but it never inherits GUI, MCP, network, or subagent tools.
+    /// can inspect and modify the selected workspace, run a sandboxed shell, and
+    /// delegate a scoped subtask to a child agent. Network tools are available
+    /// only when that session explicitly opts in; GUI and MCP tools are never
+    /// inherited. Subagents inherit this same profile and the parent's approval
+    /// posture, and the depth limit stops a child from spawning further children.
     WebCode,
 }
 
@@ -405,6 +414,10 @@ impl ToolProfile {
                     | "write_file"
                     | "edit_file"
                     | "run_shell"
+                    | "web_search"
+                    | "http_fetch"
+                    | "spawn_subagent"
+                    | "check_subagent_status"
             ),
         }
     }
@@ -417,7 +430,15 @@ impl ToolProfile {
         match self {
             Self::Full => None,
             Self::WorkspaceReadOnly => Some(2 * 1024),
-            Self::WebCode => None,
+            // Bounded, not minimal. `None` here meant a single `run_shell` log
+            // could enter history unclipped, be re-prefilled on every later step,
+            // and — because the event queue bounds on COUNT — leave the shipped
+            // memory ceiling defined by whatever the workspace happened to print.
+            // On one known dev box that never surfaced; on unknown hardware an
+            // unbounded buffer is a defect, not a tradeoff. The clip appends a
+            // visible "...[truncated for Workspace]" marker, so the model can
+            // narrow its command and re-read rather than silently losing output.
+            Self::WebCode => Some(WEB_CODE_OBSERVATION_LIMIT),
         }
     }
 
@@ -499,10 +520,6 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
             params: json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}),
         });
     }
-    if profile == ToolProfile::WebCode {
-        tools.retain(|tool| profile.allows(&tool.name));
-        return tools;
-    }
     if allow_net {
         tools.push(ToolSpec {
             name: "web_search".into(),
@@ -523,6 +540,11 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
             params: json!({"type":"object","properties":{"url":{"type":"string"},"method":{"type":"string"}},"required":["url"]}),
         });
     }
+    // NOTE: WebCode does NOT return here. It used to, which put the early exit
+    // ahead of the subagent block below and made delegation unreachable on the
+    // coding surface no matter how the session was configured. The profile
+    // filter now runs once at the end, so WebCode sees the subagent tools while
+    // `allows` still strips the Windows/GUI/MCP sets it must never inherit.
     // Subagent orchestration tools — advertised only when a session has enabled
     // orchestration AND we are below the spawn-tree depth limit (so subagents
     // don't see spawn_subagent). spawn_subagent is Exec (honours the kill-switch);
@@ -533,7 +555,11 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
                 name: "spawn_subagent".into(),
                 description: "Spawn a child agent (subagent) to work on one scoped goal in the \
                               workspace, then poll it with check_subagent_status. Exec tier — \
-                              always gated. Isolation-first, not a speedup."
+                              always gated. Isolation-first, not a speedup. The child runs \
+                              UNATTENDED: nobody can answer an approval for it, so unless this \
+                              session is in confirmed full-auto it can only READ. Delegate \
+                              investigation (find where X is handled, summarise how Y works) and \
+                              make the edits yourself from what it reports."
                     .into(),
                 risk: Risk::Exec,
                 params: json!({"type":"object","properties":{
@@ -679,6 +705,7 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
     if profile == ToolProfile::Full {
         tools.extend(super::mcp::specs());
     }
+    tools.retain(|tool| profile.allows(&tool.name));
     tools
 }
 
@@ -1024,11 +1051,10 @@ impl Action {
                 timeout.as_secs()
             ),
             // Verbatim goal text (untrusted, never re-parsed) for the approval UI.
-            // Disclose the child's posture: it runs unattended and cannot prompt,
-            // so it inherits this session's mode and DENIES anything that would
-            // confirm (it can never run an unattended shell).
+            // The child inherits this session's tool/network/approval boundary;
+            // if the session is gated, actions needing another prompt are denied.
             Action::SpawnSubagent { subtask_id, goal } => format!(
-                "spawn_subagent {subtask_id} in {} (runs unattended; Exec denied in the child):\n  goal: {goal}",
+                "spawn_subagent {subtask_id} in {} (runs unattended under this session's access policy):\n  goal: {goal}",
                 sandbox.rel(sandbox.root())
             ),
             // Verbatim text/chord so approval shows exactly what will be synthesized
@@ -2713,17 +2739,50 @@ mod tests {
                 "write_file",
                 "edit_file",
                 "run_shell",
+                "web_search",
+                "http_fetch",
             ]
         );
-        for forbidden in [
-            "http_fetch",
-            "web_search",
-            "spawn_subagent",
-            "run_windows_command",
-            "gui_input",
-        ] {
+        // Delegation is in scope for a coding surface, so the profile permits
+        // the subagent tools — but they are still only ADVERTISED once a session
+        // has configured the subagent runtime, which is why the spec list above
+        // does not contain them.
+        for allowed in ["spawn_subagent", "check_subagent_status"] {
+            assert!(ToolProfile::WebCode.allows(allowed), "{allowed}");
+        }
+        // Machine control never comes along with it.
+        for forbidden in ["run_windows_command", "gui_input", "ui_click", "screenshot"] {
             assert!(!ToolProfile::WebCode.allows(forbidden), "{forbidden}");
         }
+        let offline = specs_for(ToolProfile::WebCode, false, ShellSandbox::Sandboxed);
+        assert!(offline
+            .iter()
+            .all(|tool| !matches!(tool.name.as_str(), "web_search" | "http_fetch")));
+    }
+
+    /// This ships to machines whose RAM and context budget are unknown here, so
+    /// EVERY profile that feeds a bounded event queue must have a finite
+    /// per-observation ceiling. A count-bounded queue holding unbounded items is
+    /// not actually bounded.
+    #[test]
+    fn every_workspace_profile_bounds_a_single_observation() {
+        for profile in [ToolProfile::WorkspaceReadOnly, ToolProfile::WebCode] {
+            let limit = profile
+                .observation_limit()
+                .unwrap_or_else(|| panic!("{profile:?} must cap one observation"));
+            let runaway = "x".repeat(4 * 1024 * 1024);
+            let clipped = ToolOutcome::Ok(runaway).clipped(limit);
+            assert!(
+                clipped.text().len() <= limit,
+                "{profile:?} exceeded its own ceiling"
+            );
+            assert!(clipped.text().ends_with("...[truncated for Workspace]"));
+        }
+        // Generous enough that ordinary coding output is untouched.
+        let ordinary = "cargo test output\n".repeat(200);
+        assert!(ordinary.len() < WEB_CODE_OBSERVATION_LIMIT);
+        let kept = ToolOutcome::Ok(ordinary.clone()).clipped(WEB_CODE_OBSERVATION_LIMIT);
+        assert_eq!(kept.text(), ordinary, "a normal-sized log must pass whole");
     }
 
     #[test]

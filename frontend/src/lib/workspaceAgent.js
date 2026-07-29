@@ -7,6 +7,14 @@ export const WORKSPACE_IDLE_STATE = Object.freeze({
   totalTurns: 0,
   error: '',
   approval: null,
+  // Monotonic counter bumped on every accepted event. A streamed delta is
+  // MERGED into the tail rather than appended, so `events.length` does not
+  // change while text arrives — anything that must react per token (the
+  // autoscroll) has to watch this instead.
+  revision: 0,
+  // Maintained here so the view never has to scan the event list on render.
+  latestTool: null,
+  latestResult: null,
 })
 
 function appendActivity(events, event) {
@@ -47,7 +55,10 @@ function reduceAgentEvent(state, envelope, allowApprovals) {
       phase: 'running',
       events: appendActivity(state.events, envelope),
       turns: [...state.turns, { user: String(envelope.content || ''), assistant: '', outcome: '' }],
-      totalTurns: Math.max(state.totalTurns || 0, state.turns.length) + 1,
+      // `turns` already includes the turn being appended, so this is the count
+      // itself — the old `max(total, turns.length) + 1` double-counted every
+      // turn after a restore and drifted the header away from reality.
+      totalTurns: Math.max(state.totalTurns || 0, state.turns.length + 1),
     }
   }
   const events = [...state.events]
@@ -115,12 +126,33 @@ function reduceAgentEvent(state, envelope, allowApprovals) {
   }
 }
 
+/// Bump the revision and keep the derived tool pointers current. Returns the
+/// SAME object when the inner reducer ignored the event, so React can skip the
+/// re-render entirely.
+function withDerived(previous, next, envelope) {
+  if (next === previous) return previous
+  const event = envelope?.event
+  // A reset is a return to the idle state, revision counter included.
+  if (event === 'session.reset') return next
+  const derived = { ...next, revision: (previous.revision || 0) + 1 }
+  if (event === 'tool.call') derived.latestTool = envelope
+  else if (event === 'tool.result') {
+    derived.latestTool = null
+    derived.latestResult = envelope
+  }
+  else if (event === 'thread.restored') {
+    derived.latestTool = null
+    derived.latestResult = null
+  }
+  return derived
+}
+
 export function reduceWorkspaceEvent(state, envelope) {
-  return reduceAgentEvent(state, envelope, false)
+  return withDerived(state, reduceAgentEvent(state, envelope, false), envelope)
 }
 
 export function reduceCodeEvent(state, envelope) {
-  return reduceAgentEvent(state, envelope, true)
+  return withDerived(state, reduceAgentEvent(state, envelope, true), envelope)
 }
 
 export function workspaceEndpoint(apiBase, suffix = '') {

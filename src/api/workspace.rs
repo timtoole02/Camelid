@@ -16,22 +16,46 @@ use super::{
 };
 use crate::chat::agent::LoopEnd;
 use crate::chat::workspace_bridge::{
-    bridge, run_live, WorkspaceBridgeControl, WorkspaceBridgeWorker, WorkspaceDecisionKind,
-    WorkspaceEvent, WorkspaceRunConfig, WorkspaceRunMode,
+    bridge, run_live, WorkspaceApprovalMode, WorkspaceBridgeControl, WorkspaceBridgeWorker,
+    WorkspaceDecisionKind, WorkspaceEvent, WorkspaceRunConfig, WorkspaceRunMode,
 };
 use crate::chat::workspace_memory::{
     default_store_path, EvidenceInput, StoredThread, WorkspaceMemoryStore,
 };
 
-const EVENT_BACKLOG: usize = 128;
-const EVENT_STREAM_BUFFER: usize = 128;
+// Every generated token is one `model.delta` through this bounded channel, and
+// the send BLOCKS, so a shallow backlog makes the browser's render loop
+// backpressure on decode (the old 128 did exactly that).
+//
+// Sized for UNKNOWN hardware, not this dev box: at 10-30 tok/s this absorbs
+// roughly 30-100s of decode before it can ever throttle, while the worst-case
+// memory it can pin is bounded — 1024 x the per-observation ceiling
+// (`WEB_CODE_OBSERVATION_LIMIT`) rather than 1024 x "whatever the workspace
+// printed". Both halves are load-bearing: a count-based bound is only a real
+// bound once the item size has one too.
+const EVENT_BACKLOG: usize = 1024;
+const EVENT_STREAM_BUFFER: usize = 1024;
 const DEFAULT_MAX_STEPS: usize = 12;
 const MAX_STEPS: usize = 32;
-const DEFAULT_MAX_TOKENS: u32 = 512;
-const MAX_TOKENS: u32 = 1024;
+// A coding step routinely carries a whole file in a `write_file` argument. At
+// the old 512/1024 the call was cut off mid-JSON, parsed as no call at all, and
+// landed in the transcript as a mangled "answer" with the write silently lost.
+const DEFAULT_MAX_TOKENS: u32 = 2048;
+const MAX_TOKENS: u32 = 8192;
 const MAX_GOAL_BYTES: usize = 4 * 1024;
 const EVENT_CLAIM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const AUTO_COMPACT_TRIGGER_PERCENT: u32 = 75;
+
+fn workspace_max_steps(mode: WorkspaceRunMode, requested: Option<usize>) -> Result<usize, ()> {
+    if mode.is_code() {
+        return Ok(0);
+    }
+    let max_steps = requested.unwrap_or(DEFAULT_MAX_STEPS);
+    (1..=MAX_STEPS)
+        .contains(&max_steps)
+        .then_some(max_steps)
+        .ok_or(())
+}
 const AUTO_COMPACT_MIN_TURNS: u32 = 4;
 
 async fn run_workspace_blocking<T, F>(operation: F) -> Result<T, Response>
@@ -77,6 +101,8 @@ struct ActiveWorkspaceSession {
     max_tokens: u32,
     temperature: f32,
     allow_writes: bool,
+    approval_mode: WorkspaceApprovalMode,
+    allow_network: bool,
     mode: WorkspaceRunMode,
     memory: WorkspaceMemoryStore,
     state: StdMutex<WorkspaceSessionState>,
@@ -354,6 +380,10 @@ pub(super) struct CreateWorkspaceSessionRequest {
     allow_writes: Option<bool>,
     #[serde(default)]
     mode: WorkspaceRunMode,
+    #[serde(default)]
+    approval_mode: WorkspaceApprovalMode,
+    #[serde(default)]
+    allow_network: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -371,6 +401,8 @@ struct WorkspaceSessionResponse {
     max_steps: usize,
     max_tokens: u32,
     allow_writes: bool,
+    approval_mode: WorkspaceApprovalMode,
+    allow_network: bool,
     mode: WorkspaceRunMode,
 }
 
@@ -383,6 +415,8 @@ struct WorkspaceSessionStatusResponse {
     context_budget_tokens: u32,
     resident_cuda: Option<crate::inference::ResidentCudaStatus>,
     allow_writes: bool,
+    approval_mode: WorkspaceApprovalMode,
+    allow_network: bool,
     mode: WorkspaceRunMode,
 }
 
@@ -1069,15 +1103,22 @@ pub(super) async fn create_session(
             Some("goal"),
         );
     }
-    let max_steps = request.max_steps.unwrap_or(DEFAULT_MAX_STEPS);
-    if !(1..=MAX_STEPS).contains(&max_steps) {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_workspace_limits",
-            format!("max_steps must be between 1 and {MAX_STEPS}"),
-            Some("max_steps"),
-        );
-    }
+    let mode = request.mode;
+    // Code mode is user-cancellable and has a result-aware no-progress guard,
+    // so it does not impose an arbitrary number of model/tool turns. A zero
+    // internal value means unlimited; read-only Workspace keeps its bounded
+    // request contract.
+    let max_steps = match workspace_max_steps(mode, request.max_steps) {
+        Ok(max_steps) => max_steps,
+        Err(()) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_workspace_limits",
+                format!("max_steps must be between 1 and {MAX_STEPS}"),
+                Some("max_steps"),
+            )
+        }
+    };
     let max_tokens = request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
     if !(1..=MAX_TOKENS).contains(&max_tokens) {
         return api_error(
@@ -1096,13 +1137,38 @@ pub(super) async fn create_session(
             Some("temperature"),
         );
     }
-    let mode = request.mode;
+    let approval_mode = request.approval_mode;
+    let allow_network = request.allow_network;
     if request.allow_writes.unwrap_or(false) && !mode.is_code() {
         return api_error(
             StatusCode::BAD_REQUEST,
             "workspace_read_only",
             "Workspace is read-only; write and edit tools are not available".to_string(),
             Some("allow_writes"),
+        );
+    }
+    if approval_mode.is_full_auto() && !mode.is_code() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "workspace_read_only",
+            "Full-auto approval mode is available only in Code mode".to_string(),
+            Some("approval_mode"),
+        );
+    }
+    if allow_network && !mode.is_code() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "workspace_read_only",
+            "Network and web-search tools are available only in Code mode".to_string(),
+            Some("allow_network"),
+        );
+    }
+    if approval_mode.is_full_auto() && crate::chat::agent::is_production() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "workspace_full_auto_refused",
+            "Full auto is disabled while CAMELID_PRODUCTION is set".to_string(),
+            Some("approval_mode"),
         );
     }
     let allow_writes = mode.is_code();
@@ -1249,6 +1315,8 @@ pub(super) async fn create_session(
         max_tokens,
         temperature,
         mode,
+        approval_mode,
+        allow_network,
     };
     if mode.is_code() {
         crate::chat::checkpoint::clear();
@@ -1261,6 +1329,8 @@ pub(super) async fn create_session(
         max_tokens,
         temperature,
         allow_writes,
+        approval_mode,
+        allow_network,
         mode,
         memory,
         state: StdMutex::new(WorkspaceSessionState::WaitingForEvents),
@@ -1283,6 +1353,8 @@ pub(super) async fn create_session(
             max_steps,
             max_tokens,
             allow_writes,
+            approval_mode,
+            allow_network,
             mode,
         }),
     )
@@ -1708,11 +1780,13 @@ pub(super) async fn session_status(
         workspace: simplify_path(&session.workspace),
         model_id: session.model_id.clone(),
         state: status,
-        context_budget_tokens: crate::chat::workspace_bridge::WORKSPACE_CONTEXT_BUDGET_TOKENS,
+        context_budget_tokens: session.mode.context_budget_tokens(),
         resident_cuda: crate::inference::resident_cuda_status(super::model_resident_cache_key(
             &session.model_id,
         )),
         allow_writes: session.allow_writes,
+        approval_mode: session.approval_mode,
+        allow_network: session.allow_network,
         mode: session.mode,
     })
     .into_response()
@@ -1854,6 +1928,8 @@ pub(super) async fn send_message(
         max_tokens: session.max_tokens,
         temperature: session.temperature,
         mode: session.mode,
+        approval_mode: session.approval_mode,
+        allow_network: session.allow_network,
     };
     match session.install_turn(events, worker, run_config, control) {
         Ok(InstallTurn::Installed) => {}
@@ -2289,6 +2365,29 @@ mod tests {
     }
 
     #[test]
+    fn workspace_session_request_defaults_to_gated_and_offline() {
+        let request: CreateWorkspaceSessionRequest = serde_json::from_value(serde_json::json!({
+            "workspace": ".",
+            "goal": "inspect the project",
+            "mode": "code"
+        }))
+        .unwrap();
+        assert_eq!(request.approval_mode, WorkspaceApprovalMode::ApprovalGated);
+        assert!(!request.allow_network);
+    }
+
+    #[test]
+    fn code_sessions_have_no_arbitrary_step_limit() {
+        assert_eq!(workspace_max_steps(WorkspaceRunMode::Code, None), Ok(0));
+        assert_eq!(workspace_max_steps(WorkspaceRunMode::Code, Some(20)), Ok(0));
+        assert_eq!(
+            workspace_max_steps(WorkspaceRunMode::ReadOnly, None),
+            Ok(DEFAULT_MAX_STEPS)
+        );
+        assert!(workspace_max_steps(WorkspaceRunMode::ReadOnly, Some(MAX_STEPS + 1)).is_err());
+    }
+
+    #[test]
     fn manager_reads_terminal_and_active_session_states_without_guessing() {
         let make_session = |state| {
             let (worker, client) = bridge(1);
@@ -2301,6 +2400,8 @@ mod tests {
                 max_tokens: 1,
                 temperature: 0.0,
                 allow_writes: true,
+                approval_mode: WorkspaceApprovalMode::ApprovalGated,
+                allow_network: false,
                 mode: WorkspaceRunMode::ReadOnly,
                 memory: WorkspaceMemoryStore::open(std::env::temp_dir().join(format!(
                     "camelid-workspace-state-test-{}.sqlite3",
@@ -2349,6 +2450,8 @@ mod tests {
             max_tokens: 1,
             temperature: 0.0,
             allow_writes: true,
+            approval_mode: WorkspaceApprovalMode::ApprovalGated,
+            allow_network: false,
             mode: WorkspaceRunMode::ReadOnly,
             memory,
             state: StdMutex::new(WorkspaceSessionState::Idle),
@@ -2371,6 +2474,8 @@ mod tests {
             max_tokens: 1,
             temperature: 0.0,
             mode: WorkspaceRunMode::ReadOnly,
+            approval_mode: WorkspaceApprovalMode::ApprovalGated,
+            allow_network: false,
         };
         let (worker, client) = bridge(1);
         let (events, control) = client.into_parts();
@@ -2414,6 +2519,8 @@ mod tests {
             max_tokens: 1,
             temperature: 0.0,
             allow_writes: false,
+            approval_mode: WorkspaceApprovalMode::ApprovalGated,
+            allow_network: false,
             mode: WorkspaceRunMode::ReadOnly,
             memory,
             state: StdMutex::new(WorkspaceSessionState::Cancelled),
@@ -2443,6 +2550,8 @@ mod tests {
             max_tokens: 1,
             temperature: 0.0,
             allow_writes: false,
+            approval_mode: WorkspaceApprovalMode::ApprovalGated,
+            allow_network: false,
             mode: WorkspaceRunMode::ReadOnly,
             memory,
             state: StdMutex::new(WorkspaceSessionState::Cancelling),
@@ -2465,6 +2574,8 @@ mod tests {
             max_tokens: 1,
             temperature: 0.0,
             mode: WorkspaceRunMode::ReadOnly,
+            approval_mode: WorkspaceApprovalMode::ApprovalGated,
+            allow_network: false,
         };
 
         assert!(session
@@ -2501,6 +2612,8 @@ mod tests {
                 max_tokens: 1,
                 temperature: 0.0,
                 allow_writes: false,
+                approval_mode: WorkspaceApprovalMode::ApprovalGated,
+                allow_network: false,
                 mode: WorkspaceRunMode::ReadOnly,
                 memory,
                 state: StdMutex::new(terminal_state),
@@ -2523,6 +2636,8 @@ mod tests {
                 max_tokens: 1,
                 temperature: 0.0,
                 mode: WorkspaceRunMode::ReadOnly,
+                approval_mode: WorkspaceApprovalMode::ApprovalGated,
+                allow_network: false,
             };
             let (worker, client) = bridge(1);
             let (events, control) = client.into_parts();
@@ -2555,6 +2670,8 @@ mod tests {
             max_tokens: 1,
             temperature: 0.0,
             allow_writes: false,
+            approval_mode: WorkspaceApprovalMode::ApprovalGated,
+            allow_network: false,
             mode: WorkspaceRunMode::ReadOnly,
             memory,
             state: StdMutex::new(WorkspaceSessionState::WaitingForEvents),
@@ -2573,6 +2690,8 @@ mod tests {
                 max_tokens: 1,
                 temperature: 0.0,
                 mode: WorkspaceRunMode::ReadOnly,
+                approval_mode: WorkspaceApprovalMode::ApprovalGated,
+                allow_network: false,
             })),
             control: StdMutex::new(Some(control)),
             current_turn: StdMutex::new(Some(("message-1".into(), 0))),

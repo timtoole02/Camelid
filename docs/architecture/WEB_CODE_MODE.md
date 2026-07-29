@@ -8,8 +8,12 @@ Chat/Code switch. It does not replace Chat, the read-only Workspace, or the term
 ## User experience
 
 - **Chat** retains the ordinary prompt conversation.
-- **Code** selects one local workspace, runs an approval-gated coding turn, and streams model and
-  tool activity.
+- **Code** selects one local workspace and streams readable model, plan, tool, approval, and change
+  activity for the coding turn.
+- Approval-gated is the default. A separately confirmed full-auto choice applies to one session;
+  network/web search is controlled by an independent switch.
+- Switching back to Chat hides rather than unmounts Code, so the run continues until it finishes or
+  the user presses Stop.
 - The left rail shows durable coding threads independently of chat history.
 - A completed session exposes its checkpoint summary and diff, plus guarded single-step undo.
 - Saved coding turns can be reopened and resumed when the same exact model artifact is active.
@@ -22,17 +26,31 @@ same loopback WebUI served by the engine.
 The server, not the browser, owns the boundary:
 
 1. Requests require the existing loopback and exact same-origin authorization.
-2. The workspace is canonicalized and every file or shell target stays confined to that root.
+2. The workspace is canonicalized and every file-tool target stays confined to that root.
 3. Admission requires a loaded, generation-ready, supported exact model row with
    `tool_capable: true`.
-4. `ToolProfile::WebCode` advertises and accepts only:
+4. `ToolProfile::WebCode` advertises and accepts:
    `read_file`, `list_dir`, literal-content `search`, `update_plan`, `write_file`, `edit_file`, and
-   sandboxed `run_shell`.
-5. File mutations and shell commands use the existing approval bridge. Network, GUI, MCP,
-   subagent, Windows computer-control, and unattended tools are absent.
-6. Starting another workspace session is refused while a turn is active.
-7. The existing read-only mode remains the default. A legacy `allow_writes: true` request without
+   sandboxed `run_shell`; bounded `spawn_subagent`/`check_subagent_status` are added only while the
+   Code subagent runtime is active.
+5. `allow_network: true` adds only the built-in `web_search` and `http_fetch` tools. The sandbox
+   rejects both when the switch is off. This is not an OS egress firewall for `run_shell`.
+6. `approval_mode: "approval_gated"` sends exact write/Exec/network decisions through the approval
+   bridge. The separately confirmed `"full_auto"` policy promotes them for that Code session only
+   and is refused when `CAMELID_PRODUCTION` is set. File tools remain root-confined.
+7. Child agents inherit the WebCode allowlist, network switch, shell sandbox, and approval posture.
+   They cannot spawn grandchildren and are killed when the parent turn ends or is stopped.
+8. GUI, Windows computer-control, and MCP tools are never advertised or accepted by WebCode.
+   General shell execution is nevertheless general process execution: on Windows the existing
+   `ShellSandbox::Sandboxed` contract is cwd-pin + hard timeout, not filesystem or network
+   isolation. The full-auto confirmation states this explicitly.
+9. Starting another workspace session is refused while a turn is active.
+10. The existing read-only mode remains the default. A legacy `allow_writes: true` request without
    `mode: "code"` still fails with `400 workspace_read_only`.
+
+Code uses cancellation and a result-aware repetition guard instead of an arbitrary model/tool step
+count. Its local-model stream has no wall-clock model-step deadline; the visible Stop control remains
+authoritative.
 
 ## API additions
 

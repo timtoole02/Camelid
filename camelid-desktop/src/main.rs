@@ -11,7 +11,11 @@
 
 mod engine;
 
-use std::sync::Mutex;
+use std::{
+    sync::Mutex,
+    thread,
+    time::{Duration, Instant},
+};
 use tauri::{Emitter, Manager};
 
 use engine::Engine;
@@ -74,21 +78,78 @@ fn start_engine(app: tauri::AppHandle) {
                 }
             }
             emit_status(&app, "Engine ready. Loading\u{2026}");
-            if let Some(window) = app.get_webview_window("main") {
-                match tauri::Url::parse(&url) {
-                    Ok(parsed) => {
-                        if let Err(e) = window.navigate(parsed) {
-                            emit_error(&app, &format!("could not load the engine UI: {e}"));
-                        }
-                    }
-                    Err(e) => emit_error(&app, &format!("invalid engine URL {url}: {e}")),
-                }
-            } else {
-                emit_error(&app, "internal error: main window not found");
-            }
+            navigate_engine_ui(&app, &url);
         }
         Err(e) => emit_error(&app, &e.detail()),
     }
+}
+
+/// Navigate away from the bundled splash and verify that WebView2 accepted the request.
+///
+/// `WebviewWindow::navigate` is asynchronous: a successful return only means the request
+/// reached the UI event loop. If WebView2 leaves the splash in place, fall back to a
+/// same-window JavaScript navigation and report a visible error if neither route lands.
+fn navigate_engine_ui(app: &tauri::AppHandle, url: &str) {
+    let Some(window) = app.get_webview_window("main") else {
+        emit_error(app, "internal error: main window not found");
+        return;
+    };
+    let parsed = match tauri::Url::parse(url) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            emit_error(app, &format!("invalid engine URL {url}: {e}"));
+            return;
+        }
+    };
+
+    if let Err(e) = window.navigate(parsed.clone()) {
+        emit_error(app, &format!("could not load the engine UI: {e}"));
+        return;
+    }
+    if wait_for_navigation(&window, &parsed, Duration::from_secs(5)) {
+        return;
+    }
+
+    // Serialize the URL as a JavaScript string rather than interpolating it directly.
+    let target = match serde_json::to_string(url) {
+        Ok(target) => target,
+        Err(e) => {
+            emit_error(app, &format!("could not encode the engine URL: {e}"));
+            return;
+        }
+    };
+    if let Err(e) = window.eval(format!("window.location.replace({target})")) {
+        emit_error(app, &format!("could not retry loading the engine UI: {e}"));
+        return;
+    }
+    if !wait_for_navigation(&window, &parsed, Duration::from_secs(5)) {
+        let current = window
+            .url()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|_| "unknown".to_owned());
+        emit_error(
+            app,
+            &format!("engine is healthy at {url}, but the Desktop window remained at {current}"),
+        );
+    }
+}
+
+fn wait_for_navigation(
+    window: &tauri::WebviewWindow,
+    target: &tauri::Url,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if window
+            .url()
+            .is_ok_and(|current| current.origin() == target.origin())
+        {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    false
 }
 
 /// Kill the sidecar cleanly on shutdown. Idempotent: `take()` ensures one shutdown.

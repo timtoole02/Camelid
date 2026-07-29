@@ -210,6 +210,9 @@ fn base_config(concurrency: usize, timeout: Duration) -> SubagentConfig {
         // read-only call anyway).
         auto_approve: false,
         shell_mode: super::shell_sandbox::ShellSandbox::Sandboxed,
+        allow_net: false,
+        yolo: false,
+        web_code: false,
     }
 }
 
@@ -449,6 +452,9 @@ fn run_real_model_battery(
         timeout: Duration::from_secs(60),
         auto_approve: true,
         shell_mode: super::shell_sandbox::ShellSandbox::Unrestricted,
+        allow_net: false,
+        yolo: false,
+        web_code: false,
     });
 
     let sandbox = match Sandbox::new(&work, false, Duration::from_secs(60)) {
