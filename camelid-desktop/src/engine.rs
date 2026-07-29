@@ -90,7 +90,7 @@ impl EngineError {
                 "Another local process claimed Camelid's selected loopback port. Close it and retry."
             }
             EngineErrorKind::StartupTimeout => {
-                "The engine did not pass its 40-second health check. Retry, then review the technical details if it persists."
+                "The engine did not pass its 120-second health check. Retry, then review the technical details if it persists."
             }
             EngineErrorKind::StartupFailed => {
                 "The engine stopped before it became healthy. Review the technical details, then retry."
@@ -334,8 +334,7 @@ fn wait_for_health_with_timeout(
             return Err(EngineError::new(
                 EngineErrorKind::StartupTimeout,
                 format!(
-                    "the camelid engine did not report healthy on 127.0.0.1:{port} within {}s",
-                    HEALTH_TIMEOUT.as_secs()
+                    "the camelid engine did not report healthy on 127.0.0.1:{port} within {timeout:?}",
                 ),
             ));
         }
@@ -556,7 +555,7 @@ mod tests {
             (
                 EngineErrorKind::StartupTimeout,
                 "Engine startup timed out",
-                "40-second health check",
+                "120-second health check",
             ),
             (
                 EngineErrorKind::StartupFailed,

@@ -1212,7 +1212,15 @@ pub(super) async fn create_session(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let semantic_retriever = workspace_semantic_retriever(&state, &workspace).await;
+    // Semantic retrieval is a read-only Workspace feature: the session-scoped
+    // index is built once and never invalidated, which is only sound while the
+    // workspace cannot change under it. Code mode writes files, so its turns
+    // must not be fed pre-edit excerpts labeled as live workspace content.
+    let semantic_retriever = if mode.is_code() {
+        None
+    } else {
+        workspace_semantic_retriever(&state, &workspace).await
+    };
     let embedding_model_id = semantic_retriever
         .as_ref()
         .map(|retriever| retriever.model_id().to_string());
