@@ -424,6 +424,24 @@ jobs:
           curl --fail --silent http://127.0.0.1:4175/ >/dev/null
           npm run smoke:workspace-visual
 
+      # The Code workbench harness drives the full Chat/Code surface against a
+      # scripted backend: pending-approval rendering, the background-switch
+      # (hide-not-unmount) contract, the access menu, and the full-auto session
+      # request body. It shipped with feat/web-code-mode; wire it here so the
+      # surface is gated, not just runnable.
+      - name: Code workbench visual smoke
+        run: |
+          set -euo pipefail
+          npm run preview > /tmp/camelid-code-workbench-preview.log 2>&1 &
+          preview_pid=$!
+          trap 'kill "$preview_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:4175/ >/dev/null; then break; fi
+            sleep 1
+          done
+          curl --fail --silent http://127.0.0.1:4175/ >/dev/null
+          npm run smoke:code-workbench
+
       - name: Frontend UI regression smoke
         run: npm run smoke:ui
 
