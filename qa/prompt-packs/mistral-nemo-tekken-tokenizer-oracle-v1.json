@@ -1,0 +1,499 @@
+{
+  "oracle": {
+    "command": "llama-tokenize -m <gguf> -p <input> --ids --no-bos --no-escape --log-disable",
+    "commit": "acd79d603cb2e1c84c0886137b80f1ad649b6857",
+    "model": "Mistral-Nemo-Instruct-2407-Q4_K_M.gguf",
+    "pre_tokenizer": "tekken"
+  },
+  "cases": [
+    {
+      "id": "contraction-s",
+      "input": "John's book",
+      "input_utf8_hex": "4a6f686e277320626f6f6b",
+      "expected_token_ids": [
+        14979,
+        1681,
+        4978
+      ]
+    },
+    {
+      "id": "contraction-t",
+      "input": "don't stop",
+      "input_utf8_hex": "646f6e27742073746f70",
+      "expected_token_ids": [
+        21797,
+        2405,
+        5304
+      ]
+    },
+    {
+      "id": "contraction-re",
+      "input": "we're here",
+      "input_utf8_hex": "77652772652068657265",
+      "expected_token_ids": [
+        1808,
+        6185,
+        3226
+      ]
+    },
+    {
+      "id": "contraction-ve",
+      "input": "they've gone",
+      "input_utf8_hex": "7468657927766520676f6e65",
+      "expected_token_ids": [
+        43880,
+        6483,
+        13141
+      ]
+    },
+    {
+      "id": "contraction-ll",
+      "input": "it'll work",
+      "input_utf8_hex": "6974276c6c20776f726b",
+      "expected_token_ids": [
+        1276,
+        7534,
+        2196
+      ]
+    },
+    {
+      "id": "contraction-d",
+      "input": "I'd like",
+      "input_utf8_hex": "492764206c696b65",
+      "expected_token_ids": [
+        1073,
+        6813,
+        2479
+      ]
+    },
+    {
+      "id": "contraction-upper",
+      "input": "JOHN'S BOOK",
+      "input_utf8_hex": "4a4f484e275320424f4f4b",
+      "expected_token_ids": [
+        1074,
+        16724,
+        1078,
+        44161,
+        27478,
+        13257
+      ]
+    },
+    {
+      "id": "digits-run",
+      "input": "1234567890",
+      "input_utf8_hex": "31323334353637383930",
+      "expected_token_ids": [
+        1049,
+        1050,
+        1051,
+        1052,
+        1053,
+        1054,
+        1055,
+        1056,
+        1057,
+        1048
+      ]
+    },
+    {
+      "id": "digits-embedded",
+      "input": "abc123def",
+      "input_utf8_hex": "616263313233646566",
+      "expected_token_ids": [
+        35416,
+        1049,
+        1050,
+        1051,
+        3149
+      ]
+    },
+    {
+      "id": "digits-mixed",
+      "input": "v2.1.0 build 4567",
+      "input_utf8_hex": "76322e312e30206275696c642034353637",
+      "expected_token_ids": [
+        1118,
+        1050,
+        1046,
+        1049,
+        1046,
+        1048,
+        4317,
+        1032,
+        1052,
+        1053,
+        1054,
+        1055
+      ]
+    },
+    {
+      "id": "digits-leading-space",
+      "input": " 42",
+      "input_utf8_hex": "203432",
+      "expected_token_ids": [
+        1032,
+        1052,
+        1050
+      ]
+    },
+    {
+      "id": "camel-case",
+      "input": "HelloWorld",
+      "input_utf8_hex": "48656c6c6f576f726c64",
+      "expected_token_ids": [
+        22177,
+        20249
+      ]
+    },
+    {
+      "id": "camel-acronym",
+      "input": "getHTTPResponse",
+      "input_utf8_hex": "67657448545450526573706f6e7365",
+      "expected_token_ids": [
+        1689,
+        30499,
+        6566
+      ]
+    },
+    {
+      "id": "all-caps",
+      "input": "HELLO WORLD",
+      "input_utf8_hex": "48454c4c4f20574f524c44",
+      "expected_token_ids": [
+        7626,
+        1076,
+        7618,
+        88164
+      ]
+    },
+    {
+      "id": "single-upper",
+      "input": "A b C d",
+      "input_utf8_hex": "41206220432064",
+      "expected_token_ids": [
+        1065,
+        1289,
+        1359,
+        1266
+      ]
+    },
+    {
+      "id": "leading-space-word",
+      "input": " hello",
+      "input_utf8_hex": "2068656c6c6f",
+      "expected_token_ids": [
+        52528
+      ]
+    },
+    {
+      "id": "punct-prefix-word",
+      "input": "(hello",
+      "input_utf8_hex": "2868656c6c6f",
+      "expected_token_ids": [
+        1040,
+        29706
+      ]
+    },
+    {
+      "id": "slash-path",
+      "input": "a/b/c",
+      "input_utf8_hex": "612f622f63",
+      "expected_token_ids": [
+        1097,
+        15836,
+        5938
+      ]
+    },
+    {
+      "id": "url",
+      "input": "https://example.com/path?q=1",
+      "input_utf8_hex": "68747470733a2f2f6578616d706c652e636f6d2f706174683f713d31",
+      "expected_token_ids": [
+        3299,
+        2345,
+        16609,
+        2354,
+        109366,
+        92404,
+        1061,
+        1049
+      ]
+    },
+    {
+      "id": "punct-run",
+      "input": "!!!???",
+      "input_utf8_hex": "2121213f3f3f",
+      "expected_token_ids": [
+        7290,
+        8937,
+        45509
+      ]
+    },
+    {
+      "id": "punct-newline",
+      "input": "x!\ny",
+      "input_utf8_hex": "78210a79",
+      "expected_token_ids": [
+        1120,
+        11330,
+        1121
+      ]
+    },
+    {
+      "id": "multi-space",
+      "input": "a   b",
+      "input_utf8_hex": "6120202062",
+      "expected_token_ids": [
+        1097,
+        1256,
+        1289
+      ]
+    },
+    {
+      "id": "trailing-space",
+      "input": "end   ",
+      "input_utf8_hex": "656e64202020",
+      "expected_token_ids": [
+        1474,
+        1293
+      ]
+    },
+    {
+      "id": "newlines",
+      "input": "x\n\ny",
+      "input_utf8_hex": "780a0a79",
+      "expected_token_ids": [
+        1120,
+        1267,
+        1121
+      ]
+    },
+    {
+      "id": "tab",
+      "input": "a\tb",
+      "input_utf8_hex": "610962",
+      "expected_token_ids": [
+        1097,
+        40796
+      ]
+    },
+    {
+      "id": "leading-newline",
+      "input": "\nstart",
+      "input_utf8_hex": "0a7374617274",
+      "expected_token_ids": [
+        1010,
+        10460
+      ]
+    },
+    {
+      "id": "accented-lower",
+      "input": "élan vital",
+      "input_utf8_hex": "c3a96c616e20766974616c",
+      "expected_token_ids": [
+        4759,
+        1271,
+        21970
+      ]
+    },
+    {
+      "id": "accented-upper",
+      "input": "ÉLAN VITAL",
+      "input_utf8_hex": "c3894c414e20564954414c",
+      "expected_token_ids": [
+        7904,
+        65744,
+        1581,
+        4778,
+        4286
+      ]
+    },
+    {
+      "id": "accented-mixed",
+      "input": "Café Zürich",
+      "input_utf8_hex": "436166c3a9205ac3bc72696368",
+      "expected_token_ids": [
+        1067,
+        4032,
+        1337,
+        51438
+      ]
+    },
+    {
+      "id": "cyrillic",
+      "input": "Привет мир",
+      "input_utf8_hex": "d09fd180d0b8d0b2d0b5d18220d0bcd0b8d180",
+      "expected_token_ids": [
+        45497,
+        13745,
+        50430
+      ]
+    },
+    {
+      "id": "greek",
+      "input": "Ελληνικά",
+      "input_utf8_hex": "ce95cebbcebbceb7cebdceb9cebaceac",
+      "expected_token_ids": [
+        36742,
+        53660,
+        13865
+      ]
+    },
+    {
+      "id": "cjk",
+      "input": "日本語のテキスト",
+      "input_utf8_hex": "e697a5e69cace8aa9ee381aee38386e382ade382b9e38388",
+      "expected_token_ids": [
+        10008,
+        15199,
+        2439,
+        7282,
+        14742,
+        13854
+      ]
+    },
+    {
+      "id": "korean",
+      "input": "한국어 텍스트",
+      "input_utf8_hex": "ed959ceab5adec96b420ed858dec8aa4ed8ab8",
+      "expected_token_ids": [
+        2316,
+        6430,
+        2897,
+        1915,
+        18550,
+        26043
+      ]
+    },
+    {
+      "id": "emoji",
+      "input": "hi 👋 there 🎉",
+      "input_utf8_hex": "686920f09f918b20746865726520f09f8e89",
+      "expected_token_ids": [
+        8101,
+        119685,
+        1145,
+        1139,
+        2156,
+        119685,
+        1142,
+        1137
+      ]
+    },
+    {
+      "id": "combining",
+      "input": "égalité",
+      "input_utf8_hex": "65cc8167616c697465cc81",
+      "expected_token_ids": [
+        1101,
+        1204,
+        1129,
+        7048,
+        1752,
+        1204,
+        1129
+      ]
+    },
+    {
+      "id": "prose",
+      "input": "The quick brown fox jumps over the lazy dog.",
+      "input_utf8_hex": "54686520717569636b2062726f776e20666f78206a756d7073206f76657220746865206c617a7920646f672e",
+      "expected_token_ids": [
+        1784,
+        7586,
+        22980,
+        94137,
+        72993,
+        2136,
+        1278,
+        42757,
+        10575,
+        1046
+      ]
+    },
+    {
+      "id": "code",
+      "input": "fn main() { let x = vec![1, 2, 3]; }",
+      "input_utf8_hex": "666e206d61696e2829207b206c65742078203d20766563215b312c20322c20335d3b207d",
+      "expected_token_ids": [
+        28117,
+        2830,
+        1690,
+        1445,
+        2878,
+        2460,
+        1376,
+        11405,
+        10614,
+        1049,
+        1044,
+        1032,
+        1050,
+        1044,
+        1032,
+        1051,
+        18290,
+        1495
+      ]
+    },
+    {
+      "id": "json",
+      "input": "{\"key\": \"value\", \"n\": 42}",
+      "input_utf8_hex": "7b226b6579223a202276616c7565222c20226e223a2034327d",
+      "expected_token_ids": [
+        19227,
+        3892,
+        2811,
+        1429,
+        3386,
+        1897,
+        1429,
+        1110,
+        2811,
+        1032,
+        1052,
+        1050,
+        1125
+      ]
+    },
+    {
+      "id": "mixed",
+      "input": "Mistral's Nemo-12B: 128K ctx, released 2024/07/18!",
+      "input_utf8_hex": "4d69737472616c2773204e656d6f2d3132423a203132384b206374782c2072656c656173656420323032342f30372f313821",
+      "expected_token_ids": [
+        1077,
+        1416,
+        2784,
+        1681,
+        1464,
+        15030,
+        1045,
+        1049,
+        1050,
+        1066,
+        1058,
+        1032,
+        1049,
+        1050,
+        1056,
+        1075,
+        18920,
+        1044,
+        7358,
+        1032,
+        1050,
+        1048,
+        1050,
+        1052,
+        1047,
+        1048,
+        1055,
+        1047,
+        1049,
+        1056,
+        1033
+      ]
+    }
+  ]
+}

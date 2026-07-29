@@ -40,7 +40,29 @@ pub enum BpePreTokenizer {
     /// up to three (`\p{N}{1,3}`).
     #[default]
     Llama3,
-    /// command-r pre-tokenizer, standard byte-fallback tiktoken behavior.
+    /// **Unreachable scaffolding — does NOT model llama.cpp's `command-r`.**
+    ///
+    /// This variant is parameterised as "llama-bpe with 3-digit grouping", but the
+    /// reference `LLAMA_VOCAB_PRE_TYPE_COMMAND_R` is not in the llama3 family at
+    /// all. llama.cpp groups it with SMOLLM/STARCODER/REFACT and uses a TWO-regex
+    /// list (`src/llama-vocab.cpp`):
+    ///
+    /// ```text
+    /// "\p{N}",
+    /// "'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)"
+    /// ```
+    ///
+    /// That differs from llama3 on three axes, not one: digits split individually
+    /// (the leading `\p{N}` isolates each, so the later ` ?\p{N}+` can never regroup
+    /// them) rather than in runs of three; the letter branch is ` ?\p{L}+` (space
+    /// prefix only) rather than `[^\r\n\p{L}\p{N}]?\p{L}+` (any non-alphanumeric
+    /// prefix); and the contractions are case-SENSITIVE rather than `'[sS]`-style.
+    ///
+    /// It is scaffolding rather than a live defect: command-r is refused at the
+    /// architecture axis before any tokenizer runs, and `resolve_gpt2_pre_tokenizer`
+    /// now refuses the `command-r` metadata value outright, so this variant cannot
+    /// be reached from a GGUF. Implementing it properly means adding a genuinely
+    /// different splitter, not another `digit_group_max` value.
     CommandR,
     /// llama.cpp `qwen2` (Qwen2/Qwen3): each digit is its own piece (`\p{N}`).
     /// Byte-for-byte identical to `llama-bpe` in every other branch — verified
@@ -58,6 +80,24 @@ pub enum BpePreTokenizer {
     /// llama.cpp `gpt-4o`: its collapsed-regex dialect uses ASCII-only case
     /// classes over Unicode General Category `L` code points.
     Gpt4o,
+    /// llama.cpp `tekken` (Mistral Nemo / Ministral / Mistral Small 3.x).
+    ///
+    /// Shares gpt-4o's case-run word grammar verbatim — same two alternatives,
+    /// same `[^\r\n\p{L}\p{N}]?` prefix, same ` ?[^\s\p{L}\p{N}]+[\r\n/]*`
+    /// punctuation branch (note the `/` in the tail, which llama-bpe lacks), same
+    /// whitespace branches. Diffed character-for-character against
+    /// `LLAMA_VOCAB_PRE_TYPE_TEKKEN` and `_GPT4O` in `src/llama-vocab.cpp`; they
+    /// differ in exactly two places:
+    ///
+    /// 1. gpt-4o appends an optional contraction group to both word alternatives;
+    ///    tekken has none. So `"John's"` is ONE segment under gpt-4o and TWO
+    ///    under tekken.
+    /// 2. gpt-4o groups digits `\p{N}{1,3}`; tekken is `\p{N}` — one per segment.
+    ///
+    /// Unlike [`Self::Gpt4o`], which is admitted only for one sha256-pinned
+    /// artifact, tekken is validated against a real Mistral Nemo GGUF via
+    /// token-id agreement with the pinned `llama-tokenize` oracle.
+    Tekken,
 }
 
 impl BpePreTokenizer {
@@ -65,7 +105,7 @@ impl BpePreTokenizer {
     fn digit_group_max(self) -> usize {
         match self {
             Self::Llama3 | Self::CommandR | Self::Gpt4o => 3,
-            Self::Qwen2 | Self::Qwen35 => 1,
+            Self::Qwen2 | Self::Qwen35 | Self::Tekken => 1,
         }
     }
 
@@ -73,6 +113,23 @@ impl BpePreTokenizer {
     /// excluded from the punctuation class) — the qwen35 regex dialect.
     fn fold_marks(self) -> bool {
         matches!(self, Self::Qwen35)
+    }
+
+    /// Whether a word segment may absorb a trailing English contraction.
+    ///
+    /// gpt-4o appends an optional `(?:'[sS]|'[tT]|…)?` to BOTH word alternatives;
+    /// tekken's regex is otherwise character-identical but has no contraction
+    /// group at all, so `"John's"` is one segment under gpt-4o and two under
+    /// tekken. This is one of only two differences between the dialects.
+    fn word_takes_contraction(self) -> bool {
+        !matches!(self, Self::Tekken)
+    }
+
+    /// Whether this dialect uses the case-run word grammar
+    /// (`prefix? UPPER* LOWER+ | prefix? UPPER+ LOWER*`) rather than the
+    /// llama-bpe `prefix? \p{L}+` grammar.
+    fn uses_case_run_words(self) -> bool {
+        matches!(self, Self::Gpt4o | Self::Tekken)
     }
 }
 
@@ -282,8 +339,29 @@ fn resolve_gpt2_pre_tokenizer(
 ) -> Result<BpePreTokenizer> {
     match pre {
         Some("llama-bpe") => Ok(BpePreTokenizer::Llama3),
-        Some("command-r") => Ok(BpePreTokenizer::CommandR),
+        // `command-r` is refused rather than mapped: [`BpePreTokenizer::CommandR`]
+        // models it as llama3-with-3-digit-grouping, but the reference dialect is
+        // a different two-regex form entirely (see that variant's docs). Accepting
+        // it here would silently mis-tokenize. The architecture is refused upstream
+        // anyway, so this closes a latent footgun rather than removing a capability.
+        Some("command-r") => Err(BackendError::UnsupportedTokenizer(
+            "command-r's pre-tokenizer is not implemented: the reference dialect is \
+             not in the llama-bpe family (digits split individually, ` ?\\p{L}+` \
+             letter branch, case-sensitive contractions) and Camelid's CommandR \
+             variant does not model it"
+                .to_string(),
+        )),
         Some("qwen2") => Ok(BpePreTokenizer::Qwen2),
+        // `stablelm2` is an EXACT alias of `qwen2`: llama.cpp puts
+        // LLAMA_VOCAB_PRE_TYPE_STABLELM2 and _QWEN2 in the same switch arm with one
+        // shared regex body, so no new splitter is required. Verified
+        // character-for-character against `src/llama-vocab.cpp`.
+        Some("stablelm2") => Ok(BpePreTokenizer::Qwen2),
+        // `tekken` (Mistral Nemo / Ministral / Mistral Small 3.x). Ungated, unlike
+        // `gpt-4o`: this dialect is validated by token-id agreement against the
+        // pinned llama-tokenize oracle on a real Mistral Nemo GGUF, not by an
+        // artifact hash.
+        Some("tekken") => Ok(BpePreTokenizer::Tekken),
         Some("qwen35") => Ok(BpePreTokenizer::Qwen35),
         Some("gpt-4o") if allow_gpt4o => Ok(BpePreTokenizer::Gpt4o),
         Some("gpt-4o") => Err(BackendError::UnsupportedTokenizer(
@@ -292,7 +370,7 @@ fn resolve_gpt2_pre_tokenizer(
         )),
         None if is_llama3_bpe_signature(token_texts) => Ok(BpePreTokenizer::Llama3),
         other => Err(BackendError::UnsupportedTokenizer(format!(
-            "unsupported GPT-2/BPE pre-tokenizer {other:?}; currently supported: llama-bpe, command-r, qwen2, qwen35"
+            "unsupported GPT-2/BPE pre-tokenizer {other:?}; currently supported: llama-bpe, qwen2, qwen35, stablelm2, tekken"
         ))),
     }
 }
@@ -871,9 +949,10 @@ impl Tokenizer {
                 .unwrap_or(text.len());
 
             let segments = match self.bpe_pre_tokenizer {
-                BpePreTokenizer::Gpt4o => bpe_pretokenize_gpt4o(
+                pre_tokenizer if pre_tokenizer.uses_case_run_words() => bpe_pretokenize_gpt4o(
                     &text[byte_start..byte_end],
-                    self.bpe_pre_tokenizer.digit_group_max(),
+                    pre_tokenizer.digit_group_max(),
+                    pre_tokenizer.word_takes_contraction(),
                 ),
                 pre_tokenizer => bpe_pretokenize_with(
                     &text[byte_start..byte_end],
@@ -1495,12 +1574,23 @@ fn bpe_pretokenize(text: &str) -> Vec<&str> {
 /// collapsed Unicode categories, not the more readable tokenizer.json regex in
 /// the adjacent source comment. In particular, marks are not letters and only
 /// ASCII `a-z`/`A-Z` affect the two ordered word alternatives.
-fn bpe_pretokenize_gpt4o(text: &str, digit_group_max: usize) -> Vec<&str> {
+/// Case-run word splitter shared by the `gpt-4o` and `tekken` dialects.
+///
+/// Their regexes are character-identical apart from two parameters:
+/// `digit_group_max` (3 for gpt-4o, 1 for tekken) and `word_takes_contraction`
+/// (gpt-4o appends an optional `(?:'[sS]|…)?` to both word alternatives; tekken
+/// has no contraction group).
+fn bpe_pretokenize_gpt4o(
+    text: &str,
+    digit_group_max: usize,
+    word_takes_contraction: bool,
+) -> Vec<&str> {
     let mut segments = Vec::new();
     let mut byte_start = 0;
 
     while byte_start < text.len() {
-        let byte_end = next_gpt4o_segment_end(text, byte_start, digit_group_max);
+        let byte_end =
+            next_gpt4o_segment_end(text, byte_start, digit_group_max, word_takes_contraction);
         segments.push(&text[byte_start..byte_end]);
         byte_start = byte_end;
     }
@@ -1508,8 +1598,13 @@ fn bpe_pretokenize_gpt4o(text: &str, digit_group_max: usize) -> Vec<&str> {
     segments
 }
 
-fn next_gpt4o_segment_end(text: &str, byte_start: usize, digit_group_max: usize) -> usize {
-    if let Some(end) = consume_gpt4o_word(text, byte_start) {
+fn next_gpt4o_segment_end(
+    text: &str,
+    byte_start: usize,
+    digit_group_max: usize,
+    word_takes_contraction: bool,
+) -> usize {
+    if let Some(end) = consume_gpt4o_word(text, byte_start, word_takes_contraction) {
         return end;
     }
 
@@ -1530,7 +1625,11 @@ fn next_gpt4o_segment_end(text: &str, byte_start: usize, digit_group_max: usize)
     byte_start + ch.len_utf8()
 }
 
-fn consume_gpt4o_word(text: &str, byte_start: usize) -> Option<usize> {
+fn consume_gpt4o_word(
+    text: &str,
+    byte_start: usize,
+    word_takes_contraction: bool,
+) -> Option<usize> {
     let first = next_char(text, byte_start)?;
     let word_start = if is_gpt4o_letter(first) {
         byte_start
@@ -1544,6 +1643,11 @@ fn consume_gpt4o_word(text: &str, byte_start: usize) -> Option<usize> {
 
     let word_end = consume_gpt4o_first_word_alternative(text, word_start)
         .or_else(|| consume_gpt4o_second_word_alternative(text, word_start))?;
+    if !word_takes_contraction {
+        // tekken's word alternatives carry no `(?:'[sS]|…)?` group, so a trailing
+        // contraction is left for the punctuation branch to pick up separately.
+        return Some(word_end);
+    }
     Some(consume_contraction(text, word_end).unwrap_or(word_end))
 }
 
@@ -2153,6 +2257,45 @@ mod tests {
     }
 
     #[test]
+    fn tekken_differs_from_gpt4o_in_exactly_two_places() {
+        use super::bpe_pretokenize_gpt4o;
+
+        // The two dialects share one splitter; these are the only two knobs.
+        //   gpt-4o: digit_group_max = 3, word_takes_contraction = true
+        //   tekken: digit_group_max = 1, word_takes_contraction = false
+        let gpt4o = |t: &'static str| bpe_pretokenize_gpt4o(t, 3, true);
+        let tekken = |t: &'static str| bpe_pretokenize_gpt4o(t, 1, false);
+
+        // Difference 1 — contractions. gpt-4o's word alternatives end in an
+        // optional `(?:'[sS]|…)?`; tekken's do not.
+        assert_eq!(gpt4o("John's"), vec!["John's"]);
+        assert_eq!(tekken("John's"), vec!["John", "'s"]);
+
+        // Difference 2 — digit grouping.
+        assert_eq!(gpt4o("1234"), vec!["123", "4"]);
+        assert_eq!(tekken("1234"), vec!["1", "2", "3", "4"]);
+
+        // Everything else is shared and must stay identical between the two.
+        for shared in [
+            "HelloWorld", // case-run split: prefix? UPPER* LOWER+
+            "HELLO",      // second alternative: prefix? UPPER+ LOWER*
+            " hello",     // the [^\r\n\p{L}\p{N}]? prefix absorbs the space
+            "a/b",        // punctuation branch tail is [\r\n/]*, which includes '/'
+            "x\n\ny",     // \s*[\r\n]+
+            "end   ",     // \s+(?!\S) then \s+
+        ] {
+            assert_eq!(
+                gpt4o(shared),
+                tekken(shared),
+                "{shared:?} must split identically under both dialects"
+            );
+        }
+
+        // Spot-check the shared case-run grammar itself.
+        assert_eq!(tekken("HelloWorld"), vec!["Hello", "World"]);
+    }
+
+    #[test]
     fn resolve_gpt2_pre_tokenizer_gates_the_missing_pre_recovery() {
         use super::{is_exact_phi4_mini_q4km, resolve_gpt2_pre_tokenizer, BpePreTokenizer};
         use crate::gguf::{GgufFile, GgufMetadataValue};
@@ -2183,6 +2326,39 @@ mod tests {
             Ok(BpePreTokenizer::Gpt4o)
         ));
         assert!(resolve_gpt2_pre_tokenizer(Some("gpt-4o"), &no_sig, false).is_err());
+
+        // `stablelm2` is an EXACT alias of `qwen2` — llama.cpp puts
+        // LLAMA_VOCAB_PRE_TYPE_STABLELM2 and _QWEN2 in one switch arm sharing a
+        // single regex body, so it needs no new splitter.
+        assert!(matches!(
+            resolve_gpt2_pre_tokenizer(Some("stablelm2"), &no_sig, false),
+            Ok(BpePreTokenizer::Qwen2)
+        ));
+
+        // `tekken` (Mistral Nemo / Ministral / Mistral Small 3.x) resolves ungated.
+        assert!(matches!(
+            resolve_gpt2_pre_tokenizer(Some("tekken"), &no_sig, false),
+            Ok(BpePreTokenizer::Tekken)
+        ));
+
+        // `command-r` is REFUSED, not mapped. BpePreTokenizer::CommandR models it
+        // as llama3-with-3-digit-grouping, but the reference dialect is a different
+        // two-regex form (digits split individually, ` ?\p{L}+` letter branch,
+        // case-sensitive contractions). Accepting it would silently mis-tokenize.
+        assert!(resolve_gpt2_pre_tokenizer(Some("command-r"), &no_sig, false).is_err());
+        assert!(resolve_gpt2_pre_tokenizer(Some("command-r"), &sig, false).is_err());
+
+        // Dialects that are NOT aliases of anything implemented stay refused: each
+        // needs a genuinely different splitter, not another digit-grouping value.
+        //   smollm       -> two-regex GPT-2 form (same arm as command-r)
+        //   deepseek-llm -> six-regex list with explicit Unicode range classes
+        //   llama4       -> maps to GPT4O upstream, which is sha256-gated here
+        for unsupported in ["smollm", "deepseek-llm", "deepseek-coder", "llama4"] {
+            assert!(
+                resolve_gpt2_pre_tokenizer(Some(unsupported), &no_sig, false).is_err(),
+                "{unsupported} must stay refused until its splitter exists"
+            );
+        }
 
         // Missing pre + Llama-3 signature => recovered as Llama3 (the fix).
         assert!(matches!(
@@ -2419,13 +2595,122 @@ mod tests {
 
         for case in pack.cases {
             assert_eq!(
-                bpe_pretokenize_gpt4o(&case.input, BpePreTokenizer::Gpt4o.digit_group_max()),
+                bpe_pretokenize_gpt4o(
+                    &case.input,
+                    BpePreTokenizer::Gpt4o.digit_group_max(),
+                    BpePreTokenizer::Gpt4o.word_takes_contraction(),
+                ),
                 case.expected_segments,
                 "case {} input {:?}",
                 case.id,
                 case.input
             );
         }
+    }
+
+    /// Token-id agreement receipt for the `tekken` dialect against the pinned
+    /// llama.cpp oracle, on a real Mistral Nemo GGUF.
+    ///
+    /// This is what justifies admitting `tekken` ungated (unlike `gpt-4o`, which is
+    /// pinned to one artifact hash). A pre-tokenizer bug is not a crash — it is
+    /// silently different tokens — so the dialect is not claimed on the strength of
+    /// reading the reference regex alone.
+    ///
+    /// Opt-in because the artifact is ~7 GB. Regenerate the pack with
+    /// `scripts/gen-tekken-tokenizer-oracle.mjs`.
+    #[test]
+    #[ignore = "set CAMELID_MISTRAL_NEMO_GGUF to a Mistral-Nemo-Instruct-2407 GGUF"]
+    fn tekken_tokenizer_matches_pinned_oracle() {
+        use super::{BpePreTokenizer, Tokenizer};
+
+        let path = std::env::var("CAMELID_MISTRAL_NEMO_GGUF")
+            .expect("set CAMELID_MISTRAL_NEMO_GGUF to a Mistral-Nemo-Instruct-2407 GGUF");
+        let gguf = crate::gguf::read_metadata(&path).expect("read Mistral Nemo GGUF metadata");
+        assert_eq!(gguf.architecture(), Some("llama"));
+        assert_eq!(gguf.metadata_string("tokenizer.ggml.model"), Some("gpt2"));
+        assert_eq!(gguf.metadata_string("tokenizer.ggml.pre"), Some("tekken"));
+
+        let tokenizer = Tokenizer::from_gguf(&gguf).expect("load Mistral Nemo tokenizer");
+        assert_eq!(tokenizer.bpe_pre_tokenizer, BpePreTokenizer::Tekken);
+
+        // The actual loadability win: every other admission axis already passed for
+        // this artifact (architecture `llama`, tokenizer `gpt2`, tensors Q4_K/Q6_K/F32),
+        // so `tekken` was the SOLE reason a 12B Mistral Nemo was refused.
+        let admitted = crate::runnable::admit::admit(&gguf)
+            .expect("Mistral Nemo must admit once tekken is supported");
+        assert_eq!(admitted.architecture, "llama");
+
+        #[derive(serde::Deserialize)]
+        struct Case {
+            id: String,
+            input: String,
+            input_utf8_hex: String,
+            expected_token_ids: Vec<u32>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Oracle {
+            command: String,
+            commit: String,
+            pre_tokenizer: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Pack {
+            oracle: Oracle,
+            cases: Vec<Case>,
+        }
+
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/qa/prompt-packs/mistral-nemo-tekken-tokenizer-oracle-v1.json"
+        ))
+        .expect("read tekken tokenizer oracle pack");
+        let pack: Pack = serde_json::from_str(&raw).expect("parse tekken tokenizer oracle pack");
+        assert_eq!(
+            pack.oracle.commit,
+            "acd79d603cb2e1c84c0886137b80f1ad649b6857"
+        );
+        assert!(pack.oracle.command.contains("llama-tokenize"));
+        // --no-escape is load-bearing: without it the oracle would re-interpret
+        // `\n`/`\t` in the argument and would not describe the bytes fed here.
+        assert!(pack.oracle.command.contains("--no-escape"));
+        assert_eq!(pack.oracle.pre_tokenizer, "tekken");
+        assert!(pack.cases.len() >= 30, "oracle pack lost coverage");
+
+        let mut mismatches = Vec::new();
+        for case in &pack.cases {
+            // The hex pins the exact bytes, so a case cannot silently drift via
+            // editor normalization of newlines or Unicode.
+            let hex: String = case
+                .input
+                .as_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            assert_eq!(
+                hex, case.input_utf8_hex,
+                "case {} input bytes drifted",
+                case.id
+            );
+
+            let got = tokenizer
+                // (add_special = false, parse_special = true) mirrors the oracle's
+                // `--no-bos` with its default special-token parsing.
+                .encode(&case.input, false, true)
+                .unwrap_or_else(|e| panic!("case {} failed to encode: {e}", case.id));
+            if got != case.expected_token_ids {
+                mismatches.push(format!(
+                    "  {}: input {:?}\n    oracle: {:?}\n    camelid: {:?}",
+                    case.id, case.input, case.expected_token_ids, got
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "{} of {} tekken cases diverged from the oracle:\n{}",
+            mismatches.len(),
+            pack.cases.len(),
+            mismatches.join("\n")
+        );
     }
 
     // Pinned llama.cpp `acd79d603` (build 9632) oracle vectors for the exact
