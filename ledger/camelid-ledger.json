@@ -1,7 +1,7 @@
 {
   "ledger_version": "camelid.ledger/v1",
   "provenance": {
-    "source_head": "875cd098",
+    "source_head": "e32790ee",
     "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
   },
   "capabilities": {
@@ -80,6 +80,11 @@
     ],
     "supported_model_families": [
       {
+        "id": "nomic_bert_encoder_exact_v1_5_q8_0",
+        "status": "supported_exact_row_embedding_lane",
+        "notes": "exact nomic-embed-text-v1.5.Q8_0.gguf only: BERT WordPiece tokenization, bidirectional split-half-RoPE attention, gated-SiLU FFN execution, mean/CLS/last pooling primitives, L2 normalization, Matryoshka truncation, OpenAI embeddings, cosine reranking, and optional Workspace semantic retrieval. Generic BERT, other Nomic files/quants, classifier-head rank pooling, GPU execution, and family-wide support are not implied."
+      },
+      {
         "id": "llama_spm_decoder",
         "status": "supported_current_gate",
         "notes": "LLaMA-style decoder path validated on TinyLlama Q8_0 gate"
@@ -144,9 +149,24 @@
         "notes": "non-streaming and SSE streaming for loaded supported dense GGUF models"
       },
       {
+        "id": "llguidance_structured_outputs",
+        "status": "supported_current_gate_nonstreaming",
+        "notes": "non-streaming /v1/chat/completions constrained decoding through LLGuidance 1.7.6 for JSON object, supported JSON Schema, and LLGuidance/Lark CFG requests. Request forms are mutually exclusive, unsupported schemas/grammars fail closed before generation, and token masks use the loaded tokenizer's exact byte vocabulary. Streaming and non-chat generation lanes remain typed unsupported."
+      },
+      {
+        "id": "openai_embeddings",
+        "status": "supported_exact_model_row",
+        "notes": "POST /v1/embeddings plus /embedding and /embeddings aliases accept one string or a bounded string batch, return finite unit-normalized float vectors and exact tokenizer usage, and support Nomic Matryoshka dimensions. The current gate is the exact Nomic Embed Text v1.5 Q8_0 catalog row; base64 encoding, token-id input, arbitrary encoder families/quants, and GPU execution are unsupported."
+      },
+      {
+        "id": "embedding_similarity_reranking",
+        "status": "supported_exact_model_row",
+        "notes": "POST /rerank, /reranking, /v1/rerank, and /v1/reranking rank bounded string/object documents by cosine similarity using Nomic search_query/search_document prefixes, stable score ordering, optional top_n, and optional returned documents. This is bi-encoder embedding-similarity reranking, not a classifier-head cross-encoder claim."
+      },
+      {
         "id": "web_workspace",
         "status": "supported_current_gate",
-        "notes": "loopback WebUI only: durable conversations over exactly read_file/list_dir/literal-content search inside one canonical workspace root; allow_writes=true is rejected. Evidence-first extension inventories are derived from successful list_dir observations. Exact prompt-plus-generation budgeting, SQLite/FTS5 retrieval, reversible automatic compaction, turn-scoped cancellation, a 90-second model-step deadline, and model-transition exclusion fail closed. Available only to supported exact rows with tool_capable=true. The historical Qwen3-4B-Q4_K_M bundle validates the underlying tool-call and sandbox path, but its write scenarios no longer describe the current read-only surface. No write, shell, network, GUI, subagent, unattended, neighboring-model, portability, or throughput claim."
+        "notes": "loopback WebUI only: durable conversations over exactly read_file/list_dir/literal-content search inside one canonical workspace root; allow_writes=true is rejected. When the exact supported Nomic embedding row is also loaded, each session lazily builds a bounded read-only in-memory source index and injects semantically relevant, explicitly untrusted excerpts before model execution; absence/failure degrades to the existing lexical path. Evidence-first extension inventories are derived from successful list_dir observations. Exact prompt-plus-generation budgeting, SQLite/FTS5 retrieval, reversible automatic compaction, turn-scoped cancellation, a 90-second model-step deadline, and model-transition exclusion fail closed. Generation remains available only to supported exact rows with tool_capable=true. No write, shell, network, GUI, subagent, unattended, neighboring-model, persistent vector database, broad retrieval-quality, portability, or throughput claim."
       },
       {
         "id": "stream_options.include_usage",
@@ -171,7 +191,7 @@
       {
         "id": "llama_server_props",
         "status": "partial",
-        "notes": "GET /props returns read-only public server properties, default generation settings, explicit fail-closed chat_template_caps, chat-template metadata when a model is loaded, and Camelid readiness notes. Local model paths are intentionally redacted, router-mode model/autoload query params and POST /props are unsupported, and this does not imply slot lifecycle, native /completion streaming, embeddings, or full llama-server WebUI parity."
+        "notes": "GET /props returns read-only public server properties, default generation settings, explicit fail-closed chat_template_caps, chat-template metadata when a model is loaded, and Camelid readiness notes. Local model paths are intentionally redacted, router-mode model/autoload query params and POST /props are unsupported, and this does not imply slot lifecycle, native /completion streaming, generic embedding-model compatibility, or full llama-server WebUI parity."
       },
       {
         "id": "llama_server_slots",
@@ -196,7 +216,7 @@
       {
         "id": "fail_closed_native_compatibility_routes",
         "status": "unsupported",
-        "notes": "Native /infill, /embedding, /embeddings, /v1/embeddings, /v1/messages, /rerank, /reranking, /v1/rerank, /v1/reranking, /v1/responses, POST /models/unload, POST /slots, and slot cache actions return typed not_implemented errors until real route semantics and backend support exist. Unsupported /models/load router-mode fields and /completion modes remain typed parameter errors."
+        "notes": "Native /infill, /v1/messages, /v1/responses, POST /models/unload, POST /slots, and slot cache actions return typed not_implemented errors until real route semantics and backend support exist. Unsupported /models/load router-mode fields and /completion modes remain typed parameter errors. Embedding and reranking routes are separately supported only for the exact evidence-gated Nomic row."
       },
       {
         "id": "multi_choice_generation",
@@ -216,6 +236,57 @@
     ]
   },
   "model_rows": [
+    {
+      "identity": {
+        "id": "nomic_embed_text_v1_5_q8_0",
+        "family": "nomic-bert",
+        "quantization": "Q8_0",
+        "gguf_filename": "nomic-embed-text-v1.5.Q8_0.gguf",
+        "sha256": "3e24342164b3d94991ba9692fdc0dd08e3fd7362e0aacc396a9a5c54a544c3b7"
+      },
+      "contract": {
+        "id": "nomic_embed_text_v1_5_q8_0",
+        "family": "nomic-bert",
+        "quantization": "Q8_0",
+        "status": "supported_exact_row_embedding",
+        "tool_capable": false,
+        "support_scope": "exact_row_embeddings_rerank_and_workspace_semantic_retrieval_only",
+        "full_support_status": "blocked_pending_broader_encoder_evidence",
+        "full_support_blockers": "generic BERT/Nomic variants, other quants, classifier-head rank models, GPU execution, long-context retrieval quality, portability, and a production retrieval benchmark remain unproven",
+        "metadata_parses": "validated_exact_nomic_bert_encoder_metadata",
+        "tokenizer_works": "validated_bert_wordpiece_three_prompt_token_id_oracle",
+        "tensors_load": "validated_61_q8_0_matrices_plus_51_f32_vectors_exact_shapes",
+        "generation_runs": "not_applicable_encoder_embeddings_execute",
+        "parity_audited": "three_768d_vectors_cosine_above_0_9997_and_max_abs_delta_below_0_003_vs_llama_cpp_b10173",
+        "performance_measured": "windows_release_cpu_4_vector_batch_median_265ms_at_8_workers_14_7pct_throughput_uplift_vs_4_workers_peak_rss_flat",
+        "frontend_load_path_verified": "real_api_sidecar_load_v1_embeddings_and_v1_rerank_validated_frontend_readiness_probe_wired",
+        "frontend_readiness_gate": "green only for the exact catalog artifact nomic-embed-text-v1.5.Q8_0.gguf; embedding readiness is independent of generation_ready",
+        "tested_context": "three_short_semantic_oracle_prompts_plus_256d_matryoshka_probe",
+        "chat_template_renderer": "not_applicable_encoder_uses_nomic_search_prefixes",
+        "chat_template_shape_pack": "not_applicable",
+        "chat_template_shape_pack_id": "not_applicable",
+        "bounded_context_512_pack": "not_applicable",
+        "bounded_context_512_pack_id": "not_applicable",
+        "bounded_context_window": 0,
+        "bounded_context_1024_pack": "not_applicable",
+        "bounded_context_1024_pack_id": "not_applicable",
+        "bounded_context_1024_window": 0,
+        "bounded_context_2048_pack": "not_applicable",
+        "bounded_context_2048_pack_id": "not_applicable",
+        "bounded_context_2048_window": 0,
+        "bounded_context_4096_pack": "not_applicable",
+        "bounded_context_4096_pack_id": "not_applicable",
+        "bounded_context_4096_window": 0,
+        "bounded_context_8192_pack": "not_applicable",
+        "bounded_context_8192_pack_id": "not_applicable",
+        "bounded_context_8192_window": 0,
+        "latest_checked_bucket": "embedding_semantic_oracle",
+        "latest_checked_result": "pass",
+        "latest_checked_output": "deterministic_unit_norm_768d_and_256d_embeddings_with_relevant_document_ranked_first",
+        "evidence": "exact row nomic-embed-text-v1.5.Q8_0.gguf (146,146,432 bytes; sha256 3e24342164b3d94991ba9692fdc0dd08e3fd7362e0aacc396a9a5c54a544c3b7; Hugging Face revision 18d1044f4866e224159fce8c6fc5c4f3920176e7): 112 tensors (61 Q8_0 matrices retained quantized + 51 F32 vectors), 12 layers, width 768, mean pooling. Exact WordPiece token IDs match llama.cpp b10173 for three fixed query/document prompts. Camelid relevant/irrelevant cosine scores are 0.860397/0.473693 versus llama.cpp 0.859971/0.472697; all three 768d vectors pass cosine >0.9997 and max absolute delta <0.003, are finite/unit-normalized, and repeated input is bit-deterministic. A 256d Matryoshka embedding is re-normalized. Real HTTP sidecar load (`set_active=false`), `/v1/embeddings`, and `/v1/rerank` pass on the exact artifact. On this Windows host, controlled release medians for four short vectors are 304ms at 4 workers and 265ms at 8 workers (13.16 -> 15.09 embeddings/s, +14.7% throughput); observed peak working set stays effectively flat at 162.4 vs 162.8 MiB, while tokenizer/metadata-only baseline is 9.2 MiB. Host-specific measurements, not a portable SLA. This supports only embeddings, embedding-similarity reranking, and bounded in-memory Workspace semantic retrieval for this exact artifact; it is not a generative or cross-encoder-reranker claim.",
+        "next_step": "add GPU encoder kernels, separately evidence a classifier-head cross-encoder reranker, and run retrieval recall/long-context/portable-host packs before broadening support"
+      }
+    },
     {
       "identity": {
         "id": "ornith_1_0_9b_q4_k_m",

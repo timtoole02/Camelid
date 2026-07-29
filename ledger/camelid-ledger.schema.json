@@ -47,6 +47,10 @@
         "planned_phase_10",
         "supported",
         "supported_current_gate",
+        "supported_current_gate_nonstreaming",
+        "supported_exact_model_row",
+        "supported_exact_row_embedding",
+        "supported_exact_row_embedding_lane",
         "supported_exact_row_smoke",
         "supported_exact_row_smoke_lane",
         "supported_exact_row_smoke_lanes",
@@ -63,6 +67,7 @@
         "exact_row_chatml_thinking_disabled_gpu_resident_smoke_only",
         "exact_row_chatml_thinking_disabled_smoke_only",
         "exact_row_distributed_serve_smoke_only",
+        "exact_row_embeddings_rerank_and_workspace_semantic_retrieval_only",
         "exact_row_gpu_resident_raw_decode_parity_smoke_only",
         "exact_row_single_node_cpu_smoke_only",
         "exact_row_smoke_only",
@@ -73,7 +78,7 @@
     "fullSupportStatusVocabulary": {
       "type": "string",
       "$comment": "Code-derived from `full_support_status:` literals in src/api/mod.rs (checked ⊇ by check-ledger-schema.mjs).",
-      "enum": ["blocked_generation_parity", "blocked_later_generation_divergence", "blocked_pending_normalized_full_support", "blocked_prompt_and_generation_parity", "current_gate_refresh_under_stricter_bar", "not_applicable_until_certified_row", "not_applicable_until_runtime_support"]
+      "enum": ["blocked_generation_parity", "blocked_later_generation_divergence", "blocked_pending_broader_encoder_evidence", "blocked_pending_normalized_full_support", "blocked_prompt_and_generation_parity", "current_gate_refresh_under_stricter_bar", "not_applicable_until_certified_row", "not_applicable_until_runtime_support"]
     },
     "latestCheckedResultVocabulary": {
       "type": "string",
