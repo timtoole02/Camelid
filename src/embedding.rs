@@ -551,9 +551,9 @@ impl NomicBertRuntime {
             for head in 0..head_count {
                 let q_start = query_token * width + head * head_dim;
                 let q = &query[q_start..q_start + head_dim];
-                for key_token in 0..token_count {
+                for (key_token, score) in scores.iter_mut().enumerate() {
                     let k_start = key_token * width + head * head_dim;
-                    scores[key_token] = dot(q, &key[k_start..k_start + head_dim]) * scale;
+                    *score = dot(q, &key[k_start..k_start + head_dim]) * scale;
                 }
                 softmax_in_place(&mut scores)?;
                 let out_start = query_token * width + head * head_dim;

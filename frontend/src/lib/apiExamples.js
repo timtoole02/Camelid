@@ -244,7 +244,7 @@ export function workbenchEndpoints({ apiBase, modelId }) {
       path: '/v1/embeddings',
       gate: 'none',
       featureRowId: 'openai_embeddings',
-      summary: 'OpenAI-compatible float embeddings for the exact supported Nomic encoder row. A typed model_not_loaded response is expected until that row is registered.',
+      summary: 'Float embeddings for the exact supported Nomic encoder row. A typed model_not_loaded response is expected until that row is registered.',
       body: embeddingsBody(model),
       examples: {
         curl: curlPost(base, '/v1/embeddings', embeddingsBody(model)),

@@ -833,9 +833,7 @@ impl Tokenizer {
                     }
                     text.push_str(word);
                 }
-            } else if is_single_bert_punctuation(&token.text) {
-                text.push_str(&token.text);
-            } else if uses_gguf_word_start {
+            } else if is_single_bert_punctuation(&token.text) || uses_gguf_word_start {
                 text.push_str(&token.text);
             } else {
                 if !text.is_empty() {
