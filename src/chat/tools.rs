@@ -1917,8 +1917,17 @@ fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
     // process holding VRAM) otherwise survives as an orphan. Descendants spawned
     // after assignment are captured too. Best-effort — if creation/assignment
     // fails, the child.kill() backstop still reaps the direct process. Mirrors
-    // run_windows_command; the Unix path is unaffected (/bin/sh's own process
-    // group is already torn down by kill()).
+    // run_windows_command.
+    //
+    // There is NO Unix equivalent here, and that is a real difference: this
+    // builder creates no process group, so the timeout path below signals only
+    // `/bin/sh` (or whatever it exec'd). A descendant tree — `cargo`'s rustc
+    // jobs, a `make -j` fan-out — survives the timeout as orphans. Delegated
+    // work does not have this gap (a subagent worker gets its own process group
+    // and is torn down by group), so the exposure is the server/CLI's own
+    // long-running commands. Fixing it here would put interactive CLI shell
+    // children outside the terminal's foreground group and break Ctrl-C, so it
+    // needs its own decision rather than a drive-by change.
     #[cfg(windows)]
     let _job = {
         use std::os::windows::io::AsRawHandle;
@@ -1959,9 +1968,11 @@ fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
-                    // Tear down the whole tree (W2), then the direct-child
-                    // backstop. Terminating the job kills every descendant;
-                    // child.kill() covers the case where the job never assigned.
+                    // Windows: tear down the whole tree (W2), then the
+                    // direct-child backstop. Terminating the job kills every
+                    // descendant; child.kill() covers the case where the job
+                    // never assigned. Unix: direct child only — see the note at
+                    // the job-object assignment above.
                     #[cfg(windows)]
                     if let Some(ref j) = _job {
                         j.terminate();

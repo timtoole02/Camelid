@@ -227,6 +227,26 @@ pub fn configure(config: SubagentConfig) {
     lock_registry().config = Some(config);
 }
 
+/// Test-only: install `config` and get a guard that restores the previous
+/// registry state on drop. The registry is process-global, so a bare
+/// `configure` in a test leaks into every later test in the binary — the
+/// tool-set pins in `tools` assert on the unconfigured baseline and fail
+/// under the test harness's scheduling, not deterministically.
+#[cfg(test)]
+pub(crate) fn configure_for_test(config: SubagentConfig) -> TestConfigGuard {
+    TestConfigGuard(lock_registry().config.replace(config))
+}
+
+#[cfg(test)]
+pub(crate) struct TestConfigGuard(Option<SubagentConfig>);
+
+#[cfg(test)]
+impl Drop for TestConfigGuard {
+    fn drop(&mut self) {
+        lock_registry().config = self.0.take();
+    }
+}
+
 /// Stop every child owned by the current session. Web Code calls this at both
 /// ends of a turn so the visible Stop control is authoritative for delegated
 /// work too, and a child cannot keep editing after its parent has finished.
@@ -236,10 +256,36 @@ pub fn cancel_all() {
         std::mem::take(&mut state.children)
     };
     for mut entry in children {
-        let _ = entry.child.kill();
-        let _ = entry.child.wait();
+        terminate_tree(&mut entry);
         let _ = std::fs::remove_file(&entry.task_path);
     }
+}
+
+/// Terminate a child and everything it spawned, then reap it.
+///
+/// Windows tears the tree down through the kill-on-close job object; Unix
+/// through the process group the worker was spawned into. `Child::kill` remains
+/// the backstop for the case where neither could be established (it reaps only
+/// the direct child, which is why it is not the primary mechanism).
+fn terminate_tree(entry: &mut ChildEntry) {
+    #[cfg(windows)]
+    if let Some(ref j) = entry.job {
+        j.terminate();
+    }
+    #[cfg(unix)]
+    {
+        // Negative pid = "every process in this group". Best-effort: the group
+        // may already be gone, and a worker spawned before `process_group` was
+        // wired simply falls through to the direct-child kill below.
+        let pid = entry.child.id() as i32;
+        if pid > 0 {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = entry.child.kill();
+    let _ = entry.child.wait();
 }
 
 /// This process's spawn-tree depth (0 for the top-level agent).
@@ -388,6 +434,18 @@ fn spawn_inner(
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
+    // Unix counterpart of the Windows job object below: put the worker in its own
+    // process group so teardown can signal the GROUP. A worker that is mid
+    // `run_shell` has a live `/bin/sh -c …` tree, and `Child::kill` signals only
+    // the worker pid — the shell tree would survive Stop and keep writing into the
+    // workspace, which is exactly what the "children are killed when the parent
+    // turn ends or is stopped" contract forbids. Descendants inherit the group, so
+    // one `killpg` reaps the whole tree.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
     let child = cmd.spawn().map_err(|e| {
         let _ = std::fs::remove_file(&tpath);
@@ -443,17 +501,40 @@ pub fn status(root: &Path, subtask_id: &str) -> Result<String, String> {
         });
     }
 
-    let live = lock_registry()
+    let elapsed = lock_registry()
         .children
         .iter()
-        .any(|c| c.subtask_id == subtask_id);
-    if live || task_path(root, subtask_id).exists() {
+        .find(|c| c.subtask_id == subtask_id)
+        .map(|c| c.started.elapsed());
+    if elapsed.is_some() || task_path(root, subtask_id).exists() {
+        // Carry elapsed time so consecutive polls are not byte-identical. The
+        // caller's no-progress guard stops a call that returns the SAME text
+        // REPEAT_LIMIT times running; a constant "has not finished yet" made a
+        // healthy child look stuck after three polls and got the whole turn
+        // killed. `RUNNING_STATUS_PREFIX` is the belt to this suspenders — see
+        // `is_running_status`.
+        let waited = elapsed.map(|e| e.as_secs_f64()).unwrap_or(0.0);
         Ok(format!(
-            "status: running\nnote: subagent {subtask_id:?} has not finished yet"
+            "{RUNNING_STATUS_PREFIX}\nnote: subagent {subtask_id:?} has not finished yet \
+             ({waited:.1}s elapsed)"
         ))
     } else {
         Err(format!("no subagent {subtask_id:?} found"))
     }
+}
+
+/// Leading line of a still-running status report.
+const RUNNING_STATUS_PREFIX: &str = "status: running";
+
+/// Whether a tool result reports a subagent that is still working.
+///
+/// Waiting on a child is progress, not repetition: the agent loop's no-progress
+/// guard must not count these against `REPEAT_LIMIT`. Polling a child is the
+/// documented way to wait for one (`spawn_subagent` says so in its own result),
+/// and Code mode has no step cap, so this guard is the loop's main terminator —
+/// mistaking a poll for a stall ends the turn AND kills the child with it.
+pub fn is_running_status(text: &str) -> bool {
+    text.starts_with(RUNNING_STATUS_PREFIX)
 }
 
 /// A compact, truncated listing of this session's subagents — live (from the
@@ -507,7 +588,7 @@ pub fn list_summary(root: &Path) -> String {
 }
 
 /// Reap children that finished or exceeded their timeout. A timed-out child is
-/// terminated (process tree on Windows) and recorded INCONCLUSIVE; one that
+/// terminated along with its process tree and recorded INCONCLUSIVE; one that
 /// vanished without a result is recorded failed. Removes them from the live set.
 fn reap_locked(state: &mut SessionState) {
     state.children.retain_mut(|entry| {
@@ -525,12 +606,7 @@ fn reap_locked(state: &mut SessionState) {
             }
             Ok(None) => {
                 if entry.started.elapsed() >= entry.timeout {
-                    #[cfg(windows)]
-                    if let Some(ref j) = entry.job {
-                        j.terminate();
-                    }
-                    let _ = entry.child.kill();
-                    let _ = entry.child.wait();
+                    terminate_tree(entry);
                     write_terminal_result(
                         entry,
                         "inconclusive",

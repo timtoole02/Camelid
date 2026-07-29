@@ -310,11 +310,19 @@ const MAX_WORKSPACE_TOOL_CALLS_PER_STEP: usize = 8;
 /// file). A call whose result keeps changing — e.g. polling
 /// `check_subagent_status` while a subagent runs (running → completed) — resets
 /// the counter and is never flagged, so legitimate polling is not cut off.
+///
+/// Waiting on a still-running child is exempt outright rather than relying on
+/// its text changing: several polls can happen inside one model step, and being
+/// wrong here does not just end the turn, it kills the child too.
 fn note_no_progress(
     counts: &mut HashMap<String, (usize, String)>,
     signature: &str,
     outcome: &ToolOutcome,
 ) -> bool {
+    if super::subagent::is_running_status(outcome.text()) {
+        counts.remove(signature);
+        return false;
+    }
     let entry = counts
         .entry(signature.to_string())
         .or_insert((0, String::new()));
@@ -1745,7 +1753,9 @@ impl LiveDriver {
         self.context_budget_tokens = budget_tokens;
     }
 
-    #[cfg(test)]
+    /// Cancellable streaming under an absolute wall-clock deadline. The
+    /// read-only Workspace lane runs this way: its published contract is a
+    /// bounded turn that fails closed on a stalled server.
     pub fn set_stream_control(&mut self, cancel: std::sync::Arc<AtomicBool>, timeout: Duration) {
         self.stream_cancel = Some(cancel);
         self.stream_timeout = Some(timeout);
@@ -3823,6 +3833,34 @@ mod tests {
         assert!(!note_no_progress(&mut stuck, "read::y", &running));
         assert!(!note_no_progress(&mut stuck, "read::y", &running));
         assert!(note_no_progress(&mut stuck, "read::y", &running));
+    }
+
+    #[test]
+    fn waiting_on_a_subagent_is_never_counted_as_no_progress() {
+        // A child can outlive any number of parent polls, and several polls can
+        // land inside ONE model step, so "the text will change" is not enough.
+        // Getting this wrong does not merely end the turn: Code mode has no step
+        // cap, so this guard is its main terminator, and the turn guard kills
+        // every live child on the way out — a healthy subagent would be
+        // destroyed for the crime of still working.
+        let waiting = ToolOutcome::Ok(
+            "status: running\nnote: subagent \"a\" has not finished yet (0.0s elapsed)".to_string(),
+        );
+        let mut counts = HashMap::new();
+        for _ in 0..(REPEAT_LIMIT * 3) {
+            assert!(!note_no_progress(
+                &mut counts,
+                "check_subagent_status::{\"subtask_id\":\"a\"}",
+                &waiting
+            ));
+        }
+        // A child that has FINISHED is a settled result like any other: polling
+        // it forever is a genuine stall and still stops the loop.
+        let done = ToolOutcome::Ok("status: completed\nanswer:\n42".to_string());
+        let mut settled = HashMap::new();
+        assert!(!note_no_progress(&mut settled, "check::a", &done));
+        assert!(!note_no_progress(&mut settled, "check::a", &done));
+        assert!(note_no_progress(&mut settled, "check::a", &done));
     }
 
     #[test]
