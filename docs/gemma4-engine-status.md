@@ -3,7 +3,7 @@
 **Status (correctness milestone): Gemma 4 runs correctly inside Camelid's
 from-scratch engine and produces output token-identical to llama.cpp.** It is now
 also served through the HTTP API (`/v1/chat/completions`, streaming and
-non-streaming, behind the `CAMELID_GEMMA4_SERVE` flag) and surfaced in the UI as a
+non-streaming; the lane is on by default, opt-out `CAMELID_GEMMA4_SERVE=0`) and surfaced in the UI as a
 supported + downloadable model. The one-time load is ~11x faster (mmap wire-backed
 weights, no eager decode). Warm decode is now ~6.75 tok/s (up from ~1.84 after the
 Q8×Q8 `sdot` matvec) — usable, but still bounded by the per-token weight read and
@@ -26,9 +26,10 @@ by cold mmap faults on an unwarmed 16GB box; do not describe it as "fast."
   via the CLI (token IDs identical — see proof below).
 - **In-engine runtime + CLI.** `Gemma4Runtime::load()` + `generate_greedy()`,
   driven by `camelid gemma4-generate`. Incremental KV cache (O(n) decode).
-- **HTTP serve (behind a flag).** With `CAMELID_GEMMA4_SERVE=1`, `camelid serve
-  --model <gemma4.gguf>` loads the runtime and serves `/v1/chat/completions`
-  both non-streaming and streaming (SSE, OpenAI `chat.completion.chunk` shape).
+- **HTTP serve (on by default).** `camelid serve --model <gemma4.gguf>` loads
+  the runtime and serves `/v1/chat/completions` both non-streaming and
+  streaming (SSE, OpenAI `chat.completion.chunk` shape). Opting out with
+  `CAMELID_GEMMA4_SERVE=0` restores the metadata-only load.
   The Gemma chat template lives in one place (`gemma4_chat_prompt`). `/v1/health`
   reports `backend`, `model_family`, and `gemma4_available`. The existing
   Llama/3B serve path is untouched, and a gemma4 request with no loaded runtime
@@ -144,8 +145,8 @@ llama-server -m /Volumes/Untitled/models/gemma-4-E4B-it-Q8_0.gguf -ngl 99 -c 512
 curl -s localhost:8080/completion -d \
   '{"prompt":"The capital of France is","n_predict":12,"temperature":0,"top_k":1}'
 
-# 4. HTTP serve (behind the flag) — non-streaming and streaming chat:
-CAMELID_GEMMA4_SERVE=1 camelid serve \
+# 4. HTTP serve (on by default; opt-out CAMELID_GEMMA4_SERVE=0) — non-streaming and streaming chat:
+camelid serve \
   --model /Volumes/Untitled/models/gemma-4-E4B-it-Q8_0.gguf --addr 127.0.0.1:8231
 curl -s 127.0.0.1:8231/v1/health            # backend=gemma4-runtime, gemma4_available=true
 curl -s 127.0.0.1:8231/v1/chat/completions -H 'Content-Type: application/json' \

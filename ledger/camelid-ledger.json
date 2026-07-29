@@ -1,7 +1,7 @@
 {
   "ledger_version": "camelid.ledger/v1",
   "provenance": {
-    "source_head": "e2d85ce3",
+    "source_head": "8cc20d03",
     "note": "Derived from the static CapabilitiesResponse literal in src/api/mod.rs by scripts/extract-capabilities-to-ledger.mjs. Contract fields are byte-faithful (plain serde Serialize, no renames). Per CAIRN Amendment 1, the CODE is the contract source of truth; this ledger is its derived canonical form, and scripts/check-ledger-drift.mjs re-derives from code and fails CI if code and ledger disagree (provenance excluded)."
   },
   "capabilities": {
@@ -871,7 +871,7 @@
         "parity_audited": "basic_v1_pack_5of5_full_budget_cpu_and_gpu_vs_pinned_plain_f32_gemv_comparator_llama_cpp_5d56eff",
         "performance_measured": "functional_milestone_only_not_perf_validated",
         "frontend_load_path_verified": "served_via_gemma4_runtime_flag",
-        "frontend_readiness_gate": "green only when this exact gemma4 GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id (serve requires CAMELID_GEMMA4_SERVE=1)",
+        "frontend_readiness_gate": "green only when this exact gemma4 GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id (served with the gemma4 serve lane enabled — on by default; opt-out CAMELID_GEMMA4_SERVE=0)",
         "tested_context": "short_api_webui_chat_smoke_streaming_and_nonstreaming_plus_cli_greedy_parity",
         "chat_template_renderer": "gemma4_marker",
         "chat_template_shape_pack": "validated_bounded_pack",
@@ -971,7 +971,7 @@
         "parity_audited": "basic_v1_pack_5of5_full_budget_cpu_and_gpu_vs_pinned_plain_f32_gemv_comparator_llama_cpp_5d56eff",
         "performance_measured": "functional_milestone_only_not_perf_validated",
         "frontend_load_path_verified": "served_via_gemma4_runtime_flag",
-        "frontend_readiness_gate": "green only when this exact gemma4 GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id (serve requires CAMELID_GEMMA4_SERVE=1)",
+        "frontend_readiness_gate": "green only when this exact gemma4 GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id (served with the gemma4 serve lane enabled — on by default; opt-out CAMELID_GEMMA4_SERVE=0)",
         "tested_context": "five_prompt_basic_v1_pack_greedy_parity_plus_api_webui_chat_smoke",
         "chat_template_renderer": "gemma4_marker",
         "chat_template_shape_pack": "validated_bounded_pack",
@@ -1020,7 +1020,7 @@
         "parity_audited": "basic_v1_pack_5of5_distributed_token_identical_to_single_node_3of5_full_budget_vs_pinned_comparator_with_two_recorded_frontiers",
         "performance_measured": "two_mac_pair_cadence_6_2_to_6_75_tok_s_recorded_in_cli_bundle_only",
         "frontend_load_path_verified": "served_via_gemma4_runtime_flag_distributed_lane",
-        "frontend_readiness_gate": "green only when this exact gemma4 GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id (serve requires CAMELID_GEMMA4_SERVE=1 plus CAMELID_GEMMA4_WORKER and CAMELID_GEMMA4_SPLIT pointing at a live gemma4-worker holding the tail layers)",
+        "frontend_readiness_gate": "green only when this exact gemma4 GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id (gemma4 serve lane on by default — opt-out CAMELID_GEMMA4_SERVE=0 — plus CAMELID_GEMMA4_WORKER and CAMELID_GEMMA4_SPLIT pointing at a live gemma4-worker holding the tail layers)",
         "tested_context": "short_api_chat_completions_sse_smoke_through_the_two_mac_distributed_lane",
         "chat_template_renderer": "gemma4_marker",
         "chat_template_shape_pack": "not_promoted",
@@ -1070,7 +1070,7 @@
         "parity_audited": "basic_v1_pack_2of5_full_budget_token_identical_plus_3of5_probe_verified_knife_edge_frontiers_vs_pinned_comparator_distributed_equals_single_node",
         "performance_measured": "two_mac_validation_decode_about_0_17_tok_s_recorded_not_a_perf_claim",
         "frontend_load_path_verified": "served_via_gemma4_runtime_flag_distributed_lane",
-        "frontend_readiness_gate": "green only when this exact gemma4 GGUF row plus Q4_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id (serve requires CAMELID_GEMMA4_SERVE=1 plus CAMELID_GEMMA4_WORKER and CAMELID_GEMMA4_SPLIT pointing at a live gemma4-worker holding the tail layers)",
+        "frontend_readiness_gate": "green only when this exact gemma4 GGUF row plus Q4_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id (gemma4 serve lane on by default — opt-out CAMELID_GEMMA4_SERVE=0 — plus CAMELID_GEMMA4_WORKER and CAMELID_GEMMA4_SPLIT pointing at a live gemma4-worker holding the tail layers)",
         "tested_context": "short_api_chat_completions_sse_smoke_through_the_two_mac_distributed_lane",
         "chat_template_renderer": "gemma4_marker",
         "chat_template_shape_pack": "not_promoted",

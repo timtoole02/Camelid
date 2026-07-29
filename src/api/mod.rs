@@ -106,9 +106,9 @@ static JINJA_CHAT_TEMPLATE_ENV_CACHE: OnceLock<Mutex<HashMap<String, Arc<Environ
 pub struct AppState {
     loaded_models: Arc<RwLock<HashMap<String, LoadedModel>>>,
     /// Gemma 4 serve runtimes (local single-node or distributed layer-sharding),
-    /// keyed by model id. Populated only when the gemma4 serve path is enabled
-    /// (`CAMELID_GEMMA4_SERVE`) and a gemma4 model is loaded. This is an
-    /// additive, parallel path: the Llama/3B backend is untouched.
+    /// keyed by model id. Populated when a gemma4 model is loaded (lane on by
+    /// default; opt out with `CAMELID_GEMMA4_SERVE=0`). This is an additive,
+    /// parallel path: the Llama/3B backend is untouched.
     gemma4_runtimes: Arc<RwLock<HashMap<String, Arc<Gemma4ServeRuntime>>>>,
     /// Runnable-lane serve runtimes (qwen35/Ornith, gemma3), keyed by model id.
     /// Populated when a runnable-served arch is loaded (lane on by default;
@@ -116,10 +116,11 @@ pub struct AppState {
     /// optimized engine â€” see the runnable serve bridge near
     /// `runnable_chat_nonstreaming`.
     runnable_runtimes: Arc<RwLock<HashMap<String, Arc<RunnableServeRuntime>>>>,
-    /// DiffusionGemma serve runtimes, keyed by model id. Populated only when
-    /// `CAMELID_DG_SERVE` is set and a diffusion-gemma model is loaded. Additive,
-    /// parallel to the optimized engine (which keeps failing closed for this
-    /// arch by design) — see the bridge near `dg_chat_nonstreaming`.
+    /// DiffusionGemma serve runtimes, keyed by model id. Populated when a
+    /// diffusion-gemma model is loaded (lane on by default; opt out with
+    /// `CAMELID_DG_SERVE=0`). Additive, parallel to the optimized engine (which
+    /// keeps failing closed for this arch by design) — see the bridge near
+    /// `dg_chat_nonstreaming`.
     dg_runtimes: Arc<RwLock<HashMap<String, Arc<DgServeRuntime>>>>,
     /// Bidirectional encoder runtimes, loaded lazily on the first embeddings or
     /// reranking request and released with the owning model.
@@ -264,7 +265,7 @@ impl AppState {
     }
 
     /// Register a loaded gemma4 runtime under a model id, exactly as the
-    /// `CAMELID_GEMMA4_SERVE` load path would. For integration tests that drive
+    /// gemma4 serve load path would. For integration tests that drive
     /// the live chat routes against a real runtime without the full
     /// model-install flow.
     pub async fn insert_gemma4_runtime_for_tests(
@@ -483,8 +484,8 @@ pub struct HealthResponse {
     pub backend: &'static str,
     /// Model family of the active model ("gemma4", "llama-family", ...), if loaded.
     pub model_family: Option<&'static str>,
-    /// True when the gemma4 serve path is built (CAMELID_GEMMA4_SERVE) and a gemma4
-    /// runtime is loaded for the active model.
+    /// True when the gemma4 serve path is enabled (on by default; opt-out
+    /// CAMELID_GEMMA4_SERVE=0) and a gemma4 runtime is loaded for the active model.
     pub gemma4_available: bool,
     /// Engine-queue backpressure gauge: generation jobs accepted and not yet
     /// finished (queued + running). Bounded by CAMELID_QUEUE_DEPTH; beyond the
@@ -4414,7 +4415,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 parity_audited: "basic_v1_pack_5of5_full_budget_cpu_and_gpu_vs_pinned_plain_f32_gemv_comparator_llama_cpp_5d56eff",
                 performance_measured: "functional_milestone_only_not_perf_validated",
                 frontend_load_path_verified: "served_via_gemma4_runtime_flag",
-                frontend_readiness_gate: "green only when this exact gemma4 GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id (serve requires CAMELID_GEMMA4_SERVE=1)",
+                frontend_readiness_gate: "green only when this exact gemma4 GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id (served with the gemma4 serve lane enabled — on by default; opt-out CAMELID_GEMMA4_SERVE=0)",
                 tested_context: "short_api_webui_chat_smoke_streaming_and_nonstreaming_plus_cli_greedy_parity",
                 chat_template_renderer: "gemma4_marker",
                 chat_template_shape_pack: "validated_bounded_pack",
@@ -4498,7 +4499,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 parity_audited: "basic_v1_pack_5of5_full_budget_cpu_and_gpu_vs_pinned_plain_f32_gemv_comparator_llama_cpp_5d56eff",
                 performance_measured: "functional_milestone_only_not_perf_validated",
                 frontend_load_path_verified: "served_via_gemma4_runtime_flag",
-                frontend_readiness_gate: "green only when this exact gemma4 GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id (serve requires CAMELID_GEMMA4_SERVE=1)",
+                frontend_readiness_gate: "green only when this exact gemma4 GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id (served with the gemma4 serve lane enabled — on by default; opt-out CAMELID_GEMMA4_SERVE=0)",
                 tested_context: "five_prompt_basic_v1_pack_greedy_parity_plus_api_webui_chat_smoke",
                 chat_template_renderer: "gemma4_marker",
                 chat_template_shape_pack: "validated_bounded_pack",
@@ -4540,7 +4541,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 parity_audited: "basic_v1_pack_5of5_distributed_token_identical_to_single_node_3of5_full_budget_vs_pinned_comparator_with_two_recorded_frontiers",
                 performance_measured: "two_mac_pair_cadence_6_2_to_6_75_tok_s_recorded_in_cli_bundle_only",
                 frontend_load_path_verified: "served_via_gemma4_runtime_flag_distributed_lane",
-                frontend_readiness_gate: "green only when this exact gemma4 GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id (serve requires CAMELID_GEMMA4_SERVE=1 plus CAMELID_GEMMA4_WORKER and CAMELID_GEMMA4_SPLIT pointing at a live gemma4-worker holding the tail layers)",
+                frontend_readiness_gate: "green only when this exact gemma4 GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id (gemma4 serve lane on by default — opt-out CAMELID_GEMMA4_SERVE=0 — plus CAMELID_GEMMA4_WORKER and CAMELID_GEMMA4_SPLIT pointing at a live gemma4-worker holding the tail layers)",
                 tested_context: "short_api_chat_completions_sse_smoke_through_the_two_mac_distributed_lane",
                 chat_template_renderer: "gemma4_marker",
                 chat_template_shape_pack: "not_promoted",
@@ -4582,7 +4583,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 parity_audited: "basic_v1_pack_2of5_full_budget_token_identical_plus_3of5_probe_verified_knife_edge_frontiers_vs_pinned_comparator_distributed_equals_single_node",
                 performance_measured: "two_mac_validation_decode_about_0_17_tok_s_recorded_not_a_perf_claim",
                 frontend_load_path_verified: "served_via_gemma4_runtime_flag_distributed_lane",
-                frontend_readiness_gate: "green only when this exact gemma4 GGUF row plus Q4_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id (serve requires CAMELID_GEMMA4_SERVE=1 plus CAMELID_GEMMA4_WORKER and CAMELID_GEMMA4_SPLIT pointing at a live gemma4-worker holding the tail layers)",
+                frontend_readiness_gate: "green only when this exact gemma4 GGUF row plus Q4_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id (gemma4 serve lane on by default — opt-out CAMELID_GEMMA4_SERVE=0 — plus CAMELID_GEMMA4_WORKER and CAMELID_GEMMA4_SPLIT pointing at a live gemma4-worker holding the tail layers)",
                 tested_context: "short_api_chat_completions_sse_smoke_through_the_two_mac_distributed_lane",
                 chat_template_renderer: "gemma4_marker",
                 chat_template_shape_pack: "not_promoted",
@@ -5968,13 +5969,32 @@ async fn inspect_model(
         .into_response()
 }
 
-/// The Gemma 4 serve path is gated behind `CAMELID_GEMMA4_SERVE` (1/true/yes).
-/// When off, the existing Llama/3B backend behaves exactly as before.
+/// The Gemma 4 serve path is ON by default: gemma4 chat never falls through to
+/// the Llama path ([`resolve_gemma4_runtime`] fails closed by design), so a
+/// supported catalog row (e.g. gemma-4-E4B-it Q8_0) must chat out of the box
+/// instead of 503ing on an env var the desktop never sets. The runtime load is
+/// a lazy mmap (no eager decode; the CUDA and distributed sub-lanes stay behind
+/// their own opt-ins). Opt out with `CAMELID_GEMMA4_SERVE=0`
+/// (0/off/false/no/disabled), which restores the metadata-only load; any other
+/// value — including unset — enables the lane. Mirrors the
+/// `CAMELID_RUNNABLE_SERVE=0` opt-out precedent.
 fn gemma4_serve_enabled() -> bool {
-    matches!(
-        std::env::var("CAMELID_GEMMA4_SERVE").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
-    )
+    gemma4_serve_flag(std::env::var("CAMELID_GEMMA4_SERVE").ok().as_deref())
+}
+
+/// Pure decision half of [`gemma4_serve_enabled`] so the default-on/opt-out
+/// contract is unit-testable without touching process env.
+fn gemma4_serve_flag(value: Option<&str>) -> bool {
+    !value
+        .map(|v| {
+            let v = v.trim();
+            v.eq_ignore_ascii_case("0")
+                || v.eq_ignore_ascii_case("off")
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("no")
+                || v.eq_ignore_ascii_case("disabled")
+        })
+        .unwrap_or(false)
 }
 
 /// Additionally route the gemma4 serve lane through the CUDA decode engine when
@@ -6312,6 +6332,48 @@ mod gemma4_template_tests {
         assert!(!runnable_serve_flag(Some("disabled")));
         assert!(!runnable_serve_flag(Some(" 0 ")));
         assert!(!runnable_serve_flag(Some("OFF")));
+    }
+
+    #[test]
+    fn gemma4_serve_lane_defaults_on_with_explicit_opt_out() {
+        // The gemma4 serve lane must work out of the box: the catalog gemma4 rows
+        // (E4B/E2B Q8_0, the distributed 12B/26B) have no other serve path — chat
+        // fails closed rather than falling through to the Llama engine — and the
+        // desktop sets no env vars. Unset — and every non-disable value — is ON.
+        assert!(gemma4_serve_flag(None));
+        assert!(gemma4_serve_flag(Some("1")));
+        assert!(gemma4_serve_flag(Some("true")));
+        assert!(gemma4_serve_flag(Some("yes")));
+        assert!(gemma4_serve_flag(Some("")));
+        // Explicit opt-out restores the metadata-only load (typed 503 on chat).
+        assert!(!gemma4_serve_flag(Some("0")));
+        assert!(!gemma4_serve_flag(Some("off")));
+        assert!(!gemma4_serve_flag(Some("false")));
+        assert!(!gemma4_serve_flag(Some("no")));
+        assert!(!gemma4_serve_flag(Some("disabled")));
+        assert!(!gemma4_serve_flag(Some(" 0 ")));
+        assert!(!gemma4_serve_flag(Some("OFF")));
+    }
+
+    #[test]
+    fn dg_serve_lane_defaults_on_with_explicit_opt_out() {
+        // Maintainer-directed: the DiffusionGemma serve lane defaults on like the
+        // runnable and gemma4 lanes — a loaded diffusion-gemma model has no other
+        // serve path (the AR engine fails closed on the arch). The request-time
+        // cost (minutes-per-block denoise) keeps the lane experimental, not gated.
+        assert!(dg_serve_flag(None));
+        assert!(dg_serve_flag(Some("1")));
+        assert!(dg_serve_flag(Some("true")));
+        assert!(dg_serve_flag(Some("yes")));
+        assert!(dg_serve_flag(Some("")));
+        // Explicit opt-out restores the metadata-only load (typed 503 on chat).
+        assert!(!dg_serve_flag(Some("0")));
+        assert!(!dg_serve_flag(Some("off")));
+        assert!(!dg_serve_flag(Some("false")));
+        assert!(!dg_serve_flag(Some("no")));
+        assert!(!dg_serve_flag(Some("disabled")));
+        assert!(!dg_serve_flag(Some(" 0 ")));
+        assert!(!dg_serve_flag(Some("OFF")));
     }
 
     #[test]
@@ -6696,7 +6758,7 @@ impl Gemma4ChannelFilter {
 /// worker over TCP). Both expose the same greedy contract, so the chat and
 /// completion handlers are lane-agnostic. The distributed lane is configured
 /// at model-load time via `CAMELID_GEMMA4_WORKER` + `CAMELID_GEMMA4_SPLIT`
-/// (alongside `CAMELID_GEMMA4_SERVE=1`).
+/// (the serve lane itself is on by default; opt-out `CAMELID_GEMMA4_SERVE=0`).
 // Always stored behind an Arc (AppState::gemma4_runtimes), so there is exactly one
 // heap-allocated instance per loaded model; the Cuda variant's resident scratch dwarfs
 // the others, but the inline size disparity has no practical cost here.
@@ -6802,7 +6864,8 @@ async fn resolve_gemma4_runtime_for_model(
             "model_not_ready",
             format!(
                 "gemma4 model '{id}' is loaded but its serve runtime is unavailable; \
-                 set CAMELID_GEMMA4_SERVE=1 and reload the model"
+                 the gemma4 serve lane is on by default — if CAMELID_GEMMA4_SERVE=0 \
+                 is set, unset it, then reload the model"
             ),
             None,
         ));
@@ -7804,7 +7867,7 @@ async fn runnable_chat_streaming(
 }
 
 // ===================================================================================
-// DiffusionGemma serve bridge (additive, gated by CAMELID_DG_SERVE).
+// DiffusionGemma serve bridge (additive, on by default; opt-out CAMELID_DG_SERVE=0).
 //
 // The block-diffusion lane cannot run on the AR engine — `model.rs` fails closed for
 // this arch BY DESIGN and stays that way. This bridge mirrors the runnable-lane
@@ -7818,13 +7881,33 @@ async fn runnable_chat_streaming(
 // one content delta per COMMITTED BLOCK with keep-alive comments in between.
 // ===================================================================================
 
-/// The DiffusionGemma serve lane is gated behind `CAMELID_DG_SERVE` (1/true/yes).
-/// When off, a diffusion-gemma load stays metadata-only (fail-closed redirect).
+/// The DiffusionGemma serve lane is ON by default (maintainer-directed,
+/// alongside the runnable PR #547 and gemma4 flips): a loaded diffusion-gemma
+/// model has no other serve path — the AR engine fails closed on the arch by
+/// design — so chat should reach the lane without an env var the desktop never
+/// sets. The runtime load is a lazy mmap (seconds); the COST lives at request
+/// time: a DG chat is minutes-per-block CPU-pure denoise serialized behind
+/// DG_GENERATION_LOCK, which is why the lane stays labeled experimental. Opt
+/// out with `CAMELID_DG_SERVE=0` (0/off/false/no/disabled), which restores the
+/// metadata-only load and the typed 503 on chat; any other value — including
+/// unset — enables the lane.
 fn dg_serve_enabled() -> bool {
-    matches!(
-        std::env::var("CAMELID_DG_SERVE").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
-    )
+    dg_serve_flag(std::env::var("CAMELID_DG_SERVE").ok().as_deref())
+}
+
+/// Pure decision half of [`dg_serve_enabled`] so the default-on/opt-out
+/// contract is unit-testable without touching process env.
+fn dg_serve_flag(value: Option<&str>) -> bool {
+    !value
+        .map(|v| {
+            let v = v.trim();
+            v.eq_ignore_ascii_case("0")
+                || v.eq_ignore_ascii_case("off")
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("no")
+                || v.eq_ignore_ascii_case("disabled")
+        })
+        .unwrap_or(false)
 }
 
 /// True for the DiffusionGemma architecture spellings the loader recognizes.
@@ -7929,7 +8012,8 @@ async fn resolve_dg_runtime(
             "model_not_ready",
             format!(
                 "model '{id}' (DiffusionGemma) is loaded but its serve runtime is \
-                 unavailable; set CAMELID_DG_SERVE=1 and reload the model"
+                 unavailable; the DiffusionGemma serve lane is on by default — if \
+                 CAMELID_DG_SERVE=0 is set, unset it, then reload the model"
             ),
             None,
         ));
@@ -8472,8 +8556,8 @@ async fn load_model_from_path_with_activation(
         clear_prompt_prefix_cache(state);
     }
 
-    // Gemma 4 serve path (additive, gated by CAMELID_GEMMA4_SERVE): load a
-    // serve runtime so /v1/chat can route to it. Fail clearly on error â€” never
+    // Gemma 4 serve path (additive, on by default; opt-out CAMELID_GEMMA4_SERVE=0):
+    // load a serve runtime so /v1/chat can route to it. Fail clearly on error â€” never
     // silently fall back to the Llama path (which would produce garbage here).
     if gemma4_serve_enabled() && model_family(&loaded.gguf) == "gemma4" {
         load_gemma4_serve_runtime(state, &id, &loaded.path).await?;
@@ -8487,8 +8571,8 @@ async fn load_model_from_path_with_activation(
         load_runnable_serve_runtime(state, &id, &loaded.path).await?;
     }
 
-    // DiffusionGemma serve path (additive, gated by CAMELID_DG_SERVE): the AR
-    // engine keeps failing closed for this arch (`unsupported_runtime` carries
+    // DiffusionGemma serve path (additive, on by default; opt-out CAMELID_DG_SERVE=0):
+    // the AR engine keeps failing closed for this arch (`unsupported_runtime` carries
     // the dedicated-lane redirect); the bridge loads the Phase 6 DgChat runtime
     // so /v1/chat routes to the diffusion lane instead.
     if dg_serve_enabled() && is_dg_serve_arch(loaded.gguf.architecture().unwrap_or_default()) {
@@ -9727,8 +9811,8 @@ async fn completions(
         Ok(payload) => payload,
         Err(err) => return malformed_json_error(err),
     };
-    // Gemma 4 serve path (additive, gated by CAMELID_GEMMA4_SERVE): raw greedy
-    // completion against the gemma4 runtime, mirroring the chat short-circuit.
+    // Gemma 4 serve path (additive, on by default; opt-out CAMELID_GEMMA4_SERVE=0):
+    // raw greedy completion against the gemma4 runtime, mirroring the chat short-circuit.
     match resolve_gemma4_runtime_for_model(&state, &req.model).await {
         Ok(Some((id, runtime))) => {
             return if req.stream.unwrap_or(false) {
@@ -10074,9 +10158,9 @@ async fn chat_completions(
             Some("response_format"),
         )
     };
-    // Gemma 4 serve path (additive, gated by CAMELID_GEMMA4_SERVE). Short-circuits
-    // if this request targets a loaded gemma4 runtime; otherwise falls through to
-    // the existing Llama/3B path unchanged.
+    // Gemma 4 serve path (additive, on by default; opt-out CAMELID_GEMMA4_SERVE=0).
+    // Short-circuits if this request targets a loaded gemma4 runtime; otherwise falls
+    // through to the existing Llama/3B path unchanged.
     match resolve_gemma4_runtime(&state, &req).await {
         Ok(Some((id, runtime))) => {
             if constraint.is_some() {
@@ -10107,7 +10191,7 @@ async fn chat_completions(
         Ok(None) => {}
         Err(resp) => return resp,
     }
-    // DiffusionGemma serve path (additive, gated by CAMELID_DG_SERVE):
+    // DiffusionGemma serve path (additive, on by default; opt-out CAMELID_DG_SERVE=0):
     // short-circuits a diffusion-gemma model to the dedicated diffusion lane
     // (block-level SSE; a denoise block is minutes of compute).
     match resolve_dg_runtime(&state, &req.model).await {
