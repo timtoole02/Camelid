@@ -3498,10 +3498,6 @@ mod tests {
         assert!(matches!(out, ToolOutcome::Ok(ref s) if s.contains("hi")));
     }
 
-    // On macOS the default mode IS enforceable (sandbox-exec), so run_shell runs
-    // — confined. Proving the confinement is the job of the enforcement tests in
-    // shell_sandbox; here we prove the tool is reachable and its writes land.
-    #[cfg(target_os = "macos")]
     #[test]
     fn resubmitting_an_unchanged_plan_is_told_to_act() {
         // Live failure on Qwen3-4B: "tic tac toe in python" produced one plan
@@ -3606,6 +3602,14 @@ mod tests {
         }
     }
 
+    // On macOS the default mode IS enforceable (sandbox-exec), so run_shell runs
+    // — confined. Proving the confinement is the job of the enforcement tests in
+    // shell_sandbox; here we prove the tool is reachable and its writes land.
+    //
+    // Keep this attribute ADJACENT to the fn: an earlier edit inserted a test
+    // between the two and silently handed the gate to the newcomer, so this ran
+    // on Windows and failed there.
+    #[cfg(target_os = "macos")]
     #[test]
     fn sandboxed_run_shell_runs_confined_on_macos() {
         use super::ShellSandbox;
