@@ -365,6 +365,15 @@
   background: color-mix(in srgb, var(--color-accent-soft) 38%, transparent);
 }
 .code-thinking-card header { display: flex; align-items: center; gap: var(--space-2); color: var(--color-text-muted); font-size: var(--text-xs); }
+/* Shown instead of the raw stream while the model is emitting tool-call syntax,
+   which is not prose and is surfaced by its own tool card. */
+.code-thinking-card__quiet {
+  margin: var(--space-2) 0 0;
+  color: var(--color-text-muted);
+  font-size: var(--text-xs);
+  font-style: italic;
+}
+
 .code-thinking-card pre {
   max-height: 220px;
   margin: var(--space-2) 0 0;

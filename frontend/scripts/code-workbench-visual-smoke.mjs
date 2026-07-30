@@ -112,6 +112,11 @@ try {
         this.emitAfter(20, { sequence: 1, event: 'session.started', workspace: 'C:/projects/camelid-demo', model_id: 'Qwen3-4B-Q4_K_M.gguf' })
         this.emitAfter(40, { sequence: 2, event: 'turn.started', turn_index: 0 })
         this.emitAfter(70, { sequence: 3, event: 'model.delta', content: 'I will inspect the existing component before changing it.' })
+        // Qwen/Hermes models stream their tool call as ordinary tokens. It is
+        // syntax, not prose, and must never reach the visible transcript.
+        this.emitAfter(72, { sequence: 3, event: 'model.delta', content: '\n<tool_call>\n{"name":"list_dir","arguments":{"path":"/x","offset":0,"limit":200}}\n</tool_call>' })
+        // The other shape seen live: no wrapper tag, just the call itself.
+        this.emitAfter(74, { sequence: 3, event: 'model.delta', content: '\nlist_dir({"path": "/x/workspace", "limit": 200, "offset": 0})' })
         this.emitAfter(90, { sequence: 4, event: 'tool.call', detail: 'update_plan(3 steps)' })
         this.emitAfter(110, { sequence: 5, event: 'tool.result', tool: 'update_plan', outcome: 'ok', content: 'plan updated\n[x] Inspect the existing Code workspace\n[~] Build the interactive agent component\n[ ] Run focused regression tests' })
         this.emitAfter(140, { sequence: 6, event: 'tool.call', detail: 'read_file(frontend/src/App.jsx, offset=0, limit=220)' })
@@ -438,6 +443,36 @@ try {
     || cancels.length !== 1) {
     throw new Error(`Stop reported the turn ending twice: ${JSON.stringify({ ...stoppedState, cancels: cancels.length })}`)
   }
+
+  // The streamed tool-call syntax must not be rendered as model output. Left
+  // raw, a normal Qwen step reads as the agent having lost its mind.
+  const liveText = await page.evaluate(() => ({
+    thinking: document.querySelector('.code-thinking-card')?.textContent || '',
+    body: document.body.textContent || '',
+  }))
+  if (liveText.body.includes('<tool_call>') || liveText.body.includes('"arguments"')) {
+    throw new Error(`raw tool-call syntax leaked into the transcript: ${liveText.thinking.slice(0, 200)}`)
+  }
+
+  // A finished session must NOT kill the access control. It was disabled
+  // whenever a session existed, so after the very first turn the dropdown was
+  // dead and full auto unreachable without starting over — and this smoke missed
+  // it precisely because it only ever opened the menu AFTER clicking "New
+  // coding session". Assert the live case first.
+  const accessAfterTurn = await page.evaluate(() => ({
+    disabled: Boolean(document.querySelector('.code-access-chip')?.disabled),
+  }))
+  if (accessAfterTurn.disabled) {
+    throw new Error('the access control is dead once a session exists')
+  }
+  await page.click('.code-access-chip')
+  await page.waitForSelector('.code-access-menu')
+  const carriedNote = await page.$eval('.code-access-menu__heading', (node) => node.textContent)
+  if (!carriedNote.includes('next task')) {
+    throw new Error(`the menu must say a change applies to the next task: ${carriedNote}`)
+  }
+  await page.keyboard.press('Escape')
+  await page.waitForSelector('.code-access-menu', { hidden: true })
 
   await page.click('button[aria-label="New coding session"]')
   await page.click('.code-access-chip')

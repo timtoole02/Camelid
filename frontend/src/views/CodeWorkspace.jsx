@@ -148,6 +148,27 @@ function groupActivityEvents(events) {
   return grouped
 }
 
+// Tool-call syntax the model streams as ordinary tokens. It is not prose and
+// must not be shown as the model's visible output: a Qwen/Hermes-style step
+// renders as a raw `<tool_call>{"name":...}` blob, which reads as the agent
+// losing its mind when in fact the call was parsed and executed normally. The
+// call itself is surfaced properly by its own tool card, so strip it here.
+const TOOL_CALL_BLOCK = /<tool_call>[\s\S]*?<\/tool_call>/g
+const TOOL_CALL_OPEN = /<tool_call>[\s\S]*$/
+// A bare JSON call, the Llama-style form, when it is the ONLY thing left.
+const BARE_TOOL_CALL = /^\s*\{\s*"(?:name|type)"\s*:[\s\S]*$/
+// The other shape small models emit: `list_dir({"path": ...})`, with no wrapper
+// tag at all. Anchored, so prose that merely mentions a call is left alone.
+const CALL_WITH_JSON = /^\s*[a-z_][a-z0-9_]*\s*\(\s*\{[\s\S]*$/i
+
+function visibleLiveText(raw) {
+  let text = String(raw || '').replace(TOOL_CALL_BLOCK, '')
+  // A block still being generated: everything from the opening tag on is syntax.
+  text = text.replace(TOOL_CALL_OPEN, '')
+  if (BARE_TOOL_CALL.test(text) || CALL_WITH_JSON.test(text)) text = ''
+  return text.trim()
+}
+
 function HistoricalTurn({ turn }) {
   return (
     <div className="code-turn-pair">
@@ -209,12 +230,12 @@ function ActivityEvent({ event, pairedResult, activeApproval, decisionBusy, onDe
     // Only the tail is rendered. This node re-renders on every generated token,
     // and a long step (a whole file inside a write_file argument) otherwise
     // grows an ever-taller <pre> that costs more to lay out with each token.
-    const live = String(event.content || '')
+    const live = visibleLiveText(event.content)
     const tail = live.length > LIVE_TAIL_CHARS ? `…${live.slice(-LIVE_TAIL_CHARS)}` : live
     return (
       <article className="code-thinking-card" aria-live="polite">
         <header><span className="code-live-dot" /><strong>Camelid is working</strong></header>
-        <pre>{tail}</pre>
+        {tail ? <pre>{tail}</pre> : <p className="code-thinking-card__quiet">Preparing the next tool call…</p>}
       </article>
     )
   }
@@ -839,10 +860,20 @@ export default function CodeWorkspace({
     signalHistoryChanged()
   }
 
+  // Whether the live session already runs under the access the user has
+  // selected. Approval mode and the network grant are fixed when the server
+  // creates a session, so a follow-up cannot carry a change — it would silently
+  // run under the old posture, which is worse than refusing.
+  const accessMatchesSession = !session
+    || ((session.approval_mode || 'approval_gated') === approvalMode
+      && Boolean(session.allow_network) === allowNetwork)
+
   const submitComposer = (event) => {
     event?.preventDefault()
     if (running) return
-    if (session) sendFollowUp()
+    // A changed posture starts a new session on the same thread, so the
+    // transcript continues while the new access actually takes effect.
+    if (session && accessMatchesSession) sendFollowUp()
     else start()
   }
 
@@ -951,19 +982,33 @@ export default function CodeWorkspace({
                     aria-haspopup="menu"
                     aria-expanded={accessMenuOpen}
                     onClick={() => setAccessMenuOpen((open) => !open)}
-                    disabled={Boolean(session)}
-                    title={session ? 'Start a new session to change access' : 'Choose approval and network access'}
+                    // Gated on a RUNNING turn, not on having a session at all.
+                    // The server binds approval mode when a session is created,
+                    // so a change cannot alter the turn in flight — but once one
+                    // finishes, refusing to let the user change access left a
+                    // permanently dead control whose only explanation was a
+                    // tooltip. A change now applies to the next task, which
+                    // `submitComposer` delivers by starting a fresh session on
+                    // the same thread instead of sending a follow-up.
+                    disabled={running}
+                    title={running
+                      ? 'Access cannot change while a turn is running'
+                      : 'Choose approval and network access'}
                   >
                     <IconWarning size={14} />
                     {approvalMode === 'full_auto' ? 'Full auto' : 'Approval gated'}
                     {allowNetwork ? <IconNetwork size={13} /> : null}
                     <IconChevronDown size={12} />
                   </button>
-                  {accessMenuOpen && !session ? (
+                  {accessMenuOpen && !running ? (
                     <div className="code-access-menu" role="menu" aria-label="Agent access">
                       <div className="code-access-menu__heading">
                         <strong>Agent access</strong>
-                        <small>Applies to this coding session only</small>
+                        <small>
+                          {session
+                            ? 'Applies to your next task, which starts a fresh session on this thread'
+                            : 'Applies to this coding session only'}
+                        </small>
                       </div>
                       <button
                         type="button"
