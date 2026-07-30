@@ -1567,7 +1567,64 @@ pub fn validate_for(
 }
 
 fn parse_args<T: for<'de> Deserialize<'de>>(args: &Value, name: &str) -> Result<T, String> {
-    serde_json::from_value(args.clone()).map_err(|e| format!("{name} has invalid arguments: {e}"))
+    match serde_json::from_value::<T>(args.clone()) {
+        Ok(parsed) => Ok(parsed),
+        Err(strict) => {
+            // Retry once with double-encoded fields unwrapped. Small models
+            // routinely hand back a structured argument as a STRING containing
+            // valid JSON (`"steps": "[{\"status\":...}]"`), which serde rejects
+            // as "expected a sequence". Accepting it costs nothing — the unwrapped
+            // value is still schema-checked below — and refusing it burns the turn
+            // on a formatting slip the model cannot see.
+            if let Some(relaxed) = unwrap_json_string_fields(args) {
+                if let Ok(parsed) = serde_json::from_value::<T>(relaxed) {
+                    return Ok(parsed);
+                }
+            }
+            // Still wrong: say what was expected. The bare serde message ("invalid
+            // type: string ..., expected a sequence") tells the model nothing about
+            // the shape it should have sent, so it retries the same malformed call
+            // until the no-progress guard ends the turn.
+            Err(match argument_schema_hint(name) {
+                Some(hint) => format!("{name} has invalid arguments: {strict}. Expected: {hint}"),
+                None => format!("{name} has invalid arguments: {strict}"),
+            })
+        }
+    }
+}
+
+/// Replace any top-level string field whose contents are themselves a JSON
+/// object or array with the parsed value. `None` when nothing looked
+/// double-encoded, so the caller keeps the original error.
+///
+/// Only reached after strict parsing has already failed, so a tool that
+/// legitimately takes a string (a `search` pattern, `write_file` content) is
+/// never reinterpreted — its strict parse succeeded.
+fn unwrap_json_string_fields(args: &Value) -> Option<Value> {
+    let fields = args.as_object()?;
+    let mut relaxed = fields.clone();
+    let mut changed = false;
+    for (key, value) in fields {
+        let Value::String(text) = value else { continue };
+        let trimmed = text.trim();
+        if !(trimmed.starts_with('[') || trimmed.starts_with('{')) {
+            continue;
+        }
+        if let Ok(inner) = serde_json::from_str::<Value>(trimmed) {
+            relaxed.insert(key.clone(), inner);
+            changed = true;
+        }
+    }
+    changed.then(|| Value::Object(relaxed))
+}
+
+/// The argument shape a tool advertises, as a compact hint for an error message.
+/// Read from the same schema the model was given, so the two cannot drift.
+fn argument_schema_hint(name: &str) -> Option<String> {
+    let spec = specs(true, shell_sandbox::ShellSandbox::Sandboxed)
+        .into_iter()
+        .find(|spec| spec.name == name)?;
+    serde_json::to_string(&spec.params).ok()
 }
 
 // --- execution ------------------------------------------------------------
@@ -3428,6 +3485,67 @@ mod tests {
     // — confined. Proving the confinement is the job of the enforcement tests in
     // shell_sandbox; here we prove the tool is reachable and its writes land.
     #[cfg(target_os = "macos")]
+    #[test]
+    fn a_double_encoded_structured_argument_is_accepted() {
+        // Observed live on Llama 3.2 3B: the model sent `steps` as a STRING
+        // holding valid JSON, serde said "expected a sequence", and the model
+        // resent the identical call until the no-progress guard killed the turn.
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path());
+        let steps = r#"[{"status":"in_progress","text":"read the file"},{"status":"pending","text":"fix the bug"}]"#;
+        let action = validate(&call("update_plan", json!({"steps": steps})), &sb)
+            .expect("a double-encoded steps array must be accepted");
+        match action {
+            Action::UpdatePlan { steps } => {
+                assert_eq!(steps.len(), 2);
+                assert_eq!(steps[1].text, "fix the bug");
+            }
+            other => panic!("expected UpdatePlan, got {other:?}"),
+        }
+        // The properly-encoded form still works, and is what the strict parse
+        // accepts without any relaxation.
+        assert!(validate(
+            &call(
+                "update_plan",
+                json!({"steps":[{"status":"pending","text":"x"}]}),
+            ),
+            &sb,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn an_unusable_argument_error_states_the_expected_shape() {
+        // The bare serde message names the offending type but never the shape
+        // the tool wanted, so a small model has nothing to correct toward.
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path());
+        let error = validate(&call("update_plan", json!({"steps": 7})), &sb).unwrap_err();
+        assert!(error.contains("invalid arguments"), "{error}");
+        assert!(
+            error.contains("Expected:") && error.contains("status"),
+            "the error must show the advertised schema: {error}"
+        );
+    }
+
+    #[test]
+    fn relaxation_never_rewrites_an_argument_that_is_genuinely_a_string() {
+        // A pattern or file body that merely LOOKS like JSON must survive intact:
+        // strict parsing succeeds for these, so the relaxed path never runs.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
+        let sb = sandbox(dir.path());
+        match validate(
+            &call("write_file", json!({"path":"f.txt","content":"[1, 2, 3]"})),
+            &sb,
+        )
+        .unwrap()
+        {
+            Action::WriteFile { content, .. } => assert_eq!(content, "[1, 2, 3]"),
+            other => panic!("expected WriteFile, got {other:?}"),
+        }
+    }
+
     #[test]
     fn sandboxed_run_shell_runs_confined_on_macos() {
         use super::ShellSandbox;
