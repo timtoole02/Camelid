@@ -33,7 +33,9 @@ impl Status {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// PartialEq so the tool can tell a real plan change from a resubmission of the
+// same plan, which is not progress and must not be reported as an update.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Step {
     pub status: Status,
     pub text: String,

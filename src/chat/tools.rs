@@ -1139,8 +1139,25 @@ impl Action {
             Action::Screenshot { path } => uia_screenshot(path),
             Action::WebSearch { query } => web_search(sandbox, query),
             Action::UpdatePlan { steps } => {
+                // Resubmitting the SAME plan is not progress, and answering it
+                // with the same "plan updated" text teaches the model nothing:
+                // observed live, a model re-sent one unchanged step until the
+                // no-progress guard ended the turn with no work done. Say the
+                // plan did not change and name what would move it forward. The
+                // text still repeats if the model insists, so the guard remains
+                // the backstop — this just gives it a chance not to be needed.
+                let unchanged = super::plan::get() == *steps;
                 let stored = super::plan::set(steps.clone());
-                ToolOutcome::Ok(format!("plan updated\n{}", super::plan::render(&stored)))
+                if unchanged {
+                    ToolOutcome::Ok(format!(
+                        "plan unchanged — this call changed nothing. Do the next step's work now \
+                         with a file or shell tool, then call update_plan again only to record \
+                         what finished.\n{}",
+                        super::plan::render(&stored)
+                    ))
+                } else {
+                    ToolOutcome::Ok(format!("plan updated\n{}", super::plan::render(&stored)))
+                }
             }
             // The server's reply is untrusted data and reaches the model through
             // the same fenced tool-result path as every native tool.
@@ -3485,6 +3502,49 @@ mod tests {
     // — confined. Proving the confinement is the job of the enforcement tests in
     // shell_sandbox; here we prove the tool is reachable and its writes land.
     #[cfg(target_os = "macos")]
+    #[test]
+    fn resubmitting_an_unchanged_plan_is_told_to_act() {
+        // Live failure on Qwen3-4B: "tic tac toe in python" produced one plan
+        // step ("create a plan to…"), then the same step three more times. Each
+        // call answered "plan updated", so nothing signalled that no progress had
+        // been made, and the turn ended on the repeat guard having written no code.
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path());
+        let plan = json!({"steps":[{"status":"in_progress","text":"write the game"}]});
+
+        let first = validate(&call("update_plan", plan.clone()), &sb)
+            .unwrap()
+            .execute(&sb);
+        assert!(first.text().contains("plan updated"), "{}", first.text());
+
+        let again = validate(&call("update_plan", plan), &sb)
+            .unwrap()
+            .execute(&sb);
+        assert!(
+            again.text().contains("plan unchanged"),
+            "an unchanged resubmission must say so: {}",
+            again.text()
+        );
+        assert!(
+            again.text().contains("file or shell tool"),
+            "and must name the way forward: {}",
+            again.text()
+        );
+
+        // A genuine change is still reported as an update.
+        let moved = validate(
+            &call(
+                "update_plan",
+                json!({"steps":[{"status":"done","text":"write the game"}]}),
+            ),
+            &sb,
+        )
+        .unwrap()
+        .execute(&sb);
+        assert!(moved.text().contains("plan updated"), "{}", moved.text());
+        crate::chat::plan::clear();
+    }
+
     #[test]
     fn a_double_encoded_structured_argument_is_accepted() {
         // Observed live on Llama 3.2 3B: the model sent `steps` as a STRING
