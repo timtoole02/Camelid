@@ -601,7 +601,7 @@ extern "C" __global__ void nvfp4_gemv(
 extern "C" __global__ void q4k_gemv(
     const float* __restrict__ input_scales,         // n_sb f32 (Q8_K d per superblock)
     const signed char* __restrict__ input_quants,   // n_sb*256 i8 (Q8_K quants)
-    const unsigned char* __restrict__ weight_bytes, // RAW 144-byte Q4_K wire, row-major
+    const unsigned char* __restrict__ weight_bytes, // SWIZZLED 144-byte Q4_K blocks, row-major
     int rows, int n_sb, float* __restrict__ output, int residual
 ) {
     extern __shared__ unsigned char smem4[];
@@ -925,7 +925,7 @@ extern "C" __global__ void q5k_gemv(
 extern "C" __global__ void q6k_gemv(
     const float* __restrict__ input_scales,         // n_sb f32 (Q8_K d per superblock)
     const signed char* __restrict__ input_quants,   // n_sb*256 i8 (Q8_K quants)
-    const unsigned char* __restrict__ weight_bytes, // raw 210-byte Q6_K wire, row-major
+    const unsigned char* __restrict__ weight_bytes, // 224-byte PADDED Q6_K blocks, row-major
     int rows, int n_sb, float* __restrict__ output, int residual
 ) {
     extern __shared__ unsigned char smem6[];

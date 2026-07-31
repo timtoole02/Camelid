@@ -3125,19 +3125,54 @@ fn q8_wire_to_soa(wire: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Quant lane of the GPU tied head: Q8_0 (`q8_gemv` over SoA-repacked weight, Q8_0
-/// input) or Q6_K (`q6k_gemv` over raw wire, Q8_K input).
+/// Quant lane of the GPU tied head: Q8_0 (`q8_gemv`, Q8_0 input), Q4_K (`q4k_gemv`,
+/// Q8_K input) or Q6_K (`q6k_gemv`, Q8_K input). Each lane's GEMV reads a specific
+/// GPU-side byte layout — see [`gemma4_head_upload`], which is the ONLY way the head
+/// weight may reach VRAM.
 #[cfg(feature = "cuda")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum HeadLane {
     Q8_0,
     Q4K,
     Q6K,
 }
 
-/// Resident GPU tied head. `weight` is the vocab-major projection (SoA for Q8_0, raw
-/// Q6_K wire otherwise); input is quantized by the fused rms_norm+quantize into
-/// `inq`/`ins`; `logits` is dtoh'd once per token. `blocks` is blocks-per-row passed
-/// to the GEMV (`hidden/32` for Q8_0, `hidden/256` for Q6_K).
+/// Convert the tied head's GGUF wire bytes into the GPU layout ITS GEMV reads.
+///
+/// None of these kernels reads the stock wire: `q8_gemv` wants the SoA split (quants
+/// then f16 scales), `q4k_gemv` wants the quant-byte swizzle that makes each aux
+/// lane's four stride-8 bytes one aligned i32, and `q6k_gemv` indexes super-blocks at
+/// a 224-byte PADDED stride, not the 210-byte wire stride. This mirrors
+/// `cuda_resident::repack_for_lane`, which is what every OTHER resident lane in the
+/// tree already routes through.
+///
+/// Root cause of the gemma4 Q4_0 mis-decode: the Q4_K and Q6_K arms used to
+/// `clone_htod` the raw wire while only the Q8_0 arm repacked. Since a Q4_0-quantized
+/// gemma4 export carries a **Q4_K** `token_embd` (the E2B Q4_0 row does), that row ran
+/// `q4k_gemv` over unswizzled bytes: every logit was formed from correctly-addressed
+/// but wrongly-PAIRED nibbles, so the lane emitted fluent-looking nonsense instead of
+/// refusing. Measured before the fix, "Name the capital of France in one word." →
+/// "passe dép oficialmenteynam shalthapp lenghtynam" on CUDA vs "Paris" on the CPU
+/// runtime. The Q6_K arm had the same defect one step worse — a 210-vs-224 stride
+/// mismatch that also reads past the end of the allocation.
+///
+/// Head lane is chosen from `token_embd`'s format, which no admission check inspects,
+/// so the only gemma4 row ever validated on this lane (E4B Q8_0) was the one whose
+/// head happened to be Q8_0. Routing all three lanes through one function is what
+/// keeps that class of bug from coming back.
+#[cfg(feature = "cuda")]
+fn gemma4_head_upload(lane: HeadLane, wire: &[u8]) -> Vec<u8> {
+    match lane {
+        HeadLane::Q8_0 => q8_wire_to_soa(wire),
+        HeadLane::Q4K => crate::cuda_resident::swz_q4k_blocks(wire),
+        HeadLane::Q6K => crate::cuda_resident::pad_q6k_blocks(wire),
+    }
+}
+
+/// Resident GPU tied head. `weight` is the vocab-major projection in its lane's GPU
+/// layout (always via [`gemma4_head_upload`]); input is quantized by the fused
+/// rms_norm+quantize into `inq`/`ins`; `logits` is dtoh'd once per token. `blocks` is
+/// blocks-per-row passed to the GEMV (`hidden/32` for Q8_0, `hidden/256` for K-quants).
 #[cfg(feature = "cuda")]
 struct Gemma4HeadDev {
     lane: HeadLane,
@@ -3397,7 +3432,7 @@ impl Gemma4CudaResident {
                 Some(Gemma4HeadDev {
                     lane: HeadLane::Q8_0,
                     weight: s
-                        .clone_htod(&q8_wire_to_soa(cpu.token_embd.bytes()))
+                        .clone_htod(&gemma4_head_upload(HeadLane::Q8_0, cpu.token_embd.bytes()))
                         .map_err(cu)?,
                     output_norm: s.clone_htod(&cpu.output_norm).map_err(cu)?,
                     logits: s.alloc_zeros::<f32>(vocab).map_err(cu)?,
@@ -3411,7 +3446,9 @@ impl Gemma4CudaResident {
                 let blocks = hidden / 256;
                 Some(Gemma4HeadDev {
                     lane: HeadLane::Q6K,
-                    weight: s.clone_htod(cpu.token_embd.bytes()).map_err(cu)?,
+                    weight: s
+                        .clone_htod(&gemma4_head_upload(HeadLane::Q6K, cpu.token_embd.bytes()))
+                        .map_err(cu)?,
                     output_norm: s.clone_htod(&cpu.output_norm).map_err(cu)?,
                     logits: s.alloc_zeros::<f32>(vocab).map_err(cu)?,
                     inq: s.alloc_zeros::<i8>(blocks * 256).map_err(cu)?,
@@ -3420,12 +3457,15 @@ impl Gemma4CudaResident {
                     softcap,
                 })
             }
-            // Q4_K tied head (mixed Q4_0 file): q4k_gemv over raw 144-byte wire, Q8_K input.
+            // Q4_K tied head (the format a Q4_0-quantized gemma4 export carries):
+            // q4k_gemv over the SWIZZLED 144-byte super-blocks, Q8_K input.
             WireFormat::Q4K if hidden.is_multiple_of(256) => {
                 let blocks = hidden / 256;
                 Some(Gemma4HeadDev {
                     lane: HeadLane::Q4K,
-                    weight: s.clone_htod(cpu.token_embd.bytes()).map_err(cu)?,
+                    weight: s
+                        .clone_htod(&gemma4_head_upload(HeadLane::Q4K, cpu.token_embd.bytes()))
+                        .map_err(cu)?,
                     output_norm: s.clone_htod(&cpu.output_norm).map_err(cu)?,
                     logits: s.alloc_zeros::<f32>(vocab).map_err(cu)?,
                     inq: s.alloc_zeros::<i8>(blocks * 256).map_err(cu)?,
@@ -5104,6 +5144,100 @@ impl Gemma4CudaResident {
 #[cfg(all(test, feature = "cuda"))]
 mod cuda_parity_tests {
     use super::*;
+
+    /// Deterministic filler for the head-upload layout tests (no rand dep).
+    fn lcg_bytes(n: usize, mut seed: u32) -> Vec<u8> {
+        (0..n)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed >> 24) as u8
+            })
+            .collect()
+    }
+
+    // Root-cause regression for the gemma4 Q4_0 mis-decode. The tied-head GEMVs do
+    // NOT read the stock GGUF wire: `q4k_gemv` indexes a SWIZZLED quant region and
+    // `q6k_gemv` indexes super-blocks at a 224-byte PADDED stride. The Q4_K and Q6_K
+    // head arms used to `clone_htod` the raw wire, so a Q4_0-quantized gemma4 export
+    // (whose token_embd is Q4_K) computed every logit from wrongly-paired nibbles —
+    // fluent-looking nonsense, no error. `gemma4_head_upload` is now the single upload
+    // path; this pins each lane's layout so raw passthrough cannot come back.
+    //
+    // Asserted with explicit index arithmetic rather than by calling the repack
+    // helpers back, so the test still fails if a helper is changed to agree with a
+    // broken caller.
+    #[test]
+    fn gemma4_head_upload_matches_each_lane_gemv_layout() {
+        // --- Q4_K: pure byte permutation of the quant region, header untouched. ---
+        const Q4K_WIRE: usize = 144;
+        let blocks = 5usize;
+        let wire = lcg_bytes(blocks * Q4K_WIRE, 0x4b_4b_01);
+        let up = gemma4_head_upload(HeadLane::Q4K, &wire);
+        assert_eq!(up.len(), wire.len(), "the swizzle must not change size");
+        assert!(
+            up != wire,
+            "raw passthrough is the defect: q4k_gemv reads swizzled quant bytes"
+        );
+        for b in 0..blocks {
+            let (s, d) = (&wire[b * Q4K_WIRE..], &up[b * Q4K_WIRE..]);
+            assert_eq!(
+                &d[..16],
+                &s[..16],
+                "d/dmin/packed-scale header is untouched"
+            );
+            // The four stride-8 bytes an aux lane consumes must land contiguous.
+            for g in 0..4 {
+                for l in 0..8 {
+                    for k in 0..4 {
+                        assert_eq!(
+                            d[16 + g * 32 + l * 4 + k],
+                            s[16 + g * 32 + l + k * 8],
+                            "q4k swizzle mismatch at block {b} group {g} lane {l} k {k}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // --- Q6_K: 210-byte wire blocks padded to the 224-byte stride the kernel
+        // indexes. Uploading raw here under-sizes the buffer AND mis-addresses every
+        // block past the first, so this length check is the load-bearing assertion.
+        const Q6K_WIRE: usize = 210;
+        const Q6K_PADDED: usize = 224;
+        let wire = lcg_bytes(blocks * Q6K_WIRE, 0x6b_6b_02);
+        let up = gemma4_head_upload(HeadLane::Q6K, &wire);
+        assert_eq!(
+            up.len(),
+            blocks * Q6K_PADDED,
+            "q6k_gemv strides super-blocks by 224 B, not the 210 B wire"
+        );
+        for b in 0..blocks {
+            assert_eq!(
+                &up[b * Q6K_PADDED..b * Q6K_PADDED + Q6K_WIRE],
+                &wire[b * Q6K_WIRE..(b + 1) * Q6K_WIRE],
+                "q6k payload block {b} must survive the pad verbatim"
+            );
+        }
+
+        // --- Q8_0: the SoA split q8_gemv reads (all quants, then all f16 scales). ---
+        const Q8_WIRE: usize = 34;
+        let wire = lcg_bytes(blocks * Q8_WIRE, 0x08_08_03);
+        let up = gemma4_head_upload(HeadLane::Q8_0, &wire);
+        assert_eq!(up.len(), wire.len());
+        for b in 0..blocks {
+            let src = &wire[b * Q8_WIRE..(b + 1) * Q8_WIRE];
+            assert_eq!(
+                &up[b * 32..b * 32 + 32],
+                &src[2..34],
+                "q8 quants are SoA-first"
+            );
+            assert_eq!(
+                &up[blocks * 32 + b * 2..blocks * 32 + b * 2 + 2],
+                &src[0..2],
+                "q8 f16 scales trail the quant plane"
+            );
+        }
+    }
 
     // Greedy parity: the CUDA gemma4 forward must match the CPU Gemma4Runtime oracle
     // token-for-token on the E4B Q8_0 file (the oracle that the CPU runtime loads).

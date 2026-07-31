@@ -1,0 +1,12 @@
+{
+  "model": "gemma-4-E2B-it-Q4_0.gguf",
+  "max_tokens": 32,
+  "legs": [
+    {"prompt": "Name the capital of France in one word.", "cuda_ids": "[50429, 236820, 643, 236779, 1340, 236779, 887, 236813]", "cpu_ids": "[50429, 236820, 643, 236779, 1340, 236779, 887, 236813]", "token_identical": true},
+    {"prompt": "What color is the sky on a clear day?", "cuda_ids": "[818, 7217, 580, 496, 3582, 1719, 563, 11082, 5213, 9503, 84750]", "cpu_ids": "[818, 7217, 580, 496, 3582, 1719, 563, 11082, 5213, 9503, 84750]", "token_identical": true},
+    {"prompt": "Name the largest ocean on Earth.", "cuda_ids": "[818, 7488, 12461, 580, 10824, 563, 506, 14225, 18414, 21603, 643, 236779, 1340, 236779, 887, 236813]", "cpu_ids": "[818, 7488, 12461, 580, 10824, 563, 506, 14225, 18414, 21603, 643, 236779, 1340, 236779, 887, 236813]", "token_identical": true},
+    {"prompt": "What is 2 + 2?", "cuda_ids": "[236778, 900, 236743, 236778, 563, 236743, 236812, 236761]", "cpu_ids": "[236778, 900, 236743, 236778, 563, 236743, 236812, 236761]", "token_identical": true},
+    {"prompt": "List three primary colors.", "cuda_ids": "[236820, 643, 236779, 1340, 236779, 887, 236813]", "cpu_ids": "[236820, 643, 236779, 1340, 236779, 887, 236813]", "token_identical": true}
+  ],
+  "all_pass": true
+}
