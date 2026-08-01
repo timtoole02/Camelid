@@ -12,7 +12,7 @@ resolver = "2"
 
 [package]
 name = "camelid"
-version = "0.4.8"
+version = "0.4.9"
 edition = "2021"
 rust-version = "1.89"
 description = "Camelid: a Rust-native local GGUF inference backend with evidence-gated model compatibility"
