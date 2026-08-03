@@ -50,7 +50,7 @@ cooperative streaming scheduler — see item 5.
 | `CAMELID_METAL_KV_DTYPE` | `f32`, `f16`, `q8` | `f16` for K-quant; `f32` otherwise | Select the resident KV primary representation. The default follows the LOADED MODEL's weights, not the `CAMELID_METAL_KQUANT` gate: a Q8_0 model keeps its F32 cache (and with it the split-K decode attention and the attention-as-matmul prefill, both of which require an F32 primary) even with K-quant admission enabled. |
 | `CAMELID_METAL_KV16` | `0`, `1` | `0` | Legacy alias for `CAMELID_METAL_KV_DTYPE=f16`. |
 | `CAMELID_CONTINUOUS_BATCH_SLOTS` | `1..256` | `2` | Maximum active cooperative streaming sessions. Set `1` for legacy run-to-completion scheduling. |
-| `CAMELID_PREFIX_CACHE_RESIDENT` | `0`, `1` | `1` | Let a GPU-resident session mirror its KV back so the prompt-prefix cache can store it. `0` keeps this lane's CPU KV at zero bytes and accepts a full re-prefill on every repeated prompt. Only ever engages when the round trip is bit-exact (F16 resident primary + non-quantized CPU KV). |
+| `CAMELID_PREFIX_CACHE_RESIDENT` | `0`, `1` | auto (`0` on hosts with ≤8 GiB RAM, otherwise `1`) | Let a GPU-resident session mirror its KV back so the prompt-prefix cache can store it. `0` keeps this lane's CPU KV at zero bytes and accepts a full re-prefill on every repeated prompt. An explicit value overrides the host-memory policy. Only ever engages when the round trip is bit-exact (F16 resident primary + non-quantized CPU KV). |
 
 `--deterministic` forces `CAMELID_METAL_KQUANT=0` and
 `CAMELID_METAL_KV_DTYPE=f32` along with the rest of the GPU-off policy.

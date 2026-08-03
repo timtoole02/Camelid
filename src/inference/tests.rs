@@ -14331,6 +14331,22 @@ fn prefix_cache_env_setting_parses_the_documented_opt_out() {
     assert!(!prefix_cache_setting_enables(Some("FALSE")));
 }
 
+/// An 8 GiB unified-memory host cannot safely retain the resident GPU KV plus
+/// both CPU histories created by mirror-then-clone. Automatic policy refuses
+/// that cache, while preserving both explicit operator overrides and the
+/// historical default when host RAM cannot be measured.
+#[test]
+fn resident_prefix_cache_policy_protects_low_memory_hosts() {
+    use super::metal_resident::resident_prefix_cache_policy;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+    assert!(!resident_prefix_cache_policy(None, Some(8 * GIB)));
+    assert!(resident_prefix_cache_policy(None, Some(16 * GIB)));
+    assert!(resident_prefix_cache_policy(None, None));
+    assert!(resident_prefix_cache_policy(Some("1"), Some(8 * GIB)));
+    assert!(!resident_prefix_cache_policy(Some("0"), Some(16 * GIB)));
+}
+
 /// BOTH halves of the mirror must be lossless. An F16 resident cache round-trips
 /// through an F32/F16 CPU cache exactly, but `--kv-quant q8_0|q4_0` re-quantizes
 /// on the way in — so a quantized CPU KV must refuse regardless of what the GPU

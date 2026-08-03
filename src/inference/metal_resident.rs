@@ -52,23 +52,56 @@ impl MetalSampleRequest {
 pub(super) const MAX_VERIFY_K: usize = 8;
 
 /// Whether `prepare_for_prompt_prefix_cache` may vouch for ANY session — the
-/// prompt-prefix-cache kill switch. Default ON: the alternative is
-/// re-prefilling every repeated or growing chat prompt, which on the resident
-/// lane costs seconds. Set `CAMELID_PREFIX_CACHE_RESIDENT=0` to refuse every
-/// preparation: no session is stored, the CPU KV stays at zero bytes on the
+/// prompt-prefix-cache host-safety gate. Default ON except on hosts with 8 GiB
+/// of physical RAM or less: mirroring and then cloning a long resident prompt
+/// can retain roughly two CPU KV histories in addition to the GPU-resident KV,
+/// which leaves too little unified-memory headroom on those Macs. The explicit
+/// environment value wins in either direction (`0`/`false` disables, any other
+/// value enables) so controlled benchmarks can still choose the tradeoff.
+///
+/// When disabled no session is stored, the CPU KV stays at zero bytes on the
 /// resident lane, and every turn pays the re-prefill. (Historically this gate
 /// sat AFTER the CPU-authoritative early accept, so it only ever suppressed
 /// the resident mirror and did nothing at all for CPU-authoritative sessions
 /// — see `prepare_for_prompt_prefix_cache_gated`.)
+const LOW_MEMORY_PREFIX_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
 pub(super) fn resident_prefix_cache_mirror_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        prefix_cache_setting_enables(
+        resident_prefix_cache_policy(
             std::env::var("CAMELID_PREFIX_CACHE_RESIDENT")
                 .ok()
                 .as_deref(),
+            prefix_cache_host_ram_bytes(),
         )
     })
+}
+
+/// Keep ordinary unit tests independent of the machine running them. The pure
+/// policy tests below inject both low- and high-memory totals explicitly; only
+/// production binaries consult the live host probe.
+#[cfg(not(test))]
+fn prefix_cache_host_ram_bytes() -> Option<u64> {
+    crate::gait::host_ram_status().map(|(total, _)| total)
+}
+
+#[cfg(test)]
+fn prefix_cache_host_ram_bytes() -> Option<u64> {
+    None
+}
+
+/// Pure policy seam for the process-wide gate above. Unknown RAM preserves the
+/// historical enabled default; a present environment value is an intentional
+/// operator override and therefore wins over the automatic low-memory guard.
+pub(super) fn resident_prefix_cache_policy(
+    raw: Option<&str>,
+    total_ram_bytes: Option<u64>,
+) -> bool {
+    match raw {
+        Some(value) => prefix_cache_setting_enables(Some(value)),
+        None => total_ram_bytes.is_none_or(|total| total > LOW_MEMORY_PREFIX_CACHE_MAX_BYTES),
+    }
 }
 
 /// Pure parse of the `CAMELID_PREFIX_CACHE_RESIDENT` value. Split from the

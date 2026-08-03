@@ -2076,6 +2076,16 @@ pub struct ErrorBody {
     pub param: Option<&'static str>,
 }
 
+/// Structured API error metadata retained in a response extension. Streaming
+/// handlers have already committed HTTP/SSE headers when a decode step fails,
+/// so they cannot forward the response body; this copy preserves the original
+/// machine-readable code and actionable message for the SSE error event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ApiErrorDetails {
+    code: String,
+    message: String,
+}
+
 /// The models directory used when `serve` gets no `--models-dir`: the first
 /// existing of `<exe dir>/models` (the shipped layout — `camelid.exe` beside a
 /// `models/` folder, the same precedent `auto_select_model` follows) then
@@ -15775,6 +15785,9 @@ enum StreamDecodeEvent {
 /// Response-shaped failure, so the engine job can hand the SSE layer
 /// byte-identical error frames without shipping the `Response` across.
 fn stream_error_parts(response: &Response) -> (String, String) {
+    if let Some(details) = response.extensions().get::<ApiErrorDetails>() {
+        return (details.code.clone(), details.message.clone());
+    }
     (
         "stream_error".to_string(),
         format!("stream failed after headers: HTTP {}", response.status()),
@@ -17942,7 +17955,11 @@ fn api_error(
         StatusCode::UNPROCESSABLE_ENTITY => "model_unavailable",
         _ => "invalid_request",
     };
-    (
+    let details = ApiErrorDetails {
+        code: code.to_string(),
+        message: message.clone(),
+    };
+    let mut response = (
         status,
         Json(ErrorEnvelope {
             error: ErrorBody {
@@ -17953,7 +17970,9 @@ fn api_error(
             },
         }),
     )
-        .into_response()
+        .into_response();
+    response.extensions_mut().insert(details);
+    response
 }
 
 fn tokenizer_state_from_result(
@@ -18046,6 +18065,36 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn streaming_error_preserves_the_structured_api_failure() {
+        let response = api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "generation_step_failed",
+            "KV cache budget exceeded; shorten this conversation".to_string(),
+            Some("max_tokens"),
+        );
+
+        assert_eq!(
+            stream_error_parts(&response),
+            (
+                "generation_step_failed".to_string(),
+                "KV cache budget exceeded; shorten this conversation".to_string(),
+            )
+        );
+    }
+
+    #[test]
+    fn streaming_error_keeps_a_status_fallback_for_foreign_responses() {
+        let response = StatusCode::SERVICE_UNAVAILABLE.into_response();
+        assert_eq!(
+            stream_error_parts(&response),
+            (
+                "stream_error".to_string(),
+                "stream failed after headers: HTTP 503 Service Unavailable".to_string(),
+            )
+        );
+    }
 
     #[test]
     fn chat_image_url_part_preserves_order_and_collects_data_url() {
