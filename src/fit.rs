@@ -156,7 +156,7 @@ impl FitInputs {
 /// - Unprobed RAM: the KV guard fails *open* (unbounded); the advisor abstains here
 ///   with `None` (surfaced as [`FitVerdict::Unknown`]) rather than assert a capacity
 ///   it cannot measure.
-fn usable_host_ram_bytes(hw: &HardwareProfile) -> Option<u64> {
+pub(crate) fn usable_host_ram_bytes(hw: &HardwareProfile) -> Option<u64> {
     if hw.host_ram_total_bytes == 0 {
         return None;
     }
@@ -321,6 +321,76 @@ impl KvDtype {
     }
 }
 
+/// Whether a resident Metal projection type selects the parity-qualified F16
+/// primary KV cache. Keep this predicate shared with the runtime's loaded-weight
+/// decision (`inference/metal_resident.rs`) so the preload advisor cannot size a
+/// Q1/Q2/K-quant model as F32 while the engine actually builds an F16 cache.
+pub(crate) fn metal_f16_kv_tensor_type(tensor_type: crate::gguf::GgufTensorType) -> bool {
+    matches!(
+        tensor_type,
+        crate::gguf::GgufTensorType::Q4K
+            | crate::gguf::GgufTensorType::Q6K
+            | crate::gguf::GgufTensorType::Q1_0
+            | crate::gguf::GgufTensorType::Q2_0G64
+            | crate::gguf::GgufTensorType::Q2_0G128
+            | crate::gguf::GgufTensorType::Pq2_0
+    )
+}
+
+/// True for the per-layer dense projections inspected by
+/// `inference::metal_resident::weights_use_kquant`. Tensor names are available in
+/// the GGUF header, so preload can mirror that runtime decision without loading or
+/// expanding the weights.
+fn is_dense_projection_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("blk.") else {
+        return false;
+    };
+    let Some((layer, role)) = rest.split_once('.') else {
+        return false;
+    };
+    if layer.is_empty() || !layer.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    matches!(
+        role,
+        "attn_q.weight"
+            | "attn_k.weight"
+            | "attn_v.weight"
+            | "attn_output.weight"
+            | "ffn_gate.weight"
+            | "ffn_up.weight"
+            | "ffn_down.weight"
+    )
+}
+
+/// Resolve the resident Metal KV width from a parsed local GGUF header and the
+/// same operator overrides consumed by the runtime. `q8` is conservatively sized
+/// as F16 because [`KvDtype`] has no block-overhead representation and two bytes
+/// per element is still an upper bound for the quantized cache.
+pub(crate) fn metal_resident_kv_dtype_for_gguf(
+    gguf: &crate::gguf::GgufFile,
+    explicit_dtype: Option<&str>,
+    legacy_kv16: Option<&str>,
+) -> KvDtype {
+    match explicit_dtype.map(str::trim).map(str::to_ascii_lowercase) {
+        Some(value) if matches!(value.as_str(), "f32" | "float32") => return KvDtype::F32,
+        Some(value) if matches!(value.as_str(), "f16" | "half" | "q8" | "q8_0") => {
+            return KvDtype::F16
+        }
+        _ => {}
+    }
+    if legacy_kv16.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")) {
+        return KvDtype::F16;
+    }
+    if gguf.tensors.iter().any(|tensor| {
+        is_dense_projection_name(&tensor.name) && metal_f16_kv_tensor_type(tensor.tensor_type)
+    }) {
+        KvDtype::F16
+    } else {
+        KvDtype::F32
+    }
+}
+
 /// The architecture dimensions the KV-cache size depends on. Read from GGUF
 /// metadata (`block_count`, `attention.head_count_kv`, `head_dim`) — never guessed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -347,6 +417,18 @@ impl ModelDims {
 /// fixed, realistic length rather than the theoretical max. The runtime's own KV
 /// predict-and-abort guard governs longer conversations.
 pub const ADVISORY_CONTEXT_TOKENS: u64 = 4096;
+
+/// The resident Metal cache's minimum allocation quantum. A fresh decode grows
+/// on demand from 512 positions rather than materializing the advisory 4K context
+/// at load time. Preload admission sizes this initial allocation; the runtime KV
+/// budget remains authoritative as a conversation grows beyond it.
+pub const METAL_INITIAL_KV_CONTEXT_TOKENS: u64 = 512;
+
+/// Measured resident-Metal load/first-token scratch reserve. On the 4B Q1 row,
+/// building the engine plus its initial KV cache raises RSS by ~177 MiB; 256 MiB
+/// leaves meaningful driver/fragmentation headroom without applying the generic
+/// 512 MiB CPU/CUDA allowance twice to unified memory.
+pub const METAL_INITIAL_ACTIVATION_SCRATCH_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Coarse, bounded allowance for activations + framework scratch beyond weights
 /// and KV. Small next to weights/KV for single-sequence decode; a fixed margin
@@ -375,8 +457,27 @@ pub fn exact_footprint(
     context_tokens: u64,
     kv: KvDtype,
 ) -> FitInputs {
-    let kv_and_scratch =
-        kv_bytes(dims, context_tokens, kv).saturating_add(ACTIVATION_SCRATCH_BYTES);
+    exact_footprint_with_scratch(
+        weight_bytes,
+        dims,
+        context_tokens,
+        kv,
+        ACTIVATION_SCRATCH_BYTES,
+    )
+}
+
+/// Exact footprint with a lane-specific scratch allowance. Preload uses this for
+/// resident Metal, whose unified-memory engine has a measured smaller initial
+/// allocation; all existing callers retain [`ACTIVATION_SCRATCH_BYTES`] through
+/// [`exact_footprint`].
+pub(crate) fn exact_footprint_with_scratch(
+    weight_bytes: u64,
+    dims: ModelDims,
+    context_tokens: u64,
+    kv: KvDtype,
+    scratch_bytes: u64,
+) -> FitInputs {
+    let kv_and_scratch = kv_bytes(dims, context_tokens, kv).saturating_add(scratch_bytes);
     FitInputs {
         weight_bytes,
         kv_bytes_at_ctx: kv_and_scratch,
@@ -678,6 +779,77 @@ mod tests {
         assert_eq!(
             kv_bytes(d, 100, KvDtype::F16) * 2,
             kv_bytes(d, 100, KvDtype::F32)
+        );
+    }
+
+    fn gguf_with_projection(
+        name: &str,
+        tensor_type: crate::gguf::GgufTensorType,
+    ) -> crate::gguf::GgufFile {
+        crate::gguf::GgufFile {
+            path: std::path::PathBuf::from("synthetic.gguf"),
+            version: 3,
+            tensor_count: 1,
+            metadata_count: 0,
+            alignment: 32,
+            data_start_offset: 0,
+            metadata: std::collections::BTreeMap::new(),
+            tensors: vec![crate::gguf::GgufTensorDescriptor {
+                name: name.to_string(),
+                dimensions: vec![128, 128],
+                tensor_type,
+                relative_offset: 0,
+                absolute_offset: 0,
+                n_bytes: 0,
+            }],
+        }
+    }
+
+    #[test]
+    fn metal_kv_dtype_tracks_the_projection_quant_not_an_unrelated_tensor() {
+        let q1_projection =
+            gguf_with_projection("blk.0.attn_q.weight", crate::gguf::GgufTensorType::Q1_0);
+        assert_eq!(
+            metal_resident_kv_dtype_for_gguf(&q1_projection, None, None),
+            KvDtype::F16
+        );
+
+        let q1_embedding =
+            gguf_with_projection("token_embd.weight", crate::gguf::GgufTensorType::Q1_0);
+        assert_eq!(
+            metal_resident_kv_dtype_for_gguf(&q1_embedding, None, None),
+            KvDtype::F32
+        );
+
+        let q8_projection =
+            gguf_with_projection("blk.0.attn_q.weight", crate::gguf::GgufTensorType::Q8_0);
+        assert_eq!(
+            metal_resident_kv_dtype_for_gguf(&q8_projection, None, None),
+            KvDtype::F32
+        );
+    }
+
+    #[test]
+    fn metal_kv_dtype_honors_runtime_overrides_conservatively() {
+        let q1 = gguf_with_projection("blk.0.ffn_down.weight", crate::gguf::GgufTensorType::Q1_0);
+        assert_eq!(
+            metal_resident_kv_dtype_for_gguf(&q1, Some("f32"), None),
+            KvDtype::F32
+        );
+
+        let q8 = gguf_with_projection("blk.0.ffn_down.weight", crate::gguf::GgufTensorType::Q8_0);
+        assert_eq!(
+            metal_resident_kv_dtype_for_gguf(&q8, Some("f16"), None),
+            KvDtype::F16
+        );
+        assert_eq!(
+            metal_resident_kv_dtype_for_gguf(&q8, Some("q8"), None),
+            KvDtype::F16,
+            "F16 is a safe upper bound for block-quantized KV"
+        );
+        assert_eq!(
+            metal_resident_kv_dtype_for_gguf(&q8, None, Some("true")),
+            KvDtype::F16
         );
     }
 

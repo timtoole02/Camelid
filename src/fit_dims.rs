@@ -476,7 +476,7 @@ pub fn dims_from_gguf_file(path: &Path) -> Option<ModelDims> {
 
 /// Map a parsed GGUF's metadata to dense-Llama KV dims, or `None` for a
 /// non-dense/unknown architecture or implausible values.
-fn dims_from_gguf(gguf: &crate::gguf::GgufFile) -> Option<ModelDims> {
+pub(crate) fn dims_from_gguf(gguf: &crate::gguf::GgufFile) -> Option<ModelDims> {
     let config = crate::model::LlamaModelConfig::from_gguf(gguf).ok()?;
     let dims = crate::model::DenseLlamaDims::from_config(&config).ok()?;
     let dims = ModelDims {

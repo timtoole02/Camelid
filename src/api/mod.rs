@@ -6389,12 +6389,17 @@ fn fit_preload_message(
     if verdict == crate::fit::FitVerdict::InsufficientFreeMemory {
         let free_gb = hw.host_ram_free_bytes as f64 / 1e9;
         let total_gb = hw.host_ram_total_bytes as f64 / 1e9;
+        let footprint_gb = footprint.footprint_bytes() as f64 / 1e9;
+        let usable_gb = crate::fit::usable_host_ram_bytes(hw).unwrap_or(0) as f64 / 1e9;
         return Some((
             "host_memory_unavailable",
             format!(
-                "This model (~{size_gb:.1} GB) fits this machine, but only ~{free_gb:.1} GB \
-                 of ~{total_gb:.1} GB memory is free right now. Close some applications \
-                 and retry, or set CAMELID_SKIP_FIT_CHECK=1 to attempt the load anyway."
+                "This model's ~{size_gb:.1} GB file fits this machine, but its estimated \
+                 in-memory footprint is ~{footprint_gb:.1} GB including weights, KV cache, \
+                 and scratch space. Only ~{free_gb:.1} GB of ~{total_gb:.1} GB memory is free \
+                 right now; after Camelid's safety reserve, ~{usable_gb:.1} GB is usable. \
+                 Close some applications and retry, or set \
+                 CAMELID_SKIP_FIT_CHECK=1 to attempt the load anyway."
             ),
         ));
     }
@@ -6414,8 +6419,9 @@ fn fit_preload_message(
 
 /// Env + filesystem wrapper around [`fit_preload_message`]. Probes **live** host
 /// memory and computes an **exact** footprint from the GGUF's real dimensions
-/// (weights + KV at a normal-use context + a bounded scratch margin) whenever the
-/// header parses, falling back to the coarse size pad otherwise. Returns a typed
+/// (weights + KV + a bounded scratch margin) whenever the header parses. Resident
+/// Metal uses its real on-demand initial KV allocation; CPU/CUDA retain the normal-
+/// use advisory context. Falls back to the coarse size pad otherwise. Returns a typed
 /// 422 only on a load-refusing verdict ([`crate::fit::FitVerdict::refuses_load`]);
 /// `None` (proceed unchanged) on the `CAMELID_SKIP_FIT_CHECK=1` override, a
 /// missing/zero-size file, or any `Fits*`/`Unknown` verdict — a fail-fast
@@ -6427,6 +6433,62 @@ fn fit_preload_message(
 /// else (including unset) keeps the preflight on.
 fn fit_check_skipped(raw: Option<&str>) -> bool {
     raw.map(str::trim) == Some("1")
+}
+
+fn preload_env_flag_enabled(raw: Option<&str>) -> bool {
+    raw.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+/// The load guard must model the lane this process will actually use. The CLI
+/// fast stack explicitly arms resident Metal before the API starts; embedders and
+/// deterministic mode keep the CPU/advisory policy.
+fn metal_resident_preload_enabled(hw: &crate::capability::HardwareProfile) -> bool {
+    hw.metal_available
+        && hw.metal_unified_memory
+        && !crate::inference::deterministic_mode_enabled()
+        && preload_env_flag_enabled(
+            std::env::var("CAMELID_METAL_RESIDENT_DECODE")
+                .ok()
+                .as_deref(),
+        )
+}
+
+/// Pure arithmetic half of the exact preload policy. Resident Metal allocates KV
+/// in 512-position chunks on demand, so requiring a full 4K cache before the model
+/// can even load is a false refusal. Longer prompts/conversations remain protected
+/// by the runtime's authoritative KV growth guard.
+fn exact_preload_footprint(
+    size: u64,
+    dims: crate::fit::ModelDims,
+    hw: &crate::capability::HardwareProfile,
+    metal_resident: bool,
+    metal_kv_dtype: crate::fit::KvDtype,
+) -> crate::fit::FitInputs {
+    let (context_tokens, kv_dtype, scratch_bytes) = if metal_resident {
+        (
+            crate::fit::METAL_INITIAL_KV_CONTEXT_TOKENS,
+            metal_kv_dtype,
+            crate::fit::METAL_INITIAL_ACTIVATION_SCRATCH_BYTES,
+        )
+    } else if hw.cuda_available && hw.cuda_vram_free_bytes > 0 {
+        (
+            crate::fit::ADVISORY_CONTEXT_TOKENS,
+            crate::fit::KvDtype::F16,
+            crate::fit::ACTIVATION_SCRATCH_BYTES,
+        )
+    } else {
+        (
+            crate::fit::ADVISORY_CONTEXT_TOKENS,
+            crate::fit::KvDtype::F32,
+            crate::fit::ACTIVATION_SCRATCH_BYTES,
+        )
+    };
+    crate::fit::exact_footprint_with_scratch(size, dims, context_tokens, kv_dtype, scratch_bytes)
 }
 
 fn fit_preload_guard(
@@ -6443,19 +6505,28 @@ fn fit_preload_guard(
     // Live probe (not the cached startup snapshot): free VRAM/RAM shift as other
     // apps run or a model is already loaded, and this decision must reflect *now*.
     let hw = crate::capability::HardwareProfile::detect();
-    // Exact footprint from the GGUF's real dims when the header parses; else the pad.
-    let footprint = match crate::fit_dims::dims_from_gguf_file(path) {
-        Some(dims) => {
-            // KV is stored f16 on the GPU-resident path, f32 on the CPU path.
-            let kv_dtype = if hw.cuda_available && hw.cuda_vram_free_bytes > 0 {
-                crate::fit::KvDtype::F16
-            } else {
-                crate::fit::KvDtype::F32
-            };
-            crate::fit::exact_footprint(size, dims, crate::fit::ADVISORY_CONTEXT_TOKENS, kv_dtype)
-        }
-        None => crate::fit::advisory_footprint(size),
-    };
+    // Parse once: dimensions and the projection tensor types both live in the GGUF
+    // header. The latter selects the same F16/F32 default as resident Metal.
+    let parsed = crate::gguf::read_metadata(path).ok();
+    let footprint = parsed
+        .as_ref()
+        .and_then(|gguf| {
+            let dims = crate::fit_dims::dims_from_gguf(gguf)?;
+            let metal_resident = metal_resident_preload_enabled(&hw);
+            let metal_kv_dtype = crate::fit::metal_resident_kv_dtype_for_gguf(
+                gguf,
+                std::env::var("CAMELID_METAL_KV_DTYPE").ok().as_deref(),
+                std::env::var("CAMELID_METAL_KV16").ok().as_deref(),
+            );
+            Some(exact_preload_footprint(
+                size,
+                dims,
+                &hw,
+                metal_resident,
+                metal_kv_dtype,
+            ))
+        })
+        .unwrap_or_else(|| crate::fit::advisory_footprint(size));
     let (code, message) = fit_preload_message(&hw, &footprint, size, reclaim)?;
     Some(api_error(
         StatusCode::UNPROCESSABLE_ENTITY,
@@ -27542,6 +27613,67 @@ mod catalog_fit_tests {
     }
 
     #[test]
+    fn resident_metal_preload_uses_the_initial_f16_cache_for_bonsai_4b() {
+        let mut hw = host(false, 0, 8 * GIB, 1_503_000_000);
+        hw.metal_available = true;
+        hw.metal_unified_memory = true;
+        let size = 572_270_624; // exact Bonsai-4B-Q1_0.gguf row
+        let dims = crate::fit::ModelDims {
+            layers: 36,
+            kv_heads: 8,
+            head_dim: 128,
+        };
+
+        // Regression: the old policy treated a Metal host as CPU-only and demanded
+        // a full 4096-position F32 cache before load, producing the confusing
+        // "0.6 GB model / 1.6 GB free" refusal on this 8 GiB Mac.
+        let old = crate::fit::exact_footprint(
+            size,
+            dims,
+            crate::fit::ADVISORY_CONTEXT_TOKENS,
+            crate::fit::KvDtype::F32,
+        );
+        assert!(super::fit_preload_message(&hw, &old, size, None).is_some());
+
+        let metal = super::exact_preload_footprint(size, dims, &hw, true, crate::fit::KvDtype::F16);
+        assert_eq!(
+            metal,
+            crate::fit::exact_footprint_with_scratch(
+                size,
+                dims,
+                crate::fit::METAL_INITIAL_KV_CONTEXT_TOKENS,
+                crate::fit::KvDtype::F16,
+                crate::fit::METAL_INITIAL_ACTIVATION_SCRATCH_BYTES,
+            )
+        );
+        assert!(
+            super::fit_preload_message(&hw, &metal, size, None).is_none(),
+            "the real initial Metal allocation fits the live-memory scenario"
+        );
+    }
+
+    #[test]
+    fn non_metal_preload_keeps_the_normal_use_context_policy() {
+        let hw = host(false, 0, 8 * GIB, 6 * GIB);
+        let dims = crate::fit::ModelDims {
+            layers: 36,
+            kv_heads: 8,
+            head_dim: 128,
+        };
+        let actual =
+            super::exact_preload_footprint(GIB, dims, &hw, false, crate::fit::KvDtype::F16);
+        assert_eq!(
+            actual,
+            crate::fit::exact_footprint(
+                GIB,
+                dims,
+                crate::fit::ADVISORY_CONTEXT_TOKENS,
+                crate::fit::KvDtype::F32,
+            )
+        );
+    }
+
+    #[test]
     fn load_request_replace_defaults_to_false_for_existing_api_clients() {
         // Back-compat: a body without `replace` must not start evicting models.
         let req: super::LoadModelRequest =
@@ -27696,6 +27828,9 @@ mod catalog_fit_tests {
         assert_eq!(code, "host_memory_unavailable");
         assert!(msg.contains("free right now"), "{msg}");
         assert!(msg.contains("Close some applications"), "{msg}");
+        assert!(msg.contains("estimated in-memory footprint"), "{msg}");
+        assert!(msg.contains("safety reserve"), "{msg}");
+        assert!(msg.contains("usable"), "{msg}");
         assert!(!msg.contains("larger than this machine"), "{msg}");
         // The override is still offered, exactly as for the too-large case.
         assert!(msg.contains("CAMELID_SKIP_FIT_CHECK=1"), "{msg}");

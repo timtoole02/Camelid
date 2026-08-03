@@ -122,17 +122,8 @@ pub(super) fn prefix_cache_setting_enables(raw: Option<&str>) -> bool {
 /// models re-decides.
 pub(super) fn weights_use_kquant(weights: &super::LlamaLoadedWeights) -> bool {
     let is_kquant = |t: &CpuTensor| {
-        matches!(
-            t.source_type,
-            Some(
-                GgufTensorType::Q4K
-                    | GgufTensorType::Q6K
-                    | GgufTensorType::Q1_0
-                    | GgufTensorType::Q2_0G64
-                    | GgufTensorType::Q2_0G128
-                    | GgufTensorType::Pq2_0
-            )
-        )
+        t.source_type
+            .is_some_and(crate::fit::metal_f16_kv_tensor_type)
     };
     weights.layers.iter().any(|l| {
         is_kquant(&l.attention_q)
