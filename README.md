@@ -4,7 +4,7 @@
 
 **Run supported GGUF language and vision models locally with a Rust-native engine.**
 
-Desktop app, browser chat, terminal UI, and an OpenAI-style API — all backed by the same local runtime.
+Desktop app, browser chat, terminal UI, and an OpenAI-compatible API—all backed by the same local runtime.
 
 [![CI][ci-badge]][ci-workflow]
 [![Latest release][release-badge]][latest-release]
@@ -12,241 +12,94 @@ Desktop app, browser chat, terminal UI, and an OpenAI-style API — all backed b
 [![Rust](https://img.shields.io/badge/built_with-Rust-dea584.svg)](https://www.rust-lang.org/)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-64748b.svg)](#platform-support)
 
-[Download][latest-release] · [Quick start](#quick-start) · [Supported models](#supported-models) · [Model compatibility](COMPATIBILITY.md) · [Documentation](DOCS.md) · [Contributing](CONTRIBUTING.md)
+[Download][latest-release] · [Quick start](#quick-start) · [Models](#supported-models) · [Documentation](DOCS.md) · [Contributing](CONTRIBUTING.md)
 
 </div>
 
 ![Camelid WebUI chat surface](docs/assets/camelid-readme-chat-surface-dark.png)
 
-<div align="center"><sub>Camelid's local web UI — a dark, collapsed-rail chat surface, served straight from the engine binary.</sub></div>
-
-Camelid loads GGUF models directly and runs inference on your own hardware. The tokenizer, model
-loader, CPU kernels, and the Metal and CUDA execution paths are implemented in this repository and
-distributed as a single Rust binary — no Python, Node.js, or Docker at runtime.
-
-Camelid deliberately supports a curated set of exact model-and-quantization combinations. Each
-supported row is validated token-for-token against a pinned reference before it is presented as
-ready to use.
+Camelid loads GGUF models and runs inference on your hardware. Its tokenizer, model loader, CPU kernels, and Metal and CUDA execution paths are implemented in this repository and distributed as a single Rust binary—no Python, Node.js, or Docker is required at runtime.
 
 ## What is Camelid?
 
-Camelid is an open-source, Rust-native local AI inference engine for running supported GGUF large
-language models (LLMs) and vision-language models (VLMs) on Windows, macOS, and Linux. Use it as a
-desktop app, a browser-based local AI chat interface, a terminal application, or a self-hosted
-OpenAI-compatible API for your own tools and applications.
+Camelid is an open-source, Rust-native local AI inference engine for running supported GGUF large language models (LLMs) and vision-language models (VLMs) on Windows, macOS, and Linux. Use it as a desktop app, a browser-based local AI chat interface, a terminal application, or a self-hosted OpenAI-compatible API for your own tools and applications.
 
-Model inference runs on your hardware, with CPU execution, Apple Silicon Metal acceleration, and
-NVIDIA CUDA acceleration available within the documented support boundaries. Camelid is designed
-for private local AI chat, offline inference after model download, GGUF model testing, and local LLM
-application development without a Python, Node.js, or Docker runtime.
+Model inference runs on your hardware, with CPU execution, Apple Silicon Metal acceleration, and NVIDIA CUDA acceleration available within the documented support boundaries. Camelid is designed for private local AI chat, offline inference after model download, GGUF model testing, and local LLM application development without a Python, Node.js, or Docker runtime.
 
-> [!TIP]
-> **New: [PrismML](https://prismml.com/) Bonsai models are Supported on Apple Silicon Metal and Windows CUDA.**
-> Seven exact, hash-pinned 4B, 8B, and 27B GGUFs covering `Q1_0`, `Q2_0`, and `PQ2_0` are
-> downloadable from the Desktop **Models** page or with `camelid pull`. With the pinned Qwen3-VL
-> projector, both 27B rows accept a local PNG/JPEG through browser chat and the API. The Models
-> page downloads and reuses the projector automatically with either 27B model; manual installs can
-> download [Ternary-Bonsai-27B-mmproj-Q8_0.gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-27B-gguf/resolve/main/Ternary-Bonsai-27B-mmproj-Q8_0.gguf)
-> into the models directory. These rows are **Supported**, not Experimental; the claim is limited
-> to the listed artifacts on macOS Apple Silicon Metal and Windows x86_64 CUDA.
-> [See the exact rows and vision setup.](#prismml--bonsai-gpu-support)
+## Why Camelid?
 
-## Why Camelid
-
-- **Local by default.** Models and inference stay on your machine unless you choose to expose the server.
-- **One engine, several interfaces.** Desktop app, browser chat, terminal chat, or HTTP API — all the same runtime.
-- **Nothing else to install.** The engine and web UI ship together as one binary.
-- **Hardware acceleration.** Native Metal on Apple Silicon and experimental Windows CUDA for exact, recorded NVIDIA paths, with a CPU fallback everywhere.
-- **Evidence-backed compatibility.** Support is tied to an exact GGUF row and published validation artifacts, never a broad claim.
+- **Local by default.** Models and inference stay on your machine unless you expose the server.
+- **One engine, several interfaces.** Use the desktop app, browser chat, terminal UI, or HTTP API.
+- **Simple distribution.** The engine and web UI ship together as one binary.
+- **Hardware acceleration.** Use Metal on Apple Silicon, CUDA on supported NVIDIA paths, or CPU fallback.
+- **Evidence-backed compatibility.** Support applies to exact model files and quantizations validated against a pinned llama.cpp reference.
 
 ## Quick start
 
-> **Before you begin.** The engine itself is a single download, but model files are large —
-> roughly 1–8 GB each. Give yourself some free disk space and a few minutes for the first model
-> to download.
+Model downloads are typically 1–8 GB. For the simplest setup, install the desktop app and download a model from its **Models** page.
 
-### Option A — Desktop app (easiest)
+### Desktop app
 
-#### Windows
-
-Paste one command into PowerShell — it downloads the signed installer from the newest release
-that publishes one, verifies its Authenticode signature, installs the app per-user (no admin
-rights) under `%LOCALAPPDATA%\Camelid Desktop`, and launches it. No toolchain required; it needs
-64-bit Windows 10 or 11.
+**Windows 10 or 11 (x86_64):**
 
 ```powershell
 irm https://raw.githubusercontent.com/timtoole02/Camelid/main/scripts/get-desktop-windows.ps1 | iex
 ```
 
-To update later, run the same command again; models and settings are preserved. The upgrade also
-drops superseded CUDA runtime files that an older version installed and the current one no longer
-ships, so an in-place update cannot accumulate dead weight. To pin a version, set
-`CAMELID_DESKTOP_TAG` first (for example `$env:CAMELID_DESKTOP_TAG = 'v0.4.5'`).
+This installs the signed app per user and bundles the CUDA runtime. A compatible NVIDIA driver is still required for CUDA; otherwise Camelid uses the CPU.
 
-Prefer to install by hand? Download either artifact from the [latest release][latest-release]:
-
-- `Camelid.Desktop_<version>_x64-setup.exe` — signed installer; installs per-user, no admin rights.
-- `camelid-desktop-windows-x64.zip` — portable desktop app, no installation required.
-
-Either way, the app bundles the CUDA runtime, so no separate CUDA Toolkit is required. Its
-experimental Windows CUDA path still requires a compatible NVIDIA driver (CPU otherwise), and it
-embeds the same engine as everything below. Windows CUDA evidence is limited to the exact rows and
-recorded GPU, driver, and CUDA versions in [COMPATIBILITY.md](COMPATIBILITY.md); it makes no
-general token-parity or throughput claim.
-
-#### macOS Apple Silicon
-
-Paste one command into Terminal — it downloads the latest release DMG, verifies its checksum,
-installs `Camelid Desktop.app` into `/Applications`, and launches it. No toolchain required;
-it needs macOS 12 or newer on Apple Silicon.
+**macOS 12 or newer (Apple Silicon):**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/timtoole02/Camelid/main/scripts/get-desktop-macos.sh | bash
 ```
 
-To update later, run the same command again; models and settings are preserved. If
-`/Applications` requires administrator access, macOS asks for your password through `sudo`.
+This installs Camelid Desktop in `/Applications`. Run the same command again to update without removing models or settings.
 
-Prefer to install by hand? Download `camelid-desktop-macos-arm64.dmg` from the
-[latest release][latest-release] and drag **Camelid Desktop** into **Applications**. The app is
-ad-hoc signed and **not notarized**, so macOS quarantines a browser download and blocks the first
-launch: approve it under **System Settings → Privacy & Security → Open Anyway** (on macOS 12:
-**System Preferences → Security & Privacy → General**), or clear the
-quarantine once with `xattr -cr "/Applications/Camelid Desktop.app"`. The install command above
-avoids this entirely, because command-line downloads are not quarantined.
+Portable downloads and engine archives for Windows, macOS, and Linux are available from the [latest release][latest-release]. See the [desktop documentation](camelid-desktop/README.md) for manual installation and packaging details.
 
-To build and install from source instead — requires the Xcode Command Line Tools,
-[Rust](https://rustup.rs/), and Node.js 22 with npm:
+### Command line
 
-```bash
-git clone https://github.com/timtoole02/Camelid.git
-cd Camelid
-./scripts/install-macos-desktop.sh
-```
-
-Downloaded models live in
-`~/Library/Application Support/app.camelid.desktop/models` by default and are preserved when the
-app is rebuilt or reinstalled. The **Downloaded models** tab shows the active folder, disk usage,
-and every local GGUF; from there you can change the next-launch storage folder, choose the startup
-default, or permanently delete an unused model after unloading the active model. Changing storage
-folders takes effect after restart and does not move existing files automatically.
-
-On launch, Desktop loads the model marked **Starts automatically**; when no choice has been saved
-yet, the first installed GGUF is selected automatically. Use **Make default** beside another
-installed model to change the next launch.
-See [Camelid Desktop](camelid-desktop/README.md) for the sidecar design and manual packaging
-details.
-
-### Option B — Prebuilt engine (Windows, macOS, or Linux)
-
-Prefer the command line? Download the engine archive for your platform from the
-[latest release][latest-release] and unpack it.
-
-| Platform | Archive |
-|---|---|
-| Windows x86_64 | `camelid-windows-x64.zip` |
-| macOS Apple Silicon | `camelid-macos-arm64.tar.gz` |
-| Linux x86_64 | `camelid-linux-x86_64.tar.gz` |
-
-Every archive ships a matching `.sha256` for verification. On macOS, if Gatekeeper blocks the
-binary, clear the quarantine attribute once: `xattr -d com.apple.quarantine ./camelid`.
-
-### First chat in two commands
+After downloading and unpacking an engine archive, start a browser chat with:
 
 ```bash
 camelid pull 3b_instruct_q8
 camelid serve --model models/Llama-3.2-3B-Instruct-Q8_0.gguf
 ```
 
-That's it — your browser opens to a local chat at `http://127.0.0.1:8181`; start typing to talk to
-the model.
+Camelid opens `http://127.0.0.1:8181`. Use `camelid chat` for the terminal UI, or add `--no-open` to run the server without opening a browser.
 
-`camelid pull` downloads the model into `./models`; run it with no argument to list the curated
-catalog. `camelid serve` starts the engine, the OpenAI-style API, and the web UI on one port
-(`127.0.0.1:8181` by default) and opens the browser automatically — pass `--no-open` to skip that.
-Prefer the terminal? Run `camelid chat` instead for a full-screen chat UI over the same engine.
-
-On Apple Silicon, the CLI and desktop sidecar automatically select the qualified Metal resident
-path, no-copy Q8_0/Q4_K/Q6_K weights, F16 resident KV for K-quant models, and two-slot streaming
-fairness. Unsupported tensor mixes or devices transparently retain their validated fallback. No
-performance flags are required; `CAMELID_METAL_KQUANT=0`,
-`CAMELID_METAL_NOCOPY=0`, or `CAMELID_CONTINUOUS_BATCH_SLOTS=1` remain available as diagnostic
-escape hatches.
+Run `camelid pull` without an argument to list the curated model catalog.
 
 > [!WARNING]
-> A non-loopback listener now fails closed unless an API key is configured. Prefer a key file so
-> the secret is not exposed in the process list:
+> A non-loopback listener requires authentication. Prefer an API key file:
 >
 > ```bash
 > camelid serve --addr 0.0.0.0:8181 --api-key-file ./camelid-api.key
 > ```
 >
-> Add exact browser origins with `--cors-origin https://chat.example`; wildcard CORS is refused.
-> For direct HTTPS, provide both `--tls-cert` and `--tls-key`. The explicit
-> `--allow-unauthenticated-remote` escape hatch is intended only for trusted, externally protected
-> networks. The bundled browser UI does not store or inject the server API key; authenticated remote
-> deployments should use an API client or an authenticating reverse proxy. Anonymous loopback keeps
-> the existing frictionless UI behavior.
-
-### If the engine stops unexpectedly
-
-`camelid serve` keeps a small journal of process lifecycle events, so a crash is still explainable
-after the console window is gone. The path is printed at startup:
-
-| Platform | Path |
-|---|---|
-| Windows | `%LOCALAPPDATA%\Camelid\logs\camelid.log` |
-| macOS / Linux | `$XDG_STATE_HOME/Camelid/logs/camelid.log` (default `~/.local/state/Camelid/logs/camelid.log`) |
-
-One JSON object per line. A `panic` record says what failed, on which thread and where; set
-`RUST_BACKTRACE=1` beforehand to get a backtrace with it. Records marked `"expected": true` are the
-routine "no CUDA runtime here, using the CPU" probe and are safe to ignore — a panic record does not
-by itself mean the engine died, because some panics are caught and handled. A `session_exit` record
-means the run ended by failing on the way up or out, and carries the reason.
-
-A `session_start` with **no** matching `session_exit` means the process did not leave through that
-path. Read that as "it did not fail on the way out" rather than as proof of a kill: `camelid serve`
-installs no signal handler, so an ordinary Ctrl-C ends the process exactly as abruptly as an
-out-of-memory kill and neither is recorded.
-
-The journal holds process facts only. Prompts and generated text never enter it, it is size-capped
-with a single retained predecessor, and nothing is ever uploaded anywhere — it is a file on your
-disk that you choose to share.
+> See [configuration](docs/CONFIGURATION.md) for CORS, TLS, and remote-deployment options.
 
 ## Supported models
 
-> [!IMPORTANT]
-> **Camelid's model policy: exact rows, not families.** Support is granted to a specific *model file
-> at a specific quantization*, validated token-for-token against a pinned llama.cpp reference and
-> backed by a committed parity receipt. A neighboring size, a different quant, another upload of
-> the "same" model, or a wider template does **not** inherit that support — it fails closed with a
-> typed error rather than quietly producing unverified output. The boundary for each row, and what
-> is explicitly *not* claimed, is pinned in [SUPPORT_MATRIX_v0.1.md](SUPPORT_MATRIX_v0.1.md) and
-> [COMPATIBILITY.md](COMPATIBILITY.md).
+Camelid deliberately supports exact model-and-quantization combinations rather than entire model families. Each supported file is validated token-for-token against a pinned llama.cpp reference. Files outside the supported set fail closed instead of silently using an unverified path.
 
-### Start here
+Good starting points:
 
-Not sure where to begin? Pick **Llama 3.2 3B** — the best balance of quality and size.
-
-| Goal | Model | Pull id |
+| Goal | Model | Pull ID |
 |---|---|---|
 | Smallest end-to-end test (~1.2 GB) | TinyLlama 1.1B Chat Q8_0 | `tinyllama` |
 | **Recommended first model** | Llama 3.2 3B Instruct Q8_0 | `3b_instruct_q8` |
 | Fits a 16 GB Apple Silicon Mac | Mistral 7B Instruct v0.3 Q8_0 | `mistral` |
-| Reasoning + coding on a small budget | Qwen3 4B Q4_K_M | `qwen3_4b_q4` |
-| PrismML compact GPU model | Bonsai 4B Q1_0 | `bonsai_4b_q1` |
-| PrismML browser/API vision (projector required) | Bonsai 27B Q1_0 | `bonsai_27b_q1` |
+| Reasoning and coding on a small budget | Qwen3 4B Q4_K_M | `qwen3_4b_q4` |
+| Compact PrismML GPU model | Bonsai 4B Q1_0 | `bonsai_4b_q1` |
+| PrismML browser/API vision | Bonsai 27B Q1_0 | `bonsai_27b_q1` |
 
-### Catalog models — `camelid pull`
+### Full `camelid pull` catalog
 
-Thirty-two curated rows ship in the `camelid pull` catalog. Run `camelid pull` with no argument to
-print the list, or `camelid pull <id>` to download into `./models`. Ids resolve by **unique
-substring**, so the short ids below are all you need — `camelid pull 3b_instruct_q8` works exactly
-like the full `llama32_3b_instruct_q8_0`. Where a model ships in several quantizations the id has to
-name one: a bare family fragment like `llama32_3b` matches all three Llama 3.2 3B rows, and `pull`
-lists them rather than guessing which multi-GB file you meant.
+Run `camelid pull <id>` to download a model into `./models`. Pull IDs resolve by unique substring; if a fragment matches several rows, Camelid lists the matches instead of guessing.
 
-| Model | Quant | Arch | Size | Pull id | GGUF file |
+| Model | Quant | Arch | Size | Pull ID | GGUF file |
 |---|---|---|---:|---|---|
 | **TinyLlama 1.1B Chat** | `Q8_0` | `llama` | 1.2 GB | `tinyllama` | `tinyllama-1.1b-chat-v1.0.Q8_0.gguf` |
 | **Llama 3.2 1B Instruct** | `Q8_0` | `llama` | 1.3 GB | `1b_instruct_q8` | `Llama-3.2-1B-Instruct-Q8_0.gguf` |
@@ -281,329 +134,87 @@ lists them rather than guessing which multi-GB file you meant.
 | **Bonsai 27B** | `Q1_0` | `qwen35` | 3.8 GB | `bonsai_27b_q1` | `Bonsai-27B-Q1_0.gguf` |
 | **Ternary Bonsai 27B** | `Q2_0` | `qwen35` | 7.2 GB | `bonsai_27b_q2` | `Ternary-Bonsai-27B-Q2_0.gguf` |
 
-The two Gemma 4 rows marked *two-Mac distributed* are validated on the layer-sharded two-host lane —
-they are memory-infeasible on a single 16 GB machine. Command R is listed for completeness; at
-37 GB it needs a workstation-class host.
+The two distributed Gemma 4 rows are validated on a layer-sharded two-host lane and do not fit on a single 16 GB machine. Command R requires a workstation-class host.
 
-### Also parity-certified
+The full catalog, exact hashes, supported execution paths, and claim boundaries live in:
 
-These exact rows carry committed parity receipts but are **not** in the `camelid pull` catalog —
-point `--model` at the file yourself. Every one of them is a local requantization or a file with no
-resolved upstream upload, which is precisely why they aren't offered as a one-command download: the
-certified bytes exist nowhere to pull them from. (Where a public upload *does* carry the certified
-bytes — the 3B K-quants, the 1B IQ4_XS, Ornith Q8_0 — the row is in the pull table above instead.)
+- [COMPATIBILITY.md](COMPATIBILITY.md)—authoritative supported-row ledger
+- [SUPPORT_MATRIX_v0.1.md](SUPPORT_MATRIX_v0.1.md)—per-row support boundaries
+- [RECEIPTS.md](RECEIPTS.md)—reproducible validation receipts
+- [benchmarks](docs/benchmarks/BENCHMARKS.md)—recorded performance measurements
 
-| Model | Quant | Arch | GGUF file | Lane |
-|---|---|---|---|---|
-| **Llama 3.2 1B Instruct** | `Q4_K_M` | `llama` | `Llama-3.2-1B-Instruct-Q4_K_M.gguf` | GPU-resident K-quant raw greedy decode (16/16 layers VRAM-resident); certified bytes match no surveyed publisher upload |
-| **Ornith 1.0 9B** | `Q4_K_M` | `qwen35` | `ornith-1.0-9b-Q4_K_M.gguf` | Fully GPU-resident CUDA lane (in-house requant — the HF Q4_K_M is a *different* file); `tool_capable` |
-| **Ornith 1.0 9B** | `Q3_K_M` | `qwen35` | `ornith-1.0-9b-Q3_K_M.gguf` | Fully GPU-resident at 16K context on a 6 GiB card (imatrix requant) |
-| **Ternary Bonsai 4B** | `TQ2_0` | `qwen3` | `Ternary-Bonsai-4B-TQ2_0.gguf` | Ternary 2.06 bpw, single-node CPU completion smoke (~3.1 GB RSS) |
-| **Gemma 4 E4B-It** | `NVFP4` | `gemma4` | `gemma-4-E4B-it-NVFP4-mm.gguf` | BASALT / GABBRO NVFP4 pilot — Windows CUDA + macOS Metal, fails closed elsewhere |
+### PrismML Bonsai and vision
 
-Each row's exact envelope — which surfaces are certified, which contexts were checked, and what is
-explicitly not claimed — lives in [SUPPORT_MATRIX_v0.1.md](SUPPORT_MATRIX_v0.1.md).
-[COMPATIBILITY.md](COMPATIBILITY.md) is the complete, authoritative supported-row ledger.
+Seven hash-pinned PrismML Bonsai GGUFs are supported on Apple Silicon Metal and Windows x86_64 CUDA: 4B Q1/Q2/PQ2, 8B Q1/Q2, and 27B Q1/Q2. Both 27B rows support PNG/JPEG input in browser chat and the API when paired with the Qwen3-VL projector.
 
-### PrismML / Bonsai GPU support
-
-Seven exact PrismML Bonsai GGUFs are supported exact-row smoke on Apple Silicon Metal and
-Windows x86_64 CUDA without expanding their Q1_0, legacy Q2_0, or PQ2_0 linears into dense
-weights. The checked matrices cover 4B Q1/Q2/PQ2, 8B Q1/Q2, and 27B Q1/Q2. On constrained
-Windows GPUs, the 27B Q2 lane capacity-plans a trailing layer suffix through pinned host RAM.
-The 27B row can pair with `Ternary-Bonsai-27B-mmproj-Q8_0.gguf` for Qwen3-VL
-image input. Exact hashes and results are recorded in the
-[Metal receipt](qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json) and
-[Windows CUDA receipt](qa/evidence-bundles/prism-bonsai-windows-cuda-20260802/manifest.json).
-
-All seven language-model files are available from the Models page or with
-`camelid pull <id>`. Downloading either exact 27B row from the Models page also
-downloads the shared vision projector automatically, skips it when it is already
-installed, and does not load the model until both files are ready. For a CLI-only
-installation, download the companion from Prism ML and place it beside the 27B
-GGUF:
-
-```bash
-hf download prism-ml/Ternary-Bonsai-27B-gguf \
-  Ternary-Bonsai-27B-mmproj-Q8_0.gguf --local-dir /path/to/model-directory
-```
-
-Place the projector beside the language-model GGUF (its filename must contain
-`mmproj`) or set `CAMELID_MMPROJ` explicitly, then start the normal browser UI:
-
-```bash
-camelid serve --model /path/to/Bonsai-27B-Q1_0.gguf
-```
-
-When `/v1/health` reports `vision_ready: true`, Chat shows an **Image** control.
-It accepts one local PNG/JPEG, keeps that image active for follow-up turns, and
-sends an OpenAI-compatible `image_url` data part. The same shape works directly
-with `/v1/chat/completions`, including SSE streaming. Remote URLs, multiple
-images, audio/video, and vision combined with tools fail closed; multimodal
-input on `/v1/responses` remains unsupported. Support is limited to the seven
-hash-pinned artifacts on macOS Apple Silicon Metal and Windows x86_64 CUDA; it is not a
-bounded-context, broad-qwen35, quant-wide, other-platform, or production-throughput claim.
-
-On Windows, the exact 27B Q1 artifact uses Q1T128 CUDA layouts, Bonsai-shape fused
-projections, binary tensor-core prompt prefill, bitplane/POPC decode kernels, and a
-captured decode graph by default. On the checked RTX 3060 Laptop GPU, a three-run
-24-token full-image benchmark measured 21.38 decode tok/s versus 16.46 tok/s with
-POPC disabled (29.9% faster), with identical generated text in all six runs. This is
-a hardware-specific receipt, not a portable throughput promise. With the same model,
-projector, image, prompt, 142 prompt tokens, 24-token greedy completion, and reasoning
-disabled, the pinned Prism CUDA demo measured 18.19 decode tok/s on the same host;
-Camelid was 17.6% faster in that bounded post-first decode comparison. Prism retained
-materially lower image TTFT, so this is not an end-to-end latency claim.
-The graph covers the layer stack, final norm, and LM head; embedding lookup, RoPE table
-selection, device argmax, and generated-token handoff stay device-resident immediately
-outside the capture. Diagnostic escape hatches are `CAMELID_PRISM_CUDA_NO_GRAPH=1` for
-ordinary per-kernel decode, `CAMELID_PRISM_CUDA_NO_POPC=1` for the prior DP4A decode
-route, and `CAMELID_PRISM_CUDA_STRICT=1` for the slower exact-arithmetic lane.
+The desktop **Models** page downloads the projector automatically with either 27B model. For a CLI installation, place `Ternary-Bonsai-27B-mmproj-Q8_0.gguf` beside the model GGUF or set `CAMELID_MMPROJ`, then run `camelid serve` normally. See [COMPATIBILITY.md](COMPATIBILITY.md) for the exact artifacts and validated scope.
 
 ## Ways to use Camelid
 
-Every interface talks to the same local engine — pick whichever fits your workflow.
-
-| Interface | How to start it | Best for |
+| Interface | Start it with | Best for |
 |---|---|---|
-| **Desktop app** | One-command Windows or macOS installer in [Quick start](#quick-start) | A native app with the engine bundled as a local sidecar |
-| **Browser chat** | `camelid serve --model <gguf>` opens the web UI automatically | Everyday chatting in a familiar UI |
-| **Terminal UI** | `camelid chat` — full-screen; `--plain` for a line REPL over SSH | Working entirely in the shell |
-| **HTTP API** | OpenAI-style `/v1/*`, served alongside the UI on the same port | Wiring Camelid into your own apps |
-| **Agent mode** | `camelid chat --agent --model <gguf>` — approval-gated tool calls | Coding-agent work in your own repo |
-| **Workspace** (preview) | Open **Workspace** in the Web UI | Read-only, resumable analysis of a local folder |
+| **Desktop app** | Install from [Quick start](#quick-start) | Native app with bundled engine |
+| **Browser chat** | `camelid serve --model <gguf>` | Everyday local chat |
+| **Terminal UI** | `camelid chat` | Shell and SSH workflows |
+| **HTTP API** | Start `camelid serve` | Integrating local inference into apps |
+| **Agent mode** | `camelid chat --agent --model <gguf>` | Approval-gated tools in a repository |
+| **Workspace** (preview) | Open **Workspace** in the web UI | Read-only analysis of a local folder |
 
-**Agent mode — Supported (experimental).** `camelid chat --agent` is an approval-gated
-tool-calling loop that can
-read, write, and search files and run shell commands, with opt-in URL fetch. File tools are confined
-to a workspace root (`--workdir`, default the current directory; path escapes are refused), and the
-network stays off unless you pass `--allow-net`. Tool results are treated as untrusted data, and
-only models the compatibility ledger marks `tool_capable` are eligible (promoted only after a
-`camelid agent-eval` PASS). The supported scope — what is claimed, its boundary, and what is
-explicitly not claimed — is pinned in [COMPATIBILITY.md](COMPATIBILITY.md), backed by the live-lane
-bundle `qa/evidence-bundles/agent-mode-supported-experimental-20260722/`. Review every requested
-action: approval is the contract.
+Agent mode confines file tools to a workspace root and keeps network access off unless enabled. Workspace is read-only and resumable. Both require a model marked `tool_capable` in the compatibility ledger. Review the [agent documentation](DOCS.md) and every requested action before enabling additional tools or network access.
 
-**Workspace (preview).** Choose one local directory and ask follow-up questions across a durable
-conversation. Workspace can only list, read, and search within that canonical root; writes, shell,
-network, GUI control, and subagents are unavailable. File inventories are grounded in observed
-directory entries, and reversible compaction keeps long threads within an exact context budget.
-Workspace requires a loaded exact model row that has earned `tool_capable: true`.
+## OpenAI-compatible API
 
-The same read-only Workspace is available from a terminal while `camelid serve` is running:
-
-```bash
-camelid workspace ask . "Which files configure authentication?"
-camelid workspace threads .
-camelid workspace show workspace-123 --workspace .
-camelid workspace ask . "What changed our conclusion?" --thread workspace-123
-camelid workspace compact workspace-123 --workspace .
-camelid workspace compact workspace-123 --workspace . --undo
-camelid workspace delete workspace-123 --workspace .
-```
-
-Use `camelid workspace --json ...` for compact JSON; `ask` emits one JSON event per line. The CLI
-is a client of the existing Workspace API, not a second agent: it uses the same three-tool profile,
-canonical root confinement, SQLite/FTS5 threads, grounding checks, cancellation behavior, and exact
-context budget as the web UI.
-
-Browser authorization remains same-origin. At each loopback server start Camelid also rotates a
-256-bit Workspace CLI bearer credential and stores it in the current user's runtime directory
-(`%LOCALAPPDATA%\camelid\runtime` on Windows, `$XDG_RUNTIME_DIR/camelid/runtime` or
-`~/.cache/camelid/runtime` on Unix). Unix files are created mode `0600`; Windows files inherit the
-current user's LocalAppData ACL. `CAMELID_WORKSPACE_TOKEN_FILE` can override the location. The token
-is never accepted on a non-loopback listener or with a non-loopback `Host`, and a clean shutdown
-removes it when destructors run. After a crash or forced termination a stale file may remain, but
-no server is present to honor it; the next server replaces it only after binding the same loopback
-address and completing startup model loading. This capability protects against browser cross-site
-requests; like the model files themselves, it does not defend against another process already
-running as the same OS user.
-
-With `--allow-net` the agent also gets `web_search` (ranked title/url/snippet results) alongside
-`http_fetch`. Results are untrusted data — reading one is a separate, separately-approved
-`http_fetch`. Point it at a different engine with `CAMELID_SEARCH_URL` (a template containing
-`{query}`).
-
-Every file the agent writes or edits is snapshotted first, so `/diff` shows what it changed,
-`/undo` reverts the last change, and `/checkpoints` lists them. Snapshots are file copies under
-`.camelid/checkpoints/` in the workspace — the agent never touches your git state.
-
-`/save <id>` and `/resume <id>` carry an agent session across restarts, storing the transcript and
-plan under `.camelid/sessions/`. A resumed transcript is replayed as context and never re-executed;
-"always allow" grants are listed but never restored from a file; and resume is refused if the
-active model is not the one that recorded it, or is no longer marked `tool_capable`.
-
-In-session: `/init` scaffolds a `CAMELID.md`, `/plan` shows the agent's current checklist, `/copy`
-puts the last answer on the clipboard, and `/help` lists the rest.
-
-**Headless.** `camelid agent exec "<goal>" --model <gguf>` runs one goal to completion with no
-prompts, prints the answer to stdout (progress goes to stderr), and exits 0 answered / 1 failed /
-3 inconclusive. With no operator to approve anything, every gated tool is denied unless you pass
-`--today-is-a-good-day-to-die` (alias: `--yolo`).
-
-**MCP servers (opt-in).** `--allow-mcp` loads the servers declared in a `camelid.mcp.json` at the
-workspace root (stdio transport) and offers their tools alongside the native ones, namespaced
-`mcp__<server>__<tool>` so none can shadow a built-in:
-
-```json
-{ "servers": { "git": { "command": "uvx", "args": ["mcp-server-git"] } } }
-```
-
-An MCP server is third-party code, so every MCP tool is classified exec-tier — always approval-gated,
-and *not* promoted by `--auto-approve` — its output is treated as untrusted data like any other tool
-result, and the whole feature is refused under `CAMELID_PRODUCTION`. A server that fails to start or
-never answers is dropped with a message; it does not stop your session.
-
-Drop a `CAMELID.md` (or `AGENTS.md`) at the workspace root to tell the agent about your project —
-build commands, layout, conventions. It is loaded into the agent's context as reference material,
-fenced and labelled as untrusted: it can inform the agent, but it cannot grant permissions, change
-an approval tier, or widen file access, and text inside it asking for any of those is ignored.
-
-## Call the API
-
-The served model id comes from the GGUF's `general.name`. Run `GET /v1/models` to read the exact
-id, then send a standard chat-completions request:
+`camelid serve` exposes the browser UI and API on the same port. Read the loaded model ID from `GET /v1/models`, then call the chat-completions endpoint:
 
 ```bash
 curl http://127.0.0.1:8181/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Llama 3.2 3B Instruct",
-    "messages": [{"role": "user", "content": "Explain why local inference is useful."}],
+    "messages": [{"role": "user", "content": "Why is local inference useful?"}],
     "max_tokens": 128,
     "temperature": 0
   }'
 ```
 
-The same evidence-gated generation core is also available through the Responses
-API. Requests remain stateless unless storage is explicitly enabled:
+Camelid also supports `/v1/responses`, streaming, local function tools, structured text formats, conversations, and optional local SQLite storage. The machine-readable route and feature inventory is available from `/api/capabilities`.
 
-```bash
-curl http://127.0.0.1:8181/v1/responses \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Llama 3.2 3B Instruct",
-    "input": "Explain why local inference is useful.",
-    "max_output_tokens": 128,
-    "stream": true,
-    "store": true,
-    "metadata": {"client": "local-agent"}
-  }'
-```
+## Platform support
 
-`/v1/responses` supports text/messages, manual function-call continuations,
-local function tools, structured text formats, streaming events, usage, and
-cancellation. With `store:true`, the terminal response and its canonical input
-and output items are committed to local SQLite before a non-streaming response
-or terminal SSE event is returned. Continue it with
-`"previous_response_id":"resp_..."`, or use `POST /v1/conversations` and pass
-the returned conversation id on later Responses requests. Stored Responses,
-conversations, and ordered conversation items have GET/DELETE routes; repeated
-`store:true` requests can use `Idempotency-Key`.
+| Platform | Distribution | Acceleration |
+|---|---|---|
+| Windows x86_64 | Desktop installer, portable app, engine archive | CUDA on validated paths; CPU fallback |
+| macOS Apple Silicon | Desktop DMG or engine archive | Metal and CPU |
+| Linux x86_64 | Engine archive | CUDA compiled in; CPU fallback |
 
-Storage defaults to `CAMELID_RESPONSES_DB`, then the platform data directory
-(`~/.local/share/camelid/responses.sqlite3` on typical Unix systems). The
-database and parent directory are owner-only on Unix. Reconstruction fails
-closed above 512 items, 1 MiB per item, or 8 MiB total; the loaded model's token
-context gate still applies after reconstruction. Conversation writes and
-idempotency keys are serialized within one Camelid process. `store:false` (the
-default) leaves no Responses record, although supplying a conversation id
-necessarily appends that turn to the conversation. Background jobs, hosted
-tools, multimodal input, remote state, and cross-process request serialization
-remain unsupported. The exact machine-readable boundaries and route inventory
-live in `/api/capabilities` under `api_conformance`.
-
-## How support is validated
-
-Camelid's core commitment is that every supported claim is backed by reproducible evidence.
-
-Support is granted per **exact GGUF row** — a specific model file, at a specific quantization, on a
-specific execution path. Each row is validated token-for-token against a pinned llama.cpp reference
-before it is presented as supported. Models outside that set fail closed with a typed error rather
-than silently producing unverified output, and experimental lanes are labeled separately and do not
-inherit supported status.
-
-The authoritative records live in the repository:
-
-- [COMPATIBILITY.md](COMPATIBILITY.md) — the supported-row ledger.
-- [SUPPORT_MATRIX_v0.1.md](SUPPORT_MATRIX_v0.1.md) — the per-row support boundary and claim limits.
-- [RECEIPTS.md](RECEIPTS.md) — reproducible validation receipts.
-- [docs/benchmarks/BENCHMARKS.md](docs/benchmarks/BENCHMARKS.md) — performance measurements.
-- [docs/architecture/ARCHITECTURE.md](docs/architecture/ARCHITECTURE.md) — how the engine is built.
-
-Every row in [Supported models](#supported-models) is backed by that evidence chain. The serve lane
-and evidence envelope for a selection of those rows:
-
-| Model row | Quant | Serve lane | Evidence |
-|---|---|---|---|
-| TinyLlama 1.1B Chat | Q8_0 | single-node | Current verified gate |
-| Llama 3.2 3B Instruct | Q8_0 | single-node | Exact-row smoke + bounded context 512→8192 |
-| Mistral 7B Instruct v0.3 | Q8_0 | single-node | Exact-row smoke + bounded context 512→8192 + GPU/CPU parity |
-| Llama 3 8B Instruct | Q8_0 | single-node | Exact-row + bounded context 512→2048 |
-| Qwen3 4B | Q8_0 | single-node | Exact-row ChatML parity (thinking-disabled) |
-| Gemma 3 1B-It | Q8_0 | single-node (Metal GPU-resident) | Exact-row chat parity 15/15 below the sliding window + 9/9 above it, to 2,403 prompt tokens — the above-window half is the resident lane only; off Metal this row falls back to the unmasked CPU bridge |
-| Gemma 4 E2B-It | Q8_0 | single-node | 5/5 greedy parity (CPU + Metal) |
+Hardware support is row- and configuration-specific. Consult [COMPATIBILITY.md](COMPATIBILITY.md) before relying on a particular GPU, model, or quantization combination.
 
 ## Build from source
 
-Camelid builds with a pinned toolchain (see [rust-toolchain.toml](rust-toolchain.toml)). The web UI
-lives in `frontend/` (React/Vite) and is embedded into the binary at build time.
+Camelid uses the toolchain pinned in [rust-toolchain.toml](rust-toolchain.toml). The React/Vite web UI in `frontend/` is embedded in the engine binary.
 
 ```bash
 (cd frontend && npm ci && npm run build)
 cargo build --release --locked --bin camelid
 ```
 
-rustup reads the pinned toolchain automatically, so a standard Rust install is enough. See
-[docs/CONTRIBUTOR_QUICKSTART.md](docs/CONTRIBUTOR_QUICKSTART.md) to get set up.
-
-## Platform support
-
-Camelid ships for three platforms today.
-
-| Platform | Distribution | Acceleration |
-|---|---|---|
-| Windows x86_64 | Desktop installer, portable desktop ZIP, engine ZIP | CUDA; supported packed Prism Q1/Q2 exact rows plus other named row-scoped lanes; CPU fallback |
-| macOS Apple Silicon | Desktop DMG (prebuilt, ad-hoc signed) or source-installed desktop app, engine archive (`.tar.gz`) | Metal and CPU |
-| Linux x86_64 | Engine archive (`.tar.gz`) | NVIDIA CUDA compiled in by default; CPU fallback |
-
-CUDA is compiled into the default build on Windows and x86_64 Linux. On Windows, the GPU path is
-experimental: it needs a compatible NVIDIA driver, but no separate CUDA Toolkit or build flag. Its
-evidence is limited to the named exact rows and recorded GPU, driver, and CUDA configuration in
-[COMPATIBILITY.md](COMPATIBILITY.md); other configurations are not covered by those parity or
-throughput claims. The driver and NVRTC load dynamically at runtime; without a usable GPU the build
-still runs CPU-only. `camelid serve --gpu auto|on|off` (or `CAMELID_GPU`) overrides the automatic
-choice. Other Linux targets — aarch64, the Raspberry Pi — stay CPU-only, with CUDA opt-in via
-`--features cuda`. Compiling the path in on Linux does not by itself extend the Windows row-level
-parity claims.
+See the [contributor quick start](docs/CONTRIBUTOR_QUICKSTART.md) for prerequisites and development setup.
 
 ## Documentation
 
-Deeper references live alongside the code:
-
-- [DOCS.md](DOCS.md) — documentation index.
-- [COMPATIBILITY.md](COMPATIBILITY.md) — supported models and quantizations.
-- [SUPPORT_MATRIX_v0.1.md](SUPPORT_MATRIX_v0.1.md) — exact-row support boundary and claim limits.
-- [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — configuration reference.
-- [docs/architecture/ARCHITECTURE.md](docs/architecture/ARCHITECTURE.md) — engine internals.
-- [docs/benchmarks/BENCHMARKS.md](docs/benchmarks/BENCHMARKS.md) — performance measurements.
-- [docs/VALIDATION_MATRIX.md](docs/VALIDATION_MATRIX.md) — validation coverage.
-- [RECEIPTS.md](RECEIPTS.md) — reproducible validation receipts.
-- [ROADMAP.md](ROADMAP.md) — what's planned next.
+- [Documentation index](DOCS.md)
+- [Configuration reference](docs/CONFIGURATION.md)
+- [Architecture](docs/architecture/ARCHITECTURE.md)
+- [Validation matrix](docs/VALIDATION_MATRIX.md)
+- [Roadmap](ROADMAP.md)
 
 ## Contributing
 
-Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) and
-[SECURITY.md](SECURITY.md) first, and start with
-[docs/CONTRIBUTOR_QUICKSTART.md](docs/CONTRIBUTOR_QUICKSTART.md).
+Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and the [contributor quick start](docs/CONTRIBUTOR_QUICKSTART.md).
 
 ## License
 
-Camelid is released under the [MIT License](LICENSE).
-
-Camelid's tokenizer, compatibility layouts, and validation are checked against llama.cpp
-(MIT, © the ggml authors), which serves as the reference oracle for supported rows. See
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for full attribution.
+Camelid is released under the [MIT License](LICENSE). llama.cpp (MIT, © the ggml authors) serves as the reference oracle for supported rows; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution.
 
 [ci-badge]: https://github.com/timtoole02/Camelid/actions/workflows/ci.yml/badge.svg
 [ci-workflow]: https://github.com/timtoole02/Camelid/actions/workflows/ci.yml
