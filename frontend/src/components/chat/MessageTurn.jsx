@@ -33,7 +33,7 @@ function MessageMetaFooter({ message }) {
   const ttft = formatMs(message.first_content_ms)
   const rate = formatRate(message.tokens_out_per_sec)
   const duration = formatMs(message.elapsed_ms)
-  const usageLabel = message.usage_source === 'backend' ? 'usage' : 'usage est.'
+  const usageLabel = message.usage_source === 'backend' ? 'tokens' : 'tokens est.'
   if (!usage && !ttft && !rate && !message.model_id) return null
   return (
     <footer className="cxturn__meta" aria-label="Generation details (client-measured telemetry)">
@@ -57,8 +57,8 @@ function MessageMetaFooter({ message }) {
         </EvidenceChip>
       )}
       {usage && Number.isFinite(Number(usage.prompt_tokens)) && (
-        <span className="cxturn__meta-item" title={message.usage_source === 'backend' ? 'Token counts reported by the backend' : 'Token counts estimated client-side (backend sent no usage)'}>
-          {usageLabel} {usage.prompt_tokens}→{usage.completion_tokens}
+        <span className="cxturn__meta-item cxturn__meta-usage" title={message.usage_source === 'backend' ? 'Token counts reported by the backend' : 'Live token counts estimated client-side until the backend reports final usage'}>
+          {usageLabel} <strong>in {usage.prompt_tokens}</strong><span aria-hidden="true"> · </span><strong>out {usage.completion_tokens ?? 0}</strong>
         </span>
       )}
       {ttft && <span className="cxturn__meta-item" title="Time to first content, measured in this browser">TTFT {ttft}</span>}

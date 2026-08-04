@@ -462,6 +462,8 @@
   white-space: nowrap;
 }
 .cxturn__meta-model { color: var(--color-text-muted); }
+.cxturn__meta-usage { color: var(--color-text-muted); }
+.cxturn__meta-usage strong { color: var(--color-text); font-weight: 600; }
 .cxturn__meta-note { margin-left: auto; opacity: 0.75; font-style: normal; letter-spacing: var(--tracking-wide); text-transform: uppercase; font-size: 0.625rem; }
 
 /* ---- User-row edit & resend (Phase 2) ---- */

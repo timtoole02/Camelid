@@ -85,7 +85,7 @@ const result = await page.evaluate(() => {
   }
 })
 const tokens = await page.evaluate(() => {
-  const m = document.querySelector('.cxturn__meta')?.textContent.match(/usage[^0-9]*(\d+)→(\d+)/)
+  const m = document.querySelector('.cxturn__meta')?.textContent.match(/tokens[^0-9]*in\s+(\d+)\s*·\s*out\s+(\d+)/)
   return m ? Number(m[2]) : null
 })
 result.completionTokens = tokens

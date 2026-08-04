@@ -1035,7 +1035,15 @@ export function useDashboardData({ showNotice, clearNotice }) {
         tokens_out_per_sec: null,
         generated_token_ids: [],
         timings_ms: null,
-        usage: null,
+        // The prompt is fixed when the request starts, so show its estimated
+        // token count immediately. Output usage advances with the stream and
+        // is replaced by backend-reported totals when they arrive.
+        usage: {
+          prompt_tokens: promptTokenEstimate,
+          completion_tokens: 0,
+          total_tokens: promptTokenEstimate,
+        },
+        usage_source: 'client_estimate',
         streaming: true,
         streaming_phase: 'preparing',
         first_byte_ms: null,
@@ -1147,6 +1155,12 @@ export function useDashboardData({ showNotice, clearNotice }) {
           streaming_phase: 'streaming',
           tokens_in_per_sec: null,
           tokens_out_per_sec: liveTps,
+          usage: {
+            prompt_tokens: promptTokenEstimate,
+            completion_tokens: realTokens,
+            total_tokens: promptTokenEstimate + realTokens,
+          },
+          usage_source: 'client_estimate',
         })
       }, {
         estimateTokenCount,
@@ -1157,6 +1171,12 @@ export function useDashboardData({ showNotice, clearNotice }) {
               first_byte_ms: event.firstByteMs ?? null,
               first_event_ms: event.firstEventMs ?? null,
             }, { immediate: true })
+          }
+          if (event.type === 'usage' && event.usage) {
+            markAssistantStreamState({
+              usage: event.usage,
+              usage_source: 'backend',
+            })
           }
         },
       })
