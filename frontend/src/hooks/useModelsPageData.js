@@ -27,6 +27,7 @@ export function useModelsPageData({ apiBase = '' } = {}) {
   const [localLoading, setLocalLoading] = useState(false)
   const [localError, setLocalError] = useState('')
   const [current, setCurrent] = useState(null) // { path } from /api/models/current
+  const [loadedModels, setLoadedModels] = useState([]) // /v1/models resident registry
   const [startupDefault, setStartupDefault] = useState(null) // { filename, configured }
   const [downloads, setDownloads] = useState([])
   const [polling, setPolling] = useState(true) // one initial pass on mount
@@ -92,6 +93,20 @@ export function useModelsPageData({ apiBase = '' } = {}) {
       return next
     } catch {
       if (baseRef.current === base) setCurrent(null)
+      return null
+    }
+  }, [base])
+
+  const refreshLoadedModels = useCallback(async () => {
+    try {
+      const res = await fetch(`${base}/v1/models`)
+      if (!res.ok) return null
+      const next = await res.json()
+      if (baseRef.current !== base) return null
+      const models = Array.isArray(next?.data) ? next.data : []
+      setLoadedModels(models)
+      return models
+    } catch {
       return null
     }
   }, [base])
@@ -200,12 +215,19 @@ export function useModelsPageData({ apiBase = '' } = {}) {
   )
 
   const refreshAll = useCallback(async () => {
-    await Promise.all([refreshLocal(), refreshCurrent(), refreshDefault(), refreshDownloads()])
-  }, [refreshLocal, refreshCurrent, refreshDefault, refreshDownloads])
+    await Promise.all([
+      refreshLocal(),
+      refreshCurrent(),
+      refreshLoadedModels(),
+      refreshDefault(),
+      refreshDownloads(),
+    ])
+  }, [refreshLocal, refreshCurrent, refreshLoadedModels, refreshDefault, refreshDownloads])
 
   useEffect(() => {
     setLocal(null)
     setCurrent(null)
+    setLoadedModels([])
     setStartupDefault(null)
     setDownloads([])
     setLocalLoading(false)
@@ -217,8 +239,9 @@ export function useModelsPageData({ apiBase = '' } = {}) {
     setPolling(true)
     refreshLocal()
     refreshCurrent()
+    refreshLoadedModels()
     refreshDefault()
-  }, [base, refreshLocal, refreshCurrent, refreshDefault])
+  }, [base, refreshLocal, refreshCurrent, refreshLoadedModels, refreshDefault])
 
   useEffect(() => {
     if (!polling) return undefined
@@ -251,6 +274,7 @@ export function useModelsPageData({ apiBase = '' } = {}) {
 
   const activeFilename = String(current?.path || '').split(/[\\/]/).pop() || ''
   const localFilenames = new Set((local?.models || []).map((m) => m.filename))
+  const loadedModelIds = new Set(loadedModels.map((model) => model?.id).filter(Boolean))
 
   return {
     base,
@@ -259,6 +283,8 @@ export function useModelsPageData({ apiBase = '' } = {}) {
     localError,
     current,
     activeFilename,
+    loadedModels,
+    loadedModelIds,
     defaultFilename: startupDefault?.filename || '',
     defaultConfigured: Boolean(startupDefault?.configured),
     localFilenames,
@@ -266,6 +292,7 @@ export function useModelsPageData({ apiBase = '' } = {}) {
     refreshLocal,
     refreshLocalAndDefault,
     refreshCurrent,
+    refreshLoadedModels,
     refreshDefault,
     refreshDownloads,
     refreshAll,

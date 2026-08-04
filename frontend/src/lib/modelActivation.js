@@ -165,6 +165,39 @@ export async function loadLocalModelForChat({
   }
 }
 
+/* Unload one exact resident model. Passing the id matters because Camelid can
+   keep a non-active embedding sidecar resident alongside the active Chat model;
+   the no-body form only unloads the active model. */
+export async function unloadLocalModel({
+  apiBase = '',
+  modelId,
+  fetchImpl = globalThis.fetch,
+} = {}) {
+  const base = String(apiBase || '').replace(/\/$/, '')
+  if (!modelId) {
+    return { ok: false, message: 'Choose a loaded model to unload.', code: 'model_not_selected' }
+  }
+
+  try {
+    const res = await fetchImpl(`${base}/api/models/unload`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: modelId }),
+    })
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}))
+      return {
+        ok: false,
+        message: body?.error?.message || `unload failed (HTTP ${res.status})`,
+        code: body?.error?.code || '',
+      }
+    }
+    return { ok: true }
+  } catch (error) {
+    return { ok: false, message: String(error?.message || error), code: '' }
+  }
+}
+
 async function readCurrentFilename(base, fetchImpl) {
   const res = await fetchImpl(`${base}/api/models/current`)
   if (!res.ok) return ''

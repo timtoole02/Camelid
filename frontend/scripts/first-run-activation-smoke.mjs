@@ -9,7 +9,12 @@ import {
   isFirstRunHost,
   recommendFirstRunModel,
 } from '../src/lib/firstRunActivation.js'
-import { loadLocalModelForChat, modelFilenameFromPath, warmGenerationPath } from '../src/lib/modelActivation.js'
+import {
+  loadLocalModelForChat,
+  modelFilenameFromPath,
+  unloadLocalModel,
+  warmGenerationPath,
+} from '../src/lib/modelActivation.js'
 
 function response({ ok = true, status = 200, body = {} } = {}) {
   return { ok, status, json: async () => body }
@@ -483,6 +488,37 @@ assert.equal(modelFilenameFromPath(null), '')
   assert.equal(result.ok, false)
   assert.equal(result.stage, 'checking')
   assert.equal(result.message, 'connection refused')
+}
+
+/* --- per-model unload ----------------------------------------------------- */
+{
+  let request = null
+  const result = await unloadLocalModel({
+    apiBase: 'http://camelid.test/',
+    modelId: 'nomic-embed-text-v1.5.Q8_0.gguf',
+    fetchImpl: async (url, options) => {
+      request = { url, method: options.method, body: JSON.parse(options.body) }
+      return response({ status: 204 })
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(request.url, 'http://camelid.test/api/models/unload')
+  assert.equal(request.method, 'POST')
+  assert.deepEqual(request.body, { id: 'nomic-embed-text-v1.5.Q8_0.gguf' }, 'unload must target the card model, including non-active sidecars')
+}
+
+{
+  const result = await unloadLocalModel({
+    modelId: 'busy.gguf',
+    fetchImpl: async () => response({
+      ok: false,
+      status: 409,
+      body: { error: { code: 'model_operation_in_progress', message: 'A model operation is in progress.' } },
+    }),
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'model_operation_in_progress')
+  assert.match(result.message, /in progress/)
 }
 
 /* --- warm-up -------------------------------------------------------------- */

@@ -1,14 +1,21 @@
-import { useMemo, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import { Button } from '../components/ui/Button'
 import { ConfirmDialog } from '../components/ui/ConfirmDialog'
 import {
   IconDownload,
   IconModels,
+  IconPlay,
   IconRefresh,
   IconSearch,
+  IconStop,
   IconTrash,
 } from '../components/ui/icons'
 import { useModelsPageData } from '../hooks/useModelsPageData'
+import {
+  loadLocalModelForChat,
+  modelFilenameFromPath,
+  unloadLocalModel,
+} from '../lib/modelActivation'
 import { modelDeleteBlockedReason } from '../lib/modelDeletion'
 import {
   describeModel,
@@ -24,7 +31,7 @@ function desktopInvoke() {
 export default function DownloadedModelsView({
   runtime,
   apiBase = '',
-  unloadCurrentModel,
+  refreshDashboard,
   onOpenModels,
 }) {
   const runtimeApiBase = (runtime?.api_base || '').replace(/\/$/, '')
@@ -33,11 +40,12 @@ export default function DownloadedModelsView({
   const [pendingDelete, setPendingDelete] = useState(null)
   const [deletingFilename, setDeletingFilename] = useState('')
   const [defaultingFilename, setDefaultingFilename] = useState('')
-  const [unloading, setUnloading] = useState(false)
+  const [modelAction, setModelAction] = useState({ filename: '', type: '' })
   const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
   const [storageBusy, setStorageBusy] = useState(false)
   const [nextStoragePath, setNextStoragePath] = useState('')
+  const modelActionInFlightRef = useRef('')
 
   const models = spine.local?.models || []
   const totalBytes = models.reduce((sum, model) => sum + Number(model.size_bytes || 0), 0)
@@ -54,10 +62,12 @@ export default function DownloadedModelsView({
     }),
     [models, normalizedQuery],
   )
+  const hasLoadedModels = Boolean(spine.activeFilename) || spine.loadedModelIds.size > 0
+  const loadedModelCount = Math.max(spine.loadedModelIds.size, spine.activeFilename ? 1 : 0)
   const deleteBlockedReason = modelDeleteBlockedReason({
-    activeFilename: spine.activeFilename,
+    residentModelsLoaded: hasLoadedModels,
     downloads: spine.downloads,
-    loading: unloading,
+    loading: Boolean(modelAction.filename),
   })
   const invoke = desktopInvoke()
 
@@ -79,17 +89,49 @@ export default function DownloadedModelsView({
     }
   }
 
-  const unload = async () => {
+  const load = async (filename) => {
+    if (modelActionInFlightRef.current) return
+    modelActionInFlightRef.current = filename
     clearMessages()
-    setUnloading(true)
+    setModelAction({ filename, type: 'load' })
     try {
-      await unloadCurrentModel()
-      await spine.refreshCurrent()
-      setNotice('The active model was unloaded. Downloaded files can now be deleted.')
+      const result = await loadLocalModelForChat({
+        apiBase: spine.base,
+        filename,
+        readActiveFilename: async () => modelFilenameFromPath((await spine.refreshCurrent())?.path),
+      })
+      if (!result.ok) throw new Error(result.message)
+      await Promise.all([spine.refreshLoadedModels(), refreshDashboard?.({ silent: true })])
+      setNotice(result.embedding
+        ? `${filename} is loaded as an embedding model.`
+        : `${filename} is loaded and ready.`)
     } catch (err) {
       setError(String(err?.message || err))
     } finally {
-      setUnloading(false)
+      modelActionInFlightRef.current = ''
+      setModelAction({ filename: '', type: '' })
+    }
+  }
+
+  const unload = async (filename, modelId = filename) => {
+    if (!filename || modelActionInFlightRef.current) return
+    modelActionInFlightRef.current = filename
+    clearMessages()
+    setModelAction({ filename, type: 'unload' })
+    try {
+      const result = await unloadLocalModel({ apiBase: spine.base, modelId })
+      if (!result.ok) throw new Error(result.message)
+      await Promise.all([
+        spine.refreshCurrent(),
+        spine.refreshLoadedModels(),
+        refreshDashboard?.({ silent: true }),
+      ])
+      setNotice(`${filename} was unloaded. Its downloaded file is still available.`)
+    } catch (err) {
+      setError(String(err?.message || err))
+    } finally {
+      modelActionInFlightRef.current = ''
+      setModelAction({ filename: '', type: '' })
     }
   }
 
@@ -205,15 +247,23 @@ export default function DownloadedModelsView({
         </div>
       </article>
 
-      {spine.activeFilename ? (
+      {hasLoadedModels ? (
         <div className="downloaded-active" id="model-delete-guard">
           <div>
-            <strong>{spine.activeFilename}</strong>
-            <span> is loaded. Unload it before deleting any model file.</span>
+            <strong>{loadedModelCount} {loadedModelCount === 1 ? 'model is' : 'models are'} loaded.</strong>
+            <span> Unload every loaded model before deleting any model file.</span>
           </div>
-          <Button variant="outline" size="sm" onClick={unload} loading={unloading}>
-            Unload current model
-          </Button>
+          {spine.activeFilename ? (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => unload(spine.activeFilename, spine.current?.id)}
+              loading={modelAction.filename === spine.activeFilename && modelAction.type === 'unload'}
+              disabled={Boolean(modelAction.filename)}
+            >
+              Unload current model
+            </Button>
+          ) : null}
         </div>
       ) : null}
 
@@ -258,9 +308,12 @@ export default function DownloadedModelsView({
         <div className="cxv-grid downloaded-grid">
           {filteredModels.map((entry) => {
             const isActive = entry.filename === spine.activeFilename
+            const isLoaded = isActive || spine.loadedModelIds.has(entry.filename)
+            const loadedModelId = isActive ? spine.current?.id : entry.filename
             const isDefault = entry.filename === spine.defaultFilename
             const deleteAvailable = Boolean(entry.delete_token)
-            const canStartAutomatically = entry.lane_class !== 'unsupported'
+            const canLoad = entry.lane_class !== 'unsupported'
+            const actionBusy = Boolean(modelAction.filename)
             return (
               <article
                 className={`cxv-card downloaded-model${isActive ? ' downloaded-model--active' : ''}`}
@@ -272,7 +325,7 @@ export default function DownloadedModelsView({
                     <span className="cxv-card__sub">{metaLine(entry) || prettySize(entry.size_bytes)}</span>
                   </div>
                   <div className="downloaded-model__tags">
-                    {isActive ? <span className="cxv-tag cxv-tag--ready">Loaded</span> : null}
+                    {isLoaded ? <span className="cxv-tag cxv-tag--ready">Loaded</span> : null}
                     {isDefault ? <span className="cxv-tag cxv-tag--accent">Default</span> : null}
                   </div>
                 </div>
@@ -284,17 +337,47 @@ export default function DownloadedModelsView({
                     <span>{entry.chat_capable ? 'Chat model' : 'Text model'}</span>
                   </div>
                   <div className="cxv-card__actions">
-                    {!isDefault && canStartAutomatically ? (
+                    {!isDefault && canLoad ? (
                       <Button
                         variant="ghost"
                         size="sm"
                         onClick={() => makeDefault(entry.filename)}
                         loading={defaultingFilename === entry.filename}
-                        disabled={Boolean(deletingFilename)}
+                        disabled={Boolean(deletingFilename) || actionBusy}
                       >
                         Make default
                       </Button>
                     ) : null}
+                    <Button
+                      variant="tonal"
+                      size="sm"
+                      icon={<IconPlay size={16} />}
+                      onClick={() => load(entry.filename)}
+                      loading={modelAction.filename === entry.filename && modelAction.type === 'load'}
+                      disabled={isLoaded || !canLoad || actionBusy || Boolean(deletingFilename)}
+                      aria-label={`Load ${entry.filename}`}
+                      title={
+                        isLoaded
+                          ? 'This model is already loaded'
+                          : canLoad
+                            ? 'Load this model into Camelid'
+                            : 'Camelid cannot load this model architecture'
+                      }
+                    >
+                      Load
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      icon={<IconStop size={15} />}
+                      onClick={() => unload(entry.filename, loadedModelId)}
+                      loading={modelAction.filename === entry.filename && modelAction.type === 'unload'}
+                      disabled={!isLoaded || actionBusy || Boolean(deletingFilename)}
+                      aria-label={`Unload ${entry.filename}`}
+                      title={isLoaded ? 'Unload this model from memory' : 'This model is not loaded'}
+                    >
+                      Unload
+                    </Button>
                     <Button
                       variant="ghost"
                       size="sm"
@@ -304,7 +387,7 @@ export default function DownloadedModelsView({
                         clearMessages()
                         setPendingDelete(entry)
                       }}
-                      disabled={!deleteAvailable || Boolean(deleteBlockedReason) || Boolean(deletingFilename)}
+                      disabled={!deleteAvailable || Boolean(deleteBlockedReason) || Boolean(deletingFilename) || actionBusy}
                       aria-label={`Delete ${entry.filename} from disk`}
                       aria-describedby={deleteBlockedReason ? 'model-delete-guard' : undefined}
                       title={

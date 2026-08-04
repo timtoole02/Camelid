@@ -397,7 +397,7 @@ function App() {
             <DownloadedModelsView
               runtime={runtime}
               apiBase={apiBase}
-              unloadCurrentModel={unloadCurrentModel}
+              refreshDashboard={loadDashboard}
               onOpenModels={() => navigateTab('library')}
             />
           )}

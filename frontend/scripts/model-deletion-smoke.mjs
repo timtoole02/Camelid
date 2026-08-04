@@ -3,6 +3,7 @@ import { localModelDeleteRequest, modelDeleteBlockedReason } from '../src/lib/mo
 
 assert.equal(modelDeleteBlockedReason(), '')
 assert.match(modelDeleteBlockedReason({ activeFilename: 'active.gguf' }), /Unload/)
+assert.match(modelDeleteBlockedReason({ residentModelsLoaded: true }), /every loaded model/)
 assert.match(modelDeleteBlockedReason({ loading: true }), /load/)
 assert.match(modelDeleteBlockedReason({ smoking: true }), /check/)
 assert.match(

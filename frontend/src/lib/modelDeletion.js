@@ -1,9 +1,11 @@
 export function modelDeleteBlockedReason({
   activeFilename = '',
+  residentModelsLoaded = false,
   downloads = [],
   loading = false,
   smoking = false,
 } = {}) {
+  if (residentModelsLoaded) return 'Unload every loaded model before deleting files.'
   if (activeFilename) return 'Unload the current model before deleting files.'
   if (loading) return 'Wait for the current model load to finish.'
   if (smoking) return 'Wait for the current model check to finish.'

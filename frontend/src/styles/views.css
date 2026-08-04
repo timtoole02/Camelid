@@ -489,7 +489,11 @@
 }
 .downloaded-model__tags { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-1); }
 .downloaded-model .cxv-card__foot { align-items: flex-end; flex-wrap: wrap; }
-.downloaded-model .cxv-card__actions { margin-left: auto; }
+.downloaded-model .cxv-card__actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  margin-left: auto;
+}
 .downloaded-empty {
   display: flex;
   flex-direction: column;
