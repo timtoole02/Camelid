@@ -18,6 +18,8 @@ Desktop app, browser chat, terminal UI, and an OpenAI-compatible API—all backe
 
 ![Camelid WebUI chat surface](docs/assets/camelid-readme-chat-surface-dark.png)
 
+<div align="center"><sub>Camelid's local web UI—a dark, collapsed-rail chat surface served directly from the engine binary.</sub></div>
+
 Camelid loads GGUF models and runs inference on your hardware. Its tokenizer, model loader, CPU kernels, and Metal and CUDA execution paths are implemented in this repository and distributed as a single Rust binary—no Python, Node.js, or Docker is required at runtime.
 
 ## What is Camelid?
