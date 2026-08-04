@@ -143,6 +143,12 @@ The full catalog, exact hashes, supported execution paths, and claim boundaries 
 - [RECEIPTS.md](RECEIPTS.md)—reproducible validation receipts
 - [benchmarks](docs/benchmarks/BENCHMARKS.md)—recorded performance measurements
 
+Selected validation highlight:
+
+| Model row | Quant | Evidence |
+|---|---|---|
+| Mistral 7B Instruct v0.3 | Q8_0 | Exact-row smoke + bounded context 512→8192 + GPU/CPU parity |
+
 ### PrismML Bonsai and vision
 
 Seven hash-pinned PrismML Bonsai GGUFs are supported on Apple Silicon Metal and Windows x86_64 CUDA: 4B Q1/Q2/PQ2, 8B Q1/Q2, and 27B Q1/Q2. Both 27B rows support PNG/JPEG input in browser chat and the API when paired with the Qwen3-VL projector.
