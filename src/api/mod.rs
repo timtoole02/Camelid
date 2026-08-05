@@ -578,6 +578,32 @@ pub struct Q8RuntimeHealth {
 }
 
 #[derive(Debug, Serialize)]
+pub struct RuntimeMemoryResponse {
+    pub process_resident_bytes: Option<u64>,
+    pub model_weight_bytes_estimate: u64,
+    pub kv_cache_bytes: u64,
+    pub kv_cache_entries: usize,
+    pub kv_cache_capacity: usize,
+    pub models: Vec<RuntimeModelMemory>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RuntimeModelMemory {
+    pub id: String,
+    pub active: bool,
+    pub weight_bytes_estimate: u64,
+    pub kv_cache_bytes: u64,
+    pub kv_cache_entries: usize,
+    pub cached_tokens: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PurgeKvCacheResponse {
+    pub purged_entries: usize,
+    pub released_bytes_estimate: u64,
+}
+
+#[derive(Debug, Serialize)]
 pub struct CapabilitiesResponse {
     pub engine: &'static str,
     pub gguf_metadata: bool,
@@ -2298,6 +2324,8 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
         .route("/v1/health", get(health))
         .route("/api/capabilities", get(capabilities))
         .route("/api/runtime/gpu", get(gpu_runtime).post(set_gpu_runtime))
+        .route("/api/runtime/memory", get(runtime_memory))
+        .route("/api/runtime/kv-cache/purge", post(purge_kv_cache))
         .route("/api/telemetry/stream", get(telemetry_stream))
         .route("/execution-plan", get(execution_plan))
         .route("/api/execution-plan", get(execution_plan))
@@ -3001,6 +3029,77 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         executable: loopback_executable_path(state.serve_addr),
         listen_addr: (state.serve_addr.ip().is_loopback()).then(|| state.serve_addr.to_string()),
     }
+}
+
+#[derive(Debug)]
+struct KvCacheEntryMemory {
+    model_id: String,
+    bytes: u64,
+    tokens: usize,
+}
+
+fn kv_cache_memory_snapshot(state: &AppState) -> (Vec<KvCacheEntryMemory>, usize) {
+    let Ok(pool) = state.cached_prompt_prefix.lock() else {
+        return (Vec::new(), 0);
+    };
+    let entries = pool
+        .entries
+        .iter()
+        .map(|entry| KvCacheEntryMemory {
+            model_id: entry.cached.model_id.clone(),
+            bytes: entry.cached.session.kv_cache_allocated_bytes(),
+            tokens: entry.cached.token_ids.len(),
+        })
+        .collect();
+    (entries, pool.capacity)
+}
+
+async fn runtime_memory(State(state): State<AppState>) -> Json<RuntimeMemoryResponse> {
+    let (kv_entries, kv_cache_capacity) = kv_cache_memory_snapshot(&state);
+    let kv_cache_bytes = kv_entries.iter().map(|entry| entry.bytes).sum();
+    let active_model_id = state.active_model_id.read().await.clone();
+    let loaded_models = state.loaded_models.read().await;
+    let mut models = loaded_models
+        .values()
+        .map(|model| {
+            let model_cache: Vec<_> = kv_entries
+                .iter()
+                .filter(|entry| entry.model_id == model.id)
+                .collect();
+            RuntimeModelMemory {
+                id: model.id.clone(),
+                active: active_model_id.as_ref() == Some(&model.id),
+                weight_bytes_estimate: std::fs::metadata(&model.path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0),
+                kv_cache_bytes: model_cache.iter().map(|entry| entry.bytes).sum(),
+                kv_cache_entries: model_cache.len(),
+                cached_tokens: model_cache.iter().map(|entry| entry.tokens).sum(),
+            }
+        })
+        .collect::<Vec<_>>();
+    models.sort_by(|left, right| left.id.cmp(&right.id));
+    let model_weight_bytes_estimate = models.iter().map(|model| model.weight_bytes_estimate).sum();
+
+    Json(RuntimeMemoryResponse {
+        process_resident_bytes: metrics::current_process_rss_bytes(),
+        model_weight_bytes_estimate,
+        kv_cache_bytes,
+        kv_cache_entries: kv_entries.len(),
+        kv_cache_capacity,
+        models,
+    })
+}
+
+async fn purge_kv_cache(State(state): State<AppState>) -> Json<PurgeKvCacheResponse> {
+    let (entries, _) = kv_cache_memory_snapshot(&state);
+    let released_bytes_estimate = entries.iter().map(|entry| entry.bytes).sum();
+    let purged_entries = entries.len();
+    clear_prompt_prefix_cache(&state);
+    Json(PurgeKvCacheResponse {
+        purged_entries,
+        released_bytes_estimate,
+    })
 }
 
 /// `/health` while a model transition holds the registries: every field that
@@ -18381,6 +18480,20 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn runtime_memory_reports_empty_state_and_purge_is_idempotent() {
+        let state = AppState::default();
+        let Json(memory) = runtime_memory(State(state.clone())).await;
+        assert_eq!(memory.model_weight_bytes_estimate, 0);
+        assert_eq!(memory.kv_cache_bytes, 0);
+        assert_eq!(memory.kv_cache_entries, 0);
+        assert!(memory.models.is_empty());
+
+        let Json(purged) = purge_kv_cache(State(state)).await;
+        assert_eq!(purged.purged_entries, 0);
+        assert_eq!(purged.released_bytes_estimate, 0);
+    }
 
     #[test]
     fn streaming_error_preserves_the_structured_api_failure() {

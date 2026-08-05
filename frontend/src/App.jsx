@@ -349,7 +349,7 @@ function App() {
           )}
 
           {tab === 'analytics' && (
-            <AnalyticsView conversations={conversations} models={models} runtime={runtime} capabilities={dashboard?.capabilities} />
+            <AnalyticsView apiBase={apiBase} conversations={conversations} models={models} runtime={runtime} capabilities={dashboard?.capabilities} />
           )}
 
           {tab === 'history' && (

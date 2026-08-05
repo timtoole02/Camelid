@@ -2650,6 +2650,13 @@ impl LlamaInferenceSession {
         self.kv_cache.position
     }
 
+    /// Bytes currently allocated by this session's CPU-side K/V history.
+    /// Used by the local runtime-memory endpoint to report retained prompt-cache
+    /// cost without exposing cache contents.
+    pub fn kv_cache_allocated_bytes(&self) -> u64 {
+        self.kv_cache.allocated_bytes()
+    }
+
     /// Positions still available before the context limit.
     pub fn remaining_context(&self) -> usize {
         self.kv_cache

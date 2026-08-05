@@ -5,6 +5,7 @@ import { isRunnableModel } from '../lib/modelState'
 import { EmptyState } from '../components/ui/EmptyState'
 import { StatusDot } from '../components/ui/StatusDot'
 import { IconAnalytics, IconChart } from '../components/ui/icons'
+import { RuntimeMemoryPanel } from '../components/analytics/RuntimeMemoryPanel'
 
 function startOfDay(date) { const next = new Date(date); next.setHours(0, 0, 0, 0); return next }
 function dayKey(date) { return startOfDay(date).toISOString().slice(0, 10) }
@@ -20,7 +21,7 @@ function summarizeGuardedTargets(targets = []) {
   return guarded.slice(0, 3).map((target) => `${target.id}: ${formatCapabilityStatus(target.status)}`).join(' · ')
 }
 
-export default function AnalyticsView({ conversations, models, runtime, capabilities }) {
+export default function AnalyticsView({ apiBase, conversations, models, runtime, capabilities }) {
   const now = new Date()
   const sevenDays = Array.from({ length: 7 }, (_, index) => {
     const date = new Date(now)
@@ -109,6 +110,8 @@ export default function AnalyticsView({ conversations, models, runtime, capabili
         <div className="cxv-stat"><span>Avg speed</span><strong>{averageReplyRate ? formatRate(averageReplyRate).replace(' tokens/sec', '') : '—'}</strong><small>{averageReplyRate ? 'tokens/sec out' : 'after first reply'}</small></div>
         <div className="cxv-stat"><span>Chat-ready</span><strong>{chatReadyModels}</strong><small>{runtime?.generation_ready ? 'runtime is green' : 'load a local GGUF'}</small></div>
       </div>
+
+      <RuntimeMemoryPanel apiBase={apiBase} />
 
       <div className="cxv-grid cxv-grid--two">
         <section className="cxv-card cxv-panel">

@@ -300,7 +300,7 @@ fn metric_gauge(out: &mut String, name: &str, help: &str, value: impl ToString) 
 }
 
 #[cfg(target_os = "linux")]
-fn current_process_rss_bytes() -> Option<u64> {
+pub(super) fn current_process_rss_bytes() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     let line = status.lines().find(|line| line.starts_with("VmRSS:"))?;
     let kib = line.split_whitespace().nth(1)?.parse::<u64>().ok()?;
@@ -308,7 +308,7 @@ fn current_process_rss_bytes() -> Option<u64> {
 }
 
 #[cfg(windows)]
-fn current_process_rss_bytes() -> Option<u64> {
+pub(super) fn current_process_rss_bytes() -> Option<u64> {
     use windows_sys::Win32::System::{
         ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
         Threading::GetCurrentProcess,
@@ -329,8 +329,21 @@ fn current_process_rss_bytes() -> Option<u64> {
     (ok != 0).then_some(counters.WorkingSetSize as u64)
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
-fn current_process_rss_bytes() -> Option<u64> {
+#[cfg(target_os = "macos")]
+pub(super) fn current_process_rss_bytes() -> Option<u64> {
+    let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::proc_pid_rusage(
+            std::process::id() as libc::c_int,
+            libc::RUSAGE_INFO_V2,
+            &mut info as *mut libc::rusage_info_v2 as *mut libc::rusage_info_t,
+        )
+    };
+    (result == 0 && info.ri_phys_footprint > 0).then_some(info.ri_phys_footprint)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub(super) fn current_process_rss_bytes() -> Option<u64> {
     None
 }
 
