@@ -134,6 +134,8 @@ const tokenizerPlaygroundSource = read('../src/components/models/TokenizerPlaygr
 const evidenceStatusSource = read('../src/lib/evidenceStatus.js')
 const useThemeSource = read('../src/hooks/useTheme.js')
 const mainSource = read('../src/main.jsx')
+const settingsViewSource = read('../src/views/SettingsView.jsx')
+const apiAuthSource = read('../src/lib/apiAuth.js')
 const tokensCss = read('../src/styles/tokens.css')
 const evidenceCss = read('../src/styles/evidence.css')
 const chatCss = read('../src/styles/chat.css')
@@ -565,6 +567,10 @@ assert.match(tokensCss, /--color-evidence:/, 'tokens must define the bounded-evi
 assert.match(mainSource, /@fontsource-variable\/inter/, 'body font must be self-hosted via Fontsource')
 assert.match(mainSource, /@fontsource\/ibm-plex-mono/, 'mono font must be self-hosted via Fontsource')
 assert.doesNotMatch(mainSource, /fonts\.googleapis|fonts\.gstatic/, 'no third-party font CDN calls')
+assert.match(mainSource, /installApiAuthFetch\(\)/, 'the UI must install authenticated API requests before rendering')
+assert.match(settingsViewSource, /type="password"[\s\S]*Save key/, 'Settings must provide an API-key control for authenticated backends')
+assert.match(apiAuthSource, /requestUrl\.origin !== apiOrigin/, 'API credentials must only be attached to the configured Camelid origin')
+assert.match(apiAuthSource, /headers\.set\('x-api-key', apiKey\)/, 'Camelid requests must include the stored API key')
 assert.match(useThemeSource, /return saved && VALID\.has\(saved\) \? saved : 'dark'/, 'theme preference must default to dark')
 
 /* ---- Brand hygiene across visible UI sources ---- */

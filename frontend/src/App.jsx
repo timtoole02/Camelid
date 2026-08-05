@@ -421,6 +421,7 @@ function App() {
               runtime={runtime}
               apiBase={apiBase}
               setApiBase={setApiBase}
+              refreshDashboard={loadDashboard}
               backend={backend}
               showNotice={showNotice}
               themePreference={preference}

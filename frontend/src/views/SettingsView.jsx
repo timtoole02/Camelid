@@ -8,6 +8,7 @@ import { CamelidMark } from '../components/ui/CamelidMark'
 import { IconPlay, IconStop, IconCopy, IconCheck, IconServer, IconMonitor, IconSun, IconMoon, IconNetwork, IconChevronRight } from '../components/ui/icons'
 import { copyText } from '../lib/markdown'
 import { getConfiguredMaxTokens, setConfiguredMaxTokens } from '../lib/responseLimits'
+import { getStoredApiKey, setStoredApiKey } from '../lib/apiAuth'
 import { ResponseLengthControl } from '../components/settings/ResponseLengthControl'
 
 const THEME_OPTS = [
@@ -20,6 +21,7 @@ export default function SettingsView({
   runtime,
   apiBase,
   setApiBase,
+  refreshDashboard = null,
   backend,
   showNotice,
   themePreference = 'system',
@@ -35,6 +37,7 @@ export default function SettingsView({
   const { status, command, setCommand, resolvedCommand, starting, start, stop } = backend
   const [copied, setCopied] = useState(false)
   const [apiBaseDraft, setApiBaseDraft] = useState(apiBase || 'http://127.0.0.1:8181')
+  const [apiKeyDraft, setApiKeyDraft] = useState(getStoredApiKey)
   const [showAdvanced, setShowAdvanced] = useState(Boolean(command))
   const [showLogs, setShowLogs] = useState(false)
   const [maxTokens, setMaxTokens] = useState(() => getConfiguredMaxTokens(selectedModel?.id))
@@ -88,6 +91,13 @@ export default function SettingsView({
     if (!next) { showNotice?.('API base cannot be empty.', 'error'); return }
     setApiBase(next)
     showNotice?.(`API base set to ${next.replace(/\/$/, '')}.`, 'success')
+  }
+
+  const handleSaveApiKey = () => {
+    const next = apiKeyDraft.trim()
+    setStoredApiKey(next)
+    showNotice?.(next ? 'API key saved in this browser.' : 'API key cleared.', 'success')
+    refreshDashboard?.()
   }
 
   const handleMaxTokens = (value) => {
@@ -180,6 +190,11 @@ export default function SettingsView({
           <div className="settings-inline">
             <input type="text" value={apiBaseDraft} spellCheck={false} onChange={(e) => setApiBaseDraft(e.target.value)} placeholder="http://127.0.0.1:8181" />
             <Button variant="tonal" onClick={handleSaveApiBase} disabled={apiBaseDraft.trim() === (apiBase || '')}>Save</Button>
+          </div>
+          <p className="settings-help">API key for authenticated LAN or remote backends. It is stored only in this browser.</p>
+          <div className="settings-inline">
+            <input type="password" value={apiKeyDraft} autoComplete="off" spellCheck={false} onChange={(e) => setApiKeyDraft(e.target.value)} placeholder="Optional API key" />
+            <Button variant="tonal" onClick={handleSaveApiKey}>Save key</Button>
           </div>
         </CardBody>
       </Card>
