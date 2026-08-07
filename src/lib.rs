@@ -27,6 +27,7 @@ pub mod ghost_hot;
 pub mod ghost_install;
 pub mod grammar;
 pub mod hf_browse;
+pub mod hf_pull;
 pub mod inference;
 pub mod kv_equivalence;
 pub mod metal;

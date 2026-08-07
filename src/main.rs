@@ -145,6 +145,139 @@ mod ghost_moe_cli_tests {
     }
 }
 
+#[cfg(test)]
+mod hf_pull_cli_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Same rationale as `ghost_moe_cli_tests::on_cli_test_stack`: the Command
+    /// enum is large enough to overflow the default test-thread stack. These
+    /// tests additionally assert on env-attached args (CAMELID_MODEL fills
+    /// Serve/Chat `model`), so a developer's exported vars would make them
+    /// flaky: the vars are scrubbed first, under a mutex that serializes the
+    /// scrub-and-parse across this module's tests.
+    fn on_cli_test_stack(test: impl FnOnce() + Send + 'static) {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::remove_var("CAMELID_MODEL");
+        std::env::remove_var("CAMELID_MODELS_DIR");
+        std::thread::Builder::new()
+            .name("hf-pull-cli-parse-test".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(test)
+            .expect("spawn CLI parse test")
+            .join()
+            .expect("CLI parse test panicked");
+        drop(guard);
+    }
+
+    #[test]
+    fn pull_accepts_hf_specs_and_dry_run() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "camelid",
+                "pull",
+                "prism-ml/Ternary-Bonsai-27B-gguf:Q2_0",
+                "--dry-run",
+            ])
+            .expect("parse pull with an org/repo:quant spec");
+            match cli.command {
+                Some(Command::Pull { model, dry_run, .. }) => {
+                    assert_eq!(
+                        model.as_deref(),
+                        Some("prism-ml/Ternary-Bonsai-27B-gguf:Q2_0")
+                    );
+                    assert!(dry_run);
+                }
+                other => panic!("expected Pull, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn pull_dry_run_defaults_off() {
+        on_cli_test_stack(|| {
+            let cli =
+                Cli::try_parse_from(["camelid", "pull", "llama32_3b"]).expect("parse curated pull");
+            match cli.command {
+                Some(Command::Pull { dry_run, .. }) => assert!(!dry_run),
+                other => panic!("expected Pull, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn serve_parses_hf_spec() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from(["camelid", "serve", "--hf", "org/repo:Q8_0"])
+                .expect("parse serve --hf");
+            match cli.command {
+                Some(Command::Serve { model, hf, .. }) => {
+                    assert_eq!(model, None);
+                    assert_eq!(hf.as_deref(), Some("org/repo:Q8_0"));
+                }
+                other => panic!("expected Serve, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn serve_accepts_hf_alongside_model() {
+        // Deliberately NOT a clap conflict: an exported CAMELID_MODEL fills
+        // `model`, and a hard conflict would then make --hf unusable. Both
+        // parse; the dispatch arm gives the typed --hf precedence.
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "camelid",
+                "serve",
+                "--hf",
+                "org/repo:Q8_0",
+                "--model",
+                "models/a.gguf",
+            ])
+            .expect("parse serve with both --hf and --model");
+            match cli.command {
+                Some(Command::Serve { model, hf, .. }) => {
+                    assert_eq!(model, Some(PathBuf::from("models/a.gguf")));
+                    assert_eq!(hf.as_deref(), Some("org/repo:Q8_0"));
+                }
+                other => panic!("expected Serve, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn chat_parses_hf_spec() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from(["camelid", "chat", "--hf", "org/repo"])
+                .expect("parse chat --hf");
+            match cli.command {
+                Some(Command::Chat { model, hf, .. }) => {
+                    assert_eq!(model, None);
+                    assert_eq!(hf.as_deref(), Some("org/repo"));
+                }
+                other => panic!("expected Chat, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn serve_defaults_leave_hf_unset() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from(["camelid", "serve"]).expect("parse bare serve");
+            match cli.command {
+                Some(Command::Serve { hf, model, .. }) => {
+                    assert_eq!(hf, None);
+                    assert_eq!(model, None::<PathBuf>);
+                }
+                other => panic!("expected Serve, got {other:?}"),
+            }
+        });
+    }
+}
+
 use camelid::{
     api, chat,
     cluster::{
@@ -197,6 +330,9 @@ fn default_launch_command() -> Command {
     Command::Serve {
         addr: "127.0.0.1:8181".parse().expect("valid default serve addr"),
         model: std::env::var_os("CAMELID_MODEL").map(PathBuf::from),
+        // Double-click launches never auto-download (--hf is CLI-only by design:
+        // no env alias exists that could move gigabytes on app open).
+        hf: None,
         threads: None,
         parallel_linear_min_outputs: None,
         apple_accelerate_min_elements: None,
@@ -823,6 +959,15 @@ enum Command {
         /// Load a GGUF model at startup and auto-select the safest validated execution plan.
         #[arg(long, env = "CAMELID_MODEL")]
         model: Option<PathBuf>,
+        /// Download (if missing) and serve a Hugging Face GGUF by
+        /// `org/repo[:quant]` spec — `camelid pull` plus `--model <file>` in one
+        /// step. Experimental lane: the file is unverified, carries no parity
+        /// claim, and still fails closed at load if unsupported. Deliberately
+        /// CLI-only (no env alias) and not a clap conflict with --model: an
+        /// exported CAMELID_MODEL must not make this flag unusable, so a typed
+        /// --hf simply takes precedence at dispatch.
+        #[arg(long, value_name = "ORG/REPO[:QUANT]")]
+        hf: Option<String>,
         /// Override Rayon worker threads for the inference server.
         #[arg(long, env = "CAMELID_THREADS")]
         threads: Option<usize>,
@@ -925,6 +1070,13 @@ enum Command {
         /// open the supported-model picker.
         #[arg(long, env = "CAMELID_MODEL")]
         model: Option<PathBuf>,
+        /// Download (if missing) a Hugging Face GGUF by `org/repo[:quant]` spec
+        /// and load it at startup — `camelid pull` plus `--model <file>` in one
+        /// step. Experimental lane: unverified, no parity claim, fails closed at
+        /// load if unsupported. Not a clap conflict with --model (an exported
+        /// CAMELID_MODEL would make it unusable); a typed --hf wins at dispatch.
+        #[arg(long, value_name = "ORG/REPO[:QUANT]")]
+        hf: Option<String>,
         /// Server to attach to, or spawn on if nothing is listening there.
         #[arg(long, default_value = "127.0.0.1:8181", env = "CAMELID_ADDR")]
         addr: SocketAddr,
@@ -1193,16 +1345,25 @@ enum Command {
         #[arg(long)]
         safety_mb: Option<u64>,
     },
-    /// Download a supported model (a known-good Q8_0 GGUF) into ./models.
+    /// Download a model into ./models: a curated known-good row, or any public
+    /// Hugging Face GGUF by `org/repo[:quant]` spec.
     ///
-    /// Run with no argument to list the catalog. Accepts a catalog id or a
-    /// fragment of the name, e.g. `camelid pull llama32_3b`.
+    /// Run with no argument to list the curated catalog. Accepts a catalog id
+    /// or a fragment of the name, e.g. `camelid pull llama32_3b` — or a Hugging
+    /// Face spec (experimental lane: unverified, no parity claim; a download
+    /// path is not a support claim), e.g.
+    /// `camelid pull prism-ml/Ternary-Bonsai-27B-gguf:Q2_0`.
     Pull {
-        /// Catalog id or name fragment to download. Omit to list all models.
+        /// Catalog id, name fragment, or Hugging Face `org/repo[:quant]` spec.
+        /// Omit to list the curated catalog.
         model: Option<String>,
         /// Directory to download into (default: ./models).
         #[arg(long, env = "CAMELID_MODELS_DIR")]
         models_dir: Option<PathBuf>,
+        /// Resolve and print what would be downloaded, then exit without
+        /// downloading.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
     },
     /// Generate text with a Gemma 4 model (correctness-first runtime).
     Gemma4Generate {
@@ -1904,6 +2065,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve {
             addr,
             model,
+            hf,
             threads,
             parallel_linear_min_outputs,
             apple_accelerate_min_elements,
@@ -1980,10 +2142,33 @@ async fn main() -> anyhow::Result<()> {
             }
             // Open-and-use launch: if no model was named, load the user's saved
             // default from the configured model library. With no saved choice,
-            // the first local GGUF is the zero-configuration default.
-            let model = match model {
-                Some(path) => Some(api::StartupModel::explicit(path)),
-                None => {
+            // the first local GGUF is the zero-configuration default. A typed
+            // --hf wins over --model/CAMELID_MODEL (see the flag's doc comment).
+            let model = match (model, hf) {
+                (shadowed, Some(spec)) => {
+                    if shadowed.is_some() {
+                        eprintln!(
+                            "note: --hf takes precedence over --model/CAMELID_MODEL for this run"
+                        );
+                    }
+                    // Pull-if-missing before the server starts, into the SAME
+                    // directory the server will scan (api::resolve_models_dir is
+                    // the server's own default resolution — exe-dir models/ in
+                    // the shipped layout, else ./models), so the file always
+                    // appears in the Models page. The user named this model, so
+                    // a failure here is fatal, exactly like an explicit --model
+                    // load. The serve --max-download-bytes flag governs this
+                    // download too.
+                    let dir = api::resolve_models_dir(models_dir.clone());
+                    let path = camelid::hf_pull::ensure_hf_model(
+                        &spec,
+                        &dir,
+                        Some(server.max_download_bytes),
+                    )?;
+                    Some(api::StartupModel::explicit(path))
+                }
+                (Some(path), None) => Some(api::StartupModel::explicit(path)),
+                (None, None) => {
                     auto_select_model(models_dir.as_deref()).map(api::StartupModel::auto_selected)
                 }
             };
@@ -2019,6 +2204,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Chat {
             model,
+            hf,
             addr,
             system,
             max_tokens,
@@ -2042,6 +2228,21 @@ async fn main() -> anyhow::Result<()> {
             audit_webhook,
             shell_sandbox,
         } => {
+            let models_dir = models_dir.unwrap_or_else(|| PathBuf::from("models"));
+            // `--hf` resolves to a local file up front (pull-if-missing), then
+            // rides the ordinary `--model` load path. A typed --hf wins over
+            // --model/CAMELID_MODEL, mirroring serve.
+            let model = match (model, hf) {
+                (shadowed, Some(spec)) => {
+                    if shadowed.is_some() {
+                        eprintln!(
+                            "note: --hf takes precedence over --model/CAMELID_MODEL for this run"
+                        );
+                    }
+                    Some(camelid::hf_pull::ensure_hf_model(&spec, &models_dir, None)?)
+                }
+                (path, None) => path,
+            };
             let code = chat::run_chat(chat::ChatOptions {
                 model,
                 addr,
@@ -2053,7 +2254,7 @@ async fn main() -> anyhow::Result<()> {
                 seed,
                 no_stream,
                 plain,
-                models_dir: models_dir.unwrap_or_else(|| PathBuf::from("models")),
+                models_dir,
                 exec_goal: None,
                 agent,
                 workdir,
@@ -2403,9 +2604,13 @@ async fn main() -> anyhow::Result<()> {
                 .collect();
             println!("[offload] layer map (V=VRAM, H=host): {map}");
         }
-        Command::Pull { model, models_dir } => {
+        Command::Pull {
+            model,
+            models_dir,
+            dry_run,
+        } => {
             let dir = models_dir.unwrap_or_else(|| PathBuf::from("models"));
-            camelid::catalog::run_pull(model.as_deref(), &dir)?;
+            camelid::catalog::run_pull_opts(model.as_deref(), &dir, dry_run)?;
         }
         Command::Gemma4Generate {
             path,

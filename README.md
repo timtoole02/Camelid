@@ -73,6 +73,14 @@ Camelid opens `http://127.0.0.1:8181`. Use `camelid chat` for the terminal UI, o
 
 Run `camelid pull` without an argument to list the curated model catalog.
 
+Public Hugging Face repos that ship single-file, top-level GGUFs can also be pulled directly by `org/repo[:quant]` spec (multi-part shards, nested files, and gated repos are not supported), or downloaded and served in one step with `--hf`:
+
+```bash
+camelid serve --hf prism-ml/Ternary-Bonsai-27B-gguf:Q2_0
+```
+
+Files pulled this way are **experimental — unverified, no parity claim**: a download path is not a support claim, and an unsupported file still fails closed at load, exactly as in the Models page's experimental Hugging Face group. When a repo ships several quantizations, Camelid lists them and asks for an explicit `:quant` instead of guessing; add `--dry-run` to `camelid pull` to preview the resolved file without downloading.
+
 > [!WARNING]
 > A non-loopback listener requires authentication. Prefer an API key file:
 >
@@ -99,7 +107,7 @@ Good starting points:
 
 ### Full `camelid pull` catalog
 
-Run `camelid pull <id>` to download a model into `./models`. Pull IDs resolve by unique substring; if a fragment matches several rows, Camelid lists the matches instead of guessing.
+Run `camelid pull <id>` to download a model into `./models`. Pull IDs resolve by unique substring; if a fragment matches several rows, Camelid lists the matches instead of guessing. A query containing `/` is treated as a Hugging Face `org/repo[:quant]` spec instead and downloads outside this catalog — experimental lane, unverified, no parity claim.
 
 | Model | Quant | Arch | Size | Pull ID | GGUF file |
 |---|---|---|---:|---|---|

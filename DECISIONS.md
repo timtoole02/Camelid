@@ -1433,3 +1433,42 @@ platform-blind (`supported_exact_row_smoke_sub512` for the gemma3 row) because
 that table is keyed on the row name alone and is reported on fallback hosts too;
 the lane-aware context claim lives in `/api/capabilities`, which is the support
 source of truth and states the lane it applies to.
+
+## D21 — CLI pull of arbitrary Hugging Face GGUFs (`org/repo[:quant]`) (2026-08-06)
+
+**Decision:** `camelid pull` accepts a Hugging Face `org/repo[:quant]` spec (any
+query containing `/`; curated ids never contain one), and `serve --hf` /
+`chat --hf` download-if-missing then load through the ordinary explicit-model
+path. The lane is the CLI twin of the Models page's "Experimental (Hugging
+Face)" group and inherits its wording verbatim: **experimental — unverified, no
+parity claim**; a download path is not a support claim; runnability is decided
+at load time by the inspect-first typed-blocker flow, fail-closed. This is a
+prerequisite for listing Camelid in the Hugging Face Hub's "Use this model"
+Local Apps dropdown, whose snippet needs a one-line spec-addressable command.
+
+**Basis (receipts):** discovery and sizes reuse `hf_browse::list_gguf_files_blocking`
+(the browse lane's LFS-aware tree fetch, extracted from `repo_gguf_files`);
+downloads adopt the web installer's semantics — `.part` + rename promotion so a
+loadable GGUF never exists half-written, resume via `curl -C -`, retries and
+stall detection, and the `CAMELID_MAX_DOWNLOAD_BYTES` ceiling enforced before
+and during transfer (`src/api/mod.rs` `spawn_catalog_artifact_download`) — while
+keeping the curated pull's live size verification against the Hub tree. Unlike
+the web install handler, the CLI validates `repo_id` with
+`fit_dims::is_safe_hf_component` (the stricter `/catalog/fit` contract) in
+addition to gating filenames through `model_default::valid_local_model_filename`.
+
+**Fail-closed selection:** a multi-GGUF repo requires an explicit `:quant`; tags
+match recognized quant labels exactly, otherwise on filename token boundaries
+(`:F16` can never silently select a `BF16` file). `mmproj` companions and
+multi-part shards are never selectable. Same-filename collisions in the flat
+models dir are an error, never an overwrite. Anonymous downloads only — gated
+repos are out of scope. `--hf` is deliberately CLI-only (no env alias, and not a
+clap conflict with `--model`: an exported `CAMELID_MODEL` must not make the flag
+unusable, so a typed `--hf` wins at dispatch), which also means no inherited env
+var can start a download on desktop app open. `serve --hf` honors the
+`--max-download-bytes` flag; `pull`/`chat --hf` read the env var only.
+
+**What this does not decide:** no support-contract change of any kind — no
+COMPATIBILITY.md row, no `/api/capabilities` change, no sha256 pinning for
+arbitrary files (the Hub tree byte count is the only integrity gate, matching
+the web lane), and no multi-part or vision-companion download support.

@@ -257,16 +257,28 @@ fn fetch_repo_files_parallel(repos: &[RepoMeta]) -> Vec<HfGgufFile> {
     collected.into_iter().flat_map(|(_, files)| files).collect()
 }
 
+/// Browse-search wrapper over [`list_gguf_files_blocking`]: patches in the
+/// downloads/likes the search response knows but the tree endpoint doesn't.
+fn repo_gguf_files(repo: &RepoMeta) -> anyhow::Result<Vec<HfGgufFile>> {
+    let mut files = list_gguf_files_blocking(&repo.id)?;
+    for file in &mut files {
+        file.downloads = repo.downloads;
+        file.likes = repo.likes;
+    }
+    Ok(files)
+}
+
 /// Enumerate the top-level `*.gguf` files in a repo with LFS-aware sizes, mirroring
 /// the `remote_size()` logic in `catalog.rs`. Only top-level files are returned:
 /// the downloader writes to `models/<filename>` and the local scan globs
 /// `models/*.gguf`, so a nested path would download but never surface as a local
 /// model. Sharded/subdir GGUFs are therefore skipped at browse time.
-fn repo_gguf_files(repo: &RepoMeta) -> anyhow::Result<Vec<HfGgufFile>> {
-    let url = format!(
-        "https://huggingface.co/api/models/{}/tree/main?recursive=1",
-        repo.id
-    );
+///
+/// Shared by browse search results and the CLI `pull org/repo[:quant]` resolver
+/// (`crate::hf_pull`); `downloads`/`likes` are zeroed here because they are
+/// repo-search metadata the tree endpoint does not report.
+pub(crate) fn list_gguf_files_blocking(repo_id: &str) -> anyhow::Result<Vec<HfGgufFile>> {
+    let url = format!("https://huggingface.co/api/models/{repo_id}/tree/main?recursive=1");
     let (body, _) = curl_get_with_headers(&url)?;
     let tree: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|err| anyhow::anyhow!("could not parse hugging face tree response: {err}"))?;
@@ -292,12 +304,12 @@ fn repo_gguf_files(repo: &RepoMeta) -> anyhow::Result<Vec<HfGgufFile>> {
             .unwrap_or(0);
 
         out.push(HfGgufFile {
-            repo_id: repo.id.clone(),
+            repo_id: repo_id.to_string(),
             filename: path.to_string(),
             size_bytes: size,
-            downloads: repo.downloads,
-            likes: repo.likes,
-            architecture: guess_architecture(path, &repo.id),
+            downloads: 0,
+            likes: 0,
+            architecture: guess_architecture(path, repo_id),
             quant: guess_quant(path).unwrap_or_default(),
         });
     }
@@ -381,7 +393,9 @@ fn extract_query_param(url: &str, key: &str) -> Option<String> {
 }
 
 /// Percent-encode a query component (RFC 3986 unreserved set kept verbatim).
-fn urlencode(s: &str) -> String {
+/// Also safe for a path segment (it never emits a literal `/`), which is how
+/// `crate::hf_pull` uses it for resolve-URL filenames.
+pub(crate) fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
@@ -413,19 +427,57 @@ fn urldecode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Best-effort quant guess from a filename (advisory only). Longest tokens first so
-/// `Q4_K_M` isn't shadowed by `Q4_K`.
-fn guess_quant(filename: &str) -> Option<String> {
-    let upper = filename.to_uppercase();
-    const PATTERNS: &[&str] = &[
-        "IQ2_XXS", "IQ3_XXS", "IQ2_XS", "IQ3_XS", "IQ4_XS", "IQ4_NL", "IQ1_S", "IQ1_M", "IQ2_S",
-        "IQ2_M", "IQ3_S", "IQ3_M", "Q2_K_S", "Q3_K_S", "Q3_K_M", "Q3_K_L", "Q4_K_S", "Q4_K_M",
-        "Q5_K_S", "Q5_K_M", "Q6_K", "Q8_K", "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q4_0", "Q4_1", "Q5_0",
-        "Q5_1", "Q8_0", "BF16", "F16", "F32",
-    ];
-    PATTERNS
+/// The quant labels [`guess_quant`] recognizes, longest first so `Q4_K_M` is
+/// tried before `Q4_K`. Includes the `_L`/`_XL` and `Q4_0_x_y` superstring
+/// variants: without them a `Q6_K_L` file would be labeled `Q6_K`, and the
+/// `pull org/repo[:quant]` exact-tag stage would silently select the wrong
+/// quantization.
+const QUANT_PATTERNS: &[&str] = &[
+    "Q4_0_4_4", "Q4_0_4_8", "Q4_0_8_8", "Q2_K_XL", "Q3_K_XL", "Q4_K_XL", "Q5_K_XL", "Q6_K_XL",
+    "Q8_K_XL", "IQ2_XXS", "IQ3_XXS", "IQ2_XS", "IQ3_XS", "IQ4_XS", "IQ4_NL", "IQ1_S", "IQ1_M",
+    "IQ2_S", "IQ2_M", "IQ3_S", "IQ3_M", "Q2_K_S", "Q2_K_L", "Q3_K_S", "Q3_K_M", "Q3_K_L", "Q4_K_S",
+    "Q4_K_M", "Q4_K_L", "Q5_K_S", "Q5_K_M", "Q5_K_L", "Q6_K_L", "MXFP4", "TQ1_0", "TQ2_0", "Q6_K",
+    "Q8_K", "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0", "BF16", "F16",
+    "F32",
+];
+
+/// True when `label` (uppercase) is a quant label [`guess_quant`] can assign.
+pub(crate) fn known_quant_label(label: &str) -> bool {
+    QUANT_PATTERNS.contains(&label)
+}
+
+/// True when uppercase-ASCII `needle` occurs in `hay` (compared
+/// case-insensitively) delimited by non-alphanumerics or the string edges.
+/// Byte-based on the uppercased haystack so multi-byte characters can never
+/// cause a mid-character slice.
+pub(crate) fn token_bounded_contains(hay: &str, needle: &str) -> bool {
+    let hay_string = hay.to_uppercase();
+    let hay = hay_string.as_bytes();
+    let needle = needle.as_bytes();
+    if needle.is_empty() || needle.len() > hay.len() {
+        return false;
+    }
+    for start in 0..=hay.len() - needle.len() {
+        if &hay[start..start + needle.len()] != needle {
+            continue;
+        }
+        let end = start + needle.len();
+        let left_ok = start == 0 || !hay[start - 1].is_ascii_alphanumeric();
+        let right_ok = end == hay.len() || !hay[end].is_ascii_alphanumeric();
+        if left_ok && right_ok {
+            return true;
+        }
+    }
+    false
+}
+
+/// Best-effort quant guess from a filename (advisory only). Labels match on
+/// token boundaries — `model-Q6_K_L.gguf` is `Q6_K_L`, never `Q6_K`, and a
+/// name with no delimited label gets no guess rather than a wrong one.
+pub(crate) fn guess_quant(filename: &str) -> Option<String> {
+    QUANT_PATTERNS
         .iter()
-        .find(|p| upper.contains(**p))
+        .find(|p| token_bounded_contains(filename, p))
         .map(|p| (*p).to_string())
 }
 
@@ -473,6 +525,35 @@ mod tests {
         );
         assert_eq!(guess_quant("model-f16.gguf").as_deref(), Some("F16"));
         assert_eq!(guess_quant("model.gguf"), None);
+    }
+
+    #[test]
+    fn quant_labels_match_on_token_boundaries() {
+        // Superstring variants get their own label, never the shorter prefix —
+        // the pull tag stage relies on this to avoid silent wrong-quant picks.
+        assert_eq!(guess_quant("model-Q6_K_L.gguf").as_deref(), Some("Q6_K_L"));
+        assert_eq!(
+            guess_quant("model-Q4_0_8_8.gguf").as_deref(),
+            Some("Q4_0_8_8")
+        );
+        assert_eq!(
+            guess_quant("model-UD-Q4_K_XL.gguf").as_deref(),
+            Some("Q4_K_XL")
+        );
+        // BF16 is not F16.
+        assert_eq!(guess_quant("model-BF16.gguf").as_deref(), Some("BF16"));
+        // An undelimited token is no longer guessed (advisory honesty).
+        assert_eq!(guess_quant("modelq4_k_m0.gguf"), None);
+    }
+
+    #[test]
+    fn token_bounded_contains_is_boundary_and_case_aware() {
+        assert!(token_bounded_contains("Model-Q2_0.gguf", "Q2_0"));
+        assert!(!token_bounded_contains("Model-PQ2_0.gguf", "Q2_0"));
+        assert!(!token_bounded_contains("Model-BF16.gguf", "F16"));
+        assert!(token_bounded_contains("model-q2_g64.gguf", "Q2_G64"));
+        assert!(token_bounded_contains("Model-Q4_K_M.gguf", "Q4_K"));
+        assert!(!token_bounded_contains("anything", ""));
     }
 
     #[test]
