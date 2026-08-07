@@ -89,6 +89,14 @@ Resource ceilings are resolved once at startup. Their CLI names and environment 
 | `--max-generation-tokens` | 8,192 | `CAMELID_MAX_GENERATION_TOKENS` |
 | `--max-download-bytes` | 64 GiB | `CAMELID_MAX_DOWNLOAD_BYTES` |
 
+The download ceiling also applies to the Hugging Face spec lanes, which download arbitrary
+GGUFs into the models directory — experimental lane, unverified, no parity claim: `serve --hf`
+honors the `--max-download-bytes` flag (and its env alias), while `camelid pull
+org/repo[:quant]` and `chat --hf` have no such flag and read `CAMELID_MAX_DOWNLOAD_BYTES`
+only. `--hf` is deliberately CLI-only (no env alias), so no inherited environment variable can
+ever start a multi-gigabyte download, and the double-click desktop launch never downloads.
+Downloads are anonymous; gated or private repos are not supported.
+
 `GET /metrics` exposes bounded-name Prometheus counters and gauges for HTTP/generation latency,
 prompt/decode tokens, prompt and weight cache outcomes, engine queue/slot progress, process RSS,
 and CUDA VRAM. It contains no model-path, prompt, API-key, or per-user labels.

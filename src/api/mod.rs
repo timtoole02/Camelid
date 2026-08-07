@@ -38,6 +38,7 @@ mod server;
 mod workspace;
 
 pub use server::ServeOptions;
+pub(crate) use server::DEFAULT_MAX_DOWNLOAD_BYTES;
 
 use crate::{
     embedding::{cosine_similarity, EncoderConfig, NomicBertRuntime},
@@ -2212,7 +2213,7 @@ fn default_models_dir() -> PathBuf {
 /// not require the directory to exist yet (a fresh install has no models/ until
 /// the first download) and never produces the Windows `\\?\` verbatim prefix in
 /// user-facing strings.
-fn resolve_models_dir(configured: Option<PathBuf>) -> PathBuf {
+pub fn resolve_models_dir(configured: Option<PathBuf>) -> PathBuf {
     let dir = configured.unwrap_or_else(default_models_dir);
     if dir.is_absolute() {
         dir

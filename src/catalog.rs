@@ -14,6 +14,20 @@ use crate::api::{curated_catalog, CatalogItem};
 /// otherwise resolves `query` to exactly one row and downloads it into
 /// `models_dir`.
 pub fn run_pull(query: Option<&str>, models_dir: &Path) -> anyhow::Result<()> {
+    run_pull_opts(query, models_dir, false)
+}
+
+/// [`run_pull`] with CLI-only options: `dry_run` resolves and prints what would
+/// be downloaded without moving bytes.
+pub fn run_pull_opts(query: Option<&str>, models_dir: &Path, dry_run: bool) -> anyhow::Result<()> {
+    // An `org/repo[:quant]` spec pulls straight from Hugging Face (experimental
+    // lane, unverified); curated catalog ids never contain a '/'.
+    if let Some(query) = query {
+        if crate::hf_pull::is_hf_spec(query) {
+            return crate::hf_pull::run_hf_pull(query, models_dir, dry_run).map(|_| ());
+        }
+    }
+
     let entries = curated_catalog();
 
     let Some(query) = query else {
@@ -23,6 +37,18 @@ pub fn run_pull(query: Option<&str>, models_dir: &Path) -> anyhow::Result<()> {
     };
 
     let item = resolve(&entries, query)?;
+    if dry_run {
+        eprintln!("Would download:");
+        eprintln!("  model: {} ({})", item.name, item.quant);
+        eprintln!("  repo:  {}", item.repo_id);
+        eprintln!(
+            "  file:  {} ({:.1} GB)",
+            item.filename,
+            item.size_bytes as f64 / 1e9
+        );
+        eprintln!("  dest:  {}", models_dir.join(item.filename).display());
+        return Ok(());
+    }
     let dest = download(&item, models_dir)?;
 
     eprintln!("\n✓ {} is ready at {}", item.name, dest.display());
@@ -555,5 +581,18 @@ mod tests {
         assert_eq!(item.repo_id, "Qwen/Qwen3-4B-GGUF");
         assert_eq!(item.filename, "Qwen3-4B-Q4_K_M.gguf");
         assert_eq!(item.quant, "Q4_K_M");
+    }
+
+    #[test]
+    fn curated_dry_run_resolves_offline_and_writes_nothing() {
+        // --dry-run must stop after resolution: no models dir, no bytes, no
+        // network (the remote size check lives inside download()).
+        let dir = std::env::temp_dir().join(format!(
+            "camelid-catalog-dry-run-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        run_pull_opts(Some("qwen3_4b_q4_k_m"), &dir, true).expect("dry-run resolves");
+        assert!(!dir.exists(), "dry-run must not create the models dir");
     }
 }

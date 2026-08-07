@@ -34,7 +34,7 @@ Read these first:
 - [`SECURITY.md`](SECURITY.md) — security reporting guidance
 - [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) — acknowledgements and license notices
 - [`DROVER_RECON.md`](DROVER_RECON.md) — the agent-mode campaign record: recon, gate ledger, amendment log
-- [`DECISIONS.md`](DECISIONS.md) — the live decision log (D1–D20, including D20's routing invariants for windowed-attention architectures; `docs/architecture/DECISIONS.md` is the frozen early-phase log)
+- [`DECISIONS.md`](DECISIONS.md) — the live decision log (D1–D21, including D21's experimental Hugging Face pull lane (`camelid pull org/repo[:quant]`, `serve --hf`); `docs/architecture/DECISIONS.md` is the frozen early-phase log)
 
 ## QA and acceptance docs
 
