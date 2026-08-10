@@ -115,7 +115,7 @@ process.stdout.write(
       oracle: {
         command: `llama-tokenize -m <gguf> -p <input> --ids --no-bos --no-escape --log-disable`,
         commit,
-        model: 'Mistral-Nemo-Instruct-2407-Q4_K_M.gguf',
+        model: 'Mistral-Nemo-Instruct-2407.Q4_K_M.gguf',
         pre_tokenizer: 'tekken',
       },
       cases,

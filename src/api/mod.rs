@@ -4950,7 +4950,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
         hf_catalog_install: true,
         execution_plan,
         support_contract: SupportContract {
-            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192 raw-decode context ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. The dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking disabled) are supported_exact_row_smoke: qwen2 BPE pre-tokenizer + ChatML renderer, per-head QK-norm + NEOX RoPE, and token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on Windows x86_64 CPU (cpu_reference + the x86_q8 AVX2 runtime-repack path, bit-identical), and additionally on Windows CUDA: the 0.6B/1.7B/4B rows fully VRAM-resident and the 8B row via the VRAM+host-RAM offload split (RTX 3060 Laptop 6 GB, driver 576.83, CUDA 12.9; GPU decode+single-shot prefill token+text identical to cpu_reference/llama.cpp at 1/5/50); 1.7B additionally has GPU-resident decode+prefill and a 15,373-token single-shot prefill lane on macOS, and thinking-mode is opt-in (leading-trace parity only). The 4B row additionally carries checked bounded-context packs 512/1024/2048/4096/8192, the 1.7B row 512/1024/2048/4096, and the 0.6B row 512/2048/4096/8192 (fully-GPU-resident raw-decode greedy parity vs llama.cpp acd79d603 at 50 tokens; the 1.7B 8192 and 0.6B 1024 buckets are held as documented benign near-ties). These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied. Seven hash-pinned Prism ML Bonsai Q1_0, Prism Q2_0, and PQ2_0 artifacts are supported_exact_row_smoke on macOS Apple Silicon Metal and Windows x86_64 CUDA after paired text and vision validation; the claim is exact-file and limited to those two GPU platforms, with broader qwen3/qwen35 or quant support, bounded/model-native context, and production throughput still unclaimed. The seven files are mixed-arch: the 4B and 8B rows declare general.architecture=qwen3 (dense), only the 27B rows declare qwen35 (hybrid).",
+            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192 raw-decode context ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. LFM2.5-2.6B Q8_0 is hash-pinned supported_exact_row_smoke after tokenizer/template parity and 96/96 greedy-token parity against pinned llama.cpp with the resident Metal graph active; its claim remains short, greedy, non-streaming chat smoke only. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. The dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking disabled) are supported_exact_row_smoke: qwen2 BPE pre-tokenizer + ChatML renderer, per-head QK-norm + NEOX RoPE, and token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on Windows x86_64 CPU (cpu_reference + the x86_q8 AVX2 runtime-repack path, bit-identical), and additionally on Windows CUDA: the 0.6B/1.7B/4B rows fully VRAM-resident and the 8B row via the VRAM+host-RAM offload split (RTX 3060 Laptop 6 GB, driver 576.83, CUDA 12.9; GPU decode+single-shot prefill token+text identical to cpu_reference/llama.cpp at 1/5/50); 1.7B additionally has GPU-resident decode+prefill and a 15,373-token single-shot prefill lane on macOS, and thinking-mode is opt-in (leading-trace parity only). The 4B row additionally carries checked bounded-context packs 512/1024/2048/4096/8192, the 1.7B row 512/1024/2048/4096, and the 0.6B row 512/2048/4096/8192 (fully-GPU-resident raw-decode greedy parity vs llama.cpp acd79d603 at 50 tokens; the 1.7B 8192 and 0.6B 1024 buckets are held as documented benign near-ties). These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied. Seven hash-pinned Prism ML Bonsai Q1_0, Prism Q2_0, and PQ2_0 artifacts are supported_exact_row_smoke on macOS Apple Silicon Metal and Windows x86_64 CUDA after paired text and vision validation; the claim is exact-file and limited to those two GPU platforms, with broader qwen3/qwen35 or quant support, bounded/model-native context, and production throughput still unclaimed. The seven files are mixed-arch: the 4B and 8B rows declare general.architecture=qwen3 (dense), only the 27B rows declare qwen35 (hybrid).",
             support_policy: "A model, tokenizer, quantization, API feature, or context length is supported only after tests, docs, and real-model evidence exist for that lane.",
             unsupported_policy: "Unsupported combinations should return typed errors instead of silently falling back to best-effort behavior.",
         },
@@ -4973,7 +4973,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "Q8_0",
                 status: "supported_current_gate",
-                notes: "TinyLlama remains the current support gate; exact Llama 3.2 1B Instruct Q8_0 now has checked bounded 512/1024/2048/4096/8192-context packs; exact Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192-context raw-decode ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); and exact Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048-context packs where row-specific PASS artifacts exist. These are exact bounded-pack lanes only; no model-native/larger-context beyond the checked packs, arbitrary-template, production-throughput, portability, neighboring-row, or broad-family support is implied.",
+                notes: "TinyLlama remains the current support gate; exact Llama 3.2 1B Instruct Q8_0 now has checked bounded 512/1024/2048/4096/8192-context packs; exact Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with the anchored checked bounded 512/1024/2048/4096/8192-context raw-decode ladder on the current canonical GGUF (prior-upload Ubuntu API/WebUI refresh at source head e9f926ed1a65 retained as historical evidence); exact Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048-context packs where row-specific PASS artifacts exist; and exact hash-pinned LFM2.5-2.6B Q8_0 has tokenizer/template plus 96/96 greedy-token parity and short non-streaming chat smoke. These are exact bounded or short-smoke lanes only; no model-native/larger-context beyond the checked packs, arbitrary-template, production-throughput, portability, neighboring-row, or broad-family support is implied.",
             },
             SupportItem {
                 id: "Q4_K_M/Q5_K_M/Q3_K_M",
@@ -5043,6 +5043,11 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 id: "mistral_instruct_exact_7b_v0_3_q8_0",
                 status: "supported_exact_row_smoke_lane",
                 notes: "exact Mistral-7B-Instruct-v0.3 Q8_0 has row-specific smoke support: tokenizer/template, deterministic and broader 50-token parity, checked bounded 512/1024/2048/4096/8192-context packs, GPU-vs-CPU greedy parity on the exact row, and a support-promotion API/WebUI smoke bundle. Exact row only; broader Mistral-family, other quants, model-native context, and full support are not implied.",
+            },
+            SupportItem {
+                id: "lfm2_5_exact_2_6b_q8_0",
+                status: "supported_exact_row_smoke_lane",
+                notes: "exact LFM2.5-2.6B-Q8_0.gguf only (sha256 36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757): llama-bpe tokenizer and embedded-template fidelity, 96/96 greedy-token parity vs pinned llama.cpp b9632, Metal-resident revalidation on Apple Silicon, plus non-streaming single/multi-turn chat smoke. Tools fail closed; sampling semantics, streaming SSE, bounded/model-native context, other LFM2 files/quants, CUDA, and broad-family support are not implied.",
             },
             SupportItem {
                 id: "llama_bpe_decoder_exact_1b_3b_8b_q8_0",
@@ -6387,6 +6392,174 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 latest_checked_output: "CMLD-M7B",
                 evidence: "exact tokenizer/template, deterministic 1-token/5-token, broader 50-token, and bounded 512/1024/2048/4096/8192 context evidence are green, GPU-vs-CPU greedy continuations match token-for-token on this exact row, and a support-promotion API/WebUI smoke bundle (qa/evidence-bundles/mistral-7b-v0.3-q8-support-promotion-*) records the promoted contract surface",
                 next_step: "repeat the current-head promotion smoke on contract-affecting changes; broader/full support still needs separate proof",
+            },
+            ModelCompatibilityTarget {
+                id: "mistral_nemo_instruct_2407_q4_k_m",
+                tool_capable: false,
+                family: "mistral",
+                quantization: "Q4_K_M",
+                status: "active_validation_exact_row_hold",
+                support_scope: "catalog_download_and_bounded_runtime_validation_only",
+                full_support_status: "blocked_before_support_promotion",
+                full_support_blockers: "the Metal and deterministic CPU K-quant lanes diverge after a five-token common prefix, the installed llama.cpp comparator exits 139 while loading this 12B artifact, and row-specific chat-template/API/WebUI/context/portability evidence is missing",
+                metadata_parses: "validated",
+                tokenizer_works: "validated_39_case_tekken_oracle",
+                tensors_load: "validated_q4_k_q6_k_f32",
+                generation_runs: "validated_bounded_on_metal_and_cpu",
+                parity_audited: "hold_cross_backend_divergence_at_generated_index_5_external_oracle_unavailable",
+                performance_measured: "bounded_measurement_only_not_promoted",
+                frontend_load_path_verified: "not_started",
+                frontend_readiness_gate: "fail-closed: catalog availability is not support; chat remains experimental until row-specific template and generation parity plus API/WebUI evidence pass",
+                tested_context: "six_token_raw_prompt_plus_eight_generated_tokens_only",
+                chat_template_renderer: "mistral_instruct_candidate_not_row_fixture_locked",
+                chat_template_shape_pack: "not_started",
+                chat_template_shape_pack_id: "not_selected",
+                bounded_context_512_pack: "not_started",
+                bounded_context_512_pack_id: "not_selected",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_started",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_started",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "exact_artifact_admission_tokenizer_and_cross_backend_runtime_smoke",
+                latest_checked_result: "partial_pass_hold",
+                latest_checked_output: "qa/evidence-bundles/catalog-expansion-20260809-head-4efe4920/manifest.json",
+                evidence: "exact public file Mistral-Nemo-Instruct-2407.Q4_K_M.gguf (sha256 5964f3e6d9c17b99e3d2174022048f3ec58b12ee8fefa987888e0562d070d52e, 7477204928 B) passes whole-file admission and all committed Tekken tokenizer oracle cases. Camelid Metal and deterministic CPU both generate, but match only the first five greedy tokens before index-5 divergence; installed llama.cpp exits 139 on both attempted load configurations. Exact outputs and commands are recorded in the cited bundle",
+                next_step: "capture a working pinned llama.cpp oracle, attribute or fix the index-5 backend frontier, fixture-lock the Nemo template, and run chat/API/WebUI smoke before support promotion",
+            },
+            ModelCompatibilityTarget {
+                id: "qwen3_14b_q4_k_m",
+                tool_capable: false,
+                family: "qwen3",
+                quantization: "Q4_K_M",
+                status: "active_validation_exact_row_smoke",
+                support_scope: "catalog_download_and_bounded_cross_backend_raw_decode_smoke_only",
+                full_support_status: "blocked_before_support_promotion",
+                full_support_blockers: "external llama.cpp generated-token parity, row-specific ChatML/API/WebUI smoke, tool evaluation, bounded context, portability, and normalized performance evidence remain missing",
+                metadata_parses: "validated",
+                tokenizer_works: "qwen2_pre_tokenizer_admits_row_specific_oracle_not_run",
+                tensors_load: "validated_q4_k_q6_k_f32",
+                generation_runs: "validated_bounded_on_metal_and_cpu",
+                parity_audited: "metal_equals_deterministic_cpu_for_8_of_8_raw_greedy_tokens_external_oracle_not_run",
+                performance_measured: "bounded_measurement_only_not_promoted",
+                frontend_load_path_verified: "not_started",
+                frontend_readiness_gate: "fail-closed: catalog availability and internal cross-backend smoke do not satisfy the supported-row frontend gate",
+                tested_context: "five_token_raw_prompt_plus_eight_generated_tokens_only",
+                chat_template_renderer: "qwen3_chatml_thinking_disabled_candidate",
+                chat_template_shape_pack: "not_started",
+                chat_template_shape_pack_id: "qwen3-chatml-chat-template-pack-v1",
+                bounded_context_512_pack: "not_started",
+                bounded_context_512_pack_id: "not_selected",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_started",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_started",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "exact_artifact_cross_backend_raw_decode_smoke",
+                latest_checked_result: "pass_active_validation_only",
+                latest_checked_output: "qa/evidence-bundles/catalog-expansion-20260809-head-4efe4920/manifest.json",
+                evidence: "exact official Qwen3-14B-Q4_K_M.gguf (sha256 500a8806e85ee9c83f3ae08420295592451379b4f8cf2d0f41c15dffeb6b81f0, 9001752960 B) parses as qwen3/qwen2-pre with the standard Qwen3 ChatML template and loads its Q4_K/Q6_K/F32 mix. Metal and deterministic CPU emitted identical text and all 8/8 greedy token ids on the bounded raw prompt; no external-oracle or chat/API claim is made",
+                next_step: "run the existing Qwen3 ChatML 1/5/50 harness against pinned llama.cpp, then add API/WebUI, tool, and bounded-context evidence before support promotion",
+            },
+            ModelCompatibilityTarget {
+                id: "deepseek_r1_0528_qwen3_8b_q4_k_m",
+                tool_capable: false,
+                family: "qwen3_deepseek_r1",
+                quantization: "Q4_K_M",
+                status: "active_validation_exact_row_hold",
+                support_scope: "catalog_download_and_bounded_raw_runtime_validation_only",
+                full_support_status: "blocked_before_support_promotion",
+                full_support_blockers: "the native DeepSeek R1 <｜User｜>/<｜Assistant｜> renderer and tool envelope are not implemented, Metal and CPU raw decode diverge at generated index 2, and external-oracle/chat/API/WebUI/context/portability evidence is missing",
+                metadata_parses: "validated",
+                tokenizer_works: "qwen2_pre_tokenizer_admits_row_specific_oracle_not_run",
+                tensors_load: "validated_q4_k_q6_k_f32",
+                generation_runs: "validated_bounded_raw_on_metal_and_cpu",
+                parity_audited: "hold_cross_backend_divergence_at_generated_index_2_external_oracle_not_run",
+                performance_measured: "bounded_measurement_only_not_promoted",
+                frontend_load_path_verified: "fail_closed_native_template_unimplemented",
+                frontend_readiness_gate: "fail-closed: never borrow Qwen3 ChatML for this file; catalog availability is not chat support",
+                tested_context: "five_token_raw_prompt_plus_eight_generated_tokens_only",
+                chat_template_renderer: "not_implemented_deepseek_r1_markers",
+                chat_template_shape_pack: "not_started",
+                chat_template_shape_pack_id: "not_selected",
+                bounded_context_512_pack: "not_started",
+                bounded_context_512_pack_id: "not_selected",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_started",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_started",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "exact_artifact_metadata_and_cross_backend_raw_decode_smoke",
+                latest_checked_result: "partial_pass_hold",
+                latest_checked_output: "qa/evidence-bundles/catalog-expansion-20260809-head-4efe4920/manifest.json",
+                evidence: "exact unsloth DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf (sha256 a86349a4180c4e6bb43f874c29c404fa2be3f90b15509bd6d86f697dba724ec1, 5027785216 B) parses as qwen3 with 131072 context/YaRN and loads its Q4_K/Q6_K/F32 mix. Both Camelid lanes execute bounded raw generation, but diverge at generated index 2. Its embedded template is the original R1 marker/tool grammar, not ChatML, so chat must remain refused until a dedicated renderer is fixture-locked",
+                next_step: "implement and fixture-lock the native R1 no-tools renderer first, keep tools refused, then resolve the index-2 backend frontier and run external-oracle plus API/WebUI gates",
+            },
+            ModelCompatibilityTarget {
+                id: "lfm2_5_2_6b_q8_0",
+                tool_capable: false,
+                family: "lfm2",
+                quantization: "Q8_0",
+                status: "supported_exact_row_smoke",
+                support_scope: "exact_row_greedy_runnable_chat_smoke_only",
+                full_support_status: "blocked_pending_normalized_full_support",
+                full_support_blockers: "streaming SSE, tool calling, sampling semantics beyond greedy, bounded/model-native context, CUDA and non-Metal GPU lanes, non-Apple-Silicon GPU execution, production throughput, neighboring LFM2 variants/quants, and normalized cross-platform support bundles remain missing",
+                metadata_parses: "validated",
+                tokenizer_works: "validated_against_pinned_llamacpp",
+                tensors_load: "validated",
+                generation_runs: "raw_greedy_and_non_streaming_chat_smoke",
+                parity_audited: "96_of_96_greedy_tokens_plus_tokenizer_and_template_parity_pass",
+                performance_measured: "macos_m4_measurement_only_not_promoted_as_sla",
+                frontend_load_path_verified: "api_chat_smoke_validated_webui_follow_up",
+                frontend_readiness_gate: "green only when this exact hash-pinned GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id",
+                tested_context: "short_raw_and_chat_prompts_only",
+                chat_template_renderer: "lfm2_5_chatml_open_think",
+                chat_template_shape_pack: "validated_three_shapes",
+                chat_template_shape_pack_id: "lfm2-chat-template-fixture-v1",
+                bounded_context_512_pack: "not_started",
+                bounded_context_512_pack_id: "not_selected",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_started",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_started",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "real_artifact_release_parity",
+                latest_checked_result: "pass",
+                latest_checked_output: "qa/runnable/lfm2-parity.json",
+                evidence: "exact LFM2.5-2.6B-Q8_0.gguf bytes (sha256 36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757, 2874779456 B) revalidated on 2026-08-09: tests/lfm2_parity.rs passes tokenizer parity and the 4-prompt x 24-token greedy gate (96/96) against llama.cpp b9632/acd79d603 while the resident Metal graph is active. tests/fixtures/lfm2_parity/lfm2-chat-template.json locks three llama.cpp /apply-template shapes; qa/runnable/lfm2-serve-smoke.json records Windows x86_64 non-streaming single/multi-turn chat, reasoning split, and typed tool refusal",
+                next_step: "add streaming SSE and bounded-context parity packs, then capture a normalized current-head API/WebUI bundle before widening this exact-row smoke envelope",
             },
             ModelCompatibilityTarget {
                 id: "qwen3_0_6b_instruct_q8_0",
@@ -18753,6 +18926,18 @@ fn render_chat_prompt_for_tokenization_for_model_result(
     let exact_llama32_metadata_jinja_row =
         model_id.and_then(llama32_metadata_jinja_exact_row_label);
     if let Some(template) = tokenizer.chat_template.as_deref() {
+        // DeepSeek-R1-0528-Qwen3 uses its own full-width marker grammar, not
+        // Qwen3 ChatML. Until that renderer is fixture-locked, neither the
+        // generic role-colon fallback nor the opt-in metadata Jinja path may
+        // silently put a foreign prompt in front of these weights.
+        if is_deepseek_r1_native_chat_template(template) {
+            return Err(MiniJinjaError::new(
+                MiniJinjaErrorKind::InvalidOperation,
+                "the loaded model uses the native DeepSeek R1 marker template; its no-tools \
+                 renderer is not implemented or fixture-locked, so chat fails closed instead \
+                 of borrowing Qwen3 ChatML or the generic role-colon renderer",
+            ));
+        }
         if metadata_chat_template_enabled() {
             return render_metadata_jinja_chat_template_prompt(messages, tokenizer, template, None);
         }
@@ -18805,6 +18990,13 @@ fn render_chat_prompt_for_tokenization_with_tools(
         })
         .collect();
     if let Some(template) = tokenizer.chat_template.as_deref() {
+        if is_deepseek_r1_native_chat_template(template) {
+            return Err(MiniJinjaError::new(
+                MiniJinjaErrorKind::InvalidOperation,
+                "the native DeepSeek R1 tool envelope is not implemented or certified; tool \
+                 requests fail closed",
+            ));
+        }
         // gemma3: the template has no tools branch and no tool-call grammar is
         // certified for this row, so tool requests fail closed on the dense
         // lane with the SAME contract the runnable bridge enforces (its typed
@@ -19327,6 +19519,15 @@ fn is_qwen2_chatml_template(template: &str) -> bool {
 /// rendered by [`render_qwen3_chatml_prompt`] instead.
 fn is_qwen3_chatml_template(template: &str) -> bool {
     template.contains("<|im_start|>") && template.contains("<|im_end|>")
+}
+
+/// DeepSeek-R1-0528-Qwen3's native marker grammar. These full-width markers
+/// distinguish the row from Qwen3 ChatML even though both use the qwen3 tensor
+/// architecture and qwen2 BPE pre-tokenizer.
+fn is_deepseek_r1_native_chat_template(template: &str) -> bool {
+    template.contains("<｜begin▁of▁sentence｜>")
+        && template.contains("<｜User｜>")
+        && template.contains("<｜Assistant｜>")
 }
 
 /// Phi-4's compact marker template keeps every role marker adjacent to content:
@@ -21719,6 +21920,88 @@ mod tests {
     }
 
     #[test]
+    fn catalog_expansion_rows_are_exact_and_support_stays_fail_closed() {
+        let capabilities = capabilities_response();
+        let catalog = curated_catalog();
+        for (id, repo, filename, size, expected_status) in [
+            (
+                "lfm2_5_2_6b_q8_0",
+                "LiquidAI/LFM2.5-2.6B-GGUF",
+                "LFM2.5-2.6B-Q8_0.gguf",
+                2_874_779_456,
+                "supported_exact_row_smoke",
+            ),
+            (
+                "mistral_nemo_instruct_2407_q4_k_m",
+                "MaziyarPanahi/Mistral-Nemo-Instruct-2407-GGUF",
+                "Mistral-Nemo-Instruct-2407.Q4_K_M.gguf",
+                7_477_204_928,
+                "active_validation_exact_row_hold",
+            ),
+            (
+                "qwen3_14b_q4_k_m",
+                "Qwen/Qwen3-14B-GGUF",
+                "Qwen3-14B-Q4_K_M.gguf",
+                9_001_752_960,
+                "active_validation_exact_row_smoke",
+            ),
+            (
+                "deepseek_r1_0528_qwen3_8b_q4_k_m",
+                "unsloth/DeepSeek-R1-0528-Qwen3-8B-GGUF",
+                "DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf",
+                5_027_785_216,
+                "active_validation_exact_row_hold",
+            ),
+        ] {
+            let item = catalog
+                .iter()
+                .find(|item| item.catalog_id == id)
+                .unwrap_or_else(|| panic!("missing exact catalog row {id}"));
+            assert_eq!(item.repo_id, repo, "{id} repo");
+            assert_eq!(item.filename, filename, "{id} filename");
+            assert_eq!(item.size_bytes, size, "{id} byte size");
+
+            let row = capabilities
+                .model_compatibility
+                .iter()
+                .find(|row| row.id == id)
+                .unwrap_or_else(|| panic!("missing compatibility row {id}"));
+            assert_eq!(row.status, expected_status, "{id} status");
+            if id != "lfm2_5_2_6b_q8_0" {
+                assert!(
+                    !row.status.starts_with("supported"),
+                    "{id} must not inherit support from an implemented architecture"
+                );
+                assert!(row.frontend_readiness_gate.contains("fail-closed"));
+            }
+        }
+
+        assert_eq!(
+            supported_artifact_expected_sha256("LFM2.5-2.6B-Q8_0.gguf"),
+            Some("36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757")
+        );
+        assert_eq!(
+            classify_loaded_model_identity(
+                Some("lfm2"),
+                "LFM2.5-2.6B-Q8_0.gguf",
+                "36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757",
+            ),
+            ModelLaneClass::Supported
+        );
+        for filename in [
+            "Mistral-Nemo-Instruct-2407.Q4_K_M.gguf",
+            "Qwen3-14B-Q4_K_M.gguf",
+            "DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf",
+        ] {
+            assert_eq!(
+                classify_model_lane(Some("qwen3"), filename),
+                ModelLaneClass::ExperimentalImplemented,
+                "downloadable validation row {filename} must stay experimental"
+            );
+        }
+    }
+
+    #[test]
     fn every_supported_row_is_reachable_on_the_models_page() {
         // REGRESSION: a row can be promoted to `supported_*` in the contract and
         // still be invisible to every user. The Models page has exactly two ways
@@ -22416,6 +22699,7 @@ mod tests {
                 // within 1e-4. Raw-completion smoke only. See qa/iquant/ receipt.
                 "llama3_2_1b_instruct_iq4_xs",
                 "llama3_8b_instruct_q8_0",
+                "lfm2_5_2_6b_q8_0",
                 "mistral_7b_instruct_v0_3_q8_0",
                 // Nomic v1.5 Q8_0 bidirectional encoder: exact-row embeddings,
                 // embedding-similarity reranking, and Workspace semantic retrieval.
@@ -22461,6 +22745,7 @@ mod tests {
             BTreeSet::from([
                 "llama_bpe_decoder_exact_1b_3b_8b_q8_0",
                 "llama_spm_decoder",
+                "lfm2_5_exact_2_6b_q8_0",
                 "mistral_instruct_exact_7b_v0_3_q8_0",
                 "nomic_bert_encoder_exact_v1_5_q8_0",
                 "prism_bonsai_qwen35_exact_4b_8b_27b_gpu",
@@ -25246,6 +25531,52 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_r1_native_template_fails_closed_for_chat_and_tools() {
+        let _guard = crate::test_support::env_lock();
+        let template = "{{ bos_token }}<｜begin▁of▁sentence｜>{% for message in messages %}{% if message['role'] == 'user' %}<｜User｜>{{ message['content'] }}{% else %}<｜Assistant｜>{{ message['content'] }}{% endif %}{% endfor %}";
+        assert!(is_deepseek_r1_native_chat_template(template));
+        assert!(!is_qwen3_chatml_template(template));
+        let tokenizer = llama3_tokenizer_with_template(template);
+        let messages = [ChatMessage {
+            image_urls: Vec::new(),
+            unsupported_content_parts: Vec::new(),
+            role: "user".to_string(),
+            content: "hello".to_string(),
+        }];
+
+        // The opt-in metadata renderer must not bypass the hold either.
+        for metadata_renderer in [false, true] {
+            if metadata_renderer {
+                std::env::set_var(METADATA_CHAT_TEMPLATE_ENV, "metadata");
+            } else {
+                std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+            }
+            let err = render_chat_prompt_for_tokenization_for_model_result(
+                &messages,
+                &tokenizer,
+                Some("DeepSeek-R1-0528-Qwen3-8B-Q4_K_M"),
+                false,
+            )
+            .expect_err("native DeepSeek R1 chat must fail closed");
+            assert_eq!(err.kind(), MiniJinjaErrorKind::InvalidOperation);
+            assert!(err
+                .to_string()
+                .contains("native DeepSeek R1 marker template"));
+        }
+        std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+
+        let tools = [serde_json::json!({
+            "name": "read_file",
+            "description": "Read a file",
+            "parameters": {"type": "object", "properties": {}}
+        })];
+        let err = render_chat_prompt_for_tokenization_with_tools(&messages, &tokenizer, &tools)
+            .expect_err("native DeepSeek R1 tools must fail closed");
+        assert_eq!(err.kind(), MiniJinjaErrorKind::InvalidOperation);
+        assert!(err.to_string().contains("native DeepSeek R1 tool envelope"));
+    }
+
+    #[test]
     fn metadata_jinja_renderer_reports_undefined_variables_as_unsupported() {
         let _guard = crate::test_support::env_lock();
         std::env::set_var(METADATA_CHAT_TEMPLATE_ENV, "metadata");
@@ -26484,6 +26815,32 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             task_tags: &["general", "coding"],
         },
         CatalogItem {
+            catalog_id: "mistral_nemo_instruct_2407_q4_k_m",
+            name: "Mistral Nemo Instruct 2407 Q4_K_M (validation hold)",
+            repo_id: "MaziyarPanahi/Mistral-Nemo-Instruct-2407-GGUF",
+            filename: "Mistral-Nemo-Instruct-2407.Q4_K_M.gguf",
+            size_bytes: 7477204928,
+            downloads: 0,
+            likes: 0,
+            quant: "Q4_K_M",
+            architecture: "llama",
+            license: "apache-2.0",
+            task_tags: &["general", "coding"],
+        },
+        CatalogItem {
+            catalog_id: "lfm2_5_2_6b_q8_0",
+            name: "LFM2.5 2.6B Q8_0",
+            repo_id: "LiquidAI/LFM2.5-2.6B-GGUF",
+            filename: "LFM2.5-2.6B-Q8_0.gguf",
+            size_bytes: 2874779456,
+            downloads: 0,
+            likes: 0,
+            quant: "Q8_0",
+            architecture: "lfm2",
+            license: "other",
+            task_tags: &["general", "reasoning"],
+        },
+        CatalogItem {
             catalog_id: "qwen3_0_6b_instruct_q8_0",
             name: "Qwen3 0.6B Q8_0",
             repo_id: "Qwen/Qwen3-0.6B-GGUF",
@@ -26556,6 +26913,19 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             downloads: 0,
             likes: 0,
             quant: "Q8_0",
+            architecture: "qwen3",
+            license: "apache-2.0",
+            task_tags: &["reasoning", "coding"],
+        },
+        CatalogItem {
+            catalog_id: "qwen3_14b_q4_k_m",
+            name: "Qwen3 14B Q4_K_M (active validation)",
+            repo_id: "Qwen/Qwen3-14B-GGUF",
+            filename: "Qwen3-14B-Q4_K_M.gguf",
+            size_bytes: 9001752960,
+            downloads: 0,
+            likes: 0,
+            quant: "Q4_K_M",
             architecture: "qwen3",
             license: "apache-2.0",
             task_tags: &["reasoning", "coding"],
@@ -26661,6 +27031,19 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "qwen25",
             license: "apache-2.0",
+            task_tags: &["reasoning", "coding"],
+        },
+        CatalogItem {
+            catalog_id: "deepseek_r1_0528_qwen3_8b_q4_k_m",
+            name: "DeepSeek R1 0528 Qwen3 8B Q4_K_M (validation hold)",
+            repo_id: "unsloth/DeepSeek-R1-0528-Qwen3-8B-GGUF",
+            filename: "DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf",
+            size_bytes: 5027785216,
+            downloads: 0,
+            likes: 0,
+            quant: "Q4_K_M",
+            architecture: "qwen3",
+            license: "mit",
             task_tags: &["reasoning", "coding"],
         },
         CatalogItem {
@@ -28605,6 +28988,10 @@ const CURATED_SUPPORTED_ARTIFACT_SHA256: &[(&str, &str)] = &[
     (
         "Qwen3-4B-Q4_K_M.gguf",
         "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5",
+    ),
+    (
+        "LFM2.5-2.6B-Q8_0.gguf",
+        "36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757",
     ),
 ];
 

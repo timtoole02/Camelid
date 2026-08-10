@@ -1,0 +1,42 @@
+{
+  "schema": "camelid.evidence_bundle_manifest/v1",
+  "bundle": "lfm2-2.6b-q8-promotion-20260809-head-4efe4920",
+  "row_id": "lfm2_5_2_6b_q8_0",
+  "date_utc": "2026-08-10",
+  "source_head": "4efe4920a2c191a4b906ef5513e048cff8b12ca6",
+  "checkout_state_before_run": "clean",
+  "model": {
+    "repo_id": "LiquidAI/LFM2.5-2.6B-GGUF",
+    "filename": "LFM2.5-2.6B-Q8_0.gguf",
+    "sha256": "36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757",
+    "size_bytes": 2874779456,
+    "architecture": "lfm2",
+    "quantization": "Q8_0"
+  },
+  "comparator": "llama.cpp b9632 (acd79d603), CPU, greedy/argmax",
+  "command": "cargo test --release --test lfm2_parity -- --nocapture",
+  "host": "macOS arm64, Apple Silicon Metal",
+  "result": "pass",
+  "gates": {
+    "tokenizer": "pass: raw completion and rendered-chat token ids match the pinned llama.cpp fixtures",
+    "forward_graph": "pass: 4 prompts x 24 generated tokens, 96/96 token-identical",
+    "runtime_lane": "resident Metal graph active",
+    "chat_template": "pass: three llama.cpp /apply-template shapes are fixture-locked",
+    "serve_smoke": "existing Windows x86_64 non-streaming single/multi-turn chat smoke passes; tools refuse with a typed error"
+  },
+  "durable_artifacts": [
+    "qa/runnable/lfm2-parity.json",
+    "qa/runnable/lfm2-serve-smoke.json",
+    "tests/fixtures/lfm2_parity/lfm2.json",
+    "tests/fixtures/lfm2_parity/lfm2-chat-template.json"
+  ],
+  "not_claimed": [
+    "streaming SSE",
+    "tool calling",
+    "sampling semantics beyond greedy",
+    "bounded or model-native context",
+    "CUDA or non-Metal GPU execution",
+    "production throughput",
+    "other LFM2 variants or quantizations"
+  ]
+}

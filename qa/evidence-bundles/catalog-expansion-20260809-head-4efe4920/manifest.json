@@ -1,0 +1,56 @@
+{
+  "schema": "camelid.evidence_bundle_manifest/v1",
+  "bundle": "catalog-expansion-20260809-head-4efe4920",
+  "date_utc": "2026-08-10",
+  "source_head": "4efe4920a2c191a4b906ef5513e048cff8b12ca6",
+  "checkout_state_before_real_model_runs": "clean",
+  "host": "macOS arm64, Apple M4, 16 GiB unified memory",
+  "models": [
+    {
+      "row_id": "mistral_nemo_instruct_2407_q4_k_m",
+      "repo_id": "MaziyarPanahi/Mistral-Nemo-Instruct-2407-GGUF",
+      "filename": "Mistral-Nemo-Instruct-2407.Q4_K_M.gguf",
+      "sha256": "5964f3e6d9c17b99e3d2174022048f3ec58b12ee8fefa987888e0562d070d52e",
+      "size_bytes": 7477204928,
+      "metadata": "architecture=llama; tokenizer.ggml.pre=tekken; context=1024000; Q4_K_M (Q4_K/Q6_K/F32)",
+      "gates": {
+        "tekken_tokenizer_and_admission": "pass: cargo test --release --lib tokenizer::tests::tekken_tokenizer_matches_pinned_oracle -- --ignored --nocapture",
+        "metal_generation": "pass: 8 tokens [6993,1046,6993,1395,1278,2725,23205,1718], text=' Paris. Paris is the most populous', peak RSS 4235755520",
+        "cpu_generation": "pass: 8 tokens [6993,1046,6993,1395,1278,12347,5970,1294], text=' Paris. Paris is the largest city in', peak RSS 7537606656",
+        "cross_backend": "hold: 5-token prefix identical; first divergence at generated index 5",
+        "llama_cpp_comparator": "blocked: installed llama-cli exited 139 on both default-Metal and bounded CPU (-ngl 0, ctx 512) attempts"
+      },
+      "catalog_status": "active_validation_not_supported"
+    },
+    {
+      "row_id": "qwen3_14b_q4_k_m",
+      "repo_id": "Qwen/Qwen3-14B-GGUF",
+      "filename": "Qwen3-14B-Q4_K_M.gguf",
+      "sha256": "500a8806e85ee9c83f3ae08420295592451379b4f8cf2d0f41c15dffeb6b81f0",
+      "size_bytes": 9001752960,
+      "metadata": "architecture=qwen3; tokenizer.ggml.pre=qwen2; context=40960; standard Qwen3 ChatML; Q4_K_M",
+      "gates": {
+        "metal_generation": "pass: 8 tokens [12095,13,3555,374,279,6722,315,279], text=' Paris. What is the capital of the', peak RSS 4529471488",
+        "cpu_generation": "pass: identical 8/8 token ids and text, peak RSS 8895070208",
+        "cross_backend": "pass: Metal == deterministic CPU, 8/8 greedy tokens",
+        "external_oracle_and_chat": "not run"
+      },
+      "catalog_status": "active_validation_not_supported"
+    },
+    {
+      "row_id": "deepseek_r1_0528_qwen3_8b_q4_k_m",
+      "repo_id": "unsloth/DeepSeek-R1-0528-Qwen3-8B-GGUF",
+      "filename": "DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf",
+      "sha256": "a86349a4180c4e6bb43f874c29c404fa2be3f90b15509bd6d86f697dba724ec1",
+      "size_bytes": 5027785216,
+      "metadata": "architecture=qwen3; tokenizer.ggml.pre=qwen2; context=131072 with YaRN factor 4; DeepSeek R1 marker template; Q4_K_M",
+      "gates": {
+        "metal_generation": "pass: bounded raw generation, 8 tokens [32671,563,4950,15920,3409,646,387,1483], peak RSS 3495149568",
+        "cpu_generation": "pass: bounded raw generation, 8 tokens [32671,563,624,785,6722,315,9625,374], peak RSS 5351653376",
+        "cross_backend": "hold: first divergence at generated index 2",
+        "chat_template": "hold: native <｜User｜>/<｜Assistant｜> R1 renderer and tool envelope are not implemented; existing qwen3 ChatML renderer must not be borrowed"
+      },
+      "catalog_status": "active_validation_not_supported"
+    }
+  ]
+}

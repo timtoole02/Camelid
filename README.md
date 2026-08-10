@@ -124,9 +124,13 @@ Run `camelid pull <id>` to download a model into `./models`. Pull IDs resolve by
 | **Qwen3 4B** | `Q8_0` | `qwen3` | 4.3 GB | `qwen3_4b_q8` | `Qwen3-4B-Q8_0.gguf` |
 | **Qwen3 4B** | `Q4_K_M` | `qwen3` | 2.5 GB | `qwen3_4b_q4` | `Qwen3-4B-Q4_K_M.gguf` |
 | **Qwen3 8B** | `Q8_0` | `qwen3` | 8.7 GB | `qwen3_8b` | `Qwen3-8B-Q8_0.gguf` |
+| **Qwen3 14B** *(active validation)* | `Q4_K_M` | `qwen3` | 9.0 GB | `qwen3_14b` | `Qwen3-14B-Q4_K_M.gguf` |
 | **Mistral 7B Instruct v0.3** | `Q8_0` | `llama` | 7.7 GB | `mistral` | `Mistral-7B-Instruct-v0.3-Q8_0.gguf` |
+| **Mistral Nemo Instruct 2407** *(validation hold)* | `Q4_K_M` | `llama` | 7.5 GB | `mistral_nemo` | `Mistral-Nemo-Instruct-2407.Q4_K_M.gguf` |
+| **LFM2.5 2.6B** | `Q8_0` | `lfm2` | 2.9 GB | `lfm2_5_2_6b` | `LFM2.5-2.6B-Q8_0.gguf` |
 | **Phi-3-mini-4k-instruct** | `Q8_0` | `phi3` | 4.1 GB | `phi3` | `Phi-3-mini-4k-instruct-Q8_0.gguf` |
 | **DeepSeek R1 Distill Qwen 7B** | `Q8_0` | `qwen25` | 8.1 GB | `distill_qwen` | `DeepSeek-R1-Distill-Qwen-7B-Q8_0.gguf` |
+| **DeepSeek R1 0528 Qwen3 8B** *(validation hold)* | `Q4_K_M` | `qwen3` | 5.0 GB | `deepseek_r1_0528` | `DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf` |
 | **DeepSeek R1 Distill Llama 8B** | `Q8_0` | `llama` | 8.5 GB | `distill_llama` | `DeepSeek-R1-Distill-Llama-8B-Q8_0.gguf` |
 | **Qwen2.5 Coder 7B** | `Q8_0` | `qwen25` | 8.1 GB | `qwen25_coder` | `qwen2.5-coder-7b-instruct-q8_0.gguf` |
 | **Cohere Command R v01** | `Q8_0` | `command-r` | 37.2 GB | `command_r` | `c4ai-command-r-v01-Q8_0.gguf` |
@@ -160,6 +164,9 @@ Selected validation highlight:
 | Model row | Quant | Evidence |
 |---|---|---|
 | Mistral 7B Instruct v0.3 | Q8_0 | Exact-row smoke + bounded context 512→8192 + GPU/CPU parity |
+| LFM2.5 2.6B | Q8_0 | Hash-pinned exact-row smoke; tokenizer/template parity and 96/96 greedy tokens vs llama.cpp |
+
+Mistral Nemo Q4_K_M, Qwen3 14B Q4_K_M, and DeepSeek-R1-0528-Qwen3-8B Q4_K_M are now downloadable catalog rows. They remain active-validation rows—not supported rows—until the explicit holds in [the expansion receipt](qa/evidence-bundles/catalog-expansion-20260809-head-4efe4920/README.md) are closed.
 
 ### Multimodal image chat
 

@@ -2,7 +2,7 @@
   "oracle": {
     "command": "llama-tokenize -m <gguf> -p <input> --ids --no-bos --no-escape --log-disable",
     "commit": "acd79d603cb2e1c84c0886137b80f1ad649b6857",
-    "model": "Mistral-Nemo-Instruct-2407-Q4_K_M.gguf",
+    "model": "Mistral-Nemo-Instruct-2407.Q4_K_M.gguf",
     "pre_tokenizer": "tekken"
   },
   "cases": [
