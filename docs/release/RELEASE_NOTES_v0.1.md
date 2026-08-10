@@ -16,15 +16,15 @@ The release gate in [`RELEASE_GATE_v0.1.md`](RELEASE_GATE_v0.1.md) is green for 
 
 - Rust GGUF backend and OpenAI-style local API surfaces.
 - React/Vite frontend that reflects the backend compatibility contract.
-- Exact-row v0.1 support ledger in [`SUPPORT_MATRIX_v0.1.md`](../../SUPPORT_MATRIX_v0.1.md), with broader background in [`COMPATIBILITY.md`](../../COMPATIBILITY.md).
-- Current support and blocker snapshot in [`STATUS.md`](../../STATUS.md).
+- Exact-row v0.1 support ledger in [`SUPPORT_MATRIX_v0.1.md`](../reference/SUPPORT_MATRIX_v0.1.md), with broader background in [`COMPATIBILITY.md`](../../COMPATIBILITY.md).
+- Current support and blocker snapshot in [`STATUS.md`](../reference/STATUS.md).
 - Committed benchmark snapshots in [`BENCHMARKS.md`](../benchmarks/BENCHMARKS.md), including same-host three-round comparator protocols against llama.cpp (Metal) and MLX-LM on the 1B/3B/8B Q8_0 rows, a decode-at-depth lane recorded as behind both comparators, and an explicit context-depth boundary on the prefill claims.
 - Public evidence-bundle checks for support-sensitive JSON artifacts.
 - Public scrub guard for private paths, host details, and legacy branding.
 
 ## Supported Public Claims
 
-Camelid v0.1 may claim exact-row support only where [`SUPPORT_MATRIX_v0.1.md`](../../SUPPORT_MATRIX_v0.1.md) cites row-specific evidence:
+Camelid v0.1 may claim exact-row support only where [`SUPPORT_MATRIX_v0.1.md`](../reference/SUPPORT_MATRIX_v0.1.md) cites row-specific evidence:
 
 - `TinyLlama 1.1B Chat Q8_0`: verified support gate.
 - `Llama 3.2 1B Instruct Q8_0`: verified bounded support.
@@ -54,7 +54,7 @@ Camelid v0.1 must not claim:
 Primary public docs:
 
 - [`COMPATIBILITY.md`](../../COMPATIBILITY.md)
-- [`STATUS.md`](../../STATUS.md)
+- [`STATUS.md`](../reference/STATUS.md)
 - [`BENCHMARKS.md`](../benchmarks/BENCHMARKS.md)
 - [`PARITY.md`](../benchmarks/PARITY.md)
 - [`qa/evidence-bundles/README.md`](../../qa/evidence-bundles/README.md)

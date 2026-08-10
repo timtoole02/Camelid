@@ -1,6 +1,6 @@
 # MUSTER Roster — Phase 0 (Gate 0)
 
-Campaign: [`MUSTER_CONDUCTOR.md`](MUSTER_CONDUCTOR.md). Phase 0 enumeration performed live against a fresh `--features cuda` release build of clean public `main` @ `cd528cacf6d707e3678155e53804cac7b5f2cfa3` (2026-07-15).
+Campaign: [`MUSTER_CONDUCTOR.md`](./MUSTER_CONDUCTOR.md). Phase 0 enumeration performed live against a fresh `--features cuda` release build of clean public `main` @ `cd528cacf6d707e3678155e53804cac7b5f2cfa3` (2026-07-15).
 
 **Status: awaiting Gate 0 — Tim reviews, strikes or adds rows; the struck roster is then frozen for the campaign.**
 

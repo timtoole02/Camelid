@@ -9,7 +9,7 @@ the model.
 This page is about closing that gap. Two pieces:
 
 - **Parity receipts** — a per-request, sealed, independently re-verifiable
-  record of what was computed. See [`../RECEIPTS.md`](../RECEIPTS.md).
+  record of what was computed. See [`../RECEIPTS.md`](./reference/RECEIPTS.md).
 - **The conformance suite** — `tools/conformance/run.mjs`, which measures any
   set of runtimes by one ruler. See
   [`../tools/conformance/README.md`](../tools/conformance/README.md).

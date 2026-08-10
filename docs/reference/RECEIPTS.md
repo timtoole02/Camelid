@@ -11,8 +11,8 @@ than this, that is a bug.
 
 1. **A receipt proves one request matched the reference — it is NOT a support promotion.**
    A green receipt for some prompt on some model does not make that model "supported."
-   Support lives in the release ledger ([`README.md`](README.md),
-   [`COMPATIBILITY.md`](COMPATIBILITY.md), [`STATUS.md`](STATUS.md)) and is unchanged by
+   Support lives in the release ledger ([`README.md`](../../README.md),
+   [`COMPATIBILITY.md`](../../COMPATIBILITY.md), [`STATUS.md`](./STATUS.md)) and is unchanged by
    receipts. A receipt's envelope is exactly one request on exactly one GGUF, byte-identified
    by hash. Support does not spread by resemblance.
 

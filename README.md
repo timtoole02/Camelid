@@ -2,7 +2,7 @@
 
 # 🐪 Camelid
 
-**Run supported GGUF language and vision models locally with a Rust-native engine.**
+**Run supported GGUF language, vision, and embedding models locally with a Rust-native engine.**
 
 Desktop app, browser chat, terminal UI, and an OpenAI-compatible API—all backed by the same local runtime.
 
@@ -24,7 +24,7 @@ Camelid loads GGUF models and runs inference on your hardware. Its tokenizer, mo
 
 ## What is Camelid?
 
-Camelid is an open-source, Rust-native local AI inference engine for running supported GGUF large language models (LLMs) and vision-language models (VLMs) on Windows, macOS, and Linux. Use it as a desktop app, a browser-based local AI chat interface, a terminal application, or a self-hosted OpenAI-compatible API for your own tools and applications.
+Camelid is an open-source, Rust-native local AI inference engine for running supported GGUF large language models (LLMs), vision-language models (VLMs), and embedding models on Windows, macOS, and Linux. Use it as a desktop app, a browser-based local AI chat interface, a terminal application, or a self-hosted OpenAI-compatible API for your own tools and applications.
 
 Model inference runs on your hardware, with CPU execution, Apple Silicon Metal acceleration, and NVIDIA CUDA acceleration available within the documented support boundaries. Camelid is designed for private local AI chat, offline inference after model download, GGUF model testing, and local LLM application development without a Python, Node.js, or Docker runtime.
 
@@ -34,6 +34,7 @@ Model inference runs on your hardware, with CPU execution, Apple Silicon Metal a
 - **One engine, several interfaces.** Use the desktop app, browser chat, terminal UI, or HTTP API.
 - **Simple distribution.** The engine and web UI ship together as one binary.
 - **Hardware acceleration.** Use Metal on Apple Silicon, CUDA on supported NVIDIA paths, or CPU fallback.
+- **Developer APIs.** Build against chat, Responses, embeddings, reranking, and structured-output endpoints.
 - **Evidence-backed compatibility.** Support applies to exact model files and quantizations validated against a pinned llama.cpp reference.
 
 ## Quick start
@@ -92,6 +93,7 @@ Good starting points:
 |---|---|---|
 | Smallest end-to-end test (~1.2 GB) | TinyLlama 1.1B Chat Q8_0 | `tinyllama` |
 | **Recommended first model** | Llama 3.2 3B Instruct Q8_0 | `3b_instruct_q8` |
+| Local embeddings and semantic retrieval | Nomic Embed Text v1.5 Q8_0 | `nomic` |
 | Fits a 16 GB Apple Silicon Mac | Mistral 7B Instruct v0.3 Q8_0 | `mistral` |
 | Reasoning and coding on a small budget | Qwen3 4B Q4_K_M | `qwen3_4b_q4` |
 | Compact PrismML GPU model | Bonsai 4B Q1_0 | `bonsai_4b_q1` |
@@ -103,6 +105,7 @@ Run `camelid pull <id>` to download a model into `./models`. Pull IDs resolve by
 
 | Model | Quant | Arch | Size | Pull ID | GGUF file |
 |---|---|---|---:|---|---|
+| **Nomic Embed Text v1.5** | `Q8_0` | `nomic-bert` | 0.15 GB | `nomic` | `nomic-embed-text-v1.5.Q8_0.gguf` |
 | **TinyLlama 1.1B Chat** | `Q8_0` | `llama` | 1.2 GB | `tinyllama` | `tinyllama-1.1b-chat-v1.0.Q8_0.gguf` |
 | **Llama 3.2 1B Instruct** | `Q8_0` | `llama` | 1.3 GB | `1b_instruct_q8` | `Llama-3.2-1B-Instruct-Q8_0.gguf` |
 | **Llama 3.2 1B Instruct** | `IQ4_XS` | `llama` | 0.7 GB | `iq4_xs` | `Llama-3.2-1B-Instruct-IQ4_XS.gguf` |
@@ -148,8 +151,8 @@ live in [docs/runtime/ghost-mode.md](docs/runtime/ghost-mode.md#ghost-moe-v2-gem
 The full catalog, exact hashes, supported execution paths, and claim boundaries live in:
 
 - [COMPATIBILITY.md](COMPATIBILITY.md)—authoritative supported-row ledger
-- [SUPPORT_MATRIX_v0.1.md](SUPPORT_MATRIX_v0.1.md)—per-row support boundaries
-- [RECEIPTS.md](RECEIPTS.md)—reproducible validation receipts
+- [SUPPORT_MATRIX_v0.1.md](./docs/reference/SUPPORT_MATRIX_v0.1.md)—per-row support boundaries
+- [RECEIPTS.md](./docs/reference/RECEIPTS.md)—reproducible validation receipts
 - [benchmarks](docs/benchmarks/BENCHMARKS.md)—recorded performance measurements
 
 Selected validation highlight:
@@ -158,13 +161,17 @@ Selected validation highlight:
 |---|---|---|
 | Mistral 7B Instruct v0.3 | Q8_0 | Exact-row smoke + bounded context 512→8192 + GPU/CPU parity |
 
-### PrismML Bonsai and vision
+### Multimodal image chat
 
-Seven hash-pinned PrismML Bonsai GGUFs are supported on Apple Silicon Metal and Windows x86_64 CUDA: 4B Q1/Q2/PQ2, 8B Q1/Q2, and 27B Q1/Q2. Both 27B rows support PNG/JPEG input in browser chat and the API when paired with the Qwen3-VL projector.
+Seven hash-pinned PrismML Bonsai GGUFs are supported on Apple Silicon Metal and Windows x86_64 CUDA: 4B Q1/Q2/PQ2, 8B Q1/Q2, and 27B Q1/Q2. Both 27B rows support multimodal PNG/JPEG input in browser chat and OpenAI-compatible Chat Completions when paired with the Qwen3-VL projector.
 
 The **Arch** column reports what each GGUF declares in `general.architecture`, so it is not uniform across this family: the 4B and 8B files declare `qwen3` and only the 27B files declare `qwen35`. The two labels bind different engines, so the split is real rather than a typo.
 
 The desktop **Models** page downloads the projector automatically with either 27B model. For a CLI installation, place `Ternary-Bonsai-27B-mmproj-Q8_0.gguf` beside the model GGUF or set `CAMELID_MMPROJ`, then run `camelid serve` normally. See [COMPATIBILITY.md](COMPATIBILITY.md) for the exact artifacts and validated scope.
+
+### Embeddings and reranking
+
+The exact Nomic Embed Text v1.5 Q8_0 row supports OpenAI-compatible `/v1/embeddings`, Matryoshka dimensions, cosine-similarity reranking through `/v1/rerank`, and optional in-memory semantic retrieval for Workspace. The encoder currently runs on CPU; other embedding families and quantizations fail closed. See the [embedding API guide](docs/architecture/EMBEDDINGS.md) for loading and request examples.
 
 ## Ways to use Camelid
 
@@ -173,7 +180,7 @@ The desktop **Models** page downloads the projector automatically with either 27
 | **Desktop app** | Install from [Quick start](#quick-start) | Native app with bundled engine |
 | **Browser chat** | `camelid serve --model <gguf>` | Everyday local chat |
 | **Terminal UI** | `camelid chat` | Shell and SSH workflows |
-| **HTTP API** | Start `camelid serve` | Integrating local inference into apps |
+| **HTTP API** | Start `camelid serve` | Chat, image input, embeddings, and reranking |
 | **Agent mode** | `camelid chat --agent --model <gguf>` | Approval-gated tools in a repository |
 | **Workspace** (preview) | Open **Workspace** in the web UI | Read-only analysis of a local folder |
 
@@ -194,13 +201,13 @@ curl http://127.0.0.1:8181/v1/chat/completions \
   }'
 ```
 
-Camelid also supports `/v1/responses`, streaming, local function tools, structured text formats, conversations, and optional local SQLite storage. The machine-readable route and feature inventory is available from `/api/capabilities`.
+Camelid also supports `/v1/responses`, `/v1/embeddings`, `/v1/rerank`, streaming, local image input on supported VLM rows, function tools, structured text formats, conversations, and optional local SQLite storage. The machine-readable route and feature inventory is available from `/api/capabilities`.
 
 ## Platform support
 
 | Platform | Distribution | Acceleration |
 |---|---|---|
-| Windows x86_64 | Desktop installer, portable app, engine archive | CUDA on validated paths; CPU fallback |
+| Windows x86_64 | Desktop installer, portable app, engine archive | Supported CUDA exact-row paths; CPU fallback |
 | macOS Apple Silicon | Desktop DMG or engine archive | Metal and CPU |
 | Linux x86_64 | Engine archive | CUDA compiled in; CPU fallback |
 

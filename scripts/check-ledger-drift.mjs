@@ -186,7 +186,7 @@ async function checkSha256(committed) {
   if (!canonicalByFile.size) { info('sha256 agreement: no ledger-anchored full sha256 to check'); return }
   const knownShas = new Set([...canonicalByFile.values()].map((v) => v.sha))
   let verified = 0
-  for (const rel of ['README.md', 'COMPATIBILITY.md', 'STATUS.md', join('src', 'api', 'mod.rs')]) {
+  for (const rel of ['README.md', 'COMPATIBILITY.md', join('docs', 'reference', 'STATUS.md'), join('src', 'api', 'mod.rs')]) {
     const p = join(ROOT, rel)
     if (!(await exists(p))) continue
     const { verified: v, findings } = shaFindings(rel, await readFile(p, 'utf8'), canonicalByFile, knownShas)
@@ -197,7 +197,7 @@ async function checkSha256(committed) {
 }
 
 // --- Check E: durable evidence anchors have a single home ------------------
-// CAIRN Phase 5 made STATUS.md the canonical anchor index and collapsed the
+// CAIRN Phase 5 made docs/reference/STATUS.md the canonical anchor index and collapsed the
 // COMPATIBILITY.md section to a pointer. Keep it that way: the anchor bundle
 // list must not be re-duplicated into COMPATIBILITY.md.
 async function checkAnchorsSingleHome() {
@@ -209,8 +209,8 @@ async function checkAnchorsSingleHome() {
   let e = md.length
   for (let i = s + 1; i < md.length; i++) if (/^## /.test(md[i])) { e = i; break }
   const count = (md.slice(s, e).join('\n').match(/qa\/evidence-bundles/g) || []).length
-  if (count > 0) fail(`COMPATIBILITY.md "Durable evidence anchors" re-lists ${count} evidence bundle(s); the canonical index is STATUS.md — keep it a pointer (CAIRN Phase 5)`)
-  else info('anchors single-home: COMPATIBILITY.md anchors is a pointer; the index lives only in STATUS.md')
+  if (count > 0) fail(`COMPATIBILITY.md "Durable evidence anchors" re-lists ${count} evidence bundle(s); the canonical index is docs/reference/STATUS.md — keep it a pointer (CAIRN Phase 5)`)
+  else info('anchors single-home: COMPATIBILITY.md anchors is a pointer; the index lives only in docs/reference/STATUS.md')
 }
 
 // ---------------------------------------------------------------------------

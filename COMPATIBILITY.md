@@ -150,18 +150,21 @@ Support rows are model-exact and do not spread across platforms any more than th
   - **Comparator caveat:** the Windows comparator is the on-disk **llama.cpp `9632` (`acd79d603`)**, NOT the **`5d56eff`** pinned by the macOS/Ubuntu Qwen3 bundles. It is recorded in each manifest as the Windows platform comparator; this is a fresh per-platform parity claim, not bit-exact continuity with the `5d56eff` bundles.
   - **Not yet:** WebUI/frontend smoke on Windows, longer/model-native context (the macOS 1.7B 15,373-token large-context lane is not re-proven on Windows), thinking-mode, and a clean-checkout reseal (these bundles were generated with the support diff uncommitted — see each manifest `checkout_note`).
 
-The Windows port is implementation-level only and behind `#[cfg(...)]` guards: file-backed Q8_0 reads use a Windows positioned read (`seek_read`) in place of `pread`/`read_exact_at`, and the GGUF wire mapping uses `memmap2` in place of the Unix `mmap`. The macOS/Ubuntu paths are unchanged. The token-major `output.weight` interpretation is a GGUF file-layout requirement and is identical on Windows.
+The Windows filesystem path uses positioned `seek_read` for file-backed Q8_0 reads in place of `pread`/`read_exact_at`, and `memmap2` for GGUF wire mapping in place of Unix `mmap`. The macOS/Ubuntu paths are unchanged. The token-major `output.weight` interpretation is a GGUF file-layout requirement and is identical on Windows.
 
-**Not a Windows claim yet:**
+**Remaining Windows CPU boundaries:**
 
 - Direct Windows-vs-llama.cpp parity artifacts for the Llama 3.2 1B/3B and other exact rows. TinyLlama and the four Qwen3 dense Q8_0 rows (0.6B/1.7B/4B/8B) carry Windows parity bundles today; the Llama 3.2 1B/3B Windows CPU lanes generate correctly and agree with the GPU lane, but their Windows parity bundles are still follow-up.
-- Performance, throughput, or packaging on Windows. (The Qwen3 rows run on the AVX2 x86_q8 path, but no Windows throughput number is claimed.)
+- Portable Windows CPU performance or throughput. The Qwen3 rows run on the AVX2 x86_q8 path, but no cross-hardware throughput number is claimed; release packaging is documented separately and does not widen model compatibility.
 
-**Windows CUDA status.** Windows CUDA is experimental. Any evidence is limited to the named exact
-rows and the recorded GPU, driver, and CUDA version; it does not establish general Windows-CUDA
-token parity or a throughput claim.
+**Windows CUDA status.** Windows CUDA is a supported acceleration path for the exact rows explicitly
+marked as Windows CUDA supported in this ledger, including the validated dense Qwen3, named Llama
+K-quant, and PrismML Bonsai rows. Support remains bounded to the named artifacts and recorded
+hardware envelopes; it is not a blanket claim for arbitrary GGUF files, NVIDIA GPUs, drivers, or
+CUDA versions. Unlisted execution paths remain experimental or unsupported, and no general
+Windows-CUDA throughput claim is implied.
 
-**Windows CUDA — dense Qwen3 Q8_0 rows validated (GPU-specific); experimental beyond the recorded GPU.** The CUDA backend is compiled into the DEFAULT build on Windows and x86_64 Linux (other targets keep it opt-in via `cargo build --features cuda`; macOS uses Metal). Compiling the path in is a build-wiring fact, not a support claim: every validated row below was recorded on the Windows GPU named with it, and running the same path on Linux does not extend those parity claims to that host. It runs the whole decode forward on an NVIDIA GPU via from-scratch NVRTC kernels (no vendored llama.cpp): a GPU-resident decode engine that uploads weights once and caches them across requests, single-shot GPU prefill, on-device greedy/temperature sampling, and a lossless n-gram speculative-decode path. The per-kernel GPU tests are bit-identical to the CPU dot, and the resident prefill / batched-verify / full-forward paths carry GPU device tests.
+**Windows CUDA detail — dense Qwen3 Q8_0 rows (GPU-specific).** The CUDA backend is compiled into the DEFAULT build on Windows and x86_64 Linux (other targets keep it opt-in via `cargo build --features cuda`; macOS uses Metal). Compiling the path in is a build-wiring fact, not a support claim: every validated row below was recorded on the Windows GPU named with it, and running the same path on Linux does not extend those parity claims to that host. It runs the whole decode forward on an NVIDIA GPU via from-scratch NVRTC kernels (no vendored llama.cpp): a GPU-resident decode engine that uploads weights once and caches them across requests, single-shot GPU prefill, on-device greedy/temperature sampling, and a lossless n-gram speculative-decode path. The per-kernel GPU tests are bit-identical to the CPU dot, and the resident prefill / batched-verify / full-forward paths carry GPU device tests.
 
 - **TinyLlama** on an RTX 3060: token-identical to the CPU/llama.cpp reference (direct parity audit, prompt + generated text + 50-token stream match, `first_divergent_token_index=-1`), including when dense per-token diagnostics force the decode onto the CPU path — the GPU prefill mirrors its KV cache back to host so the CPU and GPU KV histories stay in lockstep.
 
@@ -171,7 +174,7 @@ Caveats. Results are **specific to the recorded GPU / driver / CUDA version** �
 
 ## Durable evidence anchors
 
-The canonical durable evidence-anchor index is maintained in one place — [`STATUS.md` → Durable evidence anchors](STATUS.md#durable-evidence-anchors) — so the bundle list cannot drift across two files (CAIRN Phase 5). See that section for the full set of committed evidence-bundle and validation-note pointers.
+The canonical durable evidence-anchor index is maintained in one place — [`STATUS.md` → Durable evidence anchors](./docs/reference/STATUS.md#durable-evidence-anchors) — so the bundle list cannot drift across two files (CAIRN Phase 5). See that section for the full set of committed evidence-bundle and validation-note pointers.
 
 ## Current release ledger
 

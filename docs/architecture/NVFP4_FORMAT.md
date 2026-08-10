@@ -3,7 +3,7 @@
 > [!NOTE]
 > This is a **format spec, NOT a support claim**; adding a format here never implies support,
 > parity promotion, or a catalog claim. For current support truth and release status, use
-> [`COMPATIBILITY.md`](../../COMPATIBILITY.md) and [`STATUS.md`](../../STATUS.md). NVFP4 is
+> [`COMPATIBILITY.md`](../../COMPATIBILITY.md) and [`STATUS.md`](../reference/STATUS.md). NVFP4 is
 > shipped as engine facts for the `gemma-4-E4B-it` pilot only and is **not** a supported or
 > certified row; see the [Support status](#support-status) section for the honest boundary.
 

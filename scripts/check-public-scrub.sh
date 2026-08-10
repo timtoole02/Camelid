@@ -55,7 +55,7 @@ branding_pattern='backendinference|BackendInference|backend inference'
 branding_matches=$(git grep -n -I -E "$branding_pattern" -- \
   README.md \
   COMPATIBILITY.md \
-  STATUS.md \
+  docs/reference/STATUS.md \
   ROADMAP.md \
   docs \
   ':!docs/archive/STATUS_ARCHIVE_2026-04.md' \
@@ -72,9 +72,9 @@ stale_validation_lane_pattern='remote validation is available again|remote runti
 stale_validation_lane_matches=$(git grep -n -I -E "$stale_validation_lane_pattern" -- \
   README.md \
   COMPATIBILITY.md \
-  STATUS.md \
+  docs/reference/STATUS.md \
   ROADMAP.md \
-  FULL_SUPPORT_BLOCKER_MATRIX.md \
+  docs/archive/campaigns/FULL_SUPPORT_BLOCKER_MATRIX.md \
   docs \
   frontend/README.md \
   qa/validation-notes \
@@ -88,9 +88,9 @@ local_bundle_pattern='qa/evidence-bundles/(backend-local|local-|tpm-local-)'
 local_bundle_matches=$(git grep -n -I -E "$local_bundle_pattern" -- \
   README.md \
   COMPATIBILITY.md \
-  STATUS.md \
+  docs/reference/STATUS.md \
   ROADMAP.md \
-  FULL_SUPPORT_BLOCKER_MATRIX.md \
+  docs/archive/campaigns/FULL_SUPPORT_BLOCKER_MATRIX.md \
   docs \
   frontend/README.md \
   frontend/src \
