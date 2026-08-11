@@ -28249,8 +28249,14 @@ async fn local_models(
                         chat_capable: false,
                         context_length: None,
                     };
-                    match read_metadata(&path) {
-                        Ok(gguf) => {
+                    let metadata_path = path.clone();
+                    let parsed = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        tokio::task::spawn_blocking(move || read_metadata(&metadata_path)),
+                    )
+                    .await;
+                    match parsed {
+                        Ok(Ok(Ok(gguf))) => {
                             let quant = crate::runnable::headline_quant_of(&gguf);
                             c.quantization = Some(quant.clone());
                             // Model capabilities (system-independent): a chat template
@@ -28281,7 +28287,18 @@ async fn local_models(
                                 }
                             }
                         }
-                        Err(err) => c.admission_reason = Some(format!("GGUF parse failed: {err}")),
+                        Ok(Ok(Err(err))) => {
+                            c.admission_reason = Some(format!("GGUF parse failed: {err}"));
+                        }
+                        Ok(Err(err)) => {
+                            c.admission_reason = Some(format!("GGUF metadata task failed: {err}"));
+                        }
+                        Err(_) => {
+                            c.admission_reason = Some(
+                                "GGUF metadata scan timed out; removable-volume access may still need approval"
+                                    .to_string(),
+                            );
+                        }
                     }
                     local_meta_cache()
                         .lock()

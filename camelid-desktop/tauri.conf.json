@@ -18,9 +18,7 @@
         "minHeight": 560,
         "center": true,
         "backgroundColor": "#0e1216",
-        "url": "index.html",
-        "titleBarStyle": "Overlay",
-        "hiddenTitle": true
+        "url": "index.html"
       }
     ],
     "security": {
