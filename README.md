@@ -193,6 +193,26 @@ The desktop **Models** page downloads the projector automatically with either 27
 
 The exact Nomic Embed Text v1.5 Q8_0 row supports OpenAI-compatible `/v1/embeddings`, Matryoshka dimensions, cosine-similarity reranking through `/v1/rerank`, and optional in-memory semantic retrieval for Workspace. The encoder currently runs on CPU; other embedding families and quantizations fail closed. See the [embedding API guide](docs/architecture/EMBEDDINGS.md) for loading and request examples.
 
+### Experimental MiniMax H3 video
+
+Camelid has an experimental **Video Studio** UI and CLI lane for local MiniMax H3
+video generation through an H3-capable `stable-diffusion.cpp` backend. It supports
+text, initial/final-frame, and reference-conditioned WebM/AVI generation with
+optional native stereo audio. The UI queues long jobs asynchronously, reports
+bundle download progress, and plays completed WebM clips.
+The default four-part bundle is about 25.13 GiB and is downloaded only after an
+explicit MiniMax-H3 Community License acknowledgement.
+
+```bash
+camelid video pull --variant fl2va --accept-license
+camelid video doctor --variant fl2va --verify-sha256
+camelid video generate --prompt "a red panda in a misty forest, cinematic" --output panda.webm
+```
+
+This is a capability-checked external backend bridge, not yet a Camelid-native or
+parity-certified video runtime. See the [MiniMax H3 video guide](docs/runtime/minimax-h3-video.md)
+for backend setup, hardware caveats, reference-media commands, and the exact support boundary.
+
 ## Ways to use Camelid
 
 | Interface | Start it with | Best for |
@@ -203,6 +223,8 @@ The exact Nomic Embed Text v1.5 Q8_0 row supports OpenAI-compatible `/v1/embeddi
 | **HTTP API** | Start `camelid serve` | Chat, image input, embeddings, and reranking |
 | **Agent mode** | `camelid chat --agent --model <gguf>` | Approval-gated tools in a repository |
 | **Workspace** (preview) | Open **Workspace** in the web UI | Read-only analysis of a local folder |
+| **Video Studio** (experimental) | Open **Video Studio** in the web UI | Queue and preview local MiniMax H3 videos |
+| **Video CLI** (experimental) | `camelid video generate` | Local MiniMax H3 video/audio generation |
 
 Agent mode confines file tools to a workspace root and keeps network access off unless enabled. Workspace is read-only and resumable. Both require a model marked `tool_capable` in the compatibility ledger. Review the [agent documentation](DOCS.md) and every requested action before enabling additional tools or network access.
 

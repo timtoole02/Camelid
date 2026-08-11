@@ -9,6 +9,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 const VIEW_LABELS = [
   ['chat', 'Chat'],
   ['workspace', 'Workspace'],
+  ['video', 'Video Studio'],
   ['library', 'Models'],
   ['history', 'Chat history'],
   ['analytics', 'Analytics'],

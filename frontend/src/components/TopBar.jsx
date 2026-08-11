@@ -9,6 +9,7 @@ import { CamelidMark } from './ui/CamelidMark'
 const TITLES = {
   chat: 'Chat',
   workspace: 'Workspace',
+  video: 'Video Studio',
   library: 'Models',
   downloads: 'Downloaded models',
   api: 'API',

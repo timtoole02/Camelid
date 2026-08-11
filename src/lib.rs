@@ -33,6 +33,7 @@ pub mod hf_tokenizer_json;
 pub mod inference;
 pub mod kv_equivalence;
 pub mod metal;
+pub mod minimax_h3;
 pub mod model;
 pub mod model_default;
 pub mod model_source;

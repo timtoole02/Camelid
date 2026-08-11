@@ -48,6 +48,7 @@ These documents are working notes, not support ledgers. When a note and a public
 - [`ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md)
 - [`STRUCTURED_OUTPUTS.md`](docs/architecture/STRUCTURED_OUTPUTS.md) — LLGuidance JSON Schema and CFG constrained decoding contract
 - [`EMBEDDINGS.md`](docs/architecture/EMBEDDINGS.md) — exact-row encoder, embedding/reranking APIs, and Workspace semantic retrieval contract
+- [`minimax-h3-video.md`](docs/runtime/minimax-h3-video.md) — experimental MiniMax H3 bundle download, backend setup, Video Studio, local job API, and CLI
 - [`WORKSPACE_CLI.md`](docs/architecture/WORKSPACE_CLI.md) — durable read-only Workspace commands and the same-user loopback authentication contract
 - [`SPECULATIVE_DECODE.md`](docs/architecture/SPECULATIVE_DECODE.md) — default-off lossless greedy speculation: proven byte-exact, faster than the default stack on repetitive output (measured envelope inside), CPU-vanilla floor elsewhere
 - [`FORGELOCAL_INTEGRATION.md`](docs/architecture/FORGELOCAL_INTEGRATION.md)

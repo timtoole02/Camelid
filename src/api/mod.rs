@@ -35,6 +35,7 @@ mod metrics;
 mod responses;
 mod responses_store;
 mod server;
+mod video;
 mod workspace;
 
 pub use server::ServeOptions;
@@ -173,6 +174,9 @@ pub struct AppState {
     /// idempotency key) are serialized through a process-local keyed lock.
     responses_locks: responses_store::ResponseLockPool,
     workspace_sessions: workspace::WorkspaceSessionManager,
+    /// Bounded asynchronous MiniMax-H3 video queue. Video generation is an
+    /// isolated external-backend lane and never enters the text decode worker.
+    video_jobs: video::VideoJobManager,
     /// Process-rotated bearer capability for same-user Workspace CLI clients.
     /// Browser requests continue to use the independent same-origin predicate.
     workspace_cli_token: Option<Arc<str>>,
@@ -241,6 +245,7 @@ impl Default for AppState {
             responses_store: responses_store::ResponsesStore::default(),
             responses_locks: responses_store::ResponseLockPool::default(),
             workspace_sessions: workspace::WorkspaceSessionManager::default(),
+            video_jobs: video::VideoJobManager::default(),
             workspace_cli_token: None,
             serve_addr: SocketAddr::from(([127, 0, 0, 1], 8181)),
             engine: engine::EngineHandle::spawn(),
@@ -2465,6 +2470,15 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
             get(generation_sessions).post(create_generation_session),
         )
         .route("/api/generation/preflight", post(preflight_generation))
+        .route("/api/video/capabilities", get(video::capabilities))
+        .route(
+            "/api/video/jobs",
+            get(video::list_jobs).post(video::create_job),
+        )
+        .route("/api/video/jobs/:id", get(video::get_job))
+        .route("/api/video/jobs/:id/cancel", post(video::cancel_job))
+        .route("/api/video/jobs/:id/content", get(video::job_content))
+        .route("/api/video/jobs/:id/log", get(video::job_log))
         .route(
             "/api/agent/workspace/models",
             get(workspace::compatible_models),
@@ -32917,8 +32931,14 @@ async fn local_models(
                         generation_capable: false,
                         context_length: None,
                     };
-                    match read_metadata(&path) {
-                        Ok(gguf) => {
+                    let metadata_path = path.clone();
+                    let parsed = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        tokio::task::spawn_blocking(move || read_metadata(&metadata_path)),
+                    )
+                    .await;
+                    match parsed {
+                        Ok(Ok(Ok(gguf))) => {
                             c.embedding_capable = is_embedding_model(&gguf);
                             c.generation_capable = is_generation_model(&gguf);
                             let quant = crate::runnable::headline_quant_of(&gguf);
@@ -32951,7 +32971,18 @@ async fn local_models(
                                 }
                             }
                         }
-                        Err(err) => c.admission_reason = Some(format!("GGUF parse failed: {err}")),
+                        Ok(Ok(Err(err))) => {
+                            c.admission_reason = Some(format!("GGUF parse failed: {err}"));
+                        }
+                        Ok(Err(err)) => {
+                            c.admission_reason = Some(format!("GGUF metadata task failed: {err}"));
+                        }
+                        Err(_) => {
+                            c.admission_reason = Some(
+                                "GGUF metadata scan timed out; removable-volume access may still need approval"
+                                    .to_string(),
+                            );
+                        }
                     }
                     local_meta_cache()
                         .lock()
