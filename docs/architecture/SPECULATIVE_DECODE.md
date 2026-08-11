@@ -109,4 +109,4 @@ Performance claims stay bounded to the measured rows above; the flag stays defau
 
 Enabling speculation never changes which rows are supported. A speculative generation on an
 unsupported lane is still unsupported; a verified receipt from a speculative run proves that
-one request only, exactly as receipts always do ([`RECEIPTS.md`](../../RECEIPTS.md)).
+one request only, exactly as receipts always do ([`RECEIPTS.md`](../reference/RECEIPTS.md)).

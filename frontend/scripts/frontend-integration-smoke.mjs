@@ -863,7 +863,10 @@ try {
      above), so the invariant keeps its teeth. */
   assert.match(neighboringQuantPathChatMarkup, /Llama 3\.2 3B Instruct Q8_0 isn(?:&#x27;|')t verified for chat yet\./, '3B neighboring-quant chat UX should expose runtime-green state without claiming support')
   assert.match(neighboringQuantPathChatMarkup, /data-send-ready="false" title="Choose a verified model to send\."/, '3B neighboring-quant chat UX should name the exact row mismatch instead of showing ready chat')
-  assert.match(neighboringQuantPathChatMarkup, /This model isn(?:&#x27;|')t verified for chat yet\. Pick a verified model to unlock send\./, '3B neighboring-quant chat UX should explain that the loaded artifact quant does not match the support contract row')
+  /* Restored (2026-08): the quant mismatch names both sides again, so a reader
+     one re-download away is told which build to get instead of just "pick a
+     verified model". */
+  assert.match(neighboringQuantPathChatMarkup, /this build is Q4_0 and the verified build is Q8_0/, '3B neighboring-quant chat UX should name the loaded quant and the verified one')
   assert.doesNotMatch(neighboringQuantPathChatMarkup, /Local chat is ready|Message Camelid…|data-send-ready="true"/, '3B neighboring-quant rows must not render the live-chat ready UX')
 
   const backendReadyButUnsupported3BCapabilities = {

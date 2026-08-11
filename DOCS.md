@@ -16,11 +16,11 @@ Read these first:
 
 - [`README.md`](README.md) — product overview, milestone story, and current exact-row support table
 - [`COMPATIBILITY.md`](COMPATIBILITY.md) — authoritative support ledger and at-a-glance release contract
-- [`STATUS.md`](STATUS.md) — current milestone/evidence snapshot and exact blockers
+- [`STATUS.md`](./docs/reference/STATUS.md) — current milestone/evidence snapshot and exact blockers
 - [`BENCHMARKS.md`](docs/benchmarks/BENCHMARKS.md) — public performance snapshot and benchmark-claim rules
 - [`docs/WAR_ROOM_EVIDENCE_INDEX.md`](docs/WAR_ROOM_EVIDENCE_INDEX.md) — war-room claim-source order, evidence index, and public wording policy
 - [`PARITY.md`](docs/benchmarks/PARITY.md) — exact-row parity proof map and audit trail
-- [`RECEIPTS.md`](RECEIPTS.md) — verifiable single-request parity receipts; a receipt never changes the support ledger
+- [`RECEIPTS.md`](./docs/reference/RECEIPTS.md) — verifiable single-request parity receipts; a receipt never changes the support ledger
 - [`docs/CONFORMANCE.md`](docs/CONFORMANCE.md) — cross-runtime conformance: determinism, agreement, tokenizer parity, provability; methodology and current findings
 - [`docs/TELEMETRY.md`](docs/TELEMETRY.md) — live inference telemetry stream (`/api/telemetry/stream`): event schema, truthfulness contract, lane coverage; drives the UI's Inference Observatory
 - [`ROADMAP.md`](ROADMAP.md) — phase-level plan of record
@@ -33,12 +33,9 @@ Read these first:
 - [`docs/VALIDATION_MATRIX.md`](docs/VALIDATION_MATRIX.md) — expected checks by change class
 - [`SECURITY.md`](SECURITY.md) — security reporting guidance
 - [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) — acknowledgements and license notices
-- [`DROVER_RECON.md`](DROVER_RECON.md) — the agent-mode campaign record: recon, gate ledger, amendment log
-- [`DECISIONS.md`](DECISIONS.md) — the live decision log (D1–D20, including D20's routing invariants for windowed-attention architectures; `docs/architecture/DECISIONS.md` is the frozen early-phase log)
 
 ## QA and acceptance docs
 
-- [`FULL_SUPPORT_BLOCKER_MATRIX.md`](FULL_SUPPORT_BLOCKER_MATRIX.md) — four-row full-support owner matrix with exact missing evidence by row
 - [`QA_SMALL_MODEL_PARITY_MATRIX.md`](docs/release/QA_SMALL_MODEL_PARITY_MATRIX.md) — current small-model QA matrix
 - [`QA_LLAMA32_3B_Q8_ACCEPTANCE.md`](docs/release/QA_LLAMA32_3B_Q8_ACCEPTANCE.md) — exact 3B acceptance checklist
 - [`qa/evidence-bundles/README.md`](qa/evidence-bundles/README.md) — sanitized public evidence-bundle map, including the reopened-lane API/WebUI and bounded 8B broader/template/context summaries
@@ -67,3 +64,4 @@ These documents are working notes, not support ledgers. When a note and a public
 
 - [`ROADMAP_ARCHIVE.md`](docs/archive/ROADMAP_ARCHIVE.md) — completed-phase history
 - [`STATUS_ARCHIVE_2026-04.md`](docs/archive/STATUS_ARCHIVE_2026-04.md) — detailed historical status log
+- [`campaigns/README.md`](docs/archive/campaigns/README.md) — internal recon, conductor, campaign, and decision records retained for historical traceability

@@ -1,8 +1,8 @@
 # MUSTER Phase 2 — Acquisition & anchoring
 
-Campaign: [`MUSTER_CONDUCTOR.md`](MUSTER_CONDUCTOR.md) §5. Executed 2026-07-16 on the Gate 1-signed tree (`main` merge `b80788c9`). Every SHA-256 below is the anchor **every later artifact must repeat verbatim**; upstream verification used the Hugging Face tree API (`lfs` size + sha256) — no model was run. Raw sidecars live under the gitignored Phase 2 run dir.
+Campaign: [`MUSTER_CONDUCTOR.md`](./MUSTER_CONDUCTOR.md) §5. Executed 2026-07-16 on the Gate 1-signed tree (`main` merge `b80788c9`). Every SHA-256 below is the anchor **every later artifact must repeat verbatim**; upstream verification used the Hugging Face tree API (`lfs` size + sha256) — no model was run. Raw sidecars live under the gitignored Phase 2 run dir.
 
-M-B5 and M-B6 exited the pipeline at this phase with sealed HOLD receipts: [`qa/muster/HOLD-ornith-1.0-9b-bf16.json`](qa/muster/HOLD-ornith-1.0-9b-bf16.json), [`qa/muster/HOLD-ornith-1.0-9b-IQ3_XXS.json`](qa/muster/HOLD-ornith-1.0-9b-IQ3_XXS.json) (named blockers, oracle-side controls, exit conditions). COMPATIBILITY.md's Ornith non-claim now points at both receipts.
+M-B5 and M-B6 exited the pipeline at this phase with sealed HOLD receipts: [`qa/muster/HOLD-ornith-1.0-9b-bf16.json`](../../../qa/muster/HOLD-ornith-1.0-9b-bf16.json), [`qa/muster/HOLD-ornith-1.0-9b-IQ3_XXS.json`](../../../qa/muster/HOLD-ornith-1.0-9b-IQ3_XXS.json) (named blockers, oracle-side controls, exit conditions). COMPATIBILITY.md's Ornith non-claim now points at both receipts.
 
 ## Anchors (live rows)
 

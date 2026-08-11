@@ -18,11 +18,11 @@ IQ4_XS docs-sync note (2026-07-15): the `llama3_2_1b_instruct_iq4_xs` contract r
 
 Serving-engine note (2026-07-09): the API's decode ownership was inverted (DECISIONS.md D16). One engine worker thread now executes every decode behind a bounded queue; `generation_lock` is gone, client disconnects and timeouts can no longer orphan compute against shared GPU state, and backpressure is a typed 503 with an observable queue depth. Supported-row outputs are receipt-proven byte-identical across the change (`qa/evidence-bundles/engine-inversion-gate*`), so no support claim moves; this is a correctness/ownership change only.
 
-`STATUS.md` is Camelid's current release-evidence checkpoint. It records what Camelid can prove today, what moved recently, and what still blocks the next support change. Treat it as a briefing memo, not a diary. Detailed historical run logs, older validation slices, and superseded tactical notes now live in [`STATUS_ARCHIVE_2026-04.md`](docs/archive/STATUS_ARCHIVE_2026-04.md).
+`STATUS.md` is Camelid's current release-evidence checkpoint. It records what Camelid can prove today, what moved recently, and what still blocks the next support change. Treat it as a briefing memo, not a diary. Detailed historical run logs, older validation slices, and superseded tactical notes now live in [`STATUS_ARCHIVE_2026-04.md`](../archive/STATUS_ARCHIVE_2026-04.md).
 
 Use this file to answer three practical questions: what is supported now, what changed recently, and what still blocks the next support move?
 
-War-room claim discipline: [`docs/WAR_ROOM_EVIDENCE_INDEX.md`](docs/WAR_ROOM_EVIDENCE_INDEX.md) records the public source-of-truth order and minimum evidence checklist for support, benchmark, API capability, and WebUI readiness wording. It does not promote any row or feature by itself; it keeps this status memo, `COMPATIBILITY.md`, `BENCHMARKS.md`, `/api/capabilities`, and frontend readiness copy tied to scrubbed evidence.
+War-room claim discipline: [`docs/WAR_ROOM_EVIDENCE_INDEX.md`](../WAR_ROOM_EVIDENCE_INDEX.md) records the public source-of-truth order and minimum evidence checklist for support, benchmark, API capability, and WebUI readiness wording. It does not promote any row or feature by itself; it keeps this status memo, `COMPATIBILITY.md`, `BENCHMARKS.md`, `/api/capabilities`, and frontend readiness copy tied to scrubbed evidence.
 
 Current API capability guard: read-only llama-server model discovery may be described only as partial when focused tests prove `GET /models` returns currently loaded Camelid models with local paths redacted. Native `POST /completion` may be described only as partial non-streaming generation compatibility for the tested text `prompt` or token-id prompt array plus `n_predict`/`max_tokens` subset mapped onto Camelid's existing generation path. Router-mode cache listing, reload/autoload, native `POST /models/load`, native `POST /models/unload`, multimodal architecture metadata, native `/completion` streaming/slot/cache/timing parity, and full llama-server model-management parity remain unsupported, and these compatibility routes do not change WebUI readiness or exact-row support status.
 
@@ -82,7 +82,7 @@ Two standing rules apply to every row:
 - **Support rule:** Nothing inherits support across model size, quantization, tokenizer lane, API surface, or frontend state.
 - **Credit rule:** Visible llama.cpp / ggml acknowledgement and the MIT notice remain part of any parity-backed release claim.
 
-For the formal support ledger, see [`COMPATIBILITY.md`](COMPATIBILITY.md). For sequencing, see [`ROADMAP.md`](ROADMAP.md).
+For the formal support ledger, see [`COMPATIBILITY.md`](../../COMPATIBILITY.md). For sequencing, see [`ROADMAP.md`](../../ROADMAP.md).
 
 Bottom line for reviewers: Camelid has the original TinyLlama verified support gate plus three exact Llama Q8_0 rows with verified support within validated bounds. Mixtral remains partial runtime evidence only until later-generation divergence and API/WebUI/frontend readiness blockers close.
 
@@ -130,7 +130,7 @@ Boundaries that remain in force:
 - No portability claim beyond the measured Ubuntu x86_64 lane.
 - No broader model-family or neighboring-row support claim from this work alone.
 
-Primary public evidence anchors for this lane are summarized in [`docs/performance/ubuntu-x86-q8.md`](docs/performance/ubuntu-x86-q8.md).
+Primary public evidence anchors for this lane are summarized in [`docs/performance/ubuntu-x86-q8.md`](../performance/ubuntu-x86-q8.md).
 
 ## Windows x86 platform bring-up
 
@@ -140,15 +140,15 @@ What is proven on Windows now:
 
 - The repo-health gate is green on MSVC: `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-targets --all-features`, and `cargo doc --no-deps --all-features`. CI runs them on a `windows-latest` job.
 - The **TinyLlama 1.1B Chat Q8_0** baseline gate reproduces the cross-platform evidence exactly: output-projection layout `output_projection_layout_ok=true` with `gguf_dimensions=[2048,32000]` and `storage_row_stride_bytes=2176` (byte-for-byte identical), the `hello` smoke first token `29907`/"C" plus the same 50-token stream, and the supported-lane parity audit vs llama.cpp (prompt tokens, generated text, and generated token IDs match; `first_divergent_token_index=-1`).
-- The port is implementation-only behind `#[cfg(...)]` guards (Windows positioned `seek_read` for the Q8_0 file-backed reads; `memmap2` for the GGUF wire mapping); macOS/Ubuntu paths are unchanged, and the token-major `output.weight` interpretation is identical.
+- Windows uses positioned `seek_read` for Q8_0 file-backed reads and `memmap2` for GGUF wire mapping; macOS/Ubuntu paths are unchanged, and the token-major `output.weight` interpretation is identical.
 
 Boundaries that remain in force:
 
-- TinyLlama is the only exact row with a full Windows parity gate today; Llama 3.2 1B/3B run and agree with the GPU lane on Windows CPU, but their direct Windows-vs-llama.cpp parity bundles are follow-up.
-- No Windows performance, throughput, or packaging claim.
-- **Windows CUDA is experimental and not a supported lane.** An opt-in NVRTC backend (`--features cuda`, RTX 3060) now runs the whole TinyLlama decode forward on the GPU: a GPU-resident decode engine (weights uploaded once and cached across requests, not per call), single-shot GPU prefill, on-device greedy/temperature sampling, and a lossless n-gram speculative-decode path. Each of these is token-identical to the CPU/llama.cpp reference for TinyLlama by direct parity (prompt tokens, generated text, and the 50-token stream all match; `first_divergent_token_index=-1`), including when dense per-token diagnostics force the decode onto the CPU path — the GPU prefill mirrors its KV cache back to host so the CPU and GPU histories stay in lockstep. Per-kernel GPU tests are bit-identical to the CPU dot, and the resident `prefill`/`verify_batch`/full-forward paths have GPU device tests (`cargo test --features cuda -- --ignored`). It still carries no multi-model artifact-backed parity-bundle discipline (TinyLlama on one RTX 3060 is the only CUDA evidence) and makes no throughput claim. The CPU path stays the default and the correctness reference; do not claim the CUDA lane as supported until it carries the same committed multi-row evidence the CPU lanes do.
+- TinyLlama and the dense Qwen3 Q8_0 rows carry direct Windows parity evidence. Llama 3.2 1B/3B run and agree with the GPU lane on Windows CPU, but their direct Windows-CPU-vs-llama.cpp parity bundles remain follow-up.
+- Windows release packaging is available, but no general Windows performance or throughput claim applies across models and hardware.
+- **Windows CUDA is supported on named exact-row lanes.** TinyLlama, dense Qwen3 Q8_0, named Llama and Qwen3 K-quant rows, and the seven PrismML Bonsai rows have committed GPU evidence within the artifact and hardware boundaries recorded in [`COMPATIBILITY.md`](../../COMPATIBILITY.md). The CUDA runtime provides GPU-resident decode, single-shot prefill, on-device sampling, and bounded host-offload paths where the ledger says so. This is not broad CUDA support: unlisted models, quantizations, GPUs, drivers, and CUDA versions remain experimental or unsupported, and no portable throughput claim is implied. The CPU path remains the correctness reference.
 
-See [`COMPATIBILITY.md`](COMPATIBILITY.md) → Platform support for the release-contract wording.
+See [`COMPATIBILITY.md`](../../COMPATIBILITY.md) → Platform support for the release-contract wording.
 
 ## Durable evidence anchors
 

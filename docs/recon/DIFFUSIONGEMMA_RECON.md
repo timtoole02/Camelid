@@ -4,7 +4,7 @@
 > **Active development — recon/evidence-only. Not supported.** This document
 > describes the `experimental/diffusiongemma` lane. Nothing here is a support
 > claim; the public support truth is [`COMPATIBILITY.md`](../../COMPATIBILITY.md)
-> and [`STATUS.md`](../../STATUS.md). The lane's mission — a Rust-native
+> and [`STATUS.md`](../reference/STATUS.md). The lane's mission — a Rust-native
 > DiffusionGemma runtime — is earned by parity receipts, not claims; until the
 > Phase 5 multi-canvas parity artifact exists, the only claim made anywhere is
 > "in progress."

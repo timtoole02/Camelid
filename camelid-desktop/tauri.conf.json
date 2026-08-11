@@ -18,7 +18,9 @@
         "minHeight": 560,
         "center": true,
         "backgroundColor": "#0e1216",
-        "url": "index.html"
+        "url": "index.html",
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
       }
     ],
     "security": {
@@ -27,7 +29,9 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": [
+      "nsis"
+    ],
     "publisher": "Camelid",
     "category": "DeveloperTool",
     "shortDescription": "Native chat app for the Camelid local inference engine.",

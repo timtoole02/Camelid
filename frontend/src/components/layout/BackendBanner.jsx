@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 import { Button } from '../ui/Button'
 import { StatusDot } from '../ui/StatusDot'
-import { IconPlay, IconCopy, IconCheck, IconSettings } from '../ui/icons'
+import { IconPlay, IconCopy, IconCheck, IconRefresh, IconSettings } from '../ui/icons'
 import { copyText } from '../../lib/markdown'
+import { isDesktopShell } from '../../lib/desktopShell'
 
 /* Shown on the copy button when the engine never told us where it lives.
 
@@ -38,11 +39,7 @@ function readEnginePath() {
 
 /* Inside Camelid Desktop the sidecar engine is bundled and supervised by the
    shell — terminal restart commands are wrong there, so the banner switches to
-   app-level guidance instead. Same detection as DownloadedModelsView. */
-function isDesktopShell() {
-  if (typeof window === 'undefined') return false
-  return Boolean(window.__TAURI__?.core?.invoke)
-}
+   app-level guidance instead. Detection lives in lib/desktopShell. */
 
 /* `camelid.exe` / "unzipped" phrasing is only right on Windows. The stored
    engine path is the most reliable signal (it names the machine the engine is
@@ -134,6 +131,23 @@ export function BackendBanner({ backend, apiBase, onOpenSettings }) {
   // there would be the same class of lie this whole change is removing.
   const [copyState, setCopyState] = useState('idle')
   const copyResetRef = useRef(null)
+  const [restarting, setRestarting] = useState(false)
+  /* Only after a restart actually fails do we fall back to "quit and reopen".
+     Leading with it, as this banner used to, hands the reader a chore for
+     something the app can do itself. */
+  const [restartFailed, setRestartFailed] = useState(false)
+
+  const handleRestartEngine = async () => {
+    setRestarting(true)
+    setRestartFailed(false)
+    try {
+      await window.__TAURI__.core.invoke('retry_startup')
+    } catch {
+      setRestartFailed(true)
+    } finally {
+      setRestarting(false)
+    }
+  }
 
   useEffect(() => () => { if (copyResetRef.current) window.clearTimeout(copyResetRef.current) }, [])
 
@@ -154,8 +168,11 @@ export function BackendBanner({ backend, apiBase, onOpenSettings }) {
         <strong>Camelid engine isn’t running</strong>
         <span>
           {canStart && 'Start it to load a model and chat — no setup needed.'}
-          {!canStart && isLocalEngine && isDesktopApp && (
-            <>The engine that powers Camelid stopped. Quit and reopen Camelid Desktop to restart it.</>
+          {!canStart && isLocalEngine && isDesktopApp && restartFailed && (
+            <>The engine stopped and would not restart. Quit and reopen Camelid Desktop.</>
+          )}
+          {!canStart && isLocalEngine && isDesktopApp && !restartFailed && (
+            <>The engine that powers Camelid stopped. Restart it below — your models and settings are untouched.</>
           )}
           {!canStart && isLocalEngine && !isDesktopApp && enginePath && (
             <>This page is served by the engine, so it can’t restart it. Start it again with <code>{restartCommand}</code>{windowsEngine ? <> — or just run <code>camelid.exe</code> from where you unzipped Camelid</> : null}.</>
@@ -182,6 +199,23 @@ export function BackendBanner({ backend, apiBase, onOpenSettings }) {
             disabled={backend.starting || running}
           >
             {running ? 'Starting…' : 'Start Camelid'}
+          </Button>
+        )}
+        {/* The desktop app owns the engine as a sidecar, so it can restart it in
+            place. It previously told the reader to quit and reopen the app —
+            an instruction for something the app could do itself. The command
+            behind this is the one the splash's Retry already uses: it tears
+            down any half-running sidecar before starting a clean one. */}
+        {!canStart && isLocalEngine && isDesktopApp && (
+          <Button
+            variant="primary"
+            size="sm"
+            icon={<IconRefresh size={16} />}
+            onClick={handleRestartEngine}
+            loading={restarting}
+            disabled={restarting}
+          >
+            {restarting ? 'Restarting…' : 'Restart engine'}
           </Button>
         )}
         {!canStart && isLocalEngine && !isDesktopApp && (

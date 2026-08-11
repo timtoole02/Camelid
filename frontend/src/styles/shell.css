@@ -13,6 +13,23 @@
 .camelid-app.is-collapsed { grid-template-columns: var(--rail-collapsed-width) minmax(0, 1fr); }
 .camelid-app.is-demo { grid-template-columns: minmax(0, 1fr); }
 
+/* ---- macOS desktop window chrome ----
+   With the overlay title bar the OS draws no bar of its own, so the traffic
+   lights land on top of whatever occupies the window's top-left — the sidebar
+   brand row. The shell gains one title-bar's worth of room at the top and a
+   transparent strip across it that the window can be dragged by. Only children
+   carrying data-tauri-drag-region drag, so every control below stays clickable.
+   Applied nowhere but the macOS desktop shell; the browser build never sees it. */
+.camelid-app.has-overlay-chrome { padding-top: var(--overlay-titlebar-height); }
+.app-drag-strip {
+  position: fixed;
+  inset: 0 0 auto 0;
+  height: var(--overlay-titlebar-height);
+  z-index: 60;
+  /* Same ground as the shell so the strip reads as window chrome, not a gap. */
+  background: var(--color-canvas);
+}
+
 /* ---- Main column ---- */
 .camelid-main {
   display: flex;

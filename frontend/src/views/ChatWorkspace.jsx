@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { getChatGateState } from '../lib/chatGate'
-import { exactArtifactFilenameForRow } from '../lib/capabilities'
+import { displayQuantLabel, exactArtifactFilenameForRow } from '../lib/capabilities'
+import { formatModelLabel } from '../lib/formatters'
 import { isEmbeddingOnlyModel, isGenerationCapableModel } from '../lib/modelCapabilities.js'
 import { applyGemma4GhostChatTokenCap, getConfiguredMaxTokens, isBitNetB158ChatModel, modelContextLength, validateSendBudget } from '../lib/responseLimits'
 import { CamelidMark } from '../components/ui/CamelidMark'
@@ -210,11 +211,24 @@ export default function ChatWorkspace({
     if (selectedBitNetChatModel && thinkingMode && setThinkingMode) setThinkingMode(false)
   }, [selectedBitNetChatModel, setThinkingMode, thinkingMode])
   const supportBlocked = selectedRuntimeReady && !selectedModelCapabilitySupported
-  /* Only set when the row was matched but the loaded GGUF is not its exact
-     artifact — the one blocked state with a concrete next step. */
-  const blockedArtifactFilename = selectedChatGate.hint?.kind === 'artifact_mismatch'
-    ? exactArtifactFilenameForRow(selectedChatGate.hint.target)
-    : null
+  /* The two blocked states a reader can actually act on, each named concretely.
+     "Pick a verified model" alone leaves someone who is one file away from
+     working guessing at which file that is. */
+  const blockedSpecifics = (() => {
+    const hint = selectedChatGate.hint
+    if (hint?.kind === 'artifact_mismatch') {
+      const filename = exactArtifactFilenameForRow(hint.target)
+      return filename ? `it requires the exact ${filename} artifact` : null
+    }
+    if (hint?.kind === 'quant_mismatch') {
+      // observedQuant is a match key ("Q40"), not something to show a reader.
+      const verified = displayQuantLabel(hint.target?.quantization)
+      const observed = displayQuantLabel(selectedModel?.quant || hint.observedQuant)
+      if (verified && observed) return `this build is ${observed} and the verified build is ${verified}`
+      if (verified) return `only the ${verified} build is verified`
+    }
+    return null
+  })()
   const selectedRuntimeMatchesLoadedModel = Boolean(selectedChatGate.runtimeLoaded)
   const selectedModelName = selectedModel?.name || selectedModelId || 'No model selected'
   const selectedModelIssue = selectedModel?.load_error || selectedModel?.install_error || ''
@@ -259,11 +273,12 @@ export default function ChatWorkspace({
           ? 'This model is loaded for embeddings and reranking. Choose a generation model to chat.'
           : 'This model creates embeddings for search and reranking. Load it from Models, or choose a generation model to chat.'
         : supportBlocked
-        /* When the blocker is a near-miss GGUF, naming the file the reader
-           actually needs is far more actionable than "pick a verified model" —
-           they are usually one download away, not one decision away. */
-        ? (blockedArtifactFilename
-            ? `This model isn't verified for chat yet: it requires the exact ${blockedArtifactFilename} artifact. Pick a verified model to unlock send.`
+          /* When the blocker is a near miss — wrong file, or the right model at an
+             unverified quantization — naming it is far more actionable than "pick a
+             verified model": they are usually one download away, not one decision
+             away. */
+          ? (blockedSpecifics
+              ? `This model isn't verified for chat yet: ${blockedSpecifics}. Pick a verified model to unlock send.`
             : "This model isn't verified for chat yet. Pick a verified model to unlock send.")
         : selectedModel
           ? 'Your draft is ready now. Send unlocks as soon as this model is ready.'
@@ -450,15 +465,19 @@ export default function ChatWorkspace({
   const runnableModels = chatModels.filter(modelCanChat)
   const waitingModels = chatModels.filter((model) => !modelCanChat(model))
   const selectedPickerModelId = chatModels.some((model) => model.id === selectedModel?.id) ? selectedModel.id : ''
+  /* The picker sat next to a top bar and message footer that both render clean
+     names, while it showed the raw GGUF filename — one model wearing two names
+     in the same view. formatModelLabel passes display names through untouched. */
   const modelOptionLabel = (model) => {
     const gate = getChatGateState(capabilities, model, runtime)
-    if (gate.embeddingOnly) return `${model.name} · Embedding only`
-    if (gate.chatUnlocked) return `${model.name} · Ready`
-    if (gate.chatMode === 'experimental') return `${model.name} · Experimental ready`
-    if (apiUnavailable) return `${model.name} · Not connected`
-    if (gate.runtimeReady) return `${model.name} · Not verified`
-    if (gate.runtimeLoaded) return `${model.name} · Loading`
-    return `${model.name} · Not loaded`
+    const name = formatModelLabel(model.name)
+    if (gate.embeddingOnly) return `${name} · Embedding only`
+    if (gate.chatUnlocked) return `${name} · Ready`
+    if (gate.chatMode === 'experimental') return `${name} · Experimental ready`
+    if (apiUnavailable) return `${name} · Not connected`
+    if (gate.runtimeReady) return `${name} · Not verified`
+    if (gate.runtimeLoaded) return `${name} · Loading`
+    return `${name} · Not loaded`
   }
 
   /* Send-time budget check: the response limit is an upper bound the backend

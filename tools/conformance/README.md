@@ -22,7 +22,7 @@ stream and divergence isolates tokenization + numerics):
    endpoint, compared pairwise where exposed.
 4. **Provability** — can the runtime emit a sealed, independently verifiable
    record of what it computed? Camelid emits
-   [parity receipts](../../RECEIPTS.md) (`camelid_receipt: true`); the
+   [parity receipts](../../docs/reference/RECEIPTS.md) (`camelid_receipt: true`); the
    probe seals one and runs `camelid verify-receipt` on it. Runtimes without
    such a mechanism are recorded as having none — that is a finding, not a
    judgment.

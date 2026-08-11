@@ -3,7 +3,7 @@
 > [!NOTE]
 > This document is a design/implementation note, not the public support ledger. For current
 > support truth and release status, use [`COMPATIBILITY.md`](../../COMPATIBILITY.md) and
-> [`STATUS.md`](../../STATUS.md). Adding a new low-bit format here never implies support,
+> [`STATUS.md`](../reference/STATUS.md). Adding a new low-bit format here never implies support,
 > parity promotion, or a catalog claim until its own dequant-parity evidence lands.
 
 ## Why IQ4_XS, and why first

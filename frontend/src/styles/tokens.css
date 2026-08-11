@@ -92,6 +92,9 @@
   /* ---- Layout ---- */
   --sidebar-width: 288px;
   --rail-collapsed-width: 72px;
+  /* Room the macOS traffic lights need when the window draws its own chrome.
+     28px is the standard title-bar height they are positioned against. */
+  --overlay-titlebar-height: 28px;
   --content-max: 768px;
   --content-wide: 1100px;
 

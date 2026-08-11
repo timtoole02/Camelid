@@ -3,7 +3,7 @@
 > [!NOTE]
 > This document is a design or recon note, not the public support ledger. For
 > current support truth and release status, use
-> [`COMPATIBILITY.md`](../../COMPATIBILITY.md) and [`STATUS.md`](../../STATUS.md).
+> [`COMPATIBILITY.md`](../../COMPATIBILITY.md) and [`STATUS.md`](../reference/STATUS.md).
 > The 26B A4B row remains **blocked / fail-closed** until every gap below has
 > committed evidence. Nothing here is a support claim.
 

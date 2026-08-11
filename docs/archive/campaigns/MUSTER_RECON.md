@@ -1,6 +1,6 @@
 # MUSTER Phase 1 — Per-row recon dossiers (Gate 1)
 
-Campaign: [`MUSTER_CONDUCTOR.md`](MUSTER_CONDUCTOR.md) §4. Roster: [`MUSTER_ROSTER.md`](MUSTER_ROSTER.md) (Gate 0 signed 2026-07-15, sealed on `main` at `6f70f616`). Recon executed 2026-07-16 against that tree, read-only: no serve, no generation, no model weights loaded; the only commands run were `camelid inspect` and `camelid plan-offload` (metadata-only, both documented per row). Every dossier was independently adversarially re-verified against the code; corrections found by that pass are folded in below and marked **[verified]** / **[corrected]** where load-bearing.
+Campaign: [`MUSTER_CONDUCTOR.md`](./MUSTER_CONDUCTOR.md) §4. Roster: [`MUSTER_ROSTER.md`](./MUSTER_ROSTER.md) (Gate 0 signed 2026-07-15, sealed on `main` at `6f70f616`). Recon executed 2026-07-16 against that tree, read-only: no serve, no generation, no model weights loaded; the only commands run were `camelid inspect` and `camelid plan-offload` (metadata-only, both documented per row). Every dossier was independently adversarially re-verified against the code; corrections found by that pass are folded in below and marked **[verified]** / **[corrected]** where load-bearing.
 
 **Status: Gate 1 open — Tim skims, decides the flagged items (§Gate 1 decisions), and may re-order waves. Recon-proven HOLDs (M-B5, M-B6) carry committed receipt wording here and exit the pipeline at this gate.**
 

@@ -3,7 +3,7 @@
 > [!NOTE]
 > This is a recon/design note for the Qwen3 support lane, **not** the public
 > support ledger. For current support truth use
-> [`COMPATIBILITY.md`](../../COMPATIBILITY.md) and [`STATUS.md`](../../STATUS.md).
+> [`COMPATIBILITY.md`](../../COMPATIBILITY.md) and [`STATUS.md`](../reference/STATUS.md).
 > Qwen3 is **not** a supported row until Gate 4 evidence lands.
 
 Target row: **Qwen3-1.7B Instruct, Q8_0** — the smallest dense Qwen3 with the

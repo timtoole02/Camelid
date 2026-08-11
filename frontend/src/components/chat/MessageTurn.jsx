@@ -3,6 +3,8 @@ import { Avatar } from '../ui/Avatar'
 import { EvidenceChip } from '../ui/EvidenceChip'
 import { IconCopy, IconCheck, IconRefresh, IconEdit } from '../ui/icons'
 import { AssistantMarkdown, copyText, hasOpenCodeFence } from '../../lib/markdown'
+import { capabilityStatusLabel } from '../../lib/capabilities'
+import { formatModelLabel } from '../../lib/formatters'
 import { cleanLegacyDemoCapCopy } from '../../lib/conversationStorage'
 import {
   LiveGenerationBadge,
@@ -52,12 +54,22 @@ function MessageMetaFooter({ message }) {
   if (!usage && !ttft && !rate && !message.model_id && !sentAt) return null
   return (
     <footer className="cxturn__meta" aria-label="Generation details (client-measured telemetry)">
-      {message.model_id && <span className="cxturn__meta-item cxturn__meta-model">{message.model_id}</span>}
+      {message.model_id && (
+        <span className="cxturn__meta-item cxturn__meta-model" title={message.model_id}>
+          {formatModelLabel(message.model_id)}
+        </span>
+      )}
       {message.support_row && (
         <EvidenceChip
           status={message.support_row.status}
           state={message.support_row.supported ? 'supported' : null}
-          source={{ rowId: message.support_row.id, detail: 'Row active when this reply was generated.' }}
+          /* Under a reply the status is reassurance, not the record: show the
+             plain verdict and keep the row id and raw status in the popover. */
+          label={capabilityStatusLabel(message.support_row.status)}
+          source={{
+            rowId: message.support_row.id,
+            detail: `Status ${message.support_row.status} — the row active when this reply was generated.`,
+          }}
           size="sm"
         />
       )}
@@ -76,7 +88,9 @@ function MessageMetaFooter({ message }) {
           {usageLabel} <strong>in {usage.prompt_tokens}</strong><span aria-hidden="true"> · </span><strong>out {usage.completion_tokens ?? 0}</strong>
         </span>
       )}
-      {ttft && <span className="cxturn__meta-item" title="Time to first content, measured in this browser">TTFT {ttft}</span>}
+      {/* "TTFT" is the term of art; under a reply it just needs to say what it
+          measures. The abbreviation stays in the tooltip for anyone comparing. */}
+      {ttft && <span className="cxturn__meta-item" title="Time to first content (TTFT), measured in this browser">first token {ttft}</span>}
       {rate && <span className="cxturn__meta-item" title="End-to-end output rate, measured in this browser">{rate}</span>}
       {duration && <span className="cxturn__meta-item" title="Total request duration, measured in this browser">{duration}</span>}
       {sentAt && <time className="cxturn__meta-item" dateTime={message.created_at} title={formatFullTimestamp(message.created_at)}>{sentAt}</time>}

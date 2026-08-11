@@ -9,7 +9,7 @@ This file is the war-room guardrail for public Camelid claims. It does not creat
 When surfaces disagree, use this order:
 
 1. [`COMPATIBILITY.md`](../COMPATIBILITY.md) controls release support language, API feature status, and WebUI readiness wording.
-2. [`STATUS.md`](../STATUS.md) records the current evidence snapshot, recent movements, and blockers.
+2. [`STATUS.md`](./reference/STATUS.md) records the current evidence snapshot, recent movements, and blockers.
 3. [`BENCHMARKS.md`](benchmarks/BENCHMARKS.md) controls public performance wording and same-host comparison boundaries.
 4. [`frontend/README.md`](../frontend/README.md) controls WebUI readiness policy and smoke-test interpretation.
 5. `/api/capabilities` must mirror the compatibility ledger; it must not promote a row, context bucket, API feature, or frontend state before the docs and evidence do.
@@ -24,7 +24,7 @@ Use these anchors before changing public copy:
 
 | Claim lane | Primary anchor | Required public boundary |
 | --- | --- | --- |
-| Exact-row support | [`COMPATIBILITY.md`](../COMPATIBILITY.md), [`STATUS.md`](../STATUS.md), row manifests under `qa/evidence-bundles/` | Exact model row, quantization, context buckets, tokenizer/template scope, API/WebUI status, and unsupported neighboring rows must be stated together. |
+| Exact-row support | [`COMPATIBILITY.md`](../COMPATIBILITY.md), [`STATUS.md`](./reference/STATUS.md), row manifests under `qa/evidence-bundles/` | Exact model row, quantization, context buckets, tokenizer/template scope, API/WebUI status, and unsupported neighboring rows must be stated together. |
 | API capabilities | [`COMPATIBILITY.md`](../COMPATIBILITY.md) API table plus `src/api/mod.rs` capability rows | New capability rows must use `supported`, `partial`, `planned`, or `unsupported` language that matches committed evidence and typed runtime behavior. |
 | Native generation compatibility | [`COMPATIBILITY.md`](../COMPATIBILITY.md) API table plus focused route tests for `/completion` and `/infill` | Route presence is not support evidence. Native `/completion` may be described only as the tested narrow non-streaming mapping onto Camelid's existing generation path when request shape, typed unsupported fields, backend behavior, and capability rows are aligned. Native streaming, slot/cache controls, llama-server timings/probabilities, cancellation metadata, FIM `/infill`, and broader generation parity remain unsupported until separately tested and documented. |
 | API model discovery metadata | [`COMPATIBILITY.md`](../COMPATIBILITY.md) API table plus `/v1/models`, `/v1/models/:model`, and read-only `/models` tests | Public model-discovery fields may expose only model-shape/count/size/quant metadata already available from the loaded GGUF/runtime config or currently loaded Camelid model IDs. They must not expose local paths and must not imply tokenizer parity, generation support, WebUI readiness, router-mode cache listing, native load/unload, broader llama-server parity, or neighboring-row support. |
@@ -32,7 +32,7 @@ Use these anchors before changing public copy:
 | WebUI readiness | [`frontend/README.md`](../frontend/README.md) plus `/api/capabilities` and `/v1/health` behavior | Chat readiness requires exact-row capability support and `loaded_now=true` plus `generation_ready=true`; filenames, catalog metadata, saved paths, or prior use are not evidence. |
 | Benchmark/performance | [`BENCHMARKS.md`](benchmarks/BENCHMARKS.md), `docs/performance/`, and scrubbed benchmark manifests | Performance claims require same-host, same-row, same-prompt, same-token-budget, same-thread evidence. Direction probes and local-only gates stay labeled as such. |
 | llama.cpp comparison | [`BENCHMARKS.md`](benchmarks/BENCHMARKS.md), [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md), row parity manifests | Camelid may cite llama.cpp for parity/reference validation and credit ggml/llama.cpp work. Do not imply broad competitive superiority without a normalized same-host throughput bundle. |
-| Next-family rows | [`COMPATIBILITY.md`](../COMPATIBILITY.md), [`STATUS.md`](../STATUS.md), blocker reconciliation manifests | Mistral, Mixtral, Qwen, and Gemma wording must remain exact-row, evidence-only, planned, or blocked until promotion artifacts close every named blocker. |
+| Next-family rows | [`COMPATIBILITY.md`](../COMPATIBILITY.md), [`STATUS.md`](./reference/STATUS.md), blocker reconciliation manifests | Mistral, Mixtral, Qwen, and Gemma wording must remain exact-row, evidence-only, planned, or blocked until promotion artifacts close every named blocker. |
 | Privacy/scrub state | `scripts/check-public-scrub.sh`, `scripts/check-public-evidence-claims.mjs`, evidence-bundle privacy audits | Public docs and manifests must not expose private hostnames, private IPs, key paths, home paths, model-library paths, raw operator commands, or raw failure logs. |
 
 ## Claim policy

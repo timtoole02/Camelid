@@ -7,6 +7,7 @@ import { Notice } from './components/ui/Notice'
 import { ConfirmDialog } from './components/ui/ConfirmDialog'
 import { isFirstRunHost } from './lib/firstRunActivation'
 import { formatPreview, formatSidebarDate } from './lib/formatters'
+import { hasOverlayTitleBar } from './lib/desktopShell'
 import { useDashboardData } from './hooks/useDashboardData'
 import { useBackendLauncher } from './hooks/useBackendLauncher'
 import { useNotice } from './hooks/useNotice'
@@ -245,6 +246,10 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loadDashboard])
 
+  /* Above the loading early-return: every hook must run on every render, and
+     the shell this window lives in cannot change while it is open. */
+  const [overlayTitleBar] = useState(hasOverlayTitleBar)
+
   if (!dashboard) {
     return (
       <div className="loading-shell">
@@ -261,10 +266,17 @@ function App() {
     sidebarCollapsed ? 'is-collapsed' : '',
     mobileNavOpen ? 'is-mobile-open' : '',
     DEMO_UI ? 'is-demo' : '',
+    overlayTitleBar ? 'has-overlay-chrome' : '',
   ].filter(Boolean).join(' ')
 
   return (
     <div className={shellClasses}>
+      {/* macOS desktop only: the window draws no title bar of its own, so the
+          traffic lights float over the top-left of our content. This strip is
+          the room they sit in and the surface the window is dragged by —
+          without it the app showed the OS bar stacked above our own header,
+          which is what makes an app look like a web page in a frame. */}
+      {overlayTitleBar && <div className="app-drag-strip" data-tauri-drag-region />}
       {!DEMO_UI && (
         <SidebarRail
           collapsed={!isMobile && sidebarCollapsed}

@@ -498,7 +498,11 @@ function getGuardrailErrorMessage(error, fallback = 'Request failed.') {
   const code = getBackendErrorCode(error)
   if (!isTypedUnsupportedBackendError(code, message)) return message
   const codeCopy = code ? ` (${code})` : ''
-  return `Camelid refused this with a typed guardrail${codeCopy}: ${message}. This is not chat-ready support yet; check /api/capabilities and COMPATIBILITY.md before retrying.`
+  /* This is the message a refused action shows. It is the worst possible place
+     for contract vocabulary: the reader just had something fail and needs to
+     know what to do, not which files the claim came from. The error code is
+     kept — it is the one part worth quoting in a bug report. */
+  return `Camelid can't do this with the current model${codeCopy}: ${message}. This combination isn't verified yet — see the Compatibility page for what is.`
 }
 
 async function fetchJson(pathOrUrl, options = {}) {
@@ -1015,7 +1019,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
     // chat through the weaker EXPERIMENTAL lane (every turn marked unverified). Only
     // a model that is not generation-ready at all is fully blocked.
     if (!selectedModelRunnable && !selectedModelExperimental) {
-      showNotice('Camelid is not generation-ready for the selected model yet.', 'error')
+      showNotice('The selected model isn’t ready to generate yet.', 'error')
       return
     }
 
@@ -1657,7 +1661,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
       return
     }
     if (modelRuntimeIdMatches(model, runtime) && runtime?.generation_ready) {
-      showNotice('That model is already loaded and generation-ready.', 'success')
+      showNotice('That model is already loaded and ready.', 'success')
       return
     }
 
@@ -1694,9 +1698,9 @@ export function useDashboardData({ showNotice, clearNotice }) {
       showNotice(
         ready
           ? supportedByContract
-            ? 'Model loaded. Camelid reports generation-ready and the /api/capabilities support contract matches this model/quant.'
-            : 'Model loaded and generation-ready, but chat stays guarded until /api/capabilities has an exact supported COMPATIBILITY.md row for this model/quant.'
-          : 'Model loaded, but Camelid does not report generation-ready yet. Check tokenizer/config/tensor readiness.',
+            ? 'Model loaded and verified — you can start chatting.'
+            : 'Model loaded and running, but this build isn’t verified, so chat stays locked. The Compatibility page lists the verified builds.'
+          : 'Model loaded, but it isn’t ready to generate yet. Give it a moment, or check the Models page for details.',
         ready && supportedByContract ? 'success' : 'info',
       )
     } catch (error) {
@@ -1795,8 +1799,8 @@ export function useDashboardData({ showNotice, clearNotice }) {
         embeddingOnly
           ? 'Embedding model loaded as a sidecar. The current Chat model was left active.'
           : supportedByContract
-            ? 'Local model saved, loaded, generation-ready, and matched to a supported /api/capabilities row.'
-            : 'Local model saved and generation-ready, but chat stays guarded until COMPATIBILITY.md and /api/capabilities explicitly support this model/quant.',
+            ? 'Model saved, loaded, and verified — you can start chatting.'
+            : 'Model saved and running, but this build isn’t verified, so chat stays locked. The Compatibility page lists the verified builds.',
         embeddingOnly || supportedByContract ? 'success' : 'info',
       )
     } catch (error) {

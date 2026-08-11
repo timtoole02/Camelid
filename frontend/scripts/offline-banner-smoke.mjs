@@ -93,7 +93,7 @@ const origin = `http://127.0.0.1:${server.address().port}`
 const browser = await launchBrowser({ purpose: 'the offline banner smoke', headless: 'new' })
 const pageErrors = []
 
-async function openBanner({ clipboard = 'ok', storage = {}, platform = null } = {}) {
+async function openBanner({ clipboard = 'ok', storage = {}, platform = null, desktopShell = null } = {}) {
   const page = await browser.newPage()
   page.on('pageerror', (error) => pageErrors.push(String(error)))
   // Nothing may leave the harness. One scenario points the app at an engine on
@@ -108,12 +108,26 @@ async function openBanner({ clipboard = 'ok', storage = {}, platform = null } = 
   // copyText() calls navigator.clipboard.writeText. Drive all three real shapes:
   // present and working, ABSENT (what a non-secure context gives you, e.g. a
   // plain-http LAN address), and present but rejecting (permission denied).
-  await page.evaluateOnNewDocument((mode, seed, platformOverride) => {
+  await page.evaluateOnNewDocument((mode, seed, platformOverride, desktopShell) => {
     window.__copied = []
     /* The banner's wording is platform-aware: only Windows users are told to run
        camelid.exe. Scenarios that assert that phrasing must say which platform
        they are standing on rather than inheriting the runner's. */
     if (platformOverride) Object.defineProperty(navigator, 'platform', { configurable: true, value: platformOverride })
+    /* Desktop shell stub: the banner detects Tauri by window.__TAURI__.core.invoke
+       and, inside the app, offers to restart the sidecar itself. Record the
+       commands so the scenario can prove which one it calls. */
+    if (desktopShell) {
+      window.__invoked = []
+      window.__TAURI__ = {
+        core: {
+          invoke: (cmd) => {
+            window.__invoked.push(cmd)
+            return desktopShell === 'failing' ? Promise.reject(new Error('nope')) : Promise.resolve()
+          },
+        },
+      }
+    }
     // Pages share the browser profile, so a key seeded by an earlier scenario
     // would survive into the next one and silently test the wrong thing.
     window.localStorage.clear()
@@ -132,7 +146,7 @@ async function openBanner({ clipboard = 'ok', storage = {}, platform = null } = 
         },
       },
     })
-  }, clipboard, storage, platform)
+  }, clipboard, storage, platform, desktopShell)
   // NOT networkidle2: one scenario points the app at an engine on another host,
   // whose probe never settles, and the banner does not depend on it.
   await page.goto(origin, { waitUntil: 'domcontentloaded' })
@@ -217,6 +231,50 @@ try {
     assert.match(macBanner.text, /served by the engine/i)
     assert.match(macBanner.text, /Start the Camelid app again|re-run the command/i)
   })
+  await page.close()
+
+  /* ---- Scenario 1c: inside Camelid Desktop. The app supervises the engine as a
+     sidecar, so it can restart it in place; telling the reader to quit and
+     reopen was handing them a chore the app could do itself. ---- */
+  resetStub()
+  page = await openBanner({ desktopShell: 'ok' })
+  let desktopBanner = await page.evaluate(readBanner)
+  check('the desktop app offers to restart the engine itself', () => {
+    assert.ok(desktopBanner.buttons.some((label) => label.includes('Restart engine')),
+      `expected a restart action, got ${JSON.stringify(desktopBanner.buttons)}`)
+    assert.equal(/Quit and reopen/i.test(desktopBanner.text), false,
+      'quit-and-reopen must not be the first thing offered when the app can restart the engine')
+  })
+  check('the desktop restart reassures that nothing is lost', () => {
+    assert.match(desktopBanner.text, /models and settings are untouched/i)
+  })
+  check('the desktop app never shows terminal or executable instructions', () => {
+    assert.equal(/camelid\.exe|cargo run|serve\b/i.test(desktopBanner.text), false,
+      `desktop guidance leaked a terminal instruction: ${desktopBanner.text}`)
+  })
+  await clickBannerButton(page, 'Restart engine')
+  check('restarting calls the engine-restart command, not a page reload', async () => {
+    const invoked = await page.evaluate(() => window.__invoked || [])
+    assert.deepEqual(invoked, ['retry_startup'], `unexpected commands: ${JSON.stringify(invoked)}`)
+  })
+  await page.close()
+
+  /* Only once a restart has actually failed is quit-and-reopen the honest advice. */
+  resetStub()
+  page = await openBanner({ desktopShell: 'failing' })
+  await clickBannerButton(page, 'Restart engine')
+  await page.waitForFunction(() => /Quit and reopen/i.test(document.querySelector('.backend-banner')?.textContent || ''), { timeout: 5000 })
+  desktopBanner = await page.evaluate(readBanner)
+  check('a failed restart falls back to quit-and-reopen', () => {
+    assert.match(desktopBanner.text, /would not restart/i)
+    assert.match(desktopBanner.text, /Quit and reopen Camelid Desktop/i)
+  })
+  await page.close()
+
+  /* Restore the packaged Windows context: Scenario 1 continues below. */
+  resetStub()
+  page = await openBanner({ platform: 'Win32' })
+  banner = await page.evaluate(readBanner)
   check('the retired dead-end sentence is gone', () => {
     assert.equal(banner.text.includes(RETIRED_COPY), false)
   })

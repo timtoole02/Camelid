@@ -3,7 +3,7 @@
 > [!NOTE]
 > This is a design/recon note, not the public support ledger. For current
 > support truth use [`COMPATIBILITY.md`](../../COMPATIBILITY.md) and
-> [`STATUS.md`](../../STATUS.md). DiffusionGemma is **recognized and fails
+> [`STATUS.md`](../reference/STATUS.md). DiffusionGemma is **recognized and fails
 > closed** with a typed blocker; it is **not** a supported runtime row, and
 > nothing here is a support claim.
 

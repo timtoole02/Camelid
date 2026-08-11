@@ -338,7 +338,7 @@ jobs:
   # `Prove the INSTALLED binary is signed` below is the check that closes this class of bug
   # for good: it silently installs the built installer on the runner and asserts the unpacked
   # binary verifies. It would have caught both defects before publishing.
-  # See DECISIONS.md D11 for the desktop app's design record.
+  # See docs/archive/campaigns/DECISIONS.md D11 for the desktop app's design record.
   desktop-windows:
     if: ${{ github.event.inputs.skip_desktop != 'true' }}
     runs-on: windows-latest

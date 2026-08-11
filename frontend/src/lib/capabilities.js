@@ -2,6 +2,25 @@ export function formatCapabilityStatus(value) {
   return (value || '').toString().replace(/_/g, ' ')
 }
 
+/* Human rendering of a contract status, for surfaces where the status is a
+   reassurance rather than the subject.
+
+   formatCapabilityStatus only swaps underscores for spaces, so a status token
+   reaches the screen almost verbatim — and the chip styling uppercases it, so
+   `supported_exact_row_smoke` renders under every chat reply as
+   "SUPPORTED EXACT ROW SMOKE". That is the contract's vocabulary, not the
+   reader's. The Compatibility ledger keeps the raw form on purpose (that view
+   exists to show the contract, and the exact token is the content there); the
+   raw id and status also stay one click away in every chip's popover. */
+export function capabilityStatusLabel(value) {
+  const status = String(value || '').toLowerCase()
+  if (!status) return null
+  if (isSupportedCapabilityStatus(status)) return 'Verified'
+  if (status.startsWith('active_validation')) return 'Being verified'
+  if (status.startsWith('planned')) return 'Not verified yet'
+  return 'Not verified'
+}
+
 const GGUF_FILE_TYPE_QUANT_LABELS = {
   0: 'F32',
   1: 'F16',
@@ -42,6 +61,22 @@ const GGUF_FILE_TYPE_QUANT_LABELS = {
   // carry tensor type 41 while their file_type is 40; both Prism Q2 block
   // geometries declare file_type 41 and the backend refines the geometry.
   41: 'Q2_0',
+}
+
+/* Quant values travel through normalizeCapabilityKey, which strips separators so
+   "Q4_0" and "q4-0" compare equal — great for matching, wrong for reading, since
+   the key renders as "Q40". Map a key back to its canonical label before showing
+   it to anyone. Values already carrying a separator are passed through. */
+const CANONICAL_QUANT_BY_KEY = new Map(
+  Object.values(GGUF_FILE_TYPE_QUANT_LABELS).map((label) => [label.replace(/[^A-Z0-9]+/g, ''), label]),
+)
+
+export function displayQuantLabel(value) {
+  const raw = String(value || '').trim()
+  if (!raw) return null
+  const upper = raw.toUpperCase()
+  if (upper.includes('_')) return upper
+  return CANONICAL_QUANT_BY_KEY.get(upper.replace(/[^A-Z0-9]+/g, '')) || upper
 }
 
 export function quantLabelFromGgufFileType(fileType) {
