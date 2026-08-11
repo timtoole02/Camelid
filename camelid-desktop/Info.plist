@@ -3,6 +3,6 @@
 <plist version="1.0">
 <dict>
   <key>NSRemovableVolumesUsageDescription</key>
-  <string>Camelid reads MiniMax-H3 model bundles and writes generated videos on your selected external drive.</string>
+  <string>Camelid reads local model files from folders you select on external drives.</string>
 </dict>
 </plist>

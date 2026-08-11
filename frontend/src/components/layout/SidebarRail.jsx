@@ -6,7 +6,7 @@ import { Tooltip } from '../ui/Tooltip'
 import { ConversationListItem } from './ConversationListItem'
 import {
   IconAnalytics, IconApi, IconBolt, IconChart, IconChat, IconClose, IconHistory, IconMemory, IconModels,
-  IconDownload, IconNetwork, IconNewChat, IconObservatory, IconReceipt, IconSearch, IconSettings, IconSidebar, IconSystem, IconVideo,
+  IconDownload, IconNetwork, IconNewChat, IconObservatory, IconReceipt, IconSearch, IconSettings, IconSidebar, IconSystem,
 } from '../ui/icons'
 
 const NAV_SECTIONS = [
@@ -15,7 +15,6 @@ const NAV_SECTIONS = [
     items: [
       { tab: 'chat', label: 'Chat', Icon: IconChat },
       { tab: 'workspace', label: 'Workspace', Icon: IconBolt },
-      { tab: 'video', label: 'Video Studio', Icon: IconVideo },
       { tab: 'history', label: 'Chat history', Icon: IconHistory },
       { tab: 'memory', label: 'Memory', Icon: IconMemory },
     ],

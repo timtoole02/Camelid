@@ -230,25 +230,6 @@ async fn choose_models_directory(
     }))
 }
 
-/// Pick an H3 bundle without changing Camelid's text-model storage preference.
-/// On macOS, selecting the external folder also gives the running app the
-/// user-mediated removable-volume access required by the video sidecar.
-#[tauri::command]
-async fn choose_video_models_directory(app: tauri::AppHandle) -> Result<Option<String>, String> {
-    let Some(selected) = app
-        .dialog()
-        .file()
-        .set_title("Choose the MiniMax-H3 model bundle")
-        .blocking_pick_folder()
-    else {
-        return Ok(None);
-    };
-    let selected = selected
-        .into_path()
-        .map_err(|err| format!("the selected folder is not a local filesystem path: {err}"))?;
-    Ok(Some(selected.to_string_lossy().into_owned()))
-}
-
 // Async for the same main-thread reason as choose_models_directory: this only
 // does small preference-file IO, but it has no business on the UI thread.
 #[tauri::command]
@@ -293,7 +274,6 @@ fn main() {
             startup_snapshot,
             retry_startup,
             choose_models_directory,
-            choose_video_models_directory,
             reset_models_directory
         ])
         .setup(|app| {

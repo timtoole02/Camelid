@@ -49,10 +49,10 @@ thiserror = "1"
 # contract and use the pure-Rust regex backend: no Oniguruma/C build, C++ esaxx,
 # progress UI, or hf-hub/network feature enters Camelid's cross-platform build.
 tokenizers = { version = "=0.23.1", default-features = false, features = ["fancy-regex"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "fs", "io-util"] }
-# CancellationToken for generation guard/compute lifetime equivalence plus
-# ReaderStream for range-capable local MiniMax-H3 WebM delivery.
-tokio-util = { version = "0.7", features = ["io"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+# CancellationToken for the generation paths: guard/compute lifetime equivalence
+# (see docs/recon/ENGINE_INVERSION_CONDUCTOR.md). sync-only, no extra features.
+tokio-util = "0.7"
 tower-http = { version = "0.5", features = ["trace", "cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

@@ -31,10 +31,9 @@ const CompatibilityView = lazy(() => import('./views/CompatibilityView'))
 const TelemetryView = lazy(() => import('./views/TelemetryView'))
 const InferenceObservatoryView = lazy(() => import('./views/InferenceObservatoryView'))
 const WorkspaceView = lazy(() => import('./views/WorkspaceView'))
-const VideoView = lazy(() => import('./views/VideoView'))
 
 const DEMO_UI = import.meta.env?.VITE_CAMELID_DEMO_UI === 'true'
-const HASH_TABS = new Set(['chat', 'workspace', 'video', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory', 'compatibility', 'telemetry'])
+const HASH_TABS = new Set(['chat', 'workspace', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory', 'compatibility', 'telemetry'])
 
 function App() {
   const { notice, noticeTone, showNotice, clearNotice } = useNotice()
@@ -375,10 +374,6 @@ function App() {
               runtime={runtime}
               setTab={navigateTab}
             />
-          )}
-
-          {tab === 'video' && (
-            <VideoView apiBase={apiBase} runtime={runtime} showNotice={showNotice} />
           )}
 
           {tab === 'analytics' && (

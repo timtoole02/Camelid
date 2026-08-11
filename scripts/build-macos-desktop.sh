@@ -44,19 +44,6 @@ mkdir -p "$desktop_dir/sidecar"
 cp "$build_target/release/camelid" "$desktop_dir/sidecar/camelid"
 chmod 755 "$desktop_dir/sidecar/camelid"
 
-# Optionally ship the checked H3 backend beside the Camelid sidecar. Keeping the
-# 25 GiB model bundle on external storage is still supported; only this small
-# executable is copied into the signed app so macOS can launch it without a
-# second removable-volume executable approval.
-if [ -n "${CAMELID_DESKTOP_SD_CLI:-}" ]; then
-  if [ ! -x "$CAMELID_DESKTOP_SD_CLI" ]; then
-    echo "error: CAMELID_DESKTOP_SD_CLI is not an executable file: $CAMELID_DESKTOP_SD_CLI" >&2
-    exit 1
-  fi
-  cp "$CAMELID_DESKTOP_SD_CLI" "$desktop_dir/sidecar/sd-cli"
-  chmod 755 "$desktop_dir/sidecar/sd-cli"
-fi
-
 (
   cd "$desktop_dir"
   npx --yes @tauri-apps/cli@^2 build --config tauri.macos.bundle.conf.json

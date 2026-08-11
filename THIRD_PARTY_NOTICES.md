@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-Last updated: 2026-08-11
+Last updated: 2026-06-18
 
 ## Scope note
 
@@ -76,23 +76,6 @@ ecosystem); this records its promotion to a direct, load-bearing dependency.
 
 - Project: <https://github.com/tokio-rs/tokio>
 - License: MIT
-
-### stable-diffusion.cpp (optional MiniMax H3 video backend)
-
-The experimental `camelid video` lane can invoke a separately installed
-`stable-diffusion.cpp` `sd-cli` binary for MiniMax H3 inference. Camelid does not
-redistribute that binary in the source tree and does not represent its C/C++ H3
-implementation as Camelid-native code. If a release later bundles the binary, its
-license and copyright notice must travel with that distribution.
-
-- Project: <https://github.com/leejet/stable-diffusion.cpp>
-- License: MIT
-- First Camelid-checked H3 revision: `c6beeef35526c6dc94b74a7fb69f9d2e6a2a7a12`
-
-MiniMax H3 model weights are separately governed by the
-[MiniMax-H3 Community License Agreement](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE),
-not by stable-diffusion.cpp's or Camelid's MIT license. Camelid requires an explicit
-acknowledgement before its video pull command downloads those artifacts.
 
 ## Maintenance note
 
