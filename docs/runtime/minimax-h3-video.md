@@ -49,6 +49,14 @@ runtime capability check for the required CLI flags. Put `sd-cli` beside the
 Camelid executable, on `PATH`, in `CAMELID_SD_CLI`, in
 `/Volumes/<drive>/Camelid/bin/sd-cli` on macOS, or pass `--sd-cli <path>`.
 
+On Windows, use `sd-cli.exe` and keep any DLLs from the same upstream build
+beside it. Camelid launches both the capability check and video render without
+opening a console window. Video Studio defaults to
+`<serve --models-dir>\minimax-h3`, rather than the process working directory,
+so an installed desktop app uses its resolved sidecar model store reliably.
+The **Choose** button can point it at `D:\Camelid\models\minimax-h3` (or another
+local/removable drive) without changing the text-model store.
+
 Follow the upstream
 [build instructions](https://github.com/leejet/stable-diffusion.cpp/blob/master/docs/build.md) for
 the desired Metal, CUDA, Vulkan, or CPU backend. Camelid does not download or
@@ -88,6 +96,24 @@ signed app while leaving the model files external:
 ```bash
 CAMELID_DESKTOP_SD_CLI=/path/to/sd-cli ./scripts/build-macos-desktop.sh
 ```
+
+For a Windows desktop bundle, stage a checked upstream build and its sibling
+runtime DLLs before invoking Tauri's existing resource overlay:
+
+```powershell
+.\scripts\stage-windows-h3-backend.ps1 C:\path\to\stable-diffusion.cpp\bin\sd-cli.exe
+npm.cmd --prefix frontend run build
+cargo build --release --locked --bin camelid
+Copy-Item target\release\camelid.exe camelid-desktop\sidecar\camelid.exe -Force
+Push-Location camelid-desktop
+npx.cmd --yes '@tauri-apps/cli@^2' build --config tauri.bundle.conf.json
+Pop-Location
+```
+
+`tauri.bundle.conf.json` already includes `sidecar/*`, so the NSIS resource
+layout places `sd-cli.exe` beside the bundled `camelid.exe`; the portable layout
+uses the same sibling discovery rule. The 24–27 GB model bundle remains outside
+the installer.
 
 ## Use Video Studio
 

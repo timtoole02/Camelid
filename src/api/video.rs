@@ -39,8 +39,8 @@ use tokio_util::io::ReaderStream;
 
 use super::AppState;
 use crate::minimax_h3::{
-    self, build_generation_plan, bundle_artifacts, preflight_sd_cli, GenerateRequest, H3Bundle,
-    H3Variant,
+    self, build_generation_plan, bundle_artifacts, configure_backend_command, preflight_sd_cli,
+    GenerateRequest, H3Bundle, H3Variant,
 };
 
 const MAX_RETAINED_JOBS: usize = 64;
@@ -184,7 +184,7 @@ pub(super) async fn capabilities(
     if let Some(response) = require_loopback(&state) {
         return response;
     }
-    let models_dir = discover_models_dir(query.models_dir.as_deref());
+    let models_dir = discover_models_dir(query.models_dir.as_deref(), &state.models_dir);
     let sd_cli = minimax_h3::resolve_sd_cli(query.sd_cli.as_deref().map(Path::new));
     let variant = query.variant.unwrap_or(H3Variant::Fl2va);
     let include_audio = query.include_audio.unwrap_or(true);
@@ -292,7 +292,7 @@ pub(super) async fn create_job(
     }
     let variant = input.variant.unwrap_or(H3Variant::Fl2va);
     let include_audio = input.include_audio.unwrap_or(true);
-    let models_dir = discover_models_dir(input.models_dir.as_deref());
+    let models_dir = discover_models_dir(input.models_dir.as_deref(), &state.models_dir);
     let sd_cli = minimax_h3::resolve_sd_cli(input.sd_cli.as_deref().map(Path::new));
     let output_dir = discover_output_dir(&models_dir);
     if let Err(error) = std::fs::create_dir_all(&output_dir) {
@@ -570,7 +570,9 @@ fn run_backend(
     let log_stderr = log_file
         .try_clone()
         .map_err(|error| format!("could not open generation log stream: {error}"))?;
-    let mut child = Command::new(sd_cli)
+    let mut command = Command::new(sd_cli);
+    configure_backend_command(&mut command);
+    let mut child = command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
@@ -601,7 +603,7 @@ fn run_backend(
     Ok(())
 }
 
-fn discover_models_dir(explicit: Option<&str>) -> PathBuf {
+fn discover_models_dir(explicit: Option<&str>, server_models_dir: &Path) -> PathBuf {
     if let Some(path) = explicit.map(str::trim).filter(|value| !value.is_empty()) {
         return PathBuf::from(path);
     }
@@ -621,19 +623,27 @@ fn discover_models_dir(explicit: Option<&str>) -> PathBuf {
             }
         }
     }
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("models")
-        .join("minimax-h3")
+    h3_models_dir(server_models_dir)
+}
+
+/// Keep Video Studio under the server's single resolved model-store authority.
+/// This matters in particular for the Windows desktop app, whose Explorer
+/// launch directory is not stable and may even be a protected system folder.
+fn h3_models_dir(server_models_dir: &Path) -> PathBuf {
+    if path_file_name_eq(server_models_dir, "minimax-h3") {
+        server_models_dir.to_path_buf()
+    } else {
+        server_models_dir.join("minimax-h3")
+    }
 }
 
 fn discover_output_dir(models_dir: &Path) -> PathBuf {
     if let Some(path) = std::env::var_os("CAMELID_H3_OUTPUT_DIR") {
         return PathBuf::from(path);
     }
-    if models_dir.file_name().and_then(|name| name.to_str()) == Some("minimax-h3") {
+    if path_file_name_eq(models_dir, "minimax-h3") {
         if let Some(models) = models_dir.parent() {
-            if models.file_name().and_then(|name| name.to_str()) == Some("models") {
+            if path_file_name_eq(models, "models") {
                 if let Some(camelid) = models.parent() {
                     return camelid.join("outputs");
                 }
@@ -641,6 +651,12 @@ fn discover_output_dir(models_dir: &Path) -> PathBuf {
         }
     }
     models_dir.join("outputs")
+}
+
+fn path_file_name_eq(path: &Path, expected: &str) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case(expected))
 }
 
 fn optional_path(value: Option<String>) -> Option<PathBuf> {
@@ -770,6 +786,27 @@ mod tests {
         assert_eq!(
             discover_output_dir(models),
             Path::new("/Volumes/External/Camelid/outputs")
+        );
+    }
+
+    #[test]
+    fn video_models_follow_the_resolved_server_model_store() {
+        let server_models = Path::new("/app/sidecar/models");
+        assert_eq!(
+            h3_models_dir(server_models),
+            server_models.join("minimax-h3")
+        );
+
+        let already_scoped = server_models.join("MiniMax-H3");
+        assert_eq!(h3_models_dir(&already_scoped), already_scoped);
+    }
+
+    #[test]
+    fn windows_style_case_does_not_break_the_external_output_layout() {
+        let models = Path::new("/External/Camelid/MODELS/MiniMax-H3");
+        assert_eq!(
+            discover_output_dir(models),
+            Path::new("/External/Camelid/outputs")
         );
     }
 

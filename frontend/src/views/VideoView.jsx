@@ -251,8 +251,8 @@ export default function VideoView({ apiBase = '', showNotice }) {
 
           {!ref2va && (
             <div className="video-grid video-grid--two">
-              <label className="cx-field"><span className="cx-field__label">First-frame image path <em>optional</em></span><input value={form.initImage} onChange={(event) => update('initImage', event.target.value)} placeholder="/path/to/start.png" /></label>
-              <label className="cx-field"><span className="cx-field__label">Last-frame image path <em>optional</em></span><input value={form.endImage} onChange={(event) => update('endImage', event.target.value)} placeholder="/path/to/end.png" /></label>
+              <label className="cx-field"><span className="cx-field__label">First-frame image path <em>optional</em></span><input value={form.initImage} onChange={(event) => update('initImage', event.target.value)} placeholder="Local path to start.png" /></label>
+              <label className="cx-field"><span className="cx-field__label">Last-frame image path <em>optional</em></span><input value={form.endImage} onChange={(event) => update('endImage', event.target.value)} placeholder="Local path to end.png" /></label>
             </div>
           )}
 

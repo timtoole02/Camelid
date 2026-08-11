@@ -19,6 +19,23 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// Keep backend console processes invisible when Camelid is launched from the
+/// Windows desktop shell. The desktop already starts `camelid.exe` without a
+/// console; applying the same flag to `sd-cli.exe` prevents a preflight or a
+/// long video render from flashing a separate console window.
+pub(crate) fn configure_backend_command(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    #[cfg(not(windows))]
+    let _ = command;
+}
+
 pub const COMMUNITY_LICENSE_URL: &str =
     "https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE";
 pub const BACKEND_SOURCE_URL: &str = "https://github.com/leejet/stable-diffusion.cpp";
@@ -443,7 +460,9 @@ pub fn resolve_sd_cli(explicit: Option<&Path>) -> PathBuf {
 }
 
 pub fn preflight_sd_cli(sd_cli: &Path) -> anyhow::Result<()> {
-    let mut child = Command::new(sd_cli)
+    let mut command = Command::new(sd_cli);
+    configure_backend_command(&mut command);
+    let mut child = command
         .arg("--help")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -469,7 +488,7 @@ pub fn preflight_sd_cli(sd_cli: &Path) -> anyhow::Result<()> {
             let _ = child.kill();
             let _ = child.wait();
             anyhow::bail!(
-                "{} --help did not finish within {} seconds; on macOS, approve Camelid's removable-volume access or bundle sd-cli with the desktop app",
+                "{} --help did not finish within {} seconds; check removable-drive access or bundle sd-cli with the desktop app",
                 sd_cli.display(),
                 BACKEND_PREFLIGHT_TIMEOUT.as_secs()
             );
@@ -587,7 +606,9 @@ pub fn generate(
     {
         std::fs::create_dir_all(parent)?;
     }
-    let status = Command::new(sd_cli)
+    let mut command = Command::new(sd_cli);
+    configure_backend_command(&mut command);
+    let status = command
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
