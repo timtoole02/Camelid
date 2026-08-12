@@ -1,6 +1,6 @@
 # Camelid Status
 
-Last updated: 2026-08-10
+Last updated: 2026-08-11
 
 Web Code revival note (2026-08-11): the approval-gated Code workbench from
 `feat/web-code-mode` has been integrated onto the current model/runtime line. It uses a distinct
@@ -13,6 +13,12 @@ Qwen3-4B-Q4_K_M Code turn through the browser SSE contract: `read_file(README.md
 `write_file(agent-proof.txt)`, and `read_file(agent-proof.txt)` all returned `ok`, and the created
 file contained the exact requested text. The integration fix preserves structured
 `delta.tool_calls` in the streaming client instead of discarding them as empty assistant content.
+The Code completion contract now also rejects raw program source passed to `run_shell`, directs the
+model to probe runtimes before suggesting installation (`py` before the Windows Store `python`
+alias), and refuses to record an actionable coding request as Complete until a checkpointed file
+write succeeds;
+repeated prose surrender records No progress instead of a false success. Package-manager installs
+remain Exec actions and therefore cross the session's approval boundary.
 This surface remains preview pending normal review and release promotion.
 
 PrismML/Bonsai macOS note (2026-08-01): seven hash-pinned Bonsai artifacts are promoted to `supported_exact_row_smoke` on Apple Silicon Metal: 4B Q1/Q2/PQ2, 8B Q1/Q2, and 27B Q1/Q2. The packed Prism Q1_0, structurally resolved type-id-42 Q2_0-G128, and PQ2_0 linears stay wire-resident while the complete qwen35 hybrid graph runs on Metal. The checked 27B Q1/Q2 rows also run the real Qwen3-VL Q8_0 projector; `/v1/chat/completions` and its SSE path accept one local PNG/JPEG data URL, `/v1/health` reports `vision_ready`, and the browser composer exposes a gated Image control. All seven language files are downloadable from the Models page and derive a Supported label from exact `/api/capabilities` rows. Receipt: `qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json`. Scope remains exact-file and macOS Apple Silicon Metal only: Windows, broad qwen35/quant support, bounded context, batched vision prefill, and production throughput remain unclaimed.

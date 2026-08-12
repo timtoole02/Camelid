@@ -77,6 +77,15 @@ accumulates name/argument fragments by call index and executes those calls befor
 family-specific text parsing. This keeps the browser's live stream behavior identical to the
 non-streaming agent-eval path that earned the model's `tool_capable` receipt.
 
+Code also enforces an artifact-completion contract for actionable coding requests: it will not emit
+an `answered`/Complete outcome until `write_file` or `edit_file` has successfully created a
+checkpointed workspace change. Natural-language surrender after a failed tool call is re-prompted;
+repeated surrender ends as `repeated`/No progress rather than a false success. `run_shell` rejects
+multi-line source pasted as a command and directs the model to write the source first. Runtime
+recovery guidance requires a host probe before proposing installation (including the Windows `py`
+launcher before the Microsoft Store `python.exe` alias), and any real package-manager install still
+crosses the existing Exec approval boundary.
+
 ## API additions
 
 All endpoints remain under `/api/agent/workspace`:
@@ -112,8 +121,9 @@ one the server made itself, and it unwinds in the order it was actually committe
 
 Local Windows validation covers the allowlist and authorization tests, approval/cancellation bridge
 tests, a real Qwen3-4B-Q4_K_M read/write turn, exact-action approval, created-file verification,
-diff, durable history restore, guarded undo, desktop and 390 px responsive WebUI checks, the full
-core Rust suite, Desktop tests/build/Clippy, frontend build/smokes, and dependency audit.
+diff, durable history restore, guarded undo, raw-source shell rejection, failed-tool coding recovery,
+false-completion prevention, desktop and 390 px responsive WebUI checks, the full core Rust suite,
+Desktop tests/build/Clippy, frontend build/smokes, and dependency audit.
 
 This preview does not promote any model, quantization, backend, context window, operating system,
 latency, throughput, or broader product-support claim.

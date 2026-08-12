@@ -258,6 +258,14 @@ fn read_journal(root: &Path) -> Vec<Checkpoint> {
         .collect()
 }
 
+/// Number of committed, parseable checkpoints in this workspace's shared
+/// journal. The agent loop uses a turn-start baseline so a child process's
+/// write can satisfy Code's artifact-completion contract without treating an
+/// unrelated successful shell probe as a workspace change.
+pub fn committed_count(root: &Path) -> usize {
+    read_journal(root).len()
+}
+
 /// Fold checkpoints committed by other processes (subagents) into this
 /// process's log, in the order they were actually committed.
 ///

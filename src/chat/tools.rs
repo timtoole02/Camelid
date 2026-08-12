@@ -515,7 +515,13 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
     if shell_mode != ShellSandbox::Disabled {
         tools.push(ToolSpec {
             name: "run_shell".into(),
-            description: "Run a shell command in the workspace and capture its output.".into(),
+            description: concat!(
+                "Run a shell command in the workspace and capture its output. Pass a command ",
+                "line, never raw program source: create source with write_file first, then invoke ",
+                "its runtime. Probe a missing runtime before attempting an approval-gated ",
+                "package-manager install."
+            )
+            .into(),
             risk: Risk::Exec,
             params: json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}),
         });
@@ -1200,6 +1206,54 @@ fn refuse_agent_state_write(sandbox: &Sandbox, resolved: &Path) -> Result<(), St
     Ok(())
 }
 
+/// Catch the small-model failure where an entire source file is passed as the
+/// `run_shell` command. Shells then try to execute the first language keyword
+/// (`import`, `class`, `fn`, ...), which produces a misleading "command not
+/// found" result and often makes the model surrender. A real shell wrapper or
+/// heredoc starts with an interpreter/command and is deliberately not matched.
+fn looks_like_raw_program_source(command: &str) -> bool {
+    if !command.contains('\n') && !command.contains('\r') {
+        return false;
+    }
+    let first = command
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let lower = first.to_ascii_lowercase();
+    lower.starts_with("import ")
+        || lower.starts_with("from ")
+        || lower.starts_with("class ")
+        || lower.starts_with("def ")
+        || lower.starts_with("function ")
+        || lower.starts_with("const ")
+        || lower.starts_with("let ")
+        || lower.starts_with("fn main")
+        || lower.starts_with("use ")
+        || lower.starts_with("#include ")
+        || lower.starts_with("<!doctype html")
+        || lower.starts_with("<html")
+}
+
+fn validate_shell_command(command: String) -> Result<Action, String> {
+    if command.trim().is_empty() {
+        return Err("run_shell requires a non-empty `command`".into());
+    }
+    if looks_like_raw_program_source(&command) {
+        return Err(concat!(
+            "run_shell accepts a shell command, but this looks like raw program source. Use ",
+            "write_file to create the source file first, then call run_shell with an interpreter ",
+            "command. For Python, probe `py --version` first on Windows, then `python3 --version` ",
+            "or `python --version`; run `py your_file.py` when the Windows launcher is available. ",
+            "Only if no runtime exists, submit an appropriate package-manager install through ",
+            "run_shell so the approval policy can ask the user. Do not ask the user to install ",
+            "it manually."
+        )
+        .into());
+    }
+    Ok(Action::RunShell { command })
+}
+
 /// Validate a parsed tool call against the schema + sandbox. Returns a typed
 /// error string (→ tool-error result the model can recover from) rather than
 /// panicking, for unknown tools, bad args, or sandbox escapes.
@@ -1294,9 +1348,7 @@ pub fn validate_for(
                 new: str_arg("new")?,
             })
         }
-        "run_shell" => Ok(Action::RunShell {
-            command: str_arg("command")?,
-        }),
+        "run_shell" => validate_shell_command(str_arg("command")?),
         "http_fetch" => {
             if !sandbox.allow_net {
                 return Err("network tools are disabled (start with --allow-net)".into());
@@ -3496,6 +3548,33 @@ mod tests {
         assert_eq!(a.risk(), Risk::Exec);
         let out = a.execute(&sb);
         assert!(matches!(out, ToolOutcome::Ok(ref s) if s.contains("hi")));
+    }
+
+    #[test]
+    fn raw_program_source_is_rejected_as_a_shell_command_with_recovery_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path());
+        let source = "import tkinter as tk\n\nclass TicTacToe:\n    pass\n";
+        let error = match validate(&call("run_shell", json!({"command": source})), &sb) {
+            Ok(_) => panic!("raw Python source must not be executed as a shell command"),
+            Err(error) => error,
+        };
+        assert!(error.contains("raw program source"), "{error}");
+        assert!(error.contains("write_file"), "{error}");
+        assert!(error.contains("py --version"), "{error}");
+        assert!(error.contains("approval policy"), "{error}");
+
+        // A real interpreter command and a Unix heredoc both start with a shell
+        // command, not a language keyword, so they remain valid.
+        assert!(validate(&call("run_shell", json!({"command":"py game.py"})), &sb).is_ok());
+        assert!(validate(
+            &call(
+                "run_shell",
+                json!({"command":"python3 - <<'PY'\nimport sys\nprint(sys.version)\nPY"})
+            ),
+            &sb
+        )
+        .is_ok());
     }
 
     #[test]
