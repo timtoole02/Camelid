@@ -2862,6 +2862,9 @@ fn uia_screenshot(_path: &Path) -> ToolOutcome {
 // --- helpers --------------------------------------------------------------
 
 fn clip(s: &str) -> String {
+    if extended_shell_capture() {
+        return clip_head_tail(s);
+    }
     if s.len() <= MAX_OUTPUT_BYTES {
         s.trim_end().to_string()
     } else {
@@ -2874,6 +2877,47 @@ fn clip(s: &str) -> String {
         }
         format!("{}\n…[truncated]", &s[..end])
     }
+}
+
+// Context paging stores shell output externally and shows the model only a
+// compact summary, so it captures a much larger, tail-inclusive window: test
+// and build failures print their assertions near the END of the log, which a
+// head-only 16 KiB clip would drop before the artifact store ever saw them.
+// Thread-local and set explicitly by the agent loop each run: tool execution
+// happens on the loop's own thread, so a paging session cannot change capture
+// behavior for a concurrent legacy session (or another test) in this process.
+thread_local! {
+    static EXTENDED_SHELL_CAPTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+const EXTENDED_CAPTURE_HEAD_BYTES: usize = 64 * 1024;
+const EXTENDED_CAPTURE_TAIL_BYTES: usize = 192 * 1024;
+
+pub(crate) fn set_extended_shell_capture(enabled: bool) {
+    EXTENDED_SHELL_CAPTURE.with(|flag| flag.set(enabled));
+}
+
+fn extended_shell_capture() -> bool {
+    EXTENDED_SHELL_CAPTURE.with(std::cell::Cell::get)
+}
+
+fn clip_head_tail(s: &str) -> String {
+    if s.len() <= EXTENDED_CAPTURE_HEAD_BYTES + EXTENDED_CAPTURE_TAIL_BYTES {
+        return s.trim_end().to_string();
+    }
+    let mut head_end = EXTENDED_CAPTURE_HEAD_BYTES;
+    while head_end > 0 && !s.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = s.len() - EXTENDED_CAPTURE_TAIL_BYTES;
+    while tail_start < s.len() && !s.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!(
+        "{}\n…[{} bytes omitted]…\n{}",
+        &s[..head_end],
+        tail_start - head_end,
+        &s[tail_start..]
+    )
 }
 
 fn first_line(s: &str) -> String {

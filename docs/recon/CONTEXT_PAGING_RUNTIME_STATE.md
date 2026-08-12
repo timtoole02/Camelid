@@ -41,14 +41,30 @@ outside the model.
 - Passed the final capped full library regression: 1,874 passed, 0 failed, and
   86 ignored. The run used two test threads, two-core affinity, below-normal
   priority, and Camelid's shared Cargo target.
+- Completed a 14-finding adversarial audit and fixed every confirmed defect:
+  startup on repositories with >1 MB files, symbol-ID collisions, host-owned
+  completion gating, typed-action loop bounds, tail-inclusive raw capture,
+  search-result visibility, the eviction ladder, ledger bounding, tokenizer
+  calibration rebuilds, deletion invalidation, parent symbols, and atomic
+  persistence. Added regression tests for each fix (16 new unit tests).
+- Live Qwen3-4B smoke runs on a real playground exposed and fixed three more
+  greedy-small-model defects: structural recovery for typed-action JSON whose
+  string values carry unescaped quotes (a Python docstring's `"""` ended the
+  strict string mid-value and the model repeated the same bytes forever), a
+  body-fragment guard plus full-file write_file escalation for PATCHes that
+  would replace a whole page with a headless method, trailing-newline
+  normalization on page replacement, and duplicate-NEED_CONTEXT steering (a
+  re-request of a page already in the capsule now changes the canonical focus
+  so the next capsule breaks the greedy fixed point).
 
 ## Current focus
 
-Implementation and validation are complete; keep rollout opt-in while the live
-evidence is reviewed.
+Final gate run (fmt, clippy, full tests, scrub), then merge origin/main and
+push.
 
 ## Remaining work
 
+- Merge codex/web-code-revival with origin/main and push.
 - Review the opt-in rollout evidence and decide when
   `CAMELID_CONTEXT_PAGING=1` should become the default Web Code path.
 
@@ -58,3 +74,8 @@ evidence is reviewed.
   expensive inference and ended as no progress.
 - Transcript-only pruning bounds size but does not provide canonical restartable
   task state, hash invalidation, or exact-source authority.
+- Pinning a repeatedly faulted page without changing the rendered focus does
+  not break a greedy model's fault loop: the capsule bytes stay identical, so
+  the model re-emits the identical fault. Steering must alter canonical state.
+- A process-global extended-capture flag leaked across concurrent sessions and
+  the test process; the capture mode is thread-scoped and set per run instead.

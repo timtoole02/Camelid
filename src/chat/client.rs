@@ -134,6 +134,9 @@ pub struct StreamStats {
     /// when the request opted in via `stream_options.include_usage` (the agent
     /// lane's calibration signal); `None` otherwise.
     pub prompt_tokens: Option<u32>,
+    /// Server-reported completion tokens from the same terminal usage chunk;
+    /// feeds the paging lane's output-tokens-per-request metric.
+    pub completion_tokens: Option<u32>,
     /// Structured OpenAI tool-call deltas accumulated across the stream. The
     /// dense chat server deliberately withholds a possible tool-call envelope
     /// from `delta.content`, then emits it here at completion. Dropping this
@@ -490,6 +493,7 @@ impl Client {
                 total_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
                 ttft_ms: None,
                 prompt_tokens: None,
+                completion_tokens: None,
                 tool_calls: Vec::new(),
             });
         }
@@ -503,6 +507,7 @@ impl Client {
         // From the terminal usage chunk, when the request opted in via
         // stream_options.include_usage (agent lane); absent otherwise.
         let mut prompt_tokens: Option<u32> = None;
+        let mut completion_tokens: Option<u32> = None;
         // `finish_reason: "length"` is the ONLY signal that the model was cut
         // off at max_tokens. Without it a capped step is indistinguishable from
         // a finished one, and half-written tool calls get committed as answers.
@@ -576,6 +581,12 @@ impl Client {
                     {
                         prompt_tokens = Some(pt as u32);
                     }
+                    if let Some(ct) = chunk
+                        .pointer("/usage/completion_tokens")
+                        .and_then(Value::as_u64)
+                    {
+                        completion_tokens = Some(ct as u32);
+                    }
                 }
             }
             SseControl::Continue
@@ -598,6 +609,7 @@ impl Client {
             total_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
             ttft_ms,
             prompt_tokens,
+            completion_tokens,
             tool_calls,
         })
     }

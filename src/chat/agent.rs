@@ -70,6 +70,7 @@ pub struct AgentConfig {
 }
 
 /// What the model produced for one step.
+#[derive(Clone)]
 pub enum ModelStep {
     /// A final natural-language answer — ends the loop.
     Text(String),
@@ -361,6 +362,13 @@ const VERIFICATION_REPROMPT_LIMIT: usize = 2;
 /// produce several distinct-but-still-wrong rewrites, each of which would
 /// otherwise create another checkpoint and consume another long inference.
 const CONTEXT_PAGING_VERIFICATION_FAILURE_LIMIT: usize = 3;
+/// The web Code lane runs without a step ceiling, so the typed-action paths
+/// that `continue` without executing anything need their own bound: this many
+/// consecutive model steps with no executed workspace action end the run.
+const PAGING_NONPROGRESS_LIMIT: usize = 16;
+/// Exact-tokenizer overflows rebuild a smaller capsule instead of failing the
+/// run, at most this many times per run.
+const PAGING_BUDGET_REBUILD_LIMIT: usize = 3;
 const PAGING_FULL_REWRITE_FOCUS: &str = concat!(
     "Narrow edit recovery is exhausted. Replace the complete existing file with ",
     "write_file, preserving required behavior and correcting every persisted diagnostic."
@@ -792,6 +800,11 @@ pub fn run_loop(
     } else {
         None
     };
+    // Shell output for a paging session is stored externally and compacted for
+    // the model, so its capture window is tail-inclusive. Set explicitly both
+    // ways: tool execution happens on this thread, and a stale value from a
+    // previous run on a reused thread must not leak into a legacy session.
+    tools::set_extended_shell_capture(context_paging.is_some());
     let mut paging_discovery_complete = context_paging.as_ref().is_none_or(|runtime| {
         cfg.default_write_path.is_some() || !runtime.ledger.relevant_symbols.is_empty()
     });
@@ -802,7 +815,7 @@ pub fn run_loop(
                 .verification_state
                 .failing_diagnostic
                 .as_deref()
-                .and_then(|reference| runtime.inspect_diagnostic(reference).ok())
+                .and_then(|reference| runtime.inspect_diagnostic(reference, None).ok())
         });
     // Per-call (count, last_result): the no-progress guard is result-aware (see
     // `note_no_progress`).
@@ -831,9 +844,11 @@ pub fn run_loop(
         cfg.tool_profile.is_workspace() && workspace_request_requires_observation(history);
     let require_workspace_change = cfg.tool_profile == tools::ToolProfile::WebCode
         && workspace_request_requires_change(history);
-    let initial_checkpoint_count = require_workspace_change
-        .then(|| super::checkpoint::committed_count(sandbox.root()))
-        .unwrap_or(0);
+    let initial_checkpoint_count = if require_workspace_change {
+        super::checkpoint::committed_count(sandbox.root())
+    } else {
+        0
+    };
     let required_workspace_reads = if cfg.tool_profile.is_workspace() {
         workspace_existing_file_paths(
             history
@@ -902,11 +917,29 @@ pub fn run_loop(
     let mut malformed_tool_reprompts = 0usize;
     let mut paging_action_rejections = 0usize;
     let mut paging_verification_failures = 0usize;
+    let mut paging_nonprogress_steps = 0usize;
+    let mut paging_budget_rebuilds = 0usize;
+    let mut paging_typed_patch_rejections = 0usize;
+    let mut paging_blocked_answer = false;
     let mut python_alias_guidance_sent = false;
     let mut direct_python_rewrite_required = false;
     let mut direct_python_rewrite_violations = 0usize;
     #[cfg(windows)]
     let mut windows_python_launcher_verified = false;
+    // Every typed-action path that `continue`s without executing a workspace
+    // action must pass through this bound; a successful tool execution resets
+    // it. This is the paging lane's substitute for a step ceiling.
+    macro_rules! paging_no_progress {
+        () => {
+            paging_nonprogress_steps += 1;
+            if paging_nonprogress_steps >= PAGING_NONPROGRESS_LIMIT {
+                reporter.notice(
+                    "stopping: context paging kept cycling typed actions without executing any workspace action",
+                );
+                return LoopEnd::Repeated;
+            }
+        };
+    }
     loop {
         if cfg.max_steps != 0 && completed_steps >= cfg.max_steps {
             break;
@@ -1099,6 +1132,22 @@ pub fn run_loop(
         if let (Some(capsule), Some(exact_prompt_tokens)) = (paging_capsule.as_ref(), prompt_tokens)
         {
             if exact_prompt_tokens > capsule.max_input_tokens {
+                // The request has NOT been sent yet — the preflight count came
+                // from fit_history_to_budget. Recalibrate the estimator from
+                // this exact measurement and rebuild a smaller capsule instead
+                // of failing the whole run on estimator drift.
+                if paging_budget_rebuilds < PAGING_BUDGET_REBUILD_LIMIT {
+                    paging_budget_rebuilds += 1;
+                    if let Some(runtime) = context_paging.as_mut() {
+                        let bytes = capsule.rendered.len().max(1);
+                        runtime.set_token_calibration(exact_prompt_tokens as f32 / bytes as f32);
+                    }
+                    reporter.notice(&format!(
+                        "context capsule measured {exact_prompt_tokens} exact tokens over the {} limit; rebuilding a smaller capsule",
+                        capsule.max_input_tokens
+                    ));
+                    continue;
+                }
                 reporter.notice(&format!(
                     "context capsule exact tokenizer count {exact_prompt_tokens} exceeds configured input limit {}",
                     capsule.max_input_tokens
@@ -1110,6 +1159,10 @@ pub fn run_loop(
                     reporter.notice(&format!("context paging metrics error: {error}"));
                     return LoopEnd::DriverError;
                 }
+                // Keep composition estimates honest against the live tokenizer
+                // even when the capsule fit.
+                let bytes = capsule.rendered.len().max(1);
+                runtime.set_token_calibration(exact_prompt_tokens as f32 / bytes as f32);
             }
         }
         if trimmed {
@@ -1186,10 +1239,37 @@ pub fn run_loop(
                     match runtime.execute_typed_action(&action, capsule) {
                         Ok(Some(page)) => {
                             paging_discovery_complete = true;
-                            reporter.notice(&format!(
-                                "context page loaded: {} ({}:{}-{})",
-                                page.symbol_id, page.file, page.start_line, page.end_line
-                            ));
+                            // A greedy model re-requesting a page it already
+                            // has would see an identical capsule next step and
+                            // loop forever. A duplicate fault must CHANGE the
+                            // canonical state so the next capsule steers away
+                            // from another fault.
+                            if capsule.exact_page_ids.contains(&page.id) {
+                                runtime.ledger.failed_attempts.push(format!(
+                                    "NEED_CONTEXT duplicate: {} was already included as exact source",
+                                    page.symbol_id
+                                ));
+                                runtime.ledger.current_focus = format!(
+                                    "The exact source for {} is ALREADY in this capsule. Do not \
+                                     request it again: act on it now with one hash-checked PATCH \
+                                     or edit_file call.",
+                                    page.symbol_id
+                                );
+                                if let Err(error) = runtime.save() {
+                                    reporter
+                                        .notice(&format!("context paging state error: {error}"));
+                                    return LoopEnd::DriverError;
+                                }
+                                reporter.notice(&format!(
+                                    "duplicate context page fault: {} is already in the capsule",
+                                    page.symbol_id
+                                ));
+                            } else {
+                                reporter.notice(&format!(
+                                    "context page loaded: {} ({}:{}-{})",
+                                    page.symbol_id, page.file, page.start_line, page.end_line
+                                ));
+                            }
                         }
                         Ok(None) => {}
                         Err(error) => {
@@ -1205,24 +1285,65 @@ pub fn run_loop(
                             reporter.notice(&format!("context page fault failed: {error}"));
                         }
                     }
+                    paging_no_progress!();
                     continue;
                 }
                 Ok(action @ TypedModelAction::Patch { .. }) => {
                     step = match runtime.prepare_patch_tool_call(&action, capsule) {
                         Ok(call) => ModelStep::Calls(vec![call]),
                         Err(error) => {
+                            paging_typed_patch_rejections =
+                                paging_typed_patch_rejections.saturating_add(1);
                             runtime
                                 .ledger
                                 .failed_attempts
                                 .push(format!("PATCH rejected: {error}"));
-                            runtime.ledger.current_focus =
-                                "Reload exact source and produce a hash-matched patch".into();
+                            let message = error.to_string();
+                            if message.contains("body fragment") {
+                                runtime.ledger.current_focus = concat!(
+                                    "The last PATCH was a body fragment. PATCH replaces the ",
+                                    "ENTIRE exact page: resend it with the full declaration ",
+                                    "line and every existing member plus your addition."
+                                )
+                                .into();
+                            } else {
+                                runtime.ledger.current_focus =
+                                    "Reload exact source and produce a hash-matched patch".into();
+                            }
+                            // Two rejected typed patches mean this model cannot
+                            // author a page replacement. Pin the complete file
+                            // as exact source and require a full write_file
+                            // rewrite — the strongest recovery the exact-source
+                            // authority allows.
+                            if paging_typed_patch_rejections >= 2 {
+                                if let TypedModelAction::Patch { target, .. } = &action {
+                                    let file = runtime
+                                        .project
+                                        .resolve_symbol(target)
+                                        .and_then(|symbol| {
+                                            runtime.project.cards.get(&symbol).cloned()
+                                        })
+                                        .map(|card| card.file);
+                                    if let Some(file) = file {
+                                        if runtime.need_context(&file).is_ok() {
+                                            runtime.ledger.current_focus = concat!(
+                                                "Typed PATCH failed repeatedly. Call write_file ",
+                                                "with the COMPLETE corrected file (the full ",
+                                                "exact source is in this capsule) including ",
+                                                "your addition."
+                                            )
+                                            .into();
+                                        }
+                                    }
+                                }
+                            }
                             if let Err(save_error) = runtime.save() {
                                 reporter
                                     .notice(&format!("context paging state error: {save_error}"));
                                 return LoopEnd::DriverError;
                             }
                             reporter.notice(&format!("typed patch rejected: {error}"));
+                            paging_no_progress!();
                             continue;
                         }
                     };
@@ -1243,8 +1364,11 @@ pub fn run_loop(
                         args: json!({"command": command}),
                     }]);
                 }
-                Ok(TypedModelAction::InspectDiagnostic { reference }) => {
-                    match runtime.inspect_diagnostic(&reference) {
+                Ok(TypedModelAction::InspectDiagnostic {
+                    reference,
+                    start_line,
+                }) => {
+                    match runtime.inspect_diagnostic(&reference, start_line) {
                         Ok(diagnostic) => {
                             paging_diagnostic = Some(diagnostic);
                             runtime.ledger.current_focus =
@@ -1260,18 +1384,52 @@ pub fn run_loop(
                             reporter.notice(&format!("diagnostic lookup failed: {error}"));
                         }
                     }
+                    paging_no_progress!();
                     continue;
                 }
                 Ok(TypedModelAction::UpdatePlan { current_focus }) => {
-                    runtime.ledger.current_focus = current_focus;
+                    if current_focus.trim().is_empty() {
+                        runtime
+                            .ledger
+                            .failed_attempts
+                            .push("UPDATE_PLAN rejected: empty focus".into());
+                        reporter.notice("typed UPDATE_PLAN rejected: empty focus");
+                    } else {
+                        runtime.ledger.current_focus = current_focus;
+                        reporter.notice("canonical task focus updated");
+                    }
+                    plan_updates = plan_updates.saturating_add(1);
                     if let Err(error) = runtime.save() {
                         reporter.notice(&format!("context paging state error: {error}"));
                         return LoopEnd::DriverError;
                     }
-                    reporter.notice("canonical task focus updated");
+                    paging_no_progress!();
                     continue;
                 }
                 Ok(TypedModelAction::Complete { summary }) => {
+                    // Verification is host-owned: the model may not author a
+                    // verified completion. COMPLETE is accepted only after the
+                    // host-run verification actually passed.
+                    let verified = matches!(
+                        runtime.ledger.verification_state.status.as_str(),
+                        "passed" | "complete"
+                    );
+                    if !verified || summary.trim().is_empty() {
+                        runtime
+                            .ledger
+                            .failed_attempts
+                            .push("COMPLETE rejected: host verification has not passed".into());
+                        runtime.ledger.current_focus =
+                            "Run the narrowest relevant verification before completing".into();
+                        if let Err(error) = runtime.save() {
+                            reporter.notice(&format!("context paging state error: {error}"));
+                            return LoopEnd::DriverError;
+                        }
+                        reporter
+                            .notice("typed COMPLETE rejected: host verification has not passed");
+                        paging_no_progress!();
+                        continue;
+                    }
                     runtime.ledger.current_focus = "Task complete".into();
                     runtime.ledger.verification_state.status = "complete".into();
                     if let Err(error) = runtime.save() {
@@ -1281,12 +1439,28 @@ pub fn run_loop(
                     step = ModelStep::Text(summary);
                 }
                 Ok(TypedModelAction::Blocked { reason }) => {
+                    if reason.trim().is_empty() {
+                        runtime
+                            .ledger
+                            .failed_attempts
+                            .push("BLOCKED rejected: empty reason".into());
+                        if let Err(error) = runtime.save() {
+                            reporter.notice(&format!("context paging state error: {error}"));
+                            return LoopEnd::DriverError;
+                        }
+                        reporter.notice("typed BLOCKED rejected: empty reason");
+                        paging_no_progress!();
+                        continue;
+                    }
+                    // A blocked task is not a completed one: the ledger keeps
+                    // its honest verification status and the blocked focus.
                     runtime.ledger.current_focus = format!("Blocked: {reason}");
                     runtime.ledger.open_questions.push(reason.clone());
                     if let Err(error) = runtime.save() {
                         reporter.notice(&format!("context paging state error: {error}"));
                         return LoopEnd::DriverError;
                     }
+                    paging_blocked_answer = true;
                     step = ModelStep::Text(format!("Blocked: {reason}"));
                 }
                 Err(error)
@@ -1304,6 +1478,7 @@ pub fn run_loop(
                         return LoopEnd::DriverError;
                     }
                     reporter.notice(&format!("typed action rejected: {error}"));
+                    paging_no_progress!();
                     continue;
                 }
                 Err(_) => {}
@@ -1652,12 +1827,36 @@ pub fn run_loop(
                     continue;
                 }
                 if let Some(runtime) = context_paging.as_mut() {
-                    runtime.ledger.verification_state.status = if workspace_changed {
-                        "complete".into()
-                    } else {
-                        runtime.ledger.verification_state.status.clone()
-                    };
-                    runtime.ledger.current_focus = "Task complete".into();
+                    let verified = matches!(
+                        runtime.ledger.verification_state.status.as_str(),
+                        "passed" | "complete"
+                    );
+                    if workspace_changed && verified {
+                        // Only a host-verified change may be recorded complete.
+                        runtime.ledger.verification_state.status = "complete".into();
+                        runtime.ledger.current_focus = "Task complete".into();
+                    } else if workspace_changed && !paging_blocked_answer {
+                        // The workspace changed but host verification has not
+                        // passed: a prose answer must not end the task as
+                        // verified. Reprompt within the no-progress bound, then
+                        // accept the answer while persisting the honest status.
+                        if paging_nonprogress_steps + 1 < PAGING_NONPROGRESS_LIMIT {
+                            runtime.ledger.failed_attempts.push(
+                                "A prose answer arrived before host verification passed".into(),
+                            );
+                            runtime.ledger.current_focus =
+                                "Run the narrowest relevant verification before completing".into();
+                            if let Err(error) = runtime.save() {
+                                reporter.notice(&format!("context paging state error: {error}"));
+                                return LoopEnd::DriverError;
+                            }
+                            reporter.notice(
+                                "prose completion before host verification; requesting verification",
+                            );
+                            paging_no_progress!();
+                            continue;
+                        }
+                    }
                     if let Err(error) = runtime.save().and_then(|_| runtime.record_task_complete())
                     {
                         reporter.notice(&format!("context paging completion error: {error}"));
@@ -1692,6 +1891,7 @@ pub fn run_loop(
                             reporter.notice(&format!("context paging state error: {error}"));
                             return LoopEnd::DriverError;
                         }
+                        paging_no_progress!();
                     }
                     continue;
                 }
@@ -1725,7 +1925,12 @@ pub fn run_loop(
                                 .into();
                         paging_action_rejections = paging_action_rejections.saturating_add(1);
                         if message.contains("identical to the current source") {
-                            tools.retain(|tool| tool.name != "write_file");
+                            // Removing write_file is only safe while edit_file
+                            // remains; dropping both would strand the run with
+                            // no modification tool at all.
+                            if tools.iter().any(|tool| tool.name == "edit_file") {
+                                tools.retain(|tool| tool.name != "write_file");
+                            }
                             runtime.ledger.current_focus = concat!(
                                 "The previous full-file rewrite was byte-for-byte identical and was rejected. ",
                                 "Do not reproduce the exact page. Use PATCH or edit_file to make a real change ",
@@ -2209,6 +2414,10 @@ pub fn run_loop(
                             _ => None,
                         };
                         let status = if raw_outcome.is_err() { "error" } else { "ok" };
+                        if !raw_outcome.is_err() {
+                            // An executed workspace action is real progress.
+                            paging_nonprogress_steps = 0;
+                        }
                         let compact =
                             match runtime.compact_result(status, command, raw_outcome.text()) {
                                 Ok(compact) => compact,
@@ -2218,7 +2427,20 @@ pub fn run_loop(
                                     return LoopEnd::DriverError;
                                 }
                             };
-                        if raw_outcome.is_err() || matches!(&action, Action::RunShell { .. }) {
+                        // Fresh capsules never replay history, so the compact
+                        // summary is the ONLY channel through which any tool
+                        // result reaches the model. Successful search, listing,
+                        // and read results ride the diagnostic slot too (status
+                        // "ok"), or the model could never see them at all.
+                        if raw_outcome.is_err()
+                            || matches!(
+                                &action,
+                                Action::RunShell { .. }
+                                    | Action::Search { .. }
+                                    | Action::ListDir { .. }
+                                    | Action::ReadFile { .. }
+                            )
+                        {
                             paging_diagnostic = Some(compact.clone());
                         }
                         match &action {
@@ -2276,9 +2498,16 @@ pub fn run_loop(
                                     runtime.ledger.verification_state.last_command =
                                         Some(command.clone());
                                     if verification.is_err() {
+                                        // Bounded: raw compiler output belongs in
+                                        // the artifact store, not the ledger focus.
+                                        let mut detail = verification.text().to_string();
+                                        if let Some((boundary, _)) = detail.char_indices().nth(400)
+                                        {
+                                            detail.truncate(boundary);
+                                            detail.push('…');
+                                        }
                                         semantic_contract_findings.push(format!(
-                                            "Python syntax validation failed for {relative}: {}",
-                                            verification.text()
+                                            "Python syntax validation failed for {relative}: {detail}"
                                         ));
                                     }
                                 }
@@ -2369,6 +2598,20 @@ pub fn run_loop(
                         reporter.notice(
                             "Python verification failed; requiring a complete source replacement",
                         );
+                        // Paging never replays history, so recovery guidance
+                        // must live in the ledger the next capsule renders.
+                        if let Some(runtime) = context_paging.as_mut() {
+                            runtime.ledger.current_focus = concat!(
+                                "The Python traceback/syntax error proves the artifact is broken. ",
+                                "Your next action must be write_file with the COMPLETE corrected ",
+                                "source at the same workspace-relative path."
+                            )
+                            .into();
+                            if let Err(error) = runtime.save() {
+                                reporter.notice(&format!("context paging state error: {error}"));
+                                return LoopEnd::DriverError;
+                            }
+                        }
                         history.push(AgentMsg::System(
                             "The Python traceback/syntax error proves the current standalone artifact is broken. Do not read more lines, rerun it, explain, or answer. Your NEXT tool call must be write_file with the COMPLETE corrected source at the same workspace-relative path."
                                 .into(),
@@ -2379,6 +2622,18 @@ pub fn run_loop(
                         reporter.notice(
                             "Python launcher verified; requiring artifact work instead of installation",
                         );
+                        if let Some(runtime) = context_paging.as_mut() {
+                            runtime.ledger.current_focus = concat!(
+                                "Python is installed (`py --version` succeeded); do not run any ",
+                                "install command. Write or fix the requested source, then verify ",
+                                "with `py -m py_compile <file.py>`."
+                            )
+                            .into();
+                            if let Err(error) = runtime.save() {
+                                reporter.notice(&format!("context paging state error: {error}"));
+                                return LoopEnd::DriverError;
+                            }
+                        }
                         history.push(AgentMsg::System(
                             "`py --version` succeeded, so Python is installed and ready. Do not run any install command. Fix or write the requested source now using its workspace-relative path, then use `py -m py_compile <file.py>` for a bounded syntax check; do not launch a GUI during verification."
                                 .into(),
@@ -3749,7 +4004,9 @@ impl LiveDriver {
         self.last_step_metrics = Some(ModelStepMetrics {
             total_ms: stats.total_ms,
             ttft_ms: stats.ttft_ms,
-            output_tokens: None,
+            // From the same terminal usage chunk that carries prompt_tokens;
+            // the paging lane's output-token metric depends on it.
+            output_tokens: stats.completion_tokens,
         });
         // The calibration signal for the compaction budget, from the terminal
         // usage chunk the streaming request opts into.
@@ -4857,6 +5114,256 @@ mod tests {
             .join(".camelid/context-paging/ledgers")
             .is_dir());
         super::super::checkpoint::clear_for_workspace(sandbox.root());
+    }
+
+    /// Shared scripted driver for the paging gate tests: replies with the
+    /// scripted step and records every capsule and tool set it was shown.
+    struct ScriptedPagingDriver {
+        steps: Vec<ModelStep>,
+        index: usize,
+        histories: Vec<Vec<AgentMsg>>,
+    }
+    impl ModelDriver for ScriptedPagingDriver {
+        fn step(&mut self, history: &[AgentMsg], _tools: &[ToolSpec]) -> Result<ModelStep, String> {
+            self.histories.push(history.to_vec());
+            if !matches!(history, [AgentMsg::User(_)]) {
+                return Err("paging request replayed non-capsule history".into());
+            }
+            let index = self.index;
+            self.index += 1;
+            match self.steps.get(index) {
+                Some(step) => Ok(step.clone()),
+                None => Err("script exhausted".into()),
+            }
+        }
+    }
+
+    fn paging_workspace() -> (tempfile::TempDir, Sandbox) {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join("src")).unwrap();
+        std::fs::write(
+            directory.path().join("src/lib.rs"),
+            "pub fn increment(value: i32) -> i32 {\n    value + 1\n}\n",
+        )
+        .unwrap();
+        let sandbox = Sandbox::new(directory.path(), false, Duration::from_secs(5))
+            .unwrap()
+            .with_shell_mode(ShellSandbox::Sandboxed);
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+        (directory, sandbox)
+    }
+
+    fn paging_cfg(dir: &std::path::Path) -> AgentConfig {
+        let mut config = cfg(dir, false);
+        config.max_steps = 8;
+        config.shell_sandbox = ShellSandbox::Sandboxed;
+        config.tool_profile = tools::ToolProfile::WebCode;
+        config.allow_plan = false;
+        config.context_paging = true;
+        config
+    }
+
+    fn paging_patch_step(directory: &std::path::Path) -> ModelStep {
+        use sha2::Digest as _;
+        let current =
+            std::fs::read_to_string(directory.join("src/lib.rs")).expect("fixture source");
+        let hash = format!("{:x}", sha2::Sha256::digest(current.as_bytes()));
+        ModelStep::Text(
+            json!({
+                "action": "PATCH",
+                "target": "src/lib.rs::function::increment",
+                "expectedSourceHash": hash,
+                "patch": "pub fn increment(value: i32) -> i32 {\n    value + 2\n}\n",
+                "justification": "Implement the requested increment change"
+            })
+            .to_string(),
+        )
+    }
+
+    #[test]
+    fn typed_complete_before_host_verification_is_rejected() {
+        let _checkpoint_guard = super::super::checkpoint::tests::cp_lock();
+        let (directory, sandbox) = paging_workspace();
+        let mut driver = ScriptedPagingDriver {
+            steps: vec![
+                paging_patch_step(directory.path()),
+                ModelStep::Text(json!({"action": "COMPLETE", "summary": "All done."}).to_string()),
+                ModelStep::Calls(vec![tc("read_file", json!({"path": "src/lib.rs"}))]),
+                ModelStep::Text(
+                    json!({"action": "COMPLETE", "summary": "Changed increment and verified it."})
+                        .to_string(),
+                ),
+            ],
+            index: 0,
+            histories: Vec::new(),
+        };
+        let mut approver = ScriptApprover(vec![Decision::Once], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(
+            "Change increment so it adds two and verify the saved file".into(),
+        )];
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sandbox,
+            &paging_cfg(directory.path()),
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
+        assert!(
+            reporter
+                .notices
+                .iter()
+                .any(|notice| notice.contains("typed COMPLETE rejected")),
+            "the unverified COMPLETE must be rejected: {:?}",
+            reporter.notices
+        );
+        // The persisted ledger records a verified completion only after the
+        // host verification actually ran.
+        let ledger_dir = directory.path().join(".camelid/context-paging/ledgers");
+        let ledger_file = std::fs::read_dir(&ledger_dir)
+            .unwrap()
+            .flatten()
+            .next()
+            .expect("persisted ledger");
+        let ledger_text = std::fs::read_to_string(ledger_file.path()).unwrap();
+        assert!(ledger_text.contains("\"status\": \"complete\""));
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+    }
+
+    #[test]
+    fn prose_answer_before_host_verification_is_reprompted() {
+        let _checkpoint_guard = super::super::checkpoint::tests::cp_lock();
+        let (directory, sandbox) = paging_workspace();
+        let mut driver = ScriptedPagingDriver {
+            steps: vec![
+                paging_patch_step(directory.path()),
+                ModelStep::Text("The change is complete and everything works.".into()),
+                ModelStep::Calls(vec![tc("read_file", json!({"path": "src/lib.rs"}))]),
+                ModelStep::Text(
+                    json!({"action": "COMPLETE", "summary": "Changed increment and verified it."})
+                        .to_string(),
+                ),
+            ],
+            index: 0,
+            histories: Vec::new(),
+        };
+        let mut approver = ScriptApprover(vec![Decision::Once], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(
+            "Change increment so it adds two and verify the saved file".into(),
+        )];
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sandbox,
+            &paging_cfg(directory.path()),
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
+        assert!(
+            reporter
+                .notices
+                .iter()
+                .any(|notice| notice.contains("prose completion before host verification")),
+            "the premature prose answer must be reprompted: {:?}",
+            reporter.notices
+        );
+        assert_eq!(driver.histories.len(), 4);
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+    }
+
+    #[test]
+    fn typed_action_cycles_are_bounded_without_a_step_ceiling() {
+        let (directory, sandbox) = paging_workspace();
+        let fault = ModelStep::Text(
+            json!({"action": "NEED_CONTEXT", "symbol": "increment", "reason": "inspect"})
+                .to_string(),
+        );
+        let mut driver = ScriptedPagingDriver {
+            steps: vec![fault; PAGING_NONPROGRESS_LIMIT + 4],
+            index: 0,
+            histories: Vec::new(),
+        };
+        let mut approver = ScriptApprover(Vec::new(), 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(
+            "Change increment so it adds two and verify the saved file".into(),
+        )];
+        let mut config = paging_cfg(directory.path());
+        // The web Code lane runs without a step ceiling.
+        config.max_steps = 0;
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sandbox,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        assert_eq!(end, LoopEnd::Repeated, "notices: {:?}", reporter.notices);
+        assert!(
+            driver.histories.len() <= PAGING_NONPROGRESS_LIMIT + 1,
+            "the fault cycle must stop at the non-progress bound, ran {} steps",
+            driver.histories.len()
+        );
+        assert!(reporter
+            .notices
+            .iter()
+            .any(|notice| notice.contains("without executing any workspace action")));
+        // Re-requesting a page that is already exact source in the capsule is
+        // called out and steers the canonical focus instead of reloading.
+        assert!(reporter
+            .notices
+            .iter()
+            .any(|notice| notice.contains("duplicate context page fault")));
+    }
+
+    #[test]
+    fn search_results_reach_the_next_capsule_as_compact_diagnostics() {
+        let (directory, sandbox) = paging_workspace();
+        let mut driver = ScriptedPagingDriver {
+            steps: vec![
+                ModelStep::Text(json!({"action": "SEARCH", "query": "increment"}).to_string()),
+                ModelStep::Text("increment is defined in src/lib.rs.".into()),
+            ],
+            index: 0,
+            histories: Vec::new(),
+        };
+        let mut approver = ScriptApprover(Vec::new(), 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(
+            "Where is increment defined in this workspace?".into(),
+        )];
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sandbox,
+            &paging_cfg(directory.path()),
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
+        assert_eq!(driver.histories.len(), 2);
+        let followup_capsule = match &driver.histories[1][..] {
+            [AgentMsg::User(capsule)] => capsule,
+            other => panic!("expected fresh capsule, got {other:?}"),
+        };
+        // Fresh capsules never replay history, so the compact summary is the
+        // only channel: the successful search must ride the diagnostic slot.
+        assert!(followup_capsule.contains("<current_diagnostic>"));
+        assert!(followup_capsule.contains("\"status\":\"ok\""));
+        assert!(followup_capsule.contains("\"rawReference\":\"tool-"));
     }
 
     #[test]
