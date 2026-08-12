@@ -1885,7 +1885,23 @@ pub fn run_loop(
                             if call.name == "edit_file" && force_full_rewrite {
                                 PAGING_FULL_REWRITE_FOCUS.into()
                             } else {
-                                "Choose one action using only the phase-relevant tools".into()
+                                // Name the tools the phase actually offers: a
+                                // greedy model told only "use phase-relevant
+                                // tools" keeps re-proposing the same absent one.
+                                let available = step_tools
+                                    .iter()
+                                    .map(|tool| tool.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                if available.is_empty() {
+                                    "No tools are available in this phase: return one typed action"
+                                        .into()
+                                } else {
+                                    format!(
+                                    "Only these tools are available in this phase: {available}. \
+                                     Use one of them (or a typed action) now."
+                                )
+                                }
                             };
                         if let Err(error) = runtime.save() {
                             reporter.notice(&format!("context paging state error: {error}"));
