@@ -299,6 +299,10 @@ pub fn resolve_policy(auto_approve: bool, yolo: bool, production: bool) -> Resul
 /// result-aware repetition guard still stops a model that makes no progress.
 /// Consecutive identical (tool + args) calls before the loop gives up.
 const REPEAT_LIMIT: usize = 3;
+/// Invalid calls never ran, so repeating the exact same validation failure is
+/// cheaper to classify than an executed action with a stable result. Local
+/// models can take a minute per retry; stop after the first ignored correction.
+const VALIDATION_REPEAT_LIMIT: usize = 2;
 /// How many times a step may be re-run after being cut off at `max_tokens`
 /// before the loop gives up and surfaces the incomplete text with a disclosure.
 const CAPPED_RETRY_LIMIT: usize = 2;
@@ -335,6 +339,15 @@ fn note_no_progress(
     signature: &str,
     outcome: &ToolOutcome,
 ) -> bool {
+    note_no_progress_at(counts, signature, outcome, REPEAT_LIMIT)
+}
+
+fn note_no_progress_at(
+    counts: &mut HashMap<String, (usize, String)>,
+    signature: &str,
+    outcome: &ToolOutcome,
+    limit: usize,
+) -> bool {
     if super::subagent::is_running_status(outcome.text()) {
         counts.remove(signature);
         return false;
@@ -348,11 +361,17 @@ fn note_no_progress(
         entry.0 = 1;
         entry.1 = outcome.text().to_string();
     }
-    entry.0 >= REPEAT_LIMIT
+    entry.0 >= limit
 }
 
 fn repeat_notice(name: &str) -> String {
     format!("stopping: `{name}` repeated {REPEAT_LIMIT}× with the same result and no progress")
+}
+
+fn validation_repeat_notice(name: &str) -> String {
+    format!(
+        "stopping: `{name}` repeated the same invalid call {VALIDATION_REPEAT_LIMIT}× without correcting its arguments"
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -670,8 +689,13 @@ pub fn run_loop(
                             reporter.tool_call(&format!("{}(?)", call.name));
                             let outcome = ToolOutcome::Err(e);
                             reporter.tool_result(&call.name, &outcome);
-                            let stuck = note_no_progress(&mut call_counts, &signature, &outcome);
-                            let stop = stuck.then(|| repeat_notice(&call.name));
+                            let stuck = note_no_progress_at(
+                                &mut call_counts,
+                                &signature,
+                                &outcome,
+                                VALIDATION_REPEAT_LIMIT,
+                            );
+                            let stop = stuck.then(|| validation_repeat_notice(&call.name));
                             history.push(AgentMsg::ToolResult {
                                 name: call.name,
                                 outcome,
@@ -680,6 +704,13 @@ pub fn run_loop(
                                 reporter.notice(&msg);
                                 return LoopEnd::Repeated;
                             }
+                            history.push(AgentMsg::System(
+                                "That tool call was not executed because its arguments were invalid. \
+                                 Correct the arguments before retrying and never repeat the identical \
+                                 failed call. For a small single-file coding task, use write_file or \
+                                 edit_file directly; subagent delegation is optional."
+                                    .into(),
+                            ));
                             continue;
                         }
                     };
@@ -1704,6 +1735,8 @@ pub fn system_prompt(sandbox: &Sandbox, tools: &[ToolSpec]) -> String {
         "\nHow to work:\n",
         "- Read before you write. Inspect a file and nearby conventions before changing it.\n",
         "- Make small, reviewable edits. Prefer edit_file over rewriting a whole file.\n",
+        "- Do not spawn a subagent for a small single-file task. Use direct file tools. Delegate ",
+        "only independent investigation or genuinely separable work.\n",
         "- Put program source in files with write_file/edit_file; run_shell accepts commands, ",
         "not raw source. Probe required runtimes before deciding they are missing. On Windows, ",
         "try the `py` launcher before treating a failing `python` app alias as no Python. If a ",
@@ -4123,6 +4156,58 @@ mod tests {
         // Stopped at the repeat limit (same call, same result REPEAT_LIMIT times),
         // not the 25-step cap.
         assert!(reporter.results.len() <= REPEAT_LIMIT);
+    }
+
+    #[test]
+    fn repeated_invalid_call_stops_after_one_ignored_correction() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        let invalid = || {
+            ModelStep::Calls(vec![tc(
+                "spawn_subagent",
+                json!({
+                    "subtask_id": "../generate_tic_tac_toe_code",
+                    "goal": "Create the graphical game"
+                }),
+            )])
+        };
+        let mut driver = MockDriver {
+            steps: vec![
+                invalid(),
+                invalid(),
+                ModelStep::Text("should not run".into()),
+            ],
+            idx: 0,
+        };
+        let mut approver = ScriptApprover(vec![], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(
+            "Code me a graphical tic tac toe game with Python.".into(),
+        )];
+        let mut config = cfg(dir.path(), false);
+        config.tool_profile = tools::ToolProfile::WebCode;
+        config.max_steps = 0;
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sb,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Repeated);
+        assert_eq!(reporter.results.len(), VALIDATION_REPEAT_LIMIT);
+        assert!(reporter
+            .notices
+            .iter()
+            .any(|notice| notice.contains("same invalid call")));
+        assert!(history.iter().any(|message| matches!(
+            message,
+            AgentMsg::System(text) if text.contains("never repeat the identical failed call")
+        )));
     }
 
     #[test]

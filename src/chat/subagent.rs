@@ -53,6 +53,85 @@ pub fn valid_subtask_id(id: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// Convert a model-facing task name into the strict filename-safe id used by
+/// the worker protocol. Human-readable aliases are deliberately more tolerant
+/// than the storage boundary: case is folded and `_`, whitespace, and repeated
+/// separators become one `-`. Path punctuation and every other character fail
+/// closed instead of being silently laundered into a filename.
+pub fn normalize_subtask_id(id: &str) -> Result<String, String> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Err("subtask_id must not be empty".into());
+    }
+
+    let mut normalized = String::with_capacity(id.len().min(64));
+    let mut pending_separator = false;
+    for byte in id.bytes() {
+        if byte.is_ascii_alphanumeric() {
+            if pending_separator && !normalized.is_empty() && normalized.len() < 64 {
+                normalized.push('-');
+            }
+            pending_separator = false;
+            if normalized.len() < 64 {
+                normalized.push(byte.to_ascii_lowercase() as char);
+            }
+        } else if byte == b'-' || byte == b'_' || byte.is_ascii_whitespace() {
+            pending_separator = !normalized.is_empty();
+        } else {
+            return Err(format!(
+                "invalid subtask_id {id:?}; use letters, numbers, spaces, `_`, or `-`"
+            ));
+        }
+    }
+    while normalized.ends_with('-') {
+        normalized.pop();
+    }
+    if !valid_subtask_id(&normalized) {
+        return Err(format!("invalid subtask_id {id:?}"));
+    }
+    Ok(normalized)
+}
+
+/// Resolve the optional model-facing alias to a stable internal id. When the
+/// model omits it, derive a readable, deterministic id from the goal so a retry
+/// of the same spawn request is idempotent rather than creating duplicate work.
+pub fn canonical_subtask_id(alias: Option<&str>, goal: &str) -> Result<String, String> {
+    if let Some(alias) = alias.filter(|value| !value.trim().is_empty()) {
+        return normalize_subtask_id(alias);
+    }
+
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in goal.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    let mut slug = String::new();
+    let mut pending_separator = false;
+    for byte in goal.bytes() {
+        if byte.is_ascii_alphanumeric() {
+            if pending_separator && !slug.is_empty() && slug.len() < 41 {
+                slug.push('-');
+            }
+            pending_separator = false;
+            if slug.len() < 41 {
+                slug.push(byte.to_ascii_lowercase() as char);
+            }
+        } else {
+            pending_separator = !slug.is_empty();
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    let generated = if slug.is_empty() {
+        format!("task-{hash:016x}")
+    } else {
+        format!("task-{slug}-{hash:016x}")
+    };
+    debug_assert!(valid_subtask_id(&generated));
+    Ok(generated)
+}
+
 /// The scoped instructions handed to a child (NOT the parent's full history).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskSpec {
@@ -364,20 +443,26 @@ fn spawn_inner(
     // Reap finished/timed-out children before counting live ones.
     reap_locked(&mut state);
 
+    // Repeating an already-admitted spawn is an idempotent status lookup, not a
+    // validation failure. Small local models commonly retry a call after missing
+    // its result; launching a second child or bouncing the retry back as another
+    // error both turn a harmless recovery into a loop.
+    if state.children.iter().any(|c| c.subtask_id == subtask_id)
+        || result_path(root, subtask_id).exists()
+        || task_path(root, subtask_id).exists()
+    {
+        drop(state);
+        return status(root, subtask_id).map(|report| {
+            format!("{report}\nnote: this subtask was already admitted; do not spawn it again")
+        });
+    }
+
     let live = state.children.len();
     if live >= config.concurrency {
         return Err(format!(
             "subagent concurrency cap reached ({live}/{}); wait for one to finish (check_subagent_status)",
             config.concurrency
         ));
-    }
-
-    // Refuse a reused id (live, or an existing task/result on disk).
-    if state.children.iter().any(|c| c.subtask_id == subtask_id)
-        || result_path(root, subtask_id).exists()
-        || task_path(root, subtask_id).exists()
-    {
-        return Err(format!("subtask_id {subtask_id:?} is already in use"));
     }
 
     let dir = subagent_dir(root);
@@ -474,7 +559,7 @@ fn spawn_inner(
     });
 
     Ok(format!(
-        "spawned subagent {subtask_id:?} (depth {}); poll it with check_subagent_status",
+        "status: accepted\nsubtask_id: {subtask_id}\nnote: child started at depth {}; use this returned subtask_id with check_subagent_status",
         depth + 1
     ))
 }
@@ -490,7 +575,7 @@ pub fn status(root: &Path, subtask_id: &str) -> Result<String, String> {
     if let Ok(text) = std::fs::read_to_string(&rpath) {
         return Ok(match serde_json::from_str::<SubagentResult>(&text) {
             Ok(res) => format!(
-                "status: {}\nnote: {}\ntool_calls: {}\nanswer:\n{}",
+                "status: {}\nsubtask_id: {subtask_id}\nnote: {}\ntool_calls: {}\nanswer:\n{}",
                 res.status,
                 res.note,
                 res.tool_calls.join(", "),
@@ -515,7 +600,7 @@ pub fn status(root: &Path, subtask_id: &str) -> Result<String, String> {
         // `is_running_status`.
         let waited = elapsed.map(|e| e.as_secs_f64()).unwrap_or(0.0);
         Ok(format!(
-            "{RUNNING_STATUS_PREFIX}\nnote: subagent {subtask_id:?} has not finished yet \
+            "{RUNNING_STATUS_PREFIX}\nsubtask_id: {subtask_id}\nnote: subagent {subtask_id:?} has not finished yet \
              ({waited:.1}s elapsed)"
         ))
     } else {
@@ -941,6 +1026,30 @@ mod tests {
         assert!(!valid_subtask_id("dir/child"));
         assert!(!valid_subtask_id("dot.dot"));
         assert!(!valid_subtask_id(&"x".repeat(65)));
+    }
+
+    #[test]
+    fn model_facing_subtask_names_are_normalized_before_storage() {
+        assert_eq!(
+            normalize_subtask_id("Generate_Tic Tac--Toe_Code").unwrap(),
+            "generate-tic-tac-toe-code"
+        );
+        assert!(normalize_subtask_id("../escape").is_err());
+        assert!(normalize_subtask_id("dir/child").is_err());
+        assert!(normalize_subtask_id("all.good").is_err());
+        assert!(normalize_subtask_id("___").is_err());
+    }
+
+    #[test]
+    fn omitted_subtask_id_is_safe_stable_and_goal_specific() {
+        let goal = "Inspect the coding frontend and report how tools are admitted.";
+        let first = canonical_subtask_id(None, goal).unwrap();
+        let retry = canonical_subtask_id(None, goal).unwrap();
+        let other = canonical_subtask_id(None, "Inspect a different feature.").unwrap();
+        assert!(valid_subtask_id(&first), "{first}");
+        assert_eq!(first, retry);
+        assert_ne!(first, other);
+        assert!(first.len() <= 64);
     }
 
     #[test]

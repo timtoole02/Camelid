@@ -559,19 +559,18 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
         if shell_mode != ShellSandbox::Disabled {
             tools.push(ToolSpec {
                 name: "spawn_subagent".into(),
-                description: "Spawn a child agent (subagent) to work on one scoped goal in the \
-                              workspace, then poll it with check_subagent_status. Exec tier — \
-                              always gated. Isolation-first, not a speedup. The child runs \
-                              UNATTENDED: nobody can answer an approval for it, so unless this \
-                              session is in confirmed full-auto it can only READ. Delegate \
-                              investigation (find where X is handled, summarise how Y works) and \
-                              make the edits yourself from what it reports."
+                description: "Spawn a child agent (subagent) for one independent scoped goal, \
+                              then poll it with check_subagent_status. Do not delegate a small \
+                              single-file task; use write_file/edit_file directly. Exec tier — \
+                              always gated. The child runs UNATTENDED: unless this session is in \
+                              confirmed full-auto it can only READ, so delegate investigation \
+                              and make edits yourself from its report."
                     .into(),
                 risk: Risk::Exec,
                 params: json!({"type":"object","properties":{
-                    "subtask_id":{"type":"string","description":"Unique id, ^[a-z0-9-]{1,64}$"},
+                    "subtask_id":{"type":"string","description":"Optional readable alias. Case, spaces, `_`, and `-` are normalized; the runtime generates an id when omitted."},
                     "goal":{"type":"string","description":"The scoped goal for the subagent"}
-                },"required":["subtask_id","goal"]}),
+                },"required":["goal"]}),
             });
         }
         tools.push(ToolSpec {
@@ -1427,22 +1426,17 @@ pub fn validate_for(
             if sandbox.shell_mode() == ShellSandbox::Disabled {
                 return Err("spawn_subagent is disabled (shell execution is off)".into());
             }
-            let subtask_id = str_arg("subtask_id")?;
-            if !subagent::valid_subtask_id(&subtask_id) {
-                return Err(format!(
-                    "invalid subtask_id {subtask_id:?} (allowed: ^[a-z0-9-]{{1,64}}$)"
-                ));
-            }
-            Ok(Action::SpawnSubagent {
-                subtask_id,
-                goal: str_arg("goal")?,
-            })
+            let goal = str_arg("goal")?;
+            let alias = match args.get("subtask_id") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(alias)) => Some(alias.as_str()),
+                Some(_) => return Err("spawn_subagent requires a string `subtask_id`".into()),
+            };
+            let subtask_id = subagent::canonical_subtask_id(alias, &goal)?;
+            Ok(Action::SpawnSubagent { subtask_id, goal })
         }
         "check_subagent_status" => {
-            let subtask_id = str_arg("subtask_id")?;
-            if !subagent::valid_subtask_id(&subtask_id) {
-                return Err(format!("invalid subtask_id {subtask_id:?}"));
-            }
+            let subtask_id = subagent::normalize_subtask_id(&str_arg("subtask_id")?)?;
             Ok(Action::CheckSubagentStatus { subtask_id })
         }
         "type_text" => {
@@ -3136,6 +3130,64 @@ mod tests {
         let outcome = action.execute(&free);
         assert!(!outcome.is_err(), "{}", outcome.text());
         assert!(outcome.text().contains("outside needle"));
+    }
+
+    #[test]
+    fn spawn_subagent_normalizes_underscores_and_can_generate_an_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path());
+        let with_alias = validate_for(
+            ToolProfile::WebCode,
+            &call(
+                "spawn_subagent",
+                json!({
+                    "subtask_id": "generate_tic_tac_toe_code",
+                    "goal": "Create the graphical game"
+                }),
+            ),
+            &sb,
+        )
+        .unwrap();
+        assert!(matches!(
+            with_alias,
+            Action::SpawnSubagent { ref subtask_id, .. }
+                if subtask_id == "generate-tic-tac-toe-code"
+        ));
+
+        let generated = validate_for(
+            ToolProfile::WebCode,
+            &call(
+                "spawn_subagent",
+                json!({"goal": "Create the graphical game"}),
+            ),
+            &sb,
+        )
+        .unwrap();
+        assert!(matches!(
+            generated,
+            Action::SpawnSubagent { ref subtask_id, .. }
+                if subagent::valid_subtask_id(subtask_id)
+        ));
+    }
+
+    #[test]
+    fn subagent_status_accepts_the_original_readable_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path());
+        let action = validate_for(
+            ToolProfile::WebCode,
+            &call(
+                "check_subagent_status",
+                json!({"subtask_id": "generate_tic_tac_toe_code"}),
+            ),
+            &sb,
+        )
+        .unwrap();
+        assert!(matches!(
+            action,
+            Action::CheckSubagentStatus { ref subtask_id }
+                if subtask_id == "generate-tic-tac-toe-code"
+        ));
     }
 
     #[test]
