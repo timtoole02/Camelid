@@ -98,6 +98,141 @@ impl WorkspaceRunMode {
     }
 }
 
+/// Keep obvious standalone-file creation on the parent model. Delegating these
+/// tasks adds two extra inference turns (spawn + wait), competes for the same
+/// resident engine, and on slow local hardware can take longer than doing the
+/// work. Complex repository work retains the complete orchestration surface.
+fn direct_creation_request(goal: &str) -> bool {
+    let goal = goal.to_ascii_lowercase();
+    let asks_to_create = [
+        "code me",
+        "create",
+        "write me",
+        "make me",
+        "build me",
+        "implement",
+    ]
+    .iter()
+    .any(|phrase| goal.contains(phrase));
+    let names_standalone_technology = [
+        "python",
+        "tkinter",
+        "pygame",
+        "single-file",
+        "single file",
+        "one-file",
+        "one file",
+    ]
+    .iter()
+    .any(|phrase| goal.contains(phrase));
+    let names_complex_scope = [
+        "repository",
+        " repo",
+        "project",
+        "frontend",
+        "backend",
+        "multiple files",
+        "refactor",
+        "migrate",
+        "audit",
+        "investigate",
+        "deep dive",
+        "subagent",
+        "agent runtime",
+    ]
+    .iter()
+    .any(|phrase| goal.contains(phrase));
+    asks_to_create && names_standalone_technology && !names_complex_scope
+}
+
+/// Choose a stable artifact name only for the direct standalone route. This is
+/// not used for repository work, and the resulting relative path still goes
+/// through the workspace sandbox before any write executes.
+fn direct_creation_path(goal: &str) -> Option<String> {
+    if !direct_creation_request(goal) {
+        return None;
+    }
+    let lower = goal.to_ascii_lowercase();
+    if lower.contains("tic tac toe") || lower.contains("tic-tac-toe") {
+        return Some("tic_tac_toe.py".into());
+    }
+    if lower.contains("python") || lower.contains("tkinter") || lower.contains("pygame") {
+        return Some("app.py".into());
+    }
+    None
+}
+
+/// Turn explicit standalone-artifact wording into a compact acceptance contract
+/// for small local models. This does not invent features: each clause is gated
+/// by words the user actually supplied, and exists to keep those requirements
+/// from disappearing between a plan and the generated source.
+fn direct_creation_contract(goal: &str) -> String {
+    let lower = goal.to_ascii_lowercase();
+    let mut requirements = vec![
+        "Create the requested runnable artifact in the workspace with write_file; do not spend a turn on update_plan or delegation."
+            .to_string(),
+        "For every correction, replace the complete standalone artifact with write_file; do not attempt a narrow edit_file patch."
+            .to_string(),
+        "Preserve and implement every explicit requirement in the user's wording. A comment, filename, label, or completion claim is not implementation."
+            .to_string(),
+    ];
+    if lower.contains("python") {
+        requirements.push(
+            "The delivered artifact must be runnable Python source in a .py file.".to_string(),
+        );
+    }
+    if lower.contains("graphics") || lower.contains("graphical") || lower.contains("gui") {
+        requirements.push(
+            "Graphics means a real interactive GUI window (for example tkinter or pygame), not terminal input/output."
+                .to_string(),
+        );
+    }
+    if lower.contains("python")
+        && (lower.contains("graphics") || lower.contains("graphical") || lower.contains("gui"))
+    {
+        requirements.push(
+            "Prefer tkinter for a dependency-free Python GUI. Tkinter ships with the Python standard library: never try to install it with pip."
+                .to_string(),
+        );
+    }
+    if lower.contains("computer")
+        && (lower.contains("player") || lower.contains("opponent") || lower.contains(" vs "))
+    {
+        requirements.push(
+            "A human-vs-computer game means the human controls exactly one side and the program automatically chooses and performs every opposing move."
+                .to_string(),
+        );
+    }
+    if lower.contains("tic tac toe") || lower.contains("tic-tac-toe") {
+        requirements.push(
+            "Tic-tac-toe turn handling must keep the human as X: after each valid human click, check the human terminal state, automatically make exactly one legal O move when play continues, check the computer terminal state/draw, and return control to X. Occupied cells and clicks after game-over must do nothing."
+                .to_string(),
+        );
+        requirements.push(
+            "For tkinter board buttons created in loops, bind row and column in each callback using lambda defaults such as row=i, col=j; a bare lambda that closes over i/j makes every button target the final cell."
+                .to_string(),
+        );
+        requirements.push(
+            "Choose O only from the current list of empty cells, track a game_over state, detect all eight winning lines and a full-board draw after each side, show the result in the GUI with a status label or messagebox, and provide an in-window reset/new-game control."
+                .to_string(),
+        );
+    }
+    if lower.contains("play") || lower.contains("game") {
+        requirements.push(
+            "The interaction must be complete enough for the user to start, play through, and see the win/draw state without editing source."
+                .to_string(),
+        );
+    }
+    requirements.push(
+        "After writing, re-read the final file, compare its behavior to every clause above, fix omissions, and run an available syntax/build check before answering."
+            .to_string(),
+    );
+    format!(
+        "\n\nDirect creation acceptance contract:\n- {}",
+        requirements.join("\n- ")
+    )
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub(crate) enum WorkspaceEvent {
@@ -487,6 +622,10 @@ pub(crate) fn run_live(
     config: WorkspaceRunConfig,
     mut worker: WorkspaceBridgeWorker,
 ) -> Result<LoopEnd, String> {
+    let direct_creation = config.mode.is_code() && direct_creation_request(&config.goal);
+    let default_write_path = direct_creation
+        .then(|| direct_creation_path(&config.goal))
+        .flatten();
     let _subagent_guard = if config.mode.is_code() {
         super::subagent::cancel_all();
         Some(WorkspaceSubagentTurnGuard)
@@ -558,7 +697,7 @@ pub(crate) fn run_live(
     // web lane silently did not. Children inherit this session's model, approval
     // posture, and shell sandbox; the depth limit keeps a child from spawning
     // grandchildren. Read-only Workspace stays single-agent.
-    if config.mode.is_code() {
+    if config.mode.is_code() && !direct_creation {
         super::subagent::configure(super::subagent::SubagentConfig::for_web_code_session(
             config.addr,
             config.model_id.clone(),
@@ -568,12 +707,24 @@ pub(crate) fn run_live(
             config.allow_network,
             shell_sandbox,
         ));
+    } else if direct_creation {
+        worker.reporter.notice(
+            "using direct file tools for this standalone creation; delegation is reserved for complex repository work",
+        );
     }
 
     let system = if config.mode.is_code() {
-        let specs = super::tools::specs_for(tool_profile, config.allow_network, shell_sandbox);
+        let mut specs = super::tools::specs_for(tool_profile, config.allow_network, shell_sandbox);
+        if direct_creation {
+            specs.retain(|spec| spec.name != "update_plan" && spec.name != "edit_file");
+        }
         let project = super::agent::load_project_context(&sandbox);
-        super::agent::system_prompt_with_project(&sandbox, &specs, project.as_ref())
+        let mut system =
+            super::agent::system_prompt_with_project(&sandbox, &specs, project.as_ref());
+        if direct_creation {
+            system.push_str(&direct_creation_contract(&config.goal));
+        }
+        system
     } else {
         super::agent::workspace_system_prompt(&sandbox)
     };
@@ -637,6 +788,8 @@ pub(crate) fn run_live(
         audit: Box::new(NoopSink),
         shell_sandbox,
         tool_profile,
+        allow_plan: !direct_creation,
+        default_write_path,
         ctx_budget: None,
     };
     let end = run_loop(
@@ -723,11 +876,11 @@ mod tests {
     /// impossible on this surface while the CLI lane had it all along.
     #[test]
     fn code_mode_advertises_the_subagent_tools_once_the_runtime_is_configured() {
-        // Serializes with the tool-set pins in `tools`, which assert on the
-        // unconfigured baseline of the same process-global registry.
+        // Keep the tool-set baseline deterministic for this test thread.
         let _lock = crate::chat::mcp::tests::registry_lock();
         let profile = WorkspaceRunMode::Code.tool_profile();
         assert!(profile.allows("spawn_subagent"));
+        assert!(profile.allows("await_subagent"));
         assert!(profile.allows("check_subagent_status"));
 
         // Built exactly as `run_live` builds it. The terminal `for_session`
@@ -763,6 +916,7 @@ mod tests {
                 .map(|tool| tool.name)
                 .collect::<Vec<_>>();
         assert!(advertised.iter().any(|name| name == "spawn_subagent"));
+        assert!(advertised.iter().any(|name| name == "await_subagent"));
         assert!(advertised
             .iter()
             .any(|name| name == "check_subagent_status"));
@@ -816,6 +970,8 @@ mod tests {
             audit: Box::new(NoopSink),
             shell_sandbox: ShellSandbox::Disabled,
             tool_profile: ToolProfile::Full,
+            allow_plan: true,
+            default_write_path: None,
             ctx_budget: None,
         }
     }
@@ -914,6 +1070,51 @@ mod tests {
             WorkspaceRunMode::Code.context_budget_tokens()
                 > WorkspaceRunMode::ReadOnly.context_budget_tokens()
         );
+    }
+
+    #[test]
+    fn standalone_python_creation_stays_direct_but_repo_work_can_delegate() {
+        assert!(direct_creation_request(
+            "Can you code me tic tac toe, one player vs the computer. In Python with graphics so I can play"
+        ));
+        assert!(direct_creation_request(
+            "Create one file in Python that displays a desktop clock"
+        ));
+        assert!(!direct_creation_request(
+            "Deep dive this repository and refactor the Python agent frontend"
+        ));
+        assert!(!direct_creation_request(
+            "Investigate the backend and implement the fix across multiple files"
+        ));
+        assert_eq!(
+            direct_creation_path(
+                "Can you code me tic tac toe, one player vs the computer. In Python with graphics so I can play"
+            )
+            .as_deref(),
+            Some("tic_tac_toe.py")
+        );
+        assert_eq!(
+            direct_creation_path("Create a small Python GUI utility").as_deref(),
+            Some("app.py")
+        );
+        assert!(direct_creation_path("Refactor this Python repository").is_none());
+    }
+
+    #[test]
+    fn direct_game_contract_keeps_graphics_and_computer_behavior_explicit() {
+        let contract = direct_creation_contract(
+            "Can you code me tic tac toe, one player vs the computer. In Python with graphics so I can play",
+        );
+        assert!(contract.contains("runnable Python source"));
+        assert!(contract.contains("real interactive GUI window"));
+        assert!(contract.contains("human controls exactly one side"));
+        assert!(contract.contains("automatically chooses and performs every opposing move"));
+        assert!(contract.contains("keep the human as X"));
+        assert!(contract.contains("exactly one legal O move"));
+        assert!(contract.contains("return control to X"));
+        assert!(contract.contains("lambda defaults"));
+        assert!(contract.contains("all eight winning lines"));
+        assert!(contract.contains("status label or messagebox"));
     }
 
     #[test]

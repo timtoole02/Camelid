@@ -19625,7 +19625,29 @@ fn parse_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
             .strip_prefix("[TOOL_CALLS]")
             .map(str::trim_start)
             .unwrap_or(trimmed);
-        values.push(first_json_value(mistral)?);
+        if let Some(value) = first_json_value(mistral) {
+            values.push(value);
+        } else {
+            // Local models frequently embed valid source intent in invalid JSON,
+            // most notably Python `it\'s` (JSON has no `\'` escape). Reuse the
+            // agent boundary's narrow repair so the API can still emit a
+            // structured tool_calls delta instead of leaking the raw envelope
+            // through visible content.
+            let recovered = crate::chat::tool_parse::parse(trimmed, "qwen");
+            let calls = recovered
+                .into_iter()
+                .map(|call| ToolCall {
+                    id: format!("call_{}", uuid::Uuid::new_v4().simple()),
+                    kind: "function",
+                    function: ToolCallFunction {
+                        name: call.name,
+                        arguments: serde_json::to_string(&call.args)
+                            .unwrap_or_else(|_| "{}".to_string()),
+                    },
+                })
+                .collect::<Vec<_>>();
+            return (!calls.is_empty()).then_some(calls);
+        }
     }
 
     let values = values
@@ -24349,6 +24371,19 @@ mod tests {
         assert_eq!(mistral.len(), 1);
         assert_eq!(mistral[0].function.name, "read_file");
         assert_eq!(mistral[0].function.arguments, r#"{"path":"b.txt"}"#);
+    }
+
+    #[test]
+    fn parse_tool_calls_repairs_python_apostrophe_escape() {
+        let calls = parse_tool_calls(
+            r#"<tool_call>{"name":"write_file","arguments":{"path":"game.py","content":"print('it\'s a turn')\n"}}</tool_call>"#,
+        )
+        .expect("recoverable tool call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "write_file");
+        let args: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).expect("arguments JSON");
+        assert_eq!(args["content"], "print('it\\'s a turn')\n");
     }
 
     #[test]

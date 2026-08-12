@@ -20,10 +20,12 @@
 //! hang), and reaping of wedged children. No VirtualLock / memory pinning. A
 //! child's stdout/result is UNTRUSTED data.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Child;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -31,7 +33,10 @@ use serde::{Deserialize, Serialize};
 const SUBAGENT_DIR: &str = ".camelid/subagents";
 const DEFAULT_CONCURRENCY: usize = 2;
 const DEFAULT_DEPTH_LIMIT: usize = 1;
-const DEFAULT_TIMEOUT_SECS: u64 = 300;
+/// Local 4B-class models can spend 60-200 seconds in each prefill on constrained
+/// hardware. Five minutes killed healthy multi-step children before they could
+/// commit a result; keep a hard cap, but size it for actual local inference.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 30 * 60;
 
 // Worker-side hard caps. The worker treats its task file as UNTRUSTED data
 // (defense-in-depth: the parent validated it, but a hand-crafted file must not
@@ -282,38 +287,43 @@ struct ChildEntry {
 struct SessionState {
     config: Option<SubagentConfig>,
     children: Vec<ChildEntry>,
+    /// Model-facing readable alias -> runtime-owned storage id. This gives one
+    /// turn idempotency without letting stale files from an earlier turn own a
+    /// new request with the same name.
+    aliases: HashMap<String, String>,
 }
 
-fn registry() -> &'static Mutex<SessionState> {
-    static REG: OnceLock<Mutex<SessionState>> = OnceLock::new();
-    REG.get_or_init(|| {
-        Mutex::new(SessionState {
+thread_local! {
+    /// Each Web Code turn runs on its own worker thread. Keeping orchestration
+    /// state thread-local makes its configuration, children, aliases, and Stop
+    /// boundary belong to that turn instead of to the entire server process.
+    static SESSION_STATE: RefCell<SessionState> = RefCell::new(SessionState {
             config: None,
             children: Vec::new(),
-        })
-    })
+            aliases: HashMap::new(),
+        });
 }
 
-/// Lock the registry, recovering from a poisoned lock (the state is a plain
-/// bookkeeping registry; a panic elsewhere must not wedge orchestration).
-fn lock_registry() -> MutexGuard<'static, SessionState> {
-    registry().lock().unwrap_or_else(|e| e.into_inner())
+fn with_state<R>(f: impl FnOnce(&mut SessionState) -> R) -> R {
+    SESSION_STATE.with(|state| f(&mut state.borrow_mut()))
 }
 
 /// Install the orchestration config for this process/session. Until called,
 /// spawning is refused and the tools are not advertised.
 pub fn configure(config: SubagentConfig) {
-    lock_registry().config = Some(config);
+    with_state(|state| {
+        state.config = Some(config);
+        if state.children.is_empty() {
+            state.aliases.clear();
+        }
+    });
 }
 
 /// Test-only: install `config` and get a guard that restores the previous
-/// registry state on drop. The registry is process-global, so a bare
-/// `configure` in a test leaks into every later test in the binary — the
-/// tool-set pins in `tools` assert on the unconfigured baseline and fail
-/// under the test harness's scheduling, not deterministically.
+/// thread-local configuration on drop.
 #[cfg(test)]
 pub(crate) fn configure_for_test(config: SubagentConfig) -> TestConfigGuard {
-    TestConfigGuard(lock_registry().config.replace(config))
+    TestConfigGuard(with_state(|state| state.config.replace(config)))
 }
 
 #[cfg(test)]
@@ -322,7 +332,7 @@ pub(crate) struct TestConfigGuard(Option<SubagentConfig>);
 #[cfg(test)]
 impl Drop for TestConfigGuard {
     fn drop(&mut self) {
-        lock_registry().config = self.0.take();
+        with_state(|state| state.config = self.0.take());
     }
 }
 
@@ -330,10 +340,11 @@ impl Drop for TestConfigGuard {
 /// ends of a turn so the visible Stop control is authoritative for delegated
 /// work too, and a child cannot keep editing after its parent has finished.
 pub fn cancel_all() {
-    let children = {
-        let mut state = lock_registry();
+    let children = with_state(|state| {
+        state.config = None;
+        state.aliases.clear();
         std::mem::take(&mut state.children)
-    };
+    });
     for mut entry in children {
         terminate_tree(&mut entry);
         let _ = std::fs::remove_file(&entry.task_path);
@@ -378,11 +389,10 @@ pub fn current_depth() -> usize {
 /// Whether spawn_subagent should be advertised/usable now: configured AND below
 /// the depth limit (the depth-1 default means subagents do not see the tool).
 pub fn is_enabled() -> bool {
-    let state = lock_registry();
-    match state.config.as_ref() {
+    with_state(|state| match state.config.as_ref() {
         Some(c) => current_depth() < c.depth_limit,
         None => false,
-    }
+    })
 }
 
 fn subagent_dir(root: &Path) -> PathBuf {
@@ -393,6 +403,40 @@ fn task_path(root: &Path, id: &str) -> PathBuf {
 }
 fn result_path(root: &Path, id: &str) -> PathBuf {
     subagent_dir(root).join(format!("result_{id}.json"))
+}
+
+/// The readable alias is an idempotency key inside one turn; it is never the
+/// durable child identity. A random suffix prevents a result left by an earlier
+/// turn (or a concurrent turn in the same workspace) from being mistaken for
+/// this request.
+fn runtime_storage_id(alias: &str) -> String {
+    const SUFFIX_LEN: usize = 12;
+    const PREFIX_LEN: usize = 64 - SUFFIX_LEN - 1;
+    let mut prefix = alias[..alias.len().min(PREFIX_LEN)]
+        .trim_end_matches('-')
+        .to_string();
+    if prefix.is_empty() {
+        prefix.push_str("task");
+    }
+    let uuid = uuid::Uuid::new_v4().simple().to_string();
+    format!("{prefix}-{}", &uuid[..SUFFIX_LEN])
+}
+
+fn resolve_runtime_id(requested: &str) -> String {
+    with_state(|state| {
+        state
+            .aliases
+            .get(requested)
+            .cloned()
+            .or_else(|| {
+                state
+                    .aliases
+                    .values()
+                    .find(|runtime_id| runtime_id.as_str() == requested)
+                    .cloned()
+            })
+            .unwrap_or_else(|| requested.to_string())
+    })
 }
 
 /// Spawn a subagent for `goal`, returning a human/agent-readable status line.
@@ -425,10 +469,7 @@ fn spawn_inner(
         ));
     }
 
-    let mut state = lock_registry();
-    let config = state
-        .config
-        .clone()
+    let config = with_state(|state| state.config.clone())
         .ok_or_else(|| "subagent orchestration is not configured for this session".to_string())?;
 
     // Depth guard (fork-bomb): subagents may not spawn deeper by default.
@@ -441,32 +482,45 @@ fn spawn_inner(
     }
 
     // Reap finished/timed-out children before counting live ones.
-    reap_locked(&mut state);
+    with_state(reap_locked);
 
-    // Repeating an already-admitted spawn is an idempotent status lookup, not a
-    // validation failure. Small local models commonly retry a call after missing
-    // its result; launching a second child or bouncing the retry back as another
-    // error both turn a harmless recovery into a loop.
-    if state.children.iter().any(|c| c.subtask_id == subtask_id)
-        || result_path(root, subtask_id).exists()
-        || task_path(root, subtask_id).exists()
-    {
-        drop(state);
-        return status(root, subtask_id).map(|report| {
-            format!("{report}\nnote: this subtask was already admitted; do not spawn it again")
+    // Repeating an already-admitted alias or the returned runtime id is an
+    // idempotent status lookup. Files alone are deliberately NOT evidence here:
+    // they may belong to an earlier or concurrent turn.
+    let admitted = with_state(|state| {
+        state.aliases.get(subtask_id).cloned().or_else(|| {
+            state
+                .aliases
+                .values()
+                .find(|runtime_id| runtime_id.as_str() == subtask_id)
+                .cloned()
+        })
+    });
+    if let Some(runtime_id) = admitted {
+        return status(root, &runtime_id).map(|report| {
+            format!(
+                "{report}\ntask_name: {subtask_id}\nadmission: existing\nnote: this subtask was already admitted; do not spawn it again"
+            )
         });
     }
 
-    let live = state.children.len();
+    let live = with_state(|state| state.children.len());
     if live >= config.concurrency {
         return Err(format!(
-            "subagent concurrency cap reached ({live}/{}); wait for one to finish (check_subagent_status)",
+            "subagent concurrency cap reached ({live}/{}); wait for one to finish with await_subagent",
             config.concurrency
         ));
     }
 
     let dir = subagent_dir(root);
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+
+    let runtime_id = (0..4)
+        .map(|_| runtime_storage_id(subtask_id))
+        .find(|candidate| {
+            !task_path(root, candidate).exists() && !result_path(root, candidate).exists()
+        })
+        .ok_or_else(|| "could not allocate a unique runtime id for the subagent".to_string())?;
 
     // Eval hook: force a deterministic canned subagent for a tool-driven spawn
     // (CAMELID_SUBAGENT_FORCE_CANNED). Used ONLY by the rung-3 real-model eval to
@@ -483,7 +537,7 @@ fn spawn_inner(
         None => (None, None),
     };
     let task = TaskSpec {
-        subtask_id: subtask_id.to_string(),
+        subtask_id: runtime_id.clone(),
         goal: goal.to_string(),
         addr: config.addr.to_string(),
         model_id: config.model_id.clone(),
@@ -500,7 +554,7 @@ fn spawn_inner(
         canned_answer,
         canned_sleep_ms,
     };
-    let tpath = task_path(root, subtask_id);
+    let tpath = task_path(root, &runtime_id);
     let task_json = serde_json::to_string_pretty(&task).map_err(|e| e.to_string())?;
     std::fs::write(&tpath, task_json).map_err(|e| format!("cannot write task file: {e}"))?;
 
@@ -547,19 +601,24 @@ fn spawn_inner(
         j
     };
 
-    state.children.push(ChildEntry {
-        subtask_id: subtask_id.to_string(),
-        child,
-        #[cfg(windows)]
-        job,
-        started: Instant::now(),
-        timeout: config.timeout,
-        task_path: tpath,
-        result_path: result_path(root, subtask_id),
+    with_state(|state| {
+        state
+            .aliases
+            .insert(subtask_id.to_string(), runtime_id.clone());
+        state.children.push(ChildEntry {
+            subtask_id: runtime_id.clone(),
+            child,
+            #[cfg(windows)]
+            job,
+            started: Instant::now(),
+            timeout: config.timeout,
+            task_path: tpath,
+            result_path: result_path(root, &runtime_id),
+        });
     });
 
     Ok(format!(
-        "status: accepted\nsubtask_id: {subtask_id}\nnote: child started at depth {}; use this returned subtask_id with check_subagent_status",
+        "status: accepted\nsubtask_id: {runtime_id}\ntask_name: {subtask_id}\nnote: child started at depth {}; call await_subagent once with the returned subtask_id",
         depth + 1
     ))
 }
@@ -569,13 +628,14 @@ pub fn status(root: &Path, subtask_id: &str) -> Result<String, String> {
     if !valid_subtask_id(subtask_id) {
         return Err(format!("invalid subtask_id {subtask_id:?}"));
     }
-    reap_locked(&mut lock_registry());
+    let runtime_id = resolve_runtime_id(subtask_id);
+    with_state(reap_locked);
 
-    let rpath = result_path(root, subtask_id);
+    let rpath = result_path(root, &runtime_id);
     if let Ok(text) = std::fs::read_to_string(&rpath) {
         return Ok(match serde_json::from_str::<SubagentResult>(&text) {
             Ok(res) => format!(
-                "status: {}\nsubtask_id: {subtask_id}\nnote: {}\ntool_calls: {}\nanswer:\n{}",
+                "status: {}\nsubtask_id: {runtime_id}\nnote: {}\ntool_calls: {}\nanswer:\n{}",
                 res.status,
                 res.note,
                 res.tool_calls.join(", "),
@@ -586,25 +646,22 @@ pub fn status(root: &Path, subtask_id: &str) -> Result<String, String> {
         });
     }
 
-    let elapsed = lock_registry()
-        .children
-        .iter()
-        .find(|c| c.subtask_id == subtask_id)
-        .map(|c| c.started.elapsed());
-    if elapsed.is_some() || task_path(root, subtask_id).exists() {
-        // Carry elapsed time so consecutive polls are not byte-identical. The
-        // caller's no-progress guard stops a call that returns the SAME text
-        // REPEAT_LIMIT times running; a constant "has not finished yet" made a
-        // healthy child look stuck after three polls and got the whole turn
-        // killed. `RUNNING_STATUS_PREFIX` is the belt to this suspenders — see
-        // `is_running_status`.
+    let elapsed = with_state(|state| {
+        state
+            .children
+            .iter()
+            .find(|c| c.subtask_id == runtime_id)
+            .map(|c| c.started.elapsed())
+    });
+    if elapsed.is_some() || task_path(root, &runtime_id).exists() {
+        // Carry elapsed time for useful non-blocking inspection output.
         let waited = elapsed.map(|e| e.as_secs_f64()).unwrap_or(0.0);
         Ok(format!(
-            "{RUNNING_STATUS_PREFIX}\nsubtask_id: {subtask_id}\nnote: subagent {subtask_id:?} has not finished yet \
+            "{RUNNING_STATUS_PREFIX}\nsubtask_id: {runtime_id}\nnote: subagent {runtime_id:?} has not finished yet \
              ({waited:.1}s elapsed)"
         ))
     } else {
-        Err(format!("no subagent {subtask_id:?} found"))
+        Err(format!("no subagent {subtask_id:?} found in this turn"))
     }
 }
 
@@ -613,13 +670,42 @@ const RUNNING_STATUS_PREFIX: &str = "status: running";
 
 /// Whether a tool result reports a subagent that is still working.
 ///
-/// Waiting on a child is progress, not repetition: the agent loop's no-progress
-/// guard must not count these against `REPEAT_LIMIT`. Polling a child is the
-/// documented way to wait for one (`spawn_subagent` says so in its own result),
-/// and Code mode has no step cap, so this guard is the loop's main terminator —
-/// mistaking a poll for a stall ends the turn AND kills the child with it.
+/// Waiting on a child is progress, not repetition. This exemption remains for
+/// non-blocking inspection, though models are directed to use `await_subagent`
+/// once instead of creating inference-driven polling loops.
 pub fn is_running_status(text: &str) -> bool {
     text.starts_with(RUNNING_STATUS_PREFIX)
+}
+
+/// Park one tool execution until its child becomes terminal, the caller's wait
+/// window expires, or the parent turn is cancelled. This is runtime waiting —
+/// it performs no model inference and therefore cannot create a poll/tool-call
+/// loop. The result file is the authoritative completion event.
+pub fn await_status(
+    root: &Path,
+    subtask_id: &str,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> Result<String, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return Err(format!(
+                "await_subagent cancelled while waiting for {subtask_id:?}"
+            ));
+        }
+        let report = status(root, subtask_id)?;
+        if !is_running_status(&report) {
+            return Ok(report);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(format!(
+                "{report}\nwait: timed_out\nnote: the await window ended but the child is still running; call await_subagent again only if its result is required"
+            ));
+        }
+        std::thread::sleep((deadline - now).min(Duration::from_millis(50)));
+    }
 }
 
 /// A compact, truncated listing of this session's subagents — live (from the
@@ -627,11 +713,10 @@ pub fn is_running_status(text: &str) -> bool {
 /// command. The child statuses/answers it surfaces are UNTRUSTED data.
 pub fn list_summary(root: &Path) -> String {
     const MAX_LISTED: usize = 40;
-    reap_locked(&mut lock_registry());
+    with_state(reap_locked);
 
     let mut lines: Vec<String> = Vec::new();
-    {
-        let state = lock_registry();
+    with_state(|state| {
         for c in &state.children {
             lines.push(format!(
                 "  {} — running ({:.0}s)",
@@ -639,7 +724,7 @@ pub fn list_summary(root: &Path) -> String {
                 c.started.elapsed().as_secs_f64()
             ));
         }
-    }
+    });
     if let Ok(entries) = std::fs::read_dir(subagent_dir(root)) {
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
@@ -773,7 +858,8 @@ pub fn run_worker(task_file: &Path) -> anyhow::Result<i32> {
     j.push('\n');
     write_result_atomic(&rpath, &j);
 
-    // Consume the task file (cleanup); the result file remains for polling.
+    // Consume the task file (cleanup); the result remains for authoritative
+    // completion delivery and later inspection.
     let _ = std::fs::remove_file(task_file);
 
     Ok(execution.outcome.exit_code())
@@ -837,6 +923,8 @@ fn execute_task(task: &TaskSpec) -> TaskExecution {
         audit: Box::new(super::audit::NoopSink),
         shell_sandbox: shell_mode,
         tool_profile,
+        allow_plan: true,
+        default_write_path: None,
         // A subagent runs a real, open-ended goal, so it gets the same context
         // protection the parent has.
         ctx_budget: Some(agent::AGENT_VALIDATED_CTX),
@@ -1050,6 +1138,68 @@ mod tests {
         assert_eq!(first, retry);
         assert_ne!(first, other);
         assert!(first.len() <= 64);
+    }
+
+    #[test]
+    fn runtime_ids_are_unique_even_when_the_readable_alias_repeats() {
+        let first = runtime_storage_id("generate-tic-tac-toe-code");
+        let second = runtime_storage_id("generate-tic-tac-toe-code");
+        assert_ne!(first, second);
+        assert!(valid_subtask_id(&first), "{first}");
+        assert!(valid_subtask_id(&second), "{second}");
+        assert!(first.starts_with("generate-tic-tac-toe-code-"));
+    }
+
+    #[test]
+    fn orchestration_configuration_is_isolated_per_turn_thread() {
+        let config = SubagentConfig::for_web_code_session(
+            "127.0.0.1:8181".parse().unwrap(),
+            "model".into(),
+            "qwen3".into(),
+            2048,
+            true,
+            false,
+            super::super::shell_sandbox::ShellSandbox::Sandboxed,
+        );
+        let _configured = configure_for_test(config);
+        assert!(is_enabled());
+        assert!(std::thread::spawn(|| !is_enabled()).join().unwrap());
+        assert!(
+            is_enabled(),
+            "another turn must not alter this turn's registry"
+        );
+    }
+
+    #[test]
+    fn await_status_delivers_terminal_result_without_model_polling() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(subagent_dir(root)).unwrap();
+        let result = SubagentResult {
+            subtask_id: "runtime-1".into(),
+            status: "completed".into(),
+            answer: "done".into(),
+            tool_calls: vec!["read_file".into()],
+            note: "finished".into(),
+        };
+        std::fs::write(
+            result_path(root, "runtime-1"),
+            serde_json::to_string(&result).unwrap(),
+        )
+        .unwrap();
+        let cancel = AtomicBool::new(false);
+        let report = await_status(root, "runtime-1", Duration::from_secs(1), &cancel).unwrap();
+        assert!(report.contains("status: completed"), "{report}");
+        assert!(report.contains("answer:\ndone"), "{report}");
+    }
+
+    #[test]
+    fn await_status_obeys_parent_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = AtomicBool::new(true);
+        let error =
+            await_status(dir.path(), "runtime-1", Duration::from_secs(30), &cancel).unwrap_err();
+        assert!(error.contains("cancelled"), "{error}");
     }
 
     #[test]

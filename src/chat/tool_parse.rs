@@ -2,8 +2,9 @@
 //! renders tool definitions through the model's own chat template; this turns the
 //! model's *output* back into structured calls. Family-specific: Llama 3.x emits
 //! JSON (`{"name":…,"parameters":…}`, optionally `<|python_tag|>`-wrapped);
-//! Qwen3/Hermes emit `<tool_call>{…}</tool_call>`. Malformed output yields no
-//! calls (the loop then treats the text as a final answer) — never a panic.
+//! Qwen3/Hermes emit `<tool_call>{…}</tool_call>`. Common, unambiguous JSON
+//! escaping mistakes are repaired before a malformed envelope is treated as
+//! plain text; unrecoverable output still yields no calls — never a panic.
 
 use serde_json::Value;
 
@@ -97,7 +98,44 @@ fn json_from_str_lenient(s: &str) -> Option<Value> {
     if let Ok(value) = serde_json::from_str::<Value>(s) {
         return Some(value);
     }
-    serde_json::from_str::<Value>(&repair_path_backslashes(s)).ok()
+    let repaired_paths = repair_path_backslashes(s);
+    if let Ok(value) = serde_json::from_str::<Value>(&repaired_paths) {
+        return Some(value);
+    }
+    serde_json::from_str::<Value>(&repair_invalid_json_escapes(&repaired_paths)).ok()
+}
+
+/// Preserve model-authored source while repairing invalid JSON string escapes.
+///
+/// A frequent Qwen failure is embedding Python such as `it\'s` directly in a
+/// JSON string. JSON does not define `\'`, even though the backslash is needed
+/// by the Python source. Doubling only invalid escapes makes the JSON decode to
+/// the exact intended `\'`. Valid JSON escapes (`\n`, `\t`, `\u1234`, …) are
+/// deliberately untouched.
+fn repair_invalid_json_escapes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    let mut chars = s.chars().peekable();
+    let mut in_string = false;
+    while let Some(character) = chars.next() {
+        if character == '"' {
+            in_string = !in_string;
+            out.push(character);
+            continue;
+        }
+        if in_string && character == '\\' {
+            let valid = matches!(
+                chars.peek(),
+                Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u')
+            );
+            if !valid {
+                out.push('\\');
+            }
+            out.push(character);
+            continue;
+        }
+        out.push(character);
+    }
+    out
 }
 
 /// Public wrapper for the structured-`tool_calls` path: parse an arguments string
@@ -294,13 +332,111 @@ fn parse_json(text: &str) -> Vec<ToolCall> {
     if let Some(value) = json_from_str_lenient(trimmed) {
         return calls_from_value(&value);
     }
-    // Otherwise try to extract the first balanced {…} object.
-    if let Some(slice) = first_json_object(trimmed) {
+    // Otherwise recover every balanced object. Some certified Llama 3 rows
+    // emit several native calls as `{...}; {...}; {...}` instead of a JSON
+    // array. Executing only the first loses follow-up verification, while
+    // treating the whole line as prose loses every call.
+    let mut calls = Vec::new();
+    let mut rest = trimmed;
+    while let Some(slice) = first_json_object(rest) {
+        let start = rest.find(slice).unwrap_or(0);
         if let Some(value) = json_from_str_lenient(slice) {
-            return calls_from_value(&value);
+            calls.extend(calls_from_value(&value));
+        }
+        let consumed = start.saturating_add(slice.len());
+        if consumed >= rest.len() {
+            break;
+        }
+        rest = &rest[consumed..];
+    }
+    // A malformed write can share a turn with valid calls. Do not let the
+    // successfully parsed tail hide the artifact-producing call: recover the
+    // narrowly recognised write and retain the valid verification calls too.
+    if !calls.iter().any(|call| call.name == "write_file") {
+        if let Some(call) = recover_malformed_write_file(trimmed) {
+            calls.insert(0, call);
         }
     }
-    Vec::new()
+    calls
+}
+
+/// Recover only a clearly delimited `write_file` envelope whose source contains
+/// unescaped quotes. This is intentionally not a general malformed-JSON parser:
+/// writes remain sandbox-validated and approval-gated, while malformed shell or
+/// network calls stay inert. Llama 3 occasionally emits valid native envelope
+/// structure but forgets to JSON-escape quotes inside the `content` value.
+fn recover_malformed_write_file(text: &str) -> Option<ToolCall> {
+    let trimmed = text.trim();
+    if !trimmed.starts_with('{')
+        || !(trimmed.contains(r#""name":"write_file""#)
+            || trimmed.contains(r#""name": "write_file""#))
+    {
+        return None;
+    }
+    let content_key = trimmed.find(r#""content""#)?;
+    let after_key = &trimmed[content_key + r#""content""#.len()..];
+    let content_open = after_key.find('"')?;
+    let encoded_content = &after_key[content_open + 1..];
+    let (encoded_content, path) = if let Some((content, path_tail)) = encoded_content
+        .rsplit_once(r#"", "path": ""#)
+        .or_else(|| encoded_content.rsplit_once(r#"","path":""#))
+    {
+        let path_end = path_tail.find('"')?;
+        let path = &path_tail[..path_end];
+        if path.is_empty() || path.contains(['\n', '\r', '\0']) {
+            return None;
+        }
+        (content, Some(decode_jsonish_string(path)))
+    } else {
+        // Preserve a recognisable malformed write even when the model omitted
+        // its required path. The call remains non-executable: normal tool
+        // validation will reject the missing path and feed that typed error
+        // back to the model. Dropping it here would misclassify source as a
+        // final answer and bypass the model's recovery turn entirely.
+        let content = encoded_content
+            .strip_suffix(r#""}}"#)
+            .or_else(|| encoded_content.strip_suffix(r#""} }"#))
+            // Exact Llama 3.2 3B live failure: it closes `parameters` but
+            // omits the outer envelope brace after a long content value.
+            .or_else(|| encoded_content.strip_suffix(r#""}"#))?;
+        (content, None)
+    };
+    let mut args = serde_json::Map::new();
+    args.insert(
+        "content".into(),
+        Value::String(decode_jsonish_string(encoded_content)),
+    );
+    if let Some(path) = path {
+        args.insert("path".into(), Value::String(path));
+    }
+    Some(ToolCall {
+        name: "write_file".into(),
+        args: Value::Object(args),
+    })
+}
+
+fn decode_jsonish_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            out.push(character);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 fn calls_from_value(value: &Value) -> Vec<ToolCall> {
@@ -491,6 +627,78 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].args["path"], r"C:\workspace\note.txt");
         assert_eq!(out[0].args["content"], "line1\nline2\t☺");
+    }
+
+    #[test]
+    fn parses_semicolon_separated_llama_json_calls() {
+        let out = parse(
+            r#"{"name":"write_file","parameters":{"path":"game.py","content":"print('x')\n"}}; {"name":"run_shell","parameters":{"command":"py -m py_compile game.py"}}; {"name":"read_file","parameters":{"path":"game.py"}}"#,
+            "llama_bpe_decoder",
+        );
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].name, "write_file");
+        assert_eq!(out[1].name, "run_shell");
+        assert_eq!(out[2].name, "read_file");
+        assert_eq!(out[0].args["path"], "game.py");
+    }
+
+    #[test]
+    fn recovers_unescaped_source_quotes_only_for_write_file() {
+        let text = r#"{"name": "write_file", "parameters": {"content": "self.window.title("Tic Tac Toe)\nprint("hi")", "path": "tic_tac_toe.py"}}"#;
+        let out = parse(text, "llama_bpe_decoder");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "write_file");
+        assert_eq!(out[0].args["path"], "tic_tac_toe.py");
+        assert_eq!(
+            out[0].args["content"],
+            "self.window.title(\"Tic Tac Toe)\nprint(\"hi\")"
+        );
+        assert!(parse(
+            r#"{"name":"run_shell","parameters":{"command":"echo "oops""}}"#,
+            "llama_bpe_decoder"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn malformed_write_is_not_lost_when_later_llama_calls_are_valid() {
+        let text = concat!(
+            r#"{"name": "write_file", "parameters": {"content": "root.title("Tic Tac Toe")\n", "path": "tic_tac_toe.py"}}"#,
+            r#"; {"name":"run_shell","parameters":{"command":"py tic_tac_toe.py"}}"#,
+            r#"; {"name":"search","parameters":{"pattern":"TicTacToe","path":"."}}"#,
+        );
+        let out = parse(text, "llama_bpe_decoder");
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].name, "write_file");
+        assert_eq!(out[0].args["path"], "tic_tac_toe.py");
+        assert_eq!(out[1].name, "run_shell");
+        assert_eq!(out[2].name, "search");
+    }
+
+    #[test]
+    fn malformed_write_without_path_surfaces_for_typed_validation_error() {
+        // Exact live shape has only one trailing brace: the model closes the
+        // parameters object but omits the outer envelope brace.
+        let text = r#"{"name": "write_file", "parameters": {"content": "root.title("Tic Tac Toe)\ngame.run()"}"#;
+        let out = parse(text, "llama_bpe_decoder");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "write_file");
+        assert_eq!(
+            out[0].args["content"],
+            "root.title(\"Tic Tac Toe)\ngame.run()"
+        );
+        assert!(out[0].args.get("path").is_none());
+    }
+
+    #[test]
+    fn lenient_parse_preserves_backslash_apostrophe_in_embedded_source() {
+        let out = parse(
+            r#"<tool_call>{"name":"write_file","arguments":{"path":"game.py","content":"print('it\'s your turn')\n"}}</tool_call>"#,
+            "qwen3",
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "write_file");
+        assert_eq!(out[0].args["content"], "print('it\\'s your turn')\n");
     }
 
     #[test]

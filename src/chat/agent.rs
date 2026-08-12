@@ -8,7 +8,7 @@
 //! clean redirected transcripts. The full-screen TUI agent (modal approvals in
 //! the redraw loop) is a documented follow-up. See `DECISIONS.md` D9.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -48,6 +48,15 @@ pub struct AgentConfig {
     /// The tools this loop may advertise and validate. Existing CLI/TUI agent
     /// sessions use `Full`; the Web Workspace uses only scoped file tools.
     pub tool_profile: tools::ToolProfile,
+    /// Whether `update_plan` is useful for this run. Obvious standalone
+    /// creation requests skip it so small local models spend inference on the
+    /// artifact instead of narrating the plan.
+    pub allow_plan: bool,
+    /// Deterministic relative artifact path for an obvious standalone creation.
+    /// If a model supplies complete write content but omits only `path`, the
+    /// host fills this before ordinary sandbox validation. General/repo runs
+    /// leave it unset.
+    pub default_write_path: Option<String>,
     /// Usable context in tokens for the Full agent. `None` keeps deterministic
     /// gate harnesses byte-stable; Workspace uses its exact preflight budget.
     pub ctx_budget: Option<u32>,
@@ -299,6 +308,10 @@ pub fn resolve_policy(auto_approve: bool, yolo: bool, production: bool) -> Resul
 /// result-aware repetition guard still stops a model that makes no progress.
 /// Consecutive identical (tool + args) calls before the loop gives up.
 const REPEAT_LIMIT: usize = 3;
+/// Intervene before the terminal repeat limit. A guard that only stops is safe
+/// but still abandons recoverable work; one runtime-owned correction gives the
+/// model a chance to change actions without permitting an unbounded loop.
+const REPEAT_RECOVERY_THRESHOLD: usize = 2;
 /// Invalid calls never ran, so repeating the exact same validation failure is
 /// cheaper to classify than an executed action with a stable result. Local
 /// models can take a minute per retry; stop after the first ignored correction.
@@ -322,7 +335,69 @@ const EVIDENCE_REPROMPT_LIMIT: usize = 3;
 /// succeeds. This catches confident prose after a failed tool call without
 /// letting a small model own an unbounded Code turn.
 const CHANGE_REPROMPT_LIMIT: usize = 3;
+/// A write proves that bytes changed, not that the requested behavior works.
+/// Require evidence from the post-change state before accepting completion.
+const VERIFICATION_REPROMPT_LIMIT: usize = 2;
 const MAX_WORKSPACE_TOOL_CALLS_PER_STEP: usize = 8;
+/// Absolute admission ceiling for one Workspace turn. Code mode deliberately
+/// has no arbitrary model-step cap, but it must still have a resource ceiling:
+/// a broken model must not be able to emit unbounded process/file activity.
+const MAX_WORKSPACE_TOOL_CALLS_PER_RUN: usize = 64;
+/// Plans are a user-facing aid, not work. Two updates allow an initial plan and
+/// one milestone; after that the tool disappears for the remainder of the run.
+const MAX_PLAN_UPDATES_PER_RUN: usize = 2;
+/// A small model that cannot produce a unique edit needle usually benefits from
+/// replacing the short file instead of burning turns on ever-changing needles.
+const MAX_CONSECUTIVE_EDIT_FAILURES: usize = 2;
+const MALFORMED_TOOL_REPROMPT_LIMIT: usize = 2;
+/// Catch a model that evades the exact-repeat guard by changing arguments while
+/// receiving the same failure. This mirrors OpenClaw's narrow tail-churn rule:
+/// same tool, at least two variants, stable error result.
+const ERROR_ARGUMENT_CHURN_LIMIT: usize = 4;
+
+#[derive(Default)]
+struct ErrorArgumentChurn {
+    tool: String,
+    samples: VecDeque<(String, String)>,
+}
+
+fn note_error_argument_churn(
+    churn: &mut ErrorArgumentChurn,
+    tool: &str,
+    signature: &str,
+    outcome: &ToolOutcome,
+) -> bool {
+    if !outcome.is_err() {
+        churn.tool.clear();
+        churn.samples.clear();
+        return false;
+    }
+    if churn.tool != tool {
+        churn.tool.clear();
+        churn.tool.push_str(tool);
+        churn.samples.clear();
+    }
+    churn
+        .samples
+        .push_back((signature.to_string(), outcome.text().to_string()));
+    while churn.samples.len() > ERROR_ARGUMENT_CHURN_LIMIT {
+        churn.samples.pop_front();
+    }
+    if churn.samples.len() < ERROR_ARGUMENT_CHURN_LIMIT {
+        return false;
+    }
+    let first_result = &churn.samples[0].1;
+    let stable_result = churn
+        .samples
+        .iter()
+        .all(|(_, result)| result == first_result);
+    let first_signature = &churn.samples[0].0;
+    let has_variant = churn
+        .samples
+        .iter()
+        .any(|(candidate, _)| candidate != first_signature);
+    stable_result && has_variant
+}
 
 /// Result-aware no-progress guard. Records the outcome for a call signature and
 /// returns true once that exact call has produced the SAME result on
@@ -374,6 +449,142 @@ fn validation_repeat_notice(name: &str) -> String {
     )
 }
 
+/// Fill only the one missing argument a direct-creation route can determine
+/// without model judgment. The resulting call still passes through the normal
+/// schema, sandbox, approval, checkpoint and audit boundaries.
+fn supply_default_write_path(call: &mut ToolCall, path: &str) -> bool {
+    if call.name != "write_file" || path.is_empty() {
+        return false;
+    }
+    let Some(args) = call.args.as_object_mut() else {
+        return false;
+    };
+    if args.contains_key("path") || !args.get("content").is_some_and(Value::is_string) {
+        return false;
+    }
+    args.insert("path".into(), Value::String(path.to_string()));
+    true
+}
+
+#[cfg(windows)]
+fn normalize_verified_windows_python(action: &mut Action) -> Option<String> {
+    let Action::RunShell { command } = action else {
+        return None;
+    };
+    let trimmed = command.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let (rest, already_py) = lower
+        .strip_prefix("python.exe ")
+        .map(|_| (&trimmed["python.exe ".len()..], false))
+        .or_else(|| {
+            lower
+                .strip_prefix("python ")
+                .map(|_| (&trimmed["python ".len()..], false))
+        })
+        .or_else(|| {
+            lower
+                .strip_prefix("py ")
+                .map(|_| (&trimmed["py ".len()..], true))
+        })?;
+    let rest = rest.trim();
+    let simple_script = rest.to_ascii_lowercase().ends_with(".py")
+        && !rest.contains(" -")
+        && !rest.contains(" && ")
+        && !rest.contains("; ");
+    if already_py && !simple_script {
+        return None;
+    }
+    let normalized = if simple_script {
+        format!("py -m py_compile {rest}")
+    } else {
+        format!("py {rest}")
+    };
+    *command = normalized.clone();
+    Some(normalized)
+}
+
+/// Deterministic acceptance checks for explicit behavioral contracts that are
+/// cheap to prove from source. These are deliberately narrow and only activate
+/// when the user named the exact domain; they complement model review instead
+/// of pretending a syntax check proves behavior.
+fn source_contract_findings(history: &[AgentMsg], sources: &[(String, String)]) -> Vec<String> {
+    let goal = history
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            AgentMsg::User(text) => Some(text.to_ascii_lowercase()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if !(goal.contains("tic tac toe") || goal.contains("tic-tac-toe")) || !goal.contains("computer")
+    {
+        return Vec::new();
+    }
+    let source = sources
+        .iter()
+        .filter(|(path, _)| path.to_ascii_lowercase().ends_with(".py"))
+        .map(|(_, content)| content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if source.is_empty() {
+        return vec!["no Python source was captured for the requested game".into()];
+    }
+    let lower = source.to_ascii_lowercase();
+    let mut findings = Vec::new();
+    let computer_moves_automatically =
+        lower.contains("computer_move") && (source.contains("= \"O\"") || source.contains("= 'O'"));
+    if !computer_moves_automatically {
+        findings.push(
+            "the captured source does not prove an automatic legal O move by the computer".into(),
+        );
+    }
+    let computer_block = source
+        .split("def computer_move")
+        .nth(1)
+        .and_then(|tail| tail.split("\n    def ").next())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if lower.contains("current_player")
+        && !(computer_block.contains("current_player = \"x\"")
+            || computer_block.contains("current_player = 'x'"))
+    {
+        findings.push(
+            "the computer_move function itself never explicitly returns current_player to X, so a later human click can place O"
+                .into(),
+        );
+    }
+    if lower.contains("command=lambda:") {
+        findings.push(
+            "a Tkinter button callback uses a bare loop-variable lambda; bind row/column as lambda defaults (for example row=i, col=j) so every button does not target the final cell"
+                .into(),
+        );
+    }
+    let settles_computer_terminal = (computer_block.contains("check_win")
+        || computer_block.contains("check_winner")
+        || computer_block.contains("game_over"))
+        && (computer_block.contains("draw") || lower.contains("check_draw"));
+    if !settles_computer_terminal {
+        findings.push(
+            "after the automatic O move the source does not settle the computer win/draw state before returning control"
+                .into(),
+        );
+    }
+    let has_gui_result = lower.contains("messagebox")
+        || lower.contains("status_label")
+        || lower.contains("result_label")
+        || lower.contains("winner_label");
+    if (goal.contains("graphics") || goal.contains("graphical") || goal.contains("gui"))
+        && lower.contains("root.destroy()")
+        && !has_gui_result
+    {
+        findings.push(
+            "the graphical window is destroyed without showing the win/draw result through a messagebox or status/result label in the GUI"
+                .into(),
+        );
+    }
+    findings
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_loop(
     driver: &mut dyn ModelDriver,
@@ -385,10 +596,22 @@ pub fn run_loop(
     policy: &mut Policy,
     history: &mut Vec<AgentMsg>,
 ) -> LoopEnd {
-    let tools = tools::specs_for(cfg.tool_profile, cfg.allow_net, sandbox.shell_mode());
+    let mut tools = tools::specs_for(cfg.tool_profile, cfg.allow_net, sandbox.shell_mode());
+    if !cfg.allow_plan {
+        tools.retain(|spec| spec.name != "update_plan");
+    }
+    if cfg.default_write_path.is_some() {
+        tools.retain(|spec| spec.name != "edit_file");
+    }
     // Per-call (count, last_result): the no-progress guard is result-aware (see
     // `note_no_progress`).
     let mut call_counts: HashMap<String, (usize, String)> = HashMap::new();
+    let mut recovered_call_signatures = BTreeSet::new();
+    let mut error_argument_churn = ErrorArgumentChurn::default();
+    let mut total_tool_calls = 0usize;
+    let mut plan_updates = 0usize;
+    let mut consecutive_edit_failures = 0usize;
+    let mut force_full_rewrite = cfg.default_write_path.is_some();
     let mut ran: BTreeMap<String, usize> = BTreeMap::new();
     let require_workspace_observation =
         cfg.tool_profile.is_workspace() && workspace_request_requires_observation(history);
@@ -414,6 +637,8 @@ pub fn run_loop(
     };
     let mut observed_workspace = false;
     let mut workspace_changed = false;
+    let mut pending_verification_paths: BTreeSet<String> = BTreeSet::new();
+    let mut semantic_contract_findings: Vec<String> = Vec::new();
     let mut workspace_observations: Vec<(String, String)> = Vec::new();
     let mut successful_workspace_reads = BTreeSet::new();
     let mut calibration: Option<f32> = None;
@@ -422,6 +647,13 @@ pub fn run_loop(
     let mut capped_retries = 0usize;
     let mut evidence_reprompts = 0usize;
     let mut change_reprompts = 0usize;
+    let mut verification_reprompts = 0usize;
+    let mut malformed_tool_reprompts = 0usize;
+    let mut python_alias_guidance_sent = false;
+    let mut direct_python_rewrite_required = false;
+    let mut direct_python_rewrite_violations = 0usize;
+    #[cfg(windows)]
+    let mut windows_python_launcher_verified = false;
     loop {
         if cfg.max_steps != 0 && completed_steps >= cfg.max_steps {
             break;
@@ -518,6 +750,33 @@ pub fn run_loop(
         }
         match step {
             ModelStep::Text(text) => {
+                let trimmed_text = text.trim();
+                let looks_like_unparsed_tool = trimmed_text.contains("<tool_call>")
+                    || trimmed_text.starts_with("edit_file(")
+                    || trimmed_text.starts_with("write_file(")
+                    || trimmed_text.starts_with("run_shell(");
+                if cfg.tool_profile.is_workspace() && looks_like_unparsed_tool {
+                    if malformed_tool_reprompts < MALFORMED_TOOL_REPROMPT_LIMIT {
+                        malformed_tool_reprompts += 1;
+                        completed_steps = completed_steps.saturating_sub(1);
+                        reporter.notice(
+                            "model emitted malformed tool syntax; requesting one structured recovery call",
+                        );
+                        let required = if force_full_rewrite {
+                            "edit_file is unavailable after repeated patch failures. Emit exactly one structured write_file call containing the COMPLETE corrected file at the same path."
+                        } else {
+                            "Emit exactly one valid structured tool call using the advertised schema. Do not wrap source in prose or manually write <tool_call> syntax."
+                        };
+                        history.push(AgentMsg::System(format!(
+                            "Your last response looked like a tool call but could not be parsed, so it was NOT executed and is not a completion answer. {required}"
+                        )));
+                        continue;
+                    }
+                    reporter.notice(
+                        "stopping: the model repeatedly emitted malformed tool-call syntax",
+                    );
+                    return LoopEnd::Repeated;
+                }
                 // A step that stopped at max_tokens is CUT OFF, not finished.
                 // Text here means `tool_parse` found no call — and the single
                 // most common reason for that on a capped step is a `write_file`
@@ -574,6 +833,144 @@ pub fn run_loop(
                         "stopping: the model repeatedly tried to finish without making the ",
                         "requested workspace change"
                     ));
+                    return LoopEnd::Repeated;
+                }
+                if require_workspace_change
+                    && workspace_changed
+                    && (!pending_verification_paths.is_empty()
+                        || !semantic_contract_findings.is_empty())
+                {
+                    if verification_reprompts < VERIFICATION_REPROMPT_LIMIT {
+                        verification_reprompts += 1;
+                        reporter.notice(
+                            "Code changed; capturing the exact post-change files for semantic review",
+                        );
+                        // Verification evidence is lifecycle work, not a model
+                        // planning decision. Capture the exact paths Camelid saw
+                        // change and retain those observations in the transcript,
+                        // then give the model one focused critique turn. This is
+                        // the same separation OpenClaw applies to execution vs.
+                        // completion capture/delivery and avoids spending whole
+                        // inference turns asking a small model to call read_file.
+                        let mut captured_sources = Vec::new();
+                        for relative in pending_verification_paths
+                            .iter()
+                            .filter(|path| path.as_str() != "<child-created file>")
+                            .cloned()
+                            .collect::<Vec<_>>()
+                        {
+                            let call = ToolCall {
+                                name: "read_file".into(),
+                                args: json!({"path": relative.clone()}),
+                            };
+                            let Ok(action) = tools::validate_for(cfg.tool_profile, &call, sandbox)
+                            else {
+                                continue;
+                            };
+                            reporter.tool_call(&action.call_line(sandbox));
+                            let outcome = execute_audited(
+                                &action,
+                                sandbox,
+                                ApprovalTier::Auto,
+                                &call.args,
+                                cfg.audit.as_ref(),
+                                cancel,
+                            )
+                            .clipped(cfg.tool_profile.observation_limit().unwrap_or(usize::MAX));
+                            reporter.tool_result("read_file", &outcome);
+                            history.push(AgentMsg::ToolCalls(vec![call]));
+                            history.push(AgentMsg::ToolResult {
+                                name: "read_file".into(),
+                                outcome: outcome.clone(),
+                            });
+                            if !outcome.is_err() {
+                                captured_sources
+                                    .push((relative.clone(), outcome.text().to_string()));
+                                pending_verification_paths.remove(&relative);
+                                observed_workspace = true;
+                                successful_workspace_reads.insert(relative);
+                                workspace_observations
+                                    .push(("read_file".into(), outcome.text().to_string()));
+                            }
+                        }
+                        if pending_verification_paths.is_empty() && !captured_sources.is_empty() {
+                            semantic_contract_findings =
+                                source_contract_findings(history, &captured_sources);
+                            #[cfg(windows)]
+                            for (relative, _) in captured_sources
+                                .iter()
+                                .filter(|(path, _)| path.to_ascii_lowercase().ends_with(".py"))
+                            {
+                                // Windows `cmd /C` does not use CRT quoting; the
+                                // generic run_shell boundary intentionally
+                                // documents that quoted arguments can arrive
+                                // with literal quotes. Auto-compile only simple
+                                // sandbox-relative names and leave complex paths
+                                // to explicit model/user verification.
+                                if !relative.chars().all(|character| {
+                                    character.is_ascii_alphanumeric()
+                                        || matches!(character, '.' | '_' | '-' | '/' | '\\')
+                                }) {
+                                    continue;
+                                }
+                                let command = format!("py -m py_compile {relative}");
+                                let action = Action::RunShell {
+                                    command: command.clone(),
+                                };
+                                reporter.tool_call(&action.call_line(sandbox));
+                                let outcome = execute_audited(
+                                    &action,
+                                    sandbox,
+                                    ApprovalTier::Auto,
+                                    &json!({"command": command}),
+                                    cfg.audit.as_ref(),
+                                    cancel,
+                                )
+                                .clipped(
+                                    cfg.tool_profile.observation_limit().unwrap_or(usize::MAX),
+                                );
+                                reporter.tool_result("run_shell", &outcome);
+                                history.push(AgentMsg::ToolCalls(vec![ToolCall {
+                                    name: "run_shell".into(),
+                                    args: json!({"command": command}),
+                                }]));
+                                history.push(AgentMsg::ToolResult {
+                                    name: "run_shell".into(),
+                                    outcome: outcome.clone(),
+                                });
+                                if outcome.is_err() {
+                                    semantic_contract_findings.push(format!(
+                                        "Python syntax validation failed for {relative}: {}",
+                                        outcome.text()
+                                    ));
+                                }
+                            }
+                        }
+                        if !semantic_contract_findings.is_empty() {
+                            history.push(AgentMsg::System(format!(
+                                "Camelid's deterministic source-contract audit found behavior that does not satisfy the explicit request:\n- {}\nDo not answer or merely explain these findings. Your NEXT tool call must be edit_file or write_file to correct every item. After the new version is written, Camelid will capture and audit that exact version again.",
+                                semantic_contract_findings.join("\n- ")
+                            )));
+                        } else if pending_verification_paths.is_empty() {
+                            history.push(AgentMsg::System(
+                                "Camelid captured the exact final changed source above as retained verification evidence. Do not repeat the previous completion claim. Review the ACTUAL implementation against EVERY explicit user requirement and its state transitions. A comment, filename, UI label, syntax check, or claim is not behavior. If anything is missing or incorrect, your NEXT tool call must edit_file or write_file to fix it. Otherwise run an appropriate syntax/build/test command when available, then answer concisely."
+                                    .into(),
+                            ));
+                        } else {
+                            history.push(AgentMsg::System(format!(
+                                "Camelid could not capture every changed path: {}. Use read_file on those exact paths before answering.",
+                                pending_verification_paths
+                                    .iter()
+                                    .map(String::as_str)
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )));
+                        }
+                        continue;
+                    }
+                    reporter.notice(
+                        "stopping: the model repeatedly claimed completion without post-change verification",
+                    );
                     return LoopEnd::Repeated;
                 }
                 let missing_reads = required_workspace_reads
@@ -662,7 +1059,16 @@ pub fn run_loop(
                 history.push(AgentMsg::Assistant(text));
                 return LoopEnd::Answered;
             }
-            ModelStep::Calls(calls) => {
+            ModelStep::Calls(mut calls) => {
+                if let Some(path) = cfg.default_write_path.as_deref() {
+                    for call in &mut calls {
+                        if supply_default_write_path(call, path) {
+                            reporter.notice(&format!(
+                                "supplied deterministic standalone artifact path: {path}"
+                            ));
+                        }
+                    }
+                }
                 if cfg.tool_profile.is_workspace()
                     && calls.len() > MAX_WORKSPACE_TOOL_CALLS_PER_STEP
                 {
@@ -673,6 +1079,17 @@ pub fn run_loop(
                     ));
                     return LoopEnd::DriverError;
                 }
+                if cfg.tool_profile.is_workspace()
+                    && total_tool_calls.saturating_add(calls.len())
+                        > MAX_WORKSPACE_TOOL_CALLS_PER_RUN
+                {
+                    reporter.notice(&format!(
+                        "stopping: Workspace turn reached its {}-tool-call resource ceiling",
+                        MAX_WORKSPACE_TOOL_CALLS_PER_RUN
+                    ));
+                    return LoopEnd::Repeated;
+                }
+                total_tool_calls = total_tool_calls.saturating_add(calls.len());
                 history.push(AgentMsg::ToolCalls(calls.clone()));
                 for call in calls {
                     if cancel.load(Ordering::Relaxed) {
@@ -681,14 +1098,90 @@ pub fn run_loop(
                     }
                     let signature = format!("{}::{}", call.name, call.args);
                     *ran.entry(call.name.clone()).or_insert(0) += 1;
+                    if call.name == "update_plan"
+                        && !tools.iter().any(|spec| spec.name == call.name)
+                    {
+                        reporter.tool_call("update_plan(?)");
+                        let outcome = ToolOutcome::Err(
+                            "planning budget exhausted; take a file, shell, or delegation action now"
+                                .into(),
+                        );
+                        reporter.tool_result(&call.name, &outcome);
+                        history.push(AgentMsg::ToolResult {
+                            name: call.name,
+                            outcome,
+                        });
+                        history.push(AgentMsg::System(
+                            "Do not call update_plan again in this run. Planning is finished. Advance the user's goal with a file, shell, or delegation tool now."
+                                .into(),
+                        ));
+                        continue;
+                    }
+                    if call.name == "edit_file" && force_full_rewrite {
+                        reporter.tool_call("edit_file(?)");
+                        let outcome = ToolOutcome::Err(
+                            "edit_file is disabled after repeated unmatched/ambiguous patches; use write_file with the complete corrected file"
+                                .into(),
+                        );
+                        reporter.tool_result(&call.name, &outcome);
+                        history.push(AgentMsg::ToolResult {
+                            name: call.name,
+                            outcome,
+                        });
+                        history.push(AgentMsg::System(
+                            "Do not call edit_file again for this version. Your NEXT tool call must be write_file with the complete corrected source at the same path; the existing file remains intact until that replacement succeeds."
+                                .into(),
+                        ));
+                        continue;
+                    }
+                    if direct_python_rewrite_required && call.name != "write_file" {
+                        direct_python_rewrite_violations =
+                            direct_python_rewrite_violations.saturating_add(1);
+                        reporter.tool_call(&format!("{}(?)", call.name));
+                        let outcome = ToolOutcome::Err(
+                            "the last Python verification exposed a real source failure; this direct standalone task now requires a complete write_file replacement before any more reads or shell commands"
+                                .into(),
+                        );
+                        reporter.tool_result(&call.name, &outcome);
+                        history.push(AgentMsg::ToolResult {
+                            name: call.name,
+                            outcome,
+                        });
+                        if direct_python_rewrite_violations >= 3 {
+                            reporter.notice(
+                                "stopping: the model ignored the required complete Python rewrite",
+                            );
+                            return LoopEnd::Repeated;
+                        }
+                        history.push(AgentMsg::System(
+                            "Do not inspect, run, explain, or answer. Your NEXT and ONLY valid action is write_file with the COMPLETE corrected Python artifact at the same workspace-relative path. Preserve every requested behavior while fixing the traceback/syntax failure."
+                                .into(),
+                        ));
+                        continue;
+                    }
                     // Validate against schema + sandbox. A bad/unknown/escape call
                     // becomes a tool-error result the model can recover from.
-                    let action = match tools::validate_for(cfg.tool_profile, &call, sandbox) {
+                    let mut action = match tools::validate_for(cfg.tool_profile, &call, sandbox) {
                         Ok(a) => a,
                         Err(e) => {
+                            let call_name = call.name.clone();
+                            let rejected_raw_source = require_workspace_change
+                                && !workspace_changed
+                                && e.contains("raw program source");
                             reporter.tool_call(&format!("{}(?)", call.name));
                             let outcome = ToolOutcome::Err(e);
                             reporter.tool_result(&call.name, &outcome);
+                            let churn_tool = if outcome.text().starts_with("unknown tool") {
+                                "<unknown_tool>"
+                            } else {
+                                call.name.as_str()
+                            };
+                            let churning = note_error_argument_churn(
+                                &mut error_argument_churn,
+                                churn_tool,
+                                &signature,
+                                &outcome,
+                            );
                             let stuck = note_no_progress_at(
                                 &mut call_counts,
                                 &signature,
@@ -704,16 +1197,31 @@ pub fn run_loop(
                                 reporter.notice(&msg);
                                 return LoopEnd::Repeated;
                             }
-                            history.push(AgentMsg::System(
-                                "That tool call was not executed because its arguments were invalid. \
-                                 Correct the arguments before retrying and never repeat the identical \
-                                 failed call. For a small single-file coding task, use write_file or \
-                                 edit_file directly; subagent delegation is optional."
-                                    .into(),
-                            ));
+                            if churning {
+                                reporter.notice(&format!(
+                                    "stopping: `{}` kept changing arguments but returned the same error {} times",
+                                    call_name, ERROR_ARGUMENT_CHURN_LIMIT
+                                ));
+                                return LoopEnd::Repeated;
+                            }
+                            history.push(AgentMsg::System(if rejected_raw_source {
+                                "Program source must be persisted before it is run. Do not retry or rephrase the shell command and do not answer. Your NEXT tool call must be write_file (or edit_file for an existing file) containing the source; then re-read that exact file and run it or syntax-check it."
+                                    .into()
+                            } else {
+                                "That tool call was not executed because its arguments were invalid. Correct the arguments before retrying and never repeat the identical failed call. For a small single-file coding task, use write_file or edit_file directly; subagent delegation is optional."
+                                    .into()
+                            }));
                             continue;
                         }
                     };
+                    #[cfg(windows)]
+                    if windows_python_launcher_verified {
+                        if let Some(normalized) = normalize_verified_windows_python(&mut action) {
+                            reporter.notice(&format!(
+                                "normalized the unusable Windows python.exe alias to verified command: {normalized}"
+                            ));
+                        }
+                    }
                     reporter.tool_call(&action.call_line(sandbox));
 
                     // Consult the approval policy for the effective tier — the one
@@ -745,20 +1253,49 @@ pub fn run_loop(
                         }
                         Decision::AlwaysTool => {
                             policy.grant(action.tool_name());
-                            execute_audited(&action, sandbox, tier, &call.args, cfg.audit.as_ref())
+                            execute_audited(
+                                &action,
+                                sandbox,
+                                tier,
+                                &call.args,
+                                cfg.audit.as_ref(),
+                                cancel,
+                            )
                         }
-                        Decision::Once => {
-                            execute_audited(&action, sandbox, tier, &call.args, cfg.audit.as_ref())
-                        }
+                        Decision::Once => execute_audited(
+                            &action,
+                            sandbox,
+                            tier,
+                            &call.args,
+                            cfg.audit.as_ref(),
+                            cancel,
+                        ),
                     };
                     let outcome = match cfg.tool_profile.observation_limit() {
                         Some(max_bytes) => outcome.clipped(max_bytes),
                         None => outcome,
                     };
-                    if !outcome.is_err()
-                        && matches!(&action, Action::WriteFile { .. } | Action::EditFile { .. })
-                    {
-                        workspace_changed = true;
+                    let exhausted_edit_recovery = if matches!(&action, Action::EditFile { .. }) {
+                        if outcome.is_err() {
+                            consecutive_edit_failures = consecutive_edit_failures.saturating_add(1);
+                            consecutive_edit_failures >= MAX_CONSECUTIVE_EDIT_FAILURES
+                        } else {
+                            consecutive_edit_failures = 0;
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if !outcome.is_err() {
+                        if let Action::WriteFile { path, .. } | Action::EditFile { path, .. } =
+                            &action
+                        {
+                            workspace_changed = true;
+                            verification_reprompts = 0;
+                            semantic_contract_findings.clear();
+                            pending_verification_paths
+                                .insert(normalize_workspace_path(&sandbox.rel(path)));
+                        }
                     }
                     if require_workspace_change
                         && !workspace_changed
@@ -766,6 +1303,17 @@ pub fn run_loop(
                             > initial_checkpoint_count
                     {
                         workspace_changed = true;
+                        pending_verification_paths.insert("<child-created file>".into());
+                    }
+                    if workspace_changed && !outcome.is_err() {
+                        if let Action::ReadFile { path, .. } = &action {
+                            pending_verification_paths
+                                .remove(&normalize_workspace_path(&sandbox.rel(path)));
+                            // A child checkpoint does not expose its path at this
+                            // boundary. The first successful post-child read is
+                            // the parent's evidence from that external change.
+                            pending_verification_paths.remove("<child-created file>");
+                        }
                     }
                     if cfg.tool_profile.is_workspace() && !outcome.is_err() {
                         observed_workspace = true;
@@ -778,17 +1326,148 @@ pub fn run_loop(
                     }
                     let name = action.tool_name();
                     reporter.tool_result(name, &outcome);
+                    if !outcome.is_err() && matches!(&action, Action::UpdatePlan { .. }) {
+                        plan_updates = plan_updates.saturating_add(1);
+                        if plan_updates >= MAX_PLAN_UPDATES_PER_RUN {
+                            tools.retain(|spec| spec.name != "update_plan");
+                            reporter.notice(
+                                "planning budget used; subsequent steps must perform or verify work",
+                            );
+                        }
+                    }
+                    let delegated_terminal_without_result = require_workspace_change
+                        && !workspace_changed
+                        && matches!(&action, Action::AwaitSubagent { .. })
+                        && (outcome.text().starts_with("status: failed")
+                            || outcome.text().starts_with("status: inconclusive"));
+                    let direct_python_failure = cfg.default_write_path.is_some()
+                        && workspace_changed
+                        && outcome.is_err()
+                        && matches!(&action, Action::RunShell { .. })
+                        && (outcome.text().contains("Traceback (most recent call last)")
+                            || outcome.text().contains("SyntaxError:"));
+                    let python_alias_failure = !python_alias_guidance_sent
+                        && outcome.is_err()
+                        && outcome.text().contains("Python was not found")
+                        && outcome.text().contains("Microsoft Store")
+                        && matches!(&action, Action::RunShell { command }
+                            if command.trim_start().to_ascii_lowercase().starts_with("python"));
+                    #[cfg(windows)]
+                    let python_launcher_just_verified = !outcome.is_err()
+                        && matches!(&action, Action::RunShell { command }
+                            if command.trim().eq_ignore_ascii_case("py --version"));
+                    #[cfg(windows)]
+                    if python_launcher_just_verified {
+                        windows_python_launcher_verified = true;
+                    }
+                    #[cfg(not(windows))]
+                    let python_launcher_just_verified = false;
+                    let churning = note_error_argument_churn(
+                        &mut error_argument_churn,
+                        name,
+                        &signature,
+                        &outcome,
+                    );
                     // Result-aware no-progress guard: stop only if the SAME call has
                     // returned the SAME result REPEAT_LIMIT times in a row. A call
                     // whose result keeps changing — e.g. polling
                     // check_subagent_status until a subagent finishes — is progress.
                     let stuck = note_no_progress(&mut call_counts, &signature, &outcome);
+                    let repeat_count = call_counts
+                        .get(&signature)
+                        .map(|(count, _)| *count)
+                        .unwrap_or(0);
+                    let already_recovered = recovered_call_signatures.contains(&signature);
+                    let recover_now = repeat_count >= REPEAT_RECOVERY_THRESHOLD
+                        && !already_recovered
+                        && recovered_call_signatures.insert(signature.clone());
                     history.push(AgentMsg::ToolResult {
                         name: name.to_string(),
                         outcome,
                     });
-                    if stuck {
+                    if !history.last().is_some_and(|message| {
+                        matches!(
+                            message,
+                            AgentMsg::ToolResult { outcome, .. } if outcome.is_err()
+                        )
+                    }) && matches!(&action, Action::WriteFile { .. })
+                    {
+                        direct_python_rewrite_required = false;
+                        direct_python_rewrite_violations = 0;
+                    }
+                    if direct_python_failure {
+                        direct_python_rewrite_required = true;
+                        direct_python_rewrite_violations = 0;
+                        reporter.notice(
+                            "Python verification failed; requiring a complete source replacement",
+                        );
+                        history.push(AgentMsg::System(
+                            "The Python traceback/syntax error proves the current standalone artifact is broken. Do not read more lines, rerun it, explain, or answer. Your NEXT tool call must be write_file with the COMPLETE corrected source at the same workspace-relative path."
+                                .into(),
+                        ));
+                        continue;
+                    }
+                    if python_launcher_just_verified {
+                        reporter.notice(
+                            "Python launcher verified; requiring artifact work instead of installation",
+                        );
+                        history.push(AgentMsg::System(
+                            "`py --version` succeeded, so Python is installed and ready. Do not run any install command. Fix or write the requested source now using its workspace-relative path, then use `py -m py_compile <file.py>` for a bounded syntax check; do not launch a GUI during verification."
+                                .into(),
+                        ));
+                        continue;
+                    }
+                    if exhausted_edit_recovery {
+                        force_full_rewrite = true;
+                        tools.retain(|spec| spec.name != "edit_file");
+                        reporter.notice(
+                            "two file patches failed; requiring a complete write_file replacement",
+                        );
+                        history.push(AgentMsg::System(
+                            "Two edit_file patches failed and the original file is unchanged. Stop attempting narrow edits. Your NEXT tool call must be write_file with the complete corrected source at the same path. Include every existing required behavior plus all audit fixes; then Camelid will re-read and audit the replacement."
+                                .into(),
+                        ));
+                        continue;
+                    }
+                    if python_alias_failure {
+                        python_alias_guidance_sent = true;
+                        reporter.notice(
+                            "python.exe resolved to the Windows Store alias; requiring launcher probe",
+                        );
+                        history.push(AgentMsg::System(
+                            "That result only proves the Windows `python.exe` Store alias is unusable; it does NOT prove Python is absent. Do not repeat a `python` command, ask the user to install anything, or answer. Your NEXT tool call must be `run_shell` with exactly `py --version`. If it succeeds, use `py` for later checks and persist requested source with write_file."
+                                .into(),
+                        ));
+                        continue;
+                    }
+                    if delegated_terminal_without_result {
+                        reporter.notice(
+                            "delegated work ended without a workspace change; requiring direct parent execution",
+                        );
+                        history.push(AgentMsg::System(
+                            "The delegated child ended without completing the requested workspace change. Do not answer, spawn another child, or wait again. Complete the task yourself now. Your NEXT tool call must be write_file or edit_file, using the information already available; then verify the result."
+                                .into(),
+                        ));
+                        continue;
+                    }
+                    if recover_now {
+                        reporter.notice(&format!(
+                            "recovering: `{name}` returned the same result twice; requiring a different action"
+                        ));
+                        history.push(AgentMsg::System(format!(
+                            "Runtime loop recovery: `{name}` with those arguments has already returned the same result twice. Treat that observation as settled and DO NOT call it again with the same arguments. Choose a different action that advances the user's request now. If a directory listing established that the workspace is empty and the user asked you to create code, call `write_file` now; do not inspect the empty directory again."
+                        )));
+                        continue;
+                    }
+                    if stuck || (already_recovered && repeat_count >= REPEAT_RECOVERY_THRESHOLD) {
                         reporter.notice(&repeat_notice(name));
+                        return LoopEnd::Repeated;
+                    }
+                    if churning {
+                        reporter.notice(&format!(
+                            "stopping: `{name}` kept changing arguments but returned the same error {} times",
+                            ERROR_ARGUMENT_CHURN_LIMIT
+                        ));
                         return LoopEnd::Repeated;
                     }
                 }
@@ -1385,12 +2064,13 @@ fn execute_audited(
     tier: ApprovalTier,
     raw_args: &Value,
     sink: &dyn AuditSink,
+    cancel: &AtomicBool,
 ) -> ToolOutcome {
     let tool = action.tool_name();
     let digest = audit::digest_args(raw_args);
     sink.emit(&AuditEvent::call(tool, tier.label(), digest.clone()));
     let start = Instant::now();
-    let outcome = action.execute(sandbox);
+    let outcome = action.execute_cancellable(sandbox, cancel);
     sink.emit(&AuditEvent::result(
         tool,
         tier.label(),
@@ -2731,7 +3411,7 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
     // Enable subagent orchestration for this session: children share this serve
     // (same addr → resident model reused) and inherit the same gates. Capped
     // (concurrency, depth-1) inside the spawn path. Until this call, the
-    // spawn_subagent/check_subagent_status tools are not advertised.
+    // spawn_subagent/await_subagent/check_subagent_status tools are not advertised.
     super::subagent::configure(super::subagent::SubagentConfig::for_session(
         addr,
         session.active_id.clone().unwrap_or_default(),
@@ -3070,8 +3750,33 @@ mod tests {
             audit: Box::new(audit::NoopSink),
             shell_sandbox: ShellSandbox::Sandboxed,
             tool_profile: tools::ToolProfile::Full,
+            allow_plan: true,
+            default_write_path: None,
             ctx_budget: None,
         }
+    }
+
+    #[test]
+    fn deterministic_write_path_fills_only_missing_direct_write_argument() {
+        let mut missing = ToolCall {
+            name: "write_file".into(),
+            args: json!({"content":"print('ready')\n"}),
+        };
+        assert!(supply_default_write_path(&mut missing, "tic_tac_toe.py"));
+        assert_eq!(missing.args["path"], "tic_tac_toe.py");
+
+        let mut explicit = ToolCall {
+            name: "write_file".into(),
+            args: json!({"path":"chosen.py","content":"print('ready')\n"}),
+        };
+        assert!(!supply_default_write_path(&mut explicit, "tic_tac_toe.py"));
+        assert_eq!(explicit.args["path"], "chosen.py");
+
+        let mut shell = ToolCall {
+            name: "run_shell".into(),
+            args: json!({"command":"echo ready"}),
+        };
+        assert!(!supply_default_write_path(&mut shell, "ignored.py"));
     }
 
     fn sb_with(files: &[(&str, &str)]) -> (tempfile::TempDir, Sandbox) {
@@ -3093,6 +3798,66 @@ mod tests {
             name: name.into(),
             args,
         }
+    }
+
+    #[test]
+    fn argument_churn_requires_variants_and_one_stable_error() {
+        let mut churn = ErrorArgumentChurn::default();
+        let failure = ToolOutcome::Err("same failure".into());
+        for signature in ["tool::{a:1}", "tool::{a:2}", "tool::{a:1}"] {
+            assert!(!note_error_argument_churn(
+                &mut churn, "tool", signature, &failure
+            ));
+        }
+        assert!(note_error_argument_churn(
+            &mut churn,
+            "tool",
+            "tool::{a:2}",
+            &failure
+        ));
+
+        let success = ToolOutcome::Ok("worked".into());
+        assert!(!note_error_argument_churn(
+            &mut churn,
+            "tool",
+            "tool::{a:3}",
+            &success
+        ));
+        assert!(churn.samples.is_empty());
+    }
+
+    #[test]
+    fn workspace_turn_has_an_absolute_tool_call_ceiling() {
+        let (dir, sandbox) = sb_with(&[]);
+        let mut steps = (0..=MAX_WORKSPACE_TOOL_CALLS_PER_RUN)
+            .map(|offset| {
+                ModelStep::Calls(vec![tc("list_dir", json!({"path": ".", "offset": offset}))])
+            })
+            .collect::<Vec<_>>();
+        steps.push(ModelStep::Text("should never reach this".into()));
+        let mut driver = MockDriver { steps, idx: 0 };
+        let mut approver = ScriptApprover(vec![], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("Keep inspecting the workspace.".into())];
+        let mut config = cfg(dir.path(), false);
+        config.max_steps = 0;
+        config.tool_profile = tools::ToolProfile::WebCode;
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sandbox,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        assert_eq!(end, LoopEnd::Repeated);
+        assert_eq!(reporter.calls.len(), MAX_WORKSPACE_TOOL_CALLS_PER_RUN);
+        assert!(reporter
+            .notices
+            .iter()
+            .any(|notice| notice.contains("resource ceiling")));
     }
 
     #[test]
@@ -4153,9 +4918,585 @@ mod tests {
             &mut history,
         );
         assert_eq!(end, LoopEnd::Repeated);
-        // Stopped at the repeat limit (same call, same result REPEAT_LIMIT times),
-        // not the 25-step cap.
-        assert!(reporter.results.len() <= REPEAT_LIMIT);
+        // Validation failures use the stricter two-strike correction path and
+        // stop well before the 25-step cap.
+        assert!(reporter.results.len() <= REPEAT_LIMIT + REPEAT_RECOVERY_THRESHOLD);
+    }
+
+    #[test]
+    fn empty_workspace_repeat_recovers_into_the_requested_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        let source = "import tkinter as tk\n\nroot = tk.Tk()\nroot.mainloop()\n";
+        let mut driver = MockDriver {
+            steps: vec![
+                ModelStep::Calls(vec![tc("list_dir", json!({"path": "."}))]),
+                ModelStep::Calls(vec![tc("list_dir", json!({"path": "."}))]),
+                ModelStep::Calls(vec![tc(
+                    "write_file",
+                    json!({"path": "tic_tac_toe.py", "content": source}),
+                )]),
+                ModelStep::Calls(vec![tc("read_file", json!({"path": "tic_tac_toe.py"}))]),
+                ModelStep::Text("Created the graphical game.".into()),
+            ],
+            idx: 0,
+        };
+        let mut approver = ScriptApprover(vec![Decision::Once], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(
+            "Can you code me tic tac toe in Python with graphics?".into(),
+        )];
+        let mut config = cfg(dir.path(), true);
+        config.max_steps = 0;
+        config.tool_profile = tools::ToolProfile::WebCode;
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sb,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        assert_eq!(end, LoopEnd::Answered);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("tic_tac_toe.py")).unwrap(),
+            source
+        );
+        assert!(reporter
+            .notices
+            .iter()
+            .any(|notice| notice.contains("requiring a different action")));
+    }
+
+    #[test]
+    fn terminal_child_without_a_change_forces_direct_parent_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        let result_dir = dir.path().join(".camelid/subagents");
+        std::fs::create_dir_all(&result_dir).unwrap();
+        std::fs::write(
+            result_dir.join("result_child.json"),
+            serde_json::to_string(&super::super::subagent::SubagentResult {
+                subtask_id: "child".into(),
+                status: "inconclusive".into(),
+                answer: String::new(),
+                tool_calls: vec![],
+                note: "timed out".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let source = "print('direct fallback')\n";
+        let mut driver = MockDriver {
+            steps: vec![
+                ModelStep::Calls(vec![tc(
+                    "await_subagent",
+                    json!({"subtask_id": "child", "timeout_seconds": 1}),
+                )]),
+                ModelStep::Calls(vec![tc(
+                    "write_file",
+                    json!({"path": "game.py", "content": source}),
+                )]),
+                ModelStep::Calls(vec![tc("read_file", json!({"path": "game.py"}))]),
+                ModelStep::Text("Created game.py directly.".into()),
+            ],
+            idx: 0,
+        };
+        let mut approver = ScriptApprover(vec![Decision::Once], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("Create a Python game.".into())];
+        let mut config = cfg(dir.path(), false);
+        config.max_steps = 0;
+        config.tool_profile = tools::ToolProfile::WebCode;
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sb,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        assert_eq!(end, LoopEnd::Answered);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("game.py")).unwrap(),
+            source
+        );
+        assert!(reporter
+            .notices
+            .iter()
+            .any(|notice| notice.contains("direct parent execution")));
+        assert!(history.iter().any(|message| matches!(
+            message,
+            AgentMsg::System(text) if text.contains("NEXT tool call must be write_file")
+        )));
+    }
+
+    #[test]
+    fn code_completion_requires_post_change_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        let mut driver = MockDriver {
+            steps: vec![
+                ModelStep::Calls(vec![tc(
+                    "write_file",
+                    json!({"path": "game.py", "content": "print('game')\n"}),
+                )]),
+                ModelStep::Text("Done without checking.".into()),
+                ModelStep::Calls(vec![tc("read_file", json!({"path": "game.py"}))]),
+                ModelStep::Text("Verified game.py.".into()),
+            ],
+            idx: 0,
+        };
+        let mut approver = ScriptApprover(vec![Decision::Once], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("Create a Python game.".into())];
+        let mut config = cfg(dir.path(), false);
+        config.max_steps = 0;
+        config.tool_profile = tools::ToolProfile::WebCode;
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sb,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        assert_eq!(end, LoopEnd::Answered);
+        assert_eq!(reporter.text, vec!["Verified game.py."]);
+        assert!(reporter
+            .notices
+            .iter()
+            .any(|notice| notice
+                .contains("capturing the exact post-change files for semantic review")));
+        assert!(history.iter().any(|message| matches!(
+            message,
+            AgentMsg::System(text) if text.contains("EVERY explicit user requirement")
+        )));
+    }
+
+    #[test]
+    fn completion_claim_captures_the_exact_changed_file_for_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        let mut driver = MockDriver {
+            steps: vec![
+                ModelStep::Calls(vec![tc(
+                    "write_file",
+                    json!({"path": "game.py", "content": "print('game')\n"}),
+                )]),
+                ModelStep::Text("Done without checking.".into()),
+                ModelStep::Text("Reviewed the captured game.py source.".into()),
+            ],
+            idx: 0,
+        };
+        let mut approver = ScriptApprover(vec![Decision::Once], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("Create a Python game.".into())];
+        let mut config = cfg(dir.path(), false);
+        config.max_steps = 0;
+        config.tool_profile = tools::ToolProfile::WebCode;
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sb,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        assert_eq!(end, LoopEnd::Answered);
+        assert_eq!(reporter.text, vec!["Reviewed the captured game.py source."]);
+        assert!(reporter
+            .calls
+            .iter()
+            .any(|call| call.starts_with("read_file(game.py")));
+        assert!(history.iter().any(|message| matches!(
+            message,
+            AgentMsg::ToolResult { name, outcome }
+                if name == "read_file" && outcome.text().contains("print('game')")
+        )));
+    }
+
+    #[test]
+    fn tic_tac_toe_contract_audit_catches_the_live_turn_state_failure() {
+        let history = vec![AgentMsg::User(
+            "Code me tic tac toe, one player vs the computer, in Python with graphics.".into(),
+        )];
+        let bad_source = concat!(
+            "import tkinter as tk\n",
+            "class Game:\n",
+            "    def __init__(self):\n",
+            "        self.root = tk.Tk()\n",
+            "        self.current_player = \"X\"\n",
+            "        self.button = tk.Button(command=lambda: self.make_move(i, j))\n",
+            "    def make_move(self, idx):\n",
+            "        self.board[idx] = self.current_player\n",
+            "        self.current_player = \"O\"\n",
+            "        self.computer_move()\n",
+            "    def computer_move(self):\n",
+            "        self.board[0] = \"O\"\n",
+            "    def check_draw(self):\n",
+            "        return False\n",
+            "    def finish(self):\n",
+            "        self.root.destroy()\n",
+            "        print(\"O wins\")\n",
+        );
+        let findings =
+            source_contract_findings(&history, &[("tic_tac_toe.py".into(), bad_source.into())]);
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("current_player to X")));
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("loop-variable lambda")));
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("computer win/draw")));
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("messagebox or status/result label")));
+    }
+
+    #[test]
+    fn tic_tac_toe_contract_audit_accepts_a_settled_gui_turn() {
+        let history = vec![AgentMsg::User(
+            "Code me tic tac toe, one player vs the computer, in Python with graphics.".into(),
+        )];
+        let good_source = concat!(
+            "import tkinter as tk\n",
+            "from tkinter import messagebox\n",
+            "class Game:\n",
+            "    def __init__(self):\n",
+            "        self.current_player = \"X\"\n",
+            "    def make_move(self, idx):\n",
+            "        self.board[idx] = \"X\"\n",
+            "        self.computer_move()\n",
+            "    def computer_move(self):\n",
+            "        self.board[0] = \"O\"\n",
+            "        if self.check_win(\"O\") or self.check_draw():\n",
+            "            messagebox.showinfo(\"Done\", \"Result\")\n",
+            "        self.current_player = \"X\"\n",
+        );
+        let findings =
+            source_contract_findings(&history, &[("tic_tac_toe.py".into(), good_source.into())]);
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn direct_creation_rejects_unadvertised_plan_and_continues_to_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        let mut driver = MockDriver {
+            steps: vec![
+                ModelStep::Calls(vec![tc(
+                    "update_plan",
+                    json!({"steps": [{"status": "in_progress", "text": "make game"}]}),
+                )]),
+                ModelStep::Calls(vec![tc(
+                    "write_file",
+                    json!({"path": "game.py", "content": "print('game')\n"}),
+                )]),
+                ModelStep::Calls(vec![tc("read_file", json!({"path": "game.py"}))]),
+                ModelStep::Text("Verified game.py.".into()),
+            ],
+            idx: 0,
+        };
+        let mut approver = ScriptApprover(vec![Decision::Once], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("Create a Python game.".into())];
+        let mut config = cfg(dir.path(), false);
+        config.max_steps = 0;
+        config.tool_profile = tools::ToolProfile::WebCode;
+        config.allow_plan = false;
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sb,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        assert_eq!(end, LoopEnd::Answered);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("game.py")).unwrap(),
+            "print('game')\n"
+        );
+        assert!(reporter
+            .results
+            .iter()
+            .any(|result| result.contains("planning budget exhausted")));
+    }
+
+    #[test]
+    fn ignored_repeat_recovery_stops_on_the_next_identical_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        let listing = || ModelStep::Calls(vec![tc("list_dir", json!({"path": "."}))]);
+        let mut driver = MockDriver {
+            steps: vec![
+                listing(),
+                listing(),
+                listing(),
+                ModelStep::Text("not reached".into()),
+            ],
+            idx: 0,
+        };
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("Create a Python game.".into())];
+        let mut config = cfg(dir.path(), false);
+        config.max_steps = 0;
+        config.tool_profile = tools::ToolProfile::WebCode;
+        let end = run_loop(
+            &mut driver,
+            &mut ScriptApprover(vec![], 0),
+            &mut reporter,
+            &sb,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        assert_eq!(end, LoopEnd::Repeated);
+        assert_eq!(reporter.calls.len(), 3);
+        assert!(reporter
+            .notices
+            .iter()
+            .any(|notice| notice.contains("recovering:")));
+    }
+
+    #[test]
+    fn two_failed_patches_force_a_complete_file_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("game.py"), "old source\n").unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        let bad_edit = |old: &str| {
+            ModelStep::Calls(vec![tc(
+                "edit_file",
+                json!({"path": "game.py", "old": old, "new": "fixed"}),
+            )])
+        };
+        let mut driver = MockDriver {
+            steps: vec![
+                bad_edit("missing one"),
+                bad_edit("missing two"),
+                bad_edit("missing three"),
+                ModelStep::Calls(vec![tc(
+                    "write_file",
+                    json!({"path": "game.py", "content": "complete corrected source\n"}),
+                )]),
+                ModelStep::Calls(vec![tc("read_file", json!({"path": "game.py"}))]),
+                ModelStep::Text("Replaced and verified.".into()),
+            ],
+            idx: 0,
+        };
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("Fix game.py.".into())];
+        let mut config = cfg(dir.path(), false);
+        config.max_steps = 0;
+        config.tool_profile = tools::ToolProfile::WebCode;
+        let end = run_loop(
+            &mut driver,
+            &mut ScriptApprover(vec![Decision::Once, Decision::Once, Decision::Once], 0),
+            &mut reporter,
+            &sb,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        assert_eq!(end, LoopEnd::Answered);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("game.py")).unwrap(),
+            "complete corrected source\n"
+        );
+        assert!(reporter
+            .notices
+            .iter()
+            .any(|notice| notice.contains("requiring a complete write_file replacement")));
+        assert!(reporter.results.iter().any(|result| result
+            .contains("edit_file is disabled after repeated unmatched/ambiguous patches")));
+    }
+
+    #[test]
+    fn malformed_raw_tool_envelope_is_recovered_not_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        let mut driver = MockDriver {
+            steps: vec![
+                ModelStep::Text("<tool_call>{\"name\":\"write_file\",BROKEN}</tool_call>".into()),
+                ModelStep::Calls(vec![tc(
+                    "write_file",
+                    json!({"path": "game.py", "content": "print('game')\n"}),
+                )]),
+                ModelStep::Calls(vec![tc("read_file", json!({"path": "game.py"}))]),
+                ModelStep::Text("Recovered and verified.".into()),
+            ],
+            idx: 0,
+        };
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("Create a Python game.".into())];
+        let mut config = cfg(dir.path(), false);
+        config.max_steps = 0;
+        config.tool_profile = tools::ToolProfile::WebCode;
+        let end = run_loop(
+            &mut driver,
+            &mut ScriptApprover(vec![Decision::Once], 0),
+            &mut reporter,
+            &sb,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        assert_eq!(end, LoopEnd::Answered);
+        assert_eq!(reporter.text, vec!["Recovered and verified."]);
+        assert!(reporter
+            .notices
+            .iter()
+            .any(|notice| notice.contains("malformed tool syntax")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn host_verification_rejects_invalid_python_before_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        let mut driver = MockDriver {
+            steps: vec![
+                ModelStep::Calls(vec![tc(
+                    "write_file",
+                    json!({"path": "game.py", "content": "def broken(:\n    pass\n"}),
+                )]),
+                ModelStep::Text("Done with broken source.".into()),
+                ModelStep::Calls(vec![tc(
+                    "write_file",
+                    json!({"path": "game.py", "content": "print('fixed')\n"}),
+                )]),
+                ModelStep::Text("Done with fixed source.".into()),
+                ModelStep::Text("Syntax checked and verified.".into()),
+            ],
+            idx: 0,
+        };
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("Create a Python game.".into())];
+        let mut config = cfg(dir.path(), false);
+        config.max_steps = 0;
+        config.tool_profile = tools::ToolProfile::WebCode;
+        let end = run_loop(
+            &mut driver,
+            &mut ScriptApprover(vec![Decision::Once, Decision::Once], 0),
+            &mut reporter,
+            &sb,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        assert_eq!(end, LoopEnd::Answered);
+        assert_eq!(reporter.text, vec!["Syntax checked and verified."]);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("game.py")).unwrap(),
+            "print('fixed')\n"
+        );
+        assert!(reporter
+            .results
+            .iter()
+            .any(|result| result.contains("SyntaxError")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_store_alias_failure_requires_py_launcher_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        let mut driver = MockDriver {
+            steps: vec![
+                ModelStep::Calls(vec![tc(
+                    "run_shell",
+                    json!({"command": "python --version"}),
+                )]),
+                ModelStep::Calls(vec![tc("run_shell", json!({"command": "py --version"}))]),
+                ModelStep::Calls(vec![tc(
+                    "write_file",
+                    json!({"path": "game.py", "content": "print('game')\n"}),
+                )]),
+                ModelStep::Calls(vec![tc("read_file", json!({"path": "game.py"}))]),
+                ModelStep::Text("Verified game.py.".into()),
+            ],
+            idx: 0,
+        };
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("Create a Python game.".into())];
+        let mut config = cfg(dir.path(), false);
+        config.max_steps = 0;
+        config.tool_profile = tools::ToolProfile::WebCode;
+        let end = run_loop(
+            &mut driver,
+            &mut ScriptApprover(vec![Decision::Once, Decision::Once, Decision::Once], 0),
+            &mut reporter,
+            &sb,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        assert_eq!(end, LoopEnd::Answered);
+        assert!(reporter
+            .notices
+            .iter()
+            .any(|notice| notice.contains("Windows Store alias")));
+        assert!(history.iter().any(|message| matches!(
+            message,
+            AgentMsg::System(text) if text.contains("exactly `py --version`")
+        )));
+        assert!(history.iter().any(|message| matches!(
+            message,
+            AgentMsg::System(text) if text.contains("Python is installed and ready")
+        )));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verified_windows_launcher_normalizes_python_and_gui_script_checks() {
+        let mut version = Action::RunShell {
+            command: "python --version".into(),
+        };
+        assert_eq!(
+            normalize_verified_windows_python(&mut version).as_deref(),
+            Some("py --version")
+        );
+        assert!(matches!(version, Action::RunShell { ref command } if command == "py --version"));
+
+        let mut gui = Action::RunShell {
+            command: "python tic_tac_toe.py".into(),
+        };
+        assert_eq!(
+            normalize_verified_windows_python(&mut gui).as_deref(),
+            Some("py -m py_compile tic_tac_toe.py")
+        );
+        assert!(
+            matches!(gui, Action::RunShell { ref command } if command == "py -m py_compile tic_tac_toe.py")
+        );
+
+        let mut py_gui = Action::RunShell {
+            command: "py tic_tac_toe.py".into(),
+        };
+        assert_eq!(
+            normalize_verified_windows_python(&mut py_gui).as_deref(),
+            Some("py -m py_compile tic_tac_toe.py")
+        );
+        assert!(
+            matches!(py_gui, Action::RunShell { ref command } if command == "py -m py_compile tic_tac_toe.py")
+        );
     }
 
     #[test]

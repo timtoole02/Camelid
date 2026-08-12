@@ -307,6 +307,8 @@ pub fn run(cfg: EvalConfig) -> anyhow::Result<i32> {
             audit: Box::new(super::audit::NoopSink),
             shell_sandbox: super::shell_sandbox::ShellSandbox::Unrestricted,
             tool_profile: super::tools::ToolProfile::Full,
+            allow_plan: true,
+            default_write_path: None,
             // No compaction: a promotion receipt must attest a transcript the
             // harness fully determines. Cases are short and cannot approach the
             // budget anyway (D-DROVER-6).

@@ -39,7 +39,7 @@ mod shell_sandbox;
 mod subagent;
 mod term_guard;
 mod theme;
-mod tool_parse;
+pub(crate) mod tool_parse;
 pub(crate) mod tools;
 mod tui;
 #[cfg(windows)]
@@ -182,6 +182,8 @@ pub fn run_chat(opts: ChatOptions) -> anyhow::Result<i32> {
             audit: audit::sink_from_config(opts.audit_webhook.as_deref()),
             shell_sandbox,
             tool_profile: tools::ToolProfile::Full,
+            allow_plan: true,
+            default_write_path: None,
             // The smaller of what the model was trained for and what the agent
             // lane is validated to; falls back to the validated ceiling when the
             // server has not reported a context length.

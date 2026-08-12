@@ -1,7 +1,7 @@
 # Agent Runtime Recovery Plan
 
-Status: Phase 1 implemented on `codex/web-code-revival`
-Reference: OpenClaw commit [`630aac9`](https://github.com/openclaw/openclaw/tree/630aac9b25ae6f42c760226662d4a7b3d1545f82)
+Status: Runtime recovery implemented on `codex/web-code-revival`; transport/tool gate passes, behavioral real-model release gate remains on hold
+Reference: OpenClaw commit [`b82ad646`](https://github.com/openclaw/openclaw/tree/b82ad646a5151e5fb6378e72dbbe257fd5012813)
 
 ## Failure that triggered this work
 
@@ -18,28 +18,30 @@ terminal product failure.
 
 OpenClaw separates the model-facing task name from the runtime-owned child
 identity. Its spawn contract requires the task, makes the readable task name
-optional, normalizes it before admission, and returns a runtime session key and
-run id. See
-[`subagent-task-name.ts`](https://github.com/openclaw/openclaw/blob/630aac9b25ae6f42c760226662d4a7b3d1545f82/src/agents/subagents/spawn/subagent-task-name.ts),
-[`subagent-spawn-contract.ts`](https://github.com/openclaw/openclaw/blob/630aac9b25ae6f42c760226662d4a7b3d1545f82/src/agents/subagents/spawn/subagent-spawn-contract.ts),
+optional, and returns a runtime session key and run id. See
+[`subagent-spawn-contract.ts`](https://github.com/openclaw/openclaw/blob/b82ad646a5151e5fb6378e72dbbe257fd5012813/src/agents/subagents/spawn/subagent-spawn-contract.ts)
 and
-[`sessions-spawn-tool.ts`](https://github.com/openclaw/openclaw/blob/630aac9b25ae6f42c760226662d4a7b3d1545f82/src/agents/tools/sessions-spawn-tool.ts).
+[`sessions-spawn-tool.ts`](https://github.com/openclaw/openclaw/blob/b82ad646a5151e5fb6378e72dbbe257fd5012813/src/agents/tools/sessions-spawn-tool.ts).
 
 Its loop protection also operates before tool execution. Calls are canonicalized,
 hashed by tool plus stable arguments, admitted atomically, and checked for repeat,
 argument churn, unknown-tool repetition, polling without progress, ping-pong, and
 a global circuit breaker. See
-[`tool-loop-recovery.ts`](https://github.com/openclaw/openclaw/blob/630aac9b25ae6f42c760226662d4a7b3d1545f82/src/agents/embedded-agent-runner/run/tool-loop-recovery.ts),
-[`tool-loop-admission.ts`](https://github.com/openclaw/openclaw/blob/630aac9b25ae6f42c760226662d4a7b3d1545f82/src/agents/tool-loop-admission.ts),
+[`tool-loop-argument-churn.ts`](https://github.com/openclaw/openclaw/blob/b82ad646a5151e5fb6378e72dbbe257fd5012813/src/agents/tool-loop-argument-churn.ts)
 and
-[`tool-loop-detection.ts`](https://github.com/openclaw/openclaw/blob/630aac9b25ae6f42c760226662d4a7b3d1545f82/src/agents/tool-loop-detection.ts).
+[`tool-loop-call-reconciliation.ts`](https://github.com/openclaw/openclaw/blob/b82ad646a5151e5fb6378e72dbbe257fd5012813/src/agents/tool-loop-call-reconciliation.ts).
 
-Finally, child completion is an event delivered back to the parent instead of a
-model-managed polling ritual. Child liveness, cascade stop, stale-run pruning,
-depth policy, concurrency, and delivery backpressure belong to the runtime. See
-[`docs/tools/subagents.md`](https://github.com/openclaw/openclaw/blob/630aac9b25ae6f42c760226662d4a7b3d1545f82/docs/tools/subagents.md)
+Finally, child completion is captured authoritatively and delivered back to the
+parent instead of becoming a model-managed polling ritual. The registry owns
+execution state, capture state, delivery state, generations, deadlines,
+idempotency, recovery, and cancellation. The wait bridge parks until the
+registry wakes it and then re-checks to close the subscribe race. See
+[`subagent-registry.types.ts`](https://github.com/openclaw/openclaw/blob/b82ad646a5151e5fb6378e72dbbe257fd5012813/src/agents/subagents/registry/subagent-registry.types.ts),
+[`subagent-registry-completion.ts`](https://github.com/openclaw/openclaw/blob/b82ad646a5151e5fb6378e72dbbe257fd5012813/src/agents/subagents/registry/subagent-registry-completion.ts),
+[`subagent-completion-delivery.ts`](https://github.com/openclaw/openclaw/blob/b82ad646a5151e5fb6378e72dbbe257fd5012813/src/agents/subagents/completion/subagent-completion-delivery.ts),
+[`subagent-announce.ts`](https://github.com/openclaw/openclaw/blob/b82ad646a5151e5fb6378e72dbbe257fd5012813/src/agents/subagents/announce/subagent-announce.ts),
 and
-[`docs/agent-runtime-architecture.md`](https://github.com/openclaw/openclaw/blob/630aac9b25ae6f42c760226662d4a7b3d1545f82/docs/agent-runtime-architecture.md).
+[`agents-wait-tool.ts`](https://github.com/openclaw/openclaw/blob/b82ad646a5151e5fb6378e72dbbe257fd5012813/src/agents/tools/agents-wait-tool.ts).
 
 ## Camelid target architecture
 
@@ -55,30 +57,95 @@ retry state, and completion delivery.
    explicit correction message. Repeating the identical invalid call stops after
    two attempts, not three minute-long inference rounds. Small single-file coding
    work is directed to `write_file`/`edit_file` instead of unnecessary delegation.
-3. **Event-driven child completion.** Add a run-scoped completion queue. A parent
-   that has live children suspends without another model inference and resumes
-   when a completion, timeout, cancellation, or failure event arrives. Keep
-   `check_subagent_status` for user inspection and recovery, not normal control
-   flow.
-4. **Pre-execution batch admission.** Canonicalize every proposed call before
-   signatures are computed. Evaluate a whole tool-call batch before launching any
-   action. Record only admitted actions as launched; record denied actions as
-   denial evidence. Add detectors for argument churn, unknown-tool repetition,
-   ping-pong, and a global call ceiling.
+3. **Runtime-owned child completion — implemented.** `await_subagent` parks one
+   cancellable tool execution until the authoritative result becomes terminal or
+   its bounded wait expires. It performs no additional model inference.
+   `check_subagent_status` remains a non-blocking inspection/recovery tool and its
+   schema explicitly tells the model not to poll it.
+4. **Run-level circuit breakers — implemented.** Every Workspace turn has an
+   absolute 64-call admission ceiling in addition to the eight-call per-step
+   ceiling. A narrow tail-churn detector stops the same tool after four varied
+   argument signatures produce the same error; exact invalid repeats still stop
+   after two. Unknown-tool variants share one churn lane.
 5. **Structured outcomes and run-level retry state.** Replace control decisions
    based on display text with typed statuses such as `accepted`, `running`,
    `completed`, `failed`, `inconclusive`, `validation_error`, and `timed_out`.
    Retry counters live for the whole run so compaction or a driver retry cannot
    reset them.
-6. **Lifecycle ownership and backpressure.** Give every run a runtime id, parent
-   id, depth, captured policy, deadline, and cancellation token. Cascade Stop to
-   descendants. Reap stale task files. Refuse new delegation when the completion
-   delivery queue is saturated.
-7. **Real-model release gate.** Before shipping agent changes, run a fixed Qwen
+6. **Per-turn lifecycle ownership — implemented.** Camelid's former process-wide
+   registry let one Web Code turn reconfigure or cancel another turn's children.
+   Registry state is now isolated to the turn worker thread. A readable alias is
+   only the turn-local idempotency key; every admitted child receives a unique
+   runtime/storage id, so stale or concurrent result files cannot be mistaken for
+   a new request. Stop remains authoritative for that turn's whole child tree.
+7. **Real-model release gate — required before merge.** Run a fixed Qwen
    Web Code matrix: one-file Python GUI creation, missing-runtime recovery,
    underscore task alias, omitted task alias, duplicate spawn, invalid argument
    correction, child timeout, Stop cascade, and successful direct edit. Assert a
    bounded number of model turns and tool calls for every case.
+
+## Additional recovery work implemented
+
+- Obvious standalone creation stays on the parent model. It does not advertise
+  subagents, planning, or patch editing; every draft/correction is a complete
+  `write_file` replacement. Repository work retains orchestration.
+- Direct creation owns a deterministic fallback artifact name (`tic_tac_toe.py`
+  for the triggering request, otherwise `app.py` for a small Python GUI). It is
+  supplied only when a recognizable write contains real content but omits only
+  `path`; explicit model paths are preserved and every call still passes normal
+  schema, sandbox, approval, checkpoint, and audit validation.
+- Llama/Qwen malformed-call recovery handles invalid JSON escapes, semicolon-
+  separated native calls, unescaped source quotes, a malformed write followed by
+  valid calls, and the observed one-brace-short write envelope. Malformed shell
+  and network envelopes remain inert.
+- Mutation results report workspace-relative paths. Windows extended paths no
+  longer leak into model context and come back double-escaped in repair calls.
+- Windows Python recovery probes `py --version`, treats success as authoritative,
+  blocks `pip install tkinter`, and turns both `python game.py` and `py game.py`
+  verification attempts into bounded `py -m py_compile game.py` checks. A real
+  traceback or syntax error locks a direct task to a complete source rewrite.
+- The host captures exact changed paths itself before accepting completion,
+  retains the observations, runs Python syntax validation, and applies a narrow
+  source contract for the explicit tic-tac-toe request: automatic legal O move,
+  return to X inside the computer-move block, terminal states/draw, GUI result,
+  and correctly bound Tkinter loop callbacks.
+- No-progress guards cover exact invalid repeats, same-result repeats, varied-
+  argument error churn, malformed tool syntax, repeated completion without a
+  mutation, and completion without exact post-change verification.
+
+## 2026-08-12 live-model evidence
+
+All runs used the exact user prompt, an empty temporary workspace, Code mode,
+full-auto approval, network disabled, and the real authenticated Workspace API.
+The CUDA-resident server was stopped between builds and at handoff.
+
+- `Llama-3.2-3B-Instruct-Q8_0.gguf` proved the Llama structured boundary:
+  malformed writes were recovered, a deterministic filename was supplied, files
+  were checkpointed, the Windows Store alias recovered to `py`, relative-path
+  rewrites succeeded, and syntax failures were caught. It did not converge on a
+  behaviorally correct game; successive rewrites regressed computer turns and
+  emitted invalid Python. This row is useful for fast boundary smoke, not the
+  recommended coding row.
+- `Qwen3-4B-Q4_K_M.gguf` proved the Qwen route through real writes, exact host
+  capture, syntax validation, and semantic rejection. Its first drafts still had
+  material defects (late-bound Tkinter callbacks, incomplete O terminal handling,
+  bad initialization/minimax behavior), then ignored the required full rewrite
+  and was stopped by the no-progress guard. It is stronger than the 3B row but
+  has not passed this behavioral release gate.
+- `Qwen3-4B-Q8_0.gguf` is tool-certified but not operational for this workflow on
+  the 6 GiB RTX 3060 laptop: context residency leaves too little headroom and the
+  correction turn becomes impractically slow.
+- `Qwen3-8B-Q4_K_M.gguf` was not used for Code because its exact compatibility
+  row is not tool-capable. An attempted promotion evaluation was inconclusive;
+  support was not widened and no receipt was fabricated.
+
+Release verdict: the runtime bugs that caused the original `spawn_subagent`
+failure and later silent write loss are fixed and regression-tested. The exact
+one-file acceptance prompt still lacks a complete behavioral pass from an
+installed model, so this branch must not claim that model-quality gate as passed.
+The next product step is to certify a stronger coding/tool row that fits the host,
+then rerun the fixed matrix above; do not weaken the host audit to make a smaller
+model appear successful.
 
 ## Non-negotiable invariants
 
