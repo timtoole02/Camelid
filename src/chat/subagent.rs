@@ -928,6 +928,7 @@ fn execute_task(task: &TaskSpec) -> TaskExecution {
         // A subagent runs a real, open-ended goal, so it gets the same context
         // protection the parent has.
         ctx_budget: Some(agent::AGENT_VALIDATED_CTX),
+        context_paging: false,
     };
     // The parent's approval posture, with the production fail-closed honoured:
     // resolve_policy refuses blanket auto-approve under CAMELID_PRODUCTION, so a

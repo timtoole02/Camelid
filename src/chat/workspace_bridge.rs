@@ -195,7 +195,11 @@ fn direct_creation_contract(goal: &str) -> String {
                 .to_string(),
         );
     }
-    if lower.contains("computer")
+    if (lower.contains("computer")
+        || lower.contains("one-player")
+        || lower.contains("one player")
+        || lower.contains("single-player")
+        || lower.contains("single player"))
         && (lower.contains("player") || lower.contains("opponent") || lower.contains(" vs "))
     {
         requirements.push(
@@ -231,6 +235,15 @@ fn direct_creation_contract(goal: &str) -> String {
         "\n\nDirect creation acceptance contract:\n- {}",
         requirements.join("\n- ")
     )
+}
+
+fn restrict_direct_creation_tools(
+    specs: &mut Vec<super::tools::ToolSpec>,
+    context_paging_enabled: bool,
+) {
+    specs.retain(|spec| {
+        spec.name != "update_plan" && (context_paging_enabled || spec.name != "edit_file")
+    });
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -749,10 +762,11 @@ pub(crate) fn run_live(
         );
     }
 
+    let context_paging_enabled = super::context_paging::ContextPagingConfig::from_env().enabled;
     let system = if config.mode.is_code() {
         let mut specs = super::tools::specs_for(tool_profile, config.allow_network, shell_sandbox);
         if direct_creation {
-            specs.retain(|spec| spec.name != "update_plan" && spec.name != "edit_file");
+            restrict_direct_creation_tools(&mut specs, context_paging_enabled);
         }
         let project = super::agent::load_project_context(&sandbox);
         let mut system =
@@ -827,6 +841,7 @@ pub(crate) fn run_live(
         allow_plan: !direct_creation,
         default_write_path,
         ctx_budget: None,
+        context_paging: context_paging_enabled,
     };
     let end = run_loop(
         &mut driver,
@@ -1009,6 +1024,7 @@ mod tests {
             allow_plan: true,
             default_write_path: None,
             ctx_budget: None,
+            context_paging: false,
         }
     }
 
@@ -1151,6 +1167,28 @@ mod tests {
         assert!(contract.contains("lambda defaults"));
         assert!(contract.contains("all eight winning lines"));
         assert!(contract.contains("status label or messagebox"));
+
+        let implied_opponent = direct_creation_contract(
+            "Code me a one-player tic tac toe game in Python using graphics.",
+        );
+        assert!(implied_opponent.contains("human controls exactly one side"));
+        assert!(implied_opponent.contains("automatically chooses and performs every opposing move"));
+    }
+
+    #[test]
+    fn context_paged_direct_creation_keeps_narrow_edit_recovery_available() {
+        let mut paged =
+            crate::chat::tools::specs_for(ToolProfile::WebCode, false, ShellSandbox::Disabled);
+        restrict_direct_creation_tools(&mut paged, true);
+        assert!(paged.iter().any(|tool| tool.name == "write_file"));
+        assert!(paged.iter().any(|tool| tool.name == "edit_file"));
+        assert!(!paged.iter().any(|tool| tool.name == "update_plan"));
+
+        let mut legacy =
+            crate::chat::tools::specs_for(ToolProfile::WebCode, false, ShellSandbox::Disabled);
+        restrict_direct_creation_tools(&mut legacy, false);
+        assert!(legacy.iter().any(|tool| tool.name == "write_file"));
+        assert!(!legacy.iter().any(|tool| tool.name == "edit_file"));
     }
 
     #[test]

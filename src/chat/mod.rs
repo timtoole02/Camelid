@@ -26,6 +26,7 @@ mod banner;
 pub(crate) mod checkpoint;
 mod client;
 mod clipboard;
+pub(crate) mod context_paging;
 mod inline;
 mod markdown;
 mod mcp;
@@ -193,6 +194,7 @@ pub fn run_chat(opts: ChatOptions) -> anyhow::Result<i32> {
                     .unwrap_or(agent::AGENT_VALIDATED_CTX)
                     .min(agent::AGENT_VALIDATED_CTX),
             ),
+            context_paging: false,
         };
         // MCP servers, if the user opted in. A broken MCP config costs you MCP,
         // not your session, so problems are reported and the agent still runs.

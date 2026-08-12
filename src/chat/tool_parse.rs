@@ -98,11 +98,67 @@ fn json_from_str_lenient(s: &str) -> Option<Value> {
     if let Ok(value) = serde_json::from_str::<Value>(s) {
         return Some(value);
     }
-    let repaired_paths = repair_path_backslashes(s);
+    // Exact live Qwen3 failure observed in Web Code:
+    //
+    //   "content:""import tkinter as tk\n..."
+    //
+    // The model put the key/value colon inside the closing key quote.  The
+    // remainder of the write_file envelope (including its escaped source) was
+    // valid, but dropping the whole call made the agent reprompt until its
+    // no-progress guard fired.  Repair only a structural `content` key (after
+    // `{` or `,`) and only after strict JSON has already failed; a literal copy
+    // of the same bytes inside otherwise-valid file content is therefore never
+    // rewritten.
+    let repaired_key = repair_misquoted_content_key(s).unwrap_or_else(|| s.to_string());
+    let repaired_paths = repair_path_backslashes(&repaired_key);
     if let Ok(value) = serde_json::from_str::<Value>(&repaired_paths) {
         return Some(value);
     }
     serde_json::from_str::<Value>(&repair_invalid_json_escapes(&repaired_paths)).ok()
+}
+
+fn repair_misquoted_content_key(s: &str) -> Option<String> {
+    const MALFORMED_QUOTED: &str = "\"content:\"\"";
+    const MALFORMED_PYTHON_WRAPPER: &str = "\"content:\"python -c '";
+    const REPAIRED: &str = "\"content\":\"";
+
+    // This recovery changes executable file bytes, so keep it scoped to the
+    // only advertised tool whose schema owns `content`. Unknown envelopes and
+    // malformed shell/network calls remain inert.
+    if !(s.contains(r#""name":"write_file""#) || s.contains(r#""name": "write_file""#)) {
+        return None;
+    }
+    let structural_start = |needle: &str| {
+        let start = s.find(needle)?;
+        s[..start]
+            .chars()
+            .rev()
+            .find(|character| !character.is_whitespace())
+            .is_some_and(|character| matches!(character, '{' | ','))
+            .then_some(start)
+    };
+
+    if let Some(start) = structural_start(MALFORMED_QUOTED) {
+        let mut output = s.to_string();
+        output.replace_range(start..start + MALFORMED_QUOTED.len(), REPAIRED);
+        return Some(output);
+    }
+
+    let start = structural_start(MALFORMED_PYTHON_WRAPPER)?;
+    let source_start = start + MALFORMED_PYTHON_WRAPPER.len();
+    let closing_relative = s[source_start..].rfind("'\"")?;
+    let closing_apostrophe = source_start + closing_relative;
+    // The shell-style quote must terminate the content value immediately
+    // before the arguments/envelope braces. Do not peel quotes out of source.
+    if !s[closing_apostrophe + 2..].trim_start().starts_with('}') {
+        return None;
+    }
+    let mut output = String::with_capacity(s.len());
+    output.push_str(&s[..start]);
+    output.push_str(REPAIRED);
+    output.push_str(&s[source_start..closing_apostrophe]);
+    output.push_str(&s[closing_apostrophe + 1..]); // keep the JSON quote, drop only `'`
+    Some(output)
 }
 
 /// Preserve model-authored source while repairing invalid JSON string escapes.
@@ -616,6 +672,64 @@ mod tests {
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].args["content"], "line1\nline2 \"q\"");
+    }
+
+    #[test]
+    fn repairs_live_qwen_misquoted_write_content_key() {
+        // Exact structural corruption captured from Qwen3-4B-Q4_K_M in Web
+        // Code. The path and source are valid; only the colon terminating the
+        // known `content` key moved one byte to the left.
+        let out = parse(
+            r#"<tool_call>
+{"name":"write_file","arguments":{"path":"tic_tac_toe.py","content:""import tkinter as tk\n\nroot = tk.Tk()\nroot.title(\"Tic Tac Toe\")\n"}}}
+</tool_call>"#,
+            "qwen3",
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "write_file");
+        assert_eq!(out[0].args["path"], "tic_tac_toe.py");
+        assert_eq!(
+            out[0].args["content"],
+            "import tkinter as tk\n\nroot = tk.Tk()\nroot.title(\"Tic Tac Toe\")\n"
+        );
+    }
+
+    #[test]
+    fn valid_content_containing_misquoted_key_bytes_is_not_rewritten() {
+        let out = parse(
+            r#"<tool_call>{"name":"write_file","arguments":{"path":"note.txt","content":"literal \"content:\"\" marker"}}</tool_call>"#,
+            "qwen3",
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].args["content"], "literal \"content:\"\" marker");
+    }
+
+    #[test]
+    fn repairs_live_qwen_misquoted_python_wrapper_write() {
+        // Second exact live variation: Qwen placed a shell-style python -c
+        // wrapper where the write_file content string should begin.
+        let out = parse(
+            r#"<tool_call>
+{"name":"write_file","arguments":{"path":"tic_tac_toe.py","content:"python -c 'import tkinter as tk\nroot = tk.Tk()\nroot.title(\"Tic Tac Toe\")'"}}
+</tool_call>"#,
+            "qwen3",
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "write_file");
+        assert_eq!(out[0].args["path"], "tic_tac_toe.py");
+        assert_eq!(
+            out[0].args["content"],
+            "import tkinter as tk\nroot = tk.Tk()\nroot.title(\"Tic Tac Toe\")"
+        );
+    }
+
+    #[test]
+    fn python_wrapper_repair_is_write_file_only() {
+        assert!(parse(
+            r#"<tool_call>{"name":"run_shell","arguments":{"content:"python -c 'print(1)'"}}</tool_call>"#,
+            "qwen3"
+        )
+        .is_empty());
     }
 
     #[test]

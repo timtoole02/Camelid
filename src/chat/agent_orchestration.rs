@@ -525,6 +525,7 @@ fn run_real_model_battery(
         default_write_path: None,
         // Gate harness: bounded by max_steps, and must stay reproducible.
         ctx_budget: None,
+        context_paging: false,
     };
     let mut policy = agent::Policy::default();
     policy.set_auto_all(true);

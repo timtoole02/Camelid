@@ -20,6 +20,10 @@ use serde_json::{json, Value};
 use super::audit::{self, AuditEvent, AuditSink};
 use super::banner;
 use super::client::{Client, StreamEnd};
+use super::context_paging::{
+    parse_typed_action, ActionPhase, CompactDiagnostic, ContextPagingConfig, ContextPagingRuntime,
+    TypedModelAction,
+};
 use super::session::{Session, CANCEL};
 use super::shell_sandbox::{self, ShellSandbox};
 use super::tools::{self, Action, ApprovalTier, Sandbox, ToolCall, ToolOutcome, ToolSpec};
@@ -60,6 +64,9 @@ pub struct AgentConfig {
     /// Usable context in tokens for the Full agent. `None` keeps deterministic
     /// gate harnesses byte-stable; Workspace uses its exact preflight budget.
     pub ctx_budget: Option<u32>,
+    /// Construct a fresh host-owned bounded capsule for each Web Code action.
+    /// The detailed budgets remain environment-configurable during rollout.
+    pub context_paging: bool,
 }
 
 /// What the model produced for one step.
@@ -350,6 +357,14 @@ const CHANGE_REPROMPT_LIMIT: usize = 3;
 /// A write proves that bytes changed, not that the requested behavior works.
 /// Require evidence from the post-change state before accepting completion.
 const VERIFICATION_REPROMPT_LIMIT: usize = 2;
+/// Bound semantic rewrite/audit cycles in one paging run. A small model can
+/// produce several distinct-but-still-wrong rewrites, each of which would
+/// otherwise create another checkpoint and consume another long inference.
+const CONTEXT_PAGING_VERIFICATION_FAILURE_LIMIT: usize = 3;
+const PAGING_FULL_REWRITE_FOCUS: &str = concat!(
+    "Narrow edit recovery is exhausted. Replace the complete existing file with ",
+    "write_file, preserving required behavior and correcting every persisted diagnostic."
+);
 const MAX_WORKSPACE_TOOL_CALLS_PER_STEP: usize = 8;
 /// Absolute admission ceiling for one Workspace turn. Code mode deliberately
 /// has no arbitrary model-step cap, but it must still have a resource ceiling:
@@ -528,7 +543,13 @@ fn source_contract_findings(history: &[AgentMsg], sources: &[(String, String)]) 
             _ => None,
         })
         .unwrap_or_default();
-    if !(goal.contains("tic tac toe") || goal.contains("tic-tac-toe")) || !goal.contains("computer")
+    let requests_computer_opponent = goal.contains("computer")
+        || goal.contains("one-player")
+        || goal.contains("one player")
+        || goal.contains("single-player")
+        || goal.contains("single player");
+    if !(goal.contains("tic tac toe") || goal.contains("tic-tac-toe"))
+        || !requests_computer_opponent
     {
         return Vec::new();
     }
@@ -543,16 +564,25 @@ fn source_contract_findings(history: &[AgentMsg], sources: &[(String, String)]) 
     }
     let lower = source.to_ascii_lowercase();
     let mut findings = Vec::new();
-    let computer_moves_automatically =
-        lower.contains("computer_move") && (source.contains("= \"O\"") || source.contains("= 'O'"));
+    let computer_method = [
+        "computer_move",
+        "auto_move",
+        "ai_move",
+        "make_computer_move",
+    ]
+    .into_iter()
+    .find(|method| lower.contains(&format!("def {method}")));
+    let computer_moves_automatically = computer_method.is_some_and(|method| {
+        lower.contains(&format!("self.{method}("))
+            && (source.contains("= \"O\"") || source.contains("= 'O'"))
+    });
     if !computer_moves_automatically {
         findings.push(
             "the captured source does not prove an automatic legal O move by the computer".into(),
         );
     }
-    let computer_block = source
-        .split("def computer_move")
-        .nth(1)
+    let computer_block = computer_method
+        .and_then(|method| source.split(&format!("def {method}")).nth(1))
         .and_then(|tail| tail.split("\n    def ").next())
         .unwrap_or_default()
         .to_ascii_lowercase();
@@ -585,6 +615,28 @@ fn source_contract_findings(history: &[AgentMsg], sources: &[(String, String)]) 
         || lower.contains("status_label")
         || lower.contains("result_label")
         || lower.contains("winner_label");
+    if goal.contains("status") && !has_gui_result {
+        findings.push(
+            "the requested clear win/draw status is missing; add a visible status/result label or messagebox and update it for human win, computer win, draw, and reset"
+                .into(),
+        );
+    }
+    let compact = lower
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    let enumerates_diagonals = (compact.contains("(0,4,8)") || compact.contains("[0,4,8]"))
+        && (compact.contains("(2,4,6)") || compact.contains("[2,4,6]"));
+    let checks_diagonals_directly = compact.contains("buttons[0]")
+        && compact.contains("buttons[8]")
+        && compact.contains("buttons[2]")
+        && compact.contains("buttons[6]");
+    if !(enumerates_diagonals || checks_diagonals_directly) {
+        findings.push(
+            "winner detection does not prove both diagonal lines (0-4-8 and 2-4-6); cover all eight tic-tac-toe winning lines"
+                .into(),
+        );
+    }
     if (goal.contains("graphics") || goal.contains("graphical") || goal.contains("gui"))
         && lower.contains("root.destroy()")
         && !has_gui_result
@@ -595,6 +647,29 @@ fn source_contract_findings(history: &[AgentMsg], sources: &[(String, String)]) 
         );
     }
     findings
+}
+
+fn paging_failed_attempts_require_full_rewrite(failed_attempts: &[String]) -> bool {
+    failed_attempts.iter().any(|attempt| {
+        attempt.starts_with("edit_file:")
+            || attempt.contains("tool `edit_file` is not available")
+            || attempt.contains("narrow edit recovery is exhausted")
+    })
+}
+
+fn host_direct_creation_criteria(history: &[AgentMsg]) -> Vec<String> {
+    const MARKER: &str = "Direct creation acceptance contract:\n";
+    history
+        .iter()
+        .find_map(|message| match message {
+            AgentMsg::System(text) => text.split_once(MARKER).map(|(_, contract)| contract),
+            _ => None,
+        })
+        .into_iter()
+        .flat_map(str::lines)
+        .filter_map(|line| line.trim().strip_prefix("- "))
+        .map(str::to_string)
+        .collect()
 }
 
 fn subagent_report_field<'a>(report: &'a str, field: &str) -> Option<&'a str> {
@@ -645,9 +720,90 @@ pub fn run_loop(
     if !cfg.allow_plan {
         tools.retain(|spec| spec.name != "update_plan");
     }
-    if cfg.default_write_path.is_some() {
+    if cfg.default_write_path.is_some() && !cfg.context_paging {
         tools.retain(|spec| spec.name != "edit_file");
     }
+    let task_objective = history
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            AgentMsg::User(text) => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let mut context_paging = if cfg.context_paging
+        && cfg.tool_profile == tools::ToolProfile::WebCode
+    {
+        let mut paging_config = ContextPagingConfig::from_env();
+        paging_config.enabled = true;
+        if let Some(model_budget) = driver.context_budget_tokens() {
+            let reserved = paging_config
+                .output_reserve
+                .saturating_add(paging_config.safety_reserve);
+            paging_config.max_input_tokens = paging_config
+                .max_input_tokens
+                .min(model_budget.saturating_sub(reserved).max(256));
+        }
+        match ContextPagingRuntime::open(sandbox.root(), &task_objective, paging_config) {
+            Ok(mut runtime) => {
+                let mut ledger_changed = false;
+                let mut criteria = host_direct_creation_criteria(history);
+                if let Some(path) = cfg.default_write_path.as_deref() {
+                    criteria.push(format!(
+                            "Create the standalone artifact at the exact workspace-relative path `{path}` with write_file"
+                        ));
+                }
+                for criterion in criteria {
+                    if !runtime.ledger.acceptance_criteria.contains(&criterion) {
+                        runtime.ledger.acceptance_criteria.push(criterion);
+                        ledger_changed = true;
+                    }
+                }
+                if let Some(path) = cfg.default_write_path.as_deref().filter(|path| {
+                    !sandbox.root().join(path).is_file() && runtime.ledger.completed_work.is_empty()
+                }) {
+                    runtime.ledger.current_focus = format!(
+                            "Create the new standalone artifact `{path}` with write_file; it does not exist yet"
+                        );
+                    ledger_changed = true;
+                }
+                if ledger_changed {
+                    if let Err(error) = runtime.save() {
+                        reporter.notice(&format!("context paging state error: {error}"));
+                        return LoopEnd::DriverError;
+                    }
+                }
+                if let Err(error) = runtime.seed_relevance_from_query(&task_objective, 1) {
+                    reporter.notice(&format!("context paging relevance error: {error}"));
+                    return LoopEnd::DriverError;
+                }
+                reporter.notice(&format!(
+                    "context paging enabled: task {} ({} indexed symbols)",
+                    runtime.task_id,
+                    runtime.project.cards.len()
+                ));
+                Some(runtime)
+            }
+            Err(error) => {
+                reporter.notice(&format!("context paging startup error: {error}"));
+                return LoopEnd::DriverError;
+            }
+        }
+    } else {
+        None
+    };
+    let mut paging_discovery_complete = context_paging.as_ref().is_none_or(|runtime| {
+        cfg.default_write_path.is_some() || !runtime.ledger.relevant_symbols.is_empty()
+    });
+    let mut paging_diagnostic: Option<CompactDiagnostic> =
+        context_paging.as_ref().and_then(|runtime| {
+            runtime
+                .ledger
+                .verification_state
+                .failing_diagnostic
+                .as_deref()
+                .and_then(|reference| runtime.inspect_diagnostic(reference).ok())
+        });
     // Per-call (count, last_result): the no-progress guard is result-aware (see
     // `note_no_progress`).
     let mut call_counts: HashMap<String, (usize, String)> = HashMap::new();
@@ -660,7 +816,16 @@ pub fn run_loop(
     // of truth for execution and cancellation.
     let mut delegated_agents: HashMap<String, (String, String)> = HashMap::new();
     let mut consecutive_edit_failures = 0usize;
-    let mut force_full_rewrite = cfg.default_write_path.is_some();
+    // The legacy standalone lane prefers whole-file generation. Context paging
+    // already supplies exact source and hash authority, so it must keep narrow
+    // edits available for an existing artifact.
+    let mut force_full_rewrite = cfg.default_write_path.is_some() && !cfg.context_paging
+        || context_paging.as_ref().is_some_and(|runtime| {
+            paging_failed_attempts_require_full_rewrite(&runtime.ledger.failed_attempts)
+        });
+    if force_full_rewrite {
+        tools.retain(|spec| spec.name != "edit_file");
+    }
     let mut ran: BTreeMap<String, usize> = BTreeMap::new();
     let require_workspace_observation =
         cfg.tool_profile.is_workspace() && workspace_request_requires_observation(history);
@@ -684,12 +849,49 @@ pub fn run_loop(
     } else {
         BTreeSet::new()
     };
-    let mut observed_workspace = false;
-    let mut workspace_changed = false;
-    let mut pending_verification_paths: BTreeSet<String> = BTreeSet::new();
+    let persisted_verified_paths: BTreeSet<String> = context_paging
+        .as_ref()
+        .into_iter()
+        .flat_map(|runtime| {
+            runtime
+                .ledger
+                .verification_state
+                .verified_symbols
+                .iter()
+                .filter_map(|symbol| runtime.project.cards.get(symbol))
+                .map(|card| card.file.clone())
+        })
+        .collect();
+    let mut observed_workspace = !persisted_verified_paths.is_empty();
+    let mut workspace_changed = context_paging
+        .as_ref()
+        .is_some_and(|runtime| !runtime.ledger.completed_work.is_empty());
+    let mut pending_verification_paths: BTreeSet<String> = if workspace_changed
+        && context_paging.as_ref().is_some_and(|runtime| {
+            runtime.ledger.verification_state.status != "complete"
+                && runtime
+                    .ledger
+                    .verification_state
+                    .verified_symbols
+                    .is_empty()
+        }) {
+        context_paging
+            .as_ref()
+            .into_iter()
+            .flat_map(|runtime| runtime.ledger.relevant_symbols.iter())
+            .filter_map(|symbol| {
+                context_paging
+                    .as_ref()
+                    .and_then(|runtime| runtime.project.cards.get(symbol))
+                    .map(|card| card.file.clone())
+            })
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
     let mut semantic_contract_findings: Vec<String> = Vec::new();
     let mut workspace_observations: Vec<(String, String)> = Vec::new();
-    let mut successful_workspace_reads = BTreeSet::new();
+    let mut successful_workspace_reads = persisted_verified_paths;
     let mut calibration: Option<f32> = None;
 
     let mut completed_steps = 0usize;
@@ -698,6 +900,8 @@ pub fn run_loop(
     let mut change_reprompts = 0usize;
     let mut verification_reprompts = 0usize;
     let mut malformed_tool_reprompts = 0usize;
+    let mut paging_action_rejections = 0usize;
+    let mut paging_verification_failures = 0usize;
     let mut python_alias_guidance_sent = false;
     let mut direct_python_rewrite_required = false;
     let mut direct_python_rewrite_violations = 0usize;
@@ -712,25 +916,178 @@ pub fn run_loop(
             reporter.notice("aborted");
             return LoopEnd::Aborted;
         }
-        if let Some(budget) = cfg.ctx_budget {
-            let limit = (budget as f32 * COMPACT_AT) as u32;
-            if estimate_tokens(history, calibration) > limit {
-                let target = budget / 2;
-                if let Some((compacted, report)) = compact(history, target, calibration) {
-                    *history = compacted;
-                    reporter.notice(&format!(
-                        "compacted context: {} messages -> {} ({} folded into a summary)",
-                        report.before, report.after, report.elided
-                    ));
+        if context_paging.is_none() {
+            if let Some(budget) = cfg.ctx_budget {
+                let limit = (budget as f32 * COMPACT_AT) as u32;
+                if estimate_tokens(history, calibration) > limit {
+                    let target = budget / 2;
+                    if let Some((compacted, report)) = compact(history, target, calibration) {
+                        *history = compacted;
+                        reporter.notice(&format!(
+                            "compacted context: {} messages -> {} ({} folded into a summary)",
+                            report.before, report.after, report.elided
+                        ));
+                    }
                 }
             }
         }
-        let compiled_history = compile_history_for_step(history, cfg.tool_profile);
+        let (compiled_history, step_tools, paging_capsule, requested_max_tokens) = if let Some(
+            runtime,
+        ) =
+            context_paging.as_mut()
+        {
+            if let Err(error) = runtime.refresh_project() {
+                reporter.notice(&format!("context paging refresh error: {error}"));
+                return LoopEnd::DriverError;
+            }
+            if let Err(error) = runtime.seed_relevance_from_query(&task_objective, 1) {
+                reporter.notice(&format!("context paging relevance error: {error}"));
+                return LoopEnd::DriverError;
+            }
+            let direct_creation_target = cfg
+                .default_write_path
+                .as_deref()
+                .filter(|path| !workspace_changed && !sandbox.root().join(path).is_file());
+            let phase = if workspace_changed && !pending_verification_paths.is_empty() {
+                // Exact post-write source capture is host lifecycle work. Do
+                // it before reacting to a model-selected command failure so
+                // a Windows `python.exe` alias cannot masquerade as a source
+                // defect and send the task back to Modify.
+                ActionPhase::Verify
+            } else if !semantic_contract_findings.is_empty()
+                || paging_diagnostic
+                    .as_ref()
+                    .is_some_and(|diagnostic| diagnostic.status != "ok")
+            {
+                ActionPhase::Modify
+            } else if workspace_changed
+                && pending_verification_paths.is_empty()
+                && matches!(
+                    runtime.ledger.verification_state.status.as_str(),
+                    "passed" | "complete"
+                )
+            {
+                ActionPhase::Complete
+            } else if workspace_changed {
+                ActionPhase::Verify
+            } else if !paging_discovery_complete {
+                ActionPhase::Discover
+            } else {
+                ActionPhase::Modify
+            };
+            let current_action = match phase {
+                    ActionPhase::Discover => "Retrieve one missing exact source page".to_string(),
+                    ActionPhase::Modify if direct_creation_target.is_some() => format!(
+                        "Create the new file `{}` now with write_file containing the COMPLETE runnable artifact. The target does not exist: do not call read_file, search, edit_file, or any shell command first.",
+                        direct_creation_target.unwrap_or_default()
+                    ),
+                    ActionPhase::Modify if force_full_rewrite => concat!(
+                        "Replace the complete existing file with write_file. Preserve required ",
+                        "behavior, correct every persisted diagnostic, and do not call edit_file."
+                    )
+                    .to_string(),
+                    ActionPhase::Modify
+                        if !semantic_contract_findings.is_empty()
+                            || paging_diagnostic
+                                .as_ref()
+                                .is_some_and(|diagnostic| diagnostic.status != "ok") =>
+                    {
+                        concat!(
+                            "Correct the persisted diagnostic with a real source change. ",
+                            "Do not return or rewrite the exact source unchanged. Prefer a ",
+                            "hash-checked PATCH or edit_file for an existing file."
+                        )
+                        .to_string()
+                    }
+                    ActionPhase::Modify => concat!(
+                        "Inspect the provided exact source when modifying existing code, ",
+                        "then perform one bounded code change"
+                    )
+                    .to_string(),
+                    ActionPhase::Verify if !pending_verification_paths.is_empty() => concat!(
+                        "Re-read the exact changed artifact with read_file. The host will run ",
+                        "syntax verification and semantic acceptance checks after the read."
+                    )
+                    .to_string(),
+                    ActionPhase::Verify => {
+                        "Run the narrowest relevant verification or re-read the changed artifact"
+                            .to_string()
+                    }
+                    ActionPhase::Complete => concat!(
+                        "Return exactly one JSON action on one line with no reasoning: ",
+                        "{\"action\":\"COMPLETE\",\"summary\":\"A concise verified summary under 60 words\"}"
+                    )
+                    .to_string(),
+                };
+            let mut capsule_tools = tools.clone();
+            if direct_creation_target.is_some() {
+                capsule_tools.retain(|tool| tool.name == "write_file");
+            } else if phase == ActionPhase::Verify && !pending_verification_paths.is_empty() {
+                capsule_tools.retain(|tool| tool.name == "read_file");
+            }
+            let capsule = match runtime.build_capsule(
+                &current_action,
+                phase,
+                paging_diagnostic.as_ref(),
+                &capsule_tools,
+            ) {
+                Ok(capsule) => capsule,
+                Err(error) => {
+                    reporter.notice(&format!("context capsule error: {error}"));
+                    return LoopEnd::DriverError;
+                }
+            };
+            if runtime.config.debug {
+                reporter.notice(&format!(
+                    "context capsule: estimated={} max={} pages={} included={} excluded={}",
+                    capsule.estimated_input_tokens,
+                    capsule.max_input_tokens,
+                    capsule.exact_page_ids.len(),
+                    capsule.included.len(),
+                    capsule.excluded.len()
+                ));
+                for item in &capsule.included {
+                    reporter.notice(&format!(
+                        "context include {}:{} ({} tokens): {}",
+                        item.category, item.id, item.tokens, item.reason
+                    ));
+                }
+                for item in &capsule.excluded {
+                    reporter.notice(&format!(
+                        "context exclude {}:{} ({} tokens): {}",
+                        item.category, item.id, item.tokens, item.reason
+                    ));
+                }
+            }
+            let step_tools = tools
+                .iter()
+                .filter(|tool| capsule.tool_names.binary_search(&tool.name).is_ok())
+                .cloned()
+                .collect::<Vec<_>>();
+            let requested = if phase == ActionPhase::Complete {
+                cfg.max_tokens.min(capsule.output_reserve).min(256)
+            } else {
+                cfg.max_tokens.min(capsule.output_reserve)
+            };
+            (
+                vec![AgentMsg::User(capsule.rendered.clone())],
+                step_tools,
+                Some(capsule),
+                requested,
+            )
+        } else {
+            (
+                compile_history_for_step(history, cfg.tool_profile),
+                tools.clone(),
+                None,
+                cfg.max_tokens,
+            )
+        };
         let (compiled_history, trimmed, prompt_tokens, allowance) = match fit_history_to_budget(
             driver,
             compiled_history,
-            &tools,
-            cfg.max_tokens,
+            &step_tools,
+            requested_max_tokens,
             cfg.tool_profile,
         ) {
             Ok(result) => result,
@@ -739,6 +1096,22 @@ pub fn run_loop(
                 return LoopEnd::DriverError;
             }
         };
+        if let (Some(capsule), Some(exact_prompt_tokens)) = (paging_capsule.as_ref(), prompt_tokens)
+        {
+            if exact_prompt_tokens > capsule.max_input_tokens {
+                reporter.notice(&format!(
+                    "context capsule exact tokenizer count {exact_prompt_tokens} exceeds configured input limit {}",
+                    capsule.max_input_tokens
+                ));
+                return LoopEnd::DriverError;
+            }
+            if let Some(runtime) = context_paging.as_mut() {
+                if let Err(error) = runtime.record_exact_input_tokens(exact_prompt_tokens) {
+                    reporter.notice(&format!("context paging metrics error: {error}"));
+                    return LoopEnd::DriverError;
+                }
+            }
+        }
         if trimmed {
             reporter.notice("older conversation detail was omitted to keep this step responsive");
         }
@@ -756,13 +1129,13 @@ pub fn run_loop(
         {
             reporter.context_budget(context_budget_usage(
                 &compiled_history,
-                &tools,
+                &step_tools,
                 prompt_tokens,
                 allowance,
                 budget_tokens,
             ));
         }
-        let step = match driver.step(&compiled_history, &tools) {
+        let mut step = match driver.step(&compiled_history, &step_tools) {
             Ok(s) => s,
             Err(e) => {
                 reporter.notice(&format!("model error: {e}"));
@@ -770,6 +1143,14 @@ pub fn run_loop(
             }
         };
         if let Some(metrics) = driver.take_step_metrics() {
+            if let (Some(runtime), Some(output_tokens)) =
+                (context_paging.as_mut(), metrics.output_tokens)
+            {
+                if let Err(error) = runtime.record_output_tokens(output_tokens) {
+                    reporter.notice(&format!("context paging metrics error: {error}"));
+                    return LoopEnd::DriverError;
+                }
+            }
             reporter.model_timing(metrics);
         }
         // Ctrl-C lands DURING a step more often than between steps (a streamed
@@ -795,6 +1176,137 @@ pub fn run_loop(
                 .sum();
             if chars > 0 && reported > 0 {
                 calibration = Some(reported as f32 / chars as f32);
+            }
+        }
+        if let (Some(runtime), Some(capsule), ModelStep::Text(text)) =
+            (context_paging.as_mut(), paging_capsule.as_ref(), &step)
+        {
+            match parse_typed_action(text) {
+                Ok(action @ TypedModelAction::NeedContext { .. }) => {
+                    match runtime.execute_typed_action(&action, capsule) {
+                        Ok(Some(page)) => {
+                            paging_discovery_complete = true;
+                            reporter.notice(&format!(
+                                "context page loaded: {} ({}:{}-{})",
+                                page.symbol_id, page.file, page.start_line, page.end_line
+                            ));
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            runtime
+                                .ledger
+                                .failed_attempts
+                                .push(format!("NEED_CONTEXT rejected: {error}"));
+                            if let Err(save_error) = runtime.save() {
+                                reporter
+                                    .notice(&format!("context paging state error: {save_error}"));
+                                return LoopEnd::DriverError;
+                            }
+                            reporter.notice(&format!("context page fault failed: {error}"));
+                        }
+                    }
+                    continue;
+                }
+                Ok(action @ TypedModelAction::Patch { .. }) => {
+                    step = match runtime.prepare_patch_tool_call(&action, capsule) {
+                        Ok(call) => ModelStep::Calls(vec![call]),
+                        Err(error) => {
+                            runtime
+                                .ledger
+                                .failed_attempts
+                                .push(format!("PATCH rejected: {error}"));
+                            runtime.ledger.current_focus =
+                                "Reload exact source and produce a hash-matched patch".into();
+                            if let Err(save_error) = runtime.save() {
+                                reporter
+                                    .notice(&format!("context paging state error: {save_error}"));
+                                return LoopEnd::DriverError;
+                            }
+                            reporter.notice(&format!("typed patch rejected: {error}"));
+                            continue;
+                        }
+                    };
+                }
+                Ok(TypedModelAction::Search { query, path }) => {
+                    let mut args = json!({"pattern": query});
+                    if let (Some(path), Some(object)) = (path, args.as_object_mut()) {
+                        object.insert("path".into(), Value::String(path));
+                    }
+                    step = ModelStep::Calls(vec![ToolCall {
+                        name: "search".into(),
+                        args,
+                    }]);
+                }
+                Ok(TypedModelAction::RunTest { command }) => {
+                    step = ModelStep::Calls(vec![ToolCall {
+                        name: "run_shell".into(),
+                        args: json!({"command": command}),
+                    }]);
+                }
+                Ok(TypedModelAction::InspectDiagnostic { reference }) => {
+                    match runtime.inspect_diagnostic(&reference) {
+                        Ok(diagnostic) => {
+                            paging_diagnostic = Some(diagnostic);
+                            runtime.ledger.current_focus =
+                                "Use the bounded diagnostic slice to choose one repair".into();
+                            if let Err(error) = runtime.save() {
+                                reporter.notice(&format!("context paging state error: {error}"));
+                                return LoopEnd::DriverError;
+                            }
+                            reporter
+                                .notice(&format!("loaded bounded diagnostic artifact {reference}"));
+                        }
+                        Err(error) => {
+                            reporter.notice(&format!("diagnostic lookup failed: {error}"));
+                        }
+                    }
+                    continue;
+                }
+                Ok(TypedModelAction::UpdatePlan { current_focus }) => {
+                    runtime.ledger.current_focus = current_focus;
+                    if let Err(error) = runtime.save() {
+                        reporter.notice(&format!("context paging state error: {error}"));
+                        return LoopEnd::DriverError;
+                    }
+                    reporter.notice("canonical task focus updated");
+                    continue;
+                }
+                Ok(TypedModelAction::Complete { summary }) => {
+                    runtime.ledger.current_focus = "Task complete".into();
+                    runtime.ledger.verification_state.status = "complete".into();
+                    if let Err(error) = runtime.save() {
+                        reporter.notice(&format!("context paging state error: {error}"));
+                        return LoopEnd::DriverError;
+                    }
+                    step = ModelStep::Text(summary);
+                }
+                Ok(TypedModelAction::Blocked { reason }) => {
+                    runtime.ledger.current_focus = format!("Blocked: {reason}");
+                    runtime.ledger.open_questions.push(reason.clone());
+                    if let Err(error) = runtime.save() {
+                        reporter.notice(&format!("context paging state error: {error}"));
+                        return LoopEnd::DriverError;
+                    }
+                    step = ModelStep::Text(format!("Blocked: {reason}"));
+                }
+                Err(error)
+                    if text.trim_start().starts_with('{')
+                        || text.trim_start().starts_with("```json") =>
+                {
+                    runtime
+                        .ledger
+                        .failed_attempts
+                        .push(format!("Invalid typed action: {error}"));
+                    runtime.ledger.current_focus =
+                        "Return exactly one valid typed action or advertised tool call".into();
+                    if let Err(save_error) = runtime.save() {
+                        reporter.notice(&format!("context paging state error: {save_error}"));
+                        return LoopEnd::DriverError;
+                    }
+                    reporter.notice(&format!("typed action rejected: {error}"));
+                    continue;
+                }
+                Err(_) => {}
             }
         }
         match step {
@@ -834,6 +1346,41 @@ pub fn run_loop(
                 // write. Retry with the cap disclosed instead; the guard keeps a
                 // model that cannot fit its answer from spinning forever.
                 if driver.last_step_capped() && !text.trim().is_empty() {
+                    if let Some(runtime) = context_paging.as_mut().filter(|runtime| {
+                        runtime.ledger.verification_state.status == "passed"
+                            && paging_capsule
+                                .as_ref()
+                                .is_some_and(|capsule| capsule.tool_names.is_empty())
+                    }) {
+                        let work = if runtime.ledger.completed_work.is_empty() {
+                            "the requested workspace change".to_string()
+                        } else {
+                            runtime.ledger.completed_work.join("; ")
+                        };
+                        let verification = runtime
+                            .ledger
+                            .verification_state
+                            .last_command
+                            .clone()
+                            .unwrap_or_else(|| "the recorded verification checks".into());
+                        let summary = format!("Completed {work}. Verified with `{verification}`.");
+                        runtime.ledger.current_focus = "Task complete".into();
+                        runtime.ledger.verification_state.status = "complete".into();
+                        if let Err(error) =
+                            runtime.save().and_then(|_| runtime.record_task_complete())
+                        {
+                            reporter.notice(&format!(
+                                "context paging completion fallback error: {error}"
+                            ));
+                            return LoopEnd::DriverError;
+                        }
+                        reporter.notice(
+                            "verified completion exceeded its tiny output cap; using the host-owned ledger summary",
+                        );
+                        reporter.model_text(&summary);
+                        history.push(AgentMsg::Assistant(summary));
+                        return LoopEnd::Answered;
+                    }
                     if capped_retries < CAPPED_RETRY_LIMIT {
                         capped_retries += 1;
                         completed_steps = completed_steps.saturating_sub(1);
@@ -1104,11 +1651,50 @@ pub fn run_loop(
                     ));
                     continue;
                 }
+                if let Some(runtime) = context_paging.as_mut() {
+                    runtime.ledger.verification_state.status = if workspace_changed {
+                        "complete".into()
+                    } else {
+                        runtime.ledger.verification_state.status.clone()
+                    };
+                    runtime.ledger.current_focus = "Task complete".into();
+                    if let Err(error) = runtime.save().and_then(|_| runtime.record_task_complete())
+                    {
+                        reporter.notice(&format!("context paging completion error: {error}"));
+                        return LoopEnd::DriverError;
+                    }
+                }
                 reporter.model_text(&text);
                 history.push(AgentMsg::Assistant(text));
                 return LoopEnd::Answered;
             }
             ModelStep::Calls(mut calls) => {
+                if let Some(call) = context_paging.as_ref().and_then(|_| {
+                    calls
+                        .iter()
+                        .find(|call| !step_tools.iter().any(|tool| tool.name == call.name))
+                }) {
+                    let message = format!(
+                        "tool `{}` is not available in the current context-paging phase",
+                        call.name
+                    );
+                    reporter.tool_call(&format!("{}(?)", call.name));
+                    reporter.tool_result(&call.name, &ToolOutcome::Err(message.clone()));
+                    if let Some(runtime) = context_paging.as_mut() {
+                        runtime.ledger.failed_attempts.push(message);
+                        runtime.ledger.current_focus =
+                            if call.name == "edit_file" && force_full_rewrite {
+                                PAGING_FULL_REWRITE_FOCUS.into()
+                            } else {
+                                "Choose one action using only the phase-relevant tools".into()
+                            };
+                        if let Err(error) = runtime.save() {
+                            reporter.notice(&format!("context paging state error: {error}"));
+                            return LoopEnd::DriverError;
+                        }
+                    }
+                    continue;
+                }
                 if let Some(path) = cfg.default_write_path.as_deref() {
                     for call in &mut calls {
                         if supply_default_write_path(call, path) {
@@ -1116,6 +1702,48 @@ pub fn run_loop(
                                 "supplied deterministic standalone artifact path: {path}"
                             ));
                         }
+                    }
+                }
+                if let (Some(runtime), Some(capsule)) =
+                    (context_paging.as_mut(), paging_capsule.as_ref())
+                {
+                    if let Some((call_name, error)) = calls.iter().find_map(|call| {
+                        runtime
+                            .validate_tool_modification(call, capsule)
+                            .err()
+                            .map(|error| (call.name.clone(), error))
+                    }) {
+                        let message = error.to_string();
+                        reporter.tool_call(&format!("{call_name}(?)"));
+                        reporter.tool_result(&call_name, &ToolOutcome::Err(message.clone()));
+                        runtime
+                            .ledger
+                            .failed_attempts
+                            .push(format!("{call_name} rejected: {message}"));
+                        runtime.ledger.current_focus =
+                            "Load exact source with NEED_CONTEXT, then issue a hash-checked PATCH"
+                                .into();
+                        paging_action_rejections = paging_action_rejections.saturating_add(1);
+                        if message.contains("identical to the current source") {
+                            tools.retain(|tool| tool.name != "write_file");
+                            runtime.ledger.current_focus = concat!(
+                                "The previous full-file rewrite was byte-for-byte identical and was rejected. ",
+                                "Do not reproduce the exact page. Use PATCH or edit_file to make a real change ",
+                                "that resolves every current diagnostic."
+                            )
+                            .into();
+                        }
+                        if let Err(save_error) = runtime.save() {
+                            reporter.notice(&format!("context paging state error: {save_error}"));
+                            return LoopEnd::DriverError;
+                        }
+                        if paging_action_rejections >= 3 {
+                            reporter.notice(
+                                "stopping: the model repeatedly proposed invalid or no-op context-paging modifications",
+                            );
+                            return LoopEnd::Repeated;
+                        }
+                        continue;
                     }
                 }
                 if cfg.tool_profile.is_workspace()
@@ -1359,6 +1987,7 @@ pub fn run_loop(
                             cancel,
                         ),
                     };
+                    let raw_outcome_for_paging = context_paging.as_ref().map(|_| outcome.clone());
                     let outcome = match cfg.tool_profile.observation_limit() {
                         Some(max_bytes) => outcome.clipped(max_bytes),
                         None => outcome,
@@ -1405,6 +2034,16 @@ pub fn run_loop(
                     }
                     if cfg.tool_profile.is_workspace() && !outcome.is_err() {
                         observed_workspace = true;
+                        if context_paging.is_some()
+                            && matches!(
+                                &action,
+                                Action::ReadFile { .. }
+                                    | Action::ListDir { .. }
+                                    | Action::Search { .. }
+                            )
+                        {
+                            paging_discovery_complete = true;
+                        }
                         if let Action::ReadFile { path, .. } = &action {
                             successful_workspace_reads
                                 .insert(normalize_workspace_path(&sandbox.rel(path)));
@@ -1414,6 +2053,52 @@ pub fn run_loop(
                     }
                     let name = action.tool_name();
                     reporter.tool_result(name, &outcome);
+                    #[cfg(windows)]
+                    let host_python_verification = if context_paging.is_some()
+                        && workspace_changed
+                        && pending_verification_paths.is_empty()
+                    {
+                        match &action {
+                            Action::ReadFile { path, .. } => {
+                                let relative = normalize_workspace_path(&sandbox.rel(path));
+                                let safe_relative = relative.chars().all(|character| {
+                                    character.is_ascii_alphanumeric()
+                                        || matches!(character, '.' | '_' | '-' | '/' | '\\')
+                                });
+                                if relative.to_ascii_lowercase().ends_with(".py") && safe_relative {
+                                    let command = format!("py -m py_compile {relative}");
+                                    let verification = Action::RunShell {
+                                        command: command.clone(),
+                                    };
+                                    reporter.tool_call(&verification.call_line(sandbox));
+                                    let result = execute_audited(
+                                        &verification,
+                                        sandbox,
+                                        ApprovalTier::Auto,
+                                        &json!({"command": command}),
+                                        cfg.audit.as_ref(),
+                                        cancel,
+                                    )
+                                    .clipped(
+                                        cfg.tool_profile.observation_limit().unwrap_or(usize::MAX),
+                                    );
+                                    reporter.tool_result("run_shell", &result);
+                                    *ran.entry("run_shell".into()).or_insert(0) += 1;
+                                    Some((command, result))
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    #[cfg(not(windows))]
+                    let host_python_verification: Option<(
+                        String,
+                        ToolOutcome,
+                    )> = None;
                     match &action {
                         Action::SpawnSubagent { subtask_id, goal } => {
                             if outcome.is_err() {
@@ -1516,10 +2201,158 @@ pub fn run_loop(
                     let recover_now = repeat_count >= REPEAT_RECOVERY_THRESHOLD
                         && !already_recovered
                         && recovered_call_signatures.insert(signature.clone());
+                    let history_outcome = if let (Some(runtime), Some(raw_outcome)) =
+                        (context_paging.as_mut(), raw_outcome_for_paging.as_ref())
+                    {
+                        let command = match &action {
+                            Action::RunShell { command } => Some(command.as_str()),
+                            _ => None,
+                        };
+                        let status = if raw_outcome.is_err() { "error" } else { "ok" };
+                        let compact =
+                            match runtime.compact_result(status, command, raw_outcome.text()) {
+                                Ok(compact) => compact,
+                                Err(error) => {
+                                    reporter
+                                        .notice(&format!("context paging artifact error: {error}"));
+                                    return LoopEnd::DriverError;
+                                }
+                            };
+                        if raw_outcome.is_err() || matches!(&action, Action::RunShell { .. }) {
+                            paging_diagnostic = Some(compact.clone());
+                        }
+                        match &action {
+                            Action::WriteFile { path, .. } | Action::EditFile { path, .. }
+                                if !raw_outcome.is_err() =>
+                            {
+                                let relative = normalize_workspace_path(&sandbox.rel(path));
+                                runtime
+                                    .ledger
+                                    .completed_work
+                                    .push(format!("{} changed {relative}", action.tool_name()));
+                                runtime.ledger.current_focus =
+                                    format!("Verify the change to {relative}");
+                                runtime.ledger.verification_state.status = "pending".into();
+                                runtime.ledger.verification_state.failing_diagnostic = None;
+                                runtime.ledger.verification_state.verified_symbols.clear();
+                                paging_diagnostic = None;
+                                if let Err(error) = runtime.refresh_project().and_then(|_| {
+                                    runtime.seed_relevance_from_query(&relative, 1).map(|_| ())
+                                }) {
+                                    reporter
+                                        .notice(&format!("context paging reindex error: {error}"));
+                                    return LoopEnd::DriverError;
+                                }
+                            }
+                            Action::RunShell { command } => {
+                                runtime.ledger.verification_state.last_command =
+                                    Some(command.clone());
+                                if raw_outcome.is_err() {
+                                    runtime.ledger.verification_state.status = "failed".into();
+                                    runtime.ledger.verification_state.failing_diagnostic =
+                                        Some(compact.raw_reference.clone());
+                                    runtime.metrics.verification_retries =
+                                        runtime.metrics.verification_retries.saturating_add(1);
+                                } else {
+                                    runtime.ledger.verification_state.status = "passed".into();
+                                    runtime.ledger.verification_state.failing_diagnostic = None;
+                                    runtime.ledger.current_focus =
+                                        "Return a concise verified completion summary".into();
+                                }
+                            }
+                            Action::ReadFile { path, .. }
+                                if !raw_outcome.is_err()
+                                    && workspace_changed
+                                    && pending_verification_paths.is_empty() =>
+                            {
+                                let relative = normalize_workspace_path(&sandbox.rel(path));
+                                semantic_contract_findings = source_contract_findings(
+                                    history,
+                                    &[(relative.clone(), raw_outcome.text().to_string())],
+                                );
+                                if let Some((command, verification)) =
+                                    host_python_verification.as_ref()
+                                {
+                                    runtime.ledger.verification_state.last_command =
+                                        Some(command.clone());
+                                    if verification.is_err() {
+                                        semantic_contract_findings.push(format!(
+                                            "Python syntax validation failed for {relative}: {}",
+                                            verification.text()
+                                        ));
+                                    }
+                                }
+                                if semantic_contract_findings.is_empty() {
+                                    runtime.ledger.verification_state.status = "passed".into();
+                                    runtime.ledger.verification_state.failing_diagnostic = None;
+                                    runtime.ledger.verification_state.verified_symbols =
+                                        runtime.ledger.relevant_symbols.clone();
+                                    runtime.ledger.current_focus =
+                                        "Return a concise verified completion summary".into();
+                                    paging_diagnostic = None;
+                                } else {
+                                    let audit = semantic_contract_findings.join("\n");
+                                    let diagnostic = match runtime.compact_result(
+                                        "semantic_contract_error",
+                                        None,
+                                        &audit,
+                                    ) {
+                                        Ok(diagnostic) => diagnostic,
+                                        Err(error) => {
+                                            reporter.notice(&format!(
+                                                "context paging semantic artifact error: {error}"
+                                            ));
+                                            return LoopEnd::DriverError;
+                                        }
+                                    };
+                                    runtime.ledger.verification_state.status = "failed".into();
+                                    runtime.ledger.verification_state.failing_diagnostic =
+                                        Some(diagnostic.raw_reference.clone());
+                                    runtime.ledger.current_focus = format!(
+                                        "Correct every source-contract finding:\n- {}",
+                                        semantic_contract_findings.join("\n- ")
+                                    );
+                                    runtime.ledger.failed_attempts.push(format!(
+                                        "The most recently verified source still failed these checks; do not copy the exact page unchanged:\n- {}",
+                                        semantic_contract_findings.join("\n- ")
+                                    ));
+                                    runtime.metrics.verification_retries =
+                                        runtime.metrics.verification_retries.saturating_add(1);
+                                    paging_verification_failures =
+                                        paging_verification_failures.saturating_add(1);
+                                    paging_diagnostic = Some(diagnostic);
+                                }
+                            }
+                            _ if raw_outcome.is_err() => runtime
+                                .ledger
+                                .failed_attempts
+                                .push(format!("{}: {}", action.tool_name(), compact.preview)),
+                            _ => {}
+                        }
+                        if let Err(error) = runtime.save() {
+                            reporter.notice(&format!("context paging state error: {error}"));
+                            return LoopEnd::DriverError;
+                        }
+                        let compact_text = serde_json::to_string(&compact)
+                            .unwrap_or_else(|_| "{\"status\":\"serialization_error\"}".into());
+                        if raw_outcome.is_err() {
+                            ToolOutcome::Err(compact_text)
+                        } else {
+                            ToolOutcome::Ok(compact_text)
+                        }
+                    } else {
+                        outcome
+                    };
                     history.push(AgentMsg::ToolResult {
                         name: name.to_string(),
-                        outcome,
+                        outcome: history_outcome,
                     });
+                    if paging_verification_failures >= CONTEXT_PAGING_VERIFICATION_FAILURE_LIMIT {
+                        reporter.notice(
+                            "stopping: context paging reached its bounded semantic verification retry limit",
+                        );
+                        return LoopEnd::Repeated;
+                    }
                     if !history.last().is_some_and(|message| {
                         matches!(
                             message,
@@ -1555,6 +2388,17 @@ pub fn run_loop(
                     if exhausted_edit_recovery {
                         force_full_rewrite = true;
                         tools.retain(|spec| spec.name != "edit_file");
+                        if let Some(runtime) = context_paging.as_mut() {
+                            runtime.ledger.current_focus = PAGING_FULL_REWRITE_FOCUS.into();
+                            runtime.ledger.failed_attempts.push(
+                                "narrow edit recovery is exhausted after repeated patch failures"
+                                    .into(),
+                            );
+                            if let Err(error) = runtime.save() {
+                                reporter.notice(&format!("context paging state error: {error}"));
+                                return LoopEnd::DriverError;
+                            }
+                        }
                         reporter.notice(
                             "two file patches failed; requiring a complete write_file replacement",
                         );
@@ -3888,7 +4732,394 @@ mod tests {
             allow_plan: true,
             default_write_path: None,
             ctx_budget: None,
+            context_paging: false,
         }
+    }
+
+    #[test]
+    fn context_paging_runs_multistep_task_from_fresh_capsules() {
+        let _checkpoint_guard = super::super::checkpoint::tests::cp_lock();
+        struct PagingDriver {
+            step: usize,
+            histories: Vec<Vec<AgentMsg>>,
+            tool_names: Vec<Vec<String>>,
+        }
+        impl ModelDriver for PagingDriver {
+            fn step(
+                &mut self,
+                history: &[AgentMsg],
+                tools: &[ToolSpec],
+            ) -> Result<ModelStep, String> {
+                self.histories.push(history.to_vec());
+                self.tool_names
+                    .push(tools.iter().map(|tool| tool.name.clone()).collect());
+                let capsule = match history {
+                    [AgentMsg::User(capsule)] => capsule,
+                    _ => return Err("paging request replayed non-capsule history".into()),
+                };
+                if capsule.contains("UNBOUNDED_TRANSCRIPT_SENTINEL") {
+                    return Err("old transcript leaked into a fresh capsule".into());
+                }
+                let response = match self.step {
+                    0 => {
+                        let hash = capsule
+                            .split("sourceHash=\"")
+                            .nth(1)
+                            .and_then(|rest| rest.split('"').next())
+                            .ok_or_else(|| "exact source hash missing".to_string())?;
+                        ModelStep::Text(
+                            json!({
+                                "action": "PATCH",
+                                "target": "src/lib.rs::function::increment",
+                                "expectedSourceHash": hash,
+                                "patch": "pub fn increment(value: i32) -> i32 {\n    value + 2\n}\n",
+                                "justification": "Implement the requested increment change"
+                            })
+                            .to_string(),
+                        )
+                    }
+                    1 => ModelStep::Calls(vec![tc("read_file", json!({"path": "src/lib.rs"}))]),
+                    _ => ModelStep::Text(
+                        json!({
+                            "action": "COMPLETE",
+                            "summary": "Changed increment and verified the saved source."
+                        })
+                        .to_string(),
+                    ),
+                };
+                self.step += 1;
+                Ok(response)
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join("src")).unwrap();
+        std::fs::write(
+            directory.path().join("src/lib.rs"),
+            "pub fn increment(value: i32) -> i32 {\n    value + 1\n}\n",
+        )
+        .unwrap();
+        let sandbox = Sandbox::new(directory.path(), false, Duration::from_secs(5))
+            .unwrap()
+            .with_shell_mode(ShellSandbox::Sandboxed);
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+        let mut driver = PagingDriver {
+            step: 0,
+            histories: Vec::new(),
+            tool_names: Vec::new(),
+        };
+        let mut approver = ScriptApprover(vec![Decision::Once], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![
+            AgentMsg::System("UNBOUNDED_TRANSCRIPT_SENTINEL".repeat(2_000)),
+            AgentMsg::User("Change increment so it adds two and verify the saved file".into()),
+        ];
+        let mut config = cfg(directory.path(), false);
+        config.max_steps = 5;
+        config.shell_sandbox = ShellSandbox::Sandboxed;
+        config.tool_profile = tools::ToolProfile::WebCode;
+        config.allow_plan = false;
+        config.context_paging = true;
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sandbox,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
+        assert_eq!(driver.histories.len(), 3);
+        assert!(driver.histories.iter().all(|history| history.len() == 1));
+        assert!(driver.histories.iter().all(|history| matches!(
+            history.first(),
+            Some(AgentMsg::User(capsule))
+                if capsule.starts_with("You are Camelid's Context Paging coding agent.")
+        )));
+        assert!(driver.tool_names[0].contains(&"edit_file".to_string()));
+        assert!(!driver.tool_names[0].contains(&"run_shell".to_string()));
+        assert_eq!(driver.tool_names[1], vec!["read_file".to_string()]);
+        let final_capsule = match &driver.histories[2][0] {
+            AgentMsg::User(capsule) => capsule,
+            other => panic!("expected final fresh capsule, got {other:?}"),
+        };
+        assert!(final_capsule.contains("\"action\":\"COMPLETE\""));
+        assert!(!final_capsule.contains("<exact_source_page"));
+        assert!(!final_capsule.contains("<failed_attempts>"));
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("src/lib.rs")).unwrap(),
+            "pub fn increment(value: i32) -> i32 {\n    value + 2\n}\n"
+        );
+        assert!(directory
+            .path()
+            .join(".camelid/context-paging/ledgers")
+            .is_dir());
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+    }
+
+    #[test]
+    fn paging_empty_direct_creation_starts_with_the_exact_write_and_finishes() {
+        struct EmptyCreationDriver {
+            step: usize,
+            source: &'static str,
+        }
+        impl ModelDriver for EmptyCreationDriver {
+            fn step(
+                &mut self,
+                history: &[AgentMsg],
+                tools: &[ToolSpec],
+            ) -> Result<ModelStep, String> {
+                let capsule = match history {
+                    [AgentMsg::User(capsule)] => capsule,
+                    _ => return Err("paging request replayed non-capsule history".into()),
+                };
+                let response = match self.step {
+                    0 => {
+                        assert_eq!(
+                            tools
+                                .iter()
+                                .map(|tool| tool.name.as_str())
+                                .collect::<Vec<_>>(),
+                            vec!["write_file"]
+                        );
+                        assert!(capsule.contains("`tic_tac_toe.py`"));
+                        assert!(capsule.contains("does not exist"));
+                        assert!(capsule.contains("human controls exactly one side"));
+                        ModelStep::Calls(vec![tc(
+                            "write_file",
+                            json!({"path":"tic_tac_toe.py","content":self.source}),
+                        )])
+                    }
+                    1 => {
+                        assert_eq!(
+                            tools
+                                .iter()
+                                .map(|tool| tool.name.as_str())
+                                .collect::<Vec<_>>(),
+                            vec!["read_file"]
+                        );
+                        ModelStep::Calls(vec![tc("read_file", json!({"path":"tic_tac_toe.py"}))])
+                    }
+                    _ => {
+                        assert!(tools.is_empty());
+                        ModelStep::Text(
+                            json!({
+                                "action":"COMPLETE",
+                                "summary":"Created and verified tic_tac_toe.py."
+                            })
+                            .to_string(),
+                        )
+                    }
+                };
+                self.step += 1;
+                Ok(response)
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::new(directory.path(), false, Duration::from_secs(5)).unwrap();
+        let source = concat!(
+            "import tkinter as tk\n",
+            "from tkinter import messagebox\n",
+            "class Game:\n",
+            "    def __init__(self):\n",
+            "        self.current_player = 'X'\n",
+            "    def make_move(self, idx):\n",
+            "        self.board[idx] = 'X'\n",
+            "        self.computer_move()\n",
+            "    def computer_move(self):\n",
+            "        self.board[0] = 'O'\n",
+            "        if self.check_win('O') or self.check_draw():\n",
+            "            messagebox.showinfo('Done', 'Result')\n",
+            "        self.current_player = 'X'\n",
+            "    winning_lines = [(0, 4, 8), (2, 4, 6)]\n",
+        );
+        let mut driver = EmptyCreationDriver { step: 0, source };
+        let mut approver = ScriptApprover(vec![Decision::Once], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![
+            AgentMsg::System(concat!(
+                "host system prompt\n\nDirect creation acceptance contract:\n",
+                "- Create the requested runnable artifact in the workspace with write_file\n",
+                "- A human-vs-computer game means the human controls exactly one side and the program automatically chooses and performs every opposing move\n"
+            ).into()),
+            AgentMsg::User(
+                "Code me a one-player tic tac toe game in Python using graphics.".into(),
+            ),
+        ];
+        let mut config = cfg(directory.path(), true);
+        config.max_steps = 0;
+        config.max_tokens = 1_300;
+        config.tool_profile = tools::ToolProfile::WebCode;
+        config.context_paging = true;
+        config.default_write_path = Some("tic_tac_toe.py".into());
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sandbox,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
+        assert_eq!(driver.step, 3);
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("tic_tac_toe.py")).unwrap(),
+            source
+        );
+        let restarted = ContextPagingRuntime::open(
+            directory.path(),
+            "Code me a one-player tic tac toe game in Python using graphics.",
+            ContextPagingConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(restarted.ledger.verification_state.status, "complete");
+        assert!(restarted
+            .ledger
+            .acceptance_criteria
+            .iter()
+            .any(|criterion| criterion.contains("human controls exactly one side")));
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+    }
+
+    #[test]
+    fn verified_paging_task_uses_host_summary_when_complete_action_hits_cap() {
+        struct CappedCompletion {
+            steps: usize,
+            max_tokens: u32,
+        }
+        impl ModelDriver for CappedCompletion {
+            fn step(
+                &mut self,
+                _history: &[AgentMsg],
+                tools: &[ToolSpec],
+            ) -> Result<ModelStep, String> {
+                self.steps += 1;
+                assert!(tools.is_empty(), "Complete phase must expose no tools");
+                Ok(ModelStep::Text(
+                    "unfinished completion reasoning".repeat(50),
+                ))
+            }
+
+            fn last_step_capped(&self) -> bool {
+                true
+            }
+
+            fn set_max_tokens(&mut self, max_tokens: u32) {
+                self.max_tokens = max_tokens;
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("game.py"), "print('ready')\n").unwrap();
+        let objective = "Change game.py and verify it";
+        let mut runtime =
+            ContextPagingRuntime::open(directory.path(), objective, ContextPagingConfig::default())
+                .unwrap();
+        let symbol = runtime.project.cards.keys().next().unwrap().clone();
+        runtime
+            .ledger
+            .completed_work
+            .push("write_file changed game.py".into());
+        runtime.ledger.relevant_symbols.push(symbol.clone());
+        runtime.ledger.verification_state.status = "passed".into();
+        runtime.ledger.verification_state.last_command = Some("py -m py_compile game.py".into());
+        runtime
+            .ledger
+            .verification_state
+            .verified_symbols
+            .push(symbol);
+        runtime.save().unwrap();
+        drop(runtime);
+
+        let sandbox = Sandbox::new(directory.path(), false, Duration::from_secs(5))
+            .unwrap()
+            .with_shell_mode(ShellSandbox::Disabled);
+        let mut driver = CappedCompletion {
+            steps: 0,
+            max_tokens: 0,
+        };
+        let mut approver = ScriptApprover(Vec::new(), 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(objective.into())];
+        let mut config = cfg(directory.path(), false);
+        config.max_tokens = 1_024;
+        config.max_steps = 3;
+        config.tool_profile = tools::ToolProfile::WebCode;
+        config.shell_sandbox = ShellSandbox::Disabled;
+        config.context_paging = true;
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sandbox,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Answered);
+        assert_eq!(driver.steps, 1);
+        assert_eq!(driver.max_tokens, 256);
+        assert!(reporter
+            .notices
+            .iter()
+            .any(|notice| notice.contains("verified completion exceeded its tiny output cap")));
+        assert!(reporter.text[0].contains("py -m py_compile game.py"));
+        let restarted =
+            ContextPagingRuntime::open(directory.path(), objective, ContextPagingConfig::default())
+                .unwrap();
+        assert_eq!(restarted.ledger.verification_state.status, "complete");
+        drop(restarted);
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+
+        struct CompletedRestart {
+            steps: usize,
+        }
+        impl ModelDriver for CompletedRestart {
+            fn step(
+                &mut self,
+                history: &[AgentMsg],
+                tools: &[ToolSpec],
+            ) -> Result<ModelStep, String> {
+                self.steps += 1;
+                assert!(tools.is_empty(), "a completed restart must expose no tools");
+                assert!(matches!(
+                    history.first(),
+                    Some(AgentMsg::User(capsule))
+                        if capsule.contains(r#"{"action":"COMPLETE""#)
+                ));
+                Ok(ModelStep::Text(
+                    r#"{"action":"COMPLETE","summary":"Already changed and verified."}"#.into(),
+                ))
+            }
+        }
+
+        let mut restart_driver = CompletedRestart { steps: 0 };
+        let mut restart_approver = ScriptApprover(Vec::new(), 0);
+        let mut restart_reporter = RecordReporter::default();
+        let mut restart_history = vec![AgentMsg::User(objective.into())];
+        let restart_end = run_loop(
+            &mut restart_driver,
+            &mut restart_approver,
+            &mut restart_reporter,
+            &sandbox,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut restart_history,
+        );
+
+        assert_eq!(restart_end, LoopEnd::Answered);
+        assert_eq!(restart_driver.steps, 1);
+        assert_eq!(restart_reporter.text, vec!["Already changed and verified."]);
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
     }
 
     #[test]
@@ -5262,7 +6493,7 @@ mod tests {
     #[test]
     fn tic_tac_toe_contract_audit_catches_the_live_turn_state_failure() {
         let history = vec![AgentMsg::User(
-            "Code me tic tac toe, one player vs the computer, in Python with graphics.".into(),
+            "Code me a one-player tic tac toe game in Python with graphics.".into(),
         )];
         let bad_source = concat!(
             "import tkinter as tk\n",
@@ -5274,8 +6505,8 @@ mod tests {
             "    def make_move(self, idx):\n",
             "        self.board[idx] = self.current_player\n",
             "        self.current_player = \"O\"\n",
-            "        self.computer_move()\n",
-            "    def computer_move(self):\n",
+            "        self.auto_move()\n",
+            "    def auto_move(self):\n",
             "        self.board[0] = \"O\"\n",
             "    def check_draw(self):\n",
             "        return False\n",
@@ -5297,6 +6528,9 @@ mod tests {
         assert!(findings
             .iter()
             .any(|finding| finding.contains("messagebox or status/result label")));
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("both diagonal lines")));
     }
 
     #[test]
@@ -5318,10 +6552,24 @@ mod tests {
             "        if self.check_win(\"O\") or self.check_draw():\n",
             "            messagebox.showinfo(\"Done\", \"Result\")\n",
             "        self.current_player = \"X\"\n",
+            "    winning_lines = [(0, 4, 8), (2, 4, 6)]\n",
         );
         let findings =
             source_contract_findings(&history, &[("tic_tac_toe.py".into(), good_source.into())]);
         assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn paging_restart_preserves_full_rewrite_recovery_after_edit_failure() {
+        assert!(paging_failed_attempts_require_full_rewrite(&[
+            "edit_file: `old` text is not unique (2 occurrences); include more context".into()
+        ]));
+        assert!(paging_failed_attempts_require_full_rewrite(&[
+            "tool `edit_file` is not available in the current context-paging phase".into()
+        ]));
+        assert!(!paging_failed_attempts_require_full_rewrite(&[
+            "read_file: file not found".into()
+        ]));
     }
 
     #[test]

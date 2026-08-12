@@ -172,6 +172,7 @@ impl ApprovalPolicy {
 }
 
 /// A tool advertised to the model: name, description, JSON-schema params.
+#[derive(Clone)]
 pub struct ToolSpec {
     pub name: String,
     pub description: String,

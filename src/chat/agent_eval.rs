@@ -313,6 +313,7 @@ pub fn run(cfg: EvalConfig) -> anyhow::Result<i32> {
             // harness fully determines. Cases are short and cannot approach the
             // budget anyway (D-DROVER-6).
             ctx_budget: None,
+            context_paging: false,
         };
         // Auto-approve posture (write/network auto; run_shell still gated, which
         // the AutoApprove approver allows). Production was already refused above.
