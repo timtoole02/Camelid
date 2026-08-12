@@ -133,6 +133,7 @@ struct ActiveWorkspaceSession {
     run_config: StdMutex<Option<WorkspaceRunConfig>>,
     control: StdMutex<Option<WorkspaceBridgeControl>>,
     current_turn: StdMutex<Option<(String, u32)>>,
+    activity: StdMutex<WorkspaceActivitySnapshot>,
 }
 
 enum InstallTurn {
@@ -154,6 +155,262 @@ enum WorkspaceSessionState {
     Cancelling,
     Cancelled,
     Failed,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct WorkspaceAgentActivity {
+    id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_id: Option<String>,
+    label: String,
+    status: String,
+    task: String,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct WorkspaceActivitySnapshot {
+    started_at_ms: u64,
+    updated_at_ms: u64,
+    phase: String,
+    stage: String,
+    detail: String,
+    task: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_tool: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_outcome: Option<String>,
+    agents: Vec<WorkspaceAgentActivity>,
+}
+
+impl WorkspaceActivitySnapshot {
+    fn new(task: &str) -> Self {
+        let now = now_epoch_millis();
+        Self {
+            started_at_ms: now,
+            updated_at_ms: now,
+            phase: "starting".to_string(),
+            stage: "starting".to_string(),
+            detail: "Starting coding session".to_string(),
+            task: task.to_string(),
+            current_tool: None,
+            output_tokens: None,
+            terminal_outcome: None,
+            agents: vec![WorkspaceAgentActivity {
+                id: "main".to_string(),
+                parent_id: None,
+                label: "Camelid".to_string(),
+                status: "starting".to_string(),
+                task: task.to_string(),
+                detail: "Preparing the coding session".to_string(),
+            }],
+        }
+    }
+
+    fn main_agent_mut(&mut self) -> &mut WorkspaceAgentActivity {
+        let index = self
+            .agents
+            .iter()
+            .position(|agent| agent.id == "main")
+            .unwrap_or_else(|| {
+                self.agents.insert(
+                    0,
+                    WorkspaceAgentActivity {
+                        id: "main".to_string(),
+                        parent_id: None,
+                        label: "Camelid".to_string(),
+                        status: "running".to_string(),
+                        task: self.task.clone(),
+                        detail: self.detail.clone(),
+                    },
+                );
+                0
+            });
+        &mut self.agents[index]
+    }
+
+    fn sync_main(&mut self, status: Option<&str>) {
+        let detail = self.detail.clone();
+        let main = self.main_agent_mut();
+        if let Some(status) = status {
+            main.status = status.to_string();
+        }
+        main.detail = detail;
+    }
+
+    fn upsert_agent(&mut self, incoming: WorkspaceAgentActivity) {
+        if let Some(existing) = self.agents.iter_mut().find(|agent| {
+            agent.id == incoming.id
+                || (agent.parent_id.is_some()
+                    && incoming.parent_id.is_some()
+                    && agent.label == incoming.label)
+        }) {
+            existing.id = incoming.id;
+            existing.parent_id = incoming.parent_id;
+            existing.label = incoming.label;
+            existing.status = incoming.status;
+            if !incoming.task.is_empty() {
+                existing.task = incoming.task;
+            }
+            existing.detail = incoming.detail;
+        } else {
+            self.agents.push(incoming);
+        }
+    }
+
+    fn apply(&mut self, event: &WorkspaceEvent) {
+        self.updated_at_ms = now_epoch_millis();
+        match event {
+            WorkspaceEvent::Started { .. } => {
+                self.phase = "running".to_string();
+                self.stage = "starting".to_string();
+                self.detail = "Preparing the model and workspace tools".to_string();
+                self.sync_main(Some("running"));
+            }
+            WorkspaceEvent::TurnStarted { .. } => {
+                self.phase = "running".to_string();
+                self.stage = "context".to_string();
+                self.detail = "Building the model context".to_string();
+                self.sync_main(None);
+            }
+            WorkspaceEvent::MemoryUpdated {
+                prompt_tokens,
+                budget_total,
+                ..
+            } => {
+                self.phase = "running".to_string();
+                self.stage = "context".to_string();
+                self.detail = format!(
+                    "Prepared {prompt_tokens} prompt tokens inside a {budget_total}-token context"
+                );
+                self.sync_main(None);
+            }
+            WorkspaceEvent::ModelDelta { .. } => {
+                self.phase = "running".to_string();
+                self.stage = "generating".to_string();
+                self.detail = "The model is generating its next action".to_string();
+                self.current_tool = None;
+                self.sync_main(Some("running"));
+            }
+            WorkspaceEvent::ModelTiming { output_tokens, .. } => {
+                self.output_tokens = *output_tokens;
+                self.detail = output_tokens.map_or_else(
+                    || "The model finished a generation step".to_string(),
+                    |tokens| format!("The model finished a {tokens}-token generation step"),
+                );
+                self.sync_main(None);
+            }
+            WorkspaceEvent::ModelAnswer { .. } => {
+                self.phase = "running".to_string();
+                self.stage = "finishing".to_string();
+                self.detail = "Reviewing and saving the final answer".to_string();
+                self.current_tool = None;
+                self.sync_main(None);
+            }
+            WorkspaceEvent::ToolCall { detail } => {
+                self.phase = "running".to_string();
+                self.stage = "tool".to_string();
+                self.detail = detail.clone();
+                self.current_tool = Some(detail.clone());
+                self.sync_main(Some("running"));
+            }
+            WorkspaceEvent::ToolResult { tool, outcome, .. } => {
+                self.phase = "running".to_string();
+                self.stage = "tool_result".to_string();
+                self.detail = format!(
+                    "{} {}",
+                    tool.replace('_', " "),
+                    if *outcome == "ok" {
+                        "completed"
+                    } else {
+                        "failed"
+                    }
+                );
+                self.current_tool = None;
+                self.sync_main(Some("running"));
+            }
+            WorkspaceEvent::ApprovalRequired { tool, .. } => {
+                self.phase = "awaiting_approval".to_string();
+                self.stage = "approval".to_string();
+                self.detail = format!("Waiting for approval to run {}", tool.replace('_', " "));
+                self.sync_main(Some("waiting"));
+            }
+            WorkspaceEvent::Notice { content } => {
+                self.detail = content.clone();
+                self.sync_main(None);
+            }
+            WorkspaceEvent::AgentUpdated {
+                agent_id,
+                parent_id,
+                label,
+                status,
+                task,
+                detail,
+            } => self.upsert_agent(WorkspaceAgentActivity {
+                id: agent_id.clone(),
+                parent_id: parent_id.clone(),
+                label: label.clone(),
+                status: status.clone(),
+                task: task.clone(),
+                detail: detail.clone(),
+            }),
+            WorkspaceEvent::Finished { outcome } => {
+                self.phase = (*outcome).to_string();
+                self.stage = "finished".to_string();
+                self.current_tool = None;
+                self.terminal_outcome = Some((*outcome).to_string());
+                self.detail = terminal_activity_detail(outcome).to_string();
+                let main_status = if *outcome == "answered" {
+                    "completed"
+                } else if matches!(*outcome, "driver_error" | "failed") {
+                    "failed"
+                } else {
+                    "stopped"
+                };
+                for agent in &mut self.agents {
+                    if agent.id == "main" {
+                        agent.status = main_status.to_string();
+                        agent.detail = self.detail.clone();
+                    } else if matches!(agent.status.as_str(), "starting" | "running" | "waiting") {
+                        agent.status = "stopped".to_string();
+                        agent.detail = "The parent turn ended".to_string();
+                    }
+                }
+            }
+            WorkspaceEvent::Error { message } => {
+                self.phase = "error".to_string();
+                self.stage = "finished".to_string();
+                self.detail = message.clone();
+                self.current_tool = None;
+                self.terminal_outcome = Some("error".to_string());
+                let main = self.main_agent_mut();
+                main.status = "failed".to_string();
+                main.detail = message.clone();
+            }
+            WorkspaceEvent::MemoryCompacted { .. } => {}
+        }
+    }
+}
+
+fn terminal_activity_detail(outcome: &str) -> &'static str {
+    match outcome {
+        "answered" => "The coding turn completed",
+        "repeated" => "Stopped because the model repeated actions without making progress",
+        "step_capped" => "Stopped after reaching the step limit",
+        "aborted" | "cancelled" => "The coding turn was stopped",
+        "driver_error" | "failed" => "The model or runtime failed",
+        _ => "The coding turn ended",
+    }
+}
+
+fn now_epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 impl WorkspaceSessionState {
@@ -249,6 +506,9 @@ impl ActiveWorkspaceSession {
         if let Some(control) = self.control.lock().ok().and_then(|control| control.clone()) {
             control.cancel();
         }
+        if let Ok(mut activity) = self.activity.lock() {
+            activity.apply(&WorkspaceEvent::Finished { outcome: "aborted" });
+        }
         *status = WorkspaceSessionState::Cancelled;
         *current_turn = None;
         Ok(true)
@@ -302,6 +562,11 @@ impl ActiveWorkspaceSession {
             .control
             .lock()
             .map_err(|_| "turn control is unavailable")?;
+        let mut activity = self
+            .activity
+            .lock()
+            .map_err(|_| "activity state is unavailable")?;
+        *activity = WorkspaceActivitySnapshot::new(&run_config.goal);
         *current_turn = Some((run_config.client_message_id.clone(), run_config.turn_index));
         *event_slot = Some(events);
         *worker_slot = Some(worker);
@@ -358,8 +623,17 @@ impl ActiveWorkspaceSession {
                 TurnCompletion::Failed
             },
         );
+        if let Ok(mut activity) = self.activity.lock() {
+            activity.apply(&WorkspaceEvent::Finished { outcome: "aborted" });
+        }
         persisted?;
         Ok(finished)
+    }
+
+    fn record_activity(&self, event: &WorkspaceEvent) {
+        if let Ok(mut activity) = self.activity.lock() {
+            activity.apply(event);
+        }
     }
 }
 
@@ -446,6 +720,25 @@ struct WorkspaceSessionStatusResponse {
     semantic_retrieval: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     embedding_model_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkspaceActivityResponse {
+    id: String,
+    workspace: String,
+    model_id: String,
+    state: &'static str,
+    approval_mode: WorkspaceApprovalMode,
+    allow_network: bool,
+    mode: WorkspaceRunMode,
+    #[serde(flatten)]
+    activity: WorkspaceActivitySnapshot,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkspaceActivityEnvelope {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activity: Option<WorkspaceActivityResponse>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1379,6 +1672,7 @@ pub(super) async fn create_session(
         run_config: StdMutex::new(Some(run_config)),
         control: StdMutex::new(Some(control)),
         current_turn: StdMutex::new(Some((client_message_id.clone(), turn_index))),
+        activity: StdMutex::new(WorkspaceActivitySnapshot::new(&goal)),
     });
     arm_event_claim_deadline(&session, client_message_id);
     *active = Some(session);
@@ -1625,6 +1919,7 @@ pub(super) async fn session_events(
             let mut assistant_answer = None;
             let mut persistence_attempted = false;
             while let Ok(event) = events.recv() {
+                persist_session.record_activity(&event);
                 if let WorkspaceEvent::MemoryUpdated {
                     prompt_tokens,
                     generation_tokens,
@@ -1659,9 +1954,11 @@ pub(super) async fn session_events(
                         outcome,
                         &evidence,
                     ) {
-                        let _ = event_tx.try_send(WorkspaceEvent::Error {
+                        let activity_error = WorkspaceEvent::Error {
                             message: format!("Workspace memory could not save this turn: {error}"),
-                        });
+                        };
+                        persist_session.record_activity(&activity_error);
+                        let _ = event_tx.try_send(activity_error);
                         persist_session.finish_turn_if_current(
                             &persisted_turn.client_message_id,
                             TurnCompletion::Failed,
@@ -1720,11 +2017,12 @@ pub(super) async fn session_events(
                     forward_control.cancel();
                     break;
                 }
-                if automatic_compaction
-                    .is_some_and(|event| event_tx.try_send(event).is_err())
-                {
-                    forward_control.cancel();
-                    break;
+                if let Some(event) = automatic_compaction {
+                    persist_session.record_activity(&event);
+                    if event_tx.try_send(event).is_err() {
+                        forward_control.cancel();
+                        break;
+                    }
                 }
             }
             if !persistence_attempted {
@@ -1842,6 +2140,52 @@ pub(super) async fn session_status(
             .semantic_retriever
             .as_ref()
             .map(|retriever| retriever.model_id().to_string()),
+    })
+    .into_response()
+}
+
+/// Browser-resilient view of the one Workspace session that currently owns the
+/// runtime slot. Unlike the SSE feed, this snapshot is safe to poll and remains
+/// available after a turn settles, so a remount never has to pretend that an
+/// active or just-finished coding task does not exist.
+pub(super) async fn current_activity(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) = authorize(&state, &headers) {
+        return response;
+    }
+    let session = state.workspace_sessions.active.lock().await.clone();
+    let Some(session) = session else {
+        return Json(WorkspaceActivityEnvelope { activity: None }).into_response();
+    };
+    let state = session
+        .state
+        .lock()
+        .map(|state| state.as_str())
+        .unwrap_or("failed");
+    let activity = match session.activity.lock() {
+        Ok(activity) => activity.clone(),
+        Err(_) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "workspace_activity_unavailable",
+                "Workspace live activity is unavailable".to_string(),
+                None,
+            )
+        }
+    };
+    Json(WorkspaceActivityEnvelope {
+        activity: Some(WorkspaceActivityResponse {
+            id: session.id.clone(),
+            workspace: simplify_path(&session.workspace),
+            model_id: session.model_id.clone(),
+            state,
+            approval_mode: session.approval_mode,
+            allow_network: session.allow_network,
+            mode: session.mode,
+            activity,
+        }),
     })
     .into_response()
 }
@@ -2563,6 +2907,44 @@ mod tests {
     }
 
     #[test]
+    fn live_activity_tracks_parent_tools_children_and_terminal_reason() {
+        let mut activity = WorkspaceActivitySnapshot::new("build a graphical game");
+        activity.apply(&WorkspaceEvent::Started {
+            workspace: "C:/work".into(),
+            model_id: "model".into(),
+        });
+        activity.apply(&WorkspaceEvent::ToolCall {
+            detail: "write_file(game.py, 1200 bytes)".into(),
+        });
+        assert_eq!(activity.phase, "running");
+        assert_eq!(activity.stage, "tool");
+        assert_eq!(
+            activity.current_tool.as_deref(),
+            Some("write_file(game.py, 1200 bytes)")
+        );
+
+        activity.apply(&WorkspaceEvent::AgentUpdated {
+            agent_id: "child-runtime-id".into(),
+            parent_id: Some("main".into()),
+            label: "game-logic".into(),
+            status: "running".into(),
+            task: "implement the computer player".into(),
+            detail: "Delegated agent is working".into(),
+        });
+        assert_eq!(activity.agents.len(), 2);
+        assert_eq!(activity.agents[1].task, "implement the computer player");
+
+        activity.apply(&WorkspaceEvent::Finished {
+            outcome: "repeated",
+        });
+        assert_eq!(activity.phase, "repeated");
+        assert_eq!(activity.terminal_outcome.as_deref(), Some("repeated"));
+        assert!(activity.detail.contains("repeated actions"));
+        assert_eq!(activity.agents[0].status, "stopped");
+        assert_eq!(activity.agents[1].status, "stopped");
+    }
+
+    #[test]
     fn manager_reads_terminal_and_active_session_states_without_guessing() {
         let make_session = |state| {
             let (worker, client) = bridge(1);
@@ -2591,6 +2973,7 @@ mod tests {
                 run_config: StdMutex::new(None),
                 control: StdMutex::new(Some(control)),
                 current_turn: StdMutex::new(None),
+                activity: StdMutex::new(WorkspaceActivitySnapshot::new("test task")),
             })
         };
 
@@ -2639,6 +3022,7 @@ mod tests {
             run_config: StdMutex::new(None),
             control: StdMutex::new(Some(initial_control)),
             current_turn: StdMutex::new(None),
+            activity: StdMutex::new(WorkspaceActivitySnapshot::new("test task")),
         };
         let config = WorkspaceRunConfig {
             addr: "127.0.0.1:8181".parse().unwrap(),
@@ -2711,6 +3095,7 @@ mod tests {
             run_config: StdMutex::new(None),
             control: StdMutex::new(None),
             current_turn: StdMutex::new(Some(("message-1".into(), 0))),
+            activity: StdMutex::new(WorkspaceActivitySnapshot::new("test task")),
         };
         assert!(session.finish_turn_if_current("message-1", TurnCompletion::Idle));
         assert_eq!(
@@ -2744,6 +3129,7 @@ mod tests {
             run_config: StdMutex::new(None),
             control: StdMutex::new(None),
             current_turn: StdMutex::new(Some(("message-1".into(), 0))),
+            activity: StdMutex::new(WorkspaceActivitySnapshot::new("test task")),
         };
         let run_config = WorkspaceRunConfig {
             addr: "127.0.0.1:8181".parse().unwrap(),
@@ -2809,6 +3195,7 @@ mod tests {
                 run_config: StdMutex::new(None),
                 control: StdMutex::new(Some(stale_control)),
                 current_turn: StdMutex::new(Some(("old-message".into(), 0))),
+                activity: StdMutex::new(WorkspaceActivitySnapshot::new("test task")),
             };
             let config = WorkspaceRunConfig {
                 addr: "127.0.0.1:8181".parse().unwrap(),
@@ -2886,6 +3273,7 @@ mod tests {
             })),
             control: StdMutex::new(Some(control)),
             current_turn: StdMutex::new(Some(("message-1".into(), 0))),
+            activity: StdMutex::new(WorkspaceActivitySnapshot::new("test task")),
         };
 
         assert!(session.expire_unclaimed_turn("message-1").unwrap());

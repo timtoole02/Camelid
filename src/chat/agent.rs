@@ -180,6 +180,18 @@ pub trait Reporter {
     fn notice(&mut self, text: &str);
     fn context_budget(&mut self, _usage: ContextBudgetUsage) {}
     fn model_timing(&mut self, _metrics: ModelStepMetrics) {}
+    /// Publish one agent's live ownership/status to interactive frontends.
+    /// Non-interactive reporters deliberately ignore this by default.
+    fn agent_update(
+        &mut self,
+        _agent_id: &str,
+        _parent_id: Option<&str>,
+        _label: &str,
+        _status: &str,
+        _task: &str,
+        _detail: &str,
+    ) {
+    }
 }
 
 /// How the loop ended.
@@ -585,6 +597,39 @@ fn source_contract_findings(history: &[AgentMsg], sources: &[(String, String)]) 
     findings
 }
 
+fn subagent_report_field<'a>(report: &'a str, field: &str) -> Option<&'a str> {
+    report.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        (key.trim() == field)
+            .then(|| value.trim())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn subagent_activity_status(outcome: &ToolOutcome) -> &'static str {
+    if outcome.is_err() {
+        return "failed";
+    }
+    match subagent_report_field(outcome.text(), "status") {
+        Some("completed") => "completed",
+        Some("failed") => "failed",
+        Some("inconclusive") => "inconclusive",
+        Some("cancelled") => "cancelled",
+        _ => "running",
+    }
+}
+
+fn subagent_activity_detail(report: &str) -> &str {
+    subagent_report_field(report, "note")
+        .or_else(|| subagent_report_field(report, "wait"))
+        .unwrap_or_else(|| {
+            report
+                .lines()
+                .next()
+                .unwrap_or("Delegated agent status updated")
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_loop(
     driver: &mut dyn ModelDriver,
@@ -610,6 +655,10 @@ pub fn run_loop(
     let mut error_argument_churn = ErrorArgumentChurn::default();
     let mut total_tool_calls = 0usize;
     let mut plan_updates = 0usize;
+    // Runtime id (and the readable alias) -> (readable label, assigned task).
+    // This is presentation state only; the subagent registry remains the source
+    // of truth for execution and cancellation.
+    let mut delegated_agents: HashMap<String, (String, String)> = HashMap::new();
     let mut consecutive_edit_failures = 0usize;
     let mut force_full_rewrite = cfg.default_write_path.is_some();
     let mut ran: BTreeMap<String, usize> = BTreeMap::new();
@@ -1222,6 +1271,45 @@ pub fn run_loop(
                             ));
                         }
                     }
+                    match &action {
+                        Action::SpawnSubagent { subtask_id, goal } => reporter.agent_update(
+                            subtask_id,
+                            Some("main"),
+                            subtask_id,
+                            "starting",
+                            goal,
+                            "Preparing delegated agent",
+                        ),
+                        Action::AwaitSubagent { subtask_id, .. } => {
+                            let (label, task) = delegated_agents
+                                .get(subtask_id)
+                                .cloned()
+                                .unwrap_or_else(|| (subtask_id.clone(), String::new()));
+                            reporter.agent_update(
+                                subtask_id,
+                                Some("main"),
+                                &label,
+                                "running",
+                                &task,
+                                "Parent is waiting for this agent's result",
+                            );
+                        }
+                        Action::CheckSubagentStatus { subtask_id } => {
+                            let (label, task) = delegated_agents
+                                .get(subtask_id)
+                                .cloned()
+                                .unwrap_or_else(|| (subtask_id.clone(), String::new()));
+                            reporter.agent_update(
+                                subtask_id,
+                                Some("main"),
+                                &label,
+                                "running",
+                                &task,
+                                "Checking delegated progress",
+                            );
+                        }
+                        _ => {}
+                    }
                     reporter.tool_call(&action.call_line(sandbox));
 
                     // Consult the approval policy for the effective tier — the one
@@ -1326,6 +1414,53 @@ pub fn run_loop(
                     }
                     let name = action.tool_name();
                     reporter.tool_result(name, &outcome);
+                    match &action {
+                        Action::SpawnSubagent { subtask_id, goal } => {
+                            if outcome.is_err() {
+                                reporter.agent_update(
+                                    subtask_id,
+                                    Some("main"),
+                                    subtask_id,
+                                    "failed",
+                                    goal,
+                                    outcome.text(),
+                                );
+                            } else {
+                                let runtime_id =
+                                    subagent_report_field(outcome.text(), "subtask_id")
+                                        .unwrap_or(subtask_id)
+                                        .to_string();
+                                let entry = (subtask_id.clone(), goal.clone());
+                                delegated_agents.insert(subtask_id.clone(), entry.clone());
+                                delegated_agents.insert(runtime_id.clone(), entry);
+                                reporter.agent_update(
+                                    &runtime_id,
+                                    Some("main"),
+                                    subtask_id,
+                                    "running",
+                                    goal,
+                                    "Delegated agent is working",
+                                );
+                            }
+                        }
+                        Action::AwaitSubagent { subtask_id, .. }
+                        | Action::CheckSubagentStatus { subtask_id } => {
+                            let (label, task) = delegated_agents
+                                .get(subtask_id)
+                                .cloned()
+                                .unwrap_or_else(|| (subtask_id.clone(), String::new()));
+                            let status = subagent_activity_status(&outcome);
+                            reporter.agent_update(
+                                subtask_id,
+                                Some("main"),
+                                &label,
+                                status,
+                                &task,
+                                subagent_activity_detail(outcome.text()),
+                            );
+                        }
+                        _ => {}
+                    }
                     if !outcome.is_err() && matches!(&action, Action::UpdatePlan { .. }) {
                         plan_updates = plan_updates.saturating_add(1);
                         if plan_updates >= MAX_PLAN_UPDATES_PER_RUN {

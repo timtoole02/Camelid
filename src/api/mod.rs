@@ -2504,6 +2504,10 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
         )
         .route("/api/agent/workspace/browse", get(workspace::browse))
         .route(
+            "/api/agent/workspace/activity",
+            get(workspace::current_activity),
+        )
+        .route(
             "/api/agent/workspace/sessions",
             post(workspace::create_session),
         )

@@ -160,6 +160,24 @@ async fn code_history_requires_same_origin_browser_provenance() {
 }
 
 #[tokio::test]
+async fn live_workspace_activity_is_same_origin_and_empty_without_a_session() {
+    let app = camelid::api::router();
+    let response = app
+        .clone()
+        .oneshot(workspace_get("/api/agent/workspace/activity", false))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let response = app
+        .oneshot(workspace_get("/api/agent/workspace/activity", true))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_json(response).await, json!({}));
+}
+
+#[tokio::test]
 async fn workspace_decision_for_an_unknown_session_is_typed_not_found() {
     let app = camelid::api::router();
     let response = app

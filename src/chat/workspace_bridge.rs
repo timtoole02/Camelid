@@ -286,6 +286,15 @@ pub(crate) enum WorkspaceEvent {
         outcome: &'static str,
         content: String,
     },
+    #[serde(rename = "agent.updated")]
+    AgentUpdated {
+        agent_id: String,
+        parent_id: Option<String>,
+        label: String,
+        status: String,
+        task: String,
+        detail: String,
+    },
     #[serde(rename = "session.notice")]
     Notice { content: String },
     #[serde(rename = "session.finished")]
@@ -545,6 +554,25 @@ impl Reporter for WorkspaceReporter {
             output_tokens: metrics.output_tokens,
         });
     }
+
+    fn agent_update(
+        &mut self,
+        agent_id: &str,
+        parent_id: Option<&str>,
+        label: &str,
+        status: &str,
+        task: &str,
+        detail: &str,
+    ) {
+        self.send(WorkspaceEvent::AgentUpdated {
+            agent_id: agent_id.to_string(),
+            parent_id: parent_id.map(str::to_string),
+            label: label.to_string(),
+            status: status.to_string(),
+            task: task.to_string(),
+            detail: detail.to_string(),
+        });
+    }
 }
 
 pub(crate) struct WorkspaceApprover {
@@ -674,6 +702,14 @@ pub(crate) fn run_live(
             return Err(message);
         }
     };
+    worker.reporter.send(WorkspaceEvent::AgentUpdated {
+        agent_id: "main".to_string(),
+        parent_id: None,
+        label: "Camelid".to_string(),
+        status: "running".to_string(),
+        task: config.goal.clone(),
+        detail: "Preparing the first model step".to_string(),
+    });
     worker.reporter.send(WorkspaceEvent::Started {
         workspace: sandbox.root_display(),
         model_id: config.model_id.clone(),

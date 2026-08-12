@@ -5,6 +5,7 @@ import {
   createWorkspaceSession,
   decideWorkspaceApproval,
   getWorkspaceChanges,
+  getWorkspaceActivity,
   getWorkspaceThread,
   getWorkspaceThreads,
   reduceCodeEvent,
@@ -61,6 +62,7 @@ const DETACHED_FOLLOW_TIMEOUT_MS = 30 * 60 * 1000
 const DETACHED_FOLLOW_POLL_MS = 1500
 /// Tail of the in-flight model output kept on screen while a step streams.
 const LIVE_TAIL_CHARS = 2000
+const SERVER_ACTIVE_STATES = new Set(['waiting_for_events', 'running', 'cancelling'])
 
 const EMPTY_CHANGES = Object.freeze({
   summary: 'No checkpoints this session',
@@ -221,6 +223,23 @@ function PlanUpdate({ content }) {
   )
 }
 
+function LiveActivitySummary({ activity, running }) {
+  if (!activity) return null
+  const tokenText = Number.isFinite(activity.output_tokens)
+    ? `${activity.output_tokens} tokens in the latest model step`
+    : null
+  return (
+    <article className={`code-live-summary ${running ? 'is-running' : 'is-terminal'}`} role="status">
+      <span className="code-live-summary__pulse">{running ? <span className="code-live-dot" /> : <IconCheckCircle size={15} />}</span>
+      <div>
+        <strong>{running ? 'Current activity' : (PHASE_LABEL[activity.phase] || 'Last activity')}</strong>
+        <p>{activity.detail || 'Waiting for the next agent update'}</p>
+        <small>{[activity.stage ? formatToolName(activity.stage) : null, tokenText].filter(Boolean).join(' · ')}</small>
+      </div>
+    </article>
+  )
+}
+
 function ActivityEvent({ event, pairedResult, activeApproval, decisionBusy, onDecision }) {
   if (event.event === 'turn.user') {
     return <article className="code-message code-message--user">{event.content}</article>
@@ -335,6 +354,8 @@ function ActivityEvent({ event, pairedResult, activeApproval, decisionBusy, onDe
 }
 
 function CodeInspector({
+  activity,
+  agents,
   approvalMode,
   allowNetwork,
   changes,
@@ -377,7 +398,12 @@ function CodeInspector({
 
       <section className="code-inspector__section">
         <div className="code-inspector__section-head"><h3>Active work</h3></div>
-        {running && latestTool ? (
+        {activity ? (
+          <div className={`code-process-row ${running ? 'is-running' : ''}`}>
+            {running ? <span className="code-live-dot" /> : <IconCheckCircle size={15} />}
+            <div><strong>{activity.stage ? formatToolName(activity.stage) : (running ? 'Working' : 'Finished')}</strong><small>{activity.detail || 'Waiting for an update'}</small></div>
+          </div>
+        ) : running && latestTool ? (
           <div className="code-process-row is-running">
             <span className="code-live-dot" />
             <div><strong>{toolCallLabel(latestTool.detail)}</strong><small>{String(latestTool.detail || '').slice(0, 110)}</small></div>
@@ -388,6 +414,25 @@ function CodeInspector({
             <div><strong>{formatToolName(latestResult.tool)}</strong><small>Last tool completed</small></div>
           </div>
         ) : <p className="code-inspector__empty">No active tool or command.</p>}
+      </section>
+
+      <section className="code-inspector__section">
+        <div className="code-inspector__section-head"><h3>Agents <span>{agents.length}</span></h3></div>
+        {agents.length ? (
+          <ul className="code-agent-list">
+            {agents.map((agent) => (
+              <li key={agent.id} className={`is-${agent.status || 'running'}`}>
+                <span className="code-agent-list__status"><span /></span>
+                <div>
+                  <strong>{agent.id === 'main' ? 'Primary agent' : agent.label}</strong>
+                  <small className="code-agent-list__state">{formatToolName(agent.status || 'running')}</small>
+                  <p>{agent.task || 'No scoped task reported'}</p>
+                  {agent.detail ? <small>{agent.detail}</small> : null}
+                </div>
+              </li>
+            ))}
+          </ul>
+        ) : <p className="code-inspector__empty">Agents will appear when a coding task starts.</p>}
       </section>
 
       <section className="code-inspector__section">
@@ -446,6 +491,7 @@ export default function CodeWorkspace({
   // Identifies the create request a Stop can abandon while it is still in
   // flight — before there is any session id to cancel.
   const pendingStartRef = useRef(null)
+  const activityRecoverySuppressedRef = useRef(false)
   const threadRef = useRef(null)
   const accessMenuRef = useRef(null)
   const stickToBottomRef = useRef(true)
@@ -484,6 +530,8 @@ export default function CodeWorkspace({
   )
   const latestTool = state.latestTool
   const latestResult = state.latestResult
+  const activity = state.liveActivity
+  const agents = state.agents || []
   const feedEvents = useMemo(() => groupActivityEvents(state.events), [state.events])
   // Gated on `selectedThreadId` so a cleared session stops borrowing the title
   // of the rail entry App is still holding.
@@ -491,6 +539,7 @@ export default function CodeWorkspace({
     ? savedThreads.find((thread) => thread.id === selectedThreadId) || requestedThread || null
     : null
   const title = selectedThread?.title
+    || activity?.task?.slice(0, 72)
     || state.turns.find((turn) => turn.user)?.user?.slice(0, 72)
     || 'New coding session'
   const elapsed = startedAt ? formatElapsed(clock - startedAt) : ''
@@ -502,6 +551,52 @@ export default function CodeWorkspace({
   useEffect(() => {
     if (workspacePath) window.localStorage.setItem('camelid.codeWorkspacePath', workspacePath)
   }, [workspacePath])
+
+  // SSE is the rich transcript, but this backend-owned snapshot is the durable
+  // truth for "what is it doing right now?". It lets a remounted Code page
+  // recover the active task instead of displaying an unrelated blank composer.
+  useEffect(() => {
+    const controller = new AbortController()
+    let polling = false
+    const refreshActivity = async () => {
+      if (polling) return
+      polling = true
+      try {
+        const next = await getWorkspaceActivity(apiBase, { signal: controller.signal })
+        if (!next || next.mode !== 'code') return
+        const current = sessionRef.current
+        const sameSession = current?.id === next.id
+        const liveSession = SERVER_ACTIVE_STATES.has(next.state)
+        if (!sameSession && (!liveSession || activityRecoverySuppressedRef.current)) return
+        dispatch({ event: 'activity.snapshot', activity: next })
+        if (!current && liveSession) {
+          sessionRef.current = next
+          setSession(next)
+          setWorkspacePath(next.workspace || '')
+          setSelectedThreadId(next.id)
+          setApprovalMode(next.approval_mode || 'approval_gated')
+          setAllowNetwork(Boolean(next.allow_network))
+          setStartedAt(Number(next.started_at_ms) || Date.now())
+          setClock(Date.now())
+          getWorkspaceChanges(apiBase, next.id).then(setChanges).catch(() => {})
+        }
+      } catch (error) {
+        if (error?.name !== 'AbortError') {
+          // The live event stream remains authoritative while this optional
+          // recovery poll is unavailable; do not turn a transient poll failure
+          // into a fake session failure.
+        }
+      } finally {
+        polling = false
+      }
+    }
+    refreshActivity()
+    const timer = window.setInterval(refreshActivity, 1000)
+    return () => {
+      controller.abort()
+      window.clearInterval(timer)
+    }
+  }, [apiBase])
 
   useEffect(() => {
     window.localStorage.setItem('camelid.codeInspectorOpen', String(inspectorOpen))
@@ -716,9 +811,10 @@ export default function CodeWorkspace({
 
   const start = async () => {
     if (!canStart) return
+    activityRecoverySuppressedRef.current = false
     const pending = { abandoned: false }
     pendingStartRef.current = pending
-    dispatch({ event: 'session.starting' })
+    dispatch({ event: 'session.starting', task: goal.trim() })
     setStartedAt(Date.now())
     setClock(Date.now())
     try {
@@ -763,7 +859,7 @@ export default function CodeWorkspace({
   const sendFollowUp = async () => {
     const text = followUp.trim()
     if (!session || !text || running) return
-    dispatch({ event: 'turn.starting' })
+    dispatch({ event: 'turn.starting', task: text })
     setStartedAt(Date.now())
     setClock(Date.now())
     try {
@@ -838,6 +934,7 @@ export default function CodeWorkspace({
   }
 
   const reset = async () => {
+    activityRecoverySuppressedRef.current = true
     if (session) {
       try { await cancelWorkspaceSession(apiBase, session.id) } catch {}
     }
@@ -846,6 +943,7 @@ export default function CodeWorkspace({
       eventSourceRef.current.close()
     }
     eventSourceRef.current = null
+    sessionRef.current = null
     setSession(null)
     setSelectedThreadId('')
     setGoal('')
@@ -885,7 +983,7 @@ export default function CodeWorkspace({
   }
 
   const status = stopPending ? 'Stopping' : PHASE_LABEL[state.phase] || state.phase
-  const empty = !historicalTurns.length && !state.events.length
+  const empty = !historicalTurns.length && !state.events.length && !activity?.task
 
   return (
     <div className={`code-workbench ${inspectorOpen ? '' : 'is-inspector-closed'}`}>
@@ -928,6 +1026,7 @@ export default function CodeWorkspace({
             </div>
           ) : (
             <div className="code-feed">
+              <LiveActivitySummary activity={activity} running={running} />
               {historicalTurns.map((turn, index) => <HistoricalTurn turn={turn} key={`history-${index}-${turn.user}`} />)}
               {feedEvents.map((entry) => (
                 <ActivityEvent
@@ -1074,6 +1173,8 @@ export default function CodeWorkspace({
 
       {inspectorOpen ? (
         <CodeInspector
+          activity={activity}
+          agents={agents}
           approvalMode={session?.approval_mode || approvalMode}
           allowNetwork={session?.allow_network ?? allowNetwork}
           changes={changes}

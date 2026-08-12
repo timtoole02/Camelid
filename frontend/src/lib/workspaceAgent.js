@@ -25,6 +25,8 @@ export const WORKSPACE_IDLE_STATE = Object.freeze({
   // Maintained here so the view never has to scan the event list on render.
   latestTool: null,
   latestResult: null,
+  liveActivity: null,
+  agents: [],
 })
 
 function appendActivity(events, event) {
@@ -52,14 +54,49 @@ function reduceAgentEvent(state, envelope, allowApprovals) {
       totalTurns: Math.max(turns.length, Number(envelope.turnCount || 0)),
       // A restore replaces the event list, so every restored turn is history.
       liveTurns: 0,
+      liveActivity: null,
+      agents: [],
       error: '',
     }
   }
-  if (event === 'session.starting') return { ...state, phase: 'starting', error: '', approval: null }
-  if (event === 'turn.starting') return { ...state, phase: 'starting', error: '', approval: null }
-  if (event === 'turn.stopping') return { ...state, phase: 'cancelling', error: '' }
+  if (event === 'session.starting' || event === 'turn.starting') {
+    const task = String(envelope.task || '')
+    const activity = {
+      phase: 'starting',
+      stage: 'starting',
+      detail: 'Starting coding session',
+      task,
+      started_at_ms: Date.now(),
+      updated_at_ms: Date.now(),
+      agents: [{ id: 'main', parent_id: null, label: 'Camelid', status: 'starting', task, detail: 'Preparing the coding session' }],
+    }
+    return { ...state, phase: 'starting', error: '', approval: null, liveActivity: activity, agents: activity.agents }
+  }
+  if (event === 'turn.stopping') {
+    const liveActivity = state.liveActivity
+      ? { ...state.liveActivity, phase: 'cancelling', stage: 'stopping', detail: 'Stopping the active coding turn', updated_at_ms: Date.now() }
+      : null
+    return { ...state, phase: 'cancelling', liveActivity, error: '' }
+  }
   if (event === 'turn.stop_failed') {
-    return { ...state, phase: 'cancel_error', error: String(envelope.message || 'Workspace could not confirm that the turn stopped.') }
+    const message = String(envelope.message || 'Workspace could not confirm that the turn stopped.')
+    const liveActivity = state.liveActivity
+      ? { ...state.liveActivity, phase: 'cancel_error', stage: 'warning', detail: message, updated_at_ms: Date.now() }
+      : null
+    return { ...state, phase: 'cancel_error', liveActivity, error: message }
+  }
+  if (event === 'activity.snapshot') {
+    const activity = envelope.activity || null
+    if (!activity) return state
+    if (state.liveActivity?.updated_at_ms === activity.updated_at_ms
+      && state.liveActivity?.phase === activity.phase) return state
+    return {
+      ...state,
+      phase: String(activity.phase || state.phase || 'idle'),
+      liveActivity: activity,
+      agents: Array.isArray(activity.agents) ? activity.agents : state.agents,
+      error: activity.phase === 'error' ? String(activity.detail || 'Workspace stopped.') : state.error,
+    }
   }
   const eventSeq = (state.eventSeq || 0) + 1
   const arrival = { ...envelope, uid: eventSeq }
@@ -96,6 +133,7 @@ function reduceAgentEvent(state, envelope, allowApprovals) {
       ...state,
       phase: state.phase === 'cancel_error' ? state.phase : 'running',
       events: events.slice(-MAX_WORKSPACE_ACTIVITY_EVENTS),
+      liveActivity: advanceLiveActivity(state.liveActivity, envelope),
       // A merged delta reuses the tail entry's identity; only a new one consumes.
       eventSeq: merged ? (state.eventSeq || 0) : eventSeq,
     }
@@ -119,7 +157,14 @@ function reduceAgentEvent(state, envelope, allowApprovals) {
     }
   }
   // Every branch below keeps the appended event, so they share one base.
-  const appended = { ...state, events, turns, eventSeq, liveTurns }
+  const appended = {
+    ...state,
+    events,
+    turns,
+    eventSeq,
+    liveTurns,
+    liveActivity: advanceLiveActivity(state.liveActivity, envelope),
+  }
 
   if (event === 'approval.required') {
     if (allowApprovals) {
@@ -128,20 +173,46 @@ function reduceAgentEvent(state, envelope, allowApprovals) {
     return { ...appended, phase: 'error', error: 'Read-only Workspace received an unexpected approval request.' }
   }
   if (event === 'approval.resolved') {
-    return { ...state, phase: 'running', approval: null, error: '' }
+    return { ...appended, phase: 'running', approval: null, error: '' }
   }
   if (event === 'tool.result') {
     return { ...appended, phase: state.phase === 'cancel_error' ? state.phase : 'running', approval: null }
+  }
+  if (event === 'agent.updated') {
+    const incoming = {
+      id: String(envelope.agent_id || 'agent'),
+      parent_id: envelope.parent_id || null,
+      label: String(envelope.label || envelope.agent_id || 'Agent'),
+      status: String(envelope.status || 'running'),
+      task: String(envelope.task || ''),
+      detail: String(envelope.detail || ''),
+    }
+    const agents = [...(state.agents || [])]
+    const index = agents.findIndex((agent) => agent.id === incoming.id
+      || (agent.parent_id && incoming.parent_id && agent.label === incoming.label))
+    if (index === -1) agents.push(incoming)
+    else agents[index] = { ...agents[index], ...incoming, task: incoming.task || agents[index].task }
+    return { ...appended, agents }
   }
   if (event === 'session.finished') {
     if (envelope.outcome !== 'answered' && turns.length) {
       turns = [...turns]
       turns[turns.length - 1] = { ...turns.at(-1), outcome: envelope.outcome }
     }
-    return { ...appended, turns, phase: envelope.outcome === 'answered' ? 'finished' : envelope.outcome, approval: null }
+    const terminalStatus = envelope.outcome === 'answered' ? 'completed' : 'stopped'
+    const agents = (state.agents || []).map((agent) => ({
+      ...agent,
+      status: ['starting', 'running', 'waiting'].includes(agent.status) ? terminalStatus : agent.status,
+      detail: agent.id === 'main' ? terminalActivityDetail(envelope.outcome) : agent.detail,
+    }))
+    return { ...appended, turns, agents, phase: envelope.outcome === 'answered' ? 'finished' : envelope.outcome, approval: null }
   }
   if (event === 'session.error') {
-    return { ...appended, phase: 'error', error: String(envelope.message || 'Workspace stopped.') }
+    const agents = (state.agents || []).map((agent) => ({
+      ...agent,
+      status: ['starting', 'running', 'waiting'].includes(agent.status) ? 'failed' : agent.status,
+    }))
+    return { ...appended, agents, phase: 'error', error: String(envelope.message || 'Workspace stopped.') }
   }
   return {
     ...appended,
@@ -181,6 +252,88 @@ export function reduceCodeEvent(state, envelope) {
 export function workspaceEndpoint(apiBase, suffix = '') {
   const base = String(apiBase || '').replace(/\/$/, '')
   return `${base}/api/agent/workspace/sessions${suffix}`
+}
+
+function formatActivityTool(tool) {
+  return String(tool || 'tool').replaceAll('_', ' ')
+}
+
+function terminalActivityDetail(outcome) {
+  if (outcome === 'answered') return 'The coding turn completed'
+  if (outcome === 'repeated') return 'Stopped because the model repeated actions without making progress'
+  if (outcome === 'step_capped') return 'Stopped after reaching the step limit'
+  if (outcome === 'aborted' || outcome === 'cancelled') return 'The coding turn was stopped'
+  if (outcome === 'driver_error' || outcome === 'failed') return 'The model or runtime failed'
+  return 'The coding turn ended'
+}
+
+function advanceLiveActivity(current, envelope) {
+  if (!current || !envelope?.event) return current
+  const next = { ...current, updated_at_ms: Date.now() }
+  const event = envelope.event
+  if (event === 'session.started') {
+    Object.assign(next, { phase: 'running', stage: 'starting', detail: 'Preparing the model and workspace tools' })
+  } else if (event === 'turn.started') {
+    Object.assign(next, { phase: 'running', stage: 'context', detail: 'Building the model context' })
+  } else if (event === 'memory.updated') {
+    Object.assign(next, {
+      phase: 'running',
+      stage: 'context',
+      detail: `Prepared ${envelope.prompt_tokens || 0} prompt tokens inside a ${envelope.budget_total || 0}-token context`,
+    })
+  } else if (event === 'model.delta') {
+    Object.assign(next, { phase: 'running', stage: 'generating', detail: 'The model is generating its next action', current_tool: null })
+  } else if (event === 'model.timing') {
+    Object.assign(next, {
+      output_tokens: Number.isFinite(envelope.output_tokens) ? envelope.output_tokens : next.output_tokens,
+      detail: Number.isFinite(envelope.output_tokens)
+        ? `The model finished a ${envelope.output_tokens}-token generation step`
+        : 'The model finished a generation step',
+    })
+  } else if (event === 'model.answer') {
+    Object.assign(next, { phase: 'running', stage: 'finishing', detail: 'Reviewing and saving the final answer', current_tool: null })
+  } else if (event === 'tool.call') {
+    Object.assign(next, { phase: 'running', stage: 'tool', detail: String(envelope.detail || 'Running a tool'), current_tool: envelope.detail || null })
+  } else if (event === 'tool.result') {
+    Object.assign(next, {
+      phase: 'running',
+      stage: 'tool_result',
+      detail: `${formatActivityTool(envelope.tool)} ${envelope.outcome === 'error' ? 'failed' : 'completed'}`,
+      current_tool: null,
+    })
+  } else if (event === 'approval.required') {
+    Object.assign(next, { phase: 'awaiting_approval', stage: 'approval', detail: `Waiting for approval to run ${formatActivityTool(envelope.tool)}` })
+  } else if (event === 'approval.resolved') {
+    Object.assign(next, { phase: 'running', stage: 'approval', detail: 'Approval received; resuming the agent' })
+  } else if (event === 'session.notice') {
+    next.detail = String(envelope.content || next.detail)
+  } else if (event === 'agent.updated' && envelope.agent_id === 'main') {
+    if (envelope.task) next.task = String(envelope.task)
+    if (envelope.detail) next.detail = String(envelope.detail)
+  } else if (event === 'session.finished') {
+    Object.assign(next, {
+      phase: String(envelope.outcome || 'finished'),
+      stage: 'finished',
+      current_tool: null,
+      terminal_outcome: String(envelope.outcome || 'finished'),
+      detail: terminalActivityDetail(envelope.outcome),
+    })
+  } else if (event === 'session.error') {
+    Object.assign(next, { phase: 'error', stage: 'finished', current_tool: null, terminal_outcome: 'error', detail: String(envelope.message || 'Workspace stopped.') })
+  }
+  return next
+}
+
+export function workspaceActivityEndpoint(apiBase) {
+  const base = String(apiBase || '').replace(/\/$/, '')
+  return `${base}/api/agent/workspace/activity`
+}
+
+export async function getWorkspaceActivity(apiBase, { signal } = {}) {
+  const response = await fetch(workspaceActivityEndpoint(apiBase), { signal })
+  if (!response.ok) throw new Error(await readError(response, `Workspace activity failed (${response.status}).`))
+  const payload = await response.json()
+  return payload?.activity || null
 }
 
 export function workspaceModelsEndpoint(apiBase) {

@@ -111,6 +111,8 @@ try {
         if (this.stream > 1) return this.followUpTurn()
         this.emitAfter(20, { sequence: 1, event: 'session.started', workspace: 'C:/projects/camelid-demo', model_id: 'Qwen3-4B-Q4_K_M.gguf' })
         this.emitAfter(40, { sequence: 2, event: 'turn.started', turn_index: 0 })
+        this.emitAfter(45, { sequence: 3, event: 'agent.updated', agent_id: 'main', parent_id: null, label: 'Camelid', status: 'running', task: 'Build an interactive coding agent experience', detail: 'Inspecting the workspace' })
+        this.emitAfter(50, { sequence: 4, event: 'agent.updated', agent_id: 'child-ui', parent_id: 'main', label: 'ui-specialist', status: 'running', task: 'Implement the right-side agent activity panel', detail: 'Delegated agent is working' })
         this.emitAfter(70, { sequence: 3, event: 'model.delta', content: 'I will inspect the existing component before changing it.' })
         // Qwen/Hermes models stream their tool call as ordinary tokens. It is
         // syntax, not prose, and must never reach the visible transcript.
@@ -200,6 +202,7 @@ try {
     if (url.endsWith('/api/models/catalog/downloads')) return respondJson(request, [])
     if (url.endsWith('/api/models/current')) return respondJson(request, currentModel)
     if (url.endsWith('/api/models/local')) return respondJson(request, localModels)
+    if (url.endsWith('/api/agent/workspace/activity')) return respondJson(request, { activity: null })
     if (url.includes('/api/agent/workspace/threads/recent?')) return respondJson(request, { threads: railThreads })
     if (url.includes('/api/agent/workspace/threads?')) return respondJson(request, { threads: [] })
     if (url.endsWith('/api/agent/workspace/sessions/code-workbench-smoke/messages')) {
@@ -262,6 +265,7 @@ try {
     hasStepChip: [...document.querySelectorAll('.code-composer__chips > span')].some((node) => node.textContent.includes('steps')),
     hasApproval: Boolean(document.querySelector('.code-inline-approval.is-pending')),
     hasInspector: Boolean(document.querySelector('.code-inspector')),
+    agents: [...document.querySelectorAll('.code-agent-list li')].map((node) => node.textContent.replace(/\s+/g, ' ').trim()),
     hasComposer: Boolean(document.querySelector('.code-composer')),
     rects: Object.fromEntries(['.code-workbench', '.code-stage', '.code-thread', '.code-composer-shell', '.code-inspector', '.code-inline-approval'].map((selector) => {
       const node = document.querySelector(selector)
@@ -285,6 +289,9 @@ try {
     || !pendingState.hasToolCard
     || !pendingState.hasApproval
     || !pendingState.hasInspector
+    || pendingState.agents.length !== 2
+    || !pendingState.agents.some((agent) => agent.includes('Primary agent'))
+    || !pendingState.agents.some((agent) => agent.includes('right-side agent activity panel'))
     || !pendingState.hasComposer
     || !pendingState.planText?.includes('Working on: Build the interactive agent component')
     || !pendingState.planText?.includes('Run focused regression tests')
