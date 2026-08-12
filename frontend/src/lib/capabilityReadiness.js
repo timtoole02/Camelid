@@ -5,6 +5,7 @@
 
 export const READINESS = {
   SUPPORTED_EXACT_ROW: 'supported-exact-row',
+  RUNNABLE_VARIANCE: 'runnable-variance',
   ACTIVE_VALIDATION: 'active-validation',
   CPU_ONLY: 'cpu-only',
   GPU_EXPERIMENTAL: 'gpu-experimental',
@@ -17,6 +18,7 @@ export const READINESS = {
 
 export const READINESS_LABELS = {
   [READINESS.SUPPORTED_EXACT_ROW]: 'Supported exact row',
+  [READINESS.RUNNABLE_VARIANCE]: 'Runnable with reference variance',
   [READINESS.ACTIVE_VALIDATION]: 'Active validation',
   [READINESS.CPU_ONLY]: 'CPU only',
   [READINESS.GPU_EXPERIMENTAL]: 'GPU experimental',
@@ -45,6 +47,7 @@ export function classifyCapabilityRow(row) {
     if (perf.includes('cpu_only') || generation.includes('cpu_only')) return READINESS.CPU_ONLY
     return READINESS.SUPPORTED_EXACT_ROW
   }
+  if (status === 'runnable_exact_row_numerical_variance') return READINESS.RUNNABLE_VARIANCE
   if (status.startsWith('active_validation')) return READINESS.ACTIVE_VALIDATION
   if (status.startsWith('planned')) return READINESS.PLANNED
   if (status.startsWith('blocked') || (row.full_support_status || '').toString().startsWith('blocked')) {

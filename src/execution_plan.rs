@@ -893,8 +893,24 @@ pub fn plan_for_model_with_platform_and_env(
             "unknown_or_unvalidated".into()
         };
     }
+    if is_phi3_mini_4k_exact_row(&row) {
+        support_level = if phi3_selected_lane_supported(
+            &profile,
+            &platform,
+            model_path,
+            gguf,
+            &quant_type,
+            selected_backend,
+            prefill_path,
+            decode_path,
+        ) {
+            "supported_exact_row_smoke".into()
+        } else {
+            "unknown_or_unvalidated".into()
+        };
+    }
     // Preserve the stable reason ordering (profile, row, quant, support, lane)
-    // even though LFM support can only be decided after lane selection.
+    // even though platform-scoped support can only be decided after lane selection.
     reasons.insert(3, format!("support_level={support_level}"));
 
     let plan = ExecutionPlan {
@@ -1947,7 +1963,9 @@ fn support_level(row: &str, quant_type: &str) -> String {
     let level = recognized_row_level(row);
     if matches!(
         level,
-        "recognized_prism_bonsai_exact_row" | "recognized_lfm2_5_2_6b_exact_row"
+        "recognized_prism_bonsai_exact_row"
+            | "recognized_lfm2_5_2_6b_exact_row"
+            | "recognized_phi3_mini_4k_exact_row"
     ) {
         "unknown_or_unvalidated".into()
     } else {
@@ -1962,6 +1980,15 @@ fn is_lfm2_5_2_6b_exact_row(row: &str) -> bool {
     let normalized = normalize_row(row);
     let stem = normalized.strip_suffix("_gguf").unwrap_or(&normalized);
     matches!(stem, "lfm2_5_2_6b" | "lfm2_5_2_6b_q8_0")
+}
+
+/// Exact public Phi-3 Mini 4K Instruct row recognition. `general.name` in the
+/// certified GGUF is only `Phi3`, so recognition must be anchored to the narrow
+/// catalog filename rather than widening to every model with a phi3 header.
+fn is_phi3_mini_4k_exact_row(row: &str) -> bool {
+    let normalized = normalize_row(row);
+    let stem = normalized.strip_suffix("_gguf").unwrap_or(&normalized);
+    stem == "phi_3_mini_4k_instruct_q8_0" || stem == "phi3_mini_4k_instruct_q8_0"
 }
 
 /// Whether the selected execution plan is one of the two receipted LFM lanes.
@@ -2004,6 +2031,33 @@ fn lfm2_selected_lane_supported(
         && decode_path == "lfm2_metal_resident_decode";
 
     windows_runnable_cpu || exact_m4_resident_metal
+}
+
+/// Windows x86_64 exact-row lane that cleared Phi-3's stale head-dimension hold.
+/// The current receipt covers the conservative CPU reference prefill/decode path;
+/// other platforms and a future optimized route remain recognition-only until
+/// independently re-run.
+#[allow(clippy::too_many_arguments)]
+fn phi3_selected_lane_supported(
+    profile: &ExecutionProfile,
+    platform: &PlanPlatform,
+    model_path: &Path,
+    gguf: &GgufFile,
+    quant_type: &str,
+    selected_backend: &str,
+    prefill_path: &str,
+    decode_path: &str,
+) -> bool {
+    !matches!(profile, ExecutionProfile::Safe)
+        && platform.operating_system == "windows"
+        && platform.architecture == "x86_64"
+        && gguf.architecture() == Some("phi3")
+        && quant_type == "Q8_0"
+        && model_path.file_name().and_then(|name| name.to_str())
+            == Some("Phi-3-mini-4k-instruct-Q8_0.gguf")
+        && selected_backend == "cpu_reference"
+        && prefill_path == "safe_cpu_prefill"
+        && decode_path == "safe_cpu_decode"
 }
 
 /// Quant certified for one exact Prism/Bonsai artifact name. Exact normalized
@@ -2086,6 +2140,11 @@ fn recognized_row_level(row: &str) -> &'static str {
         // `is_supported_exact_q8_row` rejects runnable-only architectures
         // before consulting this table.
         "recognized_lfm2_5_2_6b_exact_row"
+    } else if is_phi3_mini_4k_exact_row(row) {
+        // Recognition only. Windows x86_64 promotes this marker after route
+        // selection; the marker itself is platform-blind and therefore never a
+        // support claim.
+        "recognized_phi3_mini_4k_exact_row"
     } else if normalized.contains("ornith_1_0_9b") {
         // Ornith-1.0-9B (qwen35 hybrid gated-delta-net), certified on the
         // runnable serve lane. `/api/capabilities` has carried
@@ -2442,7 +2501,7 @@ pub(crate) fn lfm2_metal_plan_selectable() -> bool {
 /// The promotion receipts cover the normal runnable profile, not Safe (or an
 /// invalid profile that resolves to Safe). API/catalog host classification uses
 /// this same parser so it cannot disagree with the stored execution plan.
-pub(crate) fn lfm2_supported_profile_selected() -> bool {
+pub(crate) fn supported_profile_selected() -> bool {
     !matches!(requested_profile().0, ExecutionProfile::Safe)
 }
 
@@ -3030,6 +3089,24 @@ mod tests {
         )
     }
 
+    fn phi3_q8_fixture() -> GgufFile {
+        let mut gguf = quant_fixture("Phi3", None, &[GgufTensorType::Q8_0, GgufTensorType::F32]);
+        gguf.metadata.insert(
+            "general.architecture".into(),
+            GgufMetadataValue::String("phi3".into()),
+        );
+        gguf
+    }
+
+    fn phi3_plan(filename: &str, platform: PlanPlatform) -> ExecutionPlanOutcome {
+        plan_for_model_with_platform(
+            &PathBuf::from(format!("/models/{filename}")),
+            &phi3_q8_fixture(),
+            Some(8),
+            platform,
+        )
+    }
+
     #[test]
     fn lfm2_support_level_is_limited_to_the_two_receipted_execution_lanes() {
         let _guard = env_lock();
@@ -3136,6 +3213,54 @@ mod tests {
             "a general.name match cannot promote a renamed artifact"
         );
 
+        clear_profile_env();
+    }
+
+    #[test]
+    fn phi3_mini_q8_support_is_exact_and_windows_only() {
+        let _guard = env_lock();
+        clear_profile_env();
+
+        let windows = phi3_plan(
+            "Phi-3-mini-4k-instruct-Q8_0.gguf",
+            platform("windows", "x86_64", &["avx2"]),
+        );
+        assert_eq!(
+            windows.plan.exact_model_row,
+            "Phi-3-mini-4k-instruct-Q8_0.gguf"
+        );
+        assert_eq!(windows.plan.selected_backend, "cpu_reference");
+        assert_eq!(windows.plan.prefill_path, "safe_cpu_prefill");
+        assert_eq!(windows.plan.decode_path, "safe_cpu_decode");
+        assert_eq!(windows.plan.support_level, "supported_exact_row_smoke");
+
+        for other in [
+            phi3_plan(
+                "Phi-3-mini-4k-instruct-Q8_0.gguf",
+                platform("linux", "x86_64", &["avx2"]),
+            ),
+            phi3_plan(
+                "Phi-3-mini-4k-instruct-Q8_0.gguf",
+                platform("windows", "aarch64", &[]),
+            ),
+            phi3_plan(
+                "repacked-phi3.gguf",
+                platform("windows", "x86_64", &["avx2"]),
+            ),
+        ] {
+            assert_eq!(other.plan.support_level, "unknown_or_unvalidated");
+        }
+
+        env::set_var("CAMELID_PROFILE", "safe");
+        assert_eq!(
+            phi3_plan(
+                "Phi-3-mini-4k-instruct-Q8_0.gguf",
+                platform("windows", "x86_64", &["avx2"]),
+            )
+            .plan
+            .support_level,
+            "unknown_or_unvalidated"
+        );
         clear_profile_env();
     }
 

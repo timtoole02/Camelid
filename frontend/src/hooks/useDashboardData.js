@@ -1137,8 +1137,9 @@ export function useDashboardData({ showNotice, clearNotice }) {
       const supportRowAtSend = sendGate.hint?.target
         ? { id: sendGate.hint.target.id, status: sendGate.hint.target.status, supported: sendGate.contractSupported }
         : null
-      // Mark this turn experimental when it ran on the weaker (implemented-but-not-
-      // supported) lane, so the footer can flag it as unverified with no parity claim.
+      // Mark this turn unverified only when it ran without either support or the
+      // exact-row verified-runnable qualification. Verified-but-limited rows keep
+      // their contract status in support_row without borrowing full support.
       const experimentalLaneAtSend = sendGate.chatMode === 'experimental'
       const assistantMessageBase = {
         id: assistantId,
@@ -1200,7 +1201,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
       // The generic BitNet runnable is a greedy lane. Its experimental status
       // must not cause the browser to advertise Prism's sampling controls that
       // this model does not use.
-      const useExperimentalSampling = selectedModelExperimental && !bitNetB158Chat
+      const useExperimentalSampling = sendGate.chatMode === 'experimental' && !bitNetB158Chat
       const requestController = new AbortController()
       activeChatRequestRef.current = requestController
       const response = await fetch(`${normalizedApiBase}/v1/chat/completions`, {

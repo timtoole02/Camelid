@@ -213,6 +213,8 @@ export function SupportedRow({
 export function CompatibleRow({
   entry,
   receipt,
+  exactRowVerified = false,
+  numericalVariance = false,
   active = false,
   resident = active,
   busy,
@@ -232,18 +234,20 @@ export function CompatibleRow({
           <span className="lane-row-name">{entry.filename}</span>
           <span className="lane-row-meta">{metaLine(entry)}</span>
         </div>
-        <EvidenceChip state="runnable" asText>Experimental</EvidenceChip>
+        <EvidenceChip state="runnable" asText>{exactRowVerified ? 'Verified' : numericalVariance ? 'Runnable' : 'Local test passed'}</EvidenceChip>
       </div>
       <p className="lane-row-note">{describeModel(entry)}</p>
       {receipt ? (
         <ParityReceiptCard receipt={receipt} />
-      ) : (
-        <p className="lane-row-faint">Loading test results…</p>
-      )}
+      ) : null}
       <p className="lane-row-faint">
-        {isEmbeddingOnlyModel(entry)
-          ? 'This model passed a quick local embedding test, but its vectors are not verified for broad use.'
-          : <>This model passed a quick local test, but its chat output isn&rsquo;t verified for correctness.</>}
+        {exactRowVerified
+          ? 'This exact row passed load, deterministic output comparison, and guarded app/API checks. Extended-context support is still pending.'
+          : numericalVariance
+            ? 'This exact model loads and generates normally. Some deterministic token IDs differ from the pinned reference, so it remains outside Verified and Supported.'
+          : isEmbeddingOnlyModel(entry)
+            ? 'This model passed a quick local embedding test, but its vectors are not verified for broad use.'
+            : <>This model passed a quick local run test. Reference-output verification is still pending.</>}
       </p>
       {resident ? (
         <p className="lane-row-loaded">
@@ -308,20 +312,20 @@ export function NotAnchoredRow({
   onMakeDefault,
 }) {
   return (
-    <article className={`lane-row lane-row--blocked${resident ? ' lane-row--active' : ''}`} aria-label={`Experimental model ${entry.filename}`}>
+    <article className={`lane-row lane-row--blocked${resident ? ' lane-row--active' : ''}`} aria-label={`Unverified model ${entry.filename}`}>
       <div className="lane-row-head">
         <div className="lane-row-id">
           <span className="lane-row-name">{entry.filename}</span>
           <span className="lane-row-meta">{metaLine(entry)}</span>
         </div>
-        <EvidenceChip state="unsupported" asText>Experimental</EvidenceChip>
+        <EvidenceChip state="unsupported" asText>Unverified</EvidenceChip>
       </div>
       <p className="lane-row-note">{describeModel(entry)}</p>
       <p className="lane-row-note">
         {isEmbeddingOnlyModel(entry)
-          ? 'This embedding runtime loads and runs, but its vectors are experimental.'
+          ? 'This embedding runtime loads and runs, but its vectors have not been verified.'
           : 'This model loads and runs, but its output isn’t verified for correctness.'}
-        {' '}For experimentation only.
+        {' '}Use it with that limitation in mind.
       </p>
       {resident ? (
         <p className="lane-row-loaded">

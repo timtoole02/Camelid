@@ -1,4 +1,8 @@
-import { isCompatibilitySupportedForModel } from './capabilities.js'
+import {
+  isCompatibilitySupportedForModel,
+  isCompatibilityNumericalVarianceRunnableForModel,
+  isCompatibilityVerifiedRunnableForModel,
+} from './capabilities.js'
 
 /* Derived lane membership for local models — extracted verbatim from
    LocalLaneSections so every consumer computes lanes the same way. Membership is
@@ -40,12 +44,18 @@ function backendMarksSupported(entry) {
 
 export function laneOf(entry, capabilities) {
   if (backendMarksSupported(entry)) return 'supported'
+  if (entry?.lane_class === 'runnable_with_variance') return 'compatible'
   // An explicit backend verdict is authoritative. In particular, a hash-pinned
   // filename (Prism, the non-catalog allowlist, and the curated rows carrying a
   // recorded digest) remains experimental until the server has verified its
   // loaded digest, and stays experimental if those bytes are not the certified
   // ones; the looser frontend name/quant matcher must not promote it back.
   if (!entry?.lane_class && isCompatibilitySupportedForModel(capabilities, matchModel(entry))) return 'supported'
+  // An exact row that passed load + deterministic parity + guarded API/WebUI is
+  // already verified runnable even while extended-context evidence keeps it out
+  // of the full Supported lane. Do not collapse it back into an unverified bucket.
+  if (isCompatibilityVerifiedRunnableForModel(capabilities, matchModel(entry))) return 'compatible'
+  if (isCompatibilityNumericalVarianceRunnableForModel(capabilities, matchModel(entry))) return 'compatible'
   if (entry.runnable_receipt_present) return 'compatible'
   if (entry.admitted && entry.oracle_qualified) return 'eligible'
   return 'not_anchored'

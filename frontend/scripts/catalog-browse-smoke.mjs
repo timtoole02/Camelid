@@ -6,6 +6,7 @@
 
 import assert from 'node:assert/strict'
 import {
+  catalogQualification,
   compareByQuality,
   defaultFileIndex,
   fitDetail,
@@ -71,6 +72,66 @@ const GB = 1024 * 1024 * 1024
     predictedLane({ ...lfm, group: 'experimental', host_lane_class: 'supported' }, capabilities),
     'not_anchored',
     'live filename guesses remain advisory even if a malformed response carries a lane',
+  )
+}
+
+/* --- exact-row qualification is not a binary Experimental bucket ---------- */
+{
+  const capabilities = {
+    model_compatibility: [
+      {
+        id: 'gemma2_9b_it_q8_0',
+        family: 'gemma2',
+        quantization: 'Q8_0',
+        status: 'active_validation_api_webui_pass_pending_context',
+        tensors_load: 'validated_real_weight_forward',
+        generation_runs: 'validated_deterministic_greedy',
+        parity_audited: 'pass_exact_greedy_token_ids',
+        frontend_load_path_verified: 'validated_guarded_api_webui_smoke',
+      },
+      {
+        id: 'gemma3_4b_it_q8_0',
+        family: 'gemma3',
+        quantization: 'Q8_0',
+        status: 'runnable_exact_row_numerical_variance',
+        tensors_load: 'validated_real_weight_forward',
+        generation_runs: 'validated_deterministic_greedy',
+        parity_audited: 'failed_exact_greedy_token_ids',
+        frontend_load_path_verified: 'runnable_normal_inspect_and_load_path',
+        full_support_blockers: 'loads and generates; differs from the pinned oracle at generated token index 3',
+      },
+    ],
+  }
+  const gemma2 = {
+    catalog_id: 'gemma2_9b_it_q8_0',
+    group: 'curated',
+    filename: 'gemma-2-9b-it-q8_0.gguf',
+    quant: 'Q8_0',
+    oracle_qualified: false,
+  }
+  const gemma3 = {
+    catalog_id: 'gemma3_4b_it_q8_0',
+    group: 'curated',
+    filename: 'gemma-3-4b-it-Q8_0.gguf',
+    quant: 'Q8_0',
+    oracle_qualified: true,
+  }
+
+  assert.equal(catalogQualification(gemma2, capabilities).label, 'Verified')
+  assert.equal(predictedLane(gemma2, capabilities), 'compatible', 'verified-runnable rows download and start')
+  assert.equal(catalogQualification(gemma3, capabilities).label, 'Runnable')
+  assert.equal(catalogQualification(gemma3, capabilities).kind, 'variance')
+  assert.match(catalogQualification(gemma3, capabilities).detail, /token index 3/)
+  assert.equal(predictedLane(gemma3, capabilities), 'compatible', 'load-and-generate rows auto-start with a disclosed variance warning')
+  assert.equal(
+    catalogQualification({ ...gemma3, host_lane_class: 'runnable_with_variance' }, capabilities).kind,
+    'variance',
+    'the backend exact-artifact verdict preserves the amber runnable lane',
+  )
+  assert.equal(
+    catalogQualification({ ...gemma2, filename: 'neighbor-gemma-2-9b-it-q8_0.gguf' }, capabilities).label,
+    'Not verified',
+    'a same-size neighboring filename cannot inherit exact-row verification',
   )
 }
 

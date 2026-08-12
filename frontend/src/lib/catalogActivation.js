@@ -33,13 +33,6 @@ export function beginCatalogSettlement(inFlightRef) {
   return true
 }
 
-export function reserveCatalogAcquisition(currentCatalogId, requestedCatalogId) {
-  if (currentCatalogId && currentCatalogId !== requestedCatalogId) {
-    return { accepted: false, catalogId: currentCatalogId }
-  }
-  return { accepted: true, catalogId: requestedCatalogId }
-}
-
 export async function completeCatalogAcquisition({
   item,
   mode = 'download',
@@ -88,7 +81,7 @@ export async function completeCatalogAcquisition({
       ok: true,
       started: false,
       stage: 'checked',
-      message: 'Downloaded and smoke-admitted — see it above in Experimental.',
+      message: 'Downloaded and smoke-admitted — see it above in Other local models.',
     }
   }
 
@@ -112,7 +105,7 @@ export async function completeCatalogAcquisition({
         // with the message so a caller can distinguish a permanent refusal from a
         // retryable one instead of parsing prose.
         code: loaded?.code || '',
-        message: loaded?.message || 'Downloaded and checked, but Camelid could not load the model.',
+        message: loaded?.message || 'Downloaded, but Camelid could not start the model.',
       }
     }
     if (loaded.embedding) {
@@ -129,7 +122,7 @@ export async function completeCatalogAcquisition({
       ok: false,
       started: false,
       stage: 'loading',
-      message: `Downloaded and checked, but Camelid could not load the model: ${String(error?.message || error)}`,
+      message: `Downloaded, but Camelid could not start the model: ${String(error?.message || error)}`,
     }
   }
 

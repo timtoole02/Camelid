@@ -1011,13 +1011,21 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
                 .as_str()
                 .unwrap()
                 .contains("bounded one-token exact-row MoE runtime evidence")));
-    for id in ["qwen25", "gemma2"] {
-        assert!(body["planned_model_families"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["id"] == id && item["status"] == "planned_exact_row_candidate"));
-    }
+    assert!(body["planned_model_families"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["id"] == "qwen25" && item["status"] == "planned_exact_row_candidate"));
+    assert!(body["planned_model_families"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["id"] == "gemma2"
+            && item["status"] == "active_validation_api_webui_pass_pending_context"
+            && item["notes"]
+                .as_str()
+                .unwrap()
+                .contains("verified runnable")));
     assert!(body["api_features"].as_array().unwrap().iter().any(|item| {
         item["id"] == "multi_choice_generation"
             && item["status"] == "supported_current_gate_nonstreaming"

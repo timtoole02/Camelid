@@ -12,7 +12,8 @@ import { ConfirmDialog } from '../components/ui/ConfirmDialog'
 import { Notice } from '../components/ui/Notice'
 import { useModelsPageData } from '../hooks/useModelsPageData'
 import { formatBytes } from '../lib/formatters'
-import { bucketByLane } from '../lib/modelLanes'
+import { isCompatibilityNumericalVarianceRunnableForModel, isCompatibilityVerifiedRunnableForModel } from '../lib/capabilities'
+import { bucketByLane, matchModel } from '../lib/modelLanes'
 import { modelSearchText, shouldOpenModelFamily } from '../lib/modelFamilies'
 import { loadLocalModelForChat, modelFilenameFromPath, unloadLocalModel } from '../lib/modelActivation'
 import { modelDeleteBlockedReason } from '../lib/modelDeletion'
@@ -21,7 +22,8 @@ import { IconClose, IconModels, IconRefresh, IconSearch } from '../components/ui
 /* The Models page: one scroll, five zones.
      1. Active model bar — what is loaded now, with Unload.
      2. Supported — local GGUFs matching an exact supported /api/capabilities row.
-     3. Experimental — every other local GGUF, honestly labeled by evidence state.
+     3. Other local models — runnable, ready-to-test, and unverified GGUFs with
+        their distinct evidence states preserved.
      4. Downloads — one global live-progress area with cancel.
      5. Get models — curated picks + live Hugging Face search, confirmed downloads.
    Membership everywhere is DERIVED at render time from /api/models/local +
@@ -74,6 +76,11 @@ export default function ModelsView({
      CatalogLaneBrowse so the result line can say whether scrolling is worth it. */
   const [catalogMatchCount, setCatalogMatchCount] = useState(null)
   const loadInFlightRef = useRef('')
+  // Catalog downloads are intentionally parallel. Their completion order is
+  // nondeterministic, so serialize only the short model-transition step after
+  // each download finishes. This preserves every requested start instead of
+  // rejecting whichever download happened to complete second.
+  const loadQueueRef = useRef(Promise.resolve())
 
   const laneBuckets = useMemo(
     () => (spine.local ? bucketByLane(spine.local.models, capabilities) : null),
@@ -138,40 +145,39 @@ export default function ModelsView({
   // lib/modelActivation so this page and the first-run card cannot drift; what stays
   // here is the page's own state wiring. The spine's `/api/models/current` refresh
   // answers the identity check, so the confirmation costs no extra request.
-  const loadModelForChat = async (filename, { onStage, model = null } = {}) => {
-    if (loadInFlightRef.current) {
-      const message = loadInFlightRef.current === filename
-        ? `${filename} is already loading.`
-        : `Wait for ${loadInFlightRef.current} to finish loading, then retry.`
-      setLaneError(message)
-      return { ok: false, stage: 'loading', message }
-    }
-    loadInFlightRef.current = filename
-    setUsingFilename(filename)
-    setLaneError('')
-    setBlocker(null)
-    try {
-      const result = await loadLocalModelForChat({
-        apiBase: spine.base,
-        filename,
-        model: model || spine.local?.models.find((entry) => entry.filename === filename) || null,
-        onStage,
-        readActiveFilename: async () => modelFilenameFromPath((await spine.refreshCurrent())?.path),
-      })
-      if (!result.ok) {
-        if (result.blocker) setBlocker(result.blocker)
-        setLaneError(result.message)
+  const loadModelForChat = (filename, { onStage, model = null } = {}) => {
+    const run = async () => {
+      loadInFlightRef.current = filename
+      setUsingFilename(filename)
+      setLaneError('')
+      setBlocker(null)
+      try {
+        const result = await loadLocalModelForChat({
+          apiBase: spine.base,
+          filename,
+          model: model || spine.local?.models.find((entry) => entry.filename === filename) || null,
+          onStage,
+          readActiveFilename: async () => modelFilenameFromPath((await spine.refreshCurrent())?.path),
+        })
+        if (!result.ok) {
+          if (result.blocker) setBlocker(result.blocker)
+          setLaneError(result.message)
+          return result
+        }
+        await Promise.all([
+          spine.refreshLoadedModels(),
+          refreshDashboard?.({ silent: true }),
+        ])
         return result
+      } finally {
+        if (loadInFlightRef.current === filename) loadInFlightRef.current = ''
+        setUsingFilename('')
       }
-      await Promise.all([
-        spine.refreshLoadedModels(),
-        refreshDashboard?.({ silent: true }),
-      ])
-      return result
-    } finally {
-      if (loadInFlightRef.current === filename) loadInFlightRef.current = ''
-      setUsingFilename('')
     }
+
+    const queued = loadQueueRef.current.then(run, run)
+    loadQueueRef.current = queued.catch(() => {})
+    return queued
   }
 
   const unloadEmbeddingModel = async (filename) => {
@@ -514,9 +520,9 @@ export default function ModelsView({
 
       {/* Zone 3 — everything else local, honestly labeled by evidence state */}
       <Section
-        title="Experimental"
+        title="Other local models"
         count={laneBuckets ? experimentalRows.length : undefined}
-        subtitle="These run, but their output isn't verified."
+        subtitle="Verification varies by exact row; each model shows what has actually passed."
       >
         {blocker ? <UnsupportedBlocker blocker={blocker} className="local-lane-blocker" /> : null}
         {!laneBuckets ? (
@@ -532,6 +538,8 @@ export default function ModelsView({
                 key={m.filename}
                 entry={m}
                 receipt={receipts[m.filename]}
+                exactRowVerified={isCompatibilityVerifiedRunnableForModel(capabilities, matchModel(m))}
+                numericalVariance={m.lane_class === 'runnable_with_variance' || isCompatibilityNumericalVarianceRunnableForModel(capabilities, matchModel(m))}
                 active={m.filename === spine.activeFilename}
                 resident={m.filename === spine.activeFilename || spine.loadedModelIds.has(m.filename)}
                 busy={usingFilename === m.filename}
@@ -573,7 +581,7 @@ export default function ModelsView({
             )}
           />
         ) : (
-          <p className="lane-empty">{filteringModels ? 'No experimental model matches this search.' : 'Nothing experimental on this machine — every downloaded model is verified.'}</p>
+          <p className="lane-empty">{filteringModels ? 'No other local model matches this search.' : 'Every downloaded model is in the Supported section.'}</p>
         )}
       </Section>
 

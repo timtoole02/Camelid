@@ -31,6 +31,11 @@ check(
   classifyCapabilityRow({ id: 'mixtral_8x7b_instruct_v0_1_q8_0', status: 'active_validation_partial_runtime' }),
   READINESS.ACTIVE_VALIDATION,
 )
+check(
+  'runnable exact row with reference variance',
+  classifyCapabilityRow({ id: 'gemma3_4b_it_q8_0', status: 'runnable_exact_row_numerical_variance' }),
+  READINESS.RUNNABLE_VARIANCE,
+)
 // Real shipped row (gemma3 -> Metal, then -> CUDA): a GPU-resident windowed
 // lane is the default serve lane for this row on BOTH GPU backends, and the row
 // carries NO throughput claim on either.

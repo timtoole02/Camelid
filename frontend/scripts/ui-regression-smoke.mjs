@@ -227,7 +227,7 @@ assert.match(
   'local chat sends should apply the fresh-BitNet cap before the Gemma 4 floor and Ghost-only Metal-context ceiling',
 )
 assert.match(dashboardHookSource, /max_tokens:\s*requestMaxTokens/, 'the computed lane-aware response budget must be sent to the backend')
-assert.match(dashboardHookSource, /const useExperimentalSampling = selectedModelExperimental && !bitNetB158Chat/, 'experimental BitNet chat must stay on its honest greedy lane')
+assert.match(dashboardHookSource, /const useExperimentalSampling = sendGate\.chatMode === 'experimental' && !bitNetB158Chat/, 'only genuinely unverified chat may enable the fallback sampler; verified-runnable and BitNet greedy lanes stay deterministic')
 assert.match(dashboardHookSource, /temperature:\s*useExperimentalSampling \? 0\.7 : 0/, 'BitNet and supported rows must send greedy temperature zero')
 assert.match(dashboardHookSource, /\.\.\.\(useExperimentalSampling \? \{ top_p: 0\.95, top_k: 20, min_p: 0 \} : \{\}\)/, 'unsupported experimental sampling fields must be omitted from BitNet requests')
 assert.match(dashboardHookSource, /thinkingMode && !bitNetB158Chat \? \{ camelid_enable_thinking: true \}/, 'a stale thinking toggle must not make a BitNet request fail before the UI effect clears it')
@@ -351,18 +351,18 @@ assert.match(modelLanesSource, /isCompatibilitySupportedForModel\(capabilities, 
 assert.doesNotMatch(modelsViewSource, /SUPPORTED_MODELS/, 'Models view must not place models from a hand-authored array')
 
 /* ---- Models page: search the models on this machine ---- */
-// The filter spans Supported AND Experimental, so both sections must read from
+// The filter spans Supported AND Other local models, so both sections must read from
 // the filtered lists rather than the raw buckets — otherwise a section keeps
 // showing rows the search excluded.
 assert.match(modelsViewSource, /supportedRows\s*=\s*\(laneBuckets \? laneBuckets\.supported : \[\]\)\.filter\(matchesModelQuery\)/, 'the Supported section must render the filtered rows')
 assert.match(modelsViewSource, /compatibleRows\s*=\s*\(laneBuckets \? laneBuckets\.compatible : \[\]\)\.filter\(matchesModelQuery\)/, 'the Compatible sub-lane must be filtered before rendering')
 assert.match(modelsViewSource, /eligibleRows\s*=\s*\(laneBuckets \? laneBuckets\.eligible : \[\]\)\.filter\(matchesModelQuery\)/, 'the Eligible sub-lane must be filtered before rendering')
 assert.match(modelsViewSource, /notAnchoredRows\s*=\s*\(laneBuckets \? laneBuckets\.not_anchored : \[\]\)\.filter\(matchesModelQuery\)/, 'the Not anchored sub-lane must be filtered before rendering')
-assert.match(modelsViewSource, /\.\.\.compatibleRows\.map\(\(entry\) => \(\{ \.\.\.entry, _familyLane: 'compatible' \}\)\)/, 'the grouped Experimental section must derive Compatible rows from the filtered list')
-assert.match(modelsViewSource, /\.\.\.eligibleRows\.map\(\(entry\) => \(\{ \.\.\.entry, _familyLane: 'eligible' \}\)\)/, 'the grouped Experimental section must derive Eligible rows from the filtered list')
-assert.match(modelsViewSource, /\.\.\.notAnchoredRows\.map\(\(entry\) => \(\{ \.\.\.entry, _familyLane: 'not_anchored' \}\)\)/, 'the grouped Experimental section must derive Not anchored rows from the filtered list')
+assert.match(modelsViewSource, /\.\.\.compatibleRows\.map\(\(entry\) => \(\{ \.\.\.entry, _familyLane: 'compatible' \}\)\)/, 'the grouped other-models section must derive Compatible rows from the filtered list')
+assert.match(modelsViewSource, /\.\.\.eligibleRows\.map\(\(entry\) => \(\{ \.\.\.entry, _familyLane: 'eligible' \}\)\)/, 'the grouped other-models section must derive Eligible rows from the filtered list')
+assert.match(modelsViewSource, /\.\.\.notAnchoredRows\.map\(\(entry\) => \(\{ \.\.\.entry, _familyLane: 'not_anchored' \}\)\)/, 'the grouped other-models section must derive Not anchored rows from the filtered list')
 assert.match(modelsViewSource, /items=\{supportedRows\}/, 'the Supported family groups must render the filtered list')
-assert.match(modelsViewSource, /items=\{experimentalRows\}/, 'the Experimental family groups must render the filtered tagged list')
+assert.match(modelsViewSource, /items=\{experimentalRows\}/, 'the other-models family groups must render the filtered tagged list')
 assert.match(modelsViewSource, /filtering:\s*filteringModels[\s\S]*activeFilename:\s*spine\.activeFilename[\s\S]*loadedModelIds:\s*spine\.loadedModelIds/, 'local family disclosures must open for search, the active model, and resident sidecars')
 assert.equal((modelsViewSource.match(/initiallyOpen=\{localFamilyInitiallyOpen\}/g) || []).length, 2, 'both local lanes must use the shared disclosure-open policy')
 // A GGUF's filename is often the only place the quantization appears, so a
@@ -383,7 +383,7 @@ assert.match(modelsViewSource, /to download in Get models/, 'the result line mus
 // Empty states must not keep claiming the machine has nothing while a filter is
 // simply hiding it.
 assert.match(modelsViewSource, /filteringModels \? 'No verified model matches this search\.'/, 'the Supported empty state must say when a filter is what emptied it')
-assert.match(modelsViewSource, /filteringModels \? 'No experimental model matches this search\.'/, 'the Experimental empty state must say when a filter is what emptied it')
+assert.match(modelsViewSource, /filteringModels \? 'No other local model matches this search\.'/, 'the other-models empty state must say when a filter is what emptied it')
 assert.doesNotMatch(modelsViewSource, /localStorage\.(get|set|remove)Item/, 'Models view must not read or write localStorage truth')
 /* The inspect-first load protocol moved into lib/modelActivation.js when the
    first-run card became a second caller: two hand-written copies of an ordered
@@ -400,15 +400,18 @@ assert.doesNotMatch(modelsViewSource, /supported_quantization|planned_quantizati
 assert.match(laneRowsSource, /<EvidenceChip/, 'Models lane rows must render their status claims through the Evidence Chip')
 assert.match(laneRowsSource, /never copper/, 'runnable rows must document that they never take the reserved supported (copper) styling')
 assert.match(catalogBrowseSource, /predictedLane\(item, capabilities\)/, 'catalog rows must delegate lane placement to the shared prediction helper')
-assert.match(catalogLaneSource, /if \(item\?\.group === 'experimental'\) return 'not_anchored'/, 'live Hugging Face rows must never anchor a lane or imply support')
-assert.match(catalogLaneSource, /if \(item\?\.host_lane_class != null\)[\s\S]*return 'not_anchored'/, 'an explicit unrecognized or unsupported host lane must fail closed')
+assert.match(catalogLaneSource, /if \(item\?\.group === 'experimental'\)[\s\S]*kind: 'unverified'/, 'live Hugging Face rows must never anchor a lane or imply support')
+assert.match(catalogLaneSource, /item\.host_lane_class === 'unsupported'[\s\S]*kind: 'blocked'/, 'an explicit unsupported host lane must fail closed')
+assert.match(catalogLaneSource, /isVerifiedRunnableCompatibilityTarget\(target\)[\s\S]*kind: 'verified'/, 'exact rows that passed load, parity, and guarded API\/WebUI checks must not be collapsed into the unverified label')
 assert.match(catalogBrowseSource, /Confirm download/, 'catalog downloads must go through an explicit confirmation phase')
 assert.match(catalogBrowseSource, /Download and start/, 'curated catalog rows should offer the complete activation workflow')
 assert.match(catalogBrowseSource, /settlementInFlightRef\.current/, 'catalog settlement must be single-flight across polling ticks')
 assert.match(catalogBrowseSource, /canceledCatalogIds\.has\(item\.catalog_id\)/, 'catalog cancellation must be keyed by catalog identity, not filename')
 assert.match(catalogBrowseSource, /aria-label="Search model catalog"/, 'catalog search must have an explicit accessible name')
-assert.match(catalogBrowseSource, /downloadAndStart = lane === 'supported' && !effectiveFitRefusal/, 'automatic start must be limited to supported rows that are not known to exceed this host')
-assert.match(catalogBrowseSource, /refusedByFit[\s\S]*item\.oracle_qualified/, 'rows this host cannot load must not automatically run generic smoke admission')
+assert.match(catalogBrowseSource, /downloadAndStart = \(lane === 'supported' \|\| lane === 'compatible'\) && !effectiveFitRefusal/, 'supported and compatible curated rows should continue directly into the guarded load path')
+assert.doesNotMatch(catalogBrowseSource, /pendingCatalogId|acquisitionLocked/, 'unrelated catalog rows must not be serialized behind one pending download')
+assert.match(catalogBrowseSource, /setPendingItems[\s\S]*current\.filter/, 'parallel acquisitions must preserve every independently pending row')
+assert.match(modelsViewSource, /loadQueueRef\.current\.then\(run, run\)/, 'parallel downloads must queue only their model-transition step instead of rejecting overlapping starts')
 // The refusal set must stay the FULL one. Testing `fit !== 'wont_fit'` alone was a
 // real defect: an `insufficient_free_memory` row would chain into a load that the
 // 422 preload guard refuses, since that guard blocks on both negative verdicts.
@@ -441,7 +444,7 @@ assert.match(firstRunCardSource, /confirmed = res\.ok/, 'only a successful cance
 assert.match(firstRunCardSource, /observeAfterCancel\(\)/, 'the cancel outcome must be decided by re-reading downloads plus the local scan')
 assert.match(firstRunCardSource, /firstRunCancelOutcome\(\{ confirmed, \.\.\.observed \}\)/, 'and routed through the shared outcome rule')
 assert.doesNotMatch(firstRunCardSource, /finally \{[\s\S]{0,200}fail\('Download canceled/, 'cancellation must never be reported unconditionally from a finally block')
-assert.match(modelsViewSource, /loadInFlightRef\.current[\s\S]*(already loading|finish loading, then retry)/, 'model loading must be single-flight across catalog completions')
+assert.match(modelsViewSource, /const queued = loadQueueRef\.current\.then\(run, run\)[\s\S]*loadQueueRef\.current = queued\.catch/, 'model transitions must remain ordered across parallel catalog completions')
 assert.match(modelsViewSource, /deleteLocalModel\(entry\)/, 'local deletion must submit the scanned entry identity rather than filename alone')
 assert.match(modelsViewSource, /This cannot be undone[\s\S]*confirmLabel="Delete model"/, 'local model deletion must require destructive confirmation naming the file')
 assert.match(laneRowsSource, /entry\.delete_token/, 'delete controls must require the scan-issued opaque identity token')

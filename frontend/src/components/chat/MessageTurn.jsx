@@ -77,10 +77,10 @@ function MessageMetaFooter({ message }) {
         <EvidenceChip
           state="unsupported"
           asText
-          source={{ detail: 'Experimental support: this model type runs, but this build has not been validated against the reference implementation.' }}
+          source={{ detail: 'This model type runs, but this exact build has not been validated against the reference implementation.' }}
           size="sm"
         >
-          Experimental — unverified
+          Unverified model
         </EvidenceChip>
       )}
       {usage && Number.isFinite(Number(usage.prompt_tokens)) && (

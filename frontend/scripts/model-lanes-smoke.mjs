@@ -40,6 +40,15 @@ const CAPABILITIES = {
       quantization: 'Q8_0',
       status: 'tracked_not_supported',
     },
+    {
+      id: 'gemma3_4b_it_q8_0',
+      family: 'gemma3',
+      quantization: 'Q8_0',
+      status: 'runnable_exact_row_numerical_variance',
+      tensors_load: 'validated_real_weight_forward',
+      generation_runs: 'validated_deterministic_greedy',
+      parity_audited: 'failed_exact_greedy_token_ids',
+    },
     // Real /api/capabilities row id — the id IS the normalized GGUF filename
     // (`gemma-3-1b-it-Q8_0.gguf` -> `gemma_3_1b_it_q8_0`), which is what lets
     // the identity matcher resolve this row from the local file alone, with no
@@ -148,6 +157,12 @@ check(
 check(
   'compatible: runnable receipt present',
   laneOf(entry('ornith-1.0-9b-Q8_0.gguf', { runnable_receipt_present: true }), CAPABILITIES),
+  'compatible',
+)
+
+check(
+  'compatible: backend exact-row numerical-variance verdict',
+  laneOf(entry('gemma-3-4b-it-Q8_0.gguf', { lane_class: 'runnable_with_variance' }), CAPABILITIES),
   'compatible',
 )
 

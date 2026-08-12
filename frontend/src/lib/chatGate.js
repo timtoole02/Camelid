@@ -1,4 +1,10 @@
-import { compatibilityHintCopy, findCompatibilityHint, isCompatibilitySupportedForModel } from './capabilities.js'
+import {
+  compatibilityHintCopy,
+  findCompatibilityHint,
+  isCompatibilityNumericalVarianceRunnableForModel,
+  isCompatibilitySupportedForModel,
+  isCompatibilityVerifiedRunnableForModel,
+} from './capabilities.js'
 import { isEmbeddingOnlyModel, modelTaskKind } from './modelCapabilities.js'
 import { isModelLoadedNow, isRunnableInCurrentRuntime, modelRuntimeIdMatches } from './modelState.js'
 
@@ -114,8 +120,8 @@ function supportedCatalogGhostCuda(runtime, runtimeLane) {
 
 function runtimeLaneHint(hint, laneScopedRow, runtimeLane) {
   const reason = runtimeLane === 'ghost_moe'
-    ? 'This model is running in a configuration that has not been verified, so replies are treated as experimental.'
-    : 'No verified run configuration was detected for this model, so replies are treated as experimental.'
+    ? 'This model is running in a configuration that has not been verified, so replies are marked unverified.'
+    : 'No verified run configuration was detected for this model, so replies are marked unverified.'
   const target = hint?.target || (laneScopedRow
     ? {
         id: GEMMA4_26B_LANE_SCOPED_ROW,
@@ -183,16 +189,39 @@ export function getChatGateState(capabilities, model, runtime) {
     ? backendMarksSupportedRow(model)
     : !lfm2LaneScopedRow && isCompatibilitySupportedForModel(capabilities, model)
   const contractSupported = Boolean(!embeddingOnly && runtimeLaneEligible && artifactSupported)
+  const exactRowVerifiedRunnable = Boolean(
+    !embeddingOnly
+    && runtimeLaneEligible
+    && isCompatibilityVerifiedRunnableForModel(capabilities, model),
+  )
+  const exactRowNumericalVariance = Boolean(
+    !embeddingOnly
+    && runtimeLaneEligible
+    && (
+      model?.lane_class === 'runnable_with_variance'
+      || isCompatibilityNumericalVarianceRunnableForModel(capabilities, model)
+    )
+  )
   const hint = runtimeLaneEligible
     ? contractHint
     : runtimeLaneHint(contractHint, gemmaLaneScopedRow, runtimeLane)
   const chatUnlocked = Boolean(runtimeReady && contractSupported)
+  const verifiedUnlocked = Boolean(runtimeReady && !contractSupported && exactRowVerifiedRunnable)
+  const varianceUnlocked = Boolean(runtimeReady && !contractSupported && exactRowNumericalVariance)
   // Experimental lane: the model loaded and is generation-ready (so its architecture
   // is implemented — generation_ready is false for unimplemented archs) but it is NOT
   // a supported contract row. A separate, weaker affordance from the supported gate:
   // chat is allowed but every turn is marked unverified with no parity claim.
   const experimentalUnlocked = Boolean(runtimeReady && !contractSupported)
-  const chatMode = contractSupported ? 'supported' : experimentalUnlocked ? 'experimental' : 'blocked'
+  const chatMode = contractSupported
+    ? 'supported'
+    : verifiedUnlocked
+      ? 'verified'
+      : varianceUnlocked
+        ? 'variance'
+      : experimentalUnlocked
+        ? 'experimental'
+        : 'blocked'
 
   return {
     hint,
@@ -215,6 +244,10 @@ export function getChatGateState(capabilities, model, runtime) {
         ? 'Embedding only'
       : contractSupported
         ? 'Verified'
+        : verifiedUnlocked
+          ? 'Verified (limited)'
+        : varianceUnlocked
+          ? 'Runnable (reference differs)'
         : experimentalUnlocked
           ? 'Runnable (unverified)'
           : 'Not verified',

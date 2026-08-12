@@ -1,4 +1,9 @@
-import { isCompatibilitySupportedForModel } from './capabilities.js'
+import {
+  exactCompatibilityTargetForModel,
+  isCompatibilitySupportedForModel,
+  isNumericalVarianceRunnableCompatibilityTarget,
+  isVerifiedRunnableCompatibilityTarget,
+} from './capabilities.js'
 
 /* Pure presentation logic for the "Get models" catalog browse.
 
@@ -25,20 +30,144 @@ import { isCompatibilitySupportedForModel } from './capabilities.js'
    first would let a platform-scoped row read Supported on a host with no receipt.
    Absence preserves the existing behavior for ordinary curated rows and older
    servers; any explicit unknown/unsupported value fails closed. */
-export function predictedLane(item, capabilities) {
-  // Live Hugging Face metadata is filename-guessed and can never imply support.
-  if (item?.group === 'experimental') return 'not_anchored'
-
-  if (item?.host_lane_class != null) {
-    if (item.host_lane_class === 'supported') return 'supported'
-    if (item.host_lane_class === 'experimental_implemented' && item.oracle_qualified) {
-      return 'compatible'
+export function catalogQualification(item, capabilities) {
+  // Live Hugging Face metadata is filename-guessed and can never imply support
+  // or exact-row verification.
+  if (item?.group === 'experimental') {
+    return {
+      kind: 'unverified',
+      label: 'Unverified',
+      detail: 'Live Hugging Face result. Camelid has not inspected or compared this exact file.',
     }
-    return 'not_anchored'
   }
 
-  if (isCompatibilitySupportedForModel(capabilities, null, item)) return 'supported'
-  if (item?.oracle_qualified) return 'compatible'
+  const target = exactCompatibilityTargetForModel(capabilities, null, item)
+
+  // A host-scoped backend verdict outranks the static contract. Supported rows
+  // whose receipts cover a different host remain runnable here, but may not borrow
+  // the Supported badge.
+  if (item?.host_lane_class != null) {
+    if (item.host_lane_class === 'supported') {
+      return { kind: 'supported', label: 'Supported', detail: '' }
+    }
+    if (item.host_lane_class === 'runnable_with_variance') {
+      return {
+        kind: 'variance',
+        label: 'Runnable',
+        detail: target?.full_support_blockers || 'This exact model loads and generates, but some deterministic token IDs differ from the pinned reference.',
+        target,
+      }
+    }
+    if (item.host_lane_class === 'unsupported') {
+      return {
+        kind: 'blocked',
+        label: 'Cannot run',
+        detail: 'Camelid does not have a runnable implementation for this model on the current host.',
+        target,
+      }
+    }
+    if (item.host_lane_class === 'experimental_implemented') {
+      return {
+        kind: 'runnable',
+        label: 'Runnable',
+        detail: target?.status?.startsWith('supported')
+          ? 'This exact row is supported on a qualified host; this host has a runnable path without the same support receipt.'
+          : 'Camelid implements this model on the current host, but this exact run configuration is not fully supported.',
+        target,
+      }
+    }
+    return {
+      kind: 'blocked',
+      label: 'Cannot run',
+      detail: 'Camelid did not recognize the backend lane reported for this model on the current host.',
+      target,
+    }
+  }
+
+  if (isCompatibilitySupportedForModel(capabilities, null, item)) {
+    return { kind: 'supported', label: 'Supported', detail: '', target }
+  }
+
+  if (isVerifiedRunnableCompatibilityTarget(target)) {
+    return {
+      kind: 'verified',
+      label: 'Verified',
+      detail: 'Exact artifact passed load, deterministic output comparison, and guarded API/WebUI checks. Extended-context support is still pending.',
+      target,
+    }
+  }
+
+  const status = String(target?.status || '').toLowerCase()
+  const parity = String(target?.parity_audited || '').toLowerCase()
+  if (status.includes('blocked_load')) {
+    return {
+      kind: 'blocked',
+      label: 'Load blocked',
+      detail: target?.full_support_blockers || 'The exact artifact does not complete Camelid\'s load path yet.',
+      target,
+    }
+  }
+  if (isNumericalVarianceRunnableCompatibilityTarget(target)) {
+    return {
+      kind: 'variance',
+      label: 'Runnable',
+      detail: target?.full_support_blockers || 'This exact model loads and generates, but some deterministic token IDs differ from the pinned reference.',
+      target,
+    }
+  }
+  if (status.includes('blocked_parity') || parity.includes('failed') || parity.includes('divergence')) {
+    return {
+      kind: 'mismatch',
+      label: 'Output mismatch',
+      detail: target?.full_support_blockers || 'The model loads, but deterministic output differs from the pinned reference.',
+      target,
+    }
+  }
+  if (status.includes('blocked_template')) {
+    return {
+      kind: 'limited',
+      label: 'Chat limited',
+      detail: target?.full_support_blockers || 'Raw generation works, but the public chat-template envelope is not verified.',
+      target,
+    }
+  }
+  if (status.startsWith('active_validation')) {
+    return {
+      kind: 'validating',
+      label: 'Validation pending',
+      detail: target?.full_support_blockers || 'This exact row is still being validated.',
+      target,
+    }
+  }
+  if (status.startsWith('planned')) {
+    return {
+      kind: 'unverified',
+      label: 'Not verified',
+      detail: target?.full_support_blockers || 'This exact row is planned but has not completed runtime qualification.',
+      target,
+    }
+  }
+  if (item?.oracle_qualified) {
+    return {
+      kind: 'runnable',
+      label: 'Runnable',
+      detail: 'Camelid implements this architecture and quantization; this exact file does not have a full support receipt.',
+      target,
+    }
+  }
+  return {
+    kind: 'unverified',
+    label: 'Not verified',
+    detail: 'This curated file does not yet have an exact-row runtime qualification result.',
+    target,
+  }
+}
+
+export function predictedLane(item, capabilities) {
+  const qualification = catalogQualification(item, capabilities)
+
+  if (qualification.kind === 'supported') return 'supported'
+  if (qualification.kind === 'verified' || qualification.kind === 'runnable' || qualification.kind === 'variance') return 'compatible'
   return 'not_anchored'
 }
 

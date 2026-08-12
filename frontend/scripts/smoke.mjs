@@ -44,8 +44,8 @@ if (!Number.isInteger(chatRepeats) || chatRepeats < 1) {
 if (!Number.isInteger(streamMaxTokens) || streamMaxTokens < 1) {
   throw new Error(`--stream-max-tokens must be a positive integer, got ${args.get('stream-max-tokens')}`)
 }
-if (expectLocalLaneClass && !['supported', 'experimental_implemented', 'unsupported'].includes(expectLocalLaneClass)) {
-  throw new Error(`--expect-local-lane-class must be one of supported, experimental_implemented, unsupported; got ${expectLocalLaneClass}`)
+if (expectLocalLaneClass && !['supported', 'runnable_with_variance', 'experimental_implemented', 'unsupported'].includes(expectLocalLaneClass)) {
+  throw new Error(`--expect-local-lane-class must be one of supported, runnable_with_variance, experimental_implemented, unsupported; got ${expectLocalLaneClass}`)
 }
 
 if (loadTiny && modelPath) {
@@ -414,10 +414,14 @@ const webuiChatState = !activeModelListed || !activeChatGate
   ? 'blocked'
   : activeChatGate.chatMode === 'supported'
     ? 'enabled'
+    : activeChatGate.chatMode === 'verified'
+      ? 'verified'
+    : activeChatGate.chatMode === 'variance'
+      ? 'variance'
     : activeChatGate.chatMode === 'experimental'
       ? 'experimental'
       : 'blocked'
-const webuiChatEnabled = webuiChatState === 'enabled' || webuiChatState === 'experimental'
+const webuiChatEnabled = ['enabled', 'verified', 'variance', 'experimental'].includes(webuiChatState)
 const qaChatBypass = Boolean(allowGuardedChat && health.generation_ready && activeModel && activeModelListed && !webuiChatEnabled)
 
 if (expectContractSupported !== null) {
@@ -425,8 +429,8 @@ if (expectContractSupported !== null) {
 }
 
 if (expectWebUiChat) {
-  if (!['enabled', 'experimental', 'blocked'].includes(expectWebUiChat)) {
-    throw new Error(`--expect-webui-chat must be one of enabled, experimental, blocked; got ${expectWebUiChat}`)
+  if (!['enabled', 'verified', 'variance', 'experimental', 'blocked'].includes(expectWebUiChat)) {
+    throw new Error(`--expect-webui-chat must be one of enabled, verified, variance, experimental, blocked; got ${expectWebUiChat}`)
   }
   assertExpected('WebUI chat state', webuiChatState, expectWebUiChat)
 }

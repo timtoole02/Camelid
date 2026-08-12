@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { beginCatalogSettlement, catalogDownloadSettlement, completeCatalogAcquisition, reserveCatalogAcquisition } from '../src/lib/catalogActivation.js'
+import { beginCatalogSettlement, catalogDownloadSettlement, completeCatalogAcquisition } from '../src/lib/catalogActivation.js'
 
 function response({ ok = true, body = {} } = {}) {
   return { ok, json: async () => body }
@@ -9,28 +9,6 @@ const curated = {
   group: 'supported',
   filename: 'Llama-3.2-1B-Instruct-Q8_0.gguf',
   oracle_qualified: true,
-}
-
-{
-  assert.deepEqual(
-    reserveCatalogAcquisition('', 'model-a'),
-    { accepted: true, catalogId: 'model-a' },
-  )
-  assert.deepEqual(
-    reserveCatalogAcquisition('model-a', 'model-a'),
-    { accepted: true, catalogId: 'model-a' },
-    'the owning row may rejoin its own acquisition',
-  )
-  assert.deepEqual(
-    reserveCatalogAcquisition('model-a', 'model-b'),
-    { accepted: false, catalogId: 'model-a' },
-    'a competing confirmation or rejoin must wait',
-  )
-  assert.deepEqual(
-    reserveCatalogAcquisition('', 'model-b'),
-    { accepted: true, catalogId: 'model-b' },
-    'the next acquisition may reserve after release',
-  )
 }
 
 {

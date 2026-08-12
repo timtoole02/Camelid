@@ -220,7 +220,7 @@ const capabilityFixture = {
     { id: 'mistral_7b_instruct_v0_3_q8_0', family: 'mistral', quantization: 'Q8_0', status: 'supported_exact_row_smoke', support_scope: 'exact_row_smoke_only', full_support_status: 'blocked_pending_normalized_full_support', full_support_blockers: 'model-native/larger context beyond checked packs, broader arbitrary/Jinja templates beyond the row-scoped renderer and template-shape evidence, production throughput beyond bounded perf/RSS evidence, portability, and durable repeated current-head bundles remain missing', frontend_readiness_gate: 'green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id', performance_measured: 'bounded_unique_chat_perf_rss_validated', evidence: 'Mistral v0.3 exact-row smoke (promoted post-v0.1.0, head d7b1699): metadata/tokenizer/template validated, tensors load, API completion+chat smoke plus broader 50-token API smoke, tokenizer/template/1-token/bounded/broader-50-token and GPU-vs-CPU greedy parity pass, bounded unique-chat perf/RSS validated; full support still blocked pending normalized evidence' },
     { id: 'mixtral_8x7b_instruct_v0_1_q8_0', family: 'mixtral_moe', quantization: 'Q8_0', status: 'active_validation_partial_runtime', support_scope: 'exact_row_bounded_moe_runtime_only', full_support_status: 'blocked_later_generation_divergence', full_support_blockers: 'later short-prompt generation still diverges from llama.cpp; API/WebUI readiness, long-context evidence, production throughput, portability, and durable broad prompt coverage are missing', frontend_readiness_gate: 'fail-closed for broad readiness: exact row may be described only as bounded one-token backend runtime evidence until later-generation parity and API/WebUI gates close', evidence: 'Mixtral bounded one-token backend MoE runtime evidence only; later-generation divergence keeps frontend/API/WebUI support blocked' },
     { id: 'qwen25_7b_instruct_q8_0', family: 'qwen2', quantization: 'Q8_0', status: 'planned_unsupported', support_scope: 'future_exact_row_planning_only', full_support_status: 'not_applicable_until_runtime_support', full_support_blockers: 'qwen2 runtime, tokenizer/pre-tokenizer fixtures, ChatML parity, bounded load/readiness, API/WebUI, RSS/timing, context, and durable bundle evidence are missing', evidence: 'Qwen 2.5 planning row only; no support evidence exists' },
-    { id: 'gemma2_9b_it_q8_0', family: 'gemma2', quantization: 'Q8_0', status: 'planned_unsupported', support_scope: 'future_exact_row_planning_only', full_support_status: 'not_applicable_until_runtime_support', full_support_blockers: 'gemma2 runtime, control-token/template fixtures, bounded load/readiness, API/WebUI, RSS/timing, context, and durable bundle evidence are missing', evidence: 'Gemma 2 planning row only; no support evidence exists' },
+    { id: 'gemma2_9b_it_q8_0', family: 'gemma2', quantization: 'Q8_0', status: 'active_validation_api_webui_pass_pending_context', support_scope: 'phase2_exact_row_validation_only', full_support_status: 'blocked_pending_context_performance_and_portability', full_support_blockers: 'short deterministic parity and guarded API/WebUI smoke pass; the exact-row bounded 512-context receipt is still required before support promotion', tensors_load: 'validated_real_weight_forward', generation_runs: 'validated_deterministic_greedy', parity_audited: 'pass_exact_greedy_token_ids', frontend_load_path_verified: 'validated_guarded_api_webui_smoke', evidence: 'qa/model-qualification/phase2-runtime/gemma2_9b_it_q8_0.json' },
     // Real shipped /api/capabilities row, copied field-for-field from the
     // generated ledger (ledger/camelid-ledger.json) rather than paraphrased.
     // The id IS the normalized GGUF filename, which is what lets the exact
@@ -689,15 +689,42 @@ assert.equal(qwenHint.target.id, 'qwen25_7b_instruct_q8_0')
 assert.equal(isCompatibilitySupportedForModel(capabilityFixture, { name: 'Qwen2.5-7B-Instruct-Q8_0', quant: 'Q8_0' }), false)
 const qwenQ4Hint = findCompatibilityHint(capabilityFixture, { name: 'Qwen2.5-7B-Instruct-Q4_K_M', quant: 'Q4_K_M' })
 assert.equal(qwenQ4Hint.kind, 'quant_mismatch', 'Qwen planning rows must not absorb different quantizations')
-const gemmaHint = findCompatibilityHint(capabilityFixture, { name: 'gemma-2-9b-it-Q8_0', quant: 'Q8_0' })
-assert.equal(gemmaHint.kind, 'compatibility', 'Gemma should match only its exact future planning row')
+const gemmaHint = findCompatibilityHint(capabilityFixture, { name: 'gemma-2-9b-it-Q8_0', model_path: 'gemma-2-9b-it-q8_0.gguf', quant: 'Q8_0' })
+assert.equal(gemmaHint.kind, 'compatibility', 'Gemma should match only its exact qualified row')
 assert.equal(gemmaHint.target.id, 'gemma2_9b_it_q8_0')
 assert.equal(isCompatibilitySupportedForModel(capabilityFixture, { name: 'gemma-2-9b-it-Q8_0', quant: 'Q8_0' }), false)
-assert.equal(
-  getChatGateState(capabilityFixture, { ...localLoadedReady, id: 'gemma2-9b', name: 'gemma-2-9b-it-Q8_0', quant: 'Q8_0' }, { active_model_id: 'gemma2-9b', loaded_now: true, generation_ready: true }).chatUnlocked,
-  false,
-  'even runtime-green Gemma planning rows remain blocked until /api/capabilities promotes the exact row to supported',
+const gemma2VerifiedGate = getChatGateState(
+  capabilityFixture,
+  { ...localLoadedReady, id: 'gemma2-9b', name: 'gemma-2-9b-it-Q8_0', model_path: 'gemma-2-9b-it-q8_0.gguf', quant: 'Q8_0' },
+  { active_model_id: 'gemma2-9b', loaded_now: true, generation_ready: true },
 )
+assert.equal(gemma2VerifiedGate.chatUnlocked, false, 'verified-runnable is narrower than Supported')
+assert.equal(gemma2VerifiedGate.chatMode, 'verified', 'Gemma 2 must preserve its passed exact-row qualification in chat')
+assert.equal(gemma2VerifiedGate.experimentalUnlocked, true, 'verified-runnable Gemma 2 remains usable')
+
+const gemma3VarianceCapabilities = {
+  ...capabilityFixture,
+  model_compatibility: [
+    ...capabilityFixture.model_compatibility,
+    {
+      id: 'gemma3_4b_it_q8_0',
+      family: 'gemma3',
+      quantization: 'Q8_0',
+      status: 'runnable_exact_row_numerical_variance',
+      tensors_load: 'validated_real_weight_forward',
+      generation_runs: 'validated_deterministic_greedy',
+      parity_audited: 'failed_exact_greedy_token_ids',
+    },
+  ],
+}
+const gemma3VarianceGate = getChatGateState(
+  gemma3VarianceCapabilities,
+  { ...localLoadedReady, id: 'gemma3-4b', name: 'gemma-3-4b-it-Q8_0', model_path: 'gemma-3-4b-it-Q8_0.gguf', quant: 'Q8_0', lane_class: 'runnable_with_variance' },
+  { active_model_id: 'gemma3-4b', loaded_now: true, generation_ready: true },
+)
+assert.equal(gemma3VarianceGate.contractSupported, false, 'numerical variance does not borrow Supported')
+assert.equal(gemma3VarianceGate.chatMode, 'variance', 'a qualified numerical-variance row gets its own runnable chat mode')
+assert.equal(gemma3VarianceGate.label, 'Runnable (reference differs)')
 
 // gemma3 1B Q8_0: the promoted row, and the counter-case to the gemma2 planning
 // row directly above. The exact-row id is the normalized GGUF filename, so the

@@ -51,6 +51,7 @@
         "planned_beyond_named_certified_rows",
         "planned_exact_row_candidate",
         "planned_phase_10",
+        "runnable_exact_row_numerical_variance",
         "supported",
         "supported_current_gate",
         "supported_current_gate_nonstreaming",
@@ -91,6 +92,7 @@
         "exact_row_single_node_cpu_smoke_only",
         "exact_row_smoke_only",
         "exact_row_validation_only",
+        "exact_row_windows_x86_64_cpu_reference_short_greedy",
         "future_exact_row_planning_only",
         "phase2_exact_row_validation_only"
       ]
@@ -103,7 +105,7 @@
     "latestCheckedResultVocabulary": {
       "type": "string",
       "$comment": "Code-derived from `latest_checked_result:` literals in src/api/mod.rs (checked ⊇ by check-ledger-schema.mjs).",
-      "enum": ["active_validation_api_webui_pass_pending_context", "active_validation_blocked_load", "active_validation_blocked_parity", "active_validation_blocked_template", "blocked_generation_parity", "blocked_later_generation_divergence", "blocked_prompt_and_generation_parity", "not_started", "partial_pass_hold", "pass", "pass_active_validation_only", "planning_only"]
+      "enum": ["active_validation_api_webui_pass_pending_context", "active_validation_blocked_load", "active_validation_blocked_parity", "active_validation_blocked_template", "blocked_generation_parity", "blocked_later_generation_divergence", "blocked_prompt_and_generation_parity", "not_started", "partial_pass_hold", "pass", "pass_active_validation_only", "planning_only", "runnable_exact_row_numerical_variance"]
     },
     "supportItem": {
       "type": "object",

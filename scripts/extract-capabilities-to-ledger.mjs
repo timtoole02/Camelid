@@ -258,17 +258,18 @@ async function extractApiFeatureContract(root) {
 }
 
 function phase2CompatibilityContract({ id, family, quantization, loadPass, parityPass, templatePass, evidence }) {
+  const runnableWithVariance = loadPass && !parityPass && templatePass
   const status = !loadPass
     ? 'active_validation_blocked_load'
-    : !parityPass
-      ? 'active_validation_blocked_parity'
-      : !templatePass
-        ? 'active_validation_blocked_template'
+    : !templatePass
+      ? 'active_validation_blocked_template'
+      : !parityPass
+        ? 'runnable_exact_row_numerical_variance'
         : 'active_validation_api_webui_pass_pending_context'
   const blocker = !loadPass
     ? 'the exact artifact does not yet complete tensor binding/load; parity, API/WebUI, context, performance, and portability remain blocked'
     : !parityPass
-      ? 'the exact artifact loads and generates, but deterministic greedy token parity against the pinned llama.cpp oracle fails; API/WebUI promotion and context remain fail-closed'
+      ? 'the exact artifact loads and generates, but deterministic greedy token IDs differ from the pinned llama.cpp oracle. Runtime use is allowed with a numerical-variance warning; Verified/Supported promotion, tools, and checked context remain held'
       : !templatePass
         ? 'raw deterministic parity passes, but the public chat-template envelope is intentionally bounded and has not earned API/WebUI or context promotion'
         : 'short deterministic parity and guarded API/WebUI smoke pass; the exact-row bounded 512-context receipt is still required before support promotion'
@@ -287,8 +288,16 @@ function phase2CompatibilityContract({ id, family, quantization, loadPass, parit
     generation_runs: loadPass ? 'validated_deterministic_greedy' : 'blocked_by_load_failure',
     parity_audited: parityPass ? 'pass_exact_greedy_token_ids' : loadPass ? 'failed_exact_greedy_token_ids' : 'blocked_by_load_failure',
     performance_measured: 'not_promoted',
-    frontend_load_path_verified: parityPass ? 'validated_guarded_api_webui_smoke' : 'fail_closed_phase2_validation',
-    frontend_readiness_gate: 'fail-closed; green only after this exact row passes parity, API/WebUI, and the bounded 512-context gate',
+    frontend_load_path_verified: parityPass
+      ? 'validated_guarded_api_webui_smoke'
+      : runnableWithVariance
+        ? 'runnable_normal_inspect_and_load_path'
+        : 'fail_closed_phase2_validation',
+    frontend_readiness_gate: loadPass && parityPass && templatePass
+      ? 'verified-runnable UI is green for this exact row after parity and guarded API/WebUI pass; Supported remains fail-closed until the bounded 512-context gate passes'
+      : runnableWithVariance
+        ? 'amber runnable UI is allowed for this exact hash-pinned row after the normal inspect/load path reports loaded_now=true and generation_ready=true; label it Runnable, disclose numerical variance, and do not label it Verified or Supported'
+        : 'fail-closed; this exact row must clear its recorded load, parity, or template blocker before guarded API/WebUI qualification',
     tested_context: 'short_prompt_oracle_pack_only',
     chat_template_renderer: templatePass ? 'validated_exact_row_shape_pack' : 'bounded_default_envelope_only',
     chat_template_shape_pack: templatePass ? 'pass' : 'blocked_partial_envelope',
@@ -308,11 +317,17 @@ function phase2CompatibilityContract({ id, family, quantization, loadPass, parit
     bounded_context_8192_pack: 'not_promoted',
     bounded_context_8192_pack_id: 'not_selected',
     bounded_context_8192_window: 8192,
-    latest_checked_bucket: parityPass ? 'phase2_guarded_api_webui_smoke' : 'phase2_short_greedy_parity',
+    latest_checked_bucket: parityPass
+      ? 'phase2_guarded_api_webui_smoke'
+      : runnableWithVariance
+        ? 'phase2_short_greedy_numerical_variance'
+        : 'phase2_short_greedy_parity',
     latest_checked_result: status,
     latest_checked_output: evidence,
     evidence,
-    next_step: 'close the recorded blocker, then capture exact-row API/WebUI and bounded 512-context evidence before support promotion',
+    next_step: runnableWithVariance
+      ? 'keep the exact row usable with an amber numerical-variance warning; capture explicit API/WebUI load and bounded 512-context receipts, and require a documented parity/tolerance decision before Verified or Supported promotion'
+      : 'close the recorded blocker, then capture exact-row API/WebUI and bounded 512-context evidence before support promotion',
   }
 }
 

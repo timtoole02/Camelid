@@ -11,9 +11,9 @@ import { isEmbeddingOnlyModel } from '../../lib/modelCapabilities.js'
 
 function activeLaneChip(lane) {
   if (lane === 'supported') return <EvidenceChip state="supported" asText size="sm">Supported</EvidenceChip>
-  if (lane === 'compatible') return <EvidenceChip state="runnable" asText size="sm">Experimental</EvidenceChip>
+  if (lane === 'compatible') return <EvidenceChip state="runnable" asText size="sm">Runnable</EvidenceChip>
   if (lane === 'eligible') return <EvidenceChip state="runnable" asText size="sm">Ready to test</EvidenceChip>
-  return <EvidenceChip state="unsupported" asText size="sm">Experimental</EvidenceChip>
+  return <EvidenceChip state="unsupported" asText size="sm">Unverified</EvidenceChip>
 }
 
 export function ActiveModelBar({

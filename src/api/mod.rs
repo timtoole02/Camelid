@@ -5114,21 +5114,36 @@ fn phase2_model_compatibility_target(
     template_pass: bool,
     evidence: &'static str,
 ) -> ModelCompatibilityTarget {
+    let runnable_with_variance = load_pass && !parity_pass && template_pass;
     let status = if !load_pass {
         "active_validation_blocked_load"
-    } else if !parity_pass {
-        "active_validation_blocked_parity"
     } else if !template_pass {
         "active_validation_blocked_template"
+    } else if !parity_pass {
+        "runnable_exact_row_numerical_variance"
     } else {
         "active_validation_api_webui_pass_pending_context"
     };
     let blocker = if !load_pass {
-        "the exact artifact does not yet complete tensor binding/load; parity, API/WebUI, context, performance, and portability remain blocked"
+        match id {
+            "phi4_mini_instruct_q8_0" => "the exact artifact cannot load because its fused Phi-4 QKV tensor names are not bound; parity, API/WebUI, context, performance, and portability remain blocked",
+            _ => "the exact artifact does not yet complete tensor binding/load; parity, API/WebUI, context, performance, and portability remain blocked",
+        }
     } else if !parity_pass {
-        "the exact artifact loads and generates, but deterministic greedy token parity against the pinned llama.cpp oracle fails; API/WebUI promotion and context remain fail-closed"
+        match id {
+            "lfm2_5_1_2b_thinking_q8_0" => "the exact artifact loads and generates; the first deterministic greedy probe differs from the pinned llama.cpp oracle at generated token index 3. Runtime use is allowed with a numerical-variance warning; Verified/Supported promotion, tools, and checked context remain held",
+            "gemma3_4b_it_q8_0" => "the exact artifact loads and generates, its tokenizer and chat-template shapes match, and linear RoPE metadata is accepted; the first deterministic greedy probe differs from the pinned llama.cpp oracle at generated token index 3. Runtime use is allowed with a numerical-variance warning; Verified/Supported promotion, tools, and checked context remain held",
+            "llama3_1_8b_instruct_q8_0" => "the exact artifact loads and generates; the first deterministic greedy probe differs from the pinned llama.cpp oracle at generated token index 3. Runtime use is allowed with a numerical-variance warning; Verified/Supported promotion, tools, and checked context remain held",
+            "qwen2_5_0_5b_instruct_q8_0" => "the exact artifact loads and generates, and 3 of 4 deterministic greedy probes match. A fresh current-release run reproduces one probe flip at generated token index 6 (the older committed receipt recorded index 15). Runtime use is allowed with a numerical-variance warning; Verified/Supported promotion, tools, and checked context remain held",
+            "qwen2_5_1_5b_instruct_q8_0" => "the exact artifact loads and generates; the first deterministic greedy probe differs from the pinned llama.cpp oracle at generated token index 4. Runtime use is allowed with a numerical-variance warning; Verified/Supported promotion, tools, and checked context remain held",
+            "qwen3_5_4b_q8_0" => "the exact artifact loads and generates, but only 3 of 6 deterministic greedy probes match the pinned llama.cpp oracle. Runtime use is allowed with a numerical-variance warning; Verified/Supported promotion, tools, and checked context remain held",
+            "qwen3_5_9b_q8_0" => "the exact artifact loads and generates; the first deterministic greedy probe differs from the pinned llama.cpp oracle at generated token index 3. Runtime use is allowed with a numerical-variance warning; Verified/Supported promotion, tools, and checked context remain held",
+            "deepseek_r1_distill_qwen_1_5b_q8_0" => "the exact artifact loads and generates; the first deterministic greedy probe differs from the pinned llama.cpp oracle at generated token index 3. Runtime use is allowed with a numerical-variance warning; Verified/Supported promotion, tools, and checked context remain held",
+            "aya_expanse_8b_q4_k_m" => "the exact artifact loads and generates, and 5 of 6 deterministic greedy probes match; the math probe differs at generated token index 3. Runtime use is allowed with a numerical-variance warning; Verified/Supported promotion, tools, and checked context remain held",
+            _ => "the exact artifact loads and generates, but deterministic greedy token IDs differ from the pinned llama.cpp oracle. Runtime use is allowed with a numerical-variance warning; Verified/Supported promotion, tools, and checked context remain held",
+        }
     } else if !template_pass {
-        "raw deterministic parity passes, but the public chat-template envelope is intentionally bounded and has not earned API/WebUI or context promotion"
+        "raw deterministic parity passes, but the public chat-template envelope is intentionally bounded and has not earned chat or context promotion"
     } else {
         "short deterministic parity and guarded API/WebUI smoke pass; the exact-row bounded 512-context receipt is still required before support promotion"
     };
@@ -5163,10 +5178,18 @@ fn phase2_model_compatibility_target(
         performance_measured: "not_promoted",
         frontend_load_path_verified: if parity_pass {
             "validated_guarded_api_webui_smoke"
+        } else if runnable_with_variance {
+            "runnable_normal_inspect_and_load_path"
         } else {
             "fail_closed_phase2_validation"
         },
-        frontend_readiness_gate: "fail-closed; green only after this exact row passes parity, API/WebUI, and the bounded 512-context gate",
+        frontend_readiness_gate: if load_pass && parity_pass && template_pass {
+            "verified-runnable UI is green for this exact row after parity and guarded API/WebUI pass; Supported remains fail-closed until the bounded 512-context gate passes"
+        } else if runnable_with_variance {
+            "amber runnable UI is allowed for this exact hash-pinned row after the normal inspect/load path reports loaded_now=true and generation_ready=true; label it Runnable, disclose numerical variance, and do not label it Verified or Supported"
+        } else {
+            "fail-closed; this exact row must clear its recorded load, parity, or template blocker before guarded API/WebUI qualification"
+        },
         tested_context: "short_prompt_oracle_pack_only",
         chat_template_renderer: if template_pass {
             "validated_exact_row_shape_pack"
@@ -5196,13 +5219,19 @@ fn phase2_model_compatibility_target(
         bounded_context_8192_window: 8192,
         latest_checked_bucket: if parity_pass {
             "phase2_guarded_api_webui_smoke"
+        } else if runnable_with_variance {
+            "phase2_short_greedy_numerical_variance"
         } else {
             "phase2_short_greedy_parity"
         },
         latest_checked_result: status,
         latest_checked_output: evidence,
         evidence,
-        next_step: "close the recorded blocker, then capture exact-row API/WebUI and bounded 512-context evidence before support promotion",
+        next_step: if runnable_with_variance {
+            "keep the exact row usable with an amber numerical-variance warning; capture explicit API/WebUI load and bounded 512-context receipts, and require a documented parity/tolerance decision before Verified or Supported promotion"
+        } else {
+            "close the recorded blocker, then capture exact-row API/WebUI and bounded 512-context evidence before support promotion"
+        },
     }
 }
 
@@ -5269,7 +5298,7 @@ fn phase2_model_compatibility_targets() -> Vec<ModelCompatibilityTarget> {
             true,
             false,
             true,
-            "qa/model-qualification/phase2-runtime/qwen2_5_0_5b_instruct_q8_0.json",
+            "qa/model-qualification/qwen2.5-0.5b-q8-parity-localization.json",
         ),
         phase2_model_compatibility_target(
             "qwen2_5_1_5b_instruct_q8_0",
@@ -5537,8 +5566,8 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             SupportItem {
                 id: "gemma2",
-                status: "planned_exact_row_candidate",
-                notes: "public readiness: planned first Gemma row only for gemma-2-9b-it-Q8_0.gguf; not supported yet. The exact embedded Gemma 2 IT template now has a fixture-locked renderer and fail-closed route, but real-row token-id parity, bounded load/generation, parity, API/WebUI, RSS, context, and bundle evidence are still missing",
+                status: "active_validation_api_webui_pass_pending_context",
+                notes: "the exact gemma-2-9b-it-Q8_0.gguf row is verified runnable: pinned tokenizer/template identity, real-weight load, six short deterministic greedy oracle probes, and the guarded API/WebUI surface bundle pass. Supported remains fail-closed pending the bounded 512-context receipt plus broader performance and portability evidence",
             },
             SupportItem {
                 id: "phi_falcon_mamba_others",
@@ -7316,21 +7345,21 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 tool_capable: false,
                 family: "phi3",
                 quantization: "Q8_0",
-                status: "active_validation_blocked_parity",
-                support_scope: "exact_row_validation_only",
-                full_support_status: "blocked_generation_parity",
-                full_support_blockers: "generation parity is not certified: prefill and incremental decode disagree from the 3rd generated token (deterministically, since the Metal PV row-tail fix); API/WebUI readiness, context, performance, and portability evidence are also missing. Prompt-token parity and the temperature-0 non-determinism no longer block",
-                metadata_parses: "observed",
+                status: "supported_exact_row_smoke",
+                support_scope: "exact_row_windows_x86_64_cpu_reference_short_greedy",
+                full_support_status: "blocked_pending_context_performance_and_portability",
+                full_support_blockers: "the promoted claim is limited to the exact sha256-pinned Phi-3 Mini 4K Instruct Q8_0 artifact on the Windows x86_64 CPU-reference prefill/decode lane and the checked short greedy/API load envelope; bounded 512/1024/2048/4096 context, performance, tools, neighboring files, Linux, and macOS remain unclaimed",
+                metadata_parses: "validated_exact_artifact",
                 tokenizer_works: "validated_raw_8_of_8_and_chat_3_of_3_prompt_token_parity",
-                tensors_load: "observed",
-                generation_runs: "observed_but_not_parity_certified",
-                parity_audited: "failed",
-                performance_measured: "not_started",
-                frontend_load_path_verified: "fail_closed_blocked_parity",
-                frontend_readiness_gate: "fail-closed until generation parity passes for this exact artifact",
-                tested_context: "prompt_token_parity_to_2180_tokens_single_token_decode_reference_matched_multi_token_diverges_at_index_2",
+                tensors_load: "validated_fused_qkv_and_gate_up_windows_x86_64",
+                generation_runs: "validated_deterministic_greedy_windows_x86_64",
+                parity_audited: "pass_exact_five_token_greedy_windows_x86_64",
+                performance_measured: "not_promoted",
+                frontend_load_path_verified: "validated_api_load_generation_ready_windows_x86_64",
+                frontend_readiness_gate: "green only for the exact certified artifact on Windows x86_64 when loaded_now=true, generation_ready=true, and selected on the CPU-reference prefill/decode lane",
+                tested_context: "short_raw_decode_five_generated_tokens_plus_prompt_token_parity_to_2180_tokens",
                 chat_template_renderer: "phi3_metadata_template_prompt_tokens_reference_matched",
-                chat_template_shape_pack: "failed_reference_parity",
+                chat_template_shape_pack: "validated_prompt_token_parity_3_of_3",
                 chat_template_shape_pack_id: "phi3-chat-template-pack-v1",
                 bounded_context_512_pack: "not_started",
                 bounded_context_512_pack_id: "phi3-context-512-smoke-v1",
@@ -7347,11 +7376,11 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 bounded_context_8192_pack: "not_promoted",
                 bounded_context_8192_pack_id: "not_selected",
                 bounded_context_8192_window: 8192,
-                latest_checked_bucket: "phi3_hold_evidence",
-                latest_checked_result: "blocked_generation_parity",
-                latest_checked_output: "qa/muster/phi3-hold-evidence/README.md",
-                evidence: "prompt-token parity PASSES on the exact artifact Phi-3-mini-4k-instruct-Q8_0.gguf: all_match=true over the committed 8-prompt pack (to a 2180-token prompt) and over the 3 rendered chat prompts, against pinned llama.cpp acd79d603 — qa/muster/phi3-hold-evidence/{prompt-token-parity-q8-20260727.json,chat-prompt-token-parity-q8-20260727.json}. The temperature-0 NON-DETERMINISM that previously blocked this row is FIXED: half_mm_batched_f16o ignored its `rows` argument, so at head_dim=96 the prefill PV pass's partial 64-row tile read past each head V slab and wrote into the next head's columns, racing it; bounding the three unguarded sites by `rows` makes the default path bit-stable (6/6 identical single-token, 3/3 identical multi-token) and returns the reference token 32001 — qa/muster/phi3-hold-evidence/nondeterminism-fixed-q8-20260728.json, which also records Llama-3.2-3B and Mistral-7B bit-identical pre/post patch. Generation parity STILL blocks the row for a separate and now-DETERMINISTIC reason: on 'The capital of France is' the reference emits [3681,29889,13,32001,3869] while camelid emits [3681,29889,3681,338,2998], diverging at index 2, and a fresh prefill of the 8-token prefix returns the reference 13 where incremental decode returns 3681. This row is intentionally not advertised as supported",
-                next_step: "reconcile phi3 incremental decode with prefill — a fresh prefill of the same prefix matches the reference while decode does not, so compare the decode KV-cache read against the prefill path for head_dim=96 (the same non-multiple-of-64 shape that broke the PV row tile). Then re-run generation parity and capture exact-row API/WebUI and bounded-context evidence before promotion",
+                latest_checked_bucket: "windows_x86_64_cpu_reference_short_greedy",
+                latest_checked_result: "pass",
+                latest_checked_output: "qa/model-qualification/phi3-mini-windows-support-20260811.json",
+                evidence: "The exact artifact Phi-3-mini-4k-instruct-Q8_0.gguf (sha256 0ac8ee48aeebf7d1b354691fd1e29e91c32ad88bbad10ad45ac880dcd4372a47) passes prompt-token parity on the committed 8-prompt raw pack and 3 rendered chat prompts. On Windows x86_64 at source head e4bf87d7, POST /api/models/load reports generation-ready on the conservative CPU-reference prefill/decode lane, and the formerly failing raw prompt now emits the pinned llama.cpp sequence [3681,29889,13,32001,3869] exactly. Receipt: qa/model-qualification/phi3-mini-windows-support-20260811.json",
+                next_step: "run bounded 512/1024/2048/4096 context packs and independent macOS/Linux lanes before widening this exact Windows short-greedy support claim",
             },
             ModelCompatibilityTarget {
                 id: "phi4_mini_instruct_q4_k_m",
@@ -15180,6 +15209,9 @@ async fn chat_completions_multi_choice(
     };
     // Disclose the serve lane once — every choice ran the same model.
     let lane = match state.loaded_models.read().await.get(&model_id) {
+        Some(model) if classify_loaded_model(model) == ModelLaneClass::RunnableWithVariance => {
+            Some("numerical_variance")
+        }
         Some(model) if classify_loaded_model(model) == ModelLaneClass::ExperimentalImplemented => {
             Some("experimental")
         }
@@ -15562,6 +15594,11 @@ async fn chat_completions(
             // an implemented decoder that is NOT a supported exact row. Never set
             // for supported rows; never a parity claim.
             let lane = match state.loaded_models.read().await.get(&model_id) {
+                Some(model)
+                    if classify_loaded_model(model) == ModelLaneClass::RunnableWithVariance =>
+                {
+                    Some("numerical_variance")
+                }
                 Some(model)
                     if classify_loaded_model(model) == ModelLaneClass::ExperimentalImplemented =>
                 {
@@ -25283,6 +25320,14 @@ mod tests {
                 ModelLaneClass::ExperimentalImplemented
             },
         );
+        assert_eq!(
+            classify_model_lane(Some("phi3"), PHI3_MINI_4K_Q8_0_FILENAME),
+            if phi3_supported_on_current_host() {
+                ModelLaneClass::Supported
+            } else {
+                ModelLaneClass::ExperimentalImplemented
+            },
+        );
         // Non-catalog allowlisted artifact of a supported row (in-house requant
         // with no HF catalog source) â†’ Supported.
         assert_eq!(
@@ -25341,6 +25386,26 @@ mod tests {
                 classify_model_lane(Some("qwen35"), filename),
                 ModelLaneClass::Supported,
                 "{filename} should resolve through its supported catalog row",
+            );
+        }
+        // Exact Phase 2 rows that load and generate but cross a strict
+        // reference-token numerical frontier are runnable amber, not generic
+        // Experimental and not Supported.
+        for (architecture, filename) in [
+            ("lfm2", "LFM2.5-1.2B-Thinking-Q8_0.gguf"),
+            ("gemma3", "gemma-3-4b-it-Q8_0.gguf"),
+            ("llama", "Meta-Llama-3.1-8B-Instruct-Q8_0.gguf"),
+            ("qwen2", "qwen2.5-0.5b-instruct-q8_0.gguf"),
+            ("qwen2", "qwen2.5-1.5b-instruct-q8_0.gguf"),
+            ("qwen35", "Qwen3.5-4B-Q8_0.gguf"),
+            ("qwen35", "Qwen3.5-9B-Q8_0.gguf"),
+            ("qwen2", "DeepSeek-R1-Distill-Qwen-1.5B-Q8_0.gguf"),
+            ("command-r", "aya-expanse-8b-Q4_K_M.gguf"),
+        ] {
+            assert_eq!(
+                classify_model_lane(Some(architecture), filename),
+                ModelLaneClass::RunnableWithVariance,
+                "{filename} should keep its runnable numerical-variance lane",
             );
         }
         // Implemented architecture but NOT a supported exact artifact (different
@@ -25430,6 +25495,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn phi3_support_scope_is_windows_x86_64_only() {
+        assert!(phi3_support_scope_matches("windows", "x86_64"));
+        assert!(!phi3_support_scope_matches("windows", "aarch64"));
+        assert!(!phi3_support_scope_matches("linux", "x86_64"));
+        assert!(!phi3_support_scope_matches("macos", "aarch64"));
+    }
+
     fn provisional_lfm2_supported_plan() -> ExecutionPlan {
         ExecutionPlan {
             profile: ExecutionProfile::Auto,
@@ -25486,6 +25559,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn stored_phi3_plan_requires_the_exact_certified_artifact() {
+        let expected_sha = supported_artifact_expected_sha256(PHI3_MINI_4K_Q8_0_FILENAME)
+            .expect("promoted Phi-3 row must carry a digest");
+        let mut plan = provisional_lfm2_supported_plan();
+        plan.model_family = "phi3".into();
+
+        finalize_execution_plan_support_for_loaded_artifact(
+            &mut plan,
+            std::path::Path::new("/models/Phi-3-mini-4k-instruct-Q8_0.gguf"),
+            expected_sha,
+        );
+        assert_eq!(plan.support_level, "supported_exact_row_smoke");
+
+        for (path, sha) in [
+            ("/models/Phi-3-mini-4k-instruct-Q8_0.gguf", "00"),
+            ("/models/renamed-phi3.gguf", expected_sha),
+        ] {
+            let mut plan = provisional_lfm2_supported_plan();
+            plan.model_family = "phi3".into();
+            finalize_execution_plan_support_for_loaded_artifact(
+                &mut plan,
+                std::path::Path::new(path),
+                sha,
+            );
+            assert_eq!(plan.support_level, "unknown_or_unvalidated");
+        }
+    }
+
     /// Every artifact whose supported-row identity is pinned to exact bytes:
     /// the paired Prism evidence bundles, the non-catalog allowlist, and the
     /// curated rows carrying a recorded digest. `classify_model_lane` only
@@ -25519,12 +25621,11 @@ mod tests {
                 filename,
                 &"00".repeat(32)
             ));
-            let expected_lane =
-                if filename == LFM2_5_2_6B_Q8_0_FILENAME && !lfm2_supported_on_current_host() {
-                    ModelLaneClass::ExperimentalImplemented
-                } else {
-                    ModelLaneClass::Supported
-                };
+            let expected_lane = if supported_exact_row_host_eligible(filename) {
+                ModelLaneClass::Supported
+            } else {
+                ModelLaneClass::ExperimentalImplemented
+            };
             assert_eq!(
                 classify_loaded_model_identity(Some("qwen35"), filename, expected_sha256),
                 expected_lane,
@@ -25537,7 +25638,7 @@ mod tests {
             );
             // With no digest in hand, a pin says nothing: the row keeps its
             // ordinary filename/header class, further narrowed only by an
-            // explicitly host-scoped receipt such as LFM2's.
+            // explicitly host-scoped receipt such as LFM2's or Phi-3's.
             assert_eq!(
                 classify_model_lane_with_verified_sha256(Some("qwen35"), filename, None),
                 expected_lane,
@@ -25581,6 +25682,7 @@ mod tests {
             "gemma-3-1b-it-Q8_0.gguf",
             "Qwen3-4B-Q4_K_M.gguf",
             "LFM2.5-2.6B-Q8_0.gguf",
+            "Phi-3-mini-4k-instruct-Q8_0.gguf",
             "ornith-1.0-9b-Q8_0.gguf",
             "ornith-1.0-9b-Q4_K_M.gguf",
             "ornith-1.0-9b-Q3_K_M.gguf",
@@ -25600,12 +25702,11 @@ mod tests {
                 supported_artifact_expected_sha256(filename).is_some(),
                 "precondition: {filename} is hash-pinned"
             );
-            let expected_preload_class =
-                if filename == LFM2_5_2_6B_Q8_0_FILENAME && !lfm2_supported_on_current_host() {
-                    ModelLaneClass::ExperimentalImplemented
-                } else {
-                    ModelLaneClass::Supported
-                };
+            let expected_preload_class = if supported_exact_row_host_eligible(filename) {
+                ModelLaneClass::Supported
+            } else {
+                ModelLaneClass::ExperimentalImplemented
+            };
             assert_eq!(
                 classify_model_lane_with_verified_sha256(Some("llama"), filename, None),
                 expected_preload_class,
@@ -25677,12 +25778,11 @@ mod tests {
                 supported_artifact_identity_matches(filename, sha256),
                 "{filename} must retain its certified byte identity independently of host scope"
             );
-            let expected_lane =
-                if *filename == LFM2_5_2_6B_Q8_0_FILENAME && !lfm2_supported_on_current_host() {
-                    ModelLaneClass::ExperimentalImplemented
-                } else {
-                    ModelLaneClass::Supported
-                };
+            let expected_lane = if supported_exact_row_host_eligible(filename) {
+                ModelLaneClass::Supported
+            } else {
+                ModelLaneClass::ExperimentalImplemented
+            };
             assert_eq!(
                 classify_loaded_model_identity(Some("llama"), filename, sha256),
                 expected_lane,
@@ -25692,6 +25792,34 @@ mod tests {
                 classify_loaded_model_identity(Some("llama"), filename, &"00".repeat(32)),
                 ModelLaneClass::ExperimentalImplemented,
                 "{filename} with other bytes must not inherit the row"
+            );
+        }
+    }
+
+    #[test]
+    fn numerical_variance_rows_keep_their_lane_only_for_certified_bytes() {
+        for (architecture, filename) in [
+            ("lfm2", "LFM2.5-1.2B-Thinking-Q8_0.gguf"),
+            ("gemma3", "gemma-3-4b-it-Q8_0.gguf"),
+            ("llama", "Meta-Llama-3.1-8B-Instruct-Q8_0.gguf"),
+            ("qwen2", "qwen2.5-0.5b-instruct-q8_0.gguf"),
+            ("qwen2", "qwen2.5-1.5b-instruct-q8_0.gguf"),
+            ("qwen35", "Qwen3.5-4B-Q8_0.gguf"),
+            ("qwen35", "Qwen3.5-9B-Q8_0.gguf"),
+            ("qwen2", "DeepSeek-R1-Distill-Qwen-1.5B-Q8_0.gguf"),
+            ("command-r", "aya-expanse-8b-Q4_K_M.gguf"),
+        ] {
+            let expected = phase2_curated_artifact_expected_sha256(filename)
+                .unwrap_or_else(|| panic!("missing Phase 2 pin for {filename}"));
+            assert_eq!(
+                classify_loaded_model_identity(Some(architecture), filename, expected),
+                ModelLaneClass::RunnableWithVariance,
+                "{filename} should retain its amber lane for the qualified bytes",
+            );
+            assert_eq!(
+                classify_loaded_model_identity(Some(architecture), filename, &"00".repeat(32)),
+                ModelLaneClass::ExperimentalImplemented,
+                "{filename} must lose the qualified lane when its bytes differ",
             );
         }
     }
@@ -26050,6 +26178,10 @@ mod tests {
                 "llama3_2_1b_instruct_iq4_xs",
                 "llama3_8b_instruct_q8_0",
                 "lfm2_5_2_6b_q8_0",
+                // Phi-3 Mini 4K Instruct Q8_0: exact SHA-pinned artifact on the
+                // Windows x86_64 CPU-reference lane, with prompt-token parity
+                // and the previously held greedy sequence now matching exactly.
+                "phi3_mini_4k_instruct_q8_0",
                 "mistral_7b_instruct_v0_3_q8_0",
                 // Nomic v1.5 Q8_0 bidirectional encoder: exact-row embeddings,
                 // embedding-similarity reranking, and Workspace semantic retrieval.
@@ -26121,10 +26253,17 @@ mod tests {
                 !target.status.starts_with("supported"),
                 "{id} must not become supported through family-level inference"
             );
-            assert!(
-                target.frontend_readiness_gate.contains("fail-closed"),
-                "{id} must keep frontend readiness fail-closed"
-            );
+            if target.status == "runnable_exact_row_numerical_variance" {
+                assert!(
+                    target.frontend_readiness_gate.contains("amber runnable"),
+                    "{id} must disclose its runnable numerical-variance lane"
+                );
+            } else {
+                assert!(
+                    target.frontend_readiness_gate.contains("fail-closed"),
+                    "{id} must keep frontend readiness fail-closed"
+                );
+            }
         }
 
         assert!(response
@@ -26172,7 +26311,7 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_report_next_family_rows_stay_planned_and_fail_closed() {
+    fn capabilities_report_next_family_rows_with_precise_evidence_gates() {
         let response = capabilities_response();
 
         let mixtral = response
@@ -26255,12 +26394,12 @@ mod tests {
             .iter()
             .find(|target| target.id == "aya_expanse_8b_q4_k_m")
             .expect("the manageable Aya Command-R candidate must stay advertised");
-        assert_eq!(command_r.status, "active_validation_blocked_parity");
+        assert_eq!(command_r.status, "runnable_exact_row_numerical_variance");
         assert_eq!(command_r.support_scope, "phase2_exact_row_validation_only");
         assert_eq!(command_r.metadata_parses, "validated_exact_artifact");
         assert_eq!(command_r.tensors_load, "validated_real_weight_forward");
         assert_eq!(command_r.parity_audited, "failed_exact_greedy_token_ids");
-        assert!(command_r.frontend_readiness_gate.contains("fail-closed"));
+        assert!(command_r.frontend_readiness_gate.contains("amber runnable"));
         assert_eq!(
             command_r.evidence,
             "qa/model-qualification/phase2-runtime/aya_expanse_8b_q4_k_m.json"
@@ -26272,37 +26411,24 @@ mod tests {
             .iter()
             .find(|target| target.id == "phi3_mini_4k_instruct_q8_0")
             .expect("Phi-3 exact-row validation lane should stay visible");
-        // The row stays blocked and fail-closed: prompt-token parity was cleared
-        // 2026-07-27, but the forward pass still diverges from the reference, so
-        // nothing about the support claim moves.
-        assert_eq!(phi3.status, "active_validation_blocked_parity");
-        assert_eq!(phi3.parity_audited, "failed");
-        assert_eq!(phi3.latest_checked_result, "blocked_generation_parity");
-        assert!(phi3.frontend_readiness_gate.contains("fail-closed"));
-        // Prompt-token parity now passes and must be stated as passing...
-        assert!(phi3.evidence.contains("prompt-token parity PASSES"));
-        assert!(phi3.evidence.contains("all_match=true"));
+        assert_eq!(phi3.status, "supported_exact_row_smoke");
+        assert_eq!(
+            phi3.support_scope,
+            "exact_row_windows_x86_64_cpu_reference_short_greedy"
+        );
+        assert_eq!(
+            phi3.parity_audited,
+            "pass_exact_five_token_greedy_windows_x86_64"
+        );
+        assert_eq!(phi3.latest_checked_result, "pass");
+        assert!(phi3.frontend_readiness_gate.contains("Windows x86_64"));
+        assert!(phi3.evidence.contains("prompt-token parity"));
+        assert!(phi3.evidence.contains("[3681,29889,13,32001,3869] exactly"));
         assert!(!phi3.tokenizer_works.starts_with("blocked"));
-        // ...the temperature-0 non-determinism must be stated as FIXED (the Metal PV
-        // row-tail guard landed)...
-        assert!(phi3
-            .evidence
-            .contains("NON-DETERMINISM that previously blocked this row is"));
-        assert!(phi3
-            .evidence
-            .contains("nondeterminism-fixed-q8-20260728.json"));
-        // ...and generation parity must still be stated as blocking, for the separate
-        // DETERMINISTIC prefill-vs-decode divergence. This is the same claim an earlier
-        // receipt made and had to retract -- it was then inferred from two samples of a
-        // non-deterministic engine. It is assertable here only because it is now
-        // repeatable (3/3 identical runs), which is what makes it evidence.
-        assert!(phi3
-            .evidence
-            .contains("Generation parity STILL blocks the row"));
-        assert!(phi3.evidence.contains("diverging at index 2"));
-        assert!(phi3
-            .full_support_status
-            .contains("blocked_generation_parity"));
+        assert_eq!(
+            phi3.latest_checked_output,
+            "qa/model-qualification/phi3-mini-windows-support-20260811.json"
+        );
 
         // The held Phi-4 artifact carries a tokenizer admission gate but no support
         // claim, so it must never surface as an installable catalog row.
@@ -26331,7 +26457,7 @@ mod tests {
     }
 
     #[test]
-    fn phase2_exact_rows_are_unique_downloadable_and_fail_closed() {
+    fn phase2_exact_rows_are_unique_downloadable_and_evidence_gated() {
         let expected = BTreeSet::from([
             "lfm2_5_1_2b_instruct_q8_0",
             "lfm2_5_1_2b_thinking_q8_0",
@@ -26379,16 +26505,20 @@ mod tests {
             phase2_rows
                 .iter()
                 .filter(|row| {
-                    row.status == "active_validation_blocked_parity"
+                    row.status == "runnable_exact_row_numerical_variance"
                         || row.status == "active_validation_blocked_load"
                 })
                 .count(),
-            11
+            10
         );
-        assert!(phase2_rows.iter().all(|row| {
-            !row.status.starts_with("supported")
-                && row.frontend_readiness_gate.contains("fail-closed")
-        }));
+        assert_eq!(
+            phase2_rows
+                .iter()
+                .filter(|row| row.status.starts_with("supported"))
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec!["phi3_mini_4k_instruct_q8_0"]
+        );
 
         let catalog_ids = curated_catalog()
             .iter()
@@ -26396,6 +26526,50 @@ mod tests {
             .map(|item| item.catalog_id)
             .collect::<BTreeSet<_>>();
         assert_eq!(catalog_ids, expected);
+
+        // Qualification belongs to immutable bytes, not a filename that an
+        // upstream repository can replace. Every Phase 2 catalog row must stay
+        // joined to the digest captured by the qualification roster, including
+        // rows whose result is a known load/parity/template hold.
+        let phase2_catalog = curated_catalog()
+            .into_iter()
+            .filter(|item| expected.contains(item.catalog_id))
+            .collect::<Vec<_>>();
+        assert_eq!(PHASE2_CURATED_ARTIFACT_SHA256.len(), 20);
+        assert_eq!(phase2_catalog.len(), 20);
+        for item in &phase2_catalog {
+            let digest = phase2_curated_artifact_expected_sha256(item.filename)
+                .unwrap_or_else(|| panic!("missing pinned digest for {}", item.filename));
+            assert_eq!(digest.len(), 64, "invalid digest for {}", item.filename);
+            assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
+
+        let gemma2 = phase2_rows
+            .iter()
+            .find(|row| row.id == "gemma2_9b_it_q8_0")
+            .expect("Gemma 2 qualification row should remain visible");
+        assert_eq!(
+            gemma2.status,
+            "active_validation_api_webui_pass_pending_context"
+        );
+        assert_eq!(gemma2.parity_audited, "pass_exact_greedy_token_ids");
+        assert_eq!(
+            gemma2.frontend_load_path_verified,
+            "validated_guarded_api_webui_smoke"
+        );
+
+        let gemma3_4b = phase2_rows
+            .iter()
+            .find(|row| row.id == "gemma3_4b_it_q8_0")
+            .expect("Gemma 3 4B qualification row should remain visible");
+        assert_eq!(gemma3_4b.status, "runnable_exact_row_numerical_variance");
+        assert!(gemma3_4b
+            .full_support_blockers
+            .contains("generated token index 3"));
+        assert!(gemma3_4b
+            .full_support_blockers
+            .contains("tokenizer and chat-template shapes match"));
+        assert!(gemma3_4b.frontend_readiness_gate.contains("amber runnable"));
     }
 
     #[test]
@@ -34464,6 +34638,10 @@ const HF_SEARCH_LIMIT: usize = 15;
 pub enum ModelLaneClass {
     /// Exact supported row (asserted by `/api/capabilities`) â€” the full supported lane.
     Supported,
+    /// Exact hash-pinned row that loads and generates, while deterministic token
+    /// IDs differ from the pinned reference on at least one probe. This lane is
+    /// runnable and amber; it is neither Experimental nor Verified/Supported.
+    RunnableWithVariance,
     /// Architecture is implemented but this is NOT a supported row: attemptable,
     /// unverified, no parity claim.
     ExperimentalImplemented,
@@ -34481,6 +34659,21 @@ fn supported_compatibility_row_ids() -> &'static std::collections::HashSet<&'sta
             .model_compatibility
             .into_iter()
             .filter(|row| row.status == "supported" || row.status.starts_with("supported_"))
+            .map(|row| row.id)
+            .collect()
+    })
+}
+
+/// Exact rows whose real-weight load/generation path is proven but whose strict
+/// deterministic token-ID comparison has a disclosed numerical frontier. These
+/// rows remain outside Supported/Verified while staying usable in the product.
+fn numerical_variance_compatibility_row_ids() -> &'static std::collections::HashSet<&'static str> {
+    static IDS: OnceLock<std::collections::HashSet<&'static str>> = OnceLock::new();
+    IDS.get_or_init(|| {
+        capabilities_response_with_plan(None)
+            .model_compatibility
+            .into_iter()
+            .filter(|row| row.status == "runnable_exact_row_numerical_variance")
             .map(|row| row.id)
             .collect()
     })
@@ -34614,7 +34807,104 @@ const CURATED_SUPPORTED_ARTIFACT_SHA256: &[(&str, &str)] = &[
         "LFM2.5-2.6B-Q8_0.gguf",
         "36587fdf27bdfc69caf2637273679a0870ec155162161bde6fd16e8c70bdb757",
     ),
+    (
+        "Phi-3-mini-4k-instruct-Q8_0.gguf",
+        "0ac8ee48aeebf7d1b354691fd1e29e91c32ad88bbad10ad45ac880dcd4372a47",
+    ),
 ];
+
+/// Immutable identities captured by the Phase 2 exact-row qualification roster.
+/// This table is an install-integrity gate, not a support allowlist: rows with a
+/// recorded parity/load/template hold are pinned too, so a later upstream
+/// replacement cannot silently inherit either a pass or a known-failure result.
+const PHASE2_CURATED_ARTIFACT_SHA256: &[(&str, &str)] = &[
+    (
+        "LFM2.5-1.2B-Instruct-Q8_0.gguf",
+        "f6b981dcb86917fa463f78a362320bd5e2dc45445df147287eedb85e5a30d26a",
+    ),
+    (
+        "LFM2.5-1.2B-Thinking-Q8_0.gguf",
+        "255f9dcbb8f198c8b6e91b35a63349f062a4902bc58f59312f9b66de45fa9064",
+    ),
+    (
+        "gemma-3-270m-it-Q8_0.gguf",
+        "d156a5159f2f79c1b1d53c7c1cc20f1ff28ab8d00f17a292620aad13399b9698",
+    ),
+    (
+        "gemma-3-4b-it-Q8_0.gguf",
+        "97b06383df48336e7d2f9b56b6ce545e0fa476407a62c0bd081b53447a58e644",
+    ),
+    (
+        "Meta-Llama-3.1-8B-Instruct-Q8_0.gguf",
+        "9da71c45c90a821809821244d4971e5e5dfad7eb091f0b8ff0546392393b6283",
+    ),
+    (
+        "mistral-7b-instruct-v0.2.Q8_0.gguf",
+        "f326f5f4f137f3ad30f8c9cc21d4d39e54476583e8306ee2931d5a022cb85b06",
+    ),
+    (
+        "qwen2.5-0.5b-instruct-q8_0.gguf",
+        "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e",
+    ),
+    (
+        "qwen2.5-1.5b-instruct-q8_0.gguf",
+        "d7efb072e7724d25048a4fda0a3e10b04bdef5d06b1403a1c93bd9f1240a63c8",
+    ),
+    (
+        "qwen2.5-coder-1.5b-instruct-q8_0.gguf",
+        "507de59046601282ba768a9789900e6ccf60ed93ddf346730b7c68eb0715bc47",
+    ),
+    (
+        "Qwen3.5-0.8B-Q8_0.gguf",
+        "0ad885ffd4bb022fc4f0d33a3308fa108ef8613159d3b3a67e23abca056b7a6c",
+    ),
+    (
+        "Qwen3.5-2B-Q8_0.gguf",
+        "1b04acba824817554f4ce23639bc8495ff70453b8fcb047900c731521021f2c1",
+    ),
+    (
+        "Qwen3.5-4B-Q8_0.gguf",
+        "10cc391b403021dd11c614679d2fd92f611c3681d29e29651b717316965d61e1",
+    ),
+    (
+        "Qwen3.5-9B-Q8_0.gguf",
+        "809626574d0cb43d4becfa56169980da2bb448f2299270f7be443cb89d0a6ae4",
+    ),
+    (
+        "DeepSeek-R1-Distill-Qwen-1.5B-Q8_0.gguf",
+        "068a721e47419ccfc94b6420118f772478544e1a0d4fad7118212774b3f9ba9e",
+    ),
+    (
+        "DeepSeek-R1-Distill-Llama-8B-Q8_0.gguf",
+        "8c6e3924d662d3f24a96b228a5c317510c27e91c587e71e78877ed18a875ec82",
+    ),
+    (
+        "Phi-3-mini-4k-instruct-Q8_0.gguf",
+        "0ac8ee48aeebf7d1b354691fd1e29e91c32ad88bbad10ad45ac880dcd4372a47",
+    ),
+    (
+        "Phi-4-mini-instruct.Q8_0.gguf",
+        "26188c6050d525376a88b04514c236c5e28a36730f1e936f2a00314212b7ba42",
+    ),
+    (
+        "gemma-2-9b-it-q8_0.gguf",
+        "59f2e1125fc3af738c256336fb11095da855050305b3705c6c779730a3a8d84e",
+    ),
+    (
+        "SmolLM3-Q8_0.gguf",
+        "8aa8cc74656137174a1988d993b00828e65a86fd68773412b632a75aa1373248",
+    ),
+    (
+        "aya-expanse-8b-Q4_K_M.gguf",
+        "9592bad943fe56cf93200286a0a4b00a158cd84a408f227b9978ec5879002fb8",
+    ),
+];
+
+fn phase2_curated_artifact_expected_sha256(filename: &str) -> Option<&'static str> {
+    PHASE2_CURATED_ARTIFACT_SHA256
+        .iter()
+        .find_map(|(artifact, sha256)| (*artifact == filename).then_some(*sha256))
+}
 
 /// Exact Prism model identities proven by the paired Metal/CUDA evidence
 /// bundles. Unlike the cheap local-library listing, a loaded model already has
@@ -34717,7 +35007,17 @@ fn filename_is_supported_exact_row(filename: &str) -> bool {
             .any(|(artifact, row_id, _)| *artifact == filename && supported.contains(row_id))
 }
 
+/// True only for a curated exact artifact whose capability row records a proven
+/// load/generation path plus disclosed numerical variance against the reference.
+fn filename_is_numerical_variance_exact_row(filename: &str) -> bool {
+    let runnable = numerical_variance_compatibility_row_ids();
+    curated_catalog()
+        .iter()
+        .any(|item| item.filename == filename && runnable.contains(item.catalog_id))
+}
+
 const LFM2_5_2_6B_Q8_0_FILENAME: &str = "LFM2.5-2.6B-Q8_0.gguf";
+const PHI3_MINI_4K_Q8_0_FILENAME: &str = "Phi-3-mini-4k-instruct-Q8_0.gguf";
 
 /// The exact platform envelope carried by the LFM2 promotion receipts.
 ///
@@ -34761,7 +35061,7 @@ fn lfm2_support_command_output(program: &str, args: &[&str]) -> Option<String> {
 }
 
 fn lfm2_supported_on_current_host() -> bool {
-    let supported_profile_selected = crate::execution_plan::lfm2_supported_profile_selected();
+    let supported_profile_selected = crate::execution_plan::supported_profile_selected();
     if lfm2_support_scope_matches(
         env::consts::OS,
         env::consts::ARCH,
@@ -34805,31 +35105,45 @@ fn lfm2_supported_on_current_host() -> bool {
     }
 }
 
-fn supported_exact_row_host_eligible(filename: &str) -> bool {
-    filename != LFM2_5_2_6B_Q8_0_FILENAME || lfm2_supported_on_current_host()
+fn phi3_support_scope_matches(operating_system: &str, architecture: &str) -> bool {
+    operating_system == "windows" && architecture == "x86_64"
 }
 
-/// Finalize the provisional LFM plan only after the load pipeline has hashed
-/// the actual bytes. Planning can prove a host/backend shape but cannot prove
-/// artifact identity from GGUF metadata: `general.name` is user-controlled and
-/// a same-named replacement may carry different bytes. Every stored/health plan
-/// therefore loses the supported label unless filename and certified digest
-/// both match the promoted artifact.
+fn phi3_supported_on_current_host() -> bool {
+    phi3_support_scope_matches(env::consts::OS, env::consts::ARCH)
+        && crate::execution_plan::supported_profile_selected()
+}
+
+fn supported_exact_row_host_eligible(filename: &str) -> bool {
+    match filename {
+        LFM2_5_2_6B_Q8_0_FILENAME => lfm2_supported_on_current_host(),
+        PHI3_MINI_4K_Q8_0_FILENAME => phi3_supported_on_current_host(),
+        _ => true,
+    }
+}
+
+/// Finalize a provisional platform-scoped plan only after the load pipeline has
+/// hashed the actual bytes. Planning can prove a host/backend shape but cannot
+/// prove artifact identity from GGUF metadata: `general.name` is user-controlled
+/// and a same-named replacement may carry different bytes.
 fn finalize_execution_plan_support_for_loaded_artifact(
     plan: &mut ExecutionPlan,
     model_path: &std::path::Path,
     gguf_sha256: &str,
 ) {
-    if plan.model_family != "lfm2" || plan.support_level != "supported_exact_row_smoke" {
+    if plan.support_level != "supported_exact_row_smoke" {
         return;
     }
+    let expected_filename = match plan.model_family.as_str() {
+        "lfm2" => LFM2_5_2_6B_Q8_0_FILENAME,
+        "phi3" => PHI3_MINI_4K_Q8_0_FILENAME,
+        _ => return,
+    };
     let filename = model_path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default();
-    if filename == LFM2_5_2_6B_Q8_0_FILENAME
-        && supported_artifact_identity_matches(filename, gguf_sha256)
-    {
+    if filename == expected_filename && supported_artifact_identity_matches(filename, gguf_sha256) {
         return;
     }
 
@@ -34841,11 +35155,12 @@ fn finalize_execution_plan_support_for_loaded_artifact(
     {
         *reason = "support_level=unknown_or_unvalidated".into();
     }
-    plan.reasons
-        .push("support withheld: LFM filename or certified sha256 did not match".into());
+    plan.reasons.push(
+        "support withheld: platform-scoped filename or certified sha256 did not match".into(),
+    );
 }
 
-/// Add a current-host answer only for the explicitly platform-scoped LFM row.
+/// Add a current-host answer only for explicitly platform-scoped supported rows.
 /// Other curated rows retain their existing compatibility/oracle prediction;
 /// live Hugging Face rows never call this helper.
 ///
@@ -34856,13 +35171,20 @@ fn catalog_host_lane_class_with_eligibility(
     item: &CatalogItem,
     host_eligible: bool,
 ) -> Option<ModelLaneClass> {
-    (item.filename == LFM2_5_2_6B_Q8_0_FILENAME
-        && supported_compatibility_row_ids().contains(item.catalog_id))
-    .then_some(if host_eligible {
-        ModelLaneClass::Supported
-    } else {
-        ModelLaneClass::ExperimentalImplemented
-    })
+    if matches!(
+        item.filename,
+        LFM2_5_2_6B_Q8_0_FILENAME | PHI3_MINI_4K_Q8_0_FILENAME
+    ) && supported_compatibility_row_ids().contains(item.catalog_id)
+    {
+        return Some(if host_eligible {
+            ModelLaneClass::Supported
+        } else {
+            ModelLaneClass::ExperimentalImplemented
+        });
+    }
+    numerical_variance_compatibility_row_ids()
+        .contains(item.catalog_id)
+        .then_some(ModelLaneClass::RunnableWithVariance)
 }
 
 fn catalog_host_lane_class(item: &CatalogItem) -> Option<ModelLaneClass> {
@@ -34881,6 +35203,8 @@ fn classify_model_lane(architecture: Option<&str>, filename: &str) -> ModelLaneC
                 && supported_exact_row_host_eligible(filename)
             {
                 ModelLaneClass::Supported
+            } else if filename_is_numerical_variance_exact_row(filename) {
+                ModelLaneClass::RunnableWithVariance
             } else {
                 ModelLaneClass::ExperimentalImplemented
             }
@@ -34933,9 +35257,12 @@ fn classify_loaded_model_identity(
     gguf_sha256: &str,
 ) -> ModelLaneClass {
     let class = classify_model_lane(architecture, filename);
-    if class == ModelLaneClass::Supported
-        && supported_artifact_expected_sha256(filename).is_some()
-        && !supported_artifact_identity_matches(filename, gguf_sha256)
+    let expected_sha256 = supported_artifact_expected_sha256(filename)
+        .or_else(|| phase2_curated_artifact_expected_sha256(filename));
+    if matches!(
+        class,
+        ModelLaneClass::Supported | ModelLaneClass::RunnableWithVariance
+    ) && expected_sha256.is_some_and(|expected| !gguf_sha256.eq_ignore_ascii_case(expected))
     {
         ModelLaneClass::ExperimentalImplemented
     } else {
@@ -35238,10 +35565,12 @@ impl CatalogDownloadArtifact {
     }
 
     fn expected_sha256(&self) -> Option<&'static str> {
-        (self.role != "model")
-            .then(|| catalog_companion_artifact_by_filename(&self.filename))
-            .flatten()
-            .and_then(|companion| catalog_companion_expected_sha256(&companion))
+        if self.role == "model" {
+            phase2_curated_artifact_expected_sha256(&self.filename)
+        } else {
+            catalog_companion_artifact_by_filename(&self.filename)
+                .and_then(|companion| catalog_companion_expected_sha256(&companion))
+        }
     }
 }
 
@@ -36505,10 +36834,29 @@ mod catalog_fit_tests {
             serde_json::to_value(&view).unwrap()["host_lane_class"],
             serde_json::json!(match expected {
                 super::ModelLaneClass::Supported => "supported",
+                super::ModelLaneClass::RunnableWithVariance => "runnable_with_variance",
                 super::ModelLaneClass::ExperimentalImplemented => "experimental_implemented",
                 super::ModelLaneClass::Unsupported => "unsupported",
             }),
             "the frontend must receive the host-scoped verdict"
+        );
+
+        let phi3 = row("phi3_mini_4k_instruct_q8_0");
+        assert_eq!(
+            super::catalog_host_lane_class_with_eligibility(&phi3, true),
+            Some(super::ModelLaneClass::Supported)
+        );
+        assert_eq!(
+            super::catalog_host_lane_class_with_eligibility(&phi3, false),
+            Some(super::ModelLaneClass::ExperimentalImplemented)
+        );
+        assert_eq!(
+            CatalogItemView::from_curated(&phi3, &hw).host_lane_class,
+            Some(if super::phi3_supported_on_current_host() {
+                super::ModelLaneClass::Supported
+            } else {
+                super::ModelLaneClass::ExperimentalImplemented
+            })
         );
 
         let unpromoted = row("qwen3_14b_q4_k_m");

@@ -1,0 +1,56 @@
+{
+  "schema": "camelid.exact-row-support-receipt/v1",
+  "captured_at": "2026-08-11T23:00:00Z",
+  "source_head": "e4bf87d7b5d8b75d6f11577bf6ac82229064f2e8",
+  "row_id": "phi3_mini_4k_instruct_q8_0",
+  "artifact": {
+    "filename": "Phi-3-mini-4k-instruct-Q8_0.gguf",
+    "size_bytes": 4061221376,
+    "sha256": "0ac8ee48aeebf7d1b354691fd1e29e91c32ad88bbad10ad45ac880dcd4372a47",
+    "architecture": "phi3",
+    "quantization": "Q8_0",
+    "source": "bartowski/Phi-3-mini-4k-instruct-GGUF"
+  },
+  "host": {
+    "operating_system": "windows",
+    "architecture": "x86_64",
+    "windows_version": "10.0.26220",
+    "cpu": "11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz",
+    "logical_cpus": 16,
+    "gpu": "NVIDIA GeForce RTX 3060 Laptop GPU"
+  },
+  "load": {
+    "endpoint": "POST /api/models/load",
+    "loaded_now": true,
+    "generation_ready": true,
+    "selected_backend": "cpu_reference",
+    "prefill_path": "safe_cpu_prefill",
+    "decode_path": "safe_cpu_decode"
+  },
+  "parity": {
+    "reference": "llama.cpp acd79d603",
+    "prompt": "The capital of France is",
+    "prompt_token_ids": [1, 450, 7483, 310, 3444, 338],
+    "expected_generated_token_ids": [3681, 29889, 13, 32001, 3869],
+    "actual_generated_token_ids": [3681, 29889, 13, 32001, 3869],
+    "generated_text": " Paris.\n Yes",
+    "result": "pass"
+  },
+  "prior_hold": {
+    "receipt": "qa/muster/phi3-hold-evidence/nondeterminism-fixed-q8-20260728.json",
+    "stale_actual_generated_token_ids": [3681, 29889, 3681, 338, 2998],
+    "cleared": true,
+    "reason": "the current Windows CPU-reference API path now emits the pinned five-token sequence exactly"
+  },
+  "scope": {
+    "supported": "this exact artifact on Windows x86_64 using the CPU-reference prefill/decode path for the checked short greedy and API load envelope",
+    "not_claimed": [
+      "bounded 512/1024/2048/4096 context packs",
+      "performance",
+      "tools",
+      "neighboring Phi-3 files or quants",
+      "Linux",
+      "macOS"
+    ]
+  }
+}

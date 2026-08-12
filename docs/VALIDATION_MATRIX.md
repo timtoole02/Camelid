@@ -18,7 +18,8 @@ Next-family public language is locked to row-by-row evidence, not family-wide su
 
 - Mixtral 8x7B Instruct: “Bounded one-token backend MoE runtime evidence exists for `Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf`; later-generation/API/WebUI/frontend readiness is not yet established.”
 - Qwen 2.5 7B Instruct: “Planned exact-row candidate for `Qwen2.5-7B-Instruct-Q8_0.gguf`; not supported yet.”
-- Gemma 2 9B Instruct: “Planned exact-row candidate for `gemma-2-9b-it-Q8_0.gguf`; not supported yet.”
+- Gemma 2 9B Instruct: “Verified runnable exact row for `gemma-2-9b-it-q8_0.gguf`: tokenizer/template identity, real-weight load, six short deterministic greedy probes, and guarded API/WebUI checks pass; bounded 512-context, broader performance, and portability evidence remain before Supported.”
+- Nine hash-pinned Phase 2 rows are “Runnable with numerical variance”: they pass exact-artifact load, generation, and template gates, but at least one strict deterministic token-ID probe differs from pinned llama.cpp. The Models UI must download, start, and chat through the normal path with an amber warning; it must not call these rows Experimental, Verified, or Supported. Load-blocked and template-blocked rows remain fail-closed.
 
 First promotion for any unsupported row requires row-specific source/SHA/license, tokenizer/template references, bounded load/readiness, parity, API/WebUI, RSS/timing, scrubbed manifest, and checksum evidence. Mixtral has not cleared support promotion under the current blocker record: later-generation divergence and the continuation backend HTTP hang must be fixed before rerunning API/WebUI/RSS/frontend readiness. The current long-generation continuation lane is blocker work and does not widen support wording.
 
