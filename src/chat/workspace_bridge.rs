@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use super::agent::{
     run_loop, AgentConfig, AgentMsg, Approver, ContextBudgetUsage, Decision, LiveDriver, LoopEnd,
-    ModelStepMetrics, Policy, Reporter,
+    ModelStepMetrics, Reporter,
 };
 use super::audit::NoopSink;
 use super::client::Client;
@@ -22,10 +22,81 @@ use super::shell_sandbox::ShellSandbox;
 use super::tools::{Action, Sandbox, ToolOutcome, ToolProfile};
 use super::workspace_memory::MemoryContext;
 
+/// Wall-clock ceiling for one `run_shell` in web Code mode.
+///
+/// This is the constant most exposed to hardware variance: the SAME `cargo
+/// test` or `npm install` takes several times longer on a low-end laptop than
+/// on a dev box, so a wall-clock budget tuned against one machine silently
+/// becomes a build killer on another. The previous 30s could not fit an
+/// ordinary Rust or Node build even here — and a killed build does not read as
+/// "too slow", it reads to the model as a FAILING command, which sends it off
+/// fixing a defect that does not exist.
+///
+/// Kept finite because a hung command must not own the turn forever, and Stop
+/// stays live throughout. Teardown at the deadline kills the whole process tree
+/// on Windows (the job object; see `run_shell_timeout_tears_down_the_process_tree`)
+/// and, for delegated work, on Unix too (the worker's process group). A command
+/// the server itself runs on Unix is killed as a single process, so a descendant
+/// build tree can outlive the deadline — `run_shell` in `tools.rs` records why.
+const WEB_CODE_SHELL_TIMEOUT: Duration = Duration::from_secs(120);
+/// Absolute wall-clock deadline for one model step in the read-only Workspace
+/// lane: it starts at the first prompt preflight and covers every fitting
+/// retry, the wait for generation headers, and the SSE body. Documented in
+/// WORKSPACE_MEMORY_SPEC.md as a fail-closed guarantee of that surface.
+const WORKSPACE_MODEL_STEP_TIMEOUT: Duration = Duration::from_secs(90);
 const APPROVAL_POLL: Duration = Duration::from_millis(25);
 const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 pub(crate) const WORKSPACE_CONTEXT_BUDGET_TOKENS: u32 = 4_096;
-const WORKSPACE_MODEL_STEP_TIMEOUT: Duration = Duration::from_secs(90);
+pub(crate) const CODE_CONTEXT_BUDGET_TOKENS: u32 = super::agent::AGENT_VALIDATED_CTX;
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorkspaceRunMode {
+    #[default]
+    ReadOnly,
+    Code,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorkspaceApprovalMode {
+    #[default]
+    ApprovalGated,
+    FullAuto,
+}
+
+impl WorkspaceApprovalMode {
+    pub(crate) fn is_full_auto(self) -> bool {
+        self == Self::FullAuto
+    }
+}
+
+impl WorkspaceRunMode {
+    pub(crate) fn is_code(self) -> bool {
+        self == Self::Code
+    }
+
+    fn tool_profile(self) -> ToolProfile {
+        match self {
+            Self::ReadOnly => ToolProfile::WorkspaceReadOnly,
+            Self::Code => ToolProfile::WebCode,
+        }
+    }
+
+    fn shell_sandbox(self) -> ShellSandbox {
+        match self {
+            Self::ReadOnly => ShellSandbox::Disabled,
+            Self::Code => ShellSandbox::Sandboxed,
+        }
+    }
+
+    pub(crate) fn context_budget_tokens(self) -> u32 {
+        match self {
+            Self::ReadOnly => WORKSPACE_CONTEXT_BUDGET_TOKENS,
+            Self::Code => CODE_CONTEXT_BUDGET_TOKENS,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -130,9 +201,22 @@ pub(crate) struct WorkspaceRunConfig {
     pub max_steps: usize,
     pub max_tokens: u32,
     pub temperature: f32,
+    pub mode: WorkspaceRunMode,
+    pub approval_mode: WorkspaceApprovalMode,
+    pub allow_network: bool,
     /// Optional session-scoped semantic index. When present, each turn gets a
     /// bounded set of relevant workspace excerpts before the model runs.
     pub semantic_retriever: Option<Arc<super::semantic_search::WorkspaceSemanticRetriever>>,
+}
+
+/// Makes delegated work share the exact lifetime of one Web Code turn, including
+/// early returns and unwinding paths.
+struct WorkspaceSubagentTurnGuard;
+
+impl Drop for WorkspaceSubagentTurnGuard {
+    fn drop(&mut self) {
+        super::subagent::cancel_all();
+    }
 }
 
 impl WorkspaceBridgeClient {
@@ -403,10 +487,45 @@ pub(crate) fn run_live(
     config: WorkspaceRunConfig,
     mut worker: WorkspaceBridgeWorker,
 ) -> Result<LoopEnd, String> {
-    let sandbox = match Sandbox::new(&config.workspace, false, Duration::from_secs(30)) {
-        Ok(sandbox) => sandbox.with_shell_mode(ShellSandbox::Disabled),
+    let _subagent_guard = if config.mode.is_code() {
+        super::subagent::cancel_all();
+        Some(WorkspaceSubagentTurnGuard)
+    } else {
+        None
+    };
+    // What this host can actually enforce, not what the mode asks for. On a host
+    // where sandboxed confinement is unenforceable (macOS, unsupported arch) this
+    // drops to `Disabled` so `run_shell` is never advertised to the model — see
+    // `shell_sandbox::resolve_for_unattended_surface`.
+    let (shell_sandbox, shell_unavailable) = super::shell_sandbox::resolve_for_unattended_surface(
+        config.mode.shell_sandbox(),
+        &config.workspace,
+    );
+    let tool_profile = config.mode.tool_profile();
+    let sandbox = match Sandbox::new(
+        &config.workspace,
+        config.allow_network,
+        WEB_CODE_SHELL_TIMEOUT,
+    ) {
+        Ok(sandbox) => sandbox.with_shell_mode(shell_sandbox),
         Err(error) => {
             let message = error.to_string();
+            worker.reporter.send(WorkspaceEvent::Error {
+                message: message.clone(),
+            });
+            worker.reporter.send(WorkspaceEvent::Finished {
+                outcome: "driver_error",
+            });
+            return Err(message);
+        }
+    };
+    let mut policy = match super::agent::resolve_policy(
+        false,
+        config.approval_mode.is_full_auto(),
+        super::agent::is_production(),
+    ) {
+        Ok(policy) => policy,
+        Err(message) => {
             worker.reporter.send(WorkspaceEvent::Error {
                 message: message.clone(),
             });
@@ -420,11 +539,44 @@ pub(crate) fn run_live(
         workspace: sandbox.root_display(),
         model_id: config.model_id.clone(),
     });
+    // Say so when this host cannot run commands at all. The terminal lane prints
+    // the same fact in its startup banner; without it a Code user on macOS just
+    // sees the model never build or test anything, with no stated reason.
+    if let Some(why) = shell_unavailable.as_deref() {
+        worker.reporter.notice(&format!(
+            "shell commands are unavailable on this host, so run_shell is not offered to the \
+             model: {why}"
+        ));
+    }
     worker.reporter.send(WorkspaceEvent::TurnStarted {
         turn_index: config.turn_index,
     });
 
-    let system = super::agent::workspace_system_prompt(&sandbox);
+    // Register the subagent runtime for this turn. Without it `is_enabled()` is
+    // false, `specs_for` never advertises spawn_subagent, and Code mode has no
+    // way to delegate a scoped subtask — the CLI lane configured this and the
+    // web lane silently did not. Children inherit this session's model, approval
+    // posture, and shell sandbox; the depth limit keeps a child from spawning
+    // grandchildren. Read-only Workspace stays single-agent.
+    if config.mode.is_code() {
+        super::subagent::configure(super::subagent::SubagentConfig::for_web_code_session(
+            config.addr,
+            config.model_id.clone(),
+            config.family.clone(),
+            config.max_tokens,
+            config.approval_mode.is_full_auto(),
+            config.allow_network,
+            shell_sandbox,
+        ));
+    }
+
+    let system = if config.mode.is_code() {
+        let specs = super::tools::specs_for(tool_profile, config.allow_network, shell_sandbox);
+        let project = super::agent::load_project_context(&sandbox);
+        super::agent::system_prompt_with_project(&sandbox, &specs, project.as_ref())
+    } else {
+        super::agent::workspace_system_prompt(&sandbox)
+    };
     let mut history = vec![AgentMsg::System(system)];
     if let Some(retriever) = config.semantic_retriever.as_ref() {
         worker.reporter.notice(&format!(
@@ -456,9 +608,18 @@ pub(crate) fn run_live(
         config.max_tokens,
         config.temperature,
     );
-    driver.set_context_budget(Some(WORKSPACE_CONTEXT_BUDGET_TOKENS));
+    driver.set_context_budget(Some(config.mode.context_budget_tokens()));
     driver.set_native_tool_history(true);
-    driver.set_stream_control(Arc::clone(&worker.cancel), WORKSPACE_MODEL_STEP_TIMEOUT);
+    // Code drops the wall-clock model-step deadline (a coding turn can sit in a
+    // long prefill, and Stop stays authoritative), but the read-only lane keeps
+    // it: a bounded turn that fails closed on a stalled server is its published
+    // contract, and it did not ask to be changed.
+    match config.mode {
+        WorkspaceRunMode::Code => driver.set_stream_cancel(Arc::clone(&worker.cancel)),
+        WorkspaceRunMode::ReadOnly => {
+            driver.set_stream_control(Arc::clone(&worker.cancel), WORKSPACE_MODEL_STEP_TIMEOUT)
+        }
+    }
     let delta_reporter = worker.reporter.clone();
     driver.set_delta_sink(Some(Box::new(move |delta| {
         delta_reporter.model_delta(delta);
@@ -466,16 +627,16 @@ pub(crate) fn run_live(
     let agent_config = AgentConfig {
         workdir: config.workspace,
         max_steps: config.max_steps,
-        auto_approve: false,
-        yolo: false,
-        allow_net: false,
+        auto_approve: config.approval_mode.is_full_auto(),
+        yolo: config.approval_mode.is_full_auto(),
+        allow_net: config.allow_network,
         allow_fs: false,
         shell_timeout: Duration::from_secs(30),
         max_tokens: config.max_tokens,
         temperature: config.temperature,
         audit: Box::new(NoopSink),
-        shell_sandbox: ShellSandbox::Disabled,
-        tool_profile: ToolProfile::WorkspaceReadOnly,
+        shell_sandbox,
+        tool_profile,
         ctx_budget: None,
     };
     let end = run_loop(
@@ -485,7 +646,7 @@ pub(crate) fn run_live(
         &sandbox,
         &agent_config,
         worker.cancel.as_ref(),
-        &mut Policy::default(),
+        &mut policy,
         &mut history,
     );
     let outcome = match end {
@@ -554,7 +715,62 @@ mod tests {
     };
     use crate::chat::audit::NoopSink;
     use crate::chat::shell_sandbox::ShellSandbox;
-    use crate::chat::tools::{ToolCall, ToolProfile, ToolSpec};
+    use crate::chat::tools::{Action, ApprovalTier, ToolCall, ToolProfile, ToolSpec};
+
+    /// Code mode must be able to delegate a scoped subtask. The tools existed
+    /// but the web lane never configured the subagent runtime, so `is_enabled()`
+    /// was false, `specs_for` never advertised them, and delegation was silently
+    /// impossible on this surface while the CLI lane had it all along.
+    #[test]
+    fn code_mode_advertises_the_subagent_tools_once_the_runtime_is_configured() {
+        // Serializes with the tool-set pins in `tools`, which assert on the
+        // unconfigured baseline of the same process-global registry.
+        let _lock = crate::chat::mcp::tests::registry_lock();
+        let profile = WorkspaceRunMode::Code.tool_profile();
+        assert!(profile.allows("spawn_subagent"));
+        assert!(profile.allows("check_subagent_status"));
+
+        // Built exactly as `run_live` builds it. The terminal `for_session`
+        // constructor leaves `web_code: false`, which hands the child
+        // `ToolProfile::Full` — GUI, Windows control, MCP, none of which this
+        // parent may touch — and silently drops `allow_net` and the confirmed
+        // full-auto Exec posture. Asserting the resulting boundary here is what
+        // catches a call site that reached for the wrong constructor.
+        let config = crate::chat::subagent::SubagentConfig::for_web_code_session(
+            "127.0.0.1:9".parse().unwrap(),
+            "model".into(),
+            "llama".into(),
+            2048,
+            true,
+            true,
+            WorkspaceRunMode::Code.shell_sandbox(),
+        );
+        assert!(
+            config.web_code,
+            "a child of Code mode must run on the narrow WebCode profile, not Full"
+        );
+        assert!(config.allow_net, "the parent's network switch must carry");
+        assert!(config.yolo, "confirmed full auto must carry to the child");
+        assert_eq!(
+            config.shell_mode,
+            ShellSandbox::Sandboxed,
+            "the child must never widen the parent's shell confinement"
+        );
+        let _configured = crate::chat::subagent::configure_for_test(config);
+        let advertised =
+            crate::chat::tools::specs_for(profile, false, WorkspaceRunMode::Code.shell_sandbox())
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect::<Vec<_>>();
+        assert!(advertised.iter().any(|name| name == "spawn_subagent"));
+        assert!(advertised
+            .iter()
+            .any(|name| name == "check_subagent_status"));
+
+        // Read-only Workspace stays single-agent even with the runtime up.
+        let read_only = WorkspaceRunMode::ReadOnly.tool_profile();
+        assert!(!read_only.allows("spawn_subagent"));
+    }
 
     struct ScriptedDriver {
         steps: Vec<ModelStep>,
@@ -643,6 +859,61 @@ mod tests {
                 _ => continue,
             }
         }
+    }
+
+    #[test]
+    fn code_network_switch_exposes_real_web_tools_only_when_enabled() {
+        let offline =
+            crate::chat::tools::specs_for(ToolProfile::WebCode, false, ShellSandbox::Sandboxed);
+        let online =
+            crate::chat::tools::specs_for(ToolProfile::WebCode, true, ShellSandbox::Sandboxed);
+
+        for name in ["web_search", "http_fetch"] {
+            assert!(offline.iter().all(|tool| tool.name != name));
+            assert!(online.iter().any(|tool| tool.name == name));
+        }
+    }
+
+    #[test]
+    fn full_auto_workspace_policy_promotes_exec_and_network_actions() {
+        let policy = crate::chat::agent::resolve_policy(false, true, false).unwrap();
+        assert_eq!(
+            policy.tier_for(&Action::RunShell {
+                command: "cargo test".to_string()
+            }),
+            ApprovalTier::Auto
+        );
+        assert_eq!(
+            policy.tier_for(&Action::WebSearch {
+                query: "Camelid".to_string()
+            }),
+            ApprovalTier::Auto
+        );
+    }
+
+    #[test]
+    fn workspace_access_defaults_fail_closed() {
+        assert_eq!(
+            WorkspaceApprovalMode::default(),
+            WorkspaceApprovalMode::ApprovalGated
+        );
+        assert!(!WorkspaceApprovalMode::default().is_full_auto());
+    }
+
+    #[test]
+    fn code_uses_the_validated_agent_budget_without_widening_read_only_workspace() {
+        assert_eq!(
+            WorkspaceRunMode::ReadOnly.context_budget_tokens(),
+            WORKSPACE_CONTEXT_BUDGET_TOKENS
+        );
+        assert_eq!(
+            WorkspaceRunMode::Code.context_budget_tokens(),
+            crate::chat::agent::AGENT_VALIDATED_CTX
+        );
+        assert!(
+            WorkspaceRunMode::Code.context_budget_tokens()
+                > WorkspaceRunMode::ReadOnly.context_budget_tokens()
+        );
     }
 
     #[test]

@@ -122,6 +122,44 @@ async fn workspace_create_requires_a_loaded_tool_capable_model_after_root_valida
 }
 
 #[tokio::test]
+async fn code_mode_accepts_the_explicit_write_surface_then_requires_a_model() {
+    let root = tempfile::tempdir().unwrap();
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(workspace_request(
+            "/api/agent/workspace/sessions",
+            json!({
+                "workspace": root.path(),
+                "goal": "edit and test the project",
+                "mode": "code",
+                "allow_writes": true
+            }),
+            true,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response_json(response).await["error"]["code"],
+        "model_not_loaded"
+    );
+}
+
+#[tokio::test]
+async fn code_history_requires_same_origin_browser_provenance() {
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(workspace_get(
+            "/api/agent/workspace/threads/recent?mode=code",
+            false,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn workspace_decision_for_an_unknown_session_is_typed_not_found() {
     let app = camelid::api::router();
     let response = app
@@ -184,6 +222,127 @@ async fn workspace_message_for_an_unknown_session_is_typed_not_found() {
         .oneshot(workspace_request(
             "/api/agent/workspace/sessions/missing/messages",
             json!({"text":"follow up","client_message_id":"message-1"}),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response_json(response).await["error"]["code"],
+        "workspace_session_not_found"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fail-closed boundaries that WEB_CODE_MODE.md promises. Each of these is a
+// refusal the model, the UI, and the doc all rely on; none had a test, so a
+// serde rename or an inverted predicate would have shipped silently.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn code_full_auto_is_refused_under_production() {
+    // Serialized against the other env-touching test in this file by running
+    // the whole check inside one lock-free process step: cargo runs each
+    // integration test binary's tests on separate threads, so the variable is
+    // set and cleared without an await in between.
+    let response = {
+        std::env::set_var("CAMELID_PRODUCTION", "1");
+        let app = camelid::api::router();
+        let request = workspace_request(
+            "/api/agent/workspace/sessions",
+            json!({
+                "workspace": ".",
+                "goal": "edit the project",
+                "mode": "code",
+                "allow_writes": true,
+                "approval_mode": "full_auto"
+            }),
+            true,
+        );
+        let response = app.oneshot(request).await.unwrap();
+        std::env::remove_var("CAMELID_PRODUCTION");
+        response
+    };
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        response_json(response).await["error"]["code"],
+        "workspace_full_auto_refused"
+    );
+}
+
+// The cross-mode resume refusal itself lives behind the loaded-model gate, so
+// it is unreachable from here without a model; `thread_id_mode_boundary_is_a_
+// single_rule` in src/api/workspace.rs covers the rule it enforces. What this
+// asserts is the part that IS reachable: a wrong-mode resume request is not
+// waved through on the way to that gate.
+#[tokio::test]
+async fn resuming_a_read_only_thread_through_code_mode_still_requires_admission() {
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(workspace_request(
+            "/api/agent/workspace/sessions",
+            json!({
+                "workspace": ".",
+                "goal": "keep going",
+                "mode": "code",
+                "allow_writes": true,
+                "thread_id": "workspace-1111"
+            }),
+            true,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response_json(response).await["error"]["code"],
+        "model_not_loaded"
+    );
+}
+
+#[tokio::test]
+async fn code_changes_and_undo_require_same_origin_browser_provenance() {
+    for (method, uri) in [
+        ("GET", "/api/agent/workspace/sessions/any/changes"),
+        ("POST", "/api/agent/workspace/sessions/any/undo"),
+    ] {
+        let app = camelid::api::router();
+        let request = if method == "GET" {
+            workspace_get(uri, false)
+        } else {
+            workspace_request(uri, json!({}), false)
+        };
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {uri} must refuse a request without same-origin provenance"
+        );
+    }
+}
+
+#[tokio::test]
+async fn changes_and_undo_for_an_unknown_session_are_typed_not_found() {
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(workspace_get(
+            "/api/agent/workspace/sessions/missing/changes",
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response_json(response).await["error"]["code"],
+        "workspace_session_not_found"
+    );
+
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(workspace_request(
+            "/api/agent/workspace/sessions/missing/undo",
+            json!({}),
             true,
         ))
         .await

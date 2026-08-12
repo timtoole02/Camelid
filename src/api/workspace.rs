@@ -17,22 +17,61 @@ use super::{
 };
 use crate::chat::agent::LoopEnd;
 use crate::chat::workspace_bridge::{
-    bridge, run_live, WorkspaceBridgeControl, WorkspaceBridgeWorker, WorkspaceDecisionKind,
-    WorkspaceEvent, WorkspaceRunConfig,
+    bridge, run_live, WorkspaceApprovalMode, WorkspaceBridgeControl, WorkspaceBridgeWorker,
+    WorkspaceDecisionKind, WorkspaceEvent, WorkspaceRunConfig, WorkspaceRunMode,
 };
 use crate::chat::workspace_memory::{
     default_store_path, EvidenceInput, StoredThread, WorkspaceMemoryStore,
 };
 
-const EVENT_BACKLOG: usize = 128;
-const EVENT_STREAM_BUFFER: usize = 128;
+// Every generated token is one `model.delta` through this bounded channel, and
+// the send BLOCKS, so a shallow backlog makes the browser's render loop
+// backpressure on decode (the old 128 did exactly that).
+//
+// Sized for UNKNOWN hardware, not this dev box: at 10-30 tok/s this absorbs
+// roughly 30-100s of decode before it can ever throttle, while the worst-case
+// memory it can pin is bounded — 1024 x the per-observation ceiling
+// (`WEB_CODE_OBSERVATION_LIMIT`) rather than 1024 x "whatever the workspace
+// printed". Both halves are load-bearing: a count-based bound is only a real
+// bound once the item size has one too.
+const EVENT_BACKLOG: usize = 1024;
+const EVENT_STREAM_BUFFER: usize = 1024;
 const DEFAULT_MAX_STEPS: usize = 12;
 const MAX_STEPS: usize = 32;
-const DEFAULT_MAX_TOKENS: u32 = 512;
-const MAX_TOKENS: u32 = 1024;
+// A coding step routinely carries a whole file in a `write_file` argument. At
+// the old 512/1024 the call was cut off mid-JSON, parsed as no call at all, and
+// landed in the transcript as a mangled "answer" with the write silently lost.
+const DEFAULT_MAX_TOKENS: u32 = 2048;
+const MAX_TOKENS: u32 = 8192;
 const MAX_GOAL_BYTES: usize = 4 * 1024;
 const EVENT_CLAIM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const AUTO_COMPACT_TRIGGER_PERCENT: u32 = 75;
+
+/// Whether a stored thread belongs to `mode`, by its id prefix.
+///
+/// The prefix is the whole cross-mode boundary: a read-only Workspace thread
+/// resumed as Code would inherit write tools it was never approved for, and a
+/// Code thread resumed read-only would silently lose them. One function so the
+/// resume gate and both thread listings cannot drift apart.
+fn thread_id_belongs_to_mode(thread_id: &str, mode: WorkspaceRunMode) -> bool {
+    let expected = if mode.is_code() {
+        "code-"
+    } else {
+        "workspace-"
+    };
+    thread_id.starts_with(expected)
+}
+
+fn workspace_max_steps(mode: WorkspaceRunMode, requested: Option<usize>) -> Result<usize, ()> {
+    if mode.is_code() {
+        return Ok(0);
+    }
+    let max_steps = requested.unwrap_or(DEFAULT_MAX_STEPS);
+    (1..=MAX_STEPS)
+        .contains(&max_steps)
+        .then_some(max_steps)
+        .ok_or(())
+}
 const AUTO_COMPACT_MIN_TURNS: u32 = 4;
 
 async fn run_workspace_blocking<T, F>(operation: F) -> Result<T, Response>
@@ -74,10 +113,18 @@ struct ActiveWorkspaceSession {
     id: String,
     workspace: PathBuf,
     model_id: String,
+    /// Digest of the artifact that opened the session. An id alone does not
+    /// identify a model: a re-pulled or replaced GGUF keeps its filename, and
+    /// an idle session survives an unload/reload, so follow-up turns check this
+    /// too — the same exactness `create_session`'s resume path applies.
+    model_sha256: String,
     max_steps: usize,
     max_tokens: u32,
     temperature: f32,
     allow_writes: bool,
+    approval_mode: WorkspaceApprovalMode,
+    allow_network: bool,
+    mode: WorkspaceRunMode,
     semantic_retriever: Option<Arc<crate::chat::semantic_search::WorkspaceSemanticRetriever>>,
     memory: WorkspaceMemoryStore,
     state: StdMutex<WorkspaceSessionState>,
@@ -353,6 +400,12 @@ pub(super) struct CreateWorkspaceSessionRequest {
     temperature: Option<f32>,
     #[serde(default)]
     allow_writes: Option<bool>,
+    #[serde(default)]
+    mode: WorkspaceRunMode,
+    #[serde(default)]
+    approval_mode: WorkspaceApprovalMode,
+    #[serde(default)]
+    allow_network: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -370,6 +423,9 @@ struct WorkspaceSessionResponse {
     max_steps: usize,
     max_tokens: u32,
     allow_writes: bool,
+    approval_mode: WorkspaceApprovalMode,
+    allow_network: bool,
+    mode: WorkspaceRunMode,
     semantic_retrieval: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     embedding_model_id: Option<String>,
@@ -384,6 +440,9 @@ struct WorkspaceSessionStatusResponse {
     context_budget_tokens: u32,
     resident_cuda: Option<crate::inference::ResidentCudaStatus>,
     allow_writes: bool,
+    approval_mode: WorkspaceApprovalMode,
+    allow_network: bool,
+    mode: WorkspaceRunMode,
     semantic_retrieval: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     embedding_model_id: Option<String>,
@@ -417,6 +476,14 @@ struct WorkspaceModelsResponse {
 #[derive(Debug, Deserialize)]
 pub(super) struct WorkspaceThreadsQuery {
     workspace: PathBuf,
+    #[serde(default)]
+    mode: WorkspaceRunMode,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct WorkspaceRecentThreadsQuery {
+    #[serde(default)]
+    mode: WorkspaceRunMode,
 }
 
 #[derive(Debug, Serialize)]
@@ -476,6 +543,7 @@ pub(super) async fn list_threads(
         return response;
     }
     let requested_workspace = query.workspace;
+    let mode = query.mode;
     let workspace = match run_workspace_blocking(move || {
         std::fs::canonicalize(requested_workspace)
             .ok()
@@ -506,9 +574,67 @@ pub(super) async fn list_threads(
         let threads = store
             .threads_for_root(&workspace, 20)?
             .into_iter()
-            .filter(|thread| thread.model_id == model_id && thread.model_sha256 == model_sha256)
+            .filter(|thread| {
+                let mode_matches = thread_id_belongs_to_mode(&thread.id, mode);
+                mode_matches && thread.model_id == model_id && thread.model_sha256 == model_sha256
+            })
             .collect();
         Ok(threads)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+    match result {
+        Ok(threads) => Json(WorkspaceThreadsResponse { threads }).into_response(),
+        Err(error) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "workspace_memory_unavailable",
+            format!("Workspace threads could not be listed: {error}"),
+            None,
+        ),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct WorkspaceChangesResponse {
+    summary: String,
+    diff: String,
+    files: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct WorkspaceUndoRequest {
+    #[serde(default)]
+    force: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkspaceUndoResponse {
+    result: String,
+    summary: String,
+    diff: String,
+    files: Vec<String>,
+}
+
+pub(super) async fn list_recent_threads(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<WorkspaceRecentThreadsQuery>,
+) -> Response {
+    if let Some(response) = authorize(&state, &headers) {
+        return response;
+    }
+    let mode = query.mode;
+    let result = match run_workspace_blocking(move || -> anyhow::Result<_> {
+        let store = WorkspaceMemoryStore::open(default_store_path())?;
+        Ok(store
+            .recent_threads(100)?
+            .into_iter()
+            .filter(|thread| thread_id_belongs_to_mode(&thread.id, mode))
+            .take(40)
+            .collect::<Vec<_>>())
     })
     .await
     {
@@ -999,15 +1125,22 @@ pub(super) async fn create_session(
             Some("goal"),
         );
     }
-    let max_steps = request.max_steps.unwrap_or(DEFAULT_MAX_STEPS);
-    if !(1..=MAX_STEPS).contains(&max_steps) {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_workspace_limits",
-            format!("max_steps must be between 1 and {MAX_STEPS}"),
-            Some("max_steps"),
-        );
-    }
+    let mode = request.mode;
+    // Code mode is user-cancellable and has a result-aware no-progress guard,
+    // so it does not impose an arbitrary number of model/tool turns. A zero
+    // internal value means unlimited; read-only Workspace keeps its bounded
+    // request contract.
+    let max_steps = match workspace_max_steps(mode, request.max_steps) {
+        Ok(max_steps) => max_steps,
+        Err(()) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_workspace_limits",
+                format!("max_steps must be between 1 and {MAX_STEPS}"),
+                Some("max_steps"),
+            )
+        }
+    };
     let max_tokens = request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
     if !(1..=MAX_TOKENS).contains(&max_tokens) {
         return api_error(
@@ -1026,7 +1159,9 @@ pub(super) async fn create_session(
             Some("temperature"),
         );
     }
-    if request.allow_writes.unwrap_or(false) {
+    let approval_mode = request.approval_mode;
+    let allow_network = request.allow_network;
+    if request.allow_writes.unwrap_or(false) && !mode.is_code() {
         return api_error(
             StatusCode::BAD_REQUEST,
             "workspace_read_only",
@@ -1034,7 +1169,31 @@ pub(super) async fn create_session(
             Some("allow_writes"),
         );
     }
-    let allow_writes = false;
+    if approval_mode.is_full_auto() && !mode.is_code() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "workspace_read_only",
+            "Full-auto approval mode is available only in Code mode".to_string(),
+            Some("approval_mode"),
+        );
+    }
+    if allow_network && !mode.is_code() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "workspace_read_only",
+            "Network and web-search tools are available only in Code mode".to_string(),
+            Some("allow_network"),
+        );
+    }
+    if approval_mode.is_full_auto() && crate::chat::agent::is_production() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "workspace_full_auto_refused",
+            "Full auto is disabled while CAMELID_PRODUCTION is set".to_string(),
+            Some("approval_mode"),
+        );
+    }
+    let allow_writes = mode.is_code();
 
     let requested_workspace = request.workspace;
     let workspace =
@@ -1064,7 +1223,15 @@ pub(super) async fn create_session(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let semantic_retriever = workspace_semantic_retriever(&state, &workspace).await;
+    // Semantic retrieval is a read-only Workspace feature: the session-scoped
+    // index is built once and never invalidated, which is only sound while the
+    // workspace cannot change under it. Code mode writes files, so its turns
+    // must not be fed pre-edit excerpts labeled as live workspace content.
+    let semantic_retriever = if mode.is_code() {
+        None
+    } else {
+        workspace_semantic_retriever(&state, &workspace).await
+    };
     let embedding_model_id = semantic_retriever
         .as_ref()
         .map(|retriever| retriever.model_id().to_string());
@@ -1081,7 +1248,13 @@ pub(super) async fn create_session(
                 None,
             );
         }
-        *active = None;
+        // The finished session is NOT evicted here. Everything below can still
+        // fail — wrong mode, wrong artifact, unknown thread, memory store — and
+        // a refused request must not destroy the session it refused to replace:
+        // that session still owns the Changes view and the guarded undo for work
+        // already applied to the user's files, both of which resolve through the
+        // active slot. It is replaced wholesale on success (`*active = Some(..)`),
+        // and this lock is held throughout, so nothing observes a stale slot.
     }
 
     let canonical_root = simplify_path(&workspace);
@@ -1098,6 +1271,9 @@ pub(super) async fn create_session(
     let prepared = match run_workspace_blocking(move || -> anyhow::Result<_> {
         let memory = WorkspaceMemoryStore::open(default_store_path())?;
         let prepared = if let Some(thread_id) = resume_id {
+            if !thread_id_belongs_to_mode(&thread_id, mode) {
+                return Ok(Err("mode_mismatch"));
+            }
             let Some(stored) = memory.thread(&thread_id)? else {
                 return Ok(Err("not_found"));
             };
@@ -1110,7 +1286,8 @@ pub(super) async fn create_session(
             let context = memory.context_for(&thread_id, &memory_goal, 2 * 1024)?;
             (memory, thread_id, context, stored.turn_count)
         } else {
-            let id = format!("workspace-{}", uuid::Uuid::new_v4());
+            let prefix = if mode.is_code() { "code" } else { "workspace" };
+            let id = format!("{prefix}-{}", uuid::Uuid::new_v4());
             memory.create_thread_for_model(
                 &id,
                 &memory_root,
@@ -1139,6 +1316,14 @@ pub(super) async fn create_session(
                 None,
             )
         }
+        Ok(Err("mode_mismatch")) => {
+            return api_error(
+                StatusCode::CONFLICT,
+                "workspace_thread_mode_mismatch",
+                "the saved thread belongs to a different Workspace mode".to_string(),
+                None,
+            )
+        }
         Ok(Err(_)) => unreachable!("fixed Workspace preparation error"),
         Err(error) => {
             return api_error(
@@ -1164,16 +1349,28 @@ pub(super) async fn create_session(
         max_steps,
         max_tokens,
         temperature,
+        mode,
+        approval_mode,
+        allow_network,
         semantic_retriever: semantic_retriever.clone(),
     };
+    if mode.is_code() {
+        // Clears the workspace journal too, so this session's first undo cannot
+        // walk back into a previous session's (or its subagents') changes.
+        crate::chat::checkpoint::clear_for_workspace(&workspace);
+    }
     let session = Arc::new(ActiveWorkspaceSession {
         id: id.clone(),
         workspace: workspace.clone(),
         model_id: model.id.clone(),
+        model_sha256: model.lane.gguf_sha256.to_string(),
         max_steps,
         max_tokens,
         temperature,
         allow_writes,
+        approval_mode,
+        allow_network,
+        mode,
         semantic_retriever,
         memory,
         state: StdMutex::new(WorkspaceSessionState::WaitingForEvents),
@@ -1196,11 +1393,144 @@ pub(super) async fn create_session(
             max_steps,
             max_tokens,
             allow_writes,
+            approval_mode,
+            allow_network,
+            mode,
             semantic_retrieval: embedding_model_id.is_some(),
             embedding_model_id,
         }),
     )
         .into_response()
+}
+
+pub(super) async fn session_changes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Some(response) = authorize(&state, &headers) {
+        return response;
+    }
+    let session = match find_session(&state, &id).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    if !session.mode.is_code() {
+        return api_error(
+            StatusCode::CONFLICT,
+            "workspace_read_only",
+            "File changes are available only in Code mode".to_string(),
+            None,
+        );
+    }
+    let workspace = session.workspace.clone();
+    match run_workspace_blocking(move || workspace_changes_response(&workspace)).await {
+        Ok(Ok(changes)) => Json(changes).into_response(),
+        Ok(Err(error)) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "workspace_changes_unavailable",
+            error.to_string(),
+            None,
+        ),
+        Err(response) => response,
+    }
+}
+
+pub(super) async fn undo_session_change(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<WorkspaceUndoRequest>,
+) -> Response {
+    if let Some(response) = authorize(&state, &headers) {
+        return response;
+    }
+    let session = match find_session(&state, &id).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    if !session.mode.is_code() {
+        return api_error(
+            StatusCode::CONFLICT,
+            "workspace_read_only",
+            "Undo is available only in Code mode".to_string(),
+            None,
+        );
+    }
+    if session
+        .state
+        .lock()
+        .map(|status| status.blocks_model_transition())
+        .unwrap_or(true)
+    {
+        return api_error(
+            StatusCode::CONFLICT,
+            "workspace_turn_active",
+            "stop or finish the active turn before undoing a file change".to_string(),
+            None,
+        );
+    }
+    let workspace = session.workspace.clone();
+    let changes_workspace = workspace.clone();
+    let result = match run_workspace_blocking(move || {
+        let sandbox = crate::chat::tools::Sandbox::new(
+            &workspace,
+            false,
+            std::time::Duration::from_secs(30),
+        )?;
+        // Undo must walk back the newest change in the WORKSPACE, which may be a
+        // subagent's — see `workspace_changes_response`.
+        crate::chat::checkpoint::sync_from_store(sandbox.root());
+        crate::chat::checkpoint::undo(&sandbox, request.force).map_err(anyhow::Error::msg)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+    match result {
+        Ok(result) => match workspace_changes_response(&changes_workspace) {
+            Ok(changes) => Json(WorkspaceUndoResponse {
+                result,
+                summary: changes.summary,
+                diff: changes.diff,
+                files: changes.files,
+            })
+            .into_response(),
+            Err(error) => api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "workspace_changes_unavailable",
+                error.to_string(),
+                None,
+            ),
+        },
+        Err(error) => api_error(
+            StatusCode::CONFLICT,
+            "workspace_undo_refused",
+            error.to_string(),
+            None,
+        ),
+    }
+}
+
+fn workspace_changes_response(
+    workspace: &std::path::Path,
+) -> anyhow::Result<WorkspaceChangesResponse> {
+    let sandbox =
+        crate::chat::tools::Sandbox::new(workspace, false, std::time::Duration::from_secs(30))?;
+    // Subagents write from their own processes, so their checkpoints live only
+    // in the workspace journal until this pulls them in. Without it the change
+    // set silently omits every file a delegated child touched.
+    crate::chat::checkpoint::sync_from_store(sandbox.root());
+    let checkpoints = crate::chat::checkpoint::all();
+    Ok(WorkspaceChangesResponse {
+        summary: crate::chat::checkpoint::summary(),
+        diff: crate::chat::checkpoint::diff(&sandbox),
+        files: checkpoints
+            .into_iter()
+            .map(|checkpoint| checkpoint.rel)
+            .collect(),
+    })
 }
 
 pub(super) async fn session_events(
@@ -1499,11 +1829,14 @@ pub(super) async fn session_status(
         workspace: simplify_path(&session.workspace),
         model_id: session.model_id.clone(),
         state: status,
-        context_budget_tokens: crate::chat::workspace_bridge::WORKSPACE_CONTEXT_BUDGET_TOKENS,
+        context_budget_tokens: session.mode.context_budget_tokens(),
         resident_cuda: crate::inference::resident_cuda_status(super::model_resident_cache_key(
             &session.model_id,
         )),
         allow_writes: session.allow_writes,
+        approval_mode: session.approval_mode,
+        allow_network: session.allow_network,
+        mode: session.mode,
         semantic_retrieval: session.semantic_retriever.is_some(),
         embedding_model_id: session
             .semantic_retriever
@@ -1599,7 +1932,7 @@ pub(super) async fn send_message(
         Ok(value) => value,
         Err(response) => return response,
     };
-    if model.id != session.model_id {
+    if model.id != session.model_id || model.lane.gguf_sha256 != session.model_sha256 {
         return api_error(
             StatusCode::CONFLICT,
             "workspace_model_changed",
@@ -1648,6 +1981,9 @@ pub(super) async fn send_message(
         max_steps: session.max_steps,
         max_tokens: session.max_tokens,
         temperature: session.temperature,
+        mode: session.mode,
+        approval_mode: session.approval_mode,
+        allow_network: session.allow_network,
         semantic_retriever: session.semantic_retriever.clone(),
     };
     match session.install_turn(events, worker, run_config, control) {
@@ -2150,6 +2486,37 @@ mod tests {
     }
 
     #[test]
+    fn thread_id_mode_boundary_is_a_single_rule() {
+        // Resuming across modes must fail closed in BOTH directions: a read-only
+        // thread must not gain write tools by being reopened as Code, and a Code
+        // thread must not be silently downgraded. The listings and the resume
+        // gate share this rule, so a fix to one cannot leave the other behind.
+        assert!(thread_id_belongs_to_mode(
+            "code-1111",
+            WorkspaceRunMode::Code
+        ));
+        assert!(!thread_id_belongs_to_mode(
+            "workspace-1111",
+            WorkspaceRunMode::Code
+        ));
+        assert!(thread_id_belongs_to_mode(
+            "workspace-1111",
+            WorkspaceRunMode::ReadOnly
+        ));
+        assert!(!thread_id_belongs_to_mode(
+            "code-1111",
+            WorkspaceRunMode::ReadOnly
+        ));
+        // Neither prefix is a prefix of the other, and an unprefixed id belongs
+        // to no mode at all.
+        assert!(!thread_id_belongs_to_mode("1111", WorkspaceRunMode::Code));
+        assert!(!thread_id_belongs_to_mode(
+            "1111",
+            WorkspaceRunMode::ReadOnly
+        ));
+    }
+
+    #[test]
     fn cancellation_stays_blocking_until_a_running_worker_exits() {
         let requested = WorkspaceSessionState::Running.after_cancel_request();
         assert_eq!(requested, WorkspaceSessionState::Cancelling);
@@ -2173,6 +2540,29 @@ mod tests {
     }
 
     #[test]
+    fn workspace_session_request_defaults_to_gated_and_offline() {
+        let request: CreateWorkspaceSessionRequest = serde_json::from_value(serde_json::json!({
+            "workspace": ".",
+            "goal": "inspect the project",
+            "mode": "code"
+        }))
+        .unwrap();
+        assert_eq!(request.approval_mode, WorkspaceApprovalMode::ApprovalGated);
+        assert!(!request.allow_network);
+    }
+
+    #[test]
+    fn code_sessions_have_no_arbitrary_step_limit() {
+        assert_eq!(workspace_max_steps(WorkspaceRunMode::Code, None), Ok(0));
+        assert_eq!(workspace_max_steps(WorkspaceRunMode::Code, Some(20)), Ok(0));
+        assert_eq!(
+            workspace_max_steps(WorkspaceRunMode::ReadOnly, None),
+            Ok(DEFAULT_MAX_STEPS)
+        );
+        assert!(workspace_max_steps(WorkspaceRunMode::ReadOnly, Some(MAX_STEPS + 1)).is_err());
+    }
+
+    #[test]
     fn manager_reads_terminal_and_active_session_states_without_guessing() {
         let make_session = |state| {
             let (worker, client) = bridge(1);
@@ -2181,10 +2571,14 @@ mod tests {
                 id: "session-test".to_string(),
                 workspace: PathBuf::from("."),
                 model_id: "model-test".to_string(),
+                model_sha256: "sha-test".to_string(),
                 max_steps: 1,
                 max_tokens: 1,
                 temperature: 0.0,
                 allow_writes: true,
+                approval_mode: WorkspaceApprovalMode::ApprovalGated,
+                allow_network: false,
+                mode: WorkspaceRunMode::ReadOnly,
                 semantic_retriever: None,
                 memory: WorkspaceMemoryStore::open(std::env::temp_dir().join(format!(
                     "camelid-workspace-state-test-{}.sqlite3",
@@ -2229,10 +2623,14 @@ mod tests {
             id: "thread".into(),
             workspace: dir.path().to_path_buf(),
             model_id: "model".into(),
+            model_sha256: "sha-test".to_string(),
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
             allow_writes: true,
+            approval_mode: WorkspaceApprovalMode::ApprovalGated,
+            allow_network: false,
+            mode: WorkspaceRunMode::ReadOnly,
             semantic_retriever: None,
             memory,
             state: StdMutex::new(WorkspaceSessionState::Idle),
@@ -2254,6 +2652,9 @@ mod tests {
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
+            mode: WorkspaceRunMode::ReadOnly,
+            approval_mode: WorkspaceApprovalMode::ApprovalGated,
+            allow_network: false,
             semantic_retriever: None,
         };
         let (worker, client) = bridge(1);
@@ -2294,10 +2695,14 @@ mod tests {
             id: "thread".into(),
             workspace: dir.path().to_path_buf(),
             model_id: "model".into(),
+            model_sha256: "sha-test".to_string(),
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
             allow_writes: false,
+            approval_mode: WorkspaceApprovalMode::ApprovalGated,
+            allow_network: false,
+            mode: WorkspaceRunMode::ReadOnly,
             semantic_retriever: None,
             memory,
             state: StdMutex::new(WorkspaceSessionState::Cancelled),
@@ -2323,10 +2728,14 @@ mod tests {
             id: "thread".into(),
             workspace: dir.path().to_path_buf(),
             model_id: "model".into(),
+            model_sha256: "sha-test".to_string(),
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
             allow_writes: false,
+            approval_mode: WorkspaceApprovalMode::ApprovalGated,
+            allow_network: false,
+            mode: WorkspaceRunMode::ReadOnly,
             semantic_retriever: None,
             memory,
             state: StdMutex::new(WorkspaceSessionState::Cancelling),
@@ -2348,6 +2757,9 @@ mod tests {
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
+            mode: WorkspaceRunMode::ReadOnly,
+            approval_mode: WorkspaceApprovalMode::ApprovalGated,
+            allow_network: false,
             semantic_retriever: None,
         };
 
@@ -2381,10 +2793,14 @@ mod tests {
                 id: "thread".into(),
                 workspace: dir.path().to_path_buf(),
                 model_id: "model".into(),
+                model_sha256: "sha-test".to_string(),
                 max_steps: 1,
                 max_tokens: 1,
                 temperature: 0.0,
                 allow_writes: false,
+                approval_mode: WorkspaceApprovalMode::ApprovalGated,
+                allow_network: false,
+                mode: WorkspaceRunMode::ReadOnly,
                 semantic_retriever: None,
                 memory,
                 state: StdMutex::new(terminal_state),
@@ -2406,6 +2822,9 @@ mod tests {
                 max_steps: 1,
                 max_tokens: 1,
                 temperature: 0.0,
+                mode: WorkspaceRunMode::ReadOnly,
+                approval_mode: WorkspaceApprovalMode::ApprovalGated,
+                allow_network: false,
                 semantic_retriever: None,
             };
             let (worker, client) = bridge(1);
@@ -2435,10 +2854,14 @@ mod tests {
             id: "thread".into(),
             workspace: dir.path().to_path_buf(),
             model_id: "model".into(),
+            model_sha256: "sha-test".to_string(),
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
             allow_writes: false,
+            approval_mode: WorkspaceApprovalMode::ApprovalGated,
+            allow_network: false,
+            mode: WorkspaceRunMode::ReadOnly,
             semantic_retriever: None,
             memory,
             state: StdMutex::new(WorkspaceSessionState::WaitingForEvents),
@@ -2456,6 +2879,9 @@ mod tests {
                 max_steps: 1,
                 max_tokens: 1,
                 temperature: 0.0,
+                mode: WorkspaceRunMode::ReadOnly,
+                approval_mode: WorkspaceApprovalMode::ApprovalGated,
+                allow_network: false,
                 semantic_retriever: None,
             })),
             control: StdMutex::new(Some(control)),

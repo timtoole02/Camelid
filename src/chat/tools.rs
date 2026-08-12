@@ -262,6 +262,12 @@ const MAX_SEARCH_FILES: usize = 5_000;
 const MAX_SEARCH_DURATION: Duration = Duration::from_secs(2);
 const FULL_SEARCH_HITS: u64 = 100;
 const WORKSPACE_SEARCH_HITS: u64 = 20;
+/// Per-observation ceiling for the browser/desktop coding surface. Generous —
+/// 8x the read-only cap, so ordinary test output and file reads pass through
+/// whole — but FINITE, because this ships to machines whose RAM and context
+/// budget are unknown here. ~4k tokens, i.e. half an 8192-token budget, so a
+/// single runaway command cannot on its own force a context trim.
+const WEB_CODE_OBSERVATION_LIMIT: usize = 16 * 1024;
 const SEARCH_SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".camelid"];
 
 impl Sandbox {
@@ -385,23 +391,54 @@ impl Sandbox {
 pub enum ToolProfile {
     Full,
     WorkspaceReadOnly,
+    /// Browser/Desktop coding surface. Deliberately narrower than `Full`: it
+    /// can inspect and modify the selected workspace, run a sandboxed shell, and
+    /// delegate a scoped subtask to a child agent. Network tools are available
+    /// only when that session explicitly opts in; GUI and MCP tools are never
+    /// inherited. Subagents inherit this same profile and the parent's approval
+    /// posture, and the depth limit stops a child from spawning further children.
+    WebCode,
 }
 
 impl ToolProfile {
     pub fn allows(self, tool: &str) -> bool {
-        self == ToolProfile::Full
-            || (self == ToolProfile::WorkspaceReadOnly
-                && matches!(tool, "read_file" | "list_dir" | "search"))
+        match self {
+            Self::Full => true,
+            Self::WorkspaceReadOnly => matches!(tool, "read_file" | "list_dir" | "search"),
+            Self::WebCode => matches!(
+                tool,
+                "read_file"
+                    | "list_dir"
+                    | "search"
+                    | "update_plan"
+                    | "write_file"
+                    | "edit_file"
+                    | "run_shell"
+                    | "web_search"
+                    | "http_fetch"
+                    | "spawn_subagent"
+                    | "check_subagent_status"
+            ),
+        }
     }
 
     pub fn is_workspace(self) -> bool {
-        self == Self::WorkspaceReadOnly
+        matches!(self, Self::WorkspaceReadOnly | Self::WebCode)
     }
 
     pub fn observation_limit(self) -> Option<usize> {
         match self {
             Self::Full => None,
             Self::WorkspaceReadOnly => Some(2 * 1024),
+            // Bounded, not minimal. `None` here meant a single `run_shell` log
+            // could enter history unclipped, be re-prefilled on every later step,
+            // and — because the event queue bounds on COUNT — leave the shipped
+            // memory ceiling defined by whatever the workspace happened to print.
+            // On one known dev box that never surfaced; on unknown hardware an
+            // unbounded buffer is a defect, not a tradeoff. The clip appends a
+            // visible "...[truncated for Workspace]" marker, so the model can
+            // narrow its command and re-read rather than silently losing output.
+            Self::WebCode => Some(WEB_CODE_OBSERVATION_LIMIT),
         }
     }
 
@@ -503,6 +540,11 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
             params: json!({"type":"object","properties":{"url":{"type":"string"},"method":{"type":"string"}},"required":["url"]}),
         });
     }
+    // NOTE: WebCode does NOT return here. It used to, which put the early exit
+    // ahead of the subagent block below and made delegation unreachable on the
+    // coding surface no matter how the session was configured. The profile
+    // filter now runs once at the end, so WebCode sees the subagent tools while
+    // `allows` still strips the Windows/GUI/MCP sets it must never inherit.
     // Subagent orchestration tools — advertised only when a session has enabled
     // orchestration AND we are below the spawn-tree depth limit (so subagents
     // don't see spawn_subagent). spawn_subagent is Exec (honours the kill-switch);
@@ -513,7 +555,11 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
                 name: "spawn_subagent".into(),
                 description: "Spawn a child agent (subagent) to work on one scoped goal in the \
                               workspace, then poll it with check_subagent_status. Exec tier — \
-                              always gated. Isolation-first, not a speedup."
+                              always gated. Isolation-first, not a speedup. The child runs \
+                              UNATTENDED: nobody can answer an approval for it, so unless this \
+                              session is in confirmed full-auto it can only READ. Delegate \
+                              investigation (find where X is handled, summarise how Y works) and \
+                              make the edits yourself from what it reports."
                     .into(),
                 risk: Risk::Exec,
                 params: json!({"type":"object","properties":{
@@ -659,6 +705,7 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
     if profile == ToolProfile::Full {
         tools.extend(super::mcp::specs());
     }
+    tools.retain(|tool| profile.allows(&tool.name));
     tools
 }
 
@@ -1004,11 +1051,10 @@ impl Action {
                 timeout.as_secs()
             ),
             // Verbatim goal text (untrusted, never re-parsed) for the approval UI.
-            // Disclose the child's posture: it runs unattended and cannot prompt,
-            // so it inherits this session's mode and DENIES anything that would
-            // confirm (it can never run an unattended shell).
+            // The child inherits this session's tool/network/approval boundary;
+            // if the session is gated, actions needing another prompt are denied.
             Action::SpawnSubagent { subtask_id, goal } => format!(
-                "spawn_subagent {subtask_id} in {} (runs unattended; Exec denied in the child):\n  goal: {goal}",
+                "spawn_subagent {subtask_id} in {} (runs unattended under this session's access policy):\n  goal: {goal}",
                 sandbox.rel(sandbox.root())
             ),
             // Verbatim text/chord so approval shows exactly what will be synthesized
@@ -1093,8 +1139,25 @@ impl Action {
             Action::Screenshot { path } => uia_screenshot(path),
             Action::WebSearch { query } => web_search(sandbox, query),
             Action::UpdatePlan { steps } => {
+                // Resubmitting the SAME plan is not progress, and answering it
+                // with the same "plan updated" text teaches the model nothing:
+                // observed live, a model re-sent one unchanged step until the
+                // no-progress guard ended the turn with no work done. Say the
+                // plan did not change and name what would move it forward. The
+                // text still repeats if the model insists, so the guard remains
+                // the backstop — this just gives it a chance not to be needed.
+                let unchanged = super::plan::get() == *steps;
                 let stored = super::plan::set(steps.clone());
-                ToolOutcome::Ok(format!("plan updated\n{}", super::plan::render(&stored)))
+                if unchanged {
+                    ToolOutcome::Ok(format!(
+                        "plan unchanged — this call changed nothing. Do the next step's work now \
+                         with a file or shell tool, then call update_plan again only to record \
+                         what finished.\n{}",
+                        super::plan::render(&stored)
+                    ))
+                } else {
+                    ToolOutcome::Ok(format!("plan updated\n{}", super::plan::render(&stored)))
+                }
             }
             // The server's reply is untrusted data and reaches the model through
             // the same fenced tool-result path as every native tool.
@@ -1521,7 +1584,64 @@ pub fn validate_for(
 }
 
 fn parse_args<T: for<'de> Deserialize<'de>>(args: &Value, name: &str) -> Result<T, String> {
-    serde_json::from_value(args.clone()).map_err(|e| format!("{name} has invalid arguments: {e}"))
+    match serde_json::from_value::<T>(args.clone()) {
+        Ok(parsed) => Ok(parsed),
+        Err(strict) => {
+            // Retry once with double-encoded fields unwrapped. Small models
+            // routinely hand back a structured argument as a STRING containing
+            // valid JSON (`"steps": "[{\"status\":...}]"`), which serde rejects
+            // as "expected a sequence". Accepting it costs nothing — the unwrapped
+            // value is still schema-checked below — and refusing it burns the turn
+            // on a formatting slip the model cannot see.
+            if let Some(relaxed) = unwrap_json_string_fields(args) {
+                if let Ok(parsed) = serde_json::from_value::<T>(relaxed) {
+                    return Ok(parsed);
+                }
+            }
+            // Still wrong: say what was expected. The bare serde message ("invalid
+            // type: string ..., expected a sequence") tells the model nothing about
+            // the shape it should have sent, so it retries the same malformed call
+            // until the no-progress guard ends the turn.
+            Err(match argument_schema_hint(name) {
+                Some(hint) => format!("{name} has invalid arguments: {strict}. Expected: {hint}"),
+                None => format!("{name} has invalid arguments: {strict}"),
+            })
+        }
+    }
+}
+
+/// Replace any top-level string field whose contents are themselves a JSON
+/// object or array with the parsed value. `None` when nothing looked
+/// double-encoded, so the caller keeps the original error.
+///
+/// Only reached after strict parsing has already failed, so a tool that
+/// legitimately takes a string (a `search` pattern, `write_file` content) is
+/// never reinterpreted — its strict parse succeeded.
+fn unwrap_json_string_fields(args: &Value) -> Option<Value> {
+    let fields = args.as_object()?;
+    let mut relaxed = fields.clone();
+    let mut changed = false;
+    for (key, value) in fields {
+        let Value::String(text) = value else { continue };
+        let trimmed = text.trim();
+        if !(trimmed.starts_with('[') || trimmed.starts_with('{')) {
+            continue;
+        }
+        if let Ok(inner) = serde_json::from_str::<Value>(trimmed) {
+            relaxed.insert(key.clone(), inner);
+            changed = true;
+        }
+    }
+    changed.then(|| Value::Object(relaxed))
+}
+
+/// The argument shape a tool advertises, as a compact hint for an error message.
+/// Read from the same schema the model was given, so the two cannot drift.
+fn argument_schema_hint(name: &str) -> Option<String> {
+    let spec = specs(true, shell_sandbox::ShellSandbox::Sandboxed)
+        .into_iter()
+        .find(|spec| spec.name == name)?;
+    serde_json::to_string(&spec.params).ok()
 }
 
 // --- execution ------------------------------------------------------------
@@ -1821,13 +1941,13 @@ fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
     // the shell-sandbox layer (Task 1), which fails closed when the configured
     // mode can't be enforced on this host.
     #[cfg(unix)]
-    let mut builder = {
-        let mut c = Command::new("/bin/sh");
-        c.arg("-c").arg(command);
-        c
-    };
+    let shell_argv: Vec<std::ffi::OsString> = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        std::ffi::OsString::from(command),
+    ];
     #[cfg(windows)]
-    let mut builder = {
+    let shell_argv: Vec<std::ffi::OsString> = {
         // Absolute interpreter path (W4), matching run_windows_command's
         // system32() discipline. Defense-in-depth only: std's process search
         // already consults System32 *before* the parent PATH and never the
@@ -1845,21 +1965,26 @@ fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
         // mismatch is not exploitable — std only emits `\` immediately before a
         // `"`, which is an illegal Windows filename character, so a mangled path
         // errors out rather than escaping the cwd pin (verified Phase 0, W4).
-        let mut c = Command::new(system32("cmd.exe"));
-        c.arg("/C").arg(command);
-        c
+        vec![
+            system32("cmd.exe").into(),
+            "/C".into(),
+            std::ffi::OsString::from(command),
+        ]
     };
+    // Build the confined command. A sandboxed mode that can't be enforced here
+    // returns an error → refuse to run, never a silent unconfined fallback. The
+    // confinement and the report of it come from this one call, so the layers
+    // shown to the user cannot describe something that was not applied.
+    let argv: Vec<&std::ffi::OsStr> = shell_argv.iter().map(|a| a.as_os_str()).collect();
+    let mut builder =
+        match shell_sandbox::confined_command(&argv, &sandbox.root, sandbox.shell_mode) {
+            Ok((builder, _enforced)) => builder,
+            Err(e) => return ToolOutcome::Err(format!("run_shell refused: {e}")),
+        };
     builder
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // Apply confinement. A sandboxed mode that can't be enforced here returns an
-    // error → refuse to run, never a silent unconfined fallback.
-    if let Err(e) =
-        shell_sandbox::configure_command(&mut builder, &sandbox.root, sandbox.shell_mode)
-    {
-        return ToolOutcome::Err(format!("run_shell refused: {e}"));
-    }
     let mut child = match builder.spawn() {
         Ok(c) => c,
         Err(e) => return ToolOutcome::Err(format!("spawn failed: {e}")),
@@ -1871,8 +1996,17 @@ fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
     // process holding VRAM) otherwise survives as an orphan. Descendants spawned
     // after assignment are captured too. Best-effort — if creation/assignment
     // fails, the child.kill() backstop still reaps the direct process. Mirrors
-    // run_windows_command; the Unix path is unaffected (/bin/sh's own process
-    // group is already torn down by kill()).
+    // run_windows_command.
+    //
+    // There is NO Unix equivalent here, and that is a real difference: this
+    // builder creates no process group, so the timeout path below signals only
+    // `/bin/sh` (or whatever it exec'd). A descendant tree — `cargo`'s rustc
+    // jobs, a `make -j` fan-out — survives the timeout as orphans. Delegated
+    // work does not have this gap (a subagent worker gets its own process group
+    // and is torn down by group), so the exposure is the server/CLI's own
+    // long-running commands. Fixing it here would put interactive CLI shell
+    // children outside the terminal's foreground group and break Ctrl-C, so it
+    // needs its own decision rather than a drive-by change.
     #[cfg(windows)]
     let _job = {
         use std::os::windows::io::AsRawHandle;
@@ -1913,9 +2047,11 @@ fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
-                    // Tear down the whole tree (W2), then the direct-child
-                    // backstop. Terminating the job kills every descendant;
-                    // child.kill() covers the case where the job never assigned.
+                    // Windows: tear down the whole tree (W2), then the
+                    // direct-child backstop. Terminating the job kills every
+                    // descendant; child.kill() covers the case where the job
+                    // never assigned. Unix: direct child only — see the note at
+                    // the job-object assignment above.
                     #[cfg(windows)]
                     if let Some(ref j) = _job {
                         j.terminate();
@@ -2678,6 +2814,68 @@ mod tests {
     }
 
     #[test]
+    fn web_code_profile_is_coding_scoped_not_full_computer_control() {
+        let code = specs_for(ToolProfile::WebCode, true, ShellSandbox::Sandboxed)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            code,
+            vec![
+                "read_file",
+                "list_dir",
+                "search",
+                "update_plan",
+                "write_file",
+                "edit_file",
+                "run_shell",
+                "web_search",
+                "http_fetch",
+            ]
+        );
+        // Delegation is in scope for a coding surface, so the profile permits
+        // the subagent tools — but they are still only ADVERTISED once a session
+        // has configured the subagent runtime, which is why the spec list above
+        // does not contain them.
+        for allowed in ["spawn_subagent", "check_subagent_status"] {
+            assert!(ToolProfile::WebCode.allows(allowed), "{allowed}");
+        }
+        // Machine control never comes along with it.
+        for forbidden in ["run_windows_command", "gui_input", "ui_click", "screenshot"] {
+            assert!(!ToolProfile::WebCode.allows(forbidden), "{forbidden}");
+        }
+        let offline = specs_for(ToolProfile::WebCode, false, ShellSandbox::Sandboxed);
+        assert!(offline
+            .iter()
+            .all(|tool| !matches!(tool.name.as_str(), "web_search" | "http_fetch")));
+    }
+
+    /// This ships to machines whose RAM and context budget are unknown here, so
+    /// EVERY profile that feeds a bounded event queue must have a finite
+    /// per-observation ceiling. A count-bounded queue holding unbounded items is
+    /// not actually bounded.
+    #[test]
+    fn every_workspace_profile_bounds_a_single_observation() {
+        for profile in [ToolProfile::WorkspaceReadOnly, ToolProfile::WebCode] {
+            let limit = profile
+                .observation_limit()
+                .unwrap_or_else(|| panic!("{profile:?} must cap one observation"));
+            let runaway = "x".repeat(4 * 1024 * 1024);
+            let clipped = ToolOutcome::Ok(runaway).clipped(limit);
+            assert!(
+                clipped.text().len() <= limit,
+                "{profile:?} exceeded its own ceiling"
+            );
+            assert!(clipped.text().ends_with("...[truncated for Workspace]"));
+        }
+        // Generous enough that ordinary coding output is untouched.
+        let ordinary = "cargo test output\n".repeat(200);
+        assert!(ordinary.len() < WEB_CODE_OBSERVATION_LIMIT);
+        let kept = ToolOutcome::Ok(ordinary.clone()).clipped(WEB_CODE_OBSERVATION_LIMIT);
+        assert_eq!(kept.text(), ordinary, "a normal-sized log must pass whole");
+    }
+
+    #[test]
     fn workspace_observation_clip_is_bounded_and_utf8_safe() {
         let mut text = "a".repeat(4 * 1024);
         text.push('—');
@@ -3300,13 +3498,149 @@ mod tests {
         assert!(matches!(out, ToolOutcome::Ok(ref s) if s.contains("hi")));
     }
 
-    // On other unenforceable hosts (macOS, unsupported arch), the default mode is
-    // not kernel-enforceable, so run_shell must refuse rather than run unconfined.
+    #[test]
+    fn resubmitting_an_unchanged_plan_is_told_to_act() {
+        // Live failure on Qwen3-4B: "tic tac toe in python" produced one plan
+        // step ("create a plan to…"), then the same step three more times. Each
+        // call answered "plan updated", so nothing signalled that no progress had
+        // been made, and the turn ended on the repeat guard having written no code.
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path());
+        let plan = json!({"steps":[{"status":"in_progress","text":"write the game"}]});
+
+        let first = validate(&call("update_plan", plan.clone()), &sb)
+            .unwrap()
+            .execute(&sb);
+        assert!(first.text().contains("plan updated"), "{}", first.text());
+
+        let again = validate(&call("update_plan", plan), &sb)
+            .unwrap()
+            .execute(&sb);
+        assert!(
+            again.text().contains("plan unchanged"),
+            "an unchanged resubmission must say so: {}",
+            again.text()
+        );
+        assert!(
+            again.text().contains("file or shell tool"),
+            "and must name the way forward: {}",
+            again.text()
+        );
+
+        // A genuine change is still reported as an update.
+        let moved = validate(
+            &call(
+                "update_plan",
+                json!({"steps":[{"status":"done","text":"write the game"}]}),
+            ),
+            &sb,
+        )
+        .unwrap()
+        .execute(&sb);
+        assert!(moved.text().contains("plan updated"), "{}", moved.text());
+        crate::chat::plan::clear();
+    }
+
+    #[test]
+    fn a_double_encoded_structured_argument_is_accepted() {
+        // Observed live on Llama 3.2 3B: the model sent `steps` as a STRING
+        // holding valid JSON, serde said "expected a sequence", and the model
+        // resent the identical call until the no-progress guard killed the turn.
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path());
+        let steps = r#"[{"status":"in_progress","text":"read the file"},{"status":"pending","text":"fix the bug"}]"#;
+        let action = validate(&call("update_plan", json!({"steps": steps})), &sb)
+            .expect("a double-encoded steps array must be accepted");
+        match action {
+            Action::UpdatePlan { steps } => {
+                assert_eq!(steps.len(), 2);
+                assert_eq!(steps[1].text, "fix the bug");
+            }
+            other => panic!("expected UpdatePlan, got {other:?}"),
+        }
+        // The properly-encoded form still works, and is what the strict parse
+        // accepts without any relaxation.
+        assert!(validate(
+            &call(
+                "update_plan",
+                json!({"steps":[{"status":"pending","text":"x"}]}),
+            ),
+            &sb,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn an_unusable_argument_error_states_the_expected_shape() {
+        // The bare serde message names the offending type but never the shape
+        // the tool wanted, so a small model has nothing to correct toward.
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path());
+        let error = validate(&call("update_plan", json!({"steps": 7})), &sb).unwrap_err();
+        assert!(error.contains("invalid arguments"), "{error}");
+        assert!(
+            error.contains("Expected:") && error.contains("status"),
+            "the error must show the advertised schema: {error}"
+        );
+    }
+
+    #[test]
+    fn relaxation_never_rewrites_an_argument_that_is_genuinely_a_string() {
+        // A pattern or file body that merely LOOKS like JSON must survive intact:
+        // strict parsing succeeds for these, so the relaxed path never runs.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
+        let sb = sandbox(dir.path());
+        match validate(
+            &call("write_file", json!({"path":"f.txt","content":"[1, 2, 3]"})),
+            &sb,
+        )
+        .unwrap()
+        {
+            Action::WriteFile { content, .. } => assert_eq!(content, "[1, 2, 3]"),
+            other => panic!("expected WriteFile, got {other:?}"),
+        }
+    }
+
+    // On macOS the default mode IS enforceable (sandbox-exec), so run_shell runs
+    // — confined. Proving the confinement is the job of the enforcement tests in
+    // shell_sandbox; here we prove the tool is reachable and its writes land.
+    //
+    // Keep this attribute ADJACENT to the fn: an earlier edit inserted a test
+    // between the two and silently handed the gate to the newcomer, so this ran
+    // on Windows and failed there.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandboxed_run_shell_runs_confined_on_macos() {
+        use super::ShellSandbox;
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path()); // default = Sandboxed
+        assert_eq!(sb.shell_mode(), ShellSandbox::Sandboxed);
+        let action = validate(
+            &call("run_shell", json!({"command":"echo shell-works > out.txt"})),
+            &sb,
+        )
+        .unwrap();
+        let out = action.execute(&sb);
+        assert!(
+            !out.is_err(),
+            "run_shell must work on macOS: {}",
+            out.text()
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("out.txt")).unwrap(),
+            "shell-works\n"
+        );
+    }
+
+    // On any other unenforceable host (unsupported arch), the default mode is not
+    // kernel-enforceable, so run_shell must refuse rather than run unconfined.
     #[cfg(not(any(
         all(
             target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64")
         ),
+        target_os = "macos",
         windows
     )))]
     #[test]

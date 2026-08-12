@@ -2,6 +2,19 @@
 
 Last updated: 2026-08-10
 
+Web Code revival note (2026-08-11): the approval-gated Code workbench from
+`feat/web-code-mode` has been integrated onto the current model/runtime line. It uses a distinct
+`WebCode` tool profile, exact supported `tool_capable` model admission, live plan/tool/approval
+events, durable `code-*` history, checkpoint-backed changes and undo, and bounded child-agent
+delegation. The default remains approval-gated; built-in network tools require an independent
+session grant. Windows shell execution remains cwd-pinned and hard-timed rather than filesystem or
+egress isolated. The revived current-head binary completed a live, fully GPU-resident
+Qwen3-4B-Q4_K_M Code turn through the browser SSE contract: `read_file(README.md)`,
+`write_file(agent-proof.txt)`, and `read_file(agent-proof.txt)` all returned `ok`, and the created
+file contained the exact requested text. The integration fix preserves structured
+`delta.tool_calls` in the streaming client instead of discarding them as empty assistant content.
+This surface remains preview pending normal review and release promotion.
+
 PrismML/Bonsai macOS note (2026-08-01): seven hash-pinned Bonsai artifacts are promoted to `supported_exact_row_smoke` on Apple Silicon Metal: 4B Q1/Q2/PQ2, 8B Q1/Q2, and 27B Q1/Q2. The packed Prism Q1_0, structurally resolved type-id-42 Q2_0-G128, and PQ2_0 linears stay wire-resident while the complete qwen35 hybrid graph runs on Metal. The checked 27B Q1/Q2 rows also run the real Qwen3-VL Q8_0 projector; `/v1/chat/completions` and its SSE path accept one local PNG/JPEG data URL, `/v1/health` reports `vision_ready`, and the browser composer exposes a gated Image control. All seven language files are downloadable from the Models page and derive a Supported label from exact `/api/capabilities` rows. Receipt: `qa/evidence-bundles/prism-bonsai-metal-mini2-20260801/manifest.json`. Scope remains exact-file and macOS Apple Silicon Metal only: Windows, broad qwen35/quant support, bounded context, batched vision prefill, and production throughput remain unclaimed.
 
 gemma3-CUDA note (2026-07-31): the same row now also runs GPU-resident on **CUDA** (`selected_backend=cuda_resident_windowed_runtime`, `decode_path=q8_0_cuda_resident_windowed_decode`; opt-out `CAMELID_GEMMA3_CUDA_RESIDENT=0`), so a Windows or Linux NVIDIA host no longer falls back to the CPU bridge. The CUDA lane carries the same 512-token window mask and 5:1 dual-θ schedule and is **9/9 token-AND-text identical above the window** (606 / 1205 / 2403 prompt tokens, depths 1/5/50, zero flips) against the same pinned llama.cpp `acd79d603` captures replayed from the Metal bundle. It is **10/15 BELOW the window**, where the Metal lane is 15/15: five divergences across three prompts, attributed to lane numerics rather than structure by a per-layer hidden-state trace (no step change at any layer; worst relative L2 1.89% across all 494 position/layer pairs; the CUDA engine quantizes activations to Q8_0 per GEMV and stores KV as f16 while the oracle is f32). Those flips are **DISCLOSED, not adjudicated** — confirming them as genuine near-ties from the oracle side needs a live llama.cpp re-score that was not run, so the CUDA lane does NOT carry a sub-512 token-exactness claim. Replaying a committed capture is not a re-run. No throughput claim on either lane. Campaign record `GEMMA3_CUDA_CONDUCTOR.md`; receipts `qa/gemma3-cuda/`.

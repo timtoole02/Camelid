@@ -41,6 +41,8 @@
   background: var(--color-canvas);
 }
 .camelid-view { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; }
+.camelid-code-slot { display: flex; flex: 1; min-height: 0; }
+.camelid-code-slot[hidden] { display: none; }
 .camelid-notice-slot { padding: var(--space-2) var(--space-5) 0; }
 
 /* ---- Top bar ---- */
@@ -82,6 +84,27 @@
   max-width: 60%;
 }
 .topbar__spacer { flex: 1; }
+.topbar__mode-switch {
+  display: inline-flex;
+  flex: none;
+  padding: 3px;
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-pill);
+  background: var(--color-surface);
+}
+.topbar__mode-switch button {
+  min-width: 58px;
+  height: 28px;
+  padding: 0 var(--space-3);
+  border-radius: var(--radius-pill);
+  color: var(--color-text-muted);
+  font-size: var(--text-xs);
+  font-weight: 700;
+}
+.topbar__mode-switch button.is-active {
+  background: var(--color-accent-soft);
+  color: var(--color-accent-text);
+}
 .topbar__model {
   display: inline-flex;
   align-items: center;
@@ -230,6 +253,25 @@
 }
 .rail__group-label { font-size: var(--text-xs); color: var(--color-text-faint); padding: var(--space-3) var(--space-3) var(--space-1); }
 .rail__empty { padding: var(--space-2) var(--space-3); color: var(--color-text-faint); font-size: var(--text-sm); }
+.rail-code-thread {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: start;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  color: var(--color-text-muted);
+  text-align: left;
+}
+.rail-code-thread:hover { background: var(--color-surface-hover); color: var(--color-text); }
+.rail-code-thread.is-selected { background: var(--color-selected-row); color: var(--color-text); }
+.rail-code-thread > svg { margin-top: 2px; color: var(--color-accent-text); }
+.rail-code-thread span { min-width: 0; }
+.rail-code-thread strong,
+.rail-code-thread small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rail-code-thread strong { font-size: var(--text-sm); font-weight: 650; }
+.rail-code-thread small { margin-top: 2px; color: var(--color-text-faint); font-family: var(--font-mono); font-size: 9px; }
 
 .rail__nav-item {
   display: flex;

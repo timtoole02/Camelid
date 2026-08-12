@@ -18,9 +18,22 @@ use super::tools::Sandbox;
 
 const DIR: &str = ".camelid/checkpoints";
 
+/// Append-only record of every committed checkpoint, next to the backups.
+///
+/// The in-memory log below belongs to one process, but a subagent is a separate
+/// process writing into the SAME workspace. Without a shared record its edits
+/// are absent from the Changes view and cannot be undone — the session would
+/// report a change set that is missing files it really wrote. Journal lines are
+/// the durable form; [`sync_from_store`] folds a sibling's entries into this
+/// process's log in the order they were actually committed.
+const JOURNAL: &str = ".camelid/checkpoints/journal.jsonl";
+
 /// One saved file state, taken immediately before a write.
 #[derive(Clone)]
 pub struct Checkpoint {
+    /// Identity of this entry across processes: `<pid>-<per-process counter>`.
+    /// Used to fold a subagent's journal entries in without duplicating our own.
+    pub id: String,
     /// Workspace-relative path of the file that was about to change.
     pub rel: String,
     /// Where the previous contents were saved, or `None` if the file did not
@@ -42,6 +55,19 @@ pub struct Pending {
     backup: Option<PathBuf>,
     tool: String,
     target: PathBuf,
+    /// Resolved store directory, carried so `finish` can journal without
+    /// needing the sandbox again.
+    dir: PathBuf,
+}
+
+/// Serialized form of a [`Checkpoint`] in the shared journal.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct JournalLine {
+    id: String,
+    rel: String,
+    backup: Option<String>,
+    tool: String,
+    post_hash: Option<u64>,
 }
 
 /// A cheap, dependency-free content hash (FNV-1a). Collision resistance is not
@@ -152,6 +178,7 @@ pub fn prepare(sandbox: &Sandbox, path: &Path, tool: &str) -> Option<Pending> {
         backup,
         tool: tool.to_string(),
         target: target_canon,
+        dir,
     })
 }
 
@@ -168,14 +195,126 @@ pub fn finish(pending: Option<Pending>, mutated: bool) {
         return;
     }
     let post_hash = content_hash(&p.target);
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = format!(
+        "{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let cp = Checkpoint {
+        id,
+        rel: p.rel,
+        backup: p.backup,
+        tool: p.tool,
+        post_hash,
+    };
+    // Journal before the in-memory push so a crash between the two loses
+    // nothing: a duplicate is filtered by id on the next sync, a missing entry
+    // would be an un-undoable edit. Best-effort like the rest of this module —
+    // a journal that cannot be written must not block the user's edit.
+    append_journal(&p.dir, &cp);
     if let Ok(mut g) = log().lock() {
-        g.push(Checkpoint {
-            rel: p.rel,
-            backup: p.backup,
-            tool: p.tool,
-            post_hash,
-        });
+        g.push(cp);
     }
+}
+
+fn append_journal(dir: &Path, cp: &Checkpoint) {
+    use std::io::Write;
+    let line = JournalLine {
+        id: cp.id.clone(),
+        rel: cp.rel.clone(),
+        backup: cp.backup.as_ref().map(|b| b.display().to_string()),
+        tool: cp.tool.clone(),
+        post_hash: cp.post_hash,
+    };
+    let Ok(mut json) = serde_json::to_string(&line) else {
+        return;
+    };
+    json.push('\n');
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("journal.jsonl"))
+    {
+        let _ = f.write_all(json.as_bytes());
+    }
+}
+
+fn read_journal(root: &Path) -> Vec<Checkpoint> {
+    let Ok(text) = std::fs::read_to_string(root.join(JOURNAL)) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        // A torn final line from a killed child is skipped, not a hard error.
+        .filter_map(|line| serde_json::from_str::<JournalLine>(line).ok())
+        .map(|entry| Checkpoint {
+            id: entry.id,
+            rel: entry.rel,
+            backup: entry.backup.map(PathBuf::from),
+            tool: entry.tool,
+            post_hash: entry.post_hash,
+        })
+        .collect()
+}
+
+/// Fold checkpoints committed by other processes (subagents) into this
+/// process's log, in the order they were actually committed.
+///
+/// Called before serving the change set or an undo, so a delegated write is as
+/// visible and as revertible as one the server made itself. The journal's
+/// append order is the true commit order across processes, so it — not
+/// arrival at this process — decides what undo walks back. Idempotent: entries
+/// are matched by id, and anything only this process knows (a journal write
+/// that failed) is kept at the end rather than dropped.
+pub fn sync_from_store(root: &Path) {
+    let journaled = read_journal(root);
+    if journaled.is_empty() {
+        return;
+    }
+    let Ok(mut g) = log().lock() else { return };
+    let ordered: std::collections::HashSet<&str> =
+        journaled.iter().map(|cp| cp.id.as_str()).collect();
+    let unjournaled: Vec<Checkpoint> = g
+        .iter()
+        .filter(|cp| !ordered.contains(cp.id.as_str()))
+        .cloned()
+        .collect();
+    *g = journaled;
+    g.extend(unjournaled);
+}
+
+/// Drop one entry from the shared journal, so an undone change is not folded
+/// back in by the next [`sync_from_store`].
+fn forget_journaled(root: &Path, id: &str) {
+    let journal = root.join(JOURNAL);
+    let Ok(text) = std::fs::read_to_string(&journal) else {
+        return;
+    };
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|line| {
+            serde_json::from_str::<JournalLine>(line)
+                .map(|entry| entry.id != id)
+                .unwrap_or(true)
+        })
+        .collect();
+    let mut out = kept.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    let _ = std::fs::write(&journal, out);
+}
+
+/// Clear the log AND the workspace's shared journal.
+///
+/// Plain [`clear`] resets only this process, which is right for a terminal
+/// session that owns its whole store. A new web Code session must also drop
+/// what earlier sessions (and their subagents) journaled, or the first undo
+/// would walk back into a previous session's changes.
+pub fn clear_for_workspace(root: &Path) {
+    clear();
+    let _ = std::fs::remove_file(root.join(JOURNAL));
 }
 
 /// Undo the most recent checkpoint. Returns what it did.
@@ -186,9 +325,9 @@ pub fn finish(pending: Option<Pending>, mutated: bool) {
 /// current state is parked in the store (`undone_*`), so even a forced undo
 /// destroys nothing irrecoverably.
 pub fn undo(sandbox: &Sandbox, force: bool) -> Result<String, String> {
-    let cp = {
+    let (cp, depth) = {
         let g = log().lock().map_err(|_| "checkpoint log poisoned")?;
-        g.last().cloned().ok_or("nothing to undo")?
+        (g.last().cloned().ok_or("nothing to undo")?, g.len())
     };
     let target = sandbox.resolve(&cp.rel, false)?;
     let target = canonical_target(&target).unwrap_or(target);
@@ -221,10 +360,27 @@ pub fn undo(sandbox: &Sandbox, force: bool) -> Result<String, String> {
         }
     }
 
-    // Only pop once the guard has passed.
-    if let Ok(mut g) = log().lock() {
+    // Only pop once the guard has passed — and only if the entry read at the top
+    // is still the newest one. The hashing and parking above happen with the log
+    // unlocked, and the web lane can run a turn concurrently with an undo, so a
+    // blind `pop()` here could discard a checkpoint some other write pushed in
+    // between: that write would then be missing from the Changes view and could
+    // never be reverted, while the file this call restores is a different one.
+    // Refuse instead of corrupting the log; the caller can undo again.
+    {
+        let mut g = log().lock().map_err(|_| "checkpoint log poisoned")?;
+        if g.len() != depth || g.last().map(|last| last.id.as_str()) != Some(cp.id.as_str()) {
+            return Err(format!(
+                "{} was not undone: the workspace changed while the undo was preparing. Nothing \
+                 was modified — try again",
+                cp.rel
+            ));
+        }
         g.pop();
     }
+    // Keep the durable journal in step, or the next sync would resurrect the
+    // entry this call just walked back.
+    forget_journaled(sandbox.root(), &cp.id);
     match &cp.backup {
         Some(b) => {
             std::fs::copy(b, &target).map_err(|e| format!("restore failed: {e}"))?;
@@ -428,6 +584,106 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "v1");
         assert!(undo(&sandbox, false).is_err(), "nothing left to undo");
         clear();
+    }
+
+    #[test]
+    fn a_sibling_processs_checkpoint_is_visible_and_undoable_here() {
+        // A subagent is a separate process writing into the SAME workspace. Its
+        // checkpoints reach this process only through the shared journal; before
+        // that existed, a delegated write was missing from the change set and
+        // could never be undone.
+        let _g = cp_lock();
+        let d = tempfile::tempdir().unwrap();
+        let sandbox = sb(d.path());
+        clear_for_workspace(sandbox.root());
+
+        let f = d.path().join("child.txt");
+        std::fs::write(&f, "before").unwrap();
+        let pending = prepare(&sandbox, &f, "write_file");
+        std::fs::write(&f, "after").unwrap();
+        finish(pending, true);
+
+        // Stand in for the child exiting: its in-memory log dies with it, the
+        // journal on disk does not.
+        clear();
+        assert!(all().is_empty());
+
+        sync_from_store(sandbox.root());
+        assert_eq!(
+            all().iter().map(|cp| cp.rel.as_str()).collect::<Vec<_>>(),
+            vec!["child.txt"],
+            "the delegated write must appear in this process's change set"
+        );
+
+        undo(&sandbox, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "before");
+
+        // And it must not come back: the journal entry is dropped with the undo.
+        sync_from_store(sandbox.root());
+        assert!(all().is_empty(), "an undone change must stay undone");
+        clear_for_workspace(sandbox.root());
+    }
+
+    #[test]
+    fn syncing_orders_by_commit_not_by_arrival() {
+        // Undo is LIFO over the whole workspace, so a sibling's later write must
+        // walk back before this process's earlier one — arrival order here would
+        // revert the wrong file.
+        let _g = cp_lock();
+        let d = tempfile::tempdir().unwrap();
+        let sandbox = sb(d.path());
+        clear_for_workspace(sandbox.root());
+
+        let mine = d.path().join("mine.txt");
+        std::fs::write(&mine, "v1").unwrap();
+        let p = prepare(&sandbox, &mine, "edit_file");
+        std::fs::write(&mine, "v2").unwrap();
+        finish(p, true);
+
+        // A sibling commits AFTER us, then exits (its entry lives in the journal
+        // only). Simulate by taking our copy out of memory and back in.
+        let theirs = d.path().join("theirs.txt");
+        std::fs::write(&theirs, "t1").unwrap();
+        let p = prepare(&sandbox, &theirs, "edit_file");
+        std::fs::write(&theirs, "t2").unwrap();
+        finish(p, true);
+        clear();
+
+        sync_from_store(sandbox.root());
+        undo(&sandbox, false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&theirs).unwrap(),
+            "t1",
+            "the newest change in the workspace is the one that unwinds first"
+        );
+        assert_eq!(std::fs::read_to_string(&mine).unwrap(), "v2");
+        clear_for_workspace(sandbox.root());
+    }
+
+    #[test]
+    fn a_torn_journal_line_is_skipped_not_fatal() {
+        // A child killed mid-write can leave a half line. Losing that one entry
+        // is acceptable; refusing to serve the change set is not.
+        let _g = cp_lock();
+        let d = tempfile::tempdir().unwrap();
+        let sandbox = sb(d.path());
+        clear_for_workspace(sandbox.root());
+
+        let f = d.path().join("a.txt");
+        std::fs::write(&f, "one").unwrap();
+        let p = prepare(&sandbox, &f, "write_file");
+        std::fs::write(&f, "two").unwrap();
+        finish(p, true);
+        clear();
+
+        let journal = d.path().join(JOURNAL);
+        let mut text = std::fs::read_to_string(&journal).unwrap();
+        text.push_str("{\"id\":\"9-0\",\"rel\":\"trunc");
+        std::fs::write(&journal, text).unwrap();
+
+        sync_from_store(sandbox.root());
+        assert_eq!(all().len(), 1, "the intact entry survives the torn one");
+        clear_for_workspace(sandbox.root());
     }
 
     #[test]

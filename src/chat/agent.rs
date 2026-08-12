@@ -108,6 +108,20 @@ pub trait ModelDriver {
     fn last_step_truncated(&self) -> bool {
         false
     }
+
+    /// Whether the most recent step stopped at `max_tokens` rather than because
+    /// the model was finished. Distinct from [`Self::last_step_truncated`]: no
+    /// one cancelled, the budget simply ran out. The text is cut off mid-thought
+    /// — a `write_file` payload in it is incomplete and any tool-call JSON in it
+    /// is very likely unparseable — so the loop retries instead of committing it.
+    fn last_step_capped(&self) -> bool {
+        false
+    }
+
+    /// Set the generation allowance for the next step. The loop calls this with
+    /// the allowance that fits the remaining context budget, which may be below
+    /// the configured ceiling. Drivers without a token budget ignore it.
+    fn set_max_tokens(&mut self, _max_tokens: u32) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,9 +294,26 @@ pub fn resolve_policy(auto_approve: bool, yolo: bool, production: bool) -> Resul
 }
 
 /// Run the bounded loop for one goal. Returns how it ended. Never loops past
-/// `max_steps`; checks `cancel` between steps and tool calls.
+/// `max_steps` when it is non-zero; zero means no arbitrary step cap. The loop
+/// always checks `cancel` between model steps and tool calls, and the
+/// result-aware repetition guard still stops a model that makes no progress.
 /// Consecutive identical (tool + args) calls before the loop gives up.
 const REPEAT_LIMIT: usize = 3;
+/// How many times a step may be re-run after being cut off at `max_tokens`
+/// before the loop gives up and surfaces the incomplete text with a disclosure.
+const CAPPED_RETRY_LIMIT: usize = 2;
+/// How many times a workspace turn may be sent back for missing evidence before
+/// the loop stops insisting and answers with a disclosure instead.
+///
+/// The evidence guards below assume `read_file` is the only way to observe a
+/// file. In Code mode that is no longer true — a model can `cat`, `wc` or `grep`
+/// through `run_shell`, or learn a file by editing it — so a model that answered
+/// correctly from a shell observation was re-prompted forever. Code has no step
+/// cap, so "forever" was literal: the turn only ended when the user pressed
+/// Stop. Insisting a bounded number of times keeps the guard's value (a model
+/// that invents file contents gets pushed to look) without letting it own the
+/// turn.
+const EVIDENCE_REPROMPT_LIMIT: usize = 3;
 const MAX_WORKSPACE_TOOL_CALLS_PER_STEP: usize = 8;
 
 /// Result-aware no-progress guard. Records the outcome for a call signature and
@@ -291,11 +322,19 @@ const MAX_WORKSPACE_TOOL_CALLS_PER_STEP: usize = 8;
 /// file). A call whose result keeps changing — e.g. polling
 /// `check_subagent_status` while a subagent runs (running → completed) — resets
 /// the counter and is never flagged, so legitimate polling is not cut off.
+///
+/// Waiting on a still-running child is exempt outright rather than relying on
+/// its text changing: several polls can happen inside one model step, and being
+/// wrong here does not just end the turn, it kills the child too.
 fn note_no_progress(
     counts: &mut HashMap<String, (usize, String)>,
     signature: &str,
     outcome: &ToolOutcome,
 ) -> bool {
+    if super::subagent::is_running_status(outcome.text()) {
+        counts.remove(signature);
+        return false;
+    }
     let entry = counts
         .entry(signature.to_string())
         .or_insert((0, String::new()));
@@ -350,7 +389,14 @@ pub fn run_loop(
     let mut successful_workspace_reads = BTreeSet::new();
     let mut calibration: Option<f32> = None;
 
-    for _ in 0..cfg.max_steps {
+    let mut completed_steps = 0usize;
+    let mut capped_retries = 0usize;
+    let mut evidence_reprompts = 0usize;
+    loop {
+        if cfg.max_steps != 0 && completed_steps >= cfg.max_steps {
+            break;
+        }
+        completed_steps = completed_steps.saturating_add(1);
         if cancel.load(Ordering::Relaxed) {
             reporter.notice("aborted");
             return LoopEnd::Aborted;
@@ -369,7 +415,7 @@ pub fn run_loop(
             }
         }
         let compiled_history = compile_history_for_step(history, cfg.tool_profile);
-        let (compiled_history, trimmed, prompt_tokens) = match fit_history_to_budget(
+        let (compiled_history, trimmed, prompt_tokens, allowance) = match fit_history_to_budget(
             driver,
             compiled_history,
             &tools,
@@ -385,6 +431,15 @@ pub fn run_loop(
         if trimmed {
             reporter.notice("older conversation detail was omitted to keep this step responsive");
         }
+        // The ceiling only applies when it fits; otherwise the step runs on the
+        // headroom that is actually left.
+        driver.set_max_tokens(allowance);
+        if allowance < cfg.max_tokens {
+            reporter.notice(&format!(
+                "this step's reply is limited to {allowance} tokens by the remaining context \
+                 budget"
+            ));
+        }
         if let (Some(prompt_tokens), Some(budget_tokens)) =
             (prompt_tokens, driver.context_budget_tokens())
         {
@@ -392,7 +447,7 @@ pub fn run_loop(
                 &compiled_history,
                 &tools,
                 prompt_tokens,
-                cfg.max_tokens,
+                allowance,
                 budget_tokens,
             ));
         }
@@ -433,11 +488,40 @@ pub fn run_loop(
         }
         match step {
             ModelStep::Text(text) => {
+                // A step that stopped at max_tokens is CUT OFF, not finished.
+                // Text here means `tool_parse` found no call — and the single
+                // most common reason for that on a capped step is a `write_file`
+                // whose JSON never closed. Committing it would render a mangled
+                // half-tool-call as the assistant's answer and silently drop the
+                // write. Retry with the cap disclosed instead; the guard keeps a
+                // model that cannot fit its answer from spinning forever.
+                if driver.last_step_capped() && !text.trim().is_empty() {
+                    if capped_retries < CAPPED_RETRY_LIMIT {
+                        capped_retries += 1;
+                        completed_steps = completed_steps.saturating_sub(1);
+                        reporter.notice(
+                            "the model hit its output cap mid-answer; retrying with a smaller \
+                             unit of work",
+                        );
+                        history.push(AgentMsg::System(
+                            "Your last reply was cut off at the output-token limit, so it was \
+                             discarded. Do less in one step: write ONE file (or make ONE \
+                             edit_file change) per step, and prefer edit_file over rewriting a \
+                             whole file. Emit the complete tool call and nothing else."
+                                .into(),
+                        ));
+                        continue;
+                    }
+                    reporter.notice(
+                        "the model hit its output cap repeatedly; the answer below is incomplete",
+                    );
+                }
                 let missing_reads = required_workspace_reads
                     .difference(&successful_workspace_reads)
                     .cloned()
                     .collect::<BTreeSet<_>>();
-                if !missing_reads.is_empty() {
+                if !missing_reads.is_empty() && evidence_reprompts < EVIDENCE_REPROMPT_LIMIT {
+                    evidence_reprompts += 1;
                     reporter.notice("Workspace must read each named file before answering");
                     history.push(AgentMsg::System(format!(
                         "Use read_file on these exact relative paths before answering: {}. Then \
@@ -447,7 +531,20 @@ pub fn run_loop(
                     )));
                     continue;
                 }
-                if require_workspace_observation && !observed_workspace {
+                if !missing_reads.is_empty() {
+                    // Said once, plainly, instead of asking again: the model has
+                    // had its chances, and the user needs to know the answer is
+                    // not backed by a read of these paths.
+                    reporter.notice(&format!(
+                        "answering without a read_file observation of: {}",
+                        missing_reads.into_iter().collect::<Vec<_>>().join(", ")
+                    ));
+                }
+                if require_workspace_observation
+                    && !observed_workspace
+                    && evidence_reprompts < EVIDENCE_REPROMPT_LIMIT
+                {
+                    evidence_reprompts += 1;
                     reporter.notice(
                         "Workspace inspection is required before answering this file request",
                     );
@@ -1044,18 +1141,34 @@ fn context_budget_usage(
     }
 }
 
+/// The smallest generation allowance worth running a step with. Below this a
+/// step cannot emit even a short tool call, so failing is more honest than
+/// generating something guaranteed to be cut off.
+const MIN_GENERATION_ALLOWANCE: u32 = 256;
+
+/// The allowance worth protecting history for. While at least this much headroom
+/// remains, the step runs on the headroom and the history is left ALONE — the
+/// cached prefix survives and only the new suffix is prefilled. Trimming starts
+/// only below this, because each trim costs a full re-prefill of the context.
+const WORKING_ALLOWANCE: u32 = 512;
+
+/// Fit the prompt under the model's context budget and report the generation
+/// allowance that actually fits. `max_tokens` is a CEILING, not a reservation:
+/// once trimming is exhausted the allowance shrinks into whatever headroom is
+/// left rather than failing the turn — a large ceiling must never turn a
+/// session that used to run into a hard "context budget error".
 fn fit_history_to_budget(
     driver: &mut dyn ModelDriver,
     mut history: Vec<AgentMsg>,
     tools: &[ToolSpec],
     max_tokens: u32,
     profile: tools::ToolProfile,
-) -> Result<(Vec<AgentMsg>, bool, Option<u32>), String> {
+) -> Result<(Vec<AgentMsg>, bool, Option<u32>, u32), String> {
     if !profile.is_workspace() {
-        return Ok((history, false, None));
+        return Ok((history, false, None, max_tokens));
     }
     let Some(budget) = driver.context_budget_tokens() else {
-        return Ok((history, false, None));
+        return Ok((history, false, None, max_tokens));
     };
     let mut trimmed = false;
     loop {
@@ -1064,9 +1177,22 @@ fn fit_history_to_budget(
                 if u64::from(prompt_tokens).saturating_add(u64::from(max_tokens))
                     <= u64::from(budget) =>
             {
-                return Ok((history, trimmed, Some(prompt_tokens)));
+                return Ok((history, trimmed, Some(prompt_tokens), max_tokens));
             }
-            Ok(None) => return Ok((history, trimmed, None)),
+            // The ceiling did not fit, but a WORKING allowance still does. Spend
+            // the headroom rather than trimming: `remove_oldest_optional_context`
+            // edits the FRONT of the history, which invalidates the whole cached
+            // prefix and forces a full re-prefill — and prefill is ~99% of the
+            // long-context wall. Raising the generation ceiling must not drag the
+            // trim point down with it; trimming stays the last resort it was.
+            Ok(Some(prompt_tokens))
+                if u64::from(prompt_tokens).saturating_add(u64::from(WORKING_ALLOWANCE))
+                    <= u64::from(budget) =>
+            {
+                let headroom = budget.saturating_sub(prompt_tokens).min(max_tokens);
+                return Ok((history, trimmed, Some(prompt_tokens), headroom));
+            }
+            Ok(None) => return Ok((history, trimmed, None, max_tokens)),
             Ok(Some(_)) if remove_oldest_optional_context(&mut history) => {
                 trimmed = true;
             }
@@ -1074,9 +1200,14 @@ fn fit_history_to_budget(
                 trimmed = true;
             }
             Ok(Some(prompt_tokens)) => {
+                let headroom = budget.saturating_sub(prompt_tokens);
+                if headroom >= MIN_GENERATION_ALLOWANCE {
+                    return Ok((history, trimmed, Some(prompt_tokens), headroom));
+                }
                 return Err(format!(
-                    "required prompt ({prompt_tokens} tokens) plus generation allowance \
-                     ({max_tokens} tokens) exceeds the {budget}-token Workspace budget"
+                    "required prompt ({prompt_tokens} tokens) leaves under \
+                     {MIN_GENERATION_ALLOWANCE} tokens of the {budget}-token Workspace budget \
+                     for the reply"
                 ));
             }
             Err(error) => return Err(error),
@@ -1581,6 +1712,8 @@ pub struct LiveDriver {
     last_prompt_tokens: Option<u32>,
     /// Whether the most recent streamed step ended in mid-stream cancellation.
     last_step_truncated: bool,
+    /// Whether the most recent streamed step stopped at `max_tokens`.
+    last_step_capped: bool,
     /// Optional live-token sink. When set (the TUI), `step` streams the model's
     /// output via `chat_stream`, forwards each delta here, and parses tool calls
     /// from the accumulated raw content (`tool_parse`, every family). When `None`
@@ -1605,6 +1738,7 @@ impl LiveDriver {
             native_tool_history: false,
             last_prompt_tokens: None,
             last_step_truncated: false,
+            last_step_capped: false,
             on_delta: None,
         }
     }
@@ -1631,6 +1765,7 @@ impl LiveDriver {
             native_tool_history: false,
             last_prompt_tokens: None,
             last_step_truncated: false,
+            last_step_capped: false,
             on_delta: None,
         }
     }
@@ -1645,9 +1780,21 @@ impl LiveDriver {
         self.context_budget_tokens = budget_tokens;
     }
 
+    /// Cancellable streaming under an absolute wall-clock deadline. The
+    /// read-only Workspace lane runs this way: its published contract is a
+    /// bounded turn that fails closed on a stalled server.
     pub fn set_stream_control(&mut self, cancel: std::sync::Arc<AtomicBool>, timeout: Duration) {
         self.stream_cancel = Some(cancel);
         self.stream_timeout = Some(timeout);
+    }
+
+    /// Keep streamed generation cancellable without imposing a wall-clock
+    /// deadline. Web Code uses this because large local models can legitimately
+    /// spend minutes in prefill or a long tool-producing turn; the user-facing
+    /// Stop control remains authoritative.
+    pub fn set_stream_cancel(&mut self, cancel: std::sync::Arc<AtomicBool>) {
+        self.stream_cancel = Some(cancel);
+        self.stream_timeout = None;
     }
 
     pub fn set_native_tool_history(&mut self, enabled: bool) {
@@ -1664,9 +1811,19 @@ impl ModelDriver for LiveDriver {
         self.last_step_truncated
     }
 
+    fn last_step_capped(&self) -> bool {
+        self.last_step_capped
+    }
+
+    fn set_max_tokens(&mut self, max_tokens: u32) {
+        self.max_tokens = max_tokens;
+    }
+
     fn step(&mut self, history: &[AgentMsg], tools: &[ToolSpec]) -> Result<ModelStep, String> {
         self.last_step_metrics = None;
         self.last_prompt_tokens = None;
+        // Clear per-step flags so a previous step's cap never leaks into this one.
+        self.last_step_capped = false;
         let tool_defs = tools_to_json(tools);
         // TUI lane: stream the model's output live, then parse tool calls from the
         // accumulated raw content (the structured-tool_calls path is non-streaming).
@@ -1735,13 +1892,14 @@ impl ModelDriver for LiveDriver {
         if let Some(object) = request.as_object_mut() {
             object.remove("camelid_context_budget_tokens");
         }
-        let prompt_tokens = match self.stream_cancel.as_deref() {
-            Some(cancel) => self.client.generation_preflight_with_control(
-                &request,
-                cancel,
-                self.stream_timeout.unwrap_or(Duration::from_secs(30)),
-            ),
-            None => self.client.generation_preflight(&request),
+        let prompt_tokens = match (self.stream_cancel.as_deref(), self.stream_timeout) {
+            (Some(cancel), Some(timeout)) => self
+                .client
+                .generation_preflight_with_control(&request, cancel, timeout),
+            (Some(cancel), None) => self
+                .client
+                .generation_preflight_with_cancel(&request, cancel),
+            (None, _) => self.client.generation_preflight(&request),
         };
         prompt_tokens.map(Some).map_err(|error| error.to_string())
     }
@@ -1820,11 +1978,29 @@ impl LiveDriver {
         // usage chunk the streaming request opts into.
         self.last_prompt_tokens = stats.prompt_tokens;
         self.last_step_truncated = stats.end == StreamEnd::Cancelled;
+        self.last_step_capped = stats.end == StreamEnd::Length;
         let end = stats.end;
         if end == StreamEnd::Cancelled {
             // run_loop re-checks the cancel flag right after step and aborts; the
             // partial text is discarded there.
             return Ok(ModelStep::Text(content));
+        }
+        // Tool-enabled Camelid streams buffer the candidate envelope and emit
+        // a structured OpenAI `delta.tool_calls` at completion. Prefer those
+        // calls exactly as the blocking agent path does; otherwise a valid
+        // Qwen action arrives with empty `delta.content` and Code mistakes it
+        // for an unsupported plain answer.
+        if !stats.tool_calls.is_empty() {
+            return Ok(ModelStep::Calls(
+                stats
+                    .tool_calls
+                    .into_iter()
+                    .map(|call| ToolCall {
+                        name: call.name,
+                        args: super::tool_parse::json_args_lenient(&call.arguments),
+                    })
+                    .collect(),
+            ));
         }
         let calls = super::tool_parse::parse(&content, &self.family);
         Ok(if calls.is_empty() {
@@ -2931,7 +3107,7 @@ mod tests {
             AgentMsg::Memory("x".repeat(80)),
             AgentMsg::User("current".into()),
         ];
-        let (fitted, trimmed, prompt_tokens) = fit_history_to_budget(
+        let (fitted, trimmed, prompt_tokens, _allowance) = fit_history_to_budget(
             &mut CountingDriver,
             history,
             &[],
@@ -3007,7 +3183,7 @@ mod tests {
             });
         }
 
-        let (fitted, trimmed, prompt_tokens) = fit_history_to_budget(
+        let (fitted, trimmed, prompt_tokens, _allowance) = fit_history_to_budget(
             &mut CharacterDriver,
             history,
             &[],
@@ -3271,6 +3447,66 @@ mod tests {
         assert_eq!(reporter.text.len(), 1);
         assert!(reporter.text[0].contains("Found 1 Markdown file"));
         assert!(reporter.text[0].contains("- `README.md`"));
+    }
+
+    #[test]
+    fn the_evidence_guard_stops_insisting_instead_of_owning_the_turn() {
+        // Regression: the guard assumed read_file was the only way to observe a
+        // file and re-prompted with no limit. Code mode has no step cap, so a
+        // model that had genuinely observed notes.txt another way (run_shell
+        // `wc -l`, an edit, a search) was sent back forever and the turn only
+        // ended when the user pressed Stop. Measured live on macOS once the shell
+        // became enforceable: 22 identical notices and no terminal event.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "alpha\nbeta\ngamma\n").unwrap();
+        let sandbox = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        // The model answers from a shell observation every time and never calls
+        // read_file — exactly the live failure.
+        let mut driver = MockDriver {
+            steps: (0..12)
+                .map(|_| ModelStep::Text("notes.txt has 3 lines.".into()))
+                .collect(),
+            idx: 0,
+        };
+        let mut approver = ScriptApprover(vec![], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(
+            "Run the shell command: wc -l < notes.txt . Then tell me the count.".into(),
+        )];
+        let mut config = cfg(dir.path(), false);
+        config.tool_profile = tools::ToolProfile::WebCode;
+        // No step cap, as Code mode runs.
+        config.max_steps = 0;
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sandbox,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Answered, "the turn must terminate on its own");
+        let insisted = reporter
+            .notices
+            .iter()
+            .filter(|n| n.contains("must read each named file"))
+            .count();
+        assert!(
+            insisted <= EVIDENCE_REPROMPT_LIMIT,
+            "the guard may insist at most {EVIDENCE_REPROMPT_LIMIT}×, got {insisted}: {:?}",
+            reporter.notices
+        );
+        assert!(
+            reporter
+                .notices
+                .iter()
+                .any(|n| n.contains("without a read_file observation")),
+            "the user must be told the answer was not backed by a read: {:?}",
+            reporter.notices
+        );
     }
 
     #[test]
@@ -3602,6 +3838,57 @@ mod tests {
     }
 
     #[test]
+    fn zero_step_limit_runs_until_the_model_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        let mut driver = MockDriver {
+            steps: vec![
+                ModelStep::Calls(vec![tc("search", json!({"pattern":"first"}))]),
+                ModelStep::Calls(vec![tc("search", json!({"pattern":"second"}))]),
+                ModelStep::Text("finished without an arbitrary cap".into()),
+            ],
+            idx: 0,
+        };
+        let mut approver = ScriptApprover(vec![], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("keep working".into())];
+        let mut config = cfg(dir.path(), false);
+        config.max_steps = 0;
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sb,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        assert_eq!(end, LoopEnd::Answered);
+        assert_eq!(reporter.calls.len(), 2);
+        assert_eq!(reporter.text, vec!["finished without an arbitrary cap"]);
+    }
+
+    #[test]
+    fn cancellable_stream_can_run_without_a_model_step_deadline() {
+        let mut driver = LiveDriver::with(
+            Client::new("127.0.0.1:8181".parse().unwrap()),
+            "model".into(),
+            "qwen3".into(),
+            64,
+            0.0,
+        );
+        driver.set_stream_control(
+            std::sync::Arc::new(AtomicBool::new(false)),
+            Duration::from_secs(90),
+        );
+        assert_eq!(driver.stream_timeout, Some(Duration::from_secs(90)));
+        driver.set_stream_cancel(std::sync::Arc::new(AtomicBool::new(false)));
+        assert_eq!(driver.stream_timeout, None);
+        assert!(driver.stream_cancel.is_some());
+    }
+
+    #[test]
     fn repeated_identical_call_breaks_the_loop() {
         let dir = tempfile::tempdir().unwrap();
         let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
@@ -3650,6 +3937,34 @@ mod tests {
         assert!(!note_no_progress(&mut stuck, "read::y", &running));
         assert!(!note_no_progress(&mut stuck, "read::y", &running));
         assert!(note_no_progress(&mut stuck, "read::y", &running));
+    }
+
+    #[test]
+    fn waiting_on_a_subagent_is_never_counted_as_no_progress() {
+        // A child can outlive any number of parent polls, and several polls can
+        // land inside ONE model step, so "the text will change" is not enough.
+        // Getting this wrong does not merely end the turn: Code mode has no step
+        // cap, so this guard is its main terminator, and the turn guard kills
+        // every live child on the way out — a healthy subagent would be
+        // destroyed for the crime of still working.
+        let waiting = ToolOutcome::Ok(
+            "status: running\nnote: subagent \"a\" has not finished yet (0.0s elapsed)".to_string(),
+        );
+        let mut counts = HashMap::new();
+        for _ in 0..(REPEAT_LIMIT * 3) {
+            assert!(!note_no_progress(
+                &mut counts,
+                "check_subagent_status::{\"subtask_id\":\"a\"}",
+                &waiting
+            ));
+        }
+        // A child that has FINISHED is a settled result like any other: polling
+        // it forever is a genuine stall and still stops the loop.
+        let done = ToolOutcome::Ok("status: completed\nanswer:\n42".to_string());
+        let mut settled = HashMap::new();
+        assert!(!note_no_progress(&mut settled, "check::a", &done));
+        assert!(!note_no_progress(&mut settled, "check::a", &done));
+        assert!(note_no_progress(&mut settled, "check::a", &done));
     }
 
     #[test]
@@ -4229,6 +4544,141 @@ mod tests {
         );
         // The safety spine is still the first message.
         assert!(matches!(&history[0], AgentMsg::System(s) if s.contains("untrusted data")));
+    }
+
+    /// A step cut off at `max_tokens` is NOT an answer. The single most common
+    /// shape here is a `write_file` whose JSON never closed, which `tool_parse`
+    /// reports as no call at all — so committing the text would render a mangled
+    /// half-tool-call as the reply and silently drop the write.
+    #[test]
+    fn a_step_capped_at_max_tokens_is_retried_not_committed() {
+        struct CappedThenAnswers {
+            steps: usize,
+        }
+        impl ModelDriver for CappedThenAnswers {
+            fn step(&mut self, _h: &[AgentMsg], _t: &[ToolSpec]) -> Result<ModelStep, String> {
+                self.steps += 1;
+                Ok(ModelStep::Text(if self.steps == 1 {
+                    // A write_file call that ran out of budget mid-argument.
+                    r#"write_file({"path": "a.rs", "content": "fn main() {"#.into()
+                } else {
+                    "done".into()
+                }))
+            }
+            fn last_step_capped(&self) -> bool {
+                self.steps == 1
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut driver = CappedThenAnswers { steps: 0 };
+        let mut approver = ScriptApprover(vec![], 0);
+        let mut reporter = RecordReporter::default();
+        let mut policy = Policy::default();
+        let mut history = vec![
+            AgentMsg::System("rules".into()),
+            AgentMsg::User("goal".into()),
+        ];
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sb,
+            &cfg(dir.path(), false),
+            &cancel,
+            &mut policy,
+            &mut history,
+        );
+        assert_eq!(end, LoopEnd::Answered);
+        assert_eq!(driver.steps, 2, "the capped step must be re-run");
+        assert!(
+            !history
+                .iter()
+                .any(|m| matches!(m, AgentMsg::Assistant(a) if a.contains("write_file("))),
+            "the cut-off tool call must never be committed as the answer"
+        );
+        assert!(
+            history
+                .iter()
+                .any(|m| matches!(m, AgentMsg::System(s) if s.contains("cut off"))),
+            "the retry must disclose the cap to the model"
+        );
+    }
+
+    /// Raising the generation ceiling must NOT drag the trim point down with it.
+    /// Trimming edits the front of the history, which invalidates the cached
+    /// prefix and costs a full re-prefill — ~99% of the long-context wall. While
+    /// a working allowance still fits, the history must be left untouched.
+    #[test]
+    fn a_ceiling_that_does_not_fit_spends_headroom_instead_of_trimming() {
+        struct Roomy;
+        impl ModelDriver for Roomy {
+            fn step(&mut self, _h: &[AgentMsg], _t: &[ToolSpec]) -> Result<ModelStep, String> {
+                unreachable!("fit_history_to_budget does not step")
+            }
+            fn context_budget_tokens(&self) -> Option<u32> {
+                Some(8192)
+            }
+            fn prompt_tokens(
+                &mut self,
+                _h: &[AgentMsg],
+                _t: &[ToolSpec],
+            ) -> Result<Option<u32>, String> {
+                // 6600 + the 2048 ceiling overflows 8192, but 6600 + 512 fits, so
+                // this step must run on headroom with the history intact.
+                Ok(Some(6600))
+            }
+        }
+        let history = vec![
+            AgentMsg::System("rules".into()),
+            AgentMsg::User("q".into()),
+            AgentMsg::Assistant("a".into()),
+        ];
+        let before = history.len();
+        let (fitted, trimmed, _prompt, allowance) =
+            fit_history_to_budget(&mut Roomy, history, &[], 2048, tools::ToolProfile::WebCode)
+                .expect("headroom remains, so this must not fail");
+        assert!(
+            !trimmed,
+            "the cached prefix must survive a non-fitting ceiling"
+        );
+        assert_eq!(fitted.len(), before, "no message may be dropped here");
+        assert_eq!(allowance, 1592, "the step runs on the remaining headroom");
+    }
+
+    /// A generation ceiling larger than the remaining context headroom must
+    /// shrink into the headroom, not fail the turn: raising the ceiling can only
+    /// ever add capability, never turn a session that used to run into an error.
+    #[test]
+    fn an_oversized_generation_ceiling_shrinks_instead_of_failing() {
+        struct TightBudget;
+        impl ModelDriver for TightBudget {
+            fn step(&mut self, _h: &[AgentMsg], _t: &[ToolSpec]) -> Result<ModelStep, String> {
+                unreachable!("fit_history_to_budget does not step")
+            }
+            fn context_budget_tokens(&self) -> Option<u32> {
+                Some(1000)
+            }
+            fn prompt_tokens(
+                &mut self,
+                _h: &[AgentMsg],
+                _t: &[ToolSpec],
+            ) -> Result<Option<u32>, String> {
+                Ok(Some(600))
+            }
+        }
+        let history = vec![AgentMsg::System("rules".into()), AgentMsg::User("q".into())];
+        let (_fitted, _trimmed, prompt_tokens, allowance) = fit_history_to_budget(
+            &mut TightBudget,
+            history,
+            &[],
+            4096,
+            tools::ToolProfile::WebCode,
+        )
+        .expect("a ceiling over the headroom must clamp, not error");
+        assert_eq!(prompt_tokens, Some(600));
+        assert_eq!(allowance, 400, "the allowance is the remaining headroom");
     }
 
     /// B6: a step that raced a cancel is discarded whole. Committing its

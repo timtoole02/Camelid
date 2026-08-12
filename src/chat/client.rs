@@ -112,12 +112,16 @@ pub enum LoadOutcome {
 }
 
 /// How a finished/halted chat stream ended.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum StreamEnd {
     /// `[DONE]` (or a clean close) was reached.
     Done,
     /// Aborted because the cancel flag was set (Ctrl-C mid-stream).
     Cancelled,
+    /// The server stopped at `max_tokens` (`finish_reason: "length"`). The text
+    /// is CUT OFF mid-thought — a tool call in it may be unparseable JSON — so
+    /// callers must distinguish it from a normally completed answer.
+    Length,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -130,6 +134,11 @@ pub struct StreamStats {
     /// when the request opted in via `stream_options.include_usage` (the agent
     /// lane's calibration signal); `None` otherwise.
     pub prompt_tokens: Option<u32>,
+    /// Structured OpenAI tool-call deltas accumulated across the stream. The
+    /// dense chat server deliberately withholds a possible tool-call envelope
+    /// from `delta.content`, then emits it here at completion. Dropping this
+    /// field turns a valid agent action into an empty assistant answer.
+    pub tool_calls: Vec<ToolCallOut>,
 }
 
 #[derive(Clone)]
@@ -267,13 +276,15 @@ impl Client {
         path: &str,
         body: Option<&Value>,
         cancel: &AtomicBool,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> anyhow::Result<(u16, Value)> {
-        let deadline = Instant::now() + timeout;
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
         if cancel.load(Ordering::Relaxed) {
             anyhow::bail!("request cancelled");
         }
-        let connect_timeout = timeout.min(Duration::from_secs(2));
+        let connect_timeout = timeout
+            .unwrap_or(Duration::from_secs(2))
+            .min(Duration::from_secs(2));
         if connect_timeout.is_zero() {
             anyhow::bail!("request exceeded its deadline");
         }
@@ -283,7 +294,7 @@ impl Client {
         // platform's socket-timeout message.
         let mut stream = TcpStream::connect_timeout(&self.addr, connect_timeout).map_err(
             |error| -> anyhow::Error {
-                if connect_timeout == timeout && is_timeout(&error) {
+                if timeout.is_some_and(|timeout| connect_timeout == timeout) && is_timeout(&error) {
                     anyhow::anyhow!("request exceeded its deadline")
                 } else {
                     error.into()
@@ -292,7 +303,8 @@ impl Client {
         )?;
         stream.set_read_timeout(Some(Duration::from_millis(100)))?;
         let write_timeout = deadline
-            .saturating_duration_since(Instant::now())
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::from_secs(30))
             .min(Duration::from_secs(30));
         if write_timeout.is_zero() {
             // set_write_timeout rejects a zero Duration; a spent budget means
@@ -326,7 +338,7 @@ impl Client {
             if cancel.load(Ordering::Relaxed) {
                 anyhow::bail!("request cancelled");
             }
-            if Instant::now() >= deadline {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 anyhow::bail!("request exceeded its deadline");
             }
             match stream.read(&mut chunk) {
@@ -478,6 +490,7 @@ impl Client {
                 total_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
                 ttft_ms: None,
                 prompt_tokens: None,
+                tool_calls: Vec::new(),
             });
         }
         if reader.status != 200 {
@@ -490,6 +503,15 @@ impl Client {
         // From the terminal usage chunk, when the request opted in via
         // stream_options.include_usage (agent lane); absent otherwise.
         let mut prompt_tokens: Option<u32> = None;
+        // `finish_reason: "length"` is the ONLY signal that the model was cut
+        // off at max_tokens. Without it a capped step is indistinguishable from
+        // a finished one, and half-written tool calls get committed as answers.
+        let mut length_capped = false;
+        // OpenAI streams one logical tool call as fragments keyed by `index`.
+        // Camelid currently emits each completed call in one terminal delta,
+        // but accumulating fragments here keeps the client correct for every
+        // conforming stream shape and for future incremental server emission.
+        let mut tool_calls: Vec<ToolCallOut> = Vec::new();
         let end = reader.stream(cancel, deadline, |line| {
             if let Some(payload) = line.strip_prefix("data:") {
                 let payload = payload.trim();
@@ -509,6 +531,45 @@ impl Client {
                             on_delta(content);
                         }
                     }
+                    if let Some(calls) = chunk
+                        .pointer("/choices/0/delta/tool_calls")
+                        .and_then(Value::as_array)
+                    {
+                        for (fallback_index, call) in calls.iter().enumerate() {
+                            let index = call
+                                .get("index")
+                                .and_then(Value::as_u64)
+                                .and_then(|value| usize::try_from(value).ok())
+                                .unwrap_or(fallback_index);
+                            while tool_calls.len() <= index {
+                                tool_calls.push(ToolCallOut {
+                                    name: String::new(),
+                                    arguments: String::new(),
+                                });
+                            }
+                            let accumulated = &mut tool_calls[index];
+                            if let Some(name) =
+                                call.pointer("/function/name").and_then(Value::as_str)
+                            {
+                                accumulated.name.push_str(name);
+                            }
+                            if let Some(arguments) =
+                                call.pointer("/function/arguments").and_then(Value::as_str)
+                            {
+                                accumulated.arguments.push_str(arguments);
+                            }
+                            ttft_ms.get_or_insert_with(|| {
+                                started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+                            });
+                        }
+                    }
+                    if chunk
+                        .pointer("/choices/0/finish_reason")
+                        .and_then(Value::as_str)
+                        == Some("length")
+                    {
+                        length_capped = true;
+                    }
                     if let Some(pt) = chunk
                         .pointer("/usage/prompt_tokens")
                         .and_then(Value::as_u64)
@@ -519,12 +580,25 @@ impl Client {
             }
             SseControl::Continue
         })?;
+        // A cancel outranks the cap: the user stopped it, whatever the server said.
+        let end = if length_capped && end == StreamEnd::Done {
+            StreamEnd::Length
+        } else {
+            end
+        };
+        tool_calls.retain(|call| !call.name.is_empty());
+        for call in &mut tool_calls {
+            if call.arguments.is_empty() {
+                call.arguments.push_str("{}");
+            }
+        }
         Ok(StreamStats {
             end,
             deltas,
             total_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
             ttft_ms,
             prompt_tokens,
+            tool_calls,
         })
     }
 
@@ -577,7 +651,29 @@ impl Client {
             "/api/generation/preflight",
             Some(request),
             cancel,
-            timeout,
+            Some(timeout),
+        )?;
+        if status != 200 {
+            anyhow::bail!(envelope_message(&body).unwrap_or_else(|| format!("HTTP {status}")));
+        }
+        let count = body
+            .get("prompt_token_count")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("generation preflight omitted prompt_token_count"))?;
+        u32::try_from(count).map_err(|_| anyhow::anyhow!("prompt token count exceeds u32"))
+    }
+
+    pub fn generation_preflight_with_cancel(
+        &self,
+        request: &Value,
+        cancel: &AtomicBool,
+    ) -> anyhow::Result<u32> {
+        let (status, body) = self.request_with_control(
+            "POST",
+            "/api/generation/preflight",
+            Some(request),
+            cancel,
+            None,
         )?;
         if status != 200 {
             anyhow::bail!(envelope_message(&body).unwrap_or_else(|| format!("HTTP {status}")));
@@ -610,6 +706,7 @@ pub struct ChatTurn {
 }
 
 /// One structured tool call (OpenAI shape): a name + a JSON-encoded args string.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCallOut {
     pub name: String,
     pub arguments: String,
@@ -1114,6 +1211,126 @@ mod tests {
         assert_eq!(end, StreamEnd::Done);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["outcome"], "answered");
+        server.join().unwrap();
+    }
+
+    /// `finish_reason: "length"` is the only way to tell a reply that FINISHED
+    /// from one the token cap cut off. Reporting it as `Done` is what let a
+    /// half-written tool call reach the transcript as a settled answer.
+    #[test]
+    fn a_stream_stopped_at_the_token_cap_reports_length_not_done() {
+        for (finish_reason, expected) in [("length", StreamEnd::Length), ("stop", StreamEnd::Done)]
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                // Read the headers AND the POST body. Closing a socket that
+                // still has unread bytes queued sends RST rather than FIN on
+                // Windows, which discards the response the client is reading.
+                loop {
+                    let read = stream.read(&mut buffer).unwrap();
+                    request.extend_from_slice(&buffer[..read]);
+                    let Some(head) = find(&request, b"\r\n\r\n").map(|at| at + 4) else {
+                        assert!(read > 0, "the client closed before sending headers");
+                        continue;
+                    };
+                    let declared = String::from_utf8_lossy(&request[..head])
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("Content-Length: ")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if read == 0 || request.len() >= head + declared {
+                        break;
+                    }
+                }
+                let events = format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"fn main() {{\"}}}}]}}\n\n\
+                     data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"{finish_reason}\"}}]}}\n\n\
+                     data: [DONE]\n\n"
+                );
+                let body = format!("{:X}\r\n{events}\r\n0\r\n\r\n", events.len());
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+                );
+            });
+
+            let stats = Client::new(addr)
+                .chat_stream_timed(&json!({"model": "m"}), &AtomicBool::new(false), |_| {})
+                .unwrap();
+            assert_eq!(stats.end, expected, "finish_reason {finish_reason}");
+            assert_eq!(stats.deltas, 1);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn chat_stream_accumulates_structured_tool_call_deltas() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..read]);
+                let Some(head) = find(&request, b"\r\n\r\n").map(|at| at + 4) else {
+                    assert!(read > 0, "the client closed before sending headers");
+                    continue;
+                };
+                let declared = String::from_utf8_lossy(&request[..head])
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("Content-Length: ")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if read == 0 || request.len() >= head + declared {
+                    break;
+                }
+            }
+            let events = concat!(
+                "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"type\":\"function\",\"function\":{\"name\":\"write_\",\"arguments\":\"{\\\"path\\\":\"}}]},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"file\",\"arguments\":\"\\\"agent-proof.txt\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1378}}\n\n",
+                "data: [DONE]\n\n",
+            );
+            let body = format!("{:X}\r\n{events}\r\n0\r\n\r\n", events.len());
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+            )
+            .unwrap();
+        });
+
+        let mut visible = String::new();
+        let stats = Client::new(addr)
+            .chat_stream_timed(
+                &json!({"model": "m", "stream": true}),
+                &AtomicBool::new(false),
+                |delta| visible.push_str(delta),
+            )
+            .unwrap();
+        assert_eq!(stats.end, StreamEnd::Done);
+        assert!(
+            visible.is_empty(),
+            "tool calls must not leak as visible text"
+        );
+        assert_eq!(stats.prompt_tokens, Some(1378));
+        assert_eq!(stats.tool_calls.len(), 1);
+        assert_eq!(stats.tool_calls[0].name, "write_file");
+        assert_eq!(
+            stats.tool_calls[0].arguments,
+            r#"{"path":"agent-proof.txt"}"#
+        );
         server.join().unwrap();
     }
 

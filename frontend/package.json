@@ -28,6 +28,7 @@
     "smoke:observatory": "node scripts/observatory-smoke.mjs",
     "smoke:workspace": "node scripts/workspace-agent-smoke.mjs",
     "smoke:workspace-visual": "node scripts/workspace-readonly-visual-smoke.mjs",
+    "smoke:code-workbench": "node scripts/code-workbench-visual-smoke.mjs",
     "smoke:integration": "node scripts/frontend-integration-smoke.mjs",
     "smoke:tiny": "node scripts/smoke.mjs --load-tiny",
     "smoke:warm": "node scripts/smoke.mjs --chat-repeats 3",
@@ -44,7 +45,7 @@
     "@vitejs/plugin-react": "^6.0.1",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
-    "vite": "^8.0.8"
+    "vite": "^8.1.5"
   },
   "devDependencies": {
     "puppeteer-core": "^25.1.0"

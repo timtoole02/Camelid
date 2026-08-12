@@ -148,7 +148,7 @@ function IconArrowUp({ size = 20 }) {
   )
 }
 
-function FolderPicker({ apiBase, initialPath, onClose, onPick }) {
+export function FolderPicker({ apiBase, initialPath, onClose, onPick }) {
   const [view, setView] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')

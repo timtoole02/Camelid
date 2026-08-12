@@ -16,6 +16,7 @@ import { ensureInferenceTelemetryConnected } from './hooks/useInferenceTelemetry
 import ChatWorkspace from './views/ChatWorkspace'
 import { CommandPalette } from './components/CommandPalette'
 import { ShortcutsOverlay } from './components/ShortcutsOverlay'
+import { getRecentCodeThreads } from './lib/workspaceAgent'
 
 /* Route-level code splitting (Phase 7): chat is the default surface and stays
    eager; every other view loads on first visit. */
@@ -32,9 +33,10 @@ const CompatibilityView = lazy(() => import('./views/CompatibilityView'))
 const TelemetryView = lazy(() => import('./views/TelemetryView'))
 const InferenceObservatoryView = lazy(() => import('./views/InferenceObservatoryView'))
 const WorkspaceView = lazy(() => import('./views/WorkspaceView'))
+const CodeWorkspace = lazy(() => import('./views/CodeWorkspace'))
 
 const DEMO_UI = import.meta.env?.VITE_CAMELID_DEMO_UI === 'true'
-const HASH_TABS = new Set(['chat', 'workspace', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory', 'compatibility', 'telemetry'])
+const HASH_TABS = new Set(['chat', 'code', 'workspace', 'library', 'downloads', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory', 'compatibility', 'telemetry'])
 
 function App() {
   const { notice, noticeTone, showNotice, clearNotice } = useNotice()
@@ -55,6 +57,14 @@ function App() {
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
   const [deleteBusy, setDeleteBusy] = useState(false)
   const [modelsVisited, setModelsVisited] = useState(false)
+  const [codeVisited, setCodeVisited] = useState(
+    () => typeof window !== 'undefined' && window.location.hash === '#code',
+  )
+  const [codeThreads, setCodeThreads] = useState([])
+  const [requestedCodeThread, setRequestedCodeThread] = useState(null)
+  const [codeWorkspaceKey, setCodeWorkspaceKey] = useState(0)
+  const [codeRunning, setCodeRunning] = useState(false)
+  const [pendingCodeNav, setPendingCodeNav] = useState(null)
   const [firstRunCardActive, setFirstRunCardActive] = useState(false)
   const viewRef = useRef(null)
   const hamburgerRef = useRef(null)
@@ -86,7 +96,31 @@ function App() {
   const backend = useBackendLauncher({ showNotice, loadDashboard })
 
   useEffect(() => {
+    const controller = new AbortController()
+    const refresh = () => {
+      getRecentCodeThreads(apiBase, { signal: controller.signal })
+        .then(setCodeThreads)
+        .catch((error) => {
+          if (error.name !== 'AbortError') setCodeThreads([])
+        })
+    }
+    refresh()
+    window.addEventListener('camelid:code-history-changed', refresh)
+    return () => {
+      controller.abort()
+      window.removeEventListener('camelid:code-history-changed', refresh)
+    }
+  }, [apiBase])
+
+  useEffect(() => {
     if (tab === 'library') setModelsVisited(true)
+  }, [tab])
+
+  // Keep Code mounted after its first visit. A local coding turn may run for
+  // minutes; switching to Chat must not trigger CodeWorkspace's unmount cleanup
+  // and silently cancel the agent.
+  useEffect(() => {
+    if (tab === 'code') setCodeVisited(true)
   }, [tab])
 
   useEffect(() => {
@@ -199,6 +233,26 @@ function App() {
     closeMobileNav()
   }
 
+  /* Both rail actions swap the Code surface by bumping its React key, and that
+     remount runs CodeWorkspace's unmount cleanup — a real DELETE that aborts the
+     turn on the server. Same contract as the Chat/Code switch above: a coding
+     run ends when it finishes or when the user stops it, so a live one is worth
+     a question first. */
+  const applyCodeNav = (nav) => {
+    setRequestedCodeThread(nav.thread || null)
+    setCodeWorkspaceKey((value) => value + 1)
+    navigateTab('code')
+  }
+
+  const requestCodeNav = (nav) => {
+    if (codeRunning) setPendingCodeNav(nav)
+    else applyCodeNav(nav)
+  }
+
+  const startNewCodeSession = () => requestCodeNav({ thread: null })
+
+  const selectCodeThread = (thread) => requestCodeNav({ thread })
+
   const requestDeleteConversation = (id) => {
     setPendingDeleteConversationId(id)
     setDeleteBusy(false)
@@ -291,6 +345,10 @@ function App() {
           onSelectConversation={selectConversation}
           renameConversation={renameConversation}
           requestDeleteConversation={requestDeleteConversation}
+          codeThreads={codeThreads}
+          selectedCodeThreadId={requestedCodeThread?.id || ''}
+          onSelectCodeThread={selectCodeThread}
+          onNewCodeSession={startNewCodeSession}
           runtime={runtime}
           themePreference={preference}
           themeResolved={resolved}
@@ -340,9 +398,9 @@ function App() {
         )}
 
         {/* --chat is the full-bleed frame for views that own their own edges and
-           manage their own height (chat, workspace, cluster canvas). Every
+           manage their own height (chat, code, workspace, cluster canvas). Every
            other view is a .cxv page and needs the padded page frame. */}
-        <div ref={viewRef} className={`camelid-view ${(tab === 'chat' || tab === 'workspace' || tab === 'cluster') ? 'camelid-view--chat' : 'camelid-view--page'}`}>
+        <div ref={viewRef} className={`camelid-view ${(tab === 'chat' || tab === 'code' || tab === 'workspace' || tab === 'cluster') ? 'camelid-view--chat' : 'camelid-view--page'}`}>
           <Suspense fallback={<div className="view-loading" role="status" aria-label="Loading view">Loading view…</div>}>
           {tab === 'chat' && (
             <ChatWorkspace
@@ -386,6 +444,22 @@ function App() {
               runtime={runtime}
               setTab={navigateTab}
             />
+          )}
+
+          {codeVisited && (
+            <div className="camelid-code-slot" hidden={tab !== 'code'}>
+              <CodeWorkspace
+                key={codeWorkspaceKey}
+                apiBase={apiBase}
+                capabilities={dashboard?.capabilities}
+                selectedModel={selectedModel}
+                runtime={runtime}
+                setTab={navigateTab}
+                requestedThread={requestedCodeThread}
+                onHistoryChanged={() => {}}
+                onRunningChange={setCodeRunning}
+              />
+            </div>
           )}
 
           {tab === 'analytics' && (
@@ -492,6 +566,20 @@ function App() {
         setSelectedModelId={setSelectedModelId}
       />
       <ShortcutsOverlay open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
+
+      <ConfirmDialog
+        open={Boolean(pendingCodeNav)}
+        title="Stop the coding session that is running?"
+        detail={`Camelid is still working in the open coding session. ${pendingCodeNav?.thread ? 'Opening this saved session' : 'Starting a new session'} stops that turn on the server. Files it has already written stay on disk.`}
+        confirmLabel="Stop and switch"
+        cancelLabel="Keep working"
+        onCancel={() => setPendingCodeNav(null)}
+        onConfirm={() => {
+          const nav = pendingCodeNav
+          setPendingCodeNav(null)
+          if (nav) applyCodeNav(nav)
+        }}
+      />
 
             <ConfirmDialog
         open={Boolean(pendingDeleteConversation)}

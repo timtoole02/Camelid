@@ -202,9 +202,19 @@ The exact Nomic Embed Text v1.5 Q8_0 row supports OpenAI-compatible `/v1/embeddi
 | **Terminal UI** | `camelid chat` | Shell and SSH workflows |
 | **HTTP API** | Start `camelid serve` | Chat, image input, embeddings, and reranking |
 | **Agent mode** | `camelid chat --agent --model <gguf>` | Approval-gated tools in a repository |
+| **Code** (preview) | Open **Code** in the web UI or desktop app | Approval-gated coding with live activity, diffs, undo, and subagents |
 | **Workspace** (preview) | Open **Workspace** in the web UI | Read-only analysis of a local folder |
 
 Agent mode confines file tools to a workspace root and keeps network access off unless enabled. Workspace is read-only and resumable. Both require a model marked `tool_capable` in the compatibility ledger. Review the [agent documentation](DOCS.md) and every requested action before enabling additional tools or network access.
+
+**Code (preview).** Choose a local workspace and give Camelid a coding task. Code streams model,
+plan, tool, approval, and change activity; keeps approval-gated access as the default; supports
+bounded child-agent delegation; and exposes checkpoint-backed diff and undo without invoking git.
+It fails closed unless the loaded exact model artifact is supported, hash-valid when pinned, and has
+earned `tool_capable: true`. File tools remain confined to the selected root. Shell confinement is
+platform-specific: Windows shell commands are working-directory pinned and hard-timed, not a
+filesystem or network jail. See [Web Code mode](docs/architecture/WEB_CODE_MODE.md) for the full
+security and lifecycle contract.
 
 ## OpenAI-compatible API
 

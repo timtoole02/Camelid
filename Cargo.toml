@@ -167,6 +167,19 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-cli
 # optimizer inline and vectorize the hot Q8_0 matvec/dequant loops across module
 # boundaries. opt-level 3 is already the release default. No fast-math is enabled,
 # so f32 reduction order — and therefore token output — stays bit-identical.
+# Camelid is a large crate and full debug info plus incremental query caches can
+# consume tens of GiB after only a few test/build variants. Keep local validation
+# disk-bounded by default. Level 1 retains line tables for useful backtraces while
+# avoiding multi-hundred-MiB PDBs; incremental builds are disabled so stale worktree
+# and test fingerprints cannot accumulate duplicate query/object caches indefinitely.
+[profile.dev]
+debug = 1
+incremental = false
+
+[profile.test]
+debug = 1
+incremental = false
+
 [profile.release]
 lto = "fat"
 codegen-units = 1

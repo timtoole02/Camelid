@@ -2491,6 +2491,10 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
         )
         .route("/api/agent/workspace/threads", get(workspace::list_threads))
         .route(
+            "/api/agent/workspace/threads/recent",
+            get(workspace::list_recent_threads),
+        )
+        .route(
             "/api/agent/workspace/threads/:id",
             get(workspace::get_thread).delete(workspace::delete_thread),
         )
@@ -2518,6 +2522,14 @@ fn router_with_state_and_policy(state: AppState, policy: server::ServerPolicy) -
         .route(
             "/api/agent/workspace/sessions/:id/decisions",
             post(workspace::decide),
+        )
+        .route(
+            "/api/agent/workspace/sessions/:id/changes",
+            get(workspace::session_changes),
+        )
+        .route(
+            "/api/agent/workspace/sessions/:id/undo",
+            post(workspace::undo_session_change),
         )
         .route("/api/models/local", get(local_models))
         .route("/api/models/local/delete", post(delete_local_model))

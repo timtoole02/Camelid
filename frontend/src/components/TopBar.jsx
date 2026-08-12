@@ -8,6 +8,7 @@ import { CamelidMark } from './ui/CamelidMark'
 
 const TITLES = {
   chat: 'Chat',
+  code: 'Code',
   workspace: 'Workspace',
   library: 'Models',
   downloads: 'Downloaded models',
@@ -72,6 +73,12 @@ function TopBar({
       )}
       <CamelidMark size={18} className="topbar__mark" />
       <h1 className="topbar__title" title={tab === 'chat' && hasCustomTitle ? rawTitle : heading}>{heading}</h1>
+      {(tab === 'chat' || tab === 'code') && !demoMode ? (
+        <div className="topbar__mode-switch" role="group" aria-label="Interaction mode">
+          <button type="button" className={tab === 'chat' ? 'is-active' : ''} aria-pressed={tab === 'chat'} onClick={() => setTab('chat')}>Chat</button>
+          <button type="button" className={tab === 'code' ? 'is-active' : ''} aria-pressed={tab === 'code'} onClick={() => setTab('code')}>Code</button>
+        </div>
+      ) : null}
       <div className="topbar__spacer" />
       {!demoMode && (
         <div className="topbar__gate">

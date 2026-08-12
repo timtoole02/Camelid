@@ -207,14 +207,16 @@ pub fn run(cfg: EvalConfig) -> anyhow::Result<i32> {
             );
         }
         Ok(Err(err)) => {
-            return finish(
-                &cfg,
-                EvalOutcome::Fail,
-                &abs,
-                None,
-                &format!("load error: {err}"),
-                &[],
-            );
+            // A load the HOST refused is not a verdict on the model. The fit
+            // preflight declines when the machine is merely busy ("fits this
+            // machine, but only N GB free right now") or too small for this
+            // artifact — in both cases the model never ran a single step, so a
+            // FAIL receipt would stand as evidence that it cannot drive tools
+            // when nothing of the kind was measured. That is the same contended-
+            // box case the timeout arm below already treats as INCONCLUSIVE, and
+            // this function's own contract promises: "never FAIL".
+            let (outcome, note) = classify_load_error(&err.to_string());
+            return finish(&cfg, outcome, &abs, None, &note, &[]);
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {
             return finish(
@@ -375,6 +377,20 @@ fn host_loadavg_1m() -> Option<f64> {
 }
 
 /// Emit the receipt + the human verdict, return the exit code.
+/// Split a failed load into "the host said no" (never a verdict on the model)
+/// and a real load failure. The fit preflight's refusals all name the
+/// `CAMELID_SKIP_FIT_CHECK` override, which is the stable marker for "this was a
+/// host decision", not prose that happens to mention memory.
+fn classify_load_error(err: &str) -> (EvalOutcome, String) {
+    if err.contains("CAMELID_SKIP_FIT_CHECK") {
+        return (
+            EvalOutcome::Inconclusive,
+            format!("host refused the load, so tool capability was never exercised: {err}"),
+        );
+    }
+    (EvalOutcome::Fail, format!("load error: {err}"))
+}
+
 fn finish(
     cfg: &EvalConfig,
     outcome: EvalOutcome,
@@ -481,6 +497,28 @@ mod tests {
         assert_eq!(EvalOutcome::Pass.exit(), 0);
         assert_eq!(EvalOutcome::Fail.exit(), 1);
         assert_eq!(EvalOutcome::Inconclusive.exit(), 3);
+    }
+
+    #[test]
+    fn a_host_refused_load_is_inconclusive_not_a_model_verdict() {
+        // Measured on this Mac: an 8B artifact was declined because only ~7.9 GB
+        // of ~17.2 GB was free. The model never ran a step, yet the receipt said
+        // FAIL — which reads as evidence that it cannot drive tools, and could be
+        // cited later to keep a capable row un-promoted.
+        let busy = "This model (~8.7 GB) fits this machine, but only ~7.9 GB of ~17.2 GB memory \
+                    is free right now. Close some applications and retry, or set \
+                    CAMELID_SKIP_FIT_CHECK=1 to attempt the load anyway.";
+        let (outcome, note) = classify_load_error(busy);
+        assert_eq!(outcome, EvalOutcome::Inconclusive);
+        assert!(note.contains("never exercised"), "{note}");
+
+        let too_big = "This model (~40.0 GB) is larger than this machine can hold in memory. \
+                       Set CAMELID_SKIP_FIT_CHECK=1 to attempt the load anyway.";
+        assert_eq!(classify_load_error(too_big).0, EvalOutcome::Inconclusive);
+
+        // A genuine load failure is still a FAIL: the engine tried and could not.
+        let broken = "tensor blk.0.attn_k.weight has unknown or removed GGML type Unknown(16)";
+        assert_eq!(classify_load_error(broken).0, EvalOutcome::Fail);
     }
 
     #[test]

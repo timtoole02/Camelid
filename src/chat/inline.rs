@@ -265,6 +265,17 @@ fn generate(session: &mut Session) -> Gen {
     });
     println!();
     match result {
+        Ok((StreamEnd::Length, deltas)) => {
+            session.last_prompt_tokens = None;
+            session.last_completion_tokens = Some(deltas);
+            session.push_assistant(assistant);
+            println!(
+                "{}",
+                banner::dim("[cut off at max_tokens — raise it to finish this answer]")
+            );
+            print_stats(session, Some(deltas), started);
+            Gen::Done
+        }
         Ok((StreamEnd::Done, deltas)) => {
             session.last_prompt_tokens = None;
             session.last_completion_tokens = Some(deltas);

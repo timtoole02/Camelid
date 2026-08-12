@@ -174,6 +174,23 @@ impl WorkspaceMemoryStore {
         Ok(threads)
     }
 
+    pub(crate) fn recent_threads(&self, limit: usize) -> anyhow::Result<Vec<StoredThread>> {
+        let connection = self.connect()?;
+        let mut statement = connection.prepare(
+            "SELECT th.id, th.canonical_root, th.model_id, th.model_sha256,
+                    th.compacted_through_turn,
+                    (SELECT COUNT(*) FROM workspace_compactions c WHERE c.thread_id = th.id),
+                    th.updated_at, COUNT(t.id), th.title
+             FROM workspace_threads AS th
+             LEFT JOIN workspace_turns AS t ON t.thread_id = th.id
+             GROUP BY th.id ORDER BY th.updated_at DESC LIMIT ?1",
+        )?;
+        let threads = statement
+            .query_map([limit as i64], stored_thread_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(threads)
+    }
+
     pub(crate) fn delete_thread(&self, thread_id: &str) -> anyhow::Result<bool> {
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;

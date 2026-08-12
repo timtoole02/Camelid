@@ -10,11 +10,11 @@
 //!
 //! Honesty + safety: orchestration is isolation-first, NOT a speedup. A child is
 //! itself an agent and is NEVER more privileged than the parent: it inherits the
-//! parent's shell-sandbox mode and approval posture (auto_approve, with the
-//! CAMELID_PRODUCTION fail-closed honoured). Because a child is non-interactive
-//! (no human to confirm), any action that would prompt is DENIED — so a subagent
-//! is read-capable by default and write/network-capable only when the parent
-//! explicitly opted into --auto-approve; it can never run an unattended shell.
+//! parent's tool profile, network grant, shell-sandbox mode, and approval posture
+//! (with the CAMELID_PRODUCTION fail-closed honoured). Because a child is
+//! non-interactive, any action that would prompt is DENIED. A gated child is
+//! therefore read-capable by default; a confirmed Web Code full-auto child may
+//! also write, use explicitly enabled network tools, and run sandboxed commands.
 //! Mandatory caps: a concurrency ceiling, a spawn-tree DEPTH LIMIT of 1 by default
 //! (fork-bomb guard), a per-child hard timeout (→ INCONCLUSIVE, never a silent
 //! hang), and reaping of wedged children. No VirtualLock / memory pinning. A
@@ -71,6 +71,19 @@ pub struct TaskSpec {
     pub auto_approve: bool,
     /// The parent's shell-sandbox mode (as_str), inherited — never hardcoded.
     pub shell_mode: String,
+    /// The parent's explicit network grant. False for older task files and for
+    /// every CLI subagent unless its session deliberately opts in.
+    #[serde(default)]
+    pub allow_net: bool,
+    /// Whether the parent granted unattended Exec as well as writes. This is
+    /// separate from `auto_approve`, whose historical contract does not include
+    /// shell execution.
+    #[serde(default)]
+    pub yolo: bool,
+    /// Keep browser/Desktop Code children on the narrow WebCode allowlist
+    /// instead of silently expanding them to the terminal's Full profile.
+    #[serde(default)]
+    pub web_code: bool,
     /// Test hook: when set, the worker uses a deterministic canned driver (one
     /// read-only tool call, then this answer) instead of contacting a model — so
     /// orchestration mechanics are verifiable without a tool-capable model.
@@ -118,6 +131,12 @@ pub struct SubagentConfig {
     pub auto_approve: bool,
     /// The parent's shell-sandbox mode, inherited by every child.
     pub shell_mode: super::shell_sandbox::ShellSandbox,
+    /// The parent's explicit network grant.
+    pub allow_net: bool,
+    /// The parent's unattended Exec grant.
+    pub yolo: bool,
+    /// True when the child must remain on the WebCode tool allowlist.
+    pub web_code: bool,
 }
 
 impl SubagentConfig {
@@ -143,7 +162,30 @@ impl SubagentConfig {
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             auto_approve,
             shell_mode,
+            allow_net: false,
+            yolo: false,
+            web_code: false,
         }
+    }
+
+    /// Browser/Desktop Code child configuration. Unlike the legacy terminal
+    /// constructor, this preserves the complete parent capability boundary:
+    /// narrow WebCode tools, the explicit network switch, and full-auto Exec.
+    pub fn for_web_code_session(
+        addr: SocketAddr,
+        model_id: String,
+        family: String,
+        max_tokens: u32,
+        full_auto: bool,
+        allow_net: bool,
+        shell_mode: super::shell_sandbox::ShellSandbox,
+    ) -> Self {
+        let mut config =
+            Self::for_session(addr, model_id, family, max_tokens, full_auto, shell_mode);
+        config.allow_net = allow_net;
+        config.yolo = full_auto;
+        config.web_code = true;
+        config
     }
 }
 
@@ -154,6 +196,7 @@ struct ChildEntry {
     job: Option<super::win_job::JobObject>,
     started: Instant,
     timeout: Duration,
+    task_path: PathBuf,
     result_path: PathBuf,
 }
 
@@ -182,6 +225,67 @@ fn lock_registry() -> MutexGuard<'static, SessionState> {
 /// spawning is refused and the tools are not advertised.
 pub fn configure(config: SubagentConfig) {
     lock_registry().config = Some(config);
+}
+
+/// Test-only: install `config` and get a guard that restores the previous
+/// registry state on drop. The registry is process-global, so a bare
+/// `configure` in a test leaks into every later test in the binary — the
+/// tool-set pins in `tools` assert on the unconfigured baseline and fail
+/// under the test harness's scheduling, not deterministically.
+#[cfg(test)]
+pub(crate) fn configure_for_test(config: SubagentConfig) -> TestConfigGuard {
+    TestConfigGuard(lock_registry().config.replace(config))
+}
+
+#[cfg(test)]
+pub(crate) struct TestConfigGuard(Option<SubagentConfig>);
+
+#[cfg(test)]
+impl Drop for TestConfigGuard {
+    fn drop(&mut self) {
+        lock_registry().config = self.0.take();
+    }
+}
+
+/// Stop every child owned by the current session. Web Code calls this at both
+/// ends of a turn so the visible Stop control is authoritative for delegated
+/// work too, and a child cannot keep editing after its parent has finished.
+pub fn cancel_all() {
+    let children = {
+        let mut state = lock_registry();
+        std::mem::take(&mut state.children)
+    };
+    for mut entry in children {
+        terminate_tree(&mut entry);
+        let _ = std::fs::remove_file(&entry.task_path);
+    }
+}
+
+/// Terminate a child and everything it spawned, then reap it.
+///
+/// Windows tears the tree down through the kill-on-close job object; Unix
+/// through the process group the worker was spawned into. `Child::kill` remains
+/// the backstop for the case where neither could be established (it reaps only
+/// the direct child, which is why it is not the primary mechanism).
+fn terminate_tree(entry: &mut ChildEntry) {
+    #[cfg(windows)]
+    if let Some(ref j) = entry.job {
+        j.terminate();
+    }
+    #[cfg(unix)]
+    {
+        // Negative pid = "every process in this group". Best-effort: the group
+        // may already be gone, and a worker spawned before `process_group` was
+        // wired simply falls through to the direct-child kill below.
+        let pid = entry.child.id() as i32;
+        if pid > 0 {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = entry.child.kill();
+    let _ = entry.child.wait();
 }
 
 /// This process's spawn-tree depth (0 for the top-level agent).
@@ -305,6 +409,9 @@ fn spawn_inner(
         depth: depth + 1,
         auto_approve: config.auto_approve,
         shell_mode: config.shell_mode.as_str().to_string(),
+        allow_net: config.allow_net,
+        yolo: config.yolo,
+        web_code: config.web_code,
         canned_answer,
         canned_sleep_ms,
     };
@@ -326,6 +433,18 @@ fn spawn_inner(
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    // Unix counterpart of the Windows job object below: put the worker in its own
+    // process group so teardown can signal the GROUP. A worker that is mid
+    // `run_shell` has a live `/bin/sh -c …` tree, and `Child::kill` signals only
+    // the worker pid — the shell tree would survive Stop and keep writing into the
+    // workspace, which is exactly what the "children are killed when the parent
+    // turn ends or is stopped" contract forbids. Descendants inherit the group, so
+    // one `killpg` reaps the whole tree.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
     }
 
     let child = cmd.spawn().map_err(|e| {
@@ -350,6 +469,7 @@ fn spawn_inner(
         job,
         started: Instant::now(),
         timeout: config.timeout,
+        task_path: tpath,
         result_path: result_path(root, subtask_id),
     });
 
@@ -381,17 +501,40 @@ pub fn status(root: &Path, subtask_id: &str) -> Result<String, String> {
         });
     }
 
-    let live = lock_registry()
+    let elapsed = lock_registry()
         .children
         .iter()
-        .any(|c| c.subtask_id == subtask_id);
-    if live || task_path(root, subtask_id).exists() {
+        .find(|c| c.subtask_id == subtask_id)
+        .map(|c| c.started.elapsed());
+    if elapsed.is_some() || task_path(root, subtask_id).exists() {
+        // Carry elapsed time so consecutive polls are not byte-identical. The
+        // caller's no-progress guard stops a call that returns the SAME text
+        // REPEAT_LIMIT times running; a constant "has not finished yet" made a
+        // healthy child look stuck after three polls and got the whole turn
+        // killed. `RUNNING_STATUS_PREFIX` is the belt to this suspenders — see
+        // `is_running_status`.
+        let waited = elapsed.map(|e| e.as_secs_f64()).unwrap_or(0.0);
         Ok(format!(
-            "status: running\nnote: subagent {subtask_id:?} has not finished yet"
+            "{RUNNING_STATUS_PREFIX}\nnote: subagent {subtask_id:?} has not finished yet \
+             ({waited:.1}s elapsed)"
         ))
     } else {
         Err(format!("no subagent {subtask_id:?} found"))
     }
+}
+
+/// Leading line of a still-running status report.
+const RUNNING_STATUS_PREFIX: &str = "status: running";
+
+/// Whether a tool result reports a subagent that is still working.
+///
+/// Waiting on a child is progress, not repetition: the agent loop's no-progress
+/// guard must not count these against `REPEAT_LIMIT`. Polling a child is the
+/// documented way to wait for one (`spawn_subagent` says so in its own result),
+/// and Code mode has no step cap, so this guard is the loop's main terminator —
+/// mistaking a poll for a stall ends the turn AND kills the child with it.
+pub fn is_running_status(text: &str) -> bool {
+    text.starts_with(RUNNING_STATUS_PREFIX)
 }
 
 /// A compact, truncated listing of this session's subagents — live (from the
@@ -445,7 +588,7 @@ pub fn list_summary(root: &Path) -> String {
 }
 
 /// Reap children that finished or exceeded their timeout. A timed-out child is
-/// terminated (process tree on Windows) and recorded INCONCLUSIVE; one that
+/// terminated along with its process tree and recorded INCONCLUSIVE; one that
 /// vanished without a result is recorded failed. Removes them from the live set.
 fn reap_locked(state: &mut SessionState) {
     state.children.retain_mut(|entry| {
@@ -463,12 +606,7 @@ fn reap_locked(state: &mut SessionState) {
             }
             Ok(None) => {
                 if entry.started.elapsed() >= entry.timeout {
-                    #[cfg(windows)]
-                    if let Some(ref j) = entry.job {
-                        j.terminate();
-                    }
-                    let _ = entry.child.kill();
-                    let _ = entry.child.wait();
+                    terminate_tree(entry);
                     write_terminal_result(
                         entry,
                         "inconclusive",
@@ -583,11 +721,16 @@ fn execute_task(task: &TaskSpec) -> TaskExecution {
     let max_steps = task.max_steps.clamp(1, MAX_WORKER_STEPS);
     let max_tokens = task.max_tokens.clamp(1, MAX_WORKER_TOKENS);
     let root = Path::new(&task.workdir);
-    let sandbox = match Sandbox::new(root, false, Duration::from_secs(60)) {
+    let tool_profile = if task.web_code {
+        super::tools::ToolProfile::WebCode
+    } else {
+        super::tools::ToolProfile::Full
+    };
+    let sandbox = match Sandbox::new(root, task.allow_net, Duration::from_secs(60)) {
         Ok(s) => s.with_shell_mode(shell_mode),
         Err(e) => return fail(agent::RunOutcome::Failed, format!("sandbox: {e}")),
     };
-    let tools = super::tools::specs(false, sandbox.shell_mode());
+    let tools = super::tools::specs_for(tool_profile, task.allow_net, sandbox.shell_mode());
 
     let mut reporter = CaptureReporter::default();
     // A subagent is NON-INTERACTIVE: there is no human to confirm an action, so
@@ -600,15 +743,15 @@ fn execute_task(task: &TaskSpec) -> TaskExecution {
         workdir: root.to_path_buf(),
         max_steps,
         auto_approve: task.auto_approve,
-        yolo: false,
-        allow_net: false,
+        yolo: task.yolo,
+        allow_net: task.allow_net,
         allow_fs: false,
         shell_timeout: Duration::from_secs(60),
         max_tokens,
         temperature: 0.0,
         audit: Box::new(super::audit::NoopSink),
         shell_sandbox: shell_mode,
-        tool_profile: super::tools::ToolProfile::Full,
+        tool_profile,
         // A subagent runs a real, open-ended goal, so it gets the same context
         // protection the parent has.
         ctx_budget: Some(agent::AGENT_VALIDATED_CTX),
@@ -616,10 +759,10 @@ fn execute_task(task: &TaskSpec) -> TaskExecution {
     // The parent's approval posture, with the production fail-closed honoured:
     // resolve_policy refuses blanket auto-approve under CAMELID_PRODUCTION, so a
     // child can never silently run write/network there.
-    // Subagents are never --yolo (the unattended exec auto-approve is parent-only);
-    // a child stays scoped + its NonInteractiveApprover denies any confirm-tier.
-    let mut policy =
-        agent::resolve_policy(task.auto_approve, false, agent::is_production()).unwrap_or_default();
+    // Web Code's confirmed full-auto mode includes Exec; approval-gated children
+    // still deny every confirm-tier action because nobody is present to answer.
+    let mut policy = agent::resolve_policy(task.auto_approve, task.yolo, agent::is_production())
+        .unwrap_or_default();
     // A subagent does real work in the user's workspace, so it gets the same
     // project context its parent has. (The gate harnesses in agent_eval.rs and
     // agent_orchestration.rs deliberately do not — see D-DROVER-6.)
@@ -725,10 +868,9 @@ impl super::agent::Reporter for CaptureReporter {
 
 /// A subagent runs unattended, so there is no human to confirm a gated action.
 /// This approver DENIES every action it is consulted for (i.e. every Confirm-tier
-/// action: Write/Network unless the policy auto-approved them, and Exec always).
-/// The child therefore cannot run an unattended shell or otherwise exceed the
-/// parent's posture — it is read-capable by default, and write/network-capable
-/// only when the parent explicitly opted into --auto-approve (non-production).
+/// action: Write/Network unless the policy auto-approved them, and Exec unless
+/// the parent explicitly enabled a non-production full-auto posture). The child
+/// therefore cannot exceed the parent's posture.
 /// Denies everything that needs approval. Used wherever no human is present:
 /// a subagent worker, and `agent exec` without `--yolo`. "Nobody to ask" means
 /// *more* conservative, not less.
@@ -802,6 +944,48 @@ mod tests {
     }
 
     #[test]
+    fn web_code_children_inherit_the_complete_parent_boundary() {
+        let config = SubagentConfig::for_web_code_session(
+            "127.0.0.1:8181".parse().unwrap(),
+            "model".into(),
+            "qwen3".into(),
+            2048,
+            true,
+            true,
+            super::super::shell_sandbox::ShellSandbox::Sandboxed,
+        );
+        assert!(config.auto_approve);
+        assert!(config.yolo);
+        assert!(config.allow_net);
+        assert!(config.web_code);
+        assert_eq!(
+            config.shell_mode,
+            super::super::shell_sandbox::ShellSandbox::Sandboxed
+        );
+    }
+
+    #[test]
+    fn older_task_files_default_to_the_conservative_terminal_boundary() {
+        let task: TaskSpec = serde_json::from_value(serde_json::json!({
+            "subtask_id": "legacy",
+            "goal": "inspect",
+            "addr": "127.0.0.1:8181",
+            "model_id": "model",
+            "family": "qwen3",
+            "workdir": ".",
+            "max_steps": 4,
+            "max_tokens": 64,
+            "depth": 1,
+            "auto_approve": false,
+            "shell_mode": "sandboxed"
+        }))
+        .unwrap();
+        assert!(!task.allow_net);
+        assert!(!task.yolo);
+        assert!(!task.web_code);
+    }
+
+    #[test]
     fn malformed_result_is_handled_not_crashed() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -863,6 +1047,9 @@ mod tests {
             depth: 1,
             auto_approve: false,
             shell_mode: "sandboxed".to_string(),
+            allow_net: false,
+            yolo: false,
+            web_code: false,
             canned_answer: Some("WORKER-OK".to_string()),
             canned_sleep_ms: None,
         }
