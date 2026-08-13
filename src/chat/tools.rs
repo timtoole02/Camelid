@@ -2370,12 +2370,10 @@ fn run_shell_cancellable(sandbox: &Sandbox, command: &str, cancel: &AtomicBool) 
                     }
                     let _ = child.kill();
                     let _ = child.wait();
-                    if let Some(h) = out_reader {
-                        let _ = h.join();
-                    }
-                    if let Some(h) = err_reader {
-                        let _ = h.join();
-                    }
+                    // Do NOT join the readers here — see the note on the timeout
+                    // arm below. Their output is discarded on this path anyway.
+                    drop(out_reader);
+                    drop(err_reader);
                     return ToolOutcome::Err("command cancelled by user stop".into());
                 }
                 if std::time::Instant::now() >= deadline {
@@ -2390,14 +2388,19 @@ fn run_shell_cancellable(sandbox: &Sandbox, command: &str, cancel: &AtomicBool) 
                     }
                     let _ = child.kill();
                     let _ = child.wait();
-                    // Killing the child closes the write ends → the readers hit
-                    // EOF. Join them so neither thread outlives this call.
-                    if let Some(h) = out_reader {
-                        let _ = h.join();
-                    }
-                    if let Some(h) = err_reader {
-                        let _ = h.join();
-                    }
+                    // DETACH the readers instead of joining them. Killing the
+                    // direct child does NOT necessarily close the pipe write
+                    // ends on Unix: a pipe reports EOF only once EVERY writer
+                    // has closed, and `/bin/sh -c` may leave a descendant
+                    // (`sleep`, a `make -j` fan-out) holding the inherited fd.
+                    // Joining then blocked until that orphan exited on its own,
+                    // so BOTH the deadline and a user Stop were silently
+                    // unbounded — measured at a full 30s against a 3s deadline
+                    // on Linux CI. The output is discarded on these paths, so
+                    // the threads have nothing to hand back; they own only their
+                    // own buffer and exit when the pipe finally closes.
+                    drop(out_reader);
+                    drop(err_reader);
                     // The hint pass below never sees this early return, so the
                     // guidance rides the message itself.
                     return ToolOutcome::Err(format!(
@@ -4241,7 +4244,12 @@ mod tests {
         let sb = sandbox(dir.path()).with_shell_mode(ShellSandbox::Unrestricted);
         let cancel = AtomicBool::new(true);
         let started = std::time::Instant::now();
-        let out = run_shell_cancellable(&sb, "sleep 30", &cancel);
+        // A BACKGROUNDED descendant that inherits the pipes: killing the direct
+        // `/bin/sh` leaves it holding the write ends, so a teardown that joins
+        // the reader threads blocks until it exits. This is the shape that made
+        // the cancel path take a full 30s on Linux CI while passing on macOS
+        // (where `sh -c` execs a lone `sleep` and the fds die with it).
+        let out = run_shell_cancellable(&sb, "sleep 30 & sleep 30", &cancel);
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "cancel should return promptly, took {:?}",
