@@ -114,7 +114,58 @@ fn json_from_str_lenient(s: &str) -> Option<Value> {
     if let Ok(value) = serde_json::from_str::<Value>(&repaired_paths) {
         return Some(value);
     }
-    serde_json::from_str::<Value>(&repair_invalid_json_escapes(&repaired_paths)).ok()
+    let unescaped = repair_overescaped_quotes(&repaired_paths);
+    if let Ok(value) = serde_json::from_str::<Value>(&unescaped) {
+        return Some(value);
+    }
+    serde_json::from_str::<Value>(&repair_invalid_json_escapes(&unescaped)).ok()
+}
+
+/// Repair `\\"` that was meant as an ESCAPED QUOTE, not as a backslash ending
+/// the string.
+///
+/// Observed live (Qwen3-4B, Code loop, twice in a row): asked for a shell
+/// command it wrote PowerShell nested inside the JSON string and over-escaped
+/// the inner quotes —
+///
+/// ```text
+/// {"command": "powershell -Command \"... New-Item -Path \\".\" -Name $n ...\""}
+/// ```
+///
+/// JSON reads `\\` as one literal backslash, so the following `"` TERMINATES
+/// the value and everything after it is garbage; the call was dropped and the
+/// turn died on the malformed-syntax guard.
+///
+/// The discrimination is what makes this safe: `\\"` is perfectly legal when
+/// the string really does end in a backslash (`{"path": "C:\\"}`), so the
+/// rewrite only fires where the quote CANNOT be a terminator — i.e. the next
+/// non-whitespace character is not one of `,`, `}`, `]`, or `:`, the only
+/// things JSON allows after a closing string quote. A genuine trailing
+/// backslash is therefore never touched.
+fn repair_overescaped_quotes(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 2 < bytes.len() && bytes[i + 1] == b'\\' && bytes[i + 2] == b'"'
+        {
+            let terminator_is_legal = s[i + 3..]
+                .chars()
+                .find(|c| !c.is_whitespace())
+                .is_some_and(|c| matches!(c, ',' | '}' | ']' | ':'));
+            if !terminator_is_legal {
+                // The model meant an escaped quote; keep exactly one backslash.
+                out.push('\\');
+                out.push('"');
+                i += 3;
+                continue;
+            }
+        }
+        let ch = s[i..].chars().next().expect("char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 fn repair_misquoted_content_key(s: &str) -> Option<String> {
@@ -934,6 +985,67 @@ done()"}}</tool_call>"#;
         assert!(
             content.contains("out.json") && content.contains("done()"),
             "content must not be truncated at the in-content path text: {content}"
+        );
+    }
+
+    /// VERBATIM live capture (Qwen3-4B, Code loop, "create 100 text files"):
+    /// asked for a shell command it nested PowerShell inside the JSON string
+    /// and wrote `\\"` where it meant `\"`. JSON reads `\\` as a literal
+    /// backslash, so the next quote closed the value and the call was dropped —
+    /// twice in a row, which killed the turn on the malformed-syntax guard.
+    #[test]
+    fn overescaped_nested_quotes_from_powershell_one_liner_are_recovered() {
+        let text = r#"<tool_call>
+{"name": "run_shell", "arguments": {"command": "powershell -NoProfile -Command \"for ($i = 0; $i -lt 100; $i++) { $name = [System.Guid]::NewGuid().ToString(); New-Item -Path \\".\" -Name $name -ItemType File }\""}}
+</tool_call>"#;
+        let calls = parse(text, "qwen3");
+        assert_eq!(calls.len(), 1, "the call must be recovered, got {calls:?}");
+        assert_eq!(calls[0].name, "run_shell");
+        let command = calls[0].args["command"].as_str().unwrap();
+        assert!(
+            command.contains("New-Item -Path \".\" -Name $name"),
+            "the inner quotes must survive as real quotes: {command}"
+        );
+        assert!(
+            command.starts_with("powershell -NoProfile -Command \"for ($i = 0;"),
+            "the command must not be truncated at the over-escape: {command}"
+        );
+    }
+
+    /// The second live shape from the same session: the over-escape wraps a
+    /// variable rather than a literal.
+    #[test]
+    fn overescaped_quotes_around_a_variable_are_recovered() {
+        let text = r#"<tool_call>
+{"name": "run_shell", "arguments": {"command": "powershell -NoProfile -Command \"for ($i = 0; $i -lt 100; $i++) { New-Item -Path \\"$name.txt\\" -Type File -Force }\""}}
+</tool_call>"#;
+        let calls = parse(text, "qwen3");
+        assert_eq!(calls.len(), 1, "got {calls:?}");
+        let command = calls[0].args["command"].as_str().unwrap();
+        assert!(command.contains("-Path \"$name.txt\""), "{command}");
+        assert!(
+            command.contains("-Force }\""),
+            "tail must survive: {command}"
+        );
+    }
+
+    /// A string that genuinely ENDS in a backslash is valid JSON and must be
+    /// left exactly alone — the repair keys on the quote being an ILLEGAL
+    /// terminator, not on the byte pattern.
+    #[test]
+    fn a_real_trailing_backslash_is_not_rewritten() {
+        // Valid JSON: parses on the first attempt, never reaching the repair.
+        let text = r#"<tool_call>{"name": "run_shell", "arguments": {"command": "dir", "cwd": "C:\\src\\"}}</tool_call>"#;
+        let calls = parse(text, "qwen3");
+        assert_eq!(calls.len(), 1, "got {calls:?}");
+        assert_eq!(calls[0].args["cwd"], r"C:\src\");
+        // And the repair itself leaves a legal terminator untouched.
+        let legal = r#"{"a": "C:\\", "b": 1}"#;
+        assert_eq!(super::repair_overescaped_quotes(legal), legal);
+        // While an illegal one is repaired.
+        assert_eq!(
+            super::repair_overescaped_quotes(r#"{"a": "x \\"y\" z"}"#),
+            r#"{"a": "x \"y\" z"}"#
         );
     }
 

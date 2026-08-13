@@ -598,11 +598,22 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
         // model writes bash at cmd.exe (`for i in {1..100}`), fails with a
         // parse error that names no shell, and repeats to loop death —
         // observed live on the Windows dev box.
+        // Do NOT suggest `powershell -Command "..."` here. Nesting quotes
+        // inside a JSON string inside a shell command is the one thing a small
+        // model reliably gets wrong: observed live, Qwen3-4B answered this
+        // advice with `New-Item -Path \\".\"`, where JSON reads `\\` as a
+        // literal backslash so the next quote closed the value and the whole
+        // call was unparseable — twice in a row, killing the turn. Steer to
+        // forms that need no inner quotes at all, and to a script file when
+        // the work genuinely needs quoting.
         #[cfg(windows)]
         const SHELL_PLATFORM: &str = concat!(
-            "The shell is Windows cmd.exe — NOT bash: no {1..N}, $(...), or `%%`; ",
-            "loop with `for /L %i in (1,1,N) do @...`, or run one PowerShell line via ",
-            "`powershell -NoProfile -Command \"...\"`. "
+            "The shell is Windows cmd.exe — NOT bash: no {1..N}, $(...), or `%%`. ",
+            "Loop with `for /L %i in (1,1,N) do @...` and prefer forms with NO inner ",
+            "quotes, e.g. `for /L %i in (1,1,100) do @echo some text> file%i.txt`. ",
+            "If the work needs quoting or more than one line, write_file a `.ps1` or ",
+            "`.cmd` script and then run that file — never nest quotes inside this ",
+            "command string. "
         );
         #[cfg(not(windows))]
         const SHELL_PLATFORM: &str = "The shell is POSIX `/bin/sh`. ";
@@ -3007,9 +3018,10 @@ fn shell_failure_hint(command: &str, stdout: &str, stderr: &str) -> Option<&'sta
             );
         }
         return Some(
-            "this shell is Windows cmd.exe, not bash. Rewrite with cmd syntax (e.g. \
-             `for /L %i in (1,1,100) do @echo hello> file%i.txt`) or run one PowerShell \
-             line: `powershell -NoProfile -Command \"<script>\"`",
+            "this shell is Windows cmd.exe, not bash. Rewrite with cmd syntax and NO \
+             inner quotes (e.g. `for /L %i in (1,1,100) do @echo hello> file%i.txt`); \
+             if the work needs quotes or several lines, write_file a .ps1/.cmd script \
+             and run that file instead of nesting quotes here",
         );
     }
     if has("is not recognized as an internal or external command") {
