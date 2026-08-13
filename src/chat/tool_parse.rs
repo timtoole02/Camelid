@@ -166,38 +166,99 @@ fn repair_misquoted_content_key(s: &str) -> Option<String> {
 /// A frequent Qwen failure is embedding Python such as `it\'s` directly in a
 /// JSON string. JSON does not define `\'`, even though the backslash is needed
 /// by the Python source. Doubling only invalid escapes makes the JSON decode to
-/// the exact intended `\'`. Valid JSON escapes (`\n`, `\t`, `\u1234`, …) are
-/// deliberately untouched.
+/// the exact intended `\'`. Valid JSON escapes (`\n`, `\t`, `\u1234`, ...) are
+/// untouched -- EXCEPT inside a string that carries an unescaped Windows drive
+/// path, where the letter escapes are path separators, not escapes (see
+/// `repair_string_body`).
+///
+/// Escape pairs are consumed atomically per string span: a `\"` must never flip
+/// the string tracker, or a command like `echo \"\$i.txt\"` leaves the later
+/// `\$` treated as outside a string and never repaired -- the live failure that
+/// killed a turn on an over-escaped `$`.
 fn repair_invalid_json_escapes(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
-    let mut chars = s.chars().peekable();
-    let mut in_string = false;
+    let mut cursor = 0usize;
+    while cursor < s.len() {
+        let Some(relative_start) = s[cursor..].find('"') else {
+            out.push_str(&s[cursor..]);
+            break;
+        };
+        let start = cursor + relative_start;
+        out.push_str(&s[cursor..=start]);
+        let Some(end) = json_string_end(s, start) else {
+            // Unterminated string: repair the remainder as string body.
+            out.push_str(&repair_string_body(&s[start + 1..]));
+            break;
+        };
+        out.push_str(&repair_string_body(&s[start + 1..end]));
+        out.push('"');
+        cursor = end + 1;
+    }
+    out
+}
+
+/// `\uXXXX` is a valid escape only when four hex digits actually follow -- `\u`
+/// in `c:\users` is a path separator, and treating it as valid kept the JSON
+/// unparseable, so the whole call was dropped and the turn died on the
+/// malformed-syntax guard.
+fn unicode_escape_is_valid(rest: &std::str::Chars) -> bool {
+    rest.clone().take(4).filter(|c| c.is_ascii_hexdigit()).count() == 4
+}
+
+/// A body containing `X:\` is carrying an unescaped Windows path.
+fn body_has_drive_path(body: &str) -> bool {
+    body.as_bytes()
+        .windows(3)
+        .any(|w| w[0].is_ascii_alphabetic() && w[1] == b':' && w[2] == b'\\')
+}
+
+/// Repair one JSON string body.
+///
+/// Normal mode doubles only invalid escapes. But when the body carries an
+/// unescaped Windows drive path AND at least one invalid escape, the letter
+/// escapes in it are almost certainly path separators too: doubling only `\U`
+/// in `C:\Users\timto` while keeping `\t` as a "valid" escape decodes to
+/// `C:\Users<TAB>imto` -- a control-char-corrupted path inside an EXECUTED
+/// command (cmd.exe treats the tab as a delimiter, so a redirect/del/move
+/// lands on the wrong target). In that path mode every `\b \f \n \r \t` is
+/// doubled as well; `\"`, `\\`, `\/` and a genuine `\uXXXX` stay escapes.
+fn repair_string_body(body: &str) -> String {
+    let mut has_invalid = false;
+    {
+        let mut chars = body.chars();
+        while let Some(character) = chars.next() {
+            if character != '\\' {
+                continue;
+            }
+            match chars.next() {
+                Some('u') => has_invalid |= !unicode_escape_is_valid(&chars),
+                Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't') => {}
+                _ => has_invalid = true,
+            }
+        }
+    }
+    let path_mode = has_invalid && body_has_drive_path(body);
+    let mut out = String::with_capacity(body.len() + 8);
+    let mut chars = body.chars();
     while let Some(character) = chars.next() {
-        if in_string && character == '\\' {
-            // Consume the escape and its following char TOGETHER. A `\"` must not
-            // fall through to the `"` arm below, or it would flip `in_string` and
-            // desync the tracker — a command like `echo \"\$i.txt\"` then leaves
-            // the later `\$` treated as outside a string and never repaired, so
-            // the whole call stays unparseable. (This was the live failure: Qwen
-            // over-escaping `$` inside a run_shell command killed the turn.)
-            let next = chars.next();
-            let valid = matches!(
-                next,
-                Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u')
-            );
-            if !valid {
-                out.push('\\');
-            }
+        if character != '\\' {
             out.push(character);
-            if let Some(next) = next {
-                out.push(next);
-            }
             continue;
         }
-        if character == '"' {
-            in_string = !in_string;
+        let next = chars.next();
+        let keep = match next {
+            Some('u') => unicode_escape_is_valid(&chars),
+            Some('"' | '\\' | '/') => true,
+            Some('b' | 'f' | 'n' | 'r' | 't') => !path_mode,
+            _ => false,
+        };
+        if !keep {
+            out.push('\\');
         }
-        out.push(character);
+        out.push('\\');
+        if let Some(next) = next {
+            out.push(next);
+        }
     }
     out
 }
@@ -320,10 +381,24 @@ fn parse_hermes(text: &str) -> Vec<ToolCall> {
             }
             None => rest,
         };
-        if let Some(value) = json_from_str_lenient(inner.trim()) {
-            if let Some(call) = call_from_obj(&value) {
-                calls.push(call);
-            }
+        let inner = inner.trim();
+        if let Some(call) = json_from_str_lenient(inner)
+            .as_ref()
+            .and_then(call_from_obj)
+        {
+            calls.push(call);
+            continue;
+        }
+        // Unparseable inner envelope: the one recoverable shape is a
+        // write_file whose content carries raw quotes — a Python docstring's
+        // `"""` ends the strict JSON string mid-source, and no escape repair
+        // can help because nothing is escaped. Observed live (Qwen3-4B, Code
+        // loop): the model re-emitted the same malformed write twice after a
+        // py_compile failure and the turn died on the malformed-syntax guard,
+        // because this recovery was reachable only from the bare-JSON parser,
+        // never from the Hermes wrapper the model actually uses.
+        if let Some(call) = recover_malformed_write_file(inner) {
+            calls.push(call);
         }
     }
     calls
@@ -463,7 +538,11 @@ fn recover_malformed_write_file(text: &str) -> Option<ToolCall> {
             // Exact Llama 3.2 3B live failure: it closes `parameters` but
             // omits the outer envelope brace after a long content value.
             .or_else(|| encoded_content.strip_suffix(r#""}"#))?;
-        (content, None)
+        // Qwen commonly orders `path` BEFORE `content`; the rsplit above only
+        // finds a path that FOLLOWS the content value. Scan strictly before
+        // the content key — that region is structurally outside the content
+        // value, so a literal `"path"` inside source can never match.
+        (content, path_key_before_content(&trimmed[..content_key]))
     };
     let mut args = serde_json::Map::new();
     args.insert(
@@ -477,6 +556,23 @@ fn recover_malformed_write_file(text: &str) -> Option<ToolCall> {
         name: "write_file".into(),
         args: Value::Object(args),
     })
+}
+
+/// Extract a `"path"` key's quoted value from the region BEFORE the content
+/// key of a malformed write_file envelope. Path values contain no raw quotes,
+/// so a plain quote scan suffices even though the envelope as a whole failed
+/// to parse.
+fn path_key_before_content(prefix: &str) -> Option<String> {
+    let key = prefix.rfind(r#""path""#)?;
+    let after = prefix[key + r#""path""#.len()..].trim_start();
+    let after = after.strip_prefix(':')?.trim_start();
+    let after = after.strip_prefix('"')?;
+    let end = after.find('"')?;
+    let path = &after[..end];
+    if path.is_empty() || path.contains(['\n', '\r', '\0']) {
+        return None;
+    }
+    Some(decode_jsonish_string(path))
 }
 
 fn decode_jsonish_string(value: &str) -> String {
@@ -649,11 +745,82 @@ mod tests {
         let calls = parse(text, "qwen3");
         assert_eq!(calls.len(), 1, "the call must be recovered, got {calls:?}");
         assert_eq!(calls[0].name, "run_shell");
-        let command = calls[0].args["command"].as_str().unwrap();
-        assert!(
-            command.contains("seq 1 100") && command.contains("i.txt"),
-            "command survived repair: {command}"
+        // Pin the EXACT repaired command: the preserved backslash means `\$`
+        // suppresses expansion inside POSIX double quotes — a deliberate
+        // consequence of the preserve-the-backslash design, visible here
+        // rather than masked by substring checks.
+        assert_eq!(
+            calls[0].args["command"],
+            r#"seq 1 100 | while read -r i; do echo "\$i.txt"; done"#
         );
+    }
+
+    /// The live Qwen3-4B Code-loop death: a write_file whose content carries a
+    /// raw Python docstring — `"""` ends the strict JSON string mid-source, no
+    /// escape repair applies (nothing is escaped), and the recovery used to be
+    /// reachable only from the bare-JSON parser, never from the Hermes wrapper
+    /// the model actually emits. Two of these in a row killed the turn.
+    #[test]
+    fn hermes_write_file_with_raw_docstring_quotes_is_recovered() {
+        let text = r#"<tool_call>
+{"name": "write_file", "arguments": {"path": "inventory.py", "content": "class Inventory:\n    """Track item counts."""\n    pass\n"}}
+</tool_call>"#;
+        let calls = parse(text, "qwen3");
+        assert_eq!(calls.len(), 1, "the write must be recovered, got {calls:?}");
+        assert_eq!(calls[0].name, "write_file");
+        assert_eq!(
+            calls[0].args["path"], "inventory.py",
+            "a path BEFORE the content key must be recovered too"
+        );
+        let content = calls[0].args["content"].as_str().unwrap();
+        assert!(
+            content.contains(r#""""Track item counts.""""#),
+            "raw docstring quotes must survive verbatim: {content}"
+        );
+        assert!(
+            content.starts_with("class Inventory:\n"),
+            "JSON newline escapes must decode: {content}"
+        );
+    }
+
+    /// `\u` not followed by four hex digits is a path separator, not a Unicode
+    /// escape: `cd c:\users\timto` must repair and parse instead of being
+    /// dropped (the drop killed the turn on the malformed-syntax guard).
+    #[test]
+    fn run_shell_lowercase_windows_path_is_repaired_not_dropped() {
+        let text = r#"<tool_call>{"name": "run_shell", "arguments": {"command": "cd c:\users\timto && dir"}}</tool_call>"#;
+        let calls = parse(text, "qwen3");
+        assert_eq!(calls.len(), 1, "got {calls:?}");
+        assert_eq!(calls[0].args["command"], r"cd c:\users\timto && dir");
+    }
+
+    /// The mixed shape: escaped quotes (valid) plus a Windows path whose
+    /// segments start with both invalid (`\U`, `\o`) and "valid" (`\t`) escape
+    /// letters. Doubling only the invalid ones decoded `\t` to a TAB inside an
+    /// EXECUTED command's target path (C:\Users<TAB>imto); path mode doubles
+    /// the letter escapes too, so the command round-trips byte-exact.
+    #[test]
+    fn quoted_redirect_with_windows_path_repairs_without_control_chars() {
+        let text = r#"<tool_call>{"name": "run_shell", "arguments": {"command": "echo \"ok\" > C:\Users\timto\out.txt"}}</tool_call>"#;
+        let calls = parse(text, "qwen3");
+        assert_eq!(calls.len(), 1, "got {calls:?}");
+        let command = calls[0].args["command"].as_str().unwrap();
+        assert_eq!(command, r#"echo "ok" > C:\Users\timto\out.txt"#);
+        assert!(
+            !command.chars().any(|c| c.is_control()),
+            "no control characters may be injected into an executed command: {command}"
+        );
+    }
+
+    /// No drive path means normal mode: `\n` stays a newline while the invalid
+    /// `\q` is preserved as a literal backslash-q. Path mode must not leak into
+    /// ordinary source strings.
+    #[test]
+    fn plain_source_string_keeps_valid_escapes_without_drive_path() {
+        let text = r#"<tool_call>{"name": "write_file", "arguments": {"path": "a.txt", "content": "line1\nline2 \q end"}}</tool_call>"#;
+        let calls = parse(text, "qwen3");
+        assert_eq!(calls.len(), 1, "got {calls:?}");
+        assert_eq!(calls[0].args["content"], "line1\nline2 \\q end");
     }
 
     #[test]
