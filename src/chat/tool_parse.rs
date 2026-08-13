@@ -173,21 +173,29 @@ fn repair_invalid_json_escapes(s: &str) -> String {
     let mut chars = s.chars().peekable();
     let mut in_string = false;
     while let Some(character) = chars.next() {
-        if character == '"' {
-            in_string = !in_string;
-            out.push(character);
-            continue;
-        }
         if in_string && character == '\\' {
+            // Consume the escape and its following char TOGETHER. A `\"` must not
+            // fall through to the `"` arm below, or it would flip `in_string` and
+            // desync the tracker — a command like `echo \"\$i.txt\"` then leaves
+            // the later `\$` treated as outside a string and never repaired, so
+            // the whole call stays unparseable. (This was the live failure: Qwen
+            // over-escaping `$` inside a run_shell command killed the turn.)
+            let next = chars.next();
             let valid = matches!(
-                chars.peek(),
+                next,
                 Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u')
             );
             if !valid {
                 out.push('\\');
             }
             out.push(character);
+            if let Some(next) = next {
+                out.push(next);
+            }
             continue;
+        }
+        if character == '"' {
+            in_string = !in_string;
         }
         out.push(character);
     }
@@ -628,6 +636,25 @@ fn first_json_array(s: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The live failure that killed a Code turn: Qwen over-escapes `$` inside a
+    /// run_shell command, and the command also contains escaped quotes `\"`. The
+    /// `\"` used to desync the repair's in-string tracker so the later `\$` was
+    /// never doubled, leaving the call unparseable and looping the turn to death.
+    #[test]
+    fn hermes_call_with_escaped_quotes_and_escaped_dollar_is_recovered() {
+        let text = r#"<tool_call>
+{"name": "run_shell", "arguments": {"command": "seq 1 100 | while read -r i; do echo \"\$i.txt\"; done"}}
+</tool_call>"#;
+        let calls = parse(text, "qwen3");
+        assert_eq!(calls.len(), 1, "the call must be recovered, got {calls:?}");
+        assert_eq!(calls[0].name, "run_shell");
+        let command = calls[0].args["command"].as_str().unwrap();
+        assert!(
+            command.contains("seq 1 100") && command.contains("i.txt"),
+            "command survived repair: {command}"
+        );
+    }
 
     #[test]
     fn parses_llama_json_with_parameters() {
