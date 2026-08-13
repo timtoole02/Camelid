@@ -551,7 +551,7 @@ fn source_contract_findings(history: &[AgentMsg], sources: &[(String, String)]) 
         .iter()
         .rev()
         .find_map(|message| match message {
-            AgentMsg::User(text) => Some(text.to_ascii_lowercase()),
+            AgentMsg::User(text) if !is_harness_reminder(text) => Some(text.to_ascii_lowercase()),
             _ => None,
         })
         .unwrap_or_default();
@@ -739,7 +739,7 @@ pub fn run_loop(
         .iter()
         .rev()
         .find_map(|message| match message {
-            AgentMsg::User(text) => Some(text.clone()),
+            AgentMsg::User(text) if !is_harness_reminder(text) => Some(text.clone()),
             _ => None,
         })
         .unwrap_or_default();
@@ -859,7 +859,7 @@ pub fn run_loop(
                 .iter()
                 .rev()
                 .find_map(|message| match message {
-                    AgentMsg::User(text) => Some(text.as_str()),
+                    AgentMsg::User(text) if !is_harness_reminder(text) => Some(text.as_str()),
                     _ => None,
                 })
                 .unwrap_or_default(),
@@ -1550,7 +1550,7 @@ pub fn run_loop(
                          now: either exactly one tool call, or the final answer in plain \
                          text.",
                     );
-                    history.push(AgentMsg::System(resume));
+                    push_reminder(history, &resume);
                     continue;
                 }
                 if cfg.tool_profile.is_workspace()
@@ -1566,11 +1566,11 @@ pub fn run_loop(
                         let required = if force_full_rewrite {
                             "edit_file is unavailable after repeated patch failures. Emit exactly one structured write_file call containing the COMPLETE corrected file at the same path."
                         } else {
-                            "Emit exactly one valid structured tool call using the advertised schema. Do not wrap source in prose or manually write <tool_call> syntax."
+                            "Emit at least one valid structured tool call using the advertised schema. Do not wrap source in prose or manually write <tool_call> syntax."
                         };
-                        history.push(AgentMsg::System(format!(
+                        push_reminder(history, &format!(
                             "Your last response looked like a tool call but could not be parsed, so it was NOT executed and is not a completion answer. {required}"
-                        )));
+                        ));
                         continue;
                     }
                     reporter.notice(
@@ -1628,13 +1628,15 @@ pub fn run_loop(
                             "the model hit its output cap mid-answer; retrying with a smaller \
                              unit of work",
                         );
-                        history.push(AgentMsg::System(
+                        push_reminder(
+                            history,
                             "Your last reply was cut off at the output-token limit, so it was \
-                             discarded. Do less in one step: write ONE file (or make ONE \
-                             edit_file change) per step, and prefer edit_file over rewriting a \
-                             whole file. Emit the complete tool call and nothing else."
-                                .into(),
-                        ));
+                             discarded. FOR THIS RETRY ONLY, do less in one step: write ONE \
+                             file (or make ONE edit_file change), and prefer edit_file over \
+                             rewriting a whole file. Emit the complete tool call and nothing \
+                             else. This narrowing applies to recovering from the output cap, \
+                             not to the turn in general.",
+                        );
                         continue;
                     }
                     reporter.notice(
@@ -1647,7 +1649,8 @@ pub fn run_loop(
                         reporter.notice(
                             "Code has not changed a workspace file; asking the model to continue",
                         );
-                        history.push(AgentMsg::System(
+                        push_reminder(
+                            history,
                             concat!(
                                 "The user requested a coding change, but no write_file or ",
                                 "edit_file call has succeeded. Do not stop, provide source only ",
@@ -1660,9 +1663,8 @@ pub fn run_loop(
                                 "--version`. Only when no runtime exists, submit an appropriate ",
                                 "package-manager install through run_shell so the approval UI can ",
                                 "ask the user. A failed tool call is not a completed task."
-                            )
-                            .into(),
-                        ));
+                            ),
+                        );
                         continue;
                     }
                     reporter.notice(concat!(
@@ -1791,24 +1793,21 @@ pub fn run_loop(
                             }
                         }
                         if !semantic_contract_findings.is_empty() {
-                            history.push(AgentMsg::System(format!(
+                            push_reminder(history, &format!(
                                 "Camelid's deterministic source-contract audit found behavior that does not satisfy the explicit request:\n- {}\nDo not answer or merely explain these findings. Your NEXT tool call must be edit_file or write_file to correct every item. After the new version is written, Camelid will capture and audit that exact version again.",
                                 semantic_contract_findings.join("\n- ")
-                            )));
-                        } else if pending_verification_paths.is_empty() {
-                            history.push(AgentMsg::System(
-                                "Camelid captured the exact final changed source above as retained verification evidence. Do not repeat the previous completion claim. Review the ACTUAL implementation against EVERY explicit user requirement and its state transitions. A comment, filename, UI label, syntax check, or claim is not behavior. If anything is missing or incorrect, your NEXT tool call must edit_file or write_file to fix it. Otherwise run an appropriate syntax/build/test command when available, then answer concisely."
-                                    .into(),
                             ));
+                        } else if pending_verification_paths.is_empty() {
+                            push_reminder(history, "Camelid captured the exact final changed source above as retained verification evidence. Do not repeat the previous completion claim. Review the ACTUAL implementation against EVERY explicit user requirement and its state transitions. A comment, filename, UI label, syntax check, or claim is not behavior. If anything is missing or incorrect, your NEXT tool call must edit_file or write_file to fix it. Otherwise run an appropriate syntax/build/test command when available, then answer concisely.");
                         } else {
-                            history.push(AgentMsg::System(format!(
+                            push_reminder(history, &format!(
                                 "Camelid could not capture every changed path: {}. Use read_file on those exact paths before answering.",
                                 pending_verification_paths
                                     .iter()
                                     .map(String::as_str)
                                     .collect::<Vec<_>>()
                                     .join(", ")
-                            )));
+                            ));
                         }
                         continue;
                     }
@@ -1824,12 +1823,15 @@ pub fn run_loop(
                 if !missing_reads.is_empty() && evidence_reprompts < EVIDENCE_REPROMPT_LIMIT {
                     evidence_reprompts += 1;
                     reporter.notice("Workspace must read each named file before answering");
-                    history.push(AgentMsg::System(format!(
+                    push_reminder(
+                        history,
+                        &format!(
                         "Use read_file on these exact relative paths before answering: {}. Then \
                          answer from the observations instead of describing what the files usually \
                          contain or saying further reading is required.",
                         missing_reads.into_iter().collect::<Vec<_>>().join(", ")
-                    )));
+                    ),
+                    );
                     continue;
                 }
                 if !missing_reads.is_empty() {
@@ -1849,13 +1851,13 @@ pub fn run_loop(
                     reporter.notice(
                         "Workspace inspection is required before answering this file request",
                     );
-                    history.push(AgentMsg::System(
+                    push_reminder(
+                        history,
                         "The current request requires direct workspace evidence. Call at least \
                          one available read tool now, observe its result, and only then answer. \
                          Never claim that files are absent without a successful directory or \
-                         search observation."
-                            .into(),
-                    ));
+                         search observation.",
+                    );
                     continue;
                 }
                 if cfg.tool_profile.is_workspace() {
@@ -1877,26 +1879,26 @@ pub fn run_loop(
                     reporter.notice(
                         "The proposed answer contradicted filenames observed in the workspace",
                     );
-                    history.push(AgentMsg::System(
+                    push_reminder(
+                        history,
                         "Your proposed absence claim conflicts with successful file-tool \
                          observations containing the requested extension. Reconcile all prior \
                          observations and answer from the filenames already listed. The search \
-                         tool matches literal file contents, not filename regexes or globs."
-                            .into(),
-                    ));
+                         tool matches literal file contents, not filename regexes or globs.",
+                    );
                     continue;
                 }
                 if cfg.tool_profile.is_workspace()
                     && workspace_answer_misclassifies_directories(history, &text)
                 {
                     reporter.notice("The proposed answer classified directories as matching files");
-                    history.push(AgentMsg::System(
+                    push_reminder(
+                        history,
                         "The current request asks for files with a specific extension. Only \
                          entries ending with that extension are matching files. Entries ending \
                          in `/` are directories and must not be included in the file list. \
-                         Correct the answer using the existing list_dir observation."
-                            .into(),
-                    ));
+                         Correct the answer using the existing list_dir observation.",
+                    );
                     continue;
                 }
                 if let Some(runtime) = context_paging.as_mut() {
@@ -1968,7 +1970,7 @@ pub fn run_loop(
                                     .join(", ");
                                 if available.is_empty() {
                                     "No tools are available in this phase: return one typed action"
-                                        .into()
+                                        .to_string()
                                 } else {
                                     format!(
                                     "Only these tools are available in this phase: {available}. \
@@ -2024,8 +2026,7 @@ pub fn run_loop(
                                 "The previous full-file rewrite was byte-for-byte identical and was rejected. ",
                                 "Do not reproduce the exact page. Use PATCH or edit_file to make a real change ",
                                 "that resolves every current diagnostic."
-                            )
-                            .into();
+                            ).into();
                         }
                         if let Err(save_error) = runtime.save() {
                             reporter.notice(&format!("context paging state error: {save_error}"));
@@ -2069,6 +2070,27 @@ pub fn run_loop(
                     budget_exhaustion_grace_answer(driver, reporter, history, cancel);
                     return LoopEnd::Repeated;
                 }
+                // Collapse exact duplicates WITHIN one batch before executing
+                // any of them. Now that batching is advertised, a model that
+                // asks for the same read twice in one response would otherwise
+                // pay for it twice — and, worse, trip the repeat guard on its
+                // own sibling. Keyed on the canonical (repaired) identity.
+                {
+                    let mut seen_in_batch: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    let before = calls.len();
+                    calls.retain(|call| {
+                        let name = tools::repair_tool_name(&call.name, cfg.tool_profile)
+                            .unwrap_or(call.name.as_str());
+                        seen_in_batch.insert(format!("{name}::{}", call.args))
+                    });
+                    let collapsed = before - calls.len();
+                    if collapsed > 0 {
+                        reporter.notice(&format!(
+                            "collapsed {collapsed} duplicate tool call(s) in one step"
+                        ));
+                    }
+                }
                 total_tool_calls = total_tool_calls.saturating_add(calls.len());
                 history.push(AgentMsg::ToolCalls(calls.clone()));
                 for call in calls {
@@ -2076,8 +2098,15 @@ pub fn run_loop(
                         reporter.notice("aborted");
                         return LoopEnd::Aborted;
                     }
-                    let signature = format!("{}::{}", call.name, call.args);
-                    *ran.entry(call.name.clone()).or_insert(0) += 1;
+                    // Key the guard on the name that will actually EXECUTE. The
+                    // repair ladder folds `WriteFile`/`write-file`/`write_file`
+                    // onto one tool, so hashing the raw spelling let a model
+                    // repeat the same failing call forever just by varying the
+                    // casing — the repeat and churn guards never saw a match.
+                    let canonical_name = tools::repair_tool_name(&call.name, cfg.tool_profile)
+                        .unwrap_or(call.name.as_str());
+                    let signature = format!("{}::{}", canonical_name, call.args);
+                    *ran.entry(canonical_name.to_string()).or_insert(0) += 1;
                     if call.name == "update_plan"
                         && !tools.iter().any(|spec| spec.name == call.name)
                     {
@@ -2091,10 +2120,7 @@ pub fn run_loop(
                             name: call.name,
                             outcome,
                         });
-                        history.push(AgentMsg::System(
-                            "Do not call update_plan again in this run. Planning is finished. Advance the user's goal with a file, shell, or delegation tool now."
-                                .into(),
-                        ));
+                        push_reminder(history, "Do not call update_plan again in this run. Planning is finished. Advance the user's goal with a file, shell, or delegation tool now.");
                         continue;
                     }
                     if call.name == "edit_file" && force_full_rewrite {
@@ -2108,10 +2134,7 @@ pub fn run_loop(
                             name: call.name,
                             outcome,
                         });
-                        history.push(AgentMsg::System(
-                            "Do not call edit_file again for this version. Your NEXT tool call must be write_file with the complete corrected source at the same path; the existing file remains intact until that replacement succeeds."
-                                .into(),
-                        ));
+                        push_reminder(history, "Do not call edit_file again for this version. Your NEXT tool call must be write_file with the complete corrected source at the same path; the existing file remains intact until that replacement succeeds.");
                         continue;
                     }
                     if direct_python_rewrite_required && call.name != "write_file" {
@@ -2133,10 +2156,7 @@ pub fn run_loop(
                             );
                             return LoopEnd::Repeated;
                         }
-                        history.push(AgentMsg::System(
-                            "Do not inspect, run, explain, or answer. Your NEXT and ONLY valid action is write_file with the COMPLETE corrected Python artifact at the same workspace-relative path. Preserve every requested behavior while fixing the traceback/syntax failure."
-                                .into(),
-                        ));
+                        push_reminder(history, "Do not inspect, run, explain, or answer. Your NEXT and ONLY valid action is write_file with the COMPLETE corrected Python artifact at the same workspace-relative path. Preserve every requested behavior while fixing the traceback/syntax failure.");
                         continue;
                     }
                     // Validate against schema + sandbox. A bad/unknown/escape call
@@ -2190,13 +2210,14 @@ pub fn run_loop(
                                 ));
                                 return LoopEnd::Repeated;
                             }
-                            history.push(AgentMsg::System(if rejected_raw_source {
-                                "Program source must be persisted before it is run. Do not retry or rephrase the shell command and do not answer. Your NEXT tool call must be write_file (or edit_file for an existing file) containing the source; then re-read that exact file and run it or syntax-check it."
-                                    .into()
-                            } else {
-                                "That tool call was not executed because its arguments were invalid. Correct the arguments before retrying and never repeat the identical failed call. For a small single-file coding task, use write_file or edit_file directly; subagent delegation is optional."
-                                    .into()
-                            }));
+                            push_reminder(
+                                history,
+                                if rejected_raw_source {
+                                    "Program source must be persisted before it is run. Do not retry or rephrase the shell command and do not answer. Your NEXT tool call must be write_file (or edit_file for an existing file) containing the source; then re-read that exact file and run it or syntax-check it."
+                                } else {
+                                    "That tool call was not executed because its arguments were invalid. Correct the arguments before retrying and never repeat the identical failed call. For a small single-file coding task, use write_file or edit_file directly; subagent delegation is optional."
+                                },
+                            );
                             continue;
                         }
                     };
@@ -2745,10 +2766,7 @@ pub fn run_loop(
                                 return LoopEnd::DriverError;
                             }
                         }
-                        history.push(AgentMsg::System(
-                            "The Python traceback/syntax error proves the current standalone artifact is broken. Do not read more lines, rerun it, explain, or answer. Your NEXT tool call must be write_file with the COMPLETE corrected source at the same workspace-relative path."
-                                .into(),
-                        ));
+                        push_reminder(history, "The Python traceback/syntax error proves the current standalone artifact is broken. Do not read more lines, rerun it, explain, or answer. Your NEXT tool call must be write_file with the COMPLETE corrected source at the same workspace-relative path.");
                         continue;
                     }
                     if python_launcher_just_verified {
@@ -2767,10 +2785,7 @@ pub fn run_loop(
                                 return LoopEnd::DriverError;
                             }
                         }
-                        history.push(AgentMsg::System(
-                            "`py --version` succeeded, so Python is installed and ready. Do not run any install command. Fix or write the requested source now using its workspace-relative path, then use `py -m py_compile <file.py>` for a bounded syntax check; do not launch a GUI during verification."
-                                .into(),
-                        ));
+                        push_reminder(history, "`py --version` succeeded, so Python is installed and ready. Do not run any install command. Fix or write the requested source now using its workspace-relative path, then use `py -m py_compile <file.py>` for a bounded syntax check; do not launch a GUI during verification.");
                         continue;
                     }
                     if exhausted_edit_recovery {
@@ -2790,10 +2805,7 @@ pub fn run_loop(
                         reporter.notice(
                             "two file patches failed; requiring a complete write_file replacement",
                         );
-                        history.push(AgentMsg::System(
-                            "Two edit_file patches failed and the original file is unchanged. Stop attempting narrow edits. Your NEXT tool call must be write_file with the complete corrected source at the same path. Include every existing required behavior plus all audit fixes; then Camelid will re-read and audit the replacement."
-                                .into(),
-                        ));
+                        push_reminder(history, "Two edit_file patches failed and the original file is unchanged. Stop attempting narrow edits. Your NEXT tool call must be write_file with the complete corrected source at the same path. Include every existing required behavior plus all audit fixes; then Camelid will re-read and audit the replacement.");
                         continue;
                     }
                     if python_alias_failure {
@@ -2801,29 +2813,23 @@ pub fn run_loop(
                         reporter.notice(
                             "python.exe resolved to the Windows Store alias; requiring launcher probe",
                         );
-                        history.push(AgentMsg::System(
-                            "That result only proves the Windows `python.exe` Store alias is unusable; it does NOT prove Python is absent. Do not repeat a `python` command, ask the user to install anything, or answer. Your NEXT tool call must be `run_shell` with exactly `py --version`. If it succeeds, use `py` for later checks and persist requested source with write_file."
-                                .into(),
-                        ));
+                        push_reminder(history, "That result only proves the Windows `python.exe` Store alias is unusable; it does NOT prove Python is absent. Do not repeat a `python` command, ask the user to install anything, or answer. Your NEXT tool call must be `run_shell` with exactly `py --version`. If it succeeds, use `py` for later checks and persist requested source with write_file.");
                         continue;
                     }
                     if delegated_terminal_without_result {
                         reporter.notice(
                             "delegated work ended without a workspace change; requiring direct parent execution",
                         );
-                        history.push(AgentMsg::System(
-                            "The delegated child ended without completing the requested workspace change. Do not answer, spawn another child, or wait again. Complete the task yourself now. Your NEXT tool call must be write_file or edit_file, using the information already available; then verify the result."
-                                .into(),
-                        ));
+                        push_reminder(history, "The delegated child ended without completing the requested workspace change. Do not answer, spawn another child, or wait again. Complete the task yourself now. Your NEXT tool call must be write_file or edit_file, using the information already available; then verify the result.");
                         continue;
                     }
                     if recover_now {
                         reporter.notice(&format!(
                             "recovering: `{name}` returned the same result twice; requiring a different action"
                         ));
-                        history.push(AgentMsg::System(format!(
+                        push_reminder(history, &format!(
                             "Runtime loop recovery: `{name}` with those arguments has already returned the same result twice. Treat that observation as settled and DO NOT call it again with the same arguments. Choose a different action that advances the user's request now. If a directory listing established that the workspace is empty and the user asked you to create code, call `write_file` now; do not inspect the empty directory again."
-                        )));
+                        ));
                         continue;
                     }
                     if stuck || (already_recovered && repeat_count >= REPEAT_RECOVERY_THRESHOLD) {
@@ -2842,14 +2848,17 @@ pub fn run_loop(
                     // The clamp above ran only the first page of an oversized batch.
                     // Tell the model exactly what happened, or its next step would
                     // reason from the false belief that the whole batch executed.
-                    history.push(AgentMsg::System(format!(
-                        "{deferred_calls} tool call(s) beyond the first \
+                    push_reminder(
+                        history,
+                        &format!(
+                            "{deferred_calls} tool call(s) beyond the first \
                          {MAX_WORKSPACE_TOOL_CALLS_PER_STEP} were NOT run. Continue the \
                          remaining work now, at most {MAX_WORKSPACE_TOOL_CALLS_PER_STEP} \
                          calls per step — or collapse mechanical repetition into one \
                          run_shell command, which handles any number of files in a \
                          single call."
-                    )));
+                        ),
+                    );
                 }
             }
         }
@@ -2926,7 +2935,7 @@ fn budget_exhaustion_grace_answer(
 
 fn workspace_request_requires_observation(history: &[AgentMsg]) -> bool {
     let Some(request) = history.iter().rev().find_map(|message| match message {
-        AgentMsg::User(text) => Some(text.to_ascii_lowercase()),
+        AgentMsg::User(text) if !is_harness_reminder(text) => Some(text.to_ascii_lowercase()),
         _ => None,
     }) else {
         return false;
@@ -2980,7 +2989,7 @@ fn workspace_request_requires_observation(history: &[AgentMsg]) -> bool {
 
 fn workspace_request_requires_change(history: &[AgentMsg]) -> bool {
     let Some(request) = history.iter().rev().find_map(|message| match message {
-        AgentMsg::User(text) => Some(text.to_ascii_lowercase()),
+        AgentMsg::User(text) if !is_harness_reminder(text) => Some(text.to_ascii_lowercase()),
         _ => None,
     }) else {
         return false;
@@ -3077,6 +3086,51 @@ fn workspace_changes_since(root: &Path, since: std::time::SystemTime) -> Option<
     changed.then_some(paths)
 }
 
+/// Append a mid-turn correction as a tagged USER turn, not a system message.
+///
+/// Two reasons, both load-bearing:
+///
+/// 1. POSITION. `history_to_messages` folds every `AgentMsg::System` in history
+///    into the FIRST user message when `fold_system` is on, so a correction
+///    pushed at step 12 was retroactively spliced in at position 0 — the model
+///    read "your last reply was cut off" before it had written anything.
+/// 2. PREFIX CACHE. That same fold rewrites the first user message every time a
+///    correction is added, which changes the prompt prefix and throws away the
+///    prefix cache. On this lane a cache miss is a full re-prefill — seconds of
+///    wall clock — so a correction that should be nearly free became the most
+///    expensive kind of message. Appending at the tail keeps the prefix intact.
+///
+/// The tag is closed defensively: correction text can embed tool output, and an
+/// unescaped closing tag would let that output impersonate the harness.
+fn push_reminder(history: &mut Vec<AgentMsg>, text: &str) {
+    let safe = text.replace("</system-reminder>", "<\u{200b}/system-reminder>");
+    history.push(AgentMsg::User(format!(
+        "{REMINDER_OPEN}\n{safe}\n</system-reminder>"
+    )));
+}
+
+const REMINDER_OPEN: &str = "<system-reminder>";
+
+/// Is this history entry a harness reminder rather than something the USER said?
+///
+/// Reminders ride as user turns so they land in chronological position and keep
+/// the prompt prefix stable — but several deterministic behaviors key off "the
+/// user's request" by scanning backwards for the last user message. Without this
+/// distinction a mid-turn correction would silently BECOME the request, which
+/// broke the workspace-inventory synthesizer the moment reminders were
+/// introduced.
+fn is_harness_reminder(text: &str) -> bool {
+    text.starts_with(REMINDER_OPEN)
+}
+
+/// The last thing the USER actually asked for, ignoring harness reminders.
+fn last_user_request(history: &[AgentMsg]) -> Option<&str> {
+    history.iter().rev().find_map(|message| match message {
+        AgentMsg::User(text) if !is_harness_reminder(text) => Some(text.as_str()),
+        _ => None,
+    })
+}
+
 /// Does a failed host syntax check actually blame the FILE?
 ///
 /// The auto `py -m py_compile` probe borrows the caller's shell timeout, so on a
@@ -3170,7 +3224,7 @@ fn workspace_answer_contradicts_observations(
     observations: &[(String, String)],
 ) -> bool {
     let Some(request) = history.iter().rev().find_map(|message| match message {
-        AgentMsg::User(text) => Some(text.to_ascii_lowercase()),
+        AgentMsg::User(text) if !is_harness_reminder(text) => Some(text.to_ascii_lowercase()),
         _ => None,
     }) else {
         return false;
@@ -3221,10 +3275,7 @@ fn canonical_workspace_inventory(
     history: &[AgentMsg],
     observations: &[(String, String)],
 ) -> Option<String> {
-    let request = history.iter().rev().find_map(|message| match message {
-        AgentMsg::User(text) => Some(text.to_ascii_lowercase()),
-        _ => None,
-    })?;
+    let request = last_user_request(history)?.to_ascii_lowercase();
     let extensions = workspace_requested_extensions(&request);
     if extensions.is_empty() || !workspace_request_is_immediate_inventory(&request) {
         return None;
@@ -3358,7 +3409,7 @@ fn workspace_requested_extensions(request: &str) -> Vec<String> {
 
 fn workspace_answer_misclassifies_directories(history: &[AgentMsg], answer: &str) -> bool {
     let Some(request) = history.iter().rev().find_map(|message| match message {
-        AgentMsg::User(text) => Some(text.to_ascii_lowercase()),
+        AgentMsg::User(text) if !is_harness_reminder(text) => Some(text.to_ascii_lowercase()),
         _ => None,
     }) else {
         return false;
@@ -3991,7 +4042,10 @@ pub fn system_prompt(sandbox: &Sandbox, tools: &[ToolSpec]) -> String {
         "try the `py` launcher before treating a failing `python` app alias as no Python. If a ",
         "runtime is truly absent, submit an approval-gated package-manager command instead of ",
         "asking the user to install it manually.\n",
-        "- Verify your work with a build, test, or re-read before claiming completion.\n",
+        "- Verify your work with a build, test, or re-read before claiming completion. A write \
+         or edit result that already shows the new content IS that verification.\n",
+        "- When you need several independent things, ask for them in ONE step: up to 8 tool \
+         calls per response. Serialize only when a later call depends on an earlier result.\n",
         "- Keep going until the goal is met or you are genuinely blocked.\n",
         "- Do not invent workspace facts. Look first, and label assumptions.\n"
     ));
@@ -5782,11 +5836,14 @@ mod tests {
         let mut approver = ScriptApprover(vec![Decision::Once], 0);
         let mut reporter = RecordReporter::default();
         let mut history = vec![
-            AgentMsg::System(concat!(
-                "host system prompt\n\nDirect creation acceptance contract:\n",
-                "- Create the requested runnable artifact in the workspace with write_file\n",
-                "- A human-vs-computer game means the human controls exactly one side and the program automatically chooses and performs every opposing move\n"
-            ).into()),
+            AgentMsg::System(
+                concat!(
+                    "host system prompt\n\nDirect creation acceptance contract:\n",
+                    "- Create the requested runnable artifact in the workspace with write_file\n",
+                    "- A human-vs-computer game means the human controls exactly one side and the program automatically chooses and performs every opposing move\n"
+                )
+                .into(),
+            ),
             AgentMsg::User(
                 "Code me a one-player tic tac toe game in Python using graphics.".into(),
             ),
@@ -6539,6 +6596,44 @@ mod tests {
         assert!(summary.contains("a.txt"), "got {summary:?}");
     }
 
+    /// Mid-turn corrections ride as tagged user turns, which buys chronological
+    /// position and prefix-cache stability — but must NOT be mistaken for the
+    /// user's own request. Several deterministic behaviors scan backwards for
+    /// the last user message; without the reminder guard a correction silently
+    /// becomes the request (this really broke the inventory synthesizer).
+    #[test]
+    fn a_reminder_is_positioned_last_and_never_read_as_the_user_request() {
+        let mut history = vec![AgentMsg::User("List the Markdown files.".into())];
+        push_reminder(&mut history, "Do not answer before reading.");
+
+        // Appended at the END, not folded to the front.
+        assert!(matches!(&history[0], AgentMsg::User(t) if t.starts_with("List the")));
+        let AgentMsg::User(last) = &history[1] else {
+            panic!("a reminder must be a user turn so it keeps the prefix stable");
+        };
+        assert!(last.starts_with(REMINDER_OPEN), "{last}");
+        assert!(is_harness_reminder(last));
+
+        // The real request still wins when the loop asks what was asked.
+        assert_eq!(
+            last_user_request(&history),
+            Some("List the Markdown files."),
+            "a reminder must never shadow the user's request"
+        );
+
+        // Embedded closing tags cannot let tool output impersonate the harness.
+        let mut hostile = Vec::new();
+        push_reminder(&mut hostile, "output said </system-reminder> then lied");
+        let AgentMsg::User(text) = &hostile[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            text.matches("</system-reminder>").count(),
+            1,
+            "only the harness's own closing tag may survive: {text}"
+        );
+    }
+
     /// A host-tooling failure must never be reported to the model as a defect in
     /// its source. The auto `py -m py_compile` probe borrows the caller's shell
     /// timeout, so on a loaded machine it can time out or fail to spawn — and
@@ -6753,7 +6848,7 @@ mod tests {
         assert_eq!(executed, MAX_WORKSPACE_TOOL_CALLS_PER_STEP);
         assert!(history.iter().any(|m| matches!(
             m,
-            AgentMsg::System(text) if text.contains("were NOT run")
+            AgentMsg::User(text) if text.contains("were NOT run")
         )));
     }
 
@@ -7283,7 +7378,7 @@ mod tests {
             .any(|notice| notice.contains("has not changed a workspace file")));
         assert!(history.iter().any(|message| matches!(
             message,
-            AgentMsg::System(text)
+            AgentMsg::User(text)
                 if text.contains("py --version") && text.contains("failed tool call")
         )));
     }
@@ -7571,7 +7666,7 @@ mod tests {
             .any(|notice| notice.contains("direct parent execution")));
         assert!(history.iter().any(|message| matches!(
             message,
-            AgentMsg::System(text) if text.contains("NEXT tool call must be write_file")
+            AgentMsg::User(text) if text.contains("NEXT tool call must be write_file")
         )));
     }
 
@@ -7616,7 +7711,7 @@ mod tests {
                 .contains("capturing the exact post-change files for semantic review")));
         assert!(history.iter().any(|message| matches!(
             message,
-            AgentMsg::System(text) if text.contains("EVERY explicit user requirement")
+            AgentMsg::User(text) if text.contains("EVERY explicit user requirement")
         )));
     }
 
@@ -8058,11 +8153,11 @@ mod tests {
             .any(|notice| notice.contains("Windows Store alias")));
         assert!(history.iter().any(|message| matches!(
             message,
-            AgentMsg::System(text) if text.contains("exactly `py --version`")
+            AgentMsg::User(text) if text.contains("exactly `py --version`")
         )));
         assert!(history.iter().any(|message| matches!(
             message,
-            AgentMsg::System(text) if text.contains("Python is installed and ready")
+            AgentMsg::User(text) if text.contains("Python is installed and ready")
         )));
     }
 
@@ -8149,7 +8244,7 @@ mod tests {
             .any(|notice| notice.contains("same invalid call")));
         assert!(history.iter().any(|message| matches!(
             message,
-            AgentMsg::System(text) if text.contains("never repeat the identical failed call")
+            AgentMsg::User(text) if text.contains("never repeat the identical failed call")
         )));
     }
 
@@ -8853,7 +8948,7 @@ mod tests {
         assert!(
             history
                 .iter()
-                .any(|m| matches!(m, AgentMsg::System(s) if s.contains("cut off"))),
+                .any(|m| matches!(m, AgentMsg::User(s) if s.contains("cut off"))),
             "the retry must disclose the cap to the model"
         );
     }

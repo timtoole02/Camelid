@@ -272,6 +272,72 @@ const WORKSPACE_SEARCH_HITS: u64 = 20;
 const WEB_CODE_OBSERVATION_LIMIT: usize = 16 * 1024;
 pub(crate) const SEARCH_SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".camelid"];
 
+/// Separator between a synthetic line number and the file's own bytes.
+///
+/// Deliberately NOT `": "`, which occurs constantly in Rust, Python, YAML and
+/// JSON — the model could not tell the harness's prefix from the file's own
+/// content, and then echoed the prefix back inside an `edit_file` needle, which
+/// of course never matched.
+pub(crate) const LINE_ANCHOR: &str = " | ";
+
+/// Up to three sibling names similar to the one that was not found, plus the
+/// workspace-root note.
+///
+/// A wrong path guess otherwise costs a bare OS error, a `list_dir` round trip,
+/// and a retry — three decodes for a typo. Bounded: one directory read, no
+/// recursion, silent on any failure.
+fn similar_path_hint(path: &Path) -> String {
+    let Some(parent) = path.parent() else {
+        return String::new();
+    };
+    let Some(leaf) = path.file_name().and_then(|n| n.to_str()) else {
+        return String::new();
+    };
+    let needle = leaf.to_ascii_lowercase();
+    let stem = needle.split('.').next().unwrap_or(&needle).to_string();
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return String::new();
+    };
+    let mut similar: Vec<String> = Vec::new();
+    for entry in entries.flatten().take(2_000) {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let lowered = name.to_ascii_lowercase();
+        if lowered == needle {
+            continue;
+        }
+        // Substring either way catches truncated/extended guesses; edit distance
+        // catches the typo shapes substring matching cannot (a dropped or
+        // transposed character, e.g. `confg.toml` -> `config.toml`).
+        let close_enough = (!stem.is_empty() && lowered.contains(&stem))
+            || needle.contains(&lowered)
+            || edit_distance(&needle, &lowered) <= (needle.len() / 4).clamp(1, 3);
+        if close_enough {
+            similar.push(name);
+            if similar.len() == 3 {
+                break;
+            }
+        }
+    }
+    if similar.is_empty() {
+        String::new()
+    } else {
+        format!(" Similar names here: {}.", similar.join(", "))
+    }
+}
+
+/// Error text for a failed read that names the fix when the path is the problem.
+fn read_failure_message(path: &Path, error: &std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return format!(
+            "read failed: {error}. Paths are relative to the workspace root.{}",
+            similar_path_hint(path)
+        );
+    }
+    format!("read failed: {error}")
+}
+
 impl Sandbox {
     /// Build a sandbox rooted at `root` (canonicalized). Fails if the root does
     /// not resolve to a real directory.
@@ -470,21 +536,22 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
     let mut tools = vec![
         ToolSpec {
             name: "read_file".into(),
-            description: "Read a UTF-8 text file within the workspace (not cat/head/tail). Use \
-                          start_line and max_lines for bounded excerpts."
+            description: "Read a UTF-8 text file (not cat/head/tail). start_line/max_lines \
+                          bound the excerpt. The `N | ` prefix is not file content. Read \
+                          several files in one step."
                 .into(),
             risk: Risk::Read,
             params: json!({"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"max_lines":{"type":"integer","minimum":1,"maximum":200}},"required":["path"]}),
         },
         ToolSpec {
             name: "list_dir".into(),
-            description: "List a page of directory entry names within the workspace (not ls/find). Use this to discover filenames and file extensions.".into(),
+            description: "List directory entry names (not ls/find). Discovers filenames and extensions.".into(),
             risk: Risk::Read,
             params: json!({"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":200}},"required":["path"]}),
         },
         ToolSpec {
             name: "search".into(),
-            description: "Search UTF-8 file contents for a literal substring within the workspace (not grep/rg). Matches contents only - no filenames, regex, or globs.".into(),
+            description: "Search file contents for a literal substring (not grep/rg). Contents only - no filenames, regex, or globs.".into(),
             risk: Risk::Read,
             params: json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":profile.search_hit_limit()}},"required":["pattern"]}),
         },
@@ -514,10 +581,12 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
         },
         ToolSpec {
             name: "edit_file".into(),
-            description: "Replace a unique occurrence of `old` with `new` in a file (not sed/awk)."
+            description: "Replace `old` with `new` in a file (not sed/awk). `old` is the file's \
+                          own text without the `N | ` prefix, at its exact indentation. \
+                          replace_all:true changes every occurrence."
                 .into(),
             risk: Risk::Write,
-            params: json!({"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"}},"required":["path","old","new"]}),
+            params: json!({"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["path","old","new"]}),
         },
     ];
     if profile == ToolProfile::WorkspaceReadOnly {
@@ -806,6 +875,8 @@ pub enum Action {
         summary: String,
     },
     EditFile {
+        /// Change every occurrence instead of refusing an ambiguous match.
+        replace_all: bool,
         path: PathBuf,
         old: String,
         new: String,
@@ -1056,7 +1127,9 @@ impl Action {
             Action::WriteFile { path, summary, .. } => {
                 format!("write_file → {}\n{summary}", sandbox.rel(path))
             }
-            Action::EditFile { path, old, new } => {
+            Action::EditFile {
+                path, old, new, replace_all: _,
+            } => {
                 // The full replacement, - then +, bounded: unique-replace
                 // needles are short by construction, and an approval that
                 // shows only first lines is approving on faith.
@@ -1157,9 +1230,14 @@ impl Action {
                 super::checkpoint::finish(pending, !out.is_err());
                 out
             }
-            Action::EditFile { path, old, new } => {
+            Action::EditFile {
+                path,
+                old,
+                new,
+                replace_all,
+            } => {
                 let pending = super::checkpoint::prepare(sandbox, path, "edit_file");
-                let out = edit_file(path, old, new, &sandbox.rel(path));
+                let out = edit_file(path, old, new, &sandbox.rel(path), *replace_all);
                 super::checkpoint::finish(pending, !out.is_err());
                 out
             }
@@ -1594,6 +1672,10 @@ pub fn validate_for(
                 path,
                 old: str_arg("old")?,
                 new: str_arg("new")?,
+                replace_all: args
+                    .get("replace_all")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             })
         }
         "run_shell" => validate_shell_command(str_arg("command")?),
@@ -1970,7 +2052,7 @@ fn read_file(path: &Path, start_line: Option<usize>, max_lines: Option<usize>) -
         }
         let file = match std::fs::File::open(path) {
             Ok(file) => file,
-            Err(error) => return ToolOutcome::Err(format!("read failed: {error}")),
+            Err(error) => return ToolOutcome::Err(read_failure_message(path, &error)),
         };
         let start = start_line.unwrap_or(1);
         let limit = max_lines.unwrap_or(200);
@@ -1987,9 +2069,9 @@ fn read_file(path: &Path, start_line: Option<usize>, max_lines: Option<usize>) -
             }
             let line = match line {
                 Ok(line) => line,
-                Err(error) => return ToolOutcome::Err(format!("read failed: {error}")),
+                Err(error) => return ToolOutcome::Err(read_failure_message(path, &error)),
             };
-            let rendered = format!("{line_number}: {line}\n");
+            let rendered = format!("{line_number}{LINE_ANCHOR}{line}\n");
             if output.len().saturating_add(rendered.len()) > MAX_READ_BYTES {
                 output.push_str(&format!("...[continue at start_line={line_number}]"));
                 break;
@@ -2015,13 +2097,22 @@ fn read_file(path: &Path, start_line: Option<usize>, max_lines: Option<usize>) -
         Ok(bytes) => {
             let truncated = bytes.len() > MAX_READ_BYTES;
             let slice = &bytes[..bytes.len().min(MAX_READ_BYTES)];
-            let mut text = String::from_utf8_lossy(slice).into_owned();
+            let raw = String::from_utf8_lossy(slice);
+            // Number this branch the SAME way as the ranged one. They used to
+            // differ — ranged emitted "N: line", whole-file emitted raw bytes —
+            // so the model's mental model of the file depended on which branch
+            // it happened to hit, and an edit anchored after a whole-file read
+            // had no line numbers to reason with.
+            let mut text = String::with_capacity(raw.len() + raw.lines().count() * 6);
+            for (index, line) in raw.lines().enumerate() {
+                text.push_str(&format!("{}{LINE_ANCHOR}{line}\n", index + 1));
+            }
             if truncated {
                 text.push_str(&format!("\n…[truncated at {MAX_READ_BYTES} bytes]"));
             }
             ToolOutcome::Ok(text)
         }
-        Err(e) => ToolOutcome::Err(format!("read failed: {e}")),
+        Err(e) => ToolOutcome::Err(read_failure_message(path, &e)),
     }
 }
 
@@ -2030,7 +2121,16 @@ fn list_dir(path: &Path, offset: usize, limit: Option<usize>) -> ToolOutcome {
     let mut capped = false;
     let read = match std::fs::read_dir(path) {
         Ok(r) => r,
-        Err(e) => return ToolOutcome::Err(format!("list failed: {e}")),
+        Err(e) => {
+            return ToolOutcome::Err(if e.kind() == std::io::ErrorKind::NotFound {
+                format!(
+                    "list failed: {e}. Paths are relative to the workspace root.{}",
+                    similar_path_hint(path)
+                )
+            } else {
+                format!("list failed: {e}")
+            })
+        }
     };
     for entry in read.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -2223,23 +2323,197 @@ fn write_file(path: &Path, content: &str, display_path: &str) -> ToolOutcome {
     }
 }
 
-fn edit_file(path: &Path, old: &str, new: &str, display_path: &str) -> ToolOutcome {
+/// Normalize a line for tolerant matching: fold CRLF, strip horizontal
+/// whitespace at both ends, and map the Unicode characters a model most often
+/// substitutes for their ASCII originals.
+fn normalize_match_line(line: &str) -> String {
+    line.trim_end_matches('\r')
+        .trim_matches(|c: char| c == ' ' || c == '\t')
+        .chars()
+        .map(|c| match c {
+            '\u{2018}' | '\u{2019}' | '\u{201b}' => '\'',
+            '\u{201c}' | '\u{201d}' | '\u{201f}' => '"',
+            '\u{00a0}' | '\u{2007}' | '\u{202f}' => ' ',
+            '\u{2013}' | '\u{2014}' | '\u{2212}' => '-',
+            other => other,
+        })
+        .collect()
+}
+
+/// Find `old` in `content` tolerantly, returning the byte range of the matched
+/// region and whether tolerance was needed.
+///
+/// The exact `content.matches(old)` that used to be the ONLY strategy fails on
+/// drift a model cannot see it introduced — a re-indented block, CRLF, a smart
+/// quote pasted from prose. Each such miss cost two decodes and then escalated
+/// to a whole-file rewrite, which is the most expensive path in the loop.
+fn locate_edit_region(content: &str, old: &str) -> Option<(std::ops::Range<usize>, bool)> {
+    if let Some(start) = content.find(old) {
+        return Some((start..start + old.len(), false));
+    }
+    // Line-wise tolerant match: compare normalized lines, then map the hit back
+    // to real byte offsets so the splice stays byte-exact outside the region.
+    let needle: Vec<String> = old.lines().map(normalize_match_line).collect();
+    if needle.is_empty() {
+        return None;
+    }
+    // (byte_start, byte_end_exclusive_of_newline, normalized)
+    let mut hay: Vec<(usize, usize, String)> = Vec::new();
+    let mut offset = 0usize;
+    for line in content.split_inclusive('\n') {
+        let trimmed = line.strip_suffix('\n').unwrap_or(line);
+        hay.push((
+            offset,
+            offset + trimmed.len(),
+            normalize_match_line(trimmed),
+        ));
+        offset += line.len();
+    }
+    if needle.len() > hay.len() {
+        return None;
+    }
+    let mut hit: Option<std::ops::Range<usize>> = None;
+    for window_start in 0..=(hay.len() - needle.len()) {
+        let matches = needle
+            .iter()
+            .enumerate()
+            .all(|(i, want)| &hay[window_start + i].2 == want);
+        if matches {
+            if hit.is_some() {
+                return None; // ambiguous under tolerance: refuse rather than guess
+            }
+            hit = Some(hay[window_start].0..hay[window_start + needle.len() - 1].1);
+        }
+    }
+    hit.map(|range| (range, true))
+}
+
+/// The region of `content` around `at`, for handing back as ground truth.
+fn region_excerpt(content: &str, at: usize, budget: usize) -> String {
+    let start = content[..at.min(content.len())]
+        .rfind('\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let mut end = (start + budget).min(content.len());
+    while end > start && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    if let Some(last_newline) = content[start..end].rfind('\n') {
+        if last_newline > 0 {
+            end = start + last_newline;
+        }
+    }
+    content[start..end].to_string()
+}
+
+/// Render the changed region with line anchors so the model can see what landed
+/// and anchor its NEXT edit on freshly-rendered text.
+fn changed_region_snippet(updated: &str, at: usize, new_len: usize) -> String {
+    const CONTEXT_LINES: usize = 4;
+    const MAX_SNIPPET_BYTES: usize = 4096;
+    let first_changed = updated[..at.min(updated.len())].lines().count();
+    let last_changed = first_changed
+        + updated[at..(at + new_len).min(updated.len())]
+            .lines()
+            .count();
+    let from = first_changed.saturating_sub(CONTEXT_LINES);
+    let to = last_changed + CONTEXT_LINES;
+    let mut out = String::new();
+    for (index, line) in updated.lines().enumerate() {
+        let number = index + 1;
+        if number <= from || number > to {
+            continue;
+        }
+        if out.len() >= MAX_SNIPPET_BYTES {
+            out.push_str("…\n");
+            break;
+        }
+        out.push_str(&format!("{number}{LINE_ANCHOR}{line}\n"));
+    }
+    out
+}
+
+fn edit_file(
+    path: &Path,
+    old: &str,
+    new: &str,
+    display_path: &str,
+    replace_all: bool,
+) -> ToolOutcome {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
-        Err(e) => return ToolOutcome::Err(format!("read failed: {e}")),
+        Err(e) => return ToolOutcome::Err(read_failure_message(path, &e)),
     };
-    let count = content.matches(old).count();
-    if count == 0 {
-        return ToolOutcome::Err("`old` text not found in file".into());
-    }
-    if count > 1 {
+    let exact = content.matches(old).count();
+    if exact > 1 && !replace_all {
         return ToolOutcome::Err(format!(
-            "`old` text is not unique ({count} occurrences); include more context"
+            "`old` text is not unique ({exact} occurrences); include more surrounding context to \
+             pick one, or set replace_all:true to change every occurrence"
         ));
     }
-    let updated = content.replacen(old, new, 1);
+    if exact > 1 {
+        let updated = content.replace(old, new);
+        return match std::fs::write(path, &updated) {
+            Ok(()) => ToolOutcome::Ok(format!(
+                "edited {display_path} ({exact} occurrences replaced)"
+            )),
+            Err(e) => ToolOutcome::Err(format!("write failed: {e}")),
+        };
+    }
+    let Some((range, needed_tolerance)) = locate_edit_region(&content, old) else {
+        // Hand back GROUND TRUTH instead of a bare "not found". The model
+        // reconstructed `old` from an earlier read and got whitespace or a
+        // quote character wrong; without the real bytes its retry is another
+        // guess, and two guesses escalate to a full-file rewrite.
+        let anchor = old
+            .lines()
+            .map(normalize_match_line)
+            .find(|line| !line.is_empty())
+            .and_then(|line| {
+                content
+                    .split_inclusive('\n')
+                    .scan(0usize, |offset, raw| {
+                        let start = *offset;
+                        *offset += raw.len();
+                        Some((start, raw))
+                    })
+                    .find(|(_, raw)| normalize_match_line(raw.trim_end_matches('\n')) == line)
+                    .map(|(start, _)| start)
+            });
+        let excerpt = match anchor {
+            Some(at) => format!(
+                "The closest matching region currently reads:\n{}",
+                region_excerpt(&content, at, 800)
+            ),
+            None => format!(
+                "The file currently begins:\n{}",
+                region_excerpt(&content, 0, 800)
+            ),
+        };
+        return ToolOutcome::Err(format!(
+            "`old` text not found in {display_path}, even allowing for indentation, line endings, \
+             and quote-style differences. Match the text below EXACTLY as shown.\n{excerpt}"
+        ));
+    };
+    let mut updated = String::with_capacity(content.len() + new.len());
+    updated.push_str(&content[..range.start]);
+    updated.push_str(new);
+    updated.push_str(&content[range.end..]);
     match std::fs::write(path, &updated) {
-        Ok(()) => ToolOutcome::Ok(format!("edited {display_path}")),
+        Ok(()) => {
+            let mut message = format!("edited {display_path}");
+            if needed_tolerance {
+                message
+                    .push_str(" (matched allowing for indentation/line-ending/quote differences)");
+            }
+            let snippet = changed_region_snippet(&updated, range.start, new.len());
+            if !snippet.is_empty() {
+                message.push_str(&format!(
+                    "\nThe file now reads (no need to re-read it):\n{snippet}"
+                ));
+            }
+            ToolOutcome::Ok(message)
+        }
         Err(e) => ToolOutcome::Err(format!("write failed: {e}")),
     }
 }
@@ -3239,17 +3513,22 @@ fn clip(s: &str) -> String {
     if extended_shell_capture() {
         return clip_head_tail(s);
     }
+    // Strip terminal control sequences BEFORE measuring: a colorized `cargo` or
+    // `npm` log spends a large share of its bytes on escapes that carry no
+    // meaning for the model, and charging them against the budget evicts real
+    // output. Cheap no-op on plain text.
+    let stripped = strip_ansi(s);
+    let s: &str = &stripped;
     if s.len() <= MAX_OUTPUT_BYTES {
         s.trim_end().to_string()
     } else {
-        // Truncate on a UTF-8 char boundary: slicing raw bytes at a fixed offset
-        // panics when a multibyte char straddles the cut (e.g. a 3-byte char that
-        // begins at byte 16383). Walk back to the nearest boundary first.
-        let mut end = MAX_OUTPUT_BYTES;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}\n…[truncated]", &s[..end])
+        // KEEP THE TAIL. Build and test runners put the thing the model needs —
+        // the failing assertion, the error summary, the exit verdict — at the
+        // END. Head-only truncation handed back 16 KiB of compile banner and
+        // dropped the verdict entirely, so the model's only recovery was to
+        // re-run the whole command piped through `tail`: a wasted decode plus a
+        // full re-execution, and the re-run clipped identically.
+        clip_head_tail_within(s, MAX_OUTPUT_BYTES)
     }
 }
 
@@ -3275,23 +3554,83 @@ fn extended_shell_capture() -> bool {
 }
 
 fn clip_head_tail(s: &str) -> String {
-    if s.len() <= EXTENDED_CAPTURE_HEAD_BYTES + EXTENDED_CAPTURE_TAIL_BYTES {
+    keep_head_and_tail(s, EXTENDED_CAPTURE_HEAD_BYTES, EXTENDED_CAPTURE_TAIL_BYTES)
+}
+
+/// Head+tail clip inside one total budget, weighted toward the tail (3/8 head,
+/// 5/8 tail) because that is where runners put the verdict.
+fn clip_head_tail_within(s: &str, budget: usize) -> String {
+    let head = budget * 3 / 8;
+    keep_head_and_tail(s, head, budget.saturating_sub(head))
+}
+
+fn keep_head_and_tail(s: &str, head_bytes: usize, tail_bytes: usize) -> String {
+    if s.len() <= head_bytes + tail_bytes {
         return s.trim_end().to_string();
     }
-    let mut head_end = EXTENDED_CAPTURE_HEAD_BYTES;
+    let mut head_end = head_bytes;
     while head_end > 0 && !s.is_char_boundary(head_end) {
         head_end -= 1;
     }
-    let mut tail_start = s.len() - EXTENDED_CAPTURE_TAIL_BYTES;
+    let mut tail_start = s.len() - tail_bytes;
     while tail_start < s.len() && !s.is_char_boundary(tail_start) {
         tail_start += 1;
+    }
+    // Defensive: a pathological boundary walk must never invert the window.
+    if tail_start <= head_end {
+        return s[..head_end].trim_end().to_string();
     }
     format!(
         "{}\n…[{} bytes omitted]…\n{}",
         &s[..head_end],
         tail_start - head_end,
-        &s[tail_start..]
+        s[tail_start..].trim_end()
     )
+}
+
+/// Remove ANSI/CSI escape sequences (colors, cursor moves, OSC titles).
+///
+/// Returns the input untouched when there is no ESC at all, so plain output
+/// pays a single scan and no allocation.
+fn strip_ansi(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains('\u{1b}') {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            // CSI: consume params/intermediates up to the final byte @..~
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            // OSC: runs until BEL or ST (ESC \)
+            Some(']') => {
+                while let Some(c) = chars.next() {
+                    if c == '\u{7}' {
+                        break;
+                    }
+                    if c == '\u{1b}' {
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                        }
+                        break;
+                    }
+                }
+            }
+            // Two-character escape (or a trailing lone ESC): already consumed.
+            _ => {}
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 fn first_line(s: &str) -> String {
@@ -3489,8 +3828,8 @@ mod tests {
         )
         .unwrap()
         .execute(&sb);
-        assert!(read.text().contains("2: two"));
-        assert!(read.text().contains("3: three"));
+        assert!(read.text().contains(&format!("2{LINE_ANCHOR}two")));
+        assert!(read.text().contains(&format!("3{LINE_ANCHOR}three")));
         assert!(read.text().contains("continue at start_line=4"));
 
         let list = validate(
@@ -4142,6 +4481,178 @@ mod tests {
         assert!(matches!(out, ToolOutcome::Ok(ref s) if s.contains("marker.txt")));
     }
 
+    /// Tool schemas ride in EVERY request on this lane, so their size is paid
+    /// once per step forever — and on the context-paging lane they are mandatory
+    /// content that evicts real source pages when they grow.
+    ///
+    /// This is the guard for that. Growing the schemas is allowed; doing it
+    /// ACCIDENTALLY is not. If this fails, either earn the tokens back elsewhere
+    /// or raise the ceiling deliberately, in the same commit as the description
+    /// that needed the room.
+    #[test]
+    fn tool_schemas_stay_within_their_token_budget() {
+        // ~4 chars/token is the conservative estimator this repo uses elsewhere.
+        const CEILING_TOKENS: usize = 1_200;
+        let specs = specs_for(ToolProfile::WebCode, false, ShellSandbox::Sandboxed);
+        let rendered: usize = specs
+            .iter()
+            .map(|spec| spec.name.len() + spec.description.len() + spec.params.to_string().len())
+            .sum();
+        let estimated = rendered / 4;
+        assert!(
+            estimated <= CEILING_TOKENS,
+            "WebCode tool schemas grew to ~{estimated} tokens ({rendered} chars), over the \
+             {CEILING_TOKENS}-token ceiling. They are sent on every request and are mandatory \
+             capsule content; trim a description or raise this ceiling on purpose."
+        );
+    }
+
+    /// A 4B reconstructs the needle from an earlier read and gets indentation,
+    /// line endings, or a quote character wrong far more often than it gets the
+    /// INTENT wrong. Exact-match-only turned each of those into a failed edit,
+    /// and two failures escalated to a full-file rewrite — the most expensive
+    /// path in the loop. The ladder must absorb that drift.
+    #[test]
+    fn edit_file_absorbs_indentation_line_ending_and_quote_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let edit = |body: &str, old: &str, new: &str| {
+            let f = dir.path().join("t.rs");
+            std::fs::write(&f, body).unwrap();
+            let out = edit_file(&f, old, new, "t.rs", false);
+            (out, std::fs::read_to_string(&f).unwrap())
+        };
+
+        // Indentation drift: model sent 2 spaces, file has 4.
+        let (out, after) = edit(
+            "fn a() {\n    let x = 1;\n}\n",
+            "  let x = 1;",
+            "    let x = 2;",
+        );
+        assert!(!out.is_err(), "{}", out.text());
+        assert!(after.contains("let x = 2;"), "{after}");
+
+        // CRLF file, LF needle.
+        let (out, after) = edit("a\r\ntarget\r\nb\r\n", "target", "changed");
+        assert!(!out.is_err(), "{}", out.text());
+        assert!(after.contains("changed"), "{after}");
+
+        // Smart quotes in the needle, straight quotes in the file.
+        let (out, after) = edit(
+            "let s = \"hi\";\n",
+            "let s = \u{201c}hi\u{201d};",
+            "let s = \"bye\";",
+        );
+        assert!(!out.is_err(), "{}", out.text());
+        assert!(after.contains("bye"), "{after}");
+
+        // A genuine miss still fails — but hands back GROUND TRUTH so the retry
+        // is informed instead of another guess.
+        let (out, after) = edit("alpha\nbeta\n", "gamma", "delta");
+        assert!(out.is_err());
+        assert!(
+            out.text().contains("alpha") || out.text().contains("beta"),
+            "must return the real file text: {}",
+            out.text()
+        );
+        assert_eq!(
+            after, "alpha\nbeta\n",
+            "a failed edit must not modify the file"
+        );
+    }
+
+    /// Renaming an identifier across N sites cost N decodes, each needing a
+    /// unique anchor the model is bad at inventing. One flag, one decode.
+    #[test]
+    fn edit_file_replace_all_changes_every_occurrence_and_is_named_in_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("m.rs");
+        std::fs::write(&f, "let a = old_name;\nlet b = old_name;\n").unwrap();
+
+        // Without the flag the ambiguity error must NAME the flag as the fix.
+        let refused = edit_file(&f, "old_name", "new_name", "m.rs", false);
+        assert!(refused.is_err());
+        assert!(refused.text().contains("replace_all"), "{}", refused.text());
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            "let a = old_name;\nlet b = old_name;\n",
+            "the refusal must not have edited anything"
+        );
+
+        let done = edit_file(&f, "old_name", "new_name", "m.rs", true);
+        assert!(!done.is_err(), "{}", done.text());
+        assert!(
+            done.text().contains('2'),
+            "reports the count: {}",
+            done.text()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            "let a = new_name;\nlet b = new_name;\n"
+        );
+    }
+
+    /// A wrong path guess cost a bare OS error, a list_dir, and a retry.
+    #[test]
+    fn a_missing_path_suggests_similar_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), "x").unwrap();
+        let missing = dir.path().join("confg.toml");
+        let error = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
+        let message = read_failure_message(&missing, &error);
+        assert!(message.contains("config.toml"), "{message}");
+        assert!(message.contains("workspace root"), "{message}");
+        // A non-NotFound error stays terse — no directory scan, no noise.
+        let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        assert!(!read_failure_message(&missing, &denied).contains("Similar"));
+    }
+
+    /// Build and test runners print the verdict — the failing assertion, the
+    /// error summary — at the END. A head-only clip dropped exactly that and
+    /// left the model to re-run the whole command piped through `tail`.
+    #[test]
+    fn shell_clipping_keeps_the_tail_where_the_verdict_is() {
+        let banner = "compiling crate\n".repeat(4000); // ~64 KiB, over budget
+        let log = format!("{banner}error[E0425]: cannot find value `x`\ntest result: FAILED");
+        assert!(log.len() > MAX_OUTPUT_BYTES);
+        let clipped = clip(&log);
+        assert!(
+            clipped.contains("test result: FAILED"),
+            "the verdict at the tail must survive"
+        );
+        assert!(
+            clipped.contains("error[E0425]"),
+            "the failing diagnostic must survive"
+        );
+        assert!(
+            clipped.contains("bytes omitted"),
+            "the cut must be disclosed"
+        );
+        assert!(
+            clipped.len() <= MAX_OUTPUT_BYTES + 128,
+            "still within budget, got {}",
+            clipped.len()
+        );
+        // Short output is untouched.
+        assert_eq!(clip("all good"), "all good");
+    }
+
+    /// Escape bytes carry no meaning for the model; charging them against the
+    /// byte budget evicts real output on colorized cargo/npm logs.
+    #[test]
+    fn ansi_escapes_are_stripped_before_the_budget_is_charged() {
+        let colored = "\u{1b}[1m\u{1b}[31merror\u{1b}[0m: boom\n";
+        assert_eq!(clip(colored), "error: boom");
+        // OSC title sequence terminated by BEL.
+        assert_eq!(clip("\u{1b}]0;title\u{7}hello"), "hello");
+        // Plain text is returned unchanged (and borrows, not allocates).
+        assert!(matches!(
+            strip_ansi("plain"),
+            std::borrow::Cow::Borrowed("plain")
+        ));
+        // A multibyte char adjacent to an escape must not panic or corrupt.
+        assert_eq!(clip("\u{1b}[32m✓ ok\u{1b}[0m"), "✓ ok");
+    }
+
     /// A bare non-zero exit makes a small model retry the identical command and
     /// burn a whole decode pass. Every failure class we know about must name the
     /// next action instead — and a SUCCESS must never carry a hint.
@@ -4352,7 +4863,18 @@ mod tests {
         )
         .unwrap()
         .execute(&sb);
-        assert_eq!(edited.text(), "edited note.txt");
+        // The result now echoes the changed region so the model never spends a
+        // round trip re-reading to confirm the write landed.
+        assert!(
+            edited.text().starts_with("edited note.txt"),
+            "{}",
+            edited.text()
+        );
+        assert!(
+            edited.text().contains(&format!("1{LINE_ANCHOR}done")),
+            "{}",
+            edited.text()
+        );
     }
 
     #[test]
@@ -4520,7 +5042,10 @@ mod tests {
         s.push('—');
         s.push_str(&"b".repeat(64));
         let out = clip(&s); // must not panic
-        assert!(out.ends_with("…[truncated]"));
+                            // Tail-inclusive now: the cut is disclosed mid-string and the LAST
+                            // bytes (where a runner puts its verdict) survive.
+        assert!(out.contains("bytes omitted"), "{out:.120}");
+        assert!(out.ends_with('b'), "the tail must be kept");
     }
 
     #[test]
