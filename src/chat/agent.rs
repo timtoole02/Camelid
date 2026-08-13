@@ -1775,10 +1775,18 @@ pub fn run_loop(
                                     outcome: outcome.clone(),
                                 });
                                 if outcome.is_err() {
-                                    semantic_contract_findings.push(format!(
-                                        "Python syntax validation failed for {relative}: {}",
-                                        outcome.text()
-                                    ));
+                                    if python_check_blames_the_file(outcome.text()) {
+                                        semantic_contract_findings.push(format!(
+                                            "Python syntax validation failed for {relative}: {}",
+                                            outcome.text()
+                                        ));
+                                    } else {
+                                        // Disclose the gap instead of inventing a defect.
+                                        reporter.notice(&format!(
+                                            "host syntax check for {relative} did not complete; \
+                                             treating the file as unverified rather than failed"
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -3067,6 +3075,29 @@ fn workspace_changes_since(root: &Path, since: std::time::SystemTime) -> Option<
         }
     }
     changed.then_some(paths)
+}
+
+/// Does a failed host syntax check actually blame the FILE?
+///
+/// The auto `py -m py_compile` probe borrows the caller's shell timeout, so on a
+/// loaded machine it can fail for reasons that say nothing about the source: a
+/// timeout, a spawn failure, a missing launcher. Recording those as "Python
+/// syntax validation failed" sends the model off to rewrite code that is already
+/// correct, and — because `semantic_contract_findings` is sticky — re-arms the
+/// completion gate on a finding it can never re-derive, so the turn ends
+/// `Repeated` instead of `Answered`. That is exactly the shape of the flake seen
+/// on the Windows CI leg, where the same commit passed and failed on two runs.
+///
+/// Mirrors the discrimination the alias/traceback check further down already
+/// applies. Deliberately NOT `#[cfg(windows)]` even though its only caller is,
+/// so the rule stays testable on every host — hence the allow, which is the
+/// repo's usual shape for a Windows-only helper that CI still clippies on
+/// Linux and macOS.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn python_check_blames_the_file(text: &str) -> bool {
+    text.contains("SyntaxError")
+        || text.contains("IndentationError")
+        || text.contains("Traceback (most recent call last)")
 }
 
 /// Everything outside `<think>…</think>`, trimmed.
@@ -6506,6 +6537,46 @@ mod tests {
             })
             .expect("the grace summary must be committed to the transcript");
         assert!(summary.contains("a.txt"), "got {summary:?}");
+    }
+
+    /// A host-tooling failure must never be reported to the model as a defect in
+    /// its source. The auto `py -m py_compile` probe borrows the caller's shell
+    /// timeout, so on a loaded machine it can time out or fail to spawn — and
+    /// recording that as "Python syntax validation failed" both lies to the model
+    /// and permanently re-arms the sticky completion gate, ending the turn
+    /// `Repeated`. This is the flake that made the Windows CI leg pass and fail
+    /// on the same commit.
+    #[test]
+    fn only_a_real_python_diagnostic_counts_as_a_source_finding() {
+        // Real interpreter diagnostics: the file IS at fault.
+        assert!(python_check_blames_the_file(
+            "exit: 1\nstderr:\n  File \"game.py\", line 1\n    def broken(:\nSyntaxError: invalid syntax"
+        ));
+        assert!(python_check_blames_the_file(
+            "IndentationError: unexpected indent"
+        ));
+        assert!(python_check_blames_the_file(
+            "Traceback (most recent call last):\n  File \"x.py\", line 2"
+        ));
+        // Host failures: the file is UNVERIFIED, not broken.
+        assert!(
+            !python_check_blames_the_file("command timed out after 5s"),
+            "a timeout says nothing about the source"
+        );
+        assert!(
+            !python_check_blames_the_file("wait failed: No such file or directory"),
+            "a spawn failure says nothing about the source"
+        );
+        assert!(
+            !python_check_blames_the_file(
+                "Python was not found; run without arguments to install from the Microsoft Store"
+            ),
+            "a missing launcher says nothing about the source"
+        );
+        assert!(
+            !python_check_blames_the_file("command cancelled by user stop"),
+            "a user Stop says nothing about the source"
+        );
     }
 
     /// Reasoning is real work. A step that emits only `<think>` used to be
