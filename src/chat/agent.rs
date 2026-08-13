@@ -7899,9 +7899,54 @@ mod tests {
             .any(|result| result.contains("SyntaxError")));
     }
 
+    /// Is `python` on THIS host the Windows Store alias stub?
+    ///
+    /// The stub exits non-zero and prints "Python was not found … Microsoft
+    /// Store" instead of a version. Keyed on that observed behavior rather than
+    /// on whether Python is installed anywhere: the alias can coexist with a
+    /// real interpreter and merely win PATH order (confirmed on a dev box that
+    /// has Python 3.10 installed while `python` still resolves to the stub), so
+    /// "is Python present" is the wrong question.
+    #[cfg(windows)]
+    fn python_resolves_to_store_alias() -> bool {
+        let Ok(output) = std::process::Command::new("cmd")
+            .args(["/C", "python --version"])
+            .output()
+        else {
+            return false;
+        };
+        if output.status.success() {
+            return false;
+        }
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        text.contains("Python was not found") && text.contains("Microsoft Store")
+    }
+
+    /// Exercises the Store-alias recovery ladder against a REAL `python
+    /// --version`, so it only means anything on a host where that command
+    /// actually hits the alias stub.
+    ///
+    /// GitHub's `windows-latest` runner ships a working Python, so `python
+    /// --version` succeeds there, no alias failure is ever produced, and the
+    /// assertions below cannot hold — the job failed on every run regardless of
+    /// the code under test. Self-skip instead, the same way the Metal tests
+    /// skip when no device is present: a test whose premise the host does not
+    /// satisfy must not report failure.
     #[cfg(windows)]
     #[test]
     fn windows_store_alias_failure_requires_py_launcher_probe() {
+        if !python_resolves_to_store_alias() {
+            eprintln!(
+                "SKIP windows_store_alias_failure_requires_py_launcher_probe: `python` does \
+                 not resolve to the Windows Store alias stub on this host, so the failure \
+                 this test recovers from cannot be produced here"
+            );
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
         let mut driver = MockDriver {
