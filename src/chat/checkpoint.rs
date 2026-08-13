@@ -112,8 +112,18 @@ fn canonical_rel(sandbox: &Sandbox, target: &Path) -> Option<(PathBuf, String)> 
 /// A flattened path safe as a single filename component on every platform:
 /// anything outside [A-Za-z0-9._-] becomes '_' (colons would be NTFS stream
 /// syntax; separators would be directories).
+///
+/// BOUNDED: NTFS caps one component at 255 UTF-16 units, and the `\\?\`
+/// verbatim prefix lifts only MAX_PATH, not that cap — so a deep rel path
+/// made both the prepare backup and the undo park copies fail SILENTLY: the
+/// file then had no checkpoint at all, and a forced undo overwrote user edits
+/// with no parked copy, breaking the documented "destroys nothing
+/// irrecoverably" promise. Long names keep a recognizable tail plus a hash of
+/// the full path for uniqueness (two deep paths sharing a tail must not
+/// clobber each other's blobs).
 fn flat_name(rel: &str) -> String {
-    rel.chars()
+    let flat: String = rel
+        .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
                 c
@@ -121,7 +131,18 @@ fn flat_name(rel: &str) -> String {
                 '_'
             }
         })
-        .collect()
+        .collect();
+    const MAX_FLAT_CHARS: usize = 120;
+    if flat.chars().count() <= MAX_FLAT_CHARS {
+        return flat;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    rel.hash(&mut hasher);
+    let digest = hasher.finish();
+    let tail_start = flat.chars().count() - MAX_FLAT_CHARS;
+    let tail: String = flat.chars().skip(tail_start).collect();
+    format!("h{digest:016x}_{tail}")
 }
 
 fn log() -> &'static Mutex<Vec<Checkpoint>> {
@@ -382,21 +403,34 @@ pub fn undo(sandbox: &Sandbox, force: bool) -> Result<String, String> {
     // Park what is being overwritten, outside the LIFO log (pushing it onto
     // the log would turn walk-back into a toggle).
     if target.exists() {
-        if let Ok(dir) = sandbox.resolve(DIR, true) {
-            let flat: String = cp
-                .rel
-                .chars()
-                .map(|c| if c == '/' || c == '\\' { '_' } else { c })
-                .collect();
-            // Sequence the park like `prepare` sequences backups: pid alone
-            // made a second undo of the same file overwrite the first park,
-            // destroying the only copy of the intermediate state.
-            static UNDONE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let seq = UNDONE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let _ = std::fs::copy(
+        // Sequence the park like `prepare` sequences backups: pid alone
+        // made a second undo of the same file overwrite the first park,
+        // destroying the only copy of the intermediate state.
+        static UNDONE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = UNDONE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let parked = sandbox.resolve(DIR, true).ok().and_then(|dir| {
+            std::fs::copy(
                 &target,
-                dir.join(format!("undone_{}_{seq:04}_{flat}", std::process::id())),
-            );
+                dir.join(format!(
+                    "undone_{}_{seq:04}_{}",
+                    std::process::id(),
+                    flat_name(&cp.rel)
+                )),
+            )
+            .ok()
+        });
+        // A forced undo is the one path licensed to overwrite USER edits, and
+        // the park is its only recovery copy. If the park failed, refusing is
+        // the only answer that keeps the documented "destroys nothing
+        // irrecoverably" promise; an unforced undo restores agent-written
+        // state that the backup blob already holds, so it may proceed.
+        if force && parked.is_none() {
+            return Err(format!(
+                "undo force refused: parking the current {} failed, so the forced undo \
+                 would overwrite your edits with no recovery copy. Fix the checkpoint \
+                 store (disk space / permissions) and retry",
+                cp.rel
+            ));
         }
     }
 
@@ -454,9 +488,24 @@ pub fn undo(sandbox: &Sandbox, force: bool) -> Result<String, String> {
             }
         }
         None => {
-            // The file did not exist before the agent made it.
-            let _ = std::fs::remove_file(&target);
-            Ok(format!("removed {} (it was newly created)", cp.rel))
+            // The file did not exist before the agent made it. Windows can
+            // refuse this delete where POSIX cannot (a running .exe's image
+            // section, an open handle without FILE_SHARE_DELETE, a read-only
+            // attribute) — swallowing that error reported "removed" while the
+            // file remained, dropped the checkpoint from both stores, and
+            // made the undo unretryable. Surface it instead: the error takes
+            // the retryable arm below, which re-pushes the entry.
+            match std::fs::remove_file(&target) {
+                Ok(()) => Ok(format!("removed {} (it was newly created)", cp.rel)),
+                // Already gone: the undo's goal state holds.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(format!("removed {} (it was newly created)", cp.rel))
+                }
+                Err(e) => Err(format!(
+                    "undo could not remove {} (is it open in another program?): {e}",
+                    cp.rel
+                )),
+            }
         }
     };
     match restore_result {
@@ -651,6 +700,93 @@ pub(crate) mod tests {
 
         undo(&sandbox, false).unwrap();
         assert!(!f.exists(), "a newly created file should be removed");
+        clear();
+    }
+
+    /// A denied delete must surface as a retryable failure, not report
+    /// "removed" while the file remains — that dropped the checkpoint from
+    /// both stores and made the undo unretryable. The reliable Windows denial
+    /// is an open handle WITHOUT FILE_SHARE_DELETE (a file open in another
+    /// program, a running .exe's image section); std's own opens always grant
+    /// share-delete, and remove_file clears the read-only attribute itself.
+    #[cfg(windows)]
+    #[test]
+    fn undo_of_undeletable_created_file_fails_retryable() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x1;
+        let _g = cp_lock();
+        clear();
+        let d = tempfile::tempdir().unwrap();
+        let sandbox = sb(d.path());
+        let f = d.path().join("locked.txt");
+
+        let pending = prepare(&sandbox, &f, "write_file"); // does not exist yet
+        std::fs::write(&f, "created by the agent").unwrap();
+        finish(pending, true);
+        let hold = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ) // no FILE_SHARE_DELETE
+            .open(&f)
+            .unwrap();
+
+        let error = undo(&sandbox, false).expect_err("a denied delete must not report success");
+        assert!(error.contains("could not remove"), "{error}");
+        assert!(f.exists(), "the file must survive the failed undo");
+
+        // Retryable: release the handle and the SAME checkpoint undoes.
+        drop(hold);
+        let message = undo(&sandbox, false).expect("retry must succeed");
+        assert!(message.contains("removed"), "{message}");
+        assert!(!f.exists());
+        clear();
+    }
+
+    /// Deep rel paths must still get checkpoints and parks: the flattened
+    /// component is bounded under the NTFS 255-unit cap, keeps a recognizable
+    /// tail, and stays unique across paths sharing that tail.
+    #[test]
+    fn flat_name_bounds_deep_paths_within_one_component() {
+        let deep_a = format!("{}{}", "alpha/".repeat(60), "module.py");
+        let deep_b = format!("{}{}", "omega/".repeat(60), "module.py");
+        let a = flat_name(&deep_a);
+        let b = flat_name(&deep_b);
+        assert!(a.chars().count() < 160, "component must fit NTFS: {a}");
+        assert!(a.ends_with("module.py"), "tail must stay recognizable: {a}");
+        assert_ne!(a, b, "different paths must not share a blob name");
+        assert_eq!(
+            flat_name("src/lib.rs"),
+            "src_lib.rs",
+            "short names must be untouched"
+        );
+    }
+
+    /// End-to-end at the depth that used to fail silently: prepare + undo of a
+    /// file whose rel path flattens past the old unbounded component.
+    #[test]
+    fn undo_restores_a_deeply_nested_file() {
+        let _g = cp_lock();
+        clear();
+        let d = tempfile::tempdir().unwrap();
+        let sandbox = sb(d.path());
+        let mut nested = d.path().to_path_buf();
+        for _ in 0..30 {
+            nested = nested.join("deepdir");
+        }
+        std::fs::create_dir_all(&nested).unwrap();
+        let f = nested.join("target.txt");
+        let original = "original nested content\n";
+        std::fs::write(&f, original).unwrap();
+
+        let pending = prepare(&sandbox, &f, "edit_file");
+        std::fs::write(&f, "agent replacement\n").unwrap();
+        finish(pending, true);
+
+        undo(&sandbox, false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            original,
+            "the deep file must restore byte-identical (its backup blob must exist)"
+        );
         clear();
     }
 
