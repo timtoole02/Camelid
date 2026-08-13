@@ -1485,10 +1485,7 @@ pub(crate) fn tool_name_is_unrecoverable(raw: &str) -> bool {
         return true;
     }
     // Echoed JSON/markup fragments rather than an identifier.
-    trimmed.len() > 48
-        || trimmed.contains('{')
-        || trimmed.contains('}')
-        || trimmed.contains('\n')
+    trimmed.len() > 48 || trimmed.contains('{') || trimmed.contains('}') || trimmed.contains('\n')
 }
 
 pub fn validate_for(
@@ -2553,7 +2550,9 @@ fn shell_failure_hint(stdout: &str, stderr: &str) -> Option<&'static str> {
         );
     }
     if has("file exists") {
-        return Some("the target already exists. Read it first, then edit_file rather than recreating it");
+        return Some(
+            "the target already exists. Read it first, then edit_file rather than recreating it",
+        );
     }
     // --- network (the sandbox denies egress; the shell reports it as DNS failure) ---
     if has("could not resolve host")
@@ -4145,8 +4144,11 @@ mod tests {
     /// next action instead — and a SUCCESS must never carry a hint.
     #[test]
     fn failed_shell_results_carry_one_actionable_hint() {
-        assert!(shell_failure_hint("", "").is_none(), "no hint without a known class");
-        let sandbox_hint = shell_failure_hint("", "touch: /Users/x: Operation not permitted")
+        assert!(
+            shell_failure_hint("", "").is_none(),
+            "no hint without a known class"
+        );
+        let sandbox_hint = shell_failure_hint("", "touch: /etc/probe: Operation not permitted")
             .expect("sandbox denial must hint");
         assert!(sandbox_hint.contains("sandbox"), "{sandbox_hint}");
         assert!(
@@ -4247,7 +4249,10 @@ mod tests {
         );
         match out {
             ToolOutcome::Err(ref message) => {
-                assert!(message.contains("cancelled"), "unexpected message: {message}");
+                assert!(
+                    message.contains("cancelled"),
+                    "unexpected message: {message}"
+                );
             }
             other => panic!("expected a cancelled error, got {other:?}"),
         }

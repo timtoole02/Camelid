@@ -391,8 +391,7 @@ pub fn undo(sandbox: &Sandbox, force: bool) -> Result<String, String> {
             // Sequence the park like `prepare` sequences backups: pid alone
             // made a second undo of the same file overwrite the first park,
             // destroying the only copy of the intermediate state.
-            static UNDONE_SEQ: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
+            static UNDONE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let seq = UNDONE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let _ = std::fs::copy(
                 &target,
@@ -704,7 +703,10 @@ pub(crate) mod tests {
         // Restore permissions before asserting so a failure still cleans up.
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        assert!(result.is_err(), "an unwritable target must fail the restore");
+        assert!(
+            result.is_err(),
+            "an unwritable target must fail the restore"
+        );
         assert_eq!(
             std::fs::read_to_string(&f).unwrap(),
             "v2",
@@ -745,9 +747,7 @@ pub(crate) mod tests {
         // The whole line is untrusted and dropped — NOT surfaced with a null
         // backup, which would make undo "delete victim.txt" (None = never
         // existed). A benign line alongside it still loads.
-        let benign_backup = sandbox
-            .root()
-            .join(".camelid/checkpoints/1234_0000_ok.txt");
+        let benign_backup = sandbox.root().join(".camelid/checkpoints/1234_0000_ok.txt");
         std::fs::write(&benign_backup, "prior").unwrap();
         let benign = serde_json::json!({
             "id": "1234-0",

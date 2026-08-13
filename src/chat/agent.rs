@@ -1553,7 +1553,9 @@ pub fn run_loop(
                     history.push(AgentMsg::System(resume));
                     continue;
                 }
-                if cfg.tool_profile.is_workspace() && looks_like_unparsed_tool && !capped_not_malformed
+                if cfg.tool_profile.is_workspace()
+                    && looks_like_unparsed_tool
+                    && !capped_not_malformed
                 {
                     if malformed_tool_reprompts < MALFORMED_TOOL_REPROMPT_LIMIT {
                         malformed_tool_reprompts += 1;
@@ -3007,10 +3009,7 @@ fn workspace_request_requires_change(history: &[AgentMsg]) -> bool {
 /// contract stays as strict as before. `.camelid/` is the agent's own
 /// bookkeeping (checkpoints, subagent results) and is skipped, or every turn
 /// would count as a workspace change.
-fn workspace_changes_since(
-    root: &Path,
-    since: std::time::SystemTime,
-) -> Option<Vec<String>> {
+fn workspace_changes_since(root: &Path, since: std::time::SystemTime) -> Option<Vec<String>> {
     const MAX_CHANGE_SCAN_ENTRIES: usize = 50_000;
     const MAX_CHANGED_PATHS_REPORTED: usize = 8;
     // HFS+ (this user's external T7, where real checkouts live) stores mtimes at
@@ -6450,7 +6449,9 @@ mod tests {
                         json!({"path": "a.txt"}),
                     )]))
                 } else {
-                    Ok(ModelStep::Text("I inspected a.txt but did not finish.".into()))
+                    Ok(ModelStep::Text(
+                        "I inspected a.txt but did not finish.".into(),
+                    ))
                 }
             }
         }
