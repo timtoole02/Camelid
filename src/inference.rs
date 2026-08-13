@@ -3300,20 +3300,49 @@ impl LlamaInferenceSession {
                 v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
             })
             .unwrap_or_else(|| !slot.engine.prefers_batched_prefill());
+        // TURN-TO-TURN CONTINUATION. An agent step re-sends the whole
+        // conversation, so consecutive prompts share everything but the newest
+        // message — yet every request used to prefill from position 0, which on
+        // this lane is ~50ms/token and made a 2,000-token history cost ~100s of
+        // dead time BEFORE the model could emit its first token.
+        //
+        // A KV row is a pure function of the token prefix that produced it, so
+        // rows the engine already holds for an identical prefix are already the
+        // rows this prompt needs. Skipping them is not an approximation and
+        // needs no host mirror (which is why the existing prompt-prefix cache is
+        // bypassed on this lane: reseeding GPU KV from f16 host history is NOT
+        // bit-identical to a fresh prefill). Recomputing them would reproduce
+        // the same values with the same kernels in the same order.
+        //
+        // The last shared token is always recomputed so the prefill still ends
+        // by writing position n-1, which is the state the decode lane expects.
+        let reuse = slot.engine.resident_prefix_len(token_ids).min(n - 1);
+        if reuse > 0 {
+            slot.engine.set_filled(reuse);
+        }
         let prefill_result = if serial_prefill {
             slot.engine
-                .prefill(&embeddings.data, &tables.cos, &tables.sin, n, scale)
+                .prefill(&embeddings.data, &tables.cos, &tables.sin, n, scale, reuse)
         } else {
             slot.engine
-                .prefill_batched(&embeddings.data, &tables.cos, &tables.sin, n, scale)
+                .prefill_batched(&embeddings.data, &tables.cos, &tables.sin, n, scale, reuse)
         };
         if prefill_result.is_err() {
             // A partial prefill leaves the GPU KV inconsistent; mark unfilled so the
             // decode path rebuilds/reseeds rather than trusting it.
             slot.engine.set_filled(0);
+            slot.engine.set_resident_tokens(&[]);
             return Ok(false);
         }
         slot.engine.set_filled(n);
+        slot.engine.set_resident_tokens(token_ids);
+        if trace && reuse > 0 {
+            eprintln!(
+                "[resident-cuda] prefix continuation: reused {reuse} of {n} positions, \
+                 prefilled {}",
+                n - reuse
+            );
+        }
         // The GPU prefill only fills the GPU KV cache. Copy it back so the CPU-side
         // KV cache is authoritative too: otherwise any later forward that takes the
         // CPU path (dense diagnostics, a GPU-decode fallback, or a KV rollback) reads

@@ -2895,6 +2895,7 @@ fn prefill_then_decode_matches_sequential() {
         &sin_all[..(n - 1) * half],
         n - 1,
         scale,
+        0,
     )
     .unwrap();
     let pre_logits = pre
@@ -2938,6 +2939,7 @@ fn prefill_then_decode_matches_sequential() {
         &sin_all[..(n - 1) * half],
         n - 1,
         scale,
+        0,
     )
     .unwrap();
     let preb_logits = preb
@@ -2958,6 +2960,75 @@ fn prefill_then_decode_matches_sequential() {
         close(&preb_logits, &pre_logits, 1e-4),
         "batched prefill logits diverged from serial prefill logits"
     );
+
+    // TURN-TO-TURN CONTINUATION: prefilling only the divergent SUFFIX over KV a
+    // previous prefill already built must land on BIT-IDENTICAL logits. This is
+    // the property that lets an agent step skip re-prefilling its whole history,
+    // and it is only sound because a KV row is a pure function of its token
+    // prefix — so it gets a bitwise assertion, not a tolerance.
+    let reuse = (n - 1) / 2;
+    let mut cont = build_engine(&layers, &final_norm, &output_w);
+    cont.prefill(
+        &flat_emb,
+        &cos_all[..(n - 1) * half],
+        &sin_all[..(n - 1) * half],
+        reuse,
+        scale,
+        0,
+    )
+    .unwrap();
+    cont.set_filled(reuse);
+    // Second turn: same prompt, but only [reuse, n-1) is actually computed.
+    cont.prefill(
+        &flat_emb,
+        &cos_all[..(n - 1) * half],
+        &sin_all[..(n - 1) * half],
+        n - 1,
+        scale,
+        reuse,
+    )
+    .unwrap();
+    cont.set_filled(n - 1);
+    let cont_logits = cont
+        .forward_token_logits(
+            &embeddings[n - 1],
+            &cos_all[(n - 1) * half..n * half],
+            &sin_all[(n - 1) * half..n * half],
+            n - 1,
+            scale,
+        )
+        .unwrap();
+    assert_same_bits(
+        "prefix-continuation vs full serial prefill",
+        &cont_logits,
+        &pre_logits,
+    );
+}
+
+/// The reuse length must never exceed what the engine can vouch for: the
+/// recorded token sequence AND the filled watermark. A rewind, a decode past
+/// the recorded prompt, or a foreign sequence all have to shrink it — claiming
+/// a row the engine cannot account for would skip prefilling KV that does not
+/// hold these tokens, which is silently wrong output rather than a slow path.
+#[test]
+fn resident_prefix_len_is_bounded_by_the_recorded_sequence() {
+    use super::resident_prefix_len as prefix;
+    let resident = [10u32, 11, 12, 13];
+    assert_eq!(prefix(&resident, 4, &[10, 11, 12, 13, 14]), 4);
+    assert_eq!(prefix(&resident, 4, &[10, 11, 99, 13]), 2);
+    assert_eq!(prefix(&resident, 4, &[7, 11]), 0);
+    // A shorter prompt cannot claim more than it contains.
+    assert_eq!(prefix(&resident, 4, &[10, 11]), 2);
+    // A rewind lowers the watermark, so reuse shrinks with it even though the
+    // recorded sequence still matches.
+    assert_eq!(prefix(&resident, 2, &[10, 11, 12, 13]), 2);
+    assert_eq!(prefix(&resident, 0, &[10, 11, 12, 13]), 0);
+    // Decode advanced `filled` past the recorded prompt: the extra rows hold
+    // generated tokens, so the claim stays at the recorded length.
+    assert_eq!(prefix(&resident, 99, &[10, 11, 12, 13, 14, 15]), 4);
+    // A different sequence shares nothing.
+    assert_eq!(prefix(&[20, 21, 22], 3, &[10, 11, 12]), 0);
+    assert_eq!(prefix(&[], 0, &[10, 11]), 0);
 }
 
 // Deterministic LCG so the tests need no rand dependency.

@@ -3648,11 +3648,25 @@ impl RunnableModel {
             }
             if engine.prefers_batched_prefill() {
                 engine
-                    .prefill_batched(&embeddings, &cos_all, &sin_all, prior_inputs.len(), scale)
+                    .prefill_batched(
+                        &embeddings,
+                        &cos_all,
+                        &sin_all,
+                        prior_inputs.len(),
+                        scale,
+                        0,
+                    )
                     .map_err(BackendError::InvalidTensorData)?;
             } else {
                 engine
-                    .prefill(&embeddings, &cos_all, &sin_all, prior_inputs.len(), scale)
+                    .prefill(
+                        &embeddings,
+                        &cos_all,
+                        &sin_all,
+                        prior_inputs.len(),
+                        scale,
+                        0,
+                    )
                     .map_err(BackendError::InvalidTensorData)?;
             }
         }
@@ -3957,11 +3971,25 @@ impl RunnableModel {
             }
             if engine.prefers_batched_prefill() {
                 engine
-                    .prefill_batched(&embeddings, &cos_all, &sin_all, prior_prompt.len(), scale)
+                    .prefill_batched(
+                        &embeddings,
+                        &cos_all,
+                        &sin_all,
+                        prior_prompt.len(),
+                        scale,
+                        0,
+                    )
                     .map_err(BackendError::InvalidTensorData)?;
             } else {
                 engine
-                    .prefill(&embeddings, &cos_all, &sin_all, prior_prompt.len(), scale)
+                    .prefill(
+                        &embeddings,
+                        &cos_all,
+                        &sin_all,
+                        prior_prompt.len(),
+                        scale,
+                        0,
+                    )
                     .map_err(BackendError::InvalidTensorData)?;
             }
         }
@@ -6442,7 +6470,7 @@ mod gpu_ssm_layer_tests {
 
         engine.reset_qwen35_state().unwrap();
         engine
-            .prefill(&embeddings, &cos_all, &sin_all, prior.len(), scale)
+            .prefill(&embeddings, &cos_all, &sin_all, prior.len(), scale, 0)
             .expect("serial prefill");
         let serial = engine
             .forward_token_logits(&last_embedding, &last_cos, &last_sin, prior.len(), scale)
@@ -6450,7 +6478,7 @@ mod gpu_ssm_layer_tests {
 
         engine.reset_qwen35_state().unwrap();
         engine
-            .prefill_batched(&embeddings, &cos_all, &sin_all, prior.len(), scale)
+            .prefill_batched(&embeddings, &cos_all, &sin_all, prior.len(), scale, 0)
             .expect("batched prefill");
         let batched = engine
             .forward_token_logits(&last_embedding, &last_cos, &last_sin, prior.len(), scale)

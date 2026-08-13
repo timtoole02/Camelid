@@ -8268,6 +8268,25 @@ fn kquant_narrow_is_crowded(cols: usize, k_tokens: usize, aux_lanes: usize) -> b
     ((SHARED_BUDGET - stage) / per_warp.max(1)) < 8
 }
 
+/// Leading positions of `tokens` whose KV a previous prefill already built.
+///
+/// Bounded by BOTH the recorded sequence and the `filled` watermark: a decode
+/// can advance `filled` past the recorded prompt (those rows hold generated
+/// tokens this function cannot vouch for), and a rewind can drop `filled` below
+/// it. Claiming a row the engine cannot account for would skip a prefill of KV
+/// that does not hold these tokens — silently wrong output, not a slow path —
+/// so the bound is deliberately the pessimistic one.
+///
+/// Split out of the engine so the bookkeeping is testable without a GPU.
+fn resident_prefix_len(resident: &[u32], filled: usize, tokens: &[u32]) -> usize {
+    let limit = resident.len().min(filled).min(tokens.len());
+    let mut shared = 0usize;
+    while shared < limit && resident[shared] == tokens[shared] {
+        shared += 1;
+    }
+    shared
+}
+
 /// Warps per block for the wide K-quant GEMM.
 const KQUANT_WIDE_WARPS: u32 = 8;
 
@@ -8308,16 +8327,29 @@ fn kquant_wide_rows_per_warp(k_tokens: u32, acc_lanes: u32) -> u32 {
         .unwrap_or(1)
 }
 
-/// Widest chunk the wide K-quant GEMM can run at full warp occupancy while
-/// still affording enough rows per warp to keep staging amortized.
+/// Widest chunk the wide K-quant GEMM can run at full warp occupancy.
+///
+/// Bounded by shared memory only. An earlier version also demanded enough rows
+/// per warp to keep staging amortized, but that requirement belonged to the
+/// rows-per-warp theory the measurements refuted (see
+/// `kquant_wide_rows_per_warp`): with rows back at 1 it silently collapsed the
+/// chunk to 3 tokens, which is the opposite of the point.
 pub(crate) fn kquant_wide_token_cap(acc_lanes: u32, _min_warps: u32, requested: u32) -> u32 {
     const SHARED_BUDGET: u32 = 46 * 1024;
+    // An SM86 SM offers 100 KiB of shared memory, so the per-block shared
+    // footprint decides how many blocks it can host. Fitting the 46 KiB launch
+    // budget is necessary but NOT sufficient: k=64 fits and still leaves only
+    // two blocks per SM, and starving occupancy is precisely what made the
+    // rows-per-warp experiment slower than the kernel it replaced. Keep at
+    // least four.
+    const SM_SHARED_BYTES: u32 = 100 * 1024;
+    const MIN_BLOCKS_PER_SM: u32 = 4;
     (1..=requested.max(1))
         .rev()
         .find(|&k| {
             let rows = kquant_wide_rows_per_warp(k, acc_lanes);
-            rows >= (k / 2).max(1)
-                && kquant_wide_shared_bytes(k, KQUANT_WIDE_WARPS, rows, acc_lanes) <= SHARED_BUDGET
+            let bytes = kquant_wide_shared_bytes(k, KQUANT_WIDE_WARPS, rows, acc_lanes);
+            bytes <= SHARED_BUDGET && SM_SHARED_BYTES / bytes.max(1) >= MIN_BLOCKS_PER_SM
         })
         .unwrap_or(1)
 }
@@ -10196,6 +10228,19 @@ pub struct CudaResidentDecode {
     /// Number of KV positions materialized on the GPU (so the driver knows
     /// whether the session needs (re)seeding from the CPU history).
     filled: usize,
+    /// The prompt tokens whose KV currently occupies rows `[0, len)`.
+    ///
+    /// This is what makes a turn-to-turn prefill continuation possible: a KV row
+    /// is a pure function of the token prefix that produced it, so if the next
+    /// prompt starts with the same tokens, those rows are ALREADY correct and
+    /// re-running them would recompute identical values. Without this the engine
+    /// knows only HOW MANY rows are filled, never WHICH sequence they belong to,
+    /// so every request had to prefill from position 0.
+    ///
+    /// Safe against a shared process-global engine: whoever prefills last owns
+    /// both the rows and this vector, so a different sequence simply yields a
+    /// short common prefix rather than a wrong reuse.
+    resident_tokens: Vec<u32>,
     // per-token scratch (reused)
     d_hidden: CudaSlice<f32>,
     d_normed: CudaSlice<f32>,
@@ -10761,6 +10806,7 @@ impl CudaResidentDecode {
             cache_k,
             cache_v,
             filled: 0,
+            resident_tokens: Vec::new(),
             d_hidden: alloc_f(hidden)?,
             d_normed: alloc_f(max_in)?,
             d_q: alloc_f(q_width)?,
@@ -11661,6 +11707,25 @@ impl CudaResidentDecode {
 
     pub fn set_filled(&mut self, filled: usize) {
         self.filled = filled;
+        // Never let the token record outlive the rows it describes: a rewind
+        // (speculative reject, error reset) invalidates everything past the new
+        // watermark, and a stale tail would authorize reusing rows that no
+        // longer hold those tokens.
+        if self.resident_tokens.len() > filled {
+            self.resident_tokens.truncate(filled);
+        }
+    }
+
+    /// Record the prompt whose KV now occupies rows `[0, tokens.len())`.
+    pub fn set_resident_tokens(&mut self, tokens: &[u32]) {
+        self.resident_tokens.clear();
+        self.resident_tokens.extend_from_slice(tokens);
+    }
+
+    /// How many leading positions of `tokens` are ALREADY materialized in this
+    /// engine's KV cache and can be skipped by a prefill.
+    pub fn resident_prefix_len(&self, tokens: &[u32]) -> usize {
+        resident_prefix_len(&self.resident_tokens, self.filled, tokens)
     }
 
     /// True when any layer's weights live in host RAM and stream to a GPU scratch buffer
@@ -13894,6 +13959,9 @@ impl CudaResidentDecode {
     /// instead of on the CPU. `embeddings` is `n * hidden` f32; `cos_all`/`sin_all`
     /// are the per-position RoPE tables flattened (`n * rope_dim/2`). Leaves the
     /// GPU KV cache holding positions `0..n`.
+    /// `start` skips positions already materialized by a previous prefill of the
+    /// SAME token prefix (see `resident_prefix_len`); rows `[0, start)` are left
+    /// untouched because recomputing them would reproduce identical KV.
     pub fn prefill(
         &mut self,
         embeddings: &[f32],
@@ -13901,13 +13969,14 @@ impl CudaResidentDecode {
         sin_all: &[f32],
         n: usize,
         scale: f32,
+        start: usize,
     ) -> Result<(), String> {
         let half = self.rope_dim / 2;
         let hidden = self.hidden;
         if embeddings.len() < n * hidden || cos_all.len() < n * half || sin_all.len() < n * half {
             return Err("prefill: input slices too short".into());
         }
-        for i in 0..n {
+        for i in start..n {
             let emb = &embeddings[i * hidden..(i + 1) * hidden];
             let cos = &cos_all[i * half..(i + 1) * half];
             let sin = &sin_all[i * half..(i + 1) * half];
@@ -15510,6 +15579,7 @@ impl CudaResidentDecode {
         sin_all: &[f32],
         n: usize,
         scale: f32,
+        start: usize,
     ) -> Result<(), String> {
         // The batched layer stack reads each layer's VRAM weight slice directly and has
         // no offload-streaming path (unlike forward_pass), so for an offloaded model
@@ -15517,7 +15587,7 @@ impl CudaResidentDecode {
         // serial prefill, which streams offloaded weights correctly. Batching is a
         // resident-only fast path.
         if !self.supports_batched_prefill() {
-            return self.prefill(embeddings, cos_all, sin_all, n, scale);
+            return self.prefill(embeddings, cos_all, sin_all, n, scale, start);
         }
         let map = |e: cudarc::driver::DriverError| format!("cuda prefill: {e}");
         let hidden = self.hidden;
@@ -15529,7 +15599,8 @@ impl CudaResidentDecode {
         self.ensure_prefill_scratch(batch_cap)?;
         let s = self.k.stream.clone();
         let mut sc = self.prefill_scratch.take().expect("allocated above");
-        let mut base = 0usize;
+        // Rows [0, start) already hold this prompt's KV from a previous turn.
+        let mut base = start;
         while base < n {
             let kk = (n - base).min(batch_cap);
             // Stage this chunk's embeddings + RoPE tables into the shared scratch at

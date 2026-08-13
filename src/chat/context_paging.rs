@@ -2827,8 +2827,13 @@ mod tests {
         task.failed_attempts = (0..80)
             .map(|index| format!("large unrelated history {index} {}", "x".repeat(100)))
             .collect();
+        // Deliberately tight so eviction MUST happen and the exact page must
+        // still survive — that is what this test pins. It is not a cap on tool
+        // schema size; `tool_schemas_stay_within_their_token_budget` owns that
+        // invariant, so schema growth fails there (where the message is clear)
+        // instead of surfacing here as an unrelated MandatoryBudget error.
         let config = ContextPagingConfig {
-            max_input_tokens: 1_100,
+            max_input_tokens: 1_500,
             ..ContextPagingConfig::default()
         };
         let mandatory = BTreeSet::from([symbol.clone()]);
