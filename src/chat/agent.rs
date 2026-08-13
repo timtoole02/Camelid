@@ -2793,6 +2793,28 @@ pub fn run_loop(
                         reporter.notice(
                             "python.exe resolved to the Windows Store alias; requiring launcher probe",
                         );
+                        // Paging never replays history, so recovery guidance
+                        // must live in the ledger the next capsule renders —
+                        // otherwise the alias failure masquerades as a source
+                        // defect and the Modify phase demands code changes for
+                        // a missing-interpreter error (observed live: the
+                        // steering below was invisible and the turn died).
+                        if let Some(runtime) = context_paging.as_mut() {
+                            runtime.ledger.current_focus = concat!(
+                                "`python` resolves to the unusable Windows Store alias stub; ",
+                                "that is a host condition, NOT a source defect — do not change ",
+                                "source because of it. Probe the launcher with exactly ",
+                                "`py --version`, then use `py` for every later Python command."
+                            )
+                            .into();
+                            runtime.ledger.failed_attempts.push(
+                                "`python --version` hit the Windows Store alias stub".into(),
+                            );
+                            if let Err(error) = runtime.save() {
+                                reporter.notice(&format!("context paging state error: {error}"));
+                                return LoopEnd::DriverError;
+                            }
+                        }
                         history.push(AgentMsg::System(
                             "That result only proves the Windows `python.exe` Store alias is unusable; it does NOT prove Python is absent. Do not repeat a `python` command, ask the user to install anything, or answer. Your NEXT tool call must be `run_shell` with exactly `py --version`. If it succeeds, use `py` for later checks and persist requested source with write_file."
                                 .into(),
@@ -2803,6 +2825,24 @@ pub fn run_loop(
                         reporter.notice(
                             "delegated work ended without a workspace change; requiring direct parent execution",
                         );
+                        // Same ledger discipline as the branches above — paging
+                        // renders only the capsule, never history.
+                        if let Some(runtime) = context_paging.as_mut() {
+                            runtime.ledger.current_focus = concat!(
+                                "Delegated work ended without a workspace change. Do not ",
+                                "delegate again or wait; complete the change yourself now with ",
+                                "write_file or edit_file, then verify it."
+                            )
+                            .into();
+                            runtime
+                                .ledger
+                                .failed_attempts
+                                .push("a delegated child ended without a workspace change".into());
+                            if let Err(error) = runtime.save() {
+                                reporter.notice(&format!("context paging state error: {error}"));
+                                return LoopEnd::DriverError;
+                            }
+                        }
                         history.push(AgentMsg::System(
                             "The delegated child ended without completing the requested workspace change. Do not answer, spawn another child, or wait again. Complete the task yourself now. Your NEXT tool call must be write_file or edit_file, using the information already available; then verify the result."
                                 .into(),
@@ -2813,6 +2853,28 @@ pub fn run_loop(
                         reporter.notice(&format!(
                             "recovering: `{name}` returned the same result twice; requiring a different action"
                         ));
+                        // The duplicate call is a greedy fixed point: if the
+                        // next capsule renders byte-identical, the model
+                        // repeats forever (observed live — the identical
+                        // `search` looped until the repeat guard killed the
+                        // turn). The ledger write both carries the corrective
+                        // demand and guarantees the capsule differs.
+                        if let Some(runtime) = context_paging.as_mut() {
+                            runtime.ledger.current_focus = format!(
+                                "`{name}` with those arguments is settled — it returned the same \
+                                 result twice. Do NOT call it again with the same arguments; take \
+                                 a different action that advances the task (write or edit the \
+                                 target file if the needed information is already known)."
+                            );
+                            runtime
+                                .ledger
+                                .failed_attempts
+                                .push(format!("`{name}` repeated with an identical result"));
+                            if let Err(error) = runtime.save() {
+                                reporter.notice(&format!("context paging state error: {error}"));
+                                return LoopEnd::DriverError;
+                            }
+                        }
                         history.push(AgentMsg::System(format!(
                             "Runtime loop recovery: `{name}` with those arguments has already returned the same result twice. Treat that observation as settled and DO NOT call it again with the same arguments. Choose a different action that advances the user's request now. If a directory listing established that the workspace is empty and the user asked you to create code, call `write_file` now; do not inspect the empty directory again."
                         )));
@@ -5668,6 +5730,88 @@ mod tests {
         assert!(followup_capsule.contains("<current_diagnostic>"));
         assert!(followup_capsule.contains("\"status\":\"ok\""));
         assert!(followup_capsule.contains("\"rawReference\":\"tool-"));
+    }
+
+    /// A duplicate tool result under paging must CHANGE the next capsule and
+    /// carry the corrective demand. History-only steering is invisible here —
+    /// the driver receives exactly one fresh capsule per step — which let a
+    /// greedy model loop an identical `search` until the repeat guard killed
+    /// the turn (observed live on the Windows dev box). The recover_now ledger
+    /// write pins both properties; its absence fails the contains() asserts.
+    #[test]
+    fn paging_duplicate_tool_result_changes_the_next_capsule() {
+        let _checkpoint_guard = super::super::checkpoint::tests::cp_lock();
+        struct RepeatDriver {
+            capsules: Vec<String>,
+        }
+        impl ModelDriver for RepeatDriver {
+            fn step(
+                &mut self,
+                history: &[AgentMsg],
+                _tools: &[ToolSpec],
+            ) -> Result<ModelStep, String> {
+                let capsule = match history {
+                    [AgentMsg::User(capsule)] => capsule.clone(),
+                    _ => return Err("paging request replayed non-capsule history".into()),
+                };
+                self.capsules.push(capsule);
+                Ok(ModelStep::Calls(vec![tc(
+                    "search",
+                    json!({"pattern": "class Inventory"}),
+                )]))
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("inventory.py"),
+            "class Inventory:\n    def __init__(self):\n        self.items = {}\n",
+        )
+        .unwrap();
+        let sandbox = Sandbox::new(directory.path(), false, Duration::from_secs(5))
+            .unwrap()
+            .with_shell_mode(ShellSandbox::Sandboxed);
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+        let mut driver = RepeatDriver {
+            capsules: Vec::new(),
+        };
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(
+            "Add a low_stock method to the Inventory class in inventory.py".into(),
+        )];
+        let mut config = cfg(directory.path(), false);
+        config.shell_sandbox = ShellSandbox::Sandboxed;
+        config.tool_profile = tools::ToolProfile::WebCode;
+        config.allow_plan = false;
+        config.context_paging = true;
+        let end = run_loop(
+            &mut driver,
+            &mut ScriptApprover(vec![], 0),
+            &mut reporter,
+            &sandbox,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        assert_eq!(end, LoopEnd::Repeated, "notices: {:?}", reporter.notices);
+        let n = driver.capsules.len();
+        assert!(n >= 3, "expected at least three capsules, got {n}");
+        let after_recovery = &driver.capsules[n - 1];
+        let before_recovery = &driver.capsules[n - 2];
+        assert_ne!(
+            after_recovery, before_recovery,
+            "the recovery must change the capsule a greedy model sees"
+        );
+        assert!(
+            after_recovery.contains("is settled"),
+            "the corrective demand must render into the capsule: {after_recovery}"
+        );
+        assert!(
+            after_recovery.contains("repeated with an identical result"),
+            "the failed attempt must render into the capsule: {after_recovery}"
+        );
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
     }
 
     #[test]
