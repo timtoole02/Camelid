@@ -6955,7 +6955,7 @@ fn greedy_sample_rows(logits: &CpuTensor) -> Result<Vec<u32>> {
 
 /// Force every disallowed token's logit to `-inf` (grammar-constrained decoding).
 /// Errors if the mask length does not match the vocab or masks every token.
-fn apply_token_mask(logits: &mut CpuTensor, allowed: &[bool]) -> Result<()> {
+pub(crate) fn apply_token_mask(logits: &mut CpuTensor, allowed: &[bool]) -> Result<()> {
     if allowed.len() != logits.data.len() {
         return Err(BackendError::RuntimeShapeMismatch(format!(
             "grammar mask length {} does not match vocabulary size {}",

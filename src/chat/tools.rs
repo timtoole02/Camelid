@@ -206,15 +206,32 @@ impl ToolOutcome {
 
     pub fn clipped(self, max_bytes: usize) -> Self {
         let clip_text = |text: String| {
-            const MARKER: &str = "\n...[truncated for Workspace]";
             if text.len() <= max_bytes {
                 return text;
             }
-            let mut end = max_bytes.saturating_sub(MARKER.len());
+            // ANCHOR THE CUT. A bare "[truncated]" leaves a small model two
+            // moves: reissue the identical call (the repeat guard then ends the
+            // run) or give up — both dead 10-20s decodes. Reporting where the
+            // cut fell, and the exact continuation, turns that into one targeted
+            // read. The notice is composed first so its own length is inside the
+            // budget and a later clip can never remove it.
+            let total = text.len();
+            // Line count is what read_file's continuation cursor speaks in.
+            let marker = |shown_lines: usize| {
+                format!(
+                    "\n…[showing the first {shown_lines} lines of this result ({total} bytes \
+                     total); continue with read_file start_line={} if this was a file]",
+                    shown_lines + 1
+                )
+            };
+            // Reserve generously: the marker's own digits vary.
+            let reserve = marker(total).len();
+            let mut end = max_bytes.saturating_sub(reserve);
             while end > 0 && !text.is_char_boundary(end) {
                 end -= 1;
             }
-            format!("{}{MARKER}", &text[..end])
+            let head = &text[..end];
+            format!("{head}{}", marker(head.lines().count()))
         };
         match self {
             Self::Ok(text) => Self::Ok(clip_text(text)),
@@ -261,6 +278,9 @@ const MAX_OUTPUT_BYTES: usize = 16 * 1024;
 const MAX_RANGED_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_LIST_ENTRIES: usize = 4_096;
 const MAX_SEARCH_FILES: usize = 5_000;
+/// Longest single search hit handed back. One minified or generated line can
+/// otherwise eat the whole observation budget and evict every other match.
+const MAX_SEARCH_HIT_BYTES: usize = 500;
 const MAX_SEARCH_DURATION: Duration = Duration::from_secs(2);
 const FULL_SEARCH_HITS: u64 = 100;
 const WORKSPACE_SEARCH_HITS: u64 = 20;
@@ -1672,10 +1692,7 @@ pub fn validate_for(
                 path,
                 old: str_arg("old")?,
                 new: str_arg("new")?,
-                replace_all: args
-                    .get("replace_all")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
+                replace_all: lenient_bool(args.get("replace_all")),
             })
         }
         "run_shell" => validate_shell_command(str_arg("command")?),
@@ -1992,6 +2009,19 @@ fn parse_args<T: for<'de> Deserialize<'de>>(args: &Value, name: &str) -> Result<
                     return Ok(parsed);
                 }
             }
+            // Second rung: coerce scalars toward the types the tool's OWN schema
+            // declares ("50" -> 50, "true" -> true) and drop explicit nulls sent
+            // for optional fields. Same argument as the rung above — a
+            // stringified integer is a formatting tic, not a reasoning failure —
+            // and with VALIDATION_REPEAT_LIMIT at 2, two such tics end the run.
+            if let Some(schema) = argument_schema_for(name) {
+                let coerced = coerce_to_schema(args, &schema);
+                if &coerced != args {
+                    if let Ok(parsed) = serde_json::from_value::<T>(coerced) {
+                        return Ok(parsed);
+                    }
+                }
+            }
             // Still wrong: say what was expected. The bare serde message ("invalid
             // type: string ..., expected a sequence") tells the model nothing about
             // the shape it should have sent, so it retries the same malformed call
@@ -2031,11 +2061,131 @@ fn unwrap_json_string_fields(args: &Value) -> Option<Value> {
 
 /// The argument shape a tool advertises, as a compact hint for an error message.
 /// Read from the same schema the model was given, so the two cannot drift.
+/// A boolean argument that tolerates the string and integer spellings a small
+/// model produces. `validate_for` reads a few flags straight off the raw args
+/// rather than through `parse_args`, so schema coercion never sees them.
+fn lenient_bool(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::Bool(flag)) => *flag,
+        Some(Value::String(text)) => {
+            matches!(
+                text.trim().to_ascii_lowercase().as_str(),
+                "true" | "yes" | "1"
+            )
+        }
+        Some(Value::Number(number)) => number.as_i64() == Some(1),
+        _ => false,
+    }
+}
+
 fn argument_schema_hint(name: &str) -> Option<String> {
     let spec = specs(true, shell_sandbox::ShellSandbox::Sandboxed)
         .into_iter()
         .find(|spec| spec.name == name)?;
     serde_json::to_string(&spec.params).ok()
+}
+
+/// The tool's declared JSON Schema, for coercion (the hint above renders the
+/// same value for humans).
+fn argument_schema_for(name: &str) -> Option<Value> {
+    specs(true, shell_sandbox::ShellSandbox::Sandboxed)
+        .into_iter()
+        .find(|spec| spec.name == name)
+        .map(|spec| spec.params)
+}
+
+/// Nudge scalars toward the types the schema declares, and drop explicit nulls
+/// sent for fields the schema does not require.
+///
+/// Deliberately conservative: it only rewrites a value when the declared type
+/// says what the value should have been, never invents a field, and never
+/// touches a value that already type-checks. Anything it cannot confidently
+/// convert is left exactly as the model sent it, so the caller still reports the
+/// original error.
+fn coerce_to_schema(value: &Value, schema: &Value) -> Value {
+    let declared = schema.get("type").and_then(Value::as_str);
+    match declared {
+        Some("object") => {
+            let Some(map) = value.as_object() else {
+                return value.clone();
+            };
+            let properties = schema.get("properties").and_then(Value::as_object);
+            let required: Vec<&str> = schema
+                .get("required")
+                .and_then(Value::as_array)
+                .map(|items| items.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            let mut out = serde_json::Map::new();
+            for (key, child) in map {
+                // An explicit null for an optional field is the model saying
+                // "not applicable"; serde reads it as a type error.
+                if child.is_null() && !required.contains(&key.as_str()) {
+                    continue;
+                }
+                match properties.and_then(|properties| properties.get(key)) {
+                    Some(child_schema) => {
+                        out.insert(key.clone(), coerce_to_schema(child, child_schema));
+                    }
+                    None => {
+                        out.insert(key.clone(), child.clone());
+                    }
+                }
+            }
+            Value::Object(out)
+        }
+        Some("array") => {
+            let Some(items) = value.as_array() else {
+                return value.clone();
+            };
+            match schema.get("items") {
+                Some(item_schema) => Value::Array(
+                    items
+                        .iter()
+                        .map(|item| coerce_to_schema(item, item_schema))
+                        .collect(),
+                ),
+                None => value.clone(),
+            }
+        }
+        Some("integer") | Some("number") => match value {
+            Value::String(text) => {
+                let trimmed = text.trim();
+                if let Ok(parsed) = trimmed.parse::<i64>() {
+                    return Value::from(parsed);
+                }
+                if declared == Some("number") {
+                    if let Ok(parsed) = trimmed.parse::<f64>() {
+                        if let Some(number) = serde_json::Number::from_f64(parsed) {
+                            return Value::Number(number);
+                        }
+                    }
+                }
+                value.clone()
+            }
+            Value::Bool(_) => value.clone(),
+            _ => value.clone(),
+        },
+        Some("boolean") => match value {
+            Value::String(text) => match text.trim().to_ascii_lowercase().as_str() {
+                "true" | "yes" | "1" => Value::Bool(true),
+                "false" | "no" | "0" => Value::Bool(false),
+                _ => value.clone(),
+            },
+            Value::Number(number) => match number.as_i64() {
+                Some(0) => Value::Bool(false),
+                Some(1) => Value::Bool(true),
+                _ => value.clone(),
+            },
+            _ => value.clone(),
+        },
+        Some("string") => match value {
+            // A bare number where a string is declared (a path like 2024).
+            Value::Number(number) => Value::String(number.to_string()),
+            Value::Bool(flag) => Value::String(flag.to_string()),
+            _ => value.clone(),
+        },
+        _ => value.clone(),
+    }
 }
 
 // --- execution ------------------------------------------------------------
@@ -2203,13 +2353,24 @@ fn search(
     let mut visited = std::collections::HashSet::new();
     let mut files_scanned = 0usize;
     let started = Instant::now();
-    let mut truncated = false;
+    // WHY the search stopped, not just THAT it did. One flag collapsed three
+    // very different situations into "narrow pattern or path" — advice that is
+    // actively wrong for the hit cap (`limit` is a parameter the model can
+    // raise) and silent about a biased partial sample when a budget ran out.
+    let mut stopped_at_hit_cap = false;
+    let mut stopped_at_file_budget = false;
+    let mut stopped_at_time_budget = false;
     while let Some(dir) = stack.pop() {
-        if hits.len() >= limit
-            || (bounded
-                && (files_scanned >= MAX_SEARCH_FILES || started.elapsed() >= MAX_SEARCH_DURATION))
-        {
-            truncated = true;
+        if hits.len() >= limit {
+            stopped_at_hit_cap = true;
+            break;
+        }
+        if bounded && files_scanned >= MAX_SEARCH_FILES {
+            stopped_at_file_budget = true;
+            break;
+        }
+        if bounded && started.elapsed() >= MAX_SEARCH_DURATION {
+            stopped_at_time_budget = true;
             break;
         }
         let Ok(dir) = std::fs::canonicalize(dir) else {
@@ -2222,12 +2383,16 @@ fn search(
             continue;
         };
         for entry in read.flatten() {
-            if hits.len() >= limit
-                || (bounded
-                    && (files_scanned >= MAX_SEARCH_FILES
-                        || started.elapsed() >= MAX_SEARCH_DURATION))
-            {
-                truncated = true;
+            if hits.len() >= limit {
+                stopped_at_hit_cap = true;
+                break;
+            }
+            if bounded && files_scanned >= MAX_SEARCH_FILES {
+                stopped_at_file_budget = true;
+                break;
+            }
+            if bounded && started.elapsed() >= MAX_SEARCH_DURATION {
+                stopped_at_time_budget = true;
                 break;
             }
             let Ok(path) = std::fs::canonicalize(entry.path()) else {
@@ -2258,9 +2423,21 @@ fn search(
             let text = String::from_utf8_lossy(&bytes);
             for (n, line) in text.lines().enumerate() {
                 if line.to_lowercase().contains(&needle) {
-                    hits.push(format!("{}:{}: {}", sandbox.rel(&path), n + 1, line.trim()));
+                    // Cap each hit: one minified or generated line can otherwise
+                    // consume the whole observation budget and evict every other
+                    // match, which is the opposite of what a search is for.
+                    let mut rendered = line.trim().to_string();
+                    if rendered.len() > MAX_SEARCH_HIT_BYTES {
+                        let mut end = MAX_SEARCH_HIT_BYTES;
+                        while end > 0 && !rendered.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        rendered.truncate(end);
+                        rendered.push('…');
+                    }
+                    hits.push(format!("{}:{}: {rendered}", sandbox.rel(&path), n + 1));
                     if hits.len() >= limit {
-                        truncated = true;
+                        stopped_at_hit_cap = true;
                         break;
                     }
                 }
@@ -2272,8 +2449,22 @@ fn search(
     } else {
         hits.join("\n")
     };
-    if truncated {
-        output.push_str("\n...[search truncated; narrow pattern or path]");
+    if stopped_at_hit_cap {
+        output.push_str(&format!(
+            "\n…[stopped at the {limit}-hit limit; there may be more matches. Raise `limit` \
+             or search a narrower `path` — do NOT narrow the pattern, \
+             that discards real matches]"
+        ));
+    } else if stopped_at_file_budget {
+        output.push_str(&format!(
+            "\n…[stopped after scanning {MAX_SEARCH_FILES} files; these results are a PARTIAL \
+             sample of the tree, not all matches. Search a specific `path` to cover the rest]"
+        ));
+    } else if stopped_at_time_budget {
+        output.push_str(
+            "\n…[stopped at the search time budget; these results are a PARTIAL sample of the \
+             tree, not all matches. Search a specific `path` to cover the rest]",
+        );
     }
     ToolOutcome::Ok(output)
 }
@@ -3746,7 +3937,9 @@ mod tests {
                 clipped.text().len() <= limit,
                 "{profile:?} exceeded its own ceiling"
             );
-            assert!(clipped.text().ends_with("...[truncated for Workspace]"));
+            // The marker must ANCHOR the cut, not merely announce it.
+            assert!(clipped.text().contains("showing the first"), "{profile:?}");
+            assert!(clipped.text().contains("start_line="), "{profile:?}");
         }
         // Generous enough that ordinary coding output is untouched.
         let ordinary = "cargo test output\n".repeat(200);
@@ -3761,7 +3954,8 @@ mod tests {
         text.push('—');
         let clipped = ToolOutcome::Ok(text).clipped(4 * 1024);
         assert!(clipped.text().len() <= 4 * 1024);
-        assert!(clipped.text().ends_with("...[truncated for Workspace]"));
+        assert!(clipped.text().contains("bytes total"));
+        assert!(clipped.text().contains("start_line="));
     }
 
     #[test]
@@ -3848,7 +4042,15 @@ mod tests {
         .unwrap()
         .execute(&sb);
         assert_eq!(search.text().lines().count(), 2);
-        assert!(search.text().contains("search truncated"));
+        // The hit cap is now named as the hit cap, with the correct remedy —
+        // raising `limit` or narrowing the PATH, never narrowing the pattern
+        // (which would silently discard real matches).
+        assert!(search.text().contains("hit limit"), "{}", search.text());
+        assert!(
+            !search.text().contains("narrow pattern or path"),
+            "the old catch-all advice was wrong for this cause: {}",
+            search.text()
+        );
     }
 
     #[test]
@@ -4479,6 +4681,61 @@ mod tests {
         assert_eq!(a.risk(), Risk::Exec);
         let out = a.execute(&sb);
         assert!(matches!(out, ToolOutcome::Ok(ref s) if s.contains("marker.txt")));
+    }
+
+    /// A stringified integer is a formatting tic, not a reasoning failure — and
+    /// with VALIDATION_REPEAT_LIMIT at 2, two of them end the run.
+    #[test]
+    fn tool_arguments_are_coerced_toward_the_declared_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        let sb = sandbox(dir.path());
+
+        // start_line/max_lines declared integer, sent as strings.
+        let action = validate(
+            &call(
+                "read_file",
+                json!({"path":"a.txt","start_line":"2","max_lines":"1"}),
+            ),
+            &sb,
+        )
+        .expect("stringified integers must coerce, not fail the call");
+        let out = action.execute(&sb);
+        assert!(!out.is_err(), "{}", out.text());
+        assert!(out.text().contains("two"), "{}", out.text());
+
+        // An explicit null for an OPTIONAL field means "not applicable".
+        validate(
+            &call("read_file", json!({"path":"a.txt","start_line":null})),
+            &sb,
+        )
+        .expect("an explicit null on an optional field must not fail the call");
+
+        // replace_all declared boolean, sent as a string.
+        std::fs::write(dir.path().join("m.txt"), "x x\n").unwrap();
+        let edit = validate(
+            &call(
+                "edit_file",
+                json!({"path":"m.txt","old":"x","new":"y","replace_all":"true"}),
+            ),
+            &sb,
+        )
+        .expect("a stringified boolean must coerce");
+        assert!(!edit.execute(&sb).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("m.txt")).unwrap(),
+            "y y\n"
+        );
+
+        // Coercion must NOT invent meaning: genuine nonsense still fails.
+        assert!(validate(
+            &call(
+                "read_file",
+                json!({"path":"a.txt","start_line":"not-a-number"})
+            ),
+            &sb,
+        )
+        .is_err());
     }
 
     /// Tool schemas ride in EVERY request on this lane, so their size is paid

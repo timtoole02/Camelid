@@ -389,6 +389,36 @@ const MALFORMED_TOOL_REPROMPT_LIMIT: usize = 2;
 /// Qwen3-class models intermittently emit a `<think>` block and stop without
 /// ever writing the answer or the tool call it just talked itself into.
 const THINKING_ONLY_RESUME_LIMIT: usize = 2;
+/// How many times one model step may be retried after a TRANSIENT failure.
+const MODEL_STEP_RETRY_LIMIT: usize = 2;
+
+/// Is this driver error worth retrying with an identical prompt?
+///
+/// Only failures whose cause is the transport or a momentarily busy server. A
+/// rejected request, a bad template, or a refusal is deterministic — retrying
+/// it burns a decode to fail the same way. Matched on the message because the
+/// driver surfaces errors as strings.
+fn is_transient_model_error(error: &str) -> bool {
+    let lowered = error.to_ascii_lowercase();
+    const TRANSIENT: &[&str] = &[
+        "timed out",
+        "timeout",
+        "connection",
+        "connect",
+        "broken pipe",
+        "reset by peer",
+        "eof",
+        "temporarily",
+        "unavailable",
+        "503",
+        "502",
+        "504",
+        "429",
+        "overloaded",
+        "busy",
+    ];
+    TRANSIENT.iter().any(|needle| lowered.contains(needle))
+}
 /// Catch a model that evades the exact-repeat guard by changing arguments while
 /// receiving the same failure. This mirrors OpenClaw's narrow tail-churn rule:
 /// same tool, at least two variants, stable error result.
@@ -1193,11 +1223,32 @@ pub fn run_loop(
                 budget_tokens,
             ));
         }
-        let mut step = match driver.step(&compiled_history, &step_tools) {
-            Ok(s) => s,
-            Err(e) => {
-                reporter.notice(&format!("model error: {e}"));
-                return LoopEnd::DriverError;
+        // A transport blip must not discard a turn that has already paid for
+        // every prior step. Retry a TRANSIENT failure a bounded number of times:
+        // the retry sends a byte-identical prompt, so it re-uses the prefix
+        // cache and costs almost nothing. A deterministic failure (a rejected
+        // request, a template error) is not retried — it would fail identically.
+        let mut step = {
+            let mut attempt = 0usize;
+            loop {
+                match driver.step(&compiled_history, &step_tools) {
+                    Ok(s) => break s,
+                    Err(e) if attempt < MODEL_STEP_RETRY_LIMIT && is_transient_model_error(&e) => {
+                        attempt += 1;
+                        reporter.notice(&format!(
+                            "model step failed ({e}); retrying ({attempt}/{MODEL_STEP_RETRY_LIMIT})"
+                        ));
+                        if cancel.load(Ordering::Relaxed) {
+                            reporter.notice("aborted");
+                            return LoopEnd::Aborted;
+                        }
+                        std::thread::sleep(Duration::from_millis(250 * attempt as u64));
+                    }
+                    Err(e) => {
+                        reporter.notice(&format!("model error: {e}"));
+                        return LoopEnd::DriverError;
+                    }
+                }
             }
         };
         if let Some(metrics) = driver.take_step_metrics() {
@@ -3454,19 +3505,48 @@ fn compile_history_for_step(history: &[AgentMsg], profile: tools::ToolProfile) -
     let keep_from = tool_groups.last().copied().unwrap_or(history.len());
     let mut compiled = history[..=current_user].to_vec();
     if keep_from > current_user + 1 {
-        let mut evidence = String::from("Earlier tool observations from this turn:\n");
+        // ONE MESSAGE PER OBSERVATION, oldest first — never one rebuilt blob.
+        //
+        // The blob this replaces was regenerated every step and gained a line
+        // each time, and it sat immediately after the user's goal. That put the
+        // divergence point at the FRONT of the turn, so every step re-prefilled
+        // the entire turn and the prompt-prefix cache could never hit on this
+        // lane. Emitting each observation separately keeps every earlier message
+        // byte-identical from one step to the next, so the shared prefix now
+        // runs through all of them and only the newest group differs.
+        //
+        // The budget is spent oldest-first for the same reason: an entry that
+        // has already been sent must keep its exact bytes, so newer entries are
+        // what gets dropped, and the drop marker is a single stable message.
+        const EVIDENCE_BUDGET_BYTES: usize = 1_024;
+        const PER_OBSERVATION_BYTES: usize = 256;
+        let mut spent = 0usize;
+        let mut omitted = 0usize;
         for message in &history[current_user + 1..keep_from] {
-            if let AgentMsg::ToolResult { name, outcome } = message {
-                let line = format!("- {name}: {}\n", outcome.text());
-                if evidence.len().saturating_add(line.len()) > 1_024 {
-                    evidence.push_str("...[older observations omitted]\n");
-                    break;
+            let AgentMsg::ToolResult { name, outcome } = message else {
+                continue;
+            };
+            let text = outcome.text();
+            let mut line = format!("- {name}: {text}");
+            if line.len() > PER_OBSERVATION_BYTES {
+                let mut end = PER_OBSERVATION_BYTES;
+                while end > 0 && !line.is_char_boundary(end) {
+                    end -= 1;
                 }
-                evidence.push_str(&line);
+                line.truncate(end);
+                line.push('…');
             }
+            if spent.saturating_add(line.len()) > EVIDENCE_BUDGET_BYTES {
+                omitted += 1;
+                continue;
+            }
+            spent += line.len();
+            compiled.push(AgentMsg::Memory(line));
         }
-        if evidence.lines().count() > 1 {
-            compiled.push(AgentMsg::Memory(evidence));
+        if omitted > 0 {
+            compiled.push(AgentMsg::Memory(format!(
+                "…[{omitted} more observation(s) from this turn omitted]"
+            )));
         }
     }
     compiled.extend_from_slice(&history[keep_from..]);
@@ -3707,11 +3787,26 @@ fn digest(message: &AgentMsg) -> Option<String> {
         AgentMsg::System(_) | AgentMsg::Memory(_) | AgentMsg::Summary(_) => None,
         AgentMsg::User(text) => Some(format!("- you asked: {}", first_line(text, 120))),
         AgentMsg::Assistant(text) => Some(format!("- you replied: {}", first_line(text, 120))),
+        // Name AND path. "called: read_file" tells a compacted model nothing it
+        // can act on, so the commonest post-compaction waste is re-reading a
+        // file it already read. The path comes from the agent's OWN arguments,
+        // not from tool output, so retaining it is consistent with the
+        // retention rule below (which governs observations, not requests).
         AgentMsg::ToolCalls(calls) => Some(format!(
             "- called: {}",
             calls
                 .iter()
-                .map(|call| call.name.as_str())
+                .map(|call| {
+                    match call
+                        .args
+                        .get("path")
+                        .and_then(|value| value.as_str())
+                        .filter(|path| !path.is_empty())
+                    {
+                        Some(path) => format!("{}({path})", call.name),
+                        None => call.name.clone(),
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         )),
@@ -4011,14 +4106,13 @@ pub fn system_prompt(sandbox: &Sandbox, tools: &[ToolSpec]) -> String {
              from inside the session, so never retry a refused path unchanged.\n",
         );
     }
-    s.push_str("Available tools:\n");
+    // NAME AND RISK ONLY. The full description already ships in the JSON tool
+    // schema on the same request (`tools_to_json`), so listing it here sent
+    // every description twice — pure duplicated tokens in the cache-stable
+    // prefix, on every single step.
+    s.push_str("Available tools (full parameters in the tool schema):\n");
     for t in tools {
-        s.push_str(&format!(
-            "- {} [{}]: {}\n",
-            t.name,
-            t.risk.label(),
-            t.description
-        ));
+        s.push_str(&format!("- {} [{}]\n", t.name, t.risk.label()));
     }
     let scope = if sandbox.fs_unrestricted() {
         "Work across the computer as needed for the goal"
@@ -6175,6 +6269,75 @@ mod tests {
         assert!(!prompt.contains("Available tools:"));
     }
 
+    /// THE prefix-cache property. Consecutive steps of one turn must share the
+    /// longest possible token prefix: the goal AND every earlier observation.
+    ///
+    /// The compiler used to emit one `Memory` blob that was REBUILT and grew by
+    /// a line each step, sitting immediately after the user goal — so the very
+    /// first message after the goal differed every step, the prompt-prefix
+    /// cache could never hit on this lane, and each step re-prefilled the whole
+    /// turn. Prefill dominates wall clock here, so this was the single largest
+    /// avoidable cost in the loop.
+    #[test]
+    fn consecutive_steps_share_every_message_except_the_newest_group() {
+        let observation = |name: &str, text: &str| AgentMsg::ToolResult {
+            name: name.into(),
+            outcome: ToolOutcome::Ok(text.into()),
+        };
+        let mut history = vec![AgentMsg::User("Fix the auth bug.".into())];
+        let profile = tools::ToolProfile::WorkspaceReadOnly;
+
+        // Step 2: one completed exchange behind us.
+        history.push(AgentMsg::ToolCalls(vec![tc(
+            "search",
+            json!({"pattern":"login"}),
+        )]));
+        history.push(observation("search", "src/auth.rs:10"));
+        history.push(AgentMsg::ToolCalls(vec![tc(
+            "read_file",
+            json!({"path":"a.rs"}),
+        )]));
+        history.push(observation("read_file", "fn login() {}"));
+        let step_a = compile_history_for_step(&history, profile);
+
+        // Step 3: another exchange lands.
+        history.push(AgentMsg::ToolCalls(vec![tc(
+            "read_file",
+            json!({"path":"b.rs"}),
+        )]));
+        history.push(observation("read_file", "fn logout() {}"));
+        let step_b = compile_history_for_step(&history, profile);
+
+        let render = |messages: &[AgentMsg]| {
+            messages
+                .iter()
+                .map(|m| match m {
+                    AgentMsg::User(t) | AgentMsg::Memory(t) | AgentMsg::Assistant(t) => t.clone(),
+                    AgentMsg::System(t) => t.clone(),
+                    AgentMsg::ToolCalls(c) => format!("{c:?}"),
+                    AgentMsg::ToolResult { name, outcome } => {
+                        format!("{name}{}", outcome.text())
+                    }
+                    AgentMsg::Summary(t) => t.clone(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let a = render(&step_a);
+        let b = render(&step_b);
+        let shared = a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count();
+
+        // The goal plus the older observation must be byte-identical, so the
+        // divergence point is the newest group — NOT the message after the goal.
+        assert!(
+            shared >= 2,
+            "steps diverge too early: only {shared} leading messages match\nA: {a:#?}\nB: {b:#?}"
+        );
+        assert!(
+            b[..shared].iter().any(|m| m.contains("src/auth.rs:10")),
+            "the older observation must be inside the shared prefix: {b:#?}"
+        );
+    }
+
     #[test]
     fn workspace_history_compiler_keeps_only_latest_native_tool_exchange() {
         let history = vec![
@@ -6356,10 +6519,14 @@ mod tests {
                 .count(),
             6
         );
+        // The clip is now ANCHORED: it reports how much was shown, the total,
+        // and the exact continuation, so a clipped observation is recoverable
+        // instead of a dead end.
         assert!(fitted.iter().any(|message| matches!(
             message,
             AgentMsg::ToolResult { outcome, .. }
-                if outcome.text().contains("truncated for Workspace")
+                if outcome.text().contains("showing the first")
+                    && outcome.text().contains("start_line=")
         )));
     }
 
