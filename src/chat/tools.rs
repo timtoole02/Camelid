@@ -11,7 +11,7 @@
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -270,7 +270,7 @@ const WORKSPACE_SEARCH_HITS: u64 = 20;
 /// budget are unknown here. ~4k tokens, i.e. half an 8192-token budget, so a
 /// single runaway command cannot on its own force a context trim.
 const WEB_CODE_OBSERVATION_LIMIT: usize = 16 * 1024;
-const SEARCH_SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".camelid"];
+pub(crate) const SEARCH_SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".camelid"];
 
 impl Sandbox {
     /// Build a sandbox rooted at `root` (canonicalized). Fails if the root does
@@ -362,9 +362,14 @@ impl Sandbox {
         if self.fs_unrestricted || canon == self.root || canon.starts_with(&self.root) {
             Ok(canon)
         } else {
+            // Lead with the correction, not the escape hatch. `--allow-fs` is a CLI
+            // flag; on the Workspace/Code web surfaces there is no way to pass it, so
+            // naming it first told the model to do something it cannot do and left it
+            // repeating the same refused call until the repeat guard ended the turn.
             Err(format!(
-                "path {raw} escapes the sandbox root {} (pass --allow-fs to let the agent \
-                 read/write anywhere on disk)",
+                "path {raw} escapes the workspace root {}. Retry with a path relative to \
+                 that root — `.` for the root itself, `sub/file.txt` beneath it. Do not \
+                 repeat this call unchanged.",
                 self.root.display()
             ))
         }
@@ -465,21 +470,21 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
     let mut tools = vec![
         ToolSpec {
             name: "read_file".into(),
-            description: "Read a UTF-8 text file within the workspace. Use start_line and \
-                          max_lines for bounded excerpts."
+            description: "Read a UTF-8 text file within the workspace (not cat/head/tail). Use \
+                          start_line and max_lines for bounded excerpts."
                 .into(),
             risk: Risk::Read,
             params: json!({"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"max_lines":{"type":"integer","minimum":1,"maximum":200}},"required":["path"]}),
         },
         ToolSpec {
             name: "list_dir".into(),
-            description: "List a page of directory entry names within the workspace. Use this to discover filenames and file extensions.".into(),
+            description: "List a page of directory entry names within the workspace (not ls/find). Use this to discover filenames and file extensions.".into(),
             risk: Risk::Read,
             params: json!({"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":200}},"required":["path"]}),
         },
         ToolSpec {
             name: "search".into(),
-            description: "Search UTF-8 file contents for a literal substring within the workspace. This does not search filenames and does not accept regex or glob syntax.".into(),
+            description: "Search UTF-8 file contents for a literal substring within the workspace (not grep/rg). Matches contents only - no filenames, regex, or globs.".into(),
             risk: Risk::Read,
             params: json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":profile.search_hit_limit()}},"required":["pattern"]}),
         },
@@ -501,13 +506,16 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
         },
         ToolSpec {
             name: "write_file".into(),
-            description: "Create or overwrite a file within the workspace.".into(),
+            description: "Create or overwrite ONE file in the workspace; for many similar \
+                          files use one run_shell loop."
+                .into(),
             risk: Risk::Write,
             params: json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}),
         },
         ToolSpec {
             name: "edit_file".into(),
-            description: "Replace a unique occurrence of `old` with `new` in a file.".into(),
+            description: "Replace a unique occurrence of `old` with `new` in a file (not sed/awk)."
+                .into(),
             risk: Risk::Write,
             params: json!({"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"}},"required":["path","old","new"]}),
         },
@@ -523,7 +531,8 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
                 "Run a shell command in the workspace and capture its output. Pass a command ",
                 "line, never raw program source: create source with write_file first, then invoke ",
                 "its runtime. Probe a missing runtime before attempting an approval-gated ",
-                "package-manager install."
+                "package-manager install. Prefer the file tools over cat/grep/ls/find/sed; use ",
+                "the shell for builds, tests, git, installs, and bulk repetitive work."
             )
             .into(),
             risk: Risk::Exec,
@@ -565,14 +574,15 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
                 name: "spawn_subagent".into(),
                 description: "Spawn a child agent (subagent) for one independent scoped goal, \
                               then call await_subagent once with the returned runtime id. Do not delegate a small \
-                              single-file task; use write_file/edit_file directly. Exec tier — \
+                              single-file task or bulk mechanical work (one run_shell loop beats \
+                              a subagent); use write_file/edit_file directly. Exec tier — \
                               always gated. The child runs UNATTENDED: unless this session is in \
                               confirmed full-auto it can only READ, so delegate investigation \
                               and make edits yourself from its report."
                     .into(),
                 risk: Risk::Exec,
                 params: json!({"type":"object","properties":{
-                    "subtask_id":{"type":"string","description":"Optional readable alias. Case, spaces, `_`, and `-` are normalized; the runtime generates an id when omitted."},
+                    "subtask_id":{"type":"string","description":"Optional readable alias; normalized; omit to auto-generate."},
                     "goal":{"type":"string","description":"The scoped goal for the subagent"}
                 },"required":["goal"]}),
             });
@@ -1105,6 +1115,13 @@ impl Action {
     }
 
     /// Execute the (already approved) action outside an agent turn.
+    ///
+    /// The live agent loop calls `execute_cancellable` directly; this wrapper's only
+    /// non-test caller is the `#[cfg(windows)]` syscap battery, so on a non-Windows
+    /// lib build it is legitimately unreferenced. Kept rather than cfg'd away because
+    /// the tests exercise it on every platform — but CI runs
+    /// `cargo clippy --all-targets -- -D warnings`, where bare dead_code is fatal.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn execute(&self, sandbox: &Sandbox) -> ToolOutcome {
         static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
         self.execute_cancellable(sandbox, &NEVER_CANCELLED)
@@ -1146,7 +1163,7 @@ impl Action {
                 super::checkpoint::finish(pending, !out.is_err());
                 out
             }
-            Action::RunShell { command } => run_shell(sandbox, command),
+            Action::RunShell { command } => run_shell_cancellable(sandbox, command, cancel),
             Action::HttpFetch { method, url } => http_fetch(sandbox, method, url),
             Action::RunWindowsCommand {
                 workdir,
@@ -1324,17 +1341,189 @@ pub fn validate(call: &ToolCall, sandbox: &Sandbox) -> Result<Action, String> {
     validate_for(ToolProfile::Full, call, sandbox)
 }
 
+/// Every tool name `validate_for` has an arm for. The repair ladder below
+/// fuzzy-matches against the subset the active profile actually advertises.
+const KNOWN_TOOL_NAMES: &[&str] = &[
+    "await_subagent",
+    "check_subagent_status",
+    "edit_file",
+    "http_fetch",
+    "inspect_system",
+    "list_dir",
+    "mouse_click",
+    "mouse_move",
+    "press_keys",
+    "read_file",
+    "run_shell",
+    "run_windows_command",
+    "screenshot",
+    "search",
+    "spawn_subagent",
+    "type_text",
+    "ui_click",
+    "ui_inspect",
+    "update_plan",
+    "web_search",
+    "write_file",
+];
+
+/// Fold the spelling variants small models actually emit onto the canonical
+/// form: `WriteFile`, `write-file`, `Write File`, `write_file_tool`,
+/// `functions.write_file`, and stray quote/tag fragments all become
+/// `write_file`. Pure string work — no allocation beyond the result.
+fn normalize_tool_name(raw: &str) -> String {
+    // Drop a namespace prefix (`functions.write_file`, `tools:write_file`) and
+    // any leaked XML/quote fragments around the name.
+    let trimmed = raw.trim().trim_matches(|c: char| {
+        c == '"' || c == '\'' || c == '`' || c == '<' || c == '>' || c == '/' || c.is_whitespace()
+    });
+    // Skip EMPTY segments: a trailing separator ("write_file." / "write_file:")
+    // otherwise selects "" and defeats an otherwise-certain repair.
+    let trimmed = trimmed
+        .rsplit(['.', ':'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(trimmed);
+    let mut out = String::with_capacity(trimmed.len() + 4);
+    let mut previous_lower_or_digit = false;
+    for character in trimmed.chars() {
+        if character == '-' || character == ' ' {
+            out.push('_');
+            previous_lower_or_digit = false;
+            continue;
+        }
+        if character.is_ascii_uppercase() {
+            // CamelCase -> snake_case, but do not inject a leading underscore.
+            if previous_lower_or_digit {
+                out.push('_');
+            }
+            out.push(character.to_ascii_lowercase());
+            previous_lower_or_digit = false;
+            continue;
+        }
+        previous_lower_or_digit = character.is_ascii_lowercase() || character.is_ascii_digit();
+        out.push(character);
+    }
+    // `write_file_tool` / `write_filetool` -> `write_file`.
+    for suffix in ["_tool", "tool"] {
+        if let Some(stripped) = out.strip_suffix(suffix) {
+            if !stripped.is_empty() && KNOWN_TOOL_NAMES.contains(&stripped.trim_end_matches('_')) {
+                out = stripped.trim_end_matches('_').to_string();
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Levenshtein distance, capped — only used against a ~12-entry name list.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b_chars: Vec<char> = b.chars().collect();
+    let mut previous: Vec<usize> = (0..=b_chars.len()).collect();
+    let mut current = vec![0usize; b_chars.len() + 1];
+    for (i, ca) in a.chars().enumerate() {
+        current[0] = i + 1;
+        for (j, cb) in b_chars.iter().enumerate() {
+            let cost = usize::from(ca != *cb);
+            current[j + 1] = (previous[j] + cost)
+                .min(previous[j + 1] + 1)
+                .min(current[j] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[b_chars.len()]
+}
+
+/// Repair a near-miss tool name to the canonical one this profile advertises.
+///
+/// A small model that emits `WriteFile` knows exactly what it wants; rejecting
+/// it burns a validation strike plus a full local decode pass to re-emit the
+/// same intent. Normalization is exact-match-safe; the fuzzy step is deliberately
+/// tight (distance <= 2 and <= 1/3 of the name) so `read_file` can never be
+/// "repaired" into `edit_file` — a wrong repair would silently run the wrong tool.
+pub(crate) fn repair_tool_name(raw: &str, profile: ToolProfile) -> Option<&'static str> {
+    let normalized = normalize_tool_name(raw);
+    if normalized.is_empty() {
+        return None;
+    }
+    let candidates = || KNOWN_TOOL_NAMES.iter().filter(|name| profile.allows(name));
+    if let Some(exact) = candidates().find(|name| **name == normalized) {
+        return Some(exact);
+    }
+    let mut best: Option<(usize, &'static str)> = None;
+    for candidate in candidates() {
+        let distance = edit_distance(&normalized, candidate);
+        let ceiling = 2.min(candidate.len() / 3);
+        if distance == 0 || distance > ceiling {
+            continue;
+        }
+        if best.is_none_or(|(d, _)| distance < d) {
+            best = Some((distance, candidate));
+        }
+    }
+    // Ambiguity is a wrong-tool hazard: refuse when two candidates tie.
+    if let Some((distance, winner)) = best {
+        let ties = candidates()
+            .filter(|candidate| edit_distance(&normalized, candidate) == distance)
+            .count();
+        if ties == 1 {
+            return Some(winner);
+        }
+    }
+    None
+}
+
+/// A name that carries no recoverable intent — empty, whitespace, or a fragment
+/// of echoed tool-call JSON lifted out of file contents. These get a terse error
+/// with NO tool catalog: repeating the catalog primes the model to emit more of
+/// the same phantom calls.
+pub(crate) fn tool_name_is_unrecoverable(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if !trimmed.contains(|c: char| c.is_ascii_alphabetic()) {
+        return true;
+    }
+    // Echoed JSON/markup fragments rather than an identifier.
+    trimmed.len() > 48
+        || trimmed.contains('{')
+        || trimmed.contains('}')
+        || trimmed.contains('\n')
+}
+
 pub fn validate_for(
     profile: ToolProfile,
     call: &ToolCall,
     sandbox: &Sandbox,
 ) -> Result<Action, String> {
-    if !profile.allows(&call.name) {
+    // Repair before rejecting: a spelling variant of a real tool should execute,
+    // not burn a strike and a decode pass. `repaired` is used for dispatch below.
+    let repaired: Option<&'static str> = if profile.allows(&call.name) {
+        None
+    } else {
+        repair_tool_name(&call.name, profile)
+    };
+    if !profile.allows(&call.name) && repaired.is_none() {
+        if tool_name_is_unrecoverable(&call.name) {
+            // Terse and catalog-free on purpose (anti-priming).
+            return Err(
+                "that was not a tool call. Answer in plain text, or emit one call using an \
+                 advertised tool name."
+                    .to_string(),
+            );
+        }
         return Err(format!(
             "tool `{}` is not available in this agent mode",
             call.name
         ));
     }
+    let call = match repaired {
+        Some(canonical) => &ToolCall {
+            name: canonical.to_string(),
+            args: call.args.clone(),
+        },
+        None => call,
+    };
     let args = &call.args;
     let str_arg = |key: &str| -> Result<String, String> {
         args.get(key)
@@ -2058,7 +2247,13 @@ fn edit_file(path: &Path, old: &str, new: &str, display_path: &str) -> ToolOutco
     }
 }
 
-fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
+/// Shell execution whose wait loop also honors the turn's cancel flag: a
+/// user Stop kills the child within one 50ms poll instead of being ignored for
+/// the rest of the shell timeout (120s on the Web Code lane — the old behavior
+/// left Stop dead for the whole window). Cancellation uses the same
+/// direct-child kill as the timeout path; the documented Unix orphan-descendant
+/// tradeoff is unchanged.
+fn run_shell_cancellable(sandbox: &Sandbox, command: &str, cancel: &AtomicBool) -> ToolOutcome {
     // Platform shell with a timeout: `/bin/sh -c <command>` on Unix, `cmd /C
     // <command>` on Windows. The cwd-pin and OS-level confinement are applied by
     // the shell-sandbox layer (Task 1), which fails closed when the configured
@@ -2169,6 +2364,23 @@ fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
+                if cancel.load(Ordering::Relaxed) {
+                    // User Stop: same teardown as the timeout arm below, taken
+                    // within one poll instead of at the end of the window.
+                    #[cfg(windows)]
+                    if let Some(ref j) = _job {
+                        j.terminate();
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    if let Some(h) = out_reader {
+                        let _ = h.join();
+                    }
+                    if let Some(h) = err_reader {
+                        let _ = h.join();
+                    }
+                    return ToolOutcome::Err("command cancelled by user stop".into());
+                }
                 if std::time::Instant::now() >= deadline {
                     // Windows: tear down the whole tree (W2), then the
                     // direct-child backstop. Terminating the job kills every
@@ -2189,8 +2401,11 @@ fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
                     if let Some(h) = err_reader {
                         let _ = h.join();
                     }
+                    // The hint pass below never sees this early return, so the
+                    // guidance rides the message itself.
                     return ToolOutcome::Err(format!(
-                        "command timed out after {}s",
+                        "command timed out after {}s\n[hint: run a smaller unit of work \
+                         rather than repeating the same long command]",
                         sandbox.shell_timeout.as_secs()
                     ));
                 }
@@ -2221,8 +2436,165 @@ fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
     if status.success() {
         ToolOutcome::Ok(text)
     } else {
+        if let Some(hint) = shell_failure_hint(&stdout, &stderr) {
+            text.push_str(&format!("[hint: {hint}]\n"));
+        }
         ToolOutcome::Err(text)
     }
+}
+
+/// One actionable line appended to a FAILED `run_shell` result, naming the next
+/// action for the most common failure classes.
+///
+/// A bare non-zero exit tells a small model that something went wrong but not
+/// what to do about it, so it typically retries the identical command, burns a
+/// full decode pass (30s+ on a local 4B), and often trips a repeat guard. Each
+/// arm here is a class that costs at least one wasted round trip.
+///
+/// Rules: first match wins, at most ONE hint, and every hint names a concrete
+/// next action rather than restating the error. Ordered most-specific first —
+/// the sandbox arm must precede the generic permission arm, since a Seatbelt
+/// denial also prints "Operation not permitted". Deliberately a plain scan over
+/// a bounded prefix: no regex dependency, and no cost at all on success.
+fn shell_failure_hint(stdout: &str, stderr: &str) -> Option<&'static str> {
+    // Bounded scan of the HEAD AND TAIL of each stream. Head-only missed the
+    // classes that matter most for dev work: cargo/npm print the verdict
+    // ("test result: FAILED", the failing assertion) at the END of the log, so
+    // any suite whose chatter exceeded the budget was classified by incidental
+    // words in its head instead.
+    const SLICE_BYTES: usize = 2048;
+    fn char_floor(s: &str, mut index: usize) -> usize {
+        while index > 0 && !s.is_char_boundary(index) {
+            index -= 1;
+        }
+        index
+    }
+    fn char_ceil(s: &str, mut index: usize) -> usize {
+        while index < s.len() && !s.is_char_boundary(index) {
+            index += 1;
+        }
+        index
+    }
+    let mut combined = String::with_capacity(4 * SLICE_BYTES + 4);
+    for part in [stderr, stdout] {
+        if part.len() <= 2 * SLICE_BYTES {
+            combined.push_str(part);
+        } else {
+            combined.push_str(&part[..char_floor(part, SLICE_BYTES)]);
+            combined.push('\n');
+            combined.push_str(&part[char_ceil(part, part.len() - SLICE_BYTES)..]);
+        }
+        combined.push('\n');
+    }
+    let text = combined.to_ascii_lowercase();
+    let has = |needle: &str| text.contains(needle);
+
+    // --- build/test verdicts FIRST: a failing suite's output can contain any of
+    // the permission/network phrases below inside test names or asserted
+    // strings, and the verdict arms are the more specific classification. ---
+    if has("error[e") || has("could not compile") {
+        return Some(
+            "this is a compile error, not a harness failure. Read the named file at the reported \
+             line, fix the code, then rebuild",
+        );
+    }
+    if has("test result: failed") || has("assertion") && has("failed") {
+        return Some(
+            "a test failed. Read the assertion and the file it names, fix the cause, then re-run \
+             only that test",
+        );
+    }
+    // --- sandbox / permission ---
+    // The Seatbelt denial always prints "operation not permitted"; matching
+    // loose word pairs like sandbox+deny false-fired on test NAMES in suite
+    // output (this repo's own tests contain both words).
+    if has("operation not permitted") {
+        return Some(
+            "the kernel sandbox refused this path or network access. Do NOT retry unchanged — \
+             work inside the workspace root, or use the file tools instead",
+        );
+    }
+    if has("permission denied") {
+        return Some(
+            "permission denied. Check the path is inside the workspace; do not retry the same \
+             command, and do not attempt to change permissions on files you did not create",
+        );
+    }
+    // --- missing interpreters/tools: name the platform-correct alternative ---
+    if has("command not found") || has("no such file or directory") && has("bad interpreter") {
+        if has("python") && !has("python3") {
+            return Some("`python` is not on PATH here; use `python3` instead");
+        }
+        if has("py: command not found") {
+            return Some("the `py` launcher is Windows-only; on this host use `python3`");
+        }
+        if has("pip") && !has("pip3") {
+            return Some("use `python3 -m pip` instead of a bare `pip`");
+        }
+        return Some(
+            "that command is not installed on this host. Probe for an alternative (e.g. \
+             `command -v <tool>`) before assuming an install is needed",
+        );
+    }
+    // --- filesystem ---
+    if has("no such file or directory") {
+        return Some(
+            "a path in the command does not exist. Use list_dir to confirm the real path before \
+             retrying — paths are relative to the workspace root",
+        );
+    }
+    if has("is a directory") {
+        return Some("that path is a directory, not a file. Use list_dir to inspect it");
+    }
+    if has("no space left on device") {
+        return Some(
+            "the disk is full. Do not retry; report this to the user — it is not something the \
+             agent can fix",
+        );
+    }
+    if has("file exists") {
+        return Some("the target already exists. Read it first, then edit_file rather than recreating it");
+    }
+    // --- network (the sandbox denies egress; the shell reports it as DNS failure) ---
+    if has("could not resolve host")
+        || has("temporary failure in name resolution")
+        || has("network is unreachable")
+        || has("connection refused")
+    {
+        return Some(
+            "network access is not available to shell commands here. Do not retry — if the task \
+             needs the network, say so instead of working around it",
+        );
+    }
+    // --- build/test toolchains ---
+    if has("blocking waiting for file lock") || has("waiting for file lock on build directory") {
+        return Some(
+            "another cargo build holds the target-directory lock. Do not retry in a loop — wait \
+             for it, or report the conflict",
+        );
+    }
+    if has("modulenotfounderror") || has("importerror") {
+        return Some(
+            "a Python import failed. Check the module name and whether it needs installing; \
+             package installs cross the approval boundary, so ask rather than assuming",
+        );
+    }
+    if has("syntaxerror") || has("indentationerror") {
+        return Some(
+            "the source file has a syntax error. Read the file at the reported line and fix it \
+             with edit_file before running it again",
+        );
+    }
+    if has("not a git repository") {
+        return Some("this workspace is not a git repository; do not use git commands here");
+    }
+    if has("timed out") {
+        return Some(
+            "the command exceeded its time budget. Run a smaller unit of work rather than \
+             repeating the same long command",
+        );
+    }
+    None
 }
 
 /// Endpoint template for `web_search`. `{query}` is replaced with the
@@ -3204,6 +3576,25 @@ mod tests {
         assert!(err2.contains("escapes") || err2.contains("cannot access"));
     }
 
+    /// A refusal the model cannot act on is how a small model ends up repeating the
+    /// same call until the validation-repeat guard kills the turn. The escape error
+    /// must name the correction, and must NOT advertise `--allow-fs`: that is a CLI
+    /// flag, and the Workspace/Code web surfaces have no way to pass it.
+    #[test]
+    fn sandbox_escape_error_is_actionable_and_names_no_cli_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path());
+        let err = validate(&call("list_dir", json!({"path":"/"})), &sb).unwrap_err();
+        assert!(
+            !err.contains("--allow-fs"),
+            "escape error must not advertise a CLI-only flag: {err}"
+        );
+        assert!(
+            err.contains("relative to"),
+            "escape error must state the correction: {err}"
+        );
+    }
+
     #[test]
     fn fs_unrestricted_allows_writes_outside_the_root() {
         let _cp = super::super::checkpoint::tests::cp_lock();
@@ -3747,6 +4138,120 @@ mod tests {
         assert_eq!(a.risk(), Risk::Exec);
         let out = a.execute(&sb);
         assert!(matches!(out, ToolOutcome::Ok(ref s) if s.contains("marker.txt")));
+    }
+
+    /// A bare non-zero exit makes a small model retry the identical command and
+    /// burn a whole decode pass. Every failure class we know about must name the
+    /// next action instead — and a SUCCESS must never carry a hint.
+    #[test]
+    fn failed_shell_results_carry_one_actionable_hint() {
+        assert!(shell_failure_hint("", "").is_none(), "no hint without a known class");
+        let sandbox_hint = shell_failure_hint("", "touch: /Users/x: Operation not permitted")
+            .expect("sandbox denial must hint");
+        assert!(sandbox_hint.contains("sandbox"), "{sandbox_hint}");
+        assert!(
+            sandbox_hint.to_ascii_lowercase().contains("not retry"),
+            "must tell the model not to retry unchanged: {sandbox_hint}"
+        );
+        // The sandbox arm must win over the generic permission arm: a Seatbelt
+        // denial also prints "not permitted", and the generic advice is wrong for it.
+        let generic = shell_failure_hint("", "cat: f.txt: Permission denied").unwrap();
+        assert!(generic.contains("permission denied"), "{generic}");
+        assert!(!generic.contains("sandbox"), "{generic}");
+        // Platform-correct interpreter advice on macOS.
+        let python = shell_failure_hint("", "sh: python: command not found").unwrap();
+        assert!(python.contains("python3"), "{python}");
+        let py = shell_failure_hint("", "sh: py: command not found").unwrap();
+        assert!(py.contains("python3"), "{py}");
+        // Network is denied by the jail; the shell reports it as a DNS failure.
+        let net = shell_failure_hint("", "curl: (6) Could not resolve host: example.com").unwrap();
+        assert!(net.contains("network"), "{net}");
+        // A compile error is the model's problem, not the harness's.
+        let rustc = shell_failure_hint("", "error[E0425]: cannot find value `x`").unwrap();
+        assert!(rustc.contains("compile error"), "{rustc}");
+        assert!(
+            shell_failure_hint("all good\n", "").is_none(),
+            "clean output must not be hinted"
+        );
+    }
+
+    /// A spelling variant of a real tool should EXECUTE, not burn a validation
+    /// strike plus a full local decode pass to re-emit the same intent — while a
+    /// genuinely different tool must never be silently substituted.
+    #[test]
+    fn tool_name_repair_fixes_variants_but_never_swaps_tools() {
+        let p = ToolProfile::WebCode;
+        for variant in [
+            "WriteFile",
+            "write-file",
+            "Write File",
+            "write_file_tool",
+            "functions.write_file",
+            "  write_file  ",
+        ] {
+            assert_eq!(
+                repair_tool_name(variant, p),
+                Some("write_file"),
+                "variant {variant:?} must repair to write_file"
+            );
+        }
+        assert_eq!(repair_tool_name("ReadFile", p), Some("read_file"));
+        assert_eq!(repair_tool_name("list-dir", p), Some("list_dir"));
+        // NEVER silently swap one real tool for another: read_file and edit_file
+        // are both advertised and close in spelling, so a repair here would run
+        // the wrong tool on the user's files.
+        assert_eq!(
+            repair_tool_name("read_file", p),
+            Some("read_file"),
+            "an exact name must stay itself"
+        );
+        assert_eq!(
+            repair_tool_name("totally_unrelated_name", p),
+            None,
+            "an unrecognizable name must not be force-fitted"
+        );
+        // Profile-scoped: a tool this profile does not advertise is not conjured.
+        assert_eq!(repair_tool_name("screenshot", ToolProfile::WebCode), None);
+    }
+
+    /// Echoed tool-call JSON lifted out of file contents must get a terse,
+    /// catalog-free error: repeating the tool list primes more phantom calls.
+    #[test]
+    fn unrecoverable_tool_names_are_detected_for_anti_priming() {
+        assert!(tool_name_is_unrecoverable(""));
+        assert!(tool_name_is_unrecoverable("   "));
+        assert!(tool_name_is_unrecoverable("{\"name\": \"x\"}"));
+        assert!(tool_name_is_unrecoverable("1234"));
+        assert!(!tool_name_is_unrecoverable("write_file"));
+        assert!(!tool_name_is_unrecoverable("WriteFile"));
+    }
+
+    /// A user Stop must interrupt an in-flight shell command within a poll, not
+    /// be ignored for the whole shell timeout (120s on the Web Code lane). The
+    /// cancel flag is pre-set so the wait loop takes the cancel arm on its first
+    /// iteration; a 30s sleep would hang the test if the flag were not honored.
+    #[cfg(unix)]
+    #[test]
+    fn run_shell_honors_a_preset_cancel_within_the_wait_loop() {
+        use super::ShellSandbox;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path()).with_shell_mode(ShellSandbox::Unrestricted);
+        let cancel = AtomicBool::new(true);
+        let started = std::time::Instant::now();
+        let out = run_shell_cancellable(&sb, "sleep 30", &cancel);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "cancel should return promptly, took {:?}",
+            started.elapsed()
+        );
+        match out {
+            ToolOutcome::Err(ref message) => {
+                assert!(message.contains("cancelled"), "unexpected message: {message}");
+            }
+            other => panic!("expected a cancelled error, got {other:?}"),
+        }
+        let _ = cancel.load(Ordering::Relaxed);
     }
 
     // On Windows the default (sandboxed) mode is enforced natively (cwd-pin +

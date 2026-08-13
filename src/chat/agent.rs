@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::Write;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -385,6 +385,10 @@ const MAX_PLAN_UPDATES_PER_RUN: usize = 2;
 /// replacing the short file instead of burning turns on ever-changing needles.
 const MAX_CONSECUTIVE_EDIT_FAILURES: usize = 2;
 const MALFORMED_TOOL_REPROMPT_LIMIT: usize = 2;
+/// How many times one turn may resume a step that produced only reasoning.
+/// Qwen3-class models intermittently emit a `<think>` block and stop without
+/// ever writing the answer or the tool call it just talked itself into.
+const THINKING_ONLY_RESUME_LIMIT: usize = 2;
 /// Catch a model that evades the exact-repeat guard by changing arguments while
 /// receiving the same failure. This mirrors OpenClaw's narrow tail-churn rule:
 /// same tool, at least two variants, stable error result.
@@ -915,6 +919,7 @@ pub fn run_loop(
     let mut change_reprompts = 0usize;
     let mut verification_reprompts = 0usize;
     let mut malformed_tool_reprompts = 0usize;
+    let mut thinking_only_resumes = 0usize;
     let mut paging_action_rejections = 0usize;
     let mut paging_verification_failures = 0usize;
     let mut paging_nonprogress_steps = 0usize;
@@ -1491,7 +1496,65 @@ pub fn run_loop(
                     || trimmed_text.starts_with("edit_file(")
                     || trimmed_text.starts_with("write_file(")
                     || trimmed_text.starts_with("run_shell(");
-                if cfg.tool_profile.is_workspace() && looks_like_unparsed_tool {
+                // TRUNCATION IS NOT MALFORMED SYNTAX. A large write_file cut off at the
+                // output cap still contains `<tool_call>`, so it used to take the malformed
+                // branch below: it burned one of only two malformed strikes AND handed the
+                // model the wrong correction ("do not hand-write <tool_call> syntax") for a
+                // response whose syntax was fine and merely unfinished. The capped handler
+                // further down gives the correction that actually applies — do less in one
+                // step — so let a capped step fall through to it.
+                let capped_not_malformed = driver.last_step_capped() && !trimmed_text.is_empty();
+                // Thinking-only step: the model reasoned and then stopped without
+                // emitting the answer or the tool call it had just decided on. The
+                // reasoning is real work — throwing it away and re-asking the same
+                // question usually reproduces the same stall.
+                //
+                // Instead, RESUME: hand the model back its own reasoning as context
+                // and ask only for the conclusion. Because the system prompt and
+                // history are unchanged and the reasoning is appended, the next
+                // request's token prefix is a strict extension of the one just
+                // served, so it lands on the prompt-prefix cache and the re-prefill
+                // is nearly free — the local-inference equivalent of continuing from
+                // the KV cache instead of paying a cold prompt again.
+                //
+                // Ordered after the capped check so a `<think>` block cut off at the
+                // output cap keeps the cap handling (which shrinks the unit of work);
+                // resuming a capped step would just refill the same cap.
+                if !capped_not_malformed
+                    && !looks_like_unparsed_tool
+                    && visible_text_outside_thinking(&text).is_none()
+                    && thinking_only_resumes < THINKING_ONLY_RESUME_LIMIT
+                {
+                    thinking_only_resumes += 1;
+                    completed_steps = completed_steps.saturating_sub(1);
+                    reporter.notice(
+                        "the model produced only reasoning; resuming from it instead of re-asking",
+                    );
+                    // Carry the reasoning INSIDE the correction rather than as a
+                    // trailing Assistant message: several chat templates treat a
+                    // final assistant turn as "continue this message", which
+                    // suppresses the generation prompt and derails the reply.
+                    // The prompt prefix still strictly extends, so the request
+                    // stays on the prompt cache either way.
+                    let mut resume = String::from(
+                        "Your last reply contained only reasoning and no answer or tool \
+                         call, so nothing was executed.",
+                    );
+                    if !trimmed_text.is_empty() {
+                        resume.push_str(" Your reasoning so far:\n");
+                        resume.push_str(trimmed_text);
+                        resume.push('\n');
+                    }
+                    resume.push_str(
+                        "Do not repeat the reasoning. Emit ONLY the next concrete step \
+                         now: either exactly one tool call, or the final answer in plain \
+                         text.",
+                    );
+                    history.push(AgentMsg::System(resume));
+                    continue;
+                }
+                if cfg.tool_profile.is_workspace() && looks_like_unparsed_tool && !capped_not_malformed
+                {
                     if malformed_tool_reprompts < MALFORMED_TOOL_REPROMPT_LIMIT {
                         malformed_tool_reprompts += 1;
                         completed_steps = completed_steps.saturating_sub(1);
@@ -1967,15 +2030,23 @@ pub fn run_loop(
                         continue;
                     }
                 }
+                let mut deferred_calls = 0usize;
                 if cfg.tool_profile.is_workspace()
                     && calls.len() > MAX_WORKSPACE_TOOL_CALLS_PER_STEP
                 {
+                    // An eager model emitting one big batch is doing what we asked —
+                    // punishing it with a dead turn (`LoopEnd::DriverError`, the old
+                    // behavior) turned its best step into its last. Clamp instead:
+                    // run the first page, tell the model how many were deferred, and
+                    // let the next step continue from where the page ended.
+                    deferred_calls = calls.len() - MAX_WORKSPACE_TOOL_CALLS_PER_STEP;
+                    calls.truncate(MAX_WORKSPACE_TOOL_CALLS_PER_STEP);
                     reporter.notice(&format!(
-                        "model emitted {} tool calls in one step; Workspace allows at most {}",
-                        calls.len(),
-                        MAX_WORKSPACE_TOOL_CALLS_PER_STEP
+                        "model emitted {} tool calls in one step; running the first {} and deferring {}",
+                        MAX_WORKSPACE_TOOL_CALLS_PER_STEP + deferred_calls,
+                        MAX_WORKSPACE_TOOL_CALLS_PER_STEP,
+                        deferred_calls
                     ));
-                    return LoopEnd::DriverError;
                 }
                 if cfg.tool_profile.is_workspace()
                     && total_tool_calls.saturating_add(calls.len())
@@ -1985,6 +2056,7 @@ pub fn run_loop(
                         "stopping: Workspace turn reached its {}-tool-call resource ceiling",
                         MAX_WORKSPACE_TOOL_CALLS_PER_RUN
                     ));
+                    budget_exhaustion_grace_answer(driver, reporter, history, cancel);
                     return LoopEnd::Repeated;
                 }
                 total_tool_calls = total_tool_calls.saturating_add(calls.len());
@@ -2059,6 +2131,12 @@ pub fn run_loop(
                     }
                     // Validate against schema + sandbox. A bad/unknown/escape call
                     // becomes a tool-error result the model can recover from.
+                    // `mut` is load-bearing only on Windows, where
+                    // `normalize_verified_windows_python` rewrites the action in place.
+                    // Everywhere else the binding is never mutated, and the repo's CI gate
+                    // is `cargo clippy --all-targets -- -D warnings`, so the bare `mut`
+                    // failed the macOS and Linux legs outright.
+                    #[cfg_attr(not(windows), allow(unused_mut))]
                     let mut action = match tools::validate_for(cfg.tool_profile, &call, sandbox) {
                         Ok(a) => a,
                         Err(e) => {
@@ -2172,6 +2250,10 @@ pub fn run_loop(
                         ApprovalTier::Deny => Decision::No,
                     };
 
+                    // Captured immediately before execution (after any approval
+                    // wait) so the run_shell change-scan below compares against
+                    // the tightest honest window.
+                    let action_started_at = std::time::SystemTime::now();
                     let outcome = match decision {
                         Decision::Abort => {
                             reporter.notice("aborted by user");
@@ -2242,6 +2324,31 @@ pub fn run_loop(
                     {
                         workspace_changed = true;
                         pending_verification_paths.insert("<child-created file>".into());
+                    }
+                    // run_shell writes bypass checkpoints, so a turn that did its
+                    // work through one shell loop (exactly what the tool guidance
+                    // steers bulk work toward) used to fail the completion
+                    // contract forever: "Code has not changed a workspace file"
+                    // reprompts against work that IS done. Count a successful
+                    // shell command as the change it made, verified against the
+                    // filesystem (bounded scan, fail-closed) — never against the
+                    // model's claim. The scan reports the actual changed paths so
+                    // the semantic post-change capture reads real files, exactly
+                    // as it does for write_file/edit_file.
+                    if require_workspace_change
+                        && !workspace_changed
+                        && !outcome.is_err()
+                        && matches!(&action, Action::RunShell { .. })
+                    {
+                        if let Some(shell_changed_paths) =
+                            workspace_changes_since(sandbox.root(), action_started_at)
+                        {
+                            workspace_changed = true;
+                            for relative in shell_changed_paths {
+                                pending_verification_paths
+                                    .insert(normalize_workspace_path(&relative));
+                            }
+                        }
                     }
                     if workspace_changed && !outcome.is_err() {
                         if let Action::ReadFile { path, .. } = &action {
@@ -2721,6 +2828,19 @@ pub fn run_loop(
                         return LoopEnd::Repeated;
                     }
                 }
+                if deferred_calls > 0 {
+                    // The clamp above ran only the first page of an oversized batch.
+                    // Tell the model exactly what happened, or its next step would
+                    // reason from the false belief that the whole batch executed.
+                    history.push(AgentMsg::System(format!(
+                        "{deferred_calls} tool call(s) beyond the first \
+                         {MAX_WORKSPACE_TOOL_CALLS_PER_STEP} were NOT run. Continue the \
+                         remaining work now, at most {MAX_WORKSPACE_TOOL_CALLS_PER_STEP} \
+                         calls per step — or collapse mechanical repetition into one \
+                         run_shell command, which handles any number of files in a \
+                         single call."
+                    )));
+                }
             }
         }
     }
@@ -2736,7 +2856,62 @@ pub fn run_loop(
         "stopped: reached the {}-step limit without a final answer (ran: {summary})",
         cfg.max_steps
     ));
+    budget_exhaustion_grace_answer(driver, reporter, history, cancel);
     LoopEnd::StepCapped
+}
+
+/// One final TOOLLESS model step when a turn runs out of budget.
+///
+/// A run that spent its whole step or tool-call budget doing real investigation
+/// used to return nothing at all — every observation discarded. One more decode
+/// (whose prefix is already in the prompt cache, so prefill is nearly free)
+/// converts that dead run into a partial deliverable, and summarizing what is
+/// already in the transcript is well within a small local model.
+///
+/// Deliberately: no tools are offered (so it cannot start new work), the request
+/// is appended rather than replacing history, and ANY failure — driver error,
+/// cancellation, a tool call anyway, or empty text — leaves the transcript as it
+/// was.
+///
+/// The caller KEEPS its exhaustion outcome (`StepCapped` / `Repeated`). Promoting
+/// it to `Answered` would be a lie in two places that matter: `agent_eval` maps
+/// the outcome to PASS/INCONCLUSIVE, and a subagent reports its exit reason to
+/// the parent, which must not read a truncated run as a completed one. The value
+/// here is that the work is no longer DISCARDED — the summary is streamed to the
+/// user and left in the transcript — not that the run gets to claim success.
+fn budget_exhaustion_grace_answer(
+    driver: &mut dyn ModelDriver,
+    reporter: &mut dyn Reporter,
+    history: &mut Vec<AgentMsg>,
+    cancel: &AtomicBool,
+) -> Option<String> {
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    reporter.notice("budget exhausted; asking for a final summary of what was accomplished");
+    history.push(AgentMsg::System(
+        "You have reached this turn's limit and no further tool calls are possible. \
+         Reply with a final plain-text summary of what you found and what you changed, \
+         based only on what you actually observed. State clearly what remains unfinished. \
+         Do not call any tool."
+            .into(),
+    ));
+    match driver.step(history, &[]) {
+        // A thinking-only reply must not become "the summary" — strip the
+        // reasoning and require visible text.
+        Ok(ModelStep::Text(text)) if visible_text_outside_thinking(&text).is_some() => {
+            let text = visible_text_outside_thinking(&text).unwrap_or_default();
+            reporter.model_text(&text);
+            history.push(AgentMsg::Assistant(text.clone()));
+            Some(text)
+        }
+        _ => {
+            // Roll back the request so a failed grace call leaves no orphan
+            // instruction in a transcript the caller may still persist.
+            history.pop();
+            None
+        }
+    }
 }
 
 fn workspace_request_requires_observation(history: &[AgentMsg]) -> bool {
@@ -2818,6 +2993,107 @@ fn workspace_request_requires_change(history: &[AgentMsg]) -> bool {
     ]
     .iter()
     .any(|phrase| request.contains(phrase))
+}
+
+/// What changed under `root` at or after `since`? Returns `None` when nothing
+/// did, `Some(paths)` when something did — `paths` holds up to
+/// `MAX_CHANGED_PATHS_REPORTED` workspace-relative FILE paths for the semantic
+/// post-change capture (a delete-only change yields `Some` with an empty list:
+/// the parent directory's mtime moved but there is no file to re-read).
+///
+/// Bounded and fail-closed: walks at most `MAX_CHANGE_SCAN_ENTRIES` entries
+/// (without following symlinks); hitting the cap with nothing found returns
+/// `None`, so a huge workspace can only under-report and the completion
+/// contract stays as strict as before. `.camelid/` is the agent's own
+/// bookkeeping (checkpoints, subagent results) and is skipped, or every turn
+/// would count as a workspace change.
+fn workspace_changes_since(
+    root: &Path,
+    since: std::time::SystemTime,
+) -> Option<Vec<String>> {
+    const MAX_CHANGE_SCAN_ENTRIES: usize = 50_000;
+    const MAX_CHANGED_PATHS_REPORTED: usize = 8;
+    // HFS+ (this user's external T7, where real checkouts live) stores mtimes at
+    // ONE-SECOND granularity, truncating downward — a file written 300ms after
+    // `since` stats as the floor of the second and compares BELOW it, silently
+    // reverting this feature to the nag loop it exists to fix. One second of
+    // slack accepts those; the false-positive window it opens (a write in the
+    // second before the command ran) is negligible against a fresh SystemTime.
+    let since = since
+        .checked_sub(std::time::Duration::from_secs(1))
+        .unwrap_or(since);
+    // A delete-only command bumps the PARENT directory's mtime; the walk below
+    // only inspects entries, so the root itself needs its own check.
+    let mut changed = std::fs::metadata(root)
+        .and_then(|metadata| metadata.modified())
+        .is_ok_and(|modified| modified >= since);
+    let mut paths = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    let mut seen = 0usize;
+    'walk: while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            seen += 1;
+            if seen > MAX_CHANGE_SCAN_ENTRIES {
+                break 'walk;
+            }
+            // Same skip set as `search`: VCS/build internals are not "the
+            // requested workspace change". Counting a `.git/index` or `target/`
+            // write here disarmed the completion contract on the canonical
+            // first action of a fix turn (`git checkout -b`, `cargo build`) and
+            // fed binary build artifacts into the semantic capture as
+            // "verification evidence".
+            if super::tools::SEARCH_SKIP_DIRS
+                .iter()
+                .any(|skip| entry.file_name() == *skip)
+            {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.modified().is_ok_and(|modified| modified >= since) {
+                changed = true;
+                if metadata.is_file() && paths.len() < MAX_CHANGED_PATHS_REPORTED {
+                    if let Ok(relative) = entry.path().strip_prefix(root) {
+                        paths.push(relative.to_string_lossy().replace('\\', "/"));
+                    }
+                }
+            }
+            if metadata.is_dir() && !metadata.is_symlink() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    changed.then_some(paths)
+}
+
+/// Everything outside `<think>…</think>`, trimmed.
+///
+/// Returns `None` when the reply is nothing but reasoning (or is empty): the
+/// model thought and then stopped without writing the answer or the tool call
+/// it had just talked itself into. An unterminated `<think>` with no closing tag
+/// counts too — that is the output-cap case of the same failure.
+fn visible_text_outside_thinking(text: &str) -> Option<String> {
+    let mut visible = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let Some(open) = rest.find("<think>") else {
+            visible.push_str(rest);
+            break;
+        };
+        visible.push_str(&rest[..open]);
+        let after = &rest[open + "<think>".len()..];
+        match after.find("</think>") {
+            Some(close) => rest = &after[close + "</think>".len()..],
+            // Unterminated: the rest of the reply is reasoning.
+            None => break,
+        }
+    }
+    let visible = visible.trim();
+    (!visible.is_empty()).then(|| visible.to_string())
 }
 
 fn normalize_workspace_path(path: &str) -> String {
@@ -3639,6 +3915,19 @@ pub fn system_prompt(sandbox: &Sandbox, tools: &[ToolSpec]) -> String {
             "File access: UNRESTRICTED — you may read and write files anywhere on this \
              computer. Use absolute paths for locations outside the workspace (e.g. the user's \
              Desktop or Documents). Relative paths resolve against the workspace root.\n",
+        );
+    } else {
+        // The confined case is the one that needs this MORE, not less: every path
+        // argument must be workspace-relative or the tool call is refused. Stating
+        // it only in the unrestricted branch left a confined agent to guess, and a
+        // small model that guesses `/` gets a refusal it cannot act on, repeats the
+        // call, and trips the validation-repeat guard two steps later.
+        s.push_str(
+            "File access: CONFINED to the workspace root above. Every path argument is \
+             resolved relative to that root — use `.` for the root itself and plain relative \
+             paths like `src/main.rs` beneath it. Absolute paths and any path that climbs \
+             out of the root (`/`, `..`, `~`) are refused. There is no way to widen this \
+             from inside the session, so never retry a refused path unchanged.\n",
         );
     }
     s.push_str("Available tools:\n");
@@ -6072,16 +6361,296 @@ mod tests {
         assert!(usage.evidence_memory_tokens_estimate > 0);
     }
 
+    /// A big write_file cut off at the output cap still contains `<tool_call>`,
+    /// so it used to take the MALFORMED branch: it burned one of only two
+    /// malformed strikes and handed the model the wrong correction ("do not
+    /// hand-write <tool_call> syntax") for a reply whose syntax was fine and
+    /// merely unfinished. A capped step must get the cap correction instead.
     #[test]
-    fn workspace_refuses_oversized_parallel_tool_batches() {
+    fn a_capped_step_is_not_punished_as_malformed_syntax() {
+        struct CappedDriver {
+            steps: usize,
+        }
+        impl ModelDriver for CappedDriver {
+            fn step(&mut self, _h: &[AgentMsg], _t: &[ToolSpec]) -> Result<ModelStep, String> {
+                self.steps += 1;
+                if self.steps == 1 {
+                    // A write_file truncated mid-JSON: opens a tool_call, never closes.
+                    Ok(ModelStep::Text(
+                        "<tool_call>\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"big.txt\", \"content\": \"aaaa"
+                            .into(),
+                    ))
+                } else {
+                    Ok(ModelStep::Text("Done, wrote a smaller unit.".into()))
+                }
+            }
+            fn last_step_capped(&self) -> bool {
+                // Only the first (truncated) step was capped.
+                self.steps == 1
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        let mut driver = CappedDriver { steps: 0 };
+        let mut approver = ScriptApprover(vec![], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("write a big file".into())];
+        let mut config = cfg(dir.path(), false);
+        config.tool_profile = tools::ToolProfile::WebCode;
+        let _ = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sb,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        assert!(
+            reporter
+                .notices
+                .iter()
+                .any(|notice| notice.contains("output cap")),
+            "a capped step must get the output-cap correction: {:?}",
+            reporter.notices
+        );
+        assert!(
+            !reporter
+                .notices
+                .iter()
+                .any(|notice| notice.contains("malformed tool syntax")),
+            "a capped step must NOT burn a malformed strike: {:?}",
+            reporter.notices
+        );
+    }
+
+    /// A run that spends its whole step budget on real investigation must not
+    /// return empty-handed: one toolless grace step converts it into a partial
+    /// deliverable. The grace step must be offered NO tools.
+    #[test]
+    fn budget_exhaustion_asks_for_a_final_summary_with_no_tools() {
+        #[derive(Default)]
+        struct GraceDriver {
+            steps: usize,
+            tool_counts: Vec<usize>,
+        }
+        impl ModelDriver for GraceDriver {
+            fn step(
+                &mut self,
+                _history: &[AgentMsg],
+                tools: &[ToolSpec],
+            ) -> Result<ModelStep, String> {
+                self.tool_counts.push(tools.len());
+                self.steps += 1;
+                // Never answers on its own: burns every step reading a file.
+                if self.steps <= 2 {
+                    Ok(ModelStep::Calls(vec![tc(
+                        "read_file",
+                        json!({"path": "a.txt"}),
+                    )]))
+                } else {
+                    Ok(ModelStep::Text("I inspected a.txt but did not finish.".into()))
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        let mut driver = GraceDriver::default();
+        let mut approver = ScriptApprover(vec![Decision::Once, Decision::Once], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("Investigate a.txt".into())];
+        let mut config = cfg(dir.path(), false);
+        config.max_steps = 2;
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sb,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        // The outcome must stay HONEST — agent_eval maps it to PASS/INCONCLUSIVE
+        // and a subagent reports it to its parent, so a truncated run must never
+        // read as a completed one.
+        assert_eq!(
+            end,
+            LoopEnd::StepCapped,
+            "exhaustion must keep its outcome: {:?}",
+            reporter.notices
+        );
+        assert!(
+            reporter
+                .notices
+                .iter()
+                .any(|notice| notice.contains("budget exhausted")),
+            "{:?}",
+            reporter.notices
+        );
+        assert_eq!(
+            driver.tool_counts.last().copied(),
+            Some(0),
+            "the grace step must be offered NO tools so it cannot start new work"
+        );
+        // ...but the work must NOT be discarded: the summary is in the transcript.
+        let summary = history
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                AgentMsg::Assistant(text) => Some(text.clone()),
+                _ => None,
+            })
+            .expect("the grace summary must be committed to the transcript");
+        assert!(summary.contains("a.txt"), "got {summary:?}");
+    }
+
+    /// Reasoning is real work. A step that emits only `<think>` used to be
+    /// accepted as the assistant's answer (or re-asked from scratch); it must
+    /// instead resume from that reasoning and ask only for the conclusion.
+    #[test]
+    fn a_thinking_only_step_resumes_instead_of_being_accepted_as_the_answer() {
+        assert_eq!(
+            visible_text_outside_thinking("<think>I should read the file.</think>"),
+            None,
+            "pure reasoning has no visible answer"
+        );
+        assert_eq!(
+            visible_text_outside_thinking("<think>unterminated reasoning..."),
+            None,
+            "an output-capped think block is still reasoning-only"
+        );
+        assert_eq!(
+            visible_text_outside_thinking("<think>hmm</think>\n\nThe answer is 3."),
+            Some("The answer is 3.".to_string())
+        );
+        assert_eq!(visible_text_outside_thinking("   "), None);
+
         let dir = tempfile::tempdir().unwrap();
         let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
         let mut driver = MockDriver {
-            steps: vec![ModelStep::Calls(
-                (0..=MAX_WORKSPACE_TOOL_CALLS_PER_STEP)
-                    .map(|index| tc("list_dir", json!({"path": format!("dir-{index}")})))
-                    .collect(),
-            )],
+            steps: vec![
+                ModelStep::Text("<think>Let me think about what to do.</think>".into()),
+                // After the resume the model produces the real answer.
+                ModelStep::Text("The workspace contains README.md.".into()),
+            ],
+            idx: 0,
+        };
+        let mut approver = ScriptApprover(vec![], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("What is in the workspace?".into())];
+        let mut config = cfg(dir.path(), false);
+        config.tool_profile = tools::ToolProfile::WebCode;
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sb,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
+        assert!(
+            reporter
+                .notices
+                .iter()
+                .any(|notice| notice.contains("only reasoning")),
+            "must report the resume: {:?}",
+            reporter.notices
+        );
+        // The thinking block must NOT be the committed answer.
+        let answer = history
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                AgentMsg::Assistant(text) if !text.contains("<think>") => Some(text.clone()),
+                _ => None,
+            })
+            .expect("a real answer must be committed");
+        assert!(answer.contains("README.md"), "got {answer:?}");
+    }
+
+    /// A Code turn that does its work through one run_shell loop (exactly what
+    /// the tool guidance steers bulk work toward) must satisfy the completion
+    /// contract: shell writes bypass checkpoints, so before the filesystem
+    /// change-scan the loop nagged "Code has not changed a workspace file"
+    /// against work that was already done, then ended the turn.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_shell_that_changes_the_tree_satisfies_the_completion_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5))
+            .unwrap()
+            .with_shell_mode(ShellSandbox::Unrestricted);
+        let mut driver = MockDriver {
+            steps: vec![
+                ModelStep::Calls(vec![tc(
+                    "run_shell",
+                    json!({"command": "touch 1.txt 2.txt 3.txt"}),
+                )]),
+                ModelStep::Text("Created the requested files.".into()),
+                // The semantic post-change capture auto-reads the changed paths
+                // and gives the model one critique turn; this is its answer.
+                ModelStep::Text("Verified: 1.txt, 2.txt and 3.txt exist as requested.".into()),
+            ],
+            idx: 0,
+        };
+        let mut approver = ScriptApprover(vec![Decision::Once], 0);
+        let mut reporter = RecordReporter::default();
+        // "create " arms require_workspace_change.
+        let mut history = vec![AgentMsg::User(
+            "create 3 text files named 1.txt 2.txt 3.txt".into(),
+        )];
+        let mut config = cfg(dir.path(), false);
+        config.tool_profile = tools::ToolProfile::WebCode;
+        config.shell_sandbox = ShellSandbox::Unrestricted;
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sb,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
+        assert!(dir.path().join("1.txt").exists());
+        assert!(
+            !reporter
+                .notices
+                .iter()
+                .any(|notice| notice.contains("has not changed a workspace file")),
+            "the shell change must satisfy the contract: {:?}",
+            reporter.notices
+        );
+    }
+
+    #[test]
+    fn workspace_clamps_oversized_parallel_tool_batches_and_continues() {
+        // The old contract killed the turn (`LoopEnd::DriverError`) when a model
+        // emitted more than MAX_WORKSPACE_TOOL_CALLS_PER_STEP calls — punishing
+        // an eager batch by discarding all of it. The new contract runs the
+        // first page, tells the model how many were deferred, and lets the turn
+        // continue.
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..=MAX_WORKSPACE_TOOL_CALLS_PER_STEP {
+            std::fs::create_dir(dir.path().join(format!("dir-{index}"))).unwrap();
+        }
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        let mut driver = MockDriver {
+            steps: vec![
+                ModelStep::Calls(
+                    (0..=MAX_WORKSPACE_TOOL_CALLS_PER_STEP)
+                        .map(|index| tc("list_dir", json!({"path": format!("dir-{index}")})))
+                        .collect(),
+                ),
+                ModelStep::Text("Listed the directories.".into()),
+            ],
             idx: 0,
         };
         let mut approver = ScriptApprover(vec![], 0);
@@ -6099,11 +6668,21 @@ mod tests {
             &mut Policy::default(),
             &mut history,
         );
-        assert_eq!(end, LoopEnd::DriverError);
+        assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
         assert!(reporter
             .notices
             .iter()
-            .any(|notice| notice.contains("allows at most 8")));
+            .any(|notice| notice.contains("deferring 1")));
+        // Exactly the first page ran; the model was told about the remainder.
+        let executed = history
+            .iter()
+            .filter(|m| matches!(m, AgentMsg::ToolResult { .. }))
+            .count();
+        assert_eq!(executed, MAX_WORKSPACE_TOOL_CALLS_PER_STEP);
+        assert!(history.iter().any(|m| matches!(
+            m,
+            AgentMsg::System(text) if text.contains("were NOT run")
+        )));
     }
 
     #[test]
@@ -7878,6 +8457,26 @@ mod tests {
             .unwrap()
             .with_fs_unrestricted(true);
         assert!(system_prompt(&sandbox, &[]).contains("File access: UNRESTRICTED"));
+    }
+
+    /// The confined case needs the path rule more than the unrestricted one, not
+    /// less. It used to be stated ONLY inside the `fs_unrestricted` branch, so a
+    /// Code session — which is always confined — never told the model that paths
+    /// resolve against the root, and a small model guessing `/` burned the turn.
+    #[test]
+    fn system_prompt_states_the_path_rule_when_confined() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        assert!(!sandbox.fs_unrestricted());
+        let prompt = system_prompt(&sandbox, &[]);
+        assert!(
+            prompt.contains("File access: CONFINED"),
+            "confined prompt must declare the confinement: {prompt}"
+        );
+        assert!(
+            prompt.contains("relative to that root"),
+            "confined prompt must state how paths resolve: {prompt}"
+        );
     }
 
     #[test]
