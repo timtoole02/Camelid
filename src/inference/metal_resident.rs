@@ -575,32 +575,21 @@ impl super::LlamaInferenceSession {
         if !matches!(self.kv_cache.dtype, KvDtype::F32 | KvDtype::F16) {
             return false;
         }
-        // Source: which resident lane holds this history decides the check.
-        // The METAL engine hangs off the session, so ask THIS session's engine
-        // (never the process-global KV format — a model switch re-decides the
-        // global while this session still holds an engine built under the
-        // previous format, so the global is a time-of-check answer to a
-        // time-of-use question). The CUDA engine is process-global, and its
-        // recovery does its own identity + exactness discipline inside
-        // `recover_cpu_kv_from_cuda_resident` (key, exact layer range,
-        // `filled() == position`, lock held across the readback).
-        //
-        // The CUDA arm is what turns the prompt cache ON for that lane at
-        // all: the eager prefill mirror covers [0, prompt), but every
-        // resident-DECODED token advances the position with nothing written
-        // to the CPU buffers, so this gate always found
-        // `cpu_kv_authoritative()` false, the Metal-only engine check below
-        // returned false, and no entry was ever stored — every request paid a
-        // full re-prefill (measured live: a 4k-token continuation cost the
-        // same 200+ seconds as its cold request on the Windows dev box).
+        // Source: ask THIS session's engine, never the process-global KV format.
+        // A model switch re-decides the global (`set_resident_kquant_lane`) while
+        // this session still holds an engine built under the previous format, so
+        // the global is a time-of-check answer to a time-of-use question.
         //
         // Reading [0, position) is safe against the encode-ahead window: a
-        // pre-committed future graph writes the NEXT position's row, so it
-        // cannot touch the range being mirrored.
-        let metal_holds = self
+        // pre-committed future graph writes the NEXT position's row, so it cannot
+        // touch the range being mirrored.
+        if !self
             .resident_decode
             .as_ref()
-            .is_some_and(|state| state.kv_roundtrips_through_cpu_exactly());
+            .is_some_and(|state| state.kv_roundtrips_through_cpu_exactly())
+        {
+            return false;
+        }
         // Same rollback discipline as `ensure_cpu_kv_materialized`: a mirror that
         // dies part way through must not leave the watermark vouching for rows it
         // never wrote, or every later `cpu_kv_authoritative` check would pass over
@@ -609,12 +598,7 @@ impl super::LlamaInferenceSession {
         // buffers were never grown before.
         let restore = self.kv_cache.materialized_through;
         let trace = std::env::var_os("CAMELID_RESIDENT_TRACE").is_some();
-        let recovered = if metal_holds {
-            self.recover_cpu_kv_from_metal_resident(position)
-        } else {
-            self.recover_cpu_kv_from_cuda_resident(position)
-        };
-        match recovered {
+        match self.recover_cpu_kv_from_metal_resident(position) {
             Ok(true) => self.cpu_kv_authoritative(),
             Ok(false) => false,
             Err(err) => {
