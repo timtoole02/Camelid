@@ -204,6 +204,10 @@ fn confined(
     match mode {
         ShellSandbox::Disabled => Err("run_shell is disabled (shell_sandbox=disabled)".to_string()),
         ShellSandbox::Unrestricted => {
+            // Unrestricted still promises the cwd-pin layer, so the UNC
+            // refusal applies here exactly as in the sandboxed arm.
+            #[cfg(windows)]
+            refuse_unc_root(root)?;
             let mut builder = Command::new(program);
             builder.args(args);
             attach_command(&mut builder, command);
@@ -530,6 +534,7 @@ fn configure_sandboxed(builder: &mut Command, root: &Path) -> Result<EnforcedShe
 // — this is NOT a faked sandbox; it never claims seccomp/uid-drop.
 #[cfg(windows)]
 fn configure_sandboxed(builder: &mut Command, root: &Path) -> Result<EnforcedShell, String> {
+    refuse_unc_root(root)?;
     builder.current_dir(root);
     Ok(EnforcedShell {
         mode: ShellSandbox::Sandboxed,
@@ -540,6 +545,32 @@ fn configure_sandboxed(builder: &mut Command, root: &Path) -> Result<EnforcedShe
                 .to_string(),
         ),
     })
+}
+
+/// cmd.exe REFUSES a `\\`-prefixed current directory: it prints "UNC paths are
+/// not supported", defaults the cwd to C:\Windows, and still runs the command
+/// with exit 0 — so on a network-located workspace (mapped drive, NAS, \\wsl$)
+/// every "cwd-pinned" shell command silently executed in C:\Windows, where a
+/// relative-path `del /q` or `git clean` hits the wrong tree while the
+/// EnforcedShell report claimed a pin that was never applied. Canonicalized
+/// roots arrive as `\\?\UNC\server\share\...` (std rewrites that to
+/// `\\server\share\...` for CreateProcessW — still `\\`-prefixed). Fail closed
+/// like the other unenforceable arms; the file tools still work there.
+#[cfg(windows)]
+fn refuse_unc_root(root: &Path) -> Result<(), String> {
+    let text = root.as_os_str().to_string_lossy();
+    let unc = text.starts_with(r"\\?\UNC\") || {
+        // `\\server\share`, but not the verbatim drive prefix `\\?\C:\`.
+        text.starts_with(r"\\") && !text.starts_with(r"\\?\")
+    };
+    if unc {
+        return Err(format!(
+            "the workspace root {text} is a network (UNC) path; cmd.exe cannot use it as a \
+             working directory and would silently run every command in C:\\Windows instead. \
+             Use a local workspace for run_shell, or map the work into a local directory"
+        ));
+    }
+    Ok(())
 }
 
 // ===========================================================================
@@ -834,6 +865,33 @@ mod tests {
         let (_, e) = confine(&["true"], Path::new("."), ShellSandbox::Unrestricted).unwrap();
         assert_eq!(e.mode, ShellSandbox::Unrestricted);
         assert!(e.layers.contains(&"wall-timeout"));
+    }
+
+    /// cmd.exe refuses a `\\`-prefixed cwd and silently defaults to
+    /// C:\Windows with exit 0 — so a UNC workspace root must fail closed in
+    /// BOTH cwd-pinning modes instead of running every command in the wrong
+    /// tree while reporting a cwd-pin that was never applied.
+    #[cfg(windows)]
+    #[test]
+    fn unc_workspace_roots_are_refused_for_run_shell() {
+        for root in [
+            r"\\?\UNC\localhost\C$\Users\timto",
+            r"\\localhost\C$\Users\timto",
+        ] {
+            for mode in [ShellSandbox::Sandboxed, ShellSandbox::Unrestricted] {
+                let err = confine(&["cmd"], Path::new(root), mode)
+                    .expect_err("a UNC root must fail closed");
+                assert!(err.contains("UNC"), "{err}");
+                assert!(err.contains("C:\\Windows"), "{err}");
+            }
+        }
+        // The verbatim DRIVE prefix is not UNC and must keep working.
+        assert!(confine(
+            &["cmd"],
+            Path::new(r"\\?\C:\Users"),
+            ShellSandbox::Sandboxed
+        )
+        .is_ok());
     }
 
     // On Windows, sandboxed mode is enforced natively (cwd-pin + wall-timeout, no

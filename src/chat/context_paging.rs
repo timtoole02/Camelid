@@ -459,10 +459,30 @@ impl StructuralProjectMemory {
         let mut pending = vec![self.root.clone()];
         let mut files = Vec::new();
         while let Some(directory) = pending.pop() {
-            let mut entries = std::fs::read_dir(directory)?.flatten().collect::<Vec<_>>();
+            // An unreadable SUBDIRECTORY gets the same tolerance as an
+            // unindexable file below: skip it, never kill the runtime. Every
+            // NTFS volume root carries an ACCESS_DENIED "System Volume
+            // Information" (and corporate ACLs / OneDrive vaults deny freely),
+            // so propagating the error made a drive-root workspace fail every
+            // Code turn with a context-paging startup error, while the
+            // non-paged path walks the same tree non-fatally. The root itself
+            // staying unreadable is still fatal — an empty index over a real
+            // workspace would silently hide the whole tree.
+            let entries = match std::fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    if directory == self.root {
+                        return Err(error.into());
+                    }
+                    continue;
+                }
+            };
+            let mut entries = entries.flatten().collect::<Vec<_>>();
             entries.sort_by_key(|entry| entry.file_name());
             for entry in entries.into_iter().rev() {
-                let file_type = entry.file_type()?;
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
                 if file_type.is_symlink() {
                     continue;
                 }
@@ -2752,6 +2772,40 @@ mod tests {
         memory.index_workspace().unwrap();
         let symbol = memory.resolve_symbol("increment").unwrap();
         (directory, memory, symbol)
+    }
+
+    /// An ACL-denied subdirectory (every NTFS volume root has one: "System
+    /// Volume Information") must be skipped like an unindexable file, not
+    /// abort the whole Code turn with a context-paging startup error.
+    #[cfg(windows)]
+    #[test]
+    fn index_workspace_skips_unreadable_subdirectories() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn increment(value: i32) -> i32 {\n    value + 1\n}\n",
+        )
+        .unwrap();
+        let denied = directory.path().join("denied");
+        std::fs::create_dir(&denied).unwrap();
+        std::fs::write(denied.join("secret.rs"), "pub fn hidden() {}\n").unwrap();
+        // Deny list-directory to Everyone by SID (locale-proof), then always
+        // re-grant so the tempdir can clean up.
+        let deny = std::process::Command::new("icacls")
+            .args([denied.to_str().unwrap(), "/deny", "*S-1-1-0:(RD)"])
+            .output()
+            .expect("icacls must run");
+        assert!(deny.status.success(), "icacls deny failed: {deny:?}");
+        let result = StructuralProjectMemory::new(directory.path())
+            .and_then(|mut memory| memory.index_workspace().map(|()| memory));
+        let _ = std::process::Command::new("icacls")
+            .args([denied.to_str().unwrap(), "/remove:d", "*S-1-1-0"])
+            .output();
+        let memory = result.expect("an unreadable subdirectory must not abort indexing");
+        assert!(
+            memory.resolve_symbol("increment").is_some(),
+            "readable siblings must still index"
+        );
     }
 
     fn ledger(symbol: &str) -> TaskLedger {
