@@ -3316,7 +3316,21 @@ impl LlamaInferenceSession {
         //
         // The last shared token is always recomputed so the prefill still ends
         // by writing position n-1, which is the state the decode lane expects.
-        let reuse = slot.engine.resident_prefix_len(token_ids).min(n - 1);
+        // `CAMELID_CUDA_PREFIX_CONTINUATION=0` forces a full prefill, so the
+        // saving can be measured against the same binary rather than against a
+        // differently-built one.
+        let continuation_enabled = !std::env::var_os("CAMELID_CUDA_PREFIX_CONTINUATION")
+            .map(|v| {
+                let v = v.to_string_lossy();
+                let v = v.trim();
+                v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
+            })
+            .unwrap_or(false);
+        let reuse = if continuation_enabled {
+            slot.engine.resident_prefix_len(token_ids).min(n - 1)
+        } else {
+            0
+        };
         if reuse > 0 {
             slot.engine.set_filled(reuse);
         }
