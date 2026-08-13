@@ -505,6 +505,20 @@ fn supply_default_write_path(call: &mut ToolCall, path: &str) -> bool {
     true
 }
 
+/// True when a `-m py_compile` failure is the INTERPRETER being unusable — a
+/// missing `py` launcher (`'py' is not recognized …`, exit 9009) or the
+/// Windows Store alias stub — rather than the source failing to compile.
+/// Recording those as "Python syntax validation failed" forced a rewrite loop
+/// against perfectly valid source on Store-Python-only hosts (python.exe
+/// works, py.exe was never installed), where no Python-writing Code turn
+/// could ever be accepted.
+#[cfg(windows)]
+fn python_interpreter_unusable(outcome_text: &str) -> bool {
+    outcome_text.contains("is not recognized as an internal or external command")
+        || (outcome_text.contains("Python was not found")
+            && outcome_text.contains("Microsoft Store"))
+}
+
 #[cfg(windows)]
 fn normalize_verified_windows_python(action: &mut Action) -> Option<String> {
     let Action::RunShell { command } = action else {
@@ -1749,36 +1763,60 @@ pub fn run_loop(
                                 }) {
                                     continue;
                                 }
-                                let command = format!("py -m py_compile {relative}");
-                                let action = Action::RunShell {
-                                    command: command.clone(),
-                                };
-                                reporter.tool_call(&action.call_line(sandbox));
-                                let outcome = execute_audited(
-                                    &action,
-                                    sandbox,
-                                    ApprovalTier::Auto,
-                                    &json!({"command": command}),
-                                    cfg.audit.as_ref(),
-                                    cancel,
-                                )
-                                .clipped(
-                                    cfg.tool_profile.observation_limit().unwrap_or(usize::MAX),
-                                );
-                                reporter.tool_result("run_shell", &outcome);
-                                history.push(AgentMsg::ToolCalls(vec![ToolCall {
-                                    name: "run_shell".into(),
-                                    args: json!({"command": command}),
-                                }]));
-                                history.push(AgentMsg::ToolResult {
-                                    name: "run_shell".into(),
-                                    outcome: outcome.clone(),
-                                });
-                                if outcome.is_err() {
-                                    semantic_contract_findings.push(format!(
-                                        "Python syntax validation failed for {relative}: {}",
-                                        outcome.text()
-                                    ));
+                                // `py` first (the python.org launcher), then
+                                // `python` (real on Store-Python-only hosts).
+                                // An interpreter-unusable failure is a HOST
+                                // condition: it must neither be recorded as a
+                                // syntax finding nor pushed into history where
+                                // it would prime install detours.
+                                let mut compiled: Option<(String, ToolOutcome)> = None;
+                                for interpreter in ["py", "python"] {
+                                    let command =
+                                        format!("{interpreter} -m py_compile {relative}");
+                                    let action = Action::RunShell {
+                                        command: command.clone(),
+                                    };
+                                    reporter.tool_call(&action.call_line(sandbox));
+                                    let outcome = execute_audited(
+                                        &action,
+                                        sandbox,
+                                        ApprovalTier::Auto,
+                                        &json!({"command": command}),
+                                        cfg.audit.as_ref(),
+                                        cancel,
+                                    )
+                                    .clipped(
+                                        cfg.tool_profile.observation_limit().unwrap_or(usize::MAX),
+                                    );
+                                    reporter.tool_result("run_shell", &outcome);
+                                    if outcome.is_err()
+                                        && python_interpreter_unusable(&outcome.text())
+                                    {
+                                        continue;
+                                    }
+                                    compiled = Some((command, outcome));
+                                    break;
+                                }
+                                match compiled {
+                                    Some((command, outcome)) => {
+                                        history.push(AgentMsg::ToolCalls(vec![ToolCall {
+                                            name: "run_shell".into(),
+                                            args: json!({"command": command}),
+                                        }]));
+                                        history.push(AgentMsg::ToolResult {
+                                            name: "run_shell".into(),
+                                            outcome: outcome.clone(),
+                                        });
+                                        if outcome.is_err() {
+                                            semantic_contract_findings.push(format!(
+                                                "Python syntax validation failed for {relative}: {}",
+                                                outcome.text()
+                                            ));
+                                        }
+                                    }
+                                    None => reporter.notice(&format!(
+                                        "no usable Python interpreter on this host; skipped syntax validation for {relative}"
+                                    )),
                                 }
                             }
                         }
@@ -2193,11 +2231,14 @@ pub fn run_loop(
                         }
                     };
                     #[cfg(windows)]
+                    let mut python_substitution: Option<String> = None;
+                    #[cfg(windows)]
                     if windows_python_launcher_verified {
                         if let Some(normalized) = normalize_verified_windows_python(&mut action) {
                             reporter.notice(&format!(
                                 "normalized the unusable Windows python.exe alias to verified command: {normalized}"
                             ));
+                            python_substitution = Some(normalized);
                         }
                     }
                     match &action {
@@ -2291,6 +2332,29 @@ pub fn run_loop(
                             cfg.audit.as_ref(),
                             cancel,
                         ),
+                    };
+                    // Disclose a python->py substitution IN THE RESULT the model
+                    // reads: the reporter notice is a UI channel (and invisible
+                    // under paging), so without this the model records success
+                    // for the command it wrote, not the one that ran — a
+                    // py_compile substituted for a script run would otherwise
+                    // read as a verified execution.
+                    #[cfg(windows)]
+                    let outcome = match python_substitution.take() {
+                        Some(normalized) => {
+                            let disclose = |text: String| {
+                                format!(
+                                    "[substituted: executed `{normalized}` because the Windows \
+                                     python alias is unusable; a py_compile check proves syntax \
+                                     only, not runtime behavior]\n{text}"
+                                )
+                            };
+                            match outcome {
+                                ToolOutcome::Ok(text) => ToolOutcome::Ok(disclose(text)),
+                                ToolOutcome::Err(text) => ToolOutcome::Err(disclose(text)),
+                            }
+                        }
+                        None => outcome,
                     };
                     let raw_outcome_for_paging = context_paging.as_ref().map(|_| outcome.clone());
                     let outcome = match cfg.tool_profile.observation_limit() {
@@ -2396,25 +2460,48 @@ pub fn run_loop(
                                         || matches!(character, '.' | '_' | '-' | '/' | '\\')
                                 });
                                 if relative.to_ascii_lowercase().ends_with(".py") && safe_relative {
-                                    let command = format!("py -m py_compile {relative}");
-                                    let verification = Action::RunShell {
-                                        command: command.clone(),
-                                    };
-                                    reporter.tool_call(&verification.call_line(sandbox));
-                                    let result = execute_audited(
-                                        &verification,
-                                        sandbox,
-                                        ApprovalTier::Auto,
-                                        &json!({"command": command}),
-                                        cfg.audit.as_ref(),
-                                        cancel,
-                                    )
-                                    .clipped(
-                                        cfg.tool_profile.observation_limit().unwrap_or(usize::MAX),
-                                    );
-                                    reporter.tool_result("run_shell", &result);
-                                    *ran.entry("run_shell".into()).or_insert(0) += 1;
-                                    Some((command, result))
+                                    // Same interpreter ladder as the completion
+                                    // capture: `py`, then `python`; a host
+                                    // without either skips host verification
+                                    // instead of recording a false syntax
+                                    // failure that no rewrite can ever clear.
+                                    let mut compiled: Option<(String, ToolOutcome)> = None;
+                                    for interpreter in ["py", "python"] {
+                                        let command =
+                                            format!("{interpreter} -m py_compile {relative}");
+                                        let verification = Action::RunShell {
+                                            command: command.clone(),
+                                        };
+                                        reporter.tool_call(&verification.call_line(sandbox));
+                                        let result = execute_audited(
+                                            &verification,
+                                            sandbox,
+                                            ApprovalTier::Auto,
+                                            &json!({"command": command}),
+                                            cfg.audit.as_ref(),
+                                            cancel,
+                                        )
+                                        .clipped(
+                                            cfg.tool_profile
+                                                .observation_limit()
+                                                .unwrap_or(usize::MAX),
+                                        );
+                                        reporter.tool_result("run_shell", &result);
+                                        *ran.entry("run_shell".into()).or_insert(0) += 1;
+                                        if result.is_err()
+                                            && python_interpreter_unusable(&result.text())
+                                        {
+                                            continue;
+                                        }
+                                        compiled = Some((command, result));
+                                        break;
+                                    }
+                                    if compiled.is_none() {
+                                        reporter.notice(&format!(
+                                            "no usable Python interpreter on this host; skipped syntax validation for {relative}"
+                                        ));
+                                    }
+                                    compiled
                                 } else {
                                     None
                                 }
@@ -2506,8 +2593,15 @@ pub fn run_loop(
                     let python_launcher_just_verified = !outcome.is_err()
                         && matches!(&action, Action::RunShell { command }
                             if command.trim().eq_ignore_ascii_case("py --version"));
+                    // Arm the rewriter only when the Store-alias failure was
+                    // actually observed on THIS host. A bare successful
+                    // `py --version` probe (the loop's own reprompt suggests
+                    // it) used to arm it on healthy hosts too, silently
+                    // downgrading later `python foo.py` runs to syntax checks
+                    // — empty success fabricating verification where python
+                    // works fine.
                     #[cfg(windows)]
-                    if python_launcher_just_verified {
+                    if python_launcher_just_verified && python_alias_guidance_sent {
                         windows_python_launcher_verified = true;
                     }
                     #[cfg(not(windows))]
@@ -8137,6 +8231,162 @@ mod tests {
             message,
             AgentMsg::System(text) if text.contains("Python is installed and ready")
         )));
+    }
+
+    /// A host-condition failure (missing launcher, Store alias stub) must not
+    /// be classified as a source syntax failure — that misclassification put
+    /// Store-Python-only hosts into a rewrite loop no edit could ever clear.
+    #[cfg(windows)]
+    #[test]
+    fn interpreter_unusable_classifier_separates_host_from_source_failures() {
+        assert!(python_interpreter_unusable(
+            "exit: 1\nstderr:\n'py' is not recognized as an internal or external command,\noperable program or batch file.\n"
+        ));
+        assert!(python_interpreter_unusable(
+            "exit: 49\nstderr:\nPython was not found; run without arguments to install from the Microsoft Store, or disable this shortcut from Settings.\n"
+        ));
+        assert!(!python_interpreter_unusable(
+            "exit: 1\nstderr:\n  File \"game.py\", line 3\nSyntaxError: invalid syntax\n"
+        ));
+        assert!(!python_interpreter_unusable("exit: 0\n"));
+    }
+
+    /// On a host where `python` really works (GitHub's windows runner), a
+    /// successful `py --version` probe must NOT arm the python->py rewriter:
+    /// pre-fix it armed unconditionally and silently downgraded later
+    /// `python foo.py` runs into syntax checks — empty success fabricating
+    /// verification. Self-skips on Store-alias hosts (this dev box), the
+    /// inverse of the store-alias test's guard.
+    #[cfg(windows)]
+    #[test]
+    fn healthy_host_python_run_is_not_downgraded() {
+        if python_resolves_to_store_alias() {
+            eprintln!(
+                "SKIP healthy_host_python_run_is_not_downgraded: `python` resolves to the \
+                 Windows Store alias stub on this host, so the healthy-host premise does not hold"
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(15)).unwrap();
+        let mut driver = MockDriver {
+            steps: vec![
+                ModelStep::Calls(vec![tc("run_shell", json!({"command": "py --version"}))]),
+                ModelStep::Calls(vec![tc(
+                    "run_shell",
+                    json!({"command": "python -c \"print('RAN_FOR_REAL')\""}),
+                )]),
+                ModelStep::Calls(vec![tc(
+                    "write_file",
+                    json!({"path": "probe.py", "content": "print('probe')\n"}),
+                )]),
+                ModelStep::Calls(vec![tc("read_file", json!({"path": "probe.py"}))]),
+                ModelStep::Text("Verified probe.py.".into()),
+            ],
+            idx: 0,
+        };
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("Create a Python probe.".into())];
+        let mut config = cfg(dir.path(), false);
+        config.max_steps = 0;
+        config.tool_profile = tools::ToolProfile::WebCode;
+        let end = run_loop(
+            &mut driver,
+            &mut ScriptApprover(
+                vec![Decision::Once, Decision::Once, Decision::Once, Decision::Once],
+                0,
+            ),
+            &mut reporter,
+            &sb,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
+        assert!(
+            !reporter
+                .notices
+                .iter()
+                .any(|notice| notice.contains("normalized the unusable Windows python.exe alias")),
+            "a healthy host must not arm the rewriter: {:?}",
+            reporter.notices
+        );
+        assert!(
+            history.iter().any(|message| matches!(
+                message,
+                AgentMsg::ToolResult { outcome, .. } if outcome.text().contains("RAN_FOR_REAL")
+            )),
+            "the python -c run must EXECUTE, not be downgraded to a syntax check"
+        );
+    }
+
+    /// On a Store-alias host the rewrite is legitimate — but the substitution
+    /// must be disclosed in the RESULT the model reads, not only in a UI
+    /// notice: the model otherwise records success for the command it wrote,
+    /// not the py_compile that actually ran. Self-skips where the alias is
+    /// absent (same guard as the store-alias test).
+    #[cfg(windows)]
+    #[test]
+    fn alias_host_substitution_is_disclosed_in_the_tool_result() {
+        if !python_resolves_to_store_alias() {
+            eprintln!(
+                "SKIP alias_host_substitution_is_disclosed_in_the_tool_result: `python` does \
+                 not resolve to the Windows Store alias stub on this host"
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(15)).unwrap();
+        let mut driver = MockDriver {
+            steps: vec![
+                ModelStep::Calls(vec![tc(
+                    "run_shell",
+                    json!({"command": "python --version"}),
+                )]),
+                ModelStep::Calls(vec![tc("run_shell", json!({"command": "py --version"}))]),
+                ModelStep::Calls(vec![tc(
+                    "write_file",
+                    json!({"path": "game.py", "content": "print('game')\n"}),
+                )]),
+                ModelStep::Calls(vec![tc("run_shell", json!({"command": "python game.py"}))]),
+                ModelStep::Calls(vec![tc("read_file", json!({"path": "game.py"}))]),
+                ModelStep::Text("Verified game.py.".into()),
+            ],
+            idx: 0,
+        };
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("Create a Python game.".into())];
+        let mut config = cfg(dir.path(), false);
+        config.max_steps = 0;
+        config.tool_profile = tools::ToolProfile::WebCode;
+        let end = run_loop(
+            &mut driver,
+            &mut ScriptApprover(
+                vec![
+                    Decision::Once,
+                    Decision::Once,
+                    Decision::Once,
+                    Decision::Once,
+                ],
+                0,
+            ),
+            &mut reporter,
+            &sb,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
+        assert!(
+            history.iter().any(|message| matches!(
+                message,
+                AgentMsg::ToolResult { outcome, .. }
+                    if outcome.text().contains("substituted: executed `py -m py_compile game.py`")
+            )),
+            "the substitution must be visible in the model-facing result"
+        );
     }
 
     #[cfg(windows)]
