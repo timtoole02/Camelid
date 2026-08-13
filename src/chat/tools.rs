@@ -525,16 +525,31 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
         return tools;
     }
     if shell_mode != ShellSandbox::Disabled {
+        // The platform shell is load-bearing guidance: without it a small
+        // model writes bash at cmd.exe (`for i in {1..100}`), fails with a
+        // parse error that names no shell, and repeats to loop death —
+        // observed live on the Windows dev box.
+        #[cfg(windows)]
+        const SHELL_PLATFORM: &str = concat!(
+            "The shell is Windows cmd.exe — NOT bash: no {1..N}, $(...), or `%%`; ",
+            "loop with `for /L %i in (1,1,N) do @...`, or run one PowerShell line via ",
+            "`powershell -NoProfile -Command \"...\"`. "
+        );
+        #[cfg(not(windows))]
+        const SHELL_PLATFORM: &str = "The shell is POSIX `/bin/sh`. ";
         tools.push(ToolSpec {
             name: "run_shell".into(),
-            description: concat!(
-                "Run a shell command in the workspace and capture its output. Pass a command ",
-                "line, never raw program source: create source with write_file first, then invoke ",
-                "its runtime. Probe a missing runtime before attempting an approval-gated ",
-                "package-manager install. Prefer the file tools over cat/grep/ls/find/sed; use ",
-                "the shell for builds, tests, git, installs, and bulk repetitive work."
-            )
-            .into(),
+            description: format!(
+                concat!(
+                    "Run a shell command in the workspace and capture its output. {}",
+                    "Pass a command ",
+                    "line, never raw program source: create source with write_file first, then invoke ",
+                    "its runtime. Probe a missing runtime before attempting an approval-gated ",
+                    "package-manager install. Prefer the file tools over cat/grep/ls/find/sed; use ",
+                    "the shell for builds, tests, git, installs, and bulk repetitive work."
+                ),
+                SHELL_PLATFORM
+            ),
             risk: Risk::Exec,
             params: json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}),
         });
@@ -2626,7 +2641,7 @@ fn run_shell_cancellable(sandbox: &Sandbox, command: &str, cancel: &AtomicBool) 
     if status.success() {
         ToolOutcome::Ok(text)
     } else {
-        if let Some(hint) = shell_failure_hint(&stdout, &stderr) {
+        if let Some(hint) = shell_failure_hint(command, &stdout, &stderr) {
             text.push_str(&format!("[hint: {hint}]\n"));
         }
         ToolOutcome::Err(text)
@@ -2646,7 +2661,7 @@ fn run_shell_cancellable(sandbox: &Sandbox, command: &str, cancel: &AtomicBool) 
 /// the sandbox arm must precede the generic permission arm, since a Seatbelt
 /// denial also prints "Operation not permitted". Deliberately a plain scan over
 /// a bounded prefix: no regex dependency, and no cost at all on success.
-fn shell_failure_hint(stdout: &str, stderr: &str) -> Option<&'static str> {
+fn shell_failure_hint(command: &str, stdout: &str, stderr: &str) -> Option<&'static str> {
     // Bounded scan of the HEAD AND TAIL of each stream. Head-only missed the
     // classes that matter most for dev work: cargo/npm print the verdict
     // ("test result: FAILED", the failing assertion) at the END of the log, so
@@ -2692,6 +2707,49 @@ fn shell_failure_hint(stdout: &str, stderr: &str) -> Option<&'static str> {
         return Some(
             "a test failed. Read the assertion and the file it names, fix the cause, then re-run \
              only that test",
+        );
+    }
+    // --- Windows cmd.exe syntax: the command never ran at all. ---
+    // "X was unexpected at this time." is cmd's parse error. Classify by what
+    // the model wrote so the hint names the actual mistake — observed live: a
+    // greedy 4B ran bash `for i in {1..100}; do ...` at cmd.exe, then
+    // batch-FILE `%%i` at the interactive prompt, and repeated each to loop
+    // death because the bare exit-1 result never said which shell this is.
+    if has("was unexpected at this time") {
+        let written = command.to_ascii_lowercase();
+        if written.contains("%%") {
+            return Some(
+                "cmd.exe parse error: `%%` is batch-FILE syntax. This is the interactive \
+                 prompt — use a single `%`, e.g. `for /L %i in (1,1,100) do @echo %i`",
+            );
+        }
+        return Some(
+            "this shell is Windows cmd.exe, not bash. Rewrite with cmd syntax (e.g. \
+             `for /L %i in (1,1,100) do @echo hello> file%i.txt`) or run one PowerShell \
+             line: `powershell -NoProfile -Command \"<script>\"`",
+        );
+    }
+    if has("is not recognized as an internal or external command") {
+        let first_word = command
+            .trim_start()
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if matches!(
+            first_word.as_str(),
+            "touch" | "ls" | "rm" | "cp" | "mv" | "cat" | "grep" | "sed" | "awk" | "which"
+        ) {
+            return Some(
+                "that is a Unix tool; this shell is Windows cmd.exe. Use `dir` (ls), `type` \
+                 (cat), `del` (rm), `copy` (cp), `move` (mv), `findstr` (grep), `where` \
+                 (which), `echo.> file` (touch) — or one PowerShell line: `powershell \
+                 -NoProfile -Command \"<script>\"`",
+            );
+        }
+        return Some(
+            "that command is not recognized on this Windows host. Probe with `where <tool>` \
+             before assuming an install is needed, and prefer the file tools for file work",
         );
     }
     // --- sandbox / permission ---
@@ -4338,10 +4396,10 @@ mod tests {
     #[test]
     fn failed_shell_results_carry_one_actionable_hint() {
         assert!(
-            shell_failure_hint("", "").is_none(),
+            shell_failure_hint("", "", "").is_none(),
             "no hint without a known class"
         );
-        let sandbox_hint = shell_failure_hint("", "touch: /etc/probe: Operation not permitted")
+        let sandbox_hint = shell_failure_hint("", "", "touch: /etc/probe: Operation not permitted")
             .expect("sandbox denial must hint");
         assert!(sandbox_hint.contains("sandbox"), "{sandbox_hint}");
         assert!(
@@ -4350,24 +4408,52 @@ mod tests {
         );
         // The sandbox arm must win over the generic permission arm: a Seatbelt
         // denial also prints "not permitted", and the generic advice is wrong for it.
-        let generic = shell_failure_hint("", "cat: f.txt: Permission denied").unwrap();
+        let generic = shell_failure_hint("", "", "cat: f.txt: Permission denied").unwrap();
         assert!(generic.contains("permission denied"), "{generic}");
         assert!(!generic.contains("sandbox"), "{generic}");
         // Platform-correct interpreter advice on macOS.
-        let python = shell_failure_hint("", "sh: python: command not found").unwrap();
+        let python = shell_failure_hint("", "", "sh: python: command not found").unwrap();
         assert!(python.contains("python3"), "{python}");
-        let py = shell_failure_hint("", "sh: py: command not found").unwrap();
+        let py = shell_failure_hint("", "", "sh: py: command not found").unwrap();
         assert!(py.contains("python3"), "{py}");
         // Network is denied by the jail; the shell reports it as a DNS failure.
-        let net = shell_failure_hint("", "curl: (6) Could not resolve host: example.com").unwrap();
+        let net =
+            shell_failure_hint("", "", "curl: (6) Could not resolve host: example.com").unwrap();
         assert!(net.contains("network"), "{net}");
         // A compile error is the model's problem, not the harness's.
-        let rustc = shell_failure_hint("", "error[E0425]: cannot find value `x`").unwrap();
+        let rustc = shell_failure_hint("", "", "error[E0425]: cannot find value `x`").unwrap();
         assert!(rustc.contains("compile error"), "{rustc}");
         assert!(
-            shell_failure_hint("all good\n", "").is_none(),
+            shell_failure_hint("", "all good\n", "").is_none(),
             "clean output must not be hinted"
         );
+        // Windows cmd parse errors name the platform and the actual mistake —
+        // the two live shapes: bash at cmd.exe, then batch-file %% doubling.
+        let bash = shell_failure_hint(
+            "for i in {1..100}; do touch \"file$i.txt\"; done",
+            "",
+            "i was unexpected at this time.",
+        )
+        .unwrap();
+        assert!(bash.contains("cmd.exe, not bash"), "{bash}");
+        assert!(bash.contains("for /L %i"), "{bash}");
+        let batch = shell_failure_hint(
+            "for /f \"tokens=1\" %%i in ('cmd /c echo /s') do @echo %%i",
+            "",
+            "%%i was unexpected at this time.",
+        )
+        .unwrap();
+        assert!(batch.contains("batch-FILE syntax"), "{batch}");
+        assert!(batch.contains("single `%`"), "{batch}");
+        // Unix tools at cmd get the platform-correct replacements.
+        let unix_tool = shell_failure_hint(
+            "touch file1.txt",
+            "",
+            "'touch' is not recognized as an internal or external command,\noperable program or batch file.",
+        )
+        .unwrap();
+        assert!(unix_tool.contains("Unix tool"), "{unix_tool}");
+        assert!(unix_tool.contains("echo.> file"), "{unix_tool}");
     }
 
     /// A spelling variant of a real tool should EXECUTE, not burn a validation
