@@ -4809,6 +4809,228 @@ fn q4k_gemm_batched_matches_oracle() {
     );
 }
 
+/// The wide Q4_K GEMM must be BIT-IDENTICAL to the narrow one, not merely
+/// close: prefill writes the KV cache every later token attends over, so any
+/// drift here changes generated text. Runs a chunk (32) the narrow kernel
+/// cannot serve at full occupancy, and an n_sb wide enough that the narrow
+/// kernel's staging would blow its shared budget — the exact regime the wide
+/// kernel exists for.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn q4k_gemm_batched_wide_is_bit_identical_to_narrow() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    // n_sb=38 mirrors a 9728-wide FFN; k=2 is all the narrow kernel can run
+    // there at 8 warps, so both widths are exercised against it.
+    let (rows, n_sb) = (96usize, 38usize);
+    let kdim = n_sb * 256;
+    let mut rng = Lcg(0x5749_4445_5f34);
+    let wire = synth_q4k_wire(rows, n_sb, &mut rng);
+    let weights = super::swz_q4k_blocks(&wire);
+    let d_w = k.stream.clone_htod(&weights).unwrap();
+
+    for k_tokens in [1usize, 2, 8, 32] {
+        let mut in_scales = Vec::with_capacity(k_tokens * n_sb);
+        let mut in_quants = Vec::with_capacity(k_tokens * kdim);
+        for _ in 0..k_tokens {
+            let act: Vec<f32> = (0..kdim).map(|_| rng.next_f32()).collect();
+            for block in &crate::inference::quantize_q8_k_blocks(&act) {
+                in_scales.push(block.d);
+                in_quants.extend_from_slice(&block.qs);
+            }
+        }
+        let d_is = k.stream.clone_htod(&in_scales).unwrap();
+        let d_iq = k.stream.clone_htod(&in_quants).unwrap();
+
+        let mut wide = vec![0f32; k_tokens * rows];
+        let mut d_wide = k.stream.alloc_zeros::<f32>(k_tokens * rows).unwrap();
+        super::launch_kquant_gemm_batched_wide(
+            &k.stream,
+            &k.q4k_gemm_batched_wide,
+            &d_is,
+            &d_iq,
+            &d_w,
+            rows,
+            n_sb,
+            k_tokens,
+            9,
+            &mut d_wide,
+        )
+        .unwrap();
+        k.stream.memcpy_dtoh(&d_wide, &mut wide).unwrap();
+        k.ctx.synchronize().unwrap();
+
+        // The narrow kernel cannot be launched past its shared budget, so the
+        // reference for wide chunks is the per-row GEMV oracle both claim to
+        // reproduce; where narrow CAN run, compare against it directly too.
+        let mut expected = vec![0f32; k_tokens * rows];
+        for t in 0..k_tokens {
+            let q8k: Vec<_> = (0..n_sb)
+                .map(|sb| crate::inference::Q8KBlock {
+                    d: in_scales[t * n_sb + sb],
+                    qs: in_quants[(t * n_sb + sb) * 256..(t * n_sb + sb + 1) * 256]
+                        .try_into()
+                        .unwrap(),
+                })
+                .collect();
+            for row in 0..rows {
+                let lo = row * n_sb * 144;
+                expected[t * rows + row] =
+                    crate::inference::q4_k_wire_row_dot(&wire[lo..lo + n_sb * 144], &q8k);
+            }
+        }
+        let exact = wide
+            .iter()
+            .zip(&expected)
+            .filter(|(g, e)| g.to_bits() == e.to_bits())
+            .count();
+        eprintln!(
+            "wide q4k k={k_tokens}: {exact}/{} bit-identical to oracle",
+            wide.len()
+        );
+        assert!(
+            close(&wide, &expected, 1e-4),
+            "wide Q4_K k={k_tokens} diverged from q4_k_wire_row_dot"
+        );
+
+        if !super::kquant_narrow_is_crowded(kdim, k_tokens, 9) {
+            let mut narrow = vec![0f32; k_tokens * rows];
+            let mut d_narrow = k.stream.alloc_zeros::<f32>(k_tokens * rows).unwrap();
+            super::launch_kquant_gemm_batched(
+                &k.stream,
+                &k.q4k_gemm_batched,
+                &d_is,
+                &d_iq,
+                &d_w,
+                rows,
+                n_sb,
+                k_tokens,
+                9,
+                &mut d_narrow,
+            )
+            .unwrap();
+            k.stream.memcpy_dtoh(&d_narrow, &mut narrow).unwrap();
+            k.ctx.synchronize().unwrap();
+            assert_same_bits(&format!("wide vs narrow Q4_K k={k_tokens}"), &wide, &narrow);
+        }
+    }
+}
+
+/// Q6_K twin of the Q4_K bit-parity test above.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn q6k_gemm_batched_wide_is_bit_identical_to_narrow() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let (rows, n_sb) = (96usize, 38usize);
+    let kdim = n_sb * 256;
+    let mut rng = Lcg(0x5749_4445_5f36);
+    let wire = synth_q6k_wire(rows, n_sb, &mut rng);
+    let weights = super::pad_q6k_blocks(&wire);
+    let d_w = k.stream.clone_htod(&weights).unwrap();
+
+    for k_tokens in [1usize, 2, 8, 32] {
+        let mut in_scales = Vec::with_capacity(k_tokens * n_sb);
+        let mut in_quants = Vec::with_capacity(k_tokens * kdim);
+        for _ in 0..k_tokens {
+            let act: Vec<f32> = (0..kdim).map(|_| rng.next_f32()).collect();
+            for block in &crate::inference::quantize_q8_k_blocks(&act) {
+                in_scales.push(block.d);
+                in_quants.extend_from_slice(&block.qs);
+            }
+        }
+        let d_is = k.stream.clone_htod(&in_scales).unwrap();
+        let d_iq = k.stream.clone_htod(&in_quants).unwrap();
+
+        let mut wide = vec![0f32; k_tokens * rows];
+        let mut d_wide = k.stream.alloc_zeros::<f32>(k_tokens * rows).unwrap();
+        super::launch_kquant_gemm_batched_wide(
+            &k.stream,
+            &k.q6k_gemm_batched_wide,
+            &d_is,
+            &d_iq,
+            &d_w,
+            rows,
+            n_sb,
+            k_tokens,
+            8,
+            &mut d_wide,
+        )
+        .unwrap();
+        k.stream.memcpy_dtoh(&d_wide, &mut wide).unwrap();
+        k.ctx.synchronize().unwrap();
+
+        if !super::kquant_narrow_is_crowded(kdim, k_tokens, 8) {
+            let mut narrow = vec![0f32; k_tokens * rows];
+            let mut d_narrow = k.stream.alloc_zeros::<f32>(k_tokens * rows).unwrap();
+            super::launch_kquant_gemm_batched(
+                &k.stream,
+                &k.q6k_gemm_batched,
+                &d_is,
+                &d_iq,
+                &d_w,
+                rows,
+                n_sb,
+                k_tokens,
+                8,
+                &mut d_narrow,
+            )
+            .unwrap();
+            k.stream.memcpy_dtoh(&d_narrow, &mut narrow).unwrap();
+            k.ctx.synchronize().unwrap();
+            assert_same_bits(&format!("wide vs narrow Q6_K k={k_tokens}"), &wide, &narrow);
+        } else {
+            let mut expected = vec![0f32; k_tokens * rows];
+            for t in 0..k_tokens {
+                let q8k: Vec<_> = (0..n_sb)
+                    .map(|sb| crate::inference::Q8KBlock {
+                        d: in_scales[t * n_sb + sb],
+                        qs: in_quants[(t * n_sb + sb) * 256..(t * n_sb + sb + 1) * 256]
+                            .try_into()
+                            .unwrap(),
+                    })
+                    .collect();
+                for row in 0..rows {
+                    let lo = row * n_sb * 210;
+                    expected[t * rows + row] =
+                        crate::inference::q6_k_wire_row_dot(&wire[lo..lo + n_sb * 210], &q8k);
+                }
+            }
+            assert!(
+                close(&wide, &expected, 1e-4),
+                "wide Q6_K k={k_tokens} diverged from q6_k_wire_row_dot"
+            );
+        }
+    }
+}
+
+/// The chunk-width policy must never hand a kernel a shape it cannot launch,
+/// and must keep a full 8 warps — the property the narrow path lost at k=4.
+#[test]
+fn kquant_wide_token_cap_keeps_eight_warps() {
+    for lanes in [8u32, 9] {
+        let cap = super::kquant_wide_token_cap(lanes, 8, 64);
+        assert!(cap >= 8, "expected a usable chunk, got {cap}");
+        let rows = super::kquant_wide_rows_per_warp(cap, lanes);
+        let bytes = cap * 260 + 8 * rows * cap * lanes * 4;
+        assert!(bytes <= 46 * 1024, "cap {cap} needs {bytes} B");
+        // Occupancy is the property that actually moved the stopwatch: an
+        // SM86 SM has 100 KiB of shared, and dropping below ~4 blocks/SM cost
+        // more than any staging saving gained (measured 124s vs 106s).
+        assert!(
+            (100 * 1024) / bytes >= 4,
+            "cap {cap} rows/warp {rows} needs {bytes} B => only {} blocks/SM",
+            (100 * 1024) / bytes
+        );
+    }
+    // A request far past the budget is clamped, never allowed to panic a launch.
+    let huge = super::kquant_wide_token_cap(9, 8, 4096);
+    let rows = super::kquant_wide_rows_per_warp(huge, 9);
+    assert!(huge * 260 + 8 * rows * huge * 9 * 4 <= 46 * 1024);
+}
+
 // Build `rows*n_sb` synthetic Q5_K_M super-blocks (176 bytes each, row-major):
 // d(f16), dmin(f16), scales[12], qh[32], qs[128]. Like synth_q4k_wire the bytes need
 // not be a real quantization — the kernel and the oracle read the SAME bytes — so the

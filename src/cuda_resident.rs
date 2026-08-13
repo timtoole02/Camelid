@@ -3474,6 +3474,316 @@ extern "C" __global__ void q6k_gemm_batched(
     }
 }
 
+// ---- Wide batched K-quant GEMMs -------------------------------------------
+// Identical math and, crucially, identical ACCUMULATION ORDER to the narrow
+// q4k/q6k_gemm_batched kernels above (hence bit-identical results) —
+// restructured so the chunk width is not bounded by shared memory.
+//
+// The narrow kernels stage EVERY super-block's activations for EVERY token up
+// front (`k*n_sb*260` bytes), which is self-defeating: warps-per-block is
+// whatever is left of the 46 KiB budget after that staging, so widening the
+// chunk REMOVES parallelism. Measured on a 9728-wide FFN: k=2 leaves 8 warps,
+// k=4 leaves 1, and the k=4 prefill ran 2.2x slower than the per-token GEMV it
+// was meant to replace.
+//
+// Here the super-block loop is OUTERMOST and only the current super-block is
+// staged (`k*260` bytes), so k=32..64 still runs a full 8 warps. Each weight
+// byte is then read once per CHUNK instead of once per token — the whole point
+// of batching a prefill, and the difference between streaming 10 TB and 160 GB
+// of weights for a 4k-token prompt.
+//
+// Lane mapping mirrors the narrow kernels so the integer reduction tree is the
+// same: `g = lane & 3` is the unit-group within a super-block (as `u & 3` was)
+// and `tslot = lane >> 2` selects which tokens this lane owns, so the
+// `__shfl_down_sync` by 2 then 1 still reduces exactly the four lanes holding
+// g=0..3 of one (row, super-block, token). The f32 tail then accumulates over
+// super-blocks in ascending order into per-(warp, token) shared accumulators,
+// which is precisely what the narrow kernels' final lane-0 loop does.
+extern "C" __global__ void q4k_gemm_batched_wide(
+    const float* __restrict__ input_scales,
+    const signed char* __restrict__ input_quants,
+    const unsigned char* __restrict__ weight_bytes,
+    int rows, int n_sb, int k_tokens, int rows_per_warp, float* __restrict__ output
+) {
+    extern __shared__ unsigned char smem4w[];
+    signed char* s_iq = (signed char*)smem4w;                   // k_tokens * 256
+    float* s_is = (float*)(smem4w + (long)k_tokens * 256);      // k_tokens
+    float* acc = (float*)(smem4w + (long)k_tokens * 260);       // warps*R*k_tokens*9
+
+    const unsigned int KMASK1 = 0x3f3f3f3fu;
+    const unsigned int KMASK2 = 0x0f0f0f0fu;
+    const unsigned int KMASK3 = 0x03030303u;
+    const int WIRE = 144;
+    int tid = threadIdx.x;
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int g = lane & 3;
+    int tslot = lane >> 2;
+    // Each warp owns `rows_per_warp` CONSECUTIVE rows and sweeps them under one
+    // staging of the current super-block. Staging is block-wide traffic that
+    // every block repeats, so with one row per warp it dwarfed the weight
+    // stream it was meant to amortize (measured: ~378 MB of activation reads
+    // against 53 MB of weights per GEMM). More rows per staging is what puts
+    // the ratio back where batching pays.
+    long row_base = ((long)blockIdx.x * warps_per_block + warp) * rows_per_warp;
+    float* warpacc = acc + (long)warp * rows_per_warp * k_tokens * 9;
+    int iters = (k_tokens + 7) >> 3;
+
+    for (int i = lane; i < rows_per_warp * k_tokens * 9; i += 32) warpacc[i] = 0.0f;
+    __syncwarp();
+
+    for (int sb = 0; sb < n_sb; sb++) {
+        __syncthreads();
+        // Stage THIS super-block only, in the same stride-8 swizzle the narrow
+        // kernel applies, so the hot loop stays at two dp4a per aux lane.
+        for (int i = tid; i < k_tokens * 256; i += blockDim.x) {
+            int t = i >> 8;
+            int p = i & 255;
+            int grp = p >> 5;
+            int pg = p & 31;
+            int l = pg & 7;
+            int kk = pg >> 3;
+            s_iq[(long)t * 256 + grp * 32 + l * 4 + kk] =
+                input_quants[((long)t * n_sb + sb) * 256 + p];
+        }
+        for (int i = tid; i < k_tokens; i += blockDim.x)
+            s_is[i] = input_scales[(long)i * n_sb + sb];
+        __syncthreads();
+
+        for (int r = 0; r < rows_per_warp; r++) {
+            long row = row_base + r;
+            bool active = row < rows;
+            float* myacc = warpacc + (long)r * k_tokens * 9;
+            int slo = 0, shi = 0, mnlo = 0, mnhi = 0;
+            int qwords[8];
+            #pragma unroll
+            for (int l = 0; l < 8; l++) qwords[l] = 0;
+            float d = 0.0f, dmin = 0.0f;
+            if (active) {
+                const unsigned char* blk = weight_bytes + (row * n_sb + sb) * WIRE;
+                uint4 hdr = *reinterpret_cast<const uint4*>(blk);
+                unsigned int u0w = hdr.y;
+                unsigned int u1 = hdr.z;
+                unsigned int u2 = hdr.w;
+                unsigned int u3 = ((u2 >> 4) & KMASK2) | (((u1 >> 6) & KMASK3) << 4);
+                unsigned int uaux = u1 & KMASK1;
+                u1 = (u2 & KMASK2) | (((u0w >> 6) & KMASK3) << 4);
+                u2 = uaux;
+                u0w &= KMASK1;
+                unsigned char sc[8], mn[8];
+                sc[0] = u0w & 0xff; sc[1] = (u0w >> 8) & 0xff;
+                sc[2] = (u0w >> 16) & 0xff; sc[3] = (u0w >> 24) & 0xff;
+                sc[4] = u1 & 0xff; sc[5] = (u1 >> 8) & 0xff;
+                sc[6] = (u1 >> 16) & 0xff; sc[7] = (u1 >> 24) & 0xff;
+                mn[0] = u2 & 0xff; mn[1] = (u2 >> 8) & 0xff;
+                mn[2] = (u2 >> 16) & 0xff; mn[3] = (u2 >> 24) & 0xff;
+                mn[4] = u3 & 0xff; mn[5] = (u3 >> 8) & 0xff;
+                mn[6] = (u3 >> 16) & 0xff; mn[7] = (u3 >> 24) & 0xff;
+                slo = (int)sc[2 * g];
+                shi = (int)sc[2 * g + 1];
+                mnlo = (int)mn[2 * g];
+                mnhi = (int)mn[2 * g + 1];
+                const int* qw = reinterpret_cast<const int*>(blk + 16 + g * 32);
+                #pragma unroll
+                for (int l = 0; l < 8; l++) qwords[l] = qw[l];
+                d = f16_bits_to_f32((unsigned short)blk[0] | ((unsigned short)blk[1] << 8));
+                dmin = f16_bits_to_f32((unsigned short)blk[2] | ((unsigned short)blk[3] << 8));
+            }
+
+            // Uniform trip count across the warp keeps every lane at the shuffles.
+            for (int it = 0; it < iters; it++) {
+                int t = (it << 3) + tslot;
+                bool has_t = t < k_tokens;
+                int partial[8];
+                #pragma unroll
+                for (int l = 0; l < 8; l++) partial[l] = 0;
+                int sumi = 0;
+                if (active && has_t) {
+                    const signed char* y256 = s_iq + (long)t * 256;
+                    const int* ylo = reinterpret_cast<const int*>(y256 + (2 * g) * 32);
+                    const int* yhi = reinterpret_cast<const int*>(y256 + (2 * g + 1) * 32);
+                    int sum_lo = 0, sum_hi = 0;
+                    #pragma unroll
+                    for (int l = 0; l < 8; l++) {
+                        int q = qwords[l];
+                        int yl = ylo[l];
+                        int yh = yhi[l];
+                        partial[l] +=
+                            slo * __dp4a(q & 0x0F0F0F0F, yl, 0)
+                            + shi * __dp4a((q >> 4) & 0x0F0F0F0F, yh, 0);
+                        sum_lo = __dp4a(yl, 0x01010101, sum_lo);
+                        sum_hi = __dp4a(yh, 0x01010101, sum_hi);
+                    }
+                    sumi = mnlo * sum_lo + mnhi * sum_hi;
+                }
+                #pragma unroll
+                for (int off = 2; off >= 1; off >>= 1) {
+                    #pragma unroll
+                    for (int l = 0; l < 8; l++)
+                        partial[l] += __shfl_down_sync(0xffffffffu, partial[l], off);
+                    sumi += __shfl_down_sync(0xffffffffu, sumi, off);
+                }
+                if (active && has_t && g == 0) {
+                    float dact = s_is[t];
+                    float dd = d * dact;
+                    float* dst = myacc + (long)t * 9;
+                    #pragma unroll
+                    for (int l = 0; l < 8; l++) dst[l] += dd * (float)partial[l];
+                    dst[8] -= dmin * dact * (float)sumi;
+                }
+            }
+        }
+    }
+
+    if (g == 0) {
+        for (int r = 0; r < rows_per_warp; r++) {
+            long row = row_base + r;
+            if (row >= rows) break;
+            const float* myacc = warpacc + (long)r * k_tokens * 9;
+            for (int it = 0; it < iters; it++) {
+                int t = (it << 3) + tslot;
+                if (t >= k_tokens) continue;
+                const float* src = myacc + (long)t * 9;
+                float smain = 0.0f;
+                #pragma unroll
+                for (int l = 0; l < 8; l++) smain += src[l];
+                output[(long)t * rows + row] = src[8] + smain;
+            }
+        }
+    }
+}
+
+extern "C" __global__ void q6k_gemm_batched_wide(
+    const float* __restrict__ input_scales,
+    const signed char* __restrict__ input_quants,
+    const unsigned char* __restrict__ weight_bytes,
+    int rows, int n_sb, int k_tokens, int rows_per_warp, float* __restrict__ output
+) {
+    extern __shared__ unsigned char smem6w[];
+    signed char* s_iq = (signed char*)smem6w;                   // k_tokens * 256
+    float* s_is = (float*)(smem6w + (long)k_tokens * 256);      // k_tokens
+    float* acc = (float*)(smem6w + (long)k_tokens * 260);       // warps*R*k_tokens*8
+
+    const int WIRE = 224;
+    int tid = threadIdx.x;
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int quarter = lane & 3;
+    int tslot = lane >> 2;
+    long row_base = ((long)blockIdx.x * warps_per_block + warp) * rows_per_warp;
+    float* warpacc = acc + (long)warp * rows_per_warp * k_tokens * 8;
+    int iters = (k_tokens + 7) >> 3;
+
+    for (int i = lane; i < rows_per_warp * k_tokens * 8; i += 32) warpacc[i] = 0.0f;
+    __syncwarp();
+
+    for (int sb = 0; sb < n_sb; sb++) {
+        __syncthreads();
+        // Q6_K activations stage in natural order (64 ints per token).
+        for (int i = tid; i < k_tokens * 64; i += blockDim.x) {
+            int t = i >> 6;
+            int w = i & 63;
+            ((int*)s_iq)[(long)t * 64 + w] =
+                ((const int*)input_quants)[((long)t * n_sb + sb) * 64 + w];
+        }
+        for (int i = tid; i < k_tokens; i += blockDim.x)
+            s_is[i] = input_scales[(long)i * n_sb + sb];
+        __syncthreads();
+
+        for (int r = 0; r < rows_per_warp; r++) {
+            long row = row_base + r;
+            bool active = row < rows;
+            float* myacc = warpacc + (long)r * k_tokens * 8;
+            int s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+            int base = 0;
+            uint4 qlo = make_uint4(0, 0, 0, 0);
+            uint4 qhi = make_uint4(0, 0, 0, 0);
+            uint4 qhv = make_uint4(0, 0, 0, 0);
+            float d = 0.0f;
+            if (active) {
+                const unsigned char* blk = weight_bytes + (row * n_sb + sb) * WIRE;
+                int h = quarter >> 1;
+                int ss = quarter & 1;
+                int qlb = h * 64;
+                int qhb = 128 + h * 32;
+                int wbase = h * 128;
+                uint4 scv = *reinterpret_cast<const uint4*>(blk + 192);
+                const signed char* sc = (const signed char*)&scv;
+                qlo = *reinterpret_cast<const uint4*>(blk + qlb + ss * 16);
+                qhi = *reinterpret_cast<const uint4*>(blk + qlb + 32 + ss * 16);
+                qhv = *reinterpret_cast<const uint4*>(blk + qhb + ss * 16);
+                base = wbase + ss * 16;
+                int j0 = 8 * h + ss;
+                s0 = (int)sc[j0];
+                s1 = (int)sc[j0 + 2];
+                s2 = (int)sc[j0 + 4];
+                s3 = (int)sc[j0 + 6];
+                d = f16_bits_to_f32((unsigned short)blk[208] | ((unsigned short)blk[209] << 8));
+            }
+            const unsigned char* ql_lo = (const unsigned char*)&qlo;
+            const unsigned char* ql_hi = (const unsigned char*)&qhi;
+            const unsigned char* qh = (const unsigned char*)&qhv;
+
+            for (int it = 0; it < iters; it++) {
+                int t = (it << 3) + tslot;
+                bool has_t = t < k_tokens;
+                int partial[8];
+                #pragma unroll
+                for (int l = 0; l < 8; l++) partial[l] = 0;
+                if (active && has_t) {
+                    const signed char* y256 = s_iq + (long)t * 256;
+                    #pragma unroll
+                    for (int l = 0; l < 16; l++) {
+                        int albyte = (int)ql_lo[l];
+                        int ahbyte = (int)ql_hi[l];
+                        int hbyte = (int)qh[l];
+                        int a0 = ((albyte & 0xF) | ((hbyte & 3) << 4)) - 32;
+                        int a1 = ((ahbyte & 0xF) | (((hbyte >> 2) & 3) << 4)) - 32;
+                        int a2 = ((albyte >> 4) | (((hbyte >> 4) & 3) << 4)) - 32;
+                        int a3 = ((ahbyte >> 4) | (((hbyte >> 6) & 3) << 4)) - 32;
+                        int al = l & 7;
+                        partial[al] += s0 * (int)y256[base + l] * a0;
+                        partial[al] += s1 * (int)y256[base + l + 32] * a1;
+                        partial[al] += s2 * (int)y256[base + l + 64] * a2;
+                        partial[al] += s3 * (int)y256[base + l + 96] * a3;
+                    }
+                }
+                #pragma unroll
+                for (int off = 2; off >= 1; off >>= 1) {
+                    #pragma unroll
+                    for (int l = 0; l < 8; l++)
+                        partial[l] += __shfl_down_sync(0xffffffffu, partial[l], off);
+                }
+                if (active && has_t && quarter == 0) {
+                    float dd = d * s_is[t];
+                    float* dst = myacc + (long)t * 8;
+                    #pragma unroll
+                    for (int l = 0; l < 8; l++) dst[l] += dd * (float)partial[l];
+                }
+            }
+        }
+    }
+
+    if (quarter == 0) {
+        for (int r = 0; r < rows_per_warp; r++) {
+            long row = row_base + r;
+            if (row >= rows) break;
+            const float* myacc = warpacc + (long)r * k_tokens * 8;
+            for (int it = 0; it < iters; it++) {
+                int t = (it << 3) + tslot;
+                if (t >= k_tokens) continue;
+                const float* src = myacc + (long)t * 8;
+                float sum = 0.0f;
+                #pragma unroll
+                for (int l = 0; l < 8; l++) sum += src[l];
+                output[(long)t * rows + row] = sum;
+            }
+        }
+    }
+}
+
 // ---- RoPE: supports adjacent-even-odd (pairing=0) and split-half/NEOX (pairing=1).
 // cos/sin are per-pair (rope_dim/2). ---
 extern "C" __global__ void rope_rotate(
@@ -5781,6 +6091,8 @@ pub struct CudaResidentKernels {
     pub(crate) iq4xs_gemv: CudaFunction,
     pub(crate) q4k_gemm_batched: CudaFunction,
     pub(crate) q6k_gemm_batched: CudaFunction,
+    pub(crate) q4k_gemm_batched_wide: CudaFunction,
+    pub(crate) q6k_gemm_batched_wide: CudaFunction,
     pub(crate) quantize_q8k: CudaFunction,
     pub(crate) rms_norm_quantize_q8k: CudaFunction,
     pub(crate) silu_mul_quantize_q8k: CudaFunction,
@@ -5984,6 +6296,8 @@ impl CudaResidentKernels {
             q3k_gemv: f("q3k_gemv")?,
             q4k_gemm_batched: f("q4k_gemm_batched")?,
             q6k_gemm_batched: f("q6k_gemm_batched")?,
+            q4k_gemm_batched_wide: f("q4k_gemm_batched_wide")?,
+            q6k_gemm_batched_wide: f("q6k_gemm_batched_wide")?,
             quantize_q8k: f("quantize_q8k")?,
             rms_norm_quantize_q8k: f("rms_norm_quantize_q8k")?,
             silu_mul_quantize_q8k: f("silu_mul_quantize_q8k")?,
@@ -7566,6 +7880,26 @@ fn dispatch_gemm_batched(
             k_tokens,
             out,
         ),
+        // The narrow kernel stages every super-block's activations, so its
+        // shared-memory need scales with `cols` and the warp count collapses as
+        // the chunk widens (1 warp at k=4 on a 9728-wide FFN). Route anything
+        // the narrow kernel cannot run at full occupancy to the wide kernel,
+        // whose staging is one super-block regardless of `cols`. Both produce
+        // bit-identical results; this is purely an occupancy choice.
+        ProjQuant::Q4K if kquant_narrow_is_crowded(cols, k_tokens, 9) => {
+            launch_kquant_gemm_batched_wide(
+                s,
+                &kern.q4k_gemm_batched_wide,
+                q8k_scales,
+                q8k_quants,
+                weight,
+                rows,
+                cols / 256,
+                k_tokens,
+                9,
+                out,
+            )
+        }
         ProjQuant::Q4K => launch_kquant_gemm_batched(
             s,
             &kern.q4k_gemm_batched,
@@ -7578,6 +7912,20 @@ fn dispatch_gemm_batched(
             9,
             out,
         ),
+        ProjQuant::Q6K if kquant_narrow_is_crowded(cols, k_tokens, 8) => {
+            launch_kquant_gemm_batched_wide(
+                s,
+                &kern.q6k_gemm_batched_wide,
+                q8k_scales,
+                q8k_quants,
+                weight,
+                rows,
+                cols / 256,
+                k_tokens,
+                8,
+                out,
+            )
+        }
         ProjQuant::Q6K => launch_kquant_gemm_batched(
             s,
             &kern.q6k_gemm_batched,
@@ -7900,6 +8248,127 @@ pub(crate) fn launch_kquant_gemm_batched(
         .arg(&r)
         .arg(&ns)
         .arg(&kt)
+        .arg(out);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Whether the NARROW K-quant GEMM would run this shape at reduced occupancy
+/// (fewer than 8 warps), which is the point where the wide kernel — same
+/// results, staging independent of the contraction width — is the better
+/// choice. Below that threshold the narrow kernel keeps its mature behavior
+/// byte for byte.
+fn kquant_narrow_is_crowded(cols: usize, k_tokens: usize, aux_lanes: usize) -> bool {
+    const SHARED_BUDGET: u32 = 46 * 1024;
+    let n_sb = (cols / 256) as u32;
+    let stage = (k_tokens as u32) * n_sb * 260;
+    let per_warp = (k_tokens as u32) * n_sb * (aux_lanes as u32) * 4;
+    if stage + per_warp > SHARED_BUDGET {
+        return true;
+    }
+    ((SHARED_BUDGET - stage) / per_warp.max(1)) < 8
+}
+
+/// Warps per block for the wide K-quant GEMM.
+const KQUANT_WIDE_WARPS: u32 = 8;
+
+/// Shared-memory bytes the WIDE K-quant GEMM needs: one super-block of staged
+/// activations (k*260) plus the per-(warp, row, token) f32 accumulators.
+/// Unlike the narrow kernel this does NOT scale with `n_sb`.
+fn kquant_wide_shared_bytes(k_tokens: u32, warps: u32, rows_per_warp: u32, acc_lanes: u32) -> u32 {
+    k_tokens * 260 + warps * rows_per_warp * k_tokens * acc_lanes * 4
+}
+
+/// Rows each warp sweeps under ONE staging of the current super-block.
+///
+/// MEASURED, not modelled. The obvious argument says raise this: staging is
+/// block-wide traffic every block repeats, so more rows per staging improves
+/// the (staged activation bytes)/(weight bytes) ratio, which at R=1 is ~7x.
+/// Acting on that argument made the prefill SLOWER (124s vs 106s GPU time on
+/// a 4k prompt), because the accumulators are shared-resident: R=4 took the
+/// block from 17.5 KiB to 45 KiB, and an SM86 SM fits 100 KiB of shared, so
+/// blocks-per-SM fell from 5 to 2 and occupancy from ~83% to ~33%. These
+/// kernels are latency-bound, not staging-bound — the re-read activations sit
+/// in L2 (a whole chunk's Q8_K is only a few hundred KiB), so the traffic the
+/// ratio counts never reaches DRAM, while the occupancy loss is real.
+///
+/// Keep R=1 unless a device profile says otherwise; the knob stays for tuning
+/// on cards with a different shared-memory-to-latency balance.
+fn kquant_wide_rows_per_warp(k_tokens: u32, acc_lanes: u32) -> u32 {
+    const SHARED_BUDGET: u32 = 46 * 1024;
+    let requested = std::env::var("CAMELID_CUDA_KQUANT_ROWS_PER_WARP")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(1)
+        .max(1);
+    (1..=requested)
+        .rev()
+        .find(|&r| {
+            kquant_wide_shared_bytes(k_tokens, KQUANT_WIDE_WARPS, r, acc_lanes) <= SHARED_BUDGET
+        })
+        .unwrap_or(1)
+}
+
+/// Widest chunk the wide K-quant GEMM can run at full warp occupancy while
+/// still affording enough rows per warp to keep staging amortized.
+pub(crate) fn kquant_wide_token_cap(acc_lanes: u32, _min_warps: u32, requested: u32) -> u32 {
+    const SHARED_BUDGET: u32 = 46 * 1024;
+    (1..=requested.max(1))
+        .rev()
+        .find(|&k| {
+            let rows = kquant_wide_rows_per_warp(k, acc_lanes);
+            rows >= (k / 2).max(1)
+                && kquant_wide_shared_bytes(k, KQUANT_WIDE_WARPS, rows, acc_lanes) <= SHARED_BUDGET
+        })
+        .unwrap_or(1)
+}
+
+/// Wide batched Q4_K/Q6_K GEMM: same ordered accumulation as
+/// [`launch_kquant_gemm_batched`], but the kernel streams one super-block at a
+/// time so shared memory (and therefore the warp count) is independent of the
+/// contraction width. `acc_lanes` is 9 for Q4_K (8 sub-block sums + the dmin
+/// term) and 8 for Q6_K.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_kquant_gemm_batched_wide(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    in_scales: &CudaSlice<f32>,
+    in_quants: &CudaSlice<i8>,
+    weight: &CudaSlice<u8>,
+    rows: usize,
+    n_sb: usize,
+    k_tokens: usize,
+    acc_lanes: usize,
+    out: &mut CudaSlice<f32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    const SHARED_BUDGET: u32 = 46 * 1024;
+    let k = k_tokens as u32;
+    let lanes = acc_lanes as u32;
+    let rows_per_warp = kquant_wide_rows_per_warp(k, lanes);
+    let shared = kquant_wide_shared_bytes(k, KQUANT_WIDE_WARPS, rows_per_warp, lanes);
+    assert!(
+        shared <= SHARED_BUDGET,
+        "wide K-quant batch does not fit the shared-memory budget"
+    );
+    let rows_per_block = KQUANT_WIDE_WARPS * rows_per_warp;
+    let cfg = LaunchConfig {
+        grid_dim: ((rows as u32).div_ceil(rows_per_block), 1, 1),
+        block_dim: (KQUANT_WIDE_WARPS * 32, 1, 1),
+        shared_mem_bytes: shared,
+    };
+    let (r, ns, kt, rpw) = (
+        rows as i32,
+        n_sb as i32,
+        k_tokens as i32,
+        rows_per_warp as i32,
+    );
+    let mut b = s.launch_builder(f);
+    b.arg(in_scales)
+        .arg(in_quants)
+        .arg(weight)
+        .arg(&r)
+        .arg(&ns)
+        .arg(&kt)
+        .arg(&rpw)
         .arg(out);
     unsafe { b.launch(cfg) }.map(|_| ())
 }
@@ -9845,6 +10314,11 @@ pub struct CudaResidentDecode {
 /// lets each weight read verify more drafts per round, raising the ceiling on
 /// repetitive/structured output where n-gram acceptance is high.
 pub(crate) const MAX_VERIFY_K: usize = 8;
+/// Default prefill chunk for K-quant models, served by the wide kernels. 32
+/// tokens cuts the weight traffic of a 4k-token prompt from ~10 TB to ~310 GB
+/// while still leaving a full 8 warps per block (`k*260 + 8*k*9*4` = 17.5 KiB
+/// of the 46 KiB budget at 9 accumulator lanes).
+const DEFAULT_KQUANT_BATCH_TOKENS: usize = 32;
 const MAX_PRISM_PREFILL_K: usize = 128;
 const DEFAULT_PRISM_BMMA_MIN_TOKENS: usize = 32;
 
@@ -10033,6 +10507,9 @@ fn prism_bmma_shape_enabled(kern: &CudaResidentKernels, cols: usize, k_tokens: u
 
 /// K-batched scratch buffers for `verify_batch`, sized `MAX_VERIFY_K * dim`.
 struct VerifyScratch {
+    /// Rows every buffer below was sized for, so a wider chunk reallocates
+    /// instead of overrunning.
+    cap: usize,
     vh: CudaSlice<f32>,
     vn: CudaSlice<f32>,
     viq: CudaSlice<i8>,
@@ -11023,17 +11500,15 @@ impl CudaResidentDecode {
         if !has_kquant {
             return MAX_VERIFY_K;
         }
-        // Two tokens leave enough of the portable 46 KiB shared-memory
-        // budget for eight warps on the 8192-wide 3B FFN. Four-token tiles
-        // remain available for same-binary diagnostics where the dimensions
-        // fit; larger models are clamped down instead of panicking at launch.
-        let requested = std::env::var("CAMELID_CUDA_KQUANT_BATCH_TOKENS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(2)
-            .clamp(1, 4);
-        let max_cols = self.hidden.max(self.q_width).max(self.ffn_dim);
-        let n_sb = max_cols / 256;
+        // The WIDE K-quant kernels stage one super-block at a time, so their
+        // shared-memory need is `k*260 + warps*k*lanes*4` — independent of the
+        // contraction width. That decouples the chunk from `n_sb` and is what
+        // makes a real prefill batch possible: the narrow kernels stage every
+        // super-block, so their warp count collapses as k grows (8 warps at
+        // k=2, ONE at k=4 on a 9728-wide FFN) and a k=4 prefill measured 2.2x
+        // SLOWER than the per-token GEMV it replaces. `dispatch_gemm_batched`
+        // routes to whichever kernel runs the shape at full occupancy; both are
+        // bit-identical, so this is purely an occupancy decision.
         let aux_lanes = if self
             .layers
             .iter()
@@ -11043,10 +11518,11 @@ impl CudaResidentDecode {
         } else {
             8
         };
-        (1..=requested)
-            .rev()
-            .find(|&k| k * n_sb * (260 + aux_lanes * 4) <= 46 * 1024)
-            .unwrap_or(1)
+        let requested = std::env::var("CAMELID_CUDA_KQUANT_BATCH_TOKENS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_KQUANT_BATCH_TOKENS);
+        kquant_wide_token_cap(aux_lanes as u32, 8, requested as u32) as usize
     }
 
     fn batched_verify_token_cap(&self) -> usize {
@@ -11085,8 +11561,30 @@ impl CudaResidentDecode {
     }
 
     /// Default policy after same-host Windows/WDDM benchmarking. Q8_0 batching
-    /// remains a clear win; the parity-correct Q4_K/Q6_K tiles stay opt-in until
-    /// a device shows a sustained gain over the mature serial GEMVs.
+    /// remains a clear win; K-quant stays on the serial GEMV.
+    ///
+    /// The wide K-quant kernels below remove the structural reason K-quant
+    /// could not batch (the narrow tiles lose warps as the chunk widens, so
+    /// they could only run 2-4 tokens and a k=4 prefill measured 2.2x SLOWER
+    /// than per-token). They are parity-proven and can run k=32. They are
+    /// still NOT the default, because a PAIRED, interleaved, thermally
+    /// controlled A/B on the reference RTX 3060 Laptop showed no gain:
+    ///
+    ///   serial 202.1s / 213.5s      wide 208.8s / 210.4s   (4019-token prefill)
+    ///
+    /// Sequential measurements taken earlier appeared to show 195s -> 106s, but
+    /// that was thermal drift on a laptop GPU under hours of sustained load,
+    /// not the kernel. Anyone re-measuring this must interleave the arms and
+    /// cool between runs, or they will measure the cooling system.
+    ///
+    /// The nsys breakdown says where a real win has to come from: GEMMs are
+    /// 92% of prefill GPU time (attention only 6.4%), and these kernels sustain
+    /// roughly 4 GB/s against a card capable of ~250 — `q6k_gemm_batched_wide`
+    /// alone is 46.7% of the time from 2142 calls, being ~6x slower per call
+    /// than the Q4_K path because Q6_K decodes with scalar byte loads instead
+    /// of `__dp4a`. Register-resident accumulators over a 128x128 CTA tile (the
+    /// shape the Prism BMMA kernel already uses) plus a dp4a Q6_K lane is the
+    /// work that would move this; a wider chunk alone does not.
     pub fn prefers_batched_prefill(&self) -> bool {
         self.supports_batched_prefill()
             && self.layers.iter().all(|layer| {
@@ -13570,8 +14068,17 @@ impl CudaResidentDecode {
         Ok(())
     }
 
+    /// Allocate (or GROW) the prefill scratch. The size check is load-bearing
+    /// now that the chunk width is tunable at runtime: a plain
+    /// already-allocated early return would silently keep a buffer sized for an
+    /// earlier, narrower cap and the layer stack would write past every
+    /// `cap * dim` row.
     fn ensure_prefill_scratch(&mut self, cap: usize) -> Result<(), String> {
-        if self.prefill_scratch.is_some() {
+        if self
+            .prefill_scratch
+            .as_ref()
+            .is_some_and(|scratch| scratch.cap >= cap)
+        {
             return Ok(());
         }
         self.prefill_scratch = Some(self.alloc_verify_scratch(cap)?);
@@ -13598,6 +14105,7 @@ impl CudaResidentDecode {
                 .map_err(|e| format!("verify alloc: {e}"))
         };
         Ok(VerifyScratch {
+            cap,
             vh: af(mk * hidden)?,
             vn: af(mk * hidden)?,
             viq: st
