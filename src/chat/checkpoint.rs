@@ -408,6 +408,13 @@ pub fn undo(sandbox: &Sandbox, force: bool) -> Result<String, String> {
         // destroying the only copy of the intermediate state.
         static UNDONE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = UNDONE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Create the store before resolving it, exactly as `prepare` does:
+        // `resolve(.., must_exist=true)` fails on a missing directory, so
+        // without this the park could never succeed in a workspace whose
+        // store was cleaned up (or whose only checkpoints are creations,
+        // which write no backup blob) — and the force refusal below would
+        // then reject every forced undo permanently.
+        let _ = std::fs::create_dir_all(sandbox.root().join(DIR));
         let parked = sandbox.resolve(DIR, true).ok().and_then(|dir| {
             std::fs::copy(
                 &target,
@@ -738,6 +745,42 @@ pub(crate) mod tests {
         let message = undo(&sandbox, false).expect("retry must succeed");
         assert!(message.contains("removed"), "{message}");
         assert!(!f.exists());
+        clear();
+    }
+
+    /// A forced undo must still work when the store directory is gone: the
+    /// park creates it, so the refusal guards a genuine copy failure rather
+    /// than firing permanently on a cleaned-up store.
+    #[test]
+    fn forced_undo_recreates_a_missing_store_and_proceeds() {
+        let _g = cp_lock();
+        clear();
+        let d = tempfile::tempdir().unwrap();
+        let sandbox = sb(d.path());
+        let f = d.path().join("a.txt");
+        std::fs::write(&f, "original").unwrap();
+
+        let pending = prepare(&sandbox, &f, "edit_file");
+        std::fs::write(&f, "agent version").unwrap();
+        finish(pending, true);
+        // The user edits after the agent, so only a FORCED undo applies.
+        std::fs::write(&f, "user edit").unwrap();
+
+        let message = undo(&sandbox, true).expect("a forced undo must not be refused");
+        assert!(message.contains("restored"), "{message}");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "original");
+        // The park copy exists, so the overwritten user edit is recoverable.
+        let parked: Vec<String> = std::fs::read_dir(d.path().join(DIR))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("undone_"))
+            .collect();
+        assert_eq!(
+            parked.len(),
+            1,
+            "the user's state must be parked: {parked:?}"
+        );
         clear();
     }
 

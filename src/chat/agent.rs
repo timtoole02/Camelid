@@ -512,11 +512,24 @@ fn supply_default_write_path(call: &mut ToolCall, path: &str) -> bool {
 /// against perfectly valid source on Store-Python-only hosts (python.exe
 /// works, py.exe was never installed), where no Python-writing Code turn
 /// could ever be accepted.
+/// Anchored to the FIRST few lines of the shell result on purpose: a real
+/// py_compile SyntaxError echoes the offending source line, so a
+/// whole-output `contains` let a script that merely MENTIONS these strings
+/// (this project's own domain) classify its own compile failure as a missing
+/// interpreter — skipping validation and letting a non-compiling file be
+/// accepted as verified. cmd emits the interpreter failure immediately, before
+/// any source echo.
 #[cfg(windows)]
 fn python_interpreter_unusable(outcome_text: &str) -> bool {
-    outcome_text.contains("is not recognized as an internal or external command")
-        || (outcome_text.contains("Python was not found")
-            && outcome_text.contains("Microsoft Store"))
+    outcome_text.lines().any(|line| {
+        let line = line.trim_start();
+        // cmd's own message BEGINS the line: `'py' is not recognized …`. An
+        // echoed source line quoting the same words is indented and starts
+        // with the source token (`print(...`), never the quoted program name.
+        (line.starts_with('\'')
+            && line.contains("is not recognized as an internal or external command"))
+            || (line.starts_with("Python was not found") && line.contains("Microsoft Store"))
+    })
 }
 
 #[cfg(windows)]
@@ -1771,8 +1784,7 @@ pub fn run_loop(
                                 // it would prime install detours.
                                 let mut compiled: Option<(String, ToolOutcome)> = None;
                                 for interpreter in ["py", "python"] {
-                                    let command =
-                                        format!("{interpreter} -m py_compile {relative}");
+                                    let command = format!("{interpreter} -m py_compile {relative}");
                                     let action = Action::RunShell {
                                         command: command.clone(),
                                     };
@@ -1790,7 +1802,7 @@ pub fn run_loop(
                                     );
                                     reporter.tool_result("run_shell", &outcome);
                                     if outcome.is_err()
-                                        && python_interpreter_unusable(&outcome.text())
+                                        && python_interpreter_unusable(outcome.text())
                                     {
                                         continue;
                                     }
@@ -2489,7 +2501,7 @@ pub fn run_loop(
                                         reporter.tool_result("run_shell", &result);
                                         *ran.entry("run_shell".into()).or_insert(0) += 1;
                                         if result.is_err()
-                                            && python_interpreter_unusable(&result.text())
+                                            && python_interpreter_unusable(result.text())
                                         {
                                             continue;
                                         }
@@ -2901,9 +2913,10 @@ pub fn run_loop(
                                 "`py --version`, then use `py` for every later Python command."
                             )
                             .into();
-                            runtime.ledger.failed_attempts.push(
-                                "`python --version` hit the Windows Store alias stub".into(),
-                            );
+                            runtime
+                                .ledger
+                                .failed_attempts
+                                .push("`python --version` hit the Windows Store alias stub".into());
                             if let Err(error) = runtime.save() {
                                 reporter.notice(&format!("context paging state error: {error}"));
                                 return LoopEnd::DriverError;
@@ -8249,6 +8262,14 @@ mod tests {
             "exit: 1\nstderr:\n  File \"game.py\", line 3\nSyntaxError: invalid syntax\n"
         ));
         assert!(!python_interpreter_unusable("exit: 0\n"));
+        // A REAL syntax error whose echoed source line quotes the host-failure
+        // text must stay a source failure: classifying it as a missing
+        // interpreter skips validation and accepts a file that cannot compile.
+        assert!(!python_interpreter_unusable(concat!(
+            "exit: 1\nstderr:\n  File \"shell_help.py\", line 12\n",
+            "    print('py is not recognized as an internal or external command')\n",
+            "SyntaxError: unterminated string literal\n"
+        )));
     }
 
     /// On a host where `python` really works (GitHub's windows runner), a
@@ -8267,6 +8288,10 @@ mod tests {
             );
             return;
         }
+        // This test's write_file pushes onto the PROCESS-GLOBAL checkpoint
+        // log; unserialized, a concurrent checkpoint test's sync adopts the
+        // entry as "unjournaled" and undoes the wrong file.
+        let _cp = super::super::checkpoint::tests::cp_lock();
         let dir = tempfile::tempdir().unwrap();
         let sb = Sandbox::new(dir.path(), false, Duration::from_secs(15)).unwrap();
         let mut driver = MockDriver {
@@ -8293,7 +8318,12 @@ mod tests {
         let end = run_loop(
             &mut driver,
             &mut ScriptApprover(
-                vec![Decision::Once, Decision::Once, Decision::Once, Decision::Once],
+                vec![
+                    Decision::Once,
+                    Decision::Once,
+                    Decision::Once,
+                    Decision::Once,
+                ],
                 0,
             ),
             &mut reporter,
@@ -8336,6 +8366,8 @@ mod tests {
             );
             return;
         }
+        // Same checkpoint-log serialization as the healthy-host test above.
+        let _cp = super::super::checkpoint::tests::cp_lock();
         let dir = tempfile::tempdir().unwrap();
         let sb = Sandbox::new(dir.path(), false, Duration::from_secs(15)).unwrap();
         let mut driver = MockDriver {

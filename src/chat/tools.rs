@@ -2313,8 +2313,11 @@ impl PipeCapture {
         let mut bytes = self.head.clone();
         if self.dropped > 0 {
             bytes.extend_from_slice(
-                format!("\n...[output capture truncated: {} bytes dropped]...\n", self.dropped)
-                    .as_bytes(),
+                format!(
+                    "\n...[output capture truncated: {} bytes dropped]...\n",
+                    self.dropped
+                )
+                .as_bytes(),
             );
         }
         bytes.extend(self.tail.iter().copied());
@@ -2563,8 +2566,18 @@ fn run_shell_cancellable(sandbox: &Sandbox, command: &str, cancel: &AtomicBool) 
                     let _ = child.wait();
                     // Brief drain only — the tree is dead, so the pipes close
                     // almost immediately; whatever arrived is returned so the
-                    // Stop is not also an evidence wipe.
-                    await_pipe_drain(captures, done, Duration::from_millis(500), cancel);
+                    // Stop is not also an evidence wipe. NOT `cancel`: that
+                    // flag is already set (it is why we are here), and
+                    // await_pipe_drain aborts on it — passing it made this a
+                    // 0ms no-op that raced the reader threads and usually
+                    // lost the final flush, the most useful bytes on a Stop.
+                    // The 500ms cap and the stall detector bound it instead.
+                    await_pipe_drain(
+                        captures,
+                        done,
+                        Duration::from_millis(500),
+                        &AtomicBool::new(false),
+                    );
                     return ToolOutcome::Err(format!(
                         "command cancelled by user stop{}",
                         partial_output_text(&stdout_cap, &stderr_cap)
@@ -2602,27 +2615,23 @@ fn run_shell_cancellable(sandbox: &Sandbox, command: &str, cancel: &AtomicBool) 
         }
     };
 
-    // The child exited. Give the readers a bounded, growth-aware window to
-    // drain what is still buffered in the pipes: for a normal command both
-    // pipes hit EOF within milliseconds of exit; while output is still
-    // FLOWING (a big dump mid-transfer) the window extends up to the
-    // command's own deadline; a descendant holding the write end open
-    // WITHOUT writing (`start /b server`) stalls out in ~400ms instead of
-    // hanging the turn forever. On Windows the kill-on-close job reaps such
+    // The child exited. Give the readers a SHORT bounded window to drain what
+    // is still buffered in the pipes: at most one pipe buffer per pipe of the
+    // child's own output can remain (~64 KiB), which drains in milliseconds.
+    //
+    // The cap is a small constant, NOT the remaining deadline: any output
+    // still arriving after the direct child exited comes from a descendant
+    // that inherited the write ends, and a chatty one (`start /b` a dev
+    // server, `sh -c 'server &'`) writing faster than the stall detector's
+    // window would otherwise hold a SUCCEEDED command open for the rest of
+    // its timeout — 120s on the Web Code lane — and pollute its stdout with
+    // the descendant's chatter. On Windows the kill-on-close job reaps such
     // stragglers when this function returns, which also EOFs the readers.
-    let drain_cap = deadline
-        .saturating_duration_since(std::time::Instant::now())
-        .max(Duration::from_millis(500));
-    await_pipe_drain(captures, done, drain_cap, cancel);
+    const POST_EXIT_DRAIN: Duration = Duration::from_millis(1500);
+    await_pipe_drain(captures, done, POST_EXIT_DRAIN, cancel);
 
-    let stdout_bytes = stdout_cap
-        .lock()
-        .map(|c| c.snapshot())
-        .unwrap_or_default();
-    let stderr_bytes = stderr_cap
-        .lock()
-        .map(|c| c.snapshot())
-        .unwrap_or_default();
+    let stdout_bytes = stdout_cap.lock().map(|c| c.snapshot()).unwrap_or_default();
+    let stderr_bytes = stderr_cap.lock().map(|c| c.snapshot()).unwrap_or_default();
 
     let mut text = String::new();
     let code = status.code().unwrap_or(-1);
@@ -2731,7 +2740,6 @@ fn shell_failure_hint(command: &str, stdout: &str, stderr: &str) -> Option<&'sta
     }
     if has("is not recognized as an internal or external command") {
         let first_word = command
-            .trim_start()
             .split_whitespace()
             .next()
             .unwrap_or_default()

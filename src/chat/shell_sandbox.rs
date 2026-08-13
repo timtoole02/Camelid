@@ -943,9 +943,8 @@ mod tests {
                 .map(std::ffi::OsString::from)
                 .collect();
             let borrowed: Vec<&std::ffi::OsStr> = owned.iter().map(|a| a.as_os_str()).collect();
-            let (mut builder, enforced) =
-                confined(&borrowed, None, root, ShellSandbox::Sandboxed)
-                    .expect("sandbox-exec must be enforceable on macOS");
+            let (mut builder, enforced) = confined(&borrowed, None, root, ShellSandbox::Sandboxed)
+                .expect("sandbox-exec must be enforceable on macOS");
             assert_eq!(enforced.mode, ShellSandbox::Sandboxed);
             let out = builder.output().expect("spawn the confined shell");
             let mut text = String::from_utf8_lossy(&out.stdout).to_string();

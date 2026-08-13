@@ -202,14 +202,35 @@ fn repair_invalid_json_escapes(s: &str) -> String {
 /// unparseable, so the whole call was dropped and the turn died on the
 /// malformed-syntax guard.
 fn unicode_escape_is_valid(rest: &std::str::Chars) -> bool {
-    rest.clone().take(4).filter(|c| c.is_ascii_hexdigit()).count() == 4
+    rest.clone()
+        .take(4)
+        .filter(|c| c.is_ascii_hexdigit())
+        .count()
+        == 4
 }
 
-/// A body containing `X:\` is carrying an unescaped Windows path.
+/// A body carrying an UNESCAPED Windows drive path (`C:\Users`), which the
+/// bare `<alpha>:\` trigram is far too loose to identify:
+///
+/// * the drive letter must STAND ALONE — `"Status:\n"` ends in `t`,`:`,`\` and
+///   is an ordinary word followed by a newline escape, not a path. Requiring a
+///   non-alphanumeric char before the letter rejects it.
+/// * a CORRECTLY escaped path (`C:\\Users`) is already valid JSON, so its
+///   letter escapes are real escapes; a following second backslash rules it
+///   out.
+///
+/// Getting this wrong is not cosmetic: path mode doubles every `\n`/`\t`, so a
+/// false positive rewrites a model-authored source file into one line of
+/// literal `\n` sequences.
 fn body_has_drive_path(body: &str) -> bool {
-    body.as_bytes()
-        .windows(3)
-        .any(|w| w[0].is_ascii_alphabetic() && w[1] == b':' && w[2] == b'\\')
+    let bytes = body.as_bytes();
+    bytes.windows(3).enumerate().any(|(index, window)| {
+        window[0].is_ascii_alphabetic()
+            && window[1] == b':'
+            && window[2] == b'\\'
+            && (index == 0 || !bytes[index - 1].is_ascii_alphanumeric())
+            && bytes.get(index + 3) != Some(&b'\\')
+    })
 }
 
 /// Repair one JSON string body.
@@ -506,19 +527,29 @@ fn parse_json(text: &str) -> Vec<ToolCall> {
 /// structure but forgets to JSON-escape quotes inside the `content` value.
 fn recover_malformed_write_file(text: &str) -> Option<ToolCall> {
     let trimmed = text.trim();
-    if !trimmed.starts_with('{')
-        || !(trimmed.contains(r#""name":"write_file""#)
-            || trimmed.contains(r#""name": "write_file""#))
-    {
+    // The envelope's FIRST `"name"` must be write_file, at KEY position. A
+    // bare `contains` matched a write_file mention anywhere — including inside
+    // a run_shell command VALUE that happens to emit JSON — and recovered that
+    // shell call as a write, executing a completely different tool than the
+    // model asked for. Only structural key position can tell those apart.
+    if !trimmed.starts_with('{') || !envelope_names_write_file(trimmed) {
         return None;
     }
     let content_key = trimmed.find(r#""content""#)?;
     let after_key = &trimmed[content_key + r#""content""#.len()..];
     let content_open = after_key.find('"')?;
     let encoded_content = &after_key[content_open + 1..];
+    // A `path` key BEFORE the content value wins over any `", "path": "`
+    // sequence found INSIDE it: the pre-content region is structurally outside
+    // the content value, whereas an in-content match is by construction
+    // literal text the model wrote (a script printing a JSON path field), and
+    // honoring it truncated the content at that point and wrote the truncated
+    // source to the wrong file.
+    let path_before = path_key_before_content(&trimmed[..content_key]);
     let (encoded_content, path) = if let Some((content, path_tail)) = encoded_content
         .rsplit_once(r#"", "path": ""#)
         .or_else(|| encoded_content.rsplit_once(r#"","path":""#))
+        .filter(|_| path_before.is_none())
     {
         let path_end = path_tail.find('"')?;
         let path = &path_tail[..path_end];
@@ -526,23 +557,16 @@ fn recover_malformed_write_file(text: &str) -> Option<ToolCall> {
             return None;
         }
         (content, Some(decode_jsonish_string(path)))
+    } else if path_before.is_some() {
+        let content = strip_envelope_tail(encoded_content)?;
+        (content, path_before)
     } else {
         // Preserve a recognisable malformed write even when the model omitted
         // its required path. The call remains non-executable: normal tool
         // validation will reject the missing path and feed that typed error
         // back to the model. Dropping it here would misclassify source as a
         // final answer and bypass the model's recovery turn entirely.
-        let content = encoded_content
-            .strip_suffix(r#""}}"#)
-            .or_else(|| encoded_content.strip_suffix(r#""} }"#))
-            // Exact Llama 3.2 3B live failure: it closes `parameters` but
-            // omits the outer envelope brace after a long content value.
-            .or_else(|| encoded_content.strip_suffix(r#""}"#))?;
-        // Qwen commonly orders `path` BEFORE `content`; the rsplit above only
-        // finds a path that FOLLOWS the content value. Scan strictly before
-        // the content key — that region is structurally outside the content
-        // value, so a literal `"path"` inside source can never match.
-        (content, path_key_before_content(&trimmed[..content_key]))
+        (strip_envelope_tail(encoded_content)?, None)
     };
     let mut args = serde_json::Map::new();
     args.insert(
@@ -558,12 +582,55 @@ fn recover_malformed_write_file(text: &str) -> Option<ToolCall> {
     })
 }
 
+/// Close a malformed write_file's content value at the envelope's own tail.
+fn strip_envelope_tail(encoded_content: &str) -> Option<&str> {
+    encoded_content
+        .strip_suffix(r#""}}"#)
+        .or_else(|| encoded_content.strip_suffix(r#""} }"#))
+        // Exact Llama 3.2 3B live failure: it closes `parameters` but
+        // omits the outer envelope brace after a long content value.
+        .or_else(|| encoded_content.strip_suffix(r#""}"#))
+}
+
+/// True when the envelope's FIRST `"name"` KEY names write_file. Key position
+/// is what distinguishes the tool being called from the same bytes appearing
+/// inside some other tool's argument value.
+fn envelope_names_write_file(trimmed: &str) -> bool {
+    let Some(key) = find_structural_key(trimmed, r#""name""#) else {
+        return false;
+    };
+    let after = trimmed[key + r#""name""#.len()..].trim_start();
+    let Some(after) = after.strip_prefix(':') else {
+        return false;
+    };
+    after.trim_start().starts_with(r#""write_file""#)
+}
+
+/// First occurrence of `key` at KEY position — immediately after `{` or `,`
+/// (whitespace allowed). A match inside a string VALUE never qualifies.
+fn find_structural_key(text: &str, key: &str) -> Option<usize> {
+    let mut cursor = 0usize;
+    while let Some(relative) = text[cursor..].find(key) {
+        let start = cursor + relative;
+        let preceding = text[..start]
+            .chars()
+            .rev()
+            .find(|character| !character.is_whitespace());
+        if matches!(preceding, Some('{') | Some(',')) {
+            return Some(start);
+        }
+        cursor = start + key.len();
+    }
+    None
+}
+
 /// Extract a `"path"` key's quoted value from the region BEFORE the content
-/// key of a malformed write_file envelope. Path values contain no raw quotes,
-/// so a plain quote scan suffices even though the envelope as a whole failed
-/// to parse.
+/// key of a malformed write_file envelope. The key must sit at structural key
+/// position, so a literal `"path"` inside an earlier VALUE cannot match. Path
+/// values contain no raw quotes, so a plain quote scan suffices even though
+/// the envelope as a whole failed to parse.
 fn path_key_before_content(prefix: &str) -> Option<String> {
-    let key = prefix.rfind(r#""path""#)?;
+    let key = find_structural_key(prefix, r#""path""#)?;
     let after = prefix[key + r#""path""#.len()..].trim_start();
     let after = after.strip_prefix(':')?.trim_start();
     let after = after.strip_prefix('"')?;
@@ -809,6 +876,64 @@ mod tests {
         assert!(
             !command.chars().any(|c| c.is_control()),
             "no control characters may be injected into an executed command: {command}"
+        );
+    }
+
+    /// Path mode must key on a REAL drive path. `Status:\n` ends in the same
+    /// alpha-colon-backslash trigram, so a loose match flipped ordinary source
+    /// into path mode and doubled every newline — rewriting a Python file into
+    /// one line of literal `\n` sequences (a regression of this function's
+    /// original `\'` case, triggered by any colon-suffixed word).
+    #[test]
+    fn colon_suffixed_words_do_not_trigger_path_mode() {
+        let text = r#"<tool_call>{"name": "write_file", "arguments": {"path": "s.py", "content": "print('Status:\nit\'s running')\nmain()"}}</tool_call>"#;
+        let calls = parse(text, "qwen3");
+        assert_eq!(calls.len(), 1, "got {calls:?}");
+        assert_eq!(
+            calls[0].args["content"], "print('Status:\nit\\'s running')\nmain()",
+            "newlines must stay real newlines"
+        );
+    }
+
+    /// A correctly escaped drive path is already valid JSON, so its letter
+    /// escapes are genuine escapes and path mode must stay off.
+    #[test]
+    fn correctly_escaped_drive_path_keeps_normal_escape_handling() {
+        let text = r#"<tool_call>{"name": "write_file", "arguments": {"path": "w.py", "content": "root = 'C:\\Users\\timto'\nprint(root)\nit\'s"}}</tool_call>"#;
+        let calls = parse(text, "qwen3");
+        assert_eq!(calls.len(), 1, "got {calls:?}");
+        let content = calls[0].args["content"].as_str().unwrap();
+        assert!(content.contains(r"C:\Users\timto"), "{content}");
+        assert!(content.contains("\nprint(root)"), "{content}");
+    }
+
+    /// A malformed run_shell whose COMMAND emits JSON mentioning write_file
+    /// must not be recovered as a write: the gate is the envelope's first
+    /// `"name"` KEY, never a substring inside some other tool's argument.
+    #[test]
+    fn malformed_run_shell_mentioning_write_file_is_not_recovered_as_a_write() {
+        let text = r#"<tool_call>{"name": "run_shell", "arguments": {"command": "echo {"path": "call.json", "name": "write_file", "content": "x"} > gen.json"}}</tool_call>"#;
+        let calls = parse(text, "qwen3");
+        assert!(
+            !calls.iter().any(|call| call.name == "write_file"),
+            "a shell call must never be executed as a write: {calls:?}"
+        );
+    }
+
+    /// When a real `path` key precedes the content, an in-content
+    /// `", "path": "` sequence is literal text — honoring it truncated the
+    /// source and wrote the fragment to the wrong file.
+    #[test]
+    fn in_content_path_text_does_not_hijack_the_real_path_key() {
+        let text = r#"<tool_call>{"name": "write_file", "arguments": {"path": "gen.py", "content": "print('{"name": "job", "path": "out.json"}')
+done()"}}</tool_call>"#;
+        let calls = parse(text, "qwen3");
+        assert_eq!(calls.len(), 1, "got {calls:?}");
+        assert_eq!(calls[0].args["path"], "gen.py", "the real key must win");
+        let content = calls[0].args["content"].as_str().unwrap();
+        assert!(
+            content.contains("out.json") && content.contains("done()"),
+            "content must not be truncated at the in-content path text: {content}"
         );
     }
 
