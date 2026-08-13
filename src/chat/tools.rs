@@ -2244,25 +2244,201 @@ fn edit_file(path: &Path, old: &str, new: &str, display_path: &str) -> ToolOutco
     }
 }
 
+/// Per-pipe capture bounds: first `CAPTURE_HEAD_BYTES` plus a rolling tail of
+/// `CAPTURE_TAIL_BYTES`, everything between counted and dropped. Sized so the
+/// extended render (`clip_head_tail`: 64 KiB head + 192 KiB tail) always has
+/// full material, while a runaway emitter (`type model.gguf`, a looping
+/// logger) can no longer grow an unbounded Vec until the allocator aborts the
+/// whole process. The reader keeps draining past the cap so the child never
+/// wedges on a full pipe.
+const CAPTURE_HEAD_BYTES: usize = 128 * 1024;
+const CAPTURE_TAIL_BYTES: usize = 256 * 1024;
+
+/// Bounded pipe capture shared between a detached reader thread and the wait
+/// loop. The main thread snapshots it at any point without joining the reader
+/// — the reader owns nothing the caller needs to wait for.
+struct PipeCapture {
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    dropped: u64,
+    /// Total bytes ever appended; the drain wait uses this to tell "still
+    /// flowing" from "a descendant is just holding the write end open".
+    seen: u64,
+}
+
+impl PipeCapture {
+    fn new() -> Self {
+        PipeCapture {
+            head: Vec::new(),
+            tail: std::collections::VecDeque::new(),
+            dropped: 0,
+            seen: 0,
+        }
+    }
+
+    fn append(&mut self, chunk: &[u8]) {
+        self.seen += chunk.len() as u64;
+        let head_room = CAPTURE_HEAD_BYTES.saturating_sub(self.head.len());
+        let take = head_room.min(chunk.len());
+        self.head.extend_from_slice(&chunk[..take]);
+        let rest = &chunk[take..];
+        if !rest.is_empty() {
+            self.tail.extend(rest.iter().copied());
+            let excess = self.tail.len().saturating_sub(CAPTURE_TAIL_BYTES);
+            if excess > 0 {
+                self.tail.drain(..excess);
+                self.dropped += excess as u64;
+            }
+        }
+    }
+
+    /// Everything retained, with an explicit marker where bytes were dropped so
+    /// truncation is visible instead of silent.
+    fn snapshot(&self) -> Vec<u8> {
+        let mut bytes = self.head.clone();
+        if self.dropped > 0 {
+            bytes.extend_from_slice(
+                format!("\n...[output capture truncated: {} bytes dropped]...\n", self.dropped)
+                    .as_bytes(),
+            );
+        }
+        bytes.extend(self.tail.iter().copied());
+        bytes
+    }
+}
+
+type SharedCapture = std::sync::Arc<std::sync::Mutex<PipeCapture>>;
+
+/// Detached reader: drains the pipe into the shared capture until EOF, then
+/// flips `done`. Never joined — when the pipe's last writer disappears (child
+/// exit, or the job object killing stragglers) it reads EOF and exits on its
+/// own.
+fn spawn_capture_reader<R: std::io::Read + Send + 'static>(
+    mut pipe: R,
+    capture: SharedCapture,
+    done: std::sync::Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 16 * 1024];
+        loop {
+            match std::io::Read::read(&mut pipe, &mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if let Ok(mut c) = capture.lock() {
+                        c.append(&chunk[..n]);
+                    }
+                }
+            }
+        }
+        done.store(true, Ordering::Release);
+    });
+}
+
+/// Wait briefly for the detached readers to finish after the child exited (or
+/// was killed). Returns when both pipes hit EOF, when neither has produced a
+/// byte for `STALL_MS` (a lingering descendant is holding the write end open
+/// without writing — never wait for it; on Windows the kill-on-close job
+/// reaps it when the caller returns), when `hard_cap` elapses, or on cancel.
+/// This replaces the old unbounded `join()`, which deadlocked the turn: the
+/// join waited for the descendant to exit, and the descendant's teardown (job
+/// drop) waited for the join.
+fn await_pipe_drain(
+    captures: [&SharedCapture; 2],
+    done: [&std::sync::Arc<AtomicBool>; 2],
+    hard_cap: Duration,
+    cancel: &AtomicBool,
+) {
+    const STALL_MS: u64 = 400;
+    let total = |captures: [&SharedCapture; 2]| -> u64 {
+        captures
+            .iter()
+            .map(|c| c.lock().map(|c| c.seen).unwrap_or(0))
+            .sum()
+    };
+    let start = std::time::Instant::now();
+    let mut last_seen = total(captures);
+    let mut last_growth = std::time::Instant::now();
+    loop {
+        if done.iter().all(|d| d.load(Ordering::Acquire)) {
+            return;
+        }
+        if start.elapsed() >= hard_cap || cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        let seen = total(captures);
+        if seen != last_seen {
+            last_seen = seen;
+            last_growth = std::time::Instant::now();
+        } else if last_growth.elapsed() >= Duration::from_millis(STALL_MS) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// One visible line when the capture cap dropped bytes. The in-stream marker
+/// sits at the head/tail seam, which the 16 KiB display clip usually cuts out —
+/// this note rides OUTSIDE the clipped region so truncation is never silent.
+fn capture_drop_note(stdout: &SharedCapture, stderr: &SharedCapture) -> Option<String> {
+    let dropped = |c: &SharedCapture| c.lock().map(|c| c.dropped).unwrap_or(0);
+    let (out, err) = (dropped(stdout), dropped(stderr));
+    if out == 0 && err == 0 {
+        return None;
+    }
+    Some(format!(
+        "[output exceeded the capture limit: {out} stdout / {err} stderr bytes dropped \
+         between the retained head and tail]\n"
+    ))
+}
+
+/// Render whatever the pipes captured, for the timeout/cancel error paths.
+/// Partial output is forensics the model (and user) act on — the name of the
+/// hanging test, the last log line before the wedge — and discarding it forced
+/// blind retries at full-timeout cost.
+fn partial_output_text(stdout: &SharedCapture, stderr: &SharedCapture) -> String {
+    let render = |c: &SharedCapture| -> String {
+        c.lock()
+            .map(|c| clip(&String::from_utf8_lossy(&c.snapshot())))
+            .unwrap_or_default()
+    };
+    let out = render(stdout);
+    let err = render(stderr);
+    let mut text = String::new();
+    if !out.is_empty() {
+        text.push_str(&format!("\npartial stdout before teardown:\n{out}\n"));
+    }
+    if !err.is_empty() {
+        text.push_str(&format!("\npartial stderr before teardown:\n{err}\n"));
+    }
+    if let Some(note) = capture_drop_note(stdout, stderr) {
+        text.push_str(&note);
+    }
+    text
+}
+
 /// Shell execution whose wait loop also honors the turn's cancel flag: a
 /// user Stop kills the child within one 50ms poll instead of being ignored for
 /// the rest of the shell timeout (120s on the Web Code lane — the old behavior
 /// left Stop dead for the whole window). Cancellation uses the same
 /// direct-child kill as the timeout path; the documented Unix orphan-descendant
 /// tradeoff is unchanged.
+///
+/// Readers are NEVER joined, on any path. A descendant that inherited the pipe
+/// write ends (`start /b …`, `sh -c "server &"`) keeps them open after the
+/// direct child exits, so a join blocks for the descendant's lifetime — on the
+/// success path that was a permanent, uncancellable hang (the kill-on-close job
+/// that would have reaped the descendant only dropped AFTER the join). Instead
+/// the readers stream into bounded shared buffers and the wait loop snapshots
+/// them after a short, growth-aware drain window.
 fn run_shell_cancellable(sandbox: &Sandbox, command: &str, cancel: &AtomicBool) -> ToolOutcome {
     // Platform shell with a timeout: `/bin/sh -c <command>` on Unix, `cmd /C
     // <command>` on Windows. The cwd-pin and OS-level confinement are applied by
     // the shell-sandbox layer (Task 1), which fails closed when the configured
     // mode can't be enforced on this host.
     #[cfg(unix)]
-    let shell_argv: Vec<std::ffi::OsString> = vec![
-        "/bin/sh".into(),
-        "-c".into(),
-        std::ffi::OsString::from(command),
-    ];
+    let interpreter_argv: Vec<std::ffi::OsString> = vec!["/bin/sh".into(), "-c".into()];
     #[cfg(windows)]
-    let shell_argv: Vec<std::ffi::OsString> = {
+    let interpreter_argv: Vec<std::ffi::OsString> = {
         // Absolute interpreter path (W4), matching run_windows_command's
         // system32() discipline. Defense-in-depth only: std's process search
         // already consults System32 *before* the parent PATH and never the
@@ -2275,27 +2451,26 @@ fn run_shell_cancellable(sandbox: &Sandbox, command: &str, cancel: &AtomicBool) 
         // /bin/sh -c above), NOT a script fed over stdin the way
         // run_windows_command does: run_shell's contract is one shell command
         // line, and stdin delivery would change cmd's exit-code/echo semantics
-        // and diverge from the Unix path. std applies CRT-style quoting to the
-        // single `command` arg while cmd does not use CRT parsing, but the
-        // mismatch is not exploitable — std only emits `\` immediately before a
-        // `"`, which is an illegal Windows filename character, so a mangled path
-        // errors out rather than escaping the cwd pin (verified Phase 0, W4).
-        vec![
-            system32("cmd.exe").into(),
-            "/C".into(),
-            std::ffi::OsString::from(command),
-        ]
+        // and diverge from the Unix path. The command tail is attached via
+        // `raw_arg` inside `confined_shell_command` so cmd receives the exact
+        // bytes the model wrote — std's CRT-style auto-quoting mangled every
+        // command containing a double quote (see that function's contract).
+        vec![system32("cmd.exe").into(), "/C".into()]
     };
     // Build the confined command. A sandboxed mode that can't be enforced here
     // returns an error → refuse to run, never a silent unconfined fallback. The
     // confinement and the report of it come from this one call, so the layers
     // shown to the user cannot describe something that was not applied.
-    let argv: Vec<&std::ffi::OsStr> = shell_argv.iter().map(|a| a.as_os_str()).collect();
-    let mut builder =
-        match shell_sandbox::confined_command(&argv, &sandbox.root, sandbox.shell_mode) {
-            Ok((builder, _enforced)) => builder,
-            Err(e) => return ToolOutcome::Err(format!("run_shell refused: {e}")),
-        };
+    let argv: Vec<&std::ffi::OsStr> = interpreter_argv.iter().map(|a| a.as_os_str()).collect();
+    let mut builder = match shell_sandbox::confined_shell_command(
+        &argv,
+        std::ffi::OsStr::new(command),
+        &sandbox.root,
+        sandbox.shell_mode,
+    ) {
+        Ok((builder, _enforced)) => builder,
+        Err(e) => return ToolOutcome::Err(format!("run_shell refused: {e}")),
+    };
     builder
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2332,29 +2507,30 @@ fn run_shell_cancellable(sandbox: &Sandbox, command: &str, cancel: &AtomicBool) 
         job
     };
 
-    // Drain stdout/stderr on their own threads (W1). Nothing read these until
-    // after the child exited, so a command that emitted more than one pipe
-    // buffer — 64 KiB per pipe on Windows (std sys/process/windows/child_pipe.rs
-    // PIPE_BUFFER_CAPACITY), and the same order on Linux — blocked forever in
-    // write(), never exited, and was then reported to the model as a timeout
-    // with every captured byte discarded. `git log` in this repo clears that in
-    // one command. Both pipes get their own quota, so either one alone can wedge
-    // the child; both must be drained. This mirrors run_windows_command, which
-    // has had the fix since it was written.
-    let out_reader = child.stdout.take().map(|mut p| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut p, &mut buf);
-            buf
-        })
-    });
-    let err_reader = child.stderr.take().map(|mut p| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut p, &mut buf);
-            buf
-        })
-    });
+    // Drain stdout/stderr on detached threads into BOUNDED shared captures
+    // (W1 + the capture cap). Nothing read these until after the child exited,
+    // so a command that emitted more than one pipe buffer — 64 KiB per pipe on
+    // Windows (std sys/process/windows/child_pipe.rs PIPE_BUFFER_CAPACITY),
+    // and the same order on Linux — blocked forever in write(), never exited,
+    // and was then reported to the model as a timeout with every captured byte
+    // discarded. `git log` in this repo clears that in one command. Both pipes
+    // get their own reader, so either one alone can wedge the child; both must
+    // be drained. The shared buffers (not thread-owned Vecs) are what let every
+    // exit path snapshot output without joining — see the function contract.
+    let stdout_cap: SharedCapture = std::sync::Arc::new(std::sync::Mutex::new(PipeCapture::new()));
+    let stderr_cap: SharedCapture = std::sync::Arc::new(std::sync::Mutex::new(PipeCapture::new()));
+    let stdout_done = std::sync::Arc::new(AtomicBool::new(false));
+    let stderr_done = std::sync::Arc::new(AtomicBool::new(false));
+    match child.stdout.take() {
+        Some(p) => spawn_capture_reader(p, stdout_cap.clone(), stdout_done.clone()),
+        None => stdout_done.store(true, Ordering::Release),
+    }
+    match child.stderr.take() {
+        Some(p) => spawn_capture_reader(p, stderr_cap.clone(), stderr_done.clone()),
+        None => stderr_done.store(true, Ordering::Release),
+    }
+    let captures = [&stdout_cap, &stderr_cap];
+    let done = [&stdout_done, &stderr_done];
 
     let deadline = std::time::Instant::now() + sandbox.shell_timeout;
     let status = loop {
@@ -2370,43 +2546,39 @@ fn run_shell_cancellable(sandbox: &Sandbox, command: &str, cancel: &AtomicBool) 
                     }
                     let _ = child.kill();
                     let _ = child.wait();
-                    // Do NOT join the readers here — see the note on the timeout
-                    // arm below. Their output is discarded on this path anyway.
-                    drop(out_reader);
-                    drop(err_reader);
-                    return ToolOutcome::Err("command cancelled by user stop".into());
+                    // Brief drain only — the tree is dead, so the pipes close
+                    // almost immediately; whatever arrived is returned so the
+                    // Stop is not also an evidence wipe.
+                    await_pipe_drain(captures, done, Duration::from_millis(500), cancel);
+                    return ToolOutcome::Err(format!(
+                        "command cancelled by user stop{}",
+                        partial_output_text(&stdout_cap, &stderr_cap)
+                    ));
                 }
                 if std::time::Instant::now() >= deadline {
                     // Windows: tear down the whole tree (W2), then the
                     // direct-child backstop. Terminating the job kills every
                     // descendant; child.kill() covers the case where the job
                     // never assigned. Unix: direct child only — see the note at
-                    // the job-object assignment above.
+                    // the job-object assignment above. Readers stay detached
+                    // (killing the direct child need not close pipe write ends
+                    // held by descendants — a join here was measured unbounded,
+                    // 30s against a 3s deadline on Linux CI); the shared
+                    // captures still hand back everything that arrived.
                     #[cfg(windows)]
                     if let Some(ref j) = _job {
                         j.terminate();
                     }
                     let _ = child.kill();
                     let _ = child.wait();
-                    // DETACH the readers instead of joining them. Killing the
-                    // direct child does NOT necessarily close the pipe write
-                    // ends on Unix: a pipe reports EOF only once EVERY writer
-                    // has closed, and `/bin/sh -c` may leave a descendant
-                    // (`sleep`, a `make -j` fan-out) holding the inherited fd.
-                    // Joining then blocked until that orphan exited on its own,
-                    // so BOTH the deadline and a user Stop were silently
-                    // unbounded — measured at a full 30s against a 3s deadline
-                    // on Linux CI. The output is discarded on these paths, so
-                    // the threads have nothing to hand back; they own only their
-                    // own buffer and exit when the pipe finally closes.
-                    drop(out_reader);
-                    drop(err_reader);
+                    await_pipe_drain(captures, done, Duration::from_millis(500), cancel);
                     // The hint pass below never sees this early return, so the
                     // guidance rides the message itself.
                     return ToolOutcome::Err(format!(
                         "command timed out after {}s\n[hint: run a smaller unit of work \
-                         rather than repeating the same long command]",
-                        sandbox.shell_timeout.as_secs()
+                         rather than repeating the same long command]{}",
+                        sandbox.shell_timeout.as_secs(),
+                        partial_output_text(&stdout_cap, &stderr_cap)
                     ));
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -2415,11 +2587,26 @@ fn run_shell_cancellable(sandbox: &Sandbox, command: &str, cancel: &AtomicBool) 
         }
     };
 
-    let stdout_bytes = out_reader
-        .map(|h| h.join().unwrap_or_default())
+    // The child exited. Give the readers a bounded, growth-aware window to
+    // drain what is still buffered in the pipes: for a normal command both
+    // pipes hit EOF within milliseconds of exit; while output is still
+    // FLOWING (a big dump mid-transfer) the window extends up to the
+    // command's own deadline; a descendant holding the write end open
+    // WITHOUT writing (`start /b server`) stalls out in ~400ms instead of
+    // hanging the turn forever. On Windows the kill-on-close job reaps such
+    // stragglers when this function returns, which also EOFs the readers.
+    let drain_cap = deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .max(Duration::from_millis(500));
+    await_pipe_drain(captures, done, drain_cap, cancel);
+
+    let stdout_bytes = stdout_cap
+        .lock()
+        .map(|c| c.snapshot())
         .unwrap_or_default();
-    let stderr_bytes = err_reader
-        .map(|h| h.join().unwrap_or_default())
+    let stderr_bytes = stderr_cap
+        .lock()
+        .map(|c| c.snapshot())
         .unwrap_or_default();
 
     let mut text = String::new();
@@ -2432,6 +2619,9 @@ fn run_shell_cancellable(sandbox: &Sandbox, command: &str, cancel: &AtomicBool) 
     }
     if !stderr.is_empty() {
         text.push_str(&format!("stderr:\n{stderr}\n"));
+    }
+    if let Some(note) = capture_drop_note(&stdout_cap, &stderr_cap) {
+        text.push_str(&note);
     }
     if status.success() {
         ToolOutcome::Ok(text)
@@ -4265,6 +4455,179 @@ mod tests {
             other => panic!("expected a cancelled error, got {other:?}"),
         }
         let _ = cancel.load(Ordering::Relaxed);
+    }
+
+    /// The success path must not wait for a descendant that inherited the pipe
+    /// write ends: the direct child exits immediately, the backgrounded
+    /// descendant keeps the pipes open for ~30s (Windows) / 30s (Unix), and the
+    /// old unbounded reader join turned that into a hang — with Stop dead and,
+    /// on Windows, the kill-on-close job unable to fire because its drop was
+    /// sequenced behind the join (a circular wait).
+    #[test]
+    fn run_shell_success_with_lingering_descendant_returns_promptly() {
+        #[cfg(windows)]
+        let _serial = ps_serial();
+        // -n 272: distinct from every other test's ping marker (W2 uses 271).
+        #[cfg(windows)]
+        let marker = "-n 272";
+        #[cfg(windows)]
+        for pid in pids_of_marked_ping(marker) {
+            kill_tree(pid);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(15))
+            .unwrap()
+            .with_shell_mode(ShellSandbox::Unrestricted);
+        #[cfg(windows)]
+        let command = "start /b ping -n 272 127.0.0.1";
+        #[cfg(unix)]
+        let command = "sleep 30 & echo started";
+        let a = validate(&call("run_shell", json!({ "command": command })), &sb).unwrap();
+        let t0 = std::time::Instant::now();
+        let out = a.execute(&sb);
+        let elapsed = t0.elapsed();
+        assert!(
+            matches!(out, ToolOutcome::Ok(_)),
+            "the exited command must report success, got {out:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "success must not wait for the lingering descendant (took {elapsed:?})"
+        );
+        // Windows: the kill-on-close job reaps the descendant when run_shell
+        // returns — it must not outlive the tool call.
+        #[cfg(windows)]
+        {
+            std::thread::sleep(Duration::from_millis(1000));
+            let survivors = pids_of_marked_ping(marker);
+            for pid in &survivors {
+                kill_tree(*pid);
+            }
+            assert!(
+                survivors.is_empty(),
+                "descendant outlived run_shell: {survivors:?}"
+            );
+        }
+    }
+
+    /// cmd.exe must receive the exact bytes the model wrote. std's CRT-style
+    /// auto-quoting backslash-escaped every interior quote — which cmd does not
+    /// parse — so `echo "two words"` reached the child as `echo \"two words\"`
+    /// and every double-quoted command was mangled (a quoted `python -c`
+    /// one-liner became a silent no-op). The raw_arg attachment pins the fix.
+    #[cfg(windows)]
+    #[test]
+    fn run_shell_windows_preserves_double_quotes() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path());
+        let a = validate(
+            &call("run_shell", json!({ "command": "echo \"two words\"" })),
+            &sb,
+        )
+        .unwrap();
+        let out = a.execute(&sb);
+        let text = out.text().to_string();
+        assert!(matches!(out, ToolOutcome::Ok(_)), "{text}");
+        assert!(
+            text.contains("\"two words\""),
+            "quotes must reach cmd verbatim: {text}"
+        );
+        assert!(
+            !text.contains("\\\""),
+            "CRT backslash-escapes must not leak into the child: {text}"
+        );
+    }
+
+    /// A timeout must hand back what was captured before the kill — the model
+    /// acts on the tail (which test hung, the last log line) instead of
+    /// retrying blind against a zero-output error.
+    #[test]
+    fn run_shell_timeout_returns_partial_output() {
+        #[cfg(windows)]
+        let _serial = ps_serial();
+        #[cfg(windows)]
+        let marker = "-n 273";
+        #[cfg(windows)]
+        for pid in pids_of_marked_ping(marker) {
+            kill_tree(pid);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(2))
+            .unwrap()
+            .with_shell_mode(ShellSandbox::Unrestricted);
+        #[cfg(windows)]
+        let command = "echo EARLY_FORENSIC_MARKER& ping -n 273 127.0.0.1";
+        #[cfg(unix)]
+        let command = "echo EARLY_FORENSIC_MARKER; sleep 30";
+        let a = validate(&call("run_shell", json!({ "command": command })), &sb).unwrap();
+        let out = a.execute(&sb);
+        match out {
+            ToolOutcome::Err(ref message) => {
+                assert!(message.contains("timed out"), "{message}");
+                assert!(
+                    message.contains("EARLY_FORENSIC_MARKER"),
+                    "partial output must survive the kill: {message}"
+                );
+            }
+            other => panic!("expected a timeout error, got {other:?}"),
+        }
+        #[cfg(windows)]
+        for pid in pids_of_marked_ping(marker) {
+            kill_tree(pid);
+        }
+    }
+
+    /// The capture cap keeps an exact head and tail, counts every dropped byte,
+    /// and marks the gap in the snapshot — this is what bounds run_shell's
+    /// memory on a runaway emitter instead of growing a Vec until the
+    /// allocator aborts the process.
+    #[test]
+    fn pipe_capture_bounds_memory_and_marks_the_gap() {
+        let total = CAPTURE_HEAD_BYTES + CAPTURE_TAIL_BYTES + 100_000;
+        let bytes: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        let mut capture = PipeCapture::new();
+        for chunk in bytes.chunks(64 * 1024) {
+            capture.append(chunk);
+        }
+        assert_eq!(capture.head.len(), CAPTURE_HEAD_BYTES);
+        assert_eq!(capture.tail.len(), CAPTURE_TAIL_BYTES);
+        assert_eq!(capture.seen as usize, total);
+        assert_eq!(
+            capture.dropped as usize,
+            total - CAPTURE_HEAD_BYTES - CAPTURE_TAIL_BYTES
+        );
+        assert_eq!(&capture.head[..], &bytes[..CAPTURE_HEAD_BYTES]);
+        let tail: Vec<u8> = capture.tail.iter().copied().collect();
+        assert_eq!(&tail[..], &bytes[total - CAPTURE_TAIL_BYTES..]);
+        let snapshot = capture.snapshot();
+        assert!(String::from_utf8_lossy(&snapshot).contains("output capture truncated"));
+    }
+
+    /// Shell-level twin of the cap test: a dump bigger than head+tail succeeds,
+    /// stays live, and surfaces the drop as a visible note outside the display
+    /// clip (the in-stream marker sits at the head/tail seam, which the 16 KiB
+    /// render clip usually removes).
+    #[test]
+    fn run_shell_caps_runaway_output_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = format!("{}\n", "Y".repeat(99));
+        let lines = (CAPTURE_HEAD_BYTES + CAPTURE_TAIL_BYTES) / line.len() + 1_000;
+        let mut payload = String::with_capacity(lines * line.len());
+        for _ in 0..lines {
+            payload.push_str(&line);
+        }
+        std::fs::write(dir.path().join("big.txt"), &payload).unwrap();
+        let (out, elapsed) = run_shell_cat(dir.path(), "big.txt", false);
+        assert!(
+            matches!(out, ToolOutcome::Ok(_)),
+            "an oversized dump must still succeed, got {out:?}"
+        );
+        assert!(
+            out.text().contains("exceeded the capture limit"),
+            "the drop must be visible after clipping: {}",
+            out.text()
+        );
+        assert!(elapsed < Duration::from_secs(15), "took {elapsed:?}");
     }
 
     // On Windows the default (sandboxed) mode is enforced natively (cwd-pin +

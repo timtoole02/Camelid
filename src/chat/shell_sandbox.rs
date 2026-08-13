@@ -35,7 +35,7 @@
 //!   downgrading.
 //!
 //! macOS confines by *wrapping* argv rather than by configuring the forked
-//! child, which is why [`confined_command`] both builds the command and returns
+//! child, which is why [`confined_shell_command`] both builds the command and returns
 //! what was enforced: a two-step API would let a caller collect the layer report
 //! without the wrapper ever reaching the command line.
 //!
@@ -144,20 +144,56 @@ impl EnforcedShell {
     }
 }
 
-/// Build the confined command that runs `shell_argv` (e.g. `["/bin/sh", "-c",
-/// command]`), with `root` as the scratch workspace. Returns the command
-/// together with what was actually enforced, or an error that means **refuse to
-/// run** (fail closed) — never a silent downgrade. `Disabled` is rejected here
-/// too (the tool should not have reached execution).
+/// The `run_shell` entry — deliberately the ONLY way to construct a run_shell
+/// command. Returns the command together with what was actually enforced, or an
+/// error that means **refuse to run** (fail closed) — never a silent downgrade;
+/// `Disabled` is rejected here too. macOS confines by wrapping argv
+/// (`sandbox-exec`) rather than by configuring the forked child, so a two-step
+/// "build it, then apply confinement" API would let a caller obtain the
+/// reported layers without the wrapper ever being applied — the exact shape of
+/// "reported but never applied". Handing the argv in means the report and the
+/// confinement are produced by one call or not at all.
 ///
-/// This is deliberately the ONLY way to construct a run_shell command. macOS
-/// confines by wrapping argv (`sandbox-exec`) rather than by configuring the
-/// forked child, so a two-step "build it, then apply confinement" API would let
-/// a caller obtain the reported layers without the wrapper ever being applied —
-/// the exact shape of "reported but never applied". Handing the argv in means
-/// the report and the confinement are produced by one call or not at all.
-pub fn confined_command(
+/// `interpreter_argv` is the platform shell prefix
+/// (`["/bin/sh","-c"]` or `[...\cmd.exe,"/C"]`) and `command` is the user's one
+/// shell command line, attached VERBATIM. On Unix that is a plain `arg()` —
+/// execve hands the byte string to the shell untouched. On Windows it must be
+/// `raw_arg()`: std's CRT-style auto-quoting wraps a spaced arg in quotes and
+/// backslash-escapes every interior `"`, but cmd.exe does not parse backslash
+/// escapes (it strips only the first and last quote of the `/C` tail), so every
+/// double-quoted command reached the child mangled — `python -c "print('ok')"`
+/// executed the literal string `"print('ok')"` as a bare expression and
+/// silently did nothing, and a quoted interpreter path stopped resolving at
+/// all. `raw_arg` gives cmd the exact bytes the model wrote, matching the Unix
+/// contract. The cwd-pin is unaffected: it comes from `current_dir`, not from
+/// how the tail is quoted.
+pub fn confined_shell_command(
+    interpreter_argv: &[&std::ffi::OsStr],
+    command: &std::ffi::OsStr,
+    root: &Path,
+    mode: ShellSandbox,
+) -> Result<(Command, EnforcedShell), String> {
+    confined(interpreter_argv, Some(command), root, mode)
+}
+
+/// Attach the user command line to a finished builder, per platform. Windows
+/// `raw_arg` bypasses the CRT quoting that cmd.exe cannot undo; everywhere else
+/// a normal `arg` is already verbatim.
+fn attach_command(builder: &mut Command, command: Option<&std::ffi::OsStr>) {
+    if let Some(command) = command {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            builder.raw_arg(command);
+        }
+        #[cfg(not(windows))]
+        builder.arg(command);
+    }
+}
+
+fn confined(
     shell_argv: &[&std::ffi::OsStr],
+    command: Option<&std::ffi::OsStr>,
     root: &Path,
     mode: ShellSandbox,
 ) -> Result<(Command, EnforcedShell), String> {
@@ -170,6 +206,7 @@ pub fn confined_command(
         ShellSandbox::Unrestricted => {
             let mut builder = Command::new(program);
             builder.args(args);
+            attach_command(&mut builder, command);
             builder.current_dir(root);
             Ok((builder, EnforcedShell::unrestricted()))
         }
@@ -182,6 +219,7 @@ pub fn confined_command(
                 // profile is in force.
                 builder.args(&plan.argv_prefix()[1..]);
                 builder.arg(program).args(args);
+                attach_command(&mut builder, command);
                 builder.current_dir(root);
                 Ok((builder, plan.enforced))
             }
@@ -189,6 +227,7 @@ pub fn confined_command(
             {
                 let mut builder = Command::new(program);
                 builder.args(args);
+                attach_command(&mut builder, command);
                 let enforced = configure_sandboxed(&mut builder, root)?;
                 Ok((builder, enforced))
             }
@@ -676,7 +715,7 @@ mod macos {
 // macOS: confinement comes from the kernel's Sandbox (Seatbelt) via
 // `sandbox-exec`, which applies an SBPL profile and then execs the shell. Unlike
 // Linux's `pre_exec` route this works by WRAPPING the command, so the profile is
-// built here and the argv prefix is applied by `confined_command` — the single
+// built here and the argv prefix is applied by `confined_shell_command` — the single
 // place that constructs a real run_shell command, so a reported layer cannot
 // drift away from an unapplied one.
 #[cfg(target_os = "macos")]
@@ -769,7 +808,7 @@ mod tests {
         assert_eq!(ShellSandbox::default(), ShellSandbox::Sandboxed);
     }
 
-    /// `["/bin/sh","-c",cmd]` as the borrowed argv `confined_command` takes.
+    /// `["/bin/sh","-c",cmd]` as the borrowed argv the confined core takes.
     fn argv(parts: &[&str]) -> Vec<std::ffi::OsString> {
         parts.iter().map(std::ffi::OsString::from).collect()
     }
@@ -781,7 +820,7 @@ mod tests {
     ) -> Result<(Command, EnforcedShell), String> {
         let owned = argv(parts);
         let borrowed: Vec<&std::ffi::OsStr> = owned.iter().map(|a| a.as_os_str()).collect();
-        confined_command(&borrowed, root, mode)
+        confined(&borrowed, None, root, mode)
     }
 
     #[test]
@@ -847,7 +886,7 @@ mod tests {
                 .collect();
             let borrowed: Vec<&std::ffi::OsStr> = owned.iter().map(|a| a.as_os_str()).collect();
             let (mut builder, enforced) =
-                confined_command(&borrowed, root, ShellSandbox::Sandboxed)
+                confined(&borrowed, None, root, ShellSandbox::Sandboxed)
                     .expect("sandbox-exec must be enforceable on macOS");
             assert_eq!(enforced.mode, ShellSandbox::Sandboxed);
             let out = builder.output().expect("spawn the confined shell");
@@ -999,7 +1038,7 @@ mod tests {
                 .collect();
             let borrowed: Vec<&std::ffi::OsStr> = owned.iter().map(|a| a.as_os_str()).collect();
             let (builder, enforced) =
-                confined_command(&borrowed, dir.path(), ShellSandbox::Sandboxed).unwrap();
+                confined(&borrowed, None, dir.path(), ShellSandbox::Sandboxed).unwrap();
             assert_eq!(builder.get_program(), "/usr/bin/sandbox-exec");
             let args: Vec<String> = builder
                 .get_args()
@@ -1087,7 +1126,7 @@ mod tests {
             .map(std::ffi::OsString::from)
             .collect();
         let borrowed: Vec<&std::ffi::OsStr> = owned.iter().map(|a| a.as_os_str()).collect();
-        let (mut builder, enforced) = confined_command(&borrowed, &dir, ShellSandbox::Sandboxed)
+        let (mut builder, enforced) = confined(&borrowed, None, &dir, ShellSandbox::Sandboxed)
             .expect("seccomp must be available on the Linux CI host");
         builder
             .stdin(Stdio::null())
