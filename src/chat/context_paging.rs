@@ -1967,13 +1967,23 @@ impl<E: TokenEstimator> ContextCapsuleBuilder<E> {
                     .saturating_add(16)
             })
             .sum::<u32>();
+        // Phase legality is the intersection of the phase contract and the
+        // schemas actually supplied for this step. Most paging turns retain the
+        // stable full schema set, but narrow creation routes intentionally send
+        // only write_file or run_shell. Advertising absent tools in the capsule
+        // leaves small models trapped proposing calls the host must reject.
+        let usable_tools = allowed
+            .iter()
+            .copied()
+            .filter(|name| tools.iter().any(|tool| tool == name))
+            .collect::<Vec<_>>();
         candidates.push(Candidate {
             category: "tools",
             id: format!("phase:{:?}", request.phase).to_ascii_lowercase(),
             text: format!(
                 "<usable_tools phase=\"{:?}\">{}</usable_tools>\n",
                 request.phase,
-                allowed.join(",")
+                usable_tools.join(",")
             ),
             mandatory: true,
             importance: 240,

@@ -506,12 +506,14 @@ fn bridge_with_timeout(
     let (decision_tx, decision_rx) = sync_channel(1);
     let cancel = Arc::new(AtomicBool::new(false));
     let delivery_failed = Arc::new(AtomicBool::new(false));
+    let terminal_publication = Arc::new(Mutex::new(TerminalPublicationState::default()));
     let pending_approval = Arc::new(Mutex::new(None));
     (
         WorkspaceBridgeWorker {
             reporter: WorkspaceReporter {
                 events: event_tx.clone(),
                 delivery_failed: Arc::clone(&delivery_failed),
+                terminal_publication,
             },
             approver: WorkspaceApprover {
                 events: event_tx,
@@ -533,10 +535,20 @@ fn bridge_with_timeout(
     )
 }
 
+#[derive(Default)]
+struct TerminalPublicationState {
+    answer_emitted: bool,
+    finished: bool,
+}
+
 #[derive(Clone)]
 pub(crate) struct WorkspaceReporter {
     events: SyncSender<WorkspaceEvent>,
     delivery_failed: Arc<AtomicBool>,
+    /// One serialized publication state shared by every reporter clone. The
+    /// mutex remains held while answer and finish events are sent so a racing
+    /// clone cannot publish a real answer after `session.finished`.
+    terminal_publication: Arc<Mutex<TerminalPublicationState>>,
 }
 
 impl WorkspaceReporter {
@@ -553,13 +565,63 @@ impl WorkspaceReporter {
             content: content.to_string(),
         });
     }
+
+    /// Publish the terminal event and, for failure modes that would otherwise
+    /// leave an empty chat bubble, one deterministic user-facing explanation.
+    /// A real model answer always wins, including one sent through a clone.
+    fn finish(&self, end: &LoopEnd) {
+        let mut publication = self
+            .terminal_publication
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if publication.finished {
+            return;
+        }
+        let fallback = match end {
+            LoopEnd::Repeated => Some(
+                "I couldn't complete this request because the agent stopped after repeating an action without making progress.",
+            ),
+            LoopEnd::DriverError => Some(
+                "I couldn't complete this request because the agent stopped on a model/runtime error before it could provide an answer.",
+            ),
+            LoopEnd::StepCapped => Some(
+                "I couldn't complete this request because the agent reached its step limit before it could provide an answer.",
+            ),
+            LoopEnd::Answered | LoopEnd::Aborted => None,
+        };
+        if !publication.answer_emitted {
+            if let Some(content) = fallback {
+                self.send(WorkspaceEvent::ModelAnswer {
+                    content: content.to_string(),
+                });
+                publication.answer_emitted = true;
+            }
+        }
+        let outcome = match end {
+            LoopEnd::Answered => "answered",
+            LoopEnd::Aborted => "aborted",
+            LoopEnd::StepCapped => "step_capped",
+            LoopEnd::Repeated => "repeated",
+            LoopEnd::DriverError => "driver_error",
+        };
+        self.send(WorkspaceEvent::Finished { outcome });
+        publication.finished = true;
+    }
 }
 
 impl Reporter for WorkspaceReporter {
     fn model_text(&mut self, text: &str) {
+        let mut publication = self
+            .terminal_publication
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if publication.finished {
+            return;
+        }
         self.send(WorkspaceEvent::ModelAnswer {
             content: text.to_string(),
         });
+        publication.answer_emitted = true;
     }
 
     fn tool_call(&mut self, line: &str) {
@@ -754,9 +816,7 @@ pub(crate) fn run_live(
             worker.reporter.send(WorkspaceEvent::Error {
                 message: message.clone(),
             });
-            worker.reporter.send(WorkspaceEvent::Finished {
-                outcome: "driver_error",
-            });
+            worker.reporter.finish(&LoopEnd::DriverError);
             return Err(message);
         }
     };
@@ -770,9 +830,7 @@ pub(crate) fn run_live(
             worker.reporter.send(WorkspaceEvent::Error {
                 message: message.clone(),
             });
-            worker.reporter.send(WorkspaceEvent::Finished {
-                outcome: "driver_error",
-            });
+            worker.reporter.finish(&LoopEnd::DriverError);
             return Err(message);
         }
     };
@@ -915,14 +973,7 @@ pub(crate) fn run_live(
         &mut policy,
         &mut history,
     );
-    let outcome = match end {
-        LoopEnd::Answered => "answered",
-        LoopEnd::Aborted => "aborted",
-        LoopEnd::StepCapped => "step_capped",
-        LoopEnd::Repeated => "repeated",
-        LoopEnd::DriverError => "driver_error",
-    };
-    worker.reporter.send(WorkspaceEvent::Finished { outcome });
+    worker.reporter.finish(&end);
     Ok(end)
 }
 
@@ -971,6 +1022,7 @@ fn render_evidence_memory(evidence: &[super::workspace_memory::StoredEvidence]) 
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicBool;
+    use std::sync::Barrier;
     use std::thread;
 
     use serde_json::{json, Value};
@@ -1364,6 +1416,142 @@ mod tests {
         restrict_direct_creation_tools(&mut legacy, false);
         assert!(legacy.iter().any(|tool| tool.name == "write_file"));
         assert!(!legacy.iter().any(|tool| tool.name == "edit_file"));
+    }
+
+    #[test]
+    fn terminal_failures_emit_one_answer_before_finished() {
+        for (end, outcome, expected_answer) in [
+            (
+                LoopEnd::Repeated,
+                "repeated",
+                "I couldn't complete this request because the agent stopped after repeating an action without making progress.",
+            ),
+            (
+                LoopEnd::DriverError,
+                "driver_error",
+                "I couldn't complete this request because the agent stopped on a model/runtime error before it could provide an answer.",
+            ),
+            (
+                LoopEnd::StepCapped,
+                "step_capped",
+                "I couldn't complete this request because the agent reached its step limit before it could provide an answer.",
+            ),
+        ] {
+            let (worker, client) = bridge(4);
+            worker.reporter.finish(&end);
+            let events = client.events.try_iter().collect::<Vec<_>>();
+
+            assert_eq!(events.len(), 2, "terminal events: {events:?}");
+            assert!(matches!(
+                &events[0],
+                WorkspaceEvent::ModelAnswer { content } if content == expected_answer
+            ));
+            assert!(matches!(
+                &events[1],
+                WorkspaceEvent::Finished { outcome: actual } if *actual == outcome
+            ));
+        }
+    }
+
+    #[test]
+    fn terminal_failure_never_duplicates_a_real_answer_from_a_reporter_clone() {
+        let (worker, client) = bridge(4);
+        let mut model_reporter = worker.reporter.clone();
+        model_reporter.model_text("The requested work is complete.");
+        worker.reporter.finish(&LoopEnd::DriverError);
+        let events = client.events.try_iter().collect::<Vec<_>>();
+
+        assert_eq!(events.len(), 2, "terminal events: {events:?}");
+        assert!(matches!(
+            &events[0],
+            WorkspaceEvent::ModelAnswer { content } if content == "The requested work is complete."
+        ));
+        assert!(matches!(
+            &events[1],
+            WorkspaceEvent::Finished {
+                outcome: "driver_error"
+            }
+        ));
+    }
+
+    #[test]
+    fn model_answer_after_finished_is_suppressed() {
+        let (worker, client) = bridge(4);
+        let mut late_reporter = worker.reporter.clone();
+        worker.reporter.finish(&LoopEnd::StepCapped);
+        late_reporter.model_text("This answer arrived too late.");
+        late_reporter.finish(&LoopEnd::DriverError);
+        let events = client.events.try_iter().collect::<Vec<_>>();
+
+        assert_eq!(events.len(), 2, "terminal events: {events:?}");
+        assert!(matches!(
+            &events[0],
+            WorkspaceEvent::ModelAnswer { content }
+                if content.contains("reached its step limit")
+        ));
+        assert!(matches!(
+            &events[1],
+            WorkspaceEvent::Finished {
+                outcome: "step_capped"
+            }
+        ));
+    }
+
+    #[test]
+    fn racing_model_answer_and_finish_publish_one_ordered_answer() {
+        for iteration in 0..128 {
+            let (worker, client) = bridge(4);
+            let barrier = Arc::new(Barrier::new(3));
+            let mut model_reporter = worker.reporter.clone();
+            let finish_reporter = worker.reporter.clone();
+            let model_barrier = Arc::clone(&barrier);
+            let finish_barrier = Arc::clone(&barrier);
+
+            let model_thread = thread::spawn(move || {
+                model_barrier.wait();
+                model_reporter.model_text("A real model answer.");
+            });
+            let finish_thread = thread::spawn(move || {
+                finish_barrier.wait();
+                finish_reporter.finish(&LoopEnd::Repeated);
+            });
+            barrier.wait();
+            model_thread.join().unwrap();
+            finish_thread.join().unwrap();
+
+            let events = client.events.try_iter().collect::<Vec<_>>();
+            assert_eq!(
+                events.len(),
+                2,
+                "iteration {iteration} terminal events: {events:?}"
+            );
+            assert!(
+                matches!(&events[0], WorkspaceEvent::ModelAnswer { .. }),
+                "iteration {iteration} must publish its only answer before Finished: {events:?}"
+            );
+            assert!(
+                matches!(
+                    &events[1],
+                    WorkspaceEvent::Finished {
+                        outcome: "repeated"
+                    }
+                ),
+                "iteration {iteration} must publish exactly one terminal event: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn manual_abort_finishes_without_a_synthetic_answer() {
+        let (worker, client) = bridge(4);
+        worker.reporter.finish(&LoopEnd::Aborted);
+        let events = client.events.try_iter().collect::<Vec<_>>();
+
+        assert_eq!(events.len(), 1, "terminal events: {events:?}");
+        assert!(matches!(
+            &events[0],
+            WorkspaceEvent::Finished { outcome: "aborted" }
+        ));
     }
 
     #[test]

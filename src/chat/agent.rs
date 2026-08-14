@@ -9,7 +9,7 @@
 //! the redraw loop) is a documented follow-up. See `DECISIONS.md` D9.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -966,8 +966,36 @@ pub fn run_loop(
     let mut ran: BTreeMap<String, usize> = BTreeMap::new();
     let require_workspace_observation =
         cfg.tool_profile.is_workspace() && workspace_request_requires_observation(history);
+    // Creating many brand-new files has no source dependency to discover. A
+    // small model otherwise sees the generic Discover instruction, invents a
+    // synthetic symbol such as `create_files`, and can page-fault forever in a
+    // workspace where that symbol cannot exist. Keep this deliberately narrow:
+    // an empty structural index is not proof of an empty workspace (the index
+    // does not cover every language or text file).
+    let bulk_candidate = select_workspace_bulk_file_creation_contract(
+        history,
+        cfg.tool_profile,
+        tools.iter().any(|tool| tool.name == "run_shell"),
+    );
+    let (bulk_file_creation, bulk_creation_baseline) = match bulk_candidate {
+        Some(contract) => {
+            let baseline = bulk_file_creation_baseline(sandbox.root());
+            if bulk_fast_path_baseline_is_eligible(&contract, &baseline) {
+                (Some(contract), Some(baseline))
+            } else {
+                reporter.notice(
+                    "bulk-file fast path disabled: the bounded baseline cannot prove the requested final count",
+                );
+                (None, None)
+            }
+        }
+        None => (None, None),
+    };
     let require_workspace_change = cfg.tool_profile == tools::ToolProfile::WebCode
-        && workspace_request_requires_change(history);
+        && (workspace_request_requires_change(history) || bulk_file_creation.is_some());
+    if bulk_file_creation.is_some() {
+        paging_discovery_complete = true;
+    }
     let initial_checkpoint_count = if require_workspace_change {
         super::checkpoint::committed_count(sandbox.root())
     } else {
@@ -1046,6 +1074,8 @@ pub fn run_loop(
     let mut paging_budget_rebuilds = 0usize;
     let mut paging_typed_patch_rejections = 0usize;
     let mut paging_blocked_answer = false;
+    let mut paging_missing_context_counts: HashMap<String, usize> = HashMap::new();
+    let mut paging_missing_context_observation_used = false;
     let mut python_alias_guidance_sent = false;
     let mut direct_python_rewrite_required = false;
     let mut direct_python_rewrite_violations = 0usize;
@@ -1089,6 +1119,34 @@ pub fn run_loop(
                 }
             }
         }
+        let bulk_creation_status = bulk_file_creation
+            .as_ref()
+            .zip(bulk_creation_baseline.as_ref())
+            .map(|(contract, baseline)| {
+                bulk_file_creation_status(sandbox.root(), baseline, contract)
+            });
+        if let Some(status) = bulk_creation_status.as_ref() {
+            if !status.scan_complete {
+                reporter.notice(
+                    "stopping: the post-action workspace scan is incomplete, so the exact bulk-file contract cannot be proven",
+                );
+                reporter.model_text(
+                    "I stopped without claiming completion because the workspace became too large or unreadable for an exact file-count verification. Any files already created are preserved; inspect them before retrying.",
+                );
+                return LoopEnd::Repeated;
+            }
+            if !status.collateral_paths.is_empty() {
+                reporter
+                    .notice("stopping: the bulk command modified or deleted pre-existing files");
+                reporter.model_text(
+                    "I stopped because the bulk command changed pre-existing files, so it is not safe to continue automatically. The changes are preserved for review and the requested bulk-file contract was not marked complete.",
+                );
+                return LoopEnd::Repeated;
+            }
+        }
+        let bulk_creation_pending = bulk_creation_status
+            .as_ref()
+            .is_some_and(|status| !status.complete);
         let (compiled_history, step_tools, paging_capsule, requested_max_tokens) = if let Some(
             runtime,
         ) =
@@ -1106,7 +1164,9 @@ pub fn run_loop(
                 .default_write_path
                 .as_deref()
                 .filter(|path| !workspace_changed && !sandbox.root().join(path).is_file());
-            let phase = if workspace_changed && !pending_verification_paths.is_empty() {
+            let phase = if bulk_creation_pending {
+                ActionPhase::Modify
+            } else if workspace_changed && !pending_verification_paths.is_empty() {
                 // Exact post-write source capture is host lifecycle work. Do
                 // it before reacting to a model-selected command failure so
                 // a Windows `python.exe` alias cannot masquerade as a source
@@ -1135,6 +1195,14 @@ pub fn run_loop(
             };
             let current_action = match phase {
                     ActionPhase::Discover => "Retrieve one missing exact source page".to_string(),
+                    ActionPhase::Modify if bulk_creation_pending => bulk_file_creation_action(
+                        bulk_file_creation
+                            .as_ref()
+                            .expect("pending bulk creation has a contract"),
+                        bulk_creation_status
+                            .as_ref()
+                            .expect("pending bulk creation has host status"),
+                    ),
                     ActionPhase::Modify if direct_creation_target.is_some() => format!(
                         "Create the new file `{}` now with write_file containing the COMPLETE runnable artifact. The target does not exist: do not call read_file, search, edit_file, or any shell command first.",
                         direct_creation_target.unwrap_or_default()
@@ -1178,7 +1246,9 @@ pub fn run_loop(
                     .to_string(),
                 };
             let mut capsule_tools = tools.clone();
-            if direct_creation_target.is_some() {
+            if bulk_creation_pending {
+                capsule_tools.retain(|tool| tool.name == "run_shell");
+            } else if direct_creation_target.is_some() {
                 capsule_tools.retain(|tool| tool.name == "write_file");
             } else if phase == ActionPhase::Verify && !pending_verification_paths.is_empty() {
                 capsule_tools.retain(|tool| tool.name == "read_file");
@@ -1224,7 +1294,11 @@ pub fn run_loop(
                 .collect::<Vec<_>>();
             let phase_cap = match phase {
                 ActionPhase::Discover => PAGING_DISCOVER_MAX_TOKENS,
-                ActionPhase::Modify if direct_creation_target.is_some() || force_full_rewrite => {
+                ActionPhase::Modify
+                    if bulk_creation_pending
+                        || direct_creation_target.is_some()
+                        || force_full_rewrite =>
+                {
                     capsule.output_reserve
                 }
                 ActionPhase::Modify => PAGING_PATCH_MAX_TOKENS,
@@ -1301,7 +1375,7 @@ pub fn run_loop(
         // The ceiling only applies when it fits; otherwise the step runs on the
         // headroom that is actually left.
         driver.set_max_tokens(allowance);
-        if allowance < cfg.max_tokens {
+        if allowance < requested_max_tokens {
             reporter.notice(&format!(
                 "this step's reply is limited to {allowance} tokens by the remaining context \
                  budget"
@@ -1387,6 +1461,7 @@ pub fn run_loop(
         {
             match parse_typed_action(text) {
                 Ok(action @ TypedModelAction::NeedContext { .. }) => {
+                    let mut recovered_with_observation = false;
                     match runtime.execute_typed_action(&action, capsule) {
                         Ok(Some(page)) => {
                             paging_discovery_complete = true;
@@ -1424,6 +1499,34 @@ pub fn run_loop(
                         }
                         Ok(None) => {}
                         Err(error) => {
+                            if let ContextPagingError::MissingContext(missing) = &error {
+                                let key = missing.trim().to_ascii_lowercase();
+                                let count = paging_missing_context_counts.entry(key).or_default();
+                                *count = count.saturating_add(1);
+                                paging_discovery_complete = true;
+                                runtime.ledger.current_focus = format!(
+                                    "Context item `{missing}` is unavailable. Do not request it \
+                                     again. For a creation task, create the requested artifacts \
+                                     directly with an advertised write tool. For an existing \
+                                     artifact, use the host directory observation when present, \
+                                     then locate it with search/read_file before changing it."
+                                );
+                                // The first unresolved discovery request gets one
+                                // deterministic, host-owned workspace observation.
+                                // That makes forward progress and gives edit/delete
+                                // tasks real path evidence without asking the model
+                                // to guess another synthetic symbol. Never auto-list
+                                // repeatedly.
+                                if !paging_missing_context_observation_used
+                                    && capsule
+                                        .tool_names
+                                        .binary_search_by(|name| name.as_str().cmp("list_dir"))
+                                        .is_ok()
+                                {
+                                    paging_missing_context_observation_used = true;
+                                    recovered_with_observation = true;
+                                }
+                            }
                             runtime
                                 .ledger
                                 .failed_attempts
@@ -1436,8 +1539,37 @@ pub fn run_loop(
                             reporter.notice(&format!("context page fault failed: {error}"));
                         }
                     }
-                    paging_no_progress!();
-                    continue;
+                    if recovered_with_observation {
+                        reporter.notice(
+                            "unavailable context item; observing the workspace once and continuing",
+                        );
+                        step = ModelStep::Calls(vec![ToolCall {
+                            name: "list_dir".into(),
+                            args: json!({"path": "."}),
+                        }]);
+                    } else {
+                        if let TypedModelAction::NeedContext { symbol, .. } = &action {
+                            let key = symbol.trim().to_ascii_lowercase();
+                            if paging_missing_context_counts
+                                .get(&key)
+                                .copied()
+                                .unwrap_or(0)
+                                >= 2
+                            {
+                                reporter.notice(&format!(
+                                    "stopping: the model repeatedly requested unavailable context `{symbol}`"
+                                ));
+                                reporter.model_text(
+                                    "I couldn't finish this turn because the model repeatedly requested \
+                                     context that does not exist. Any completed tool changes are preserved; \
+                                     review the tool results before retrying.",
+                                );
+                                return LoopEnd::Repeated;
+                            }
+                        }
+                        paging_no_progress!();
+                        continue;
+                    }
                 }
                 Ok(action @ TypedModelAction::Patch { .. }) => {
                     step = match runtime.prepare_patch_tool_call(&action, capsule) {
@@ -1564,20 +1696,38 @@ pub fn run_loop(
                     let verified = matches!(
                         runtime.ledger.verification_state.status.as_str(),
                         "passed" | "complete"
-                    );
+                    ) && !bulk_creation_pending;
                     if !verified || summary.trim().is_empty() {
                         runtime
                             .ledger
                             .failed_attempts
-                            .push("COMPLETE rejected: host verification has not passed".into());
-                        runtime.ledger.current_focus =
-                            "Run the narrowest relevant verification before completing".into();
+                            .push(if bulk_creation_pending {
+                                "COMPLETE rejected: the exact bulk-file contract has not passed"
+                                    .into()
+                            } else {
+                                "COMPLETE rejected: host verification has not passed".into()
+                            });
+                        runtime.ledger.current_focus = if bulk_creation_pending {
+                            bulk_file_creation_action(
+                                bulk_file_creation
+                                    .as_ref()
+                                    .expect("pending bulk creation has a contract"),
+                                bulk_creation_status
+                                    .as_ref()
+                                    .expect("pending bulk creation has host status"),
+                            )
+                        } else {
+                            "Run the narrowest relevant verification before completing".into()
+                        };
                         if let Err(error) = runtime.save() {
                             reporter.notice(&format!("context paging state error: {error}"));
                             return LoopEnd::DriverError;
                         }
-                        reporter
-                            .notice("typed COMPLETE rejected: host verification has not passed");
+                        reporter.notice(if bulk_creation_pending {
+                            "typed COMPLETE rejected: exact bulk-file contract has not passed"
+                        } else {
+                            "typed COMPLETE rejected: host verification has not passed"
+                        });
                         paging_no_progress!();
                         continue;
                     }
@@ -1733,7 +1883,8 @@ pub fn run_loop(
                 // model that cannot fit its answer from spinning forever.
                 if driver.last_step_capped() && !text.trim().is_empty() {
                     if let Some(runtime) = context_paging.as_mut().filter(|runtime| {
-                        runtime.ledger.verification_state.status == "passed"
+                        !bulk_creation_pending
+                            && runtime.ledger.verification_state.status == "passed"
                             && paging_capsule
                                 .as_ref()
                                 .is_some_and(|capsule| capsule.tool_names.is_empty())
@@ -1774,20 +1925,59 @@ pub fn run_loop(
                             "the model hit its output cap mid-answer; retrying with a smaller \
                              unit of work",
                         );
-                        push_reminder(
-                            history,
+                        let recovery = if bulk_creation_pending {
+                            "Your last reply was cut off at the output-token limit, so it was \
+                             discarded. Emit ONE shorter, complete run_shell call that creates \
+                             exactly the remaining host-counted files. Preserve files already \
+                             created this turn, use collision-resistant new paths, and do not \
+                             split the remaining bulk loop into one-file turns."
+                        } else {
                             "Your last reply was cut off at the output-token limit, so it was \
                              discarded. FOR THIS RETRY ONLY, do less in one step: write ONE \
                              file (or make ONE edit_file change), and prefer edit_file over \
                              rewriting a whole file. Emit the complete tool call and nothing \
                              else. This narrowing applies to recovering from the output cap, \
-                             not to the turn in general.",
-                        );
+                             not to the turn in general."
+                        };
+                        push_reminder(history, recovery);
                         continue;
                     }
                     reporter.notice(
                         "the model hit its output cap repeatedly; the answer below is incomplete",
                     );
+                }
+                if bulk_creation_pending && !paging_blocked_answer {
+                    let action = bulk_file_creation_action(
+                        bulk_file_creation
+                            .as_ref()
+                            .expect("pending bulk creation has a contract"),
+                        bulk_creation_status
+                            .as_ref()
+                            .expect("pending bulk creation has host status"),
+                    );
+                    if change_reprompts < CHANGE_REPROMPT_LIMIT {
+                        change_reprompts += 1;
+                        reporter.notice(
+                            "Bulk-file completion rejected: the host has not verified the exact contract",
+                        );
+                        if let Some(runtime) = context_paging.as_mut() {
+                            runtime.ledger.current_focus = action.clone();
+                            runtime.ledger.failed_attempts.push(
+                                "A completion answer arrived before the exact bulk-file contract passed"
+                                    .into(),
+                            );
+                            if let Err(error) = runtime.save() {
+                                reporter.notice(&format!("context paging state error: {error}"));
+                                return LoopEnd::DriverError;
+                            }
+                        }
+                        push_reminder(history, &action);
+                        continue;
+                    }
+                    reporter.notice(
+                        "stopping: the model repeatedly claimed completion before the exact bulk-file contract passed",
+                    );
+                    return LoopEnd::Repeated;
                 }
                 if require_workspace_change && !workspace_changed {
                     if change_reprompts < CHANGE_REPROMPT_LIMIT {
@@ -3396,6 +3586,24 @@ pub fn run_loop(
             }
         }
     }
+    if let (Some(contract), Some(baseline)) =
+        (bulk_file_creation.as_ref(), bulk_creation_baseline.as_ref())
+    {
+        let status = bulk_file_creation_status(sandbox.root(), baseline, contract);
+        if !status.complete {
+            reporter.notice(&format!(
+                "stopped at the step limit with {} of exactly {} bulk files host-verified",
+                status.created_paths.len(),
+                contract.requested_count
+            ));
+            reporter.model_text(&format!(
+                "I stopped before claiming completion. The host verified {} of exactly {} requested files; the partial files are preserved for review or a retry.",
+                status.created_paths.len(),
+                contract.requested_count
+            ));
+            return LoopEnd::StepCapped;
+        }
+    }
     let summary = if ran.is_empty() {
         "no tools were run".to_string()
     } else {
@@ -3553,6 +3761,258 @@ fn workspace_request_requires_change(history: &[AgentMsg]) -> bool {
     .any(|phrase| request.contains(phrase))
 }
 
+/// True only for an explicit request to create more than one new file.
+///
+/// This is intentionally more conservative than the general mutation intent
+/// detector. It controls a no-discovery/run-shell fast path, so an instruction
+/// such as "fix code that reads 100 files" must not match merely because it
+/// contains a count and the word `files`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BulkContentRequirement {
+    Any,
+    Empty,
+    NonEmpty,
+    DistinctNonEmpty,
+}
+
+// Keep the fast path comfortably below the bounded snapshot ceiling. Larger
+// requests remain on the ordinary agent route instead of entering a contract
+// the host cannot deterministically recount in a non-empty workspace.
+const MAX_BULK_FILE_CREATION_COUNT: usize = 10_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BulkFileCreationContract {
+    requested_count: usize,
+    direct_workspace_root: bool,
+    txt_extension: bool,
+    distinct_names: bool,
+    random_names: bool,
+    content: BulkContentRequirement,
+}
+
+/// Parse a high-confidence, self-contained bulk-file creation request.
+///
+/// The accepted grammar deliberately allows only harmless filler between
+/// `create`/`generate` and the exact count. This route skips source discovery,
+/// so "create a manifest of 100 files" and "generate a summary of 100 files"
+/// must remain ordinary source-aware tasks. `make` is also excluded: the
+/// general mutation detector does not classify bare `make N files` as a write.
+fn workspace_bulk_file_creation_contract(history: &[AgentMsg]) -> Option<BulkFileCreationContract> {
+    let request = history.iter().rev().find_map(|message| match message {
+        AgentMsg::User(text) if !is_harness_reminder(text) => Some(text.to_ascii_lowercase()),
+        _ => None,
+    })?;
+    // These phrases make the files dependent on existing workspace content.
+    // A shell-only/no-discovery route would be unsafe even if the surface
+    // grammar happened to contain `create N files`.
+    if [
+        "from ",
+        "using ",
+        "based on ",
+        "copy of ",
+        "copies of ",
+        "according to ",
+        " from ",
+        " using ",
+        " based on ",
+        " copy of ",
+        " copies of ",
+        " according to ",
+        "from existing",
+        "from the existing",
+        "based on existing",
+        "based on the existing",
+        "using existing",
+        "using the existing",
+        "for each existing",
+        "by reading",
+    ]
+    .iter()
+    .any(|phrase| request.contains(phrase))
+    {
+        return None;
+    }
+    let recognized_random_content = request.contains("something random")
+        || request.contains("random content")
+        || request.contains("random contents")
+        || request.contains("random value");
+    if [
+        "same content",
+        "same contents",
+        "same random content",
+        "same value",
+        "identical content",
+        "identical contents",
+        "identical value",
+    ]
+    .iter()
+    .any(|phrase| request.contains(phrase))
+    {
+        return None;
+    }
+    let direct_workspace_root = [
+        "working directory",
+        "working folder",
+        "current directory",
+        "current folder",
+        "workspace root",
+    ]
+    .iter()
+    .any(|phrase| request.contains(phrase));
+    // This optimized contract currently proves only direct-root text files and
+    // the content modes below. Anything more specific stays on the ordinary,
+    // source-aware path instead of silently weakening the request.
+    if !direct_workspace_root
+        || request.contains('/')
+        || request.contains('\\')
+        || (request.contains("extension") && !request.contains(".txt"))
+        || [" named ", " prefix", " suffix", " filename pattern"]
+            .iter()
+            .any(|phrase| request.contains(phrase))
+        || [
+            " delete ",
+            " remove ",
+            " move ",
+            " rename ",
+            " overwrite ",
+            " modify ",
+            " edit ",
+        ]
+        .iter()
+        .any(|phrase| request.contains(phrase))
+        || (request.contains("containing ") && !recognized_random_content)
+        || ((request.contains("write ") || request.contains("put "))
+            && (request.contains("in each file") || request.contains("inside each file"))
+            && !recognized_random_content)
+    {
+        return None;
+    }
+    let words = request
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    if words
+        .iter()
+        .filter(|word| word.parse::<usize>().is_ok())
+        .count()
+        != 1
+        || words
+            .iter()
+            .filter(|word| matches!(**word, "create" | "generate"))
+            .count()
+            != 1
+        || words.iter().any(|word| {
+            matches!(
+                *word,
+                "delete" | "remove" | "move" | "rename" | "overwrite" | "modify" | "edit"
+            )
+        })
+    {
+        return None;
+    }
+    let (count_index, requested_count, file_index) =
+        words.iter().enumerate().find_map(|(count_index, word)| {
+            let requested_count = word
+                .parse::<usize>()
+                .ok()
+                .filter(|count| *count > 1 && *count <= MAX_BULK_FILE_CREATION_COUNT)?;
+            let start = count_index.saturating_sub(4);
+            (start..count_index).rev().find(|index| {
+                matches!(words[*index], "create" | "generate")
+                    && words[*index + 1..count_index].iter().all(|filler| {
+                        matches!(
+                            *filler,
+                            "all" | "exactly" | "for" | "me" | "please" | "the" | "these"
+                        )
+                    })
+            })?;
+            let file_index = (count_index + 1..words.len().min(count_index + 5)).find(|index| {
+                matches!(words[*index], "file" | "files")
+                    && words[count_index + 1..*index].iter().all(|adjective| {
+                        matches!(
+                            *adjective,
+                            "different"
+                                | "distinct"
+                                | "empty"
+                                | "new"
+                                | "non"
+                                | "plain"
+                                | "random"
+                                | "text"
+                                | "unique"
+                        )
+                    })
+            })?;
+            Some((count_index, requested_count, file_index))
+        })?;
+
+    let noun_phrase = &words[count_index + 1..file_index];
+    let txt_extension =
+        noun_phrase.contains(&"text") || request.contains(".txt") || request.contains(" txt file");
+    if !txt_extension {
+        return None;
+    }
+    let random_names =
+        request.contains("random") && (request.contains("name") || request.contains("filename"));
+    let distinct_names = random_names
+        || [
+            "distinct names",
+            "distinct file names",
+            "different names",
+            "different file names",
+            "unique names",
+            "unique file names",
+        ]
+        .iter()
+        .any(|phrase| request.contains(phrase));
+    let explicitly_nonempty = request.contains("nonempty") || request.contains("non-empty");
+    let explicitly_empty = !explicitly_nonempty
+        && (request.contains("empty files")
+            || request.contains("empty file")
+            || request.contains("empty text files")
+            || request.contains("empty text file"));
+    let distinct_content = !explicitly_empty
+        && (recognized_random_content
+            || request.contains("unique content")
+            || request.contains("distinct content")
+            || request.contains("different content")
+            || request.contains("different nonempty value"));
+    let nonempty_content = !explicitly_empty
+        && (distinct_content
+            || request.contains("nonempty")
+            || request.contains("non-empty")
+            || request.contains("inside each file")
+            || request.contains("in each file"));
+    let content = if explicitly_empty {
+        BulkContentRequirement::Empty
+    } else if distinct_content {
+        BulkContentRequirement::DistinctNonEmpty
+    } else if nonempty_content {
+        BulkContentRequirement::NonEmpty
+    } else {
+        BulkContentRequirement::Any
+    };
+
+    Some(BulkFileCreationContract {
+        requested_count,
+        direct_workspace_root,
+        txt_extension,
+        distinct_names,
+        random_names,
+        content,
+    })
+}
+
+fn select_workspace_bulk_file_creation_contract(
+    history: &[AgentMsg],
+    profile: tools::ToolProfile,
+    run_shell_available: bool,
+) -> Option<BulkFileCreationContract> {
+    (profile == tools::ToolProfile::WebCode && run_shell_available)
+        .then(|| workspace_bulk_file_creation_contract(history))
+        .flatten()
+}
+
 #[derive(Debug)]
 struct WorkspaceChanges {
     /// Exact while `scan_truncated` is false. Keeping this separate from the
@@ -3674,6 +4134,424 @@ fn workspace_snapshot(root: &Path) -> WorkspaceSnapshot {
         entries: entries_by_path,
         scan_truncated,
     }
+}
+
+#[derive(Debug)]
+struct BulkFileCreationStatus {
+    complete: bool,
+    scan_complete: bool,
+    created_paths: Vec<String>,
+    problems: Vec<String>,
+    repair_paths: Vec<String>,
+    surplus_paths: Vec<String>,
+    collateral_paths: Vec<String>,
+}
+
+#[derive(Debug)]
+struct BulkFileCreationBaseline {
+    snapshot: WorkspaceSnapshot,
+    file_hashes: BTreeMap<String, [u8; 32]>,
+}
+
+const MAX_BULK_BASELINE_HASH_FILES: usize = 256;
+const MAX_BULK_BASELINE_HASH_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_BULK_BASELINE_HASH_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
+
+fn hash_file_contents(path: &Path) -> std::io::Result<[u8; 32]> {
+    use sha2::Digest as _;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = hasher.finalize();
+    let mut result = [0_u8; 32];
+    result.copy_from_slice(&digest);
+    Ok(result)
+}
+
+fn bulk_file_creation_baseline(root: &Path) -> BulkFileCreationBaseline {
+    let snapshot = workspace_snapshot(root);
+    let mut file_hashes = BTreeMap::new();
+    let mut hashed_bytes = 0_u64;
+    for (relative, state) in &snapshot.entries {
+        if state.kind != WorkspaceEntryKind::File
+            || state.len > MAX_BULK_BASELINE_HASH_FILE_BYTES
+            || file_hashes.len() >= MAX_BULK_BASELINE_HASH_FILES
+            || hashed_bytes.saturating_add(state.len) > MAX_BULK_BASELINE_HASH_TOTAL_BYTES
+        {
+            continue;
+        }
+        if let Ok(hash) = hash_file_contents(&root.join(relative)) {
+            hashed_bytes = hashed_bytes.saturating_add(state.len);
+            file_hashes.insert(relative.clone(), hash);
+        }
+    }
+    BulkFileCreationBaseline {
+        snapshot,
+        file_hashes,
+    }
+}
+
+fn bulk_fast_path_baseline_is_eligible(
+    contract: &BulkFileCreationContract,
+    baseline: &BulkFileCreationBaseline,
+) -> bool {
+    bulk_fast_path_capacity_is_eligible(
+        contract.requested_count,
+        baseline.snapshot.entries.len(),
+        baseline.snapshot.scan_truncated,
+    )
+}
+
+fn bulk_fast_path_capacity_is_eligible(
+    requested_count: usize,
+    baseline_entries: usize,
+    baseline_truncated: bool,
+) -> bool {
+    !baseline_truncated
+        && baseline_entries.saturating_add(requested_count) <= MAX_CHANGE_SCAN_ENTRIES
+}
+
+/// Verify a bulk-creation contract against the turn-start tree, not against
+/// shell stdout. Comparing every later snapshot with the same baseline makes
+/// partial attempts cumulative: 1 file followed by 99 files is exactly 100,
+/// while repeating the original 100-file loop becomes a detectable overrun.
+fn bulk_file_creation_status(
+    root: &Path,
+    baseline: &BulkFileCreationBaseline,
+    contract: &BulkFileCreationContract,
+) -> BulkFileCreationStatus {
+    let after = workspace_snapshot(root);
+    let scan_complete = !baseline.snapshot.scan_truncated && !after.scan_truncated;
+    let created_paths = after
+        .entries
+        .iter()
+        .filter_map(|(relative, state)| {
+            (state.kind == WorkspaceEntryKind::File
+                && !baseline.snapshot.entries.contains_key(relative))
+            .then_some(relative.clone())
+        })
+        .collect::<Vec<_>>();
+    let mut problems = Vec::new();
+    let mut repair_paths = BTreeSet::new();
+
+    if !scan_complete {
+        problems.push(
+            "the bounded workspace scan was incomplete, so the exact created-file count cannot be proven"
+                .to_string(),
+        );
+    }
+    let mut collateral_paths = Vec::new();
+    for (relative, original_state) in baseline
+        .snapshot
+        .entries
+        .iter()
+        .filter(|(_, state)| state.kind == WorkspaceEntryKind::File)
+    {
+        let unchanged = after.entries.get(relative).is_some_and(|state| {
+            state == original_state
+                && baseline
+                    .file_hashes
+                    .get(relative)
+                    .is_none_or(|original_hash| {
+                        hash_file_contents(&root.join(relative))
+                            .is_ok_and(|current_hash| current_hash == *original_hash)
+                    })
+        });
+        if !unchanged {
+            collateral_paths.push(relative.clone());
+        }
+    }
+    if !collateral_paths.is_empty() {
+        problems.push(format!(
+            "{} pre-existing files were modified or deleted",
+            collateral_paths.len()
+        ));
+        repair_paths.extend(collateral_paths.iter().cloned());
+    }
+    if created_paths.len() != contract.requested_count {
+        problems.push(format!(
+            "created {} of exactly {} requested files",
+            created_paths.len(),
+            contract.requested_count
+        ));
+    }
+
+    if contract.direct_workspace_root {
+        let nested = created_paths
+            .iter()
+            .filter(|relative| relative.contains('/'))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !nested.is_empty() {
+            problems.push(format!(
+                "{} created files are not directly in the workspace root",
+                nested.len()
+            ));
+            repair_paths.extend(nested);
+        }
+    }
+    if contract.txt_extension {
+        let wrong_extension = created_paths
+            .iter()
+            .filter(|relative| !relative.to_ascii_lowercase().ends_with(".txt"))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !wrong_extension.is_empty() {
+            problems.push(format!(
+                "{} created files do not have the requested .txt extension",
+                wrong_extension.len()
+            ));
+            repair_paths.extend(wrong_extension);
+        }
+    }
+    if contract.distinct_names {
+        let mut names = BTreeMap::<String, String>::new();
+        let mut duplicate_names = Vec::new();
+        for relative in &created_paths {
+            let name = Path::new(relative)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(relative)
+                .to_ascii_lowercase();
+            if names.insert(name, relative.clone()).is_some() {
+                duplicate_names.push(relative.clone());
+            }
+        }
+        if !duplicate_names.is_empty() {
+            problems.push(format!(
+                "{} created files reuse a requested-distinct filename",
+                duplicate_names.len()
+            ));
+            repair_paths.extend(duplicate_names);
+        }
+    }
+    if contract.random_names {
+        let invalid_guid_names = created_paths
+            .iter()
+            .filter(|relative| {
+                Path::new(relative)
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_none_or(|stem| uuid::Uuid::parse_str(stem).is_err())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !invalid_guid_names.is_empty() {
+            problems.push(format!(
+                "{} created files do not use host-verifiable random GUID names",
+                invalid_guid_names.len()
+            ));
+            repair_paths.extend(invalid_guid_names);
+        }
+    }
+
+    if matches!(
+        contract.content,
+        BulkContentRequirement::NonEmpty | BulkContentRequirement::DistinctNonEmpty
+    ) {
+        let empty = created_paths
+            .iter()
+            .filter(|relative| {
+                after
+                    .entries
+                    .get(*relative)
+                    .is_none_or(|state| state.len == 0)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !empty.is_empty() {
+            problems.push(format!("{} created files are empty", empty.len()));
+            repair_paths.extend(empty);
+        }
+    }
+    if contract.content == BulkContentRequirement::Empty {
+        let nonempty = created_paths
+            .iter()
+            .filter(|relative| {
+                after
+                    .entries
+                    .get(*relative)
+                    .is_some_and(|state| state.len != 0)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !nonempty.is_empty() {
+            problems.push(format!(
+                "{} created files are nonempty but empty files were requested",
+                nonempty.len()
+            ));
+            repair_paths.extend(nonempty);
+        }
+    }
+    if contract.content == BulkContentRequirement::DistinctNonEmpty {
+        let mut hashes = BTreeMap::<[u8; 32], String>::new();
+        let mut duplicate_content = Vec::new();
+        let mut unreadable = Vec::new();
+        let mut oversized = Vec::new();
+        let mut hashed_bytes = 0_u64;
+        for relative in &created_paths {
+            let size = after
+                .entries
+                .get(relative)
+                .map(|state| state.len)
+                .unwrap_or(u64::MAX);
+            if size > MAX_BULK_BASELINE_HASH_FILE_BYTES
+                || hashed_bytes.saturating_add(size) > MAX_BULK_BASELINE_HASH_TOTAL_BYTES
+            {
+                oversized.push(relative.clone());
+                continue;
+            }
+            match hash_file_contents(&root.join(relative)) {
+                Ok(hash) => {
+                    hashed_bytes = hashed_bytes.saturating_add(size);
+                    if hashes.insert(hash, relative.clone()).is_some() {
+                        duplicate_content.push(relative.clone());
+                    }
+                }
+                Err(_) => unreadable.push(relative.clone()),
+            }
+        }
+        if !duplicate_content.is_empty() {
+            problems.push(format!(
+                "{} created files do not have distinct content",
+                duplicate_content.len()
+            ));
+            repair_paths.extend(duplicate_content);
+        }
+        if !unreadable.is_empty() {
+            problems.push(format!(
+                "{} created files could not be read for content verification",
+                unreadable.len()
+            ));
+            repair_paths.extend(unreadable);
+        }
+        if !oversized.is_empty() {
+            problems.push(format!(
+                "{} created files exceed the bounded distinct-content verification budget",
+                oversized.len()
+            ));
+            repair_paths.extend(oversized);
+        }
+    }
+
+    let surplus = created_paths.len().saturating_sub(contract.requested_count);
+    let surplus_paths = created_paths
+        .iter()
+        .rev()
+        .take(surplus.min(MAX_CHANGED_PATH_SAMPLES))
+        .cloned()
+        .collect::<Vec<_>>();
+    let repair_paths = repair_paths
+        .into_iter()
+        .take(MAX_CHANGED_PATH_SAMPLES)
+        .collect::<Vec<_>>();
+    BulkFileCreationStatus {
+        complete: scan_complete && problems.is_empty(),
+        scan_complete,
+        created_paths,
+        problems,
+        repair_paths,
+        surplus_paths,
+        collateral_paths: collateral_paths
+            .into_iter()
+            .take(MAX_CHANGED_PATH_SAMPLES)
+            .collect(),
+    }
+}
+
+fn bulk_file_creation_action(
+    contract: &BulkFileCreationContract,
+    status: &BulkFileCreationStatus,
+) -> String {
+    let created = status.created_paths.len();
+    let count_action = if !status.collateral_paths.is_empty() {
+        format!(
+            "The host detected modification or deletion of pre-existing files: {}. Create no more files and do not claim completion. Restore only those paths from an authoritative original before continuing.",
+            serde_json::to_string(&status.collateral_paths).unwrap_or_else(|_| "[]".into())
+        )
+    } else if !status.scan_complete {
+        concat!(
+            "The host cannot prove the exact count because its bounded workspace scan was ",
+            "incomplete. Do not create duplicates or claim completion."
+        )
+        .to_string()
+    } else if created < contract.requested_count {
+        format!(
+            "The host has verified {created} new files since this turn began. Preserve them and create exactly {} additional new files; never overwrite or recreate an existing path.",
+            contract.requested_count - created
+        )
+    } else if created > contract.requested_count {
+        format!(
+            "The host has verified {created} new files, which is {} too many. Create no more files. Remove only these host-proven files created during this turn, then let the host recount: {}.",
+            created - contract.requested_count,
+            serde_json::to_string(&status.surplus_paths).unwrap_or_else(|_| "[]".into())
+        )
+    } else if !status.problems.is_empty() {
+        format!(
+            "The host has verified the exact file count, so create no additional files. Repair only the nonconforming turn-created files, starting with: {}.",
+            serde_json::to_string(&status.repair_paths).unwrap_or_else(|_| "[]".into())
+        )
+    } else {
+        format!(
+            "The host has verified all {} requested files.",
+            contract.requested_count
+        )
+    };
+    let placement = if contract.direct_workspace_root {
+        " Every requested file must be directly in the workspace root."
+    } else {
+        ""
+    };
+    let extension = if contract.txt_extension {
+        " Every requested filename must end in .txt."
+    } else {
+        ""
+    };
+    let names = if contract.random_names && cfg!(windows) {
+        r#" Use exactly `([guid]::NewGuid().ToString() + '.txt')` for each filename. Keep '.txt' single-quoted exactly; never emit `\.txt` or bare `.txt`. This gives every file a fresh host-verifiable random GUID stem."#
+    } else if contract.random_names {
+        " Use a fresh UUID as every filename stem so the host can verify the requested random-name shape."
+    } else if contract.distinct_names {
+        " Use collision-resistant distinct filenames."
+    } else {
+        ""
+    };
+    let content = match contract.content {
+        BulkContentRequirement::Any => "",
+        BulkContentRequirement::Empty => " Every requested file must be empty (zero bytes).",
+        BulkContentRequirement::NonEmpty => " Every requested file must be nonempty.",
+        BulkContentRequirement::DistinctNonEmpty => {
+            " Every requested file must have distinct, nonempty content. Keep each file at or below 1 MiB and their aggregate content at or below 8 MiB so the host can verify every byte."
+        }
+    };
+    let problems = if status.problems.is_empty() {
+        String::new()
+    } else {
+        format!(" Host findings: {}.", status.problems.join("; "))
+    };
+    let shell_contract = if cfg!(windows) {
+        concat!(
+            " Use exactly one run_shell call. run_shell receives native Windows PowerShell 5.1 ",
+            "verbatim: do not wrap it in powershell -Command. Use only workspace-relative paths, ",
+            "close every handle, and print the final count inside the same command."
+        )
+    } else {
+        concat!(
+            " Use exactly one workspace-relative run_shell call and print the final count inside ",
+            "the same command."
+        )
+    };
+    format!(
+        "{count_action}{placement}{extension}{names}{content}{problems}{shell_contract} Do not call NEED_CONTEXT or inspect source first."
+    )
 }
 
 /// Compare a pre-execution tree baseline with current state. New/deleted paths
@@ -6704,6 +7582,9 @@ mod tests {
         config
     }
 
+    const BULK_CREATION_REGRESSION_PROMPT: &str =
+        "I want you to create 100 text files with random names in the current working folder";
+
     fn paging_patch_step(directory: &std::path::Path) -> ModelStep {
         use sha2::Digest as _;
         let current =
@@ -6849,6 +7730,656 @@ mod tests {
             .notices
             .iter()
             .any(|notice| notice.contains("duplicate context page fault")));
+    }
+
+    #[test]
+    fn greenfield_creation_recovers_from_need_context_for_a_nonexistent_symbol() {
+        let _checkpoint_guard = super::super::checkpoint::tests::cp_lock();
+
+        struct GreenfieldCreationDriver {
+            histories: Vec<Vec<AgentMsg>>,
+            missing_faults: usize,
+            saw_modify: bool,
+            modify_tools: Vec<String>,
+        }
+
+        impl ModelDriver for GreenfieldCreationDriver {
+            fn step(
+                &mut self,
+                history: &[AgentMsg],
+                tools: &[ToolSpec],
+            ) -> Result<ModelStep, String> {
+                self.histories.push(history.to_vec());
+                let capsule = match history {
+                    [AgentMsg::User(capsule)] => capsule,
+                    _ => return Err("paging request replayed non-capsule history".into()),
+                };
+                // Always inject the bad page fault first. Empty-project
+                // initialization may already select Modify, but the regression
+                // is specifically about recovering after the model asks for a
+                // synthetic creation helper that cannot exist in the index.
+                if self.histories.len() == 1 {
+                    self.missing_faults += 1;
+                    return Ok(ModelStep::Text(
+                        json!({
+                            "action": "NEED_CONTEXT",
+                            "symbol": "create_files",
+                            "reason": "inspect the creation helper"
+                        })
+                        .to_string(),
+                    ));
+                }
+                if self.histories.len() == 2 {
+                    self.saw_modify = capsule.contains("phase=\"Modify\"");
+                    self.modify_tools = tools.iter().map(|tool| tool.name.clone()).collect();
+                    if !self.saw_modify {
+                        return Err(
+                            "missing synthetic creation context did not recover to Modify".into(),
+                        );
+                    }
+                }
+                if capsule.contains("phase=\"Complete\"") {
+                    return Ok(ModelStep::Text(
+                        json!({
+                            "action": "COMPLETE",
+                            "summary": "Created and verified result.txt."
+                        })
+                        .to_string(),
+                    ));
+                }
+                if capsule.contains("phase=\"Verify\"") {
+                    return Ok(ModelStep::Calls(vec![ToolCall {
+                        name: "read_file".into(),
+                        args: json!({"path": "result.txt"}),
+                    }]));
+                }
+                if capsule.contains("phase=\"Modify\"") {
+                    self.saw_modify = true;
+                    self.modify_tools = tools.iter().map(|tool| tool.name.clone()).collect();
+                    return Ok(ModelStep::Calls(vec![ToolCall {
+                        name: "write_file".into(),
+                        args: json!({"path": "result.txt", "content": "hello\n"}),
+                    }]));
+                }
+                Err("greenfield recovery left the executable workflow".into())
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::new(directory.path(), false, Duration::from_secs(5))
+            .unwrap()
+            .with_shell_mode(ShellSandbox::Sandboxed);
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+        let mut driver = GreenfieldCreationDriver {
+            histories: Vec::new(),
+            missing_faults: 0,
+            saw_modify: false,
+            modify_tools: Vec::new(),
+        };
+        let mut approver = ScriptApprover(vec![Decision::Once], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(
+            "Create result.txt in this empty workspace containing exactly hello".into(),
+        )];
+        let mut config = paging_cfg(directory.path());
+        config.max_steps = 0;
+
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sandbox,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(
+            driver.missing_faults, 1,
+            "the scripted missing-context fault must occur exactly once"
+        );
+        assert!(
+            driver.saw_modify,
+            "the capsule immediately after the rejected creation symbol must remain or enter Modify; capsules={:?}",
+            driver.histories
+        );
+        assert!(
+            driver.modify_tools.iter().any(|tool| tool == "write_file"),
+            "Modify recovery must expose an executable creation tool: {:?}",
+            driver.modify_tools
+        );
+        assert!(
+            driver.modify_tools.iter().any(|tool| tool == "run_shell"),
+            "Modify recovery must expose the shell fallback too: {:?}",
+            driver.modify_tools
+        );
+        assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
+        assert!(
+            driver.histories.len() <= 4,
+            "greenfield recovery should stay bounded, got {} model calls",
+            driver.histories.len()
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("result.txt")).unwrap(),
+            "hello\n"
+        );
+        assert!(!reporter
+            .notices
+            .iter()
+            .any(|notice| notice.contains("cycling typed actions")));
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+    }
+
+    #[test]
+    fn repeated_unavailable_context_stops_after_one_host_observation_with_an_answer() {
+        let _checkpoint_guard = super::super::checkpoint::tests::cp_lock();
+
+        struct AlwaysMissingDriver {
+            calls: usize,
+        }
+
+        impl ModelDriver for AlwaysMissingDriver {
+            fn step(
+                &mut self,
+                history: &[AgentMsg],
+                _tools: &[ToolSpec],
+            ) -> Result<ModelStep, String> {
+                assert!(
+                    matches!(history, [AgentMsg::User(_)]),
+                    "paging must send one fresh capsule per model call"
+                );
+                self.calls += 1;
+                Ok(ModelStep::Text(
+                    json!({
+                        "action": "NEED_CONTEXT",
+                        "symbol": "create_files",
+                        "reason": "inspect the creation helper"
+                    })
+                    .to_string(),
+                ))
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::new(directory.path(), false, Duration::from_secs(5))
+            .unwrap()
+            .with_shell_mode(ShellSandbox::Sandboxed);
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+        let mut driver = AlwaysMissingDriver { calls: 0 };
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(
+            "Create result.txt in this empty workspace containing hello".into(),
+        )];
+        let mut config = paging_cfg(directory.path());
+        config.max_steps = 0;
+
+        let end = run_loop(
+            &mut driver,
+            &mut ScriptApprover(Vec::new(), 0),
+            &mut reporter,
+            &sandbox,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Repeated, "notices: {:?}", reporter.notices);
+        assert_eq!(
+            driver.calls, 2,
+            "the second identical miss must trip the circuit breaker"
+        );
+        assert_eq!(
+            reporter
+                .calls
+                .iter()
+                .filter(|call| call.contains("list_dir"))
+                .count(),
+            1,
+            "the host may observe the workspace at most once: {:?}",
+            reporter.calls
+        );
+        assert!(
+            reporter.text.iter().any(|answer| !answer.trim().is_empty()),
+            "bounded termination must surface an honest answer"
+        );
+        assert!(reporter.notices.iter().any(|notice| {
+            notice.contains("repeatedly requested unavailable context `create_files`")
+        }));
+        assert!(!reporter
+            .notices
+            .iter()
+            .any(|notice| notice.contains("cycling typed actions")));
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+    }
+
+    #[test]
+    fn bulk_file_creation_classifier_requires_direct_bulk_creation() {
+        let classified = |request: &str| {
+            workspace_bulk_file_creation_contract(&[AgentMsg::User(request.into())])
+        };
+
+        let contract = classified(BULK_CREATION_REGRESSION_PROMPT).expect("bulk contract");
+        assert_eq!(contract.requested_count, 100);
+        assert!(contract.direct_workspace_root);
+        assert!(contract.txt_extension);
+        assert!(contract.distinct_names);
+        assert!(contract.random_names);
+        assert_eq!(contract.content, BulkContentRequirement::Any);
+        let bulk_history = [AgentMsg::User(BULK_CREATION_REGRESSION_PROMPT.into())];
+        assert!(select_workspace_bulk_file_creation_contract(
+            &bulk_history,
+            tools::ToolProfile::WebCode,
+            false
+        )
+        .is_none());
+        assert!(select_workspace_bulk_file_creation_contract(
+            &bulk_history,
+            tools::ToolProfile::WebCode,
+            true
+        )
+        .is_some());
+        assert!(select_workspace_bulk_file_creation_contract(
+            &bulk_history,
+            tools::ToolProfile::Full,
+            true
+        )
+        .is_none());
+
+        let distinct = classified(
+            "Generate 2 text files with a different nonempty value in each file in the working directory",
+        )
+        .expect("distinct-content contract");
+        assert_eq!(distinct.content, BulkContentRequirement::DistinctNonEmpty);
+        let nonempty = classified("Create 100 non-empty text files in the working directory")
+            .expect("nonempty-file contract");
+        assert_eq!(nonempty.content, BulkContentRequirement::NonEmpty);
+        let empty = classified("Create exactly 2 empty text files in the working directory")
+            .expect("empty-file contract");
+        assert_eq!(empty.content, BulkContentRequirement::Empty);
+        assert!(classified("Create 1000 random text files in the working directory").is_some());
+        for near_miss in [
+            "Create an app that processes 100 files",
+            "Create a manifest of 100 files",
+            "Generate a summary of 100 files",
+            "Create an archive of 100 files",
+            "Create 100 files from existing templates",
+            "Create 100 text files from template.txt in the current folder",
+            "Create 100 text files using template.txt in the current folder",
+            "Create 100 text files based on README in the current folder",
+            "Create 100 text files as copies of seed.txt in the current folder",
+            "Create 100 text files according to spec.txt in the current folder",
+            "From template.txt, create 100 text files in the current folder",
+            "Using template.txt, create 100 text files in the current folder",
+            "Based on README, create 100 text files in the current folder",
+            "According to spec.txt, create 100 text files in the current folder",
+            "Create 100 files; write TODO in each file in the working directory",
+            "Create 100 text files with random names in the current folder, all containing hello",
+            "Create 100 files in docs/generated",
+            "Create 100 files with .json extension in the working directory",
+            "Create 100 files and delete all existing files in the working directory",
+            "Create 100 files and generate 200 more in the working directory",
+            "Create 100 files with the same content in the working directory",
+            "Create 100 files with the same random content in each in the working directory",
+            "Fix code that reads 1000 text files",
+            "Inspect 1000 text files in the working directory",
+            "Make 100 text files in the working directory",
+            "Create 1 text file in the working directory",
+            "Create 10001 text files in the working directory",
+            "Create 1000 directories in the working directory",
+            "Create text files in the working directory",
+            "Generate 2 files with a different nonempty value in each file",
+        ] {
+            assert!(
+                classified(near_miss).is_none(),
+                "non-bulk-creation request was classified as the shell fast path: {near_miss:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bulk_file_contract_verifies_properties_and_detects_collateral_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("existing.rs"), "original\n").unwrap();
+        let baseline = bulk_file_creation_baseline(directory.path());
+        std::fs::write(directory.path().join("one.txt"), "same").unwrap();
+        std::fs::write(directory.path().join("two.txt"), "same").unwrap();
+        let contract = BulkFileCreationContract {
+            requested_count: 2,
+            direct_workspace_root: true,
+            txt_extension: true,
+            distinct_names: true,
+            random_names: false,
+            content: BulkContentRequirement::DistinctNonEmpty,
+        };
+
+        let duplicate = bulk_file_creation_status(directory.path(), &baseline, &contract);
+        assert!(!duplicate.complete);
+        assert!(duplicate
+            .problems
+            .iter()
+            .any(|problem| problem.contains("distinct content")));
+
+        std::fs::write(directory.path().join("two.txt"), "different").unwrap();
+        assert!(bulk_file_creation_status(directory.path(), &baseline, &contract).complete);
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(directory.path().join("two.txt"))
+            .unwrap()
+            .set_len(MAX_BULK_BASELINE_HASH_FILE_BYTES + 1)
+            .unwrap();
+        let oversized = bulk_file_creation_status(directory.path(), &baseline, &contract);
+        assert!(!oversized.complete);
+        assert!(oversized
+            .problems
+            .iter()
+            .any(|problem| problem.contains("verification budget")));
+
+        std::fs::write(directory.path().join("existing.rs"), "changed\n").unwrap();
+        let collateral = bulk_file_creation_status(directory.path(), &baseline, &contract);
+        assert!(!collateral.complete);
+        assert_eq!(collateral.collateral_paths, ["existing.rs"]);
+    }
+
+    #[test]
+    fn bulk_file_contract_preserves_empty_and_rejects_unsupported_same_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let baseline = bulk_file_creation_baseline(directory.path());
+        std::fs::File::create(directory.path().join("empty-1.txt")).unwrap();
+        std::fs::File::create(directory.path().join("empty-2.txt")).unwrap();
+        let empty = workspace_bulk_file_creation_contract(&[AgentMsg::User(
+            "Create exactly 2 empty text files in the working directory".into(),
+        )])
+        .unwrap();
+        assert!(bulk_file_creation_status(directory.path(), &baseline, &empty).complete);
+        std::fs::write(directory.path().join("empty-2.txt"), "not empty").unwrap();
+        assert!(!bulk_file_creation_status(directory.path(), &baseline, &empty).complete);
+
+        let same_content = workspace_bulk_file_creation_contract(&[AgentMsg::User(
+            "Create 2 text files with the same content in the working directory".into(),
+        )]);
+        assert!(same_content.is_none());
+    }
+
+    #[test]
+    fn bulk_file_baseline_content_hashing_is_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        for index in 0..MAX_BULK_BASELINE_HASH_FILES + 1 {
+            std::fs::File::create(directory.path().join(format!("existing-{index}.txt"))).unwrap();
+        }
+        let baseline = bulk_file_creation_baseline(directory.path());
+        assert_eq!(baseline.file_hashes.len(), MAX_BULK_BASELINE_HASH_FILES);
+        assert_eq!(
+            baseline.snapshot.entries.len(),
+            MAX_BULK_BASELINE_HASH_FILES + 1
+        );
+        assert!(!bulk_fast_path_capacity_is_eligible(100, 0, true));
+        assert!(bulk_fast_path_capacity_is_eligible(
+            10_000,
+            MAX_CHANGE_SCAN_ENTRIES - 10_000,
+            false
+        ));
+        assert!(!bulk_fast_path_capacity_is_eligible(
+            10_000,
+            MAX_CHANGE_SCAN_ENTRIES - 9_999,
+            false
+        ));
+    }
+
+    #[test]
+    fn exact_bulk_creation_prompt_starts_shell_only_modify_without_a_page_fault() {
+        let _checkpoint_guard = super::super::checkpoint::tests::cp_lock();
+
+        struct BulkCreationDriver {
+            histories: Vec<Vec<AgentMsg>>,
+            first_capsule: Option<String>,
+            first_tools: Vec<String>,
+            faults_before_shell: usize,
+            shell_model_call: Option<usize>,
+        }
+
+        impl ModelDriver for BulkCreationDriver {
+            fn step(
+                &mut self,
+                history: &[AgentMsg],
+                tools: &[ToolSpec],
+            ) -> Result<ModelStep, String> {
+                self.histories.push(history.to_vec());
+                let capsule = match history {
+                    [AgentMsg::User(capsule)] => capsule,
+                    _ => return Err("paging request replayed non-capsule history".into()),
+                };
+                let call_number = self.histories.len();
+
+                if self.shell_model_call.is_none() {
+                    let tool_names = tools
+                        .iter()
+                        .map(|tool| tool.name.clone())
+                        .collect::<Vec<_>>();
+                    if call_number == 1 {
+                        self.first_capsule = Some(capsule.clone());
+                        self.first_tools = tool_names.clone();
+                    }
+                    let has_platform_steering = if cfg!(windows) {
+                        capsule.contains("native Windows PowerShell 5.1 verbatim")
+                            && capsule.contains("do not wrap it in powershell -Command")
+                    } else {
+                        capsule.contains("exactly one workspace-relative run_shell call")
+                    };
+                    let ready_for_shell = capsule.contains("phase=\"Modify\"")
+                        && tool_names == ["run_shell"]
+                        && capsule.contains("Do not call NEED_CONTEXT or inspect source first")
+                        && has_platform_steering;
+                    if !ready_for_shell {
+                        // Reproduce the observed small-model fallback if the
+                        // host ever regresses to a discovery-shaped capsule.
+                        self.faults_before_shell += 1;
+                        return Ok(ModelStep::Text(
+                            json!({
+                                "action": "NEED_CONTEXT",
+                                "symbol": "create_files",
+                                "reason": "inspect the creation helper"
+                            })
+                            .to_string(),
+                        ));
+                    }
+
+                    self.shell_model_call = Some(call_number);
+                    let command = if cfg!(windows) {
+                        "$utf8 = [Text.UTF8Encoding]::new($false); 1..100 | ForEach-Object { $path = Join-Path (Get-Location) ('00000000-0000-4000-8000-{0:D12}.txt' -f $_); [IO.File]::WriteAllText($path, ('value-{0}' -f $_), $utf8) }; Write-Output 100"
+                    } else {
+                        "i=1; while [ $i -le 100 ]; do name=$(printf '00000000-0000-4000-8000-%012d.txt' \"$i\"); printf 'value-%s' \"$i\" > \"$name\"; i=$((i + 1)); done; printf '100\\n'"
+                    };
+                    return Ok(ModelStep::Calls(vec![ToolCall {
+                        name: "run_shell".into(),
+                        args: json!({"command": command}),
+                    }]));
+                }
+
+                if capsule.contains("phase=\"Verify\"") {
+                    return Ok(ModelStep::Calls(vec![ToolCall {
+                        name: "read_file".into(),
+                        args: json!({"path": "00000000-0000-4000-8000-000000000001.txt"}),
+                    }]));
+                }
+                if capsule.contains("phase=\"Complete\"") {
+                    return Ok(ModelStep::Text(
+                        json!({
+                            "action": "COMPLETE",
+                            "summary": "Executed and verified the bulk-creation shell workflow."
+                        })
+                        .to_string(),
+                    ));
+                }
+                Err("bulk creation left the executable workflow".into())
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::new(directory.path(), false, Duration::from_secs(10))
+            .unwrap()
+            .with_shell_mode(ShellSandbox::Unrestricted);
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+        let mut driver = BulkCreationDriver {
+            histories: Vec::new(),
+            first_capsule: None,
+            first_tools: Vec::new(),
+            faults_before_shell: 0,
+            shell_model_call: None,
+        };
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(BULK_CREATION_REGRESSION_PROMPT.into())];
+        let mut config = paging_cfg(directory.path());
+        config.max_steps = 0;
+        config.shell_sandbox = ShellSandbox::Unrestricted;
+
+        let end = run_loop(
+            &mut driver,
+            &mut ScriptApprover(vec![Decision::Once], 0),
+            &mut reporter,
+            &sandbox,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        let first_capsule = driver.first_capsule.as_deref().expect("first capsule");
+        assert!(first_capsule.contains("phase=\"Modify\""));
+        assert!(first_capsule.contains("<usable_tools phase=\"Modify\">run_shell</usable_tools>"));
+        assert!(first_capsule.contains("Do not call NEED_CONTEXT or inspect source first"));
+        assert!(!first_capsule.contains("<failed_attempts>"));
+        if cfg!(windows) {
+            assert!(first_capsule.contains("native Windows PowerShell 5.1 verbatim"));
+            assert!(first_capsule.contains("do not wrap it in powershell -Command"));
+            assert!(first_capsule.contains("([guid]::NewGuid().ToString() + '.txt')"));
+            assert!(first_capsule.contains("never emit `\\.txt` or bare `.txt`"));
+        }
+        assert_eq!(driver.first_tools, ["run_shell"]);
+        assert_eq!(driver.faults_before_shell, 0);
+        assert_eq!(driver.shell_model_call, Some(1));
+        assert!(reporter
+            .calls
+            .first()
+            .is_some_and(|call| call.contains("run_shell")));
+        assert!(!reporter
+            .notices
+            .iter()
+            .any(|notice| notice.contains("context page fault")));
+        assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
+        assert_eq!(
+            std::fs::read_to_string(
+                directory
+                    .path()
+                    .join("00000000-0000-4000-8000-000000000001.txt")
+            )
+            .unwrap(),
+            "value-1"
+        );
+        assert_eq!(
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .flatten()
+                .filter(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("txt"))
+                })
+                .count(),
+            100
+        );
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+    }
+
+    #[test]
+    fn bulk_creation_cannot_complete_after_creating_only_one_of_one_hundred_files() {
+        let _checkpoint_guard = super::super::checkpoint::tests::cp_lock();
+
+        struct UnderProducingDriver {
+            calls: usize,
+        }
+
+        impl ModelDriver for UnderProducingDriver {
+            fn step(
+                &mut self,
+                history: &[AgentMsg],
+                tools: &[ToolSpec],
+            ) -> Result<ModelStep, String> {
+                let capsule = match history {
+                    [AgentMsg::User(capsule)] => capsule,
+                    _ => return Err("paging request replayed non-capsule history".into()),
+                };
+                self.calls += 1;
+                if self.calls == 1 {
+                    assert!(capsule.contains("phase=\"Modify\""));
+                    assert_eq!(
+                        tools
+                            .iter()
+                            .map(|tool| tool.name.as_str())
+                            .collect::<Vec<_>>(),
+                        ["run_shell"]
+                    );
+                    let command = if cfg!(windows) {
+                        "Set-Content -LiteralPath 'only-one.txt' -Value 'one' -NoNewline; Write-Output 1"
+                    } else {
+                        "printf %s one > only-one.txt; printf '1\\n'"
+                    };
+                    return Ok(ModelStep::Calls(vec![ToolCall {
+                        name: "run_shell".into(),
+                        args: json!({"command": command}),
+                    }]));
+                }
+                assert!(
+                    capsule.contains("verified 1 new files")
+                        && capsule.contains("99 additional new files"),
+                    "partial host evidence was not carried into recovery: {capsule}"
+                );
+                Ok(ModelStep::Text(
+                    json!({
+                        "action": "COMPLETE",
+                        "summary": "Created all one hundred files."
+                    })
+                    .to_string(),
+                ))
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::new(directory.path(), false, Duration::from_secs(10))
+            .unwrap()
+            .with_shell_mode(ShellSandbox::Unrestricted);
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+        let mut driver = UnderProducingDriver { calls: 0 };
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(BULK_CREATION_REGRESSION_PROMPT.into())];
+        let mut config = paging_cfg(directory.path());
+        config.max_steps = 0;
+        config.shell_sandbox = ShellSandbox::Unrestricted;
+
+        let end = run_loop(
+            &mut driver,
+            &mut ScriptApprover(vec![Decision::Once], 0),
+            &mut reporter,
+            &sandbox,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_ne!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("only-one.txt")).unwrap(),
+            "one"
+        );
+        assert!(reporter.notices.iter().any(|notice| {
+            notice.contains("exact bulk-file contract")
+                || notice.contains("bulk-file contract has not passed")
+        }));
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
     }
 
     #[test]
