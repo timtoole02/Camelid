@@ -3,7 +3,7 @@ use std::{
     convert::Infallible,
     env, mem,
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
@@ -387,12 +387,7 @@ struct PromptPrefixCachePool {
 
 impl PromptPrefixCachePool {
     fn from_env() -> Self {
-        let capacity = env::var(PROMPT_PREFIX_CACHE_CAPACITY_ENV)
-            .ok()
-            .and_then(|value| value.trim().parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(DEFAULT_PROMPT_PREFIX_CACHE_CAPACITY);
-        Self::with_capacity(capacity)
+        Self::with_capacity(prompt_prefix_cache_capacity())
     }
 
     fn with_capacity(capacity: usize) -> Self {
@@ -406,7 +401,53 @@ impl PromptPrefixCachePool {
         self.entries.clear();
     }
 
+    /// Permanently release and turn off retained KV entries. Capacity zero is
+    /// an internal low-memory state; environment parsing still treats zero as
+    /// invalid so ordinary startup behavior remains unchanged.
+    fn disable(&mut self) {
+        self.entries.clear();
+        self.capacity = 0;
+    }
+
+    /// Free the slot that a newly cloned KV entry will occupy *before* the
+    /// clone is built. Evicting inside `insert` is too late: a full pool plus
+    /// the active session plus the replacement clone creates a transient extra
+    /// multi-gigabyte KV owner on long prompts.
+    fn reserve_for_insert(
+        &mut self,
+        model_id: &str,
+        model_path: &Path,
+        token_ids: &[u32],
+        sampling: &SamplingConfig,
+    ) {
+        if self.capacity == 0 {
+            return;
+        }
+        let replace_index = self.entries.iter().position(|entry| {
+            entry.cached.model_id == model_id
+                && entry.cached.model_path == model_path
+                && entry.cached.token_ids == token_ids
+                && entry.cached.sampling == *sampling
+        });
+        let evict_index = replace_index.or_else(|| {
+            (self.entries.len() >= self.capacity).then(|| {
+                self.entries
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, entry)| entry.last_used)
+                    .map(|(index, _)| index)
+                    .expect("a full positive-capacity pool has an LRU entry")
+            })
+        });
+        if let Some(index) = evict_index {
+            self.entries.remove(index);
+        }
+    }
+
     fn insert(&mut self, cached: CachedPromptPrefix) {
+        if self.capacity == 0 {
+            return;
+        }
         let cached = Arc::new(cached);
         let now = std::time::Instant::now();
 
@@ -438,6 +479,14 @@ impl PromptPrefixCachePool {
             last_used: now,
         });
     }
+}
+
+pub(crate) fn prompt_prefix_cache_capacity() -> usize {
+    env::var(PROMPT_PREFIX_CACHE_CAPACITY_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_PROMPT_PREFIX_CACHE_CAPACITY)
 }
 
 #[derive(Clone)]
@@ -853,6 +902,10 @@ pub struct ChatCompletionRequest {
     pub camelid_logit_token_ids: Option<Vec<u32>>,
     pub camelid_dense_diagnostics: Option<bool>,
     pub camelid_dense_diagnostic_generated_index: Option<u32>,
+    /// Private Web Code opt-in for a compact timing receipt on the terminal
+    /// streaming chunk. This avoids enabling verbose timing diagnostics for
+    /// unrelated API callers while exposing prompt-cache behavior per step.
+    pub camelid_stream_timing_diagnostics: Option<bool>,
     /// Optional hard ceiling for the exact rendered prompt plus generation.
     /// Workspace sets this private extension; ordinary OpenAI callers omit it.
     pub camelid_context_budget_tokens: Option<u32>,
@@ -1698,6 +1751,10 @@ pub struct GenerationTimings {
     pub weight_load: u128,
     pub weight_cache_hit: bool,
     pub prompt_cache_hit: bool,
+    /// Prompt tokens restored from an accepted exact/partial prefix entry.
+    pub prompt_reused_tokens: usize,
+    /// Prompt tokens evaluated for this request after any accepted reuse.
+    pub prompt_prefilled_tokens: usize,
     pub session_create: u128,
     pub generate: u128,
     pub generation: GenerationPhaseTimings,
@@ -11883,6 +11940,34 @@ fn decode_prism_image_data_url(url: &str) -> std::result::Result<Vec<u8>, Respon
 }
 
 #[allow(clippy::result_large_err)]
+fn tokenize_runnable_text_prompt(
+    architecture: &str,
+    tokenizer: &Tokenizer,
+    prompt_text: &str,
+) -> std::result::Result<Vec<u32>, Response> {
+    // `add_special` supplies the leading BOS for templates that emit
+    // `bos_token` outside their returned text. Without it the whole prompt is
+    // shifted and the forward diverges from the reference.  This helper is the
+    // single tokenization path for live runnable chat and its exact preflight.
+    let llama_template_omits_bos = architecture == "llama"
+        && tokenizer.config.add_bos
+        && tokenizer
+            .token_text(tokenizer.special.bos)
+            .is_some_and(|bos| !prompt_text.starts_with(bos));
+    let add_special = runnable_prompt_add_special(architecture) || llama_template_omits_bos;
+    tokenizer
+        .encode(prompt_text, add_special, true)
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "tokenize_error",
+                error.to_string(),
+                None,
+            )
+        })
+}
+
+#[allow(clippy::result_large_err)]
 fn prepare_runnable_prompt(
     runtime: &RunnableServeRuntime,
     req: &ChatCompletionRequest,
@@ -11895,28 +11980,11 @@ fn prepare_runnable_prompt(
         .flat_map(|message| message.image_urls.iter().map(String::as_str))
         .collect();
     if image_urls.is_empty() {
-        // `add_special` supplies the leading BOS for templates that emit
-        // `bos_token` outside their returned text. Without it the whole prompt
-        // is shifted and the forward diverges from the reference.
-        let llama_template_omits_bos = runtime.architecture == "llama"
-            && runtime.tokenizer.config.add_bos
-            && runtime
-                .tokenizer
-                .token_text(runtime.tokenizer.special.bos)
-                .is_some_and(|bos| !prompt_text.starts_with(bos));
-        let add_special =
-            runnable_prompt_add_special(&runtime.architecture) || llama_template_omits_bos;
-        let ids = runtime
-            .tokenizer
-            .encode(prompt_text, add_special, true)
-            .map_err(|error| {
-                api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "tokenize_error",
-                    error.to_string(),
-                    None,
-                )
-            })?;
+        let ids = tokenize_runnable_text_prompt(
+            &runtime.architecture,
+            runtime.tokenizer.as_ref(),
+            prompt_text,
+        )?;
         return Ok(RunnablePreparedPrompt::Text(ids));
     }
     if image_urls.len() != 1 {
@@ -12034,6 +12102,67 @@ struct RunnableGenerationResult {
     generated_token_ids: Vec<u32>,
     prompt_token_ids: Option<Vec<u32>>,
     prompt_token_count: usize,
+}
+
+/// Apply Workspace's private total-context ceiling to a prepared runnable
+/// prompt before any expensive prefill begins. Text prompts have an exact token
+/// representation and are therefore enforceable. Vision projection produces a
+/// data-dependent embedding span, so that unrelated surface fails closed when
+/// asked to honor a text-token budget rather than claiming a guessed count.
+async fn runnable_max_tokens_for_prepared(
+    state: &AppState,
+    model_id: &str,
+    prepared: &RunnablePreparedPrompt,
+    req: &ChatCompletionRequest,
+) -> std::result::Result<usize, Response> {
+    match prepared {
+        RunnablePreparedPrompt::Text(prompt_ids) => {
+            let model = state
+                .loaded_models
+                .read()
+                .await
+                .get(model_id)
+                .cloned()
+                .ok_or_else(|| {
+                    api_error(
+                        StatusCode::CONFLICT,
+                        "model_transitioned",
+                        "the runnable model was unloaded while generation was preparing; retry the request"
+                            .to_string(),
+                        Some("model"),
+                    )
+                })?;
+            runnable_effective_max_tokens(
+                state,
+                &model,
+                prompt_ids.len(),
+                req.max_tokens,
+                req.camelid_context_budget_tokens,
+            )
+            .map(|tokens| tokens as usize)
+            .map_err(RunnableBudgetError::into_response)
+        }
+        RunnablePreparedPrompt::Vision { .. } => {
+            if req.camelid_context_budget_tokens.is_some() {
+                return Err(api_error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "unsupported_context_budget",
+                    "camelid_context_budget_tokens requires an exact text-token prompt and is not supported for projected image embeddings"
+                        .to_string(),
+                    Some("camelid_context_budget_tokens"),
+                ));
+            }
+            if req.max_tokens == Some(0) {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_max_tokens",
+                    "max_tokens must be greater than zero".to_string(),
+                    Some("max_tokens"),
+                ));
+            }
+            Ok(req.max_tokens.unwrap_or(256).min(4096) as usize)
+        }
+    }
 }
 
 fn runnable_generation_diagnostics(
@@ -12218,7 +12347,10 @@ async fn runnable_chat_nonstreaming(
         Ok(config) => config,
         Err(response) => return response,
     };
-    let max_tokens = req.max_tokens.unwrap_or(256).min(4096) as usize;
+    let max_tokens = match runnable_max_tokens_for_prepared(state, &id, &prepared, req).await {
+        Ok(max_tokens) => max_tokens,
+        Err(response) => return response,
+    };
     let rt = runtime.clone();
     let result = tokio::task::spawn_blocking(move || match prepared {
         RunnablePreparedPrompt::Text(prompt_ids) => {
@@ -12375,6 +12507,7 @@ async fn runnable_chat_nonstreaming(
 /// scanning is needed; per-phase text is decoded incrementally with UTF-8
 /// hold-back (a multi-token code point emits only once complete).
 async fn runnable_chat_streaming(
+    state: &AppState,
     id: String,
     runtime: Arc<RunnableServeRuntime>,
     req: &ChatCompletionRequest,
@@ -12452,7 +12585,10 @@ async fn runnable_chat_streaming(
         Ok(config) => config,
         Err(response) => return response,
     };
-    let max_tokens = req.max_tokens.unwrap_or(256).min(4096) as usize;
+    let max_tokens = match runnable_max_tokens_for_prepared(state, &id, &prepared, req).await {
+        Ok(max_tokens) => max_tokens,
+        Err(response) => return response,
+    };
     let include_usage = stream_options_include_usage(req.stream_options.as_ref());
     let parse_stream_tool_calls = !tools.is_empty();
     // Post-hoc envelope lifting is gated on tool_choice, not tool presence:
@@ -14816,10 +14952,136 @@ async fn preflight_generation(
         Ok(payload) => payload,
         Err(err) => return malformed_json_error(err),
     };
-    match validate_generation_request(&state, req).await {
-        Ok(summary) => Json(summary).into_response(),
+    // Workspace sends chat-shaped requests here to obtain the exact rendered
+    // prompt count before it decides whether to retain or trim history.  The
+    // dense validator below deliberately rejects runnable-only architectures,
+    // because it would otherwise bind them to the wrong graph.  Ornith/qwen35
+    // nevertheless has a real chat renderer and tokenizer, so count that exact
+    // runnable prompt without constructing (or claiming) a dense session.
+    match preflight_runnable_chat_request(&state, &req).await {
+        Ok(Some(summary)) => Json(summary).into_response(),
+        Ok(None) => match validate_generation_request(&state, req).await {
+            Ok(summary) => Json(summary).into_response(),
+            Err(response) => response,
+        },
         Err(response) => response,
     }
+}
+
+/// Tokenization-only preflight for the runnable Ornith/qwen35 chat lane.
+///
+/// Raw completion requests intentionally keep flowing to the dense validator,
+/// which returns `unsupported_completions_lane` for qwen35.  This branch is
+/// only for the chat-shaped request Workspace already sends: it renders the
+/// same Ornith tool prompt and calls the same tokenizer helper as the runnable
+/// chat handler, then applies the same private prompt+generation ceiling.  It
+/// does not build a dense inference session or publish dense prompt-cache
+/// readiness; runnable prefill has separate runtime state and diagnostics.
+async fn preflight_runnable_chat_request(
+    state: &AppState,
+    req: &GenerationSessionRequest,
+) -> std::result::Result<Option<GenerationSessionSummary>, Response> {
+    // Preserve the raw-completions gate, including the existing qwen35
+    // `/api/generation/preflight` test that submits `prompt` rather than chat
+    // `messages`.
+    if req.messages.is_none() {
+        return Ok(None);
+    }
+
+    let model_id = match req.model.as_deref() {
+        Some(id) => Some(id.to_string()),
+        None => state.active_model_id.read().await.clone(),
+    };
+    let Some(model_id) = model_id else {
+        return Ok(None);
+    };
+    let model = state.loaded_models.read().await.get(&model_id).cloned();
+    let Some(model) = model else {
+        return Ok(None);
+    };
+    if model.gguf.architecture() != Some("qwen35") || !is_runnable_serve_file(&model.gguf) {
+        return Ok(None);
+    }
+
+    validate_unsupported_generation_fields(req).map_err(|response| *response)?;
+    validate_choice_and_logprob_fields(req).map_err(|response| *response)?;
+    // Keep request validation aligned with the served chat path even though
+    // sampling does not affect token count.
+    let _ = sampling_config_from_request(req).map_err(|response| *response)?;
+    let _ = stop_sequences_from_request(req.stop.as_ref()).map_err(|response| *response)?;
+    if req.max_tokens == Some(0) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_max_tokens",
+            "max_tokens must be greater than zero".to_string(),
+            Some("max_tokens"),
+        ));
+    }
+    if req.prompt.is_some() || req.camelid_prompt_token_ids.is_some() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "ambiguous_generation_input",
+            "runnable chat preflight accepts messages only; do not combine messages with prompt or camelid_prompt_token_ids"
+                .to_string(),
+            None,
+        ));
+    }
+    let messages = req
+        .messages
+        .as_deref()
+        .filter(|messages| !messages.is_empty())
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "missing_generation_input",
+                "runnable chat preflight requires a non-empty messages array".to_string(),
+                Some("messages"),
+            )
+        })?;
+    validate_chat_messages(messages).map_err(|response| *response)?;
+
+    let tokenizer = model.tokenizer_runtime.as_deref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "tokenizer_unavailable",
+            format!("model '{}' has no usable runnable tokenizer", model.id),
+            Some("model"),
+        )
+    })?;
+    let tools = unwrap_runnable_tools(req.tools.clone().unwrap_or_default());
+    let prompt = if tools.is_empty() {
+        render_ornith_chatml_prompt(messages, req.camelid_enable_thinking.unwrap_or(false))
+    } else {
+        render_ornith_chatml_prompt_with_tools(
+            messages,
+            &tools,
+            req.camelid_enable_thinking.unwrap_or(false),
+        )
+    };
+    let token_ids = tokenize_runnable_text_prompt("qwen35", tokenizer, &prompt)?;
+    let max_tokens = runnable_effective_max_tokens(
+        state,
+        &model,
+        token_ids.len(),
+        req.max_tokens,
+        req.camelid_context_budget_tokens,
+    )
+    .map_err(RunnableBudgetError::into_response)?;
+
+    Ok(Some(GenerationSessionSummary {
+        id: format!(
+            "gen-{}-{}",
+            model.id,
+            state.generation_sessions.read().await.len() + 1
+        ),
+        object: "generation.session",
+        model: model.id,
+        prompt_token_count: token_ids.len(),
+        max_tokens,
+        state: "validated",
+        dense_session_ready: false,
+        next_step: "the exact runnable chat prompt fits; /v1/chat/completions will enforce the same total context budget without claiming dense prompt-cache telemetry",
+    }))
 }
 
 /// Every choice of an n>1 request, prepared upfront (KV caches allocate
@@ -15115,7 +15377,7 @@ async fn completions(
     if stream {
         // Text-completion streaming does not implement stream_options yet
         // (scope: chat-completions only), so usage is never emitted here.
-        return stream_completion(&state, prepared, false, false, false);
+        return stream_completion(&state, prepared, false, false, false, false);
     }
 
     // The decode runs on the engine worker; CancelOnDrop stops it within one
@@ -15382,7 +15644,7 @@ async fn chat_completions(
                 return constraint_unsupported_on_lane();
             }
             if req.stream.unwrap_or(false) {
-                return runnable_chat_streaming(id, runtime, &req).await;
+                return runnable_chat_streaming(&state, id, runtime, &req).await;
             }
             return runnable_chat_nonstreaming(&state, id, runtime, &req).await;
         }
@@ -15516,6 +15778,7 @@ async fn chat_completions(
     // request. Threaded into stream_completion; ignored on the non-streaming
     // branch, which already returns `usage`.
     let include_usage = stream_options_include_usage(req.stream_options.as_ref());
+    let request_timing_diagnostics = req.camelid_stream_timing_diagnostics.unwrap_or(false);
     let req = GenerationSessionRequest {
         model: req.model,
         prompt: None,
@@ -15582,6 +15845,7 @@ async fn chat_completions(
             true,
             include_usage,
             tools_active && !constraint_active,
+            request_timing_diagnostics,
         );
     }
 
@@ -16924,6 +17188,127 @@ fn enforce_context_budget(
     Ok(())
 }
 
+#[derive(Debug)]
+struct RunnableBudgetError {
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+    param: Option<&'static str>,
+}
+
+impl RunnableBudgetError {
+    fn new(
+        status: StatusCode,
+        code: &'static str,
+        message: String,
+        param: Option<&'static str>,
+    ) -> Self {
+        Self {
+            status,
+            code,
+            message,
+            param,
+        }
+    }
+
+    fn into_response(self) -> Response {
+        api_error(self.status, self.code, self.message, self.param)
+    }
+}
+
+/// Resolve the runnable text lane's effective generation allowance and enforce
+/// the same total prompt+generation ceiling Workspace selected for the turn.
+///
+/// This deliberately carries no dense cache/session state: runnable qwen35 has
+/// its own resident/CPU runtime and the only shared contract here is exact
+/// rendered token count plus a hard total-token bound.
+fn runnable_effective_max_tokens(
+    state: &AppState,
+    model: &LoadedModel,
+    prompt_tokens: usize,
+    requested_max_tokens: Option<u32>,
+    context_budget_tokens: Option<u32>,
+) -> std::result::Result<u32, RunnableBudgetError> {
+    if requested_max_tokens == Some(0) {
+        return Err(RunnableBudgetError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_max_tokens",
+            "max_tokens must be greater than zero".to_string(),
+            Some("max_tokens"),
+        ));
+    }
+    if prompt_tokens > state.server_limits.max_prompt_tokens {
+        return Err(RunnableBudgetError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "prompt_token_limit_exceeded",
+            format!(
+                "prompt encoded to {prompt_tokens} tokens, above the server ceiling of {}",
+                state.server_limits.max_prompt_tokens
+            ),
+            Some("prompt"),
+        ));
+    }
+    let context_length = model
+        .llama_config
+        .as_ref()
+        .map(|config| config.context_length as usize)
+        .ok_or_else(|| {
+            RunnableBudgetError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unsupported_model_architecture",
+                "loaded runnable model does not expose a context length".to_string(),
+                Some("model"),
+            )
+        })?;
+    if prompt_tokens >= context_length {
+        return Err(RunnableBudgetError::new(
+            StatusCode::BAD_REQUEST,
+            "context_length_exceeded",
+            format!(
+                "prompt token count {prompt_tokens} leaves no room for generation in context length {context_length}"
+            ),
+            Some("prompt"),
+        ));
+    }
+
+    // Keep the runnable bridge's existing public default and 4096-token output
+    // cap, then clamp it to model headroom exactly as the dense lane does.
+    let max_tokens = requested_max_tokens
+        .unwrap_or(256)
+        .min(4096)
+        .min((context_length - prompt_tokens) as u32);
+    if max_tokens > state.server_limits.max_generation_tokens {
+        return Err(RunnableBudgetError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "generation_token_limit_exceeded",
+            format!(
+                "effective max_tokens exceeds the server ceiling of {}",
+                state.server_limits.max_generation_tokens
+            ),
+            Some("max_tokens"),
+        ));
+    }
+    if let Some(budget_tokens) = context_budget_tokens {
+        if budget_tokens == 0 {
+            return Err(RunnableBudgetError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_context_budget",
+                "camelid_context_budget_tokens must be greater than zero".to_string(),
+                Some("camelid_context_budget_tokens"),
+            ));
+        }
+        if let Err(message) = enforce_context_budget(prompt_tokens, max_tokens, budget_tokens) {
+            return Err(RunnableBudgetError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "context_budget_exceeded",
+                message,
+                Some("camelid_context_budget_tokens"),
+            ));
+        }
+    }
+    Ok(max_tokens)
+}
+
 pub(super) fn model_resident_cache_key(model_id: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -17248,6 +17633,7 @@ async fn prepare_generation(
             Some("prompt"),
         ));
     }
+    timings.prompt_prefilled_tokens = token_ids.len();
     if token_ids.len() > state.server_limits.max_prompt_tokens {
         return Err(api_error(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -18548,6 +18934,14 @@ fn clear_prompt_prefix_cache(state: &AppState) {
     }
 }
 
+fn disable_prompt_prefix_cache(state: &AppState) {
+    let mut pool = state
+        .cached_prompt_prefix
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    pool.disable();
+}
+
 fn lookup_prompt_prefix_cache(prepared: &PreparedGeneration) -> Option<PrefixMatchResult> {
     // A constraint no longer disqualifies a hit. The cached artifact is prompt
     // KV plus the logits for the first output token — both independent of the
@@ -18557,6 +18951,9 @@ fn lookup_prompt_prefix_cache(prepared: &PreparedGeneration) -> Option<PrefixMat
     // every step. Refusing outright meant a constrained request paid a full
     // cold prefill every time — the very cost this cache exists to remove.
     let mut pool = prepared.cached_prompt_prefix.lock().ok()?;
+    if pool.capacity == 0 {
+        return None;
+    }
     let min_prefix = prompt_prefix_cache_min_tokens_from_env();
     let mut best: Option<(usize, bool, usize, std::time::Instant)> = None;
 
@@ -18654,17 +19051,39 @@ fn store_prompt_prefix_cache(prepared: &mut PreparedGeneration, step: &LlamaGene
     // entry must never be a differently-answering shortcut.
     // Position check FIRST: it is free, and mirroring is not — a session that is
     // about to be rejected must not pay for hundreds of MiB of KV readback.
-    if prepared.session.kv_position() != prepared.token_ids.len()
-        || !prepared.session.prepare_for_prompt_prefix_cache()
-    {
+    if prepared.session.kv_position() != prepared.token_ids.len() {
+        return;
+    }
+
+    // Serialize reservation, Metal->CPU mirroring and the large session clone.
+    // This briefly blocks cache lookups, but keeps replacement peak memory to
+    // the configured pool capacity instead of capacity+1. A cache is an
+    // optimization; if mirroring declines after eviction, the next request
+    // simply cold-prefills.
+    let Ok(mut pool) = prepared.cached_prompt_prefix.lock() else {
+        return;
+    };
+    // Low-memory admission disables the cache before the expensive
+    // Metal->CPU mirror and populated-session clone. Checking only in `insert`
+    // would avoid retention but still create the transient owners that this
+    // mode exists to prevent.
+    if pool.capacity == 0 {
+        return;
+    }
+    pool.reserve_for_insert(
+        &prepared.model_id,
+        &prepared.model_path,
+        &prepared.token_ids,
+        &prepared.sampling,
+    );
+    if !prepared.session.prepare_for_prompt_prefix_cache() {
         return;
     }
 
     let metal_f32_resident_kv = prepared.session.uses_f32_metal_resident_kv();
 
-    // Cloning a populated session can copy hundreds of MiB of KV data. Do that
-    // outside the global cache lock so concurrent requests can still look up
-    // their own prefixes.
+    // Cloning a populated session can copy hundreds of MiB of KV data. The
+    // destination slot was released above, before this allocation starts.
     let cached = CachedPromptPrefix {
         model_id: prepared.model_id.clone(),
         model_path: prepared.model_path.clone(),
@@ -18677,9 +19096,7 @@ fn store_prompt_prefix_cache(prepared: &mut PreparedGeneration, step: &LlamaGene
         metal_f32_resident_kv,
     };
 
-    if let Ok(mut pool) = prepared.cached_prompt_prefix.lock() {
-        pool.insert(cached);
-    }
+    pool.insert(cached);
 }
 
 /// Resume a PARTIAL prompt-prefix-cache hit: roll the cached session back to
@@ -18711,6 +19128,8 @@ fn resume_partial_prefix_hit(
         prepared.session = cached_session;
         *input = prepared.token_ids[prefix_len..].to_vec();
         prepared.timings.prompt_cache_hit = true;
+        prepared.timings.prompt_reused_tokens = prefix_len;
+        prepared.timings.prompt_prefilled_tokens = input.len();
     }
 }
 
@@ -18959,6 +19378,8 @@ fn generate_token_ids(
                 let cached_next_token = first_step.next_token_id;
                 sample += first_step.sample;
                 prepared.timings.prompt_cache_hit = true;
+                prepared.timings.prompt_reused_tokens = prepared.token_ids.len();
+                prepared.timings.prompt_prefilled_tokens = 0;
                 consume_generation_step(
                     &prepared,
                     first_step,
@@ -19714,9 +20135,14 @@ fn runnable_request_tools(req: &ChatCompletionRequest) -> Vec<serde_json::Value>
     if !tool_choice_allows_calls(req.tool_choice.as_ref()) {
         return Vec::new();
     }
-    req.tools
-        .clone()
-        .unwrap_or_default()
+    unwrap_runnable_tools(req.tools.clone().unwrap_or_default())
+}
+
+/// Normalize OpenAI function-tool envelopes into the flat definitions Ornith's
+/// native template consumes. Shared with runnable preflight so its exact token
+/// count cannot drift from the prompt that generation will actually see.
+fn unwrap_runnable_tools(tools: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    tools
         .into_iter()
         .map(|t| t.get("function").cloned().unwrap_or(t))
         .collect()
@@ -20090,6 +20516,8 @@ fn stream_timing_diagnostics_json(
                 "weight_load": timings.weight_load,
                 "weight_cache_hit": timings.weight_cache_hit,
                 "prompt_cache_hit": timings.prompt_cache_hit,
+                "prompt_reused_tokens": timings.prompt_reused_tokens,
+                "prompt_prefilled_tokens": timings.prompt_prefilled_tokens,
                 "session_create": timings.session_create,
                 "prefill_forward_total": timings.prompt_evaluation.prefill.forward_total,
                 "first_token_forward_total": timings.prompt_evaluation.first_token.forward_total,
@@ -20104,6 +20532,33 @@ fn stream_timing_diagnostics_json(
                 },
             },
             "q8_schedule": timings.q8_schedule,
+        }
+    })
+}
+
+/// Small terminal receipt used by Web Code on every model step. The existing
+/// env-gated diagnostics above intentionally include per-role/per-layer maps
+/// and Q8 schedule detail; serializing that verbose payload on every agent
+/// request would make the performance instrument part of the performance
+/// problem it is measuring.
+fn stream_timing_receipt_json(
+    timings: &GenerationTimings,
+    first_content_ms: Option<u128>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "stream_timing_diagnostics": {
+            "timings_ms": {
+                "first_content": first_content_ms,
+                "weight_load": timings.weight_load,
+                "weight_cache_hit": timings.weight_cache_hit,
+                "prompt_cache_hit": timings.prompt_cache_hit,
+                "prompt_reused_tokens": timings.prompt_reused_tokens,
+                "prompt_prefilled_tokens": timings.prompt_prefilled_tokens,
+                "session_create": timings.session_create,
+                "prefill_forward_total": timings.prompt_evaluation.prefill.forward_total,
+                "first_token_forward_total": timings.prompt_evaluation.first_token.forward_total,
+                "generation_forward_total": timings.generation.forward_total,
+            }
         }
     })
 }
@@ -20273,6 +20728,8 @@ fn stream_prompt_cache_prologue(
                     Ok(first_step) => {
                         let cached_next_token = first_step.next_token_id;
                         prepared.timings.prompt_cache_hit = true;
+                        prepared.timings.prompt_reused_tokens = prepared.token_ids.len();
+                        prepared.timings.prompt_prefilled_tokens = 0;
                         *sample += first_step.sample;
                         if let Err(response) = consume_generation_step(
                             prepared,
@@ -20902,6 +21359,7 @@ fn stream_completion(
     chat: bool,
     include_usage: bool,
     parse_stream_tool_calls: bool,
+    request_timing_diagnostics: bool,
 ) -> Response {
     // Speculation only runs in the non-streaming loop; streaming requests on
     // a spec-enabled server keep the unchanged vanilla path (including the
@@ -20912,7 +21370,8 @@ fn stream_completion(
     // Captured before the job so the streaming usage frame reports the exact
     // same prompt count as the non-streaming path (single source of truth).
     let prompt_token_count = prepared.token_ids.len();
-    let stream_timing_diagnostics = stream_timing_diagnostics_enabled();
+    let verbose_stream_timing_diagnostics = stream_timing_diagnostics_enabled();
+    let stream_timing_diagnostics = request_timing_diagnostics || verbose_stream_timing_diagnostics;
     let stream_poll_yield = stream_poll_yield_enabled();
     let stream_id = if chat {
         format!("chatcmpl-{}", uuid::Uuid::new_v4())
@@ -21053,7 +21512,15 @@ fn stream_completion(
                 } => {
                     stream_event_timings.final_yield = Some(stream_started.elapsed().as_millis());
                     let camelid_diagnostics = stream_timing_diagnostics.then(|| {
-                        stream_timing_diagnostics_json(&timings, first_content_ms, stream_event_timings)
+                        if verbose_stream_timing_diagnostics {
+                            stream_timing_diagnostics_json(
+                                &timings,
+                                first_content_ms,
+                                stream_event_timings,
+                            )
+                        } else {
+                            stream_timing_receipt_json(&timings, first_content_ms)
+                        }
                     });
                     if chat {
                         let mut resolved_finish_reason = finish_reason;
@@ -23991,6 +24458,7 @@ mod tests {
             true,
             false,
             false,
+            false,
         );
 
         // Drive the SSE body the way a client does. The reader task polls the
@@ -24845,6 +25313,40 @@ mod tests {
             13.0
         );
         assert!(diagnostics["q8_schedule"].is_null());
+    }
+
+    #[test]
+    fn stream_timing_receipt_omits_verbose_layer_and_schedule_payloads() {
+        let mut timings = GenerationTimings {
+            weight_load: 17,
+            weight_cache_hit: true,
+            prompt_cache_hit: true,
+            prompt_reused_tokens: 1_200,
+            prompt_prefilled_tokens: 178,
+            session_create: 9,
+            ..GenerationTimings::default()
+        };
+        timings.prompt_evaluation.prefill.forward_total = 41.5;
+        timings.prompt_evaluation.first_token.forward_total = 3.0;
+        timings.generation.forward_total = 88.25;
+        timings.prompt_evaluation.prefill_layers = vec![GenerationLayerTimings {
+            layer_index: 7,
+            ffn_down: 99.0,
+            ..GenerationLayerTimings::default()
+        }];
+
+        let value = stream_timing_receipt_json(&timings, Some(123));
+        let receipt = &value["stream_timing_diagnostics"]["timings_ms"];
+        assert_eq!(receipt["first_content"], 123);
+        assert_eq!(receipt["prefill_forward_total"], 41.5);
+        assert_eq!(receipt["prompt_cache_hit"], true);
+        assert_eq!(receipt["prompt_reused_tokens"], 1_200);
+        assert_eq!(receipt["prompt_prefilled_tokens"], 178);
+        assert!(receipt.get("prefill_role_timings").is_none());
+        assert!(receipt.get("layer_role_hotspots").is_none());
+        assert!(value["stream_timing_diagnostics"]
+            .get("q8_schedule")
+            .is_none());
     }
 
     #[test]
@@ -27755,6 +28257,8 @@ mod tests {
             "the cooperative streaming job must consume the prompt-prefix cache, \
              not re-prefill the prompt it already has"
         );
+        assert_eq!(job.prepared.timings.prompt_reused_tokens, 2);
+        assert_eq!(job.prepared.timings.prompt_prefilled_tokens, 0);
         assert_eq!(
             job.generated,
             vec![cached_next_token],
@@ -27974,6 +28478,10 @@ mod tests {
         let cold_output = generate_token_ids(cold).expect("cold generation");
         assert_eq!(warm_output.token_ids, cold_output.token_ids);
         assert!(warm_output.timings.prompt_cache_hit);
+        assert_eq!(warm_output.timings.prompt_reused_tokens, 2);
+        assert_eq!(warm_output.timings.prompt_prefilled_tokens, 2);
+        assert_eq!(cold_output.timings.prompt_reused_tokens, 0);
+        assert_eq!(cold_output.timings.prompt_prefilled_tokens, 4);
         assert!(
             warm_output.timings.prompt_evaluation.prefill.forward_total
                 + warm_output
@@ -28083,6 +28591,70 @@ mod tests {
             );
         }
         std::env::remove_var(PROMPT_PREFIX_CACHE_CAPACITY_ENV);
+    }
+
+    #[test]
+    fn prompt_prefix_cache_reserves_replacement_slot_before_large_clone() {
+        let mut session = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        let step = session
+            .generate_next_token_with_history_diagnostics(
+                &[0, 1],
+                crate::inference::LlamaSampler::Greedy,
+                &[0, 1],
+                false,
+                None,
+            )
+            .unwrap();
+        let mut prepared = prepared_for_cache("tiny", "model-a.gguf", vec![0, 1], session);
+        prepared.cached_prompt_prefix =
+            Arc::new(Mutex::new(PromptPrefixCachePool::with_capacity(1)));
+        store_prompt_prefix_cache(&mut prepared, &step);
+
+        let mut pool = prepared.cached_prompt_prefix.lock().unwrap();
+        assert_eq!(pool.entries.len(), 1);
+        pool.reserve_for_insert(
+            "tiny",
+            Path::new("model-a.gguf"),
+            &[0, 2],
+            &SamplingConfig::default(),
+        );
+        assert!(
+            pool.entries.is_empty(),
+            "the old KV entry must be dropped before replacement allocation starts"
+        );
+    }
+
+    #[test]
+    fn disabled_prompt_prefix_cache_releases_entries_and_refuses_new_stores() {
+        let mut session = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        let step = session
+            .generate_next_token_with_history_diagnostics(
+                &[0, 1],
+                crate::inference::LlamaSampler::Greedy,
+                &[0, 1],
+                false,
+                None,
+            )
+            .unwrap();
+        let mut prepared = prepared_for_cache("tiny", "model-a.gguf", vec![0, 1], session);
+        prepared.cached_prompt_prefix =
+            Arc::new(Mutex::new(PromptPrefixCachePool::with_capacity(1)));
+        store_prompt_prefix_cache(&mut prepared, &step);
+        assert_eq!(
+            prepared.cached_prompt_prefix.lock().unwrap().entries.len(),
+            1
+        );
+
+        prepared.cached_prompt_prefix.lock().unwrap().disable();
+        store_prompt_prefix_cache(&mut prepared, &step);
+        let pool = prepared.cached_prompt_prefix.lock().unwrap();
+        assert_eq!(pool.capacity, 0);
+        assert!(
+            pool.entries.is_empty(),
+            "disabled cache must neither retain the old KV nor clone a replacement"
+        );
+        drop(pool);
+        assert!(lookup_prompt_prefix_cache(&prepared).is_none());
     }
 
     #[test]
@@ -30834,6 +31406,10 @@ mod tests {
         token_ids: Vec<u32>,
         session: LlamaInferenceSession,
     ) -> PreparedGeneration {
+        let timings = GenerationTimings {
+            prompt_prefilled_tokens: token_ids.len(),
+            ..GenerationTimings::default()
+        };
         PreparedGeneration {
             _model_file_lease: None,
             model_id: model_id.to_string(),
@@ -30850,7 +31426,7 @@ mod tests {
             collect_dense_diagnostics: false,
             dense_diagnostic_generated_index: None,
             dense_metadata: dummy_dense_metadata(),
-            timings: GenerationTimings::default(),
+            timings,
             cached_prompt_prefix: Arc::new(Mutex::new(PromptPrefixCachePool::with_capacity(8))),
             metrics: metrics::ServerMetrics::default(),
             engine_progress: engine::EngineHandle::spawn(),
@@ -33034,14 +33610,15 @@ mod default_model_api_tests {
 #[cfg(test)]
 mod runnable_completions_gate_api_tests {
     use std::{
-        collections::{BTreeMap, HashMap},
+        collections::{BTreeMap, BTreeSet, HashMap},
         sync::OnceLock,
     };
 
     use super::*;
     use crate::gguf::{GgufMetadataValue, GgufTensorDescriptor};
     use crate::tokenizer::{
-        BpePreTokenizer, BpeRegistry, SpecialTokens, TokenizerConfig, TokenizerModel,
+        BpePreTokenizer, BpeRegistry, SpecialTokens, Token, TokenKind, TokenizerConfig,
+        TokenizerModel,
     };
     use axum::{
         body::{to_bytes, Body},
@@ -33241,6 +33818,118 @@ mod runnable_completions_gate_api_tests {
             chat_template: None,
             specials_index: OnceLock::new(),
         }
+    }
+
+    /// Complete byte vocabulary with no merges: every ASCII byte in the
+    /// rendered Ornith prompt is exactly one token.  That makes the router test
+    /// below an independent exact-count oracle while still exercising the real
+    /// qwen35 pre-tokenizer and runnable prompt tokenization helper.
+    fn qwen35_byte_test_tokenizer() -> Tokenizer {
+        fn byte_char(byte: u8) -> char {
+            let byte = u32::from(byte);
+            if (33..=126).contains(&byte)
+                || (161..=172).contains(&byte)
+                || (174..=255).contains(&byte)
+            {
+                return char::from_u32(byte).unwrap();
+            }
+            let offset = (0..byte)
+                .filter(|candidate| {
+                    !((33..=126).contains(candidate)
+                        || (161..=172).contains(candidate)
+                        || (174..=255).contains(candidate))
+                })
+                .count() as u32;
+            char::from_u32(256 + offset).unwrap()
+        }
+
+        let tokens = (0..=u8::MAX)
+            .map(|byte| Token {
+                id: u32::from(byte),
+                text: byte_char(byte).to_string(),
+                score: 0.0,
+                kind: TokenKind::Normal,
+            })
+            .collect::<Vec<_>>();
+        Tokenizer {
+            model: TokenizerModel::Gpt2Bpe,
+            bpe_pre_tokenizer: BpePreTokenizer::Qwen35,
+            token_to_id: tokens
+                .iter()
+                .map(|token| (token.text.clone(), token.id))
+                .collect(),
+            tokens,
+            byte_token_to_id: HashMap::new(),
+            bpe_ranks: HashMap::new(),
+            bpe_registry: BpeRegistry::default(),
+            special: SpecialTokens {
+                eog: BTreeSet::new(),
+                ..SpecialTokens::default()
+            },
+            config: TokenizerConfig {
+                add_bos: false,
+                add_eos: false,
+                add_sep: false,
+                add_space_prefix: false,
+                remove_extra_whitespaces: false,
+            },
+            chat_template: Some("ornith-chatml-native".to_string()),
+            specials_index: OnceLock::new(),
+        }
+    }
+
+    fn qwen35_preflight_config() -> LlamaModelConfig {
+        LlamaModelConfig {
+            architecture: "qwen35".to_string(),
+            context_length: 8_192,
+            embedding_length: 4,
+            block_count: 1,
+            feed_forward_length: 6,
+            attention_head_count: 2,
+            attention_head_count_kv: 1,
+            kv_quant: crate::model::KvCacheQuantization::F16,
+            rope_dimension_count: Some(2),
+            rope_freq_base: Some(10_000.0),
+            rope_scaling_type: None,
+            rope_scaling_factor: None,
+            rope_scaling_original_context_length: None,
+            rope_scaling_low_freq_factor: None,
+            rope_scaling_high_freq_factor: None,
+            rms_norm_epsilon: 1e-6,
+            vocab_size: Some(256),
+            file_type: Some(0),
+            rope_neox_pairing: false,
+            no_rope_layer_step: None,
+            attention_key_length: None,
+            logit_scale: None,
+            moe: None,
+            gemma3: None,
+            gemma4: None,
+            qwen35: None,
+            lfm2: None,
+            mla: None,
+        }
+    }
+
+    async fn state_with_exact_tool_capable_ornith_preflight() -> AppState {
+        const FILENAME: &str = "ornith-1.0-9b-Q8_0.gguf";
+        let state = state_with_loaded_arch("qwen35").await;
+        let tokenizer = Arc::new(qwen35_byte_test_tokenizer());
+        let mut loaded = state.loaded_models.write().await;
+        let model = loaded
+            .get_mut("gate-test")
+            .expect("synthetic qwen35 row is loaded");
+        model.path = PathBuf::from(FILENAME);
+        model.llama_config = Some(qwen35_preflight_config());
+        model.tokenizer = TokenizerLoadState::Available(tokenizer_summary(&tokenizer));
+        model.tokenizer_runtime = Some(tokenizer);
+        model.lane.gguf_filename = FILENAME.to_string();
+        model.lane.gguf_sha256 = supported_artifact_expected_sha256(FILENAME)
+            .expect("Ornith Q8 exact row is hash-pinned")
+            .to_string();
+        model.lane.quantization = "Q8_0".to_string();
+        drop(loaded);
+        state
     }
 
     async fn state_with_loaded_qwen3_moe_template(template: Option<&str>) -> AppState {
@@ -33895,6 +34584,122 @@ mod runnable_completions_gate_api_tests {
         let (status, body) =
             post_json(app, "/api/generation/preflight", json!({ "prompt": "hi" })).await;
         assert_gate_rejection(status, &body);
+    }
+
+    #[tokio::test]
+    async fn ornith_workspace_preflight_counts_exact_tool_prompt_and_enforces_budget() {
+        let state = state_with_exact_tool_capable_ornith_preflight().await;
+        {
+            let loaded = state.loaded_models.read().await;
+            let model = loaded.get("gate-test").unwrap();
+            assert_eq!(classify_loaded_model(model), ModelLaneClass::Supported);
+            let row = capabilities_response()
+                .model_compatibility
+                .into_iter()
+                .find(|row| row.id == "Ornith 1.0 9B")
+                .expect("exact Ornith Q8 compatibility row");
+            assert!(row.tool_capable, "precondition: Workspace-earned row");
+        }
+
+        let app = router_with_state(state.clone());
+        let tool = json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read one workspace file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }
+            }
+        });
+        let request = json!({
+            "model": "gate-test",
+            "messages": [
+                {"role": "system", "content": "Use workspace tools."},
+                {"role": "user", "content": "Read notes.txt"}
+            ],
+            "tools": [tool],
+            "stream": true,
+            "max_tokens": 32
+        });
+
+        let (status, body) =
+            post_json(app.clone(), "/api/generation/preflight", request.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], "validated");
+        assert_eq!(body["dense_session_ready"], false);
+        assert_eq!(body["max_tokens"], 32);
+        assert!(
+            body.get("camelid").is_none(),
+            "runnable preflight must not fabricate dense cache diagnostics: {body}"
+        );
+
+        let messages = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: "Use workspace tools.".to_string(),
+                image_urls: Vec::new(),
+                unsupported_content_parts: Vec::new(),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: "Read notes.txt".to_string(),
+                image_urls: Vec::new(),
+                unsupported_content_parts: Vec::new(),
+            },
+        ];
+        let flat_tool = request["tools"][0]["function"].clone();
+        let rendered = render_ornith_chatml_prompt_with_tools(&messages, &[flat_tool], false);
+        let prompt_tokens = body["prompt_token_count"].as_u64().unwrap() as u32;
+        assert_eq!(
+            prompt_tokens as usize,
+            rendered.len(),
+            "the byte-vocab fixture makes rendered bytes the independent exact-token oracle"
+        );
+
+        let mut within = request.clone();
+        within["camelid_context_budget_tokens"] = json!(prompt_tokens + 32);
+        let (status, body) = post_json(app.clone(), "/api/generation/preflight", within).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["prompt_token_count"], prompt_tokens);
+
+        let mut over = request;
+        over["camelid_context_budget_tokens"] = json!(prompt_tokens + 31);
+        let (status, body) = post_json(app, "/api/generation/preflight", over).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["error"]["code"], "context_budget_exceeded");
+        assert_eq!(body["error"]["param"], "camelid_context_budget_tokens");
+
+        // The served runnable handlers call this guard after preparing the
+        // exact same token ids and before prefill. Pin that integration seam so
+        // a future route refactor cannot leave preflight safe while live
+        // Workspace generation silently exceeds its frozen session budget.
+        let live_request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "gate-test",
+            "messages": [{"role": "user", "content": "Read notes.txt"}],
+            "max_tokens": 32,
+            "camelid_context_budget_tokens": prompt_tokens + 31
+        }))
+        .unwrap();
+        let live_prepared = RunnablePreparedPrompt::Text(vec![0; prompt_tokens as usize]);
+        let response = match runnable_max_tokens_for_prepared(
+            &state,
+            "gate-test",
+            &live_prepared,
+            &live_request,
+        )
+        .await
+        {
+            Ok(_) => panic!("live runnable generation must enforce the Workspace budget"),
+            Err(response) => response,
+        };
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "context_budget_exceeded");
     }
 
     #[tokio::test]

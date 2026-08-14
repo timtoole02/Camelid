@@ -1,6 +1,6 @@
 # Configuration Guide
 
-Last updated: 2026-07-28
+Last updated: 2026-08-14
 
 This guide documents Camelid's current local configuration reality without pretending every workflow is fully automated.
 
@@ -186,6 +186,28 @@ Current public docs assume:
 
 Backend runtime knobs used during performance work:
 
+- Web Code resolves one adaptive prompt-plus-generation context envelope when a
+  session starts, using the active GGUF's native limit, Camelid's validated
+  agent-context ceiling, and a conservative share of currently available host
+  memory divided across active generation slots (including their retained CPU
+  mirrors) and prompt-prefix cache entries. Native
+  metadata alone never widens the supported agent window. The selected value
+  remains fixed for all follow-up turns and child agents in that session. Set
+  `CAMELID_AGENT_CONTEXT_MAX_TOKENS` to impose a process-wide maximum; invalid
+  and zero values leave automatic selection in control. A cap too small for the
+  mandatory paging capsule plus output and safety reserves fails closed instead
+  of truncating the task contract. Session diagnostics distinguish the raw
+  memory-derived capacity from the 8K minimum operational recommendation; the
+  latter is not a claim that an already memory-starved host can allocate 8K.
+  With paging enabled, the exact Qwen3 4B Q8_0 Code row exposes a 16K logical
+  task envelope while each actual model request remains bounded to the 8K
+  paging working set. Disabling paging restores the ordinary 8K operational
+  agent ceiling; this does not certify a 16K single prompt. The exact
+  Qwen3-4B-Q4_K_M row keeps that legacy 8K operational envelope so the paging
+  capsule and reply reserves can fit, but it receives no 16K logical exception:
+  its promoted parity-context ladder remains only 512/1,024. The operational
+  envelope is not a Q4 context-support promotion; the non-contiguous 4K/8K
+  sweep matches remain unclaimed while the 2K bucket is a disclosed near-tie.
 - Web Code uses bounded Context Paging by default so long coding turns do not
   replay an ever-growing transcript into the model window. Set
   `CAMELID_CONTEXT_PAGING=0` only to diagnose or roll back to the legacy loop.

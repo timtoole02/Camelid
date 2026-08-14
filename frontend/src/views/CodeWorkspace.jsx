@@ -8,6 +8,10 @@ import {
   getWorkspaceActivity,
   getWorkspaceThread,
   getWorkspaceThreads,
+  contextLimitingFactorLabel,
+  contextWindowModeLabel,
+  formatContextTokens,
+  normalizeContextWindow,
   parsePlanSteps,
   reduceCodeEvent,
   sendWorkspaceMessage,
@@ -110,12 +114,51 @@ function firstLine(text) {
   return value.length > TOOL_LINE_HINT_CHARS ? `${head}…` : head
 }
 
+function timingMetric(timing, snakeCase, camelCase) {
+  const value = timing?.[snakeCase] ?? timing?.[camelCase]
+  return Number.isFinite(value) ? value : null
+}
+
+function timingBoolean(timing, snakeCase, camelCase) {
+  const value = timing?.[snakeCase] ?? timing?.[camelCase]
+  return typeof value === 'boolean' ? value : null
+}
+
 function formatTimingBits(timing) {
+  const totalMs = timingMetric(timing, 'total_ms', 'totalMs')
+  const outputTokens = timingMetric(timing, 'output_tokens', 'outputTokens')
+  const ttftMs = timingMetric(timing, 'ttft_ms', 'ttftMs')
+  const firstContentMs = timingMetric(timing, 'server_first_content_ms', 'serverFirstContentMs')
+    ?? timingMetric(timing, 'first_token_ms', 'firstTokenMs')
+  const prefillMs = timingMetric(timing, 'prefill_ms', 'prefillMs')
+  const decodeMs = timingMetric(timing, 'decode_ms', 'decodeMs')
+  const cacheHit = timingBoolean(timing, 'prompt_cache_hit', 'promptCacheHit')
+  const reusedTokens = timingMetric(timing, 'reused_tokens', 'reusedTokens')
+  const prefilledTokens = timingMetric(timing, 'prefilled_tokens', 'prefilledTokens')
   return [
-    Number.isFinite(timing.total_ms) ? `${(timing.total_ms / 1000).toFixed(1)}s` : null,
-    Number.isFinite(timing.output_tokens) ? `${timing.output_tokens} tokens` : null,
-    Number.isFinite(timing.ttft_ms) ? `${timing.ttft_ms}ms to first token` : null,
+    Number.isFinite(totalMs) ? `${formatMs(totalMs)} total` : null,
+    Number.isFinite(outputTokens) ? `${formatTokens(outputTokens)} output tokens` : null,
+    Number.isFinite(ttftMs) ? `${formatMs(ttftMs)} TTFT` : null,
+    Number.isFinite(firstContentMs) ? `${formatMs(firstContentMs)} server first content` : null,
+    Number.isFinite(prefillMs) ? `${formatMs(prefillMs)} prefill` : null,
+    Number.isFinite(decodeMs) ? `${formatMs(decodeMs)} decode` : null,
+    cacheHit === true ? 'cache hit' : cacheHit === false ? 'prompt-cache miss' : null,
+    Number.isFinite(reusedTokens) && reusedTokens > 0 ? `${formatTokens(reusedTokens)} reused` : null,
+    Number.isFinite(prefilledTokens) && prefilledTokens > 0 ? `${formatTokens(prefilledTokens)} prefilled` : null,
   ].filter(Boolean)
+}
+
+function formatPromptStep(step) {
+  const prefillMs = timingMetric(step, 'prefill_ms', 'prefillMs')
+  const cacheHit = timingBoolean(step, 'prompt_cache_hit', 'promptCacheHit')
+  const reusedTokens = timingMetric(step, 'reused_tokens', 'reusedTokens')
+  const prefilledTokens = timingMetric(step, 'prefilled_tokens', 'prefilledTokens')
+  const tokenCount = cacheHit === true ? reusedTokens : prefilledTokens
+  const cache = cacheHit === true ? 'hit' : cacheHit === false ? 'miss' : null
+  return [
+    Number.isFinite(prefillMs) ? formatMs(prefillMs) : null,
+    cache ? `${cache}${Number.isFinite(tokenCount) && tokenCount > 0 ? ` ${formatTokens(tokenCount)}` : ''}` : null,
+  ].filter(Boolean).join(' · ') || '—'
 }
 
 function formatElapsed(milliseconds) {
@@ -581,31 +624,36 @@ function AgentCard({ agent, isMain, anchor, anchorTitle, action, children }) {
 function StepTable({ steps, running }) {
   return (
     <div className="ci-table-wrap">
-      <table className="ci-table">
+      <table className="ci-table ci-table--model">
         <thead>
           <tr>
             <th scope="col"><span className="sr-only">State</span></th>
             <th scope="col">#</th>
-            <th scope="col">Tokens</th>
+            <th scope="col">Out</th>
             <th scope="col">TTFT</th>
-            <th scope="col">Time</th>
+            <th scope="col">Prompt</th>
+            <th scope="col">Total</th>
           </tr>
         </thead>
         <tbody>
-          {steps.map((step) => (
-            <tr key={step.index}>
-              <td className="ci-table__mark"><IconCheck size={11} /></td>
-              <td>{step.index}</td>
-              <td>{Number.isFinite(step.outputTokens) ? step.outputTokens.toLocaleString() : '—'}</td>
-              <td>{formatMs(step.ttftMs)}</td>
-              <td>{formatMs(step.totalMs)}</td>
-            </tr>
-          ))}
+          {steps.map((step) => {
+            const details = formatTimingBits(step).join(' · ')
+            return (
+              <tr key={step.index} title={details || undefined}>
+                <td className="ci-table__mark"><IconCheck size={11} /></td>
+                <td>{step.index}</td>
+                <td>{Number.isFinite(step.outputTokens) ? step.outputTokens.toLocaleString() : '—'}</td>
+                <td>{formatMs(step.ttftMs)}</td>
+                <td className="ci-table__prompt">{formatPromptStep(step)}</td>
+                <td>{formatMs(step.totalMs)}</td>
+              </tr>
+            )
+          })}
           {running ? (
             <tr className="is-live">
               <td className="ci-table__mark"><span className="ci-spin" aria-hidden="true" /></td>
               <td>{steps.length + 1}</td>
-              <td>—</td><td>—</td><td>—</td>
+              <td>—</td><td>—</td><td>—</td><td>—</td>
             </tr>
           ) : null}
         </tbody>
@@ -622,6 +670,7 @@ const CodeInspector = memo(function CodeInspector({
   allowNetwork,
   changes,
   context,
+  contextWindow,
   modelName,
   modelSteps,
   planSteps,
@@ -798,6 +847,25 @@ const CodeInspector = memo(function CodeInspector({
         <Fold label="Session" count={approvalMode === 'full_auto' ? 'Full auto' : 'Gated'}>
           <dl className="ci-kv ci-kv--wide">
             <div><dt>Model</dt><dd>{modelName || 'No model loaded'}</dd></div>
+            {contextWindow ? (
+              <div><dt>Context</dt><dd className="ci-num">{contextWindowModeLabel(contextWindow)} · {formatContextTokens(contextWindow.effectiveTokens)}</dd></div>
+            ) : null}
+            {contextWindow?.pagedWorkingSetTokens ? (
+              <div><dt>Active working set</dt><dd className="ci-num">{formatContextTokens(contextWindow.pagedWorkingSetTokens)} paged</dd></div>
+            ) : null}
+            {Number.isFinite(contextWindow?.memorySafeMaxTokens)
+              && contextWindow.memorySafeMaxTokens < (contextWindow.pagedWorkingSetTokens || contextWindow.effectiveTokens) ? (
+                <div><dt>Memory estimate</dt><dd className="ci-num">{formatContextTokens(contextWindow.memorySafeMaxTokens)} / KV owner</dd></div>
+              ) : null}
+            {contextWindow?.modelMaxTokens ? (
+              <div><dt>Model max</dt><dd className="ci-num">{formatContextTokens(contextWindow.modelMaxTokens)}</dd></div>
+            ) : null}
+            {contextWindow?.validatedMaxTokens ? (
+              <div><dt>Agent ceiling</dt><dd className="ci-num">{formatContextTokens(contextWindow.validatedMaxTokens)}</dd></div>
+            ) : null}
+            {contextWindow?.limitingFactor ? (
+              <div><dt>Limited by</dt><dd>{contextLimitingFactorLabel(contextWindow.limitingFactor)}</dd></div>
+            ) : null}
             <div><dt>Access</dt><dd>{approvalMode === 'full_auto' ? 'Full auto' : 'Approval gated'}</dd></div>
             <div><dt>Web tools</dt><dd>{allowNetwork ? 'On · search and fetch' : 'Off'}</dd></div>
             <div><dt>Tools run</dt><dd>{runTotals.tools} · {runTotals.toolFailures} failed</dd></div>
@@ -925,6 +993,10 @@ export default function CodeWorkspace({
   const stopUnconfirmed = state.phase === 'cancel_error' && !running
   const canStart = Boolean(workspacePath.trim() && goal.trim() && toolCapable && runtimeReady && !running && !session)
   const modelName = hasLoadedModel ? runtime?.active_model_id || selectedModel?.name || 'Loaded model' : ''
+  const contextWindow = useMemo(
+    () => normalizeContextWindow(session?.context_window, state.context?.budgetTotal),
+    [session?.context_window, state.context?.budgetTotal],
+  )
   const composerValue = session ? followUp : goal
   const canSubmit = session
     ? Boolean(followUp.trim() && !running)
@@ -1693,6 +1765,14 @@ export default function CodeWorkspace({
                   ) : null}
                 </div>
                 <span title={modelName}><IconBolt size={14} /> {modelName || 'No model'}</span>
+                {contextWindow ? (
+                  <span
+                    className="code-context-chip"
+                    title={`${contextWindowModeLabel(contextWindow)} context: ${contextWindow.effectiveTokens.toLocaleString()} tokens${contextWindow.pagedWorkingSetTokens ? ` · active paged working set ${contextWindow.pagedWorkingSetTokens.toLocaleString()}` : ''}${contextWindow.validatedMaxTokens ? ` · agent ceiling ${contextWindow.validatedMaxTokens.toLocaleString()}` : ''}${contextWindow.modelMaxTokens ? ` · model max ${contextWindow.modelMaxTokens.toLocaleString()}` : ''}${contextWindow.limitingFactor ? ` · limited by ${contextLimitingFactorLabel(contextWindow.limitingFactor)}` : ''}`}
+                  >
+                    {contextWindowModeLabel(contextWindow)} · {formatContextTokens(contextWindow.effectiveTokens)}
+                  </span>
+                ) : null}
               </div>
               {running ? (
                 <button type="button" className="code-composer__send is-stop" aria-label="Stop coding task" onClick={stop} disabled={stopPending}><IconStop size={17} /></button>
@@ -1726,6 +1806,7 @@ export default function CodeWorkspace({
           allowNetwork={session?.allow_network ?? allowNetwork}
           changes={changes}
           context={state.context}
+          contextWindow={contextWindow}
           modelName={modelName}
           modelSteps={state.modelSteps}
           planSteps={state.planSteps}

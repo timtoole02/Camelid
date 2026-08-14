@@ -1,5 +1,19 @@
 import assert from 'node:assert/strict'
-import { reduceCodeEvent, reduceWorkspaceEvent, waitForWorkspaceSessionTerminal, WORKSPACE_IDLE_STATE, workspaceEndpoint, workspaceModelsEndpoint, workspaceBrowseEndpoint, workspaceThreadsEndpoint, workspaceCompactionEndpoint } from '../src/lib/workspaceAgent.js'
+import {
+  contextLimitingFactorLabel,
+  contextWindowModeLabel,
+  formatContextTokens,
+  normalizeContextWindow,
+  reduceCodeEvent,
+  reduceWorkspaceEvent,
+  waitForWorkspaceSessionTerminal,
+  WORKSPACE_IDLE_STATE,
+  workspaceEndpoint,
+  workspaceModelsEndpoint,
+  workspaceBrowseEndpoint,
+  workspaceThreadsEndpoint,
+  workspaceCompactionEndpoint,
+} from '../src/lib/workspaceAgent.js'
 
 let state = { ...WORKSPACE_IDLE_STATE, events: [] }
 state = reduceWorkspaceEvent(state, { event: 'session.started', model_id: 'tool-model', sequence: 1 })
@@ -94,6 +108,100 @@ for (let index = 0; index < 300; index += 1) {
 }
 assert.equal(bounded.events.length, 240, 'activity history must remain bounded during long sessions')
 assert.equal(bounded.events[0].content, 'event-60')
+
+let timed = reduceCodeEvent(
+  { ...WORKSPACE_IDLE_STATE, events: [], turns: [] },
+  { event: 'session.starting', task: 'Measure the local model' },
+)
+timed = reduceCodeEvent(timed, {
+  event: 'model.timing',
+  total_ms: 2480,
+  ttft_ms: 190,
+  output_tokens: 92,
+  prefill_ms: 120,
+  server_first_content_ms: 165,
+  decode_ms: 2200,
+  prompt_cache_hit: true,
+  reused_tokens: 2884,
+  prefilled_tokens: 302,
+})
+assert.deepEqual(timed.modelSteps[0], {
+  index: 1,
+  totalMs: 2480,
+  ttftMs: 190,
+  outputTokens: 92,
+  prefillMs: 120,
+  serverFirstContentMs: 165,
+  decodeMs: 2200,
+  promptCacheHit: true,
+  reusedTokens: 2884,
+  prefilledTokens: 302,
+})
+assert.equal(timed.liveActivity.server_first_content_ms, 165)
+assert.equal(timed.liveActivity.prompt_cache_hit, true)
+assert.match(timed.liveActivity.detail, /190ms TTFT/)
+assert.match(timed.liveActivity.detail, /165ms server first content/)
+assert.match(timed.liveActivity.detail, /prompt-cache hit/)
+assert.match(timed.liveActivity.detail, /2,884 prompt tokens reused/)
+
+// The activity poll exposes the durable core metrics but not every resident
+// engine diagnostic. It must not erase the richer SSE timing between frames.
+timed = reduceCodeEvent(timed, {
+  event: 'activity.snapshot',
+  activity: {
+    phase: 'running',
+    stage: 'tool',
+    detail: 'Running a tool',
+    updated_at_ms: (timed.liveActivity.updated_at_ms || 0) + 1,
+    total_model_ms: 2480,
+    ttft_ms: 190,
+    prefill_ms: 120,
+    prompt_cache_hit: true,
+    agents: [],
+  },
+})
+assert.equal(timed.liveActivity.decode_ms, 2200)
+
+const adaptiveContext = normalizeContextWindow({
+  mode: 'auto',
+  effective_tokens: 16_384,
+  recommended_max_tokens: 12_288,
+  memory_safe_max_tokens: 12_288,
+  model_max_tokens: 40_960,
+  validated_max_tokens: 8_192,
+  paged_target_tokens: 16_384,
+  paged_working_set_tokens: 8_000,
+  kv_owner_slots: 3,
+  limiting_factor: 'paged_model_target',
+})
+assert.equal(contextWindowModeLabel(adaptiveContext), 'Auto')
+assert.equal(formatContextTokens(adaptiveContext.effectiveTokens), '16K')
+assert.equal(formatContextTokens(adaptiveContext.pagedWorkingSetTokens), '7.8K')
+assert.equal(formatContextTokens(adaptiveContext.modelMaxTokens), '40K')
+assert.equal(formatContextTokens(adaptiveContext.validatedMaxTokens), '8K')
+assert.equal(adaptiveContext.kvOwnerSlots, 3)
+assert.equal(formatContextTokens(5500), '5.4K')
+assert.equal(normalizeContextWindow({ effective_tokens: 8192, memory_safe_max_tokens: 0 }).memorySafeMaxTokens, 0)
+assert.equal(formatContextTokens(0), '0')
+assert.equal(contextLimitingFactorLabel(adaptiveContext.limitingFactor), 'Qwen 4B paged target')
+assert.deepEqual(normalizeContextWindow(null, 8192), {
+  mode: 'auto',
+  effectiveTokens: 8192,
+  recommendedMaxTokens: null,
+  memorySafeMaxTokens: null,
+  modelMaxTokens: null,
+  validatedMaxTokens: null,
+  kvOwnerSlots: null,
+  availableMemoryBytes: null,
+  kvBytesPerToken: null,
+  residentCapacityTokens: null,
+  configuredMaxTokens: null,
+  pagedTargetTokens: null,
+  pagedWorkingSetTokens: null,
+  limitingFactor: null,
+})
+assert.equal(normalizeContextWindow({ effective_tokens: 'not-a-number' }, 0), null)
+
 assert.equal(workspaceEndpoint('http://127.0.0.1:8181/', '/abc/events'), 'http://127.0.0.1:8181/api/agent/workspace/sessions/abc/events')
 assert.equal(workspaceModelsEndpoint('http://127.0.0.1:8181/'), 'http://127.0.0.1:8181/api/agent/workspace/models')
 assert.equal(workspaceBrowseEndpoint('http://127.0.0.1:8181/'), 'http://127.0.0.1:8181/api/agent/workspace/browse')

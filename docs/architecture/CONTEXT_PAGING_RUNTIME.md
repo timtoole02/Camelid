@@ -38,8 +38,9 @@ Relevant integration points:
 Compatibility constraints:
 
 - Context Paging is the default Web Code runtime. Set `CAMELID_CONTEXT_PAGING=0`
-  only as a rollback/diagnostic switch; terminal agent mode, read-only Workspace,
-  and subagents retain their existing history behavior.
+  only as a rollback/diagnostic switch. Terminal agent mode and read-only
+  Workspace retain their existing history behavior. Web Code subagents inherit
+  paging and the parent's fixed context envelope, but keep isolated task state.
 - `.camelid` is already protected from model-authored writes. Runtime state is
   stored below `.camelid/context-paging` through host code only.
 - Exact source is authoritative. A card or page whose file hash no longer
@@ -48,8 +49,11 @@ Compatibility constraints:
   workspace sandbox, approval, checkpoint, and audit layers. When a valid
   native edit or overwrite targets indexed source that was evicted from the
   current capsule, the host raises a page fault, makes that exact page mandatory,
-  and asks the model to retry. Wrong and no-op edits remain rejected; overwrites
-  of existing files require a bounded full exact file page.
+  and asks the model to retry. Wrong edits remain rejected. An edit whose exact
+  old and new text are identical is acknowledged as already satisfied only when
+  the current indexed source and hash prove that text is on disk; it advances
+  to verification instead of consuming the invalid-action retry budget.
+  Overwrites of existing files require a bounded full exact file page.
 - No embeddings, vector database, multi-agent dependency, or growing KV cache
   is required by the first slice.
 
@@ -115,7 +119,12 @@ page-fault operation, so a small model does not need to learn a second JSON
 protocol before it can edit. `list_dir` with an omitted path is deterministically
 repaired to the workspace root. Modify and Verify expose the same scoped native
 tool set, allowing multi-file work to continue after the first write and keeping
-tool schemas stable across active steps. The earlier typed actions
+tool schemas stable across active steps. Once the model declares modification
+settled (including an already-satisfied edit or a premature completion claim),
+the next step exposes only `run_shell` when available; this deliberate one-step
+cache break prevents another cosmetic edit loop and makes execution verification
+mandatory. A failing command restores the complete active-work tool set and its
+diagnostic. The earlier typed actions
 (`NEED_CONTEXT`, `PATCH`, `SEARCH`, `RUN_TEST`, `INSPECT_DIAGNOSTIC`,
 `UPDATE_PLAN`, `COMPLETE`, and `BLOCKED`) remain accepted for persisted/older
 clients but are no longer advertised in the stable kernel. Typed `PATCH` still
@@ -171,16 +180,51 @@ prompt. Any later tool result consumes that one-shot feedback. An exact-tokenize
 overflow recalibrates the estimator from the measured count and rebuilds a
 smaller capsule (up to 3 times per run) instead of failing the run.
 
-Persistence is crash-safe: the ledger, index, runtime-state, and raw
-artifacts are written via temp-file+rename, so a crash cannot leave
-half-written state. Retrieval misses are persisted even when the fault fails.
+Persistence publication is atomic against concurrent writers and process
+interruption: the ledger, index, runtime-state, and raw artifacts are written
+through unique same-directory temporary files and atomically replaced.
+Concurrent workers cannot collide on a shared temp name or publish half-written
+JSON. This is a consistency guarantee, not power-loss durability; files and
+parent directories are not explicitly synced to stable storage. Child ledgers
+and runtime state are task-scoped. The project index remains shared, derived
+workspace state and is published only after a fresh index or structural edit;
+task-local ledger/metrics saves never rewrite a possibly stale project copy.
+Retrieval misses are persisted even when the fault fails.
 
 ## Configuration
 
+- `CAMELID_AGENT_CONTEXT_MAX_TOKENS`: optional process-wide cap for adaptive
+  session context selection. Automatic selection divides its memory allowance
+  across each active engine generation slot's resident and CPU-mirrored KV plus
+  retained prompt-prefix cache entries, then clamps the result to Camelid's
+  validated agent-context ceiling (and any lower model/server limit). When that
+  aggregate allowance cannot hold the selected active working set, Camelid
+  reselects for exactly one owner, permanently serializes KV-owning engine work
+  for the process, and disables the retained prompt cache before the agent
+  starts. If even that one-owner raw estimate is below the required active
+  envelope, Workspace fails closed before the first model request rather than
+  relying on memory compression or swap; the operational floor is never
+  relabeled as memory-safe.
+  A GGUF's larger native-context declaration alone does not widen supported
+  agent context. The status API separates raw memory-derived capacity from the
+  8K minimum operational recommendation. Invalid and zero values leave
+  automatic selection in control.
+  The exact Qwen3 4B Q8_0 Code row is the narrow exception: when paging is
+  enabled it receives a 16K logical task envelope, while the enforced active
+  input + output + safety working set remains 8K and inside the validated
+  request envelope. This is not a 16K single-prompt support claim. The exact
+  Qwen3-4B-Q4_K_M row keeps the legacy 8K operational agent envelope needed to
+  fit the paging capsule and output/safety reserves, but it receives no 16K
+  logical exception. That operational value is not a Q4 context-support claim:
+  the row's promoted parity-context ladder remains 512/1,024, and its
+  non-contiguous 4K/8K sweep matches remain unclaimed while the 2K bucket is a
+  disclosed near-tie.
 - `CAMELID_CONTEXT_PAGING=0`: disable Context Paging for Web Code and use the
   legacy growing-transcript loop. Context Paging is enabled when the variable is
   absent; `1` explicitly keeps it enabled.
-- `CAMELID_CONTEXT_MAX_INPUT_TOKENS`: input ceiling, default `5500`.
+- `CAMELID_CONTEXT_MAX_INPUT_TOKENS`: active input ceiling. Unset or invalid
+  values use `5500`; an explicit value may raise it only within the session
+  context remaining after output and safety reserves.
 - `CAMELID_CONTEXT_OUTPUT_RESERVE`: output reserve, default `1300`.
 - `CAMELID_CONTEXT_SAFETY_RESERVE`: safety reserve, default `1200`.
 - `CAMELID_CONTEXT_TOOL_RESULT_BYTES`: compact tool-result preview bytes,

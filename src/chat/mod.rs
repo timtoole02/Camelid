@@ -27,6 +27,7 @@ pub(crate) mod checkpoint;
 mod client;
 mod clipboard;
 pub(crate) mod context_paging;
+pub(crate) mod context_window;
 mod inline;
 mod markdown;
 mod mcp;

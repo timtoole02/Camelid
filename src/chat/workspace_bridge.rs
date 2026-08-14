@@ -46,7 +46,9 @@ const WEB_CODE_SHELL_TIMEOUT: Duration = Duration::from_secs(120);
 const WORKSPACE_MODEL_STEP_TIMEOUT: Duration = Duration::from_secs(90);
 const APPROVAL_POLL: Duration = Duration::from_millis(25);
 const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+#[cfg(test)]
 pub(crate) const WORKSPACE_CONTEXT_BUDGET_TOKENS: u32 = 4_096;
+#[cfg(test)]
 pub(crate) const CODE_CONTEXT_BUDGET_TOKENS: u32 = super::agent::AGENT_VALIDATED_CTX;
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -90,6 +92,7 @@ impl WorkspaceRunMode {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn context_budget_tokens(self) -> u32 {
         match self {
             Self::ReadOnly => WORKSPACE_CONTEXT_BUDGET_TOKENS,
@@ -281,6 +284,12 @@ pub(crate) enum WorkspaceEvent {
         total_ms: u64,
         ttft_ms: Option<u64>,
         output_tokens: Option<u32>,
+        prefill_ms: Option<u64>,
+        server_first_content_ms: Option<u64>,
+        decode_ms: Option<u64>,
+        prompt_cache_hit: Option<bool>,
+        reused_tokens: Option<u32>,
+        prefilled_tokens: Option<u32>,
     },
     #[serde(rename = "model.answer")]
     ModelAnswer { content: String },
@@ -357,6 +366,10 @@ pub(crate) struct WorkspaceRunConfig {
     pub family: String,
     pub max_steps: usize,
     pub max_tokens: u32,
+    /// Total prompt + generation envelope selected from the active model and
+    /// live machine memory when the session is created. Follow-up turns and
+    /// child agents inherit the same frozen value.
+    pub context_budget_tokens: u32,
     pub temperature: f32,
     pub mode: WorkspaceRunMode,
     pub approval_mode: WorkspaceApprovalMode,
@@ -482,12 +495,14 @@ fn bridge_with_timeout(
     let (decision_tx, decision_rx) = sync_channel(1);
     let cancel = Arc::new(AtomicBool::new(false));
     let delivery_failed = Arc::new(AtomicBool::new(false));
+    let terminal_publication = Arc::new(Mutex::new(TerminalPublicationState::default()));
     let pending_approval = Arc::new(Mutex::new(None));
     (
         WorkspaceBridgeWorker {
             reporter: WorkspaceReporter {
                 events: event_tx.clone(),
                 delivery_failed: Arc::clone(&delivery_failed),
+                terminal_publication,
             },
             approver: WorkspaceApprover {
                 events: event_tx,
@@ -509,10 +524,19 @@ fn bridge_with_timeout(
     )
 }
 
+#[derive(Default)]
+struct TerminalPublicationState {
+    answer_emitted: bool,
+    finished: bool,
+}
+
 #[derive(Clone)]
 pub(crate) struct WorkspaceReporter {
     events: SyncSender<WorkspaceEvent>,
     delivery_failed: Arc<AtomicBool>,
+    /// Shared by every reporter clone so a racing model answer cannot arrive
+    /// after the terminal event or duplicate a deterministic fallback answer.
+    terminal_publication: Arc<Mutex<TerminalPublicationState>>,
 }
 
 impl WorkspaceReporter {
@@ -529,13 +553,60 @@ impl WorkspaceReporter {
             content: content.to_string(),
         });
     }
+
+    fn finish(&self, end: &LoopEnd) {
+        let mut publication = self
+            .terminal_publication
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if publication.finished {
+            return;
+        }
+        let fallback = match end {
+            LoopEnd::Repeated => Some(
+                "I couldn't complete this request because the agent stopped after repeating an action without making progress.",
+            ),
+            LoopEnd::DriverError => Some(
+                "I couldn't complete this request because the agent stopped on a model/runtime error before it could provide an answer.",
+            ),
+            LoopEnd::StepCapped => Some(
+                "I couldn't complete this request because the agent reached its step limit before it could provide an answer.",
+            ),
+            LoopEnd::Answered | LoopEnd::Aborted => None,
+        };
+        if !publication.answer_emitted {
+            if let Some(content) = fallback {
+                self.send(WorkspaceEvent::ModelAnswer {
+                    content: content.to_string(),
+                });
+                publication.answer_emitted = true;
+            }
+        }
+        let outcome = match end {
+            LoopEnd::Answered => "answered",
+            LoopEnd::Aborted => "aborted",
+            LoopEnd::StepCapped => "step_capped",
+            LoopEnd::Repeated => "repeated",
+            LoopEnd::DriverError => "driver_error",
+        };
+        self.send(WorkspaceEvent::Finished { outcome });
+        publication.finished = true;
+    }
 }
 
 impl Reporter for WorkspaceReporter {
     fn model_text(&mut self, text: &str) {
+        let mut publication = self
+            .terminal_publication
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if publication.finished {
+            return;
+        }
         self.send(WorkspaceEvent::ModelAnswer {
             content: text.to_string(),
         });
+        publication.answer_emitted = true;
     }
 
     fn tool_call(&mut self, line: &str) {
@@ -578,6 +649,12 @@ impl Reporter for WorkspaceReporter {
             total_ms: metrics.total_ms,
             ttft_ms: metrics.ttft_ms,
             output_tokens: metrics.output_tokens,
+            prefill_ms: metrics.prefill_ms,
+            server_first_content_ms: metrics.server_first_content_ms,
+            decode_ms: metrics.decode_ms,
+            prompt_cache_hit: metrics.prompt_cache_hit,
+            reused_tokens: metrics.reused_tokens,
+            prefilled_tokens: metrics.prefilled_tokens,
         });
     }
 
@@ -706,9 +783,7 @@ pub(crate) fn run_live(
             worker.reporter.send(WorkspaceEvent::Error {
                 message: message.clone(),
             });
-            worker.reporter.send(WorkspaceEvent::Finished {
-                outcome: "driver_error",
-            });
+            worker.reporter.finish(&LoopEnd::DriverError);
             return Err(message);
         }
     };
@@ -722,9 +797,7 @@ pub(crate) fn run_live(
             worker.reporter.send(WorkspaceEvent::Error {
                 message: message.clone(),
             });
-            worker.reporter.send(WorkspaceEvent::Finished {
-                outcome: "driver_error",
-            });
+            worker.reporter.finish(&LoopEnd::DriverError);
             return Err(message);
         }
     };
@@ -765,6 +838,7 @@ pub(crate) fn run_live(
             config.model_id.clone(),
             config.family.clone(),
             config.max_tokens,
+            config.context_budget_tokens,
             config.approval_mode.is_full_auto(),
             config.allow_network,
             shell_sandbox,
@@ -822,7 +896,7 @@ pub(crate) fn run_live(
         config.max_tokens,
         config.temperature,
     );
-    driver.set_context_budget(Some(config.mode.context_budget_tokens()));
+    driver.set_context_budget(Some(config.context_budget_tokens));
     driver.set_native_tool_history(true);
     // Code drops the wall-clock model-step deadline (a coding turn can sit in a
     // long prefill, and Stop stays authoritative), but the read-only lane keeps
@@ -866,14 +940,7 @@ pub(crate) fn run_live(
         &mut policy,
         &mut history,
     );
-    let outcome = match end {
-        LoopEnd::Answered => "answered",
-        LoopEnd::Aborted => "aborted",
-        LoopEnd::StepCapped => "step_capped",
-        LoopEnd::Repeated => "repeated",
-        LoopEnd::DriverError => "driver_error",
-    };
-    worker.reporter.send(WorkspaceEvent::Finished { outcome });
+    worker.reporter.finish(&end);
     Ok(end)
 }
 
@@ -922,6 +989,7 @@ fn render_evidence_memory(evidence: &[super::workspace_memory::StoredEvidence]) 
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Barrier};
     use std::thread;
 
     use serde_json::{json, Value};
@@ -958,6 +1026,7 @@ mod tests {
             "model".into(),
             "llama".into(),
             2048,
+            32_768,
             true,
             true,
             WorkspaceRunMode::Code.shell_sandbox(),
@@ -968,6 +1037,7 @@ mod tests {
         );
         assert!(config.allow_net, "the parent's network switch must carry");
         assert!(config.yolo, "confirmed full auto must carry to the child");
+        assert_eq!(config.context_budget_tokens, 32_768);
         assert_eq!(
             config.shell_mode,
             ShellSandbox::Sandboxed,
@@ -1122,7 +1192,7 @@ mod tests {
     }
 
     #[test]
-    fn code_uses_the_validated_agent_budget_without_widening_read_only_workspace() {
+    fn legacy_test_budget_distinguishes_code_from_read_only_workspace() {
         assert_eq!(
             WorkspaceRunMode::ReadOnly.context_budget_tokens(),
             WORKSPACE_CONTEXT_BUDGET_TOKENS
@@ -1348,5 +1418,95 @@ mod tests {
         let _approval_id = next_approval(&client);
         assert_eq!(join.join().unwrap(), LoopEnd::Aborted);
         assert!(!root.path().join("result.txt").exists());
+    }
+
+    #[test]
+    fn terminal_failures_emit_one_answer_before_finished() {
+        for end in [LoopEnd::Repeated, LoopEnd::DriverError, LoopEnd::StepCapped] {
+            let (worker, client) = bridge(4);
+            worker.reporter.finish(&end);
+            let events = client.events.try_iter().collect::<Vec<_>>();
+            assert_eq!(events.len(), 2, "unexpected terminal events for {end:?}");
+            assert!(matches!(events[0], WorkspaceEvent::ModelAnswer { .. }));
+            assert!(matches!(events[1], WorkspaceEvent::Finished { .. }));
+        }
+    }
+
+    #[test]
+    fn terminal_failure_never_duplicates_a_real_answer_from_a_reporter_clone() {
+        let (worker, client) = bridge(4);
+        let mut clone = worker.reporter.clone();
+        clone.model_text("the real answer");
+        worker.reporter.finish(&LoopEnd::Repeated);
+
+        let events = client.events.try_iter().collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            WorkspaceEvent::ModelAnswer { content } if content == "the real answer"
+        ));
+        assert!(matches!(
+            events[1],
+            WorkspaceEvent::Finished {
+                outcome: "repeated"
+            }
+        ));
+    }
+
+    #[test]
+    fn model_answer_after_finished_is_suppressed() {
+        let (worker, client) = bridge(4);
+        worker.reporter.finish(&LoopEnd::Repeated);
+        let mut clone = worker.reporter.clone();
+        clone.model_text("too late");
+
+        let events = client.events.try_iter().collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], WorkspaceEvent::ModelAnswer { .. }));
+        assert!(matches!(events[1], WorkspaceEvent::Finished { .. }));
+    }
+
+    #[test]
+    fn racing_model_answer_and_finish_publish_one_ordered_answer() {
+        let (worker, client) = bridge(4);
+        let barrier = Arc::new(Barrier::new(3));
+        let mut answer_reporter = worker.reporter.clone();
+        let answer_barrier = Arc::clone(&barrier);
+        let answer = thread::spawn(move || {
+            answer_barrier.wait();
+            answer_reporter.model_text("racing answer");
+        });
+        let finish_reporter = worker.reporter.clone();
+        let finish_barrier = Arc::clone(&barrier);
+        let finish = thread::spawn(move || {
+            finish_barrier.wait();
+            finish_reporter.finish(&LoopEnd::Repeated);
+        });
+        barrier.wait();
+        answer.join().unwrap();
+        finish.join().unwrap();
+
+        let events = client.events.try_iter().collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, WorkspaceEvent::ModelAnswer { .. }))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            events.last(),
+            Some(WorkspaceEvent::Finished { .. })
+        ));
+    }
+
+    #[test]
+    fn manual_abort_finishes_without_a_synthetic_answer() {
+        let (worker, client) = bridge(4);
+        worker.reporter.finish(&LoopEnd::Aborted);
+        assert_eq!(
+            client.events.try_iter().collect::<Vec<_>>(),
+            vec![WorkspaceEvent::Finished { outcome: "aborted" }]
+        );
     }
 }

@@ -7,6 +7,16 @@ const MAX_MODEL_STEP_ROWS = 60
 /// `update_plan` can emit, so the list is capped before it reaches a render.
 const MAX_PLAN_STEPS = 120
 const PLAN_STEP_LINE = /^\[([x~ ])\]\s+(.+)$/
+const MODEL_TIMING_ACTIVITY_FIELDS = [
+  'total_model_ms',
+  'ttft_ms',
+  'prefill_ms',
+  'server_first_content_ms',
+  'decode_ms',
+  'prompt_cache_hit',
+  'reused_tokens',
+  'prefilled_tokens',
+]
 
 /// The only structured plan the agent publishes. Exported so the transcript
 /// card and the inspector's Plan group read one parse, not two that can drift.
@@ -147,8 +157,18 @@ function reduceAgentEvent(state, envelope, allowApprovals) {
     return { ...state, phase: 'cancel_error', liveActivity, error: message }
   }
   if (event === 'activity.snapshot') {
-    const activity = envelope.activity || null
+    const snapshot = envelope.activity || null
+    // The durable activity endpoint intentionally carries a smaller timing
+    // summary than the live SSE event. Preserve fields that belong to the last
+    // completed model step when a poll for that same activity arrives, or the
+    // richer diagnostics blink out of the inspector one second after receipt.
+    const activity = snapshot ? { ...snapshot } : null
     if (!activity) return state
+    for (const field of MODEL_TIMING_ACTIVITY_FIELDS) {
+      if (!Object.prototype.hasOwnProperty.call(activity, field) && state.liveActivity?.[field] != null) {
+        activity[field] = state.liveActivity[field]
+      }
+    }
     if (state.liveActivity?.updated_at_ms === activity.updated_at_ms
       && state.liveActivity?.phase === activity.phase) return state
     const snapshotAgents = Array.isArray(activity.agents) ? activity.agents : state.agents
@@ -343,6 +363,7 @@ function withDerived(previous, next, envelope) {
     derived.modelSteps = []
   } else if (event === 'model.timing') {
     const base = previous.runTotals || WORKSPACE_IDLE_STATE.runTotals
+    const timing = modelTimingStep(envelope)
     derived.runTotals = {
       ...base,
       steps: base.steps + 1,
@@ -351,9 +372,7 @@ function withDerived(previous, next, envelope) {
     }
     derived.modelSteps = [...(previous.modelSteps || []), {
       index: base.steps + 1,
-      totalMs: Number.isFinite(envelope.total_ms) ? envelope.total_ms : null,
-      ttftMs: Number.isFinite(envelope.ttft_ms) ? envelope.ttft_ms : null,
-      outputTokens: Number.isFinite(envelope.output_tokens) ? envelope.output_tokens : null,
+      ...timing,
     }].slice(-MAX_MODEL_STEP_ROWS)
   } else if (event === 'tool.result') {
     const base = previous.runTotals || WORKSPACE_IDLE_STATE.runTotals
@@ -387,6 +406,109 @@ function withDerived(previous, next, envelope) {
 function numeric(value) {
   const parsed = Number(value)
   return Number.isFinite(parsed) ? parsed : 0
+}
+
+function finiteMetric(value) {
+  return Number.isFinite(value) ? value : null
+}
+
+function booleanMetric(value) {
+  return typeof value === 'boolean' ? value : null
+}
+
+function modelTimingStep(envelope) {
+  return {
+    totalMs: finiteMetric(envelope.total_ms),
+    ttftMs: finiteMetric(envelope.ttft_ms),
+    outputTokens: finiteMetric(envelope.output_tokens),
+    prefillMs: finiteMetric(envelope.prefill_ms),
+    serverFirstContentMs: finiteMetric(envelope.server_first_content_ms ?? envelope.first_token_ms),
+    decodeMs: finiteMetric(envelope.decode_ms),
+    promptCacheHit: booleanMetric(envelope.prompt_cache_hit),
+    reusedTokens: finiteMetric(envelope.reused_tokens),
+    prefilledTokens: finiteMetric(envelope.prefilled_tokens),
+  }
+}
+
+function positiveTokenCount(value) {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed) : null
+}
+
+function nonNegativeTokenCount(value) {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.round(parsed) : null
+}
+
+/** Normalize the adaptive-window response while keeping older backends useful.
+ * Older sessions have no `context_window`, but their memory event still carries
+ * the effective prompt budget, so the UI can show that instead of disappearing.
+ */
+export function normalizeContextWindow(selection, fallbackBudget = 0) {
+  const source = selection && typeof selection === 'object' && !Array.isArray(selection)
+    ? selection
+    : null
+  const readTokens = (snakeCase, camelCase) => positiveTokenCount(source?.[snakeCase] ?? source?.[camelCase])
+  const effectiveTokens = readTokens('effective_tokens', 'effectiveTokens') || positiveTokenCount(fallbackBudget)
+  if (!effectiveTokens) return null
+
+  const rawMode = String(source?.mode || 'auto').trim().toLowerCase()
+  const rawLimit = source?.limiting_factor ?? source?.limitingFactor
+  return {
+    mode: rawMode === 'fixed' || rawMode === 'manual' ? 'fixed' : 'auto',
+    effectiveTokens,
+    recommendedMaxTokens: readTokens('recommended_max_tokens', 'recommendedMaxTokens'),
+    memorySafeMaxTokens: nonNegativeTokenCount(source?.memory_safe_max_tokens ?? source?.memorySafeMaxTokens),
+    modelMaxTokens: readTokens('model_max_tokens', 'modelMaxTokens'),
+    validatedMaxTokens: readTokens('validated_max_tokens', 'validatedMaxTokens'),
+    kvOwnerSlots: readTokens('kv_owner_slots', 'kvOwnerSlots'),
+    availableMemoryBytes: readTokens('available_memory_bytes', 'availableMemoryBytes'),
+    kvBytesPerToken: readTokens('kv_bytes_per_token', 'kvBytesPerToken'),
+    residentCapacityTokens: readTokens('resident_capacity_tokens', 'residentCapacityTokens'),
+    configuredMaxTokens: readTokens('configured_max_tokens', 'configuredMaxTokens'),
+    pagedTargetTokens: readTokens('paged_target_tokens', 'pagedTargetTokens'),
+    pagedWorkingSetTokens: readTokens('paged_working_set_tokens', 'pagedWorkingSetTokens'),
+    limitingFactor: typeof rawLimit === 'string' && rawLimit.trim() ? rawLimit.trim() : null,
+  }
+}
+
+/** Render context sizes in binary K/M units so capacities such as 12,288 and
+ * 16,384 tokens become the familiar 12K and 16K model-window labels.
+ */
+export function formatContextTokens(value) {
+  const tokens = nonNegativeTokenCount(value)
+  if (tokens == null) return '—'
+  if (tokens === 0) return '0'
+  if (tokens < 1024) return tokens.toLocaleString()
+  const unit = tokens >= 1024 * 1024 ? 1024 * 1024 : 1024
+  const suffix = unit === 1024 ? 'K' : 'M'
+  const scaled = tokens / unit
+  const rounded = Number(scaled.toFixed(1))
+  return `${rounded}${suffix}`
+}
+
+export function contextWindowModeLabel(selection) {
+  return selection?.mode === 'fixed' ? 'Fixed' : 'Auto'
+}
+
+export function contextLimitingFactorLabel(value) {
+  const factor = String(value || '').trim().toLowerCase().replace(/[\s-]+/g, '_')
+  if (!factor) return ''
+  const known = {
+    available_memory: 'Available memory',
+    configured_maximum: 'Configured maximum',
+    validated_agent_maximum: 'Validated agent maximum',
+    model_maximum: 'Model maximum',
+    server_context_maximum: 'Server context maximum',
+    minimum_operational_envelope: 'Minimum operational envelope',
+    operational_ceiling: 'Operational ceiling',
+    unknown_telemetry_fallback: 'Telemetry fallback',
+    paged_model_target: 'Qwen 4B paged target',
+  }
+  if (known[factor]) return known[factor]
+  return factor.split('_').filter(Boolean).map((word, index) => (
+    index === 0 ? `${word.charAt(0).toUpperCase()}${word.slice(1)}` : word
+  )).join(' ')
 }
 
 export function reduceWorkspaceEvent(state, envelope) {
@@ -432,11 +554,31 @@ function advanceLiveActivity(current, envelope) {
   } else if (event === 'model.delta') {
     Object.assign(next, { phase: 'running', stage: 'generating', detail: 'The model is generating its next action', current_tool: null })
   } else if (event === 'model.timing') {
+    const timing = modelTimingStep(envelope)
+    const stepDetail = []
+    if (Number.isFinite(timing.ttftMs)) stepDetail.push(`${Math.round(timing.ttftMs)}ms TTFT`)
+    if (Number.isFinite(timing.serverFirstContentMs)) {
+      stepDetail.push(`${Math.round(timing.serverFirstContentMs)}ms server first content`)
+    }
+    if (Number.isFinite(timing.prefillMs)) stepDetail.push(`${Math.round(timing.prefillMs)}ms prefill`)
+    if (timing.promptCacheHit === true) stepDetail.push('prompt-cache hit')
+    if (timing.promptCacheHit === false) stepDetail.push('prompt-cache miss')
+    if (Number.isFinite(timing.reusedTokens) && timing.reusedTokens > 0) {
+      stepDetail.push(`${timing.reusedTokens.toLocaleString()} prompt tokens reused`)
+    }
     Object.assign(next, {
-      output_tokens: Number.isFinite(envelope.output_tokens) ? envelope.output_tokens : next.output_tokens,
-      detail: Number.isFinite(envelope.output_tokens)
-        ? `The model finished a ${envelope.output_tokens}-token generation step`
-        : 'The model finished a generation step',
+      total_model_ms: timing.totalMs,
+      ttft_ms: timing.ttftMs,
+      output_tokens: timing.outputTokens,
+      prefill_ms: timing.prefillMs,
+      server_first_content_ms: timing.serverFirstContentMs,
+      decode_ms: timing.decodeMs,
+      prompt_cache_hit: timing.promptCacheHit,
+      reused_tokens: timing.reusedTokens,
+      prefilled_tokens: timing.prefilledTokens,
+      detail: `${Number.isFinite(timing.outputTokens)
+        ? `The model finished a ${timing.outputTokens}-token generation step`
+        : 'The model finished a generation step'}${stepDetail.length ? ` · ${stepDetail.join(' · ')}` : ''}`,
     })
   } else if (event === 'model.answer') {
     Object.assign(next, { phase: 'running', stage: 'finishing', detail: 'Reviewing and saving the final answer', current_tool: null })

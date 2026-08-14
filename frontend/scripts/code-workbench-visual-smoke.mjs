@@ -29,28 +29,28 @@ const health = {
   engine: 'camelid',
   loaded_now: true,
   generation_ready: true,
-  active_model_id: 'Qwen3-4B-Q4_K_M.gguf',
+  active_model_id: 'Qwen3-4B-Q8_0.gguf',
   backend: 'llama',
   model_family: 'qwen3',
-  execution_plan: { selected_backend: 'cuda_resident_kquant_runtime', cuda_resident_active: true },
+  execution_plan: { selected_backend: 'cuda_resident_q8', cuda_resident_active: true },
 }
 const models = {
   object: 'list',
-  data: [{ id: 'Qwen3-4B-Q4_K_M.gguf', object: 'model', created: 0, owned_by: 'camelid', meta: { size: 2_497_280_256 } }],
+  data: [{ id: 'Qwen3-4B-Q8_0.gguf', object: 'model', created: 0, owned_by: 'camelid', meta: { size: 4_280_404_704 } }],
 }
 const currentModel = {
-  id: 'Qwen3-4B-Q4_K_M.gguf',
-  path: 'models/Qwen3-4B-Q4_K_M.gguf',
-  gguf: { metadata: { 'general.file_type': 15 } },
+  id: 'Qwen3-4B-Q8_0.gguf',
+  path: 'models/Qwen3-4B-Q8_0.gguf',
+  gguf: { metadata: { 'general.file_type': 7 } },
   tokenizer: { status: 'available' },
 }
 const localModels = {
   models_dir: 'C:/models',
   models: [{
-    filename: 'Qwen3-4B-Q4_K_M.gguf',
-    size_bytes: 2_497_280_256,
+    filename: 'Qwen3-4B-Q8_0.gguf',
+    size_bytes: 4_280_404_704,
     architecture: 'qwen3',
-    quantization: 'Q4_K_M',
+    quantization: 'Q8_0',
     tokenizer_kind: 'gpt2_bpe',
     admitted: true,
     chat_capable: true,
@@ -60,9 +60,9 @@ const localModels = {
 }
 const capabilities = {
   model_compatibility: [{
-    id: 'Qwen3-4B-Q4_K_M.gguf',
+    id: 'Qwen3-4B-Q8_0.gguf',
     family: 'qwen3',
-    quantization: 'Q4_K_M',
+    quantization: 'Q8_0',
     status: 'supported_exact_row_smoke',
     tool_capable: true,
   }],
@@ -109,7 +109,7 @@ try {
         this.listeners.set(type, callback)
         if (type !== 'workspace' || this.stream === 0) return
         if (this.stream > 1) return this.followUpTurn()
-        this.emitAfter(20, { sequence: 1, event: 'session.started', workspace: 'C:/projects/camelid-demo', model_id: 'Qwen3-4B-Q4_K_M.gguf' })
+        this.emitAfter(20, { sequence: 1, event: 'session.started', workspace: 'C:/projects/camelid-demo', model_id: 'Qwen3-4B-Q8_0.gguf' })
         this.emitAfter(40, { sequence: 2, event: 'turn.started', turn_index: 0 })
         this.emitAfter(45, { sequence: 3, event: 'agent.updated', agent_id: 'main', parent_id: null, label: 'Camelid', status: 'running', task: 'Build an interactive coding agent experience', detail: 'Inspecting the workspace' })
         this.emitAfter(50, { sequence: 4, event: 'agent.updated', agent_id: 'child-ui', parent_id: 'main', label: 'ui-specialist', status: 'running', task: 'Implement the right-side agent activity panel', detail: 'Delegated agent is working' })
@@ -137,7 +137,7 @@ try {
       // stream — so these low numbers collide with turn one's, which is exactly
       // the state that used to give two rendered cards the same React key.
       followUpTurn() {
-        this.emitAfter(20, { sequence: 1, event: 'session.started', workspace: 'C:/projects/camelid-demo', model_id: 'Qwen3-4B-Q4_K_M.gguf' })
+        this.emitAfter(20, { sequence: 1, event: 'session.started', workspace: 'C:/projects/camelid-demo', model_id: 'Qwen3-4B-Q8_0.gguf' })
         this.emitAfter(40, { sequence: 2, event: 'tool.call', detail: 'read_file(frontend/src/components/InteractiveAgent.jsx, offset=0, limit=80)' })
         this.emitAfter(60, { sequence: 3, event: 'tool.result', tool: 'read_file', outcome: 'ok', content: 'export function InteractiveAgent() { return null }' })
         this.emitAfter(80, { sequence: 4, event: 'model.delta', content: 'Writing focused tests for the component now.' })
@@ -154,7 +154,19 @@ try {
       const source = globalThis.__codeEventSource
       source?.emit({ sequence: 14, event: 'tool.result', tool: 'write_file', outcome: 'ok', content: 'Created frontend/src/components/InteractiveAgent.jsx' })
       source?.emit({ sequence: 15, event: 'model.answer', content: 'Implemented the interactive agent component and kept the change inside the selected workspace. The new component is ready for review.' })
-      source?.emit({ sequence: 16, event: 'model.timing', total_ms: 2480, ttft_ms: 165, output_tokens: 92 })
+      source?.emit({
+        sequence: 16,
+        event: 'model.timing',
+        total_ms: 2480,
+        ttft_ms: 190,
+        output_tokens: 92,
+        prefill_ms: 120,
+        server_first_content_ms: 165,
+        decode_ms: 2200,
+        prompt_cache_hit: true,
+        reused_tokens: 2884,
+        prefilled_tokens: 302,
+      })
       source?.emit({ sequence: 17, event: 'session.finished', outcome: 'answered' })
     }
     // The terminal event a Stop really produces: the still-open stream delivers
@@ -229,10 +241,22 @@ try {
       return respondJson(request, {
         id: 'code-workbench-smoke',
         workspace: 'C:/projects/camelid-demo',
-        model_id: 'Qwen3-4B-Q4_K_M.gguf',
+        model_id: 'Qwen3-4B-Q8_0.gguf',
         state: 'waiting_for_events',
         max_steps: 0,
         max_tokens: 768,
+        context_window: {
+          mode: 'auto',
+          effective_tokens: 16_384,
+          recommended_max_tokens: 8_192,
+          memory_safe_max_tokens: 2_048,
+          model_max_tokens: 40_960,
+          validated_max_tokens: 8_192,
+          kv_owner_slots: 1,
+          paged_target_tokens: 16_384,
+          paged_working_set_tokens: 8_000,
+          limiting_factor: 'paged_model_target',
+        },
         allow_writes: true,
         approval_mode: body.approval_mode,
         allow_network: body.allow_network,
@@ -259,6 +283,12 @@ try {
   await page.type('.code-composer textarea', 'Inspect the WebUI and build an interactive coding agent experience.')
   await page.click('.code-composer__send')
   await page.waitForSelector('.code-inline-approval.is-pending', { timeout: 5000 })
+  await page.evaluate(() => {
+    const sessionSummary = [...document.querySelectorAll('.ci-fold > summary')]
+      .find((summary) => summary.textContent.includes('Session'))
+    sessionSummary?.click()
+  })
+  await page.waitForSelector('.ci-kv--wide', { timeout: 5000 })
 
   const pendingState = await page.evaluate(() => ({
     href: location.hash,
@@ -271,6 +301,11 @@ try {
     hasInspector: Boolean(document.querySelector('.code-inspector')),
     agents: [...document.querySelectorAll('.code-agent-list li')].map((node) => node.textContent.replace(/\s+/g, ' ').trim()),
     hasComposer: Boolean(document.querySelector('.code-composer')),
+    contextChip: document.querySelector('.code-context-chip')?.textContent.replace(/\s+/g, ' ').trim(),
+    sessionDetails: Object.fromEntries([...document.querySelectorAll('.ci-kv--wide > div')].map((row) => [
+      row.querySelector('dt')?.textContent.trim(),
+      row.querySelector('dd')?.textContent.replace(/\s+/g, ' ').trim(),
+    ])),
     rects: Object.fromEntries(['.code-workbench', '.code-stage', '.code-thread', '.code-composer-shell', '.code-inspector', '.code-inline-approval'].map((selector) => {
       const node = document.querySelector(selector)
       const rect = node?.getBoundingClientRect()
@@ -299,6 +334,13 @@ try {
     || !pendingState.hasComposer
     || !pendingState.planText?.includes('Working on: Build the interactive agent component')
     || !pendingState.planText?.includes('Run focused regression tests')
+    || pendingState.contextChip !== 'Auto · 16K'
+    || pendingState.sessionDetails.Context !== 'Auto · 16K'
+    || pendingState.sessionDetails['Active working set'] !== '7.8K paged'
+    || pendingState.sessionDetails['Memory estimate'] !== '2K / KV owner'
+    || pendingState.sessionDetails['Model max'] !== '40K'
+    || pendingState.sessionDetails['Agent ceiling'] !== '8K'
+    || pendingState.sessionDetails['Limited by'] !== 'Qwen 4B paged target'
     || pendingState.hasStepChip) {
     throw new Error(`interactive workbench did not render: ${JSON.stringify(pendingState)}`)
   }

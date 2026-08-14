@@ -6,13 +6,17 @@
 //! artifact references, or budget accounting.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use super::tools::{ToolCall, ToolSpec};
+use super::tools::{repair_tool_name, ToolCall, ToolProfile, ToolSpec};
 
 pub(crate) const STABLE_AGENT_KERNEL: &str = concat!(
     "You are Camelid's bounded-context coding agent. Persistent state is host-owned.\n",
@@ -26,6 +30,10 @@ const INDEX_FILE: &str = "project-index.json";
 const LEDGER_DIR: &str = "ledgers";
 const ARTIFACT_DIR: &str = "artifacts";
 const RUNTIME_STATE_PREFIX: &str = "runtime-state-";
+/// Internal worker identity installed by the subagent launcher. Parent sessions
+/// deliberately leave this unset so their objective-derived ledger ids remain
+/// backward compatible and resume across sessions.
+pub(crate) const TASK_SCOPE_ENV: &str = "CAMELID_CONTEXT_PAGING_TASK_SCOPE";
 const DEFAULT_MAX_INPUT_TOKENS: u32 = 5_500;
 const DEFAULT_OUTPUT_RESERVE: u32 = 1_300;
 const DEFAULT_SAFETY_RESERVE: u32 = 1_200;
@@ -59,6 +67,7 @@ const SKIP_DIRECTORIES: &[&str] = &[
     "venv",
     "dist",
     "build",
+    "__pycache__",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +79,9 @@ pub(crate) struct ContextPagingConfig {
     pub tool_result_bytes: usize,
     pub tool_result_lines: usize,
     pub debug: bool,
+    /// Stable worker scope used only to namespace canonical task/runtime state.
+    /// The shared project index remains workspace-wide derived data.
+    pub task_scope: Option<String>,
 }
 
 impl Default for ContextPagingConfig {
@@ -88,6 +100,7 @@ impl Default for ContextPagingConfig {
             tool_result_bytes: DEFAULT_TOOL_RESULT_BYTES,
             tool_result_lines: DEFAULT_TOOL_RESULT_LINES,
             debug: false,
+            task_scope: None,
         }
     }
 }
@@ -114,7 +127,17 @@ impl ContextPagingConfig {
                 DEFAULT_TOOL_RESULT_LINES,
                 4,
             ),
+            task_scope: std::env::var(TASK_SCOPE_ENV)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
         }
+    }
+
+    pub(crate) fn working_set_tokens(&self) -> u32 {
+        self.max_input_tokens
+            .saturating_add(self.output_reserve)
+            .saturating_add(self.safety_reserve)
     }
 }
 
@@ -145,12 +168,118 @@ fn env_usize(name: &str, fallback: usize, minimum: usize) -> usize {
         .unwrap_or(fallback)
 }
 
-/// Persist via a same-directory temp file and rename so a crash mid-write can
-/// never leave a half-written ledger, index, or runtime-state file behind.
+static ATOMIC_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn atomic_temp_path(path: &Path, process_id: u32, nonce: u64) -> std::io::Result<PathBuf> {
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "atomic persistence target has no filename: {}",
+                path.display()
+            ),
+        )
+    })?;
+    let mut temp_name = OsString::from(".");
+    temp_name.push(file_name);
+    temp_name.push(format!(".{process_id}.{nonce}.tmp"));
+    Ok(path.with_file_name(temp_name))
+}
+
+fn create_unique_atomic_temp(path: &Path) -> std::io::Result<(PathBuf, File)> {
+    // PID separates processes; the monotonic counter separates every writer in
+    // this process. `create_new` also makes stale PID-reuse leftovers harmless.
+    for _ in 0..64 {
+        let nonce = ATOMIC_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp = atomic_temp_path(path, std::process::id(), nonce)?;
+        match OpenOptions::new().write(true).create_new(true).open(&temp) {
+            Ok(file) => return Ok((temp, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "could not allocate a unique atomic persistence file beside {}",
+            path.display()
+        ),
+    ))
+}
+
+#[cfg(not(windows))]
+fn replace_file_atomically(temp: &Path, path: &Path) -> std::io::Result<()> {
+    // POSIX rename replaces an existing regular file atomically. Concurrent
+    // writers therefore publish one complete JSON document or another.
+    std::fs::rename(temp, path)
+}
+
+#[cfg(windows)]
+fn replace_file_atomically(temp: &Path, path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    let path_wide = wide(path);
+    let temp_wide = wide(temp);
+    let mut last_error = None;
+    for attempt in 0..8_u32 {
+        // SAFETY: both buffers are live NUL-terminated UTF-16 paths. The source
+        // is a closed same-directory file. MoveFileExW handles both the initial
+        // publication and replacement without an exists/check race.
+        let moved = unsafe {
+            MoveFileExW(
+                temp_wide.as_ptr(),
+                path_wide.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if moved != 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        // Antivirus, indexers, and another MoveFileExW can briefly hold a name
+        // on Windows. These codes are transient sharing/access/name collisions;
+        // malformed paths and real I/O failures still fail immediately.
+        let transient = matches!(
+            error.raw_os_error(),
+            Some(5 | 32 | 33 | 80 | 183 | 1175 | 1176 | 1177)
+        );
+        if !transient {
+            return Err(error);
+        }
+        last_error = Some(error);
+        std::thread::sleep(std::time::Duration::from_millis(1_u64 << attempt));
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::other(format!("could not atomically replace {}", path.display()))
+    }))
+}
+
+/// Persist via a unique same-directory temp and atomic replacement. Unique
+/// names prevent parent/child writers from truncating or renaming each other's
+/// staging file; atomic replacement leaves readers with one coherent version.
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let temp = path.with_extension("tmp");
-    std::fs::write(&temp, bytes)?;
-    std::fs::rename(&temp, path)
+    let (temp, mut file) = create_unique_atomic_temp(path)?;
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.flush()) {
+        drop(file);
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    drop(file);
+    let result = replace_file_atomically(&temp, path);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -179,6 +308,17 @@ pub(crate) enum ContextPagingError {
     InvalidAction(String),
     #[error("patch source hash mismatch: expected {expected}, current {current}")]
     PatchHashMismatch { expected: String, current: String },
+}
+
+/// Host disposition for a native file modification before ordinary tool
+/// validation/execution.  A model can legitimately rediscover a change that is
+/// already present (especially after a fresh capsule replaced its transcript).
+/// That is settled evidence, not a malformed edit and not another filesystem
+/// mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ModificationValidation {
+    Ready,
+    AlreadySatisfied { path: String },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -309,7 +449,22 @@ impl TaskLedgerStore {
     }
 
     pub(crate) fn stable_task_id(objective: &str) -> String {
-        format!("task-{}", &sha256_text(objective)[..20])
+        Self::scoped_task_id(objective, None)
+    }
+
+    fn scoped_task_id(objective: &str, task_scope: Option<&str>) -> String {
+        let objective_hash = sha256_text(objective);
+        match task_scope.map(str::trim).filter(|scope| !scope.is_empty()) {
+            // Hash rather than interpolate the worker id: the namespace remains
+            // filename-safe and bounded even if a hand-launched worker supplies
+            // an unexpected value. Parent sessions keep the historical id above.
+            Some(scope) => format!(
+                "task-{}-{}",
+                &objective_hash[..20],
+                &sha256_text(scope)[..16]
+            ),
+            None => format!("task-{}", &objective_hash[..20]),
+        }
     }
 
     fn path(&self, task_id: &str) -> Result<PathBuf, ContextPagingError> {
@@ -527,7 +682,7 @@ impl StructuralProjectMemory {
             }
         }
         self.rebuild_callers();
-        self.save()
+        Ok(())
     }
 
     fn purge_file(&mut self, relative: &str) {
@@ -2168,11 +2323,19 @@ impl ContextPagingRuntime {
         objective: &str,
         config: ContextPagingConfig,
     ) -> Result<Self, ContextPagingError> {
-        let task_id = TaskLedgerStore::stable_task_id(objective);
+        let task_id = match config.task_scope.as_deref() {
+            Some(scope) => TaskLedgerStore::scoped_task_id(objective, Some(scope)),
+            None => TaskLedgerStore::stable_task_id(objective),
+        };
         let ledger_store = TaskLedgerStore::for_workspace(root);
         let ledger = ledger_store.load_or_create(&task_id, objective)?;
         let mut project = StructuralProjectMemory::load_or_new(root)?;
         project.index_workspace()?;
+        // `project-index.json` is shared derived workspace state. Publish it
+        // only from a fresh workspace index (and from structural edit paths),
+        // never from a later task-ledger/runtime-state save whose in-memory
+        // project copy may have gone stale behind another worker.
+        project.save()?;
         let runtime_state_path = std::fs::canonicalize(root)?
             .join(STATE_DIR)
             .join(format!("{RUNTIME_STATE_PREFIX}{task_id}.json"));
@@ -2216,7 +2379,6 @@ impl ContextPagingRuntime {
     pub(crate) fn save(&mut self) -> Result<(), ContextPagingError> {
         self.ledger.touch();
         self.ledger_store.save(&self.task_id, &self.ledger)?;
-        self.project.save()?;
         self.save_runtime_state()
     }
 
@@ -2240,6 +2402,9 @@ impl ContextPagingRuntime {
     pub(crate) fn refresh_project(&mut self) -> Result<(), ContextPagingError> {
         let before = self.project.stale_record_invalidations;
         self.project.index_workspace()?;
+        // A refresh owns a newly rebuilt view of the workspace and is therefore
+        // an authoritative point at which to publish the shared derived index.
+        self.project.save()?;
         let delta = self
             .project
             .stale_record_invalidations
@@ -2541,13 +2706,19 @@ impl ContextPagingRuntime {
         &mut self,
         call: &ToolCall,
         capsule: &ContextCapsule,
-    ) -> Result<(), ContextPagingError> {
+    ) -> Result<ModificationValidation, ContextPagingError> {
+        // Tool execution repairs small-model spelling variants before dispatch.
+        // Apply the same canonicalization at this earlier authority boundary so
+        // aliases such as `EditFile` cannot skip exact-source validation and
+        // then execute as their canonical modification tool.
+        let canonical_name =
+            repair_tool_name(&call.name, ToolProfile::WebCode).unwrap_or(call.name.as_str());
         let validation = (|| {
             let Some(path) = call.args.get("path").and_then(|value| value.as_str()) else {
-                return Ok(());
+                return Ok(ModificationValidation::Ready);
             };
             let normalized = path.replace('\\', "/");
-            match call.name.as_str() {
+            match canonical_name {
                 "edit_file" => {
                     let old = call
                         .args
@@ -2572,38 +2743,60 @@ impl ContextPagingRuntime {
                                 "edit_file requires replacement source".into(),
                             )
                         })?;
-                    if new == old {
-                        return Err(ContextPagingError::InvalidAction(
-                            "edit_file replacement is identical to the current source".into(),
-                        ));
-                    }
                     // Distinguish an actually wrong `old` value from a valid edit
                     // whose source page was merely evicted from this fresh capsule.
                     // Only the latter is recoverable by a deterministic page fault.
-                    if let Some(page) = capsule.exact_page_ids.iter().find_map(|page_id| {
+                    // Prefer the exact page the model actually holds. A file
+                    // page and a nested symbol page can both contain `old`; a
+                    // global first-match may select the unpaged file card and
+                    // manufacture a page fault even though the exact function
+                    // page is already in this capsule.
+                    let capsule_page = capsule.exact_page_ids.iter().find_map(|page_id| {
                         self.project.pages.get(page_id).filter(|page| {
                             page.file == normalized && page.exact_source.contains(old)
                         })
-                    }) {
-                        return self.project.ensure_hash(&page.file, &page.source_hash);
+                    });
+                    if let Some(page) = capsule_page {
+                        // Identical old/new text is common after the model has
+                        // independently reached the state already on disk.  Check
+                        // the authoritative current page first so a fabricated
+                        // `old` value remains a real rejection, then acknowledge
+                        // the settled state without executing a fake write.
+                        if new == old {
+                            self.project.ensure_hash(&page.file, &page.source_hash)?;
+                            return Ok(ModificationValidation::AlreadySatisfied {
+                                path: normalized,
+                            });
+                        }
+                        self.project.ensure_hash(&page.file, &page.source_hash)?;
+                        return Ok(ModificationValidation::Ready);
                     }
-                    let authoritative_page = self
-                        .project
-                        .pages
-                        .values()
-                        .find(|page| {
+                    let current_page =
+                        self.project.pages.values().find(|page| {
                             page.file == normalized && page.exact_source.contains(old)
-                        })
-                        .ok_or_else(|| {
-                            ContextPagingError::InvalidAction(format!(
-                                "edit_file old source does not match indexed source for {normalized}"
-                            ))
-                        })?;
-                    Err(ContextPagingError::MissingModificationSource {
-                        tool: call.name.clone(),
-                        path: normalized,
-                        symbol: authoritative_page.symbol_id.clone(),
-                    })
+                        });
+                    if let Some(page) = current_page {
+                        if new == old {
+                            self.project.ensure_hash(&page.file, &page.source_hash)?;
+                            return Ok(ModificationValidation::AlreadySatisfied {
+                                path: normalized,
+                            });
+                        }
+                        return Err(ContextPagingError::MissingModificationSource {
+                            tool: canonical_name.to_string(),
+                            path: normalized,
+                            symbol: page.symbol_id.clone(),
+                        });
+                    }
+
+                    // Seeing `new` somewhere in the file is not proof that an
+                    // old -> new edit already landed (a common token such as
+                    // `1` would turn a fabricated `old` needle into a false
+                    // success). Without authoritative prior-edit evidence,
+                    // preserve the fail-closed wrong-old rejection.
+                    Err(ContextPagingError::InvalidAction(format!(
+                        "edit_file old source does not match indexed source for {normalized}"
+                    )))
                 }
                 "write_file" => {
                     let Some(replacement) =
@@ -2611,7 +2804,7 @@ impl ContextPagingRuntime {
                     else {
                         // Leave ordinary schema errors to the normal tool validator;
                         // absence of an exact page is not the only defect here.
-                        return Ok(());
+                        return Ok(ModificationValidation::Ready);
                     };
                     let Some(entry) = self
                         .project
@@ -2620,14 +2813,13 @@ impl ContextPagingRuntime {
                         .iter()
                         .find(|entry| entry.file == normalized && !entry.stale)
                     else {
-                        return Ok(());
+                        return Ok(ModificationValidation::Ready);
                     };
                     let current =
                         std::fs::read_to_string(contained_path(&self.project.root, &normalized)?)?;
                     if replacement == current {
-                        return Err(ContextPagingError::InvalidAction(
-                            "write_file content is identical to the current source".into(),
-                        ));
+                        self.project.ensure_hash(&normalized, &entry.source_hash)?;
+                        return Ok(ModificationValidation::AlreadySatisfied { path: normalized });
                     }
                     let authoritative_page = self.project.pages.values().find(|page| {
                         page.file == normalized
@@ -2645,14 +2837,14 @@ impl ContextPagingRuntime {
                         .any(|page_id| page_id == &authoritative_page.id)
                     {
                         return Err(ContextPagingError::MissingModificationSource {
-                            tool: call.name.clone(),
+                            tool: canonical_name.to_string(),
                             path: normalized,
                             symbol: authoritative_page.symbol_id.clone(),
                         });
                     }
-                    Ok(())
+                    Ok(ModificationValidation::Ready)
                 }
-                _ => Ok(()),
+                _ => Ok(ModificationValidation::Ready),
             }
         })();
         if validation.as_ref().is_err_and(|error| {
@@ -2831,11 +3023,207 @@ mod tests {
     use super::*;
 
     #[test]
+    fn atomic_temp_names_are_same_directory_and_cross_process_unique() {
+        let target = PathBuf::from("workspace").join("project-index.json");
+        let first = atomic_temp_path(&target, 101, 7).unwrap();
+        let other_process = atomic_temp_path(&target, 202, 7).unwrap();
+        let other_write = atomic_temp_path(&target, 101, 8).unwrap();
+        assert_eq!(first.parent(), target.parent());
+        assert_ne!(first, other_process);
+        assert_ne!(first, other_write);
+        assert!(first
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(".project-index.json."));
+    }
+
+    #[test]
+    fn concurrent_atomic_writers_publish_complete_json_without_temp_collisions() {
+        const WRITERS: usize = 8;
+        const ROUNDS: usize = 12;
+        let directory = tempfile::tempdir().unwrap();
+        let target = std::sync::Arc::new(directory.path().join("project-index.json"));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITERS));
+        let handles = (0..WRITERS)
+            .map(|writer| {
+                let target = std::sync::Arc::clone(&target);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || -> std::io::Result<()> {
+                    barrier.wait();
+                    for round in 0..ROUNDS {
+                        let payload = serde_json::to_vec(&serde_json::json!({
+                            "writer": writer,
+                            "round": round,
+                            "body": format!("writer-{writer}-round-{round}").repeat(32),
+                        }))
+                        .unwrap();
+                        write_atomic(&target, &payload)?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle
+                .join()
+                .expect("atomic writer thread panicked")
+                .unwrap();
+        }
+
+        let final_value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(target.as_ref()).unwrap()).unwrap();
+        assert!(final_value["writer"].as_u64().unwrap() < WRITERS as u64);
+        assert!(final_value["round"].as_u64().unwrap() < ROUNDS as u64);
+        let leftovers = std::fs::read_dir(directory.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.starts_with(".project-index.json.") && name.ends_with(".tmp")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "successful writers must clean their unique temps: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn subagent_task_scopes_isolate_ledger_and_runtime_state() {
+        let objective = "Inspect the same subsystem";
+        let historical_parent = format!("task-{}", &sha256_text(objective)[..20]);
+        assert_eq!(
+            TaskLedgerStore::stable_task_id(objective),
+            historical_parent
+        );
+
+        let child_a = TaskLedgerStore::scoped_task_id(objective, Some("runtime-a"));
+        let child_a_again = TaskLedgerStore::scoped_task_id(objective, Some("runtime-a"));
+        let child_b = TaskLedgerStore::scoped_task_id(objective, Some("runtime-b"));
+        assert_eq!(child_a, child_a_again);
+        assert_ne!(child_a, child_b);
+        assert_ne!(child_a, historical_parent);
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut runtime_a = ContextPagingRuntime::open(
+            directory.path(),
+            objective,
+            ContextPagingConfig {
+                task_scope: Some("runtime-a".into()),
+                ..ContextPagingConfig::default()
+            },
+        )
+        .unwrap();
+        runtime_a.ledger.decisions.push("child a decision".into());
+        runtime_a.metrics.page_fault_count = 7;
+        runtime_a.save().unwrap();
+
+        let mut runtime_b = ContextPagingRuntime::open(
+            directory.path(),
+            objective,
+            ContextPagingConfig {
+                task_scope: Some("runtime-b".into()),
+                ..ContextPagingConfig::default()
+            },
+        )
+        .unwrap();
+        assert!(runtime_b.ledger.decisions.is_empty());
+        assert_eq!(runtime_b.metrics.page_fault_count, 0);
+        runtime_b.ledger.decisions.push("child b decision".into());
+        runtime_b.metrics.page_fault_count = 11;
+        runtime_b.save().unwrap();
+
+        assert_eq!(runtime_a.task_id, child_a);
+        assert_eq!(runtime_b.task_id, child_b);
+        assert_ne!(runtime_a.runtime_state_path, runtime_b.runtime_state_path);
+        let reopened_a = ContextPagingRuntime::open(
+            directory.path(),
+            objective,
+            ContextPagingConfig {
+                task_scope: Some("runtime-a".into()),
+                ..ContextPagingConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(reopened_a.ledger.decisions, ["child a decision"]);
+        assert_eq!(reopened_a.metrics.page_fault_count, 7);
+    }
+
+    #[test]
+    fn task_state_save_does_not_overwrite_a_newer_shared_project_index() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn original() -> i32 { 1 }\n",
+        )
+        .unwrap();
+        let objective = "Inspect a changing workspace";
+        let mut stale_runtime = ContextPagingRuntime::open(
+            directory.path(),
+            objective,
+            ContextPagingConfig {
+                task_scope: Some("stale-worker".into()),
+                ..ContextPagingConfig::default()
+            },
+        )
+        .unwrap();
+        assert!(stale_runtime.project.resolve_symbol("newer").is_none());
+
+        let mut fresh_runtime = ContextPagingRuntime::open(
+            directory.path(),
+            objective,
+            ContextPagingConfig {
+                task_scope: Some("fresh-worker".into()),
+                ..ContextPagingConfig::default()
+            },
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("newer.rs"),
+            "pub fn newer() -> i32 { 2 }\n",
+        )
+        .unwrap();
+        fresh_runtime.refresh_project().unwrap();
+        assert!(fresh_runtime.project.resolve_symbol("newer").is_some());
+
+        // This worker still holds the pre-newer.rs project map. Persisting an
+        // unrelated ledger/metrics update must not publish that stale copy over
+        // the shared index written by the fresh worker.
+        stale_runtime
+            .ledger
+            .decisions
+            .push("record a task-local decision".into());
+        stale_runtime.metrics.page_fault_count = 3;
+        stale_runtime.save().unwrap();
+
+        let index_path = directory.path().join(STATE_DIR).join(INDEX_FILE);
+        let persisted: StructuralProjectMemory =
+            serde_json::from_slice(&std::fs::read(index_path).unwrap()).unwrap();
+        assert!(persisted.resolve_symbol("newer").is_some());
+        assert!(persisted
+            .project_map
+            .files
+            .iter()
+            .any(|entry| entry.file == "newer.rs"));
+    }
+
+    #[test]
     fn context_paging_defaults_on_and_keeps_an_explicit_kill_switch() {
         let _env_guard = crate::test_support::env_lock();
         std::env::remove_var("CAMELID_CONTEXT_PAGING");
+        std::env::remove_var(TASK_SCOPE_ENV);
         assert!(ContextPagingConfig::default().enabled);
         assert!(ContextPagingConfig::from_env().enabled);
+        assert_eq!(ContextPagingConfig::default().working_set_tokens(), 8_000);
+        assert_eq!(ContextPagingConfig::from_env().task_scope, None);
+
+        std::env::set_var(TASK_SCOPE_ENV, "  child-runtime-7  ");
+        assert_eq!(
+            ContextPagingConfig::from_env().task_scope.as_deref(),
+            Some("child-runtime-7")
+        );
+        std::env::remove_var(TASK_SCOPE_ENV);
 
         for disabled in ["0", "false", "no", "off", "disabled"] {
             std::env::set_var("CAMELID_CONTEXT_PAGING", disabled);
@@ -2857,6 +3245,7 @@ mod tests {
         std::env::set_var("CAMELID_CONTEXT_PAGING", "maybe");
         assert!(ContextPagingConfig::from_env().enabled);
         std::env::remove_var("CAMELID_CONTEXT_PAGING");
+        std::env::remove_var(TASK_SCOPE_ENV);
     }
 
     fn fixture() -> (tempfile::TempDir, StructuralProjectMemory, String) {
@@ -3314,7 +3703,7 @@ mod tests {
     }
 
     #[test]
-    fn native_noop_overwrite_is_rejected_before_execution() {
+    fn native_noop_overwrite_is_settled_before_execution() {
         let (directory, _memory, symbol) = fixture();
         let mut runtime = ContextPagingRuntime::open(
             directory.path(),
@@ -3331,12 +3720,82 @@ mod tests {
             name: "write_file".into(),
             args: json!({"path": "lib.rs", "content": current}),
         };
+        assert_eq!(
+            runtime.validate_tool_modification(&call, &capsule).unwrap(),
+            ModificationValidation::AlreadySatisfied {
+                path: "lib.rs".into()
+            }
+        );
+        assert_eq!(runtime.metrics.patch_rejection_count, 0);
+    }
+
+    #[test]
+    fn native_identical_edit_is_settled_but_wrong_old_stays_rejected() {
+        let (directory, _memory, _symbol) = fixture();
+        let mut runtime = ContextPagingRuntime::open(
+            directory.path(),
+            "Change increment safely",
+            ContextPagingConfig::default(),
+        )
+        .unwrap();
+        let capsule = ContextCapsule {
+            rendered: STABLE_AGENT_KERNEL.into(),
+            estimated_input_tokens: 100,
+            max_input_tokens: 5_500,
+            output_reserve: 1_300,
+            safety_reserve: 1_200,
+            exact_page_ids: Vec::new(),
+            tool_names: Vec::new(),
+            composition: CapsuleComposition::default(),
+            included: Vec::new(),
+            excluded: Vec::new(),
+        };
+
+        let identical = ToolCall {
+            name: "edit_file".into(),
+            args: json!({
+                "path": "lib.rs",
+                "old": "helper(value) + 1",
+                "new": "helper(value) + 1"
+            }),
+        };
+        assert_eq!(
+            runtime
+                .validate_tool_modification(&identical, &capsule)
+                .unwrap(),
+            ModificationValidation::AlreadySatisfied {
+                path: "lib.rs".into()
+            }
+        );
+
+        let wrong_old_with_common_new = ToolCall {
+            name: "edit_file".into(),
+            args: json!({
+                "path": "lib.rs",
+                "old": "source that never existed",
+                "new": "1"
+            }),
+        };
         assert!(matches!(
-            runtime.validate_tool_modification(&call, &capsule),
+            runtime
+                .validate_tool_modification(&wrong_old_with_common_new, &capsule),
             Err(ContextPagingError::InvalidAction(message))
-                if message.contains("identical to the current source")
+                if message.contains("does not match indexed source")
         ));
-        assert_eq!(runtime.metrics.patch_rejection_count, 1);
+        let fabricated_identical = ToolCall {
+            name: "edit_file".into(),
+            args: json!({
+                "path": "lib.rs",
+                "old": "fabricated source",
+                "new": "fabricated source"
+            }),
+        };
+        assert!(matches!(
+            runtime.validate_tool_modification(&fabricated_identical, &capsule),
+            Err(ContextPagingError::InvalidAction(message))
+                if message.contains("does not match indexed source")
+        ));
+        assert_eq!(runtime.metrics.patch_rejection_count, 2);
     }
 
     #[test]
@@ -3420,6 +3879,77 @@ mod tests {
         runtime
             .validate_tool_modification(&overwrite, &retry_capsule)
             .unwrap();
+    }
+
+    #[test]
+    fn repaired_modification_names_cannot_bypass_exact_source_authority() {
+        let (directory, _memory, _symbol) = fixture();
+        let mut runtime = ContextPagingRuntime::open(
+            directory.path(),
+            "Fix wrong arithmetic and verify",
+            ContextPagingConfig::default(),
+        )
+        .unwrap();
+        let empty_capsule = ContextCapsule {
+            rendered: STABLE_AGENT_KERNEL.into(),
+            estimated_input_tokens: 100,
+            max_input_tokens: 5_500,
+            output_reserve: 1_300,
+            safety_reserve: 1_200,
+            exact_page_ids: Vec::new(),
+            tool_names: Vec::new(),
+            composition: CapsuleComposition::default(),
+            included: Vec::new(),
+            excluded: Vec::new(),
+        };
+        let edit_alias = ToolCall {
+            name: "EditFile".into(),
+            args: json!({
+                "path": "lib.rs",
+                "old": "helper(value) + 1",
+                "new": "helper(value) + 2"
+            }),
+        };
+        assert!(matches!(
+            runtime.validate_tool_modification(&edit_alias, &empty_capsule),
+            Err(ContextPagingError::MissingModificationSource {
+                tool,
+                path,
+                ..
+            }) if tool == "edit_file" && path == "lib.rs"
+        ));
+
+        let mut replacement = std::fs::read_to_string(directory.path().join("lib.rs")).unwrap();
+        replacement = replacement.replace("helper(value) + 1", "helper(value) + 2");
+        let overwrite_alias = ToolCall {
+            name: "functions.write_file".into(),
+            args: json!({"path": "lib.rs", "content": replacement}),
+        };
+        assert!(matches!(
+            runtime.validate_tool_modification(&overwrite_alias, &empty_capsule),
+            Err(ContextPagingError::MissingModificationSource {
+                tool,
+                path,
+                ..
+            }) if tool == "write_file" && path == "lib.rs"
+        ));
+
+        let identical_alias = ToolCall {
+            name: "edit-file".into(),
+            args: json!({
+                "path": "lib.rs",
+                "old": "helper(value) + 1",
+                "new": "helper(value) + 1"
+            }),
+        };
+        assert_eq!(
+            runtime
+                .validate_tool_modification(&identical_alias, &empty_capsule)
+                .unwrap(),
+            ModificationValidation::AlreadySatisfied {
+                path: "lib.rs".into()
+            }
+        );
     }
 
     #[test]

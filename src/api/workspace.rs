@@ -17,7 +17,10 @@ use super::{
     supported_artifact_expected_sha256, AppState, CatalogItemView, LoadedModel,
     NON_CATALOG_SUPPORTED_ARTIFACTS,
 };
-use crate::chat::agent::LoopEnd;
+use crate::chat::context_window::{
+    configured_agent_context_max, select_context_window, ContextWindowInputs,
+    ContextWindowSelection,
+};
 use crate::chat::workspace_bridge::{
     bridge, run_live, WorkspaceApprovalMode, WorkspaceBridgeControl, WorkspaceBridgeWorker,
     WorkspaceDecisionKind, WorkspaceEvent, WorkspaceRunConfig, WorkspaceRunMode,
@@ -194,6 +197,10 @@ struct ActiveWorkspaceSession {
     /// an idle session survives an unload/reload, so follow-up turns check this
     /// too — the same exactness `create_session`'s resume path applies.
     model_sha256: String,
+    /// The memory/model-aware context envelope resolved when this session was
+    /// created. It stays fixed for the session so follow-up turns and spawned
+    /// children share one predictable prompt/cache contract.
+    context_window: ContextWindowSelection,
     max_steps: usize,
     max_tokens: u32,
     temperature: f32,
@@ -258,6 +265,18 @@ struct WorkspaceActivitySnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    total_model_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttft_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefill_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_hit: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reused_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefilled_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     terminal_outcome: Option<String>,
     agents: Vec<WorkspaceAgentActivity>,
 }
@@ -274,6 +293,12 @@ impl WorkspaceActivitySnapshot {
             task: task.to_string(),
             current_tool: None,
             output_tokens: None,
+            total_model_ms: None,
+            ttft_ms: None,
+            prefill_ms: None,
+            prompt_cache_hit: None,
+            reused_tokens: None,
+            prefilled_tokens: None,
             terminal_outcome: None,
             agents: vec![WorkspaceAgentActivity {
                 id: "main".to_string(),
@@ -371,12 +396,38 @@ impl WorkspaceActivitySnapshot {
                 self.current_tool = None;
                 self.sync_main(Some("running"));
             }
-            WorkspaceEvent::ModelTiming { output_tokens, .. } => {
+            WorkspaceEvent::ModelTiming {
+                total_ms,
+                ttft_ms,
+                output_tokens,
+                prefill_ms,
+                prompt_cache_hit,
+                reused_tokens,
+                prefilled_tokens,
+                ..
+            } => {
                 self.output_tokens = *output_tokens;
-                self.detail = output_tokens.map_or_else(
+                self.total_model_ms = Some(*total_ms);
+                self.ttft_ms = *ttft_ms;
+                self.prefill_ms = *prefill_ms;
+                self.prompt_cache_hit = *prompt_cache_hit;
+                self.reused_tokens = *reused_tokens;
+                self.prefilled_tokens = *prefilled_tokens;
+                let mut detail = output_tokens.map_or_else(
                     || "The model finished a generation step".to_string(),
                     |tokens| format!("The model finished a {tokens}-token generation step"),
                 );
+                if let Some(hit) = prompt_cache_hit {
+                    detail.push_str(if *hit {
+                        " with a prompt-cache hit"
+                    } else {
+                        " with a prompt-cache miss"
+                    });
+                }
+                if let Some(tokens) = reused_tokens.filter(|tokens| *tokens > 0) {
+                    detail.push_str(&format!(" ({tokens} prompt tokens reused)"));
+                }
+                self.detail = detail;
                 self.sync_main(None);
             }
             WorkspaceEvent::ModelAnswer { .. } => {
@@ -1001,22 +1052,9 @@ fn start_turn(session: &Arc<ActiveWorkspaceSession>, message_id: String) {
     };
 
     let persisted_turn = run_config.clone();
-    let worker_session = Arc::clone(session);
-    let worker_turn_id = message_id.clone();
-    let delivery_failed = Arc::clone(&worker.delivery_failed);
     std::thread::Builder::new()
         .name("camelid-workspace-agent".to_string())
-        .spawn(move || {
-            let result = run_live(run_config, worker);
-            if result.is_err() || delivery_failed.load(Ordering::Acquire) {
-                let completion = if matches!(result, Ok(LoopEnd::DriverError) | Err(_)) {
-                    TurnCompletion::Failed
-                } else {
-                    TurnCompletion::Idle
-                };
-                worker_session.finish_turn_if_current(&worker_turn_id, completion);
-            }
-        })
+        .spawn(move || run_workspace_agent(run_config, worker))
         .expect("spawn Workspace agent thread");
 
     let forward_control = control;
@@ -1027,6 +1065,24 @@ fn start_turn(session: &Arc<ActiveWorkspaceSession>, message_id: String) {
             forward_workspace_events(persist_session, events, persisted_turn, forward_control)
         })
         .expect("spawn Workspace event forwarder");
+}
+
+/// Run the model-side half of a Workspace turn without settling the session.
+///
+/// `run_live` publishes its terminal events before it returns. Those events may
+/// still be sitting in the bounded bridge when this function returns, so only
+/// `forward_workspace_events` may persist them, publish them, and clear the
+/// current turn. Settling here races the forwarder and lets event readers stop
+/// before the queued fallback answer and terminal event become visible.
+fn run_workspace_agent(run_config: WorkspaceRunConfig, worker: WorkspaceBridgeWorker) {
+    let delivery_failed = Arc::clone(&worker.delivery_failed);
+    let _ = run_live(run_config, worker);
+    if delivery_failed.load(Ordering::Acquire) {
+        // Diagnostic only. The receiver closes after the forwarder has either
+        // settled its fallback path or failed; it is never safe to race that
+        // owner by clearing the turn from this thread.
+        eprintln!("Workspace agent event delivery ended before the worker returned");
+    }
 }
 
 /// The only thing that ends an unattended turn.
@@ -1246,6 +1302,7 @@ struct WorkspaceSessionResponse {
     state: &'static str,
     max_steps: usize,
     max_tokens: u32,
+    context_window: ContextWindowSelection,
     allow_writes: bool,
     approval_mode: WorkspaceApprovalMode,
     allow_network: bool,
@@ -1262,6 +1319,7 @@ struct WorkspaceSessionStatusResponse {
     model_id: String,
     state: &'static str,
     context_budget_tokens: u32,
+    context_window: ContextWindowSelection,
     resident_cuda: Option<crate::inference::ResidentCudaStatus>,
     allow_writes: bool,
     approval_mode: WorkspaceApprovalMode,
@@ -1278,6 +1336,7 @@ struct WorkspaceActivityResponse {
     workspace: String,
     model_id: String,
     state: &'static str,
+    context_window: ContextWindowSelection,
     approval_mode: WorkspaceApprovalMode,
     allow_network: bool,
     mode: WorkspaceRunMode,
@@ -2092,6 +2151,52 @@ pub(super) async fn create_session(
         Ok(value) => value,
         Err(response) => return response,
     };
+    // Dense model registration parses GGUF metadata and tensor bindings but
+    // intentionally defers the multi-gigabyte weight materialization until the
+    // first generation. Sampling "available RAM" before that allocation makes
+    // the adaptive KV budget count the same memory twice. Warm the exact weights
+    // first (runnable-only architectures already initialize their runtime at
+    // model load), then take the live memory snapshot used for this session.
+    if let Some(binding) = model.llama_tensors.as_ref() {
+        if let Err(response) = super::load_weights_lru(&state, &model, binding).await {
+            return response;
+        }
+    }
+    let paging_config = mode
+        .is_code()
+        .then(crate::chat::context_paging::ContextPagingConfig::from_env);
+    let enabled_paging_config = paging_config.as_ref().filter(|config| config.enabled);
+    let (context_window, enable_single_kv_owner_mode) =
+        select_workspace_context_window(&state, &model, max_tokens, enabled_paging_config);
+    if let Some((memory_safe, required)) = workspace_context_memory_shortfall(&context_window) {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "workspace_context_memory_insufficient",
+            format!(
+                "the active model has memory for about {memory_safe} context tokens, below the required {required}-token Workspace envelope; close other memory-heavy work or choose a smaller model"
+            ),
+            None,
+        );
+    }
+    eprintln!(
+        "[workspace-context] model={} selected={} validated={} native={} recommended={} memory_safe={} kv_owners={} limited_by={:?} available_ram_mib={} kv_bytes_per_token={} resident_capacity={} paged_target={} paged_working_set={}",
+        model.id,
+        context_window.effective_tokens,
+        context_window.validated_max_tokens,
+        context_window.model_max_tokens,
+        context_window.recommended_max_tokens,
+        context_window.memory_safe_max_tokens.unwrap_or(0),
+        context_window.kv_owner_slots,
+        context_window.limiting_factor,
+        context_window
+            .available_memory_bytes
+            .map(|bytes| bytes / (1024 * 1024))
+            .unwrap_or(0),
+        context_window.kv_bytes_per_token.unwrap_or(0),
+        context_window.resident_capacity_tokens.unwrap_or(0),
+        context_window.paged_target_tokens.unwrap_or(0),
+        context_window.paged_working_set_tokens.unwrap_or(0),
+    );
     // Semantic retrieval is a read-only Workspace feature: the session-scoped
     // index is built once and never invalidated, which is only sound while the
     // workspace cannot change under it. Code mode writes files, so its turns
@@ -2217,6 +2322,7 @@ pub(super) async fn create_session(
         family,
         max_steps,
         max_tokens,
+        context_budget_tokens: context_window.effective_tokens,
         temperature,
         mode,
         approval_mode,
@@ -2233,6 +2339,7 @@ pub(super) async fn create_session(
         workspace: workspace.clone(),
         model_id: model.id.clone(),
         model_sha256: model.lane.gguf_sha256.to_string(),
+        context_window,
         max_steps,
         max_tokens,
         temperature,
@@ -2253,6 +2360,18 @@ pub(super) async fn create_session(
         watch: TurnWatch::default(),
     });
     session.watch.begin();
+    if enable_single_kv_owner_mode {
+        // The measured aggregate budget cannot hold the selected active
+        // envelope across concurrent streams plus the retained/mirrored prompt
+        // cache. Apply both halves only after session preparation has
+        // succeeded, but before the first agent request can allocate KV:
+        // engine serialization prevents active overlap, and disabling retained
+        // prompt entries prevents cache publication from recreating an extra
+        // KV owner. If even one active owner is short, the selection keeps that
+        // raw shortfall visible to the allocator guard.
+        state.engine.enable_single_kv_owner_mode();
+        super::disable_prompt_prefix_cache(&state);
+    }
     *active = Some(Arc::clone(&session));
     // The turn starts HERE, not when a browser opens `/events`. That single move
     // is the fix: there is no claim to lose, so a refresh between this POST and
@@ -2271,6 +2390,7 @@ pub(super) async fn create_session(
             state: WorkspaceSessionState::Running.as_str(),
             max_steps,
             max_tokens,
+            context_window,
             allow_writes,
             approval_mode,
             allow_network,
@@ -2629,7 +2749,8 @@ pub(super) async fn session_status(
         workspace: simplify_path(&session.workspace),
         model_id: session.model_id.clone(),
         state: status,
-        context_budget_tokens: session.mode.context_budget_tokens(),
+        context_budget_tokens: session.context_window.effective_tokens,
+        context_window: session.context_window,
         resident_cuda: crate::inference::resident_cuda_status(super::model_resident_cache_key(
             &session.model_id,
         )),
@@ -2683,6 +2804,7 @@ pub(super) async fn current_activity(
             workspace: simplify_path(&session.workspace),
             model_id: session.model_id.clone(),
             state,
+            context_window: session.context_window,
             approval_mode: session.approval_mode,
             allow_network: session.allow_network,
             mode: session.mode,
@@ -2826,6 +2948,7 @@ pub(super) async fn send_message(
         family,
         max_steps: session.max_steps,
         max_tokens: session.max_tokens,
+        context_budget_tokens: session.context_window.effective_tokens,
         temperature: session.temperature,
         mode: session.mode,
         approval_mode: session.approval_mode,
@@ -3067,6 +3190,126 @@ async fn active_tool_capable_model(state: &AppState) -> Result<(LoadedModel, Str
     }
 }
 
+/// Resolve the agent's total prompt + generation envelope from the active
+/// model and memory available *after* that model has loaded. The native GGUF
+/// context remains the hard model ceiling. Live RAM determines the ordinary
+/// envelope; the exact Qwen3 4B Q8_0 Code row may instead use a 16K logical target when
+/// bounded paging keeps every active request inside the validated 8K working set.
+const QWEN3_4B_PAGED_CONTEXT_TARGET_TOKENS: u32 = 16_384;
+
+fn paged_context_policy_for_row(
+    row_id: Option<&str>,
+    paging_config: Option<&crate::chat::context_paging::ContextPagingConfig>,
+) -> (Option<u32>, Option<u32>) {
+    let qwen3_4b_q8 = matches!(row_id, Some("qwen3_4b_instruct_q8_0"));
+    match paging_config.filter(|config| config.enabled && qwen3_4b_q8) {
+        Some(config) => (
+            Some(QWEN3_4B_PAGED_CONTEXT_TARGET_TOKENS),
+            Some(config.working_set_tokens()),
+        ),
+        None => (None, None),
+    }
+}
+
+fn select_workspace_context_window(
+    state: &AppState,
+    model: &LoadedModel,
+    generation_allowance_tokens: u32,
+    paging_config: Option<&crate::chat::context_paging::ContextPagingConfig>,
+) -> (ContextWindowSelection, bool) {
+    let native_context_tokens = model
+        .llama_config
+        .as_ref()
+        .map(|config| config.context_length)
+        .unwrap_or(crate::chat::agent::AGENT_VALIDATED_CTX);
+    let kv_bytes_per_token = model
+        .llama_config
+        .as_ref()
+        .and_then(|config| crate::inference::conservative_host_kv_bytes_per_token(config).ok());
+    let resident_capacity_tokens =
+        crate::inference::resident_cuda_status(super::model_resident_cache_key(&model.id))
+            .and_then(|status| u32::try_from(status.max_positions).ok());
+    let filename = model
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let row_id = tool_capable_row_for_loaded_artifact(filename, &model.lane.gguf_sha256)
+        .map(|(row_id, _)| row_id);
+    let (paged_target_tokens, paged_working_set_tokens) =
+        paged_context_policy_for_row(row_id, paging_config);
+
+    let kv_owner_slots = if state.engine.single_kv_owner_mode() {
+        1
+    } else {
+        u32::try_from(
+            state
+                .engine
+                .continuous_batch_slots()
+                // A Metal stream retains resident KV after publication also
+                // materializes its CPU-authoritative mirror. Budget both for
+                // every admitted stream, plus each retained cache clone.
+                .saturating_mul(2)
+                .saturating_add(super::prompt_prefix_cache_capacity()),
+        )
+        .unwrap_or(u32::MAX)
+        .max(1)
+    };
+    select_context_window_for_kv_admission(ContextWindowInputs {
+        native_context_tokens,
+        // This is the legacy operational agent-loop envelope, not a promotion
+        // of every tool-capable row's parity-qualified context ladder. In
+        // particular, Qwen3-4B-Q4_K_M remains qualified only at 512/1024 and
+        // is deliberately excluded from the 16K logical paging exception.
+        validated_context_tokens: crate::chat::agent::AGENT_VALIDATED_CTX,
+        server_context_tokens: u32::try_from(state.server_limits.max_prompt_tokens)
+            .unwrap_or(u32::MAX)
+            .saturating_add(
+                generation_allowance_tokens.min(state.server_limits.max_generation_tokens),
+            ),
+        host_memory: crate::capability::live_host_memory_status(),
+        kv_bytes_per_token,
+        kv_owner_slots,
+        resident_capacity_tokens,
+        configured_max_tokens: configured_agent_context_max(),
+        paged_target_tokens,
+        paged_working_set_tokens,
+    })
+}
+
+/// Select against the configured aggregate owner count first. If the raw
+/// memory budget cannot hold the selected request's real resident working set,
+/// preserve that supported context by admitting exactly one owner instead of
+/// treating the 8K operational floor as aggregate-memory authority.
+fn select_context_window_for_kv_admission(
+    mut inputs: ContextWindowInputs,
+) -> (ContextWindowSelection, bool) {
+    let shared = select_context_window(inputs);
+    let active_working_set = shared
+        .paged_working_set_tokens
+        .unwrap_or(shared.effective_tokens);
+    let aggregate_shortfall = inputs.kv_owner_slots > 1
+        && shared
+            .memory_safe_max_tokens
+            .is_some_and(|tokens| tokens < active_working_set);
+    if !aggregate_shortfall {
+        return (shared, false);
+    }
+
+    inputs.kv_owner_slots = 1;
+    (select_context_window(inputs), true)
+}
+
+fn workspace_context_memory_shortfall(selection: &ContextWindowSelection) -> Option<(u32, u32)> {
+    let required = selection
+        .paged_working_set_tokens
+        .unwrap_or(selection.effective_tokens);
+    selection
+        .memory_safe_max_tokens
+        .filter(|memory_safe| *memory_safe < required)
+        .map(|memory_safe| (memory_safe, required))
+}
+
 /// Name-only resolution, for listing which rows COULD serve Workspace (nothing
 /// is loaded, so there are no bytes to check). Never use this to authorize a
 /// loaded model — see `tool_capable_row_for_loaded_artifact`.
@@ -3109,6 +3352,144 @@ fn tool_capable_row_for_loaded_artifact(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_context_window() -> ContextWindowSelection {
+        select_context_window(ContextWindowInputs {
+            native_context_tokens: 8_192,
+            validated_context_tokens: 8_192,
+            server_context_tokens: 131_072,
+            host_memory: None,
+            kv_bytes_per_token: None,
+            kv_owner_slots: 1,
+            resident_capacity_tokens: None,
+            configured_max_tokens: None,
+            paged_target_tokens: None,
+            paged_working_set_tokens: None,
+        })
+    }
+
+    #[test]
+    fn low_memory_qwen_paging_preserves_8k_by_admitting_one_kv_owner() {
+        const GIB: u64 = 1_073_741_824;
+        let inputs = ContextWindowInputs {
+            native_context_tokens: 40_960,
+            validated_context_tokens: 8_192,
+            server_context_tokens: 131_072,
+            host_memory: Some(crate::capability::HostMemoryStatus {
+                total_bytes: 16 * GIB,
+                available_bytes: 52 * GIB / 10,
+            }),
+            kv_bytes_per_token: Some(294_912),
+            // Two cooperative sessions can each retain resident + mirrored
+            // CPU KV, alongside one retained prefix clone.
+            kv_owner_slots: 5,
+            resident_capacity_tokens: None,
+            configured_max_tokens: None,
+            paged_target_tokens: Some(16_384),
+            paged_working_set_tokens: Some(8_000),
+        };
+
+        let configured = select_context_window(inputs);
+        assert_eq!(configured.memory_safe_max_tokens, Some(2_048));
+        let (selection, single_owner) = select_context_window_for_kv_admission(inputs);
+        assert!(single_owner);
+        assert_eq!(selection.kv_owner_slots, 1);
+        assert_eq!(selection.memory_safe_max_tokens, Some(12_288));
+        assert_eq!(selection.effective_tokens, 16_384);
+        assert_eq!(selection.paged_working_set_tokens, Some(8_000));
+
+        let active_kv_bytes = u64::from(selection.paged_working_set_tokens.unwrap())
+            * selection.kv_bytes_per_token.unwrap();
+        let memory_budget = selection.available_memory_bytes.unwrap() * 70 / 100;
+        assert!(
+            active_kv_bytes <= memory_budget,
+            "the admitted 8K working set must fit the measured KV allowance"
+        );
+    }
+
+    #[test]
+    fn ample_memory_keeps_configured_kv_concurrency() {
+        const GIB: u64 = 1_073_741_824;
+        let inputs = ContextWindowInputs {
+            native_context_tokens: 40_960,
+            validated_context_tokens: 8_192,
+            server_context_tokens: 131_072,
+            host_memory: Some(crate::capability::HostMemoryStatus {
+                total_bytes: 64 * GIB,
+                available_bytes: 48 * GIB,
+            }),
+            kv_bytes_per_token: Some(294_912),
+            kv_owner_slots: 5,
+            resident_capacity_tokens: None,
+            configured_max_tokens: None,
+            paged_target_tokens: Some(16_384),
+            paged_working_set_tokens: Some(8_000),
+        };
+
+        let (selection, single_owner) = select_context_window_for_kv_admission(inputs);
+        assert!(!single_owner);
+        assert_eq!(selection.kv_owner_slots, 5);
+        assert_eq!(selection.effective_tokens, 16_384);
+    }
+
+    #[test]
+    fn one_owner_shortfall_fails_workspace_admission_under_severe_pressure() {
+        const GIB: u64 = 1_073_741_824;
+        let inputs = ContextWindowInputs {
+            native_context_tokens: 40_960,
+            validated_context_tokens: 8_192,
+            server_context_tokens: 131_072,
+            host_memory: Some(crate::capability::HostMemoryStatus {
+                total_bytes: 16 * GIB,
+                available_bytes: GIB,
+            }),
+            kv_bytes_per_token: Some(294_912),
+            kv_owner_slots: 5,
+            resident_capacity_tokens: None,
+            configured_max_tokens: None,
+            paged_target_tokens: Some(16_384),
+            paged_working_set_tokens: Some(8_000),
+        };
+
+        let (selection, single_owner) = select_context_window_for_kv_admission(inputs);
+        assert!(single_owner);
+        assert_eq!(selection.kv_owner_slots, 1);
+        assert_eq!(selection.memory_safe_max_tokens, Some(2_048));
+        assert_eq!(
+            workspace_context_memory_shortfall(&selection),
+            Some((2_048, 8_000))
+        );
+    }
+
+    #[test]
+    fn zero_available_memory_fails_workspace_admission_instead_of_using_fallback() {
+        const GIB: u64 = 1_073_741_824;
+        let inputs = ContextWindowInputs {
+            native_context_tokens: 40_960,
+            validated_context_tokens: 8_192,
+            server_context_tokens: 131_072,
+            host_memory: Some(crate::capability::HostMemoryStatus {
+                total_bytes: 16 * GIB,
+                available_bytes: 0,
+            }),
+            kv_bytes_per_token: Some(294_912),
+            kv_owner_slots: 5,
+            resident_capacity_tokens: None,
+            configured_max_tokens: None,
+            paged_target_tokens: Some(16_384),
+            paged_working_set_tokens: Some(8_000),
+        };
+
+        let (selection, single_owner) = select_context_window_for_kv_admission(inputs);
+        assert!(single_owner);
+        assert_eq!(selection.kv_owner_slots, 1);
+        assert_eq!(selection.available_memory_bytes, Some(0));
+        assert_eq!(selection.memory_safe_max_tokens, Some(0));
+        assert_eq!(
+            workspace_context_memory_shortfall(&selection),
+            Some((0, 8_000))
+        );
+    }
 
     #[test]
     fn a_written_out_task_spec_fits_the_goal_limit() {
@@ -3432,6 +3813,26 @@ mod tests {
         assert_eq!(activity.agents.len(), 2);
         assert_eq!(activity.agents[1].task, "implement the computer player");
 
+        activity.apply(&WorkspaceEvent::ModelTiming {
+            total_ms: 1_250,
+            ttft_ms: Some(980),
+            output_tokens: Some(42),
+            prefill_ms: Some(900),
+            server_first_content_ms: Some(980),
+            decode_ms: Some(270),
+            prompt_cache_hit: Some(true),
+            reused_tokens: Some(1_920),
+            prefilled_tokens: Some(31),
+        });
+        assert_eq!(activity.output_tokens, Some(42));
+        assert_eq!(activity.total_model_ms, Some(1_250));
+        assert_eq!(activity.ttft_ms, Some(980));
+        assert_eq!(activity.prefill_ms, Some(900));
+        assert_eq!(activity.prompt_cache_hit, Some(true));
+        assert_eq!(activity.reused_tokens, Some(1_920));
+        assert_eq!(activity.prefilled_tokens, Some(31));
+        assert!(activity.detail.contains("prompt-cache hit"));
+
         activity.apply(&WorkspaceEvent::Finished {
             outcome: "repeated",
         });
@@ -3452,6 +3853,7 @@ mod tests {
                 workspace: PathBuf::from("."),
                 model_id: "model-test".to_string(),
                 model_sha256: "sha-test".to_string(),
+                context_window: test_context_window(),
                 max_steps: 1,
                 max_tokens: 1,
                 temperature: 0.0,
@@ -3507,6 +3909,7 @@ mod tests {
             workspace: dir.path().to_path_buf(),
             model_id: "model".into(),
             model_sha256: "sha-test".to_string(),
+            context_window: test_context_window(),
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
@@ -3537,6 +3940,7 @@ mod tests {
             family: "qwen3".into(),
             max_steps: 1,
             max_tokens: 1,
+            context_budget_tokens: test_context_window().effective_tokens,
             temperature: 0.0,
             mode: WorkspaceRunMode::ReadOnly,
             approval_mode: WorkspaceApprovalMode::ApprovalGated,
@@ -3582,6 +3986,7 @@ mod tests {
             workspace: dir.path().to_path_buf(),
             model_id: "model".into(),
             model_sha256: "sha-test".to_string(),
+            context_window: test_context_window(),
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
@@ -3618,6 +4023,7 @@ mod tests {
             workspace: dir.path().to_path_buf(),
             model_id: "model".into(),
             model_sha256: "sha-test".to_string(),
+            context_window: test_context_window(),
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
@@ -3648,6 +4054,7 @@ mod tests {
             family: "qwen3".into(),
             max_steps: 1,
             max_tokens: 1,
+            context_budget_tokens: test_context_window().effective_tokens,
             temperature: 0.0,
             mode: WorkspaceRunMode::ReadOnly,
             approval_mode: WorkspaceApprovalMode::ApprovalGated,
@@ -3672,6 +4079,107 @@ mod tests {
     }
 
     #[test]
+    fn worker_return_waits_for_queued_terminal_events_to_be_forwarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_workspace = dir.path().join("missing-workspace");
+        let memory = WorkspaceMemoryStore::open(dir.path().join("memory.sqlite3")).unwrap();
+        memory.create_thread("thread", "root", "model").unwrap();
+        // The immediate Sandbox error queues Error, the fallback ModelAnswer,
+        // and Finished. Capacity four lets the worker return before anything
+        // drains, deterministically reproducing the publication race.
+        let (worker, client) = bridge(4);
+        let (events, control) = client.into_parts();
+        let session = Arc::new(ActiveWorkspaceSession {
+            id: "thread".into(),
+            workspace: dir.path().to_path_buf(),
+            model_id: "model".into(),
+            model_sha256: "sha-test".to_string(),
+            context_window: test_context_window(),
+            max_steps: 1,
+            max_tokens: 1,
+            temperature: 0.0,
+            allow_writes: false,
+            approval_mode: WorkspaceApprovalMode::ApprovalGated,
+            allow_network: false,
+            mode: WorkspaceRunMode::ReadOnly,
+            semantic_retriever: None,
+            memory,
+            state: StdMutex::new(WorkspaceSessionState::Running),
+            events: StdMutex::new(None),
+            worker: StdMutex::new(None),
+            run_config: StdMutex::new(None),
+            control: StdMutex::new(Some(control.clone())),
+            current_turn: StdMutex::new(Some(("message-1".into(), 0))),
+            feed: SessionFeed::default(),
+            watch: TurnWatch::default(),
+            activity: StdMutex::new(WorkspaceActivitySnapshot::new("test task")),
+        });
+        let run_config = WorkspaceRunConfig {
+            addr: "127.0.0.1:8181".parse().unwrap(),
+            workspace: missing_workspace,
+            goal: "question".into(),
+            client_message_id: "message-1".into(),
+            turn_index: 0,
+            memory: Default::default(),
+            model_id: "model".into(),
+            family: "qwen3".into(),
+            max_steps: 1,
+            max_tokens: 1,
+            context_budget_tokens: test_context_window().effective_tokens,
+            temperature: 0.0,
+            mode: WorkspaceRunMode::ReadOnly,
+            approval_mode: WorkspaceApprovalMode::ApprovalGated,
+            allow_network: false,
+            semantic_retriever: None,
+        };
+
+        run_workspace_agent(run_config.clone(), worker);
+
+        // Returning from run_live is not publication: the bridge still owns
+        // all three terminal events, so the turn must remain visible as active.
+        assert_eq!(
+            session.state.lock().map(|state| *state).unwrap(),
+            WorkspaceSessionState::Running
+        );
+        assert_eq!(session.pending_message("message-1"), Some(0));
+        assert!(session
+            .memory
+            .turn_by_client_message("thread", "message-1")
+            .unwrap()
+            .is_none());
+
+        forward_workspace_events(Arc::clone(&session), events, run_config, control);
+
+        assert_eq!(
+            session.state.lock().map(|state| *state).unwrap(),
+            WorkspaceSessionState::Failed
+        );
+        assert_eq!(session.pending_message("message-1"), None);
+        let turn = session
+            .memory
+            .turn_by_client_message("thread", "message-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(turn.terminal_outcome, "driver_error");
+        assert!(turn.assistant_text.contains("model/runtime error"));
+
+        let (published, complete) = session.feed.entries.lock().unwrap().since(0);
+        assert!(complete);
+        assert_eq!(published.len(), 3);
+        assert!(matches!(&published[0].1, WorkspaceEvent::Error { .. }));
+        assert!(matches!(
+            &published[1].1,
+            WorkspaceEvent::ModelAnswer { .. }
+        ));
+        assert!(matches!(
+            &published[2].1,
+            WorkspaceEvent::Finished {
+                outcome: "driver_error"
+            }
+        ));
+    }
+
+    #[test]
     fn terminal_turn_states_accept_a_follow_up() {
         for terminal_state in [
             WorkspaceSessionState::Cancelled,
@@ -3686,6 +4194,7 @@ mod tests {
                 workspace: dir.path().to_path_buf(),
                 model_id: "model".into(),
                 model_sha256: "sha-test".to_string(),
+                context_window: test_context_window(),
                 max_steps: 1,
                 max_tokens: 1,
                 temperature: 0.0,
@@ -3716,6 +4225,7 @@ mod tests {
                 family: "qwen3".into(),
                 max_steps: 1,
                 max_tokens: 1,
+                context_budget_tokens: test_context_window().effective_tokens,
                 temperature: 0.0,
                 mode: WorkspaceRunMode::ReadOnly,
                 approval_mode: WorkspaceApprovalMode::ApprovalGated,
@@ -3748,6 +4258,7 @@ mod tests {
             workspace: dir.to_path_buf(),
             model_id: "model".into(),
             model_sha256: "sha-test".to_string(),
+            context_window: test_context_window(),
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
@@ -3965,5 +4476,53 @@ mod tests {
             tool_capable_row_for_filename("neighboring-model.gguf"),
             None
         );
+    }
+
+    #[test]
+    fn exact_qwen3_4b_paging_policy_gives_only_q8_the_16k_target() {
+        let config = crate::chat::context_paging::ContextPagingConfig::default();
+        assert_eq!(
+            paged_context_policy_for_row(Some("qwen3_4b_instruct_q8_0"), Some(&config)),
+            (Some(16_384), Some(8_000))
+        );
+        assert_eq!(
+            paged_context_policy_for_row(Some("qwen3_4b_q4_k_m"), Some(&config)),
+            (None, None),
+            "Q4_K_M's legacy 8K operational envelope is not a promoted context bucket"
+        );
+        assert_eq!(
+            paged_context_policy_for_row(Some("llama32_3b_instruct_q8_0"), Some(&config)),
+            (None, None)
+        );
+
+        let mut disabled = config.clone();
+        disabled.enabled = false;
+        assert_eq!(
+            paged_context_policy_for_row(Some("qwen3_4b_instruct_q8_0"), Some(&disabled)),
+            (None, None)
+        );
+
+        let q4_operational = select_context_window(ContextWindowInputs {
+            native_context_tokens: 40_960,
+            validated_context_tokens: crate::chat::agent::AGENT_VALIDATED_CTX,
+            server_context_tokens: 131_072,
+            host_memory: None,
+            kv_bytes_per_token: None,
+            kv_owner_slots: 1,
+            resident_capacity_tokens: None,
+            configured_max_tokens: None,
+            paged_target_tokens: paged_context_policy_for_row(
+                Some("qwen3_4b_q4_k_m"),
+                Some(&config),
+            )
+            .0,
+            paged_working_set_tokens: paged_context_policy_for_row(
+                Some("qwen3_4b_q4_k_m"),
+                Some(&config),
+            )
+            .1,
+        });
+        assert_eq!(q4_operational.effective_tokens, 8_192);
+        assert_eq!(q4_operational.paged_target_tokens, None);
     }
 }

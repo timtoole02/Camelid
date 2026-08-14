@@ -238,6 +238,9 @@ pub(crate) enum KvStoreFidelity {
     F16Rounded,
     /// Store the f32 values bit-exactly. Only observable in a [`KvDtype::F32`]
     /// cache, and only correct for device-produced K/V.
+    // Metal constructs this in production. Other hosts keep the shared enum so
+    // recovery and parity tests exercise both fidelity contracts.
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
     ExactF32,
 }
 
