@@ -6,7 +6,7 @@ import { Tooltip } from '../ui/Tooltip'
 import { ConversationListItem } from './ConversationListItem'
 import {
   IconAnalytics, IconApi, IconBolt, IconChart, IconChat, IconClose, IconHistory, IconMemory, IconModels,
-  IconDownload, IconNetwork, IconNewChat, IconObservatory, IconReceipt, IconSearch, IconSettings, IconSidebar, IconSystem,
+  IconDownload, IconNetwork, IconNewChat, IconObservatory, IconReceipt, IconSearch, IconSettings, IconSidebar, IconSystem, IconTrash,
 } from '../ui/icons'
 
 const NAV_SECTIONS = [
@@ -75,6 +75,7 @@ export function SidebarRail({
   renameConversation,
   requestDeleteConversation,
   codeThreads = [],
+  onDeleteCodeThread,
   selectedCodeThreadId = '',
   onSelectCodeThread,
   onNewCodeSession,
@@ -189,16 +190,31 @@ export function SidebarRail({
             <div key={group.label} className="rail__group">
               <div className="rail__group-label">{group.label}</div>
               {showingCode ? group.items.map((thread) => (
-                <button
-                  type="button"
+                // A row, not a button: the delete control is itself a button and
+                // nesting one inside another is invalid and unreachable by keyboard.
+                <div
                   key={thread.id}
                   className={`rail-code-thread ${thread.id === selectedCodeThreadId ? 'is-selected' : ''}`}
-                  onClick={() => onSelectCodeThread?.(thread)}
-                  title={thread.canonical_root}
                 >
-                  <IconBolt size={15} />
-                  <span><strong>{thread.title || 'Coding session'}</strong><small>{thread.canonical_root}</small></span>
-                </button>
+                  <button
+                    type="button"
+                    className="rail-code-thread__open"
+                    onClick={() => onSelectCodeThread?.(thread)}
+                    title={thread.canonical_root}
+                  >
+                    <IconBolt size={15} />
+                    <span><strong>{thread.title || 'Coding session'}</strong><small>{thread.canonical_root}</small></span>
+                  </button>
+                  <button
+                    type="button"
+                    className="rail-code-thread__delete"
+                    aria-label={`Delete coding session ${thread.title || ''}`.trim()}
+                    title="Delete coding session"
+                    onClick={() => onDeleteCodeThread?.(thread)}
+                  >
+                    <IconTrash size={14} />
+                  </button>
+                </div>
               )) : group.items.map((conversation) => (
                 <ConversationListItem
                   key={conversation.id}

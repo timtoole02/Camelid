@@ -16,7 +16,7 @@ import { ensureInferenceTelemetryConnected } from './hooks/useInferenceTelemetry
 import ChatWorkspace from './views/ChatWorkspace'
 import { CommandPalette } from './components/CommandPalette'
 import { ShortcutsOverlay } from './components/ShortcutsOverlay'
-import { getRecentCodeThreads } from './lib/workspaceAgent'
+import { deleteCodeThread, getRecentCodeThreads } from './lib/workspaceAgent'
 
 /* Route-level code splitting (Phase 7): chat is the default surface and stays
    eager; every other view loads on first visit. */
@@ -52,6 +52,8 @@ function App() {
     () => typeof window !== 'undefined' && window.matchMedia('(max-width: 860px)').matches,
   )
   const [pendingDeleteConversationId, setPendingDeleteConversationId] = useState(null)
+  const [pendingDeleteCodeThread, setPendingDeleteCodeThread] = useState(null)
+  const [codeDeleteError, setCodeDeleteError] = useState('')
   const [ledgerFocusRow, setLedgerFocusRow] = useState(null)
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
@@ -278,6 +280,29 @@ function App() {
     return preview === 'No messages yet' ? 'This conversation will be permanently removed.' : `“${preview}” — this conversation will be permanently removed.`
   }, [pendingDeleteConversation])
 
+  const requestDeleteCodeThread = (thread) => {
+    setPendingDeleteCodeThread(thread)
+    setCodeDeleteError('')
+    setDeleteBusy(false)
+  }
+
+  const handleDeleteCodeThreadConfirm = async () => {
+    if (!pendingDeleteCodeThread || deleteBusy) return
+    setDeleteBusy(true)
+    try {
+      await deleteCodeThread(apiBase, pendingDeleteCodeThread.id, pendingDeleteCodeThread.canonical_root)
+      // The rail owns the list and reloads on this event, so one dispatch keeps
+      // the sidebar and any open Code view in step without threading a setter.
+      window.dispatchEvent(new Event('camelid:code-history-changed'))
+      setPendingDeleteCodeThread(null)
+    } catch (error) {
+      // The server refuses to delete a session that is still running. Show what
+      // it said instead of closing the dialog on a delete that did not happen.
+      setCodeDeleteError(String(error?.message || 'Coding session could not be deleted.'))
+    }
+    setDeleteBusy(false)
+  }
+
   const handleDeleteConfirm = async () => {
     if (!pendingDeleteConversationId || deleteBusy) return
     setDeleteBusy(true)
@@ -346,6 +371,7 @@ function App() {
           renameConversation={renameConversation}
           requestDeleteConversation={requestDeleteConversation}
           codeThreads={codeThreads}
+          onDeleteCodeThread={requestDeleteCodeThread}
           selectedCodeThreadId={requestedCodeThread?.id || ''}
           onSelectCodeThread={selectCodeThread}
           onNewCodeSession={startNewCodeSession}
@@ -582,6 +608,19 @@ function App() {
       />
 
             <ConfirmDialog
+        open={Boolean(pendingDeleteCodeThread)}
+        title={pendingDeleteCodeThread?.title?.trim()
+          ? `Delete \u201c${pendingDeleteCodeThread.title.trim()}\u201d?`
+          : 'Delete this coding session?'}
+        detail={codeDeleteError
+          || `The saved transcript for ${pendingDeleteCodeThread?.canonical_root || 'this workspace'} will be permanently removed. Files it wrote stay on disk.`}
+        confirmLabel="Delete"
+        busy={deleteBusy}
+        onCancel={() => { if (!deleteBusy) { setPendingDeleteCodeThread(null); setCodeDeleteError('') } }}
+        onConfirm={handleDeleteCodeThreadConfirm}
+      />
+
+      <ConfirmDialog
         open={Boolean(pendingDeleteConversation)}
         title={pendingDeleteTitle}
         detail={pendingDeleteDetail}

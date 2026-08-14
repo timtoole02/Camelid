@@ -516,6 +516,25 @@ export async function getRecentCodeThreads(apiBase, { signal } = {}) {
   return Array.isArray(payload?.threads) ? payload.threads : []
 }
 
+/// Delete one saved coding session. The server refuses to delete the thread of a
+/// session that is still running (it returns a 409 naming the live turn), so the
+/// message it sends back is surfaced rather than replaced with a generic one.
+export async function deleteCodeThread(apiBase, threadId, workspace) {
+  const base = String(apiBase || '').replace(/\/$/, '')
+  // `workspace` is REQUIRED by the endpoint, which cross-checks it against the
+  // thread's stored canonical_root and rejects the request outright without it
+  // ("missing field `workspace`"). Pass the thread's own root.
+  const query = new URLSearchParams({ workspace: String(workspace || ''), mode: 'code' })
+  const response = await fetch(
+    `${base}/api/agent/workspace/threads/${encodeURIComponent(threadId)}?${query}`,
+    { method: 'DELETE' },
+  )
+  if (!response.ok) {
+    throw new Error(await readError(response, `Coding session could not be deleted (${response.status}).`))
+  }
+  return true
+}
+
 export async function getWorkspaceThread(apiBase, workspace, threadId, { signal } = {}) {
   const response = await fetch(workspaceThreadsEndpoint(apiBase, workspace, threadId), { signal })
   if (!response.ok) throw new Error(await readError(response, `Saved Workspace thread failed (${response.status}).`))
