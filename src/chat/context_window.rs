@@ -6,6 +6,9 @@
 //! deterministic and cheap to test. A resident GPU capacity is retained for
 //! diagnostics only: exceeding it can make a request slower by falling back to
 //! the host cache, but does not make the model context incorrect.
+//! Model-specific paged targets are a separate logical-memory policy: they are
+//! valid only when the caller also supplies the much smaller host-enforced
+//! paged working set used on every actual model request.
 
 use serde::Serialize;
 
@@ -34,6 +37,14 @@ pub(crate) struct ContextWindowInputs {
     /// Optional operator cap. API callers may supply this directly; the normal
     /// environment-backed value comes from [`configured_agent_context_max`].
     pub configured_max_tokens: Option<u32>,
+    /// Model-specific logical target used only when host-owned context paging
+    /// keeps the active prompt bounded independently. This may be higher than
+    /// the conservative host-KV recommendation because the paged working set,
+    /// not the whole logical task context, is resident on each model step.
+    pub paged_target_tokens: Option<u32>,
+    /// Maximum prompt + output + safety envelope retained on each paged step.
+    /// Diagnostic only; the paging runtime remains the enforcing authority.
+    pub paged_working_set_tokens: Option<u32>,
 }
 
 /// The bound that ultimately selected `effective_tokens`.
@@ -47,6 +58,7 @@ pub(crate) enum ContextWindowLimitingFactor {
     MinimumOperationalEnvelope,
     OperationalCeiling,
     UnknownTelemetryFallback,
+    PagedModelTarget,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -61,10 +73,12 @@ pub(crate) struct ContextWindowSelection {
     pub mode: ContextWindowMode,
     pub effective_tokens: u32,
     /// The automatic memory/operational recommendation before immutable model,
-    /// server, and explicit operator caps are applied. Under severe memory
-    /// pressure this is the 8K minimum operational envelope rather than a claim
-    /// that 70% of the current available-memory sample can hold 8K; the runtime
-    /// allocation guard remains authoritative.
+    /// server, and explicit operator caps are applied. For a model-specific
+    /// paged target this is the logical target, while
+    /// `paged_working_set_tokens` reports the smaller resident request envelope.
+    /// Under severe non-paged memory pressure this is the 8K minimum operational
+    /// envelope rather than a claim that 70% of the current available-memory
+    /// sample can hold 8K; the runtime allocation guard remains authoritative.
     pub safe_max_tokens: u32,
     pub model_max_tokens: u32,
     pub limiting_factor: ContextWindowLimitingFactor,
@@ -74,6 +88,10 @@ pub(crate) struct ContextWindowSelection {
     pub resident_capacity_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub configured_max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paged_target_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paged_working_set_tokens: Option<u32>,
 }
 
 /// Read the optional process-wide operator cap. Invalid and zero values are
@@ -107,8 +125,10 @@ pub(crate) fn select_context_window(inputs: ContextWindowInputs) -> ContextWindo
     let available_memory_bytes = host_memory.map(|memory| memory.available_bytes);
     let kv_bytes_per_token = inputs.kv_bytes_per_token.filter(|bytes| *bytes > 0);
     let configured_max_tokens = inputs.configured_max_tokens.filter(|tokens| *tokens > 0);
+    let paged_target_tokens = inputs.paged_target_tokens.filter(|tokens| *tokens > 0);
+    let paged_working_set_tokens = inputs.paged_working_set_tokens.filter(|tokens| *tokens > 0);
 
-    let (safe_max_tokens, automatic_factor) = match (available_memory_bytes, kv_bytes_per_token) {
+    let (memory_safe_tokens, memory_factor) = match (available_memory_bytes, kv_bytes_per_token) {
         (Some(available), Some(bytes_per_token)) => {
             let memory_budget = available.saturating_mul(AVAILABLE_MEMORY_PERCENT) / 100;
             let raw_tokens = memory_budget / bytes_per_token;
@@ -139,6 +159,10 @@ pub(crate) fn select_context_window(inputs: ContextWindowInputs) -> ContextWindo
             ContextWindowLimitingFactor::UnknownTelemetryFallback,
         ),
     };
+    let (safe_max_tokens, automatic_factor) = paged_target_tokens
+        .map_or((memory_safe_tokens, memory_factor), |target| {
+            (target, ContextWindowLimitingFactor::PagedModelTarget)
+        });
 
     // Tie order is intentional: an explicit cap is the most useful explanation,
     // followed by immutable model/server limits, then the automatic recommendation.
@@ -165,6 +189,9 @@ pub(crate) fn select_context_window(inputs: ContextWindowInputs) -> ContextWindo
         }
     }
 
+    let paged_working_set_tokens =
+        paged_working_set_tokens.map(|tokens| tokens.min(effective_tokens));
+
     ContextWindowSelection {
         mode: ContextWindowMode::Auto,
         effective_tokens,
@@ -175,6 +202,8 @@ pub(crate) fn select_context_window(inputs: ContextWindowInputs) -> ContextWindo
         kv_bytes_per_token,
         resident_capacity_tokens: inputs.resident_capacity_tokens,
         configured_max_tokens,
+        paged_target_tokens,
+        paged_working_set_tokens,
     }
 }
 
@@ -193,6 +222,8 @@ mod tests {
             kv_bytes_per_token: Some(64 * 1024),
             resident_capacity_tokens: None,
             configured_max_tokens: None,
+            paged_target_tokens: None,
+            paged_working_set_tokens: None,
         }
     }
 
@@ -346,6 +377,47 @@ mod tests {
     }
 
     #[test]
+    fn qwen_4b_paged_target_reaches_16k_without_expanding_the_active_working_set() {
+        let mut inputs = inputs();
+        inputs.host_memory = Some(HostMemoryStatus {
+            total_bytes: 16 * 1024 * 1024 * 1024,
+            available_bytes: 2 * 1024 * 1024 * 1024,
+        });
+        inputs.kv_bytes_per_token = Some(294_912);
+        inputs.native_context_tokens = 40_960;
+        inputs.paged_target_tokens = Some(16_384);
+        inputs.paged_working_set_tokens = Some(8_000);
+
+        let selection = select_context_window(inputs);
+        assert_eq!(selection.effective_tokens, 16_384);
+        assert_eq!(selection.safe_max_tokens, 16_384);
+        assert_eq!(selection.paged_target_tokens, Some(16_384));
+        assert_eq!(selection.paged_working_set_tokens, Some(8_000));
+        assert_eq!(
+            selection.limiting_factor,
+            ContextWindowLimitingFactor::PagedModelTarget
+        );
+
+        inputs.server_max_prompt_tokens = 12_288;
+        let server_limited = select_context_window(inputs);
+        assert_eq!(server_limited.effective_tokens, 12_288);
+        assert_eq!(
+            server_limited.limiting_factor,
+            ContextWindowLimitingFactor::ServerPromptMaximum
+        );
+
+        inputs.server_max_prompt_tokens = 131_072;
+        inputs.configured_max_tokens = Some(4_096);
+        let configured = select_context_window(inputs);
+        assert_eq!(configured.effective_tokens, 4_096);
+        assert_eq!(configured.paged_working_set_tokens, Some(4_096));
+        assert_eq!(
+            configured.limiting_factor,
+            ContextWindowLimitingFactor::ConfiguredMaximum
+        );
+    }
+
+    #[test]
     fn configured_max_parser_rejects_invalid_and_zero_values() {
         assert_eq!(parse_configured_max(" 32768 "), Some(32_768));
         assert_eq!(parse_configured_max("0"), None);
@@ -366,5 +438,7 @@ mod tests {
         assert!(value.get("kv_bytes_per_token").is_some());
         assert!(value.get("resident_capacity_tokens").is_some());
         assert!(value.get("configured_max_tokens").is_none());
+        assert!(value.get("paged_target_tokens").is_none());
+        assert!(value.get("paged_working_set_tokens").is_none());
     }
 }

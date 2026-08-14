@@ -824,6 +824,9 @@ const CodeInspector = memo(function CodeInspector({
             {contextWindow ? (
               <div><dt>Context</dt><dd className="ci-num">{contextWindowModeLabel(contextWindow)} · {formatContextTokens(contextWindow.effectiveTokens)}</dd></div>
             ) : null}
+            {contextWindow?.pagedWorkingSetTokens ? (
+              <div><dt>Active prompt</dt><dd className="ci-num">{formatContextTokens(contextWindow.pagedWorkingSetTokens)} paged</dd></div>
+            ) : null}
             {contextWindow?.modelMaxTokens ? (
               <div><dt>Model max</dt><dd className="ci-num">{formatContextTokens(contextWindow.modelMaxTokens)}</dd></div>
             ) : null}
@@ -1739,7 +1742,7 @@ export default function CodeWorkspace({
                 {contextWindow ? (
                   <span
                     className="code-context-chip"
-                    title={`${contextWindowModeLabel(contextWindow)} context: ${contextWindow.effectiveTokens.toLocaleString()} tokens${contextWindow.modelMaxTokens ? ` · model max ${contextWindow.modelMaxTokens.toLocaleString()}` : ''}${contextWindow.limitingFactor ? ` · limited by ${contextLimitingFactorLabel(contextWindow.limitingFactor)}` : ''}`}
+                    title={`${contextWindowModeLabel(contextWindow)} context: ${contextWindow.effectiveTokens.toLocaleString()} tokens${contextWindow.pagedWorkingSetTokens ? ` · active paged prompt ${contextWindow.pagedWorkingSetTokens.toLocaleString()}` : ''}${contextWindow.modelMaxTokens ? ` · model max ${contextWindow.modelMaxTokens.toLocaleString()}` : ''}${contextWindow.limitingFactor ? ` · limited by ${contextLimitingFactorLabel(contextWindow.limitingFactor)}` : ''}`}
                   >
                     {contextWindowModeLabel(contextWindow)} · {formatContextTokens(contextWindow.effectiveTokens)}
                   </span>

@@ -112,16 +112,19 @@ assert.equal(bounded.events[0].content, 'event-60')
 
 const adaptiveContext = normalizeContextWindow({
   mode: 'auto',
-  effective_tokens: 12_288,
-  safe_max_tokens: 12_288,
+  effective_tokens: 16_384,
+  safe_max_tokens: 16_384,
   model_max_tokens: 40_960,
-  limiting_factor: 'available_memory',
+  paged_target_tokens: 16_384,
+  paged_working_set_tokens: 8_000,
+  limiting_factor: 'paged_model_target',
 })
 assert.equal(contextWindowModeLabel(adaptiveContext), 'Auto')
-assert.equal(formatContextTokens(adaptiveContext.effectiveTokens), '12K')
+assert.equal(formatContextTokens(adaptiveContext.effectiveTokens), '16K')
 assert.equal(formatContextTokens(adaptiveContext.modelMaxTokens), '40K')
+assert.equal(formatContextTokens(adaptiveContext.pagedWorkingSetTokens), '7.8K')
 assert.equal(formatContextTokens(5500), '5.4K')
-assert.equal(contextLimitingFactorLabel(adaptiveContext.limitingFactor), 'Available memory')
+assert.equal(contextLimitingFactorLabel(adaptiveContext.limitingFactor), 'Qwen 4B paged target')
 assert.deepEqual(normalizeContextWindow(null, 8192), {
   mode: 'auto',
   effectiveTokens: 8192,
@@ -131,6 +134,8 @@ assert.deepEqual(normalizeContextWindow(null, 8192), {
   kvBytesPerToken: null,
   residentCapacityTokens: null,
   configuredMaxTokens: null,
+  pagedTargetTokens: null,
+  pagedWorkingSetTokens: null,
   limitingFactor: null,
 })
 assert.equal(normalizeContextWindow({ effective_tokens: 'not-a-number' }, 0), null)

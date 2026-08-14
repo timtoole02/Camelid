@@ -2284,9 +2284,13 @@ pub(super) async fn create_session(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let context_window = select_workspace_context_window(&state, &model);
+    let paging_config = mode
+        .is_code()
+        .then(crate::chat::context_paging::ContextPagingConfig::from_env);
+    let enabled_paging_config = paging_config.as_ref().filter(|config| config.enabled);
+    let context_window = select_workspace_context_window(&state, &model, enabled_paging_config);
     eprintln!(
-        "[workspace-context] model={} selected={} native={} safe_max={} limited_by={:?} available_ram_mib={} kv_bytes_per_token={} resident_capacity={}",
+        "[workspace-context] model={} selected={} native={} safe_max={} limited_by={:?} available_ram_mib={} kv_bytes_per_token={} resident_capacity={} paged_target={} paged_working_set={}",
         model.id,
         context_window.effective_tokens,
         context_window.model_max_tokens,
@@ -2298,9 +2302,10 @@ pub(super) async fn create_session(
             .unwrap_or(0),
         context_window.kv_bytes_per_token.unwrap_or(0),
         context_window.resident_capacity_tokens.unwrap_or(0),
+        context_window.paged_target_tokens.unwrap_or(0),
+        context_window.paged_working_set_tokens.unwrap_or(0),
     );
-    let context_paging_enabled =
-        mode.is_code() && crate::chat::context_paging::ContextPagingConfig::from_env().enabled;
+    let context_paging_enabled = enabled_paging_config.is_some();
     if !context_paging_enabled {
         let Some(tokenizer) = model.tokenizer_runtime.as_ref() else {
             return api_error(
@@ -3314,11 +3319,29 @@ async fn active_tool_capable_model(state: &AppState) -> Result<(LoadedModel, Str
 
 /// Resolve the agent's total prompt + generation envelope from the active
 /// model and memory available *after* that model has loaded. The native GGUF
-/// context remains the hard model ceiling; live RAM determines how much of it
-/// this machine can safely use today.
+/// context remains the hard model ceiling. Live RAM determines the normal
+/// envelope; exact Qwen3 4B Code sessions instead use a 16K logical target
+/// backed by the separately bounded context-paging working set.
+const QWEN3_4B_PAGED_CONTEXT_TARGET_TOKENS: u32 = 16_384;
+
+fn paged_context_policy_for_row(
+    row_id: Option<&str>,
+    paging_config: Option<&crate::chat::context_paging::ContextPagingConfig>,
+) -> (Option<u32>, Option<u32>) {
+    let qwen3_4b = matches!(row_id, Some("qwen3_4b_instruct_q8_0" | "qwen3_4b_q4_k_m"));
+    match paging_config.filter(|config| config.enabled && qwen3_4b) {
+        Some(config) => (
+            Some(QWEN3_4B_PAGED_CONTEXT_TARGET_TOKENS),
+            Some(config.working_set_tokens()),
+        ),
+        None => (None, None),
+    }
+}
+
 fn select_workspace_context_window(
     state: &AppState,
     model: &LoadedModel,
+    paging_config: Option<&crate::chat::context_paging::ContextPagingConfig>,
 ) -> ContextWindowSelection {
     let native_context_tokens = model
         .llama_config
@@ -3332,6 +3355,15 @@ fn select_workspace_context_window(
     let resident_capacity_tokens =
         crate::inference::resident_cuda_status(super::model_resident_cache_key(&model.id))
             .and_then(|status| u32::try_from(status.max_positions).ok());
+    let filename = model
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let row_id = tool_capable_row_for_loaded_artifact(filename, &model.lane.gguf_sha256)
+        .map(|(row_id, _)| row_id);
+    let (paged_target_tokens, paged_working_set_tokens) =
+        paged_context_policy_for_row(row_id, paging_config);
 
     select_context_window(ContextWindowInputs {
         native_context_tokens,
@@ -3341,6 +3373,8 @@ fn select_workspace_context_window(
         kv_bytes_per_token,
         resident_capacity_tokens,
         configured_max_tokens: configured_agent_context_max(),
+        paged_target_tokens,
+        paged_working_set_tokens,
     })
 }
 
@@ -3395,6 +3429,8 @@ mod tests {
             kv_bytes_per_token: None,
             resident_capacity_tokens: None,
             configured_max_tokens: None,
+            paged_target_tokens: None,
+            paged_working_set_tokens: None,
         })
     }
 
@@ -4384,6 +4420,28 @@ mod tests {
         assert_eq!(
             tool_capable_row_for_filename("neighboring-model.gguf"),
             None
+        );
+    }
+
+    #[test]
+    fn qwen3_4b_paging_targets_16k_with_a_bounded_active_working_set() {
+        let config = crate::chat::context_paging::ContextPagingConfig::default();
+        for row_id in ["qwen3_4b_instruct_q8_0", "qwen3_4b_q4_k_m"] {
+            assert_eq!(
+                paged_context_policy_for_row(Some(row_id), Some(&config)),
+                (Some(16_384), Some(8_000))
+            );
+        }
+        assert_eq!(
+            paged_context_policy_for_row(Some("llama32_3b_instruct_q8_0"), Some(&config)),
+            (None, None)
+        );
+
+        let mut disabled = config;
+        disabled.enabled = false;
+        assert_eq!(
+            paged_context_policy_for_row(Some("qwen3_4b_q4_k_m"), Some(&disabled)),
+            (None, None)
         );
     }
 }

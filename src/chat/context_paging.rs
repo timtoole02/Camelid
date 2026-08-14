@@ -154,6 +154,12 @@ impl ContextPagingConfig {
             .saturating_sub(self.safety_reserve);
         self.max_input_tokens = self.max_input_tokens.min(available_input);
     }
+
+    pub(crate) fn working_set_tokens(&self) -> u32 {
+        self.max_input_tokens
+            .saturating_add(self.output_reserve)
+            .saturating_add(self.safety_reserve)
+    }
 }
 
 fn env_flag(name: &str) -> bool {
@@ -3402,10 +3408,8 @@ mod tests {
         let mut config = ContextPagingConfig::default();
         config.apply_model_budget(40_960);
         assert_eq!(config.max_input_tokens, DEFAULT_MAX_INPUT_TOKENS);
-        assert_eq!(
-            config.max_input_tokens + config.output_reserve + config.safety_reserve,
-            8_000
-        );
+        assert_eq!(config.working_set_tokens(), 8_000);
+        assert!(config.working_set_tokens() < 16_384);
     }
 
     #[test]

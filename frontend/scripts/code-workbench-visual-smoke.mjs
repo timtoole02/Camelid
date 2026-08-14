@@ -247,10 +247,12 @@ try {
         max_tokens: 768,
         context_window: {
           mode: 'auto',
-          effective_tokens: 12_288,
-          safe_max_tokens: 12_288,
+          effective_tokens: 16_384,
+          safe_max_tokens: 16_384,
           model_max_tokens: 40_960,
-          limiting_factor: 'available_memory',
+          paged_target_tokens: 16_384,
+          paged_working_set_tokens: 8_000,
+          limiting_factor: 'paged_model_target',
         },
         allow_writes: true,
         approval_mode: body.approval_mode,
@@ -329,10 +331,11 @@ try {
     || !pendingState.hasComposer
     || !pendingState.planText?.includes('Working on: Build the interactive agent component')
     || !pendingState.planText?.includes('Run focused regression tests')
-    || pendingState.contextChip !== 'Auto · 12K'
-    || pendingState.sessionDetails.Context !== 'Auto · 12K'
+    || pendingState.contextChip !== 'Auto · 16K'
+    || pendingState.sessionDetails.Context !== 'Auto · 16K'
+    || pendingState.sessionDetails['Active prompt'] !== '7.8K paged'
     || pendingState.sessionDetails['Model max'] !== '40K'
-    || pendingState.sessionDetails['Limited by'] !== 'Available memory'
+    || pendingState.sessionDetails['Limited by'] !== 'Qwen 4B paged target'
     || pendingState.hasStepChip) {
     throw new Error(`interactive workbench did not render: ${JSON.stringify(pendingState)}`)
   }

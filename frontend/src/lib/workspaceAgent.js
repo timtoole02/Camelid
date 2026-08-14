@@ -417,6 +417,8 @@ export function normalizeContextWindow(selection, fallbackBudget = 0) {
     kvBytesPerToken: readTokens('kv_bytes_per_token', 'kvBytesPerToken'),
     residentCapacityTokens: readTokens('resident_capacity_tokens', 'residentCapacityTokens'),
     configuredMaxTokens: readTokens('configured_max_tokens', 'configuredMaxTokens'),
+    pagedTargetTokens: readTokens('paged_target_tokens', 'pagedTargetTokens'),
+    pagedWorkingSetTokens: readTokens('paged_working_set_tokens', 'pagedWorkingSetTokens'),
     limitingFactor: typeof rawLimit === 'string' && rawLimit.trim() ? rawLimit.trim() : null,
   }
 }
@@ -447,6 +449,7 @@ export function contextLimitingFactorLabel(value) {
     configured_max: 'Configured max',
     model_max: 'Model max',
     resident_capacity: 'Resident capacity',
+    paged_model_target: 'Qwen 4B paged target',
     safe_max: 'Safe max',
     server_limit: 'Server limit',
   }
