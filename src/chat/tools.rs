@@ -1434,6 +1434,25 @@ fn validate_shell_command(command: String) -> Result<Action, String> {
         )
         .into());
     }
+    // `%%VAR` is batch-FILE syntax. This lane runs `cmd /C`, i.e. the
+    // interactive form, where the loop variable is `%i` — a doubled percent
+    // does NOT expand and, unlike a syntax error, the command SUCCEEDS while
+    // doing the wrong thing. Observed live: a `for /L %i ... do @echo.%%i.txt >
+    // .%%i.txt` created 100 files literally named `.%1.txt`, exit 0, no
+    // failure hint, and the model had no signal that anything was wrong.
+    // Refuse before execution so the mistake is correctable instead of
+    // silently producing garbage on disk.
+    #[cfg(windows)]
+    if command.contains("%%") {
+        return Err(concat!(
+            "`%%` is batch-FILE syntax and does not expand here: run_shell runs `cmd /C`, the ",
+            "interactive form, where the loop variable is a SINGLE percent. Rewrite `%%i` as ",
+            "`%i`, e.g. `for /L %i in (1,1,100) do @echo some text> file%i.txt`. If the work ",
+            "needs several lines or quoting, write_file a .cmd/.ps1 script and run that file ",
+            "instead (a .cmd file is the one place `%%i` is correct)."
+        )
+        .into());
+    }
     Ok(Action::RunShell { command })
 }
 
@@ -5263,6 +5282,40 @@ mod tests {
         assert!(matches!(out, ToolOutcome::Ok(ref s) if s.contains("hi")));
     }
 
+    /// `%%` at the `cmd /C` prompt silently produces garbage rather than an
+    /// error, which is worse than failing: observed live, a `for /L` loop using
+    /// `%%i` in its body created 100 files literally named `.%1.txt` with exit
+    /// 0, so no failure hint could fire and the model kept going on a false
+    /// premise. Refuse it up front with the single-percent correction.
+    #[cfg(windows)]
+    #[test]
+    fn batch_file_percent_syntax_is_refused_before_it_writes_garbage() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path());
+        let error = match validate(
+            &call(
+                "run_shell",
+                json!({"command":"for /L %i in (1,1,100) do @echo.%%i.txt > .%%i.txt"}),
+            ),
+            &sb,
+        ) {
+            Ok(_) => panic!("batch-file percent syntax must not reach cmd /C"),
+            Err(error) => error,
+        };
+        assert!(error.contains("batch-FILE syntax"), "{error}");
+        assert!(error.contains("SINGLE percent"), "{error}");
+        assert!(error.contains("for /L %i in (1,1,100)"), "{error}");
+        // The correct single-percent form still runs.
+        assert!(validate(
+            &call(
+                "run_shell",
+                json!({"command":"for /L %i in (1,1,3) do @echo hi> file%i.txt"}),
+            ),
+            &sb,
+        )
+        .is_ok());
+    }
+
     #[test]
     fn raw_program_source_is_rejected_as_a_shell_command_with_recovery_guidance() {
         let dir = tempfile::tempdir().unwrap();
@@ -5312,6 +5365,12 @@ mod tests {
 
     #[test]
     fn mutation_results_report_workspace_relative_paths() {
+        // Executing a write AND an edit pushes two entries onto the
+        // PROCESS-GLOBAL checkpoint log, so this must serialize with the
+        // checkpoint tests that assert on that log's exact contents —
+        // otherwise it intermittently fails a sibling, which is one of the
+        // Windows-leg flakes.
+        let _cp = super::super::checkpoint::tests::cp_lock();
         let dir = tempfile::tempdir().unwrap();
         let sb = sandbox(dir.path());
         let written = validate(
