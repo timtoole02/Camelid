@@ -2819,12 +2819,13 @@ pub fn run_loop(
         // The ceiling only applies when it fits; otherwise the step runs on the
         // headroom that is actually left.
         driver.set_max_tokens(allowance);
-        if allowance < cfg.max_tokens {
-            reporter.notice(&format!(
-                "this step's reply is limited to {allowance} tokens by the remaining context \
-                 budget"
-            ));
-        }
+        // Deliberately NOT a notice. This is per-step bookkeeping, and a notice
+        // is transcript prose that lands between the agent's actions — the one
+        // place a reader is following what it DID, not how it was budgeted. The
+        // same fact goes out as structured data immediately below, where the UI
+        // renders it as a context meter that is always visible and never
+        // interrupts. A `trimmed` notice still fires, because that one reports
+        // something LOST rather than something merely accounted for.
         if let (Some(prompt_tokens), Some(budget_tokens)) =
             (prompt_tokens, driver.context_budget_tokens())
         {
