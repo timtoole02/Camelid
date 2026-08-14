@@ -417,9 +417,53 @@ impl Sandbox {
         display_path(&self.root)
     }
 
+    /// Canonicalize a directory that does not exist yet, by canonicalizing its
+    /// nearest EXISTING ancestor and re-appending the missing components.
+    ///
+    /// A plain `canonicalize` of the parent fails outright on a new subdirectory,
+    /// which made `write_file rpncalc/__init__.py` impossible in a fresh
+    /// workspace: every write into a directory the model had not created yet was
+    /// refused, and the only route left was for it to guess `run_shell mkdir -p`.
+    ///
+    /// Canonicalizing is what resolves `..` and symlinks, and it is the ONLY
+    /// reason the `starts_with(&self.root)` check in `resolve` means anything.
+    /// So the missing tail must not contain `..`: it cannot be resolved against a
+    /// real directory, and appending it blindly would walk back out of the
+    /// workspace past the check. Anything that cannot be resolved fails closed.
+    fn canonicalize_possibly_missing_dir(dir: &Path, raw: &str) -> Result<PathBuf, String> {
+        let mut missing: Vec<std::ffi::OsString> = Vec::new();
+        let mut cursor = dir;
+        loop {
+            if let Ok(base) = std::fs::canonicalize(cursor) {
+                let mut resolved = base;
+                for part in missing.iter().rev() {
+                    resolved.push(part);
+                }
+                return Ok(resolved);
+            }
+            // `file_name()` is None for a path ending in `..` or a root, so both
+            // land here and are refused rather than guessed at.
+            let name = cursor.file_name().ok_or_else(|| {
+                format!("cannot access parent of {raw}: no existing ancestor directory")
+            })?;
+            if name == std::ffi::OsStr::new("..") {
+                return Err(format!(
+                    "cannot resolve {raw}: it points through `..` above a directory that does \
+                     not exist yet. Use a path relative to the workspace root."
+                ));
+            }
+            missing.push(name.to_os_string());
+            cursor = cursor.parent().ok_or_else(|| {
+                format!("cannot access parent of {raw}: no existing ancestor directory")
+            })?;
+        }
+    }
+
     /// Resolve a user/model-supplied path against the root and confirm it stays
     /// inside. `must_exist=false` resolves the parent (for write targets that
-    /// don't exist yet). This is the path-escape backstop (constraint 5).
+    /// don't exist yet, including ones whose directory does not exist yet — see
+    /// [`Self::canonicalize_possibly_missing_dir`]). This is the path-escape
+    /// backstop (constraint 5).
     pub fn resolve(&self, raw: &str, must_exist: bool) -> Result<PathBuf, String> {
         if raw.trim().is_empty() {
             return Err("empty path".into());
@@ -441,8 +485,7 @@ impl Sandbox {
             let file = candidate
                 .file_name()
                 .ok_or_else(|| format!("invalid path {raw}"))?;
-            let parent_canon = std::fs::canonicalize(parent)
-                .map_err(|e| format!("cannot access parent of {raw}: {e}"))?;
+            let parent_canon = Self::canonicalize_possibly_missing_dir(parent, raw)?;
             parent_canon.join(file)
         };
         if self.fs_unrestricted || canon == self.root || canon.starts_with(&self.root) {
@@ -2508,6 +2551,21 @@ fn search_file(needle: &str, path: &Path, limit: usize, sandbox: &Sandbox) -> To
 }
 
 fn write_file(path: &Path, content: &str, display_path: &str) -> ToolOutcome {
+    // Create the containing directory. `path` has already been through
+    // `Workspace::resolve`, which canonicalized every existing ancestor and
+    // refused anything outside the root, so this cannot create a directory the
+    // write itself would not have been allowed to target.
+    //
+    // Without this, laying down any package — `pkg/__init__.py`, `tests/test_x.py`
+    // — burned one failed call per file and then depended on the model guessing
+    // `run_shell mkdir -p`, which is a separate approval on the gated surfaces.
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return ToolOutcome::Err(format!(
+                "write failed: could not create the directory for {display_path}: {e}"
+            ));
+        }
+    }
     match std::fs::write(path, content) {
         Ok(()) => ToolOutcome::Ok(format!("wrote {} bytes to {}", content.len(), display_path)),
         Err(e) => ToolOutcome::Err(format!("write failed: {e}")),
@@ -3868,6 +3926,54 @@ mod tests {
             name: name.into(),
             args,
         }
+    }
+
+    #[test]
+    fn write_file_creates_the_package_directories_it_was_given() {
+        // Laying down a package is the ordinary shape of a from-scratch task, and
+        // it used to be impossible: `resolve` canonicalized the parent, which does
+        // not exist yet, so every one of these writes was refused and the model
+        // had to guess `run_shell mkdir -p` to make progress.
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path());
+        for (path, body) in [
+            ("rpncalc/__init__.py", ""),
+            ("rpncalc/deep/nested/mod.py", "X = 1\n"),
+            ("tests/test_rpncalc.py", "import unittest\n"),
+        ] {
+            let resolved = sb.resolve(path, false).expect("resolves a missing parent");
+            let display = sb.rel(&resolved);
+            match write_file(&resolved, body, &display) {
+                ToolOutcome::Ok(_) => {}
+                other => panic!("write_file({path}) failed: {other:?}"),
+            }
+            assert_eq!(std::fs::read_to_string(&resolved).unwrap(), body);
+        }
+        assert!(dir.path().join("rpncalc/deep/nested/mod.py").is_file());
+    }
+
+    #[test]
+    fn a_missing_parent_still_cannot_be_used_to_escape_the_root() {
+        // Canonicalizing the parent is what resolved `..` and made the
+        // starts_with(root) check meaningful. Now that a missing parent is
+        // reconstructed instead of canonicalized, the `..` it may contain has to
+        // be refused explicitly or the escape backstop is gone.
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path());
+        for escape in [
+            "nope/../../../etc/passwd",
+            "a/b/../../../../outside.txt",
+            "missing/../../sibling.txt",
+        ] {
+            let result = sb.resolve(escape, false);
+            assert!(
+                result.is_err(),
+                "{escape} resolved to {:?} instead of being refused",
+                result.ok()
+            );
+        }
+        // A legitimate deep path with no `..` is still allowed.
+        assert!(sb.resolve("pkg/sub/file.py", false).is_ok());
     }
 
     #[test]
