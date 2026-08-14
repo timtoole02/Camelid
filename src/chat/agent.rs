@@ -4729,7 +4729,17 @@ impl ModelDriver for LiveDriver {
         let tool_defs = tools_to_json(tools);
         let mut request = self.request(history, &tool_defs, false, false);
         if let Some(object) = request.as_object_mut() {
-            object.remove("camelid_context_budget_tokens");
+            // `/api/generation/preflight` validates its body strictly and
+            // rejects anything it does not declare, so every camelid-private
+            // control has to come OFF here — including at its default value,
+            // because the route refuses the key, not the value. Missing
+            // `camelid_stream_timing_diagnostics` made the preflight 400, which
+            // surfaces as "context budget error" and ends the turn in
+            // DriverError before a single tool call runs: the whole Code lane
+            // was dead, not slow.
+            for key in PREFLIGHT_REJECTED_KEYS {
+                object.remove(*key);
+            }
         }
         let prompt_tokens = match (self.stream_cancel.as_deref(), self.stream_timeout) {
             (Some(cancel), Some(timeout)) => self
@@ -4751,6 +4761,19 @@ impl ModelDriver for LiveDriver {
         self.last_step_metrics.take()
     }
 }
+
+/// Camelid-private request keys that `/api/generation/preflight` refuses.
+///
+/// The route validates strictly and rejects any field it does not declare, by
+/// KEY — sending one at its default value fails exactly as sending it set does.
+/// Kept as a named list so `prompt_tokens` and its regression test cannot drift
+/// apart: a control added to `LiveDriver::request` without being stripped here
+/// makes every Code turn die in DriverError before its first tool call.
+const PREFLIGHT_REJECTED_KEYS: &[&str] = &[
+    "camelid_context_budget_tokens",
+    "camelid_stream_timing_diagnostics",
+    "stream_options",
+];
 
 impl LiveDriver {
     fn request(
@@ -8649,6 +8672,41 @@ mod tests {
     /// A host-condition failure (missing launcher, Store alias stub) must not
     /// be classified as a source syntax failure — that misclassification put
     /// Store-Python-only hosts into a rewrite loop no edit could ever clear.
+    /// The token-count preflight must carry NO camelid-private key.
+    ///
+    /// `/api/generation/preflight` validates strictly and 400s on any field it
+    /// does not declare, and `fit_history_to_budget` turns that 400 into
+    /// LoopEnd::DriverError — so a single unstripped control kills every Code
+    /// turn before its first tool call. That is exactly what shipped when
+    /// `camelid_stream_timing_diagnostics` was added to the request builder
+    /// without being added to the strip list: the live session died in 27s with
+    /// "context budget error: unsupported generation request field".
+    #[test]
+    fn preflight_request_carries_no_camelid_private_keys() {
+        let driver = LiveDriver::with(
+            super::super::client::Client::new("127.0.0.1:1".parse().expect("loopback addr")),
+            "test-model".into(),
+            "qwen3".into(),
+            256,
+            0.0,
+        );
+        let history = vec![AgentMsg::User("hi".into())];
+        // Every shape the builder can produce must be covered by the strip
+        // list, streaming included — `stream_options` only appears when
+        // streaming, and it is rejected too.
+        for stream in [false, true] {
+            let request = driver.request(&history, &[], false, stream);
+            let object = request.as_object().expect("request is an object");
+            for key in object.keys() {
+                assert!(
+                    !key.starts_with("camelid_") || PREFLIGHT_REJECTED_KEYS.contains(&key.as_str()),
+                    "private key `{key}` is not in PREFLIGHT_REJECTED_KEYS, so the \
+                     preflight would 400 and every Code turn would DriverError"
+                );
+            }
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn interpreter_unusable_classifier_separates_host_from_source_failures() {
