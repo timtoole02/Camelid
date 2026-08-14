@@ -635,6 +635,535 @@ fn host_python_compile_command(relative: &str) -> Option<String> {
     Some(format!("{launcher} -m py_compile {relative}"))
 }
 
+fn workspace_path_looks_like_test(path: &str) -> bool {
+    let normalized = normalize_workspace_path(path).to_ascii_lowercase();
+    let filename = normalized.rsplit('/').next().unwrap_or(&normalized);
+    let stem = filename.rsplit_once('.').map_or(filename, |(stem, _)| stem);
+    stem == "test"
+        || stem.starts_with("test_")
+        || stem.ends_with("_test")
+        || normalized
+            .split('/')
+            .any(|component| matches!(component, "test" | "tests"))
+}
+
+fn workspace_test_artifacts(
+    completed_work: &[String],
+    required_artifacts: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let changed = completed_work
+        .iter()
+        .filter_map(|entry| entry.split_once(" changed ").map(|(_, path)| path))
+        .map(normalize_workspace_path)
+        .filter(|path| workspace_path_looks_like_test(path))
+        .collect::<BTreeSet<_>>();
+    let qualified_required_basenames = required_artifacts
+        .iter()
+        .map(|path| normalize_workspace_path(path))
+        .filter(|path| path.contains('/'))
+        .filter_map(|path| path.rsplit('/').next().map(str::to_string))
+        .collect::<BTreeSet<_>>();
+    let mut artifacts = changed.clone();
+    for required in required_artifacts {
+        let required = normalize_workspace_path(required);
+        if !workspace_path_looks_like_test(&required) {
+            continue;
+        }
+        let basename = required.rsplit('/').next().unwrap_or(&required);
+        let bare_alias = !required.contains('/')
+            && (qualified_required_basenames.contains(basename)
+                || changed
+                    .iter()
+                    .any(|path| path.contains('/') && path.rsplit('/').next() == Some(basename)));
+        if !bare_alias {
+            artifacts.insert(required);
+        }
+    }
+    artifacts
+}
+
+fn objective_requests_test_execution(
+    objective: &str,
+    completed_work: &[String],
+    required_artifacts: &BTreeSet<String>,
+) -> bool {
+    workspace_test_artifacts(completed_work, required_artifacts)
+        .iter()
+        .next()
+        .is_some()
+        || objective
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .any(|word| {
+                matches!(
+                    word.to_ascii_lowercase().as_str(),
+                    "test"
+                        | "tests"
+                        | "tested"
+                        | "testing"
+                        | "unittest"
+                        | "unittests"
+                        | "testcase"
+                        | "testcases"
+                        | "pytest"
+                )
+            })
+}
+
+const TEST_EXECUTION_EVIDENCE_PREFIX: &str = "host verification evidence: tests passed: ";
+const MANUAL_VALIDATION_EVIDENCE_PREFIX: &str = "host verification evidence: manual command ";
+const SOURCE_FINGERPRINT_EVIDENCE_PREFIX: &str = "host verification evidence: source fingerprint: ";
+const SOURCE_FINGERPRINT_INCOMPLETE_MARKER: &str =
+    "host verification blocked: shell source-change scan was truncated";
+const MAX_MANUAL_VALIDATION_COMMANDS: usize = 16;
+
+fn objective_has_runtime_execution_requirement(objective: &str) -> bool {
+    let objective = objective.to_ascii_lowercase();
+    [
+        "actually execute",
+        "manually execute",
+        "manually executed",
+        "manual validation",
+        "run the application yourself",
+        "execute the application",
+        "exercise multiple cli",
+        "exercise the cli",
+    ]
+    .iter()
+    .any(|phrase| objective.contains(phrase))
+}
+
+fn has_verification_evidence(decisions: &[String], prefix: &str) -> bool {
+    decisions
+        .iter()
+        .any(|decision| decision.starts_with(prefix))
+}
+
+fn record_verification_evidence(decisions: &mut Vec<String>, prefix: &str, command: &str) -> bool {
+    let receipt = format!("{prefix}`{command}`");
+    let already_recorded = decisions.iter().any(|decision| decision == &receipt);
+    decisions.retain(|decision| !decision.starts_with(prefix));
+    decisions.push(receipt);
+    !already_recorded
+}
+
+fn clear_execution_verification_evidence(decisions: &mut Vec<String>) {
+    decisions.retain(|decision| {
+        !decision.starts_with(TEST_EXECUTION_EVIDENCE_PREFIX)
+            && !decision.starts_with(MANUAL_VALIDATION_EVIDENCE_PREFIX)
+            && !decision.starts_with(SOURCE_FINGERPRINT_EVIDENCE_PREFIX)
+    });
+}
+
+fn completed_source_paths(completed_work: &[String]) -> BTreeSet<String> {
+    const SOURCE_EXTENSIONS: &[&str] = &[
+        "c", "cc", "cpp", "cs", "go", "h", "hpp", "java", "js", "jsx", "kt", "kts", "mjs", "php",
+        "py", "pyw", "rb", "rs", "swift", "ts", "tsx",
+    ];
+    completed_work
+        .iter()
+        .filter_map(|entry| entry.split_once(" changed ").map(|(_, path)| path))
+        .map(normalize_workspace_path)
+        .filter(|path| {
+            path.rsplit_once('.').is_some_and(|(_, extension)| {
+                SOURCE_EXTENSIONS
+                    .iter()
+                    .any(|known| extension.eq_ignore_ascii_case(known))
+            })
+        })
+        .collect()
+}
+
+fn current_source_fingerprint(runtime: &ContextPagingRuntime) -> Option<String> {
+    use sha2::Digest as _;
+
+    let paths = completed_source_paths(&runtime.ledger.completed_work);
+    if paths.is_empty() {
+        return None;
+    }
+    let mut material = String::new();
+    for path in paths {
+        let entry = runtime
+            .project
+            .project_map
+            .files
+            .iter()
+            .find(|entry| entry.file == path && !entry.stale)?;
+        material.push_str(&path);
+        material.push('\0');
+        material.push_str(&entry.source_hash);
+        material.push('\n');
+    }
+    Some(format!(
+        "sha256:{:x}",
+        sha2::Sha256::digest(material.as_bytes())
+    ))
+}
+
+fn record_source_fingerprint(runtime: &mut ContextPagingRuntime) -> bool {
+    let Some(fingerprint) = current_source_fingerprint(runtime) else {
+        return false;
+    };
+    let receipt = format!("{SOURCE_FINGERPRINT_EVIDENCE_PREFIX}{fingerprint}");
+    if runtime
+        .ledger
+        .decisions
+        .iter()
+        .any(|decision| decision == &receipt)
+    {
+        return false;
+    }
+    runtime
+        .ledger
+        .decisions
+        .retain(|decision| !decision.starts_with(SOURCE_FINGERPRINT_EVIDENCE_PREFIX));
+    runtime.ledger.decisions.push(receipt);
+    true
+}
+
+fn source_fingerprint_receipt_is_current(runtime: &ContextPagingRuntime) -> bool {
+    if runtime
+        .ledger
+        .decisions
+        .iter()
+        .any(|decision| decision == SOURCE_FINGERPRINT_INCOMPLETE_MARKER)
+    {
+        return false;
+    }
+    if completed_source_paths(&runtime.ledger.completed_work).is_empty() {
+        return true;
+    }
+    let Some(current) = current_source_fingerprint(runtime) else {
+        return false;
+    };
+    runtime.ledger.decisions.iter().any(|decision| {
+        decision.strip_prefix(SOURCE_FINGERPRINT_EVIDENCE_PREFIX) == Some(current.as_str())
+    })
+}
+
+fn invalidate_stale_source_fingerprint(runtime: &mut ContextPagingRuntime) -> bool {
+    if completed_source_paths(&runtime.ledger.completed_work).is_empty() {
+        return false;
+    }
+    let persisted = runtime
+        .ledger
+        .decisions
+        .iter()
+        .find_map(|decision| decision.strip_prefix(SOURCE_FINGERPRINT_EVIDENCE_PREFIX))
+        .map(str::to_string);
+    let verification_claimed = matches!(
+        runtime.ledger.verification_state.status.as_str(),
+        "passed" | "complete"
+    );
+    if persisted.is_none() && !verification_claimed {
+        return false;
+    }
+    if persisted
+        .as_deref()
+        .is_some_and(|persisted| current_source_fingerprint(runtime).as_deref() == Some(persisted))
+    {
+        return false;
+    }
+    clear_execution_verification_evidence(&mut runtime.ledger.decisions);
+    runtime.ledger.verification_state.status = "pending".into();
+    runtime.ledger.verification_state.failing_diagnostic = None;
+    runtime.ledger.verification_state.verified_symbols.clear();
+    runtime.ledger.current_focus =
+        "Verified source changed outside this run; recapture it and repeat required execution verification"
+            .into();
+    true
+}
+
+fn python_runtime_entrypoint(
+    completed_work: &[String],
+    required_artifacts: &BTreeSet<String>,
+) -> Option<String> {
+    let candidates = completed_work
+        .iter()
+        .filter_map(|entry| entry.split_once(" changed ").map(|(_, path)| path))
+        .map(normalize_workspace_path)
+        .map(|path| (path, true))
+        .chain(
+            required_artifacts
+                .iter()
+                .map(|path| (normalize_workspace_path(path), false)),
+        )
+        .filter(|(path, _)| !workspace_path_looks_like_test(path))
+        .filter(|(path, _)| path.to_ascii_lowercase().ends_with(".py"))
+        .collect::<BTreeSet<_>>();
+    candidates
+        .into_iter()
+        .max_by_key(|(path, changed)| {
+            let filename = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
+            let entrypoint = matches!(
+                filename.as_str(),
+                "main.py" | "__main__.py" | "app.py" | "cli.py"
+            );
+            (entrypoint, *changed, path.matches('/').count())
+        })
+        .map(|(path, _)| path)
+}
+
+fn python_module_for_path(path: &str) -> Option<String> {
+    let normalized = normalize_workspace_path(path);
+    let without_extension = normalized.strip_suffix(".py")?;
+    let module = without_extension.replace('/', ".");
+    Some(
+        module
+            .strip_suffix(".__main__")
+            .unwrap_or(&module)
+            .to_string(),
+    )
+}
+
+fn host_python_runtime_guidance(
+    objective: &str,
+    completed_work: &[String],
+    required_artifacts: &BTreeSet<String>,
+) -> Option<String> {
+    let path = python_runtime_entrypoint(completed_work, required_artifacts)?;
+    let module = python_module_for_path(&path)?;
+    #[cfg(windows)]
+    let launcher = "py";
+    #[cfg(not(windows))]
+    let launcher = "python3";
+    let subcommand = if objective
+        .to_ascii_lowercase()
+        .contains("python main.py list")
+    {
+        " list"
+    } else {
+        ""
+    };
+    Some(format!("{launcher} -m {module}{subcommand}"))
+}
+
+fn manual_validation_source_commands(objective: &str) -> Vec<String> {
+    let mut in_manual_section = false;
+    let mut commands = Vec::new();
+    for line in objective.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            if in_manual_section {
+                break;
+            }
+            if trimmed.to_ascii_lowercase().contains("manual validation") {
+                in_manual_section = true;
+            }
+            continue;
+        }
+        if !in_manual_section {
+            continue;
+        }
+        let candidate = trimmed.strip_prefix("$ ").unwrap_or(trimmed);
+        let first = candidate
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if matches!(first.as_str(), "python" | "python3" | "py") {
+            commands.push(candidate.to_string());
+            if commands.len() >= MAX_MANUAL_VALIDATION_COMMANDS {
+                break;
+            }
+        }
+    }
+    commands
+}
+
+fn manual_command_in_module_form(command: &str, module: &str) -> Option<String> {
+    let words = command.split_whitespace().collect::<Vec<_>>();
+    let launcher = words.first()?.to_ascii_lowercase();
+    if !matches!(launcher.as_str(), "python" | "python3" | "py") {
+        return None;
+    }
+    let target_index = usize::from(words.get(1).is_some_and(|word| *word == "-m")) + 1;
+    let target = words.get(target_index)?;
+    if target_index == 1 && !target.to_ascii_lowercase().ends_with(".py") {
+        return None;
+    }
+    let lower = command.to_ascii_lowercase();
+    let target_start = lower.find(&target.to_ascii_lowercase())?;
+    let suffix = command
+        .get(target_start + target.len()..)
+        .unwrap_or_default();
+    #[cfg(windows)]
+    let launcher = "py";
+    #[cfg(not(windows))]
+    let launcher = "python3";
+    Some(format!("{launcher} -m {module}{suffix}"))
+}
+
+fn manual_validation_obligations(
+    objective: &str,
+    completed_work: &[String],
+    required_artifacts: &BTreeSet<String>,
+) -> Vec<String> {
+    let Some(entrypoint) = python_runtime_entrypoint(completed_work, required_artifacts) else {
+        return Vec::new();
+    };
+    let Some(module) = python_module_for_path(&entrypoint) else {
+        return Vec::new();
+    };
+    let mut obligations = manual_validation_source_commands(objective)
+        .into_iter()
+        .filter_map(|command| manual_command_in_module_form(&command, &module))
+        .take(MAX_MANUAL_VALIDATION_COMMANDS)
+        .collect::<Vec<_>>();
+    if obligations.is_empty() && objective_has_runtime_execution_requirement(objective) {
+        if let Some(command) =
+            host_python_runtime_guidance(objective, completed_work, required_artifacts)
+        {
+            obligations.push(command);
+        }
+    }
+    obligations
+}
+
+fn manual_validation_receipt(index: usize, command: &str) -> String {
+    format!(
+        "{MANUAL_VALIDATION_EVIDENCE_PREFIX}{} passed: `{command}`",
+        index + 1
+    )
+}
+
+fn manual_validation_receipt_exists(decisions: &[String], index: usize, command: &str) -> bool {
+    decisions
+        .iter()
+        .any(|decision| decision == &manual_validation_receipt(index, command))
+}
+
+fn next_manual_validation_obligation<'a>(
+    obligations: &'a [String],
+    decisions: &[String],
+) -> Option<(usize, &'a str)> {
+    obligations.iter().enumerate().find_map(|(index, command)| {
+        (!manual_validation_receipt_exists(decisions, index, command))
+            .then_some((index, command.as_str()))
+    })
+}
+
+fn normalize_manual_validation_command(command: &str) -> String {
+    command
+        .trim()
+        .to_ascii_lowercase()
+        .replace('\\', "/")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn manual_validation_command_matches(command: &str, expected: &str) -> bool {
+    normalize_manual_validation_command(command) == normalize_manual_validation_command(expected)
+}
+
+fn record_manual_validation_evidence(
+    decisions: &mut Vec<String>,
+    obligations: &[String],
+    command: &str,
+) -> bool {
+    let Some((index, expected)) = next_manual_validation_obligation(obligations, decisions) else {
+        return false;
+    };
+    if !manual_validation_command_matches(command, expected) {
+        return false;
+    }
+    decisions.push(manual_validation_receipt(index, expected));
+    true
+}
+
+fn verification_requirements_focus(
+    objective: &str,
+    completed_work: &[String],
+    required_artifacts: &BTreeSet<String>,
+    decisions: &[String],
+) -> String {
+    let tests_required =
+        objective_requests_test_execution(objective, completed_work, required_artifacts);
+    let manual_obligations =
+        manual_validation_obligations(objective, completed_work, required_artifacts);
+    if tests_required && !has_verification_evidence(decisions, TEST_EXECUTION_EVIDENCE_PREFIX) {
+        if let Some(command) =
+            host_python_unittest_command(objective, completed_work, required_artifacts)
+        {
+            return format!(
+                "Run the requested test suite now with run_shell using exactly `{command}`. A syntax check does not satisfy the test requirement."
+            );
+        }
+        return "Run the actual requested test suite now with run_shell. A syntax check or unrelated test runner does not satisfy the test requirement.".into();
+    }
+    if let Some((index, command)) =
+        next_manual_validation_obligation(&manual_obligations, decisions)
+    {
+        return format!(
+            "Run manual validation command {}/{} now with run_shell using exactly `{command}`. Tests and syntax checks do not satisfy the explicit manual workflow.",
+            index + 1,
+            manual_obligations.len()
+        );
+    }
+    "Run the narrowest relevant verification before completing".into()
+}
+
+fn execution_verification_requirements_satisfied(
+    objective: &str,
+    completed_work: &[String],
+    required_artifacts: &BTreeSet<String>,
+    decisions: &[String],
+) -> bool {
+    (!objective_requests_test_execution(objective, completed_work, required_artifacts)
+        || has_verification_evidence(decisions, TEST_EXECUTION_EVIDENCE_PREFIX))
+        && manual_validation_obligations(objective, completed_work, required_artifacts)
+            .iter()
+            .enumerate()
+            .all(|(index, command)| manual_validation_receipt_exists(decisions, index, command))
+}
+
+/// Build the narrowest host-owned Python suite guidance that can be derived
+/// from artifacts the user requested or the agent changed. This deliberately
+/// activates only for an explicit `unittest` contract: pytest-style files may
+/// require third-party collection semantics and must remain model-selected.
+/// Grouping by test directory makes the command exercise the authored suite,
+/// rather than allowing an unrelated successful test runner to satisfy the
+/// completion gate. The returned command is never auto-executed: authored test
+/// files are arbitrary code and remain subject to the ordinary shell approval.
+fn host_python_unittest_command(
+    objective: &str,
+    completed_work: &[String],
+    required_artifacts: &BTreeSet<String>,
+) -> Option<String> {
+    let objective = objective.to_ascii_lowercase();
+    if !objective.contains("unittest") {
+        return None;
+    }
+    let directories = workspace_test_artifacts(completed_work, required_artifacts)
+        .into_iter()
+        .filter(|path| path.to_ascii_lowercase().ends_with(".py"))
+        .filter(|path| {
+            path.chars().all(|character| {
+                character.is_ascii_alphanumeric()
+                    || matches!(character, '.' | '_' | '-' | '/' | '\\')
+            })
+        })
+        .map(|path| {
+            path.rsplit_once('/')
+                .map_or_else(|| ".".to_string(), |(parent, _)| parent.to_string())
+        })
+        .collect::<BTreeSet<_>>();
+    if directories.is_empty() {
+        return None;
+    }
+    #[cfg(windows)]
+    let launcher = "py";
+    #[cfg(not(windows))]
+    let launcher = "python3";
+    Some(
+        directories
+            .into_iter()
+            .map(|directory| format!("{launcher} -m unittest discover -s {directory}"))
+            .collect::<Vec<_>>()
+            .join(" && "),
+    )
+}
+
 /// Deterministic acceptance checks for explicit behavioral contracts that are
 /// cheap to prove from source. These are deliberately narrow and only activate
 /// when the user named the exact domain; they complement model review instead
@@ -894,6 +1423,15 @@ pub fn run_loop(
                     reporter.notice(&format!("context paging relevance error: {error}"));
                     return LoopEnd::DriverError;
                 }
+                if invalidate_stale_source_fingerprint(&mut runtime) {
+                    reporter.notice(
+                        "persisted verification invalidated because completed source changed",
+                    );
+                    if let Err(error) = runtime.save() {
+                        reporter.notice(&format!("context paging state error: {error}"));
+                        return LoopEnd::DriverError;
+                    }
+                }
                 reporter.notice(&format!(
                     "context paging enabled: task {} ({} indexed symbols)",
                     runtime.task_id,
@@ -1036,7 +1574,11 @@ pub fn run_loop(
     // still being authored lets multi-file tasks proceed; once work is claimed
     // done, however, the next action must be behavioral verification rather
     // than another completion/no-op loop.
-    let mut paging_shell_verification_required = false;
+    let mut paging_shell_verification_required = context_paging.as_ref().is_some_and(|runtime| {
+        runtime.ledger.verification_state.status == "pending"
+            && runtime.ledger.current_focus.contains("run_shell")
+            && tools.iter().any(|tool| tool.name == "run_shell")
+    });
     let mut python_alias_guidance_sent = false;
     let mut direct_python_rewrite_required = false;
     let mut direct_python_rewrite_violations = 0usize;
@@ -1122,6 +1664,14 @@ pub fn run_loop(
                 reporter.notice(&format!("context paging refresh error: {error}"));
                 return LoopEnd::DriverError;
             }
+            if invalidate_stale_source_fingerprint(runtime) {
+                reporter
+                    .notice("persisted verification invalidated because completed source changed");
+                if let Err(error) = runtime.save() {
+                    reporter.notice(&format!("context paging state error: {error}"));
+                    return LoopEnd::DriverError;
+                }
+            }
             if let Err(error) = runtime.seed_relevance_from_query(&task_objective, 1) {
                 reporter.notice(&format!("context paging relevance error: {error}"));
                 return LoopEnd::DriverError;
@@ -1160,6 +1710,12 @@ pub fn run_loop(
                 && matches!(
                     runtime.ledger.verification_state.status.as_str(),
                     "passed" | "complete"
+                )
+                && execution_verification_requirements_satisfied(
+                    &task_objective,
+                    &runtime.ledger.completed_work,
+                    &required_workspace_artifacts,
+                    &runtime.ledger.decisions,
                 )
             {
                 ActionPhase::Complete
@@ -1432,6 +1988,7 @@ pub fn run_loop(
         {
             match parse_typed_action(text) {
                 Ok(action @ TypedModelAction::NeedContext { .. }) => {
+                    let mut loaded_new_page = false;
                     match runtime.execute_typed_action(&action, capsule) {
                         Ok(Some(page)) => {
                             paging_discovery_complete = true;
@@ -1461,6 +2018,7 @@ pub fn run_loop(
                                     page.symbol_id
                                 ));
                             } else {
+                                loaded_new_page = true;
                                 reporter.notice(&format!(
                                     "context page loaded: {} ({}:{}-{})",
                                     page.symbol_id, page.file, page.start_line, page.end_line
@@ -1481,7 +2039,13 @@ pub fn run_loop(
                             reporter.notice(&format!("context page fault failed: {error}"));
                         }
                     }
-                    paging_no_progress!();
+                    if loaded_new_page {
+                        call_counts.clear();
+                        recovered_call_signatures.clear();
+                        paging_nonprogress_steps = 0;
+                    } else {
+                        paging_no_progress!();
+                    }
                     continue;
                 }
                 Ok(action @ TypedModelAction::Patch { .. }) => {
@@ -1606,37 +2170,64 @@ pub fn run_loop(
                     // Verification is host-owned: the model may not author a
                     // verified completion. COMPLETE is accepted only after the
                     // host-run verification actually passed.
-                    let verified = matches!(
+                    let execution_verified = matches!(
                         runtime.ledger.verification_state.status.as_str(),
                         "passed" | "complete"
-                    );
+                    ) && execution_verification_requirements_satisfied(
+                        &task_objective,
+                        &runtime.ledger.completed_work,
+                        &required_workspace_artifacts,
+                        &runtime.ledger.decisions,
+                    ) && source_fingerprint_receipt_is_current(runtime);
+                    let source_capture_complete = !require_workspace_change
+                        || (pending_verification_paths.is_empty()
+                            && semantic_contract_findings.is_empty());
+                    let verified = execution_verified && source_capture_complete;
                     let missing_artifacts =
                         missing_required_artifacts(sandbox.root(), &required_workspace_artifacts);
                     if !verified || !missing_artifacts.is_empty() || summary.trim().is_empty() {
-                        if !verified
+                        if !execution_verified
                             && missing_artifacts.is_empty()
                             && tools.iter().any(|tool| tool.name == "run_shell")
                         {
                             paging_shell_verification_required = true;
                         }
-                        let reason = if missing_artifacts.is_empty() {
-                            "host verification has not passed".to_string()
-                        } else {
+                        let reason = if !missing_artifacts.is_empty() {
                             format!(
                                 "required artifacts are still missing: {}",
                                 missing_artifacts.join(", ")
                             )
+                        } else if !source_capture_complete {
+                            format!(
+                                "post-write source capture and semantic review are still pending ({} paths, {} findings)",
+                                pending_verification_paths.len(),
+                                semantic_contract_findings.len()
+                            )
+                        } else {
+                            "host verification has not passed".to_string()
                         };
                         runtime
                             .ledger
                             .failed_attempts
                             .push(format!("COMPLETE rejected: {reason}"));
-                        runtime.ledger.current_focus = if missing_artifacts.is_empty() {
-                            "Run the narrowest relevant verification before completing".into()
-                        } else {
+                        runtime.ledger.current_focus = if !missing_artifacts.is_empty() {
                             format!(
                                 "Create the remaining required artifacts: {}",
                                 missing_artifacts.join(", ")
+                            )
+                        } else if !source_capture_complete {
+                            concat!(
+                                "Post-write exact-source capture is still pending. Return the ",
+                                "completion summary in plain text so the host can capture and ",
+                                "review every changed source file before accepting completion."
+                            )
+                            .into()
+                        } else {
+                            verification_requirements_focus(
+                                &task_objective,
+                                &runtime.ledger.completed_work,
+                                &required_workspace_artifacts,
+                                &runtime.ledger.decisions,
                             )
                         };
                         if let Err(error) = runtime.save() {
@@ -1800,6 +2391,13 @@ pub fn run_loop(
                 if driver.last_step_capped() && !text.trim().is_empty() {
                     if let Some(runtime) = context_paging.as_mut().filter(|runtime| {
                         runtime.ledger.verification_state.status == "passed"
+                            && execution_verification_requirements_satisfied(
+                                &task_objective,
+                                &runtime.ledger.completed_work,
+                                &required_workspace_artifacts,
+                                &runtime.ledger.decisions,
+                            )
+                            && source_fingerprint_receipt_is_current(runtime)
                             && paging_capsule
                                 .as_ref()
                                 .is_some_and(|capsule| capsule.tool_names.is_empty())
@@ -1938,7 +2536,10 @@ pub fn run_loop(
                                     .push((relative.clone(), outcome.text().to_string()));
                                 pending_verification_paths.remove(&relative);
                                 observed_workspace = true;
-                                successful_workspace_reads.insert(relative);
+                                if successful_workspace_reads.insert(relative) {
+                                    call_counts.clear();
+                                    recovered_call_signatures.clear();
+                                }
                                 workspace_observations
                                     .push(("read_file".into(), outcome.text().to_string()));
                             }
@@ -2033,7 +2634,40 @@ pub fn run_loop(
                                 semantic_contract_findings.join("\n- ")
                             ));
                         } else if pending_verification_paths.is_empty() {
-                            push_reminder(history, "Camelid captured the exact final changed source above as retained verification evidence. Do not repeat the previous completion claim. Review the ACTUAL implementation against EVERY explicit user requirement and its state transitions. A comment, filename, UI label, syntax check, or claim is not behavior. If anything is missing or incorrect, your NEXT tool call must edit_file or write_file to fix it. Otherwise run an appropriate syntax/build/test command when available, then answer concisely.");
+                            let mut required_execution = None;
+                            if let Some(runtime) = context_paging.as_mut() {
+                                if !execution_verification_requirements_satisfied(
+                                    &task_objective,
+                                    &runtime.ledger.completed_work,
+                                    &required_workspace_artifacts,
+                                    &runtime.ledger.decisions,
+                                ) {
+                                    let focus = verification_requirements_focus(
+                                        &task_objective,
+                                        &runtime.ledger.completed_work,
+                                        &required_workspace_artifacts,
+                                        &runtime.ledger.decisions,
+                                    );
+                                    runtime.ledger.verification_state.status = "pending".into();
+                                    runtime.ledger.current_focus = focus.clone();
+                                    paging_shell_verification_required =
+                                        tools.iter().any(|tool| tool.name == "run_shell");
+                                    required_execution = Some(focus);
+                                    if let Err(error) = runtime.save() {
+                                        reporter.notice(&format!(
+                                            "context paging state error: {error}"
+                                        ));
+                                        return LoopEnd::DriverError;
+                                    }
+                                }
+                            }
+                            if let Some(focus) = required_execution {
+                                push_reminder(history, &format!(
+                                    "Camelid captured the exact final changed source and syntax-checked every Python file. Syntax is not completion evidence for this objective. {focus}"
+                                ));
+                            } else {
+                                push_reminder(history, "Camelid captured the exact final changed source above as retained verification evidence. Do not repeat the previous completion claim. Review the ACTUAL implementation against EVERY explicit user requirement and its state transitions. A comment, filename, UI label, syntax check, or claim is not behavior. If anything is missing or incorrect, your NEXT tool call must edit_file or write_file to fix it. Otherwise run an appropriate syntax/build/test command when available, then answer concisely.");
+                            }
                         } else {
                             push_reminder(history, &format!(
                                 "Camelid could not capture every changed path: {}. Use read_file on those exact paths before answering.",
@@ -2140,7 +2774,12 @@ pub fn run_loop(
                     let verified = matches!(
                         runtime.ledger.verification_state.status.as_str(),
                         "passed" | "complete"
-                    );
+                    ) && execution_verification_requirements_satisfied(
+                        &task_objective,
+                        &runtime.ledger.completed_work,
+                        &required_workspace_artifacts,
+                        &runtime.ledger.decisions,
+                    ) && source_fingerprint_receipt_is_current(runtime);
                     let missing_artifacts =
                         missing_required_artifacts(sandbox.root(), &required_workspace_artifacts);
                     if workspace_changed && verified && missing_artifacts.is_empty() {
@@ -2164,7 +2803,12 @@ pub fn run_loop(
                             .failed_attempts
                             .push(format!("Prose completion rejected: {reason}"));
                         runtime.ledger.current_focus = if missing_artifacts.is_empty() {
-                            "Run the narrowest relevant verification before completing".into()
+                            verification_requirements_focus(
+                                &task_objective,
+                                &runtime.ledger.completed_work,
+                                &required_workspace_artifacts,
+                                &runtime.ledger.decisions,
+                            )
                         } else {
                             format!(
                                 "Create the remaining required artifacts: {}",
@@ -2382,7 +3026,9 @@ pub fn run_loop(
                             reporter.tool_call(&format!("{call_name}(?)"));
                             reporter.tool_result(&call_name, &ToolOutcome::Err(message.clone()));
                             reporter.notice(&message);
-                            paging_no_progress!();
+                            call_counts.clear();
+                            recovered_call_signatures.clear();
+                            paging_nonprogress_steps = 0;
                             continue;
                         }
                         let message = error.to_string();
@@ -2664,7 +3310,9 @@ pub fn run_loop(
                             &action,
                             Action::RunShell { .. } | Action::RunWindowsCommand { .. }
                         )
-                        && (!workspace_changed || shell_action_is_mutation_shaped(&action))
+                        && (!workspace_changed
+                            || context_paging.is_some()
+                            || shell_action_is_mutation_shaped(&action))
                     {
                         Some(workspace_snapshot(sandbox.root()))
                     } else {
@@ -2711,6 +3359,24 @@ pub fn run_loop(
                         shell_workspace_before.as_ref().and_then(|before| {
                             workspace_changes_since(sandbox.root(), action_started_at, before)
                         });
+                    let shell_changed_source = shell_workspace_changes
+                        .as_ref()
+                        .is_some_and(workspace_changes_touch_source);
+                    let shell_changed_source_paths = shell_workspace_changes
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|changes| changes.sample_paths.iter())
+                        .map(|path| normalize_workspace_path(path))
+                        .filter(|path| path_is_source_code(path))
+                        .collect::<Vec<_>>();
+                    let shell_source_scan_truncated = shell_workspace_changes
+                        .as_ref()
+                        .is_some_and(|changes| changes.scan_truncated);
+                    if shell_changed_source {
+                        call_counts.clear();
+                        recovered_call_signatures.clear();
+                        paging_nonprogress_steps = 0;
+                    }
                     let outcome = if let Some(changes) = shell_workspace_changes.as_ref() {
                         shell_outcome_with_workspace_evidence(outcome, changes)
                     } else if !outcome.is_err()
@@ -2766,7 +3432,10 @@ pub fn run_loop(
                     if let Some(changes) = shell_workspace_changes {
                         workspace_changed = true;
                         for relative in changes.sample_paths {
-                            pending_verification_paths.insert(normalize_workspace_path(&relative));
+                            let relative = normalize_workspace_path(&relative);
+                            if path_is_source_code(&relative) {
+                                pending_verification_paths.insert(relative);
+                            }
                         }
                     }
                     let read_captures_pending_path = workspace_changed
@@ -2800,8 +3469,12 @@ pub fn run_loop(
                             paging_discovery_complete = true;
                         }
                         if let Action::ReadFile { path, .. } = &action {
-                            successful_workspace_reads
-                                .insert(normalize_workspace_path(&sandbox.rel(path)));
+                            if successful_workspace_reads
+                                .insert(normalize_workspace_path(&sandbox.rel(path)))
+                            {
+                                call_counts.clear();
+                                recovered_call_signatures.clear();
+                            }
                         }
                         workspace_observations
                             .push((action.tool_name().to_string(), outcome.text().to_string()));
@@ -2946,6 +3619,18 @@ pub fn run_loop(
                     }
                     #[cfg(not(windows))]
                     let python_launcher_just_verified = false;
+                    let durable_modification_succeeded = !outcome.is_err()
+                        && matches!(&action, Action::WriteFile { .. } | Action::EditFile { .. });
+                    if durable_modification_succeeded {
+                        // A committed file mutation is the strongest progress
+                        // signal in this loop. Old repeated-call recovery and
+                        // malformed-action strikes must not shorten the fresh
+                        // repair cycle it just opened.
+                        call_counts.clear();
+                        recovered_call_signatures.clear();
+                        paging_action_rejections = 0;
+                        paging_typed_patch_rejections = 0;
+                    }
                     let churning = note_error_argument_churn(
                         &mut error_argument_churn,
                         name,
@@ -3046,6 +3731,9 @@ pub fn run_loop(
                                 runtime.ledger.verification_state.status = "pending".into();
                                 runtime.ledger.verification_state.failing_diagnostic = None;
                                 runtime.ledger.verification_state.verified_symbols.clear();
+                                clear_execution_verification_evidence(
+                                    &mut runtime.ledger.decisions,
+                                );
                                 paging_diagnostic = None;
                                 if let Err(error) = runtime.refresh_project().and_then(|_| {
                                     runtime.seed_relevance_from_query(&relative, 1).map(|_| ())
@@ -3058,6 +3746,55 @@ pub fn run_loop(
                             Action::RunShell { command } => {
                                 runtime.ledger.verification_state.last_command =
                                     Some(command.clone());
+                                if shell_changed_source {
+                                    // Shell commands are not transactional. Any observed source
+                                    // mutation invalidates receipts earned against the old bytes,
+                                    // even when the command eventually exits non-zero. A verifier
+                                    // later in this same status-propagating chain may earn fresh
+                                    // evidence below; one that ran before the mutation may not.
+                                    clear_execution_verification_evidence(
+                                        &mut runtime.ledger.decisions,
+                                    );
+                                    runtime.ledger.verification_state.status = "pending".into();
+                                    runtime.ledger.verification_state.failing_diagnostic = None;
+                                    runtime.ledger.verification_state.verified_symbols.clear();
+                                    for path in &shell_changed_source_paths {
+                                        let already_tracked = runtime
+                                            .ledger
+                                            .completed_work
+                                            .iter()
+                                            .filter_map(|entry| {
+                                                entry
+                                                    .split_once(" changed ")
+                                                    .map(|(_, existing)| existing)
+                                            })
+                                            .any(|existing| {
+                                                normalize_workspace_path(existing) == *path
+                                            });
+                                        if !already_tracked {
+                                            runtime
+                                                .ledger
+                                                .completed_work
+                                                .push(format!("run_shell changed {path}"));
+                                        }
+                                    }
+                                    if shell_source_scan_truncated
+                                        && !runtime.ledger.decisions.iter().any(|decision| {
+                                            decision == SOURCE_FINGERPRINT_INCOMPLETE_MARKER
+                                        })
+                                    {
+                                        runtime
+                                            .ledger
+                                            .decisions
+                                            .push(SOURCE_FINGERPRINT_INCOMPLETE_MARKER.into());
+                                    }
+                                    if let Err(error) = runtime.refresh_project() {
+                                        reporter.notice(&format!(
+                                            "context paging shell-mutation reindex error: {error}"
+                                        ));
+                                        return LoopEnd::DriverError;
+                                    }
+                                }
                                 let zero_tests = !raw_outcome.is_err()
                                     && paging_verification_reports_zero_tests(
                                         command,
@@ -3065,6 +3802,53 @@ pub fn run_loop(
                                     );
                                 let missing_python_alias = raw_outcome.is_err()
                                     && missing_posix_python_alias(command, raw_outcome.text());
+                                let package_module_retry = raw_outcome
+                                    .is_err()
+                                    .then(|| {
+                                        python_package_module_retry_command(
+                                            command,
+                                            raw_outcome.text(),
+                                        )
+                                    })
+                                    .flatten();
+                                let tests_required = objective_requests_test_execution(
+                                    &task_objective,
+                                    &runtime.ledger.completed_work,
+                                    &required_workspace_artifacts,
+                                );
+                                let manual_obligations = manual_validation_obligations(
+                                    &task_objective,
+                                    &runtime.ledger.completed_work,
+                                    &required_workspace_artifacts,
+                                );
+                                let next_manual_obligation = next_manual_validation_obligation(
+                                    &manual_obligations,
+                                    &runtime.ledger.decisions,
+                                )
+                                .map(|(_, command)| command.to_string());
+                                let relevant_verification = !raw_outcome.is_err()
+                                    && paging_verification_command_is_relevant(
+                                        command,
+                                        &runtime.ledger.completed_work,
+                                        &required_workspace_artifacts,
+                                        &task_objective,
+                                    )
+                                    && !shell_changed_source;
+                                let relevant_test_execution = tests_required
+                                    && relevant_verification
+                                    && verification_command_kind(command)
+                                        == Some(VerificationCommandKind::TestExecution);
+                                let python_tests_confirmed = !relevant_test_execution
+                                    || !verification_command_runs_python_tests(command)
+                                    || paging_python_verification_reports_executed_tests(
+                                        command,
+                                        raw_outcome.text(),
+                                    );
+                                let relevant_manual_execution = !raw_outcome.is_err()
+                                    && next_manual_obligation.as_deref().is_some_and(|expected| {
+                                        manual_validation_command_matches(command, expected)
+                                    })
+                                    && !shell_changed_source;
                                 if missing_python_alias {
                                     paging_shell_verification_required = workspace_changed
                                         && tools.iter().any(|tool| tool.name == "run_shell");
@@ -3079,6 +3863,18 @@ pub fn run_loop(
                                         "Retry the same verification now with `python3`."
                                     )
                                     .into();
+                                } else if let Some(retry) = package_module_retry {
+                                    paging_shell_verification_required = workspace_changed
+                                        && tools.iter().any(|tool| tool.name == "run_shell");
+                                    paging_diagnostic = None;
+                                    runtime.ledger.verification_state.status = "pending".into();
+                                    runtime.ledger.verification_state.failing_diagnostic = None;
+                                    runtime.ledger.failed_attempts.push(format!(
+                                        "`{command}` invoked a package script by filename; retry from the workspace root with `{retry}`"
+                                    ));
+                                    runtime.ledger.current_focus = format!(
+                                        "The application was invoked with the wrong Python import root; the source has not yet failed verification. Retry now with run_shell using exactly `{retry}`."
+                                    );
                                 } else if raw_outcome.is_err() {
                                     // The diagnostic needs source repair, so
                                     // release the verification-only tool gate.
@@ -3086,25 +3882,108 @@ pub fn run_loop(
                                     runtime.ledger.verification_state.status = "failed".into();
                                     runtime.ledger.verification_state.failing_diagnostic =
                                         Some(compact.raw_reference.clone());
+                                    runtime.ledger.current_focus = format!(
+                                        "`{command}` failed. Read the persisted diagnostic, correct the reported source or runtime defect, then rerun the relevant verification."
+                                    );
                                     runtime.metrics.verification_retries =
                                         runtime.metrics.verification_retries.saturating_add(1);
-                                } else if paging_verification_command_is_relevant(
-                                    command,
-                                    &runtime.ledger.completed_work,
-                                    &required_workspace_artifacts,
-                                    &task_objective,
-                                ) && !zero_tests
+                                } else if zero_tests
+                                    && verification_command_runs_python_tests(command)
                                 {
-                                    paging_shell_verification_required = false;
-                                    runtime.ledger.verification_state.status = "passed".into();
+                                    paging_shell_verification_required = workspace_changed
+                                        && tools.iter().any(|tool| tool.name == "run_shell");
+                                    runtime.ledger.verification_state.status = "pending".into();
                                     runtime.ledger.verification_state.failing_diagnostic = None;
-                                    // Behavioral execution and exact final-byte
-                                    // capture are independent gates. A passing
-                                    // suite may never import an unused malformed
-                                    // artifact, so retain every pending path for
-                                    // the host-owned post-write reread.
-                                    runtime.ledger.current_focus =
-                                        "Return a concise verified completion summary".into();
+                                    runtime.ledger.failed_attempts.push(format!(
+                                        "`{command}` exited successfully but discovered zero tests"
+                                    ));
+                                    runtime.ledger.current_focus = concat!(
+                                        "The last test command discovered zero tests and did not verify anything. ",
+                                        "Run the actual suite from the directory that contains the changed tests."
+                                    )
+                                    .into();
+                                } else if relevant_test_execution && !python_tests_confirmed {
+                                    paging_shell_verification_required = workspace_changed
+                                        && tools.iter().any(|tool| tool.name == "run_shell");
+                                    runtime.ledger.verification_state.status = "pending".into();
+                                    runtime.ledger.verification_state.failing_diagnostic = None;
+                                    runtime.ledger.failed_attempts.push(format!(
+                                        "`{command}` exited successfully but did not report executing any tests"
+                                    ));
+                                    runtime.ledger.current_focus = concat!(
+                                        "The last Python test command did not expose an affirmative executed-test count. ",
+                                        "Run the requested suite without redirecting or hiding its output."
+                                    )
+                                    .into();
+                                } else if relevant_verification || relevant_manual_execution {
+                                    let mut recorded_execution_evidence = false;
+                                    if relevant_test_execution {
+                                        recorded_execution_evidence |= record_verification_evidence(
+                                            &mut runtime.ledger.decisions,
+                                            TEST_EXECUTION_EVIDENCE_PREFIX,
+                                            command,
+                                        );
+                                    }
+                                    if relevant_manual_execution {
+                                        recorded_execution_evidence |=
+                                            record_manual_validation_evidence(
+                                                &mut runtime.ledger.decisions,
+                                                &manual_obligations,
+                                                command,
+                                            );
+                                    }
+                                    let execution_requirements_satisfied =
+                                        execution_verification_requirements_satisfied(
+                                            &task_objective,
+                                            &runtime.ledger.completed_work,
+                                            &required_workspace_artifacts,
+                                            &runtime.ledger.decisions,
+                                        );
+                                    runtime.ledger.verification_state.failing_diagnostic = None;
+                                    if execution_requirements_satisfied {
+                                        recorded_execution_evidence |=
+                                            record_source_fingerprint(runtime);
+                                    }
+                                    let source_fingerprint_current =
+                                        source_fingerprint_receipt_is_current(runtime);
+                                    if execution_requirements_satisfied
+                                        && source_fingerprint_current
+                                    {
+                                        paging_shell_verification_required = false;
+                                        runtime.ledger.verification_state.status = "passed".into();
+                                        // Behavioral execution and exact final-byte
+                                        // capture are independent gates. A passing
+                                        // suite may never import an unused malformed
+                                        // artifact, so retain every pending path for
+                                        // the host-owned post-write reread.
+                                        runtime.ledger.current_focus =
+                                            "Return a concise verified completion summary".into();
+                                    } else {
+                                        paging_shell_verification_required =
+                                            !execution_requirements_satisfied
+                                                && workspace_changed
+                                                && tools
+                                                    .iter()
+                                                    .any(|tool| tool.name == "run_shell");
+                                        runtime.ledger.verification_state.status = "pending".into();
+                                        runtime.ledger.current_focus =
+                                            if execution_requirements_satisfied
+                                                && !source_fingerprint_current
+                                            {
+                                                "Verification could not be bound to every current source hash; recapture the changed source before completing".into()
+                                            } else {
+                                                verification_requirements_focus(
+                                                    &task_objective,
+                                                    &runtime.ledger.completed_work,
+                                                    &required_workspace_artifacts,
+                                                    &runtime.ledger.decisions,
+                                                )
+                                            };
+                                    }
+                                    if recorded_execution_evidence {
+                                        call_counts.clear();
+                                        recovered_call_signatures.clear();
+                                    }
                                 } else {
                                     paging_shell_verification_required = workspace_changed
                                         && tools.iter().any(|tool| tool.name == "run_shell");
@@ -3123,12 +4002,13 @@ pub fn run_loop(
                                         runtime.ledger.failed_attempts.push(format!(
                                             "`{command}` succeeded but did not verify the changed/requested artifacts"
                                         ));
-                                        runtime.ledger.current_focus = concat!(
-                                            "The last shell command was only a probe, not verification. ",
-                                            "Run a relevant test, build, lint, type-check, syntax check, ",
-                                            "or execute the changed artifact."
-                                        )
-                                        .into();
+                                        runtime.ledger.current_focus =
+                                            verification_requirements_focus(
+                                                &task_objective,
+                                                &runtime.ledger.completed_work,
+                                                &required_workspace_artifacts,
+                                                &runtime.ledger.decisions,
+                                            );
                                     }
                                 }
                             }
@@ -3165,12 +4045,38 @@ pub fn run_loop(
                                                     &task_objective,
                                                 )
                                         });
-                                    let command_already_passed = matches!(
+                                    let command_previously_passed = matches!(
                                         runtime.ledger.verification_state.status.as_str(),
                                         "passed" | "complete"
-                                    );
-                                    if !shell_verification_available
-                                        || host_verification_passed
+                                    )
+                                        && execution_verification_requirements_satisfied(
+                                            &task_objective,
+                                            &runtime.ledger.completed_work,
+                                            &required_workspace_artifacts,
+                                            &runtime.ledger.decisions,
+                                        );
+                                    let execution_requirements_satisfied =
+                                        execution_verification_requirements_satisfied(
+                                            &task_objective,
+                                            &runtime.ledger.completed_work,
+                                            &required_workspace_artifacts,
+                                            &runtime.ledger.decisions,
+                                        );
+                                    let pass_candidate = ((host_verification_passed
+                                        || !shell_verification_available)
+                                        && execution_requirements_satisfied)
+                                        || command_previously_passed;
+                                    if pass_candidate {
+                                        record_source_fingerprint(runtime);
+                                    }
+                                    let source_fingerprint_current =
+                                        source_fingerprint_receipt_is_current(runtime);
+                                    let command_already_passed =
+                                        command_previously_passed && source_fingerprint_current;
+                                    if (((host_verification_passed
+                                        || !shell_verification_available)
+                                        && execution_requirements_satisfied)
+                                        && source_fingerprint_current)
                                         || command_already_passed
                                     {
                                         runtime.ledger.verification_state.status = "passed".into();
@@ -3183,7 +4089,19 @@ pub fn run_loop(
                                         // completing after its first reread.
                                         runtime.ledger.verification_state.status = "pending".into();
                                         runtime.ledger.current_focus =
-                                            "Verification pending".into();
+                                            if execution_requirements_satisfied {
+                                                "Verification pending".into()
+                                            } else {
+                                                verification_requirements_focus(
+                                                    &task_objective,
+                                                    &runtime.ledger.completed_work,
+                                                    &required_workspace_artifacts,
+                                                    &runtime.ledger.decisions,
+                                                )
+                                            };
+                                        paging_shell_verification_required =
+                                            shell_verification_available
+                                                && !execution_requirements_satisfied;
                                     }
                                     paging_diagnostic = None;
                                 } else {
@@ -3806,6 +4724,10 @@ fn shell_action_is_mutation_shaped(action: &Action) -> bool {
     let Some(command) = shell_action_command(action) else {
         return false;
     };
+    shell_command_is_mutation_shaped(command)
+}
+
+fn shell_command_is_mutation_shaped(command: &str) -> bool {
     let lowered = command.to_ascii_lowercase();
     if shell_projection_has_file_redirection(&lowered) {
         return true;
@@ -3854,6 +4776,21 @@ fn shell_action_is_mutation_shaped(action: &Action) -> bool {
     ]
     .iter()
     .any(|marker| lowered.contains(marker))
+}
+
+fn path_is_source_code(path: &str) -> bool {
+    completed_source_paths(&[format!("shell changed {}", normalize_workspace_path(path))])
+        .iter()
+        .next()
+        .is_some()
+}
+
+fn workspace_changes_touch_source(changes: &WorkspaceChanges) -> bool {
+    changes.scan_truncated
+        || changes
+            .sample_paths
+            .iter()
+            .any(|path| path_is_source_code(path))
 }
 
 fn shell_no_workspace_change_error(action: &Action, shell_output: &str) -> String {
@@ -4012,6 +4949,105 @@ fn missing_posix_python_alias(command: &str, output: &str) -> bool {
                 || output.contains("python: not found")
                 || output.contains("env: python: no such file"))
     }
+}
+
+/// Running a package-owned script by filename changes Python's import root and
+/// commonly produces a misleading `No module named <package>` failure. Preserve
+/// the original CLI arguments but steer the next approved shell call to module
+/// form from the workspace root; this is an invocation repair, not source-fail
+/// evidence.
+fn python_package_module_retry_command(command: &str, output: &str) -> Option<String> {
+    let output = output.to_ascii_lowercase();
+    let relative_import = output.contains("attempted relative import with no known parent package");
+    let missing_module = output.find("no module named").and_then(|start| {
+        let rest = output[start + "no module named".len()..].trim_start();
+        let rest = rest.trim_start_matches(['\'', '"']);
+        let module = rest
+            .split(|character: char| {
+                character.is_ascii_whitespace() || matches!(character, '\'' | '"' | ':' | ';')
+            })
+            .next()
+            .unwrap_or_default();
+        (!module.is_empty()).then_some(module.to_string())
+    });
+    if !relative_import && missing_module.is_none() {
+        return None;
+    }
+    #[cfg(windows)]
+    let launcher = "py";
+    #[cfg(not(windows))]
+    let launcher = "python3";
+    for segment in shell_command_segments(command) {
+        let words = segment
+            .split_whitespace()
+            .map(normalized_shell_word)
+            .filter(|word| !word.is_empty())
+            .collect::<Vec<_>>();
+        let Some(executable) = words.first().map(|word| shell_executable_name(word)) else {
+            continue;
+        };
+        let executable = executable.strip_suffix(".exe").unwrap_or(executable);
+        if !matches!(executable, "python" | "python3" | "py") && !executable.starts_with("python3.")
+        {
+            continue;
+        }
+        let Some(script) = words
+            .iter()
+            .skip(1)
+            .find(|word| word.contains('/') && word.ends_with(".py"))
+        else {
+            continue;
+        };
+        if !script.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | '/' | '\\')
+        }) {
+            continue;
+        }
+        let Some(module) = python_module_for_path(script) else {
+            continue;
+        };
+        if module.split('.').any(|component| {
+            component.is_empty()
+                || !component
+                    .chars()
+                    .next()
+                    .is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
+                || !component
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        }) {
+            continue;
+        }
+        if !relative_import {
+            let script_package = module.split('.').next().unwrap_or_default();
+            let missing_package = missing_module
+                .as_deref()
+                .and_then(|missing| missing.split('.').next())
+                .unwrap_or_default();
+            if script_package.is_empty() || script_package != missing_package {
+                continue;
+            }
+        }
+        let lower_segment = segment.to_ascii_lowercase().replace('\\', "/");
+        let Some(script_start) = lower_segment.find(script) else {
+            continue;
+        };
+        let script_end = script_start + script.len();
+        let quoted_script = lower_segment
+            .as_bytes()
+            .get(script_start.wrapping_sub(1))
+            .is_some_and(|byte| matches!(byte, b'\'' | b'"'))
+            || lower_segment
+                .as_bytes()
+                .get(script_end)
+                .is_some_and(|byte| matches!(byte, b'\'' | b'"'));
+        if quoted_script {
+            continue;
+        }
+        let suffix = segment.get(script_end..).unwrap_or_default();
+        return Some(format!("{launcher} -m {module}{suffix}"));
+    }
+    None
 }
 
 /// Everything outside `<think>…</think>`, trimmed.
@@ -4294,7 +5330,78 @@ enum VerificationCommandKind {
     TestExecution,
 }
 
+fn shell_segment_redirects_output(segment: &str) -> bool {
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut escaped = false;
+    for byte in segment.bytes() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_single_quote {
+            if byte == b'\'' {
+                in_single_quote = false;
+            }
+            continue;
+        }
+        if in_double_quote {
+            match byte {
+                b'"' => in_double_quote = false,
+                b'\\' => escaped = true,
+                _ => {}
+            }
+            continue;
+        }
+        match byte {
+            b'\'' => in_single_quote = true,
+            b'"' => in_double_quote = true,
+            b'\\' => escaped = true,
+            b'>' => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn shell_projection_has_unquoted_sequence_separator(command: &str) -> bool {
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut escaped = false;
+    for byte in command.bytes() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_single_quote {
+            if byte == b'\'' {
+                in_single_quote = false;
+            }
+            continue;
+        }
+        if in_double_quote {
+            match byte {
+                b'"' => in_double_quote = false,
+                b'\\' | b'`' => escaped = true,
+                _ => {}
+            }
+            continue;
+        }
+        match byte {
+            b'\'' => in_single_quote = true,
+            b'"' => in_double_quote = true,
+            b'\\' | b'`' => escaped = true,
+            b';' | b'\n' | b'\r' => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 fn verifier_segment_kind(segment: &str) -> Option<VerificationCommandKind> {
+    if shell_segment_redirects_output(segment) {
+        return None;
+    }
     let words = segment
         .split_whitespace()
         .map(normalized_shell_word)
@@ -4434,6 +5541,127 @@ fn verification_command_kind(command: &str) -> Option<VerificationCommandKind> {
         })
 }
 
+fn verifier_segment_runs_python_tests(segment: &str) -> bool {
+    if verifier_segment_kind(segment) != Some(VerificationCommandKind::TestExecution) {
+        return false;
+    }
+    let words = segment
+        .split_whitespace()
+        .map(normalized_shell_word)
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    let mut index = 0usize;
+    while words
+        .get(index)
+        .is_some_and(|word| word == "&" || (!word.starts_with('-') && word.contains('=')))
+    {
+        index += 1;
+    }
+    if words
+        .get(index)
+        .is_some_and(|word| shell_executable_name(word) == "env")
+    {
+        index += 1;
+        while words.get(index).is_some_and(|word| {
+            word.starts_with('-') || (!word.starts_with('-') && word.contains('='))
+        }) {
+            index += 1;
+        }
+    }
+    let Some(executable) = words.get(index).map(|word| shell_executable_name(word)) else {
+        return false;
+    };
+    let executable = executable.strip_suffix(".exe").unwrap_or(executable);
+    let args = &words[index + 1..];
+    match executable {
+        "pytest" | "py.test" => true,
+        "python" | "python3" | "py" => args
+            .windows(2)
+            .any(|pair| pair[0] == "-m" && matches!(pair[1].as_str(), "pytest" | "unittest")),
+        executable if executable.starts_with("python3.") => args
+            .windows(2)
+            .any(|pair| pair[0] == "-m" && matches!(pair[1].as_str(), "pytest" | "unittest")),
+        "uv" | "poetry" => {
+            args.first().is_some_and(|word| word == "run")
+                && args
+                    .get(1)
+                    .is_some_and(|word| matches!(shell_executable_name(word), "pytest" | "py.test"))
+        }
+        _ => false,
+    }
+}
+
+fn verification_command_runs_python_tests(command: &str) -> bool {
+    shell_command_segments(command)
+        .into_iter()
+        .any(verifier_segment_runs_python_tests)
+}
+
+fn verification_command_covers_python_tests(command: &str, test_artifacts: &[String]) -> bool {
+    if shell_projection_has_unquoted_sequence_separator(command) {
+        return false;
+    }
+    let status_segments = shell_command_segments(command);
+    if status_segments.is_empty()
+        || status_segments
+            .iter()
+            .any(|segment| !verifier_segment_runs_python_tests(segment))
+    {
+        return false;
+    }
+    let verifier_segments = status_segments;
+    if test_artifacts.is_empty() {
+        return true;
+    }
+    if verifier_segments
+        .iter()
+        .any(|segment| python_verifier_uses_root_discovery(segment))
+    {
+        return true;
+    }
+    test_artifacts.iter().all(|path| {
+        verifier_segments
+            .iter()
+            .any(|segment| python_verifier_segment_covers_artifact(segment, path))
+    })
+}
+
+fn python_verifier_uses_root_discovery(segment: &str) -> bool {
+    let words = segment
+        .split_whitespace()
+        .map(normalized_shell_word)
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    if words.iter().any(|word| word == "unittest") && words.iter().any(|word| word == "discover") {
+        return !words
+            .iter()
+            .any(|word| word == "-s" || word.starts_with("-s="));
+    }
+    let Some(runner) = words
+        .iter()
+        .position(|word| matches!(shell_executable_name(word), "pytest" | "py.test"))
+    else {
+        return false;
+    };
+    words[runner + 1..].iter().all(|word| word.starts_with('-'))
+}
+
+fn python_verifier_segment_covers_artifact(segment: &str, artifact: &str) -> bool {
+    let artifact = normalize_workspace_path(artifact).to_ascii_lowercase();
+    let parent = artifact.rsplit_once('/').map(|(parent, _)| parent);
+    let module = python_module_for_path(&artifact);
+    segment
+        .split_whitespace()
+        .map(normalized_shell_word)
+        .map(|word| word.replace('\\', "/"))
+        .any(|word| {
+            let target = word.strip_prefix("-s=").unwrap_or(&word);
+            target == artifact
+                || parent.is_some_and(|parent| target == parent)
+                || module.as_ref().is_some_and(|module| target == module)
+        })
+}
+
 fn direct_artifact_segment_is_relevant(segment: &str, artifact_paths: &[(String, String)]) -> bool {
     let words = segment
         .split_whitespace()
@@ -4484,6 +5712,20 @@ fn direct_artifact_segment_is_relevant(segment: &str, artifact_paths: &[(String,
     };
     if hides_inline_program {
         return false;
+    }
+
+    if matches!(executable, "python" | "python3" | "py") || executable.starts_with("python3.") {
+        if let Some(module) = args
+            .windows(2)
+            .find(|pair| pair[0] == "-m")
+            .map(|pair| pair[1].as_str())
+        {
+            if artifact_paths.iter().any(|(path, _)| {
+                python_module_for_path(path).is_some_and(|candidate| candidate == module)
+            }) {
+                return true;
+            }
+        }
     }
 
     let direct_executable = executable_word.starts_with("./") || executable_word.starts_with(".\\");
@@ -4553,15 +5795,43 @@ fn paging_verification_command_is_relevant(
     if output_only_shell_builtin {
         return false;
     }
-    let objective = objective.to_ascii_lowercase();
-    let objective_requires_tests = objective
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .any(|word| matches!(word, "test" | "tests" | "tested" | "testing"));
+    let objective_requires_tests =
+        objective_requests_test_execution(objective, completed_work, required_artifacts);
     if let Some(kind) = verification_command_kind(&command) {
         // Syntax/build/lint evidence is useful, but it cannot discharge an
         // explicit behavioral/unit-test requirement. Keep verification
         // pending until a real test runner executes tests.
-        return !objective_requires_tests || kind == VerificationCommandKind::TestExecution;
+        if !objective_requires_tests {
+            return true;
+        }
+        if kind != VerificationCommandKind::TestExecution {
+            return false;
+        }
+        if let Some(expected) =
+            host_python_unittest_command(objective, completed_work, required_artifacts)
+        {
+            // When the host can derive the authored unittest suite, accept only
+            // that exact approval-controlled command. Generic shell parsing
+            // cannot prove cwd/import-root/filter option semantics strongly
+            // enough to bind a passing count to the requested files.
+            return normalize_manual_validation_command(&command)
+                == normalize_manual_validation_command(&expected);
+        }
+        // When the manifest identifies Python tests, a runner from another
+        // ecosystem (for example an unrelated `cargo test`) is not relevant
+        // evidence for those authored files.
+        let python_tests_requested = workspace_test_artifacts(completed_work, required_artifacts)
+            .into_iter()
+            .filter(|path| path.to_ascii_lowercase().ends_with(".py"))
+            .collect::<Vec<_>>();
+        let runs_python_tests = verification_command_runs_python_tests(&command);
+        return if python_tests_requested.is_empty() {
+            !runs_python_tests
+                || verification_command_covers_python_tests(&command, &python_tests_requested)
+        } else {
+            runs_python_tests
+                && verification_command_covers_python_tests(&command, &python_tests_requested)
+        };
     }
     if objective_requires_tests {
         return false;
@@ -4604,6 +5874,28 @@ fn paging_verification_reports_zero_tests(command: &str, output: &str) -> bool {
     ]
     .iter()
     .any(|marker| output.contains(marker))
+}
+
+fn paging_python_verification_reports_executed_tests(command: &str, output: &str) -> bool {
+    if !verification_command_runs_python_tests(command) {
+        return false;
+    }
+    let output = output.to_ascii_lowercase();
+    let words = output
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    words.windows(3).any(|window| {
+        (window[0] == "ran"
+            && window[1].parse::<usize>().is_ok_and(|count| count > 0)
+            && matches!(window[2], "test" | "tests"))
+            || (window[0].parse::<usize>().is_ok_and(|count| count > 0)
+                && matches!(window[1], "passed" | "pass")
+                && !window[2].is_empty())
+    }) || words.windows(2).any(|window| {
+        window[0].parse::<usize>().is_ok_and(|count| count > 0)
+            && matches!(window[1], "passed" | "pass")
+    })
 }
 
 fn workspace_existing_file_paths(text: &str, sandbox: &Sandbox) -> BTreeSet<String> {
@@ -7624,6 +8916,314 @@ mod tests {
             runtime.ledger.verification_state.last_command.as_deref(),
             Some("python3 -m unittest discover -s taskforge/tests")
         );
+        assert!(
+            runtime
+                .ledger
+                .current_focus
+                .contains("python3 -m unittest discover -s taskforge/tests"),
+            "a real shell failure must replace stale verification guidance: {}",
+            runtime.ledger.current_focus
+        );
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+    }
+
+    /// Regression for Run F: the authored unittest suite and every explicitly
+    /// requested CLI workflow step are distinct persisted obligations. Runtime
+    /// JSON churn must not re-open source capture between those approved calls.
+    #[cfg(not(windows))]
+    #[test]
+    fn paging_taskforge_requires_tests_then_module_runtime_execution() {
+        let _checkpoint_guard = super::super::checkpoint::tests::cp_lock();
+        const MAIN: &str = concat!(
+            "from taskforge.models import label\n",
+            "from pathlib import Path\n",
+            "import json\n",
+            "import sys\n\n",
+            "def main():\n",
+            "    target = Path('taskforge/data/tasks.json')\n",
+            "    target.parent.mkdir(parents=True, exist_ok=True)\n",
+            "    records = json.loads(target.read_text()) if target.exists() else []\n",
+            "    records.append(sys.argv[1:])\n",
+            "    target.write_text(json.dumps(records))\n",
+            "    print(label(), *sys.argv[1:])\n\n",
+            "if __name__ == '__main__':\n",
+            "    main()\n",
+        );
+        const MODEL: &str = "def label():\n    return 'ready'\n";
+        const TEST: &str = concat!(
+            "import unittest\n",
+            "from taskforge.main import main\n",
+            "from taskforge.models import label\n\n",
+            "class ModelTests(unittest.TestCase):\n",
+            "    def test_label(self):\n",
+            "        main()\n",
+            "        self.assertEqual(label(), 'ready')\n",
+        );
+        const MANUAL_COMMANDS: [&str; 8] = [
+            "python3 -m taskforge.main add \"Generate report\"",
+            "python3 -m taskforge.main add \"Clean cache\"",
+            "python3 -m taskforge.main list",
+            "python3 -m taskforge.main run",
+            "python3 -m taskforge.main completed",
+            "python3 -m taskforge.main add \"fail intentionally\"",
+            "python3 -m taskforge.main run",
+            "python3 -m taskforge.main failed",
+        ];
+
+        struct TaskForgeDriver {
+            step: usize,
+        }
+        impl ModelDriver for TaskForgeDriver {
+            fn step(
+                &mut self,
+                history: &[AgentMsg],
+                tools: &[ToolSpec],
+            ) -> Result<ModelStep, String> {
+                let [AgentMsg::User(capsule)] = history else {
+                    return Err("paging must send exactly one fresh User capsule".into());
+                };
+                if (5..13).contains(&self.step) {
+                    let command = MANUAL_COMMANDS[self.step - 5];
+                    assert_eq!(
+                        tools
+                            .iter()
+                            .map(|tool| tool.name.as_str())
+                            .collect::<Vec<_>>(),
+                        vec!["run_shell"]
+                    );
+                    assert!(capsule.contains(command), "{capsule}");
+                    self.step += 1;
+                    return Ok(ModelStep::Calls(vec![tc(
+                        "run_shell",
+                        json!({"command": command}),
+                    )]));
+                }
+                let response = match self.step {
+                    0 => ModelStep::Calls(vec![tc(
+                        "write_file",
+                        json!({"path": "taskforge/main.py", "content": MAIN}),
+                    )]),
+                    1 => ModelStep::Calls(vec![tc(
+                        "write_file",
+                        json!({"path": "taskforge/models.py", "content": MODEL}),
+                    )]),
+                    2 => ModelStep::Calls(vec![tc(
+                        "write_file",
+                        json!({"path": "taskforge/tests/test_models.py", "content": TEST}),
+                    )]),
+                    3 => ModelStep::Calls(vec![tc(
+                        "run_shell",
+                        json!({"command": "python3 -m unittest discover -s taskforge/tests"}),
+                    )]),
+                    4 => {
+                        assert_eq!(
+                            tools
+                                .iter()
+                                .map(|tool| tool.name.as_str())
+                                .collect::<Vec<_>>(),
+                            vec!["run_shell"]
+                        );
+                        assert!(capsule.contains(MANUAL_COMMANDS[0]), "{capsule}");
+                        ModelStep::Calls(vec![tc(
+                            "run_shell",
+                            json!({"command": "python3 taskforge/main.py add \"Generate report\""}),
+                        )])
+                    }
+                    13 => ModelStep::Text(
+                        json!({
+                            "action": "COMPLETE",
+                            "summary": "TaskForge is complete and verified."
+                        })
+                        .to_string(),
+                    ),
+                    14 => ModelStep::Text("TaskForge is complete and verified.".into()),
+                    15 => {
+                        assert!(
+                            tools.is_empty(),
+                            "all execution evidence must close the gate"
+                        );
+                        ModelStep::Text("TaskForge is complete and verified.".into())
+                    }
+                    _ => return Err("unexpected scripted step".into()),
+                };
+                self.step += 1;
+                Ok(response)
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::new(directory.path(), false, Duration::from_secs(10))
+            .unwrap()
+            .with_shell_mode(ShellSandbox::Sandboxed);
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+        let objective = concat!(
+            "Create taskforge/main.py, taskforge/models.py, and ",
+            "taskforge/tests/test_models.py using unittest. Persist runtime state at ",
+            "taskforge/data/tasks.json. Run the test suite.\n\n",
+            "## Manual Validation\n",
+            "python main.py add \"Generate report\"\n",
+            "python main.py add \"Clean cache\"\n",
+            "python main.py list\n",
+            "python main.py run\n",
+            "python main.py completed\n",
+            "python main.py add \"fail intentionally\"\n",
+            "python main.py run\n",
+            "python main.py failed\n"
+        );
+        let mut driver = TaskForgeDriver { step: 0 };
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(objective.into())];
+        let mut config = paging_cfg(directory.path());
+        config.max_steps = 20;
+        let end = run_loop(
+            &mut driver,
+            &mut ScriptApprover(vec![Decision::Once; 13], 0),
+            &mut reporter,
+            &sandbox,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
+        assert_eq!(driver.step, 16);
+        assert!(reporter
+            .results
+            .iter()
+            .any(|result| result.to_ascii_lowercase().contains("ran 1 test")));
+        assert!(reporter
+            .results
+            .iter()
+            .any(|result| result.contains("ModuleNotFoundError")));
+        assert!(reporter
+            .results
+            .iter()
+            .any(|result| result.lines().any(|line| line.trim() == "ready failed")));
+        assert!(reporter
+            .calls
+            .iter()
+            .all(|call| !call.contains("taskforge/data/tasks.json")));
+        assert!(reporter.notices.iter().any(|notice| {
+            notice.contains("typed COMPLETE rejected: post-write source capture")
+        }));
+        let runtime =
+            ContextPagingRuntime::open(directory.path(), objective, ContextPagingConfig::default())
+                .unwrap();
+        assert_eq!(runtime.ledger.verification_state.status, "complete");
+        assert!(has_verification_evidence(
+            &runtime.ledger.decisions,
+            TEST_EXECUTION_EVIDENCE_PREFIX
+        ));
+        assert!(has_verification_evidence(
+            &runtime.ledger.decisions,
+            MANUAL_VALIDATION_EVIDENCE_PREFIX
+        ));
+        assert_eq!(
+            runtime
+                .ledger
+                .decisions
+                .iter()
+                .filter(|decision| decision.starts_with(MANUAL_VALIDATION_EVIDENCE_PREFIX))
+                .count(),
+            MANUAL_COMMANDS.len()
+        );
+        assert!(source_fingerprint_receipt_is_current(&runtime));
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn paging_shell_source_mutation_cannot_reuse_earlier_test_output() {
+        let _checkpoint_guard = super::super::checkpoint::tests::cp_lock();
+        const TEST: &str = concat!(
+            "import unittest\n",
+            "class SmokeTests(unittest.TestCase):\n",
+            "    def test_smoke(self):\n",
+            "        self.assertTrue(True)\n",
+        );
+        const SUITE: &str = "python3 -m unittest discover -s taskforge/tests";
+
+        struct MutationDriver {
+            step: usize,
+        }
+        impl ModelDriver for MutationDriver {
+            fn step(
+                &mut self,
+                history: &[AgentMsg],
+                tools: &[ToolSpec],
+            ) -> Result<ModelStep, String> {
+                let [AgentMsg::User(capsule)] = history else {
+                    return Err("expected one paging capsule".into());
+                };
+                let response = match self.step {
+                    0 => ModelStep::Calls(vec![tc(
+                        "write_file",
+                        json!({"path": "taskforge/main.py", "content": "print('ready')\n"}),
+                    )]),
+                    1 => ModelStep::Calls(vec![tc(
+                        "write_file",
+                        json!({"path": "taskforge/tests/test_smoke.py", "content": TEST}),
+                    )]),
+                    2 => ModelStep::Calls(vec![tc(
+                        "run_shell",
+                        json!({
+                            "command": "python3 -m unittest discover -s taskforge/tests && python3 -c \"open('taskforge/main.py','w').write('broken source')\""
+                        }),
+                    )]),
+                    3 => {
+                        assert!(capsule.contains(SUITE), "{capsule}");
+                        assert!(capsule.contains("verification: pending"), "{capsule}");
+                        assert!(tools.iter().any(|tool| tool.name == "run_shell"));
+                        return Err("stop after observing invalidation".into());
+                    }
+                    _ => return Err("unexpected scripted step".into()),
+                };
+                self.step += 1;
+                Ok(response)
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::new(directory.path(), false, Duration::from_secs(10))
+            .unwrap()
+            .with_shell_mode(ShellSandbox::Sandboxed);
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+        let objective =
+            "Create taskforge/main.py and taskforge/tests/test_smoke.py using unittest; run the test suite.";
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(objective.into())];
+        let end = run_loop(
+            &mut MutationDriver { step: 0 },
+            &mut ScriptApprover(vec![Decision::Once; 3], 0),
+            &mut reporter,
+            &sandbox,
+            &paging_cfg(directory.path()),
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        assert_eq!(end, LoopEnd::DriverError);
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("taskforge/main.py")).unwrap(),
+            "broken source"
+        );
+        assert!(reporter
+            .results
+            .iter()
+            .any(|result| result.to_ascii_lowercase().contains("ran 1 test")));
+        let runtime =
+            ContextPagingRuntime::open(directory.path(), objective, ContextPagingConfig::default())
+                .unwrap();
+        assert_eq!(runtime.ledger.verification_state.status, "pending");
+        assert!(!has_verification_evidence(
+            &runtime.ledger.decisions,
+            TEST_EXECUTION_EVIDENCE_PREFIX
+        ));
+        assert!(!source_fingerprint_receipt_is_current(&runtime));
+        assert!(
+            completed_source_paths(&runtime.ledger.completed_work).contains("taskforge/main.py")
+        );
         super::super::checkpoint::clear_for_workspace(sandbox.root());
     }
 
@@ -8110,12 +9710,7 @@ mod tests {
             &required,
             "run the app.py tests"
         ));
-        for command in [
-            "cd tests && pytest",
-            "pytest && echo done",
-            "true; pytest",
-            "pytest -k 'queue or storage|models'",
-        ] {
+        for command in ["pytest", "pytest -k 'queue or storage|models'"] {
             assert!(
                 paging_verification_command_is_relevant(
                     command,
@@ -8138,7 +9733,110 @@ mod tests {
             &required,
             "run the unit tests for app.py"
         ));
+        let python_suite = BTreeSet::from([
+            "taskforge/main.py".to_string(),
+            "taskforge/tests/test_queue.py".to_string(),
+        ]);
+        assert!(!paging_verification_command_is_relevant(
+            "cargo test",
+            &work,
+            &python_suite,
+            "create and run the unittest suite"
+        ));
         assert!(paging_verification_command_is_relevant(
+            "python3 -m unittest discover -s taskforge/tests",
+            &work,
+            &python_suite,
+            "create and run the unittest suite"
+        ));
+        assert!(!paging_verification_command_is_relevant(
+            "python3 -m unittest discover -s unrelated/tests",
+            &work,
+            &python_suite,
+            "create and run the unittest suite"
+        ));
+        for bypass in [
+            "python3 -m unittest discover -s unrelated/tests && echo taskforge/tests",
+            "cd unrelated && python3 -m unittest discover",
+            "cd unrelated; python3 -m unittest discover",
+            "PYTHONPATH=unrelated python3 -m unittest discover -s taskforge/tests",
+            "python3 -m unittest discover -s taskforge/tests && echo done",
+            "python3 -m unittest discover -s taskforge/tests > test.log",
+        ] {
+            assert!(
+                !paging_verification_command_is_relevant(
+                    bypass,
+                    &work,
+                    &python_suite,
+                    "create and run the unittest suite"
+                ),
+                "non-verifier/cwd/redirection bypass must not count: {bypass}"
+            );
+        }
+        let two_suites = BTreeSet::from([
+            "taskforge/tests/test_queue.py".to_string(),
+            "taskforge/integration/test_cli.py".to_string(),
+        ]);
+        assert!(!paging_verification_command_is_relevant(
+            "python3 -m unittest discover -s taskforge/tests",
+            &work,
+            &two_suites,
+            "create and run both unittest suites"
+        ));
+        assert!(paging_verification_command_is_relevant(
+            "python3 -m unittest discover -s taskforge/integration && python3 -m unittest discover -s taskforge/tests",
+            &work,
+            &two_suites,
+            "create and run both unittest suites"
+        ));
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                python_package_module_retry_command(
+                    "python3 taskforge/main.py add \"Generate daily report\"",
+                    "ModuleNotFoundError: No module named 'taskforge'",
+                )
+                .as_deref(),
+                Some("python3 -m taskforge.main add \"Generate daily report\"")
+            );
+            assert_eq!(
+                python_package_module_retry_command(
+                    "python3 taskforge/main.py list && echo done",
+                    "ModuleNotFoundError: No module named 'taskforge'",
+                )
+                .as_deref(),
+                Some("python3 -m taskforge.main list")
+            );
+            assert!(python_package_module_retry_command(
+                "python3 taskforge/main.py list",
+                "ModuleNotFoundError: No module named 'requests'",
+            )
+            .is_none());
+            assert!(python_package_module_retry_command(
+                "python3 'taskforge/main.py' list",
+                "ModuleNotFoundError: No module named 'taskforge'",
+            )
+            .is_none());
+            assert!(python_package_module_retry_command(
+                "python3 'taskforge/main.py;touch_pwned' list",
+                "ModuleNotFoundError: No module named 'taskforge'",
+            )
+            .is_none());
+            let aliased_suite = BTreeSet::from([
+                "test_queue.py".to_string(),
+                "taskforge/tests/test_queue.py".to_string(),
+            ]);
+            assert_eq!(
+                host_python_unittest_command(
+                    "Create and run the unittest suite",
+                    &["write_file changed taskforge/tests/test_queue.py".to_string()],
+                    &aliased_suite,
+                )
+                .as_deref(),
+                Some("python3 -m unittest discover -s taskforge/tests")
+            );
+        }
+        assert!(!paging_verification_command_is_relevant(
             "cd taskforge && env PYTHONPATH=. python3 -m unittest discover -s tests",
             &work,
             &required,
@@ -8169,6 +9867,22 @@ mod tests {
         assert!(!paging_verification_reports_zero_tests(
             "python3 -m unittest discover -s taskforge/tests",
             "----------------------------------------------------------------------\nRan 4 tests in 0.003s\n\nOK\n"
+        ));
+        assert!(paging_python_verification_reports_executed_tests(
+            "python3 -m unittest discover -s taskforge/tests",
+            "----------------------------------------------------------------------\nRan 4 tests in 0.003s\n\nOK\n"
+        ));
+        assert!(!paging_python_verification_reports_executed_tests(
+            "python3 -m unittest discover -s taskforge/tests",
+            "----------------------------------------------------------------------\nOK\n"
+        ));
+        assert!(manual_validation_command_matches(
+            "python3 -m taskforge.main list",
+            "python3 -m taskforge.main list"
+        ));
+        assert!(!manual_validation_command_matches(
+            "cd unrelated && python3 -m taskforge.main list",
+            "python3 -m taskforge.main list"
         ));
     }
 
@@ -8403,6 +10117,7 @@ mod tests {
                     json!({"action": "COMPLETE", "summary": "Changed increment and verified it."})
                         .to_string(),
                 ),
+                ModelStep::Text("Changed increment and verified it.".into()),
                 ModelStep::Text(
                     json!({"action": "COMPLETE", "summary": "Changed increment and verified it."})
                         .to_string(),
@@ -8432,7 +10147,7 @@ mod tests {
                 .notices
                 .iter()
                 .any(|notice| notice.contains("typed COMPLETE rejected")),
-            "the unverified COMPLETE must be rejected: {:?}",
+            "the pre-execution COMPLETE action must be rejected: {:?}",
             reporter.notices
         );
         // The persisted ledger records a verified completion only after the
@@ -8767,6 +10482,7 @@ mod tests {
             .verification_state
             .verified_symbols
             .push(symbol);
+        assert!(record_source_fingerprint(&mut runtime));
         runtime.save().unwrap();
         drop(runtime);
 
@@ -8850,6 +10566,86 @@ mod tests {
         assert_eq!(restart_end, LoopEnd::Answered);
         assert_eq!(restart_driver.steps, 1);
         assert_eq!(restart_reporter.text, vec!["Already changed and verified."]);
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+    }
+
+    #[test]
+    fn paging_reopen_invalidates_complete_evidence_after_external_source_edit() {
+        let _checkpoint_guard = super::super::checkpoint::tests::cp_lock();
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("app.py"), "print('verified')\n").unwrap();
+        let objective = "Change app.py and verify it";
+        let mut runtime =
+            ContextPagingRuntime::open(directory.path(), objective, ContextPagingConfig::default())
+                .unwrap();
+        let symbol = runtime.project.cards.keys().next().unwrap().clone();
+        runtime
+            .ledger
+            .completed_work
+            .push("write_file changed app.py".into());
+        runtime.ledger.relevant_symbols.push(symbol.clone());
+        runtime
+            .ledger
+            .verification_state
+            .verified_symbols
+            .push(symbol);
+        runtime.ledger.verification_state.status = "complete".into();
+        assert!(record_source_fingerprint(&mut runtime));
+        runtime.save().unwrap();
+        drop(runtime);
+
+        std::fs::write(
+            directory.path().join("app.py"),
+            "print('externally changed')\n",
+        )
+        .unwrap();
+
+        struct StaleRestart;
+        impl ModelDriver for StaleRestart {
+            fn step(
+                &mut self,
+                history: &[AgentMsg],
+                tools: &[ToolSpec],
+            ) -> Result<ModelStep, String> {
+                let [AgentMsg::User(capsule)] = history else {
+                    return Err("expected one paging capsule".into());
+                };
+                assert!(
+                    capsule.contains("source changed outside this run"),
+                    "{capsule}"
+                );
+                assert!(!tools.is_empty(), "stale completion must reopen work");
+                Err("stop after observing invalidation".into())
+            }
+        }
+
+        let sandbox = Sandbox::new(directory.path(), false, Duration::from_secs(5)).unwrap();
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(objective.into())];
+        let end = run_loop(
+            &mut StaleRestart,
+            &mut ScriptApprover(Vec::new(), 0),
+            &mut reporter,
+            &sandbox,
+            &paging_cfg(directory.path()),
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        assert_eq!(end, LoopEnd::DriverError);
+        assert!(reporter
+            .notices
+            .iter()
+            .any(|notice| notice.contains("verification invalidated")));
+        let reopened =
+            ContextPagingRuntime::open(directory.path(), objective, ContextPagingConfig::default())
+                .unwrap();
+        assert_eq!(reopened.ledger.verification_state.status, "pending");
+        assert!(reopened
+            .ledger
+            .decisions
+            .iter()
+            .all(|decision| !decision.starts_with(SOURCE_FINGERPRINT_EVIDENCE_PREFIX)));
         super::super::checkpoint::clear_for_workspace(sandbox.root());
     }
 

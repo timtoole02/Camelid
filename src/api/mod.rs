@@ -153,6 +153,11 @@ pub struct AppState {
     embedding_runtime_load: Arc<tokio::sync::Mutex<()>>,
     execution_plans: Arc<RwLock<HashMap<String, ExecutionPlan>>>,
     cached_weights: Arc<RwLock<HashMap<String, Arc<LlamaLoadedWeights>>>>,
+    /// Serializes the cache-miss admission, LRU eviction, weight materialization, and
+    /// publication window. A read/write lock around only `cached_weights` is insufficient:
+    /// two misses can both observe the same under-budget snapshot and then materialize a full
+    /// model apiece before either publishes it.
+    weight_load_admission: Arc<tokio::sync::Mutex<()>>,
     active_model_id: Arc<RwLock<Option<String>>>,
     model_last_used: Arc<RwLock<HashMap<String, std::time::Instant>>>,
     cached_prompt_prefix: Arc<Mutex<PromptPrefixCachePool>>,
@@ -234,6 +239,7 @@ impl Default for AppState {
             embedding_runtime_load: Arc::new(tokio::sync::Mutex::new(())),
             execution_plans: Arc::new(RwLock::new(HashMap::new())),
             cached_weights: Arc::new(RwLock::new(HashMap::new())),
+            weight_load_admission: Arc::new(tokio::sync::Mutex::new(())),
             active_model_id: Arc::new(RwLock::new(None)),
             model_last_used: Arc::new(RwLock::new(HashMap::new())),
             cached_prompt_prefix: Arc::new(Mutex::new(PromptPrefixCachePool::from_env())),
@@ -383,6 +389,10 @@ struct PromptPrefixCacheEntry {
 struct PromptPrefixCachePool {
     entries: Vec<PromptPrefixCacheEntry>,
     capacity: usize,
+    /// Models whose materialized weights were removed by the LRU. A generation prepared before
+    /// that eviction can finish later and try to store a new prefix; keep it out until the model
+    /// is materialized and budget-accounted again.
+    weight_evicted_models: HashSet<String>,
 }
 
 impl PromptPrefixCachePool {
@@ -394,11 +404,34 @@ impl PromptPrefixCachePool {
         Self {
             entries: Vec::new(),
             capacity: capacity.max(1),
+            weight_evicted_models: HashSet::new(),
         }
     }
 
     fn clear(&mut self) {
         self.entries.clear();
+        // Do not clear weight-eviction tombstones here. Active-model changes clear prompt
+        // entries too, and a generation prepared before an LRU eviction can still finish after
+        // that change. Only a successful weight hit/publication may readmit the model.
+    }
+
+    /// Drop every retained session for one materialized model. Each session owns the same
+    /// `Arc<LlamaLoadedWeights>` as the weight registry, so LRU eviction is not complete until
+    /// these secondary owners are gone as well.
+    fn evict_model(&mut self, model_id: &str) -> usize {
+        let before = self.entries.len();
+        self.entries
+            .retain(|entry| entry.cached.model_id != model_id);
+        self.weight_evicted_models.insert(model_id.to_string());
+        before - self.entries.len()
+    }
+
+    fn admit_model(&mut self, model_id: &str) {
+        self.weight_evicted_models.remove(model_id);
+    }
+
+    fn model_is_admitted(&self, model_id: &str) -> bool {
+        !self.weight_evicted_models.contains(model_id)
     }
 
     /// Permanently release and turn off retained KV entries. Capacity zero is
@@ -445,7 +478,7 @@ impl PromptPrefixCachePool {
     }
 
     fn insert(&mut self, cached: CachedPromptPrefix) {
-        if self.capacity == 0 {
+        if self.capacity == 0 || !self.model_is_admitted(&cached.model_id) {
             return;
         }
         let cached = Arc::new(cached);
@@ -13949,11 +13982,14 @@ async fn unload_model(
 ///
 /// Shared by `/api/models/unload` and the `replace` load path so both free the
 /// SAME things. That sharing is load-bearing, not tidiness: the registry clears
-/// below are CPU-side only, and the resident decode engine keeps its weights in
-/// process-global caches. Skipping `reset_resident_caches` leaves ~4.7 GB parked
-/// on the device, which starves the next model into an NVIDIA sysmem spill and
-/// makes decode ~20x slower — so a `replace` that hand-rolled the teardown would
-/// silently reintroduce exactly the bug this reset exists to prevent.
+/// below are CPU-side only, while both GPU backends retain model state in
+/// process-global caches. CUDA can leave multi-GB resident engines and allocator
+/// pages parked on the device; Metal's permanent linear cache can keep no-copy
+/// `WirePages` alive after the registry's last model reference is gone. Skipping
+/// `reset_resident_caches` therefore either starves the next CUDA model into an
+/// NVIDIA sysmem spill or leaves roughly a GGUF's worth of anonymous host pages
+/// eligible for macOS compression. A `replace` that hand-rolled the teardown
+/// would silently reintroduce exactly the bug this reset exists to prevent.
 ///
 /// The caller must already hold the model-transition lock and an exclusive
 /// `model_file_lifecycle` guard. `Err` carries a ready-to-return response.
@@ -13993,12 +14029,12 @@ async fn release_model(state: &AppState, target: Option<String>) -> Result<(), B
     }
 
     clear_prompt_prefix_cache(state);
-    // Free the GPU VRAM held by the resident decode engine. The clears above only drop
-    // the CPU-side registries; the Llama resident engine lives in process-global caches
-    // (see inference::reset_resident_caches) that unload never touched, so its ~4.7 GB
-    // stayed on the device and starved the next model into a host-RAM spill (NVIDIA
-    // sysmem fallback), making decode ~20x slower. (A gemma4 CUDA runtime's VRAM is
-    // freed by dropping it from gemma4_runtimes above.)
+    // Free process-global GPU/model-weight state. The clears above only drop the API
+    // registries. CUDA's Llama resident engine and allocator pool otherwise keep VRAM
+    // alive, which can starve the next model into the ~20x-slower NVIDIA sysmem fallback.
+    // Metal's permanent linear cache otherwise keeps Arc<WirePages> no-copy weights alive,
+    // pinning anonymous host pages (and therefore macOS compressor pressure) until process
+    // exit. A gemma4 CUDA runtime's own VRAM is freed by dropping it above.
     //
     // The reset mutates engine-owned GPU state, so it runs as an ENGINE JOB —
     // it can never race a decode. A failed post is surfaced, never skipped
@@ -14346,16 +14382,29 @@ async fn load_weights_lru(
     model: &LoadedModel,
     binding: &LlamaTensorBinding,
 ) -> Result<Arc<LlamaLoadedWeights>, Response> {
-    {
-        let cached = state.cached_weights.read().await;
-        if let Some(weights) = cached.get(&model.id) {
-            state
-                .model_last_used
-                .write()
-                .await
-                .insert(model.id.clone(), std::time::Instant::now());
-            return Ok(weights.clone());
-        }
+    let cached = state.cached_weights.read().await.get(&model.id).cloned();
+    if let Some(weights) = cached {
+        state
+            .model_last_used
+            .write()
+            .await
+            .insert(model.id.clone(), std::time::Instant::now());
+        return Ok(weights);
+    }
+
+    // Only cache misses enter the expensive lane. Double-check after acquiring it: another
+    // caller may have loaded this exact model while we waited. Keep the guard through budget
+    // admission, all evictions, materialization, and publication so two distinct misses cannot
+    // independently pass the same budget snapshot and transiently oversubscribe host memory.
+    let _admission = state.weight_load_admission.lock().await;
+    let cached = state.cached_weights.read().await.get(&model.id).cloned();
+    if let Some(weights) = cached {
+        state
+            .model_last_used
+            .write()
+            .await
+            .insert(model.id.clone(), std::time::Instant::now());
+        return Ok(weights);
     }
 
     let (layer_range, load_embedding, load_output) = api_weight_load_ownership();
@@ -14376,6 +14425,7 @@ async fn load_weights_lru(
 
     let limit_bytes = cpu_weight_materialization_limit_bytes().unwrap_or(u64::MAX);
 
+    let mut evicted_weights = Vec::new();
     loop {
         let loaded = state.loaded_models.read().await;
         let cached = state.cached_weights.read().await;
@@ -14425,11 +14475,71 @@ async fn load_weights_lru(
 
         if let Some(evict_id) = lru_id {
             tracing::info!(model=%evict_id, "LRU evicting weights of model to stay under budget");
-            let mut cached_write = state.cached_weights.write().await;
-            cached_write.remove(&evict_id);
+            let removed_weights = {
+                let mut cached_write = state.cached_weights.write().await;
+                remove_lru_entry(&mut cached_write, &evict_id)
+            };
+            if let Some(weights) = removed_weights {
+                let last_used = state.model_last_used.write().await.remove(&evict_id);
+                evicted_weights.push((evict_id, weights, last_used));
+            }
         } else {
             break;
         }
+    }
+
+    if !evicted_weights.is_empty() {
+        // Every registry guard is out of scope before this await. Prompt-prefix sessions are
+        // secondary owners of the evicted Arc<LlamaLoadedWeights>, so release those entries in
+        // the same engine job as the Metal reset. Running both on the compute owner orders them
+        // after any decode already storing a prefix and prevents clearing Metal no-copy buffers
+        // underneath active GPU work. Do NOT call inference::reset_resident_caches here: unlike
+        // explicit unload, LRU admission holds only a shared model lifecycle lease, and clearing
+        // CUDA's process-global engine/KV between cooperative stream steps corrupts that stream.
+        let prompt_cache = Arc::clone(&state.cached_prompt_prefix);
+        let evicted_model_ids = evicted_weights
+            .iter()
+            .map(|(model_id, _, _)| model_id.clone())
+            .collect::<Vec<_>>();
+        let rollback_model_ids = evicted_model_ids.clone();
+        let evicted_count = evicted_weights.len();
+        tracing::info!(
+            evicted_models = evicted_count,
+            "LRU eviction completed; releasing prompt prefixes and Metal weight caches"
+        );
+        if let Err(err) = state
+            .engine
+            .run_exclusive(move || {
+                {
+                    let mut pool = prompt_cache
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    for model_id in &evicted_model_ids {
+                        pool.evict_model(model_id);
+                    }
+                }
+                crate::metal::reset_model_caches();
+            })
+            .await
+        {
+            // A rejected/lost engine job means the prefix owners and backend caches may not
+            // have been released. Restore the exact registry state so a retry cannot observe
+            // an artificially empty budget and load a replacement on top of those owners.
+            restore_lru_weight_transaction(state, evicted_weights, &rollback_model_ids).await;
+            return Err(*engine_post_error_response(err));
+        }
+        let retained_model_ids = externally_retained_lru_model_ids(&evicted_weights);
+        if !retained_model_ids.is_empty() {
+            // Do not wait for active requests while holding admission: their completion may
+            // itself need this server to keep scheduling work. Restore the transaction and ask
+            // this caller to retry after those owners naturally finish.
+            restore_lru_weight_transaction(state, evicted_weights, &rollback_model_ids).await;
+            return Err(lru_weights_in_use_response(&retained_model_ids));
+        }
+        // The reset completed and prompt-prefix owners are gone. Release the rollback Arcs
+        // before materializing the replacement, otherwise this safety mechanism itself would
+        // create a transient two-model resident peak.
+        drop(evicted_weights);
     }
 
     let store = TensorStore::open(&model.path, &model.gguf);
@@ -14467,6 +14577,9 @@ async fn load_weights_lru(
         .write()
         .await
         .insert(model.id.clone(), weights.clone());
+    // No await between publication and readmission: a stale cache-hit clone racing an eviction
+    // must never clear the tombstone after that eviction has completed.
+    admit_prompt_prefix_cache_model(state, &model.id);
     state
         .model_last_used
         .write()
@@ -14474,6 +14587,79 @@ async fn load_weights_lru(
         .insert(model.id.clone(), std::time::Instant::now());
 
     Ok(weights)
+}
+
+/// Remove an entry selected by the LRU scan and return its value as rollback authority.
+/// Keeping the removed value until the engine reset succeeds prevents a failed post from
+/// permanently hiding still-retained memory from the next budget calculation.
+fn remove_lru_entry<V>(cache: &mut HashMap<String, V>, model_id: &str) -> Option<V> {
+    cache.remove(model_id)
+}
+
+/// Restore a failed eviction transaction exactly, including the prior LRU timestamp. Consuming
+/// the values transfers the original weight Arcs back into the registry without a transient clone.
+fn restore_lru_entries<V>(
+    cache: &mut HashMap<String, V>,
+    last_used: &mut HashMap<String, std::time::Instant>,
+    entries: Vec<(String, V, Option<std::time::Instant>)>,
+) {
+    for (model_id, value, prior_last_used) in entries {
+        cache.insert(model_id.clone(), value);
+        if let Some(prior) = prior_last_used {
+            last_used.insert(model_id, prior);
+        } else {
+            last_used.remove(&model_id);
+        }
+    }
+}
+
+/// Models still owned outside the removed registry value. At this point prompt-cache owners have
+/// already been released, so any extra strong owner is an in-flight prepared/generating request.
+fn externally_retained_lru_model_ids<V>(
+    entries: &[(String, Arc<V>, Option<std::time::Instant>)],
+) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|(_, value, _)| Arc::strong_count(value) > 1)
+        .map(|(model_id, _, _)| model_id.clone())
+        .collect()
+}
+
+async fn restore_lru_weight_transaction(
+    state: &AppState,
+    entries: Vec<(String, Arc<LlamaLoadedWeights>, Option<std::time::Instant>)>,
+    model_ids: &[String],
+) {
+    let (mut cached, mut last_used) =
+        tokio::join!(state.cached_weights.write(), state.model_last_used.write());
+    restore_lru_entries(&mut cached, &mut last_used, entries);
+    drop(cached);
+    drop(last_used);
+
+    let mut pool = state
+        .cached_prompt_prefix
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for model_id in model_ids {
+        pool.admit_model(model_id);
+    }
+}
+
+fn lru_weights_in_use_response(model_ids: &[String]) -> Response {
+    let mut response = api_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "model_weights_in_use",
+        format!(
+            "cannot evict model weights still owned by an active request ({}); retry after the active generation finishes",
+            model_ids.join(", ")
+        ),
+        Some("model"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        "1".parse().expect("static header"),
+    );
+    response
 }
 
 async fn tokenizer_encode(
@@ -18934,6 +19120,16 @@ fn clear_prompt_prefix_cache(state: &AppState) {
     }
 }
 
+/// A successful weight publication/rollback makes this model budget-accounted again, so
+/// generations prepared from it may retain prompt prefixes.
+fn admit_prompt_prefix_cache_model(state: &AppState, model_id: &str) {
+    state
+        .cached_prompt_prefix
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .admit_model(model_id);
+}
+
 fn disable_prompt_prefix_cache(state: &AppState) {
     let mut pool = state
         .cached_prompt_prefix
@@ -19067,7 +19263,7 @@ fn store_prompt_prefix_cache(prepared: &mut PreparedGeneration, step: &LlamaGene
     // Metal->CPU mirror and populated-session clone. Checking only in `insert`
     // would avoid retention but still create the transient owners that this
     // mode exists to prevent.
-    if pool.capacity == 0 {
+    if pool.capacity == 0 || !pool.model_is_admitted(&prepared.model_id) {
         return;
     }
     pool.reserve_for_insert(
@@ -24047,6 +24243,85 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn lru_eviction_reset_is_armed_only_by_an_actual_removal() {
+        let mut cache = HashMap::from([("resident".to_string(), 1_u8)]);
+
+        assert_eq!(remove_lru_entry(&mut cache, "already-evicted"), None);
+        assert_eq!(remove_lru_entry(&mut cache, "resident"), Some(1));
+        assert_eq!(remove_lru_entry(&mut cache, "resident"), None);
+    }
+
+    #[test]
+    fn failed_lru_reset_restores_weights_and_exact_timestamp_state() {
+        let prior = std::time::Instant::now();
+        let mut cache = HashMap::new();
+        let mut last_used = HashMap::from([
+            ("without-prior".to_string(), prior),
+            ("unrelated".to_string(), prior),
+        ]);
+
+        restore_lru_entries(
+            &mut cache,
+            &mut last_used,
+            vec![
+                ("with-prior".to_string(), 1_u8, Some(prior)),
+                ("without-prior".to_string(), 2_u8, None),
+            ],
+        );
+
+        assert_eq!(cache.get("with-prior"), Some(&1));
+        assert_eq!(cache.get("without-prior"), Some(&2));
+        assert_eq!(last_used.get("with-prior"), Some(&prior));
+        assert!(!last_used.contains_key("without-prior"));
+        assert_eq!(last_used.get("unrelated"), Some(&prior));
+    }
+
+    #[test]
+    fn lru_admission_detects_an_in_flight_weight_owner() {
+        let entries = vec![("active".to_string(), Arc::new(1_u8), None)];
+        assert!(externally_retained_lru_model_ids(&entries).is_empty());
+
+        let active_request = Arc::clone(&entries[0].1);
+        assert_eq!(
+            externally_retained_lru_model_ids(&entries),
+            vec!["active".to_string()]
+        );
+        let response = lru_weights_in_use_response(&["active".to_string()]);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(axum::http::header::RETRY_AFTER),
+            Some(&"1".parse().unwrap())
+        );
+
+        drop(active_request);
+        assert!(externally_retained_lru_model_ids(&entries).is_empty());
+    }
+
+    #[tokio::test]
+    async fn weight_load_admission_serializes_cache_miss_windows() {
+        let state = AppState::default();
+        let first = Arc::clone(&state.weight_load_admission).lock_owned().await;
+        let second_admission = Arc::clone(&state.weight_load_admission);
+        let second = tokio::spawn(async move {
+            let _guard = second_admission.lock_owned().await;
+            "admitted"
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !second.is_finished(),
+            "a second cache miss must not enter admission while materialization is in flight"
+        );
+
+        drop(first);
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), second)
+            .await
+            .expect("the next cache miss is admitted after publication")
+            .expect("admission task");
+        assert_eq!(outcome, "admitted");
+    }
+
     #[tokio::test]
     async fn runtime_memory_reports_empty_state_and_purge_is_idempotent() {
         let state = AppState::default();
@@ -28269,6 +28544,121 @@ mod tests {
             vec![cached_next_token],
             "decode resumes from the cached token, not from the whole prompt"
         );
+        std::env::remove_var("CAMELID_CUDA_RESIDENT_DECODE");
+    }
+
+    #[test]
+    fn prompt_prefix_model_eviction_releases_only_that_models_weights() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var("CAMELID_CUDA_RESIDENT_DECODE", "0");
+        std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
+        std::env::remove_var("CAMELID_GQA_HEAD_MAPPING");
+
+        let pool = Arc::new(Mutex::new(PromptPrefixCachePool::with_capacity(8)));
+
+        let weights_a = Arc::new(tiny_weights());
+        let weak_a = Arc::downgrade(&weights_a);
+        let mut session_a =
+            LlamaInferenceSession::new(tiny_config(), Arc::clone(&weights_a)).unwrap();
+        drop(weights_a);
+        let step_a = session_a
+            .generate_next_token_with_history_diagnostics(
+                &[1, 2],
+                crate::inference::LlamaSampler::Greedy,
+                &[1, 2],
+                false,
+                None,
+            )
+            .unwrap();
+        let mut prepared_a = prepared_for_cache("model-a", "model-a.gguf", vec![1, 2], session_a);
+        prepared_a.cached_prompt_prefix = Arc::clone(&pool);
+        store_prompt_prefix_cache(&mut prepared_a, &step_a);
+
+        let weights_b = Arc::new(tiny_weights());
+        let weak_b = Arc::downgrade(&weights_b);
+        let mut session_b =
+            LlamaInferenceSession::new(tiny_config(), Arc::clone(&weights_b)).unwrap();
+        drop(weights_b);
+        let step_b = session_b
+            .generate_next_token_with_history_diagnostics(
+                &[1, 2],
+                crate::inference::LlamaSampler::Greedy,
+                &[1, 2],
+                false,
+                None,
+            )
+            .unwrap();
+        let mut prepared_b = prepared_for_cache("model-b", "model-b.gguf", vec![1, 2], session_b);
+        prepared_b.cached_prompt_prefix = Arc::clone(&pool);
+        store_prompt_prefix_cache(&mut prepared_b, &step_b);
+
+        drop(prepared_a);
+        drop(prepared_b);
+        assert!(weak_a.upgrade().is_some());
+        assert!(weak_b.upgrade().is_some());
+
+        let removed = pool.lock().unwrap().evict_model("model-a");
+        assert_eq!(removed, 1);
+        assert!(
+            weak_a.upgrade().is_none(),
+            "evicting a model's prompt entries must release their weight Arc"
+        );
+        assert!(
+            weak_b.upgrade().is_some(),
+            "model-scoped eviction must preserve unrelated prompt entries"
+        );
+
+        pool.lock().unwrap().clear();
+        assert!(weak_b.upgrade().is_none());
+        std::env::remove_var("CAMELID_CUDA_RESIDENT_DECODE");
+    }
+
+    #[test]
+    fn weight_evicted_model_rejects_late_prefix_store_until_readmitted() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var("CAMELID_CUDA_RESIDENT_DECODE", "0");
+        std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
+        std::env::remove_var("CAMELID_GQA_HEAD_MAPPING");
+
+        let mut session = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        let step = session
+            .generate_next_token_with_history_diagnostics(
+                &[1, 2],
+                crate::inference::LlamaSampler::Greedy,
+                &[1, 2],
+                false,
+                None,
+            )
+            .unwrap();
+        let mut prepared = prepared_for_cache("evicted", "evicted.gguf", vec![1, 2], session);
+
+        {
+            let mut pool = prepared.cached_prompt_prefix.lock().unwrap();
+            pool.evict_model("evicted");
+            // Active-model transitions clear entries, but must not erase the LRU tombstone
+            // while an already-prepared generation can still arrive late.
+            pool.clear();
+            assert!(!pool.model_is_admitted("evicted"));
+        }
+        store_prompt_prefix_cache(&mut prepared, &step);
+        assert!(prepared
+            .cached_prompt_prefix
+            .lock()
+            .unwrap()
+            .entries
+            .is_empty());
+
+        prepared
+            .cached_prompt_prefix
+            .lock()
+            .unwrap()
+            .admit_model("evicted");
+        store_prompt_prefix_cache(&mut prepared, &step);
+        assert_eq!(
+            prepared.cached_prompt_prefix.lock().unwrap().entries.len(),
+            1
+        );
+
         std::env::remove_var("CAMELID_CUDA_RESIDENT_DECODE");
     }
 

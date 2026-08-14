@@ -13154,25 +13154,29 @@ fn spec_draft_kv_context() -> usize {
         .unwrap_or(512)
 }
 
-/// Clear both resident-engine caches (target + drafter) so the next decode rebuilds them. Used
-/// when the VRAM budget changes (entering/leaving speculative coexistence). No-op without CUDA.
-#[cfg(feature = "cuda")]
+/// Clear process-global resident/model-weight caches so the next decode rebuilds them.
+///
+/// CUDA owns target + drafter engine slots and an async allocation pool. Metal owns a permanent
+/// linear-weight cache whose no-copy entries pin their host `WirePages`. Model unload/replacement
+/// invokes this as an engine-exclusive job, after dropping API registries and prompt sessions.
 pub fn reset_resident_caches() {
-    *resident_cuda_cache()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner()) = None;
-    *resident_cuda_drafter_cache()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner()) = None;
-    // The engines dropped above returned their VRAM to cudarc's stream-ordered async
-    // pool (cuMemFreeAsync), where the free-VRAM probe cannot see it. Trim the pool so
-    // the next model's resident fit decision measures the real free VRAM ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â otherwise a
-    // larger model wrongly falls back to the CPU path (the ~20x-slower symptom this
-    // unload path exists to prevent).
-    crate::cuda::release_async_pool();
+    #[cfg(feature = "cuda")]
+    {
+        *resident_cuda_cache()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+        *resident_cuda_drafter_cache()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+        // The engines dropped above returned their VRAM to cudarc's stream-ordered async
+        // pool (cuMemFreeAsync), where the free-VRAM probe cannot see it. Trim the pool so
+        // the next model's resident fit decision measures the real free VRAM ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â otherwise a
+        // larger model wrongly falls back to the CPU path (the ~20x-slower symptom this
+        // unload path exists to prevent).
+        crate::cuda::release_async_pool();
+    }
+    crate::metal::reset_model_caches();
 }
-#[cfg(not(feature = "cuda"))]
-pub fn reset_resident_caches() {}
 
 /// Prompt-lookup n-gram drafter: find the most recent earlier occurrence of the
 /// last `ngram` tokens and propose the up-to-`max_draft` tokens that followed it.

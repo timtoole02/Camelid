@@ -439,6 +439,17 @@ impl MetalLinearCache {
             .insert(key, (buffer.to_owned(), std::sync::Arc::clone(pages)));
         buffer
     }
+
+    /// Release model-owned buffers while preserving the small reusable activation/scalar
+    /// pools. Every map cleared here either owns an uploaded weight copy or, for the no-copy
+    /// lane, pins the weight's host [`crate::wire_mmap::WirePages`] allocation through an `Arc`.
+    fn clear_model_weights(&mut self) {
+        self.weight_buffers.clear();
+        self.q8_block_weight_buffers.clear();
+        self.q8_wire_weight_buffers.clear();
+        self.raw_wire_weight_buffers.clear();
+        self.q8_wire_nocopy_buffers.clear();
+    }
 }
 
 /// Hardware GPU timestamps from a completed command buffer: (GPU busy window µs,
@@ -8010,6 +8021,14 @@ fn metal_linear_cache() -> &'static Mutex<MetalLinearCache> {
 }
 
 #[cfg(target_os = "macos")]
+fn reset_model_weight_cache(cache: &Mutex<MetalLinearCache>) {
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear_model_weights();
+}
+
+#[cfg(target_os = "macos")]
 static SESSION_ACTIVE: Mutex<bool> = Mutex::new(false);
 
 #[cfg(target_os = "macos")]
@@ -8052,6 +8071,32 @@ pub fn synchronize_active_session() {
     }
     cache.scalar_index = 0;
 }
+
+/// Drop every process-global Metal weight cache after model eviction/unload/replacement.
+///
+/// The Q8/K-quant no-copy loader stores page-aligned heap allocations in
+/// `q8_wire_nocopy_buffers`, whose `Arc<WirePages>` must outlive the Metal buffer. That is
+/// correct while a model is loaded, but it also means dropping the API's weight registry alone
+/// cannot release those allocations. Model teardown enters this function as an engine-exclusive
+/// job, so first settle any command buffer that may still reference a cached weight and then
+/// release all permanent weight owners. Avoid initializing Metal on an unload that never ran a
+/// Metal operation.
+#[cfg(target_os = "macos")]
+pub(crate) fn reset_model_caches() {
+    if METAL_LINEAR_KERNEL
+        .get()
+        .and_then(std::option::Option::as_ref)
+        .is_some()
+    {
+        synchronize_active_session();
+    }
+    if let Some(cache) = METAL_LINEAR_CACHE.get() {
+        reset_model_weight_cache(cache);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn reset_model_caches() {}
 
 #[cfg(target_os = "macos")]
 fn get_active_or_new_command_buffer(kernel: &MetalLinearKernel) -> (metal::CommandBuffer, bool) {
@@ -27531,6 +27576,41 @@ mod tests {
         file.flush().expect("flush");
         crate::wire_mmap::WirePages::read_from_file(file.as_file(), 0, wire.len())
             .expect("page-backed wire fixture")
+    }
+
+    /// A no-copy Metal buffer deliberately pins its host allocation while cached. Model
+    /// teardown must break that ownership edge; otherwise each same-process unload/reload adds
+    /// another model-sized set of anonymous pages and macOS eventually compresses them rather
+    /// than making the memory available to the replacement model.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn model_cache_reset_releases_nocopy_wire_pages() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("Metal pipelines");
+        let pages = page_backed_wire_fixture(4 * 2 * 34);
+        let weak = std::sync::Arc::downgrade(&pages);
+        let cache = Mutex::new(MetalLinearCache::new());
+
+        {
+            let buffer = cache
+                .lock()
+                .expect("linear cache")
+                .q8_wire_nocopy_buffer(&kernel.device, &pages);
+            assert_eq!(buffer.length(), pages.alloc_len() as u64);
+        }
+        drop(pages);
+        assert!(
+            weak.upgrade().is_some(),
+            "the live no-copy cache must pin its WirePages backing"
+        );
+
+        reset_model_weight_cache(&cache);
+        assert!(
+            weak.upgrade().is_none(),
+            "model cache reset must release the last WirePages owner"
+        );
     }
 
     /// The hybrid Prism wire path keeps its own admission list, separate from the loader's
