@@ -281,11 +281,28 @@ pub(crate) enum WorkspaceEvent {
         total_ms: u64,
         ttft_ms: Option<u64>,
         output_tokens: Option<u32>,
+        prefill_ms: Option<u64>,
+        first_token_ms: Option<u64>,
+        decode_ms: Option<u64>,
+        reused_tokens: Option<u32>,
+        prefilled_tokens: Option<u32>,
+        engine_rebuilt: Option<bool>,
+        engine_rebuild_count: Option<u64>,
+        batched_prefill: Option<bool>,
+        resident_backend: Option<String>,
     },
     #[serde(rename = "model.answer")]
     ModelAnswer { content: String },
+    #[serde(rename = "index.timing")]
+    IndexTiming {
+        elapsed_ms: u64,
+        files_hashed: u64,
+        files_reused: u64,
+    },
     #[serde(rename = "tool.call")]
     ToolCall { detail: String },
+    #[serde(rename = "tool.timing")]
+    ToolTiming { tool: String, elapsed_ms: u64 },
     #[serde(rename = "approval.required")]
     ApprovalRequired {
         approval_id: String,
@@ -565,6 +582,30 @@ impl Reporter for WorkspaceReporter {
             total_ms: metrics.total_ms,
             ttft_ms: metrics.ttft_ms,
             output_tokens: metrics.output_tokens,
+            prefill_ms: metrics.prefill_ms,
+            first_token_ms: metrics.first_token_ms,
+            decode_ms: metrics.decode_ms,
+            reused_tokens: metrics.reused_tokens,
+            prefilled_tokens: metrics.prefilled_tokens,
+            engine_rebuilt: metrics.engine_rebuilt,
+            engine_rebuild_count: metrics.engine_rebuild_count,
+            batched_prefill: metrics.batched_prefill,
+            resident_backend: metrics.resident_backend,
+        });
+    }
+
+    fn tool_timing(&mut self, name: &str, elapsed_ms: u64) {
+        self.send(WorkspaceEvent::ToolTiming {
+            tool: name.to_string(),
+            elapsed_ms,
+        });
+    }
+
+    fn index_timing(&mut self, elapsed_ms: u64, files_hashed: u64, files_reused: u64) {
+        self.send(WorkspaceEvent::IndexTiming {
+            elapsed_ms,
+            files_hashed,
+            files_reused,
         });
     }
 

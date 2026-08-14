@@ -21,8 +21,8 @@ use super::audit::{self, AuditEvent, AuditSink};
 use super::banner;
 use super::client::{Client, StreamEnd};
 use super::context_paging::{
-    parse_typed_action, ActionPhase, CompactDiagnostic, ContextPagingConfig, ContextPagingRuntime,
-    TypedModelAction,
+    parse_typed_action, ActionPhase, CompactDiagnostic, ContextPagingConfig, ContextPagingError,
+    ContextPagingRuntime, TypedModelAction,
 };
 use super::session::{Session, CANCEL};
 use super::shell_sandbox::{self, ShellSandbox};
@@ -141,11 +141,20 @@ pub trait ModelDriver {
     fn set_max_tokens(&mut self, _max_tokens: u32) {}
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelStepMetrics {
     pub total_ms: u64,
     pub ttft_ms: Option<u64>,
     pub output_tokens: Option<u32>,
+    pub prefill_ms: Option<u64>,
+    pub first_token_ms: Option<u64>,
+    pub decode_ms: Option<u64>,
+    pub reused_tokens: Option<u32>,
+    pub prefilled_tokens: Option<u32>,
+    pub engine_rebuilt: Option<bool>,
+    pub engine_rebuild_count: Option<u64>,
+    pub batched_prefill: Option<bool>,
+    pub resident_backend: Option<String>,
 }
 
 /// The approval decision for one gated action.
@@ -188,6 +197,8 @@ pub trait Reporter {
     fn notice(&mut self, text: &str);
     fn context_budget(&mut self, _usage: ContextBudgetUsage) {}
     fn model_timing(&mut self, _metrics: ModelStepMetrics) {}
+    fn tool_timing(&mut self, _name: &str, _elapsed_ms: u64) {}
+    fn index_timing(&mut self, _elapsed_ms: u64, _files_hashed: u64, _files_reused: u64) {}
     /// Publish one agent's live ownership/status to interactive frontends.
     /// Non-interactive reporters deliberately ignore this by default.
     fn agent_update(
@@ -369,6 +380,10 @@ const PAGING_NONPROGRESS_LIMIT: usize = 16;
 /// Exact-tokenizer overflows rebuild a smaller capsule instead of failing the
 /// run, at most this many times per run.
 const PAGING_BUDGET_REBUILD_LIMIT: usize = 3;
+const PAGING_DISCOVER_MAX_TOKENS: u32 = 256;
+const PAGING_PATCH_MAX_TOKENS: u32 = 1_024;
+const PAGING_VERIFY_MAX_TOKENS: u32 = 256;
+const PAGING_COMPLETE_MAX_TOKENS: u32 = 256;
 const PAGING_FULL_REWRITE_FOCUS: &str = concat!(
     "Narrow edit recovery is exhausted. Replace the complete existing file with ",
     "write_file, preserving required behavior and correcting every persisted diagnostic."
@@ -688,6 +703,41 @@ fn source_contract_findings(history: &[AgentMsg], sources: &[(String, String)]) 
     findings
 }
 
+/// Commit deterministic post-write verification to the paged ledger. The host
+/// owns source capture and syntax checks; the model is only asked back when
+/// those checks produce a real semantic finding. Returning the compact
+/// diagnostic lets the next capsule carry the failure without replaying raw
+/// tool output.
+fn apply_paging_verification(
+    runtime: &mut ContextPagingRuntime,
+    relative: &str,
+    findings: &[String],
+) -> Result<Option<CompactDiagnostic>, ContextPagingError> {
+    if findings.is_empty() {
+        runtime.ledger.verification_state.status = "passed".into();
+        runtime.ledger.verification_state.failing_diagnostic = None;
+        runtime.ledger.verification_state.verified_symbols =
+            runtime.ledger.relevant_symbols.clone();
+        runtime.ledger.current_focus = "Return a concise verified completion summary".into();
+        return Ok(None);
+    }
+
+    let audit = findings.join("\n");
+    let diagnostic = runtime.compact_result("semantic_contract_error", None, &audit)?;
+    runtime.ledger.verification_state.status = "failed".into();
+    runtime.ledger.verification_state.failing_diagnostic = Some(diagnostic.raw_reference.clone());
+    runtime.ledger.current_focus = format!(
+        "Correct every source-contract finding in {relative}:\n- {}",
+        findings.join("\n- ")
+    );
+    runtime.ledger.failed_attempts.push(format!(
+        "The most recently verified source still failed these checks; do not copy the exact page unchanged:\n- {}",
+        findings.join("\n- ")
+    ));
+    runtime.metrics.verification_retries = runtime.metrics.verification_retries.saturating_add(1);
+    Ok(Some(diagnostic))
+}
+
 fn paging_failed_attempts_require_full_rewrite(failed_attempts: &[String]) -> bool {
     failed_attempts.iter().any(|attempt| {
         attempt.starts_with("edit_file:")
@@ -821,6 +871,11 @@ pub fn run_loop(
                     runtime.task_id,
                     runtime.project.cards.len()
                 ));
+                reporter.index_timing(
+                    runtime.metrics.last_index_refresh_ms,
+                    runtime.metrics.last_index_files_hashed,
+                    runtime.metrics.last_index_files_reused,
+                );
                 Some(runtime)
             }
             Err(error) => {
@@ -1001,10 +1056,10 @@ pub fn run_loop(
         ) =
             context_paging.as_mut()
         {
-            if let Err(error) = runtime.refresh_project() {
-                reporter.notice(&format!("context paging refresh error: {error}"));
-                return LoopEnd::DriverError;
-            }
+            // Opening the paging runtime indexed the project, and successful
+            // host-observed mutations refresh it synchronously below. Walking
+            // the whole tree again before every model action added thousands
+            // of Windows metadata calls without changing the index.
             if let Err(error) = runtime.seed_relevance_from_query(&task_objective, 1) {
                 reporter.notice(&format!("context paging relevance error: {error}"));
                 return LoopEnd::DriverError;
@@ -1129,11 +1184,16 @@ pub fn run_loop(
                 .filter(|tool| capsule.tool_names.binary_search(&tool.name).is_ok())
                 .cloned()
                 .collect::<Vec<_>>();
-            let requested = if phase == ActionPhase::Complete {
-                cfg.max_tokens.min(capsule.output_reserve).min(256)
-            } else {
-                cfg.max_tokens.min(capsule.output_reserve)
+            let phase_cap = match phase {
+                ActionPhase::Discover => PAGING_DISCOVER_MAX_TOKENS,
+                ActionPhase::Modify if direct_creation_target.is_some() || force_full_rewrite => {
+                    capsule.output_reserve
+                }
+                ActionPhase::Modify => PAGING_PATCH_MAX_TOKENS,
+                ActionPhase::Verify => PAGING_VERIFY_MAX_TOKENS,
+                ActionPhase::Complete => PAGING_COMPLETE_MAX_TOKENS,
             };
+            let requested = cfg.max_tokens.min(capsule.output_reserve).min(phase_cap);
             (
                 vec![AgentMsg::User(capsule.rendered.clone())],
                 step_tools,
@@ -2346,6 +2406,7 @@ pub fn run_loop(
                     // wait) so the run_shell change-scan below compares against
                     // the tightest honest window.
                     let action_started_at = std::time::SystemTime::now();
+                    let tool_started = Instant::now();
                     let outcome = match decision {
                         Decision::Abort => {
                             reporter.notice("aborted by user");
@@ -2421,15 +2482,53 @@ pub fn run_loop(
                     } else {
                         false
                     };
+                    let mut host_captured_sources: Vec<(String, String)> = Vec::new();
                     if !outcome.is_err() {
                         if let Action::WriteFile { path, .. } | Action::EditFile { path, .. } =
                             &action
                         {
+                            let relative = normalize_workspace_path(&sandbox.rel(path));
                             workspace_changed = true;
                             verification_reprompts = 0;
                             semantic_contract_findings.clear();
-                            pending_verification_paths
-                                .insert(normalize_workspace_path(&sandbox.rel(path)));
+                            pending_verification_paths.insert(relative.clone());
+
+                            // Context paging used to spend the next full model
+                            // turn asking for a read_file call. Capture the exact
+                            // bytes now instead: this is deterministic lifecycle
+                            // work, and the same audited read remains visible in
+                            // the activity stream and semantic acceptance gate.
+                            if context_paging.is_some() {
+                                let read_call = ToolCall {
+                                    name: "read_file".into(),
+                                    args: json!({"path": relative.clone()}),
+                                };
+                                if let Ok(read_action) =
+                                    tools::validate_for(cfg.tool_profile, &read_call, sandbox)
+                                {
+                                    reporter.tool_call(&read_action.call_line(sandbox));
+                                    let captured = execute_audited(
+                                        &read_action,
+                                        sandbox,
+                                        ApprovalTier::Auto,
+                                        &read_call.args,
+                                        cfg.audit.as_ref(),
+                                        cancel,
+                                    )
+                                    .clipped(
+                                        cfg.tool_profile.observation_limit().unwrap_or(usize::MAX),
+                                    );
+                                    reporter.tool_result("read_file", &captured);
+                                    if !captured.is_err() {
+                                        let source = captured.text().to_string();
+                                        pending_verification_paths.remove(&relative);
+                                        successful_workspace_reads.insert(relative.clone());
+                                        workspace_observations
+                                            .push(("read_file".into(), source.clone()));
+                                        host_captured_sources.push((relative, source));
+                                    }
+                                }
+                            }
                         }
                     }
                     if require_workspace_change
@@ -2460,8 +2559,41 @@ pub fn run_loop(
                         {
                             workspace_changed = true;
                             for relative in shell_changed_paths {
-                                pending_verification_paths
-                                    .insert(normalize_workspace_path(&relative));
+                                let relative = normalize_workspace_path(&relative);
+                                pending_verification_paths.insert(relative.clone());
+                                if context_paging.is_some() {
+                                    let read_call = ToolCall {
+                                        name: "read_file".into(),
+                                        args: json!({"path": relative.clone()}),
+                                    };
+                                    if let Ok(read_action) =
+                                        tools::validate_for(cfg.tool_profile, &read_call, sandbox)
+                                    {
+                                        reporter.tool_call(&read_action.call_line(sandbox));
+                                        let captured = execute_audited(
+                                            &read_action,
+                                            sandbox,
+                                            ApprovalTier::Auto,
+                                            &read_call.args,
+                                            cfg.audit.as_ref(),
+                                            cancel,
+                                        )
+                                        .clipped(
+                                            cfg.tool_profile
+                                                .observation_limit()
+                                                .unwrap_or(usize::MAX),
+                                        );
+                                        reporter.tool_result("read_file", &captured);
+                                        if !captured.is_err() {
+                                            let source = captured.text().to_string();
+                                            pending_verification_paths.remove(&relative);
+                                            successful_workspace_reads.insert(relative.clone());
+                                            workspace_observations
+                                                .push(("read_file".into(), source.clone()));
+                                            host_captured_sources.push((relative, source));
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -2496,14 +2628,26 @@ pub fn run_loop(
                     }
                     let name = action.tool_name();
                     reporter.tool_result(name, &outcome);
+                    reporter.tool_timing(
+                        name,
+                        tool_started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                    );
                     #[cfg(windows)]
                     let host_python_verification = if context_paging.is_some()
                         && workspace_changed
                         && pending_verification_paths.is_empty()
                     {
-                        match &action {
-                            Action::ReadFile { path, .. } => {
-                                let relative = normalize_workspace_path(&sandbox.rel(path));
+                        let verification_relative = host_captured_sources
+                            .first()
+                            .map(|(relative, _)| relative.clone())
+                            .or_else(|| match &action {
+                                Action::ReadFile { path, .. } => {
+                                    Some(normalize_workspace_path(&sandbox.rel(path)))
+                                }
+                                _ => None,
+                            });
+                        match verification_relative {
+                            Some(relative) => {
                                 let safe_relative = relative.chars().all(|character| {
                                     character.is_ascii_alphanumeric()
                                         || matches!(character, '.' | '_' | '-' | '/' | '\\')
@@ -2733,6 +2877,55 @@ pub fn run_loop(
                                         .notice(&format!("context paging reindex error: {error}"));
                                     return LoopEnd::DriverError;
                                 }
+                                reporter.index_timing(
+                                    runtime.metrics.last_index_refresh_ms,
+                                    runtime.metrics.last_index_files_hashed,
+                                    runtime.metrics.last_index_files_reused,
+                                );
+                                if let Some((captured_relative, _)) = host_captured_sources.first()
+                                {
+                                    semantic_contract_findings =
+                                        source_contract_findings(history, &host_captured_sources);
+                                    if let Some((command, verification)) =
+                                        host_python_verification.as_ref()
+                                    {
+                                        runtime.ledger.verification_state.last_command =
+                                            Some(command.clone());
+                                        if verification.is_err()
+                                            && python_check_blames_the_file(verification.text())
+                                        {
+                                            let mut detail = verification.text().to_string();
+                                            if let Some((boundary, _)) =
+                                                detail.char_indices().nth(400)
+                                            {
+                                                detail.truncate(boundary);
+                                                detail.push('…');
+                                            }
+                                            semantic_contract_findings.push(format!(
+                                                "Python syntax validation failed for {captured_relative}: {detail}"
+                                            ));
+                                        }
+                                    }
+                                    match apply_paging_verification(
+                                        runtime,
+                                        captured_relative,
+                                        &semantic_contract_findings,
+                                    ) {
+                                        Ok(diagnostic) => {
+                                            if diagnostic.is_some() {
+                                                paging_verification_failures =
+                                                    paging_verification_failures.saturating_add(1);
+                                            }
+                                            paging_diagnostic = diagnostic;
+                                        }
+                                        Err(error) => {
+                                            reporter.notice(&format!(
+                                                "context paging semantic artifact error: {error}"
+                                            ));
+                                            return LoopEnd::DriverError;
+                                        }
+                                    }
+                                }
                             }
                             Action::RunShell { command } => {
                                 runtime.ledger.verification_state.last_command =
@@ -2743,6 +2936,45 @@ pub fn run_loop(
                                         Some(compact.raw_reference.clone());
                                     runtime.metrics.verification_retries =
                                         runtime.metrics.verification_retries.saturating_add(1);
+                                } else if let Some((captured_relative, _)) =
+                                    host_captured_sources.first()
+                                {
+                                    if let Err(error) = runtime.refresh_project().and_then(|_| {
+                                        runtime
+                                            .seed_relevance_from_query(captured_relative, 1)
+                                            .map(|_| ())
+                                    }) {
+                                        reporter.notice(&format!(
+                                            "context paging shell reindex error: {error}"
+                                        ));
+                                        return LoopEnd::DriverError;
+                                    }
+                                    reporter.index_timing(
+                                        runtime.metrics.last_index_refresh_ms,
+                                        runtime.metrics.last_index_files_hashed,
+                                        runtime.metrics.last_index_files_reused,
+                                    );
+                                    semantic_contract_findings =
+                                        source_contract_findings(history, &host_captured_sources);
+                                    match apply_paging_verification(
+                                        runtime,
+                                        captured_relative,
+                                        &semantic_contract_findings,
+                                    ) {
+                                        Ok(diagnostic) => {
+                                            if diagnostic.is_some() {
+                                                paging_verification_failures =
+                                                    paging_verification_failures.saturating_add(1);
+                                            }
+                                            paging_diagnostic = diagnostic;
+                                        }
+                                        Err(error) => {
+                                            reporter.notice(&format!(
+                                                "context paging shell verification artifact error: {error}"
+                                            ));
+                                            return LoopEnd::DriverError;
+                                        }
+                                    }
                                 } else {
                                     runtime.ledger.verification_state.status = "passed".into();
                                     runtime.ledger.verification_state.failing_diagnostic = None;
@@ -4455,6 +4687,15 @@ impl ModelDriver for LiveDriver {
             total_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
             ttft_ms: None,
             output_tokens: turn.completion_tokens,
+            prefill_ms: None,
+            first_token_ms: None,
+            decode_ms: None,
+            reused_tokens: None,
+            prefilled_tokens: None,
+            engine_rebuilt: None,
+            engine_rebuild_count: None,
+            batched_prefill: None,
+            resident_backend: None,
         });
         // Prefer the server's STRUCTURED tool_calls (OpenAI shape): the server
         // parses the model's tool call and EMPTIES `content`, so reading only the
@@ -4531,6 +4772,7 @@ impl LiveDriver {
             "stream": stream,
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
+            "camelid_stream_timing_diagnostics": stream,
         });
         if stream {
             // The terminal usage chunk (validated server surface, oracle-matched)
@@ -4567,12 +4809,22 @@ impl LiveDriver {
             });
         self.on_delta = sink; // restore for the next step
         let (stats, content) = outcome?;
+        let timing = stats.timing.as_ref();
         self.last_step_metrics = Some(ModelStepMetrics {
             total_ms: stats.total_ms,
             ttft_ms: stats.ttft_ms,
             // From the same terminal usage chunk that carries prompt_tokens;
             // the paging lane's output-token metric depends on it.
             output_tokens: stats.completion_tokens,
+            prefill_ms: timing.and_then(|value| value.prefill_ms),
+            first_token_ms: timing.and_then(|value| value.first_token_ms),
+            decode_ms: timing.and_then(|value| value.decode_ms),
+            reused_tokens: timing.and_then(|value| value.reused_tokens),
+            prefilled_tokens: timing.and_then(|value| value.prefilled_tokens),
+            engine_rebuilt: timing.and_then(|value| value.engine_rebuilt),
+            engine_rebuild_count: timing.and_then(|value| value.engine_rebuild_count),
+            batched_prefill: timing.and_then(|value| value.batched_prefill),
+            resident_backend: timing.and_then(|value| value.resident_backend.clone()),
         });
         // The calibration signal for the compaction budget, from the terminal
         // usage chunk the streaming request opts into.
@@ -5601,14 +5853,14 @@ mod tests {
                             .to_string(),
                         )
                     }
-                    1 => ModelStep::Calls(vec![tc("read_file", json!({"path": "src/lib.rs"}))]),
-                    _ => ModelStep::Text(
+                    1 => ModelStep::Text(
                         json!({
                             "action": "COMPLETE",
                             "summary": "Changed increment and verified the saved source."
                         })
                         .to_string(),
                     ),
+                    _ => panic!("host verification should remove the read-only model turn"),
                 };
                 self.step += 1;
                 Ok(response)
@@ -5654,7 +5906,7 @@ mod tests {
             &mut history,
         );
         assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
-        assert_eq!(driver.histories.len(), 3);
+        assert_eq!(driver.histories.len(), 2);
         assert!(driver.histories.iter().all(|history| history.len() == 1));
         assert!(driver.histories.iter().all(|history| matches!(
             history.first(),
@@ -5662,9 +5914,9 @@ mod tests {
                 if capsule.starts_with("You are Camelid's Context Paging coding agent.")
         )));
         assert!(driver.tool_names[0].contains(&"edit_file".to_string()));
-        assert!(!driver.tool_names[0].contains(&"run_shell".to_string()));
-        assert_eq!(driver.tool_names[1], vec!["read_file".to_string()]);
-        let final_capsule = match &driver.histories[2][0] {
+        assert!(driver.tool_names[0].contains(&"run_shell".to_string()));
+        assert!(driver.tool_names[1].is_empty());
+        let final_capsule = match &driver.histories[1][0] {
             AgentMsg::User(capsule) => capsule,
             other => panic!("expected final fresh capsule, got {other:?}"),
         };
@@ -5747,18 +5999,13 @@ mod tests {
     }
 
     #[test]
-    fn typed_complete_before_host_verification_is_rejected() {
+    fn typed_complete_after_immediate_host_verification_is_accepted() {
         let _checkpoint_guard = super::super::checkpoint::tests::cp_lock();
         let (directory, sandbox) = paging_workspace();
         let mut driver = ScriptedPagingDriver {
             steps: vec![
                 paging_patch_step(directory.path()),
                 ModelStep::Text(json!({"action": "COMPLETE", "summary": "All done."}).to_string()),
-                ModelStep::Calls(vec![tc("read_file", json!({"path": "src/lib.rs"}))]),
-                ModelStep::Text(
-                    json!({"action": "COMPLETE", "summary": "Changed increment and verified it."})
-                        .to_string(),
-                ),
             ],
             index: 0,
             histories: Vec::new(),
@@ -5779,16 +6026,13 @@ mod tests {
             &mut history,
         );
         assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
-        assert!(
-            reporter
-                .notices
-                .iter()
-                .any(|notice| notice.contains("typed COMPLETE rejected")),
-            "the unverified COMPLETE must be rejected: {:?}",
-            reporter.notices
-        );
-        // The persisted ledger records a verified completion only after the
-        // host verification actually ran.
+        assert_eq!(driver.histories.len(), 2);
+        assert!(!reporter
+            .notices
+            .iter()
+            .any(|notice| notice.contains("typed COMPLETE rejected")));
+        // The deterministic host read ran in the write lifecycle, so the next
+        // model action may complete without a read-only verification turn.
         let ledger_dir = directory.path().join(".camelid/context-paging/ledgers");
         let ledger_file = std::fs::read_dir(&ledger_dir)
             .unwrap()
@@ -5801,18 +6045,13 @@ mod tests {
     }
 
     #[test]
-    fn prose_answer_before_host_verification_is_reprompted() {
+    fn prose_answer_after_immediate_host_verification_is_accepted() {
         let _checkpoint_guard = super::super::checkpoint::tests::cp_lock();
         let (directory, sandbox) = paging_workspace();
         let mut driver = ScriptedPagingDriver {
             steps: vec![
                 paging_patch_step(directory.path()),
                 ModelStep::Text("The change is complete and everything works.".into()),
-                ModelStep::Calls(vec![tc("read_file", json!({"path": "src/lib.rs"}))]),
-                ModelStep::Text(
-                    json!({"action": "COMPLETE", "summary": "Changed increment and verified it."})
-                        .to_string(),
-                ),
             ],
             index: 0,
             histories: Vec::new(),
@@ -5833,15 +6072,11 @@ mod tests {
             &mut history,
         );
         assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
-        assert!(
-            reporter
-                .notices
-                .iter()
-                .any(|notice| notice.contains("prose completion before host verification")),
-            "the premature prose answer must be reprompted: {:?}",
-            reporter.notices
-        );
-        assert_eq!(driver.histories.len(), 4);
+        assert!(!reporter
+            .notices
+            .iter()
+            .any(|notice| notice.contains("prose completion before host verification")));
+        assert_eq!(driver.histories.len(), 2);
         super::super::checkpoint::clear_for_workspace(sandbox.root());
     }
 
@@ -6048,16 +6283,6 @@ mod tests {
                         )])
                     }
                     1 => {
-                        assert_eq!(
-                            tools
-                                .iter()
-                                .map(|tool| tool.name.as_str())
-                                .collect::<Vec<_>>(),
-                            vec!["read_file"]
-                        );
-                        ModelStep::Calls(vec![tc("read_file", json!({"path":"tic_tac_toe.py"}))])
-                    }
-                    _ => {
                         assert!(tools.is_empty());
                         ModelStep::Text(
                             json!({
@@ -6067,6 +6292,7 @@ mod tests {
                             .to_string(),
                         )
                     }
+                    _ => panic!("host verification should remove the read-only model turn"),
                 };
                 self.step += 1;
                 Ok(response)
@@ -6125,7 +6351,7 @@ mod tests {
         );
 
         assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
-        assert_eq!(driver.step, 3);
+        assert_eq!(driver.step, 2);
         assert_eq!(
             std::fs::read_to_string(directory.path().join("tic_tac_toe.py")).unwrap(),
             source

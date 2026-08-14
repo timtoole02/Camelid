@@ -71,7 +71,12 @@ async function main() {
   // --- Prefill benchmark (depth-N) ---
   const prefillRuns = []
   for (let i = 0; i < runs; i++) {
-    const r = await timed(() => complete(longPrompt, 1))
+    // Change the FIRST user token, not a suffix. Resident prefix continuation
+    // is a production win, but reusing the entire benchmark prompt would turn
+    // this into a prefix-cache benchmark and hide actual prefill throughput.
+    const nonce = String.fromCharCode(65 + (i % 26)).repeat(12)
+    const uniquePrompt = `${nonce} benchmark sample ${i}.\n${longPrompt}`
+    const r = await timed(() => complete(uniquePrompt, 1))
     prefillRuns.push(r)
   }
   const promptTok = prefillRuns[0].promptTokens
@@ -96,6 +101,7 @@ async function main() {
       prompt_tokens: promptTok,
       tok_s: stats(prefillTokS),
       total_ms: stats(prefillRuns.map((r) => r.ms)),
+      resident_receipts: prefillRuns.map((r) => r.residentPrefill).filter(Boolean),
     },
     note: 'median-of-N, same session; RTX 3060 Laptop 6GB. Pre-optimization baseline.',
   }
@@ -145,9 +151,13 @@ async function complete(prompt, maxTokens) {
 
 async function timed(fn) {
   const start = process.hrtime.bigint()
-  const { promptTokens } = await fn()
+  const { body, promptTokens } = await fn()
   const end = process.hrtime.bigint()
-  return { ms: Number(end - start) / 1e6, promptTokens }
+  return {
+    ms: Number(end - start) / 1e6,
+    promptTokens,
+    residentPrefill: body?.timings?.prompt_evaluation?.resident_prefill ?? null,
+  }
 }
 
 function buildLongPrompt(approxTokens) {

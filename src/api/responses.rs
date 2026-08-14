@@ -239,6 +239,7 @@ impl ResponsesRequest {
             camelid_logit_token_ids: None,
             camelid_dense_diagnostics: None,
             camelid_dense_diagnostic_generated_index: None,
+            camelid_stream_timing_diagnostics: None,
             camelid_context_budget_tokens: None,
             camelid_receipt: None,
             camelid_enable_thinking: None,

@@ -3784,6 +3784,135 @@ extern "C" __global__ void q6k_gemm_batched_wide(
     }
 }
 
+// Q6_K prefill tile for Windows/WDDM: keep every token/aux accumulator in a
+// register across the complete contraction and unpack each row's 6-bit weights
+// once per warp/super-block. The previous wide kernel did four scalar products
+// per inner iteration and spilled k*8 f32 accumulators to shared memory. Here a
+// lane owns one of the eight exact aux sums for four interleaved tokens, and
+// `dp4a` evaluates the (l,l+8) pair in one instruction. Integer grouping is
+// exact; the final eight f32 aux lanes are folded in the same left-to-right
+// order as q6k_gemm_batched_wide, preserving output parity.
+extern "C" __global__ void q6k_gemm_batched_dp4a(
+    const float* __restrict__ input_scales,
+    const signed char* __restrict__ input_quants,
+    const unsigned char* __restrict__ weight_bytes,
+    int rows, int n_sb, int k_tokens, int rows_per_warp, float* __restrict__ output
+) {
+    extern __shared__ unsigned char smem6d[];
+    signed char* s_iq = (signed char*)smem6d;                    // k_tokens * 256
+    float* s_is = (float*)(smem6d + (long)k_tokens * 256);       // k_tokens
+    unsigned char* warp_base = smem6d + (long)k_tokens * 260;   // 276 bytes / warp
+
+    const int WIRE = 224;
+    const int WARP_BYTES = 276;
+    const int MAX_TOKEN_ITERS = 16; // launcher caps this kernel at 64 tokens
+    int tid = threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int tslot = lane >> 3;       // four tokens per warp
+    int aux_lane = lane & 7;     // exact l/l+8 accumulator
+    long row_base = ((long)blockIdx.x * warps_per_block + warp) * rows_per_warp;
+    int iters = (k_tokens + 3) >> 2;
+
+    signed char* wq = (signed char*)(warp_base + (long)warp * WARP_BYTES);
+    signed char* ws = wq + 256;
+    float* wd = (float*)(wq + 272);
+
+    for (int r = 0; r < rows_per_warp; r++) {
+        long row = row_base + r;
+        bool active = row < rows;
+        float sums[MAX_TOKEN_ITERS];
+        #pragma unroll
+        for (int it = 0; it < MAX_TOKEN_ITERS; it++) sums[it] = 0.0f;
+
+        for (int sb = 0; sb < n_sb; sb++) {
+            // Every block stages one activation super-block. The barrier at
+            // the top also protects the prior iteration's shared reads.
+            __syncthreads();
+            for (int i = tid; i < k_tokens * 64; i += blockDim.x) {
+                int t = i >> 6;
+                int word = i & 63;
+                ((int*)s_iq)[(long)t * 64 + word] =
+                    ((const int*)input_quants)[((long)t * n_sb + sb) * 64 + word];
+            }
+            for (int i = tid; i < k_tokens; i += blockDim.x)
+                s_is[i] = input_scales[(long)i * n_sb + sb];
+            __syncthreads();
+
+            const unsigned char* blk = active
+                ? weight_bytes + (row * n_sb + sb) * WIRE
+                : (const unsigned char*)0;
+
+            // Cooperative exact Q6_K unpack: 32 lanes x 8 values = 256.
+            // Group j owns scale[j] and two dp4a bytes at aux and aux+8.
+            #pragma unroll
+            for (int pass = 0; pass < 8; pass++) {
+                int p = lane + (pass << 5);
+                int half = p >> 7;
+                int group = (p >> 4) & 7;
+                int pos = p & 15;
+                int pair = group >> 1;
+                int odd_group = group & 1;
+                int ql_offset = half * 64 + (pair & 1) * 32 + odd_group * 16 + pos;
+                int qh_offset = 128 + half * 32 + odd_group * 16 + pos;
+                int value = 0;
+                if (active) {
+                    int ql = (int)blk[ql_offset];
+                    int qh = (int)blk[qh_offset];
+                    int low = pair < 2 ? (ql & 15) : (ql >> 4);
+                    value = (low | (((qh >> (2 * pair)) & 3) << 4)) - 32;
+                }
+                wq[p] = (signed char)value;
+            }
+            if (lane < 16) ws[lane] = active ? (signed char)blk[192 + lane] : 0;
+            if (lane == 0) {
+                wd[0] = active
+                    ? f16_bits_to_f32((unsigned short)blk[208] | ((unsigned short)blk[209] << 8))
+                    : 0.0f;
+            }
+            __syncwarp();
+
+            #pragma unroll
+            for (int it = 0; it < MAX_TOKEN_ITERS; it++) {
+                if (it >= iters) break;
+                int t = (it << 2) + tslot;
+                if (active && t < k_tokens) {
+                    const signed char* y = s_iq + (long)t * 256;
+                    int exact_aux = 0;
+                    #pragma unroll
+                    for (int j = 0; j < 16; j++) {
+                        int p = (j << 4) + aux_lane;
+                        int wp = (int)(unsigned char)wq[p]
+                            | ((int)(unsigned char)wq[p + 8] << 8);
+                        int yp = (int)(unsigned char)y[p]
+                            | ((int)(unsigned char)y[p + 8] << 8);
+                        exact_aux += (int)ws[j] * __dp4a(wp, yp, 0);
+                    }
+                    sums[it] += wd[0] * s_is[t] * (float)exact_aux;
+                }
+            }
+        }
+
+        // All lanes execute every shuffle. The first lane in each 8-lane token
+        // group performs the same deterministic aux[0]..aux[7] f32 fold as the
+        // reference wide kernel.
+        #pragma unroll
+        for (int it = 0; it < MAX_TOKEN_ITERS; it++) {
+            if (it >= iters) break;
+            int t = (it << 2) + tslot;
+            float sum = 0.0f;
+            #pragma unroll
+            for (int src = 0; src < 8; src++) {
+                float value = __shfl_sync(0xffffffffu, sums[it], (tslot << 3) + src);
+                if (aux_lane == 0) sum += value;
+            }
+            if (active && aux_lane == 0 && t < k_tokens)
+                output[(long)t * rows + row] = sum;
+        }
+    }
+}
+
 // ---- RoPE: supports adjacent-even-odd (pairing=0) and split-half/NEOX (pairing=1).
 // cos/sin are per-pair (rope_dim/2). ---
 extern "C" __global__ void rope_rotate(
@@ -6093,6 +6222,7 @@ pub struct CudaResidentKernels {
     pub(crate) q6k_gemm_batched: CudaFunction,
     pub(crate) q4k_gemm_batched_wide: CudaFunction,
     pub(crate) q6k_gemm_batched_wide: CudaFunction,
+    pub(crate) q6k_gemm_batched_dp4a: CudaFunction,
     pub(crate) quantize_q8k: CudaFunction,
     pub(crate) rms_norm_quantize_q8k: CudaFunction,
     pub(crate) silu_mul_quantize_q8k: CudaFunction,
@@ -6298,6 +6428,7 @@ impl CudaResidentKernels {
             q6k_gemm_batched: f("q6k_gemm_batched")?,
             q4k_gemm_batched_wide: f("q4k_gemm_batched_wide")?,
             q6k_gemm_batched_wide: f("q6k_gemm_batched_wide")?,
+            q6k_gemm_batched_dp4a: f("q6k_gemm_batched_dp4a")?,
             quantize_q8k: f("quantize_q8k")?,
             rms_norm_quantize_q8k: f("rms_norm_quantize_q8k")?,
             silu_mul_quantize_q8k: f("silu_mul_quantize_q8k")?,
@@ -7913,18 +8044,32 @@ fn dispatch_gemm_batched(
             out,
         ),
         ProjQuant::Q6K if kquant_narrow_is_crowded(cols, k_tokens, 8) => {
-            launch_kquant_gemm_batched_wide(
-                s,
-                &kern.q6k_gemm_batched_wide,
-                q8k_scales,
-                q8k_quants,
-                weight,
-                rows,
-                cols / 256,
-                k_tokens,
-                8,
-                out,
-            )
+            if q6k_dp4a_prefill_enabled() {
+                launch_q6k_gemm_batched_dp4a(
+                    s,
+                    &kern.q6k_gemm_batched_dp4a,
+                    q8k_scales,
+                    q8k_quants,
+                    weight,
+                    rows,
+                    cols / 256,
+                    k_tokens,
+                    out,
+                )
+            } else {
+                launch_kquant_gemm_batched_wide(
+                    s,
+                    &kern.q6k_gemm_batched_wide,
+                    q8k_scales,
+                    q8k_quants,
+                    weight,
+                    rows,
+                    cols / 256,
+                    k_tokens,
+                    8,
+                    out,
+                )
+            }
         }
         ProjQuant::Q6K => launch_kquant_gemm_batched(
             s,
@@ -8401,6 +8546,57 @@ pub(crate) fn launch_kquant_gemm_batched_wide(
         .arg(&ns)
         .arg(&kt)
         .arg(&rpw)
+        .arg(out);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Default-on replacement for the scalar/shared-accumulator Q6_K wide tile.
+/// The escape hatch is deliberately narrow so paired Windows benchmarks can
+/// compare the two kernels without changing batching or any other schedule.
+fn q6k_dp4a_prefill_enabled() -> bool {
+    !std::env::var_os("CAMELID_CUDA_Q6K_DP4A").is_some_and(|value| {
+        let value = value.to_string_lossy();
+        let value = value.trim();
+        value == "0" || value.eq_ignore_ascii_case("false") || value.eq_ignore_ascii_case("off")
+    })
+}
+
+fn q6k_dp4a_shared_bytes(k_tokens: u32, warps: u32) -> u32 {
+    k_tokens * 260 + warps * 276
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_q6k_gemm_batched_dp4a(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    in_scales: &CudaSlice<f32>,
+    in_quants: &CudaSlice<i8>,
+    weight: &CudaSlice<u8>,
+    rows: usize,
+    n_sb: usize,
+    k_tokens: usize,
+    out: &mut CudaSlice<f32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    const MAX_TOKENS: usize = 64;
+    assert!(
+        (1..=MAX_TOKENS).contains(&k_tokens),
+        "Q6_K dp4a batch must contain 1..={MAX_TOKENS} tokens"
+    );
+    let shared = q6k_dp4a_shared_bytes(k_tokens as u32, KQUANT_WIDE_WARPS);
+    let cfg = LaunchConfig {
+        grid_dim: ((rows as u32).div_ceil(KQUANT_WIDE_WARPS), 1, 1),
+        block_dim: (KQUANT_WIDE_WARPS * 32, 1, 1),
+        shared_mem_bytes: shared,
+    };
+    let (r, ns, kt, rows_per_warp) = (rows as i32, n_sb as i32, k_tokens as i32, 1_i32);
+    let mut b = s.launch_builder(f);
+    b.arg(in_scales)
+        .arg(in_quants)
+        .arg(weight)
+        .arg(&r)
+        .arg(&ns)
+        .arg(&kt)
+        .arg(&rows_per_warp)
         .arg(out);
     unsafe { b.launch(cfg) }.map(|_| ())
 }
@@ -11606,39 +11802,21 @@ impl CudaResidentDecode {
                 }))
     }
 
-    /// Default policy after same-host Windows/WDDM benchmarking. Q8_0 batching
-    /// remains a clear win; K-quant stays on the serial GEMV.
+    /// Default policy after the Q6_K dp4a/register-accumulator promotion on the
+    /// Windows SM86 reference host. The earlier wide Q6_K tile was correctly
+    /// kept opt-in: it spilled k*8 accumulators to shared memory and decoded
+    /// every 6-bit value with scalar byte operations. The replacement is
+    /// bit-identical at k={1,2,8,32}, makes a representative 2,560x9,728 Q6_K
+    /// projection 2.62x faster (62.953 -> 24.042 ms), and flips the mixed
+    /// Qwen3-4B Q4_K_M whole-model result decisively:
     ///
-    /// The wide K-quant kernels below remove the structural reason K-quant
-    /// could not batch (the narrow tiles lose warps as the chunk widens, so
-    /// they could only run 2-4 tokens and a k=4 prefill measured 2.2x SLOWER
-    /// than per-token). They are parity-proven and can run k=32. They are
-    /// still NOT the default, because a PAIRED, interleaved, thermally
-    /// controlled A/B on the reference RTX 3060 Laptop showed no gain:
+    ///   298-token prompt: serial 22.72 tok/s, old batched 57.01, new 85.43
+    ///   858-token prompt: serial 21.98 tok/s, new batched 52.16 (sd 0.11)
     ///
-    ///   serial 202.1s / 213.5s      wide 208.8s / 210.4s   (4019-token prefill)
-    ///
-    /// Sequential measurements taken earlier appeared to show 195s -> 106s, but
-    /// that was thermal drift on a laptop GPU under hours of sustained load,
-    /// not the kernel. Anyone re-measuring this must interleave the arms and
-    /// cool between runs, or they will measure the cooling system.
-    ///
-    /// The nsys breakdown says where a real win has to come from: GEMMs are
-    /// 92% of prefill GPU time (attention only 6.4%), and these kernels sustain
-    /// roughly 4 GB/s against a card capable of ~250 — `q6k_gemm_batched_wide`
-    /// alone is 46.7% of the time from 2142 calls, being ~6x slower per call
-    /// than the Q4_K path because Q6_K decodes with scalar byte loads instead
-    /// of `__dp4a`. Register-resident accumulators over a 128x128 CTA tile (the
-    /// shape the Prism BMMA kernel already uses) plus a dp4a Q6_K lane is the
-    /// work that would move this; a wider chunk alone does not.
+    /// The explicit prefill-batched and Q6-dp4a environment switches remain
+    /// independent rollback/A-B controls.
     pub fn prefers_batched_prefill(&self) -> bool {
         self.supports_batched_prefill()
-            && self.layers.iter().all(|layer| {
-                layer
-                    .quants
-                    .iter()
-                    .all(|q| matches!(q, ProjQuant::Q8_0 | ProjQuant::Q1_0))
-            })
     }
 
     /// Whether linear speculative verification can use the batched stack,

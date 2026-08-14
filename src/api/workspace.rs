@@ -38,6 +38,8 @@ const EVENT_BACKLOG: usize = 1024;
 const EVENT_STREAM_BUFFER: usize = 1024;
 const DEFAULT_MAX_STEPS: usize = 12;
 const MAX_STEPS: usize = 32;
+const DEFAULT_CODE_MAX_STEPS: usize = 48;
+const MAX_CODE_STEPS: usize = 128;
 // A coding step routinely carries a whole file in a `write_file` argument. At
 // the old 512/1024 the call was cut off mid-JSON, parsed as no call at all, and
 // landed in the transcript as a mangled "answer" with the write silently lost.
@@ -64,7 +66,11 @@ fn thread_id_belongs_to_mode(thread_id: &str, mode: WorkspaceRunMode) -> bool {
 
 fn workspace_max_steps(mode: WorkspaceRunMode, requested: Option<usize>) -> Result<usize, ()> {
     if mode.is_code() {
-        return Ok(0);
+        let max_steps = requested.unwrap_or(DEFAULT_CODE_MAX_STEPS);
+        return (1..=MAX_CODE_STEPS)
+            .contains(&max_steps)
+            .then_some(max_steps)
+            .ok_or(());
     }
     let max_steps = requested.unwrap_or(DEFAULT_MAX_STEPS);
     (1..=MAX_STEPS)
@@ -181,6 +187,28 @@ struct WorkspaceActivitySnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    total_model_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttft_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefill_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reused_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefilled_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    engine_rebuilt: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resident_backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_tool_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    index_refresh_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    index_files_hashed: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    index_files_reused: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     terminal_outcome: Option<String>,
     agents: Vec<WorkspaceAgentActivity>,
 }
@@ -197,6 +225,17 @@ impl WorkspaceActivitySnapshot {
             task: task.to_string(),
             current_tool: None,
             output_tokens: None,
+            total_model_ms: None,
+            ttft_ms: None,
+            prefill_ms: None,
+            reused_tokens: None,
+            prefilled_tokens: None,
+            engine_rebuilt: None,
+            resident_backend: None,
+            last_tool_ms: None,
+            index_refresh_ms: None,
+            index_files_hashed: None,
+            index_files_reused: None,
             terminal_outcome: None,
             agents: vec![WorkspaceAgentActivity {
                 id: "main".to_string(),
@@ -294,12 +333,33 @@ impl WorkspaceActivitySnapshot {
                 self.current_tool = None;
                 self.sync_main(Some("running"));
             }
-            WorkspaceEvent::ModelTiming { output_tokens, .. } => {
+            WorkspaceEvent::ModelTiming {
+                total_ms,
+                ttft_ms,
+                output_tokens,
+                prefill_ms,
+                reused_tokens,
+                prefilled_tokens,
+                engine_rebuilt,
+                resident_backend,
+                ..
+            } => {
                 self.output_tokens = *output_tokens;
-                self.detail = output_tokens.map_or_else(
-                    || "The model finished a generation step".to_string(),
-                    |tokens| format!("The model finished a {tokens}-token generation step"),
-                );
+                self.total_model_ms = Some(*total_ms);
+                self.ttft_ms = *ttft_ms;
+                self.prefill_ms = *prefill_ms;
+                self.reused_tokens = *reused_tokens;
+                self.prefilled_tokens = *prefilled_tokens;
+                self.engine_rebuilt = *engine_rebuilt;
+                self.resident_backend = resident_backend.clone();
+                let tokens = output_tokens
+                    .map(|tokens| format!("{tokens} output tokens"))
+                    .unwrap_or_else(|| "generation step".to_string());
+                let cache = reused_tokens
+                    .filter(|tokens| *tokens > 0)
+                    .map(|tokens| format!(", reused {tokens} prompt tokens"))
+                    .unwrap_or_default();
+                self.detail = format!("The model finished {tokens}{cache}");
                 self.sync_main(None);
             }
             WorkspaceEvent::ModelAnswer { .. } => {
@@ -309,12 +369,24 @@ impl WorkspaceActivitySnapshot {
                 self.current_tool = None;
                 self.sync_main(None);
             }
+            WorkspaceEvent::IndexTiming {
+                elapsed_ms,
+                files_hashed,
+                files_reused,
+            } => {
+                self.index_refresh_ms = Some(*elapsed_ms);
+                self.index_files_hashed = Some(*files_hashed);
+                self.index_files_reused = Some(*files_reused);
+            }
             WorkspaceEvent::ToolCall { detail } => {
                 self.phase = "running".to_string();
                 self.stage = "tool".to_string();
                 self.detail = detail.clone();
                 self.current_tool = Some(detail.clone());
                 self.sync_main(Some("running"));
+            }
+            WorkspaceEvent::ToolTiming { elapsed_ms, .. } => {
+                self.last_tool_ms = Some(*elapsed_ms);
             }
             WorkspaceEvent::ToolResult { tool, outcome, .. } => {
                 self.phase = "running".to_string();
@@ -1419,17 +1491,23 @@ pub(super) async fn create_session(
         );
     }
     let mode = request.mode;
-    // Code mode is user-cancellable and has a result-aware no-progress guard,
-    // so it does not impose an arbitrary number of model/tool turns. A zero
-    // internal value means unlimited; read-only Workspace keeps its bounded
-    // request contract.
+    // Code mode gets a generous explicit ceiling in addition to its
+    // result-aware no-progress guards. A broken small-model recovery loop must
+    // not turn 20-second local inference steps into an unbounded overnight run.
     let max_steps = match workspace_max_steps(mode, request.max_steps) {
         Ok(max_steps) => max_steps,
         Err(()) => {
             return api_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_workspace_limits",
-                format!("max_steps must be between 1 and {MAX_STEPS}"),
+                format!(
+                    "max_steps must be between 1 and {}",
+                    if mode.is_code() {
+                        MAX_CODE_STEPS
+                    } else {
+                        MAX_STEPS
+                    }
+                ),
                 Some("max_steps"),
             )
         }
@@ -2896,9 +2974,16 @@ mod tests {
     }
 
     #[test]
-    fn code_sessions_have_no_arbitrary_step_limit() {
-        assert_eq!(workspace_max_steps(WorkspaceRunMode::Code, None), Ok(0));
-        assert_eq!(workspace_max_steps(WorkspaceRunMode::Code, Some(20)), Ok(0));
+    fn code_sessions_have_a_generous_but_finite_step_limit() {
+        assert_eq!(
+            workspace_max_steps(WorkspaceRunMode::Code, None),
+            Ok(DEFAULT_CODE_MAX_STEPS)
+        );
+        assert_eq!(
+            workspace_max_steps(WorkspaceRunMode::Code, Some(20)),
+            Ok(20)
+        );
+        assert!(workspace_max_steps(WorkspaceRunMode::Code, Some(MAX_CODE_STEPS + 1)).is_err());
         assert_eq!(
             workspace_max_steps(WorkspaceRunMode::ReadOnly, None),
             Ok(DEFAULT_MAX_STEPS)

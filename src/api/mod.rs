@@ -843,6 +843,11 @@ pub struct ChatCompletionRequest {
     pub camelid_logit_token_ids: Option<Vec<u32>>,
     pub camelid_dense_diagnostics: Option<bool>,
     pub camelid_dense_diagnostic_generated_index: Option<u32>,
+    /// Private agent/UI opt-in for the compact timing object on the terminal
+    /// streaming chunk. Unlike the process-wide environment switch, this lets
+    /// local interactive clients observe their own cold/warm path without
+    /// enabling verbose diagnostics for every API caller.
+    pub camelid_stream_timing_diagnostics: Option<bool>,
     /// Optional hard ceiling for the exact rendered prompt plus generation.
     /// Workspace sets this private extension; ordinary OpenAI callers omit it.
     pub camelid_context_budget_tokens: Option<u32>,
@@ -1712,6 +1717,8 @@ pub struct PromptEvaluationTimings {
     pub prefill_memory: Option<crate::inference::LlamaForwardMemoryTimings>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_token_memory: Option<crate::inference::LlamaForwardMemoryTimings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resident_prefill: Option<crate::inference::ResidentPrefillMetrics>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -15105,7 +15112,7 @@ async fn completions(
     if stream {
         // Text-completion streaming does not implement stream_options yet
         // (scope: chat-completions only), so usage is never emitted here.
-        return stream_completion(&state, prepared, false, false, false);
+        return stream_completion(&state, prepared, false, false, false, false);
     }
 
     // The decode runs on the engine worker; CancelOnDrop stops it within one
@@ -15506,6 +15513,7 @@ async fn chat_completions(
     // request. Threaded into stream_completion; ignored on the non-streaming
     // branch, which already returns `usage`.
     let include_usage = stream_options_include_usage(req.stream_options.as_ref());
+    let request_timing_diagnostics = req.camelid_stream_timing_diagnostics.unwrap_or(false);
     let req = GenerationSessionRequest {
         model: req.model,
         prompt: None,
@@ -15572,6 +15580,7 @@ async fn chat_completions(
             true,
             include_usage,
             tools_active && !constraint_active,
+            request_timing_diagnostics,
         );
     }
 
@@ -18257,6 +18266,7 @@ fn gpu_sampled_generation_step(
         },
         prefill_timings: LlamaForwardTimings::default(),
         first_token_timings: LlamaForwardTimings::default(),
+        resident_prefill: None,
         sample: 0,
         diagnostics: None,
     })
@@ -18705,6 +18715,7 @@ fn sample_cached_prompt_prefix(
         timings: LlamaForwardTimings::default(),
         prefill_timings: LlamaForwardTimings::default(),
         first_token_timings: LlamaForwardTimings::default(),
+        resident_prefill: None,
         sample: sample_started.elapsed().as_micros(),
         diagnostics: None,
     })
@@ -19841,6 +19852,7 @@ fn prompt_evaluation_timings_from_step(step: &LlamaGenerationStep) -> PromptEval
         first_token_layers: generation_layer_timings_from_forward(&step.first_token_timings.layers),
         prefill_memory: step.prefill_timings.memory.clone(),
         first_token_memory: step.first_token_timings.memory.clone(),
+        resident_prefill: step.resident_prefill.clone(),
     }
 }
 
@@ -19991,6 +20003,7 @@ fn stream_timing_diagnostics_json(
                 "prompt_cache_hit": timings.prompt_cache_hit,
                 "session_create": timings.session_create,
                 "prefill_forward_total": timings.prompt_evaluation.prefill.forward_total,
+                "resident_prefill": timings.prompt_evaluation.resident_prefill,
                 "first_token_forward_total": timings.prompt_evaluation.first_token.forward_total,
                 "generation_forward_total": timings.generation.forward_total,
                 "prefill_role_timings": stream_role_timings_json(&timings.prompt_evaluation.prefill, &timings.prompt_evaluation.prefill_layers),
@@ -20799,6 +20812,7 @@ fn stream_completion(
     chat: bool,
     include_usage: bool,
     parse_stream_tool_calls: bool,
+    request_timing_diagnostics: bool,
 ) -> Response {
     // Speculation only runs in the non-streaming loop; streaming requests on
     // a spec-enabled server keep the unchanged vanilla path (including the
@@ -20809,7 +20823,8 @@ fn stream_completion(
     // Captured before the job so the streaming usage frame reports the exact
     // same prompt count as the non-streaming path (single source of truth).
     let prompt_token_count = prepared.token_ids.len();
-    let stream_timing_diagnostics = stream_timing_diagnostics_enabled();
+    let stream_timing_diagnostics =
+        request_timing_diagnostics || stream_timing_diagnostics_enabled();
     let stream_poll_yield = stream_poll_yield_enabled();
     let stream_id = if chat {
         format!("chatcmpl-{}", uuid::Uuid::new_v4())
@@ -23886,6 +23901,7 @@ mod tests {
             &state,
             orphan_test_prepared("model-a.gguf"),
             true,
+            false,
             false,
             false,
         );

@@ -228,13 +228,22 @@ function LiveActivitySummary({ activity, running }) {
   const tokenText = Number.isFinite(activity.output_tokens)
     ? `${activity.output_tokens} tokens in the latest model step`
     : null
+  const timingText = Number.isFinite(activity.ttft_ms)
+    ? `${activity.ttft_ms}ms TTFT`
+    : (Number.isFinite(activity.total_model_ms) ? `${(activity.total_model_ms / 1000).toFixed(1)}s model` : null)
+  const reuseText = Number.isFinite(activity.reused_tokens) && activity.reused_tokens > 0
+    ? `${activity.reused_tokens} prompt tokens reused`
+    : null
+  const indexText = Number.isFinite(activity.index_refresh_ms)
+    ? `${activity.index_refresh_ms}ms index`
+    : null
   return (
     <article className={`code-live-summary ${running ? 'is-running' : 'is-terminal'}`} role="status">
       <span className="code-live-summary__pulse">{running ? <span className="code-live-dot" /> : <IconCheckCircle size={15} />}</span>
       <div>
         <strong>{running ? 'Current activity' : (PHASE_LABEL[activity.phase] || 'Last activity')}</strong>
         <p>{activity.detail || 'Waiting for the next agent update'}</p>
-        <small>{[activity.stage ? formatToolName(activity.stage) : null, tokenText].filter(Boolean).join(' · ')}</small>
+        <small>{[activity.stage ? formatToolName(activity.stage) : null, tokenText, timingText, reuseText, indexText].filter(Boolean).join(' · ')}</small>
       </div>
     </article>
   )
@@ -326,8 +335,21 @@ function ActivityEvent({ event, pairedResult, activeApproval, decisionBusy, onDe
       Number.isFinite(event.total_ms) ? `${(event.total_ms / 1000).toFixed(1)}s` : null,
       Number.isFinite(event.output_tokens) ? `${event.output_tokens} tokens` : null,
       Number.isFinite(event.ttft_ms) ? `${event.ttft_ms}ms to first token` : null,
+      Number.isFinite(event.prefill_ms) ? `${event.prefill_ms}ms prefill` : null,
+      Number.isFinite(event.reused_tokens) && event.reused_tokens > 0 ? `${event.reused_tokens} reused` : null,
+      event.engine_rebuilt === true ? `${event.resident_backend || 'resident'} cold build` : null,
+      event.engine_rebuilt === false && event.resident_backend ? `${event.resident_backend} warm` : null,
+      typeof event.batched_prefill === 'boolean' ? (event.batched_prefill ? 'batched prefill' : 'serial prefill') : null,
     ].filter(Boolean)
     return <div className="code-meta-event"><IconBolt size={13} /><span>{bits.join(' · ')}</span></div>
+  }
+
+  if (event.event === 'index.timing') {
+    return <div className="code-meta-event"><IconHistory size={13} /><span>{event.elapsed_ms || 0}ms index · {event.files_hashed || 0} hashed · {event.files_reused || 0} reused</span></div>
+  }
+
+  if (event.event === 'tool.timing') {
+    return <div className="code-meta-event"><IconBolt size={13} /><span>{formatToolName(event.tool)} · {event.elapsed_ms || 0}ms</span></div>
   }
 
   if (event.event === 'memory.compacted') {

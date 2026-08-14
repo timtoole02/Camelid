@@ -5033,6 +5033,24 @@ fn q6k_gemm_batched_wide_is_bit_identical_to_narrow() {
         k.stream.memcpy_dtoh(&d_wide, &mut wide).unwrap();
         k.ctx.synchronize().unwrap();
 
+        let mut dp4a = vec![0f32; k_tokens * rows];
+        let mut d_dp4a = k.stream.alloc_zeros::<f32>(k_tokens * rows).unwrap();
+        super::launch_q6k_gemm_batched_dp4a(
+            &k.stream,
+            &k.q6k_gemm_batched_dp4a,
+            &d_is,
+            &d_iq,
+            &d_w,
+            rows,
+            n_sb,
+            k_tokens,
+            &mut d_dp4a,
+        )
+        .unwrap();
+        k.stream.memcpy_dtoh(&d_dp4a, &mut dp4a).unwrap();
+        k.ctx.synchronize().unwrap();
+        assert_same_bits(&format!("dp4a vs wide Q6_K k={k_tokens}"), &dp4a, &wide);
+
         if !super::kquant_narrow_is_crowded(kdim, k_tokens, 8) {
             let mut narrow = vec![0f32; k_tokens * rows];
             let mut d_narrow = k.stream.alloc_zeros::<f32>(k_tokens * rows).unwrap();
@@ -5100,6 +5118,103 @@ fn kquant_wide_token_cap_keeps_eight_warps() {
     let huge = super::kquant_wide_token_cap(9, 8, 4096);
     let rows = super::kquant_wide_rows_per_warp(huge, 9);
     assert!(huge * 260 + 8 * rows * huge * 9 * 4 <= 46 * 1024);
+}
+
+#[test]
+fn q6k_dp4a_tile_removes_shared_accumulator_pressure() {
+    for k in [1u32, 2, 8, 32, 64] {
+        let bytes = super::q6k_dp4a_shared_bytes(k, 8);
+        assert_eq!(bytes, k * 260 + 8 * 276);
+        assert!(bytes <= 19 * 1024, "k={k} unexpectedly needs {bytes} B");
+    }
+    assert!(
+        super::q6k_dp4a_shared_bytes(32, 8) < super::kquant_wide_shared_bytes(32, 8, 1, 8),
+        "register accumulation must beat the prior k*8 shared spill"
+    );
+}
+
+/// Representative Qwen3 FFN-width A/B on the Windows reference GPU. This is a
+/// manual promotion receipt, not a timing assertion: CI GPUs and WDDM clocks
+/// vary. Run with `--ignored --nocapture` and compare median per-launch time.
+#[test]
+#[ignore = "requires a CUDA device; manual Q6_K promotion benchmark"]
+fn q6k_dp4a_prefill_benchmark_against_wide() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let (rows, n_sb, k_tokens) = (2_560usize, 38usize, 32usize);
+    let kdim = n_sb * 256;
+    let mut rng = Lcg(0x4450_3441_5f51_364b);
+    let wire = synth_q6k_wire(rows, n_sb, &mut rng);
+    let weights = super::pad_q6k_blocks(&wire);
+    let mut in_scales = Vec::with_capacity(k_tokens * n_sb);
+    let mut in_quants = Vec::with_capacity(k_tokens * kdim);
+    for _ in 0..k_tokens {
+        let act: Vec<f32> = (0..kdim).map(|_| rng.next_f32()).collect();
+        for block in &crate::inference::quantize_q8_k_blocks(&act) {
+            in_scales.push(block.d);
+            in_quants.extend_from_slice(&block.qs);
+        }
+    }
+    let d_is = k.stream.clone_htod(&in_scales).unwrap();
+    let d_iq = k.stream.clone_htod(&in_quants).unwrap();
+    let d_w = k.stream.clone_htod(&weights).unwrap();
+    let mut d_out = k.stream.alloc_zeros::<f32>(k_tokens * rows).unwrap();
+
+    let mut wide_ms = Vec::new();
+    let mut dp4a_ms = Vec::new();
+    const LAUNCHES: usize = 12;
+    for _round in 0..7 {
+        let wide = {
+            let started = std::time::Instant::now();
+            for _ in 0..LAUNCHES {
+                super::launch_kquant_gemm_batched_wide(
+                    &k.stream,
+                    &k.q6k_gemm_batched_wide,
+                    &d_is,
+                    &d_iq,
+                    &d_w,
+                    rows,
+                    n_sb,
+                    k_tokens,
+                    8,
+                    &mut d_out,
+                )
+                .unwrap();
+            }
+            k.ctx.synchronize().unwrap();
+            started.elapsed().as_secs_f64() * 1_000.0 / LAUNCHES as f64
+        };
+        let dp4a = {
+            let started = std::time::Instant::now();
+            for _ in 0..LAUNCHES {
+                super::launch_q6k_gemm_batched_dp4a(
+                    &k.stream,
+                    &k.q6k_gemm_batched_dp4a,
+                    &d_is,
+                    &d_iq,
+                    &d_w,
+                    rows,
+                    n_sb,
+                    k_tokens,
+                    &mut d_out,
+                )
+                .unwrap();
+            }
+            k.ctx.synchronize().unwrap();
+            started.elapsed().as_secs_f64() * 1_000.0 / LAUNCHES as f64
+        };
+        wide_ms.push(wide);
+        dp4a_ms.push(dp4a);
+    }
+    wide_ms.sort_by(f64::total_cmp);
+    dp4a_ms.sort_by(f64::total_cmp);
+    let wide = wide_ms[wide_ms.len() / 2];
+    let dp4a = dp4a_ms[dp4a_ms.len() / 2];
+    eprintln!(
+        "Q6_K k={k_tokens} rows={rows} n_sb={n_sb}: wide={wide:.3} ms, dp4a={dp4a:.3} ms, speedup={:.2}x",
+        wide / dp4a
+    );
 }
 
 // Build `rows*n_sb` synthetic Q5_K_M super-blocks (176 bytes each, row-major):
