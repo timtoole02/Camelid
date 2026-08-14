@@ -201,15 +201,23 @@ pub(crate) struct TaskLedger {
 impl TaskLedger {
     pub(crate) fn new(objective: impl Into<String>) -> Self {
         let objective = objective.into();
+        let (mut acceptance_criteria, mut invariants) =
+            extract_objective_contract_items(&objective);
+        if acceptance_criteria.is_empty() {
+            acceptance_criteria.push(
+                "The requested workspace outcome is implemented and narrowly verified".into(),
+            );
+        }
+        if invariants.is_empty() {
+            invariants.push(
+                "Preserve Camelid sandbox, approval, checkpoint, and audit boundaries".into(),
+            );
+        }
         Self {
             current_focus: objective.clone(),
             objective,
-            acceptance_criteria: vec![
-                "The requested workspace outcome is implemented and narrowly verified".into(),
-            ],
-            invariants: vec![
-                "Preserve Camelid sandbox, approval, checkpoint, and audit boundaries".into(),
-            ],
+            acceptance_criteria,
+            invariants,
             decisions: Vec::new(),
             completed_work: Vec::new(),
             open_questions: Vec::new(),
@@ -233,6 +241,123 @@ impl TaskLedger {
         bound_list(&mut self.failed_attempts);
         bound_list(&mut self.relevant_symbols);
         bound_list(&mut self.verification_state.verified_symbols);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ObjectiveContractSection {
+    Acceptance,
+    Invariant,
+}
+
+/// Pull explicit Markdown contract bullets out of a written task spec. The
+/// complete objective remains canonical persisted state; these bounded lists
+/// only make requirements near the end of a long spec visible in every model
+/// capsule. Source order is deterministic, with the final item retained when
+/// a section is longer than the rendered contract can carry.
+fn extract_objective_contract_items(objective: &str) -> (Vec<String>, Vec<String>) {
+    let mut section = None;
+    let mut acceptance = Vec::new();
+    let mut invariants = Vec::new();
+    for raw_line in objective.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(next) = objective_contract_heading(line) {
+            section = Some(next);
+            continue;
+        }
+        if line.starts_with('#') || line.ends_with(':') {
+            section = None;
+            continue;
+        }
+        let Some(mut item) = markdown_bullet_item(line) else {
+            continue;
+        };
+        if let Some(stripped) = item
+            .strip_prefix("[ ] ")
+            .or_else(|| item.strip_prefix("[x] "))
+            .or_else(|| item.strip_prefix("[X] "))
+        {
+            item = stripped.trim();
+        }
+        if let Some((label, value)) = item.split_once(':') {
+            if let Some(explicit) = objective_contract_heading(label) {
+                push_objective_contract_item(explicit, value, &mut acceptance, &mut invariants);
+                continue;
+            }
+        }
+        if let Some(active) = section {
+            push_objective_contract_item(active, item, &mut acceptance, &mut invariants);
+        }
+    }
+    bound_extracted_contract_items(&mut acceptance);
+    bound_extracted_contract_items(&mut invariants);
+    (acceptance, invariants)
+}
+
+fn objective_contract_heading(line: &str) -> Option<ObjectiveContractSection> {
+    let normalized = line
+        .trim_start_matches('#')
+        .trim()
+        .trim_end_matches(':')
+        .trim()
+        .to_ascii_lowercase();
+    match normalized.as_str() {
+        "acceptance"
+        | "acceptance criterion"
+        | "acceptance criteria"
+        | "success criteria"
+        | "definition of done" => Some(ObjectiveContractSection::Acceptance),
+        "constraint"
+        | "constraints"
+        | "invariant"
+        | "invariants"
+        | "critical invariants"
+        | "must preserve" => Some(ObjectiveContractSection::Invariant),
+        _ => None,
+    }
+}
+
+fn markdown_bullet_item(line: &str) -> Option<&str> {
+    for marker in ["- ", "* ", "+ "] {
+        if let Some(item) = line.strip_prefix(marker) {
+            return Some(item.trim());
+        }
+    }
+    let (ordinal, item) = line.split_once(". ").or_else(|| line.split_once(") "))?;
+    ordinal
+        .bytes()
+        .all(|byte| byte.is_ascii_digit())
+        .then(|| item.trim())
+}
+
+fn push_objective_contract_item(
+    section: ObjectiveContractSection,
+    item: &str,
+    acceptance: &mut Vec<String>,
+    invariants: &mut Vec<String>,
+) {
+    if item.is_empty() {
+        return;
+    }
+    match section {
+        ObjectiveContractSection::Acceptance => acceptance.push(item.to_string()),
+        ObjectiveContractSection::Invariant => invariants.push(item.to_string()),
+    }
+}
+
+fn bound_extracted_contract_items(items: &mut Vec<String>) {
+    for item in items.iter_mut() {
+        bound_item(item, MAX_LEDGER_ITEM_CHARS);
+    }
+    let mut seen = BTreeSet::new();
+    items.retain(|item| seen.insert(item.clone()));
+    if items.len() > MAX_CONTRACT_ITEMS {
+        let final_item = items.pop().expect("length was checked");
+        items.truncate(MAX_CONTRACT_ITEMS - 1);
+        items.push(final_item);
     }
 }
 
@@ -1902,12 +2027,16 @@ fn category_order(category: &str) -> u8 {
     match category {
         "stable_kernel" => 0,
         "task" => 1,
-        "task_detail" => 2,
-        "map" => 3,
-        "card" => 4,
-        "page" => 5,
-        "diagnostic" => 6,
-        "tools" => 7,
+        "map" => 2,
+        "card" => 3,
+        "page" => 4,
+        "diagnostic" => 5,
+        "tools" => 6,
+        // Decisions and open questions are mutable ledger state. Keep every
+        // ledger-derived tail section after the structural/tool evidence so a
+        // phase or decision update does not invalidate unchanged CUDA KV rows
+        // for the project map, symbol cards, and exact source pages.
+        "task_detail" => 7,
         "completed_work" => 8,
         "action" => 9,
         _ => 10,
@@ -1933,8 +2062,7 @@ fn add_composition(composition: &mut CapsuleComposition, category: &str, tokens:
 /// in `render_current_action` at the capsule tail so ordinary phase changes can
 /// reuse all KV rows through this contract and the unchanged source evidence.
 fn render_stable_task_contract(ledger: &TaskLedger) -> String {
-    let mut objective = ledger.objective.clone();
-    bound_item(&mut objective, MAX_CONTRACT_FIELD_CHARS);
+    let objective = bounded_head_tail(&ledger.objective, MAX_CONTRACT_FIELD_CHARS);
     format!(
         concat!(
             "<task_contract>\n",
@@ -1947,6 +2075,33 @@ fn render_stable_task_contract(ledger: &TaskLedger) -> String {
         bounded_bullets(&ledger.acceptance_criteria),
         bounded_bullets(&ledger.invariants),
     )
+}
+
+/// Bound immutable prose without silently dropping requirements written at
+/// the end. This is rendering-only: the persisted ledger keeps the complete
+/// objective, and the deterministic split therefore remains byte-stable for
+/// the lifetime of that objective.
+fn bounded_head_tail(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    const OMITTED: &str = "\n...[objective middle omitted]...\n";
+    if max_bytes <= OMITTED.len() {
+        let mut prefix = value.to_string();
+        bound_item(&mut prefix, max_bytes);
+        return prefix;
+    }
+    let available = max_bytes - OMITTED.len();
+    let mut head_end = available / 2;
+    while head_end > 0 && !value.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let tail_budget = available - head_end;
+    let mut tail_start = value.len().saturating_sub(tail_budget);
+    while tail_start < value.len() && !value.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!("{}{}{}", &value[..head_end], OMITTED, &value[tail_start..])
 }
 
 fn render_current_action(ledger: &TaskLedger, current_action: &str, phase: ActionPhase) -> String {
@@ -3151,6 +3306,131 @@ mod tests {
         assert!(verify
             .rendered
             .contains("<usable_tools phase=\"Verify\">read_file,run_shell</usable_tools>"));
+    }
+
+    #[test]
+    fn mutable_ledger_and_phase_changes_preserve_source_evidence_prefix() {
+        let (_directory, memory, symbol) = fixture();
+        let mandatory = BTreeSet::from([symbol.clone()]);
+        let mut before_ledger = ledger(&symbol);
+        before_ledger
+            .decisions
+            .push("Keep the helper unchanged".into());
+        let before =
+            ContextCapsuleBuilder::new(ContextPagingConfig::default(), ConservativeTokenEstimator)
+                .build(ContextCapsuleRequest {
+                    ledger: &before_ledger,
+                    current_action: "Inspect increment",
+                    phase: ActionPhase::Discover,
+                    relevant_symbols: std::slice::from_ref(&symbol),
+                    mandatory_symbols: &mandatory,
+                    project: &memory,
+                    diagnostic: None,
+                    available_tools: &tools(),
+                })
+                .unwrap();
+
+        let mut after_ledger = before_ledger.clone();
+        after_ledger.decisions = vec!["Replace the increment body exactly".into()];
+        after_ledger.touch();
+        let after =
+            ContextCapsuleBuilder::new(ContextPagingConfig::default(), ConservativeTokenEstimator)
+                .build(ContextCapsuleRequest {
+                    ledger: &after_ledger,
+                    current_action: "Patch increment",
+                    phase: ActionPhase::Modify,
+                    relevant_symbols: std::slice::from_ref(&symbol),
+                    mandatory_symbols: &mandatory,
+                    project: &memory,
+                    diagnostic: None,
+                    available_tools: &tools(),
+                })
+                .unwrap();
+
+        let page_end_marker = "</exact_source_page>\n";
+        let page_end = before
+            .rendered
+            .find(page_end_marker)
+            .map(|start| start + page_end_marker.len())
+            .expect("the unchanged exact source page must be rendered");
+        let shared_prefix_bytes = before
+            .rendered
+            .bytes()
+            .zip(after.rendered.bytes())
+            .take_while(|(left, right)| left == right)
+            .count();
+        assert!(
+            shared_prefix_bytes >= page_end,
+            "mutable ledger/phase state changed before the exact source page ended: shared={shared_prefix_bytes}, page_end={page_end}"
+        );
+
+        let tools_start = after.rendered.find("<usable_tools").unwrap();
+        let task_detail_start = after.rendered.find("<task_detail>").unwrap();
+        assert!(page_end <= tools_start);
+        assert!(tools_start < task_detail_start);
+    }
+
+    #[test]
+    fn long_written_spec_persists_whole_objective_and_renders_final_acceptance() {
+        let (directory, memory, symbol) = fixture();
+        let final_acceptance =
+            "FINAL_WINDOWS_ACCEPTANCE: the Code agent completes a PowerShell-backed edit";
+        let preliminary_acceptance = (1..=8)
+            .map(|index| format!("- Preliminary acceptance criterion {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let objective = format!(
+            concat!(
+                "Build the Windows agentic Code experience.\n",
+                "{}\n",
+                "## Constraints\n",
+                "- Preserve the sandbox and approval boundaries\n",
+                "## Acceptance Criteria\n",
+                "{}\n",
+                "- {}\n"
+            ),
+            "Detailed implementation background for the agent runtime. ".repeat(100),
+            preliminary_acceptance,
+            final_acceptance,
+        );
+        assert!(objective.len() > 4 * 1024);
+
+        let mut task = TaskLedger::new(objective.clone());
+        task.relevant_symbols = vec![symbol.clone()];
+        assert_eq!(task.acceptance_criteria.len(), MAX_CONTRACT_ITEMS);
+        assert_eq!(task.acceptance_criteria.last().unwrap(), final_acceptance);
+        assert_eq!(
+            task.invariants,
+            vec!["Preserve the sandbox and approval boundaries"]
+        );
+        let store = TaskLedgerStore::for_workspace(directory.path());
+        store.save("task-long-written-spec", &task).unwrap();
+        let restored = store
+            .load_or_create("task-long-written-spec", &objective)
+            .unwrap();
+        assert_eq!(restored.objective, objective);
+
+        let mandatory = BTreeSet::from([symbol.clone()]);
+        let capsule =
+            ContextCapsuleBuilder::new(ContextPagingConfig::default(), ConservativeTokenEstimator)
+                .build(ContextCapsuleRequest {
+                    ledger: &restored,
+                    current_action: "Implement the Windows task spec",
+                    phase: ActionPhase::Modify,
+                    relevant_symbols: std::slice::from_ref(&symbol),
+                    mandatory_symbols: &mandatory,
+                    project: &memory,
+                    diagnostic: None,
+                    available_tools: &tools(),
+                })
+                .unwrap();
+        assert!(capsule
+            .rendered
+            .contains("Build the Windows agentic Code experience."));
+        assert!(capsule
+            .rendered
+            .contains("...[objective middle omitted]..."));
+        assert!(capsule.rendered.contains(final_acceptance));
     }
 
     #[test]

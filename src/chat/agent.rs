@@ -356,9 +356,8 @@ const CAPPED_RETRY_LIMIT: usize = 2;
 /// The evidence guards below assume `read_file` is the only way to observe a
 /// file. In Code mode that is no longer true — a model can `cat`, `wc` or `grep`
 /// through `run_shell`, or learn a file by editing it — so a model that answered
-/// correctly from a shell observation was re-prompted forever. Code has no step
-/// cap, so "forever" was literal: the turn only ended when the user pressed
-/// Stop. Insisting a bounded number of times keeps the guard's value (a model
+/// correctly from a shell observation could burn the entire Code step budget.
+/// Insisting a bounded number of times keeps the guard's value (a model
 /// that invents file contents gets pushed to look) without letting it own the
 /// turn.
 const EVIDENCE_REPROMPT_LIMIT: usize = 3;
@@ -373,8 +372,8 @@ const VERIFICATION_REPROMPT_LIMIT: usize = 2;
 /// produce several distinct-but-still-wrong rewrites, each of which would
 /// otherwise create another checkpoint and consume another long inference.
 const CONTEXT_PAGING_VERIFICATION_FAILURE_LIMIT: usize = 3;
-/// The web Code lane runs without a step ceiling, so the typed-action paths
-/// that `continue` without executing anything need their own bound: this many
+/// The web Code lane has a generous step ceiling, so typed-action paths that
+/// `continue` without executing anything still need a tighter bound: this many
 /// consecutive model steps with no executed workspace action end the run.
 const PAGING_NONPROGRESS_LIMIT: usize = 16;
 /// Exact-tokenizer overflows rebuild a smaller capsule instead of failing the
@@ -404,6 +403,49 @@ const MALFORMED_TOOL_REPROMPT_LIMIT: usize = 2;
 /// Qwen3-class models intermittently emit a `<think>` block and stop without
 /// ever writing the answer or the tool call it just talked itself into.
 const THINKING_ONLY_RESUME_LIMIT: usize = 2;
+/// How many times one model step may be retried after a TRANSIENT failure.
+const MODEL_STEP_RETRY_LIMIT: usize = 2;
+
+/// Is this driver error worth retrying with an identical prompt?
+///
+/// Only failures whose cause is the transport or a momentarily busy server. A
+/// rejected request, a bad template, or a refusal is deterministic — retrying
+/// it burns a decode to fail the same way. Matched on the message because the
+/// driver surfaces errors as strings.
+fn is_transient_model_error(error: &str) -> bool {
+    let lowered = error.to_ascii_lowercase();
+    const TRANSIENT: &[&str] = &[
+        "timed out",
+        "timeout",
+        "connection",
+        "connect",
+        "broken pipe",
+        "reset by peer",
+        "eof",
+        "temporarily",
+        "unavailable",
+        "503",
+        "502",
+        "504",
+        "429",
+        "overloaded",
+        "busy",
+    ];
+    TRANSIENT.iter().any(|needle| lowered.contains(needle))
+}
+
+/// Retry backoff for production model calls. Unit tests replace only the wait
+/// with zero time; they still drive the real retry branch and its state changes.
+#[cfg(not(test))]
+fn model_step_retry_backoff(attempt: usize) -> Duration {
+    Duration::from_millis(250 * attempt as u64)
+}
+
+#[cfg(test)]
+fn model_step_retry_backoff(_attempt: usize) -> Duration {
+    Duration::ZERO
+}
+
 /// Catch a model that evades the exact-repeat guard by changing arguments while
 /// receiving the same failure. This mirrors OpenClaw's narrow tail-churn rule:
 /// same tool, at least two variants, stable error result.
@@ -1281,11 +1323,32 @@ pub fn run_loop(
                 budget_tokens,
             ));
         }
-        let mut step = match driver.step(&compiled_history, &step_tools) {
-            Ok(s) => s,
-            Err(e) => {
-                reporter.notice(&format!("model error: {e}"));
-                return LoopEnd::DriverError;
+        // A transport blip must not discard a turn that has already paid for
+        // every prior step. Retry a TRANSIENT failure a bounded number of times:
+        // the retry sends a byte-identical prompt, so it re-uses the prefix
+        // cache and costs almost nothing. A deterministic failure (a rejected
+        // request, a template error) is not retried — it would fail identically.
+        let mut step = {
+            let mut attempt = 0usize;
+            loop {
+                match driver.step(&compiled_history, &step_tools) {
+                    Ok(s) => break s,
+                    Err(e) if attempt < MODEL_STEP_RETRY_LIMIT && is_transient_model_error(&e) => {
+                        attempt += 1;
+                        reporter.notice(&format!(
+                            "model step failed ({e}); retrying ({attempt}/{MODEL_STEP_RETRY_LIMIT})"
+                        ));
+                        if cancel.load(Ordering::Relaxed) {
+                            reporter.notice("aborted");
+                            return LoopEnd::Aborted;
+                        }
+                        std::thread::sleep(model_step_retry_backoff(attempt));
+                    }
+                    Err(e) => {
+                        reporter.notice(&format!("model error: {e}"));
+                        return LoopEnd::DriverError;
+                    }
+                }
             }
         };
         if let Some(metrics) = driver.take_step_metrics() {
@@ -3904,19 +3967,48 @@ fn compile_history_for_step(history: &[AgentMsg], profile: tools::ToolProfile) -
     let keep_from = tool_groups.last().copied().unwrap_or(history.len());
     let mut compiled = history[..=current_user].to_vec();
     if keep_from > current_user + 1 {
-        let mut evidence = String::from("Earlier tool observations from this turn:\n");
+        // ONE MESSAGE PER OBSERVATION, oldest first — never one rebuilt blob.
+        //
+        // The blob this replaces was regenerated every step and gained a line
+        // each time, and it sat immediately after the user's goal. That put the
+        // divergence point at the FRONT of the turn, so every step re-prefilled
+        // the entire turn and the prompt-prefix cache could never hit on this
+        // lane. Emitting each observation separately keeps every earlier message
+        // byte-identical from one step to the next, so the shared prefix now
+        // runs through all of them and only the newest group differs.
+        //
+        // The budget is spent oldest-first for the same reason: an entry that
+        // has already been sent must keep its exact bytes, so newer entries are
+        // what gets dropped, and the drop marker is a single stable message.
+        const EVIDENCE_BUDGET_BYTES: usize = 1_024;
+        const PER_OBSERVATION_BYTES: usize = 256;
+        let mut spent = 0usize;
+        let mut omitted = 0usize;
         for message in &history[current_user + 1..keep_from] {
-            if let AgentMsg::ToolResult { name, outcome } = message {
-                let line = format!("- {name}: {}\n", outcome.text());
-                if evidence.len().saturating_add(line.len()) > 1_024 {
-                    evidence.push_str("...[older observations omitted]\n");
-                    break;
+            let AgentMsg::ToolResult { name, outcome } = message else {
+                continue;
+            };
+            let text = outcome.text();
+            let mut line = format!("- {name}: {text}");
+            if line.len() > PER_OBSERVATION_BYTES {
+                let mut end = PER_OBSERVATION_BYTES;
+                while end > 0 && !line.is_char_boundary(end) {
+                    end -= 1;
                 }
-                evidence.push_str(&line);
+                line.truncate(end);
+                line.push('…');
             }
+            if spent.saturating_add(line.len()) > EVIDENCE_BUDGET_BYTES {
+                omitted += 1;
+                continue;
+            }
+            spent += line.len();
+            compiled.push(AgentMsg::Memory(line));
         }
-        if evidence.lines().count() > 1 {
-            compiled.push(AgentMsg::Memory(evidence));
+        if omitted > 0 {
+            compiled.push(AgentMsg::Memory(format!(
+                "…[{omitted} more observation(s) from this turn omitted]"
+            )));
         }
     }
     compiled.extend_from_slice(&history[keep_from..]);
@@ -4157,11 +4249,26 @@ fn digest(message: &AgentMsg) -> Option<String> {
         AgentMsg::System(_) | AgentMsg::Memory(_) | AgentMsg::Summary(_) => None,
         AgentMsg::User(text) => Some(format!("- you asked: {}", first_line(text, 120))),
         AgentMsg::Assistant(text) => Some(format!("- you replied: {}", first_line(text, 120))),
+        // Name AND path. "called: read_file" tells a compacted model nothing it
+        // can act on, so the commonest post-compaction waste is re-reading a
+        // file it already read. The path comes from the agent's OWN arguments,
+        // not from tool output, so retaining it is consistent with the
+        // retention rule below (which governs observations, not requests).
         AgentMsg::ToolCalls(calls) => Some(format!(
             "- called: {}",
             calls
                 .iter()
-                .map(|call| call.name.as_str())
+                .map(|call| {
+                    match call
+                        .args
+                        .get("path")
+                        .and_then(|value| value.as_str())
+                        .filter(|path| !path.is_empty())
+                    {
+                        Some(path) => format!("{}({path})", call.name),
+                        None => call.name.clone(),
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         )),
@@ -4461,14 +4568,13 @@ pub fn system_prompt(sandbox: &Sandbox, tools: &[ToolSpec]) -> String {
              from inside the session, so never retry a refused path unchanged.\n",
         );
     }
-    s.push_str("Available tools:\n");
+    // NAME AND RISK ONLY. The full description already ships in the JSON tool
+    // schema on the same request (`tools_to_json`), so listing it here sent
+    // every description twice — pure duplicated tokens in the cache-stable
+    // prefix, on every single step.
+    s.push_str("Available tools (full parameters in the tool schema):\n");
     for t in tools {
-        s.push_str(&format!(
-            "- {} [{}]: {}\n",
-            t.name,
-            t.risk.label(),
-            t.description
-        ));
+        s.push_str(&format!("- {} [{}]\n", t.name, t.risk.label()));
     }
     let scope = if sandbox.fs_unrestricted() {
         "Work across the computer as needed for the goal"
@@ -5854,6 +5960,34 @@ mod tests {
         }
     }
 
+    /// Scripted failure/success driver that records the exact serialized model
+    /// inputs for each attempt. This makes retry-prefix stability an assertion,
+    /// rather than an inference from a successful second call.
+    struct RetryProbeDriver {
+        responses: VecDeque<Result<ModelStep, String>>,
+        requests: Vec<(Vec<u8>, Vec<u8>)>,
+        cancel_on_error: Option<std::sync::Arc<AtomicBool>>,
+    }
+
+    impl ModelDriver for RetryProbeDriver {
+        fn step(&mut self, history: &[AgentMsg], tools: &[ToolSpec]) -> Result<ModelStep, String> {
+            self.requests.push((
+                serde_json::to_vec(history).expect("history serializes"),
+                serde_json::to_vec(&tools_to_json(tools)).expect("tool schemas serialize"),
+            ));
+            let response = self
+                .responses
+                .pop_front()
+                .expect("retry probe received an unexpected model call");
+            if response.is_err() {
+                if let Some(cancel) = &self.cancel_on_error {
+                    cancel.store(true, Ordering::Release);
+                }
+            }
+            response
+        }
+    }
+
     fn cfg(dir: &std::path::Path, auto: bool) -> AgentConfig {
         AgentConfig {
             workdir: dir.to_path_buf(),
@@ -5873,6 +6007,122 @@ mod tests {
             ctx_budget: None,
             context_paging: false,
         }
+    }
+
+    #[test]
+    fn transient_model_step_retries_identical_request_and_succeeds() {
+        let directory = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::new(directory.path(), false, Duration::from_secs(5)).unwrap();
+        let mut driver = RetryProbeDriver {
+            responses: vec![
+                Err("connection reset by peer".to_string()),
+                Ok(ModelStep::Text("recovered answer".to_string())),
+            ]
+            .into(),
+            requests: Vec::new(),
+            cancel_on_error: None,
+        };
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("answer after a transport blip".into())];
+
+        let end = run_loop(
+            &mut driver,
+            &mut ScriptApprover(Vec::new(), 0),
+            &mut reporter,
+            &sandbox,
+            &cfg(directory.path(), false),
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Answered);
+        assert_eq!(reporter.text, vec!["recovered answer"]);
+        assert_eq!(driver.requests.len(), 2);
+        assert_eq!(
+            driver.requests[0], driver.requests[1],
+            "retry must preserve byte-identical history and tool schemas for prefix reuse"
+        );
+        assert_eq!(
+            reporter
+                .notices
+                .iter()
+                .filter(|notice| notice.contains("retrying (1/2)"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn deterministic_model_step_failure_is_not_retried() {
+        let directory = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::new(directory.path(), false, Duration::from_secs(5)).unwrap();
+        let mut driver = RetryProbeDriver {
+            responses: vec![Err("invalid chat template".to_string())].into(),
+            requests: Vec::new(),
+            cancel_on_error: None,
+        };
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("answer".into())];
+
+        let end = run_loop(
+            &mut driver,
+            &mut ScriptApprover(Vec::new(), 0),
+            &mut reporter,
+            &sandbox,
+            &cfg(directory.path(), false),
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::DriverError);
+        assert_eq!(driver.requests.len(), 1);
+        assert!(reporter
+            .notices
+            .iter()
+            .any(|notice| notice == "model error: invalid chat template"));
+        assert!(!reporter
+            .notices
+            .iter()
+            .any(|notice| notice.contains("retrying")));
+    }
+
+    #[test]
+    fn transient_model_step_cancellation_stops_before_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::new(directory.path(), false, Duration::from_secs(5)).unwrap();
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let mut driver = RetryProbeDriver {
+            responses: vec![Err("temporarily unavailable".to_string())].into(),
+            requests: Vec::new(),
+            cancel_on_error: Some(std::sync::Arc::clone(&cancel)),
+        };
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("answer".into())];
+
+        let end = run_loop(
+            &mut driver,
+            &mut ScriptApprover(Vec::new(), 0),
+            &mut reporter,
+            &sandbox,
+            &cfg(directory.path(), false),
+            cancel.as_ref(),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Aborted);
+        assert_eq!(
+            driver.requests.len(),
+            1,
+            "cancel must prevent a second call"
+        );
+        assert!(reporter
+            .notices
+            .iter()
+            .any(|notice| notice.contains("retrying (1/2)")));
+        assert_eq!(reporter.notices.last().map(String::as_str), Some("aborted"));
     }
 
     #[test]
@@ -6724,6 +6974,75 @@ mod tests {
         assert!(!prompt.contains("Available tools:"));
     }
 
+    /// THE prefix-cache property. Consecutive steps of one turn must share the
+    /// longest possible token prefix: the goal AND every earlier observation.
+    ///
+    /// The compiler used to emit one `Memory` blob that was REBUILT and grew by
+    /// a line each step, sitting immediately after the user goal — so the very
+    /// first message after the goal differed every step, the prompt-prefix
+    /// cache could never hit on this lane, and each step re-prefilled the whole
+    /// turn. Prefill dominates wall clock here, so this was the single largest
+    /// avoidable cost in the loop.
+    #[test]
+    fn consecutive_steps_share_every_message_except_the_newest_group() {
+        let observation = |name: &str, text: &str| AgentMsg::ToolResult {
+            name: name.into(),
+            outcome: ToolOutcome::Ok(text.into()),
+        };
+        let mut history = vec![AgentMsg::User("Fix the auth bug.".into())];
+        let profile = tools::ToolProfile::WorkspaceReadOnly;
+
+        // Step 2: one completed exchange behind us.
+        history.push(AgentMsg::ToolCalls(vec![tc(
+            "search",
+            json!({"pattern":"login"}),
+        )]));
+        history.push(observation("search", "src/auth.rs:10"));
+        history.push(AgentMsg::ToolCalls(vec![tc(
+            "read_file",
+            json!({"path":"a.rs"}),
+        )]));
+        history.push(observation("read_file", "fn login() {}"));
+        let step_a = compile_history_for_step(&history, profile);
+
+        // Step 3: another exchange lands.
+        history.push(AgentMsg::ToolCalls(vec![tc(
+            "read_file",
+            json!({"path":"b.rs"}),
+        )]));
+        history.push(observation("read_file", "fn logout() {}"));
+        let step_b = compile_history_for_step(&history, profile);
+
+        let render = |messages: &[AgentMsg]| {
+            messages
+                .iter()
+                .map(|m| match m {
+                    AgentMsg::User(t) | AgentMsg::Memory(t) | AgentMsg::Assistant(t) => t.clone(),
+                    AgentMsg::System(t) => t.clone(),
+                    AgentMsg::ToolCalls(c) => format!("{c:?}"),
+                    AgentMsg::ToolResult { name, outcome } => {
+                        format!("{name}{}", outcome.text())
+                    }
+                    AgentMsg::Summary(t) => t.clone(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let a = render(&step_a);
+        let b = render(&step_b);
+        let shared = a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count();
+
+        // The goal plus the older observation must be byte-identical, so the
+        // divergence point is the newest group — NOT the message after the goal.
+        assert!(
+            shared >= 2,
+            "steps diverge too early: only {shared} leading messages match\nA: {a:#?}\nB: {b:#?}"
+        );
+        assert!(
+            b[..shared].iter().any(|m| m.contains("src/auth.rs:10")),
+            "the older observation must be inside the shared prefix: {b:#?}"
+        );
+    }
+
     #[test]
     fn workspace_history_compiler_keeps_only_latest_native_tool_exchange() {
         let history = vec![
@@ -6905,10 +7224,15 @@ mod tests {
                 .count(),
             6
         );
+        // The generic budget clip is anchored without inventing a file cursor.
+        // The original read may have started at an arbitrary line, while shell
+        // and search observations pass through the same fitter; exact file
+        // continuations are emitted by read_file itself when it owns the range.
         assert!(fitted.iter().any(|message| matches!(
             message,
             AgentMsg::ToolResult { outcome, .. }
-                if outcome.text().contains("truncated for Workspace")
+                if outcome.text().contains("showing the first")
+                    && outcome.text().contains("result clipped")
         )));
     }
 
@@ -7669,7 +7993,7 @@ mod tests {
     #[test]
     fn the_evidence_guard_stops_insisting_instead_of_owning_the_turn() {
         // Regression: the guard assumed read_file was the only way to observe a
-        // file and re-prompted with no limit. Code mode has no step cap, so a
+        // file and re-prompted with no local limit, so a
         // model that had genuinely observed notes.txt another way (run_shell
         // `wc -l`, an edit, a search) was sent back forever and the turn only
         // ended when the user pressed Stop. Measured live on macOS once the shell
@@ -9179,8 +9503,8 @@ mod tests {
     fn waiting_on_a_subagent_is_never_counted_as_no_progress() {
         // A child can outlive any number of parent polls, and several polls can
         // land inside ONE model step, so "the text will change" is not enough.
-        // Getting this wrong does not merely end the turn: Code mode has no step
-        // cap, so this guard is its main terminator, and the turn guard kills
+        // Getting this wrong does not merely end the turn: this guard normally
+        // terminates long before the generous Code ceiling, and the turn guard kills
         // every live child on the way out — a healthy subagent would be
         // destroyed for the crime of still working.
         let waiting = ToolOutcome::Ok(

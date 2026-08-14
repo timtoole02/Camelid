@@ -29,10 +29,10 @@ mod decode_scratch;
 mod diagnostic_config;
 pub mod draft_merge;
 pub(crate) mod gemma4;
-mod kv_cache;
+pub(crate) mod kv_cache;
 mod kv_f16;
 pub mod kv_pool;
-mod metal_resident;
+pub(crate) mod metal_resident;
 mod metal_seam;
 mod q8_block_reader;
 mod q8_runtime;
@@ -3543,8 +3543,16 @@ impl LlamaInferenceSession {
                 .engine
                 .read_kv_layer(engine_layer, position)
                 .map_err(BackendError::RuntimeShapeMismatch)?;
-            self.kv_cache
-                .store_mirrored_layer_kv(layer_idx, position, &keys, &values)?;
+            // CUDA re-seeds by converting host f32 back to f16 bits
+            // (`CudaResidentDecode::seed_layer`), so an exact CPU copy would be
+            // discarded on the way in. Keep the rounding here.
+            self.kv_cache.store_mirrored_layer_kv(
+                layer_idx,
+                position,
+                &keys,
+                &values,
+                crate::inference::kv_cache::KvStoreFidelity::F16Rounded,
+            )?;
         }
         if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
             eprintln!(
@@ -7053,7 +7061,7 @@ fn greedy_sample_rows(logits: &CpuTensor) -> Result<Vec<u32>> {
 
 /// Force every disallowed token's logit to `-inf` (grammar-constrained decoding).
 /// Errors if the mask length does not match the vocab or masks every token.
-fn apply_token_mask(logits: &mut CpuTensor, allowed: &[bool]) -> Result<()> {
+pub(crate) fn apply_token_mask(logits: &mut CpuTensor, allowed: &[bool]) -> Result<()> {
     if allowed.len() != logits.data.len() {
         return Err(BackendError::RuntimeShapeMismatch(format!(
             "grammar mask length {} does not match vocabulary size {}",

@@ -220,6 +220,30 @@ pub enum KvDtype {
     Q4_0,
 }
 
+/// Whether a KV write must reproduce the CPU forward's f16 rounding.
+///
+/// The rounding is a deliberate llama.cpp-oracle contract — `KvDtype`'s note above
+/// and `kv_cache_storage_matches_llama_cpp_f16_rounding` both pin it — but it is
+/// load-bearing only for K/V the CPU forward itself computed. A GPU→host mirror
+/// carries no such contract: that data never touched the CPU reference lane, and
+/// rounding it just discards precision the device is still holding, which is what
+/// made an F32-primary Metal session ineligible for the prompt-prefix cache.
+///
+/// Deciding this PER ENGINE rather than globally matters: the CUDA lane converts
+/// host f32 back to f16 bits when it re-seeds (`CudaResidentDecode::seed_layer`),
+/// so an exact CPU copy would be thrown away there — it stays `F16Rounded`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KvStoreFidelity {
+    /// Round every value through f16, as every CPU-forward write does.
+    F16Rounded,
+    /// Store the f32 values bit-exactly. Only observable in a [`KvDtype::F32`]
+    /// cache, and only correct for device-produced K/V.
+    // Metal constructs this in production. Other hosts keep the shared enum so
+    // recovery and parity tests exercise both fidelity contracts.
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+    ExactF32,
+}
+
 /// Env gate for f16 storage, read once per cache construction. Requires the
 /// Item-1 blocked-dot lane (the fused f16 kernels realize its canonical
 /// order; the legacy serial dot has no f16 variant by design) — requested
@@ -598,9 +622,15 @@ impl LlamaKvCache {
     /// slots relative to the session's owned layer range, so a sharded caller translates
     /// before calling (as the CUDA seed path already does in the other direction).
     ///
-    /// Rows go through [`store_kv_head_row`](Self::store_kv_head_row), so the f16 rounding and
-    /// the materialized-through watermark are handled exactly as for a CPU write — the GPU KV
-    /// is f16 already, so the re-rounding is idempotent.
+    /// Rows go through [`store_kv_head_row_with_fidelity`](Self::store_kv_head_row_with_fidelity),
+    /// so the materialized-through watermark is handled exactly as for a CPU write.
+    ///
+    /// `fidelity` is the CALLER'S engine format, and it is load-bearing. The re-rounding is
+    /// idempotent only when the device cache is f16 already (CUDA always, Metal's F16/K-quant
+    /// primary); against Metal's **F32 primary** it would destroy precision the GPU is still
+    /// holding, so that engine passes [`KvStoreFidelity::ExactF32`]. Unlike the CPU forward's
+    /// writers, this path carries no llama.cpp-oracle contract — the data never came from the
+    /// CPU reference lane — so storing it exactly is free of parity consequences.
     ///
     /// Shared by the Metal and CUDA recovery paths so the only backend-specific code left is
     /// the device readback itself.
@@ -610,6 +640,7 @@ impl LlamaKvCache {
         position_count: usize,
         keys: &[f32],
         values: &[f32],
+        fidelity: KvStoreFidelity,
     ) -> Result<()> {
         let k_head_dim = self.plan.k_head_dim;
         let v_head_dim = self.plan.v_head_dim;
@@ -649,12 +680,13 @@ impl LlamaKvCache {
                 } else {
                     &[]
                 };
-                self.store_kv_head_row(
+                self.store_kv_head_row_with_fidelity(
                     layer_idx,
                     p,
                     h,
                     &keys[k_src..k_src + k_head_dim],
                     value_slice,
+                    fidelity,
                 );
             }
         }
@@ -772,10 +804,12 @@ impl LlamaKvCache {
 
     /// THE canonical KV store: one (layer, position, kv_head) row of K and V,
     /// rounded through f16 exactly as the write path always has, into
-    /// whichever dtype backs this cache. Every writer routes through here —
-    /// including the CUDA prefill mirror-back, whose data is f16-exact
-    /// already (re-rounding is idempotent), so the routing is bit-neutral
-    /// and enforces the f16-exactness invariant structurally.
+    /// whichever dtype backs this cache. Every CPU-forward writer routes
+    /// through here, which is what enforces the llama.cpp f16-exactness
+    /// invariant structurally (see `kv_cache_storage_matches_llama_cpp_f16_rounding`).
+    ///
+    /// GPU→host mirrors call [`store_kv_head_row_with_fidelity`](Self::store_kv_head_row_with_fidelity)
+    /// instead, because their data never passed through the CPU reference lane.
     pub(super) fn store_kv_head_row(
         &mut self,
         layer_idx: usize,
@@ -783,6 +817,31 @@ impl LlamaKvCache {
         kv_head: usize,
         key_row: &[f32],
         value_row: &[f32],
+    ) {
+        self.store_kv_head_row_with_fidelity(
+            layer_idx,
+            position,
+            kv_head,
+            key_row,
+            value_row,
+            KvStoreFidelity::F16Rounded,
+        );
+    }
+
+    /// [`store_kv_head_row`](Self::store_kv_head_row) with the f16 rounding made explicit.
+    ///
+    /// `ExactF32` skips the rounding, and only changes anything for a [`KvDtype::F32`]
+    /// cache — an F16 or quantized cache converts on the way in regardless, so the flag
+    /// is a no-op there rather than a silent lie. Reserved for data a GPU produced: the
+    /// CPU forward's own writes must stay rounded to hold the oracle contract.
+    pub(super) fn store_kv_head_row_with_fidelity(
+        &mut self,
+        layer_idx: usize,
+        position: usize,
+        kv_head: usize,
+        key_row: &[f32],
+        value_row: &[f32],
+        fidelity: KvStoreFidelity,
     ) {
         let k_head_dim = self.plan.k_head_dim;
         let v_dim = value_row.len();
@@ -795,15 +854,21 @@ impl LlamaKvCache {
 
         match self.dtype {
             KvDtype::F32 => {
+                let round = |value: f32| match fidelity {
+                    KvStoreFidelity::F16Rounded => {
+                        super::kv_f16::f16_to_f32_kv(super::kv_f16::f32_to_f16_kv(value))
+                    }
+                    KvStoreFidelity::ExactF32 => value,
+                };
                 for (slot, &value) in self.keys[dst..dst + k_head_dim].iter_mut().zip(key_row) {
-                    *slot = super::kv_f16::f16_to_f32_kv(super::kv_f16::f32_to_f16_kv(value));
+                    *slot = round(value);
                 }
                 if v_dim > 0 {
                     let v_dst = dst / k_head_dim * v_dim; // Adjust offset for value buffer if dims differ
                     for (slot, &value) in
                         self.values[v_dst..v_dst + v_dim].iter_mut().zip(value_row)
                     {
-                        *slot = super::kv_f16::f16_to_f32_kv(super::kv_f16::f32_to_f16_kv(value));
+                        *slot = round(value);
                     }
                 }
             }

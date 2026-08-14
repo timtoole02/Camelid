@@ -18549,9 +18549,13 @@ fn clear_prompt_prefix_cache(state: &AppState) {
 }
 
 fn lookup_prompt_prefix_cache(prepared: &PreparedGeneration) -> Option<PrefixMatchResult> {
-    if prepared.constraint.is_some() {
-        return None;
-    }
+    // A constraint no longer disqualifies a hit. The cached artifact is prompt
+    // KV plus the logits for the first output token — both independent of the
+    // constraint, which only governs which OUTPUT tokens are legal. The exact-
+    // hit path masks those logits before sampling (`sample_cached_prompt_prefix`)
+    // and the partial-hit path re-enters the main decode loop, which masks
+    // every step. Refusing outright meant a constrained request paid a full
+    // cold prefill every time — the very cost this cache exists to remove.
     let mut pool = prepared.cached_prompt_prefix.lock().ok()?;
     let min_prefix = prompt_prefix_cache_min_tokens_from_env();
     let mut best: Option<(usize, bool, usize, std::time::Instant)> = None;
@@ -18607,9 +18611,10 @@ fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
 }
 
 fn store_prompt_prefix_cache(prepared: &mut PreparedGeneration, step: &LlamaGenerationStep) {
-    if prepared.constraint.is_some() {
-        return;
-    }
+    // Storing is constraint-independent for the same reason: what is retained
+    // is the PROMPT's KV and its raw (unmasked) logits. A later request applies
+    // its own constraint to those logits, so an entry seeded by a constrained
+    // request is equally valid for an unconstrained one and vice versa.
     // Windowed-attention archs (gemma3): NEVER store a prefix entry. Any later
     // partial hit would resume the cached session at `kv_position = k > 0` and
     // re-prefill the divergent suffix on the CPU dense forward — which has no
@@ -18685,9 +18690,21 @@ fn resume_partial_prefix_hit(
     }
 }
 
+/// Sample the first output token from a fully-cached prompt.
+///
+/// `allowed` is the grammar mask for that token when a structured-output
+/// constraint is active. It MUST be applied here: this path bypasses the main
+/// decode loop (which masks at src/api/mod.rs `compute_mask`), so without it a
+/// cache hit would emit exactly one unconstrained token and silently break the
+/// constraint. That single gap is why the prefix cache used to refuse every
+/// constrained request outright.
+///
+/// A fresh grammar state is correct here: the cache holds PROMPT tokens, the
+/// grammar constrains OUTPUT, and no output token has been emitted yet.
 fn sample_cached_prompt_prefix(
     cached: &CachedPromptPrefix,
     history: &[u32],
+    allowed: Option<&[bool]>,
 ) -> std::result::Result<LlamaGenerationStep, Box<Response>> {
     let sampler = if cached.sampling == SamplingConfig::default() {
         LlamaSampler::Greedy
@@ -18695,8 +18712,23 @@ fn sample_cached_prompt_prefix(
         LlamaSampler::Sampling(cached.sampling.clone())
     };
     let sample_started = Instant::now();
+    let masked_logits = match allowed {
+        Some(mask) => {
+            let mut logits = cached.logits.clone();
+            crate::inference::apply_token_mask(&mut logits, mask).map_err(|err| {
+                Box::new(api_error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "constraint_unsatisfiable",
+                    format!("the structured-output constraint could not be applied: {err}"),
+                    Some("response_format"),
+                ))
+            })?;
+            std::borrow::Cow::Owned(logits)
+        }
+        None => std::borrow::Cow::Borrowed(&cached.logits),
+    };
     let next_token_id = sampler
-        .sample_with_history(&cached.logits, history)
+        .sample_with_history(&masked_logits, history)
         .map_err(|err| {
             Box::new(api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -18865,7 +18897,44 @@ fn generate_token_ids(
             if match_res.is_exact_match {
                 prepared.session = cached_session;
                 input.clear();
-                let first_step = sample_cached_prompt_prefix(&match_res.cached, &history)?;
+                // Mask the cached logits with the constraint's first-token set,
+                // exactly as the main loop would have for a cold prefill.
+                let first_mask = match grammar.as_mut() {
+                    Some(state) => {
+                        state.compute_mask(&mut grammar_mask).map_err(|err| {
+                            Box::new(api_error(
+                                StatusCode::UNPROCESSABLE_ENTITY,
+                                "constraint_evaluation_failed",
+                                format!("LLGuidance could not compute the next-token mask: {err}"),
+                                Some("response_format"),
+                            ))
+                        })?;
+                        Some(grammar_mask.as_slice())
+                    }
+                    None => None,
+                };
+                let first_step =
+                    sample_cached_prompt_prefix(&match_res.cached, &history, first_mask)?;
+                // ADVANCE the grammar over the token we just emitted. The main
+                // loop commits every sampled token (see `commit_token` below);
+                // this path bypasses that, and without the commit the SECOND
+                // token's mask would be computed as though the first had never
+                // been produced — the other half of the hazard that made this
+                // cache refuse constrained requests outright.
+                let grammar_completed = if let Some(state) = grammar.as_mut() {
+                    state
+                        .commit_token(first_step.next_token_id)
+                        .map_err(|err| {
+                            Box::new(api_error(
+                                StatusCode::UNPROCESSABLE_ENTITY,
+                                "constraint_commit_failed",
+                                format!("LLGuidance rejected the sampled token: {err}"),
+                                Some("response_format"),
+                            ))
+                        })?
+                } else {
+                    false
+                };
                 let cached_next_token = first_step.next_token_id;
                 sample += first_step.sample;
                 prepared.timings.prompt_cache_hit = true;
@@ -18881,6 +18950,14 @@ fn generate_token_ids(
                         finish_reason: &mut finish_reason,
                     },
                 )?;
+                // Match the cold path exactly: a token that completed the
+                // grammar is a successful stop even when it consumed the last
+                // available output slot. Leaving this as `length` made a warm
+                // one-token response disagree with its cold twin and also
+                // queued a continuation token the grammar no longer needed.
+                if grammar_completed {
+                    finish_reason = "stop";
+                }
                 if finish_reason == "length" {
                     input.push(cached_next_token);
                 }
@@ -20179,7 +20256,9 @@ fn stream_prompt_cache_prologue(
             if match_res.is_exact_match {
                 prepared.session = cached_session;
                 input.clear();
-                match sample_cached_prompt_prefix(&match_res.cached, history) {
+                // Streaming with a constraint is refused before dispatch, so no
+                // mask can apply on this path.
+                match sample_cached_prompt_prefix(&match_res.cached, history, None) {
                     Ok(first_step) => {
                         let cached_next_token = first_step.next_token_id;
                         prepared.timings.prompt_cache_hit = true;
@@ -27708,7 +27787,7 @@ mod tests {
         assert_eq!(match_res.cached.session.kv_cache.position, 2);
         assert_eq!(match_res.cached.logits, step.logits);
         assert_eq!(
-            sample_cached_prompt_prefix(&match_res.cached, &[1, 2])
+            sample_cached_prompt_prefix(&match_res.cached, &[1, 2], None)
                 .unwrap()
                 .next_token_id,
             step.next_token_id
@@ -27952,11 +28031,17 @@ mod tests {
 
     #[test]
     fn constrained_generation_skips_prompt_prefix_cache_lookup() {
-        // B1 regression: the cache key is (model, path, tokens, sampling) -- the
-        // constraint is NOT in the key. On a warm hit the first token would be
-        // sampled from raw cached logits with no mask and the grammar state never
-        // advanced over it, breaking the response_format guarantee on the second
-        // identical request. Constrained requests must not read the cache.
+        // B1, now handled rather than avoided. The cache key is still
+        // (model, path, tokens, sampling) with the constraint deliberately NOT
+        // in it — that is correct, because what is cached is the PROMPT's KV and
+        // its raw logits, neither of which depends on the constraint. Both legs
+        // of the original hazard are closed at the point of use instead:
+        //   * the exact-hit path masks the cached logits before sampling, and
+        //   * it commits the sampled token to the grammar state,
+        // so the second token's mask is computed from a correctly advanced
+        // state. The partial-hit path re-enters the main decode loop, which
+        // already masks and commits every step. Refusing the cache outright cost
+        // a full cold prefill on every constrained request.
         let config = tiny_config();
         let weights = tiny_weights();
         let mut session = LlamaInferenceSession::new(config, weights).unwrap();
@@ -27989,16 +28074,79 @@ mod tests {
         constrained.cached_prompt_prefix = unconstrained.cached_prompt_prefix.clone();
         constrained.constraint = Some(crate::grammar::ConstraintSpec::json_object());
         assert!(
-            lookup_prompt_prefix_cache(&constrained).is_none(),
-            "a constrained request must never read the prompt-prefix cache"
+            lookup_prompt_prefix_cache(&constrained).is_some(),
+            "a constrained request must now REUSE the prompt cache; the constraint is \
+             enforced when the cached logits are sampled, not by refusing the hit"
         );
+    }
+
+    #[test]
+    fn constrained_exact_prompt_cache_hit_preserves_first_token_stop() {
+        let _env_guard = crate::test_support::env_lock();
+        // Pin the CPU lane whose prompt cache this test exercises. CUDA uses
+        // its device-local prefix continuation instead, and deterministic mode
+        // intentionally bypasses the cache.
+        std::env::set_var("CAMELID_CUDA_RESIDENT_DECODE", "0");
+        std::env::remove_var("CAMELID_DETERMINISTIC");
+        std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
+        std::env::remove_var("CAMELID_GQA_HEAD_MAPPING");
+
+        // Token 0 is the entire grammar. With max_tokens=1, the cold path has
+        // always reported `stop` as soon as committing it completes the value.
+        // The exact cache-hit path must make the identical decision instead of
+        // falling out of the loop as `length` merely because no second slot is
+        // available.
+        let tokenizer = Arc::new(single_token_constraint_tokenizer());
+        let constraint = crate::grammar::ConstraintSpec::from_lark(r#"start: "yes""#).unwrap();
+
+        let mut cold = prepared_for_cache(
+            "tiny",
+            "model-a.gguf",
+            vec![1, 2],
+            LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap(),
+        );
+        cold.max_tokens = 1;
+        cold.tokenizer = Arc::clone(&tokenizer);
+        cold.constraint = Some(constraint.clone());
+        let shared_pool = Arc::clone(&cold.cached_prompt_prefix);
+
+        let cold_output = generate_token_ids(cold).expect("cold constrained generation");
+        assert_eq!(cold_output.token_ids, vec![0]);
+        assert_eq!(cold_output.finish_reason, "stop");
+        assert!(!cold_output.timings.prompt_cache_hit);
+
+        let mut warm = prepared_for_cache(
+            "tiny",
+            "model-a.gguf",
+            vec![1, 2],
+            LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap(),
+        );
+        warm.max_tokens = 1;
+        warm.tokenizer = tokenizer;
+        warm.constraint = Some(constraint);
+        warm.cached_prompt_prefix = shared_pool;
+
+        let warm_output = generate_token_ids(warm).expect("warm constrained generation");
+        assert!(
+            warm_output.timings.prompt_cache_hit,
+            "control: the second identical prompt must take the exact cache path"
+        );
+        assert_eq!(warm_output.token_ids, cold_output.token_ids);
+        assert_eq!(
+            warm_output.finish_reason, cold_output.finish_reason,
+            "a warm grammar-complete first token must preserve the cold path's stop reason"
+        );
+
+        std::env::remove_var("CAMELID_CUDA_RESIDENT_DECODE");
     }
 
     #[test]
     fn constrained_generation_does_not_store_prompt_prefix_cache() {
         // Mirror of the lookup test: skipping both directions keeps the invariant
-        // one sentence -- the prompt-prefix cache never interacts with constrained
-        // decoding.
+        // The stored artifact is constraint-INDEPENDENT: prompt KV plus raw
+        // logits. Storing from a constrained request is therefore safe and
+        // useful, because every reader applies its own constraint at sample
+        // time (or none at all).
         let config = tiny_config();
         let weights = tiny_weights();
         let mut session = LlamaInferenceSession::new(config, weights).unwrap();
@@ -28023,8 +28171,10 @@ mod tests {
         );
         unconstrained.cached_prompt_prefix = constrained.cached_prompt_prefix.clone();
         assert!(
-            lookup_prompt_prefix_cache(&unconstrained).is_none(),
-            "a constrained request must never write the prompt-prefix cache"
+            lookup_prompt_prefix_cache(&unconstrained).is_some(),
+            "a constrained request now SEEDS the cache: the stored artifact is the \
+             prompt's KV and its raw, unmasked logits, so an unconstrained twin may \
+             reuse it (and vice versa) — the constraint is applied at sample time"
         );
     }
 
@@ -30759,6 +30909,41 @@ mod tests {
             .iter()
             .map(|t| (t.text.clone(), t.id))
             .collect();
+        tokenizer
+    }
+
+    /// Three-token vocabulary for an end-to-end grammar-cache test: token 0
+    /// completes the whole grammar in one sample, token 1 is a disallowed
+    /// ordinary alternative, and token 2 supplies the tokenizer's required EOS.
+    fn single_token_constraint_tokenizer() -> Tokenizer {
+        let mut tokenizer = test_tokenizer();
+        tokenizer.tokens = vec![
+            Token {
+                id: 0,
+                text: "yes".to_string(),
+                score: 0.0,
+                kind: TokenKind::Normal,
+            },
+            Token {
+                id: 1,
+                text: "no".to_string(),
+                score: 0.0,
+                kind: TokenKind::Normal,
+            },
+            Token {
+                id: 2,
+                text: "<eos>".to_string(),
+                score: 0.0,
+                kind: TokenKind::Control,
+            },
+        ];
+        tokenizer.token_to_id = tokenizer
+            .tokens
+            .iter()
+            .map(|token| (token.text.clone(), token.id))
+            .collect();
+        tokenizer.special.eos = Some(2);
+        tokenizer.special.eog = BTreeSet::from([2]);
         tokenizer
     }
 

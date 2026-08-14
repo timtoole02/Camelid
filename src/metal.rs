@@ -15665,10 +15665,17 @@ fn resident_kv_format() -> ResidentKvFormat {
         return explicit;
     }
     if KQUANT_LANE_ENGAGED.load(std::sync::atomic::Ordering::Relaxed) {
-        ResidentKvFormat::F16
-    } else {
-        ResidentKvFormat::F32
+        return ResidentKvFormat::F16;
     }
+    // DO NOT move a Q8_0 model onto F16 here to buy it the prompt-prefix cache.
+    // That trade was measured and it is a bad one twice over: the F16 primary
+    // silently disables the split-K decode attention and the attention-as-matmul
+    // prefill (both gated on `!kv16`), and it changes the attention numerics, so
+    // the Metal-vs-CPU parity tests in this file fail. The prefix cache is
+    // reached instead by making the GPU→CPU mirror EXACT for an F32 primary —
+    // see [`KvStoreFidelity`] and `kv_roundtrips_through_cpu_exactly` — which
+    // keeps the fast kernels and the parity contract at the same time.
+    ResidentKvFormat::F32
 }
 
 #[cfg(target_os = "macos")]
@@ -21713,21 +21720,43 @@ impl ResidentDecodeState {
 
     /// Whether THIS engine's KV survives a GPU -> CPU -> GPU round trip unchanged.
     ///
-    /// The CPU KV history always stores f16-ROUNDED values — `store_kv_head_row`
-    /// rounds through f16 even in `KvDtype::F32` mode, and every writer including
-    /// the GPU mirror-back routes through it. So an F16 primary round-trips
-    /// exactly (f16 -> f32 is exact; f32 -> f16 of a value that came from f16 is
-    /// the identity), while an F32 primary would be silently rounded on the way
-    /// out and a resumed sequence would attend over different K/V than its
-    /// prefill produced. Q8 is lossy by construction.
+    /// An F16 primary round-trips through any F32/F16 CPU cache (f16 -> f32 is exact,
+    /// and f32 -> f16 of a value that came from f16 is the identity), so it does not
+    /// care what `cpu_holds_f32_exactly` says.
+    ///
+    /// An F32 primary round-trips only into an F32 CPU cache, and only because the
+    /// mirror now writes it with [`KvStoreFidelity::ExactF32`]; it used to be rounded
+    /// on the way out, which is why this lane was locked out of the prompt-prefix
+    /// cache. Both halves of the trip are plain `copy_nonoverlapping` (`read_from` /
+    /// `seed_into`, F32 arms), so with the rounding gone the trip is bit-exact.
+    ///
+    /// Q8 is lossy by construction and never qualifies.
     ///
     /// Deliberately reads the format THIS engine was built with rather than the
     /// process-global `resident_kv_format()`: a model switch re-decides the
     /// global (`set_resident_kquant_lane`) while an older session still holds an
     /// engine built under the previous format, so the global is a time-of-check
     /// answer to a time-of-use question.
-    pub fn kv_roundtrips_through_cpu_exactly(&self) -> bool {
-        self.kv16
+    pub fn kv_roundtrips_through_cpu_exactly(&self, cpu_holds_f32_exactly: bool) -> bool {
+        if self.kvq8 {
+            return false;
+        }
+        if self.kv16 {
+            return true;
+        }
+        cpu_holds_f32_exactly
+    }
+
+    /// The fidelity the GPU -> CPU mirror must use for THIS engine's KV, so that the
+    /// CPU copy is a faithful record of what the device holds. Paired with
+    /// [`Self::kv_roundtrips_through_cpu_exactly`]; deriving both from the same
+    /// engine state is what stops the mirror and the cache gate from drifting apart.
+    pub(crate) fn kv_mirror_fidelity(&self) -> crate::inference::kv_cache::KvStoreFidelity {
+        if self.kv16 || self.kvq8 {
+            crate::inference::kv_cache::KvStoreFidelity::F16Rounded
+        } else {
+            crate::inference::kv_cache::KvStoreFidelity::ExactF32
+        }
     }
 
     /// Mark `n` positions as materialized (called after seeding history from a CPU cache).
@@ -26295,8 +26324,12 @@ impl ResidentDecodeState {
         0
     }
 
-    pub fn kv_roundtrips_through_cpu_exactly(&self) -> bool {
+    pub fn kv_roundtrips_through_cpu_exactly(&self, _cpu_holds_f32_exactly: bool) -> bool {
         false
+    }
+
+    pub(crate) fn kv_mirror_fidelity(&self) -> crate::inference::kv_cache::KvStoreFidelity {
+        crate::inference::kv_cache::KvStoreFidelity::F16Rounded
     }
 
     pub fn set_filled(&mut self, _n: usize) {}

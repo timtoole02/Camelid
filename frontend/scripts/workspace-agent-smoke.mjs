@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { reduceCodeEvent, reduceWorkspaceEvent, waitForWorkspaceSessionTerminal, WORKSPACE_IDLE_STATE, workspaceEndpoint, workspaceModelsEndpoint, workspaceBrowseEndpoint, workspaceThreadsEndpoint, workspaceCompactionEndpoint } from '../src/lib/workspaceAgent.js'
+import { recordedWorkspaceOutcome, reduceCodeEvent, reduceWorkspaceEvent, waitForWorkspaceSessionTerminal, WORKSPACE_IDLE_STATE, workspaceEndpoint, workspaceModelsEndpoint, workspaceBrowseEndpoint, workspaceThreadsEndpoint, workspaceCompactionEndpoint } from '../src/lib/workspaceAgent.js'
 
 let state = { ...WORKSPACE_IDLE_STATE, events: [] }
 state = reduceWorkspaceEvent(state, { event: 'session.started', model_id: 'tool-model', sequence: 1 })
@@ -101,5 +101,19 @@ assert.equal(workspaceBrowseEndpoint('http://127.0.0.1:8181/', 'C:/data'), 'http
 assert.equal(workspaceThreadsEndpoint('http://127.0.0.1:8181/', 'C:/data', 'thread/1'), 'http://127.0.0.1:8181/api/agent/workspace/threads/thread%2F1?workspace=C%3A%2Fdata')
 assert.equal(workspaceThreadsEndpoint('http://127.0.0.1:8181/', 'C:/data', '', 'code'), 'http://127.0.0.1:8181/api/agent/workspace/threads?workspace=C%3A%2Fdata&mode=code')
 assert.equal(workspaceCompactionEndpoint('http://127.0.0.1:8181/', 'C:/data', 'thread/1'), 'http://127.0.0.1:8181/api/agent/workspace/threads/thread%2F1/compact?workspace=C%3A%2Fdata')
+assert.equal(
+  recordedWorkspaceOutcome(
+    'detached-thread',
+    { id: 'new-active-thread', terminal_outcome: 'answered' },
+    { turns: [{ terminal_outcome: 'driver_error' }] },
+  ),
+  'driver_error',
+  'a detached follower must ignore another active session and use its own saved turn',
+)
+assert.equal(
+  recordedWorkspaceOutcome('detached-thread', { id: 'new-active-thread', terminal_outcome: 'answered' }, null),
+  null,
+  'an unknown detached outcome must not be guessed as answered',
+)
 
 console.log('workspace-agent-smoke: PASS')

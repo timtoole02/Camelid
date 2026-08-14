@@ -93,11 +93,11 @@ const GROUNDING_FILES = Object.freeze({
   }),
   runtime_envelope: Object.freeze({
     path: 'qa/model-qualification/fixtures/smollm3-default-thinking-runtime-envelope-v1.json',
-    sha256: 'dc014572439846e208c30055953c5811dc2ec0a885008d679d61b3634eaa04bc',
+    sha256: 'bd3f7f7470185d59b2dea12151b32f378206f75fd45463cbd46b5fc4b8413669',
   }),
 })
 
-const RENDERER_GIT_BLOB_SHA1 = 'fb11c94932f7b4f57ffc6502689898f75fec547d'
+const RENDERER_GIT_BLOB_SHA1 = 'b31b590cc218c2154c07e63849fe70a19fc6da8f'
 const SHAPE_CASE_ID = 'default_think_single_user_generation_prompt'
 const NORMALIZED_PROMPT_UTF8_BYTES = 1_392
 const NORMALIZED_PROMPT_SHA256 = '7619416ae94ba9a00378d976bfa944f5ba726747f9b67ba4e862d9a7fe20e4f1'
@@ -715,7 +715,12 @@ async function inspectGroundings(root, {
   'chat_parity_grounding_invalid')
   let rendererBlob
   try {
-    const { stdout } = await execFileImpl('git', ['-C', root, 'hash-object', '--', 'src/api/mod.rs'], {
+    // Apply the repository's clean filters before hashing. This makes the
+    // pinned renderer identity match Git's LF blob on Windows even when the
+    // worktree is checked out with CRLF by core.autocrlf.
+    const { stdout } = await execFileImpl('git', [
+      '-C', root, 'hash-object', '--filters', '--path=src/api/mod.rs', '--', 'src/api/mod.rs',
+    ], {
       timeout: 10_000, windowsHide: true, env: buildWindowsChildEnv(inheritedEnv),
     })
     rendererBlob = String(stdout).trim().toLowerCase()

@@ -66,7 +66,7 @@ pub(super) const MAX_VERIFY_K: usize = 8;
 /// — see `prepare_for_prompt_prefix_cache_gated`.)
 const LOW_MEMORY_PREFIX_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
-pub(super) fn resident_prefix_cache_mirror_enabled() -> bool {
+pub(crate) fn resident_prefix_cache_mirror_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         resident_prefix_cache_policy(
@@ -583,10 +583,14 @@ impl super::LlamaInferenceSession {
         // Reading [0, position) is safe against the encode-ahead window: a
         // pre-committed future graph writes the NEXT position's row, so it cannot
         // touch the range being mirrored.
+        // An F32 primary is exact only into an F32 CPU cache; an F16 primary is exact
+        // into either. The mirror writes with the matching `KvStoreFidelity`, derived
+        // from the same engine state, so the two answers cannot disagree.
+        let cpu_holds_f32_exactly = matches!(self.kv_cache.dtype, KvDtype::F32);
         if !self
             .resident_decode
             .as_ref()
-            .is_some_and(|state| state.kv_roundtrips_through_cpu_exactly())
+            .is_some_and(|state| state.kv_roundtrips_through_cpu_exactly(cpu_holds_f32_exactly))
         {
             return false;
         }
@@ -625,6 +629,14 @@ impl super::LlamaInferenceSession {
         {
             return Ok(false);
         }
+        // Ask THIS engine how its KV must be written, for the same time-of-check /
+        // time-of-use reason the round-trip gate does: a model switch re-decides the
+        // process-global format while this session keeps the engine it was built with.
+        let fidelity = self
+            .resident_decode
+            .as_ref()
+            .expect("resident session present (checked above)")
+            .kv_mirror_fidelity();
         let dims = DenseLlamaDims::from_config(&self.config)?;
         let range = self
             .weights
@@ -645,7 +657,7 @@ impl super::LlamaInferenceSession {
                 ))
             })?;
             self.kv_cache
-                .store_mirrored_layer_kv(layer_idx, position, &keys, &values)?;
+                .store_mirrored_layer_kv(layer_idx, position, &keys, &values, fidelity)?;
         }
         if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
             eprintln!(

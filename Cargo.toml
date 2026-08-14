@@ -49,7 +49,7 @@ thiserror = "1"
 # contract and use the pure-Rust regex backend: no Oniguruma/C build, C++ esaxx,
 # progress UI, or hf-hub/network feature enters Camelid's cross-platform build.
 tokenizers = { version = "=0.23.1", default-features = false, features = ["fancy-regex"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
 # CancellationToken for the generation paths: guard/compute lifetime equivalence
 # (see docs/recon/ENGINE_INVERSION_CONDUCTOR.md). sync-only, no extra features.
 tokio-util = "0.7"
@@ -75,6 +75,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_SystemInformation",
+    # Suspend-excluding monotonic time for workspace-turn supervision. Rust's
+    # Instant uses QPC on Windows, whose elapsed time includes sleep/hibernate.
+    "Win32_System_WindowsProgramming",
     "Win32_System_Threading",
     "Win32_System_ProcessStatus",
     "Win32_System_Power",

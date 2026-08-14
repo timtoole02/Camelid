@@ -93,16 +93,20 @@ try {
     // Counted per Code session stream only — the app also opens an observatory
     // telemetry EventSource at startup, which must not consume a turn script.
     let streamsOpened = 0
+    globalThis.__codeEventSourceUrls = []
+    globalThis.__staleCodeTerminalReplayed = false
     class MockEventSource {
       constructor(url) {
         this.listeners = new Map()
         this.closed = false
         this.stream = 0
-        if (String(url || '').includes('/api/agent/workspace/sessions/')) {
+        this.url = String(url || '')
+        if (this.url.includes('/api/agent/workspace/sessions/')) {
           streamsOpened += 1
           this.stream = streamsOpened
           globalThis.__codeStreamsOpened = streamsOpened
           globalThis.__codeEventSource = this
+          globalThis.__codeEventSourceUrls.push(this.url)
         }
       }
       addEventListener(type, callback) {
@@ -113,19 +117,19 @@ try {
         this.emitAfter(40, { sequence: 2, event: 'turn.started', turn_index: 0 })
         this.emitAfter(45, { sequence: 3, event: 'agent.updated', agent_id: 'main', parent_id: null, label: 'Camelid', status: 'running', task: 'Build an interactive coding agent experience', detail: 'Inspecting the workspace' })
         this.emitAfter(50, { sequence: 4, event: 'agent.updated', agent_id: 'child-ui', parent_id: 'main', label: 'ui-specialist', status: 'running', task: 'Implement the right-side agent activity panel', detail: 'Delegated agent is working' })
-        this.emitAfter(70, { sequence: 3, event: 'model.delta', content: 'I will inspect the existing component before changing it.' })
+        this.emitAfter(70, { sequence: 5, event: 'model.delta', content: 'I will inspect the existing component before changing it.' })
         // Qwen/Hermes models stream their tool call as ordinary tokens. It is
         // syntax, not prose, and must never reach the visible transcript.
-        this.emitAfter(72, { sequence: 3, event: 'model.delta', content: '\n<tool_call>\n{"name":"list_dir","arguments":{"path":"/x","offset":0,"limit":200}}\n</tool_call>' })
+        this.emitAfter(72, { sequence: 6, event: 'model.delta', content: '\n<tool_call>\n{"name":"list_dir","arguments":{"path":"/x","offset":0,"limit":200}}\n</tool_call>' })
         // The other shape seen live: no wrapper tag, just the call itself.
-        this.emitAfter(74, { sequence: 3, event: 'model.delta', content: '\nlist_dir({"path": "/x/workspace", "limit": 200, "offset": 0})' })
-        this.emitAfter(90, { sequence: 4, event: 'tool.call', detail: 'update_plan(3 steps)' })
-        this.emitAfter(110, { sequence: 5, event: 'tool.result', tool: 'update_plan', outcome: 'ok', content: 'plan updated\n[x] Inspect the existing Code workspace\n[~] Build the interactive agent component\n[ ] Run focused regression tests' })
-        this.emitAfter(140, { sequence: 6, event: 'tool.call', detail: 'read_file(frontend/src/App.jsx, offset=0, limit=220)' })
-        this.emitAfter(170, { sequence: 7, event: 'tool.result', tool: 'read_file', outcome: 'ok', content: 'import App from \"./App\"\\n// existing application shell\\n' })
-        this.emitAfter(200, { sequence: 8, event: 'tool.call', detail: 'write_file(frontend/src/components/InteractiveAgent.jsx, 1480 bytes)' })
+        this.emitAfter(74, { sequence: 7, event: 'model.delta', content: '\nlist_dir({"path": "/x/workspace", "limit": 200, "offset": 0})' })
+        this.emitAfter(90, { sequence: 8, event: 'tool.call', detail: 'update_plan(3 steps)' })
+        this.emitAfter(110, { sequence: 9, event: 'tool.result', tool: 'update_plan', outcome: 'ok', content: 'plan updated\n[x] Inspect the existing Code workspace\n[~] Build the interactive agent component\n[ ] Run focused regression tests' })
+        this.emitAfter(140, { sequence: 10, event: 'tool.call', detail: 'read_file(frontend/src/App.jsx, offset=0, limit=220)' })
+        this.emitAfter(170, { sequence: 11, event: 'tool.result', tool: 'read_file', outcome: 'ok', content: 'import App from \"./App\"\\n// existing application shell\\n' })
+        this.emitAfter(200, { sequence: 12, event: 'tool.call', detail: 'write_file(frontend/src/components/InteractiveAgent.jsx, 1480 bytes)' })
         this.emitAfter(230, {
-          sequence: 9,
+          sequence: 13,
           event: 'approval.required',
           approval_id: 'approval-1',
           tool: 'write_file',
@@ -137,6 +141,14 @@ try {
       // stream — so these low numbers collide with turn one's, which is exactly
       // the state that used to give two rendered cards the same React key.
       followUpTurn() {
+        // Model the retained server feed closely enough to catch the `after=0`
+        // regression. An explicit zero asks for the whole session, including
+        // turn one's terminal. Omitting the cursor asks the server for the
+        // current turn only, so this stale terminal is never replayed.
+        if (new URL(this.url, location.href).searchParams.get('after') === '0') {
+          globalThis.__staleCodeTerminalReplayed = true
+          this.emitAfter(5, { sequence: 17, event: 'session.finished', outcome: 'answered' })
+        }
         this.emitAfter(20, { sequence: 1, event: 'session.started', workspace: 'C:/projects/camelid-demo', model_id: 'Qwen3-4B-Q4_K_M.gguf' })
         this.emitAfter(40, { sequence: 2, event: 'tool.call', detail: 'read_file(frontend/src/components/InteractiveAgent.jsx, offset=0, limit=80)' })
         this.emitAfter(60, { sequence: 3, event: 'tool.result', tool: 'read_file', outcome: 'ok', content: 'export function InteractiveAgent() { return null }' })
@@ -152,15 +164,19 @@ try {
     globalThis.EventSource = MockEventSource
     globalThis.__finishCodeTurn = () => {
       const source = globalThis.__codeEventSource
-      source?.emit({ sequence: 10, event: 'tool.result', tool: 'write_file', outcome: 'ok', content: 'Created frontend/src/components/InteractiveAgent.jsx' })
-      source?.emit({ sequence: 11, event: 'model.answer', content: 'Implemented the interactive agent component and kept the change inside the selected workspace. The new component is ready for review.' })
-      source?.emit({ sequence: 12, event: 'model.timing', total_ms: 2480, ttft_ms: 165, output_tokens: 92 })
-      source?.emit({ sequence: 13, event: 'session.finished', outcome: 'answered' })
+      source?.emit({ sequence: 14, event: 'tool.result', tool: 'write_file', outcome: 'ok', content: 'Created frontend/src/components/InteractiveAgent.jsx' })
+      source?.emit({ sequence: 15, event: 'model.answer', content: 'Implemented the interactive agent component and kept the change inside the selected workspace. The new component is ready for review.' })
+      source?.emit({ sequence: 16, event: 'model.timing', total_ms: 2480, ttft_ms: 165, output_tokens: 92 })
+      source?.emit({ sequence: 17, event: 'session.finished', outcome: 'answered' })
     }
     // The terminal event a Stop really produces: the still-open stream delivers
     // the server's own `aborted` before the DELETE poll settles.
     globalThis.__abortCodeTurn = () => {
-      globalThis.__codeEventSource?.emit({ sequence: 5, event: 'session.finished', outcome: 'aborted' })
+      // Sequences are session-scoped and monotonic now, and the client drops
+      // anything at or below what it has already applied — so a terminal must
+      // be numbered ABOVE the flood below (100..324) or it is deduped away and
+      // the turn never visibly ends.
+      globalThis.__codeEventSource?.emit({ sequence: 1_000, event: 'session.finished', outcome: 'aborted' })
     }
     // Pushes the oldest entries out of the client's 240-entry activity ring.
     globalThis.__floodCodeEvents = (count) => {
@@ -227,7 +243,7 @@ try {
         workspace: 'C:/projects/camelid-demo',
         model_id: 'Qwen3-4B-Q4_K_M.gguf',
         state: 'waiting_for_events',
-        max_steps: 0,
+        max_steps: 48,
         max_tokens: 768,
         allow_writes: true,
         approval_mode: body.approval_mode,
@@ -313,10 +329,31 @@ try {
   }
   await page.screenshot({ path: join(outputDir, 'code-workbench-approval.png'), fullPage: true })
 
+  // The delete control is visually quiet until the row has keyboard focus, but
+  // it must become visible before Tab reaches it. A control that stays
+  // `visibility: hidden` cannot itself receive focus, making the advertised
+  // keyboard path impossible.
+  await page.focus('.rail-code-thread__open')
+  const deleteReveal = await page.$eval('.rail-code-thread__delete', (node) => ({
+    visibility: getComputedStyle(node).visibility,
+    opacity: getComputedStyle(node).opacity,
+  }))
+  await page.keyboard.press('Tab')
+  const deleteKeyboardState = await page.evaluate(() => ({
+    focused: document.activeElement?.matches('.rail-code-thread__delete') || false,
+    visibility: getComputedStyle(document.querySelector('.rail-code-thread__delete')).visibility,
+  }))
+  if (deleteReveal.visibility !== 'visible'
+    || deleteReveal.opacity !== '1'
+    || !deleteKeyboardState.focused
+    || deleteKeyboardState.visibility !== 'visible') {
+    throw new Error(`Code-thread delete is not keyboard accessible: ${JSON.stringify({ deleteReveal, deleteKeyboardState })}`)
+  }
+
   // Opening a rail entry remounts the Code surface, and the remount cancels the
   // live turn on the server. A run only ends when it finishes or the user stops
   // it, so the rail has to ask — and declining must leave the run untouched.
-  await page.click('.rail-code-thread')
+  await page.click('.rail-code-thread__open')
   await page.waitForSelector('.cx-modal', { timeout: 5000 })
   const railGuard = await page.evaluate(() => ({
     text: document.querySelector('.cx-modal')?.textContent,
@@ -387,12 +424,15 @@ try {
   const completedState = await page.evaluate(() => ({
     status: document.querySelector('.code-stage__status')?.textContent.trim(),
     assistant: document.querySelector('.code-message--assistant')?.textContent.trim(),
+    inspectorHeading: document.querySelector('.code-inspector .ci-group__label')?.textContent.trim(),
     changedFiles: [...document.querySelectorAll('.code-file-list li')].map((node) => node.textContent.trim()),
     activeWork: document.querySelector('.code-process-row')?.textContent.trim(),
     sendEnabled: !document.querySelector('.code-composer__send')?.disabled,
     bodyWidth: [document.documentElement.clientWidth, document.documentElement.scrollWidth],
   }))
-  if (completedState.status !== 'Complete' || !completedState.assistant?.includes('interactive agent component')) {
+  if (completedState.status !== 'Complete'
+    || !completedState.assistant?.includes('interactive agent component')
+    || !completedState.inspectorHeading?.startsWith('Primary agent')) {
     throw new Error(`completed workbench state mismatch: ${JSON.stringify(completedState)}`)
   }
   if (!completedState.changedFiles.some((file) => file.includes('InteractiveAgent.jsx'))) {
@@ -410,11 +450,18 @@ try {
   const followUpState = await page.evaluate(() => ({
     toolCards: [...document.querySelectorAll('.code-tool-card summary strong')].map((node) => node.textContent),
     userMessages: [...document.querySelectorAll('.code-message--user')].map((node) => node.textContent),
+    status: document.querySelector('.code-stage__status')?.textContent.trim(),
+    streamUrls: [...globalThis.__codeEventSourceUrls],
+    staleTerminalReplayed: globalThis.__staleCodeTerminalReplayed,
   }))
   if (followUps.length !== 1
     || followUpState.toolCards.length !== 3
     || followUpState.userMessages.length !== 2
-    || !followUpState.userMessages[1]?.includes('focused tests')) {
+    || !followUpState.userMessages[1]?.includes('focused tests')
+    || followUpState.status !== 'Working'
+    || followUpState.staleTerminalReplayed
+    || followUpState.streamUrls.length !== 2
+    || followUpState.streamUrls.some((url) => new URL(url).searchParams.get('after') === '0')) {
     throw new Error(`follow-up turn did not render alongside the first: ${JSON.stringify({ ...followUpState, followUps })}`)
   }
 
@@ -543,11 +590,14 @@ try {
   const abandonedStart = await page.evaluate(() => ({
     status: document.querySelector('.code-stage__status')?.textContent.trim(),
     streamsOpened: globalThis.__codeStreamsOpened,
+    streamUrls: [...globalThis.__codeEventSourceUrls],
     composerPlaceholder: document.querySelector('.code-composer textarea')?.placeholder,
   }))
   if (sessionBodies.length !== 3
     || cancels.length !== 4
     || abandonedStart.streamsOpened !== 3
+    || abandonedStart.streamUrls.length !== 3
+    || abandonedStart.streamUrls.some((url) => new URL(url).searchParams.get('after') === '0')
     || !abandonedStart.composerPlaceholder?.includes('Describe the change')) {
     throw new Error(`Stop during session creation did not take: ${JSON.stringify({ ...abandonedStart, sessions: sessionBodies.length, cancels: cancels.length })}`)
   }

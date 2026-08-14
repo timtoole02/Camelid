@@ -253,25 +253,62 @@
 }
 .rail__group-label { font-size: var(--text-xs); color: var(--color-text-faint); padding: var(--space-3) var(--space-3) var(--space-1); }
 .rail__empty { padding: var(--space-2) var(--space-3); color: var(--color-text-faint); font-size: var(--text-sm); }
+/* The row is a container now, not the button: it holds the open control and a
+   delete control, and a button inside a button is invalid and unfocusable. The
+   padding moved onto `__open` so the hit area still covers the whole row. */
 .rail-code-thread {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+  width: 100%;
+  border-radius: var(--radius-md);
+  color: var(--color-text-muted);
+}
+.rail-code-thread__open {
   display: grid;
   grid-template-columns: 18px minmax(0, 1fr);
   align-items: start;
   gap: var(--space-2);
-  width: 100%;
-  padding: var(--space-2) var(--space-3);
-  border-radius: var(--radius-md);
-  color: var(--color-text-muted);
+  min-width: 0;
+  flex: 1;
+  /* Right padding clears the delete control so a long title ellipsizes before
+     it collides rather than sliding underneath. */
+  padding: var(--space-2) var(--space-7) var(--space-2) var(--space-3);
+  border-radius: inherit;
+  color: inherit;
   text-align: left;
+}
+.rail-code-thread__delete {
+  position: absolute;
+  top: 50%;
+  right: var(--space-2);
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  transform: translateY(-50%);
+  border-radius: var(--radius-sm);
+  color: var(--color-text-faint);
+  /* Revealed on hover or keyboard focus. `opacity` alone would leave it in the
+     hit-test layer, so it would swallow clicks meant for the row behind it. */
+  opacity: 0;
+  visibility: hidden;
+}
+.rail-code-thread:hover .rail-code-thread__delete,
+.rail-code-thread:focus-within .rail-code-thread__delete,
+.rail-code-thread__delete:focus-visible { opacity: 1; visibility: visible; }
+.rail-code-thread__delete:hover { background: var(--color-surface-strong); color: var(--color-error); }
+@media (hover: none), (pointer: coarse) {
+  .rail-code-thread__delete { opacity: 1; visibility: visible; }
 }
 .rail-code-thread:hover { background: var(--color-surface-hover); color: var(--color-text); }
 .rail-code-thread.is-selected { background: var(--color-selected-row); color: var(--color-text); }
-.rail-code-thread > svg { margin-top: 2px; color: var(--color-accent-text); }
-.rail-code-thread span { min-width: 0; }
-.rail-code-thread strong,
-.rail-code-thread small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.rail-code-thread strong { font-size: var(--text-sm); font-weight: 650; }
-.rail-code-thread small { margin-top: 2px; color: var(--color-text-faint); font-family: var(--font-mono); font-size: 9px; }
+.rail-code-thread__open > svg { margin-top: 2px; color: var(--color-accent-text); }
+.rail-code-thread__open > span { min-width: 0; }
+.rail-code-thread__open strong,
+.rail-code-thread__open small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rail-code-thread__open strong { font-size: var(--text-sm); font-weight: 650; }
+.rail-code-thread__open small { margin-top: 2px; color: var(--color-text-faint); font-family: var(--font-mono); font-size: 9px; }
 
 .rail__nav-item {
   display: flex;
