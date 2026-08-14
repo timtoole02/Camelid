@@ -766,6 +766,11 @@ const visibleUiSources = [
   '../src/views/CompatibilityView.jsx',
   '../src/components/api/ApiWorkbench.jsx',
   '../src/views/TelemetryView.jsx',
+  // The Code workspace renders agent transcripts and is a magnet for
+  // comparisons to other agent CLIs while it is being restyled. It was
+  // outside this list, and check-public-scrub.sh has no brand pattern, so
+  // nothing caught a competitor name in its copy.
+  '../src/views/CodeWorkspace.jsx',
 ].map((path) => [path, read(path)])
 for (const [path, source] of visibleUiSources) {
   assert.doesNotMatch(source, /\b(OpenAI|ChatGPT|Claude|Gemini)\b/, `${path} visible copy should not mention competitor brands`)

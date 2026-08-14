@@ -1,5 +1,26 @@
 const MAX_WORKSPACE_ACTIVITY_EVENTS = 240
 
+/// Rows kept for the inspector's model-step table. The aggregate lives in
+/// `runTotals`, which is a counter, so capping rows never changes the total.
+const MAX_MODEL_STEP_ROWS = 60
+/// Plan steps are model-authored and nothing bounds how many lines
+/// `update_plan` can emit, so the list is capped before it reaches a render.
+const MAX_PLAN_STEPS = 120
+const PLAN_STEP_LINE = /^\[([x~ ])\]\s+(.+)$/
+
+/// The only structured plan the agent publishes. Exported so the transcript
+/// card and the inspector's Plan group read one parse, not two that can drift.
+export function parsePlanSteps(content) {
+  const steps = []
+  for (const line of String(content || '').split(/\r?\n/)) {
+    const match = PLAN_STEP_LINE.exec(line.trim())
+    if (!match) continue
+    steps.push({ status: match[1] === 'x' ? 'done' : match[1] === '~' ? 'active' : 'pending', text: match[2] })
+    if (steps.length >= MAX_PLAN_STEPS) break
+  }
+  return steps
+}
+
 export const WORKSPACE_IDLE_STATE = Object.freeze({
   phase: 'idle',
   events: [],
@@ -27,6 +48,27 @@ export const WORKSPACE_IDLE_STATE = Object.freeze({
   latestResult: null,
   liveActivity: null,
   agents: [],
+  // Monotonic run totals. Accumulated HERE rather than recomputed by scanning
+  // `events`, for the same reason `liveTurns` is: that array is a ring capped
+  // at MAX_WORKSPACE_ACTIVITY_EVENTS, so a long turn evicts its oldest
+  // `model.timing` and `tool.result` entries and any re-scan silently
+  // UNDERCOUNTS. A sidebar readout that drifts downward as a run gets longer
+  // is worse than no readout.
+  runTotals: Object.freeze({ steps: 0, outputTokens: 0, elapsedMs: 0, tools: 0, toolFailures: 0 }),
+  // Latest `memory.updated` snapshot: the live context-budget position and its
+  // composition. Replaced wholesale, never appended to — this is the current
+  // state of the window, not a history of it.
+  context: null,
+  // The last `update_plan` result, already parsed. Held here because the event
+  // that carried it is among the first the 240-entry ring evicts.
+  planSteps: [],
+  // One row per completed model step, capped at MAX_MODEL_STEP_ROWS.
+  modelSteps: [],
+  // Client-observed first/last sighting per agent id. Deliberately NOT stored
+  // on the agent objects: `activity.snapshot` replaces `agents` wholesale about
+  // once a second with the six server fields, so anything derived onto an agent
+  // is wiped every poll. The server reports no per-agent clock at all.
+  agentSeen: {},
 })
 
 function appendActivity(events, event) {
@@ -56,11 +98,20 @@ function reduceAgentEvent(state, envelope, allowApprovals) {
       liveTurns: 0,
       liveActivity: null,
       agents: [],
+      planSteps: [],
+      modelSteps: [],
+      agentSeen: {},
       error: '',
     }
   }
   if (event === 'session.starting' || event === 'turn.starting') {
     const task = String(envelope.task || '')
+    const main = { id: 'main', parent_id: null, label: 'Camelid', status: 'starting', task, detail: 'Preparing the coding session' }
+    // A follow-up turn KEEPS the agents earlier turns finished — the panel
+    // groups them under Finished, and wiping the list every turn made that
+    // group unreachable in the common case. A new session starts empty.
+    const carried = event === 'turn.starting' ? (state.agents || []).filter((agent) => agent.id !== 'main') : []
+    const agents = [main, ...carried]
     const activity = {
       phase: 'starting',
       stage: 'starting',
@@ -68,9 +119,19 @@ function reduceAgentEvent(state, envelope, allowApprovals) {
       task,
       started_at_ms: Date.now(),
       updated_at_ms: Date.now(),
-      agents: [{ id: 'main', parent_id: null, label: 'Camelid', status: 'starting', task, detail: 'Preparing the coding session' }],
+      agents,
     }
-    return { ...state, phase: 'starting', error: '', approval: null, liveActivity: activity, agents: activity.agents }
+    return {
+      ...state,
+      phase: 'starting',
+      error: '',
+      approval: null,
+      liveActivity: activity,
+      agents,
+      // The plan belongs to the turn that published it.
+      planSteps: [],
+      agentSeen: event === 'turn.starting' ? (state.agentSeen || {}) : {},
+    }
   }
   if (event === 'turn.stopping') {
     const liveActivity = state.liveActivity
@@ -90,11 +151,29 @@ function reduceAgentEvent(state, envelope, allowApprovals) {
     if (!activity) return state
     if (state.liveActivity?.updated_at_ms === activity.updated_at_ms
       && state.liveActivity?.phase === activity.phase) return state
+    const snapshotAgents = Array.isArray(activity.agents) ? activity.agents : state.agents
+    // The poll fires every second and `updated_at_ms` moves on every applied
+    // event, so the early return above never holds during a run. Reusing the
+    // previous array when nothing the panel shows has changed is what lets the
+    // memoized inspector skip that re-render.
+    const sameAgents = snapshotAgents.length === state.agents.length
+      && snapshotAgents.every((agent, index) => {
+        const previous = state.agents[index]
+        return previous && agent.id === previous.id && agent.status === previous.status
+          && agent.label === previous.label && agent.task === previous.task && agent.detail === previous.detail
+      })
+    let agentSeen = state.agentSeen || {}
+    const seenAt = Date.now()
+    for (const agent of snapshotAgents) {
+      const id = String(agent?.id || '')
+      if (id && !agentSeen[id]) agentSeen = { ...agentSeen, [id]: { firstSeenAt: seenAt, lastSeenAt: seenAt } }
+    }
     return {
       ...state,
       phase: String(activity.phase || state.phase || 'idle'),
       liveActivity: activity,
-      agents: Array.isArray(activity.agents) ? activity.agents : state.agents,
+      agents: sameAgents ? state.agents : snapshotAgents,
+      agentSeen,
       error: activity.phase === 'error' ? String(activity.detail || 'Workspace stopped.') : state.error,
     }
   }
@@ -176,7 +255,17 @@ function reduceAgentEvent(state, envelope, allowApprovals) {
     return { ...appended, phase: 'running', approval: null, error: '' }
   }
   if (event === 'tool.result') {
-    return { ...appended, phase: state.phase === 'cancel_error' ? state.phase : 'running', approval: null }
+    const plan = envelope.tool === 'update_plan' && envelope.outcome !== 'error'
+      ? parsePlanSteps(envelope.content)
+      : null
+    return {
+      ...appended,
+      phase: state.phase === 'cancel_error' ? state.phase : 'running',
+      approval: null,
+      // Only replace on a parse that produced steps: a plan the agent wrote as
+      // free prose must not wipe the last good one.
+      planSteps: plan && plan.length ? plan : state.planSteps,
+    }
   }
   if (event === 'agent.updated') {
     const incoming = {
@@ -192,7 +281,13 @@ function reduceAgentEvent(state, envelope, allowApprovals) {
       || (agent.parent_id && incoming.parent_id && agent.label === incoming.label))
     if (index === -1) agents.push(incoming)
     else agents[index] = { ...agents[index], ...incoming, task: incoming.task || agents[index].task }
-    return { ...appended, agents }
+    const seenAt = Date.now()
+    const seen = (state.agentSeen || {})[incoming.id]
+    return {
+      ...appended,
+      agents,
+      agentSeen: { ...(state.agentSeen || {}), [incoming.id]: { firstSeenAt: seen?.firstSeenAt ?? seenAt, lastSeenAt: seenAt } },
+    }
   }
   if (event === 'session.finished') {
     if (envelope.outcome !== 'answered' && turns.length) {
@@ -238,7 +333,60 @@ function withDerived(previous, next, envelope) {
     derived.latestTool = null
     derived.latestResult = null
   }
+
+  // ---- Monotonic totals (see `runTotals` in WORKSPACE_IDLE_STATE) ----
+  // A restore replaces the event list wholesale, so its totals restart too;
+  // anything else only ever adds.
+  if (event === 'thread.restored') {
+    derived.runTotals = WORKSPACE_IDLE_STATE.runTotals
+    derived.context = null
+    derived.modelSteps = []
+  } else if (event === 'model.timing') {
+    const base = previous.runTotals || WORKSPACE_IDLE_STATE.runTotals
+    derived.runTotals = {
+      ...base,
+      steps: base.steps + 1,
+      outputTokens: base.outputTokens + numeric(envelope.output_tokens),
+      elapsedMs: base.elapsedMs + numeric(envelope.total_ms),
+    }
+    derived.modelSteps = [...(previous.modelSteps || []), {
+      index: base.steps + 1,
+      totalMs: Number.isFinite(envelope.total_ms) ? envelope.total_ms : null,
+      ttftMs: Number.isFinite(envelope.ttft_ms) ? envelope.ttft_ms : null,
+      outputTokens: Number.isFinite(envelope.output_tokens) ? envelope.output_tokens : null,
+    }].slice(-MAX_MODEL_STEP_ROWS)
+  } else if (event === 'tool.result') {
+    const base = previous.runTotals || WORKSPACE_IDLE_STATE.runTotals
+    derived.runTotals = {
+      ...base,
+      tools: base.tools + 1,
+      toolFailures: base.toolFailures + (envelope.outcome === 'error' ? 1 : 0),
+    }
+  } else if (event === 'memory.updated') {
+    derived.context = {
+      promptTokens: numeric(envelope.prompt_tokens),
+      generationTokens: numeric(envelope.generation_tokens),
+      budgetTotal: numeric(envelope.budget_total),
+      // Composition, in the order the window is actually assembled.
+      parts: [
+        { key: 'system', label: 'System', tokens: numeric(envelope.system_tokens_estimate) },
+        { key: 'tools', label: 'Tool schemas', tokens: numeric(envelope.tool_definition_tokens_estimate) },
+        { key: 'messages', label: 'Messages', tokens: numeric(envelope.message_tokens_estimate) },
+        { key: 'recent', label: 'Recent memory', tokens: numeric(envelope.recent_memory_tokens_estimate) },
+        { key: 'retrieved', label: 'Retrieved memory', tokens: numeric(envelope.retrieved_memory_tokens_estimate) },
+        { key: 'evidence', label: 'Evidence', tokens: numeric(envelope.evidence_memory_tokens_estimate) },
+        { key: 'results', label: 'Tool results', tokens: numeric(envelope.tool_result_tokens_estimate) },
+      ],
+    }
+  }
   return derived
+}
+
+/** Event payloads are JSON off the wire; a missing or malformed field must
+ *  contribute zero to a running total rather than poison it with NaN. */
+function numeric(value) {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : 0
 }
 
 export function reduceWorkspaceEvent(state, envelope) {

@@ -227,6 +227,9 @@
 }
 .code-workbench.is-inspector-closed { grid-template-columns: minmax(0, 1fr); }
 .code-stage {
+  /* The reading measure for this surface. The feed and the composer share it,
+     so the transcript and the box you type into are one column. */
+  --code-measure: var(--content-max);
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto minmax(0, 1fr) auto;
@@ -313,90 +316,124 @@
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
 }
+/* ── Code transcript ───────────────────────────────────────────────────────
+   One column, one voice. The assistant's prose is the only element allowed to
+   carry weight; everything the agent DID is a quiet line beneath it. Boxes are
+   reserved for what needs containment: an approval that blocks the run. There
+   is no per-message avatar gutter, so nothing in the feed is indented and the
+   eye follows a single column top to bottom.
+   ────────────────────────────────────────────────────────────────────────── */
 .code-feed,
 .code-landing {
   box-sizing: border-box;
   width: 100%;
-  max-width: 900px;
+  max-width: var(--code-measure);
   margin: 0 auto;
   padding: var(--space-7) clamp(var(--space-4), 4vw, var(--space-7));
 }
-.code-feed { display: flex; flex-direction: column; gap: var(--space-4); padding-bottom: var(--space-6); }
-.code-live-summary {
-  display: grid;
-  grid-template-columns: 24px minmax(0, 1fr);
-  gap: var(--space-3);
-  padding: var(--space-3) var(--space-4);
-  border: 1px solid color-mix(in srgb, var(--color-accent) 30%, var(--color-border-soft));
-  border-radius: var(--radius-lg);
-  background: color-mix(in srgb, var(--color-accent-soft) 28%, var(--color-surface));
-}
-.code-live-summary.is-terminal { border-color: var(--color-border-soft); background: var(--color-surface); }
-.code-live-summary__pulse { display: grid; width: 24px; height: 24px; place-items: center; color: var(--color-ready); }
-.code-live-summary strong,
-.code-live-summary small { display: block; }
-.code-live-summary strong { color: var(--color-text); font-size: var(--text-xs); }
-.code-live-summary p { margin: 3px 0; color: var(--color-text-muted); font-size: var(--text-sm); line-height: var(--leading-snug); overflow-wrap: anywhere; }
-.code-live-summary small { color: var(--color-text-faint); font-family: var(--font-mono); font-size: 9px; }
+/* Tight base rhythm: consecutive tool lines sit 4px apart. Anything that needs
+   air asks for it with its own margin, which adds to this gap. */
+.code-feed { display: flex; flex-direction: column; gap: var(--space-1); padding-bottom: var(--space-6); }
 .code-turn-pair { display: contents; }
 .code-message { max-width: 100%; overflow-wrap: anywhere; }
-.code-message--user {
-  align-self: flex-end;
-  max-width: min(78%, 720px);
-  padding: 10px 14px;
-  border: 1px solid var(--color-border-soft);
-  border-radius: 18px 18px 5px 18px;
-  background: var(--color-surface);
-  color: var(--color-text);
-  font-size: var(--text-sm);
-  line-height: var(--leading-normal);
-}
-.code-message--assistant {
-  display: grid;
-  grid-template-columns: 28px minmax(0, 1fr);
-  gap: var(--space-3);
-  align-self: stretch;
-  padding: var(--space-3) 0 var(--space-4);
-}
-.code-message__mark {
-  display: grid;
-  width: 28px;
-  height: 28px;
-  place-items: center;
-  border: 1px solid var(--color-border-soft);
-  border-radius: 9px;
-  background: var(--color-surface);
-  color: var(--color-accent-text);
-}
-.code-message__content { min-width: 0; color: var(--color-text); font-size: var(--text-sm); line-height: var(--leading-relaxed); }
-.code-message__content > :first-child { margin-top: 2px; }
-.code-message__content > :last-child { margin-bottom: 0; }
-.code-message__content pre { max-width: 100%; overflow: auto; }
 
-.code-thinking-card {
-  max-width: calc(100% - 40px);
-  margin-left: 40px;
-  padding: var(--space-3) var(--space-4);
-  border-left: 2px solid var(--color-accent);
-  background: color-mix(in srgb, var(--color-accent-soft) 38%, transparent);
+/* What the user typed, at full strength on a tinted block — not a right-aligned
+   bubble, which is the one shape that cannot read as part of a single column,
+   and not a left rule, which is the blockquote's device four lines below.
+   `pre-wrap` because a pasted multi-line prompt collapsed into one run-on line
+   here; Chat has always had it. */
+.code-message--user {
+  margin: var(--space-6) 0 var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--color-user-chip);
+  color: var(--color-text);
+  font-size: var(--text-md);
+  font-weight: 500;
+  line-height: var(--leading-normal);
+  white-space: pre-wrap;
 }
-.code-thinking-card header { display: flex; align-items: center; gap: var(--space-2); color: var(--color-text-muted); font-size: var(--text-xs); }
+.code-feed > .code-message--user:first-child { margin-top: 0; }
+
+.code-message--assistant { align-self: stretch; margin: var(--space-2) 0 var(--space-4); }
+.code-message__content { min-width: 0; color: var(--color-text); }
+.code-message__content pre { max-width: 100%; overflow: auto; }
+.code-message__content > :last-child { margin-bottom: 0; }
+
+/* Assistant prose. These mirror the equivalent rules in chat.css, which scope
+   every one of them to `.cxturn__body` — a container this surface never enters,
+   so until now Code prose had NO block spacing at all (base.css zeroes every
+   margin) and headings rendered at the raw base.css display sizes. Keep the two
+   blocks in sync; un-scoping the chat rules instead would move a surface
+   ui-regression-smoke.mjs reads. */
+.code-message__content .message-markdown { color: var(--color-text); font-size: var(--text-md); line-height: var(--leading-relaxed); }
+.code-message__content .message-markdown > * + * { margin-top: var(--space-4); }
+.code-message__content .message-markdown h2 { font-size: var(--text-xl); margin-top: var(--space-5); }
+.code-message__content .message-markdown h3 { font-size: var(--text-lg); margin-top: var(--space-4); }
+.code-message__content .message-markdown h4 { font-size: var(--text-md); font-weight: 650; margin-top: var(--space-4); }
+.code-message__content .message-markdown blockquote {
+  margin: 0;
+  padding: var(--space-1) var(--space-4);
+  border-left: 3px solid var(--color-border-strong);
+  color: var(--color-text-muted);
+}
+.code-message__content .message-markdown blockquote > p + p { margin-top: var(--space-2); }
+.code-message__content .message-markdown hr { border: none; border-top: 1px solid var(--color-border-soft); }
+.code-message__content .message-markdown ul { display: flex; flex-direction: column; gap: var(--space-1); }
+.code-message__content .message-markdown li { line-height: var(--leading-normal); }
+/* The COLUMN is 768px because tool lines, code blocks and the composer want it.
+   Running text does not: 768px at 15px is ~94 characters, well past the band a
+   reader can track back. Clamp the prose, not the column. */
+.code-message__content .message-markdown > p,
+.code-message__content .message-markdown > ul,
+.code-message__content .message-markdown > ol,
+.code-message__content .message-markdown > blockquote,
+.code-message__content .message-markdown > h2,
+.code-message__content .message-markdown > h3,
+.code-message__content .message-markdown > h4 { max-width: 68ch; }
+
+/* The answer's own cost. Once per answer, at the end, near-invisible — never a
+   full-width row between every pair of tool lines. */
+.code-message__timing {
+  margin-top: var(--space-3);
+  color: var(--color-text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: var(--tracking-wide);
+}
+
+/* Streaming tail: the rail idiom without the wash. */
+.code-thinking-card {
+  max-width: 100%;
+  margin: var(--space-2) 0;
+  padding-left: var(--space-3);
+  border-left: 2px solid color-mix(in srgb, var(--color-accent) 45%, transparent);
+}
+.code-thinking-card header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--color-text-muted);
+  font-size: var(--text-2xs);
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+}
 /* Shown instead of the raw stream while the model is emitting tool-call syntax,
-   which is not prose and is surfaced by its own tool card. */
+   which is not prose and is surfaced by its own tool line. */
 .code-thinking-card__quiet {
   margin: var(--space-2) 0 0;
   color: var(--color-text-muted);
   font-size: var(--text-xs);
   font-style: italic;
 }
-
 .code-thinking-card pre {
   max-height: 220px;
   margin: var(--space-2) 0 0;
   overflow: auto;
   color: var(--color-text-muted);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--text-2xs);
   line-height: var(--leading-normal);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -412,198 +449,297 @@
   animation: cxPulse 1.35s var(--ease-standard) infinite;
 }
 
-.code-tool-card {
-  margin-left: 40px;
-  border: 1px solid var(--color-border-soft);
-  border-radius: var(--radius-lg);
-  background: color-mix(in srgb, var(--color-surface) 86%, transparent);
-  overflow: hidden;
-}
-.code-tool-card summary {
-  display: grid;
-  grid-template-columns: 26px minmax(0, 1fr) auto;
-  align-items: center;
+/* ── A completed tool call is ONE LINE ──────────────────────────────────────
+   No border, no fill, no 48px row, no status pill, no subtitle. The hit area is
+   as wide as the text, not the column, so a mouse pass does not paint a 768px
+   slab. One size and one family across the row, on a shared baseline.
+   ────────────────────────────────────────────────────────────────────────── */
+.code-tool-card { margin: 0; }
+.code-tool-card > summary {
+  display: flex;
+  width: fit-content;
+  max-width: 100%;
+  flex-wrap: wrap;
+  align-items: baseline;
   gap: var(--space-2);
-  min-height: 48px;
-  padding: 0 var(--space-3);
-  color: var(--color-text);
+  margin-left: calc(var(--space-2) * -1);
+  padding: 3px var(--space-2);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
   cursor: pointer;
   list-style: none;
 }
-.code-tool-card summary::-webkit-details-marker { display: none; }
-.code-tool-card__icon {
-  display: grid;
-  width: 26px;
-  height: 26px;
-  place-items: center;
-  border-radius: 8px;
-  background: var(--color-bg-elevated);
-  color: var(--color-text-faint);
+.code-tool-card > summary::-webkit-details-marker { display: none; }
+/* A wash mixed from the text colour lifts by the same amount in both themes;
+   --color-surface-hover is a large lift on dark and near-invisible on light. */
+.code-tool-card > summary:hover { background: color-mix(in srgb, var(--color-text) 7%, transparent); }
+.code-tool-card__glyph { display: inline-flex; flex: none; align-self: center; color: var(--color-text-faint); }
+.code-tool-card.is-error .code-tool-card__glyph { color: var(--color-error); }
+.code-tool-card > summary strong {
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
+  color: var(--color-text-muted);
+  font-size: var(--text-sm);
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.code-tool-card:not(.is-complete):not(.is-error)[open] .code-tool-card__icon > svg:first-child { transform: rotate(90deg); }
-.code-tool-card.is-complete .code-tool-card__icon { color: var(--color-ready); }
-.code-tool-card.is-error .code-tool-card__icon { color: var(--color-error); }
-.code-tool-card summary > span:nth-child(2) { min-width: 0; }
-.code-tool-card summary strong,
-.code-tool-card summary small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.code-tool-card summary strong { font-size: var(--text-sm); }
-.code-tool-card summary small { margin-top: 1px; color: var(--color-text-faint); font-size: 10px; }
-.code-tool-card__state {
-  padding: 3px 7px;
-  border-radius: var(--radius-pill);
-  background: var(--color-bg-elevated);
+.code-tool-card.is-running > summary strong { color: var(--color-text); }
+.code-tool-card.is-error > summary strong { color: var(--color-error); font-weight: 600; }
+.code-tool-card__hint {
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
   color: var(--color-text-faint);
-  font-size: 10px;
-  font-weight: 700;
+  font-size: var(--text-sm);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.code-tool-card__state.is-running { color: var(--color-accent-text); }
-.code-tool-card__state.is-complete { color: var(--color-ready); }
-.code-tool-card__state.is-error { color: var(--color-error); }
+/* A failure's message IS the line. It gets a full second row rather than being
+   ellipsised down to a few characters behind the name and the label. */
+.code-tool-card.is-error > summary { width: 100%; }
+.code-tool-card.is-error .code-tool-card__hint {
+  flex: 1 1 100%;
+  overflow: visible;
+  padding-left: 21px;
+  color: var(--color-text-muted);
+  white-space: normal;
+}
+.code-tool-card__chevron {
+  flex: none;
+  align-self: center;
+  color: var(--color-text-faint);
+  transition: transform var(--dur-fast) var(--ease-standard);
+}
+.code-tool-card[open] .code-tool-card__chevron { transform: rotate(90deg); }
+/* A settled call says so with its glyph. The word stays in the DOM for
+   assistive technology, and for the workbench smoke, which reads it — but it is
+   never painted: a status pill on every line IS the density problem this
+   replaces. Only a failure earns a painted word. (Recipe: base.css .sr-only.) */
+.code-tool-card__state.is-complete,
+.code-tool-card__state.is-running {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  border: 0;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+}
+.code-tool-card__state.is-error { flex: none; color: var(--color-error); font-size: var(--text-sm); }
+.code-tool-card__meta {
+  margin: var(--space-2) 0 0;
+  color: var(--color-text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: var(--tracking-wide);
+}
 .code-tool-card > pre {
   max-height: 300px;
-  margin: 0;
+  margin: var(--space-2) 0 var(--space-3);
   overflow: auto;
-  padding: var(--space-3) var(--space-4);
-  border-top: 1px solid var(--color-border-soft);
-  background: var(--color-canvas);
+  padding: var(--space-3);
+  /* The card's border is gone, so the body needs its own edge — the fill alone
+     is a three-unit delta from the page in light theme. */
+  border: 1px solid var(--color-code-border);
+  border-radius: var(--radius-md);
+  background: var(--color-code-bg);
   color: var(--color-text-muted);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--text-2xs);
   line-height: var(--leading-normal);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 
+/* ── The plan: ONE compact card ─────────────────────────────────────────────
+   Title, the step it is on, a count and a progress strip — all inside the
+   summary, so the row and the strip stay together whether it is open or shut.
+   No header block, no numbered circles, no per-row fill, no accent wash.
+   ────────────────────────────────────────────────────────────────────────── */
 .code-plan-update {
-  margin-left: 40px;
+  margin: var(--space-3) 0;
+  padding: var(--space-3);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-subtle);
+}
+.code-plan-update > summary { list-style: none; cursor: pointer; }
+.code-plan-update > summary::-webkit-details-marker { display: none; }
+.code-plan-update__head { display: flex; align-items: baseline; gap: var(--space-2); }
+.code-plan-update__head strong {
+  flex: none;
+  color: var(--color-text);
+  font-size: var(--text-2xs);
+  font-weight: 650;
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+}
+.code-plan-update__now {
+  min-width: 0;
+  flex: 1 1 auto;
   overflow: hidden;
-  border: 1px solid color-mix(in srgb, var(--color-accent) 30%, var(--color-border-soft));
-  border-radius: var(--radius-lg);
-  background: color-mix(in srgb, var(--color-accent-soft) 28%, var(--color-surface));
-}
-.code-plan-update > header {
-  display: grid;
-  grid-template-columns: 30px minmax(0, 1fr);
-  align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-3) var(--space-4);
-  border-bottom: 1px solid var(--color-border-soft);
-}
-.code-plan-update__icon {
-  display: grid;
-  width: 30px;
-  height: 30px;
-  place-items: center;
-  border-radius: 9px;
-  background: color-mix(in srgb, var(--color-accent) 13%, transparent);
-  color: var(--color-accent-text);
-}
-.code-plan-update header strong,
-.code-plan-update header small { display: block; }
-.code-plan-update header strong { font-size: var(--text-sm); }
-.code-plan-update header small {
-  margin-top: 2px;
   color: var(--color-text-muted);
   font-size: var(--text-xs);
-  overflow-wrap: anywhere;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.code-plan-update ol { display: grid; gap: 0; margin: 0; padding: var(--space-2) 0; list-style: none; }
+.code-plan-update__count {
+  flex: none;
+  color: var(--color-text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  font-variant-numeric: tabular-nums;
+}
+.code-plan-update__chevron {
+  flex: none;
+  align-self: center;
+  color: var(--color-text-faint);
+  transition: transform var(--dur-fast) var(--ease-standard);
+}
+.code-plan-update[open] .code-plan-update__chevron { transform: rotate(90deg); }
+.code-plan-update__pips { display: flex; gap: 3px; margin-top: var(--space-2); }
+.code-plan-update__pips > i { height: 3px; flex: 1 1 auto; border-radius: 1px; background: var(--color-border-strong); }
+.code-plan-update__pips > i.is-done { background: var(--color-ready); }
+.code-plan-update__pips > i.is-active { background: color-mix(in srgb, var(--color-accent) 55%, transparent); }
+.code-plan-update ol { display: grid; gap: 2px; margin: var(--space-3) 0 0; padding: 0; list-style: none; }
 .code-plan-update li {
   display: grid;
-  grid-template-columns: 24px minmax(0, 1fr);
-  align-items: center;
+  grid-template-columns: 14px minmax(0, 1fr);
+  align-items: start;
   gap: var(--space-2);
-  padding: 7px var(--space-4);
   color: var(--color-text-muted);
   font-size: var(--text-xs);
   line-height: var(--leading-snug);
 }
 .code-plan-update li > span:first-child {
-  display: grid;
-  width: 20px;
-  height: 20px;
-  place-items: center;
-  border-radius: 50%;
-  background: var(--color-bg-elevated);
+  display: inline-flex;
+  height: calc(var(--text-xs) * 1.4);
+  align-items: center;
   color: var(--color-text-faint);
-  font-size: 9px;
-  font-weight: 750;
 }
-.code-plan-update li.is-active {
-  background: color-mix(in srgb, var(--color-accent) 8%, transparent);
-  color: var(--color-text);
-  font-weight: 650;
-}
-.code-plan-update li.is-active > span:first-child { color: var(--color-accent-text); }
+.code-plan-update li > span:last-child { overflow-wrap: anywhere; }
+.code-plan-update li.is-active { color: var(--color-text); }
 .code-plan-update li.is-done { color: var(--color-text-faint); }
 .code-plan-update li.is-done > span:first-child { color: var(--color-ready); }
-.code-plan-update li > span:last-child { overflow-wrap: anywhere; }
 .code-plan-update > pre {
-  margin: 0;
-  padding: var(--space-3) var(--space-4);
+  margin: var(--space-2) 0 0;
+  padding: var(--space-3);
+  border: 1px solid var(--color-code-border);
+  border-radius: var(--radius-md);
+  background: var(--color-code-bg);
   color: var(--color-text-muted);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--text-2xs);
   white-space: pre-wrap;
 }
 
-.code-inline-approval {
-  margin-left: 40px;
-  padding: var(--space-4);
+/* ── Approval: the one element that keeps its box ───────────────────────────
+   It blocks the run and carries four consequential actions. Once decided it
+   collapses to a line that still holds the payload that was approved — the
+   audit record — instead of a dimmed card sitting on 260px of it forever.
+   ────────────────────────────────────────────────────────────────────────── */
+.code-inline-approval.is-pending {
+  margin: var(--space-3) 0;
+  padding: var(--space-3);
   border: 1px solid color-mix(in srgb, var(--color-warning) 45%, var(--color-border-soft));
-  border-radius: var(--radius-lg);
-  background: color-mix(in srgb, var(--color-warning) 8%, var(--color-surface));
+  border-radius: var(--radius-md);
+  /* Mixed against the ELEVATED surface: light --color-warning is a dark olive,
+     and 6% of it into the page made the card read as a grey smudge. The warning
+     signal lives in the border and the header glyph, which are full strength. */
+  background: color-mix(in srgb, var(--color-warning) 6%, var(--color-bg-elevated));
 }
-.code-inline-approval header { display: flex; align-items: center; gap: var(--space-3); }
-.code-inline-approval header > span { display: grid; width: 30px; height: 30px; place-items: center; border-radius: 9px; background: color-mix(in srgb, var(--color-warning) 14%, transparent); color: var(--color-warning); }
-.code-inline-approval header strong,
-.code-inline-approval header small { display: block; }
-.code-inline-approval header strong { font-size: var(--text-sm); }
-.code-inline-approval header small { margin-top: 2px; color: var(--color-text-muted); font-size: var(--text-xs); text-transform: capitalize; }
+.code-inline-approval header { display: flex; align-items: baseline; gap: var(--space-2); color: var(--color-warning); }
+.code-inline-approval header > svg { flex: none; align-self: center; }
+.code-inline-approval header strong { flex: none; color: var(--color-text); font-size: var(--text-sm); }
+.code-inline-approval header small { color: var(--color-text-muted); font-size: var(--text-2xs); text-transform: capitalize; }
 .code-inline-approval pre {
   max-height: 260px;
   margin: var(--space-3) 0;
   overflow: auto;
   padding: var(--space-3);
+  border: 1px solid var(--color-code-border);
   border-radius: var(--radius-md);
-  background: var(--color-canvas);
+  background: var(--color-code-bg);
   color: var(--color-text);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--text-2xs);
   line-height: var(--leading-normal);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 .code-inline-approval__actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-2); }
-.code-inline-approval > p { margin: var(--space-3) 0 0; color: var(--color-text-faint); font-size: var(--text-xs); }
-.code-inline-approval.is-resolved { opacity: 0.72; }
+.code-inline-approval.is-resolved { margin: 0; }
+.code-inline-approval.is-resolved > summary {
+  display: flex;
+  width: fit-content;
+  max-width: 100%;
+  align-items: baseline;
+  gap: var(--space-2);
+  margin-left: calc(var(--space-2) * -1);
+  padding: 3px var(--space-2);
+  border-radius: var(--radius-sm);
+  color: var(--color-text-faint);
+  font-size: var(--text-sm);
+  cursor: pointer;
+  list-style: none;
+}
+.code-inline-approval.is-resolved > summary::-webkit-details-marker { display: none; }
+.code-inline-approval.is-resolved > summary:hover { background: color-mix(in srgb, var(--color-text) 7%, transparent); }
+.code-inline-approval.is-resolved > summary > svg { flex: none; align-self: center; color: var(--color-warning); }
+.code-inline-approval.is-resolved > summary strong { color: var(--color-text-muted); font-weight: 500; }
+.code-inline-approval__chevron {
+  flex: none;
+  align-self: center;
+  transition: transform var(--dur-fast) var(--ease-standard);
+}
+.code-inline-approval.is-resolved[open] .code-inline-approval__chevron { transform: rotate(90deg); }
 
+/* Standalone metadata: a step timing with nothing to ride on, or a compaction. */
 .code-meta-event {
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  margin-left: 40px;
+  padding: 2px 0;
   color: var(--color-text-faint);
-  font-size: 10px;
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  font-variant-numeric: tabular-nums;
 }
+.code-meta-event > svg { flex: none; }
+
+/* Notices are inline lines, not tinted strips: a coloured glyph — and, for a
+   failure, a coloured label — followed by the text. */
 .code-session-notice {
   display: flex;
   align-items: flex-start;
   gap: var(--space-2);
-  margin-left: 40px;
-  padding: var(--space-3);
-  border-radius: var(--radius-md);
-  background: color-mix(in srgb, var(--color-ready) 8%, transparent);
+  padding: 2px 0;
   color: var(--color-text-muted);
-  font-size: var(--text-xs);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
 }
-.code-session-notice > svg { flex: none; color: var(--color-ready); }
-.code-session-notice.is-error { background: color-mix(in srgb, var(--color-error) 8%, transparent); }
+.code-session-notice > svg { flex: none; margin-top: 2px; color: var(--color-ready); }
+.code-session-notice > strong { flex: none; color: var(--color-error); font-size: var(--text-sm); font-weight: 600; }
+.code-session-notice.is-error { color: var(--color-text); }
 .code-session-notice.is-error > svg { color: var(--color-error); }
-.code-worked-divider { display: flex; align-items: center; gap: var(--space-3); margin: var(--space-3) 0; color: var(--color-text-faint); font-size: var(--text-xs); }
-.code-worked-divider::before,
+
+/* A turn boundary, not a banner. One trailing hairline, sentence case. */
+.code-worked-divider {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin: var(--space-4) 0 var(--space-3);
+  color: var(--color-text-faint);
+  font-size: var(--text-2xs);
+}
 .code-worked-divider::after { content: ''; height: 1px; flex: 1; background: var(--color-border-soft); }
-.code-agent-working { display: flex; align-items: center; gap: var(--space-2); margin: var(--space-2) 0 var(--space-2) 40px; color: var(--color-text-muted); font-size: var(--text-sm); }
+.code-agent-working { display: flex; align-items: center; gap: var(--space-2); margin: var(--space-2) 0; color: var(--color-text-muted); font-size: var(--text-sm); }
 
 .code-landing {
   display: flex;
@@ -656,7 +792,7 @@
   z-index: 4;
   box-sizing: border-box;
   width: 100%;
-  max-width: 900px;
+  max-width: var(--code-measure);
   margin: 0 auto;
   padding: var(--space-2) clamp(var(--space-4), 4vw, var(--space-7)) var(--space-4);
   background: linear-gradient(to bottom, transparent, var(--color-bg) 18%);
@@ -825,8 +961,16 @@
 .code-composer__send:hover:not(:disabled) { transform: translateY(-1px); }
 .code-composer__send:disabled { opacity: 0.3; cursor: not-allowed; }
 .code-composer__send.is-stop { background: var(--color-warning); color: var(--color-bg); }
-.code-composer-hint { display: block; margin-top: var(--space-2); color: var(--color-text-faint); font-size: 9px; text-align: center; }
+.code-composer-hint { display: block; margin-top: var(--space-2); color: var(--color-text-faint); font-size: var(--text-micro); text-align: center; }
 
+/* ── Right inspector — a session instrument, not a stack of cards ──────────
+   The PANEL is the container. Nothing inside gets a border or a fill; groups
+   are separated by one hairline and rows by nothing at all, and the rhythm has
+   three weights (the agent block, the data groups, the folded tail) rather than
+   N identical sections. Every number is mono + tabular-nums + right-aligned.
+   --text-2xs (11px) is the small size and --text-micro (10px) the floor; the
+   sheet this replaces used bare 9px in three places, below its own floor.
+   ────────────────────────────────────────────────────────────────────────── */
 .code-inspector {
   min-width: 0;
   min-height: 0;
@@ -842,20 +986,30 @@
   min-height: 70px;
   align-items: center;
   justify-content: space-between;
+  gap: var(--space-2);
   padding: var(--space-3) var(--space-4);
   border-bottom: 1px solid var(--color-border-soft);
-  background: color-mix(in srgb, var(--color-bg-elevated) 94%, transparent);
-  backdrop-filter: blur(10px);
+  /* Opaque, not a backdrop blur: the panel below it now updates continuously,
+     and a backdrop-filter re-snapshots and re-blurs on every frame that does. */
+  background: var(--color-bg-elevated);
 }
-.code-inspector__header span,
-.code-inspector__header strong { display: block; }
-.code-inspector__header span { color: var(--color-text-faint); font-size: 10px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; }
-.code-inspector__header strong { margin-top: 2px; font-size: var(--text-sm); }
-.code-inspector__header button,
-.code-inspector__section-head button {
+.code-inspector__header > div { min-width: 0; }
+.code-inspector__header strong { display: block; color: var(--color-text); font-size: var(--text-sm); }
+.code-inspector__header small {
+  display: block;
+  margin-top: 2px;
+  overflow: hidden;
+  color: var(--color-text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.code-inspector__header button {
   display: grid;
   width: 30px;
   height: 30px;
+  flex: none;
   place-items: center;
   border: 0;
   border-radius: var(--radius-md);
@@ -863,46 +1017,273 @@
   color: var(--color-text-muted);
   cursor: pointer;
 }
-.code-inspector__header button:hover,
-.code-inspector__section-head button:hover { background: var(--color-surface-hover); color: var(--color-text); }
-.code-inspector__section { padding: var(--space-4); border-bottom: 1px solid var(--color-border-soft); }
-.code-inspector__section-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); margin-bottom: var(--space-3); }
-.code-inspector__section h3 { margin: 0; color: var(--color-text-muted); font-size: var(--text-xs); font-weight: 750; letter-spacing: 0.04em; text-transform: uppercase; }
-.code-inspector__section h3 span { margin-left: 4px; color: var(--color-text-faint); }
-.code-inspector__empty { margin: 0; color: var(--color-text-faint); font-size: var(--text-xs); line-height: var(--leading-snug); }
-.code-file-list { display: grid; gap: var(--space-1); margin: 0 0 var(--space-3); padding: 0; list-style: none; }
-.code-file-list li { display: grid; grid-template-columns: 18px minmax(0, 1fr); align-items: center; gap: var(--space-2); color: var(--color-text-muted); font-family: var(--font-mono); font-size: 10px; }
-.code-file-list li svg { color: var(--color-accent-text); }
-.code-file-list li span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.code-patch { margin: var(--space-2) 0; }
-.code-patch summary { display: flex; align-items: center; gap: var(--space-1); color: var(--color-text-muted); font-size: var(--text-xs); cursor: pointer; list-style: none; }
-.code-patch summary::-webkit-details-marker { display: none; }
-.code-patch[open] summary svg { transform: rotate(90deg); }
-.code-patch pre { max-height: 320px; margin: var(--space-2) 0 0; overflow: auto; padding: var(--space-3); border-radius: var(--radius-md); background: var(--color-canvas); color: var(--color-text-muted); font-family: var(--font-mono); font-size: 10px; line-height: var(--leading-normal); white-space: pre; }
-.code-process-row { display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: var(--space-2); align-items: start; }
-.code-process-row > svg { margin-top: 2px; color: var(--color-ready); }
-.code-process-row strong,
-.code-process-row small { display: block; }
-.code-process-row strong { font-size: var(--text-xs); }
-.code-process-row small { margin-top: 3px; color: var(--color-text-faint); font-family: var(--font-mono); font-size: 9px; line-height: var(--leading-snug); overflow-wrap: anywhere; }
-.code-agent-list { display: grid; gap: var(--space-3); margin: 0; padding: 0; list-style: none; }
-.code-agent-list li { display: grid; grid-template-columns: 14px minmax(0, 1fr); gap: var(--space-2); align-items: start; }
-.code-agent-list__status { display: grid; height: 18px; place-items: center; }
-.code-agent-list__status > span { width: 7px; height: 7px; border-radius: 50%; background: var(--color-text-faint); }
-.code-agent-list li.is-starting .code-agent-list__status > span,
-.code-agent-list li.is-running .code-agent-list__status > span { background: var(--color-accent); box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-accent) 13%, transparent); animation: cxPulse 1.35s var(--ease-standard) infinite; }
-.code-agent-list li.is-waiting .code-agent-list__status > span { background: var(--color-warning); }
-.code-agent-list li.is-completed .code-agent-list__status > span { background: var(--color-ready); }
-.code-agent-list li.is-failed .code-agent-list__status > span { background: var(--color-error); }
-.code-agent-list li > div { min-width: 0; }
-.code-agent-list strong { color: var(--color-text); font-size: var(--text-xs); }
-.code-agent-list__state { float: right; margin-left: var(--space-2); color: var(--color-text-faint); font-size: 9px; text-transform: uppercase; }
-.code-agent-list p { margin: 4px 0 0; color: var(--color-text-muted); font-size: var(--text-xs); line-height: var(--leading-snug); overflow-wrap: anywhere; }
-.code-agent-list li > div > small:last-child { display: block; margin-top: 4px; color: var(--color-text-faint); font-family: var(--font-mono); font-size: 9px; line-height: var(--leading-snug); overflow-wrap: anywhere; }
-.code-context-list { display: grid; gap: var(--space-3); margin: 0; }
-.code-context-list > div { display: grid; gap: 3px; }
-.code-context-list dt { color: var(--color-text-faint); font-size: 10px; }
-.code-context-list dd { margin: 0; color: var(--color-text-muted); font-size: var(--text-xs); overflow-wrap: anywhere; }
+.code-inspector__header button:hover { background: var(--color-surface-hover); color: var(--color-text); }
+
+.code-inspector .ci-group { min-width: 0; padding: var(--space-2) var(--space-4); border-bottom: 1px solid var(--color-border-soft); }
+/* The running agent and the plan it is working through are one block. */
+.code-inspector .ci-group--joined { padding-bottom: 0; border-bottom: 0; }
+.code-inspector .ci-group:first-of-type { padding-top: var(--space-4); }
+.code-inspector .ci-group__head { display: flex; min-height: 22px; align-items: center; justify-content: space-between; gap: var(--space-2); }
+.code-inspector .ci-group__label {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  margin: 0;
+  color: var(--color-text-muted);
+  font-family: var(--font-ui);
+  font-size: var(--text-2xs);
+  font-weight: 700;
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+}
+.code-inspector .ci-empty { margin: var(--space-2) 0 0; color: var(--color-text-faint); font-size: var(--text-2xs); line-height: var(--leading-snug); }
+.code-inspector .ci-icon-btn {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-faint);
+  cursor: pointer;
+}
+.code-inspector .ci-icon-btn:hover:not(:disabled) { background: var(--color-surface-hover); color: var(--color-text); }
+.code-inspector .ci-icon-btn:disabled { color: var(--color-border-strong); cursor: not-allowed; }
+
+/* Numbers: one treatment, everywhere. */
+.code-inspector .ci-num {
+  color: var(--color-text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* Disclosure rows. */
+.code-inspector .ci-fold > summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) max-content 12px;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) 0;
+  color: var(--color-text-muted);
+  font-size: var(--text-xs);
+  cursor: pointer;
+  list-style: none;
+}
+.code-inspector .ci-fold > summary::-webkit-details-marker { display: none; }
+.code-inspector .ci-fold > summary:hover { color: var(--color-text); }
+.code-inspector .ci-fold > summary > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.code-inspector .ci-fold--nested { margin-top: var(--space-1); padding-left: 20px; }
+.code-inspector .ci-chev { display: grid; place-items: center; color: var(--color-text-faint); transition: transform var(--dur-fast) var(--ease-standard); }
+.code-inspector .ci-fold[open] > summary .ci-chev { transform: rotate(90deg); }
+
+/* Agent rows. */
+.code-inspector .code-agent-list { display: grid; gap: 0; margin: var(--space-2) 0 0; padding: 0; list-style: none; }
+.code-inspector .code-agent-list li { min-width: 0; padding: var(--space-2) 0; border-top: 1px solid var(--color-border-soft); }
+.code-inspector .code-agent-list li:first-child { padding-top: 0; border-top: 0; }
+.code-inspector .ci-task__head { display: grid; grid-template-columns: 12px minmax(0, 1fr) 24px; align-items: center; gap: var(--space-2); }
+.code-inspector .ci-task__title { overflow: hidden; color: var(--color-text); font-size: var(--text-xs); font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.code-inspector .ci-task__glyph { display: grid; width: 12px; height: 12px; place-items: center; color: var(--color-text-faint); }
+/* cxPulse animates box-shadow from currentColor, so the colour has to sit on
+   the element itself rather than on a background. */
+.code-inspector .ci-task__glyph > span { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.code-inspector .ci-task.is-starting .ci-task__glyph,
+.code-inspector .ci-task.is-running .ci-task__glyph { color: var(--color-accent); }
+.code-inspector .ci-task.is-starting .ci-task__glyph > span,
+.code-inspector .ci-task.is-running .ci-task__glyph > span { animation: cxPulse 1.35s var(--ease-standard) infinite; }
+.code-inspector .ci-task.is-waiting .ci-task__glyph { color: var(--color-warning); }
+.code-inspector .ci-task.is-completed .ci-task__glyph { color: var(--color-ready); }
+.code-inspector .ci-task.is-failed .ci-task__glyph { color: var(--color-error); }
+/* These three are real terminal states the backend reports and the old sheet
+   styled none of them, so they rendered identically to "unknown". */
+.code-inspector .ci-task.is-inconclusive .ci-task__glyph,
+.code-inspector .ci-task.is-cancelled .ci-task__glyph,
+.code-inspector .ci-task.is-stopped .ci-task__glyph { color: var(--color-unsupported); }
+
+/* Grid, never `float: right` — a float cannot hold a right-aligned numeric
+   column against a truncating label. */
+.code-inspector .ci-task__meta {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) max-content;
+  align-items: baseline;
+  gap: var(--space-2);
+  margin: 3px 0 0;
+  padding-left: 20px;
+  color: var(--color-text-faint);
+  font-size: var(--text-2xs);
+}
+.code-inspector .ci-task__meta > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.code-inspector .ci-task__desc {
+  margin: var(--space-1) 0 0;
+  padding-left: 20px;
+  color: var(--color-text-muted);
+  font-size: var(--text-2xs);
+  line-height: var(--leading-snug);
+  overflow-wrap: anywhere;
+}
+.code-inspector .ci-task__note {
+  margin: var(--space-1) 0 0;
+  color: var(--color-text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  line-height: var(--leading-snug);
+  overflow-wrap: anywhere;
+}
+.code-inspector .code-agent-list .ci-task__note { padding-left: 20px; }
+.code-inspector .code-process-row {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  align-items: baseline;
+  gap: var(--space-2);
+  margin-top: var(--space-1);
+  padding-left: 20px;
+}
+.code-inspector .ci-task__stage {
+  color: var(--color-accent-text);
+  font-size: var(--text-micro);
+  font-weight: 650;
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+}
+.code-inspector .code-process-row small {
+  overflow: hidden;
+  color: var(--color-text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Plan. Pending squares are OUTLINED, not filled: a --color-border-strong fill
+   composites to ~1.6:1 in both themes, i.e. absent, and this is the only
+   progress affordance in the group. */
+.code-inspector .ci-pips { display: flex; flex-wrap: wrap; gap: 5px; margin: var(--space-2) 0; }
+.code-inspector .ci-pips i { width: 6px; height: 6px; border-radius: 2px; background: transparent; box-shadow: inset 0 0 0 1px var(--color-text-faint); }
+.code-inspector .ci-pips i.is-done { background: var(--color-ready); box-shadow: none; }
+.code-inspector .ci-pips i.is-active { background: color-mix(in srgb, var(--color-accent) 55%, transparent); box-shadow: none; }
+.code-inspector .ci-plan { display: grid; gap: 3px; margin: 0; padding: 0; list-style: none; }
+.code-inspector .ci-plan li {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr);
+  align-items: start;
+  gap: var(--space-2);
+  color: var(--color-text-muted);
+  font-size: var(--text-2xs);
+  line-height: var(--leading-snug);
+  overflow-wrap: anywhere;
+}
+.code-inspector .ci-plan__mark { display: grid; height: 15px; place-items: center; }
+.code-inspector .ci-plan li.is-done { color: var(--color-text-faint); }
+.code-inspector .ci-plan li.is-done .ci-plan__mark { color: var(--color-ready); }
+.code-inspector .ci-plan li.is-active { color: var(--color-text); font-weight: 600; }
+.code-inspector .ci-plan li.is-active .ci-plan__mark { color: var(--color-accent); }
+.code-inspector .ci-plan li.is-pending { color: var(--color-text-faint); }
+
+/* Mini table. */
+.code-inspector .ci-table-wrap { max-width: 100%; margin-top: var(--space-2); overflow-x: auto; }
+.code-inspector .ci-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+.code-inspector .ci-table th {
+  padding: 0 0 3px;
+  border-bottom: 1px solid var(--color-border-strong);
+  color: var(--color-text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  font-weight: 500;
+  letter-spacing: var(--tracking-wide);
+  text-align: right;
+  text-transform: uppercase;
+}
+.code-inspector .ci-table td {
+  padding: 3px 0;
+  border-bottom: 1px solid var(--color-border-soft);
+  color: var(--color-text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.code-inspector .ci-table th:first-child,
+.code-inspector .ci-table td:first-child { width: 16px; text-align: left; }
+.code-inspector .ci-table th:nth-child(2),
+.code-inspector .ci-table td:nth-child(2) { width: 26px; }
+.code-inspector .ci-table tbody tr:last-child td { border-bottom: 0; }
+.code-inspector .ci-table__mark { color: var(--color-ready); line-height: 0; }
+.code-inspector .ci-table tr.is-live td { color: var(--color-text-faint); }
+.code-inspector .ci-table tr.is-live .ci-table__mark { color: var(--color-accent); }
+/* The house spinner recipe (ui.css .cx-btn__spinner), sized for a table cell. */
+.code-inspector .ci-spin {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: camelidSpin 0.7s linear infinite;
+}
+
+/* Context meter + key/value lists. */
+.code-inspector .ci-meter { height: 4px; margin: var(--space-2) 0; overflow: hidden; border-radius: var(--radius-pill); background: var(--color-border-soft); }
+.code-inspector .ci-meter i { display: block; height: 100%; background: var(--color-accent); }
+.code-inspector .ci-meter.is-warn i { background: var(--color-warning); }
+.code-inspector .ci-meter.is-critical i { background: var(--color-error); }
+.code-inspector .ci-kv { display: grid; gap: 3px; margin: var(--space-1) 0 0; }
+.code-inspector .ci-kv > div { display: grid; grid-template-columns: minmax(0, 1fr) max-content; align-items: baseline; gap: var(--space-2); }
+.code-inspector .ci-kv dt { color: var(--color-text-faint); font-size: var(--text-2xs); }
+.code-inspector .ci-kv dd { margin: 0; color: var(--color-text-muted); font-size: var(--text-2xs); }
+.code-inspector .ci-kv--wide { gap: var(--space-2); }
+.code-inspector .ci-kv--wide > div { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+.code-inspector .ci-kv--wide dd { overflow-wrap: anywhere; }
+
+/* Changed files + patch. */
+.code-inspector .code-file-list { display: grid; gap: 3px; margin: var(--space-2) 0 0; padding: 0; list-style: none; }
+.code-inspector .code-file-list li {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--color-text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+}
+.code-inspector .code-file-list li svg { color: var(--color-accent-text); }
+.code-inspector .code-file-list li span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.code-inspector .code-patch { margin-top: var(--space-2); }
+.code-inspector .code-patch pre {
+  max-height: 320px;
+  margin: var(--space-2) 0;
+  overflow: auto;
+  padding: var(--space-3);
+  border: 1px solid var(--color-code-border);
+  border-radius: var(--radius-md);
+  background: var(--color-code-bg);
+  color: var(--color-text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  line-height: var(--leading-normal);
+  white-space: pre;
+}
+
+/* Finished tail. */
+.code-inspector .ci-group--fold { padding-block: var(--space-2); }
+.code-inspector .ci-group--fold > summary { grid-template-columns: minmax(0, 1fr) max-content 12px; }
+.code-inspector .ci-group__foldbody { padding-top: var(--space-1); }
+/* One action idiom in this panel: bare text. A 32px pill would be the loudest
+   thing in a column built out of hairlines. */
+.code-inspector .ci-textaction {
+  margin-top: var(--space-2);
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--color-accent-text);
+  font: inherit;
+  font-size: var(--text-2xs);
+  cursor: pointer;
+}
+.code-inspector .ci-textaction:hover:not(:disabled) { text-decoration: underline; }
+.code-inspector .ci-textaction:disabled { color: var(--color-text-faint); cursor: not-allowed; }
 
 @media (max-width: 980px) {
   .workspace-view { grid-template-columns: 1fr; grid-template-rows: max-content minmax(520px, max-content); overflow-y: auto; }
@@ -932,14 +1313,7 @@
   .code-elapsed { display: none; }
   .code-feed,
   .code-landing { padding-inline: var(--space-3); }
-  .code-message--user { max-width: 88%; }
-  .code-thinking-card,
-  .code-tool-card,
-  .code-plan-update,
-  .code-inline-approval,
-  .code-meta-event,
-  .code-session-notice,
-  .code-agent-working { margin-left: 0; max-width: 100%; }
+  .code-message--user { max-width: 100%; }
   .code-composer-shell { padding-inline: var(--space-3); }
   .code-composer__chips > span:nth-child(3) { display: none; }
 }

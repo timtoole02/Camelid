@@ -111,6 +111,10 @@
 
   --color-border-soft: rgba(148, 178, 209, 0.13);
   --color-border-strong: rgba(148, 178, 209, 0.26);
+  /* Alias. Five rules in workspace.css already referenced this name and it was
+     never declared, so their `border-style` resolved to none. Composed from the
+     themed token, so it does not need duplicating into the light blocks. */
+  --color-border: var(--color-border-strong);
 
   --color-text: #dde5ed;
   --color-text-muted: #9caab9;
