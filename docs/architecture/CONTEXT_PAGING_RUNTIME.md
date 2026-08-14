@@ -59,8 +59,14 @@ Compatibility constraints:
 
 ## Vertical-slice architecture
 
-The first slice supports Rust and Python symbol extraction with deterministic
-source-derived signatures and balanced source ranges. It persists:
+The first slice gives common UTF-8 source, build, configuration, test, and
+documentation artifacts hash-backed path authority and exact bounded pages.
+Rust and Python additionally receive deterministic symbol extraction with
+source-derived signatures and balanced source ranges. The runtime retains up
+to 8,192 authority paths and 256 hydrated files at once; an explicitly named
+supported text path can be admitted and hydrated on demand when it lies beyond
+that initial inventory. Binary, oversized, sensitive, and ambiguous targets
+fail closed instead of being treated as new files. It persists:
 
 - a canonical `TaskLedger`;
 - a `ProjectMap`, `SymbolCard`s, and exact `SourcePage`s;
@@ -96,7 +102,7 @@ task state contains `action`, `focus`, and `verification`. The immutable user
 objective is preserved verbatim and fails closed if it cannot fit; mutable focus
 is bounded to 600 bytes, and criterion/invariant lists render at most 6 items of
 240 bytes. `decisions` and `openQuestions` render as evictable task detail.
-Ledger lists themselves are bounded (32 items, 480 bytes per item), so
+Ledger lists themselves are bounded (128 items, 480 bytes per item), so
 model-authored state cannot grow without bound. The builder uses a
 `TokenEstimator` interface that is continuously calibrated from the live
 tokenizer's measured tokens-per-byte rate; the integrated request is still
@@ -108,9 +114,11 @@ measured M4 break-even, not a paging policy knob. The late task state is kept
 compact so ordinary Modify/Verify transitions can clear it. A real write still
 changes source hashes, map rows, and pages and may correctly force one cold
 prefill; the layout does not claim that every action is cacheable. On the exact
-TaskForge/Qwen3-4B-Q8_0 fixture with six active-work schemas and unchanged
-preceding evidence, the measured integer reuse ratios are 53:1 (Modify to
-pending Verify), 66:1 (pending to plain Verify), and 67:1 (source-fault retry).
+recorded multi-file Python/Qwen3-4B-Q8_0 benchmark fixture with six active-work
+schemas and unchanged preceding evidence, the measured integer reuse ratios
+are 53:1 (Modify to pending Verify), 66:1 (pending to plain Verify), and 67:1
+(source-fault retry). The fixture is only a benchmark workload; the runtime
+does not match its project name, file layout, language, or application domain.
 
 The advertised action protocol is the model's existing native function-call
 format: one advertised tool call per step, followed by a concise plain-text
@@ -154,17 +162,23 @@ observability.
 
 ## Robustness and loop bounds
 
-Indexing failure is contained per file: a file that cannot be indexed (over
-the 1 MiB per-file limit, non-UTF-8, or changed mid-walk) is skipped and its
-stale records are purged instead of failing the whole runtime. Files deleted
-mid-session have their map entries, cards, and pages purged on the next
-refresh. A corrupt project index or runtime-state file is rebuilt/reset from
-source instead of refusing to start; the canonical task ledger stays strict.
+Indexing failure is contained per file: a supported path that cannot be
+hydrated (over the 1 MiB per-file limit, non-UTF-8, or changed mid-read) retains
+at most path authority while stale cards/pages are purged; a later modification
+fails closed rather than guessing bytes. Files deleted mid-session have their
+map entries, cards, and pages purged on the next refresh. A corrupt project
+index or runtime-state file is rebuilt/reset from source instead of refusing to
+start; the canonical task ledger stays strict.
 
 Verification is host-owned. `COMPLETE` is accepted only when host-run
 verification has passed. A prose answer after a workspace change but before
 verification is reprompted (bounded) and can never overwrite a failed
 verification status with "complete"; `BLOCKED` never marks the task complete.
+A user-declared test, launch, or manual-validation command is retained as an
+exact host obligation independent of language or framework. Ecosystem adapters
+can recognize additional conventional runners, but an allowlist is not the
+completion authority; successful probes, help, collection-only, or syntax-only
+commands cannot satisfy application-execution evidence.
 A successful reread proves the saved bytes but does not by itself mark Code
 verification passed when `run_shell` is available; a post-write test, build, or
 syntax command must also succeed. Successful environment probes such as
@@ -240,8 +254,9 @@ dropping them.
 
 ## Known first-slice limits
 
-- Structural extraction covers ordinary Rust/Python declarations; macros and
-  generated sources fall back to bounded file pages.
+- Structural extraction covers ordinary Rust/Python declarations. Other
+  supported text ecosystems use exact full-file or overlapping line-safe chunk
+  pages; macros and generated sources use the same bounded fallback.
 - Caller/callee edges are lexical heuristics, not a compiler call graph, and
   `imports` and `dependencies` currently duplicate each other.
 - Multi-line raw strings can still fool Rust block-end detection; the error is
@@ -249,8 +264,10 @@ dropping them.
 - Output-token metrics depend on the driver reporting completion tokens;
   streaming responses may not.
 - Typed `PATCH` uses exact page replacement rather than arbitrary unified diff.
-- File-level exact pages are limited to 16 KiB; larger files must be changed by
-  symbol page or a later bounded-range paging adapter.
+- Complete-file exact pages are limited to 8 KiB and the text-authority reader
+  is limited to 1 MiB. Larger supported text files use overlapping exact chunk
+  pages for narrow edits; whole-file overwrite remains fail-closed unless the
+  complete current file fits the bounded page.
 - The benchmark is a deterministic fixture, not a live-model throughput claim;
   default-on live-model receipts remain part of release validation.
 

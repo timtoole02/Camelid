@@ -156,9 +156,6 @@ fn direct_creation_path(goal: &str) -> Option<String> {
         return None;
     }
     let lower = goal.to_ascii_lowercase();
-    if lower.contains("tic tac toe") || lower.contains("tic-tac-toe") {
-        return Some("tic_tac_toe.py".into());
-    }
     if lower.contains("python") || lower.contains("tkinter") || lower.contains("pygame") {
         return Some("app.py".into());
     }
@@ -186,7 +183,7 @@ fn direct_creation_contract(goal: &str) -> String {
     }
     if lower.contains("graphics") || lower.contains("graphical") || lower.contains("gui") {
         requirements.push(
-            "Graphics means a real interactive GUI window (for example tkinter or pygame), not terminal input/output."
+            "Graphics means a real interactive graphical interface appropriate to the requested platform, not terminal-only input/output."
                 .to_string(),
         );
     }
@@ -210,23 +207,9 @@ fn direct_creation_contract(goal: &str) -> String {
                 .to_string(),
         );
     }
-    if lower.contains("tic tac toe") || lower.contains("tic-tac-toe") {
-        requirements.push(
-            "Tic-tac-toe turn handling must keep the human as X: after each valid human click, check the human terminal state, automatically make exactly one legal O move when play continues, check the computer terminal state/draw, and return control to X. Occupied cells and clicks after game-over must do nothing."
-                .to_string(),
-        );
-        requirements.push(
-            "For tkinter board buttons created in loops, bind row and column in each callback using lambda defaults such as row=i, col=j; a bare lambda that closes over i/j makes every button target the final cell."
-                .to_string(),
-        );
-        requirements.push(
-            "Choose O only from the current list of empty cells, track a game_over state, detect all eight winning lines and a full-board draw after each side, show the result in the GUI with a status label or messagebox, and provide an in-window reset/new-game control."
-                .to_string(),
-        );
-    }
     if lower.contains("play") || lower.contains("game") {
         requirements.push(
-            "The interaction must be complete enough for the user to start, play through, and see the win/draw state without editing source."
+            "The interaction must be complete enough for the user to start, play through, and see the current state and outcome, when applicable, without editing source."
                 .to_string(),
         );
     }
@@ -1210,7 +1193,7 @@ mod tests {
     #[test]
     fn standalone_python_creation_stays_direct_but_repo_work_can_delegate() {
         assert!(direct_creation_request(
-            "Can you code me tic tac toe, one player vs the computer. In Python with graphics so I can play"
+            "Can you code me a one-player board game in Python with graphics so I can play"
         ));
         assert!(direct_creation_request(
             "Create one file in Python that displays a desktop clock"
@@ -1223,10 +1206,10 @@ mod tests {
         ));
         assert_eq!(
             direct_creation_path(
-                "Can you code me tic tac toe, one player vs the computer. In Python with graphics so I can play"
+                "Can you code me a one-player board game in Python with graphics so I can play"
             )
             .as_deref(),
-            Some("tic_tac_toe.py")
+            Some("app.py")
         );
         assert_eq!(
             direct_creation_path("Create a small Python GUI utility").as_deref(),
@@ -1236,26 +1219,44 @@ mod tests {
     }
 
     #[test]
-    fn direct_game_contract_keeps_graphics_and_computer_behavior_explicit() {
+    fn direct_game_contract_keeps_only_domain_neutral_requirements() {
         let contract = direct_creation_contract(
-            "Can you code me tic tac toe, one player vs the computer. In Python with graphics so I can play",
+            "Can you code me a one-player board game in Python with graphics so I can play",
         );
         assert!(contract.contains("runnable Python source"));
-        assert!(contract.contains("real interactive GUI window"));
+        assert!(contract.contains("real interactive graphical interface"));
         assert!(contract.contains("human controls exactly one side"));
         assert!(contract.contains("automatically chooses and performs every opposing move"));
-        assert!(contract.contains("keep the human as X"));
-        assert!(contract.contains("exactly one legal O move"));
-        assert!(contract.contains("return control to X"));
-        assert!(contract.contains("lambda defaults"));
-        assert!(contract.contains("all eight winning lines"));
-        assert!(contract.contains("status label or messagebox"));
+        assert!(contract.contains("current state and outcome"));
+        assert_eq!(
+            contract
+                .lines()
+                .filter(|line| line.starts_with("- "))
+                .count(),
+            9,
+            "the contract should contain only shared creation, language, GUI, opponent, game, and verification requirements"
+        );
 
         let implied_opponent = direct_creation_contract(
-            "Code me a one-player tic tac toe game in Python using graphics.",
+            "Code me a one-player strategy game in Python using graphics.",
         );
         assert!(implied_opponent.contains("human controls exactly one side"));
         assert!(implied_opponent.contains("automatically chooses and performs every opposing move"));
+    }
+
+    #[test]
+    fn non_python_standalone_creation_does_not_invent_a_language_or_domain() {
+        let goal = "Create a single-file JavaScript countdown timer";
+        assert!(direct_creation_request(goal));
+        assert_eq!(direct_creation_path(goal), None);
+
+        let contract = direct_creation_contract(goal);
+        assert!(contract.contains("requested runnable artifact"));
+        assert!(contract.contains("every explicit requirement"));
+        assert!(!contract.contains("Python"));
+        assert!(!contract.contains("tkinter"));
+        assert!(!contract.contains("game"));
+        assert!(!contract.contains("human controls"));
     }
 
     #[test]

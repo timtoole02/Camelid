@@ -642,9 +642,14 @@ fn workspace_path_looks_like_test(path: &str) -> bool {
     stem == "test"
         || stem.starts_with("test_")
         || stem.ends_with("_test")
+        || stem.ends_with("_spec")
+        || filename.contains(".test.")
+        || filename.contains(".spec.")
+        || (filename.ends_with(".java")
+            && (stem.ends_with("test") || stem.ends_with("tests") || stem.ends_with("it")))
         || normalized
             .split('/')
-            .any(|component| matches!(component, "test" | "tests"))
+            .any(|component| matches!(component, "test" | "tests" | "__tests__"))
 }
 
 fn workspace_test_artifacts(
@@ -682,54 +687,194 @@ fn workspace_test_artifacts(
     artifacts
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ObjectiveExecutionIntent {
+    tests: Option<bool>,
+    runtime: Option<bool>,
+}
+
+fn objective_intent_clauses(objective: &str) -> Vec<String> {
+    let mut normalized = objective.to_ascii_lowercase();
+    for contrast in [
+        " however ",
+        " instead ",
+        " but ",
+        " yet ",
+        " whereas ",
+        " while ",
+    ] {
+        normalized = normalized.replace(contrast, ";");
+    }
+    normalized
+        .split(['\n', '\r', '.', ';', '!', '?'])
+        .map(str::trim)
+        .filter(|clause| !clause.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn objective_intent_words(clause: &str) -> Vec<&str> {
+    clause
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '\'')
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+fn intent_word_is_test_target(word: &str) -> bool {
+    matches!(
+        word,
+        "test"
+            | "tests"
+            | "tested"
+            | "testing"
+            | "testcase"
+            | "testcases"
+            | "unittest"
+            | "unittests"
+            | "pytest"
+            | "spec"
+            | "specs"
+    )
+}
+
+fn intent_word_is_runtime_target(word: &str) -> bool {
+    matches!(
+        word,
+        "app"
+            | "application"
+            | "binary"
+            | "cli"
+            | "executable"
+            | "it"
+            | "program"
+            | "server"
+            | "service"
+    )
+}
+
+fn intent_word_is_execution_action(word: &str) -> bool {
+    matches!(
+        word,
+        "execute"
+            | "executed"
+            | "executing"
+            | "exercise"
+            | "invoke"
+            | "launch"
+            | "launched"
+            | "run"
+            | "running"
+            | "start"
+            | "started"
+    )
+}
+
+fn nearest_execution_action(words: &[&str], target: usize) -> Option<usize> {
+    words
+        .iter()
+        .enumerate()
+        .filter(|(_, word)| intent_word_is_execution_action(word))
+        .min_by_key(|(index, _)| index.abs_diff(target))
+        .map(|(index, _)| index)
+}
+
+fn objective_intent_is_negated(words: &[&str], action: Option<usize>, target: usize) -> bool {
+    let anchor = action.unwrap_or(target);
+    let start = anchor.min(target).saturating_sub(2);
+    let end = anchor.max(target).saturating_add(1).min(words.len());
+    let window = &words[start..end];
+    window.iter().any(|word| {
+        matches!(
+            *word,
+            "never" | "skip" | "skipping" | "without" | "don't" | "dont" | "not"
+        )
+    }) || window
+        .windows(2)
+        .any(|pair| matches!(pair, ["do" | "must" | "should", "not"]))
+}
+
+/// Track test execution and application execution independently. Negation is
+/// bound to the nearest action/target pair, and contrast words split clauses,
+/// so "skip tests, but run the app" cannot suppress the application gate (or
+/// accidentally require the skipped test gate).
+fn objective_execution_intent(objective: &str) -> ObjectiveExecutionIntent {
+    let mut intent = ObjectiveExecutionIntent::default();
+    for clause in objective_intent_clauses(objective) {
+        let words = objective_intent_words(&clause);
+        for (target, _) in words
+            .iter()
+            .enumerate()
+            .filter(|(_, word)| intent_word_is_test_target(word))
+        {
+            let action = nearest_execution_action(&words, target);
+            intent.tests = Some(!objective_intent_is_negated(&words, action, target));
+        }
+        for (target, _) in words
+            .iter()
+            .enumerate()
+            .filter(|(_, word)| intent_word_is_runtime_target(word))
+        {
+            let action = nearest_execution_action(&words, target);
+            if action.is_some() {
+                intent.runtime = Some(!objective_intent_is_negated(&words, action, target));
+            }
+        }
+        if !words.iter().any(|word| intent_word_is_test_target(word))
+            && !words.iter().any(|word| intent_word_is_runtime_target(word))
+        {
+            if let Some(action) = words
+                .iter()
+                .position(|word| intent_word_is_execution_action(word))
+            {
+                let emphasized = words
+                    .iter()
+                    .any(|word| matches!(*word, "actually" | "manually" | "yourself"));
+                if emphasized {
+                    intent.runtime =
+                        Some(!objective_intent_is_negated(&words, Some(action), action));
+                }
+            }
+        }
+    }
+    intent
+}
+
 fn objective_requests_test_execution(
     objective: &str,
     completed_work: &[String],
     required_artifacts: &BTreeSet<String>,
 ) -> bool {
+    let declared = declared_validation_commands(objective);
+    if !declared.tests.commands.is_empty() || declared.tests.invalid || declared.tests.overflow {
+        return true;
+    }
+    if let Some(required) = objective_execution_intent(objective).tests {
+        return required;
+    }
     workspace_test_artifacts(completed_work, required_artifacts)
         .iter()
         .next()
         .is_some()
-        || objective
-            .split(|character: char| !character.is_ascii_alphanumeric())
-            .any(|word| {
-                matches!(
-                    word.to_ascii_lowercase().as_str(),
-                    "test"
-                        | "tests"
-                        | "tested"
-                        | "testing"
-                        | "unittest"
-                        | "unittests"
-                        | "testcase"
-                        | "testcases"
-                        | "pytest"
-                )
-            })
 }
 
 const TEST_EXECUTION_EVIDENCE_PREFIX: &str = "host verification evidence: tests passed: ";
+const DECLARED_TEST_EVIDENCE_PREFIX: &str = "host verification evidence: requested test command ";
 const MANUAL_VALIDATION_EVIDENCE_PREFIX: &str = "host verification evidence: manual command ";
+const RUNTIME_EXECUTION_EVIDENCE_PREFIX: &str =
+    "host verification evidence: application execution passed: ";
+const DECLARED_RUNTIME_EVIDENCE_PREFIX: &str =
+    "host verification evidence: requested runtime command ";
 const SOURCE_FINGERPRINT_EVIDENCE_PREFIX: &str = "host verification evidence: source fingerprint: ";
 const SOURCE_FINGERPRINT_INCOMPLETE_MARKER: &str =
     "host verification blocked: shell source-change scan was truncated";
-const MAX_MANUAL_VALIDATION_COMMANDS: usize = 16;
+const MAX_DECLARED_VALIDATION_COMMANDS: usize = 128;
 
 fn objective_has_runtime_execution_requirement(objective: &str) -> bool {
-    let objective = objective.to_ascii_lowercase();
-    [
-        "actually execute",
-        "manually execute",
-        "manually executed",
-        "manual validation",
-        "run the application yourself",
-        "execute the application",
-        "exercise multiple cli",
-        "exercise the cli",
-    ]
-    .iter()
-    .any(|phrase| objective.contains(phrase))
+    let declared = declared_validation_commands(objective);
+    !declared.runtime.commands.is_empty()
+        || declared.runtime.invalid
+        || declared.runtime.overflow
+        || objective_execution_intent(objective).runtime == Some(true)
 }
 
 fn has_verification_evidence(decisions: &[String], prefix: &str) -> bool {
@@ -750,25 +895,258 @@ fn clear_execution_verification_evidence(decisions: &mut Vec<String>) {
     decisions.retain(|decision| {
         !decision.starts_with(TEST_EXECUTION_EVIDENCE_PREFIX)
             && !decision.starts_with(MANUAL_VALIDATION_EVIDENCE_PREFIX)
+            && !decision.starts_with(RUNTIME_EXECUTION_EVIDENCE_PREFIX)
+            && !decision.starts_with(DECLARED_TEST_EVIDENCE_PREFIX)
+            && !decision.starts_with(DECLARED_RUNTIME_EVIDENCE_PREFIX)
             && !decision.starts_with(SOURCE_FINGERPRINT_EVIDENCE_PREFIX)
     });
 }
 
-fn completed_source_paths(completed_work: &[String]) -> BTreeSet<String> {
+/// Files whose bytes can change the authored program, its build, or its test
+/// discovery. Runtime data is intentionally excluded: executing an application
+/// may legitimately update JSON/database state between separate validation
+/// commands, and that must not invalidate earlier workflow receipts.
+fn workspace_path_is_authored_input(path: &str) -> bool {
     const SOURCE_EXTENSIONS: &[&str] = &[
-        "c", "cc", "cpp", "cs", "go", "h", "hpp", "java", "js", "jsx", "kt", "kts", "mjs", "php",
-        "py", "pyw", "rb", "rs", "swift", "ts", "tsx",
+        "bash",
+        "bat",
+        "c",
+        "cc",
+        "cfg",
+        "cjs",
+        "clj",
+        "cljs",
+        "cmake",
+        "cmd",
+        "conf",
+        "cpp",
+        "cxx",
+        "cs",
+        "css",
+        "cts",
+        "dart",
+        "dockerfile",
+        "edn",
+        "erl",
+        "ex",
+        "exs",
+        "fish",
+        "fs",
+        "fsx",
+        "gql",
+        "go",
+        "gradle",
+        "graphql",
+        "groovy",
+        "h",
+        "hcl",
+        "hpp",
+        "hxx",
+        "hrl",
+        "hs",
+        "htm",
+        "html",
+        "ini",
+        "java",
+        "js",
+        "jsonc",
+        "jsx",
+        "kt",
+        "kts",
+        "less",
+        "lhs",
+        "lua",
+        "m",
+        "mjs",
+        "ml",
+        "mli",
+        "mm",
+        "mod",
+        "mts",
+        "mk",
+        "nim",
+        "php",
+        "pl",
+        "pm",
+        "proto",
+        "properties",
+        "ps1",
+        "py",
+        "pyi",
+        "pyw",
+        "r",
+        "rb",
+        "rs",
+        "sass",
+        "scala",
+        "sc",
+        "scss",
+        "sh",
+        "sol",
+        "sql",
+        "svelte",
+        "swift",
+        "tf",
+        "thrift",
+        "toml",
+        "ts",
+        "tsx",
+        "txt",
+        "vb",
+        "vue",
+        "xml",
+        "yaml",
+        "yml",
+        "zig",
+        "zsh",
     ];
+    const MANIFEST_NAMES: &[&str] = &[
+        "build.gradle",
+        "build.gradle.kts",
+        "build.sbt",
+        "build.zig",
+        "build",
+        "build.bazel",
+        "cargo.lock",
+        "cargo.toml",
+        "cmakelists.txt",
+        "composer.json",
+        "composer.lock",
+        "cabal.project",
+        "deno.json",
+        "deno.jsonc",
+        "dockerfile",
+        "gemfile",
+        "gemfile.lock",
+        "go.mod",
+        "go.sum",
+        "gradle.properties",
+        "gradlew",
+        "gradlew.bat",
+        "justfile",
+        "makefile",
+        "package-lock.json",
+        "package.json",
+        "package.swift",
+        "project.clj",
+        "pubspec.yaml",
+        "pipfile",
+        "pipfile.lock",
+        "pnpm-lock.yaml",
+        "pom.xml",
+        "procfile",
+        "pyproject.toml",
+        "requirements.txt",
+        "rakefile",
+        "setup.cfg",
+        "setup.py",
+        "settings.gradle",
+        "settings.gradle.kts",
+        "stack.yaml",
+        "tox.ini",
+        "tsconfig.json",
+        "uv.lock",
+        "workspace",
+        "workspace.bazel",
+        "yarn.lock",
+    ];
+
+    let normalized = normalize_workspace_path(path).to_ascii_lowercase();
+    let filename = normalized.rsplit('/').next().unwrap_or(&normalized);
+    if MANIFEST_NAMES.contains(&filename)
+        || filename.starts_with("requirements-") && filename.ends_with(".txt")
+        || filename.starts_with("tsconfig.") && filename.ends_with(".json")
+        || filename.ends_with(".csproj")
+        || filename.ends_with(".fsproj")
+        || filename.ends_with(".vbproj")
+        || filename.ends_with(".sln")
+    {
+        return true;
+    }
+    filename
+        .rsplit_once('.')
+        .is_some_and(|(_, extension)| SOURCE_EXTENSIONS.contains(&extension))
+}
+
+/// Runtime and test tools commonly materialize these paths while exercising an
+/// application. New files under them are evidence *from* execution, not inputs
+/// to the authored program, and must not invalidate the receipts the same
+/// command just earned. A path already written by an agent tool or explicitly
+/// requested by the user is handled as authored provenance before this filter.
+fn workspace_path_is_generated_output(path: &str) -> bool {
+    let normalized = normalize_workspace_path(path).to_ascii_lowercase();
+    let components = normalized.split('/').collect::<Vec<_>>();
+    if components.iter().any(|component| {
+        matches!(
+            *component,
+            ".coverage"
+                | ".nyc_output"
+                | ".pytest_cache"
+                | "coverage"
+                | "coverage-reports"
+                | "htmlcov"
+                | "junit"
+                | "logs"
+                | "test-reports"
+                | "test-results"
+        )
+    }) {
+        return true;
+    }
+    let filename = components.last().copied().unwrap_or_default();
+    matches!(
+        filename,
+        ".coverage"
+            | "coverage.json"
+            | "coverage.xml"
+            | "junit.xml"
+            | "lcov.info"
+            | "test-results.xml"
+    ) || filename.ends_with(".log")
+        || filename.starts_with("coverage.")
+        || filename.starts_with("junit.")
+        || filename.starts_with("report.")
+        || filename.starts_with("test-results.")
+}
+
+fn workspace_path_is_runtime_data(path: &str) -> bool {
+    let normalized = normalize_workspace_path(path).to_ascii_lowercase();
+    let filename = normalized.rsplit('/').next().unwrap_or(&normalized);
+    let data_extension = [".db", ".json", ".sqlite", ".sqlite3"]
+        .iter()
+        .any(|extension| filename.ends_with(extension));
+    if ["config", "configuration", "schema", "settings"]
+        .iter()
+        .any(|marker| filename.contains(marker))
+    {
+        return false;
+    }
+    data_extension
+        && normalized.split('/').any(|component| {
+            matches!(
+                component,
+                "data" | "runtime-data" | "runtime_state" | "state"
+            )
+        })
+}
+
+fn completed_work_entry_has_authored_provenance(entry: &str) -> bool {
+    matches!(
+        entry.split_once(" changed ").map(|(tool, _)| tool),
+        Some("write_file" | "edit_file" | "run_shell authored")
+    )
+}
+
+fn completed_source_paths(completed_work: &[String]) -> BTreeSet<String> {
     completed_work
         .iter()
-        .filter_map(|entry| entry.split_once(" changed ").map(|(_, path)| path))
-        .map(normalize_workspace_path)
-        .filter(|path| {
-            path.rsplit_once('.').is_some_and(|(_, extension)| {
-                SOURCE_EXTENSIONS
-                    .iter()
-                    .any(|known| extension.eq_ignore_ascii_case(known))
-            })
+        .filter_map(|entry| {
+            let (_, path) = entry.split_once(" changed ")?;
+            let path = normalize_workspace_path(path);
+            (completed_work_entry_has_authored_provenance(entry)
+                || workspace_path_is_authored_input(&path)
+                    && !workspace_path_is_generated_output(&path))
+            .then_some(path)
         })
         .collect()
 }
@@ -780,17 +1158,20 @@ fn current_source_fingerprint(runtime: &ContextPagingRuntime) -> Option<String> 
     if paths.is_empty() {
         return None;
     }
+    let indexed_hashes = runtime
+        .project
+        .project_map
+        .files
+        .iter()
+        .filter(|entry| !entry.stale)
+        .map(|entry| (entry.file.as_str(), entry.source_hash.as_str()))
+        .collect::<BTreeMap<_, _>>();
     let mut material = String::new();
     for path in paths {
-        let entry = runtime
-            .project
-            .project_map
-            .files
-            .iter()
-            .find(|entry| entry.file == path && !entry.stale)?;
+        let source_hash = indexed_hashes.get(path.as_str())?;
         material.push_str(&path);
         material.push('\0');
-        material.push_str(&entry.source_hash);
+        material.push_str(source_hash);
         material.push('\n');
     }
     Some(format!(
@@ -881,26 +1262,24 @@ fn python_runtime_entrypoint(
         .iter()
         .filter_map(|entry| entry.split_once(" changed ").map(|(_, path)| path))
         .map(normalize_workspace_path)
-        .map(|path| (path, true))
         .chain(
             required_artifacts
                 .iter()
-                .map(|path| (normalize_workspace_path(path), false)),
+                .map(|path| normalize_workspace_path(path)),
         )
-        .filter(|(path, _)| !workspace_path_looks_like_test(path))
-        .filter(|(path, _)| path.to_ascii_lowercase().ends_with(".py"))
-        .collect::<BTreeSet<_>>();
-    candidates
-        .into_iter()
-        .max_by_key(|(path, changed)| {
+        .filter(|path| !workspace_path_looks_like_test(path))
+        .filter(|path| path.to_ascii_lowercase().ends_with(".py"))
+        .filter(|path| {
             let filename = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
-            let entrypoint = matches!(
+            matches!(
                 filename.as_str(),
                 "main.py" | "__main__.py" | "app.py" | "cli.py"
-            );
-            (entrypoint, *changed, path.matches('/').count())
+            )
         })
-        .map(|(path, _)| path)
+        .collect::<BTreeSet<_>>();
+    (candidates.len() == 1)
+        .then(|| candidates.into_iter().next())
+        .flatten()
 }
 
 fn python_module_for_path(path: &str) -> Option<String> {
@@ -916,7 +1295,6 @@ fn python_module_for_path(path: &str) -> Option<String> {
 }
 
 fn host_python_runtime_guidance(
-    objective: &str,
     completed_work: &[String],
     required_artifacts: &BTreeSet<String>,
 ) -> Option<String> {
@@ -926,97 +1304,349 @@ fn host_python_runtime_guidance(
     let launcher = "py";
     #[cfg(not(windows))]
     let launcher = "python3";
-    let subcommand = if objective
-        .to_ascii_lowercase()
-        .contains("python main.py list")
+    Some(format!("{launcher} -m {module}"))
+}
+
+fn strip_manual_validation_prompt(line: &str) -> (&str, bool) {
+    let trimmed = line.trim();
+    for prefix in ["$ ", "> ", "PS> ", "ps> "] {
+        if let Some(command) = trimmed.strip_prefix(prefix) {
+            return (command.trim(), true);
+        }
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("ps ") {
+        if let Some(prompt) = trimmed.find("> ") {
+            return (trimmed[prompt + 2..].trim(), true);
+        }
+    }
+    (trimmed, false)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeclaredValidationKind {
+    Test,
+    Runtime,
+    Manual,
+}
+
+#[derive(Debug, Default)]
+struct DeclaredValidationSection {
+    commands: Vec<String>,
+    overflow: bool,
+    invalid: bool,
+}
+
+#[derive(Debug, Default)]
+struct DeclaredValidationCommands {
+    tests: DeclaredValidationSection,
+    runtime: DeclaredValidationSection,
+    manual: DeclaredValidationSection,
+}
+
+impl DeclaredValidationCommands {
+    fn section_mut(&mut self, kind: DeclaredValidationKind) -> &mut DeclaredValidationSection {
+        match kind {
+            DeclaredValidationKind::Test => &mut self.tests,
+            DeclaredValidationKind::Runtime => &mut self.runtime,
+            DeclaredValidationKind::Manual => &mut self.manual,
+        }
+    }
+}
+
+fn declared_validation_heading(line: &str) -> Option<DeclaredValidationKind> {
+    let heading = line.trim_start_matches('#').trim().to_ascii_lowercase();
+    if [
+        "manual validation",
+        "manual verification",
+        "acceptance commands",
+        "acceptance validation",
+        "smoke commands",
+        "smoke validation",
+    ]
+    .iter()
+    .any(|marker| heading.contains(marker))
     {
-        " list"
+        Some(DeclaredValidationKind::Manual)
+    } else if heading == "tests"
+        || heading == "testing"
+        || heading.contains("test commands")
+        || heading.contains("tests commands")
+        || heading.contains("commands to test")
+        || heading.contains("run the tests")
+    {
+        Some(DeclaredValidationKind::Test)
+    } else if heading.contains("runtime commands")
+        || heading.contains("run commands")
+        || heading.contains("launch commands")
+        || heading.contains("application execution")
+        || heading.contains("cli commands")
+    {
+        Some(DeclaredValidationKind::Runtime)
+    } else if heading.contains("verification commands")
+        || heading.contains("validation commands")
+        || heading.contains("build commands")
+        || heading.contains("check commands")
+    {
+        // User-declared project commands are first-class, exact obligations.
+        // They are deliberately Manual rather than guessed Test evidence: only
+        // a heading that actually says tests may satisfy a test-required goal.
+        Some(DeclaredValidationKind::Manual)
     } else {
-        ""
+        None
+    }
+}
+
+fn command_fence_language_is_shell(language: &str) -> bool {
+    matches!(
+        language,
+        "" | "bash"
+            | "bat"
+            | "batch"
+            | "cmd"
+            | "console"
+            | "powershell"
+            | "ps1"
+            | "pwsh"
+            | "sh"
+            | "shell"
+            | "zsh"
+    )
+}
+
+/// Unprompted prose inside a Markdown section must not turn into an execution
+/// obligation merely because it starts with a tool-shaped English word such as
+/// "Go" or "Make". Retain support for unmistakable command lines in legacy
+/// task specs (for example `python app.py`) while preferring prompts or fences.
+fn unprompted_line_is_explicit_command(command: &str) -> bool {
+    if command.starts_with("./") || command.starts_with(".\\") {
+        return true;
+    }
+    let Some(words) = manual_shell_words(command) else {
+        return false;
     };
-    Some(format!("{launcher} -m {module}{subcommand}"))
+    let Some(raw_executable) = words.first() else {
+        return false;
+    };
+    let executable = shell_executable_name(raw_executable);
+    if executable != executable.to_ascii_lowercase() {
+        return false;
+    }
+    let executable = executable
+        .strip_suffix(".exe")
+        .or_else(|| executable.strip_suffix(".cmd"))
+        .or_else(|| executable.strip_suffix(".bat"))
+        .unwrap_or(executable);
+    let args = &words[1..];
+    let first = args.first().map(String::as_str).unwrap_or_default();
+    let has_command_syntax = args.iter().any(|arg| {
+        arg.starts_with('-')
+            || arg.contains('/')
+            || arg.contains('\\')
+            || arg.contains('.')
+            || arg.contains('=')
+    });
+    (matches!(
+        executable,
+        "python" | "python3" | "py" | "node" | "ruby" | "php" | "lua" | "luajit" | "rscript"
+    ) || executable.starts_with("python3."))
+        && has_command_syntax
+        || matches!(
+            (executable, first),
+            ("cargo", "run" | "test" | "build" | "check")
+                | ("go", "run" | "test" | "build")
+                | ("mix", "run" | "test" | "phx.server")
+                | ("dart", "run" | "test")
+                | ("flutter", "run" | "test")
+                | ("zig", "run" | "test" | "build")
+                | ("cabal", "run" | "test")
+                | ("stack", "run" | "test")
+                | ("sbt", "run" | "test")
+                | ("bazel", "run" | "test")
+                | ("bazelisk", "run" | "test")
+                | ("npm", "run" | "test")
+                | ("pnpm", "run" | "test")
+                | ("yarn", "run" | "test")
+                | ("bun", "run" | "test")
+                | ("dotnet", "run" | "test")
+                | ("swift", "run" | "test")
+                | ("java", "-jar")
+        )
+}
+
+fn command_line_continuation(command: &str) -> Option<&str> {
+    let trimmed = command.trim_end();
+    let marker = trimmed.as_bytes().last().copied()?;
+    matches!(marker, b'\\' | b'`' | b'^').then(|| trimmed[..trimmed.len() - 1].trim_end())
+}
+
+/// Split a requested `a; b` sequence into independently verifiable commands.
+/// Pipelines, OR-fallbacks, and background jobs cannot yield trustworthy
+/// per-command status, so flag the section instead of creating an obligation
+/// that can never be discharged.
+fn split_declared_command_sequence(command: &str) -> Option<Vec<String>> {
+    let bytes = command.as_bytes();
+    let mut commands = Vec::new();
+    let mut start = 0usize;
+    let mut index = 0usize;
+    let mut single = false;
+    let mut double = false;
+    let mut escaped = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if single {
+            if byte == b'\'' {
+                single = false;
+            }
+            index += 1;
+            continue;
+        }
+        if double {
+            match byte {
+                b'"' => double = false,
+                b'\\' | b'`' => escaped = true,
+                _ => {}
+            }
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'\'' => single = true,
+            b'"' => double = true,
+            b'\\' | b'`' => escaped = true,
+            b'|' => return None,
+            b'&' if index + 1 >= bytes.len() || bytes[index + 1] != b'&' => return None,
+            b'&' => index += 1,
+            b';' => {
+                let piece = command[start..index].trim();
+                if !piece.is_empty() {
+                    commands.push(piece.to_string());
+                }
+                start = index + 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    if escaped || single || double {
+        return None;
+    }
+    let piece = command[start..].trim();
+    if !piece.is_empty() {
+        commands.push(piece.to_string());
+    }
+    (!commands.is_empty()).then_some(commands)
+}
+
+fn push_declared_commands(
+    parsed: &mut DeclaredValidationCommands,
+    kind: DeclaredValidationKind,
+    command: &str,
+) {
+    let Some(commands) = split_declared_command_sequence(command) else {
+        parsed.section_mut(kind).invalid = true;
+        return;
+    };
+    for command in commands {
+        let section = parsed.section_mut(kind);
+        if section.commands.len() >= MAX_DECLARED_VALIDATION_COMMANDS {
+            section.overflow = true;
+        } else {
+            section.commands.push(command);
+        }
+    }
+}
+
+fn declared_validation_commands(objective: &str) -> DeclaredValidationCommands {
+    let mut parsed = DeclaredValidationCommands::default();
+    let mut active_kind = None;
+    let mut in_fence = false;
+    let mut command_fence = false;
+    let mut console_fence = false;
+    let mut pending = None::<String>;
+    for line in objective.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            if in_fence {
+                if let (Some(kind), Some(command)) = (active_kind, pending.take()) {
+                    push_declared_commands(&mut parsed, kind, &command);
+                }
+                in_fence = false;
+                command_fence = false;
+                console_fence = false;
+            } else {
+                let language = trimmed[3..].trim().to_ascii_lowercase();
+                in_fence = true;
+                command_fence = command_fence_language_is_shell(&language);
+                console_fence = language == "console";
+            }
+            continue;
+        }
+        if trimmed.starts_with('#') && !in_fence {
+            if let (Some(kind), Some(command)) = (active_kind, pending.take()) {
+                push_declared_commands(&mut parsed, kind, &command);
+            }
+            active_kind = declared_validation_heading(trimmed);
+            continue;
+        }
+        let Some(kind) = active_kind else {
+            continue;
+        };
+        if in_fence && !command_fence {
+            continue;
+        }
+        let (candidate, had_prompt) = strip_manual_validation_prompt(trimmed);
+        let comment = candidate.starts_with('#')
+            || candidate.starts_with("//")
+            || candidate.to_ascii_lowercase().starts_with("rem ");
+        let accepted = !candidate.is_empty()
+            && !comment
+            && (had_prompt
+                || in_fence && !console_fence
+                || !in_fence && unprompted_line_is_explicit_command(candidate));
+        if !accepted {
+            continue;
+        }
+        if let Some(continuation) = command_line_continuation(candidate) {
+            let pending_command = pending.get_or_insert_with(String::new);
+            if !pending_command.is_empty() {
+                pending_command.push(' ');
+            }
+            pending_command.push_str(continuation);
+            continue;
+        }
+        let command = if let Some(mut continued) = pending.take() {
+            if !continued.is_empty() {
+                continued.push(' ');
+            }
+            continued.push_str(candidate);
+            continued
+        } else {
+            candidate.to_string()
+        };
+        push_declared_commands(&mut parsed, kind, &command);
+    }
+    if let (Some(kind), Some(command)) = (active_kind, pending) {
+        push_declared_commands(&mut parsed, kind, &command);
+    }
+    parsed
 }
 
 fn manual_validation_source_commands(objective: &str) -> Vec<String> {
-    let mut in_manual_section = false;
-    let mut commands = Vec::new();
-    for line in objective.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('#') {
-            if in_manual_section {
-                break;
-            }
-            if trimmed.to_ascii_lowercase().contains("manual validation") {
-                in_manual_section = true;
-            }
-            continue;
-        }
-        if !in_manual_section {
-            continue;
-        }
-        let candidate = trimmed.strip_prefix("$ ").unwrap_or(trimmed);
-        let first = candidate
-            .split_whitespace()
-            .next()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if matches!(first.as_str(), "python" | "python3" | "py") {
-            commands.push(candidate.to_string());
-            if commands.len() >= MAX_MANUAL_VALIDATION_COMMANDS {
-                break;
-            }
-        }
-    }
-    commands
-}
-
-fn manual_command_in_module_form(command: &str, module: &str) -> Option<String> {
-    let words = command.split_whitespace().collect::<Vec<_>>();
-    let launcher = words.first()?.to_ascii_lowercase();
-    if !matches!(launcher.as_str(), "python" | "python3" | "py") {
-        return None;
-    }
-    let target_index = usize::from(words.get(1).is_some_and(|word| *word == "-m")) + 1;
-    let target = words.get(target_index)?;
-    if target_index == 1 && !target.to_ascii_lowercase().ends_with(".py") {
-        return None;
-    }
-    let lower = command.to_ascii_lowercase();
-    let target_start = lower.find(&target.to_ascii_lowercase())?;
-    let suffix = command
-        .get(target_start + target.len()..)
-        .unwrap_or_default();
-    #[cfg(windows)]
-    let launcher = "py";
-    #[cfg(not(windows))]
-    let launcher = "python3";
-    Some(format!("{launcher} -m {module}{suffix}"))
+    declared_validation_commands(objective).manual.commands
 }
 
 fn manual_validation_obligations(
     objective: &str,
-    completed_work: &[String],
-    required_artifacts: &BTreeSet<String>,
+    _completed_work: &[String],
+    _required_artifacts: &BTreeSet<String>,
 ) -> Vec<String> {
-    let Some(entrypoint) = python_runtime_entrypoint(completed_work, required_artifacts) else {
-        return Vec::new();
-    };
-    let Some(module) = python_module_for_path(&entrypoint) else {
-        return Vec::new();
-    };
-    let mut obligations = manual_validation_source_commands(objective)
-        .into_iter()
-        .filter_map(|command| manual_command_in_module_form(&command, &module))
-        .take(MAX_MANUAL_VALIDATION_COMMANDS)
-        .collect::<Vec<_>>();
-    if obligations.is_empty() && objective_has_runtime_execution_requirement(objective) {
-        if let Some(command) =
-            host_python_runtime_guidance(objective, completed_work, required_artifacts)
-        {
-            obligations.push(command);
-        }
-    }
-    obligations
+    manual_validation_source_commands(objective)
 }
 
 fn manual_validation_receipt(index: usize, command: &str) -> String {
@@ -1032,6 +1662,64 @@ fn manual_validation_receipt_exists(decisions: &[String], index: usize, command:
         .any(|decision| decision == &manual_validation_receipt(index, command))
 }
 
+fn declared_validation_receipt(prefix: &str, index: usize, command: &str) -> String {
+    format!("{prefix}{} passed: `{command}`", index + 1)
+}
+
+fn declared_validation_receipt_exists(
+    decisions: &[String],
+    prefix: &str,
+    index: usize,
+    command: &str,
+) -> bool {
+    let receipt = declared_validation_receipt(prefix, index, command);
+    decisions.iter().any(|decision| decision == &receipt)
+}
+
+fn next_declared_validation_obligation<'a>(
+    section: &'a DeclaredValidationSection,
+    decisions: &[String],
+    prefix: &str,
+) -> Option<(usize, &'a str)> {
+    section
+        .commands
+        .iter()
+        .enumerate()
+        .find_map(|(index, command)| {
+            (!declared_validation_receipt_exists(decisions, prefix, index, command))
+                .then_some((index, command.as_str()))
+        })
+}
+
+fn declared_validation_section_satisfied(
+    section: &DeclaredValidationSection,
+    decisions: &[String],
+    prefix: &str,
+) -> bool {
+    !section.invalid
+        && !section.overflow
+        && section.commands.iter().enumerate().all(|(index, command)| {
+            declared_validation_receipt_exists(decisions, prefix, index, command)
+        })
+}
+
+fn record_declared_validation_evidence(
+    decisions: &mut Vec<String>,
+    section: &DeclaredValidationSection,
+    prefix: &str,
+    command: &str,
+) -> bool {
+    let Some((index, expected)) = next_declared_validation_obligation(section, decisions, prefix)
+    else {
+        return false;
+    };
+    if !declared_validation_command_matches(command, expected) {
+        return false;
+    }
+    decisions.push(declared_validation_receipt(prefix, index, expected));
+    true
+}
+
 fn next_manual_validation_obligation<'a>(
     obligations: &'a [String],
     decisions: &[String],
@@ -1043,28 +1731,218 @@ fn next_manual_validation_obligation<'a>(
 }
 
 fn normalize_manual_validation_command(command: &str) -> String {
-    command
-        .trim()
-        .to_ascii_lowercase()
-        .replace('\\', "/")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    command.trim().to_string()
 }
 
-fn manual_validation_command_matches(command: &str, expected: &str) -> bool {
-    normalize_manual_validation_command(command) == normalize_manual_validation_command(expected)
+fn declared_validation_command_matches(command: &str, expected: &str) -> bool {
+    !shell_command_segments(command).is_empty()
+        && !shell_projection_has_unquoted_sequence_separator(command)
+        && normalize_manual_validation_command(command)
+            == normalize_manual_validation_command(expected)
+}
+
+fn manual_shell_words(command: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut escaped = false;
+    for character in command.chars() {
+        if escaped {
+            word.push(character);
+            escaped = false;
+            continue;
+        }
+        if single_quoted {
+            if character == '\'' {
+                single_quoted = false;
+            } else {
+                word.push(character);
+            }
+            continue;
+        }
+        if double_quoted {
+            match character {
+                '"' => double_quoted = false,
+                '\\' => escaped = true,
+                _ => word.push(character),
+            }
+            continue;
+        }
+        match character {
+            '\'' => single_quoted = true,
+            '"' => double_quoted = true,
+            '\\' => word.push(character),
+            character if character.is_whitespace() => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            }
+            _ => word.push(character),
+        }
+    }
+    if escaped || single_quoted || double_quoted {
+        return None;
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    Some(words)
+}
+
+fn python_manual_invocation(command: &str) -> Option<(String, String, Vec<String>)> {
+    let segments = shell_command_segments(command);
+    if segments.len() != 1 {
+        return None;
+    }
+    let words = manual_shell_words(segments[0])?;
+    let mut launcher = 0usize;
+    if words
+        .get(launcher)
+        .is_some_and(|word| shell_executable_name(word).eq_ignore_ascii_case("env"))
+    {
+        launcher += 1;
+        while words.get(launcher).is_some_and(|word| {
+            word.starts_with('-') || (!word.starts_with('-') && word.contains('='))
+        }) {
+            launcher += 1;
+        }
+    }
+    let executable = words
+        .get(launcher)
+        .map(|word| shell_executable_name(word))?;
+    let executable = executable.to_ascii_lowercase();
+    let executable = executable.strip_suffix(".exe").unwrap_or(&executable);
+    if !matches!(executable, "python" | "python3" | "py") && !executable.starts_with("python3.") {
+        return None;
+    }
+    let args = &words[launcher + 1..];
+    let (module_form, target_index) = if args.first().is_some_and(|word| word == "-m") {
+        (true, 1usize)
+    } else {
+        (false, 0usize)
+    };
+    let target = args.get(target_index)?.to_string();
+    if !module_form && !target.to_ascii_lowercase().ends_with(".py") {
+        return None;
+    }
+    let basename = if module_form {
+        format!(
+            "{}.py",
+            target
+                .strip_suffix(".__main__")
+                .unwrap_or(&target)
+                .rsplit('.')
+                .next()
+                .unwrap_or(&target)
+        )
+    } else {
+        normalize_workspace_path(&target)
+            .rsplit('/')
+            .next()
+            .unwrap_or(&target)
+            .to_string()
+    };
+    Some((
+        basename.to_ascii_lowercase(),
+        target,
+        args[target_index + 1..].to_vec(),
+    ))
+}
+
+fn python_invocation_workspace_artifact(
+    target: &str,
+    completed_work: &[String],
+    required_artifacts: &BTreeSet<String>,
+) -> Option<String> {
+    let tracked = completed_work
+        .iter()
+        .filter_map(|entry| entry.split_once(" changed ").map(|(_, path)| path))
+        .chain(required_artifacts.iter().map(String::as_str))
+        .map(normalize_workspace_path)
+        .collect::<BTreeSet<_>>();
+    let direct = normalize_workspace_path(target);
+    let candidates = if target.to_ascii_lowercase().ends_with(".py") {
+        if direct.contains('/') {
+            tracked
+                .into_iter()
+                .filter(|path| path == &direct)
+                .collect::<BTreeSet<_>>()
+        } else {
+            let qualified = tracked
+                .iter()
+                .filter(|path| {
+                    path.contains('/') && path.rsplit('/').next() == Some(direct.as_str())
+                })
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if qualified.is_empty() {
+                tracked
+                    .into_iter()
+                    .filter(|path| path == &direct)
+                    .collect::<BTreeSet<_>>()
+            } else {
+                qualified
+            }
+        }
+    } else {
+        let module_path = format!("{}.py", target.replace('.', "/"));
+        let module_main = format!("{}/__main__.py", target.replace('.', "/"));
+        tracked
+            .into_iter()
+            .filter(|path| path == &module_path || path == &module_main)
+            .collect::<BTreeSet<_>>()
+    };
+    (candidates.len() == 1)
+        .then(|| candidates.into_iter().next())
+        .flatten()
+}
+
+fn manual_validation_command_matches(
+    command: &str,
+    expected: &str,
+    completed_work: &[String],
+    required_artifacts: &BTreeSet<String>,
+) -> bool {
+    if shell_command_segments(command).is_empty()
+        || shell_projection_has_unquoted_sequence_separator(command)
+    {
+        return false;
+    }
+    if normalize_manual_validation_command(command) == normalize_manual_validation_command(expected)
+    {
+        return true;
+    }
+    let Some((actual_basename, actual_target, actual_args)) = python_manual_invocation(command)
+    else {
+        return false;
+    };
+    let Some((expected_basename, expected_target, expected_args)) =
+        python_manual_invocation(expected)
+    else {
+        return false;
+    };
+    let actual_artifact =
+        python_invocation_workspace_artifact(&actual_target, completed_work, required_artifacts);
+    let expected_artifact =
+        python_invocation_workspace_artifact(&expected_target, completed_work, required_artifacts);
+    actual_basename == expected_basename
+        && actual_args == expected_args
+        && actual_artifact.is_some()
+        && actual_artifact == expected_artifact
 }
 
 fn record_manual_validation_evidence(
     decisions: &mut Vec<String>,
     obligations: &[String],
     command: &str,
+    completed_work: &[String],
+    required_artifacts: &BTreeSet<String>,
 ) -> bool {
     let Some((index, expected)) = next_manual_validation_obligation(obligations, decisions) else {
         return false;
     };
-    if !manual_validation_command_matches(command, expected) {
+    if !manual_validation_command_matches(command, expected, completed_work, required_artifacts) {
         return false;
     }
     decisions.push(manual_validation_receipt(index, expected));
@@ -1077,11 +1955,48 @@ fn verification_requirements_focus(
     required_artifacts: &BTreeSet<String>,
     decisions: &[String],
 ) -> String {
+    let declared = declared_validation_commands(objective);
+    for (label, section) in [
+        ("test", &declared.tests),
+        ("runtime", &declared.runtime),
+        ("manual", &declared.manual),
+    ] {
+        if section.overflow {
+            return format!(
+                "The requested {label} command list exceeds the bounded limit of {MAX_DECLARED_VALIDATION_COMMANDS}; ask the user to reduce or group the explicit workflow before completing"
+            );
+        }
+        if section.invalid {
+            return format!(
+                "The requested {label} workflow contains a pipeline, fallback, background job, or malformed command whose status cannot be projected safely; ask for separate status-preserving commands before completing"
+            );
+        }
+    }
     let tests_required =
         objective_requests_test_execution(objective, completed_work, required_artifacts);
+    let test_evidence_satisfied = if declared.tests.commands.is_empty() {
+        has_verification_evidence(decisions, TEST_EXECUTION_EVIDENCE_PREFIX)
+    } else {
+        declared_validation_section_satisfied(
+            &declared.tests,
+            decisions,
+            DECLARED_TEST_EVIDENCE_PREFIX,
+        )
+    };
     let manual_obligations =
         manual_validation_obligations(objective, completed_work, required_artifacts);
-    if tests_required && !has_verification_evidence(decisions, TEST_EXECUTION_EVIDENCE_PREFIX) {
+    if tests_required && !test_evidence_satisfied {
+        if let Some((index, command)) = next_declared_validation_obligation(
+            &declared.tests,
+            decisions,
+            DECLARED_TEST_EVIDENCE_PREFIX,
+        ) {
+            return format!(
+                "Run requested test command {}/{} now with run_shell exactly as declared: `{command}`.",
+                index + 1,
+                declared.tests.commands.len()
+            );
+        }
         if let Some(command) =
             host_python_unittest_command(objective, completed_work, required_artifacts)
         {
@@ -1095,10 +2010,41 @@ fn verification_requirements_focus(
         next_manual_validation_obligation(&manual_obligations, decisions)
     {
         return format!(
-            "Run manual validation command {}/{} now with run_shell using exactly `{command}`. Tests and syntax checks do not satisfy the explicit manual workflow.",
+            "Run manual validation command {}/{} now with run_shell: `{command}`. Use an equivalent platform/project entry point only when necessary; preserve the requested arguments and behavior. Tests and syntax checks do not satisfy the explicit manual workflow.",
             index + 1,
             manual_obligations.len()
         );
+    }
+    let runtime_evidence_satisfied = if declared.runtime.commands.is_empty() {
+        has_verification_evidence(decisions, RUNTIME_EXECUTION_EVIDENCE_PREFIX)
+    } else {
+        declared_validation_section_satisfied(
+            &declared.runtime,
+            decisions,
+            DECLARED_RUNTIME_EVIDENCE_PREFIX,
+        )
+    };
+    if objective_has_runtime_execution_requirement(objective)
+        && manual_obligations.is_empty()
+        && !runtime_evidence_satisfied
+    {
+        if let Some((index, command)) = next_declared_validation_obligation(
+            &declared.runtime,
+            decisions,
+            DECLARED_RUNTIME_EVIDENCE_PREFIX,
+        ) {
+            return format!(
+                "Run requested application command {}/{} now with run_shell exactly as declared: `{command}`. Tests and syntax checks do not satisfy application execution.",
+                index + 1,
+                declared.runtime.commands.len()
+            );
+        }
+        if let Some(command) = host_python_runtime_guidance(completed_work, required_artifacts) {
+            return format!(
+                "Run the application itself now with run_shell (for example `{command}`). A test, build, syntax check, or environment probe does not satisfy the explicit execution requirement."
+            );
+        }
+        return "Run the application itself now with run_shell using its real project entry point. A test, build, syntax check, or environment probe does not satisfy the explicit execution requirement.".into();
     }
     "Run the narrowest relevant verification before completing".into()
 }
@@ -1109,12 +2055,39 @@ fn execution_verification_requirements_satisfied(
     required_artifacts: &BTreeSet<String>,
     decisions: &[String],
 ) -> bool {
-    (!objective_requests_test_execution(objective, completed_work, required_artifacts)
-        || has_verification_evidence(decisions, TEST_EXECUTION_EVIDENCE_PREFIX))
-        && manual_validation_obligations(objective, completed_work, required_artifacts)
+    let declared = declared_validation_commands(objective);
+    let manual_obligations =
+        manual_validation_obligations(objective, completed_work, required_artifacts);
+    let manual_satisfied = !declared.manual.invalid
+        && !declared.manual.overflow
+        && manual_obligations
             .iter()
             .enumerate()
-            .all(|(index, command)| manual_validation_receipt_exists(decisions, index, command))
+            .all(|(index, command)| manual_validation_receipt_exists(decisions, index, command));
+    let declared_tests_satisfied = declared_validation_section_satisfied(
+        &declared.tests,
+        decisions,
+        DECLARED_TEST_EVIDENCE_PREFIX,
+    );
+    let tests_satisfied = if declared.tests.commands.is_empty() {
+        !objective_requests_test_execution(objective, completed_work, required_artifacts)
+            || has_verification_evidence(decisions, TEST_EXECUTION_EVIDENCE_PREFIX)
+    } else {
+        declared_tests_satisfied
+    };
+    let declared_runtime_satisfied = declared_validation_section_satisfied(
+        &declared.runtime,
+        decisions,
+        DECLARED_RUNTIME_EVIDENCE_PREFIX,
+    );
+    let runtime_satisfied = !objective_has_runtime_execution_requirement(objective)
+        || (!manual_obligations.is_empty() && manual_satisfied)
+        || if declared.runtime.commands.is_empty() {
+            has_verification_evidence(decisions, RUNTIME_EXECUTION_EVIDENCE_PREFIX)
+        } else {
+            declared_runtime_satisfied
+        };
+    tests_satisfied && manual_satisfied && runtime_satisfied
 }
 
 /// Build the narrowest host-owned Python suite guidance that can be derived
@@ -1162,125 +2135,6 @@ fn host_python_unittest_command(
             .collect::<Vec<_>>()
             .join(" && "),
     )
-}
-
-/// Deterministic acceptance checks for explicit behavioral contracts that are
-/// cheap to prove from source. These are deliberately narrow and only activate
-/// when the user named the exact domain; they complement model review instead
-/// of pretending a syntax check proves behavior.
-fn source_contract_findings(history: &[AgentMsg], sources: &[(String, String)]) -> Vec<String> {
-    let goal = history
-        .iter()
-        .rev()
-        .find_map(|message| match message {
-            AgentMsg::User(text) if !is_harness_reminder(text) => Some(text.to_ascii_lowercase()),
-            _ => None,
-        })
-        .unwrap_or_default();
-    let requests_computer_opponent = goal.contains("computer")
-        || goal.contains("one-player")
-        || goal.contains("one player")
-        || goal.contains("single-player")
-        || goal.contains("single player");
-    if !(goal.contains("tic tac toe") || goal.contains("tic-tac-toe"))
-        || !requests_computer_opponent
-    {
-        return Vec::new();
-    }
-    let source = sources
-        .iter()
-        .filter(|(path, _)| path.to_ascii_lowercase().ends_with(".py"))
-        .map(|(_, content)| content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    if source.is_empty() {
-        return vec!["no Python source was captured for the requested game".into()];
-    }
-    let lower = source.to_ascii_lowercase();
-    let mut findings = Vec::new();
-    let computer_method = [
-        "computer_move",
-        "auto_move",
-        "ai_move",
-        "make_computer_move",
-    ]
-    .into_iter()
-    .find(|method| lower.contains(&format!("def {method}")));
-    let computer_moves_automatically = computer_method.is_some_and(|method| {
-        lower.contains(&format!("self.{method}("))
-            && (source.contains("= \"O\"") || source.contains("= 'O'"))
-    });
-    if !computer_moves_automatically {
-        findings.push(
-            "the captured source does not prove an automatic legal O move by the computer".into(),
-        );
-    }
-    let computer_block = computer_method
-        .and_then(|method| source.split(&format!("def {method}")).nth(1))
-        .and_then(|tail| tail.split("\n    def ").next())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if lower.contains("current_player")
-        && !(computer_block.contains("current_player = \"x\"")
-            || computer_block.contains("current_player = 'x'"))
-    {
-        findings.push(
-            "the computer_move function itself never explicitly returns current_player to X, so a later human click can place O"
-                .into(),
-        );
-    }
-    if lower.contains("command=lambda:") {
-        findings.push(
-            "a Tkinter button callback uses a bare loop-variable lambda; bind row/column as lambda defaults (for example row=i, col=j) so every button does not target the final cell"
-                .into(),
-        );
-    }
-    let settles_computer_terminal = (computer_block.contains("check_win")
-        || computer_block.contains("check_winner")
-        || computer_block.contains("game_over"))
-        && (computer_block.contains("draw") || lower.contains("check_draw"));
-    if !settles_computer_terminal {
-        findings.push(
-            "after the automatic O move the source does not settle the computer win/draw state before returning control"
-                .into(),
-        );
-    }
-    let has_gui_result = lower.contains("messagebox")
-        || lower.contains("status_label")
-        || lower.contains("result_label")
-        || lower.contains("winner_label");
-    if goal.contains("status") && !has_gui_result {
-        findings.push(
-            "the requested clear win/draw status is missing; add a visible status/result label or messagebox and update it for human win, computer win, draw, and reset"
-                .into(),
-        );
-    }
-    let compact = lower
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect::<String>();
-    let enumerates_diagonals = (compact.contains("(0,4,8)") || compact.contains("[0,4,8]"))
-        && (compact.contains("(2,4,6)") || compact.contains("[2,4,6]"));
-    let checks_diagonals_directly = compact.contains("buttons[0]")
-        && compact.contains("buttons[8]")
-        && compact.contains("buttons[2]")
-        && compact.contains("buttons[6]");
-    if !(enumerates_diagonals || checks_diagonals_directly) {
-        findings.push(
-            "winner detection does not prove both diagonal lines (0-4-8 and 2-4-6); cover all eight tic-tac-toe winning lines"
-                .into(),
-        );
-    }
-    if (goal.contains("graphics") || goal.contains("graphical") || goal.contains("gui"))
-        && lower.contains("root.destroy()")
-        && !has_gui_result
-    {
-        findings.push(
-            "the graphical window is destroyed without showing the win/draw result through a messagebox or status/result label in the GUI"
-                .into(),
-        );
-    }
-    findings
 }
 
 fn paging_failed_attempts_require_full_rewrite(failed_attempts: &[String]) -> bool {
@@ -2545,8 +3399,7 @@ pub fn run_loop(
                             }
                         }
                         if pending_verification_paths.is_empty() && !captured_sources.is_empty() {
-                            semantic_contract_findings =
-                                source_contract_findings(history, &captured_sources);
+                            semantic_contract_findings.clear();
                             for (relative, _) in &captured_sources {
                                 let Some(command) = host_python_compile_command(relative) else {
                                     continue;
@@ -3336,42 +4189,74 @@ pub fn run_loop(
                             ToolOutcome::Err(msg)
                         }
                         Decision::AlwaysTool => {
-                            policy.grant(action.tool_name());
-                            execute_audited(
-                                &action,
-                                sandbox,
-                                tier,
-                                &call.args,
-                                cfg.audit.as_ref(),
-                                cancel,
-                            )
+                            if let Some(error) = context_paging.as_ref().and_then(|runtime| {
+                                runtime.revalidate_approved_modification(&action).err()
+                            }) {
+                                ToolOutcome::Err(error.to_string())
+                            } else {
+                                // Install the persistent grant only after the
+                                // action that earned it still matches the exact
+                                // source/path the user approved.
+                                policy.grant(action.tool_name());
+                                execute_audited(
+                                    &action,
+                                    sandbox,
+                                    tier,
+                                    &call.args,
+                                    cfg.audit.as_ref(),
+                                    cancel,
+                                )
+                            }
                         }
-                        Decision::Once => execute_audited(
-                            &action,
-                            sandbox,
-                            tier,
-                            &call.args,
-                            cfg.audit.as_ref(),
-                            cancel,
-                        ),
+                        Decision::Once => {
+                            if let Some(error) = context_paging.as_ref().and_then(|runtime| {
+                                runtime.revalidate_approved_modification(&action).err()
+                            }) {
+                                ToolOutcome::Err(error.to_string())
+                            } else {
+                                execute_audited(
+                                    &action,
+                                    sandbox,
+                                    tier,
+                                    &call.args,
+                                    cfg.audit.as_ref(),
+                                    cancel,
+                                )
+                            }
+                        }
                     };
                     let shell_workspace_changes =
                         shell_workspace_before.as_ref().and_then(|before| {
                             workspace_changes_since(sandbox.root(), action_started_at, before)
                         });
-                    let shell_changed_source = shell_workspace_changes
+                    let tracked_work = context_paging
                         .as_ref()
-                        .is_some_and(workspace_changes_touch_source);
+                        .map(|runtime| runtime.ledger.completed_work.as_slice())
+                        .unwrap_or(&[]);
                     let shell_changed_source_paths = shell_workspace_changes
                         .as_ref()
                         .into_iter()
                         .flat_map(|changes| changes.sample_paths.iter())
                         .map(|path| normalize_workspace_path(path))
-                        .filter(|path| path_is_source_code(path))
+                        .filter(|path| {
+                            shell_workspace_before.as_ref().is_some_and(|before| {
+                                shell_changed_path_is_authored_input(
+                                    path,
+                                    before,
+                                    tracked_work,
+                                    &required_workspace_artifacts,
+                                )
+                            })
+                        })
                         .collect::<Vec<_>>();
-                    let shell_source_scan_truncated = shell_workspace_changes
-                        .as_ref()
-                        .is_some_and(|changes| changes.scan_truncated);
+                    let shell_source_scan_truncated =
+                        shell_workspace_changes.as_ref().is_some_and(|changes| {
+                            changes.scan_truncated
+                                || changes.changed_file_count + changes.deleted_file_count
+                                    > changes.sample_paths.len()
+                        });
+                    let shell_changed_source =
+                        shell_source_scan_truncated || !shell_changed_source_paths.is_empty();
                     if shell_changed_source {
                         call_counts.clear();
                         recovered_call_signatures.clear();
@@ -3433,7 +4318,7 @@ pub fn run_loop(
                         workspace_changed = true;
                         for relative in changes.sample_paths {
                             let relative = normalize_workspace_path(&relative);
-                            if path_is_source_code(&relative) {
+                            if shell_changed_source_paths.contains(&relative) {
                                 pending_verification_paths.insert(relative);
                             }
                         }
@@ -3687,14 +4572,25 @@ pub fn run_loop(
                         {
                             paging_diagnostic = Some(compact.clone());
                         }
-                        if let Action::ReadFile { path, .. } = &action {
+                        if let Action::ReadFile {
+                            path,
+                            start_line,
+                            max_lines,
+                        } = &action
+                        {
                             if !raw_outcome.is_err() {
                                 let relative = normalize_workspace_path(&sandbox.rel(path));
                                 // Native read_file is also the page-fault API. This keeps one
                                 // familiar tool protocol for small models while preserving the
                                 // host-owned exact-source/hash boundary for later edits.
-                                if runtime.project.resolve_symbol(&relative).is_some() {
-                                    match runtime.need_context(&relative) {
+                                if runtime.project.resolve_symbol(&relative).is_some()
+                                    || runtime.has_authority_path(&relative)
+                                {
+                                    match runtime.need_context_for_read(
+                                        &relative,
+                                        *start_line,
+                                        *max_lines,
+                                    ) {
                                         Ok(page) => {
                                             // A bounded full-file page is the canonical,
                                             // hash-backed version of this read. Do not also
@@ -3775,7 +4671,7 @@ pub fn run_loop(
                                             runtime
                                                 .ledger
                                                 .completed_work
-                                                .push(format!("run_shell changed {path}"));
+                                                .push(format!("run_shell authored changed {path}"));
                                         }
                                     }
                                     if shell_source_scan_truncated
@@ -3816,6 +4712,28 @@ pub fn run_loop(
                                     &runtime.ledger.completed_work,
                                     &required_workspace_artifacts,
                                 );
+                                let declared_commands =
+                                    declared_validation_commands(&task_objective);
+                                let next_declared_test = next_declared_validation_obligation(
+                                    &declared_commands.tests,
+                                    &runtime.ledger.decisions,
+                                    DECLARED_TEST_EVIDENCE_PREFIX,
+                                )
+                                .map(|(_, command)| command.to_string());
+                                let next_declared_runtime = next_declared_validation_obligation(
+                                    &declared_commands.runtime,
+                                    &runtime.ledger.decisions,
+                                    DECLARED_RUNTIME_EVIDENCE_PREFIX,
+                                )
+                                .map(|(_, command)| command.to_string());
+                                let matches_declared_test =
+                                    next_declared_test.as_deref().is_some_and(|expected| {
+                                        declared_validation_command_matches(command, expected)
+                                    });
+                                let matches_declared_runtime =
+                                    next_declared_runtime.as_deref().is_some_and(|expected| {
+                                        declared_validation_command_matches(command, expected)
+                                    });
                                 let manual_obligations = manual_validation_obligations(
                                     &task_objective,
                                     &runtime.ledger.completed_work,
@@ -3833,11 +4751,14 @@ pub fn run_loop(
                                         &required_workspace_artifacts,
                                         &task_objective,
                                     )
+                                    && (declared_commands.tests.commands.is_empty()
+                                        || matches_declared_test)
                                     && !shell_changed_source;
                                 let relevant_test_execution = tests_required
                                     && relevant_verification
-                                    && verification_command_kind(command)
-                                        == Some(VerificationCommandKind::TestExecution);
+                                    && (matches_declared_test
+                                        || verification_command_kind(command)
+                                            == Some(VerificationCommandKind::TestExecution));
                                 let python_tests_confirmed = !relevant_test_execution
                                     || !verification_command_runs_python_tests(command)
                                     || paging_python_verification_reports_executed_tests(
@@ -3846,8 +4767,26 @@ pub fn run_loop(
                                     );
                                 let relevant_manual_execution = !raw_outcome.is_err()
                                     && next_manual_obligation.as_deref().is_some_and(|expected| {
-                                        manual_validation_command_matches(command, expected)
+                                        manual_validation_command_matches(
+                                            command,
+                                            expected,
+                                            &runtime.ledger.completed_work,
+                                            &required_workspace_artifacts,
+                                        )
                                     })
+                                    && !shell_changed_source;
+                                let relevant_runtime_execution = !raw_outcome.is_err()
+                                    && objective_has_runtime_execution_requirement(&task_objective)
+                                    && manual_obligations.is_empty()
+                                    && if declared_commands.runtime.commands.is_empty() {
+                                        paging_runtime_command_is_relevant(
+                                            command,
+                                            &runtime.ledger.completed_work,
+                                            &required_workspace_artifacts,
+                                        )
+                                    } else {
+                                        matches_declared_runtime
+                                    }
                                     && !shell_changed_source;
                                 if missing_python_alias {
                                     paging_shell_verification_required = workspace_changed
@@ -3887,9 +4826,7 @@ pub fn run_loop(
                                     );
                                     runtime.metrics.verification_retries =
                                         runtime.metrics.verification_retries.saturating_add(1);
-                                } else if zero_tests
-                                    && verification_command_runs_python_tests(command)
-                                {
+                                } else if zero_tests {
                                     paging_shell_verification_required = workspace_changed
                                         && tools.iter().any(|tool| tool.name == "run_shell");
                                     runtime.ledger.verification_state.status = "pending".into();
@@ -3915,14 +4852,27 @@ pub fn run_loop(
                                         "Run the requested suite without redirecting or hiding its output."
                                     )
                                     .into();
-                                } else if relevant_verification || relevant_manual_execution {
+                                } else if relevant_verification
+                                    || relevant_manual_execution
+                                    || relevant_runtime_execution
+                                {
                                     let mut recorded_execution_evidence = false;
                                     if relevant_test_execution {
-                                        recorded_execution_evidence |= record_verification_evidence(
-                                            &mut runtime.ledger.decisions,
-                                            TEST_EXECUTION_EVIDENCE_PREFIX,
-                                            command,
-                                        );
+                                        recorded_execution_evidence |=
+                                            if declared_commands.tests.commands.is_empty() {
+                                                record_verification_evidence(
+                                                    &mut runtime.ledger.decisions,
+                                                    TEST_EXECUTION_EVIDENCE_PREFIX,
+                                                    command,
+                                                )
+                                            } else {
+                                                record_declared_validation_evidence(
+                                                    &mut runtime.ledger.decisions,
+                                                    &declared_commands.tests,
+                                                    DECLARED_TEST_EVIDENCE_PREFIX,
+                                                    command,
+                                                )
+                                            };
                                     }
                                     if relevant_manual_execution {
                                         recorded_execution_evidence |=
@@ -3930,7 +4880,26 @@ pub fn run_loop(
                                                 &mut runtime.ledger.decisions,
                                                 &manual_obligations,
                                                 command,
+                                                &runtime.ledger.completed_work,
+                                                &required_workspace_artifacts,
                                             );
+                                    }
+                                    if relevant_runtime_execution {
+                                        recorded_execution_evidence |=
+                                            if declared_commands.runtime.commands.is_empty() {
+                                                record_verification_evidence(
+                                                    &mut runtime.ledger.decisions,
+                                                    RUNTIME_EXECUTION_EVIDENCE_PREFIX,
+                                                    command,
+                                                )
+                                            } else {
+                                                record_declared_validation_evidence(
+                                                    &mut runtime.ledger.decisions,
+                                                    &declared_commands.runtime,
+                                                    DECLARED_RUNTIME_EVIDENCE_PREFIX,
+                                                    command,
+                                                )
+                                            };
                                     }
                                     let execution_requirements_satisfied =
                                         execution_verification_requirements_satisfied(
@@ -4012,16 +4981,11 @@ pub fn run_loop(
                                     }
                                 }
                             }
-                            Action::ReadFile { path, .. }
+                            Action::ReadFile { .. }
                                 if !raw_outcome.is_err()
                                     && workspace_changed
                                     && pending_verification_paths.is_empty() =>
                             {
-                                let relative = normalize_workspace_path(&sandbox.rel(path));
-                                semantic_contract_findings.extend(source_contract_findings(
-                                    history,
-                                    &[(relative.clone(), raw_outcome.text().to_string())],
-                                ));
                                 semantic_contract_findings.sort();
                                 semantic_contract_findings.dedup();
                                 if let Some((command, _)) = host_python_verification.as_ref() {
@@ -4496,7 +5460,7 @@ struct WorkspaceSnapshot {
 }
 
 const MAX_CHANGE_SCAN_ENTRIES: usize = 50_000;
-const MAX_CHANGED_PATH_SAMPLES: usize = 16;
+const MAX_CHANGED_PATH_SAMPLES: usize = 256;
 
 /// Capture a deterministic, bounded tree baseline without following symlinked
 /// directories. Comparing two snapshots makes new and deleted paths independent
@@ -4620,7 +5584,11 @@ fn workspace_changes_since(
             }
             match state.kind {
                 WorkspaceEntryKind::File => {
-                    deleted_file_count = deleted_file_count.saturating_add(1)
+                    deleted_file_count = deleted_file_count.saturating_add(1);
+                    sample_paths.insert(relative.clone());
+                    if sample_paths.len() > MAX_CHANGED_PATH_SAMPLES {
+                        sample_paths.pop_last();
+                    }
                 }
                 WorkspaceEntryKind::Directory => {
                     deleted_directory_count = deleted_directory_count.saturating_add(1)
@@ -4779,18 +5747,35 @@ fn shell_command_is_mutation_shaped(command: &str) -> bool {
 }
 
 fn path_is_source_code(path: &str) -> bool {
-    completed_source_paths(&[format!("shell changed {}", normalize_workspace_path(path))])
-        .iter()
-        .next()
-        .is_some()
+    workspace_path_is_authored_input(path) && !workspace_path_is_generated_output(path)
 }
 
-fn workspace_changes_touch_source(changes: &WorkspaceChanges) -> bool {
-    changes.scan_truncated
-        || changes
-            .sample_paths
-            .iter()
-            .any(|path| path_is_source_code(path))
+fn shell_changed_path_is_authored_input(
+    path: &str,
+    before: &WorkspaceSnapshot,
+    completed_work: &[String],
+    required_artifacts: &BTreeSet<String>,
+) -> bool {
+    let path = normalize_workspace_path(path);
+    let explicitly_required = required_artifacts
+        .iter()
+        .any(|required| normalize_workspace_path(required) == path);
+    let previously_authored = completed_source_paths(completed_work).contains(&path);
+    if previously_authored {
+        return true;
+    }
+    if workspace_path_is_runtime_data(&path) {
+        return false;
+    }
+    if explicitly_required {
+        return true;
+    }
+    // New source/build/test files created by generators are authored inputs;
+    // existing untracked JSON and databases remain runtime state. The baseline
+    // lookup is intentionally retained here to make that provenance boundary
+    // explicit even though extension classification is the same on both sides.
+    let _existed_before = before.entries.contains_key(&path);
+    path_is_source_code(&path)
 }
 
 fn shell_no_workspace_change_error(action: &Action, shell_output: &str) -> String {
@@ -5090,10 +6075,100 @@ fn normalize_workspace_path(path: &str) -> String {
 /// `unittest.mock`). The list covers source, test, configuration, data, and
 /// documentation files that a coding task can reasonably require.
 const REQUIRED_ARTIFACT_EXTENSIONS: &[&str] = &[
-    "bash", "c", "cc", "cfg", "cjs", "conf", "cpp", "cs", "css", "csv", "env", "fish", "fs", "fsx",
-    "go", "h", "hpp", "html", "ini", "java", "js", "json", "jsx", "kt", "kts", "lock", "md", "mjs",
-    "php", "ps1", "py", "pyw", "rb", "rs", "scss", "sh", "sql", "svelte", "swift", "toml", "ts",
-    "tsx", "txt", "vue", "xml", "yaml", "yml", "zsh",
+    "bash",
+    "c",
+    "cc",
+    "cfg",
+    "cjs",
+    "clj",
+    "cljs",
+    "conf",
+    "cpp",
+    "cs",
+    "css",
+    "csv",
+    "cts",
+    "dart",
+    "dockerfile",
+    "env",
+    "erl",
+    "ex",
+    "exs",
+    "fish",
+    "fs",
+    "fsx",
+    "gql",
+    "go",
+    "gradle",
+    "graphql",
+    "groovy",
+    "h",
+    "hcl",
+    "hpp",
+    "hrl",
+    "hs",
+    "htm",
+    "html",
+    "ini",
+    "java",
+    "js",
+    "json",
+    "jsonc",
+    "jsx",
+    "kt",
+    "kts",
+    "less",
+    "lock",
+    "lua",
+    "m",
+    "md",
+    "mjs",
+    "mm",
+    "mts",
+    "php",
+    "pl",
+    "pm",
+    "proto",
+    "ps1",
+    "py",
+    "pyi",
+    "pyw",
+    "r",
+    "rb",
+    "rs",
+    "scala",
+    "scss",
+    "sh",
+    "sol",
+    "sql",
+    "svelte",
+    "swift",
+    "tf",
+    "toml",
+    "ts",
+    "tsx",
+    "txt",
+    "vb",
+    "vue",
+    "xml",
+    "yaml",
+    "yml",
+    "zsh",
+];
+const REQUIRED_ARTIFACT_NAMES: &[&str] = &[
+    "build",
+    "build.bazel",
+    "cmakelists.txt",
+    "dockerfile",
+    "gemfile",
+    "gradlew",
+    "gradlew.bat",
+    "justfile",
+    "makefile",
+    "procfile",
+    "rakefile",
+    "workspace",
+    "workspace.bazel",
 ];
 
 /// Extract an explicit host-owned artifact manifest from the immutable user
@@ -5112,6 +6187,9 @@ fn workspace_requested_artifacts(objective: &str) -> BTreeSet<String> {
                         && !matches!(character, '.' | '/' | '\\' | '_' | '-')
                 })
                 .replace('\\', "/");
+            while token.ends_with('.') && token[..token.len() - 1].contains('.') {
+                token.pop();
+            }
             while let Some(stripped) = token.strip_prefix("./") {
                 token = stripped.to_string();
             }
@@ -5145,14 +6223,16 @@ fn workspace_requested_artifacts(objective: &str) -> BTreeSet<String> {
             let Some(filename) = token.rsplit('/').next() else {
                 continue;
             };
-            let Some((stem, extension)) = filename.rsplit_once('.') else {
-                continue;
-            };
-            if stem.is_empty()
-                || !REQUIRED_ARTIFACT_EXTENSIONS
-                    .iter()
-                    .any(|known| extension.eq_ignore_ascii_case(known))
-            {
+            let known_name = REQUIRED_ARTIFACT_NAMES
+                .iter()
+                .any(|known| filename.eq_ignore_ascii_case(known));
+            let known_extension = filename.rsplit_once('.').is_some_and(|(stem, extension)| {
+                !stem.is_empty()
+                    && REQUIRED_ARTIFACT_EXTENSIONS
+                        .iter()
+                        .any(|known| extension.eq_ignore_ascii_case(known))
+            });
+            if !known_name && !known_extension {
                 continue;
             }
             artifacts.insert(token);
@@ -5164,7 +6244,7 @@ fn workspace_requested_artifacts(objective: &str) -> BTreeSet<String> {
     artifacts
 }
 
-const MAX_LEDGER_MANIFEST_ITEMS: usize = 32;
+const MAX_LEDGER_MANIFEST_ITEMS: usize = 128;
 const MAX_ARTIFACT_SCAN_ENTRIES: usize = 4_096;
 
 fn skip_artifact_scan_directory(name: &str) -> bool {
@@ -5426,7 +6506,11 @@ fn verifier_segment_kind(segment: &str) -> Option<VerificationCommandKind> {
         }
     }
     let executable = words.get(index).map(|word| shell_executable_name(word))?;
-    let executable = executable.strip_suffix(".exe").unwrap_or(executable);
+    let executable = executable
+        .strip_suffix(".exe")
+        .or_else(|| executable.strip_suffix(".cmd"))
+        .or_else(|| executable.strip_suffix(".bat"))
+        .unwrap_or(executable);
     let args = &words[index + 1..];
     if args.iter().any(|word| {
         matches!(
@@ -5454,7 +6538,16 @@ fn verifier_segment_kind(segment: &str) -> Option<VerificationCommandKind> {
     let first = positionals.first().copied().unwrap_or_default();
     let second = positionals.get(1).copied().unwrap_or_default();
     let script_is_test = |script: &str| script == "test" || script.starts_with("test:");
-    let script_is_check = |script: &str| script == "check" || script.starts_with("check:");
+    let script_is_static = |script: &str| {
+        ["build", "check", "compile", "format", "lint", "typecheck"]
+            .iter()
+            .any(|kind| {
+                script == *kind
+                    || script
+                        .strip_prefix(kind)
+                        .is_some_and(|suffix| suffix.starts_with(':'))
+            })
+    };
     let python_module = args
         .windows(2)
         .find(|pair| pair[0] == "-m")
@@ -5470,7 +6563,9 @@ fn verifier_segment_kind(segment: &str) -> Option<VerificationCommandKind> {
         "ctest" if !args.iter().any(|word| word == "-n") => {
             Some(VerificationCommandKind::TestExecution)
         }
-        "ruff" | "mypy" | "eslint" | "tsc" => Some(VerificationCommandKind::StaticCheck),
+        "rustc" | "gcc" | "g++" | "cc" | "c++" | "clang" | "clang++" | "clang-cl" | "cl"
+        | "swiftc" | "kotlinc" | "scalac" | "javac" | "tsc" | "msbuild" | "ruff" | "mypy"
+        | "eslint" => Some(VerificationCommandKind::StaticCheck),
         "xcodebuild" => Some(if positionals.contains(&"test") {
             VerificationCommandKind::TestExecution
         } else {
@@ -5486,11 +6581,41 @@ fn verifier_segment_kind(segment: &str) -> Option<VerificationCommandKind> {
             Some("py_compile" | "compileall") => Some(VerificationCommandKind::StaticCheck),
             _ => None,
         },
+        "node"
+            if args
+                .iter()
+                .any(|word| word == "--test" || word.starts_with("--test=")) =>
+        {
+            Some(VerificationCommandKind::TestExecution)
+        }
+        "node"
+            if args
+                .iter()
+                .any(|word| matches!(word.as_str(), "--check" | "--check-syntax" | "-c")) =>
+        {
+            Some(VerificationCommandKind::StaticCheck)
+        }
+        "php"
+            if args
+                .iter()
+                .any(|word| matches!(word.as_str(), "-l" | "--syntax-check")) =>
+        {
+            Some(VerificationCommandKind::StaticCheck)
+        }
+        "ruby" | "perl" if args.iter().any(|word| word == "-c") => {
+            Some(VerificationCommandKind::StaticCheck)
+        }
+        "bash" | "sh" | "zsh" if args.iter().any(|word| word == "-n") => {
+            Some(VerificationCommandKind::StaticCheck)
+        }
+        "luac" if args.iter().any(|word| word == "-p") => {
+            Some(VerificationCommandKind::StaticCheck)
+        }
         "npm" | "pnpm" | "yarn" | "bun" => {
             let script = if first == "run" { second } else { first };
             if script_is_test(script) {
                 Some(VerificationCommandKind::TestExecution)
-            } else if script_is_check(script) {
+            } else if script_is_static(script) {
                 Some(VerificationCommandKind::StaticCheck)
             } else {
                 None
@@ -5500,6 +6625,82 @@ fn verifier_segment_kind(segment: &str) -> Option<VerificationCommandKind> {
             let only_lists = (executable == "go" && args.iter().any(|word| word == "-list"))
                 || (executable == "dotnet" && args.iter().any(|word| word == "--list-tests"));
             (!only_lists).then_some(VerificationCommandKind::TestExecution)
+        }
+        "deno" if matches!(first, "check" | "compile" | "fmt" | "lint") => {
+            Some(VerificationCommandKind::StaticCheck)
+        }
+        "go" if matches!(first, "build" | "vet") => Some(VerificationCommandKind::StaticCheck),
+        "dotnet" if matches!(first, "build" | "format" | "pack" | "publish") => {
+            Some(VerificationCommandKind::StaticCheck)
+        }
+        "swift" if first == "build" => Some(VerificationCommandKind::StaticCheck),
+        "mvn" | "mvnw" => {
+            if positionals
+                .iter()
+                .any(|goal| matches!(*goal, "test" | "verify"))
+                && !args
+                    .iter()
+                    .any(|word| word == "-dskiptests" || word == "-dmaven.test.skip=true")
+            {
+                Some(VerificationCommandKind::TestExecution)
+            } else if positionals
+                .iter()
+                .any(|goal| matches!(*goal, "compile" | "package"))
+            {
+                Some(VerificationCommandKind::StaticCheck)
+            } else {
+                None
+            }
+        }
+        "gradle" | "gradlew" => {
+            if args.iter().any(|word| word == "--dry-run" || word == "-m") {
+                None
+            } else if positionals.iter().any(|task| {
+                *task == "test"
+                    || task.ends_with(":test")
+                    || task.ends_with("test") && !task.ends_with("testclasses")
+            }) {
+                Some(VerificationCommandKind::TestExecution)
+            } else if positionals
+                .iter()
+                .any(|task| matches!(*task, "assemble" | "build" | "check" | "classes"))
+            {
+                Some(VerificationCommandKind::StaticCheck)
+            } else {
+                None
+            }
+        }
+        "jest" | "vitest" | "mocha" | "ava" | "tap" | "phpunit" | "rspec" => {
+            Some(VerificationCommandKind::TestExecution)
+        }
+        "rake" | "bundle"
+            if positionals
+                .iter()
+                .any(|target| *target == "test" || *target == "spec" || *target == "rspec") =>
+        {
+            Some(VerificationCommandKind::TestExecution)
+        }
+        "composer" if positionals.iter().any(|target| script_is_test(target)) => {
+            Some(VerificationCommandKind::TestExecution)
+        }
+        "just"
+            if !args
+                .iter()
+                .any(|word| matches!(word.as_str(), "-n" | "--dry-run"))
+                && positionals.iter().any(|target| script_is_test(target)) =>
+        {
+            Some(VerificationCommandKind::TestExecution)
+        }
+        "just"
+            if !args
+                .iter()
+                .any(|word| matches!(word.as_str(), "-n" | "--dry-run"))
+                && positionals.iter().any(|target| script_is_static(target)) =>
+        {
+            Some(VerificationCommandKind::StaticCheck)
+        }
+        "cmake" if args.iter().any(|word| word == "--build") => {
+            Some(VerificationCommandKind::StaticCheck)
         }
         "make" | "gmake"
             if !args.iter().any(|word| {
@@ -5511,14 +6712,20 @@ fn verifier_segment_kind(segment: &str) -> Option<VerificationCommandKind> {
         {
             if positionals.iter().any(|target| script_is_test(target)) {
                 Some(VerificationCommandKind::TestExecution)
-            } else if positionals.iter().any(|target| script_is_check(target)) {
+            } else if positionals.is_empty()
+                || positionals.iter().any(|target| {
+                    matches!(*target, "all" | "build" | "compile") || script_is_static(target)
+                })
+            {
                 Some(VerificationCommandKind::StaticCheck)
             } else {
                 None
             }
         }
         "npx" => match shell_executable_name(first) {
-            "pytest" | "py.test" | "ctest" => Some(VerificationCommandKind::TestExecution),
+            "pytest" | "py.test" | "ctest" | "jest" | "vitest" | "mocha" | "ava" | "tap" => {
+                Some(VerificationCommandKind::TestExecution)
+            }
             "ruff" | "mypy" | "eslint" | "tsc" => Some(VerificationCommandKind::StaticCheck),
             _ => None,
         },
@@ -5527,6 +6734,49 @@ fn verifier_segment_kind(segment: &str) -> Option<VerificationCommandKind> {
             "ruff" | "mypy" => Some(VerificationCommandKind::StaticCheck),
             _ => None,
         },
+        "mix" | "sbt" | "bazel" | "bazelisk" | "dart" | "flutter" | "cabal" | "stack" | "lein"
+            if matches!(first, "test" | "tests" | "spec") =>
+        {
+            Some(VerificationCommandKind::TestExecution)
+        }
+        "mix" if matches!(first, "compile" | "format") => {
+            Some(VerificationCommandKind::StaticCheck)
+        }
+        "sbt" if matches!(first, "compile" | "package" | "assembly") => {
+            Some(VerificationCommandKind::StaticCheck)
+        }
+        "bazel" | "bazelisk" if matches!(first, "build" | "analyze-profile") => {
+            Some(VerificationCommandKind::StaticCheck)
+        }
+        "dart" | "flutter" if matches!(first, "analyze" | "build" | "compile" | "format") => {
+            Some(VerificationCommandKind::StaticCheck)
+        }
+        "cabal" | "stack" if matches!(first, "build" | "check") => {
+            Some(VerificationCommandKind::StaticCheck)
+        }
+        "lein" if matches!(first, "check" | "compile") => {
+            Some(VerificationCommandKind::StaticCheck)
+        }
+        "zig" if first == "test" => Some(VerificationCommandKind::TestExecution),
+        "zig" if first == "build" => {
+            if positionals.iter().skip(1).any(|word| *word == "test") {
+                Some(VerificationCommandKind::TestExecution)
+            } else if positionals.iter().skip(1).any(|word| *word == "run") {
+                None
+            } else {
+                Some(VerificationCommandKind::StaticCheck)
+            }
+        }
+        "lua" | "luajit" | "rscript"
+            if positionals
+                .iter()
+                .any(|path| workspace_path_looks_like_test(path)) =>
+        {
+            Some(VerificationCommandKind::TestExecution)
+        }
+        _ if matches!(first, "test" | "tests" | "spec") => {
+            Some(VerificationCommandKind::TestExecution)
+        }
         _ => None,
     }
 }
@@ -5538,6 +6788,128 @@ fn verification_command_kind(command: &str) -> Option<VerificationCommandKind> {
         .max_by_key(|kind| match kind {
             VerificationCommandKind::StaticCheck => 0,
             VerificationCommandKind::TestExecution => 1,
+        })
+}
+
+fn verifier_segment_test_ecosystem(segment: &str) -> Option<ProjectEcosystem> {
+    if verifier_segment_kind(segment) != Some(VerificationCommandKind::TestExecution) {
+        return None;
+    }
+    let words = segment
+        .split_whitespace()
+        .map(normalized_shell_word)
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    let mut index = 0usize;
+    while words
+        .get(index)
+        .is_some_and(|word| word == "&" || (!word.starts_with('-') && word.contains('=')))
+    {
+        index += 1;
+    }
+    if words
+        .get(index)
+        .is_some_and(|word| shell_executable_name(word) == "env")
+    {
+        index += 1;
+        while words.get(index).is_some_and(|word| {
+            word.starts_with('-') || (!word.starts_with('-') && word.contains('='))
+        }) {
+            index += 1;
+        }
+    }
+    let executable = words.get(index).map(|word| shell_executable_name(word))?;
+    let executable = executable
+        .strip_suffix(".exe")
+        .or_else(|| executable.strip_suffix(".cmd"))
+        .or_else(|| executable.strip_suffix(".bat"))
+        .unwrap_or(executable);
+    let args = &words[index + 1..];
+    let delegated = args
+        .iter()
+        .find(|word| !word.starts_with('-'))
+        .map(|word| shell_executable_name(word))
+        .unwrap_or_default();
+    match executable {
+        "cargo" => Some(ProjectEcosystem::Rust),
+        "pytest" | "py.test" | "python" | "python3" | "py" | "uv" | "poetry" => {
+            Some(ProjectEcosystem::Python)
+        }
+        executable if executable.starts_with("python3.") => Some(ProjectEcosystem::Python),
+        "npm" | "pnpm" | "yarn" | "bun" | "deno" | "jest" | "vitest" | "mocha" | "ava" | "tap" => {
+            Some(ProjectEcosystem::JavaScript)
+        }
+        "npx" => match delegated {
+            "pytest" | "py.test" => Some(ProjectEcosystem::Python),
+            "ctest" => Some(ProjectEcosystem::Native),
+            _ => Some(ProjectEcosystem::JavaScript),
+        },
+        "go" => Some(ProjectEcosystem::Go),
+        "mvn" | "mvnw" | "gradle" | "gradlew" => Some(ProjectEcosystem::Java),
+        "dotnet" => Some(ProjectEcosystem::DotNet),
+        "swift" | "xcodebuild" => Some(ProjectEcosystem::Swift),
+        "ctest" | "make" | "gmake" => Some(ProjectEcosystem::Native),
+        "phpunit" | "composer" => Some(ProjectEcosystem::Php),
+        "rspec" | "rake" | "bundle" => Some(ProjectEcosystem::Ruby),
+        "mix" => Some(ProjectEcosystem::Elixir),
+        "sbt" => Some(ProjectEcosystem::Java),
+        "dart" | "flutter" => Some(ProjectEcosystem::Dart),
+        "cabal" | "stack" => Some(ProjectEcosystem::Haskell),
+        "lein" => Some(ProjectEcosystem::Clojure),
+        "zig" => Some(ProjectEcosystem::Zig),
+        "lua" | "luajit" => Some(ProjectEcosystem::Lua),
+        "rscript" => Some(ProjectEcosystem::R),
+        _ => None,
+    }
+}
+
+fn verification_command_test_ecosystems(command: &str) -> BTreeSet<ProjectEcosystem> {
+    shell_command_segments(command)
+        .into_iter()
+        .filter_map(verifier_segment_test_ecosystem)
+        .collect()
+}
+
+fn verification_command_uses_neutral_test_wrapper(command: &str) -> bool {
+    shell_command_segments(command).into_iter().any(|segment| {
+        let executable = segment
+            .split_whitespace()
+            .map(normalized_shell_word)
+            .find(|word| !word.contains('='))
+            .map(|word| shell_executable_name(&word).to_string())
+            .unwrap_or_default();
+        matches!(
+            executable
+                .strip_suffix(".exe")
+                .or_else(|| executable.strip_suffix(".cmd"))
+                .or_else(|| executable.strip_suffix(".bat"))
+                .unwrap_or(&executable),
+            "bazel" | "bazelisk" | "ctest" | "gmake" | "just" | "make"
+        )
+    })
+}
+
+fn workspace_has_neutral_test_wrapper(
+    completed_work: &[String],
+    required_artifacts: &BTreeSet<String>,
+) -> bool {
+    completed_work
+        .iter()
+        .filter_map(|entry| entry.split_once(" changed ").map(|(_, path)| path))
+        .chain(required_artifacts.iter().map(String::as_str))
+        .map(normalize_workspace_path)
+        .filter_map(|path| path.rsplit('/').next().map(str::to_ascii_lowercase))
+        .any(|filename| {
+            matches!(
+                filename.as_str(),
+                "build"
+                    | "build.bazel"
+                    | "cmakelists.txt"
+                    | "justfile"
+                    | "makefile"
+                    | "workspace"
+                    | "workspace.bazel"
+            )
         })
 }
 
@@ -5568,9 +6940,15 @@ fn verifier_segment_runs_python_tests(segment: &str) -> bool {
             index += 1;
         }
     }
-    let Some(executable) = words.get(index).map(|word| shell_executable_name(word)) else {
+    let Some(executable_word) = words.get(index) else {
         return false;
     };
+    if (executable_word.starts_with("./") || executable_word.starts_with(".\\"))
+        && workspace_path_looks_like_test(executable_word)
+    {
+        return false;
+    }
+    let executable = shell_executable_name(executable_word);
     let executable = executable.strip_suffix(".exe").unwrap_or(executable);
     let args = &words[index + 1..];
     match executable {
@@ -5662,10 +7040,39 @@ fn python_verifier_segment_covers_artifact(segment: &str, artifact: &str) -> boo
         })
 }
 
+fn runtime_argument_matches_artifact(argument: &str, artifact_paths: &[(String, String)]) -> bool {
+    let argument = argument.replace('\\', "/");
+    let argument = argument.strip_prefix("./").unwrap_or(&argument);
+    artifact_paths.iter().any(|(path, basename)| {
+        argument == path.as_str()
+            || argument == basename.as_str()
+            || argument
+                .strip_suffix(path.as_str())
+                .is_some_and(|prefix| prefix.ends_with('/'))
+    })
+}
+
+fn first_runtime_positional(arguments: &[String]) -> Option<&str> {
+    arguments
+        .iter()
+        .find(|word| !word.starts_with('-'))
+        .map(String::as_str)
+}
+
+fn runtime_positional_after<'a>(arguments: &'a [String], subcommand: &str) -> Option<&'a str> {
+    arguments
+        .iter()
+        .position(|word| word == subcommand)
+        .and_then(|position| first_runtime_positional(&arguments[position + 1..]))
+}
+
 fn direct_artifact_segment_is_relevant(segment: &str, artifact_paths: &[(String, String)]) -> bool {
-    let words = segment
-        .split_whitespace()
-        .map(normalized_shell_word)
+    let Some(words) = manual_shell_words(segment) else {
+        return false;
+    };
+    let words = words
+        .iter()
+        .map(|word| normalized_shell_word(word))
         .filter(|word| !word.is_empty())
         .collect::<Vec<_>>();
     let mut index = 0usize;
@@ -5704,9 +7111,12 @@ fn direct_artifact_segment_is_relevant(segment: &str, artifact_paths: &[(String,
         }),
         "python" | "python3" | "py" | "ruby" => args.iter().any(|arg| arg == "-c" || arg == "-e"),
         executable if executable.starts_with("python3.") => args.iter().any(|arg| arg == "-c"),
-        "node" | "deno" | "bun" => args
-            .iter()
-            .any(|arg| matches!(arg.as_str(), "-e" | "--eval" | "eval")),
+        "node" | "deno" | "bun" => args.iter().any(|arg| {
+            matches!(
+                arg.as_str(),
+                "-e" | "--eval" | "eval" | "-p" | "--print" | "print"
+            )
+        }),
         "php" => args.iter().any(|arg| arg == "-r"),
         _ => false,
     };
@@ -5720,11 +7130,9 @@ fn direct_artifact_segment_is_relevant(segment: &str, artifact_paths: &[(String,
             .find(|pair| pair[0] == "-m")
             .map(|pair| pair[1].as_str())
         {
-            if artifact_paths.iter().any(|(path, _)| {
+            return artifact_paths.iter().any(|(path, _)| {
                 python_module_for_path(path).is_some_and(|candidate| candidate == module)
-            }) {
-                return true;
-            }
+            });
         }
     }
 
@@ -5738,14 +7146,18 @@ fn direct_artifact_segment_is_relevant(segment: &str, artifact_paths: &[(String,
             | "deno"
             | "bun"
             | "ruby"
+            | "perl"
             | "php"
             | "java"
             | "go"
-            | "rustc"
-            | "gcc"
-            | "clang"
+            | "lua"
+            | "luajit"
+            | "rscript"
             | "swift"
             | "dotnet"
+            | "dart"
+            | "flutter"
+            | "zig"
             | "bash"
             | "sh"
             | "zsh"
@@ -5756,21 +7168,561 @@ fn direct_artifact_segment_is_relevant(segment: &str, artifact_paths: &[(String,
         return false;
     }
 
-    let candidate_start = if direct_executable { index } else { index + 1 };
-    words[candidate_start..]
+    let entrypoint = if direct_executable {
+        Some(executable_word.as_str())
+    } else {
+        match executable {
+            "python" | "python3" | "py" => first_runtime_positional(args),
+            executable if executable.starts_with("python3.") => first_runtime_positional(args),
+            "node" | "ruby" | "perl" | "php" | "lua" | "luajit" | "rscript" | "bash" | "sh"
+            | "zsh" => first_runtime_positional(args),
+            "deno" | "bun" => {
+                runtime_positional_after(args, "run").or_else(|| first_runtime_positional(args))
+            }
+            "go" | "dart" | "flutter" | "zig" => runtime_positional_after(args, "run"),
+            "java" => args
+                .iter()
+                .position(|word| word == "-jar")
+                .and_then(|position| args.get(position + 1).map(String::as_str))
+                .or_else(|| first_runtime_positional(args)),
+            "pwsh" | "powershell" => args
+                .iter()
+                .position(|word| matches!(word.as_str(), "-file" | "-f"))
+                .and_then(|position| args.get(position + 1).map(String::as_str))
+                .or_else(|| first_runtime_positional(args)),
+            "swift" => {
+                runtime_positional_after(args, "run").or_else(|| first_runtime_positional(args))
+            }
+            _ => None,
+        }
+    };
+    entrypoint
+        .is_some_and(|entrypoint| runtime_argument_matches_artifact(entrypoint, artifact_paths))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ProjectEcosystem {
+    Clojure,
+    Dart,
+    DotNet,
+    Elixir,
+    Go,
+    Haskell,
+    Java,
+    JavaScript,
+    Lua,
+    Native,
+    Php,
+    Python,
+    R,
+    Ruby,
+    Rust,
+    Swift,
+    Zig,
+}
+
+fn workspace_artifact_ecosystem(path: &str) -> Option<ProjectEcosystem> {
+    let normalized = normalize_workspace_path(path).to_ascii_lowercase();
+    let filename = normalized.rsplit('/').next().unwrap_or(&normalized);
+    if matches!(filename, "cargo.toml" | "cargo.lock") || filename.ends_with(".rs") {
+        Some(ProjectEcosystem::Rust)
+    } else if matches!(filename, "go.mod" | "go.sum") || filename.ends_with(".go") {
+        Some(ProjectEcosystem::Go)
+    } else if matches!(
+        filename,
+        "package.json"
+            | "package-lock.json"
+            | "pnpm-lock.yaml"
+            | "yarn.lock"
+            | "deno.json"
+            | "deno.jsonc"
+    ) || [".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"]
         .iter()
-        .filter(|word| !word.starts_with('-'))
-        .any(|word| {
-            let argument = word.replace('\\', "/");
-            let argument = argument.strip_prefix("./").unwrap_or(&argument);
-            artifact_paths.iter().any(|(path, basename)| {
-                argument == path.as_str()
-                    || argument == basename.as_str()
-                    || argument
-                        .strip_suffix(path.as_str())
-                        .is_some_and(|prefix| prefix.ends_with('/'))
-            })
+        .any(|extension| filename.ends_with(extension))
+    {
+        Some(ProjectEcosystem::JavaScript)
+    } else if matches!(
+        filename,
+        "pom.xml"
+            | "build.sbt"
+            | "build.gradle"
+            | "build.gradle.kts"
+            | "settings.gradle"
+            | "settings.gradle.kts"
+            | "gradlew"
+            | "gradlew.bat"
+    ) || [".java", ".kt", ".kts", ".scala"]
+        .iter()
+        .any(|extension| filename.ends_with(extension))
+    {
+        Some(ProjectEcosystem::Java)
+    } else if filename.ends_with(".py")
+        || filename.ends_with(".pyi")
+        || matches!(
+            filename,
+            "pyproject.toml" | "setup.py" | "setup.cfg" | "requirements.txt"
+        )
+    {
+        Some(ProjectEcosystem::Python)
+    } else if filename.ends_with(".rb")
+        || matches!(filename, "gemfile" | "gemfile.lock" | "rakefile")
+    {
+        Some(ProjectEcosystem::Ruby)
+    } else if filename.ends_with(".php") || matches!(filename, "composer.json" | "composer.lock") {
+        Some(ProjectEcosystem::Php)
+    } else if filename.ends_with(".cs")
+        || filename.ends_with(".fs")
+        || filename.ends_with(".vb")
+        || filename.ends_with(".csproj")
+        || filename.ends_with(".fsproj")
+        || filename.ends_with(".vbproj")
+        || filename.ends_with(".sln")
+    {
+        Some(ProjectEcosystem::DotNet)
+    } else if filename.ends_with(".swift") || filename == "package.swift" {
+        Some(ProjectEcosystem::Swift)
+    } else if filename.ends_with(".dart") || filename == "pubspec.yaml" {
+        Some(ProjectEcosystem::Dart)
+    } else if filename.ends_with(".ex") || filename.ends_with(".exs") || filename == "mix.exs" {
+        Some(ProjectEcosystem::Elixir)
+    } else if filename.ends_with(".hs")
+        || filename.ends_with(".lhs")
+        || filename.ends_with(".cabal")
+        || matches!(filename, "cabal.project" | "stack.yaml")
+    {
+        Some(ProjectEcosystem::Haskell)
+    } else if filename.ends_with(".lua") {
+        Some(ProjectEcosystem::Lua)
+    } else if filename.ends_with(".r") || matches!(filename, "description" | "namespace") {
+        Some(ProjectEcosystem::R)
+    } else if filename.ends_with(".zig") || filename == "build.zig" {
+        Some(ProjectEcosystem::Zig)
+    } else if filename.ends_with(".clj")
+        || filename.ends_with(".cljs")
+        || filename.ends_with(".edn")
+        || filename == "project.clj"
+    {
+        Some(ProjectEcosystem::Clojure)
+    } else if [".c", ".cc", ".cpp", ".h", ".hpp", ".m", ".mm"]
+        .iter()
+        .any(|extension| filename.ends_with(extension))
+        || matches!(filename, "cmakelists.txt" | "makefile")
+    {
+        Some(ProjectEcosystem::Native)
+    } else {
+        None
+    }
+}
+
+fn workspace_project_ecosystems(
+    completed_work: &[String],
+    required_artifacts: &BTreeSet<String>,
+) -> BTreeSet<ProjectEcosystem> {
+    completed_work
+        .iter()
+        .filter_map(|entry| entry.split_once(" changed ").map(|(_, path)| path))
+        .chain(required_artifacts.iter().map(String::as_str))
+        .filter_map(workspace_artifact_ecosystem)
+        .collect()
+}
+
+fn workspace_has_native_source(
+    completed_work: &[String],
+    required_artifacts: &BTreeSet<String>,
+) -> bool {
+    completed_work
+        .iter()
+        .filter_map(|entry| entry.split_once(" changed ").map(|(_, path)| path))
+        .chain(required_artifacts.iter().map(String::as_str))
+        .map(|path| normalize_workspace_path(path).to_ascii_lowercase())
+        .any(|path| {
+            [
+                ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hxx", ".m", ".mm",
+            ]
+            .iter()
+            .any(|extension| path.ends_with(extension))
         })
+}
+
+fn test_target_matches_artifact(target: &str, test_artifacts: &[String]) -> bool {
+    let target = normalize_workspace_path(target)
+        .trim_start_matches("./")
+        .trim_start_matches("//")
+        .trim_end_matches("/...")
+        .trim_end_matches(":all")
+        .replace(':', "/")
+        .to_ascii_lowercase();
+    !target.is_empty()
+        && test_artifacts.iter().any(|artifact| {
+            let artifact = normalize_workspace_path(artifact).to_ascii_lowercase();
+            let basename = artifact.rsplit('/').next().unwrap_or(&artifact);
+            artifact == target
+                || basename == target
+                || artifact.starts_with(&format!("{target}/"))
+                || target.starts_with(&format!("{artifact}/"))
+        })
+}
+
+/// Broad project discovery is acceptable generic evidence; package/test
+/// filters are not unless they name one of the requested test artifacts. An
+/// exact command explicitly supplied by the user bypasses this inference and
+/// is checked before this helper.
+fn verification_command_has_unbound_test_narrowing(
+    command: &str,
+    test_artifacts: &[String],
+) -> bool {
+    shell_command_segments(command).into_iter().any(|segment| {
+        let Some(words) = manual_shell_words(segment) else {
+            return true;
+        };
+        let normalized = words
+            .iter()
+            .map(|word| normalized_shell_word(word))
+            .collect::<Vec<_>>();
+        let Some(executable_index) = normalized
+            .iter()
+            .position(|word| !word.contains('=') && shell_executable_name(word) != "env")
+        else {
+            return true;
+        };
+        let executable = shell_executable_name(&normalized[executable_index]);
+        let executable = executable
+            .strip_suffix(".exe")
+            .or_else(|| executable.strip_suffix(".cmd"))
+            .or_else(|| executable.strip_suffix(".bat"))
+            .unwrap_or(executable);
+        let args = &normalized[executable_index + 1..];
+        match executable {
+            "cargo" => {
+                if args.iter().any(|arg| {
+                    matches!(arg.as_str(), "-p" | "--package") || arg.starts_with("--package=")
+                }) {
+                    return true;
+                }
+                let Some(test_index) = args.iter().position(|arg| arg == "test") else {
+                    return false;
+                };
+                args[test_index + 1..]
+                    .iter()
+                    .filter(|arg| !arg.starts_with('-') && arg.as_str() != "--")
+                    .any(|target| !test_target_matches_artifact(target, test_artifacts))
+            }
+            "go" => {
+                let Some(test_index) = args.iter().position(|arg| arg == "test") else {
+                    return false;
+                };
+                args[test_index + 1..]
+                    .iter()
+                    .filter(|arg| !arg.starts_with('-'))
+                    .any(|target| {
+                        !matches!(target.as_str(), "." | "./..." | "...")
+                            && !test_target_matches_artifact(target, test_artifacts)
+                    })
+            }
+            "npm" | "pnpm" | "yarn" | "bun" => {
+                let positionals = args
+                    .iter()
+                    .filter(|arg| !arg.starts_with('-') && arg.as_str() != "--")
+                    .collect::<Vec<_>>();
+                let script = if positionals
+                    .first()
+                    .is_some_and(|word| word.as_str() == "run")
+                {
+                    positionals
+                        .get(1)
+                        .map(|word| word.as_str())
+                        .unwrap_or_default()
+                } else {
+                    positionals
+                        .first()
+                        .map(|word| word.as_str())
+                        .unwrap_or_default()
+                };
+                if script.starts_with("test:") {
+                    return true;
+                }
+                let after_separator = args
+                    .iter()
+                    .position(|arg| arg == "--")
+                    .map(|index| &args[index + 1..])
+                    .unwrap_or(&[]);
+                after_separator
+                    .iter()
+                    .filter(|arg| !arg.starts_with('-'))
+                    .any(|target| !test_target_matches_artifact(target, test_artifacts))
+            }
+            "bazel" | "bazelisk" => args
+                .iter()
+                .skip_while(|arg| arg.as_str() != "test")
+                .skip(1)
+                .filter(|arg| !arg.starts_with('-'))
+                .any(|target| {
+                    target.as_str() != "//..."
+                        && !test_target_matches_artifact(target, test_artifacts)
+                }),
+            _ => args
+                .iter()
+                .position(|arg| matches!(arg.as_str(), "test" | "tests" | "spec"))
+                .is_some_and(|test_index| {
+                    args[test_index + 1..]
+                        .iter()
+                        .filter(|arg| !arg.starts_with('-'))
+                        .any(|target| !test_target_matches_artifact(target, test_artifacts))
+                }),
+        }
+    })
+}
+
+fn runtime_segment_is_project_launch(
+    segment: &str,
+    ecosystems: &BTreeSet<ProjectEcosystem>,
+    neutral_wrapper: bool,
+) -> bool {
+    if shell_segment_redirects_output(segment) {
+        return false;
+    }
+    let words = segment
+        .split_whitespace()
+        .map(normalized_shell_word)
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    let mut index = 0usize;
+    while words
+        .get(index)
+        .is_some_and(|word| word == "&" || (!word.starts_with('-') && word.contains('=')))
+    {
+        index += 1;
+    }
+    if words
+        .get(index)
+        .is_some_and(|word| shell_executable_name(word) == "env")
+    {
+        index += 1;
+        while words.get(index).is_some_and(|word| {
+            word.starts_with('-') || (!word.starts_with('-') && word.contains('='))
+        }) {
+            index += 1;
+        }
+    }
+    let Some(executable_word) = words.get(index) else {
+        return false;
+    };
+    let executable = shell_executable_name(executable_word);
+    let executable = executable.strip_suffix(".exe").unwrap_or(executable);
+    let args = &words[index + 1..];
+    let first = args
+        .iter()
+        .find(|word| !word.starts_with('-'))
+        .map(String::as_str)
+        .unwrap_or_default();
+    let has = |ecosystem| ecosystems.contains(&ecosystem);
+
+    match executable {
+        "cargo" => has(ProjectEcosystem::Rust) && first == "run",
+        "go" => has(ProjectEcosystem::Go) && first == "run",
+        "dotnet" => has(ProjectEcosystem::DotNet) && first == "run",
+        "swift" => has(ProjectEcosystem::Swift) && first == "run",
+        "dart" => has(ProjectEcosystem::Dart) && first == "run",
+        "flutter" => has(ProjectEcosystem::Dart) && first == "run",
+        "mix" => has(ProjectEcosystem::Elixir) && matches!(first, "run" | "phx.server" | "release"),
+        "cabal" | "stack" => has(ProjectEcosystem::Haskell) && first == "run",
+        "sbt" => has(ProjectEcosystem::Java) && matches!(first, "run" | "runmain"),
+        "zig" => {
+            has(ProjectEcosystem::Zig)
+                && (first == "run"
+                    || first == "build"
+                        && args
+                            .iter()
+                            .filter(|word| !word.starts_with('-'))
+                            .skip(1)
+                            .any(|word| word == "run"))
+        }
+        "bazel" | "bazelisk" => neutral_wrapper && first == "run",
+        "java" => {
+            has(ProjectEcosystem::Java)
+                && (args.iter().any(|word| word == "-jar")
+                    || (!first.is_empty()
+                        && !matches!(first, "-version" | "--version" | "-help" | "--help")))
+        }
+        "npm" | "pnpm" | "yarn" | "bun" if has(ProjectEcosystem::JavaScript) => {
+            let positionals = args
+                .iter()
+                .filter(|word| !word.starts_with('-'))
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            let script = if positionals.first().is_some_and(|word| *word == "run") {
+                positionals.get(1).copied().unwrap_or_default()
+            } else {
+                positionals.first().copied().unwrap_or_default()
+            };
+            !script.is_empty()
+                && !matches!(
+                    script,
+                    "build"
+                        | "check"
+                        | "compile"
+                        | "format"
+                        | "install"
+                        | "lint"
+                        | "test"
+                        | "typecheck"
+                )
+                && !script.starts_with("test:")
+        }
+        _ => executable_word.starts_with("./") || executable_word.starts_with(".\\"),
+    }
+}
+
+fn runtime_segment_is_actual_execution(segment: &str) -> bool {
+    if shell_segment_redirects_output(segment) {
+        return false;
+    }
+    let Some(words) = manual_shell_words(segment) else {
+        return false;
+    };
+    let words = words
+        .iter()
+        .map(|word| normalized_shell_word(word))
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    let mut index = 0usize;
+    if words
+        .get(index)
+        .is_some_and(|word| shell_executable_name(word) == "env")
+    {
+        index += 1;
+        while words.get(index).is_some_and(|word| {
+            word.starts_with('-') || (!word.starts_with('-') && word.contains('='))
+        }) {
+            index += 1;
+        }
+    }
+    let Some(executable) = words.get(index).map(|word| shell_executable_name(word)) else {
+        return false;
+    };
+    let executable = executable
+        .strip_suffix(".exe")
+        .or_else(|| executable.strip_suffix(".cmd"))
+        .or_else(|| executable.strip_suffix(".bat"))
+        .unwrap_or(executable);
+    let args = &words[index + 1..];
+    let separator = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    let launcher_args = &args[..separator];
+    let help_flag = |word: &str| matches!(word, "--help" | "-h" | "-help" | "/?");
+    if launcher_args.iter().any(|word| word == "--version") {
+        return false;
+    }
+    match executable {
+        "cargo" | "go" | "dotnet" | "swift" | "dart" | "flutter" | "mix" | "cabal" | "stack"
+        | "sbt" | "zig" | "bazel" | "bazelisk" => {
+            if launcher_args.iter().any(|word| help_flag(word)) {
+                return false;
+            }
+        }
+        "node" | "deno" | "bun" => {
+            let script_index = launcher_args.iter().position(|word| !word.starts_with('-'));
+            let control_args = script_index
+                .map(|script| &launcher_args[..script])
+                .unwrap_or(launcher_args);
+            if control_args.iter().any(|word| {
+                help_flag(word)
+                    || matches!(
+                        word.as_str(),
+                        "--check" | "--check-syntax" | "-c" | "-p" | "--print"
+                    )
+            }) {
+                return false;
+            }
+            if script_index
+                .is_some_and(|script| workspace_path_looks_like_test(&launcher_args[script]))
+            {
+                return false;
+            }
+        }
+        "python" | "python3" | "py" => {
+            let module = launcher_args
+                .windows(2)
+                .find(|pair| pair[0] == "-m")
+                .map(|pair| pair[1].as_str());
+            if matches!(
+                module,
+                Some("pytest" | "unittest" | "compileall" | "py_compile")
+            ) {
+                return false;
+            }
+            let target_index = launcher_args.iter().position(|word| !word.starts_with('-'));
+            let control_args = target_index
+                .map(|target| &launcher_args[..target])
+                .unwrap_or(launcher_args);
+            if control_args.iter().any(|word| help_flag(word)) {
+                return false;
+            }
+            if target_index
+                .is_some_and(|target| workspace_path_looks_like_test(&launcher_args[target]))
+            {
+                return false;
+            }
+        }
+        executable if executable.starts_with("python3.") => {
+            if launcher_args
+                .iter()
+                .take_while(|word| word.starts_with('-'))
+                .any(|word| help_flag(word))
+            {
+                return false;
+            }
+        }
+        _ => {
+            if launcher_args.first().is_some_and(|word| help_flag(word)) {
+                return false;
+            }
+            if matches!(executable, "lua" | "luajit" | "rscript")
+                && launcher_args
+                    .iter()
+                    .find(|word| !word.starts_with('-'))
+                    .is_some_and(|target| workspace_path_looks_like_test(target))
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn paging_runtime_command_is_relevant(
+    command: &str,
+    completed_work: &[String],
+    required_artifacts: &BTreeSet<String>,
+) -> bool {
+    if verification_command_kind(command).is_some()
+        || command.to_ascii_lowercase().contains("--version")
+    {
+        return false;
+    }
+    let artifact_paths = completed_work
+        .iter()
+        .filter_map(|entry| entry.split_once(" changed ").map(|(_, path)| path))
+        .chain(required_artifacts.iter().map(String::as_str))
+        .map(|path| {
+            let normalized = normalize_workspace_path(path).to_ascii_lowercase();
+            let basename = normalized
+                .rsplit('/')
+                .next()
+                .unwrap_or(&normalized)
+                .to_string();
+            (normalized, basename)
+        })
+        .collect::<Vec<_>>();
+    let ecosystems = workspace_project_ecosystems(completed_work, required_artifacts);
+    let neutral_wrapper = workspace_has_neutral_test_wrapper(completed_work, required_artifacts);
+    shell_command_segments(command).into_iter().any(|segment| {
+        runtime_segment_is_actual_execution(segment)
+            && (direct_artifact_segment_is_relevant(segment, &artifact_paths)
+                || runtime_segment_is_project_launch(segment, &ecosystems, neutral_wrapper))
+    })
 }
 
 /// A successful shell call is not automatically verification. Reject pure
@@ -5783,7 +7735,17 @@ fn paging_verification_command_is_relevant(
     required_artifacts: &BTreeSet<String>,
     objective: &str,
 ) -> bool {
-    let command = command.trim().to_ascii_lowercase();
+    let command = command.trim();
+    let declared = declared_validation_commands(objective);
+    if declared
+        .tests
+        .commands
+        .iter()
+        .any(|expected| declared_validation_command_matches(command, expected))
+    {
+        return true;
+    }
+    let command = command.to_ascii_lowercase();
     if command.is_empty() || command.contains("--version") {
         return false;
     }
@@ -5817,10 +7779,37 @@ fn paging_verification_command_is_relevant(
             return normalize_manual_validation_command(&command)
                 == normalize_manual_validation_command(&expected);
         }
+        let test_artifacts = workspace_test_artifacts(completed_work, required_artifacts)
+            .into_iter()
+            .collect::<Vec<_>>();
+        if verification_command_has_unbound_test_narrowing(&command, &test_artifacts) {
+            return false;
+        }
+        let mut expected_ecosystems =
+            workspace_project_ecosystems(completed_work, required_artifacts);
+        expected_ecosystems.extend(
+            test_artifacts
+                .iter()
+                .filter_map(|path| workspace_artifact_ecosystem(path)),
+        );
+        if expected_ecosystems.len() > 1
+            && !workspace_has_native_source(completed_work, required_artifacts)
+        {
+            expected_ecosystems.remove(&ProjectEcosystem::Native);
+        }
+        let executed_ecosystems = verification_command_test_ecosystems(&command);
+        let neutral_project_wrapper = verification_command_uses_neutral_test_wrapper(&command)
+            && workspace_has_neutral_test_wrapper(completed_work, required_artifacts);
+        if !expected_ecosystems.is_empty()
+            && !expected_ecosystems.is_subset(&executed_ecosystems)
+            && !neutral_project_wrapper
+        {
+            return false;
+        }
         // When the manifest identifies Python tests, a runner from another
         // ecosystem (for example an unrelated `cargo test`) is not relevant
         // evidence for those authored files.
-        let python_tests_requested = workspace_test_artifacts(completed_work, required_artifacts)
+        let python_tests_requested = test_artifacts
             .into_iter()
             .filter(|path| path.to_ascii_lowercase().ends_with(".py"))
             .collect::<Vec<_>>();
@@ -5859,17 +7848,70 @@ fn paging_verification_command_is_relevant(
 /// explicitly says it discovered no tests. Keep this outcome in Verify so a
 /// wrong discovery root cannot certify a multi-file task without exercising it.
 fn paging_verification_reports_zero_tests(command: &str, output: &str) -> bool {
-    let command = command.to_ascii_lowercase();
-    if !(command.contains("unittest") || command.contains("pytest") || command.contains("py.test"))
+    let lower_command = command.to_ascii_lowercase();
+    let names_a_test_runner = [
+        "unittest",
+        "pytest",
+        "py.test",
+        "cargo test",
+        "go test",
+        "npm test",
+        "pnpm test",
+        "yarn test",
+        "bun test",
+        "deno test",
+        "dotnet test",
+        "swift test",
+        "ctest",
+        "mvn test",
+        "gradle test",
+        "gradlew test",
+        "jest",
+        "vitest",
+        "mocha",
+        "rspec",
+        "phpunit",
+    ]
+    .iter()
+    .any(|marker| lower_command.contains(marker));
+    if verification_command_kind(command) != Some(VerificationCommandKind::TestExecution)
+        && !names_a_test_runner
     {
         return false;
     }
     let output = output.to_ascii_lowercase();
+    let words = output
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    let positive_count = words.windows(3).any(|window| {
+        (matches!(window[0], "ran" | "running")
+            && window[1].parse::<usize>().is_ok_and(|count| count > 0)
+            && matches!(window[2], "test" | "tests"))
+            || (window[0] == "tests"
+                && window[1] == "run"
+                && window[2].parse::<usize>().is_ok_and(|count| count > 0))
+    }) || words.windows(2).any(|window| {
+        window[0].parse::<usize>().is_ok_and(|count| count > 0)
+            && matches!(window[1], "passed" | "passing" | "tests")
+    });
+    if positive_count {
+        return false;
+    }
     [
         "ran 0 tests",
+        "running 0 tests",
+        "tests run: 0",
+        "0 tests run",
+        "0 tests completed",
+        "0 passed",
+        "0 passing",
         "no tests ran",
+        "no tests to run",
         "collected 0 items",
         "no tests found",
+        "no test files found",
+        "no matching tests",
         "[no test files]",
     ]
     .iter()
@@ -6805,8 +8847,9 @@ pub fn system_prompt(sandbox: &Sandbox, tools: &[ToolSpec]) -> String {
         "try the `py` launcher before treating a failing `python` app alias as no Python. If a ",
         "runtime is truly absent, submit an approval-gated package-manager command instead of ",
         "asking the user to install it manually.\n",
-        "- Verify your work with a build, test, or re-read before claiming completion. A write \
-         or edit result that already shows the new content IS that verification.\n",
+        "- Verify your work with the narrowest relevant build, test, or application run before \
+         claiming completion. A write/edit result verifies only the persisted bytes; it never \
+         replaces an explicitly requested test suite or runtime/manual workflow.\n",
         "- When you need several independent things, ask for them in ONE step: up to 8 tool \
          calls per response. Serialize only when a later call depends on an earlier result.\n",
         "- Keep going until the goal is met or you are genuinely blocked.\n",
@@ -8359,6 +10402,353 @@ mod tests {
     }
 
     #[test]
+    fn paging_once_revalidates_exact_source_after_approval() {
+        let _checkpoint_guard = super::super::checkpoint::tests::cp_lock();
+        struct MutatingApprover {
+            path: PathBuf,
+        }
+        impl Approver for MutatingApprover {
+            fn approve(&mut self, _action: &Action, _sandbox: &Sandbox) -> Decision {
+                std::fs::write(&self.path, "external bytes survive\n").unwrap();
+                Decision::Once
+            }
+        }
+
+        let (directory, sandbox) = paging_workspace();
+        let initial_checkpoints = super::super::checkpoint::committed_count(sandbox.root());
+        let sink = audit::InMemorySink::default();
+        let mut driver = ScriptedPagingDriver {
+            steps: vec![ModelStep::Calls(vec![tc(
+                "edit_file",
+                json!({
+                    "path": "src/lib.rs",
+                    "old": "value + 1",
+                    "new": "value + 2"
+                }),
+            )])],
+            index: 0,
+            histories: Vec::new(),
+        };
+        let mut approver = MutatingApprover {
+            path: directory.path().join("src/lib.rs"),
+        };
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(
+            "Change src/lib.rs increment to add two".into(),
+        )];
+        let mut config = paging_cfg(directory.path());
+        config.max_steps = 1;
+        config.audit = Box::new(sink.clone());
+        let mut policy = Policy::default();
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sandbox,
+            &config,
+            &AtomicBool::new(false),
+            &mut policy,
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::StepCapped, "notices: {:?}", reporter.notices);
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("src/lib.rs")).unwrap(),
+            "external bytes survive\n"
+        );
+        assert_eq!(
+            super::super::checkpoint::committed_count(sandbox.root()),
+            initial_checkpoints,
+            "post-approval authority rejection must not prepare a checkpoint"
+        );
+        assert!(policy.granted().is_empty());
+        assert!(
+            sink.events().is_empty(),
+            "a rejected action did not execute"
+        );
+        assert!(reporter.results.iter().any(|result| {
+            result.contains("approved native edit_file target authority changed before execution")
+        }));
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+    }
+
+    #[test]
+    fn paging_always_tool_grant_requires_post_approval_authority() {
+        let _checkpoint_guard = super::super::checkpoint::tests::cp_lock();
+        struct MutatingApprover {
+            path: PathBuf,
+        }
+        impl Approver for MutatingApprover {
+            fn approve(&mut self, _action: &Action, _sandbox: &Sandbox) -> Decision {
+                std::fs::write(&self.path, "external always bytes survive\n").unwrap();
+                Decision::AlwaysTool
+            }
+        }
+
+        let (directory, sandbox) = paging_workspace();
+        let initial_checkpoints = super::super::checkpoint::committed_count(sandbox.root());
+        let mut driver = ScriptedPagingDriver {
+            steps: vec![ModelStep::Calls(vec![tc(
+                "edit_file",
+                json!({
+                    "path": "src/lib.rs",
+                    "old": "value + 1",
+                    "new": "value + 2"
+                }),
+            )])],
+            index: 0,
+            histories: Vec::new(),
+        };
+        let mut approver = MutatingApprover {
+            path: directory.path().join("src/lib.rs"),
+        };
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(
+            "Change src/lib.rs increment to add two".into(),
+        )];
+        let mut config = paging_cfg(directory.path());
+        config.max_steps = 1;
+        let mut policy = Policy::default();
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sandbox,
+            &config,
+            &AtomicBool::new(false),
+            &mut policy,
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::StepCapped, "notices: {:?}", reporter.notices);
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("src/lib.rs")).unwrap(),
+            "external always bytes survive\n"
+        );
+        assert_eq!(
+            super::super::checkpoint::committed_count(sandbox.root()),
+            initial_checkpoints
+        );
+        assert!(
+            policy.granted().is_empty(),
+            "a stale action must not install its AlwaysTool grant"
+        );
+        assert!(reporter.results.iter().any(|result| {
+            result.contains("approved native edit_file target authority changed before execution")
+        }));
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paging_rejects_a_symlink_retarget_during_approval() {
+        use std::os::unix::fs::symlink;
+
+        let _checkpoint_guard = super::super::checkpoint::tests::cp_lock();
+        struct RetargetingApprover {
+            approved_path: PathBuf,
+            external_path: PathBuf,
+        }
+        impl Approver for RetargetingApprover {
+            fn approve(&mut self, _action: &Action, _sandbox: &Sandbox) -> Decision {
+                std::fs::write(&self.external_path, "external symlink target\n").unwrap();
+                std::fs::remove_file(&self.approved_path).unwrap();
+                symlink("other.rs", &self.approved_path).unwrap();
+                Decision::Once
+            }
+        }
+
+        let (directory, sandbox) = paging_workspace();
+        let initial_checkpoints = super::super::checkpoint::committed_count(sandbox.root());
+        let mut driver = ScriptedPagingDriver {
+            steps: vec![ModelStep::Calls(vec![tc(
+                "edit_file",
+                json!({
+                    "path": "src/lib.rs",
+                    "old": "value + 1",
+                    "new": "value + 2"
+                }),
+            )])],
+            index: 0,
+            histories: Vec::new(),
+        };
+        let mut approver = RetargetingApprover {
+            approved_path: directory.path().join("src/lib.rs"),
+            external_path: directory.path().join("src/other.rs"),
+        };
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(
+            "Change src/lib.rs increment to add two".into(),
+        )];
+        let mut config = paging_cfg(directory.path());
+        config.max_steps = 1;
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sandbox,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::StepCapped, "notices: {:?}", reporter.notices);
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("src/other.rs")).unwrap(),
+            "external symlink target\n"
+        );
+        assert_eq!(
+            super::super::checkpoint::committed_count(sandbox.root()),
+            initial_checkpoints
+        );
+        assert!(reporter.results.iter().any(|result| {
+            result.contains("approved native edit_file target authority changed before execution")
+        }));
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+    }
+
+    #[test]
+    fn paging_read_hydrates_a_metadata_only_authority_path() {
+        struct LazyReadDriver {
+            step: usize,
+        }
+        impl ModelDriver for LazyReadDriver {
+            fn step(
+                &mut self,
+                history: &[AgentMsg],
+                _tools: &[ToolSpec],
+            ) -> Result<ModelStep, String> {
+                let [AgentMsg::User(capsule)] = history else {
+                    return Err("paging must send exactly one fresh capsule".into());
+                };
+                let response = if self.step == 0 {
+                    assert!(!capsule.contains("metadata-only sentinel"));
+                    ModelStep::Calls(vec![tc("read_file", json!({"path": "state.json"}))])
+                } else {
+                    assert!(capsule.contains("metadata-only sentinel"), "{capsule}");
+                    assert!(capsule.contains("<exact_source_page"), "{capsule}");
+                    ModelStep::Text("Inspected the requested state.".into())
+                };
+                self.step += 1;
+                Ok(response)
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("state.json"),
+            "{\"note\":\"metadata-only sentinel\"}\n",
+        )
+        .unwrap();
+        let sandbox = Sandbox::new(directory.path(), false, Duration::from_secs(5)).unwrap();
+        let mut driver = LazyReadDriver { step: 0 };
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("Inspect the workspace state".into())];
+        let mut config = paging_cfg(directory.path());
+        config.max_steps = 2;
+        let end = run_loop(
+            &mut driver,
+            &mut ScriptApprover(Vec::new(), 0),
+            &mut reporter,
+            &sandbox,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
+        assert_eq!(driver.step, 2);
+    }
+
+    #[test]
+    fn paging_ranged_read_authorizes_the_next_large_file_edit() {
+        let _checkpoint_guard = super::super::checkpoint::tests::cp_lock();
+        struct RangedReadDriver {
+            step: usize,
+            old: String,
+        }
+        impl ModelDriver for RangedReadDriver {
+            fn step(
+                &mut self,
+                history: &[AgentMsg],
+                _tools: &[ToolSpec],
+            ) -> Result<ModelStep, String> {
+                let [AgentMsg::User(capsule)] = history else {
+                    return Err("paging must send exactly one fresh capsule".into());
+                };
+                let response = if self.step == 0 {
+                    ModelStep::Calls(vec![tc(
+                        "read_file",
+                        json!({"path": "large.js", "start_line": 500, "max_lines": 10}),
+                    )])
+                } else {
+                    assert!(capsule.contains(&self.old), "{capsule}");
+                    ModelStep::Calls(vec![tc(
+                        "edit_file",
+                        json!({
+                            "path": "large.js",
+                            "old": self.old,
+                            "new": "const line500 = 'corrected';"
+                        }),
+                    )])
+                };
+                self.step += 1;
+                Ok(response)
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let line500 = format!("const line500 = 'payload-500-{}';", "x".repeat(32));
+        let source = (1..=700)
+            .map(|line| {
+                format!(
+                    "const line{line:03} = 'payload-{line:03}-{}';\n",
+                    "x".repeat(32)
+                )
+            })
+            .collect::<String>();
+        std::fs::write(directory.path().join("large.js"), source).unwrap();
+        let sandbox = Sandbox::new(directory.path(), false, Duration::from_secs(5)).unwrap();
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+        let mut driver = RangedReadDriver {
+            step: 0,
+            old: line500.clone(),
+        };
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(
+            "Update a later implementation line in large.js".into(),
+        )];
+        let mut config = paging_cfg(directory.path());
+        config.max_steps = 2;
+        let end = run_loop(
+            &mut driver,
+            &mut ScriptApprover(vec![Decision::Once], 0),
+            &mut reporter,
+            &sandbox,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::StepCapped, "notices: {:?}", reporter.notices);
+        let updated = std::fs::read_to_string(directory.path().join("large.js")).unwrap();
+        assert!(updated.contains("const line500 = 'corrected';"));
+        assert!(!updated.contains(&line500));
+        assert!(
+            reporter
+                .results
+                .iter()
+                .all(|result| !result.contains("was absent; host faulted")),
+            "the ranged read should avoid a reject/fault/retry: {:?}",
+            reporter.results
+        );
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+    }
+
+    #[test]
     fn paging_validation_feedback_reaches_the_next_fresh_capsule() {
         let _checkpoint_guard = super::super::checkpoint::tests::cp_lock();
         struct FeedbackDriver {
@@ -8969,6 +11359,16 @@ mod tests {
             "python3 -m taskforge.main run",
             "python3 -m taskforge.main failed",
         ];
+        const REQUESTED_COMMANDS: [&str; 8] = [
+            "python main.py add \"Generate report\"",
+            "python main.py add \"Clean cache\"",
+            "python main.py list",
+            "python main.py run",
+            "python main.py completed",
+            "python main.py add \"fail intentionally\"",
+            "python main.py run",
+            "python main.py failed",
+        ];
 
         struct TaskForgeDriver {
             step: usize,
@@ -8984,6 +11384,7 @@ mod tests {
                 };
                 if (5..13).contains(&self.step) {
                     let command = MANUAL_COMMANDS[self.step - 5];
+                    let requested = REQUESTED_COMMANDS[self.step - 5];
                     assert_eq!(
                         tools
                             .iter()
@@ -8991,7 +11392,7 @@ mod tests {
                             .collect::<Vec<_>>(),
                         vec!["run_shell"]
                     );
-                    assert!(capsule.contains(command), "{capsule}");
+                    assert!(capsule.contains(requested), "{capsule}");
                     self.step += 1;
                     return Ok(ModelStep::Calls(vec![tc(
                         "run_shell",
@@ -9023,7 +11424,7 @@ mod tests {
                                 .collect::<Vec<_>>(),
                             vec!["run_shell"]
                         );
-                        assert!(capsule.contains(MANUAL_COMMANDS[0]), "{capsule}");
+                        assert!(capsule.contains(REQUESTED_COMMANDS[0]), "{capsule}");
                         ModelStep::Calls(vec![tc(
                             "run_shell",
                             json!({"command": "python3 taskforge/main.py add \"Generate report\""}),
@@ -9842,11 +12243,17 @@ mod tests {
             &required,
             "run the unit tests for app.py"
         ));
-        assert!(paging_verification_command_is_relevant(
+        assert!(!paging_verification_command_is_relevant(
             "cargo --quiet test",
             &work,
             &required,
             "run the tests for app.py"
+        ));
+        assert!(paging_verification_command_is_relevant(
+            "cargo --quiet test",
+            &["write_file changed src/lib.rs".to_string()],
+            &BTreeSet::from(["Cargo.toml".to_string()]),
+            "run the Rust tests"
         ));
         assert!(!paging_verification_command_is_relevant(
             "cargo build",
@@ -9878,12 +12285,737 @@ mod tests {
         ));
         assert!(manual_validation_command_matches(
             "python3 -m taskforge.main list",
-            "python3 -m taskforge.main list"
+            "python3 -m taskforge.main list",
+            &[],
+            &BTreeSet::new(),
         ));
         assert!(!manual_validation_command_matches(
             "cd unrelated && python3 -m taskforge.main list",
-            "python3 -m taskforge.main list"
+            "python3 -m taskforge.main list",
+            &[],
+            &BTreeSet::new(),
         ));
+    }
+
+    #[test]
+    fn manual_validation_commands_are_project_agnostic_and_fail_closed() {
+        let objective = concat!(
+            "Build the application and perform the workflow.\n\n",
+            "## Manual Validation\n",
+            "```bash\n",
+            "cargo run -- --smoke\n",
+            "node tools/Check.js \"MiXeD Arg\"\n",
+            "go run ./cmd/server --once\n",
+            "```\n",
+            "```powershell\n",
+            "java -jar target/app.jar verify\n",
+            "```\n",
+        );
+        let expected = vec![
+            "cargo run -- --smoke".to_string(),
+            "node tools/Check.js \"MiXeD Arg\"".to_string(),
+            "go run ./cmd/server --once".to_string(),
+            "java -jar target/app.jar verify".to_string(),
+        ];
+        let work = vec![
+            "write_file changed Cargo.toml".to_string(),
+            "write_file changed tools/Check.js".to_string(),
+            "write_file changed cmd/server/main.go".to_string(),
+            "write_file changed pom.xml".to_string(),
+        ];
+        let required = BTreeSet::new();
+        assert_eq!(
+            manual_validation_obligations(objective, &work, &required),
+            expected
+        );
+        let mut decisions = Vec::new();
+        assert!(!execution_verification_requirements_satisfied(
+            objective, &work, &required, &decisions
+        ));
+        for command in &expected {
+            assert!(record_manual_validation_evidence(
+                &mut decisions,
+                &expected,
+                command,
+                &work,
+                &required,
+            ));
+        }
+        assert!(execution_verification_requirements_satisfied(
+            objective, &work, &required, &decisions
+        ));
+
+        let runtime_only = "Create a Rust CLI. Actually execute the application before completing.";
+        let rust_work = vec![
+            "write_file changed Cargo.toml".to_string(),
+            "write_file changed src/main.rs".to_string(),
+        ];
+        let mut runtime_decisions = Vec::new();
+        assert!(!execution_verification_requirements_satisfied(
+            runtime_only,
+            &rust_work,
+            &required,
+            &runtime_decisions,
+        ));
+        assert!(paging_runtime_command_is_relevant(
+            "cargo run -- --smoke",
+            &rust_work,
+            &required,
+        ));
+        record_verification_evidence(
+            &mut runtime_decisions,
+            RUNTIME_EXECUTION_EVIDENCE_PREFIX,
+            "cargo run -- --smoke",
+        );
+        assert!(execution_verification_requirements_satisfied(
+            runtime_only,
+            &rust_work,
+            &required,
+            &runtime_decisions,
+        ));
+    }
+
+    #[test]
+    fn project_runtime_classifier_supports_rust_node_go_and_java() {
+        let required = BTreeSet::new();
+        let cases = [
+            (
+                vec![
+                    "write_file changed Cargo.toml".to_string(),
+                    "write_file changed src/main.rs".to_string(),
+                ],
+                "cargo run --release",
+                "cargo test",
+            ),
+            (
+                vec![
+                    "write_file changed package.json".to_string(),
+                    "write_file changed src/cli.ts".to_string(),
+                ],
+                "npm run cli -- list",
+                "npm test",
+            ),
+            (
+                vec![
+                    "write_file changed go.mod".to_string(),
+                    "write_file changed cmd/server/main.go".to_string(),
+                ],
+                "go run ./cmd/server --once",
+                "go test ./...",
+            ),
+            (
+                vec![
+                    "write_file changed pom.xml".to_string(),
+                    "write_file changed src/main/java/App.java".to_string(),
+                ],
+                "java -jar target/app.jar verify",
+                "mvn test",
+            ),
+        ];
+        for (work, launch, tests) in cases {
+            assert!(
+                paging_runtime_command_is_relevant(launch, &work, &required),
+                "project launch must count as runtime evidence: {launch}"
+            );
+            assert!(
+                !paging_runtime_command_is_relevant(tests, &work, &required),
+                "a test command must not count as application execution: {tests}"
+            );
+        }
+
+        let test_cases = [
+            (
+                vec!["write_file changed src/lib.rs".to_string()],
+                BTreeSet::from(["Cargo.toml".to_string()]),
+                "cargo test",
+                "npm test",
+            ),
+            (
+                vec!["write_file changed src/app.test.ts".to_string()],
+                BTreeSet::from(["package.json".to_string()]),
+                "npm test",
+                "cargo test",
+            ),
+            (
+                vec!["write_file changed queue/queue_test.go".to_string()],
+                BTreeSet::from(["go.mod".to_string()]),
+                "go test ./...",
+                "cargo test",
+            ),
+            (
+                vec!["write_file changed src/test/java/AppTest.java".to_string()],
+                BTreeSet::from(["pom.xml".to_string()]),
+                "mvn test",
+                "cargo test",
+            ),
+        ];
+        for (work, required, matching, unrelated) in test_cases {
+            assert!(paging_verification_command_is_relevant(
+                matching,
+                &work,
+                &required,
+                "run the tests",
+            ));
+            assert!(
+                !paging_verification_command_is_relevant(
+                    unrelated,
+                    &work,
+                    &required,
+                    "run the tests",
+                ),
+                "an unrelated green runner must not satisfy {matching}: {unrelated}"
+            );
+        }
+        let rust_with_make = BTreeSet::from(["Cargo.toml".to_string(), "Makefile".to_string()]);
+        assert!(paging_verification_command_is_relevant(
+            "make test",
+            &["write_file changed src/lib.rs".to_string()],
+            &rust_with_make,
+            "run the tests",
+        ));
+        assert!(!paging_verification_command_is_relevant(
+            "npm test",
+            &["write_file changed src/lib.rs".to_string()],
+            &rust_with_make,
+            "run the tests",
+        ));
+    }
+
+    #[test]
+    fn python_manual_equivalence_fails_closed_for_ambiguous_entrypoints() {
+        let expected = "python main.py add \"Generate Report\"";
+        let actual = "python3 -m alpha.main add \"Generate Report\"";
+        let one_entrypoint = vec!["write_file changed alpha/main.py".to_string()];
+        assert!(manual_validation_command_matches(
+            actual,
+            expected,
+            &one_entrypoint,
+            &BTreeSet::new(),
+        ));
+        assert!(manual_validation_command_matches(
+            "env PYTHONPATH=. python3 -m alpha.main add \"Generate Report\"",
+            expected,
+            &one_entrypoint,
+            &BTreeSet::new(),
+        ));
+        assert!(!manual_validation_command_matches(
+            "python3 -m alpha.main add generate report",
+            expected,
+            &one_entrypoint,
+            &BTreeSet::new(),
+        ));
+        assert!(!manual_validation_command_matches(
+            "python3 -m alpha.main add \"generate report\"",
+            expected,
+            &one_entrypoint,
+            &BTreeSet::new(),
+        ));
+
+        let ambiguous = vec![
+            "write_file changed alpha/main.py".to_string(),
+            "write_file changed beta/main.py".to_string(),
+        ];
+        assert!(host_python_runtime_guidance(&ambiguous, &BTreeSet::new()).is_none());
+        assert!(!manual_validation_command_matches(
+            actual,
+            expected,
+            &ambiguous,
+            &BTreeSet::new(),
+        ));
+    }
+
+    #[test]
+    fn generic_runner_and_authored_input_classification_is_fail_closed() {
+        for command in [
+            "mvn test",
+            "./mvnw verify",
+            "gradle test",
+            "./gradlew :app:test",
+            "npx vitest run",
+            "bundle exec rspec",
+            "composer test",
+        ] {
+            assert_eq!(
+                verification_command_kind(command),
+                Some(VerificationCommandKind::TestExecution),
+                "runner must execute tests: {command}"
+            );
+        }
+        for command in [
+            "npm run build",
+            "pnpm lint",
+            "yarn typecheck",
+            "bun run format:check",
+            "make",
+            "gmake all",
+            "make compile",
+            "just build",
+            "just check",
+        ] {
+            assert_eq!(
+                verification_command_kind(command),
+                Some(VerificationCommandKind::StaticCheck),
+                "conventional no-test verifier must count as a static check: {command}"
+            );
+        }
+        for dry_run in ["make -n", "gmake --dry-run all", "just --dry-run build"] {
+            assert_eq!(
+                verification_command_kind(dry_run),
+                None,
+                "a dry run must not count as verification: {dry_run}"
+            );
+        }
+        for (command, output) in [
+            ("cargo test", "running 0 tests\ntest result: ok. 0 passed"),
+            ("go test ./...", "? example/cmd [no test files]"),
+            ("mvn test", "Tests run: 0, Failures: 0, Errors: 0"),
+            ("npx vitest run", "No test files found, exiting with code 0"),
+            ("mix test", "There are no tests to run"),
+        ] {
+            assert!(
+                paging_verification_reports_zero_tests(command, output),
+                "zero-test success must not certify the project: {command}"
+            );
+        }
+        assert!(!paging_verification_reports_zero_tests(
+            "cargo test",
+            "running 0 tests\nrunning 2 tests\ntest result: ok. 2 passed"
+        ));
+        for path in [
+            "Dockerfile",
+            "Justfile",
+            "Cargo.toml",
+            "package.json",
+            "src/view.svelte",
+            "web/index.html",
+            "infra/main.tf",
+            "config/schema.yaml",
+        ] {
+            assert!(
+                workspace_path_is_authored_input(path),
+                "authored build/source input must be fingerprinted: {path}"
+            );
+        }
+        assert!(!workspace_path_is_authored_input("data/runtime-state.json"));
+        let requested = workspace_requested_artifacts(
+            "Create Dockerfile, Makefile, Justfile, Gemfile, CMakeLists.txt, src/main.rs, and web/app.tsx.",
+        );
+        for path in [
+            "Dockerfile",
+            "Makefile",
+            "Justfile",
+            "Gemfile",
+            "CMakeLists.txt",
+            "src/main.rs",
+            "web/app.tsx",
+        ] {
+            assert!(
+                requested.contains(path),
+                "missing requested artifact: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_test_and_runtime_commands_are_open_ended_but_exact() {
+        let objective = concat!(
+            "Build the requested polyglot project.\n\n",
+            "## Test Commands\n",
+            "```sh\n",
+            "mix test\n",
+            "sbt test\n",
+            "bazel test //...\n",
+            "zig build test\n",
+            "dart test\n",
+            "flutter test\n",
+            "cabal test\n",
+            "lua tests/run.lua\n",
+            "Rscript tests/testthat.R\n",
+            "```\n\n",
+            "## Runtime Commands\n",
+            "```sh\n",
+            "lua src/app.lua\n",
+            "Rscript app.R\n",
+            "```\n",
+        );
+        let declared = declared_validation_commands(objective);
+        assert_eq!(declared.tests.commands.len(), 9);
+        assert_eq!(declared.runtime.commands.len(), 2);
+        assert!(!declared.tests.invalid && !declared.tests.overflow);
+        assert!(!declared.runtime.invalid && !declared.runtime.overflow);
+
+        let work = vec!["write_file changed src/opaque.extension".to_string()];
+        let required = BTreeSet::new();
+        for command in &declared.tests.commands {
+            assert!(
+                paging_verification_command_is_relevant(command, &work, &required, objective),
+                "an exact user-declared test command must be first-class evidence: {command}"
+            );
+        }
+        assert!(!paging_verification_command_is_relevant(
+            "mix test --only unrelated",
+            &work,
+            &required,
+            objective,
+        ));
+
+        let mut decisions = Vec::new();
+        for command in &declared.tests.commands {
+            assert!(record_declared_validation_evidence(
+                &mut decisions,
+                &declared.tests,
+                DECLARED_TEST_EVIDENCE_PREFIX,
+                command,
+            ));
+        }
+        for command in &declared.runtime.commands {
+            assert!(record_declared_validation_evidence(
+                &mut decisions,
+                &declared.runtime,
+                DECLARED_RUNTIME_EVIDENCE_PREFIX,
+                command,
+            ));
+        }
+        assert!(execution_verification_requirements_satisfied(
+            objective, &work, &required, &decisions,
+        ));
+    }
+
+    #[test]
+    fn generic_verification_headings_create_exact_manual_obligations() {
+        for heading in [
+            "Verification Commands",
+            "Validation Commands",
+            "Build Commands",
+            "Check Commands",
+        ] {
+            let objective = format!("## {heading}\n```sh\n./custom-verify\n```\n");
+            let declared = declared_validation_commands(&objective);
+            assert_eq!(
+                declared.manual.commands,
+                vec!["./custom-verify".to_string()],
+                "explicit project verifier was ignored under {heading}"
+            );
+            assert!(declared.tests.commands.is_empty());
+            assert!(declared.runtime.commands.is_empty());
+        }
+    }
+
+    #[test]
+    fn runtime_evidence_rejects_syntax_help_and_test_only_invocations() {
+        let required = BTreeSet::new();
+        let node = vec!["write_file changed src/app.js".to_string()];
+        assert!(!paging_runtime_command_is_relevant(
+            "node --check src/app.js",
+            &node,
+            &required,
+        ));
+        assert!(paging_runtime_command_is_relevant(
+            "node src/app.js --help",
+            &node,
+            &required,
+        ));
+        for non_execution in [
+            "node helper.js src/app.js",
+            "node -p src/app.js",
+            "node --print src/app.js",
+        ] {
+            assert!(
+                !paging_runtime_command_is_relevant(non_execution, &node, &required),
+                "a trailing tracked argument or print mode must not certify Node execution: {non_execution}"
+            );
+        }
+        assert!(paging_runtime_command_is_relevant(
+            "node src/app.js helper.js",
+            &node,
+            &required,
+        ));
+
+        let python = vec![
+            "write_file changed app.py".to_string(),
+            "write_file changed tests/test_smoke.py".to_string(),
+        ];
+        assert!(!paging_runtime_command_is_relevant(
+            "python3 tests/test_smoke.py",
+            &python,
+            &required,
+        ));
+        assert!(paging_runtime_command_is_relevant(
+            "python3 app.py --help",
+            &python,
+            &required,
+        ));
+        for non_execution in ["python3 helper.py app.py", "python3 -m helper app.py"] {
+            assert!(
+                !paging_runtime_command_is_relevant(non_execution, &python, &required),
+                "a trailing tracked argument must not certify Python execution: {non_execution}"
+            );
+        }
+        assert!(paging_runtime_command_is_relevant(
+            "python3 app.py helper.py",
+            &python,
+            &required,
+        ));
+
+        let rust = vec![
+            "write_file changed Cargo.toml".to_string(),
+            "write_file changed src/main.rs".to_string(),
+        ];
+        assert!(!paging_runtime_command_is_relevant(
+            "cargo run --help",
+            &rust,
+            &required,
+        ));
+        assert!(paging_runtime_command_is_relevant(
+            "cargo run -- --help",
+            &rust,
+            &required,
+        ));
+        assert!(!objective_has_runtime_execution_requirement(
+            "Do not run the application; only build it."
+        ));
+        assert!(objective_has_runtime_execution_requirement(
+            "Build it, then launch the program."
+        ));
+        assert!(objective_has_runtime_execution_requirement(
+            "Do not run the tests; run the app itself."
+        ));
+        assert!(!objective_has_runtime_execution_requirement(
+            "Do not run the app; only build it."
+        ));
+
+        let authored_tests = vec!["write_file changed tests/test_app.py".to_string()];
+        assert!(!objective_requests_test_execution(
+            "Create the tests, but do not run tests.",
+            &authored_tests,
+            &required,
+        ));
+        assert!(objective_requests_test_execution(
+            "Do not run tests on Windows; run tests on macOS.",
+            &authored_tests,
+            &required,
+        ));
+        for (objective, tests, runtime) in [
+            ("Never run tests, but run the application.", false, true),
+            ("Run tests, but never launch the application.", true, false),
+            ("Skip tests and execute the app.", false, true),
+            ("Do not execute the app; instead run tests.", true, false),
+        ] {
+            assert_eq!(
+                objective_requests_test_execution(objective, &authored_tests, &required),
+                tests,
+                "test intent leaked across an independent clause: {objective}"
+            );
+            assert_eq!(
+                objective_has_runtime_execution_requirement(objective),
+                runtime,
+                "runtime intent leaked across an independent clause: {objective}"
+            );
+        }
+
+        let static_only = [
+            ("rustc src/main.rs", "src/main.rs"),
+            ("gcc app.c -o app", "app.c"),
+            ("go build main.go", "main.go"),
+            ("dotnet build app.csproj", "app.csproj"),
+            ("dart analyze app.dart", "app.dart"),
+            ("flutter build apk", "lib/main.dart"),
+            ("zig build", "build.zig"),
+            ("bazel build //...", "BUILD.bazel"),
+            ("php -l app.php", "app.php"),
+            ("ruby -c app.rb", "app.rb"),
+            ("perl -c app.pl", "app.pl"),
+            ("bash -n script.sh", "script.sh"),
+            ("sh -n script.sh", "script.sh"),
+            ("zsh -n script.sh", "script.sh"),
+            ("luac -p app.lua", "app.lua"),
+        ];
+        for (command, artifact) in static_only {
+            let work = vec![format!("write_file changed {artifact}")];
+            assert_eq!(
+                verification_command_kind(command),
+                Some(VerificationCommandKind::StaticCheck),
+                "build/syntax command must be classified as static verification: {command}"
+            );
+            assert!(
+                !paging_runtime_command_is_relevant(command, &work, &required),
+                "build/syntax command must not certify application execution: {command}"
+            );
+        }
+
+        assert_eq!(
+            verification_command_kind("node --test src/app.js"),
+            Some(VerificationCommandKind::TestExecution)
+        );
+        assert!(!paging_runtime_command_is_relevant(
+            "node --test src/app.js",
+            &node,
+            &required,
+        ));
+
+        for (command, artifact) in [
+            ("go run main.go", "main.go"),
+            ("php app.php", "app.php"),
+            ("ruby app.rb", "app.rb"),
+            ("perl app.pl", "app.pl"),
+            ("bash script.sh", "script.sh"),
+        ] {
+            assert!(
+                paging_runtime_command_is_relevant(
+                    command,
+                    &[format!("write_file changed {artifact}")],
+                    &required,
+                ),
+                "real application execution must remain accepted: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_test_evidence_cannot_certify_unrelated_targets_or_ecosystems() {
+        let mixed_work = vec![
+            "write_file changed src/lib.rs".to_string(),
+            "write_file changed web/app.test.ts".to_string(),
+        ];
+        let mixed_required = BTreeSet::from(["Cargo.toml".to_string(), "package.json".to_string()]);
+        assert!(!paging_verification_command_is_relevant(
+            "cargo test",
+            &mixed_work,
+            &mixed_required,
+            "run all tests",
+        ));
+        assert!(!paging_verification_command_is_relevant(
+            "npm test",
+            &mixed_work,
+            &mixed_required,
+            "run all tests",
+        ));
+
+        let rust = vec!["write_file changed src/lib.rs".to_string()];
+        let cargo = BTreeSet::from(["Cargo.toml".to_string()]);
+        assert!(!paging_verification_command_is_relevant(
+            "cargo test -p unrelated",
+            &rust,
+            &cargo,
+            "run the Rust tests",
+        ));
+        let go = vec!["write_file changed queue/queue_test.go".to_string()];
+        let go_mod = BTreeSet::from(["go.mod".to_string()]);
+        assert!(!paging_verification_command_is_relevant(
+            "go test ./unrelated",
+            &go,
+            &go_mod,
+            "run the Go tests",
+        ));
+        let js = vec!["write_file changed web/app.test.ts".to_string()];
+        let package = BTreeSet::from(["package.json".to_string()]);
+        assert!(!paging_verification_command_is_relevant(
+            "npm test -- unrelated",
+            &js,
+            &package,
+            "run the JavaScript tests",
+        ));
+
+        let exact = "## Test Commands\n```sh\ncargo test -p selected\n```";
+        assert!(paging_verification_command_is_relevant(
+            "cargo test -p selected",
+            &rust,
+            &cargo,
+            exact,
+        ));
+    }
+
+    #[test]
+    fn declared_command_parser_joins_continuations_splits_sequences_and_rejects_prose() {
+        let objective = concat!(
+            "## Manual Validation\n",
+            "Go through every scenario before finishing.\n",
+            "Make sure the output looks correct.\n",
+            "$ cargo test\n",
+            "```powershell\n",
+            "cargo run `\n",
+            "  -- --smoke; cargo run -- --second\n",
+            "```\n",
+            "```console\n",
+            "$ node app.js\n",
+            "server ready\n",
+            "```\n",
+        );
+        assert_eq!(
+            manual_validation_source_commands(objective),
+            vec![
+                "cargo test".to_string(),
+                "cargo run -- --smoke".to_string(),
+                "cargo run -- --second".to_string(),
+                "node app.js".to_string(),
+            ]
+        );
+
+        let many = format!(
+            "## Manual Validation\n```sh\n{}\n```",
+            (0..=MAX_DECLARED_VALIDATION_COMMANDS)
+                .map(|index| format!("./check-{index}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let parsed = declared_validation_commands(&many);
+        assert_eq!(
+            parsed.manual.commands.len(),
+            MAX_DECLARED_VALIDATION_COMMANDS
+        );
+        assert!(parsed.manual.overflow);
+        assert!(!execution_verification_requirements_satisfied(
+            &many,
+            &[],
+            &BTreeSet::new(),
+            &[],
+        ));
+    }
+
+    #[test]
+    fn shell_mutation_provenance_separates_authored_config_from_generated_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let before = workspace_snapshot(directory.path());
+        let no_work = Vec::<String>::new();
+        assert!(shell_changed_path_is_authored_input(
+            "config.json",
+            &before,
+            &no_work,
+            &BTreeSet::from(["config.json".to_string()]),
+        ));
+        assert!(shell_changed_path_is_authored_input(
+            "data/config.json",
+            &before,
+            &no_work,
+            &BTreeSet::from(["data/config.json".to_string()]),
+        ));
+        assert!(!shell_changed_path_is_authored_input(
+            "data/runtime-state.json",
+            &before,
+            &no_work,
+            &BTreeSet::from(["data/runtime-state.json".to_string()]),
+        ));
+        for generated in [
+            "coverage/index.html",
+            "coverage/style.css",
+            "reports/report.xml",
+            "report.txt",
+        ] {
+            assert!(!shell_changed_path_is_authored_input(
+                generated,
+                &before,
+                &no_work,
+                &BTreeSet::new(),
+            ));
+        }
+        assert!(
+            completed_source_paths(&["write_file changed config.json".to_string()])
+                .contains("config.json")
+        );
+        assert!(
+            !completed_source_paths(&["run_shell changed data/state.json".to_string()])
+                .contains("data/state.json")
+        );
     }
 
     #[test]
@@ -10647,6 +13779,49 @@ mod tests {
             .iter()
             .all(|decision| !decision.starts_with(SOURCE_FINGERPRINT_EVIDENCE_PREFIX)));
         super::super::checkpoint::clear_for_workspace(sandbox.root());
+    }
+
+    #[test]
+    fn shell_authored_required_json_is_fingerprinted_and_reopens_after_external_edit() {
+        let _checkpoint_guard = super::super::checkpoint::tests::cp_lock();
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("config.json"),
+            "{\"mode\":\"safe\"}\n",
+        )
+        .unwrap();
+        let objective = "Update config.json and verify it";
+        let mut runtime =
+            ContextPagingRuntime::open(directory.path(), objective, ContextPagingConfig::default())
+                .unwrap();
+        runtime
+            .ledger
+            .completed_work
+            .push("run_shell authored changed config.json".into());
+        runtime.refresh_project().unwrap();
+        assert!(runtime.project.project_map.files.iter().any(|entry| {
+            entry.file == "config.json" && !entry.stale && !entry.source_hash.is_empty()
+        }));
+        runtime.ledger.verification_state.status = "complete".into();
+        assert!(record_source_fingerprint(&mut runtime));
+        runtime.save().unwrap();
+        drop(runtime);
+
+        std::fs::write(
+            directory.path().join("config.json"),
+            "{\"mode\":\"externally-changed\"}\n",
+        )
+        .unwrap();
+        let mut reopened =
+            ContextPagingRuntime::open(directory.path(), objective, ContextPagingConfig::default())
+                .unwrap();
+        assert!(invalidate_stale_source_fingerprint(&mut reopened));
+        assert_eq!(reopened.ledger.verification_state.status, "pending");
+        assert!(reopened
+            .ledger
+            .decisions
+            .iter()
+            .all(|decision| !decision.starts_with(SOURCE_FINGERPRINT_EVIDENCE_PREFIX)));
     }
 
     #[test]
@@ -11586,7 +14761,9 @@ mod tests {
         let annotated =
             shell_outcome_with_workspace_evidence(ToolOutcome::Ok(String::new()), &changes);
         assert!(annotated.text().contains("changed 1000 workspace files"));
-        assert!(annotated.text().contains("sampled 16/1000"));
+        assert!(annotated
+            .text()
+            .contains(&format!("sampled {MAX_CHANGED_PATH_SAMPLES}/1000")));
     }
 
     #[test]
@@ -12738,75 +15915,6 @@ mod tests {
             AgentMsg::ToolResult { name, outcome }
                 if name == "read_file" && outcome.text().contains("print('game')")
         )));
-    }
-
-    #[test]
-    fn tic_tac_toe_contract_audit_catches_the_live_turn_state_failure() {
-        let history = vec![AgentMsg::User(
-            "Code me a one-player tic tac toe game in Python with graphics.".into(),
-        )];
-        let bad_source = concat!(
-            "import tkinter as tk\n",
-            "class Game:\n",
-            "    def __init__(self):\n",
-            "        self.root = tk.Tk()\n",
-            "        self.current_player = \"X\"\n",
-            "        self.button = tk.Button(command=lambda: self.make_move(i, j))\n",
-            "    def make_move(self, idx):\n",
-            "        self.board[idx] = self.current_player\n",
-            "        self.current_player = \"O\"\n",
-            "        self.auto_move()\n",
-            "    def auto_move(self):\n",
-            "        self.board[0] = \"O\"\n",
-            "    def check_draw(self):\n",
-            "        return False\n",
-            "    def finish(self):\n",
-            "        self.root.destroy()\n",
-            "        print(\"O wins\")\n",
-        );
-        let findings =
-            source_contract_findings(&history, &[("tic_tac_toe.py".into(), bad_source.into())]);
-        assert!(findings
-            .iter()
-            .any(|finding| finding.contains("current_player to X")));
-        assert!(findings
-            .iter()
-            .any(|finding| finding.contains("loop-variable lambda")));
-        assert!(findings
-            .iter()
-            .any(|finding| finding.contains("computer win/draw")));
-        assert!(findings
-            .iter()
-            .any(|finding| finding.contains("messagebox or status/result label")));
-        assert!(findings
-            .iter()
-            .any(|finding| finding.contains("both diagonal lines")));
-    }
-
-    #[test]
-    fn tic_tac_toe_contract_audit_accepts_a_settled_gui_turn() {
-        let history = vec![AgentMsg::User(
-            "Code me tic tac toe, one player vs the computer, in Python with graphics.".into(),
-        )];
-        let good_source = concat!(
-            "import tkinter as tk\n",
-            "from tkinter import messagebox\n",
-            "class Game:\n",
-            "    def __init__(self):\n",
-            "        self.current_player = \"X\"\n",
-            "    def make_move(self, idx):\n",
-            "        self.board[idx] = \"X\"\n",
-            "        self.computer_move()\n",
-            "    def computer_move(self):\n",
-            "        self.board[0] = \"O\"\n",
-            "        if self.check_win(\"O\") or self.check_draw():\n",
-            "            messagebox.showinfo(\"Done\", \"Result\")\n",
-            "        self.current_player = \"X\"\n",
-            "    winning_lines = [(0, 4, 8), (2, 4, 6)]\n",
-        );
-        let findings =
-            source_contract_findings(&history, &[("tic_tac_toe.py".into(), good_source.into())]);
-        assert!(findings.is_empty(), "{findings:?}");
     }
 
     #[test]
