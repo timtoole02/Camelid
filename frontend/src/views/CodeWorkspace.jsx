@@ -8,6 +8,10 @@ import {
   getWorkspaceActivity,
   getWorkspaceThread,
   getWorkspaceThreads,
+  contextLimitingFactorLabel,
+  contextWindowModeLabel,
+  formatContextTokens,
+  normalizeContextWindow,
   parsePlanSteps,
   recordedWorkspaceOutcome,
   reduceCodeEvent,
@@ -638,6 +642,7 @@ const CodeInspector = memo(function CodeInspector({
   allowNetwork,
   changes,
   context,
+  contextWindow,
   modelName,
   modelSteps,
   planSteps,
@@ -816,6 +821,15 @@ const CodeInspector = memo(function CodeInspector({
         <Fold label="Session" count={approvalMode === 'full_auto' ? 'Full auto' : 'Gated'}>
           <dl className="ci-kv ci-kv--wide">
             <div><dt>Model</dt><dd>{modelName || 'No model loaded'}</dd></div>
+            {contextWindow ? (
+              <div><dt>Context</dt><dd className="ci-num">{contextWindowModeLabel(contextWindow)} · {formatContextTokens(contextWindow.effectiveTokens)}</dd></div>
+            ) : null}
+            {contextWindow?.modelMaxTokens ? (
+              <div><dt>Model max</dt><dd className="ci-num">{formatContextTokens(contextWindow.modelMaxTokens)}</dd></div>
+            ) : null}
+            {contextWindow?.limitingFactor ? (
+              <div><dt>Limited by</dt><dd>{contextLimitingFactorLabel(contextWindow.limitingFactor)}</dd></div>
+            ) : null}
             <div><dt>Access</dt><dd>{approvalMode === 'full_auto' ? 'Full auto' : 'Approval gated'}</dd></div>
             <div><dt>Web tools</dt><dd>{allowNetwork ? 'On · search and fetch' : 'Off'}</dd></div>
             <div><dt>Tools run</dt><dd>{runTotals.tools} · {runTotals.toolFailures} failed</dd></div>
@@ -943,6 +957,10 @@ export default function CodeWorkspace({
   const stopUnconfirmed = state.phase === 'cancel_error' && !running
   const canStart = Boolean(workspacePath.trim() && goal.trim() && toolCapable && runtimeReady && !running && !session)
   const modelName = hasLoadedModel ? runtime?.active_model_id || selectedModel?.name || 'Loaded model' : ''
+  const contextWindow = useMemo(
+    () => normalizeContextWindow(session?.context_window, state.context?.budgetTotal),
+    [session?.context_window, state.context?.budgetTotal],
+  )
   const composerValue = session ? followUp : goal
   const canSubmit = session
     ? Boolean(followUp.trim() && !running)
@@ -1718,6 +1736,14 @@ export default function CodeWorkspace({
                   ) : null}
                 </div>
                 <span title={modelName}><IconBolt size={14} /> {modelName || 'No model'}</span>
+                {contextWindow ? (
+                  <span
+                    className="code-context-chip"
+                    title={`${contextWindowModeLabel(contextWindow)} context: ${contextWindow.effectiveTokens.toLocaleString()} tokens${contextWindow.modelMaxTokens ? ` · model max ${contextWindow.modelMaxTokens.toLocaleString()}` : ''}${contextWindow.limitingFactor ? ` · limited by ${contextLimitingFactorLabel(contextWindow.limitingFactor)}` : ''}`}
+                  >
+                    {contextWindowModeLabel(contextWindow)} · {formatContextTokens(contextWindow.effectiveTokens)}
+                  </span>
+                ) : null}
               </div>
               {running ? (
                 <button type="button" className="code-composer__send is-stop" aria-label="Stop coding task" onClick={stop} disabled={stopPending}><IconStop size={17} /></button>
@@ -1751,6 +1777,7 @@ export default function CodeWorkspace({
           allowNetwork={session?.allow_network ?? allowNetwork}
           changes={changes}
           context={state.context}
+          contextWindow={contextWindow}
           modelName={modelName}
           modelSteps={state.modelSteps}
           planSteps={state.planSteps}

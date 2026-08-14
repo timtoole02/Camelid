@@ -46,7 +46,9 @@ const WEB_CODE_SHELL_TIMEOUT: Duration = Duration::from_secs(120);
 const WORKSPACE_MODEL_STEP_TIMEOUT: Duration = Duration::from_secs(90);
 const APPROVAL_POLL: Duration = Duration::from_millis(25);
 const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+#[cfg(test)]
 pub(crate) const WORKSPACE_CONTEXT_BUDGET_TOKENS: u32 = 4_096;
+#[cfg(test)]
 pub(crate) const CODE_CONTEXT_BUDGET_TOKENS: u32 = super::agent::AGENT_VALIDATED_CTX;
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -90,6 +92,7 @@ impl WorkspaceRunMode {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn context_budget_tokens(self) -> u32 {
         match self {
             Self::ReadOnly => WORKSPACE_CONTEXT_BUDGET_TOKENS,
@@ -374,6 +377,10 @@ pub(crate) struct WorkspaceRunConfig {
     pub family: String,
     pub max_steps: usize,
     pub max_tokens: u32,
+    /// Total prompt + generation envelope selected for this turn from the
+    /// active model and live machine memory. This is resolved by the API at a
+    /// user-turn boundary and then frozen for the complete agent loop.
+    pub context_budget_tokens: u32,
     pub temperature: f32,
     pub mode: WorkspaceRunMode,
     pub approval_mode: WorkspaceApprovalMode,
@@ -806,6 +813,7 @@ pub(crate) fn run_live(
             config.model_id.clone(),
             config.family.clone(),
             config.max_tokens,
+            config.context_budget_tokens,
             config.approval_mode.is_full_auto(),
             config.allow_network,
             shell_sandbox,
@@ -863,7 +871,7 @@ pub(crate) fn run_live(
         config.max_tokens,
         config.temperature,
     );
-    driver.set_context_budget(Some(config.mode.context_budget_tokens()));
+    driver.set_context_budget(Some(config.context_budget_tokens));
     driver.set_native_tool_history(true);
     // Code drops the wall-clock model-step deadline (a coding turn can sit in a
     // long prefill, and Stop stays authoritative), but the read-only lane keeps
@@ -999,6 +1007,7 @@ mod tests {
             "model".into(),
             "llama".into(),
             2048,
+            32_768,
             true,
             true,
             WorkspaceRunMode::Code.shell_sandbox(),
@@ -1009,6 +1018,7 @@ mod tests {
         );
         assert!(config.allow_net, "the parent's network switch must carry");
         assert!(config.yolo, "confirmed full auto must carry to the child");
+        assert_eq!(config.context_budget_tokens, 32_768);
         assert_eq!(
             config.shell_mode,
             ShellSandbox::Sandboxed,
@@ -1136,6 +1146,117 @@ mod tests {
         }
     }
 
+    /// Regression for the live Windows request "create 1000 text files in the
+    /// working directory". `Path.GetTempFileName()` looks plausible to a small
+    /// model but creates an absolute file under `%TEMP%`; the command succeeds
+    /// while `list_dir .` correctly observes no workspace progress. Exercise
+    /// the actual Web Code tool boundary with relative random names so routing
+    /// back to cmd.exe, dropping the cwd pin, or truncating the loop all fail
+    /// here without requiring a live model.
+    #[cfg(windows)]
+    #[test]
+    fn code_powershell_bulk_creation_stays_in_the_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::new(root.path(), false, Duration::from_secs(60)).unwrap();
+
+        let refused = crate::chat::tools::validate_for(
+            ToolProfile::WebCode,
+            &call(
+                "run_shell",
+                json!({"command": "1..1000 | ForEach-Object { $filename = [System.IO.Path]::GetTempFileName(); [System.IO.File]::WriteAllText($filename, 'outside') }"}),
+            ),
+            &sandbox,
+        )
+        .expect_err("the system-temp form must be refused before it can escape the workspace");
+        assert!(
+            refused.contains("GetTempFileName") && refused.contains("outside"),
+            "the correction must explain why the successful-looking command made no progress: {refused}"
+        );
+        assert_eq!(
+            std::fs::read_dir(root.path()).unwrap().count(),
+            0,
+            "refusing the escaping form must happen before any requested file is created"
+        );
+
+        let command = concat!(
+            "$created = [System.Collections.Generic.List[string]]::new(); ",
+            "$utf8 = [System.Text.UTF8Encoding]::new($false); ",
+            "1..1000 | ForEach-Object { ",
+            "$name = [System.Guid]::NewGuid().ToString('N') + '.txt'; ",
+            "$path = Join-Path (Get-Location) $name; ",
+            "$content = [System.Guid]::NewGuid().ToString('N'); ",
+            "[System.IO.File]::WriteAllText($path, $content, $utf8); ",
+            "$created.Add($path) | Out-Null ",
+            "}; ",
+            "if ($created.Count -ne 1000) { throw 'bulk creation count mismatch' }; ",
+            "Write-Output ('created=' + $created.Count)"
+        );
+        let action = crate::chat::tools::validate_for(
+            ToolProfile::WebCode,
+            &call("run_shell", json!({"command": command})),
+            &sandbox,
+        )
+        .expect("Web Code must accept its advertised PowerShell bulk-work shape");
+
+        match &action {
+            Action::RunPowerShell {
+                workdir,
+                command: routed,
+                ..
+            } => {
+                assert_eq!(workdir, sandbox.root(), "PowerShell must be cwd-pinned");
+                assert_eq!(routed, command, "the script must be passed verbatim");
+            }
+            other => panic!("Web Code routed PowerShell to the wrong action: {other:?}"),
+        }
+
+        let outcome = action.execute(&sandbox);
+        assert!(
+            !outcome.is_err(),
+            "the 1000-file PowerShell loop must complete: {}",
+            outcome.text()
+        );
+        assert!(
+            outcome.text().contains("created=1000"),
+            "PowerShell must verify the full batch in the same command: {}",
+            outcome.text()
+        );
+
+        let entries = std::fs::read_dir(root.path())
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(entries.len(), 1000, "every requested file must be created");
+        let mut contents = std::collections::HashSet::with_capacity(entries.len());
+        for entry in entries {
+            let path = entry.path();
+            assert!(
+                path.is_file(),
+                "bulk output must contain files only: {path:?}"
+            );
+            assert_eq!(
+                path.extension().and_then(std::ffi::OsStr::to_str),
+                Some("txt"),
+                "every output needs the requested text-file extension: {path:?}"
+            );
+            let stem = path.file_stem().and_then(std::ffi::OsStr::to_str).unwrap();
+            assert!(
+                stem.len() == 32 && stem.chars().all(|character| character.is_ascii_hexdigit()),
+                "every filename should be a random GUID: {path:?}"
+            );
+            let content = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(
+                content.len(),
+                32,
+                "GUID content should be complete: {path:?}"
+            );
+            assert!(
+                contents.insert(content),
+                "each generated file should have independent random content"
+            );
+        }
+    }
+
     #[test]
     fn full_auto_workspace_policy_promotes_exec_and_network_actions() {
         let policy = crate::chat::agent::resolve_policy(false, true, false).unwrap();
@@ -1163,7 +1284,7 @@ mod tests {
     }
 
     #[test]
-    fn code_uses_the_validated_agent_budget_without_widening_read_only_workspace() {
+    fn legacy_test_budget_distinguishes_code_from_read_only_workspace() {
         assert_eq!(
             WorkspaceRunMode::ReadOnly.context_budget_tokens(),
             WORKSPACE_CONTEXT_BUDGET_TOKENS

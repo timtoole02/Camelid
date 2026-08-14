@@ -2,7 +2,7 @@
 
 ## Objective
 
-Build an opt-in, bounded-context Web Code runtime that constructs one fresh
+Build a bounded-context Web Code runtime that constructs one fresh
 context capsule per action while keeping canonical task/project/tool state
 outside the model.
 
@@ -15,7 +15,7 @@ outside the model.
 - Preserve all existing sandbox, approval, checkpoint, and audit boundaries.
 - Use JSON typed actions; first executable actions are `NEED_CONTEXT` and
   hash-checked full-page `PATCH`.
-- Keep rollout behind `CAMELID_CONTEXT_PAGING=1`.
+- Keep a fail-safe rollback behind `CAMELID_CONTEXT_PAGING=0`.
 
 ## Completed work
 
@@ -26,8 +26,8 @@ outside the model.
   schemas, plus exact tokenizer enforcement at the live inference boundary.
 - Added typed actions, repeated page-fault pinning, hash-checked PATCH-to-edit
   translation, phase tool enforcement, and compact diagnostic inspection.
-- Integrated a fresh-capsule-per-action Web Code loop behind
-  `CAMELID_CONTEXT_PAGING=1`; the old loop is unchanged when disabled.
+- Integrated a fresh-capsule-per-action Web Code loop as the default; the old
+  loop is unchanged when explicitly disabled with `CAMELID_CONTEXT_PAGING=0`.
 - Added the deterministic benchmark report and an end-to-end three-request
   test proving an oversized transcript is not replayed.
 - Preserved narrow Qwen malformed-`write_file` parser regressions developed
@@ -65,8 +65,8 @@ push.
 ## Remaining work
 
 - Merge codex/web-code-revival with origin/main and push.
-- Review the opt-in rollout evidence and decide when
-  `CAMELID_CONTEXT_PAGING=1` should become the default Web Code path.
+- Continue expanding live-model paging evidence while retaining the explicit
+  rollback switch and the Qwen 4B-safe default 8K active working envelope.
 
 ## Failed approaches
 

@@ -6,7 +6,11 @@
 //! artifact references, or budget accounting.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -39,6 +43,13 @@ const RUNTIME_STATE_PREFIX: &str = "runtime-state-";
 const DEFAULT_MAX_INPUT_TOKENS: u32 = 5_500;
 const DEFAULT_OUTPUT_RESERVE: u32 = 1_300;
 const DEFAULT_SAFETY_RESERVE: u32 = 1_200;
+const CONTEXT_PAGING_ENV: &str = "CAMELID_CONTEXT_PAGING";
+/// Internal worker identity installed by the subagent launcher. Parent sessions
+/// deliberately leave this unset so their objective-derived ledger ids remain
+/// backward compatible and resume across sessions.
+pub(crate) const TASK_SCOPE_ENV: &str = "CAMELID_CONTEXT_PAGING_TASK_SCOPE";
+const MAX_INPUT_TOKENS_ENV: &str = "CAMELID_CONTEXT_MAX_INPUT_TOKENS";
+const MIN_MAX_INPUT_TOKENS: u32 = 256;
 const DEFAULT_TOOL_RESULT_BYTES: usize = 2 * 1024;
 const DEFAULT_TOOL_RESULT_LINES: usize = 32;
 const MAX_INDEX_FILES: usize = 256;
@@ -79,18 +90,25 @@ pub(crate) struct ContextPagingConfig {
     pub tool_result_bytes: usize,
     pub tool_result_lines: usize,
     pub debug: bool,
+    /// Stable worker scope used only to namespace canonical task/runtime state.
+    /// The shared project index remains workspace-wide derived data.
+    pub task_scope: Option<String>,
 }
 
 impl Default for ContextPagingConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            // Web Code is a long-running agent surface. Host-owned task state,
+            // exact source pages, and bounded capsules are its normal memory
+            // model now; CAMELID_CONTEXT_PAGING=0 remains the rollback switch.
+            enabled: true,
             max_input_tokens: DEFAULT_MAX_INPUT_TOKENS,
             output_reserve: DEFAULT_OUTPUT_RESERVE,
             safety_reserve: DEFAULT_SAFETY_RESERVE,
             tool_result_bytes: DEFAULT_TOOL_RESULT_BYTES,
             tool_result_lines: DEFAULT_TOOL_RESULT_LINES,
             debug: false,
+            task_scope: None,
         }
     }
 }
@@ -98,12 +116,12 @@ impl Default for ContextPagingConfig {
 impl ContextPagingConfig {
     pub(crate) fn from_env() -> Self {
         Self {
-            enabled: env_flag("CAMELID_CONTEXT_PAGING"),
+            enabled: env_flag_with_default(CONTEXT_PAGING_ENV, true),
             debug: env_flag("CAMELID_CONTEXT_DEBUG"),
             max_input_tokens: env_u32(
-                "CAMELID_CONTEXT_MAX_INPUT_TOKENS",
+                MAX_INPUT_TOKENS_ENV,
                 DEFAULT_MAX_INPUT_TOKENS,
-                256,
+                MIN_MAX_INPUT_TOKENS,
             ),
             output_reserve: env_u32("CAMELID_CONTEXT_OUTPUT_RESERVE", DEFAULT_OUTPUT_RESERVE, 64),
             safety_reserve: env_u32("CAMELID_CONTEXT_SAFETY_RESERVE", DEFAULT_SAFETY_RESERVE, 64),
@@ -117,7 +135,24 @@ impl ContextPagingConfig {
                 DEFAULT_TOOL_RESULT_LINES,
                 4,
             ),
+            task_scope: std::env::var(TASK_SCOPE_ENV)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
         }
+    }
+
+    /// Fit the capsule input allowance to the context budget the active model
+    /// driver will actually enforce. The default 5.5K working set stays inside
+    /// the checked Qwen 4B 8K lane and deliberately does not expand because the logical
+    /// context is larger: long dense prefills have quadratic attention cost. An
+    /// operator can explicitly raise `CAMELID_CONTEXT_MAX_INPUT_TOKENS`; that
+    /// value remains a ceiling and is still clamped to real available input room.
+    pub(crate) fn apply_model_budget(&mut self, model_budget: u32) {
+        let available_input = model_budget
+            .saturating_sub(self.output_reserve)
+            .saturating_sub(self.safety_reserve);
+        self.max_input_tokens = self.max_input_tokens.min(available_input);
     }
 }
 
@@ -127,12 +162,32 @@ fn env_flag(name: &str) -> bool {
         .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
 }
 
+fn env_flag_with_default(name: &str, fallback: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .as_deref()
+        .and_then(parse_env_flag)
+        .unwrap_or(fallback)
+}
+
+fn parse_env_flag(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" | "enabled" => Some(true),
+        "0" | "false" | "no" | "off" | "disabled" => Some(false),
+        _ => None,
+    }
+}
+
 fn env_u32(name: &str, fallback: u32, minimum: u32) -> u32 {
     std::env::var(name)
         .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|value| *value >= minimum)
+        .as_deref()
+        .and_then(|value| parse_u32_at_least(value, minimum))
         .unwrap_or(fallback)
+}
+
+fn parse_u32_at_least(value: &str, minimum: u32) -> Option<u32> {
+    value.parse::<u32>().ok().filter(|value| *value >= minimum)
 }
 
 fn env_usize(name: &str, fallback: usize, minimum: usize) -> usize {
@@ -143,12 +198,118 @@ fn env_usize(name: &str, fallback: usize, minimum: usize) -> usize {
         .unwrap_or(fallback)
 }
 
-/// Persist via a same-directory temp file and rename so a crash mid-write can
-/// never leave a half-written ledger, index, or runtime-state file behind.
+static ATOMIC_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn atomic_temp_path(path: &Path, process_id: u32, nonce: u64) -> std::io::Result<PathBuf> {
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "atomic persistence target has no filename: {}",
+                path.display()
+            ),
+        )
+    })?;
+    let mut temp_name = OsString::from(".");
+    temp_name.push(file_name);
+    temp_name.push(format!(".{process_id}.{nonce}.tmp"));
+    Ok(path.with_file_name(temp_name))
+}
+
+fn create_unique_atomic_temp(path: &Path) -> std::io::Result<(PathBuf, File)> {
+    // PID separates processes; the monotonic counter separates every writer in
+    // this process. `create_new` also makes stale PID-reuse leftovers harmless.
+    for _ in 0..64 {
+        let nonce = ATOMIC_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp = atomic_temp_path(path, std::process::id(), nonce)?;
+        match OpenOptions::new().write(true).create_new(true).open(&temp) {
+            Ok(file) => return Ok((temp, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "could not allocate a unique atomic persistence file beside {}",
+            path.display()
+        ),
+    ))
+}
+
+#[cfg(not(windows))]
+fn replace_file_atomically(temp: &Path, path: &Path) -> std::io::Result<()> {
+    // POSIX rename replaces an existing regular file atomically. Concurrent
+    // writers therefore publish one complete JSON document or another.
+    std::fs::rename(temp, path)
+}
+
+#[cfg(windows)]
+fn replace_file_atomically(temp: &Path, path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    let path_wide = wide(path);
+    let temp_wide = wide(temp);
+    let mut last_error = None;
+    for attempt in 0..8_u32 {
+        // SAFETY: both buffers are live NUL-terminated UTF-16 paths. The source
+        // is a closed same-directory file. MoveFileExW handles both the initial
+        // publication and replacement without an exists/check race.
+        let moved = unsafe {
+            MoveFileExW(
+                temp_wide.as_ptr(),
+                path_wide.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if moved != 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        // Antivirus, indexers, and another MoveFileExW can briefly hold a name
+        // on Windows. These codes are transient sharing/access/name collisions;
+        // malformed paths and real I/O failures still fail immediately.
+        let transient = matches!(
+            error.raw_os_error(),
+            Some(5 | 32 | 33 | 80 | 183 | 1175 | 1176 | 1177)
+        );
+        if !transient {
+            return Err(error);
+        }
+        last_error = Some(error);
+        std::thread::sleep(std::time::Duration::from_millis(1_u64 << attempt));
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::other(format!("could not atomically replace {}", path.display()))
+    }))
+}
+
+/// Persist via a unique same-directory temp and atomic replacement. Unique
+/// names prevent parent/child writers from truncating or renaming each other's
+/// staging file; atomic replacement leaves readers with one coherent version.
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let temp = path.with_extension("tmp");
-    std::fs::write(&temp, bytes)?;
-    std::fs::rename(&temp, path)
+    let (temp, mut file) = create_unique_atomic_temp(path)?;
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.flush()) {
+        drop(file);
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    drop(file);
+    let result = replace_file_atomically(&temp, path);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -426,7 +587,22 @@ impl TaskLedgerStore {
     }
 
     pub(crate) fn stable_task_id(objective: &str) -> String {
-        format!("task-{}", &sha256_text(objective)[..20])
+        Self::scoped_task_id(objective, None)
+    }
+
+    fn scoped_task_id(objective: &str, task_scope: Option<&str>) -> String {
+        let objective_hash = sha256_text(objective);
+        match task_scope.map(str::trim).filter(|scope| !scope.is_empty()) {
+            // Hash rather than interpolate the worker id: the namespace remains
+            // filename-safe and bounded even if a hand-launched worker supplies
+            // an unexpected value. Parent sessions keep the historical id above.
+            Some(scope) => format!(
+                "task-{}-{}",
+                &objective_hash[..20],
+                &sha256_text(scope)[..16]
+            ),
+            None => format!("task-{}", &objective_hash[..20]),
+        }
     }
 
     fn path(&self, task_id: &str) -> Result<PathBuf, ContextPagingError> {
@@ -2455,7 +2631,10 @@ impl ContextPagingRuntime {
         objective: &str,
         config: ContextPagingConfig,
     ) -> Result<Self, ContextPagingError> {
-        let task_id = TaskLedgerStore::stable_task_id(objective);
+        let task_id = match config.task_scope.as_deref() {
+            Some(scope) => TaskLedgerStore::scoped_task_id(objective, Some(scope)),
+            None => TaskLedgerStore::stable_task_id(objective),
+        };
         let ledger_store = TaskLedgerStore::for_workspace(root);
         let ledger = ledger_store.load_or_create(&task_id, objective)?;
         let mut project = StructuralProjectMemory::load_or_new(root)?;
@@ -3093,6 +3272,177 @@ mod tests {
     use super::super::tools::{self, ToolProfile};
     use super::*;
 
+    #[test]
+    fn atomic_temp_names_are_same_directory_and_cross_process_unique() {
+        let target = PathBuf::from("workspace").join("project-index.json");
+        let first = atomic_temp_path(&target, 101, 7).unwrap();
+        let other_process = atomic_temp_path(&target, 202, 7).unwrap();
+        let other_write = atomic_temp_path(&target, 101, 8).unwrap();
+        assert_eq!(first.parent(), target.parent());
+        assert_ne!(first, other_process);
+        assert_ne!(first, other_write);
+        assert!(first
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(".project-index.json."));
+    }
+
+    #[test]
+    fn concurrent_atomic_writers_publish_complete_json_without_temp_collisions() {
+        const WRITERS: usize = 8;
+        const ROUNDS: usize = 12;
+        let directory = tempfile::tempdir().unwrap();
+        let target = std::sync::Arc::new(directory.path().join("project-index.json"));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITERS));
+        let handles = (0..WRITERS)
+            .map(|writer| {
+                let target = std::sync::Arc::clone(&target);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || -> std::io::Result<()> {
+                    barrier.wait();
+                    for round in 0..ROUNDS {
+                        let payload = serde_json::to_vec(&serde_json::json!({
+                            "writer": writer,
+                            "round": round,
+                            "body": format!("writer-{writer}-round-{round}").repeat(32),
+                        }))
+                        .unwrap();
+                        write_atomic(&target, &payload)?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle
+                .join()
+                .expect("atomic writer thread panicked")
+                .unwrap();
+        }
+
+        let final_value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(target.as_ref()).unwrap()).unwrap();
+        assert!(final_value["writer"].as_u64().unwrap() < WRITERS as u64);
+        assert!(final_value["round"].as_u64().unwrap() < ROUNDS as u64);
+        let leftovers = std::fs::read_dir(directory.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.starts_with(".project-index.json.") && name.ends_with(".tmp")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "successful writers must clean their unique temps: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn subagent_task_scopes_isolate_identical_objectives_and_parent_ids_stay_stable() {
+        let objective = "Inspect the same subsystem";
+        let historical_parent = format!("task-{}", &sha256_text(objective)[..20]);
+        assert_eq!(
+            TaskLedgerStore::stable_task_id(objective),
+            historical_parent
+        );
+
+        let child_a = TaskLedgerStore::scoped_task_id(objective, Some("runtime-a"));
+        let child_a_again = TaskLedgerStore::scoped_task_id(objective, Some("runtime-a"));
+        let child_b = TaskLedgerStore::scoped_task_id(objective, Some("runtime-b"));
+        assert_eq!(child_a, child_a_again);
+        assert_ne!(child_a, child_b);
+        assert_ne!(child_a, historical_parent);
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = TaskLedgerStore {
+            directory: directory.path().to_path_buf(),
+        };
+        let mut a = store.load_or_create(&child_a, objective).unwrap();
+        a.decisions.push("child a decision".into());
+        store.save(&child_a, &a).unwrap();
+        let mut b = store.load_or_create(&child_b, objective).unwrap();
+        b.decisions.push("child b decision".into());
+        store.save(&child_b, &b).unwrap();
+        assert_eq!(
+            store.load_or_create(&child_a, objective).unwrap().decisions,
+            ["child a decision"]
+        );
+        assert_eq!(
+            store.load_or_create(&child_b, objective).unwrap().decisions,
+            ["child b decision"]
+        );
+    }
+
+    #[test]
+    fn context_paging_is_default_on_with_an_explicit_rollback_value() {
+        assert!(ContextPagingConfig::default().enabled);
+        for value in ["0", "false", "no", "off", "disabled"] {
+            assert_eq!(parse_env_flag(value), Some(false), "{value}");
+        }
+        for value in ["1", "true", "yes", "on", "enabled"] {
+            assert_eq!(parse_env_flag(value), Some(true), "{value}");
+        }
+        assert_eq!(parse_env_flag("not-a-boolean"), None);
+    }
+
+    #[test]
+    fn qwen4b_native_context_keeps_the_checked_default_paged_working_set() {
+        let mut config = ContextPagingConfig::default();
+        config.apply_model_budget(40_960);
+        assert_eq!(config.max_input_tokens, DEFAULT_MAX_INPUT_TOKENS);
+        assert_eq!(
+            config.max_input_tokens + config.output_reserve + config.safety_reserve,
+            8_000
+        );
+    }
+
+    #[test]
+    fn larger_capsule_input_is_explicit_opt_in_and_clamped_to_available_room() {
+        let mut opted_in = ContextPagingConfig {
+            max_input_tokens: 12_288,
+            ..ContextPagingConfig::default()
+        };
+        opted_in.apply_model_budget(40_960);
+        assert_eq!(opted_in.max_input_tokens, 12_288);
+
+        let mut too_large = ContextPagingConfig {
+            max_input_tokens: 40_000,
+            ..ContextPagingConfig::default()
+        };
+        too_large.apply_model_budget(32_768);
+        assert_eq!(
+            too_large.max_input_tokens,
+            32_768 - DEFAULT_OUTPUT_RESERVE - DEFAULT_SAFETY_RESERVE
+        );
+    }
+
+    #[test]
+    fn adaptive_model_budget_saturates_when_the_effective_budget_is_tiny() {
+        let mut config = ContextPagingConfig::default();
+        config.apply_model_budget(1_000);
+        assert_eq!(config.max_input_tokens, 0);
+    }
+
+    #[test]
+    fn adaptive_model_budget_ignores_invalid_environment_ceilings() {
+        for invalid in ["", "invalid", "0", "255", "-1"] {
+            assert_eq!(
+                parse_u32_at_least(invalid, MIN_MAX_INPUT_TOKENS),
+                None,
+                "{invalid:?} is not a valid override"
+            );
+            let mut config = ContextPagingConfig::default();
+            config.apply_model_budget(32_768);
+            assert_eq!(
+                config.max_input_tokens, DEFAULT_MAX_INPUT_TOKENS,
+                "{invalid:?} must retain the checked default working set"
+            );
+        }
+        assert_eq!(parse_u32_at_least("256", MIN_MAX_INPUT_TOKENS), Some(256));
+    }
+
     fn fixture() -> (tempfile::TempDir, StructuralProjectMemory, String) {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -3171,7 +3521,7 @@ mod tests {
         // invariant, so schema growth fails there (where the message is clear)
         // instead of surfacing here as an unrelated MandatoryBudget error.
         let config = ContextPagingConfig {
-            max_input_tokens: 1_500,
+            max_input_tokens: 2_300,
             ..ContextPagingConfig::default()
         };
         let mandatory = BTreeSet::from([symbol.clone()]);
@@ -3603,7 +3953,19 @@ mod tests {
             build("Patch increment", ActionPhase::Modify),
             build("Verify the patched symbol", ActionPhase::Verify),
         ];
-        let system_prompt = "You are a coding agent. Tools: read_file, write_file, edit_file, run_shell, search, list_dir.".repeat(8);
+        // Include the real tool descriptions and parameter schemas on the
+        // legacy side too. Both lanes pay for them on every request; comparing
+        // full paged capsules to a legacy prompt that merely *names* its tools
+        // stopped being honest as the Windows PowerShell contract grew.
+        let system_prompt = tools()
+            .into_iter()
+            .map(|tool| {
+                format!(
+                    "tool {}: {}\nparameters: {}\n",
+                    tool.name, tool.description, tool.params
+                )
+            })
+            .collect::<String>();
         let tool_log = format!(
             "$ cargo test\n{}\nerror: assertion failed",
             "noise\n".repeat(400)
@@ -3870,7 +4232,7 @@ mod tests {
             .all(|item| item.len() <= MAX_LEDGER_ITEM_CHARS + 4));
         let mandatory = BTreeSet::from([symbol.clone()]);
         let config = ContextPagingConfig {
-            max_input_tokens: 1_400,
+            max_input_tokens: 2_300,
             ..ContextPagingConfig::default()
         };
         let capsule = ContextCapsuleBuilder::new(config, ConservativeTokenEstimator)

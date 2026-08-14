@@ -693,8 +693,28 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
             concat!(
                 "Run Windows PowerShell 5.1 in the workspace, passed verbatim over stdin — ",
                 "not cmd.exe or bash. Use PowerShell directly (`ForEach-Object`, `Set-Content`); ",
-                "never add a `powershell -Command` wrapper or cmd `%i` syntax. Use it for ",
-                "builds, tests, git, installs, and bulk work; use file tools for source."
+                "never add a `powershell -Command` wrapper or cmd `%i` syntax. This is 5.1: ",
+                "PowerShell 7-only `&&`, `||`, `??`, ternary `? :`, and `ForEach-Object ",
+                "-Parallel` do not work; use `;`, `if`, and sequential loops. After each native ",
+                "executable, immediately test `$LASTEXITCODE` and exit on nonzero because a ",
+                "later native success overwrites it. Scripts arrive via stdin, so ",
+                "`$PSScriptRoot` is empty; use `(Get-Location)`. `curl`/`wget` are aliases (use ",
+                "`curl.exe` for native flags), and do not use async `Start-Process` for work that ",
+                "must finish. Every requested ",
+                "output must use a workspace-relative path (for example, start with `Join-Path ",
+                "(Get-Location) …`). Never use `GetTempFileName`, `New-TemporaryFile`, ",
+                "`GetTempPath`, or `$env:TEMP` ",
+                "for requested files: those target the system temp directory, not this working ",
+                "directory. Use `-LiteralPath` for generated names. Prefer `Set-Content` for ",
+                "writes so handles close; do not use `File.CreateText` unless a `finally` block ",
+                "calls `Dispose`. In 5.1, `>`/`Out-File` use UTF-16LE and `Set-Content ",
+                "-Encoding UTF8` adds a BOM. For BOM-less bulk text, create one ",
+                "`$utf8 = [Text.UTF8Encoding]::new($false)` and call synchronous ",
+                "`[IO.File]::WriteAllText($path,$text,$utf8)`; use file tools for source. For ",
+                "bulk writes, ",
+                "track the created paths and verify/count them in the same command; `list_dir` ",
+                "is paginated and is not a count of more than 200 files. Use it for builds, tests, ",
+                "git, installs, and bulk work; use file tools for source."
             )
             .to_string()
         } else {
@@ -817,9 +837,31 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
                               statement — the script is passed VERBATIM (no shell quoting layer, \
                               no cmd `%%` vs `%` rule), so normal PowerShell works as written: \
                               loop with `1..N | ForEach-Object { … }`, write with \
-                              `Set-Content -Path … -Value …`, read with `Get-ChildItem`. Supply \
-                              the real filenames and content your task calls for — never copy \
-                              placeholder text out of this description. Exec tier — always \
+                              `Set-Content -LiteralPath … -Value …`, read with `Get-ChildItem`. \
+                              This is 5.1: PowerShell 7-only `&&`, `||`, `??`, ternary `? :`, and \
+                              `ForEach-Object -Parallel` do not work; use `;`, `if`, and sequential \
+                              loops. After each native executable, immediately test \
+                              `$LASTEXITCODE` and exit on nonzero because a later native success \
+                              overwrites it. Scripts arrive via stdin, so `$PSScriptRoot` is empty; \
+                              use `(Get-Location)`. `curl`/`wget` are aliases (use `curl.exe` for \
+                              native flags), and do not use async `Start-Process` for work that \
+                              must finish. Every \
+                              requested output must use a workspace-relative path (for example, \
+                              start with `Join-Path (Get-Location) …`). Never use \
+                              `GetTempFileName`, `New-TemporaryFile`, `GetTempPath`, or \
+                              `$env:TEMP` for requested \
+                              files: those target the system temp directory, not the working \
+                              directory. Use `-LiteralPath` for generated names. Prefer \
+                              `Set-Content` so handles close; do not use `File.CreateText` unless \
+                              a `finally` block calls `Dispose`. In 5.1, `>`/`Out-File` use \
+                              UTF-16LE and `Set-Content -Encoding UTF8` adds a BOM. For BOM-less \
+                              bulk text, create one `$utf8 = [Text.UTF8Encoding]::new($false)` \
+                              and call synchronous `[IO.File]::WriteAllText($path,$text,$utf8)`; \
+                              use file tools for source. For bulk writes, \
+                              track the created paths and verify/count them in the same command; \
+                              `list_dir` is paginated and is not a count of more than 200 files. \
+                              Supply the real filenames and content your task calls for — never \
+                              copy placeholder text out of this description. Exec tier — always \
                               gated by the approval policy."
                     .into(),
                 risk: Risk::Exec,
@@ -1578,6 +1620,321 @@ fn powershell_script_from_wrapper(command: &str) -> Option<String> {
     (!script.trim().is_empty()).then_some(script)
 }
 
+/// Return only PowerShell text that executes, with inert string/comment bytes
+/// replaced by spaces. Expandable-string `$()` subexpressions remain executable
+/// and are scanned recursively; quoted documentation therefore stays inert
+/// without letting `"$([IO.Path]::GetTempFileName())"` evade a caller.
+///
+/// This is a deliberately small lexer, not a PowerShell parser. It covers the
+/// normal single/double strings, single/double here-strings, line comments,
+/// nested block comments, backtick escapes, and nested interpolation needed by
+/// the shell safety/progress classifiers. It does not resolve dynamically built
+/// command names or code later passed to `Invoke-Expression`.
+#[cfg(windows)]
+pub(crate) fn powershell_executable_projection(command: &str) -> String {
+    #[derive(Clone, Copy)]
+    enum Frame {
+        Code { interpolation_depth: usize },
+        SingleString,
+        DoubleString,
+        SingleHereString,
+        DoubleHereString,
+        LineComment,
+        BlockComment { depth: usize },
+    }
+
+    fn masked(output: &mut String, character: char) {
+        output.push(if matches!(character, '\r' | '\n') {
+            character
+        } else {
+            ' '
+        });
+    }
+
+    let input: Vec<char> = command.chars().collect();
+    let mut output = String::with_capacity(command.len());
+    let mut frames = vec![Frame::Code {
+        interpolation_depth: 0,
+    }];
+    let mut index = 0;
+    while index < input.len() {
+        let frame = *frames.last().expect("the root code frame never pops");
+        let current = input[index];
+        let next = input.get(index + 1).copied();
+        match frame {
+            Frame::Code {
+                interpolation_depth,
+            } => {
+                if current == '<' && next == Some('#') {
+                    masked(&mut output, current);
+                    masked(&mut output, '#');
+                    frames.push(Frame::BlockComment { depth: 1 });
+                    index += 2;
+                } else if current == '#' {
+                    masked(&mut output, current);
+                    frames.push(Frame::LineComment);
+                    index += 1;
+                } else if current == '@'
+                    && matches!(next, Some('\'') | Some('"'))
+                    && input[index + 2..]
+                        .iter()
+                        .take_while(|character| !matches!(character, '\r' | '\n'))
+                        .all(|character| character.is_whitespace())
+                {
+                    masked(&mut output, current);
+                    masked(&mut output, next.unwrap());
+                    frames.push(if next == Some('\'') {
+                        Frame::SingleHereString
+                    } else {
+                        Frame::DoubleHereString
+                    });
+                    index += 2;
+                } else if current == '\'' {
+                    masked(&mut output, current);
+                    frames.push(Frame::SingleString);
+                    index += 1;
+                } else if current == '"' {
+                    masked(&mut output, current);
+                    frames.push(Frame::DoubleString);
+                    index += 1;
+                } else if current == '`' {
+                    masked(&mut output, current);
+                    if let Some(escaped) = next {
+                        // Outside a string, the escaped character is still part
+                        // of executable syntax; retain it without interpreting a
+                        // quote/comment delimiter a second time.
+                        output.push(escaped);
+                        index += 2;
+                    } else {
+                        index += 1;
+                    }
+                } else if interpolation_depth > 0 && current == '(' {
+                    output.push(current);
+                    if let Some(Frame::Code {
+                        interpolation_depth,
+                    }) = frames.last_mut()
+                    {
+                        *interpolation_depth += 1;
+                    }
+                    index += 1;
+                } else if interpolation_depth > 0 && current == ')' {
+                    output.push(current);
+                    if interpolation_depth == 1 {
+                        frames.pop();
+                    } else if let Some(Frame::Code {
+                        interpolation_depth,
+                    }) = frames.last_mut()
+                    {
+                        *interpolation_depth -= 1;
+                    }
+                    index += 1;
+                } else {
+                    output.push(current);
+                    index += 1;
+                }
+            }
+            Frame::SingleString => {
+                masked(&mut output, current);
+                if current == '\'' {
+                    if next == Some('\'') {
+                        masked(&mut output, '\'');
+                        index += 2;
+                    } else {
+                        frames.pop();
+                        index += 1;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            Frame::DoubleString | Frame::DoubleHereString => {
+                let here = matches!(frame, Frame::DoubleHereString);
+                let at_line_start = index == 0 || matches!(input[index - 1], '\r' | '\n');
+                if here && at_line_start && current == '"' && next == Some('@') {
+                    masked(&mut output, current);
+                    masked(&mut output, '@');
+                    frames.pop();
+                    index += 2;
+                } else if !here && current == '"' {
+                    masked(&mut output, current);
+                    frames.pop();
+                    index += 1;
+                } else if current == '`' {
+                    masked(&mut output, current);
+                    if let Some(escaped) = next {
+                        masked(&mut output, escaped);
+                        index += 2;
+                    } else {
+                        index += 1;
+                    }
+                } else if current == '$' && next == Some('(') {
+                    output.push('$');
+                    output.push('(');
+                    frames.push(Frame::Code {
+                        interpolation_depth: 1,
+                    });
+                    index += 2;
+                } else {
+                    masked(&mut output, current);
+                    index += 1;
+                }
+            }
+            Frame::SingleHereString => {
+                let at_line_start = index == 0 || matches!(input[index - 1], '\r' | '\n');
+                masked(&mut output, current);
+                if at_line_start && current == '\'' && next == Some('@') {
+                    masked(&mut output, '@');
+                    frames.pop();
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+            }
+            Frame::LineComment => {
+                masked(&mut output, current);
+                index += 1;
+                if matches!(current, '\r' | '\n') {
+                    frames.pop();
+                }
+            }
+            Frame::BlockComment { depth } => {
+                if current == '<' && next == Some('#') {
+                    masked(&mut output, current);
+                    masked(&mut output, '#');
+                    if let Some(Frame::BlockComment { depth }) = frames.last_mut() {
+                        *depth += 1;
+                    }
+                    index += 2;
+                } else if current == '#' && next == Some('>') {
+                    masked(&mut output, current);
+                    masked(&mut output, '>');
+                    if depth == 1 {
+                        frames.pop();
+                    } else if let Some(Frame::BlockComment { depth }) = frames.last_mut() {
+                        *depth -= 1;
+                    }
+                    index += 2;
+                } else {
+                    masked(&mut output, current);
+                    index += 1;
+                }
+            }
+        }
+    }
+    output
+}
+
+#[cfg(windows)]
+/// Whether `target` appears as a bare or module-qualified command invocation in
+/// raw PowerShell, rather than as an argument, quoted value, or comment.
+pub(crate) fn powershell_invokes_command(command: &str, target: &str) -> bool {
+    let code = powershell_executable_projection(command);
+    powershell_executable_code_invokes_command(&code, target)
+}
+
+#[cfg(windows)]
+/// Specialized spelling retained for the confined system-temp guard.
+pub(crate) fn powershell_invokes_new_temporary_file(command: &str) -> bool {
+    powershell_invokes_command(command, "New-TemporaryFile")
+}
+
+#[cfg(windows)]
+fn powershell_executable_code_invokes_command(code: &str, target: &str) -> bool {
+    let lowered = code.to_ascii_lowercase();
+    let target = target.to_ascii_lowercase();
+    if target.is_empty()
+        || !target
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return false;
+    }
+    let bytes = lowered.as_bytes();
+    let token_character =
+        |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'\\');
+    for (target_start, _) in lowered.match_indices(&target) {
+        let target_end = target_start + target.len();
+        if target_end < lowered.len() && token_character(bytes[target_end]) {
+            continue;
+        }
+        let mut token_start = target_start;
+        while token_start > 0 && token_character(bytes[token_start - 1]) {
+            token_start -= 1;
+        }
+        let token = &lowered[token_start..target_end];
+        let is_target = token == target;
+        let is_module_qualified =
+            token
+                .strip_suffix(&format!("\\{target}"))
+                .is_some_and(|module| {
+                    !module.is_empty()
+                        && module != "."
+                        && module != ".."
+                        && !module.contains('\\')
+                        && module.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
+                        })
+                });
+        if !is_target && !is_module_qualified {
+            continue;
+        }
+        let command_start = lowered[..token_start]
+            .rfind(|character| {
+                matches!(
+                    character,
+                    '\r' | '\n' | ';' | '|' | '&' | '{' | '}' | '(' | '='
+                )
+            })
+            .map_or(0, |position| position + 1);
+        let prefix = lowered[command_start..token_start].trim();
+        if prefix.is_empty() || prefix == "." {
+            return true;
+        }
+    }
+    false
+}
+
+/// Refuse the exact PowerShell APIs behind a live Web Code failure before they
+/// can write outside a confined workspace. These APIs are especially deceptive:
+/// unlike a relative `Set-Content` path they ignore PowerShell's cwd and create
+/// a file in `%TEMP%` immediately. This is not a broad lexical sandbox; strings
+/// and comments stay inert, and the exec approval remains the authority for
+/// every other script.
+#[cfg(windows)]
+fn refuse_confined_powershell_temp_file(command: &str, sandbox: &Sandbox) -> Result<(), String> {
+    if sandbox.fs_unrestricted() {
+        return Ok(());
+    }
+    let code = powershell_executable_projection(command);
+    let compact: String = code
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect();
+    let api = if compact.contains("::gettempfilename(") {
+        Some("`GetTempFileName()`")
+    } else if powershell_executable_code_invokes_command(&code, "New-TemporaryFile") {
+        Some("`New-TemporaryFile`")
+    } else {
+        None
+    };
+    if let Some(api) = api {
+        return Err(format!(
+            concat!(
+                "PowerShell command refused before execution: {} immediately creates a file ",
+                "under `%TEMP%`, outside the PowerShell working directory and confined ",
+                "workspace. Generate a name without creating elsewhere, then write the ",
+                "workspace path, for example: `$name = [guid]::NewGuid().ToString('N') + ",
+                "'.txt'; $path = Join-Path (Get-Location) $name; Set-Content -LiteralPath ",
+                "$path -Value ([guid]::NewGuid().ToString('N'))`. Do not repeat the refused ",
+                "call unchanged."
+            ),
+            api
+        ));
+    }
+    Ok(())
+}
+
 fn validate_shell_command(
     command: String,
     profile: ToolProfile,
@@ -1620,9 +1977,11 @@ fn validate_shell_command(
         }
         let wrapped = powershell_script_from_wrapper(&command);
         if profile == ToolProfile::WebCode || wrapped.is_some() {
+            let command = wrapped.unwrap_or(command);
+            refuse_confined_powershell_temp_file(&command, sandbox)?;
             return Ok(Action::RunPowerShell {
                 workdir: sandbox.root().to_path_buf(),
-                command: wrapped.unwrap_or(command),
+                command,
                 timeout: sandbox.shell_timeout,
             });
         }
@@ -1973,6 +2332,7 @@ pub fn validate_for(
                 if command.trim().is_empty() {
                     return Err("run_windows_command requires a non-empty `command`".into());
                 }
+                refuse_confined_powershell_temp_file(&command, sandbox)?;
                 // cwd defaults to the workspace root; a supplied cwd must resolve
                 // inside it (the path-escape backstop applies to Exec cwd too).
                 let workdir = match args.get("cwd").and_then(Value::as_str) {
@@ -5954,7 +6314,17 @@ mod tests {
         assert_eq!(ps.risk, Risk::Exec, "it stays approval-gated");
         assert!(
             ps.description.contains("Windows PowerShell 5.1")
-                && ps.description.contains("passed verbatim"),
+                && ps.description.contains("passed verbatim")
+                && ps.description.contains("workspace-relative path")
+                && ps.description.contains("Join-Path (Get-Location)")
+                && ps.description.contains("GetTempFileName")
+                && ps.description.contains("$env:TEMP")
+                && ps.description.contains("handles close")
+                && ps
+                    .description
+                    .contains("verify/count them in the same command")
+                && ps.description.contains("list_dir")
+                && ps.description.contains("more than 200 files"),
             "the model needs one explicit dialect contract: {}",
             ps.description
         );
@@ -5996,6 +6366,221 @@ mod tests {
                 .trim(),
             "a joke"
         );
+    }
+
+    /// `GetTempFileName` is not a random-name helper scoped by cwd: it creates
+    /// under `%TEMP%` immediately. This exact production command exited 0 three
+    /// times while `list_dir .` stayed empty, then the repeat guard ended the
+    /// turn. Refuse it before execution and give the next inference a complete,
+    /// relative-path replacement instead of another vague "stay in workspace".
+    #[cfg(windows)]
+    #[test]
+    fn confined_powershell_rejects_get_temp_file_name_with_actionable_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path());
+        let bad = "for ($i = 0; $i -lt 1000; $i++) { \
+                   $filename = [System.IO.Path] :: GetTempFileName (); \
+                   [System.IO.File]::CreateText($filename) }";
+        let error = validate_for(
+            ToolProfile::WebCode,
+            &call("run_shell", json!({"command": bad})),
+            &sb,
+        )
+        .expect_err("a confined Code shell must reject the system-temp write");
+        for expected in [
+            "refused before execution",
+            "immediately creates a file under `%TEMP%`",
+            "outside the PowerShell working directory",
+            "[guid]::NewGuid().ToString('N') + '.txt'",
+            "Join-Path (Get-Location)",
+            "Set-Content -LiteralPath",
+            "Do not repeat",
+        ] {
+            assert!(
+                error.contains(expected),
+                "missing {expected:?} in {error:?}"
+            );
+        }
+        let legacy_error = validate(&call("run_windows_command", json!({"command": bad})), &sb)
+            .expect_err("the confined legacy PowerShell surface needs the same backstop");
+        assert!(
+            legacy_error.contains("GetTempFileName") && legacy_error.contains("%TEMP%"),
+            "unexpected legacy error: {legacy_error}"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "validation must fail before any file is created"
+        );
+
+        let safe = "$name = [guid]::NewGuid().ToString('N') + '.txt'; \
+                    $path = Join-Path (Get-Location) $name; \
+                    Set-Content -LiteralPath $path -Value ([guid]::NewGuid().ToString('N'))";
+        assert!(matches!(
+            validate_for(
+                ToolProfile::WebCode,
+                &call("run_shell", json!({"command": safe})),
+                &sb,
+            ),
+            Ok(Action::RunPowerShell { .. })
+        ));
+
+        // The helper is a confined-workspace backstop, not a new blanket ban on
+        // an explicitly unrestricted PowerShell session.
+        let unrestricted = sandbox(dir.path()).with_fs_unrestricted(true);
+        assert!(matches!(
+            validate_for(
+                ToolProfile::WebCode,
+                &call("run_shell", json!({"command": bad})),
+                &unrestricted,
+            ),
+            Ok(Action::RunPowerShell { .. })
+        ));
+    }
+
+    /// Safety matching must inspect PowerShell code, not documentation carried
+    /// by that code. The original substring guard refused harmless search/log/
+    /// docs commands, while expandable `$()` still needs inspection because it
+    /// really executes even though it appears inside a double-quoted string.
+    #[cfg(windows)]
+    #[test]
+    fn confined_powershell_temp_detection_is_quote_and_comment_aware() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path());
+        let accepts = |command: &str| {
+            validate_for(
+                ToolProfile::WebCode,
+                &call("run_shell", json!({"command": command})),
+                &sb,
+            )
+            .unwrap_or_else(|error| panic!("harmless text was refused: {command:?}: {error}"));
+        };
+        for harmless in [
+            "Write-Output '[IO.Path]::GetTempFileName()'",
+            "Write-Output \"[IO.Path]::GetTempFileName()\"",
+            "Set-Content -LiteralPath docs.txt -Value '[IO.Path]::GetTempFileName()'",
+            "Select-String -LiteralPath docs.txt -Pattern 'New-TemporaryFile'",
+            "Write-Output New-TemporaryFile",
+            "Get-Command New-TemporaryFile",
+            "Write-Output Microsoft.PowerShell.Utility\\New-TemporaryFile",
+            "Get-Command Microsoft.PowerShell.Utility\\New-TemporaryFile",
+            "# [IO.Path]::GetTempFileName(); New-TemporaryFile\nWrite-Output ok",
+            "<# [IO.Path]::GetTempFileName(); <# nested New-TemporaryFile #> #>\nWrite-Output ok",
+            "$doc = @'\n[IO.Path]::GetTempFileName()\nNew-TemporaryFile\n'@\nSet-Content -LiteralPath docs.txt -Value $doc",
+            "$doc = @\"\n[IO.Path]::GetTempFileName()\nNew-TemporaryFile\n\"@\nSet-Content -LiteralPath docs.txt -Value $doc",
+        ] {
+            accepts(harmless);
+        }
+
+        for dangerous in [
+            "$path = [SyStEm.IO.PaTh] :: GeTtEmPfIlEnAmE ( )",
+            "Write-Output \"created=$([IO.Path]::GetTempFileName())\"",
+            "# inert first\n[IO.Path]::GetTempFileName()",
+            "<# inert first #> [IO.Path]::GetTempFileName()",
+            "$file = NeW-TeMpOrArYfIlE",
+            "& New-TemporaryFile",
+            "$file = Microsoft.PowerShell.Utility\\New-TemporaryFile",
+            "Write-Output \"created=$(New-TemporaryFile)\"",
+        ] {
+            let error = validate_for(
+                ToolProfile::WebCode,
+                &call("run_shell", json!({"command": dangerous})),
+                &sb,
+            )
+            .expect_err("an executable system-temp creation must be refused");
+            assert!(
+                error.contains("%TEMP%") && error.contains("refused before execution"),
+                "unexpected refusal for {dangerous:?}: {error}"
+            );
+        }
+    }
+
+    /// Mutation/progress classification shares this helper with the safety
+    /// guard. A marker used as another command's argument is data; only a token
+    /// in a statement/pipeline command position is an invocation. Module-
+    /// qualified cmdlets retain the same semantics.
+    #[cfg(windows)]
+    #[test]
+    fn powershell_command_position_detection_ignores_argument_markers() {
+        for command in [
+            "Set-Content -LiteralPath out.txt -Value x",
+            "Get-Content in.txt | Set-Content -LiteralPath out.txt",
+            "$result = Set-Content -LiteralPath out.txt -Value x",
+            "Microsoft.PowerShell.Management\\Set-Content -LiteralPath out.txt -Value x",
+            "& Microsoft.PowerShell.Management\\Set-Content -LiteralPath out.txt -Value x",
+        ] {
+            assert!(
+                powershell_invokes_command(command, "Set-Content"),
+                "missed invocation: {command}"
+            );
+        }
+        for command in [
+            "Get-Content docs.txt | Select-String Set-Content",
+            "Write-Output Set-Content",
+            "Get-Command Set-Content",
+            "Select-String -Pattern 'Set-Content' docs.txt",
+            "# Set-Content out.txt x\nGet-Content docs.txt",
+        ] {
+            assert!(
+                !powershell_invokes_command(command, "Set-Content"),
+                "argument/documentation was misclassified: {command}"
+            );
+        }
+        assert!(powershell_invokes_new_temporary_file(
+            "Microsoft.PowerShell.Utility\\New-TemporaryFile"
+        ));
+    }
+
+    /// The legacy Full-profile PowerShell surface must carry the same cwd/temp
+    /// distinction as Web Code; otherwise switching profiles resurrects the
+    /// exact bad generation pattern.
+    #[cfg(windows)]
+    #[test]
+    fn windows_powershell_tool_schemas_explain_bulk_workspace_paths() {
+        for (profile, name) in [
+            (ToolProfile::WebCode, "run_shell"),
+            (ToolProfile::Full, "run_windows_command"),
+        ] {
+            let spec = specs_for(profile, false, ShellSandbox::Sandboxed)
+                .into_iter()
+                .find(|spec| spec.name == name)
+                .unwrap_or_else(|| panic!("missing {name} for {profile:?}"));
+            for expected in [
+                "PowerShell 7-only",
+                "`&&`",
+                "`||`",
+                "`??`",
+                "ternary `? :`",
+                "ForEach-Object -Parallel",
+                "$LASTEXITCODE",
+                "$PSScriptRoot",
+                "curl.exe",
+                "Start-Process",
+                "workspace-relative path",
+                "Join-Path (Get-Location)",
+                "GetTempFileName",
+                "New-TemporaryFile",
+                "GetTempPath",
+                "$env:TEMP",
+                "-LiteralPath",
+                "File.CreateText",
+                "Dispose",
+                "UTF-16LE",
+                "Set-Content -Encoding UTF8",
+                "adds a BOM",
+                "[Text.UTF8Encoding]::new($false)",
+                "[IO.File]::WriteAllText",
+                "verify/count them in the same command",
+                "list_dir",
+                "more than 200 files",
+            ] {
+                assert!(
+                    spec.description.contains(expected),
+                    "{name} is missing {expected:?}: {}",
+                    spec.description
+                );
+            }
+        }
     }
 
     /// Cached prompts may still add a redundant launcher. Strip it host-side

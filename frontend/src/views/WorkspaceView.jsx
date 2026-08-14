@@ -5,12 +5,15 @@ import {
   cancelWorkspaceSession,
   compactWorkspaceThread,
   createWorkspaceSession,
+  contextWindowModeLabel,
   deleteWorkspaceThread,
+  formatContextTokens,
   getWorkspaceCompatibleModels,
   getWorkspaceSession,
   getWorkspaceThread,
   getWorkspaceThreads,
   reduceWorkspaceEvent,
+  normalizeContextWindow,
   sendWorkspaceMessage,
   waitForWorkspaceSessionTerminal,
   WORKSPACE_IDLE_STATE,
@@ -234,41 +237,48 @@ export function FolderPicker({ apiBase, initialPath, onClose, onPick }) {
 }
 
 function ContextInspector({ budget, timing, runtimeContext, compaction, busy, disabled, onCompact, onUndo }) {
-  if (!budget) return null
-  const promptUsed = Number(budget.prompt_tokens || 0)
-  const generation = Number(budget.generation_tokens || 0)
-  const total = Number(budget.budget_total || 0)
+  const promptUsed = Number(budget?.prompt_tokens || 0)
+  const generation = Number(budget?.generation_tokens || 0)
+  const total = Number(budget?.budget_total || 0)
+  const contextWindow = normalizeContextWindow(runtimeContext?.context_window, total)
+  if (!budget && !contextWindow) return null
   const rows = [
-    ['System instructions', budget.system_tokens_estimate],
-    ['Tool definitions', budget.tool_definition_tokens_estimate],
-    ['Messages', budget.message_tokens_estimate],
-    ['Recent memory', budget.recent_memory_tokens_estimate],
-    ['Retrieved memory', budget.retrieved_memory_tokens_estimate],
-    ['Evidence memory', budget.evidence_memory_tokens_estimate],
-    ['Tool results', budget.tool_result_tokens_estimate],
+    ['System instructions', budget?.system_tokens_estimate],
+    ['Tool definitions', budget?.tool_definition_tokens_estimate],
+    ['Messages', budget?.message_tokens_estimate],
+    ['Recent memory', budget?.recent_memory_tokens_estimate],
+    ['Retrieved memory', budget?.retrieved_memory_tokens_estimate],
+    ['Evidence memory', budget?.evidence_memory_tokens_estimate],
+    ['Tool results', budget?.tool_result_tokens_estimate],
   ].filter(([, value]) => Number(value || 0) > 0)
   return (
     <details className="workspace-context-inspector">
-      <summary title="Exact rendered prompt plus reserved generation">
+      <summary title={total > 0 ? 'Exact rendered prompt plus reserved generation' : 'Selected context window'}>
         <span>Context</span>
-        <progress value={promptUsed + generation} max={total} />
-        <strong>{promptUsed + generation} / {total}</strong>
+        <progress value={promptUsed + generation} max={total || contextWindow?.effectiveTokens || 1} />
+        <strong>{total > 0 ? `${promptUsed + generation} / ${total}` : `${contextWindowModeLabel(contextWindow)} · ${formatContextTokens(contextWindow?.effectiveTokens)}`}</strong>
       </summary>
       <div className="workspace-context-inspector__panel">
         <div className="workspace-context-inspector__total">
-          <span>Exact prompt</span><strong>{promptUsed}</strong>
-          <span>Reserved response</span><strong>{generation}</strong>
+          {contextWindow ? <><span>Context selection</span><strong>{contextWindowModeLabel(contextWindow)}</strong></> : null}
+          {contextWindow ? <><span>Effective window</span><strong title={`${contextWindow.effectiveTokens.toLocaleString()} tokens`}>{formatContextTokens(contextWindow.effectiveTokens)}</strong></> : null}
+          {budget ? <><span>Exact prompt</span><strong>{promptUsed}</strong></> : null}
+          {budget ? <><span>Reserved response</span><strong>{generation}</strong></> : null}
           {timing ? <><span>Last model call</span><strong>{(timing.total_ms / 1000).toFixed(1)} s</strong></> : null}
           {timing?.ttft_ms != null ? <><span>First token</span><strong>{(timing.ttft_ms / 1000).toFixed(1)} s</strong></> : null}
           {runtimeContext?.resident_cuda ? <><span>Resident capacity</span><strong>{runtimeContext.resident_cuda.max_positions}</strong></> : null}
           {runtimeContext?.resident_cuda ? <><span>Layer placement</span><strong>{runtimeContext.resident_cuda.offloaded ? 'Offloaded' : 'Resident'}</strong></> : null}
         </div>
-        <p>Estimated breakdown</p>
-        <dl>
-          {rows.map(([label, value]) => (
-            <div key={label}><dt>{label}</dt><dd>{Number(value || 0)}</dd></div>
-          ))}
-        </dl>
+        {rows.length ? (
+          <>
+            <p>Estimated breakdown</p>
+            <dl>
+              {rows.map(([label, value]) => (
+                <div key={label}><dt>{label}</dt><dd>{Number(value || 0)}</dd></div>
+              ))}
+            </dl>
+          </>
+        ) : null}
         <div className="workspace-context-inspector__actions">
           <Button variant="outline" onClick={() => onCompact()} disabled={disabled || busy} loading={busy}>
             Compact conversation
@@ -931,7 +941,7 @@ export default function WorkspaceView({ apiBase, capabilities, selectedModel, ru
           <ContextInspector
             budget={budget}
             timing={timing}
-            runtimeContext={sessionRuntime}
+            runtimeContext={sessionRuntime || session}
             compaction={compaction}
             busy={compactionBusy}
             disabled={running || !session}

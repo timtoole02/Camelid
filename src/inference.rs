@@ -124,6 +124,43 @@ use crate::{
     BackendError, Result,
 };
 
+/// Return a conservative upper bound for the host KV-cache cost of one token.
+///
+/// The calculation is built from the same [`LlamaKvCachePlan`] shapes the
+/// runtime allocates, including MLA's compressed-key/no-value storage shape.
+/// It deliberately prices every stored element as f32: the host cache may use
+/// f16, Q8_0, or Q4_0, but f32 is the default and the largest supported host
+/// representation. Adaptive context sizing can therefore avoid depending on
+/// process-wide diagnostic flags while the runtime's allocation guard remains
+/// authoritative.
+pub(crate) fn conservative_host_kv_bytes_per_token(config: &LlamaModelConfig) -> Result<u64> {
+    let plan = LlamaKvCachePlan::from_config(config)?;
+    let stored_value_head_dim = plan.value_shape.get(3).copied().unwrap_or(0);
+    let elements_per_token = plan
+        .layer_count
+        .checked_mul(plan.kv_head_count)
+        .and_then(|value| value.checked_mul(plan.k_head_dim.saturating_add(stored_value_head_dim)))
+        .ok_or_else(|| {
+            BackendError::InvalidModelMetadata(
+                "KV-cache dimensions overflow the host context sizing calculation".to_string(),
+            )
+        })?;
+    let bytes_per_token = u64::try_from(elements_per_token)
+        .ok()
+        .and_then(|value| value.checked_mul(std::mem::size_of::<f32>() as u64))
+        .ok_or_else(|| {
+            BackendError::InvalidModelMetadata(
+                "KV-cache byte cost overflows the host context sizing calculation".to_string(),
+            )
+        })?;
+    if bytes_per_token == 0 {
+        return Err(BackendError::InvalidModelMetadata(
+            "KV-cache dimensions produce a zero byte cost per token".to_string(),
+        ));
+    }
+    Ok(bytes_per_token)
+}
+
 #[cfg(test)]
 use crate::tensor::record_q8_0_file_read;
 

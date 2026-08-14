@@ -389,6 +389,73 @@ function numeric(value) {
   return Number.isFinite(parsed) ? parsed : 0
 }
 
+function positiveTokenCount(value) {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed) : null
+}
+
+/** Normalize the adaptive-window response while keeping older backends useful.
+ * Older sessions have no `context_window`, but their memory event still carries
+ * the effective prompt budget, so the UI can show that instead of disappearing.
+ */
+export function normalizeContextWindow(selection, fallbackBudget = 0) {
+  const source = selection && typeof selection === 'object' && !Array.isArray(selection)
+    ? selection
+    : null
+  const readTokens = (snakeCase, camelCase) => positiveTokenCount(source?.[snakeCase] ?? source?.[camelCase])
+  const effectiveTokens = readTokens('effective_tokens', 'effectiveTokens') || positiveTokenCount(fallbackBudget)
+  if (!effectiveTokens) return null
+
+  const rawMode = String(source?.mode || 'auto').trim().toLowerCase()
+  const rawLimit = source?.limiting_factor ?? source?.limitingFactor
+  return {
+    mode: rawMode === 'fixed' || rawMode === 'manual' ? 'fixed' : 'auto',
+    effectiveTokens,
+    safeMaxTokens: readTokens('safe_max_tokens', 'safeMaxTokens'),
+    modelMaxTokens: readTokens('model_max_tokens', 'modelMaxTokens'),
+    availableMemoryBytes: readTokens('available_memory_bytes', 'availableMemoryBytes'),
+    kvBytesPerToken: readTokens('kv_bytes_per_token', 'kvBytesPerToken'),
+    residentCapacityTokens: readTokens('resident_capacity_tokens', 'residentCapacityTokens'),
+    configuredMaxTokens: readTokens('configured_max_tokens', 'configuredMaxTokens'),
+    limitingFactor: typeof rawLimit === 'string' && rawLimit.trim() ? rawLimit.trim() : null,
+  }
+}
+
+/** Render context sizes in binary K/M units so capacities such as 12,288 and
+ * 16,384 tokens become the familiar 12K and 16K model-window labels.
+ */
+export function formatContextTokens(value) {
+  const tokens = positiveTokenCount(value)
+  if (!tokens) return '—'
+  if (tokens < 1024) return tokens.toLocaleString()
+  const unit = tokens >= 1024 * 1024 ? 1024 * 1024 : 1024
+  const suffix = unit === 1024 ? 'K' : 'M'
+  const scaled = tokens / unit
+  const rounded = Number(scaled.toFixed(1))
+  return `${rounded}${suffix}`
+}
+
+export function contextWindowModeLabel(selection) {
+  return selection?.mode === 'fixed' ? 'Fixed' : 'Auto'
+}
+
+export function contextLimitingFactorLabel(value) {
+  const factor = String(value || '').trim().toLowerCase().replace(/[\s-]+/g, '_')
+  if (!factor) return ''
+  const known = {
+    available_memory: 'Available memory',
+    configured_max: 'Configured max',
+    model_max: 'Model max',
+    resident_capacity: 'Resident capacity',
+    safe_max: 'Safe max',
+    server_limit: 'Server limit',
+  }
+  if (known[factor]) return known[factor]
+  return factor.split('_').filter(Boolean).map((word, index) => (
+    index === 0 ? `${word.charAt(0).toUpperCase()}${word.slice(1)}` : word
+  )).join(' ')
+}
+
 export function reduceWorkspaceEvent(state, envelope) {
   return withDerived(state, reduceAgentEvent(state, envelope, false), envelope)
 }

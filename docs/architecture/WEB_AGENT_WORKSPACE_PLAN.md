@@ -125,13 +125,27 @@ Compaction changes which completed turns are always recent; it does not delete t
 
 ## Exact Context Budget
 
-Workspace uses a static total envelope of 4,096 tokens:
+Workspace uses a per-session adaptive total envelope. Camelid reads the active
+GGUF's native context and exact KV dimensions, samples currently available host
+RAM after model load, budgets 70% of that memory for conservative f32 KV, and
+rounds down to a 1,024-token quantum. The result is clamped by the model and
+server limits, a 65,536-token operational ceiling, and the optional
+`CAMELID_AGENT_CONTEXT_MAX_TOKENS` operator cap. Unknown telemetry falls back to
+8,192 tokens. A Qwen model with a 40,960 native window can therefore use that
+whole window on a roomy machine rather than being artificially capped at 8K.
 
-- default generation reserve: 512 tokens;
-- maximum generation reserve: 1,024 tokens;
-- default agent steps: 12;
-- maximum agent steps: 32;
-- maximum first goal: 4 KiB.
+Generation allowance and action steps remain separate bounded controls. Code
+defaults to 48 steps (128 maximum), accepts a 64 KiB written task specification,
+and uses context paging by default so durable task/source state does not depend
+on replaying an ever-growing transcript.
+
+The logical envelope and the live paging working set are intentionally
+different. Qwen 4B can expose its native 40,960-token ceiling for admission and
+task memory, while default paging holds each active request to 5,500 input
+tokens plus 1,300 output and 1,200 safety tokens (8,000 total). This preserves
+the checked 8K lane and avoids turning a larger logical context into an
+unbounded quadratic prefill. Operators can explicitly raise the paging input
+ceiling after validating their hardware.
 
 Before every model step, Camelid renders the real chat template with the actual tool schemas and tokenizer. The required system policy, current user message, and latest native tool call/result pair stay intact. Earlier tool exchanges are reduced to bounded observations. If the request is too large, optional memory is removed first, followed by complete older user/assistant turn pairs. If required content still cannot fit, the turn fails instead of overflowing.
 

@@ -856,6 +856,13 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.code-composer__chips > .code-context-chip {
+  flex: none;
+  max-width: none;
+  color: var(--color-text-muted);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
 .code-access-control { position: relative; }
 .code-access-chip {
   border-color: color-mix(in srgb, var(--color-warning) 28%, var(--color-border-soft));

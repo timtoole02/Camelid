@@ -1,5 +1,20 @@
 import assert from 'node:assert/strict'
-import { recordedWorkspaceOutcome, reduceCodeEvent, reduceWorkspaceEvent, waitForWorkspaceSessionTerminal, WORKSPACE_IDLE_STATE, workspaceEndpoint, workspaceModelsEndpoint, workspaceBrowseEndpoint, workspaceThreadsEndpoint, workspaceCompactionEndpoint } from '../src/lib/workspaceAgent.js'
+import {
+  contextLimitingFactorLabel,
+  contextWindowModeLabel,
+  formatContextTokens,
+  normalizeContextWindow,
+  recordedWorkspaceOutcome,
+  reduceCodeEvent,
+  reduceWorkspaceEvent,
+  waitForWorkspaceSessionTerminal,
+  WORKSPACE_IDLE_STATE,
+  workspaceEndpoint,
+  workspaceModelsEndpoint,
+  workspaceBrowseEndpoint,
+  workspaceThreadsEndpoint,
+  workspaceCompactionEndpoint,
+} from '../src/lib/workspaceAgent.js'
 
 let state = { ...WORKSPACE_IDLE_STATE, events: [] }
 state = reduceWorkspaceEvent(state, { event: 'session.started', model_id: 'tool-model', sequence: 1 })
@@ -94,6 +109,32 @@ for (let index = 0; index < 300; index += 1) {
 }
 assert.equal(bounded.events.length, 240, 'activity history must remain bounded during long sessions')
 assert.equal(bounded.events[0].content, 'event-60')
+
+const adaptiveContext = normalizeContextWindow({
+  mode: 'auto',
+  effective_tokens: 12_288,
+  safe_max_tokens: 12_288,
+  model_max_tokens: 40_960,
+  limiting_factor: 'available_memory',
+})
+assert.equal(contextWindowModeLabel(adaptiveContext), 'Auto')
+assert.equal(formatContextTokens(adaptiveContext.effectiveTokens), '12K')
+assert.equal(formatContextTokens(adaptiveContext.modelMaxTokens), '40K')
+assert.equal(formatContextTokens(5500), '5.4K')
+assert.equal(contextLimitingFactorLabel(adaptiveContext.limitingFactor), 'Available memory')
+assert.deepEqual(normalizeContextWindow(null, 8192), {
+  mode: 'auto',
+  effectiveTokens: 8192,
+  safeMaxTokens: null,
+  modelMaxTokens: null,
+  availableMemoryBytes: null,
+  kvBytesPerToken: null,
+  residentCapacityTokens: null,
+  configuredMaxTokens: null,
+  limitingFactor: null,
+})
+assert.equal(normalizeContextWindow({ effective_tokens: 'not-a-number' }, 0), null)
+
 assert.equal(workspaceEndpoint('http://127.0.0.1:8181/', '/abc/events'), 'http://127.0.0.1:8181/api/agent/workspace/sessions/abc/events')
 assert.equal(workspaceModelsEndpoint('http://127.0.0.1:8181/'), 'http://127.0.0.1:8181/api/agent/workspace/models')
 assert.equal(workspaceBrowseEndpoint('http://127.0.0.1:8181/'), 'http://127.0.0.1:8181/api/agent/workspace/browse')

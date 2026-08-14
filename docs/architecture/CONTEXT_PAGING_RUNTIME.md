@@ -36,8 +36,9 @@ Relevant integration points:
 
 Compatibility constraints:
 
-- Rollout is opt-in with `CAMELID_CONTEXT_PAGING=1`; existing agent behavior is
-  unchanged when disabled.
+- Context paging is the default Web Code memory path. Set
+  `CAMELID_CONTEXT_PAGING=0` only as a deliberate rollback; the legacy loop is
+  unchanged while disabled.
 - `.camelid` is already protected from model-authored writes. Runtime state is
   stored below `.camelid/context-paging` through host code only.
 - Exact source is authoritative. A card or page whose file hash no longer
@@ -139,14 +140,21 @@ workspace action end the run. An exact-tokenizer overflow recalibrates the
 estimator from the measured count and rebuilds a smaller capsule (up to 3
 times per run) instead of failing the run.
 
-Persistence is crash-safe: the ledger, index, runtime-state, and raw
-artifacts are written via temp-file+rename, so a crash cannot leave
-half-written state. Retrieval misses are persisted even when the fault fails.
+Persistence is crash-safe and Windows-concurrency-safe: the ledger, index,
+runtime-state, and raw artifacts are written through unique same-directory
+temp files and atomic replacement, so parent and delegated workers cannot
+truncate or rename one another's staging files. Delegated workers also receive
+stable task scopes so identical objectives do not share canonical ledger or
+runtime-state files. Retrieval misses are persisted even when the fault fails.
 
 ## Configuration
 
-- `CAMELID_CONTEXT_PAGING=1`: enable the experimental Web Code integration.
-- `CAMELID_CONTEXT_MAX_INPUT_TOKENS`: input ceiling, default `5500`.
+- `CAMELID_CONTEXT_PAGING=0`: disable the default Web Code paging integration.
+- `CAMELID_CONTEXT_MAX_INPUT_TOKENS`: optional explicit input ceiling. Unset or
+  invalid values keep the default `5500`-token active input working set; with
+  the default reserves this stays inside the checked Qwen 4B 8K envelope.
+  An explicit value can opt into a larger working set, but is still clamped to
+  the session context window minus the output and safety reserves.
 - `CAMELID_CONTEXT_OUTPUT_RESERVE`: output reserve, default `1300`.
 - `CAMELID_CONTEXT_SAFETY_RESERVE`: safety reserve, default `1200`.
 - `CAMELID_CONTEXT_TOOL_RESULT_BYTES`: compact tool-result preview bytes,
@@ -155,7 +163,7 @@ half-written state. Retrieval misses are persisted even when the fault fails.
   default `32`, minimum `4`.
 - `CAMELID_CONTEXT_DEBUG=1`: record item inclusion/exclusion explanations.
 
-Invalid numeric values fail closed to the documented defaults. A capsule that
+Invalid numeric values fail closed to their documented defaults. A capsule that
 cannot retain its mandatory task contract, current focus, critical invariants,
 diagnostic, and exact target source returns a budget error rather than silently
 dropping them.
@@ -174,7 +182,8 @@ dropping them.
 - File-level exact pages are limited to 16 KiB; larger files must be changed by
   symbol page or a later bounded-range paging adapter.
 - The benchmark is a deterministic fixture, not a live-model comparison; the
-  rollout is opt-in while live-model coverage is expanded beyond it.
+  legacy loop remains available through the rollback switch while live-model
+  coverage expands.
 
 The next iteration should add compiler/LSP diagnostics adapters, more language
 indexers, and direct UI controls for capsule-debug and page-fault metrics.

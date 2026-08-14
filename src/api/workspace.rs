@@ -18,6 +18,10 @@ use super::{
     NON_CATALOG_SUPPORTED_ARTIFACTS,
 };
 use crate::chat::agent::LoopEnd;
+use crate::chat::context_window::{
+    configured_agent_context_max, select_context_window, ContextWindowInputs,
+    ContextWindowSelection,
+};
 use crate::chat::workspace_bridge::{
     bridge, run_live, WorkspaceApprovalMode, WorkspaceBridgeControl, WorkspaceBridgeWorker,
     WorkspaceDecisionKind, WorkspaceEvent, WorkspaceRunConfig, WorkspaceRunMode,
@@ -204,6 +208,10 @@ struct ActiveWorkspaceSession {
     /// an idle session survives an unload/reload, so follow-up turns check this
     /// too — the same exactness `create_session`'s resume path applies.
     model_sha256: String,
+    /// The memory/model-aware context envelope resolved when this session was
+    /// created. It stays fixed for the session so follow-up turns and spawned
+    /// children share one predictable prompt/cache contract.
+    context_window: ContextWindowSelection,
     max_steps: usize,
     max_tokens: u32,
     temperature: f32,
@@ -1412,6 +1420,7 @@ struct WorkspaceSessionResponse {
     state: &'static str,
     max_steps: usize,
     max_tokens: u32,
+    context_window: ContextWindowSelection,
     allow_writes: bool,
     approval_mode: WorkspaceApprovalMode,
     allow_network: bool,
@@ -1428,6 +1437,7 @@ struct WorkspaceSessionStatusResponse {
     model_id: String,
     state: &'static str,
     context_budget_tokens: u32,
+    context_window: ContextWindowSelection,
     resident_cuda: Option<crate::inference::ResidentCudaStatus>,
     allow_writes: bool,
     approval_mode: WorkspaceApprovalMode,
@@ -1444,6 +1454,7 @@ struct WorkspaceActivityResponse {
     workspace: String,
     model_id: String,
     state: &'static str,
+    context_window: ContextWindowSelection,
     approval_mode: WorkspaceApprovalMode,
     allow_network: bool,
     mode: WorkspaceRunMode,
@@ -2273,6 +2284,21 @@ pub(super) async fn create_session(
         Ok(value) => value,
         Err(response) => return response,
     };
+    let context_window = select_workspace_context_window(&state, &model);
+    eprintln!(
+        "[workspace-context] model={} selected={} native={} safe_max={} limited_by={:?} available_ram_mib={} kv_bytes_per_token={} resident_capacity={}",
+        model.id,
+        context_window.effective_tokens,
+        context_window.model_max_tokens,
+        context_window.safe_max_tokens,
+        context_window.limiting_factor,
+        context_window
+            .available_memory_bytes
+            .map(|bytes| bytes / (1024 * 1024))
+            .unwrap_or(0),
+        context_window.kv_bytes_per_token.unwrap_or(0),
+        context_window.resident_capacity_tokens.unwrap_or(0),
+    );
     let context_paging_enabled =
         mode.is_code() && crate::chat::context_paging::ContextPagingConfig::from_env().enabled;
     if !context_paging_enabled {
@@ -2296,7 +2322,7 @@ pub(super) async fn create_session(
                 )
             }
         };
-        if let Some(message) = goal_context_error(goal_tokens, mode.context_budget_tokens()) {
+        if let Some(message) = goal_context_error(goal_tokens, context_window.effective_tokens) {
             return api_error(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "workspace_goal_exceeds_context",
@@ -2430,6 +2456,7 @@ pub(super) async fn create_session(
         family,
         max_steps,
         max_tokens,
+        context_budget_tokens: context_window.effective_tokens,
         temperature,
         mode,
         approval_mode,
@@ -2446,6 +2473,7 @@ pub(super) async fn create_session(
         workspace: workspace.clone(),
         model_id: model.id.clone(),
         model_sha256: model.lane.gguf_sha256.to_string(),
+        context_window,
         max_steps,
         max_tokens,
         temperature,
@@ -2483,6 +2511,7 @@ pub(super) async fn create_session(
             state: WorkspaceSessionState::Running.as_str(),
             max_steps,
             max_tokens,
+            context_window,
             allow_writes,
             approval_mode,
             allow_network,
@@ -2842,7 +2871,8 @@ pub(super) async fn session_status(
         workspace: simplify_path(&session.workspace),
         model_id: session.model_id.clone(),
         state: status,
-        context_budget_tokens: session.mode.context_budget_tokens(),
+        context_budget_tokens: session.context_window.effective_tokens,
+        context_window: session.context_window,
         resident_cuda: crate::inference::resident_cuda_status(super::model_resident_cache_key(
             &session.model_id,
         )),
@@ -2896,6 +2926,7 @@ pub(super) async fn current_activity(
             workspace: simplify_path(&session.workspace),
             model_id: session.model_id.clone(),
             state,
+            context_window: session.context_window,
             approval_mode: session.approval_mode,
             allow_network: session.allow_network,
             mode: session.mode,
@@ -3039,6 +3070,7 @@ pub(super) async fn send_message(
         family,
         max_steps: session.max_steps,
         max_tokens: session.max_tokens,
+        context_budget_tokens: session.context_window.effective_tokens,
         temperature: session.temperature,
         mode: session.mode,
         approval_mode: session.approval_mode,
@@ -3280,6 +3312,38 @@ async fn active_tool_capable_model(state: &AppState) -> Result<(LoadedModel, Str
     }
 }
 
+/// Resolve the agent's total prompt + generation envelope from the active
+/// model and memory available *after* that model has loaded. The native GGUF
+/// context remains the hard model ceiling; live RAM determines how much of it
+/// this machine can safely use today.
+fn select_workspace_context_window(
+    state: &AppState,
+    model: &LoadedModel,
+) -> ContextWindowSelection {
+    let native_context_tokens = model
+        .llama_config
+        .as_ref()
+        .map(|config| config.context_length)
+        .unwrap_or(crate::chat::agent::AGENT_VALIDATED_CTX);
+    let kv_bytes_per_token = model
+        .llama_config
+        .as_ref()
+        .and_then(|config| crate::inference::conservative_host_kv_bytes_per_token(config).ok());
+    let resident_capacity_tokens =
+        crate::inference::resident_cuda_status(super::model_resident_cache_key(&model.id))
+            .and_then(|status| u32::try_from(status.max_positions).ok());
+
+    select_context_window(ContextWindowInputs {
+        native_context_tokens,
+        server_max_prompt_tokens: u32::try_from(state.server_limits.max_prompt_tokens)
+            .unwrap_or(u32::MAX),
+        host_memory: crate::capability::live_host_memory_status(),
+        kv_bytes_per_token,
+        resident_capacity_tokens,
+        configured_max_tokens: configured_agent_context_max(),
+    })
+}
+
 /// Name-only resolution, for listing which rows COULD serve Workspace (nothing
 /// is loaded, so there are no bytes to check). Never use this to authorize a
 /// loaded model — see `tool_capable_row_for_loaded_artifact`.
@@ -3322,6 +3386,17 @@ fn tool_capable_row_for_loaded_artifact(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_context_window() -> ContextWindowSelection {
+        select_context_window(ContextWindowInputs {
+            native_context_tokens: 8_192,
+            server_max_prompt_tokens: 131_072,
+            host_memory: None,
+            kv_bytes_per_token: None,
+            resident_capacity_tokens: None,
+            configured_max_tokens: None,
+        })
+    }
 
     #[test]
     fn a_written_out_task_spec_fits_the_goal_limit() {
@@ -3682,6 +3757,7 @@ mod tests {
                 workspace: PathBuf::from("."),
                 model_id: "model-test".to_string(),
                 model_sha256: "sha-test".to_string(),
+                context_window: test_context_window(),
                 max_steps: 1,
                 max_tokens: 1,
                 temperature: 0.0,
@@ -3791,6 +3867,7 @@ mod tests {
             workspace: dir.path().to_path_buf(),
             model_id: "model".into(),
             model_sha256: "sha-test".to_string(),
+            context_window: test_context_window(),
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
@@ -3821,6 +3898,7 @@ mod tests {
             family: "qwen3".into(),
             max_steps: 1,
             max_tokens: 1,
+            context_budget_tokens: WorkspaceRunMode::ReadOnly.context_budget_tokens(),
             temperature: 0.0,
             mode: WorkspaceRunMode::ReadOnly,
             approval_mode: WorkspaceApprovalMode::ApprovalGated,
@@ -3866,6 +3944,7 @@ mod tests {
             workspace: dir.path().to_path_buf(),
             model_id: "model".into(),
             model_sha256: "sha-test".to_string(),
+            context_window: test_context_window(),
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
@@ -3902,6 +3981,7 @@ mod tests {
             workspace: dir.path().to_path_buf(),
             model_id: "model".into(),
             model_sha256: "sha-test".to_string(),
+            context_window: test_context_window(),
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,
@@ -3932,6 +4012,7 @@ mod tests {
             family: "qwen3".into(),
             max_steps: 1,
             max_tokens: 1,
+            context_budget_tokens: test_context_window().effective_tokens,
             temperature: 0.0,
             mode: WorkspaceRunMode::ReadOnly,
             approval_mode: WorkspaceApprovalMode::ApprovalGated,
@@ -3970,6 +4051,7 @@ mod tests {
                 workspace: dir.path().to_path_buf(),
                 model_id: "model".into(),
                 model_sha256: "sha-test".to_string(),
+                context_window: test_context_window(),
                 max_steps: 1,
                 max_tokens: 1,
                 temperature: 0.0,
@@ -4000,6 +4082,7 @@ mod tests {
                 family: "qwen3".into(),
                 max_steps: 1,
                 max_tokens: 1,
+                context_budget_tokens: test_context_window().effective_tokens,
                 temperature: 0.0,
                 mode: WorkspaceRunMode::ReadOnly,
                 approval_mode: WorkspaceApprovalMode::ApprovalGated,
@@ -4032,6 +4115,7 @@ mod tests {
             workspace: dir.to_path_buf(),
             model_id: "model".into(),
             model_sha256: "sha-test".to_string(),
+            context_window: test_context_window(),
             max_steps: 1,
             max_tokens: 1,
             temperature: 0.0,

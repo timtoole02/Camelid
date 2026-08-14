@@ -187,6 +187,7 @@ pub fn run(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> anyhow:
         session.active_id.clone().unwrap_or_default(),
         session.active_family(),
         cfg.max_tokens,
+        cfg.ctx_budget.unwrap_or(8_192),
         cfg.auto_approve,
         cfg.shell_sandbox,
     ));

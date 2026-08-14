@@ -44,6 +44,13 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 30 * 60;
 const MAX_WORKER_STEPS: usize = 30;
 const MAX_WORKER_TOKENS: u32 = 4096;
 const MAX_WORKER_DEPTH: usize = 8;
+/// Task files written before adaptive context sizing carried no context field.
+/// Preserve their exact former behavior when serde reads one.
+const LEGACY_TASK_CONTEXT_BUDGET_TOKENS: u32 = 8_192;
+
+fn legacy_task_context_budget_tokens() -> u32 {
+    LEGACY_TASK_CONTEXT_BUDGET_TOKENS
+}
 
 /// Env var carrying a child's spawn-tree depth (0 = top-level agent).
 pub const DEPTH_ENV: &str = "CAMELID_SUBAGENT_DEPTH";
@@ -148,6 +155,10 @@ pub struct TaskSpec {
     pub workdir: String,
     pub max_steps: usize,
     pub max_tokens: u32,
+    /// Effective context ceiling selected by the parent session. Older task
+    /// files deserialize to the former fixed 8K agent context.
+    #[serde(default = "legacy_task_context_budget_tokens")]
+    pub context_budget_tokens: u32,
     pub depth: usize,
     /// The parent's resolved approval posture, inherited so a child is never more
     /// privileged than its parent (auto-approve still fails closed under
@@ -208,6 +219,9 @@ pub struct SubagentConfig {
     pub family: String,
     pub max_steps: usize,
     pub max_tokens: u32,
+    /// Effective context ceiling selected for the parent. Children share the
+    /// model and inherit this value instead of silently falling back to 8K.
+    pub context_budget_tokens: u32,
     pub concurrency: usize,
     pub depth_limit: usize,
     pub timeout: Duration,
@@ -232,6 +246,7 @@ impl SubagentConfig {
         model_id: String,
         family: String,
         max_tokens: u32,
+        context_budget_tokens: u32,
         auto_approve: bool,
         shell_mode: super::shell_sandbox::ShellSandbox,
     ) -> Self {
@@ -241,6 +256,7 @@ impl SubagentConfig {
             family,
             max_steps: 12,
             max_tokens,
+            context_budget_tokens,
             concurrency: DEFAULT_CONCURRENCY,
             depth_limit: DEFAULT_DEPTH_LIMIT,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
@@ -255,17 +271,26 @@ impl SubagentConfig {
     /// Browser/Desktop Code child configuration. Unlike the legacy terminal
     /// constructor, this preserves the complete parent capability boundary:
     /// narrow WebCode tools, the explicit network switch, and full-auto Exec.
+    #[allow(clippy::too_many_arguments)]
     pub fn for_web_code_session(
         addr: SocketAddr,
         model_id: String,
         family: String,
         max_tokens: u32,
+        context_budget_tokens: u32,
         full_auto: bool,
         allow_net: bool,
         shell_mode: super::shell_sandbox::ShellSandbox,
     ) -> Self {
-        let mut config =
-            Self::for_session(addr, model_id, family, max_tokens, full_auto, shell_mode);
+        let mut config = Self::for_session(
+            addr,
+            model_id,
+            family,
+            max_tokens,
+            context_budget_tokens,
+            full_auto,
+            shell_mode,
+        );
         config.allow_net = allow_net;
         config.yolo = full_auto;
         config.web_code = true;
@@ -536,24 +561,15 @@ fn spawn_inner(
         Some((answer, sleep_ms)) => (Some(answer), Some(sleep_ms)),
         None => (None, None),
     };
-    let task = TaskSpec {
-        subtask_id: runtime_id.clone(),
-        goal: goal.to_string(),
-        addr: config.addr.to_string(),
-        model_id: config.model_id.clone(),
-        family: config.family.clone(),
-        workdir: root.display().to_string(),
-        max_steps: config.max_steps,
-        max_tokens: config.max_tokens,
-        depth: depth + 1,
-        auto_approve: config.auto_approve,
-        shell_mode: config.shell_mode.as_str().to_string(),
-        allow_net: config.allow_net,
-        yolo: config.yolo,
-        web_code: config.web_code,
+    let task = task_spec_from_config(
+        &config,
+        root,
+        &runtime_id,
+        goal,
+        depth + 1,
         canned_answer,
         canned_sleep_ms,
-    };
+    );
     let tpath = task_path(root, &runtime_id);
     let task_json = serde_json::to_string_pretty(&task).map_err(|e| e.to_string())?;
     std::fs::write(&tpath, task_json).map_err(|e| format!("cannot write task file: {e}"))?;
@@ -564,6 +580,7 @@ fn spawn_inner(
     cmd.arg("__subagent")
         .arg("--task-file")
         .arg(&tpath)
+        .env(super::context_paging::TASK_SCOPE_ENV, &runtime_id)
         .env(DEPTH_ENV, (depth + 1).to_string())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -621,6 +638,37 @@ fn spawn_inner(
         "status: accepted\nsubtask_id: {runtime_id}\ntask_name: {subtask_id}\nnote: child started at depth {}; call await_subagent once with the returned subtask_id",
         depth + 1
     ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn task_spec_from_config(
+    config: &SubagentConfig,
+    root: &Path,
+    runtime_id: &str,
+    goal: &str,
+    depth: usize,
+    canned_answer: Option<String>,
+    canned_sleep_ms: Option<u64>,
+) -> TaskSpec {
+    TaskSpec {
+        subtask_id: runtime_id.to_string(),
+        goal: goal.to_string(),
+        addr: config.addr.to_string(),
+        model_id: config.model_id.clone(),
+        family: config.family.clone(),
+        workdir: root.display().to_string(),
+        max_steps: config.max_steps,
+        max_tokens: config.max_tokens,
+        context_budget_tokens: config.context_budget_tokens,
+        depth,
+        auto_approve: config.auto_approve,
+        shell_mode: config.shell_mode.as_str().to_string(),
+        allow_net: config.allow_net,
+        yolo: config.yolo,
+        web_code: config.web_code,
+        canned_answer,
+        canned_sleep_ms,
+    }
 }
 
 /// Report a subagent's status (reaps first). Result text is UNTRUSTED data.
@@ -927,8 +975,8 @@ fn execute_task(task: &TaskSpec) -> TaskExecution {
         default_write_path: None,
         // A subagent runs a real, open-ended goal, so it gets the same context
         // protection the parent has.
-        ctx_budget: Some(agent::AGENT_VALIDATED_CTX),
-        context_paging: false,
+        ctx_budget: Some(worker_context_budget_tokens(task)),
+        context_paging: worker_context_paging_enabled(task),
     };
     // The parent's approval posture, with the production fail-closed honoured:
     // resolve_policy refuses blanket auto-approve under CAMELID_PRODUCTION, so a
@@ -991,6 +1039,7 @@ fn execute_task(task: &TaskSpec) -> TaskExecution {
             max_tokens,
             0.0,
         );
+        configure_worker_driver(&mut driver, task);
         agent::run_loop(
             &mut driver,
             &mut approver,
@@ -1022,6 +1071,26 @@ fn execute_task(task: &TaskSpec) -> TaskExecution {
         },
         outcome,
     }
+}
+
+fn worker_context_budget_tokens(task: &TaskSpec) -> u32 {
+    task.context_budget_tokens.max(1)
+}
+
+fn configure_worker_driver(driver: &mut super::agent::LiveDriver, task: &TaskSpec) {
+    driver.set_context_budget(Some(worker_context_budget_tokens(task)));
+    driver.set_native_tool_history(task.web_code);
+}
+
+fn worker_context_paging_enabled(task: &TaskSpec) -> bool {
+    worker_context_paging_enabled_for(
+        task,
+        super::context_paging::ContextPagingConfig::from_env().enabled,
+    )
+}
+
+fn worker_context_paging_enabled_for(task: &TaskSpec, paging_enabled: bool) -> bool {
+    task.web_code && paging_enabled
 }
 
 #[derive(Default)]
@@ -1158,6 +1227,7 @@ mod tests {
             "model".into(),
             "qwen3".into(),
             2048,
+            32_768,
             true,
             false,
             super::super::shell_sandbox::ShellSandbox::Sandboxed,
@@ -1210,6 +1280,7 @@ mod tests {
             "model".into(),
             "qwen3".into(),
             2048,
+            32_768,
             true,
             true,
             super::super::shell_sandbox::ShellSandbox::Sandboxed,
@@ -1218,6 +1289,38 @@ mod tests {
         assert!(config.yolo);
         assert!(config.allow_net);
         assert!(config.web_code);
+        assert_eq!(config.context_budget_tokens, 32_768);
+        let root = tempfile::tempdir().unwrap();
+        let task =
+            task_spec_from_config(&config, root.path(), "runtime-1", "inspect", 1, None, None);
+        assert_eq!(task.context_budget_tokens, 32_768);
+        assert_eq!(worker_context_budget_tokens(&task), 32_768);
+        let mut driver = super::super::agent::LiveDriver::with(
+            super::super::client::Client::new("127.0.0.1:8181".parse().unwrap()),
+            "model".into(),
+            "qwen3".into(),
+            2_048,
+            0.0,
+        );
+        configure_worker_driver(&mut driver, &task);
+        assert_eq!(
+            super::super::agent::ModelDriver::context_budget_tokens(&driver),
+            Some(32_768)
+        );
+        assert!(
+            worker_context_paging_enabled_for(&task, true),
+            "Web Code children must inherit the default-on paging policy"
+        );
+        assert!(
+            !worker_context_paging_enabled_for(&task, false),
+            "the explicit paging rollback must carry into Web Code children"
+        );
+        let mut legacy_task = task.clone();
+        legacy_task.web_code = false;
+        assert!(
+            !worker_context_paging_enabled_for(&legacy_task, true),
+            "legacy Full-profile children must keep their existing non-paged behavior"
+        );
         assert_eq!(
             config.shell_mode,
             super::super::shell_sandbox::ShellSandbox::Sandboxed
@@ -1243,6 +1346,7 @@ mod tests {
         assert!(!task.allow_net);
         assert!(!task.yolo);
         assert!(!task.web_code);
+        assert_eq!(task.context_budget_tokens, 8_192);
     }
 
     #[test]
@@ -1304,6 +1408,7 @@ mod tests {
             workdir: root.display().to_string(),
             max_steps: 4,
             max_tokens: 64,
+            context_budget_tokens: 32_768,
             depth: 1,
             auto_approve: false,
             shell_mode: "sandboxed".to_string(),

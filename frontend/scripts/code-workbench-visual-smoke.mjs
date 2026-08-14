@@ -245,6 +245,13 @@ try {
         state: 'waiting_for_events',
         max_steps: 48,
         max_tokens: 768,
+        context_window: {
+          mode: 'auto',
+          effective_tokens: 12_288,
+          safe_max_tokens: 12_288,
+          model_max_tokens: 40_960,
+          limiting_factor: 'available_memory',
+        },
         allow_writes: true,
         approval_mode: body.approval_mode,
         allow_network: body.allow_network,
@@ -271,6 +278,12 @@ try {
   await page.type('.code-composer textarea', 'Inspect the WebUI and build an interactive coding agent experience.')
   await page.click('.code-composer__send')
   await page.waitForSelector('.code-inline-approval.is-pending', { timeout: 5000 })
+  await page.evaluate(() => {
+    const sessionSummary = [...document.querySelectorAll('.ci-fold > summary')]
+      .find((node) => node.querySelector('span')?.textContent.trim() === 'Session')
+    sessionSummary?.click()
+  })
+  await page.waitForSelector('.ci-kv--wide')
 
   const pendingState = await page.evaluate(() => ({
     href: location.hash,
@@ -279,6 +292,11 @@ try {
     hasToolCard: Boolean(document.querySelector('.code-tool-card')),
     planText: document.querySelector('.code-plan-update')?.textContent.replace(/\s+/g, ' ').trim(),
     hasStepChip: [...document.querySelectorAll('.code-composer__chips > span')].some((node) => node.textContent.includes('steps')),
+    contextChip: document.querySelector('.code-context-chip')?.textContent.replace(/\s+/g, ' ').trim(),
+    sessionDetails: Object.fromEntries([...document.querySelectorAll('.ci-kv--wide > div')].map((row) => [
+      row.querySelector('dt')?.textContent.trim(),
+      row.querySelector('dd')?.textContent.replace(/\s+/g, ' ').trim(),
+    ])),
     hasApproval: Boolean(document.querySelector('.code-inline-approval.is-pending')),
     hasInspector: Boolean(document.querySelector('.code-inspector')),
     agents: [...document.querySelectorAll('.code-agent-list li')].map((node) => node.textContent.replace(/\s+/g, ' ').trim()),
@@ -311,6 +329,10 @@ try {
     || !pendingState.hasComposer
     || !pendingState.planText?.includes('Working on: Build the interactive agent component')
     || !pendingState.planText?.includes('Run focused regression tests')
+    || pendingState.contextChip !== 'Auto · 12K'
+    || pendingState.sessionDetails.Context !== 'Auto · 12K'
+    || pendingState.sessionDetails['Model max'] !== '40K'
+    || pendingState.sessionDetails['Limited by'] !== 'Available memory'
     || pendingState.hasStepChip) {
     throw new Error(`interactive workbench did not render: ${JSON.stringify(pendingState)}`)
   }

@@ -149,6 +149,36 @@ impl HardwareProfile {
     }
 }
 
+/// A live snapshot of physical host memory.
+///
+/// Unlike [`HardwareProfile::cached`], this value is intentionally sampled for
+/// each context-window decision: available memory can change materially after a
+/// model is loaded or another application starts. `available_bytes` is the
+/// operating system's best estimate of memory available to new allocations, not
+/// merely the number of currently unused pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HostMemoryStatus {
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+}
+
+/// Query total and currently available physical RAM without using the cached
+/// capability profile. `None` means the platform probe failed or returned an
+/// unusable zero value, in which case callers must use a bounded fallback rather
+/// than deriving an allocation from it.
+pub(crate) fn live_host_memory_status() -> Option<HostMemoryStatus> {
+    let (total_bytes, available_bytes) = host_ram_bytes();
+    if total_bytes == 0 || available_bytes == 0 {
+        return None;
+    }
+    Some(HostMemoryStatus {
+        total_bytes,
+        // Be defensive about a transient or platform-specific probe reporting
+        // reclaimable memory above physical memory.
+        available_bytes: available_bytes.min(total_bytes),
+    })
+}
+
 fn detect_simd() -> SimdCaps {
     #[cfg(target_arch = "x86_64")]
     {

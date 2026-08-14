@@ -869,12 +869,7 @@ pub fn run_loop(
         let mut paging_config = ContextPagingConfig::from_env();
         paging_config.enabled = true;
         if let Some(model_budget) = driver.context_budget_tokens() {
-            let reserved = paging_config
-                .output_reserve
-                .saturating_add(paging_config.safety_reserve);
-            paging_config.max_input_tokens = paging_config
-                .max_input_tokens
-                .min(model_budget.saturating_sub(reserved).max(256));
+            paging_config.apply_model_budget(model_budget);
         }
         match ContextPagingRuntime::open(sandbox.root(), &task_objective, paging_config) {
             Ok(mut runtime) => {
@@ -2477,9 +2472,27 @@ pub fn run_loop(
                         ApprovalTier::Deny => Decision::No,
                     };
 
-                    // Captured immediately before execution (after any approval
-                    // wait) so the run_shell change-scan below compares against
-                    // the tightest honest window.
+                    // Snapshot after approval and immediately before execution.
+                    // Path-set/state comparison is the primary mutation proof:
+                    // Windows can stamp the first newly-created file a fraction
+                    // before SystemTime::now(), so timestamps alone occasionally
+                    // counted 998/999 files in a 1,000-file command. Until the
+                    // first change, inspect every shell action; afterwards only
+                    // mutation-shaped shells need the two bounded tree walks.
+                    let shell_workspace_before = if require_workspace_change
+                        && matches!(decision, Decision::Once | Decision::AlwaysTool)
+                        && matches!(
+                            &action,
+                            Action::RunShell { .. }
+                                | Action::RunPowerShell { .. }
+                                | Action::RunWindowsCommand { .. }
+                        )
+                        && (!workspace_changed || shell_action_is_mutation_shaped(&action))
+                    {
+                        Some(workspace_snapshot(sandbox.root()))
+                    } else {
+                        None
+                    };
                     let action_started_at = std::time::SystemTime::now();
                     let tool_started = Instant::now();
                     let outcome = match decision {
@@ -2540,6 +2553,31 @@ pub fn run_loop(
                             }
                         }
                         None => outcome,
+                    };
+                    // Shells can exit zero while completely missing the requested
+                    // workspace (the canonical Windows failure is
+                    // Path.GetTempFileName(), which returns an absolute %TEMP%
+                    // path). Observe the filesystem before clipping/compaction so
+                    // the model sees what the host verified, not merely an empty
+                    // stdout. Conversely, a build/read-only command that changes
+                    // nothing is still an honest success: only mutation-shaped
+                    // commands are converted into a corrective error.
+                    // Diff even after a non-zero exit: shells are not
+                    // transactional. A loop can create 900 files and then throw;
+                    // hiding those mutations primes the model to duplicate them.
+                    let shell_workspace_changes =
+                        shell_workspace_before.as_ref().and_then(|before| {
+                            workspace_changes_since(sandbox.root(), action_started_at, before)
+                        });
+                    let outcome = if let Some(changes) = shell_workspace_changes.as_ref() {
+                        shell_outcome_with_workspace_evidence(outcome, changes)
+                    } else if !outcome.is_err()
+                        && shell_action_is_mutation_shaped(&action)
+                        && require_workspace_change
+                    {
+                        ToolOutcome::Err(shell_no_workspace_change_error(&action, outcome.text()))
+                    } else {
+                        outcome
                     };
                     let raw_outcome_for_paging = context_paging.as_ref().map(|_| outcome.clone());
                     let outcome = match cfg.tool_profile.observation_limit() {
@@ -2631,54 +2669,39 @@ pub fn run_loop(
                     // workspace file", so the model burned its remaining steps
                     // re-running `dir /b` to prove work it had already done and
                     // died on the repeat guard.
-                    if require_workspace_change
-                        && !workspace_changed
-                        && !outcome.is_err()
-                        && matches!(
-                            &action,
-                            Action::RunShell { .. }
-                                | Action::RunPowerShell { .. }
-                                | Action::RunWindowsCommand { .. }
-                        )
-                    {
-                        if let Some(shell_changed_paths) =
-                            workspace_changes_since(sandbox.root(), action_started_at)
-                        {
-                            workspace_changed = true;
-                            for relative in shell_changed_paths {
-                                let relative = normalize_workspace_path(&relative);
-                                pending_verification_paths.insert(relative.clone());
-                                if context_paging.is_some() {
-                                    let read_call = ToolCall {
-                                        name: "read_file".into(),
-                                        args: json!({"path": relative.clone()}),
-                                    };
-                                    if let Ok(read_action) =
-                                        tools::validate_for(cfg.tool_profile, &read_call, sandbox)
-                                    {
-                                        reporter.tool_call(&read_action.call_line(sandbox));
-                                        let captured = execute_audited(
-                                            &read_action,
-                                            sandbox,
-                                            ApprovalTier::Auto,
-                                            &read_call.args,
-                                            cfg.audit.as_ref(),
-                                            cancel,
-                                        )
-                                        .clipped(
-                                            cfg.tool_profile
-                                                .observation_limit()
-                                                .unwrap_or(usize::MAX),
-                                        );
-                                        reporter.tool_result("read_file", &captured);
-                                        if !captured.is_err() {
-                                            let source = captured.text().to_string();
-                                            pending_verification_paths.remove(&relative);
-                                            successful_workspace_reads.insert(relative.clone());
-                                            workspace_observations
-                                                .push(("read_file".into(), source.clone()));
-                                            host_captured_sources.push((relative, source));
-                                        }
+                    if let Some(changes) = shell_workspace_changes {
+                        workspace_changed = true;
+                        for relative in changes.sample_paths {
+                            let relative = normalize_workspace_path(&relative);
+                            pending_verification_paths.insert(relative.clone());
+                            if context_paging.is_some() {
+                                let read_call = ToolCall {
+                                    name: "read_file".into(),
+                                    args: json!({"path": relative.clone()}),
+                                };
+                                if let Ok(read_action) =
+                                    tools::validate_for(cfg.tool_profile, &read_call, sandbox)
+                                {
+                                    reporter.tool_call(&read_action.call_line(sandbox));
+                                    let captured = execute_audited(
+                                        &read_action,
+                                        sandbox,
+                                        ApprovalTier::Auto,
+                                        &read_call.args,
+                                        cfg.audit.as_ref(),
+                                        cancel,
+                                    )
+                                    .clipped(
+                                        cfg.tool_profile.observation_limit().unwrap_or(usize::MAX),
+                                    );
+                                    reporter.tool_result("read_file", &captured);
+                                    if !captured.is_err() {
+                                        let source = captured.text().to_string();
+                                        pending_verification_paths.remove(&relative);
+                                        successful_workspace_reads.insert(relative.clone());
+                                        workspace_observations
+                                            .push(("read_file".into(), source.clone()));
+                                        host_captured_sources.push((relative, source));
                                     }
                                 }
                             }
@@ -3519,16 +3542,144 @@ fn workspace_request_requires_change(history: &[AgentMsg]) -> bool {
         "generate ",
         "make a ",
         "make me",
+        "delete ",
+        "remove ",
+        "erase ",
+        "move ",
+        "rename ",
+        "copy ",
     ]
     .iter()
     .any(|phrase| request.contains(phrase))
 }
 
-/// What changed under `root` at or after `since`? Returns `None` when nothing
-/// did, `Some(paths)` when something did — `paths` holds up to
-/// `MAX_CHANGED_PATHS_REPORTED` workspace-relative FILE paths for the semantic
-/// post-change capture (a delete-only change yields `Some` with an empty list:
-/// the parent directory's mtime moved but there is no file to re-read).
+#[derive(Debug)]
+struct WorkspaceChanges {
+    /// Exact while `scan_truncated` is false. Keeping this separate from the
+    /// samples lets a 1,000-file generation report 1,000 without scheduling
+    /// 1,000 automatic read_file calls.
+    changed_file_count: usize,
+    changed_directory_count: usize,
+    deleted_file_count: usize,
+    deleted_directory_count: usize,
+    sample_paths: Vec<String>,
+    scan_truncated: bool,
+}
+
+impl WorkspaceChanges {
+    fn has_changes(&self) -> bool {
+        self.changed_file_count > 0
+            || self.changed_directory_count > 0
+            || self.deleted_file_count > 0
+            || self.deleted_directory_count > 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceEntryKind {
+    File,
+    Directory,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkspaceEntryState {
+    kind: WorkspaceEntryKind,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+#[derive(Debug)]
+struct WorkspaceSnapshot {
+    entries: BTreeMap<String, WorkspaceEntryState>,
+    scan_truncated: bool,
+}
+
+const MAX_CHANGE_SCAN_ENTRIES: usize = 50_000;
+const MAX_CHANGED_PATH_SAMPLES: usize = 32;
+
+/// Capture a bounded tree baseline without following symlinked directories.
+/// Entries are sorted per directory so the cap has deterministic semantics.
+fn workspace_snapshot(root: &Path) -> WorkspaceSnapshot {
+    let mut entries_by_path = BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    let mut seen = 0usize;
+    let mut scan_truncated = false;
+
+    'walk: while let Some(dir) = stack.pop() {
+        let Ok(read_dir) = std::fs::read_dir(&dir) else {
+            scan_truncated = true;
+            continue;
+        };
+        let mut entries = read_dir.flatten().collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        let mut child_dirs = Vec::new();
+        for entry in entries {
+            seen = seen.saturating_add(1);
+            if seen > MAX_CHANGE_SCAN_ENTRIES {
+                scan_truncated = true;
+                break 'walk;
+            }
+            if super::tools::SEARCH_SKIP_DIRS
+                .iter()
+                .any(|skip| entry.file_name() == *skip)
+            {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                scan_truncated = true;
+                continue;
+            };
+            let metadata = if file_type.is_symlink() {
+                std::fs::symlink_metadata(entry.path())
+            } else {
+                entry.metadata()
+            };
+            let Ok(metadata) = metadata else {
+                scan_truncated = true;
+                continue;
+            };
+            let kind = if file_type.is_symlink() {
+                WorkspaceEntryKind::Other
+            } else if metadata.is_file() {
+                WorkspaceEntryKind::File
+            } else if metadata.is_dir() {
+                WorkspaceEntryKind::Directory
+            } else {
+                WorkspaceEntryKind::Other
+            };
+            let Ok(relative) = entry.path().strip_prefix(root).map(Path::to_path_buf) else {
+                scan_truncated = true;
+                continue;
+            };
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            entries_by_path.insert(
+                relative,
+                WorkspaceEntryState {
+                    kind,
+                    len: metadata.len(),
+                    modified: metadata.modified().ok(),
+                },
+            );
+            if kind == WorkspaceEntryKind::Directory && !file_type.is_symlink() {
+                child_dirs.push(entry.path());
+            }
+        }
+        // Stack is LIFO; reverse insertion visits the lexicographically first
+        // directory first if the global entry cap is ever reached.
+        child_dirs.reverse();
+        stack.extend(child_dirs);
+    }
+    WorkspaceSnapshot {
+        entries: entries_by_path,
+        scan_truncated,
+    }
+}
+
+/// Compare a pre-execution tree baseline with current state. New/deleted paths
+/// are clock-independent, fixing Windows bulk-creation undercounts. Metadata
+/// catches ordinary modifications. macOS retains a narrow legacy fallback for
+/// HFS+ same-size rewrites whose one-second mtime did not advance.
 ///
 /// Bounded and fail-closed: walks at most `MAX_CHANGE_SCAN_ENTRIES` entries
 /// (without following symlinks); hitting the cap with nothing found returns
@@ -3536,67 +3687,323 @@ fn workspace_request_requires_change(history: &[AgentMsg]) -> bool {
 /// contract stays as strict as before. `.camelid/` is the agent's own
 /// bookkeeping (checkpoints, subagent results) and is skipped, or every turn
 /// would count as a workspace change.
-fn workspace_changes_since(root: &Path, since: std::time::SystemTime) -> Option<Vec<String>> {
-    const MAX_CHANGE_SCAN_ENTRIES: usize = 50_000;
-    // Bulk generation is an advertised run_shell use case. Eight paths meant a
-    // 100-file command was accepted after the host inspected only its first
-    // eight outputs. Keep the scan bounded, but cover realistic generated sets.
-    const MAX_CHANGED_PATHS_REPORTED: usize = 256;
-    // HFS+ (this user's external T7, where real checkouts live) stores mtimes at
-    // ONE-SECOND granularity, truncating downward — a file written 300ms after
-    // `since` stats as the floor of the second and compares BELOW it, silently
-    // reverting this feature to the nag loop it exists to fix. One second of
-    // slack accepts those; the false-positive window it opens (a write in the
-    // second before the command ran) is negligible against a fresh SystemTime.
-    let since = since
+fn workspace_changes_since(
+    root: &Path,
+    since: std::time::SystemTime,
+    before: &WorkspaceSnapshot,
+) -> Option<WorkspaceChanges> {
+    let after = workspace_snapshot(root);
+    #[cfg(target_os = "macos")]
+    let coarse_since = since
         .checked_sub(std::time::Duration::from_secs(1))
         .unwrap_or(since);
-    // A delete-only command bumps the PARENT directory's mtime; the walk below
-    // only inspects entries, so the root itself needs its own check.
-    let mut changed = std::fs::metadata(root)
-        .and_then(|metadata| metadata.modified())
-        .is_ok_and(|modified| modified >= since);
-    let mut paths = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    let mut seen = 0usize;
-    'walk: while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
+    #[cfg(not(target_os = "macos"))]
+    let _ = since;
+
+    let mut changed_file_count = 0usize;
+    let mut changed_directory_count = 0usize;
+    let mut deleted_file_count = 0usize;
+    let mut deleted_directory_count = 0usize;
+    let mut sample_paths = BTreeSet::new();
+
+    for (relative, state) in &after.entries {
+        let state_changed = match before.entries.get(relative) {
+            Some(previous) => previous != state,
+            None if !before.scan_truncated => true,
+            // An incomplete baseline cannot prove this is a newly-created path.
+            // Fall back to the tight execution timestamp and otherwise fail closed.
+            None => state.modified.is_some_and(|modified| modified >= since),
         };
-        for entry in entries.flatten() {
-            seen += 1;
-            if seen > MAX_CHANGE_SCAN_ENTRIES {
-                break 'walk;
-            }
-            // Same skip set as `search`: VCS/build internals are not "the
-            // requested workspace change". Counting a `.git/index` or `target/`
-            // write here disarmed the completion contract on the canonical
-            // first action of a fix turn (`git checkout -b`, `cargo build`) and
-            // fed binary build artifacts into the semantic capture as
-            // "verification evidence".
-            if super::tools::SEARCH_SKIP_DIRS
-                .iter()
-                .any(|skip| entry.file_name() == *skip)
-            {
-                continue;
-            }
-            let Ok(metadata) = entry.metadata() else {
-                continue;
-            };
-            if metadata.modified().is_ok_and(|modified| modified >= since) {
-                changed = true;
-                if metadata.is_file() && paths.len() < MAX_CHANGED_PATHS_REPORTED {
-                    if let Ok(relative) = entry.path().strip_prefix(root) {
-                        paths.push(relative.to_string_lossy().replace('\\', "/"));
-                    }
+        #[cfg(target_os = "macos")]
+        let state_changed = state_changed
+            || state
+                .modified
+                .is_some_and(|modified| modified >= coarse_since);
+        if !state_changed {
+            continue;
+        }
+        match state.kind {
+            WorkspaceEntryKind::File => {
+                changed_file_count = changed_file_count.saturating_add(1);
+                sample_paths.insert(relative.clone());
+                if sample_paths.len() > MAX_CHANGED_PATH_SAMPLES {
+                    sample_paths.pop_last();
                 }
             }
-            if metadata.is_dir() && !metadata.is_symlink() {
-                stack.push(entry.path());
+            WorkspaceEntryKind::Directory => {
+                changed_directory_count = changed_directory_count.saturating_add(1);
+            }
+            WorkspaceEntryKind::Other => {}
+        }
+    }
+    // Missing entries are trustworthy only when both bounded walks completed;
+    // otherwise a path may be absent merely because one snapshot hit the cap.
+    if !before.scan_truncated && !after.scan_truncated {
+        for (relative, state) in &before.entries {
+            if after.entries.contains_key(relative) {
+                continue;
+            }
+            match state.kind {
+                WorkspaceEntryKind::File => {
+                    deleted_file_count = deleted_file_count.saturating_add(1)
+                }
+                WorkspaceEntryKind::Directory => {
+                    deleted_directory_count = deleted_directory_count.saturating_add(1)
+                }
+                WorkspaceEntryKind::Other => {}
             }
         }
     }
-    changed.then_some(paths)
+
+    let changes = WorkspaceChanges {
+        changed_file_count,
+        changed_directory_count,
+        deleted_file_count,
+        deleted_directory_count,
+        sample_paths: sample_paths.into_iter().collect(),
+        scan_truncated: before.scan_truncated || after.scan_truncated,
+    };
+    changes.has_changes().then_some(changes)
+}
+
+fn shell_action_command(action: &Action) -> Option<&str> {
+    match action {
+        Action::RunShell { command }
+        | Action::RunPowerShell { command, .. }
+        | Action::RunWindowsCommand { command, .. } => Some(command),
+        _ => None,
+    }
+}
+
+fn shell_action_executable_projection(action: &Action) -> Option<String> {
+    let command = shell_action_command(action)?;
+    #[cfg(windows)]
+    if matches!(
+        action,
+        Action::RunPowerShell { .. } | Action::RunWindowsCommand { .. }
+    ) {
+        return Some(super::tools::powershell_executable_projection(command));
+    }
+    Some(command.to_string())
+}
+
+fn shell_action_invokes_new_temporary_file(action: &Action) -> bool {
+    #[cfg(windows)]
+    if let Action::RunPowerShell { command, .. } | Action::RunWindowsCommand { command, .. } =
+        action
+    {
+        return super::tools::powershell_invokes_new_temporary_file(command);
+    }
+    false
+}
+
+fn shell_action_invokes_mutating_powershell_command(action: &Action) -> bool {
+    #[cfg(windows)]
+    if let Action::RunPowerShell { command, .. } | Action::RunWindowsCommand { command, .. } =
+        action
+    {
+        return [
+            "Set-Content",
+            "Add-Content",
+            "Out-File",
+            "New-Item",
+            "Remove-Item",
+            "Copy-Item",
+            "Move-Item",
+            "Rename-Item",
+            "Clear-Content",
+            "Tee-Object",
+            "tee",
+            "New-TemporaryFile",
+        ]
+        .iter()
+        .any(|target| super::tools::powershell_invokes_command(command, target));
+    }
+    false
+}
+
+fn powershell_projection_has_file_redirection(executable: &str) -> bool {
+    let bytes = executable.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] != b'>' {
+            index += 1;
+            continue;
+        }
+        index += 1;
+        if index < bytes.len() && bytes[index] == b'>' {
+            index += 1;
+        }
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        // `2>&1` is stream merging, not a filesystem destination. `$null` is
+        // PowerShell's explicit sink and likewise cannot change the workspace.
+        if index < bytes.len() && bytes[index] == b'&' {
+            continue;
+        }
+        if executable[index..]
+            .to_ascii_lowercase()
+            .starts_with("$null")
+        {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+/// A narrow classifier, deliberately excluding compilers, test runners and
+/// package builds: those can legitimately exit zero without touching source.
+fn shell_action_is_mutation_shaped(action: &Action) -> bool {
+    let Some(executable) = shell_action_executable_projection(action) else {
+        return false;
+    };
+    let lowered = executable.to_ascii_lowercase();
+    if matches!(
+        action,
+        Action::RunPowerShell { .. } | Action::RunWindowsCommand { .. }
+    ) {
+        let compact: String = lowered
+            .chars()
+            .filter(|character| !character.is_ascii_whitespace())
+            .collect();
+        return shell_action_invokes_mutating_powershell_command(action)
+            || [
+                "::createtext(",
+                "::writealltext(",
+                "::writeallbytes(",
+                "::create(",
+            ]
+            .iter()
+            .any(|marker| compact.contains(marker))
+            || powershell_projection_has_file_redirection(&executable);
+    }
+    let trimmed = lowered.trim_start();
+    // Do not mistake a query ABOUT a mutating command for the command itself.
+    // These are common during repository discovery and can legitimately return
+    // zero matches without changing the workspace.
+    let standalone_observation = [
+        "rg ",
+        "grep ",
+        "git grep ",
+        "findstr ",
+        "select-string ",
+        "get-content ",
+        "cat ",
+        "type ",
+        "echo ",
+    ]
+    .iter()
+    .any(|prefix| trimmed.starts_with(prefix))
+        && !trimmed
+            .chars()
+            .any(|character| matches!(character, ';' | '|' | '\n' | '\r'));
+    if standalone_observation {
+        return false;
+    }
+    [
+        "set-content",
+        "add-content",
+        "out-file",
+        "new-item",
+        "remove-item",
+        "copy-item",
+        "move-item",
+        "::createtext(",
+        "::writealltext(",
+        "::writeallbytes(",
+        "touch ",
+        "mkdir ",
+        "tee ",
+    ]
+    .iter()
+    .any(|marker| lowered.contains(marker))
+}
+
+fn shell_no_workspace_change_error(action: &Action, shell_output: &str) -> String {
+    let command = shell_action_executable_projection(action).unwrap_or_default();
+    let compact: String = command
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect();
+    let guidance = if compact.contains("gettempfilename(") {
+        concat!(
+            " `Path.GetTempFileName()` creates and returns an absolute file under `%TEMP%`, not ",
+            "under the PowerShell working directory. Use a leaf-only random name (for example ",
+            "`[guid]::NewGuid().ToString('N') + '.txt'`), join it to `(Get-Location)`, and write ",
+            "that workspace-relative destination with `Set-Content`."
+        )
+    } else if shell_action_invokes_new_temporary_file(action) {
+        concat!(
+            " `New-TemporaryFile` creates its file under `%TEMP%`, not under the PowerShell ",
+            "working directory. Generate a leaf-only random name (for example ",
+            "`[guid]::NewGuid().ToString('N') + '.txt'`), join it to `(Get-Location)`, and write ",
+            "that workspace destination with `Set-Content`."
+        )
+    } else {
+        " Use workspace-relative destinations (or join leaf names to the current working directory), then verify the workspace inventory."
+    };
+    let output = if shell_output.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" Shell output was:\n{shell_output}")
+    };
+    format!(
+        "command exited successfully but made no detectable change inside the workspace.{guidance} Do not repeat this command unchanged.{output}"
+    )
+}
+
+fn shell_outcome_with_workspace_evidence(
+    outcome: ToolOutcome,
+    changes: &WorkspaceChanges,
+) -> ToolOutcome {
+    let file_noun = if changes.changed_file_count == 1 {
+        "file"
+    } else {
+        "files"
+    };
+    let directory_noun = if changes.changed_directory_count == 1 {
+        "directory"
+    } else {
+        "directories"
+    };
+    let sample = if changes.sample_paths.is_empty() {
+        "no surviving changed file to sample (for example, a delete-only change)".to_string()
+    } else {
+        format!(
+            "sampled {}/{}: {}",
+            changes.sample_paths.len(),
+            changes.changed_file_count,
+            changes.sample_paths.join(", ")
+        )
+    };
+    let evidence = if changes.scan_truncated {
+        format!(
+            "[host verification (bounded scan incomplete; counts are non-exhaustive \
+             observations): observed {} changed workspace {file_noun}, {} changed \
+             {directory_noun}, {} deleted files and {} deleted directories; {sample}]",
+            changes.changed_file_count,
+            changes.changed_directory_count,
+            changes.deleted_file_count,
+            changes.deleted_directory_count,
+        )
+    } else {
+        format!(
+            "[host verification: command changed {} workspace {file_noun}, changed {} \
+             {directory_noun}, deleted {} files and {} directories; {sample}]",
+            changes.changed_file_count,
+            changes.changed_directory_count,
+            changes.deleted_file_count,
+            changes.deleted_directory_count,
+        )
+    };
+    match outcome {
+        ToolOutcome::Ok(text) if text.is_empty() => ToolOutcome::Ok(evidence),
+        ToolOutcome::Ok(text) => ToolOutcome::Ok(format!("{evidence}\n{text}")),
+        ToolOutcome::Err(text) => ToolOutcome::Err(format!("{evidence}\n{text}")),
+    }
 }
 
 /// Append a mid-turn correction as a tagged USER turn, not a system message.
@@ -5453,6 +5860,7 @@ pub fn run_exec(
         session.active_id.clone().unwrap_or_default(),
         session.active_family(),
         cfg.max_tokens,
+        cfg.ctx_budget.unwrap_or(8_192),
         cfg.auto_approve,
         cfg.shell_sandbox,
     ));
@@ -5641,6 +6049,7 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
         session.active_id.clone().unwrap_or_default(),
         session.active_family(),
         cfg.max_tokens,
+        cfg.ctx_budget.unwrap_or(8_192),
         cfg.auto_approve,
         cfg.shell_sandbox,
     ));
@@ -7614,25 +8023,158 @@ mod tests {
         assert!(answer.contains("README.md"), "got {answer:?}");
     }
 
-    /// The semantic capture must cover the observed 100-file bulk-generation
-    /// failure, not silently inspect only the first eight paths.
+    /// Count the complete bulk change while retaining only a deterministic,
+    /// bounded semantic sample. A thousand-file request must not enqueue a
+    /// thousand automatic read_file calls just to prove the shell changed them.
     #[test]
-    fn shell_change_scan_captures_a_hundred_files() {
+    fn shell_change_scan_counts_a_thousand_files_with_bounded_samples() {
         let dir = tempfile::tempdir().unwrap();
-        let since = std::time::SystemTime::now();
-        for index in 1..=100 {
+        let before = workspace_snapshot(dir.path());
+        // Deliberately put the timestamp after every write. The pre/post path
+        // baseline, not a forgiving clock window, must identify all new files.
+        let since = std::time::SystemTime::now() + Duration::from_secs(60);
+        for index in 1..=1_000 {
             std::fs::write(
                 dir.path().join(format!("generated-{index}.txt")),
                 index.to_string(),
             )
             .unwrap();
         }
-        let paths = workspace_changes_since(dir.path(), since).expect("changes must be detected");
-        let paths = paths.into_iter().collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(paths.len(), 100, "every generated file must be verified");
-        for index in 1..=100 {
-            assert!(paths.contains(&format!("generated-{index}.txt")));
+        let changes =
+            workspace_changes_since(dir.path(), since, &before).expect("changes must be detected");
+        assert_eq!(changes.changed_file_count, 1_000);
+        assert!(!changes.scan_truncated);
+        assert_eq!(changes.sample_paths.len(), 32);
+        assert!(changes
+            .sample_paths
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]));
+        for relative in &changes.sample_paths {
+            assert!(dir.path().join(relative).is_file());
         }
+        let annotated =
+            shell_outcome_with_workspace_evidence(ToolOutcome::Ok(String::new()), &changes);
+        assert!(annotated.text().contains("changed 1000 workspace files"));
+        assert!(annotated.text().contains("sampled 32/1000"));
+    }
+
+    #[test]
+    fn shell_change_scan_tracks_empty_directories_and_deletions() {
+        let dir = tempfile::tempdir().unwrap();
+        let before_create = workspace_snapshot(dir.path());
+        let since_create = std::time::SystemTime::now();
+        std::fs::create_dir(dir.path().join("empty-dir")).unwrap();
+        let created = workspace_changes_since(dir.path(), since_create, &before_create)
+            .expect("empty directory creation is a real tree mutation");
+        assert_eq!(created.changed_file_count, 0);
+        assert_eq!(created.changed_directory_count, 1);
+        assert_eq!(created.deleted_directory_count, 0);
+
+        let before_delete = workspace_snapshot(dir.path());
+        let since_delete = std::time::SystemTime::now();
+        std::fs::remove_dir(dir.path().join("empty-dir")).unwrap();
+        let deleted = workspace_changes_since(dir.path(), since_delete, &before_delete)
+            .expect("empty directory deletion is a real tree mutation");
+        assert_eq!(deleted.changed_file_count, 0);
+        assert_eq!(deleted.deleted_file_count, 0);
+        assert_eq!(deleted.deleted_directory_count, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_symlink_target_change_is_not_workspace_progress() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("outside.txt");
+        std::fs::write(&target, "before").unwrap();
+        symlink(&target, workspace.path().join("linked.txt")).unwrap();
+        let before = workspace_snapshot(workspace.path());
+        assert_eq!(
+            before.entries.get("linked.txt").map(|state| state.kind),
+            Some(WorkspaceEntryKind::Other)
+        );
+        let since = std::time::SystemTime::now();
+        std::fs::write(&target, "after and larger").unwrap();
+        assert!(workspace_changes_since(workspace.path(), since, &before).is_none());
+    }
+
+    #[test]
+    fn read_only_and_build_shell_commands_remain_success_shaped() {
+        for command in [
+            "Get-ChildItem -LiteralPath .",
+            "cargo test --lib",
+            "git status --short",
+            "rg -n \"Set-Content\" .",
+            "Select-String -Pattern 'CreateText' -Path script.ps1",
+        ] {
+            assert!(
+                !shell_action_is_mutation_shaped(&Action::RunShell {
+                    command: command.into(),
+                }),
+                "read-only/build command was misclassified: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn temp_file_api_gets_workspace_specific_recovery_guidance() {
+        let command = concat!(
+            "$filename = [System.IO.Path]::GetTempFileName(); ",
+            "[System.IO.File]::CreateText($filename).Close()"
+        )
+        .to_string();
+        let action = Action::RunShell { command };
+        assert!(shell_action_is_mutation_shaped(&action));
+        let error = shell_no_workspace_change_error(&action, "");
+        assert!(error.contains("%TEMP%"));
+        assert!(error.contains("Get-Location"));
+        assert!(error.contains("Do not repeat"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_mutation_classifier_ignores_inert_text_but_keeps_later_code() {
+        let action = |command: &str| Action::RunPowerShell {
+            workdir: PathBuf::from("."),
+            command: command.into(),
+            timeout: Duration::from_secs(1),
+        };
+        assert!(!shell_action_is_mutation_shaped(&action(
+            "git grep Set-Content"
+        )));
+        assert!(!shell_action_is_mutation_shaped(&action(
+            "Write-Output \"documentation mentions Set-Content and CreateText\""
+        )));
+        assert!(!shell_action_is_mutation_shaped(&action(
+            "Get-Content docs.txt | Select-String Set-Content"
+        )));
+        assert!(shell_action_is_mutation_shaped(&action(
+            "Get-Content input.txt | Set-Content output.txt"
+        )));
+        let inert_temp_name = action("Write-Output New-TemporaryFile");
+        assert!(!shell_action_is_mutation_shaped(&inert_temp_name));
+        assert!(!shell_no_workspace_change_error(&inert_temp_name, "").contains("%TEMP%"));
+        assert!(shell_action_is_mutation_shaped(&action(
+            "Select-String -Pattern 'Set-Content' -Path docs.txt; Set-Content -Path made.txt -Value made"
+        )));
+        assert!(shell_action_is_mutation_shaped(&action(
+            "Write-Output \"created: $(Set-Content -Path made.txt -Value made)\""
+        )));
+        let quoted_temp_docs = action(concat!(
+            "if ($false) { Set-Content -Path never.txt -Value never }; ",
+            "Write-Output \"GetTempFileName and New-TemporaryFile are documented here\""
+        ));
+        assert!(shell_action_is_mutation_shaped(&quoted_temp_docs));
+        let generic_error = shell_no_workspace_change_error(&quoted_temp_docs, "");
+        assert!(!generic_error.contains("%TEMP%"));
+
+        let executable_temp = action("$file = New-TemporaryFile; Write-Output $file.FullName");
+        assert!(shell_action_is_mutation_shaped(&executable_temp));
+        let temp_error = shell_no_workspace_change_error(&executable_temp, "");
+        assert!(temp_error.contains("New-TemporaryFile"));
+        assert!(temp_error.contains("%TEMP%"));
     }
 
     /// A Code turn that does its work through one run_shell loop (exactly what
@@ -7752,6 +8294,234 @@ mod tests {
             "the PowerShell change must satisfy the contract: {:?}",
             reporter.notices
         );
+    }
+
+    /// Exit status alone cannot prove a mutating command reached the workspace.
+    /// Feed the loop a safe PowerShell branch that contains a write but never
+    /// executes it: the first result must be a corrective error, allowing the
+    /// model to switch actions instead of repeating an empty success.
+    #[cfg(windows)]
+    #[test]
+    fn zero_exit_mutation_with_no_workspace_change_is_corrected_before_retry() {
+        let _cp = super::super::checkpoint::tests::cp_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(30)).unwrap();
+        let mut driver = MockDriver {
+            steps: vec![
+                ModelStep::Calls(vec![tc(
+                    "run_shell",
+                    json!({"command": "if ($false) { Set-Content -LiteralPath 'never.txt' -Value 'never' }"}),
+                )]),
+                ModelStep::Calls(vec![tc(
+                    "write_file",
+                    json!({"path": "created.txt", "content": "created in workspace\n"}),
+                )]),
+                ModelStep::Calls(vec![tc("read_file", json!({"path": "created.txt"}))]),
+                ModelStep::Text("Created and verified created.txt in the workspace.".into()),
+            ],
+            idx: 0,
+        };
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(
+            "create a text file in the working directory".into(),
+        )];
+        let mut config = cfg(dir.path(), false);
+        config.max_steps = 0;
+        config.tool_profile = tools::ToolProfile::WebCode;
+        let end = run_loop(
+            &mut driver,
+            &mut ScriptApprover(vec![Decision::Once, Decision::Once], 0),
+            &mut reporter,
+            &sb,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
+        assert!(!dir.path().join("never.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("created.txt")).unwrap(),
+            "created in workspace\n"
+        );
+        assert!(history.iter().any(|message| matches!(
+            message,
+            AgentMsg::ToolResult { name, outcome }
+                if name == "run_shell"
+                    && outcome.is_err()
+                    && outcome.text().contains("made no detectable change inside the workspace")
+                    && outcome.text().contains("Do not repeat")
+        )));
+    }
+
+    /// A prior successful write must not disable the same guard for a later
+    /// mutation-shaped shell miss. Multi-part tasks commonly create one file,
+    /// then accidentally direct the next batch somewhere else.
+    #[cfg(windows)]
+    #[test]
+    fn later_zero_exit_mutation_is_still_corrected_after_an_earlier_write() {
+        let _cp = super::super::checkpoint::tests::cp_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(30)).unwrap();
+        let mut driver = MockDriver {
+            steps: vec![
+                ModelStep::Calls(vec![tc(
+                    "write_file",
+                    json!({"path": "first.txt", "content": "first\n"}),
+                )]),
+                ModelStep::Calls(vec![tc(
+                    "run_shell",
+                    json!({"command": "if ($false) { Set-Content -LiteralPath 'missed.txt' -Value 'missed' }"}),
+                )]),
+                ModelStep::Calls(vec![tc(
+                    "write_file",
+                    json!({"path": "second.txt", "content": "second\n"}),
+                )]),
+                ModelStep::Calls(vec![
+                    tc("read_file", json!({"path": "first.txt"})),
+                    tc("read_file", json!({"path": "second.txt"})),
+                ]),
+                ModelStep::Text("Created and verified both workspace files.".into()),
+            ],
+            idx: 0,
+        };
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(
+            "create first.txt and second.txt in the working directory".into(),
+        )];
+        let mut config = cfg(dir.path(), false);
+        config.max_steps = 0;
+        config.tool_profile = tools::ToolProfile::WebCode;
+        let end = run_loop(
+            &mut driver,
+            &mut ScriptApprover(vec![Decision::Once, Decision::Once, Decision::Once], 0),
+            &mut reporter,
+            &sb,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
+        assert!(!dir.path().join("missed.txt").exists());
+        assert!(history.iter().any(|message| matches!(
+            message,
+            AgentMsg::ToolResult { name, outcome }
+                if name == "run_shell"
+                    && outcome.is_err()
+                    && outcome.text().contains("made no detectable change inside the workspace")
+        )));
+    }
+
+    /// A failing shell is not a rolled-back shell. Preserve both facts in the
+    /// result so recovery starts from the file that really exists rather than
+    /// blindly replaying the whole batch.
+    #[cfg(windows)]
+    #[test]
+    fn partial_powershell_failure_reports_the_workspace_mutation() {
+        let _cp = super::super::checkpoint::tests::cp_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(30)).unwrap();
+        let mut driver = MockDriver {
+            steps: vec![
+                ModelStep::Calls(vec![tc(
+                    "run_shell",
+                    json!({"command": "Set-Content -LiteralPath 'partial.txt' -Value 'kept'; throw 'after-write failure'"}),
+                )]),
+                ModelStep::Calls(vec![tc("read_file", json!({"path": "partial.txt"}))]),
+                ModelStep::Text(
+                    "Recovered and verified partial.txt after the shell failure.".into(),
+                ),
+            ],
+            idx: 0,
+        };
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(
+            "create partial.txt in the working directory".into(),
+        )];
+        let mut config = cfg(dir.path(), false);
+        config.max_steps = 0;
+        config.tool_profile = tools::ToolProfile::WebCode;
+        let end = run_loop(
+            &mut driver,
+            &mut ScriptApprover(vec![Decision::Once], 0),
+            &mut reporter,
+            &sb,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("partial.txt"))
+                .unwrap()
+                .trim(),
+            "kept"
+        );
+        assert!(history.iter().any(|message| matches!(
+            message,
+            AgentMsg::ToolResult { name, outcome }
+                if name == "run_shell"
+                    && outcome.is_err()
+                    && outcome.text().contains("host verification")
+                    && outcome.text().contains("changed 1 workspace file")
+                    && outcome.text().contains("after-write failure")
+        )));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pure_rename_request_tracks_powershell_move_as_workspace_progress() {
+        let _cp = super::super::checkpoint::tests::cp_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("old.txt"), "kept through rename\n").unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(30)).unwrap();
+        let mut driver = MockDriver {
+            steps: vec![
+                ModelStep::Calls(vec![tc("read_file", json!({"path": "old.txt"}))]),
+                ModelStep::Calls(vec![tc(
+                    "run_shell",
+                    json!({"command": "Move-Item -LiteralPath 'old.txt' -Destination 'new.txt'"}),
+                )]),
+                ModelStep::Calls(vec![tc("read_file", json!({"path": "new.txt"}))]),
+                ModelStep::Text("Renamed old.txt to new.txt and verified its content.".into()),
+            ],
+            idx: 0,
+        };
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("rename old.txt to new.txt".into())];
+        let mut config = cfg(dir.path(), false);
+        config.max_steps = 0;
+        config.tool_profile = tools::ToolProfile::WebCode;
+        let end = run_loop(
+            &mut driver,
+            &mut ScriptApprover(vec![Decision::Once], 0),
+            &mut reporter,
+            &sb,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
+        assert!(!dir.path().join("old.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("new.txt")).unwrap(),
+            "kept through rename\n"
+        );
+        assert!(history.iter().any(|message| matches!(
+            message,
+            AgentMsg::ToolResult { name, outcome }
+                if name == "run_shell"
+                    && !outcome.is_err()
+                    && outcome.text().contains("changed 1 workspace file")
+                    && outcome.text().contains("deleted 1 files")
+        )));
     }
 
     /// Regression for the production failure: context paging advertised a
@@ -8461,8 +9231,11 @@ mod tests {
         assert!(!workspace_request_requires_change(&[AgentMsg::User(
             "Explain how this parser works".into()
         )]));
-        assert!(!workspace_request_requires_change(&[AgentMsg::User(
+        assert!(workspace_request_requires_change(&[AgentMsg::User(
             "Delete the generated file".into()
+        )]));
+        assert!(workspace_request_requires_change(&[AgentMsg::User(
+            "Rename old.txt to new.txt".into()
         )]));
     }
 
