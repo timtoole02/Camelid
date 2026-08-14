@@ -487,18 +487,6 @@ impl ToolProfile {
                     | "write_file"
                     | "edit_file"
                     | "run_shell"
-                    // Windows PowerShell, fed VERBATIM over stdin. Admitted to
-                    // the coding lane because it removes an entire failure
-                    // class rather than patching its instances: `run_shell`
-                    // hands cmd.exe one command line through a JSON string, so
-                    // a small model has to get nested quoting AND `%` vs `%%`
-                    // right at the same time. Live captures show it reliably
-                    // does not — over-escaped `\\"` killed one turn, batch-file
-                    // `%%i` silently wrote 100 garbage files in another. This
-                    // tool takes a script with no shell quoting layer at all.
-                    // Same Exec tier and approval gate as run_shell, with its
-                    // own cwd-pin + timeout + job-object teardown.
-                    | "run_windows_command"
                     | "web_search"
                     | "http_fetch"
                     | "spawn_subagent"
@@ -619,28 +607,35 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
         // forms that need no inner quotes at all, and to a script file when
         // the work genuinely needs quoting.
         #[cfg(windows)]
-        const SHELL_PLATFORM: &str = concat!(
-            "The shell is Windows cmd.exe — NOT bash: no {1..N}, $(...), or `%%`. ",
-            "Use this only for SIMPLE one-liners with no inner quotes, e.g. ",
-            "`dir /b` or `git status`. For anything with quotes, loops, variables, ",
-            "or several statements, call `run_windows_command` instead: it takes ",
-            "PowerShell verbatim with no quoting layer. "
-        );
+        let shell_description = if profile == ToolProfile::WebCode {
+            concat!(
+                "Run Windows PowerShell 5.1 in the workspace, passed verbatim over stdin — ",
+                "not cmd.exe or bash. Use PowerShell directly (`ForEach-Object`, `Set-Content`); ",
+                "never add a `powershell -Command` wrapper or cmd `%i` syntax. Use it for ",
+                "builds, tests, git, installs, and bulk work; use file tools for source."
+            )
+            .to_string()
+        } else {
+            concat!(
+                "Run a shell command in the workspace and capture its output. The shell is ",
+                "Windows cmd.exe — NOT bash: no {1..N}, $(...), or `%%`. Use this only for ",
+                "simple one-liners with no inner quotes, e.g. `dir /b` or `git status`. For ",
+                "PowerShell, call `run_windows_command` with the script itself. Pass a command ",
+                "line, never raw program source; use file tools for source."
+            )
+            .to_string()
+        };
         #[cfg(not(windows))]
-        const SHELL_PLATFORM: &str = "The shell is POSIX `/bin/sh`. ";
+        let shell_description = concat!(
+            "Run a POSIX `/bin/sh` command in the workspace and capture its output. Pass a ",
+            "command line, never raw program source: create source with write_file first, then ",
+            "invoke its runtime. Prefer file tools over cat/grep/ls/find/sed; use the shell for ",
+            "builds, tests, git, installs, and bulk repetitive work."
+        )
+        .to_string();
         tools.push(ToolSpec {
             name: "run_shell".into(),
-            description: format!(
-                concat!(
-                    "Run a shell command in the workspace and capture its output. {}",
-                    "Pass a command ",
-                    "line, never raw program source: create source with write_file first, then invoke ",
-                    "its runtime. Probe a missing runtime before attempting an approval-gated ",
-                    "package-manager install. Prefer the file tools over cat/grep/ls/find/sed; use ",
-                    "the shell for builds, tests, git, installs, and bulk repetitive work."
-                ),
-                SHELL_PLATFORM
-            ),
+            description: shell_description,
             risk: Risk::Exec,
             params: json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}),
         });
@@ -937,6 +932,15 @@ pub enum Action {
     RunShell {
         command: String,
     },
+    /// Windows Web Code's public `run_shell` surface, executed as PowerShell.
+    /// Keeping this distinct from `RunWindowsCommand` preserves the model's
+    /// tool-call name in the corresponding tool result.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    RunPowerShell {
+        workdir: PathBuf,
+        command: String,
+        timeout: Duration,
+    },
     HttpFetch {
         method: String,
         url: String,
@@ -1039,6 +1043,7 @@ impl Action {
             Action::ReadFile { .. } | Action::ListDir { .. } | Action::Search { .. } => Risk::Read,
             Action::WriteFile { .. } | Action::EditFile { .. } => Risk::Write,
             Action::RunShell { .. }
+            | Action::RunPowerShell { .. }
             | Action::RunWindowsCommand { .. }
             | Action::SpawnSubagent { .. }
             | Action::TypeText { .. }
@@ -1065,6 +1070,7 @@ impl Action {
             Action::WriteFile { .. } => "write_file",
             Action::EditFile { .. } => "edit_file",
             Action::RunShell { .. } => "run_shell",
+            Action::RunPowerShell { .. } => "run_shell",
             Action::HttpFetch { .. } => "http_fetch",
             Action::RunWindowsCommand { .. } => "run_windows_command",
             Action::InspectSystem { .. } => "inspect_system",
@@ -1120,6 +1126,7 @@ impl Action {
             }
             Action::EditFile { path, .. } => format!("edit_file({})", sandbox.rel(path)),
             Action::RunShell { command } => format!("run_shell({command})"),
+            Action::RunPowerShell { command, .. } => format!("run_shell({command})"),
             Action::HttpFetch { method, url } => format!("http_fetch({method} {url})"),
             Action::RunWindowsCommand { command, .. } => {
                 format!("run_windows_command({command})")
@@ -1209,6 +1216,15 @@ impl Action {
                 "run_shell in {}:\n  $ {command}",
                 sandbox.rel(sandbox.root())
             ),
+            Action::RunPowerShell {
+                workdir,
+                command,
+                timeout,
+            } => format!(
+                "run_shell in {} (PowerShell, timeout {}s):\n  PS> {command}",
+                sandbox.rel(workdir),
+                timeout.as_secs()
+            ),
             Action::HttpFetch { method, url } => format!("http_fetch:\n  {method} {url}"),
             // Verbatim command text (never re-parsed) so approval shows exactly
             // what PowerShell will receive on its stdin.
@@ -1295,12 +1311,17 @@ impl Action {
                 out
             }
             Action::RunShell { command } => run_shell_cancellable(sandbox, command, cancel),
+            Action::RunPowerShell {
+                workdir,
+                command,
+                timeout,
+            } => run_windows_command(workdir, command, *timeout, cancel),
             Action::HttpFetch { method, url } => http_fetch(sandbox, method, url),
             Action::RunWindowsCommand {
                 workdir,
                 command,
                 timeout,
-            } => run_windows_command(workdir, command, *timeout),
+            } => run_windows_command(workdir, command, *timeout, cancel),
             Action::InspectSystem { query, filter } => inspect_system(*query, filter.as_deref()),
             Action::SpawnSubagent { subtask_id, goal } => {
                 match subagent::spawn(sandbox.root(), subtask_id, goal) {
@@ -1435,7 +1456,51 @@ fn looks_like_raw_program_source(command: &str) -> bool {
         || lower.starts_with("<html")
 }
 
-fn validate_shell_command(command: String) -> Result<Action, String> {
+/// Peel the redundant launcher off the PowerShell shape small models learned
+/// before Web Code exposed one platform shell. This is intentionally narrow:
+/// only a leading powershell/pwsh executable followed by a real `-Command`
+/// token is rewritten, and the script bytes after that token are otherwise
+/// preserved. The action remains Exec-tier and goes through the same approval
+/// gate; normalization removes quoting layers, not authority.
+#[cfg(windows)]
+fn powershell_script_from_wrapper(command: &str) -> Option<String> {
+    let trimmed = command.trim();
+    let executable_end = trimmed.find(char::is_whitespace)?;
+    let executable = trimmed[..executable_end]
+        .trim_matches('"')
+        .to_ascii_lowercase();
+    if !matches!(
+        executable.as_str(),
+        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe"
+    ) {
+        return None;
+    }
+
+    let arguments = trimmed[executable_end..].trim_start();
+    let lowered = arguments.to_ascii_lowercase();
+    let marker = "-command";
+    let marker_start = lowered.match_indices(marker).find_map(|(index, _)| {
+        let before_ok = index == 0 || lowered.as_bytes()[index - 1].is_ascii_whitespace();
+        let after = index + marker.len();
+        let after_ok = after == lowered.len() || lowered.as_bytes()[after].is_ascii_whitespace();
+        (before_ok && after_ok).then_some(index)
+    })?;
+    let mut script = arguments[marker_start + marker.len()..].trim().to_string();
+    if script.len() >= 2 {
+        let first = script.as_bytes()[0];
+        let last = script.as_bytes()[script.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            script = script[1..script.len() - 1].to_string();
+        }
+    }
+    (!script.trim().is_empty()).then_some(script)
+}
+
+fn validate_shell_command(
+    command: String,
+    profile: ToolProfile,
+    sandbox: &Sandbox,
+) -> Result<Action, String> {
     if command.trim().is_empty() {
         return Err("run_shell requires a non-empty `command`".into());
     }
@@ -1461,27 +1526,27 @@ fn validate_shell_command(command: String) -> Result<Action, String> {
         )
         .into());
     }
-    // Nesting PowerShell inside cmd inside a JSON string is the exact shape
-    // that has failed every time it was tried here: the inner quotes arrive
-    // mangled (cmd does not parse the backslash escapes std emits), so
-    // `-Path "./$f"` reaches PowerShell as `-Path ./$f`. `run_windows_command`
-    // takes the same script with no quoting layer at all, so route there rather
-    // than letting the model burn its turn on quoting.
+    // Web Code has exactly one shell contract. On Windows its advertised
+    // `run_shell` is PowerShell, so the model never has to choose between two
+    // dialects. Also absorb the older nested-launcher shape on the Full surface
+    // instead of rejecting it and hoping a small model spends another turn
+    // rewriting the same intent.
     #[cfg(windows)]
     {
-        let head = command.trim_start().to_ascii_lowercase();
-        if (head.starts_with("powershell") || head.starts_with("pwsh"))
-            && command.contains("-Command")
-        {
-            return Err(concat!(
-                "do not nest PowerShell inside run_shell — cmd.exe mangles the inner quotes. ",
-                "Call `run_windows_command` with the SCRIPT ITSELF instead (no `powershell ",
-                "-Command` wrapper, no outer quotes): its `command` argument is PowerShell, ",
-                "passed verbatim."
-            )
-            .into());
+        if sandbox.shell_mode() == ShellSandbox::Disabled {
+            return Err("run_shell is disabled (shell execution is off)".into());
+        }
+        let wrapped = powershell_script_from_wrapper(&command);
+        if profile == ToolProfile::WebCode || wrapped.is_some() {
+            return Ok(Action::RunPowerShell {
+                workdir: sandbox.root().to_path_buf(),
+                command: wrapped.unwrap_or(command),
+                timeout: sandbox.shell_timeout,
+            });
         }
     }
+    #[cfg(not(windows))]
+    let _ = (profile, sandbox);
     // `%%VAR` is batch-FILE syntax and does not expand under `cmd /C`. Refusing
     // it was measurably worse than correcting it: the rejection fired three
     // times with a clear message and a 4B re-emitted the identical command
@@ -1626,6 +1691,18 @@ pub(crate) fn repair_tool_name(raw: &str, profile: ToolProfile) -> Option<&'stat
     let normalized = normalize_tool_name(raw);
     if normalized.is_empty() {
         return None;
+    }
+    // Compatibility for cached/older Windows Web Code prompts. The public
+    // surface now has one shell (`run_shell`), but normalizing these familiar
+    // spellings host-side lets an in-flight small model retain its intent.
+    #[cfg(windows)]
+    if profile == ToolProfile::WebCode
+        && matches!(
+            normalized.as_str(),
+            "run_windows_command" | "run_powershell" | "powershell"
+        )
+    {
+        return Some("run_shell");
     }
     let candidates = || KNOWN_TOOL_NAMES.iter().filter(|name| profile.allows(name));
     if let Some(exact) = candidates().find(|name| **name == normalized) {
@@ -1782,7 +1859,7 @@ pub fn validate_for(
                     .unwrap_or(false),
             })
         }
-        "run_shell" => validate_shell_command(str_arg("command")?),
+        "run_shell" => validate_shell_command(str_arg("command")?, profile, sandbox),
         "http_fetch" => {
             if !sandbox.allow_net {
                 return Err("network tools are disabled (start with --allow-net)".into());
@@ -3507,9 +3584,9 @@ fn base64_ascii(data: &[u8]) -> String {
 /// stdin as base64 inside a pure-ASCII preamble (W3a: a console-less child sits
 /// on the OEM code page, so raw UTF-8 would be mojibake'd both ways; ASCII
 /// survives any code page, and the preamble flips the child's output to UTF-8
-/// before decoding the real command). A trailing guard re-raises $LASTEXITCODE
-/// so a failing native command is reported with its true exit code even when a
-/// later statement succeeded (W3b). The run is cwd-pinned, hard-timed, has
+/// before decoding the real command). A guarded invocation turns cmdlet errors
+/// and native non-zero statuses into failed tool results (W3b). The run is
+/// cwd-pinned, cancellable, hard-timed, has
 /// stdout/stderr drained concurrently (so a chatty command can't wedge on a full
 /// pipe), and is assigned to a kill-on-close job object so a timeout tears down
 /// the whole process tree.
@@ -3520,7 +3597,12 @@ fn base64_ascii(data: &[u8]) -> String {
 /// primary dev host has no pwsh to validate a second branch against (HARDPAN A8:
 /// an untestable branch ships untested, so it doesn't ship).
 #[cfg(windows)]
-fn run_windows_command(workdir: &Path, command: &str, timeout: Duration) -> ToolOutcome {
+fn run_windows_command(
+    workdir: &Path,
+    command: &str,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> ToolOutcome {
     use std::io::{Read, Write};
     use std::os::windows::io::AsRawHandle;
     use std::os::windows::process::CommandExt;
@@ -3587,21 +3669,23 @@ fn run_windows_command(workdir: &Path, command: &str, timeout: Duration) -> Tool
     // command. Still stdin delivery — NOT -EncodedCommand, which would
     // reintroduce the ~32 KiB command-line ceiling stdin was chosen to avoid.
     //
-    // W3(b): `powershell -Command` drops a native command's non-zero exit
-    // status whenever a later statement succeeds, so a failed `cargo build`
-    // followed by any successful statement reported exit 0 → ToolOutcome::Ok
-    // and the model proceeded on a false premise. The trailing guard re-raises
-    // $LASTEXITCODE (the true code — pre-fix even a *last* failing native
-    // command was flattened to 1). When no native command ran, $LASTEXITCODE
-    // is $null and the host's own status stands: 0 on success, 1 on a
-    // terminating error. Residual, documented: $LASTEXITCODE tracks only the
-    // LAST native command, so `cmd /c exit 3; cmd /c exit 0` reports 0 both
-    // before and after this fix.
+    // W3(b): ErrorActionPreference turns ordinary cmdlet failures into caught
+    // terminating errors. Native commands do not honor it, so preserve their
+    // exact non-zero LASTEXITCODE. Resetting it first distinguishes "no native
+    // command ran" from native success. Residual: LASTEXITCODE tracks only the
+    // last native command, so `cmd /c exit 3; cmd /c exit 0` reports 0.
+    // Keep the wrapper on one physical line. Windows PowerShell's `-Command -`
+    // treats redirected stdin like an interactive stream; a multiline `try`
+    // block reaches EOF without executing, silently returning exit 0.
     let script = format!(
-        "$OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)\r\n\
-         $c = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{}'))\r\n\
-         Invoke-Expression $c\r\n\
-         if ($LASTEXITCODE -ne $null) {{ exit $LASTEXITCODE }}\r\n",
+        "$OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); \
+         $ErrorActionPreference = 'Stop'; $global:LASTEXITCODE = $null; \
+         $c = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{}')); \
+         try {{ Invoke-Expression $c; $camelidPsOk = $?; \
+         $camelidNativeExit = $LASTEXITCODE; \
+         if ($camelidNativeExit -ne $null -and $camelidNativeExit -ne 0) {{ exit $camelidNativeExit }}; \
+         if (-not $camelidPsOk) {{ exit 1 }} }} catch {{ \
+         [Console]::Error.WriteLine(($_ | Out-String)); exit 1 }}\r\n",
         base64_ascii(command.as_bytes())
     );
     if let Some(mut stdin) = child.stdin.take() {
@@ -3614,6 +3698,20 @@ fn run_windows_command(workdir: &Path, command: &str, timeout: Duration) -> Tool
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
+                if cancel.load(Ordering::Relaxed) {
+                    if let Some(ref j) = job {
+                        j.terminate();
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    if let Some(h) = out_reader {
+                        let _ = h.join();
+                    }
+                    if let Some(h) = err_reader {
+                        let _ = h.join();
+                    }
+                    return ToolOutcome::Err("command cancelled by user stop".into());
+                }
                 if std::time::Instant::now() >= deadline {
                     if let Some(ref j) = job {
                         j.terminate();
@@ -3664,7 +3762,12 @@ fn run_windows_command(workdir: &Path, command: &str, timeout: Duration) -> Tool
 }
 
 #[cfg(not(windows))]
-fn run_windows_command(_workdir: &Path, _command: &str, _timeout: Duration) -> ToolOutcome {
+fn run_windows_command(
+    _workdir: &Path,
+    _command: &str,
+    _timeout: Duration,
+    _cancel: &AtomicBool,
+) -> ToolOutcome {
     ToolOutcome::Err("run_windows_command is only available on Windows".into())
 }
 
@@ -4059,7 +4162,7 @@ mod tests {
             .into_iter()
             .map(|tool| tool.name)
             .collect::<Vec<_>>();
-        let mut expected = vec![
+        let expected = vec![
             "read_file",
             "list_dir",
             "search",
@@ -4070,17 +4173,11 @@ mod tests {
             "web_search",
             "http_fetch",
         ];
-        // Windows gets PowerShell as well. This is a widening of the coding
-        // scope, made deliberately: run_shell hands cmd.exe ONE command line
-        // through a JSON string, so a small model must solve nested quoting and
-        // `%` vs `%%` simultaneously, and live captures show it does not. This
-        // tool takes the script verbatim. It is a workspace SHELL at the same
-        // Exec tier and approval gate as run_shell, with its own cwd-pin,
-        // timeout, and job-object teardown — not machine control, which stays
-        // out (see the forbidden list below).
-        #[cfg(windows)]
-        expected.push("run_windows_command");
+        // Web Code has one shell name. On Windows that public surface is
+        // PowerShell; the Full profile's explicit legacy tool must not compete
+        // with it in the model schema.
         assert_eq!(code, expected);
+        assert!(!ToolProfile::WebCode.allows("run_windows_command"));
         // Delegation is in scope for a coding surface, so the profile permits
         // the subagent tools — but they are still only ADVERTISED once a session
         // has configured the subagent runtime, which is why the spec list above
@@ -5135,6 +5232,14 @@ mod tests {
         );
         // Profile-scoped: a tool this profile does not advertise is not conjured.
         assert_eq!(repair_tool_name("screenshot", ToolProfile::WebCode), None);
+        #[cfg(windows)]
+        for legacy in ["run_windows_command", "run_powershell", "powershell"] {
+            assert_eq!(
+                repair_tool_name(legacy, ToolProfile::WebCode),
+                Some("run_shell"),
+                "cached Windows spelling {legacy:?} must retain its intent"
+            );
+        }
     }
 
     /// Echoed tool-call JSON lifted out of file contents must get a terse,
@@ -5422,47 +5527,46 @@ mod tests {
         );
     }
 
-    /// The Code lane must OFFER PowerShell on Windows, and it must actually
-    /// run. `run_shell` hands cmd.exe one command line through a JSON string,
-    /// so a small model has to solve nested quoting and `%` vs `%%` at once —
-    /// live captures show it does not (`\\"` killed one turn, `%%i` wrote 100
-    /// garbage files in another). This tool takes the script verbatim, which is
-    /// what removes the class rather than patching instances.
+    /// The Code lane must offer exactly one Windows shell, describe it as
+    /// PowerShell, keep its public name as `run_shell`, and execute it verbatim.
     #[cfg(windows)]
     #[test]
     fn code_profile_offers_powershell_and_runs_it_verbatim() {
         let specs = specs_for(ToolProfile::WebCode, false, ShellSandbox::Sandboxed);
         let ps = specs
             .iter()
-            .find(|spec| spec.name == "run_windows_command")
-            .expect("the coding lane must offer PowerShell on Windows");
+            .find(|spec| spec.name == "run_shell")
+            .expect("the coding lane must offer its shell on Windows");
         assert_eq!(ps.risk, Risk::Exec, "it stays approval-gated");
         assert!(
-            ps.description.contains("PREFER THIS over run_shell"),
-            "the model needs to know when to reach for it: {}",
+            ps.description.contains("Windows PowerShell 5.1")
+                && ps.description.contains("passed verbatim"),
+            "the model needs one explicit dialect contract: {}",
             ps.description
         );
+        assert!(!specs.iter().any(|spec| spec.name == "run_windows_command"));
         // Disabling the shell must still take it away with everything else.
         assert!(
             !specs_for(ToolProfile::WebCode, false, ShellSandbox::Disabled)
                 .iter()
-                .any(|spec| spec.name == "run_windows_command")
+                .any(|spec| spec.name == "run_shell")
         );
 
-        // And the exact shape that defeats run_shell works here verbatim:
-        // inner quotes, a variable, and a loop, with no escaping layer.
+        // Inner quotes, a variable, and a loop work with no cmd escaping layer.
         let dir = tempfile::tempdir().unwrap();
         let sb = Sandbox::new(dir.path(), false, Duration::from_secs(60)).unwrap();
         let out = validate_for(
             ToolProfile::WebCode,
             &call(
-                "run_windows_command",
+                "run_shell",
                 json!({"command":"1..3 | ForEach-Object { Set-Content -Path \"file$_.txt\" -Value 'a joke' }"}),
             ),
             &sb,
         )
-        .expect("the Code profile must validate PowerShell")
-        .execute(&sb);
+        .expect("the Code profile must validate PowerShell");
+        assert!(matches!(out, Action::RunPowerShell { .. }));
+        assert_eq!(out.tool_name(), "run_shell");
+        let out = out.execute(&sb);
         assert!(!out.is_err(), "PowerShell must run: {}", out.text());
         let names: Vec<String> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -5480,37 +5584,35 @@ mod tests {
         );
     }
 
-    /// Nesting PowerShell inside run_shell is the shape that has failed every
-    /// time: cmd mangles the inner quotes, so `-Path "./$f"` arrives as
-    /// `-Path ./$f`. Observed live three times in one turn. Route it to the
-    /// tool that takes the script verbatim instead of letting the turn burn.
+    /// Cached prompts may still add a redundant launcher. Strip it host-side
+    /// and execute once instead of spending another inference turn on syntax.
     #[cfg(windows)]
     #[test]
     fn nested_powershell_in_run_shell_is_routed_to_the_verbatim_tool() {
         let dir = tempfile::tempdir().unwrap();
         let sb = sandbox(dir.path());
-        let error = match validate(
+        let action = validate_for(
+            ToolProfile::WebCode,
             &call(
                 "run_shell",
-                json!({"command":"powershell -Command \"1..3 | ForEach-Object { New-Item -Path \"./f$_.txt\" }\""}),
+                json!({"command":"powershell -NoProfile -Command \"1..3 | ForEach-Object { Set-Content -Path ('f' + $_ + '.txt') -Value $_ }\""}),
             ),
             &sb,
-        ) {
-            Ok(_) => panic!("nested PowerShell must not run through cmd"),
-            Err(error) => error,
-        };
-        assert!(error.contains("run_windows_command"), "{error}");
-        assert!(error.contains("verbatim"), "{error}");
-        // Plain cmd work is untouched, and so is a path that merely mentions it.
-        assert!(validate(&call("run_shell", json!({"command":"dir /b"})), &sb).is_ok());
-        assert!(validate(
-            &call(
-                "run_shell",
-                json!({"command":"findstr powershell notes.txt"})
-            ),
-            &sb
         )
-        .is_ok());
+        .expect("nested launchers should be normalized, not reprompted");
+        assert!(
+            matches!(&action, Action::RunPowerShell { command, .. } if command.starts_with("1..3 |")),
+            "got {action:?}"
+        );
+        let out = action.execute(&sb);
+        assert!(
+            !out.is_err(),
+            "normalized PowerShell must run: {}",
+            out.text()
+        );
+        for expected in ["f1.txt", "f2.txt", "f3.txt"] {
+            assert!(dir.path().join(expected).is_file(), "missing {expected}");
+        }
     }
 
     /// A command AUTHORING a batch file is the one place `%%` is correct, and
@@ -6539,5 +6641,67 @@ mod tests {
         let out = run("cmd /c exit 3; cmd /c exit 0");
         assert!(matches!(out, ToolOutcome::Ok(_)), "got {out:?}");
         assert!(out.text().contains("exit: 0"));
+    }
+
+    /// Non-terminating cmdlet errors used to leave `$LASTEXITCODE` null and the
+    /// trailing host guard itself succeeded, turning a failed read into exit 0.
+    #[cfg(windows)]
+    #[test]
+    fn run_windows_command_reports_cmdlet_failures() {
+        let _serial = ps_serial();
+        let dir = tempfile::tempdir().unwrap();
+        let sb = win_sandbox(dir.path());
+        let out = validate(
+            &call(
+                "run_windows_command",
+                json!({"command":"Get-Content -LiteralPath '.camelid-definitely-missing-7f34f8d1.txt'"}),
+            ),
+            &sb,
+        )
+        .unwrap()
+        .execute(&sb);
+        assert!(out.is_err(), "missing input must fail, got {out:?}");
+        assert!(out.text().contains("exit: 1"), "got: {}", out.text());
+        assert!(
+            out.text().contains("cannot find") || out.text().contains("does not exist"),
+            "the diagnostic must survive: {}",
+            out.text()
+        );
+    }
+
+    /// Stop is a first-class termination condition for the PowerShell runner,
+    /// not something deferred until its hard timeout.
+    #[cfg(windows)]
+    #[test]
+    fn run_windows_command_honors_cancellation() {
+        use std::sync::Arc;
+
+        let _serial = ps_serial();
+        let dir = tempfile::tempdir().unwrap();
+        let sb = win_sandbox(dir.path());
+        let action = validate(
+            &call(
+                "run_windows_command",
+                json!({"command":"Start-Sleep -Seconds 30"}),
+            ),
+            &sb,
+        )
+        .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&cancel);
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            signal.store(true, Ordering::Relaxed);
+        });
+        let started = std::time::Instant::now();
+        let out = action.execute_cancellable(&sb, &cancel);
+        setter.join().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "cancel should return promptly, took {:?}",
+            started.elapsed()
+        );
+        assert!(out.is_err(), "expected cancellation, got {out:?}");
+        assert!(out.text().contains("cancelled"), "got: {}", out.text());
     }
 }

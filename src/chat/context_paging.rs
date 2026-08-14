@@ -1336,7 +1336,13 @@ pub(crate) enum ActionPhase {
 pub(crate) fn phase_tool_names(phase: ActionPhase) -> &'static [&'static str] {
     match phase {
         ActionPhase::Discover => &["read_file", "list_dir", "search"],
-        ActionPhase::Modify => &["read_file", "search", "write_file", "edit_file"],
+        ActionPhase::Modify => &[
+            "read_file",
+            "search",
+            "write_file",
+            "edit_file",
+            "run_shell",
+        ],
         ActionPhase::Verify => &["read_file", "run_shell"],
         ActionPhase::Complete => &[],
     }
@@ -3125,7 +3131,7 @@ mod tests {
         assert!(capsule.tool_names.contains(&"run_shell".to_string()));
         assert!(!capsule.tool_names.contains(&"spawn_subagent".to_string()));
         assert!(capsule.rendered.contains(
-            "<usable_tools phase=\"Modify\">read_file,search,write_file,edit_file</usable_tools>"
+            "<usable_tools phase=\"Modify\">read_file,search,write_file,edit_file,run_shell</usable_tools>"
         ));
 
         let verify =

@@ -549,8 +549,9 @@ fn python_interpreter_unusable(outcome_text: &str) -> bool {
 
 #[cfg(windows)]
 fn normalize_verified_windows_python(action: &mut Action) -> Option<String> {
-    let Action::RunShell { command } = action else {
-        return None;
+    let command = match action {
+        Action::RunShell { command } | Action::RunPowerShell { command, .. } => command,
+        _ => return None,
     };
     let trimmed = command.trim();
     let lower = trimmed.to_ascii_lowercase();
@@ -2062,9 +2063,11 @@ pub fn run_loop(
             }
             ModelStep::Calls(mut calls) => {
                 if let Some(call) = context_paging.as_ref().and_then(|_| {
-                    calls
-                        .iter()
-                        .find(|call| !step_tools.iter().any(|tool| tool.name == call.name))
+                    calls.iter().find(|call| {
+                        let canonical = tools::repair_tool_name(&call.name, cfg.tool_profile)
+                            .unwrap_or(call.name.as_str());
+                        !step_tools.iter().any(|tool| tool.name == canonical)
+                    })
                 }) {
                     let message = format!(
                         "tool `{}` is not available in the current context-paging phase",
@@ -2207,6 +2210,15 @@ pub fn run_loop(
                         reporter.notice(&format!(
                             "collapsed {collapsed} duplicate tool call(s) in one step"
                         ));
+                    }
+                }
+                // Persist the repaired public name too. Tool-call/result pairs
+                // must agree in history; keeping a cached `run_windows_command`
+                // call beside a `run_shell` result can make the next provider
+                // request invalid even though execution itself succeeded.
+                for call in &mut calls {
+                    if let Some(canonical) = tools::repair_tool_name(&call.name, cfg.tool_profile) {
+                        call.name = canonical.to_string();
                     }
                 }
                 total_tool_calls = total_tool_calls.saturating_add(calls.len());
@@ -2561,7 +2573,9 @@ pub fn run_loop(
                         && !outcome.is_err()
                         && matches!(
                             &action,
-                            Action::RunShell { .. } | Action::RunWindowsCommand { .. }
+                            Action::RunShell { .. }
+                                | Action::RunPowerShell { .. }
+                                | Action::RunWindowsCommand { .. }
                         )
                     {
                         if let Some(shell_changed_paths) =
@@ -2783,19 +2797,30 @@ pub fn run_loop(
                     let direct_python_failure = cfg.default_write_path.is_some()
                         && workspace_changed
                         && outcome.is_err()
-                        && matches!(&action, Action::RunShell { .. })
+                        && matches!(
+                            &action,
+                            Action::RunShell { .. } | Action::RunPowerShell { .. }
+                        )
                         && (outcome.text().contains("Traceback (most recent call last)")
                             || outcome.text().contains("SyntaxError:"));
                     let python_alias_failure = !python_alias_guidance_sent
                         && outcome.is_err()
                         && outcome.text().contains("Python was not found")
                         && outcome.text().contains("Microsoft Store")
-                        && matches!(&action, Action::RunShell { command }
-                            if command.trim_start().to_ascii_lowercase().starts_with("python"));
+                        && matches!(
+                            &action,
+                            Action::RunShell { command }
+                                | Action::RunPowerShell { command, .. }
+                                if command.trim_start().to_ascii_lowercase().starts_with("python")
+                        );
                     #[cfg(windows)]
                     let python_launcher_just_verified = !outcome.is_err()
-                        && matches!(&action, Action::RunShell { command }
-                            if command.trim().eq_ignore_ascii_case("py --version"));
+                        && matches!(
+                            &action,
+                            Action::RunShell { command }
+                                | Action::RunPowerShell { command, .. }
+                                if command.trim().eq_ignore_ascii_case("py --version")
+                        );
                     // Arm the rewriter only when the Store-alias failure was
                     // actually observed on THIS host. A bare successful
                     // `py --version` probe (the loop's own reprompt suggests
@@ -2832,7 +2857,8 @@ pub fn run_loop(
                         (context_paging.as_mut(), raw_outcome_for_paging.as_ref())
                     {
                         let command = match &action {
-                            Action::RunShell { command } => Some(command.as_str()),
+                            Action::RunShell { command }
+                            | Action::RunPowerShell { command, .. } => Some(command.as_str()),
                             _ => None,
                         };
                         let status = if raw_outcome.is_err() { "error" } else { "ok" };
@@ -2858,6 +2884,7 @@ pub fn run_loop(
                             || matches!(
                                 &action,
                                 Action::RunShell { .. }
+                                    | Action::RunPowerShell { .. }
                                     | Action::Search { .. }
                                     | Action::ListDir { .. }
                                     | Action::ReadFile { .. }
@@ -2937,7 +2964,8 @@ pub fn run_loop(
                                     }
                                 }
                             }
-                            Action::RunShell { command } => {
+                            Action::RunShell { command }
+                            | Action::RunPowerShell { command, .. } => {
                                 runtime.ledger.verification_state.last_command =
                                     Some(command.clone());
                                 if raw_outcome.is_err() {
@@ -3447,7 +3475,10 @@ fn workspace_request_requires_change(history: &[AgentMsg]) -> bool {
 /// would count as a workspace change.
 fn workspace_changes_since(root: &Path, since: std::time::SystemTime) -> Option<Vec<String>> {
     const MAX_CHANGE_SCAN_ENTRIES: usize = 50_000;
-    const MAX_CHANGED_PATHS_REPORTED: usize = 8;
+    // Bulk generation is an advertised run_shell use case. Eight paths meant a
+    // 100-file command was accepted after the host inspected only its first
+    // eight outputs. Keep the scan bounded, but cover realistic generated sets.
+    const MAX_CHANGED_PATHS_REPORTED: usize = 256;
     // HFS+ (this user's external T7, where real checkouts live) stores mtimes at
     // ONE-SECOND granularity, truncating downward — a file written 300ms after
     // `since` stats as the floor of the second and compares BELOW it, silently
@@ -7259,6 +7290,27 @@ mod tests {
         assert!(answer.contains("README.md"), "got {answer:?}");
     }
 
+    /// The semantic capture must cover the observed 100-file bulk-generation
+    /// failure, not silently inspect only the first eight paths.
+    #[test]
+    fn shell_change_scan_captures_a_hundred_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let since = std::time::SystemTime::now();
+        for index in 1..=100 {
+            std::fs::write(
+                dir.path().join(format!("generated-{index}.txt")),
+                index.to_string(),
+            )
+            .unwrap();
+        }
+        let paths = workspace_changes_since(dir.path(), since).expect("changes must be detected");
+        let paths = paths.into_iter().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(paths.len(), 100, "every generated file must be verified");
+        for index in 1..=100 {
+            assert!(paths.contains(&format!("generated-{index}.txt")));
+        }
+    }
+
     /// A Code turn that does its work through one run_shell loop (exactly what
     /// the tool guidance steers bulk work toward) must satisfy the completion
     /// contract: shell writes bypass checkpoints, so before the filesystem
@@ -7331,17 +7383,21 @@ mod tests {
         let mut driver = MockDriver {
             steps: vec![
                 ModelStep::Calls(vec![tc(
-                    "run_windows_command",
-                    json!({"command": "1..3 | ForEach-Object { Set-Content -Path \"n$_.txt\" -Value \"line $_\" }"}),
+                    "run_shell",
+                    json!({"command": "1..100 | ForEach-Object { Set-Content -Path \"n$_.txt\" -Value \"line $_\" }"}),
                 )]),
-                ModelStep::Text("Created the requested files.".into()),
-                ModelStep::Text("Verified: n1.txt, n2.txt and n3.txt exist as requested.".into()),
+                ModelStep::Text("Created the requested 100 files.".into()),
+                ModelStep::Text(
+                    "Verified: all 100 numbered files exist with unique content.".into(),
+                ),
             ],
             idx: 0,
         };
         let mut approver = ScriptApprover(vec![Decision::Once], 0);
         let mut reporter = RecordReporter::default();
-        let mut history = vec![AgentMsg::User("create 3 text files".into())];
+        let mut history = vec![AgentMsg::User(
+            "create 100 numbered text files with unique numbered content".into(),
+        )];
         let mut config = cfg(dir.path(), false);
         config.tool_profile = tools::ToolProfile::WebCode;
         let end = run_loop(
@@ -7355,13 +7411,87 @@ mod tests {
             &mut history,
         );
         assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
-        assert!(dir.path().join("n1.txt").exists(), "PowerShell must write");
+        for index in 1..=100 {
+            let path = dir.path().join(format!("n{index}.txt"));
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap().trim(),
+                format!("line {index}"),
+                "PowerShell must create unique content in {}",
+                path.display()
+            );
+        }
         assert!(
             !reporter
                 .notices
                 .iter()
                 .any(|notice| notice.contains("has not changed a workspace file")),
             "the PowerShell change must satisfy the contract: {:?}",
+            reporter.notices
+        );
+    }
+
+    /// Regression for the production failure: context paging advertised a
+    /// stable `run_shell` schema but its Modify allowlist rejected PowerShell
+    /// before execution. Exercise Discover -> Modify -> Complete end to end.
+    #[cfg(windows)]
+    #[test]
+    fn context_paging_can_create_and_verify_files_with_powershell() {
+        let _cp = super::super::checkpoint::tests::cp_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(30)).unwrap();
+        let mut driver = MockDriver {
+            steps: vec![
+                ModelStep::Calls(vec![tc("list_dir", json!({"path":"."}))]),
+                ModelStep::Calls(vec![tc(
+                    "run_shell",
+                    json!({"command":"powershell -NoProfile -Command \"1..3 | ForEach-Object { Set-Content -Path ('paged' + $_ + '.txt') -Value ('value ' + $_) }\""}),
+                )]),
+                ModelStep::Text(
+                    json!({
+                        "action":"COMPLETE",
+                        "summary":"Created and verified three uniquely numbered PowerShell outputs."
+                    })
+                    .to_string(),
+                ),
+            ],
+            idx: 0,
+        };
+        let mut approver = ScriptApprover(vec![Decision::Once], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(
+            "create three numbered text files with unique content".into(),
+        )];
+        let mut config = cfg(dir.path(), false);
+        config.max_steps = 5;
+        config.shell_timeout = Duration::from_secs(30);
+        config.tool_profile = tools::ToolProfile::WebCode;
+        config.allow_plan = false;
+        config.context_paging = true;
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sb,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
+        for index in 1..=3 {
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(format!("paged{index}.txt")))
+                    .unwrap()
+                    .trim(),
+                format!("value {index}")
+            );
+        }
+        assert!(
+            !reporter.notices.iter().any(|notice| {
+                notice.contains("not available during")
+                    || notice.contains("has not changed a workspace file")
+            }),
+            "PowerShell must survive the paging phase gate: {:?}",
             reporter.notices
         );
     }
