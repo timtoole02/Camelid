@@ -286,12 +286,23 @@ function advanceLiveActivity(current, envelope) {
   } else if (event === 'model.timing') {
     Object.assign(next, {
       output_tokens: Number.isFinite(envelope.output_tokens) ? envelope.output_tokens : next.output_tokens,
-      detail: Number.isFinite(envelope.output_tokens)
-        ? `The model finished a ${envelope.output_tokens}-token generation step`
-        : 'The model finished a generation step',
+      total_model_ms: Number.isFinite(envelope.total_ms) ? envelope.total_ms : next.total_model_ms,
+      ttft_ms: Number.isFinite(envelope.ttft_ms) ? envelope.ttft_ms : next.ttft_ms,
+      prefill_ms: Number.isFinite(envelope.prefill_ms) ? envelope.prefill_ms : next.prefill_ms,
+      reused_tokens: Number.isFinite(envelope.reused_tokens) ? envelope.reused_tokens : next.reused_tokens,
+      prefilled_tokens: Number.isFinite(envelope.prefilled_tokens) ? envelope.prefilled_tokens : next.prefilled_tokens,
+      engine_rebuilt: typeof envelope.engine_rebuilt === 'boolean' ? envelope.engine_rebuilt : next.engine_rebuilt,
+      resident_backend: envelope.resident_backend || next.resident_backend,
+      detail: `${Number.isFinite(envelope.output_tokens) ? `${envelope.output_tokens} output tokens` : 'Generation step'}${Number.isFinite(envelope.reused_tokens) && envelope.reused_tokens > 0 ? ` · reused ${envelope.reused_tokens} prompt tokens` : ''}`,
     })
   } else if (event === 'model.answer') {
     Object.assign(next, { phase: 'running', stage: 'finishing', detail: 'Reviewing and saving the final answer', current_tool: null })
+  } else if (event === 'index.timing') {
+    Object.assign(next, {
+      index_refresh_ms: Number(envelope.elapsed_ms || 0),
+      index_files_hashed: Number(envelope.files_hashed || 0),
+      index_files_reused: Number(envelope.files_reused || 0),
+    })
   } else if (event === 'tool.call') {
     Object.assign(next, { phase: 'running', stage: 'tool', detail: String(envelope.detail || 'Running a tool'), current_tool: envelope.detail || null })
   } else if (event === 'tool.result') {
@@ -301,6 +312,8 @@ function advanceLiveActivity(current, envelope) {
       detail: `${formatActivityTool(envelope.tool)} ${envelope.outcome === 'error' ? 'failed' : 'completed'}`,
       current_tool: null,
     })
+  } else if (event === 'tool.timing') {
+    next.last_tool_ms = Number(envelope.elapsed_ms || 0)
   } else if (event === 'approval.required') {
     Object.assign(next, { phase: 'awaiting_approval', stage: 'approval', detail: `Waiting for approval to run ${formatActivityTool(envelope.tool)}` })
   } else if (event === 'approval.resolved') {

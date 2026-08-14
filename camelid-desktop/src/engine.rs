@@ -139,14 +139,60 @@ impl Drop for Engine {
 }
 
 /// Locate the `camelid` engine binary. Resolution order:
-/// 1. Beside the desktop executable (the bundled/portable case — and the dev case, since both
-///    workspace binaries land in `target/<profile>/`).
-/// 2. An explicit `resource_dir/sidecar/<platform engine>` (Tauri-bundled resource layout).
-/// 3. Bare name on `PATH` (developer convenience).
+/// 1. Absolute `CAMELID_ENGINE_PATH`, the recommended developer path for pairing
+///    a debug desktop shell with an optimized release engine.
+/// 2. `target/release/<engine>` when a debug desktop is running from
+///    `target/debug`; this prevents an innocent UI dev run from launching the
+///    catastrophically slow debug inference engine.
+/// 3. Beside the desktop executable (the bundled/portable case).
+/// 4. An explicit `resource_dir/sidecar/<platform engine>` (Tauri-bundled resource layout).
+/// 5. Bare name on `PATH` (developer convenience).
 pub fn resolve_engine_path(resource_dir: Option<PathBuf>) -> Result<PathBuf, EngineError> {
+    let explicit = std::env::var_os("CAMELID_ENGINE_PATH").map(PathBuf::from);
+    let current_exe = std::env::current_exe().ok();
+    resolve_engine_path_from(
+        current_exe.as_deref(),
+        resource_dir.as_deref(),
+        explicit.as_deref(),
+    )
+}
+
+fn resolve_engine_path_from(
+    current_exe: Option<&Path>,
+    resource_dir: Option<&Path>,
+    explicit: Option<&Path>,
+) -> Result<PathBuf, EngineError> {
     let file = engine_binary_file();
-    if let Ok(exe) = std::env::current_exe() {
+    if let Some(explicit) = explicit {
+        if !explicit.is_absolute() {
+            return Err(EngineError::new(
+                EngineErrorKind::MissingBinary,
+                "CAMELID_ENGINE_PATH must be an absolute path to the optimized Camelid engine",
+            ));
+        }
+        if !explicit.is_file() {
+            return Err(EngineError::new(
+                EngineErrorKind::MissingBinary,
+                format!(
+                    "CAMELID_ENGINE_PATH does not name a file: {}",
+                    explicit.display()
+                ),
+            ));
+        }
+        return Ok(simplify_extended_path(explicit.to_path_buf()));
+    }
+    if let Some(exe) = current_exe {
         if let Some(dir) = exe.parent() {
+            if cfg!(debug_assertions)
+                && dir.file_name().and_then(|name| name.to_str()) == Some("debug")
+            {
+                if let Some(target_dir) = dir.parent() {
+                    let optimized = target_dir.join("release").join(&file);
+                    if optimized.is_file() {
+                        return Ok(simplify_extended_path(optimized));
+                    }
+                }
+            }
             let beside = dir.join(&file);
             if beside.is_file() {
                 return Ok(simplify_extended_path(beside));
@@ -509,9 +555,9 @@ impl Drop for JobObject {
 #[cfg(test)]
 mod tests {
     use super::{
-        finish_startup_failure, http_health_ok, sidecar_models_dir, spawn, stderr_is_bind_failure,
-        terminate_and_collect_stderr, wait_for_health_with_timeout, EngineError, EngineErrorKind,
-        HEALTH_RESPONSE_TIMEOUT,
+        finish_startup_failure, http_health_ok, resolve_engine_path_from, sidecar_models_dir,
+        spawn, stderr_is_bind_failure, terminate_and_collect_stderr, wait_for_health_with_timeout,
+        EngineError, EngineErrorKind, HEALTH_RESPONSE_TIMEOUT,
     };
     use std::io::Read;
     use std::net::TcpListener;
@@ -699,6 +745,57 @@ mod tests {
         // The PATH-resolution fallback: no directory to anchor to, so the engine's own
         // exe-relative default must stay in charge.
         assert_eq!(sidecar_models_dir(Path::new("camelid.exe")), None);
+    }
+
+    #[test]
+    fn explicit_engine_path_beats_debug_sibling_and_must_exist() {
+        let directory = tempfile::tempdir().unwrap();
+        let debug = directory.path().join("debug");
+        let release = directory.path().join("release");
+        std::fs::create_dir_all(&debug).unwrap();
+        std::fs::create_dir_all(&release).unwrap();
+        let desktop = debug.join(if cfg!(windows) {
+            "camelid-desktop.exe"
+        } else {
+            "camelid-desktop"
+        });
+        let debug_engine = debug.join(super::engine_binary_file());
+        let release_engine = release.join(super::engine_binary_file());
+        std::fs::write(&desktop, b"desktop").unwrap();
+        std::fs::write(&debug_engine, b"debug").unwrap();
+        std::fs::write(&release_engine, b"release").unwrap();
+
+        let resolved =
+            resolve_engine_path_from(Some(&desktop), None, Some(release_engine.as_path())).unwrap();
+        assert_eq!(resolved, release_engine);
+
+        let missing = release.join("missing-engine");
+        let error = resolve_engine_path_from(Some(&desktop), None, Some(&missing)).unwrap_err();
+        assert_eq!(error.kind, EngineErrorKind::MissingBinary);
+        assert!(error.message.contains("does not name a file"));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn debug_desktop_automatically_prefers_the_release_engine() {
+        let directory = tempfile::tempdir().unwrap();
+        let debug = directory.path().join("debug");
+        let release = directory.path().join("release");
+        std::fs::create_dir_all(&debug).unwrap();
+        std::fs::create_dir_all(&release).unwrap();
+        let desktop = debug.join(if cfg!(windows) {
+            "camelid-desktop.exe"
+        } else {
+            "camelid-desktop"
+        });
+        let debug_engine = debug.join(super::engine_binary_file());
+        let release_engine = release.join(super::engine_binary_file());
+        std::fs::write(&desktop, b"desktop").unwrap();
+        std::fs::write(&debug_engine, b"debug").unwrap();
+        std::fs::write(&release_engine, b"release").unwrap();
+
+        let resolved = resolve_engine_path_from(Some(&desktop), None, None).unwrap();
+        assert_eq!(resolved, release_engine);
     }
 
     #[cfg(windows)]

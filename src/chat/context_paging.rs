@@ -397,6 +397,14 @@ pub(crate) struct ProjectMapEntry {
     pub source_hash: String,
     pub symbols: Vec<String>,
     pub stale: bool,
+    /// Cheap change detector used before the content hash. These fields are
+    /// derived hints only: any source page selected for a capsule still passes
+    /// `ensure_hash`, so a false metadata hit cannot make stale source
+    /// authoritative. Defaults force one hash pass when loading an older index.
+    #[serde(default)]
+    pub size_bytes: u64,
+    #[serde(default)]
+    pub modified_nanos: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -414,6 +422,16 @@ pub(crate) struct StructuralProjectMemory {
     pub cards: BTreeMap<String, SymbolCard>,
     pub pages: BTreeMap<String, SourcePage>,
     pub stale_record_invalidations: u64,
+    #[serde(skip)]
+    last_index_stats: ProjectIndexStats,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ProjectIndexStats {
+    elapsed_ms: u64,
+    files_seen: u64,
+    files_hashed: u64,
+    files_reused: u64,
 }
 
 impl StructuralProjectMemory {
@@ -424,6 +442,7 @@ impl StructuralProjectMemory {
             cards: BTreeMap::new(),
             pages: BTreeMap::new(),
             stale_record_invalidations: 0,
+            last_index_stats: ProjectIndexStats::default(),
         })
     }
 
@@ -456,6 +475,9 @@ impl StructuralProjectMemory {
     }
 
     pub(crate) fn index_workspace(&mut self) -> Result<(), ContextPagingError> {
+        let started = std::time::Instant::now();
+        let revision_before = self.project_map.index_revision;
+        let files_before = self.project_map.files.clone();
         let mut pending = vec![self.root.clone()];
         let mut files = Vec::new();
         while let Some(directory) = pending.pop() {
@@ -496,7 +518,10 @@ impl StructuralProjectMemory {
                         pending.push(entry.path());
                     }
                 } else if file_type.is_file() && supported_source(&entry.path()) {
-                    files.push(entry.path());
+                    let Ok(metadata) = entry.metadata() else {
+                        continue;
+                    };
+                    files.push((entry.path(), metadata));
                     if files.len() >= MAX_INDEX_FILES {
                         pending.clear();
                         break;
@@ -504,14 +529,23 @@ impl StructuralProjectMemory {
                 }
             }
         }
-        files.sort();
+        files.sort_by(|left, right| left.0.cmp(&right.0));
         let mut indexed = BTreeSet::new();
-        for file in files {
-            let Ok(relative) = normalized_relative(&self.root, &file) else {
+        let mut stats = ProjectIndexStats {
+            files_seen: files.len() as u64,
+            ..ProjectIndexStats::default()
+        };
+        for (file, metadata) in files {
+            let Ok(relative) = normalized_relative_from_walk(&self.root, &file) else {
                 continue;
             };
-            match self.index_file(&relative) {
-                Ok(()) => {
+            match self.index_file_with_metadata(&relative, &metadata, false) {
+                Ok(hashed) => {
+                    if hashed {
+                        stats.files_hashed = stats.files_hashed.saturating_add(1);
+                    } else {
+                        stats.files_reused = stats.files_reused.saturating_add(1);
+                    }
                     indexed.insert(relative);
                 }
                 Err(_) => {
@@ -538,8 +572,15 @@ impl StructuralProjectMemory {
                 self.purge_file(&file);
             }
         }
-        self.rebuild_callers();
-        self.save()
+        let changed = self.project_map.index_revision != revision_before
+            || self.project_map.files != files_before;
+        if changed {
+            self.rebuild_callers();
+            self.save()?;
+        }
+        stats.elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        self.last_index_stats = stats;
+        Ok(())
     }
 
     fn purge_file(&mut self, relative: &str) {
@@ -562,12 +603,39 @@ impl StructuralProjectMemory {
     pub(crate) fn index_file(&mut self, relative: &str) -> Result<(), ContextPagingError> {
         let path = contained_path(&self.root, relative)?;
         let metadata = std::fs::metadata(&path)?;
+        self.index_file_with_metadata(relative, &metadata, true)
+            .map(|_| ())
+    }
+
+    /// Index one source file, avoiding the read+SHA pass when its filesystem
+    /// fingerprint is unchanged. `force_hash` is used after Camelid itself
+    /// writes a file: that boundary already knows content changed and should not
+    /// depend on timestamp granularity.
+    fn index_file_with_metadata(
+        &mut self,
+        relative: &str,
+        metadata: &std::fs::Metadata,
+        force_hash: bool,
+    ) -> Result<bool, ContextPagingError> {
         if metadata.len() > MAX_SOURCE_BYTES {
             return Err(ContextPagingError::MissingContext(format!(
                 "{} is larger than the source indexing limit",
                 relative
             )));
         }
+        let (size_bytes, modified_nanos) = source_fingerprint(metadata);
+        if !force_hash
+            && self.project_map.files.iter().any(|entry| {
+                entry.file == relative
+                    && !entry.stale
+                    && entry.size_bytes == size_bytes
+                    && entry.modified_nanos == modified_nanos
+                    && entry.modified_nanos != 0
+            })
+        {
+            return Ok(false);
+        }
+        let path = contained_path(&self.root, relative)?;
         let text = std::fs::read_to_string(&path)?;
         let file_hash = sha256_text(&text);
         let previous_hash = self
@@ -577,7 +645,17 @@ impl StructuralProjectMemory {
             .find(|entry| entry.file == relative)
             .map(|entry| entry.source_hash.clone());
         if previous_hash.as_deref() == Some(&file_hash) {
-            return Ok(());
+            if let Some(entry) = self
+                .project_map
+                .files
+                .iter_mut()
+                .find(|entry| entry.file == relative)
+            {
+                entry.size_bytes = size_bytes;
+                entry.modified_nanos = modified_nanos;
+                entry.stale = false;
+            }
+            return Ok(true);
         }
         if previous_hash.is_some() {
             self.mark_file_stale(relative);
@@ -594,6 +672,8 @@ impl StructuralProjectMemory {
             source_hash: file_hash,
             symbols: symbol_ids,
             stale: false,
+            size_bytes,
+            modified_nanos,
         });
         self.project_map
             .files
@@ -604,7 +684,7 @@ impl StructuralProjectMemory {
             self.pages.insert(page.id.clone(), page);
             self.cards.insert(card.id.clone(), card);
         }
-        Ok(())
+        Ok(true)
     }
 
     fn mark_file_stale(&mut self, relative: &str) {
@@ -626,15 +706,21 @@ impl StructuralProjectMemory {
             .iter()
             .map(|entry| (entry.file.clone(), entry.source_hash.clone()))
             .collect::<Vec<_>>();
-        for (file, indexed_hash) in files {
-            // A deleted or unreadable file hashes to "not the indexed hash":
-            // its records go stale rather than aborting the load.
+        for (file, _indexed_hash) in files {
+            // Loading an index must be cheap too. Older indexes have zeroed
+            // fingerprints and deliberately fail this comparison, forcing one
+            // normal reindex that upgrades them.
             let current = contained_path(&self.root, &file)
                 .ok()
-                .and_then(|path| std::fs::read_to_string(path).ok())
-                .map(|text| sha256_text(&text))
-                .unwrap_or_default();
-            if current != indexed_hash {
+                .and_then(|path| std::fs::metadata(path).ok())
+                .map(|metadata| source_fingerprint(&metadata));
+            let indexed = self
+                .project_map
+                .files
+                .iter()
+                .find(|entry| entry.file == file)
+                .map(|entry| (entry.size_bytes, entry.modified_nanos));
+            if current != indexed || indexed.is_some_and(|(_, modified)| modified == 0) {
                 self.mark_file_stale(&file);
             }
         }
@@ -769,12 +855,23 @@ fn supported_source(path: &Path) -> bool {
         .is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(), "rs" | "py"))
 }
 
-fn normalized_relative(root: &Path, path: &Path) -> Result<String, ContextPagingError> {
-    let canonical = std::fs::canonicalize(path)?;
-    canonical
-        .strip_prefix(root)
+/// A path returned by `read_dir` is already rooted below the canonical
+/// workspace, and symlinks were rejected by the walker. Avoid a second
+/// `canonicalize` syscall per file on the hot refresh path.
+fn normalized_relative_from_walk(root: &Path, path: &Path) -> Result<String, ContextPagingError> {
+    path.strip_prefix(root)
         .map(|relative| relative.to_string_lossy().replace('\\', "/"))
         .map_err(|_| ContextPagingError::OutsideWorkspace(path.display().to_string()))
+}
+
+fn source_fingerprint(metadata: &std::fs::Metadata) -> (u64, u64) {
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0);
+    (metadata.len(), modified_nanos)
 }
 
 fn contained_path(root: &Path, relative: &str) -> Result<PathBuf, ContextPagingError> {
@@ -1245,6 +1342,27 @@ pub(crate) fn phase_tool_names(phase: ActionPhase) -> &'static [&'static str] {
     }
 }
 
+/// Stable native schema set for every non-terminal paging request. Changing
+/// tool definitions changes tokens near the start of several chat templates,
+/// destroying resident-prefix reuse even when the source capsule is otherwise
+/// identical. Phase legality remains explicit in `<current_action>` and is
+/// enforced again by the host state machine.
+const PAGED_WORK_TOOL_NAMES: &[&str] = &[
+    "edit_file",
+    "list_dir",
+    "read_file",
+    "run_shell",
+    "search",
+    "write_file",
+];
+
+// Below this budget the extra phase-inactive schemas can crowd out the exact
+// source page, which is the authority the model must edit. Normal Code-mode
+// capsules are comfortably above this threshold and keep the byte-identical
+// schema prefix; deliberately tiny/test budgets retain the old phase-minimal
+// fail-safe instead of becoming impossible to compose.
+const STABLE_TOOL_SCHEMA_MIN_INPUT_TOKENS: u32 = 2_048;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CompactDiagnostic {
@@ -1487,10 +1605,10 @@ impl<E: TokenEstimator> ContextCapsuleBuilder<E> {
         candidates.push(Candidate {
             category: "task",
             id: "task-contract".into(),
-            text: render_task_contract(request.ledger, request.current_action),
+            text: render_stable_task_contract(request.ledger),
             mandatory: true,
             importance: 250,
-            reason: "objective, current acceptance condition, focus, and invariants are pinned"
+            reason: "byte-stable objective, acceptance conditions, and invariants are pinned"
                 .into(),
         });
         if let Some(diagnostic) = request.diagnostic {
@@ -1508,10 +1626,19 @@ impl<E: TokenEstimator> ContextCapsuleBuilder<E> {
         }
 
         let allowed = phase_tool_names(request.phase);
+        let stable_tool_schemas = request.phase != ActionPhase::Complete
+            && self.config.max_input_tokens >= STABLE_TOOL_SCHEMA_MIN_INPUT_TOKENS;
         let mut tools = request
             .available_tools
             .iter()
-            .filter(|tool| allowed.contains(&tool.name.as_str()))
+            .filter(|tool| {
+                request.phase != ActionPhase::Complete
+                    && if stable_tool_schemas {
+                        PAGED_WORK_TOOL_NAMES.contains(&tool.name.as_str())
+                    } else {
+                        allowed.contains(&tool.name.as_str())
+                    }
+            })
             .map(|tool| tool.name.clone())
             .collect::<Vec<_>>();
         tools.sort();
@@ -1539,11 +1666,19 @@ impl<E: TokenEstimator> ContextCapsuleBuilder<E> {
             text: format!(
                 "<usable_tools phase=\"{:?}\">{}</usable_tools>\n",
                 request.phase,
-                tools.join(",")
+                allowed.join(",")
             ),
             mandatory: true,
             importance: 240,
             reason: "only tools usable in the current phase".into(),
+        });
+        candidates.push(Candidate {
+            category: "action",
+            id: "current-action".into(),
+            text: render_current_action(request.ledger, request.current_action, request.phase),
+            mandatory: true,
+            importance: 249,
+            reason: "dynamic action and verification state are pinned at the capsule tail".into(),
         });
 
         let mut stale_lookups = Vec::new();
@@ -1768,14 +1903,17 @@ fn category_order(category: &str) -> u8 {
         "diagnostic" => 6,
         "tools" => 7,
         "completed_work" => 8,
-        _ => 9,
+        "action" => 9,
+        _ => 10,
     }
 }
 
 fn add_composition(composition: &mut CapsuleComposition, category: &str, tokens: u32) {
     match category {
         "stable_kernel" => composition.stable_kernel_tokens += tokens,
-        "task" | "task_detail" | "completed_work" | "history" => composition.task_tokens += tokens,
+        "task" | "task_detail" | "completed_work" | "history" | "action" => {
+            composition.task_tokens += tokens
+        }
         "map" => composition.map_tokens += tokens,
         "card" => composition.card_tokens += tokens,
         "page" => composition.page_tokens += tokens,
@@ -1785,33 +1923,38 @@ fn add_composition(composition: &mut CapsuleComposition, category: &str, tokens:
     }
 }
 
-/// The mandatory contract carries only the never-evict content: objective,
-/// current action and focus, acceptance conditions, critical invariants, and
-/// the verification status. Decisions and open questions render separately as
-/// evictable task detail so ledger growth can never brick capsule construction.
-fn render_task_contract(ledger: &TaskLedger, current_action: &str) -> String {
+/// Byte-stable prefix for the lifetime of one task. Mutable ledger fields live
+/// in `render_current_action` at the capsule tail so ordinary phase changes can
+/// reuse all KV rows through this contract and the unchanged source evidence.
+fn render_stable_task_contract(ledger: &TaskLedger) -> String {
     let mut objective = ledger.objective.clone();
     bound_item(&mut objective, MAX_CONTRACT_FIELD_CHARS);
+    format!(
+        concat!(
+            "<task_contract>\n",
+            "objective: {}\n",
+            "acceptanceCriteria:\n{}\n",
+            "criticalInvariants:\n{}\n",
+            "</task_contract>\n"
+        ),
+        objective,
+        bounded_bullets(&ledger.acceptance_criteria),
+        bounded_bullets(&ledger.invariants),
+    )
+}
+
+fn render_current_action(ledger: &TaskLedger, current_action: &str, phase: ActionPhase) -> String {
     let mut focus = ledger.current_focus.clone();
     bound_item(&mut focus, MAX_CONTRACT_FIELD_CHARS);
     format!(
         concat!(
-            "<task_contract revision=\"{}\">\n",
-            "objective: {}\n",
-            "currentAction: {}\n",
-            "currentFocus: {}\n",
-            "acceptanceCriteria:\n{}\n",
-            "criticalInvariants:\n{}\n",
+            "<current_action revision=\"{}\" phase=\"{:?}\">\n",
+            "instruction: {}\n",
+            "focus: {}\n",
             "verificationStatus: {}\n",
-            "</task_contract>\n"
+            "</current_action>\n"
         ),
-        ledger.revision,
-        objective,
-        current_action,
-        focus,
-        bounded_bullets(&ledger.acceptance_criteria),
-        bounded_bullets(&ledger.invariants),
-        ledger.verification_state.status,
+        ledger.revision, phase, current_action, focus, ledger.verification_state.status,
     )
 }
 
@@ -2099,6 +2242,18 @@ pub(crate) struct ContextPagingMetrics {
     pub verification_retries: u64,
     pub tokens_per_completed_task: u64,
     pub peak_active_context_size: u32,
+    /// Last metadata-gated project refresh and cumulative file decisions. These
+    /// make Windows filesystem overhead visible independently of model TTFT.
+    #[serde(default)]
+    pub last_index_refresh_ms: u64,
+    #[serde(default)]
+    pub last_index_files_hashed: u64,
+    #[serde(default)]
+    pub last_index_files_reused: u64,
+    #[serde(default)]
+    pub index_files_hashed: u64,
+    #[serde(default)]
+    pub index_files_reused: u64,
     /// Composition of the most recent capsule, by category.
     #[serde(default)]
     pub last_capsule_composition: CapsuleComposition,
@@ -2156,7 +2311,17 @@ impl ContextPagingRuntime {
             PersistedRuntimeState::default()
         };
         let stale_record_invalidations = project.stale_record_invalidations;
+        let index_stats = project.last_index_stats;
         let mut metrics = persisted.metrics;
+        metrics.last_index_refresh_ms = index_stats.elapsed_ms;
+        metrics.last_index_files_hashed = index_stats.files_hashed;
+        metrics.last_index_files_reused = index_stats.files_reused;
+        metrics.index_files_hashed = metrics
+            .index_files_hashed
+            .saturating_add(index_stats.files_hashed);
+        metrics.index_files_reused = metrics
+            .index_files_reused
+            .saturating_add(index_stats.files_reused);
         metrics.stale_record_invalidations = metrics
             .stale_record_invalidations
             .max(stale_record_invalidations);
@@ -2211,6 +2376,18 @@ impl ContextPagingRuntime {
     pub(crate) fn refresh_project(&mut self) -> Result<(), ContextPagingError> {
         let before = self.project.stale_record_invalidations;
         self.project.index_workspace()?;
+        let index_stats = self.project.last_index_stats;
+        self.metrics.last_index_refresh_ms = index_stats.elapsed_ms;
+        self.metrics.last_index_files_hashed = index_stats.files_hashed;
+        self.metrics.last_index_files_reused = index_stats.files_reused;
+        self.metrics.index_files_hashed = self
+            .metrics
+            .index_files_hashed
+            .saturating_add(index_stats.files_hashed);
+        self.metrics.index_files_reused = self
+            .metrics
+            .index_files_reused
+            .saturating_add(index_stats.files_reused);
         let delta = self
             .project
             .stale_record_invalidations
@@ -2928,7 +3105,7 @@ mod tests {
     }
 
     #[test]
-    fn capsule_includes_only_phase_relevant_tools() {
+    fn capsule_keeps_work_tool_schemas_stable_but_declares_phase_legality() {
         let (_directory, memory, symbol) = fixture();
         let mandatory = BTreeSet::from([symbol.clone()]);
         let capsule =
@@ -2945,8 +3122,29 @@ mod tests {
                 })
                 .unwrap();
         assert!(capsule.tool_names.contains(&"write_file".to_string()));
-        assert!(!capsule.tool_names.contains(&"run_shell".to_string()));
+        assert!(capsule.tool_names.contains(&"run_shell".to_string()));
         assert!(!capsule.tool_names.contains(&"spawn_subagent".to_string()));
+        assert!(capsule.rendered.contains(
+            "<usable_tools phase=\"Modify\">read_file,search,write_file,edit_file</usable_tools>"
+        ));
+
+        let verify =
+            ContextCapsuleBuilder::new(ContextPagingConfig::default(), ConservativeTokenEstimator)
+                .build(ContextCapsuleRequest {
+                    ledger: &ledger(&mandatory.iter().next().unwrap().clone()),
+                    current_action: "Verify increment",
+                    phase: ActionPhase::Verify,
+                    relevant_symbols: &mandatory.iter().cloned().collect::<Vec<_>>(),
+                    mandatory_symbols: &mandatory,
+                    project: &memory,
+                    diagnostic: None,
+                    available_tools: &tools(),
+                })
+                .unwrap();
+        assert_eq!(capsule.tool_names, verify.tool_names);
+        assert!(verify
+            .rendered
+            .contains("<usable_tools phase=\"Verify\">read_file,run_shell</usable_tools>"));
     }
 
     #[test]
@@ -3205,6 +3403,28 @@ mod tests {
             .any(|entry| entry.file == "extra.rs"));
         assert!(!memory.cards.values().any(|card| card.file == "extra.rs"));
         assert!(memory.stale_record_invalidations >= 1);
+    }
+
+    #[test]
+    fn unchanged_workspace_refresh_reuses_metadata_fingerprints() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("lib.rs");
+        std::fs::write(&path, "pub fn value() -> i32 { 1 }\n").unwrap();
+        let mut memory = StructuralProjectMemory::new(directory.path()).unwrap();
+
+        memory.index_workspace().unwrap();
+        assert_eq!(memory.last_index_stats.files_hashed, 1);
+
+        memory.index_workspace().unwrap();
+        assert_eq!(memory.last_index_stats.files_hashed, 0);
+        assert_eq!(memory.last_index_stats.files_reused, 1);
+
+        // Different length makes the fingerprint transition deterministic even
+        // on filesystems with coarse modification timestamps.
+        std::fs::write(&path, "pub fn value() -> i32 { 200 }\n").unwrap();
+        memory.index_workspace().unwrap();
+        assert_eq!(memory.last_index_stats.files_hashed, 1);
+        assert_eq!(memory.resolve_symbol("value").is_some(), true);
     }
 
     #[test]

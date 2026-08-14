@@ -167,14 +167,18 @@ directory: installed models survive updates and reinstalls.
 ## Building (developers)
 
 ```sh
-# From the workspace root. Build the debug server sidecar, then build and run
-# the desktop app. Both executables land in target/debug/:
-cargo build --locked --bin camelid
-cargo build -p camelid-desktop
+# From the workspace root. Keep the UI shell debuggable, but always run the
+# optimized inference engine; an unoptimized CPU fallback can take minutes per
+# token on agent prompts.
+cargo build --release --locked --bin camelid
+$env:CAMELID_ENGINE_PATH = (Resolve-Path target/release/camelid.exe)
 cargo run -p camelid-desktop
 ```
 
-For packaging, build the release sidecar explicitly:
+On macOS/Linux, set the same override with
+`CAMELID_ENGINE_PATH="$(pwd)/target/release/camelid"`. The override must be an
+absolute existing path and takes precedence over an engine beside the desktop
+executable. For packaging, build the release sidecar explicitly:
 
 ```sh
 cargo build --release --locked --bin camelid

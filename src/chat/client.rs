@@ -137,11 +137,31 @@ pub struct StreamStats {
     /// Server-reported completion tokens from the same terminal usage chunk;
     /// feeds the paging lane's output-tokens-per-request metric.
     pub completion_tokens: Option<u32>,
+    /// Compact server-side timing receipt requested by the agent lane. These
+    /// are model-runtime timings (not socket-wall estimates), including the
+    /// resident CUDA cold/warm decision when that lane ran.
+    pub timing: Option<StreamTimingStats>,
     /// Structured OpenAI tool-call deltas accumulated across the stream. The
     /// dense chat server deliberately withholds a possible tool-call envelope
     /// from `delta.content`, then emits it here at completion. Dropping this
     /// field turns a valid agent action into an empty assistant answer.
     pub tool_calls: Vec<ToolCallOut>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq, Clone)]
+pub struct StreamTimingStats {
+    pub prefill_ms: Option<u64>,
+    pub first_token_ms: Option<u64>,
+    pub decode_ms: Option<u64>,
+    pub weight_load_ms: Option<u64>,
+    pub weight_cache_hit: Option<bool>,
+    pub prompt_cache_hit: Option<bool>,
+    pub resident_backend: Option<String>,
+    pub reused_tokens: Option<u32>,
+    pub prefilled_tokens: Option<u32>,
+    pub engine_rebuilt: Option<bool>,
+    pub engine_rebuild_count: Option<u64>,
+    pub batched_prefill: Option<bool>,
 }
 
 #[derive(Clone)]
@@ -494,6 +514,7 @@ impl Client {
                 ttft_ms: None,
                 prompt_tokens: None,
                 completion_tokens: None,
+                timing: None,
                 tool_calls: Vec::new(),
             });
         }
@@ -508,6 +529,7 @@ impl Client {
         // stream_options.include_usage (agent lane); absent otherwise.
         let mut prompt_tokens: Option<u32> = None;
         let mut completion_tokens: Option<u32> = None;
+        let mut timing: Option<StreamTimingStats> = None;
         // `finish_reason: "length"` is the ONLY signal that the model was cut
         // off at max_tokens. Without it a capped step is indistinguishable from
         // a finished one, and half-written tool calls get committed as answers.
@@ -587,6 +609,50 @@ impl Client {
                     {
                         completion_tokens = Some(ct as u32);
                     }
+                    if let Some(values) =
+                        chunk.pointer("/camelid/stream_timing_diagnostics/timings_ms")
+                    {
+                        let millis = |field: &str| {
+                            values
+                                .get(field)
+                                .and_then(Value::as_f64)
+                                .map(|value| value.max(0.0).round() as u64)
+                        };
+                        let resident = values.get("resident_prefill");
+                        timing = Some(StreamTimingStats {
+                            prefill_ms: millis("prefill_forward_total"),
+                            first_token_ms: millis("first_token_forward_total"),
+                            decode_ms: millis("generation_forward_total"),
+                            weight_load_ms: values.get("weight_load").and_then(Value::as_u64),
+                            weight_cache_hit: values
+                                .get("weight_cache_hit")
+                                .and_then(Value::as_bool),
+                            prompt_cache_hit: values
+                                .get("prompt_cache_hit")
+                                .and_then(Value::as_bool),
+                            resident_backend: resident
+                                .and_then(|value| value.get("backend"))
+                                .and_then(Value::as_str)
+                                .map(ToString::to_string),
+                            reused_tokens: resident
+                                .and_then(|value| value.get("reused_tokens"))
+                                .and_then(Value::as_u64)
+                                .and_then(|value| u32::try_from(value).ok()),
+                            prefilled_tokens: resident
+                                .and_then(|value| value.get("prefilled_tokens"))
+                                .and_then(Value::as_u64)
+                                .and_then(|value| u32::try_from(value).ok()),
+                            engine_rebuilt: resident
+                                .and_then(|value| value.get("engine_rebuilt"))
+                                .and_then(Value::as_bool),
+                            engine_rebuild_count: resident
+                                .and_then(|value| value.get("engine_rebuild_count"))
+                                .and_then(Value::as_u64),
+                            batched_prefill: resident
+                                .and_then(|value| value.get("batched"))
+                                .and_then(Value::as_bool),
+                        });
+                    }
                 }
             }
             SseControl::Continue
@@ -610,6 +676,7 @@ impl Client {
             ttft_ms,
             prompt_tokens,
             completion_tokens,
+            timing,
             tool_calls,
         })
     }
@@ -1312,6 +1379,7 @@ mod tests {
                 "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"type\":\"function\",\"function\":{\"name\":\"write_\",\"arguments\":\"{\\\"path\\\":\"}}]},\"finish_reason\":null}]}\n\n",
                 "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"file\",\"arguments\":\"\\\"agent-proof.txt\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
                 "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: {\"choices\":[],\"camelid\":{\"stream_timing_diagnostics\":{\"timings_ms\":{\"prefill_forward_total\":812.4,\"first_token_forward_total\":18.2,\"generation_forward_total\":44.8,\"weight_load\":7,\"weight_cache_hit\":true,\"prompt_cache_hit\":false,\"resident_prefill\":{\"backend\":\"cuda\",\"reused_tokens\":1200,\"prefilled_tokens\":178,\"engine_rebuilt\":false,\"engine_rebuild_count\":1,\"batched\":true}}}}}\n\n",
                 "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1378}}\n\n",
                 "data: [DONE]\n\n",
             );
@@ -1337,6 +1405,12 @@ mod tests {
             "tool calls must not leak as visible text"
         );
         assert_eq!(stats.prompt_tokens, Some(1378));
+        let timing = stats.timing.as_ref().expect("timing receipt");
+        assert_eq!(timing.prefill_ms, Some(812));
+        assert_eq!(timing.reused_tokens, Some(1200));
+        assert_eq!(timing.prefilled_tokens, Some(178));
+        assert_eq!(timing.engine_rebuilt, Some(false));
+        assert_eq!(timing.resident_backend.as_deref(), Some("cuda"));
         assert_eq!(stats.tool_calls.len(), 1);
         assert_eq!(stats.tool_calls[0].name, "write_file");
         assert_eq!(

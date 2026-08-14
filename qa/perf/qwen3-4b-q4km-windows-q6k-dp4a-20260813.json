@@ -1,0 +1,45 @@
+{
+  "schema": "camelid.cuda_resident.q6k_dp4a_windows.v1",
+  "captured_at": "2026-08-13",
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 3060 Laptop GPU",
+    "compute_capability": "sm_86",
+    "vram_gib": 6,
+    "os": "Windows"
+  },
+  "model": "Qwen3-4B-Q4_K_M.gguf",
+  "mode": "greedy_temperature_0",
+  "runs_per_leg": 5,
+  "kernel_projection": {
+    "rows": 2560,
+    "q6_superblocks_per_row": 38,
+    "tokens": 32,
+    "old_wide_ms": 62.953,
+    "new_dp4a_ms": 24.042,
+    "speedup": 2.62
+  },
+  "whole_model": {
+    "298_prompt_tokens": {
+      "new_dp4a_batched_prompt_tokens_per_second": 85.43,
+      "old_wide_batched_prompt_tokens_per_second": 57.01,
+      "serial_prompt_tokens_per_second": 22.72,
+      "new_vs_old_speedup": 1.498,
+      "new_vs_serial_speedup": 3.76
+    },
+    "858_prompt_tokens": {
+      "new_dp4a_batched_prompt_tokens_per_second": 52.16,
+      "new_dp4a_batched_stddev": 0.11,
+      "serial_prompt_tokens_per_second": 21.98,
+      "serial_stddev": 0.04,
+      "new_vs_serial_speedup": 2.37
+    }
+  },
+  "correctness": {
+    "q6k_dp4a_vs_wide_bit_exact_tokens": [1, 2, 8, 32],
+    "status": "pass"
+  },
+  "rollback": {
+    "environment_variable": "CAMELID_CUDA_Q6K_DP4A",
+    "disable_values": ["0", "false", "off"]
+  }
+}

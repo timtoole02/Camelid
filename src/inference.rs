@@ -2452,8 +2452,24 @@ pub struct LlamaGenerationStep {
     pub timings: LlamaForwardTimings,
     pub prefill_timings: LlamaForwardTimings,
     pub first_token_timings: LlamaForwardTimings,
+    pub resident_prefill: Option<ResidentPrefillMetrics>,
     pub sample: u128,
     pub diagnostics: Option<LlamaForwardDiagnostics>,
+}
+
+/// Request-scoped evidence for the resident prefill decision. This is kept
+/// intentionally compact so interactive agent clients can distinguish a cold
+/// engine build from a warm prefix continuation without enabling a profiler.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResidentPrefillMetrics {
+    pub backend: &'static str,
+    pub prompt_tokens: usize,
+    pub reused_tokens: usize,
+    pub prefilled_tokens: usize,
+    pub engine_rebuilt: bool,
+    pub engine_rebuild_count: u64,
+    pub batched: bool,
+    pub elapsed_ms: u64,
 }
 
 /// Result of a GPU-resident decode step: either the post-layers hidden state (when logits
@@ -3125,9 +3141,12 @@ impl LlamaInferenceSession {
     /// advanced (positions left empty ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â only the resident path continues this sequence),
     /// and the caller skips its CPU prefill loop entirely; the last prompt token then runs
     /// through the resident decode for logits.
-    fn try_resident_prefill(&mut self, token_ids: &[u32]) -> Result<bool> {
+    fn try_resident_prefill(
+        &mut self,
+        token_ids: &[u32],
+    ) -> Result<Option<ResidentPrefillMetrics>> {
         if self.resident_paths_disabled {
-            return Ok(false);
+            return Ok(None);
         }
         // CUDA: run the whole prompt on the GPU resident engine (default on when a
         // device is present), eliminating the CPU prefill / TTFT. The Metal seam
@@ -3136,7 +3155,19 @@ impl LlamaInferenceSession {
         if resident_decode_cuda_enabled() {
             return self.try_resident_prefill_cuda(token_ids);
         }
-        self.try_metal_resident_prefill(token_ids)
+        let started = Instant::now();
+        self.try_metal_resident_prefill(token_ids).map(|used| {
+            used.then(|| ResidentPrefillMetrics {
+                backend: "metal",
+                prompt_tokens: token_ids.len(),
+                reused_tokens: 0,
+                prefilled_tokens: token_ids.len(),
+                engine_rebuilt: false,
+                engine_rebuild_count: 0,
+                batched: true,
+                elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            })
+        })
     }
 
     /// CUDA GPU prefill: run the whole prompt through the resident engine on the
@@ -3146,7 +3177,10 @@ impl LlamaInferenceSession {
     /// the CPU prefill ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â the main time-to-first-token cost. Returns `false` to fall
     /// back to the CPU prefill for any unsupported config.
     #[cfg(feature = "cuda")]
-    fn try_resident_prefill_cuda(&mut self, token_ids: &[u32]) -> Result<bool> {
+    fn try_resident_prefill_cuda(
+        &mut self,
+        token_ids: &[u32],
+    ) -> Result<Option<ResidentPrefillMetrics>> {
         // Explicit escape hatch: `CAMELID_CUDA_RESIDENT_PREFILL=0` keeps prefill on
         // the CPU while still allowing GPU-resident decode (debugging / isolation).
         if std::env::var_os("CAMELID_CUDA_RESIDENT_PREFILL")
@@ -3157,7 +3191,7 @@ impl LlamaInferenceSession {
             })
             .unwrap_or(false)
         {
-            return Ok(false);
+            return Ok(None);
         }
         if self.resident_paths_disabled
             || token_ids.len() < 2
@@ -3166,7 +3200,7 @@ impl LlamaInferenceSession {
             || self.weights.layer_range.is_some()
             || !self.resident_decode_eligible(false)?
         {
-            return Ok(false);
+            return Ok(None);
         }
         // Windowed archs (gemma3) decline the batched resident prefill outright.
         // Two independent reasons, either of which alone is disqualifying:
@@ -3190,7 +3224,7 @@ impl LlamaInferenceSession {
                      in the batched kernels, and this path would cache a non-windowed engine)"
                 );
             }
-            return Ok(false);
+            return Ok(None);
         }
         let weights = Arc::clone(&self.weights);
         let dims = DenseLlamaDims::from_config(&self.config)?;
@@ -3206,7 +3240,7 @@ impl LlamaInferenceSession {
             .min(self.kv_cache.plan.max_sequence_length)
             .min(resident_cuda_max_context());
         if n >= kv_cap {
-            return Ok(false);
+            return Ok(None);
         }
         let rms_eps = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
         let scale = attention_score_scale_value(head_dim, diagnostic_attention_score_scale()?);
@@ -3222,7 +3256,7 @@ impl LlamaInferenceSession {
             weights.rope_freqs.as_ref(),
         )? {
             Some(t) => t,
-            None => return Ok(false),
+            None => return Ok(None),
         };
         let embeddings = weights
             .token_embedding
@@ -3280,18 +3314,19 @@ impl LlamaInferenceSession {
                         range: 0..n_layers,
                     })
                 }
-                None => return Ok(false),
+                None => return Ok(None),
             }
         }
         let slot = guard.as_mut().expect("resident CUDA engine built above");
         // The engine's VRAM-sized capacity is authoritative; a prompt longer than it
         // fits prefills on the CPU instead of overrunning the resident KV.
         if n > slot.engine.max_pos() {
-            return Ok(false);
+            return Ok(None);
         }
-        // Default to batched prefill on the benchmark-promoted Q8 lane. The
-        // parity-correct Q4_K/Q6_K tiles remain explicit opt-ins because they
-        // regress sustained WDDM throughput on the RTX 3060 Laptop reference.
+        // Default to batched prefill on every benchmark-promoted resident lane.
+        // Q4_K/Q6_K joined Q8 after the Q6 dp4a/register tile made the mixed
+        // Qwen3-4B lane 3.76x faster than serial at agent-prompt scale and
+        // 2.37x faster at 858 tokens on the Windows SM86 reference host.
         // `CAMELID_CUDA_RESIDENT_PREFILL_BATCHED=0/1` remains the A/B override.
         let serial_prefill = std::env::var_os("CAMELID_CUDA_RESIDENT_PREFILL_BATCHED")
             .map(|v| {
@@ -3332,7 +3367,7 @@ impl LlamaInferenceSession {
             // decode path rebuilds/reseeds rather than trusting it.
             slot.engine.set_filled(0);
             slot.engine.set_resident_tokens(&[]);
-            return Ok(false);
+            return Ok(None);
         }
         slot.engine.set_filled(n);
         slot.engine.set_resident_tokens(token_ids);
@@ -3356,7 +3391,7 @@ impl LlamaInferenceSession {
                 eprintln!("[resident-cuda] KV readback to host failed ({e}); using CPU prefill");
             }
             slot.engine.set_filled(0);
-            return Ok(false);
+            return Ok(None);
         }
         drop(guard);
         self.kv_cache.position = n;
@@ -3366,7 +3401,21 @@ impl LlamaInferenceSession {
                 started.elapsed().as_millis()
             );
         }
-        Ok(true)
+        let rebuild_count = if need_build {
+            RESIDENT_CUDA_PREFILL_REBUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+        } else {
+            RESIDENT_CUDA_PREFILL_REBUILDS.load(std::sync::atomic::Ordering::Relaxed)
+        };
+        Ok(Some(ResidentPrefillMetrics {
+            backend: "cuda",
+            prompt_tokens: n,
+            reused_tokens: reuse,
+            prefilled_tokens: n - reuse,
+            engine_rebuilt: need_build,
+            engine_rebuild_count: rebuild_count,
+            batched: !serial_prefill,
+            elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        }))
     }
 
     /// Mirror the GPU-resident prefill KV into the CPU KV cache so both backends hold
@@ -5406,7 +5455,12 @@ impl LlamaInferenceSession {
             });
         }
         let resident_prefill_started = Instant::now();
-        if prefill_count > 1 && self.try_resident_prefill(&token_ids[..prefill_count])? {
+        let resident_prefill = if prefill_count > 1 {
+            self.try_resident_prefill(&token_ids[..prefill_count])?
+        } else {
+            None
+        };
+        if resident_prefill.is_some() {
             // Whole prompt prefilled on the GPU in one command buffer; the last prompt
             // token below decodes through the resident session. The wall-clock covers
             // session setup + the command buffer; per-stage GPU splits aren't available.
@@ -5526,6 +5580,7 @@ impl LlamaInferenceSession {
             timings,
             prefill_timings,
             first_token_timings,
+            resident_prefill,
             sample,
             diagnostics,
         })
@@ -12872,6 +12927,9 @@ struct ResidentCudaSlot {
     /// (The build/reseed decisions deliberately keep their existing key-only policy.)
     range: std::ops::Range<usize>,
 }
+
+#[cfg(feature = "cuda")]
+static RESIDENT_CUDA_PREFILL_REBUILDS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct ResidentCudaStatus {
