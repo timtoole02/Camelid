@@ -61,8 +61,9 @@ pub struct AgentConfig {
     /// host fills this before ordinary sandbox validation. General/repo runs
     /// leave it unset.
     pub default_write_path: Option<String>,
-    /// Usable context in tokens for the Full agent. `None` keeps deterministic
-    /// gate harnesses byte-stable; Workspace uses its exact preflight budget.
+    /// Optional context-budget override for proactive legacy-transcript
+    /// compaction. Workspace normally uses the exact budget reported by the
+    /// model driver; `None` keeps deterministic gate harnesses byte-stable.
     pub ctx_budget: Option<u32>,
     /// Construct a fresh host-owned bounded capsule for each Web Code action.
     /// The detailed budgets remain environment-configurable during rollout.
@@ -369,6 +370,10 @@ const PAGING_NONPROGRESS_LIMIT: usize = 16;
 /// Exact-tokenizer overflows rebuild a smaller capsule instead of failing the
 /// run, at most this many times per run.
 const PAGING_BUDGET_REBUILD_LIMIT: usize = 3;
+/// Retry feedback is mandatory in the next fresh capsule, but a reasoning-only
+/// reply or a verbose validation error must not turn that bounded channel into
+/// another unbounded transcript.
+const MAX_PAGING_RETRY_FEEDBACK_BYTES: usize = 1_024;
 const PAGING_FULL_REWRITE_FOCUS: &str = concat!(
     "Narrow edit recovery is exhausted. Replace the complete existing file with ",
     "write_file, preserving required behavior and correcting every persisted diagnostic."
@@ -533,6 +538,40 @@ fn supply_default_write_path(call: &mut ToolCall, path: &str) -> bool {
     }
     args.insert("path".into(), Value::String(path.to_string()));
     true
+}
+
+/// `list_dir({})` is the shortest useful call a small model can emit in a new
+/// workspace. The workspace root is the only path the host can fill without
+/// guessing intent, and `search` already uses the same deterministic default.
+fn supply_paging_list_dir_root(call: &mut ToolCall, profile: tools::ToolProfile) -> bool {
+    let canonical = tools::repair_tool_name(&call.name, profile).unwrap_or(call.name.as_str());
+    if canonical != "list_dir" {
+        return false;
+    }
+    let Some(args) = call.args.as_object_mut() else {
+        return false;
+    };
+    if args.contains_key("path") {
+        return false;
+    }
+    args.insert("path".into(), Value::String(".".into()));
+    true
+}
+
+/// Context Paging creates `.camelid/` before the first model step, so a literal
+/// `read_dir().next().is_none()` can never recognize a greenfield task. Ignore
+/// only host metadata that is not user project state; any other entry keeps the
+/// ordinary discovery phase.
+fn workspace_is_effectively_empty(root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    entries.flatten().all(|entry| {
+        matches!(
+            entry.file_name().to_string_lossy().as_ref(),
+            ".camelid" | ".git" | ".DS_Store"
+        )
+    })
 }
 
 #[cfg(windows)]
@@ -773,6 +812,11 @@ pub fn run_loop(
             _ => None,
         })
         .unwrap_or_default();
+    let required_workspace_artifacts = if cfg.tool_profile == tools::ToolProfile::WebCode {
+        workspace_requested_artifacts(&task_objective)
+    } else {
+        BTreeSet::new()
+    };
     let mut context_paging = if cfg.context_paging
         && cfg.tool_profile == tools::ToolProfile::WebCode
     {
@@ -795,6 +839,9 @@ pub fn run_loop(
                             "Create the standalone artifact at the exact workspace-relative path `{path}` with write_file"
                         ));
                 }
+                criteria.extend(required_workspace_artifacts.iter().map(|path| {
+                    format!("Required workspace artifact exists before completion: `{path}`")
+                }));
                 for criterion in criteria {
                     if !runtime.ledger.acceptance_criteria.contains(&criterion) {
                         runtime.ledger.acceptance_criteria.push(criterion);
@@ -985,10 +1032,43 @@ pub fn run_loop(
             return LoopEnd::Aborted;
         }
         if context_paging.is_none() {
-            if let Some(budget) = cfg.ctx_budget {
-                let limit = (budget as f32 * COMPACT_AT) as u32;
-                if estimate_tokens(history, calibration) > limit {
-                    let target = budget / 2;
+            // The Web Workspace owns an exact model budget on the driver. It
+            // used to leave `cfg.ctx_budget` unset, which silently disabled the
+            // 80% high-water compactor and let the legacy rollback lane crawl
+            // all the way to the model window. Keep the explicit config override
+            // for CLI/tests, but use the driver's real budget for Workspace.
+            let proactive_budget = cfg.ctx_budget.or_else(|| {
+                cfg.tool_profile
+                    .is_workspace()
+                    .then(|| driver.context_budget_tokens())
+                    .flatten()
+            });
+            if let Some(budget) = proactive_budget {
+                let proportional_limit = (budget as f32 * COMPACT_AT) as u32;
+                let limit = if cfg.tool_profile.is_workspace() {
+                    proportional_limit.min(WORKSPACE_LEGACY_HIGH_WATER)
+                } else {
+                    proportional_limit
+                };
+                // Decide from the projection actually sent to the model. Raw
+                // audit history may contain megabytes of completed write args
+                // that the workspace compiler already replaces with bounded
+                // observations; compacting solely because of those hidden bytes
+                // would invalidate a useful prefix for no latency benefit.
+                let projected_tokens = if cfg.tool_profile.is_workspace() {
+                    estimate_tokens(
+                        &compile_history_for_step(history, cfg.tool_profile),
+                        calibration,
+                    )
+                } else {
+                    estimate_tokens(history, calibration)
+                };
+                if projected_tokens > limit {
+                    let target = if cfg.tool_profile.is_workspace() {
+                        (budget / 2).min(WORKSPACE_LEGACY_LOW_WATER)
+                    } else {
+                        budget / 2
+                    };
                     if let Some((compacted, report)) = compact(history, target, calibration) {
                         *history = compacted;
                         reporter.notice(&format!(
@@ -1016,6 +1096,10 @@ pub fn run_loop(
                 .default_write_path
                 .as_deref()
                 .filter(|path| !workspace_changed && !sandbox.root().join(path).is_file());
+            let empty_creation_workspace =
+                require_workspace_change && workspace_is_effectively_empty(sandbox.root());
+            let missing_artifacts =
+                missing_required_artifacts(sandbox.root(), &required_workspace_artifacts);
             let phase = if workspace_changed && !pending_verification_paths.is_empty() {
                 // Exact post-write source capture is host lifecycle work. Do
                 // it before reacting to a model-selected command failure so
@@ -1026,10 +1110,12 @@ pub fn run_loop(
                 || paging_diagnostic
                     .as_ref()
                     .is_some_and(|diagnostic| diagnostic.status != "ok")
+                || (workspace_changed && !missing_artifacts.is_empty())
             {
                 ActionPhase::Modify
             } else if workspace_changed
                 && pending_verification_paths.is_empty()
+                && missing_artifacts.is_empty()
                 && matches!(
                     runtime.ledger.verification_state.status.as_str(),
                     "passed" | "complete"
@@ -1038,16 +1124,30 @@ pub fn run_loop(
                 ActionPhase::Complete
             } else if workspace_changed {
                 ActionPhase::Verify
-            } else if !paging_discovery_complete {
+            } else if !paging_discovery_complete && !empty_creation_workspace {
                 ActionPhase::Discover
             } else {
                 ActionPhase::Modify
             };
             let current_action = match phase {
-                    ActionPhase::Discover => "Retrieve one missing exact source page".to_string(),
+                    ActionPhase::Discover => concat!(
+                        "Inspect the workspace with one advertised native read tool. Read exact ",
+                        "source before changing an existing file."
+                    )
+                    .to_string(),
                     ActionPhase::Modify if direct_creation_target.is_some() => format!(
                         "Create the new file `{}` now with write_file containing the COMPLETE runnable artifact. The target does not exist: do not call read_file, search, edit_file, or any shell command first.",
                         direct_creation_target.unwrap_or_default()
+                    ),
+                    ActionPhase::Modify if empty_creation_workspace => concat!(
+                        "The host confirmed this workspace has no project files. Start implementing ",
+                        "the exact objective now with write_file. Continue until every requested ",
+                        "file and requirement exists, then run the relevant tests."
+                    )
+                    .to_string(),
+                    ActionPhase::Modify if !missing_artifacts.is_empty() => format!(
+                        "Create the remaining required workspace artifacts before completing: {}. Use write_file now, then verify the complete result.",
+                        missing_artifacts.join(", ")
                     ),
                     ActionPhase::Modify if force_full_rewrite => concat!(
                         "Replace the complete existing file with write_file. Preserve required ",
@@ -1062,36 +1162,34 @@ pub fn run_loop(
                     {
                         concat!(
                             "Correct the persisted diagnostic with a real source change. ",
-                            "Do not return or rewrite the exact source unchanged. Prefer a ",
-                            "hash-checked PATCH or edit_file for an existing file."
+                            "Do not return or rewrite the exact source unchanged. Read the ",
+                            "target when necessary, then use edit_file or write_file."
                         )
                         .to_string()
                     }
                     ActionPhase::Modify => concat!(
-                        "Inspect the provided exact source when modifying existing code, ",
-                        "then perform one bounded code change"
+                        "Advance the complete objective with one native tool call. Inspect exact ",
+                        "source when needed, then write or edit the next required file."
                     )
                     .to_string(),
                     ActionPhase::Verify if !pending_verification_paths.is_empty() => concat!(
-                        "Re-read the exact changed artifact with read_file. The host will run ",
-                        "syntax verification and semantic acceptance checks after the read."
+                        "Continue implementing any remaining requirements. When implementation is ",
+                        "complete, re-read every changed file and run the narrowest relevant tests."
                     )
                     .to_string(),
-                    ActionPhase::Verify => {
-                        "Run the narrowest relevant verification or re-read the changed artifact"
-                            .to_string()
-                    }
-                    ActionPhase::Complete => concat!(
-                        "Return exactly one JSON action on one line with no reasoning: ",
-                        "{\"action\":\"COMPLETE\",\"summary\":\"A concise verified summary under 60 words\"}"
+                    ActionPhase::Verify => concat!(
+                        "Run the narrowest relevant test, build, or syntax check now. If any ",
+                        "requirement remains, write or edit it before completing."
                     )
                     .to_string(),
+                    ActionPhase::Complete =>
+                        "Answer in plain text with a concise verified summary under 60 words"
+                            .to_string(),
                 };
+            let current_action = current_action_with_paging_feedback(current_action, history);
             let mut capsule_tools = tools.clone();
             if direct_creation_target.is_some() {
                 capsule_tools.retain(|tool| tool.name == "write_file");
-            } else if phase == ActionPhase::Verify && !pending_verification_paths.is_empty() {
-                capsule_tools.retain(|tool| tool.name == "read_file");
             }
             let capsule = match runtime.build_capsule(
                 &current_action,
@@ -1470,19 +1568,34 @@ pub fn run_loop(
                         runtime.ledger.verification_state.status.as_str(),
                         "passed" | "complete"
                     );
-                    if !verified || summary.trim().is_empty() {
+                    let missing_artifacts =
+                        missing_required_artifacts(sandbox.root(), &required_workspace_artifacts);
+                    if !verified || !missing_artifacts.is_empty() || summary.trim().is_empty() {
+                        let reason = if missing_artifacts.is_empty() {
+                            "host verification has not passed".to_string()
+                        } else {
+                            format!(
+                                "required artifacts are still missing: {}",
+                                missing_artifacts.join(", ")
+                            )
+                        };
                         runtime
                             .ledger
                             .failed_attempts
-                            .push("COMPLETE rejected: host verification has not passed".into());
-                        runtime.ledger.current_focus =
-                            "Run the narrowest relevant verification before completing".into();
+                            .push(format!("COMPLETE rejected: {reason}"));
+                        runtime.ledger.current_focus = if missing_artifacts.is_empty() {
+                            "Run the narrowest relevant verification before completing".into()
+                        } else {
+                            format!(
+                                "Create the remaining required artifacts: {}",
+                                missing_artifacts.join(", ")
+                            )
+                        };
                         if let Err(error) = runtime.save() {
                             reporter.notice(&format!("context paging state error: {error}"));
                             return LoopEnd::DriverError;
                         }
-                        reporter
-                            .notice("typed COMPLETE rejected: host verification has not passed");
+                        reporter.notice(&format!("typed COMPLETE rejected: {reason}"));
                         paging_no_progress!();
                         continue;
                     }
@@ -1957,31 +2070,45 @@ pub fn run_loop(
                         runtime.ledger.verification_state.status.as_str(),
                         "passed" | "complete"
                     );
-                    if workspace_changed && verified {
+                    let missing_artifacts =
+                        missing_required_artifacts(sandbox.root(), &required_workspace_artifacts);
+                    if workspace_changed && verified && missing_artifacts.is_empty() {
                         // Only a host-verified change may be recorded complete.
                         runtime.ledger.verification_state.status = "complete".into();
                         runtime.ledger.current_focus = "Task complete".into();
                     } else if workspace_changed && !paging_blocked_answer {
                         // The workspace changed but host verification has not
-                        // passed: a prose answer must not end the task as
-                        // verified. Reprompt within the no-progress bound, then
-                        // accept the answer while persisting the honest status.
-                        if paging_nonprogress_steps + 1 < PAGING_NONPROGRESS_LIMIT {
-                            runtime.ledger.failed_attempts.push(
-                                "A prose answer arrived before host verification passed".into(),
-                            );
-                            runtime.ledger.current_focus =
-                                "Run the narrowest relevant verification before completing".into();
-                            if let Err(error) = runtime.save() {
-                                reporter.notice(&format!("context paging state error: {error}"));
-                                return LoopEnd::DriverError;
-                            }
-                            reporter.notice(
-                                "prose completion before host verification; requesting verification",
-                            );
-                            paging_no_progress!();
-                            continue;
+                        // passed or a required artifact is absent: a prose answer
+                        // must never record an incomplete task as complete.
+                        let reason = if missing_artifacts.is_empty() {
+                            "host verification has not passed".to_string()
+                        } else {
+                            format!(
+                                "required artifacts are still missing: {}",
+                                missing_artifacts.join(", ")
+                            )
+                        };
+                        runtime
+                            .ledger
+                            .failed_attempts
+                            .push(format!("Prose completion rejected: {reason}"));
+                        runtime.ledger.current_focus = if missing_artifacts.is_empty() {
+                            "Run the narrowest relevant verification before completing".into()
+                        } else {
+                            format!(
+                                "Create the remaining required artifacts: {}",
+                                missing_artifacts.join(", ")
+                            )
+                        };
+                        if let Err(error) = runtime.save() {
+                            reporter.notice(&format!("context paging state error: {error}"));
+                            return LoopEnd::DriverError;
                         }
+                        reporter.notice(&format!(
+                            "prose completion rejected: {reason}; continuing bounded work"
+                        ));
+                        paging_no_progress!();
+                        continue;
                     }
                     if let Err(error) = runtime.save().and_then(|_| runtime.record_task_complete())
                     {
@@ -1994,10 +2121,20 @@ pub fn run_loop(
                 return LoopEnd::Answered;
             }
             ModelStep::Calls(mut calls) => {
+                if context_paging.is_some() {
+                    for call in &mut calls {
+                        if supply_paging_list_dir_root(call, cfg.tool_profile) {
+                            reporter
+                                .notice("supplied deterministic workspace-root path for list_dir");
+                        }
+                    }
+                }
                 if let Some(call) = context_paging.as_ref().and_then(|_| {
-                    calls
-                        .iter()
-                        .find(|call| !step_tools.iter().any(|tool| tool.name == call.name))
+                    calls.iter().find(|call| {
+                        let canonical = tools::repair_tool_name(&call.name, cfg.tool_profile)
+                            .unwrap_or(call.name.as_str());
+                        !step_tools.iter().any(|tool| tool.name == canonical)
+                    })
                 }) {
                     let message = format!(
                         "tool `{}` is not available in the current context-paging phase",
@@ -2221,6 +2358,7 @@ pub fn run_loop(
                     let mut action = match tools::validate_for(cfg.tool_profile, &call, sandbox) {
                         Ok(a) => a,
                         Err(e) => {
+                            let validation_error = e.clone();
                             let call_name = call.name.clone();
                             let rejected_raw_source = require_workspace_change
                                 && !workspace_changed
@@ -2261,14 +2399,18 @@ pub fn run_loop(
                                 ));
                                 return LoopEnd::Repeated;
                             }
+                            let guidance = if rejected_raw_source {
+                                "Program source must be persisted before it is run. Do not retry or rephrase the shell command and do not answer. Your NEXT tool call must be write_file (or edit_file for an existing file) containing the source; then re-read that exact file and run it or syntax-check it."
+                            } else {
+                                "That tool call was not executed because its arguments were invalid. Correct the arguments before retrying and never repeat the identical failed call."
+                            };
                             push_reminder(
                                 history,
-                                if rejected_raw_source {
-                                    "Program source must be persisted before it is run. Do not retry or rephrase the shell command and do not answer. Your NEXT tool call must be write_file (or edit_file for an existing file) containing the source; then re-read that exact file and run it or syntax-check it."
-                                } else {
-                                    "That tool call was not executed because its arguments were invalid. Correct the arguments before retrying and never repeat the identical failed call. For a small single-file coding task, use write_file or edit_file directly; subagent delegation is optional."
-                                },
+                                &format!("{guidance} Exact validation error: {validation_error}"),
                             );
+                            if context_paging.is_some() {
+                                paging_no_progress!();
+                            }
                             continue;
                         }
                     };
@@ -2648,6 +2790,22 @@ pub fn run_loop(
                         {
                             paging_diagnostic = Some(compact.clone());
                         }
+                        if let Action::ReadFile { path, .. } = &action {
+                            if !raw_outcome.is_err() {
+                                let relative = normalize_workspace_path(&sandbox.rel(path));
+                                // Native read_file is also the page-fault API. This keeps one
+                                // familiar tool protocol for small models while preserving the
+                                // host-owned exact-source/hash boundary for later edits.
+                                if runtime.project.resolve_symbol(&relative).is_some() {
+                                    if let Err(error) = runtime.need_context(&relative) {
+                                        reporter.notice(&format!(
+                                            "context paging source-page error: {error}"
+                                        ));
+                                        return LoopEnd::DriverError;
+                                    }
+                                }
+                            }
+                        }
                         match &action {
                             Action::WriteFile { path, .. } | Action::EditFile { path, .. }
                                 if !raw_outcome.is_err() =>
@@ -2680,11 +2838,27 @@ pub fn run_loop(
                                         Some(compact.raw_reference.clone());
                                     runtime.metrics.verification_retries =
                                         runtime.metrics.verification_retries.saturating_add(1);
-                                } else {
+                                } else if paging_verification_command_is_relevant(
+                                    command,
+                                    &runtime.ledger.completed_work,
+                                    &required_workspace_artifacts,
+                                ) {
                                     runtime.ledger.verification_state.status = "passed".into();
                                     runtime.ledger.verification_state.failing_diagnostic = None;
                                     runtime.ledger.current_focus =
                                         "Return a concise verified completion summary".into();
+                                } else {
+                                    runtime.ledger.verification_state.status = "pending".into();
+                                    runtime.ledger.verification_state.failing_diagnostic = None;
+                                    runtime.ledger.failed_attempts.push(format!(
+                                        "`{command}` succeeded but did not verify the changed/requested artifacts"
+                                    ));
+                                    runtime.ledger.current_focus = concat!(
+                                        "The last shell command was only a probe, not verification. ",
+                                        "Run a relevant test, build, lint, type-check, syntax check, ",
+                                        "or execute the changed artifact."
+                                    )
+                                    .into();
                                 }
                             }
                             Action::ReadFile { path, .. }
@@ -2717,12 +2891,37 @@ pub fn run_loop(
                                     }
                                 }
                                 if semantic_contract_findings.is_empty() {
-                                    runtime.ledger.verification_state.status = "passed".into();
                                     runtime.ledger.verification_state.failing_diagnostic = None;
                                     runtime.ledger.verification_state.verified_symbols =
                                         runtime.ledger.relevant_symbols.clone();
-                                    runtime.ledger.current_focus =
-                                        "Return a concise verified completion summary".into();
+                                    let shell_verification_available =
+                                        tools.iter().any(|tool| tool.name == "run_shell");
+                                    let host_verification_passed = host_python_verification
+                                        .as_ref()
+                                        .is_some_and(|(_, verification)| !verification.is_err());
+                                    let command_already_passed = matches!(
+                                        runtime.ledger.verification_state.status.as_str(),
+                                        "passed" | "complete"
+                                    );
+                                    if !shell_verification_available
+                                        || host_verification_passed
+                                        || command_already_passed
+                                    {
+                                        runtime.ledger.verification_state.status = "passed".into();
+                                        runtime.ledger.current_focus =
+                                            "Return a concise verified completion summary".into();
+                                    } else {
+                                        // A read proves bytes, not behavior. Keep verification
+                                        // pending until a post-write test/build/syntax command
+                                        // succeeds; this also prevents a multi-file task from
+                                        // completing after its first reread.
+                                        runtime.ledger.verification_state.status = "pending".into();
+                                        runtime.ledger.current_focus = concat!(
+                                            "All changed files were captured. Run the narrowest ",
+                                            "relevant test, build, or syntax check before completing."
+                                        )
+                                        .into();
+                                    }
                                     paging_diagnostic = None;
                                 } else {
                                     let audit = semantic_contract_findings.join("\n");
@@ -3174,6 +3373,38 @@ fn is_harness_reminder(text: &str) -> bool {
     text.starts_with(REMINDER_OPEN)
 }
 
+/// Fresh paging capsules intentionally do not replay transcript history. A
+/// correction appended by `push_reminder` must nevertheless survive for the
+/// immediately following retry, or an invalid native call is presented with a
+/// byte-identical prompt and a greedy local model repeats it until the guard
+/// stops the run. Only a trailing reminder is live: any later tool/result entry
+/// proves the correction was consumed and prevents stale guidance resurfacing.
+fn current_action_with_paging_feedback(base: String, history: &[AgentMsg]) -> String {
+    let Some(AgentMsg::User(reminder)) = history.last() else {
+        return base;
+    };
+    let Some(body) = reminder.strip_prefix(REMINDER_OPEN) else {
+        return base;
+    };
+    let Some(body) = body.strip_suffix("</system-reminder>") else {
+        return base;
+    };
+    let mut feedback = body.trim().to_string();
+    if feedback.len() > MAX_PAGING_RETRY_FEEDBACK_BYTES {
+        let mut end = MAX_PAGING_RETRY_FEEDBACK_BYTES;
+        while end > 0 && !feedback.is_char_boundary(end) {
+            end -= 1;
+        }
+        feedback.truncate(end);
+        feedback.push('…');
+    }
+    if feedback.is_empty() {
+        base
+    } else {
+        format!("{base}\nImmediate retry feedback from the host (correct this now): {feedback}")
+    }
+}
+
 /// The last thing the USER actually asked for, ignoring harness reminders.
 fn last_user_request(history: &[AgentMsg]) -> Option<&str> {
     history.iter().rev().find_map(|message| match message {
@@ -3238,6 +3469,232 @@ fn normalize_workspace_path(path: &str) -> String {
         .unwrap_or(&normalized)
         .trim_matches('/')
         .to_string()
+}
+
+/// File extensions that make an objective token an explicit artifact rather
+/// than an arbitrary dotted word (for example a Python module such as
+/// `unittest.mock`). The list covers source, test, configuration, data, and
+/// documentation files that a coding task can reasonably require.
+const REQUIRED_ARTIFACT_EXTENSIONS: &[&str] = &[
+    "bash", "c", "cc", "cfg", "cjs", "conf", "cpp", "cs", "css", "csv", "env", "fish", "fs", "fsx",
+    "go", "h", "hpp", "html", "ini", "java", "js", "json", "jsx", "kt", "kts", "lock", "md", "mjs",
+    "php", "ps1", "py", "pyw", "rb", "rs", "scss", "sh", "sql", "svelte", "swift", "toml", "ts",
+    "tsx", "txt", "vue", "xml", "yaml", "yml", "zsh",
+];
+
+/// Extract an explicit host-owned artifact manifest from the immutable user
+/// objective. This is intentionally conservative: only ordinary relative file
+/// paths with a known coding-artifact extension qualify, and deletion targets
+/// are excluded. The exact objective remains authoritative; this manifest is a
+/// completion floor that prevents a multi-file task from stopping after file 1.
+fn workspace_requested_artifacts(objective: &str) -> BTreeSet<String> {
+    let mut artifacts = BTreeSet::new();
+    for line in objective.lines() {
+        let mut previous_word = String::new();
+        for raw in line.split_whitespace() {
+            let mut token = raw
+                .trim_matches(|character: char| {
+                    !character.is_ascii_alphanumeric()
+                        && !matches!(character, '.' | '/' | '\\' | '_' | '-')
+                })
+                .replace('\\', "/");
+            while let Some(stripped) = token.strip_prefix("./") {
+                token = stripped.to_string();
+            }
+            let lower_word = token.to_ascii_lowercase();
+            let deleting = matches!(
+                previous_word.as_str(),
+                "delete"
+                    | "deletes"
+                    | "deleted"
+                    | "deleting"
+                    | "remove"
+                    | "removes"
+                    | "removed"
+                    | "removing"
+                    | "rename"
+                    | "renames"
+                    | "renamed"
+                    | "renaming"
+            );
+            previous_word = lower_word;
+            if deleting
+                || token.is_empty()
+                || token.len() > 240
+                || token.starts_with('/')
+                || token.contains("://")
+                || token.contains('*')
+                || token.split('/').any(|part| part.is_empty() || part == "..")
+            {
+                continue;
+            }
+            let Some(filename) = token.rsplit('/').next() else {
+                continue;
+            };
+            let Some((stem, extension)) = filename.rsplit_once('.') else {
+                continue;
+            };
+            if stem.is_empty()
+                || !REQUIRED_ARTIFACT_EXTENSIONS
+                    .iter()
+                    .any(|known| extension.eq_ignore_ascii_case(known))
+            {
+                continue;
+            }
+            artifacts.insert(token);
+            if artifacts.len() >= MAX_LEDGER_MANIFEST_ITEMS {
+                return artifacts;
+            }
+        }
+    }
+    artifacts
+}
+
+const MAX_LEDGER_MANIFEST_ITEMS: usize = 32;
+const MAX_ARTIFACT_SCAN_ENTRIES: usize = 4_096;
+
+fn skip_artifact_scan_directory(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | ".camelid"
+            | "target"
+            | "node_modules"
+            | "vendor"
+            | ".venv"
+            | "venv"
+            | "dist"
+            | "build"
+    )
+}
+
+fn required_artifact_exists(root: &Path, required: &str) -> bool {
+    if required.contains('/') {
+        return root.join(required).is_file();
+    }
+    let mut pending = vec![root.to_path_buf()];
+    let mut scanned = 0usize;
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            scanned = scanned.saturating_add(1);
+            if scanned > MAX_ARTIFACT_SCAN_ENTRIES {
+                return false;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_file() && entry.file_name().to_string_lossy() == required {
+                return true;
+            }
+            if file_type.is_dir() {
+                let name = entry.file_name();
+                if !skip_artifact_scan_directory(&name.to_string_lossy()) {
+                    pending.push(entry.path());
+                }
+            }
+        }
+    }
+    false
+}
+
+fn missing_required_artifacts(root: &Path, required: &BTreeSet<String>) -> Vec<String> {
+    required
+        .iter()
+        .filter(|artifact| !required_artifact_exists(root, artifact))
+        .cloned()
+        .collect()
+}
+
+/// A successful shell call is not automatically verification. Reject pure
+/// probes such as `python --version`, `ls`, or `pwd`; accept conventional test,
+/// build, lint, and type-check commands, or an executable invocation that names
+/// one of the changed/requested artifacts.
+fn paging_verification_command_is_relevant(
+    command: &str,
+    completed_work: &[String],
+    required_artifacts: &BTreeSet<String>,
+) -> bool {
+    let command = command.trim().to_ascii_lowercase();
+    if command.is_empty() || command.contains("--version") {
+        return false;
+    }
+    const VERIFICATION_MARKERS: &[&str] = &[
+        "cargo test",
+        "cargo check",
+        "cargo build",
+        "pytest",
+        "py.test",
+        "unittest",
+        "py_compile",
+        "compileall",
+        "npm test",
+        "npm run test",
+        "pnpm test",
+        "yarn test",
+        "bun test",
+        "deno test",
+        "go test",
+        "dotnet test",
+        "swift test",
+        "xcodebuild",
+        "ctest",
+        "make test",
+        "ruff",
+        "mypy",
+        "eslint",
+        "tsc",
+    ];
+    if VERIFICATION_MARKERS
+        .iter()
+        .any(|marker| command.contains(marker))
+    {
+        return true;
+    }
+    let runner = command
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .rsplit('/')
+        .next()
+        .unwrap_or_default();
+    let runs_artifact = matches!(
+        runner,
+        "python"
+            | "python3"
+            | "py"
+            | "node"
+            | "deno"
+            | "bun"
+            | "ruby"
+            | "php"
+            | "java"
+            | "go"
+            | "rustc"
+            | "gcc"
+            | "clang"
+            | "swift"
+            | "dotnet"
+            | "bash"
+            | "sh"
+            | "zsh"
+            | "pwsh"
+            | "powershell"
+    ) || command.starts_with("./");
+    if !runs_artifact {
+        return false;
+    }
+    completed_work
+        .iter()
+        .filter_map(|entry| entry.split_once(" changed ").map(|(_, path)| path))
+        .chain(required_artifacts.iter().map(String::as_str))
+        .any(|path| {
+            let path = path.to_ascii_lowercase();
+            let basename = path.rsplit('/').next().unwrap_or(&path);
+            command.contains(&path) || command.contains(basename)
+        })
 }
 
 fn workspace_existing_file_paths(text: &str, sandbox: &Sandbox) -> BTreeSet<String> {
@@ -3491,7 +3948,12 @@ fn compile_history_for_step(history: &[AgentMsg], profile: tools::ToolProfile) -
     }
     let Some(current_user) = history
         .iter()
-        .rposition(|message| matches!(message, AgentMsg::User(_)))
+        // Harness reminders intentionally ride as chronological USER turns so
+        // they do not rewrite the prompt prefix. They are not new task
+        // boundaries. Treating one as the current user pinned every earlier
+        // write_file argument and read result back into the next prompt — often
+        // replaying whole source files twice after post-write capture.
+        .rposition(|message| matches!(message, AgentMsg::User(text) if !is_harness_reminder(text)))
     else {
         return history.to_vec();
     };
@@ -3769,6 +4231,12 @@ fn execute_audited(
 }
 
 const COMPACT_AT: f32 = 0.80;
+/// A wider advertised window must not move the legacy workspace rollback lane's
+/// compaction threshold beyond the measured cold-prefill cliff. The 16K run was
+/// already effectively stalled around 7K input even though that was only 44%
+/// of its nominal window.
+const WORKSPACE_LEGACY_HIGH_WATER: u32 = 5_500;
+const WORKSPACE_LEGACY_LOW_WATER: u32 = 4_000;
 const KEEP_RECENT: usize = 6;
 const FALLBACK_TOKENS_PER_CHAR: f32 = 0.34;
 pub const AGENT_VALIDATED_CTX: u32 = 8192;
@@ -5519,6 +5987,10 @@ mod tests {
                         )
                     }
                     1 => ModelStep::Calls(vec![tc("read_file", json!({"path": "src/lib.rs"}))]),
+                    2 => ModelStep::Calls(vec![tc(
+                        "run_shell",
+                        json!({"command": "rustc --crate-type lib src/lib.rs --emit metadata -o check.rmeta"}),
+                    )]),
                     _ => ModelStep::Text(
                         json!({
                             "action": "COMPLETE",
@@ -5548,7 +6020,7 @@ mod tests {
             histories: Vec::new(),
             tool_names: Vec::new(),
         };
-        let mut approver = ScriptApprover(vec![Decision::Once], 0);
+        let mut approver = ScriptApprover(vec![Decision::Once, Decision::Once], 0);
         let mut reporter = RecordReporter::default();
         let mut history = vec![
             AgentMsg::System("UNBOUNDED_TRANSCRIPT_SENTINEL".repeat(2_000)),
@@ -5571,21 +6043,23 @@ mod tests {
             &mut history,
         );
         assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
-        assert_eq!(driver.histories.len(), 3);
+        assert_eq!(driver.histories.len(), 4);
         assert!(driver.histories.iter().all(|history| history.len() == 1));
         assert!(driver.histories.iter().all(|history| matches!(
             history.first(),
             Some(AgentMsg::User(capsule))
-                if capsule.starts_with("You are Camelid's Context Paging coding agent.")
+                if capsule.starts_with("You are Camelid's bounded-context coding agent.")
         )));
         assert!(driver.tool_names[0].contains(&"edit_file".to_string()));
-        assert!(!driver.tool_names[0].contains(&"run_shell".to_string()));
-        assert_eq!(driver.tool_names[1], vec!["read_file".to_string()]);
-        let final_capsule = match &driver.histories[2][0] {
+        assert!(driver.tool_names[0].contains(&"run_shell".to_string()));
+        assert_eq!(driver.tool_names[0], driver.tool_names[1]);
+        assert_eq!(driver.tool_names[1], driver.tool_names[2]);
+        assert!(driver.tool_names[3].is_empty());
+        let final_capsule = match &driver.histories[3][0] {
             AgentMsg::User(capsule) => capsule,
             other => panic!("expected final fresh capsule, got {other:?}"),
         };
-        assert!(final_capsule.contains("\"action\":\"COMPLETE\""));
+        assert!(final_capsule.contains("Answer in plain text"));
         assert!(!final_capsule.contains("<exact_source_page"));
         assert!(!final_capsule.contains("<failed_attempts>"));
         assert_eq!(
@@ -5646,6 +6120,346 @@ mod tests {
         config
     }
 
+    #[test]
+    fn paging_validation_feedback_reaches_the_next_fresh_capsule() {
+        let _checkpoint_guard = super::super::checkpoint::tests::cp_lock();
+        struct FeedbackDriver {
+            step: usize,
+            capsules: Vec<String>,
+        }
+        impl ModelDriver for FeedbackDriver {
+            fn step(
+                &mut self,
+                history: &[AgentMsg],
+                _tools: &[ToolSpec],
+            ) -> Result<ModelStep, String> {
+                let [AgentMsg::User(capsule)] = history else {
+                    return Err("paging must send exactly one fresh User capsule".into());
+                };
+                self.capsules.push(capsule.clone());
+                let response = match self.step {
+                    0 => {
+                        assert!(!capsule.contains("Immediate retry feedback"));
+                        ModelStep::Calls(vec![tc("read_file", json!({}))])
+                    }
+                    1 => {
+                        assert!(capsule.contains("Immediate retry feedback"), "{capsule}");
+                        assert!(capsule.contains("Exact validation error"), "{capsule}");
+                        assert!(capsule.contains("read_file"), "{capsule}");
+                        ModelStep::Calls(vec![tc(
+                            "edit_file",
+                            json!({
+                                "path": "src/lib.rs",
+                                "old": "value + 1",
+                                "new": "value + 2"
+                            }),
+                        )])
+                    }
+                    2 => ModelStep::Calls(vec![tc("read_file", json!({"path": "src/lib.rs"}))]),
+                    3 => ModelStep::Calls(vec![tc(
+                        "run_shell",
+                        json!({"command": "rustc --crate-type lib src/lib.rs --emit metadata -o check.rmeta"}),
+                    )]),
+                    _ => ModelStep::Text("Changed increment and verified it.".into()),
+                };
+                self.step += 1;
+                Ok(response)
+            }
+        }
+
+        let (directory, sandbox) = paging_workspace();
+        let mut driver = FeedbackDriver {
+            step: 0,
+            capsules: Vec::new(),
+        };
+        let mut approver = ScriptApprover(vec![Decision::Once, Decision::Once], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(
+            "Change src/lib.rs increment to add two, then verify it".into(),
+        )];
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sandbox,
+            &paging_cfg(directory.path()),
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
+        assert_eq!(driver.step, 5);
+        assert_ne!(driver.capsules[0], driver.capsules[1]);
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("src/lib.rs")).unwrap(),
+            "pub fn increment(value: i32) -> i32 {\n    value + 2\n}\n"
+        );
+        assert_eq!(
+            reporter
+                .results
+                .iter()
+                .filter(|result| result.contains("read_file") && result.contains("path"))
+                .count(),
+            1,
+            "one visible correction must replace the old byte-identical retry"
+        );
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+    }
+
+    #[test]
+    fn paging_greenfield_starts_with_native_write_tools_and_repairs_root_listing() {
+        let _checkpoint_guard = super::super::checkpoint::tests::cp_lock();
+        struct GreenfieldDriver {
+            step: usize,
+        }
+        impl ModelDriver for GreenfieldDriver {
+            fn step(
+                &mut self,
+                history: &[AgentMsg],
+                tools: &[ToolSpec],
+            ) -> Result<ModelStep, String> {
+                let [AgentMsg::User(capsule)] = history else {
+                    return Err("paging must send exactly one fresh User capsule".into());
+                };
+                let response = match self.step {
+                    0 => {
+                        assert!(capsule.contains("host confirmed this workspace"));
+                        assert!(tools.iter().any(|tool| tool.name == "write_file"));
+                        ModelStep::Calls(vec![tc("list_dir", json!({}))])
+                    }
+                    1 => ModelStep::Calls(vec![tc(
+                        "write_file",
+                        json!({
+                            "path": "app.rs",
+                            "content": "fn main() { println!(\"ready\"); }\n"
+                        }),
+                    )]),
+                    2 => ModelStep::Calls(vec![tc("read_file", json!({"path": "app.rs"}))]),
+                    3 => ModelStep::Calls(vec![tc(
+                        "run_shell",
+                        json!({"command": "rustc app.rs -o app-check"}),
+                    )]),
+                    _ => ModelStep::Text("Created and verified app.rs.".into()),
+                };
+                self.step += 1;
+                Ok(response)
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::new(directory.path(), false, Duration::from_secs(5))
+            .unwrap()
+            .with_shell_mode(ShellSandbox::Sandboxed);
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+        let mut driver = GreenfieldDriver { step: 0 };
+        let mut approver = ScriptApprover(vec![Decision::Once, Decision::Once], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(
+            "Create a complete small Rust application in app.rs and verify it".into(),
+        )];
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sandbox,
+            &paging_cfg(directory.path()),
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
+        assert_eq!(driver.step, 5);
+        assert!(directory.path().join("app.rs").is_file());
+        assert!(reporter.notices.iter().any(
+            |notice| notice.contains("supplied deterministic workspace-root path for list_dir")
+        ));
+        assert!(!reporter
+            .notices
+            .iter()
+            .any(|notice| notice.contains("same invalid call")));
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+    }
+
+    #[test]
+    fn paging_multifile_goal_cannot_complete_after_verifying_only_the_first_file() {
+        let _checkpoint_guard = super::super::checkpoint::tests::cp_lock();
+        struct MultiFileDriver {
+            step: usize,
+        }
+        impl ModelDriver for MultiFileDriver {
+            fn step(
+                &mut self,
+                history: &[AgentMsg],
+                tools: &[ToolSpec],
+            ) -> Result<ModelStep, String> {
+                let [AgentMsg::User(capsule)] = history else {
+                    return Err("paging must send exactly one fresh User capsule".into());
+                };
+                let response = match self.step {
+                    0 => ModelStep::Calls(vec![tc(
+                        "write_file",
+                        json!({"path":"first.rs","content":"fn main() { println!(\"first\"); }\n"}),
+                    )]),
+                    1 => ModelStep::Calls(vec![tc("read_file", json!({"path":"first.rs"}))]),
+                    2 => ModelStep::Calls(vec![tc(
+                        "run_shell",
+                        json!({"command":"rustc first.rs -o first-check"}),
+                    )]),
+                    3 => {
+                        assert!(tools.iter().any(|tool| tool.name == "write_file"));
+                        assert!(capsule.contains("second.rs"), "{capsule}");
+                        assert!(capsule.contains("remaining required workspace artifacts"));
+                        ModelStep::Calls(vec![tc(
+                            "write_file",
+                            json!({"path":"second.rs","content":"fn main() { println!(\"second\"); }\n"}),
+                        )])
+                    }
+                    4 => ModelStep::Calls(vec![tc("read_file", json!({"path":"second.rs"}))]),
+                    5 => ModelStep::Calls(vec![tc(
+                        "run_shell",
+                        json!({"command":"rustc second.rs -o second-check"}),
+                    )]),
+                    _ => {
+                        assert!(tools.is_empty());
+                        ModelStep::Text("Created and verified both requested files.".into())
+                    }
+                };
+                self.step += 1;
+                Ok(response)
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::new(directory.path(), false, Duration::from_secs(5))
+            .unwrap()
+            .with_shell_mode(ShellSandbox::Sandboxed);
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+        let mut driver = MultiFileDriver { step: 0 };
+        let mut approver = ScriptApprover(
+            vec![
+                Decision::Once,
+                Decision::Once,
+                Decision::Once,
+                Decision::Once,
+            ],
+            0,
+        );
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(
+            "Create `first.rs` and `second.rs`, then verify both files.".into(),
+        )];
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sandbox,
+            &paging_cfg(directory.path()),
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
+        assert_eq!(driver.step, 7);
+        assert!(directory.path().join("first.rs").is_file());
+        assert!(directory.path().join("second.rs").is_file());
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+    }
+
+    #[test]
+    fn paging_verification_rejects_environment_probes() {
+        let work = vec!["write_file changed app.py".to_string()];
+        let required = BTreeSet::from(["app.py".to_string()]);
+        assert!(!paging_verification_command_is_relevant(
+            "python --version",
+            &work,
+            &required
+        ));
+        assert!(!paging_verification_command_is_relevant(
+            "ls", &work, &required
+        ));
+        assert!(paging_verification_command_is_relevant(
+            "python -m py_compile app.py",
+            &work,
+            &required
+        ));
+        assert!(paging_verification_command_is_relevant(
+            "python app.py",
+            &work,
+            &required
+        ));
+        assert!(paging_verification_command_is_relevant(
+            "pytest", &work, &required
+        ));
+    }
+
+    #[test]
+    fn paging_without_run_shell_uses_the_host_read_verification_path() {
+        let _checkpoint_guard = super::super::checkpoint::tests::cp_lock();
+        struct NoShellDriver {
+            step: usize,
+        }
+        impl ModelDriver for NoShellDriver {
+            fn step(
+                &mut self,
+                history: &[AgentMsg],
+                tools: &[ToolSpec],
+            ) -> Result<ModelStep, String> {
+                let [AgentMsg::User(capsule)] = history else {
+                    return Err("paging must send exactly one fresh User capsule".into());
+                };
+                assert!(!tools.iter().any(|tool| tool.name == "run_shell"));
+                let response = match self.step {
+                    0 => ModelStep::Calls(vec![tc(
+                        "write_file",
+                        json!({"path":"app.py","content":"print('ready')\n"}),
+                    )]),
+                    1 => {
+                        assert!(
+                            capsule.contains("otherwise use the advertised host-verification path")
+                        );
+                        ModelStep::Calls(vec![tc("read_file", json!({"path":"app.py"}))])
+                    }
+                    _ => {
+                        assert!(tools.is_empty());
+                        ModelStep::Text("Created app.py and captured its saved source.".into())
+                    }
+                };
+                self.step += 1;
+                Ok(response)
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::new(directory.path(), false, Duration::from_secs(5))
+            .unwrap()
+            .with_shell_mode(ShellSandbox::Disabled);
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+        let mut config = paging_cfg(directory.path());
+        config.shell_sandbox = ShellSandbox::Disabled;
+        let mut driver = NoShellDriver { step: 0 };
+        let mut approver = ScriptApprover(vec![Decision::Once], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("Create `app.py`.".into())];
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sandbox,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
+        assert_eq!(driver.step, 3);
+        assert!(directory.path().join("app.py").is_file());
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+    }
+
     fn paging_patch_step(directory: &std::path::Path) -> ModelStep {
         use sha2::Digest as _;
         let current =
@@ -5672,6 +6486,10 @@ mod tests {
                 paging_patch_step(directory.path()),
                 ModelStep::Text(json!({"action": "COMPLETE", "summary": "All done."}).to_string()),
                 ModelStep::Calls(vec![tc("read_file", json!({"path": "src/lib.rs"}))]),
+                ModelStep::Calls(vec![tc(
+                    "run_shell",
+                    json!({"command": "rustc --crate-type lib src/lib.rs --emit metadata -o check.rmeta"}),
+                )]),
                 ModelStep::Text(
                     json!({"action": "COMPLETE", "summary": "Changed increment and verified it."})
                         .to_string(),
@@ -5680,7 +6498,7 @@ mod tests {
             index: 0,
             histories: Vec::new(),
         };
-        let mut approver = ScriptApprover(vec![Decision::Once], 0);
+        let mut approver = ScriptApprover(vec![Decision::Once, Decision::Once], 0);
         let mut reporter = RecordReporter::default();
         let mut history = vec![AgentMsg::User(
             "Change increment so it adds two and verify the saved file".into(),
@@ -5726,6 +6544,10 @@ mod tests {
                 paging_patch_step(directory.path()),
                 ModelStep::Text("The change is complete and everything works.".into()),
                 ModelStep::Calls(vec![tc("read_file", json!({"path": "src/lib.rs"}))]),
+                ModelStep::Calls(vec![tc(
+                    "run_shell",
+                    json!({"command": "rustc --crate-type lib src/lib.rs --emit metadata -o check.rmeta"}),
+                )]),
                 ModelStep::Text(
                     json!({"action": "COMPLETE", "summary": "Changed increment and verified it."})
                         .to_string(),
@@ -5734,7 +6556,7 @@ mod tests {
             index: 0,
             histories: Vec::new(),
         };
-        let mut approver = ScriptApprover(vec![Decision::Once], 0);
+        let mut approver = ScriptApprover(vec![Decision::Once, Decision::Once], 0);
         let mut reporter = RecordReporter::default();
         let mut history = vec![AgentMsg::User(
             "Change increment so it adds two and verify the saved file".into(),
@@ -5754,11 +6576,11 @@ mod tests {
             reporter
                 .notices
                 .iter()
-                .any(|notice| notice.contains("prose completion before host verification")),
+                .any(|notice| notice.contains("prose completion rejected: host verification")),
             "the premature prose answer must be reprompted: {:?}",
             reporter.notices
         );
-        assert_eq!(driver.histories.len(), 4);
+        assert_eq!(driver.histories.len(), 5);
         super::super::checkpoint::clear_for_workspace(sandbox.root());
     }
 
@@ -5883,24 +6705,18 @@ mod tests {
                         )])
                     }
                     1 => {
-                        assert_eq!(
-                            tools
-                                .iter()
-                                .map(|tool| tool.name.as_str())
-                                .collect::<Vec<_>>(),
-                            vec!["read_file"]
-                        );
+                        assert!(tools.iter().any(|tool| tool.name == "read_file"));
+                        assert!(tools.iter().any(|tool| tool.name == "write_file"));
+                        assert!(tools.iter().any(|tool| tool.name == "run_shell"));
                         ModelStep::Calls(vec![tc("read_file", json!({"path":"tic_tac_toe.py"}))])
                     }
+                    2 if !tools.is_empty() => ModelStep::Calls(vec![tc(
+                        "run_shell",
+                        json!({"command": "python3 -m py_compile tic_tac_toe.py"}),
+                    )]),
                     _ => {
                         assert!(tools.is_empty());
-                        ModelStep::Text(
-                            json!({
-                                "action":"COMPLETE",
-                                "summary":"Created and verified tic_tac_toe.py."
-                            })
-                            .to_string(),
-                        )
+                        ModelStep::Text("Created and verified tic_tac_toe.py.".into())
                     }
                 };
                 self.step += 1;
@@ -5927,7 +6743,7 @@ mod tests {
             "    winning_lines = [(0, 4, 8), (2, 4, 6)]\n",
         );
         let mut driver = EmptyCreationDriver { step: 0, source };
-        let mut approver = ScriptApprover(vec![Decision::Once], 0);
+        let mut approver = ScriptApprover(vec![Decision::Once, Decision::Once], 0);
         let mut reporter = RecordReporter::default();
         let mut history = vec![
             AgentMsg::System(
@@ -5960,7 +6776,7 @@ mod tests {
         );
 
         assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
-        assert_eq!(driver.step, 3);
+        assert!(matches!(driver.step, 3 | 4));
         assert_eq!(
             std::fs::read_to_string(directory.path().join("tic_tac_toe.py")).unwrap(),
             source
@@ -6086,11 +6902,9 @@ mod tests {
                 assert!(matches!(
                     history.first(),
                     Some(AgentMsg::User(capsule))
-                        if capsule.contains(r#"{"action":"COMPLETE""#)
+                        if capsule.contains("Answer in plain text")
                 ));
-                Ok(ModelStep::Text(
-                    r#"{"action":"COMPLETE","summary":"Already changed and verified."}"#.into(),
-                ))
+                Ok(ModelStep::Text("Already changed and verified.".into()))
             }
         }
 
@@ -6373,6 +7187,77 @@ mod tests {
             AgentMsg::ToolResult { name, outcome }
                 if name == "read_file" && outcome.text().contains("login")
         )));
+    }
+
+    #[test]
+    fn harness_reminder_does_not_resurrect_completed_write_payloads() {
+        let old_read = format!("{}READ_A_TAIL_SENTINEL", "x".repeat(600));
+        let mut history = vec![
+            AgentMsg::System("system".into()),
+            AgentMsg::User("Implement the requested workspace change.".into()),
+            AgentMsg::ToolCalls(vec![tc(
+                "write_file",
+                json!({
+                    "path": "a.rs",
+                    "content": "WRITE_A_SOURCE_SENTINEL fn a() {}"
+                }),
+            )]),
+            AgentMsg::ToolResult {
+                name: "write_file".into(),
+                outcome: ToolOutcome::Ok("wrote a.rs".into()),
+            },
+            AgentMsg::ToolCalls(vec![tc(
+                "write_file",
+                json!({
+                    "path": "b.rs",
+                    "content": "WRITE_B_SOURCE_SENTINEL fn b() {}"
+                }),
+            )]),
+            AgentMsg::ToolResult {
+                name: "write_file".into(),
+                outcome: ToolOutcome::Ok("wrote b.rs".into()),
+            },
+            AgentMsg::ToolCalls(vec![tc("read_file", json!({"path": "a.rs"}))]),
+            AgentMsg::ToolResult {
+                name: "read_file".into(),
+                outcome: ToolOutcome::Ok(old_read),
+            },
+            // Only this newest native exchange remains exact. Everything before
+            // it is projected into bounded observations.
+            AgentMsg::ToolCalls(vec![tc("read_file", json!({"path": "b.rs"}))]),
+            AgentMsg::ToolResult {
+                name: "read_file".into(),
+                outcome: ToolOutcome::Ok("LATEST_EXACT_SOURCE fn b() {}".into()),
+            },
+        ];
+        push_reminder(
+            &mut history,
+            "Review the captured source, then run the narrowest verification.",
+        );
+
+        let compiled = compile_history_for_step(&history, tools::ToolProfile::WebCode);
+        let rendered = compiled
+            .iter()
+            .map(|message| format!("{message:?}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!rendered.contains("WRITE_A_SOURCE_SENTINEL"));
+        assert!(!rendered.contains("WRITE_B_SOURCE_SENTINEL"));
+        assert!(
+            !rendered.contains("READ_A_TAIL_SENTINEL"),
+            "older read results must be bounded rather than replayed verbatim"
+        );
+        assert!(rendered.contains("LATEST_EXACT_SOURCE"));
+        assert!(rendered.contains("Review the captured source"));
+        assert_eq!(
+            compiled
+                .iter()
+                .filter(|message| matches!(message, AgentMsg::ToolCalls(_)))
+                .count(),
+            1,
+            "only the latest native tool group may remain exact"
+        );
     }
 
     #[test]
@@ -6798,6 +7683,32 @@ mod tests {
             text.matches("</system-reminder>").count(),
             1,
             "only the harness's own closing tag may survive: {text}"
+        );
+    }
+
+    #[test]
+    fn paging_retry_feedback_is_bounded_and_only_the_trailing_reminder_is_live() {
+        let mut history = vec![AgentMsg::User("Build the application".into())];
+        let feedback = format!(
+            "VALIDATION_BEGIN {} VALIDATION_TAIL_SHOULD_BE_BOUNDED",
+            "é".repeat(MAX_PAGING_RETRY_FEEDBACK_BYTES)
+        );
+        push_reminder(&mut history, &feedback);
+
+        let action = current_action_with_paging_feedback("Continue work".into(), &history);
+        assert!(action.contains("Immediate retry feedback"));
+        assert!(action.contains("VALIDATION_BEGIN"));
+        assert!(!action.contains("VALIDATION_TAIL_SHOULD_BE_BOUNDED"));
+        assert!(action.ends_with('…'));
+
+        history.push(AgentMsg::ToolResult {
+            name: "read_file".into(),
+            outcome: ToolOutcome::Ok("consumed".into()),
+        });
+        assert_eq!(
+            current_action_with_paging_feedback("Continue work".into(), &history),
+            "Continue work",
+            "a later tool result consumes retry feedback"
         );
     }
 
@@ -8988,11 +9899,34 @@ mod tests {
     }
 
     #[test]
-    fn run_loop_compacts_when_the_budget_is_reached() {
+    fn workspace_legacy_loop_compacts_before_the_wide_window_prefill_cliff() {
+        struct BudgetDriver {
+            inner: MockDriver,
+            budget: u32,
+        }
+        impl ModelDriver for BudgetDriver {
+            fn step(
+                &mut self,
+                history: &[AgentMsg],
+                tools: &[ToolSpec],
+            ) -> Result<ModelStep, String> {
+                self.inner.step(history, tools)
+            }
+
+            fn context_budget_tokens(&self) -> Option<u32> {
+                Some(self.budget)
+            }
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
         let mut c = cfg(dir.path(), true);
-        c.ctx_budget = Some(2048);
+        // WorkspaceBridge leaves the legacy override unset. The model driver is
+        // the authoritative source for the actual window in this configuration.
+        c.ctx_budget = None;
+        // Use the Code rollback lane: its larger observation cap reproduces the
+        // 7K-class prompt that percentage-only compaction missed at 16K.
+        c.tool_profile = tools::ToolProfile::WebCode;
         c.max_steps = 30;
 
         // Each step reads a *different* file, so the transcript grows fast and
@@ -9016,7 +9950,13 @@ mod tests {
             .unwrap();
         }
 
-        let mut driver = MockDriver { steps, idx: 0 };
+        let mut driver = BudgetDriver {
+            inner: MockDriver { steps, idx: 0 },
+            // At 16K the old percentage-only policy waited until 13.1K, well
+            // beyond the measured 7K slow zone. The absolute high-water mark
+            // must still trigger while the driver's override remains unset.
+            budget: 16_384,
+        };
         let mut approver = ScriptApprover(vec![], 0);
         let mut reporter = RecordReporter::default();
         let mut policy = Policy::default();

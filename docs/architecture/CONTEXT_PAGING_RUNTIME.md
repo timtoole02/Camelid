@@ -21,13 +21,14 @@ Camelid's current Web Code request flow is:
 Relevant integration points:
 
 - `src/chat/context_paging.rs`: canonical ledger, structural index, hash-backed
-  pages, compact artifact store, typed actions, and deterministic capsule
-  builder.
-- `src/chat/workspace_bridge.rs`: enables the feature-gated runtime for Web
-  Code.
-- `src/chat/agent.rs`: constructs a new capsule and phase-filtered tool set for
-  every action. The existing tokenizer preflight remains the final hard request
-  gate; tool validation and approval boundaries remain authoritative.
+  pages, compact artifact store, backward-compatible typed-action parsing, and
+  the deterministic capsule builder.
+- `src/chat/workspace_bridge.rs`: enables the default-on runtime for Web Code
+  and retains an explicit rollback switch.
+- `src/chat/agent.rs`: constructs a new capsule for every action and keeps one
+  stable native-tool vocabulary through active modification and verification.
+  The existing tokenizer preflight remains the final hard request gate; tool
+  validation and approval boundaries remain authoritative.
 - `src/chat/tools.rs`: bounded file/search primitives and audited writes remain
   the execution layer. Raw paging artifacts are never executable authority.
 - `src/chat/workspace_memory.rs`: remains the user-visible thread store. Context
@@ -36,8 +37,9 @@ Relevant integration points:
 
 Compatibility constraints:
 
-- Rollout is opt-in with `CAMELID_CONTEXT_PAGING=1`; existing agent behavior is
-  unchanged when disabled.
+- Context Paging is the default Web Code runtime. Set `CAMELID_CONTEXT_PAGING=0`
+  only as a rollback/diagnostic switch; terminal agent mode, read-only Workspace,
+  and subagents retain their existing history behavior.
 - `.camelid` is already protected from model-authored writes. Runtime state is
   stored below `.camelid/context-paging` through host code only.
 - Exact source is authoritative. A card or page whose file hash no longer
@@ -81,28 +83,32 @@ diagnostic, the phase tool list, the modification target page (the most
 recently faulted symbol), and every pinned page. Pinned pages are capped at 4;
 the least-faulted pin is released first. The task contract is split:
 `objective`, `currentAction`, `currentFocus`, `acceptanceCriteria`,
-`criticalInvariants`, and `verificationStatus` stay mandatory and bounded (at
-most 6 items of 240 chars per list, 600 chars per field), while `decisions`
-and `openQuestions` render as evictable task detail. Ledger lists themselves
-are bounded (32 items, 480 chars per item), so ledger growth can never brick
-capsule construction. The builder uses a `TokenEstimator` interface that is
-continuously calibrated from the live tokenizer's measured tokens-per-byte
-rate; the integrated request is still checked with Camelid's exact
-loaded-model tokenizer preflight before inference.
+`criticalInvariants`, and `verificationStatus` stay mandatory. The immutable
+user objective is preserved verbatim and fails closed if it cannot fit; mutable
+focus is bounded to 600 bytes, and criterion/invariant lists render at most 6
+items of 240 bytes. `decisions` and `openQuestions` render as evictable task
+detail. Ledger lists themselves are bounded (32 items, 480 bytes per item), so
+model-authored state cannot grow without bound. The builder uses a
+`TokenEstimator` interface that is continuously calibrated from the live
+tokenizer's measured tokens-per-byte rate; the integrated request is still
+checked with Camelid's exact loaded-model tokenizer preflight before inference.
 
-The typed action protocol is JSON with one of: `NEED_CONTEXT`, `SEARCH`,
-`PATCH`, `RUN_TEST`, `INSPECT_DIAGNOSTIC`, `UPDATE_PLAN`, `COMPLETE`, or
-`BLOCKED`. The stable kernel includes the one-line JSON shape of all eight
-actions and remains byte-stable. The live slice executes `NEED_CONTEXT` and
-translates `PATCH`, `SEARCH`, and `RUN_TEST` through the existing tool
-boundary. Diagnostic inspection and plan updates remain host-owned state
-actions. `INSPECT_DIAGNOSTIC` accepts an optional `startLine` to page bounded
-slices of a stored raw artifact by reference; `UPDATE_PLAN` and `BLOCKED`
-validate non-empty fields. The parser also accepts an action inside a plain
-(unlabeled) code fence or as a standalone JSON line inside prose; anything
-looser stays rejected. `PATCH.patch` is the complete replacement text for the
-exact target page. The action must include the page's expected file hash; a
-mismatch is rejected.
+The advertised action protocol is the model's existing native function-call
+format: one advertised tool call per step, followed by a concise plain-text
+answer only after host verification. `read_file` doubles as the exact-source
+page-fault operation, so a small model does not need to learn a second JSON
+protocol before it can edit. `list_dir` with an omitted path is deterministically
+repaired to the workspace root. Modify and Verify expose the same scoped native
+tool set, allowing multi-file work to continue after the first write and keeping
+tool schemas stable across active steps. The earlier typed actions
+(`NEED_CONTEXT`, `PATCH`, `SEARCH`, `RUN_TEST`, `INSPECT_DIAGNOSTIC`,
+`UPDATE_PLAN`, `COMPLETE`, and `BLOCKED`) remain accepted for persisted/older
+clients but are no longer advertised in the stable kernel. Typed `PATCH` still
+requires a complete exact-page replacement and the expected file hash.
+Explicit relative artifact names in the immutable objective form a conservative
+host-owned completion manifest. Missing entries keep the runtime in Modify even
+after an earlier file passed verification, preventing multi-file creation from
+ending after its first artifact.
 
 Every tool result is stored content-addressed under
 `.camelid/context-paging/artifacts`. Only its bounded structured diagnostic is
@@ -133,11 +139,20 @@ Verification is host-owned. `COMPLETE` is accepted only when host-run
 verification has passed. A prose answer after a workspace change but before
 verification is reprompted (bounded) and can never overwrite a failed
 verification status with "complete"; `BLOCKED` never marks the task complete.
+A successful reread proves the saved bytes but does not by itself mark Code
+verification passed when `run_shell` is available; a post-write test, build, or
+syntax command must also succeed. Successful environment probes such as
+`python --version`, `ls`, and `pwd` are not verification. When `run_shell` is not
+advertised, the bounded host read-verification path remains valid and the stable
+kernel does not instruct the model to call a missing tool.
 
-The paging loop is bounded: 16 consecutive typed-action steps that execute no
-workspace action end the run. An exact-tokenizer overflow recalibrates the
-estimator from the measured count and rebuilds a smaller capsule (up to 3
-times per run) instead of failing the run.
+The paging loop is bounded: 16 consecutive model steps that execute no workspace
+action end the run. A trailing host retry reminder is copied, bounded, into the
+next capsule's mandatory `currentAction`; this prevents invalid native calls,
+malformed envelopes, or capped replies from receiving a byte-identical retry
+prompt. Any later tool result consumes that one-shot feedback. An exact-tokenizer
+overflow recalibrates the estimator from the measured count and rebuilds a
+smaller capsule (up to 3 times per run) instead of failing the run.
 
 Persistence is crash-safe: the ledger, index, runtime-state, and raw
 artifacts are written via temp-file+rename, so a crash cannot leave
@@ -145,7 +160,9 @@ half-written state. Retrieval misses are persisted even when the fault fails.
 
 ## Configuration
 
-- `CAMELID_CONTEXT_PAGING=1`: enable the experimental Web Code integration.
+- `CAMELID_CONTEXT_PAGING=0`: disable Context Paging for Web Code and use the
+  legacy growing-transcript loop. Context Paging is enabled when the variable is
+  absent; `1` explicitly keeps it enabled.
 - `CAMELID_CONTEXT_MAX_INPUT_TOKENS`: input ceiling, default `5500`.
 - `CAMELID_CONTEXT_OUTPUT_RESERVE`: output reserve, default `1300`.
 - `CAMELID_CONTEXT_SAFETY_RESERVE`: safety reserve, default `1200`.
@@ -173,8 +190,8 @@ dropping them.
 - Typed `PATCH` uses exact page replacement rather than arbitrary unified diff.
 - File-level exact pages are limited to 16 KiB; larger files must be changed by
   symbol page or a later bounded-range paging adapter.
-- The benchmark is a deterministic fixture, not a live-model comparison; the
-  rollout is opt-in while live-model coverage is expanded beyond it.
+- The benchmark is a deterministic fixture, not a live-model throughput claim;
+  default-on live-model receipts remain part of release validation.
 
 The next iteration should add compiler/LSP diagnostics adapters, more language
 indexers, and direct UI controls for capsule-debug and page-fault metrics.
