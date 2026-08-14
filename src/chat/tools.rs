@@ -487,6 +487,18 @@ impl ToolProfile {
                     | "write_file"
                     | "edit_file"
                     | "run_shell"
+                    // Windows PowerShell, fed VERBATIM over stdin. Admitted to
+                    // the coding lane because it removes an entire failure
+                    // class rather than patching its instances: `run_shell`
+                    // hands cmd.exe one command line through a JSON string, so
+                    // a small model has to get nested quoting AND `%` vs `%%`
+                    // right at the same time. Live captures show it reliably
+                    // does not — over-escaped `\\"` killed one turn, batch-file
+                    // `%%i` silently wrote 100 garbage files in another. This
+                    // tool takes a script with no shell quoting layer at all.
+                    // Same Exec tier and approval gate as run_shell, with its
+                    // own cwd-pin + timeout + job-object teardown.
+                    | "run_windows_command"
                     | "web_search"
                     | "http_fetch"
                     | "spawn_subagent"
@@ -609,11 +621,10 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
         #[cfg(windows)]
         const SHELL_PLATFORM: &str = concat!(
             "The shell is Windows cmd.exe — NOT bash: no {1..N}, $(...), or `%%`. ",
-            "Loop with `for /L %i in (1,1,N) do @...` and prefer forms with NO inner ",
-            "quotes, e.g. `for /L %i in (1,1,100) do @echo some text> file%i.txt`. ",
-            "If the work needs quoting or more than one line, write_file a `.ps1` or ",
-            "`.cmd` script and then run that file — never nest quotes inside this ",
-            "command string. "
+            "Use this only for SIMPLE one-liners with no inner quotes, e.g. ",
+            "`dir /b` or `git status`. For anything with quotes, loops, variables, ",
+            "or several statements, call `run_windows_command` instead: it takes ",
+            "PowerShell verbatim with no quoting layer. "
         );
         #[cfg(not(windows))]
         const SHELL_PLATFORM: &str = "The shell is POSIX `/bin/sh`. ";
@@ -715,8 +726,14 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
         if shell_mode != ShellSandbox::Disabled {
             tools.push(ToolSpec {
                 name: "run_windows_command".into(),
-                description: "Windows only: run a PowerShell command in the workspace and capture \
-                              its output. Exec tier — always gated by the approval policy."
+                description: "Windows: run PowerShell in the workspace and capture its output. \
+                              PREFER THIS over run_shell for anything with quotes, loops, \
+                              variables, or more than one statement — the script is passed \
+                              VERBATIM (no shell quoting layer, no cmd `%%` vs `%` rule), so \
+                              normal PowerShell works as written: \
+                              `1..100 | ForEach-Object { Set-Content -Path \"file$_.txt\" \
+                              -Value 'a joke' }`. Exec tier — always gated by the approval \
+                              policy."
                     .into(),
                 risk: Risk::Exec,
                 params: json!({"type":"object","properties":{
@@ -3063,10 +3080,10 @@ fn shell_failure_hint(command: &str, stdout: &str, stderr: &str) -> Option<&'sta
             );
         }
         return Some(
-            "this shell is Windows cmd.exe, not bash. Rewrite with cmd syntax and NO \
-             inner quotes (e.g. `for /L %i in (1,1,100) do @echo hello> file%i.txt`); \
-             if the work needs quotes or several lines, write_file a .ps1/.cmd script \
-             and run that file instead of nesting quotes here",
+            "this shell is Windows cmd.exe, not bash. Do not retry this command here — \
+             call `run_windows_command` instead, which takes PowerShell verbatim with no \
+             quoting layer (e.g. `1..100 | ForEach-Object { Set-Content -Path \
+             \"file$_.txt\" -Value 'text' }`)",
         );
     }
     if has("is not recognized as an internal or external command") {
@@ -3082,8 +3099,8 @@ fn shell_failure_hint(command: &str, stdout: &str, stderr: &str) -> Option<&'sta
             return Some(
                 "that is a Unix tool; this shell is Windows cmd.exe. Use `dir` (ls), `type` \
                  (cat), `del` (rm), `copy` (cp), `move` (mv), `findstr` (grep), `where` \
-                 (which), `echo.> file` (touch) — or one PowerShell line: `powershell \
-                 -NoProfile -Command \"<script>\"`",
+                 (which), `echo.> file` (touch) — or call `run_windows_command`, which takes \
+                 PowerShell verbatim and has Get-ChildItem/Get-Content/Remove-Item",
             );
         }
         return Some(
@@ -4012,20 +4029,28 @@ mod tests {
             .into_iter()
             .map(|tool| tool.name)
             .collect::<Vec<_>>();
-        assert_eq!(
-            code,
-            vec![
-                "read_file",
-                "list_dir",
-                "search",
-                "update_plan",
-                "write_file",
-                "edit_file",
-                "run_shell",
-                "web_search",
-                "http_fetch",
-            ]
-        );
+        let mut expected = vec![
+            "read_file",
+            "list_dir",
+            "search",
+            "update_plan",
+            "write_file",
+            "edit_file",
+            "run_shell",
+            "web_search",
+            "http_fetch",
+        ];
+        // Windows gets PowerShell as well. This is a widening of the coding
+        // scope, made deliberately: run_shell hands cmd.exe ONE command line
+        // through a JSON string, so a small model must solve nested quoting and
+        // `%` vs `%%` simultaneously, and live captures show it does not. This
+        // tool takes the script verbatim. It is a workspace SHELL at the same
+        // Exec tier and approval gate as run_shell, with its own cwd-pin,
+        // timeout, and job-object teardown — not machine control, which stays
+        // out (see the forbidden list below).
+        #[cfg(windows)]
+        expected.push("run_windows_command");
+        assert_eq!(code, expected);
         // Delegation is in scope for a coding surface, so the profile permits
         // the subagent tools — but they are still only ADVERTISED once a session
         // has configured the subagent runtime, which is why the spec list above
@@ -4033,8 +4058,16 @@ mod tests {
         for allowed in ["spawn_subagent", "await_subagent", "check_subagent_status"] {
             assert!(ToolProfile::WebCode.allows(allowed), "{allowed}");
         }
-        // Machine control never comes along with it.
-        for forbidden in ["run_windows_command", "gui_input", "ui_click", "screenshot"] {
+        // MACHINE control never comes along with it. A workspace shell does;
+        // synthesized input and screen capture do not, and that boundary is the
+        // point of this profile.
+        for forbidden in [
+            "gui_input",
+            "ui_click",
+            "screenshot",
+            "type_text",
+            "inspect_system",
+        ] {
             assert!(!ToolProfile::WebCode.allows(forbidden), "{forbidden}");
         }
         let offline = specs_for(ToolProfile::WebCode, false, ShellSandbox::Sandboxed);
@@ -5012,7 +5045,10 @@ mod tests {
         )
         .unwrap();
         assert!(bash.contains("cmd.exe, not bash"), "{bash}");
-        assert!(bash.contains("for /L %i"), "{bash}");
+        // The hint now routes to PowerShell rather than teaching cmd syntax:
+        // a small model that reached for bash will not fare better with
+        // `for /L`, and run_windows_command takes the script verbatim.
+        assert!(bash.contains("run_windows_command"), "{bash}");
         let batch = shell_failure_hint(
             "for /f \"tokens=1\" %%i in ('cmd /c echo /s') do @echo %%i",
             "",
@@ -5353,6 +5389,64 @@ mod tests {
         assert!(
             !names.iter().any(|n| n.contains('%')),
             "no literal percent may survive: {names:?}"
+        );
+    }
+
+    /// The Code lane must OFFER PowerShell on Windows, and it must actually
+    /// run. `run_shell` hands cmd.exe one command line through a JSON string,
+    /// so a small model has to solve nested quoting and `%` vs `%%` at once —
+    /// live captures show it does not (`\\"` killed one turn, `%%i` wrote 100
+    /// garbage files in another). This tool takes the script verbatim, which is
+    /// what removes the class rather than patching instances.
+    #[cfg(windows)]
+    #[test]
+    fn code_profile_offers_powershell_and_runs_it_verbatim() {
+        let specs = specs_for(ToolProfile::WebCode, false, ShellSandbox::Sandboxed);
+        let ps = specs
+            .iter()
+            .find(|spec| spec.name == "run_windows_command")
+            .expect("the coding lane must offer PowerShell on Windows");
+        assert_eq!(ps.risk, Risk::Exec, "it stays approval-gated");
+        assert!(
+            ps.description.contains("PREFER THIS over run_shell"),
+            "the model needs to know when to reach for it: {}",
+            ps.description
+        );
+        // Disabling the shell must still take it away with everything else.
+        assert!(
+            !specs_for(ToolProfile::WebCode, false, ShellSandbox::Disabled)
+                .iter()
+                .any(|spec| spec.name == "run_windows_command")
+        );
+
+        // And the exact shape that defeats run_shell works here verbatim:
+        // inner quotes, a variable, and a loop, with no escaping layer.
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(60)).unwrap();
+        let out = validate_for(
+            ToolProfile::WebCode,
+            &call(
+                "run_windows_command",
+                json!({"command":"1..3 | ForEach-Object { Set-Content -Path \"file$_.txt\" -Value 'a joke' }"}),
+            ),
+            &sb,
+        )
+        .expect("the Code profile must validate PowerShell")
+        .execute(&sb);
+        assert!(!out.is_err(), "PowerShell must run: {}", out.text());
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        for expected in ["file1.txt", "file2.txt", "file3.txt"] {
+            assert!(names.contains(&expected.to_string()), "got {names:?}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("file2.txt"))
+                .unwrap()
+                .trim(),
+            "a joke"
         );
     }
 
