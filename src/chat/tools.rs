@@ -726,21 +726,24 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
         if shell_mode != ShellSandbox::Disabled {
             tools.push(ToolSpec {
                 name: "run_windows_command".into(),
-                // The example is deliberately READ-ONLY. A write example here
-                // was copied verbatim by a small model — it emitted the
-                // description's own `-Value 'a joke'` placeholder for a task
-                // asking for a hundred distinct jokes, producing a hundred
-                // files that all said "a joke". An example must teach the
-                // syntax, not supply an answer.
+                // The example must be WRITE-SHAPED but not runnable, and both
+                // failure modes were observed live. A complete write example
+                // (`-Value 'a joke'`) was copied verbatim: a hundred files that
+                // all said "a joke". Replacing it with a read-only example lost
+                // the tool for writes entirely — the model went back to
+                // `run_shell` with nested `powershell -Command "..."` and
+                // mangled its own quotes again. So: show the write SHAPE with
+                // ellipses, which cannot be pasted as an answer.
                 description: "Windows: run PowerShell in the workspace and capture its output. \
-                              PREFER THIS over run_shell for anything with quotes, loops, \
-                              variables, or more than one statement — the script is passed \
-                              VERBATIM (no shell quoting layer, no cmd `%%` vs `%` rule), so \
-                              normal PowerShell works as written, e.g. \
-                              `Get-ChildItem -Recurse -Filter *.txt | Measure-Object`. Write \
-                              the real values your task calls for; never copy placeholder text \
-                              out of this description. Exec tier — always gated by the approval \
-                              policy."
+                              PREFER THIS over run_shell for ALL file creation and editing, and \
+                              for anything with quotes, loops, variables, or more than one \
+                              statement — the script is passed VERBATIM (no shell quoting layer, \
+                              no cmd `%%` vs `%` rule), so normal PowerShell works as written: \
+                              loop with `1..N | ForEach-Object { … }`, write with \
+                              `Set-Content -Path … -Value …`, read with `Get-ChildItem`. Supply \
+                              the real filenames and content your task calls for — never copy \
+                              placeholder text out of this description. Exec tier — always \
+                              gated by the approval policy."
                     .into(),
                 risk: Risk::Exec,
                 params: json!({"type":"object","properties":{
@@ -1457,6 +1460,27 @@ fn validate_shell_command(command: String) -> Result<Action, String> {
             "it manually."
         )
         .into());
+    }
+    // Nesting PowerShell inside cmd inside a JSON string is the exact shape
+    // that has failed every time it was tried here: the inner quotes arrive
+    // mangled (cmd does not parse the backslash escapes std emits), so
+    // `-Path "./$f"` reaches PowerShell as `-Path ./$f`. `run_windows_command`
+    // takes the same script with no quoting layer at all, so route there rather
+    // than letting the model burn its turn on quoting.
+    #[cfg(windows)]
+    {
+        let head = command.trim_start().to_ascii_lowercase();
+        if (head.starts_with("powershell") || head.starts_with("pwsh"))
+            && command.contains("-Command")
+        {
+            return Err(concat!(
+                "do not nest PowerShell inside run_shell — cmd.exe mangles the inner quotes. ",
+                "Call `run_windows_command` with the SCRIPT ITSELF instead (no `powershell ",
+                "-Command` wrapper, no outer quotes): its `command` argument is PowerShell, ",
+                "passed verbatim."
+            )
+            .into());
+        }
     }
     // `%%VAR` is batch-FILE syntax and does not expand under `cmd /C`. Refusing
     // it was measurably worse than correcting it: the rejection fired three
@@ -5454,6 +5478,39 @@ mod tests {
                 .trim(),
             "a joke"
         );
+    }
+
+    /// Nesting PowerShell inside run_shell is the shape that has failed every
+    /// time: cmd mangles the inner quotes, so `-Path "./$f"` arrives as
+    /// `-Path ./$f`. Observed live three times in one turn. Route it to the
+    /// tool that takes the script verbatim instead of letting the turn burn.
+    #[cfg(windows)]
+    #[test]
+    fn nested_powershell_in_run_shell_is_routed_to_the_verbatim_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path());
+        let error = match validate(
+            &call(
+                "run_shell",
+                json!({"command":"powershell -Command \"1..3 | ForEach-Object { New-Item -Path \"./f$_.txt\" }\""}),
+            ),
+            &sb,
+        ) {
+            Ok(_) => panic!("nested PowerShell must not run through cmd"),
+            Err(error) => error,
+        };
+        assert!(error.contains("run_windows_command"), "{error}");
+        assert!(error.contains("verbatim"), "{error}");
+        // Plain cmd work is untouched, and so is a path that merely mentions it.
+        assert!(validate(&call("run_shell", json!({"command":"dir /b"})), &sb).is_ok());
+        assert!(validate(
+            &call(
+                "run_shell",
+                json!({"command":"findstr powershell notes.txt"})
+            ),
+            &sb
+        )
+        .is_ok());
     }
 
     /// A command AUTHORING a batch file is the one place `%%` is correct, and
