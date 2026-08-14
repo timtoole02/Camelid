@@ -514,11 +514,11 @@ impl super::LlamaInferenceSession {
     ///
     /// Mirroring back is only safe when the round trip cannot change the K/V:
     /// see [`crate::metal::ResidentDecodeState::kv_roundtrips_through_cpu_exactly`].
-    /// With an F32 or Q8 primary the CPU copy would be rounded and the resumed
+    /// With a quantized primary the CPU copy would be rounded and the resumed
     /// sequence would attend over different K/V than its prefill produced — the
     /// same hazard that makes the streaming path bypass this cache entirely when
-    /// the CUDA resident engine is driving. So this helps Q4_K/Q6_K models (which
-    /// default to an F16 primary) and deliberately does NOT help Q8_0 ones.
+    /// the CUDA resident engine is driving. F16 primaries round-trip through an
+    /// F16/F32 CPU cache; F32 primaries require an F32 CPU cache.
     ///
     /// Opt out with `CAMELID_PREFIX_CACHE_RESIDENT=0`: mirroring takes the CPU KV
     /// for this sequence from zero bytes to full size, and `store_prompt_prefix_cache`
@@ -542,6 +542,18 @@ impl super::LlamaInferenceSession {
     /// caller's request: a refusal just means no cache entry.
     pub fn prepare_for_prompt_prefix_cache(&mut self) -> bool {
         self.prepare_for_prompt_prefix_cache_gated(resident_prefix_cache_mirror_enabled())
+    }
+
+    /// Whether a cached clone came from the exact-F32 Metal lane. Partial hits
+    /// on this lane cannot use batched resident prefill at a nonzero KV position,
+    /// so API cache admission treats them differently from F16/Q4_K resumes.
+    pub(crate) fn uses_f32_metal_resident_kv(&self) -> bool {
+        self.resident_decode.as_ref().is_some_and(|session| {
+            matches!(
+                session.kv_mirror_fidelity(),
+                crate::inference::kv_cache::KvStoreFidelity::ExactF32
+            )
+        })
     }
 
     /// `cache_enabled` is `resident_prefix_cache_mirror_enabled()` in

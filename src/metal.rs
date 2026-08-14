@@ -75,6 +75,7 @@ struct MetalLinearKernel {
     q8_0_block_wire_mm_pipeline: ComputePipelineState,
     q8_0_block_wire_mm_f16o_pipeline: ComputePipelineState,
     quantize_q8k_rows_pipeline: ComputePipelineState,
+    quantize_q8k_rows_parallel_pipeline: ComputePipelineState,
     /// Ordered Q4_0 x Q8_0 row dot used by disk-paged Gemma 4 experts. Unlike
     /// the resident f32-activation Q4 kernel, this preserves the CPU Ghost-MoE
     /// comparator's per-block integer dot and left-to-right f32 accumulation.
@@ -2429,6 +2430,56 @@ kernel void quantize_q8k_rows_strict(
         quants[base + i] =
             char(min(nearest_int_q8k_strict(iscale * input[base + i]), 127));
     }
+}
+
+// Parallel, bit-identical sibling of quantize_q8k_rows_strict. One 256-thread
+// group owns one Q8_K super-block. The (absolute value, lowest index) reduction
+// reproduces the scalar loop's strict-`>` tie rule, including its signed choice
+// when +amax and -amax have equal magnitude.
+kernel void quantize_q8k_rows_strict_parallel(
+    device const float* input [[buffer(0)]],
+    device float* scales [[buffer(1)]],
+    device char* quants [[buffer(2)]],
+    constant uint& n_sb [[buffer(3)]],
+    constant uint& n_rows [[buffer(4)]],
+    uint block_id [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    const uint total = n_rows * n_sb;
+    if (block_id >= total) return;
+    const uint row = block_id / n_sb;
+    const uint sb = block_id - row * n_sb;
+    const uint base = row * n_sb * 256 + sb * 256;
+    const float v = input[base + tid];
+    const float a = fabs(v);
+    threadgroup float best_abs[256];
+    threadgroup uint best_index[256];
+    best_abs[tid] = isnan(a) ? -1.0f : a;
+    best_index[tid] = tid;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            const float candidate = best_abs[tid + stride];
+            const uint candidate_index = best_index[tid + stride];
+            if (candidate > best_abs[tid]
+                || (candidate == best_abs[tid] && candidate_index < best_index[tid])) {
+                best_abs[tid] = candidate;
+                best_index[tid] = candidate_index;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float amax = best_abs[0];
+    if (amax <= 0.0f) {
+        if (tid == 0) scales[block_id] = 0.0f;
+        quants[base + tid] = 0;
+        return;
+    }
+    const float maxv = input[base + best_index[0]];
+    const float iscale = -127.0f / maxv;
+    if (tid == 0) scales[block_id] = 1.0f / iscale;
+    quants[base + tid] =
+        char(min(nearest_int_q8k_strict(iscale * v), 127));
 }
 
 // Gemma 4 Ghost-MoE expert GEMM, parity-first form. One GPU thread owns one
@@ -7667,6 +7718,12 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let quantize_q8k_rows_pipeline = device
                 .new_compute_pipeline_state_with_function(&quantize_q8k_rows_function)
                 .ok()?;
+            let quantize_q8k_rows_parallel_function = strict_q8k_library
+                .get_function("quantize_q8k_rows_strict_parallel", None)
+                .ok()?;
+            let quantize_q8k_rows_parallel_pipeline = device
+                .new_compute_pipeline_state_with_function(&quantize_q8k_rows_parallel_function)
+                .ok()?;
             let q4_0_q8_ordered_function = strict_q8k_library
                 .get_function("q4_0_q8_ordered_rows", None)
                 .ok()?;
@@ -7838,6 +7895,7 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 q8_0_block_wire_mm_pipeline,
                 q8_0_block_wire_mm_f16o_pipeline,
                 quantize_q8k_rows_pipeline,
+                quantize_q8k_rows_parallel_pipeline,
                 q4_0_q8_ordered_pipeline,
                 q4_0_q8_ordered_simd_pipeline,
                 gemma4_q4_expert_gate_up_geglu_pipeline,
@@ -12215,6 +12273,30 @@ pub fn kquant_resident_enabled() -> bool {
             .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
+/// Reuse one strict Q8_K activation across projections that consume the same
+/// normalized input. Default on; the opt-out exists for same-binary A/B and
+/// field rollback without disabling the resident K-quant lane.
+#[cfg(target_os = "macos")]
+fn kquant_quant_reuse_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var("CAMELID_METAL_KQUANT_QUANT_REUSE")
+            .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+    })
+}
+
+/// Parallelize strict Q8_K activation quantization across all 256 values in a
+/// super-block. Default on; the scalar kernel remains available for same-binary
+/// performance and parity diagnosis.
+#[cfg(target_os = "macos")]
+fn kquant_parallel_quant_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var("CAMELID_METAL_KQUANT_PARALLEL_QUANT")
+            .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+    })
+}
+
 /// Non-macOS stub: there is no Metal stack, so wire mode is never active.
 #[cfg(not(target_os = "macos"))]
 pub fn wire_mode_active() -> bool {
@@ -12403,6 +12485,7 @@ fn encode_resident_matmul_f32(
                 input_width,
                 rows,
                 n_tokens,
+                true,
             );
             keep.extend([scales, quants]);
         }
@@ -12727,6 +12810,11 @@ fn try_prism_wire_matmul_flat(
 /// Allocating a fresh pair per dispatch instead makes transient scratch scale with
 /// `n_tokens * sum(input_width) * n_layers` — gigabytes for an 8B model on a long
 /// prompt — where `n_tokens * sum(input_width)` is sufficient.
+///
+/// `quantize_input = false` is valid only when an earlier dispatch on this same
+/// serial encoder populated `scales`/`quants` from the identical `y` rows. It
+/// skips only that conversion; the projection kernel and its reduction order
+/// are unchanged.
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn encode_resident_kquant_matmul_f32(
@@ -12741,6 +12829,7 @@ fn encode_resident_kquant_matmul_f32(
     input_width: usize,
     rows: usize,
     n_tokens: usize,
+    quantize_input: bool,
 ) {
     let n_sb = input_width / 256;
     unsafe {
@@ -12749,13 +12838,36 @@ fn encode_resident_kquant_matmul_f32(
         *p.add(1) = rows as u32;
         *p.add(2) = n_tokens as u32;
     }
-    e.set_compute_pipeline_state(&k.quantize_q8k_rows_pipeline);
-    e.set_buffer(0, Some(y), 0);
-    e.set_buffer(1, Some(scales), 0);
-    e.set_buffer(2, Some(quants), 0);
-    e.set_buffer(3, Some(scalar), 0);
-    e.set_buffer(4, Some(scalar), 8);
-    dispatch_1d(e, &k.quantize_q8k_rows_pipeline, n_tokens * n_sb);
+    if quantize_input {
+        let parallel_quant = kquant_parallel_quant_enabled();
+        let quantize_pipeline = if parallel_quant {
+            &k.quantize_q8k_rows_parallel_pipeline
+        } else {
+            &k.quantize_q8k_rows_pipeline
+        };
+        e.set_compute_pipeline_state(quantize_pipeline);
+        e.set_buffer(0, Some(y), 0);
+        e.set_buffer(1, Some(scales), 0);
+        e.set_buffer(2, Some(quants), 0);
+        e.set_buffer(3, Some(scalar), 0);
+        e.set_buffer(4, Some(scalar), 8);
+        if parallel_quant {
+            e.dispatch_thread_groups(
+                metal::MTLSize {
+                    width: (n_tokens * n_sb) as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        } else {
+            dispatch_1d(e, quantize_pipeline, n_tokens * n_sb);
+        }
+    }
 
     let pipeline = match (weight.format, n_tokens == 1) {
         (ResidentWeightFormat::Q4K, true) => &k.q4k_linear_simd_pipeline,
@@ -12812,6 +12924,56 @@ fn encode_resident_kquant_matmul_f32(
     } else {
         dispatch_1d(e, pipeline, rows * n_tokens.div_ceil(4));
     }
+}
+
+/// Encode several K-quant projections that consume the same f32 activation,
+/// quantizing that activation exactly once. Dispatches on the shared compute
+/// encoder are serial, so every GEMV consumes the buffers before any later
+/// command can overwrite them. Returns false without encoding when the A/B
+/// gate is off or any projection is not Q4_K/Q6_K.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn try_encode_shared_kquant_matmuls(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    keep: &mut Vec<Buffer>,
+    y: &Buffer,
+    input_width: usize,
+    n_tokens: usize,
+    projections: &[(&ResidentLinearWeight, &Buffer, &Buffer, usize)],
+) -> bool {
+    if !kquant_quant_reuse_enabled()
+        || projections.is_empty()
+        || !projections.iter().all(|(weight, _, _, _)| {
+            matches!(
+                weight.format,
+                ResidentWeightFormat::Q4K | ResidentWeightFormat::Q6K
+            )
+        })
+    {
+        return false;
+    }
+
+    let scales = pool_get(k, (n_tokens * (input_width / 256) * 4) as u64);
+    let quants = pool_get(k, (n_tokens * input_width) as u64);
+    for (index, (weight, out, scalar, rows)) in projections.iter().enumerate() {
+        encode_resident_kquant_matmul_f32(
+            e,
+            k,
+            y,
+            weight,
+            out,
+            scalar,
+            &scales,
+            &quants,
+            input_width,
+            *rows,
+            n_tokens,
+            index == 0,
+        );
+    }
+    keep.extend([scales, quants]);
+    true
 }
 
 /// Batched-column mirror of [`encode_q8_matmul_f32y`]'s production NSG=8 wire GEMV.
@@ -16524,30 +16686,45 @@ fn encode_ffn_block(
             *(silu_n.contents() as *mut u32) = ffn_dim as u32;
         }
         encode_rms_norm_f32(e, k, in_buf, &norm_w_buf, &normf, &rms_scalar);
-        encode_resident_matmul_f32(
+        // Gate and up consume the identical normalized activation. Quantize it
+        // once to Q8_K when both projections use the K-quant lane.
+        if !try_encode_shared_kquant_matmuls(
             e,
             k,
             keep,
             &normf,
-            gate_w,
-            &gate_buf,
-            &gateup_scalar,
             hidden,
-            ffn_dim,
             1,
-        );
-        encode_resident_matmul_f32(
-            e,
-            k,
-            keep,
-            &normf,
-            up_w,
-            &up_buf,
-            &gateup_scalar,
-            hidden,
-            ffn_dim,
-            1,
-        );
+            &[
+                (gate_w, &gate_buf, &gateup_scalar, ffn_dim),
+                (up_w, &up_buf, &gateup_scalar, ffn_dim),
+            ],
+        ) {
+            encode_resident_matmul_f32(
+                e,
+                k,
+                keep,
+                &normf,
+                gate_w,
+                &gate_buf,
+                &gateup_scalar,
+                hidden,
+                ffn_dim,
+                1,
+            );
+            encode_resident_matmul_f32(
+                e,
+                k,
+                keep,
+                &normf,
+                up_w,
+                &up_buf,
+                &gateup_scalar,
+                hidden,
+                ffn_dim,
+                1,
+            );
+        }
         // gemma3 GeGLU: gelu_tanh(gate) * up via the existing gelu_mul_f32
         // kernel (mirrors the CPU reference exactly; the fused gate+up variant
         // was previously reverted for register spill — keep separate GEMVs).
@@ -16827,42 +17004,58 @@ fn encode_attention_block(
     let normf_attn = if f32y_gemv_enabled() {
         let normf = nb((hidden * 4) as u64);
         encode_rms_norm_f32(e, k, in_buf, &norm_w_buf, &normf, &rms_scalar);
-        encode_resident_matmul_f32(
+        // Q, K and V consume the identical normalized activation. The former
+        // path ran the strict Q8_K quantizer three times per layer.
+        if !try_encode_shared_kquant_matmuls(
             e,
             k,
             keep,
             &normf,
-            q_w_buf,
-            &query_buf,
-            &q_mm_scalar,
             hidden,
-            q_dim,
             1,
-        );
-        encode_resident_matmul_f32(
-            e,
-            k,
-            keep,
-            &normf,
-            k_w_buf,
-            &key_buf,
-            &kv_mm_scalar,
-            hidden,
-            kv_dim,
-            1,
-        );
-        encode_resident_matmul_f32(
-            e,
-            k,
-            keep,
-            &normf,
-            v_w_buf,
-            &val_buf,
-            &kv_mm_scalar,
-            hidden,
-            kv_dim,
-            1,
-        );
+            &[
+                (q_w_buf, &query_buf, &q_mm_scalar, q_dim),
+                (k_w_buf, &key_buf, &kv_mm_scalar, kv_dim),
+                (v_w_buf, &val_buf, &kv_mm_scalar, kv_dim),
+            ],
+        ) {
+            encode_resident_matmul_f32(
+                e,
+                k,
+                keep,
+                &normf,
+                q_w_buf,
+                &query_buf,
+                &q_mm_scalar,
+                hidden,
+                q_dim,
+                1,
+            );
+            encode_resident_matmul_f32(
+                e,
+                k,
+                keep,
+                &normf,
+                k_w_buf,
+                &key_buf,
+                &kv_mm_scalar,
+                hidden,
+                kv_dim,
+                1,
+            );
+            encode_resident_matmul_f32(
+                e,
+                k,
+                keep,
+                &normf,
+                v_w_buf,
+                &val_buf,
+                &kv_mm_scalar,
+                hidden,
+                kv_dim,
+                1,
+            );
+        }
         Some(normf)
     } else {
         encode_rms_norm_quantize(
@@ -22806,6 +22999,7 @@ impl ResidentDecodeState {
                         input_width,
                         rows,
                         n_tokens,
+                        true,
                     );
                 }
             }
@@ -27753,13 +27947,24 @@ mod tests {
                 }
                 let qcb = kernel.queue.new_command_buffer();
                 let qe = qcb.new_compute_command_encoder();
-                qe.set_compute_pipeline_state(&kernel.quantize_q8k_rows_pipeline);
+                qe.set_compute_pipeline_state(&kernel.quantize_q8k_rows_parallel_pipeline);
                 qe.set_buffer(0, Some(&q_input), 0);
                 qe.set_buffer(1, Some(&q_scales), 0);
                 qe.set_buffer(2, Some(&q_codes), 0);
                 qe.set_buffer(3, Some(&q_scalar), 0);
                 qe.set_buffer(4, Some(&q_scalar), 4);
-                dispatch_1d(qe, &kernel.quantize_q8k_rows_pipeline, n_tokens * n_sb);
+                qe.dispatch_thread_groups(
+                    metal::MTLSize {
+                        width: (n_tokens * n_sb) as u64,
+                        height: 1,
+                        depth: 1,
+                    },
+                    metal::MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
                 qe.end_encoding();
                 qcb.commit();
                 qcb.wait_until_completed();

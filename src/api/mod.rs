@@ -99,6 +99,12 @@ const PROMPT_PREFIX_CACHE_CAPACITY_ENV: &str = "CAMELID_PREFIX_CACHE_CAPACITY";
 const PROMPT_PREFIX_CACHE_MIN_TOKENS_ENV: &str = "CAMELID_PREFIX_CACHE_MIN_TOKENS";
 const DEFAULT_PROMPT_PREFIX_CACHE_CAPACITY: usize = 1;
 const DEFAULT_PROMPT_PREFIX_CACHE_MIN_TOKENS: usize = 16;
+// An F32 Metal-resident prefix can only resume its divergent suffix through the
+// CPU prefill path, followed by a full CPU -> Metal KV seed. On an M4, reusing a
+// 3,062-token prefix for a 74-token suffix was already slower than a cold
+// batched Metal prefill; a 23-token suffix was still comfortably faster. Keep
+// the measured break-even conservative and scale it with prefix length.
+const METAL_F32_PARTIAL_PREFIX_MIN_REUSE_RATIO: usize = 48;
 /// Reserved model id for the speculative draft model; loaded without becoming
 /// the active model.
 const SPEC_DRAFT_MODEL_ID: &str = "spec-draft";
@@ -362,6 +368,10 @@ struct CachedPromptPrefix {
     logits: CpuTensor,
     hidden_state: CpuTensor,
     output_norm_state: CpuTensor,
+    /// The source session held an exact-F32 Metal KV cache when this entry was
+    /// mirrored. Its clone is CPU-only, but a partial resume will return to the
+    /// same expensive CPU-suffix/Metal-reseed path.
+    metal_f32_resident_kv: bool,
 }
 
 #[derive(Clone)]
@@ -18564,6 +18574,15 @@ fn lookup_prompt_prefix_cache(prepared: &PreparedGeneration) -> Option<PrefixMat
         if !is_exact_match && common_len < min_prefix {
             continue;
         }
+        if !is_exact_match
+            && cached.metal_f32_resident_kv
+            && !metal_f32_partial_prefix_is_profitable(
+                common_len,
+                prepared.token_ids.len().saturating_sub(common_len),
+            )
+        {
+            continue;
+        }
 
         let candidate_rank = (is_exact_match, common_len, entry.last_used);
         let should_replace = best
@@ -18600,6 +18619,10 @@ fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b.iter()).take_while(|(&x, &y)| x == y).count()
 }
 
+fn metal_f32_partial_prefix_is_profitable(prefix_len: usize, suffix_len: usize) -> bool {
+    suffix_len > 0 && prefix_len / suffix_len >= METAL_F32_PARTIAL_PREFIX_MIN_REUSE_RATIO
+}
+
 fn store_prompt_prefix_cache(prepared: &mut PreparedGeneration, step: &LlamaGenerationStep) {
     // Storing is constraint-independent for the same reason: what is retained
     // is the PROMPT's KV and its raw (unmasked) logits. A later request applies
@@ -18629,6 +18652,8 @@ fn store_prompt_prefix_cache(prepared: &mut PreparedGeneration, step: &LlamaGene
         return;
     }
 
+    let metal_f32_resident_kv = prepared.session.uses_f32_metal_resident_kv();
+
     // Cloning a populated session can copy hundreds of MiB of KV data. Do that
     // outside the global cache lock so concurrent requests can still look up
     // their own prefixes.
@@ -18641,6 +18666,7 @@ fn store_prompt_prefix_cache(prepared: &mut PreparedGeneration, step: &LlamaGene
         logits: step.logits.clone(),
         hidden_state: step.hidden_state.clone(),
         output_norm_state: step.output_norm_state.clone(),
+        metal_f32_resident_kv,
     };
 
     if let Ok(mut pool) = prepared.cached_prompt_prefix.lock() {
@@ -27817,6 +27843,59 @@ mod tests {
     }
 
     #[test]
+    fn metal_f32_partial_prefix_admission_tracks_measured_break_even() {
+        assert!(metal_f32_partial_prefix_is_profitable(3_062, 23));
+        assert!(!metal_f32_partial_prefix_is_profitable(3_062, 74));
+        assert!(!metal_f32_partial_prefix_is_profitable(3_062, 346));
+        assert!(!metal_f32_partial_prefix_is_profitable(3_062, 0));
+    }
+
+    #[test]
+    fn metal_f32_prompt_cache_keeps_exact_hits_but_rejects_large_suffixes() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var(PROMPT_PREFIX_CACHE_MIN_TOKENS_ENV, "2");
+        std::env::set_var("CAMELID_CUDA_RESIDENT_DECODE", "0");
+        std::env::remove_var("CAMELID_DETERMINISTIC");
+
+        let mut session = LlamaInferenceSession::new(tiny_spec_config(), tiny_weights()).unwrap();
+        let step = session
+            .generate_next_token_with_history_diagnostics(
+                &[0, 1, 2],
+                crate::inference::LlamaSampler::Greedy,
+                &[0, 1, 2],
+                false,
+                None,
+            )
+            .unwrap();
+        let mut prepared = prepared_for_cache("tiny", "model-a.gguf", vec![0, 1, 2], session);
+        store_prompt_prefix_cache(&mut prepared, &step);
+        {
+            let mut pool = prepared.cached_prompt_prefix.lock().unwrap();
+            let cached = Arc::get_mut(&mut pool.entries[0].cached)
+                .expect("the freshly stored entry has one owner");
+            cached.metal_f32_resident_kv = true;
+        }
+
+        let exact = lookup_prompt_prefix_cache(&prepared).expect("exact hit remains eligible");
+        assert!(exact.is_exact_match);
+
+        let mut extended = prepared_for_cache(
+            "tiny",
+            "model-a.gguf",
+            vec![0, 1, 2, 0, 1],
+            prepared.session.clone(),
+        );
+        extended.cached_prompt_prefix = Arc::clone(&prepared.cached_prompt_prefix);
+        assert!(
+            lookup_prompt_prefix_cache(&extended).is_none(),
+            "a suffix too large for the cached prefix must take cold Metal prefill"
+        );
+
+        std::env::remove_var(PROMPT_PREFIX_CACHE_MIN_TOKENS_ENV);
+        std::env::remove_var("CAMELID_CUDA_RESIDENT_DECODE");
+    }
+
+    #[test]
     fn prompt_prefix_cache_partial_match_and_lru_eviction() {
         let _env_guard = crate::test_support::env_lock();
         std::env::set_var(PROMPT_PREFIX_CACHE_MIN_TOKENS_ENV, "2");
@@ -28255,6 +28334,7 @@ mod tests {
                 logits: step.logits.clone(),
                 hidden_state: step.hidden_state.clone(),
                 output_norm_state: step.output_norm_state.clone(),
+                metal_f32_resident_kv: false,
             });
 
         // A longer prompt sharing the pool: a partial hit (the shared
