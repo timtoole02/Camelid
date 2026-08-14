@@ -726,13 +726,20 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
         if shell_mode != ShellSandbox::Disabled {
             tools.push(ToolSpec {
                 name: "run_windows_command".into(),
+                // The example is deliberately READ-ONLY. A write example here
+                // was copied verbatim by a small model — it emitted the
+                // description's own `-Value 'a joke'` placeholder for a task
+                // asking for a hundred distinct jokes, producing a hundred
+                // files that all said "a joke". An example must teach the
+                // syntax, not supply an answer.
                 description: "Windows: run PowerShell in the workspace and capture its output. \
                               PREFER THIS over run_shell for anything with quotes, loops, \
                               variables, or more than one statement — the script is passed \
                               VERBATIM (no shell quoting layer, no cmd `%%` vs `%` rule), so \
-                              normal PowerShell works as written: \
-                              `1..100 | ForEach-Object { Set-Content -Path \"file$_.txt\" \
-                              -Value 'a joke' }`. Exec tier — always gated by the approval \
+                              normal PowerShell works as written, e.g. \
+                              `Get-ChildItem -Recurse -Filter *.txt | Measure-Object`. Write \
+                              the real values your task calls for; never copy placeholder text \
+                              out of this description. Exec tier — always gated by the approval \
                               policy."
                     .into(),
                 risk: Risk::Exec,
@@ -3082,8 +3089,7 @@ fn shell_failure_hint(command: &str, stdout: &str, stderr: &str) -> Option<&'sta
         return Some(
             "this shell is Windows cmd.exe, not bash. Do not retry this command here — \
              call `run_windows_command` instead, which takes PowerShell verbatim with no \
-             quoting layer (e.g. `1..100 | ForEach-Object { Set-Content -Path \
-             \"file$_.txt\" -Value 'text' }`)",
+             quoting layer, so loops, quotes and $variables work as written",
         );
     }
     if has("is not recognized as an internal or external command") {

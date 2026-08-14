@@ -2549,10 +2549,20 @@ pub fn run_loop(
                     // model's claim. The scan reports the actual changed paths so
                     // the semantic post-change capture reads real files, exactly
                     // as it does for write_file/edit_file.
+                    // PowerShell writes count exactly as cmd writes do. Missing
+                    // it was live-visible the moment run_windows_command joined
+                    // the coding profile: a single PowerShell pipeline created
+                    // 100 files, and the loop still said "Code has not changed a
+                    // workspace file", so the model burned its remaining steps
+                    // re-running `dir /b` to prove work it had already done and
+                    // died on the repeat guard.
                     if require_workspace_change
                         && !workspace_changed
                         && !outcome.is_err()
-                        && matches!(&action, Action::RunShell { .. })
+                        && matches!(
+                            &action,
+                            Action::RunShell { .. } | Action::RunWindowsCommand { .. }
+                        )
                     {
                         if let Some(shell_changed_paths) =
                             workspace_changes_since(sandbox.root(), action_started_at)
@@ -7301,6 +7311,57 @@ mod tests {
                 .iter()
                 .any(|notice| notice.contains("has not changed a workspace file")),
             "the shell change must satisfy the contract: {:?}",
+            reporter.notices
+        );
+    }
+
+    /// A PowerShell write satisfies the completion contract exactly as a cmd
+    /// write does. Missing this was live-visible the moment PowerShell joined
+    /// the coding profile: one pipeline created 100 files and the loop still
+    /// reported "Code has not changed a workspace file", so the model spent its
+    /// remaining steps re-running `dir /b` to prove work it had already done and
+    /// died on the repeat guard with the task effectively complete on disk.
+    #[cfg(windows)]
+    #[test]
+    fn a_powershell_write_satisfies_the_completion_contract() {
+        // Drives run_loop, which touches the process-global checkpoint log.
+        let _cp = super::super::checkpoint::tests::cp_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(60)).unwrap();
+        let mut driver = MockDriver {
+            steps: vec![
+                ModelStep::Calls(vec![tc(
+                    "run_windows_command",
+                    json!({"command": "1..3 | ForEach-Object { Set-Content -Path \"n$_.txt\" -Value \"line $_\" }"}),
+                )]),
+                ModelStep::Text("Created the requested files.".into()),
+                ModelStep::Text("Verified: n1.txt, n2.txt and n3.txt exist as requested.".into()),
+            ],
+            idx: 0,
+        };
+        let mut approver = ScriptApprover(vec![Decision::Once], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("create 3 text files".into())];
+        let mut config = cfg(dir.path(), false);
+        config.tool_profile = tools::ToolProfile::WebCode;
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sb,
+            &config,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
+        assert!(dir.path().join("n1.txt").exists(), "PowerShell must write");
+        assert!(
+            !reporter
+                .notices
+                .iter()
+                .any(|notice| notice.contains("has not changed a workspace file")),
+            "the PowerShell change must satisfy the contract: {:?}",
             reporter.notices
         );
     }
