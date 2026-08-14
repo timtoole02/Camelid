@@ -1116,16 +1116,31 @@
   font-size: var(--text-2xs);
 }
 .code-inspector .ci-task__meta > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The task is whatever the author typed, and a written-out spec runs to
+   thousands of characters — unclamped it filled the entire panel and pushed
+   Changes, the context meter and every other group off the bottom. Three lines
+   is enough to recognise the task; the full text is the `title` and the
+   transcript's first message. */
 .code-inspector .ci-task__desc {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
   margin: var(--space-1) 0 0;
   padding-left: 20px;
+  overflow: hidden;
   color: var(--color-text-muted);
   font-size: var(--text-2xs);
   line-height: var(--leading-snug);
   overflow-wrap: anywhere;
 }
 .code-inspector .ci-task__note {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
   margin: var(--space-1) 0 0;
+  overflow: hidden;
   color: var(--color-text-faint);
   font-family: var(--font-mono);
   font-size: var(--text-micro);

@@ -570,7 +570,7 @@ function AgentCard({ agent, isMain, anchor, anchorTitle, action, children }) {
         <Elapsed anchor={anchor} title={anchorTitle} />
       </p>
       {children}
-      {agent.task ? <p className="ci-task__desc">{agent.task}</p> : null}
+      {agent.task ? <p className="ci-task__desc" title={agent.task}>{agent.task}</p> : null}
     </li>
   )
 }
@@ -720,7 +720,7 @@ const CodeInspector = memo(function CodeInspector({
                 anchorTitle={anchorTitleFor(agent)}
                 action={null}
               >
-                {agent.detail ? <p className="ci-task__note">{agent.detail}</p> : null}
+                {agent.detail ? <p className="ci-task__note" title={agent.detail}>{agent.detail}</p> : null}
               </AgentCard>
             ))}
           </ul>
@@ -824,7 +824,7 @@ const CodeInspector = memo(function CodeInspector({
                     anchorTitle={anchorTitleFor(agent)}
                     action={null}
                   >
-                    {agent.detail ? <p className="ci-task__note">{agent.detail}</p> : null}
+                    {agent.detail ? <p className="ci-task__note" title={agent.detail}>{agent.detail}</p> : null}
                   </AgentCard>
                 ))}
               </ul>

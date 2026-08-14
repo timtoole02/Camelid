@@ -43,9 +43,30 @@ const MAX_STEPS: usize = 32;
 // landed in the transcript as a mangled "answer" with the write silently lost.
 const DEFAULT_MAX_TOKENS: u32 = 2048;
 const MAX_TOKENS: u32 = 8192;
-const MAX_GOAL_BYTES: usize = 4 * 1024;
+// A written-out task spec — module layout, constraints, acceptance criteria — is
+// the normal shape of a good coding goal, and 4 KiB rejected one outright AFTER
+// the user had typed the whole thing. This is an abuse bound, not a prompt
+// budget: what a goal can actually afford is the model's context window, which
+// the context budget and auto-compaction already enforce downstream with real
+// numbers. Keep the hard cap generous and let that machinery do the sizing.
+const MAX_GOAL_BYTES: usize = 64 * 1024;
 const EVENT_CLAIM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const AUTO_COMPACT_TRIGGER_PERCENT: u32 = 75;
+
+/// Reject an empty or over-long goal/message with the numbers, not just the rule.
+/// "must contain 1 to 65536 UTF-8 bytes" leaves the author guessing how far over
+/// they are and whether trimming a paragraph would be enough.
+fn oversize_text_message(field: &str, value: &str) -> String {
+    if value.is_empty() {
+        return format!("{field} cannot be empty");
+    }
+    format!(
+        "{field} is {} bytes, over the {} byte limit — trim about {} bytes and resend",
+        value.len(),
+        MAX_GOAL_BYTES,
+        value.len().saturating_sub(MAX_GOAL_BYTES)
+    )
+}
 
 /// Whether a stored thread belongs to `mode`, by its id prefix.
 ///
@@ -1414,7 +1435,7 @@ pub(super) async fn create_session(
         return api_error(
             StatusCode::BAD_REQUEST,
             "invalid_workspace_goal",
-            format!("goal must contain 1 to {MAX_GOAL_BYTES} UTF-8 bytes"),
+            oversize_text_message("goal", &goal),
             Some("goal"),
         );
     }
@@ -2205,7 +2226,7 @@ pub(super) async fn send_message(
         return api_error(
             StatusCode::BAD_REQUEST,
             "invalid_workspace_message",
-            format!("text must contain 1 to {MAX_GOAL_BYTES} UTF-8 bytes"),
+            oversize_text_message("message", &text),
             Some("text"),
         );
     }
@@ -2645,6 +2666,42 @@ fn tool_capable_row_for_loaded_artifact(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_written_out_task_spec_fits_the_goal_limit() {
+        // The limit that rejected a real goal was 4 KiB. A spec that names the
+        // module layout, the constraints, the CLI surface and the acceptance
+        // criteria — the shape that actually makes an agent succeed — runs well
+        // past that, and the rejection arrived only after it had been written.
+        let spec = "# Goal\nBuild a small but complete Python application.\n\n\
+             ## Architecture Requirements\nUse separate modules with clear \
+             responsibilities. models.py defines the Task model. storage.py handles \
+             persistence. queue.py contains task queue behavior. executor.py handles \
+             task execution. main.py implements the CLI.\n\n"
+            .repeat(24);
+        assert!(
+            spec.len() > 4 * 1024,
+            "fixture must exceed the old cap to prove anything ({} bytes)",
+            spec.len()
+        );
+        assert!(
+            spec.len() <= MAX_GOAL_BYTES,
+            "a written-out spec of {} bytes must fit the {MAX_GOAL_BYTES} byte limit",
+            spec.len()
+        );
+    }
+
+    #[test]
+    fn an_oversize_goal_is_told_how_far_over_it_is() {
+        let over = "x".repeat(MAX_GOAL_BYTES + 500);
+        let message = oversize_text_message("goal", &over);
+        assert!(message.contains(&over.len().to_string()), "{message}");
+        assert!(
+            message.contains("500"),
+            "should name the overshoot: {message}"
+        );
+        assert_eq!(oversize_text_message("goal", ""), "goal cannot be empty");
+    }
 
     #[test]
     fn browse_lists_only_child_directories_sorted_and_excludes_files() {
