@@ -1434,26 +1434,37 @@ fn validate_shell_command(command: String) -> Result<Action, String> {
         )
         .into());
     }
-    // `%%VAR` is batch-FILE syntax. This lane runs `cmd /C`, i.e. the
-    // interactive form, where the loop variable is `%i` — a doubled percent
-    // does NOT expand and, unlike a syntax error, the command SUCCEEDS while
-    // doing the wrong thing. Observed live: a `for /L %i ... do @echo.%%i.txt >
-    // .%%i.txt` created 100 files literally named `.%1.txt`, exit 0, no
-    // failure hint, and the model had no signal that anything was wrong.
-    // Refuse before execution so the mistake is correctable instead of
-    // silently producing garbage on disk.
-    #[cfg(windows)]
-    if command.contains("%%") {
-        return Err(concat!(
-            "`%%` is batch-FILE syntax and does not expand here: run_shell runs `cmd /C`, the ",
-            "interactive form, where the loop variable is a SINGLE percent. Rewrite `%%i` as ",
-            "`%i`, e.g. `for /L %i in (1,1,100) do @echo some text> file%i.txt`. If the work ",
-            "needs several lines or quoting, write_file a .cmd/.ps1 script and run that file ",
-            "instead (a .cmd file is the one place `%%i` is correct)."
-        )
-        .into());
-    }
+    // `%%VAR` is batch-FILE syntax and does not expand under `cmd /C`. Refusing
+    // it was measurably worse than correcting it: the rejection fired three
+    // times with a clear message and a 4B re-emitted the identical command
+    // verbatim each time, so the turn died having done nothing. The correction
+    // is applied at execution and DISCLOSED in the result (see
+    // `correct_batch_percent`) — unlike the python->py rewrite, which changed
+    // what the command DID, this preserves the model's intent exactly and only
+    // fixes notation for the context it misjudged.
     Ok(Action::RunShell { command })
+}
+
+/// Rewrite batch-file `%%VAR` to the `%VAR` that `cmd /C` actually expands,
+/// returning `None` when the command must be left alone.
+///
+/// Left alone when the command AUTHORS a batch file (redirects into `.cmd` or
+/// `.bat`): there the `%%` is file CONTENT and genuinely correct, so rewriting
+/// it would corrupt the script the model is writing.
+#[cfg(windows)]
+fn correct_batch_percent(command: &str) -> Option<String> {
+    if !command.contains("%%") {
+        return None;
+    }
+    let lowered = command.to_ascii_lowercase();
+    let authors_batch_file = lowered.split('>').skip(1).any(|tail| {
+        let target = tail.split_whitespace().next().unwrap_or("");
+        target.ends_with(".cmd") || target.ends_with(".bat")
+    });
+    if authors_batch_file {
+        return None;
+    }
+    Some(command.replace("%%", "%"))
 }
 
 /// Validate a parsed tool call against the schema + sandbox. Returns a typed
@@ -2753,6 +2764,13 @@ fn partial_output_text(stdout: &SharedCapture, stderr: &SharedCapture) -> String
 /// the readers stream into bounded shared buffers and the wait loop snapshots
 /// them after a short, growth-aware drain window.
 fn run_shell_cancellable(sandbox: &Sandbox, command: &str, cancel: &AtomicBool) -> ToolOutcome {
+    // Correct batch-file `%%VAR` to the `%VAR` cmd /C expands, and DISCLOSE it:
+    // the model must never believe it ran bytes it did not. Silent correction is
+    // how the python->py rewrite fabricated verification.
+    #[cfg(windows)]
+    let corrected = correct_batch_percent(command);
+    #[cfg(windows)]
+    let command: &str = corrected.as_deref().unwrap_or(command);
     // Platform shell with a timeout: `/bin/sh -c <command>` on Unix, `cmd /C
     // <command>` on Windows. The cwd-pin and OS-level confinement are applied by
     // the shell-sandbox layer (Task 1), which fails closed when the configured
@@ -2938,6 +2956,14 @@ fn run_shell_cancellable(sandbox: &Sandbox, command: &str, cancel: &AtomicBool) 
     let stderr_bytes = stderr_cap.lock().map(|c| c.snapshot()).unwrap_or_default();
 
     let mut text = String::new();
+    #[cfg(windows)]
+    if corrected.is_some() {
+        text.push_str(&format!(
+            "[corrected: `%%` is batch-FILE syntax; this shell is `cmd /C`, so it ran as \
+             `{command}`. Use a SINGLE percent here, or write_file a .cmd script when you \
+             need `%%`.]\n"
+        ));
+    }
     let code = status.code().unwrap_or(-1);
     text.push_str(&format!("exit: {code}\n"));
     let stdout = clip(&String::from_utf8_lossy(&stdout_bytes));
@@ -5287,33 +5313,69 @@ mod tests {
     /// `%%i` in its body created 100 files literally named `.%1.txt` with exit
     /// 0, so no failure hint could fire and the model kept going on a false
     /// premise. Refuse it up front with the single-percent correction.
+    /// `%%VAR` is batch-FILE syntax that `cmd /C` does not expand, so a loop
+    /// using it succeeds while writing garbage (observed live: 100 files named
+    /// `.%1.txt`). REFUSING it was worse than correcting it — the rejection
+    /// fired three times with a clear message and the model re-emitted the
+    /// identical command each time, so the turn died having done nothing.
+    /// Correct the notation, run what was meant, and DISCLOSE the change.
     #[cfg(windows)]
     #[test]
-    fn batch_file_percent_syntax_is_refused_before_it_writes_garbage() {
+    fn batch_file_percent_is_corrected_and_disclosed() {
         let dir = tempfile::tempdir().unwrap();
-        let sb = sandbox(dir.path());
-        let error = match validate(
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(20))
+            .unwrap()
+            .with_shell_mode(ShellSandbox::Unrestricted);
+        let out = validate(
             &call(
                 "run_shell",
-                json!({"command":"for /L %i in (1,1,100) do @echo.%%i.txt > .%%i.txt"}),
-            ),
-            &sb,
-        ) {
-            Ok(_) => panic!("batch-file percent syntax must not reach cmd /C"),
-            Err(error) => error,
-        };
-        assert!(error.contains("batch-FILE syntax"), "{error}");
-        assert!(error.contains("SINGLE percent"), "{error}");
-        assert!(error.contains("for /L %i in (1,1,100)"), "{error}");
-        // The correct single-percent form still runs.
-        assert!(validate(
-            &call(
-                "run_shell",
-                json!({"command":"for /L %i in (1,1,3) do @echo hi> file%i.txt"}),
+                json!({"command":"for /L %%i in (1,1,3) do @echo joke%%i> file%%i.txt"}),
             ),
             &sb,
         )
-        .is_ok());
+        .expect("the call must run, not be refused")
+        .execute(&sb);
+        let text = out.text().to_string();
+        assert!(
+            text.contains("corrected:") && text.contains("batch-FILE syntax"),
+            "the substitution must be disclosed to the model: {text}"
+        );
+        // The corrected command must actually have expanded the loop variable.
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "file1.txt"),
+            "expected expanded names, got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains('%')),
+            "no literal percent may survive: {names:?}"
+        );
+    }
+
+    /// A command AUTHORING a batch file is the one place `%%` is correct, and
+    /// rewriting it would corrupt the script being written.
+    #[cfg(windows)]
+    #[test]
+    fn percent_correction_skips_a_command_that_writes_a_batch_file() {
+        assert_eq!(
+            super::correct_batch_percent("for /L %%i in (1,1,3) do @echo %%i> out.txt"),
+            Some("for /L %i in (1,1,3) do @echo %i> out.txt".to_string())
+        );
+        // Redirecting into a .cmd/.bat means the `%%` is file CONTENT.
+        assert_eq!(
+            super::correct_batch_percent("echo for /L %%i in (1,1,3) do @echo %%i > build.cmd"),
+            None
+        );
+        assert_eq!(
+            super::correct_batch_percent("echo @echo %%A > run.bat"),
+            None
+        );
+        // Nothing to do without a doubled percent.
+        assert_eq!(super::correct_batch_percent("echo hi> a.txt"), None);
     }
 
     #[test]
