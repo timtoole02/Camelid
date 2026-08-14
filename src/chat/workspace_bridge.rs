@@ -454,6 +454,19 @@ impl WorkspaceBridgeControl {
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Release);
     }
+
+    /// The approval this turn is currently parked on, if any.
+    ///
+    /// Set before the request event is published and cleared on decision,
+    /// timeout or cancel (`WorkspaceApprover::approve`), so it is the exact
+    /// liveness test for whether a replayed approval prompt is still
+    /// actionable — `try_decide` above refuses any other id.
+    pub fn pending_approval_id(&self) -> Option<String> {
+        self.pending_approval
+            .lock()
+            .ok()
+            .and_then(|pending| pending.clone())
+    }
 }
 
 pub(crate) fn bridge(capacity: usize) -> (WorkspaceBridgeWorker, WorkspaceBridgeClient) {

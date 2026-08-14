@@ -898,6 +898,9 @@ export default function CodeWorkspace({
   const accessMenuRef = useRef(null)
   const stickToBottomRef = useRef(true)
   const changesTimerRef = useRef(null)
+  // Highest session-scoped sequence this page has applied. Sequences are
+  // monotonic, so a replay after a reconnect deduplicates on them alone.
+  const lastSequenceRef = useRef(0)
   // A delta is one generated token. Dispatching each one is one full feed
   // render per token, and the agent's event channel blocks on this consumer, so
   // the render loop is backpressure on the model's decode loop. Deltas coalesce
@@ -1022,6 +1025,28 @@ export default function CodeWorkspace({
           setStartedAt(Number(next.started_at_ms) || Date.now())
           setClock(Date.now())
           getWorkspaceChanges(apiBase, next.id).then(setChanges).catch(() => {})
+          // Re-attach, do not just watch. The server keeps an unwatched run
+          // alive for a bounded window and ends it if no stream comes back, so
+          // adopting the session without reopening /events would still lose the
+          // turn — just ninety seconds later.
+          //
+          // Order matters three ways. `thread.restored` REPLACES the event list,
+          // so it has to land before any live event. Setting `session` above
+          // permanently disables the restore effect at :1139-1146, so this is
+          // now the only place those turns come back. And the live turn's own
+          // prompt is not in the store yet, so it is re-seeded from the
+          // snapshot's task or the transcript shows an answer with no question.
+          const restored = await getWorkspaceThread(apiBase, next.workspace || '', next.id).catch(() => null)
+          if (restored) {
+            dispatch({ event: 'thread.restored', turns: restored.turns, turnCount: restored.thread.turn_count })
+          }
+          if (next.task) dispatch({ event: 'turn.user', content: String(next.task) })
+          if (!eventSourceRef.current) {
+            // A re-attach after a reload has no cursor of its own, so it asks
+            // for the whole current turn: `resume` with the cursor still at 0.
+            lastSequenceRef.current = 0
+            openEventStream(next, true)
+          }
         }
       } catch (error) {
         if (error?.name !== 'AbortError') {
@@ -1130,7 +1155,9 @@ export default function CodeWorkspace({
 
   // App owns the rail actions that remount this component, and a remount runs
   // the unmount cleanup below — a real server-side cancel. It has to know a turn
-  // is live so it can ask before ending one.
+  // is live so it can ask before ending one. Note the asymmetry with a browser
+  // refresh, which no longer ends anything: this cancel is a DELIBERATE stop
+  // behind App's confirm dialog, not a consequence of losing a socket.
   useEffect(() => {
     onRunningChange?.(running)
     return () => onRunningChange?.(false)
@@ -1185,14 +1212,61 @@ export default function CodeWorkspace({
     dispatch({ event: 'model.delta', content })
   }
 
-  const openEventStream = (created) => {
+  // `resume` is true ONLY when re-attaching to a turn this page was already
+  // following. Everything else — a new session, a follow-up turn — starts the
+  // dedupe cursor over.
+  //
+  // The distinction is load-bearing and not merely tidy. Dedupe drops anything
+  // at or below the cursor, so carrying a cursor into a stream that numbers
+  // independently of the last one swallows the whole turn. The server now
+  // allocates session-scoped monotonic sequences and would not do that, but a
+  // client that only works while the server keeps that discipline is a client
+  // that breaks silently the day it changes, and "silently" here means an empty
+  // transcript for a run that is really executing.
+  const openEventStream = (created, resume = false) => {
+    // A stream this page has stopped reading is exactly what the server's grace
+    // window counts as a live viewer, so there is never more than one.
+    const previous = eventSourceRef.current
+    if (previous) {
+      intentionalClosuresRef.current.add(previous)
+      previous.close()
+    }
     terminalHandledRef.current = false
-    const source = new EventSource(workspaceEndpoint(apiBase, `/${encodeURIComponent(created.id)}/events`))
+    if (!resume) lastSequenceRef.current = 0
+    // 0 asks for the whole current turn, which is what a page that just
+    // reloaded wants. The browser's own reconnect adds Last-Event-ID, which the
+    // server prefers, so an automatic retry resumes exactly where it stopped.
+    const after = lastSequenceRef.current
+    const source = new EventSource(
+      workspaceEndpoint(apiBase, `/${encodeURIComponent(created.id)}/events?after=${after}`),
+    )
     eventSourceRef.current = source
+    const closeStream = () => {
+      intentionalClosuresRef.current.add(source)
+      source.close()
+      if (eventSourceRef.current === source) eventSourceRef.current = null
+    }
+    // The server's definitive end-of-response marker. EventSource reconnects
+    // after ANY close and cannot see the status line, so without acting on this
+    // a reader that attached to an already-settled turn reconnects forever.
+    source.addEventListener('workspace.closed', () => {
+      if (eventSourceRef.current !== source) return
+      closeStream()
+      if (!terminalHandledRef.current) followDetachedSession(created)
+    })
     source.addEventListener('workspace', (message) => {
       if (eventSourceRef.current !== source) return
       try {
         const envelope = JSON.parse(message.data)
+        const sequence = Number(envelope.sequence) || 0
+        if (sequence && sequence <= lastSequenceRef.current) return
+        if (sequence) lastSequenceRef.current = sequence
+        if (envelope.replay_gap) {
+          dispatch({
+            event: 'session.notice',
+            content: 'Reconnected to a turn that had already run past what Camelid keeps in memory, so its earliest steps are not shown here. The files it changed are in Changes, and the full record is saved with the session.',
+          })
+        }
         if (envelope.event === 'model.delta') {
           deltaBufferRef.current += String(envelope.content || '')
           if (deltaFrameRef.current === null) deltaFrameRef.current = window.requestAnimationFrame(flushDeltas)
@@ -1215,27 +1289,23 @@ export default function CodeWorkspace({
           }
           refreshChanges(created.id)
           signalHistoryChanged()
-          intentionalClosuresRef.current.add(source)
-          source.close()
-          eventSourceRef.current = null
         }
       } catch {
         dispatch({ event: 'session.error', message: 'Camelid returned an unreadable Code-mode event.' })
-        source.close()
-        eventSourceRef.current = null
+        closeStream()
       }
     })
     source.onerror = () => {
       if (intentionalClosuresRef.current.has(source) || eventSourceRef.current !== source) return
-      // The server's /events claim is one-shot: an EventSource that reconnects
-      // after any blip gets a 409, which is fatal to the EventSource. Closing it
-      // here keeps that 409 out of the picture, but it does not save the run —
-      // the response carries a cancel-on-drop guard, so losing the stream
-      // cancels the turn server-side. All that is left to do is find out what it
-      // managed to finish first.
-      intentionalClosuresRef.current.add(source)
-      source.close()
-      eventSourceRef.current = null
+      // A dropped stream no longer ends the run: the turn is decoupled from the
+      // socket and keeps going with nobody attached. So let EventSource do what
+      // it does — reconnect, carrying Last-Event-ID, and pick the transcript up
+      // where this reader stopped. Only a stream that cannot come back at all
+      // falls through to the status poller. Do NOT bound the retries: giving up
+      // on a live run means no approval card, and an approval nobody can answer
+      // self-aborts the turn five minutes later.
+      if (source.readyState === EventSource.CONNECTING) return
+      closeStream()
       followDetachedSession(created)
     }
   }
@@ -1243,20 +1313,25 @@ export default function CodeWorkspace({
   // The outcome the SERVER recorded for the turn, which is the only account of a
   // run whose event stream we lost. It is written before the session leaves its
   // running state, and a Code session id is also its thread id.
-  const readRecordedOutcome = async (created) => {
+  // The outcome the SERVER recorded, read without a workspace-path round trip:
+  // the activity snapshot already carries `terminal_outcome` and is served by
+  // /activity with no arguments. Returning null rather than 'aborted' matters
+  // now — after this change a stream we lost usually belongs to a turn that
+  // ANSWERED, and one failed fetch must not stamp it "Stopped".
+  const readRecordedOutcome = async () => {
     try {
-      const restored = await getWorkspaceThread(apiBase, workspacePath.trim(), created.id)
-      const last = Array.isArray(restored?.turns) ? restored.turns.at(-1) : null
-      return String(last?.terminal_outcome || 'aborted')
+      const snapshot = await getWorkspaceActivity(apiBase)
+      const outcome = snapshot?.terminal_outcome
+      return outcome ? String(outcome) : null
     } catch {
-      return 'aborted'
+      return null
     }
   }
 
   const followDetachedSession = async (created) => {
     dispatch({
       event: 'session.notice',
-      content: 'Lost the live activity stream. Camelid stops a run whose stream drops, so this turn is ending — reading the outcome it recorded.',
+      content: 'Lost the live activity stream. The turn keeps running on the server — following its recorded status until it ends.',
     })
     try {
       await waitForWorkspaceSessionTerminal(apiBase, created.id, {
@@ -1264,7 +1339,7 @@ export default function CodeWorkspace({
         pollMs: DETACHED_FOLLOW_POLL_MS,
       })
       terminalHandledRef.current = true
-      dispatch({ event: 'session.finished', outcome: await readRecordedOutcome(created) })
+      dispatch({ event: 'session.finished', outcome: (await readRecordedOutcome()) || 'answered' })
     } catch (error) {
       terminalHandledRef.current = true
       dispatch({ event: 'session.error', message: error.message })

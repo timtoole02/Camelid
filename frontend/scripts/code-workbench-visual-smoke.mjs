@@ -113,19 +113,19 @@ try {
         this.emitAfter(40, { sequence: 2, event: 'turn.started', turn_index: 0 })
         this.emitAfter(45, { sequence: 3, event: 'agent.updated', agent_id: 'main', parent_id: null, label: 'Camelid', status: 'running', task: 'Build an interactive coding agent experience', detail: 'Inspecting the workspace' })
         this.emitAfter(50, { sequence: 4, event: 'agent.updated', agent_id: 'child-ui', parent_id: 'main', label: 'ui-specialist', status: 'running', task: 'Implement the right-side agent activity panel', detail: 'Delegated agent is working' })
-        this.emitAfter(70, { sequence: 3, event: 'model.delta', content: 'I will inspect the existing component before changing it.' })
+        this.emitAfter(70, { sequence: 5, event: 'model.delta', content: 'I will inspect the existing component before changing it.' })
         // Qwen/Hermes models stream their tool call as ordinary tokens. It is
         // syntax, not prose, and must never reach the visible transcript.
-        this.emitAfter(72, { sequence: 3, event: 'model.delta', content: '\n<tool_call>\n{"name":"list_dir","arguments":{"path":"/x","offset":0,"limit":200}}\n</tool_call>' })
+        this.emitAfter(72, { sequence: 6, event: 'model.delta', content: '\n<tool_call>\n{"name":"list_dir","arguments":{"path":"/x","offset":0,"limit":200}}\n</tool_call>' })
         // The other shape seen live: no wrapper tag, just the call itself.
-        this.emitAfter(74, { sequence: 3, event: 'model.delta', content: '\nlist_dir({"path": "/x/workspace", "limit": 200, "offset": 0})' })
-        this.emitAfter(90, { sequence: 4, event: 'tool.call', detail: 'update_plan(3 steps)' })
-        this.emitAfter(110, { sequence: 5, event: 'tool.result', tool: 'update_plan', outcome: 'ok', content: 'plan updated\n[x] Inspect the existing Code workspace\n[~] Build the interactive agent component\n[ ] Run focused regression tests' })
-        this.emitAfter(140, { sequence: 6, event: 'tool.call', detail: 'read_file(frontend/src/App.jsx, offset=0, limit=220)' })
-        this.emitAfter(170, { sequence: 7, event: 'tool.result', tool: 'read_file', outcome: 'ok', content: 'import App from \"./App\"\\n// existing application shell\\n' })
-        this.emitAfter(200, { sequence: 8, event: 'tool.call', detail: 'write_file(frontend/src/components/InteractiveAgent.jsx, 1480 bytes)' })
+        this.emitAfter(74, { sequence: 7, event: 'model.delta', content: '\nlist_dir({"path": "/x/workspace", "limit": 200, "offset": 0})' })
+        this.emitAfter(90, { sequence: 8, event: 'tool.call', detail: 'update_plan(3 steps)' })
+        this.emitAfter(110, { sequence: 9, event: 'tool.result', tool: 'update_plan', outcome: 'ok', content: 'plan updated\n[x] Inspect the existing Code workspace\n[~] Build the interactive agent component\n[ ] Run focused regression tests' })
+        this.emitAfter(140, { sequence: 10, event: 'tool.call', detail: 'read_file(frontend/src/App.jsx, offset=0, limit=220)' })
+        this.emitAfter(170, { sequence: 11, event: 'tool.result', tool: 'read_file', outcome: 'ok', content: 'import App from \"./App\"\\n// existing application shell\\n' })
+        this.emitAfter(200, { sequence: 12, event: 'tool.call', detail: 'write_file(frontend/src/components/InteractiveAgent.jsx, 1480 bytes)' })
         this.emitAfter(230, {
-          sequence: 9,
+          sequence: 13,
           event: 'approval.required',
           approval_id: 'approval-1',
           tool: 'write_file',
@@ -152,15 +152,19 @@ try {
     globalThis.EventSource = MockEventSource
     globalThis.__finishCodeTurn = () => {
       const source = globalThis.__codeEventSource
-      source?.emit({ sequence: 10, event: 'tool.result', tool: 'write_file', outcome: 'ok', content: 'Created frontend/src/components/InteractiveAgent.jsx' })
-      source?.emit({ sequence: 11, event: 'model.answer', content: 'Implemented the interactive agent component and kept the change inside the selected workspace. The new component is ready for review.' })
-      source?.emit({ sequence: 12, event: 'model.timing', total_ms: 2480, ttft_ms: 165, output_tokens: 92 })
-      source?.emit({ sequence: 13, event: 'session.finished', outcome: 'answered' })
+      source?.emit({ sequence: 14, event: 'tool.result', tool: 'write_file', outcome: 'ok', content: 'Created frontend/src/components/InteractiveAgent.jsx' })
+      source?.emit({ sequence: 15, event: 'model.answer', content: 'Implemented the interactive agent component and kept the change inside the selected workspace. The new component is ready for review.' })
+      source?.emit({ sequence: 16, event: 'model.timing', total_ms: 2480, ttft_ms: 165, output_tokens: 92 })
+      source?.emit({ sequence: 17, event: 'session.finished', outcome: 'answered' })
     }
     // The terminal event a Stop really produces: the still-open stream delivers
     // the server's own `aborted` before the DELETE poll settles.
     globalThis.__abortCodeTurn = () => {
-      globalThis.__codeEventSource?.emit({ sequence: 5, event: 'session.finished', outcome: 'aborted' })
+      // Sequences are session-scoped and monotonic now, and the client drops
+      // anything at or below what it has already applied — so a terminal must
+      // be numbered ABOVE the flood below (100..324) or it is deduped away and
+      // the turn never visibly ends.
+      globalThis.__codeEventSource?.emit({ sequence: 1_000, event: 'session.finished', outcome: 'aborted' })
     }
     // Pushes the oldest entries out of the client's 240-entry activity ring.
     globalThis.__floodCodeEvents = (count) => {

@@ -1,5 +1,7 @@
+use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use axum::extract::{Path as AxumPath, Query, State};
@@ -25,17 +27,33 @@ use crate::chat::workspace_memory::{
 };
 
 // Every generated token is one `model.delta` through this bounded channel, and
-// the send BLOCKS, so a shallow backlog makes the browser's render loop
-// backpressure on decode (the old 128 did exactly that).
+// the send BLOCKS. It used to be the browser's render loop that could throttle
+// decode through it; the forwarder on the other end now drains into a retained
+// session feed and never waits on a socket, so this is the worker's run-ahead
+// against a busy forwarder and nothing more. A browser MUST NOT be able to
+// backpressure decode on a turn it no longer owns.
 //
-// Sized for UNKNOWN hardware, not this dev box: at 10-30 tok/s this absorbs
-// roughly 30-100s of decode before it can ever throttle, while the worst-case
-// memory it can pin is bounded — 1024 x the per-observation ceiling
-// (`WEB_CODE_OBSERVATION_LIMIT`) rather than 1024 x "whatever the workspace
-// printed". Both halves are load-bearing: a count-based bound is only a real
-// bound once the item size has one too.
+// Kept deep anyway, because the worst-case memory it can pin is bounded — 1024 x
+// the per-observation ceiling (`WEB_CODE_OBSERVATION_LIMIT`, tools.rs:292)
+// rather than 1024 x "whatever the workspace printed". Both halves are
+// load-bearing: a count-based bound is only a real bound once the item size has
+// one too.
 const EVENT_BACKLOG: usize = 1024;
-const EVENT_STREAM_BUFFER: usize = 1024;
+/// Retained transcript depth, split by what a returning reader actually needs.
+///
+/// Structural entries — tool calls, results, approvals, notices, agent updates,
+/// answers — are the transcript that EXPLAINS a run, so they are retained whole.
+/// The browser renders at most `MAX_WORKSPACE_ACTIVITY_EVENTS` (240) of them, so
+/// this is already deeper than any client will show, and the worst case is the
+/// same bounded product as `EVENT_BACKLOG` above.
+const EVENT_HISTORY_STRUCTURAL: usize = 1024;
+/// Streamed model text is kept only deep enough for a reader that is LAGGING,
+/// not one that was away: the UI shows a 2000-character tail of the current step
+/// (`LIVE_TAIL_CHARS`) and nothing of earlier ones, and the finished text
+/// arrives again as `model.answer`. Evicting these is therefore not a hole in
+/// the transcript, which is why they get their own budget instead of pushing
+/// tool calls out of history one token at a time.
+const EVENT_HISTORY_DELTAS: usize = 512;
 const DEFAULT_MAX_STEPS: usize = 12;
 const MAX_STEPS: usize = 32;
 // A coding step routinely carries a whole file in a `write_file` argument. At
@@ -50,7 +68,44 @@ const MAX_TOKENS: u32 = 8192;
 // the context budget and auto-compaction already enforce downstream with real
 // numbers. Keep the hard cap generous and let that machinery do the sizing.
 const MAX_GOAL_BYTES: usize = 64 * 1024;
-const EVENT_CLAIM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long a turn may run before ANY `/events` response has ever attached to
+/// it. This is the old `EVENT_CLAIM_TIMEOUT`, kept at its old value and its old
+/// meaning: a POST whose GET never arrived is almost always a request that was
+/// abandoned in flight, and 30 seconds is long enough to tell that apart from a
+/// slow page load. It matters more than it used to, because the turn now starts
+/// at POST rather than at GET, so those 30 seconds are real GPU.
+const FIRST_ATTACH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long a turn may run with nobody actually watching it.
+///
+/// This is the entire replacement for cancel-on-disconnect, so it is sized
+/// against what it protects rather than against the network. A refresh
+/// re-attaches in about a second (bundle parse, mount, one 1s activity poll);
+/// a browser relaunch takes tens of seconds; a resumed laptop does not spend
+/// this window at all, because it is measured on a monotonic clock that macOS
+/// stops during sleep. What it bounds is the tab that closed for good: at most
+/// this much exclusive decode on a single-worker host, after which the turn is
+/// cancelled exactly the way Stop cancels it.
+///
+/// The asymmetry sets the number. Ending a turn whose browser is two seconds
+/// from coming back throws away minutes of GPU; waiting for one that never
+/// comes back costs 90 seconds. Deliberate departures do not arrive here at
+/// all — in-app navigation, Stop and Reset each cancel explicitly through
+/// DELETE (CodeWorkspace.jsx:1149, :1355, :1410).
+const ABANDON_GRACE: std::time::Duration = std::time::Duration::from_secs(90);
+/// The unconditional ceiling on one turn, watched or not.
+///
+/// It exists because nothing else bounds a Code turn in wall-clock terms:
+/// `workspace_max_steps` returns 0 for Code (:86-89), 0 means no step cap
+/// (agent.rs:326, :979), and Code gets `set_stream_cancel` with no model-step
+/// deadline (workspace_bridge.rs:818-822). Without this, a degenerate
+/// repeating generate with a browser glued to it holds the machine's only
+/// decode slot forever. Generous on purpose — a legitimate coding turn runs
+/// 5-20 minutes, so this is 6-24x the real workload and is a runaway backstop,
+/// not a policy.
+const TURN_WALL_CLOCK_CEILING: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
+/// Supervisor granularity. Deliberately coarse: the deadlines are minutes and
+/// one tick costs a clock read plus four atomic loads.
+const SUPERVISOR_TICK: std::time::Duration = std::time::Duration::from_secs(5);
 const AUTO_COMPACT_TRIGGER_PERCENT: u32 = 75;
 
 /// Reject an empty or over-long goal/message with the numbers, not just the rule.
@@ -155,6 +210,8 @@ struct ActiveWorkspaceSession {
     control: StdMutex<Option<WorkspaceBridgeControl>>,
     current_turn: StdMutex<Option<(String, u32)>>,
     activity: StdMutex<WorkspaceActivitySnapshot>,
+    feed: SessionFeed,
+    watch: TurnWatch,
 }
 
 enum InstallTurn {
@@ -170,7 +227,6 @@ enum TurnCompletion {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkspaceSessionState {
-    WaitingForEvents,
     Running,
     Idle,
     Cancelling,
@@ -414,6 +470,159 @@ impl WorkspaceActivitySnapshot {
         }
     }
 }
+/// Ordered replay history for one session, plus the wake every attached stream
+/// waits on.
+///
+/// This is what makes `/events` an observer instead of an owner. The forwarder
+/// writes here once; zero or more responses read from it at their own pace.
+/// Nothing a reader does is visible to the writer, so no reader can end a turn.
+/// That property IS the fix — the guard that used to sit on the response was
+/// only ever a proxy for "is anyone still interested", and it answered a
+/// question about a socket with a decision about a run.
+struct SessionFeed {
+    entries: StdMutex<FeedEntries>,
+    /// Level-triggered wake carrying the newest sequence. `watch` and not
+    /// `Notify`: it cannot lose a wakeup between a reader's drain and its next
+    /// await, and it wakes every subscriber rather than one of them.
+    tip: tokio::sync::watch::Sender<u64>,
+}
+
+impl Default for SessionFeed {
+    fn default() -> Self {
+        Self {
+            entries: StdMutex::new(FeedEntries {
+                first_structural: u64::MAX,
+                ..FeedEntries::default()
+            }),
+            // The initial receiver is dropped on purpose: subscribers come and
+            // go, and `send_replace` publishes whether or not any exist.
+            tip: tokio::sync::watch::channel(0).0,
+        }
+    }
+}
+
+#[derive(Default)]
+struct FeedEntries {
+    /// Newest sequence handed out. Session-scoped and monotonic ACROSS turns, so
+    /// a cursor a browser kept over a refresh still means the same thing
+    /// afterwards. The old counter was per stream and restarted at 0 on every
+    /// claim, which is why the client had to key its rendering on an arrival
+    /// counter instead (CodeWorkspace.jsx:176-180).
+    last: u64,
+    /// Sequence the CURRENT turn started at. A reader that arrives without a
+    /// cursor resumes from here, not from 0 — replaying a previous turn's
+    /// `session.finished` into a live page makes the UI report a running turn
+    /// as complete and then close the stream it just opened.
+    turn_start: u64,
+    /// The transcript: everything except streamed model text.
+    structural: VecDeque<(u64, WorkspaceEvent)>,
+    /// Streamed model text, on its own eviction budget.
+    deltas: VecDeque<(u64, WorkspaceEvent)>,
+    /// Oldest structural sequence still retained. Below this a reader has a real
+    /// gap and is TOLD so; a transcript with a silent hole is worse than an
+    /// admittedly short one.
+    first_structural: u64,
+}
+
+impl FeedEntries {
+    /// Mark where a newly installed turn begins. The sequence and the retained
+    /// entries deliberately survive: a follow-up turn continues the same feed,
+    /// so a client that kept its cursor across the boundary resumes without
+    /// re-rendering what it already showed.
+    fn begin_turn(&mut self) {
+        self.turn_start = self.last;
+    }
+
+    fn record(&mut self, event: &WorkspaceEvent) -> u64 {
+        self.last += 1;
+        if matches!(event, WorkspaceEvent::ModelDelta { .. }) {
+            self.deltas.push_back((self.last, event.clone()));
+            while self.deltas.len() > EVENT_HISTORY_DELTAS {
+                self.deltas.pop_front();
+            }
+        } else {
+            self.structural.push_back((self.last, event.clone()));
+            while self.structural.len() > EVENT_HISTORY_STRUCTURAL {
+                self.structural.pop_front();
+            }
+            self.first_structural = self
+                .structural
+                .front()
+                .map_or(u64::MAX, |(sequence, _)| *sequence);
+        }
+        self.last
+    }
+
+    /// Everything after `after`, in sequence order, and whether that range is
+    /// actually complete. Two sorted deques merged by sequence — the split is an
+    /// eviction policy, never an ordering one.
+    fn since(&self, after: u64) -> (Vec<(u64, WorkspaceEvent)>, bool) {
+        let complete =
+            self.structural.is_empty() || after.saturating_add(1) >= self.first_structural;
+        let structural = self
+            .structural
+            .partition_point(|(sequence, _)| *sequence <= after);
+        let deltas = self
+            .deltas
+            .partition_point(|(sequence, _)| *sequence <= after);
+        let mut merged: Vec<(u64, WorkspaceEvent)> = self
+            .structural
+            .iter()
+            .skip(structural)
+            .chain(self.deltas.iter().skip(deltas))
+            .cloned()
+            .collect();
+        merged.sort_by_key(|(sequence, _)| *sequence);
+        (merged, complete)
+    }
+}
+
+/// Everything the supervisor reads to decide whether a turn is still wanted.
+///
+/// Atomics rather than a mutex on purpose. This is read on a 5-second tick and
+/// written on every delivered event, and — more to the point — a reaper whose
+/// inputs can be poisoned by an unrelated panic is a reaper that stops reaping.
+/// Nothing here is ever left at its `Default`; `begin` stamps every clock.
+#[derive(Default)]
+struct TurnWatch {
+    /// How many `/events` responses are attached right now.
+    observers: AtomicUsize,
+    /// Whether any `/events` response has ever attached to the current turn.
+    ever_observed: AtomicBool,
+    /// Monotonic ms at which `observers` last fell to zero.
+    unobserved_since: AtomicU64,
+    /// Highest feed sequence any attached response has actually written out.
+    ///
+    /// `observers > 0` proves a subscription EXISTS; only this proves one is
+    /// consuming. It is the port of the `try_send`-on-`Full` bound that used to
+    /// end a turn whose client stopped draining — a case a half-open TCP peer,
+    /// a suspended renderer or a stale tab reconnect-looping across an upgrade
+    /// can sustain indefinitely while the refcount stays at one.
+    delivered: AtomicU64,
+    /// Monotonic ms at which `delivered` last advanced.
+    delivered_at: AtomicU64,
+    /// Monotonic ms at which the current turn was installed.
+    turn_started: AtomicU64,
+}
+
+impl TurnWatch {
+    fn begin(&self) {
+        let now = monotonic_millis();
+        self.observers.store(0, Ordering::Release);
+        self.ever_observed.store(false, Ordering::Release);
+        self.unobserved_since.store(now, Ordering::Release);
+        self.delivered.store(0, Ordering::Release);
+        self.delivered_at.store(now, Ordering::Release);
+        self.turn_started.store(now, Ordering::Release);
+    }
+
+    fn note_delivered(&self, sequence: u64) {
+        if self.delivered.fetch_max(sequence, Ordering::AcqRel) < sequence {
+            self.delivered_at
+                .store(monotonic_millis(), Ordering::Release);
+        }
+    }
+}
 
 fn terminal_activity_detail(outcome: &str) -> &'static str {
     match outcome {
@@ -433,11 +642,26 @@ fn now_epoch_millis() -> u64 {
         .as_millis()
         .min(u128::from(u64::MAX)) as u64
 }
+/// Milliseconds since the first call, on a clock that only moves forward.
+///
+/// Every reaper deadline is measured with this and never with
+/// `now_epoch_millis`. `SystemTime` is subject to NTP steps and manual clock
+/// changes: a backwards correction pins every elapsed-time subtraction at zero,
+/// which would silently disable the only thing that ends an abandoned turn, and
+/// a forward jump would kill healthy ones. On macOS this also excludes system
+/// suspend, so a closed lid pauses the grace window rather than spending it.
+fn monotonic_millis() -> u64 {
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    ORIGIN
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
 
 impl WorkspaceSessionState {
     fn as_str(self) -> &'static str {
         match self {
-            Self::WaitingForEvents => "waiting_for_events",
             Self::Running => "running",
             Self::Idle => "idle",
             Self::Cancelling => "cancelling",
@@ -447,28 +671,21 @@ impl WorkspaceSessionState {
     }
 
     fn blocks_model_transition(self) -> bool {
-        matches!(
-            self,
-            Self::WaitingForEvents | Self::Running | Self::Cancelling
-        )
+        matches!(self, Self::Running | Self::Cancelling)
     }
 
     fn accepts_new_turn(self) -> bool {
         matches!(self, Self::Idle | Self::Cancelled | Self::Failed)
     }
 
+    /// `WaitingForEvents` is gone because nothing waits for events any more: a
+    /// turn is running before the POST response is written. `Cancelling` keeps
+    /// `blocks_model_transition` true until the worker has actually exited,
+    /// which is what makes an unload or replace during teardown fail closed.
     fn after_cancel_request(self) -> Self {
         match self {
-            Self::WaitingForEvents => Self::Cancelled,
             Self::Running => Self::Cancelling,
             Self::Idle => Self::Cancelled,
-            other => other,
-        }
-    }
-
-    fn after_events_claimed(self) -> Self {
-        match self {
-            Self::WaitingForEvents => Self::Running,
             other => other,
         }
     }
@@ -498,43 +715,6 @@ impl WorkspaceSessionManager {
 }
 
 impl ActiveWorkspaceSession {
-    fn expire_unclaimed_turn(&self, message_id: &str) -> anyhow::Result<bool> {
-        let (Ok(mut status), Ok(mut current_turn)) = (self.state.lock(), self.current_turn.lock())
-        else {
-            anyhow::bail!("Workspace turn state is unavailable");
-        };
-        if *status != WorkspaceSessionState::WaitingForEvents
-            || current_turn
-                .as_ref()
-                .is_none_or(|(current_id, _)| current_id != message_id)
-        {
-            return Ok(false);
-        }
-        let config = self
-            .run_config
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Workspace turn configuration is unavailable"))?
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Workspace turn configuration is missing"))?;
-        self.memory.append_terminal_turn(
-            &self.id,
-            &config.client_message_id,
-            &config.goal,
-            "",
-            "aborted",
-            &[],
-        )?;
-        if let Some(control) = self.control.lock().ok().and_then(|control| control.clone()) {
-            control.cancel();
-        }
-        if let Ok(mut activity) = self.activity.lock() {
-            activity.apply(&WorkspaceEvent::Finished { outcome: "aborted" });
-        }
-        *status = WorkspaceSessionState::Cancelled;
-        *current_turn = None;
-        Ok(true)
-    }
-
     fn pending_message(&self, client_message_id: &str) -> Option<u32> {
         self.current_turn
             .lock()
@@ -588,12 +768,19 @@ impl ActiveWorkspaceSession {
             .lock()
             .map_err(|_| "activity state is unavailable")?;
         *activity = WorkspaceActivitySnapshot::new(&run_config.goal);
+        if let Ok(mut entries) = self.feed.entries.lock() {
+            entries.begin_turn();
+        }
+        // Every clock the supervisor reads restarts here. A follow-up sent from
+        // a page whose stream is closed gets its own full grace rather than
+        // inheriting however long the session had already sat unwatched.
+        self.watch.begin();
         *current_turn = Some((run_config.client_message_id.clone(), run_config.turn_index));
         *event_slot = Some(events);
         *worker_slot = Some(worker);
         *config_slot = Some(run_config);
         *control_slot = Some(control);
-        *status = WorkspaceSessionState::WaitingForEvents;
+        *status = WorkspaceSessionState::Running;
         Ok(InstallTurn::Installed)
     }
 
@@ -636,6 +823,13 @@ impl ActiveWorkspaceSession {
             "aborted",
             evidence,
         );
+        // Published BEFORE the turn is settled, and through the feed rather than
+        // straight into the activity snapshot. Both halves matter: a reader
+        // breaks out of its loop once `current_turn` is None, so a terminal
+        // published afterwards is never drained; and a terminal that only ever
+        // reaches the snapshot leaves every attached response parked forever on
+        // a `tip` that will never change again.
+        self.publish(&WorkspaceEvent::Finished { outcome: "aborted" });
         let finished = self.finish_turn_if_current(
             &run_config.client_message_id,
             if persisted.is_ok() {
@@ -644,9 +838,6 @@ impl ActiveWorkspaceSession {
                 TurnCompletion::Failed
             },
         );
-        if let Ok(mut activity) = self.activity.lock() {
-            activity.apply(&WorkspaceEvent::Finished { outcome: "aborted" });
-        }
         persisted?;
         Ok(finished)
     }
@@ -656,29 +847,367 @@ impl ActiveWorkspaceSession {
             activity.apply(event);
         }
     }
+    /// The one place an event becomes visible: the pollable snapshot, the replay
+    /// history, and the wake for every attached stream, in that order.
+    fn publish(&self, event: &WorkspaceEvent) {
+        self.record_activity(event);
+        let sequence = match self.feed.entries.lock() {
+            Ok(mut entries) => entries.record(event),
+            // The ring has no invariant a panic could half-break, and an event
+            // that never reaches the feed is an event no reader can ever see.
+            Err(poisoned) => poisoned.into_inner().record(event),
+        };
+        self.feed.tip.send_replace(sequence);
+    }
+
+    /// Fails CLOSED: an unreadable slot is not evidence that this turn is
+    /// someone else's problem, and the supervisor's exit condition is the only
+    /// thing standing between a bug and a pinned GPU.
+    fn owns_turn(&self, message_id: &str) -> bool {
+        match self.current_turn.lock() {
+            Ok(turn) => turn
+                .as_ref()
+                .is_some_and(|(current_id, _)| current_id == message_id),
+            Err(_) => true,
+        }
+    }
+
+    /// Pull the same lever Stop pulls, and mark the session as stopping.
+    ///
+    /// The cancel flag is the ONLY lever that reaps delegated child processes:
+    /// they are torn down by `WorkspaceSubagentTurnGuard::drop`
+    /// (workspace_bridge.rs:373-377), which runs on the worker thread when
+    /// `run_live` returns, and the registry is thread-local so no other thread
+    /// can reach them. Anything that ends a turn without setting this flag
+    /// leaves subagents writing into the workspace.
+    fn request_cancel(&self) {
+        let control = match self.control.lock() {
+            Ok(control) => control.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        if let Some(control) = control {
+            control.cancel();
+        }
+        if let Ok(mut status) = self.state.lock() {
+            *status = status.after_cancel_request();
+        }
+    }
+
+    /// Why this turn should be stopped without anyone asking, if it should.
+    ///
+    /// Three deadlines, all monotonic, all failing closed on unreadable state.
+    /// The middle one is the interesting one: "watched" is not "a response
+    /// object exists", it is "somebody is keeping up". A reader that stops
+    /// consuming while the feed runs ahead is indistinguishable from a reader
+    /// that vanished, and both used to be handled — by killing the turn on the
+    /// spot. Now they buy the same bounded grace as everything else.
+    fn abandonment_reason(&self) -> Option<String> {
+        self.abandonment_reason_at(monotonic_millis())
+    }
+
+    /// `now` is a parameter so the deadlines are testable without sleeping
+    /// through them. `monotonic_millis` counts from the first call in the
+    /// process, so in a test it is a handful of milliseconds and backdating a
+    /// clock saturates at zero — no amount of arithmetic on the stored stamps
+    /// can reach a 30-second deadline. Passing the instant in makes every
+    /// branch below reachable and deterministic.
+    fn abandonment_reason_at(&self, now: u64) -> Option<String> {
+        let ran_for = now.saturating_sub(self.watch.turn_started.load(Ordering::Acquire));
+        if ran_for >= TURN_WALL_CLOCK_CEILING.as_millis() as u64 {
+            return Some(format!(
+                "This turn ran for {} hours without finishing, so Camelid stopped it.",
+                TURN_WALL_CLOCK_CEILING.as_secs() / 3600
+            ));
+        }
+        if !self.watch.ever_observed.load(Ordering::Acquire) {
+            return (ran_for >= FIRST_ATTACH_TIMEOUT.as_millis() as u64).then(|| {
+                "No browser ever attached to this turn, so Camelid stopped it.".to_string()
+            });
+        }
+        let unattended_since = if self.watch.observers.load(Ordering::Acquire) == 0 {
+            self.watch.unobserved_since.load(Ordering::Acquire)
+        } else {
+            let published = match self.feed.entries.lock() {
+                Ok(entries) => entries.last,
+                // Cannot prove anyone is keeping up.
+                Err(_) => u64::MAX,
+            };
+            if published <= self.watch.delivered.load(Ordering::Acquire) {
+                // Nothing to keep up WITH. A silent turn is not the reader's
+                // fault; that case belongs to the ceiling above.
+                return None;
+            }
+            self.watch.delivered_at.load(Ordering::Acquire)
+        };
+        (now.saturating_sub(unattended_since) >= ABANDON_GRACE.as_millis() as u64).then(|| {
+            format!(
+                "No browser watched this turn for {} seconds, so Camelid stopped it.",
+                ABANDON_GRACE.as_secs()
+            )
+        })
+    }
 }
 
-fn arm_event_claim_deadline(session: &Arc<ActiveWorkspaceSession>, message_id: String) {
+/// Start the worker and the event forwarder for the turn just installed.
+///
+/// Called by whoever INSTALLS a turn, never by whoever watches one. That single
+/// move is the decoupling: `/events` no longer starts anything, so there is no
+/// first consumer to lose, no claim to expire, and nothing about a socket
+/// anywhere in a turn's lifetime.
+fn start_turn(session: &Arc<ActiveWorkspaceSession>, message_id: String) {
+    // Armed FIRST, before anything below can bail. The supervisor is the only
+    // thing that can end an unattended turn, and the arm below — a slot that is
+    // unexpectedly empty — is exactly the path where nothing else ever will.
+    supervise_turn(session, message_id.clone());
+
+    let events = session
+        .events
+        .lock()
+        .ok()
+        .and_then(|mut events| events.take());
+    let worker = session
+        .worker
+        .lock()
+        .ok()
+        .and_then(|mut worker| worker.take());
+    let run_config = session
+        .run_config
+        .lock()
+        .ok()
+        .and_then(|mut config| config.take());
+    let control = session
+        .control
+        .lock()
+        .ok()
+        .and_then(|control| control.clone());
+    let (Some(events), Some(worker), Some(run_config), Some(control)) =
+        (events, worker, run_config, control)
+    else {
+        // `install_turn` fills all four under the state lock and this runs once
+        // per install, so this is a broken invariant rather than a caller's
+        // mistake — most plausibly a poisoned slot. Fail the turn loudly instead
+        // of returning: a `Running` session with no worker blocks every model
+        // load, unload and new session for the life of the process.
+        debug_assert!(
+            false,
+            "install_turn fills every turn slot under the state lock"
+        );
+        eprintln!("Workspace turn {message_id} was installed without a worker; failing it");
+        session.publish(&WorkspaceEvent::Error {
+            message: "Camelid could not start this coding turn.".to_string(),
+        });
+        session.finish_turn_if_current(&message_id, TurnCompletion::Failed);
+        return;
+    };
+
+    let persisted_turn = run_config.clone();
+    let worker_session = Arc::clone(session);
+    let worker_turn_id = message_id.clone();
+    let delivery_failed = Arc::clone(&worker.delivery_failed);
+    std::thread::Builder::new()
+        .name("camelid-workspace-agent".to_string())
+        .spawn(move || {
+            let result = run_live(run_config, worker);
+            if result.is_err() || delivery_failed.load(Ordering::Acquire) {
+                let completion = if matches!(result, Ok(LoopEnd::DriverError) | Err(_)) {
+                    TurnCompletion::Failed
+                } else {
+                    TurnCompletion::Idle
+                };
+                worker_session.finish_turn_if_current(&worker_turn_id, completion);
+            }
+        })
+        .expect("spawn Workspace agent thread");
+
+    let forward_control = control;
+    let persist_session = Arc::clone(session);
+    std::thread::Builder::new()
+        .name("camelid-workspace-events".to_string())
+        .spawn(move || {
+            forward_workspace_events(persist_session, events, persisted_turn, forward_control)
+        })
+        .expect("spawn Workspace event forwarder");
+}
+
+/// The only thing that ends an unattended turn.
+///
+/// Socket liveness used to be this rule, which is exactly why a refresh killed a
+/// run. Its replacement has to be bounded and self-healing WITHOUT a socket, so
+/// it is a slow tick over `abandonment_reason`'s three deadlines. Shaped like
+/// the claim deadline it replaces — a detached task holding a `Weak`, re-checking
+/// the turn identity every tick — so it cannot outlive its turn, cannot keep the
+/// session alive, and cannot act on a later one.
+///
+/// It does NOT return after asking once. Cancellation is cooperative: a
+/// `write_file` already dispatched completes, a `run_shell` can sit up to
+/// WEB_CODE_SHELL_TIMEOUT, and `request_cancel` is idempotent. The only exit is
+/// the turn actually going away.
+fn supervise_turn(session: &Arc<ActiveWorkspaceSession>, message_id: String) {
     let session = Arc::downgrade(session);
     tokio::spawn(async move {
-        tokio::time::sleep(EVENT_CLAIM_TIMEOUT).await;
-        let Some(session) = session.upgrade() else {
-            return;
-        };
-        let expiry_session = Arc::clone(&session);
-        let expiry =
-            tokio::task::spawn_blocking(move || expiry_session.expire_unclaimed_turn(&message_id))
-                .await;
-        if let Err(error) = expiry
-            .map_err(anyhow::Error::from)
-            .and_then(|result| result)
-        {
-            eprintln!("Workspace event-claim timeout could not persist the turn: {error}");
-            if let Ok(mut status) = session.state.lock() {
-                *status = WorkspaceSessionState::Failed;
+        let mut announced = false;
+        let mut ticks_since_ask = 0_u32;
+        loop {
+            tokio::time::sleep(SUPERVISOR_TICK).await;
+            let Some(session) = session.upgrade() else {
+                return;
+            };
+            if !session.owns_turn(&message_id) {
+                return;
             }
+            let Some(reason) = session.abandonment_reason() else {
+                continue;
+            };
+            if !announced {
+                announced = true;
+                // Published before the cancel, so a reader still attached — or
+                // one that re-attaches later and replays — is told WHY the turn
+                // ended instead of watching it stop for no stated reason.
+                session.publish(&WorkspaceEvent::Notice { content: reason });
+            } else {
+                ticks_since_ask = ticks_since_ask.saturating_add(1);
+                if ticks_since_ask.is_multiple_of(12) {
+                    eprintln!(
+                        "Workspace turn {message_id} has not stopped {}s after it was reaped",
+                        u64::from(ticks_since_ask) * SUPERVISOR_TICK.as_secs()
+                    );
+                }
+            }
+            session.request_cancel();
         }
     });
+}
+
+fn forward_workspace_events(
+    persist_session: Arc<ActiveWorkspaceSession>,
+    events: std::sync::mpsc::Receiver<WorkspaceEvent>,
+    persisted_turn: WorkspaceRunConfig,
+    forward_control: WorkspaceBridgeControl,
+) {
+    let mut pending_call = None;
+    let mut evidence = Vec::new();
+    let mut last_context_usage = None;
+    let mut assistant_answer = None;
+    let mut persistence_attempted = false;
+    while let Ok(event) = events.recv() {
+        // EDIT 1 (was `record_activity` at :1943): one publish path, and the
+        // TERMINAL is deferred. Publishing `Finished{answered}` before
+        // `append_terminal_turn` has returned would tell an attached browser the
+        // turn succeeded and let it close the stream, so a failed memory write
+        // would render as a success.
+        let terminal = matches!(event, WorkspaceEvent::Finished { .. });
+        if !terminal {
+            persist_session.publish(&event);
+        }
+        if let WorkspaceEvent::MemoryUpdated {
+            prompt_tokens,
+            generation_tokens,
+            budget_total,
+            ..
+        } = &event
+        {
+            last_context_usage = Some((*prompt_tokens, *generation_tokens, *budget_total));
+        }
+        if let WorkspaceEvent::ToolCall { detail } = &event {
+            pending_call = Some(detail.clone());
+        }
+        if let WorkspaceEvent::ToolResult { tool, content, .. } = &event {
+            evidence.push(EvidenceInput {
+                tool: tool.clone(),
+                detail: pending_call.take().unwrap_or_default(),
+                observation: content.clone(),
+            });
+        }
+        let mut automatic_compaction = None;
+        if let WorkspaceEvent::ModelAnswer { content } = &event {
+            assistant_answer = Some(content.clone());
+        }
+        if let WorkspaceEvent::Finished { outcome } = &event {
+            persistence_attempted = true;
+            if let Err(error) = persist_session.memory.append_terminal_turn(
+                &persist_session.id,
+                &persisted_turn.client_message_id,
+                &persisted_turn.goal,
+                assistant_answer.as_deref().unwrap_or_default(),
+                outcome,
+                &evidence,
+            ) {
+                // EDIT 2 (was :1978-1988): publish, THEN settle. A reader breaks
+                // out of its loop once the turn is settled, so a terminal
+                // published afterwards is never drained. This cancel stays
+                // immediate — nothing inside `run_loop` reads `delivery_failed`,
+                // so without it a broken forwarder leaves the agent running
+                // invisibly, still writing files.
+                persist_session.publish(&WorkspaceEvent::Error {
+                    message: format!("Workspace memory could not save this turn: {error}"),
+                });
+                persist_session.finish_turn_if_current(
+                    &persisted_turn.client_message_id,
+                    TurnCompletion::Failed,
+                );
+                forward_control.cancel();
+                break;
+            }
+            if *outcome == "answered" {
+                if let Some((prompt_tokens, generation_tokens, budget_total)) = last_context_usage {
+                    let thread = persist_session.memory.thread(&persist_session.id);
+                    if let Ok(Some(thread)) = thread {
+                        if should_auto_compact(
+                            thread.turn_count,
+                            prompt_tokens,
+                            generation_tokens,
+                            budget_total,
+                        ) {
+                            match persist_session.memory.compact_thread(&persist_session.id) {
+                                Ok(result) if result.archived_turns > 0 => {
+                                    automatic_compaction = Some(WorkspaceEvent::MemoryCompacted {
+                                        compacted_through_turn: result.compacted_through_turn,
+                                        archived_turns: result.archived_turns,
+                                        compaction_count: result.compaction_count,
+                                        trigger_tokens: prompt_tokens
+                                            .saturating_add(generation_tokens),
+                                        budget_total,
+                                    });
+                                }
+                                Ok(_) => {}
+                                Err(error) => {
+                                    automatic_compaction = Some(WorkspaceEvent::Notice {
+                                        content: format!(
+                                            "Automatic conversation compaction was skipped: {error}"
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // EDIT 3 (was :2041-2047): compaction is published BEFORE the
+            // terminal rather than after it, so `Finished` is unambiguously the
+            // last event of a turn. Under the old channel it was sent after a
+            // reader had already broken on the terminal, i.e. never delivered.
+            if let Some(compaction) = automatic_compaction {
+                persist_session.publish(&compaction);
+            }
+            persist_session.publish(&event);
+            let completion = if *outcome == "driver_error" {
+                TurnCompletion::Failed
+            } else {
+                TurnCompletion::Idle
+            };
+            persist_session.finish_turn_if_current(&persisted_turn.client_message_id, completion);
+        }
+        // EDIT 4: the forwarder->SSE channel is gone, so both `try_send` cancels
+        // (:2037-2040, :2043-2046) go with it. A reader that is absent or slow is
+        // no longer an event at all, let alone a reason to end a run.
+    }
+    if !persistence_attempted {
+        if let Err(error) =
+            persist_session.persist_aborted_turn_and_finish(&persisted_turn, &evidence)
+        {
+            eprintln!("Workspace memory could not save an interrupted turn: {error}");
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -821,15 +1350,41 @@ pub(super) struct WorkspaceDecisionRequest {
 struct WorkspaceEventEnvelope {
     sequence: u64,
     session_id: String,
+    /// Set on the first entry of an incomplete replay: this reader's cursor was
+    /// older than the retained history, so earlier steps of the turn are missing
+    /// from this feed. Carried on the envelope rather than emitted as a
+    /// synthetic event so sequences stay monotonic and a client can keep
+    /// deduplicating on them alone.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    replay_gap: bool,
     #[serde(flatten)]
     event: WorkspaceEvent,
 }
 
-struct CancelStreamOnDrop(WorkspaceBridgeControl);
+/// Attach/detach bookkeeping for one `/events` response.
+///
+/// The replacement for `CancelStreamOnDrop`, and the replacement IS the fix: a
+/// dropped stream now records that nobody is watching, which the supervisor may
+/// act on ninety seconds later, instead of ending the turn on the spot.
+/// Dropping a socket is no longer a decision about a run.
+struct ObserverGuard(Arc<ActiveWorkspaceSession>);
 
-impl Drop for CancelStreamOnDrop {
+impl ObserverGuard {
+    fn attach(session: &Arc<ActiveWorkspaceSession>) -> Self {
+        session.watch.ever_observed.store(true, Ordering::Release);
+        session.watch.observers.fetch_add(1, Ordering::AcqRel);
+        Self(Arc::clone(session))
+    }
+}
+
+impl Drop for ObserverGuard {
     fn drop(&mut self) {
-        self.0.cancel();
+        if self.0.watch.observers.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0
+                .watch
+                .unobserved_since
+                .store(monotonic_millis(), Ordering::Release);
+        }
     }
 }
 
@@ -1687,16 +2242,25 @@ pub(super) async fn create_session(
         mode,
         semantic_retriever,
         memory,
-        state: StdMutex::new(WorkspaceSessionState::WaitingForEvents),
+        state: StdMutex::new(WorkspaceSessionState::Running),
         events: StdMutex::new(Some(events)),
         worker: StdMutex::new(Some(worker)),
         run_config: StdMutex::new(Some(run_config)),
         control: StdMutex::new(Some(control)),
         current_turn: StdMutex::new(Some((client_message_id.clone(), turn_index))),
         activity: StdMutex::new(WorkspaceActivitySnapshot::new(&goal)),
+        feed: SessionFeed::default(),
+        watch: TurnWatch::default(),
     });
-    arm_event_claim_deadline(&session, client_message_id);
-    *active = Some(session);
+    session.watch.begin();
+    *active = Some(Arc::clone(&session));
+    // The turn starts HERE, not when a browser opens `/events`. That single move
+    // is the fix: there is no claim to lose, so a refresh between this POST and
+    // the GET that used to start the work no longer costs the turn. Called with
+    // the session already published so a Stop that lands in this microsecond
+    // finds it and is honoured by the loop's first cancel check.
+    start_turn(&session, client_message_id);
+    drop(active);
 
     (
         StatusCode::CREATED,
@@ -1704,7 +2268,7 @@ pub(super) async fn create_session(
             id,
             workspace: simplify_path(&workspace),
             model_id: model.id,
-            state: WorkspaceSessionState::WaitingForEvents.as_str(),
+            state: WorkspaceSessionState::Running.as_str(),
             max_steps,
             max_tokens,
             allow_writes,
@@ -1848,10 +2412,25 @@ fn workspace_changes_response(
     })
 }
 
+#[derive(Debug, Deserialize)]
+pub(super) struct WorkspaceEventsQuery {
+    /// Resume cursor: the highest envelope `sequence` this client has already
+    /// applied. Taken as a string and parsed here so a malformed value gets this
+    /// file's `api_error` JSON rather than axum's plain-text `Query` rejection.
+    #[serde(default)]
+    after: Option<String>,
+}
+
+/// A pure observer of a turn that is running whether or not anyone is watching.
+///
+/// Attaching starts nothing, consumes nothing, and excludes nobody: several
+/// responses may follow the same turn at once, which is what makes a refresh
+/// safe even while the socket it replaced is still being torn down.
 pub(super) async fn session_events(
     State(state): State<AppState>,
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
+    Query(query): Query<WorkspaceEventsQuery>,
 ) -> Response {
     if let Some(response) = authorize(&state, &headers) {
         return response;
@@ -1860,225 +2439,127 @@ pub(super) async fn session_events(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let Ok(mut status) = session.state.lock() else {
-        return api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "workspace_state_unavailable",
-            "Workspace session state is unavailable".to_string(),
-            None,
-        );
+    let requested_cursor = match query.after.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(value) => match value.parse::<u64>() {
+            Ok(cursor) => Some(cursor),
+            Err(_) => {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_workspace_event_cursor",
+                    "after must be a whole number event sequence".to_string(),
+                    Some("after"),
+                )
+            }
+        },
     };
-    if *status != WorkspaceSessionState::WaitingForEvents {
-        return api_error(
-            StatusCode::CONFLICT,
-            "workspace_event_stream_unavailable",
-            "this Workspace turn is no longer waiting for an event consumer".to_string(),
-            None,
-        );
-    }
-    let events = session
-        .events
-        .lock()
-        .ok()
-        .and_then(|mut events| events.take());
-    let worker = session
-        .worker
-        .lock()
-        .ok()
-        .and_then(|mut worker| worker.take());
-    let run_config = session
-        .run_config
-        .lock()
-        .ok()
-        .and_then(|mut config| config.take());
-    let control = session
+    // `Last-Event-ID` first because it only EXISTS on the browser's own
+    // reconnect, where it is by construction fresher than the `?after=` frozen
+    // into the URL when the EventSource was constructed. The query parameter is
+    // the one that covers a page reload, which builds a brand-new EventSource
+    // and never sends the header. Absent both, resume from the start of the
+    // CURRENT turn — never from 0, which would replay a previous turn's
+    // `session.finished` into a live page.
+    let resume_from = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .or(requested_cursor)
+        .unwrap_or_else(|| match session.feed.entries.lock() {
+            Ok(entries) => entries.turn_start,
+            Err(poisoned) => poisoned.into_inner().turn_start,
+        });
+    // An approval prompt is the one replayed event that can be actively wrong:
+    // the loop may already have its decision, and re-rendering the card gives
+    // the user buttons whose POST will 409. `try_decide` rejects a stale id
+    // (workspace_bridge.rs:435-443), so the live pending id is the exact test.
+    let pending_approval = session
         .control
         .lock()
         .ok()
-        .and_then(|control| control.clone());
-    let (Some(events), Some(worker), Some(run_config), Some(control)) =
-        (events, worker, run_config, control)
-    else {
-        return api_error(
-            StatusCode::CONFLICT,
-            "workspace_event_stream_already_claimed",
-            "this Workspace session already has an event consumer".to_string(),
-            None,
-        );
-    };
-    let persisted_turn = run_config.clone();
-    *status = status.after_events_claimed();
-    drop(status);
-
-    let worker_session = Arc::clone(&session);
-    let worker_turn_id = run_config.client_message_id.clone();
-    let delivery_failed = Arc::clone(&worker.delivery_failed);
-    std::thread::Builder::new()
-        .name("camelid-workspace-agent".to_string())
-        .spawn(move || {
-            let result = run_live(run_config, worker);
-            if result.is_err() || delivery_failed.load(std::sync::atomic::Ordering::Acquire) {
-                let completion = if matches!(result, Ok(LoopEnd::DriverError) | Err(_)) {
-                    TurnCompletion::Failed
-                } else {
-                    TurnCompletion::Idle
-                };
-                worker_session.finish_turn_if_current(&worker_turn_id, completion);
-            }
-        })
-        .expect("spawn Workspace agent thread");
-
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(EVENT_STREAM_BUFFER);
-    let forward_control = control.clone();
-    let persist_session = Arc::clone(&session);
-    std::thread::Builder::new()
-        .name("camelid-workspace-events".to_string())
-        .spawn(move || {
-            let mut pending_call = None;
-            let mut evidence = Vec::new();
-            let mut last_context_usage = None;
-            let mut assistant_answer = None;
-            let mut persistence_attempted = false;
-            while let Ok(event) = events.recv() {
-                persist_session.record_activity(&event);
-                if let WorkspaceEvent::MemoryUpdated {
-                    prompt_tokens,
-                    generation_tokens,
-                    budget_total,
-                    ..
-                } = &event
-                {
-                    last_context_usage =
-                        Some((*prompt_tokens, *generation_tokens, *budget_total));
-                }
-                if let WorkspaceEvent::ToolCall { detail } = &event {
-                    pending_call = Some(detail.clone());
-                }
-                if let WorkspaceEvent::ToolResult { tool, content, .. } = &event {
-                    evidence.push(EvidenceInput {
-                        tool: tool.clone(),
-                        detail: pending_call.take().unwrap_or_default(),
-                        observation: content.clone(),
-                    });
-                }
-                let mut automatic_compaction = None;
-                if let WorkspaceEvent::ModelAnswer { content } = &event {
-                    assistant_answer = Some(content.clone());
-                }
-                if let WorkspaceEvent::Finished { outcome } = &event {
-                    persistence_attempted = true;
-                    if let Err(error) = persist_session.memory.append_terminal_turn(
-                        &persist_session.id,
-                        &persisted_turn.client_message_id,
-                        &persisted_turn.goal,
-                        assistant_answer.as_deref().unwrap_or_default(),
-                        outcome,
-                        &evidence,
-                    ) {
-                        let activity_error = WorkspaceEvent::Error {
-                            message: format!("Workspace memory could not save this turn: {error}"),
-                        };
-                        persist_session.record_activity(&activity_error);
-                        let _ = event_tx.try_send(activity_error);
-                        persist_session.finish_turn_if_current(
-                            &persisted_turn.client_message_id,
-                            TurnCompletion::Failed,
-                        );
-                        forward_control.cancel();
-                        break;
-                    }
-                    if *outcome == "answered" {
-                        if let Some((prompt_tokens, generation_tokens, budget_total)) =
-                            last_context_usage
-                        {
-                            let thread = persist_session.memory.thread(&persist_session.id);
-                            if let Ok(Some(thread)) = thread {
-                                if should_auto_compact(
-                                    thread.turn_count,
-                                    prompt_tokens,
-                                    generation_tokens,
-                                    budget_total,
-                                ) {
-                                    match persist_session.memory.compact_thread(&persist_session.id)
-                                    {
-                                        Ok(result) if result.archived_turns > 0 => {
-                                            automatic_compaction =
-                                                Some(WorkspaceEvent::MemoryCompacted {
-                                                    compacted_through_turn: result
-                                                        .compacted_through_turn,
-                                                    archived_turns: result.archived_turns,
-                                                    compaction_count: result.compaction_count,
-                                                    trigger_tokens: prompt_tokens
-                                                        .saturating_add(generation_tokens),
-                                                    budget_total,
-                                                });
-                                        }
-                                        Ok(_) => {}
-                                        Err(error) => {
-                                            automatic_compaction = Some(WorkspaceEvent::Notice {
-                                                content: format!(
-                                                    "Automatic conversation compaction was skipped: {error}"
-                                                ),
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    let completion = if *outcome == "driver_error" {
-                        TurnCompletion::Failed
-                    } else {
-                        TurnCompletion::Idle
-                    };
-                    persist_session
-                        .finish_turn_if_current(&persisted_turn.client_message_id, completion);
-                }
-                if event_tx.try_send(event).is_err() {
-                    forward_control.cancel();
-                    break;
-                }
-                if let Some(event) = automatic_compaction {
-                    persist_session.record_activity(&event);
-                    if event_tx.try_send(event).is_err() {
-                        forward_control.cancel();
-                        break;
-                    }
-                }
-            }
-            if !persistence_attempted {
-                if let Err(error) =
-                    persist_session.persist_aborted_turn_and_finish(&persisted_turn, &evidence)
-                {
-                    eprintln!("Workspace memory could not save an interrupted turn: {error}");
-                }
-            }
-        })
-        .expect("spawn Workspace event forwarder");
+        .and_then(|control| control.clone())
+        .and_then(|control| control.pending_approval_id());
 
     let session_id = session.id.clone();
-    let disconnect_guard = CancelStreamOnDrop(control);
+    let mut tip = session.feed.tip.subscribe();
+    let observer = ObserverGuard::attach(&session);
     let stream = async_stream::stream! {
-        let _disconnect_guard = disconnect_guard;
-        let mut sequence = 0_u64;
-        while let Some(event) = event_rx.recv().await {
-            sequence += 1;
-            let terminal = matches!(event, WorkspaceEvent::Finished { .. } | WorkspaceEvent::Error { .. });
-            let envelope = WorkspaceEventEnvelope {
-                sequence,
-                session_id: session_id.clone(),
-                event,
+        // Held for the life of the response. Dropping it records that nobody is
+        // watching; it does not end anything.
+        let _observer = observer;
+        let mut cursor = resume_from;
+        let mut gap_pending = false;
+        let mut replaying = true;
+        loop {
+            // Read "has the turn settled" BEFORE draining, so anything published
+            // before we looked is still delivered by this pass. Fails closed on
+            // an unreadable slot: ending the response sends the client to the
+            // status poll, which is the recoverable direction.
+            let settled = session
+                .current_turn
+                .lock()
+                .map(|turn| turn.is_none())
+                .unwrap_or(true);
+            // Scoped deliberately: a std `MutexGuard` held across a `yield`
+            // makes this generator non-Send and axum will not accept it.
+            let (batch, complete) = {
+                match session.feed.entries.lock() {
+                    Ok(entries) => entries.since(cursor),
+                    Err(poisoned) => poisoned.into_inner().since(cursor),
+                }
             };
-            match serde_json::to_string(&envelope) {
-                Ok(json) => yield Ok::<Event, std::convert::Infallible>(
-                    Event::default().event("workspace").id(sequence.to_string()).data(json)
-                ),
-                Err(_) => continue,
+            if replaying {
+                gap_pending = !complete;
             }
-            if terminal {
+            for (sequence, event) in batch {
+                cursor = sequence;
+                if replaying {
+                    if let WorkspaceEvent::ApprovalRequired { approval_id, .. } = &event {
+                        if pending_approval.as_deref() != Some(approval_id.as_str()) {
+                            continue;
+                        }
+                    }
+                }
+                let envelope = WorkspaceEventEnvelope {
+                    sequence,
+                    session_id: session_id.clone(),
+                    replay_gap: std::mem::take(&mut gap_pending),
+                    event,
+                };
+                match serde_json::to_string(&envelope) {
+                    Ok(json) => {
+                        // Stamped only once the frame is actually handed to the
+                        // response body. This is what tells the supervisor that
+                        // an attached reader is a consuming reader.
+                        session.watch.note_delivered(sequence);
+                        yield Ok::<Event, std::convert::Infallible>(
+                            Event::default().event("workspace").id(sequence.to_string()).data(json)
+                        );
+                    }
+                    Err(_) => continue,
+                }
+            }
+            replaying = false;
+            if settled {
                 break;
             }
+            // The sleep is a floor, not a poll: `tip` wakes this immediately on
+            // any publish. It exists so a reader can never park forever on a
+            // turn that settled without publishing anything — which a panicking
+            // worker thread would produce.
+            tokio::select! {
+                changed = tip.changed() => { if changed.is_err() { break } }
+                _ = tokio::time::sleep(SUPERVISOR_TICK) => {}
+            }
         }
+        // A definitive end-of-response marker. EventSource reconnects after ANY
+        // close, clean or not, and cannot see the status line — so a reader that
+        // attached to a turn which had already settled would otherwise reconnect
+        // forever against a finished feed. The client closes on this; it carries
+        // no sequence so it cannot collide with replay.
+        yield Ok::<Event, std::convert::Infallible>(
+            Event::default().event("workspace.closed").data("{}")
+        );
     };
     Sse::new(stream)
         .keep_alive(
@@ -2378,13 +2859,13 @@ pub(super) async fn send_message(
             )
         }
     }
-    arm_event_claim_deadline(&session, client_message_id);
+    start_turn(&session, client_message_id);
     (
         StatusCode::ACCEPTED,
         Json(WorkspaceMessageResponse {
             session_id: session.id.clone(),
             turn_index,
-            state: WorkspaceSessionState::WaitingForEvents.as_str(),
+            state: WorkspaceSessionState::Running.as_str(),
             duplicate: false,
         }),
     )
@@ -2415,51 +2896,13 @@ pub(super) async fn cancel_session(
     {
         control.cancel();
     }
-    let was_waiting = session
-        .state
-        .lock()
-        .map(|status| *status == WorkspaceSessionState::WaitingForEvents)
-        .unwrap_or(false);
-    let unclaimed_turn = if was_waiting {
-        session
-            .run_config
-            .lock()
-            .ok()
-            .and_then(|config| config.clone())
-    } else {
-        None
-    };
+    // No `was_waiting` fast path any more. Every installed turn has a live
+    // forwarder (or was failed outright at install), and that forwarder is the
+    // single writer of the terminal memory row via
+    // `persist_aborted_turn_and_finish`. Persisting here as well would race it
+    // for the same `client_message_id`.
     if let Ok(mut status) = session.state.lock() {
         *status = status.after_cancel_request();
-    }
-    if let Some(turn) = unclaimed_turn {
-        let cancel_memory = session.memory.clone();
-        let cancel_session_id = session.id.clone();
-        let cancel_turn = turn.clone();
-        let persisted = match run_workspace_blocking(move || {
-            cancel_memory.append_terminal_turn(
-                &cancel_session_id,
-                &cancel_turn.client_message_id,
-                &cancel_turn.goal,
-                "",
-                "aborted",
-                &[],
-            )
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(response) => return response,
-        };
-        if let Err(error) = persisted {
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "workspace_memory_unavailable",
-                format!("Workspace memory could not save the cancelled turn: {error}"),
-                None,
-            );
-        }
-        session.finish_turn_if_current(&turn.client_message_id, TurnCompletion::Idle);
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -2878,7 +3321,6 @@ mod tests {
 
     #[test]
     fn session_state_blocks_model_transitions_only_while_active() {
-        assert!(WorkspaceSessionState::WaitingForEvents.blocks_model_transition());
         assert!(WorkspaceSessionState::Running.blocks_model_transition());
         assert!(WorkspaceSessionState::Cancelling.blocks_model_transition());
         assert!(!WorkspaceSessionState::Idle.blocks_model_transition());
@@ -2922,12 +3364,11 @@ mod tests {
         let requested = WorkspaceSessionState::Running.after_cancel_request();
         assert_eq!(requested, WorkspaceSessionState::Cancelling);
         assert!(requested.blocks_model_transition());
+        // A turn is Running from the moment it is installed, so a cancel request
+        // always goes through Cancelling — there is no pre-Running state left that
+        // could shortcut straight to Cancelled.
         assert_eq!(
-            WorkspaceSessionState::WaitingForEvents.after_cancel_request(),
-            WorkspaceSessionState::Cancelled
-        );
-        assert_eq!(
-            WorkspaceSessionState::Cancelled.after_events_claimed(),
+            WorkspaceSessionState::Cancelled.after_cancel_request(),
             WorkspaceSessionState::Cancelled
         );
     }
@@ -3030,6 +3471,8 @@ mod tests {
                 run_config: StdMutex::new(None),
                 control: StdMutex::new(Some(control)),
                 current_turn: StdMutex::new(None),
+                feed: SessionFeed::default(),
+                watch: TurnWatch::default(),
                 activity: StdMutex::new(WorkspaceActivitySnapshot::new("test task")),
             })
         };
@@ -3079,6 +3522,8 @@ mod tests {
             run_config: StdMutex::new(None),
             control: StdMutex::new(Some(initial_control)),
             current_turn: StdMutex::new(None),
+            feed: SessionFeed::default(),
+            watch: TurnWatch::default(),
             activity: StdMutex::new(WorkspaceActivitySnapshot::new("test task")),
         };
         let config = WorkspaceRunConfig {
@@ -3107,7 +3552,7 @@ mod tests {
         assert!(!session.finish_turn_if_current("stale-message", TurnCompletion::Idle));
         assert_eq!(
             session.state.lock().map(|state| *state).unwrap(),
-            WorkspaceSessionState::WaitingForEvents
+            WorkspaceSessionState::Running
         );
         assert_eq!(session.pending_message("message-1"), Some(3));
         let (duplicate_worker, duplicate_client) = bridge(1);
@@ -3152,6 +3597,8 @@ mod tests {
             run_config: StdMutex::new(None),
             control: StdMutex::new(None),
             current_turn: StdMutex::new(Some(("message-1".into(), 0))),
+            feed: SessionFeed::default(),
+            watch: TurnWatch::default(),
             activity: StdMutex::new(WorkspaceActivitySnapshot::new("test task")),
         };
         assert!(session.finish_turn_if_current("message-1", TurnCompletion::Idle));
@@ -3186,6 +3633,8 @@ mod tests {
             run_config: StdMutex::new(None),
             control: StdMutex::new(None),
             current_turn: StdMutex::new(Some(("message-1".into(), 0))),
+            feed: SessionFeed::default(),
+            watch: TurnWatch::default(),
             activity: StdMutex::new(WorkspaceActivitySnapshot::new("test task")),
         };
         let run_config = WorkspaceRunConfig {
@@ -3252,6 +3701,8 @@ mod tests {
                 run_config: StdMutex::new(None),
                 control: StdMutex::new(Some(stale_control)),
                 current_turn: StdMutex::new(Some(("old-message".into(), 0))),
+                feed: SessionFeed::default(),
+                watch: TurnWatch::default(),
                 activity: StdMutex::new(WorkspaceActivitySnapshot::new("test task")),
             };
             let config = WorkspaceRunConfig {
@@ -3282,21 +3733,19 @@ mod tests {
             assert_eq!(session.pending_message("new-message"), Some(1));
             assert_eq!(
                 session.state.lock().map(|state| *state).unwrap(),
-                WorkspaceSessionState::WaitingForEvents
+                WorkspaceSessionState::Running
             );
         }
     }
 
-    #[test]
-    fn unclaimed_turn_expiry_persists_and_unblocks_the_session() {
-        let dir = tempfile::tempdir().unwrap();
-        let memory = WorkspaceMemoryStore::open(dir.path().join("memory.sqlite3")).unwrap();
-        memory.create_thread("thread", "root", "model").unwrap();
+    /// A session carrying nothing but the state the reaper actually reads.
+    fn reaper_session(dir: &std::path::Path) -> ActiveWorkspaceSession {
+        let memory = WorkspaceMemoryStore::open(dir.join("memory.sqlite3")).unwrap();
         let (worker, client) = bridge(1);
-        let (events, control) = client.into_parts();
-        let session = ActiveWorkspaceSession {
+        let (_events, control) = client.into_parts();
+        ActiveWorkspaceSession {
             id: "thread".into(),
-            workspace: dir.path().to_path_buf(),
+            workspace: dir.to_path_buf(),
             model_id: "model".into(),
             model_sha256: "sha-test".to_string(),
             max_steps: 1,
@@ -3308,50 +3757,189 @@ mod tests {
             mode: WorkspaceRunMode::ReadOnly,
             semantic_retriever: None,
             memory,
-            state: StdMutex::new(WorkspaceSessionState::WaitingForEvents),
-            events: StdMutex::new(Some(events)),
+            state: StdMutex::new(WorkspaceSessionState::Running),
+            events: StdMutex::new(None),
             worker: StdMutex::new(Some(worker)),
-            run_config: StdMutex::new(Some(WorkspaceRunConfig {
-                addr: "127.0.0.1:8181".parse().unwrap(),
-                workspace: dir.path().to_path_buf(),
-                goal: "question".into(),
-                client_message_id: "message-1".into(),
-                turn_index: 0,
-                memory: Default::default(),
-                model_id: "model".into(),
-                family: "qwen3".into(),
-                max_steps: 1,
-                max_tokens: 1,
-                temperature: 0.0,
-                mode: WorkspaceRunMode::ReadOnly,
-                approval_mode: WorkspaceApprovalMode::ApprovalGated,
-                allow_network: false,
-                semantic_retriever: None,
-            })),
+            run_config: StdMutex::new(None),
             control: StdMutex::new(Some(control)),
             current_turn: StdMutex::new(Some(("message-1".into(), 0))),
+            feed: SessionFeed::default(),
+            watch: TurnWatch::default(),
             activity: StdMutex::new(WorkspaceActivitySnapshot::new("test task")),
-        };
+        }
+    }
 
-        assert!(session.expire_unclaimed_turn("message-1").unwrap());
-        assert_eq!(
-            session.state.lock().map(|state| *state).unwrap(),
-            WorkspaceSessionState::Cancelled
+    /// A `now` far enough past the stamps `begin()` wrote that any deadline can
+    /// be expressed as an offset from it.
+    const TEST_NOW: u64 = 24 * 60 * 60 * 1_000;
+
+    fn ms(d: std::time::Duration) -> u64 {
+        d.as_millis() as u64
+    }
+
+    #[test]
+    fn a_never_watched_turn_is_reaped_at_the_first_attach_deadline() {
+        // Replaces `unclaimed_turn_expiry_persists_and_unblocks_the_session`.
+        // Nothing "claims" a turn any more — it starts at install — so the case
+        // that test covered is now "a turn no browser ever attached to", decided
+        // by the supervisor's first-attach deadline rather than a one-shot expiry.
+        let dir = tempfile::tempdir().unwrap();
+        let session = reaper_session(dir.path());
+        session.watch.begin();
+        session
+            .watch
+            .turn_started
+            .store(TEST_NOW, Ordering::Release);
+        assert!(
+            session.abandonment_reason_at(TEST_NOW).is_none(),
+            "just started"
         );
-        assert!(!session
-            .state
-            .lock()
-            .map(|state| state.blocks_model_transition())
-            .unwrap());
-        assert_eq!(session.pending_message("message-1"), None);
-        let turn = session
-            .memory
-            .turn_by_client_message("thread", "message-1")
-            .unwrap()
-            .unwrap();
-        assert_eq!(turn.user_text, "question");
-        assert_eq!(turn.terminal_outcome, "aborted");
-        assert!(!session.expire_unclaimed_turn("message-1").unwrap());
+        assert!(
+            session
+                .abandonment_reason_at(TEST_NOW + ms(FIRST_ATTACH_TIMEOUT) / 2)
+                .is_none(),
+            "still inside the first-attach window"
+        );
+        assert!(
+            session
+                .abandonment_reason_at(TEST_NOW + ms(FIRST_ATTACH_TIMEOUT) + 1)
+                .is_some(),
+            "a turn no stream ever attached to must be reaped"
+        );
+    }
+
+    #[test]
+    fn a_watched_turn_is_not_reaped_but_an_abandoned_one_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = reaper_session(dir.path());
+        session.watch.begin();
+        session.watch.ever_observed.store(true, Ordering::Release);
+        session.watch.observers.store(1, Ordering::Release);
+        session.watch.note_delivered(10);
+        session
+            .watch
+            .turn_started
+            .store(TEST_NOW, Ordering::Release);
+        assert!(
+            session.abandonment_reason_at(TEST_NOW).is_none(),
+            "a reader that is keeping up is watching"
+        );
+
+        session.watch.observers.store(0, Ordering::Release);
+        session
+            .watch
+            .unobserved_since
+            .store(TEST_NOW, Ordering::Release);
+        assert!(
+            session.abandonment_reason_at(TEST_NOW).is_none(),
+            "a reader that just left still has its grace"
+        );
+        assert!(
+            session
+                .abandonment_reason_at(TEST_NOW + ms(ABANDON_GRACE) + 1)
+                .is_some(),
+            "a turn nobody came back for must be reaped"
+        );
+    }
+
+    #[test]
+    fn a_reader_that_stops_consuming_counts_as_abandoned() {
+        // The regression guard for the deleted `try_send`-on-`Full` bound. A
+        // half-open TCP peer keeps the refcount at one forever, so liveness has
+        // to be what the reader actually drained, not that it exists.
+        let dir = tempfile::tempdir().unwrap();
+        let session = reaper_session(dir.path());
+        session.watch.begin();
+        session.watch.ever_observed.store(true, Ordering::Release);
+        session.watch.observers.store(1, Ordering::Release);
+        session.watch.note_delivered(10);
+        if let Ok(mut entries) = session.feed.entries.lock() {
+            entries.last = 500;
+        }
+        session
+            .watch
+            .turn_started
+            .store(TEST_NOW, Ordering::Release);
+        session
+            .watch
+            .delivered_at
+            .store(TEST_NOW, Ordering::Release);
+        assert!(
+            session.abandonment_reason_at(TEST_NOW).is_none(),
+            "a reader behind but inside the grace is still watching"
+        );
+        assert!(
+            session
+                .abandonment_reason_at(TEST_NOW + ms(ABANDON_GRACE) + 1)
+                .is_some(),
+            "an attached reader that stopped draining is not watching"
+        );
+    }
+
+    #[test]
+    fn the_wall_clock_ceiling_fires_even_with_a_live_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = reaper_session(dir.path());
+        session.watch.begin();
+        session.watch.ever_observed.store(true, Ordering::Release);
+        session.watch.observers.store(1, Ordering::Release);
+        session.watch.note_delivered(10);
+        session
+            .watch
+            .turn_started
+            .store(TEST_NOW, Ordering::Release);
+        assert!(
+            session
+                .abandonment_reason_at(TEST_NOW + ms(TURN_WALL_CLOCK_CEILING) + 1)
+                .is_some(),
+            "the ceiling is the bound on a turn nobody stops"
+        );
+    }
+
+    #[test]
+    fn abandonment_reason_fails_closed_when_the_feed_is_poisoned() {
+        // A reaper whose inputs can be poisoned by an unrelated panic is a reaper
+        // that stops reaping. An unreadable feed must read as "cannot prove
+        // anyone is keeping up", not as "everyone is fine".
+        let dir = tempfile::tempdir().unwrap();
+        let session = reaper_session(dir.path());
+        session.watch.begin();
+        session.watch.ever_observed.store(true, Ordering::Release);
+        session.watch.observers.store(1, Ordering::Release);
+        session.watch.note_delivered(10);
+        session
+            .watch
+            .turn_started
+            .store(TEST_NOW, Ordering::Release);
+        session
+            .watch
+            .delivered_at
+            .store(TEST_NOW, Ordering::Release);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = session.feed.entries.lock().unwrap();
+            panic!("poison the feed");
+        }));
+        assert!(session.feed.entries.is_poisoned());
+        assert!(
+            session
+                .abandonment_reason_at(TEST_NOW + ms(ABANDON_GRACE) + 1)
+                .is_some(),
+            "a poisoned feed must not read as a healthy reader"
+        );
+    }
+
+    #[test]
+    fn owns_turn_fails_closed_when_the_turn_identity_is_poisoned() {
+        // Must stay true so the supervisor keeps ticking rather than exiting and
+        // leaving the turn with nothing watching it at all.
+        let dir = tempfile::tempdir().unwrap();
+        let session = reaper_session(dir.path());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = session.current_turn.lock().unwrap();
+            panic!("poison the turn identity");
+        }));
+        assert!(session.current_turn.is_poisoned());
+        assert!(session.owns_turn("message-1"));
     }
 
     #[test]
