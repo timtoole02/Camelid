@@ -18574,13 +18574,21 @@ fn lookup_prompt_prefix_cache(prepared: &PreparedGeneration) -> Option<PrefixMat
         if !is_exact_match && common_len < min_prefix {
             continue;
         }
+        let divergent_suffix_len = prepared.token_ids.len().saturating_sub(common_len);
         if !is_exact_match
             && cached.metal_f32_resident_kv
-            && !metal_f32_partial_prefix_is_profitable(
-                common_len,
-                prepared.token_ids.len().saturating_sub(common_len),
-            )
+            && !metal_f32_partial_prefix_is_profitable(common_len, divergent_suffix_len)
         {
+            tracing::debug!(
+                target: "camelid::prompt_cache",
+                decision = "candidate_rejected_metal_ratio",
+                common_prefix_tokens = common_len,
+                divergent_suffix_tokens = divergent_suffix_len,
+                cached_prompt_tokens = cached.token_ids.len(),
+                request_prompt_tokens = prepared.token_ids.len(),
+                min_reuse_ratio = METAL_F32_PARTIAL_PREFIX_MIN_REUSE_RATIO,
+                "prompt-cache candidate is below the measured Metal F32 reuse threshold"
+            );
             continue;
         }
 
@@ -27848,6 +27856,23 @@ mod tests {
         assert!(!metal_f32_partial_prefix_is_profitable(3_062, 74));
         assert!(!metal_f32_partial_prefix_is_profitable(3_062, 346));
         assert!(!metal_f32_partial_prefix_is_profitable(3_062, 0));
+    }
+
+    #[test]
+    fn compact_paging_task_state_receipt_clears_the_metal_f32_gate() {
+        // Exact Qwen3-4B-Q8_0 token counts from the TaskForge objective with
+        // Camelid's six active-work schemas. Agent-loop tests pin the compact
+        // action/focus strings; this pins their relationship to the measured
+        // M4 Metal admission rule without requiring a 4 GiB model in CI.
+        let receipts = [
+            (2_071, 39, 53), // Modify -> pending Verify.
+            (2_074, 31, 66), // Pending Verify -> plain Verify.
+            (2_086, 31, 67), // Missing-source retry.
+        ];
+        for (prefix, suffix, integer_ratio) in receipts {
+            assert_eq!(prefix / suffix, integer_ratio);
+            assert!(metal_f32_partial_prefix_is_profitable(prefix, suffix));
+        }
     }
 
     #[test]

@@ -167,6 +167,12 @@ pub(crate) enum ContextPagingError {
     StaleSource(String),
     #[error("context item is unavailable: {0}")]
     MissingContext(String),
+    #[error("exact source for native {tool} target {path} was not present in this capsule")]
+    MissingModificationSource {
+        tool: String,
+        path: String,
+        symbol: String,
+    },
     #[error("mandatory capsule content needs {required} tokens but the limit is {limit}")]
     MandatoryBudget { required: u32, limit: u32 },
     #[error("typed action is invalid: {0}")]
@@ -671,6 +677,14 @@ impl StructuralProjectMemory {
             .ok_or_else(|| ContextPagingError::MissingContext(symbol_id.to_string()))?;
         self.ensure_hash(&page.file, &page.source_hash)?;
         Ok(page)
+    }
+
+    pub(crate) fn page_covers_full_file(&self, page: &SourcePage) -> bool {
+        self.cards.get(&page.symbol_id).is_some_and(|card| {
+            card.file == page.file
+                && card.location.start_line == 1
+                && card.signature.strip_prefix("file ") == Some(page.file.as_str())
+        })
     }
 
     pub(crate) fn resolve_symbol(&self, id_or_query: &str) -> Option<String> {
@@ -1480,11 +1494,18 @@ impl<E: TokenEstimator> ContextCapsuleBuilder<E> {
         candidates.push(Candidate {
             category: "task",
             id: "task-contract".into(),
-            text: render_task_contract(request.ledger, request.current_action),
+            text: render_task_contract(request.ledger),
             mandatory: true,
             importance: 250,
-            reason: "objective, current acceptance condition, focus, and invariants are pinned"
-                .into(),
+            reason: "exact objective, acceptance conditions, and invariants are pinned".into(),
+        });
+        candidates.push(Candidate {
+            category: "task_state",
+            id: "runtime-guidance".into(),
+            text: render_runtime_guidance(request.ledger, request.current_action),
+            mandatory: true,
+            importance: 249,
+            reason: "current action, recovery focus, and verification state are pinned late".into(),
         });
         if let Some(diagnostic) = request.diagnostic {
             candidates.push(Candidate {
@@ -1528,15 +1549,12 @@ impl<E: TokenEstimator> ContextCapsuleBuilder<E> {
             .sum::<u32>();
         candidates.push(Candidate {
             category: "tools",
-            id: format!("phase:{:?}", request.phase).to_ascii_lowercase(),
-            text: format!(
-                "<usable_tools phase=\"{:?}\">{}</usable_tools>\n",
-                request.phase,
-                tools.join(",")
-            ),
+            id: format!("tools:{}", tools.join(",")),
+            text: format!("<usable_tools>{}</usable_tools>\n", tools.join(",")),
             mandatory: true,
             importance: 240,
-            reason: "only tools usable in the current phase".into(),
+            reason: "only currently usable tools; byte-stable when the native schema set is stable"
+                .into(),
         });
 
         let mut stale_lookups = Vec::new();
@@ -1754,21 +1772,29 @@ fn category_order(category: &str) -> u8 {
     match category {
         "stable_kernel" => 0,
         "task" => 1,
-        "task_detail" => 2,
-        "map" => 3,
-        "card" => 4,
-        "page" => 5,
-        "diagnostic" => 6,
-        "tools" => 7,
-        "completed_work" => 8,
-        _ => 9,
+        "tools" => 2,
+        "task_detail" => 3,
+        "map" => 4,
+        "card" => 5,
+        "page" => 6,
+        "completed_work" => 7,
+        "history" => 8,
+        "diagnostic" => 9,
+        // Volatile guidance is deliberately last. Qwen's prompt cache keys on
+        // the longest common token prefix, so putting ledger revision/action
+        // state before the immutable contract forced every fresh capsule to
+        // cold-prefill the objective and exact pages again.
+        "task_state" => 10,
+        _ => 11,
     }
 }
 
 fn add_composition(composition: &mut CapsuleComposition, category: &str, tokens: u32) {
     match category {
         "stable_kernel" => composition.stable_kernel_tokens += tokens,
-        "task" | "task_detail" | "completed_work" | "history" => composition.task_tokens += tokens,
+        "task" | "task_state" | "task_detail" | "completed_work" | "history" => {
+            composition.task_tokens += tokens
+        }
         "map" => composition.map_tokens += tokens,
         "card" => composition.card_tokens += tokens,
         "page" => composition.page_tokens += tokens,
@@ -1778,33 +1804,43 @@ fn add_composition(composition: &mut CapsuleComposition, category: &str, tokens:
     }
 }
 
-/// The mandatory contract carries only the never-evict content: the exact,
-/// immutable user objective, current action and bounded mutable focus,
-/// acceptance conditions, critical invariants, and verification status.
-/// Decisions and open questions render separately as evictable task detail.
-/// An objective that cannot fit the aggregate mandatory-token budget fails
-/// closed; task requirements are never silently truncated.
-fn render_task_contract(ledger: &TaskLedger, current_action: &str) -> String {
+/// The immutable part of the mandatory task contract is rendered before every
+/// source-derived section. It intentionally contains no ledger revision or
+/// mutable action state: those fields made the prompt diverge before the exact
+/// objective and defeated cross-request prefix reuse.
+///
+/// An objective that cannot fit the aggregate mandatory-token budget still
+/// fails closed; task requirements are never silently truncated.
+fn render_task_contract(ledger: &TaskLedger) -> String {
+    format!(
+        concat!(
+            "<task_contract>\n",
+            "objective: {}\n",
+            "acceptanceCriteria:\n{}\n",
+            "criticalInvariants:\n{}\n",
+            "</task_contract>\n"
+        ),
+        ledger.objective,
+        bounded_bullets(&ledger.acceptance_criteria),
+        bounded_bullets(&ledger.invariants),
+    )
+}
+
+/// Mutable task state remains mandatory, but is kept at the end of the
+/// inference projection. The persisted ledger revision is host observability,
+/// not model input; source hashes and the project revision enforce freshness.
+fn render_runtime_guidance(ledger: &TaskLedger, current_action: &str) -> String {
     let mut focus = ledger.current_focus.clone();
     bound_item(&mut focus, MAX_FOCUS_FIELD_BYTES);
     format!(
         concat!(
-            "<task_contract revision=\"{}\">\n",
-            "objective: {}\n",
-            "currentAction: {}\n",
-            "currentFocus: {}\n",
-            "acceptanceCriteria:\n{}\n",
-            "criticalInvariants:\n{}\n",
-            "verificationStatus: {}\n",
-            "</task_contract>\n"
+            "<task_state>\n",
+            "action: {}\n",
+            "focus: {}\n",
+            "verification: {}\n",
+            "</task_state>\n"
         ),
-        ledger.revision,
-        ledger.objective,
-        current_action,
-        focus,
-        bounded_bullets(&ledger.acceptance_criteria),
-        bounded_bullets(&ledger.invariants),
-        ledger.verification_state.status,
+        current_action, focus, ledger.verification_state.status,
     )
 }
 
@@ -2522,24 +2558,61 @@ impl ContextPagingRuntime {
                                 "edit_file requires exact old source".into(),
                             )
                         })?;
-                    let page = capsule.exact_page_ids.iter().find_map(|page_id| {
-                        self.project.pages.get(page_id).filter(|page| {
-                            page.file == normalized && page.exact_source.contains(old)
-                        })
-                    });
-                    let page = page.ok_or_else(|| {
-                        ContextPagingError::InvalidAction(format!(
-                            "edit_file target {normalized} is not backed by exact source in this capsule"
-                        ))
-                    })?;
-                    if call.args.get("new").and_then(|value| value.as_str()) == Some(old) {
+                    if old.is_empty() {
+                        return Err(ContextPagingError::InvalidAction(
+                            "edit_file requires non-empty exact old source".into(),
+                        ));
+                    }
+                    let new = call
+                        .args
+                        .get("new")
+                        .and_then(|value| value.as_str())
+                        .ok_or_else(|| {
+                            ContextPagingError::InvalidAction(
+                                "edit_file requires replacement source".into(),
+                            )
+                        })?;
+                    if new == old {
                         return Err(ContextPagingError::InvalidAction(
                             "edit_file replacement is identical to the current source".into(),
                         ));
                     }
-                    self.project.ensure_hash(&page.file, &page.source_hash)
+                    // Distinguish an actually wrong `old` value from a valid edit
+                    // whose source page was merely evicted from this fresh capsule.
+                    // Only the latter is recoverable by a deterministic page fault.
+                    if let Some(page) = capsule.exact_page_ids.iter().find_map(|page_id| {
+                        self.project.pages.get(page_id).filter(|page| {
+                            page.file == normalized && page.exact_source.contains(old)
+                        })
+                    }) {
+                        return self.project.ensure_hash(&page.file, &page.source_hash);
+                    }
+                    let authoritative_page = self
+                        .project
+                        .pages
+                        .values()
+                        .find(|page| {
+                            page.file == normalized && page.exact_source.contains(old)
+                        })
+                        .ok_or_else(|| {
+                            ContextPagingError::InvalidAction(format!(
+                                "edit_file old source does not match indexed source for {normalized}"
+                            ))
+                        })?;
+                    Err(ContextPagingError::MissingModificationSource {
+                        tool: call.name.clone(),
+                        path: normalized,
+                        symbol: authoritative_page.symbol_id.clone(),
+                    })
                 }
                 "write_file" => {
+                    let Some(replacement) =
+                        call.args.get("content").and_then(|value| value.as_str())
+                    else {
+                        // Leave ordinary schema errors to the normal tool validator;
+                        // absence of an exact page is not the only defect here.
+                        return Ok(());
+                    };
                     let Some(entry) = self
                         .project
                         .project_map
@@ -2551,31 +2624,40 @@ impl ContextPagingRuntime {
                     };
                     let current =
                         std::fs::read_to_string(contained_path(&self.project.root, &normalized)?)?;
-                    if call.args.get("content").and_then(|value| value.as_str())
-                        == Some(current.as_str())
-                    {
+                    if replacement == current {
                         return Err(ContextPagingError::InvalidAction(
                             "write_file content is identical to the current source".into(),
                         ));
                     }
-                    let has_full_page = capsule.exact_page_ids.iter().any(|page_id| {
-                        self.project.pages.get(page_id).is_some_and(|page| {
-                            page.file == normalized
-                                && page.source_hash == entry.source_hash
-                                && page.exact_source == current
-                        })
+                    let authoritative_page = self.project.pages.values().find(|page| {
+                        page.file == normalized
+                            && page.source_hash == entry.source_hash
+                            && page.exact_source == current
                     });
-                    if !has_full_page {
+                    let Some(authoritative_page) = authoritative_page else {
                         return Err(ContextPagingError::InvalidAction(format!(
-                            "overwriting existing file {normalized} requires its complete exact source page"
+                            "overwriting existing file {normalized} requires a complete indexable exact source page"
                         )));
+                    };
+                    if !capsule
+                        .exact_page_ids
+                        .iter()
+                        .any(|page_id| page_id == &authoritative_page.id)
+                    {
+                        return Err(ContextPagingError::MissingModificationSource {
+                            tool: call.name.clone(),
+                            path: normalized,
+                            symbol: authoritative_page.symbol_id.clone(),
+                        });
                     }
                     Ok(())
                 }
                 _ => Ok(()),
             }
         })();
-        if validation.is_err() {
+        if validation.as_ref().is_err_and(|error| {
+            !matches!(error, ContextPagingError::MissingModificationSource { .. })
+        }) {
             self.metrics.patch_rejection_count =
                 self.metrics.patch_rejection_count.saturating_add(1);
             self.save_runtime_state()?;
@@ -2874,10 +2956,81 @@ mod tests {
         let rendered_objective = capsule
             .rendered
             .split_once("objective: ")
-            .and_then(|(_, rest)| rest.split_once("\ncurrentAction:").map(|(text, _)| text))
+            .and_then(|(_, rest)| {
+                rest.split_once("\nacceptanceCriteria:")
+                    .map(|(text, _)| text)
+            })
             .expect("task contract objective");
         assert_eq!(rendered_objective, objective);
         assert!(rendered_objective.contains("TAIL_REQUIREMENT_MUST_SURVIVE"));
+    }
+
+    #[test]
+    fn mutable_guidance_follows_the_stable_contract_tools_map_and_exact_source() {
+        let (_directory, memory, symbol) = fixture();
+        let mandatory = BTreeSet::from([symbol.clone()]);
+        let mut first_ledger = ledger(&symbol);
+        first_ledger.current_focus = "Modify increment".into();
+        first_ledger.verification_state.status = "pending".into();
+        first_ledger.revision = 20;
+        let mut second_ledger = first_ledger.clone();
+        second_ledger.current_focus = "Verify increment".into();
+        second_ledger.verification_state.status = "passed".into();
+        second_ledger.revision = 21;
+        let build = |task: &TaskLedger, action: &str, phase| {
+            ContextCapsuleBuilder::new(ContextPagingConfig::default(), ConservativeTokenEstimator)
+                .build(ContextCapsuleRequest {
+                    ledger: task,
+                    current_action: action,
+                    phase,
+                    relevant_symbols: std::slice::from_ref(&symbol),
+                    mandatory_symbols: &mandatory,
+                    project: &memory,
+                    diagnostic: None,
+                    available_tools: &tools(),
+                })
+                .unwrap()
+        };
+        let modify = build(&first_ledger, "Modify increment", ActionPhase::Modify);
+        let verify = build(&second_ledger, "Verify increment", ActionPhase::Verify);
+
+        let runtime_start = modify.rendered.find("<task_state>").unwrap();
+        for stable_section in [
+            "<task_contract>",
+            "objective: Change increment safely",
+            "<usable_tools>",
+            "<project_map",
+            "<symbol_card",
+            "<exact_source_page",
+        ] {
+            let position = modify
+                .rendered
+                .find(stable_section)
+                .unwrap_or_else(|| panic!("missing stable section {stable_section}"));
+            assert!(
+                position < runtime_start,
+                "{stable_section} must precede mutable runtime guidance"
+            );
+        }
+        assert!(!modify.rendered.contains("revision=\"20\""));
+        assert!(!verify.rendered.contains("revision=\"21\""));
+        assert_eq!(modify.tool_names, verify.tool_names);
+        assert!(modify.rendered.contains(
+            "<usable_tools>edit_file,list_dir,read_file,run_shell,search,write_file</usable_tools>"
+        ));
+
+        let common_bytes = modify
+            .rendered
+            .bytes()
+            .zip(verify.rendered.bytes())
+            .take_while(|(left, right)| left == right)
+            .count();
+        let expected_stable = runtime_start + "<task_state>\naction: ".len();
+        assert_eq!(
+            common_bytes, expected_stable,
+            "the first changing byte must be the action, after all stable evidence"
+        );
+        assert!(modify.rendered[..common_bytes].contains("pub fn increment"));
     }
 
     #[test]
@@ -3184,6 +3337,89 @@ mod tests {
                 if message.contains("identical to the current source")
         ));
         assert_eq!(runtime.metrics.patch_rejection_count, 1);
+    }
+
+    #[test]
+    fn native_edit_and_overwrite_report_a_faultable_missing_source_page() {
+        let (directory, _memory, _symbol) = fixture();
+        let mut runtime = ContextPagingRuntime::open(
+            directory.path(),
+            "Fix wrong arithmetic and verify",
+            ContextPagingConfig::default(),
+        )
+        .unwrap();
+        let empty_capsule = ContextCapsule {
+            rendered: STABLE_AGENT_KERNEL.into(),
+            estimated_input_tokens: 100,
+            max_input_tokens: 5_500,
+            output_reserve: 1_300,
+            safety_reserve: 1_200,
+            exact_page_ids: Vec::new(),
+            tool_names: Vec::new(),
+            composition: CapsuleComposition::default(),
+            included: Vec::new(),
+            excluded: Vec::new(),
+        };
+        let edit = ToolCall {
+            name: "edit_file".into(),
+            args: json!({
+                "path": "lib.rs",
+                "old": "helper(value) + 1",
+                "new": "helper(value) + 2"
+            }),
+        };
+        let mut replacement = std::fs::read_to_string(directory.path().join("lib.rs")).unwrap();
+        replacement = replacement.replace("helper(value) + 1", "helper(value) + 2");
+        let overwrite = ToolCall {
+            name: "write_file".into(),
+            args: json!({"path": "lib.rs", "content": replacement}),
+        };
+
+        let edit_symbol = match runtime.validate_tool_modification(&edit, &empty_capsule) {
+            Err(ContextPagingError::MissingModificationSource { tool, path, symbol }) => {
+                assert_eq!(tool, "edit_file");
+                assert_eq!(path, "lib.rs");
+                symbol
+            }
+            result => panic!("expected a faultable edit source, got {result:?}"),
+        };
+        assert!(matches!(
+            runtime.validate_tool_modification(&overwrite, &empty_capsule),
+            Err(ContextPagingError::MissingModificationSource {
+                tool,
+                path,
+                ..
+            }) if tool == "write_file" && path == "lib.rs"
+        ));
+        assert_eq!(
+            runtime.metrics.patch_rejection_count, 0,
+            "an evicted source page is a recoverable page fault, not a bad patch"
+        );
+        let wrong_old = ToolCall {
+            name: "edit_file".into(),
+            args: json!({
+                "path": "lib.rs",
+                "old": "source that never existed",
+                "new": "replacement"
+            }),
+        };
+        assert!(matches!(
+            runtime.validate_tool_modification(&wrong_old, &empty_capsule),
+            Err(ContextPagingError::InvalidAction(message))
+                if message.contains("does not match indexed source")
+        ));
+        assert_eq!(runtime.metrics.patch_rejection_count, 1);
+
+        runtime.need_context(&edit_symbol).unwrap();
+        let retry_capsule = runtime
+            .build_capsule("Retry the edit", ActionPhase::Modify, None, &tools())
+            .unwrap();
+        runtime
+            .validate_tool_modification(&edit, &retry_capsule)
+            .unwrap();
+        runtime
+            .validate_tool_modification(&overwrite, &retry_capsule)
+            .unwrap();
     }
 
     #[test]

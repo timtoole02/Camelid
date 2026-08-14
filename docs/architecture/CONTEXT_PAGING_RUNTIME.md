@@ -45,9 +45,11 @@ Compatibility constraints:
 - Exact source is authoritative. A card or page whose file hash no longer
   matches is excluded and must be rebuilt.
 - Typed patches are translated to ordinary `edit_file` calls and pass the
-  workspace sandbox, approval, checkpoint, and audit layers. Native edits are
-  also rejected unless their old source occurs in an exact page in the current
-  capsule; overwrites of existing files require a full exact file page.
+  workspace sandbox, approval, checkpoint, and audit layers. When a valid
+  native edit or overwrite targets indexed source that was evicted from the
+  current capsule, the host raises a page fault, makes that exact page mandatory,
+  and asks the model to retry. Wrong and no-op edits remain rejected; overwrites
+  of existing files require a bounded full exact file page.
 - No embeddings, vector database, multi-agent dependency, or growing KV cache
   is required by the first slice.
 
@@ -71,9 +73,12 @@ implemented type, and generic `impl<T>` headers are recognized. Brace counting
 ignores braces inside string/char literals and `//` comments; multi-line raw
 strings remain a documented heuristic limit.
 
-`ContextCapsuleBuilder` emits a fresh capsule for one action. The stable kernel
-is a byte-stable prefix; task-specific state follows it. Items are ordered by
-category and stable identifiers. Eviction strictly follows the spec priority
+`ContextCapsuleBuilder` emits a fresh capsule for one action. Prefix order is
+chosen for the actual Qwen cache key: the byte-stable kernel, immutable task
+contract, stable active-work tool list, project map, cards, and exact pages all
+precede the late mutable task state. The persisted ledger revision is not model
+input; source hashes and project-index revisions enforce freshness. Items within
+a category use stable identifiers. Eviction strictly follows the spec priority
 ladder as a prefix take — first removed to last removed: failed-attempt
 history, low-relevance cards, dependency pages, completed-work detail,
 repository map, task detail — never a greedy fill that would keep small
@@ -81,17 +86,27 @@ low-priority history while dropping higher-priority evidence. Never-evict
 content is the stable kernel, the bounded task contract, the current
 diagnostic, the phase tool list, the modification target page (the most
 recently faulted symbol), and every pinned page. Pinned pages are capped at 4;
-the least-faulted pin is released first. The task contract is split:
-`objective`, `currentAction`, `currentFocus`, `acceptanceCriteria`,
-`criticalInvariants`, and `verificationStatus` stay mandatory. The immutable
-user objective is preserved verbatim and fails closed if it cannot fit; mutable
-focus is bounded to 600 bytes, and criterion/invariant lists render at most 6
-items of 240 bytes. `decisions` and `openQuestions` render as evictable task
-detail. Ledger lists themselves are bounded (32 items, 480 bytes per item), so
+the least-faulted pin is released first. The immutable contract contains the
+exact `objective`, `acceptanceCriteria`, and `criticalInvariants`; late mandatory
+task state contains `action`, `focus`, and `verification`. The immutable user
+objective is preserved verbatim and fails closed if it cannot fit; mutable focus
+is bounded to 600 bytes, and criterion/invariant lists render at most 6 items of
+240 bytes. `decisions` and `openQuestions` render as evictable task detail.
+Ledger lists themselves are bounded (32 items, 480 bytes per item), so
 model-authored state cannot grow without bound. The builder uses a
 `TokenEstimator` interface that is continuously calibrated from the live
 tokenizer's measured tokens-per-byte rate; the integrated request is still
 checked with Camelid's exact loaded-model tokenizer preflight before inference.
+
+Dense Qwen3 with F32 resident Metal KV admits a partial prefix only when the
+common-prefix/divergent-suffix token ratio is at least 48:1; that threshold is a
+measured M4 break-even, not a paging policy knob. The late task state is kept
+compact so ordinary Modify/Verify transitions can clear it. A real write still
+changes source hashes, map rows, and pages and may correctly force one cold
+prefill; the layout does not claim that every action is cacheable. On the exact
+TaskForge/Qwen3-4B-Q8_0 fixture with six active-work schemas and unchanged
+preceding evidence, the measured integer reuse ratios are 53:1 (Modify to
+pending Verify), 66:1 (pending to plain Verify), and 67:1 (source-fault retry).
 
 The advertised action protocol is the model's existing native function-call
 format: one advertised tool call per step, followed by a concise plain-text
@@ -118,10 +133,12 @@ storage, because test failures print their assertions near the end of logs;
 the model still sees only the compact bounded summary. The capture mode is
 scoped to the paging session's own agent-loop thread and set explicitly each
 run, so a concurrent session without paging keeps the legacy head-only 16 KiB
-clip. Successful `search`, `list_dir`, and `read_file`
-results reach the next capsule as compact "ok"-status diagnostics with
-reference IDs — fresh capsules never replay history, so the compact diagnostic
-is the only channel through which any tool result reaches the model. Runtime
+clip. Successful `search` and `list_dir` results, plus reads that cannot be
+represented by one bounded full-file page, reach the next capsule as compact
+"ok"-status diagnostics with reference IDs. A successful small-file read instead
+faults in its canonical hash-backed full page and drops the duplicate numbered
+preview. Fresh capsules never replay history, so one of those bounded channels
+must carry each observation. Runtime
 metrics and repeated page-fault pins are persisted separately from the ledger,
 so restarting the inference session does not reset canonical progress or
 observability.
@@ -173,7 +190,7 @@ half-written state. Retrieval misses are persisted even when the fault fails.
 - `CAMELID_CONTEXT_DEBUG=1`: record item inclusion/exclusion explanations.
 
 Invalid numeric values fail closed to the documented defaults. A capsule that
-cannot retain its mandatory task contract, current focus, critical invariants,
+cannot retain its immutable task contract, late mandatory task state, current
 diagnostic, and exact target source returns a budget error rather than silently
 dropping them.
 

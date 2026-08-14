@@ -21,8 +21,8 @@ use super::audit::{self, AuditEvent, AuditSink};
 use super::banner;
 use super::client::{Client, StreamEnd};
 use super::context_paging::{
-    parse_typed_action, ActionPhase, CompactDiagnostic, ContextPagingConfig, ContextPagingRuntime,
-    TypedModelAction,
+    parse_typed_action, ActionPhase, CompactDiagnostic, ContextPagingConfig, ContextPagingError,
+    ContextPagingRuntime, TypedModelAction,
 };
 use super::session::{Session, CANCEL};
 use super::shell_sandbox::{self, ShellSandbox};
@@ -1167,21 +1167,14 @@ pub fn run_loop(
                         )
                         .to_string()
                     }
-                    ActionPhase::Modify => concat!(
-                        "Advance the complete objective with one native tool call. Inspect exact ",
-                        "source when needed, then write or edit the next required file."
-                    )
-                    .to_string(),
-                    ActionPhase::Verify if !pending_verification_paths.is_empty() => concat!(
-                        "Continue implementing any remaining requirements. When implementation is ",
-                        "complete, re-read every changed file and run the narrowest relevant tests."
-                    )
-                    .to_string(),
-                    ActionPhase::Verify => concat!(
-                        "Run the narrowest relevant test, build, or syntax check now. If any ",
-                        "requirement remains, write or edit it before completing."
-                    )
-                    .to_string(),
+                    ActionPhase::Modify =>
+                        "Implement the next unmet requirement; inspect exact source before editing."
+                            .to_string(),
+                    ActionPhase::Verify if !pending_verification_paths.is_empty() =>
+                        "Finish missing work; reread changed files; verify as required.".to_string(),
+                    ActionPhase::Verify =>
+                        "Finish missing work or run the narrowest relevant verification now."
+                            .to_string(),
                     ActionPhase::Complete =>
                         "Answer in plain text with a concise verified summary under 60 words"
                             .to_string(),
@@ -2192,6 +2185,42 @@ pub fn run_loop(
                             .err()
                             .map(|error| (call.name.clone(), error))
                     }) {
+                        if let ContextPagingError::MissingModificationSource {
+                            path, symbol, ..
+                        } = &error
+                        {
+                            let page = match runtime.need_context(symbol) {
+                                Ok(page) => page,
+                                Err(fault_error) => {
+                                    reporter.notice(&format!(
+                                        "context paging source-page recovery failed: {fault_error}"
+                                    ));
+                                    return LoopEnd::DriverError;
+                                }
+                            };
+                            // `need_context` makes the last faulted symbol mandatory,
+                            // so the retry capsule cannot evict the edit target. Keep
+                            // this expected page fault out of the fixed rejection
+                            // counter: the same native call is valid on the next step.
+                            paging_discovery_complete = true;
+                            paging_diagnostic = None;
+                            runtime.ledger.current_focus =
+                                format!("Source loaded for `{path}`; retry {call_name}.");
+                            if let Err(save_error) = runtime.save() {
+                                reporter
+                                    .notice(&format!("context paging state error: {save_error}"));
+                                return LoopEnd::DriverError;
+                            }
+                            let message = format!(
+                                "exact source for `{path}` was absent; host faulted and pinned {} ({}:{}-{}). Retry {call_name} now",
+                                page.symbol_id, page.file, page.start_line, page.end_line
+                            );
+                            reporter.tool_call(&format!("{call_name}(?)"));
+                            reporter.tool_result(&call_name, &ToolOutcome::Err(message.clone()));
+                            reporter.notice(&message);
+                            paging_no_progress!();
+                            continue;
+                        }
                         let message = error.to_string();
                         reporter.tool_call(&format!("{call_name}(?)"));
                         reporter.tool_result(&call_name, &ToolOutcome::Err(message.clone()));
@@ -2774,11 +2803,11 @@ pub fn run_loop(
                                     return LoopEnd::DriverError;
                                 }
                             };
-                        // Fresh capsules never replay history, so the compact
-                        // summary is the ONLY channel through which any tool
-                        // result reaches the model. Successful search, listing,
-                        // and read results ride the diagnostic slot too (status
-                        // "ok"), or the model could never see them at all.
+                        // Fresh capsules never replay history, so every result
+                        // needs a bounded next-step channel. Search/listing and
+                        // non-indexable reads use the compact diagnostic slot;
+                        // a small indexed file is represented more precisely by
+                        // its canonical exact page below.
                         if raw_outcome.is_err()
                             || matches!(
                                 &action,
@@ -2797,11 +2826,26 @@ pub fn run_loop(
                                 // familiar tool protocol for small models while preserving the
                                 // host-owned exact-source/hash boundary for later edits.
                                 if runtime.project.resolve_symbol(&relative).is_some() {
-                                    if let Err(error) = runtime.need_context(&relative) {
-                                        reporter.notice(&format!(
-                                            "context paging source-page error: {error}"
-                                        ));
-                                        return LoopEnd::DriverError;
+                                    match runtime.need_context(&relative) {
+                                        Ok(page) => {
+                                            // A bounded full-file page is the canonical,
+                                            // hash-backed version of this read. Do not also
+                                            // replay the numbered read preview in the next
+                                            // capsule: it duplicates source and turns an
+                                            // otherwise small changing suffix into a cold
+                                            // Metal prefill. Symbol-only pages keep the
+                                            // compact read result because they may not cover
+                                            // everything the model requested.
+                                            if runtime.project.page_covers_full_file(&page) {
+                                                paging_diagnostic = None;
+                                            }
+                                        }
+                                        Err(error) => {
+                                            reporter.notice(&format!(
+                                                "context paging source-page error: {error}"
+                                            ));
+                                            return LoopEnd::DriverError;
+                                        }
                                     }
                                 }
                             }
@@ -2815,8 +2859,7 @@ pub fn run_loop(
                                     .ledger
                                     .completed_work
                                     .push(format!("{} changed {relative}", action.tool_name()));
-                                runtime.ledger.current_focus =
-                                    format!("Verify the change to {relative}");
+                                runtime.ledger.current_focus = format!("Verify {relative}");
                                 runtime.ledger.verification_state.status = "pending".into();
                                 runtime.ledger.verification_state.failing_diagnostic = None;
                                 runtime.ledger.verification_state.verified_symbols.clear();
@@ -2916,11 +2959,8 @@ pub fn run_loop(
                                         // succeeds; this also prevents a multi-file task from
                                         // completing after its first reread.
                                         runtime.ledger.verification_state.status = "pending".into();
-                                        runtime.ledger.current_focus = concat!(
-                                            "All changed files were captured. Run the narrowest ",
-                                            "relevant test, build, or syntax check before completing."
-                                        )
-                                        .into();
+                                        runtime.ledger.current_focus =
+                                            "Verification pending".into();
                                     }
                                     paging_diagnostic = None;
                                 } else {
@@ -6204,6 +6244,318 @@ mod tests {
             1,
             "one visible correction must replace the old byte-identical retry"
         );
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+    }
+
+    #[test]
+    fn paging_read_uses_a_full_exact_page_but_keeps_symbol_only_read_diagnostics() {
+        let _checkpoint_guard = super::super::checkpoint::tests::cp_lock();
+        struct ReadChannelDriver {
+            step: usize,
+        }
+        impl ModelDriver for ReadChannelDriver {
+            fn step(
+                &mut self,
+                history: &[AgentMsg],
+                tools: &[ToolSpec],
+            ) -> Result<ModelStep, String> {
+                let [AgentMsg::User(capsule)] = history else {
+                    return Err("paging must send exactly one fresh User capsule".into());
+                };
+                let response = match self.step {
+                    0 => ModelStep::Calls(vec![tc("read_file", json!({"path": "src/lib.rs"}))]),
+                    1 => {
+                        assert!(capsule.contains("<exact_source_page"), "{capsule}");
+                        assert!(capsule.contains("pub fn increment"), "{capsule}");
+                        assert!(
+                            !capsule.contains("<current_diagnostic>"),
+                            "a full hash-backed page must replace the duplicate read preview: {capsule}"
+                        );
+                        ModelStep::Calls(vec![tc("read_file", json!({"path": "src/large.rs"}))])
+                    }
+                    2 => {
+                        assert!(capsule.contains("<exact_source_page"), "{capsule}");
+                        assert!(
+                            capsule.contains("<current_diagnostic>"),
+                            "a symbol-only page does not cover the whole read, so its bounded preview must survive: {capsule}"
+                        );
+                        assert!(tools.iter().any(|tool| tool.name == "write_file"));
+                        ModelStep::Calls(vec![tc(
+                            "write_file",
+                            json!({
+                                "path": "marker.rs",
+                                "content": "fn main() { println!(\"verified\"); }\n"
+                            }),
+                        )])
+                    }
+                    3 => ModelStep::Calls(vec![tc("read_file", json!({"path": "marker.rs"}))]),
+                    4 => ModelStep::Calls(vec![tc(
+                        "run_shell",
+                        json!({"command": "rustc marker.rs -o marker-check"}),
+                    )]),
+                    _ => {
+                        assert!(tools.is_empty());
+                        ModelStep::Text(
+                            "Inspected both source shapes and verified marker.rs.".into(),
+                        )
+                    }
+                };
+                self.step += 1;
+                Ok(response)
+            }
+        }
+
+        let (directory, sandbox) = paging_workspace();
+        let large = (0..500)
+            .map(|index| {
+                format!("pub fn generated_{index}(value: i32) -> i32 {{ value + {index} }}\n")
+            })
+            .collect::<String>();
+        assert!(
+            large.len() > 16 * 1024,
+            "fixture must exceed the full-page bound"
+        );
+        std::fs::write(directory.path().join("src/large.rs"), large).unwrap();
+        let mut driver = ReadChannelDriver { step: 0 };
+        let mut approver = ScriptApprover(vec![Decision::Once, Decision::Once], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(
+            "Inspect `src/lib.rs` and `src/large.rs`, then create and verify `marker.rs`.".into(),
+        )];
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sandbox,
+            &paging_cfg(directory.path()),
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
+        assert_eq!(driver.step, 6);
+        assert!(directory.path().join("marker.rs").is_file());
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+    }
+
+    #[test]
+    fn paging_faults_missing_native_edit_source_before_retrying_the_same_call() {
+        let _checkpoint_guard = super::super::checkpoint::tests::cp_lock();
+        struct FaultOnEditDriver {
+            step: usize,
+            capsules: Vec<String>,
+        }
+        impl ModelDriver for FaultOnEditDriver {
+            fn step(
+                &mut self,
+                history: &[AgentMsg],
+                tools: &[ToolSpec],
+            ) -> Result<ModelStep, String> {
+                let [AgentMsg::User(capsule)] = history else {
+                    return Err("paging must send exactly one fresh User capsule".into());
+                };
+                self.capsules.push(capsule.clone());
+                let edit = || {
+                    ModelStep::Calls(vec![tc(
+                        "edit_file",
+                        json!({
+                            "path": "src/lib.rs",
+                            "old": "value + 1",
+                            "new": "value + 2"
+                        }),
+                    )])
+                };
+                let response = match self.step {
+                    0 => {
+                        assert!(!capsule.contains("<exact_source_page"), "{capsule}");
+                        assert!(tools.iter().any(|tool| tool.name == "list_dir"));
+                        ModelStep::Calls(vec![tc("list_dir", json!({"path": "."}))])
+                    }
+                    1 => {
+                        assert!(!capsule.contains("value + 1"), "{capsule}");
+                        assert!(tools.iter().any(|tool| tool.name == "edit_file"));
+                        edit()
+                    }
+                    2 => {
+                        assert!(capsule.contains("value + 1"), "{capsule}");
+                        assert!(
+                            capsule.contains("Source loaded for `src/lib.rs`; retry edit_file"),
+                            "{capsule}"
+                        );
+                        edit()
+                    }
+                    3 => {
+                        assert!(
+                            capsule.contains(
+                                "action: Finish missing work; reread changed files; verify as required."
+                            ),
+                            "{capsule}"
+                        );
+                        assert!(capsule.contains("focus: Verify src/lib.rs"), "{capsule}");
+                        ModelStep::Calls(vec![tc("read_file", json!({"path": "src/lib.rs"}))])
+                    }
+                    4 => {
+                        assert!(capsule.contains("<exact_source_page"), "{capsule}");
+                        assert!(
+                            !capsule.contains("<current_diagnostic>"),
+                            "a full exact page must replace the duplicate numbered read preview: {capsule}"
+                        );
+                        assert!(
+                            capsule.contains(
+                                "action: Finish missing work or run the narrowest relevant verification now."
+                            ),
+                            "{capsule}"
+                        );
+                        assert!(capsule.contains("focus: Verification pending"), "{capsule}");
+                        ModelStep::Calls(vec![tc(
+                            "run_shell",
+                            json!({"command": "rustc --crate-type lib src/lib.rs --emit metadata -o check.rmeta"}),
+                        )])
+                    }
+                    _ => {
+                        assert!(tools.is_empty());
+                        ModelStep::Text("Corrected the arithmetic and verified the library.".into())
+                    }
+                };
+                self.step += 1;
+                Ok(response)
+            }
+        }
+
+        let objective = "Fix wrong arithmetic and verify the result";
+        let (directory, sandbox) = paging_workspace();
+        let mut driver = FaultOnEditDriver {
+            step: 0,
+            capsules: Vec::new(),
+        };
+        let mut approver = ScriptApprover(vec![Decision::Once, Decision::Once], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(objective.into())];
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sandbox,
+            &paging_cfg(directory.path()),
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
+        assert_eq!(driver.step, 6);
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("src/lib.rs")).unwrap(),
+            "pub fn increment(value: i32) -> i32 {\n    value + 2\n}\n"
+        );
+        assert!(reporter
+            .notices
+            .iter()
+            .any(|notice| notice.contains("host faulted and pinned")));
+        assert!(!reporter
+            .notices
+            .iter()
+            .any(|notice| notice.contains("repeatedly proposed invalid")));
+        let runtime =
+            ContextPagingRuntime::open(directory.path(), objective, ContextPagingConfig::default())
+                .unwrap();
+        assert_eq!(
+            runtime.metrics.patch_rejection_count, 0,
+            "a missing capsule page must not consume the bad-patch retry budget"
+        );
+        assert!(runtime.metrics.page_fault_count >= 1);
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+    }
+
+    #[test]
+    fn paging_greenfield_write_then_edit_then_read_verify_and_complete() {
+        let _checkpoint_guard = super::super::checkpoint::tests::cp_lock();
+        struct WriteEditDriver {
+            step: usize,
+        }
+        impl ModelDriver for WriteEditDriver {
+            fn step(
+                &mut self,
+                history: &[AgentMsg],
+                tools: &[ToolSpec],
+            ) -> Result<ModelStep, String> {
+                let [AgentMsg::User(capsule)] = history else {
+                    return Err("paging must send exactly one fresh User capsule".into());
+                };
+                let response = match self.step {
+                    0 => {
+                        assert!(tools.iter().any(|tool| tool.name == "write_file"));
+                        ModelStep::Calls(vec![tc(
+                            "write_file",
+                            json!({
+                                "path": "app.rs",
+                                "content": concat!(
+                                    "fn value() -> i32 { 1 }\n\n",
+                                    "#[cfg(test)]\nmod tests {\n",
+                                    "    use super::value;\n",
+                                    "    #[test]\n",
+                                    "    fn value_is_two() { assert_eq!(value(), 2); }\n",
+                                    "}\n"
+                                )
+                            }),
+                        )])
+                    }
+                    1 => {
+                        assert!(capsule.contains("fn value() -> i32 { 1 }"), "{capsule}");
+                        assert!(tools.iter().any(|tool| tool.name == "edit_file"));
+                        ModelStep::Calls(vec![tc(
+                            "edit_file",
+                            json!({
+                                "path": "app.rs",
+                                "old": "fn value() -> i32 { 1 }",
+                                "new": "fn value() -> i32 { 2 }"
+                            }),
+                        )])
+                    }
+                    2 => ModelStep::Calls(vec![tc("read_file", json!({"path": "app.rs"}))]),
+                    3 => ModelStep::Calls(vec![tc(
+                        "run_shell",
+                        json!({"command": "rustc --test app.rs -o app-tests"}),
+                    )]),
+                    _ => {
+                        assert!(tools.is_empty());
+                        ModelStep::Text("Created, corrected, and verified app.rs.".into())
+                    }
+                };
+                self.step += 1;
+                Ok(response)
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::new(directory.path(), false, Duration::from_secs(5))
+            .unwrap()
+            .with_shell_mode(ShellSandbox::Sandboxed);
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+        let mut driver = WriteEditDriver { step: 0 };
+        let mut approver = ScriptApprover(vec![Decision::Once, Decision::Once, Decision::Once], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(
+            "Create app.rs so value returns two and its test passes, then verify app.rs".into(),
+        )];
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sandbox,
+            &paging_cfg(directory.path()),
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
+        assert_eq!(driver.step, 5);
+        assert!(std::fs::read_to_string(directory.path().join("app.rs"))
+            .unwrap()
+            .contains("fn value() -> i32 { 2 }"));
+        assert!(directory.path().join("app-tests").is_file());
         super::super::checkpoint::clear_for_workspace(sandbox.root());
     }
 
