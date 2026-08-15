@@ -564,6 +564,43 @@ fn supply_paging_list_dir_root(call: &mut ToolCall, profile: tools::ToolProfile)
     true
 }
 
+/// POSIX Python installations commonly expose only `python3`. Small local
+/// models still strongly prefer the shorter `python` spelling even when the
+/// stable kernel says otherwise, spending a complete inference turn on a
+/// deterministic launcher error. Repair only a simple leading executable: no
+/// shell operators, substitutions, or multi-command input are rewritten.
+#[cfg(not(windows))]
+fn supply_paging_python3_launcher(call: &mut ToolCall, profile: tools::ToolProfile) -> bool {
+    let canonical = tools::repair_tool_name(&call.name, profile).unwrap_or(call.name.as_str());
+    if canonical != "run_shell" {
+        return false;
+    }
+    let Some(args) = call.args.as_object_mut() else {
+        return false;
+    };
+    let Some(command) = args.get("command").and_then(Value::as_str) else {
+        return false;
+    };
+    let trimmed = command.trim();
+    let suffix = if trimmed == "python" {
+        ""
+    } else if let Some(suffix) = trimmed.strip_prefix("python ") {
+        suffix
+    } else {
+        return false;
+    };
+    if trimmed.contains(['\n', '\r', ';', '|', '&', '`']) || trimmed.contains("$(") {
+        return false;
+    }
+    let normalized = if suffix.is_empty() {
+        "python3".to_string()
+    } else {
+        format!("python3 {suffix}")
+    };
+    args.insert("command".into(), Value::String(normalized));
+    true
+}
+
 /// Context Paging creates `.camelid/` before the first model step, so a literal
 /// `read_dir().next().is_none()` can never recognize a greenfield task. Ignore
 /// only host metadata that is not user project state; any other entry keeps the
@@ -2544,6 +2581,8 @@ pub fn run_loop(
                 require_workspace_change && workspace_is_effectively_empty(sandbox.root());
             let missing_artifacts =
                 missing_required_artifacts(sandbox.root(), &required_workspace_artifacts);
+            let missing_authored_artifacts =
+                missing_required_authored_artifacts(sandbox.root(), &required_workspace_artifacts);
             let verification_failed = runtime.ledger.verification_state.status.as_str() == "failed";
             let phase = if workspace_changed && verification_failed {
                 // A real test/build failure is repair evidence.  Return all
@@ -2649,6 +2688,15 @@ pub fn run_loop(
             }
             if direct_creation_target.is_some() {
                 capsule_tools.retain(|tool| tool.name == "write_file");
+            } else if !missing_authored_artifacts.is_empty() {
+                // A read-only verification command cannot succeed for an
+                // explicitly incomplete project. Advertising run_shell here
+                // lets a small model execute a half-built entry point, then
+                // chase secondary import/path errors instead of creating the
+                // remaining host-known artifacts. Keep file tools available;
+                // restore the stable shell vocabulary as soon as the manifest
+                // is complete.
+                capsule_tools.retain(|tool| tool.name != "run_shell");
             } else if phase == ActionPhase::Verify && paging_shell_verification_required {
                 capsule_tools.retain(|tool| tool.name == "run_shell");
             }
@@ -3712,6 +3760,11 @@ pub fn run_loop(
                             reporter
                                 .notice("supplied deterministic workspace-root path for list_dir");
                         }
+                        #[cfg(not(windows))]
+                        if supply_paging_python3_launcher(call, cfg.tool_profile) {
+                            reporter
+                                .notice("normalized the unavailable POSIX python alias to python3");
+                        }
                     }
                 }
                 if let Some(call) = context_paging.as_ref().and_then(|_| {
@@ -3721,6 +3774,8 @@ pub fn run_loop(
                         !step_tools.iter().any(|tool| tool.name == canonical)
                     })
                 }) {
+                    let canonical = tools::repair_tool_name(&call.name, cfg.tool_profile)
+                        .unwrap_or(call.name.as_str());
                     let message = format!(
                         "tool `{}` is not available in the current context-paging phase",
                         call.name
@@ -3729,28 +3784,38 @@ pub fn run_loop(
                     reporter.tool_result(&call.name, &ToolOutcome::Err(message.clone()));
                     if let Some(runtime) = context_paging.as_mut() {
                         runtime.ledger.failed_attempts.push(message);
-                        runtime.ledger.current_focus =
-                            if call.name == "edit_file" && force_full_rewrite {
-                                PAGING_FULL_REWRITE_FOCUS.into()
+                        let missing_artifacts = missing_required_authored_artifacts(
+                            sandbox.root(),
+                            &required_workspace_artifacts,
+                        );
+                        runtime.ledger.current_focus = if canonical == "run_shell"
+                            && !missing_artifacts.is_empty()
+                        {
+                            format!(
+                                "Do not verify the incomplete project yet. Create the remaining required artifacts with write_file: {}.",
+                                missing_artifacts.join(", ")
+                            )
+                        } else if canonical == "edit_file" && force_full_rewrite {
+                            PAGING_FULL_REWRITE_FOCUS.into()
+                        } else {
+                            // Name the tools the phase actually offers: a
+                            // greedy model told only "use phase-relevant
+                            // tools" keeps re-proposing the same absent one.
+                            let available = step_tools
+                                .iter()
+                                .map(|tool| tool.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            if available.is_empty() {
+                                "No tools are available in this phase: return one typed action"
+                                    .to_string()
                             } else {
-                                // Name the tools the phase actually offers: a
-                                // greedy model told only "use phase-relevant
-                                // tools" keeps re-proposing the same absent one.
-                                let available = step_tools
-                                    .iter()
-                                    .map(|tool| tool.name.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(", ");
-                                if available.is_empty() {
-                                    "No tools are available in this phase: return one typed action"
-                                        .to_string()
-                                } else {
-                                    format!(
+                                format!(
                                     "Only these tools are available in this phase: {available}. \
                                      Use one of them (or a typed action) now."
                                 )
-                                }
-                            };
+                            }
+                        };
                         if let Err(error) = runtime.save() {
                             reporter.notice(&format!("context paging state error: {error}"));
                             return LoopEnd::DriverError;
@@ -4867,9 +4932,38 @@ pub fn run_loop(
                                     runtime.ledger.verification_state.status = "failed".into();
                                     runtime.ledger.verification_state.failing_diagnostic =
                                         Some(compact.raw_reference.clone());
-                                    runtime.ledger.current_focus = format!(
-                                        "`{command}` failed. Read the persisted diagnostic, correct the reported source or runtime defect, then rerun the relevant verification."
+                                    let summary = bounded_inline_shell_diagnostic(&compact.preview);
+                                    let missing_artifacts = missing_required_authored_artifacts(
+                                        sandbox.root(),
+                                        &required_workspace_artifacts,
                                     );
+                                    let missing_module = missing_required_python_module_artifact(
+                                        raw_outcome.text(),
+                                        &required_workspace_artifacts,
+                                        sandbox.root(),
+                                    );
+                                    runtime.ledger.current_focus = if let Some(path) =
+                                        missing_module
+                                    {
+                                        format!(
+                                            "`{command}` failed: {summary}. The required local module `{path}` does not exist; create it with write_file before rerunning."
+                                        )
+                                    } else if !missing_artifacts.is_empty() {
+                                        format!(
+                                            "`{command}` failed: {summary}. Do not verify the incomplete project again; create the remaining required artifacts with write_file: {}.",
+                                            missing_artifacts.join(", ")
+                                        )
+                                    } else {
+                                        format!(
+                                            "`{command}` failed: {summary}. Correct this exact source or runtime failure, then rerun the relevant verification."
+                                        )
+                                    };
+                                    let failed_attempt = format!("`{command}` failed: {summary}");
+                                    if runtime.ledger.failed_attempts.last()
+                                        != Some(&failed_attempt)
+                                    {
+                                        runtime.ledger.failed_attempts.push(failed_attempt);
+                                    }
                                     runtime.metrics.verification_retries =
                                         runtime.metrics.verification_retries.saturating_add(1);
                                 } else if zero_tests {
@@ -6091,6 +6185,78 @@ fn python_package_module_retry_command(command: &str, output: &str) -> Option<St
     None
 }
 
+const MAX_INLINE_SHELL_DIAGNOSTIC_CHARS: usize = 360;
+
+/// Keep the exact failure in the mandatory task-state tail. The complete raw
+/// result remains hash-addressed on disk, but a 4B model should not have to
+/// infer that a generic "persisted diagnostic" instruction refers to a
+/// separate optional-looking JSON block.
+fn bounded_inline_shell_diagnostic(output: &str) -> String {
+    let mut summary = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(8)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if summary.chars().count() > MAX_INLINE_SHELL_DIAGNOSTIC_CHARS {
+        summary = summary
+            .chars()
+            .take(MAX_INLINE_SHELL_DIAGNOSTIC_CHARS)
+            .collect();
+        summary.push('…');
+    }
+    if summary.is_empty() {
+        "the command returned an error without diagnostic text".into()
+    } else {
+        summary
+    }
+}
+
+/// Resolve a Python `No module named ...` error to a missing file only when
+/// the immutable user contract already names that artifact. This is a generic
+/// ecosystem adapter, not a guessed project layout: unknown third-party
+/// packages and undeclared module paths deliberately return `None`.
+fn missing_required_python_module_artifact(
+    output: &str,
+    required_artifacts: &BTreeSet<String>,
+    root: &Path,
+) -> Option<String> {
+    let lower = output.to_ascii_lowercase();
+    let start = lower.find("no module named")?;
+    let rest = lower[start + "no module named".len()..].trim_start();
+    let module = rest
+        .trim_start_matches(['\'', '"'])
+        .split(|character: char| {
+            character.is_ascii_whitespace() || matches!(character, '\'' | '"' | ':' | ';')
+        })
+        .next()
+        .unwrap_or_default();
+    if module.is_empty()
+        || module.split('.').any(|component| {
+            component.is_empty()
+                || !component
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        })
+    {
+        return None;
+    }
+    let module_path = module.replace('.', "/");
+    let candidates = [
+        format!("{module_path}.py"),
+        format!("{module_path}/__init__.py"),
+    ];
+    required_artifacts.iter().find_map(|required| {
+        let normalized = normalize_workspace_path(required);
+        candidates
+            .iter()
+            .any(|candidate| candidate == &normalized)
+            .then(|| (!root.join(&normalized).is_file()).then_some(normalized))
+            .flatten()
+    })
+}
+
 /// `unittest discover -t <root>` requires the start directory to be an
 /// importable package. Small models often add `-t .` even when the authored
 /// tests are ordinary filesystem-discovered modules. When that setup-only
@@ -6380,6 +6546,17 @@ fn missing_required_artifacts(root: &Path, required: &BTreeSet<String>) -> Vec<S
         .iter()
         .filter(|artifact| !required_artifact_exists(root, artifact))
         .cloned()
+        .collect()
+}
+
+/// Runtime-owned JSON/database state may be created only by executing the
+/// application. It must not deadlock the build by hiding run_shell. Everything
+/// else explicitly named by the user is part of the authored project floor and
+/// must exist before read-only verification begins.
+fn missing_required_authored_artifacts(root: &Path, required: &BTreeSet<String>) -> Vec<String> {
+    missing_required_artifacts(root, required)
+        .into_iter()
+        .filter(|artifact| !workspace_path_is_runtime_data(artifact))
         .collect()
 }
 
@@ -11394,6 +11571,11 @@ mod tests {
                     9 => {
                         assert!(capsule.contains("verification: failed"), "{capsule}");
                         assert!(capsule.contains("<current_diagnostic>"), "{capsule}");
+                        assert!(
+                            capsule.contains("required positional argument")
+                                || capsule.contains("required positional arguments"),
+                            "the mandatory recovery focus must restate the concrete shell failure: {capsule}"
+                        );
                         assert!(tools.iter().any(|tool| tool.name == "write_file"));
                         assert!(tools.iter().any(|tool| tool.name == "edit_file"));
                         assert!(tools.iter().any(|tool| tool.name == "run_shell"));
@@ -11475,6 +11657,23 @@ mod tests {
             "a real shell failure must replace stale verification guidance: {}",
             runtime.ledger.current_focus
         );
+        assert!(
+            runtime
+                .ledger
+                .current_focus
+                .contains("required positional argument")
+                || runtime
+                    .ledger
+                    .current_focus
+                    .contains("required positional arguments"),
+            "the exact shell error must be inline in mandatory focus: {}",
+            runtime.ledger.current_focus
+        );
+        assert!(runtime
+            .ledger
+            .failed_attempts
+            .iter()
+            .any(|attempt| attempt.contains("required positional argument")));
         super::super::checkpoint::clear_for_workspace(sandbox.root());
     }
 
@@ -12106,12 +12305,18 @@ mod tests {
                         json!({"path":"first.rs","content":"fn main() { println!(\"first\"); }\n"}),
                     )]),
                     1 => ModelStep::Calls(vec![tc("read_file", json!({"path":"first.rs"}))]),
-                    2 => ModelStep::Calls(vec![tc(
-                        "run_shell",
-                        json!({"command":"rustc first.rs -o first-check"}),
-                    )]),
+                    2 => {
+                        assert!(tools.iter().any(|tool| tool.name == "write_file"));
+                        assert!(!tools.iter().any(|tool| tool.name == "run_shell"));
+                        assert!(capsule.contains("second.rs"), "{capsule}");
+                        ModelStep::Calls(vec![tc(
+                            "run_shell",
+                            json!({"command":"rustc first.rs -o first-check"}),
+                        )])
+                    }
                     3 => {
                         assert!(tools.iter().any(|tool| tool.name == "write_file"));
+                        assert!(!tools.iter().any(|tool| tool.name == "run_shell"));
                         assert!(capsule.contains("second.rs"), "{capsule}");
                         assert!(capsule.contains("remaining required workspace artifacts"));
                         ModelStep::Calls(vec![tc(
@@ -12353,6 +12558,28 @@ mod tests {
         ));
         #[cfg(not(windows))]
         {
+            let mut python_alias = tc(
+                "run_shell",
+                json!({"command": "python -m unittest discover -s tests"}),
+            );
+            assert!(supply_paging_python3_launcher(
+                &mut python_alias,
+                tools::ToolProfile::WebCode,
+            ));
+            assert_eq!(
+                python_alias.args["command"],
+                "python3 -m unittest discover -s tests"
+            );
+            let mut compound = tc(
+                "run_shell",
+                json!({"command": "python app.py && echo done"}),
+            );
+            assert!(!supply_paging_python3_launcher(
+                &mut compound,
+                tools::ToolProfile::WebCode,
+            ));
+            assert_eq!(compound.args["command"], "python app.py && echo done");
+
             assert_eq!(
                 python_package_module_retry_command(
                     "python3 taskforge/main.py add \"Generate daily report\"",
@@ -12416,6 +12643,28 @@ mod tests {
                 &aliased_suite,
             )
             .is_none());
+
+            let directory = tempfile::tempdir().unwrap();
+            let required_module = BTreeSet::from(["alpha/queue.py".to_string()]);
+            assert_eq!(
+                missing_required_python_module_artifact(
+                    "ModuleNotFoundError: No module named 'alpha.queue'",
+                    &required_module,
+                    directory.path(),
+                )
+                .as_deref(),
+                Some("alpha/queue.py")
+            );
+            assert!(missing_required_python_module_artifact(
+                "ModuleNotFoundError: No module named 'requests'",
+                &required_module,
+                directory.path(),
+            )
+            .is_none());
+            let inline = bounded_inline_shell_diagnostic(
+                "exit: 1\nstderr:\nModuleNotFoundError: No module named 'alpha.queue'",
+            );
+            assert!(inline.contains("ModuleNotFoundError"), "{inline}");
         }
         assert!(!paging_verification_command_is_relevant(
             "cd taskforge && env PYTHONPATH=. python3 -m unittest discover -s tests",

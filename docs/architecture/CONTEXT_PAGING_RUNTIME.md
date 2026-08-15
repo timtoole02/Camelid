@@ -125,9 +125,12 @@ format: one advertised tool call per step, followed by a concise plain-text
 answer only after host verification. `read_file` doubles as the exact-source
 page-fault operation, so a small model does not need to learn a second JSON
 protocol before it can edit. `list_dir` with an omitted path is deterministically
-repaired to the workspace root. Modify and Verify expose the same scoped native
-tool set, allowing multi-file work to continue after the first write and keeping
-tool schemas stable across active steps. Once the model declares modification
+repaired to the workspace root. Modify and Verify normally expose the same
+scoped native tool set, allowing multi-file work to continue after the first
+write and keeping tool schemas stable across active steps. `run_shell` is
+withheld while an explicit authored source/build/test artifact is still missing;
+runtime-owned state such as application data remains allowed to be created by
+execution. Once the model declares modification
 settled (including an already-satisfied edit or a premature completion claim),
 the next step exposes only `run_shell` when available; this deliberate one-step
 cache break prevents another cosmetic edit loop and makes execution verification
@@ -146,7 +149,10 @@ ending after its first artifact.
 
 Every tool result is stored content-addressed under
 `.camelid/context-paging/artifacts`. Only its bounded structured diagnostic is
-eligible for the next capsule. When paging is active, shell output capture
+eligible for the next capsule. A failing shell result also repeats that bounded
+error directly in mandatory recovery focus, alongside any missing contract-owned
+artifact it identifies; the model is never told merely to consult an opaque
+artifact reference. When paging is active, shell output capture
 becomes tail-inclusive (64 KiB head plus 192 KiB tail) before external
 storage, because test failures print their assertions near the end of logs;
 the model still sees only the compact bounded summary. The capture mode is
