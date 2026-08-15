@@ -2315,14 +2315,27 @@ fn list_dir(path: &Path, offset: usize, limit: Option<usize>) -> ToolOutcome {
     let read = match std::fs::read_dir(path) {
         Ok(r) => r,
         Err(e) => {
+            // Listing a FILE is the one failure here a model can act on, and the
+            // raw errno is the one message it cannot. `Not a directory (os error
+            // 20)` names a POSIX condition, not a next step, and a small model
+            // reads it as "try again": observed looping three times on the same
+            // call in one run, while recovering first-try from every failure in
+            // the same run whose message named the fix. Route it to the tool that
+            // actually reads a file.
             return ToolOutcome::Err(if e.kind() == std::io::ErrorKind::NotFound {
                 format!(
                     "list failed: {e}. Paths are relative to the workspace root.{}",
                     similar_path_hint(path)
                 )
+            } else if path.is_file() {
+                format!(
+                    "list_dir failed: {} is a file, not a directory. Use read_file to read it, \
+                     or list_dir on its parent directory to see what is beside it.",
+                    display_path(path)
+                )
             } else {
                 format!("list failed: {e}")
-            })
+            });
         }
     };
     for entry in read.flatten() {
@@ -2550,7 +2563,72 @@ fn search_file(needle: &str, path: &Path, limit: usize, sandbox: &Sandbox) -> To
     ToolOutcome::Ok(output)
 }
 
+/// The line and the offending text of an f-string whose quote never closes on
+/// its own line, or `None` when the Python source has no such break.
+///
+/// Deliberately narrow. It looks only for a single-quoted `f'…` / `f"…` opened
+/// and not closed before the newline, which is the ONE construct this failure
+/// takes; a triple-quoted f-string spans lines legally and must not be flagged.
+/// It is a lint, not a parser: false negatives are fine (the syntax check is
+/// still behind it), false positives are not.
+fn unterminated_fstring_line(source: &str) -> Option<(usize, String)> {
+    for (index, line) in source.lines().enumerate() {
+        let bytes = line.as_bytes();
+        let mut cursor = 0usize;
+        while let Some(found) = line[cursor..].find(['\'', '"']) {
+            let quote_at = cursor + found;
+            let quote = bytes[quote_at];
+            // Only an f-prefixed literal: plain strings break the same way but
+            // are far likelier to be a deliberate concatenation the model wrote.
+            let prefixed = quote_at > 0
+                && matches!(bytes[quote_at - 1], b'f' | b'F')
+                && (quote_at < 2 || !bytes[quote_at - 2].is_ascii_alphanumeric());
+            // A triple quote is legally multi-line; skip past it entirely.
+            if line[quote_at..].starts_with(std::str::from_utf8(&[quote; 3]).unwrap_or("")) {
+                cursor = quote_at + 3;
+                continue;
+            }
+            let mut scan = quote_at + 1;
+            let mut closed = false;
+            while scan < bytes.len() {
+                if bytes[scan] == b'\\' {
+                    scan += 2;
+                    continue;
+                }
+                if bytes[scan] == quote {
+                    closed = true;
+                    break;
+                }
+                scan += 1;
+            }
+            if !closed {
+                return prefixed.then(|| (index + 1, line.trim_start().to_string()));
+            }
+            cursor = scan + 1;
+        }
+    }
+    None
+}
+
 fn write_file(path: &Path, content: &str, display_path: &str) -> ToolOutcome {
+    // Refuse a broken f-string BEFORE it lands. This exact defect — a literal
+    // newline inside `f'…'` — appeared in all nine observed TaskForge runs, and
+    // survived being corrected once mid-run: the model fixed line 51, later
+    // regenerated the file, and re-emitted it. The kernel already says to spell
+    // breaks as `\n`, and is ignored, so instruction is not the lever here.
+    //
+    // Catching it at authorship costs one rejection with the fix in it; catching
+    // it downstream costs a write, an execute, a syntax failure, a read and an
+    // edit — and leaves a file on disk that does not parse if the turn ends first.
+    if path.extension().is_some_and(|ext| ext == "py") {
+        if let Some((line, text)) = unterminated_fstring_line(content) {
+            return ToolOutcome::Err(format!(
+                "write refused: {display_path} line {line} opens an f-string that never closes on \
+                 that line:\n  {text}\nA Python string literal cannot span lines. Spell the break \
+                 as \\n inside the quotes — print(f'a:\\n  b') — then write the file again."
+            ));
+        }
+    }
     // Create the containing directory. `path` has already been through
     // `Workspace::resolve`, which canonicalized every existing ancestor and
     // refused anything outside the root, so this cannot create a directory the
@@ -3925,6 +4003,91 @@ mod tests {
         ToolCall {
             name: name.into(),
             args,
+        }
+    }
+
+    #[test]
+    fn the_fstring_lint_catches_the_defect_every_run_reproduced() {
+        // Verbatim from the runs: nine for nine, and it recurred after the model
+        // had already fixed it once in the same session.
+        let broken = "def add(args):\n    print(f'Added task {task.id}:\n  {task.description}')\n";
+        let (line, text) = unterminated_fstring_line(broken).expect("must flag");
+        assert_eq!(line, 2);
+        assert!(text.contains("Added task"), "{text}");
+    }
+
+    #[test]
+    fn the_fstring_lint_does_not_flag_legal_python() {
+        // False positives are worse than misses here: refusing a legitimate write
+        // strands the agent with no way to author the file at all. The syntax
+        // check still sits behind this lint to catch what it lets through.
+        let legal: [&str; 9] = [
+            r#"print(f'Added task {task.id}: {task.description}')"#,
+            r#"print(f"done: {n}")"#,
+            "x = f'''multi\nline is legal'''",
+            "y = f\"\"\"also\nlegal\"\"\"",
+            r#"s = 'plain unterminated"#,
+            r#"print(f'escaped \' quote inside')"#,
+            "path = f'{root}/{name}'",
+            "",
+            "# no strings at all",
+        ];
+        for ok in legal {
+            assert!(
+                unterminated_fstring_line(ok).is_none(),
+                "false positive on: {ok}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_file_refuses_a_broken_fstring_and_says_how_to_fix_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("main.py");
+        let broken = "print(f'Added task {task.id}:\n  {task.description}')\n";
+        match write_file(&target, broken, "main.py") {
+            ToolOutcome::Err(message) => {
+                assert!(message.contains("line 1"), "{message}");
+                assert!(message.contains("\\n"), "must name the fix: {message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(!target.exists(), "a refused write must not land on disk");
+    }
+
+    #[test]
+    fn write_file_still_accepts_correct_python() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("main.py");
+        let good = "print(f'Added task {task.id}:\\n  {task.description}')\n";
+        match write_file(&target, good, "main.py") {
+            ToolOutcome::Ok(_) => {}
+            other => panic!("the fixed form must be accepted, got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), good);
+    }
+
+    #[test]
+    fn list_dir_on_a_file_names_the_tool_that_reads_it() {
+        // A raw `Not a directory (os error 20)` was retried three times in one
+        // run. Every failure in that same run whose message named the fix was
+        // recovered from on the first try.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("main.py");
+        std::fs::write(&file, "x = 1\n").unwrap();
+        match list_dir(&file, 0, None) {
+            ToolOutcome::Err(message) => {
+                assert!(message.contains("is a file, not a directory"), "{message}");
+                assert!(
+                    message.contains("read_file"),
+                    "must route to read_file: {message}"
+                );
+                assert!(
+                    !message.contains("os error"),
+                    "must not surface the errno: {message}"
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
         }
     }
 

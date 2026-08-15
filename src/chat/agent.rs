@@ -12030,7 +12030,15 @@ mod tests {
     #[test]
     fn paging_taskforge_rejects_zero_tests_and_unimported_python_syntax_error() {
         let _checkpoint_guard = super::super::checkpoint::tests::cp_lock();
-        const BROKEN_MAIN: &str = "def main():\n    print(f\"unterminated\n";
+        // Deliberately NOT an unterminated f-string. `write_file` now lints that
+        // one construct and refuses it at authorship, so using it here would test
+        // the lint instead of the thing this test is about: that a syntax-broken
+        // file which DID reach disk keeps the Verify gate execution-only. The
+        // lint is narrow by design — it misses everything but the single-line
+        // f-string, and never sees `edit_file` or non-`.py` writes — so this
+        // downstream gate is the backstop for all of that, and needs a defect the
+        // lint lets through to prove it.
+        const BROKEN_MAIN: &str = "def main(:\n    pass\n";
         const PASSING_TEST: &str = concat!(
             "import unittest\n\n",
             "class QueueTests(unittest.TestCase):\n",
