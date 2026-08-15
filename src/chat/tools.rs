@@ -2664,24 +2664,139 @@ fn unterminated_fstring_line(source: &str) -> Option<(usize, String)> {
     None
 }
 
+fn python_structural_defect(source: &str) -> Option<String> {
+    if let Some((line, text)) = unterminated_fstring_line(source) {
+        return Some(format!(
+            "line {line} opens an f-string that never closes on that line:\n  {text}\n\
+             A single-quoted Python f-string needs an explicit continuation to span physical lines. \
+             Spell the intended break as \\n inside the quotes — print(f'a:\\n  b') — then write the file again."
+        ));
+    }
+
+    let mut delimiter_stack: Vec<(char, usize)> = Vec::new();
+    let mut triple_quote: Option<(u8, usize)> = None;
+    let mut continued_quote: Option<(u8, usize)> = None;
+
+    for (index, line) in source.lines().enumerate() {
+        let line_no = index + 1;
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let bytes = line.as_bytes();
+        let mut cursor = 0usize;
+
+        if let Some((quote, _)) = continued_quote {
+            if let Some(end) = python_quote_end(bytes, 0, quote, false) {
+                continued_quote = None;
+                cursor = end;
+            } else {
+                if !python_line_has_explicit_continuation(bytes) {
+                    continued_quote = None;
+                }
+                continue;
+            }
+        }
+
+        while cursor < bytes.len() {
+            if let Some((quote, _)) = triple_quote {
+                if let Some(end) = python_quote_end(bytes, cursor, quote, true) {
+                    triple_quote = None;
+                    cursor = end;
+                    continue;
+                }
+                break;
+            }
+
+            let byte = bytes[cursor];
+            if byte == b'#' {
+                break;
+            }
+            if matches!(byte, b'\'' | b'"') {
+                let quote_at = cursor;
+                let quote = bytes[quote_at];
+                let triple = bytes
+                    .get(quote_at..quote_at.saturating_add(3))
+                    .is_some_and(|candidate| candidate == [quote; 3]);
+                let content_at = quote_at + if triple { 3 } else { 1 };
+                if let Some(end) = python_quote_end(bytes, content_at, quote, triple) {
+                    cursor = end;
+                    continue;
+                }
+                if triple {
+                    triple_quote = Some((quote, line_no));
+                    break;
+                }
+                if python_line_has_explicit_continuation(bytes) {
+                    continued_quote = Some((quote, line_no));
+                    break;
+                }
+                cursor += 1;
+                continue;
+            }
+
+            match byte {
+                b'(' | b'[' | b'{' => delimiter_stack.push((byte as char, line_no)),
+                b')' => {
+                    if let Some((open, _)) = delimiter_stack.pop() {
+                        if open != '(' {
+                            return Some(format!("line {line_no} has mismatched closing ')' for opening '{open}'"));
+                        }
+                    } else {
+                        return Some(format!("line {line_no} has unmatched closing ')'"));
+                    }
+                }
+                b']' => {
+                    if let Some((open, _)) = delimiter_stack.pop() {
+                        if open != '[' {
+                            return Some(format!("line {line_no} has mismatched closing ']' for opening '{open}'"));
+                        }
+                    } else {
+                        return Some(format!("line {line_no} has unmatched closing ']'"));
+                    }
+                }
+                b'}' => {
+                    if let Some((open, _)) = delimiter_stack.pop() {
+                        if open != '{' {
+                            return Some(format!("line {line_no} has mismatched closing '}}' for opening '{open}'"));
+                        }
+                    } else {
+                        return Some(format!("line {line_no} has unmatched closing '}}'"));
+                    }
+                }
+                _ => {}
+            }
+            cursor += 1;
+        }
+    }
+
+    if let Some((quote, line)) = triple_quote {
+        let q_str = if quote == b'\'' { "'''" } else { "\"\"\"" };
+        return Some(format!(
+            "line {line} opens triple-quoted string {q_str} that is never closed at EOF (file appears truncated). \
+             Write the complete file in a separate call."
+        ));
+    }
+
+    if let Some((open, line)) = delimiter_stack.last() {
+        return Some(format!(
+            "line {line} opens '{open}' that is never closed at EOF (file appears truncated mid-expression). \
+             Write the complete file with write_file, or write one file per call."
+        ));
+    }
+
+    None
+}
+
 fn write_file(path: &Path, content: &str, display_path: &str) -> ToolOutcome {
-    // Refuse a broken f-string BEFORE it lands. This exact defect — a literal
-    // newline inside `f'…'` — appeared in all nine observed TaskForge runs, and
-    // survived being corrected once mid-run: the model fixed line 51, later
-    // regenerated the file, and re-emitted it. The kernel already says to spell
-    // breaks as `\n`, and is ignored, so instruction is not the lever here.
+    // Refuse broken Python BEFORE it lands. Catches:
+    // 1. Literal newlines inside `f'…'` (recurring defect)
+    // 2. Mid-expression/unclosed-delimiter truncation at EOF (from hitting the output token cap)
+    // 3. Unclosed triple-quoted strings at EOF
     //
     // Catching it at authorship costs one rejection with the fix in it; catching
     // it downstream costs a write, an execute, a syntax failure, a read and an
     // edit — and leaves a file on disk that does not parse if the turn ends first.
     if path.extension().is_some_and(|ext| ext == "py") {
-        if let Some((line, text)) = unterminated_fstring_line(content) {
-            return ToolOutcome::Err(format!(
-                "write refused: {display_path} line {line} opens an f-string that never closes on \
-                 that line:\n  {text}\nA single-quoted Python f-string needs an explicit \
-                 continuation to span physical lines. Spell the intended break as \\n inside the \
-                 quotes — print(f'a:\\n  b') — then write the file again."
-            ));
+        if let Some(defect) = python_structural_defect(content) {
+            return ToolOutcome::Err(format!("write refused: {display_path} {defect}"));
         }
     }
     // Create the containing directory. `path` has already been through
@@ -4113,6 +4228,39 @@ mod tests {
             other => panic!("expected a refusal, got {other:?}"),
         }
         assert!(!target.exists(), "a refused write must not land on disk");
+    }
+
+    #[test]
+    fn write_file_refuses_truncated_python_and_names_unclosed_delimiter() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("tests").join("test_queue.py");
+        // Exact truncation shape from TaskForge Run 3: output cap cut the payload at os.path.join(
+        let truncated = "import os\nimport unittest\n\nclass TestQueue(unittest.TestCase):\n    def setUp(self):\n        self.path = os.path.join(";
+        match write_file(&target, truncated, "tests/test_queue.py") {
+            ToolOutcome::Err(message) => {
+                assert!(message.contains("line 6"), "{message}");
+                assert!(message.contains("'('"), "{message}");
+                assert!(message.contains("truncated"), "{message}");
+            }
+            other => panic!("expected a truncation refusal, got {other:?}"),
+        }
+        assert!(!target.exists(), "a truncated write must not land on disk");
+    }
+
+    #[test]
+    fn write_file_refuses_unclosed_triple_quote_at_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("main.py");
+        let truncated = "def main():\n    \"\"\"Run the CLI application without closing docstring.";
+        match write_file(&target, truncated, "main.py") {
+            ToolOutcome::Err(message) => {
+                assert!(message.contains("line 2"), "{message}");
+                assert!(message.contains("\"\"\""), "{message}");
+                assert!(message.contains("truncated"), "{message}");
+            }
+            other => panic!("expected a triple-quote refusal, got {other:?}"),
+        }
+        assert!(!target.exists(), "a truncated write must not land on disk");
     }
 
     #[test]
