@@ -140,6 +140,11 @@ pub trait ModelDriver {
     /// the allowance that fits the remaining context budget, which may be below
     /// the configured ceiling. Drivers without a token budget ignore it.
     fn set_max_tokens(&mut self, _max_tokens: u32) {}
+
+    /// Require one specific native tool on the next model step while retaining
+    /// the complete advertised schema. Live Qwen35/Ornith drivers implement
+    /// this as a cache-compatible assistant prefill.
+    fn set_forced_tool(&mut self, _tool: Option<&str>) {}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2365,12 +2370,10 @@ pub fn run_loop(
     // `note_no_progress`).
     let mut call_counts: HashMap<String, (usize, String)> = HashMap::new();
     let mut recovered_call_signatures = BTreeSet::new();
-    // A deterministic local model can ignore one textual repeat correction
-    // and select the same highest-logit observation tool again. During that
-    // single recovery epoch, omit the repeated observation tool from the
-    // native schema as well as explaining why. Any successful different tool
-    // restores the normal stable vocabulary.
-    let mut temporarily_suppressed_paging_tool: Option<String> = None;
+    // One-step host recovery for deterministic small-model loops. Unlike
+    // removing a tool schema, a forced choice leaves the expensive prompt
+    // prefix byte-identical and is cleared immediately after generation.
+    let mut forced_paging_tool: Option<String> = None;
     let mut error_argument_churn = ErrorArgumentChurn::default();
     let mut total_tool_calls = 0usize;
     let mut plan_updates = 0usize;
@@ -2715,10 +2718,7 @@ pub fn run_loop(
                     ActionPhase::Complete => unreachable!("complete phase returned above"),
                 };
             let current_action = current_action_with_paging_feedback(current_action, history);
-            let mut capsule_tools = tools.clone();
-            if let Some(suppressed) = temporarily_suppressed_paging_tool.as_deref() {
-                capsule_tools.retain(|tool| tool.name != suppressed);
-            }
+            let capsule_tools = tools.clone();
             // Keep the native schema prefix byte-identical through active work.
             // The phase/current-action contract still tells the model which
             // action is valid now, and host validation rejects unsafe calls.
@@ -2784,6 +2784,7 @@ pub fn run_loop(
                 cfg.max_tokens,
             )
         };
+        driver.set_forced_tool(forced_paging_tool.as_deref());
         let (compiled_history, trimmed, prompt_tokens, allowance) = match fit_history_to_budget(
             driver,
             compiled_history,
@@ -2885,6 +2886,8 @@ pub fn run_loop(
                 }
             }
         };
+        forced_paging_tool = None;
+        driver.set_forced_tool(None);
         if let Some(metrics) = driver.take_step_metrics() {
             if let Some(runtime) = context_paging.as_mut() {
                 if let Some(output_tokens) = metrics.output_tokens {
@@ -4487,13 +4490,6 @@ pub fn run_loop(
                             .push((action.tool_name().to_string(), outcome.text().to_string()));
                     }
                     let name = action.tool_name();
-                    if !outcome.is_err()
-                        && temporarily_suppressed_paging_tool
-                            .as_deref()
-                            .is_some_and(|suppressed| suppressed != name)
-                    {
-                        temporarily_suppressed_paging_tool = None;
-                    }
                     reporter.tool_result(name, &outcome);
                     let host_python_verification = if context_paging.is_some()
                         && read_captures_pending_path
@@ -5406,22 +5402,31 @@ pub fn run_loop(
                         continue;
                     }
                     if recover_now {
-                        if context_paging.is_some()
-                            && matches!(
-                                &action,
-                                Action::ReadFile { .. }
-                                    | Action::ListDir { .. }
-                                    | Action::Search { .. }
-                            )
-                        {
-                            temporarily_suppressed_paging_tool = Some(name.to_string());
+                        let force_creation_write = context_paging.is_some()
+                            && require_workspace_change
+                            && matches!(&action, Action::ListDir { .. })
+                            && (workspace_is_effectively_empty(sandbox.root())
+                                || !missing_required_artifacts(
+                                    sandbox.root(),
+                                    &required_workspace_artifacts,
+                                )
+                                .is_empty());
+                        if force_creation_write {
+                            forced_paging_tool = Some("write_file".into());
                         }
                         reporter.notice(&format!(
                             "recovering: `{name}` returned the same result twice; requiring a different action"
                         ));
-                        push_reminder(history, &format!(
-                            "Runtime loop recovery: `{name}` with those arguments has already returned the same result twice. Treat that observation as settled; the repeated observation tool is temporarily unavailable until a different action succeeds. Choose another advertised native tool that advances the user's request now. If a directory listing established that the workspace is empty and the user asked you to create code, call `write_file` now; do not inspect the empty directory again."
-                        ));
+                        let recovery = if force_creation_write {
+                            format!(
+                                "Runtime loop recovery: `{name}` with those arguments has already returned the same result twice while required creation work remains. Inspection is settled. The host is requiring `write_file` for the next action; create the next missing requested artifact now."
+                            )
+                        } else {
+                            format!(
+                                "Runtime loop recovery: `{name}` with those arguments has already returned the same result twice. Treat that observation as settled and DO NOT repeat the same call. Choose another advertised native tool that advances the user's request now."
+                            )
+                        };
+                        push_reminder(history, &recovery);
                         continue;
                     }
                     if stuck || (already_recovered && repeat_count >= REPEAT_RECOVERY_THRESHOLD) {
@@ -9240,6 +9245,8 @@ pub struct LiveDriver {
     last_step_truncated: bool,
     /// Whether the most recent streamed step stopped at `max_tokens`.
     last_step_capped: bool,
+    /// One-step native tool requirement, rendered after the stable prompt.
+    forced_tool_name: Option<String>,
     /// Optional live-token sink. When set (the TUI), `step` streams the model's
     /// output via `chat_stream`, forwards each delta here, and parses tool calls
     /// from the accumulated raw content (`tool_parse`, every family). When `None`
@@ -9265,6 +9272,7 @@ impl LiveDriver {
             last_prompt_tokens: None,
             last_step_truncated: false,
             last_step_capped: false,
+            forced_tool_name: None,
             on_delta: None,
         }
     }
@@ -9292,6 +9300,7 @@ impl LiveDriver {
             last_prompt_tokens: None,
             last_step_truncated: false,
             last_step_capped: false,
+            forced_tool_name: None,
             on_delta: None,
         }
     }
@@ -9329,6 +9338,10 @@ impl LiveDriver {
 }
 
 impl ModelDriver for LiveDriver {
+    fn set_forced_tool(&mut self, tool: Option<&str>) {
+        self.forced_tool_name = tool.map(str::to_owned);
+    }
+
     fn last_prompt_tokens(&self) -> Option<u32> {
         self.last_prompt_tokens
     }
@@ -9504,6 +9517,12 @@ impl LiveDriver {
         }
         if let Some(budget_tokens) = self.context_budget_tokens {
             request["camelid_context_budget_tokens"] = json!(budget_tokens);
+        }
+        if let Some(name) = self.forced_tool_name.as_deref() {
+            request["tool_choice"] = json!({
+                "type": "function",
+                "function": {"name": name}
+            });
         }
         request
     }
@@ -16485,12 +16504,17 @@ mod tests {
     }
 
     #[test]
-    fn paging_repeat_recovery_suppresses_the_repeated_observation_until_progress() {
+    fn paging_repeat_recovery_preserves_the_native_schema_until_progress() {
         let _checkpoint_guard = super::super::checkpoint::tests::cp_lock();
         struct RecoveryDriver {
             step: usize,
+            forced_tool: Option<String>,
         }
         impl ModelDriver for RecoveryDriver {
+            fn set_forced_tool(&mut self, tool: Option<&str>) {
+                self.forced_tool = tool.map(str::to_owned);
+            }
+
             fn step(
                 &mut self,
                 history: &[AgentMsg],
@@ -16501,22 +16525,28 @@ mod tests {
                 };
                 let response = match self.step {
                     0 | 1 => {
+                        assert!(self.forced_tool.is_none());
                         assert!(tools.iter().any(|tool| tool.name == "list_dir"));
                         ModelStep::Calls(vec![tc("list_dir", json!({"path": "."}))])
                     }
                     2 => {
-                        assert!(!tools.iter().any(|tool| tool.name == "list_dir"));
+                        assert_eq!(self.forced_tool.as_deref(), Some("write_file"));
+                        assert!(tools.iter().any(|tool| tool.name == "list_dir"));
                         assert!(tools.iter().any(|tool| tool.name == "write_file"));
-                        assert!(capsule.contains("temporarily unavailable"), "{capsule}");
+                        assert!(
+                            capsule.contains("host is requiring `write_file`"),
+                            "{capsule}"
+                        );
                         ModelStep::Calls(vec![tc(
                             "write_file",
                             json!({"path": "game.py", "content": "print('ready')\n"}),
                         )])
                     }
                     3 => {
+                        assert!(self.forced_tool.is_none());
                         assert!(
                             tools.iter().any(|tool| tool.name == "list_dir"),
-                            "a successful different action must restore the normal vocabulary"
+                            "recovery must never mutate the normal vocabulary"
                         );
                         ModelStep::Calls(vec![tc("read_file", json!({"path": "game.py"}))])
                     }
@@ -16535,7 +16565,11 @@ mod tests {
             .unwrap()
             .with_shell_mode(ShellSandbox::Sandboxed);
         super::super::checkpoint::clear_for_workspace(sandbox.root());
-        let mut driver = RecoveryDriver { step: 0 };
+        std::fs::write(directory.path().join("README.md"), "existing project\n").unwrap();
+        let mut driver = RecoveryDriver {
+            step: 0,
+            forced_tool: None,
+        };
         let mut reporter = RecordReporter::default();
         let mut history = vec![AgentMsg::User(
             "Create game.py containing a small standard-library program.".into(),

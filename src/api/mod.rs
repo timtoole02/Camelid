@@ -1031,8 +1031,9 @@ pub struct ChatCompletionRequest {
     /// a certified tool branch fail closed instead of silently dropping tools.
     pub tools: Option<Vec<serde_json::Value>>,
     /// OpenAI `tool_choice`: `"auto"` (default), `"none"` (suppress parsing), or
-    /// `"required"`/a specific function (treated as `auto`). Parsed permissively
-    /// as a raw value. Declaring it here removes it from `unsupported_fields`.
+    /// `"required"`/a specific function. Qwen35/Ornith honors a specific
+    /// function with a cache-compatible assistant prefill; other lanes retain
+    /// their existing permissive behavior.
     pub tool_choice: Option<serde_json::Value>,
     /// OpenAI `parallel_tool_calls`: accepted and ignored (Camelid surfaces the
     /// tool calls the model actually emits). Declared here so it is not rejected.
@@ -1715,6 +1716,10 @@ pub struct GenerationSessionRequest {
     /// template (agent mode). `None` renders identically to before.
     #[serde(default)]
     pub tools: Option<Vec<serde_json::Value>>,
+    /// OpenAI tool choice, retained by runnable preflight so its exact token
+    /// count matches the served Qwen35/Ornith prompt.
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
     #[serde(flatten)]
     pub unsupported_fields: HashMap<String, serde_json::Value>,
     #[serde(default, skip_deserializing)]
@@ -4662,6 +4667,7 @@ async fn llama_server_completion(
         camelid_context_budget_tokens: None,
         camelid_enable_thinking: None,
         tools: None,
+        tool_choice: None,
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: Some(DEFAULT_PUBLIC_CHAT_MAX_TOKENS),
         constraint: None,
@@ -11784,6 +11790,7 @@ fn render_ornith_chatml_prompt_with_tools(
     messages: &[ChatMessage],
     tools: &[serde_json::Value],
     enable_thinking: bool,
+    forced_tool_name: Option<&str>,
 ) -> String {
     let mut prompt = String::new();
     prompt.push_str("<|im_start|>system\n");
@@ -11831,8 +11838,23 @@ fn render_ornith_chatml_prompt_with_tools(
         } else {
             "<think>\n\n</think>\n\n"
         });
+        if let Some(name) = forced_tool_name {
+            // This is deliberately an assistant PREFILL after the ordinary
+            // generation prompt. The prior prompt remains an exact prefix, so
+            // forcing a recovery tool does not discard the resident KV cache.
+            prompt.push_str("<tool_call>\n<function=");
+            prompt.push_str(name);
+            prompt.push_str(">\n");
+        }
     }
     prompt
+}
+
+fn ornith_forced_tool_parse_text(forced_tool_name: Option<&str>, content: &str) -> String {
+    match forced_tool_name {
+        Some(name) => format!("<tool_call>\n<function={name}>\n{content}"),
+        None => content.to_string(),
+    }
 }
 
 /// Split a generation into `(reasoning, content)` at the `</think>` TOKEN.
@@ -12525,6 +12547,9 @@ async fn runnable_chat_nonstreaming(
     let messages = req.messages.clone().unwrap_or_default();
     let enable_thinking = req.camelid_enable_thinking.unwrap_or(false);
     let tools = runnable_request_tools(req);
+    let forced_tool_name = (runtime.architecture == "qwen35")
+        .then(|| runnable_forced_tool_name(req.tool_choice.as_ref(), &tools))
+        .flatten();
     let prompt_text = if runtime.architecture == "gemma2" {
         if !tools.is_empty() {
             return gemma_runnable_lane_tools_rejection();
@@ -12581,7 +12606,12 @@ async fn runnable_chat_nonstreaming(
     } else if tools.is_empty() {
         render_ornith_chatml_prompt(&messages, enable_thinking)
     } else {
-        render_ornith_chatml_prompt_with_tools(&messages, &tools, enable_thinking)
+        render_ornith_chatml_prompt_with_tools(
+            &messages,
+            &tools,
+            enable_thinking,
+            forced_tool_name.as_deref(),
+        )
     };
     let prepared =
         match prepare_runnable_prompt(&runtime, req, &messages, &prompt_text, !tools.is_empty()) {
@@ -12687,10 +12717,11 @@ async fn runnable_chat_nonstreaming(
     // covers). Without this a request that was REFUSED a tools array could still
     // come back with `finish_reason: "tool_calls"` if the model echoed Ornith
     // syntax from its history.
+    let tool_parse_text = ornith_forced_tool_parse_text(forced_tool_name.as_deref(), &content);
     let tool_calls = if !matches!(runtime.architecture.as_str(), "lfm2" | "bitnet-b1.58")
         && tool_choice_allows_calls(req.tool_choice.as_ref())
     {
-        parse_ornith_tool_calls_json(&content)
+        parse_ornith_tool_calls_json(&tool_parse_text)
     } else {
         Vec::new()
     };
@@ -12770,6 +12801,9 @@ async fn runnable_chat_streaming(
     let messages = req.messages.clone().unwrap_or_default();
     let enable_thinking = req.camelid_enable_thinking.unwrap_or(false);
     let tools = runnable_request_tools(req);
+    let forced_tool_name = (runtime.architecture == "qwen35")
+        .then(|| runnable_forced_tool_name(req.tool_choice.as_ref(), &tools))
+        .flatten();
     let prompt_text = if runtime.architecture == "gemma2" {
         if !tools.is_empty() {
             return gemma_runnable_lane_tools_rejection();
@@ -12826,7 +12860,12 @@ async fn runnable_chat_streaming(
     } else if tools.is_empty() {
         render_ornith_chatml_prompt(&messages, enable_thinking)
     } else {
-        render_ornith_chatml_prompt_with_tools(&messages, &tools, enable_thinking)
+        render_ornith_chatml_prompt_with_tools(
+            &messages,
+            &tools,
+            enable_thinking,
+            forced_tool_name.as_deref(),
+        )
     };
     let prepared =
         match prepare_runnable_prompt(&runtime, req, &messages, &prompt_text, !tools.is_empty()) {
@@ -13044,8 +13083,10 @@ async fn runnable_chat_streaming(
                 } else {
                     split_ornith_think(&text).1
                 };
+                let tool_parse_text =
+                    ornith_forced_tool_parse_text(forced_tool_name.as_deref(), &content);
                 let tool_calls = if lift_tool_calls {
-                    parse_ornith_tool_calls_json(&content)
+                    parse_ornith_tool_calls_json(&tool_parse_text)
                 } else {
                     Vec::new()
                 };
@@ -15460,6 +15501,7 @@ async fn preflight_runnable_chat_request(
         )
     })?;
     let tools = unwrap_runnable_tools(req.tools.clone().unwrap_or_default());
+    let forced_tool_name = runnable_forced_tool_name(req.tool_choice.as_ref(), &tools);
     let prompt = if tools.is_empty() {
         render_ornith_chatml_prompt(messages, req.camelid_enable_thinking.unwrap_or(false))
     } else {
@@ -15467,6 +15509,7 @@ async fn preflight_runnable_chat_request(
             messages,
             &tools,
             req.camelid_enable_thinking.unwrap_or(false),
+            forced_tool_name.as_deref(),
         )
     };
     let token_ids = tokenize_runnable_text_prompt("qwen35", tokenizer, &prompt)?;
@@ -15770,6 +15813,7 @@ async fn completions(
         camelid_context_budget_tokens: None,
         camelid_enable_thinking: None,
         tools: None,
+        tool_choice: None,
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: None,
         constraint: None,
@@ -16230,6 +16274,7 @@ async fn chat_completions(
         // has no certified tools branch keep serving plain chat instead of
         // failing closed on a request that never wanted calls.
         tools: if tools_active { req.tools } else { None },
+        tool_choice: req.tool_choice,
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: Some(DEFAULT_PUBLIC_CHAT_MAX_TOKENS),
         constraint,
@@ -16741,6 +16786,7 @@ async fn replay_loaded_receipt_request(
         camelid_context_budget_tokens: None,
         camelid_enable_thinking: None,
         tools: None,
+        tool_choice: None,
         unsupported_fields: HashMap::new(),
         default_max_tokens_cap: None,
         constraint,
@@ -20711,6 +20757,21 @@ fn constraint_from_response_format(
 /// everything else (auto / required / a specific function / absent) allows.
 fn tool_choice_allows_calls(tool_choice: Option<&serde_json::Value>) -> bool {
     !matches!(tool_choice.and_then(|value| value.as_str()), Some("none"))
+}
+
+/// Resolve a specific OpenAI function choice against the definitions that are
+/// actually rendered. Unknown/malformed choices retain the historical `auto`
+/// behavior; the Web Code host only emits canonical names from this list.
+fn runnable_forced_tool_name(
+    tool_choice: Option<&serde_json::Value>,
+    tools: &[serde_json::Value],
+) -> Option<String> {
+    let requested = tool_choice?.get("function")?.get("name")?.as_str()?;
+    tools
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
+        .find(|name| *name == requested)
+        .map(str::to_owned)
 }
 
 /// Tools the runnable serve lane should render and parse for this request,
@@ -25896,6 +25957,45 @@ mod tests {
             "required"
         ))));
         assert!(tool_choice_allows_calls(None));
+    }
+
+    #[test]
+    fn ornith_specific_tool_choice_is_an_exact_prompt_extension_and_parses() {
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "Create the first requested file.".into(),
+            image_urls: Vec::new(),
+            unsupported_content_parts: Vec::new(),
+        }];
+        let tools = vec![serde_json::json!({
+            "name": "write_file",
+            "description": "Write a workspace file",
+            "parameters": {"type": "object"}
+        })];
+        let ordinary = render_ornith_chatml_prompt_with_tools(&messages, &tools, false, None);
+        let forced =
+            render_ornith_chatml_prompt_with_tools(&messages, &tools, false, Some("write_file"));
+        assert_eq!(
+            forced.strip_prefix(&ordinary),
+            Some("<tool_call>\n<function=write_file>\n"),
+            "forcing a tool must preserve the complete ordinary prompt as its prefix"
+        );
+
+        let continuation = concat!(
+            "<parameter=path>\napp.py\n</parameter>\n",
+            "<parameter=content>\nprint('ready')\n\n</parameter>\n",
+            "</function>\n</tool_call>"
+        );
+        let parsed = parse_ornith_tool_calls_json(&ornith_forced_tool_parse_text(
+            Some("write_file"),
+            continuation,
+        ));
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["function"]["name"], "write_file");
+        let args: serde_json::Value =
+            serde_json::from_str(parsed[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["path"], "app.py");
+        assert_eq!(args["content"], "print('ready')\n");
     }
 
     #[test]
@@ -35943,7 +36043,7 @@ mod runnable_completions_gate_api_tests {
             },
         ];
         let flat_tool = request["tools"][0]["function"].clone();
-        let rendered = render_ornith_chatml_prompt_with_tools(&messages, &[flat_tool], false);
+        let rendered = render_ornith_chatml_prompt_with_tools(&messages, &[flat_tool], false, None);
         let prompt_tokens = body["prompt_token_count"].as_u64().unwrap() as u32;
         assert_eq!(
             prompt_tokens as usize,

@@ -3129,6 +3129,7 @@ impl RunnableModel {
         };
         let mut checkpoints = Vec::new();
         let mut reused = 0usize;
+        let mut protected_checkpoint_position = None;
 
         if cache_enabled {
             if let Some(old) = old_cache {
@@ -3147,6 +3148,7 @@ impl RunnableModel {
                 if let Some(selected) = selected {
                     if engine.restore_recurrent_state(&selected.state) {
                         reused = selected.state.position();
+                        protected_checkpoint_position = Some(reused);
                         stats.hit = true;
                         stats.decision = Some("qwen35_hybrid_block_prefix_hit");
                         stats.reused_tokens = reused;
@@ -3167,8 +3169,9 @@ impl RunnableModel {
 
                 if reused > 0 {
                     checkpoints.extend(old.checkpoints.into_iter().filter(|checkpoint| {
-                        checkpoint.state.position() <= stats.common_prefix_tokens
-                            && checkpoint_positions.contains(&checkpoint.state.position())
+                        let position = checkpoint.state.position();
+                        position <= stats.common_prefix_tokens
+                            && (position == reused || checkpoint_positions.contains(&position))
                     }));
                 }
             } else {
@@ -3274,13 +3277,30 @@ impl RunnableModel {
         if cache_enabled {
             let max_bytes = qwen35_prompt_cache_max_bytes();
             checkpoints.sort_by_key(|checkpoint| checkpoint.state.position());
+            while checkpoints.len() > checkpoint_limit {
+                let positions = checkpoints
+                    .iter()
+                    .map(|checkpoint| checkpoint.state.position())
+                    .collect::<Vec<_>>();
+                checkpoints.remove(qwen35_checkpoint_eviction_index(
+                    &positions,
+                    protected_checkpoint_position,
+                ));
+            }
             let mut checkpoint_bytes: usize = checkpoints
                 .iter()
                 .map(|checkpoint| checkpoint.state.allocated_bytes())
                 .sum();
             while checkpoint_bytes > max_bytes && !checkpoints.is_empty() {
-                checkpoint_bytes =
-                    checkpoint_bytes.saturating_sub(checkpoints.remove(0).state.allocated_bytes());
+                let positions = checkpoints
+                    .iter()
+                    .map(|checkpoint| checkpoint.state.position())
+                    .collect::<Vec<_>>();
+                let removed = checkpoints.remove(qwen35_checkpoint_eviction_index(
+                    &positions,
+                    protected_checkpoint_position,
+                ));
+                checkpoint_bytes = checkpoint_bytes.saturating_sub(removed.state.allocated_bytes());
             }
             stats.checkpoint_bytes = checkpoint_bytes;
             *prompt_cache = Some(Qwen35PromptCache {
@@ -5179,6 +5199,21 @@ fn qwen35_prompt_checkpoint_positions(
         .collect()
 }
 
+/// Evict the oldest checkpoint that is not the stable anchor restored for the
+/// current request. Capsules can shrink after a write/read transition; keeping
+/// only the newest positions then strands a large common prefix before every
+/// available checkpoint and turns the next step into a full cold prefill.
+#[cfg(target_os = "macos")]
+fn qwen35_checkpoint_eviction_index(
+    positions: &[usize],
+    protected_position: Option<usize>,
+) -> usize {
+    positions
+        .iter()
+        .position(|position| Some(*position) != protected_position)
+        .unwrap_or(0)
+}
+
 #[cfg(target_os = "macos")]
 fn qwen35_metal_context_capacity() -> usize {
     std::env::var("CAMELID_QWEN35_METAL_MAXPOS")
@@ -5487,7 +5522,9 @@ fn qwen35_imrope_tables(
 #[cfg(all(test, any(target_os = "macos", feature = "cuda")))]
 mod qwen35_imrope_tests {
     #[cfg(target_os = "macos")]
-    use super::{qwen35_common_prefix, qwen35_prompt_checkpoint_positions};
+    use super::{
+        qwen35_checkpoint_eviction_index, qwen35_common_prefix, qwen35_prompt_checkpoint_positions,
+    };
     #[cfg(feature = "cuda")]
     use super::{qwen35_device_decode_steps, Qwen35DeviceDecodeStep};
     use super::{
@@ -5560,6 +5597,14 @@ mod qwen35_imrope_tests {
         let previous = [1, 2, 3, 4, 5, 6];
         let next = [1, 2, 3, 9, 5, 6, 7];
         assert_eq!(qwen35_common_prefix(&previous, &next), 3);
+
+        // A transition from a 3,264-token capsule to a shorter 3,036-token
+        // capsule can share only 2,580 tokens. Preserve the 2,432 checkpoint
+        // that was actually restored instead of evicting it for four newer
+        // checkpoints that the shorter request cannot reach.
+        let positions = [2_432, 2_816, 2_944, 3_072, 3_200];
+        assert_eq!(qwen35_checkpoint_eviction_index(&positions, Some(2_432)), 1);
+        assert_eq!(qwen35_checkpoint_eviction_index(&positions, None), 0);
     }
 
     #[cfg(feature = "cuda")]
