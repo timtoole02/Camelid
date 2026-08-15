@@ -1998,11 +1998,20 @@ fn record_manual_validation_evidence(
 }
 
 fn verification_requirements_focus(
+    workspace_root: &Path,
     objective: &str,
     completed_work: &[String],
     required_artifacts: &BTreeSet<String>,
     decisions: &[String],
 ) -> String {
+    let missing_artifacts = missing_required_artifacts(workspace_root, required_artifacts);
+    if !missing_artifacts.is_empty() {
+        return format!(
+            "Create the remaining required artifacts before verification: {}",
+            missing_artifacts.join(", ")
+        );
+    }
+
     let declared = declared_validation_commands(objective);
     for (label, section) in [
         ("test", &declared.tests),
@@ -3183,6 +3192,7 @@ pub fn run_loop(
                             .into()
                         } else {
                             verification_requirements_focus(
+                                sandbox.root(),
                                 &task_objective,
                                 &runtime.ledger.completed_work,
                                 &required_workspace_artifacts,
@@ -3601,6 +3611,7 @@ pub fn run_loop(
                                     &runtime.ledger.decisions,
                                 ) {
                                     let focus = verification_requirements_focus(
+                                        sandbox.root(),
                                         &task_objective,
                                         &runtime.ledger.completed_work,
                                         &required_workspace_artifacts,
@@ -3762,6 +3773,7 @@ pub fn run_loop(
                             .push(format!("Prose completion rejected: {reason}"));
                         runtime.ledger.current_focus = if missing_artifacts.is_empty() {
                             verification_requirements_focus(
+                                sandbox.root(),
                                 &task_objective,
                                 &runtime.ledger.completed_work,
                                 &required_workspace_artifacts,
@@ -5120,6 +5132,7 @@ pub fn run_loop(
                                                 "Verification could not be bound to every current source hash; recapture the changed source before completing".into()
                                             } else {
                                                 verification_requirements_focus(
+                                                    sandbox.root(),
                                                     &task_objective,
                                                     &runtime.ledger.completed_work,
                                                     &required_workspace_artifacts,
@@ -5151,6 +5164,7 @@ pub fn run_loop(
                                         ));
                                         runtime.ledger.current_focus =
                                             verification_requirements_focus(
+                                                sandbox.root(),
                                                 &task_objective,
                                                 &runtime.ledger.completed_work,
                                                 &required_workspace_artifacts,
@@ -5235,6 +5249,7 @@ pub fn run_loop(
                                                 "Verification pending".into()
                                             } else {
                                                 verification_requirements_focus(
+                                                    sandbox.root(),
                                                     &task_objective,
                                                     &runtime.ledger.completed_work,
                                                     &required_workspace_artifacts,
@@ -12851,6 +12866,27 @@ mod tests {
             &required,
             &runtime_decisions,
         ));
+    }
+
+    #[test]
+    fn verification_focus_keeps_construction_ahead_of_declared_tests() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        std::fs::write(workspace.path().join("app.py"), "print('ready')\n")
+            .expect("write existing artifact");
+        let required = BTreeSet::from(["app.py".to_string(), "tests/test_app.py".to_string()]);
+        let focus = verification_requirements_focus(
+            workspace.path(),
+            "Create app.py and tests/test_app.py, then run the unit tests.",
+            &["write_file changed app.py".to_string()],
+            &required,
+            &[],
+        );
+
+        assert_eq!(
+            focus,
+            "Create the remaining required artifacts before verification: tests/test_app.py"
+        );
+        assert!(!focus.contains("Run the requested test suite"));
     }
 
     #[test]

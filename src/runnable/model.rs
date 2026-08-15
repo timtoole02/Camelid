@@ -3129,7 +3129,7 @@ impl RunnableModel {
         };
         let mut checkpoints = Vec::new();
         let mut reused = 0usize;
-        let mut protected_checkpoint_position = None;
+        let mut protected_checkpoint_positions = Vec::with_capacity(2);
 
         if cache_enabled {
             if let Some(old) = old_cache {
@@ -3137,6 +3137,20 @@ impl RunnableModel {
                 stats.common_prefix_tokens = qwen35_common_prefix(&old.tokens, prompt);
                 stats.divergent_suffix_tokens =
                     prompt.len().saturating_sub(stats.common_prefix_tokens);
+                // Preserve both ends of the useful recurrent-state range. The
+                // newest usable checkpoint minimizes this request's prefill,
+                // while the oldest usable checkpoint remains a fallback when
+                // a later capsule rewrite moves the common prefix backwards.
+                let stable_checkpoint_position = (old.block_tokens == block_tokens)
+                    .then(|| {
+                        old.checkpoints.iter().find_map(|checkpoint| {
+                            let position = checkpoint.state.position();
+                            (position <= stats.common_prefix_tokens
+                                && position <= prior_prompt.len())
+                            .then_some(position)
+                        })
+                    })
+                    .flatten();
                 let selected = (old.block_tokens == block_tokens)
                     .then(|| {
                         old.checkpoints.iter().rev().find(|checkpoint| {
@@ -3148,7 +3162,12 @@ impl RunnableModel {
                 if let Some(selected) = selected {
                     if engine.restore_recurrent_state(&selected.state) {
                         reused = selected.state.position();
-                        protected_checkpoint_position = Some(reused);
+                        if let Some(position) = stable_checkpoint_position {
+                            protected_checkpoint_positions.push(position);
+                        }
+                        if !protected_checkpoint_positions.contains(&reused) {
+                            protected_checkpoint_positions.push(reused);
+                        }
                         stats.hit = true;
                         stats.decision = Some("qwen35_hybrid_block_prefix_hit");
                         stats.reused_tokens = reused;
@@ -3171,7 +3190,8 @@ impl RunnableModel {
                     checkpoints.extend(old.checkpoints.into_iter().filter(|checkpoint| {
                         let position = checkpoint.state.position();
                         position <= stats.common_prefix_tokens
-                            && (position == reused || checkpoint_positions.contains(&position))
+                            && (protected_checkpoint_positions.contains(&position)
+                                || checkpoint_positions.contains(&position))
                     }));
                 }
             } else {
@@ -3284,7 +3304,7 @@ impl RunnableModel {
                     .collect::<Vec<_>>();
                 checkpoints.remove(qwen35_checkpoint_eviction_index(
                     &positions,
-                    protected_checkpoint_position,
+                    &protected_checkpoint_positions,
                 ));
             }
             let mut checkpoint_bytes: usize = checkpoints
@@ -3298,7 +3318,7 @@ impl RunnableModel {
                     .collect::<Vec<_>>();
                 let removed = checkpoints.remove(qwen35_checkpoint_eviction_index(
                     &positions,
-                    protected_checkpoint_position,
+                    &protected_checkpoint_positions,
                 ));
                 checkpoint_bytes = checkpoint_bytes.saturating_sub(removed.state.allocated_bytes());
             }
@@ -5199,18 +5219,15 @@ fn qwen35_prompt_checkpoint_positions(
         .collect()
 }
 
-/// Evict the oldest checkpoint that is not the stable anchor restored for the
-/// current request. Capsules can shrink after a write/read transition; keeping
-/// only the newest positions then strands a large common prefix before every
-/// available checkpoint and turns the next step into a full cold prefill.
+/// Evict the oldest checkpoint that is not one of the protected recurrent
+/// anchors. The low anchor survives capsule drift; the high anchor minimizes
+/// the current request's suffix. Keeping only recent positions can strand a
+/// large common prefix before every available checkpoint and force cold prefill.
 #[cfg(target_os = "macos")]
-fn qwen35_checkpoint_eviction_index(
-    positions: &[usize],
-    protected_position: Option<usize>,
-) -> usize {
+fn qwen35_checkpoint_eviction_index(positions: &[usize], protected_positions: &[usize]) -> usize {
     positions
         .iter()
-        .position(|position| Some(*position) != protected_position)
+        .position(|position| !protected_positions.contains(position))
         .unwrap_or(0)
 }
 
@@ -5598,13 +5615,34 @@ mod qwen35_imrope_tests {
         let next = [1, 2, 3, 9, 5, 6, 7];
         assert_eq!(qwen35_common_prefix(&previous, &next), 3);
 
-        // A transition from a 3,264-token capsule to a shorter 3,036-token
-        // capsule can share only 2,580 tokens. Preserve the 2,432 checkpoint
-        // that was actually restored instead of evicting it for four newer
-        // checkpoints that the shorter request cannot reach.
-        let positions = [2_432, 2_816, 2_944, 3_072, 3_200];
-        assert_eq!(qwen35_checkpoint_eviction_index(&positions, Some(2_432)), 1);
-        assert_eq!(qwen35_checkpoint_eviction_index(&positions, None), 0);
+        // Preserve the permanent low fallback and the checkpoint restored for
+        // this request. Newer checkpoints may rotate around those two anchors.
+        let positions = [2_176, 2_688, 2_944, 3_072, 3_200];
+        assert_eq!(
+            qwen35_checkpoint_eviction_index(&positions, &[2_176, 2_688]),
+            2
+        );
+        assert_eq!(qwen35_checkpoint_eviction_index(&positions, &[]), 0);
+
+        // Rotate the recent checkpoints through three growing prompts. The
+        // low checkpoint must remain available when a later capsule moves its
+        // common prefix back below every recent checkpoint (the live 2,452
+        // common-prefix / no-checkpoint incident).
+        let mut retained = vec![2_176, 2_304, 2_432, 2_560];
+        for (selected, next) in [(2_560, 2_688), (2_688, 2_816), (2_816, 2_944)] {
+            retained.push(next);
+            let remove = qwen35_checkpoint_eviction_index(&retained, &[2_176, selected]);
+            retained.remove(remove);
+        }
+        assert_eq!(retained, vec![2_176, 2_688, 2_816, 2_944]);
+        assert_eq!(
+            retained
+                .iter()
+                .rev()
+                .copied()
+                .find(|position| *position <= 2_452),
+            Some(2_176)
+        );
     }
 
     #[cfg(feature = "cuda")]
