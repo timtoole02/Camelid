@@ -599,22 +599,19 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
     let mut tools = vec![
         ToolSpec {
             name: "read_file".into(),
-            description: "Read a UTF-8 text file (not cat/head/tail). start_line/max_lines \
-                          bound the excerpt. The `N | ` prefix is not file content. Read \
-                          several files in one step."
-                .into(),
+            description: "Read UTF-8 text. Optional start_line/max_lines select an excerpt; `N | ` prefixes are not file content.".into(),
             risk: Risk::Read,
             params: json!({"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"max_lines":{"type":"integer","minimum":1,"maximum":200}},"required":["path"]}),
         },
         ToolSpec {
             name: "list_dir".into(),
-            description: "List directory entry names (not ls/find). Discovers filenames and extensions.".into(),
+            description: "List directory entry names.".into(),
             risk: Risk::Read,
             params: json!({"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":200}},"required":["path"]}),
         },
         ToolSpec {
             name: "search".into(),
-            description: "Search file contents for a literal substring (not grep/rg). Contents only - no filenames, regex, or globs.".into(),
+            description: "Find a literal substring in file contents; no regex or globs.".into(),
             risk: Risk::Read,
             params: json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":profile.search_hit_limit()}},"required":["pattern"]}),
         },
@@ -636,18 +633,13 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
         },
         ToolSpec {
             name: "write_file".into(),
-            description: "Create or overwrite ONE file in the workspace; for many similar \
-                          files use one run_shell loop."
-                .into(),
+            description: "Create or overwrite one workspace file.".into(),
             risk: Risk::Write,
             params: json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}),
         },
         ToolSpec {
             name: "edit_file".into(),
-            description: "Replace `old` with `new` in a file (not sed/awk). `old` is the file's \
-                          own text without the `N | ` prefix, at its exact indentation. \
-                          replace_all:true changes every occurrence."
-                .into(),
+            description: "Replace exact file text (`N | ` prefixes excluded); replace_all changes every match.".into(),
             risk: Risk::Write,
             params: json!({"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["path","old","new"]}),
         },
@@ -659,14 +651,7 @@ pub fn specs_for(profile: ToolProfile, allow_net: bool, shell_mode: ShellSandbox
     if shell_mode != ShellSandbox::Disabled {
         tools.push(ToolSpec {
             name: "run_shell".into(),
-            description: concat!(
-                "Run a shell command in the workspace and capture its output. Pass a command ",
-                "line, never raw program source: create source with write_file first, then invoke ",
-                "its runtime. Probe a missing runtime before attempting an approval-gated ",
-                "package-manager install. Prefer the file tools over cat/grep/ls/find/sed; use ",
-                "the shell for builds, tests, git, installs, and bulk repetitive work."
-            )
-            .into(),
+            description: "Run a workspace shell command. Put source in files; use this for builds, tests, apps, installs, git, or bulk work.".into(),
             risk: Risk::Exec,
             params: json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}),
         });

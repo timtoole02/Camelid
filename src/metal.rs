@@ -109,7 +109,9 @@ struct MetalLinearKernel {
     q4k_linear_simd_pipeline: ComputePipelineState,
     q6k_linear_simd_pipeline: ComputePipelineState,
     q4k_linear_tiled_pipeline: ComputePipelineState,
+    q4k_linear_mm_pipeline: ComputePipelineState,
     q6k_linear_tiled_pipeline: ComputePipelineState,
+    q6k_linear_mm_pipeline: ComputePipelineState,
     q1_0_linear_pipeline: ComputePipelineState,
     q2_0_g64_linear_pipeline: ComputePipelineState,
     q2_0_g128_linear_pipeline: ComputePipelineState,
@@ -128,7 +130,10 @@ struct MetalLinearKernel {
     silu_mul_pipeline: ComputePipelineState,
     gelu_mul_pipeline: ComputePipelineState,
     qwen35_l2_norm_pipeline: ComputePipelineState,
+    qwen35_l2_norm_strided_batch_pipeline: ComputePipelineState,
     qwen35_conv1d_pipeline: ComputePipelineState,
+    qwen35_conv1d_batch_pipeline: ComputePipelineState,
+    qwen35_conv1d_state_update_pipeline: ComputePipelineState,
     /// LFM2 short-convolution mixer. Built unconditionally so the kernel is
     /// compiled and parity-checked on every macOS build; the LFM2 Metal engine
     /// that dispatches it in a real forward is not wired yet, so outside tests
@@ -138,9 +143,12 @@ struct MetalLinearKernel {
     lfm2_shortconv_batch_pipeline: ComputePipelineState,
     lfm2_shortconv_state_update_pipeline: ComputePipelineState,
     qwen35_delta_rule_pipeline: ComputePipelineState,
+    qwen35_delta_rule_batch_pipeline: ComputePipelineState,
     qwen35_sigmoid_mul_pipeline: ComputePipelineState,
     qwen35_ssm_gates_pipeline: ComputePipelineState,
+    qwen35_ssm_gates_batch_pipeline: ComputePipelineState,
     qwen35_deinterleave_qgate_pipeline: ComputePipelineState,
+    qwen35_deinterleave_qgate_batch_pipeline: ComputePipelineState,
     vision_layer_norm_pipeline: ComputePipelineState,
     vision_add_bias_pipeline: ComputePipelineState,
     vision_bias_residual_pipeline: ComputePipelineState,
@@ -1877,6 +1885,41 @@ inline int q4k_code(device const uchar* block, uint index) {
     return int(local < 32 ? (byte & 0x0fu) : (byte >> 4));
 }
 
+inline uint load_u32_le_tg(threadgroup const uchar* p) {
+    return uint(p[0]) | (uint(p[1]) << 8) | (uint(p[2]) << 16) | (uint(p[3]) << 24);
+}
+
+inline void q4k_scale_min_tg(
+    threadgroup const uchar* block,
+    thread uchar (&scales)[8],
+    thread uchar (&mins)[8]
+) {
+    const uint kmask1 = 0x3f3f3f3fu;
+    const uint kmask2 = 0x0f0f0f0fu;
+    const uint kmask3 = 0x03030303u;
+    uint u0 = load_u32_le_tg(block + 4);
+    uint u1 = load_u32_le_tg(block + 8);
+    uint u2 = load_u32_le_tg(block + 12);
+    uint u3 = ((u2 >> 4) & kmask2) | (((u1 >> 6) & kmask3) << 4);
+    const uint aux = u1 & kmask1;
+    u1 = (u2 & kmask2) | (((u0 >> 6) & kmask3) << 4);
+    u2 = aux;
+    u0 &= kmask1;
+    for (uint i = 0; i < 4; ++i) {
+        scales[i] = uchar((u0 >> (8 * i)) & 0xffu);
+        scales[4 + i] = uchar((u1 >> (8 * i)) & 0xffu);
+        mins[i] = uchar((u2 >> (8 * i)) & 0xffu);
+        mins[4 + i] = uchar((u3 >> (8 * i)) & 0xffu);
+    }
+}
+
+inline int q4k_code_tg(threadgroup const uchar* block, uint index) {
+    const uint group = index >> 6;
+    const uint local = index & 63u;
+    const uint byte = uint(block[16 + group * 32 + (local & 31u)]);
+    return int(local < 32 ? (byte & 0x0fu) : (byte >> 4));
+}
+
 kernel void q4k_linear_tiled(
     device const float* input_scales [[buffer(0)]],
     device const char* input_quants [[buffer(1)]],
@@ -1885,56 +1928,204 @@ kernel void q4k_linear_tiled(
     constant uint& n_sb [[buffer(4)]],
     constant uint& rows [[buffer(5)]],
     constant uint& n_tokens [[buffer(6)]],
-    uint gid [[thread_position_in_grid]]
+    threadgroup int* scratch [[threadgroup(0)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
 ) {
-    constexpr uint TILE_T = 4;
-    const uint tiles = (n_tokens + TILE_T - 1) / TILE_T;
-    const uint row = gid / tiles;
-    const uint tile = gid - row * tiles;
+    constexpr uint TILE_T = 8;
+    const uint row = group.x;
+    const uint tile = group.y;
     if (row >= rows) return;
     const uint t0 = tile * TILE_T;
     const uint tn = min(uint(TILE_T), n_tokens - t0);
-    float sums[TILE_T][8];
-    float sumf[TILE_T];
-    for (uint t = 0; t < TILE_T; ++t) {
-        sumf[t] = 0.0f;
-        for (uint l = 0; l < 8; ++l) sums[t][l] = 0.0f;
-    }
-    for (uint b = 0; b < n_sb; ++b) {
-        device const uchar* block = weight_blocks + (row * n_sb + b) * 144;
-        const float dw = float(*reinterpret_cast<device const half*>(block));
-        const float dm = float(*reinterpret_cast<device const half*>(block + 2));
-        uchar sc[8], mn[8];
-        q4k_scale_min(block, sc, mn);
+    const uint units = n_sb * 4;
+    for (uint u0 = 0; u0 < units; u0 += 32) {
+        const uint u = u0 + lane;
+        const bool active = u < units;
+        const uint sb = u >> 2;
+        const uint g = u & 3u;
+        device const uchar* block = weight_blocks;
+        uchar sc[8] = {0,0,0,0,0,0,0,0};
+        uchar mn[8] = {0,0,0,0,0,0,0,0};
+        if (active) {
+            block += (row * n_sb + sb) * 144;
+            q4k_scale_min(block, sc, mn);
+        }
         for (uint t = 0; t < tn; ++t) {
-            const uint qb = (t0 + t) * n_sb * 256 + b * 256;
             int aux[8] = {0,0,0,0,0,0,0,0};
             int sumi = 0;
-            for (uint j = 0; j < 16; ++j) {
-                int bsum = 0;
-                for (uint i = 0; i < 16; ++i) bsum += int(input_quants[qb + j * 16 + i]);
-                sumi += bsum * int(mn[j >> 1]);
-            }
-            for (uint j = 0; j < 8; ++j) {
-                const int scale = int(sc[j]);
+            if (active) {
+                device const char* y = input_quants + (t0 + t) * n_sb * 256 + sb * 256;
                 for (uint k = 0; k < 4; ++k) {
-                    const uint off = j * 32 + k * 8;
                     for (uint l = 0; l < 8; ++l) {
-                        const uint idx = off + l;
-                        aux[l] += scale * int(input_quants[qb + idx]) * q4k_code(block, idx);
+                        const uint p = k * 8 + l;
+                        const uint packed = uint(block[16 + g * 32 + p]);
+                        const int ylo = int(y[g * 64 + p]);
+                        const int yhi = int(y[g * 64 + 32 + p]);
+                        aux[l] += int(sc[2 * g]) * ylo * int(packed & 0x0fu);
+                        aux[l] += int(sc[2 * g + 1]) * yhi * int(packed >> 4);
+                        sumi += int(mn[2 * g]) * ylo + int(mn[2 * g + 1]) * yhi;
                     }
                 }
             }
-            const float da = input_scales[(t0 + t) * n_sb + b];
-            const float dd = dw * da;
-            for (uint l = 0; l < 8; ++l) sums[t][l] += dd * float(aux[l]);
-            sumf[t] -= dm * da * float(sumi);
+            for (uint off = 2; off >= 1; off >>= 1) {
+                for (uint l = 0; l < 8; ++l) aux[l] += simd_shuffle_down(aux[l], off);
+                sumi += simd_shuffle_down(sumi, off);
+            }
+            if (active && g == 0) {
+                const uint dst = (t * n_sb + sb) * 9;
+                for (uint l = 0; l < 8; ++l) scratch[dst + l] = aux[l];
+                scratch[dst + 8] = sumi;
+            }
         }
     }
-    for (uint t = 0; t < tn; ++t) {
-        float main = 0.0f;
-        for (uint l = 0; l < 8; ++l) main += sums[t][l];
-        output[(t0 + t) * rows + row] = sumf[t] + main;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) {
+        for (uint t = 0; t < tn; ++t) {
+            float sums[8] = {0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f};
+            float sumf = 0.0f;
+            for (uint sb = 0; sb < n_sb; ++sb) {
+                device const uchar* block = weight_blocks + (row * n_sb + sb) * 144;
+                const float dw = float(*reinterpret_cast<device const half*>(block));
+                const float dm = float(*reinterpret_cast<device const half*>(block + 2));
+                const float da = input_scales[(t0 + t) * n_sb + sb];
+                const uint src = (t * n_sb + sb) * 9;
+                for (uint l = 0; l < 8; ++l) sums[l] += dw * da * float(scratch[src + l]);
+                sumf -= dm * da * float(scratch[src + 8]);
+            }
+            float main = 0.0f;
+            for (uint l = 0; l < 8; ++l) main += sums[l];
+            output[(t0 + t) * rows + row] = sumf + main;
+        }
+    }
+}
+
+// True Q4_K prefill GEMM for the Qwen3.5 token-major graph. A 64-row x
+// 64-token output tile is accumulated with simdgroup matrix instructions. Each
+// packed 256-value superblock is dequantized in 32-value slices into a shared
+// half tile; each activation row is rounded to half once before dispatch. This
+// avoids materializing multi-gigabyte dense weights while using Apple's matrix
+// hardware for the [T,K] x [K,N] contraction.
+kernel void q4k_linear_mm(
+    device const half* input [[buffer(0)]],
+    device const uchar* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& n_tokens [[buffer(6)]],
+    threadgroup half* shmem [[threadgroup(0)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint ROW_TILE = 64;
+    constexpr uint TOKEN_TILE = 128;
+    constexpr uint K_TILE = 32;
+    const uint tid = sg * 32 + lane;
+    const uint r0 = tg.x * ROW_TILE;
+    const uint t0 = tg.y * TOKEN_TILE;
+    const uint k_width = n_sb * 256;
+    const uint row_stride = n_sb * 144;
+    threadgroup uchar* staged = reinterpret_cast<threadgroup uchar*>(shmem);
+    threadgroup uchar* metadata = staged + ROW_TILE * 144;
+    threadgroup half* sa = shmem + (ROW_TILE * 144 + ROW_TILE * 16) / 2;
+    threadgroup half* sb = sa + 2048;
+    threadgroup float* scratch = reinterpret_cast<threadgroup float*>(shmem);
+
+    simdgroup_half8x8 ma;
+    simdgroup_half8x8 mb;
+    simdgroup_float8x8 mc[16];
+    for (uint i = 0; i < 16; ++i)
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint sb_index = 0; sb_index < n_sb; ++sb_index) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint index = tid; index < ROW_TILE * 144; index += 256) {
+            const uint lr = index / 144;
+            const uint byte = index - lr * 144;
+            const uint row = r0 + lr;
+            staged[index] = row < rows
+                ? weight_blocks[row * row_stride + sb_index * 144 + byte]
+                : uchar(0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < ROW_TILE) {
+            uchar sc[8], mn[8];
+            q4k_scale_min_tg(staged + tid * 144, sc, mn);
+            for (uint index = 0; index < 8; ++index) {
+                metadata[tid * 16 + index] = sc[index];
+                metadata[tid * 16 + 8 + index] = mn[index];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint q_group = 0; q_group < 8; ++q_group) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid < ROW_TILE * 4) {
+                const uint lr = tid >> 2;
+                const uint part = tid & 3u;
+                const uint row = r0 + lr;
+                threadgroup const uchar* block = staged + lr * 144;
+                for (uint x = 0; x < 8; ++x) {
+                    const uint kk = part * 8 + x;
+                    half value = half(0.0f);
+                    if (row < rows) {
+                        const float d = float(*reinterpret_cast<threadgroup const half*>(block));
+                        const float dm = float(*reinterpret_cast<threadgroup const half*>(block + 2));
+                        const uint packed = uint(block[
+                            16 + (q_group >> 1) * 32 + part * 8 + x
+                        ]);
+                        const int code = int((q_group & 1u) == 0
+                            ? (packed & 0x0fu)
+                            : (packed >> 4));
+                        value = half(d * float(metadata[lr * 16 + q_group])
+                            * float(code)
+                            - dm * float(metadata[lr * 16 + 8 + q_group]));
+                    }
+                    const uint row_oct = lr / 8;
+                    const uint k_oct = kk / 8;
+                    sa[(k_oct * 8 + row_oct) * 64 + (kk % 8) * 8 + (lr % 8)] = value;
+                }
+            }
+            for (uint index = tid; index < TOKEN_TILE * K_TILE; index += 256) {
+                const uint lt = index / K_TILE;
+                const uint kk = index % K_TILE;
+                const uint token = t0 + lt;
+                const half value = token < n_tokens
+                    ? input[ulong(token) * k_width + (sb_index * 8 + q_group) * K_TILE + kk]
+                    : half(0.0f);
+                const uint token_oct = lt / 8;
+                const uint k_oct = kk / 8;
+                sb[(token_oct * 4 + k_oct) * 64 + (lt % 8) * 8 + (kk % 8)] = value;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            threadgroup const half* a = sa + sg * 64;
+            threadgroup const half* b = sb;
+            for (uint ko = 0; ko < 4; ++ko) {
+                simdgroup_load(ma, a, 8, 0, false);
+                for (uint ti = 0; ti < 16; ++ti) {
+                    simdgroup_load(mb, b + ti * 4 * 64, 8, 0, false);
+                    simdgroup_multiply_accumulate(mc[ti], mb, ma, mc[ti]);
+                }
+                a += 64 * 8;
+                b += 64;
+            }
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint ti = 0; ti < 16; ++ti) {
+        simdgroup_store(mc[ti], scratch + sg * 64, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        const uint token0 = t0 + ti * 8;
+        const uint row0 = r0 + sg * 8;
+        for (uint element = lane; element < 64; element += 32) {
+            const uint tr = element / 8;
+            const uint rr = element % 8;
+            if (token0 + tr < n_tokens && row0 + rr < rows)
+                output[ulong(token0 + tr) * rows + row0 + rr] =
+                    scratch[sg * 64 + tr * 8 + rr];
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
@@ -1956,6 +2147,137 @@ inline int q6k_code(device const uchar* block, uint index) {
     return int((block[qlb + 32 + l] >> 4) | (((block[qhb + l] >> 6) & 3) << 4)) - 32;
 }
 
+inline int q6k_code_tg(threadgroup const uchar* block, uint index) {
+    const uint h = index >> 7;
+    const uint p = index & 127u;
+    const uint l = p & 31u;
+    const uint qlb = h * 64;
+    const uint qhb = 128 + h * 32;
+    if (p < 32)
+        return int((block[qlb + l] & 0x0f) | ((block[qhb + l] & 3) << 4)) - 32;
+    if (p < 64)
+        return int((block[qlb + 32 + l] & 0x0f) | (((block[qhb + l] >> 2) & 3) << 4)) - 32;
+    if (p < 96)
+        return int((block[qlb + l] >> 4) | (((block[qhb + l] >> 4) & 3) << 4)) - 32;
+    return int((block[qlb + 32 + l] >> 4) | (((block[qhb + l] >> 6) & 3) << 4)) - 32;
+}
+
+// Q6_K sibling of q4k_linear_mm. Packed six-bit weights are expanded only for
+// the current 64-row x 32-input tile, then multiplied against sixteen prompt
+// activations with the simdgroup matrix units.
+kernel void q6k_linear_mm(
+    device const half* input [[buffer(0)]],
+    device const uchar* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& n_sb [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& n_tokens [[buffer(6)]],
+    threadgroup half* shmem [[threadgroup(0)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint ROW_TILE = 64;
+    constexpr uint TOKEN_TILE = 128;
+    constexpr uint K_TILE = 32;
+    const uint tid = sg * 32 + lane;
+    const uint r0 = tg.x * ROW_TILE;
+    const uint t0 = tg.y * TOKEN_TILE;
+    const uint k_width = n_sb * 256;
+    const uint row_stride = n_sb * 210;
+    threadgroup uchar* staged = reinterpret_cast<threadgroup uchar*>(shmem);
+    threadgroup half* sa = shmem + (ROW_TILE * 210) / 2;
+    threadgroup half* sb = sa + 2048;
+    threadgroup float* scratch = reinterpret_cast<threadgroup float*>(shmem);
+
+    simdgroup_half8x8 ma;
+    simdgroup_half8x8 mb;
+    simdgroup_float8x8 mc[16];
+    for (uint i = 0; i < 16; ++i)
+        mc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint sb_index = 0; sb_index < n_sb; ++sb_index) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint index = tid; index < ROW_TILE * 210; index += 256) {
+            const uint lr = index / 210;
+            const uint byte = index - lr * 210;
+            const uint row = r0 + lr;
+            staged[index] = row < rows
+                ? weight_blocks[row * row_stride + sb_index * 210 + byte]
+                : uchar(0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint q_group = 0; q_group < 8; ++q_group) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid < ROW_TILE * 4) {
+                const uint lr = tid >> 2;
+                const uint part = tid & 3u;
+                const uint row = r0 + lr;
+                threadgroup const uchar* block = staged + lr * 210;
+                for (uint x = 0; x < 8; ++x) {
+                    const uint kk = part * 8 + x;
+                    const uint q_index = q_group * K_TILE + kk;
+                    half value = half(0.0f);
+                    if (row < rows) {
+                        const float d = float(*reinterpret_cast<threadgroup const half*>(block + 208));
+                        const float scale = float(reinterpret_cast<threadgroup const char*>(block + 192)[q_index >> 4]);
+                        const uint h = q_group >> 2;
+                        const uint mode = q_group & 3u;
+                        const uint local = part * 8 + x;
+                        const uint ql = uint(block[h * 64 + (mode & 1u) * 32 + local]);
+                        const uint qh = uint(block[128 + h * 32 + local]);
+                        const uint low = mode < 2 ? (ql & 0x0fu) : (ql >> 4);
+                        const int code = int(low | (((qh >> (mode * 2)) & 3u) << 4)) - 32;
+                        value = half(d * scale * float(code));
+                    }
+                    const uint row_oct = lr / 8;
+                    const uint k_oct = kk / 8;
+                    sa[(k_oct * 8 + row_oct) * 64 + (kk % 8) * 8 + (lr % 8)] = value;
+                }
+            }
+            for (uint index = tid; index < TOKEN_TILE * K_TILE; index += 256) {
+                const uint lt = index / K_TILE;
+                const uint kk = index % K_TILE;
+                const uint token = t0 + lt;
+                const half value = token < n_tokens
+                    ? input[ulong(token) * k_width + (sb_index * 8 + q_group) * K_TILE + kk]
+                    : half(0.0f);
+                const uint token_oct = lt / 8;
+                const uint k_oct = kk / 8;
+                sb[(token_oct * 4 + k_oct) * 64 + (lt % 8) * 8 + (kk % 8)] = value;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            threadgroup const half* a = sa + sg * 64;
+            threadgroup const half* b = sb;
+            for (uint ko = 0; ko < 4; ++ko) {
+                simdgroup_load(ma, a, 8, 0, false);
+                for (uint ti = 0; ti < 16; ++ti) {
+                    simdgroup_load(mb, b + ti * 4 * 64, 8, 0, false);
+                    simdgroup_multiply_accumulate(mc[ti], mb, ma, mc[ti]);
+                }
+                a += 64 * 8;
+                b += 64;
+            }
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint ti = 0; ti < 16; ++ti) {
+        simdgroup_store(mc[ti], scratch + sg * 64, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        const uint token0 = t0 + ti * 8;
+        const uint row0 = r0 + sg * 8;
+        for (uint element = lane; element < 64; element += 32) {
+            const uint tr = element / 8;
+            const uint rr = element % 8;
+            if (token0 + tr < n_tokens && row0 + rr < rows)
+                output[ulong(token0 + tr) * rows + row0 + rr] =
+                    scratch[sg * 64 + tr * 8 + rr];
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 kernel void q6k_linear_tiled(
     device const float* input_scales [[buffer(0)]],
     device const char* input_quants [[buffer(1)]],
@@ -1966,7 +2288,7 @@ kernel void q6k_linear_tiled(
     constant uint& n_tokens [[buffer(6)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    constexpr uint TILE_T = 4;
+    constexpr uint TILE_T = 8;
     const uint tiles = (n_tokens + TILE_T - 1) / TILE_T;
     const uint row = gid / tiles;
     const uint tile = gid - row * tiles;
@@ -6660,6 +6982,33 @@ kernel void qwen35_l2_norm_per_head(
     for (uint i = tid; i < head_dim; i += 256) data[base + i] = scratch[i] * scale;
 }
 
+// Qwen3.5 SSM Q/K rows live inside a token-major [Q | K | V] buffer. This
+// strided twin normalizes every token/head pair in one dispatch while retaining
+// the exact single-token summation order above.
+kernel void qwen35_l2_norm_strided_batch(
+    device float* data [[buffer(0)]],
+    constant uint& head_dim [[buffer(1)]],
+    constant uint& row_stride [[buffer(2)]],
+    constant uint& component_offset [[buffer(3)]],
+    constant float& eps [[buffer(4)]],
+    threadgroup float* scratch [[threadgroup(0)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    const ulong base = ulong(group.y) * row_stride + component_offset
+        + ulong(group.x) * head_dim;
+    for (uint i = tid; i < head_dim; i += 256) scratch[i] = data[base + i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float ss = 0.0f;
+        for (uint i = 0; i < head_dim; ++i) ss += scratch[i] * scratch[i];
+        scratch[head_dim] = 1.0f / max(sqrt(ss), eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float scale = scratch[head_dim];
+    for (uint i = tid; i < head_dim; i += 256) data[base + i] = scratch[i] * scale;
+}
+
 kernel void qwen35_conv1d(
     device const float* weights [[buffer(0)]],
     device const float* input [[buffer(1)]],
@@ -6680,6 +7029,57 @@ kernel void qwen35_conv1d(
     output[c] = acc / (1.0f + exp(-acc));
     for (uint t = 0; t + 1 < cm1; ++t) st[t] = st[t + 1];
     st[cm1 - 1] = x;
+}
+
+// Batched causal depthwise convolution. The rolling state is read-only here;
+// qwen35_conv1d_state_update advances it after every token row has consumed the
+// same pre-chunk history. Tap order matches qwen35_conv1d exactly.
+kernel void qwen35_conv1d_batch(
+    device const float* weights [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device const float* state [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& conv_dim [[buffer(4)]],
+    constant uint& d_conv [[buffer(5)]],
+    constant uint& n_tokens [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint c = gid.x;
+    const uint token = gid.y;
+    if (c >= conv_dim || token >= n_tokens) return;
+    const uint cm1 = d_conv - 1;
+    device const float* w = weights + ulong(c) * d_conv;
+    device const float* st = state + ulong(c) * cm1;
+    float acc = 0.0f;
+    for (uint tap = 0; tap < d_conv; ++tap) {
+        const int source_token = int(token) + int(tap) - int(cm1);
+        const float x = source_token < 0
+            ? st[uint(source_token + int(cm1))]
+            : input[ulong(uint(source_token)) * conv_dim + c];
+        acc += w[tap] * x;
+    }
+    output[ulong(token) * conv_dim + c] = acc / (1.0f + exp(-acc));
+}
+
+kernel void qwen35_conv1d_state_update(
+    device const float* input [[buffer(0)]],
+    device float* state [[buffer(1)]],
+    constant uint& conv_dim [[buffer(2)]],
+    constant uint& d_conv [[buffer(3)]],
+    constant uint& n_tokens [[buffer(4)]],
+    uint c [[thread_position_in_grid]]
+) {
+    if (c >= conv_dim) return;
+    const uint cm1 = d_conv - 1;
+    device float* st = state + ulong(c) * cm1;
+    float next[8];
+    for (uint j = 0; j < cm1; ++j) {
+        const int source_token = int(n_tokens) - int(cm1) + int(j);
+        next[j] = source_token < 0
+            ? st[uint(source_token + int(cm1))]
+            : input[ulong(uint(source_token)) * conv_dim + c];
+    }
+    for (uint j = 0; j < cm1; ++j) st[j] = next[j];
 }
 
 // LFM2 / LFM2.5 short-convolution mixer, one decode position.
@@ -6827,6 +7227,25 @@ kernel void qwen35_ssm_gates(
     glog[h] = sp * a[h];
 }
 
+kernel void qwen35_ssm_gates_batch(
+    device const float* beta_raw [[buffer(0)]],
+    device const float* alpha_raw [[buffer(1)]],
+    device const float* dt_bias [[buffer(2)]],
+    device const float* a [[buffer(3)]],
+    device float* beta [[buffer(4)]],
+    device float* glog [[buffer(5)]],
+    constant uint& n_heads [[buffer(6)]],
+    constant uint& n_tokens [[buffer(7)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= n_heads * n_tokens) return;
+    const uint h = i % n_heads;
+    beta[i] = 1.0f / (1.0f + exp(-beta_raw[i]));
+    const float x = alpha_raw[i] + dt_bias[h];
+    const float sp = x > 20.0f ? x : log(1.0f + exp(x));
+    glog[i] = sp * a[h];
+}
+
 kernel void qwen35_delta_rule(
     device float* state [[buffer(0)]],
     device const float* k_conv [[buffer(1)]],
@@ -6883,6 +7302,76 @@ kernel void qwen35_delta_rule(
     output[ulong(head) * d_state + j] = normed * (z / (1.0f + exp(-z)));
 }
 
+// One threadgroup owns one value head and walks the token dimension in order.
+// Heads remain parallel, while each recurrent matrix observes exactly the same
+// update sequence as n single-token qwen35_delta_rule dispatches.
+kernel void qwen35_delta_rule_batch(
+    device float* state [[buffer(0)]],
+    device const float* conv [[buffer(1)]],
+    device const float* gate_z [[buffer(2)]],
+    device const float* beta [[buffer(3)]],
+    device const float* glog [[buffer(4)]],
+    device const float* norm_weight [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    constant uint& d_state [[buffer(7)]],
+    constant uint& n_key_heads [[buffer(8)]],
+    constant uint& n_value_heads [[buffer(9)]],
+    constant uint& n_tokens [[buffer(10)]],
+    constant float& eps [[buffer(11)]],
+    threadgroup float* scratch [[threadgroup(0)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint j [[thread_index_in_threadgroup]]
+) {
+    if (head >= n_value_heads || j >= d_state) return;
+    threadgroup float* sk = scratch;
+    threadgroup float* sq = scratch + d_state;
+    threadgroup float* so = scratch + 2 * d_state;
+    const uint key_head = head % n_key_heads;
+    const uint key_dim = n_key_heads * d_state;
+    const uint value_dim = n_value_heads * d_state;
+    const uint conv_dim = 2 * key_dim + value_dim;
+    device float* s = state + ulong(head) * d_state * d_state;
+    const float qscale = rsqrt(float(d_state));
+
+    for (uint token = 0; token < n_tokens; ++token) {
+        const ulong conv_row = ulong(token) * conv_dim;
+        sk[j] = conv[conv_row + key_dim + ulong(key_head) * d_state + j];
+        sq[j] = conv[conv_row + ulong(key_head) * d_state + j];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const ulong head_slot = ulong(token) * n_value_heads + head;
+        const float decay = exp(glog[head_slot]);
+        float sk_j = 0.0f;
+        for (uint i = 0; i < d_state; ++i) {
+            const ulong idx = ulong(i) * d_state + j;
+            const float value = s[idx] * decay;
+            s[idx] = value;
+            sk_j += value * sk[i];
+        }
+        const float v = conv[conv_row + 2 * key_dim + ulong(head) * d_state + j];
+        const float delta = (v - sk_j) * beta[head_slot];
+        float out_j = 0.0f;
+        for (uint i = 0; i < d_state; ++i) {
+            const ulong idx = ulong(i) * d_state + j;
+            const float value = s[idx] + sk[i] * delta;
+            s[idx] = value;
+            out_j += value * (sq[i] * qscale);
+        }
+        so[j] = out_j;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (j == 0) {
+            float sum = 0.0f;
+            for (uint i = 0; i < d_state; ++i) sum += so[i] * so[i];
+            scratch[3 * d_state] = rsqrt(sum / float(d_state) + eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float normed = so[j] * scratch[3 * d_state] * norm_weight[j];
+        const ulong value_slot = ulong(token) * value_dim + ulong(head) * d_state + j;
+        const float z = gate_z[value_slot];
+        output[value_slot] = normed * (z / (1.0f + exp(-z)));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 kernel void qwen35_sigmoid_mul(
     device float* values [[buffer(0)]],
     device const float* gate [[buffer(1)]],
@@ -6906,6 +7395,27 @@ kernel void qwen35_deinterleave_qgate(
     const ulong base = ulong(head) * 2 * head_dim;
     query[i] = fused[base + d];
     gate[i] = fused[base + head_dim + d];
+}
+
+kernel void qwen35_deinterleave_qgate_batch(
+    device const float* fused [[buffer(0)]],
+    device float* query [[buffer(1)]],
+    device float* gate [[buffer(2)]],
+    constant uint& head_dim [[buffer(3)]],
+    constant uint& n [[buffer(4)]],
+    constant uint& n_tokens [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint i = gid.x;
+    const uint token = gid.y;
+    if (i >= n || token >= n_tokens) return;
+    const uint head = i / head_dim;
+    const uint d = i % head_dim;
+    const ulong fused_row = ulong(token) * 2 * n;
+    const ulong output_row = ulong(token) * n;
+    const ulong base = fused_row + ulong(head) * 2 * head_dim;
+    query[output_row + i] = fused[base + d];
+    gate[output_row + i] = fused[base + head_dim + d];
 }
 
 // Qwen3-VL vision tower primitives. Activations are token-major and remain f32;
@@ -7258,11 +7768,29 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let qwen35_l2_norm_pipeline = device
                 .new_compute_pipeline_state_with_function(&qwen35_l2_norm_function)
                 .ok()?;
+            let qwen35_l2_norm_strided_batch_function = elementwise_library
+                .get_function("qwen35_l2_norm_strided_batch", None)
+                .ok()?;
+            let qwen35_l2_norm_strided_batch_pipeline = device
+                .new_compute_pipeline_state_with_function(&qwen35_l2_norm_strided_batch_function)
+                .ok()?;
             let qwen35_conv1d_function = elementwise_library
                 .get_function("qwen35_conv1d", None)
                 .ok()?;
             let qwen35_conv1d_pipeline = device
                 .new_compute_pipeline_state_with_function(&qwen35_conv1d_function)
+                .ok()?;
+            let qwen35_conv1d_batch_function = elementwise_library
+                .get_function("qwen35_conv1d_batch", None)
+                .ok()?;
+            let qwen35_conv1d_batch_pipeline = device
+                .new_compute_pipeline_state_with_function(&qwen35_conv1d_batch_function)
+                .ok()?;
+            let qwen35_conv1d_state_update_function = elementwise_library
+                .get_function("qwen35_conv1d_state_update", None)
+                .ok()?;
+            let qwen35_conv1d_state_update_pipeline = device
+                .new_compute_pipeline_state_with_function(&qwen35_conv1d_state_update_function)
                 .ok()?;
 
             let lfm2_shortconv_function = elementwise_library
@@ -7290,6 +7818,12 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let qwen35_delta_rule_pipeline = device
                 .new_compute_pipeline_state_with_function(&qwen35_delta_rule_function)
                 .ok()?;
+            let qwen35_delta_rule_batch_function = elementwise_library
+                .get_function("qwen35_delta_rule_batch", None)
+                .ok()?;
+            let qwen35_delta_rule_batch_pipeline = device
+                .new_compute_pipeline_state_with_function(&qwen35_delta_rule_batch_function)
+                .ok()?;
             let qwen35_sigmoid_mul_function = elementwise_library
                 .get_function("qwen35_sigmoid_mul", None)
                 .ok()?;
@@ -7302,11 +7836,23 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let qwen35_ssm_gates_pipeline = device
                 .new_compute_pipeline_state_with_function(&qwen35_ssm_gates_function)
                 .ok()?;
+            let qwen35_ssm_gates_batch_function = elementwise_library
+                .get_function("qwen35_ssm_gates_batch", None)
+                .ok()?;
+            let qwen35_ssm_gates_batch_pipeline = device
+                .new_compute_pipeline_state_with_function(&qwen35_ssm_gates_batch_function)
+                .ok()?;
             let qwen35_deinterleave_qgate_function = elementwise_library
                 .get_function("qwen35_deinterleave_qgate", None)
                 .ok()?;
             let qwen35_deinterleave_qgate_pipeline = device
                 .new_compute_pipeline_state_with_function(&qwen35_deinterleave_qgate_function)
+                .ok()?;
+            let qwen35_deinterleave_qgate_batch_function = elementwise_library
+                .get_function("qwen35_deinterleave_qgate_batch", None)
+                .ok()?;
+            let qwen35_deinterleave_qgate_batch_pipeline = device
+                .new_compute_pipeline_state_with_function(&qwen35_deinterleave_qgate_batch_function)
                 .ok()?;
             let make_elementwise = |name: &str| {
                 let function = elementwise_library.get_function(name, None).ok()?;
@@ -7839,9 +8385,17 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let q4k_linear_tiled_pipeline = device
                 .new_compute_pipeline_state_with_function(&q4k_linear_tiled_function)
                 .ok()?;
+            let q4k_linear_mm_function = library.get_function("q4k_linear_mm", None).ok()?;
+            let q4k_linear_mm_pipeline = device
+                .new_compute_pipeline_state_with_function(&q4k_linear_mm_function)
+                .ok()?;
             let q6k_linear_tiled_function = library.get_function("q6k_linear_tiled", None).ok()?;
             let q6k_linear_tiled_pipeline = device
                 .new_compute_pipeline_state_with_function(&q6k_linear_tiled_function)
+                .ok()?;
+            let q6k_linear_mm_function = library.get_function("q6k_linear_mm", None).ok()?;
+            let q6k_linear_mm_pipeline = device
+                .new_compute_pipeline_state_with_function(&q6k_linear_mm_function)
                 .ok()?;
             let q1_0_linear_function = library.get_function("q1_0_linear_f32", None).ok()?;
             let q1_0_linear_pipeline = device
@@ -7923,7 +8477,9 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 q4k_linear_simd_pipeline,
                 q6k_linear_simd_pipeline,
                 q4k_linear_tiled_pipeline,
+                q4k_linear_mm_pipeline,
                 q6k_linear_tiled_pipeline,
+                q6k_linear_mm_pipeline,
                 q1_0_linear_pipeline,
                 q2_0_g64_linear_pipeline,
                 q2_0_g128_linear_pipeline,
@@ -7942,14 +8498,20 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 silu_mul_pipeline,
                 gelu_mul_pipeline,
                 qwen35_l2_norm_pipeline,
+                qwen35_l2_norm_strided_batch_pipeline,
                 qwen35_conv1d_pipeline,
+                qwen35_conv1d_batch_pipeline,
+                qwen35_conv1d_state_update_pipeline,
                 lfm2_shortconv_pipeline,
                 lfm2_shortconv_batch_pipeline,
                 lfm2_shortconv_state_update_pipeline,
                 qwen35_delta_rule_pipeline,
+                qwen35_delta_rule_batch_pipeline,
                 qwen35_sigmoid_mul_pipeline,
                 qwen35_ssm_gates_pipeline,
+                qwen35_ssm_gates_batch_pipeline,
                 qwen35_deinterleave_qgate_pipeline,
+                qwen35_deinterleave_qgate_batch_pipeline,
                 vision_layer_norm_pipeline,
                 vision_add_bias_pipeline,
                 vision_bias_residual_pipeline,
@@ -12967,7 +13529,272 @@ fn encode_resident_kquant_matmul_f32(
             },
         );
     } else {
-        dispatch_1d(e, pipeline, rows * n_tokens.div_ceil(4));
+        if weight.format == ResidentWeightFormat::Q6K {
+            dispatch_1d(e, pipeline, rows * n_tokens.div_ceil(8));
+            return;
+        }
+        let scratch_ints_per_block = match weight.format {
+            ResidentWeightFormat::Q4K => 9,
+            ResidentWeightFormat::Q6K => unreachable!(),
+            ResidentWeightFormat::Q8_0
+            | ResidentWeightFormat::DenseF32
+            | ResidentWeightFormat::DenseF16
+            | ResidentWeightFormat::Q1_0
+            | ResidentWeightFormat::Q2_0G64
+            | ResidentWeightFormat::Q2_0G128 => unreachable!(),
+        };
+        let scratch_bytes = (8 * n_sb * scratch_ints_per_block * 4).next_multiple_of(16);
+        assert_threadgroup_fits(&k.device, scratch_bytes, "K-quant batched GEMM scratch");
+        e.set_threadgroup_memory_length(0, scratch_bytes as u64);
+        e.dispatch_thread_groups(
+            metal::MTLSize {
+                width: rows as u64,
+                height: n_tokens.div_ceil(8) as u64,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+}
+
+/// Q4_K simdgroup-matrix contraction over a pre-rounded half activation panel.
+/// This is used only by the Qwen3.5 prompt path; decode and parity-sensitive
+/// single-token projections keep their established Q8_K dot kernels.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_q4k_mm_half(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    half_input: &Buffer,
+    weight: &ResidentLinearWeight,
+    out: &Buffer,
+    scalar: &Buffer,
+    input_width: usize,
+    rows: usize,
+    n_tokens: usize,
+) {
+    debug_assert_eq!(weight.format, ResidentWeightFormat::Q4K);
+    unsafe {
+        let p = scalar.contents() as *mut u32;
+        *p = (input_width / 256) as u32;
+        *p.add(1) = rows as u32;
+        *p.add(2) = n_tokens as u32;
+    }
+    e.set_compute_pipeline_state(&k.q4k_linear_mm_pipeline);
+    e.set_buffer(0, Some(half_input), 0);
+    e.set_buffer(2, Some(&weight.buffer), 0);
+    e.set_buffer(3, Some(out), 0);
+    e.set_buffer(4, Some(scalar), 0);
+    e.set_buffer(5, Some(scalar), 4);
+    e.set_buffer(6, Some(scalar), 8);
+    const SCRATCH_BYTES: usize = 64 * (144 + 16) + (64 * 32 + 128 * 32) * 2;
+    assert_threadgroup_fits(&k.device, SCRATCH_BYTES, "Q4_K prefill matrix tile");
+    e.set_threadgroup_memory_length(0, SCRATCH_BYTES as u64);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: rows.div_ceil(64) as u64,
+            height: n_tokens.div_ceil(128) as u64,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_q6k_mm_half(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    half_input: &Buffer,
+    weight: &ResidentLinearWeight,
+    out: &Buffer,
+    scalar: &Buffer,
+    input_width: usize,
+    rows: usize,
+    n_tokens: usize,
+) {
+    debug_assert_eq!(weight.format, ResidentWeightFormat::Q6K);
+    unsafe {
+        let p = scalar.contents() as *mut u32;
+        *p = (input_width / 256) as u32;
+        *p.add(1) = rows as u32;
+        *p.add(2) = n_tokens as u32;
+    }
+    e.set_compute_pipeline_state(&k.q6k_linear_mm_pipeline);
+    e.set_buffer(0, Some(half_input), 0);
+    e.set_buffer(2, Some(&weight.buffer), 0);
+    e.set_buffer(3, Some(out), 0);
+    e.set_buffer(4, Some(scalar), 0);
+    e.set_buffer(5, Some(scalar), 4);
+    e.set_buffer(6, Some(scalar), 8);
+    const SCRATCH_BYTES: usize = 64 * 210 + (64 * 32 + 128 * 32) * 2;
+    assert_threadgroup_fits(&k.device, SCRATCH_BYTES, "Q6_K prefill matrix tile");
+    e.set_threadgroup_memory_length(0, SCRATCH_BYTES as u64);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: rows.div_ceil(64) as u64,
+            height: n_tokens.div_ceil(128) as u64,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_kquant_mm_half(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    half_input: &Buffer,
+    weight: &ResidentLinearWeight,
+    out: &Buffer,
+    scalar: &Buffer,
+    input_width: usize,
+    rows: usize,
+    n_tokens: usize,
+) {
+    match weight.format {
+        ResidentWeightFormat::Q4K => encode_q4k_mm_half(
+            e,
+            k,
+            half_input,
+            weight,
+            out,
+            scalar,
+            input_width,
+            rows,
+            n_tokens,
+        ),
+        ResidentWeightFormat::Q6K => encode_q6k_mm_half(
+            e,
+            k,
+            half_input,
+            weight,
+            out,
+            scalar,
+            input_width,
+            rows,
+            n_tokens,
+        ),
+        _ => unreachable!("Qwen3.5 matrix prefill accepts only K-quant weights"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_qwen35_matmul_batch(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    keep: &mut Vec<Buffer>,
+    input: &Buffer,
+    weight: &ResidentLinearWeight,
+    output: &Buffer,
+    scalar: &Buffer,
+    input_width: usize,
+    rows: usize,
+    n_tokens: usize,
+) {
+    if n_tokens > 1
+        && matches!(
+            weight.format,
+            ResidentWeightFormat::Q4K | ResidentWeightFormat::Q6K
+        )
+        && mm_prefill_enabled()
+    {
+        let half_input = pool_get(k, (n_tokens * input_width * 2) as u64);
+        let count = pool_get(k, 4);
+        unsafe { *(count.contents() as *mut u32) = (n_tokens * input_width) as u32 };
+        e.set_compute_pipeline_state(&k.f32_to_f16_pipeline);
+        e.set_buffer(0, Some(input), 0);
+        e.set_buffer(1, Some(&half_input), 0);
+        e.set_buffer(2, Some(&count), 0);
+        dispatch_1d(e, &k.f32_to_f16_pipeline, n_tokens * input_width);
+        encode_kquant_mm_half(
+            e,
+            k,
+            &half_input,
+            weight,
+            output,
+            scalar,
+            input_width,
+            rows,
+            n_tokens,
+        );
+        keep.extend([half_input, count]);
+    } else {
+        encode_resident_matmul_f32(
+            e,
+            k,
+            keep,
+            input,
+            weight,
+            output,
+            scalar,
+            input_width,
+            rows,
+            n_tokens,
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn try_encode_qwen35_shared_matmuls(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    keep: &mut Vec<Buffer>,
+    input: &Buffer,
+    input_width: usize,
+    n_tokens: usize,
+    projections: &[(&ResidentLinearWeight, &Buffer, &Buffer, usize)],
+) -> bool {
+    if n_tokens > 1
+        && mm_prefill_enabled()
+        && !projections.is_empty()
+        && projections.iter().all(|(weight, _, _, _)| {
+            matches!(
+                weight.format,
+                ResidentWeightFormat::Q4K | ResidentWeightFormat::Q6K
+            )
+        })
+    {
+        let half_input = pool_get(k, (n_tokens * input_width * 2) as u64);
+        let count = pool_get(k, 4);
+        unsafe { *(count.contents() as *mut u32) = (n_tokens * input_width) as u32 };
+        e.set_compute_pipeline_state(&k.f32_to_f16_pipeline);
+        e.set_buffer(0, Some(input), 0);
+        e.set_buffer(1, Some(&half_input), 0);
+        e.set_buffer(2, Some(&count), 0);
+        dispatch_1d(e, &k.f32_to_f16_pipeline, n_tokens * input_width);
+        for (weight, output, scalar, rows) in projections {
+            encode_kquant_mm_half(
+                e,
+                k,
+                &half_input,
+                weight,
+                output,
+                scalar,
+                input_width,
+                *rows,
+                n_tokens,
+            );
+        }
+        keep.extend([half_input, count]);
+        true
+    } else {
+        try_encode_shared_kquant_matmuls(e, k, keep, input, input_width, n_tokens, projections)
     }
 }
 
@@ -17714,7 +18541,7 @@ impl Qwen35MetalDecode {
         &mut self,
         slots: &[(Vec<f32>, Vec<f32>, Vec<f32>)],
     ) -> bool {
-        const SLOTS_PER_COMMAND_BUFFER: usize = 16;
+        const SLOTS_PER_COMMAND_BUFFER: usize = 128;
 
         if slots.is_empty() {
             return true;
@@ -17732,61 +18559,50 @@ impl Qwen35MetalDecode {
         let Some(k) = metal_linear_kernel() else {
             return false;
         };
-        let mut state_resources: Vec<&metal::ResourceRef> =
-            Vec::with_capacity(self.layers.len() * 2);
-        for layer in &self.layers {
-            match &layer.kind {
-                Qwen35MetalLayerKind::Full {
-                    cache_k, cache_v, ..
-                } => {
-                    state_resources.push(cache_k);
-                    state_resources.push(cache_v);
-                }
-                Qwen35MetalLayerKind::Ssm {
-                    conv_state, state, ..
-                } => {
-                    state_resources.push(conv_state);
-                    state_resources.push(state);
-                }
-            }
-        }
-
         for chunk in slots.chunks(SLOTS_PER_COMMAND_BUFFER) {
+            let n_tokens = chunk.len();
+            let embeddings: Vec<f32> = chunk
+                .iter()
+                .flat_map(|(embedding, _, _)| embedding.iter().copied())
+                .collect();
+            let cosine: Vec<f32> = chunk
+                .iter()
+                .flat_map(|(_, cos, _)| cos.iter().copied())
+                .collect();
+            let sine: Vec<f32> = chunk
+                .iter()
+                .flat_map(|(_, _, sin)| sin.iter().copied())
+                .collect();
+            let hidden_a = qwen35_f32_buffer(k, &embeddings);
+            let hidden_b = qwen35_zero_buffer(k, n_tokens * c.hidden * 4);
+            let cos_buf = qwen35_f32_buffer(k, &cosine);
+            let sin_buf = qwen35_f32_buffer(k, &sine);
             let cb = k.queue.new_command_buffer();
             let encoder = cb.new_compute_command_encoder();
             let mut keep = Vec::new();
-            let mut owned = Vec::with_capacity(chunk.len() * 4);
-            for (offset, (embedding, cos, sin)) in chunk.iter().enumerate() {
-                let position = self.filled + offset;
-                let hidden_a = qwen35_f32_buffer(k, embedding);
-                let hidden_b = qwen35_zero_buffer(k, c.hidden * 4);
-                let cos_buf = qwen35_f32_buffer(k, cos);
-                let sin_buf = qwen35_f32_buffer(k, sin);
-                for layer in &self.layers {
-                    match &layer.kind {
-                        Qwen35MetalLayerKind::Full { .. } => encode_qwen35_full_layer(
-                            encoder,
-                            k,
-                            &mut keep,
-                            &hidden_a,
-                            &hidden_b,
-                            layer,
-                            &cos_buf,
-                            &sin_buf,
-                            c,
-                            self.max_positions,
-                            position,
-                        ),
-                        Qwen35MetalLayerKind::Ssm { .. } => encode_qwen35_ssm_layer(
-                            encoder, k, &mut keep, &hidden_a, &hidden_b, layer, c,
-                        ),
-                    }
-                    encode_qwen35_ffn(encoder, k, &mut keep, &hidden_b, &hidden_a, layer, c);
+            for layer in &self.layers {
+                match &layer.kind {
+                    Qwen35MetalLayerKind::Full { .. } => encode_qwen35_full_layer_batch(
+                        encoder,
+                        k,
+                        &mut keep,
+                        &hidden_a,
+                        &hidden_b,
+                        layer,
+                        &cos_buf,
+                        &sin_buf,
+                        c,
+                        self.max_positions,
+                        self.filled,
+                        n_tokens,
+                    ),
+                    Qwen35MetalLayerKind::Ssm { .. } => encode_qwen35_ssm_layer_batch(
+                        encoder, k, &mut keep, &hidden_a, &hidden_b, layer, c, n_tokens,
+                    ),
                 }
-                owned.extend([hidden_a, hidden_b, cos_buf, sin_buf]);
-                if offset + 1 < chunk.len() {
-                    encoder.memory_barrier_with_resources(&state_resources);
-                }
+                encode_qwen35_ffn_batch(
+                    encoder, k, &mut keep, &hidden_b, &hidden_a, layer, c, n_tokens,
+                );
             }
             encoder.end_encoding();
             cb.commit();
@@ -17807,7 +18623,7 @@ impl Qwen35MetalDecode {
             let status = cb.status();
             let injected = qwen35_fault_injected("prefill");
             let completed = status == metal::MTLCommandBufferStatus::Completed && !injected;
-            drop(owned);
+            drop([hidden_a, hidden_b, cos_buf, sin_buf]);
             pool_recycle(k, keep);
             if !completed {
                 // Say so out loud. This lane never read `status()`, so a fault left no
@@ -19246,6 +20062,693 @@ fn encode_qwen35_ffn(
         up,
         act,
         down,
+        hidden_mm,
+        down_mm,
+        n_ffn,
+        n_hidden,
+    ]);
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_qwen35_full_layer_batch(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    keep: &mut Vec<Buffer>,
+    input: &Buffer,
+    output: &Buffer,
+    layer: &Qwen35MetalLayer,
+    cos: &Buffer,
+    sin: &Buffer,
+    c: Qwen35MetalConfig,
+    max_positions: usize,
+    base_position: usize,
+    n_tokens: usize,
+) {
+    let Qwen35MetalLayerKind::Full {
+        q: q_weight,
+        k: k_weight,
+        v: v_weight,
+        output: o_weight,
+        q_norm,
+        k_norm,
+        cache_k,
+        cache_v,
+    } = &layer.kind
+    else {
+        unreachable!()
+    };
+    let q_dim = c.n_heads * c.head_dim;
+    let kv_dim = c.n_kv_heads * c.head_dim;
+    let half_rope = c.rope_dim / 2;
+    let normed = pool_get(k, (n_tokens * c.hidden * 4) as u64);
+    let q_fused = pool_get(k, (n_tokens * 2 * q_dim * 4) as u64);
+    let query = pool_get(k, (n_tokens * q_dim * 4) as u64);
+    let gate = pool_get(k, (n_tokens * q_dim * 4) as u64);
+    let key = pool_get(k, (n_tokens * kv_dim * 4) as u64);
+    let value = pool_get(k, (n_tokens * kv_dim * 4) as u64);
+    let context = pool_get(k, (n_tokens * q_dim * 4) as u64);
+    let mix = pool_get(k, (n_tokens * c.hidden * 4) as u64);
+    let norm_scalar = pool_get(k, 8);
+    let q_mm = pool_get(k, 12);
+    let kv_mm = pool_get(k, 12);
+    let o_mm = pool_get(k, 12);
+    let split_scalar = pool_get(k, 12);
+    let qk_norm_scalar = pool_get(k, 12);
+    let q_rope = pool_get(k, 16);
+    let k_rope = pool_get(k, 16);
+    let scatter_scalar = pool_get(k, 16);
+    let mirror_flag = pool_get(k, 4);
+    let n_q = pool_get(k, 4);
+    let n_hidden = pool_get(k, 4);
+    unsafe {
+        let p = norm_scalar.contents() as *mut u8;
+        *(p as *mut u32) = c.hidden as u32;
+        *(p.add(4) as *mut f32) = c.eps;
+        let split = split_scalar.contents() as *mut u32;
+        *split = c.head_dim as u32;
+        *split.add(1) = q_dim as u32;
+        *split.add(2) = n_tokens as u32;
+        let n = qk_norm_scalar.contents() as *mut u8;
+        *(n as *mut u32) = c.head_dim as u32;
+        *(n.add(4) as *mut f32) = c.eps;
+        *(n.add(8) as *mut u32) = 1;
+        let set_rope = |buffer: &Buffer, heads: usize| {
+            let r = buffer.contents() as *mut u32;
+            *r = heads as u32;
+            *r.add(1) = c.head_dim as u32;
+            *r.add(2) = half_rope as u32;
+            *r.add(3) = 1;
+        };
+        set_rope(&q_rope, c.n_heads);
+        set_rope(&k_rope, c.n_kv_heads);
+        let sc = scatter_scalar.contents() as *mut u32;
+        *sc = c.head_dim as u32;
+        *sc.add(1) = max_positions as u32;
+        *sc.add(2) = base_position as u32;
+        *sc.add(3) = kv_dim as u32;
+        *(mirror_flag.contents() as *mut u32) = 0;
+        *(n_q.contents() as *mut u32) = (n_tokens * q_dim) as u32;
+        *(n_hidden.contents() as *mut u32) = (n_tokens * c.hidden) as u32;
+    }
+
+    encode_rms_norm_batch(
+        k,
+        e,
+        input,
+        &layer.attn_norm,
+        &normed,
+        &norm_scalar,
+        n_tokens,
+    );
+    if !try_encode_qwen35_shared_matmuls(
+        e,
+        k,
+        keep,
+        &normed,
+        c.hidden,
+        n_tokens,
+        &[
+            (q_weight, &q_fused, &q_mm, 2 * q_dim),
+            (k_weight, &key, &kv_mm, kv_dim),
+            (v_weight, &value, &kv_mm, kv_dim),
+        ],
+    ) {
+        encode_qwen35_matmul_batch(
+            e,
+            k,
+            keep,
+            &normed,
+            q_weight,
+            &q_fused,
+            &q_mm,
+            c.hidden,
+            2 * q_dim,
+            n_tokens,
+        );
+        encode_qwen35_matmul_batch(
+            e, k, keep, &normed, k_weight, &key, &kv_mm, c.hidden, kv_dim, n_tokens,
+        );
+        encode_qwen35_matmul_batch(
+            e, k, keep, &normed, v_weight, &value, &kv_mm, c.hidden, kv_dim, n_tokens,
+        );
+    }
+    e.set_compute_pipeline_state(&k.qwen35_deinterleave_qgate_batch_pipeline);
+    e.set_buffer(0, Some(&q_fused), 0);
+    e.set_buffer(1, Some(&query), 0);
+    e.set_buffer(2, Some(&gate), 0);
+    e.set_buffer(3, Some(&split_scalar), 0);
+    e.set_buffer(4, Some(&split_scalar), 4);
+    e.set_buffer(5, Some(&split_scalar), 8);
+    let row_width = k
+        .qwen35_deinterleave_qgate_batch_pipeline
+        .thread_execution_width()
+        .max(1);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: (q_dim as u64).div_ceil(row_width),
+            height: n_tokens as u64,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: row_width,
+            height: 1,
+            depth: 1,
+        },
+    );
+    encode_rms_norm_per_head(
+        e,
+        k,
+        &query,
+        q_norm,
+        &query,
+        &qk_norm_scalar,
+        n_tokens * c.n_heads,
+        0,
+    );
+    encode_rms_norm_per_head(
+        e,
+        k,
+        &key,
+        k_norm,
+        &key,
+        &qk_norm_scalar,
+        n_tokens * c.n_kv_heads,
+        0,
+    );
+    for (data, scalar, heads) in [(&query, &q_rope, c.n_heads), (&key, &k_rope, c.n_kv_heads)] {
+        e.set_compute_pipeline_state(&k.rope_rotate_batch_pipeline);
+        e.set_buffer(0, Some(data), 0);
+        e.set_buffer(1, Some(cos), 0);
+        e.set_buffer(2, Some(sin), 0);
+        e.set_buffer(3, Some(scalar), 0);
+        e.set_buffer(4, Some(scalar), 4);
+        e.set_buffer(5, Some(scalar), 8);
+        e.set_buffer(6, Some(scalar), 12);
+        let width = k.rope_rotate_batch_pipeline.thread_execution_width().max(1);
+        e.dispatch_thread_groups(
+            metal::MTLSize {
+                width: ((heads * half_rope) as u64).div_ceil(width),
+                height: n_tokens as u64,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width,
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+    e.set_compute_pipeline_state(&k.kv_scatter_batch_pipeline);
+    e.set_buffer(0, Some(&key), 0);
+    e.set_buffer(1, Some(&value), 0);
+    e.set_buffer(2, Some(cache_k), 0);
+    e.set_buffer(3, Some(cache_v), 0);
+    e.set_buffer(4, Some(&scatter_scalar), 0);
+    e.set_buffer(5, Some(&scatter_scalar), 4);
+    e.set_buffer(6, Some(&scatter_scalar), 8);
+    e.set_buffer(7, Some(&scatter_scalar), 12);
+    e.set_buffer(8, Some(cache_k), 0);
+    e.set_buffer(9, Some(cache_v), 0);
+    e.set_buffer(10, Some(&mirror_flag), 0);
+    let scatter_width = k.kv_scatter_batch_pipeline.thread_execution_width().max(1);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: (kv_dim as u64).div_ceil(scatter_width),
+            height: n_tokens as u64,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: scatter_width,
+            height: 1,
+            depth: 1,
+        },
+    );
+    for token in 0..n_tokens {
+        let filled = base_position + token + 1;
+        let q_off = (token * q_dim * 4) as u64;
+        let scores = pool_get(k, (c.n_heads * filled * 4) as u64);
+        let attn_scalar = pool_get(k, 32);
+        unsafe {
+            let a = attn_scalar.contents() as *mut u8;
+            *(a as *mut u32) = c.n_heads as u32;
+            *(a.add(4) as *mut u32) = c.head_dim as u32;
+            *(a.add(8) as *mut u32) = filled as u32;
+            *(a.add(12) as *mut u32) = (c.n_heads / c.n_kv_heads) as u32;
+            *(a.add(16) as *mut f32) = 1.0 / (c.head_dim as f32).sqrt();
+            *(a.add(20) as *mut u32) = c.head_dim as u32;
+            *(a.add(24) as *mut u32) = (max_positions * c.head_dim) as u32;
+            *(a.add(28) as *mut u32) = 0;
+        }
+        encode_attention(
+            e,
+            k,
+            keep,
+            &query,
+            cache_k,
+            cache_v,
+            None,
+            &scores,
+            &context,
+            &attn_scalar,
+            c.n_heads,
+            c.n_kv_heads,
+            c.head_dim,
+            filled,
+            q_off,
+            q_off,
+        );
+        keep.extend([scores, attn_scalar]);
+    }
+    e.set_compute_pipeline_state(&k.qwen35_sigmoid_mul_pipeline);
+    e.set_buffer(0, Some(&context), 0);
+    e.set_buffer(1, Some(&gate), 0);
+    e.set_buffer(2, Some(&n_q), 0);
+    dispatch_1d(e, &k.qwen35_sigmoid_mul_pipeline, n_tokens * q_dim);
+    encode_qwen35_matmul_batch(
+        e, k, keep, &context, o_weight, &mix, &o_mm, q_dim, c.hidden, n_tokens,
+    );
+    encode_binary(
+        e,
+        &k.residual_add_pipeline,
+        input,
+        &mix,
+        output,
+        &n_hidden,
+        n_tokens * c.hidden,
+    );
+    keep.extend([
+        normed,
+        q_fused,
+        query,
+        gate,
+        key,
+        value,
+        context,
+        mix,
+        norm_scalar,
+        q_mm,
+        kv_mm,
+        o_mm,
+        split_scalar,
+        qk_norm_scalar,
+        q_rope,
+        k_rope,
+        scatter_scalar,
+        mirror_flag,
+        n_q,
+        n_hidden,
+    ]);
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_qwen35_ssm_layer_batch(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    keep: &mut Vec<Buffer>,
+    input: &Buffer,
+    output: &Buffer,
+    layer: &Qwen35MetalLayer,
+    c: Qwen35MetalConfig,
+    n_tokens: usize,
+) {
+    let Qwen35MetalLayerKind::Ssm {
+        qkv: qkv_weight,
+        gate: gate_weight,
+        beta: beta_weight,
+        alpha: alpha_weight,
+        output: output_weight,
+        conv1d,
+        dt_bias,
+        a,
+        norm,
+        conv_state,
+        state,
+    } = &layer.kind
+    else {
+        unreachable!()
+    };
+    let normed = pool_get(k, (n_tokens * c.hidden * 4) as u64);
+    let qkv = pool_get(k, (n_tokens * c.conv_dim * 4) as u64);
+    let gate = pool_get(k, (n_tokens * c.value_dim * 4) as u64);
+    let beta_raw = pool_get(k, (n_tokens * c.n_value_heads * 4) as u64);
+    let alpha_raw = pool_get(k, (n_tokens * c.n_value_heads * 4) as u64);
+    let beta = pool_get(k, (n_tokens * c.n_value_heads * 4) as u64);
+    let glog = pool_get(k, (n_tokens * c.n_value_heads * 4) as u64);
+    let conv_out = pool_get(k, (n_tokens * c.conv_dim * 4) as u64);
+    let delta_out = pool_get(k, (n_tokens * c.value_dim * 4) as u64);
+    let mix = pool_get(k, (n_tokens * c.hidden * 4) as u64);
+    let norm_scalar = pool_get(k, 8);
+    let hidden_mm = pool_get(k, 12);
+    let gate_mm = pool_get(k, 12);
+    let output_mm = pool_get(k, 12);
+    let head_mm = pool_get(k, 12);
+    let gate_scalar = pool_get(k, 8);
+    let conv_scalar = pool_get(k, 12);
+    let l2_q_scalar = pool_get(k, 16);
+    let l2_k_scalar = pool_get(k, 16);
+    let delta_scalar = pool_get(k, 20);
+    let n_hidden = pool_get(k, 4);
+    unsafe {
+        let p = norm_scalar.contents() as *mut u8;
+        *(p as *mut u32) = c.hidden as u32;
+        *(p.add(4) as *mut f32) = c.eps;
+        let gates = gate_scalar.contents() as *mut u32;
+        *gates = c.n_value_heads as u32;
+        *gates.add(1) = n_tokens as u32;
+        let cv = conv_scalar.contents() as *mut u32;
+        *cv = c.conv_dim as u32;
+        *cv.add(1) = c.d_conv as u32;
+        *cv.add(2) = n_tokens as u32;
+        for (scalar, offset) in [(&l2_q_scalar, 0usize), (&l2_k_scalar, c.key_dim)] {
+            let l2 = scalar.contents() as *mut u8;
+            *(l2 as *mut u32) = c.d_state as u32;
+            *(l2.add(4) as *mut u32) = c.conv_dim as u32;
+            *(l2.add(8) as *mut u32) = offset as u32;
+            *(l2.add(12) as *mut f32) = c.eps;
+        }
+        let d = delta_scalar.contents() as *mut u8;
+        *(d as *mut u32) = c.d_state as u32;
+        *(d.add(4) as *mut u32) = c.n_key_heads as u32;
+        *(d.add(8) as *mut u32) = c.n_value_heads as u32;
+        *(d.add(12) as *mut u32) = n_tokens as u32;
+        *(d.add(16) as *mut f32) = c.eps;
+        *(n_hidden.contents() as *mut u32) = (n_tokens * c.hidden) as u32;
+    }
+    encode_rms_norm_batch(
+        k,
+        e,
+        input,
+        &layer.attn_norm,
+        &normed,
+        &norm_scalar,
+        n_tokens,
+    );
+    if !try_encode_qwen35_shared_matmuls(
+        e,
+        k,
+        keep,
+        &normed,
+        c.hidden,
+        n_tokens,
+        &[
+            (qkv_weight, &qkv, &hidden_mm, c.conv_dim),
+            (gate_weight, &gate, &gate_mm, c.value_dim),
+            (beta_weight, &beta_raw, &head_mm, c.n_value_heads),
+            (alpha_weight, &alpha_raw, &head_mm, c.n_value_heads),
+        ],
+    ) {
+        encode_qwen35_matmul_batch(
+            e, k, keep, &normed, qkv_weight, &qkv, &hidden_mm, c.hidden, c.conv_dim, n_tokens,
+        );
+        encode_qwen35_matmul_batch(
+            e,
+            k,
+            keep,
+            &normed,
+            gate_weight,
+            &gate,
+            &gate_mm,
+            c.hidden,
+            c.value_dim,
+            n_tokens,
+        );
+        encode_qwen35_matmul_batch(
+            e,
+            k,
+            keep,
+            &normed,
+            beta_weight,
+            &beta_raw,
+            &head_mm,
+            c.hidden,
+            c.n_value_heads,
+            n_tokens,
+        );
+        encode_qwen35_matmul_batch(
+            e,
+            k,
+            keep,
+            &normed,
+            alpha_weight,
+            &alpha_raw,
+            &head_mm,
+            c.hidden,
+            c.n_value_heads,
+            n_tokens,
+        );
+    }
+    e.set_compute_pipeline_state(&k.qwen35_ssm_gates_batch_pipeline);
+    e.set_buffer(0, Some(&beta_raw), 0);
+    e.set_buffer(1, Some(&alpha_raw), 0);
+    e.set_buffer(2, Some(dt_bias), 0);
+    e.set_buffer(3, Some(a), 0);
+    e.set_buffer(4, Some(&beta), 0);
+    e.set_buffer(5, Some(&glog), 0);
+    e.set_buffer(6, Some(&gate_scalar), 0);
+    e.set_buffer(7, Some(&gate_scalar), 4);
+    dispatch_1d(
+        e,
+        &k.qwen35_ssm_gates_batch_pipeline,
+        n_tokens * c.n_value_heads,
+    );
+    e.set_compute_pipeline_state(&k.qwen35_conv1d_batch_pipeline);
+    e.set_buffer(0, Some(conv1d), 0);
+    e.set_buffer(1, Some(&qkv), 0);
+    e.set_buffer(2, Some(conv_state), 0);
+    e.set_buffer(3, Some(&conv_out), 0);
+    e.set_buffer(4, Some(&conv_scalar), 0);
+    e.set_buffer(5, Some(&conv_scalar), 4);
+    e.set_buffer(6, Some(&conv_scalar), 8);
+    let conv_width = k
+        .qwen35_conv1d_batch_pipeline
+        .thread_execution_width()
+        .max(1);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: (c.conv_dim as u64).div_ceil(conv_width),
+            height: n_tokens as u64,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: conv_width,
+            height: 1,
+            depth: 1,
+        },
+    );
+    e.set_compute_pipeline_state(&k.qwen35_conv1d_state_update_pipeline);
+    e.set_buffer(0, Some(&qkv), 0);
+    e.set_buffer(1, Some(conv_state), 0);
+    e.set_buffer(2, Some(&conv_scalar), 0);
+    e.set_buffer(3, Some(&conv_scalar), 4);
+    e.set_buffer(4, Some(&conv_scalar), 8);
+    dispatch_1d(e, &k.qwen35_conv1d_state_update_pipeline, c.conv_dim);
+    for l2_scalar in [&l2_q_scalar, &l2_k_scalar] {
+        e.set_compute_pipeline_state(&k.qwen35_l2_norm_strided_batch_pipeline);
+        e.set_buffer(0, Some(&conv_out), 0);
+        e.set_buffer(1, Some(l2_scalar), 0);
+        e.set_buffer(2, Some(l2_scalar), 4);
+        e.set_buffer(3, Some(l2_scalar), 8);
+        e.set_buffer(4, Some(l2_scalar), 12);
+        e.set_threadgroup_memory_length(0, ((c.d_state + 1) * 4) as u64);
+        e.dispatch_thread_groups(
+            metal::MTLSize {
+                width: c.n_key_heads as u64,
+                height: n_tokens as u64,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+    e.set_compute_pipeline_state(&k.qwen35_delta_rule_batch_pipeline);
+    e.set_buffer(0, Some(state), 0);
+    e.set_buffer(1, Some(&conv_out), 0);
+    e.set_buffer(2, Some(&gate), 0);
+    e.set_buffer(3, Some(&beta), 0);
+    e.set_buffer(4, Some(&glog), 0);
+    e.set_buffer(5, Some(norm), 0);
+    e.set_buffer(6, Some(&delta_out), 0);
+    e.set_buffer(7, Some(&delta_scalar), 0);
+    e.set_buffer(8, Some(&delta_scalar), 4);
+    e.set_buffer(9, Some(&delta_scalar), 8);
+    e.set_buffer(10, Some(&delta_scalar), 12);
+    e.set_buffer(11, Some(&delta_scalar), 16);
+    e.set_threadgroup_memory_length(0, ((3 * c.d_state + 1) * 4) as u64);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: c.n_value_heads as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: c.d_state as u64,
+            height: 1,
+            depth: 1,
+        },
+    );
+    encode_qwen35_matmul_batch(
+        e,
+        k,
+        keep,
+        &delta_out,
+        output_weight,
+        &mix,
+        &output_mm,
+        c.value_dim,
+        c.hidden,
+        n_tokens,
+    );
+    encode_binary(
+        e,
+        &k.residual_add_pipeline,
+        input,
+        &mix,
+        output,
+        &n_hidden,
+        n_tokens * c.hidden,
+    );
+    keep.extend([
+        normed,
+        qkv,
+        gate,
+        beta_raw,
+        alpha_raw,
+        beta,
+        glog,
+        conv_out,
+        delta_out,
+        mix,
+        norm_scalar,
+        hidden_mm,
+        gate_mm,
+        output_mm,
+        head_mm,
+        gate_scalar,
+        conv_scalar,
+        l2_q_scalar,
+        l2_k_scalar,
+        delta_scalar,
+        n_hidden,
+    ]);
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_qwen35_ffn_batch(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    keep: &mut Vec<Buffer>,
+    input: &Buffer,
+    output: &Buffer,
+    layer: &Qwen35MetalLayer,
+    c: Qwen35MetalConfig,
+    n_tokens: usize,
+) {
+    let normed = pool_get(k, (n_tokens * c.hidden * 4) as u64);
+    let gate = pool_get(k, (n_tokens * c.ffn_dim * 4) as u64);
+    let up = pool_get(k, (n_tokens * c.ffn_dim * 4) as u64);
+    let act = pool_get(k, (n_tokens * c.ffn_dim * 4) as u64);
+    let down = pool_get(k, (n_tokens * c.hidden * 4) as u64);
+    let norm_scalar = pool_get(k, 8);
+    let hidden_mm = pool_get(k, 12);
+    let down_mm = pool_get(k, 12);
+    let n_ffn = pool_get(k, 4);
+    let n_hidden = pool_get(k, 4);
+    unsafe {
+        let p = norm_scalar.contents() as *mut u8;
+        *(p as *mut u32) = c.hidden as u32;
+        *(p.add(4) as *mut f32) = c.eps;
+        *(n_ffn.contents() as *mut u32) = (n_tokens * c.ffn_dim) as u32;
+        *(n_hidden.contents() as *mut u32) = (n_tokens * c.hidden) as u32;
+    }
+    encode_rms_norm_batch(
+        k,
+        e,
+        input,
+        &layer.post_attn_norm,
+        &normed,
+        &norm_scalar,
+        n_tokens,
+    );
+    if !try_encode_qwen35_shared_matmuls(
+        e,
+        k,
+        keep,
+        &normed,
+        c.hidden,
+        n_tokens,
+        &[
+            (&layer.ffn_gate, &gate, &hidden_mm, c.ffn_dim),
+            (&layer.ffn_up, &up, &hidden_mm, c.ffn_dim),
+        ],
+    ) {
+        encode_qwen35_matmul_batch(
+            e,
+            k,
+            keep,
+            &normed,
+            &layer.ffn_gate,
+            &gate,
+            &hidden_mm,
+            c.hidden,
+            c.ffn_dim,
+            n_tokens,
+        );
+        encode_qwen35_matmul_batch(
+            e,
+            k,
+            keep,
+            &normed,
+            &layer.ffn_up,
+            &up,
+            &hidden_mm,
+            c.hidden,
+            c.ffn_dim,
+            n_tokens,
+        );
+    }
+    encode_binary(
+        e,
+        &k.silu_mul_pipeline,
+        &gate,
+        &up,
+        &act,
+        &n_ffn,
+        n_tokens * c.ffn_dim,
+    );
+    encode_qwen35_matmul_batch(
+        e,
+        k,
+        keep,
+        &act,
+        &layer.ffn_down,
+        &down,
+        &down_mm,
+        c.ffn_dim,
+        c.hidden,
+        n_tokens,
+    );
+    encode_binary(
+        e,
+        &k.residual_add_pipeline,
+        input,
+        &down,
+        output,
+        &n_hidden,
+        n_tokens * c.hidden,
+    );
+    keep.extend([
+        normed,
+        gate,
+        up,
+        act,
+        down,
+        norm_scalar,
         hidden_mm,
         down_mm,
         n_ffn,
@@ -28225,7 +29728,7 @@ mod tests {
         for (n_sb, rows) in [(2usize, 7usize), (11, 7), (16, 7), (48, 7)] {
             let input_width = n_sb * 256;
             // One token exercises the cooperative SIMD GEMV; five exercises
-            // TILE_T=4 prefill plus its tail.
+            // TILE_T=8 prefill plus its tail.
             for n_tokens in [1usize, 5] {
                 let inputs: Vec<f32> = (0..n_tokens * input_width)
                     .map(|i| {

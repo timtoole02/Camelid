@@ -7125,6 +7125,119 @@ mod gpu_ssm_layer_tests {
     }
 }
 
+/// Real Ornith Metal parity gate for the token-major prefill graph. The serial
+/// side deliberately runs normal one-token forwards (including the discarded
+/// LM head) so it exercises the established kernels and recurrent update order.
+#[cfg(all(test, target_os = "macos"))]
+mod qwen35_metal_prefill_tests {
+    use super::{qwen35_rope_tables, RunnableModel};
+
+    fn argmax(values: &[f32]) -> usize {
+        values
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+            .map_or(0, |(index, _)| index)
+    }
+
+    #[test]
+    #[ignore = "needs CAMELID_ORNITH_GGUF (Q4_K_M) and Apple Silicon Metal"]
+    fn qwen35_metal_batched_prefill_matches_serial_greedy_token() {
+        let Ok(path) = std::env::var("CAMELID_ORNITH_GGUF") else {
+            return;
+        };
+        let model = RunnableModel::load(&path).expect("load Ornith qwen35");
+        assert!(model.qwen35.is_some(), "fixture must be qwen35");
+        let seed = [3710u32, 369, 279, 6511, 314, 9338, 30, 220, 17];
+        let prompt: Vec<u32> = seed.into_iter().cycle().take(66).collect();
+        let (&last, prior) = prompt.split_last().unwrap();
+        let mut engine = model
+            .build_qwen35_metal(prompt.len() + 8)
+            .expect("build Ornith Metal engine");
+
+        engine.reset();
+        for (position, &token) in prior.iter().enumerate() {
+            let embedding = model
+                .token_embd
+                .dequant_row(token as usize, "token_embd")
+                .expect("serial embedding");
+            let (cos, sin) = qwen35_rope_tables(position, model.rope_base, model.rope_dim);
+            engine
+                .forward_logits(&embedding, &cos, &sin, position)
+                .expect("serial Metal forward");
+        }
+        let last_embedding = model
+            .token_embd
+            .dequant_row(last as usize, "token_embd")
+            .expect("last embedding");
+        let (last_cos, last_sin) = qwen35_rope_tables(prior.len(), model.rope_base, model.rope_dim);
+        let serial = engine
+            .forward_logits(&last_embedding, &last_cos, &last_sin, prior.len())
+            .expect("serial final logits");
+
+        engine.reset();
+        let mut slots = Vec::with_capacity(prior.len());
+        for (position, &token) in prior.iter().enumerate() {
+            let embedding = model
+                .token_embd
+                .dequant_row(token as usize, "token_embd")
+                .expect("batch embedding");
+            let (cos, sin) = qwen35_rope_tables(position, model.rope_base, model.rope_dim);
+            slots.push((embedding, cos, sin));
+        }
+        assert!(engine.forward_prefill_batch(&slots), "batched prefill");
+        let batched = engine
+            .forward_logits(&last_embedding, &last_cos, &last_sin, prior.len())
+            .expect("batched final logits");
+        assert_eq!(
+            argmax(&batched),
+            argmax(&serial),
+            "batched Metal prefill changed the next greedy token"
+        );
+        assert!(
+            batched.iter().all(|value| value.is_finite()),
+            "batched Metal prefill produced non-finite logits"
+        );
+    }
+
+    #[test]
+    #[ignore = "benchmark: needs CAMELID_ORNITH_GGUF (Q4_K_M) and Apple Silicon Metal"]
+    fn qwen35_metal_batched_prefill_tokens_per_second() {
+        let Ok(path) = std::env::var("CAMELID_ORNITH_GGUF") else {
+            return;
+        };
+        let tokens = std::env::var("CAMELID_QWEN35_BENCH_TOKENS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(512);
+        let model = RunnableModel::load(&path).expect("load Ornith qwen35");
+        let mut engine = model
+            .build_qwen35_metal(tokens + 8)
+            .expect("build Ornith Metal engine");
+        let seed = [3710u32, 369, 279, 6511, 314, 9338, 30, 220, 17];
+        let mut slots = Vec::with_capacity(tokens);
+        for position in 0..tokens {
+            let token = seed[position % seed.len()];
+            let embedding = model
+                .token_embd
+                .dequant_row(token as usize, "token_embd")
+                .expect("embedding");
+            let (cos, sin) = qwen35_rope_tables(position, model.rope_base, model.rope_dim);
+            slots.push((embedding, cos, sin));
+        }
+        engine.reset();
+        let started = std::time::Instant::now();
+        assert!(engine.forward_prefill_batch(&slots), "batched prefill");
+        let elapsed = started.elapsed().as_secs_f64();
+        let rate = tokens as f64 / elapsed;
+        eprintln!(
+            "qwen35 Metal token-major prefill: {tokens} tokens in {elapsed:.3}s = {rate:.1} tok/s"
+        );
+        assert!(rate.is_finite() && rate > 0.0);
+    }
+}
+
 /// Env-gated real-row check that the runnable lane's per-layer RoPE schedule is
 /// EXACTLY the reference 1B schedule (globals at 5/11/17/23 on base 1e6, every
 /// other layer local on base 10000) — expectations are literal lists, not the
