@@ -23,6 +23,7 @@ pub use admit::{admit, AdmissionAxis, AdmissionOk, AdmissionReject, TokenizerFam
 pub use dequant::dequantize;
 #[cfg(target_os = "macos")]
 pub(crate) use model::lfm2_prefill_mm_enabled;
+pub(crate) use model::Qwen35PromptCacheStats;
 pub use model::RunnableModel;
 pub use smoke::{headline_quant_of, oracle_qualified, smoke_admit, SmokeReport};
 pub use vision::{PrismVisionEmbedding, PrismVisionProjector};

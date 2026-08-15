@@ -5882,7 +5882,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 parity_audited: "cuda_5_prompt_pass_cross_backend_tolerance_attributed_near_ties_vs_llamacpp_acd79d6",
                 performance_measured: "cuda_device_decode_loop_18_8_toks_median_measured",
                 frontend_load_path_verified: "not_promoted",
-                frontend_readiness_gate: "green only when this exact qwen35 Q4_K_M row (ornith-1.0-9b-Q4_K_M.gguf, sha256 2711bf1e...) is loaded_now=true, generation_ready=true, matching active_model_id, served with the runnable serve lane enabled (on by default; opt-out CAMELID_RUNNABLE_SERVE=0) and CAMELID_QWEN35_CUDA=1",
+                frontend_readiness_gate: "green only when this exact qwen35 Q4_K_M row (ornith-1.0-9b-Q4_K_M.gguf; certified sha256 2711bf1e... on CUDA or 5720d1f6... on Apple Metal) is loaded_now=true, generation_ready=true, matching active_model_id, and served with the runnable serve lane enabled (on by default; opt-out CAMELID_RUNNABLE_SERVE=0)",
                 tested_context: "short_serve_smoke_plus_agent_eval_read_list_write",
                 chat_template_renderer: "ornith-chatml-native",
                 chat_template_shape_pack: "not_promoted",
@@ -5905,8 +5905,8 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 latest_checked_bucket: "agent_eval_read_list_write",
                 latest_checked_result: "pass",
                 latest_checked_output: "camelid.agent_eval/v1 PASS (full 3-case battery)",
-                evidence: "qwen35 (Ornith-1.0-9B) Q4_K_M fully GPU-resident (CAMELID_QWEN35_CUDA=1): 5-prompt greedy parity vs the pinned llama.cpp acd79d6 CUDA oracle PASSES under the cross-backend tolerance policy — 2/5 token-identical at n=64 and every flip probed and attributed to soft positions with <=0.33-nat top-2 gaps where the oracle's own CPU-vs-CUDA backends also flip (qa/ornith/constrained-vram/RECEIPT_ITEM2_qwen35_parity_cuda.json, probes + oracle/camelid internal-variance controls committed alongside). The full read_file/list_dir/write_file agent battery passes on this exact file with a committed camelid.agent_eval/v1 PASS receipt (qa/agent-eval/ornith-1.0-9b-Q4_K_M-1783019779-PASS.json); tool_capable earned ONLY by that receipt. Decode throughput 18.8 tok/s median via the device-side decode loop (qa/ornith/constrained-vram profile CSVs). NOT model-native/larger context, NOT broader templates, NOT multi-session throughput claims.",
-                next_step: "preserve the CUDA parity + agent capability for this exact row; NOTE a macOS resident Metal lane now accepts qwen35 K-quant files by default (opt-out CAMELID_QWEN35_METAL=0) and would serve THESE bytes on Apple Silicon with no receipt covering them — the only Metal K-quant parity evidence is qa/ornith/G-PARITY-qwen35-kquant-metal-macos.md, taken on a DIFFERENT artifact (sha256 5720d1f6, the HuggingFace imatrix quant, not this row's 2711bf1e); a Metal receipt on these exact bytes, context-pack coverage, the frontend picker load path, and a normalized full-support bundle remain before any broader claim",
+                evidence: "qwen35 (Ornith-1.0-9B) Q4_K_M has two byte-pinned platform receipts under this filename. The in-house requant (sha256 2711bf1e...) is fully CUDA-resident and passes 5-prompt greedy parity vs the pinned llama.cpp acd79d6 CUDA oracle under the cross-backend tolerance policy; its full read_file/list_dir/write_file agent battery is qa/agent-eval/ornith-1.0-9b-Q4_K_M-1783019779-PASS.json. The public HuggingFace imatrix quant (sha256 5720d1f6...) runs on the resident Apple Metal qwen35 K-quant lane and passes the same full three-case agent battery after command-buffer completion was made fail-closed; receipt qa/agent-eval/ornith-1.0-9b-Q4_K_M-1786773670-PASS.json. Tool capability is admitted only for one of those two exact digests. CUDA decode throughput was 18.8 tok/s median via the device-side decode loop. NOT model-native/larger context, NOT broader templates, NOT multi-session throughput claims.",
+                next_step: "preserve both byte-pinned platform receipts; add bounded-context coverage, frontend picker load evidence, repeated current-head bundles, and a normalized full-support bundle before broadening the claim",
             },
             ModelCompatibilityTarget {
                 id: "ornith_1_0_9b_q3_k_m",
@@ -9514,7 +9514,7 @@ mod gemma4_template_tests {
     fn lfm2_runnable_stream_finish_exposes_ids_and_terminal_usage_is_exact() {
         let prompt = [124_894, 10, 11, 12];
         let generated = [20, 124_902, 21, 22];
-        let diagnostics = runnable_generation_diagnostics("lfm2", Some(&prompt), &generated);
+        let diagnostics = runnable_generation_diagnostics("lfm2", Some(&prompt), &generated, None);
         let finish = runnable_stream_chunk(
             "lfm2_5_2_6b_q8_0",
             123,
@@ -9545,6 +9545,36 @@ mod gemma4_template_tests {
             prompt.len() + generated.len()
         );
         assert!(usage.get("camelid").is_none());
+    }
+
+    #[test]
+    fn runnable_qwen35_terminal_diagnostics_expose_hybrid_prefix_reuse() {
+        let cache = crate::runnable::Qwen35PromptCacheStats {
+            hit: true,
+            decision: Some("qwen35_hybrid_block_prefix_hit"),
+            common_prefix_tokens: 2_517,
+            divergent_suffix_tokens: 150,
+            candidate_tokens: 2_642,
+            reused_tokens: 2_432,
+            prefilled_tokens: 235,
+            block_tokens: 128,
+            matched_blocks: 19,
+            checkpoint_bytes: 188 * 1024 * 1024,
+            prefill_ms: 18_250,
+        };
+        let diagnostics =
+            runnable_generation_diagnostics("qwen35", Some(&[1, 2]), &[3], Some(cache));
+        let timings = &diagnostics["stream_timing_diagnostics"]["timings_ms"];
+        assert_eq!(timings["prompt_cache_hit"], true);
+        assert_eq!(
+            timings["prompt_cache_decision"],
+            "qwen35_hybrid_block_prefix_hit"
+        );
+        assert_eq!(timings["prompt_reused_tokens"], 2_432);
+        assert_eq!(timings["prompt_prefilled_tokens"], 235);
+        assert_eq!(timings["prompt_cache_block_tokens"], 128);
+        assert_eq!(timings["prompt_cache_matched_blocks"], 19);
+        assert_eq!(timings["prefill_forward_total"], 18_250.0);
     }
 
     #[test]
@@ -10850,6 +10880,11 @@ pub struct RunnableServeRuntime {
     tokenizer: std::sync::Arc<Tokenizer>,
     architecture: String,
     vision: Option<crate::runnable::PrismVisionProjector>,
+    /// Keeps generation and its prompt-cache receipt in one ownership epoch.
+    /// The model's resident engine is already single-owner; this outer lock
+    /// prevents a second request from replacing `last_cache_stats` between the
+    /// completed generation and the API copying its terminal diagnostics.
+    generation_lock: std::sync::Mutex<()>,
 }
 
 /// Lives inside the SSE body. Dropping the response (for example when the UI
@@ -10906,6 +10941,7 @@ impl RunnableServeRuntime {
             tokenizer,
             architecture,
             vision,
+            generation_lock: std::sync::Mutex::new(()),
         })
     }
 
@@ -10922,13 +10958,24 @@ impl RunnableServeRuntime {
         prompt_ids: &[u32],
         max_new: usize,
         sampling: &SamplingConfig,
-    ) -> std::result::Result<(String, Vec<u32>), BackendError> {
+    ) -> std::result::Result<
+        (
+            String,
+            Vec<u32>,
+            Option<crate::runnable::Qwen35PromptCacheStats>,
+        ),
+        BackendError,
+    > {
+        let _generation = self.generation_lock.lock().map_err(|_| {
+            BackendError::InvalidTensorData("runnable generation mutex poisoned".into())
+        })?;
         let stop: Vec<u32> = self.tokenizer.special.eog.iter().copied().collect();
         let ids = self
             .model
             .generate_stopping_with_sampling(prompt_ids, max_new, &stop, sampling)?;
         let text = self.tokenizer.decode(&ids, true).unwrap_or_default();
-        Ok((text, ids))
+        let cache_stats = self.model.qwen35_prompt_cache_stats();
+        Ok((text, ids, cache_stats))
     }
 
     /// Streaming generation with a cooperative disconnect check. The generic
@@ -10942,7 +10989,17 @@ impl RunnableServeRuntime {
         sampling: &SamplingConfig,
         is_cancelled: &dyn Fn() -> bool,
         mut on_token: F,
-    ) -> std::result::Result<(String, Vec<u32>), BackendError> {
+    ) -> std::result::Result<
+        (
+            String,
+            Vec<u32>,
+            Option<crate::runnable::Qwen35PromptCacheStats>,
+        ),
+        BackendError,
+    > {
+        let _generation = self.generation_lock.lock().map_err(|_| {
+            BackendError::InvalidTensorData("runnable generation mutex poisoned".into())
+        })?;
         let stop: Vec<u32> = self.tokenizer.special.eog.iter().copied().collect();
         let ids = self
             .model
@@ -10955,7 +11012,8 @@ impl RunnableServeRuntime {
                 &mut on_token,
             )?;
         let text = self.tokenizer.decode(&ids, true).unwrap_or_default();
-        Ok((text, ids))
+        let cache_stats = self.model.qwen35_prompt_cache_stats();
+        Ok((text, ids, cache_stats))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -10993,6 +11051,9 @@ impl RunnableServeRuntime {
         sampling: &SamplingConfig,
         mut on_token: F,
     ) -> std::result::Result<(String, Vec<u32>, usize), BackendError> {
+        let _generation = self.generation_lock.lock().map_err(|_| {
+            BackendError::InvalidTensorData("runnable generation mutex poisoned".into())
+        })?;
         let projector = self.vision.as_ref().ok_or_else(|| {
             BackendError::UnsupportedGguf("no Prism vision projector is loaded".into())
         })?;
@@ -12270,6 +12331,7 @@ struct RunnableGenerationResult {
     generated_token_ids: Vec<u32>,
     prompt_token_ids: Option<Vec<u32>>,
     prompt_token_count: usize,
+    prompt_cache: Option<crate::runnable::Qwen35PromptCacheStats>,
 }
 
 /// Apply Workspace's private total-context ceiling to a prepared runnable
@@ -12337,6 +12399,7 @@ fn runnable_generation_diagnostics(
     architecture: &str,
     prompt_token_ids: Option<&[u32]>,
     generated_token_ids: &[u32],
+    prompt_cache: Option<crate::runnable::Qwen35PromptCacheStats>,
 ) -> serde_json::Value {
     let mut diagnostics = serde_json::json!({
         "generated_token_ids": generated_token_ids,
@@ -12345,6 +12408,23 @@ fn runnable_generation_diagnostics(
     });
     if let Some(prompt_token_ids) = prompt_token_ids {
         diagnostics["prompt_token_ids"] = serde_json::json!(prompt_token_ids);
+    }
+    if let Some(cache) = prompt_cache {
+        diagnostics["stream_timing_diagnostics"] = serde_json::json!({
+            "timings_ms": {
+                "prefill_forward_total": cache.prefill_ms as f64,
+                "prompt_cache_hit": cache.hit,
+                "prompt_reused_tokens": cache.reused_tokens,
+                "prompt_prefilled_tokens": cache.prefilled_tokens,
+                "prompt_cache_decision": cache.decision,
+                "prompt_cache_common_prefix_tokens": cache.common_prefix_tokens,
+                "prompt_cache_divergent_suffix_tokens": cache.divergent_suffix_tokens,
+                "prompt_cache_candidate_tokens": cache.candidate_tokens,
+                "prompt_cache_block_tokens": cache.block_tokens,
+                "prompt_cache_matched_blocks": cache.matched_blocks,
+                "prompt_cache_checkpoint_bytes": cache.checkpoint_bytes,
+            }
+        });
     }
     diagnostics
 }
@@ -12524,11 +12604,12 @@ async fn runnable_chat_nonstreaming(
         RunnablePreparedPrompt::Text(prompt_ids) => {
             let prompt_token_count = prompt_ids.len();
             rt.generate_greedy(&prompt_ids, max_tokens, &sampling).map(
-                |(text, generated_token_ids)| RunnableGenerationResult {
+                |(text, generated_token_ids, prompt_cache)| RunnableGenerationResult {
                     text,
                     generated_token_ids,
                     prompt_token_ids: Some(prompt_ids),
                     prompt_token_count,
+                    prompt_cache,
                 },
             )
         }
@@ -12554,6 +12635,7 @@ async fn runnable_chat_nonstreaming(
                     generated_token_ids,
                     prompt_token_ids: None,
                     prompt_token_count,
+                    prompt_cache: None,
                 },
             ),
     })
@@ -12563,6 +12645,7 @@ async fn runnable_chat_nonstreaming(
         generated_token_ids: ids,
         prompt_token_ids,
         prompt_token_count,
+        prompt_cache,
     } = match result {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => {
@@ -12640,6 +12723,7 @@ async fn runnable_chat_nonstreaming(
         runtime.architecture.as_str(),
         prompt_token_ids.as_deref(),
         &ids,
+        prompt_cache,
     );
     let mut body = serde_json::json!({
         "id": "chatcmpl-runnable",
@@ -12798,12 +12882,15 @@ async fn runnable_chat_streaming(
                         }
                     },
                 )
-                .map(|(text, generated_token_ids)| RunnableGenerationResult {
-                    text,
-                    generated_token_ids,
-                    prompt_token_ids: Some(prompt_ids),
-                    prompt_token_count,
-                })
+                .map(
+                    |(text, generated_token_ids, prompt_cache)| RunnableGenerationResult {
+                        text,
+                        generated_token_ids,
+                        prompt_token_ids: Some(prompt_ids),
+                        prompt_token_count,
+                        prompt_cache,
+                    },
+                )
             }
             RunnablePreparedPrompt::Vision {
                 prefix,
@@ -12832,6 +12919,7 @@ async fn runnable_chat_streaming(
                         generated_token_ids,
                         prompt_token_ids: None,
                         prompt_token_count,
+                        prompt_cache: None,
                     },
                 ),
         };
@@ -12949,6 +13037,7 @@ async fn runnable_chat_streaming(
                 generated_token_ids: ids,
                 prompt_token_ids,
                 prompt_token_count,
+                prompt_cache,
             })) => {
                 let content = if bitnet_stream {
                     text
@@ -12998,6 +13087,7 @@ async fn runnable_chat_streaming(
                     runtime.architecture.as_str(),
                     prompt_token_ids.as_deref(),
                     &ids,
+                    prompt_cache,
                 );
                 yield Ok(Event::default().data(
                     runnable_stream_chunk(
@@ -27190,31 +27280,34 @@ mod tests {
     }
 
     #[test]
-    fn certified_filename_with_wrong_bytes_is_not_a_supported_row() {
-        // THE REGRESSION this guard exists for. `ornith-1.0-9b-Q4_K_M.gguf` names
-        // two different sets of weights: the CERTIFIED in-house requant with no
-        // imatrix (2711bf1e..., 5,629,108,416 B) that the CUDA parity + agent-eval
-        // receipts were captured against, and the public HuggingFace imatrix quant
-        // of the exact same name (5720d1f6..., 5,629,108,704 B). Classifying on the
-        // filename alone made the second one report the first one's support claims
-        // and parity evidence through /api/capabilities and the frontend.
-        const CERTIFIED: &str = "2711bf1ef034fa39eb899f793fe63bbb0aac21ebdacbcbe09406b5600ad5188f";
-        const HF_IMATRIX_SAME_NAME: &str =
+    fn ornith_q4_filename_admits_only_its_two_independently_certified_artifacts() {
+        // `ornith-1.0-9b-Q4_K_M.gguf` names two genuinely different artifacts.
+        // Both now have independent platform + agent receipts, so both exact
+        // digests are admitted while any third same-named file fails closed.
+        const CUDA_REQUANT: &str =
+            "2711bf1ef034fa39eb899f793fe63bbb0aac21ebdacbcbe09406b5600ad5188f";
+        const METAL_IMATRIX: &str =
             "5720d1f671b4996481274fffe01868c3c36e87c135cc8538471cc7bd6087b106";
 
-        assert_eq!(
-            classify_loaded_model_identity(Some("qwen35"), "ornith-1.0-9b-Q4_K_M.gguf", CERTIFIED),
-            ModelLaneClass::Supported,
-            "the certified bytes keep the row"
-        );
+        for certified in [CUDA_REQUANT, METAL_IMATRIX] {
+            assert_eq!(
+                classify_loaded_model_identity(
+                    Some("qwen35"),
+                    "ornith-1.0-9b-Q4_K_M.gguf",
+                    certified,
+                ),
+                ModelLaneClass::Supported,
+                "each independently certified artifact keeps the row"
+            );
+        }
         assert_eq!(
             classify_loaded_model_identity(
                 Some("qwen35"),
                 "ornith-1.0-9b-Q4_K_M.gguf",
-                HF_IMATRIX_SAME_NAME,
+                &"00".repeat(32),
             ),
             ModelLaneClass::ExperimentalImplemented,
-            "a same-named file with uncertified bytes must NOT inherit the row"
+            "an unrecorded same-named file must not inherit either receipt"
         );
         // Case-insensitive on the hex, since digests reach us from several
         // producers, but never lenient about which digest.
@@ -27222,7 +27315,7 @@ mod tests {
             classify_loaded_model_identity(
                 Some("qwen35"),
                 "ornith-1.0-9b-Q4_K_M.gguf",
-                &CERTIFIED.to_uppercase(),
+                &METAL_IMATRIX.to_uppercase(),
             ),
             ModelLaneClass::Supported,
         );
@@ -27230,11 +27323,10 @@ mod tests {
 
     #[test]
     fn every_non_catalog_allowlist_entry_is_hash_pinned() {
-        // The 3-tuple makes a pin-less allowlist entry unrepresentable; this pins
-        // the digest SHAPE and that the entry resolves to its own recorded value
-        // (a copy/paste that duplicates a filename would otherwise resolve to
-        // whichever row came first).
-        let mut seen = std::collections::HashMap::new();
+        // The 3-tuple makes a pin-less allowlist entry unrepresentable. Multiple
+        // independently certified byte identities may deliberately share one
+        // upstream filename, so uniqueness is on (filename, digest), not name.
+        let mut seen = std::collections::HashSet::new();
         for (filename, _, sha256) in NON_CATALOG_SUPPORTED_ARTIFACTS {
             assert_eq!(sha256.len(), 64, "{filename} digest is not a sha256");
             assert!(
@@ -27243,20 +27335,22 @@ mod tests {
                     .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
                 "{filename} digest must be lowercase hex"
             );
-            assert_eq!(
-                supported_artifact_expected_sha256(filename),
-                Some(*sha256),
-                "{filename} must resolve to its own recorded digest"
+            assert!(
+                supported_artifact_identity_matches(filename, sha256),
+                "{filename} must admit its own recorded digest"
             );
             assert!(
-                seen.insert(*filename, *sha256).is_none(),
-                "{filename} is allowlisted twice"
+                seen.insert((*filename, *sha256)),
+                "{filename} repeats the same certified digest"
             );
         }
         // The two hash-pinned tables must never disagree about the same file.
         for (filename, sha256) in PRISM_SUPPORTED_ARTIFACT_SHA256 {
-            if let Some(other) = seen.get(filename) {
-                assert_eq!(other, sha256, "{filename} is pinned to two digests");
+            if seen.iter().any(|(other, _)| other == filename) {
+                assert!(
+                    seen.contains(&(*filename, *sha256)),
+                    "{filename} is pinned to an unshared Prism digest"
+                );
             }
         }
     }
@@ -36899,6 +36993,14 @@ const NON_CATALOG_SUPPORTED_ARTIFACTS: &[(&str, &str, &str)] = &[
         "ornith_1_0_9b_q4_k_m",
         "2711bf1ef034fa39eb899f793fe63bbb0aac21ebdacbcbe09406b5600ad5188f",
     ),
+    // Public HuggingFace imatrix quant under the same filename. This is a
+    // genuinely different artifact from the in-house requant above; its own
+    // resident-Metal agent battery earns this second digest admission.
+    (
+        "ornith-1.0-9b-Q4_K_M.gguf",
+        "ornith_1_0_9b_q4_k_m",
+        "5720d1f671b4996481274fffe01868c3c36e87c135cc8538471cc7bd6087b106",
+    ),
     (
         "ornith-1.0-9b-Q3_K_M.gguf",
         "ornith_1_0_9b_q3_k_m",
@@ -37168,8 +37270,17 @@ fn supported_artifact_expected_sha256(filename: &str) -> Option<&'static str> {
 /// callers must therefore ask `supported_artifact_expected_sha256` first if they
 /// need to distinguish "wrong bytes" from "not hash-pinned".
 fn supported_artifact_identity_matches(filename: &str, gguf_sha256: &str) -> bool {
-    supported_artifact_expected_sha256(filename)
-        .is_some_and(|expected| gguf_sha256.eq_ignore_ascii_case(expected))
+    prism_supported_artifact_identity_matches(filename, gguf_sha256)
+        || NON_CATALOG_SUPPORTED_ARTIFACTS
+            .iter()
+            .any(|(artifact, _, sha256)| {
+                *artifact == filename && gguf_sha256.eq_ignore_ascii_case(sha256)
+            })
+        || CURATED_SUPPORTED_ARTIFACT_SHA256
+            .iter()
+            .any(|(artifact, sha256)| {
+                *artifact == filename && gguf_sha256.eq_ignore_ascii_case(sha256)
+            })
 }
 
 /// True when `filename` is the exact GGUF artifact of a curated row whose
@@ -37445,12 +37556,15 @@ fn classify_loaded_model_identity(
     gguf_sha256: &str,
 ) -> ModelLaneClass {
     let class = classify_model_lane(architecture, filename);
-    let expected_sha256 = supported_artifact_expected_sha256(filename)
-        .or_else(|| phase2_curated_artifact_expected_sha256(filename));
+    let artifact_is_pinned = supported_artifact_expected_sha256(filename).is_some()
+        || phase2_curated_artifact_expected_sha256(filename).is_some();
     if matches!(
         class,
         ModelLaneClass::Supported | ModelLaneClass::RunnableWithVariance
-    ) && expected_sha256.is_some_and(|expected| !gguf_sha256.eq_ignore_ascii_case(expected))
+    ) && artifact_is_pinned
+        && !supported_artifact_identity_matches(filename, gguf_sha256)
+        && !phase2_curated_artifact_expected_sha256(filename)
+            .is_some_and(|expected| gguf_sha256.eq_ignore_ascii_case(expected))
     {
         ModelLaneClass::ExperimentalImplemented
     } else {

@@ -223,6 +223,20 @@ Backend runtime knobs used during performance work:
   override the 64-token default. Hashes are only indexes—the underlying token
   IDs are compared before reuse—and existing Metal profitability and
   low-memory cache-disable gates still apply.
+- Ornith/Qwen35 Metal uses a separate hybrid prompt cache because its recurrent
+  layers cannot be restored from attention KV alone. The runtime keeps exact
+  token prefixes, resident attention KV, and bounded host snapshots of the SSM
+  convolution/recurrent state. It is enabled by default. Set
+  `CAMELID_QWEN35_PREFIX_CACHE=0` to disable it;
+  `CAMELID_QWEN35_PREFIX_CACHE_BLOCK_TOKENS` selects a power-of-two checkpoint
+  interval from 32 through 1024 (default `128`),
+  `CAMELID_QWEN35_PREFIX_CACHE_CHECKPOINTS` keeps 1 through 8 recent checkpoints
+  (default `4`), and `CAMELID_QWEN35_PREFIX_CACHE_MAX_MIB` bounds their host
+  storage from 32 through 1024 MiB (default `256`). The default Qwen35 Metal
+  resident capacity is 8,192 positions; `CAMELID_QWEN35_METAL_MAXPOS` may lower
+  or raise that allocation for diagnosis. Prompts larger than the resident
+  allocation fail closed rather than silently replaying an agent prompt on the
+  hours-slower CPU fallback.
 - `CAMELID_GPU_TEMP_SAMPLING` controls the CUDA-resident Gumbel-max path for plain temperature sampling. It defaults to enabled after seeded device/reference and streaming validation, avoiding a full-vocabulary device-to-host copy and CPU sort on each sampled token. Set it to `0`, `false`, `off`, or `no` to force the CPU sampling fallback for diagnosis.
 - `CAMELID_CUDA_RESIDENT_PREFILL_BATCHED` overrides the resident CUDA prefill policy. Q8_0 uses batched prefill by default; Q4_K/Q6_K keep the sustained-throughput winner (serial prefill) by default on the Windows/WDDM reference host. Set it to `1`, `true`, or `on` to exercise the parity-checked Q4_K/Q6_K batched kernels, or `0`, `false`, or `off` to force serial prefill for any quant lane.
 - `CAMELID_CUDA_KQUANT_BATCH_TOKENS` selects the requested Q4_K/Q6_K CUDA prefill tile size from `1` through `4` when batched K-quant prefill is explicitly enabled. Default: `2`; the runtime clamps it to the model dimensions and portable shared-memory budget. This remains a diagnostic tuning knob until a target GPU shows a sustained gain.

@@ -2587,8 +2587,6 @@ pub fn run_loop(
                 require_workspace_change && workspace_is_effectively_empty(sandbox.root());
             let missing_artifacts =
                 missing_required_artifacts(sandbox.root(), &required_workspace_artifacts);
-            let missing_authored_artifacts =
-                missing_required_authored_artifacts(sandbox.root(), &required_workspace_artifacts);
             let verification_failed = runtime.ledger.verification_state.status.as_str() == "failed";
             let phase = if workspace_changed && verification_failed {
                 // A real test/build failure is repair evidence.  Return all
@@ -2631,6 +2629,37 @@ pub fn run_loop(
             } else {
                 ActionPhase::Modify
             };
+            if phase == ActionPhase::Complete {
+                // Completion is already a host-owned decision: reaching this
+                // phase proves required artifacts, exact source capture,
+                // execution evidence, and the current source fingerprint. A
+                // final model request has no remaining judgment to perform and
+                // changes the native schema from six tools to zero, forcing an
+                // otherwise pointless cold prefill on local Qwen35. Publish the
+                // same bounded ledger summary used by the capped-output fallback.
+                let work = if runtime.ledger.completed_work.is_empty() {
+                    "the requested workspace change".to_string()
+                } else {
+                    runtime.ledger.completed_work.join("; ")
+                };
+                let verification = runtime
+                    .ledger
+                    .verification_state
+                    .last_command
+                    .clone()
+                    .unwrap_or_else(|| "the recorded verification checks".into());
+                let summary = format!("Completed {work}. Verified with `{verification}`.");
+                runtime.ledger.current_focus = "Task complete".into();
+                runtime.ledger.verification_state.status = "complete".into();
+                if let Err(error) = runtime.save().and_then(|_| runtime.record_task_complete()) {
+                    reporter.notice(&format!("context paging completion error: {error}"));
+                    return LoopEnd::DriverError;
+                }
+                reporter.notice("host verification complete; publishing the ledger summary");
+                reporter.model_text(&summary);
+                history.push(AgentMsg::Assistant(summary));
+                return LoopEnd::Answered;
+            }
             let current_action = match phase {
                     ActionPhase::Discover => concat!(
                         "Inspect the workspace with one advertised native read tool. Read exact ",
@@ -2683,29 +2712,20 @@ pub fn run_loop(
                     ActionPhase::Verify =>
                         "Finish missing work or run the narrowest relevant verification now."
                             .to_string(),
-                    ActionPhase::Complete =>
-                        "Answer in plain text with a concise verified summary under 60 words"
-                            .to_string(),
+                    ActionPhase::Complete => unreachable!("complete phase returned above"),
                 };
             let current_action = current_action_with_paging_feedback(current_action, history);
             let mut capsule_tools = tools.clone();
             if let Some(suppressed) = temporarily_suppressed_paging_tool.as_deref() {
                 capsule_tools.retain(|tool| tool.name != suppressed);
             }
-            if direct_creation_target.is_some() {
-                capsule_tools.retain(|tool| tool.name == "write_file");
-            } else if !missing_authored_artifacts.is_empty() {
-                // A read-only verification command cannot succeed for an
-                // explicitly incomplete project. Advertising run_shell here
-                // lets a small model execute a half-built entry point, then
-                // chase secondary import/path errors instead of creating the
-                // remaining host-known artifacts. Keep file tools available;
-                // restore the stable shell vocabulary as soon as the manifest
-                // is complete.
-                capsule_tools.retain(|tool| tool.name != "run_shell");
-            } else if phase == ActionPhase::Verify && paging_shell_verification_required {
-                capsule_tools.retain(|tool| tool.name == "run_shell");
-            }
+            // Keep the native schema prefix byte-identical through active work.
+            // The phase/current-action contract still tells the model which
+            // action is valid now, and host validation rejects unsafe calls.
+            // Narrowing direct creation to write_file and verification to
+            // run_shell made every phase transition a cold prefill on Qwen35,
+            // even though Context Paging already defines one stable six-tool
+            // vocabulary for Modify and Verify.
             let capsule = match runtime.build_capsule(
                 &current_action,
                 phase,
@@ -10615,7 +10635,7 @@ mod tests {
             &mut history,
         );
         assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
-        assert_eq!(driver.histories.len(), 4);
+        assert_eq!(driver.histories.len(), 3);
         assert!(driver.histories.iter().all(|history| history.len() == 1));
         assert!(driver.histories.iter().all(|history| matches!(
             history.first(),
@@ -10626,14 +10646,8 @@ mod tests {
         assert!(driver.tool_names[0].contains(&"run_shell".to_string()));
         assert_eq!(driver.tool_names[0], driver.tool_names[1]);
         assert_eq!(driver.tool_names[1], driver.tool_names[2]);
-        assert!(driver.tool_names[3].is_empty());
-        let final_capsule = match &driver.histories[3][0] {
-            AgentMsg::User(capsule) => capsule,
-            other => panic!("expected final fresh capsule, got {other:?}"),
-        };
-        assert!(final_capsule.contains("Answer in plain text"));
-        assert!(!final_capsule.contains("<exact_source_page"));
-        assert!(!final_capsule.contains("<failed_attempts>"));
+        assert_eq!(reporter.text.len(), 1);
+        assert!(reporter.text[0].contains("Verified"));
         assert_eq!(
             std::fs::read_to_string(directory.path().join("src/lib.rs")).unwrap(),
             "pub fn increment(value: i32) -> i32 {\n    value + 2\n}\n"
@@ -11108,7 +11122,7 @@ mod tests {
         );
 
         assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
-        assert_eq!(driver.step, 5);
+        assert_eq!(driver.step, 4);
         assert_ne!(driver.capsules[0], driver.capsules[1]);
         assert_eq!(
             std::fs::read_to_string(directory.path().join("src/lib.rs")).unwrap(),
@@ -11213,7 +11227,7 @@ mod tests {
         );
 
         assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
-        assert_eq!(driver.step, 6);
+        assert_eq!(driver.step, 5);
         assert!(directory.path().join("marker.rs").is_file());
         super::super::checkpoint::clear_for_workspace(sandbox.root());
     }
@@ -11323,7 +11337,7 @@ mod tests {
         );
 
         assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
-        assert_eq!(driver.step, 6);
+        assert_eq!(driver.step, 5);
         assert_eq!(
             std::fs::read_to_string(directory.path().join("src/lib.rs")).unwrap(),
             "pub fn increment(value: i32) -> i32 {\n    value + 2\n}\n"
@@ -11588,14 +11602,7 @@ mod tests {
                         )])
                     }
                     8 => {
-                        assert_eq!(
-                            tools
-                                .iter()
-                                .map(|tool| tool.name.as_str())
-                                .collect::<Vec<_>>(),
-                            vec!["run_shell"],
-                            "an already-satisfied final edit must force execution verification"
-                        );
+                        assert_stable_active_tools(tools);
                         assert!(capsule.contains("run_shell is the only valid next action"));
                         ModelStep::Calls(vec![tc(
                             "run_shell",
@@ -11779,13 +11786,7 @@ mod tests {
                 if (5..13).contains(&self.step) {
                     let command = MANUAL_COMMANDS[self.step - 5];
                     let requested = REQUESTED_COMMANDS[self.step - 5];
-                    assert_eq!(
-                        tools
-                            .iter()
-                            .map(|tool| tool.name.as_str())
-                            .collect::<Vec<_>>(),
-                        vec!["run_shell"]
-                    );
+                    assert_stable_active_tools(tools);
                     assert!(capsule.contains(requested), "{capsule}");
                     self.step += 1;
                     return Ok(ModelStep::Calls(vec![tc(
@@ -11811,13 +11812,7 @@ mod tests {
                         json!({"command": "python3 -m unittest discover -s taskforge/tests"}),
                     )]),
                     4 => {
-                        assert_eq!(
-                            tools
-                                .iter()
-                                .map(|tool| tool.name.as_str())
-                                .collect::<Vec<_>>(),
-                            vec!["run_shell"]
-                        );
+                        assert_stable_active_tools(tools);
                         assert!(capsule.contains(REQUESTED_COMMANDS[0]), "{capsule}");
                         ModelStep::Calls(vec![tc(
                             "run_shell",
@@ -11882,7 +11877,7 @@ mod tests {
         );
 
         assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
-        assert_eq!(driver.step, 16);
+        assert_eq!(driver.step, 15);
         assert!(reporter
             .results
             .iter()
@@ -12078,14 +12073,7 @@ mod tests {
                         }),
                     )]),
                     3 => {
-                        assert_eq!(
-                            tools
-                                .iter()
-                                .map(|tool| tool.name.as_str())
-                                .collect::<Vec<_>>(),
-                            vec!["run_shell"],
-                            "zero discovered tests must keep the execution-only Verify gate"
-                        );
+                        assert_stable_active_tools(tools);
                         assert!(capsule.contains("discovered zero tests"), "{capsule}");
                         ModelStep::Calls(vec![tc(
                             "run_shell",
@@ -12243,7 +12231,7 @@ mod tests {
         );
 
         assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
-        assert_eq!(driver.step, 5);
+        assert_eq!(driver.step, 4);
         assert!(std::fs::read_to_string(directory.path().join("app.rs"))
             .unwrap()
             .contains("fn value() -> i32 { 2 }"));
@@ -12314,7 +12302,7 @@ mod tests {
         );
 
         assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
-        assert_eq!(driver.step, 5);
+        assert_eq!(driver.step, 4);
         assert!(directory.path().join("app.rs").is_file());
         assert!(reporter.notices.iter().any(
             |notice| notice.contains("supplied deterministic workspace-root path for list_dir")
@@ -12349,7 +12337,7 @@ mod tests {
                     1 => ModelStep::Calls(vec![tc("read_file", json!({"path":"first.rs"}))]),
                     2 => {
                         assert!(tools.iter().any(|tool| tool.name == "write_file"));
-                        assert!(!tools.iter().any(|tool| tool.name == "run_shell"));
+                        assert!(tools.iter().any(|tool| tool.name == "run_shell"));
                         assert!(capsule.contains("second.rs"), "{capsule}");
                         ModelStep::Calls(vec![tc(
                             "run_shell",
@@ -12358,7 +12346,7 @@ mod tests {
                     }
                     3 => {
                         assert!(tools.iter().any(|tool| tool.name == "write_file"));
-                        assert!(!tools.iter().any(|tool| tool.name == "run_shell"));
+                        assert!(tools.iter().any(|tool| tool.name == "run_shell"));
                         assert!(capsule.contains("second.rs"), "{capsule}");
                         assert!(capsule.contains("remaining required workspace artifacts"));
                         ModelStep::Calls(vec![tc(
@@ -12412,7 +12400,7 @@ mod tests {
         );
 
         assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
-        assert_eq!(driver.step, 7);
+        assert_eq!(driver.step, 6);
         assert!(directory.path().join("first.rs").is_file());
         assert!(directory.path().join("second.rs").is_file());
         super::super::checkpoint::clear_for_workspace(sandbox.root());
@@ -13549,7 +13537,7 @@ mod tests {
         );
 
         assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
-        assert_eq!(driver.step, 3);
+        assert_eq!(driver.step, 2);
         assert!(directory.path().join("app.py").is_file());
         super::super::checkpoint::clear_for_workspace(sandbox.root());
     }
@@ -13931,13 +13919,7 @@ mod tests {
                 };
                 let response = match self.step {
                     0 => {
-                        assert_eq!(
-                            tools
-                                .iter()
-                                .map(|tool| tool.name.as_str())
-                                .collect::<Vec<_>>(),
-                            vec!["write_file"]
-                        );
+                        assert_stable_active_tools(tools);
                         assert!(capsule.contains("`tic_tac_toe.py`"));
                         assert!(capsule.contains("does not exist"));
                         assert!(capsule.contains("human controls exactly one side"));
@@ -14018,7 +14000,10 @@ mod tests {
         );
 
         assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
-        assert!(matches!(driver.step, 3 | 4));
+        assert!(
+            (2..=3).contains(&driver.step),
+            "host-owned completion should avoid a final model step"
+        );
         assert_eq!(
             std::fs::read_to_string(directory.path().join("tic_tac_toe.py")).unwrap(),
             source
@@ -14117,12 +14102,8 @@ mod tests {
         );
 
         assert_eq!(end, LoopEnd::Answered);
-        assert_eq!(driver.steps, 1);
-        assert_eq!(driver.max_tokens, 256);
-        assert!(reporter
-            .notices
-            .iter()
-            .any(|notice| notice.contains("verified completion exceeded its tiny output cap")));
+        assert_eq!(driver.steps, 0);
+        assert_eq!(driver.max_tokens, 0);
         assert!(reporter.text[0].contains("py -m py_compile game.py"));
         let restarted =
             ContextPagingRuntime::open(directory.path(), objective, ContextPagingConfig::default())
@@ -14167,8 +14148,9 @@ mod tests {
         );
 
         assert_eq!(restart_end, LoopEnd::Answered);
-        assert_eq!(restart_driver.steps, 1);
-        assert_eq!(restart_reporter.text, vec!["Already changed and verified."]);
+        assert_eq!(restart_driver.steps, 0);
+        assert_eq!(restart_reporter.text.len(), 1);
+        assert!(restart_reporter.text[0].contains("py -m py_compile game.py"));
         super::super::checkpoint::clear_for_workspace(sandbox.root());
     }
 
@@ -14337,6 +14319,23 @@ mod tests {
             name: name.into(),
             args,
         }
+    }
+
+    fn assert_stable_active_tools(tools: &[ToolSpec]) {
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "read_file",
+                "list_dir",
+                "search",
+                "write_file",
+                "edit_file",
+                "run_shell",
+            ]
+        );
     }
 
     #[test]
@@ -16553,7 +16552,7 @@ mod tests {
         );
 
         assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
-        assert_eq!(driver.step, 5);
+        assert_eq!(driver.step, 4);
         assert_eq!(
             std::fs::read_to_string(directory.path().join("game.py")).unwrap(),
             "print('ready')\n"

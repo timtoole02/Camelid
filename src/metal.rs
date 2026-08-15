@@ -17604,6 +17604,95 @@ impl Qwen35MetalDecode {
         self.filled = 0;
     }
 
+    /// Snapshot the order-dependent recurrent state at the current prompt
+    /// boundary. Every Qwen3.5 command buffer is complete before this method is
+    /// called, and these buffers use `StorageModeShared`, so the host read is a
+    /// coherent byte-for-byte copy on Apple Silicon.
+    pub(crate) fn snapshot_recurrent_state(&self) -> Qwen35MetalStateSnapshot {
+        let mut recurrent = Vec::new();
+        for layer in &self.layers {
+            if let Qwen35MetalLayerKind::Ssm {
+                conv_state, state, ..
+            } = &layer.kind
+            {
+                for buffer in [conv_state, state] {
+                    // SAFETY: the resident engine owns every StorageModeShared
+                    // buffer and no Metal command is in flight at this boundary.
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            buffer.contents() as *const u8,
+                            buffer.length() as usize,
+                        )
+                    };
+                    recurrent.push(bytes.to_vec().into_boxed_slice());
+                }
+            }
+        }
+        Qwen35MetalStateSnapshot {
+            position: self.filled,
+            recurrent,
+        }
+    }
+
+    /// Restore one exact recurrent checkpoint while retaining the attention K/V
+    /// prefix already resident in this same engine. Shape and position mismatch
+    /// fail closed; callers then reset and cold-prefill rather than combining
+    /// state from different prompt epochs.
+    pub(crate) fn restore_recurrent_state(&mut self, snapshot: &Qwen35MetalStateSnapshot) -> bool {
+        if snapshot.position > self.max_positions {
+            return false;
+        }
+        let expected_buffers = self
+            .layers
+            .iter()
+            .filter(|layer| matches!(layer.kind, Qwen35MetalLayerKind::Ssm { .. }))
+            .count()
+            * 2;
+        if snapshot.recurrent.len() != expected_buffers {
+            return false;
+        }
+
+        let mut payloads = snapshot.recurrent.iter();
+        for layer in &self.layers {
+            if let Qwen35MetalLayerKind::Ssm {
+                conv_state, state, ..
+            } = &layer.kind
+            {
+                for buffer in [conv_state, state] {
+                    let Some(bytes) = payloads.next() else {
+                        return false;
+                    };
+                    if bytes.len() != buffer.length() as usize {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        let mut payloads = snapshot.recurrent.iter();
+        for layer in &self.layers {
+            if let Qwen35MetalLayerKind::Ssm {
+                conv_state, state, ..
+            } = &layer.kind
+            {
+                for buffer in [conv_state, state] {
+                    let bytes = payloads.next().expect("snapshot shape checked above");
+                    // SAFETY: buffers are private StorageModeShared allocations,
+                    // no command is in flight, and the exact length was checked.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            bytes.as_ptr(),
+                            buffer.contents() as *mut u8,
+                            bytes.len(),
+                        );
+                    }
+                }
+            }
+        }
+        self.filled = snapshot.position;
+        true
+    }
+
     pub(crate) fn forward_greedy(
         &mut self,
         embedding: &[f32],
@@ -21434,6 +21523,31 @@ pub(crate) struct Qwen35MetalDecode {
     hidden_a: Buffer,
     hidden_b: Buffer,
     filled: usize,
+}
+
+/// Exact host copy of the recurrent half of one Qwen3.5 prompt checkpoint.
+///
+/// Full-attention K/V stays in the resident engine: rolling `filled` back makes
+/// positions after the checkpoint unreachable and the next prefill overwrites
+/// them.  Gated-delta/SSM layers are different because their fixed-size state is
+/// destructive, so every reusable prompt boundary must preserve both the causal
+/// convolution ring and recurrent matrix.  Payloads remain f32 byte-for-byte;
+/// lossy compression here would silently change greedy tokens after a restore.
+#[cfg(target_os = "macos")]
+pub(crate) struct Qwen35MetalStateSnapshot {
+    position: usize,
+    recurrent: Vec<Box<[u8]>>,
+}
+
+#[cfg(target_os = "macos")]
+impl Qwen35MetalStateSnapshot {
+    pub(crate) fn position(&self) -> usize {
+        self.position
+    }
+
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        self.recurrent.iter().map(|bytes| bytes.len()).sum()
+    }
 }
 
 /// Optional final stage for `forward_token`: when present, the session also runs the final

@@ -239,6 +239,33 @@ workspace state and is published only after a fresh index or structural edit;
 task-local ledger/metrics saves never rewrite a possibly stale project copy.
 Retrieval misses are persisted even when the fault fails.
 
+## Ornith/Qwen35 hybrid prefix reuse
+
+Qwen35 combines full-attention layers with recurrent SSM layers, so reusing an
+attention-only KV prefix is not correct. On Metal, Camelid retains the exact
+prompt token IDs and resident attention KV, plus bounded host snapshots of every
+SSM convolution and recurrent-state buffer at aligned token blocks. A later
+request computes the exact token LCP, restores the newest checkpoint at or below
+that prefix, and prefills only the divergent suffix. Token IDs are always
+compared before state reuse; hashes are never treated as proof of equality.
+
+The default policy uses 128-token blocks, four recent checkpoints, and at most
+256 MiB of host snapshot storage. Vision requests and failed restores invalidate
+the text cache. Timing receipts expose the cache decision, exact common prefix,
+reused/prefilled token counts, matching blocks, and checkpoint bytes.
+
+Active Modify and Verify requests keep the same six native tool schemas in the
+same order so ordinary phase transitions do not move the first divergent token
+ahead of the capsule. Once host-owned artifact, source-capture, verification, and
+fingerprint gates prove completion, the host renders the bounded ledger summary
+directly instead of paying for a final zero-tool cold inference.
+
+The controlled 2026-08-15 Apple Silicon receipt in
+`qa/ornith/G-PREFIX-qwen35-hybrid-metal-macos.md` measured 2,304 reused prompt
+tokens and only 28 prefilled tokens: 2.52 seconds versus 186.23 seconds for the
+same changed-tail request with the cache disabled, with identical greedy output.
+This does not remove the first cold prompt cost.
+
 ## Configuration
 
 - `CAMELID_AGENT_CONTEXT_MAX_TOKENS`: optional process-wide cap for adaptive
@@ -284,6 +311,18 @@ Retrieval misses are persisted even when the fault fails.
   prompt-prefix index, default `64`. Accepted values are powers of two from 16
   through 1024; invalid values use the default. This changes lookup
   granularity, not memory admission or the Metal 48:1 profitability gate.
+- `CAMELID_QWEN35_PREFIX_CACHE=0`: disable the Qwen35 hybrid attention-KV/SSM
+  cache. It is enabled by default.
+- `CAMELID_QWEN35_PREFIX_CACHE_BLOCK_TOKENS`: Qwen35 recurrent-state checkpoint
+  interval, default `128`; accepted values are powers of two from 32 through
+  1024.
+- `CAMELID_QWEN35_PREFIX_CACHE_CHECKPOINTS`: number of recent aligned Qwen35
+  checkpoints, default `4`; accepted values are 1 through 8.
+- `CAMELID_QWEN35_PREFIX_CACHE_MAX_MIB`: Qwen35 host checkpoint-memory limit,
+  default `256`; accepted values are 32 through 1024 MiB.
+- `CAMELID_QWEN35_METAL_MAXPOS`: Qwen35 Metal resident token capacity, default
+  `8192`. Oversized requests fail closed instead of silently falling back to
+  cold CPU replay.
 
 Invalid numeric values fail closed to the documented defaults. A capsule that
 cannot retain its immutable task contract, late mandatory task state, current

@@ -3371,8 +3371,23 @@ fn tool_capable_row_for_loaded_artifact(
     filename: &str,
     gguf_sha256: &str,
 ) -> Option<(&'static str, &'static str)> {
-    if supported_artifact_expected_sha256(filename)
-        .is_some_and(|expected| !gguf_sha256.eq_ignore_ascii_case(expected))
+    if let Some((_, row_id, _)) =
+        NON_CATALOG_SUPPORTED_ARTIFACTS
+            .iter()
+            .find(|(artifact, _, sha256)| {
+                *artifact == filename && gguf_sha256.eq_ignore_ascii_case(sha256)
+            })
+    {
+        return tool_capable_compatibility_rows()
+            .into_iter()
+            .find(|row| row.id == *row_id)
+            .map(|row| (row.id, row.family));
+    }
+    if NON_CATALOG_SUPPORTED_ARTIFACTS
+        .iter()
+        .any(|(artifact, _, _)| *artifact == filename)
+        || supported_artifact_expected_sha256(filename)
+            .is_some_and(|expected| !gguf_sha256.eq_ignore_ascii_case(expected))
     {
         return None;
     }
@@ -3643,24 +3658,23 @@ mod tests {
     }
 
     #[test]
-    fn tool_capability_requires_the_certified_bytes_not_just_the_name() {
+    fn tool_capability_requires_one_of_the_certified_bytes_not_just_the_name() {
         // `tool_capable` is earned per exact row by a committed agent-eval receipt
         // against specific bytes. The Ornith Q4_K_M name is shared by the certified
         // in-house requant and a different public HuggingFace imatrix quant, so the
         // digest — not the filename — has to authorize Workspace.
-        const CERTIFIED: &str = "2711bf1ef034fa39eb899f793fe63bbb0aac21ebdacbcbe09406b5600ad5188f";
-        const HF_IMATRIX_SAME_NAME: &str =
+        const CUDA_REQUANT: &str =
+            "2711bf1ef034fa39eb899f793fe63bbb0aac21ebdacbcbe09406b5600ad5188f";
+        const METAL_IMATRIX: &str =
             "5720d1f671b4996481274fffe01868c3c36e87c135cc8538471cc7bd6087b106";
         let filename = "ornith-1.0-9b-Q4_K_M.gguf";
         assert!(
             tool_capable_row_for_filename(filename).is_some(),
             "precondition: this row is tool-capable by name"
         );
-        assert!(tool_capable_row_for_loaded_artifact(filename, CERTIFIED).is_some());
-        assert!(
-            tool_capable_row_for_loaded_artifact(filename, HF_IMATRIX_SAME_NAME).is_none(),
-            "uncertified bytes must not inherit the agent battery this row passed"
-        );
+        assert!(tool_capable_row_for_loaded_artifact(filename, CUDA_REQUANT).is_some());
+        assert!(tool_capable_row_for_loaded_artifact(filename, METAL_IMATRIX).is_some());
+        assert!(tool_capable_row_for_loaded_artifact(filename, &"00".repeat(32)).is_none());
         // A row with no recorded digest keeps its existing filename gating.
         // Resolved dynamically: naming a specific file here rots the moment that
         // row gains a pin (it did — Qwen3-4B-Q4_K_M was the original example).

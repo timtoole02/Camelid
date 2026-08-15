@@ -788,6 +788,51 @@ impl KvCache {
     }
 }
 
+#[cfg(target_os = "macos")]
+const QWEN35_PROMPT_CACHE_BLOCK_TOKENS: usize = 128;
+#[cfg(target_os = "macos")]
+const QWEN35_PROMPT_CACHE_CHECKPOINTS: usize = 4;
+#[cfg(target_os = "macos")]
+const QWEN35_PROMPT_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// Compact receipt for the Qwen3.5 hybrid prompt cache. It deliberately mirrors
+/// the dense prompt-cache fields consumed by Workspace, while naming the actual
+/// hybrid decision rather than pretending this lane uses `InferenceSession`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Qwen35PromptCacheStats {
+    pub hit: bool,
+    pub decision: Option<&'static str>,
+    pub common_prefix_tokens: usize,
+    pub divergent_suffix_tokens: usize,
+    pub candidate_tokens: usize,
+    pub reused_tokens: usize,
+    pub prefilled_tokens: usize,
+    pub block_tokens: usize,
+    pub matched_blocks: usize,
+    pub checkpoint_bytes: usize,
+    pub prefill_ms: u128,
+}
+
+#[cfg(target_os = "macos")]
+struct Qwen35PromptCheckpoint {
+    state: crate::metal::Qwen35MetalStateSnapshot,
+}
+
+#[cfg(target_os = "macos")]
+struct Qwen35PromptCache {
+    tokens: Vec<u32>,
+    block_tokens: usize,
+    checkpoints: Vec<Qwen35PromptCheckpoint>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct Qwen35MetalRuntimeState {
+    engine: Option<crate::metal::Qwen35MetalDecode>,
+    prompt_cache: Option<Qwen35PromptCache>,
+    last_cache_stats: Qwen35PromptCacheStats,
+}
+
 /// A loaded runnable model: parametric config + quantized weights, ready for greedy
 /// decode. Weights are dequantized to f32 on demand during the forward pass.
 pub struct RunnableModel {
@@ -846,7 +891,7 @@ pub struct RunnableModel {
     /// Fully resident Apple Metal Qwen3.5 hybrid graph. Built lazily so merely
     /// inspecting/loading a model does not allocate recurrent/KV state.
     #[cfg(target_os = "macos")]
-    metal_qwen35: std::sync::Mutex<Option<crate::metal::Qwen35MetalDecode>>,
+    metal_qwen35: std::sync::Mutex<Qwen35MetalRuntimeState>,
     /// Resident LFM2 Metal graph, built on first use and reused. `Mutex` supplies the
     /// `&mut` a per-token forward needs while `generate_*` take `&self`.
     #[cfg(target_os = "macos")]
@@ -1290,7 +1335,7 @@ impl RunnableModel {
                 #[cfg(feature = "cuda")]
                 cuda: std::sync::Mutex::new(None),
                 #[cfg(target_os = "macos")]
-                metal_qwen35: std::sync::Mutex::new(None),
+                metal_qwen35: std::sync::Mutex::new(Qwen35MetalRuntimeState::default()),
                 #[cfg(target_os = "macos")]
                 metal_lfm2: std::sync::Mutex::new(None),
             });
@@ -1453,7 +1498,7 @@ impl RunnableModel {
                 #[cfg(feature = "cuda")]
                 cuda: std::sync::Mutex::new(None),
                 #[cfg(target_os = "macos")]
-                metal_qwen35: std::sync::Mutex::new(None),
+                metal_qwen35: std::sync::Mutex::new(Qwen35MetalRuntimeState::default()),
                 #[cfg(target_os = "macos")]
                 metal_lfm2: std::sync::Mutex::new(None),
             });
@@ -1591,7 +1636,7 @@ impl RunnableModel {
             #[cfg(feature = "cuda")]
             cuda: std::sync::Mutex::new(None),
             #[cfg(target_os = "macos")]
-            metal_qwen35: std::sync::Mutex::new(None),
+            metal_qwen35: std::sync::Mutex::new(Qwen35MetalRuntimeState::default()),
             #[cfg(target_os = "macos")]
             metal_lfm2: std::sync::Mutex::new(None),
         })
@@ -2711,6 +2756,20 @@ impl Qwen35Cache {
 }
 
 impl RunnableModel {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn qwen35_prompt_cache_stats(&self) -> Option<Qwen35PromptCacheStats> {
+        self.qwen35.as_ref()?;
+        self.metal_qwen35
+            .lock()
+            .ok()
+            .map(|state| state.last_cache_stats)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn qwen35_prompt_cache_stats(&self) -> Option<Qwen35PromptCacheStats> {
+        None
+    }
+
     /// Stateless whole-sequence forward for the smoke gate: scan all positions and
     /// return the last position's logits. Mirrors [`generate_qwen35`] step-for-step.
     ///
@@ -2934,12 +2993,13 @@ impl RunnableModel {
     /// falling back to the CPU runnable lane on any CUDA error. The CPU lane is the
     /// certified oracle, and the default only where neither GPU lane applies.
     fn generate_qwen35(&self, prompt: &[u32], max_new: usize, stop: &[u32]) -> Result<Vec<u32>> {
-        self.generate_qwen35_streaming(prompt, max_new, stop, None, false, &mut |_| {})
+        self.generate_qwen35_streaming(prompt, max_new, stop, None, false, &|| false, &mut |_| {})
     }
 
     /// Like [`generate_qwen35`](Self::generate_qwen35) but invokes `on_token` for
     /// every emitted token as soon as it is decided — the serve lane's SSE source.
     /// Token order/content identical to the non-streaming path by construction.
+    #[allow(clippy::too_many_arguments)]
     fn generate_qwen35_streaming(
         &self,
         prompt: &[u32],
@@ -2947,6 +3007,7 @@ impl RunnableModel {
         stop: &[u32],
         sampling: Option<&SamplingConfig>,
         stream_tokens_observable: bool,
+        is_cancelled: &dyn Fn() -> bool,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
         #[cfg(all(not(target_os = "macos"), not(feature = "cuda")))]
@@ -2954,12 +3015,27 @@ impl RunnableModel {
 
         #[cfg(target_os = "macos")]
         if qwen35_metal_enabled() {
+            let resident_capacity = qwen35_metal_context_capacity();
+            if prompt.len() >= resident_capacity {
+                return Err(BackendError::UnsupportedGguf(format!(
+                    "Qwen3.5 prompt of {} tokens exceeds the Metal resident capacity of \
+                     {resident_capacity}; refusing the hours-slower CPU replay",
+                    prompt.len()
+                )));
+            }
             return qwen35_accelerator_with_cpu_fallback(
                 on_token,
                 stream_tokens_observable,
                 "Metal",
                 |tracked_on_token| {
-                    self.generate_qwen35_metal(prompt, max_new, stop, sampling, tracked_on_token)
+                    self.generate_qwen35_metal(
+                        prompt,
+                        max_new,
+                        stop,
+                        sampling,
+                        is_cancelled,
+                        tracked_on_token,
+                    )
                 },
                 |fallback_on_token| {
                     self.generate_qwen35_cpu(prompt, max_new, stop, sampling, fallback_on_token)
@@ -3012,6 +3088,7 @@ impl RunnableModel {
         max_new: usize,
         stop: &[u32],
         sampling: Option<&SamplingConfig>,
+        is_cancelled: &dyn Fn() -> bool,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
         let max_positions = qwen35_metal_context_capacity();
@@ -3020,31 +3097,154 @@ impl RunnableModel {
             .metal_qwen35
             .lock()
             .map_err(|_| BackendError::InvalidTensorData("qwen35 Metal mutex poisoned".into()))?;
-        if guard.is_none() {
-            *guard = Some(self.build_qwen35_metal(max_positions)?);
+        let Qwen35MetalRuntimeState {
+            engine,
+            prompt_cache,
+            last_cache_stats,
+        } = &mut *guard;
+        if engine.is_none() {
+            *engine = Some(self.build_qwen35_metal(max_positions)?);
             eprintln!(
                 "[qwen35] full Metal resident graph active (packed weights, attention, \
                  gated-delta recurrence, FFN, logits, GPU greedy, and request sampling)"
             );
         }
-        let engine = guard.as_mut().expect("Qwen3.5 Metal engine initialized");
-        engine.reset();
+        let old_cache = prompt_cache.take();
+        let engine = engine.as_mut().expect("Qwen3.5 Metal engine initialized");
         let sampler = sampling.map(|config| LlamaSampler::Sampling(config.clone()));
         let mut token_history = prompt.to_vec();
         let (&last_prompt_token, prior_prompt) = prompt
             .split_last()
             .ok_or_else(|| BackendError::InvalidTensorData("empty prompt".into()))?;
-        let mut prefill = Vec::with_capacity(prior_prompt.len());
-        for (position, &token) in prior_prompt.iter().enumerate() {
-            let embedding = self.token_embd.dequant_row(token as usize, "token_embd")?;
-            let (cos, sin) = qwen35_rope_tables(position, self.rope_base, self.rope_dim);
-            prefill.push((embedding, cos, sin));
+        let prompt_started = std::time::Instant::now();
+        let cache_enabled = qwen35_prompt_cache_enabled();
+        let block_tokens = qwen35_prompt_cache_block_tokens();
+        let checkpoint_limit = qwen35_prompt_cache_checkpoint_limit();
+        let checkpoint_positions =
+            qwen35_prompt_checkpoint_positions(prior_prompt.len(), block_tokens, checkpoint_limit);
+        let mut stats = Qwen35PromptCacheStats {
+            block_tokens,
+            prefilled_tokens: prompt.len(),
+            ..Qwen35PromptCacheStats::default()
+        };
+        let mut checkpoints = Vec::new();
+        let mut reused = 0usize;
+
+        if cache_enabled {
+            if let Some(old) = old_cache {
+                stats.candidate_tokens = old.tokens.len();
+                stats.common_prefix_tokens = qwen35_common_prefix(&old.tokens, prompt);
+                stats.divergent_suffix_tokens =
+                    prompt.len().saturating_sub(stats.common_prefix_tokens);
+                let selected = (old.block_tokens == block_tokens)
+                    .then(|| {
+                        old.checkpoints.iter().rev().find(|checkpoint| {
+                            let position = checkpoint.state.position();
+                            position <= stats.common_prefix_tokens && position <= prior_prompt.len()
+                        })
+                    })
+                    .flatten();
+                if let Some(selected) = selected {
+                    if engine.restore_recurrent_state(&selected.state) {
+                        reused = selected.state.position();
+                        stats.hit = true;
+                        stats.decision = Some("qwen35_hybrid_block_prefix_hit");
+                        stats.reused_tokens = reused;
+                        stats.prefilled_tokens = prompt.len().saturating_sub(reused);
+                        stats.matched_blocks = reused / block_tokens;
+                    } else {
+                        engine.reset();
+                        stats.decision = Some("qwen35_hybrid_restore_failed");
+                    }
+                } else {
+                    engine.reset();
+                    stats.decision = Some(if old.block_tokens == block_tokens {
+                        "qwen35_hybrid_no_checkpoint"
+                    } else {
+                        "qwen35_hybrid_block_size_changed"
+                    });
+                }
+
+                if reused > 0 {
+                    checkpoints.extend(old.checkpoints.into_iter().filter(|checkpoint| {
+                        checkpoint.state.position() <= stats.common_prefix_tokens
+                            && checkpoint_positions.contains(&checkpoint.state.position())
+                    }));
+                }
+            } else {
+                engine.reset();
+                stats.decision = Some("qwen35_hybrid_cold_no_entry");
+                stats.divergent_suffix_tokens = prompt.len();
+            }
+        } else {
+            engine.reset();
+            stats.decision = Some("qwen35_hybrid_disabled");
+            stats.divergent_suffix_tokens = prompt.len();
         }
-        if !engine.forward_prefill_batch(&prefill) {
-            return Err(BackendError::InvalidTensorData(format!(
-                "Qwen3.5 Metal batched prefill refused {} prompt slots",
-                prefill.len()
-            )));
+
+        let mut cursor = reused;
+        for checkpoint_position in checkpoint_positions
+            .iter()
+            .copied()
+            .filter(|position| *position > reused)
+        {
+            if is_cancelled() {
+                engine.reset();
+                *last_cache_stats = stats;
+                return Err(BackendError::InvalidTensorData(
+                    "generation cancelled during Qwen3.5 prompt prefill".into(),
+                ));
+            }
+            let mut slots = Vec::with_capacity(checkpoint_position - cursor);
+            for (position, &token) in prior_prompt[cursor..checkpoint_position].iter().enumerate() {
+                let position = cursor + position;
+                let embedding = self.token_embd.dequant_row(token as usize, "token_embd")?;
+                let (cos, sin) = qwen35_rope_tables(position, self.rope_base, self.rope_dim);
+                slots.push((embedding, cos, sin));
+            }
+            if !engine.forward_prefill_batch(&slots) {
+                engine.reset();
+                *last_cache_stats = stats;
+                return Err(BackendError::InvalidTensorData(format!(
+                    "Qwen3.5 Metal batched prefill refused prompt slots {cursor}..{checkpoint_position}"
+                )));
+            }
+            cursor = checkpoint_position;
+            if cache_enabled
+                && !checkpoints
+                    .iter()
+                    .any(|checkpoint: &Qwen35PromptCheckpoint| {
+                        checkpoint.state.position() == checkpoint_position
+                    })
+            {
+                checkpoints.push(Qwen35PromptCheckpoint {
+                    state: engine.snapshot_recurrent_state(),
+                });
+            }
+        }
+        if cursor < prior_prompt.len() {
+            if is_cancelled() {
+                engine.reset();
+                *last_cache_stats = stats;
+                return Err(BackendError::InvalidTensorData(
+                    "generation cancelled during Qwen3.5 prompt prefill".into(),
+                ));
+            }
+            let mut slots = Vec::with_capacity(prior_prompt.len() - cursor);
+            for (position, &token) in prior_prompt[cursor..].iter().enumerate() {
+                let position = cursor + position;
+                let embedding = self.token_embd.dequant_row(token as usize, "token_embd")?;
+                let (cos, sin) = qwen35_rope_tables(position, self.rope_base, self.rope_dim);
+                slots.push((embedding, cos, sin));
+            }
+            if !engine.forward_prefill_batch(&slots) {
+                engine.reset();
+                *last_cache_stats = stats;
+                return Err(BackendError::InvalidTensorData(format!(
+                    "Qwen3.5 Metal batched prefill refused prompt slots {cursor}..{}",
+                    prior_prompt.len()
+                )));
+            }
         }
         let last_position = prior_prompt.len();
         let embedding = self
@@ -3071,9 +3271,44 @@ impl RunnableModel {
                     ))
                 })?,
         };
+        if cache_enabled {
+            let max_bytes = qwen35_prompt_cache_max_bytes();
+            checkpoints.sort_by_key(|checkpoint| checkpoint.state.position());
+            let mut checkpoint_bytes: usize = checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.state.allocated_bytes())
+                .sum();
+            while checkpoint_bytes > max_bytes && !checkpoints.is_empty() {
+                checkpoint_bytes =
+                    checkpoint_bytes.saturating_sub(checkpoints.remove(0).state.allocated_bytes());
+            }
+            stats.checkpoint_bytes = checkpoint_bytes;
+            *prompt_cache = Some(Qwen35PromptCache {
+                tokens: prompt.to_vec(),
+                block_tokens,
+                checkpoints,
+            });
+        }
+        stats.prefill_ms = prompt_started.elapsed().as_millis();
+        *last_cache_stats = stats;
+        eprintln!(
+            "[qwen35-prefix-cache] decision={} common={} reused={} prefilled={} block={} checkpoints_mib={:.1} prefill_ms={}",
+            stats.decision.unwrap_or("unknown"),
+            stats.common_prefix_tokens,
+            stats.reused_tokens,
+            stats.prefilled_tokens,
+            stats.block_tokens,
+            stats.checkpoint_bytes as f64 / (1024.0 * 1024.0),
+            stats.prefill_ms,
+        );
         let mut generated = Vec::with_capacity(max_new);
         let mut position = prompt.len();
         for index in 0..max_new {
+            if is_cancelled() {
+                return Err(BackendError::InvalidTensorData(
+                    "generation cancelled during Qwen3.5 decode".into(),
+                ));
+            }
             if stop.contains(&next) {
                 break;
             }
@@ -3399,11 +3634,22 @@ impl RunnableModel {
             .metal_qwen35
             .lock()
             .map_err(|_| BackendError::InvalidTensorData("qwen35 Metal mutex poisoned".into()))?;
-        if guard.is_none() {
-            *guard = Some(self.build_qwen35_metal(max_positions)?);
+        if guard.engine.is_none() {
+            guard.engine = Some(self.build_qwen35_metal(max_positions)?);
             eprintln!("[qwen35] multimodal Metal graph active (Prism image embeddings + IMRoPE)");
         }
-        let engine = guard.as_mut().expect("Qwen3.5 Metal engine initialized");
+        // Projected image embeddings have no reusable token identity. A vision
+        // request resets the shared resident engine and therefore invalidates
+        // any text-prefix checkpoint before touching KV/recurrent state.
+        guard.prompt_cache = None;
+        guard.last_cache_stats = Qwen35PromptCacheStats {
+            decision: Some("qwen35_hybrid_vision_bypass"),
+            ..Qwen35PromptCacheStats::default()
+        };
+        let engine = guard
+            .engine
+            .as_mut()
+            .expect("Qwen3.5 Metal engine initialized");
         engine.reset();
         let sampler = sampling.map(|config| LlamaSampler::Sampling(config.clone()));
         let mut token_history = Vec::with_capacity(prefix.len() + suffix.len() + max_new);
@@ -4043,7 +4289,15 @@ impl RunnableModel {
             return Err(BackendError::InvalidTensorData("empty prompt".into()));
         }
         if self.qwen35.is_some() {
-            return self.generate_qwen35_streaming(prompt, max_new, stop, None, false, &mut |_| {});
+            return self.generate_qwen35_streaming(
+                prompt,
+                max_new,
+                stop,
+                None,
+                false,
+                &|| false,
+                &mut |_| {},
+            );
         }
         self.generate_stopping_streaming(prompt, max_new, stop, &mut |_| {})
     }
@@ -4070,6 +4324,7 @@ impl RunnableModel {
                 stop,
                 sampling,
                 false,
+                &|| false,
                 &mut |_| {},
             );
         }
@@ -4162,7 +4417,15 @@ impl RunnableModel {
         }
         if self.qwen35.is_some() {
             let sampling = qwen35_sampling_requires_logits(sampling).then_some(sampling);
-            return self.generate_qwen35_streaming(prompt, max_new, stop, sampling, true, on_token);
+            return self.generate_qwen35_streaming(
+                prompt,
+                max_new,
+                stop,
+                sampling,
+                true,
+                is_cancelled,
+                on_token,
+            );
         }
         #[cfg(target_os = "macos")]
         if self.lfm2.is_some() && lfm2_metal_enabled() {
@@ -4848,12 +5111,87 @@ pub(crate) fn qwen35_metal_enabled() -> bool {
 }
 
 #[cfg(target_os = "macos")]
+fn qwen35_prompt_cache_enabled() -> bool {
+    !std::env::var("CAMELID_QWEN35_PREFIX_CACHE")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "off" | "false" | "no" | "disabled"
+            )
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn qwen35_prompt_cache_block_tokens() -> usize {
+    std::env::var("CAMELID_QWEN35_PREFIX_CACHE_BLOCK_TOKENS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (32..=1024).contains(value) && value.is_power_of_two())
+        .unwrap_or(QWEN35_PROMPT_CACHE_BLOCK_TOKENS)
+}
+
+#[cfg(target_os = "macos")]
+fn qwen35_prompt_cache_checkpoint_limit() -> usize {
+    std::env::var("CAMELID_QWEN35_PREFIX_CACHE_CHECKPOINTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|value| value.clamp(1, 8))
+        .unwrap_or(QWEN35_PROMPT_CACHE_CHECKPOINTS)
+}
+
+#[cfg(target_os = "macos")]
+fn qwen35_prompt_cache_max_bytes() -> usize {
+    std::env::var("CAMELID_QWEN35_PREFIX_CACHE_MAX_MIB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|value| value.clamp(32, 1024).saturating_mul(1024 * 1024))
+        .unwrap_or(QWEN35_PROMPT_CACHE_MAX_BYTES)
+}
+
+#[cfg(target_os = "macos")]
+fn qwen35_common_prefix(left: &[u32], right: &[u32]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+/// Keep only the most recent aligned prompt boundaries. Qwen3.5's SSM snapshot
+/// is fixed-size (roughly tens of MiB for Ornith 9B), so retaining every block
+/// would turn a context bound into an unbounded host-memory cache.
+#[cfg(target_os = "macos")]
+fn qwen35_prompt_checkpoint_positions(
+    prompt_prefix_tokens: usize,
+    block_tokens: usize,
+    limit: usize,
+) -> Vec<usize> {
+    if block_tokens == 0 || limit == 0 {
+        return Vec::new();
+    }
+    let last = prompt_prefix_tokens / block_tokens * block_tokens;
+    if last == 0 {
+        return Vec::new();
+    }
+    let first = last.saturating_sub(block_tokens.saturating_mul(limit.saturating_sub(1)));
+    (first.max(block_tokens)..=last)
+        .step_by(block_tokens)
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
 fn qwen35_metal_context_capacity() -> usize {
     std::env::var("CAMELID_QWEN35_METAL_MAXPOS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(4096)
+        // Workspace validates this exact Ornith row at 8K and may admit a 7,168
+        // token operational envelope on a 16-GB Mac. The old 4K default caused
+        // an otherwise-valid tools prompt to leave Metal and replay on the
+        // hours-slower CPU lane. Allocate the validated resident capacity once;
+        // the Workspace memory gate already prices the active context before a
+        // session starts.
+        .unwrap_or(8192)
 }
 
 #[cfg(any(target_os = "macos", feature = "cuda"))]
@@ -5148,6 +5486,8 @@ fn qwen35_imrope_tables(
 
 #[cfg(all(test, any(target_os = "macos", feature = "cuda")))]
 mod qwen35_imrope_tests {
+    #[cfg(target_os = "macos")]
+    use super::{qwen35_common_prefix, qwen35_prompt_checkpoint_positions};
     #[cfg(feature = "cuda")]
     use super::{qwen35_device_decode_steps, Qwen35DeviceDecodeStep};
     use super::{
@@ -5201,6 +5541,25 @@ mod qwen35_imrope_tests {
         ]));
         assert!(!qwen35_repetition_loop(&[7, 8, 7, 9, 7, 8, 7, 10]));
         assert!(!qwen35_repetition_loop(&[1, 2, 3, 1, 2, 3]));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hybrid_prompt_cache_keeps_only_recent_aligned_checkpoints() {
+        assert_eq!(
+            qwen35_prompt_checkpoint_positions(2_641, 128, 4),
+            vec![2_176, 2_304, 2_432, 2_560]
+        );
+        assert_eq!(
+            qwen35_prompt_checkpoint_positions(127, 128, 4),
+            Vec::<usize>::new()
+        );
+        assert_eq!(qwen35_prompt_checkpoint_positions(128, 128, 4), vec![128]);
+        assert_eq!(qwen35_prompt_checkpoint_positions(512, 128, 1), vec![512]);
+
+        let previous = [1, 2, 3, 4, 5, 6];
+        let next = [1, 2, 3, 9, 5, 6, 7];
+        assert_eq!(qwen35_common_prefix(&previous, &next), 3);
     }
 
     #[cfg(feature = "cuda")]
