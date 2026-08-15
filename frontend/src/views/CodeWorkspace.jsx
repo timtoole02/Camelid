@@ -135,6 +135,11 @@ function formatTimingBits(timing) {
   const cacheHit = timingBoolean(timing, 'prompt_cache_hit', 'promptCacheHit')
   const reusedTokens = timingMetric(timing, 'reused_tokens', 'reusedTokens')
   const prefilledTokens = timingMetric(timing, 'prefilled_tokens', 'prefilledTokens')
+  const cacheDecision = timing?.prompt_cache_decision ?? timing?.promptCacheDecision
+  const commonPrefix = timingMetric(timing, 'common_prefix_tokens', 'commonPrefixTokens')
+  const divergentSuffix = timingMetric(timing, 'divergent_suffix_tokens', 'divergentSuffixTokens')
+  const matchedBlocks = timingMetric(timing, 'matched_cache_blocks', 'matchedCacheBlocks')
+  const blockTokens = timingMetric(timing, 'cache_block_tokens', 'cacheBlockTokens')
   return [
     Number.isFinite(totalMs) ? `${formatMs(totalMs)} total` : null,
     Number.isFinite(outputTokens) ? `${formatTokens(outputTokens)} output tokens` : null,
@@ -145,6 +150,13 @@ function formatTimingBits(timing) {
     cacheHit === true ? 'cache hit' : cacheHit === false ? 'prompt-cache miss' : null,
     Number.isFinite(reusedTokens) && reusedTokens > 0 ? `${formatTokens(reusedTokens)} reused` : null,
     Number.isFinite(prefilledTokens) && prefilledTokens > 0 ? `${formatTokens(prefilledTokens)} prefilled` : null,
+    typeof cacheDecision === 'string' ? cacheDecision.replaceAll('_', ' ') : null,
+    Number.isFinite(commonPrefix) && Number.isFinite(divergentSuffix)
+      ? `diverged at ${formatTokens(commonPrefix)} · ${formatTokens(divergentSuffix)} suffix`
+      : null,
+    Number.isFinite(matchedBlocks) && matchedBlocks > 0 && Number.isFinite(blockTokens)
+      ? `${matchedBlocks}×${blockTokens}-token KV blocks`
+      : null,
   ].filter(Boolean)
 }
 
@@ -153,11 +165,18 @@ function formatPromptStep(step) {
   const cacheHit = timingBoolean(step, 'prompt_cache_hit', 'promptCacheHit')
   const reusedTokens = timingMetric(step, 'reused_tokens', 'reusedTokens')
   const prefilledTokens = timingMetric(step, 'prefilled_tokens', 'prefilledTokens')
+  const cacheDecision = step?.prompt_cache_decision ?? step?.promptCacheDecision
+  const commonPrefix = timingMetric(step, 'common_prefix_tokens', 'commonPrefixTokens')
+  const divergentSuffix = timingMetric(step, 'divergent_suffix_tokens', 'divergentSuffixTokens')
   const tokenCount = cacheHit === true ? reusedTokens : prefilledTokens
   const cache = cacheHit === true ? 'hit' : cacheHit === false ? 'miss' : null
   return [
     Number.isFinite(prefillMs) ? formatMs(prefillMs) : null,
     cache ? `${cache}${Number.isFinite(tokenCount) && tokenCount > 0 ? ` ${formatTokens(tokenCount)}` : ''}` : null,
+    typeof cacheDecision === 'string' ? cacheDecision.replaceAll('_', ' ') : null,
+    Number.isFinite(commonPrefix) && Number.isFinite(divergentSuffix)
+      ? `${formatTokens(commonPrefix)}/${formatTokens(divergentSuffix)}`
+      : null,
   ].filter(Boolean).join(' · ') || '—'
 }
 

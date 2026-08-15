@@ -3198,6 +3198,11 @@ fn decode_lenient_json_string(value: &str) -> String {
 pub(crate) struct ContextPagingMetrics {
     pub input_tokens_per_request: Vec<u32>,
     pub output_tokens_per_request: Vec<u32>,
+    /// Per-request cache admission/divergence receipts. Bounded independently
+    /// from the token arrays so a resumed long-running task cannot grow this
+    /// state without limit.
+    #[serde(default)]
+    pub prompt_cache_requests: Vec<PromptCacheRequestMetric>,
     pub page_fault_count: u64,
     pub repeated_page_faults: u64,
     pub retrieval_misses: u64,
@@ -3209,6 +3214,20 @@ pub(crate) struct ContextPagingMetrics {
     /// Composition of the most recent capsule, by category.
     #[serde(default)]
     pub last_capsule_composition: CapsuleComposition,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PromptCacheRequestMetric {
+    pub hit: Option<bool>,
+    pub decision: Option<String>,
+    pub reused_tokens: Option<u32>,
+    pub prefilled_tokens: Option<u32>,
+    pub common_prefix_tokens: Option<u32>,
+    pub divergent_suffix_tokens: Option<u32>,
+    pub candidate_tokens: Option<u32>,
+    pub block_tokens: Option<u32>,
+    pub matched_blocks: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -3859,6 +3878,18 @@ impl ContextPagingRuntime {
 
     pub(crate) fn record_output_tokens(&mut self, tokens: u32) -> Result<(), ContextPagingError> {
         self.metrics.output_tokens_per_request.push(tokens);
+        self.save_runtime_state()
+    }
+
+    pub(crate) fn record_prompt_cache_request(
+        &mut self,
+        metric: PromptCacheRequestMetric,
+    ) -> Result<(), ContextPagingError> {
+        const MAX_CACHE_REQUEST_METRICS: usize = 256;
+        if self.metrics.prompt_cache_requests.len() >= MAX_CACHE_REQUEST_METRICS {
+            self.metrics.prompt_cache_requests.remove(0);
+        }
+        self.metrics.prompt_cache_requests.push(metric);
         self.save_runtime_state()
     }
 
@@ -4943,6 +4974,49 @@ mod tests {
             vec!["Use exact page replacement"]
         );
         assert!(restarted.ledger.relevant_symbols.contains(&symbol));
+    }
+
+    #[test]
+    fn prompt_cache_divergence_receipts_persist_with_a_hard_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut runtime = ContextPagingRuntime::open(
+            directory.path(),
+            "Inspect cache behavior",
+            ContextPagingConfig::default(),
+        )
+        .unwrap();
+        for index in 0..257u32 {
+            runtime
+                .record_prompt_cache_request(PromptCacheRequestMetric {
+                    hit: Some(index % 2 == 0),
+                    decision: Some(format!("decision-{index}")),
+                    reused_tokens: Some(index),
+                    prefilled_tokens: Some(257 - index),
+                    common_prefix_tokens: Some(index),
+                    divergent_suffix_tokens: Some(257 - index),
+                    candidate_tokens: Some(300),
+                    block_tokens: Some(64),
+                    matched_blocks: Some(index / 64),
+                })
+                .unwrap();
+        }
+        assert_eq!(runtime.metrics.prompt_cache_requests.len(), 256);
+        assert_eq!(
+            runtime.metrics.prompt_cache_requests[0].decision.as_deref(),
+            Some("decision-1")
+        );
+
+        let reopened = ContextPagingRuntime::open(
+            directory.path(),
+            "Inspect cache behavior",
+            ContextPagingConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(reopened.metrics.prompt_cache_requests.len(), 256);
+        let last = reopened.metrics.prompt_cache_requests.last().unwrap();
+        assert_eq!(last.decision.as_deref(), Some("decision-256"));
+        assert_eq!(last.common_prefix_tokens, Some(256));
+        assert_eq!(last.divergent_suffix_tokens, Some(1));
     }
 
     #[test]

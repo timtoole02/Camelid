@@ -124,6 +124,12 @@ timed = reduceCodeEvent(timed, {
   prompt_cache_hit: true,
   reused_tokens: 2884,
   prefilled_tokens: 302,
+  prompt_cache_decision: 'block_prefix_hit',
+  common_prefix_tokens: 2884,
+  divergent_suffix_tokens: 302,
+  candidate_tokens: 3000,
+  cache_block_tokens: 64,
+  matched_cache_blocks: 45,
 })
 assert.deepEqual(timed.modelSteps[0], {
   index: 1,
@@ -136,9 +142,17 @@ assert.deepEqual(timed.modelSteps[0], {
   promptCacheHit: true,
   reusedTokens: 2884,
   prefilledTokens: 302,
+  promptCacheDecision: 'block_prefix_hit',
+  commonPrefixTokens: 2884,
+  divergentSuffixTokens: 302,
+  candidateTokens: 3000,
+  cacheBlockTokens: 64,
+  matchedCacheBlocks: 45,
 })
 assert.equal(timed.liveActivity.server_first_content_ms, 165)
 assert.equal(timed.liveActivity.prompt_cache_hit, true)
+assert.equal(timed.liveActivity.prompt_cache_decision, 'block_prefix_hit')
+assert.equal(timed.liveActivity.common_prefix_tokens, 2884)
 assert.match(timed.liveActivity.detail, /190ms TTFT/)
 assert.match(timed.liveActivity.detail, /165ms server first content/)
 assert.match(timed.liveActivity.detail, /prompt-cache hit/)
@@ -161,6 +175,8 @@ timed = reduceCodeEvent(timed, {
   },
 })
 assert.equal(timed.liveActivity.decode_ms, 2200)
+assert.equal(timed.liveActivity.prompt_cache_decision, 'block_prefix_hit')
+assert.equal(timed.liveActivity.divergent_suffix_tokens, 302)
 
 const adaptiveContext = normalizeContextWindow({
   mode: 'auto',

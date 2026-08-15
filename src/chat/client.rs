@@ -158,6 +158,12 @@ pub struct StreamTimingStats {
     pub prompt_cache_hit: Option<bool>,
     pub reused_tokens: Option<u32>,
     pub prefilled_tokens: Option<u32>,
+    pub prompt_cache_decision: Option<String>,
+    pub common_prefix_tokens: Option<u32>,
+    pub divergent_suffix_tokens: Option<u32>,
+    pub candidate_tokens: Option<u32>,
+    pub cache_block_tokens: Option<u32>,
+    pub matched_cache_blocks: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -631,6 +637,30 @@ impl Client {
                                 .and_then(|value| u32::try_from(value).ok()),
                             prefilled_tokens: values
                                 .get("prompt_prefilled_tokens")
+                                .and_then(Value::as_u64)
+                                .and_then(|value| u32::try_from(value).ok()),
+                            prompt_cache_decision: values
+                                .get("prompt_cache_decision")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            common_prefix_tokens: values
+                                .get("prompt_cache_common_prefix_tokens")
+                                .and_then(Value::as_u64)
+                                .and_then(|value| u32::try_from(value).ok()),
+                            divergent_suffix_tokens: values
+                                .get("prompt_cache_divergent_suffix_tokens")
+                                .and_then(Value::as_u64)
+                                .and_then(|value| u32::try_from(value).ok()),
+                            candidate_tokens: values
+                                .get("prompt_cache_candidate_tokens")
+                                .and_then(Value::as_u64)
+                                .and_then(|value| u32::try_from(value).ok()),
+                            cache_block_tokens: values
+                                .get("prompt_cache_block_tokens")
+                                .and_then(Value::as_u64)
+                                .and_then(|value| u32::try_from(value).ok()),
+                            matched_cache_blocks: values
+                                .get("prompt_cache_matched_blocks")
                                 .and_then(Value::as_u64)
                                 .and_then(|value| u32::try_from(value).ok()),
                         });
@@ -1361,7 +1391,7 @@ mod tests {
                 "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"type\":\"function\",\"function\":{\"name\":\"write_\",\"arguments\":\"{\\\"path\\\":\"}}]},\"finish_reason\":null}]}\n\n",
                 "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"file\",\"arguments\":\"\\\"agent-proof.txt\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
                 "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
-                "data: {\"choices\":[],\"camelid\":{\"stream_timing_diagnostics\":{\"timings_ms\":{\"first_content\":901.6,\"prefill_forward_total\":812.4,\"first_token_forward_total\":18.2,\"generation_forward_total\":44.8,\"prompt_cache_hit\":true,\"prompt_reused_tokens\":1200,\"prompt_prefilled_tokens\":178}}}}\n\n",
+                "data: {\"choices\":[],\"camelid\":{\"stream_timing_diagnostics\":{\"timings_ms\":{\"first_content\":901.6,\"prefill_forward_total\":812.4,\"first_token_forward_total\":18.2,\"generation_forward_total\":44.8,\"prompt_cache_hit\":true,\"prompt_reused_tokens\":1200,\"prompt_prefilled_tokens\":178,\"prompt_cache_decision\":\"block_prefix_hit\",\"prompt_cache_common_prefix_tokens\":1200,\"prompt_cache_divergent_suffix_tokens\":178,\"prompt_cache_candidate_tokens\":1280,\"prompt_cache_block_tokens\":64,\"prompt_cache_matched_blocks\":18}}}}\n\n",
                 "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1378}}\n\n",
                 "data: [DONE]\n\n",
             );
@@ -1391,6 +1421,15 @@ mod tests {
         assert_eq!(timing.prefill_ms, Some(812));
         assert_eq!(timing.server_first_content_ms, Some(902));
         assert_eq!(timing.prompt_cache_hit, Some(true));
+        assert_eq!(
+            timing.prompt_cache_decision.as_deref(),
+            Some("block_prefix_hit")
+        );
+        assert_eq!(timing.common_prefix_tokens, Some(1200));
+        assert_eq!(timing.divergent_suffix_tokens, Some(178));
+        assert_eq!(timing.candidate_tokens, Some(1280));
+        assert_eq!(timing.cache_block_tokens, Some(64));
+        assert_eq!(timing.matched_cache_blocks, Some(18));
         assert_eq!(timing.reused_tokens, Some(1200));
         assert_eq!(timing.prefilled_tokens, Some(178));
         assert_eq!(stats.tool_calls.len(), 1);

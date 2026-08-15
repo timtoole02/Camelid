@@ -22,7 +22,7 @@ use super::banner;
 use super::client::{Client, StreamEnd};
 use super::context_paging::{
     parse_typed_action, ActionPhase, CompactDiagnostic, ContextPagingConfig, ContextPagingError,
-    ContextPagingRuntime, ModificationValidation, TypedModelAction,
+    ContextPagingRuntime, ModificationValidation, PromptCacheRequestMetric, TypedModelAction,
 };
 use super::session::{Session, CANCEL};
 use super::shell_sandbox::{self, ShellSandbox};
@@ -153,6 +153,12 @@ pub struct ModelStepMetrics {
     pub prompt_cache_hit: Option<bool>,
     pub reused_tokens: Option<u32>,
     pub prefilled_tokens: Option<u32>,
+    pub prompt_cache_decision: Option<String>,
+    pub common_prefix_tokens: Option<u32>,
+    pub divergent_suffix_tokens: Option<u32>,
+    pub candidate_tokens: Option<u32>,
+    pub cache_block_tokens: Option<u32>,
+    pub matched_cache_blocks: Option<u32>,
 }
 
 /// The approval decision for one gated action.
@@ -2859,10 +2865,25 @@ pub fn run_loop(
             }
         };
         if let Some(metrics) = driver.take_step_metrics() {
-            if let (Some(runtime), Some(output_tokens)) =
-                (context_paging.as_mut(), metrics.output_tokens)
-            {
-                if let Err(error) = runtime.record_output_tokens(output_tokens) {
+            if let Some(runtime) = context_paging.as_mut() {
+                if let Some(output_tokens) = metrics.output_tokens {
+                    if let Err(error) = runtime.record_output_tokens(output_tokens) {
+                        reporter.notice(&format!("context paging metrics error: {error}"));
+                        return LoopEnd::DriverError;
+                    }
+                }
+                let cache_metric = PromptCacheRequestMetric {
+                    hit: metrics.prompt_cache_hit,
+                    decision: metrics.prompt_cache_decision.clone(),
+                    reused_tokens: metrics.reused_tokens,
+                    prefilled_tokens: metrics.prefilled_tokens,
+                    common_prefix_tokens: metrics.common_prefix_tokens,
+                    divergent_suffix_tokens: metrics.divergent_suffix_tokens,
+                    candidate_tokens: metrics.candidate_tokens,
+                    block_tokens: metrics.cache_block_tokens,
+                    matched_blocks: metrics.matched_cache_blocks,
+                };
+                if let Err(error) = runtime.record_prompt_cache_request(cache_metric) {
                     reporter.notice(&format!("context paging metrics error: {error}"));
                     return LoopEnd::DriverError;
                 }
@@ -9347,6 +9368,12 @@ impl ModelDriver for LiveDriver {
             prompt_cache_hit: None,
             reused_tokens: None,
             prefilled_tokens: None,
+            prompt_cache_decision: None,
+            common_prefix_tokens: None,
+            divergent_suffix_tokens: None,
+            candidate_tokens: None,
+            cache_block_tokens: None,
+            matched_cache_blocks: None,
         });
         // Prefer the server's STRUCTURED tool_calls (OpenAI shape): the server
         // parses the model's tool call and EMPTIES `content`, so reading only the
@@ -9496,6 +9523,12 @@ impl LiveDriver {
             prompt_cache_hit: timing.and_then(|value| value.prompt_cache_hit),
             reused_tokens: timing.and_then(|value| value.reused_tokens),
             prefilled_tokens: timing.and_then(|value| value.prefilled_tokens),
+            prompt_cache_decision: timing.and_then(|value| value.prompt_cache_decision.clone()),
+            common_prefix_tokens: timing.and_then(|value| value.common_prefix_tokens),
+            divergent_suffix_tokens: timing.and_then(|value| value.divergent_suffix_tokens),
+            candidate_tokens: timing.and_then(|value| value.candidate_tokens),
+            cache_block_tokens: timing.and_then(|value| value.cache_block_tokens),
+            matched_cache_blocks: timing.and_then(|value| value.matched_cache_blocks),
         });
         // The calibration signal for the compaction budget, from the terminal
         // usage chunk the streaming request opts into.

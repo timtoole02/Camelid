@@ -16,6 +16,12 @@ const MODEL_TIMING_ACTIVITY_FIELDS = [
   'prompt_cache_hit',
   'reused_tokens',
   'prefilled_tokens',
+  'prompt_cache_decision',
+  'common_prefix_tokens',
+  'divergent_suffix_tokens',
+  'candidate_tokens',
+  'cache_block_tokens',
+  'matched_cache_blocks',
 ]
 
 /// The only structured plan the agent publishes. Exported so the transcript
@@ -427,6 +433,14 @@ function modelTimingStep(envelope) {
     promptCacheHit: booleanMetric(envelope.prompt_cache_hit),
     reusedTokens: finiteMetric(envelope.reused_tokens),
     prefilledTokens: finiteMetric(envelope.prefilled_tokens),
+    promptCacheDecision: typeof envelope.prompt_cache_decision === 'string'
+      ? envelope.prompt_cache_decision
+      : null,
+    commonPrefixTokens: finiteMetric(envelope.common_prefix_tokens),
+    divergentSuffixTokens: finiteMetric(envelope.divergent_suffix_tokens),
+    candidateTokens: finiteMetric(envelope.candidate_tokens),
+    cacheBlockTokens: finiteMetric(envelope.cache_block_tokens),
+    matchedCacheBlocks: finiteMetric(envelope.matched_cache_blocks),
   }
 }
 
@@ -576,6 +590,12 @@ function advanceLiveActivity(current, envelope) {
       prompt_cache_hit: timing.promptCacheHit,
       reused_tokens: timing.reusedTokens,
       prefilled_tokens: timing.prefilledTokens,
+      prompt_cache_decision: timing.promptCacheDecision,
+      common_prefix_tokens: timing.commonPrefixTokens,
+      divergent_suffix_tokens: timing.divergentSuffixTokens,
+      candidate_tokens: timing.candidateTokens,
+      cache_block_tokens: timing.cacheBlockTokens,
+      matched_cache_blocks: timing.matchedCacheBlocks,
       detail: `${Number.isFinite(timing.outputTokens)
         ? `The model finished a ${timing.outputTokens}-token generation step`
         : 'The model finished a generation step'}${stepDetail.length ? ` · ${stepDetail.join(' · ')}` : ''}`,

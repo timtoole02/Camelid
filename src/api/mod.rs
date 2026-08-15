@@ -1,7 +1,9 @@
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
-    env, mem,
+    env,
+    hash::{DefaultHasher, Hash, Hasher},
+    mem,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
@@ -97,8 +99,10 @@ const SPEC_NGRAM_MIN_ENV: &str = "CAMELID_SPEC_NGRAM_MIN";
 const SPEC_NGRAM_MAX_ENV: &str = "CAMELID_SPEC_NGRAM_MAX";
 const PROMPT_PREFIX_CACHE_CAPACITY_ENV: &str = "CAMELID_PREFIX_CACHE_CAPACITY";
 const PROMPT_PREFIX_CACHE_MIN_TOKENS_ENV: &str = "CAMELID_PREFIX_CACHE_MIN_TOKENS";
+const PROMPT_PREFIX_CACHE_BLOCK_TOKENS_ENV: &str = "CAMELID_PREFIX_CACHE_BLOCK_TOKENS";
 const DEFAULT_PROMPT_PREFIX_CACHE_CAPACITY: usize = 1;
 const DEFAULT_PROMPT_PREFIX_CACHE_MIN_TOKENS: usize = 16;
+const DEFAULT_PROMPT_PREFIX_CACHE_BLOCK_TOKENS: usize = 64;
 // An F32 Metal-resident prefix can only resume its divergent suffix through the
 // CPU prefill path, followed by a full CPU -> Metal KV seed. On an M4, reusing a
 // 3,062-token prefix for a 74-token suffix was already slower than a cold
@@ -369,8 +373,20 @@ struct CachedPromptPrefix {
     model_id: String,
     model_path: PathBuf,
     token_ids: Vec<u32>,
+    /// Lookup accelerators for complete token blocks. A hash match is never
+    /// trusted by itself: lookup verifies the underlying token slice before
+    /// any KV state is reused.
+    block_hashes: Vec<u64>,
+    block_tokens: usize,
     sampling: SamplingConfig,
-    session: LlamaInferenceSession,
+    /// Physical KV blocks for exact-F32 CPU-authoritative sessions. Blocks are
+    /// independently reference-counted so retained prefixes can share their
+    /// identical leading storage without cloning a whole inference session.
+    kv_blocks: Vec<Arc<crate::inference::kv_cache::LlamaKvBlockSnapshot>>,
+    /// Legacy fail-safe for F16/quantized CPU KV formats that retain less
+    /// memory in their native typed session than normalized f32 blocks would.
+    legacy_session: Option<LlamaInferenceSession>,
+    kv_position: usize,
     logits: CpuTensor,
     hidden_state: CpuTensor,
     output_norm_state: CpuTensor,
@@ -378,6 +394,20 @@ struct CachedPromptPrefix {
     /// mirrored. Its clone is CPU-only, but a partial resume will return to the
     /// same expensive CPU-suffix/Metal-reseed path.
     metal_f32_resident_kv: bool,
+}
+
+impl CachedPromptPrefix {
+    fn kv_allocated_bytes(&self, seen_blocks: &mut HashSet<usize>) -> u64 {
+        if let Some(session) = &self.legacy_session {
+            session.kv_cache_allocated_bytes()
+        } else {
+            self.kv_blocks
+                .iter()
+                .filter(|block| seen_blocks.insert(Arc::as_ptr(block) as usize))
+                .map(|block| block.allocated_bytes())
+                .sum()
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -415,9 +445,9 @@ impl PromptPrefixCachePool {
         // that change. Only a successful weight hit/publication may readmit the model.
     }
 
-    /// Drop every retained session for one materialized model. Each session owns the same
-    /// `Arc<LlamaLoadedWeights>` as the weight registry, so LRU eviction is not complete until
-    /// these secondary owners are gone as well.
+    /// Drop every retained KV prefix for one materialized model. Legacy typed
+    /// sessions own the same `Arc<LlamaLoadedWeights>` as the registry; F32
+    /// block entries do not, but must still be invalidated with the model.
     fn evict_model(&mut self, model_id: &str) -> usize {
         let before = self.entries.len();
         self.entries
@@ -477,9 +507,47 @@ impl PromptPrefixCachePool {
         }
     }
 
-    fn insert(&mut self, cached: CachedPromptPrefix) {
+    fn touch_exact(
+        &mut self,
+        model_id: &str,
+        model_path: &Path,
+        token_ids: &[u32],
+        sampling: &SamplingConfig,
+    ) -> bool {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| {
+            entry.cached.model_id == model_id
+                && entry.cached.model_path == model_path
+                && entry.cached.token_ids == token_ids
+                && entry.cached.sampling == *sampling
+        }) {
+            entry.last_used = std::time::Instant::now();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn insert(&mut self, mut cached: CachedPromptPrefix) {
         if self.capacity == 0 || !self.model_is_admitted(&cached.model_id) {
             return;
+        }
+        if !cached.kv_blocks.is_empty() {
+            for block_index in 0..cached.kv_blocks.len() {
+                let end = ((block_index + 1) * cached.block_tokens).min(cached.token_ids.len());
+                if let Some(shared) = self.entries.iter().find_map(|entry| {
+                    let existing = &entry.cached;
+                    (existing.model_id == cached.model_id
+                        && existing.model_path == cached.model_path
+                        && existing.sampling == cached.sampling
+                        && existing.block_tokens == cached.block_tokens
+                        && existing.kv_blocks.len() > block_index
+                        && existing.token_ids.len() >= end
+                        && existing.token_ids[..end] == cached.token_ids[..end])
+                        .then(|| Arc::clone(&existing.kv_blocks[block_index]))
+                }) {
+                    cached.kv_blocks[block_index] = shared;
+                }
+            }
         }
         let cached = Arc::new(cached);
         let now = std::time::Instant::now();
@@ -1788,6 +1856,16 @@ pub struct GenerationTimings {
     pub prompt_reused_tokens: usize,
     /// Prompt tokens evaluated for this request after any accepted reuse.
     pub prompt_prefilled_tokens: usize,
+    /// Stable machine-readable reason for the prompt-cache outcome.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_decision: Option<&'static str>,
+    /// Best same-key candidate's exact token prefix, even when reuse was
+    /// rejected. This is the first divergent token index.
+    pub prompt_cache_common_prefix_tokens: usize,
+    pub prompt_cache_divergent_suffix_tokens: usize,
+    pub prompt_cache_candidate_tokens: usize,
+    pub prompt_cache_block_tokens: usize,
+    pub prompt_cache_matched_blocks: usize,
     pub session_create: u128,
     pub generate: u128,
     pub generation: GenerationPhaseTimings,
@@ -2195,6 +2273,62 @@ fn prompt_prefix_cache_min_tokens_from_env() -> usize {
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_PROMPT_PREFIX_CACHE_MIN_TOKENS)
+}
+
+fn prompt_prefix_cache_block_tokens_from_env() -> usize {
+    env::var(PROMPT_PREFIX_CACHE_BLOCK_TOKENS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| value.is_power_of_two() && (16..=1024).contains(value))
+        .unwrap_or(DEFAULT_PROMPT_PREFIX_CACHE_BLOCK_TOKENS)
+}
+
+fn prompt_token_block_hashes(token_ids: &[u32], block_tokens: usize) -> Vec<u64> {
+    token_ids
+        .chunks_exact(block_tokens)
+        .map(|block| {
+            let mut hasher = DefaultHasher::new();
+            block.hash(&mut hasher);
+            hasher.finish()
+        })
+        .collect()
+}
+
+/// Return the exact common prefix while using fixed token blocks to avoid a
+/// full token-by-token scan of every retained candidate. Hash matches only
+/// select blocks; their source tokens are compared before the corresponding
+/// KV positions are considered reusable, so collisions fail harmlessly.
+fn block_indexed_common_prefix_len(cached: &CachedPromptPrefix, request: &[u32]) -> (usize, usize) {
+    let block_tokens = cached.block_tokens.max(1);
+    let request_hashes = prompt_token_block_hashes(request, block_tokens);
+    let mut matched_blocks = 0usize;
+    for (index, (cached_hash, request_hash)) in cached
+        .block_hashes
+        .iter()
+        .zip(request_hashes.iter())
+        .enumerate()
+    {
+        if cached_hash != request_hash {
+            break;
+        }
+        let start = index * block_tokens;
+        let end = start + block_tokens;
+        if end > cached.token_ids.len() || end > request.len() {
+            break;
+        }
+        if cached.token_ids[start..end] != request[start..end] {
+            break;
+        }
+        matched_blocks += 1;
+    }
+
+    let verified = matched_blocks * block_tokens;
+    let tail = cached.token_ids[verified..]
+        .iter()
+        .zip(request[verified..].iter())
+        .take_while(|(&left, &right)| left == right)
+        .count();
+    (verified + tail, matched_blocks)
 }
 
 /// Per-request speculative decoding state: the drafter plus round counters
@@ -3417,12 +3551,13 @@ fn kv_cache_memory_snapshot(state: &AppState) -> (Vec<KvCacheEntryMemory>, usize
     let Ok(pool) = state.cached_prompt_prefix.lock() else {
         return (Vec::new(), 0);
     };
+    let mut seen_blocks = HashSet::new();
     let entries = pool
         .entries
         .iter()
         .map(|entry| KvCacheEntryMemory {
             model_id: entry.cached.model_id.clone(),
-            bytes: entry.cached.session.kv_cache_allocated_bytes(),
+            bytes: entry.cached.kv_allocated_bytes(&mut seen_blocks),
             tokens: entry.cached.token_ids.len(),
         })
         .collect();
@@ -19138,7 +19273,7 @@ fn disable_prompt_prefix_cache(state: &AppState) {
     pool.disable();
 }
 
-fn lookup_prompt_prefix_cache(prepared: &PreparedGeneration) -> Option<PrefixMatchResult> {
+fn lookup_prompt_prefix_cache(prepared: &mut PreparedGeneration) -> Option<PrefixMatchResult> {
     // A constraint no longer disqualifies a hit. The cached artifact is prompt
     // KV plus the logits for the first output token — both independent of the
     // constraint, which only governs which OUTPUT tokens are legal. The exact-
@@ -19146,82 +19281,210 @@ fn lookup_prompt_prefix_cache(prepared: &PreparedGeneration) -> Option<PrefixMat
     // and the partial-hit path re-enters the main decode loop, which masks
     // every step. Refusing outright meant a constrained request paid a full
     // cold prefill every time — the very cost this cache exists to remove.
-    let mut pool = prepared.cached_prompt_prefix.lock().ok()?;
-    if pool.capacity == 0 {
-        return None;
-    }
-    let min_prefix = prompt_prefix_cache_min_tokens_from_env();
-    let mut best: Option<(usize, bool, usize, std::time::Instant)> = None;
-
-    for (index, entry) in pool.entries.iter().enumerate() {
-        let cached = &entry.cached;
-        let same_cache_key = cached.model_id == prepared.model_id
-            && cached.model_path == prepared.model_path
-            && cached.sampling == prepared.sampling;
-        if !same_cache_key || cached.session.kv_position() != cached.token_ids.len() {
-            continue;
-        }
-
-        let common_len = common_prefix_len(&cached.token_ids, &prepared.token_ids);
-        let is_exact_match = cached.token_ids == prepared.token_ids;
-        if !is_exact_match && common_len < min_prefix {
-            continue;
-        }
-        let divergent_suffix_len = prepared.token_ids.len().saturating_sub(common_len);
-        if !is_exact_match
-            && cached.metal_f32_resident_kv
-            && !metal_f32_partial_prefix_is_profitable(common_len, divergent_suffix_len)
-        {
-            tracing::debug!(
-                target: "camelid::prompt_cache",
-                decision = "candidate_rejected_metal_ratio",
-                common_prefix_tokens = common_len,
-                divergent_suffix_tokens = divergent_suffix_len,
-                cached_prompt_tokens = cached.token_ids.len(),
-                request_prompt_tokens = prepared.token_ids.len(),
-                min_reuse_ratio = METAL_F32_PARTIAL_PREFIX_MIN_REUSE_RATIO,
-                "prompt-cache candidate is below the measured Metal F32 reuse threshold"
-            );
-            continue;
-        }
-
-        let candidate_rank = (is_exact_match, common_len, entry.last_used);
-        let should_replace = best
-            .as_ref()
-            .map(|(_, exact, prefix_len, last_used)| {
-                candidate_rank > (*exact, *prefix_len, *last_used)
-            })
-            .unwrap_or(true);
-        if should_replace {
-            best = Some((index, is_exact_match, common_len, entry.last_used));
-        }
+    #[derive(Clone, Copy)]
+    struct CandidateTelemetry {
+        decision: &'static str,
+        common: usize,
+        suffix: usize,
+        candidate: usize,
+        block_tokens: usize,
+        matched_blocks: usize,
     }
 
-    if let Some((index, is_exact_match, common_len, _)) = best {
-        let entry = &mut pool.entries[index];
-        entry.last_used = std::time::Instant::now();
-        let cached = Arc::clone(&entry.cached);
-        let prefix_len = if is_exact_match {
-            common_len
-        } else {
-            common_len.min(prepared.token_ids.len().saturating_sub(1))
+    let request_len = prepared.token_ids.len();
+    let (result, telemetry) = {
+        let Ok(mut pool) = prepared.cached_prompt_prefix.lock() else {
+            return None;
         };
-        Some(PrefixMatchResult {
-            cached,
-            prefix_len,
-            is_exact_match,
-        })
-    } else {
-        None
-    }
-}
+        if pool.capacity == 0 {
+            (
+                None,
+                CandidateTelemetry {
+                    decision: "disabled",
+                    common: 0,
+                    suffix: request_len,
+                    candidate: 0,
+                    block_tokens: prompt_prefix_cache_block_tokens_from_env(),
+                    matched_blocks: 0,
+                },
+            )
+        } else {
+            let min_prefix = prompt_prefix_cache_min_tokens_from_env();
+            let mut best: Option<(usize, bool, usize, usize, std::time::Instant)> = None;
+            let mut observed: Option<CandidateTelemetry> = None;
 
-fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
-    a.iter().zip(b.iter()).take_while(|(&x, &y)| x == y).count()
+            for (index, entry) in pool.entries.iter().enumerate() {
+                let cached = &entry.cached;
+                let same_cache_key = cached.model_id == prepared.model_id
+                    && cached.model_path == prepared.model_path
+                    && cached.sampling == prepared.sampling;
+                if !same_cache_key || cached.kv_position != cached.token_ids.len() {
+                    continue;
+                }
+
+                let (common_len, matched_blocks) =
+                    block_indexed_common_prefix_len(cached, &prepared.token_ids);
+                let is_exact_match = cached.token_ids == prepared.token_ids;
+                let divergent_suffix_len = request_len.saturating_sub(common_len);
+                let mut decision = "miss_below_minimum";
+                let eligible_by_size = is_exact_match || common_len >= min_prefix;
+                let profitable = is_exact_match
+                    || !cached.metal_f32_resident_kv
+                    || metal_f32_partial_prefix_is_profitable(common_len, divergent_suffix_len);
+                if eligible_by_size && !profitable {
+                    decision = "rejected_metal_ratio";
+                    tracing::debug!(
+                        target: "camelid::prompt_cache",
+                        decision = "candidate_rejected_metal_ratio",
+                        common_prefix_tokens = common_len,
+                        divergent_suffix_tokens = divergent_suffix_len,
+                        cached_prompt_tokens = cached.token_ids.len(),
+                        request_prompt_tokens = request_len,
+                        block_tokens = cached.block_tokens,
+                        matched_blocks,
+                        min_reuse_ratio = METAL_F32_PARTIAL_PREFIX_MIN_REUSE_RATIO,
+                        "prompt-cache candidate is below the measured Metal F32 reuse threshold"
+                    );
+                }
+                let candidate_telemetry = CandidateTelemetry {
+                    decision,
+                    common: common_len,
+                    suffix: divergent_suffix_len,
+                    candidate: cached.token_ids.len(),
+                    block_tokens: cached.block_tokens,
+                    matched_blocks,
+                };
+                if observed
+                    .as_ref()
+                    .map(|current| common_len > current.common)
+                    .unwrap_or(true)
+                {
+                    observed = Some(candidate_telemetry);
+                }
+                if !eligible_by_size || !profitable {
+                    continue;
+                }
+
+                let candidate_rank = (is_exact_match, common_len, entry.last_used);
+                let should_replace = best
+                    .as_ref()
+                    .map(|(_, exact, prefix_len, _, last_used)| {
+                        candidate_rank > (*exact, *prefix_len, *last_used)
+                    })
+                    .unwrap_or(true);
+                if should_replace {
+                    best = Some((
+                        index,
+                        is_exact_match,
+                        common_len,
+                        matched_blocks,
+                        entry.last_used,
+                    ));
+                }
+            }
+
+            if let Some((index, is_exact_match, common_len, matched_blocks, _)) = best {
+                let entry = &mut pool.entries[index];
+                entry.last_used = std::time::Instant::now();
+                let cached = Arc::clone(&entry.cached);
+                let prefix_len = if is_exact_match {
+                    common_len
+                } else {
+                    common_len.min(request_len.saturating_sub(1))
+                };
+                let telemetry = CandidateTelemetry {
+                    decision: if is_exact_match {
+                        "exact_hit"
+                    } else if matched_blocks > 0 {
+                        "block_prefix_hit"
+                    } else {
+                        "partial_prefix_hit"
+                    },
+                    common: prefix_len,
+                    suffix: request_len.saturating_sub(prefix_len),
+                    candidate: cached.token_ids.len(),
+                    block_tokens: cached.block_tokens,
+                    matched_blocks,
+                };
+                (
+                    Some(PrefixMatchResult {
+                        cached,
+                        prefix_len,
+                        is_exact_match,
+                    }),
+                    telemetry,
+                )
+            } else {
+                (
+                    None,
+                    observed.unwrap_or(CandidateTelemetry {
+                        decision: "miss_no_candidate",
+                        common: 0,
+                        suffix: request_len,
+                        candidate: 0,
+                        block_tokens: prompt_prefix_cache_block_tokens_from_env(),
+                        matched_blocks: 0,
+                    }),
+                )
+            }
+        }
+    };
+
+    prepared.timings.prompt_cache_decision = Some(telemetry.decision);
+    prepared.timings.prompt_cache_common_prefix_tokens = telemetry.common;
+    prepared.timings.prompt_cache_divergent_suffix_tokens = telemetry.suffix;
+    prepared.timings.prompt_cache_candidate_tokens = telemetry.candidate;
+    prepared.timings.prompt_cache_block_tokens = telemetry.block_tokens;
+    prepared.timings.prompt_cache_matched_blocks = telemetry.matched_blocks;
+    result
 }
 
 fn metal_f32_partial_prefix_is_profitable(prefix_len: usize, suffix_len: usize) -> bool {
     suffix_len > 0 && prefix_len / suffix_len >= METAL_F32_PARTIAL_PREFIX_MIN_REUSE_RATIO
+}
+
+fn mark_prompt_cache_bypassed(prepared: &mut PreparedGeneration, decision: &'static str) {
+    prepared.timings.prompt_cache_decision = Some(decision);
+    prepared.timings.prompt_cache_divergent_suffix_tokens = prepared.token_ids.len();
+    prepared.timings.prompt_cache_block_tokens = prompt_prefix_cache_block_tokens_from_env();
+}
+
+fn restore_cached_prompt_prefix(
+    prepared: &mut PreparedGeneration,
+    cached: &CachedPromptPrefix,
+    position: usize,
+) -> bool {
+    if crate::model::arch_has_windowed_attention(&prepared.session.config) {
+        return false;
+    }
+    let restored = if !cached.kv_blocks.is_empty() {
+        prepared
+            .session
+            .restore_prompt_kv_blocks(&cached.kv_blocks, position)
+            .is_ok()
+    } else if let Some(mut session) = cached.legacy_session.clone() {
+        if session.rollback_to_position(position).is_ok() {
+            prepared.session = session;
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if restored {
+        prepared
+            .session
+            .set_resident_paths_disabled(prepared.speculative.is_some() && !spec_gpu_enabled());
+    }
+    restored
+}
+
+fn mark_prompt_cache_restore_failed(prepared: &mut PreparedGeneration) {
+    prepared.timings.prompt_cache_decision = Some("rollback_failed");
+    prepared.timings.prompt_cache_common_prefix_tokens = 0;
+    prepared.timings.prompt_cache_divergent_suffix_tokens = prepared.token_ids.len();
+    prepared.timings.prompt_cache_matched_blocks = 0;
 }
 
 fn store_prompt_prefix_cache(prepared: &mut PreparedGeneration, step: &LlamaGenerationStep) {
@@ -19235,7 +19498,7 @@ fn store_prompt_prefix_cache(prepared: &mut PreparedGeneration, step: &LlamaGene
     // sliding-window mask and none of the arch's structure, so ordinary
     // multi-turn chat would silently attend full-causal over the whole cached
     // history (GEMMA3_METAL_CONDUCTOR.md §9e-2, hazard H1). Refused at the
-    // store site AND at both partial-resume sites (`resume_partial_prefix_hit`)
+    // store site AND at the shared cached-prefix restore path
     // so the bypass holds even against a stale pool.
     if crate::model::arch_has_windowed_attention(&prepared.session.config) {
         return;
@@ -19251,7 +19514,7 @@ fn store_prompt_prefix_cache(prepared: &mut PreparedGeneration, step: &LlamaGene
         return;
     }
 
-    // Serialize reservation, Metal->CPU mirroring and the large session clone.
+    // Serialize reservation, Metal->CPU mirroring and the KV block/session snapshot.
     // This briefly blocks cache lookups, but keeps replacement peak memory to
     // the configured pool capacity instead of capacity+1. A cache is an
     // optimization; if mirroring declines after eviction, the next request
@@ -19260,10 +19523,18 @@ fn store_prompt_prefix_cache(prepared: &mut PreparedGeneration, step: &LlamaGene
         return;
     };
     // Low-memory admission disables the cache before the expensive
-    // Metal->CPU mirror and populated-session clone. Checking only in `insert`
+    // Metal->CPU mirror and populated KV snapshot. Checking only in `insert`
     // would avoid retention but still create the transient owners that this
     // mode exists to prevent.
     if pool.capacity == 0 || !pool.model_is_admitted(&prepared.model_id) {
+        return;
+    }
+    if pool.touch_exact(
+        &prepared.model_id,
+        &prepared.model_path,
+        &prepared.token_ids,
+        &prepared.sampling,
+    ) {
         return;
     }
     pool.reserve_for_insert(
@@ -19277,15 +19548,26 @@ fn store_prompt_prefix_cache(prepared: &mut PreparedGeneration, step: &LlamaGene
     }
 
     let metal_f32_resident_kv = prepared.session.uses_f32_metal_resident_kv();
+    let block_tokens = prompt_prefix_cache_block_tokens_from_env();
+    let kv_blocks = prepared
+        .session
+        .snapshot_prompt_kv_blocks(block_tokens)
+        .unwrap_or_default();
+    let legacy_session = kv_blocks.is_empty().then(|| prepared.session.clone());
 
-    // Cloning a populated session can copy hundreds of MiB of KV data. The
-    // destination slot was released above, before this allocation starts.
+    // Exact-F32 sessions retain normalized, independently shareable KV blocks.
+    // F16/quantized CPU KV formats keep the legacy whole-session snapshot so
+    // this optimization never increases their retained memory.
     let cached = CachedPromptPrefix {
         model_id: prepared.model_id.clone(),
         model_path: prepared.model_path.clone(),
         token_ids: prepared.token_ids.clone(),
+        block_hashes: prompt_token_block_hashes(&prepared.token_ids, block_tokens),
+        block_tokens,
         sampling: prepared.sampling.clone(),
-        session: prepared.session.clone(),
+        kv_blocks,
+        legacy_session,
+        kv_position: prepared.token_ids.len(),
         logits: step.logits.clone(),
         hidden_state: step.hidden_state.clone(),
         output_norm_state: step.output_norm_state.clone(),
@@ -19311,6 +19593,7 @@ fn store_prompt_prefix_cache(prepared: &mut PreparedGeneration, step: &LlamaGene
 /// A malformed/stale cache entry must never make generation fail: when
 /// rollback cannot establish the requested prefix position the caller retains
 /// the fresh session and performs a cold prefill.
+#[cfg(test)]
 fn resume_partial_prefix_hit(
     prepared: &mut PreparedGeneration,
     mut cached_session: LlamaInferenceSession,
@@ -19326,6 +19609,24 @@ fn resume_partial_prefix_hit(
         prepared.timings.prompt_cache_hit = true;
         prepared.timings.prompt_reused_tokens = prefix_len;
         prepared.timings.prompt_prefilled_tokens = input.len();
+    } else {
+        mark_prompt_cache_restore_failed(prepared);
+    }
+}
+
+fn resume_cached_prefix_hit(
+    prepared: &mut PreparedGeneration,
+    cached: &CachedPromptPrefix,
+    prefix_len: usize,
+    input: &mut Vec<u32>,
+) {
+    if restore_cached_prompt_prefix(prepared, cached, prefix_len) {
+        *input = prepared.token_ids[prefix_len..].to_vec();
+        prepared.timings.prompt_cache_hit = true;
+        prepared.timings.prompt_reused_tokens = prefix_len;
+        prepared.timings.prompt_prefilled_tokens = input.len();
+    } else {
+        mark_prompt_cache_restore_failed(prepared);
     }
 }
 
@@ -19525,81 +19826,84 @@ fn generate_token_ids(
     let resident_cuda_active = crate::inference::resident_decode_cuda_active();
 
     if !prepared.collect_dense_diagnostics && !want_execution_trace && !resident_cuda_active {
-        if let Some(match_res) = lookup_prompt_prefix_cache(&prepared) {
-            let mut cached_session = match_res.cached.session.clone();
-            // The cached session's resident-path pin reflects the request
-            // that stored it; re-pin for this request's mode.
-            cached_session
-                .set_resident_paths_disabled(prepared.speculative.is_some() && !spec_gpu_enabled());
-
+        if let Some(match_res) = lookup_prompt_prefix_cache(&mut prepared) {
             if match_res.is_exact_match {
-                prepared.session = cached_session;
-                input.clear();
-                // Mask the cached logits with the constraint's first-token set,
-                // exactly as the main loop would have for a cold prefill.
-                let first_mask = match grammar.as_mut() {
-                    Some(state) => {
-                        state.compute_mask(&mut grammar_mask).map_err(|err| {
-                            Box::new(api_error(
-                                StatusCode::UNPROCESSABLE_ENTITY,
-                                "constraint_evaluation_failed",
-                                format!("LLGuidance could not compute the next-token mask: {err}"),
-                                Some("response_format"),
-                            ))
-                        })?;
-                        Some(grammar_mask.as_slice())
+                if restore_cached_prompt_prefix(
+                    &mut prepared,
+                    &match_res.cached,
+                    match_res.prefix_len,
+                ) {
+                    input.clear();
+                    // Mask the cached logits with the constraint's first-token set,
+                    // exactly as the main loop would have for a cold prefill.
+                    let first_mask = match grammar.as_mut() {
+                        Some(state) => {
+                            state.compute_mask(&mut grammar_mask).map_err(|err| {
+                                Box::new(api_error(
+                                    StatusCode::UNPROCESSABLE_ENTITY,
+                                    "constraint_evaluation_failed",
+                                    format!(
+                                        "LLGuidance could not compute the next-token mask: {err}"
+                                    ),
+                                    Some("response_format"),
+                                ))
+                            })?;
+                            Some(grammar_mask.as_slice())
+                        }
+                        None => None,
+                    };
+                    let first_step =
+                        sample_cached_prompt_prefix(&match_res.cached, &history, first_mask)?;
+                    if let Some(state) = grammar.as_mut() {
+                        state
+                            .commit_token(first_step.next_token_id)
+                            .map_err(|err| {
+                                Box::new(api_error(
+                                    StatusCode::UNPROCESSABLE_ENTITY,
+                                    "constraint_commit_failed",
+                                    format!("LLGuidance rejected the sampled token: {err}"),
+                                    Some("response_format"),
+                                ))
+                            })?;
                     }
-                    None => None,
-                };
-                let first_step =
-                    sample_cached_prompt_prefix(&match_res.cached, &history, first_mask)?;
-                // ADVANCE the grammar over the token we just emitted. The main
-                // loop commits every sampled token (see `commit_token` below);
-                // this path bypasses that, and without the commit the SECOND
-                // token's mask would be computed as though the first had never
-                // been produced — the other half of the hazard that made this
-                // cache refuse constrained requests outright.
-                if let Some(state) = grammar.as_mut() {
-                    state
-                        .commit_token(first_step.next_token_id)
-                        .map_err(|err| {
-                            Box::new(api_error(
-                                StatusCode::UNPROCESSABLE_ENTITY,
-                                "constraint_commit_failed",
-                                format!("LLGuidance rejected the sampled token: {err}"),
-                                Some("response_format"),
-                            ))
-                        })?;
-                }
-                let cached_next_token = first_step.next_token_id;
-                sample += first_step.sample;
-                prepared.timings.prompt_cache_hit = true;
-                prepared.timings.prompt_reused_tokens = prepared.token_ids.len();
-                prepared.timings.prompt_prefilled_tokens = 0;
-                consume_generation_step(
-                    &prepared,
-                    first_step,
-                    GenerationStepAccumulator {
-                        generated: &mut generated,
-                        history: &mut history,
-                        top_logits: &mut top_logits,
-                        output_projection: &mut output_projection,
-                        dense: &mut dense,
-                        finish_reason: &mut finish_reason,
-                    },
-                )?;
-                if finish_reason == "length" {
-                    input.push(cached_next_token);
+                    let cached_next_token = first_step.next_token_id;
+                    sample += first_step.sample;
+                    prepared.timings.prompt_cache_hit = true;
+                    prepared.timings.prompt_reused_tokens = prepared.token_ids.len();
+                    prepared.timings.prompt_prefilled_tokens = 0;
+                    consume_generation_step(
+                        &prepared,
+                        first_step,
+                        GenerationStepAccumulator {
+                            generated: &mut generated,
+                            history: &mut history,
+                            top_logits: &mut top_logits,
+                            output_projection: &mut output_projection,
+                            dense: &mut dense,
+                            finish_reason: &mut finish_reason,
+                        },
+                    )?;
+                    if finish_reason == "length" {
+                        input.push(cached_next_token);
+                    }
+                } else {
+                    mark_prompt_cache_restore_failed(&mut prepared);
                 }
             } else {
-                resume_partial_prefix_hit(
+                resume_cached_prefix_hit(
                     &mut prepared,
-                    cached_session,
+                    &match_res.cached,
                     match_res.prefix_len,
                     &mut input,
                 );
             }
         }
+    } else if prepared.collect_dense_diagnostics {
+        mark_prompt_cache_bypassed(&mut prepared, "bypassed_dense_diagnostics");
+    } else if want_execution_trace {
+        mark_prompt_cache_bypassed(&mut prepared, "bypassed_execution_trace");
+    } else {
+        mark_prompt_cache_bypassed(&mut prepared, "bypassed_cuda_resident");
     }
 
     // Arm the rollup now that the session is settled (past any prompt-cache swap). Fails closed
@@ -20714,6 +21018,12 @@ fn stream_timing_diagnostics_json(
                 "prompt_cache_hit": timings.prompt_cache_hit,
                 "prompt_reused_tokens": timings.prompt_reused_tokens,
                 "prompt_prefilled_tokens": timings.prompt_prefilled_tokens,
+                "prompt_cache_decision": timings.prompt_cache_decision,
+                "prompt_cache_common_prefix_tokens": timings.prompt_cache_common_prefix_tokens,
+                "prompt_cache_divergent_suffix_tokens": timings.prompt_cache_divergent_suffix_tokens,
+                "prompt_cache_candidate_tokens": timings.prompt_cache_candidate_tokens,
+                "prompt_cache_block_tokens": timings.prompt_cache_block_tokens,
+                "prompt_cache_matched_blocks": timings.prompt_cache_matched_blocks,
                 "session_create": timings.session_create,
                 "prefill_forward_total": timings.prompt_evaluation.prefill.forward_total,
                 "first_token_forward_total": timings.prompt_evaluation.first_token.forward_total,
@@ -20750,6 +21060,12 @@ fn stream_timing_receipt_json(
                 "prompt_cache_hit": timings.prompt_cache_hit,
                 "prompt_reused_tokens": timings.prompt_reused_tokens,
                 "prompt_prefilled_tokens": timings.prompt_prefilled_tokens,
+                "prompt_cache_decision": timings.prompt_cache_decision,
+                "prompt_cache_common_prefix_tokens": timings.prompt_cache_common_prefix_tokens,
+                "prompt_cache_divergent_suffix_tokens": timings.prompt_cache_divergent_suffix_tokens,
+                "prompt_cache_candidate_tokens": timings.prompt_cache_candidate_tokens,
+                "prompt_cache_block_tokens": timings.prompt_cache_block_tokens,
+                "prompt_cache_matched_blocks": timings.prompt_cache_matched_blocks,
                 "session_create": timings.session_create,
                 "prefill_forward_total": timings.prompt_evaluation.prefill.forward_total,
                 "first_token_forward_total": timings.prompt_evaluation.first_token.forward_total,
@@ -20912,51 +21228,55 @@ fn stream_prompt_cache_prologue(
     } = state;
     if !prepared.collect_dense_diagnostics && !crate::inference::resident_decode_cuda_active() {
         if let Some(match_res) = lookup_prompt_prefix_cache(prepared) {
-            let mut cached_session = match_res.cached.session.clone();
-            cached_session
-                .set_resident_paths_disabled(prepared.speculative.is_some() && !spec_gpu_enabled());
             if match_res.is_exact_match {
-                prepared.session = cached_session;
-                input.clear();
-                // Streaming with a constraint is refused before dispatch, so no
-                // mask can apply on this path.
-                match sample_cached_prompt_prefix(&match_res.cached, history, None) {
-                    Ok(first_step) => {
-                        let cached_next_token = first_step.next_token_id;
-                        prepared.timings.prompt_cache_hit = true;
-                        prepared.timings.prompt_reused_tokens = prepared.token_ids.len();
-                        prepared.timings.prompt_prefilled_tokens = 0;
-                        *sample += first_step.sample;
-                        if let Err(response) = consume_generation_step(
-                            prepared,
-                            first_step,
-                            GenerationStepAccumulator {
-                                generated,
-                                history,
-                                top_logits,
-                                output_projection,
-                                dense,
-                                finish_reason,
-                            },
-                        ) {
+                if restore_cached_prompt_prefix(prepared, &match_res.cached, match_res.prefix_len) {
+                    input.clear();
+                    // Streaming with a constraint is refused before dispatch, so no
+                    // mask can apply on this path.
+                    match sample_cached_prompt_prefix(&match_res.cached, history, None) {
+                        Ok(first_step) => {
+                            let cached_next_token = first_step.next_token_id;
+                            prepared.timings.prompt_cache_hit = true;
+                            prepared.timings.prompt_reused_tokens = prepared.token_ids.len();
+                            prepared.timings.prompt_prefilled_tokens = 0;
+                            *sample += first_step.sample;
+                            if let Err(response) = consume_generation_step(
+                                prepared,
+                                first_step,
+                                GenerationStepAccumulator {
+                                    generated,
+                                    history,
+                                    top_logits,
+                                    output_projection,
+                                    dense,
+                                    finish_reason,
+                                },
+                            ) {
+                                let (code, message) = stream_error_parts(&response);
+                                send(StreamDecodeEvent::Failed { code, message });
+                                return StreamPrologue::Stop;
+                            }
+                            if *finish_reason == "length" {
+                                input.push(cached_next_token);
+                            }
+                        }
+                        Err(response) => {
                             let (code, message) = stream_error_parts(&response);
                             send(StreamDecodeEvent::Failed { code, message });
                             return StreamPrologue::Stop;
                         }
-                        if *finish_reason == "length" {
-                            input.push(cached_next_token);
-                        }
                     }
-                    Err(response) => {
-                        let (code, message) = stream_error_parts(&response);
-                        send(StreamDecodeEvent::Failed { code, message });
-                        return StreamPrologue::Stop;
-                    }
+                } else {
+                    mark_prompt_cache_restore_failed(prepared);
                 }
             } else {
-                resume_partial_prefix_hit(prepared, cached_session, match_res.prefix_len, input);
+                resume_cached_prefix_hit(prepared, &match_res.cached, match_res.prefix_len, input);
             }
         }
+    } else if prepared.collect_dense_diagnostics {
+        mark_prompt_cache_bypassed(prepared, "bypassed_dense_diagnostics");
+    } else {
+        mark_prompt_cache_bypassed(prepared, "bypassed_cuda_resident");
     }
 
     // An exact prompt-cache hit samples the first token above, before the main
@@ -25598,6 +25918,12 @@ mod tests {
             prompt_cache_hit: true,
             prompt_reused_tokens: 1_200,
             prompt_prefilled_tokens: 178,
+            prompt_cache_decision: Some("block_prefix_hit"),
+            prompt_cache_common_prefix_tokens: 1_200,
+            prompt_cache_divergent_suffix_tokens: 178,
+            prompt_cache_candidate_tokens: 1_280,
+            prompt_cache_block_tokens: 64,
+            prompt_cache_matched_blocks: 18,
             session_create: 9,
             ..GenerationTimings::default()
         };
@@ -25617,6 +25943,12 @@ mod tests {
         assert_eq!(receipt["prompt_cache_hit"], true);
         assert_eq!(receipt["prompt_reused_tokens"], 1_200);
         assert_eq!(receipt["prompt_prefilled_tokens"], 178);
+        assert_eq!(receipt["prompt_cache_decision"], "block_prefix_hit");
+        assert_eq!(receipt["prompt_cache_common_prefix_tokens"], 1_200);
+        assert_eq!(receipt["prompt_cache_divergent_suffix_tokens"], 178);
+        assert_eq!(receipt["prompt_cache_candidate_tokens"], 1_280);
+        assert_eq!(receipt["prompt_cache_block_tokens"], 64);
+        assert_eq!(receipt["prompt_cache_matched_blocks"], 18);
         assert!(receipt.get("prefill_role_timings").is_none());
         assert!(receipt.get("layer_role_hotspots").is_none());
         assert!(value["stream_timing_diagnostics"]
@@ -28548,7 +28880,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_prefix_model_eviction_releases_only_that_models_weights() {
+    fn prompt_prefix_model_eviction_removes_only_that_models_entries() {
         let _env_guard = crate::test_support::env_lock();
         std::env::set_var("CAMELID_CUDA_RESIDENT_DECODE", "0");
         std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
@@ -28594,22 +28926,20 @@ mod tests {
 
         drop(prepared_a);
         drop(prepared_b);
-        assert!(weak_a.upgrade().is_some());
-        assert!(weak_b.upgrade().is_some());
+        assert!(
+            weak_a.upgrade().is_none() && weak_b.upgrade().is_none(),
+            "exact-F32 block entries must not pin either model's weights"
+        );
 
         let removed = pool.lock().unwrap().evict_model("model-a");
         assert_eq!(removed, 1);
-        assert!(
-            weak_a.upgrade().is_none(),
-            "evicting a model's prompt entries must release their weight Arc"
-        );
-        assert!(
-            weak_b.upgrade().is_some(),
-            "model-scoped eviction must preserve unrelated prompt entries"
-        );
+        let guard = pool.lock().unwrap();
+        assert_eq!(guard.entries.len(), 1);
+        assert_eq!(guard.entries[0].cached.model_id, "model-b");
+        drop(guard);
 
         pool.lock().unwrap().clear();
-        assert!(weak_b.upgrade().is_none());
+        assert!(pool.lock().unwrap().entries.is_empty());
         std::env::remove_var("CAMELID_CUDA_RESIDENT_DECODE");
     }
 
@@ -28669,7 +28999,7 @@ mod tests {
         std::env::remove_var("CAMELID_GQA_HEAD_MAPPING");
 
         let config = tiny_config();
-        let weights = tiny_weights();
+        let weights = Arc::new(tiny_weights());
         let mut session = LlamaInferenceSession::new(config.clone(), weights).unwrap();
         let step = session
             .generate_next_token_with_history_diagnostics(
@@ -28682,11 +29012,14 @@ mod tests {
             .unwrap();
         let mut prepared = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
 
-        assert!(lookup_prompt_prefix_cache(&prepared).is_none());
+        assert!(lookup_prompt_prefix_cache(&mut prepared).is_none());
         store_prompt_prefix_cache(&mut prepared, &step);
 
-        let match_res = lookup_prompt_prefix_cache(&prepared).expect("exact key cache hit");
-        assert_eq!(match_res.cached.session.kv_cache.position, 2);
+        let match_res = lookup_prompt_prefix_cache(&mut prepared).expect("exact key cache hit");
+        assert_eq!(prepared.timings.prompt_cache_decision, Some("exact_hit"));
+        assert_eq!(prepared.timings.prompt_cache_common_prefix_tokens, 2);
+        assert_eq!(prepared.timings.prompt_cache_divergent_suffix_tokens, 0);
+        assert_eq!(match_res.cached.kv_position, 2);
         assert_eq!(match_res.cached.logits, step.logits);
         assert_eq!(
             sample_cached_prompt_prefix(&match_res.cached, &[1, 2], None)
@@ -28711,7 +29044,7 @@ mod tests {
         let mut longer = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2, 0], longer_session);
         longer.cached_prompt_prefix = prepared.cached_prompt_prefix.clone();
         store_prompt_prefix_cache(&mut longer, &longer_step);
-        let exact = lookup_prompt_prefix_cache(&prepared).expect("exact entry still wins");
+        let exact = lookup_prompt_prefix_cache(&mut prepared).expect("exact entry still wins");
         assert!(exact.is_exact_match);
         assert_eq!(exact.cached.token_ids, vec![1, 2]);
 
@@ -28719,29 +29052,21 @@ mod tests {
             "tiny",
             "model-a.gguf",
             vec![99, 98],
-            match_res.cached.session.clone(),
+            prepared.session.clone(),
         );
         different_prompt.cached_prompt_prefix = prepared.cached_prompt_prefix.clone();
-        assert!(lookup_prompt_prefix_cache(&different_prompt).is_none());
+        assert!(lookup_prompt_prefix_cache(&mut different_prompt).is_none());
 
-        let mut different_sampling = prepared_for_cache(
-            "tiny",
-            "model-a.gguf",
-            vec![1, 2],
-            match_res.cached.session.clone(),
-        );
+        let mut different_sampling =
+            prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], prepared.session.clone());
         different_sampling.cached_prompt_prefix = prepared.cached_prompt_prefix.clone();
         different_sampling.sampling.temperature = 0.7;
-        assert!(lookup_prompt_prefix_cache(&different_sampling).is_none());
+        assert!(lookup_prompt_prefix_cache(&mut different_sampling).is_none());
 
-        let mut different_model = prepared_for_cache(
-            "tiny",
-            "model-b.gguf",
-            vec![1, 2],
-            match_res.cached.session.clone(),
-        );
+        let mut different_model =
+            prepared_for_cache("tiny", "model-b.gguf", vec![1, 2], prepared.session.clone());
         different_model.cached_prompt_prefix = prepared.cached_prompt_prefix.clone();
-        assert!(lookup_prompt_prefix_cache(&different_model).is_none());
+        assert!(lookup_prompt_prefix_cache(&mut different_model).is_none());
     }
 
     #[test]
@@ -28795,7 +29120,7 @@ mod tests {
             cached.metal_f32_resident_kv = true;
         }
 
-        let exact = lookup_prompt_prefix_cache(&prepared).expect("exact hit remains eligible");
+        let exact = lookup_prompt_prefix_cache(&mut prepared).expect("exact hit remains eligible");
         assert!(exact.is_exact_match);
 
         let mut extended = prepared_for_cache(
@@ -28806,9 +29131,15 @@ mod tests {
         );
         extended.cached_prompt_prefix = Arc::clone(&prepared.cached_prompt_prefix);
         assert!(
-            lookup_prompt_prefix_cache(&extended).is_none(),
+            lookup_prompt_prefix_cache(&mut extended).is_none(),
             "a suffix too large for the cached prefix must take cold Metal prefill"
         );
+        assert_eq!(
+            extended.timings.prompt_cache_decision,
+            Some("rejected_metal_ratio")
+        );
+        assert_eq!(extended.timings.prompt_cache_common_prefix_tokens, 3);
+        assert_eq!(extended.timings.prompt_cache_divergent_suffix_tokens, 2);
 
         std::env::remove_var(PROMPT_PREFIX_CACHE_MIN_TOKENS_ENV);
         std::env::remove_var("CAMELID_CUDA_RESIDENT_DECODE");
@@ -28844,7 +29175,7 @@ mod tests {
         );
         extended.cached_prompt_prefix = prepared.cached_prompt_prefix.clone();
 
-        let hit = lookup_prompt_prefix_cache(&extended).expect("partial prefix cache hit");
+        let hit = lookup_prompt_prefix_cache(&mut extended).expect("partial prefix cache hit");
         assert!(!hit.is_exact_match);
         assert_eq!(hit.prefix_len, 3);
 
@@ -28931,7 +29262,7 @@ mod tests {
 
         store_prompt_prefix_cache(&mut prep1, &step1);
         store_prompt_prefix_cache(&mut prep2, &step2);
-        assert!(lookup_prompt_prefix_cache(&prep1).is_some());
+        assert!(lookup_prompt_prefix_cache(&mut prep1).is_some());
         {
             let mut pool = pool_ref.lock().unwrap();
             let newest = std::time::Instant::now();
@@ -28958,6 +29289,187 @@ mod tests {
         assert!(!remaining.contains(&prep2.token_ids));
 
         std::env::remove_var(PROMPT_PREFIX_CACHE_MIN_TOKENS_ENV);
+        std::env::remove_var("CAMELID_CUDA_RESIDENT_DECODE");
+    }
+
+    #[test]
+    fn block_indexed_prompt_cache_reports_divergence_and_preserves_parity() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var(PROMPT_PREFIX_CACHE_MIN_TOKENS_ENV, "16");
+        std::env::set_var(PROMPT_PREFIX_CACHE_BLOCK_TOKENS_ENV, "16");
+        std::env::set_var("CAMELID_CUDA_RESIDENT_DECODE", "0");
+        std::env::remove_var("CAMELID_DETERMINISTIC");
+
+        let config = tiny_spec_config();
+        let weights = Arc::new(tiny_weights());
+        let prompt: Vec<u32> = (0..32).map(|index| (index % 3) as u32).collect();
+        let mut session = LlamaInferenceSession::new(config.clone(), Arc::clone(&weights)).unwrap();
+        let step = session
+            .generate_next_token_with_history_diagnostics(
+                &prompt,
+                crate::inference::LlamaSampler::Greedy,
+                &prompt,
+                false,
+                None,
+            )
+            .unwrap();
+        let mut seeded = prepared_for_cache("tiny", "model-a.gguf", prompt.clone(), session);
+        store_prompt_prefix_cache(&mut seeded, &step);
+
+        let mut request = prompt.clone();
+        request.extend([2, 1]);
+        let mut warm = prepared_for_cache(
+            "tiny",
+            "model-a.gguf",
+            request.clone(),
+            LlamaInferenceSession::new(config.clone(), Arc::clone(&weights)).unwrap(),
+        );
+        warm.max_tokens = 2;
+        warm.cached_prompt_prefix = Arc::clone(&seeded.cached_prompt_prefix);
+        let hit = lookup_prompt_prefix_cache(&mut warm).expect("two matching KV blocks");
+        assert_eq!(hit.prefix_len, 32);
+        assert_eq!(warm.timings.prompt_cache_decision, Some("block_prefix_hit"));
+        assert_eq!(warm.timings.prompt_cache_common_prefix_tokens, 32);
+        assert_eq!(warm.timings.prompt_cache_divergent_suffix_tokens, 2);
+        assert_eq!(warm.timings.prompt_cache_block_tokens, 16);
+        assert_eq!(warm.timings.prompt_cache_matched_blocks, 2);
+
+        let mut warm_for_generation = prepared_for_cache(
+            "tiny",
+            "model-a.gguf",
+            request.clone(),
+            LlamaInferenceSession::new(config.clone(), Arc::clone(&weights)).unwrap(),
+        );
+        warm_for_generation.max_tokens = 2;
+        warm_for_generation.cached_prompt_prefix = Arc::clone(&seeded.cached_prompt_prefix);
+        let mut cold = prepared_for_cache(
+            "tiny",
+            "model-a.gguf",
+            request,
+            LlamaInferenceSession::new(config, Arc::clone(&weights)).unwrap(),
+        );
+        cold.max_tokens = 2;
+        let warm_output = generate_token_ids(warm_for_generation).expect("block-cache generation");
+        let cold_output = generate_token_ids(cold).expect("cold generation");
+        assert_eq!(warm_output.token_ids, cold_output.token_ids);
+        assert_eq!(warm_output.timings.prompt_reused_tokens, 32);
+
+        // Divergence inside the second block restores only the seven matching
+        // rows from that block, not the mismatching tail.
+        let mut mid_block_request = prompt.clone();
+        mid_block_request[23] = (mid_block_request[23] + 1) % 3;
+        let mut mid_block_warm = prepared_for_cache(
+            "tiny",
+            "model-a.gguf",
+            mid_block_request.clone(),
+            LlamaInferenceSession::new(tiny_spec_config(), Arc::clone(&weights)).unwrap(),
+        );
+        mid_block_warm.max_tokens = 2;
+        mid_block_warm.cached_prompt_prefix = Arc::clone(&seeded.cached_prompt_prefix);
+        let mut mid_block_cold = prepared_for_cache(
+            "tiny",
+            "model-a.gguf",
+            mid_block_request,
+            LlamaInferenceSession::new(tiny_spec_config(), Arc::clone(&weights)).unwrap(),
+        );
+        mid_block_cold.max_tokens = 2;
+        let mid_block_output =
+            generate_token_ids(mid_block_warm).expect("partial-block cache generation");
+        let mid_block_control =
+            generate_token_ids(mid_block_cold).expect("partial-block cold generation");
+        assert_eq!(mid_block_output.token_ids, mid_block_control.token_ids);
+        assert_eq!(mid_block_output.timings.prompt_reused_tokens, 23);
+        assert_eq!(mid_block_output.timings.prompt_cache_matched_blocks, 1);
+
+        std::env::remove_var(PROMPT_PREFIX_CACHE_MIN_TOKENS_ENV);
+        std::env::remove_var(PROMPT_PREFIX_CACHE_BLOCK_TOKENS_ENV);
+        std::env::remove_var("CAMELID_CUDA_RESIDENT_DECODE");
+    }
+
+    #[test]
+    fn block_hash_collision_never_authorizes_kv_reuse() {
+        let block_tokens = 16;
+        let cached_tokens: Vec<u32> = (0..32).map(|index| (index % 3) as u32).collect();
+        let mut different = cached_tokens.clone();
+        different[0] = (different[0] + 1) % 3;
+        let session = LlamaInferenceSession::new(tiny_spec_config(), tiny_weights()).unwrap();
+        let cached = CachedPromptPrefix {
+            model_id: "tiny".into(),
+            model_path: PathBuf::from("model-a.gguf"),
+            token_ids: cached_tokens,
+            // Deliberately forge the request's hashes. Exact token verification
+            // must still stop at the first position.
+            block_hashes: prompt_token_block_hashes(&different, block_tokens),
+            block_tokens,
+            sampling: SamplingConfig::default(),
+            kv_blocks: Vec::new(),
+            legacy_session: Some(session),
+            kv_position: 32,
+            logits: CpuTensor::from_f32("logits", vec![1, 3], vec![0.0; 3]).unwrap(),
+            hidden_state: CpuTensor::from_f32("hidden", vec![1, 4], vec![0.0; 4]).unwrap(),
+            output_norm_state: CpuTensor::from_f32("norm", vec![1, 4], vec![0.0; 4]).unwrap(),
+            metal_f32_resident_kv: false,
+        };
+        assert_eq!(block_indexed_common_prefix_len(&cached, &different), (0, 0));
+    }
+
+    #[test]
+    fn retained_prefixes_physically_share_identical_kv_blocks() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var(PROMPT_PREFIX_CACHE_BLOCK_TOKENS_ENV, "16");
+        std::env::set_var("CAMELID_CUDA_RESIDENT_DECODE", "0");
+        std::env::remove_var("CAMELID_DETERMINISTIC");
+
+        let pool = Arc::new(Mutex::new(PromptPrefixCachePool::with_capacity(2)));
+        let first_prompt: Vec<u32> = (0..32).map(|index| (index % 3) as u32).collect();
+        let mut second_prompt = first_prompt.clone();
+        second_prompt[20] = (second_prompt[20] + 1) % 3;
+
+        for prompt in [&first_prompt, &second_prompt] {
+            let mut session =
+                LlamaInferenceSession::new(tiny_spec_config(), tiny_weights()).unwrap();
+            let step = session
+                .generate_next_token_with_history_diagnostics(
+                    prompt,
+                    crate::inference::LlamaSampler::Greedy,
+                    prompt,
+                    false,
+                    None,
+                )
+                .unwrap();
+            let mut prepared =
+                prepared_for_cache("tiny", "model-a.gguf", (*prompt).clone(), session);
+            prepared.cached_prompt_prefix = Arc::clone(&pool);
+            store_prompt_prefix_cache(&mut prepared, &step);
+        }
+
+        let guard = pool.lock().unwrap();
+        assert_eq!(guard.entries.len(), 2);
+        assert_eq!(guard.entries[0].cached.kv_blocks.len(), 2);
+        assert_eq!(guard.entries[1].cached.kv_blocks.len(), 2);
+        assert!(Arc::ptr_eq(
+            &guard.entries[0].cached.kv_blocks[0],
+            &guard.entries[1].cached.kv_blocks[0]
+        ));
+        assert!(!Arc::ptr_eq(
+            &guard.entries[0].cached.kv_blocks[1],
+            &guard.entries[1].cached.kv_blocks[1]
+        ));
+        let naive_bytes: u64 = guard
+            .entries
+            .iter()
+            .flat_map(|entry| entry.cached.kv_blocks.iter())
+            .map(|block| block.allocated_bytes())
+            .sum();
+        let mut seen = HashSet::new();
+        let unique_bytes: u64 = guard
+            .entries
+            .iter()
+            .map(|entry| entry.cached.kv_allocated_bytes(&mut seen))
+            .sum();
+        assert!(unique_bytes < naive_bytes);
+
+        std::env::remove_var(PROMPT_PREFIX_CACHE_BLOCK_TOKENS_ENV);
         std::env::remove_var("CAMELID_CUDA_RESIDENT_DECODE");
     }
 
@@ -29044,7 +29556,12 @@ mod tests {
             "disabled cache must neither retain the old KV nor clone a replacement"
         );
         drop(pool);
-        assert!(lookup_prompt_prefix_cache(&prepared).is_none());
+        assert!(lookup_prompt_prefix_cache(&mut prepared).is_none());
+        assert_eq!(prepared.timings.prompt_cache_decision, Some("disabled"));
+        assert_eq!(
+            prepared.timings.prompt_cache_divergent_suffix_tokens,
+            prepared.token_ids.len()
+        );
     }
 
     #[test]
@@ -29097,7 +29614,7 @@ mod tests {
         let mut unconstrained = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
         store_prompt_prefix_cache(&mut unconstrained, &step);
         assert!(
-            lookup_prompt_prefix_cache(&unconstrained).is_some(),
+            lookup_prompt_prefix_cache(&mut unconstrained).is_some(),
             "control: the unconstrained twin hits the warm cache"
         );
 
@@ -29105,16 +29622,12 @@ mod tests {
             "tiny",
             "model-a.gguf",
             vec![1, 2],
-            lookup_prompt_prefix_cache(&unconstrained)
-                .unwrap()
-                .cached
-                .session
-                .clone(),
+            unconstrained.session.clone(),
         );
         constrained.cached_prompt_prefix = unconstrained.cached_prompt_prefix.clone();
         constrained.constraint = Some(crate::grammar::ConstraintSpec::json_object());
         assert!(
-            lookup_prompt_prefix_cache(&constrained).is_some(),
+            lookup_prompt_prefix_cache(&mut constrained).is_some(),
             "a constrained request must now REUSE the prompt cache; the constraint is \
              enforced when the cached logits are sampled, not by refusing the hit"
         );
@@ -29151,7 +29664,7 @@ mod tests {
         );
         unconstrained.cached_prompt_prefix = constrained.cached_prompt_prefix.clone();
         assert!(
-            lookup_prompt_prefix_cache(&unconstrained).is_some(),
+            lookup_prompt_prefix_cache(&mut unconstrained).is_some(),
             "a constrained request now SEEDS the cache: the stored artifact is the \
              prompt's KV and its raw, unmasked logits, so an unconstrained twin may \
              reuse it (and vice versa) — the constraint is applied at sample time"
@@ -29185,7 +29698,7 @@ mod tests {
         let mut prepared = prepared_for_cache("tiny-g3", "model-g3.gguf", vec![1, 2], session);
         store_prompt_prefix_cache(&mut prepared, &step);
         assert!(
-            lookup_prompt_prefix_cache(&prepared).is_none(),
+            lookup_prompt_prefix_cache(&mut prepared).is_none(),
             "a windowed-attention arch must never populate the prompt-prefix cache"
         );
 
@@ -29204,7 +29717,7 @@ mod tests {
         let mut control = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], control_session);
         store_prompt_prefix_cache(&mut control, &control_step);
         assert!(
-            lookup_prompt_prefix_cache(&control).is_some(),
+            lookup_prompt_prefix_cache(&mut control).is_some(),
             "the control fixture must store — otherwise this test is not \
              exercising the windowed-arch bypass"
         );
@@ -29316,8 +29829,15 @@ mod tests {
                 model_id: warm.model_id.clone(),
                 model_path: warm.model_path.clone(),
                 token_ids: warm.token_ids.clone(),
+                block_hashes: prompt_token_block_hashes(
+                    &warm.token_ids,
+                    DEFAULT_PROMPT_PREFIX_CACHE_BLOCK_TOKENS,
+                ),
+                block_tokens: DEFAULT_PROMPT_PREFIX_CACHE_BLOCK_TOKENS,
                 sampling: warm.sampling.clone(),
-                session: warm.session.clone(),
+                kv_blocks: Vec::new(),
+                legacy_session: Some(warm.session.clone()),
+                kv_position: warm.token_ids.len(),
                 logits: step.logits.clone(),
                 hidden_state: step.hidden_state.clone(),
                 output_norm_state: step.output_norm_state.clone(),

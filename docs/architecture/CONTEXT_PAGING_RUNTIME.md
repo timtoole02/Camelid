@@ -120,6 +120,28 @@ are 53:1 (Modify to pending Verify), 66:1 (pending to plain Verify), and 67:1
 (source-fault retry). The fixture is only a benchmark workload; the runtime
 does not match its project name, file layout, language, or application domain.
 
+Prompt-prefix lookup and exact-F32 CPU KV retention are block-granular.
+Retained token sequences carry verified hashes for complete 64-token blocks;
+lookup compares those blocks first, then refines the final partial block to the
+exact first divergent token. A hash is only an index: Camelid compares the
+underlying token IDs before reusing any KV position, so collisions fall back
+safely. Exact-F32 prompt KV is copied into independently reference-counted
+blocks, and concurrent retained prefixes physically share identical leading
+blocks. A divergent request may restore only the matching rows from its final
+block. F16 and quantized CPU KV retain the previous typed whole-session
+fallback rather than expanding or requantizing their cache. All existing
+architecture, rollback, Metal-profitability, model-identity, memory-admission,
+and windowed-attention gates remain in force. This slice does not add SSD
+persistence or arbitrary non-prefix reuse; causal KV remains prefix-only.
+
+Every model request records a bounded cache receipt in
+`metrics.promptCacheRequests`: decision (including `exact_hit`,
+`block_prefix_hit`, `partial_prefix_hit`, `miss_no_candidate`,
+`miss_below_minimum`, `rejected_metal_ratio`, `disabled`, bypass, and rollback
+outcomes), candidate size, exact common prefix, divergent suffix, block
+size/count, and reused/prefilled tokens. The same fields are emitted in the
+compact streaming receipt and Web Code activity feed.
+
 The advertised action protocol is the model's existing native function-call
 format: one advertised tool call per step, followed by a concise plain-text
 answer only after host verification. `read_file` doubles as the exact-source
@@ -258,6 +280,10 @@ Retrieval misses are persisted even when the fault fails.
 - `CAMELID_CONTEXT_TOOL_RESULT_LINES`: compact tool-result preview lines,
   default `32`, minimum `4`.
 - `CAMELID_CONTEXT_DEBUG=1`: record item inclusion/exclusion explanations.
+- `CAMELID_PREFIX_CACHE_BLOCK_TOKENS`: token-block size used by the verified
+  prompt-prefix index, default `64`. Accepted values are powers of two from 16
+  through 1024; invalid values use the default. This changes lookup
+  granularity, not memory admission or the Metal 48:1 profitability gate.
 
 Invalid numeric values fail closed to the documented defaults. A capsule that
 cannot retain its immutable task contract, late mandatory task state, current

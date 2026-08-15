@@ -166,6 +166,12 @@ try {
         prompt_cache_hit: true,
         reused_tokens: 2884,
         prefilled_tokens: 302,
+        prompt_cache_decision: 'block_prefix_hit',
+        common_prefix_tokens: 2884,
+        divergent_suffix_tokens: 302,
+        candidate_tokens: 3000,
+        cache_block_tokens: 64,
+        matched_cache_blocks: 45,
       })
       source?.emit({ sequence: 17, event: 'session.finished', outcome: 'answered' })
     }

@@ -2757,6 +2757,24 @@ impl LlamaInferenceSession {
         self.kv_cache.allocated_bytes()
     }
 
+    pub(crate) fn snapshot_prompt_kv_blocks(
+        &self,
+        block_tokens: usize,
+    ) -> Option<Vec<Arc<kv_cache::LlamaKvBlockSnapshot>>> {
+        self.kv_cache
+            .snapshot_prompt_blocks(block_tokens)
+            .map(|blocks| blocks.into_iter().map(Arc::new).collect())
+    }
+
+    pub(crate) fn restore_prompt_kv_blocks(
+        &mut self,
+        blocks: &[Arc<kv_cache::LlamaKvBlockSnapshot>],
+        position: usize,
+    ) -> Result<()> {
+        self.resident_decode = None;
+        self.kv_cache.restore_prompt_blocks(blocks, position)
+    }
+
     /// Positions still available before the context limit.
     pub fn remaining_context(&self) -> usize {
         self.kv_cache

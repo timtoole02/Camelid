@@ -277,6 +277,18 @@ struct WorkspaceActivitySnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     prefilled_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_decision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    common_prefix_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    divergent_suffix_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    candidate_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_block_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    matched_cache_blocks: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     terminal_outcome: Option<String>,
     agents: Vec<WorkspaceAgentActivity>,
 }
@@ -299,6 +311,12 @@ impl WorkspaceActivitySnapshot {
             prompt_cache_hit: None,
             reused_tokens: None,
             prefilled_tokens: None,
+            prompt_cache_decision: None,
+            common_prefix_tokens: None,
+            divergent_suffix_tokens: None,
+            candidate_tokens: None,
+            cache_block_tokens: None,
+            matched_cache_blocks: None,
             terminal_outcome: None,
             agents: vec![WorkspaceAgentActivity {
                 id: "main".to_string(),
@@ -404,6 +422,12 @@ impl WorkspaceActivitySnapshot {
                 prompt_cache_hit,
                 reused_tokens,
                 prefilled_tokens,
+                prompt_cache_decision,
+                common_prefix_tokens,
+                divergent_suffix_tokens,
+                candidate_tokens,
+                cache_block_tokens,
+                matched_cache_blocks,
                 ..
             } => {
                 self.output_tokens = *output_tokens;
@@ -413,6 +437,12 @@ impl WorkspaceActivitySnapshot {
                 self.prompt_cache_hit = *prompt_cache_hit;
                 self.reused_tokens = *reused_tokens;
                 self.prefilled_tokens = *prefilled_tokens;
+                self.prompt_cache_decision = prompt_cache_decision.clone();
+                self.common_prefix_tokens = *common_prefix_tokens;
+                self.divergent_suffix_tokens = *divergent_suffix_tokens;
+                self.candidate_tokens = *candidate_tokens;
+                self.cache_block_tokens = *cache_block_tokens;
+                self.matched_cache_blocks = *matched_cache_blocks;
                 let mut detail = output_tokens.map_or_else(
                     || "The model finished a generation step".to_string(),
                     |tokens| format!("The model finished a {tokens}-token generation step"),
@@ -3823,6 +3853,12 @@ mod tests {
             prompt_cache_hit: Some(true),
             reused_tokens: Some(1_920),
             prefilled_tokens: Some(31),
+            prompt_cache_decision: Some("block_prefix_hit".into()),
+            common_prefix_tokens: Some(1_920),
+            divergent_suffix_tokens: Some(31),
+            candidate_tokens: Some(1_960),
+            cache_block_tokens: Some(64),
+            matched_cache_blocks: Some(30),
         });
         assert_eq!(activity.output_tokens, Some(42));
         assert_eq!(activity.total_model_ms, Some(1_250));
@@ -3831,6 +3867,11 @@ mod tests {
         assert_eq!(activity.prompt_cache_hit, Some(true));
         assert_eq!(activity.reused_tokens, Some(1_920));
         assert_eq!(activity.prefilled_tokens, Some(31));
+        assert_eq!(
+            activity.prompt_cache_decision.as_deref(),
+            Some("block_prefix_hit")
+        );
+        assert_eq!(activity.common_prefix_tokens, Some(1_920));
         assert!(activity.detail.contains("prompt-cache hit"));
 
         activity.apply(&WorkspaceEvent::Finished {

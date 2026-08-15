@@ -273,6 +273,12 @@ pub(crate) enum WorkspaceEvent {
         prompt_cache_hit: Option<bool>,
         reused_tokens: Option<u32>,
         prefilled_tokens: Option<u32>,
+        prompt_cache_decision: Option<String>,
+        common_prefix_tokens: Option<u32>,
+        divergent_suffix_tokens: Option<u32>,
+        candidate_tokens: Option<u32>,
+        cache_block_tokens: Option<u32>,
+        matched_cache_blocks: Option<u32>,
     },
     #[serde(rename = "model.answer")]
     ModelAnswer { content: String },
@@ -638,6 +644,12 @@ impl Reporter for WorkspaceReporter {
             prompt_cache_hit: metrics.prompt_cache_hit,
             reused_tokens: metrics.reused_tokens,
             prefilled_tokens: metrics.prefilled_tokens,
+            prompt_cache_decision: metrics.prompt_cache_decision,
+            common_prefix_tokens: metrics.common_prefix_tokens,
+            divergent_suffix_tokens: metrics.divergent_suffix_tokens,
+            candidate_tokens: metrics.candidate_tokens,
+            cache_block_tokens: metrics.cache_block_tokens,
+            matched_cache_blocks: metrics.matched_cache_blocks,
         });
     }
 

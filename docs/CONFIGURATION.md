@@ -216,6 +216,13 @@ Backend runtime knobs used during performance work:
   The bounded defaults are 5,500 input tokens, 1,300 output tokens, and a 1,200
   token safety reserve; tune them with `CAMELID_CONTEXT_MAX_INPUT_TOKENS`,
   `CAMELID_CONTEXT_OUTPUT_RESERVE`, and `CAMELID_CONTEXT_SAFETY_RESERVE`.
+- Prompt-prefix lookup uses verified token-block hashes to select retained KV
+  prefixes and reports the exact first divergent token plus the admission or
+  rejection reason on every Web Code model step. Set
+  `CAMELID_PREFIX_CACHE_BLOCK_TOKENS` to a power of two from 16 through 1024 to
+  override the 64-token default. Hashes are only indexes—the underlying token
+  IDs are compared before reuse—and existing Metal profitability and
+  low-memory cache-disable gates still apply.
 - `CAMELID_GPU_TEMP_SAMPLING` controls the CUDA-resident Gumbel-max path for plain temperature sampling. It defaults to enabled after seeded device/reference and streaming validation, avoiding a full-vocabulary device-to-host copy and CPU sort on each sampled token. Set it to `0`, `false`, `off`, or `no` to force the CPU sampling fallback for diagnosis.
 - `CAMELID_CUDA_RESIDENT_PREFILL_BATCHED` overrides the resident CUDA prefill policy. Q8_0 uses batched prefill by default; Q4_K/Q6_K keep the sustained-throughput winner (serial prefill) by default on the Windows/WDDM reference host. Set it to `1`, `true`, or `on` to exercise the parity-checked Q4_K/Q6_K batched kernels, or `0`, `false`, or `off` to force serial prefill for any quant lane.
 - `CAMELID_CUDA_KQUANT_BATCH_TOKENS` selects the requested Q4_K/Q6_K CUDA prefill tile size from `1` through `4` when batched K-quant prefill is explicitly enabled. Default: `2`; the runtime clamps it to the model dimensions and portable shared-memory budget. This remains a diagnostic tuning knob until a target GPU shows a sustained gain.
