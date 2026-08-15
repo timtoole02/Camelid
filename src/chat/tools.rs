@@ -2571,40 +2571,109 @@ fn search_file(needle: &str, path: &Path, limit: usize, sandbox: &Sandbox) -> To
 /// takes; a triple-quoted f-string spans lines legally and must not be flagged.
 /// It is a lint, not a parser: false negatives are fine (the syntax check is
 /// still behind it), false positives are not.
+fn python_quote_end(bytes: &[u8], mut cursor: usize, quote: u8, triple: bool) -> Option<usize> {
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'\\' {
+            cursor = cursor.saturating_add(2);
+            continue;
+        }
+        if bytes[cursor] == quote
+            && (!triple
+                || bytes
+                    .get(cursor..cursor.saturating_add(3))
+                    .is_some_and(|candidate| candidate == [quote; 3]))
+        {
+            return Some(cursor + if triple { 3 } else { 1 });
+        }
+        cursor += 1;
+    }
+    None
+}
+
+fn python_line_has_explicit_continuation(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .rev()
+        .take_while(|&&byte| byte == b'\\')
+        .count()
+        % 2
+        == 1
+}
+
+fn python_string_prefix(bytes: &[u8], quote_at: usize) -> &[u8] {
+    let mut start = quote_at;
+    while start > 0 && bytes[start - 1].is_ascii_alphabetic() {
+        start -= 1;
+    }
+    &bytes[start..quote_at]
+}
+
 fn unterminated_fstring_line(source: &str) -> Option<(usize, String)> {
+    let mut triple_quote = None;
+    let mut continued_quote = None;
     for (index, line) in source.lines().enumerate() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
         let bytes = line.as_bytes();
         let mut cursor = 0usize;
-        while let Some(found) = line[cursor..].find(['\'', '"']) {
-            let quote_at = cursor + found;
-            let quote = bytes[quote_at];
-            // Only an f-prefixed literal: plain strings break the same way but
-            // are far likelier to be a deliberate concatenation the model wrote.
-            let prefixed = quote_at > 0
-                && matches!(bytes[quote_at - 1], b'f' | b'F')
-                && (quote_at < 2 || !bytes[quote_at - 2].is_ascii_alphanumeric());
-            // A triple quote is legally multi-line; skip past it entirely.
-            if line[quote_at..].starts_with(std::str::from_utf8(&[quote; 3]).unwrap_or("")) {
-                cursor = quote_at + 3;
+
+        if let Some(quote) = continued_quote {
+            if let Some(end) = python_quote_end(bytes, 0, quote, false) {
+                continued_quote = None;
+                cursor = end;
+            } else {
+                if !python_line_has_explicit_continuation(bytes) {
+                    continued_quote = None;
+                }
                 continue;
             }
-            let mut scan = quote_at + 1;
-            let mut closed = false;
-            while scan < bytes.len() {
-                if bytes[scan] == b'\\' {
-                    scan += 2;
+        }
+
+        while cursor < bytes.len() {
+            if let Some(quote) = triple_quote {
+                if let Some(end) = python_quote_end(bytes, cursor, quote, true) {
+                    triple_quote = None;
+                    cursor = end;
                     continue;
                 }
-                if bytes[scan] == quote {
-                    closed = true;
-                    break;
-                }
-                scan += 1;
+                break;
             }
-            if !closed {
-                return prefixed.then(|| (index + 1, line.trim_start().to_string()));
+
+            if bytes[cursor] == b'#' {
+                break;
             }
-            cursor = scan + 1;
+            if !matches!(bytes[cursor], b'\'' | b'"') {
+                cursor += 1;
+                continue;
+            }
+
+            let quote_at = cursor;
+            let quote = bytes[quote_at];
+            let prefix = python_string_prefix(bytes, quote_at);
+            let valid_prefix = prefix
+                .iter()
+                .all(|byte| matches!(byte, b'r' | b'R' | b'b' | b'B' | b'u' | b'U' | b'f' | b'F'));
+            let formatted = valid_prefix && prefix.iter().any(|byte| matches!(byte, b'f' | b'F'));
+            let triple = bytes
+                .get(quote_at..quote_at.saturating_add(3))
+                .is_some_and(|candidate| candidate == [quote; 3]);
+            let content_at = quote_at + if triple { 3 } else { 1 };
+            if let Some(end) = python_quote_end(bytes, content_at, quote, triple) {
+                cursor = end;
+                continue;
+            }
+
+            if triple {
+                triple_quote = Some(quote);
+                break;
+            }
+            if python_line_has_explicit_continuation(bytes) {
+                continued_quote = Some(quote);
+                break;
+            }
+            if formatted {
+                return Some((index + 1, line.trim_start().to_string()));
+            }
+            break;
         }
     }
     None
@@ -2624,8 +2693,9 @@ fn write_file(path: &Path, content: &str, display_path: &str) -> ToolOutcome {
         if let Some((line, text)) = unterminated_fstring_line(content) {
             return ToolOutcome::Err(format!(
                 "write refused: {display_path} line {line} opens an f-string that never closes on \
-                 that line:\n  {text}\nA Python string literal cannot span lines. Spell the break \
-                 as \\n inside the quotes — print(f'a:\\n  b') — then write the file again."
+                 that line:\n  {text}\nA single-quoted Python f-string needs an explicit \
+                 continuation to span physical lines. Spell the intended break as \\n inside the \
+                 quotes — print(f'a:\\n  b') — then write the file again."
             ));
         }
     }
@@ -4021,13 +4091,18 @@ mod tests {
         // False positives are worse than misses here: refusing a legitimate write
         // strands the agent with no way to author the file at all. The syntax
         // check still sits behind this lint to catch what it lets through.
-        let legal: [&str; 9] = [
+        let legal: [&str; 14] = [
             r#"print(f'Added task {task.id}: {task.description}')"#,
             r#"print(f"done: {n}")"#,
             "x = f'''multi\nline is legal'''",
             "y = f\"\"\"also\nlegal\"\"\"",
+            "doc = \"\"\"example source:\n    f'not executable code\n\"\"\"",
             r#"s = 'plain unterminated"#,
             r#"print(f'escaped \' quote inside')"#,
+            "continued = f'legal\\\nphysical line'",
+            "# example only: f'not executable code",
+            "value = 1  # example only: f'not executable code",
+            r#"raw = rf'{root}\\{name}'"#,
             "path = f'{root}/{name}'",
             "",
             "# no strings at all",

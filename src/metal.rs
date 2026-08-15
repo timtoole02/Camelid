@@ -17870,7 +17870,9 @@ impl Qwen35MetalDecode {
         e.end_encoding();
         cb.commit();
         cb.wait_until_completed();
-        if cb.status() != metal::MTLCommandBufferStatus::Completed {
+        let status = cb.status();
+        let injected = qwen35_fault_injected("select");
+        if status != metal::MTLCommandBufferStatus::Completed || injected {
             // `selected` and `logits` come from the scratch pool, which never zeroes what
             // it hands back, and the only writer is a dispatch in THIS command buffer. On
             // an errored buffer that dispatch never ran, so reading them returns the
@@ -17879,11 +17881,18 @@ impl Qwen35MetalDecode {
             // shares one bucket: the stale word is a small integer that lands inside the
             // vocabulary, decodes to a real token, and is fed straight back in as the next
             // input embedding. Refuse rather than invent a token.
-            eprintln!(
-                "[qwen35] Metal decode command buffer did not complete ({:?}); refusing the \
-                 step rather than emitting a stale scratch word as a token id",
-                cb.status()
-            );
+            if injected {
+                eprintln!(
+                    "[qwen35] Metal decode fault INJECTED by CAMELID_QWEN35_FAULT_INJECT \
+                     (buffer status was {status:?}); refusing the resident step so the caller can \
+                     fall back only when no output has been observed"
+                );
+            } else {
+                eprintln!(
+                    "[qwen35] Metal decode command buffer did not complete ({status:?}); refusing \
+                     the step rather than emitting a stale scratch word as a token id"
+                );
+            }
             keep.extend([normed, norm_scalar, logits, mm_scalar]);
             if let Some((selected, vocab_scalar)) = greedy_buffers {
                 keep.extend([selected, vocab_scalar]);
@@ -19536,7 +19545,7 @@ impl Lfm2MetalDecode {
             // vocabulary, decodes to a real token, and is fed straight back in as the next
             // input embedding. Refuse rather than invent a token.
             eprintln!(
-                "[qwen35] Metal decode command buffer did not complete ({:?}); refusing the \
+                "[lfm2] Metal decode command buffer did not complete ({:?}); refusing the \
                  step rather than emitting a stale scratch word as a token id",
                 cb.status()
             );

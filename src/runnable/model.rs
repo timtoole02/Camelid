@@ -2949,17 +2949,22 @@ impl RunnableModel {
         stream_tokens_observable: bool,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(all(not(target_os = "macos"), not(feature = "cuda")))]
         let _ = stream_tokens_observable;
 
         #[cfg(target_os = "macos")]
         if qwen35_metal_enabled() {
-            match self.generate_qwen35_metal(prompt, max_new, stop, sampling, on_token) {
-                Ok(tokens) => return Ok(tokens),
-                Err(err) => {
-                    eprintln!("[qwen35] resident Metal lane failed ({err}); using hybrid fallback");
-                }
-            }
+            return qwen35_accelerator_with_cpu_fallback(
+                on_token,
+                stream_tokens_observable,
+                "Metal",
+                |tracked_on_token| {
+                    self.generate_qwen35_metal(prompt, max_new, stop, sampling, tracked_on_token)
+                },
+                |fallback_on_token| {
+                    self.generate_qwen35_cpu(prompt, max_new, stop, sampling, fallback_on_token)
+                },
+            );
         }
         #[cfg(feature = "cuda")]
         {
@@ -2984,9 +2989,10 @@ impl RunnableModel {
             // from platform capability, so the default (auto) path is unchanged.
             let cuda_enabled = cuda_requested && crate::cuda::gpu_accel_enabled();
             if cuda_enabled {
-                return qwen35_cuda_with_cpu_fallback(
+                return qwen35_accelerator_with_cpu_fallback(
                     on_token,
                     stream_tokens_observable,
+                    "CUDA",
                     |tracked_on_token| {
                         self.generate_qwen35_cuda(prompt, max_new, stop, sampling, tracked_on_token)
                     },
@@ -4933,62 +4939,63 @@ fn qwen35_device_decode_chunk_len() -> usize {
         .unwrap_or(8)
 }
 
-/// Run the CUDA text lane with a CPU fallback that cannot replay tokens already
+/// Run an accelerated text lane with a CPU fallback that cannot replay tokens already
 /// delivered to a streaming client. Non-streaming callers pass `false` because
 /// their callback is deliberately unobservable, preserving the existing
-/// CUDA-to-CPU recovery behavior for [`RunnableModel::generate_qwen35`].
-#[cfg(feature = "cuda")]
-fn qwen35_cuda_with_cpu_fallback<T>(
+/// accelerator-to-CPU recovery behavior for [`RunnableModel::generate_qwen35`].
+fn qwen35_accelerator_with_cpu_fallback<T>(
     on_token: &mut dyn FnMut(u32),
     stream_tokens_observable: bool,
-    cuda: impl FnOnce(&mut dyn FnMut(u32)) -> Result<T>,
+    lane: &str,
+    accelerated: impl FnOnce(&mut dyn FnMut(u32)) -> Result<T>,
     cpu: impl FnOnce(&mut dyn FnMut(u32)) -> Result<T>,
 ) -> Result<T> {
     let mut emitted = false;
-    let cuda_result = {
+    let accelerated_result = {
         let mut tracked_on_token = |token| {
             emitted = true;
             on_token(token);
         };
-        cuda(&mut tracked_on_token)
+        accelerated(&mut tracked_on_token)
     };
 
-    match cuda_result {
+    match accelerated_result {
         Ok(value) => Ok(value),
         Err(error) if stream_tokens_observable && emitted => {
             eprintln!(
-                "[qwen35] CUDA lane failed after streaming output ({error}); refusing CPU replay"
+                "[qwen35] {lane} lane failed after streaming output ({error}); refusing CPU replay"
             );
             Err(error)
         }
         Err(error) => {
-            eprintln!("[qwen35] CUDA lane failed ({error}); falling back to CPU");
+            eprintln!("[qwen35] {lane} lane failed ({error}); falling back to CPU");
             cpu(on_token)
         }
     }
 }
 
-#[cfg(all(test, feature = "cuda"))]
-mod qwen35_cuda_fallback_tests {
+#[cfg(test)]
+mod qwen35_accelerator_fallback_tests {
     use std::cell::Cell;
 
-    use super::{qwen35_cuda_with_cpu_fallback, BackendError, Result};
+    use super::{qwen35_accelerator_with_cpu_fallback, BackendError, Result};
 
-    fn cuda_failure(message: &str) -> BackendError {
+    fn accelerator_failure(message: &str) -> BackendError {
         BackendError::InvalidTensorData(message.into())
     }
 
     #[test]
-    fn cuda_error_after_a_streamed_token_is_not_replayed_by_cpu() {
+    fn accelerator_error_after_a_streamed_token_is_not_replayed_by_cpu() {
         let fallback_called = Cell::new(false);
         let mut delivered = Vec::new();
 
-        let result: Result<Vec<u32>> = qwen35_cuda_with_cpu_fallback(
+        let result: Result<Vec<u32>> = qwen35_accelerator_with_cpu_fallback(
             &mut |token| delivered.push(token),
             true,
+            "test accelerator",
             |on_token| {
                 on_token(7);
-                Err(cuda_failure("late CUDA failure"))
+                Err(accelerator_failure("late accelerator failure"))
             },
             |on_token| {
                 fallback_called.set(true);
@@ -5003,14 +5010,15 @@ mod qwen35_cuda_fallback_tests {
     }
 
     #[test]
-    fn cuda_error_before_streaming_still_uses_cpu_fallback() {
+    fn accelerator_error_before_streaming_still_uses_cpu_fallback() {
         let fallback_called = Cell::new(false);
         let mut delivered = Vec::new();
 
-        let result = qwen35_cuda_with_cpu_fallback(
+        let result = qwen35_accelerator_with_cpu_fallback(
             &mut |token| delivered.push(token),
             true,
-            |_| Err(cuda_failure("early CUDA failure")),
+            "test accelerator",
+            |_| Err(accelerator_failure("early accelerator failure")),
             |on_token| {
                 fallback_called.set(true);
                 on_token(11);
@@ -5025,15 +5033,16 @@ mod qwen35_cuda_fallback_tests {
     }
 
     #[test]
-    fn non_streaming_generation_preserves_cuda_to_cpu_recovery() {
+    fn non_streaming_generation_preserves_accelerator_to_cpu_recovery() {
         let fallback_called = Cell::new(false);
 
-        let result = qwen35_cuda_with_cpu_fallback(
+        let result = qwen35_accelerator_with_cpu_fallback(
             &mut |_| {},
             false,
+            "test accelerator",
             |on_token| {
                 on_token(7);
-                Err(cuda_failure("late CUDA failure"))
+                Err(accelerator_failure("late accelerator failure"))
             },
             |_| {
                 fallback_called.set(true);
