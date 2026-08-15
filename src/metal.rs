@@ -17406,6 +17406,24 @@ enum Qwen35MetalStep {
     Logits(Vec<f32>),
 }
 
+/// Test hook, default OFF. `CAMELID_QWEN35_FAULT_INJECT=prefill|select|all` makes the
+/// named command buffer report as failed so the fail-closed paths can be exercised.
+///
+/// This exists because the defect those paths guard against is both rare and SILENT: a
+/// command buffer that errors at execution (GPU watchdog, working-set allocation failure)
+/// leaves the caches at their reset values, and the lane used to advance `filled` and
+/// return success anyway — so decode ran against an all-zero KV cache and emitted fluent
+/// in-vocab tokens unrelated to the prompt, at temperature 0, with no error raised. A real
+/// command-buffer error cannot be provoked on demand, so without an injection point the
+/// recovery path would ship untested.
+#[cfg(target_os = "macos")]
+fn qwen35_fault_injected(site: &str) -> bool {
+    static SITE: OnceLock<Option<String>> = OnceLock::new();
+    SITE.get_or_init(|| std::env::var("CAMELID_QWEN35_FAULT_INJECT").ok())
+        .as_deref()
+        .is_some_and(|want| want == site || want == "all")
+}
+
 #[cfg(target_os = "macos")]
 impl Qwen35MetalDecode {
     pub(crate) fn new(
@@ -17684,8 +17702,44 @@ impl Qwen35MetalDecode {
             encoder.end_encoding();
             cb.commit();
             cb.wait_until_completed();
+            // `wait_until_completed` returns for Error as well as Completed, and an
+            // errored command buffer ran NONE of its dispatches. Advancing `filled`
+            // anyway leaves cache_k/cache_v/conv_state/state exactly as `reset()` left
+            // them — all zeroes — while the caller believes the prompt is resident.
+            // Decode then generates from an empty KV cache and a zero recurrent state,
+            // which reads out as fluent-looking in-vocab tokens unrelated to the prompt,
+            // at temperature 0, with no error raised anywhere. Fail closed instead so the
+            // caller falls back to the CPU hybrid lane.
+            //
+            // This chunk is the largest submission the process makes (SLOTS_PER_COMMAND_BUFFER
+            // positions x every layer in one buffer), so it is the one a GPU watchdog kill or
+            // a working-set allocation failure actually claims. Every other resident lane in
+            // this file already gates on `status()`; qwen35 was the only one that did not.
+            let status = cb.status();
+            let injected = qwen35_fault_injected("prefill");
+            let completed = status == metal::MTLCommandBufferStatus::Completed && !injected;
             drop(owned);
             pool_recycle(k, keep);
+            if !completed {
+                // Say so out loud. This lane never read `status()`, so a fault left no
+                // trace anywhere — which is why the resulting soup was diagnosed as a
+                // model-quality problem for as long as it was. A silent fallback would
+                // preserve exactly that blind spot. Name the INJECTED case separately:
+                // a log line that reports a healthy `Completed` while claiming a failure
+                // is the same kind of misleading diagnostic this whole fix is about.
+                if injected {
+                    eprintln!(
+                        "[qwen35] Metal prefill fault INJECTED by CAMELID_QWEN35_FAULT_INJECT \
+                         (buffer status was {status:?}); falling back to the CPU lane"
+                    );
+                } else {
+                    eprintln!(
+                        "[qwen35] Metal prefill command buffer did not complete ({status:?}); \
+                         prompt not resident, falling back to the CPU lane for this request"
+                    );
+                }
+                return false;
+            }
             self.filled += chunk.len();
         }
         true
@@ -17816,6 +17870,27 @@ impl Qwen35MetalDecode {
         e.end_encoding();
         cb.commit();
         cb.wait_until_completed();
+        if cb.status() != metal::MTLCommandBufferStatus::Completed {
+            // `selected` and `logits` come from the scratch pool, which never zeroes what
+            // it hands back, and the only writer is a dispatch in THIS command buffer. On
+            // an errored buffer that dispatch never ran, so reading them returns the
+            // previous tenant of their size class. `pool_get` rounds to a power-of-two
+            // class, so every 4/8/12-byte scalar in the engine (dims, eps, positions)
+            // shares one bucket: the stale word is a small integer that lands inside the
+            // vocabulary, decodes to a real token, and is fed straight back in as the next
+            // input embedding. Refuse rather than invent a token.
+            eprintln!(
+                "[qwen35] Metal decode command buffer did not complete ({:?}); refusing the \
+                 step rather than emitting a stale scratch word as a token id",
+                cb.status()
+            );
+            keep.extend([normed, norm_scalar, logits, mm_scalar]);
+            if let Some((selected, vocab_scalar)) = greedy_buffers {
+                keep.extend([selected, vocab_scalar]);
+            }
+            pool_recycle(k, keep);
+            return None;
+        }
         let output = match &greedy_buffers {
             Some((selected, _)) => {
                 Qwen35MetalStep::Token(unsafe { *(selected.contents() as *const u32) })
@@ -19451,6 +19526,27 @@ impl Lfm2MetalDecode {
         e.end_encoding();
         cb.commit();
         cb.wait_until_completed();
+        if cb.status() != metal::MTLCommandBufferStatus::Completed {
+            // `selected` and `logits` come from the scratch pool, which never zeroes what
+            // it hands back, and the only writer is a dispatch in THIS command buffer. On
+            // an errored buffer that dispatch never ran, so reading them returns the
+            // previous tenant of their size class. `pool_get` rounds to a power-of-two
+            // class, so every 4/8/12-byte scalar in the engine (dims, eps, positions)
+            // shares one bucket: the stale word is a small integer that lands inside the
+            // vocabulary, decodes to a real token, and is fed straight back in as the next
+            // input embedding. Refuse rather than invent a token.
+            eprintln!(
+                "[qwen35] Metal decode command buffer did not complete ({:?}); refusing the \
+                 step rather than emitting a stale scratch word as a token id",
+                cb.status()
+            );
+            keep.extend([normed, norm_scalar, logits, mm_scalar]);
+            if let Some((selected, vocab_scalar)) = greedy_buffers {
+                keep.extend([selected, vocab_scalar]);
+            }
+            pool_recycle(k, keep);
+            return None;
+        }
         let output = match &greedy_buffers {
             Some((selected, _)) => {
                 Qwen35MetalStep::Token(unsafe { *(selected.contents() as *const u32) })
@@ -19936,8 +20032,20 @@ impl Lfm2MetalDecode {
         e.end_encoding();
         cb.commit();
         cb.wait_until_completed();
+        // Same contract as the qwen35 prefill: an errored command buffer ran none of its
+        // dispatches, so advancing `filled` would claim a prompt the caches never saw.
+        // Fail closed and let the caller fall back rather than decode from empty state.
+        let status = cb.status();
+        let completed = status == metal::MTLCommandBufferStatus::Completed;
         keep.push(norm_scalar);
         pool_recycle(k, keep);
+        if !completed {
+            eprintln!(
+                "[lfm2] Metal prefill command buffer did not complete ({status:?}); prompt not \
+                 resident, falling back to the CPU lane for this request"
+            );
+            return None;
+        }
         self.filled += n_tokens;
         Some(())
     }
