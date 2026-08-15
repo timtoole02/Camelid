@@ -2322,6 +2322,12 @@ pub fn run_loop(
     // `note_no_progress`).
     let mut call_counts: HashMap<String, (usize, String)> = HashMap::new();
     let mut recovered_call_signatures = BTreeSet::new();
+    // A deterministic local model can ignore one textual repeat correction
+    // and select the same highest-logit observation tool again. During that
+    // single recovery epoch, omit the repeated observation tool from the
+    // native schema as well as explaining why. Any successful different tool
+    // restores the normal stable vocabulary.
+    let mut temporarily_suppressed_paging_tool: Option<String> = None;
     let mut error_argument_churn = ErrorArgumentChurn::default();
     let mut total_tool_calls = 0usize;
     let mut plan_updates = 0usize;
@@ -2638,6 +2644,9 @@ pub fn run_loop(
                 };
             let current_action = current_action_with_paging_feedback(current_action, history);
             let mut capsule_tools = tools.clone();
+            if let Some(suppressed) = temporarily_suppressed_paging_tool.as_deref() {
+                capsule_tools.retain(|tool| tool.name != suppressed);
+            }
             if direct_creation_target.is_some() {
                 capsule_tools.retain(|tool| tool.name == "write_file");
             } else if phase == ActionPhase::Verify && paging_shell_verification_required {
@@ -2853,13 +2862,13 @@ pub fn run_loop(
                             // from another fault.
                             if capsule.exact_page_ids.contains(&page.id) {
                                 runtime.ledger.failed_attempts.push(format!(
-                                    "NEED_CONTEXT duplicate: {} was already included as exact source",
+                                    "exact-source request duplicate: {} was already included",
                                     page.symbol_id
                                 ));
                                 runtime.ledger.current_focus = format!(
                                     "The exact source for {} is ALREADY in this capsule. Do not \
-                                     request it again: act on it now with one hash-checked PATCH \
-                                     or edit_file call.",
+                                     request it again: use edit_file now with exact current old \
+                                     text and the intended replacement.",
                                     page.symbol_id
                                 );
                                 if let Err(error) = runtime.save() {
@@ -2884,7 +2893,7 @@ pub fn run_loop(
                             runtime
                                 .ledger
                                 .failed_attempts
-                                .push(format!("NEED_CONTEXT rejected: {error}"));
+                                .push(format!("exact-source request rejected: {error}"));
                             if let Err(save_error) = runtime.save() {
                                 reporter
                                     .notice(&format!("context paging state error: {save_error}"));
@@ -2911,18 +2920,21 @@ pub fn run_loop(
                             runtime
                                 .ledger
                                 .failed_attempts
-                                .push(format!("PATCH rejected: {error}"));
+                                .push(format!("page replacement rejected: {error}"));
                             let message = error.to_string();
                             if message.contains("body fragment") {
                                 runtime.ledger.current_focus = concat!(
-                                    "The last PATCH was a body fragment. PATCH replaces the ",
-                                    "ENTIRE exact page: resend it with the full declaration ",
-                                    "line and every existing member plus your addition."
+                                    "The proposed replacement was only a body fragment. Read the ",
+                                    "target with read_file, then use edit_file with exact current ",
+                                    "old text and the complete intended replacement."
                                 )
                                 .into();
                             } else {
-                                runtime.ledger.current_focus =
-                                    "Reload exact source and produce a hash-matched patch".into();
+                                runtime.ledger.current_focus = concat!(
+                                    "Read the target with read_file, then retry with edit_file ",
+                                    "using exact current old text."
+                                )
+                                .into();
                             }
                             // Two rejected typed patches mean this model cannot
                             // author a page replacement. Pin the complete file
@@ -2941,10 +2953,10 @@ pub fn run_loop(
                                     if let Some(file) = file {
                                         if runtime.need_context(&file).is_ok() {
                                             runtime.ledger.current_focus = concat!(
-                                                "Typed PATCH failed repeatedly. Call write_file ",
-                                                "with the COMPLETE corrected file (the full ",
-                                                "exact source is in this capsule) including ",
-                                                "your addition."
+                                                "Narrow replacement failed repeatedly. Call ",
+                                                "write_file with the COMPLETE corrected file ",
+                                                "including every existing requirement and your ",
+                                                "intended change."
                                             )
                                             .into();
                                         }
@@ -2956,7 +2968,7 @@ pub fn run_loop(
                                     .notice(&format!("context paging state error: {save_error}"));
                                 return LoopEnd::DriverError;
                             }
-                            reporter.notice(&format!("typed patch rejected: {error}"));
+                            reporter.notice(&format!("page replacement rejected: {error}"));
                             paging_no_progress!();
                             continue;
                         }
@@ -3891,9 +3903,12 @@ pub fn run_loop(
                             .ledger
                             .failed_attempts
                             .push(format!("{call_name} rejected: {message}"));
-                        runtime.ledger.current_focus =
-                            "Load exact source with NEED_CONTEXT, then issue a hash-checked PATCH"
-                                .into();
+                        runtime.ledger.current_focus = format!(
+                            "The source has not failed verification: `{call_name}` was rejected \
+                             because its exact edit source did not match. Read the target with \
+                             read_file, then retry edit_file using exact current old text; use \
+                             write_file only for a complete-file replacement."
+                        );
                         paging_action_rejections = paging_action_rejections.saturating_add(1);
                         if let Err(save_error) = runtime.save() {
                             reporter.notice(&format!("context paging state error: {save_error}"));
@@ -4365,6 +4380,13 @@ pub fn run_loop(
                             .push((action.tool_name().to_string(), outcome.text().to_string()));
                     }
                     let name = action.tool_name();
+                    if !outcome.is_err()
+                        && temporarily_suppressed_paging_tool
+                            .as_deref()
+                            .is_some_and(|suppressed| suppressed != name)
+                    {
+                        temporarily_suppressed_paging_tool = None;
+                    }
                     reporter.tool_result(name, &outcome);
                     let host_python_verification = if context_paging.is_some()
                         && read_captures_pending_path
@@ -4707,6 +4729,18 @@ pub fn run_loop(
                                         )
                                     })
                                     .flatten();
+                                let unittest_discovery_retry = raw_outcome
+                                    .is_err()
+                                    .then(|| {
+                                        python_unittest_discovery_retry_command(
+                                            command,
+                                            raw_outcome.text(),
+                                            &task_objective,
+                                            &runtime.ledger.completed_work,
+                                            &required_workspace_artifacts,
+                                        )
+                                    })
+                                    .flatten();
                                 let tests_required = objective_requests_test_execution(
                                     &task_objective,
                                     &runtime.ledger.completed_work,
@@ -4813,6 +4847,18 @@ pub fn run_loop(
                                     ));
                                     runtime.ledger.current_focus = format!(
                                         "The application was invoked with the wrong Python import root; the source has not yet failed verification. Retry now with run_shell using exactly `{retry}`."
+                                    );
+                                } else if let Some(retry) = unittest_discovery_retry {
+                                    paging_shell_verification_required = workspace_changed
+                                        && tools.iter().any(|tool| tool.name == "run_shell");
+                                    paging_diagnostic = None;
+                                    runtime.ledger.verification_state.status = "pending".into();
+                                    runtime.ledger.verification_state.failing_diagnostic = None;
+                                    runtime.ledger.failed_attempts.push(format!(
+                                        "`{command}` imposed an importable unittest top-level that this project does not provide; retry with `{retry}`"
+                                    ));
+                                    runtime.ledger.current_focus = format!(
+                                        "The source has not failed verification: unittest discovery used an incompatible top-level package setting. Retry now with run_shell using exactly `{retry}`; do not create package marker files merely to satisfy the rejected invocation."
                                     );
                                 } else if raw_outcome.is_err() {
                                     // The diagnostic needs source repair, so
@@ -5224,11 +5270,21 @@ pub fn run_loop(
                         continue;
                     }
                     if recover_now {
+                        if context_paging.is_some()
+                            && matches!(
+                                &action,
+                                Action::ReadFile { .. }
+                                    | Action::ListDir { .. }
+                                    | Action::Search { .. }
+                            )
+                        {
+                            temporarily_suppressed_paging_tool = Some(name.to_string());
+                        }
                         reporter.notice(&format!(
                             "recovering: `{name}` returned the same result twice; requiring a different action"
                         ));
                         push_reminder(history, &format!(
-                            "Runtime loop recovery: `{name}` with those arguments has already returned the same result twice. Treat that observation as settled and DO NOT call it again with the same arguments. Choose a different action that advances the user's request now. If a directory listing established that the workspace is empty and the user asked you to create code, call `write_file` now; do not inspect the empty directory again."
+                            "Runtime loop recovery: `{name}` with those arguments has already returned the same result twice. Treat that observation as settled; the repeated observation tool is temporarily unavailable until a different action succeeds. Choose another advertised native tool that advances the user's request now. If a directory listing established that the workspace is empty and the user asked you to create code, call `write_file` now; do not inspect the empty directory again."
                         ));
                         continue;
                     }
@@ -6033,6 +6089,30 @@ fn python_package_module_retry_command(command: &str, output: &str) -> Option<St
         return Some(format!("{launcher} -m {module}{suffix}"));
     }
     None
+}
+
+/// `unittest discover -t <root>` requires the start directory to be an
+/// importable package. Small models often add `-t .` even when the authored
+/// tests are ordinary filesystem-discovered modules. When that setup-only
+/// failure occurs, steer back to the narrower host-derived discovery command;
+/// do not tell the model to modify application source or manufacture package
+/// marker files that the user's project never required.
+fn python_unittest_discovery_retry_command(
+    command: &str,
+    output: &str,
+    objective: &str,
+    completed_work: &[String],
+    required_artifacts: &BTreeSet<String>,
+) -> Option<String> {
+    if !output
+        .to_ascii_lowercase()
+        .contains("start directory is not importable")
+    {
+        return None;
+    }
+    let expected = host_python_unittest_command(objective, completed_work, required_artifacts)?;
+    (normalize_manual_validation_command(command) != normalize_manual_validation_command(&expected))
+        .then_some(expected)
 }
 
 /// Everything outside `<think>…</think>`, trimmed.
@@ -11057,6 +11137,87 @@ mod tests {
     }
 
     #[test]
+    fn paging_wrong_old_recovery_uses_only_advertised_native_tools() {
+        let _checkpoint_guard = super::super::checkpoint::tests::cp_lock();
+        struct NativeRecoveryDriver {
+            step: usize,
+        }
+        impl ModelDriver for NativeRecoveryDriver {
+            fn step(
+                &mut self,
+                history: &[AgentMsg],
+                tools: &[ToolSpec],
+            ) -> Result<ModelStep, String> {
+                let [AgentMsg::User(capsule)] = history else {
+                    return Err("paging must send one fresh capsule".into());
+                };
+                let response = match self.step {
+                    0 => ModelStep::Calls(vec![tc("read_file", json!({"path": "src/lib.rs"}))]),
+                    1 => ModelStep::Calls(vec![tc(
+                        "edit_file",
+                        json!({
+                            "path": "src/lib.rs",
+                            "old": "value + 99",
+                            "new": "value + 2"
+                        }),
+                    )]),
+                    2 => {
+                        assert!(capsule.contains("source has not failed verification"));
+                        assert!(capsule.contains("Read the target with read_file"));
+                        assert!(!capsule.contains("NEED_CONTEXT"), "{capsule}");
+                        assert!(!capsule.contains("hash-checked PATCH"), "{capsule}");
+                        assert!(tools.iter().any(|tool| tool.name == "edit_file"));
+                        ModelStep::Calls(vec![tc(
+                            "edit_file",
+                            json!({
+                                "path": "src/lib.rs",
+                                "old": "value + 1",
+                                "new": "value + 2"
+                            }),
+                        )])
+                    }
+                    3 => ModelStep::Calls(vec![tc("read_file", json!({"path": "src/lib.rs"}))]),
+                    4 => ModelStep::Calls(vec![tc(
+                        "run_shell",
+                        json!({
+                            "command": "rustc --crate-type lib src/lib.rs --emit metadata -o check.rmeta"
+                        }),
+                    )]),
+                    _ => {
+                        assert!(tools.is_empty());
+                        ModelStep::Text("Corrected and verified src/lib.rs.".into())
+                    }
+                };
+                self.step += 1;
+                Ok(response)
+            }
+        }
+
+        let (directory, sandbox) = paging_workspace();
+        let mut driver = NativeRecoveryDriver { step: 0 };
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(
+            "Correct src/lib.rs so increment adds two, then verify it.".into(),
+        )];
+        let end = run_loop(
+            &mut driver,
+            &mut ScriptApprover(vec![Decision::Once, Decision::Once], 0),
+            &mut reporter,
+            &sandbox,
+            &paging_cfg(directory.path()),
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
+        assert!(std::fs::read_to_string(directory.path().join("src/lib.rs"))
+            .unwrap()
+            .contains("value + 2"));
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+    }
+
+    #[test]
     fn paging_full_rewrite_restores_writer_removed_after_noop_overwrite() {
         let _checkpoint_guard = super::super::checkpoint::tests::cp_lock();
         struct RecoveryDriver {
@@ -12236,6 +12397,25 @@ mod tests {
                 .as_deref(),
                 Some("python3 -m unittest discover -s taskforge/tests")
             );
+            assert_eq!(
+                python_unittest_discovery_retry_command(
+                    "python3 -m unittest discover -s taskforge/tests -t .",
+                    "ImportError: Start directory is not importable: 'taskforge/tests'",
+                    "Create and run the unittest suite",
+                    &["write_file changed taskforge/tests/test_queue.py".to_string()],
+                    &aliased_suite,
+                )
+                .as_deref(),
+                Some("python3 -m unittest discover -s taskforge/tests")
+            );
+            assert!(python_unittest_discovery_retry_command(
+                "python3 -m unittest discover -s taskforge/tests",
+                "ImportError: Start directory is not importable: 'taskforge/tests'",
+                "Create and run the unittest suite",
+                &["write_file changed taskforge/tests/test_queue.py".to_string()],
+                &aliased_suite,
+            )
+            .is_none());
         }
         assert!(!paging_verification_command_is_relevant(
             "cd taskforge && env PYTHONPATH=. python3 -m unittest discover -s tests",
@@ -16012,6 +16192,82 @@ mod tests {
             .notices
             .iter()
             .any(|notice| notice.contains("recovering:")));
+    }
+
+    #[test]
+    fn paging_repeat_recovery_suppresses_the_repeated_observation_until_progress() {
+        let _checkpoint_guard = super::super::checkpoint::tests::cp_lock();
+        struct RecoveryDriver {
+            step: usize,
+        }
+        impl ModelDriver for RecoveryDriver {
+            fn step(
+                &mut self,
+                history: &[AgentMsg],
+                tools: &[ToolSpec],
+            ) -> Result<ModelStep, String> {
+                let [AgentMsg::User(capsule)] = history else {
+                    return Err("paging must send one fresh capsule".into());
+                };
+                let response = match self.step {
+                    0 | 1 => {
+                        assert!(tools.iter().any(|tool| tool.name == "list_dir"));
+                        ModelStep::Calls(vec![tc("list_dir", json!({"path": "."}))])
+                    }
+                    2 => {
+                        assert!(!tools.iter().any(|tool| tool.name == "list_dir"));
+                        assert!(tools.iter().any(|tool| tool.name == "write_file"));
+                        assert!(capsule.contains("temporarily unavailable"), "{capsule}");
+                        ModelStep::Calls(vec![tc(
+                            "write_file",
+                            json!({"path": "game.py", "content": "print('ready')\n"}),
+                        )])
+                    }
+                    3 => {
+                        assert!(
+                            tools.iter().any(|tool| tool.name == "list_dir"),
+                            "a successful different action must restore the normal vocabulary"
+                        );
+                        ModelStep::Calls(vec![tc("read_file", json!({"path": "game.py"}))])
+                    }
+                    _ => {
+                        assert!(tools.is_empty());
+                        ModelStep::Text("Created and verified game.py.".into())
+                    }
+                };
+                self.step += 1;
+                Ok(response)
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::new(directory.path(), false, Duration::from_secs(5))
+            .unwrap()
+            .with_shell_mode(ShellSandbox::Sandboxed);
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
+        let mut driver = RecoveryDriver { step: 0 };
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User(
+            "Create game.py containing a small standard-library program.".into(),
+        )];
+        let end = run_loop(
+            &mut driver,
+            &mut ScriptApprover(vec![Decision::Once], 0),
+            &mut reporter,
+            &sandbox,
+            &paging_cfg(directory.path()),
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+
+        assert_eq!(end, LoopEnd::Answered, "notices: {:?}", reporter.notices);
+        assert_eq!(driver.step, 5);
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("game.py")).unwrap(),
+            "print('ready')\n"
+        );
+        super::super::checkpoint::clear_for_workspace(sandbox.root());
     }
 
     #[test]

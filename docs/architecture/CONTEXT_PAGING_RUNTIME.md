@@ -136,7 +136,9 @@ diagnostic. The earlier typed actions
 (`NEED_CONTEXT`, `PATCH`, `SEARCH`, `RUN_TEST`, `INSPECT_DIAGNOSTIC`,
 `UPDATE_PLAN`, `COMPLETE`, and `BLOCKED`) remain accepted for persisted/older
 clients but are no longer advertised in the stable kernel. Typed `PATCH` still
-requires a complete exact-page replacement and the expected file hash.
+requires a complete exact-page replacement and the expected file hash, but any
+recovery after a legacy typed action is expressed back to the model only with
+advertised native `read_file`, `edit_file`, or `write_file` calls.
 Explicit relative artifact names in the immutable objective form a conservative
 host-owned completion manifest. Missing entries keep the runtime in Modify even
 after an earlier file passed verification, preventing multi-file creation from
@@ -190,7 +192,11 @@ The paging loop is bounded: 16 consecutive model steps that execute no workspace
 action end the run. A trailing host retry reminder is copied, bounded, into the
 next capsule's mandatory `currentAction`; this prevents invalid native calls,
 malformed envelopes, or capped replies from receiving a byte-identical retry
-prompt. Any later tool result consumes that one-shot feedback. An exact-tokenizer
+prompt. When a deterministic model repeats the same successful observation
+twice, that observation tool is also omitted from the next native schema until
+a different action succeeds; the recovery changes what the model can select
+instead of relying on prose alone. Any later tool result consumes the one-shot
+feedback. An exact-tokenizer
 overflow recalibrates the estimator from the measured count and rebuilds a
 smaller capsule (up to 3 times per run) instead of failing the run.
 
