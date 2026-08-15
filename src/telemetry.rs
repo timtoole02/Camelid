@@ -98,7 +98,7 @@ pub enum Event {
     PrefillStarted {
         prefill_tokens: usize,
         /// Which real prefill lane ran: "gpu_resident" | "layer_major" |
-        /// "chunked" | "single_token".
+        /// "chunked" | "cooperative_chunked" | "single_token".
         path: &'static str,
         layers_total: usize,
     },

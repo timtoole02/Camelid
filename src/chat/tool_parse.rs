@@ -637,6 +637,62 @@ fn first_json_array(s: &str) -> Option<&str> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn tool_call_parser_corpus_accepts_unambiguous_variants_and_rejects_truncation() {
+        let accepted = [
+            (
+                "qwen3",
+                r#"<tool_call>{"name":"read_file","arguments":{"path":"src/lib.rs"}}</tool_call>"#,
+                "read_file",
+                "src/lib.rs",
+            ),
+            // A complete JSON object is still unambiguous when a small model
+            // omits only the decorative closing tag.
+            (
+                "qwen3",
+                r#"<tool_call>{"name":"read_file","arguments":{"path":"src/lib.rs"}}"#,
+                "read_file",
+                "src/lib.rs",
+            ),
+            (
+                "mistral",
+                r#"[TOOL_CALLS] [{"name":"read_file","arguments":{"path":"src/lib.rs"}}]"#,
+                "read_file",
+                "src/lib.rs",
+            ),
+            (
+                "ornith",
+                "<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/lib.rs\n</parameter>\n</function>\n</tool_call>",
+                "read_file",
+                "src/lib.rs",
+            ),
+            (
+                "qwen3",
+                r#"read_file({"path":"src/lib.rs"})"#,
+                "read_file",
+                "src/lib.rs",
+            ),
+        ];
+        for (family, text, expected_name, expected_path) in accepted {
+            let calls = parse(text, family);
+            assert_eq!(calls.len(), 1, "family={family}, text={text}");
+            assert_eq!(calls[0].name, expected_name);
+            assert_eq!(calls[0].args["path"], expected_path);
+        }
+
+        for truncated_or_ambiguous in [
+            r#"<tool_call>{"name":"read_file","arguments":{"path":"src/lib.rs""#,
+            r#"<tool_call>{"arguments":{"path":"src/lib.rs"}}</tool_call>"#,
+            r#"I might call read_file({"path":"src/lib.rs"}) after checking."#,
+            r#"<tool_call><function=read_file><parameter=path>src/lib.rs"#,
+        ] {
+            assert!(
+                parse(truncated_or_ambiguous, "qwen3").is_empty(),
+                "must not fabricate a call from {truncated_or_ambiguous}"
+            );
+        }
+    }
+
     /// The live failure that killed a Code turn: Qwen over-escapes `$` inside a
     /// run_shell command, and the command also contains escaped quotes `\"`. The
     /// `\"` used to desync the repair's in-string tracker so the later `\$` was

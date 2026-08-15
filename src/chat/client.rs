@@ -564,29 +564,7 @@ impl Client {
                         .pointer("/choices/0/delta/tool_calls")
                         .and_then(Value::as_array)
                     {
-                        for (fallback_index, call) in calls.iter().enumerate() {
-                            let index = call
-                                .get("index")
-                                .and_then(Value::as_u64)
-                                .and_then(|value| usize::try_from(value).ok())
-                                .unwrap_or(fallback_index);
-                            while tool_calls.len() <= index {
-                                tool_calls.push(ToolCallOut {
-                                    name: String::new(),
-                                    arguments: String::new(),
-                                });
-                            }
-                            let accumulated = &mut tool_calls[index];
-                            if let Some(name) =
-                                call.pointer("/function/name").and_then(Value::as_str)
-                            {
-                                accumulated.name.push_str(name);
-                            }
-                            if let Some(arguments) =
-                                call.pointer("/function/arguments").and_then(Value::as_str)
-                            {
-                                accumulated.arguments.push_str(arguments);
-                            }
+                        if accumulate_stream_tool_call_deltas(&mut tool_calls, calls) {
                             ttft_ms.get_or_insert_with(|| {
                                 started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
                             });
@@ -801,6 +779,35 @@ pub struct ChatTurn {
 pub struct ToolCallOut {
     pub name: String,
     pub arguments: String,
+}
+
+/// Fold one OpenAI streaming `delta.tool_calls` array into its logical calls.
+/// Names and arguments may be split at any UTF-8 boundary, and calls may
+/// arrive out of order by `index`.
+fn accumulate_stream_tool_call_deltas(tool_calls: &mut Vec<ToolCallOut>, calls: &[Value]) -> bool {
+    let mut observed = false;
+    for (fallback_index, call) in calls.iter().enumerate() {
+        let index = call
+            .get("index")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(fallback_index);
+        while tool_calls.len() <= index {
+            tool_calls.push(ToolCallOut {
+                name: String::new(),
+                arguments: String::new(),
+            });
+        }
+        let accumulated = &mut tool_calls[index];
+        if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
+            accumulated.name.push_str(name);
+        }
+        if let Some(arguments) = call.pointer("/function/arguments").and_then(Value::as_str) {
+            accumulated.arguments.push_str(arguments);
+        }
+        observed = true;
+    }
+    observed
 }
 
 /// Extract the assistant turn (content + structured tool calls + token counts)
@@ -1439,6 +1446,73 @@ mod tests {
             r#"{"path":"agent-proof.txt"}"#
         );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn structured_tool_call_corpus_survives_every_utf8_fragment_boundary() {
+        let name = "write_file";
+        let arguments = r#"{"path":"src/λ.rs","content":"fn main() {}\n"}"#;
+        let boundaries = |text: &str| {
+            text.char_indices()
+                .map(|(index, _)| index)
+                .chain(std::iter::once(text.len()))
+                .collect::<Vec<_>>()
+        };
+
+        for name_split in boundaries(name) {
+            for arguments_split in boundaries(arguments) {
+                let mut calls = Vec::new();
+                let first = json!([{
+                    "index": 0,
+                    "function": {
+                        "name": &name[..name_split],
+                        "arguments": &arguments[..arguments_split],
+                    }
+                }]);
+                let second = json!([{
+                    "index": 0,
+                    "function": {
+                        "name": &name[name_split..],
+                        "arguments": &arguments[arguments_split..],
+                    }
+                }]);
+                assert!(accumulate_stream_tool_call_deltas(
+                    &mut calls,
+                    first.as_array().unwrap()
+                ));
+                assert!(accumulate_stream_tool_call_deltas(
+                    &mut calls,
+                    second.as_array().unwrap()
+                ));
+                assert_eq!(
+                    calls,
+                    vec![ToolCallOut {
+                        name: name.to_string(),
+                        arguments: arguments.to_string(),
+                    }],
+                    "fragment boundary name={name_split}, args={arguments_split}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn structured_tool_call_corpus_uses_indices_for_interleaved_calls() {
+        let mut calls = Vec::new();
+        for delta in [
+            json!([{"index": 1, "function": {"name": "list_", "arguments": "{\"pa"}}]),
+            json!([{"index": 0, "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}}]),
+            json!([{"index": 1, "function": {"name": "dir", "arguments": "th\":\".\"}"}}]),
+        ] {
+            assert!(accumulate_stream_tool_call_deltas(
+                &mut calls,
+                delta.as_array().unwrap()
+            ));
+        }
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments, r#"{"path":"a.rs"}"#);
+        assert_eq!(calls[1].name, "list_dir");
+        assert_eq!(calls[1].arguments, r#"{"path":"."}"#);
     }
 
     #[test]

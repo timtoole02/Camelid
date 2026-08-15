@@ -21538,6 +21538,14 @@ fn run_stream_decode_job(
 /// Cooperative streaming state machine for continuous batching. Unlike
 /// `run_stream_decode_job`, one call to `step` performs at most one model token and then
 /// yields ownership back to the engine scheduler.
+struct CooperativePrefillState {
+    prompt_tokens: usize,
+    prefill_tokens: usize,
+    cursor: usize,
+    chunk_tokens: usize,
+    timings: LlamaForwardTimings,
+}
+
 struct CooperativeStreamDecodeJob {
     prepared: PreparedGeneration,
     events: tokio::sync::mpsc::Sender<StreamDecodeEvent>,
@@ -21555,6 +21563,7 @@ struct CooperativeStreamDecodeJob {
     streamed_text: String,
     first_content_ms: Option<u128>,
     forward_timings: LlamaForwardTimings,
+    cooperative_prefill: Option<CooperativePrefillState>,
     sample: u128,
     finished: bool,
     #[cfg(test)]
@@ -21636,6 +21645,7 @@ impl CooperativeStreamDecodeJob {
             streamed_text,
             first_content_ms,
             forward_timings: LlamaForwardTimings::default(),
+            cooperative_prefill: None,
             sample,
             finished: false,
             #[cfg(test)]
@@ -21751,6 +21761,101 @@ impl CooperativeStreamDecodeJob {
             return engine::StepOutcome::Complete;
         }
 
+        // The CPU path already evaluates long prompts in fixed-size chunks.
+        // Under contention, expose those exact chunk boundaries to the engine
+        // scheduler so another stream can run between them. The decision is
+        // made once, before the first prompt token is evaluated; a lone stream
+        // and every resident/layer-major/windowed lane retain their existing
+        // run-to-completion prefill.
+        if self.cooperative_prefill.is_none()
+            && self.generated.is_empty()
+            && context.active_slots > 1
+            && self.input.len() > 1
+        {
+            let prefill_tokens = self.input.len() - 1;
+            if let Some(chunk_tokens) = self
+                .prepared
+                .session
+                .cooperative_prefill_chunk_tokens(prefill_tokens)
+            {
+                telemetry::emit(telemetry::Event::PrefillStarted {
+                    prefill_tokens,
+                    path: "cooperative_chunked",
+                    layers_total: self.prepared.session.weights.layers.len(),
+                });
+                self.cooperative_prefill = Some(CooperativePrefillState {
+                    prompt_tokens: self.input.len(),
+                    prefill_tokens,
+                    cursor: 0,
+                    chunk_tokens,
+                    timings: LlamaForwardTimings::default(),
+                });
+            }
+        }
+
+        if self
+            .cooperative_prefill
+            .as_ref()
+            .is_some_and(|state| state.cursor < state.prefill_tokens)
+        {
+            let (start, end, total) = {
+                let state = self.cooperative_prefill.as_ref().expect("checked above");
+                (
+                    state.cursor,
+                    (state.cursor + state.chunk_tokens).min(state.prefill_tokens),
+                    state.prefill_tokens,
+                )
+            };
+            let result = self
+                .prepared
+                .session
+                .cooperative_prefill_chunk(&self.input[start..end]);
+            let chunk_timings = match result {
+                Ok(timings) => timings,
+                Err(err) => {
+                    let response = api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "generation_step_failed",
+                        err.to_string(),
+                        None,
+                    );
+                    return self.fail(&response);
+                }
+            };
+            let state = self
+                .cooperative_prefill
+                .as_mut()
+                .expect("cooperative prefill remains active");
+            state.cursor = end;
+            state.timings.add_assign(&chunk_timings);
+            telemetry::emit(telemetry::Event::PrefillProgress {
+                tokens_done: end,
+                tokens_total: total,
+            });
+            self.prepared.engine_progress.record_progress(end);
+            tracing::debug!(
+                target: "camelid::prefill",
+                decision = "cooperative_yield",
+                chunk_start = start,
+                chunk_end = end,
+                prefill_tokens = total,
+                active_slots = context.active_slots,
+                "yielding between numerically identical CPU prefill chunks"
+            );
+            return engine::StepOutcome::Continue;
+        }
+
+        let completed_prefill = self.cooperative_prefill.take();
+        if let Some(state) = &completed_prefill {
+            debug_assert_eq!(state.cursor, state.prefill_tokens);
+            let final_prompt_token = self.input[state.prefill_tokens];
+            self.input.clear();
+            self.input.push(final_prompt_token);
+            telemetry::emit(telemetry::Event::DecodeStarted {
+                context_position: self.prepared.session.kv_position(),
+            });
+        }
+
         let generated_index = self.generated.len();
         let collect_dense_for_step =
             collect_dense_diagnostics_for_generated_index(&self.prepared, generated_index);
@@ -21767,7 +21872,7 @@ impl CooperativeStreamDecodeJob {
             && matches!(sampler, LlamaSampler::Greedy)
             && !collect_dense_for_step
             && !self.top_logits.is_empty();
-        let step = match run_stream_step(
+        let mut step = match run_stream_step(
             &mut self.prepared.session,
             StreamStepRequest {
                 greedy_fast,
@@ -21780,6 +21885,12 @@ impl CooperativeStreamDecodeJob {
             Ok(step) => step,
             Err(response) => return self.fail(&response),
         };
+        if let Some(prefill) = completed_prefill {
+            step.prompt_token_count = prefill.prompt_tokens;
+            step.prefill_token_count = prefill.prefill_tokens;
+            step.timings.add_assign(&prefill.timings);
+            step.prefill_timings.add_assign(&prefill.timings);
+        }
         if self.generated.is_empty()
             && !self.prepared.collect_dense_diagnostics
             && step.diagnostics.is_none()
@@ -25594,6 +25705,48 @@ mod tests {
     }
 
     #[test]
+    fn api_and_agent_tool_call_parsers_agree_on_the_shared_corpus() {
+        for (family, text) in [
+            (
+                "qwen3",
+                r#"<tool_call>{"name":"read_file","arguments":{"path":"src/lib.rs"}}</tool_call>"#,
+            ),
+            (
+                "mistral",
+                r#"[TOOL_CALLS] [{"name":"list_dir","arguments":{"path":"."}}]"#,
+            ),
+            (
+                "llama_bpe_decoder",
+                r#"<|python_tag|>{"name":"search","parameters":{"query":"TODO","path":"src"}}"#,
+            ),
+            (
+                "qwen3",
+                r#"<tool_call>{"name":"write_file","arguments":{"path":"quote.py","content":"print('it\'s valid')\n"}}</tool_call>"#,
+            ),
+        ] {
+            let api = parse_tool_calls(text).expect("API parser accepts corpus entry");
+            let agent = crate::chat::tool_parse::parse(text, family);
+            assert_eq!(api.len(), agent.len(), "family={family}, text={text}");
+            for (api, agent) in api.iter().zip(&agent) {
+                assert_eq!(api.function.name, agent.name);
+                let api_args: serde_json::Value =
+                    serde_json::from_str(&api.function.arguments).unwrap();
+                assert_eq!(api_args, agent.args);
+            }
+        }
+
+        for truncated in [
+            r#"<tool_call>{"name":"read_file","arguments":{"path":"src/lib.rs""#,
+            r#"[TOOL_CALLS] [{"name":"read_file","arguments":{"path":"src/lib.rs"}"#,
+        ] {
+            assert!(
+                parse_tool_calls(truncated).is_none(),
+                "truncated output must stay content instead of fabricating a tool call"
+            );
+        }
+    }
+
+    #[test]
     fn chat_message_accepts_tool_call_roundtrip_wire_shape() {
         let assistant: ChatMessage = serde_json::from_value(serde_json::json!({
             "role": "assistant",
@@ -28877,6 +29030,141 @@ mod tests {
             "decode resumes from the cached token, not from the whole prompt"
         );
         std::env::remove_var("CAMELID_CUDA_RESIDENT_DECODE");
+    }
+
+    #[test]
+    fn cooperative_prefill_matches_the_existing_cpu_chunk_boundaries_exactly() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var("CAMELID_METAL_RESIDENT_DECODE", "0");
+        std::env::set_var("CAMELID_CUDA_RESIDENT_DECODE", "0");
+        std::env::set_var("CAMELID_PREFILL_LAYER_MAJOR", "0");
+        std::env::set_var("CAMELID_PREFILL_CHUNK_TOKENS", "2");
+        let prompt = [0, 1, 2, 1];
+
+        let mut monolithic = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        let expected = monolithic
+            .generate_next_token_with_history_diagnostics(
+                &prompt,
+                LlamaSampler::Greedy,
+                &prompt,
+                false,
+                None,
+            )
+            .unwrap();
+
+        let mut cooperative = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        let chunk_tokens = cooperative
+            .cooperative_prefill_chunk_tokens(prompt.len() - 1)
+            .expect("the CPU chunk path can yield between its existing chunks");
+        assert_eq!(chunk_tokens, 2);
+        for chunk in prompt[..prompt.len() - 1].chunks(chunk_tokens) {
+            cooperative.cooperative_prefill_chunk(chunk).unwrap();
+        }
+        let actual = cooperative
+            .generate_next_token_with_history_diagnostics(
+                &prompt[prompt.len() - 1..],
+                LlamaSampler::Greedy,
+                &prompt,
+                false,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(actual.next_token_id, expected.next_token_id);
+        assert_eq!(actual.logits, expected.logits);
+        assert_eq!(actual.hidden_state, expected.hidden_state);
+        assert_eq!(actual.output_norm_state, expected.output_norm_state);
+        assert_eq!(cooperative.kv_position(), monolithic.kv_position());
+
+        std::env::remove_var("CAMELID_METAL_RESIDENT_DECODE");
+        std::env::remove_var("CAMELID_CUDA_RESIDENT_DECODE");
+        std::env::remove_var("CAMELID_PREFILL_LAYER_MAJOR");
+        std::env::remove_var("CAMELID_PREFILL_CHUNK_TOKENS");
+    }
+
+    #[test]
+    fn cooperative_stream_prefill_yields_cancels_and_preserves_the_single_stream_fast_path() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var("CAMELID_METAL_RESIDENT_DECODE", "0");
+        std::env::set_var("CAMELID_CUDA_RESIDENT_DECODE", "0");
+        std::env::set_var("CAMELID_PREFILL_LAYER_MAJOR", "0");
+        std::env::set_var("CAMELID_PREFILL_CHUNK_TOKENS", "2");
+        let prompt = vec![0, 1, 2, 1];
+
+        let make_job = || {
+            let session = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+            let mut prepared = prepared_for_cache("tiny", "model-a.gguf", prompt.clone(), session);
+            prepared.max_tokens = 2;
+            prepared.tokenizer = Arc::new(tiny_vocab_tokenizer());
+            let (events_tx, _events_rx) = tokio::sync::mpsc::channel(32);
+            (
+                CooperativeStreamDecodeJob::new(prepared, events_tx).unwrap(),
+                _events_rx,
+            )
+        };
+
+        let (mut contended, _events_rx) = make_job();
+        assert_eq!(
+            contended.step(engine::CooperativeStepContext { active_slots: 2 }),
+            engine::StepOutcome::Continue
+        );
+        assert_eq!(contended.prepared.session.kv_position(), 2);
+        assert!(contended.generated.is_empty());
+        assert_eq!(contended.cooperative_prefill.as_ref().unwrap().cursor, 2);
+        assert_eq!(
+            contended.step(engine::CooperativeStepContext { active_slots: 2 }),
+            engine::StepOutcome::Continue
+        );
+        assert_eq!(contended.prepared.session.kv_position(), 3);
+        assert!(contended.generated.is_empty());
+        assert_eq!(
+            contended.step(engine::CooperativeStepContext { active_slots: 2 }),
+            engine::StepOutcome::Continue
+        );
+        assert_eq!(contended.generated.len(), 1);
+        assert_eq!(
+            contended
+                .prepared
+                .timings
+                .prompt_evaluation
+                .prompt_token_count,
+            prompt.len()
+        );
+        assert_eq!(
+            contended
+                .prepared
+                .timings
+                .prompt_evaluation
+                .prefill_token_count,
+            prompt.len() - 1
+        );
+
+        let (mut cancelled, _events_rx) = make_job();
+        assert_eq!(
+            cancelled.step(engine::CooperativeStepContext { active_slots: 2 }),
+            engine::StepOutcome::Continue
+        );
+        cancelled.prepared.cancel.token.cancel();
+        assert_eq!(
+            cancelled.step(engine::CooperativeStepContext { active_slots: 2 }),
+            engine::StepOutcome::Complete
+        );
+        assert_eq!(cancelled.prepared.session.kv_position(), 2);
+        assert!(cancelled.generated.is_empty());
+
+        let (mut single, _events_rx) = make_job();
+        assert_eq!(
+            single.step(engine::CooperativeStepContext { active_slots: 1 }),
+            engine::StepOutcome::Continue,
+            "one stream keeps the pre-existing one-step prompt fast path"
+        );
+        assert!(single.cooperative_prefill.is_none());
+        assert_eq!(single.generated.len(), 1);
+
+        std::env::remove_var("CAMELID_METAL_RESIDENT_DECODE");
+        std::env::remove_var("CAMELID_CUDA_RESIDENT_DECODE");
+        std::env::remove_var("CAMELID_PREFILL_LAYER_MAJOR");
+        std::env::remove_var("CAMELID_PREFILL_CHUNK_TOKENS");
     }
 
     #[test]

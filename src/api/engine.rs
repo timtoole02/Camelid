@@ -606,6 +606,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chunked_prefill_does_not_starve_a_short_stream() {
+        let _env_guard = crate::test_support::env_lock();
+        std::env::set_var(crate::runtime_config::CONTINUOUS_BATCH_SLOTS_ENV, "2");
+        let engine = EngineHandle::spawn();
+        std::env::remove_var(crate::runtime_config::CONTINUOUS_BATCH_SLOTS_ENV);
+
+        // Queue both streams before scheduling starts. `p` models one long
+        // prompt exposing four prefill chunks; `s` models a short request that
+        // can produce its first token immediately.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        engine
+            .post(EngineTask::Exclusive(Box::new(move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })))
+            .unwrap();
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let order = Arc::clone(&order);
+            let mut chunks = 0usize;
+            engine
+                .post(EngineTask::Cooperative(Box::new(move |_| {
+                    chunks += 1;
+                    order.lock().unwrap().push('p');
+                    if chunks == 4 {
+                        StepOutcome::Complete
+                    } else {
+                        StepOutcome::Continue
+                    }
+                })))
+                .unwrap();
+        }
+        {
+            let order = Arc::clone(&order);
+            engine
+                .post(EngineTask::Cooperative(Box::new(move |_| {
+                    order.lock().unwrap().push('s');
+                    StepOutcome::Complete
+                })))
+                .unwrap();
+        }
+        release_tx.send(()).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while engine.depth() != 0 {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!['p', 's', 'p', 'p', 'p'],
+            "the short stream must run after one prefill chunk, not after the long prompt"
+        );
+    }
+
+    #[tokio::test]
     async fn single_kv_owner_mode_drains_tasks_without_retained_overlap() {
         let _env_guard = crate::test_support::env_lock();
         std::env::set_var(crate::runtime_config::CONTINUOUS_BATCH_SLOTS_ENV, "2");

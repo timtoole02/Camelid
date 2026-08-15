@@ -2800,6 +2800,44 @@ impl LlamaInferenceSession {
         self.resident_encode_ahead_enabled = enabled;
     }
 
+    /// Return the existing CPU-prefill chunk size when a prompt can be split
+    /// across cooperative engine turns without changing its numerical lane.
+    ///
+    /// The ordinary generation path already evaluates this prompt in chunks of
+    /// exactly this size. The cooperative scheduler merely yields between those
+    /// same chunks. Resident GPU prefill, layer-major prefill, single-token
+    /// fallback, and windowed attention stay monolithic until they have their
+    /// own incremental parity receipts.
+    pub(crate) fn cooperative_prefill_chunk_tokens(&self, prefill_count: usize) -> Option<usize> {
+        let chunk_tokens = session_prefill_chunk_tokens(&self.config, prefill_count);
+        if prefill_count <= chunk_tokens
+            || chunk_tokens <= 1
+            || crate::model::arch_has_windowed_attention(&self.config)
+            || prefill_layer_major_enabled(&self.weights)
+        {
+            return None;
+        }
+        let resident_would_prefill = self.kv_cache.position == 0
+            && self.weights.layer_range.is_none()
+            && self.resident_decode_eligible(false).ok()?;
+        (!resident_would_prefill).then_some(chunk_tokens)
+    }
+
+    /// Evaluate one scheduler-owned slice of a CPU chunked prefill. Callers
+    /// must obtain the slice size from [`Self::cooperative_prefill_chunk_tokens`]
+    /// so its boundaries remain identical to the run-to-completion path.
+    pub(crate) fn cooperative_prefill_chunk(
+        &mut self,
+        token_ids: &[u32],
+    ) -> Result<LlamaForwardTimings> {
+        if token_ids.is_empty() {
+            return Err(BackendError::RuntimeShapeMismatch(
+                "cooperative prefill requires a non-empty token slice".to_string(),
+            ));
+        }
+        run_on_prefill_pool(|| self.forward_prefill_chunk_timed_fast(token_ids))
+    }
+
     /// Arm the execution-trace rollup: subsequent forward passes fold every layer's output
     /// hidden state and the final logits into a streaming SHA-256 (see [`ExecutionTraceHasher`]).
     /// Fails closed unless deterministic mode is active ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â the rollup is only meaningful on the
