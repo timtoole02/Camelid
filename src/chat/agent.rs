@@ -2606,6 +2606,11 @@ pub fn run_loop(
                 // remain queued; otherwise the Verify phase can keep a small
                 // model rereading broken files instead of fixing the diagnostic.
                 ActionPhase::Modify
+            } else if workspace_changed && !missing_artifacts.is_empty() {
+                // When required artifacts are still missing (e.g. multi-file creation),
+                // the agent must remain in Modify phase so it continues creating
+                // the remaining files rather than getting stuck verifying partial work.
+                ActionPhase::Modify
             } else if workspace_changed && !pending_verification_paths.is_empty() {
                 // Exact post-write source capture is host lifecycle work. Do
                 // it before reacting to a model-selected command failure so
@@ -2616,7 +2621,6 @@ pub fn run_loop(
                 || paging_diagnostic
                     .as_ref()
                     .is_some_and(|diagnostic| diagnostic.status != "ok")
-                || (workspace_changed && !missing_artifacts.is_empty())
             {
                 ActionPhase::Modify
             } else if workspace_changed
@@ -4760,7 +4764,18 @@ pub fn run_loop(
                                     .ledger
                                     .completed_work
                                     .push(format!("{} changed {relative}", action.tool_name()));
-                                runtime.ledger.current_focus = format!("Verify {relative}");
+                                let missing_artifacts = missing_required_artifacts(
+                                    sandbox.root(),
+                                    &required_workspace_artifacts,
+                                );
+                                if missing_artifacts.is_empty() {
+                                    runtime.ledger.current_focus = format!("Verify {relative}");
+                                } else {
+                                    runtime.ledger.current_focus = format!(
+                                        "Create the remaining required workspace artifacts before completing: {}",
+                                        missing_artifacts.join(", ")
+                                    );
+                                }
                                 runtime.ledger.verification_state.status = "pending".into();
                                 runtime.ledger.verification_state.failing_diagnostic = None;
                                 runtime.ledger.verification_state.verified_symbols.clear();
@@ -5158,6 +5173,23 @@ pub fn run_loop(
                                             "Run the actual suite from the directory that contains the changed tests."
                                         )
                                         .into();
+                                    } else if verification_command_kind(command)
+                                        == Some(VerificationCommandKind::StaticCheck)
+                                    {
+                                        pending_verification_paths
+                                            .retain(|path| !command.contains(path));
+                                        runtime
+                                            .ledger
+                                            .decisions
+                                            .push(format!("Static check passed: `{command}`"));
+                                        runtime.ledger.current_focus =
+                                            verification_requirements_focus(
+                                                sandbox.root(),
+                                                &task_objective,
+                                                &runtime.ledger.completed_work,
+                                                &required_workspace_artifacts,
+                                                &runtime.ledger.decisions,
+                                            );
                                     } else {
                                         runtime.ledger.failed_attempts.push(format!(
                                             "`{command}` succeeded but did not verify the changed/requested artifacts"
@@ -12041,7 +12073,7 @@ mod tests {
         // f-string, and never sees `edit_file` or non-`.py` writes — so this
         // downstream gate is the backstop for all of that, and needs a defect the
         // lint lets through to prove it.
-        const BROKEN_MAIN: &str = "def main(:\n    pass\n";
+        const BROKEN_MAIN: &str = "def main():\n    pass pass\n";
         const PASSING_TEST: &str = concat!(
             "import unittest\n\n",
             "class QueueTests(unittest.TestCase):\n",
