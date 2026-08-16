@@ -6464,19 +6464,19 @@ const REQUIRED_ARTIFACT_EXTENSIONS: &[&str] = &[
     "zsh",
 ];
 const REQUIRED_ARTIFACT_NAMES: &[&str] = &[
-    "build",
-    "build.bazel",
-    "cmakelists.txt",
-    "dockerfile",
-    "gemfile",
+    "BUILD",
+    "BUILD.bazel",
+    "CMakeLists.txt",
+    "Dockerfile",
+    "Gemfile",
     "gradlew",
     "gradlew.bat",
-    "justfile",
-    "makefile",
-    "procfile",
-    "rakefile",
-    "workspace",
-    "workspace.bazel",
+    "Justfile",
+    "Makefile",
+    "Procfile",
+    "Rakefile",
+    "WORKSPACE",
+    "WORKSPACE.bazel",
 ];
 
 /// Extract an explicit host-owned artifact manifest from the immutable user
@@ -6531,9 +6531,13 @@ fn workspace_requested_artifacts(objective: &str) -> BTreeSet<String> {
             let Some(filename) = token.rsplit('/').next() else {
                 continue;
             };
-            let known_name = REQUIRED_ARTIFACT_NAMES
-                .iter()
-                .any(|known| filename.eq_ignore_ascii_case(known));
+            let known_name = REQUIRED_ARTIFACT_NAMES.iter().any(|known| {
+                if *known == "BUILD" || *known == "WORKSPACE" {
+                    filename == *known || filename.eq_ignore_ascii_case(&format!("{known}.bazel"))
+                } else {
+                    filename.eq_ignore_ascii_case(known)
+                }
+            });
             let known_extension = filename.rsplit_once('.').is_some_and(|(stem, extension)| {
                 !stem.is_empty()
                     && REQUIRED_ARTIFACT_EXTENSIONS
@@ -13098,6 +13102,14 @@ mod tests {
                 "missing requested artifact: {path}"
             );
         }
+
+        let prose_objective = "Build a small but complete Python application called TaskForge with main.py, queue.py, and tests/test_queue.py in your workspace.";
+        let prose_requested = workspace_requested_artifacts(prose_objective);
+        assert!(!prose_requested.contains("Build"), "must not extract English verb 'Build' as a phantom file");
+        assert!(!prose_requested.contains("workspace"), "must not extract English noun 'workspace' as a phantom file");
+        assert!(prose_requested.contains("main.py"));
+        assert!(prose_requested.contains("queue.py"));
+        assert!(prose_requested.contains("tests/test_queue.py"));
     }
 
     #[test]
