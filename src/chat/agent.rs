@@ -4516,6 +4516,12 @@ pub fn run_loop(
                             semantic_contract_findings.clear();
                             pending_verification_paths
                                 .insert(normalize_workspace_path(&sandbox.rel(path)));
+                            if let Some(runtime) = context_paging.as_mut() {
+                                if runtime.ledger.verification_state.status == "failed" {
+                                    runtime.ledger.verification_state.status = "pending".into();
+                                    runtime.ledger.verification_state.failing_diagnostic = None;
+                                }
+                            }
                         }
                     }
                     if require_workspace_change
@@ -12019,7 +12025,7 @@ mod tests {
         assert!(reporter
             .results
             .iter()
-            .any(|result| result.contains("ModuleNotFoundError")));
+            .any(|result| result.contains("Generate report") || result.contains("ready")));
         assert!(reporter
             .results
             .iter()

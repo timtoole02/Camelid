@@ -3326,7 +3326,7 @@ fn run_shell_cancellable(sandbox: &Sandbox, command: &str, cancel: &AtomicBool) 
     if status.success() {
         ToolOutcome::Ok(text)
     } else {
-        if let Some(hint) = shell_failure_hint(&stdout, &stderr) {
+        if let Some(hint) = shell_failure_hint(&stdout, &stderr, Some(&sandbox.root)) {
             text.push_str(&format!("[hint: {hint}]\n"));
         }
         ToolOutcome::Err(text)
@@ -3346,7 +3346,11 @@ fn run_shell_cancellable(sandbox: &Sandbox, command: &str, cancel: &AtomicBool) 
 /// the sandbox arm must precede the generic permission arm, since a Seatbelt
 /// denial also prints "Operation not permitted". Deliberately a plain scan over
 /// a bounded prefix: no regex dependency, and no cost at all on success.
-fn shell_failure_hint(stdout: &str, stderr: &str) -> Option<&'static str> {
+fn shell_failure_hint(
+    stdout: &str,
+    stderr: &str,
+    root: Option<&std::path::Path>,
+) -> Option<String> {
     // Bounded scan of the HEAD AND TAIL of each stream. Head-only missed the
     // classes that matter most for dev work: cargo/npm print the verdict
     // ("test result: FAILED", the failing assertion) at the END of the log, so
@@ -3385,13 +3389,15 @@ fn shell_failure_hint(stdout: &str, stderr: &str) -> Option<&'static str> {
     if has("error[e") || has("could not compile") {
         return Some(
             "this is a compile error, not a harness failure. Read the named file at the reported \
-             line, fix the code, then rebuild",
+             line, fix the code, then rebuild"
+                .into(),
         );
     }
     if has("test result: failed") || has("assertion") && has("failed") {
         return Some(
             "a test failed. Read the assertion and the file it names, fix the cause, then re-run \
-             only that test",
+             only that test"
+                .into(),
         );
     }
     // --- sandbox / permission ---
@@ -3401,50 +3407,56 @@ fn shell_failure_hint(stdout: &str, stderr: &str) -> Option<&'static str> {
     if has("operation not permitted") {
         return Some(
             "the kernel sandbox refused this path or network access. Do NOT retry unchanged — \
-             work inside the workspace root, or use the file tools instead",
+             work inside the workspace root, or use the file tools instead"
+                .into(),
         );
     }
     if has("permission denied") {
         return Some(
             "permission denied. Check the path is inside the workspace; do not retry the same \
-             command, and do not attempt to change permissions on files you did not create",
+             command, and do not attempt to change permissions on files you did not create"
+                .into(),
         );
     }
     // --- missing interpreters/tools: name the platform-correct alternative ---
     if has("command not found") || has("no such file or directory") && has("bad interpreter") {
         if has("python") && !has("python3") {
-            return Some("`python` is not on PATH here; use `python3` instead");
+            return Some("`python` is not on PATH here; use `python3` instead".into());
         }
         if has("py: command not found") {
-            return Some("the `py` launcher is Windows-only; on this host use `python3`");
+            return Some("the `py` launcher is Windows-only; on this host use `python3`".into());
         }
         if has("pip") && !has("pip3") {
-            return Some("use `python3 -m pip` instead of a bare `pip`");
+            return Some("use `python3 -m pip` instead of a bare `pip`".into());
         }
         return Some(
             "that command is not installed on this host. Probe for an alternative (e.g. \
-             `command -v <tool>`) before assuming an install is needed",
+             `command -v <tool>`) before assuming an install is needed"
+                .into(),
         );
     }
     // --- filesystem ---
     if has("no such file or directory") {
         return Some(
             "a path in the command does not exist. Use list_dir to confirm the real path before \
-             retrying — paths are relative to the workspace root",
+             retrying — paths are relative to the workspace root"
+                .into(),
         );
     }
     if has("is a directory") {
-        return Some("that path is a directory, not a file. Use list_dir to inspect it");
+        return Some("that path is a directory, not a file. Use list_dir to inspect it".into());
     }
     if has("no space left on device") {
         return Some(
             "the disk is full. Do not retry; report this to the user — it is not something the \
-             agent can fix",
+             agent can fix"
+                .into(),
         );
     }
     if has("file exists") {
         return Some(
-            "the target already exists. Read it first, then edit_file rather than recreating it",
+            "the target already exists. Read it first, then edit_file rather than recreating it"
+                .into(),
         );
     }
     // --- network (the sandbox denies egress; the shell reports it as DNS failure) ---
@@ -3455,35 +3467,54 @@ fn shell_failure_hint(stdout: &str, stderr: &str) -> Option<&'static str> {
     {
         return Some(
             "network access is not available to shell commands here. Do not retry — if the task \
-             needs the network, say so instead of working around it",
+             needs the network, say so instead of working around it"
+                .into(),
         );
     }
     // --- build/test toolchains ---
     if has("blocking waiting for file lock") || has("waiting for file lock on build directory") {
         return Some(
             "another cargo build holds the target-directory lock. Do not retry in a loop — wait \
-             for it, or report the conflict",
+             for it, or report the conflict"
+                .into(),
         );
     }
     if has("modulenotfounderror") || has("importerror") {
+        if let Some(root) = root {
+            let marker = "no module named '";
+            if let Some(pos) = text.find(marker) {
+                let start = pos + marker.len();
+                if let Some(end) = text[start..].find('\'') {
+                    let mod_name = &text[start..start + end];
+                    if root.join(mod_name).is_dir() || root.join(format!("{mod_name}.py")).is_file() {
+                        return Some(format!(
+                            "`{mod_name}` exists as a local directory/file in this workspace. Run from the workspace root (e.g. `python3 -m {mod_name}.<module>`) or use flat imports."
+                        ));
+                    }
+                }
+            }
+        }
         return Some(
             "a Python import failed. Check the module name and whether it needs installing; \
-             package installs cross the approval boundary, so ask rather than assuming",
+             package installs cross the approval boundary, so ask rather than assuming"
+                .into(),
         );
     }
     if has("syntaxerror") || has("indentationerror") {
         return Some(
             "the source file has a syntax error. Read the file at the reported line and fix it \
-             with edit_file before running it again",
+             with edit_file before running it again"
+                .into(),
         );
     }
     if has("not a git repository") {
-        return Some("this workspace is not a git repository; do not use git commands here");
+        return Some("this workspace is not a git repository; do not use git commands here".into());
     }
     if has("timed out") {
         return Some(
             "the command exceeded its time budget. Run a smaller unit of work rather than \
-             repeating the same long command",
+             repeating the same long command"
+                .into(),
         );
     }
     None
@@ -5512,10 +5543,10 @@ mod tests {
     #[test]
     fn failed_shell_results_carry_one_actionable_hint() {
         assert!(
-            shell_failure_hint("", "").is_none(),
+            shell_failure_hint("", "", None).is_none(),
             "no hint without a known class"
         );
-        let sandbox_hint = shell_failure_hint("", "touch: /etc/probe: Operation not permitted")
+        let sandbox_hint = shell_failure_hint("", "touch: /etc/probe: Operation not permitted", None)
             .expect("sandbox denial must hint");
         assert!(sandbox_hint.contains("sandbox"), "{sandbox_hint}");
         assert!(
@@ -5524,22 +5555,32 @@ mod tests {
         );
         // The sandbox arm must win over the generic permission arm: a Seatbelt
         // denial also prints "not permitted", and the generic advice is wrong for it.
-        let generic = shell_failure_hint("", "cat: f.txt: Permission denied").unwrap();
+        let generic = shell_failure_hint("", "cat: f.txt: Permission denied", None).unwrap();
         assert!(generic.contains("permission denied"), "{generic}");
         assert!(!generic.contains("sandbox"), "{generic}");
         // Platform-correct interpreter advice on macOS.
-        let python = shell_failure_hint("", "sh: python: command not found").unwrap();
+        let python = shell_failure_hint("", "sh: python: command not found", None).unwrap();
         assert!(python.contains("python3"), "{python}");
-        let py = shell_failure_hint("", "sh: py: command not found").unwrap();
+        let py = shell_failure_hint("", "sh: py: command not found", None).unwrap();
         assert!(py.contains("python3"), "{py}");
         // Network is denied by the jail; the shell reports it as a DNS failure.
-        let net = shell_failure_hint("", "curl: (6) Could not resolve host: example.com").unwrap();
+        let net = shell_failure_hint("", "curl: (6) Could not resolve host: example.com", None).unwrap();
         assert!(net.contains("network"), "{net}");
         // A compile error is the model's problem, not the harness's.
-        let rustc = shell_failure_hint("", "error[E0425]: cannot find value `x`").unwrap();
+        let rustc = shell_failure_hint("", "error[E0425]: cannot find value `x`", None).unwrap();
         assert!(rustc.contains("compile error"), "{rustc}");
+        // Local module import failure produces a local directory hint when root is provided.
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("mypackage")).unwrap();
+        let import_err = shell_failure_hint(
+            "",
+            "ModuleNotFoundError: No module named 'mypackage'",
+            Some(temp.path()),
+        )
+        .unwrap();
+        assert!(import_err.contains("`mypackage` exists as a local directory/file"), "{import_err}");
         assert!(
-            shell_failure_hint("all good\n", "").is_none(),
+            shell_failure_hint("all good\n", "", None).is_none(),
             "clean output must not be hinted"
         );
     }

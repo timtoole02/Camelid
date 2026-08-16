@@ -2830,11 +2830,11 @@ fn category_order(category: &str) -> u8 {
         "task" => 1,
         "tools" => 2,
         "task_detail" => 3,
-        "page" => 4,
+        "map" => 4,
         "card" => 5,
-        "map" => 6,
-        "completed_work" => 7,
-        "history" => 8,
+        "completed_work" => 6,
+        "history" => 7,
+        "page" => 8,
         "diagnostic" => 9,
         // Volatile guidance is deliberately last. Qwen's prompt cache keys on
         // the longest common token prefix, so putting ledger revision/action
