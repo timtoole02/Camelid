@@ -2785,18 +2785,38 @@ fn python_structural_defect(source: &str) -> Option<String> {
     None
 }
 
+fn python_test_file_has_executable_tests(path: &Path, content: &str) -> bool {
+    let filename = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    let is_test = filename.starts_with("test_")
+        || filename.ends_with("_test.py")
+        || path.to_string_lossy().contains("/tests/")
+        || path.to_string_lossy().contains("\\tests\\");
+    if !is_test {
+        return true;
+    }
+    content.lines().any(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("def test_")
+            || trimmed.starts_with("def test(")
+            || (trimmed.starts_with("class ") && (trimmed.contains("Test") || trimmed.contains("TestCase")))
+            || trimmed.starts_with("async def test_")
+    })
+}
+
 fn write_file(path: &Path, content: &str, display_path: &str) -> ToolOutcome {
     // Refuse broken Python BEFORE it lands. Catches:
     // 1. Literal newlines inside `f'…'` (recurring defect)
     // 2. Mid-expression/unclosed-delimiter truncation at EOF (from hitting the output token cap)
     // 3. Unclosed triple-quoted strings at EOF
-    //
-    // Catching it at authorship costs one rejection with the fix in it; catching
-    // it downstream costs a write, an execute, a syntax failure, a read and an
-    // edit — and leaves a file on disk that does not parse if the turn ends first.
+    // 4. Test files truncated before defining any test methods/classes
     if path.extension().is_some_and(|ext| ext == "py") {
         if let Some(defect) = python_structural_defect(content) {
             return ToolOutcome::Err(format!("write refused: {display_path} {defect}"));
+        }
+        if !python_test_file_has_executable_tests(path, content) {
+            return ToolOutcome::Err(format!(
+                "write refused: {display_path} contains only imports/preamble and no test methods (e.g. def test_*) or TestCase classes. Write the complete test suite with executable test cases."
+            ));
         }
     }
     // Create the containing directory. `path` has already been through
@@ -2996,6 +3016,16 @@ fn edit_file(
     updated.push_str(&content[..range.start]);
     updated.push_str(new);
     updated.push_str(&content[range.end..]);
+    if path.extension().is_some_and(|ext| ext == "py") {
+        if let Some(defect) = python_structural_defect(&updated) {
+            return ToolOutcome::Err(format!("edit refused: {display_path} {defect}"));
+        }
+        if !python_test_file_has_executable_tests(path, &updated) {
+            return ToolOutcome::Err(format!(
+                "edit refused: {display_path} contains only imports/preamble and no test methods (e.g. def test_*) or TestCase classes. Write the complete test suite with executable test cases."
+            ));
+        }
+    }
     match std::fs::write(path, &updated) {
         Ok(()) => {
             let mut message = format!("edited {display_path}");
@@ -4310,7 +4340,7 @@ mod tests {
         for (path, body) in [
             ("rpncalc/__init__.py", ""),
             ("rpncalc/deep/nested/mod.py", "X = 1\n"),
-            ("tests/test_rpncalc.py", "import unittest\n"),
+            ("tests/test_rpncalc.py", "import unittest\n\ndef test_calc():\n    pass\n"),
         ] {
             let resolved = sb.resolve(path, false).expect("resolves a missing parent");
             let display = sb.rel(&resolved);

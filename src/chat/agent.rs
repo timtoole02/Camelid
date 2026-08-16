@@ -396,6 +396,7 @@ const PAGING_FULL_REWRITE_FOCUS: &str = concat!(
     "write_file, preserving required behavior and correcting every persisted diagnostic."
 );
 const MAX_WORKSPACE_TOOL_CALLS_PER_STEP: usize = 8;
+const MAX_WORKSPACE_WRITES_PER_STEP: usize = 2;
 /// Absolute admission ceiling for one Workspace turn. Code mode deliberately
 /// has no arbitrary model-step cap, but it must still have a resource ceiling:
 /// a broken model must not be able to emit unbounded process/file activity.
@@ -4063,22 +4064,35 @@ pub fn run_loop(
                     }
                 }
                 let mut deferred_calls = 0usize;
-                if cfg.tool_profile.is_workspace()
-                    && calls.len() > MAX_WORKSPACE_TOOL_CALLS_PER_STEP
-                {
-                    // An eager model emitting one big batch is doing what we asked —
-                    // punishing it with a dead turn (`LoopEnd::DriverError`, the old
-                    // behavior) turned its best step into its last. Clamp instead:
-                    // run the first page, tell the model how many were deferred, and
-                    // let the next step continue from where the page ended.
-                    deferred_calls = calls.len() - MAX_WORKSPACE_TOOL_CALLS_PER_STEP;
-                    calls.truncate(MAX_WORKSPACE_TOOL_CALLS_PER_STEP);
-                    reporter.notice(&format!(
-                        "model emitted {} tool calls in one step; running the first {} and deferring {}",
-                        MAX_WORKSPACE_TOOL_CALLS_PER_STEP + deferred_calls,
-                        MAX_WORKSPACE_TOOL_CALLS_PER_STEP,
-                        deferred_calls
-                    ));
+                if cfg.tool_profile.is_workspace() {
+                    let mut write_count = 0usize;
+                    let mut clamped = Vec::new();
+                    for call in calls {
+                        let is_write = matches!(
+                            call.name.as_str(),
+                            "write_file" | "edit_file" | "create_file" | "replace_file_content"
+                        );
+                        if is_write {
+                            write_count += 1;
+                            if write_count > MAX_WORKSPACE_WRITES_PER_STEP {
+                                deferred_calls += 1;
+                                continue;
+                            }
+                        }
+                        clamped.push(call);
+                    }
+                    if clamped.len() > MAX_WORKSPACE_TOOL_CALLS_PER_STEP {
+                        deferred_calls += clamped.len() - MAX_WORKSPACE_TOOL_CALLS_PER_STEP;
+                        clamped.truncate(MAX_WORKSPACE_TOOL_CALLS_PER_STEP);
+                    }
+                    calls = clamped;
+                    if deferred_calls > 0 {
+                        reporter.notice(&format!(
+                            "model emitted tool calls; running {} and deferring {} to prevent output token truncation",
+                            calls.len(),
+                            deferred_calls
+                        ));
+                    }
                 }
                 if cfg.tool_profile.is_workspace()
                     && total_tool_calls.saturating_add(calls.len())
