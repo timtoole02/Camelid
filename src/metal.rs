@@ -18541,7 +18541,7 @@ impl Qwen35MetalDecode {
         &mut self,
         slots: &[(Vec<f32>, Vec<f32>, Vec<f32>)],
     ) -> bool {
-        const SLOTS_PER_COMMAND_BUFFER: usize = 128;
+        const SLOTS_PER_COMMAND_BUFFER: usize = 256;
 
         if slots.is_empty() {
             return true;

@@ -1163,19 +1163,31 @@ fn workspace_path_is_runtime_data(path: &str) -> bool {
     let data_extension = [".db", ".json", ".sqlite", ".sqlite3"]
         .iter()
         .any(|extension| filename.ends_with(extension));
-    if ["config", "configuration", "schema", "settings"]
+    if ["config", "configuration", "schema", "settings", "package.json", "tsconfig.json"]
         .iter()
         .any(|marker| filename.contains(marker))
     {
         return false;
     }
-    data_extension
-        && normalized.split('/').any(|component| {
-            matches!(
-                component,
-                "data" | "runtime-data" | "runtime_state" | "state"
-            )
-        })
+    let runtime_named_file = [
+        "tasks.json",
+        "todos.json",
+        "jobs.json",
+        "data.json",
+        "store.json",
+        "state.json",
+        "runtime-state.json",
+        "db.json",
+    ]
+    .contains(&filename);
+    runtime_named_file
+        || (data_extension
+            && normalized.split('/').any(|component| {
+                matches!(
+                    component,
+                    "data" | "runtime-data" | "runtime_state" | "state"
+                )
+            }))
 }
 
 fn completed_work_entry_has_authored_provenance(entry: &str) -> bool {
@@ -2004,7 +2016,8 @@ fn verification_requirements_focus(
     required_artifacts: &BTreeSet<String>,
     decisions: &[String],
 ) -> String {
-    let missing_artifacts = missing_required_artifacts(workspace_root, required_artifacts);
+    let missing_artifacts =
+        missing_required_authored_artifacts(workspace_root, required_artifacts);
     if !missing_artifacts.is_empty() {
         return format!(
             "Create the remaining required artifacts before verification: {}",
@@ -2598,7 +2611,7 @@ pub fn run_loop(
             let empty_creation_workspace =
                 require_workspace_change && workspace_is_effectively_empty(sandbox.root());
             let missing_artifacts =
-                missing_required_artifacts(sandbox.root(), &required_workspace_artifacts);
+                missing_required_authored_artifacts(sandbox.root(), &required_workspace_artifacts);
             let verification_failed = runtime.ledger.verification_state.status.as_str() == "failed";
             let phase = if workspace_changed && verification_failed {
                 // A real test/build failure is repair evidence.  Return all
@@ -3955,7 +3968,7 @@ pub fn run_loop(
                         runtime.ledger.decisions.push(format!(
                             "No {settled_tool} needed for {path}: requested result is already present"
                         ));
-                        let missing_artifacts = missing_required_artifacts(
+                        let missing_artifacts = missing_required_authored_artifacts(
                             sandbox.root(),
                             &required_workspace_artifacts,
                         );
@@ -4764,7 +4777,7 @@ pub fn run_loop(
                                     .ledger
                                     .completed_work
                                     .push(format!("{} changed {relative}", action.tool_name()));
-                                let missing_artifacts = missing_required_artifacts(
+                                let missing_artifacts = missing_required_authored_artifacts(
                                     sandbox.root(),
                                     &required_workspace_artifacts,
                                 );
