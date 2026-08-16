@@ -3178,7 +3178,15 @@ fn run_shell_cancellable(sandbox: &Sandbox, command: &str, cancel: &AtomicBool) 
             Ok((builder, _enforced)) => builder,
             Err(e) => return ToolOutcome::Err(format!("run_shell refused: {e}")),
         };
+    let root_str = sandbox.root.to_string_lossy().to_string();
+    let current_pythonpath = std::env::var("PYTHONPATH").unwrap_or_default();
+    let combined_pythonpath = if current_pythonpath.is_empty() {
+        format!("{root_str}:.")
+    } else {
+        format!("{root_str}:.:{current_pythonpath}")
+    };
     builder
+        .env("PYTHONPATH", combined_pythonpath)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
