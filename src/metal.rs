@@ -12958,7 +12958,12 @@ fn attn_mm_scratch_cap_bytes() -> usize {
 fn mm_prefill_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("CAMELID_METAL_MM").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        !std::env::var("CAMELID_METAL_MM").is_ok_and(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "off" | "false" | "no" | "disabled"
+            )
+        })
     })
 }
 
