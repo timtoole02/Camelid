@@ -1430,7 +1430,30 @@ fn looks_like_raw_program_source(command: &str) -> bool {
         || lower.starts_with("<html")
 }
 
+fn normalize_shell_command_workspace_prefix(command: &str) -> String {
+    let trimmed = command.trim();
+    for prefix in [
+        "cd /workspace && ",
+        "cd /workspace ; ",
+        "cd /workspace\n",
+        "cd /root && ",
+        "cd /root ; ",
+        "cd /app && ",
+        "cd /app ; ",
+        "cd /project && ",
+        "cd /project ; ",
+        "cd ./ && ",
+        "cd . && ",
+    ] {
+        if trimmed.starts_with(prefix) {
+            return trimmed[prefix.len()..].trim_start().to_string();
+        }
+    }
+    command.to_string()
+}
+
 fn validate_shell_command(command: String) -> Result<Action, String> {
+    let command = normalize_shell_command_workspace_prefix(&command);
     if command.trim().is_empty() {
         return Err("run_shell requires a non-empty `command`".into());
     }
