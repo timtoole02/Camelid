@@ -2738,6 +2738,12 @@ pub fn run_loop(
                         )
                         .to_string()
                     }
+                    ActionPhase::Modify if verification_failed => concat!(
+                        "The test suite or command failed. Use edit_file (or write_file) now to ",
+                        "fix the exact failing assertion or bug identified in the failure diagnostic. ",
+                        "Do not call run_shell again until the source fix is written."
+                    )
+                    .to_string(),
                     ActionPhase::Modify =>
                         "Implement the next unmet requirement; inspect exact source before editing."
                             .to_string(),
