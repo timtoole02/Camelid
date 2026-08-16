@@ -2605,6 +2605,16 @@ pub fn run_loop(
                 reporter.notice(&format!("context paging relevance error: {error}"));
                 return LoopEnd::DriverError;
             }
+            if runtime.ledger.verification_state.status == "failed" {
+                let cmd = runtime.ledger.verification_state.last_command.clone();
+                let failed_attempt = runtime.ledger.failed_attempts.last().cloned();
+                if let Some(cmd) = cmd {
+                    let _ = runtime.seed_relevance_from_query(&cmd, 1);
+                }
+                if let Some(failed_attempt) = failed_attempt {
+                    let _ = runtime.seed_relevance_from_query(&failed_attempt, 1);
+                }
+            }
             let direct_creation_target = cfg
                 .default_write_path
                 .as_deref()
