@@ -2860,6 +2860,68 @@ fn add_composition(composition: &mut CapsuleComposition, category: &str, tokens:
     }
 }
 
+fn condense_objective_for_capsule(objective: &str) -> String {
+    if objective.len() <= 1200 {
+        return objective.to_string();
+    }
+    let mut condensed = Vec::new();
+    let mut in_code_block = false;
+    let mut capture_section = true;
+    for line in objective.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            condensed.push(line);
+            continue;
+        }
+        if in_code_block {
+            condensed.push(line);
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            let lower = trimmed.to_ascii_lowercase();
+            capture_section = lower.contains("goal")
+                || lower.contains("structure")
+                || lower.contains("behavior")
+                || lower.contains("command")
+                || lower.contains("architecture")
+                || lower.contains("models")
+                || lower.contains("storage")
+                || lower.contains("queue")
+                || lower.contains("executor")
+                || lower.contains("main")
+                || lower.contains("constraint")
+                || lower.contains("test")
+                || lower.contains("validation")
+                || lower.contains("done");
+            if capture_section {
+                condensed.push(line);
+            }
+            continue;
+        }
+        if capture_section {
+            if trimmed.starts_with('*')
+                || trimmed.starts_with('-')
+                || trimmed.starts_with("python ")
+                || trimmed.starts_with("def ")
+                || trimmed.starts_with("class ")
+            {
+                condensed.push(line);
+            } else if !trimmed.is_empty()
+                && (condensed.last().map_or(true, |l| l.trim().starts_with('#')))
+            {
+                condensed.push(line);
+            }
+        }
+    }
+    let result = condensed.join("\n");
+    if result.len() > 200 {
+        result
+    } else {
+        objective.to_string()
+    }
+}
+
 /// The immutable part of the mandatory task contract is rendered before every
 /// source-derived section. It intentionally contains no ledger revision or
 /// mutable action state: those fields made the prompt diverge before the exact
@@ -2868,6 +2930,7 @@ fn add_composition(composition: &mut CapsuleComposition, category: &str, tokens:
 /// An objective that cannot fit the aggregate mandatory-token budget still
 /// fails closed; task requirements are never silently truncated.
 fn render_task_contract(ledger: &TaskLedger) -> String {
+    let objective = condense_objective_for_capsule(&ledger.objective);
     format!(
         concat!(
             "<task_contract>\n",
@@ -2876,7 +2939,7 @@ fn render_task_contract(ledger: &TaskLedger) -> String {
             "criticalInvariants:\n{}\n",
             "</task_contract>\n"
         ),
-        ledger.objective,
+        objective,
         bounded_bullets(&ledger.acceptance_criteria),
         bounded_bullets(&ledger.invariants),
     )
