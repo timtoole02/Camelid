@@ -4374,20 +4374,14 @@ pub fn run_loop(
                         }
                         Decision::AlwaysTool => {
                             if let Some(error) = context_paging.as_ref().and_then(|runtime| {
-                                let test_rerun_blocked = matches!(&action, Action::RunShell { command } if {
-                                    let cmd = command.to_ascii_lowercase();
-                                    (cmd.contains("unittest") || cmd.contains("pytest") || cmd.contains("cargo test"))
-                                        && runtime.ledger.verification_state.status == "failed"
-                                        && runtime.ledger.verification_state.last_command.as_deref().is_some_and(|last| {
-                                            let last_low = last.to_ascii_lowercase();
-                                            last_low.contains("unittest") || last_low.contains("pytest") || last_low.contains("cargo test")
-                                        })
+                                let test_rerun_blocked = matches!(&action, Action::RunShell { .. } if {
+                                    runtime.ledger.verification_state.status == "failed"
                                 });
                                 if test_rerun_blocked {
                                     Some(ContextPagingError::ApprovalAuthorityChanged {
                                         tool: action.tool_name().to_string(),
                                         path: String::new(),
-                                        reason: "cannot rerun failing test suite while in Modify repair phase; edit or write the source file first (using edit_file or write_file) to repair the failing test or assertion".into(),
+                                        reason: "cannot rerun shell command while in Modify repair phase: the workspace files have not been modified since the failure. Use edit_file or write_file to repair the failing code first".into(),
                                     })
                                 } else {
                                     runtime.revalidate_approved_modification(&action).err()
@@ -4411,20 +4405,14 @@ pub fn run_loop(
                         }
                         Decision::Once => {
                             if let Some(error) = context_paging.as_ref().and_then(|runtime| {
-                                let test_rerun_blocked = matches!(&action, Action::RunShell { command } if {
-                                    let cmd = command.to_ascii_lowercase();
-                                    (cmd.contains("unittest") || cmd.contains("pytest") || cmd.contains("cargo test"))
-                                        && runtime.ledger.verification_state.status == "failed"
-                                        && runtime.ledger.verification_state.last_command.as_deref().is_some_and(|last| {
-                                            let last_low = last.to_ascii_lowercase();
-                                            last_low.contains("unittest") || last_low.contains("pytest") || last_low.contains("cargo test")
-                                        })
+                                let test_rerun_blocked = matches!(&action, Action::RunShell { .. } if {
+                                    runtime.ledger.verification_state.status == "failed"
                                 });
                                 if test_rerun_blocked {
                                     Some(ContextPagingError::ApprovalAuthorityChanged {
                                         tool: action.tool_name().to_string(),
                                         path: String::new(),
-                                        reason: "cannot rerun failing test suite while in Modify repair phase; edit or write the source file first (using edit_file or write_file) to repair the failing test or assertion".into(),
+                                        reason: "cannot rerun shell command while in Modify repair phase: the workspace files have not been modified since the failure. Use edit_file or write_file to repair the failing code first".into(),
                                     })
                                 } else {
                                     runtime.revalidate_approved_modification(&action).err()
@@ -5095,9 +5083,15 @@ pub fn run_loop(
                                     // release the verification-only tool gate.
                                     paging_shell_verification_required = false;
                                     runtime.ledger.verification_state.status = "failed".into();
+                                    runtime.ledger.verification_state.last_command =
+                                        Some(command.clone());
                                     runtime.ledger.verification_state.failing_diagnostic =
                                         Some(compact.raw_reference.clone());
                                     let summary = bounded_inline_shell_diagnostic(&compact.preview);
+                                    let failing_source_file = extract_failing_source_file_from_traceback(
+                                        raw_outcome.text(),
+                                        sandbox.root(),
+                                    );
                                     let missing_artifacts = missing_required_authored_artifacts(
                                         sandbox.root(),
                                         &required_workspace_artifacts,
@@ -5118,9 +5112,13 @@ pub fn run_loop(
                                             "`{command}` failed: {summary}. Do not verify the incomplete project again; create the remaining required artifacts with write_file: {}.",
                                             missing_artifacts.join(", ")
                                         )
+                                    } else if let Some(failing_file) = failing_source_file {
+                                        format!(
+                                            "`{command}` failed on `{failing_file}`: {summary}. Use edit_file (or write_file) now to fix `{failing_file}`, then re-run verification."
+                                        )
                                     } else {
                                         format!(
-                                            "`{command}` failed: {summary}. Correct this exact source or runtime failure, then rerun the relevant verification."
+                                            "`{command}` failed: {summary}. Correct this exact source or runtime failure with edit_file, then rerun the relevant verification."
                                         )
                                     };
                                     let failed_attempt = format!("`{command}` failed: {summary}");
@@ -6449,6 +6447,34 @@ fn missing_required_python_module_artifact(
             .then(|| (!root.join(&normalized).is_file()).then_some(normalized))
             .flatten()
     })
+}
+
+/// Extract the innermost local source file mentioned in a Python traceback.
+fn extract_failing_source_file_from_traceback(
+    output: &str,
+    root: &Path,
+) -> Option<String> {
+    for line in output.lines().rev() {
+        if let Some(pos) = line.find("File \"") {
+            let start = pos + 6;
+            if let Some(end) = line[start..].find('"') {
+                let path_str = &line[start..start + end];
+                let path = Path::new(path_str);
+                let rel = if path.is_absolute() {
+                    path.strip_prefix(root).ok().map(|p| p.to_string_lossy().to_string())
+                } else {
+                    Some(path_str.to_string())
+                };
+                if let Some(rel_path) = rel {
+                    let normalized = normalize_workspace_path(&rel_path);
+                    if root.join(&normalized).is_file() {
+                        return Some(normalized);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// `unittest discover -t <root>` requires the start directory to be an
