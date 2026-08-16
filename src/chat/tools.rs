@@ -1432,21 +1432,21 @@ fn looks_like_raw_program_source(command: &str) -> bool {
 
 fn normalize_shell_command_workspace_prefix(command: &str) -> String {
     let trimmed = command.trim();
-    for prefix in [
-        "cd /workspace && ",
-        "cd /workspace ; ",
-        "cd /workspace\n",
-        "cd /root && ",
-        "cd /root ; ",
-        "cd /app && ",
-        "cd /app ; ",
-        "cd /project && ",
-        "cd /project ; ",
-        "cd ./ && ",
-        "cd . && ",
-    ] {
-        if trimmed.starts_with(prefix) {
-            return trimmed[prefix.len()..].trim_start().to_string();
+    for synthetic_root in ["/testbed", "/workspace", "/root", "/app", "/project"] {
+        let prefix_sub = format!("cd {synthetic_root}/");
+        if let Some(rest) = trimmed.strip_prefix(&prefix_sub) {
+            return format!("cd {rest}");
+        }
+        for sep in [" && ", " ; ", "\n"] {
+            let prefix_root = format!("cd {synthetic_root}{sep}");
+            if let Some(rest) = trimmed.strip_prefix(&prefix_root) {
+                return rest.trim_start().to_string();
+            }
+        }
+    }
+    for prefix in ["cd ./ && ", "cd . && ", "cd . ; "] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return rest.trim_start().to_string();
         }
     }
     command.to_string()

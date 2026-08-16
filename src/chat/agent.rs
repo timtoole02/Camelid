@@ -4374,13 +4374,20 @@ pub fn run_loop(
                         }
                         Decision::AlwaysTool => {
                             if let Some(error) = context_paging.as_ref().and_then(|runtime| {
-                                if matches!(&action, Action::RunShell { .. } | Action::RunWindowsCommand { .. })
-                                    && runtime.ledger.verification_state.status == "failed"
-                                {
+                                let test_rerun_blocked = matches!(&action, Action::RunShell { command } if {
+                                    let cmd = command.to_ascii_lowercase();
+                                    (cmd.contains("unittest") || cmd.contains("pytest") || cmd.contains("cargo test"))
+                                        && runtime.ledger.verification_state.status == "failed"
+                                        && runtime.ledger.verification_state.last_command.as_deref().is_some_and(|last| {
+                                            let last_low = last.to_ascii_lowercase();
+                                            last_low.contains("unittest") || last_low.contains("pytest") || last_low.contains("cargo test")
+                                        })
+                                });
+                                if test_rerun_blocked {
                                     Some(ContextPagingError::ApprovalAuthorityChanged {
                                         tool: action.tool_name().to_string(),
                                         path: String::new(),
-                                        reason: "cannot run shell verification while in Modify repair phase; edit or write the source file first (using edit_file or write_file) to repair the failing test or diagnostic".into(),
+                                        reason: "cannot rerun failing test suite while in Modify repair phase; edit or write the source file first (using edit_file or write_file) to repair the failing test or assertion".into(),
                                     })
                                 } else {
                                     runtime.revalidate_approved_modification(&action).err()
@@ -4404,13 +4411,20 @@ pub fn run_loop(
                         }
                         Decision::Once => {
                             if let Some(error) = context_paging.as_ref().and_then(|runtime| {
-                                if matches!(&action, Action::RunShell { .. } | Action::RunWindowsCommand { .. })
-                                    && runtime.ledger.verification_state.status == "failed"
-                                {
+                                let test_rerun_blocked = matches!(&action, Action::RunShell { command } if {
+                                    let cmd = command.to_ascii_lowercase();
+                                    (cmd.contains("unittest") || cmd.contains("pytest") || cmd.contains("cargo test"))
+                                        && runtime.ledger.verification_state.status == "failed"
+                                        && runtime.ledger.verification_state.last_command.as_deref().is_some_and(|last| {
+                                            let last_low = last.to_ascii_lowercase();
+                                            last_low.contains("unittest") || last_low.contains("pytest") || last_low.contains("cargo test")
+                                        })
+                                });
+                                if test_rerun_blocked {
                                     Some(ContextPagingError::ApprovalAuthorityChanged {
                                         tool: action.tool_name().to_string(),
                                         path: String::new(),
-                                        reason: "cannot run shell verification while in Modify repair phase; edit or write the source file first (using edit_file or write_file) to repair the failing test or diagnostic".into(),
+                                        reason: "cannot rerun failing test suite while in Modify repair phase; edit or write the source file first (using edit_file or write_file) to repair the failing test or assertion".into(),
                                     })
                                 } else {
                                     runtime.revalidate_approved_modification(&action).err()
