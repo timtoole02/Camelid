@@ -4374,7 +4374,17 @@ pub fn run_loop(
                         }
                         Decision::AlwaysTool => {
                             if let Some(error) = context_paging.as_ref().and_then(|runtime| {
-                                runtime.revalidate_approved_modification(&action).err()
+                                if matches!(&action, Action::RunShell { .. } | Action::RunWindowsCommand { .. })
+                                    && runtime.ledger.verification_state.status == "failed"
+                                {
+                                    Some(ContextPagingError::ApprovalAuthorityChanged {
+                                        tool: action.tool_name().to_string(),
+                                        path: String::new(),
+                                        reason: "cannot run shell verification while in Modify repair phase; edit or write the source file first (using edit_file or write_file) to repair the failing test or diagnostic".into(),
+                                    })
+                                } else {
+                                    runtime.revalidate_approved_modification(&action).err()
+                                }
                             }) {
                                 ToolOutcome::Err(error.to_string())
                             } else {
@@ -4394,7 +4404,17 @@ pub fn run_loop(
                         }
                         Decision::Once => {
                             if let Some(error) = context_paging.as_ref().and_then(|runtime| {
-                                runtime.revalidate_approved_modification(&action).err()
+                                if matches!(&action, Action::RunShell { .. } | Action::RunWindowsCommand { .. })
+                                    && runtime.ledger.verification_state.status == "failed"
+                                {
+                                    Some(ContextPagingError::ApprovalAuthorityChanged {
+                                        tool: action.tool_name().to_string(),
+                                        path: String::new(),
+                                        reason: "cannot run shell verification while in Modify repair phase; edit or write the source file first (using edit_file or write_file) to repair the failing test or diagnostic".into(),
+                                    })
+                                } else {
+                                    runtime.revalidate_approved_modification(&action).err()
+                                }
                             }) {
                                 ToolOutcome::Err(error.to_string())
                             } else {
