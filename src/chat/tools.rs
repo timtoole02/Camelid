@@ -1169,6 +1169,64 @@ impl Action {
         }
     }
 
+    /// A clear, human-readable conversational description of the action.
+    pub fn narrative(&self, sandbox: &Sandbox) -> String {
+        match self {
+            Action::WriteFile { path, content, .. } => {
+                format!("Authoring `{}` ({} bytes)...", sandbox.rel(path), content.len())
+            }
+            Action::EditFile { path, .. } => {
+                format!("Applying targeted modification to `{}`...", sandbox.rel(path))
+            }
+            Action::ReadFile { path, start_line, .. } => {
+                if let Some(start) = start_line {
+                    format!("Reading `{}` starting from line {start}...", sandbox.rel(path))
+                } else {
+                    format!("Inspecting `{}`...", sandbox.rel(path))
+                }
+            }
+            Action::ListDir { path, .. } => {
+                let rel = sandbox.rel(path);
+                if rel == "." || rel.is_empty() {
+                    "Listing workspace root layout...".to_string()
+                } else {
+                    format!("Listing directory `{rel}`...")
+                }
+            }
+            Action::Search { pattern, path, .. } => {
+                format!("Searching for {:?} in `{}`...", pattern, sandbox.rel(path))
+            }
+            Action::RunShell { command } => {
+                format!("Running command: `{command}`...")
+            }
+            Action::RunWindowsCommand { command, .. } => {
+                format!("Running command: `{command}`...")
+            }
+            Action::HttpFetch { method, url } => {
+                format!("Fetching HTTP resource: {method} {url}...")
+            }
+            Action::InspectSystem { query, .. } => {
+                format!("Inspecting system: {}...", query.label())
+            }
+            Action::SpawnSubagent { subtask_id, goal, .. } => {
+                format!("Delegating subtask `{subtask_id}`: {goal}")
+            }
+            Action::AwaitSubagent { subtask_id, .. } => {
+                format!("Waiting for subtask `{subtask_id}`...")
+            }
+            Action::CheckSubagentStatus { subtask_id, .. } => {
+                format!("Checking subtask `{subtask_id}`...")
+            }
+            Action::WebSearch { query, .. } => {
+                format!("Searching the web for {:?}...", query)
+            }
+            Action::UpdatePlan { steps, .. } => {
+                format!("Updating implementation plan ({} steps)...", steps.len())
+            }
+            _ => self.call_line(sandbox),
+        }
+    }
+
     /// The full, verbatim approval text — exactly what will happen.
     pub fn approval_detail(&self, sandbox: &Sandbox) -> String {
         match self {

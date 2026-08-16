@@ -2747,12 +2747,10 @@ pub fn run_loop(
                     ActionPhase::Modify =>
                         "Implement the next unmet requirement; inspect exact source before editing."
                             .to_string(),
-                    ActionPhase::Verify if paging_shell_verification_required => concat!(
-                        "Modification is settled. Run the narrowest relevant test, build, lint, ",
-                        "type-check, syntax check, or changed artifact now; run_shell is the only ",
-                        "valid next action."
-                    )
-                    .to_string(),
+                    ActionPhase::Verify if paging_shell_verification_required => format!(
+                        "Modification is settled. Run the requested verification now with run_shell: {}. Execute the full command directly; do not run individual file syntax checks or reads first; run_shell is the only valid next action.",
+                        runtime.ledger.current_focus
+                    ),
                     ActionPhase::Verify if !pending_verification_paths.is_empty() =>
                         "Finish missing work; reread changed files; verify as required.".to_string(),
                     ActionPhase::Verify =>
@@ -4324,6 +4322,8 @@ pub fn run_loop(
                         }
                         _ => {}
                     }
+                    let narrative = action.narrative(sandbox);
+                    reporter.notice(&narrative);
                     reporter.tool_call(&action.call_line(sandbox));
 
                     // Consult the approval policy for the effective tier — the one
@@ -4584,6 +4584,15 @@ pub fn run_loop(
                     }
                     let name = action.tool_name();
                     reporter.tool_result(name, &outcome);
+                    if outcome.is_err() {
+                        let preview = outcome.text().trim();
+                        let preview_short = if preview.len() > 120 {
+                            &preview[..preview.char_indices().map(|(i, _)| i).nth(120).unwrap_or(preview.len())]
+                        } else {
+                            preview
+                        };
+                        reporter.notice(&format!("error in `{name}`: {preview_short}"));
+                    }
                     let host_python_verification = if context_paging.is_some()
                         && read_captures_pending_path
                     {
