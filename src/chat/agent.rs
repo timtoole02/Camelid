@@ -4795,7 +4795,15 @@ pub fn run_loop(
                                     sandbox.root(),
                                     &required_workspace_artifacts,
                                 );
-                                if missing_artifacts.is_empty() {
+                                if !required_workspace_artifacts.is_empty() && missing_artifacts.is_empty() {
+                                    runtime.ledger.current_focus = verification_requirements_focus(
+                                        sandbox.root(),
+                                        &task_objective,
+                                        &runtime.ledger.completed_work,
+                                        &required_workspace_artifacts,
+                                        &runtime.ledger.decisions,
+                                    );
+                                } else if missing_artifacts.is_empty() {
                                     runtime.ledger.current_focus = format!("Verify {relative}");
                                 } else {
                                     runtime.ledger.current_focus = format!(
