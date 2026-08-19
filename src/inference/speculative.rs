@@ -37,8 +37,8 @@ use std::{
 /// repetitive code (~1.20x), where 7 drafts regress to ~1.09x. Bounded by
 /// `cuda_resident::MAX_VERIFY_K - 1`.
 pub const DEFAULT_NGRAM_DRAFT_TOKENS: usize = 5;
-pub const DEFAULT_NGRAM_MIN_MATCH: usize = 3;
-pub const DEFAULT_NGRAM_MAX_MATCH: usize = 4;
+pub const DEFAULT_NGRAM_MIN_MATCH: usize = 2;
+pub const DEFAULT_NGRAM_MAX_MATCH: usize = 5;
 
 /// Default drafted tokens per round for the draft-model drafter. Each draft
 /// token costs a sequential forward through the draft model, so the window
@@ -53,6 +53,78 @@ pub fn accepted_draft_prefix(drafts: &[u32], target_predictions: &[u32]) -> usiz
         .zip(target_predictions.iter())
         .take_while(|(draft, prediction)| draft == prediction)
         .count()
+}
+
+/// Per-round speculative execution record for Phase 0 auditing.
+#[derive(Debug, Clone)]
+pub struct SpeculativeRoundRecord {
+    pub round: usize,
+    pub requested_k: usize,
+    pub draft_tokens_proposed: usize,
+    pub actual_verifier_batch_size: usize,
+    pub fallback_k1: bool,
+    pub accepted_draft_prefix: usize,
+    pub tokens_committed: usize,
+    pub round_wall_ms: f64,
+    pub gpu_ms: f64,
+    pub cpu_ms: f64,
+    pub io_wait_ms: f64,
+}
+
+/// Report detailed accounting and histograms for speculative execution rounds.
+pub fn report_speculative_accounting(rounds: &[SpeculativeRoundRecord]) {
+    if rounds.is_empty() {
+        return;
+    }
+    let total_rounds = rounds.len();
+    let total_committed: usize = rounds.iter().map(|r| r.tokens_committed).sum();
+    let total_evaluated: usize = rounds.iter().map(|r| r.actual_verifier_batch_size).sum();
+    let total_wall_ms: f64 = rounds.iter().map(|r| r.round_wall_ms).sum();
+    let fallback_k1_rounds = rounds.iter().filter(|r| r.fallback_k1).count();
+
+    let mut draft_hist = std::collections::BTreeMap::<usize, usize>::new();
+    let mut k_hist = std::collections::BTreeMap::<usize, usize>::new();
+    let mut prefix_hist = std::collections::BTreeMap::<usize, usize>::new();
+    let mut commit_hist = std::collections::BTreeMap::<usize, usize>::new();
+
+    for r in rounds {
+        *draft_hist.entry(r.draft_tokens_proposed).or_default() += 1;
+        *k_hist.entry(r.actual_verifier_batch_size).or_default() += 1;
+        *prefix_hist.entry(r.accepted_draft_prefix).or_default() += 1;
+        *commit_hist.entry(r.tokens_committed).or_default() += 1;
+    }
+
+    eprintln!("\n================================================================================");
+    eprintln!("SPECULATIVE DECODING PHASE 0 ACCOUNTING AUDIT");
+    eprintln!("================================================================================");
+    eprintln!("Total Rounds:               {total_rounds}");
+    eprintln!("Fallback K=1 Rounds:        {fallback_k1_rounds} ({:.1}%)", (fallback_k1_rounds as f64 / total_rounds as f64) * 100.0);
+    eprintln!("Total Tokens Committed:     {total_committed}");
+    eprintln!("Total Positions Evaluated:  {total_evaluated}");
+    eprintln!("Total Speculative Wall:     {total_wall_ms:.2} ms");
+    eprintln!("Actual Emitted Throughput:  {:.2} tok/s", (total_committed as f64 / (total_wall_ms / 1000.0).max(0.001)));
+    eprintln!("Verifier Evaluated Rate:    {:.2} pos/s", (total_evaluated as f64 / (total_wall_ms / 1000.0).max(0.001)));
+
+    eprintln!("\n--- [Histogram 1: Draft Length Proposed] ---");
+    for (len, count) in &draft_hist {
+        eprintln!("  Proposed {:>2} drafts : {:>4} rounds ({:>5.1}%)", len, count, (*count as f64 / total_rounds as f64) * 100.0);
+    }
+
+    eprintln!("\n--- [Histogram 2: Actual Verifier Batch K] ---");
+    for (k, count) in &k_hist {
+        eprintln!("  Verifier K={:>2}      : {:>4} rounds ({:>5.1}%)", k, count, (*count as f64 / total_rounds as f64) * 100.0);
+    }
+
+    eprintln!("\n--- [Histogram 3: Accepted Draft Prefix Length] ---");
+    for (prefix, count) in &prefix_hist {
+        eprintln!("  Accepted {:>2} drafts : {:>4} rounds ({:>5.1}%)", prefix, count, (*count as f64 / total_rounds as f64) * 100.0);
+    }
+
+    eprintln!("\n--- [Histogram 4: Tokens Committed Per Round (1 + Prefix)] ---");
+    for (committed, count) in &commit_hist {
+        eprintln!("  Committed {:>2} toks  : {:>4} rounds ({:>5.1}%)", committed, count, (*count as f64 / total_rounds as f64) * 100.0);
+    }
+    eprintln!("================================================================================\n");
 }
 
 pub enum SpeculativeDrafter {

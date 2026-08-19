@@ -1772,6 +1772,9 @@ enum Command {
         prompt: String,
         #[arg(long, default_value_t = 24)]
         max_tokens: usize,
+        /// Number of draft tokens for speculative decoding (e.g. --spec-ngram 5).
+        #[arg(long)]
+        spec_ngram: Option<usize>,
     },
     /// Chat with a DiffusionGemma model: render the chat template, run the
     /// bit-exact multi-canvas block-autoregressive denoise loop, detokenize.
@@ -3477,6 +3480,7 @@ async fn main() -> anyhow::Result<()> {
             path,
             prompt,
             max_tokens,
+            spec_ngram,
         } => {
             #[cfg(target_os = "macos")]
             {
@@ -3490,7 +3494,11 @@ async fn main() -> anyhow::Result<()> {
                     t0.elapsed().as_secs_f32()
                 );
                 let t1 = std::time::Instant::now();
-                let (out, ids) = runtime.generate_greedy(&prompt, max_tokens)?;
+                let (out, ids) = if let Some(draft_n) = spec_ngram {
+                    runtime.generate_greedy_speculative_gpu(&prompt, max_tokens, draft_n)?
+                } else {
+                    runtime.generate_greedy(&prompt, max_tokens)?
+                };
                 let gen = t1.elapsed().as_secs_f32();
                 eprintln!(
                     "[gemma4-gpu] generated in {gen:.1}s ({:.2} tok/s)",
@@ -3501,7 +3509,7 @@ async fn main() -> anyhow::Result<()> {
             }
             #[cfg(not(target_os = "macos"))]
             {
-                let _ = (&path, &prompt, max_tokens);
+                let _ = (&path, &prompt, max_tokens, spec_ngram);
                 return Err(camelid::BackendError::UnsupportedModelArchitecture(
                     "gemma4 GPU runtime requires macOS/Metal".into(),
                 )

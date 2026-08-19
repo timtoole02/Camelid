@@ -19097,7 +19097,7 @@ fn quantize_q8_0_blocks_into(input: &[f32], blocks: &mut Vec<Q8_0Block>) {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn quantize_q8_0_block(block: &[f32]) -> Q8_0Block {
+pub(crate) fn quantize_q8_0_block(block: &[f32]) -> Q8_0Block {
     use std::arch::aarch64::{
         vabsq_f32, vcombine_s16, vcombine_s8, vcvtaq_s32_f32, vdupq_n_f32, vget_high_f32,
         vget_lane_f32, vget_low_f32, vld1q_f32, vmax_f32, vmaxq_f32, vmovn_s32, vmulq_f32,
@@ -19200,7 +19200,7 @@ fn quantize_q8_0_block(block: &[f32]) -> Q8_0Block {
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-fn quantize_q8_0_block(block: &[f32]) -> Q8_0Block {
+pub(crate) fn quantize_q8_0_block(block: &[f32]) -> Q8_0Block {
     debug_assert_eq!(block.len(), Q8_0_BLOCK_VALUES);
     let max_abs = block
         .iter()

@@ -272,6 +272,10 @@ fn source_is_sparse(_path: &Path) -> Result<bool> {
 }
 
 fn allow_legacy_sparse_identity() -> bool {
+    // Fail closed (base semantics): a legacy .cghost with no sampled source
+    // identity pairs with a sparse GGUF only under an explicit opt-in. The
+    // silent default-allow that crept in here is exactly how the sparse
+    // hot-shadow got run as if it were the full model.
     std::env::var(ALLOW_LEGACY_SPARSE_IDENTITY_ENV)
         .ok()
         .is_some_and(|value| {
@@ -903,6 +907,18 @@ impl GhostMoeExpert {
         self.bytes.len()
     }
 
+    pub fn record_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn gate_up_bytes(&self) -> &[u8] {
+        self.tensor_bytes(&self.gate_up)
+    }
+
+    pub fn down_bytes(&self) -> &[u8] {
+        self.tensor_bytes(&self.down)
+    }
+
     pub(crate) fn tensor_backing(
         &self,
         view: &GhostMoeTensorView,
@@ -910,10 +926,7 @@ impl GhostMoeExpert {
         (Arc::clone(&self.bytes), view.offset..view.offset + view.len)
     }
 
-    /// Consumed by the CUDA lane's owned expert records; other targets read
-    /// through [`Self::tensor_backing`].
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-    pub(crate) fn tensor_bytes(&self, view: &GhostMoeTensorView) -> &[u8] {
+    pub fn tensor_bytes(&self, view: &GhostMoeTensorView) -> &[u8] {
         &self.bytes[view.offset..view.offset + view.len]
     }
 }
@@ -1238,6 +1251,11 @@ impl GhostFile {
             }
         }
         Ok(())
+    }
+
+    /// Whether this .cghost index carries a cryptographic sampled source identity.
+    pub fn has_sampled_source_identity(&self) -> bool {
+        self.index.source_identity.is_some()
     }
 
     /// Prove that this `.cghost` was repacked from the supplied GGUF (or from
@@ -1747,6 +1765,13 @@ impl GhostFile {
                 return Ok(());
             }
         }
+        // Positioned pread on purpose (base semantics). Serving multi-megabyte
+        // expert records by memcpy from the .cghost mmap looked free but is a
+        // page-fault storm under memory pressure: a 3.3 MB record faults ~200
+        // 16 KiB pages one at a time, measured at ~10.7 ms per fill event
+        // (~430 MB/s) versus ~1.5 ms for one pread on the same NVMe. Decode
+        // fills sit on the K=1 critical path, so this single shortcut cost
+        // ~70 ms/token at a 96% hit rate.
         read_exact_at(&self.file, buf, start).map_err(|e| io_err(Path::new("<cghost>"), e))?;
         Ok(())
     }

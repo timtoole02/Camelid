@@ -8756,7 +8756,19 @@ fn gemma4_ghost_moe_serve_config(
             catalog_managed: false,
         }));
     }
-    crate::ghost_install::installed_runtime_config(model_path)
+    if let Ok(Some(cfg)) = crate::ghost_install::installed_runtime_config(model_path) {
+        return Ok(Some(cfg));
+    }
+    let adjacent_cghost = model_path.with_extension("cghost");
+    if adjacent_cghost.is_file() {
+        return Ok(Some(crate::ghost_install::GhostMoeRuntimeConfig {
+            cghost: adjacent_cghost,
+            cache_mib: 1024,
+            strict_cache: false,
+            catalog_managed: false,
+        }));
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -9018,6 +9030,11 @@ mod gemma4_template_tests {
         }];
         let prompt = gemma4_chat_prompt(&messages, false);
         assert_eq!(prompt, "<|turn>user\nhi<turn|>\n<|turn>model\n");
+        assert_eq!(render_gemma4_prompt(&messages, false), prompt);
+        assert!(
+            !render_gemma4_prompt(&messages, false).contains("<|channel>"),
+            "thinking-off generation prompt must not prefill an empty thought channel"
+        );
         // Gemma 3 marker spellings tokenize as plain text on gemma4 vocabs and
         // must never appear.
         assert!(!prompt.contains("<start_of_turn>"));
@@ -10215,6 +10232,9 @@ enum Gemma4StreamItem {
 pub enum Gemma4ServeRuntime {
     Local(crate::gemma4_runtime::Gemma4Runtime),
     Distributed(crate::gemma4_distributed::Gemma4DistributedRuntime),
+    /// Metal GPU resident decode engine (macOS; stateful GPU runtime -> Mutex).
+    #[cfg(target_os = "macos")]
+    Gpu(std::sync::Mutex<crate::gemma4_runtime::Gemma4GpuRuntime>),
     /// CUDA decode engine (stateful GPU runtime -> Mutex; one request at a time).
     #[cfg(feature = "cuda")]
     Cuda {
@@ -10234,6 +10254,8 @@ impl Gemma4ServeRuntime {
         match self {
             Self::Local(runtime) => runtime.ghost_metal_components(),
             Self::Distributed(_) => Default::default(),
+            #[cfg(target_os = "macos")]
+            Self::Gpu(_) => Default::default(),
             #[cfg(feature = "cuda")]
             Self::Cuda { .. } => Default::default(),
         }
@@ -10261,6 +10283,12 @@ impl Gemma4ServeRuntime {
         let tokens = match self {
             Self::Local(runtime) => runtime.tokenizer().encode(prompt, true, true)?,
             Self::Distributed(runtime) => runtime.tokenizer().encode(prompt, true, true)?,
+            #[cfg(target_os = "macos")]
+            Self::Gpu(m) => m
+                .lock()
+                .expect("gemma4 gpu runtime lock")
+                .tokenizer()
+                .encode(prompt, true, true)?,
             #[cfg(feature = "cuda")]
             Self::Cuda { runtime, .. } => runtime
                 .lock()
@@ -10280,6 +10308,11 @@ impl Gemma4ServeRuntime {
         match self {
             Self::Local(r) => r.generate_greedy_cancellable(prompt, max_new, should_cancel),
             Self::Distributed(r) => r.generate_greedy_cancellable(prompt, max_new, should_cancel),
+            #[cfg(target_os = "macos")]
+            Self::Gpu(m) => m
+                .lock()
+                .expect("gemma4 gpu runtime lock")
+                .generate_greedy_cancellable(prompt, max_new, should_cancel),
             #[cfg(feature = "cuda")]
             Self::Cuda { runtime: m, .. } => m
                 .lock()
@@ -10302,6 +10335,11 @@ impl Gemma4ServeRuntime {
             Self::Distributed(r) => {
                 r.generate_greedy_streaming_cancellable(prompt, max_new, on_delta, should_cancel)
             }
+            #[cfg(target_os = "macos")]
+            Self::Gpu(m) => m
+                .lock()
+                .expect("gemma4 gpu runtime lock")
+                .generate_greedy_streaming_cancellable(prompt, max_new, on_delta, should_cancel),
             #[cfg(feature = "cuda")]
             Self::Cuda { runtime: m, .. } => m
                 .lock()
@@ -11400,6 +11438,14 @@ fn render_gemma3_prompt(messages: &[ChatMessage]) -> String {
         prompt.push_str("<start_of_turn>model\n");
     }
     prompt
+}
+
+/// Render a Gemma 4 chat prompt. This is the same oracle-locked renderer as
+/// [`gemma4_chat_prompt`]: `<|turn>{role}\n{content}<turn|>\n` with generation
+/// prompt `<|turn>model\n`. Empty `<|channel>thought` prefills are NOT part of
+/// the llama.cpp `--jinja` reference and must not be injected here.
+fn render_gemma4_prompt(messages: &[ChatMessage], enable_thinking: bool) -> String {
+    gemma4_chat_prompt(messages, enable_thinking)
 }
 
 /// Render an Ornith/qwen35 ChatML prompt (no tools). The generation prompt opens the
@@ -14095,6 +14141,19 @@ async fn load_gemma4_serve_runtime(
             .map(Gemma4ServeRuntime::Distributed)
         }
         (None, None) => {
+            #[cfg(target_os = "macos")]
+            {
+                if crate::metal::detect_metal_device().available {
+                    match crate::gemma4_runtime::Gemma4GpuRuntime::load(&load_path, 4096) {
+                        Ok(r) => return Ok(Gemma4ServeRuntime::Gpu(std::sync::Mutex::new(r))),
+                        Err(e) => {
+                            eprintln!(
+                                "[gemma4] Metal GPU resident load failed: {e}; falling back to CPU runtime"
+                            );
+                        }
+                    }
+                }
+            }
             #[cfg(feature = "cuda")]
             {
                 if gemma4_cuda_enabled() {
@@ -14160,6 +14219,8 @@ async fn load_gemma4_serve_runtime(
         match &runtime {
             Gemma4ServeRuntime::Local(_) => Gemma4ServeLane::Local,
             Gemma4ServeRuntime::Distributed(_) => Gemma4ServeLane::Distributed,
+            #[cfg(target_os = "macos")]
+            Gemma4ServeRuntime::Gpu(_) => Gemma4ServeLane::Local,
             #[cfg(feature = "cuda")]
             Gemma4ServeRuntime::Cuda { .. } => Gemma4ServeLane::Cuda,
         }
@@ -23129,6 +23190,13 @@ fn render_chat_prompt_for_tokenization_fallback(
         // and specials parse so <start_of_turn>/<end_of_turn> become their
         // control ids. Without this branch gemma3 fell to the role-colon
         // renderer, which the model was never trained on.
+        if is_gemma4_chat_template(template) {
+            return RenderedPrompt {
+                text: render_gemma4_prompt(messages, enable_thinking),
+                add_special: true,
+                parse_special: true,
+            };
+        }
         if is_gemma3_chat_template(template) {
             return RenderedPrompt {
                 text: render_gemma3_prompt(messages),
@@ -23722,6 +23790,10 @@ fn prepare_aya_runnable_chat_prompt(
             Some("messages"),
         )
     })
+}
+
+fn is_gemma4_chat_template(template: &str) -> bool {
+    template.contains("<|turn>") && template.contains("<turn|>")
 }
 
 /// The gemma chat-template shape the gemma-3 GGUFs ship: `<start_of_turn>` /
