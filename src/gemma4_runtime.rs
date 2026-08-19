@@ -1950,6 +1950,29 @@ fn chained_round_signature(start_pos: usize, hidden_rows: &[Vec<f32>]) -> (usize
     (start_pos, hidden_rows.len(), hasher.finish())
 }
 
+/// CAMELID_GEMMA4_CHAINED_PREDICT=1 forces the speculative single-submit
+/// predicted round even for chunks that are not an exact repeat (benchmark A/B
+/// only: a refused prediction costs a full extra GPU pass).
+#[cfg(target_os = "macos")]
+fn chained_predict_forced() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_CHAINED_PREDICT")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
+/// CAMELID_GEMMA4_SPEC_K1_LANE=head routes draft-less speculative rounds
+/// through the K=1 HEAD lane instead of the chained lane (A/B only: the two
+/// lanes are not bit-identical, so the speculative stream can then drift from
+/// the chained-lane greedy stream on near-ties).
+fn spec_k1_head_lane() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_SPEC_K1_LANE").is_ok_and(|v| v.eq_ignore_ascii_case("head"))
+    })
+}
+
 /// CAMELID_GEMMA4_TRACE_LANE=1: eprintln which forward lane each call takes.
 fn lane_trace_enabled() -> bool {
     std::env::var("CAMELID_GEMMA4_TRACE_LANE")
@@ -2638,7 +2661,15 @@ impl GhostMetalExpertRuntime {
         // (the chained lane never appends the host K/V caches). So predict
         // only on an exact repeat, and retry unpredicted on a refusal.
         let chunk_sig = chained_round_signature(start_pos, hidden_rows);
-        let allow_predicted = !self.suppress_prediction && k_tokens > 1;
+        // A fresh chunk routes differently from whatever is resident, so the
+        // predicted round would run a full GPU pass only to be refused by the
+        // post-hoc union check and re-run unpredicted (2x the round). Predict
+        // only on an exact repeat of the previous chained round, or when the
+        // caller opts in for benchmarks (CAMELID_GEMMA4_CHAINED_PREDICT=1).
+        let exact_repeat = self.last_chained_sig == Some(chunk_sig);
+        let allow_predicted = !self.suppress_prediction
+            && k_tokens > 1
+            && (exact_repeat || chained_predict_forced());
         let predicted_unions: Vec<Vec<usize>> = self
             .layers
             .iter()
@@ -2906,6 +2937,18 @@ impl GhostMetalExpertRuntime {
                     led.nvme_bytes as f64 / (1024.0 * 1024.0),
                     led.nvme_ms,
                     led.unique_experts_sum,
+                );
+                eprintln!(
+                    "[metal chained stages] split={} qkv_o={:.1}ms attn={:.1}ms router={:.1}ms shared={:.1}ms gateup={:.1}ms down={:.1}ms resid={:.1}ms gpu_total={:.1}ms",
+                    if led.gpu_stage_split_measured { "measured" } else { "per-cb" },
+                    led.gpu_qkv_o_ms,
+                    led.gpu_attn_ms,
+                    led.gpu_router_ms,
+                    led.gpu_shared_ms,
+                    led.gpu_gateup_ms,
+                    led.gpu_down_ms,
+                    led.gpu_resid_ms,
+                    led.gpu_busy_ms,
                 );
             }
         }
@@ -9606,9 +9649,17 @@ impl Gemma4Runtime {
             let drafts = drafter.draft(&history, max_draft.min(budget));
             if drafts.is_empty() {
                 if spec_timing {
-                    eprintln!("[spec-debug] round pos={pos} chunk_len=1 (fast K=1 step)");
+                    eprintln!("[spec-debug] round pos={pos} chunk_len=1 (K=1 round)");
                 }
-                logits = self.step(t0, pos, kc, vc)?;
+                // Keep every round on ONE lane. The K>1 verifier and the K=1
+                // step must share kernels (same per-token reduction order) for
+                // the speculative stream to equal the greedy stream exactly;
+                // mixing the HEAD lane in here diverges on near-ties.
+                logits = if spec_k1_head_lane() {
+                    self.step(t0, pos, kc, vc)?
+                } else {
+                    self.step_chunk_speculative(&[t0], &[], pos, kc, vc)?.1
+                };
                 pos += 1;
                 accepted_rounds += 1;
                 crate::metal::SPEC_VERIFY_ROUNDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

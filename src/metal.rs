@@ -579,6 +579,17 @@ struct GpuStageStamp {
     cbs: Vec<(u8, metal::CommandBuffer)>,
 }
 
+/// CAMELID_GEMMA4_CHAINED_STAGE_PROFILE=1: one command buffer per GPU stage in
+/// the chained round so the ledger's stage split is measured, not modelled.
+#[cfg(target_os = "macos")]
+fn chained_stage_profile_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_CHAINED_STAGE_PROFILE")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
 #[cfg(target_os = "macos")]
 impl GpuStageStamp {
     fn new() -> Self {
@@ -21066,6 +21077,10 @@ pub struct ChainedRoundHostLedger {
     pub overflow_layers: u32,
     pub overflow_experts: u32,
     pub overflow_wait_ms: f64,
+    /// True when the gpu_*_ms stage split came from one command buffer per
+    /// stage (CAMELID_GEMMA4_CHAINED_STAGE_PROFILE=1); otherwise each value is
+    /// the GPU time of whichever multi-stage command buffer was attributed to it.
+    pub gpu_stage_split_measured: bool,
 }
 
 impl ChainedRoundHostLedger {
@@ -23161,10 +23176,24 @@ impl Gemma4GhostCommonMetal {
         let mut encoder = cmd_buf.new_compute_command_encoder();
         stamp.start(GPU_STAGE_QKV_O);
         let mut predicted_cbs: Vec<metal::CommandBuffer> = Vec::new();
+        // CAMELID_GEMMA4_CHAINED_STAGE_PROFILE=1 splits every stage boundary
+        // into its own command buffer so `stamp.stages_ms()` reports REAL
+        // per-stage GPU time (at the cost of lost intra-layer overlap). Off by
+        // default: the boundary is a no-op and Metal memory barriers order the
+        // stages inside one command buffer.
+        let stage_profile = chained_stage_profile_enabled();
         macro_rules! begin_gpu_stage {
             ($stage:expr) => {{
-                // Intra-layer stage boundary: no-op since Metal memory barriers
-                // provide intra-buffer ordering without encoder teardown overhead.
+                if stage_profile {
+                    ledger.encode_ms += encode_clock.elapsed().as_secs_f64() * 1000.0;
+                    encoder.end_encoding();
+                    stamp.push_current(cmd_buf);
+                    cmd_buf.commit();
+                    encode_clock = std::time::Instant::now();
+                    cmd_buf = kernel.queue.new_command_buffer();
+                    encoder = cmd_buf.new_compute_command_encoder();
+                    stamp.start($stage);
+                }
             }};
         }
 
@@ -24681,21 +24710,29 @@ impl Gemma4GhostCommonMetal {
             total_gpu_us += gpu_us;
         }
         let total_gpu_ms = total_gpu_us as f64 / 1000.0;
-        ledger.gpu_busy_ms = total_gpu_ms;
-        ledger.gpu_gateup_ms = total_gpu_ms * 0.358;
-        ledger.gpu_down_ms = total_gpu_ms * 0.218;
-        ledger.gpu_qkv_o_ms = total_gpu_ms * 0.242;
-        ledger.gpu_shared_ms = total_gpu_ms * 0.114;
-        ledger.gpu_router_ms = total_gpu_ms * 0.044;
-        ledger.gpu_attn_ms = total_gpu_ms * 0.014;
-        ledger.gpu_resid_ms = (total_gpu_ms
-            - (ledger.gpu_gateup_ms
-                + ledger.gpu_down_ms
-                + ledger.gpu_qkv_o_ms
-                + ledger.gpu_shared_ms
-                + ledger.gpu_router_ms
-                + ledger.gpu_attn_ms))
-            .max(0.0);
+        // Per-stage GPU time from the command buffers actually retired this
+        // round. Without CAMELID_GEMMA4_CHAINED_STAGE_PROFILE=1 each command
+        // buffer spans several stages and is attributed to the stage that was
+        // current when it was committed, so only the round total and the
+        // profile-mode split are exact.
+        let stage_ms = stamp.stages_ms();
+        let stage_sum: f64 = stage_ms.iter().sum();
+        ledger.gpu_busy_ms = if stage_profile {
+            stage_sum
+        } else {
+            // The per-layer waits already accumulated every retired command
+            // buffer's GPU time; the final predicted command buffer is the only
+            // one not yet counted.
+            ledger.gpu_busy_ms + total_gpu_ms
+        };
+        ledger.gpu_qkv_o_ms = stage_ms[GPU_STAGE_QKV_O as usize];
+        ledger.gpu_attn_ms = stage_ms[GPU_STAGE_ATTN as usize];
+        ledger.gpu_router_ms = stage_ms[GPU_STAGE_ROUTER as usize];
+        ledger.gpu_shared_ms = stage_ms[GPU_STAGE_SHARED as usize];
+        ledger.gpu_gateup_ms = stage_ms[GPU_STAGE_GATEUP as usize];
+        ledger.gpu_down_ms = stage_ms[GPU_STAGE_DOWN as usize];
+        ledger.gpu_resid_ms = stage_ms[GPU_STAGE_RESID as usize];
+        ledger.gpu_stage_split_measured = stage_profile;
 
         if predicted_ready {
             for layer_idx in 0..n_layers {
