@@ -579,6 +579,18 @@ struct GpuStageStamp {
     cbs: Vec<(u8, metal::CommandBuffer)>,
 }
 
+/// CAMELID_GEMMA4_HEAD_SPEC50=0 falls back to the original batched tied-head
+/// kernels. The replacement is bitwise identical for K in 1..=8, so this is an
+/// A/B lever for timing, not a correctness switch.
+#[cfg(target_os = "macos")]
+fn head_spec50_disabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_HEAD_SPEC50")
+            .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+    })
+}
+
 /// CAMELID_GEMMA4_HEAD_K8_GENERIC=1: skip the one-row-per-simdgroup K=8 tied
 /// head specialization and use the same four-row kernel as every other batch
 /// width, so a row's logits do not depend on the round's width.
@@ -15098,6 +15110,7 @@ struct Gemma4Q6KHeadInner {
     q8k_scales_batch: Buffer,
     q8k_quants_batch: Buffer,
     logits_batch: Buffer,
+    activation_perm: Buffer,
     batch_matmul_scalar: Buffer,
     out_id: Buffer,
     count_buf: Buffer,
@@ -15200,6 +15213,11 @@ impl Gemma4Q6KHead {
         let q8k_scales_batch = shared(max_k * n_superblocks * std::mem::size_of::<f32>());
         let q8k_quants_batch = shared(max_k * hidden);
         let logits_batch = shared(max_k * vocab * std::mem::size_of::<f32>());
+        // Coalescing repack of the Q8_K activation quants for the spec50 head
+        // kernel. The head was activation-access bound, not weight-bandwidth
+        // bound: at K=8 the strided int8 fetch cost more than the 605 MB weight
+        // stream. This scratch holds the permuted copy the kernel reads.
+        let activation_perm = shared(spec50_activation_scratch_bytes(max_k, hidden));
         let batch_matmul_scalar = shared(16);
         unsafe {
             let bm = batch_matmul_scalar.contents() as *mut u32;
@@ -15218,6 +15236,7 @@ impl Gemma4Q6KHead {
                 q8k_scales_batch,
                 q8k_quants_batch,
                 logits_batch,
+                activation_perm,
                 batch_matmul_scalar,
                 out_id,
                 count_buf,
@@ -15475,21 +15494,47 @@ impl Gemma4Q6KHead {
         let cb = kernel.queue.new_command_buffer();
         let encoder = cb.new_compute_command_encoder();
         let vocab = state.vocab;
-        encode_q6k_ordered_batch(
-            encoder,
-            kernel,
-            &state.q8k_scales_batch,
-            &state.q8k_quants_batch,
-            &state.weight,
-            state.weight_offset as u64,
-            &state.logits_batch,
-            &state.batch_matmul_scalar,
-            n_superblocks,
-            vocab,
-            k,
-            hidden,
-            state.softcap,
-        );
+        // The spec50 kernel is asserted bitwise identical to encode_q6k_ordered_batch
+        // for every K in 1..=8 (see spec50_batch_is_bitwise_identical_to_reference),
+        // so this swap changes timing only, never a token. It falls back on its own
+        // when its pipelines are unavailable. Reached only for k >= 2; k == 1
+        // delegates to forward() above and keeps the single-token kernel, which has
+        // its own (fma-contraction) numerics that we deliberately do not disturb here.
+        let used_spec50 = !head_spec50_disabled()
+            && spec50_head_kernels().is_some_and(|kernels| {
+                encode_q6k_spec50_batch(
+                    encoder,
+                    kernels,
+                    &state.q8k_scales_batch,
+                    &state.q8k_quants_batch,
+                    &state.activation_perm,
+                    &state.weight,
+                    state.weight_offset as u64,
+                    &state.logits_batch,
+                    n_superblocks,
+                    vocab,
+                    k,
+                    hidden,
+                    state.softcap,
+                )
+            });
+        if !used_spec50 {
+            encode_q6k_ordered_batch(
+                encoder,
+                kernel,
+                &state.q8k_scales_batch,
+                &state.q8k_quants_batch,
+                &state.weight,
+                state.weight_offset as u64,
+                &state.logits_batch,
+                &state.batch_matmul_scalar,
+                n_superblocks,
+                vocab,
+                k,
+                hidden,
+                state.softcap,
+            );
+        }
         encoder.end_encoding();
         cb.commit();
         cb.wait_until_completed();
