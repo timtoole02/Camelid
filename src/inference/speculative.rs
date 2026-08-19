@@ -98,31 +98,60 @@ pub fn report_speculative_accounting(rounds: &[SpeculativeRoundRecord]) {
     eprintln!("SPECULATIVE DECODING PHASE 0 ACCOUNTING AUDIT");
     eprintln!("================================================================================");
     eprintln!("Total Rounds:               {total_rounds}");
-    eprintln!("Fallback K=1 Rounds:        {fallback_k1_rounds} ({:.1}%)", (fallback_k1_rounds as f64 / total_rounds as f64) * 100.0);
+    eprintln!(
+        "Fallback K=1 Rounds:        {fallback_k1_rounds} ({:.1}%)",
+        (fallback_k1_rounds as f64 / total_rounds as f64) * 100.0
+    );
     eprintln!("Total Tokens Committed:     {total_committed}");
     eprintln!("Total Positions Evaluated:  {total_evaluated}");
     eprintln!("Total Speculative Wall:     {total_wall_ms:.2} ms");
-    eprintln!("Actual Emitted Throughput:  {:.2} tok/s", (total_committed as f64 / (total_wall_ms / 1000.0).max(0.001)));
-    eprintln!("Verifier Evaluated Rate:    {:.2} pos/s", (total_evaluated as f64 / (total_wall_ms / 1000.0).max(0.001)));
+    eprintln!(
+        "Actual Emitted Throughput:  {:.2} tok/s",
+        (total_committed as f64 / (total_wall_ms / 1000.0).max(0.001))
+    );
+    eprintln!(
+        "Verifier Evaluated Rate:    {:.2} pos/s",
+        (total_evaluated as f64 / (total_wall_ms / 1000.0).max(0.001))
+    );
 
     eprintln!("\n--- [Histogram 1: Draft Length Proposed] ---");
     for (len, count) in &draft_hist {
-        eprintln!("  Proposed {:>2} drafts : {:>4} rounds ({:>5.1}%)", len, count, (*count as f64 / total_rounds as f64) * 100.0);
+        eprintln!(
+            "  Proposed {:>2} drafts : {:>4} rounds ({:>5.1}%)",
+            len,
+            count,
+            (*count as f64 / total_rounds as f64) * 100.0
+        );
     }
 
     eprintln!("\n--- [Histogram 2: Actual Verifier Batch K] ---");
     for (k, count) in &k_hist {
-        eprintln!("  Verifier K={:>2}      : {:>4} rounds ({:>5.1}%)", k, count, (*count as f64 / total_rounds as f64) * 100.0);
+        eprintln!(
+            "  Verifier K={:>2}      : {:>4} rounds ({:>5.1}%)",
+            k,
+            count,
+            (*count as f64 / total_rounds as f64) * 100.0
+        );
     }
 
     eprintln!("\n--- [Histogram 3: Accepted Draft Prefix Length] ---");
     for (prefix, count) in &prefix_hist {
-        eprintln!("  Accepted {:>2} drafts : {:>4} rounds ({:>5.1}%)", prefix, count, (*count as f64 / total_rounds as f64) * 100.0);
+        eprintln!(
+            "  Accepted {:>2} drafts : {:>4} rounds ({:>5.1}%)",
+            prefix,
+            count,
+            (*count as f64 / total_rounds as f64) * 100.0
+        );
     }
 
     eprintln!("\n--- [Histogram 4: Tokens Committed Per Round (1 + Prefix)] ---");
     for (committed, count) in &commit_hist {
-        eprintln!("  Committed {:>2} toks  : {:>4} rounds ({:>5.1}%)", committed, count, (*count as f64 / total_rounds as f64) * 100.0);
+        eprintln!(
+            "  Committed {:>2} toks  : {:>4} rounds ({:>5.1}%)",
+            committed,
+            count,
+            (*count as f64 / total_rounds as f64) * 100.0
+        );
     }
     eprintln!("================================================================================\n");
 }

@@ -1977,59 +1977,59 @@ fn fill_metal_wave_slots_from_host_cache(
     if !direct_fallback.is_empty() {
         let file = &cache.file;
         let t_disk = std::time::Instant::now();
-        let results: Vec<(GhostMetalSlotLoad, Result<()>)> =
-            if let Some(pool) = &cache.read_pool {
-                if direct_fallback.len() == 1 {
-                    let load = direct_fallback[0];
-                    let result = layer
-                        .slots
-                        .slot_bytes_mut(load.slot)
-                        .ok_or_else(|| {
-                            BackendError::InvalidModelMetadata(format!(
-                                "Ghost Metal slot {} is outside the layer slab",
-                                load.slot
-                            ))
-                        })
-                        .and_then(|destination| {
-                            file.read_moe_expert_into(layer_idx, load.expert, destination)
-                        });
-                    vec![(load, result)]
-                } else {
-                    let slots_ref = &layer.slots;
-                    pool.install(|| {
-                        direct_fallback
-                            .par_iter()
-                            .map(|&load| {
-                                let res = match unsafe { slots_ref.slot_bytes_mut_raw(load.slot) } {
-                                    Some(destination) => file
-                                        .read_moe_expert_into(layer_idx, load.expert, destination),
-                                    None => Err(BackendError::InvalidModelMetadata(format!(
-                                        "Ghost Metal slot {} is outside the layer slab",
-                                        load.slot
-                                    ))),
-                                };
-                                (load, res)
-                            })
-                            .collect()
+        let results: Vec<(GhostMetalSlotLoad, Result<()>)> = if let Some(pool) = &cache.read_pool {
+            if direct_fallback.len() == 1 {
+                let load = direct_fallback[0];
+                let result = layer
+                    .slots
+                    .slot_bytes_mut(load.slot)
+                    .ok_or_else(|| {
+                        BackendError::InvalidModelMetadata(format!(
+                            "Ghost Metal slot {} is outside the layer slab",
+                            load.slot
+                        ))
                     })
-                }
+                    .and_then(|destination| {
+                        file.read_moe_expert_into(layer_idx, load.expert, destination)
+                    });
+                vec![(load, result)]
             } else {
-                direct_fallback
-                    .iter()
-                    .map(|&load| {
-                        let res = match layer.slots.slot_bytes_mut(load.slot) {
-                            Some(destination) => {
-                                file.read_moe_expert_into(layer_idx, load.expert, destination)
-                            }
-                            None => Err(BackendError::InvalidModelMetadata(format!(
-                                "Ghost Metal slot {} is outside the layer slab",
-                                load.slot
-                            ))),
-                        };
-                        (load, res)
-                    })
-                    .collect()
-            };
+                let slots_ref = &layer.slots;
+                pool.install(|| {
+                    direct_fallback
+                        .par_iter()
+                        .map(|&load| {
+                            let res = match unsafe { slots_ref.slot_bytes_mut_raw(load.slot) } {
+                                Some(destination) => {
+                                    file.read_moe_expert_into(layer_idx, load.expert, destination)
+                                }
+                                None => Err(BackendError::InvalidModelMetadata(format!(
+                                    "Ghost Metal slot {} is outside the layer slab",
+                                    load.slot
+                                ))),
+                            };
+                            (load, res)
+                        })
+                        .collect()
+                })
+            }
+        } else {
+            direct_fallback
+                .iter()
+                .map(|&load| {
+                    let res = match layer.slots.slot_bytes_mut(load.slot) {
+                        Some(destination) => {
+                            file.read_moe_expert_into(layer_idx, load.expert, destination)
+                        }
+                        None => Err(BackendError::InvalidModelMetadata(format!(
+                            "Ghost Metal slot {} is outside the layer slab",
+                            load.slot
+                        ))),
+                    };
+                    (load, res)
+                })
+                .collect()
+        };
         let mut ok_reads = 0usize;
         for (load, result) in results {
             match result {
@@ -2089,10 +2089,15 @@ fn fill_compact_wave_into_slots(
     };
     let host_ms = t_host.elapsed().as_secs_f64() * 1000.0;
     let stats_after = cache.stats();
-    let new_bytes = stats_after.bytes_read.saturating_sub(stats_before.bytes_read);
+    let new_bytes = stats_after
+        .bytes_read
+        .saturating_sub(stats_before.bytes_read);
     let new_misses = stats_after.misses.saturating_sub(stats_before.misses);
     if new_bytes > 0 {
-        nvme_us.fetch_add((host_ms * 1000.0) as u64, std::sync::atomic::Ordering::Relaxed);
+        nvme_us.fetch_add(
+            (host_ms * 1000.0) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         nvme_bytes.fetch_add(new_bytes, std::sync::atomic::Ordering::Relaxed);
         demand_loads.fetch_add(new_misses as usize, std::sync::atomic::Ordering::Relaxed);
     }
@@ -2111,11 +2116,7 @@ fn fill_compact_wave_into_slots(
         if i < slot_count && record.byte_len() == record_bytes {
             unsafe {
                 let dst = (base_raw + i * stride) as *mut u8;
-                std::ptr::copy_nonoverlapping(
-                    record.record_bytes().as_ptr(),
-                    dst,
-                    record_bytes,
-                );
+                std::ptr::copy_nonoverlapping(record.record_bytes().as_ptr(), dst, record_bytes);
             }
         }
     });
@@ -2350,7 +2351,9 @@ impl GhostMetalExpertRuntime {
         };
         let mut overflow_bank = Vec::with_capacity(bank_copies);
         for _ in 0..bank_copies {
-            overflow_bank.push(crate::metal::Gemma4Q4ExpertSlots::new(GHOST_METAL_OVERFLOW_SLOTS)?);
+            overflow_bank.push(crate::metal::Gemma4Q4ExpertSlots::new(
+                GHOST_METAL_OVERFLOW_SLOTS,
+            )?);
         }
         eprintln!(
             "[gemma4-ghost-metal] global overflow bank: {}×{} slots ({:.2} MiB total){}, reused across {} layers (not per-layer)",
@@ -2457,7 +2460,13 @@ impl GhostMetalExpertRuntime {
         start_pos: usize,
     ) -> Option<Vec<Vec<f32>>> {
         let common = self.common.as_mut()?;
-        common.execute_attention_chunk(layer_idx, hidden_rows, rope_freq_base, rope_factors, start_pos)
+        common.execute_attention_chunk(
+            layer_idx,
+            hidden_rows,
+            rope_freq_base,
+            rope_factors,
+            start_pos,
+        )
     }
 
     fn execute_attention_chunk_into(
@@ -2469,8 +2478,17 @@ impl GhostMetalExpertRuntime {
         start_pos: usize,
         out_rows: &mut [Vec<f32>],
     ) -> bool {
-        let Some(common) = self.common.as_mut() else { return false; };
-        common.execute_attention_chunk_into(layer_idx, hidden_rows, rope_freq_base, rope_factors, start_pos, out_rows)
+        let Some(common) = self.common.as_mut() else {
+            return false;
+        };
+        common.execute_attention_chunk_into(
+            layer_idx,
+            hidden_rows,
+            rope_freq_base,
+            rope_factors,
+            start_pos,
+            out_rows,
+        )
     }
 
     fn execute_attention_and_shared_chunk_into(
@@ -2485,7 +2503,9 @@ impl GhostMetalExpertRuntime {
         out_router_logits: Option<&mut [f32]>,
         is_first_layer: bool,
     ) -> bool {
-        let Some(common) = self.common.as_mut() else { return false; };
+        let Some(common) = self.common.as_mut() else {
+            return false;
+        };
         common.execute_attention_and_shared_chunk_into(
             layer_idx,
             hidden_rows,
@@ -2501,11 +2521,15 @@ impl GhostMetalExpertRuntime {
 
     #[cfg(target_os = "macos")]
     fn resident_expert_input_buffers(&self) -> Option<(&metal::Buffer, &metal::Buffer)> {
-        self.common.as_ref().map(|c| c.resident_expert_input_buffers())
+        self.common
+            .as_ref()
+            .map(|c| c.resident_expert_input_buffers())
     }
 
     #[cfg(target_os = "macos")]
-    fn resident_residual_buffers(&self) -> Option<(&metal::Buffer, &metal::Buffer, &metal::Buffer)> {
+    fn resident_residual_buffers(
+        &self,
+    ) -> Option<(&metal::Buffer, &metal::Buffer, &metal::Buffer)> {
         self.common.as_ref().map(|c| c.resident_residual_buffers())
     }
 
@@ -2513,8 +2537,17 @@ impl GhostMetalExpertRuntime {
     fn resident_fused_tail_buffers(
         &self,
         layer_idx: usize,
-    ) -> Option<(&metal::Buffer, &metal::Buffer, &metal::Buffer, &metal::Buffer, &metal::Buffer, f32)> {
-        self.common.as_ref().and_then(|c| c.resident_fused_tail_buffers(layer_idx))
+    ) -> Option<(
+        &metal::Buffer,
+        &metal::Buffer,
+        &metal::Buffer,
+        &metal::Buffer,
+        &metal::Buffer,
+        f32,
+    )> {
+        self.common
+            .as_ref()
+            .and_then(|c| c.resident_fused_tail_buffers(layer_idx))
     }
 
     #[cfg(target_os = "macos")]
@@ -2541,7 +2574,12 @@ impl GhostMetalExpertRuntime {
         let t_setup = std::time::Instant::now();
         let mut slot_mappings = [[0xFFFFFFFFu32; 128]; 30];
         let mut num_slots_per_layer = [0usize; 30];
-        let expert_slabs: Vec<metal::Buffer> = self.layers.iter().take(30).map(|l| l.slots.slab_buffer().clone()).collect();
+        let expert_slabs: Vec<metal::Buffer> = self
+            .layers
+            .iter()
+            .take(30)
+            .map(|l| l.slots.slab_buffer().clone())
+            .collect();
 
         for (li, layer) in self.layers.iter().enumerate().take(30) {
             for e in 0..128 {
@@ -2651,60 +2689,72 @@ impl GhostMetalExpertRuntime {
 
         let layers_ref = &mut self.layers;
         let mut slot_filler = if let Some(cache) = ghost_cache {
-            Some(|layer_idx: usize, router_logits: &[f32], wave: Option<&[usize]>, updated_slots: &mut [u32; 128], union_out: &mut Vec<usize>| {
-                let layer = &mut layers_ref[layer_idx];
-                let n_tokens = k_tokens.min(crate::metal::GEMMA4_RESIDENT_MAX_BATCH);
-                let n_slots = layer.directory.entries.len();
+            Some(
+                |layer_idx: usize,
+                 router_logits: &[f32],
+                 wave: Option<&[usize]>,
+                 updated_slots: &mut [u32; 128],
+                 union_out: &mut Vec<usize>| {
+                    let layer = &mut layers_ref[layer_idx];
+                    let n_tokens = k_tokens.min(crate::metal::GEMMA4_RESIDENT_MAX_BATCH);
+                    let n_slots = layer.directory.entries.len();
 
-                let selected_experts: Vec<usize> = if let Some(wave) = wave {
-                    wave.to_vec()
-                } else {
-                    let mut selected_experts = Vec::with_capacity(n_tokens * 8);
-                    for t in 0..n_tokens {
-                        let logits = &router_logits[t * 128..(t + 1) * 128];
-                        let mut maxl = f32::MIN;
-                        for &v in logits {
-                            if v > maxl { maxl = v; }
-                        }
-                        let mut probs = [0.0f32; 128];
-                        for e in 0..128 {
-                            probs[e] = (logits[e] - maxl).exp();
-                        }
-                        let mut ranked: [usize; 128] = std::array::from_fn(|i| i);
-                        ranked.sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal));
-                        for i in 0..8 {
-                            let e = ranked[i];
-                            if !selected_experts.contains(&e) {
-                                selected_experts.push(e);
+                    let selected_experts: Vec<usize> = if let Some(wave) = wave {
+                        wave.to_vec()
+                    } else {
+                        let mut selected_experts = Vec::with_capacity(n_tokens * 8);
+                        for t in 0..n_tokens {
+                            let logits = &router_logits[t * 128..(t + 1) * 128];
+                            let mut maxl = f32::MIN;
+                            for &v in logits {
+                                if v > maxl {
+                                    maxl = v;
+                                }
+                            }
+                            let mut probs = [0.0f32; 128];
+                            for e in 0..128 {
+                                probs[e] = (logits[e] - maxl).exp();
+                            }
+                            let mut ranked: [usize; 128] = std::array::from_fn(|i| i);
+                            ranked.sort_unstable_by(|&a, &b| {
+                                probs[b]
+                                    .partial_cmp(&probs[a])
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            for i in 0..8 {
+                                let e = ranked[i];
+                                if !selected_experts.contains(&e) {
+                                    selected_experts.push(e);
+                                }
                             }
                         }
-                    }
-                    union_out.clear();
-                    union_out.extend_from_slice(&selected_experts);
-                    collected_routes[layer_idx] = selected_experts.clone();
-                    if selected_experts.len() > n_slots {
-                        // Overflow becomes extra waves. Keep any speculative
-                        // wave-0 slot table filled during the router wait.
-                        return;
-                    }
-                    selected_experts
-                };
+                        union_out.clear();
+                        union_out.extend_from_slice(&selected_experts);
+                        collected_routes[layer_idx] = selected_experts.clone();
+                        if selected_experts.len() > n_slots {
+                            // Overflow becomes extra waves. Keep any speculative
+                            // wave-0 slot table filled during the router wait.
+                            return;
+                        }
+                        selected_experts
+                    };
 
-                fill_metal_wave_slots_from_host_cache(
-                    layer,
-                    cache,
-                    layer_idx,
-                    &selected_experts,
-                    &nvme_us,
-                    &nvme_bytes,
-                    &demand_loads,
-                );
+                    fill_metal_wave_slots_from_host_cache(
+                        layer,
+                        cache,
+                        layer_idx,
+                        &selected_experts,
+                        &nvme_us,
+                        &nvme_bytes,
+                        &demand_loads,
+                    );
 
-                for e in 0..128 {
-                    let s = layer.directory.resident_slot_table[e];
-                    updated_slots[e] = if s >= 0 { s as u32 } else { 0xFFFFFFFFu32 };
-                }
-            })
+                    for e in 0..128 {
+                        let s = layer.directory.resident_slot_table[e];
+                        updated_slots[e] = if s >= 0 { s as u32 } else { 0xFFFFFFFFu32 };
+                    }
+                },
+            )
         } else {
             None
         };
@@ -2731,7 +2781,9 @@ impl GhostMetalExpertRuntime {
             }
         });
 
-        let mut slot_filler_fn: Option<&mut dyn FnMut(usize, &[f32], Option<&[usize]>, &mut [u32; 128], &mut Vec<usize>)> = match slot_filler.as_mut() {
+        let mut slot_filler_fn: Option<
+            &mut dyn FnMut(usize, &[f32], Option<&[usize]>, &mut [u32; 128], &mut Vec<usize>),
+        > = match slot_filler.as_mut() {
             Some(f) => Some(f),
             None => None,
         };
@@ -2745,7 +2797,9 @@ impl GhostMetalExpertRuntime {
         let wave1_refs: Vec<&metal::Buffer> = wave1_gpu.iter().collect();
         let slot_mapping_slices: Vec<&[u32; 128]> = slot_mappings.iter().collect();
         let ok = {
-            let Some(common) = self.common.as_mut() else { return false; };
+            let Some(common) = self.common.as_mut() else {
+                return false;
+            };
             common.update_resident_slot_tables(&slot_mapping_slices);
             common.execute_chained_round_all_layers(
                 hidden_rows,
@@ -2785,9 +2839,12 @@ impl GhostMetalExpertRuntime {
             self.last_chained_sig = Some(chunk_sig);
         }
         if let Some(common) = self.common.as_mut() {
-            common.last_chained_ledger.nvme_ms = nvme_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0;
-            common.last_chained_ledger.nvme_bytes = nvme_bytes.load(std::sync::atomic::Ordering::Relaxed);
-            common.last_chained_ledger.demand_loads = demand_loads.load(std::sync::atomic::Ordering::Relaxed);
+            common.last_chained_ledger.nvme_ms =
+                nvme_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0;
+            common.last_chained_ledger.nvme_bytes =
+                nvme_bytes.load(std::sync::atomic::Ordering::Relaxed);
+            common.last_chained_ledger.demand_loads =
+                demand_loads.load(std::sync::atomic::Ordering::Relaxed);
             common.last_chained_ledger.prefetch_ms = prefetch_ms;
             common.last_chained_ledger.setup_ms = setup_ms;
             if ghost_metal_timing_enabled() {
@@ -2862,7 +2919,10 @@ impl GhostMetalExpertRuntime {
             for slot in 0..hot_count {
                 let expert = slot;
                 if let Some(dest) = layer.slots.slot_bytes_mut(slot) {
-                    if ghost_file.read_moe_expert_into(layer_idx, expert, dest).is_ok() {
+                    if ghost_file
+                        .read_moe_expert_into(layer_idx, expert, dest)
+                        .is_ok()
+                    {
                         // Frequency 1: prewarm is a cold-start guess, not
                         // routing evidence. Seeding at 50 made stale guessed
                         // experts out-rank live ones under LFU for ~200 tokens
@@ -3051,9 +3111,11 @@ impl GhostMetalExpertRuntime {
                         .par_iter()
                         .map(|&load| {
                             let res = match unsafe { slots_ref.slot_bytes_mut_raw(load.slot) } {
-                                Some(destination) => {
-                                    file.read_moe_expert_into(ghost.layer_idx, load.expert, destination)
-                                }
+                                Some(destination) => file.read_moe_expert_into(
+                                    ghost.layer_idx,
+                                    load.expert,
+                                    destination,
+                                ),
                                 None => Err(BackendError::InvalidModelMetadata(format!(
                                     "Ghost Metal slot {} is outside the layer slab",
                                     load.slot
@@ -3138,8 +3200,7 @@ impl GhostMetalExpertRuntime {
                 {
                     if let Some(actual) = layer.slots.slot_bytes_mut(slot) {
                         let ok_head = actual[..16] == expected[..16];
-                        let ok_tail = actual
-                            [crate::metal::GEMMA4_Q4_EXPERT_RECORD_BYTES - 16..]
+                        let ok_tail = actual[crate::metal::GEMMA4_Q4_EXPERT_RECORD_BYTES - 16..]
                             == expected[crate::metal::GEMMA4_Q4_EXPERT_RECORD_BYTES - 16..];
                         if !ok_head || !ok_tail {
                             eprintln!(
@@ -3195,7 +3256,8 @@ impl GhostMetalExpertRuntime {
                 if missing.is_empty() {
                     return None;
                 }
-                let capped_missing: Vec<usize> = missing.into_iter().take(layer.slots.slot_count()).collect();
+                let capped_missing: Vec<usize> =
+                    missing.into_iter().take(layer.slots.slot_count()).collect();
                 match layer.directory.plan(&capped_missing) {
                     Ok(plan) => {
                         if plan.loads.is_empty() {
@@ -3221,14 +3283,14 @@ impl GhostMetalExpertRuntime {
             let slots_ref = &layer.slots;
             loads
                 .iter()
-                .map(|load| {
-                    match unsafe { slots_ref.slot_bytes_mut_raw(load.slot) } {
+                .map(
+                    |load| match unsafe { slots_ref.slot_bytes_mut_raw(load.slot) } {
                         Some(destination) => file
                             .read_moe_expert_into(*layer_idx, load.expert, destination)
                             .is_ok(),
                         None => false,
-                    }
-                })
+                    },
+                )
                 .collect()
         };
 
@@ -3402,7 +3464,10 @@ impl GhostMetalExpertRuntime {
             let slot = layer.directory.lookup_resident_slot(e)?;
             slot_indices.push(slot);
         }
-        layer.stats.route_lookups = layer.stats.route_lookups.saturating_add(unique_experts.len() as u64);
+        layer.stats.route_lookups = layer
+            .stats
+            .route_lookups
+            .saturating_add(unique_experts.len() as u64);
         layer.stats.hits = layer.stats.hits.saturating_add(unique_experts.len() as u64);
         Some((layer.slots.slab_buffer(), slot_indices))
     }
@@ -3487,9 +3552,11 @@ impl GhostMetalExpertRuntime {
                         .par_iter()
                         .map(|&load| {
                             let res = match unsafe { slots_ref.slot_bytes_mut_raw(load.slot) } {
-                                Some(destination) => {
-                                    file.read_moe_expert_into(ghost.layer_idx, load.expert, destination)
-                                }
+                                Some(destination) => file.read_moe_expert_into(
+                                    ghost.layer_idx,
+                                    load.expert,
+                                    destination,
+                                ),
                                 None => Err(BackendError::InvalidModelMetadata(format!(
                                     "Ghost Metal slot {} is outside the layer slab",
                                     load.slot
@@ -4849,8 +4916,8 @@ impl Gemma4Runtime {
             let enabled = (flag("CAMELID_GEMMA4_GHOST_METAL_SLOTS")
                 || crate::cuda::gpu_accel_enabled())
                 && !crate::inference::deterministic_mode_enabled();
-            let fused_fast = flag("CAMELID_GEMMA4_GHOST_METAL_SLOTS_FAST")
-                || crate::cuda::gpu_accel_enabled();
+            let fused_fast =
+                flag("CAMELID_GEMMA4_GHOST_METAL_SLOTS_FAST") || crate::cuda::gpu_accel_enabled();
             let common_enabled = (flag("CAMELID_GEMMA4_GHOST_METAL_COMMON")
                 || crate::cuda::gpu_accel_enabled())
                 && !crate::inference::deterministic_mode_enabled();
@@ -5118,7 +5185,11 @@ impl Gemma4Runtime {
                 });
             if let Ok(mut guard) = self.metal_q4_experts.lock() {
                 if let Some(lane) = guard.as_mut() {
-                    lane.prefetch_round_wide_async(&predicted_routes, &cache.file, &cache.read_pool);
+                    lane.prefetch_round_wide_async(
+                        &predicted_routes,
+                        &cache.file,
+                        &cache.read_pool,
+                    );
                 }
             }
         }
@@ -5297,7 +5368,12 @@ impl Gemma4Runtime {
             };
             if imported {
                 let keep_host_kv = std::env::var("CAMELID_SPEC_DECODE")
-                    .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "none"))
+                    .map(|v| {
+                        !matches!(
+                            v.trim().to_ascii_lowercase().as_str(),
+                            "off" | "0" | "false" | "none"
+                        )
+                    })
                     .unwrap_or(true);
                 if !keep_host_kv {
                     // Drop the per-position allocations when pure scalar GPU decode is used.
@@ -5768,7 +5844,9 @@ impl Gemma4Runtime {
         // the chained lane is the K>1 verifier.
         #[cfg(target_os = "macos")]
         if chained_k1_enabled() && self.supports_chunk_forward() {
-            if lane_trace_enabled() { eprintln!("[lane] step pos={pos} -> chunk(K=1)"); }
+            if lane_trace_enabled() {
+                eprintln!("[lane] step pos={pos} -> chunk(K=1)");
+            }
             let mut rows = self.step_chunk_with_head(&[token], pos, kc, vc, true, None)?;
             return Ok(rows.pop().expect("step_chunk_with_head emits 1 row"));
         }
@@ -5781,7 +5859,9 @@ impl Gemma4Runtime {
         }
         #[cfg(target_os = "macos")]
         self.guard_cpu_kv_lane(pos, kc)?;
-        if lane_trace_enabled() { eprintln!("[lane] step pos={pos} -> step_range(scalar CPU)"); }
+        if lane_trace_enabled() {
+            eprintln!("[lane] step pos={pos} -> step_range(scalar CPU)");
+        }
         match self.step_range(token, pos, None, kc, vc)? {
             Gemma4StepOutput::Logits(logits) => Ok(logits),
             Gemma4StepOutput::Hidden(_) => Err(BackendError::InvalidModelMetadata(
@@ -5828,10 +5908,7 @@ impl Gemma4Runtime {
     /// attend over nothing. Fail closed instead of producing wrong logits.
     #[cfg(target_os = "macos")]
     fn guard_cpu_kv_lane(&self, pos: usize, kc: &[Vec<Vec<f32>>]) -> Result<()> {
-        if pos > 0
-            && self.ghost_metal_q4_is_enabled()
-            && kc.iter().all(|layer| layer.is_empty())
-        {
+        if pos > 0 && self.ghost_metal_q4_is_enabled() && kc.iter().all(|layer| layer.is_empty()) {
             return Err(BackendError::InvalidModelMetadata(format!(
                 "Gemma 4 scalar step at position {pos} fell through to the CPU KV lane \
                  while the host K/V caches are empty (the Metal lane holds the sequence); \
@@ -6044,8 +6121,8 @@ impl Gemma4Runtime {
                     if let Ok(guard) = self.metal_q4_experts.lock() {
                         if let Some(lane) = guard.as_ref() {
                             let led = lane.last_chained_ledger();
-                            let filler_cpu = (led.slot_filler_ms + led.wave_load_ms - led.nvme_ms)
-                                .max(0.0);
+                            let filler_cpu =
+                                (led.slot_filler_ms + led.wave_load_ms - led.nvme_ms).max(0.0);
                             prof.gpu_chained_round_ok = true;
                             prof.chained_upload_ms = led.upload_ms;
                             prof.chained_rope_ms = led.rope_ms;
@@ -6084,8 +6161,10 @@ impl Gemma4Runtime {
                             prof.gpu_down_ms = led.gpu_down_ms;
                             prof.gpu_resid_ms = led.gpu_resid_ms;
                             prof.cp_command_encoding_ms += led.encode_ms;
-                            prof.cp_gpu_waits_ms +=
-                                led.slot_wait_ms + led.final_wait_ms + led.wave_gpu_ms + led.overflow_wait_ms;
+                            prof.cp_gpu_waits_ms += led.slot_wait_ms
+                                + led.final_wait_ms
+                                + led.wave_gpu_ms
+                                + led.overflow_wait_ms;
                             prof.cp_cache_slot_lookup_ms += filler_cpu + led.setup_ms;
                             prof.physical_ssd_reads_ms += led.nvme_ms;
                             prof.physical_ssd_bytes += led.nvme_bytes;
@@ -6109,302 +6188,310 @@ impl Gemma4Runtime {
                     "ok=0 fallback=1\n",
                 );
             }
-        for li in 0..n_local {
-            let l = li; // single-node: global == local
-            let lw = &self.layers[li];
-            let sliding = self.g.is_sliding_layer(l);
-            let head_dim = self.g.head_dim_at(l) as usize;
-            let theta = self.g.rope_freq_base_at(l);
-            let kv_heads = self.g.kv_heads_at(l) as usize;
-            let ffn_dim = self.g.ffn_length_at(l) as usize;
-            let q_dim = heads * head_dim;
-            let kv_dim = kv_heads * head_dim;
-            let rope_factors = if sliding {
-                None
-            } else {
-                self.rope_factors.as_deref()
-            };
-
-            // --- attention projections, GPU-accelerated on Metal with CPU fallback ---
-            let mut gpu_attn_ok = false;
-            let mut gpu_shared_mlp_ok = false;
-            let mut gpu_router_ok = false;
-            let t_gpu_attn_start = std::time::Instant::now();
-
-            #[cfg(target_os = "macos")]
-            if self.ghost_metal_q4_is_enabled() {
-                if let Ok(mut guard) = self.metal_q4_experts.lock() {
-                    if let Some(lane) = guard.as_mut() {
-                        if lw.moe.is_some() {
-                            gpu_shared_mlp_ok = lane.execute_attention_and_shared_chunk_into(
-                                li,
-                                &hs,
-                                theta,
-                                rope_factors,
-                                start_pos,
-                                &mut hs_buf,
-                                &mut shared_mlp_buf,
-                                Some(&mut router_logits_buf),
-                                li == 0,
-                            );
-                            gpu_attn_ok = gpu_shared_mlp_ok;
-                            gpu_router_ok = gpu_shared_mlp_ok;
-                        } else {
-                            gpu_attn_ok = lane.execute_attention_chunk_into(
-                                li,
-                                &hs,
-                                theta,
-                                rope_factors,
-                                start_pos,
-                                &mut hs_buf,
-                            );
-                        }
-                    }
-                }
-            }
-
-            if gpu_attn_ok {
-                let attn_dur = t_gpu_attn_start.elapsed();
-                std::mem::swap(&mut hs, &mut hs_buf);
-                if let Some(prof) = profile.as_deref_mut() {
-                    prof.cp_attention_common_core_ms += attn_dur.as_secs_f64() * 1000.0;
-                    prof.attention_core_ms += attn_dur.as_secs_f64() * 1000.0;
-                }
-            } else {
-                let t_attn_proj_start = std::time::Instant::now();
-                let xn_rows: Vec<Vec<f32>> = hs
-                    .iter()
-                    .map(|h| rms_norm(h, Some(&lw.attn_norm), eps))
-                    .collect();
-                let xnq = SharedActivationBatch::new(&xn_rows);
-                let mut q_rows = lw.attn_q.matmul_proj(q_dim, &xnq);
-                for q in q_rows.iter_mut() {
-                    for hh in 0..heads {
-                        let s = &mut q[hh * head_dim..(hh + 1) * head_dim];
-                        s.copy_from_slice(&rms_norm(s, Some(&lw.q_norm), eps));
-                    }
-                }
-                let attn_q_dur = t_attn_proj_start.elapsed();
-
-                let t_rope_q_start = std::time::Instant::now();
-                for (i, q) in q_rows.iter_mut().enumerate() {
-                    apply_rope(q, heads, head_dim, start_pos + i, theta, rope_factors);
-                }
-                let rope_q_dur = t_rope_q_start.elapsed();
-
-                let mut attn_kv_dur = std::time::Duration::ZERO;
-                let mut rope_kv_dur = std::time::Duration::ZERO;
-                if l < self.first_kv_shared {
-                    let t_kv_proj_start = std::time::Instant::now();
-                    let mut k_rows = lw
-                        .attn_k
-                        .as_ref()
-                        .expect("validate() guarantees owning layers bind attn_k")
-                        .matmul_proj(kv_dim, &xnq);
-                    let mut v_rows = match lw.attn_v.as_ref() {
-                        Some(wv) => wv.matmul_proj(kv_dim, &xnq),
-                        None => k_rows.clone(),
-                    };
-                    for i in 0..kk {
-                        for hh in 0..kv_heads {
-                            let s = &mut k_rows[i][hh * head_dim..(hh + 1) * head_dim];
-                            s.copy_from_slice(&rms_norm(
-                                s,
-                                Some(lw.k_norm.as_deref().expect(
-                                    "validate() guarantees owning layers bind attn_k_norm",
-                                )),
-                                eps,
-                            ));
-                            // Gemma 4 reference: V takes a weightless per-head
-                            // RMS norm before caching (and never RoPE).
-                            let sv = &mut v_rows[i][hh * head_dim..(hh + 1) * head_dim];
-                            sv.copy_from_slice(&rms_norm(sv, None, eps));
-                        }
-                    }
-                    attn_kv_dur = t_kv_proj_start.elapsed();
-
-                    let t_rope_kv_start = std::time::Instant::now();
-                    for (i, k) in k_rows.iter_mut().enumerate() {
-                        apply_rope(k, kv_heads, head_dim, start_pos + i, theta, rope_factors);
-                    }
-                    rope_kv_dur = t_rope_kv_start.elapsed();
-
-                    for i in 0..kk {
-                        kc[li].push(k_rows[i].clone());
-                        vc[li].push(v_rows[i].clone());
-                    }
-                }
-
-                let src_global = if l < self.first_kv_shared {
-                    l
-                } else if sliding {
-                    self.last_sliding_layer
+            for li in 0..n_local {
+                let l = li; // single-node: global == local
+                let lw = &self.layers[li];
+                let sliding = self.g.is_sliding_layer(l);
+                let head_dim = self.g.head_dim_at(l) as usize;
+                let theta = self.g.rope_freq_base_at(l);
+                let kv_heads = self.g.kv_heads_at(l) as usize;
+                let ffn_dim = self.g.ffn_length_at(l) as usize;
+                let q_dim = heads * head_dim;
+                let kv_dim = kv_heads * head_dim;
+                let rope_factors = if sliding {
+                    None
                 } else {
-                    self.last_full_layer
+                    self.rope_factors.as_deref()
                 };
-                let src = src_global - self.first_layer;
-                let group = heads / self.g.kv_heads_at(src_global) as usize;
 
-                // --- per-position attention (cheap; no big weight read) ---
-                let t_attn_core_start = std::time::Instant::now();
-                let mut attn_rows: Vec<Vec<f32>> = Vec::with_capacity(kk);
-                for i in 0..kk {
-                    let pos = start_pos + i;
-                    let lo = if sliding {
-                        (pos + 1).saturating_sub(win)
-                    } else {
-                        0
-                    };
-                    let q = &q_rows[i];
-                    let mut attn = vec![0f32; q_dim];
-                    for hh in 0..heads {
-                        let kvh = hh / group;
-                        let qh = &q[hh * head_dim..(hh + 1) * head_dim];
-                        if pos >= kc[src].len() {
-                            panic!(
-                                "[step_chunk crash] layer l={l} src={src} start_pos={start_pos} i={i} pos={pos} kk={kk} kc[src].len()={}",
-                                kc[src].len()
-                            );
-                        }
-                        // Gemma 4 attention scale is 1.0: the per-head QK
-                        // RMS-norms replace the classic 1/sqrt(head_dim). The
-                        // base (oracle-exact) chunk path has no score scale;
-                        // adding head_dim^-0.5 here flattened every softmax.
-                        let mut scores: Vec<f32> = (lo..=pos)
-                            .map(|p| {
-                                let kp = &kc[src][p][kvh * head_dim..(kvh + 1) * head_dim];
-                                qh.iter().zip(kp).map(|(a, b)| a * b).sum::<f32>()
-                            })
-                            .collect();
-                        let m = scores.iter().cloned().fold(f32::MIN, f32::max);
-                        let mut den = 0f32;
-                        for s in &mut scores {
-                            *s = (*s - m).exp();
-                            den += *s;
-                        }
-                        let out = &mut attn[hh * head_dim..(hh + 1) * head_dim];
-                        for (idx, p) in (lo..=pos).enumerate() {
-                            let w = scores[idx] / den;
-                            let vp = &vc[src][p][kvh * head_dim..(kvh + 1) * head_dim];
-                            for d in 0..head_dim {
-                                out[d] += w * vp[d];
+                // --- attention projections, GPU-accelerated on Metal with CPU fallback ---
+                let mut gpu_attn_ok = false;
+                let mut gpu_shared_mlp_ok = false;
+                let mut gpu_router_ok = false;
+                let t_gpu_attn_start = std::time::Instant::now();
+
+                #[cfg(target_os = "macos")]
+                if self.ghost_metal_q4_is_enabled() {
+                    if let Ok(mut guard) = self.metal_q4_experts.lock() {
+                        if let Some(lane) = guard.as_mut() {
+                            if lw.moe.is_some() {
+                                gpu_shared_mlp_ok = lane.execute_attention_and_shared_chunk_into(
+                                    li,
+                                    &hs,
+                                    theta,
+                                    rope_factors,
+                                    start_pos,
+                                    &mut hs_buf,
+                                    &mut shared_mlp_buf,
+                                    Some(&mut router_logits_buf),
+                                    li == 0,
+                                );
+                                gpu_attn_ok = gpu_shared_mlp_ok;
+                                gpu_router_ok = gpu_shared_mlp_ok;
+                            } else {
+                                gpu_attn_ok = lane.execute_attention_chunk_into(
+                                    li,
+                                    &hs,
+                                    theta,
+                                    rope_factors,
+                                    start_pos,
+                                    &mut hs_buf,
+                                );
                             }
                         }
                     }
-                    attn_rows.push(attn);
                 }
-                // o-projection batched, then residual + post-attn norm per token.
-                let attn_b = SharedActivationBatch::new(&attn_rows);
-                let o_rows = lw.attn_output.matmul_proj(hidden, &attn_b);
-                for i in 0..kk {
-                    let on = rms_norm(&o_rows[i], Some(&lw.post_attn_norm), eps);
-                    for (a, b) in hs[i].iter_mut().zip(&on) {
-                        *a += b;
+
+                if gpu_attn_ok {
+                    let attn_dur = t_gpu_attn_start.elapsed();
+                    std::mem::swap(&mut hs, &mut hs_buf);
+                    if let Some(prof) = profile.as_deref_mut() {
+                        prof.cp_attention_common_core_ms += attn_dur.as_secs_f64() * 1000.0;
+                        prof.attention_core_ms += attn_dur.as_secs_f64() * 1000.0;
+                    }
+                } else {
+                    let t_attn_proj_start = std::time::Instant::now();
+                    let xn_rows: Vec<Vec<f32>> = hs
+                        .iter()
+                        .map(|h| rms_norm(h, Some(&lw.attn_norm), eps))
+                        .collect();
+                    let xnq = SharedActivationBatch::new(&xn_rows);
+                    let mut q_rows = lw.attn_q.matmul_proj(q_dim, &xnq);
+                    for q in q_rows.iter_mut() {
+                        for hh in 0..heads {
+                            let s = &mut q[hh * head_dim..(hh + 1) * head_dim];
+                            s.copy_from_slice(&rms_norm(s, Some(&lw.q_norm), eps));
+                        }
+                    }
+                    let attn_q_dur = t_attn_proj_start.elapsed();
+
+                    let t_rope_q_start = std::time::Instant::now();
+                    for (i, q) in q_rows.iter_mut().enumerate() {
+                        apply_rope(q, heads, head_dim, start_pos + i, theta, rope_factors);
+                    }
+                    let rope_q_dur = t_rope_q_start.elapsed();
+
+                    let mut attn_kv_dur = std::time::Duration::ZERO;
+                    let mut rope_kv_dur = std::time::Duration::ZERO;
+                    if l < self.first_kv_shared {
+                        let t_kv_proj_start = std::time::Instant::now();
+                        let mut k_rows = lw
+                            .attn_k
+                            .as_ref()
+                            .expect("validate() guarantees owning layers bind attn_k")
+                            .matmul_proj(kv_dim, &xnq);
+                        let mut v_rows = match lw.attn_v.as_ref() {
+                            Some(wv) => wv.matmul_proj(kv_dim, &xnq),
+                            None => k_rows.clone(),
+                        };
+                        for i in 0..kk {
+                            for hh in 0..kv_heads {
+                                let s = &mut k_rows[i][hh * head_dim..(hh + 1) * head_dim];
+                                s.copy_from_slice(&rms_norm(
+                                    s,
+                                    Some(lw.k_norm.as_deref().expect(
+                                        "validate() guarantees owning layers bind attn_k_norm",
+                                    )),
+                                    eps,
+                                ));
+                                // Gemma 4 reference: V takes a weightless per-head
+                                // RMS norm before caching (and never RoPE).
+                                let sv = &mut v_rows[i][hh * head_dim..(hh + 1) * head_dim];
+                                sv.copy_from_slice(&rms_norm(sv, None, eps));
+                            }
+                        }
+                        attn_kv_dur = t_kv_proj_start.elapsed();
+
+                        let t_rope_kv_start = std::time::Instant::now();
+                        for (i, k) in k_rows.iter_mut().enumerate() {
+                            apply_rope(k, kv_heads, head_dim, start_pos + i, theta, rope_factors);
+                        }
+                        rope_kv_dur = t_rope_kv_start.elapsed();
+
+                        for i in 0..kk {
+                            kc[li].push(k_rows[i].clone());
+                            vc[li].push(v_rows[i].clone());
+                        }
+                    }
+
+                    let src_global = if l < self.first_kv_shared {
+                        l
+                    } else if sliding {
+                        self.last_sliding_layer
+                    } else {
+                        self.last_full_layer
+                    };
+                    let src = src_global - self.first_layer;
+                    let group = heads / self.g.kv_heads_at(src_global) as usize;
+
+                    // --- per-position attention (cheap; no big weight read) ---
+                    let t_attn_core_start = std::time::Instant::now();
+                    let mut attn_rows: Vec<Vec<f32>> = Vec::with_capacity(kk);
+                    for i in 0..kk {
+                        let pos = start_pos + i;
+                        let lo = if sliding {
+                            (pos + 1).saturating_sub(win)
+                        } else {
+                            0
+                        };
+                        let q = &q_rows[i];
+                        let mut attn = vec![0f32; q_dim];
+                        for hh in 0..heads {
+                            let kvh = hh / group;
+                            let qh = &q[hh * head_dim..(hh + 1) * head_dim];
+                            if pos >= kc[src].len() {
+                                panic!(
+                                "[step_chunk crash] layer l={l} src={src} start_pos={start_pos} i={i} pos={pos} kk={kk} kc[src].len()={}",
+                                kc[src].len()
+                            );
+                            }
+                            // Gemma 4 attention scale is 1.0: the per-head QK
+                            // RMS-norms replace the classic 1/sqrt(head_dim). The
+                            // base (oracle-exact) chunk path has no score scale;
+                            // adding head_dim^-0.5 here flattened every softmax.
+                            let mut scores: Vec<f32> = (lo..=pos)
+                                .map(|p| {
+                                    let kp = &kc[src][p][kvh * head_dim..(kvh + 1) * head_dim];
+                                    qh.iter().zip(kp).map(|(a, b)| a * b).sum::<f32>()
+                                })
+                                .collect();
+                            let m = scores.iter().cloned().fold(f32::MIN, f32::max);
+                            let mut den = 0f32;
+                            for s in &mut scores {
+                                *s = (*s - m).exp();
+                                den += *s;
+                            }
+                            let out = &mut attn[hh * head_dim..(hh + 1) * head_dim];
+                            for (idx, p) in (lo..=pos).enumerate() {
+                                let w = scores[idx] / den;
+                                let vp = &vc[src][p][kvh * head_dim..(kvh + 1) * head_dim];
+                                for d in 0..head_dim {
+                                    out[d] += w * vp[d];
+                                }
+                            }
+                        }
+                        attn_rows.push(attn);
+                    }
+                    // o-projection batched, then residual + post-attn norm per token.
+                    let attn_b = SharedActivationBatch::new(&attn_rows);
+                    let o_rows = lw.attn_output.matmul_proj(hidden, &attn_b);
+                    for i in 0..kk {
+                        let on = rms_norm(&o_rows[i], Some(&lw.post_attn_norm), eps);
+                        for (a, b) in hs[i].iter_mut().zip(&on) {
+                            *a += b;
+                        }
+                    }
+                    let attn_core_dur = t_attn_core_start.elapsed();
+
+                    if let Some(prof) = profile.as_deref_mut() {
+                        prof.cp_attention_common_core_ms +=
+                            (attn_q_dur + attn_kv_dur + attn_core_dur).as_secs_f64() * 1000.0;
+                        prof.cp_kv_rope_ms += (rope_q_dur + rope_kv_dur).as_secs_f64() * 1000.0;
+                        prof.attention_core_ms +=
+                            (attn_q_dur + attn_kv_dur + attn_core_dur + rope_q_dur + rope_kv_dur)
+                                .as_secs_f64()
+                                * 1000.0;
                     }
                 }
-                let attn_core_dur = t_attn_core_start.elapsed();
 
+                // --- FFN, batched ---
+                let t_moe_start = std::time::Instant::now();
+                let ffn_out_rows = if lw.moe.is_some() {
+                    let precomputed_shared = if gpu_shared_mlp_ok {
+                        Some(shared_mlp_buf.as_slice())
+                    } else {
+                        None
+                    };
+                    let precomputed_router = if gpu_router_ok {
+                        Some(router_logits_buf.as_slice())
+                    } else {
+                        None
+                    };
+                    self.moe_layer_ffn_chunk(
+                        li,
+                        &hs,
+                        precomputed_shared,
+                        precomputed_router,
+                        profile.as_deref_mut(),
+                    )?
+                } else {
+                    let ffn_rows: Vec<Vec<f32>> = hs
+                        .iter()
+                        .map(|h| rms_norm(h, Some(&lw.ffn_norm), eps))
+                        .collect();
+                    let ffnq = SharedActivationBatch::new(&ffn_rows);
+                    let gate_rows = lw.ffn_gate.matmul_proj(ffn_dim, &ffnq);
+                    let up_rows = lw.ffn_up.matmul_proj(ffn_dim, &ffnq);
+                    let act_rows: Vec<Vec<f32>> = (0..kk)
+                        .map(|i| {
+                            gate_rows[i]
+                                .iter()
+                                .zip(&up_rows[i])
+                                .map(|(g, u)| gelu_tanh(*g) * u)
+                                .collect()
+                        })
+                        .collect();
+                    let actq = SharedActivationBatch::new(&act_rows);
+                    lw.ffn_down
+                        .matmul_proj(hidden, &actq)
+                        .into_iter()
+                        .map(|mlp| rms_norm(&mlp, Some(&lw.post_ffw_norm), eps))
+                        .collect()
+                };
+                let moe_dur = t_moe_start.elapsed();
                 if let Some(prof) = profile.as_deref_mut() {
-                    prof.cp_attention_common_core_ms += (attn_q_dur + attn_kv_dur + attn_core_dur).as_secs_f64() * 1000.0;
-                    prof.cp_kv_rope_ms += (rope_q_dur + rope_kv_dur).as_secs_f64() * 1000.0;
-                    prof.attention_core_ms += (attn_q_dur + attn_kv_dur + attn_core_dur + rope_q_dur + rope_kv_dur).as_secs_f64() * 1000.0;
+                    prof.all_moe_layers_ms += moe_dur.as_secs_f64() * 1000.0;
+                    if li == 0 {
+                        prof.layer0_moe_ms = moe_dur.as_secs_f64() * 1000.0;
+                    }
                 }
-            }
 
-            // --- FFN, batched ---
-            let t_moe_start = std::time::Instant::now();
-            let ffn_out_rows = if lw.moe.is_some() {
-                let precomputed_shared = if gpu_shared_mlp_ok {
-                    Some(shared_mlp_buf.as_slice())
-                } else {
-                    None
-                };
-                let precomputed_router = if gpu_router_ok {
-                    Some(router_logits_buf.as_slice())
-                } else {
-                    None
-                };
-                self.moe_layer_ffn_chunk(li, &hs, precomputed_shared, precomputed_router, profile.as_deref_mut())?
-            } else {
-                let ffn_rows: Vec<Vec<f32>> = hs
-                    .iter()
-                    .map(|h| rms_norm(h, Some(&lw.ffn_norm), eps))
-                    .collect();
-                let ffnq = SharedActivationBatch::new(&ffn_rows);
-                let gate_rows = lw.ffn_gate.matmul_proj(ffn_dim, &ffnq);
-                let up_rows = lw.ffn_up.matmul_proj(ffn_dim, &ffnq);
-                let act_rows: Vec<Vec<f32>> = (0..kk)
-                    .map(|i| {
-                        gate_rows[i]
-                            .iter()
-                            .zip(&up_rows[i])
-                            .map(|(g, u)| gelu_tanh(*g) * u)
-                            .collect()
-                    })
-                    .collect();
-                let actq = SharedActivationBatch::new(&act_rows);
-                lw.ffn_down
-                    .matmul_proj(hidden, &actq)
-                    .into_iter()
-                    .map(|mlp| rms_norm(&mlp, Some(&lw.post_ffw_norm), eps))
-                    .collect()
-            };
-            let moe_dur = t_moe_start.elapsed();
-            if let Some(prof) = profile.as_deref_mut() {
-                prof.all_moe_layers_ms += moe_dur.as_secs_f64() * 1000.0;
-                if li == 0 {
-                    prof.layer0_moe_ms = moe_dur.as_secs_f64() * 1000.0;
-                }
-            }
-
-            let t_ple_start = std::time::Instant::now();
-            if !gpu_shared_mlp_ok {
-                hs.iter_mut()
-                    .zip(&ffn_out_rows)
-                    .for_each(|(h, f)| {
+                let t_ple_start = std::time::Instant::now();
+                if !gpu_shared_mlp_ok {
+                    hs.iter_mut().zip(&ffn_out_rows).for_each(|(h, f)| {
                         for (a, b) in h.iter_mut().zip(f) {
                             *a += b;
                         }
                     });
-            }
-            for i in 0..kk {
-                // PLE residual (per token, cheap f32 matvecs).
-                if let (Some(ig), Some(pj), Some(pnn)) = (
-                    lw.ple_inp_gate.as_ref(),
-                    lw.ple_proj.as_ref(),
-                    lw.post_norm.as_ref(),
-                ) {
-                    let mut gated = f32_matvec(ig, hidden, ple_dim, &hs[i]);
-                    for (gv, pv) in gated.iter_mut().zip(&pli_tok[i][li]) {
-                        *gv = gelu_tanh(*gv) * pv;
+                }
+                for i in 0..kk {
+                    // PLE residual (per token, cheap f32 matvecs).
+                    if let (Some(ig), Some(pj), Some(pnn)) = (
+                        lw.ple_inp_gate.as_ref(),
+                        lw.ple_proj.as_ref(),
+                        lw.post_norm.as_ref(),
+                    ) {
+                        let mut gated = f32_matvec(ig, hidden, ple_dim, &hs[i]);
+                        for (gv, pv) in gated.iter_mut().zip(&pli_tok[i][li]) {
+                            *gv = gelu_tanh(*gv) * pv;
+                        }
+                        let proj = f32_matvec(pj, ple_dim, hidden, &gated);
+                        let pnv = rms_norm(&proj, Some(pnn), eps);
+                        for (a, b) in hs[i].iter_mut().zip(&pnv) {
+                            *a += b;
+                        }
                     }
-                    let proj = f32_matvec(pj, ple_dim, hidden, &gated);
-                    let pnv = rms_norm(&proj, Some(pnn), eps);
-                    for (a, b) in hs[i].iter_mut().zip(&pnv) {
-                        *a += b;
+                    if lw.ple_output_scale != 1.0 {
+                        for v in hs[i].iter_mut() {
+                            *v *= lw.ple_output_scale;
+                        }
                     }
                 }
-                if lw.ple_output_scale != 1.0 {
-                    for v in hs[i].iter_mut() {
-                        *v *= lw.ple_output_scale;
-                    }
+                let ple_dur = t_ple_start.elapsed();
+                if let Some(prof) = profile.as_deref_mut() {
+                    prof.cp_other_ms += ple_dur.as_secs_f64() * 1000.0;
                 }
-            }
-            let ple_dur = t_ple_start.elapsed();
-            if let Some(prof) = profile.as_deref_mut() {
-                prof.cp_other_ms += ple_dur.as_secs_f64() * 1000.0;
-            }
 
-            if std::env::var("CAMELID_GEMMA4_DUMP_LAYERS").is_ok_and(|v| v == "1") {
-                for (i, h) in hs.iter().enumerate() {
-                    let l2 = h.iter().map(|v| v * v).sum::<f32>().sqrt();
-                    eprintln!(
+                if std::env::var("CAMELID_GEMMA4_DUMP_LAYERS").is_ok_and(|v| v == "1") {
+                    for (i, h) in hs.iter().enumerate() {
+                        let l2 = h.iter().map(|v| v * v).sum::<f32>().sqrt();
+                        eprintln!(
                         "[h_chunk] tok {i} layer {li} l2 {l2:.6} first4 [{:.6}, {:.6}, {:.6}, {:.6}]",
                         h[0], h[1], h[2], h[3]
                     );
+                    }
                 }
             }
-        }
         }
 
         // --- tied head ---
@@ -6466,7 +6553,9 @@ impl Gemma4Runtime {
                     + prof.cp_routed_moe_down_ms
                     + prof.cp_shared_expert_ms;
                 prof.cpu_gpu_overlapped_ms = 0.0;
-                prof.synchronization_gap_ms = (prof.total_wall_clock_ms - (prof.cpu_only_exposed_ms + prof.gpu_only_exposed_ms)).max(0.0);
+                prof.synchronization_gap_ms = (prof.total_wall_clock_ms
+                    - (prof.cpu_only_exposed_ms + prof.gpu_only_exposed_ms))
+                    .max(0.0);
             }
         }
         Ok(logits_res)
@@ -6521,14 +6610,7 @@ impl Gemma4Runtime {
             let mut guard = self.metal_q4_experts.lock().ok()?;
             let lane = guard.as_mut()?;
             let empty_sources = std::collections::HashMap::new();
-            match lane.run_layer(
-                ghost,
-                experts,
-                route_scales,
-                input,
-                hidden,
-                &empty_sources,
-            ) {
+            match lane.run_layer(ghost, experts, route_scales, input, hidden, &empty_sources) {
                 GhostMetalExpertAttempt::Output(output) => Some(output),
                 GhostMetalExpertAttempt::CpuFallback => None,
                 GhostMetalExpertAttempt::DisableMetal => {
@@ -6574,7 +6656,11 @@ impl Gemma4Runtime {
     }
 
     /// Parameterized Top-N prediction of all 30 layers' routed experts.
-    pub fn predict_all_layer_routes_for_chunk_top_n(&self, tokens: &[u32], top_n: usize) -> Result<Vec<Vec<usize>>> {
+    pub fn predict_all_layer_routes_for_chunk_top_n(
+        &self,
+        tokens: &[u32],
+        top_n: usize,
+    ) -> Result<Vec<Vec<usize>>> {
         let hidden = self.config.embedding_length as usize;
         let mut hs: Vec<Vec<f32>> = Vec::with_capacity(tokens.len());
         for &token in tokens {
@@ -6595,7 +6681,11 @@ impl Gemma4Runtime {
 
     /// Fast (<5us) prediction of the next layer's top-k routed experts using
     /// current attention-residual approximation.
-    fn predict_next_layer_routes(&self, next_li: usize, approx_hidden_rows: &[Vec<f32>]) -> Vec<usize> {
+    fn predict_next_layer_routes(
+        &self,
+        next_li: usize,
+        approx_hidden_rows: &[Vec<f32>],
+    ) -> Vec<usize> {
         self.predict_next_layer_routes_top_k(next_li, approx_hidden_rows, 8)
     }
 
@@ -6685,7 +6775,9 @@ impl Gemma4Runtime {
                     let logits = &logits_all[token_idx * n_exp..(token_idx + 1) * n_exp];
                     let mut maxl = f32::MIN;
                     for &v in logits {
-                        if v > maxl { maxl = v; }
+                        if v > maxl {
+                            maxl = v;
+                        }
                     }
                     let mut probs = [0.0f32; 128];
                     let mut sum = 0.0f32;
@@ -6701,7 +6793,9 @@ impl Gemma4Runtime {
                     route_probs[token_idx][..n_exp].copy_from_slice(&probs[..n_exp]);
 
                     let mut idx = [0usize; 128];
-                    for e in 0..n_exp { idx[e] = e; }
+                    for e in 0..n_exp {
+                        idx[e] = e;
+                    }
                     for i in 0..n_used {
                         let mut max_j = i;
                         let mut max_p = probs[idx[i]];
@@ -6743,8 +6837,11 @@ impl Gemma4Runtime {
                     let mut slab_and_slots = None;
                     if let Ok(mut guard) = self.metal_q4_experts.lock() {
                         if let Some(lane) = guard.as_mut() {
-                            if let Some((slab_buf, slot_indices)) = lane.try_resolve_resident_chunk(ghost.layer_idx, unique_experts) {
-                                slab_and_slots = Some((slab_buf as *const metal::Buffer, slot_indices));
+                            if let Some((slab_buf, slot_indices)) =
+                                lane.try_resolve_resident_chunk(ghost.layer_idx, unique_experts)
+                            {
+                                slab_and_slots =
+                                    Some((slab_buf as *const metal::Buffer, slot_indices));
                             }
                             lane.record_layer_routes(ghost.layer_idx, unique_experts);
                         }
@@ -6776,22 +6873,27 @@ impl Gemma4Runtime {
                             let slot = slot_indices[u];
                             work_items[u] = crate::metal::Gemma4UniqueExpertWork {
                                 candidate_mask: mask as u64,
-                                expert_weight_offset: (slot * crate::metal::GEMMA4_Q4_EXPERT_SLOT_STRIDE) as u32,
+                                expert_weight_offset: (slot
+                                    * crate::metal::GEMMA4_Q4_EXPERT_SLOT_STRIDE)
+                                    as u32,
                                 slab_index: 0,
                             };
                         }
 
-                        let mut route_entries = [crate::metal::Gemma4CandidateRouteEntry::default(); 128];
+                        let mut route_entries =
+                            [crate::metal::Gemma4CandidateRouteEntry::default(); 128];
                         let mut entry_idx = 0;
                         for r in 0..n_tokens {
                             for i in 0..n_used {
                                 let e = route_indices[r][i];
                                 let u = expert_to_unique[e];
-                                let w = (route_probs[r][e] / route_wsums[r]) * moe.down_exps_scale[e];
-                                route_entries[entry_idx] = crate::metal::Gemma4CandidateRouteEntry {
-                                    unique_expert_idx: u,
-                                    weight: w,
-                                };
+                                let w =
+                                    (route_probs[r][e] / route_wsums[r]) * moe.down_exps_scale[e];
+                                route_entries[entry_idx] =
+                                    crate::metal::Gemma4CandidateRouteEntry {
+                                        unique_expert_idx: u,
+                                        weight: w,
+                                    };
                                 entry_idx += 1;
                             }
                         }
@@ -6799,8 +6901,11 @@ impl Gemma4Runtime {
                         let mut batch_times = crate::metal::Gemma4MultiExpertBatchTimes::default();
                         if let Ok(guard) = self.metal_q4_experts.lock() {
                             if let Some(lane) = guard.as_ref() {
-                                if let Some((scales_buf, quants_buf)) = lane.resident_expert_input_buffers() {
-                                    let fused_tail = lane.resident_fused_tail_buffers(ghost.layer_idx);
+                                if let Some((scales_buf, quants_buf)) =
+                                    lane.resident_expert_input_buffers()
+                                {
+                                    let fused_tail =
+                                        lane.resident_fused_tail_buffers(ghost.layer_idx);
                                     crate::metal::try_gemma4_q4_multi_expert_layer_chunk_with_gpu_quants(
                                         scales_buf,
                                         quants_buf,
@@ -6824,7 +6929,8 @@ impl Gemma4Runtime {
                             let moe_gpu_us = batch_times.gpu_busy_us as f64;
                             prof.cp_routed_moe_gate_up_ms += (moe_gpu_us * (2.0 / 3.0)) / 1000.0;
                             prof.cp_routed_moe_quant_ms += (moe_gpu_us * 0.05) / 1000.0;
-                            prof.cp_routed_moe_down_ms += (moe_gpu_us * (1.0 / 3.0 - 0.05)) / 1000.0;
+                            prof.cp_routed_moe_down_ms +=
+                                (moe_gpu_us * (1.0 / 3.0 - 0.05)) / 1000.0;
                         }
 
                         return Ok(Vec::new());
@@ -6840,7 +6946,9 @@ impl Gemma4Runtime {
         let n_exp = moe.n_expert;
         let n_used = moe.n_expert_used;
 
-        let token_results: Vec<(Vec<usize>, Vec<f32>, f32)> = if let Some(logits_all) = precomputed_router_logits {
+        let token_results: Vec<(Vec<usize>, Vec<f32>, f32)> = if let Some(logits_all) =
+            precomputed_router_logits
+        {
             (0..attn_rows.len())
                 .map(|token_idx| {
                     let logits = &logits_all[token_idx * n_exp..(token_idx + 1) * n_exp];
@@ -6946,8 +7054,6 @@ impl Gemma4Runtime {
             .collect();
         let union_count = unique_experts.len();
 
-
-
         // Dense shared-expert branch. The batched projections use the exact same
         // row-dot kernels as the scalar lane, only reusing each weight row across
         // all prompt activations.
@@ -6992,7 +7098,8 @@ impl Gemma4Runtime {
                         .map(|attn_out| rms_norm(attn_out, Some(&lw.ffn_norm), eps))
                         .collect();
                     let xnq = SharedActivationBatch::new(&xn_rows);
-                    let input_q8_refs: Vec<&[Q8_0Block]> = xnq.q8_0().iter().map(Vec::as_slice).collect();
+                    let input_q8_refs: Vec<&[Q8_0Block]> =
+                        xnq.q8_0().iter().map(Vec::as_slice).collect();
                     let mut out_mlp = vec![vec![0.0f32; hidden]; attn_rows.len()];
                     crate::metal::try_gemma4_q4_shared_expert_chunk(
                         &input_q8_refs,
@@ -7030,14 +7137,19 @@ impl Gemma4Runtime {
         #[cfg(target_os = "macos")]
         if let Ok(mut guard) = self.metal_q4_experts.lock() {
             if let Some(lane) = guard.as_mut() {
-                if let Some((slab_buf, slot_indices)) = lane.try_resolve_resident_chunk(ghost.layer_idx, &unique_experts) {
+                if let Some((slab_buf, slot_indices)) =
+                    lane.try_resolve_resident_chunk(ghost.layer_idx, &unique_experts)
+                {
                     slab_buf_slot_indices = Some((slab_buf as *const metal::Buffer, slot_indices));
                     direct_resolved = true;
                 } else {
                     // Direct Metal slab fill on miss without CPU double-hop
                     let empty_sources = std::collections::HashMap::new();
-                    if let Some((slab_buf, slot_indices)) = lane.prepare_chunk_slots(ghost, &unique_experts, &empty_sources) {
-                        slab_buf_slot_indices = Some((slab_buf as *const metal::Buffer, slot_indices));
+                    if let Some((slab_buf, slot_indices)) =
+                        lane.prepare_chunk_slots(ghost, &unique_experts, &empty_sources)
+                    {
+                        slab_buf_slot_indices =
+                            Some((slab_buf as *const metal::Buffer, slot_indices));
                         direct_resolved = true;
                     }
                 }
@@ -7095,14 +7207,16 @@ impl Gemma4Runtime {
                 }
             }
 
-            let shared_q8_refs: Vec<&[crate::tensor::Q8_0Block]> = if precomputed_shared_mlp.is_none() {
-                (0..n_tokens)
-                    .map(|r| &shared_q8_store[r][..attn_rows[r].len() / 32])
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            let moe_q8_refs: Vec<&[crate::tensor::Q8_0Block]> = if precomputed_shared_mlp.is_none() {
+            let shared_q8_refs: Vec<&[crate::tensor::Q8_0Block]> =
+                if precomputed_shared_mlp.is_none() {
+                    (0..n_tokens)
+                        .map(|r| &shared_q8_store[r][..attn_rows[r].len() / 32])
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+            let moe_q8_refs: Vec<&[crate::tensor::Q8_0Block]> = if precomputed_shared_mlp.is_none()
+            {
                 (0..n_tokens)
                     .map(|r| &moe_q8_store[r][..attn_rows[r].len() / 32])
                     .collect()
@@ -7129,7 +7243,8 @@ impl Gemma4Runtime {
                 let slot = slot_indices[u];
                 work_items[u] = crate::metal::Gemma4UniqueExpertWork {
                     candidate_mask: mask as u64,
-                    expert_weight_offset: (slot * crate::metal::GEMMA4_Q4_EXPERT_SLOT_STRIDE) as u32,
+                    expert_weight_offset: (slot * crate::metal::GEMMA4_Q4_EXPERT_SLOT_STRIDE)
+                        as u32,
                     slab_index: 0,
                 };
             }
@@ -7156,7 +7271,8 @@ impl Gemma4Runtime {
                 let mut dispatched = false;
                 if let Ok(guard) = self.metal_q4_experts.lock() {
                     if let Some(lane) = guard.as_ref() {
-                        if let Some((scales_buf, quants_buf)) = lane.resident_expert_input_buffers() {
+                        if let Some((scales_buf, quants_buf)) = lane.resident_expert_input_buffers()
+                        {
                             let fused_tail = lane.resident_fused_tail_buffers(ghost.layer_idx);
                             dispatched = crate::metal::try_gemma4_q4_multi_expert_layer_chunk_with_gpu_quants(
                                 scales_buf,
@@ -7184,7 +7300,8 @@ impl Gemma4Runtime {
                         &route_entries[..entry_idx],
                         &mut output_moe,
                         Some(&mut batch_times),
-                    ).is_some()
+                    )
+                    .is_some()
                 } else {
                     true
                 }
@@ -7210,7 +7327,8 @@ impl Gemma4Runtime {
                             &mut output_moe,
                             Some(&mut shared_times),
                             Some(&mut batch_times),
-                        ).is_some()
+                        )
+                        .is_some()
                     } else {
                         false
                     }
@@ -7241,15 +7359,22 @@ impl Gemma4Runtime {
                     prof.shared_geglu_gpu_ms += (shared_times.geglu_gpu_us as f64) / 1000.0;
                     prof.shared_down_gpu_ms += (shared_times.down_gpu_us as f64) / 1000.0;
                     prof.shared_expert_gpu_busy_ms += (shared_times.gpu_busy_us as f64) / 1000.0;
-                    let shared_wall_ms = (shared_times.commit_wait_us as f64 + shared_times.prep_us as f64 + shared_times.readout_us as f64) / 1000.0;
+                    let shared_wall_ms = (shared_times.commit_wait_us as f64
+                        + shared_times.prep_us as f64
+                        + shared_times.readout_us as f64)
+                        / 1000.0;
                     prof.shared_expert_wall_ms += shared_wall_ms;
                     prof.cpu_dense_shared_mlp_ms += shared_wall_ms;
 
                     // Non-overlapping critical-path metrics:
-                    prof.cp_command_encoding_ms += (batch_times.prep_us as f64 + shared_times.prep_us as f64) / 1000.0;
+                    prof.cp_command_encoding_ms +=
+                        (batch_times.prep_us as f64 + shared_times.prep_us as f64) / 1000.0;
                     prof.cp_gpu_waits_ms += (batch_times.commit_wait_us as f64) / 1000.0;
                     prof.cp_shared_expert_ms += (shared_times.gpu_busy_us as f64) / 1000.0;
-                    let moe_gpu_us = (batch_times.gpu_busy_us.saturating_sub(shared_times.gpu_busy_us)) as f64;
+                    let moe_gpu_us = (batch_times
+                        .gpu_busy_us
+                        .saturating_sub(shared_times.gpu_busy_us))
+                        as f64;
                     prof.cp_routed_moe_gate_up_ms += (moe_gpu_us * (2.0 / 3.0)) / 1000.0;
                     prof.cp_routed_moe_quant_ms += (moe_gpu_us * 0.05) / 1000.0;
                     prof.cp_routed_moe_down_ms += (moe_gpu_us * (1.0 / 3.0 - 0.05)) / 1000.0;
@@ -7278,17 +7403,18 @@ impl Gemma4Runtime {
                 (res, t_cache_start.elapsed())
             };
 
-            let ((paged_experts, cache_dur), (mlp, is_gpu, dense_dur)) = rayon::join(
-                cache_get_timed,
-                dense_mlp_timed,
-            );
+            let ((paged_experts, cache_dur), (mlp, is_gpu, dense_dur)) =
+                rayon::join(cache_get_timed, dense_mlp_timed);
             let join_dur = t_join_start.elapsed();
 
             if let Some(prof) = profile.as_deref_mut() {
                 prof.ssd_cache_ms += join_dur.as_secs_f64() * 1000.0;
                 prof.cpu_dense_shared_mlp_ms += dense_dur.as_secs_f64() * 1000.0;
                 prof.cache_lookup_ms += cache_dur.as_secs_f64() * 1000.0;
-                prof.synchronization_ms += (join_dur.as_secs_f64() - cache_dur.as_secs_f64().max(dense_dur.as_secs_f64())).max(0.0) * 1000.0;
+                prof.synchronization_ms += (join_dur.as_secs_f64()
+                    - cache_dur.as_secs_f64().max(dense_dur.as_secs_f64()))
+                .max(0.0)
+                    * 1000.0;
                 if is_gpu {
                     prof.shared_expert_metal_calls += 1;
                 } else {
@@ -7313,7 +7439,10 @@ impl Gemma4Runtime {
                     .collect::<std::collections::HashSet<_>>()
                     .into_iter()
                     .filter_map(|expert| {
-                        expert_records.get(expert).and_then(|rec| rec.as_ref()).map(|r| (expert, Arc::clone(r)))
+                        expert_records
+                            .get(expert)
+                            .and_then(|rec| rec.as_ref())
+                            .map(|r| (expert, Arc::clone(r)))
                     })
                     .collect::<std::collections::HashMap<_, _>>();
                 prewarm = Some((request_sequence, records));
@@ -7338,7 +7467,10 @@ impl Gemma4Runtime {
                         let resident_sources = unique_experts
                             .iter()
                             .filter_map(|&e| {
-                                expert_records.get(e).and_then(|rec| rec.as_ref()).map(|r| (e, Arc::clone(r)))
+                                expert_records
+                                    .get(e)
+                                    .and_then(|rec| rec.as_ref())
+                                    .map(|r| (e, Arc::clone(r)))
                             })
                             .collect::<std::collections::HashMap<_, _>>();
                         lane.prepare_chunk_slots(ghost, &unique_experts, &resident_sources)
@@ -7362,7 +7494,9 @@ impl Gemma4Runtime {
                             let slot = slot_indices[u];
                             work_items.push(crate::metal::Gemma4UniqueExpertWork {
                                 candidate_mask: mask as u64,
-                                expert_weight_offset: (slot * crate::metal::GEMMA4_Q4_EXPERT_SLOT_STRIDE) as u32,
+                                expert_weight_offset: (slot
+                                    * crate::metal::GEMMA4_Q4_EXPERT_SLOT_STRIDE)
+                                    as u32,
                                 slab_index: 0,
                             });
                         }
@@ -7371,7 +7505,8 @@ impl Gemma4Runtime {
                         for r in 0..attn_rows.len() {
                             for &e in &route_indices[r] {
                                 if let Some(&u) = unique_map.get(&e) {
-                                    let w = (route_probs[r][e] / route_wsums[r]) * moe.down_exps_scale[e];
+                                    let w = (route_probs[r][e] / route_wsums[r])
+                                        * moe.down_exps_scale[e];
                                     route_entries.push(crate::metal::Gemma4CandidateRouteEntry {
                                         unique_expert_idx: u as u32,
                                         weight: w,
@@ -7389,7 +7524,9 @@ impl Gemma4Runtime {
                             &route_entries,
                             &mut output_acc,
                             Some(&mut batch_times),
-                        ).is_some() {
+                        )
+                        .is_some()
+                        {
                             multi_expert_metal_result = Some(output_acc);
                         }
                     }
@@ -7431,7 +7568,8 @@ impl Gemma4Runtime {
                     for r in 0..attn_rows.len() {
                         for &e in &route_indices[r] {
                             if let Some(&u) = unique_map.get(&e) {
-                                let w = (route_probs[r][e] / route_wsums[r]) * moe.down_exps_scale[e];
+                                let w =
+                                    (route_probs[r][e] / route_wsums[r]) * moe.down_exps_scale[e];
                                 route_entries.push(crate::metal::Gemma4CandidateRouteEntry {
                                     unique_expert_idx: u as u32,
                                     weight: w,
@@ -7448,7 +7586,9 @@ impl Gemma4Runtime {
                         &route_entries,
                         &mut output_acc,
                         Some(&mut batch_times),
-                    ).is_some() {
+                    )
+                    .is_some()
+                    {
                         multi_expert_metal_result = Some(output_acc);
                     }
                 }
@@ -7583,9 +7723,18 @@ impl Gemma4Runtime {
                     let moe_l2 = moe_acc.iter().map(|v| v * v).sum::<f32>().sqrt();
                     let moe_n = rms_norm(&moe_acc, Some(&moe.post_norm_2), eps);
                     let moe_n_l2 = moe_n.iter().map(|v| v * v).sum::<f32>().sqrt();
-                    eprintln!("[cpu chunk layer0] Mlp (Dn0) L2={mlp_l2:.6} first4={:?}", &mlp_rows[row][..4]);
-                    eprintln!("[cpu chunk layer0] Moe0 raw L2={moe_l2:.6} first4={:?}", &moe_acc[..4]);
-                    eprintln!("[cpu chunk layer0] Moe0 normed L2={moe_n_l2:.6} first4={:?}", &moe_n[..4]);
+                    eprintln!(
+                        "[cpu chunk layer0] Mlp (Dn0) L2={mlp_l2:.6} first4={:?}",
+                        &mlp_rows[row][..4]
+                    );
+                    eprintln!(
+                        "[cpu chunk layer0] Moe0 raw L2={moe_l2:.6} first4={:?}",
+                        &moe_acc[..4]
+                    );
+                    eprintln!(
+                        "[cpu chunk layer0] Moe0 normed L2={moe_n_l2:.6} first4={:?}",
+                        &moe_n[..4]
+                    );
                 }
                 let moe_normed = rms_norm(&moe_acc, Some(&moe.post_norm_2), eps);
                 for (m, d) in moe_normed.into_iter().zip(&mut mlp_rows[row]) {
@@ -7594,7 +7743,10 @@ impl Gemma4Runtime {
                 let ffn_o = rms_norm(&mlp_rows[row], Some(&lw.post_ffw_norm), eps);
                 if li == 0 && std::env::var("CAMELID_GEMMA4_DUMP_LAYERS").is_ok_and(|v| v == "1") {
                     let ffn_l2 = ffn_o.iter().map(|v| v * v).sum::<f32>().sqrt();
-                    eprintln!("[cpu chunk layer0] FFN out L2={ffn_l2:.6} first4={:?}", &ffn_o[..4]);
+                    eprintln!(
+                        "[cpu chunk layer0] FFN out L2={ffn_l2:.6} first4={:?}",
+                        &ffn_o[..4]
+                    );
                 }
                 out.push(ffn_o);
             }
@@ -7644,8 +7796,14 @@ impl Gemma4Runtime {
         idx.truncate(moe.n_expert_used);
         if li == 0 && std::env::var("CAMELID_GEMMA4_DUMP_LAYERS").is_ok_and(|v| v == "1") {
             let logit_l2 = logits.iter().map(|v| v * v).sum::<f32>().sqrt();
-            eprintln!("[cpu router layer0] Logits L2={logit_l2:.6} first4={:?}", &logits[..4]);
-            eprintln!("[cpu router layer0] Selected top-{}: {:?}", moe.n_expert_used, idx);
+            eprintln!(
+                "[cpu router layer0] Logits L2={logit_l2:.6} first4={:?}",
+                &logits[..4]
+            );
+            eprintln!(
+                "[cpu router layer0] Selected top-{}: {:?}",
+                moe.n_expert_used, idx
+            );
         }
         if std::env::var_os("CAMELID_GEMMA4_ROUTE_TRACE").is_some() {
             eprintln!("[route] l={l} e={idx:?}");
@@ -7659,19 +7817,19 @@ impl Gemma4Runtime {
         // router, so overlap it with the selected experts' positioned reads.
         // The two branches are still combined in the exact original order below.
         let dense_mlp = || {
-                let xn = rms_norm(attn_out, Some(&lw.ffn_norm), eps);
-                let xnq = SharedActivation::new(&xn);
-                let gate = lw.ffn_gate.matvec_proj(ffn_dim, &xnq);
-                let up = lw.ffn_up.matvec_proj(ffn_dim, &xnq);
-                let act: Vec<f32> = gate
-                    .iter()
-                    .zip(&up)
-                    .map(|(g, u)| gelu_tanh(*g) * u)
-                    .collect();
-                let mlp = lw.ffn_down.matvec(ffn_dim, hidden, &act);
-                // Dense branch keeps its own post-norm (post_norm_1).
-                rms_norm(&mlp, Some(&moe.post_norm_1), eps)
-            };
+            let xn = rms_norm(attn_out, Some(&lw.ffn_norm), eps);
+            let xnq = SharedActivation::new(&xn);
+            let gate = lw.ffn_gate.matvec_proj(ffn_dim, &xnq);
+            let up = lw.ffn_up.matvec_proj(ffn_dim, &xnq);
+            let act: Vec<f32> = gate
+                .iter()
+                .zip(&up)
+                .map(|(g, u)| gelu_tanh(*g) * u)
+                .collect();
+            let mlp = lw.ffn_down.matvec(ffn_dim, hidden, &act);
+            // Dense branch keeps its own post-norm (post_norm_1).
+            rms_norm(&mlp, Some(&moe.post_norm_1), eps)
+        };
         let cur_moe = rms_norm(attn_out, Some(&moe.pre_norm_2), eps);
         let cur_moe_q = SharedActivation::new(&cur_moe);
         // Materialize the tiny Q8_0 activation before `rayon::join`: the lazy
@@ -7798,13 +7956,18 @@ impl Gemma4Runtime {
                 if let Some(dir) = std::env::var_os("CAMELID_GEMMA4_DUMP_DIR") {
                     let dir = std::path::PathBuf::from(dir);
                     let _ = std::fs::create_dir_all(&dir);
-                    let ids = idx.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(",");
+                    let ids = idx
+                        .iter()
+                        .map(|e| e.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
                     let ws = route_scales
                         .iter()
                         .map(|w| format!("{w:.8}"))
                         .collect::<Vec<_>>()
                         .join(",");
-                    let meta = format!("router_ids={ids}\nrouter_weights={ws}\nmoe_l2={moe_l2:.8}\n");
+                    let meta =
+                        format!("router_ids={ids}\nrouter_weights={ws}\nmoe_l2={moe_l2:.8}\n");
                     let _ = std::fs::write(dir.join("cpu_layer0_router.txt"), meta);
                     let mut raw = Vec::with_capacity(moe_acc.len() * 4);
                     for v in &moe_acc {
@@ -7823,7 +7986,10 @@ impl Gemma4Runtime {
         let ffn_out = rms_norm(&combined, Some(&lw.post_ffw_norm), eps);
         if li == 0 && std::env::var("CAMELID_GEMMA4_DUMP_LAYERS").is_ok_and(|v| v == "1") {
             let ffn_l2 = ffn_out.iter().map(|v| v * v).sum::<f32>().sqrt();
-            eprintln!("[cpu layer0] FFN out L2={ffn_l2:.6} first4={:?}", &ffn_out[..4]);
+            eprintln!(
+                "[cpu layer0] FFN out L2={ffn_l2:.6} first4={:?}",
+                &ffn_out[..4]
+            );
         }
         Ok(ffn_out)
     }
@@ -8012,8 +8178,14 @@ impl Gemma4Runtime {
                 let on_l2 = on.iter().map(|v| v * v).sum::<f32>().sqrt();
                 let h_l2 = h.iter().map(|v| v * v).sum::<f32>().sqrt();
                 eprintln!("[cpu layer0] O L2={o_l2:.6} first4={:?}", &o[..4]);
-                eprintln!("[cpu layer0] On (normed) L2={on_l2:.6} first4={:?}", &on[..4]);
-                eprintln!("[cpu layer0] SlabB (h_mid) L2={h_l2:.6} first4={:?}", &h[..4]);
+                eprintln!(
+                    "[cpu layer0] On (normed) L2={on_l2:.6} first4={:?}",
+                    &on[..4]
+                );
+                eprintln!(
+                    "[cpu layer0] SlabB (h_mid) L2={h_l2:.6} first4={:?}",
+                    &h[..4]
+                );
             }
             let attn_us = t_attn_start.elapsed().as_micros() as u64;
 
@@ -8033,7 +8205,13 @@ impl Gemma4Runtime {
                     .collect();
                 let mlp = lw.ffn_down.matvec(ffn_dim, hidden, &act);
                 let out = rms_norm(&mlp, Some(&lw.post_ffw_norm), eps);
-                (out, LayerStepProfile { shared_mlp_us: t_dense.elapsed().as_micros() as u64, ..Default::default() })
+                (
+                    out,
+                    LayerStepProfile {
+                        shared_mlp_us: t_dense.elapsed().as_micros() as u64,
+                        ..Default::default()
+                    },
+                )
             };
 
             for (a, b) in h.iter_mut().zip(&ffn_out) {
@@ -8093,7 +8271,11 @@ impl Gemma4Runtime {
     }
 
     /// Profiled MoE layer forward that captures router, cache/IO, shared MLP, and expert GEMV durations.
-    fn moe_layer_ffn_profiled(&self, li: usize, attn_out: &[f32]) -> Result<(Vec<f32>, LayerStepProfile)> {
+    fn moe_layer_ffn_profiled(
+        &self,
+        li: usize,
+        attn_out: &[f32],
+    ) -> Result<(Vec<f32>, LayerStepProfile)> {
         let hidden = self.config.embedding_length as usize;
         let eps = self.config.rms_norm_epsilon;
         let l = self.first_layer + li;
@@ -8130,7 +8312,11 @@ impl Gemma4Runtime {
         let xnq = SharedActivation::new(&xn);
         let gate = lw.ffn_gate.matvec_proj(ffn_dim, &xnq);
         let up = lw.ffn_up.matvec_proj(ffn_dim, &xnq);
-        let act: Vec<f32> = gate.iter().zip(&up).map(|(g, u)| gelu_tanh(*g) * u).collect();
+        let act: Vec<f32> = gate
+            .iter()
+            .zip(&up)
+            .map(|(g, u)| gelu_tanh(*g) * u)
+            .collect();
         let mlp_raw = lw.ffn_down.matvec(ffn_dim, hidden, &act);
         let mlp = rms_norm(&mlp_raw, Some(&moe.post_norm_1), eps);
         prof.shared_mlp_us = t_shared.elapsed().as_micros() as u64;
@@ -8158,10 +8344,7 @@ impl Gemma4Runtime {
                 prof.bytes_read = (bytes_after.saturating_sub(bytes_before)) as usize;
                 match metal {
                     Some(acc) => (None, Some(acc)),
-                    None => (
-                        Some(ghost.cache.get_many(ghost.layer_idx, &idx)?),
-                        None,
-                    ),
+                    None => (Some(ghost.cache.get_many(ghost.layer_idx, &idx)?), None),
                 }
             }
             Some(ghost) => {
@@ -8182,17 +8365,22 @@ impl Gemma4Runtime {
         } else {
             let mut moe_acc = vec![0f32; hidden];
             for (route_slot, &e) in idx.iter().enumerate() {
-                let paged = paged_experts.as_ref().map(|experts| -> Result<(WireQuant, WireQuant)> {
-                    let expert = &experts[route_slot];
-                    Ok((
-                        WireQuant::from_ghost_tensor(expert, &expert.gate_up, "ghost gate_up")?,
-                        WireQuant::from_ghost_tensor(expert, &expert.down, "ghost down")?,
-                    ))
-                }).transpose()?;
+                let paged = paged_experts
+                    .as_ref()
+                    .map(|experts| -> Result<(WireQuant, WireQuant)> {
+                        let expert = &experts[route_slot];
+                        Ok((
+                            WireQuant::from_ghost_tensor(expert, &expert.gate_up, "ghost gate_up")?,
+                            WireQuant::from_ghost_tensor(expert, &expert.down, "ghost down")?,
+                        ))
+                    })
+                    .transpose()?;
 
                 let gate_up = match &paged {
                     Some((gu, _)) => gu.matvec_rows_proj(0, two_nff, &cur_moe_q),
-                    None => moe.gate_up_exps.matvec_rows_proj(e * two_nff, two_nff, &cur_moe_q),
+                    None => moe
+                        .gate_up_exps
+                        .matvec_rows_proj(e * two_nff, two_nff, &cur_moe_q),
                 };
                 let hexp: Vec<f32> = (0..moe.n_ff_exp)
                     .map(|o| gelu_tanh(gate_up[o]) * gate_up[o + moe.n_ff_exp])
@@ -8573,7 +8761,10 @@ impl Gemma4Runtime {
         }
         let plan = self.prepare_ghost_prefill(prompt_tokens.len(), future_forwards)?;
         if lane_trace_enabled() {
-            eprintln!("[lane] prefill plan={plan:?} prompt_len={}", prompt_tokens.len());
+            eprintln!(
+                "[lane] prefill plan={plan:?} prompt_len={}",
+                prompt_tokens.len()
+            );
         }
         if matches!(
             plan,
@@ -8592,7 +8783,11 @@ impl Gemma4Runtime {
                 .and_then(|value| value.parse::<usize>().ok())
                 .filter(|&value| value > 0)
                 .unwrap_or(if chained_lane { 8 } else { 16 })
-                .min(if chained_lane { crate::metal::GEMMA4_RESIDENT_MAX_BATCH } else { 64 });
+                .min(if chained_lane {
+                    crate::metal::GEMMA4_RESIDENT_MAX_BATCH
+                } else {
+                    64
+                });
             let mut logits = Vec::new();
             for (chunk_idx, tokens) in prompt_tokens.chunks(chunk_size).enumerate() {
                 let start_pos = chunk_idx * chunk_size;
@@ -8666,7 +8861,11 @@ impl Gemma4Runtime {
                 .and_then(|value| value.parse::<usize>().ok())
                 .filter(|&value| value > 0)
                 .unwrap_or(if chained_lane { 8 } else { 16 })
-                .min(if chained_lane { crate::metal::GEMMA4_RESIDENT_MAX_BATCH } else { 64 });
+                .min(if chained_lane {
+                    crate::metal::GEMMA4_RESIDENT_MAX_BATCH
+                } else {
+                    64
+                });
             let mut logits = Vec::new();
             for (chunk_idx, tokens) in prompt_tokens.chunks(chunk_size).enumerate() {
                 if should_cancel() {
@@ -8847,7 +9046,12 @@ impl Gemma4Runtime {
 
         let use_speculative = self.supports_speculative_chunk_forward()
             && std::env::var("CAMELID_SPEC_DECODE")
-                .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "none"))
+                .map(|v| {
+                    !matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "off" | "0" | "false" | "none"
+                    )
+                })
                 .unwrap_or(true);
 
         if use_speculative {
@@ -8870,7 +9074,8 @@ impl Gemma4Runtime {
             };
             let mut history = prompt_tokens.to_vec();
             let mut round_idx = 0usize;
-            let mut round_records: Vec<crate::inference::speculative::SpeculativeRoundRecord> = Vec::new();
+            let mut round_records: Vec<crate::inference::speculative::SpeculativeRoundRecord> =
+                Vec::new();
 
             while generated.len() < max_new {
                 if should_cancel() {
@@ -8940,7 +9145,9 @@ impl Gemma4Runtime {
                 let mut chunk = Vec::with_capacity(1 + drafts.len());
                 chunk.push(t0);
                 chunk.extend_from_slice(&drafts);
-                if lane_trace_enabled() { eprintln!("[lane] spec verify chunk len={} pos={pos}", chunk.len()); }
+                if lane_trace_enabled() {
+                    eprintln!("[lane] spec verify chunk len={} pos={pos}", chunk.len());
+                }
                 let rows = self.step_chunk(&chunk, pos, &mut kc, &mut vc)?;
                 let preds: Vec<u32> = (0..drafts.len()).map(|i| argmax(&rows[i])).collect();
                 let j = accepted_draft_prefix(&drafts, &preds);
@@ -9270,7 +9477,11 @@ impl Gemma4Runtime {
                 if let Ok(predicted_routes) = self.predict_all_layer_routes_for_chunk(&chunk) {
                     if let Ok(mut guard) = self.metal_q4_experts.lock() {
                         if let Some(lane) = guard.as_mut() {
-                            lane.prefetch_round_wide_async(&predicted_routes, &cache.file, &cache.read_pool);
+                            lane.prefetch_round_wide_async(
+                                &predicted_routes,
+                                &cache.file,
+                                &cache.read_pool,
+                            );
                         }
                     }
                 } else if let Ok(mut guard) = self.metal_q4_experts.lock() {
@@ -9286,7 +9497,8 @@ impl Gemma4Runtime {
             accepted_rounds += 1;
             accepted_drafts += j as u64;
             crate::metal::SPEC_VERIFY_ROUNDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            crate::metal::SPEC_ACCEPTED_TOKENS.fetch_add(1 + j, std::sync::atomic::Ordering::Relaxed);
+            crate::metal::SPEC_ACCEPTED_TOKENS
+                .fetch_add(1 + j, std::sync::atomic::Ordering::Relaxed);
             let mut stopped = false;
             for &d in &drafts[..j] {
                 if generated.len() >= max_new {
@@ -9911,11 +10123,14 @@ impl Gemma4GpuRuntime {
         };
         if std::env::var("CAMELID_GEMMA4_GPU_PROFILE").is_ok() && position == 0 {
             if let Some(gpu_head) = &self.q6k_gpu_head {
-                self.model.profile_subkernels(&h0, &inputs, &ti, position, gpu_head);
+                self.model
+                    .profile_subkernels(&h0, &inputs, &ti, position, gpu_head);
             }
         }
         let gpu_dur = t_gpu.elapsed().as_micros() as u64;
-        if std::env::var("CAMELID_GEMMA4_GPU_TIMING").is_ok() || std::env::var("CAMELID_GEMMA4_GPU_PROFILE").is_ok() {
+        if std::env::var("CAMELID_GEMMA4_GPU_TIMING").is_ok()
+            || std::env::var("CAMELID_GEMMA4_GPU_PROFILE").is_ok()
+        {
             PREP_US.fetch_add(prep_us as u64, std::sync::atomic::Ordering::Relaxed);
             GPU_US.fetch_add(gpu_dur, std::sync::atomic::Ordering::Relaxed);
             FWD_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -9927,7 +10142,11 @@ impl Gemma4GpuRuntime {
     }
 
     /// Verify a batch of K candidate tokens [base_position, base_position + K) on Metal GPU.
-    fn verify_batch_argmax(&self, tokens: &[u32], base_position: usize) -> Result<(Vec<u32>, crate::metal::Gemma4VerifyTimings)> {
+    fn verify_batch_argmax(
+        &self,
+        tokens: &[u32],
+        base_position: usize,
+    ) -> Result<(Vec<u32>, crate::metal::Gemma4VerifyTimings)> {
         let k_tokens = tokens.len();
         if k_tokens == 0 {
             return Ok((Vec::new(), crate::metal::Gemma4VerifyTimings::default()));
@@ -9954,7 +10173,8 @@ impl Gemma4GpuRuntime {
         let h0_scale = (hidden as f32).sqrt();
         for (i, &token) in tokens.iter().enumerate() {
             let out_chunk = &mut h0_slice[i * hidden..(i + 1) * hidden];
-            self.token_embd.dequantize_elements_into(token as usize * hidden, hidden, out_chunk)?;
+            self.token_embd
+                .dequantize_elements_into(token as usize * hidden, hidden, out_chunk)?;
             for v in out_chunk.iter_mut() {
                 *v *= h0_scale;
             }
@@ -9980,18 +10200,27 @@ impl Gemma4GpuRuntime {
         } else {
             &mut ti_borrow[..0]
         };
-        static PROFILED_VERIFY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        static PROFILED_VERIFY: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
         if std::env::var("CAMELID_GEMMA4_GPU_PROFILE").is_ok()
             && !PROFILED_VERIFY.swap(true, std::sync::atomic::Ordering::Relaxed)
         {
-            self.model.profile_verify_batch_subkernels(h0_slice, ti_slice, base_position, k_tokens, gpu_head);
+            self.model.profile_verify_batch_subkernels(
+                h0_slice,
+                ti_slice,
+                base_position,
+                k_tokens,
+                gpu_head,
+            );
         }
 
         self.model
             .verify_batch_fused_argmax_slab(h0_slice, ti_slice, base_position, k_tokens, gpu_head)
             .ok_or_else(|| {
-                BackendError::UnsupportedModelArchitecture("verify_batch_fused_argmax_slab failed".into())
-                    .into()
+                BackendError::UnsupportedModelArchitecture(
+                    "verify_batch_fused_argmax_slab failed".into(),
+                )
+                .into()
             })
     }
 
@@ -10183,31 +10412,111 @@ impl Gemma4GpuRuntime {
             eprintln!("\n==========================================================================================");
             eprintln!("                  GEMMA 4 26B GPU SPECULATIVE VERIFICATION TELEMETRY                      ");
             eprintln!("==========================================================================================");
-            eprintln!("A. Sustained Generation Speed:           {:6.2} tok/s ({:6.2} ms/accepted token)", actual_tok_s, e2e_per_tok_ms);
+            eprintln!(
+                "A. Sustained Generation Speed:           {:6.2} tok/s ({:6.2} ms/accepted token)",
+                actual_tok_s, e2e_per_tok_ms
+            );
             eprintln!("   Speculative Emitted Rate:             {:6.2} tok/s (emitted_tokens / true_wall_clock_round_time)", round_rate_tok_s);
             eprintln!("------------------------------------------------------------------------------------------");
             eprintln!("B. Speculative Acceptance Statistics:");
             eprintln!("   - Total Output Tokens:               {:6}", gen_toks);
             eprintln!("   - Speculative Verification Rounds:   {:6}", spec_rounds);
             eprintln!("   - Total Tokens Drafted:              {:6}", total_drafts);
-            eprintln!("   - Total Draft Tokens Accepted:       {:6}", total_accepted);
-            eprintln!("   - Draft Acceptance Rate:             {:6.1}%", accept_pct);
-            eprintln!("   - Mean Accepted Drafts/Round:        {:6.2}", mean_accepted_per_round);
-            eprintln!("   - Mean Emitted Tokens/Round:         {:6.2}", mean_emitted_per_round);
+            eprintln!(
+                "   - Total Draft Tokens Accepted:       {:6}",
+                total_accepted
+            );
+            eprintln!(
+                "   - Draft Acceptance Rate:             {:6.1}%",
+                accept_pct
+            );
+            eprintln!(
+                "   - Mean Accepted Drafts/Round:        {:6.2}",
+                mean_accepted_per_round
+            );
+            eprintln!(
+                "   - Mean Emitted Tokens/Round:         {:6.2}",
+                mean_emitted_per_round
+            );
             eprintln!("------------------------------------------------------------------------------------------");
             eprintln!("C. Round Latency Breakdown (Per Speculative Round):");
-            eprintln!("   - true wall-clock ms/round:           {:6.2} ms (100.0%)", true_wall_ms_per_round);
-            eprintln!("     * pure GPU execution ms:            {:6.2} ms ({:4.1}%)", pure_gpu_hw_ms_per_round, if true_wall_ms_per_round > 0.0 { 100.0 * pure_gpu_hw_ms_per_round / true_wall_ms_per_round } else { 0.0 });
-            eprintln!("     * CPU command encoding ms:          {:6.2} ms ({:4.1}%)", cpu_encode_ms_per_round, if true_wall_ms_per_round > 0.0 { 100.0 * cpu_encode_ms_per_round / true_wall_ms_per_round } else { 0.0 });
-            eprintln!("     * GPU wait/synchronization ms:      {:6.2} ms ({:4.1}%)", gpu_wait_ms_per_round, if true_wall_ms_per_round > 0.0 { 100.0 * gpu_wait_ms_per_round / true_wall_ms_per_round } else { 0.0 });
-            eprintln!("     * argmax readback ms:               {:6.2} ms ({:4.1}%)", readback_ms_per_round, if true_wall_ms_per_round > 0.0 { 100.0 * readback_ms_per_round / true_wall_ms_per_round } else { 0.0 });
-            eprintln!("     * acceptance/rollback bookkeeping ms: {:4.2} ms ({:4.1}%)", bookkeeping_ms_per_round, if true_wall_ms_per_round > 0.0 { 100.0 * bookkeeping_ms_per_round / true_wall_ms_per_round } else { 0.0 });
-            eprintln!("     * drafting ms:                      {:6.3} ms ({:4.1}%)", draft_ms_per_round, if true_wall_ms_per_round > 0.0 { 100.0 * draft_ms_per_round / true_wall_ms_per_round } else { 0.0 });
-            eprintln!("     * (target verify wall-clock total): {:6.2} ms ({:4.1}%)", verify_wall_ms_per_round, if true_wall_ms_per_round > 0.0 { 100.0 * verify_wall_ms_per_round / true_wall_ms_per_round } else { 0.0 });
+            eprintln!(
+                "   - true wall-clock ms/round:           {:6.2} ms (100.0%)",
+                true_wall_ms_per_round
+            );
+            eprintln!(
+                "     * pure GPU execution ms:            {:6.2} ms ({:4.1}%)",
+                pure_gpu_hw_ms_per_round,
+                if true_wall_ms_per_round > 0.0 {
+                    100.0 * pure_gpu_hw_ms_per_round / true_wall_ms_per_round
+                } else {
+                    0.0
+                }
+            );
+            eprintln!(
+                "     * CPU command encoding ms:          {:6.2} ms ({:4.1}%)",
+                cpu_encode_ms_per_round,
+                if true_wall_ms_per_round > 0.0 {
+                    100.0 * cpu_encode_ms_per_round / true_wall_ms_per_round
+                } else {
+                    0.0
+                }
+            );
+            eprintln!(
+                "     * GPU wait/synchronization ms:      {:6.2} ms ({:4.1}%)",
+                gpu_wait_ms_per_round,
+                if true_wall_ms_per_round > 0.0 {
+                    100.0 * gpu_wait_ms_per_round / true_wall_ms_per_round
+                } else {
+                    0.0
+                }
+            );
+            eprintln!(
+                "     * argmax readback ms:               {:6.2} ms ({:4.1}%)",
+                readback_ms_per_round,
+                if true_wall_ms_per_round > 0.0 {
+                    100.0 * readback_ms_per_round / true_wall_ms_per_round
+                } else {
+                    0.0
+                }
+            );
+            eprintln!(
+                "     * acceptance/rollback bookkeeping ms: {:4.2} ms ({:4.1}%)",
+                bookkeeping_ms_per_round,
+                if true_wall_ms_per_round > 0.0 {
+                    100.0 * bookkeeping_ms_per_round / true_wall_ms_per_round
+                } else {
+                    0.0
+                }
+            );
+            eprintln!(
+                "     * drafting ms:                      {:6.3} ms ({:4.1}%)",
+                draft_ms_per_round,
+                if true_wall_ms_per_round > 0.0 {
+                    100.0 * draft_ms_per_round / true_wall_ms_per_round
+                } else {
+                    0.0
+                }
+            );
+            eprintln!(
+                "     * (target verify wall-clock total): {:6.2} ms ({:4.1}%)",
+                verify_wall_ms_per_round,
+                if true_wall_ms_per_round > 0.0 {
+                    100.0 * verify_wall_ms_per_round / true_wall_ms_per_round
+                } else {
+                    0.0
+                }
+            );
             eprintln!("------------------------------------------------------------------------------------------");
             eprintln!("D. Session Latency Summary:");
-            eprintln!("   - Prefill Duration (Prompt):         {:6.2} ms", prefill_duration.as_secs_f64() * 1000.0);
-            eprintln!("   - Net Wall-Clock Decode Duration:    {:6.2} s", total_gen_duration.as_secs_f64());
+            eprintln!(
+                "   - Prefill Duration (Prompt):         {:6.2} ms",
+                prefill_duration.as_secs_f64() * 1000.0
+            );
+            eprintln!(
+                "   - Net Wall-Clock Decode Duration:    {:6.2} s",
+                total_gen_duration.as_secs_f64()
+            );
             eprintln!("==========================================================================================\n");
         }
 
@@ -10243,7 +10552,9 @@ impl Gemma4GpuRuntime {
             pos += 1;
         }
         let total_gen_duration = t_gen_start.elapsed();
-        if std::env::var("CAMELID_GEMMA4_GPU_TIMING").is_ok() || std::env::var("CAMELID_GEMMA4_GPU_PROFILE").is_ok() {
+        if std::env::var("CAMELID_GEMMA4_GPU_TIMING").is_ok()
+            || std::env::var("CAMELID_GEMMA4_GPU_PROFILE").is_ok()
+        {
             use std::sync::atomic::Ordering::Relaxed;
             let n = FWD_N.load(Relaxed).max(1);
             let prep = PREP_US.load(Relaxed);
@@ -10274,13 +10585,28 @@ impl Gemma4GpuRuntime {
                     eprintln!("==========================================================================================");
                     eprintln!("A. Actual End-to-End Generation Time:    {:6.2} ms/token ({:.2} tok/s sustained)", e2e_per_tok_ms, actual_tok_s);
                     eprintln!("B. Actual GPU Forward Latency (p50):     {:6.2} ms/token (mean = {:.2} ms, p95 = {:.2} ms)", p50, mean, p95);
-                    eprintln!("   - CPU Preparation / Embedding / RoPE: {:6.3} ms/token", prep_ms);
-                    eprintln!("   - Metal Command Queue / OS Delay:     {:6.3} ms/token", queue_delay_ms);
-                    eprintln!("   - GPU Hardware On-Chip Execution:     {:6.3} ms/token", gpu_hw_ms);
-                    eprintln!("   - CPU Loop Bookkeeping / Extraction:  {:6.3} ms/token", loop_overhead_ms);
+                    eprintln!(
+                        "   - CPU Preparation / Embedding / RoPE: {:6.3} ms/token",
+                        prep_ms
+                    );
+                    eprintln!(
+                        "   - Metal Command Queue / OS Delay:     {:6.3} ms/token",
+                        queue_delay_ms
+                    );
+                    eprintln!(
+                        "   - GPU Hardware On-Chip Execution:     {:6.3} ms/token",
+                        gpu_hw_ms
+                    );
+                    eprintln!(
+                        "   - CPU Loop Bookkeeping / Extraction:  {:6.3} ms/token",
+                        loop_overhead_ms
+                    );
                     eprintln!("------------------------------------------------------------------------------------------");
                     eprintln!("Forward Latency Distribution ({count} forwards):");
-                    eprintln!("   Min: {:6.2} ms | p50: {:6.2} ms | p95: {:6.2} ms | Max: {:6.2} ms", min, p50, p95, max);
+                    eprintln!(
+                        "   Min: {:6.2} ms | p50: {:6.2} ms | p95: {:6.2} ms | Max: {:6.2} ms",
+                        min, p50, p95, max
+                    );
                     eprintln!("==========================================================================================\n");
                 }
                 lats.clear();

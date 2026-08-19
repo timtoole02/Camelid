@@ -1164,9 +1164,16 @@ fn workspace_path_is_runtime_data(path: &str) -> bool {
     let data_extension = [".db", ".json", ".sqlite", ".sqlite3"]
         .iter()
         .any(|extension| filename.ends_with(extension));
-    if ["config", "configuration", "schema", "settings", "package.json", "tsconfig.json"]
-        .iter()
-        .any(|marker| filename.contains(marker))
+    if [
+        "config",
+        "configuration",
+        "schema",
+        "settings",
+        "package.json",
+        "tsconfig.json",
+    ]
+    .iter()
+    .any(|marker| filename.contains(marker))
     {
         return false;
     }
@@ -2017,8 +2024,7 @@ fn verification_requirements_focus(
     required_artifacts: &BTreeSet<String>,
     decisions: &[String],
 ) -> String {
-    let missing_artifacts =
-        missing_required_authored_artifacts(workspace_root, required_artifacts);
+    let missing_artifacts = missing_required_authored_artifacts(workspace_root, required_artifacts);
     if !missing_artifacts.is_empty() {
         return format!(
             "Create the remaining required artifacts before verification: {}",
@@ -4581,7 +4587,11 @@ pub fn run_loop(
                     if outcome.is_err() {
                         let preview = outcome.text().trim();
                         let preview_short = if preview.len() > 120 {
-                            &preview[..preview.char_indices().map(|(i, _)| i).nth(120).unwrap_or(preview.len())]
+                            &preview[..preview
+                                .char_indices()
+                                .map(|(i, _)| i)
+                                .nth(120)
+                                .unwrap_or(preview.len())]
                         } else {
                             preview
                         };
@@ -4848,7 +4858,9 @@ pub fn run_loop(
                                     sandbox.root(),
                                     &required_workspace_artifacts,
                                 );
-                                if !required_workspace_artifacts.is_empty() && missing_artifacts.is_empty() {
+                                if !required_workspace_artifacts.is_empty()
+                                    && missing_artifacts.is_empty()
+                                {
                                     runtime.ledger.current_focus = verification_requirements_focus(
                                         sandbox.root(),
                                         &task_objective,
@@ -5088,10 +5100,11 @@ pub fn run_loop(
                                     runtime.ledger.verification_state.failing_diagnostic =
                                         Some(compact.raw_reference.clone());
                                     let summary = bounded_inline_shell_diagnostic(&compact.preview);
-                                    let failing_source_file = extract_failing_source_file_from_traceback(
-                                        raw_outcome.text(),
-                                        sandbox.root(),
-                                    );
+                                    let failing_source_file =
+                                        extract_failing_source_file_from_traceback(
+                                            raw_outcome.text(),
+                                            sandbox.root(),
+                                        );
                                     let missing_artifacts = missing_required_authored_artifacts(
                                         sandbox.root(),
                                         &required_workspace_artifacts,
@@ -6450,10 +6463,7 @@ fn missing_required_python_module_artifact(
 }
 
 /// Extract the innermost local source file mentioned in a Python traceback.
-fn extract_failing_source_file_from_traceback(
-    output: &str,
-    root: &Path,
-) -> Option<String> {
+fn extract_failing_source_file_from_traceback(output: &str, root: &Path) -> Option<String> {
     for line in output.lines().rev() {
         if let Some(pos) = line.find("File \"") {
             let start = pos + 6;
@@ -6461,7 +6471,9 @@ fn extract_failing_source_file_from_traceback(
                 let path_str = &line[start..start + end];
                 let path = Path::new(path_str);
                 let rel = if path.is_absolute() {
-                    path.strip_prefix(root).ok().map(|p| p.to_string_lossy().to_string())
+                    path.strip_prefix(root)
+                        .ok()
+                        .map(|p| p.to_string_lossy().to_string())
                 } else {
                     Some(path_str.to_string())
                 };
@@ -13263,8 +13275,14 @@ mod tests {
 
         let prose_objective = "Build a small but complete Python application called TaskForge with main.py, queue.py, and tests/test_queue.py in your workspace.";
         let prose_requested = workspace_requested_artifacts(prose_objective);
-        assert!(!prose_requested.contains("Build"), "must not extract English verb 'Build' as a phantom file");
-        assert!(!prose_requested.contains("workspace"), "must not extract English noun 'workspace' as a phantom file");
+        assert!(
+            !prose_requested.contains("Build"),
+            "must not extract English verb 'Build' as a phantom file"
+        );
+        assert!(
+            !prose_requested.contains("workspace"),
+            "must not extract English noun 'workspace' as a phantom file"
+        );
         assert!(prose_requested.contains("main.py"));
         assert!(prose_requested.contains("queue.py"));
         assert!(prose_requested.contains("tests/test_queue.py"));

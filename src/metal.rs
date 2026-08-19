@@ -612,7 +612,6 @@ impl GpuStageStamp {
     }
 }
 
-
 /// IEEE 754 binary16 bits -> f32. Exact in every case (f32 covers the whole f16 range,
 /// subnormals included), so it is the exact inverse of [`f32_to_f16_bits`] on any value that
 /// round-trips. Used by the KV readback when the resident cache is in half mode.
@@ -13804,18 +13803,38 @@ impl Gemma4MultiExpertLayerBatch {
     pub fn new(max_unique_experts: usize, max_candidates: usize) -> Option<Self> {
         let kernel = metal_linear_kernel()?;
         let shared = |size: usize| {
-            kernel.device.new_buffer(size as u64, MTLResourceOptions::StorageModeShared)
+            kernel
+                .device
+                .new_buffer(size as u64, MTLResourceOptions::StorageModeShared)
         };
         Some(Self {
-            input_scales: shared(max_candidates * GEMMA4_Q4_EXPERT_INPUT_BLOCKS * std::mem::size_of::<f32>()),
+            input_scales: shared(
+                max_candidates * GEMMA4_Q4_EXPERT_INPUT_BLOCKS * std::mem::size_of::<f32>(),
+            ),
             input_quants: shared(max_candidates * GEMMA4_Q4_EXPERT_HIDDEN),
             expert_weights: shared(max_unique_experts * GEMMA4_Q4_EXPERT_RECORD_BYTES),
             work_list: shared(max_unique_experts * std::mem::size_of::<Gemma4UniqueExpertWork>()),
-            activated: shared(max_unique_experts * max_candidates * GEMMA4_Q4_EXPERT_FF * std::mem::size_of::<f32>()),
-            activation_scales: shared(max_unique_experts * max_candidates * GEMMA4_Q4_EXPERT_ACT_BLOCKS * std::mem::size_of::<f32>()),
+            activated: shared(
+                max_unique_experts
+                    * max_candidates
+                    * GEMMA4_Q4_EXPERT_FF
+                    * std::mem::size_of::<f32>(),
+            ),
+            activation_scales: shared(
+                max_unique_experts
+                    * max_candidates
+                    * GEMMA4_Q4_EXPERT_ACT_BLOCKS
+                    * std::mem::size_of::<f32>(),
+            ),
             activation_quants: shared(max_unique_experts * max_candidates * GEMMA4_Q4_EXPERT_FF),
-            candidate_routes: shared(max_candidates * GEMMA4_Q4_EXPERT_ROUTES * std::mem::size_of::<Gemma4CandidateRouteEntry>()),
-            output_moe_acc: shared(max_candidates * GEMMA4_Q4_EXPERT_HIDDEN * std::mem::size_of::<f32>()),
+            candidate_routes: shared(
+                max_candidates
+                    * GEMMA4_Q4_EXPERT_ROUTES
+                    * std::mem::size_of::<Gemma4CandidateRouteEntry>(),
+            ),
+            output_moe_acc: shared(
+                max_candidates * GEMMA4_Q4_EXPERT_HIDDEN * std::mem::size_of::<f32>(),
+            ),
             max_unique_experts,
             max_candidates,
         })
@@ -13832,7 +13851,12 @@ impl Gemma4MultiExpertLayerBatch {
     ) -> Option<()> {
         let k_candidates = input_q8.len();
         let num_unique_experts = unique_expert_gate_up.len();
-        if k_candidates == 0 || num_unique_experts == 0 || k_candidates > self.max_candidates || num_unique_experts > self.max_unique_experts || unique_expert_down.len() != num_unique_experts {
+        if k_candidates == 0
+            || num_unique_experts == 0
+            || k_candidates > self.max_candidates
+            || num_unique_experts > self.max_unique_experts
+            || unique_expert_down.len() != num_unique_experts
+        {
             return None;
         }
 
@@ -13854,8 +13878,14 @@ impl Gemma4MultiExpertLayerBatch {
             }
 
             let weights_out = self.expert_weights.contents().cast::<u8>();
-            for (u, (&gu, &dw)) in unique_expert_gate_up.iter().zip(unique_expert_down).enumerate() {
-                if gu.len() != GEMMA4_Q4_EXPERT_GATE_UP_BYTES || dw.len() != GEMMA4_Q4_EXPERT_DOWN_BYTES {
+            for (u, (&gu, &dw)) in unique_expert_gate_up
+                .iter()
+                .zip(unique_expert_down)
+                .enumerate()
+            {
+                if gu.len() != GEMMA4_Q4_EXPERT_GATE_UP_BYTES
+                    || dw.len() != GEMMA4_Q4_EXPERT_DOWN_BYTES
+                {
                     return None;
                 }
                 let expert_offset = u * GEMMA4_Q4_EXPERT_RECORD_BYTES;
@@ -13874,14 +13904,25 @@ impl Gemma4MultiExpertLayerBatch {
             let work_out = self.work_list.contents().cast::<Gemma4UniqueExpertWork>();
             std::ptr::copy_nonoverlapping(work_items.as_ptr(), work_out, num_unique_experts);
 
-            let routes_out = self.candidate_routes.contents().cast::<Gemma4CandidateRouteEntry>();
-            std::ptr::copy_nonoverlapping(route_entries.as_ptr(), routes_out, k_candidates * GEMMA4_Q4_EXPERT_ROUTES);
+            let routes_out = self
+                .candidate_routes
+                .contents()
+                .cast::<Gemma4CandidateRouteEntry>();
+            std::ptr::copy_nonoverlapping(
+                route_entries.as_ptr(),
+                routes_out,
+                k_candidates * GEMMA4_Q4_EXPERT_ROUTES,
+            );
         }
 
         let kernel = metal_linear_kernel()?;
-        let gate_pipeline = kernel.gemma4_q4_multi_expert_gate_up_geglu_simd_pipeline.as_ref()?;
+        let gate_pipeline = kernel
+            .gemma4_q4_multi_expert_gate_up_geglu_simd_pipeline
+            .as_ref()?;
         let quant_pipeline = kernel.gemma4_q4_multi_expert_quantize_pipeline.as_ref()?;
-        let down_pipeline = kernel.gemma4_q4_multi_expert_down_scatter_reduce_simd_pipeline.as_ref()?;
+        let down_pipeline = kernel
+            .gemma4_q4_multi_expert_down_scatter_reduce_simd_pipeline
+            .as_ref()?;
 
         let command_buffer = kernel.queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
@@ -13895,9 +13936,21 @@ impl Gemma4MultiExpertLayerBatch {
         encoder.set_buffer(4, Some(&self.activated), 0);
         let num_unique_u32 = num_unique_experts as u32;
         let k_candidates_u32 = k_candidates as u32;
-        encoder.set_bytes(5, std::mem::size_of::<u32>() as u64, &num_unique_u32 as *const u32 as *const _);
-        encoder.set_bytes(6, std::mem::size_of::<u32>() as u64, &k_candidates_u32 as *const u32 as *const _);
-        dispatch_1d(encoder, gate_pipeline, num_unique_experts * GEMMA4_Q4_EXPERT_FF);
+        encoder.set_bytes(
+            5,
+            std::mem::size_of::<u32>() as u64,
+            &num_unique_u32 as *const u32 as *const _,
+        );
+        encoder.set_bytes(
+            6,
+            std::mem::size_of::<u32>() as u64,
+            &k_candidates_u32 as *const u32 as *const _,
+        );
+        dispatch_1d(
+            encoder,
+            gate_pipeline,
+            num_unique_experts * GEMMA4_Q4_EXPERT_FF,
+        );
 
         // Pass 2: Quantize GeGLU to Q8_0
         encoder.set_compute_pipeline_state(quant_pipeline);
@@ -13905,9 +13958,21 @@ impl Gemma4MultiExpertLayerBatch {
         encoder.set_buffer(1, Some(&self.activation_scales), 0);
         encoder.set_buffer(2, Some(&self.activation_quants), 0);
         encoder.set_buffer(3, Some(&self.work_list), 0);
-        encoder.set_bytes(4, std::mem::size_of::<u32>() as u64, &num_unique_u32 as *const u32 as *const _);
-        encoder.set_bytes(5, std::mem::size_of::<u32>() as u64, &k_candidates_u32 as *const u32 as *const _);
-        dispatch_1d(encoder, quant_pipeline, num_unique_experts * k_candidates * GEMMA4_Q4_EXPERT_ACT_BLOCKS);
+        encoder.set_bytes(
+            4,
+            std::mem::size_of::<u32>() as u64,
+            &num_unique_u32 as *const u32 as *const _,
+        );
+        encoder.set_bytes(
+            5,
+            std::mem::size_of::<u32>() as u64,
+            &k_candidates_u32 as *const u32 as *const _,
+        );
+        dispatch_1d(
+            encoder,
+            quant_pipeline,
+            num_unique_experts * k_candidates * GEMMA4_Q4_EXPERT_ACT_BLOCKS,
+        );
 
         // Pass 3: Down GEMV + Router Weighted Scatter/Reduce
         encoder.set_compute_pipeline_state(down_pipeline);
@@ -13917,7 +13982,11 @@ impl Gemma4MultiExpertLayerBatch {
         encoder.set_buffer(3, Some(&self.candidate_routes), 0);
         encoder.set_buffer(4, Some(&self.work_list), 0);
         encoder.set_buffer(5, Some(&self.output_moe_acc), 0);
-        encoder.set_bytes(6, std::mem::size_of::<u32>() as u64, &k_candidates_u32 as *const u32 as *const _);
+        encoder.set_bytes(
+            6,
+            std::mem::size_of::<u32>() as u64,
+            &k_candidates_u32 as *const u32 as *const _,
+        );
         dispatch_one_simdgroup_per_row(encoder, k_candidates * GEMMA4_Q4_EXPERT_HIDDEN);
 
         encoder.end_encoding();
@@ -13932,7 +14001,11 @@ impl Gemma4MultiExpertLayerBatch {
             let out_ptr = self.output_moe_acc.contents().cast::<f32>();
             for (t, row_vec) in output_acc.iter_mut().enumerate().take(k_candidates) {
                 row_vec.resize(GEMMA4_Q4_EXPERT_HIDDEN, 0.0);
-                std::ptr::copy_nonoverlapping(out_ptr.add(t * GEMMA4_Q4_EXPERT_HIDDEN), row_vec.as_mut_ptr(), GEMMA4_Q4_EXPERT_HIDDEN);
+                std::ptr::copy_nonoverlapping(
+                    out_ptr.add(t * GEMMA4_Q4_EXPERT_HIDDEN),
+                    row_vec.as_mut_ptr(),
+                    GEMMA4_Q4_EXPERT_HIDDEN,
+                );
             }
         }
         Some(())
@@ -13952,7 +14025,11 @@ impl Gemma4MultiExpertLayerBatch {
         fused_residuals: Option<(&Buffer, &Buffer, &Buffer, &Buffer, &Buffer, f32)>,
     ) -> Option<()> {
         let k_candidates = k_candidates;
-        if k_candidates == 0 || num_unique_experts == 0 || k_candidates > self.max_candidates || num_unique_experts > self.max_unique_experts {
+        if k_candidates == 0
+            || num_unique_experts == 0
+            || k_candidates > self.max_candidates
+            || num_unique_experts > self.max_unique_experts
+        {
             return None;
         }
 
@@ -13961,15 +14038,26 @@ impl Gemma4MultiExpertLayerBatch {
             let work_out = self.work_list.contents().cast::<Gemma4UniqueExpertWork>();
             std::ptr::copy_nonoverlapping(work_items.as_ptr(), work_out, num_unique_experts);
 
-            let routes_out = self.candidate_routes.contents().cast::<Gemma4CandidateRouteEntry>();
-            std::ptr::copy_nonoverlapping(route_entries.as_ptr(), routes_out, k_candidates * GEMMA4_Q4_EXPERT_ROUTES);
+            let routes_out = self
+                .candidate_routes
+                .contents()
+                .cast::<Gemma4CandidateRouteEntry>();
+            std::ptr::copy_nonoverlapping(
+                route_entries.as_ptr(),
+                routes_out,
+                k_candidates * GEMMA4_Q4_EXPERT_ROUTES,
+            );
         }
         let prep_dur = t_prep_start.elapsed();
 
         let kernel = metal_linear_kernel()?;
-        let gate_pipeline = kernel.gemma4_q4_multi_expert_gate_up_geglu_simd_pipeline.as_ref()?;
+        let gate_pipeline = kernel
+            .gemma4_q4_multi_expert_gate_up_geglu_simd_pipeline
+            .as_ref()?;
         let quant_pipeline = kernel.gemma4_q4_multi_expert_quantize_pipeline.as_ref()?;
-        let down_pipeline = kernel.gemma4_q4_multi_expert_down_scatter_reduce_simd_pipeline.as_ref()?;
+        let down_pipeline = kernel
+            .gemma4_q4_multi_expert_down_scatter_reduce_simd_pipeline
+            .as_ref()?;
 
         let command_buffer = kernel.queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
@@ -13983,9 +14071,21 @@ impl Gemma4MultiExpertLayerBatch {
         encoder.set_buffer(4, Some(&self.activated), 0);
         let num_unique_u32 = num_unique_experts as u32;
         let k_candidates_u32 = k_candidates as u32;
-        encoder.set_bytes(5, std::mem::size_of::<u32>() as u64, &num_unique_u32 as *const u32 as *const _);
-        encoder.set_bytes(6, std::mem::size_of::<u32>() as u64, &k_candidates_u32 as *const u32 as *const _);
-        dispatch_1d(encoder, gate_pipeline, num_unique_experts * GEMMA4_Q4_EXPERT_FF);
+        encoder.set_bytes(
+            5,
+            std::mem::size_of::<u32>() as u64,
+            &num_unique_u32 as *const u32 as *const _,
+        );
+        encoder.set_bytes(
+            6,
+            std::mem::size_of::<u32>() as u64,
+            &k_candidates_u32 as *const u32 as *const _,
+        );
+        dispatch_1d(
+            encoder,
+            gate_pipeline,
+            num_unique_experts * GEMMA4_Q4_EXPERT_FF,
+        );
 
         // Pass 2: Quantize GeGLU to Q8_0
         encoder.set_compute_pipeline_state(quant_pipeline);
@@ -13993,9 +14093,21 @@ impl Gemma4MultiExpertLayerBatch {
         encoder.set_buffer(1, Some(&self.activation_scales), 0);
         encoder.set_buffer(2, Some(&self.activation_quants), 0);
         encoder.set_buffer(3, Some(&self.work_list), 0);
-        encoder.set_bytes(4, std::mem::size_of::<u32>() as u64, &num_unique_u32 as *const u32 as *const _);
-        encoder.set_bytes(5, std::mem::size_of::<u32>() as u64, &k_candidates_u32 as *const u32 as *const _);
-        dispatch_1d(encoder, quant_pipeline, num_unique_experts * k_candidates * GEMMA4_Q4_EXPERT_ACT_BLOCKS);
+        encoder.set_bytes(
+            4,
+            std::mem::size_of::<u32>() as u64,
+            &num_unique_u32 as *const u32 as *const _,
+        );
+        encoder.set_bytes(
+            5,
+            std::mem::size_of::<u32>() as u64,
+            &k_candidates_u32 as *const u32 as *const _,
+        );
+        dispatch_1d(
+            encoder,
+            quant_pipeline,
+            num_unique_experts * k_candidates * GEMMA4_Q4_EXPERT_ACT_BLOCKS,
+        );
 
         // Pass 3: Down GEMV + Router Weighted Scatter/Reduce
         encoder.set_compute_pipeline_state(down_pipeline);
@@ -14005,7 +14117,11 @@ impl Gemma4MultiExpertLayerBatch {
         encoder.set_buffer(3, Some(&self.candidate_routes), 0);
         encoder.set_buffer(4, Some(&self.work_list), 0);
         encoder.set_buffer(5, Some(&self.output_moe_acc), 0);
-        encoder.set_bytes(6, std::mem::size_of::<u32>() as u64, &k_candidates_u32 as *const u32 as *const _);
+        encoder.set_bytes(
+            6,
+            std::mem::size_of::<u32>() as u64,
+            &k_candidates_u32 as *const u32 as *const _,
+        );
         dispatch_one_simdgroup_per_row(encoder, k_candidates * GEMMA4_Q4_EXPERT_HIDDEN);
 
         // Pass 4 & 5: On-Device Residual Accumulation directly into slab_a
@@ -14017,7 +14133,11 @@ impl Gemma4MultiExpertLayerBatch {
             encoder.set_buffer(1, Some(dn_batch), 0);
             encoder.set_buffer(2, Some(slab_a), 0);
             encoder.set_bytes(3, 4, &total_elements as *const u32 as *const _);
-            dispatch_1d(encoder, &kernel.residual_add_pipeline, k_candidates * GEMMA4_Q4_EXPERT_HIDDEN);
+            dispatch_1d(
+                encoder,
+                &kernel.residual_add_pipeline,
+                k_candidates * GEMMA4_Q4_EXPERT_HIDDEN,
+            );
 
             // 4b. slab_a = slab_a + slab_b
             encoder.set_compute_pipeline_state(&kernel.residual_add_pipeline);
@@ -14025,7 +14145,11 @@ impl Gemma4MultiExpertLayerBatch {
             encoder.set_buffer(1, Some(slab_b), 0);
             encoder.set_buffer(2, Some(slab_a), 0);
             encoder.set_bytes(3, 4, &total_elements as *const u32 as *const _);
-            dispatch_1d(encoder, &kernel.residual_add_pipeline, k_candidates * GEMMA4_Q4_EXPERT_HIDDEN);
+            dispatch_1d(
+                encoder,
+                &kernel.residual_add_pipeline,
+                k_candidates * GEMMA4_Q4_EXPERT_HIDDEN,
+            );
         }
 
         encoder.end_encoding();
@@ -14046,7 +14170,11 @@ impl Gemma4MultiExpertLayerBatch {
                 let out_ptr = self.output_moe_acc.contents().cast::<f32>();
                 for (t, row_vec) in output_acc.iter_mut().enumerate().take(k_candidates) {
                     row_vec.resize(GEMMA4_Q4_EXPERT_HIDDEN, 0.0);
-                    std::ptr::copy_nonoverlapping(out_ptr.add(t * GEMMA4_Q4_EXPERT_HIDDEN), row_vec.as_mut_ptr(), GEMMA4_Q4_EXPERT_HIDDEN);
+                    std::ptr::copy_nonoverlapping(
+                        out_ptr.add(t * GEMMA4_Q4_EXPERT_HIDDEN),
+                        row_vec.as_mut_ptr(),
+                        GEMMA4_Q4_EXPERT_HIDDEN,
+                    );
                 }
             }
         }
@@ -14077,7 +14205,8 @@ pub(crate) fn try_gemma4_q4_multi_expert_layer_chunk_with_gpu_quants(
 ) -> Option<()> {
     #[cfg(target_os = "macos")]
     {
-        static BATCH: std::sync::Mutex<Option<Gemma4MultiExpertLayerBatch>> = std::sync::Mutex::new(None);
+        static BATCH: std::sync::Mutex<Option<Gemma4MultiExpertLayerBatch>> =
+            std::sync::Mutex::new(None);
         let mut lock = BATCH.lock().ok()?;
         if lock.is_none() {
             *lock = Some(Gemma4MultiExpertLayerBatch::new(128, 16)?);
@@ -14097,7 +14226,18 @@ pub(crate) fn try_gemma4_q4_multi_expert_layer_chunk_with_gpu_quants(
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (input_scales, input_quants, k_candidates, expert_weights_buffer, num_unique_experts, work_items, route_entries, output_acc, timing, fused_residuals);
+        let _ = (
+            input_scales,
+            input_quants,
+            k_candidates,
+            expert_weights_buffer,
+            num_unique_experts,
+            work_items,
+            route_entries,
+            output_acc,
+            timing,
+            fused_residuals,
+        );
         None
     }
 }
@@ -14291,8 +14431,9 @@ fn encode_q6k_ordered_batch(
         let turbo_batch_pipeline = (!std::env::var("CAMELID_GEMMA4_GHOST_METAL_TURBO")
             .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false")))
         .then(|| {
-            specialized_k8
-                .or_else(|| admitted_32_lane_pipeline(kernel.q6k_linear_turbo_batch_k_pipeline.as_ref()))
+            specialized_k8.or_else(|| {
+                admitted_32_lane_pipeline(kernel.q6k_linear_turbo_batch_k_pipeline.as_ref())
+            })
         })
         .flatten();
         if let Some(pipeline) = turbo_batch_pipeline {
@@ -14418,7 +14559,6 @@ fn encode_q6k_batch_k(
         encoder.dispatch_thread_groups(thread_groups, threads_per_group);
     }
 }
-
 
 /// NVFP4 wire GEMV on the GPU (GABBRO M3) — the NVFP4 counterpart of
 /// [`try_gemma4_q4_0_matmul_f32y`]. `weight_wire` is `rows * blocks_per_row`
@@ -15218,15 +15358,16 @@ impl Gemma4Q6KHead {
                 row
             })
             .collect();
-        results.par_iter_mut().enumerate().for_each(|(i, row)| {
-            unsafe {
+        results
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(i, row)| unsafe {
                 std::ptr::copy_nonoverlapping(
                     (logits_ptr as *const f32).add(i * vocab),
                     row.as_mut_ptr(),
                     vocab,
                 );
-            }
-        });
+            });
         if std::env::var("CAMELID_GEMMA4_METAL_HEAD_TIMING")
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         {
@@ -15381,7 +15522,6 @@ pub struct Gemma4VerifyTimings {
 
 #[cfg(target_os = "macos")]
 impl Gemma4ResidentModel {
-
     pub(crate) fn forward_token_fused_argmax(
         &self,
         h0: &[f32],
@@ -15503,7 +15643,8 @@ impl Gemma4ResidentModel {
         _ti: &[f32],
         _position: usize,
         _q6k_head: &Gemma4Q6KHead,
-    ) {}
+    ) {
+    }
 
     pub(crate) fn profile_verify_batch_subkernels(
         &self,
@@ -15512,7 +15653,8 @@ impl Gemma4ResidentModel {
         _base_position: usize,
         _k_tokens: usize,
         _q6k_head: &Gemma4Q6KHead,
-    ) {}
+    ) {
+    }
 
     pub(crate) fn verify_batch_fused_argmax_slab(
         &self,
@@ -18644,9 +18786,7 @@ fn encode_gemma4_q4_0_qkv_matmul_batch_k_fused_rms(
         (*ptr, *ptr.add(1), *ptr.add(2), *ptr.add(3))
     };
     let k_batch_u32 = k_batch as u32;
-    let disp = (q_rows_u32 as usize)
-        + (k_rows_u32 as usize)
-        + (v_rows_u32 as usize);
+    let disp = (q_rows_u32 as usize) + (k_rows_u32 as usize) + (v_rows_u32 as usize);
     e.set_compute_pipeline_state(pipe);
     e.set_buffer(0, Some(x), 0);
     e.set_buffer(1, Some(q_weight), 0);
@@ -18766,7 +18906,6 @@ fn encode_gemma4_q4_0_gateup_matmul_batch_k(
         );
     }
 }
-
 
 /// Encode one ordered Q4_0 x Q8_0 GEMV for a single activation row.
 ///
@@ -19408,7 +19547,6 @@ pub struct Gemma4ResidentLayer {
 
 #[cfg(target_os = "macos")]
 impl Gemma4ResidentLayer {
-
     #[inline]
     pub fn window_start(&self, filled: usize) -> usize {
         if let Some(w) = self.sliding_window {
@@ -19443,9 +19581,28 @@ impl Gemma4ResidentLayer {
         eps: f32,
     ) -> Option<Self> {
         Self::from_wire_with_rope(
-            fmt, attn_norm, q_norm, k_norm, post_attn_norm, ffn_norm, post_ffw_norm,
-            q_wire, k_wire, v_wire, o_wire, gate_wire, up_wire, down_wire,
-            n_heads, n_kv_heads, head_dim, ffn_dim, eps, None, 2048, None,
+            fmt,
+            attn_norm,
+            q_norm,
+            k_norm,
+            post_attn_norm,
+            ffn_norm,
+            post_ffw_norm,
+            q_wire,
+            k_wire,
+            v_wire,
+            o_wire,
+            gate_wire,
+            up_wire,
+            down_wire,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            ffn_dim,
+            eps,
+            None,
+            2048,
+            None,
         )
     }
 
@@ -19486,10 +19643,38 @@ impl Gemma4ResidentLayer {
         let q_dim = n_heads * head_dim;
         let kv_dim = n_kv_heads * head_dim;
         let (
-            attn_norm_buf, q_norm_buf, k_norm_buf, post_attn_norm_buf, ffn_norm_buf, post_ffw_norm_buf,
-            rms_scalar, post_rms_scalar, perhead_q, perhead_k, perhead_v,
-            q_mm, kv_mm, qkv_scalar, qkv_scalar_batch, o_mm, o_mm_batch, gateup_scalar, gateup_scalar_batch, down_scalar, down_scalar_batch, resid_n, resid_n_batch, geglu_n, rope_q, rope_k,
-            cos_buf, sin_buf, attn_scalar, scatter_scalar, denom_buf, blocks_buf,
+            attn_norm_buf,
+            q_norm_buf,
+            k_norm_buf,
+            post_attn_norm_buf,
+            ffn_norm_buf,
+            post_ffw_norm_buf,
+            rms_scalar,
+            post_rms_scalar,
+            perhead_q,
+            perhead_k,
+            perhead_v,
+            q_mm,
+            kv_mm,
+            qkv_scalar,
+            qkv_scalar_batch,
+            o_mm,
+            o_mm_batch,
+            gateup_scalar,
+            gateup_scalar_batch,
+            down_scalar,
+            down_scalar_batch,
+            resid_n,
+            resid_n_batch,
+            geglu_n,
+            rope_q,
+            rope_k,
+            cos_buf,
+            sin_buf,
+            attn_scalar,
+            scatter_scalar,
+            denom_buf,
+            blocks_buf,
         ) = init_layer_resident_buffers(
             k,
             &attn_norm,
@@ -19594,9 +19779,28 @@ impl Gemma4ResidentLayer {
         eps: f32,
     ) -> Option<Self> {
         Self::from_wire_pages_with_rope(
-            fmt, attn_norm, q_norm, k_norm, post_attn_norm, ffn_norm, post_ffw_norm,
-            q_pages, k_pages, v_pages, o_pages, gate_pages, up_pages, down_pages,
-            n_heads, n_kv_heads, head_dim, ffn_dim, eps, None, 2048, None,
+            fmt,
+            attn_norm,
+            q_norm,
+            k_norm,
+            post_attn_norm,
+            ffn_norm,
+            post_ffw_norm,
+            q_pages,
+            k_pages,
+            v_pages,
+            o_pages,
+            gate_pages,
+            up_pages,
+            down_pages,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            ffn_dim,
+            eps,
+            None,
+            2048,
+            None,
         )
     }
 
@@ -19634,10 +19838,38 @@ impl Gemma4ResidentLayer {
         let q_dim = n_heads * head_dim;
         let kv_dim = n_kv_heads * head_dim;
         let (
-            attn_norm_buf, q_norm_buf, k_norm_buf, post_attn_norm_buf, ffn_norm_buf, post_ffw_norm_buf,
-            rms_scalar, post_rms_scalar, perhead_q, perhead_k, perhead_v,
-            q_mm, kv_mm, qkv_scalar, qkv_scalar_batch, o_mm, o_mm_batch, gateup_scalar, gateup_scalar_batch, down_scalar, down_scalar_batch, resid_n, resid_n_batch, geglu_n, rope_q, rope_k,
-            cos_buf, sin_buf, attn_scalar, scatter_scalar, denom_buf, blocks_buf,
+            attn_norm_buf,
+            q_norm_buf,
+            k_norm_buf,
+            post_attn_norm_buf,
+            ffn_norm_buf,
+            post_ffw_norm_buf,
+            rms_scalar,
+            post_rms_scalar,
+            perhead_q,
+            perhead_k,
+            perhead_v,
+            q_mm,
+            kv_mm,
+            qkv_scalar,
+            qkv_scalar_batch,
+            o_mm,
+            o_mm_batch,
+            gateup_scalar,
+            gateup_scalar_batch,
+            down_scalar,
+            down_scalar_batch,
+            resid_n,
+            resid_n_batch,
+            geglu_n,
+            rope_q,
+            rope_k,
+            cos_buf,
+            sin_buf,
+            attn_scalar,
+            scatter_scalar,
+            denom_buf,
+            blocks_buf,
         ) = init_layer_resident_buffers(
             k,
             &attn_norm,
@@ -19743,9 +19975,28 @@ impl Gemma4ResidentLayer {
         eps: f32,
     ) -> Option<Self> {
         Self::from_wire_pages_owned_with_rope(
-            fmt, attn_norm, q_norm, k_norm, post_attn_norm, ffn_norm, post_ffw_norm,
-            q_pages, k_pages, v_pages, o_pages, gate_pages, up_pages, down_pages,
-            n_heads, n_kv_heads, head_dim, ffn_dim, eps, None, 2048, None,
+            fmt,
+            attn_norm,
+            q_norm,
+            k_norm,
+            post_attn_norm,
+            ffn_norm,
+            post_ffw_norm,
+            q_pages,
+            k_pages,
+            v_pages,
+            o_pages,
+            gate_pages,
+            up_pages,
+            down_pages,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            ffn_dim,
+            eps,
+            None,
+            2048,
+            None,
         )
     }
 
@@ -19796,10 +20047,38 @@ impl Gemma4ResidentLayer {
         let q_dim = n_heads * head_dim;
         let kv_dim = n_kv_heads * head_dim;
         let (
-            attn_norm_buf, q_norm_buf, k_norm_buf, post_attn_norm_buf, ffn_norm_buf, post_ffw_norm_buf,
-            rms_scalar, post_rms_scalar, perhead_q, perhead_k, perhead_v,
-            q_mm, kv_mm, qkv_scalar, qkv_scalar_batch, o_mm, o_mm_batch, gateup_scalar, gateup_scalar_batch, down_scalar, down_scalar_batch, resid_n, resid_n_batch, geglu_n, rope_q, rope_k,
-            cos_buf, sin_buf, attn_scalar, scatter_scalar, denom_buf, blocks_buf,
+            attn_norm_buf,
+            q_norm_buf,
+            k_norm_buf,
+            post_attn_norm_buf,
+            ffn_norm_buf,
+            post_ffw_norm_buf,
+            rms_scalar,
+            post_rms_scalar,
+            perhead_q,
+            perhead_k,
+            perhead_v,
+            q_mm,
+            kv_mm,
+            qkv_scalar,
+            qkv_scalar_batch,
+            o_mm,
+            o_mm_batch,
+            gateup_scalar,
+            gateup_scalar_batch,
+            down_scalar,
+            down_scalar_batch,
+            resid_n,
+            resid_n_batch,
+            geglu_n,
+            rope_q,
+            rope_k,
+            cos_buf,
+            sin_buf,
+            attn_scalar,
+            scatter_scalar,
+            denom_buf,
+            blocks_buf,
         ) = init_layer_resident_buffers(
             kernel,
             &attn_norm,
@@ -19900,10 +20179,38 @@ fn init_layer_resident_buffers(
     rope_inv_freqs: Option<&[f32]>,
     max_positions: usize,
 ) -> (
-    Buffer, Buffer, Buffer, Buffer, Buffer, Buffer,
-    Buffer, Buffer, Buffer, Buffer, Buffer, Buffer, Buffer, Buffer, Buffer, Buffer, Buffer, Buffer,
-    Buffer, Buffer, Buffer, Buffer, Buffer, Buffer, Buffer, Buffer,
-    Buffer, Buffer, Buffer, Buffer, Buffer, Buffer,
+    Buffer,
+    Buffer,
+    Buffer,
+    Buffer,
+    Buffer,
+    Buffer,
+    Buffer,
+    Buffer,
+    Buffer,
+    Buffer,
+    Buffer,
+    Buffer,
+    Buffer,
+    Buffer,
+    Buffer,
+    Buffer,
+    Buffer,
+    Buffer,
+    Buffer,
+    Buffer,
+    Buffer,
+    Buffer,
+    Buffer,
+    Buffer,
+    Buffer,
+    Buffer,
+    Buffer,
+    Buffer,
+    Buffer,
+    Buffer,
+    Buffer,
+    Buffer,
 ) {
     let mkbuf = |bytes: usize| {
         k.device
@@ -20046,10 +20353,38 @@ fn init_layer_resident_buffers(
     }
 
     (
-        attn_norm_buf, q_norm_buf, k_norm_buf, post_attn_norm_buf, ffn_norm_buf, post_ffw_norm_buf,
-        rms_scalar, post_rms_scalar, perhead_q, perhead_k, perhead_v,
-        q_mm, kv_mm, qkv_scalar, qkv_scalar_batch, o_mm, o_mm_batch, gateup_scalar, gateup_scalar_batch, down_scalar, down_scalar_batch, resid_n, resid_n_batch, geglu_n, rope_q, rope_k,
-        cos_buf, sin_buf, attn_scalar, scatter_scalar, denom_buf, blocks_buf,
+        attn_norm_buf,
+        q_norm_buf,
+        k_norm_buf,
+        post_attn_norm_buf,
+        ffn_norm_buf,
+        post_ffw_norm_buf,
+        rms_scalar,
+        post_rms_scalar,
+        perhead_q,
+        perhead_k,
+        perhead_v,
+        q_mm,
+        kv_mm,
+        qkv_scalar,
+        qkv_scalar_batch,
+        o_mm,
+        o_mm_batch,
+        gateup_scalar,
+        gateup_scalar_batch,
+        down_scalar,
+        down_scalar_batch,
+        resid_n,
+        resid_n_batch,
+        geglu_n,
+        rope_q,
+        rope_k,
+        cos_buf,
+        sin_buf,
+        attn_scalar,
+        scatter_scalar,
+        denom_buf,
+        blocks_buf,
     )
 }
 
@@ -20717,10 +21052,14 @@ fn union_from_router_logits(logits: &[f32], k_tokens: usize) -> Vec<usize> {
     selected
 }
 
-pub static ATTENTION_BATCH_K_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-pub static ATTENTION_SCALAR_SLOT_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-pub static SPEC_VERIFY_ROUNDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-pub static SPEC_ACCEPTED_TOKENS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static ATTENTION_BATCH_K_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub static ATTENTION_SCALAR_SLOT_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub static SPEC_VERIFY_ROUNDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub static SPEC_ACCEPTED_TOKENS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(target_os = "macos")]
 #[allow(dead_code)] // Phase 1 API; gemma4_runtime integration lands separately.
@@ -20864,11 +21203,7 @@ impl Gemma4GhostCommonMetal {
         // RoPE look correct while every later token used the global table with the
         // sliding head_dim.
         for (layer, sliding) in layers.iter_mut().zip(is_sliding.iter()) {
-            layer.sliding_window = if *sliding {
-                Some(sliding_window)
-            } else {
-                None
-            };
+            layer.sliding_window = if *sliding { Some(sliding_window) } else { None };
         }
 
         if strict_26b
@@ -21101,12 +21436,21 @@ impl Gemma4GhostCommonMetal {
         };
         let mut new_cap = self.kv_capacity;
         while new_cap < needed {
-            new_cap = new_cap.saturating_mul(2).max(needed).min(self.max_positions);
+            new_cap = new_cap
+                .saturating_mul(2)
+                .max(needed)
+                .min(self.max_positions);
             if new_cap == self.kv_capacity {
                 return false;
             }
         }
-        let filled = self.next_position.iter().copied().max().unwrap_or(0).min(self.kv_capacity);
+        let filled = self
+            .next_position
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .min(self.kv_capacity);
         let mut new_k = Vec::with_capacity(self.layers.len());
         let mut new_v = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
@@ -21119,14 +21463,16 @@ impl Gemma4GhostCommonMetal {
                 None => return false,
             };
             let bytes = elements * 4;
-            new_k.push(kernel.device.new_buffer(
-                bytes.max(4) as u64,
-                MTLResourceOptions::StorageModeShared,
-            ));
-            new_v.push(kernel.device.new_buffer(
-                bytes.max(4) as u64,
-                MTLResourceOptions::StorageModeShared,
-            ));
+            new_k.push(
+                kernel
+                    .device
+                    .new_buffer(bytes.max(4) as u64, MTLResourceOptions::StorageModeShared),
+            );
+            new_v.push(
+                kernel
+                    .device
+                    .new_buffer(bytes.max(4) as u64, MTLResourceOptions::StorageModeShared),
+            );
         }
         if filled > 0 {
             let cb = kernel.queue.new_command_buffer();
@@ -21138,8 +21484,20 @@ impl Gemma4GhostCommonMetal {
                 for h in 0..layer.n_kv_heads {
                     let src = (h * old_cap) as u64 * row_bytes;
                     let dst = (h * new_cap) as u64 * row_bytes;
-                    blit.copy_from_buffer(&self.cache_k[layer_idx], src, &new_k[layer_idx], dst, run);
-                    blit.copy_from_buffer(&self.cache_v[layer_idx], src, &new_v[layer_idx], dst, run);
+                    blit.copy_from_buffer(
+                        &self.cache_k[layer_idx],
+                        src,
+                        &new_k[layer_idx],
+                        dst,
+                        run,
+                    );
+                    blit.copy_from_buffer(
+                        &self.cache_v[layer_idx],
+                        src,
+                        &new_v[layer_idx],
+                        dst,
+                        run,
+                    );
                 }
             }
             blit.end_encoding();
@@ -21513,8 +21871,7 @@ impl Gemma4GhostCommonMetal {
             // Fail before advancing KV state or committing partial attention.
             return None;
         }
-        if position >= self.max_positions
-            || self.next_position.get(layer_idx).copied()? != position
+        if position >= self.max_positions || self.next_position.get(layer_idx).copied()? != position
         {
             return None;
         }
@@ -22146,8 +22503,6 @@ impl Gemma4GhostCommonMetal {
         false
     }
 
-
-    
     pub(crate) fn execute_attention_and_shared_chunk_into(
         &mut self,
         _layer_idx: usize,
@@ -22171,11 +22526,7 @@ impl Gemma4GhostCommonMetal {
     }
 
     pub(crate) fn resident_residual_buffers(&self) -> (&Buffer, &Buffer, &Buffer) {
-        (
-            &self.slab_a,
-            &self.slab_b,
-            &self.resident_scratch.dn_batch,
-        )
+        (&self.slab_a, &self.slab_b, &self.resident_scratch.dn_batch)
     }
 
     pub(crate) fn resident_fused_tail_buffers(
@@ -22204,12 +22555,16 @@ impl Gemma4GhostCommonMetal {
         for i in 0..k_tokens.min(out_rows.len()) {
             out_rows[i].resize(hidden, 0.0);
             unsafe {
-                std::ptr::copy_nonoverlapping(ptr.add(i * hidden), out_rows[i].as_mut_ptr(), hidden);
+                std::ptr::copy_nonoverlapping(
+                    ptr.add(i * hidden),
+                    out_rows[i].as_mut_ptr(),
+                    hidden,
+                );
             }
         }
     }
 
-pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[&[u32; 128]]) {
+    pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[&[u32; 128]]) {
         if let Some(moe_layers) = self.moe_layers.as_mut() {
             for (moe_layer, mapping) in moe_layers.iter_mut().zip(slot_mappings_per_layer) {
                 unsafe {
@@ -22241,10 +22596,18 @@ pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[
             return false;
         };
         encoder.set_compute_pipeline_state(topk_pipeline);
-        encoder.set_buffer(0, Some(&self.resident_scratch.router_logits_batch), logits_byte_offset);
+        encoder.set_buffer(
+            0,
+            Some(&self.resident_scratch.router_logits_batch),
+            logits_byte_offset,
+        );
         encoder.set_buffer(1, Some(down_exps_scale), 0);
         encoder.set_buffer(2, Some(expert_to_slot_table), 0);
-        encoder.set_buffer(3, Some(&self.resident_scratch.gpu_candidate_routes[layer_idx]), 0);
+        encoder.set_buffer(
+            3,
+            Some(&self.resident_scratch.gpu_candidate_routes[layer_idx]),
+            0,
+        );
         encoder.set_buffer(4, Some(&self.resident_scratch.gpu_work_list), 0);
         let k_u32 = k_tokens as u32;
         let num_slots_u32 = num_slots as u32;
@@ -22289,10 +22652,7 @@ pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[
                 encoder.set_buffer(8, overflow_slab.map(|v| &**v), 0);
                 // One TG per (unique expert, 32-row FF block): weight tiles stream
                 // once and all K candidates accumulate inside the kernel.
-                dispatch_one_simdgroup_per_row(
-                    encoder,
-                    gateup_unique * (GEMMA4_Q4_EXPERT_FF / 32),
-                );
+                dispatch_one_simdgroup_per_row(encoder, gateup_unique * (GEMMA4_Q4_EXPERT_FF / 32));
                 encoder.memory_barrier_with_resources(&[
                     &self.resident_scratch.gpu_moe_scales,
                     &self.resident_scratch.gpu_moe_quants,
@@ -22383,7 +22743,11 @@ pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[
         encoder.set_buffer(0, Some(&self.resident_scratch.gpu_moe_scales), 0);
         encoder.set_buffer(1, Some(&self.resident_scratch.gpu_moe_quants), 0);
         encoder.set_buffer(2, Some(slab_buf), slab_byte_offset);
-        encoder.set_buffer(3, Some(&self.resident_scratch.gpu_candidate_routes[layer_idx]), 0);
+        encoder.set_buffer(
+            3,
+            Some(&self.resident_scratch.gpu_candidate_routes[layer_idx]),
+            0,
+        );
         encoder.set_buffer(4, Some(&self.resident_scratch.gpu_work_list), 0);
         encoder.set_buffer(5, Some(down_dest), 0);
         encoder.set_bytes(6, 4, &k_u32 as *const u32 as *const _);
@@ -22516,8 +22880,18 @@ pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[
         ledger.upload_ms = t_upload.elapsed().as_secs_f64() * 1000.0;
 
         // 2. Precompute RoPE cos/sin once for all tokens (both sliding/local and global tables)
-        let head_dim_sliding = self.layers.iter().find(|l| l.sliding_window.is_some()).map(|l| l.head_dim).unwrap_or(self.layers[0].head_dim);
-        let head_dim_global = self.layers.iter().find(|l| l.sliding_window.is_none()).map(|l| l.head_dim).unwrap_or(head_dim_sliding);
+        let head_dim_sliding = self
+            .layers
+            .iter()
+            .find(|l| l.sliding_window.is_some())
+            .map(|l| l.head_dim)
+            .unwrap_or(self.layers[0].head_dim);
+        let head_dim_global = self
+            .layers
+            .iter()
+            .find(|l| l.sliding_window.is_none())
+            .map(|l| l.head_dim)
+            .unwrap_or(head_dim_sliding);
         let half_rope_sliding = head_dim_sliding / 2;
         let half_rope_global = head_dim_global / 2;
 
@@ -22532,14 +22906,16 @@ pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[
                 let pos_f = pos as f32;
                 for d in 0..half_rope_sliding {
                     // Local sliding window RoPE
-                    let freq_local = rope_freq_base_local.powf(-(2.0 * d as f32) / head_dim_sliding as f32);
+                    let freq_local =
+                        rope_freq_base_local.powf(-(2.0 * d as f32) / head_dim_sliding as f32);
                     let (sin_l, cos_l) = (pos_f * freq_local).sin_cos();
                     cos_table.push(cos_l);
                     sin_table.push(sin_l);
                 }
                 for d in 0..half_rope_global {
                     // Global full context RoPE
-                    let mut freq_global = rope_freq_base_global.powf(-(2.0 * d as f32) / head_dim_global as f32);
+                    let mut freq_global =
+                        rope_freq_base_global.powf(-(2.0 * d as f32) / head_dim_global as f32);
                     if let Some(factors) = rope_factors {
                         if d < factors.len() {
                             freq_global /= factors[d];
@@ -22563,7 +22939,10 @@ pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[
             && fill_pong_wave.is_some()
             && wave1_slabs.len() >= n_layers
             && predicted_unions.len() >= n_layers
-            && predicted_unions.iter().take(n_layers).all(|u| !u.is_empty());
+            && predicted_unions
+                .iter()
+                .take(n_layers)
+                .all(|u| !u.is_empty());
         let mut predicted_w1: Vec<Vec<usize>> = vec![Vec::new(); n_layers];
         let mut predicted_ping_tables: Vec<[u32; 128]> = vec![[0xFFFFFFFFu32; 128]; n_layers];
         let mut predicted_pong_tables: Vec<[u32; 128]> = vec![[0xFFFFFFFFu32; 128]; n_layers];
@@ -22675,7 +23054,6 @@ pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[
 
         // Loop over all 30 layers in one single continuous command buffer
         for layer_idx in 0..self.layers.len() {
-
             let layer = &self.layers[layer_idx];
             let norms = &self.norms[layer_idx];
             let q_dim = layer.n_heads * layer.head_dim;
@@ -22758,9 +23136,17 @@ pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[
 
             // 3, 4, 5. Fused Attention Q/KV Norm, RoPE & Cache Scatter
             let (cur_cos, cur_sin, half_rope) = if layer.sliding_window.is_some() {
-                (&self.resident_scratch.cos_buf, &self.resident_scratch.sin_buf, half_rope_sliding)
+                (
+                    &self.resident_scratch.cos_buf,
+                    &self.resident_scratch.sin_buf,
+                    half_rope_sliding,
+                )
             } else {
-                (&self.resident_scratch.cos_global_buf, &self.resident_scratch.sin_global_buf, half_rope_global)
+                (
+                    &self.resident_scratch.cos_global_buf,
+                    &self.resident_scratch.sin_global_buf,
+                    half_rope_global,
+                )
             };
 
             // Fused Q/KV is compiled and selected, but pos>0 still diverges with
@@ -22769,7 +23155,9 @@ pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[
             // apply is proven at start_pos>0.
             if let (Some(q_pipe), Some(kv_pipe)) = (
                 kernel.gemma4_fused_q_norm_rope_batch_pipeline.as_ref(),
-                kernel.gemma4_fused_kv_norm_rope_scatter_batch_pipeline.as_ref(),
+                kernel
+                    .gemma4_fused_kv_norm_rope_scatter_batch_pipeline
+                    .as_ref(),
             ) {
                 let n_heads_u32 = layer.n_heads as u32;
                 let n_kv_heads_u32 = layer.n_kv_heads as u32;
@@ -22791,8 +23179,16 @@ pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[
                 encoder.set_bytes(7, 4, &half_rope_u32 as *const u32 as *const _);
                 encoder.set_bytes(8, 4, &eps as *const f32 as *const _);
                 encoder.dispatch_thread_groups(
-                    metal::MTLSize { width: (layer.n_heads * k_tokens) as u64, height: 1, depth: 1 },
-                    metal::MTLSize { width: 512, height: 1, depth: 1 },
+                    metal::MTLSize {
+                        width: (layer.n_heads * k_tokens) as u64,
+                        height: 1,
+                        depth: 1,
+                    },
+                    metal::MTLSize {
+                        width: 512,
+                        height: 1,
+                        depth: 1,
+                    },
                 );
 
                 // Fused KV Norm + RoPE + Cache Scatter
@@ -22818,8 +23214,16 @@ pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[
                 encoder.set_bytes(13, 4, &start_pos_u32 as *const u32 as *const _);
                 encoder.set_bytes(14, 4, &eps as *const f32 as *const _);
                 encoder.dispatch_thread_groups(
-                    metal::MTLSize { width: (layer.n_kv_heads * k_tokens) as u64, height: 1, depth: 1 },
-                    metal::MTLSize { width: 512, height: 1, depth: 1 },
+                    metal::MTLSize {
+                        width: (layer.n_kv_heads * k_tokens) as u64,
+                        height: 1,
+                        depth: 1,
+                    },
+                    metal::MTLSize {
+                        width: 512,
+                        height: 1,
+                        depth: 1,
+                    },
                 );
             } else {
                 encode_rms_norm_per_head(
@@ -22864,18 +23268,37 @@ pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[
                 let val_source = &self.resident_scratch.vn_batch;
 
                 for (data, scalar, heads) in [
-                    (&self.resident_scratch.qn_batch, &layer.rope_q, layer.n_heads),
-                    (&self.resident_scratch.kn_batch, &layer.rope_k, layer.n_kv_heads),
+                    (
+                        &self.resident_scratch.qn_batch,
+                        &layer.rope_q,
+                        layer.n_heads,
+                    ),
+                    (
+                        &self.resident_scratch.kn_batch,
+                        &layer.rope_k,
+                        layer.n_kv_heads,
+                    ),
                 ] {
                     encoder.set_compute_pipeline_state(&kernel.rope_rotate_batch_pipeline);
                     encoder.set_buffer(0, Some(data), 0);
                     encoder.set_buffer(1, Some(cur_cos), 0);
                     encoder.set_buffer(2, Some(cur_sin), 0);
-                    encoder.set_bytes(3, 4, unsafe { &*(scalar.contents() as *const u32) as *const u32 as *const _ });
-                    encoder.set_bytes(4, 4, unsafe { &*(scalar.contents().add(4) as *const u32) as *const u32 as *const _ });
-                    encoder.set_bytes(5, 4, unsafe { &*(scalar.contents().add(8) as *const u32) as *const u32 as *const _ });
-                    encoder.set_bytes(6, 4, unsafe { &*(scalar.contents().add(12) as *const u32) as *const u32 as *const _ });
-                    let width = kernel.rope_rotate_batch_pipeline.thread_execution_width().max(1);
+                    encoder.set_bytes(3, 4, unsafe {
+                        &*(scalar.contents() as *const u32) as *const u32 as *const _
+                    });
+                    encoder.set_bytes(4, 4, unsafe {
+                        &*(scalar.contents().add(4) as *const u32) as *const u32 as *const _
+                    });
+                    encoder.set_bytes(5, 4, unsafe {
+                        &*(scalar.contents().add(8) as *const u32) as *const u32 as *const _
+                    });
+                    encoder.set_bytes(6, 4, unsafe {
+                        &*(scalar.contents().add(12) as *const u32) as *const u32 as *const _
+                    });
+                    let width = kernel
+                        .rope_rotate_batch_pipeline
+                        .thread_execution_width()
+                        .max(1);
                     encoder.dispatch_thread_groups(
                         metal::MTLSize {
                             width: ((heads * half_rope) as u64).div_ceil(width),
@@ -22909,7 +23332,10 @@ pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[
                 encoder.set_buffer(8, Some(&self.resident_scratch.kv16_write), 0);
                 encoder.set_buffer(9, Some(&self.resident_scratch.kv16_write), 0);
                 encoder.set_buffer(10, Some(&self.resident_scratch.kv16_write), 0);
-                let width = kernel.kv_scatter_batch_pipeline.thread_execution_width().max(1);
+                let width = kernel
+                    .kv_scatter_batch_pipeline
+                    .thread_execution_width()
+                    .max(1);
                 encoder.dispatch_thread_groups(
                     metal::MTLSize {
                         width: (kv_dim as u64).div_ceil(width),
@@ -23037,7 +23463,10 @@ pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[
             begin_gpu_stage!(GPU_STAGE_RESID);
 
             // 8. Fused Post-Attention Norm + Residual Add + FFN Norm -> slab_b & normf_batch
-            if let Some(fused_pipe) = kernel.gemma4_fused_post_attn_residual_ffn_norm_pipeline.as_ref() {
+            if let Some(fused_pipe) = kernel
+                .gemma4_fused_post_attn_residual_ffn_norm_pipeline
+                .as_ref()
+            {
                 encoder.set_compute_pipeline_state(fused_pipe);
                 encoder.set_buffer(0, Some(&self.resident_scratch.o_batch), 0);
                 encoder.set_buffer(1, Some(&norms.post_attn), 0);
@@ -23050,8 +23479,16 @@ pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[
                 encoder.set_bytes(6, 4, &w_u32 as *const u32 as *const _);
                 encoder.set_bytes(7, 4, &eps as *const f32 as *const _);
                 encoder.dispatch_thread_groups(
-                    metal::MTLSize { width: k_tokens as u64, height: 1, depth: 1 },
-                    metal::MTLSize { width: 256, height: 1, depth: 1 },
+                    metal::MTLSize {
+                        width: k_tokens as u64,
+                        height: 1,
+                        depth: 1,
+                    },
+                    metal::MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
                 );
             } else {
                 encode_rms_norm_batch(
@@ -23131,9 +23568,15 @@ pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[
             );
 
             // 13. MoE Branch (GPU Top-K + Multi-Expert GEMM + Fused Tail)
-            let Some(moe_layer) = self.moe_layers.as_ref().and_then(|m| m.get(layer_idx)) else { return false; };
+            let Some(moe_layer) = self.moe_layers.as_ref().and_then(|m| m.get(layer_idx)) else {
+                return false;
+            };
             let slab_buf = expert_slabs.get(layer_idx).copied().unwrap();
-            let num_slots = num_slots_per_layer.get(layer_idx).copied().unwrap_or(128).min(128);
+            let num_slots = num_slots_per_layer
+                .get(layer_idx)
+                .copied()
+                .unwrap_or(128)
+                .min(128);
             let down_exps_scale = moe_layer.down_exps_scale.clone();
             let expert_to_slot_table = moe_layer.expert_to_slot_table.clone();
             // Causal: layer N+1 router logits depend on layer N output, so the
@@ -23148,50 +23591,401 @@ pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[
             begin_gpu_stage!(GPU_STAGE_ROUTER);
 
             encode_gemma4_router_batch_k(
-                    encoder,
-                    kernel,
-                    &self.slab_b,
-                    &moe_layer.gate_input_scale,
-                    &moe_layer.router,
-                    &self.resident_scratch.router_logits_batch,
-                    hidden,
-                    layer.eps,
-                    128,
-                    k_tokens,
-                    logits_off,
-                );
-                begin_gpu_stage!(GPU_STAGE_RESID);
-                encode_rms_norm_quantize_batch_k(
-                    encoder,
-                    kernel,
-                    &self.slab_b,
-                    &moe_layer.pre_norm_2,
-                    &self.resident_scratch.expert_input_scales_batch,
-                    &self.resident_scratch.expert_input_quants_batch,
-                    hidden,
-                    layer.eps,
-                    k_tokens,
-                );
+                encoder,
+                kernel,
+                &self.slab_b,
+                &moe_layer.gate_input_scale,
+                &moe_layer.router,
+                &self.resident_scratch.router_logits_batch,
+                hidden,
+                layer.eps,
+                128,
+                k_tokens,
+                logits_off,
+            );
+            begin_gpu_stage!(GPU_STAGE_RESID);
+            encode_rms_norm_quantize_batch_k(
+                encoder,
+                kernel,
+                &self.slab_b,
+                &moe_layer.pre_norm_2,
+                &self.resident_scratch.expert_input_scales_batch,
+                &self.resident_scratch.expert_input_quants_batch,
+                hidden,
+                layer.eps,
+                k_tokens,
+            );
 
-                if predicted_ready {
-                    begin_gpu_stage!(GPU_STAGE_GATEUP);
-                    if let Some(moe) = self.moe_layers.as_ref().and_then(|m| m.get(layer_idx)) {
-                        unsafe {
-                            let dest = moe.expert_to_slot_table.contents() as *mut u32;
-                            std::ptr::copy_nonoverlapping(
-                                predicted_ping_tables[layer_idx].as_ptr(),
-                                dest,
-                                128,
+            if predicted_ready {
+                begin_gpu_stage!(GPU_STAGE_GATEUP);
+                if let Some(moe) = self.moe_layers.as_ref().and_then(|m| m.get(layer_idx)) {
+                    unsafe {
+                        let dest = moe.expert_to_slot_table.contents() as *mut u32;
+                        std::ptr::copy_nonoverlapping(
+                            predicted_ping_tables[layer_idx].as_ptr(),
+                            dest,
+                            128,
+                        );
+                    }
+                }
+                let w1 = &predicted_w1[layer_idx];
+                let overflow_buf = if !w1.is_empty() {
+                    Some(wave1_slabs[layer_idx])
+                } else {
+                    None
+                };
+                let total_slots = num_slots + w1.len();
+                if !self.encode_moe_topk_gateup_down(
+                    kernel,
+                    encoder,
+                    &down_exps_scale,
+                    &expert_to_slot_table,
+                    slab_buf,
+                    layer_idx,
+                    total_slots,
+                    num_slots,
+                    k_tokens,
+                    &self.resident_scratch.gpu_moe_acc,
+                    0,
+                    logits_off,
+                    overflow_buf,
+                ) {
+                    encoder.end_encoding();
+                    self.last_chained_ledger = ledger;
+                    return false;
+                }
+                begin_gpu_stage!(GPU_STAGE_DOWN);
+                if !self.encode_moe_down(
+                    kernel,
+                    encoder,
+                    slab_buf,
+                    layer_idx,
+                    k_tokens,
+                    &self.resident_scratch.gpu_moe_acc,
+                    0,
+                    overflow_buf,
+                ) {
+                    encoder.end_encoding();
+                    self.last_chained_ledger = ledger;
+                    return false;
+                }
+            } else if let Some(filler) = slot_filler.as_mut() {
+                ledger.encode_ms += encode_clock.elapsed().as_secs_f64() * 1000.0;
+                encoder.end_encoding();
+                stamp.push_current(&cmd_buf);
+                cmd_buf.commit();
+
+                // Overlap predicted wave-0 copies with this layer's attn+router GPU.
+                // This layer's ping slab is idle. The shared pong slab may still be
+                // read by the previous layer's fused wave-1, so pong waits until
+                // this slot_wait completes.
+                let mut spec_ping = [0xFFFFFFFFu32; 128];
+                let mut spec_w0: Vec<usize> = Vec::new();
+                let mut spec_filled = false;
+                // At K=1 the previous token's routes overlap the next
+                // token's by only ~31% (measured); pre-filling them evicts
+                // live experts from the directory and costs a fill for
+                // experts that will not be used. Only speculate for K>1.
+                if let Some(predicted) = predicted_unions.get(layer_idx).filter(|_| k_tokens > 1) {
+                    if !predicted.is_empty() {
+                        let cap = num_slots.max(1);
+                        spec_w0 = predicted.iter().copied().take(cap).collect();
+                        let t_load = std::time::Instant::now();
+                        let mut spec_discard = Vec::new();
+                        filler(
+                            layer_idx,
+                            &[],
+                            Some(spec_w0.as_slice()),
+                            &mut spec_ping,
+                            &mut spec_discard,
+                        );
+                        ledger.wave_load_ms += t_load.elapsed().as_secs_f64() * 1000.0;
+                        spec_filled = true;
+                    }
+                }
+
+                let wait_t = std::time::Instant::now();
+                cmd_buf.wait_until_completed();
+                ledger.slot_wait_ms += wait_t.elapsed().as_secs_f64() * 1000.0;
+                let (gpu_us, _) = command_buffer_gpu_times_us(&cmd_buf.to_owned());
+                ledger.gpu_busy_ms += gpu_us as f64 / 1000.0;
+                if std::env::var("CAMELID_GEMMA4_GHOST_METAL_TIMING")
+                    .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                {
+                    eprintln!(
+                        "[metal chained] layer {layer_idx} slot_wait={:.2}ms",
+                        wait_t.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+
+                if (layer_idx == 0 || layer_idx == 5)
+                    && std::env::var("CAMELID_GEMMA4_DUMP_LAYERS").is_ok_and(|v| v == "1")
+                {
+                    if let Some(dir) = std::env::var_os("CAMELID_GEMMA4_DUMP_DIR") {
+                        let hd = layer.head_dim;
+                        let nkv = layer.n_kv_heads;
+                        let nh = layer.n_heads;
+                        let mp = self.kv_stride();
+                        let score_mp = self.max_positions;
+                        let group = (nh / nkv).max(1);
+                        let q = unsafe {
+                            std::slice::from_raw_parts(
+                                self.resident_scratch.qn_batch.contents() as *const f32,
+                                nh * hd,
+                            )
+                        };
+                        let kcache = unsafe {
+                            std::slice::from_raw_parts(
+                                self.cache_k[layer_idx].contents() as *const f32,
+                                nkv * mp * hd,
+                            )
+                        };
+                        let vcache = unsafe {
+                            std::slice::from_raw_parts(
+                                self.cache_v[layer_idx].contents() as *const f32,
+                                nkv * mp * hd,
+                            )
+                        };
+                        let ctx = unsafe {
+                            std::slice::from_raw_parts(
+                                self.resident_scratch.ctx_batch.contents() as *const f32,
+                                nh * hd,
+                            )
+                        };
+                        let scores = unsafe {
+                            std::slice::from_raw_parts(
+                                self.resident_scratch.scores_buf.contents() as *const f32,
+                                nh * score_mp,
+                            )
+                        };
+                        let l2 = |x: &[f32]| x.iter().map(|v| v * v).sum::<f32>().sqrt();
+                        let scale = 1.0f32;
+                        let mut lines = format!(
+                                "layer={layer_idx} start_pos={start_pos} hd={hd} nkv={nkv} nh={nh} mp={mp} group={group}\nQ_l2={:.6} ctx_l2={:.6}\n",
+                                l2(q),
+                                l2(ctx)
                             );
+                        for p in 0..=start_pos {
+                            let mut krow = Vec::with_capacity(nkv * hd);
+                            let mut vrow = Vec::with_capacity(nkv * hd);
+                            for h in 0..nkv {
+                                let off = (h * mp + p) * hd;
+                                krow.extend_from_slice(&kcache[off..off + hd]);
+                                vrow.extend_from_slice(&vcache[off..off + hd]);
+                            }
+                            lines.push_str(&format!(
+                                "K_pos{p}_l2={:.6} V_pos{p}_l2={:.6}\n",
+                                l2(&krow),
+                                l2(&vrow)
+                            ));
+                        }
+                        let mut max_score_err = 0.0f32;
+                        let mut max_ctx_err = 0.0f32;
+                        let mut host_ctx = vec![0.0f32; nh * hd];
+                        for head in 0..nh {
+                            let kvh = head / group;
+                            let qh = &q[head * hd..(head + 1) * hd];
+                            let sb = head * score_mp;
+                            let mut host_raw = Vec::with_capacity(start_pos + 1);
+                            for p in 0..=start_pos {
+                                let koff = (kvh * mp + p) * hd;
+                                let mut dot = 0.0f32;
+                                for d in 0..hd {
+                                    dot += qh[d] * kcache[koff + d];
+                                }
+                                host_raw.push(dot * scale);
+                            }
+                            let max_s = host_raw.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                            let mut den = 0.0f32;
+                            let host_prob: Vec<f32> = host_raw
+                                .iter()
+                                .map(|&s| {
+                                    let e = (s - max_s).exp();
+                                    den += e;
+                                    e
+                                })
+                                .collect();
+                            let gpu_max = (0..=start_pos)
+                                .map(|p| scores[sb + p])
+                                .fold(f32::NEG_INFINITY, f32::max);
+                            for p in 0..=start_pos {
+                                let hp = host_prob[p] / den;
+                                let gp = if gpu_max > 0.0 {
+                                    scores[sb + p] / gpu_max
+                                } else {
+                                    0.0
+                                };
+                                // gpu scores are exp(raw-max); compare ratios
+                                let hr = host_prob[p] / host_prob[0].max(1e-20);
+                                let gr = scores[sb + p] / scores[sb].max(1e-20);
+                                max_score_err = max_score_err.max((hr - gr).abs());
+                                if head < 2 {
+                                    lines.push_str(&format!(
+                                            "head{head} p{p}: host_raw={:.5} host_prob={:.5} gpu_exp={:.5} ratio_h={:.5} ratio_g={:.5}\n",
+                                            host_raw[p], hp, scores[sb + p], hr, gr
+                                        ));
+                                }
+                                let voff = (kvh * mp + p) * hd;
+                                for d in 0..hd {
+                                    host_ctx[head * hd + d] += hp * vcache[voff + d];
+                                }
+                            }
+                            let _ = gpu_max;
+                        }
+                        for i in 0..host_ctx.len() {
+                            max_ctx_err = max_ctx_err.max((host_ctx[i] - ctx[i]).abs());
+                        }
+                        let mut dot = 0.0f32;
+                        let mut aa = 0.0f32;
+                        let mut bb = 0.0f32;
+                        for i in 0..host_ctx.len() {
+                            dot += host_ctx[i] * ctx[i];
+                            aa += host_ctx[i] * host_ctx[i];
+                            bb += ctx[i] * ctx[i];
+                        }
+                        let cos = if aa > 0.0 && bb > 0.0 {
+                            dot / (aa.sqrt() * bb.sqrt())
+                        } else {
+                            0.0
+                        };
+                        lines.push_str(&format!(
+                                "max_score_ratio_err={max_score_err:.6} max_ctx_abs={max_ctx_err:.6} ctx_cosine={cos:.6} host_ctx_l2={:.6} gpu_ctx_l2={:.6}\n",
+                                aa.sqrt(),
+                                l2(ctx)
+                            ));
+                        let path = std::path::PathBuf::from(dir)
+                            .join(format!("kv_l{layer_idx}_s{start_pos}.txt"));
+                        let _ = std::fs::write(path, lines);
+                    }
+                }
+
+                let router_ptr = unsafe {
+                    (self.resident_scratch.router_logits_batch.contents() as *const f32)
+                        .add(logits_elem)
+                };
+                let router_slice =
+                    unsafe { std::slice::from_raw_parts(router_ptr, k_tokens * 128) };
+                let mut updated_slots = [0xFFFFFFFFu32; 128];
+                let mut union = Vec::new();
+                let t_fill = std::time::Instant::now();
+                filler(
+                    layer_idx,
+                    router_slice,
+                    None,
+                    &mut updated_slots,
+                    &mut union,
+                );
+                ledger.slot_filler_ms += t_fill.elapsed().as_secs_f64() * 1000.0;
+
+                let unique = union.len();
+                ledger.unique_experts_sum += unique as u32;
+                ledger.unique_experts_max = ledger.unique_experts_max.max(unique as u32);
+                if layer_idx < ledger.unique_per_layer.len() {
+                    ledger.unique_per_layer[layer_idx] = unique as u16;
+                }
+                if unique == 0 {
+                    eprintln!(
+                            "[metal chained round] layer {layer_idx} routed an empty expert union; failing closed"
+                        );
+                    self.last_chained_ledger = ledger;
+                    return false;
+                }
+                let cap0 = num_slots.max(1);
+                let cap1 = GEMMA4_OVERFLOW_BANK_SLOTS;
+                if unique > cap0 + cap1 {
+                    eprintln!(
+                            "[metal chained round] layer {layer_idx} unique {unique} exceeds resident {cap0} + overflow {cap1}; refusing drop"
+                        );
+                    ledger.selected_experts_dropped += (unique - cap0 - cap1) as u32;
+                    ledger.slot_capacity_overflow += 1;
+                    self.last_chained_ledger = ledger;
+                    return false;
+                }
+                let wave0: Vec<usize> = union.iter().copied().take(cap0).collect();
+                let wave1: Vec<usize> = union.iter().copied().skip(cap0).collect();
+                let n_waves = if wave1.is_empty() { 1usize } else { 2usize };
+                ledger.expert_waves_sum += n_waves as u32;
+                ledger.expert_waves_max = ledger.expert_waves_max.max(n_waves as u32);
+                if !wave1.is_empty() {
+                    ledger.overflow_layers += 1;
+                    ledger.overflow_experts += wave1.len() as u32;
+                }
+                let waves: Vec<Vec<usize>> = if wave1.is_empty() {
+                    vec![wave0]
+                } else {
+                    vec![wave0, wave1]
+                };
+
+                let can_fuse_waves =
+                    waves.len() == 2 && pong_slab.is_some() && fill_pong_wave.is_some();
+
+                if can_fuse_waves {
+                    let wave0 = &waves[0];
+                    let wave1 = &waves[1];
+                    let ping_hit = spec_filled && same_expert_set(&spec_w0, wave0);
+                    if ping_hit {
+                        updated_slots = spec_ping;
+                    } else {
+                        let t_load = std::time::Instant::now();
+                        filler(
+                            layer_idx,
+                            router_slice,
+                            Some(wave0.as_slice()),
+                            &mut updated_slots,
+                            &mut union,
+                        );
+                        ledger.wave_load_ms += t_load.elapsed().as_secs_f64() * 1000.0;
+                    }
+                    mask_slot_table_to_wave(&mut updated_slots, wave0);
+                    if let Some(expert) = wave_slots_ready(&updated_slots, wave0, num_slots) {
+                        eprintln!(
+                                "[metal chained round] layer {layer_idx} wave 0 missing slot for selected expert {expert}; refusing fail-close"
+                            );
+                        ledger.missing_expert_failclose += 1;
+                        self.last_chained_ledger = ledger;
+                        return false;
+                    }
+
+                    let mut pong_table = [0xFFFFFFFFu32; 128];
+                    if let Some(fill_pong) = fill_pong_wave.as_mut() {
+                        let t_load = std::time::Instant::now();
+                        fill_pong(layer_idx, wave1.as_slice(), &mut pong_table);
+                        ledger.wave_load_ms += t_load.elapsed().as_secs_f64() * 1000.0;
+                    }
+                    mask_slot_table_to_wave(&mut pong_table, wave1);
+                    let pong_slots = wave1.len().max(1);
+                    if let Some(expert) = wave_slots_ready(&pong_table, wave1, pong_slots) {
+                        eprintln!(
+                                "[metal chained round] layer {layer_idx} wave 1 missing slot for selected expert {expert}; refusing fail-close"
+                            );
+                        ledger.missing_expert_failclose += 1;
+                        self.last_chained_ledger = ledger;
+                        return false;
+                    }
+
+                    let mut unified_table = [0xFFFFFFFFu32; 128];
+                    for (e, &slot) in updated_slots.iter().enumerate() {
+                        if slot != 0xFFFFFFFFu32 {
+                            unified_table[e] = slot;
                         }
                     }
-                    let w1 = &predicted_w1[layer_idx];
-                    let overflow_buf = if !w1.is_empty() {
-                        Some(wave1_slabs[layer_idx])
-                    } else {
-                        None
-                    };
-                    let total_slots = num_slots + w1.len();
+                    for (e, &slot) in pong_table.iter().enumerate() {
+                        if slot != 0xFFFFFFFFu32 {
+                            unified_table[e] = (num_slots as u32) + slot;
+                        }
+                    }
+
+                    unsafe {
+                        let ping_dest = moe_layer.expert_to_slot_table.contents() as *mut u32;
+                        std::ptr::copy_nonoverlapping(unified_table.as_ptr(), ping_dest, 128);
+                    }
+
+                    encode_clock = std::time::Instant::now();
+                    cmd_buf = kernel.queue.new_command_buffer();
+                    encoder = cmd_buf.new_compute_command_encoder();
+                    stamp.start(GPU_STAGE_GATEUP);
+                    let pong_slab_buf = pong_slab.unwrap();
+                    let total_slots = num_slots + wave1.len();
                     if !self.encode_moe_topk_gateup_down(
                         kernel,
                         encoder,
@@ -23205,7 +23999,7 @@ pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[
                         &self.resident_scratch.gpu_moe_acc,
                         0,
                         logits_off,
-                        overflow_buf,
+                        Some(pong_slab_buf),
                     ) {
                         encoder.end_encoding();
                         self.last_chained_ledger = ledger;
@@ -23220,323 +24014,52 @@ pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[
                         k_tokens,
                         &self.resident_scratch.gpu_moe_acc,
                         0,
-                        overflow_buf,
+                        Some(pong_slab_buf),
                     ) {
                         encoder.end_encoding();
                         self.last_chained_ledger = ledger;
                         return false;
                     }
-                } else if let Some(filler) = slot_filler.as_mut() {
-                    ledger.encode_ms += encode_clock.elapsed().as_secs_f64() * 1000.0;
-                    encoder.end_encoding();
-                    stamp.push_current(&cmd_buf);
-                    cmd_buf.commit();
-
-                    // Overlap predicted wave-0 copies with this layer's attn+router GPU.
-                    // This layer's ping slab is idle. The shared pong slab may still be
-                    // read by the previous layer's fused wave-1, so pong waits until
-                    // this slot_wait completes.
-                    let mut spec_ping = [0xFFFFFFFFu32; 128];
-                    let mut spec_w0: Vec<usize> = Vec::new();
-                    let mut spec_filled = false;
-                    // At K=1 the previous token's routes overlap the next
-                    // token's by only ~31% (measured); pre-filling them evicts
-                    // live experts from the directory and costs a fill for
-                    // experts that will not be used. Only speculate for K>1.
-                    if let Some(predicted) = predicted_unions.get(layer_idx).filter(|_| k_tokens > 1) {
-                        if !predicted.is_empty() {
-                            let cap = num_slots.max(1);
-                            spec_w0 = predicted.iter().copied().take(cap).collect();
-                            let t_load = std::time::Instant::now();
-                            let mut spec_discard = Vec::new();
-                            filler(
-                                layer_idx,
-                                &[],
-                                Some(spec_w0.as_slice()),
-                                &mut spec_ping,
-                                &mut spec_discard,
-                            );
-                            ledger.wave_load_ms += t_load.elapsed().as_secs_f64() * 1000.0;
-                            spec_filled = true;
-                        }
-                    }
-
-                    let wait_t = std::time::Instant::now();
-                    cmd_buf.wait_until_completed();
-                    ledger.slot_wait_ms += wait_t.elapsed().as_secs_f64() * 1000.0;
-                    let (gpu_us, _) = command_buffer_gpu_times_us(&cmd_buf.to_owned());
-                    ledger.gpu_busy_ms += gpu_us as f64 / 1000.0;
-                    if std::env::var("CAMELID_GEMMA4_GHOST_METAL_TIMING")
-                        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                    {
-                        eprintln!(
-                            "[metal chained] layer {layer_idx} slot_wait={:.2}ms",
-                            wait_t.elapsed().as_secs_f64() * 1000.0
-                        );
-                    }
-
-                    if (layer_idx == 0 || layer_idx == 5)
-                        && std::env::var("CAMELID_GEMMA4_DUMP_LAYERS").is_ok_and(|v| v == "1")
-                    {
-                        if let Some(dir) = std::env::var_os("CAMELID_GEMMA4_DUMP_DIR") {
-                            let hd = layer.head_dim;
-                            let nkv = layer.n_kv_heads;
-                            let nh = layer.n_heads;
-                            let mp = self.kv_stride();
-                            let score_mp = self.max_positions;
-                            let group = (nh / nkv).max(1);
-                            let q = unsafe {
-                                std::slice::from_raw_parts(
-                                    self.resident_scratch.qn_batch.contents() as *const f32,
-                                    nh * hd,
-                                )
-                            };
-                            let kcache = unsafe {
-                                std::slice::from_raw_parts(
-                                    self.cache_k[layer_idx].contents() as *const f32,
-                                    nkv * mp * hd,
-                                )
-                            };
-                            let vcache = unsafe {
-                                std::slice::from_raw_parts(
-                                    self.cache_v[layer_idx].contents() as *const f32,
-                                    nkv * mp * hd,
-                                )
-                            };
-                            let ctx = unsafe {
-                                std::slice::from_raw_parts(
-                                    self.resident_scratch.ctx_batch.contents() as *const f32,
-                                    nh * hd,
-                                )
-                            };
-                            let scores = unsafe {
-                                std::slice::from_raw_parts(
-                                    self.resident_scratch.scores_buf.contents() as *const f32,
-                                    nh * score_mp,
-                                )
-                            };
-                            let l2 = |x: &[f32]| x.iter().map(|v| v * v).sum::<f32>().sqrt();
-                            let scale = 1.0f32;
-                            let mut lines = format!(
-                                "layer={layer_idx} start_pos={start_pos} hd={hd} nkv={nkv} nh={nh} mp={mp} group={group}\nQ_l2={:.6} ctx_l2={:.6}\n",
-                                l2(q),
-                                l2(ctx)
-                            );
-                            for p in 0..=start_pos {
-                                let mut krow = Vec::with_capacity(nkv * hd);
-                                let mut vrow = Vec::with_capacity(nkv * hd);
-                                for h in 0..nkv {
-                                    let off = (h * mp + p) * hd;
-                                    krow.extend_from_slice(&kcache[off..off + hd]);
-                                    vrow.extend_from_slice(&vcache[off..off + hd]);
-                                }
-                                lines.push_str(&format!(
-                                    "K_pos{p}_l2={:.6} V_pos{p}_l2={:.6}\n",
-                                    l2(&krow),
-                                    l2(&vrow)
-                                ));
-                            }
-                            let mut max_score_err = 0.0f32;
-                            let mut max_ctx_err = 0.0f32;
-                            let mut host_ctx = vec![0.0f32; nh * hd];
-                            for head in 0..nh {
-                                let kvh = head / group;
-                                let qh = &q[head * hd..(head + 1) * hd];
-                                let sb = head * score_mp;
-                                let mut host_raw = Vec::with_capacity(start_pos + 1);
-                                for p in 0..=start_pos {
-                                    let koff = (kvh * mp + p) * hd;
-                                    let mut dot = 0.0f32;
-                                    for d in 0..hd {
-                                        dot += qh[d] * kcache[koff + d];
-                                    }
-                                    host_raw.push(dot * scale);
-                                }
-                                let max_s = host_raw.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                                let mut den = 0.0f32;
-                                let host_prob: Vec<f32> = host_raw
-                                    .iter()
-                                    .map(|&s| {
-                                        let e = (s - max_s).exp();
-                                        den += e;
-                                        e
-                                    })
-                                    .collect();
-                                let gpu_max = (0..=start_pos)
-                                    .map(|p| scores[sb + p])
-                                    .fold(f32::NEG_INFINITY, f32::max);
-                                for p in 0..=start_pos {
-                                    let hp = host_prob[p] / den;
-                                    let gp = if gpu_max > 0.0 {
-                                        scores[sb + p] / gpu_max
-                                    } else {
-                                        0.0
-                                    };
-                                    // gpu scores are exp(raw-max); compare ratios
-                                    let hr = host_prob[p] / host_prob[0].max(1e-20);
-                                    let gr = scores[sb + p] / scores[sb].max(1e-20);
-                                    max_score_err = max_score_err.max((hr - gr).abs());
-                                    if head < 2 {
-                                        lines.push_str(&format!(
-                                            "head{head} p{p}: host_raw={:.5} host_prob={:.5} gpu_exp={:.5} ratio_h={:.5} ratio_g={:.5}\n",
-                                            host_raw[p], hp, scores[sb + p], hr, gr
-                                        ));
-                                    }
-                                    let voff = (kvh * mp + p) * hd;
-                                    for d in 0..hd {
-                                        host_ctx[head * hd + d] += hp * vcache[voff + d];
-                                    }
-                                }
-                                let _ = gpu_max;
-                            }
-                            for i in 0..host_ctx.len() {
-                                max_ctx_err = max_ctx_err.max((host_ctx[i] - ctx[i]).abs());
-                            }
-                            let mut dot = 0.0f32;
-                            let mut aa = 0.0f32;
-                            let mut bb = 0.0f32;
-                            for i in 0..host_ctx.len() {
-                                dot += host_ctx[i] * ctx[i];
-                                aa += host_ctx[i] * host_ctx[i];
-                                bb += ctx[i] * ctx[i];
-                            }
-                            let cos = if aa > 0.0 && bb > 0.0 {
-                                dot / (aa.sqrt() * bb.sqrt())
-                            } else {
-                                0.0
-                            };
-                            lines.push_str(&format!(
-                                "max_score_ratio_err={max_score_err:.6} max_ctx_abs={max_ctx_err:.6} ctx_cosine={cos:.6} host_ctx_l2={:.6} gpu_ctx_l2={:.6}\n",
-                                aa.sqrt(),
-                                l2(ctx)
-                            ));
-                            let path = std::path::PathBuf::from(dir)
-                                .join(format!("kv_l{layer_idx}_s{start_pos}.txt"));
-                            let _ = std::fs::write(path, lines);
-                        }
-                    }
-
-                    let router_ptr = unsafe {
-                        (self.resident_scratch.router_logits_batch.contents() as *const f32)
-                            .add(logits_elem)
-                    };
-                    let router_slice = unsafe { std::slice::from_raw_parts(router_ptr, k_tokens * 128) };
-                    let mut updated_slots = [0xFFFFFFFFu32; 128];
-                    let mut union = Vec::new();
-                    let t_fill = std::time::Instant::now();
-                    filler(layer_idx, router_slice, None, &mut updated_slots, &mut union);
-                    ledger.slot_filler_ms += t_fill.elapsed().as_secs_f64() * 1000.0;
-
-                    let unique = union.len();
-                    ledger.unique_experts_sum += unique as u32;
-                    ledger.unique_experts_max = ledger.unique_experts_max.max(unique as u32);
-                    if layer_idx < ledger.unique_per_layer.len() {
-                        ledger.unique_per_layer[layer_idx] = unique as u16;
-                    }
-                    if unique == 0 {
-                        eprintln!(
-                            "[metal chained round] layer {layer_idx} routed an empty expert union; failing closed"
-                        );
-                        self.last_chained_ledger = ledger;
-                        return false;
-                    }
-                    let cap0 = num_slots.max(1);
-                    let cap1 = GEMMA4_OVERFLOW_BANK_SLOTS;
-                    if unique > cap0 + cap1 {
-                        eprintln!(
-                            "[metal chained round] layer {layer_idx} unique {unique} exceeds resident {cap0} + overflow {cap1}; refusing drop"
-                        );
-                        ledger.selected_experts_dropped += (unique - cap0 - cap1) as u32;
-                        ledger.slot_capacity_overflow += 1;
-                        self.last_chained_ledger = ledger;
-                        return false;
-                    }
-                    let wave0: Vec<usize> = union.iter().copied().take(cap0).collect();
-                    let wave1: Vec<usize> = union.iter().copied().skip(cap0).collect();
-                    let n_waves = if wave1.is_empty() { 1usize } else { 2usize };
-                    ledger.expert_waves_sum += n_waves as u32;
-                    ledger.expert_waves_max = ledger.expert_waves_max.max(n_waves as u32);
-                    if !wave1.is_empty() {
-                        ledger.overflow_layers += 1;
-                        ledger.overflow_experts += wave1.len() as u32;
-                    }
-                    let waves: Vec<Vec<usize>> = if wave1.is_empty() {
-                        vec![wave0]
-                    } else {
-                        vec![wave0, wave1]
-                    };
-
-                    let can_fuse_waves = waves.len() == 2
-                        && pong_slab.is_some()
-                        && fill_pong_wave.is_some();
-
-                    if can_fuse_waves {
-                        let wave0 = &waves[0];
-                        let wave1 = &waves[1];
-                        let ping_hit = spec_filled && same_expert_set(&spec_w0, wave0);
-                        if ping_hit {
-                            updated_slots = spec_ping;
-                        } else {
+                } else {
+                    for (wi, wave) in waves.iter().enumerate() {
+                        if unique > num_slots || wi > 0 {
                             let t_load = std::time::Instant::now();
                             filler(
                                 layer_idx,
                                 router_slice,
-                                Some(wave0.as_slice()),
+                                Some(wave.as_slice()),
                                 &mut updated_slots,
                                 &mut union,
                             );
                             ledger.wave_load_ms += t_load.elapsed().as_secs_f64() * 1000.0;
+                        } else if spec_filled && same_expert_set(&spec_w0, wave) {
+                            updated_slots = spec_ping;
                         }
-                        mask_slot_table_to_wave(&mut updated_slots, wave0);
-                        if let Some(expert) = wave_slots_ready(&updated_slots, wave0, num_slots) {
+                        mask_slot_table_to_wave(&mut updated_slots, wave);
+                        if let Some(expert) = wave_slots_ready(&updated_slots, wave, num_slots) {
                             eprintln!(
-                                "[metal chained round] layer {layer_idx} wave 0 missing slot for selected expert {expert}; refusing fail-close"
-                            );
+                                    "[metal chained round] layer {layer_idx} wave {wi} missing slot for selected expert {expert}; refusing fail-close"
+                                );
                             ledger.missing_expert_failclose += 1;
                             self.last_chained_ledger = ledger;
                             return false;
-                        }
-
-                        let mut pong_table = [0xFFFFFFFFu32; 128];
-                        if let Some(fill_pong) = fill_pong_wave.as_mut() {
-                            let t_load = std::time::Instant::now();
-                            fill_pong(layer_idx, wave1.as_slice(), &mut pong_table);
-                            ledger.wave_load_ms += t_load.elapsed().as_secs_f64() * 1000.0;
-                        }
-                        mask_slot_table_to_wave(&mut pong_table, wave1);
-                        let pong_slots = wave1.len().max(1);
-                        if let Some(expert) = wave_slots_ready(&pong_table, wave1, pong_slots) {
-                            eprintln!(
-                                "[metal chained round] layer {layer_idx} wave 1 missing slot for selected expert {expert}; refusing fail-close"
-                            );
-                            ledger.missing_expert_failclose += 1;
-                            self.last_chained_ledger = ledger;
-                            return false;
-                        }
-
-                        let mut unified_table = [0xFFFFFFFFu32; 128];
-                        for (e, &slot) in updated_slots.iter().enumerate() {
-                            if slot != 0xFFFFFFFFu32 {
-                                unified_table[e] = slot;
-                            }
-                        }
-                        for (e, &slot) in pong_table.iter().enumerate() {
-                            if slot != 0xFFFFFFFFu32 {
-                                unified_table[e] = (num_slots as u32) + slot;
-                            }
                         }
 
                         unsafe {
-                            let ping_dest = moe_layer.expert_to_slot_table.contents() as *mut u32;
-                            std::ptr::copy_nonoverlapping(unified_table.as_ptr(), ping_dest, 128);
+                            let dest = moe_layer.expert_to_slot_table.contents() as *mut u32;
+                            std::ptr::copy_nonoverlapping(updated_slots.as_ptr(), dest, 128);
                         }
 
                         encode_clock = std::time::Instant::now();
                         cmd_buf = kernel.queue.new_command_buffer();
                         encoder = cmd_buf.new_compute_command_encoder();
                         stamp.start(GPU_STAGE_GATEUP);
-                        let pong_slab_buf = pong_slab.unwrap();
-                        let total_slots = num_slots + wave1.len();
+
+                        let down_dest = if wi == 0 {
+                            &self.resident_scratch.gpu_moe_acc
+                        } else {
+                            &self.resident_scratch.gpu_moe_acc_wave
+                        };
                         if !self.encode_moe_topk_gateup_down(
                             kernel,
                             encoder,
@@ -23544,13 +24067,13 @@ pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[
                             &expert_to_slot_table,
                             slab_buf,
                             layer_idx,
-                            total_slots,
+                            num_slots,
                             num_slots,
                             k_tokens,
-                            &self.resident_scratch.gpu_moe_acc,
+                            down_dest,
                             0,
                             logits_off,
-                            Some(pong_slab_buf),
+                            None,
                         ) {
                             encoder.end_encoding();
                             self.last_chained_ledger = ledger;
@@ -23558,217 +24081,144 @@ pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[
                         }
                         begin_gpu_stage!(GPU_STAGE_DOWN);
                         if !self.encode_moe_down(
-                            kernel,
-                            encoder,
-                            slab_buf,
-                            layer_idx,
-                            k_tokens,
-                            &self.resident_scratch.gpu_moe_acc,
-                            0,
-                            Some(pong_slab_buf),
+                            kernel, encoder, slab_buf, layer_idx, k_tokens, down_dest, 0, None,
                         ) {
                             encoder.end_encoding();
                             self.last_chained_ledger = ledger;
                             return false;
                         }
-                    } else {
-                        for (wi, wave) in waves.iter().enumerate() {
-                            if unique > num_slots || wi > 0 {
-                                let t_load = std::time::Instant::now();
-                                filler(
-                                    layer_idx,
-                                    router_slice,
-                                    Some(wave.as_slice()),
-                                    &mut updated_slots,
-                                    &mut union,
-                                );
-                                ledger.wave_load_ms += t_load.elapsed().as_secs_f64() * 1000.0;
-                            } else if spec_filled && same_expert_set(&spec_w0, wave) {
-                                updated_slots = spec_ping;
-                            }
-                            mask_slot_table_to_wave(&mut updated_slots, wave);
-                            if let Some(expert) = wave_slots_ready(&updated_slots, wave, num_slots) {
+                        if wi > 0 {
+                            let n_el = (k_tokens * GEMMA4_Q4_EXPERT_HIDDEN) as u32;
+                            encoder.set_compute_pipeline_state(&kernel.residual_add_pipeline);
+                            encoder.set_buffer(0, Some(&self.resident_scratch.gpu_moe_acc), 0);
+                            encoder.set_buffer(1, Some(&self.resident_scratch.gpu_moe_acc_wave), 0);
+                            encoder.set_buffer(2, Some(&self.resident_scratch.gpu_moe_acc), 0);
+                            encoder.set_bytes(3, 4, &n_el as *const u32 as *const _);
+                            dispatch_1d(
+                                encoder,
+                                &kernel.residual_add_pipeline,
+                                k_tokens * GEMMA4_Q4_EXPERT_HIDDEN,
+                            );
+                            encoder.memory_barrier_with_resources(&[&self
+                                .resident_scratch
+                                .gpu_moe_acc]);
+                        }
+                        if wi + 1 < waves.len() {
+                            ledger.encode_ms += encode_clock.elapsed().as_secs_f64() * 1000.0;
+                            encoder.end_encoding();
+                            stamp.push_current(&cmd_buf);
+                            cmd_buf.commit();
+                            // Same ping slab: GPU must finish wave N before CPU overwrites it.
+                            let t_wave_gpu = std::time::Instant::now();
+                            cmd_buf.wait_until_completed();
+                            ledger.wave_gpu_ms += t_wave_gpu.elapsed().as_secs_f64() * 1000.0;
+                            let (gpu_us, _) = command_buffer_gpu_times_us(&cmd_buf.to_owned());
+                            ledger.gpu_busy_ms += gpu_us as f64 / 1000.0;
+                            if cmd_buf.status() != metal::MTLCommandBufferStatus::Completed {
                                 eprintln!(
-                                    "[metal chained round] layer {layer_idx} wave {wi} missing slot for selected expert {expert}; refusing fail-close"
-                                );
-                                ledger.missing_expert_failclose += 1;
-                                self.last_chained_ledger = ledger;
-                                return false;
-                            }
-
-                            unsafe {
-                                let dest = moe_layer.expert_to_slot_table.contents() as *mut u32;
-                                std::ptr::copy_nonoverlapping(updated_slots.as_ptr(), dest, 128);
-                            }
-
-                            encode_clock = std::time::Instant::now();
-                            cmd_buf = kernel.queue.new_command_buffer();
-                            encoder = cmd_buf.new_compute_command_encoder();
-                            stamp.start(GPU_STAGE_GATEUP);
-
-                            let down_dest = if wi == 0 {
-                                &self.resident_scratch.gpu_moe_acc
-                            } else {
-                                &self.resident_scratch.gpu_moe_acc_wave
-                            };
-                            if !self.encode_moe_topk_gateup_down(
-                                kernel,
-                                encoder,
-                                &down_exps_scale,
-                                &expert_to_slot_table,
-                                slab_buf,
-                                layer_idx,
-                                num_slots,
-                                num_slots,
-                                k_tokens,
-                                down_dest,
-                                0,
-                                logits_off,
-                                None,
-                            ) {
-                                encoder.end_encoding();
-                                self.last_chained_ledger = ledger;
-                                return false;
-                            }
-                            begin_gpu_stage!(GPU_STAGE_DOWN);
-                            if !self.encode_moe_down(
-                                kernel,
-                                encoder,
-                                slab_buf,
-                                layer_idx,
-                                k_tokens,
-                                down_dest,
-                                0,
-                                None,
-                            ) {
-                                encoder.end_encoding();
-                                self.last_chained_ledger = ledger;
-                                return false;
-                            }
-                            if wi > 0 {
-                                let n_el = (k_tokens * GEMMA4_Q4_EXPERT_HIDDEN) as u32;
-                                encoder.set_compute_pipeline_state(&kernel.residual_add_pipeline);
-                                encoder.set_buffer(0, Some(&self.resident_scratch.gpu_moe_acc), 0);
-                                encoder.set_buffer(1, Some(&self.resident_scratch.gpu_moe_acc_wave), 0);
-                                encoder.set_buffer(2, Some(&self.resident_scratch.gpu_moe_acc), 0);
-                                encoder.set_bytes(3, 4, &n_el as *const u32 as *const _);
-                                dispatch_1d(
-                                    encoder,
-                                    &kernel.residual_add_pipeline,
-                                    k_tokens * GEMMA4_Q4_EXPERT_HIDDEN,
-                                );
-                                encoder.memory_barrier_with_resources(&[
-                                    &self.resident_scratch.gpu_moe_acc,
-                                ]);
-                            }
-                            if wi + 1 < waves.len() {
-                                ledger.encode_ms += encode_clock.elapsed().as_secs_f64() * 1000.0;
-                                encoder.end_encoding();
-                                stamp.push_current(&cmd_buf);
-                                cmd_buf.commit();
-                                // Same ping slab: GPU must finish wave N before CPU overwrites it.
-                                let t_wave_gpu = std::time::Instant::now();
-                                cmd_buf.wait_until_completed();
-                                ledger.wave_gpu_ms += t_wave_gpu.elapsed().as_secs_f64() * 1000.0;
-                                let (gpu_us, _) = command_buffer_gpu_times_us(&cmd_buf.to_owned());
-                                ledger.gpu_busy_ms += gpu_us as f64 / 1000.0;
-                                if cmd_buf.status() != metal::MTLCommandBufferStatus::Completed {
-                                    eprintln!(
                                         "[metal chained round] wave command buffer failed at layer {layer_idx} wave {wi}"
                                     );
-                                    self.last_chained_ledger = ledger;
-                                    return false;
-                                }
+                                self.last_chained_ledger = ledger;
+                                return false;
                             }
                         }
                     }
-                } else {
-                    if !self.encode_moe_topk_gateup_down(
-                        kernel,
-                        encoder,
-                        &down_exps_scale,
-                        &expert_to_slot_table,
-                        slab_buf,
-                        layer_idx,
-                        num_slots,
-                        num_slots,
-                        k_tokens,
-                        &self.resident_scratch.gpu_moe_acc,
-                        0,
-                        logits_off,
-                        None,
-                    ) {
-                        encoder.end_encoding();
-                        self.last_chained_ledger = ledger;
-                        return false;
-                    }
-                    begin_gpu_stage!(GPU_STAGE_DOWN);
-                    if !self.encode_moe_down(
-                        kernel,
-                        encoder,
-                        slab_buf,
-                        layer_idx,
-                        k_tokens,
-                        &self.resident_scratch.gpu_moe_acc,
-                        0,
-                        None,
-                    ) {
-                        encoder.end_encoding();
-                        self.last_chained_ledger = ledger;
-                        return false;
-                    }
                 }
+            } else {
+                if !self.encode_moe_topk_gateup_down(
+                    kernel,
+                    encoder,
+                    &down_exps_scale,
+                    &expert_to_slot_table,
+                    slab_buf,
+                    layer_idx,
+                    num_slots,
+                    num_slots,
+                    k_tokens,
+                    &self.resident_scratch.gpu_moe_acc,
+                    0,
+                    logits_off,
+                    None,
+                ) {
+                    encoder.end_encoding();
+                    self.last_chained_ledger = ledger;
+                    return false;
+                }
+                begin_gpu_stage!(GPU_STAGE_DOWN);
+                if !self.encode_moe_down(
+                    kernel,
+                    encoder,
+                    slab_buf,
+                    layer_idx,
+                    k_tokens,
+                    &self.resident_scratch.gpu_moe_acc,
+                    0,
+                    None,
+                ) {
+                    encoder.end_encoding();
+                    self.last_chained_ledger = ledger;
+                    return false;
+                }
+            }
 
-                begin_gpu_stage!(GPU_STAGE_RESID);
+            begin_gpu_stage!(GPU_STAGE_RESID);
 
-                // Pass 4: Fused Tail directly into slab_a
-                if let Some(fused_pipeline) = kernel.gemma4_fused_layer_residual_pipeline.as_ref() {
-                    encoder.set_compute_pipeline_state(fused_pipeline);
-                    encoder.set_buffer(0, Some(&self.slab_b), 0);
-                    encoder.set_buffer(1, Some(&self.resident_scratch.dn_batch), 0);
-                    encoder.set_buffer(2, Some(&self.resident_scratch.gpu_moe_acc), 0);
-                    encoder.set_buffer(3, Some(&moe_layer.post_norm_2), 0);
-                    encoder.set_buffer(4, Some(&moe_layer.post_ffw_norm), 0);
-                    encoder.set_buffer(5, Some(&self.slab_a), 0);
-                    let hidden_u32 = GEMMA4_Q4_EXPERT_HIDDEN as u32;
-                    let eps = 1.0e-6f32;
-                    let scale_f32 = moe_layer.layer_output_scale;
-                    encoder.set_bytes(6, 4, &hidden_u32 as *const u32 as *const _);
-                    encoder.set_bytes(7, 4, &eps as *const f32 as *const _);
-                    encoder.set_bytes(8, 4, &scale_f32 as *const f32 as *const _);
-                    encoder.dispatch_thread_groups(
-                        metal::MTLSize { width: k_tokens as u64, height: 1, depth: 1 },
-                        metal::MTLSize { width: 256, height: 1, depth: 1 },
+            // Pass 4: Fused Tail directly into slab_a
+            if let Some(fused_pipeline) = kernel.gemma4_fused_layer_residual_pipeline.as_ref() {
+                encoder.set_compute_pipeline_state(fused_pipeline);
+                encoder.set_buffer(0, Some(&self.slab_b), 0);
+                encoder.set_buffer(1, Some(&self.resident_scratch.dn_batch), 0);
+                encoder.set_buffer(2, Some(&self.resident_scratch.gpu_moe_acc), 0);
+                encoder.set_buffer(3, Some(&moe_layer.post_norm_2), 0);
+                encoder.set_buffer(4, Some(&moe_layer.post_ffw_norm), 0);
+                encoder.set_buffer(5, Some(&self.slab_a), 0);
+                let hidden_u32 = GEMMA4_Q4_EXPERT_HIDDEN as u32;
+                let eps = 1.0e-6f32;
+                let scale_f32 = moe_layer.layer_output_scale;
+                encoder.set_bytes(6, 4, &hidden_u32 as *const u32 as *const _);
+                encoder.set_bytes(7, 4, &eps as *const f32 as *const _);
+                encoder.set_bytes(8, 4, &scale_f32 as *const f32 as *const _);
+                encoder.dispatch_thread_groups(
+                    metal::MTLSize {
+                        width: k_tokens as u64,
+                        height: 1,
+                        depth: 1,
+                    },
+                    metal::MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            } else {
+                unsafe {
+                    *(layer.resid_n_batch.contents() as *mut u32) = (k_tokens * hidden) as u32;
+                }
+                encoder.set_compute_pipeline_state(&kernel.residual_add_pipeline);
+                encoder.set_buffer(0, Some(&self.slab_b), 0);
+                encoder.set_buffer(1, Some(&self.resident_scratch.dn_batch), 0);
+                encoder.set_buffer(2, Some(&self.slab_a), 0);
+                encoder.set_buffer(3, Some(&layer.resid_n_batch), 0);
+                dispatch_1d(encoder, &kernel.residual_add_pipeline, k_tokens * hidden);
+
+                encoder.set_compute_pipeline_state(&kernel.residual_add_pipeline);
+                encoder.set_buffer(0, Some(&self.slab_a), 0);
+                encoder.set_buffer(1, Some(&self.resident_scratch.gpu_moe_acc), 0);
+                encoder.set_buffer(2, Some(&self.slab_a), 0);
+                encoder.set_buffer(3, Some(&layer.resid_n_batch), 0);
+                dispatch_1d(encoder, &kernel.residual_add_pipeline, k_tokens * hidden);
+
+                if (moe_layer.layer_output_scale - 1.0).abs() > 1.0e-5 {
+                    encode_scale_f32(
+                        encoder,
+                        kernel,
+                        &self.slab_a,
+                        &self.slab_a,
+                        &moe_layer.layer_scale_scalar,
+                        k_tokens * hidden,
                     );
-                } else {
-                    unsafe {
-                        *(layer.resid_n_batch.contents() as *mut u32) = (k_tokens * hidden) as u32;
-                    }
-                    encoder.set_compute_pipeline_state(&kernel.residual_add_pipeline);
-                    encoder.set_buffer(0, Some(&self.slab_b), 0);
-                    encoder.set_buffer(1, Some(&self.resident_scratch.dn_batch), 0);
-                    encoder.set_buffer(2, Some(&self.slab_a), 0);
-                    encoder.set_buffer(3, Some(&layer.resid_n_batch), 0);
-                    dispatch_1d(encoder, &kernel.residual_add_pipeline, k_tokens * hidden);
-
-                    encoder.set_compute_pipeline_state(&kernel.residual_add_pipeline);
-                    encoder.set_buffer(0, Some(&self.slab_a), 0);
-                    encoder.set_buffer(1, Some(&self.resident_scratch.gpu_moe_acc), 0);
-                    encoder.set_buffer(2, Some(&self.slab_a), 0);
-                    encoder.set_buffer(3, Some(&layer.resid_n_batch), 0);
-                    dispatch_1d(encoder, &kernel.residual_add_pipeline, k_tokens * hidden);
-
-                    if (moe_layer.layer_output_scale - 1.0).abs() > 1.0e-5 {
-                        encode_scale_f32(
-                            encoder,
-                            kernel,
-                            &self.slab_a,
-                            &self.slab_a,
-                            &moe_layer.layer_scale_scalar,
-                            k_tokens * hidden,
-                        );
-                    }
                 }
+            }
 
             encoder.memory_barrier_with_resources(&[&self.slab_a]);
             self.next_position[layer_idx] = start_pos + k_tokens;
@@ -23781,17 +24231,33 @@ pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[
                     let slabb_ptr = self.slab_b.contents() as *const f32;
                     let dn_ptr = self.resident_scratch.dn_batch.contents() as *const f32;
                     let moe_ptr = self.resident_scratch.gpu_moe_acc.contents() as *const f32;
-                    let router_ptr = self.resident_scratch.router_logits_batch.contents() as *const f32;
-                    let routes_ptr = self.resident_scratch.gpu_candidate_routes[0].contents() as *const Gemma4CandidateRouteEntry;
-                    let work_ptr = self.resident_scratch.gpu_work_list.contents() as *const Gemma4UniqueExpertWork;
+                    let router_ptr =
+                        self.resident_scratch.router_logits_batch.contents() as *const f32;
+                    let routes_ptr = self.resident_scratch.gpu_candidate_routes[0].contents()
+                        as *const Gemma4CandidateRouteEntry;
+                    let work_ptr = self.resident_scratch.gpu_work_list.contents()
+                        as *const Gemma4UniqueExpertWork;
                     let slot_table_ptr = moe_layer.expert_to_slot_table.contents() as *const u32;
 
                     let mut slabb0 = vec![0.0f32; hidden];
                     let mut dn0 = vec![0.0f32; hidden];
                     let mut moe0 = vec![0.0f32; hidden];
                     let mut router0 = vec![0.0f32; 128];
-                    let mut routes0 = vec![Gemma4CandidateRouteEntry { unique_expert_idx: 0, weight: 0.0 }; 8];
-                    let mut work0 = vec![Gemma4UniqueExpertWork { candidate_mask: 0, expert_weight_offset: 0, slab_index: 0 }; 128];
+                    let mut routes0 = vec![
+                        Gemma4CandidateRouteEntry {
+                            unique_expert_idx: 0,
+                            weight: 0.0
+                        };
+                        8
+                    ];
+                    let mut work0 = vec![
+                        Gemma4UniqueExpertWork {
+                            candidate_mask: 0,
+                            expert_weight_offset: 0,
+                            slab_index: 0
+                        };
+                        128
+                    ];
                     let mut slot_table0 = vec![0u32; 128];
 
                     unsafe {
@@ -23801,7 +24267,11 @@ pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[
                         std::ptr::copy_nonoverlapping(router_ptr, router0.as_mut_ptr(), 128);
                         std::ptr::copy_nonoverlapping(routes_ptr, routes0.as_mut_ptr(), 8);
                         std::ptr::copy_nonoverlapping(work_ptr, work0.as_mut_ptr(), 128);
-                        std::ptr::copy_nonoverlapping(slot_table_ptr, slot_table0.as_mut_ptr(), 128);
+                        std::ptr::copy_nonoverlapping(
+                            slot_table_ptr,
+                            slot_table0.as_mut_ptr(),
+                            128,
+                        );
                     }
 
                     let slabb0_l2 = slabb0.iter().map(|v| v * v).sum::<f32>().sqrt();
@@ -23815,7 +24285,11 @@ pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[
                     for s in 0..num_slots.min(16) {
                         let mut b8 = vec![0u8; 8];
                         unsafe {
-                            std::ptr::copy_nonoverlapping(slab_ptr.add(s * GEMMA4_Q4_EXPERT_SLOT_STRIDE), b8.as_mut_ptr(), 8);
+                            std::ptr::copy_nonoverlapping(
+                                slab_ptr.add(s * GEMMA4_Q4_EXPERT_SLOT_STRIDE),
+                                b8.as_mut_ptr(),
+                                8,
+                            );
                         }
                         eprintln!("[metal layer0] Slot {s:3} first 8 bytes: {:02x?}", b8);
                     }
@@ -23872,7 +24346,11 @@ pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[
                         }
                         gpu_expert_ids[i] = gpu_e;
                         gpu_weights[i] = route_entry.weight;
-                        let resident_s = if logit_e < 128 { slot_table0[logit_e] } else { 0xFFFF_FFFFu32 };
+                        let resident_s = if logit_e < 128 {
+                            slot_table0[logit_e]
+                        } else {
+                            0xFFFF_FFFFu32
+                        };
                         eprintln!(
                             "  Rank #{i}: logit_expert={logit_e:3} gpu_expert={gpu_e:?} compact_unique_index={compact_u:2} resident_slot_id={resident_s:3} (work_offset={work_offset}, actual_slot={actual_slot}, mask=0x{work_mask:02x}, weight={:.6})",
                             route_entry.weight
@@ -23902,10 +24380,14 @@ pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[
                         let _ = std::fs::write(dir.join("metal_layer0_moe.bin"), raw);
                     }
 
-                    let in_scales_ptr = self.resident_scratch.expert_input_scales_batch.contents() as *const f32;
-                    let in_quants_ptr = self.resident_scratch.expert_input_quants_batch.contents() as *const i8;
-                    let moe_scales_ptr = self.resident_scratch.gpu_moe_scales.contents() as *const f32;
-                    let moe_quants_ptr = self.resident_scratch.gpu_moe_quants.contents() as *const i8;
+                    let in_scales_ptr =
+                        self.resident_scratch.expert_input_scales_batch.contents() as *const f32;
+                    let in_quants_ptr =
+                        self.resident_scratch.expert_input_quants_batch.contents() as *const i8;
+                    let moe_scales_ptr =
+                        self.resident_scratch.gpu_moe_scales.contents() as *const f32;
+                    let moe_quants_ptr =
+                        self.resident_scratch.gpu_moe_quants.contents() as *const i8;
 
                     let mut in_scales0 = vec![0.0f32; 88];
                     let mut in_quants0 = vec![0i8; 2816];
@@ -23918,15 +24400,28 @@ pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[
 
                     eprintln!("[metal layer0] geglu_path=simd-split-rowdot (scalar ordered GEMV)");
                     eprintln!("[metal layer0] Per-Expert GeGLU Activation Diagnostics:");
-                    let act_f32_ptr = self.resident_scratch.gpu_moe_activated.contents() as *const f32;
+                    let act_f32_ptr =
+                        self.resident_scratch.gpu_moe_activated.contents() as *const f32;
                     for u in 0..num_unique {
                         let mut act_f32 = vec![0.0f32; 704];
                         let mut act_scales = vec![0.0f32; 22];
                         let mut act_quants = vec![0i8; 704];
                         unsafe {
-                            std::ptr::copy_nonoverlapping(act_f32_ptr.add(u * k_tokens * 704), act_f32.as_mut_ptr(), 704);
-                            std::ptr::copy_nonoverlapping(moe_scales_ptr.add(u * k_tokens * 22), act_scales.as_mut_ptr(), 22);
-                            std::ptr::copy_nonoverlapping(moe_quants_ptr.add(u * k_tokens * 704), act_quants.as_mut_ptr(), 704);
+                            std::ptr::copy_nonoverlapping(
+                                act_f32_ptr.add(u * k_tokens * 704),
+                                act_f32.as_mut_ptr(),
+                                704,
+                            );
+                            std::ptr::copy_nonoverlapping(
+                                moe_scales_ptr.add(u * k_tokens * 22),
+                                act_scales.as_mut_ptr(),
+                                22,
+                            );
+                            std::ptr::copy_nonoverlapping(
+                                moe_quants_ptr.add(u * k_tokens * 704),
+                                act_quants.as_mut_ptr(),
+                                704,
+                            );
                         }
                         let act_f32_l2 = act_f32.iter().map(|v| v * v).sum::<f32>().sqrt();
                         eprintln!(
@@ -23959,13 +24454,18 @@ pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[
                                 quants,
                             });
                         }
-                        eprintln!("[metal layer0] host q4_0_wire_row_dot on Metal slab + Metal Q8:");
+                        eprintln!(
+                            "[metal layer0] host q4_0_wire_row_dot on Metal slab + Metal Q8:"
+                        );
                         for u in 0..num_unique {
                             let offset = work0[u].expert_weight_offset as usize;
                             let mut gu = vec![0.0f32; 1_408];
                             for row in 0..1_408 {
                                 let row_bytes = unsafe {
-                                    std::slice::from_raw_parts(slab_ptr.add(offset + row * 1_584), 1_584)
+                                    std::slice::from_raw_parts(
+                                        slab_ptr.add(offset + row * 1_584),
+                                        1_584,
+                                    )
                                 };
                                 gu[row] = q4_0_wire_row_dot(row_bytes, &input_blocks);
                             }
@@ -23999,7 +24499,11 @@ pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[
                 for i in 0..k_tokens {
                     let mut row = vec![0.0f32; hidden];
                     unsafe {
-                        std::ptr::copy_nonoverlapping(ptr.add(i * hidden), row.as_mut_ptr(), hidden);
+                        std::ptr::copy_nonoverlapping(
+                            ptr.add(i * hidden),
+                            row.as_mut_ptr(),
+                            hidden,
+                        );
                     }
                     let l2 = row.iter().map(|v| v * v).sum::<f32>().sqrt();
                     eprintln!(
@@ -24038,7 +24542,10 @@ pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[
         cmd_buf.wait_until_completed();
         ledger.final_wait_ms = t_final_wait.elapsed().as_secs_f64() * 1000.0;
         if cmd_buf.status() != metal::MTLCommandBufferStatus::Completed {
-            eprintln!("[metal chained round] command buffer failed with status {:?}", cmd_buf.status());
+            eprintln!(
+                "[metal chained round] command buffer failed with status {:?}",
+                cmd_buf.status()
+            );
             self.last_chained_ledger = ledger;
             return false;
         }
@@ -24107,7 +24614,11 @@ pub(crate) fn update_resident_slot_tables(&mut self, slot_mappings_per_layer: &[
         for i in 0..k_tokens.min(out_rows.len()) {
             out_rows[i].resize(hidden, 0.0);
             unsafe {
-                std::ptr::copy_nonoverlapping(ptr.add(i * hidden), out_rows[i].as_mut_ptr(), hidden);
+                std::ptr::copy_nonoverlapping(
+                    ptr.add(i * hidden),
+                    out_rows[i].as_mut_ptr(),
+                    hidden,
+                );
             }
         }
         ledger.download_ms = t_download.elapsed().as_secs_f64() * 1000.0;

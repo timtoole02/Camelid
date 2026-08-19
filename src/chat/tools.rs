@@ -1173,14 +1173,26 @@ impl Action {
     pub fn narrative(&self, sandbox: &Sandbox) -> String {
         match self {
             Action::WriteFile { path, content, .. } => {
-                format!("Authoring `{}` ({} bytes)...", sandbox.rel(path), content.len())
+                format!(
+                    "Authoring `{}` ({} bytes)...",
+                    sandbox.rel(path),
+                    content.len()
+                )
             }
             Action::EditFile { path, .. } => {
-                format!("Applying targeted modification to `{}`...", sandbox.rel(path))
+                format!(
+                    "Applying targeted modification to `{}`...",
+                    sandbox.rel(path)
+                )
             }
-            Action::ReadFile { path, start_line, .. } => {
+            Action::ReadFile {
+                path, start_line, ..
+            } => {
                 if let Some(start) = start_line {
-                    format!("Reading `{}` starting from line {start}...", sandbox.rel(path))
+                    format!(
+                        "Reading `{}` starting from line {start}...",
+                        sandbox.rel(path)
+                    )
                 } else {
                     format!("Inspecting `{}`...", sandbox.rel(path))
                 }
@@ -1208,7 +1220,9 @@ impl Action {
             Action::InspectSystem { query, .. } => {
                 format!("Inspecting system: {}...", query.label())
             }
-            Action::SpawnSubagent { subtask_id, goal, .. } => {
+            Action::SpawnSubagent {
+                subtask_id, goal, ..
+            } => {
                 format!("Delegating subtask `{subtask_id}`: {goal}")
             }
             Action::AwaitSubagent { subtask_id, .. } => {
@@ -2818,7 +2832,9 @@ fn python_structural_defect(source: &str) -> Option<String> {
                 b')' => {
                     if let Some((open, _)) = delimiter_stack.pop() {
                         if open != '(' {
-                            return Some(format!("line {line_no} has mismatched closing ')' for opening '{open}'"));
+                            return Some(format!(
+                                "line {line_no} has mismatched closing ')' for opening '{open}'"
+                            ));
                         }
                     } else {
                         return Some(format!("line {line_no} has unmatched closing ')'"));
@@ -2827,7 +2843,9 @@ fn python_structural_defect(source: &str) -> Option<String> {
                 b']' => {
                     if let Some((open, _)) = delimiter_stack.pop() {
                         if open != '[' {
-                            return Some(format!("line {line_no} has mismatched closing ']' for opening '{open}'"));
+                            return Some(format!(
+                                "line {line_no} has mismatched closing ']' for opening '{open}'"
+                            ));
                         }
                     } else {
                         return Some(format!("line {line_no} has unmatched closing ']'"));
@@ -2836,7 +2854,9 @@ fn python_structural_defect(source: &str) -> Option<String> {
                 b'}' => {
                     if let Some((open, _)) = delimiter_stack.pop() {
                         if open != '{' {
-                            return Some(format!("line {line_no} has mismatched closing '}}' for opening '{open}'"));
+                            return Some(format!(
+                                "line {line_no} has mismatched closing '}}' for opening '{open}'"
+                            ));
                         }
                     } else {
                         return Some(format!("line {line_no} has unmatched closing '}}'"));
@@ -2867,7 +2887,10 @@ fn python_structural_defect(source: &str) -> Option<String> {
 }
 
 fn python_test_file_has_executable_tests(path: &Path, content: &str) -> bool {
-    let filename = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
     let is_test = filename.starts_with("test_")
         || filename.ends_with("_test.py")
         || path.to_string_lossy().contains("/tests/")
@@ -2879,7 +2902,8 @@ fn python_test_file_has_executable_tests(path: &Path, content: &str) -> bool {
         let trimmed = line.trim_start();
         trimmed.starts_with("def test_")
             || trimmed.starts_with("def test(")
-            || (trimmed.starts_with("class ") && (trimmed.contains("Test") || trimmed.contains("TestCase")))
+            || (trimmed.starts_with("class ")
+                && (trimmed.contains("Test") || trimmed.contains("TestCase")))
             || trimmed.starts_with("async def test_")
     })
 }
@@ -3486,7 +3510,8 @@ fn shell_failure_hint(
                 let start = pos + marker.len();
                 if let Some(end) = text[start..].find('\'') {
                     let mod_name = &text[start..start + end];
-                    if root.join(mod_name).is_dir() || root.join(format!("{mod_name}.py")).is_file() {
+                    if root.join(mod_name).is_dir() || root.join(format!("{mod_name}.py")).is_file()
+                    {
                         return Some(format!(
                             "`{mod_name}` exists as a local directory/file in this workspace. Run from the workspace root (e.g. `python3 -m {mod_name}.<module>`) or use flat imports."
                         ));
@@ -4460,7 +4485,10 @@ mod tests {
         for (path, body) in [
             ("rpncalc/__init__.py", ""),
             ("rpncalc/deep/nested/mod.py", "X = 1\n"),
-            ("tests/test_rpncalc.py", "import unittest\n\ndef test_calc():\n    pass\n"),
+            (
+                "tests/test_rpncalc.py",
+                "import unittest\n\ndef test_calc():\n    pass\n",
+            ),
         ] {
             let resolved = sb.resolve(path, false).expect("resolves a missing parent");
             let display = sb.rel(&resolved);
@@ -5546,8 +5574,9 @@ mod tests {
             shell_failure_hint("", "", None).is_none(),
             "no hint without a known class"
         );
-        let sandbox_hint = shell_failure_hint("", "touch: /etc/probe: Operation not permitted", None)
-            .expect("sandbox denial must hint");
+        let sandbox_hint =
+            shell_failure_hint("", "touch: /etc/probe: Operation not permitted", None)
+                .expect("sandbox denial must hint");
         assert!(sandbox_hint.contains("sandbox"), "{sandbox_hint}");
         assert!(
             sandbox_hint.to_ascii_lowercase().contains("not retry"),
@@ -5564,7 +5593,8 @@ mod tests {
         let py = shell_failure_hint("", "sh: py: command not found", None).unwrap();
         assert!(py.contains("python3"), "{py}");
         // Network is denied by the jail; the shell reports it as a DNS failure.
-        let net = shell_failure_hint("", "curl: (6) Could not resolve host: example.com", None).unwrap();
+        let net =
+            shell_failure_hint("", "curl: (6) Could not resolve host: example.com", None).unwrap();
         assert!(net.contains("network"), "{net}");
         // A compile error is the model's problem, not the harness's.
         let rustc = shell_failure_hint("", "error[E0425]: cannot find value `x`", None).unwrap();
@@ -5578,7 +5608,10 @@ mod tests {
             Some(temp.path()),
         )
         .unwrap();
-        assert!(import_err.contains("`mypackage` exists as a local directory/file"), "{import_err}");
+        assert!(
+            import_err.contains("`mypackage` exists as a local directory/file"),
+            "{import_err}"
+        );
         assert!(
             shell_failure_hint("all good\n", "", None).is_none(),
             "clean output must not be hinted"
