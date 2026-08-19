@@ -2908,7 +2908,7 @@ fn condense_objective_for_capsule(objective: &str) -> String {
             {
                 condensed.push(line);
             } else if !trimmed.is_empty()
-                && (condensed.last().map_or(true, |l| l.trim().starts_with('#')))
+                && (condensed.last().is_none_or(|l| l.trim().starts_with('#')))
             {
                 condensed.push(line);
             }

@@ -8150,7 +8150,7 @@ fn q8_0_block_reader_linear_matches_existing_q8_path() {
         "weight",
         vec![2, 32],
         dequantized_weight,
-        vec![row0.clone(), row1.clone()],
+        vec![row0, row1],
     )
     .unwrap();
 
@@ -8806,7 +8806,7 @@ fn q8_0_block_dot_uses_raw_weight_blocks_and_quantized_input_when_opted_in() {
         "weight",
         vec![2, 32],
         dequantized_weight,
-        vec![row0.clone(), row1.clone()],
+        vec![row0, row1],
     )
     .unwrap();
 
@@ -8870,8 +8870,8 @@ fn q8_0_block_dot_reads_descriptor_shaped_blocks_as_transposed_rows_when_opted_i
     let descriptor_shaped_weight = CpuTensor::from_f32_with_q8_0_blocks(
         "descriptor.weight",
         vec![32, 2],
-        dequantized_q8_0_rows(&[row0.clone(), row1.clone()]),
-        vec![row0.clone(), row1.clone()],
+        dequantized_q8_0_rows(&[row0, row1]),
+        vec![row0, row1],
     )
     .unwrap();
 
@@ -8916,8 +8916,8 @@ fn output_projection_q8_0_descriptor_shape_uses_storage_token_rows() {
     let output_weight = CpuTensor::from_f32_with_q8_0_blocks(
         "output.weight",
         vec![32, 2],
-        dequantized_q8_0_rows(&[token_0.clone(), token_1.clone()]),
-        vec![token_0.clone(), token_1.clone()],
+        dequantized_q8_0_rows(&[token_0, token_1]),
+        vec![token_0, token_1],
     )
     .unwrap();
 
@@ -8986,15 +8986,15 @@ fn gated_ffn_activation_uses_q8_0_descriptor_blocks_for_gate_and_up_when_opted_i
     let gate_weight = CpuTensor::from_f32_with_q8_0_blocks(
         "blk.0.ffn_gate.weight",
         vec![32, 2],
-        dequantized_q8_0_rows(&[gate0.clone(), gate1.clone()]),
-        vec![gate0.clone(), gate1.clone()],
+        dequantized_q8_0_rows(&[gate0, gate1]),
+        vec![gate0, gate1],
     )
     .unwrap();
     let up_weight = CpuTensor::from_f32_with_q8_0_blocks(
         "blk.0.ffn_up.weight",
         vec![32, 2],
-        dequantized_q8_0_rows(&[up0.clone(), up1.clone()]),
-        vec![up0.clone(), up1.clone()],
+        dequantized_q8_0_rows(&[up0, up1]),
+        vec![up0, up1],
     )
     .unwrap();
 

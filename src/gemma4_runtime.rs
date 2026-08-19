@@ -805,7 +805,7 @@ impl<'a> SharedActivationBatch<'a> {
 /// E2B/E4B/12B), so a single hardcoded spelling misses the stop and the model
 /// emits EOG ids forever. The metadata ids are the authoritative contract;
 /// llama.cpp stops on the same set.
-fn gemma4_stop_token_ids(tokenizer: &Tokenizer) -> Vec<u32> {
+pub fn gemma4_stop_token_ids(tokenizer: &Tokenizer) -> Vec<u32> {
     let sp = &tokenizer.special;
     let mut ids: Vec<u32> = [sp.eos, sp.eot, sp.eom].iter().flatten().copied().collect();
     for marker in ["<turn|>", "<end_of_turn>"] {
@@ -1506,6 +1506,25 @@ fn parse_ghost_metal_slots_per_layer(value: Option<&str>) -> usize {
         .clamp(GHOST_METAL_EXPERT_SLOTS_MIN, GHOST_METAL_EXPERT_SLOTS_MAX)
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn parse_ghost_metal_per_layer_slots(
+    raw_per_layer: Option<&str>,
+    default_slots: usize,
+    layer_count: usize,
+) -> Vec<usize> {
+    if let Some(raw) = raw_per_layer {
+        let parsed: Vec<usize> = raw
+            .split(',')
+            .filter_map(|s| s.trim().parse::<usize>().ok())
+            .map(|s| s.clamp(GHOST_METAL_EXPERT_SLOTS_MIN, GHOST_METAL_EXPERT_SLOTS_MAX))
+            .collect();
+        if parsed.len() == layer_count {
+            return parsed;
+        }
+    }
+    vec![default_slots; layer_count]
+}
+
 #[cfg(target_os = "macos")]
 fn ghost_metal_slots_per_layer_from_env() -> usize {
     let raw = std::env::var("CAMELID_GEMMA4_GHOST_METAL_SLOTS_PER_LAYER").ok();
@@ -1520,6 +1539,24 @@ fn ghost_metal_slots_per_layer_from_env() -> usize {
             ),
             _ => {}
         }
+    }
+    slots
+}
+
+#[cfg(target_os = "macos")]
+fn ghost_metal_per_layer_slots_from_env(layer_count: usize) -> Vec<usize> {
+    let default_slots = ghost_metal_slots_per_layer_from_env();
+    let raw_per_layer = std::env::var("CAMELID_GEMMA4_GHOST_METAL_PER_LAYER_SLOTS").ok();
+    let slots =
+        parse_ghost_metal_per_layer_slots(raw_per_layer.as_deref(), default_slots, layer_count);
+    if let Some(raw) = raw_per_layer {
+        let total: usize = slots.iter().sum();
+        eprintln!(
+            "[gemma4-ghost-metal] per-layer slot distribution enabled: total {} slots ({:.2} GiB resident) across {} layers",
+            total,
+            (total * crate::metal::GEMMA4_Q4_EXPERT_SLOT_STRIDE) as f64 / (1024.0 * 1024.0 * 1024.0),
+            layer_count
+        );
     }
     slots
 }
@@ -2106,12 +2143,7 @@ fn fill_compact_wave_into_slots(
     use rayon::prelude::*;
     let base = slots.contents() as *mut u8;
     let base_raw = base as usize;
-    let items: Vec<_> = experts
-        .iter()
-        .copied()
-        .zip(records.into_iter())
-        .enumerate()
-        .collect();
+    let items: Vec<_> = experts.iter().copied().zip(records).enumerate().collect();
     items.into_par_iter().for_each(|(i, (_expert, record))| {
         if i < slot_count && record.byte_len() == record_bytes {
             unsafe {
@@ -2316,25 +2348,29 @@ impl Drop for GhostLayerPendingGuard {
 
 #[cfg(target_os = "macos")]
 impl GhostMetalExpertRuntime {
-    fn new(layer_count: usize, fused_fast: bool, slots_per_layer: usize) -> Option<Self> {
-        if !(GHOST_METAL_EXPERT_SLOTS_MIN..=GHOST_METAL_EXPERT_SLOTS_MAX).contains(&slots_per_layer)
-        {
+    fn new(layer_count: usize, fused_fast: bool, slots_per_layer: &[usize]) -> Option<Self> {
+        if slots_per_layer.len() != layer_count {
             return None;
+        }
+        for &slots in slots_per_layer {
+            if !(GHOST_METAL_EXPERT_SLOTS_MIN..=GHOST_METAL_EXPERT_SLOTS_MAX).contains(&slots) {
+                return None;
+            }
         }
         let engine = crate::metal::Gemma4Q4ExpertMetal::new()?;
         let mut layers = Vec::with_capacity(layer_count);
-        for _ in 0..layer_count {
-            let slots = crate::metal::Gemma4Q4ExpertSlots::new(slots_per_layer)?;
-            debug_assert_eq!(slots.slot_count(), slots_per_layer);
+        for &slots in slots_per_layer {
+            let slots_obj = crate::metal::Gemma4Q4ExpertSlots::new(slots)?;
+            debug_assert_eq!(slots_obj.slot_count(), slots);
             layers.push(GhostMetalExpertLayer {
-                directory: GhostMetalSlotDirectory::new(slots_per_layer),
-                slots,
+                directory: GhostMetalSlotDirectory::new(slots),
+                slots: slots_obj,
                 stats: GhostMetalSlotStats::default(),
                 shared: None,
             });
         }
         // The overflow bank only holds experts beyond the resident slots. When
-        // `slots_per_layer` already covers the worst-case per-layer union
+        // min `slots_per_layer` already covers the worst-case per-layer union
         // (observed max 42 for K=8), no layer ever spills, so `fill_pong` /
         // `fill_compact_wave_into_slots` are never called and a single copy is
         // enough. Allocating 30 copies × 24 slots = 2.25 GiB of unified memory
@@ -2343,7 +2379,8 @@ impl GhostMetalExpertRuntime {
         // all 30 layers' fills complete before the single GPU commit — sharing
         // a copy across layers would overwrite an earlier layer's overflow
         // experts before the GPU reads them.
-        let bank_never_written = slots_per_layer >= GHOST_METAL_OVERFLOW_COVER_SLOTS;
+        let min_slots = slots_per_layer.iter().copied().min().unwrap_or(0);
+        let bank_never_written = min_slots >= GHOST_METAL_OVERFLOW_COVER_SLOTS;
         let bank_copies = if bank_never_written {
             1
         } else {
@@ -2688,76 +2725,72 @@ impl GhostMetalExpertRuntime {
         }
 
         let layers_ref = &mut self.layers;
-        let mut slot_filler = if let Some(cache) = ghost_cache {
-            Some(
-                |layer_idx: usize,
-                 router_logits: &[f32],
-                 wave: Option<&[usize]>,
-                 updated_slots: &mut [u32; 128],
-                 union_out: &mut Vec<usize>| {
-                    let layer = &mut layers_ref[layer_idx];
-                    let n_tokens = k_tokens.min(crate::metal::GEMMA4_RESIDENT_MAX_BATCH);
-                    let n_slots = layer.directory.entries.len();
+        let mut slot_filler = ghost_cache.map(|cache| {
+            |layer_idx: usize,
+             router_logits: &[f32],
+             wave: Option<&[usize]>,
+             updated_slots: &mut [u32; 128],
+             union_out: &mut Vec<usize>| {
+                let layer = &mut layers_ref[layer_idx];
+                let n_tokens = k_tokens.min(crate::metal::GEMMA4_RESIDENT_MAX_BATCH);
+                let n_slots = layer.directory.entries.len();
 
-                    let selected_experts: Vec<usize> = if let Some(wave) = wave {
-                        wave.to_vec()
-                    } else {
-                        let mut selected_experts = Vec::with_capacity(n_tokens * 8);
-                        for t in 0..n_tokens {
-                            let logits = &router_logits[t * 128..(t + 1) * 128];
-                            let mut maxl = f32::MIN;
-                            for &v in logits {
-                                if v > maxl {
-                                    maxl = v;
-                                }
-                            }
-                            let mut probs = [0.0f32; 128];
-                            for e in 0..128 {
-                                probs[e] = (logits[e] - maxl).exp();
-                            }
-                            let mut ranked: [usize; 128] = std::array::from_fn(|i| i);
-                            ranked.sort_unstable_by(|&a, &b| {
-                                probs[b]
-                                    .partial_cmp(&probs[a])
-                                    .unwrap_or(std::cmp::Ordering::Equal)
-                            });
-                            for i in 0..8 {
-                                let e = ranked[i];
-                                if !selected_experts.contains(&e) {
-                                    selected_experts.push(e);
-                                }
+                let selected_experts: Vec<usize> = if let Some(wave) = wave {
+                    wave.to_vec()
+                } else {
+                    let mut selected_experts = Vec::with_capacity(n_tokens * 8);
+                    for t in 0..n_tokens {
+                        let logits = &router_logits[t * 128..(t + 1) * 128];
+                        let mut maxl = f32::MIN;
+                        for &v in logits {
+                            if v > maxl {
+                                maxl = v;
                             }
                         }
-                        union_out.clear();
-                        union_out.extend_from_slice(&selected_experts);
-                        collected_routes[layer_idx] = selected_experts.clone();
-                        if selected_experts.len() > n_slots {
-                            // Overflow becomes extra waves. Keep any speculative
-                            // wave-0 slot table filled during the router wait.
-                            return;
+                        let mut probs = [0.0f32; 128];
+                        for e in 0..128 {
+                            probs[e] = (logits[e] - maxl).exp();
                         }
-                        selected_experts
-                    };
-
-                    fill_metal_wave_slots_from_host_cache(
-                        layer,
-                        cache,
-                        layer_idx,
-                        &selected_experts,
-                        &nvme_us,
-                        &nvme_bytes,
-                        &demand_loads,
-                    );
-
-                    for e in 0..128 {
-                        let s = layer.directory.resident_slot_table[e];
-                        updated_slots[e] = if s >= 0 { s as u32 } else { 0xFFFFFFFFu32 };
+                        let mut ranked: [usize; 128] = std::array::from_fn(|i| i);
+                        ranked.sort_unstable_by(|&a, &b| {
+                            probs[b]
+                                .partial_cmp(&probs[a])
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        for i in 0..8 {
+                            let e = ranked[i];
+                            if !selected_experts.contains(&e) {
+                                selected_experts.push(e);
+                            }
+                        }
                     }
-                },
-            )
-        } else {
-            None
-        };
+                    union_out.clear();
+                    union_out.extend_from_slice(&selected_experts);
+                    collected_routes[layer_idx] = selected_experts.clone();
+                    if selected_experts.len() > n_slots {
+                        // Overflow becomes extra waves. Keep any speculative
+                        // wave-0 slot table filled during the router wait.
+                        return;
+                    }
+                    selected_experts
+                };
+
+                fill_metal_wave_slots_from_host_cache(
+                    layer,
+                    cache,
+                    layer_idx,
+                    &selected_experts,
+                    &nvme_us,
+                    &nvme_bytes,
+                    &demand_loads,
+                );
+
+                for e in 0..128 {
+                    let s = layer.directory.resident_slot_table[e];
+                    updated_slots[e] = if s >= 0 { s as u32 } else { 0xFFFFFFFFu32 };
+                }
+            }
+        });
 
         let pong_slab_for_gpu = pong_slab_buf.clone();
         let mut fill_pong = ghost_cache.map(|cache| {
@@ -2781,13 +2814,13 @@ impl GhostMetalExpertRuntime {
             }
         });
 
-        let mut slot_filler_fn: Option<
+        let slot_filler_fn: Option<
             &mut dyn FnMut(usize, &[f32], Option<&[usize]>, &mut [u32; 128], &mut Vec<usize>),
         > = match slot_filler.as_mut() {
             Some(f) => Some(f),
             None => None,
         };
-        let mut fill_pong_fn: Option<&mut dyn FnMut(usize, &[usize], &mut [u32; 128])> =
+        let fill_pong_fn: Option<&mut dyn FnMut(usize, &[usize], &mut [u32; 128])> =
             match fill_pong.as_mut() {
                 Some(f) => Some(f),
                 None => None,
@@ -3056,7 +3089,7 @@ impl GhostMetalExpertRuntime {
 
         if !loads.is_empty() {
             let fill_started = std::time::Instant::now();
-            let stride = layer.slots.slot_stride_bytes();
+            let _stride = layer.slots.slot_stride_bytes();
             let record_bytes = layer.slots.slot_record_bytes();
             debug_assert_eq!(record_bytes, crate::metal::GEMMA4_Q4_EXPERT_RECORD_BYTES);
             let file = &ghost.cache.file;
@@ -3502,7 +3535,7 @@ impl GhostMetalExpertRuntime {
         layer.stats.evictions = layer.stats.evictions.saturating_add(evictions as u64);
 
         if !loads.is_empty() {
-            let stride = layer.slots.slot_stride_bytes();
+            let _stride = layer.slots.slot_stride_bytes();
             let record_bytes = layer.slots.slot_record_bytes();
             let file = &ghost.cache.file;
             let mut host_fills = 0usize;
@@ -4921,10 +4954,10 @@ impl Gemma4Runtime {
             let common_enabled = (flag("CAMELID_GEMMA4_GHOST_METAL_COMMON")
                 || crate::cuda::gpu_accel_enabled())
                 && !crate::inference::deterministic_mode_enabled();
-            let slots_per_layer = if enabled {
-                ghost_metal_slots_per_layer_from_env()
+            let per_layer_slots = if enabled {
+                ghost_metal_per_layer_slots_from_env(block_count)
             } else {
-                GHOST_METAL_EXPERT_SLOTS_DEFAULT
+                vec![GHOST_METAL_EXPERT_SLOTS_DEFAULT; block_count]
             };
             let moe_meta = config.moe.as_ref();
             let exact_geometry = ghost_moe_cache.is_some()
@@ -4966,7 +4999,7 @@ impl Gemma4Runtime {
                 false
             };
             let mut lane = if enabled && exact_geometry && exact_records {
-                GhostMetalExpertRuntime::new(block_count, fused_fast, slots_per_layer)
+                GhostMetalExpertRuntime::new(block_count, fused_fast, &per_layer_slots)
             } else {
                 None
             };
@@ -5208,6 +5241,24 @@ impl Gemma4Runtime {
             }
         }
         (0, 0)
+    }
+
+    /// Per-layer slot stats: (layer_idx, hits, misses, slot_count).
+    pub fn ghost_metal_layer_slot_stats(&self) -> Vec<(usize, u64, u64, usize)> {
+        #[cfg(target_os = "macos")]
+        {
+            if let Ok(guard) = self.metal_q4_experts.lock() {
+                if let Some(lane) = guard.as_ref() {
+                    return lane
+                        .layers
+                        .iter()
+                        .enumerate()
+                        .map(|(i, l)| (i, l.stats.hits, l.stats.misses, l.slots.slot_count()))
+                        .collect();
+                }
+            }
+        }
+        Vec::new()
     }
 
     /// Truncate the resident sequence in the Ghost Metal common core to `keep` positions.
@@ -7052,7 +7103,7 @@ impl Gemma4Runtime {
             .iter()
             .flat_map(|indices| indices.iter().copied())
             .collect();
-        let union_count = unique_experts.len();
+        let _union_count = unique_experts.len();
 
         // Dense shared-expert branch. The batched projections use the exact same
         // row-dot kernels as the scalar lane, only reusing each weight row across
@@ -7598,7 +7649,7 @@ impl Gemma4Runtime {
         let mut out = Vec::with_capacity(attn_rows.len());
 
         if let Some(output_acc) = multi_expert_metal_result {
-            if let Some(prof) = profile.as_deref_mut() {
+            if let Some(prof) = profile {
                 prof.pure_gpu_ms += batch_times.gpu_busy_us as f64 / 1000.0;
                 prof.command_buffers += 1;
                 prof.cpu_waits += 1;
@@ -8966,14 +9017,7 @@ impl Gemma4Runtime {
             // expensive for Ghost-MoE (30 layers x 8 paged experts), so stop at
             // the exact generation boundary without changing any returned id.
             if generated_index + 1 < max_new {
-                logits = if self.supports_speculative_chunk_forward() {
-                    self.step_chunk(&[next], pos, &mut kc, &mut vc)?
-                        .into_iter()
-                        .next()
-                        .expect("step_chunk row")
-                } else {
-                    self.step(next, pos, &mut kc, &mut vc)?
-                };
+                logits = self.step(next, pos, &mut kc, &mut vc)?;
                 pos += 1;
             }
         }
@@ -9394,12 +9438,15 @@ impl Gemma4Runtime {
         let _ghost_common_request = self.lock_ghost_common_generation()?;
         #[cfg(target_os = "macos")]
         let _ghost_metal_stats = GhostMetalGenerationStatsGuard::new(&self.metal_q4_experts);
+        #[cfg(target_os = "macos")]
+        let _ghost_sequence_cleanup = GhostMetalSequenceCleanup::new(&self.metal_q4_experts);
         let n_layers = self.layers.len();
         let mut kc: Vec<Vec<Vec<f32>>> = vec![Vec::new(); n_layers];
         let mut vc: Vec<Vec<Vec<f32>>> = vec![Vec::new(); n_layers];
         let prompt_tokens = self.tokenizer.encode(prompt, true, true)?;
         let eot = gemma4_stop_token_ids(&self.tokenizer);
-        let logits = self.prefill_tokens(&prompt_tokens, &mut kc, &mut vc, 0)?;
+        let logits =
+            self.prefill_tokens(&prompt_tokens, &mut kc, &mut vc, max_new.saturating_sub(1))?;
         let generated =
             self.spec_decode_generate(&mut kc, &mut vc, logits, &prompt_tokens, &eot, max_new)?;
         let text = self.tokenizer.decode(&generated, true)?;
@@ -9415,7 +9462,7 @@ impl Gemma4Runtime {
     /// into the next round. Emits exactly the greedy token stream; drafts only change how
     /// many tokens fall out of a single weight read.
     #[allow(clippy::needless_range_loop)]
-    fn spec_decode_generate(
+    pub fn spec_decode_generate(
         &self,
         kc: &mut [Vec<Vec<f32>>],
         vc: &mut [Vec<Vec<f32>>],
@@ -9431,8 +9478,16 @@ impl Gemma4Runtime {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(DEFAULT_NGRAM_DRAFT_TOKENS)
-            .max(1);
-        let drafter = NGramDrafter::default();
+            .clamp(1, 7);
+        let min_ngram = std::env::var("CAMELID_GEMMA4_SPEC_MIN_MATCH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1);
+        let max_ngram = std::env::var("CAMELID_GEMMA4_SPEC_MAX_MATCH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(5);
+        let drafter = NGramDrafter::new(min_ngram, max_ngram);
         let argmax = |l: &[f32]| -> u32 {
             l.iter()
                 .enumerate()
@@ -9458,6 +9513,19 @@ impl Gemma4Runtime {
             }
             let budget = max_new - generated.len();
             let drafts = drafter.draft(&history, max_draft.min(budget));
+            if drafts.is_empty() {
+                if spec_timing {
+                    eprintln!("[spec-debug] round pos={pos} chunk_len=1 (fast K=1 step)");
+                }
+                logits = self.step(t0, pos, kc, vc)?;
+                pos += 1;
+                accepted_rounds += 1;
+                crate::metal::SPEC_VERIFY_ROUNDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::metal::SPEC_ACCEPTED_TOKENS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            }
+
             // Verify [t0, d1..dm] at positions pos..pos+m in one weight pass: rows[i]
             // predicts position pos+i+1.
             let mut chunk = Vec::with_capacity(1 + drafts.len());
@@ -9470,25 +9538,6 @@ impl Gemma4Runtime {
                     kc.first().map(|k| k.len()).unwrap_or(0),
                     drafts
                 );
-            }
-
-            #[cfg(target_os = "macos")]
-            if let Some(cache) = self.ghost_moe_cache.as_ref() {
-                if let Ok(predicted_routes) = self.predict_all_layer_routes_for_chunk(&chunk) {
-                    if let Ok(mut guard) = self.metal_q4_experts.lock() {
-                        if let Some(lane) = guard.as_mut() {
-                            lane.prefetch_round_wide_async(
-                                &predicted_routes,
-                                &cache.file,
-                                &cache.read_pool,
-                            );
-                        }
-                    }
-                } else if let Ok(mut guard) = self.metal_q4_experts.lock() {
-                    if let Some(lane) = guard.as_mut() {
-                        lane.prefetch_temporal_last_round(&cache.file, &cache.read_pool);
-                    }
-                }
             }
 
             let rows = self.step_chunk(&chunk, pos, kc, vc)?;
@@ -10220,7 +10269,6 @@ impl Gemma4GpuRuntime {
                 BackendError::UnsupportedModelArchitecture(
                     "verify_batch_fused_argmax_slab failed".into(),
                 )
-                .into()
             })
     }
 

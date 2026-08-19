@@ -13460,7 +13460,7 @@ impl Gemma4Q4ExpertMetal {
         if command_buffer.status() != metal::MTLCommandBufferStatus::Completed {
             return None;
         }
-        let (gpu_us, kernel_us) = command_buffer_gpu_times_us(&command_buffer.to_owned());
+        let (gpu_us, kernel_us) = command_buffer_gpu_times_us(command_buffer);
         read_buffer_f32(&self.output, output);
         let diagnostics = Gemma4Q4ExpertDiagnostics {
             wall_us: started.elapsed().as_micros(),
@@ -13529,8 +13529,8 @@ impl Gemma4Q4ExpertMetal {
         if down_command.status() != metal::MTLCommandBufferStatus::Completed {
             return None;
         }
-        let (gate_gpu_us, gate_kernel_us) = command_buffer_gpu_times_us(&gate_command.to_owned());
-        let (down_gpu_us, down_kernel_us) = command_buffer_gpu_times_us(&down_command.to_owned());
+        let (gate_gpu_us, gate_kernel_us) = command_buffer_gpu_times_us(gate_command);
+        let (down_gpu_us, down_kernel_us) = command_buffer_gpu_times_us(down_command);
         read_buffer_f32(&self.output, output);
         let diagnostics = Gemma4Q4ExpertDiagnostics {
             wall_us: started.elapsed().as_micros(),
@@ -13601,8 +13601,8 @@ impl Gemma4Q4ExpertMetal {
         if down_command.status() != metal::MTLCommandBufferStatus::Completed {
             return None;
         }
-        let (gate_gpu_us, gate_kernel_us) = command_buffer_gpu_times_us(&gate_command.to_owned());
-        let (down_gpu_us, down_kernel_us) = command_buffer_gpu_times_us(&down_command.to_owned());
+        let (gate_gpu_us, gate_kernel_us) = command_buffer_gpu_times_us(gate_command);
+        let (down_gpu_us, down_kernel_us) = command_buffer_gpu_times_us(down_command);
         common.promote_tail_output();
         let diagnostics = Gemma4Q4ExpertDiagnostics {
             wall_us: started.elapsed().as_micros(),
@@ -14162,7 +14162,7 @@ impl Gemma4MultiExpertLayerBatch {
             return None;
         }
 
-        let (gpu_busy_us, _) = command_buffer_gpu_times_us(&command_buffer.to_owned());
+        let (gpu_busy_us, _) = command_buffer_gpu_times_us(command_buffer);
 
         let t_readout_start = std::time::Instant::now();
         if fused_residuals.is_none() {
@@ -14337,7 +14337,7 @@ fn encode_q6k_ordered_single(
     weight: &Buffer,
     weight_offset: u64,
     output: &Buffer,
-    scalar: &Buffer,
+    _scalar: &Buffer,
     n_superblocks: usize,
     rows: usize,
     input_scales_offset: u64,
@@ -14425,7 +14425,7 @@ fn encode_q6k_ordered_batch(
     }
     if k_batch <= 8 {
         let specialized_k8 = (k_batch == 8)
-            .then(|| kernel.q6k_linear_turbo_batch_k8_pipeline.as_ref())
+            .then_some(kernel.q6k_linear_turbo_batch_k8_pipeline.as_ref())
             .flatten();
         let is_specialized_k8 = specialized_k8.is_some();
         let turbo_batch_pipeline = (!std::env::var("CAMELID_GEMMA4_GHOST_METAL_TURBO")
@@ -15259,7 +15259,7 @@ impl Gemma4Q6KHead {
         if std::env::var("CAMELID_GEMMA4_METAL_HEAD_TIMING")
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         {
-            let (gpu_us, kernel_us) = command_buffer_gpu_times_us(&cb.to_owned());
+            let (gpu_us, kernel_us) = command_buffer_gpu_times_us(cb);
             eprintln!(
                 "[gemma4-metal-head] Q6_K vocab={} wall={}us gpu={}us kernel={}us",
                 state.vocab,
@@ -15345,7 +15345,7 @@ impl Gemma4Q6KHead {
             return None;
         }
         let after_gpu = t_all.elapsed().as_micros();
-        let (gpu_us, kernel_us) = command_buffer_gpu_times_us(&cb.to_owned());
+        let (gpu_us, kernel_us) = command_buffer_gpu_times_us(cb);
 
         let logits_ptr = state.logits_batch.contents() as usize;
         let mut results: Vec<Vec<f32>> = (0..k)
@@ -16084,7 +16084,7 @@ pub fn try_gemma4_forward(
         .iter()
         .find_map(|p| p.as_ref().map(|p| p.post_norm.len()))
         .unwrap_or(64);
-    let scratch = Gemma4ResidentScratch::new(
+    let _scratch = Gemma4ResidentScratch::new(
         k,
         hidden,
         max_q_dim,
@@ -16222,7 +16222,7 @@ pub fn try_gemma4_layer(
     write_buffer_f32(&in_buf, h_in);
     write_buffer_f32(&cache_k, cache_k_init);
     write_buffer_f32(&cache_v, cache_v_init);
-    let scratch = Gemma4ResidentScratch::new(
+    let _scratch = Gemma4ResidentScratch::new(
         k,
         hidden,
         layer.n_heads * layer.head_dim,
@@ -18506,7 +18506,14 @@ fn encode_gemma4_q8_matmul(
     scalar: &Buffer,
     rows: usize,
 ) {
-    e.set_compute_pipeline_state(&k.q8_0_block_ksplit_f32y_wire_pipeline);
+    let nsg8 = wire_nsg8_enabled();
+    let pipeline = if nsg8 {
+        &k.q8_0_block_ksplit_f32y_wire_nsg8_pipeline
+    } else {
+        &k.q8_0_block_ksplit_f32y_wire_pipeline
+    };
+    let threads_per_tg = if nsg8 { 256 } else { 128 };
+    e.set_compute_pipeline_state(pipeline);
     e.set_buffer(0, Some(y), 0);
     e.set_buffer(2, Some(weight), 0);
     e.set_buffer(3, Some(out), 0);
@@ -18520,7 +18527,7 @@ fn encode_gemma4_q8_matmul(
             depth: 1,
         },
         metal::MTLSize {
-            width: 256,
+            width: threads_per_tg,
             height: 1,
             depth: 1,
         },
@@ -22586,7 +22593,7 @@ impl Gemma4GhostCommonMetal {
         num_slots: usize,
         num_resident_slots: usize,
         k_tokens: usize,
-        down_dest: &Buffer,
+        _down_dest: &Buffer,
         slab_byte_offset: u64,
         logits_byte_offset: u64,
         overflow_slab: Option<&Buffer>,
@@ -23672,7 +23679,7 @@ impl Gemma4GhostCommonMetal {
             } else if let Some(filler) = slot_filler.as_mut() {
                 ledger.encode_ms += encode_clock.elapsed().as_secs_f64() * 1000.0;
                 encoder.end_encoding();
-                stamp.push_current(&cmd_buf);
+                stamp.push_current(cmd_buf);
                 cmd_buf.commit();
 
                 // Overlap predicted wave-0 copies with this layer's attn+router GPU.
@@ -23707,7 +23714,7 @@ impl Gemma4GhostCommonMetal {
                 let wait_t = std::time::Instant::now();
                 cmd_buf.wait_until_completed();
                 ledger.slot_wait_ms += wait_t.elapsed().as_secs_f64() * 1000.0;
-                let (gpu_us, _) = command_buffer_gpu_times_us(&cmd_buf.to_owned());
+                let (gpu_us, _) = command_buffer_gpu_times_us(cmd_buf);
                 ledger.gpu_busy_ms += gpu_us as f64 / 1000.0;
                 if std::env::var("CAMELID_GEMMA4_GHOST_METAL_TIMING")
                     .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -23810,7 +23817,7 @@ impl Gemma4GhostCommonMetal {
                                 .fold(f32::NEG_INFINITY, f32::max);
                             for p in 0..=start_pos {
                                 let hp = host_prob[p] / den;
-                                let gp = if gpu_max > 0.0 {
+                                let _gp = if gpu_max > 0.0 {
                                     scores[sb + p] / gpu_max
                                 } else {
                                     0.0
@@ -24106,13 +24113,13 @@ impl Gemma4GhostCommonMetal {
                         if wi + 1 < waves.len() {
                             ledger.encode_ms += encode_clock.elapsed().as_secs_f64() * 1000.0;
                             encoder.end_encoding();
-                            stamp.push_current(&cmd_buf);
+                            stamp.push_current(cmd_buf);
                             cmd_buf.commit();
                             // Same ping slab: GPU must finish wave N before CPU overwrites it.
                             let t_wave_gpu = std::time::Instant::now();
                             cmd_buf.wait_until_completed();
                             ledger.wave_gpu_ms += t_wave_gpu.elapsed().as_secs_f64() * 1000.0;
-                            let (gpu_us, _) = command_buffer_gpu_times_us(&cmd_buf.to_owned());
+                            let (gpu_us, _) = command_buffer_gpu_times_us(cmd_buf);
                             ledger.gpu_busy_ms += gpu_us as f64 / 1000.0;
                             if cmd_buf.status() != metal::MTLCommandBufferStatus::Completed {
                                 eprintln!(
@@ -24274,10 +24281,10 @@ impl Gemma4GhostCommonMetal {
                         );
                     }
 
-                    let slabb0_l2 = slabb0.iter().map(|v| v * v).sum::<f32>().sqrt();
-                    let dn0_l2 = dn0.iter().map(|v| v * v).sum::<f32>().sqrt();
+                    let _slabb0_l2 = slabb0.iter().map(|v| v * v).sum::<f32>().sqrt();
+                    let _dn0_l2 = dn0.iter().map(|v| v * v).sum::<f32>().sqrt();
                     let moe0_l2 = moe0.iter().map(|v| v * v).sum::<f32>().sqrt();
-                    let router0_l2 = router0.iter().map(|v| v * v).sum::<f32>().sqrt();
+                    let _router0_l2 = router0.iter().map(|v| v * v).sum::<f32>().sqrt();
 
                     let num_unique = work0.iter().filter(|w| w.candidate_mask != 0).count();
 
@@ -25696,7 +25703,7 @@ fn encode_attention_split3(
     denom: &Buffer,
     out: &Buffer,
     scalar: &Buffer,
-    blocks: &Buffer,
+    _blocks: &Buffer,
     n_heads: usize,
     head_dim: usize,
     position_count: usize,
@@ -35397,7 +35404,7 @@ impl ResidentDecodeState {
                 // "the kernels are slow" from "the CPU cannot feed the GPU". Tier A's
                 // whole claim is about the former, so the phase record needs the split.
                 let wall_us = commit_started.elapsed().as_micros();
-                let (gpu_busy_us, kernel_window_us) = command_buffer_gpu_times_us(&cb.to_owned());
+                let (gpu_busy_us, kernel_window_us) = command_buffer_gpu_times_us(cb);
                 eprintln!(
                     "[batch-prefill] base={base} rows={k} gemm={} attn={} \
                      encode={encode_us}us commit_wait={wall_us}us gpu_busy={gpu_busy_us}us \
@@ -39520,7 +39527,7 @@ mod tests {
                         e.end_encoding();
                         cb.commit();
                         cb.wait_until_completed();
-                        let (busy_us, _) = command_buffer_gpu_times_us(&cb.to_owned());
+                        let (busy_us, _) = command_buffer_gpu_times_us(cb);
                         println!(
                         "attn probe {label} pos={positions} splits={n_splits}: round {round}: {:.2} ms/token, {:.1} GB/s",
                         busy_us as f64 / 1000.0,
@@ -41539,14 +41546,14 @@ mod tests {
         assert_eq!(common.next_position, vec![POSITIONS]);
         assert_eq!(common.latest_attention_layer, None);
 
+        let stride = common.kv_stride();
         let assert_layout = |buffer: &Buffer, rows: &[Vec<f32>]| unsafe {
             let actual = buffer.contents().cast::<f32>();
             for head in 0..KV_HEADS {
                 for (position, row) in rows.iter().enumerate().take(POSITIONS) {
                     for dim in 0..HEAD_DIM {
                         let source = row[head * HEAD_DIM + dim];
-                        let destination =
-                            *actual.add((head * CAPACITY + position) * HEAD_DIM + dim);
+                        let destination = *actual.add((head * stride + position) * HEAD_DIM + dim);
                         assert_eq!(
                             destination.to_bits(),
                             source.to_bits(),
@@ -41563,7 +41570,7 @@ mod tests {
         // sequential-position watermark established by the successful import.
         let snapshot = |buffer: &Buffer| unsafe {
             let source = buffer.contents().cast::<f32>();
-            (0..KV_HEADS * CAPACITY * HEAD_DIM)
+            (0..KV_HEADS * stride * HEAD_DIM)
                 .map(|index| (*source.add(index)).to_bits())
                 .collect::<Vec<_>>()
         };
@@ -41699,7 +41706,7 @@ mod tests {
         assert_eq!(geometry.layers, 1);
         assert_eq!(geometry.local_layers, 1);
         assert_eq!(geometry.global_layers, 0);
-        assert_eq!(geometry.kv_bytes, 2 * HEAD_DIM * 2 * 4);
+        assert_eq!(geometry.kv_bytes, common.kv_stride() * HEAD_DIM * 2 * 4);
         let (actual, diagnostics) = common
             .execute_attention(0, &h, &cos_t, &sin_t, 0)
             .expect("persistent ordered-Q4 attention");
@@ -52023,7 +52030,7 @@ kernel void mma_probe(
             e.end_encoding();
             cb.commit();
             cb.wait_until_completed();
-            let (busy_us, _) = command_buffer_gpu_times_us(&cb.to_owned());
+            let (busy_us, _) = command_buffer_gpu_times_us(cb);
             // 4 simdgroups/tg x 8 mma/iter x 1024 flop/mma
             let flops = tgs as f64 * 4.0 * iters as f64 * 32.0 * 1024.0;
             eprintln!(
@@ -52173,7 +52180,7 @@ mod gemm_probe {
             e.end_encoding();
             cb.commit();
             cb.wait_until_completed();
-            let (busy_us, _) = command_buffer_gpu_times_us(&cb.to_owned());
+            let (busy_us, _) = command_buffer_gpu_times_us(cb);
             let tiles = (n_tokens as f64 / 64.0).ceil();
             eprintln!(
                 "[gemm-probe] round {round}: {busy_us}us  weights {:.1} GB/s (x{tiles} tiles: {:.1} GB/s streamed)  {:.2} TFLOPS",
@@ -52409,7 +52416,7 @@ kernel void kernel_mul_mm_q8_0_f32(
             e.end_encoding();
             cb.commit();
             cb.wait_until_completed();
-            let (busy_us, _) = command_buffer_gpu_times_us(&cb.to_owned());
+            let (busy_us, _) = command_buffer_gpu_times_us(cb);
             let tiles = (n_tokens as f64 / 32.0).ceil();
             eprintln!(
                 "[ggml-mm-probe] round {round}: {busy_us}us  weights x{tiles} tiles: {:.1} GB/s streamed  {:.2} TFLOPS",
@@ -52590,7 +52597,7 @@ kernel void half_mm_batched(
                 e.end_encoding();
                 cb.commit();
                 cb.wait_until_completed();
-                let (busy_us, _) = command_buffer_gpu_times_us(&cb.to_owned());
+                let (busy_us, _) = command_buffer_gpu_times_us(cb);
                 let flops = 2.0 * heads as f64 * rows as f64 * cols as f64 * kdim as f64;
                 eprintln!(
                     "[attn-mm] {label} round {round}: {busy_us}us  {:.2} TFLOPS",
@@ -53378,7 +53385,7 @@ kernel void steel_q8_mm(
                 e.end_encoding();
                 cb.commit();
                 cb.wait_until_completed();
-                let (busy_us, _) = command_buffer_gpu_times_us(&cb.to_owned());
+                let (busy_us, _) = command_buffer_gpu_times_us(cb);
                 let flops = 2.0 * rows as f64 * k as f64 * m as f64;
                 eprintln!(
                     "[steel-probe] {label} round {round}: {busy_us}us  {:.2} TFLOPS",
@@ -53659,7 +53666,7 @@ kernel void steel_q8_mm_dual(
             e.end_encoding();
             cb.commit();
             cb.wait_until_completed();
-            let (busy_us, _) = command_buffer_gpu_times_us(&cb.to_owned());
+            let (busy_us, _) = command_buffer_gpu_times_us(cb);
             // flops for BOTH matmuls
             let flops = 2.0 * 2.0 * rows as f64 * k as f64 * m as f64;
             eprintln!(

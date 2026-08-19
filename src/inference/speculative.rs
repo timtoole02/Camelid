@@ -265,7 +265,20 @@ impl NGramDrafter {
         }
         let mut index = self.index.borrow_mut();
         index.sync(history);
-        index.draft(max_tokens)
+        if std::env::var("CAMELID_GEMMA4_SPEC_MULTIHOP").is_ok_and(|v| v == "1") {
+            index.draft_multihop(max_tokens)
+        } else {
+            index.draft(max_tokens)
+        }
+    }
+
+    pub fn draft_multihop(&self, history: &[u32], max_tokens: usize) -> Vec<u32> {
+        if max_tokens == 0 || self.min_ngram == 0 || history.len() <= self.min_ngram {
+            return Vec::new();
+        }
+        let mut index = self.index.borrow_mut();
+        index.sync(history);
+        index.draft_multihop(max_tokens)
     }
 
     pub fn index_stats(&self) -> NGramIndexStats {
@@ -340,10 +353,12 @@ impl BoundedNGramIndex {
 
     fn draft(&self, max_tokens: usize) -> Vec<u32> {
         let len = self.history.len();
+        if len == 0 || max_tokens == 0 || len <= self.min_ngram {
+            return Vec::new();
+        }
         let max_n = self.max_ngram.min(len.saturating_sub(1));
         for n in (self.min_ngram..=max_n).rev() {
-            let suffix_start = len - n;
-            let pattern = &self.history[suffix_start..];
+            let pattern = &self.history[len - n..];
             let key = NGramKey {
                 len: n,
                 hash: hash_ngram(pattern),
@@ -352,20 +367,79 @@ impl BoundedNGramIndex {
                 continue;
             };
             for &start in starts.iter().rev() {
-                // Exclude the suffix itself and token-verify every hash hit.
-                // A collision can cost lookup work, never change a draft.
-                if start >= suffix_start
-                    || &self.history[start..start + n] != pattern
-                    || start + n >= len
-                {
+                if start >= len - n {
+                    continue;
+                }
+                if &self.history[start..start + n] != pattern {
                     continue;
                 }
                 let continuation_start = start + n;
                 let continuation_end = (continuation_start + max_tokens).min(len);
-                return self.history[continuation_start..continuation_end].to_vec();
+                if continuation_start < continuation_end {
+                    return self.history[continuation_start..continuation_end].to_vec();
+                }
+                break;
             }
         }
         Vec::new()
+    }
+
+    fn draft_multihop(&self, max_tokens: usize) -> Vec<u32> {
+        let len = self.history.len();
+        if len == 0 || max_tokens == 0 || len <= self.min_ngram {
+            return Vec::new();
+        }
+
+        let mut drafted = Vec::with_capacity(max_tokens);
+        let mut simulated_history = self.history.clone();
+
+        while drafted.len() < max_tokens {
+            let cur_len = simulated_history.len();
+            let max_n = self.max_ngram.min(cur_len.saturating_sub(1));
+            let mut found_next = false;
+
+            for n in (self.min_ngram..=max_n).rev() {
+                let pattern = &simulated_history[cur_len - n..];
+                let key = NGramKey {
+                    len: n,
+                    hash: hash_ngram(pattern),
+                };
+                let Some(starts) = self.occurrences.get(&key) else {
+                    continue;
+                };
+
+                for &start in starts.iter().rev() {
+                    if start + n >= len {
+                        continue;
+                    }
+                    if &self.history[start..start + n] != pattern {
+                        continue;
+                    }
+
+                    let remaining = max_tokens - drafted.len();
+                    let cont_start = start + n;
+                    let cont_end = (cont_start + remaining).min(len);
+                    if cont_start < cont_end {
+                        for &tok in &self.history[cont_start..cont_end] {
+                            drafted.push(tok);
+                            simulated_history.push(tok);
+                        }
+                        found_next = true;
+                    }
+                    break;
+                }
+
+                if found_next {
+                    break;
+                }
+            }
+
+            if !found_next {
+                break;
+            }
+        }
+
+        drafted
     }
 
     fn stats(&self) -> NGramIndexStats {
@@ -681,6 +755,17 @@ impl SpecLatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multihop_draft_chains_across_disjoint_occurrences() {
+        let drafter = NGramDrafter::new(2, 3);
+        // Position 0..4: [3, 4, 5, 6] (len 4)
+        // Position 6..10: [1, 2, 3, 4] (end of history)
+        // Suffix is [3, 4], which matches at position 0, followed by [5, 6] (2 tokens).
+        // Then at position 2, [5, 6] is followed by nothing further in that phrase.
+        let history = vec![3, 4, 5, 6, 99, 99, 1, 2, 3, 4];
+        assert_eq!(drafter.draft_multihop(&history, 2), vec![5, 6]);
+    }
 
     #[test]
     fn ngram_drafts_continuation_of_most_recent_match() {
