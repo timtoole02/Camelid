@@ -744,6 +744,10 @@ fn cached_weight_contents_match(buffer: &Buffer, bytes: *const u8, len: usize) -
 static METAL_LINEAR_KERNEL: OnceLock<Option<MetalLinearKernel>> = OnceLock::new();
 #[cfg(target_os = "macos")]
 static METAL_LINEAR_CACHE: OnceLock<Mutex<MetalLinearCache>> = OnceLock::new();
+#[cfg(target_os = "macos")]
+mod spec50_head;
+#[cfg(target_os = "macos")]
+pub(crate) use spec50_head::*;
 
 #[cfg(target_os = "macos")]
 const LINEAR_ROW_SHADER: &str = r#"
