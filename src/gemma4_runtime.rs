@@ -2638,15 +2638,21 @@ impl GhostMetalExpertRuntime {
         // (the chained lane never appends the host K/V caches). So predict
         // only on an exact repeat, and retry unpredicted on a refusal.
         let chunk_sig = chained_round_signature(start_pos, hidden_rows);
-        let allow_predicted = !self.suppress_prediction
-            && k_tokens > 1
-            && self.last_chained_k == Some(k_tokens)
-            && self.last_chained_sig == Some(chunk_sig);
-        let predicted_unions = if self.prefill_round {
-            vec![Vec::new(); self.latest_routed_experts.len()]
-        } else {
-            self.latest_routed_experts.clone()
-        };
+        let allow_predicted = !self.suppress_prediction && k_tokens > 1;
+        let predicted_unions: Vec<Vec<usize>> = self
+            .layers
+            .iter()
+            .take(30)
+            .map(|l| {
+                let mut experts = Vec::new();
+                for e in 0..128 {
+                    if l.directory.resident_slot_table[e] >= 0 {
+                        experts.push(e);
+                    }
+                }
+                experts
+            })
+            .collect();
         let overflow_slot_count = self.overflow_slot_count();
         let copies = self.overflow_bank.len().max(1);
         let pong_slab_buf = self.overflow_bank[0].slab_buffer().clone();
@@ -2829,6 +2835,12 @@ impl GhostMetalExpertRuntime {
         let expert_slab_refs: Vec<&metal::Buffer> = expert_slabs.iter().collect();
         let wave1_refs: Vec<&metal::Buffer> = wave1_gpu.iter().collect();
         let slot_mapping_slices: Vec<&[u32; 128]> = slot_mappings.iter().collect();
+        let empty_unions = vec![Vec::new(); n_layers];
+        let gpu_unions = if allow_predicted {
+            &predicted_unions
+        } else {
+            &empty_unions
+        };
         let ok = {
             let Some(common) = self.common.as_mut() else {
                 return false;
@@ -2845,7 +2857,7 @@ impl GhostMetalExpertRuntime {
                 out_rows,
                 slot_filler_fn,
                 Some(&pong_slab_for_gpu),
-                &predicted_unions,
+                gpu_unions,
                 fill_pong_fn,
                 &wave1_refs,
             )
@@ -6043,6 +6055,85 @@ impl Gemma4Runtime {
         let mut prof = Gemma4ChunkRoundProfile::default();
         let logits = self.step_chunk_with_head(tokens, start_pos, kc, vc, true, Some(&mut prof))?;
         Ok((logits, prof))
+    }
+
+    /// Speculative verification step: evaluates `tokens` chunk in one chained pass,
+    /// performs in-place argmax on the GPU tied head output against `drafts`,
+    /// and returns `(accepted_draft_count, next_step_logits)`.
+    pub fn step_chunk_speculative(
+        &self,
+        tokens: &[u32],
+        drafts: &[u32],
+        start_pos: usize,
+        kc: &mut [Vec<Vec<f32>>],
+        vc: &mut [Vec<Vec<f32>>],
+    ) -> Result<(usize, Vec<f32>)> {
+        #[cfg(target_os = "macos")]
+        if ghost_metal_acceleration_enabled() && self.supports_chunk_forward() {
+            if let Some(head) = self.metal_q6k_head.as_ref() {
+                let kk = tokens.len();
+                let hidden = self.config.embedding_length as usize;
+
+                let mut hs: Vec<Vec<f32>> = Vec::with_capacity(kk);
+                for &token in tokens {
+                    let h0: Vec<f32> = self
+                        .token_embd
+                        .dequantize_elements(token as usize * hidden, hidden)?
+                        .iter()
+                        .map(|v| v * (hidden as f32).sqrt())
+                        .collect();
+                    hs.push(h0);
+                }
+
+                let mut hs_buf: Vec<Vec<f32>> = (0..kk).map(|_| vec![0.0f32; hidden]).collect();
+                let mut gpu_chained_round_ok = false;
+
+                let theta_local = (0..self.layers.len())
+                    .find(|&l| self.g.is_sliding_layer(l))
+                    .map(|l| self.g.rope_freq_base_at(l))
+                    .unwrap_or(10000.0);
+                let theta_global = (0..self.layers.len())
+                    .find(|&l| !self.g.is_sliding_layer(l))
+                    .map(|l| self.g.rope_freq_base_at(l))
+                    .unwrap_or(theta_local);
+                let rope_factors = self.rope_factors.as_deref();
+                let ghost_cache = self.ghost_moe_cache.as_deref();
+                if let Ok(mut guard) = self.metal_q4_experts.lock() {
+                    if let Some(lane) = guard.as_mut() {
+                        lane.prefill_round = false;
+                        gpu_chained_round_ok = lane.execute_chained_round_all_layers(
+                            &hs,
+                            theta_local,
+                            theta_global,
+                            rope_factors,
+                            start_pos,
+                            ghost_cache,
+                            &mut hs_buf,
+                        );
+                    }
+                }
+
+                if gpu_chained_round_ok {
+                    std::mem::swap(&mut hs, &mut hs_buf);
+                    if let Some((j, logits)) = head.forward_batch_speculative(&hs, drafts) {
+                        return Ok((j, logits));
+                    }
+                }
+            }
+        }
+
+        let rows = self.step_chunk(tokens, start_pos, kc, vc)?;
+        let argmax = |l: &[f32]| -> u32 {
+            l.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(i, _)| i as u32)
+                .unwrap()
+        };
+        let preds: Vec<u32> = (0..drafts.len()).map(|i| argmax(&rows[i])).collect();
+        let j = crate::inference::speculative::accepted_draft_prefix(drafts, &preds);
+        let next_logits = rows.into_iter().nth(j).expect("rows[j] exists");
+        Ok((j, next_logits))
     }
 
     /// Shared chunk body. Prompt prefill requests only the final row's tied
@@ -9540,9 +9631,7 @@ impl Gemma4Runtime {
                 );
             }
 
-            let rows = self.step_chunk(&chunk, pos, kc, vc)?;
-            let preds: Vec<u32> = (0..drafts.len()).map(|i| argmax(&rows[i])).collect();
-            let j = accepted_draft_prefix(&drafts, &preds);
+            let (j, next_logits) = self.step_chunk_speculative(&chunk, &drafts, pos, kc, vc)?;
             accepted_rounds += 1;
             accepted_drafts += j as u64;
             crate::metal::SPEC_VERIFY_ROUNDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -9577,7 +9666,7 @@ impl Gemma4Runtime {
                 }
             }
             pos = keep;
-            logits = rows.into_iter().nth(j).expect("rows[j] exists");
+            logits = next_logits;
         }
         if spec_timing {
             let toks = generated.len().max(1) as f64;

@@ -15386,6 +15386,105 @@ impl Gemma4Q6KHead {
         Some(results)
     }
 
+    /// Batched speculative evaluation: runs Q6_K tied head for K rows,
+    /// performs in-place argmax on the mapped shared logits buffer to evaluate
+    /// against `drafts`, and copies ONLY row `j` (the accepted/divergent step) to CPU memory.
+    pub(crate) fn forward_batch_speculative(
+        &self,
+        hidden_rows: &[Vec<f32>],
+        drafts: &[u32],
+    ) -> Option<(usize, Vec<f32>)> {
+        let k = hidden_rows.len();
+        if k == 0 || k > 16 {
+            return None;
+        }
+        if k == 1 {
+            let logit = self.forward(&hidden_rows[0])?;
+            return Some((0, logit));
+        }
+        use rayon::prelude::*;
+        let state = self.inner.lock().ok()?;
+        let kernel = metal_linear_kernel()?;
+        let n_superblocks = state.hidden / 256;
+        let hidden = state.hidden;
+        let eps = state.eps;
+        let output_norm = &state.output_norm;
+        let scales_raw = state.q8k_scales_batch.contents() as usize;
+        let quants_raw = state.q8k_quants_batch.contents() as usize;
+
+        hidden_rows.par_iter().enumerate().for_each(|(i, h)| {
+            let normalized = crate::gemma4_runtime::rms_norm(h, Some(output_norm), eps);
+            let q8 = crate::inference::quantize_q8_k_blocks(&normalized);
+            let scales_offset = i * n_superblocks * std::mem::size_of::<f32>();
+            let quants_offset = i * hidden;
+            unsafe {
+                let s_dst = (scales_raw + scales_offset) as *mut f32;
+                for (sb, block) in q8.iter().enumerate() {
+                    *s_dst.add(sb) = block.d;
+                }
+                let q_dst = (quants_raw + quants_offset) as *mut i8;
+                for (sb, block) in q8.iter().enumerate() {
+                    std::ptr::copy_nonoverlapping(block.qs.as_ptr(), q_dst.add(sb * 256), 256);
+                }
+            }
+        });
+
+        let cb = kernel.queue.new_command_buffer();
+        let encoder = cb.new_compute_command_encoder();
+        let vocab = state.vocab;
+        encode_q6k_ordered_batch(
+            encoder,
+            kernel,
+            &state.q8k_scales_batch,
+            &state.q8k_quants_batch,
+            &state.weight,
+            state.weight_offset as u64,
+            &state.logits_batch,
+            &state.batch_matmul_scalar,
+            n_superblocks,
+            vocab,
+            k,
+            hidden,
+            state.softcap,
+        );
+        encoder.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        if cb.status() != metal::MTLCommandBufferStatus::Completed {
+            return None;
+        }
+
+        let logits_ptr = state.logits_batch.contents() as *const f32;
+        let mut accepted_j = drafts.len();
+        for (i, &draft_tok) in drafts.iter().enumerate() {
+            let row_ptr = unsafe { logits_ptr.add(i * vocab) };
+            let slice = unsafe { std::slice::from_raw_parts(row_ptr, vocab) };
+            let mut best_tok = 0u32;
+            let mut best_val = slice[0];
+            for (v_idx, &v) in slice.iter().enumerate() {
+                if v > best_val {
+                    best_val = v;
+                    best_tok = v_idx as u32;
+                }
+            }
+            if best_tok != draft_tok {
+                accepted_j = i;
+                break;
+            }
+        }
+
+        let mut next_logits = Vec::with_capacity(vocab);
+        unsafe {
+            next_logits.set_len(vocab);
+            std::ptr::copy_nonoverlapping(
+                logits_ptr.add(accepted_j * vocab),
+                next_logits.as_mut_ptr(),
+                vocab,
+            );
+        }
+        Some((accepted_j, next_logits))
+    }
+
     /// Direct GPU argmax reduction: runs Q6_K projection and argmax in a single
     /// command buffer and reads back only the 4-byte token ID.
     pub(crate) fn forward_argmax(&self, hidden: &[f32]) -> Option<u32> {
@@ -20996,6 +21095,16 @@ fn same_expert_set(a: &[usize], b: &[usize]) -> bool {
     left == right
 }
 
+fn expert_set_is_covered(actual: &[usize], covered: &[usize]) -> bool {
+    let mut keep = [false; 128];
+    for &e in covered {
+        if e < 128 {
+            keep[e] = true;
+        }
+    }
+    actual.iter().all(|&e| e < 128 && keep[e])
+}
+
 fn mask_slot_table_to_wave(table: &mut [u32; 128], wave: &[usize]) {
     let mut keep = [false; 128];
     for &expert in wave {
@@ -22943,8 +23052,6 @@ impl Gemma4GhostCommonMetal {
 
         let n_layers = self.layers.len();
         let predicted_ready = slot_filler.is_some()
-            && fill_pong_wave.is_some()
-            && wave1_slabs.len() >= n_layers
             && predicted_unions.len() >= n_layers
             && predicted_unions
                 .iter()
@@ -22956,7 +23063,7 @@ impl Gemma4GhostCommonMetal {
 
         if predicted_ready {
             let filler = slot_filler.as_mut().expect("checked");
-            let fill_pong = fill_pong_wave.as_mut().expect("checked");
+            let mut fill_pong = fill_pong_wave.as_deref_mut();
             let t_pre = std::time::Instant::now();
             let overflow_cap = GEMMA4_OVERFLOW_BANK_SLOTS;
             for layer_idx in 0..self.layers.len() {
@@ -23007,7 +23114,9 @@ impl Gemma4GhostCommonMetal {
                 }
                 if !w1.is_empty() {
                     let mut pong_table = [0xFFFFFFFFu32; 128];
-                    fill_pong(layer_idx, w1.as_slice(), &mut pong_table);
+                    if let Some(f) = fill_pong.as_deref_mut() {
+                        f(layer_idx, w1.as_slice(), &mut pong_table);
+                    }
                     mask_slot_table_to_wave(&mut pong_table, &w1);
                     let pong_slots = w1.len().max(1);
                     if let Some(expert) = wave_slots_ready(&pong_table, &w1, pong_slots) {
@@ -23636,7 +23745,7 @@ impl Gemma4GhostCommonMetal {
                     }
                 }
                 let w1 = &predicted_w1[layer_idx];
-                let overflow_buf = if !w1.is_empty() {
+                let overflow_buf = if !w1.is_empty() && layer_idx < wave1_slabs.len() {
                     Some(wave1_slabs[layer_idx])
                 } else {
                     None
@@ -24599,13 +24708,13 @@ impl Gemma4GhostCommonMetal {
                     )
                 };
                 let actual = union_from_router_logits(slice, k_tokens);
-                if !same_expert_set(&actual, &predicted_unions[layer_idx]) {
+                if !expert_set_is_covered(&actual, &predicted_unions[layer_idx]) {
                     let mut a = actual.clone();
                     let mut b = predicted_unions[layer_idx].clone();
                     a.sort_unstable();
                     b.sort_unstable();
                     eprintln!(
-                        "[metal chained round] predicted union miss at layer {layer_idx} (predicted {} experts, actual {}); pred={b:?} actual={a:?}; refusing rather than fail-close",
+                        "[metal chained round] resident union miss at layer {layer_idx} (resident {} experts, actual {}); resident={b:?} actual={a:?}; refusing rather than fail-close",
                         predicted_unions[layer_idx].len(),
                         actual.len()
                     );

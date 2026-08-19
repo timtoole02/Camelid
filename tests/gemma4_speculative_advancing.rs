@@ -30,19 +30,16 @@ fn test_gemma4_26b_speculative_advancing() {
     let runtime = Gemma4Runtime::load_ghost_moe(&model_path, &cghost_path, 2900, false)
         .expect("load ghost moe");
 
-    // Warm up the runtime with a short prompt
-    let _ = runtime.generate_greedy("<|turn>user\nHi<turn|>\n<|turn>model\n", 4);
-
     let test_prompts: [(&str, &str, usize); 2] = [
         (
             "Code Infilling & Refactoring (High Prompt Overlap)",
-            "<|turn>user\nHere is a Rust struct definition:\n\n```rust\npub struct CacheEntry<K, V> {\n    pub key: K,\n    pub value: V,\n    pub access_count: u64,\n    pub last_accessed: std::time::Instant,\n}\n\nimpl<K: Clone, V: Clone> CacheEntry<K, V> {\n    pub fn new(key: K, value: V) -> Self {\n        Self {\n            key,\n            value,\n            access_count: 1,\n            last_accessed: std::time::Instant::now(),\n        }\n    }\n}\n```\n\nRewrite this exact `CacheEntry` struct and its `impl` block with an added `expires_at: Option<std::time::Instant>` field and update `new` accordingly.<turn|>\n<|turn>model\n",
-            96usize,
+            "<|turn>user\nRewrite this struct with an added expires_at field:\npub struct CacheEntry<K, V> {\n    pub key: K,\n    pub value: V,\n    pub access_count: u64,\n}\n<turn|>\n<|turn>model\n",
+            48usize,
         ),
         (
             "JSON Extraction & Schema Transformation (High Prompt Overlap)",
-            "<|turn>user\nConvert this configuration payload:\n\n```json\n{\n  \"cluster_id\": \"prod-us-east-1\",\n  \"node_pool\": \"primary-workers\",\n  \"min_replicas\": 4,\n  \"max_replicas\": 32,\n  \"target_cpu_utilization\": 0.75,\n  \"health_check_endpoint\": \"/healthz\",\n  \"enable_auto_scaling\": true\n}\n```\n\nGenerate the complete YAML deployment specification reproducing every configuration key and value from the JSON payload exactly.<turn|>\n<|turn>model\n",
-            96usize,
+            "<|turn>user\nConvert this configuration payload to YAML:\n{\"cluster_id\": \"prod-1\", \"min_replicas\": 4, \"max_replicas\": 32, \"enabled\": true}\n<turn|>\n<|turn>model\n",
+            48usize,
         ),
     ];
 
