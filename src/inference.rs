@@ -3160,7 +3160,7 @@ impl LlamaInferenceSession {
             return Ok(false);
         }
         if self.resident_paths_disabled
-            || token_ids.len() < 2
+            || token_ids.is_empty()
             || token_ids.len() > 16384
             || self.kv_cache.position != 0
             || self.weights.layer_range.is_some()
@@ -3314,20 +3314,21 @@ impl LlamaInferenceSession {
             return Ok(false);
         }
         slot.engine.set_filled(n);
-        // The GPU prefill only fills the GPU KV cache. Copy it back so the CPU-side
-        // KV cache is authoritative too: otherwise any later forward that takes the
-        // CPU path (dense diagnostics, a GPU-decode fallback, or a KV rollback) reads
-        // an all-zero history and generation degenerates. The copy is a few MB of
-        // device->host transfer ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â negligible next to the prefill compute it follows,
-        // and it keeps both backends in lockstep.
-        if let Err(e) =
-            self.copy_resident_cuda_kv_to_host(&slot.engine, n_layers, n, n_kv, head_dim)
-        {
-            if trace {
-                eprintln!("[resident-cuda] KV readback to host failed ({e}); using CPU prefill");
+        // The GPU prefill fills the GPU KV cache. Lazy recovery (recover_cpu_kv_from_cuda_resident)
+        // mirrors back to the CPU cache on-demand if a CPU fallback or prompt-prefix cache store occurs.
+        // If eager mirroring is explicitly requested via env, perform the sync copy now.
+        if std::env::var_os("CAMELID_CUDA_EAGER_KV_MIRROR").is_some() {
+            if let Err(e) =
+                self.copy_resident_cuda_kv_to_host(&slot.engine, n_layers, n, n_kv, head_dim)
+            {
+                if trace {
+                    eprintln!(
+                        "[resident-cuda] KV readback to host failed ({e}); using CPU prefill"
+                    );
+                }
+                slot.engine.set_filled(0);
+                return Ok(false);
             }
-            slot.engine.set_filled(0);
-            return Ok(false);
         }
         drop(guard);
         self.kv_cache.position = n;
@@ -3442,7 +3443,7 @@ impl LlamaInferenceSession {
             || slot.range != range
             || !slot.engine.weights_ready()
             || slot.engine.n_layers() != range.len()
-            || slot.engine.filled() != position
+            || slot.engine.filled() < position
         {
             return Ok(false);
         }
@@ -3535,7 +3536,7 @@ impl LlamaInferenceSession {
             || config.temperature <= 0.0
             || config.top_k.is_some()
             || config.top_p.is_some_and(|p| p < 1.0)
-            || config.min_p.is_some_and(|p| p > 0.0)
+            || (metal_sampling && config.min_p.is_some_and(|p| p > 0.0))
             || config.presence_penalty != 0.0
             || config.frequency_penalty != 0.0
             || config.repeat_penalty != 1.0
@@ -3561,7 +3562,12 @@ impl LlamaInferenceSession {
         } else {
             let seed =
                 base ^ 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(self.kv_cache.position as u64 + 1);
-            self.try_resident_decode_forward_cuda(&embedding, true, None, Some((inv_temp, seed)))?
+            self.try_resident_decode_forward_cuda(
+                &embedding,
+                true,
+                None,
+                Some((inv_temp, seed, config.min_p)),
+            )?
         };
         match forward {
             Some(ResidentForward::Sampled(id)) => {
@@ -3892,7 +3898,7 @@ impl LlamaInferenceSession {
         embedding: &CpuTensor,
         compute_logits: bool,
         gpu_sample_token: Option<u32>,
-        sample: Option<(f32, u64)>,
+        sample: Option<(f32, u64, Option<f32>)>,
     ) -> Result<Option<ResidentForward>> {
         if !self.resident_decode_eligible(compute_logits)? {
             return Ok(None);
@@ -4233,7 +4239,7 @@ impl LlamaInferenceSession {
                     return Ok(None);
                 }
             }
-        } else if let Some((inv_temp, seed)) = sample {
+        } else if let Some((inv_temp, seed, min_p)) = sample {
             match slot.engine.forward_token_sample(
                 embedding_data,
                 &tables.cos,
@@ -4241,6 +4247,7 @@ impl LlamaInferenceSession {
                 position,
                 scale,
                 inv_temp,
+                min_p,
                 seed,
             ) {
                 Ok(id) => ResidentForward::Sampled(id),
@@ -4306,7 +4313,7 @@ impl LlamaInferenceSession {
         embedding: &CpuTensor,
         compute_logits: bool,
         gpu_sample_token: Option<u32>,
-        sample: Option<(f32, u64)>,
+        sample: Option<(f32, u64, Option<f32>)>,
     ) -> Result<Option<ResidentForward>> {
         Ok(None)
     }
@@ -5377,7 +5384,7 @@ impl LlamaInferenceSession {
             });
         }
         let resident_prefill_started = Instant::now();
-        if prefill_count > 1 && self.try_resident_prefill(&token_ids[..prefill_count])? {
+        if prefill_count > 0 && self.try_resident_prefill(&token_ids[..prefill_count])? {
             // Whole prompt prefilled on the GPU in one command buffer; the last prompt
             // token below decodes through the resident session. The wall-clock covers
             // session setup + the command buffer; per-stage GPU splits aren't available.
@@ -13185,41 +13192,42 @@ fn build_resident_cuda_engine(
     gemma3: Option<&crate::model::Gemma3Metadata>,
 ) -> Option<crate::cuda_resident::CudaResidentDecode> {
     use crate::cuda_resident::ProjQuant;
-    // The resident upload byte source for a projection: CPU Q8_0 36-byte blocks,
-    // raw K-quant super-blocks, or native Prism Q1/Q2 packed blocks. These are the
+    // Raw quant bytes (un-repacked) for a projection tensor. The resident engine
+    // accepts either Q8_0 or one of the supported K-quant / low-bit encodings,
+    // which it reads directly from the tensor's backing memory. Returns the
     // bytes `set_layer_located`/`set_output` repack per lane.
-    fn raw(t: &CpuTensor) -> Option<&[u8]> {
-        if let Some(b) = t.q8_0_blocks.as_deref() {
-            return Some(q8_0_blocks_as_bytes(b));
+    fn raw(t: &CpuTensor) -> Option<std::borrow::Cow<'_, [u8]>> {
+        if let Some(bytes) = t.q8_0_raw_bytes() {
+            return Some(bytes);
         }
         if t.source_type == Some(GgufTensorType::Q4K) {
             if let Some(w) = t.q4_k_wire() {
-                return Some(w);
+                return Some(std::borrow::Cow::Borrowed(w));
             }
         }
         if t.source_type == Some(GgufTensorType::Q5K) {
             if let Some(w) = t.q5_k_wire_bytes.as_deref() {
-                return Some(w.as_slice());
+                return Some(std::borrow::Cow::Borrowed(w.as_slice()));
             }
         }
         if t.source_type == Some(GgufTensorType::Q6K) {
             if let Some(w) = t.q6_k_wire() {
-                return Some(w);
+                return Some(std::borrow::Cow::Borrowed(w));
             }
         }
         if t.source_type == Some(GgufTensorType::Q2K) {
             if let Some(w) = t.q2_k_wire_bytes.as_deref() {
-                return Some(w.as_slice());
+                return Some(std::borrow::Cow::Borrowed(w.as_slice()));
             }
         }
         if t.source_type == Some(GgufTensorType::Q3K) {
             if let Some(w) = t.q3_k_wire_bytes.as_deref() {
-                return Some(w.as_slice());
+                return Some(std::borrow::Cow::Borrowed(w.as_slice()));
             }
         }
         if t.source_type == Some(GgufTensorType::IQ4XS) {
             if let Some(w) = t.iq4_xs_wire_bytes.as_deref() {
-                return Some(w.as_slice());
+                return Some(std::borrow::Cow::Borrowed(w.as_slice()));
             }
         }
         if matches!(
@@ -13232,7 +13240,7 @@ fn build_resident_cuda_engine(
             )
         ) {
             if let Some(w) = t.low_bit_wire() {
-                return Some(w);
+                return Some(std::borrow::Cow::Borrowed(w));
             }
         }
         None
@@ -13559,13 +13567,13 @@ fn build_resident_cuda_engine(
         ];
         engine
             .set_layer_located(
-                q,
-                k,
-                v,
-                o,
-                gate,
-                up,
-                down,
+                &q,
+                &k,
+                &v,
+                &o,
+                &gate,
+                &up,
+                &down,
                 &l.attention_norm.data,
                 &l.ffn_norm.data,
                 l.attention_q_norm.as_ref().map(|t| t.data.as_slice()),
@@ -13650,10 +13658,11 @@ fn build_resident_cuda_engine(
     };
     eprintln!("{}", status.describe());
     crate::offload::set_offload_run_status(Some(status));
+    let output_raw = raw(weights.output_projection())?;
     engine
         .set_output(
             &weights.output_norm.data,
-            raw(weights.output_projection())?,
+            &output_raw,
             proj_quant(weights.output_projection()),
         )
         .ok()?;

@@ -1462,6 +1462,8 @@ fn select_x86_q8_plan(
         // blocks (the GPU resident engine cannot consume the CPU rows4 repack — the two
         // are mutually exclusive on weight storage). The CPU repack path only wins when
         // the CPU actually runs decode (no GPU, GPU toggled off, or deterministic mode).
+        env_updates.insert("CAMELID_X86_Q8_REPACK", Some("off"));
+        env_updates.insert("CAMELID_MAC_Q8_REPACK", Some("off"));
         reasons.push(
             "CUDA resident decode active; GPU-resident Q8_0 engine drives decode (weights stay plain RAM-resident Q8_0 blocks — the CPU rows4 repack is disabled while the GPU drives decode)"
                 .into(),

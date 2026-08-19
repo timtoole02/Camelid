@@ -3525,6 +3525,74 @@ fn gumbel_sampler_matches_stateless_reference() {
 
 #[test]
 #[ignore = "requires a CUDA device"]
+fn sample_gumbel_filtered_matches_min_p_threshold() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let n = 1000usize;
+    // Logits: linearly increasing so max logit is at index 999
+    let logits: Vec<f32> = (0..n).map(|i| i as f32 * 0.05).collect();
+    let max_logit = logits[n - 1];
+    let min_p = 0.1f32;
+    let threshold = max_logit + min_p.ln();
+    let dl = k.stream.clone_htod(&logits).unwrap();
+    let mut didx = k.stream.alloc_zeros::<u32>(1).unwrap();
+
+    let mut sampled = Vec::new();
+    for seed in 1u64..30 {
+        // Calculate CPU expected: argmax over all i where logits[i] >= threshold
+        let mut best_val = f32::NEG_INFINITY;
+        let mut expected = 0usize;
+        for (idx, &l) in logits.iter().enumerate() {
+            if l >= threshold {
+                let mut z =
+                    seed.wrapping_add(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(idx as u64 + 1));
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                let uniform = ((z >> 40) as u32 as f32 + 0.5f32) / 16777216.0f32;
+                let g = -(-uniform.ln()).ln();
+                let v = l * 1.0 + g;
+                if v > best_val {
+                    best_val = v;
+                    expected = idx;
+                }
+            }
+        }
+        super::launch_sample_gumbel_filtered(
+            &k.stream,
+            &k.sample_gumbel_filtered,
+            &dl,
+            n,
+            1.0,
+            min_p,
+            seed,
+            &mut didx,
+        )
+        .unwrap();
+        let mut got = [0u32; 1];
+        k.stream.memcpy_dtoh(&didx, &mut got).unwrap();
+        k.ctx.synchronize().unwrap();
+        assert!(
+            logits[got[0] as usize] >= threshold,
+            "Sampled token {} with logit {} below min_p threshold {}",
+            got[0],
+            logits[got[0] as usize],
+            threshold
+        );
+        assert_eq!(got[0] as usize, expected, "seed {seed}");
+        sampled.push(got[0]);
+    }
+    sampled.sort_unstable();
+    sampled.dedup();
+    assert!(
+        sampled.len() > 1,
+        "different seeds should draw diverse tokens among allowed min_p set"
+    );
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
 fn attention_decode_matches_cpu() {
     let Some(k) = kernels() else {
         return;
@@ -6779,4 +6847,130 @@ fn ssm_layer_chain_matches_cpu() {
         close(&got_cs, &exp_cs, 3e-3),
         "ssm chain conv_state diverged"
     );
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn flash_attention_prefill_tiled_parity() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let n_heads = 8usize;
+    let n_kv = 2usize;
+    let head_dim = 128usize;
+    let max_pos = 2048usize;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let sweeps = [
+        (0usize, 1usize),
+        (0, 8),
+        (0, 16),
+        (0, 32),
+        (64, 16),
+        (128, 32),
+        (512, 32),
+        (1024, 64),
+    ];
+
+    for &(base_position, k_tokens) in &sweeps {
+        let mut rng = Lcg(0xCA_FE_12_34 + (base_position as u64) + (k_tokens as u64));
+        let q: Vec<f32> = (0..k_tokens * n_heads * head_dim)
+            .map(|_| rng.next_f32() * 2.0 - 1.0)
+            .collect();
+        let total_kv_pos = base_position + k_tokens;
+        let mut cache_k_f32 = vec![0f32; n_kv * max_pos * head_dim];
+        let mut cache_v_f32 = vec![0f32; n_kv * max_pos * head_dim];
+        for x in cache_k_f32[..n_kv * total_kv_pos * head_dim].iter_mut() {
+            *x = rng.next_f32() * 2.0 - 1.0;
+        }
+        for x in cache_v_f32[..n_kv * total_kv_pos * head_dim].iter_mut() {
+            *x = rng.next_f32() * 2.0 - 1.0;
+        }
+
+        let cache_k_bits: Vec<u16> = cache_k_f32
+            .iter()
+            .map(|&x| crate::inference::f32_to_f16_bits(x))
+            .collect();
+        let cache_v_bits: Vec<u16> = cache_v_f32
+            .iter()
+            .map(|&x| crate::inference::f32_to_f16_bits(x))
+            .collect();
+
+        let dq = k.stream.clone_htod(&q).unwrap();
+        let dk = k.stream.clone_htod(&cache_k_bits).unwrap();
+        let dv = k.stream.clone_htod(&cache_v_bits).unwrap();
+        let mut dout = k
+            .stream
+            .alloc_zeros::<f32>(k_tokens * n_heads * head_dim)
+            .unwrap();
+
+        super::launch_attention_flash_prefill(
+            &k.stream,
+            &k,
+            &dq,
+            &dk,
+            &dv,
+            &mut dout,
+            n_heads,
+            n_kv,
+            head_dim,
+            base_position,
+            k_tokens,
+            n_heads * head_dim,
+            max_pos,
+            scale,
+        )
+        .unwrap();
+
+        let mut got = vec![0f32; k_tokens * n_heads * head_dim];
+        k.stream.memcpy_dtoh(&dout, &mut got).unwrap();
+        k.ctx.synchronize().unwrap();
+
+        // CPU reference causal attention
+        let mut expected = vec![0f32; k_tokens * n_heads * head_dim];
+        let repeats = n_heads / n_kv;
+        for t in 0..k_tokens {
+            let global_q_pos = base_position + t;
+            for h in 0..n_heads {
+                let kv_h = h / repeats;
+                let q_offset = (t * n_heads + h) * head_dim;
+                let q_slice = &q[q_offset..q_offset + head_dim];
+
+                // Compute scores
+                let mut scores = Vec::with_capacity(global_q_pos + 1);
+                for p in 0..=global_q_pos {
+                    let k_offset = (kv_h * max_pos + p) * head_dim;
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        let k_val = crate::inference::f16_bits_to_f32(cache_k_bits[k_offset + d]);
+                        dot += q_slice[d] * k_val;
+                    }
+                    scores.push(dot * scale);
+                }
+
+                // Softmax
+                let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let exp_scores: Vec<f32> = scores.iter().map(|&s| (s - max_s).exp()).collect();
+                let sum_exp: f32 = exp_scores.iter().sum();
+                let inv_sum = 1.0 / sum_exp;
+
+                // Weighted V
+                let out_offset = (t * n_heads + h) * head_dim;
+                for d in 0..head_dim {
+                    let mut acc = 0.0f32;
+                    for (p, &exp_score) in exp_scores.iter().enumerate().take(global_q_pos + 1) {
+                        let v_offset = (kv_h * max_pos + p) * head_dim;
+                        let v_val = crate::inference::f16_bits_to_f32(cache_v_bits[v_offset + d]);
+                        acc += exp_score * v_val;
+                    }
+                    expected[out_offset + d] = acc * inv_sum;
+                }
+            }
+        }
+
+        assert!(
+            close(&got, &expected, 1e-3),
+            "flash_attention_prefill_tiled diverged at base_position={base_position}, k_tokens={k_tokens}"
+        );
+    }
 }

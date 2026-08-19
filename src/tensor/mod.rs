@@ -112,6 +112,14 @@ pub struct Q8_0Block {
     pub quants: [i8; 32],
 }
 
+#[allow(dead_code)]
+pub(crate) fn q8_0_blocks_as_bytes(blocks: &[Q8_0Block]) -> &[u8] {
+    debug_assert_eq!(std::mem::size_of::<Q8_0Block>(), 36);
+    unsafe {
+        std::slice::from_raw_parts(blocks.as_ptr().cast::<u8>(), std::mem::size_of_val(blocks))
+    }
+}
+
 /// Cheap view into an immutable resident Q8_0 block allocation.
 ///
 /// MoE expert packs are much larger than ordinary linears. Expert selection
@@ -573,6 +581,43 @@ impl Q8_0PackedRows4 {
             vnni_packed: q8_0_pack_vnni16_if_enabled(rows, blocks_per_row, q8_0_bytes)?,
             blocks,
         })
+    }
+
+    #[allow(dead_code)]
+    pub fn to_q8_0_bytes(&self) -> Vec<u8> {
+        let block_len = self.interleave.block_len();
+        let chunks = Q8_0_BLOCK_VALUES / block_len;
+        let total_blocks = self.rows * self.blocks_per_row;
+        let mut q8_0_bytes = vec![0u8; total_blocks * Q8_0_BLOCK_BYTES];
+        let mut packed_idx = 0;
+        for row_group in (0..self.rows).step_by(4) {
+            for block_idx in 0..self.blocks_per_row {
+                let packed_blk = &self.blocks[packed_idx];
+                packed_idx += 1;
+                for (lane, &scale) in packed_blk.scales.iter().enumerate() {
+                    let target_block = (row_group + lane) * self.blocks_per_row + block_idx;
+                    let target_start = target_block * Q8_0_BLOCK_BYTES;
+                    let f16_bits = f32_to_f16_bits(scale);
+                    q8_0_bytes[target_start..target_start + 2]
+                        .copy_from_slice(&f16_bits.to_le_bytes());
+                }
+                for chunk in 0..chunks {
+                    for lane in 0..4 {
+                        let target_block = (row_group + lane) * self.blocks_per_row + block_idx;
+                        let target_start = target_block * Q8_0_BLOCK_BYTES + 2;
+                        let dst_start = target_start + chunk * block_len;
+                        let src_start = chunk * 4 * block_len + lane * block_len;
+                        for (dst, src) in q8_0_bytes[dst_start..dst_start + block_len]
+                            .iter_mut()
+                            .zip(&packed_blk.quants[src_start..src_start + block_len])
+                        {
+                            *dst = *src as u8;
+                        }
+                    }
+                }
+            }
+        }
+        q8_0_bytes
     }
 
     pub fn byte_len(&self) -> usize {
@@ -1925,6 +1970,25 @@ impl CpuTensor {
                 .as_ref()
                 .map(Q8_0SharedBlocks::as_slice)
         })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn q8_0_raw_bytes(&self) -> Option<std::borrow::Cow<'_, [u8]>> {
+        if let Some(blocks) = self.q8_0_block_slice() {
+            return Some(std::borrow::Cow::Borrowed(q8_0_blocks_as_bytes(blocks)));
+        }
+        if let Some(Q8_0RuntimeStorage::PackedRows4(packed)) = &self.q8_0_runtime_storage {
+            return Some(std::borrow::Cow::Owned(packed.to_q8_0_bytes()));
+        }
+        if let Some(wire) = &self.q8_0_wire_mmap {
+            if let Ok(b) = wire.bytes() {
+                return Some(std::borrow::Cow::Borrowed(b));
+            }
+        }
+        if let Some(wire) = &self.q8_0_wire_pages {
+            return Some(std::borrow::Cow::Borrowed(wire.bytes()));
+        }
+        None
     }
 
     pub fn with_q8_0_file_backing(mut self, backing: Q8_0FileBacking) -> Self {
