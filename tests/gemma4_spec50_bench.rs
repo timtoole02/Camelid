@@ -231,6 +231,13 @@ fn gemma4_spec50_bench() {
             let prefill_s = t0.elapsed().as_secs_f64();
             use std::sync::atomic::Ordering::Relaxed;
             let hw0 = camelid::metal::HEAD_WALL_US.load(Relaxed);
+            let ue0 = camelid::metal::SPEC_EXPERT_UNIQUE_SUM.load(Relaxed);
+            let cg0 = camelid::metal::SPEC_CHAINED_GPU_US.load(Relaxed);
+            let cr0 = camelid::metal::SPEC_CHAINED_ROUNDS.load(Relaxed);
+            let hist0: Vec<u32> = camelid::metal::SPEC_UNION_HIST
+                .iter()
+                .map(|a| a.load(Relaxed))
+                .collect();
             let hg0 = camelid::metal::HEAD_GPU_US.load(Relaxed);
             let hc0 = camelid::metal::HEAD_CALLS.load(Relaxed);
             let hr0 = camelid::metal::HEAD_ROWS.load(Relaxed);
@@ -262,6 +269,65 @@ fn gemma4_spec50_bench() {
                 exact,
                 if greedy_tok_s > 0.0 { spec_tok_s / greedy_tok_s } else { 0.0 }
             );
+            // Per-K sweep report: everything needed to price a wider wave.
+            {
+                let uniq = camelid::metal::SPEC_EXPERT_UNIQUE_SUM.load(Relaxed) - ue0;
+                let gpu_ms =
+                    (camelid::metal::SPEC_CHAINED_GPU_US.load(Relaxed) - cg0) as f64 / 1000.0;
+                let cr = camelid::metal::SPEC_CHAINED_ROUNDS.load(Relaxed) - cr0;
+                // Physical traffic. Experts: unique loads x record bytes. Dense
+                // core (attention + shared MLP + router) and the tied head are
+                // read once per chained round / head call respectively.
+                const EXPERT_RECORD_MB: f64 = 3.345408;
+                const DENSE_CORE_MB: f64 = 742.4;
+                const HEAD_MB: f64 = 605.5;
+                let expert_mb = uniq as f64 * EXPERT_RECORD_MB;
+                let dense_mb = cr as f64 * DENSE_CORE_MB + head_calls as f64 * HEAD_MB;
+                let total_mb = expert_mb + dense_mb;
+                let decode_ms = decode_s * 1000.0;
+                let idle_ms = (decode_ms - gpu_ms - head_wall_ms).max(0.0);
+                // Union distribution across layer-rounds, from the histogram delta.
+                let du: Vec<(usize, u32)> = camelid::metal::SPEC_UNION_HIST
+                    .iter()
+                    .enumerate()
+                    .map(|(u, a)| (u, a.load(Relaxed) - hist0[u]))
+                    .filter(|&(_, n)| n > 0)
+                    .collect();
+                let n_lr: u64 = du.iter().map(|&(_, n)| n as u64).sum();
+                // `du` is built from an ascending enumerate, so it is already
+                // sorted by union size; the closure below relies on that order.
+                let pct = |q: f64| -> usize {
+                    let target = (q * n_lr as f64) as u64;
+                    let mut seen = 0u64;
+                    for &(u, n) in &du {
+                        seen += n as u64;
+                        if seen > target {
+                            return u;
+                        }
+                    }
+                    du.last().map(|&(u, _)| u).unwrap_or(0)
+                };
+                println!(
+                    "[k-report K={k}] rounds={cr} accepted_tokens={} expert_bytes={:.0}MB \
+                     dense+head_bytes={:.0}MB total={:.0}MB gpu={:.0}ms head={:.0}ms \
+                     idle(host+sync)={:.0}ms realized={:.1}GB/s union/layer \
+                     min={} p25={} p50={} p75={} p95={} max={}",
+                    spec_tokens.len(),
+                    expert_mb,
+                    dense_mb,
+                    total_mb,
+                    gpu_ms,
+                    head_wall_ms,
+                    idle_ms,
+                    total_mb / decode_ms,
+                    du.first().map(|&(u, _)| u).unwrap_or(0),
+                    pct(0.25),
+                    pct(0.50),
+                    pct(0.75),
+                    pct(0.95),
+                    du.last().map(|&(u, _)| u).unwrap_or(0),
+                );
+            }
             // Head measured DIRECTLY (wall around the head call, plus the command
             // buffer's own GPU time), never inferred by subtracting stages.
             println!(

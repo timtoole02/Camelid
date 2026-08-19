@@ -21332,6 +21332,22 @@ pub static HEAD_GPU_US: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 pub static HEAD_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static HEAD_ROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Per-K sweep accounting, accumulated on every successful chained round.
+/// These feed the K=8..32 report that decides whether wider waves pay:
+/// `SPEC_UNION_HIST[u]` counts layer-rounds whose expert union was exactly `u`
+/// (the DISTRIBUTION, not just the mean — a fat tail changes the byte math),
+/// `SPEC_EXPERT_UNIQUE_SUM` is the total unique-expert loads (× record bytes =
+/// physical expert traffic), and `SPEC_CHAINED_GPU_US` / `SPEC_CHAINED_ROUNDS`
+/// give GPU-busy per round so wall − gpu − head = host/sync idle.
+pub static SPEC_UNION_HIST: [std::sync::atomic::AtomicU32; 129] =
+    [const { std::sync::atomic::AtomicU32::new(0) }; 129];
+pub static SPEC_EXPERT_UNIQUE_SUM: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_CHAINED_GPU_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_CHAINED_ROUNDS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub static SPEC_VERIFY_ROUNDS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 pub static SPEC_ACCEPTED_TOKENS: std::sync::atomic::AtomicUsize =

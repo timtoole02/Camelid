@@ -2913,6 +2913,23 @@ impl GhostMetalExpertRuntime {
         if ok {
             self.last_chained_k = Some(k_tokens);
             self.last_chained_sig = Some(chunk_sig);
+            // Feed the per-K sweep accounting from this round's ledger: the
+            // union distribution and unique-expert total are what price a
+            // wider wave, and gpu-busy is what separates kernel time from
+            // host/sync idle in the round wall.
+            if let Some(common) = self.common.as_ref() {
+                use std::sync::atomic::Ordering::Relaxed;
+                let led = &common.last_chained_ledger;
+                for li in 0..self.layers.len().min(30) {
+                    let u = (led.unique_per_layer[li] as usize).min(128);
+                    crate::metal::SPEC_UNION_HIST[u].fetch_add(1, Relaxed);
+                }
+                crate::metal::SPEC_EXPERT_UNIQUE_SUM
+                    .fetch_add(led.unique_experts_sum as u64, Relaxed);
+                crate::metal::SPEC_CHAINED_GPU_US
+                    .fetch_add((led.gpu_busy_ms * 1000.0) as u64, Relaxed);
+                crate::metal::SPEC_CHAINED_ROUNDS.fetch_add(1, Relaxed);
+            }
         }
         if let Some(common) = self.common.as_mut() {
             common.last_chained_ledger.nvme_ms =
@@ -9719,7 +9736,40 @@ impl Gemma4Runtime {
                 1
             }
         };
-        let mut history = prompt_tokens.to_vec();
+        // Break-even acceptance for spending one more candidate token, from
+        // this row's measured byte model: fixed round cost (dense + tied head)
+        // vs one expert-union increment. Hoisted here because the economic
+        // tier controller below prices tiers against it mid-generation.
+        const FIXED_MB: f64 = 742.0 + 605.5;
+        const EXPERT_MB: f64 = 30.0 * 3.345;
+        let breakeven = (FIXED_MB + EXPERT_MB * 12.8) / (FIXED_MB + EXPERT_MB * 8.0) - 1.0;
+        // Economic tier controller: once a tier has offered enough drafts to
+        // judge (>= min_offered) and its measured acceptance is below its
+        // break-even, stop granting it width for the rest of this generation.
+        // Measured 2026-08-19: match_len=1 pays on json-yaml (p=0.235) and
+        // loses on code prose (p=0.074), so this must be a per-generation
+        // measurement, not a fixed switch. CAMELID_GEMMA4_SPEC_ECON=0 disables.
+        let econ_enabled = !std::env::var("CAMELID_GEMMA4_SPEC_ECON")
+            .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"));
+        let econ_min_offered: u64 = std::env::var("CAMELID_GEMMA4_SPEC_ECON_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12);
+        // Drafter seed: the model's response boilerplate recurs in EVERY
+        // generation but cannot be found in-history the first time it is
+        // emitted (measured: nearly all copy/code-edit empty rounds were the
+        // channel preamble). Seeding the DRAFTER's view of history converts
+        // those rounds; the verifier still checks every draft, so a wrong seed
+        // costs bytes, never correctness. CAMELID_GEMMA4_SPEC_SEED_TEXT=""
+        // disables; history is used only for drafting, never for positions.
+        let seed_text = std::env::var("CAMELID_GEMMA4_SPEC_SEED_TEXT")
+            .unwrap_or_else(|_| "<|channel>thought\n<channel|>".to_string());
+        let mut history: Vec<u32> = if seed_text.is_empty() {
+            Vec::new()
+        } else {
+            self.tokenizer.encode(&seed_text, false, true).unwrap_or_default()
+        };
+        history.extend_from_slice(prompt_tokens);
         let mut generated: Vec<u32> = Vec::new();
         let mut pos = prompt_tokens.len();
         while generated.len() < max_new {
@@ -9737,7 +9787,16 @@ impl Gemma4Runtime {
             let want = if adaptive { cur_k } else { max_draft };
             let (mut drafts, matched_n, miss) =
                 drafter.draft_explained(&history, want.min(budget));
-            let width = width_for_match(matched_n, want.min(budget));
+            let tier_now = tier_of(matched_n);
+            let tier_priced_out = econ_enabled
+                && tier_offered[tier_now] >= econ_min_offered
+                && (tier_accepted[tier_now] as f64)
+                    < breakeven * tier_offered[tier_now] as f64;
+            let width = if tier_priced_out {
+                0
+            } else {
+                width_for_match(matched_n, want.min(budget))
+            };
             let had_candidates = !drafts.is_empty();
             drafts.truncate(width);
             if nomatch_dump.is_some()
@@ -9871,11 +9930,6 @@ impl Gemma4Runtime {
             // plus one expert-union increment per extra token. Emitting the
             // extra token is worth it when
             //   bytes(K+1)/(alpha+p) < bytes(K)/alpha  =>  p > alpha*delta/bytes(K).
-            const FIXED_MB: f64 = 742.0 + 605.5;
-            const EXPERT_MB: f64 = 30.0 * 3.345;
-            let bytes_k1 = FIXED_MB + EXPERT_MB * 8.0;
-            let bytes_k2 = FIXED_MB + EXPERT_MB * 12.8;
-            let breakeven = bytes_k2 / bytes_k1 - 1.0;
             let names = ["match_len=1", "match_len=2", "match_len>=3"];
             for t in 0..3 {
                 if tier_rounds[t] == 0 {
