@@ -23197,13 +23197,24 @@ impl Gemma4GhostCommonMetal {
             }};
         }
 
-        // Loop over all 30 layers in one single continuous command buffer
+        // Predicted path: all 30 layers in one continuous command buffer.
+        // Unpredicted path: per layer, CB1 = attention+router (waited on),
+        // CB2 = shared MLP (queued behind CB1, never waited on directly),
+        // CB3 = experts+tail (committed at the end of the layer, never waited
+        // on directly); the next layer's CB1 queues behind CB3.
+        let mut cb_closed = false;
+        let mut last_committed_cb: Option<metal::CommandBuffer> = None;
         for layer_idx in 0..self.layers.len() {
             let layer = &self.layers[layer_idx];
             let norms = &self.norms[layer_idx];
             let q_dim = layer.n_heads * layer.head_dim;
             let kv_dim = layer.n_kv_heads * layer.head_dim;
-            if layer_idx > 0 && !predicted_ready {
+            if cb_closed {
+                cmd_buf = kernel.queue.new_command_buffer();
+                encoder = cmd_buf.new_compute_command_encoder();
+                stamp.start(GPU_STAGE_QKV_O);
+                cb_closed = false;
+            } else if layer_idx > 0 && !predicted_ready {
                 begin_gpu_stage!(GPU_STAGE_QKV_O);
             }
 
@@ -23667,15 +23678,18 @@ impl Gemma4GhostCommonMetal {
                 );
             }
 
-            begin_gpu_stage!(GPU_STAGE_SHARED);
-
-            // 9. Batched Shared MLP
+            // 9. Batched Shared MLP. On the predicted (single-submit) path it is
+            // encoded inline; on the unpredicted path it is deferred into its own
+            // command buffer queued BEHIND the attention/router commit so the GPU
+            // keeps working while the host reads the router and fills slots.
+            macro_rules! encode_shared_mlp {
+                ($enc:expr) => {{
             unsafe {
                 let gp = layer.gateup_scalar_batch.contents() as *mut u32;
                 *gp.add(2) = k_tokens as u32;
             }
             encode_gemma4_q4_0_gateup_matmul_batch_k(
-                encoder,
+                $enc,
                 kernel,
                 &self.resident_scratch.normf_batch,
                 &layer.gate_w,
@@ -23691,7 +23705,7 @@ impl Gemma4GhostCommonMetal {
                 *dp.add(2) = k_tokens as u32;
             }
             encode_gemma4_q4_0_matmul_batch_k(
-                encoder,
+                $enc,
                 kernel,
                 &self.resident_scratch.act_batch,
                 &layer.down_w,
@@ -23704,13 +23718,20 @@ impl Gemma4GhostCommonMetal {
 
             encode_rms_norm_batch(
                 kernel,
-                encoder,
+                $enc,
                 &self.resident_scratch.down_batch,
                 &norms.post_norm_1,
                 &self.resident_scratch.dn_batch,
                 &layer.rms_scalar,
                 k_tokens,
             );
+
+                }};
+            }
+            if predicted_ready {
+                begin_gpu_stage!(GPU_STAGE_SHARED);
+                encode_shared_mlp!(encoder);
+            }
 
             // 13. MoE Branch (GPU Top-K + Multi-Expert GEMM + Fused Tail)
             let Some(moe_layer) = self.moe_layers.as_ref().and_then(|m| m.get(layer_idx)) else {
@@ -23819,6 +23840,23 @@ impl Gemma4GhostCommonMetal {
                 encoder.end_encoding();
                 stamp.push_current(cmd_buf);
                 cmd_buf.commit();
+                let cb_attn_router = cmd_buf.to_owned();
+                // Shared MLP in its own command buffer, queued behind the
+                // attention/router one: it only reads slab_b/normf_batch (both
+                // final once CB1 retires) and its output dn_batch is consumed by
+                // this layer's tail, so the GPU has real work during the host
+                // route/fill window instead of draining.
+                {
+                    encode_clock = std::time::Instant::now();
+                    let cb_shared = kernel.queue.new_command_buffer();
+                    let enc_shared = cb_shared.new_compute_command_encoder();
+                    stamp.start(GPU_STAGE_SHARED);
+                    encode_shared_mlp!(enc_shared);
+                    enc_shared.end_encoding();
+                    stamp.push_current(cb_shared);
+                    cb_shared.commit();
+                    ledger.encode_ms += encode_clock.elapsed().as_secs_f64() * 1000.0;
+                }
 
                 // Overlap predicted wave-0 copies with this layer's attn+router GPU.
                 // This layer's ping slab is idle. The shared pong slab may still be
@@ -23850,10 +23888,18 @@ impl Gemma4GhostCommonMetal {
                 }
 
                 let wait_t = std::time::Instant::now();
-                cmd_buf.wait_until_completed();
+                cb_attn_router.wait_until_completed();
                 ledger.slot_wait_ms += wait_t.elapsed().as_secs_f64() * 1000.0;
-                let (gpu_us, _) = command_buffer_gpu_times_us(cmd_buf);
+                let (gpu_us, _) = command_buffer_gpu_times_us(&cb_attn_router);
                 ledger.gpu_busy_ms += gpu_us as f64 / 1000.0;
+                if cb_attn_router.status() != metal::MTLCommandBufferStatus::Completed {
+                    eprintln!(
+                        "[metal chained round] layer {layer_idx} attention/router command buffer failed with status {:?}",
+                        cb_attn_router.status()
+                    );
+                    self.last_chained_ledger = ledger;
+                    return false;
+                }
                 if std::env::var("CAMELID_GEMMA4_GHOST_METAL_TIMING")
                     .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 {
@@ -24677,19 +24723,39 @@ impl Gemma4GhostCommonMetal {
                 encoder = cmd_buf.new_compute_command_encoder();
                 stamp.start(GPU_STAGE_QKV_O);
             }
+
+            if !predicted_ready {
+                // Commit this layer's expert/tail work now so the GPU starts
+                // on it while the host encodes the next layer's attention;
+                // the next layer opens a fresh command buffer (same queue, so
+                // it executes after this one and sees slab_a).
+                ledger.encode_ms += encode_clock.elapsed().as_secs_f64() * 1000.0;
+                encoder.end_encoding();
+                stamp.push_current(cmd_buf);
+                cmd_buf.commit();
+                last_committed_cb = Some(cmd_buf.to_owned());
+                cb_closed = true;
+                encode_clock = std::time::Instant::now();
+            }
         }
 
-        ledger.encode_ms += encode_clock.elapsed().as_secs_f64() * 1000.0;
-        encoder.end_encoding();
-        cmd_buf.commit();
-        predicted_cbs.push(cmd_buf.to_owned());
+        let final_cb: metal::CommandBuffer = if cb_closed {
+            last_committed_cb.take().expect("closed layer committed a command buffer")
+        } else {
+            ledger.encode_ms += encode_clock.elapsed().as_secs_f64() * 1000.0;
+            encoder.end_encoding();
+            stamp.push_current(cmd_buf);
+            cmd_buf.commit();
+            predicted_cbs.push(cmd_buf.to_owned());
+            cmd_buf.to_owned()
+        };
         let t_final_wait = std::time::Instant::now();
-        cmd_buf.wait_until_completed();
+        final_cb.wait_until_completed();
         ledger.final_wait_ms = t_final_wait.elapsed().as_secs_f64() * 1000.0;
-        if cmd_buf.status() != metal::MTLCommandBufferStatus::Completed {
+        if final_cb.status() != metal::MTLCommandBufferStatus::Completed {
             eprintln!(
                 "[metal chained round] command buffer failed with status {:?}",
-                cmd_buf.status()
+                final_cb.status()
             );
             self.last_chained_ledger = ledger;
             return false;
@@ -24717,14 +24783,10 @@ impl Gemma4GhostCommonMetal {
         // profile-mode split are exact.
         let stage_ms = stamp.stages_ms();
         let stage_sum: f64 = stage_ms.iter().sum();
-        ledger.gpu_busy_ms = if stage_profile {
-            stage_sum
-        } else {
-            // The per-layer waits already accumulated every retired command
-            // buffer's GPU time; the final predicted command buffer is the only
-            // one not yet counted.
-            ledger.gpu_busy_ms + total_gpu_ms
-        };
+        // Every command buffer of the round is stamped, so the stage sum is
+        // the round's true GPU-busy time in both modes.
+        let _ = total_gpu_ms;
+        ledger.gpu_busy_ms = stage_sum;
         ledger.gpu_qkv_o_ms = stage_ms[GPU_STAGE_QKV_O as usize];
         ledger.gpu_attn_ms = stage_ms[GPU_STAGE_ATTN as usize];
         ledger.gpu_router_ms = stage_ms[GPU_STAGE_ROUTER as usize];
