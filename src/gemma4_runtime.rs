@@ -9612,7 +9612,13 @@ impl Gemma4Runtime {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(DEFAULT_NGRAM_DRAFT_TOKENS)
-            .clamp(1, 7);
+            // The batched verify supports 16 rows (the tied head's max_k and
+            // GEMMA4_RESIDENT_MAX_BATCH both allow it), and the expert union
+            // saturates with width: measured on this row, K=8 -> K=16 doubles
+            // the candidate tokens for only ~1.4x the bytes. The old ceiling of
+            // 7 was not a hardware limit and capped acceptance on workloads
+            // where the drafter is nearly always right.
+            .clamp(1, crate::metal::GEMMA4_MAX_SPEC_CHUNK - 1);
         // A short match still earns a ONE-token draft (see the width tiers
         // below): leaving a round empty costs the full fixed round cost for a
         // single token, so the bar for proposing one extra candidate is low.
@@ -9639,6 +9645,32 @@ impl Gemma4Runtime {
         // "many bad ones".
         let mut offered_drafts = 0u64;
         let mut empty_rounds = 0u64;
+        // Per-tier accounting, bucketed by the n-gram match length that produced
+        // the draft: [match_len==1, match_len==2, match_len>=3]. A one-token
+        // match recurs constantly and must NOT be assumed to inherit the
+        // acceptance of a five-token literal repeat; it earns its slot only if
+        // its own measured acceptance clears its own break-even.
+        let mut tier_rounds = [0u64; 3];
+        let mut tier_offered = [0u64; 3];
+        let mut tier_accepted = [0u64; 3];
+        // Why empty rounds were empty: [HistoryTooShort, NoMatch,
+        // MatchWithoutContinuation, TierGaveZeroWidth].
+        let mut miss_reason = [0u64; 4];
+        // CAMELID_GEMMA4_SPEC_DUMP_NOMATCH=<path>: append the context of every
+        // round where the n-gram index found nothing. These are exactly the
+        // rounds a fallback proposal source would have to serve, and they must
+        // be evaluated on their OWN measured acceptance: they are by
+        // construction disjoint from the strong-match population (p~0.98), so
+        // borrowing that number would overstate any fallback's value.
+        let nomatch_dump = std::env::var("CAMELID_GEMMA4_SPEC_DUMP_NOMATCH").ok();
+        let mut nomatch_ctx: Vec<String> = Vec::new();
+        let tier_of = |n: usize| -> usize {
+            match n {
+                0 | 1 => 0,
+                2 => 1,
+                _ => 2,
+            }
+        };
         let spec_timing = std::env::var("CAMELID_GEMMA4_SPEC_TIMING").is_ok();
         // Adaptive draft width: a K-token verify round reads each routed
         // expert once, but its GPU cost still grows with K (more candidate
@@ -9665,6 +9697,12 @@ impl Gemma4Runtime {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(3);
+        // Width granted to a mid-confidence match. Scales with the cap so a
+        // wider ceiling is actually usable instead of being pinned at 3.
+        let tier_mid_width = std::env::var("CAMELID_GEMMA4_SPEC_TIER_MID_WIDTH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or_else(|| (max_draft / 2).max(3));
         let tiering = !std::env::var("CAMELID_GEMMA4_SPEC_TIERS")
             .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"));
         let width_for_match = |matched_n: usize, cap: usize| -> usize {
@@ -9676,7 +9714,7 @@ impl Gemma4Runtime {
             } else if matched_n >= tier_wide {
                 cap
             } else if matched_n >= tier_mid {
-                cap.min(3)
+                cap.min(tier_mid_width)
             } else {
                 1
             }
@@ -9697,9 +9735,34 @@ impl Gemma4Runtime {
             }
             let budget = max_new - generated.len();
             let want = if adaptive { cur_k } else { max_draft };
-            let (mut drafts, matched_n) = drafter.draft_sized(&history, want.min(budget));
+            let (mut drafts, matched_n, miss) =
+                drafter.draft_explained(&history, want.min(budget));
             let width = width_for_match(matched_n, want.min(budget));
+            let had_candidates = !drafts.is_empty();
             drafts.truncate(width);
+            if nomatch_dump.is_some()
+                && matches!(miss, Some(crate::inference::speculative::DraftMiss::NoMatch))
+            {
+                let tail_start = history.len().saturating_sub(12);
+                let tail = &history[tail_start..];
+                let text = self.tokenizer.decode(tail, true).unwrap_or_default();
+                nomatch_ctx.push(format!(
+                    "{{\"pos\":{pos},\"emitted\":{},\"tail_ids\":{:?},\"tail_text\":{:?}}}",
+                    generated.len(),
+                    tail,
+                    text
+                ));
+            }
+            if let Some(m) = miss {
+                miss_reason[match m {
+                    crate::inference::speculative::DraftMiss::HistoryTooShort => 0,
+                    crate::inference::speculative::DraftMiss::NoMatch => 1,
+                    crate::inference::speculative::DraftMiss::MatchWithoutContinuation => 2,
+                }] += 1;
+            } else if had_candidates && drafts.is_empty() {
+                // The drafter proposed, but the confidence tier granted width 0.
+                miss_reason[3] += 1;
+            }
             if drafts.is_empty() {
                 empty_rounds += 1;
                 if spec_timing {
@@ -9740,6 +9803,10 @@ impl Gemma4Runtime {
             accepted_rounds += 1;
             accepted_drafts += j as u64;
             offered_drafts += drafts.len() as u64;
+            let tier = tier_of(matched_n);
+            tier_rounds[tier] += 1;
+            tier_offered[tier] += drafts.len() as u64;
+            tier_accepted[tier] += j as u64;
             if adaptive {
                 // j drafts accepted this round means j+1 tokens emitted from
                 // one weight read. Aim next round's width at what just paid off:
@@ -9798,6 +9865,54 @@ impl Gemma4Runtime {
                 accepted_drafts as f64 / offered_drafts.max(1) as f64,
                 100.0 * empty_rounds as f64 / accepted_rounds.max(1) as f64,
             );
+            // Break-even for spending one more candidate token, from the byte
+            // model this row actually measures: a round costs a large fixed
+            // part (dense weights + tied head, read once regardless of width)
+            // plus one expert-union increment per extra token. Emitting the
+            // extra token is worth it when
+            //   bytes(K+1)/(alpha+p) < bytes(K)/alpha  =>  p > alpha*delta/bytes(K).
+            const FIXED_MB: f64 = 742.0 + 605.5;
+            const EXPERT_MB: f64 = 30.0 * 3.345;
+            let bytes_k1 = FIXED_MB + EXPERT_MB * 8.0;
+            let bytes_k2 = FIXED_MB + EXPERT_MB * 12.8;
+            let breakeven = bytes_k2 / bytes_k1 - 1.0;
+            let names = ["match_len=1", "match_len=2", "match_len>=3"];
+            for t in 0..3 {
+                if tier_rounds[t] == 0 {
+                    continue;
+                }
+                let p_t = tier_accepted[t] as f64 / tier_offered[t].max(1) as f64;
+                eprintln!(
+                    "[spec-tier] {:<12} rounds={:<4} offered={:<4} accepted={:<4} p={:.3}                      break_even={:.3} -> {}",
+                    names[t],
+                    tier_rounds[t],
+                    tier_offered[t],
+                    tier_accepted[t],
+                    p_t,
+                    breakeven,
+                    if p_t >= breakeven { "PAYS" } else { "LOSES (disable this tier)" }
+                );
+            }
+            eprintln!(
+                "[spec-empty] history_short={} no_match={} match_without_continuation={}                  tier_zero_width={}",
+                miss_reason[0], miss_reason[1], miss_reason[2], miss_reason[3]
+            );
+            if let Some(path) = nomatch_dump.as_ref() {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                {
+                    for line in &nomatch_ctx {
+                        let _ = writeln!(f, "{line}");
+                    }
+                }
+                eprintln!(
+                    "[spec-nomatch] recorded {} no-match contexts to {path}",
+                    nomatch_ctx.len()
+                );
+            }
         }
         Ok(generated)
     }

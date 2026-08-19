@@ -229,6 +229,11 @@ fn gemma4_spec50_bench() {
                 .prefill_tokens(&prompt_tokens, &mut kc, &mut vc, max_new.saturating_sub(1))
                 .unwrap();
             let prefill_s = t0.elapsed().as_secs_f64();
+            use std::sync::atomic::Ordering::Relaxed;
+            let hw0 = camelid::metal::HEAD_WALL_US.load(Relaxed);
+            let hg0 = camelid::metal::HEAD_GPU_US.load(Relaxed);
+            let hc0 = camelid::metal::HEAD_CALLS.load(Relaxed);
+            let hr0 = camelid::metal::HEAD_ROWS.load(Relaxed);
             let rounds0 = camelid::metal::SPEC_VERIFY_ROUNDS.load(std::sync::atomic::Ordering::Relaxed);
             let acc0 = camelid::metal::SPEC_ACCEPTED_TOKENS.load(std::sync::atomic::Ordering::Relaxed);
             let t1 = Instant::now();
@@ -238,6 +243,10 @@ fn gemma4_spec50_bench() {
             let decode_s = t1.elapsed().as_secs_f64();
             let rounds = camelid::metal::SPEC_VERIFY_ROUNDS.load(std::sync::atomic::Ordering::Relaxed) - rounds0;
             let acc = camelid::metal::SPEC_ACCEPTED_TOKENS.load(std::sync::atomic::Ordering::Relaxed) - acc0;
+            let head_wall_ms = (camelid::metal::HEAD_WALL_US.load(Relaxed) - hw0) as f64 / 1000.0;
+            let head_gpu_ms = (camelid::metal::HEAD_GPU_US.load(Relaxed) - hg0) as f64 / 1000.0;
+            let head_calls = camelid::metal::HEAD_CALLS.load(Relaxed) - hc0;
+            let head_rows = camelid::metal::HEAD_ROWS.load(Relaxed) - hr0;
             let spec_tok_s = spec_tokens.len() as f64 / decode_s;
             let alpha = acc as f64 / rounds.max(1) as f64;
             let exact = skip_greedy || spec_tokens == greedy_tokens;
@@ -252,6 +261,16 @@ fn gemma4_spec50_bench() {
                 decode_s * 1000.0 / rounds.max(1) as f64,
                 exact,
                 if greedy_tok_s > 0.0 { spec_tok_s / greedy_tok_s } else { 0.0 }
+            );
+            // Head measured DIRECTLY (wall around the head call, plus the command
+            // buffer's own GPU time), never inferred by subtracting stages.
+            println!(
+                "[head K={k}] calls={head_calls} rows={head_rows} wall={head_wall_ms:.1}ms \
+                 gpu={head_gpu_ms:.1}ms | per-round wall={:.1}ms gpu={:.1}ms | \
+                 share of decode={:.0}%",
+                head_wall_ms / rounds.max(1) as f64,
+                head_gpu_ms / rounds.max(1) as f64,
+                100.0 * head_wall_ms / (decode_s * 1000.0)
             );
             if !exact {
                 println!(

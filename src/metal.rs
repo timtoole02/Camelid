@@ -15298,6 +15298,14 @@ impl Gemma4Q6KHead {
                 kernel_us,
             );
         }
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let (gpu_us, _) = command_buffer_gpu_times_us(cb);
+            HEAD_WALL_US.fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+            HEAD_GPU_US.fetch_add(gpu_us as u64, Relaxed);
+            HEAD_CALLS.fetch_add(1, Relaxed);
+            HEAD_ROWS.fetch_add(1, Relaxed);
+        }
         let mut output = vec![0.0f32; state.vocab];
         read_buffer_f32(&state.logits, &mut output);
         // Rust's scalar tanh is the established Gemma 4 oracle. Metal's tanh
@@ -15432,6 +15440,7 @@ impl Gemma4Q6KHead {
             let logit = self.forward(&hidden_rows[0])?;
             return Some((0, logit));
         }
+        let t_head = std::time::Instant::now();
         use rayon::prelude::*;
         let state = self.inner.lock().ok()?;
         let kernel = metal_linear_kernel()?;
@@ -15484,13 +15493,20 @@ impl Gemma4Q6KHead {
             return None;
         }
 
-        if std::env::var("CAMELID_GEMMA4_METAL_HEAD_TIMING")
-            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         {
+            use std::sync::atomic::Ordering::Relaxed;
             let (gpu_us, kernel_us) = command_buffer_gpu_times_us(cb);
-            eprintln!(
-                "[gemma4-metal-head] speculative K={k} vocab={vocab} gpu={gpu_us}us kernel={kernel_us}us"
-            );
+            HEAD_WALL_US.fetch_add(t_head.elapsed().as_micros() as u64, Relaxed);
+            HEAD_GPU_US.fetch_add(gpu_us as u64, Relaxed);
+            HEAD_CALLS.fetch_add(1, Relaxed);
+            HEAD_ROWS.fetch_add(k as u64, Relaxed);
+            if std::env::var("CAMELID_GEMMA4_METAL_HEAD_TIMING")
+                .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            {
+                eprintln!(
+                    "[gemma4-metal-head] speculative K={k} vocab={vocab} gpu={gpu_us}us kernel={kernel_us}us"
+                );
+            }
         }
         let logits_ptr = state.logits_batch.contents() as *const f32;
         let mut accepted_j = drafts.len();
@@ -18719,6 +18735,13 @@ fn encode_gemma4_q4_0_matmul_batch_k(
     scalar_buf: &Buffer,
     k_batch: usize,
 ) {
+    // The kernels below hold a fixed `float sums[4][8]`; a wider chunk indexes
+    // past it and corrupts the round instead of failing. Refuse loudly.
+    assert!(
+        k_batch <= GEMMA4_DENSE_BATCH_K_MAX,
+        "dense batch_k chunk {k_batch} exceeds the kernels' fixed accumulator depth {}",
+        GEMMA4_DENSE_BATCH_K_MAX
+    );
     let bpr_u32 = unsafe { *(scalar_buf.contents() as *const u32) };
     let rows_u32 = rows as u32;
     let k_batch_u32 = k_batch as u32;
@@ -18811,6 +18834,13 @@ fn encode_gemma4_q4_0_qkv_matmul_batch_k(
     total_rows: usize,
     k_batch: usize,
 ) {
+    // The kernels below hold a fixed `float sums[4][8]`; a wider chunk indexes
+    // past it and corrupts the round instead of failing. Refuse loudly.
+    assert!(
+        k_batch <= GEMMA4_DENSE_BATCH_K_MAX,
+        "dense batch_k chunk {k_batch} exceeds the kernels' fixed accumulator depth {}",
+        GEMMA4_DENSE_BATCH_K_MAX
+    );
     let (bpr_u32, q_rows_u32, k_rows_u32, v_rows_u32) = unsafe {
         let ptr = qkv_scalar.contents() as *const u32;
         (*ptr, *ptr.add(1), *ptr.add(2), *ptr.add(3))
@@ -18922,6 +18952,11 @@ fn encode_gemma4_q4_0_qkv_matmul_batch_k_fused_rms(
     qkv_scalar: &Buffer,
     k_batch: usize,
 ) -> bool {
+    assert!(
+        k_batch <= GEMMA4_DENSE_BATCH_K_MAX,
+        "dense batch_k chunk {k_batch} exceeds the kernels' fixed accumulator depth {}",
+        GEMMA4_DENSE_BATCH_K_MAX
+    );
     let Some(pipe) = k.q4_0_qkv_block_batch_k_fused_rms_pipeline.as_ref() else {
         return false;
     };
@@ -18973,6 +19008,13 @@ fn encode_gemma4_q4_0_gateup_matmul_batch_k(
     rows: usize,
     k_batch: usize,
 ) {
+    // The kernels below hold a fixed `float sums[4][8]`; a wider chunk indexes
+    // past it and corrupts the round instead of failing. Refuse loudly.
+    assert!(
+        k_batch <= GEMMA4_DENSE_BATCH_K_MAX,
+        "dense batch_k chunk {k_batch} exceeds the kernels' fixed accumulator depth {}",
+        GEMMA4_DENSE_BATCH_K_MAX
+    );
     let bpr_u32 = unsafe { *(gateup_scalar.contents() as *const u32) };
     let rows_u32 = rows as u32;
     let k_batch_u32 = k_batch as u32;
@@ -20534,6 +20576,25 @@ fn init_layer_resident_buffers(
 
 pub(crate) const GEMMA4_RESIDENT_MAX_BATCH: usize = 64;
 
+/// Largest chunk the speculative verify may submit in one round.
+///
+/// The binding limit is the DENSE batch kernels, not the tied head. The head
+/// allocates batch buffers for 16 rows and the resident lane would take 64, but
+/// `q4_0_block_linear_batch_k`, `q4_0_qkv_block_linear_batch_k` and
+/// `q4_0_gateup_geglu_block_linear_batch_k` each hold a fixed `float
+/// sums[4][8]` accumulator and index it with `k_batch`, so any chunk wider than
+/// 8 writes past the end of that array and silently corrupts the round.
+/// Measured: raising this to 16 produced a speculative stream that diverged
+/// from greedy at K=9, caught by the lane parity gate.
+///
+/// Raising it requires widening those accumulators (and the K=8 specialisations
+/// alongside them) first; `encode_gemma4_q4_0_*_batch_k` refuse a wider chunk
+/// rather than trusting callers.
+pub const GEMMA4_MAX_SPEC_CHUNK: usize = 8;
+
+/// Fixed accumulator depth of the dense `*_batch_k` kernels (`float sums[4][8]`).
+pub(crate) const GEMMA4_DENSE_BATCH_K_MAX: usize = 8;
+
 /// Pre-allocated resident activation scratch slab.
 #[cfg(target_os = "macos")]
 pub struct Gemma4ResidentScratch {
@@ -21214,6 +21275,14 @@ pub static ATTENTION_BATCH_K_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 pub static ATTENTION_SCALAR_SLOT_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+/// Wall microseconds spent inside the tied-head projection, and the number of
+/// head invocations. Accumulated so the head can be measured DIRECTLY instead
+/// of inferred by subtracting stage times from a round total.
+pub static HEAD_WALL_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static HEAD_GPU_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static HEAD_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static HEAD_ROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub static SPEC_VERIFY_ROUNDS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 pub static SPEC_ACCEPTED_TOKENS: std::sync::atomic::AtomicUsize =

@@ -182,6 +182,21 @@ impl SpeculativeDrafter {
     }
 }
 
+/// Why a prompt-lookup draft produced nothing. An empty round costs the whole
+/// fixed verify cost to emit one token, so the reason matters: a short history
+/// fixes itself, a missing match is workload-inherent, and a match landing at
+/// the tail of history is a drafter limitation worth addressing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftMiss {
+    /// History shorter than the minimum match length.
+    HistoryTooShort,
+    /// No suffix of length min..=max recurred earlier.
+    NoMatch,
+    /// A match was found, but its earlier occurrence runs to the end of
+    /// history, so there is no continuation to propose.
+    MatchWithoutContinuation,
+}
+
 /// Prompt-lookup drafting: find the longest n-gram suffix of `history`
 /// (between `min_ngram` and `max_ngram`) that occurred earlier, preferring
 /// the most recent occurrence, and propose the tokens that followed it.
@@ -272,6 +287,7 @@ impl NGramDrafter {
         }
     }
 
+
     /// Draft plus the length of the n-gram match it came from. The match
     /// length is the only confidence signal a prompt-lookup drafter has: a
     /// 1-token match proposes from a context that recurs constantly and means
@@ -289,6 +305,34 @@ impl NGramDrafter {
         } else {
             index.draft_sized(max_tokens)
         }
+    }
+
+    /// [`Self::draft_sized`] plus the reason an empty draft was empty.
+    pub fn draft_explained(
+        &self,
+        history: &[u32],
+        max_tokens: usize,
+    ) -> (Vec<u32>, usize, Option<DraftMiss>) {
+        if max_tokens == 0 || self.min_ngram == 0 || history.len() <= self.min_ngram {
+            return (Vec::new(), 0, Some(DraftMiss::HistoryTooShort));
+        }
+        let mut index = self.index.borrow_mut();
+        index.sync(history);
+        let (drafts, matched) = if std::env::var("CAMELID_GEMMA4_SPEC_MULTIHOP")
+            .is_ok_and(|v| v == "1")
+        {
+            index.draft_multihop_sized(max_tokens)
+        } else {
+            index.draft_sized(max_tokens)
+        };
+        let miss = if !drafts.is_empty() {
+            None
+        } else if index.has_suffix_match() {
+            Some(DraftMiss::MatchWithoutContinuation)
+        } else {
+            Some(DraftMiss::NoMatch)
+        };
+        (drafts, matched, miss)
     }
 
     pub fn draft_multihop(&self, history: &[u32], max_tokens: usize) -> Vec<u32> {
@@ -401,6 +445,29 @@ impl BoundedNGramIndex {
             }
         }
         Vec::new()
+    }
+
+    /// True when some suffix of length min..=max recurred earlier, whether or
+    /// not it had a continuation. Distinguishes "this text is novel" from
+    /// "the match sat at the tail of history".
+    fn has_suffix_match(&self) -> bool {
+        let len = self.history.len();
+        if len == 0 {
+            return false;
+        }
+        let max_n = self.max_ngram.min(len.saturating_sub(1));
+        for n in (self.min_ngram..=max_n).rev() {
+            let pattern = &self.history[len - n..];
+            let key = NGramKey { len: n, hash: hash_ngram(pattern) };
+            if let Some(starts) = self.occurrences.get(&key) {
+                for &start in starts.iter().rev() {
+                    if start < len - n && &self.history[start..start + n] == pattern {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     fn draft_sized(&self, max_tokens: usize) -> (Vec<u32>, usize) {
