@@ -272,6 +272,25 @@ impl NGramDrafter {
         }
     }
 
+    /// Draft plus the length of the n-gram match it came from. The match
+    /// length is the only confidence signal a prompt-lookup drafter has: a
+    /// 1-token match proposes from a context that recurs constantly and means
+    /// little, while a 5-token match is usually a literal repeat. Callers whose
+    /// verify cost grows with the draft width use it to size the draft.
+    /// Returns `(drafts, matched_n)`; `matched_n` is 0 when nothing matched.
+    pub fn draft_sized(&self, history: &[u32], max_tokens: usize) -> (Vec<u32>, usize) {
+        if max_tokens == 0 || self.min_ngram == 0 || history.len() <= self.min_ngram {
+            return (Vec::new(), 0);
+        }
+        let mut index = self.index.borrow_mut();
+        index.sync(history);
+        if std::env::var("CAMELID_GEMMA4_SPEC_MULTIHOP").is_ok_and(|v| v == "1") {
+            index.draft_multihop_sized(max_tokens)
+        } else {
+            index.draft_sized(max_tokens)
+        }
+    }
+
     pub fn draft_multihop(&self, history: &[u32], max_tokens: usize) -> Vec<u32> {
         if max_tokens == 0 || self.min_ngram == 0 || history.len() <= self.min_ngram {
             return Vec::new();
@@ -382,6 +401,50 @@ impl BoundedNGramIndex {
             }
         }
         Vec::new()
+    }
+
+    fn draft_sized(&self, max_tokens: usize) -> (Vec<u32>, usize) {
+        let len = self.history.len();
+        if len == 0 || max_tokens == 0 || len <= self.min_ngram {
+            return (Vec::new(), 0);
+        }
+        let max_n = self.max_ngram.min(len.saturating_sub(1));
+        for n in (self.min_ngram..=max_n).rev() {
+            let pattern = &self.history[len - n..];
+            let key = NGramKey {
+                len: n,
+                hash: hash_ngram(pattern),
+            };
+            let Some(starts) = self.occurrences.get(&key) else {
+                continue;
+            };
+            for &start in starts.iter().rev() {
+                if start >= len - n {
+                    continue;
+                }
+                if &self.history[start..start + n] != pattern {
+                    continue;
+                }
+                let continuation_start = start + n;
+                let continuation_end = (continuation_start + max_tokens).min(len);
+                if continuation_start < continuation_end {
+                    return (
+                        self.history[continuation_start..continuation_end].to_vec(),
+                        n,
+                    );
+                }
+                break;
+            }
+        }
+        (Vec::new(), 0)
+    }
+
+    fn draft_multihop_sized(&self, max_tokens: usize) -> (Vec<u32>, usize) {
+        // The first hop is the one anchored to the real history; later hops
+        // extend a simulated context, so the first hop's match length is the
+        // confidence signal for the whole chain.
+        let (_, first_n) = self.draft_sized(max_tokens);
+        (self.draft_multihop(max_tokens), first_n)
     }
 
     fn draft_multihop(&self, max_tokens: usize) -> Vec<u32> {
@@ -843,6 +906,68 @@ mod tests {
             }
         }
         Vec::new()
+    }
+
+    #[test]
+    fn draft_sized_agrees_with_draft_and_reports_match_length() {
+        let drafter = NGramDrafter::new(2, 6);
+        // Suffix [7, 8] recurs; its earlier occurrence is followed by [9, 10].
+        let history = vec![7u32, 8, 9, 10, 42, 43, 7, 8];
+        let (drafts, matched) = drafter.draft_sized(&history, 2);
+        assert_eq!(drafts, drafter.draft(&history, 2));
+        assert_eq!(drafts, vec![9, 10]);
+        assert_eq!(matched, 2, "the [7, 8] suffix is a 2-token match");
+
+        // A longer literal repeat must report the longer match, since match
+        // length is what the caller uses to size the draft.
+        let drafter = NGramDrafter::new(2, 6);
+        let history = vec![1u32, 2, 3, 4, 5, 6, 77, 1, 2, 3, 4, 5];
+        let (drafts, matched) = drafter.draft_sized(&history, 1);
+        assert_eq!(drafts, vec![6]);
+        assert_eq!(matched, 5, "[1,2,3,4,5] repeats verbatim");
+    }
+
+    #[test]
+    fn draft_sized_reports_zero_match_when_nothing_repeats() {
+        let drafter = NGramDrafter::new(2, 5);
+        let history = vec![1u32, 2, 3, 4, 5, 6, 7, 8];
+        let (drafts, matched) = drafter.draft_sized(&history, 4);
+        assert!(drafts.is_empty());
+        assert_eq!(matched, 0, "no match must be distinguishable from a match");
+    }
+
+    #[test]
+    fn draft_sized_matches_draft_over_a_long_random_history() {
+        let drafter = NGramDrafter::new_with_index_capacity(2, 6, 1_000_000);
+        let mut history = Vec::new();
+        let mut state = 0x1234_5678u32;
+        for step in 0..600usize {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let token = if step > 24 && step % 13 < 4 {
+                history[step - 13]
+            } else {
+                state % 19
+            };
+            history.push(token);
+            for max_tokens in [1usize, 4] {
+                let (sized, matched) = drafter.draft_sized(&history, max_tokens);
+                assert_eq!(
+                    sized,
+                    drafter.draft(&history, max_tokens),
+                    "draft_sized diverged from draft at length {}",
+                    history.len()
+                );
+                assert_eq!(
+                    sized.is_empty(),
+                    matched == 0,
+                    "match length must be zero exactly when no draft is produced"
+                );
+                if matched > 0 {
+                    // The reported match must be a real suffix occurrence.
+                    assert!(matched >= 2 && matched <= 6);
+                }
+            }
+        }
     }
 
     #[test]

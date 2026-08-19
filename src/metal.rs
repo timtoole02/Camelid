@@ -579,6 +579,18 @@ struct GpuStageStamp {
     cbs: Vec<(u8, metal::CommandBuffer)>,
 }
 
+/// CAMELID_GEMMA4_HEAD_K8_GENERIC=1: skip the one-row-per-simdgroup K=8 tied
+/// head specialization and use the same four-row kernel as every other batch
+/// width, so a row's logits do not depend on the round's width.
+#[cfg(target_os = "macos")]
+fn head_k8_generic() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_HEAD_K8_GENERIC")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
 /// CAMELID_GEMMA4_CHAINED_STAGE_PROFILE=1: one command buffer per GPU stage in
 /// the chained round so the ledger's stage split is measured, not modelled.
 #[cfg(target_os = "macos")]
@@ -14435,7 +14447,14 @@ fn encode_q6k_ordered_batch(
         return;
     }
     if k_batch <= 8 {
-        let specialized_k8 = (k_batch == 8)
+        // The K=8 specialization uses one vocab row per simdgroup, while every
+        // other width (and the K=1 kernel) uses four rows per simdgroup. That is
+        // a different reduction shape, so a row's logits can differ between a
+        // K=8 round and a K=1 round — which would break the speculative stream's
+        // equality with the greedy stream at K=8 only. Set
+        // CAMELID_GEMMA4_HEAD_K8_GENERIC=1 to route K=8 through the same
+        // four-row kernel as every other width.
+        let specialized_k8 = (k_batch == 8 && !head_k8_generic())
             .then_some(kernel.q6k_linear_turbo_batch_k8_pipeline.as_ref())
             .flatten();
         let is_specialized_k8 = specialized_k8.is_some();
@@ -15465,6 +15484,14 @@ impl Gemma4Q6KHead {
             return None;
         }
 
+        if std::env::var("CAMELID_GEMMA4_METAL_HEAD_TIMING")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        {
+            let (gpu_us, kernel_us) = command_buffer_gpu_times_us(cb);
+            eprintln!(
+                "[gemma4-metal-head] speculative K={k} vocab={vocab} gpu={gpu_us}us kernel={kernel_us}us"
+            );
+        }
         let logits_ptr = state.logits_batch.contents() as *const f32;
         let mut accepted_j = drafts.len();
         for (i, &draft_tok) in drafts.iter().enumerate() {

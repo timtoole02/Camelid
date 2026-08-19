@@ -13,6 +13,8 @@
 //!   SPEC50_SKIP_GREEDY    skip the greedy reference (no parity check)
 //!   SPEC50_CACHE_MIB      host expert cache MiB (default 2900)
 //!   SPEC50_GREEDY_LANE    chained (default) | head — lane for the greedy reference
+//!   SPEC50_MIN_MATCH      n-gram min match length for the drafter (default 3)
+//!   SPEC50_ADAPTIVE       set to enable adaptive draft width
 
 use camelid::gemma4_runtime::{gemma4_stop_token_ids, Gemma4Runtime};
 use std::{path::PathBuf, time::Instant};
@@ -61,6 +63,13 @@ fn workloads() -> Vec<(&'static str, String)> {
             "copy",
             format!("<|turn>user\nRepeat the following paragraph exactly, word for word:\n\n{PARA}\n<turn|>\n<|turn>model\n"),
         ),
+        // The realistic agent-edit shape: nearly all of the output is a literal
+        // span of the input, which is exactly what a prompt-lookup drafter can
+        // predict. This is the workload that decides whether wide waves pay.
+        (
+            "code-edit",
+            "<|turn>user\nAdd a `pub expires_at: u64,` field at the end of this struct and output the COMPLETE struct definition again, unchanged otherwise, with no explanation:\n\npub struct CacheEntry<K, V> {\n    pub key: K,\n    pub value: V,\n    pub access_count: u64,\n    pub created_at: u64,\n    pub last_hit: u64,\n}\n<turn|>\n<|turn>model\n".to_string(),
+        ),
     ]
 }
 
@@ -93,6 +102,12 @@ fn gemma4_spec50_bench() {
     set_default("CAMELID_GEMMA4_GHOST_READ_THREADS", "4");
     set_default("CAMELID_GEMMA4_GHOST_METAL_SLOTS_PER_LAYER", "88");
     set_default("CAMELID_GEMMA4_SPEC_TIMING", "1");
+    if let Ok(v) = std::env::var("SPEC50_MIN_MATCH") {
+        std::env::set_var("CAMELID_GEMMA4_SPEC_MIN_MATCH", v);
+    }
+    if std::env::var_os("SPEC50_ADAPTIVE").is_some() {
+        std::env::set_var("CAMELID_GEMMA4_SPEC_ADAPTIVE", "1");
+    }
 
     let max_new: usize = env_or("SPEC50_MAX_NEW", "64").parse().unwrap();
     let ks: Vec<usize> = env_or("SPEC50_K", "4")

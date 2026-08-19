@@ -9613,6 +9613,9 @@ impl Gemma4Runtime {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(DEFAULT_NGRAM_DRAFT_TOKENS)
             .clamp(1, 7);
+        // A short match still earns a ONE-token draft (see the width tiers
+        // below): leaving a round empty costs the full fixed round cost for a
+        // single token, so the bar for proposing one extra candidate is low.
         let min_ngram = std::env::var("CAMELID_GEMMA4_SPEC_MIN_MATCH")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -9630,7 +9633,54 @@ impl Gemma4Runtime {
                 .unwrap()
         };
         let (mut accepted_rounds, mut accepted_drafts) = (0u64, 0u64);
+        // Drafts offered across the run. p = accepted/offered is the per-draft
+        // token hit rate, which (with the expert-union growth) sets the optimal
+        // draft width; alpha alone cannot distinguish "few good drafts" from
+        // "many bad ones".
+        let mut offered_drafts = 0u64;
+        let mut empty_rounds = 0u64;
         let spec_timing = std::env::var("CAMELID_GEMMA4_SPEC_TIMING").is_ok();
+        // Adaptive draft width: a K-token verify round reads each routed
+        // expert once, but its GPU cost still grows with K (more candidate
+        // tokens per expert, a larger expert union). When acceptance is low
+        // that cost is wasted, so shrink the draft toward 1; when the last
+        // round accepted its whole draft, grow back toward the cap. Opt-in so
+        // the fixed-K sweep benchmarks stay fixed.
+        let adaptive = std::env::var("CAMELID_GEMMA4_SPEC_ADAPTIVE")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        let mut cur_k = max_draft;
+        // Confidence-tiered wave width. A verify round's cost is dominated by a
+        // fixed part (dense weights + the tied head, both read once regardless
+        // of width) plus roughly one expert-union increment per extra candidate
+        // token. Measured on this row: ~2150 MB for a 1-token round and ~310 MB
+        // per additional token. So one extra candidate pays for itself at a hit
+        // rate of only ~22%, while a full-width wave needs ~80%. Match length is
+        // the drafter's confidence proxy, so it sizes the wave: short match ->
+        // one candidate, long match -> the full width.
+        let tier_wide = std::env::var("CAMELID_GEMMA4_SPEC_TIER_WIDE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(5);
+        let tier_mid = std::env::var("CAMELID_GEMMA4_SPEC_TIER_MID")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(3);
+        let tiering = !std::env::var("CAMELID_GEMMA4_SPEC_TIERS")
+            .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"));
+        let width_for_match = |matched_n: usize, cap: usize| -> usize {
+            if !tiering {
+                return cap;
+            }
+            if matched_n == 0 {
+                0
+            } else if matched_n >= tier_wide {
+                cap
+            } else if matched_n >= tier_mid {
+                cap.min(3)
+            } else {
+                1
+            }
+        };
         let mut history = prompt_tokens.to_vec();
         let mut generated: Vec<u32> = Vec::new();
         let mut pos = prompt_tokens.len();
@@ -9646,8 +9696,12 @@ impl Gemma4Runtime {
                 break;
             }
             let budget = max_new - generated.len();
-            let drafts = drafter.draft(&history, max_draft.min(budget));
+            let want = if adaptive { cur_k } else { max_draft };
+            let (mut drafts, matched_n) = drafter.draft_sized(&history, want.min(budget));
+            let width = width_for_match(matched_n, want.min(budget));
+            drafts.truncate(width);
             if drafts.is_empty() {
+                empty_rounds += 1;
                 if spec_timing {
                     eprintln!("[spec-debug] round pos={pos} chunk_len=1 (K=1 round)");
                 }
@@ -9675,7 +9729,7 @@ impl Gemma4Runtime {
             chunk.extend_from_slice(&drafts);
             if spec_timing {
                 eprintln!(
-                    "[spec-debug] round pos={pos} chunk_len={} kc0_len={} drafts={:?}",
+                    "[spec-debug] round pos={pos} chunk_len={} match_n={matched_n} kc0_len={} drafts={:?}",
                     chunk.len(),
                     kc.first().map(|k| k.len()).unwrap_or(0),
                     drafts
@@ -9685,6 +9739,20 @@ impl Gemma4Runtime {
             let (j, next_logits) = self.step_chunk_speculative(&chunk, &drafts, pos, kc, vc)?;
             accepted_rounds += 1;
             accepted_drafts += j as u64;
+            offered_drafts += drafts.len() as u64;
+            if adaptive {
+                // j drafts accepted this round means j+1 tokens emitted from
+                // one weight read. Aim next round's width at what just paid off:
+                // full acceptance grows K by one; a rejection at the first draft
+                // shrinks toward a single-token round.
+                cur_k = if j >= drafts.len() {
+                    (cur_k + 1).min(max_draft)
+                } else if j == 0 {
+                    1
+                } else {
+                    (j + 1).min(max_draft)
+                };
+            }
             crate::metal::SPEC_VERIFY_ROUNDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             crate::metal::SPEC_ACCEPTED_TOKENS
                 .fetch_add(1 + j, std::sync::atomic::Ordering::Relaxed);
@@ -9722,9 +9790,13 @@ impl Gemma4Runtime {
         if spec_timing {
             let toks = generated.len().max(1) as f64;
             eprintln!(
-                "[spec] {} tokens in {accepted_rounds} verify passes ({:.2} tokens/pass; {accepted_drafts} drafts accepted)",
+                "[spec] {} tokens in {accepted_rounds} verify passes ({:.2} tokens/pass; \
+                 {accepted_drafts}/{offered_drafts} drafts accepted, p={:.3}; \
+                 {empty_rounds} empty rounds, {:.0}% of passes)",
                 generated.len(),
                 toks / accepted_rounds.max(1) as f64,
+                accepted_drafts as f64 / offered_drafts.max(1) as f64,
+                100.0 * empty_rounds as f64 / accepted_rounds.max(1) as f64,
             );
         }
         Ok(generated)
