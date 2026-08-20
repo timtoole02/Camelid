@@ -815,6 +815,13 @@ mod spec50_widen;
 #[allow(unused_imports)]
 pub(crate) use spec50_widen::*;
 
+/// Batched router GEMV: reads the router matrix once per K-token chunk.
+#[cfg(target_os = "macos")]
+mod spec50_router;
+#[cfg(target_os = "macos")]
+#[allow(unused_imports)]
+pub(crate) use spec50_router::*;
+
 #[cfg(target_os = "macos")]
 const LINEAR_ROW_SHADER: &str = r#"
 #include <metal_stdlib>
