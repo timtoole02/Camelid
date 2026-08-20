@@ -23536,6 +23536,40 @@ impl Gemma4GhostCommonMetal {
         )
     }
 
+    /// One K-token verify round across all layers.
+    ///
+    /// # Unpredicted-path stage/buffer dependency table
+    ///
+    /// Per layer L, three command buffers on one queue (commit order is
+    /// execution order):
+    ///
+    /// | stage (CB)              | reads                                             | writes                                   |
+    /// |-------------------------|---------------------------------------------------|------------------------------------------|
+    /// | CB1 rms+QKV             | slab_a (tail L-1), norms, q/k/v weights           | normf_batch, query/key/val_batch         |
+    /// | CB1 q/kv norm+RoPE      | query/key/val_batch, cos/sin bufs                 | qn/kn/vn_batch, cache_k/v[L]             |
+    /// | CB1 attention           | qn_batch, cache_k/v[L]                            | scores_buf, denom, ctx_batch             |
+    /// | CB1 O proj + post-attn  | ctx_batch, o_w, slab_a                            | o_batch, slab_b, normf_batch             |
+    /// | CB1 router + quantize   | slab_b, router weights                            | router_logits_batch[@L], expert_input_scales/quants_batch |
+    /// | CB2 shared MLP          | normf_batch, gate/up/down weights                 | act_batch, down_batch, dn_batch          |
+    /// | CB3 topk+gateup+down    | router_logits_batch[@L], expert_to_slot_table[L], slot slab[L], expert_input_scales/quants_batch | gpu_candidate_routes[L], gpu_work_list, gpu_moe_scales/quants, gpu_moe_acc |
+    /// | CB3 tail                | slab_b, dn_batch, gpu_moe_acc, post norms         | slab_a                                   |
+    ///
+    /// Host-side inputs the GPU reads at EXECUTION time (never at encode
+    /// time): the slot slab bytes and `expert_to_slot_table[L]`, both
+    /// published by the filler before CB3 commits. That is why the overlap
+    /// path (`CAMELID_GEMMA4_OVERLAP`) may ENCODE CB3 before the router wait:
+    /// no encode argument depends on the routed union (all dispatch
+    /// dimensions are functions of `num_slots`/`k_tokens`), so encoding
+    /// early and committing after the fill yields a byte-identical stream.
+    /// True dependencies that bound any further overlap: router(L) needs
+    /// attention(L) (reads slab_b), the fill for L needs router(L)'s logits,
+    /// and attention(L+1) needs tail(L)'s slab_a — so the miss-fill itself
+    /// can never be hidden behind this layer's own MoE, only behind CB2 and
+    /// earlier queued work.
+    ///
+    /// Cross-layer scratch reuse (normf/ctx/o/act/down/dn/gpu_moe_acc,
+    /// slab_a/slab_b) is safe because command buffers execute in queue order
+    /// and layer L+1's first writer (CB1 rms) is committed after CB3(L).
     pub(crate) fn execute_chained_round_all_layers(
         &mut self,
         hidden_rows: &[Vec<f32>],
