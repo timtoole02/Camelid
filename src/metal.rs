@@ -579,6 +579,16 @@ struct GpuStageStamp {
     cbs: Vec<(u8, metal::CommandBuffer)>,
 }
 
+/// Process-cached spec50 MoE pipelines. Device::system_default() is an objc
+/// round-trip; calling it per layer per round measured as a large host-idle
+/// regression (round 217 -> 268 ms), so the lookup happens exactly once.
+#[cfg(target_os = "macos")]
+fn moe_spec50_cached() -> Option<&'static Spec50MoeVariant> {
+    static CACHE: std::sync::OnceLock<Option<&'static Spec50MoeVariant>> =
+        std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| Device::system_default().as_ref().and_then(spec50_moe_pipelines))
+}
+
 /// CAMELID_GEMMA4_MOE_SPEC50=0 falls back to the original routed-expert
 /// kernels. The replacements are bitwise identical; timing A/B lever only.
 #[cfg(target_os = "macos")]
@@ -22968,8 +22978,8 @@ impl Gemma4GhostCommonMetal {
             // static token bound). Byte-for-byte the same binding; timing-only
             // swap; CAMELID_GEMMA4_MOE_SPEC50=0 restores the reference.
             if !moe_spec50_disabled() {
-                if let Some(dev) = Device::system_default() {
-                    if let Some(variant) = spec50_moe_pipelines(&dev) {
+                if let Some(variant) = moe_spec50_cached() {
+                    {
                         encode_spec50_gateup(
                             encoder,
                             &variant.gateup,
@@ -23101,8 +23111,8 @@ impl Gemma4GhostCommonMetal {
         // bitwise identical to the scatter_reduce_simd reference for every
         // row/token/K in 1..=8, same binding. 1.62x at K=8.
         if !moe_spec50_disabled() && k_tokens <= 8 {
-            if let Some(dev) = Device::system_default() {
-                if let Some(variant) = spec50_moe_pipelines(&dev) {
+            if let Some(variant) = moe_spec50_cached() {
+                {
                     encode_spec50_down(
                         encoder,
                         &variant.down,
