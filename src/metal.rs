@@ -14516,6 +14516,99 @@ fn encode_q6k_ordered_single(
     );
 }
 
+/// [`encode_q6k_ordered_batch`] with byte offsets into the batch-major
+/// scales/quants/logits buffers, so a K>8 chunk can run as slabs of <=8 rows
+/// through the SAME batch pipelines the K<=8 path uses (identical per-row
+/// arithmetic flavor). Callers guarantee `k_batch <= 8`.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_q6k_ordered_batch_at(
+    encoder: &metal::ComputeCommandEncoderRef,
+    kernel: &MetalLinearKernel,
+    input_scales: &Buffer,
+    input_scales_offset: u64,
+    input_quants: &Buffer,
+    input_quants_offset: u64,
+    weight: &Buffer,
+    weight_offset: u64,
+    output: &Buffer,
+    output_offset: u64,
+    scalar: &Buffer,
+    n_superblocks: usize,
+    rows: usize,
+    k_batch: usize,
+    hidden: usize,
+    softcap: f32,
+) {
+    debug_assert!((1..=8).contains(&k_batch));
+    let specialized_k8 = (k_batch == 8 && !head_k8_generic())
+        .then_some(kernel.q6k_linear_turbo_batch_k8_pipeline.as_ref())
+        .flatten();
+    let is_specialized_k8 = specialized_k8.is_some();
+    let turbo_batch_pipeline = (!std::env::var("CAMELID_GEMMA4_GHOST_METAL_TURBO")
+        .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false")))
+    .then(|| {
+        specialized_k8.or_else(|| {
+            admitted_32_lane_pipeline(kernel.q6k_linear_turbo_batch_k_pipeline.as_ref())
+        })
+    })
+    .flatten();
+    let _ = hidden;
+    let _ = scalar;
+    if let Some(pipeline) = turbo_batch_pipeline {
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(input_scales), input_scales_offset);
+        encoder.set_buffer(1, Some(input_quants), input_quants_offset);
+        encoder.set_buffer(2, Some(weight), weight_offset);
+        encoder.set_buffer(3, Some(output), output_offset);
+        let n_sb_u32 = n_superblocks as u32;
+        let rows_u32 = rows as u32;
+        let k_u32 = k_batch as u32;
+        let softcap_f32 = softcap;
+        encoder.set_bytes(4, 4, &n_sb_u32 as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &rows_u32 as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &k_u32 as *const u32 as *const _);
+        encoder.set_bytes(7, 4, &softcap_f32 as *const f32 as *const _);
+        if is_specialized_k8 {
+            encoder.dispatch_thread_groups(
+                metal::MTLSize { width: rows.div_ceil(4) as u64, height: 1, depth: 1 },
+                metal::MTLSize { width: 128, height: 1, depth: 1 },
+            );
+        } else {
+            dispatch_q6k_turbo_rows(encoder, rows);
+        }
+        return;
+    }
+    if let Some(pipeline) = kernel.q6k_linear_ordered_batch_k_pipeline.as_ref() {
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(input_scales), input_scales_offset);
+        encoder.set_buffer(1, Some(input_quants), input_quants_offset);
+        encoder.set_buffer(2, Some(weight), weight_offset);
+        encoder.set_buffer(3, Some(output), output_offset);
+        let n_sb_u32 = n_superblocks as u32;
+        let rows_u32 = rows as u32;
+        let k_u32 = k_batch as u32;
+        let softcap_f32 = softcap;
+        encoder.set_bytes(4, 4, &n_sb_u32 as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &rows_u32 as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &k_u32 as *const u32 as *const _);
+        encoder.set_bytes(7, 4, &softcap_f32 as *const f32 as *const _);
+        let scratch_bytes =
+            (k_batch * n_superblocks * 8 * std::mem::size_of::<i32>()).next_multiple_of(16);
+        assert_threadgroup_fits(
+            &kernel.device,
+            scratch_bytes,
+            "ordered Gemma 4 Q6_K tile-once head scratch",
+        );
+        encoder.set_threadgroup_memory_length(0, scratch_bytes as u64);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize { width: rows as u64, height: 1, depth: 1 },
+            metal::MTLSize { width: 32, height: 1, depth: 1 },
+        );
+    }
+}
+
+
 /// Encode K candidate Q6_K GEMVs. Prefers a tile-once kernel that matches the
 /// same per-token reduction `encode_q6k_ordered_single` / `forward()` uses
 /// (turbo simd_sum when that lane is live, otherwise ordered lane-zero fold).
@@ -14645,22 +14738,40 @@ fn encode_q6k_ordered_batch(
             return;
         }
     }
-    for i in 0..k_batch {
-        encode_q6k_ordered_single(
+    // K > 8: two slabs through the SAME batch kernels the K<=8 path uses.
+    // The serial per-token fallback ran q6k_linear_turbo (the single-token
+    // kernel), whose accumulation flavor measurably diverges from the batch
+    // kernels (415/2048 rows, worst 512 ULP) and flips near-tied argmaxes
+    // against the reference stream (measured: chunk widths 9..16 emitted 9430
+    // where every width <= 8 and the llama.cpp oracle emit 2717). Slabbing
+    // keeps every row on the batch flavor, which spec50's harness proved
+    // mutually bitwise-consistent across batch_k / batch_k8 / spec50 for
+    // every K in 1..=8, so per-row numerics are now chunk-width-independent.
+    let mut done = 0usize;
+    while done < k_batch {
+        let slab = (k_batch - done).min(8);
+        let scales_off = (done * n_superblocks * std::mem::size_of::<f32>()) as u64;
+        let quants_off = (done * hidden) as u64;
+        let logits_off = (done * rows * std::mem::size_of::<f32>()) as u64;
+        encode_q6k_ordered_batch_at(
             encoder,
             kernel,
             input_scales,
+            scales_off,
             input_quants,
+            quants_off,
             weight,
             weight_offset,
             output,
+            logits_off,
             scalar,
             n_superblocks,
             rows,
-            (i * n_superblocks * std::mem::size_of::<f32>()) as u64,
-            (i * hidden) as u64,
-            (i * rows * std::mem::size_of::<f32>()) as u64,
+            slab,
+            hidden,
+            softcap,
         );
+        done += slab;
     }
 }
 #[cfg(target_os = "macos")]
@@ -15594,7 +15705,13 @@ impl Gemma4Q6KHead {
         // when its pipelines are unavailable. Reached only for k >= 2; k == 1
         // delegates to forward() above and keeps the single-token kernel, which has
         // its own (fma-contraction) numerics that we deliberately do not disturb here.
+        // spec50's k<=8 table is bitwise-proven against the batch reference;
+        // the k>8 wide table was anchored to the single-token kernel's flavor
+        // (which diverges from the oracle stream on near-ties), so wide chunks
+        // take encode_q6k_ordered_batch below, which slabs them through the
+        // proven batch pipelines at the same per-row arithmetic as K<=8.
         let used_spec50 = !head_spec50_disabled()
+            && k <= 8
             && spec50_head_kernels().is_some_and(|kernels| {
                 encode_q6k_spec50_batch(
                     encoder,
