@@ -579,6 +579,17 @@ struct GpuStageStamp {
     cbs: Vec<(u8, metal::CommandBuffer)>,
 }
 
+/// CAMELID_GEMMA4_DENSE_V4=0 falls back to the original dense batch kernels.
+/// The replacement is bitwise identical, so this is a timing A/B lever only.
+#[cfg(target_os = "macos")]
+fn dense_v4_disabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_DENSE_V4")
+            .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+    })
+}
+
 /// CAMELID_GEMMA4_HEAD_SPEC50=0 falls back to the original batched tied-head
 /// kernels. The replacement is bitwise identical for K in 1..=8, so this is an
 /// A/B lever for timing, not a correctness switch.
@@ -760,6 +771,11 @@ static METAL_LINEAR_CACHE: OnceLock<Mutex<MetalLinearCache>> = OnceLock::new();
 mod spec50_head;
 #[cfg(target_os = "macos")]
 pub(crate) use spec50_head::*;
+#[cfg(target_os = "macos")]
+mod spec50_dense;
+#[cfg(target_os = "macos")]
+#[allow(unused_imports)]
+pub(crate) use spec50_dense::*;
 
 #[cfg(target_os = "macos")]
 const LINEAR_ROW_SHADER: &str = r#"
@@ -23395,20 +23411,45 @@ impl Gemma4GhostCommonMetal {
                     &layer.rms_scalar,
                     k_tokens,
                 );
-                encode_gemma4_q4_0_qkv_matmul_batch_k(
-                    encoder,
-                    kernel,
-                    &self.resident_scratch.normf_batch,
-                    &layer.q_w,
-                    &layer.k_w,
-                    v_w,
-                    &self.resident_scratch.query_batch,
-                    &self.resident_scratch.key_batch,
-                    &self.resident_scratch.val_batch,
-                    &layer.qkv_scalar_batch,
-                    q_dim + 2 * kv_dim,
-                    k_tokens,
-                );
+                // Threadgroup-staged fused QKV: 1.44x on the local-layer shape,
+                // asserted bit-identical to the reference kernel it replaces
+                // (0 differing f32 bits, K=8, verified against loop-carried
+                // block counts). Returns false unless k_batch == 8 with
+                // 4-aligned q/k/v row splits, in which case the reference
+                // kernel below runs unchanged.
+                let staged_qkv = !dense_v4_disabled()
+                    && spec50_dense_kernels().is_some_and(|dk| {
+                        encode_gemma4_q4_0_qkv_matmul_batch_k_v4(
+                            encoder,
+                            dk,
+                            &self.resident_scratch.normf_batch,
+                            &layer.q_w,
+                            &layer.k_w,
+                            v_w,
+                            &self.resident_scratch.query_batch,
+                            &self.resident_scratch.key_batch,
+                            &self.resident_scratch.val_batch,
+                            &layer.qkv_scalar_batch,
+                            q_dim + 2 * kv_dim,
+                            k_tokens,
+                        )
+                    });
+                if !staged_qkv {
+                    encode_gemma4_q4_0_qkv_matmul_batch_k(
+                        encoder,
+                        kernel,
+                        &self.resident_scratch.normf_batch,
+                        &layer.q_w,
+                        &layer.k_w,
+                        v_w,
+                        &self.resident_scratch.query_batch,
+                        &self.resident_scratch.key_batch,
+                        &self.resident_scratch.val_batch,
+                        &layer.qkv_scalar_batch,
+                        q_dim + 2 * kv_dim,
+                        k_tokens,
+                    );
+                }
             } else {
                 encode_rms_norm_batch(
                     kernel,
