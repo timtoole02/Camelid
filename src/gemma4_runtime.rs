@@ -1803,6 +1803,139 @@ impl GhostMetalSlotDirectory {
     }
 }
 
+/// Fixed-capacity host ring of expert records salvaged at slot eviction, one
+/// per layer (so fills need no locking: the layer is already exclusively
+/// borrowed wherever fills run, including the predicted path's per-layer
+/// parallel fan-out).
+///
+/// Rationale (measured, K=8 copy workload, 64 tokens): fill time was 882 ms
+/// and every one of the 446 slot misses was a ~1.9 ms NVMe demand pread; the
+/// eviction count equaled the miss count exactly because the directory runs
+/// full, and the evicted record's bytes were sitting intact in the slot slab
+/// at eviction time. Salvaging them to host memory turns a later re-miss
+/// into a ~0.1 ms memcpy.
+///
+/// Correctness is structural: entries hold immutable `.cghost` record bytes
+/// (the slab bytes of a directory-COMMITTED slot are exactly the expert's
+/// record - fills copy or pread the full record before `commit_load`, and
+/// nothing writes expert slabs GPU-side), so a ring entry can never go
+/// stale. Replacement is ring order (oldest insertion overwritten first);
+/// slabs are allocated lazily so an idle ring costs no memory.
+#[cfg(any(target_os = "macos", test))]
+struct GhostVictimRing {
+    record_bytes: usize,
+    keys: Vec<Option<u16>>,
+    slabs: Vec<Option<Box<[u8]>>>,
+    /// expert id -> ring position, -1 = absent.
+    index: [i32; 128],
+    cursor: usize,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl GhostVictimRing {
+    fn new(capacity: usize, record_bytes: usize) -> Self {
+        Self {
+            record_bytes,
+            keys: vec![None; capacity],
+            slabs: (0..capacity).map(|_| None).collect(),
+            index: [-1; 128],
+            cursor: 0,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.keys.len()
+    }
+
+    fn lookup(&self, expert: usize) -> Option<&[u8]> {
+        if expert >= 128 {
+            return None;
+        }
+        let pos = self.index[expert];
+        if pos < 0 {
+            return None;
+        }
+        self.slabs[pos as usize].as_deref()
+    }
+
+    /// Copy `record` into the ring under `expert`. Returns true when bytes
+    /// were copied; false means disabled, invalid input, or already present
+    /// (records are immutable, so a re-insert of a resident key needs no
+    /// copy and does not advance the ring).
+    fn insert(&mut self, expert: usize, record: &[u8]) -> bool {
+        if self.keys.is_empty() || expert >= 128 || record.len() != self.record_bytes {
+            return false;
+        }
+        if self.index[expert] >= 0 {
+            return false;
+        }
+        let pos = self.cursor;
+        self.cursor = (self.cursor + 1) % self.keys.len();
+        if let Some(old) = self.keys[pos] {
+            self.index[old as usize] = -1;
+        }
+        let slab = self.slabs[pos]
+            .get_or_insert_with(|| vec![0u8; self.record_bytes].into_boxed_slice());
+        slab.copy_from_slice(record);
+        self.keys[pos] = Some(expert as u16);
+        self.index[expert] = pos as i32;
+        true
+    }
+}
+
+/// Victim-ring sizing: CAMELID_GEMMA4_VICTIM_CACHE gates it (default ON;
+/// "0"/"false" restores today's pread-only refills exactly), and
+/// CAMELID_GEMMA4_VICTIM_MB is the TOTAL host budget across all layers
+/// (default 1536 MiB -> ~16 records/layer at the 26B record size; capped at
+/// 8192). The budget is a cap, not a reservation: slabs allocate lazily.
+#[cfg(any(target_os = "macos", test))]
+fn victim_ring_records_from(
+    gate: Option<&str>,
+    budget_mb: Option<&str>,
+    layer_count: usize,
+    record_bytes: usize,
+) -> usize {
+    let disabled = matches!(gate, Some(v) if v == "0" || v.eq_ignore_ascii_case("false"));
+    if disabled || layer_count == 0 || record_bytes == 0 {
+        return 0;
+    }
+    let mb = budget_mb
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(1536)
+        .min(8192);
+    (mb * 1024 * 1024) / layer_count / record_bytes
+}
+
+#[cfg(target_os = "macos")]
+fn ghost_metal_victim_records_per_layer(layer_count: usize) -> usize {
+    victim_ring_records_from(
+        std::env::var("CAMELID_GEMMA4_VICTIM_CACHE").ok().as_deref(),
+        std::env::var("CAMELID_GEMMA4_VICTIM_MB").ok().as_deref(),
+        layer_count,
+        crate::metal::GEMMA4_Q4_EXPERT_RECORD_BYTES,
+    )
+}
+
+/// CAMELID_GEMMA4_VICTIM_VERIFY=N: byte-verify every Nth victim-ring fill
+/// against a fresh `.cghost` pread of the same record (0/unset = off). A
+/// mismatch is loud, counted, and repaired fail-closed by overwriting the
+/// slot with the disk bytes before the round proceeds.
+#[cfg(target_os = "macos")]
+fn victim_verify_every() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_VICTIM_VERIFY")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Sample counter for CAMELID_GEMMA4_VICTIM_VERIFY (process-wide so sampling
+/// is uniform across layers and rounds).
+#[cfg(target_os = "macos")]
+static VICTIM_FILL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Retain the hottest `limit` prompt experts while preserving the original
 /// repeated route sequence for LFU/recency evidence. Frequency wins; the most
 /// recent occurrence breaks ties; expert ID is the final deterministic key.
@@ -1907,6 +2040,9 @@ struct GhostMetalExpertLayer {
     slots: crate::metal::Gemma4Q4ExpertSlots,
     stats: GhostMetalSlotStats,
     shared: Option<GhostMetalSharedBuffers>,
+    /// Host ring of records salvaged from this layer's evicted slots.
+    /// Capacity 0 = disabled (CAMELID_GEMMA4_VICTIM_CACHE=0).
+    victims: GhostVictimRing,
     /// Chained-round sequence number at which each expert was last EVICTED
     /// from this layer's directory (0 = never). Prices the re-miss question:
     /// on a miss whose expert has a nonzero entry, `current_round - entry` is
@@ -2030,6 +2166,14 @@ struct WaveFillCounters {
     /// Post-router filler split: routing compute vs slot fill.
     route_us: std::sync::atomic::AtomicU64,
     fill_us: std::sync::atomic::AtomicU64,
+    /// Victim-ring outcomes: misses served from the ring (and their memcpy
+    /// time), eviction-salvage copies INTO the ring (and their time), and
+    /// sampled byte-verify failures (always 0 unless the ring is broken).
+    victim_hits: std::sync::atomic::AtomicU64,
+    victim_us: std::sync::atomic::AtomicU64,
+    salvage_copies: std::sync::atomic::AtomicU64,
+    salvage_us: std::sync::atomic::AtomicU64,
+    victim_verify_fails: std::sync::atomic::AtomicU64,
 }
 
 /// Bring `selected_experts` into this layer's persistent Metal slots.
@@ -2110,9 +2254,127 @@ fn fill_metal_wave_slots_from_host_cache(
     }
 
     let record_bytes = layer.slots.slot_record_bytes();
+
+    // Victim salvage BEFORE any fill: each eviction's slot equals the slot of
+    // the load that displaced it, and that slot still holds the evicted
+    // expert's intact record bytes until the copy/pread phases below
+    // overwrite it. Copying them to the layer's host ring turns a later
+    // re-miss of that expert into a host memcpy instead of a demand pread.
+    // This writes only host memory and cannot affect the round: slot
+    // contents, the directory, and fill sourcing for THIS plan are untouched.
+    if layer.victims.capacity() > 0 && !plan.evicted.is_empty() {
+        let t_salvage = std::time::Instant::now();
+        for eviction in &plan.evicted {
+            if let Some(src) = layer.slots.slot_bytes_mut(eviction.slot) {
+                if layer.victims.insert(eviction.expert, src) {
+                    counters.salvage_copies.fetch_add(1, Relaxed);
+                }
+            }
+        }
+        counters.salvage_us.fetch_add(
+            (t_salvage.elapsed().as_secs_f64() * 1_000_000.0) as u64,
+            Relaxed,
+        );
+    }
+
+    // Serve misses from the victim ring first (a ~0.1 ms host memcpy beats
+    // both the host expert cache probe below - which never hits on this lane -
+    // and the ~2 ms pread). Ring bytes are the expert's immutable record, so
+    // the slot ends up byte-identical to a pread fill
+    // (CAMELID_GEMMA4_VICTIM_VERIFY=N spot-checks exactly that).
+    let mut pending: Vec<GhostMetalSlotLoad> = Vec::with_capacity(plan.loads.len());
+    let mut ring_hits: Vec<GhostMetalSlotLoad> = Vec::new();
+    if layer.victims.capacity() > 0 {
+        for load in plan.loads.iter().copied() {
+            let servable = layer
+                .victims
+                .lookup(load.expert)
+                .is_some_and(|bytes| bytes.len() == record_bytes)
+                && load.slot < layer.slots.slot_count();
+            if servable {
+                ring_hits.push(load);
+            } else {
+                pending.push(load);
+            }
+        }
+    } else {
+        pending.extend(plan.loads.iter().copied());
+    }
+    if !ring_hits.is_empty() {
+        let t_victim = std::time::Instant::now();
+        if crate::metal::overlap_enabled() && ring_hits.len() > 1 && cache.read_pool.is_some() {
+            // Same race-freedom argument as the host-cache copies below: a
+            // plan's loads have pairwise distinct slots, the ring is not
+            // mutated during this phase, and commits run serially after.
+            let pool = cache.read_pool.as_ref().expect("checked above");
+            let slots_ref = &layer.slots;
+            let victims_ref = &layer.victims;
+            pool.install(|| {
+                ring_hits.par_iter().for_each(|load| {
+                    if let (Some(src), Some(dest)) = (victims_ref.lookup(load.expert), unsafe {
+                        slots_ref.slot_bytes_mut_raw(load.slot)
+                    }) {
+                        dest.copy_from_slice(src);
+                    }
+                });
+            });
+        } else {
+            for load in ring_hits.iter().copied() {
+                if let Some(src) = layer.victims.lookup(load.expert) {
+                    if let Some(dest) = unsafe { layer.slots.slot_bytes_mut_raw(load.slot) } {
+                        dest.copy_from_slice(src);
+                    }
+                }
+            }
+        }
+        for load in ring_hits.iter().copied() {
+            layer.directory.commit_load(load);
+        }
+        counters
+            .victim_hits
+            .fetch_add(ring_hits.len() as u64, Relaxed);
+        counters.victim_us.fetch_add(
+            (t_victim.elapsed().as_secs_f64() * 1_000_000.0) as u64,
+            Relaxed,
+        );
+        let verify_every = victim_verify_every();
+        if verify_every > 0 {
+            let mut oracle = vec![0u8; record_bytes];
+            for load in ring_hits.iter().copied() {
+                let seq = VICTIM_FILL_SEQ.fetch_add(1, Relaxed);
+                if !seq.is_multiple_of(verify_every) {
+                    continue;
+                }
+                if cache
+                    .file
+                    .read_moe_expert_into(layer_idx, load.expert, &mut oracle)
+                    .is_ok()
+                {
+                    let identical = layer
+                        .slots
+                        .slot_bytes_mut(load.slot)
+                        .is_some_and(|slot| slot[..] == oracle[..]);
+                    if !identical {
+                        counters.victim_verify_fails.fetch_add(1, Relaxed);
+                        eprintln!(
+                            "[gemma4-ghost-metal] VICTIM VERIFY FAIL layer {layer_idx} expert {} slot {}: ring bytes differ from .cghost; slot repaired from disk",
+                            load.expert, load.slot
+                        );
+                        if let Some(dest) = layer.slots.slot_bytes_mut(load.slot) {
+                            dest.copy_from_slice(&oracle);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if pending.is_empty() {
+        return;
+    }
+
     let t_copy = std::time::Instant::now();
-    let mut direct_fallback = Vec::with_capacity(plan.loads.len());
-    if crate::metal::overlap_enabled() && plan.loads.len() > 1 && cache.read_pool.is_some() {
+    let mut direct_fallback = Vec::with_capacity(pending.len());
+    if crate::metal::overlap_enabled() && pending.len() > 1 && cache.read_pool.is_some() {
         // CAMELID_GEMMA4_OVERLAP: run the host-cache -> slot copies through
         // the read pool instead of one serial memcpy per miss. This changes
         // only copy scheduling: the destinations are distinct slots the plan
@@ -2121,8 +2383,8 @@ fn fill_metal_wave_slots_from_host_cache(
         // serially in the plan's load order, so the directory's end state is
         // identical to the serial path's.
         let mut resident: Vec<(GhostMetalSlotLoad, Arc<GhostMoeExpert>)> =
-            Vec::with_capacity(plan.loads.len());
-        for load in plan.loads.iter().copied() {
+            Vec::with_capacity(pending.len());
+        for load in pending.iter().copied() {
             match cache.peek_resident(layer_idx, load.expert) {
                 Some(record)
                     if record.byte_len() == record_bytes
@@ -2155,7 +2417,7 @@ fn fill_metal_wave_slots_from_host_cache(
             }
         }
     } else {
-        for load in plan.loads.iter().copied() {
+        for load in pending.iter().copied() {
             if let Some(record) = cache.peek_resident(layer_idx, load.expert) {
                 if record.byte_len() == record_bytes {
                     if let Some(dest) = layer.slots.slot_bytes_mut(load.slot) {
@@ -2521,6 +2783,14 @@ impl GhostMetalExpertRuntime {
             }
         }
         let engine = crate::metal::Gemma4Q4ExpertMetal::new()?;
+        let victim_records = ghost_metal_victim_records_per_layer(layer_count);
+        if victim_records > 0 {
+            eprintln!(
+                "[gemma4-ghost-metal] victim ring: {victim_records} records/layer x {layer_count} layers (cap {:.0} MiB, lazily allocated; CAMELID_GEMMA4_VICTIM_CACHE=0 disables)",
+                (victim_records * layer_count * crate::metal::GEMMA4_Q4_EXPERT_RECORD_BYTES) as f64
+                    / (1024.0 * 1024.0),
+            );
+        }
         let mut layers = Vec::with_capacity(layer_count);
         for &slots in slots_per_layer {
             let slots_obj = crate::metal::Gemma4Q4ExpertSlots::new(slots)?;
@@ -2530,6 +2800,10 @@ impl GhostMetalExpertRuntime {
                 slots: slots_obj,
                 stats: GhostMetalSlotStats::default(),
                 shared: None,
+                victims: GhostVictimRing::new(
+                    victim_records,
+                    crate::metal::GEMMA4_Q4_EXPERT_RECORD_BYTES,
+                ),
                 evicted_round: [0; 128],
             });
         }
@@ -3149,6 +3423,21 @@ impl GhostMetalExpertRuntime {
                 fill_counters.plan_misses.load(Relaxed).min(u32::MAX as u64) as u32;
             common.last_chained_ledger.slot_evictions =
                 fill_counters.plan_evictions.load(Relaxed).min(u32::MAX as u64) as u32;
+            common.last_chained_ledger.victim_hits =
+                fill_counters.victim_hits.load(Relaxed).min(u32::MAX as u64) as u32;
+            common.last_chained_ledger.victim_fill_ms =
+                fill_counters.victim_us.load(Relaxed) as f64 / 1000.0;
+            common.last_chained_ledger.victim_salvage_copies = fill_counters
+                .salvage_copies
+                .load(Relaxed)
+                .min(u32::MAX as u64)
+                as u32;
+            common.last_chained_ledger.victim_salvage_ms =
+                fill_counters.salvage_us.load(Relaxed) as f64 / 1000.0;
+            common.last_chained_ledger.victim_verify_fails = fill_counters
+                .victim_verify_fails
+                .load(Relaxed)
+                .min(u32::MAX as u64) as u32;
             common.last_chained_ledger.overlap_prev_hits = overlap_prev_hits;
             common.last_chained_ledger.overlap_prev_total = overlap_prev_total;
             common.last_chained_ledger.resident_start_hits = resident_start_hits;
@@ -3166,6 +3455,16 @@ impl GhostMetalExpertRuntime {
                     .fetch_add(fill_counters.plan_misses.load(Relaxed), Relaxed);
                 crate::metal::SPEC_SLOT_EVICTIONS
                     .fetch_add(fill_counters.plan_evictions.load(Relaxed), Relaxed);
+                crate::metal::SPEC_VICTIM_HITS
+                    .fetch_add(fill_counters.victim_hits.load(Relaxed), Relaxed);
+                crate::metal::SPEC_VICTIM_FILL_US
+                    .fetch_add(fill_counters.victim_us.load(Relaxed), Relaxed);
+                crate::metal::SPEC_VICTIM_SALVAGE_COPIES
+                    .fetch_add(fill_counters.salvage_copies.load(Relaxed), Relaxed);
+                crate::metal::SPEC_VICTIM_SALVAGE_US
+                    .fetch_add(fill_counters.salvage_us.load(Relaxed), Relaxed);
+                crate::metal::SPEC_VICTIM_VERIFY_FAILS
+                    .fetch_add(fill_counters.victim_verify_fails.load(Relaxed), Relaxed);
                 crate::metal::SPEC_PREV_UNION_HITS.fetch_add(overlap_prev_hits as u64, Relaxed);
                 crate::metal::SPEC_PREV_UNION_TOTAL.fetch_add(overlap_prev_total as u64, Relaxed);
                 crate::metal::SPEC_RESIDENT_START_HITS
@@ -3206,15 +3505,20 @@ impl GhostMetalExpertRuntime {
                     led.unique_experts_sum,
                 );
                 eprintln!(
-                    "[metal chained idle] route={:.1}ms fill={:.1}ms (copy={:.1}ms disk={:.1}ms) pre_encode={:.1}ms slot hits={} misses={} evictions={} union_vs_prev={}/{} resident_at_start={}/{} overlap_layers={}/{}",
+                    "[metal chained idle] route={:.1}ms fill={:.1}ms (copy={:.1}ms disk={:.1}ms victim={:.1}ms) pre_encode={:.1}ms slot hits={} misses={} evictions={} victim_hits={} salvage={} ({:.1}ms) verify_fails={} union_vs_prev={}/{} resident_at_start={}/{} overlap_layers={}/{}",
                     led.filler_route_ms,
                     led.filler_fill_ms,
                     led.fill_copy_ms,
                     led.nvme_ms,
+                    led.victim_fill_ms,
                     led.pre_encode_ms,
                     led.slot_hits,
                     led.slot_misses,
                     led.slot_evictions,
+                    led.victim_hits,
+                    led.victim_salvage_copies,
+                    led.victim_salvage_ms,
+                    led.victim_verify_fails,
                     led.overlap_prev_hits,
                     led.overlap_prev_total,
                     led.resident_start_hits,
@@ -16815,6 +17119,66 @@ mod ghost_moe_wire_tests {
         }
         assert_eq!(forward.entries, reverse.entries);
         assert_eq!(forward.resident_slot_table, reverse.resident_slot_table);
+    }
+
+    /// Ring semantics the fill path relies on: lookup returns exactly the
+    /// bytes inserted, replacement is oldest-insertion-first, a displaced
+    /// key stops resolving, and re-inserting a resident key is a no-op (the
+    /// records are immutable) that neither copies nor advances the ring.
+    #[test]
+    fn victim_ring_inserts_looks_up_and_replaces_in_ring_order() {
+        let mut ring = GhostVictimRing::new(2, 4);
+        assert_eq!(ring.capacity(), 2);
+        assert!(ring.lookup(7).is_none());
+        assert!(ring.insert(7, &[1, 1, 1, 1]));
+        assert!(ring.insert(9, &[2, 2, 2, 2]));
+        assert_eq!(ring.lookup(7), Some(&[1u8, 1, 1, 1][..]));
+        assert_eq!(ring.lookup(9), Some(&[2u8, 2, 2, 2][..]));
+        // Resident key: refresh is a no-op and must not advance the cursor.
+        assert!(!ring.insert(7, &[1, 1, 1, 1]));
+        // Third distinct key displaces the OLDEST insertion (expert 7).
+        assert!(ring.insert(11, &[3, 3, 3, 3]));
+        assert!(ring.lookup(7).is_none());
+        assert_eq!(ring.lookup(9), Some(&[2u8, 2, 2, 2][..]));
+        assert_eq!(ring.lookup(11), Some(&[3u8, 3, 3, 3][..]));
+    }
+
+    #[test]
+    fn victim_ring_rejects_invalid_inserts() {
+        let mut ring = GhostVictimRing::new(1, 4);
+        assert!(!ring.insert(128, &[0, 0, 0, 0]), "expert id out of range");
+        assert!(!ring.insert(3, &[0, 0, 0]), "wrong record size");
+        assert!(ring.lookup(3).is_none());
+        let mut disabled = GhostVictimRing::new(0, 4);
+        assert!(!disabled.insert(3, &[0, 0, 0, 0]));
+        assert!(disabled.lookup(3).is_none());
+        assert_eq!(disabled.capacity(), 0);
+    }
+
+    /// CAMELID_GEMMA4_VICTIM_CACHE / CAMELID_GEMMA4_VICTIM_MB parse: default
+    /// ON with a 1536 MiB total budget split evenly across layers; "0" or
+    /// "false" (or a 0 MB budget) disables; the budget is capped.
+    #[test]
+    fn victim_ring_sizing_defaults_and_gates() {
+        let record = 3_345_408usize; // 26B expert record bytes
+        let default_records = victim_ring_records_from(None, None, 30, record);
+        assert_eq!(default_records, 16);
+        assert_eq!(victim_ring_records_from(Some("1"), None, 30, record), 16);
+        assert_eq!(victim_ring_records_from(Some("0"), None, 30, record), 0);
+        assert_eq!(victim_ring_records_from(Some("false"), None, 30, record), 0);
+        assert_eq!(victim_ring_records_from(None, Some("0"), 30, record), 0);
+        assert_eq!(victim_ring_records_from(None, Some("512"), 30, record), 5);
+        // Cap: an absurd budget clamps to 8 GiB total.
+        assert_eq!(
+            victim_ring_records_from(None, Some("999999"), 30, record),
+            victim_ring_records_from(None, Some("8192"), 30, record)
+        );
+        // Junk parses to the default budget.
+        assert_eq!(
+            victim_ring_records_from(None, Some("junk"), 30, record),
+            default_records
+        );
+        assert_eq!(victim_ring_records_from(None, None, 0, record), 0);
     }
 
     /// CAMELID_GEMMA4_OVERLAP parse: default ON, only an explicit "0" or

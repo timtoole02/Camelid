@@ -278,6 +278,14 @@ fn gemma4_spec50_bench() {
                 .iter()
                 .map(|a| a.load(Relaxed))
                 .collect();
+            // Victim-ring baselines.
+            let victim0 = [
+                camelid::metal::SPEC_VICTIM_HITS.load(Relaxed),
+                camelid::metal::SPEC_VICTIM_FILL_US.load(Relaxed),
+                camelid::metal::SPEC_VICTIM_SALVAGE_COPIES.load(Relaxed),
+                camelid::metal::SPEC_VICTIM_SALVAGE_US.load(Relaxed),
+                camelid::metal::SPEC_VICTIM_VERIFY_FAILS.load(Relaxed),
+            ];
             let t1 = Instant::now();
             let spec_tokens = runtime
                 .spec_decode_generate(&mut kc, &mut vc, logits, &prompt_tokens, &eot, max_new)
@@ -402,6 +410,19 @@ fn gemma4_spec50_bench() {
                         rd[5],
                         rd[6],
                         rd[7],
+                    );
+                    // Victim ring: misses served by host memcpy instead of
+                    // pread, plus what salvaging cost. verify_fails must be 0.
+                    println!(
+                        "[k-victim K={k}] ring_hits={} fill={:.0}ms salvage_copies={} \
+                         salvage={:.0}ms verify_fails={}",
+                        camelid::metal::SPEC_VICTIM_HITS.load(Relaxed) - victim0[0],
+                        (camelid::metal::SPEC_VICTIM_FILL_US.load(Relaxed) - victim0[1]) as f64
+                            / 1000.0,
+                        camelid::metal::SPEC_VICTIM_SALVAGE_COPIES.load(Relaxed) - victim0[2],
+                        (camelid::metal::SPEC_VICTIM_SALVAGE_US.load(Relaxed) - victim0[3]) as f64
+                            / 1000.0,
+                        camelid::metal::SPEC_VICTIM_VERIFY_FAILS.load(Relaxed) - victim0[4],
                     );
                 }
                 println!(

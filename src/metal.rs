@@ -21505,6 +21505,15 @@ pub struct ChainedRoundHostLedger {
     pub slot_hits: u32,
     pub slot_misses: u32,
     pub slot_evictions: u32,
+    /// Victim-ring outcome of this round: misses refilled from the host ring
+    /// instead of a demand pread (and their memcpy time), eviction records
+    /// salvaged INTO the ring (and their time), and sampled byte-verify
+    /// failures (nonzero only if the ring ever disagrees with the .cghost).
+    pub victim_hits: u32,
+    pub victim_fill_ms: f64,
+    pub victim_salvage_copies: u32,
+    pub victim_salvage_ms: f64,
+    pub victim_verify_fails: u32,
     /// Union continuity: of this round's per-layer union members
     /// (`overlap_prev_total`), how many were in the previous successful
     /// round's union for the same layer / already resident at round start.
@@ -21729,6 +21738,16 @@ pub static SPEC_SLOT_EVICTIONS: std::sync::atomic::AtomicU64 =
 pub static SPEC_MISS_COLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static SPEC_REMISS_DIST_HIST: [std::sync::atomic::AtomicU64; 8] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+/// Victim-ring accumulators (see ChainedRoundHostLedger::victim_*).
+pub static SPEC_VICTIM_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_VICTIM_FILL_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_VICTIM_SALVAGE_COPIES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_VICTIM_SALVAGE_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_VICTIM_VERIFY_FAILS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 /// Of this round's per-layer expert unions, how many members were (a) in the
 /// PREVIOUS successful chained round's union for the same layer and (b)
 /// resident in a slot when this round started. Totals share
