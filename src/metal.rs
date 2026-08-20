@@ -589,6 +589,17 @@ fn moe_spec50_cached() -> Option<&'static Spec50MoeVariant> {
     *CACHE.get_or_init(|| Device::system_default().as_ref().and_then(spec50_moe_pipelines))
 }
 
+/// CAMELID_GEMMA4_ROUTER_SPEC50=0 falls back to the reference router GEMV.
+/// The replacement is bitwise identical; timing A/B lever only.
+#[cfg(target_os = "macos")]
+fn router_spec50_disabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_ROUTER_SPEC50")
+            .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+    })
+}
+
 /// CAMELID_GEMMA4_MOE_SPEC50=0 falls back to the original routed-expert
 /// kernels. The replacements are bitwise identical; timing A/B lever only.
 #[cfg(target_os = "macos")]
@@ -20840,6 +20851,10 @@ pub struct Gemma4ResidentScratch {
     pub cos_global_buf: Buffer,
     pub sin_global_buf: Buffer,
     pub router_logits_batch: Buffer,
+    /// spec50 router GEMV scratch (per-token RMS factors + prepared r stream),
+    /// sized for the widest chunk, rewritten per layer, shared by all layers.
+    pub router_factors: Buffer,
+    pub router_r_stage: Buffer,
     pub expert_input_scales_batch: Buffer,
     pub expert_input_quants_batch: Buffer,
     pub gpu_candidate_routes: Vec<Buffer>,
@@ -20935,6 +20950,8 @@ impl Gemma4ResidentScratch {
             cos_global_buf: f32b(mb * (max_q_dim / 2).max(128)),
             sin_global_buf: f32b(mb * (max_q_dim / 2).max(128)),
             router_logits_batch: f32b(30 * mb * 128),
+            router_factors: mkbuf(spec50_router_factor_bytes(mb) as usize),
+            router_r_stage: mkbuf(spec50_router_r_stage_bytes(mb, hidden) as usize),
             expert_input_scales_batch: f32b(mb * (hidden / 32)),
             expert_input_quants_batch: mkbuf(mb * hidden),
             gpu_candidate_routes,
@@ -24191,19 +24208,43 @@ impl Gemma4GhostCommonMetal {
 
             begin_gpu_stage!(GPU_STAGE_ROUTER);
 
-            encode_gemma4_router_batch_k(
-                encoder,
-                kernel,
-                &self.slab_b,
-                &moe_layer.gate_input_scale,
-                &moe_layer.router,
-                &self.resident_scratch.router_logits_batch,
-                hidden,
-                layer.eps,
-                128,
-                k_tokens,
-                logits_off,
-            );
+            // spec50 router GEMV: bitwise identical to gemma4_router_batch_k_f32
+            // for every row/token at every K in 1..=8 (0 ULP), 5.5x at K=8.
+            // CAMELID_GEMMA4_ROUTER_SPEC50=0 restores the reference kernel.
+            let spec50_router_done = !router_spec50_disabled()
+                && spec50_router_kernels().is_some_and(|rk| {
+                    encode_spec50_router_gemv(
+                        encoder,
+                        rk,
+                        &self.slab_b,
+                        &moe_layer.gate_input_scale,
+                        &moe_layer.router,
+                        &self.resident_scratch.router_logits_batch,
+                        &self.resident_scratch.router_factors,
+                        &self.resident_scratch.router_r_stage,
+                        hidden,
+                        layer.eps,
+                        128,
+                        k_tokens,
+                        logits_off,
+                    )
+                    .is_some()
+                });
+            if !spec50_router_done {
+                encode_gemma4_router_batch_k(
+                    encoder,
+                    kernel,
+                    &self.slab_b,
+                    &moe_layer.gate_input_scale,
+                    &moe_layer.router,
+                    &self.resident_scratch.router_logits_batch,
+                    hidden,
+                    layer.eps,
+                    128,
+                    k_tokens,
+                    logits_off,
+                );
+            }
             begin_gpu_stage!(GPU_STAGE_RESID);
             encode_rms_norm_quantize_batch_k(
                 encoder,
