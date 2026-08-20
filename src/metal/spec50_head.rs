@@ -912,6 +912,18 @@ SPEC50_BATCH_ENTRY(5)
 SPEC50_BATCH_ENTRY(6)
 SPEC50_BATCH_ENTRY(7)
 SPEC50_BATCH_ENTRY(8)
+// K=9..16 capacity extension (spec50-widen). K is a compile-time template
+// parameter and the per-row program is identical for every row regardless of
+// K, so these instantiations change nothing about K<=8; the widened table is
+// optional at build time and K<=8 selection never touches it.
+SPEC50_BATCH_ENTRY(9)
+SPEC50_BATCH_ENTRY(10)
+SPEC50_BATCH_ENTRY(11)
+SPEC50_BATCH_ENTRY(12)
+SPEC50_BATCH_ENTRY(13)
+SPEC50_BATCH_ENTRY(14)
+SPEC50_BATCH_ENTRY(15)
+SPEC50_BATCH_ENTRY(16)
 
 // Per-candidate-row argmax with the same semantics as `argmax_f32_greedy`:
 // a strictly-greater scan (so the first maximum in a thread's ascending stride
@@ -1001,6 +1013,11 @@ pub(crate) struct Spec50HeadKernels {
     pub(crate) queue: CommandQueue,
     /// Index `k - 1` for `k` in `1..=8`.
     batch: [ComputePipelineState; 8],
+    /// Index `k - 9` for `k` in `9..=16` (spec50-widen capacity extension).
+    /// Optional so a failure here can never disable the proven K<=8 table;
+    /// when absent, `encode_q6k_spec50_batch` refuses K>8 and the caller keeps
+    /// its existing fallback.
+    batch_wide: Option<[ComputePipelineState; 8]>,
     expand: ComputePipelineState,
     argmax: ComputePipelineState,
 }
@@ -1054,6 +1071,26 @@ pub(crate) fn spec50_head_kernels() -> Option<&'static Spec50HeadKernels> {
                 eprintln!("[metal] spec50 head: simd width or threadgroup size not admitted");
                 return None;
             }
+            // K=9..16 table (spec50-widen). Strictly optional: a compile or
+            // admission failure here leaves the K<=8 table untouched and only
+            // makes `encode_q6k_spec50_batch` refuse K>8.
+            let mut wide = Vec::with_capacity(8);
+            for k in 9..=16 {
+                match pipeline(&format!("q6k_spec50_batch_k{k}")) {
+                    Some(p) => wide.push(p),
+                    None => break,
+                }
+            }
+            let batch_wide: Option<[ComputePipelineState; 8]> = if wide.len() == 8
+                && wide.iter().all(|p| {
+                    p.thread_execution_width() == 32
+                        && p.max_total_threads_per_threadgroup() >= 32 * SPEC50_SG_PER_TG as u64
+                }) {
+                wide.try_into().ok()
+            } else {
+                eprintln!("[metal] spec50 head: K=9..16 table unavailable; K<=8 unaffected");
+                None
+            };
             let expand = pipeline(SPEC50_EXPAND_KERNEL)?;
             let argmax = pipeline("q6k_spec50_argmax_rows")?;
             if argmax.max_total_threads_per_threadgroup() < 1024 {
@@ -1065,6 +1102,7 @@ pub(crate) fn spec50_head_kernels() -> Option<&'static Spec50HeadKernels> {
                 device,
                 queue,
                 batch,
+                batch_wide,
                 expand,
                 argmax,
             })
@@ -1080,7 +1118,7 @@ pub(crate) fn spec50_activation_scratch_bytes(max_k: usize, hidden: usize) -> us
     max_k * hidden * SPEC50_YFMT_STRIDE
 }
 
-/// Encode the K<=8 speculative Q6_K tied-head projection.
+/// Encode the K<=16 speculative Q6_K tied-head projection.
 ///
 /// Buffer order on `q6k_spec50_batch_k{K}`:
 ///   0 `input_scales`     `K * n_superblocks` f32 (candidate-major)
@@ -1090,7 +1128,8 @@ pub(crate) fn spec50_activation_scratch_bytes(max_k: usize, hidden: usize) -> us
 ///   4 `n_sb` u32, 5 `rows` u32, 6 `softcap` f32
 ///
 /// Returns `false` (encoding nothing) when the pipelines are unavailable or
-/// `k_batch` is outside `1..=8`; the caller then keeps `encode_q6k_ordered_batch`.
+/// `k_batch` is outside `1..=16` (K in 9..=16 additionally requires the
+/// optional widened table); the caller then keeps `encode_q6k_ordered_batch`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_q6k_spec50_batch(
     encoder: &metal::ComputeCommandEncoderRef,
@@ -1107,7 +1146,10 @@ pub(crate) fn encode_q6k_spec50_batch(
     hidden: usize,
     softcap: f32,
 ) -> bool {
-    if k_batch == 0 || k_batch > 8 || rows == 0 || n_superblocks == 0 {
+    if k_batch == 0 || k_batch > 16 || rows == 0 || n_superblocks == 0 {
+        return false;
+    }
+    if k_batch > 8 && kernels.batch_wide.is_none() {
         return false;
     }
     let count = (k_batch * hidden) as u32;
@@ -1131,7 +1173,12 @@ pub(crate) fn encode_q6k_spec50_batch(
         },
     );
 
-    encoder.set_compute_pipeline_state(&kernels.batch[k_batch - 1]);
+    if k_batch > 8 {
+        let wide = kernels.batch_wide.as_ref().expect("checked above");
+        encoder.set_compute_pipeline_state(&wide[k_batch - 9]);
+    } else {
+        encoder.set_compute_pipeline_state(&kernels.batch[k_batch - 1]);
+    }
     encoder.set_buffer(0, Some(input_scales), 0);
     encoder.set_buffer(1, Some(activation_perm), 0);
     encoder.set_buffer(2, Some(weight), weight_offset);

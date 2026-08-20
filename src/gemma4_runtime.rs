@@ -9634,8 +9634,15 @@ impl Gemma4Runtime {
             // saturates with width: measured on this row, K=8 -> K=16 doubles
             // the candidate tokens for only ~1.4x the bytes. The old ceiling of
             // 7 was not a hardware limit and capped acceptance on workloads
-            // where the drafter is nearly always right.
-            .clamp(1, crate::metal::GEMMA4_MAX_SPEC_CHUNK - 1);
+            // where the drafter is nearly always right. The runtime ceiling is
+            // CAMELID_GEMMA4_SPEC_CHUNK_MAX (default 8, i.e. today's K<=8
+            // round; up to 16 with the spec50_widen _k16 pipelines).
+            .clamp(
+                1,
+                crate::metal::gemma4_max_spec_chunk()
+                    .saturating_sub(1)
+                    .max(1),
+            );
         // A short match still earns a ONE-token draft (see the width tiers
         // below): leaving a round empty costs the full fixed round cost for a
         // single token, so the bar for proposing one extra candidate is low.

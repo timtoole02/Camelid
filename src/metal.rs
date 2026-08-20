@@ -806,6 +806,15 @@ mod spec50_moe;
 #[allow(unused_imports)]
 pub(crate) use spec50_moe::*;
 
+/// K=9..16 widened (`_k16`) twins of the dense and routed-expert batch
+/// kernels. Selected exclusively when a chunk is wider than 8; every K<=8
+/// dispatch keeps the existing kernels untouched.
+#[cfg(target_os = "macos")]
+mod spec50_widen;
+#[cfg(target_os = "macos")]
+#[allow(unused_imports)]
+pub(crate) use spec50_widen::*;
+
 #[cfg(target_os = "macos")]
 const LINEAR_ROW_SHADER: &str = r#"
 #include <metal_stdlib>
@@ -18829,16 +18838,41 @@ fn encode_gemma4_q4_0_matmul_batch_k(
     scalar_buf: &Buffer,
     k_batch: usize,
 ) {
-    // The kernels below hold a fixed `float sums[4][8]`; a wider chunk indexes
-    // past it and corrupts the round instead of failing. Refuse loudly.
+    // The k<=8 kernels below hold a fixed `float sums[4][8]`; a wider chunk
+    // indexes past it and corrupts the round instead of failing. K in 9..=16
+    // routes to the `_k16` twin (spec50_widen, `float sums[4][16]`); anything
+    // wider is refused loudly.
     assert!(
-        k_batch <= GEMMA4_DENSE_BATCH_K_MAX,
-        "dense batch_k chunk {k_batch} exceeds the kernels' fixed accumulator depth {}",
-        GEMMA4_DENSE_BATCH_K_MAX
+        k_batch <= 16,
+        "dense batch_k chunk {k_batch} exceeds the widened kernels' accumulator depth 16"
     );
     let bpr_u32 = unsafe { *(scalar_buf.contents() as *const u32) };
     let rows_u32 = rows as u32;
     let k_batch_u32 = k_batch as u32;
+
+    if k_batch > GEMMA4_DENSE_BATCH_K_MAX {
+        // K=9..16 capacity lane. Never fall back to the fixed-depth kernels:
+        // if the widened library failed to compile, encode nothing (the same
+        // failure mode as every missing-pipeline branch below).
+        if let Some(widen) = spec50_widen_kernels() {
+            encode_spec50_widen_plain(
+                e,
+                widen,
+                y,
+                weight,
+                weight_offset,
+                output,
+                bpr_u32,
+                rows,
+                k_batch,
+            );
+        } else {
+            eprintln!(
+                "[metal] dense batch_k chunk {k_batch} > {GEMMA4_DENSE_BATCH_K_MAX} but the spec50_widen pipelines are unavailable; encoding nothing"
+            );
+        }
+        return;
+    }
 
     if k_batch == 8 {
         if let Some(pipe) = &k.q4_0_block_batch_k8_pipeline {
@@ -18928,18 +18962,43 @@ fn encode_gemma4_q4_0_qkv_matmul_batch_k(
     total_rows: usize,
     k_batch: usize,
 ) {
-    // The kernels below hold a fixed `float sums[4][8]`; a wider chunk indexes
-    // past it and corrupts the round instead of failing. Refuse loudly.
+    // The k<=8 kernels below hold fixed `float sum0[8]/sum1[8]` accumulators;
+    // a wider chunk indexes past them and corrupts the round instead of
+    // failing. K in 9..=16 routes to the `_k16` twin (spec50_widen); anything
+    // wider is refused loudly.
     assert!(
-        k_batch <= GEMMA4_DENSE_BATCH_K_MAX,
-        "dense batch_k chunk {k_batch} exceeds the kernels' fixed accumulator depth {}",
-        GEMMA4_DENSE_BATCH_K_MAX
+        k_batch <= 16,
+        "dense batch_k chunk {k_batch} exceeds the widened kernels' accumulator depth 16"
     );
     let (bpr_u32, q_rows_u32, k_rows_u32, v_rows_u32) = unsafe {
         let ptr = qkv_scalar.contents() as *const u32;
         (*ptr, *ptr.add(1), *ptr.add(2), *ptr.add(3))
     };
     let k_batch_u32 = k_batch as u32;
+
+    if k_batch > GEMMA4_DENSE_BATCH_K_MAX {
+        if let Some(widen) = spec50_widen_kernels() {
+            encode_spec50_widen_qkv(
+                e,
+                widen,
+                y,
+                q_weight,
+                k_weight,
+                v_weight,
+                query_out,
+                key_out,
+                val_out,
+                (bpr_u32, q_rows_u32, k_rows_u32, v_rows_u32),
+                total_rows,
+                k_batch,
+            );
+        } else {
+            eprintln!(
+                "[metal] QKV batch_k chunk {k_batch} > {GEMMA4_DENSE_BATCH_K_MAX} but the spec50_widen pipelines are unavailable; encoding nothing"
+            );
+        }
+        return;
+    }
 
     if k_batch == 8 {
         if let Some(pipe) = &k.q4_0_qkv_block_batch_k8_pipeline {
@@ -19047,10 +19106,18 @@ fn encode_gemma4_q4_0_qkv_matmul_batch_k_fused_rms(
     k_batch: usize,
 ) -> bool {
     assert!(
-        k_batch <= GEMMA4_DENSE_BATCH_K_MAX,
-        "dense batch_k chunk {k_batch} exceeds the kernels' fixed accumulator depth {}",
-        GEMMA4_DENSE_BATCH_K_MAX
+        k_batch <= 16,
+        "dense batch_k chunk {k_batch} exceeds the widened kernels' accumulator depth 16"
     );
+    if k_batch > GEMMA4_DENSE_BATCH_K_MAX {
+        // No widened twin for the fused-RMS kernel: a verbatim `_k16` copy
+        // measured up to 492 ULP off the k<=8 kernel at k_batch=8 (widening
+        // the accumulator array shifted the compiled FMA contraction of the
+        // `(w * rms) * scale` chain), so it cannot satisfy the bitwise pinning
+        // contract. Returning false keeps the caller on its fallback
+        // (separate RMS + QKV), whose K>8 kernel IS bitwise-verified.
+        return false;
+    }
     let Some(pipe) = k.q4_0_qkv_block_batch_k_fused_rms_pipeline.as_ref() else {
         return false;
     };
@@ -19102,16 +19169,30 @@ fn encode_gemma4_q4_0_gateup_matmul_batch_k(
     rows: usize,
     k_batch: usize,
 ) {
-    // The kernels below hold a fixed `float sums[4][8]`; a wider chunk indexes
-    // past it and corrupts the round instead of failing. Refuse loudly.
+    // The k<=8 kernels below hold fixed `float g_sums/u_sums[4][8]`
+    // accumulators; a wider chunk indexes past them and corrupts the round
+    // instead of failing. K in 9..=16 routes to the `_k16` twin
+    // (spec50_widen); anything wider is refused loudly.
     assert!(
-        k_batch <= GEMMA4_DENSE_BATCH_K_MAX,
-        "dense batch_k chunk {k_batch} exceeds the kernels' fixed accumulator depth {}",
-        GEMMA4_DENSE_BATCH_K_MAX
+        k_batch <= 16,
+        "dense batch_k chunk {k_batch} exceeds the widened kernels' accumulator depth 16"
     );
     let bpr_u32 = unsafe { *(gateup_scalar.contents() as *const u32) };
     let rows_u32 = rows as u32;
     let k_batch_u32 = k_batch as u32;
+
+    if k_batch > GEMMA4_DENSE_BATCH_K_MAX {
+        if let Some(widen) = spec50_widen_kernels() {
+            encode_spec50_widen_gateup(
+                e, widen, y, gate_weight, up_weight, act_output, bpr_u32, rows, k_batch,
+            );
+        } else {
+            eprintln!(
+                "[metal] gateup batch_k chunk {k_batch} > {GEMMA4_DENSE_BATCH_K_MAX} but the spec50_widen pipelines are unavailable; encoding nothing"
+            );
+        }
+        return;
+    }
 
     if k_batch == 8 {
         if let Some(pipe) = &k.q4_0_gateup_geglu_block_batch_k8_pipeline {
@@ -20670,21 +20751,41 @@ fn init_layer_resident_buffers(
 
 pub(crate) const GEMMA4_RESIDENT_MAX_BATCH: usize = 64;
 
-/// Largest chunk the speculative verify may submit in one round.
+/// Default chunk ceiling for the speculative verify round.
 ///
-/// The binding limit is the DENSE batch kernels, not the tied head. The head
-/// allocates batch buffers for 16 rows and the resident lane would take 64, but
-/// `q4_0_block_linear_batch_k`, `q4_0_qkv_block_linear_batch_k` and
+/// The historical limit was the DENSE batch kernels, not the tied head. The
+/// head allocates batch buffers for 16 rows and the resident lane would take
+/// 64, but `q4_0_block_linear_batch_k`, `q4_0_qkv_block_linear_batch_k` and
 /// `q4_0_gateup_geglu_block_linear_batch_k` each hold a fixed `float
 /// sums[4][8]` accumulator and index it with `k_batch`, so any chunk wider than
 /// 8 writes past the end of that array and silently corrupts the round.
-/// Measured: raising this to 16 produced a speculative stream that diverged
-/// from greedy at K=9, caught by the lane parity gate.
+/// Measured: raising this to 16 without new kernels produced a speculative
+/// stream that diverged from greedy at K=9, caught by the lane parity gate.
 ///
-/// Raising it requires widening those accumulators (and the K=8 specialisations
-/// alongside them) first; `encode_gemma4_q4_0_*_batch_k` refuse a wider chunk
-/// rather than trusting callers.
+/// K in 9..=16 is now supported by the `_k16` twins in `spec50_widen`
+/// (`float sums[4][16]`), which the `encode_gemma4_q4_0_*_batch_k` fns verify
+/// at dispatch: a chunk wider than 8 is routed to those pipelines and NEVER to
+/// the fixed-depth kernels; a chunk wider than 16 is refused loudly. The
+/// runtime ceiling is [`gemma4_max_spec_chunk`]; this constant is its default,
+/// so default behavior is exactly the historical K<=8 round.
 pub const GEMMA4_MAX_SPEC_CHUNK: usize = 8;
+
+/// Runtime chunk ceiling for the speculative verify round.
+///
+/// `CAMELID_GEMMA4_SPEC_CHUNK_MAX` (clamped to 1..=16) opts into the widened
+/// K=9..16 round; unset, the ceiling is [`GEMMA4_MAX_SPEC_CHUNK`] (8), i.e.
+/// exactly today's behavior. Values above 8 require the `spec50_widen` `_k16`
+/// pipelines, which the dense encode fns verify at dispatch.
+pub fn gemma4_max_spec_chunk() -> usize {
+    static CHUNK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CHUNK.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_SPEC_CHUNK_MAX")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.clamp(1, 16))
+            .unwrap_or(GEMMA4_MAX_SPEC_CHUNK)
+    })
+}
 
 /// Fixed accumulator depth of the dense `*_batch_k` kernels (`float sums[4][8]`).
 pub(crate) const GEMMA4_DENSE_BATCH_K_MAX: usize = 8;
@@ -23029,6 +23130,47 @@ impl Gemma4GhostCommonMetal {
                 ]);
                 return true;
             }
+        }
+        if k_tokens > 8 {
+            // K=9..16 GateUp. The fused batch_k kernel above refuses
+            // k_candidates > 8 (fixed gate_acc[8]/up_acc[8]); its `_k16` twin
+            // (spec50_widen) carries [16] accumulators and the same
+            // overflow-slab handling.
+            if let Some(widen) = spec50_widen_kernels() {
+                encode_spec50_widen_moe_gateup(
+                    encoder,
+                    widen,
+                    &self.resident_scratch.expert_input_scales_batch,
+                    &self.resident_scratch.expert_input_quants_batch,
+                    slab_buf,
+                    slab_byte_offset,
+                    &self.resident_scratch.gpu_work_list,
+                    &self.resident_scratch.gpu_moe_scales,
+                    &self.resident_scratch.gpu_moe_quants,
+                    gateup_unique_u32,
+                    k_u32,
+                    overflow_slab,
+                    GEMMA4_Q4_EXPERT_FF / 32,
+                );
+                encoder.memory_barrier_with_resources(&[
+                    &self.resident_scratch.gpu_moe_scales,
+                    &self.resident_scratch.gpu_moe_quants,
+                    &self.resident_scratch.gpu_work_list,
+                    &self.resident_scratch.gpu_candidate_routes[layer_idx],
+                ]);
+                return true;
+            }
+            // The per-token fallback below reads every expert from the primary
+            // slab (no slab_index routing), so with overflow experts in play it
+            // would silently read the wrong weights. Refuse instead.
+            if overflow_slab.is_some() || num_slots > num_resident_slots {
+                eprintln!(
+                    "[metal chained round] K={k_tokens} > 8 with overflow experts requires the spec50_widen pipelines; refusing"
+                );
+                return false;
+            }
+            // No overflow: the per-token kernel is correct at any K (u64
+            // candidate mask), just slower — fall through.
         }
         if let Some(fused_gu_q) = kernel
             .gemma4_q4_multi_expert_fused_gateup_geglu_quant_pipeline
