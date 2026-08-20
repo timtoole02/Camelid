@@ -1,30 +1,48 @@
 //! spec50 router lane: a batched, bit-exact replacement for the gemma4 router GEMV.
 //!
 //! The shipping kernel (`gemma4_router_batch_k_f32`) launches one 256-thread
-//! threadgroup per token, leaves 128 of those threads idle, and re-reads the whole
-//! `[num_experts][hidden]` f32 router matrix once per token. At K=8 that is eight
-//! passes over 1.44 MB per layer.
+//! threadgroup per token, leaves 128 of those threads idle, and has each of the 128
+//! active threads walk a serial 2816-long strided dot. Measured on a 26B-shaped
+//! synthetic (hidden 2816, 128 experts, 30 layers per command buffer) it costs ~5.7 ms
+//! at K=8 -- and ~5.9 ms at K=1. That flatness is the finding: the kernel is nowhere
+//! near the ~0.48 ms byte floor for its 1.44 MB/layer matrix, it is bound by dependent
+//! FMA latency at an occupancy of 8 threadgroups. Bytes were never the problem.
 //!
-//! This module keeps the arithmetic byte-for-byte and only changes the layout:
+//! What this module changes, in order of what it bought:
 //!
-//! * `spec50_router_rms_factor` computes the per-token RMS factor once, in exactly
-//!   the operand order of the shipping kernel's phase 1 (256-thread strided
-//!   sum-of-squares, halving tree, `rms_inv * (1/sqrt(hidden))`), and parks the K
-//!   factors in a tiny scratch buffer.
-//! * `spec50_router_gemv_exact` then owns one `(token, expert)` pair per lane
-//!   (`lane = expert_sub * 8 + token_sub`), so a 32-lane simdgroup streams four
-//!   expert rows for up to eight tokens at once and the matrix is read exactly
-//!   once per K-token chunk instead of once per token.
+//! * Layout. Each lane owns one `(token, expert)` pair, `lane = expert_sub * 8 +
+//!   token_sub`, so a 32-lane simdgroup covers four expert rows for eight tokens and
+//!   the matrix is read once per chunk. 32 threadgroups instead of 8, no idle half.
+//!   Worth ~1.1x on its own -- confirming the diagnosis above.
+//! * Unrolling. The dot is a chain of 2816 dependent FMAs with three loads each and
+//!   nothing to hide the latency behind. Hoisting many iterations' loads ahead of the
+//!   FMAs is the real lever, and it is worth ~4.6x.
+//! * A prepared `r` stream. `r[t][i] = x[t][i] * factor[t] * scale[i]` is recomputed by
+//!   all four lanes that share a token. Computing it once for the batch drops two
+//!   multiplies and a whole load stream per element, which also frees the registers to
+//!   unroll deeper. Worth the last ~1.2x, for 5.5x total and ~1.04 ms at K=8.
 //!
-//! The per-lane accumulation is the shipping kernel's dot loop copied character for
-//! character — same source text, same compile options, therefore the same contraction
-//! and reassociation decisions and the same bits. This is load-bearing, not
-//! decoration: widening those loads to `float4` and unrolling the body by hand is
-//! enough for fast math to vectorise the accumulator, which moves 4374 of 9216 logits
-//! by up to 38 ULP. `spec50_router_gemv_vec4` keeps that variant alive purely so the
-//! benchmark can price it; it must never reach the runtime.
+//! EXACTNESS. Every logit is bit-identical to `gemma4_router_batch_k_f32` for every
+//! K in 1..=8. Getting there needs the two halves of the lane compiled with DIFFERENT
+//! options, which is the non-obvious part and is enforced by
+//! `spec50_router_kernels()`:
 //!
-//! Everything here is additive: its own Metal library behind a `OnceLock`, free
+//! * The GEMV is compiled with fast math OFF. Fast math permits reassociating an FP
+//!   reduction and does so the moment the loop is unrolled by hand -- measured at
+//!   37-38 ULP across 4374/4608 logits, for every unrolled shape tried. Turning fast
+//!   math off forbids that while leaving `dot += w * r` contracted to an FMA exactly as
+//!   the shipping kernel has it, so the unrolled variants come out bit-identical.
+//!   `spec50_router_gemv_exact` keeps the shipping loop verbatim as the control that
+//!   proves the second half of that claim.
+//! * The prepare pass is compiled with fast math ON, because the shipping kernel is,
+//!   and its `1.0f / sqrt(...)` is an rsqrt there. Building the same source strict
+//!   instead moves 1614/4608 logits by 6 ULP.
+//!
+//! `spec50_router_gemv_variant()` keeps all fourteen measured shapes alive, and
+//! `spec50_router_gemv_variant_exactness_sweep` pins the ULP cost of each, so the
+//! reasoning above is a test result rather than a comment.
+//!
+//! Everything here is additive: its own Metal libraries behind a `OnceLock`, free
 //! encode functions with explicit buffers, no existing dispatch site touched.
 #![allow(dead_code)]
 
@@ -46,10 +64,15 @@ pub(crate) fn spec50_router_factor_bytes(k_tokens: usize) -> u64 {
     ((k_tokens.max(1) * 4) as u64).max(16)
 }
 
-/// Compiled with DEFAULT options (fast math ON) on purpose: the shipping twin lives
-/// in `ELEMENTWISE_SHADER`, which is compiled with `CompileOptions::new()`. Same
-/// source text plus same compiler flags is what makes the contraction decisions —
-/// and therefore the bits — come out the same.
+/// Bytes for the optional `r_stage` scratch used by the r-staged variants:
+/// `k_tokens x hidden` f32.
+pub(crate) fn spec50_router_r_stage_bytes(k_tokens: usize, hidden: usize) -> u64 {
+    ((k_tokens.max(1) * hidden.max(1) * 4) as u64).max(16)
+}
+
+/// One source, compiled TWICE — once fast-math ON, once OFF. Which library each kernel
+/// is taken from is load-bearing for bit equality; see the module header and
+/// `spec50_router_kernels()`.
 const SPEC50_ROUTER_SHADER: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -127,6 +150,14 @@ kernel void spec50_router_gemv_exact(
     device const float* w_row = gate_inp_weights + ec * hidden;
     const float factor = factors[tok0 + tc];
 
+    // SPEC50 exactness note. Two independent things can break bit equality here:
+    //   * reassociation of the accumulator, which fast math permits and performs the
+    //     moment the loop is unrolled by hand (measured: 37-38 ULP);
+    //   * the per-operation semantics, i.e. whether `dot += w * r` contracts to an FMA.
+    // Compiling the GEMV with fast math OFF forbids the first and, as the strict-exact
+    // control measures, leaves the second unchanged -- contraction still happens. That
+    // is what makes the unrolled variants exact. This kernel keeps the loop verbatim so
+    // it is exact from EITHER library and can serve as the control.
     // Textually the shipping kernel's dot loop, character for character. That is the
     // whole bit-exactness argument: same source text + same compile options => the
     // compiler makes the same contraction and reassociation decisions. Widening these
@@ -142,6 +173,1096 @@ kernel void spec50_router_gemv_exact(
         out_logits[(tok0 + tok_sub) * num_experts + e] = dot_val;
     }
 }
+
+// Same layout, loads for four iterations hoisted ahead of four strictly serial FMAs.
+// Purely a memory-level-parallelism change: the accumulator order is untouched, so
+// whether this stays bit-exact depends only on how fast math treats the unrolled adds.
+kernel void spec50_router_gemv_u4(
+    device const float* input [[buffer(0)]],
+    device const float* gate_inp_scale [[buffer(1)]],
+    device const float* gate_inp_weights [[buffer(2)]],
+    device float* out_logits [[buffer(3)]],
+    device const float* factors [[buffer(4)]],
+    constant uint& hidden [[buffer(5)]],
+    constant uint& num_experts [[buffer(6)]],
+    constant uint& k_tokens [[buffer(7)]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint2 tg [[threadgroup_position_in_grid]]
+) {
+    const uint tok0 = tg.y * SPEC50_CHUNK;
+    if (tok0 >= k_tokens) return;
+    const uint kt = min(k_tokens - tok0, SPEC50_CHUNK);
+
+    const uint tok_sub = lane & 7u;
+    const uint e_sub = lane >> 3;
+    const uint e = tg.x * 4u + e_sub;
+    const bool active = (tok_sub < kt) && (e < num_experts);
+    const uint tc = min(tok_sub, kt - 1u);
+    const uint ec = min(e, num_experts - 1u);
+
+    device const float* in_tok = input + (tok0 + tc) * hidden;
+    device const float* w_row = gate_inp_weights + ec * hidden;
+    const float factor = factors[tok0 + tc];
+
+    float dot_val = 0.0f;
+    uint i = 0;
+    for (; i + 4u <= hidden; i += 4u) {
+        float w0 = w_row[i + 0u];
+        float w1 = w_row[i + 1u];
+        float w2 = w_row[i + 2u];
+        float w3 = w_row[i + 3u];
+        float x0 = in_tok[i + 0u];
+        float x1 = in_tok[i + 1u];
+        float x2 = in_tok[i + 2u];
+        float x3 = in_tok[i + 3u];
+        float c0 = gate_inp_scale[i + 0u];
+        float c1 = gate_inp_scale[i + 1u];
+        float c2 = gate_inp_scale[i + 2u];
+        float c3 = gate_inp_scale[i + 3u];
+        float r0 = x0 * factor * c0;
+        dot_val += w0 * r0;
+        float r1 = x1 * factor * c1;
+        dot_val += w1 * r1;
+        float r2 = x2 * factor * c2;
+        dot_val += w2 * r2;
+        float r3 = x3 * factor * c3;
+        dot_val += w3 * r3;
+    }
+    for (; i < hidden; ++i) {
+        float r_i = in_tok[i] * factor * gate_inp_scale[i];
+        dot_val += w_row[i] * r_i;
+    }
+
+    if (active) {
+        out_logits[(tok0 + tok_sub) * num_experts + e] = dot_val;
+    }
+}
+
+// As spec50_router_gemv_u4 with eight iterations of load lookahead.
+kernel void spec50_router_gemv_u8(
+    device const float* input [[buffer(0)]],
+    device const float* gate_inp_scale [[buffer(1)]],
+    device const float* gate_inp_weights [[buffer(2)]],
+    device float* out_logits [[buffer(3)]],
+    device const float* factors [[buffer(4)]],
+    constant uint& hidden [[buffer(5)]],
+    constant uint& num_experts [[buffer(6)]],
+    constant uint& k_tokens [[buffer(7)]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint2 tg [[threadgroup_position_in_grid]]
+) {
+    const uint tok0 = tg.y * SPEC50_CHUNK;
+    if (tok0 >= k_tokens) return;
+    const uint kt = min(k_tokens - tok0, SPEC50_CHUNK);
+
+    const uint tok_sub = lane & 7u;
+    const uint e_sub = lane >> 3;
+    const uint e = tg.x * 4u + e_sub;
+    const bool active = (tok_sub < kt) && (e < num_experts);
+    const uint tc = min(tok_sub, kt - 1u);
+    const uint ec = min(e, num_experts - 1u);
+
+    device const float* in_tok = input + (tok0 + tc) * hidden;
+    device const float* w_row = gate_inp_weights + ec * hidden;
+    const float factor = factors[tok0 + tc];
+
+    float dot_val = 0.0f;
+    uint i = 0;
+    for (; i + 8u <= hidden; i += 8u) {
+        float w0 = w_row[i + 0u];
+        float w1 = w_row[i + 1u];
+        float w2 = w_row[i + 2u];
+        float w3 = w_row[i + 3u];
+        float w4 = w_row[i + 4u];
+        float w5 = w_row[i + 5u];
+        float w6 = w_row[i + 6u];
+        float w7 = w_row[i + 7u];
+        float x0 = in_tok[i + 0u];
+        float x1 = in_tok[i + 1u];
+        float x2 = in_tok[i + 2u];
+        float x3 = in_tok[i + 3u];
+        float x4 = in_tok[i + 4u];
+        float x5 = in_tok[i + 5u];
+        float x6 = in_tok[i + 6u];
+        float x7 = in_tok[i + 7u];
+        float c0 = gate_inp_scale[i + 0u];
+        float c1 = gate_inp_scale[i + 1u];
+        float c2 = gate_inp_scale[i + 2u];
+        float c3 = gate_inp_scale[i + 3u];
+        float c4 = gate_inp_scale[i + 4u];
+        float c5 = gate_inp_scale[i + 5u];
+        float c6 = gate_inp_scale[i + 6u];
+        float c7 = gate_inp_scale[i + 7u];
+        float r0 = x0 * factor * c0;
+        dot_val += w0 * r0;
+        float r1 = x1 * factor * c1;
+        dot_val += w1 * r1;
+        float r2 = x2 * factor * c2;
+        dot_val += w2 * r2;
+        float r3 = x3 * factor * c3;
+        dot_val += w3 * r3;
+        float r4 = x4 * factor * c4;
+        dot_val += w4 * r4;
+        float r5 = x5 * factor * c5;
+        dot_val += w5 * r5;
+        float r6 = x6 * factor * c6;
+        dot_val += w6 * r6;
+        float r7 = x7 * factor * c7;
+        dot_val += w7 * r7;
+    }
+    for (; i < hidden; ++i) {
+        float r_i = in_tok[i] * factor * gate_inp_scale[i];
+        dot_val += w_row[i] * r_i;
+    }
+
+    if (active) {
+        out_logits[(tok0 + tok_sub) * num_experts + e] = dot_val;
+    }
+}
+
+// Sixteen iterations of scalar load lookahead ahead of sixteen strictly serial FMAs.
+kernel void spec50_router_gemv_u16(
+    device const float* input [[buffer(0)]],
+    device const float* gate_inp_scale [[buffer(1)]],
+    device const float* gate_inp_weights [[buffer(2)]],
+    device float* out_logits [[buffer(3)]],
+    device const float* factors [[buffer(4)]],
+    constant uint& hidden [[buffer(5)]],
+    constant uint& num_experts [[buffer(6)]],
+    constant uint& k_tokens [[buffer(7)]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint2 tg [[threadgroup_position_in_grid]]
+) {
+    const uint tok0 = tg.y * SPEC50_CHUNK;
+    if (tok0 >= k_tokens) return;
+    const uint kt = min(k_tokens - tok0, SPEC50_CHUNK);
+
+    const uint tok_sub = lane & 7u;
+    const uint e_sub = lane >> 3;
+    const uint e = tg.x * 4u + e_sub;
+    const bool active = (tok_sub < kt) && (e < num_experts);
+    const uint tc = min(tok_sub, kt - 1u);
+    const uint ec = min(e, num_experts - 1u);
+
+    device const float* in_tok = input + (tok0 + tc) * hidden;
+    device const float* w_row = gate_inp_weights + ec * hidden;
+    const float factor = factors[tok0 + tc];
+
+    float dot_val = 0.0f;
+    uint i = 0;
+    for (; i + 16u <= hidden; i += 16u) {
+        float w0 = w_row[i + 0u];
+        float w1 = w_row[i + 1u];
+        float w2 = w_row[i + 2u];
+        float w3 = w_row[i + 3u];
+        float w4 = w_row[i + 4u];
+        float w5 = w_row[i + 5u];
+        float w6 = w_row[i + 6u];
+        float w7 = w_row[i + 7u];
+        float w8 = w_row[i + 8u];
+        float w9 = w_row[i + 9u];
+        float w10 = w_row[i + 10u];
+        float w11 = w_row[i + 11u];
+        float w12 = w_row[i + 12u];
+        float w13 = w_row[i + 13u];
+        float w14 = w_row[i + 14u];
+        float w15 = w_row[i + 15u];
+        float x0 = in_tok[i + 0u];
+        float x1 = in_tok[i + 1u];
+        float x2 = in_tok[i + 2u];
+        float x3 = in_tok[i + 3u];
+        float x4 = in_tok[i + 4u];
+        float x5 = in_tok[i + 5u];
+        float x6 = in_tok[i + 6u];
+        float x7 = in_tok[i + 7u];
+        float x8 = in_tok[i + 8u];
+        float x9 = in_tok[i + 9u];
+        float x10 = in_tok[i + 10u];
+        float x11 = in_tok[i + 11u];
+        float x12 = in_tok[i + 12u];
+        float x13 = in_tok[i + 13u];
+        float x14 = in_tok[i + 14u];
+        float x15 = in_tok[i + 15u];
+        float c0 = gate_inp_scale[i + 0u];
+        float c1 = gate_inp_scale[i + 1u];
+        float c2 = gate_inp_scale[i + 2u];
+        float c3 = gate_inp_scale[i + 3u];
+        float c4 = gate_inp_scale[i + 4u];
+        float c5 = gate_inp_scale[i + 5u];
+        float c6 = gate_inp_scale[i + 6u];
+        float c7 = gate_inp_scale[i + 7u];
+        float c8 = gate_inp_scale[i + 8u];
+        float c9 = gate_inp_scale[i + 9u];
+        float c10 = gate_inp_scale[i + 10u];
+        float c11 = gate_inp_scale[i + 11u];
+        float c12 = gate_inp_scale[i + 12u];
+        float c13 = gate_inp_scale[i + 13u];
+        float c14 = gate_inp_scale[i + 14u];
+        float c15 = gate_inp_scale[i + 15u];
+        float r0 = x0 * factor * c0;
+        dot_val += w0 * r0;
+        float r1 = x1 * factor * c1;
+        dot_val += w1 * r1;
+        float r2 = x2 * factor * c2;
+        dot_val += w2 * r2;
+        float r3 = x3 * factor * c3;
+        dot_val += w3 * r3;
+        float r4 = x4 * factor * c4;
+        dot_val += w4 * r4;
+        float r5 = x5 * factor * c5;
+        dot_val += w5 * r5;
+        float r6 = x6 * factor * c6;
+        dot_val += w6 * r6;
+        float r7 = x7 * factor * c7;
+        dot_val += w7 * r7;
+        float r8 = x8 * factor * c8;
+        dot_val += w8 * r8;
+        float r9 = x9 * factor * c9;
+        dot_val += w9 * r9;
+        float r10 = x10 * factor * c10;
+        dot_val += w10 * r10;
+        float r11 = x11 * factor * c11;
+        dot_val += w11 * r11;
+        float r12 = x12 * factor * c12;
+        dot_val += w12 * r12;
+        float r13 = x13 * factor * c13;
+        dot_val += w13 * r13;
+        float r14 = x14 * factor * c14;
+        dot_val += w14 * r14;
+        float r15 = x15 * factor * c15;
+        dot_val += w15 * r15;
+    }
+    for (; i < hidden; ++i) {
+        float r_i = in_tok[i] * factor * gate_inp_scale[i];
+        dot_val += w_row[i] * r_i;
+    }
+
+    if (active) {
+        out_logits[(tok0 + tok_sub) * num_experts + e] = dot_val;
+    }
+}
+
+// Sixteen elements per step as four float4 loads per stream: wide loads AND deep
+// lookahead. Serial accumulation, so it is exact under a fast-math-OFF compile.
+kernel void spec50_router_gemv_v4x4(
+    device const float* input [[buffer(0)]],
+    device const float* gate_inp_scale [[buffer(1)]],
+    device const float* gate_inp_weights [[buffer(2)]],
+    device float* out_logits [[buffer(3)]],
+    device const float* factors [[buffer(4)]],
+    constant uint& hidden [[buffer(5)]],
+    constant uint& num_experts [[buffer(6)]],
+    constant uint& k_tokens [[buffer(7)]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint2 tg [[threadgroup_position_in_grid]]
+) {
+    const uint tok0 = tg.y * SPEC50_CHUNK;
+    if (tok0 >= k_tokens) return;
+    const uint kt = min(k_tokens - tok0, SPEC50_CHUNK);
+
+    const uint tok_sub = lane & 7u;
+    const uint e_sub = lane >> 3;
+    const uint e = tg.x * 4u + e_sub;
+    const bool active = (tok_sub < kt) && (e < num_experts);
+    const uint tc = min(tok_sub, kt - 1u);
+    const uint ec = min(e, num_experts - 1u);
+
+    device const float* in_tok = input + (tok0 + tc) * hidden;
+    device const float* w_row = gate_inp_weights + ec * hidden;
+    const float factor = factors[tok0 + tc];
+
+    float dot_val = 0.0f;
+    uint i = 0;
+    for (; i + 16u <= hidden; i += 16u) {
+        float4 w0 = *reinterpret_cast<device const float4*>(w_row + i + 0u);
+        float4 w1 = *reinterpret_cast<device const float4*>(w_row + i + 4u);
+        float4 w2 = *reinterpret_cast<device const float4*>(w_row + i + 8u);
+        float4 w3 = *reinterpret_cast<device const float4*>(w_row + i + 12u);
+        float4 x0 = *reinterpret_cast<device const float4*>(in_tok + i + 0u);
+        float4 x1 = *reinterpret_cast<device const float4*>(in_tok + i + 4u);
+        float4 x2 = *reinterpret_cast<device const float4*>(in_tok + i + 8u);
+        float4 x3 = *reinterpret_cast<device const float4*>(in_tok + i + 12u);
+        float4 c0 = *reinterpret_cast<device const float4*>(gate_inp_scale + i + 0u);
+        float4 c1 = *reinterpret_cast<device const float4*>(gate_inp_scale + i + 4u);
+        float4 c2 = *reinterpret_cast<device const float4*>(gate_inp_scale + i + 8u);
+        float4 c3 = *reinterpret_cast<device const float4*>(gate_inp_scale + i + 12u);
+        dot_val += w0.x * (x0.x * factor * c0.x);
+        dot_val += w0.y * (x0.y * factor * c0.y);
+        dot_val += w0.z * (x0.z * factor * c0.z);
+        dot_val += w0.w * (x0.w * factor * c0.w);
+        dot_val += w1.x * (x1.x * factor * c1.x);
+        dot_val += w1.y * (x1.y * factor * c1.y);
+        dot_val += w1.z * (x1.z * factor * c1.z);
+        dot_val += w1.w * (x1.w * factor * c1.w);
+        dot_val += w2.x * (x2.x * factor * c2.x);
+        dot_val += w2.y * (x2.y * factor * c2.y);
+        dot_val += w2.z * (x2.z * factor * c2.z);
+        dot_val += w2.w * (x2.w * factor * c2.w);
+        dot_val += w3.x * (x3.x * factor * c3.x);
+        dot_val += w3.y * (x3.y * factor * c3.y);
+        dot_val += w3.z * (x3.z * factor * c3.z);
+        dot_val += w3.w * (x3.w * factor * c3.w);
+    }
+    for (; i < hidden; ++i) {
+        float r_i = in_tok[i] * factor * gate_inp_scale[i];
+        dot_val += w_row[i] * r_i;
+    }
+
+    if (active) {
+        out_logits[(tok0 + tok_sub) * num_experts + e] = dot_val;
+    }
+}
+
+// Thirty-two elements per step, eight float4 loads per stream.
+kernel void spec50_router_gemv_v4x8(
+    device const float* input [[buffer(0)]],
+    device const float* gate_inp_scale [[buffer(1)]],
+    device const float* gate_inp_weights [[buffer(2)]],
+    device float* out_logits [[buffer(3)]],
+    device const float* factors [[buffer(4)]],
+    constant uint& hidden [[buffer(5)]],
+    constant uint& num_experts [[buffer(6)]],
+    constant uint& k_tokens [[buffer(7)]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint2 tg [[threadgroup_position_in_grid]]
+) {
+    const uint tok0 = tg.y * SPEC50_CHUNK;
+    if (tok0 >= k_tokens) return;
+    const uint kt = min(k_tokens - tok0, SPEC50_CHUNK);
+
+    const uint tok_sub = lane & 7u;
+    const uint e_sub = lane >> 3;
+    const uint e = tg.x * 4u + e_sub;
+    const bool active = (tok_sub < kt) && (e < num_experts);
+    const uint tc = min(tok_sub, kt - 1u);
+    const uint ec = min(e, num_experts - 1u);
+
+    device const float* in_tok = input + (tok0 + tc) * hidden;
+    device const float* w_row = gate_inp_weights + ec * hidden;
+    const float factor = factors[tok0 + tc];
+
+    float dot_val = 0.0f;
+    uint i = 0;
+    for (; i + 32u <= hidden; i += 32u) {
+        float4 w0 = *reinterpret_cast<device const float4*>(w_row + i + 0u);
+        float4 w1 = *reinterpret_cast<device const float4*>(w_row + i + 4u);
+        float4 w2 = *reinterpret_cast<device const float4*>(w_row + i + 8u);
+        float4 w3 = *reinterpret_cast<device const float4*>(w_row + i + 12u);
+        float4 w4 = *reinterpret_cast<device const float4*>(w_row + i + 16u);
+        float4 w5 = *reinterpret_cast<device const float4*>(w_row + i + 20u);
+        float4 w6 = *reinterpret_cast<device const float4*>(w_row + i + 24u);
+        float4 w7 = *reinterpret_cast<device const float4*>(w_row + i + 28u);
+        float4 x0 = *reinterpret_cast<device const float4*>(in_tok + i + 0u);
+        float4 x1 = *reinterpret_cast<device const float4*>(in_tok + i + 4u);
+        float4 x2 = *reinterpret_cast<device const float4*>(in_tok + i + 8u);
+        float4 x3 = *reinterpret_cast<device const float4*>(in_tok + i + 12u);
+        float4 x4 = *reinterpret_cast<device const float4*>(in_tok + i + 16u);
+        float4 x5 = *reinterpret_cast<device const float4*>(in_tok + i + 20u);
+        float4 x6 = *reinterpret_cast<device const float4*>(in_tok + i + 24u);
+        float4 x7 = *reinterpret_cast<device const float4*>(in_tok + i + 28u);
+        float4 c0 = *reinterpret_cast<device const float4*>(gate_inp_scale + i + 0u);
+        float4 c1 = *reinterpret_cast<device const float4*>(gate_inp_scale + i + 4u);
+        float4 c2 = *reinterpret_cast<device const float4*>(gate_inp_scale + i + 8u);
+        float4 c3 = *reinterpret_cast<device const float4*>(gate_inp_scale + i + 12u);
+        float4 c4 = *reinterpret_cast<device const float4*>(gate_inp_scale + i + 16u);
+        float4 c5 = *reinterpret_cast<device const float4*>(gate_inp_scale + i + 20u);
+        float4 c6 = *reinterpret_cast<device const float4*>(gate_inp_scale + i + 24u);
+        float4 c7 = *reinterpret_cast<device const float4*>(gate_inp_scale + i + 28u);
+        dot_val += w0.x * (x0.x * factor * c0.x);
+        dot_val += w0.y * (x0.y * factor * c0.y);
+        dot_val += w0.z * (x0.z * factor * c0.z);
+        dot_val += w0.w * (x0.w * factor * c0.w);
+        dot_val += w1.x * (x1.x * factor * c1.x);
+        dot_val += w1.y * (x1.y * factor * c1.y);
+        dot_val += w1.z * (x1.z * factor * c1.z);
+        dot_val += w1.w * (x1.w * factor * c1.w);
+        dot_val += w2.x * (x2.x * factor * c2.x);
+        dot_val += w2.y * (x2.y * factor * c2.y);
+        dot_val += w2.z * (x2.z * factor * c2.z);
+        dot_val += w2.w * (x2.w * factor * c2.w);
+        dot_val += w3.x * (x3.x * factor * c3.x);
+        dot_val += w3.y * (x3.y * factor * c3.y);
+        dot_val += w3.z * (x3.z * factor * c3.z);
+        dot_val += w3.w * (x3.w * factor * c3.w);
+        dot_val += w4.x * (x4.x * factor * c4.x);
+        dot_val += w4.y * (x4.y * factor * c4.y);
+        dot_val += w4.z * (x4.z * factor * c4.z);
+        dot_val += w4.w * (x4.w * factor * c4.w);
+        dot_val += w5.x * (x5.x * factor * c5.x);
+        dot_val += w5.y * (x5.y * factor * c5.y);
+        dot_val += w5.z * (x5.z * factor * c5.z);
+        dot_val += w5.w * (x5.w * factor * c5.w);
+        dot_val += w6.x * (x6.x * factor * c6.x);
+        dot_val += w6.y * (x6.y * factor * c6.y);
+        dot_val += w6.z * (x6.z * factor * c6.z);
+        dot_val += w6.w * (x6.w * factor * c6.w);
+        dot_val += w7.x * (x7.x * factor * c7.x);
+        dot_val += w7.y * (x7.y * factor * c7.y);
+        dot_val += w7.z * (x7.z * factor * c7.z);
+        dot_val += w7.w * (x7.w * factor * c7.w);
+    }
+    for (; i < hidden; ++i) {
+        float r_i = in_tok[i] * factor * gate_inp_scale[i];
+        dot_val += w_row[i] * r_i;
+    }
+
+    if (active) {
+        out_logits[(tok0 + tok_sub) * num_experts + e] = dot_val;
+    }
+}
+
+
+// Precomputes r[t][i] = x[t][i] * factor[t] * scale[i] once for the batch, in the
+// shipping kernel's operand order. The GEMV then reads ONE prepared stream instead of
+// recomputing r in all four lanes that share a token: it drops two multiplies per
+// element and a whole load stream, which is what the register budget needs to unroll
+// deep. Costs a k x hidden f32 scratch buffer.
+// Fused prepare pass for the r-staged variants. MUST be taken from the fast-math-ON
+// library: the shipping kernel is compiled with fast math, so `1.0f / sqrt(...)` there
+// is an rsqrt and `partial[0] / float(hidden)` a reciprocal multiply. Building this
+// same source with fast math OFF instead moves 1614/4608 logits by 6 ULP -- the factor
+// itself changes, and every expert of the affected tokens moves with it. The dot loop
+// wants the opposite (see SPEC50 exactness note on the GEMV kernels), so the two halves
+// of this lane are deliberately compiled from two different libraries.
+//
+// One 256-thread threadgroup per token
+// computes that token's RMS factor with the shipping kernel's phase 1 verbatim and
+// then writes r[t][i] = x[t][i] * factor * scale[i] for the whole row. Fusing the two
+// prepare dispatches matters at this size: the GEMV is down to ~1 ms for 30 layers,
+// so 30 saved dispatches are a measurable share of it.
+kernel void spec50_router_prepare(
+    device const float* input [[buffer(0)]],
+    device const float* gate_inp_scale [[buffer(1)]],
+    device float* out_r [[buffer(2)]],
+    device float* out_factor [[buffer(3)]],
+    constant uint& hidden [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    constant uint& k_tokens [[buffer(6)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint token_idx [[threadgroup_position_in_grid]],
+    uint tgsize [[threads_per_threadgroup]]
+) {
+    if (token_idx >= k_tokens) return;
+    device const float* in_tok = input + token_idx * hidden;
+
+    threadgroup float partial[256];
+    float local_ss = 0.0f;
+    for (uint i = tid; i < hidden; i += tgsize) {
+        float v = in_tok[i];
+        local_ss += v * v;
+    }
+    partial[tid] = local_ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgsize >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            partial[tid] += partial[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float rms_inv = 1.0f / sqrt(partial[0] / float(hidden) + eps);
+    float factor = rms_inv * (1.0f / sqrt(float(hidden)));
+    if (tid == 0) {
+        out_factor[token_idx] = factor;
+    }
+    device float* r_tok = out_r + token_idx * hidden;
+    for (uint i = tid; i < hidden; i += tgsize) {
+        r_tok[i] = in_tok[i] * factor * gate_inp_scale[i];
+    }
+}
+
+kernel void spec50_router_r_precompute(
+    device const float* input [[buffer(0)]],
+    device const float* gate_inp_scale [[buffer(1)]],
+    device float* out_r [[buffer(2)]],
+    device const float* factors [[buffer(3)]],
+    constant uint& hidden [[buffer(4)]],
+    constant uint& k_tokens [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint i = gid.x;
+    const uint t = gid.y;
+    if (i >= hidden || t >= k_tokens) return;
+    device const float* in_tok = input + t * hidden;
+    const float factor = factors[t];
+    out_r[t * hidden + i] = in_tok[i] * factor * gate_inp_scale[i];
+}
+
+// Sixty-four elements per step, three streams. Register-pressure probe.
+kernel void spec50_router_gemv_v4x16(
+    device const float* input [[buffer(0)]],
+    device const float* gate_inp_scale [[buffer(1)]],
+    device const float* gate_inp_weights [[buffer(2)]],
+    device float* out_logits [[buffer(3)]],
+    device const float* factors [[buffer(4)]],
+    constant uint& hidden [[buffer(5)]],
+    constant uint& num_experts [[buffer(6)]],
+    constant uint& k_tokens [[buffer(7)]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint2 tg [[threadgroup_position_in_grid]]
+) {
+    const uint tok0 = tg.y * SPEC50_CHUNK;
+    if (tok0 >= k_tokens) return;
+    const uint kt = min(k_tokens - tok0, SPEC50_CHUNK);
+
+    const uint tok_sub = lane & 7u;
+    const uint e_sub = lane >> 3;
+    const uint e = tg.x * 4u + e_sub;
+    const bool active = (tok_sub < kt) && (e < num_experts);
+    const uint tc = min(tok_sub, kt - 1u);
+    const uint ec = min(e, num_experts - 1u);
+
+    device const float* in_tok = input + (tok0 + tc) * hidden;
+    device const float* w_row = gate_inp_weights + ec * hidden;
+    const float factor = factors[tok0 + tc];
+
+    float dot_val = 0.0f;
+    uint i = 0;
+    for (; i + 64u <= hidden; i += 64u) {
+        float4 w0 = *reinterpret_cast<device const float4*>(w_row + i + 0u);
+        float4 w1 = *reinterpret_cast<device const float4*>(w_row + i + 4u);
+        float4 w2 = *reinterpret_cast<device const float4*>(w_row + i + 8u);
+        float4 w3 = *reinterpret_cast<device const float4*>(w_row + i + 12u);
+        float4 w4 = *reinterpret_cast<device const float4*>(w_row + i + 16u);
+        float4 w5 = *reinterpret_cast<device const float4*>(w_row + i + 20u);
+        float4 w6 = *reinterpret_cast<device const float4*>(w_row + i + 24u);
+        float4 w7 = *reinterpret_cast<device const float4*>(w_row + i + 28u);
+        float4 w8 = *reinterpret_cast<device const float4*>(w_row + i + 32u);
+        float4 w9 = *reinterpret_cast<device const float4*>(w_row + i + 36u);
+        float4 w10 = *reinterpret_cast<device const float4*>(w_row + i + 40u);
+        float4 w11 = *reinterpret_cast<device const float4*>(w_row + i + 44u);
+        float4 w12 = *reinterpret_cast<device const float4*>(w_row + i + 48u);
+        float4 w13 = *reinterpret_cast<device const float4*>(w_row + i + 52u);
+        float4 w14 = *reinterpret_cast<device const float4*>(w_row + i + 56u);
+        float4 w15 = *reinterpret_cast<device const float4*>(w_row + i + 60u);
+        float4 x0 = *reinterpret_cast<device const float4*>(in_tok + i + 0u);
+        float4 x1 = *reinterpret_cast<device const float4*>(in_tok + i + 4u);
+        float4 x2 = *reinterpret_cast<device const float4*>(in_tok + i + 8u);
+        float4 x3 = *reinterpret_cast<device const float4*>(in_tok + i + 12u);
+        float4 x4 = *reinterpret_cast<device const float4*>(in_tok + i + 16u);
+        float4 x5 = *reinterpret_cast<device const float4*>(in_tok + i + 20u);
+        float4 x6 = *reinterpret_cast<device const float4*>(in_tok + i + 24u);
+        float4 x7 = *reinterpret_cast<device const float4*>(in_tok + i + 28u);
+        float4 x8 = *reinterpret_cast<device const float4*>(in_tok + i + 32u);
+        float4 x9 = *reinterpret_cast<device const float4*>(in_tok + i + 36u);
+        float4 x10 = *reinterpret_cast<device const float4*>(in_tok + i + 40u);
+        float4 x11 = *reinterpret_cast<device const float4*>(in_tok + i + 44u);
+        float4 x12 = *reinterpret_cast<device const float4*>(in_tok + i + 48u);
+        float4 x13 = *reinterpret_cast<device const float4*>(in_tok + i + 52u);
+        float4 x14 = *reinterpret_cast<device const float4*>(in_tok + i + 56u);
+        float4 x15 = *reinterpret_cast<device const float4*>(in_tok + i + 60u);
+        float4 c0 = *reinterpret_cast<device const float4*>(gate_inp_scale + i + 0u);
+        float4 c1 = *reinterpret_cast<device const float4*>(gate_inp_scale + i + 4u);
+        float4 c2 = *reinterpret_cast<device const float4*>(gate_inp_scale + i + 8u);
+        float4 c3 = *reinterpret_cast<device const float4*>(gate_inp_scale + i + 12u);
+        float4 c4 = *reinterpret_cast<device const float4*>(gate_inp_scale + i + 16u);
+        float4 c5 = *reinterpret_cast<device const float4*>(gate_inp_scale + i + 20u);
+        float4 c6 = *reinterpret_cast<device const float4*>(gate_inp_scale + i + 24u);
+        float4 c7 = *reinterpret_cast<device const float4*>(gate_inp_scale + i + 28u);
+        float4 c8 = *reinterpret_cast<device const float4*>(gate_inp_scale + i + 32u);
+        float4 c9 = *reinterpret_cast<device const float4*>(gate_inp_scale + i + 36u);
+        float4 c10 = *reinterpret_cast<device const float4*>(gate_inp_scale + i + 40u);
+        float4 c11 = *reinterpret_cast<device const float4*>(gate_inp_scale + i + 44u);
+        float4 c12 = *reinterpret_cast<device const float4*>(gate_inp_scale + i + 48u);
+        float4 c13 = *reinterpret_cast<device const float4*>(gate_inp_scale + i + 52u);
+        float4 c14 = *reinterpret_cast<device const float4*>(gate_inp_scale + i + 56u);
+        float4 c15 = *reinterpret_cast<device const float4*>(gate_inp_scale + i + 60u);
+        dot_val += w0.x * (x0.x * factor * c0.x);
+        dot_val += w0.y * (x0.y * factor * c0.y);
+        dot_val += w0.z * (x0.z * factor * c0.z);
+        dot_val += w0.w * (x0.w * factor * c0.w);
+        dot_val += w1.x * (x1.x * factor * c1.x);
+        dot_val += w1.y * (x1.y * factor * c1.y);
+        dot_val += w1.z * (x1.z * factor * c1.z);
+        dot_val += w1.w * (x1.w * factor * c1.w);
+        dot_val += w2.x * (x2.x * factor * c2.x);
+        dot_val += w2.y * (x2.y * factor * c2.y);
+        dot_val += w2.z * (x2.z * factor * c2.z);
+        dot_val += w2.w * (x2.w * factor * c2.w);
+        dot_val += w3.x * (x3.x * factor * c3.x);
+        dot_val += w3.y * (x3.y * factor * c3.y);
+        dot_val += w3.z * (x3.z * factor * c3.z);
+        dot_val += w3.w * (x3.w * factor * c3.w);
+        dot_val += w4.x * (x4.x * factor * c4.x);
+        dot_val += w4.y * (x4.y * factor * c4.y);
+        dot_val += w4.z * (x4.z * factor * c4.z);
+        dot_val += w4.w * (x4.w * factor * c4.w);
+        dot_val += w5.x * (x5.x * factor * c5.x);
+        dot_val += w5.y * (x5.y * factor * c5.y);
+        dot_val += w5.z * (x5.z * factor * c5.z);
+        dot_val += w5.w * (x5.w * factor * c5.w);
+        dot_val += w6.x * (x6.x * factor * c6.x);
+        dot_val += w6.y * (x6.y * factor * c6.y);
+        dot_val += w6.z * (x6.z * factor * c6.z);
+        dot_val += w6.w * (x6.w * factor * c6.w);
+        dot_val += w7.x * (x7.x * factor * c7.x);
+        dot_val += w7.y * (x7.y * factor * c7.y);
+        dot_val += w7.z * (x7.z * factor * c7.z);
+        dot_val += w7.w * (x7.w * factor * c7.w);
+        dot_val += w8.x * (x8.x * factor * c8.x);
+        dot_val += w8.y * (x8.y * factor * c8.y);
+        dot_val += w8.z * (x8.z * factor * c8.z);
+        dot_val += w8.w * (x8.w * factor * c8.w);
+        dot_val += w9.x * (x9.x * factor * c9.x);
+        dot_val += w9.y * (x9.y * factor * c9.y);
+        dot_val += w9.z * (x9.z * factor * c9.z);
+        dot_val += w9.w * (x9.w * factor * c9.w);
+        dot_val += w10.x * (x10.x * factor * c10.x);
+        dot_val += w10.y * (x10.y * factor * c10.y);
+        dot_val += w10.z * (x10.z * factor * c10.z);
+        dot_val += w10.w * (x10.w * factor * c10.w);
+        dot_val += w11.x * (x11.x * factor * c11.x);
+        dot_val += w11.y * (x11.y * factor * c11.y);
+        dot_val += w11.z * (x11.z * factor * c11.z);
+        dot_val += w11.w * (x11.w * factor * c11.w);
+        dot_val += w12.x * (x12.x * factor * c12.x);
+        dot_val += w12.y * (x12.y * factor * c12.y);
+        dot_val += w12.z * (x12.z * factor * c12.z);
+        dot_val += w12.w * (x12.w * factor * c12.w);
+        dot_val += w13.x * (x13.x * factor * c13.x);
+        dot_val += w13.y * (x13.y * factor * c13.y);
+        dot_val += w13.z * (x13.z * factor * c13.z);
+        dot_val += w13.w * (x13.w * factor * c13.w);
+        dot_val += w14.x * (x14.x * factor * c14.x);
+        dot_val += w14.y * (x14.y * factor * c14.y);
+        dot_val += w14.z * (x14.z * factor * c14.z);
+        dot_val += w14.w * (x14.w * factor * c14.w);
+        dot_val += w15.x * (x15.x * factor * c15.x);
+        dot_val += w15.y * (x15.y * factor * c15.y);
+        dot_val += w15.z * (x15.z * factor * c15.z);
+        dot_val += w15.w * (x15.w * factor * c15.w);
+    }
+    for (; i < hidden; ++i) {
+        float r_i = in_tok[i] * factor * gate_inp_scale[i];
+        dot_val += w_row[i] * r_i;
+    }
+
+    if (active) {
+        out_logits[(tok0 + tok_sub) * num_experts + e] = dot_val;
+    }
+}
+
+// Thirty-two elements per step over the precomputed r stream (two streams).
+kernel void spec50_router_gemv_rv4x8(
+    device const float* input [[buffer(0)]],
+    device const float* gate_inp_scale [[buffer(1)]],
+    device const float* gate_inp_weights [[buffer(2)]],
+    device float* out_logits [[buffer(3)]],
+    device const float* factors [[buffer(4)]],
+    constant uint& hidden [[buffer(5)]],
+    constant uint& num_experts [[buffer(6)]],
+    constant uint& k_tokens [[buffer(7)]],
+    device const float* r_stage [[buffer(8)]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint2 tg [[threadgroup_position_in_grid]]
+) {
+    const uint tok0 = tg.y * SPEC50_CHUNK;
+    if (tok0 >= k_tokens) return;
+    const uint kt = min(k_tokens - tok0, SPEC50_CHUNK);
+
+    const uint tok_sub = lane & 7u;
+    const uint e_sub = lane >> 3;
+    const uint e = tg.x * 4u + e_sub;
+    const bool active = (tok_sub < kt) && (e < num_experts);
+    const uint tc = min(tok_sub, kt - 1u);
+    const uint ec = min(e, num_experts - 1u);
+
+    device const float* in_tok = input + (tok0 + tc) * hidden;
+    device const float* w_row = gate_inp_weights + ec * hidden;
+    const float factor = factors[tok0 + tc];
+    device const float* r_row = r_stage + (tok0 + tc) * hidden;
+
+    float dot_val = 0.0f;
+    uint i = 0;
+    for (; i + 32u <= hidden; i += 32u) {
+        float4 w0 = *reinterpret_cast<device const float4*>(w_row + i + 0u);
+        float4 w1 = *reinterpret_cast<device const float4*>(w_row + i + 4u);
+        float4 w2 = *reinterpret_cast<device const float4*>(w_row + i + 8u);
+        float4 w3 = *reinterpret_cast<device const float4*>(w_row + i + 12u);
+        float4 w4 = *reinterpret_cast<device const float4*>(w_row + i + 16u);
+        float4 w5 = *reinterpret_cast<device const float4*>(w_row + i + 20u);
+        float4 w6 = *reinterpret_cast<device const float4*>(w_row + i + 24u);
+        float4 w7 = *reinterpret_cast<device const float4*>(w_row + i + 28u);
+        float4 r0 = *reinterpret_cast<device const float4*>(r_row + i + 0u);
+        float4 r1 = *reinterpret_cast<device const float4*>(r_row + i + 4u);
+        float4 r2 = *reinterpret_cast<device const float4*>(r_row + i + 8u);
+        float4 r3 = *reinterpret_cast<device const float4*>(r_row + i + 12u);
+        float4 r4 = *reinterpret_cast<device const float4*>(r_row + i + 16u);
+        float4 r5 = *reinterpret_cast<device const float4*>(r_row + i + 20u);
+        float4 r6 = *reinterpret_cast<device const float4*>(r_row + i + 24u);
+        float4 r7 = *reinterpret_cast<device const float4*>(r_row + i + 28u);
+        dot_val += w0.x * r0.x;
+        dot_val += w0.y * r0.y;
+        dot_val += w0.z * r0.z;
+        dot_val += w0.w * r0.w;
+        dot_val += w1.x * r1.x;
+        dot_val += w1.y * r1.y;
+        dot_val += w1.z * r1.z;
+        dot_val += w1.w * r1.w;
+        dot_val += w2.x * r2.x;
+        dot_val += w2.y * r2.y;
+        dot_val += w2.z * r2.z;
+        dot_val += w2.w * r2.w;
+        dot_val += w3.x * r3.x;
+        dot_val += w3.y * r3.y;
+        dot_val += w3.z * r3.z;
+        dot_val += w3.w * r3.w;
+        dot_val += w4.x * r4.x;
+        dot_val += w4.y * r4.y;
+        dot_val += w4.z * r4.z;
+        dot_val += w4.w * r4.w;
+        dot_val += w5.x * r5.x;
+        dot_val += w5.y * r5.y;
+        dot_val += w5.z * r5.z;
+        dot_val += w5.w * r5.w;
+        dot_val += w6.x * r6.x;
+        dot_val += w6.y * r6.y;
+        dot_val += w6.z * r6.z;
+        dot_val += w6.w * r6.w;
+        dot_val += w7.x * r7.x;
+        dot_val += w7.y * r7.y;
+        dot_val += w7.z * r7.z;
+        dot_val += w7.w * r7.w;
+    }
+    for (; i < hidden; ++i) {
+        float r_i = r_row[i];
+        dot_val += w_row[i] * r_i;
+    }
+
+    if (active) {
+        out_logits[(tok0 + tok_sub) * num_experts + e] = dot_val;
+    }
+}
+
+// Sixty-four elements per step over the precomputed r stream.
+kernel void spec50_router_gemv_rv4x16(
+    device const float* input [[buffer(0)]],
+    device const float* gate_inp_scale [[buffer(1)]],
+    device const float* gate_inp_weights [[buffer(2)]],
+    device float* out_logits [[buffer(3)]],
+    device const float* factors [[buffer(4)]],
+    constant uint& hidden [[buffer(5)]],
+    constant uint& num_experts [[buffer(6)]],
+    constant uint& k_tokens [[buffer(7)]],
+    device const float* r_stage [[buffer(8)]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint2 tg [[threadgroup_position_in_grid]]
+) {
+    const uint tok0 = tg.y * SPEC50_CHUNK;
+    if (tok0 >= k_tokens) return;
+    const uint kt = min(k_tokens - tok0, SPEC50_CHUNK);
+
+    const uint tok_sub = lane & 7u;
+    const uint e_sub = lane >> 3;
+    const uint e = tg.x * 4u + e_sub;
+    const bool active = (tok_sub < kt) && (e < num_experts);
+    const uint tc = min(tok_sub, kt - 1u);
+    const uint ec = min(e, num_experts - 1u);
+
+    device const float* in_tok = input + (tok0 + tc) * hidden;
+    device const float* w_row = gate_inp_weights + ec * hidden;
+    const float factor = factors[tok0 + tc];
+    device const float* r_row = r_stage + (tok0 + tc) * hidden;
+
+    float dot_val = 0.0f;
+    uint i = 0;
+    for (; i + 64u <= hidden; i += 64u) {
+        float4 w0 = *reinterpret_cast<device const float4*>(w_row + i + 0u);
+        float4 w1 = *reinterpret_cast<device const float4*>(w_row + i + 4u);
+        float4 w2 = *reinterpret_cast<device const float4*>(w_row + i + 8u);
+        float4 w3 = *reinterpret_cast<device const float4*>(w_row + i + 12u);
+        float4 w4 = *reinterpret_cast<device const float4*>(w_row + i + 16u);
+        float4 w5 = *reinterpret_cast<device const float4*>(w_row + i + 20u);
+        float4 w6 = *reinterpret_cast<device const float4*>(w_row + i + 24u);
+        float4 w7 = *reinterpret_cast<device const float4*>(w_row + i + 28u);
+        float4 w8 = *reinterpret_cast<device const float4*>(w_row + i + 32u);
+        float4 w9 = *reinterpret_cast<device const float4*>(w_row + i + 36u);
+        float4 w10 = *reinterpret_cast<device const float4*>(w_row + i + 40u);
+        float4 w11 = *reinterpret_cast<device const float4*>(w_row + i + 44u);
+        float4 w12 = *reinterpret_cast<device const float4*>(w_row + i + 48u);
+        float4 w13 = *reinterpret_cast<device const float4*>(w_row + i + 52u);
+        float4 w14 = *reinterpret_cast<device const float4*>(w_row + i + 56u);
+        float4 w15 = *reinterpret_cast<device const float4*>(w_row + i + 60u);
+        float4 r0 = *reinterpret_cast<device const float4*>(r_row + i + 0u);
+        float4 r1 = *reinterpret_cast<device const float4*>(r_row + i + 4u);
+        float4 r2 = *reinterpret_cast<device const float4*>(r_row + i + 8u);
+        float4 r3 = *reinterpret_cast<device const float4*>(r_row + i + 12u);
+        float4 r4 = *reinterpret_cast<device const float4*>(r_row + i + 16u);
+        float4 r5 = *reinterpret_cast<device const float4*>(r_row + i + 20u);
+        float4 r6 = *reinterpret_cast<device const float4*>(r_row + i + 24u);
+        float4 r7 = *reinterpret_cast<device const float4*>(r_row + i + 28u);
+        float4 r8 = *reinterpret_cast<device const float4*>(r_row + i + 32u);
+        float4 r9 = *reinterpret_cast<device const float4*>(r_row + i + 36u);
+        float4 r10 = *reinterpret_cast<device const float4*>(r_row + i + 40u);
+        float4 r11 = *reinterpret_cast<device const float4*>(r_row + i + 44u);
+        float4 r12 = *reinterpret_cast<device const float4*>(r_row + i + 48u);
+        float4 r13 = *reinterpret_cast<device const float4*>(r_row + i + 52u);
+        float4 r14 = *reinterpret_cast<device const float4*>(r_row + i + 56u);
+        float4 r15 = *reinterpret_cast<device const float4*>(r_row + i + 60u);
+        dot_val += w0.x * r0.x;
+        dot_val += w0.y * r0.y;
+        dot_val += w0.z * r0.z;
+        dot_val += w0.w * r0.w;
+        dot_val += w1.x * r1.x;
+        dot_val += w1.y * r1.y;
+        dot_val += w1.z * r1.z;
+        dot_val += w1.w * r1.w;
+        dot_val += w2.x * r2.x;
+        dot_val += w2.y * r2.y;
+        dot_val += w2.z * r2.z;
+        dot_val += w2.w * r2.w;
+        dot_val += w3.x * r3.x;
+        dot_val += w3.y * r3.y;
+        dot_val += w3.z * r3.z;
+        dot_val += w3.w * r3.w;
+        dot_val += w4.x * r4.x;
+        dot_val += w4.y * r4.y;
+        dot_val += w4.z * r4.z;
+        dot_val += w4.w * r4.w;
+        dot_val += w5.x * r5.x;
+        dot_val += w5.y * r5.y;
+        dot_val += w5.z * r5.z;
+        dot_val += w5.w * r5.w;
+        dot_val += w6.x * r6.x;
+        dot_val += w6.y * r6.y;
+        dot_val += w6.z * r6.z;
+        dot_val += w6.w * r6.w;
+        dot_val += w7.x * r7.x;
+        dot_val += w7.y * r7.y;
+        dot_val += w7.z * r7.z;
+        dot_val += w7.w * r7.w;
+        dot_val += w8.x * r8.x;
+        dot_val += w8.y * r8.y;
+        dot_val += w8.z * r8.z;
+        dot_val += w8.w * r8.w;
+        dot_val += w9.x * r9.x;
+        dot_val += w9.y * r9.y;
+        dot_val += w9.z * r9.z;
+        dot_val += w9.w * r9.w;
+        dot_val += w10.x * r10.x;
+        dot_val += w10.y * r10.y;
+        dot_val += w10.z * r10.z;
+        dot_val += w10.w * r10.w;
+        dot_val += w11.x * r11.x;
+        dot_val += w11.y * r11.y;
+        dot_val += w11.z * r11.z;
+        dot_val += w11.w * r11.w;
+        dot_val += w12.x * r12.x;
+        dot_val += w12.y * r12.y;
+        dot_val += w12.z * r12.z;
+        dot_val += w12.w * r12.w;
+        dot_val += w13.x * r13.x;
+        dot_val += w13.y * r13.y;
+        dot_val += w13.z * r13.z;
+        dot_val += w13.w * r13.w;
+        dot_val += w14.x * r14.x;
+        dot_val += w14.y * r14.y;
+        dot_val += w14.z * r14.z;
+        dot_val += w14.w * r14.w;
+        dot_val += w15.x * r15.x;
+        dot_val += w15.y * r15.y;
+        dot_val += w15.z * r15.z;
+        dot_val += w15.w * r15.w;
+    }
+    for (; i < hidden; ++i) {
+        float r_i = r_row[i];
+        dot_val += w_row[i] * r_i;
+    }
+
+    if (active) {
+        out_logits[(tok0 + tok_sub) * num_experts + e] = dot_val;
+    }
+}
+
+// 96 elements per step over the precomputed r stream.
+kernel void spec50_router_gemv_rv4x24(
+    device const float* input [[buffer(0)]],
+    device const float* gate_inp_scale [[buffer(1)]],
+    device const float* gate_inp_weights [[buffer(2)]],
+    device float* out_logits [[buffer(3)]],
+    device const float* factors [[buffer(4)]],
+    constant uint& hidden [[buffer(5)]],
+    constant uint& num_experts [[buffer(6)]],
+    constant uint& k_tokens [[buffer(7)]],
+    device const float* r_stage [[buffer(8)]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint2 tg [[threadgroup_position_in_grid]]
+) {
+    const uint tok0 = tg.y * SPEC50_CHUNK;
+    if (tok0 >= k_tokens) return;
+    const uint kt = min(k_tokens - tok0, SPEC50_CHUNK);
+
+    const uint tok_sub = lane & 7u;
+    const uint e_sub = lane >> 3;
+    const uint e = tg.x * 4u + e_sub;
+    const bool active = (tok_sub < kt) && (e < num_experts);
+    const uint tc = min(tok_sub, kt - 1u);
+    const uint ec = min(e, num_experts - 1u);
+
+    device const float* in_tok = input + (tok0 + tc) * hidden;
+    device const float* w_row = gate_inp_weights + ec * hidden;
+    const float factor = factors[tok0 + tc];
+    device const float* r_row = r_stage + (tok0 + tc) * hidden;
+
+    float dot_val = 0.0f;
+    uint i = 0;
+    for (; i + 96u <= hidden; i += 96u) {
+        float4 w0 = *reinterpret_cast<device const float4*>(w_row + i + 0u);
+        float4 w1 = *reinterpret_cast<device const float4*>(w_row + i + 4u);
+        float4 w2 = *reinterpret_cast<device const float4*>(w_row + i + 8u);
+        float4 w3 = *reinterpret_cast<device const float4*>(w_row + i + 12u);
+        float4 w4 = *reinterpret_cast<device const float4*>(w_row + i + 16u);
+        float4 w5 = *reinterpret_cast<device const float4*>(w_row + i + 20u);
+        float4 w6 = *reinterpret_cast<device const float4*>(w_row + i + 24u);
+        float4 w7 = *reinterpret_cast<device const float4*>(w_row + i + 28u);
+        float4 w8 = *reinterpret_cast<device const float4*>(w_row + i + 32u);
+        float4 w9 = *reinterpret_cast<device const float4*>(w_row + i + 36u);
+        float4 w10 = *reinterpret_cast<device const float4*>(w_row + i + 40u);
+        float4 w11 = *reinterpret_cast<device const float4*>(w_row + i + 44u);
+        float4 w12 = *reinterpret_cast<device const float4*>(w_row + i + 48u);
+        float4 w13 = *reinterpret_cast<device const float4*>(w_row + i + 52u);
+        float4 w14 = *reinterpret_cast<device const float4*>(w_row + i + 56u);
+        float4 w15 = *reinterpret_cast<device const float4*>(w_row + i + 60u);
+        float4 w16 = *reinterpret_cast<device const float4*>(w_row + i + 64u);
+        float4 w17 = *reinterpret_cast<device const float4*>(w_row + i + 68u);
+        float4 w18 = *reinterpret_cast<device const float4*>(w_row + i + 72u);
+        float4 w19 = *reinterpret_cast<device const float4*>(w_row + i + 76u);
+        float4 w20 = *reinterpret_cast<device const float4*>(w_row + i + 80u);
+        float4 w21 = *reinterpret_cast<device const float4*>(w_row + i + 84u);
+        float4 w22 = *reinterpret_cast<device const float4*>(w_row + i + 88u);
+        float4 w23 = *reinterpret_cast<device const float4*>(w_row + i + 92u);
+        float4 r0 = *reinterpret_cast<device const float4*>(r_row + i + 0u);
+        float4 r1 = *reinterpret_cast<device const float4*>(r_row + i + 4u);
+        float4 r2 = *reinterpret_cast<device const float4*>(r_row + i + 8u);
+        float4 r3 = *reinterpret_cast<device const float4*>(r_row + i + 12u);
+        float4 r4 = *reinterpret_cast<device const float4*>(r_row + i + 16u);
+        float4 r5 = *reinterpret_cast<device const float4*>(r_row + i + 20u);
+        float4 r6 = *reinterpret_cast<device const float4*>(r_row + i + 24u);
+        float4 r7 = *reinterpret_cast<device const float4*>(r_row + i + 28u);
+        float4 r8 = *reinterpret_cast<device const float4*>(r_row + i + 32u);
+        float4 r9 = *reinterpret_cast<device const float4*>(r_row + i + 36u);
+        float4 r10 = *reinterpret_cast<device const float4*>(r_row + i + 40u);
+        float4 r11 = *reinterpret_cast<device const float4*>(r_row + i + 44u);
+        float4 r12 = *reinterpret_cast<device const float4*>(r_row + i + 48u);
+        float4 r13 = *reinterpret_cast<device const float4*>(r_row + i + 52u);
+        float4 r14 = *reinterpret_cast<device const float4*>(r_row + i + 56u);
+        float4 r15 = *reinterpret_cast<device const float4*>(r_row + i + 60u);
+        float4 r16 = *reinterpret_cast<device const float4*>(r_row + i + 64u);
+        float4 r17 = *reinterpret_cast<device const float4*>(r_row + i + 68u);
+        float4 r18 = *reinterpret_cast<device const float4*>(r_row + i + 72u);
+        float4 r19 = *reinterpret_cast<device const float4*>(r_row + i + 76u);
+        float4 r20 = *reinterpret_cast<device const float4*>(r_row + i + 80u);
+        float4 r21 = *reinterpret_cast<device const float4*>(r_row + i + 84u);
+        float4 r22 = *reinterpret_cast<device const float4*>(r_row + i + 88u);
+        float4 r23 = *reinterpret_cast<device const float4*>(r_row + i + 92u);
+        dot_val += w0.x * r0.x;
+        dot_val += w0.y * r0.y;
+        dot_val += w0.z * r0.z;
+        dot_val += w0.w * r0.w;
+        dot_val += w1.x * r1.x;
+        dot_val += w1.y * r1.y;
+        dot_val += w1.z * r1.z;
+        dot_val += w1.w * r1.w;
+        dot_val += w2.x * r2.x;
+        dot_val += w2.y * r2.y;
+        dot_val += w2.z * r2.z;
+        dot_val += w2.w * r2.w;
+        dot_val += w3.x * r3.x;
+        dot_val += w3.y * r3.y;
+        dot_val += w3.z * r3.z;
+        dot_val += w3.w * r3.w;
+        dot_val += w4.x * r4.x;
+        dot_val += w4.y * r4.y;
+        dot_val += w4.z * r4.z;
+        dot_val += w4.w * r4.w;
+        dot_val += w5.x * r5.x;
+        dot_val += w5.y * r5.y;
+        dot_val += w5.z * r5.z;
+        dot_val += w5.w * r5.w;
+        dot_val += w6.x * r6.x;
+        dot_val += w6.y * r6.y;
+        dot_val += w6.z * r6.z;
+        dot_val += w6.w * r6.w;
+        dot_val += w7.x * r7.x;
+        dot_val += w7.y * r7.y;
+        dot_val += w7.z * r7.z;
+        dot_val += w7.w * r7.w;
+        dot_val += w8.x * r8.x;
+        dot_val += w8.y * r8.y;
+        dot_val += w8.z * r8.z;
+        dot_val += w8.w * r8.w;
+        dot_val += w9.x * r9.x;
+        dot_val += w9.y * r9.y;
+        dot_val += w9.z * r9.z;
+        dot_val += w9.w * r9.w;
+        dot_val += w10.x * r10.x;
+        dot_val += w10.y * r10.y;
+        dot_val += w10.z * r10.z;
+        dot_val += w10.w * r10.w;
+        dot_val += w11.x * r11.x;
+        dot_val += w11.y * r11.y;
+        dot_val += w11.z * r11.z;
+        dot_val += w11.w * r11.w;
+        dot_val += w12.x * r12.x;
+        dot_val += w12.y * r12.y;
+        dot_val += w12.z * r12.z;
+        dot_val += w12.w * r12.w;
+        dot_val += w13.x * r13.x;
+        dot_val += w13.y * r13.y;
+        dot_val += w13.z * r13.z;
+        dot_val += w13.w * r13.w;
+        dot_val += w14.x * r14.x;
+        dot_val += w14.y * r14.y;
+        dot_val += w14.z * r14.z;
+        dot_val += w14.w * r14.w;
+        dot_val += w15.x * r15.x;
+        dot_val += w15.y * r15.y;
+        dot_val += w15.z * r15.z;
+        dot_val += w15.w * r15.w;
+        dot_val += w16.x * r16.x;
+        dot_val += w16.y * r16.y;
+        dot_val += w16.z * r16.z;
+        dot_val += w16.w * r16.w;
+        dot_val += w17.x * r17.x;
+        dot_val += w17.y * r17.y;
+        dot_val += w17.z * r17.z;
+        dot_val += w17.w * r17.w;
+        dot_val += w18.x * r18.x;
+        dot_val += w18.y * r18.y;
+        dot_val += w18.z * r18.z;
+        dot_val += w18.w * r18.w;
+        dot_val += w19.x * r19.x;
+        dot_val += w19.y * r19.y;
+        dot_val += w19.z * r19.z;
+        dot_val += w19.w * r19.w;
+        dot_val += w20.x * r20.x;
+        dot_val += w20.y * r20.y;
+        dot_val += w20.z * r20.z;
+        dot_val += w20.w * r20.w;
+        dot_val += w21.x * r21.x;
+        dot_val += w21.y * r21.y;
+        dot_val += w21.z * r21.z;
+        dot_val += w21.w * r21.w;
+        dot_val += w22.x * r22.x;
+        dot_val += w22.y * r22.y;
+        dot_val += w22.z * r22.z;
+        dot_val += w22.w * r22.w;
+        dot_val += w23.x * r23.x;
+        dot_val += w23.y * r23.y;
+        dot_val += w23.z * r23.z;
+        dot_val += w23.w * r23.w;
+    }
+    for (; i < hidden; ++i) {
+        float r_i = r_row[i];
+        dot_val += w_row[i] * r_i;
+    }
+
+    if (active) {
+        out_logits[(tok0 + tok_sub) * num_experts + e] = dot_val;
+    }
+}
+
+
 
 // NOT BIT-EXACT. Identical layout to spec50_router_gemv_exact, but with float4 loads
 // and a hand-unrolled body. Kept only so the benchmark can price what exactness costs;
@@ -194,8 +1315,66 @@ kernel void spec50_router_gemv_vec4(
 pub(crate) struct Spec50RouterKernels {
     pub(crate) rms_factor_pipeline: ComputePipelineState,
     pub(crate) router_gemv_pipeline: ComputePipelineState,
-    /// NOT bit-exact; benchmark-only. See `encode_spec50_router_gemv_vec4`.
+    pub(crate) router_gemv_u4_pipeline: ComputePipelineState,
+    pub(crate) router_gemv_u8_pipeline: ComputePipelineState,
+    /// NOT bit-exact; benchmark-only.
     pub(crate) router_gemv_vec4_pipeline: ComputePipelineState,
+    /// Same three sources again, from a fast-math-OFF library. Without fast math the
+    /// compiler may not reassociate an FP reduction, so a hand-unrolled loop keeps the
+    /// shipping kernel's summation order by construction -- IF the per-operation
+    /// semantics (notably whether `dot += w * r` still contracts to an FMA) survive
+    /// turning fast math off. `strict_exact` is the control that answers that.
+    pub(crate) router_gemv_strict_pipeline: ComputePipelineState,
+    pub(crate) router_gemv_strict_u8_pipeline: ComputePipelineState,
+    pub(crate) router_gemv_strict_vec4_pipeline: ComputePipelineState,
+    pub(crate) router_gemv_strict_u16_pipeline: ComputePipelineState,
+    pub(crate) router_gemv_strict_v4x4_pipeline: ComputePipelineState,
+    pub(crate) router_gemv_strict_v4x8_pipeline: ComputePipelineState,
+    pub(crate) router_gemv_strict_v4x16_pipeline: ComputePipelineState,
+    pub(crate) r_precompute_pipeline: ComputePipelineState,
+    pub(crate) router_gemv_strict_rv4x8_pipeline: ComputePipelineState,
+    pub(crate) router_gemv_strict_rv4x16_pipeline: ComputePipelineState,
+    pub(crate) router_gemv_strict_rv4x24_pipeline: ComputePipelineState,
+    pub(crate) prepare_pipeline: ComputePipelineState,
+}
+
+/// Which dot-loop shape to dispatch. Only `Exact` is proven bit-identical to
+/// `gemma4_router_batch_k_f32`; the others exist so the tests can measure what each
+/// step away from the shipping loop text costs in ULP and what it buys in ms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Spec50RouterVariant {
+    Exact,
+    Unroll4,
+    Unroll8,
+    Vec4,
+    StrictExact,
+    StrictUnroll8,
+    StrictVec4,
+    StrictUnroll16,
+    StrictVec4x4,
+    StrictVec4x8,
+    StrictVec4x16,
+    /// Needs the `r_stage` scratch buffer.
+    StrictRVec4x8,
+    /// Needs the `r_stage` scratch buffer.
+    StrictRVec4x16,
+    /// Needs the `r_stage` scratch buffer.
+    StrictRVec4x24,
+}
+
+/// What [`encode_spec50_router_gemv`] dispatches: the fastest variant that is
+/// bit-identical to `gemma4_router_batch_k_f32` across K=1..=8.
+pub(crate) const SPEC50_ROUTER_DEFAULT_VARIANT: Spec50RouterVariant =
+    Spec50RouterVariant::StrictRVec4x16;
+
+impl Spec50RouterVariant {
+    /// True when the variant needs the `k_tokens x hidden` f32 `r_stage` scratch.
+    pub(crate) fn needs_r_stage(self) -> bool {
+        matches!(
+            self,
+            Self::StrictRVec4x8 | Self::StrictRVec4x16 | Self::StrictRVec4x24
+        )
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -214,8 +1393,16 @@ pub(crate) fn spec50_router_kernels() -> Option<&'static Spec50RouterKernels> {
                 .new_library_with_source(SPEC50_ROUTER_SHADER, &options)
                 .map_err(|err| eprintln!("[metal] SPEC50_ROUTER_SHADER compile failed: {err}"))
                 .ok()?;
-            let pipeline = |name: &str| -> Option<ComputePipelineState> {
-                let function = library
+            let strict_options = CompileOptions::new();
+            strict_options.set_fast_math_enabled(false);
+            let strict_library = device
+                .new_library_with_source(SPEC50_ROUTER_SHADER, &strict_options)
+                .map_err(|err| {
+                    eprintln!("[metal] SPEC50_ROUTER_SHADER (strict) compile failed: {err}")
+                })
+                .ok()?;
+            let pipeline_from = |lib: &metal::Library, name: &str| -> Option<ComputePipelineState> {
+                let function = lib
                     .get_function(name, None)
                     .map_err(|err| eprintln!("[metal] spec50 function {name} missing: {err}"))
                     .ok()?;
@@ -224,10 +1411,26 @@ pub(crate) fn spec50_router_kernels() -> Option<&'static Spec50RouterKernels> {
                     .map_err(|err| eprintln!("[metal] spec50 pipeline {name} failed: {err}"))
                     .ok()
             };
+            let pipeline = |name: &str| pipeline_from(&library, name);
+            let strict = |name: &str| pipeline_from(&strict_library, name);
             Some(Spec50RouterKernels {
                 rms_factor_pipeline: pipeline("spec50_router_rms_factor")?,
                 router_gemv_pipeline: pipeline("spec50_router_gemv_exact")?,
+                router_gemv_u4_pipeline: pipeline("spec50_router_gemv_u4")?,
+                router_gemv_u8_pipeline: pipeline("spec50_router_gemv_u8")?,
                 router_gemv_vec4_pipeline: pipeline("spec50_router_gemv_vec4")?,
+                router_gemv_strict_pipeline: strict("spec50_router_gemv_exact")?,
+                router_gemv_strict_u8_pipeline: strict("spec50_router_gemv_u8")?,
+                router_gemv_strict_vec4_pipeline: strict("spec50_router_gemv_vec4")?,
+                router_gemv_strict_u16_pipeline: strict("spec50_router_gemv_u16")?,
+                router_gemv_strict_v4x4_pipeline: strict("spec50_router_gemv_v4x4")?,
+                router_gemv_strict_v4x8_pipeline: strict("spec50_router_gemv_v4x8")?,
+                router_gemv_strict_v4x16_pipeline: strict("spec50_router_gemv_v4x16")?,
+                r_precompute_pipeline: strict("spec50_router_r_precompute")?,
+                router_gemv_strict_rv4x8_pipeline: strict("spec50_router_gemv_rv4x8")?,
+                router_gemv_strict_rv4x16_pipeline: strict("spec50_router_gemv_rv4x16")?,
+                router_gemv_strict_rv4x24_pipeline: strict("spec50_router_gemv_rv4x24")?,
+                prepare_pipeline: pipeline("spec50_router_prepare")?,
             })
         })
         .as_ref()
@@ -237,18 +1440,23 @@ pub(crate) fn spec50_router_kernels() -> Option<&'static Spec50RouterKernels> {
 ///
 /// Encodes TWO dispatches into `encoder` (a compute encoder is serial, so the
 /// ordering is guaranteed without an explicit barrier):
-///   1. `spec50_router_rms_factor` -> `factors[0..k_tokens]`
-///   2. `spec50_router_gemv_exact` -> `out_logits[k_tokens][num_experts]`
+///   1. `spec50_router_prepare`     -> `factors[0..k_tokens]` and `r_stage`
+///   2. `spec50_router_gemv_rv4x16` -> `out_logits[k_tokens][num_experts]`
 ///
-/// Buffers:
-///   0 `input`            `[k_tokens][hidden]` f32
-///   1 `gate_inp_scale`   `[hidden]` f32
-///   2 `gate_inp_weights` `[num_experts][hidden]` f32
-///   3 `out_logits`       `[k_tokens][num_experts]` f32, at `out_logits_offset`
-///   4 `factors`          NEW scratch, `spec50_router_factor_bytes(k_tokens)` bytes
+/// Buffers the integrator supplies:
+///   `input`            `[k_tokens][hidden]` f32
+///   `gate_inp_scale`   `[hidden]` f32
+///   `gate_inp_weights` `[num_experts][hidden]` f32
+///   `out_logits`       `[k_tokens][num_experts]` f32, at `out_logits_offset`
+///   `factors`          NEW scratch, `spec50_router_factor_bytes(k_tokens)` bytes
+///   `r_stage`          NEW scratch, `spec50_router_r_stage_bytes(k_tokens, hidden)`
+///                      bytes (90 KB at K=8, hidden 2816)
 ///
-/// Returns `None` (encode nothing) unless `num_experts % 4 == 0` — the caller should
-/// fall back to the shipping encode then. `hidden` is unconstrained.
+/// Both scratch buffers are written every call and carry nothing between calls, so one
+/// pair sized for the largest K can be shared by every layer.
+///
+/// Returns `None` (encode nothing) unless `num_experts % 4 == 0` and `hidden % 4 == 0`
+/// — the caller should fall back to the shipping encode then.
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_spec50_router_gemv(
@@ -259,78 +1467,45 @@ pub(crate) fn encode_spec50_router_gemv(
     gate_inp_weights: &Buffer,
     out_logits: &Buffer,
     factors: &Buffer,
+    r_stage: &Buffer,
     hidden: usize,
     eps: f32,
     num_experts: usize,
     k_tokens: usize,
     out_logits_offset: u64,
 ) -> Option<()> {
-    if k_tokens == 0
-        || num_experts == 0
-        || hidden == 0
-        || num_experts % SPEC50_ROUTER_EXPERTS_PER_TG != 0
-    {
-        return None;
-    }
-    let hidden_u32 = hidden as u32;
-    let num_experts_u32 = num_experts as u32;
-    let k_tokens_u32 = k_tokens as u32;
-
-    encoder.set_compute_pipeline_state(&kernels.rms_factor_pipeline);
-    encoder.set_buffer(0, Some(input), 0);
-    encoder.set_buffer(1, Some(factors), 0);
-    encoder.set_bytes(2, 4, &hidden_u32 as *const u32 as *const _);
-    encoder.set_bytes(3, 4, &eps as *const f32 as *const _);
-    encoder.set_bytes(4, 4, &k_tokens_u32 as *const u32 as *const _);
-    encoder.dispatch_thread_groups(
-        metal::MTLSize {
-            width: k_tokens as u64,
-            height: 1,
-            depth: 1,
-        },
-        metal::MTLSize {
-            width: SPEC50_ROUTER_RMS_TG_THREADS,
-            height: 1,
-            depth: 1,
-        },
-    );
-
-    encoder.set_compute_pipeline_state(&kernels.router_gemv_pipeline);
-    encoder.set_buffer(0, Some(input), 0);
-    encoder.set_buffer(1, Some(gate_inp_scale), 0);
-    encoder.set_buffer(2, Some(gate_inp_weights), 0);
-    encoder.set_buffer(3, Some(out_logits), out_logits_offset);
-    encoder.set_buffer(4, Some(factors), 0);
-    encoder.set_bytes(5, 4, &hidden_u32 as *const u32 as *const _);
-    encoder.set_bytes(6, 4, &num_experts_u32 as *const u32 as *const _);
-    encoder.set_bytes(7, 4, &k_tokens_u32 as *const u32 as *const _);
-    encoder.dispatch_thread_groups(
-        metal::MTLSize {
-            width: (num_experts / SPEC50_ROUTER_EXPERTS_PER_TG) as u64,
-            height: k_tokens.div_ceil(SPEC50_ROUTER_CHUNK_TOKENS) as u64,
-            depth: 1,
-        },
-        metal::MTLSize {
-            width: SPEC50_ROUTER_TG_THREADS,
-            height: 1,
-            depth: 1,
-        },
-    );
-    Some(())
+    encode_spec50_router_gemv_variant(
+        encoder,
+        kernels,
+        SPEC50_ROUTER_DEFAULT_VARIANT,
+        input,
+        Some(r_stage),
+        gate_inp_scale,
+        gate_inp_weights,
+        out_logits,
+        factors,
+        hidden,
+        eps,
+        num_experts,
+        k_tokens,
+        out_logits_offset,
+    )
 }
 
-/// NOT BIT-EXACT — benchmark and diagnostics only, never the runtime.
+/// Variant-selecting sibling of [`encode_spec50_router_gemv`], for tests and
+/// benchmarks. Same buffers, same grid; only the dot-loop pipeline changes.
 ///
-/// Same buffers and same grid as [`encode_spec50_router_gemv`], but dispatches the
-/// `float4` variant of the dot loop. It exists to measure what the bit-exactness
-/// constraint costs; it disagrees with `gemma4_router_batch_k_f32` by up to 38 ULP.
-/// Requires `hidden % 4 == 0` (the vector loads have no scalar tail).
+/// ONLY [`Spec50RouterVariant::Exact`] may reach the runtime. The others are here
+/// to be measured, and the test suite pins what each one costs in ULP.
+/// `Vec4` additionally requires `hidden % 4 == 0`.
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn encode_spec50_router_gemv_vec4_inexact(
+pub(crate) fn encode_spec50_router_gemv_variant(
     encoder: &metal::ComputeCommandEncoderRef,
     kernels: &Spec50RouterKernels,
+    variant: Spec50RouterVariant,
     input: &Buffer,
+    r_stage: Option<&Buffer>,
     gate_inp_scale: &Buffer,
     gate_inp_weights: &Buffer,
     out_logits: &Buffer,
@@ -345,7 +1520,18 @@ pub(crate) fn encode_spec50_router_gemv_vec4_inexact(
         || num_experts == 0
         || hidden == 0
         || num_experts % SPEC50_ROUTER_EXPERTS_PER_TG != 0
-        || hidden % 4 != 0
+        || (variant.needs_r_stage() && r_stage.is_none())
+        || (matches!(
+            variant,
+            Spec50RouterVariant::Vec4
+                | Spec50RouterVariant::StrictVec4
+                | Spec50RouterVariant::StrictVec4x4
+                | Spec50RouterVariant::StrictVec4x8
+                | Spec50RouterVariant::StrictVec4x16
+                | Spec50RouterVariant::StrictRVec4x8
+                | Spec50RouterVariant::StrictRVec4x16
+                | Spec50RouterVariant::StrictRVec4x24
+        ) && hidden % 4 != 0)
     {
         return None;
     }
@@ -353,26 +1539,70 @@ pub(crate) fn encode_spec50_router_gemv_vec4_inexact(
     let num_experts_u32 = num_experts as u32;
     let k_tokens_u32 = k_tokens as u32;
 
-    encoder.set_compute_pipeline_state(&kernels.rms_factor_pipeline);
-    encoder.set_buffer(0, Some(input), 0);
-    encoder.set_buffer(1, Some(factors), 0);
-    encoder.set_bytes(2, 4, &hidden_u32 as *const u32 as *const _);
-    encoder.set_bytes(3, 4, &eps as *const f32 as *const _);
-    encoder.set_bytes(4, 4, &k_tokens_u32 as *const u32 as *const _);
-    encoder.dispatch_thread_groups(
-        metal::MTLSize {
-            width: k_tokens as u64,
-            height: 1,
-            depth: 1,
-        },
-        metal::MTLSize {
-            width: SPEC50_ROUTER_RMS_TG_THREADS,
-            height: 1,
-            depth: 1,
-        },
-    );
+    // Dispatch 1: the batch-wide prepare pass. r-staged variants take the fused
+    // kernel (factors AND r in one dispatch); the others only need the factors.
+    // A compute encoder is serial, so the GEMV observes this without a barrier.
+    if variant.needs_r_stage() {
+        let r_buf = r_stage?;
+        encoder.set_compute_pipeline_state(&kernels.prepare_pipeline);
+        encoder.set_buffer(0, Some(input), 0);
+        encoder.set_buffer(1, Some(gate_inp_scale), 0);
+        encoder.set_buffer(2, Some(r_buf), 0);
+        encoder.set_buffer(3, Some(factors), 0);
+        encoder.set_bytes(4, 4, &hidden_u32 as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &eps as *const f32 as *const _);
+        encoder.set_bytes(6, 4, &k_tokens_u32 as *const u32 as *const _);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize {
+                width: k_tokens as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: SPEC50_ROUTER_RMS_TG_THREADS,
+                height: 1,
+                depth: 1,
+            },
+        );
+    } else {
+        encoder.set_compute_pipeline_state(&kernels.rms_factor_pipeline);
+        encoder.set_buffer(0, Some(input), 0);
+        encoder.set_buffer(1, Some(factors), 0);
+        encoder.set_bytes(2, 4, &hidden_u32 as *const u32 as *const _);
+        encoder.set_bytes(3, 4, &eps as *const f32 as *const _);
+        encoder.set_bytes(4, 4, &k_tokens_u32 as *const u32 as *const _);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize {
+                width: k_tokens as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: SPEC50_ROUTER_RMS_TG_THREADS,
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
 
-    encoder.set_compute_pipeline_state(&kernels.router_gemv_vec4_pipeline);
+    // Dispatch 2: the GEMV itself.
+    let pipeline = match variant {
+        Spec50RouterVariant::Exact => &kernels.router_gemv_pipeline,
+        Spec50RouterVariant::Unroll4 => &kernels.router_gemv_u4_pipeline,
+        Spec50RouterVariant::Unroll8 => &kernels.router_gemv_u8_pipeline,
+        Spec50RouterVariant::Vec4 => &kernels.router_gemv_vec4_pipeline,
+        Spec50RouterVariant::StrictExact => &kernels.router_gemv_strict_pipeline,
+        Spec50RouterVariant::StrictUnroll8 => &kernels.router_gemv_strict_u8_pipeline,
+        Spec50RouterVariant::StrictVec4 => &kernels.router_gemv_strict_vec4_pipeline,
+        Spec50RouterVariant::StrictUnroll16 => &kernels.router_gemv_strict_u16_pipeline,
+        Spec50RouterVariant::StrictVec4x4 => &kernels.router_gemv_strict_v4x4_pipeline,
+        Spec50RouterVariant::StrictVec4x8 => &kernels.router_gemv_strict_v4x8_pipeline,
+        Spec50RouterVariant::StrictVec4x16 => &kernels.router_gemv_strict_v4x16_pipeline,
+        Spec50RouterVariant::StrictRVec4x8 => &kernels.router_gemv_strict_rv4x8_pipeline,
+        Spec50RouterVariant::StrictRVec4x16 => &kernels.router_gemv_strict_rv4x16_pipeline,
+        Spec50RouterVariant::StrictRVec4x24 => &kernels.router_gemv_strict_rv4x24_pipeline,
+    };
+    encoder.set_compute_pipeline_state(pipeline);
     encoder.set_buffer(0, Some(input), 0);
     encoder.set_buffer(1, Some(gate_inp_scale), 0);
     encoder.set_buffer(2, Some(gate_inp_weights), 0);
@@ -381,6 +1611,9 @@ pub(crate) fn encode_spec50_router_gemv_vec4_inexact(
     encoder.set_bytes(5, 4, &hidden_u32 as *const u32 as *const _);
     encoder.set_bytes(6, 4, &num_experts_u32 as *const u32 as *const _);
     encoder.set_bytes(7, 4, &k_tokens_u32 as *const u32 as *const _);
+    if let Some(r_buf) = r_stage {
+        encoder.set_buffer(8, Some(r_buf), 0);
+    }
     encoder.dispatch_thread_groups(
         metal::MTLSize {
             width: (num_experts / SPEC50_ROUTER_EXPERTS_PER_TG) as u64,
@@ -460,6 +1693,7 @@ mod tests {
         scale_buf: Buffer,
         weights_buf: Buffer,
         factors: Buffer,
+        r_stage: Buffer,
         old_out: Buffer,
         new_out: Buffer,
     }
@@ -475,6 +1709,7 @@ mod tests {
         let scale_buf = buf_f32(&device, &scale);
         let weights_buf = buf_f32(&device, &weights);
         let factors = shared(&device, spec50_router_factor_bytes(k_max) as usize);
+        let r_stage = shared(&device, spec50_router_r_stage_bytes(k_max, HIDDEN) as usize);
         let old_out = shared(&device, k_max * EXPERTS * 4);
         let new_out = shared(&device, k_max * EXPERTS * 4);
         RouterFixture {
@@ -487,6 +1722,7 @@ mod tests {
             scale_buf,
             weights_buf,
             factors,
+            r_stage,
             old_out,
             new_out,
         }
@@ -518,10 +1754,28 @@ mod tests {
         (out, l1)
     }
 
+    const VARIANTS: [(Spec50RouterVariant, &str); 14] = [
+        (Spec50RouterVariant::Exact, "exact"),
+        (Spec50RouterVariant::Unroll4, "unroll4"),
+        (Spec50RouterVariant::Unroll8, "unroll8"),
+        (Spec50RouterVariant::Vec4, "vec4"),
+        (Spec50RouterVariant::StrictExact, "strict-exact"),
+        (Spec50RouterVariant::StrictUnroll8, "strict-unroll8"),
+        (Spec50RouterVariant::StrictVec4, "strict-vec4"),
+        (Spec50RouterVariant::StrictUnroll16, "strict-unroll16"),
+        (Spec50RouterVariant::StrictVec4x4, "strict-vec4x4"),
+        (Spec50RouterVariant::StrictVec4x8, "strict-vec4x8"),
+        (Spec50RouterVariant::StrictVec4x16, "strict-vec4x16"),
+        (Spec50RouterVariant::StrictRVec4x8, "strict-r-vec4x8"),
+        (Spec50RouterVariant::StrictRVec4x16, "strict-r-vec4x16"),
+        (Spec50RouterVariant::StrictRVec4x24, "strict-r-vec4x24"),
+    ];
+
     #[allow(clippy::too_many_arguments)]
-    fn encode_vec4(
+    fn encode_variant(
         e: &metal::ComputeCommandEncoderRef,
         kernels: &Spec50RouterKernels,
+        variant: Spec50RouterVariant,
         input: &Buffer,
         fx: &RouterFixture,
         weights: &Buffer,
@@ -529,10 +1783,12 @@ mod tests {
         k: usize,
         offset: u64,
     ) {
-        encode_spec50_router_gemv_vec4_inexact(
+        encode_spec50_router_gemv_variant(
             e,
             kernels,
+            variant,
             input,
+            Some(&fx.r_stage),
             &fx.scale_buf,
             weights,
             out,
@@ -543,7 +1799,7 @@ mod tests {
             k,
             offset,
         )
-        .expect("spec50 router vec4 encode rejected a supported shape");
+        .expect("spec50 router encode rejected a supported shape");
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -565,6 +1821,7 @@ mod tests {
             weights,
             out,
             &fx.factors,
+            &fx.r_stage,
             HIDDEN,
             EPS,
             EXPERTS,
@@ -681,67 +1938,76 @@ mod tests {
         );
     }
 
-    /// Documents WHY the shipping kernel keeps a scalar dot loop: the same layout
-    /// with `float4` loads is not bit-exact. If this test ever reports 0 mismatches
-    /// the toolchain changed, and the vec4 variant becomes eligible for promotion.
+    /// Documents WHY the shipping kernel keeps the scalar dot loop verbatim: every
+    /// variant that touches the loop's text — even ones that only hoist loads and
+    /// leave the accumulator order alone — is a chance for fast math to reassociate
+    /// the reduction. This prints the ULP cost of each so the trade is on the record.
     #[test]
-    fn spec50_router_gemv_vec4_is_not_bit_exact() {
+    fn spec50_router_gemv_variant_exactness_sweep() {
         if !detect_metal_device().available {
             return;
         }
         let kernels = spec50_router_kernels().expect("spec50 kernels");
         let old = metal_linear_kernel().expect("metal linear kernel");
         let fx = router_fixture(0x5eed_0001, 8);
-        let mut mismatches = 0usize;
-        let mut max_ulp: u32 = 0;
-        let mut max_abs = 0f32;
-        let mut total = 0usize;
-        for k in 1..=8usize {
-            run(&fx.queue, |e| {
-                encode_gemma4_router_batch_k(
-                    e,
-                    old,
-                    &fx.input_buf,
-                    &fx.scale_buf,
-                    &fx.weights_buf,
-                    &fx.old_out,
-                    HIDDEN,
-                    EPS,
-                    EXPERTS,
-                    k,
-                    0,
-                )
-                .unwrap();
-                encode_vec4(
-                    e,
-                    kernels,
-                    &fx.input_buf,
-                    &fx,
-                    &fx.weights_buf,
-                    &fx.new_out,
-                    k,
-                    0,
-                );
-            });
-            let a = read_f32(&fx.old_out, k * EXPERTS);
-            let b = read_f32(&fx.new_out, k * EXPERTS);
-            for i in 0..k * EXPERTS {
-                total += 1;
-                if a[i].to_bits() != b[i].to_bits() {
-                    mismatches += 1;
-                    max_ulp = max_ulp.max(a[i].to_bits().abs_diff(b[i].to_bits()));
-                    max_abs = max_abs.max((a[i] - b[i]).abs());
+        eprintln!("| variant | mismatching logits (K=1..8) | max ULP delta | max abs diff |");
+        eprintln!("|---------|-----------------------------|---------------|--------------|");
+        let mut exact_mismatches = usize::MAX;
+        for (variant, name) in VARIANTS {
+            let mut mismatches = 0usize;
+            let mut max_ulp: u32 = 0;
+            let mut max_abs = 0f32;
+            let mut total = 0usize;
+            for k in 1..=8usize {
+                run(&fx.queue, |e| {
+                    encode_gemma4_router_batch_k(
+                        e,
+                        old,
+                        &fx.input_buf,
+                        &fx.scale_buf,
+                        &fx.weights_buf,
+                        &fx.old_out,
+                        HIDDEN,
+                        EPS,
+                        EXPERTS,
+                        k,
+                        0,
+                    )
+                    .unwrap();
+                    encode_variant(
+                        e,
+                        kernels,
+                        variant,
+                        &fx.input_buf,
+                        &fx,
+                        &fx.weights_buf,
+                        &fx.new_out,
+                        k,
+                        0,
+                    );
+                });
+                let a = read_f32(&fx.old_out, k * EXPERTS);
+                let b = read_f32(&fx.new_out, k * EXPERTS);
+                for i in 0..k * EXPERTS {
+                    total += 1;
+                    if a[i].to_bits() != b[i].to_bits() {
+                        mismatches += 1;
+                        max_ulp = max_ulp.max(a[i].to_bits().abs_diff(b[i].to_bits()));
+                        max_abs = max_abs.max((a[i] - b[i]).abs());
+                    }
                 }
             }
+            eprintln!(
+                "| {name} | {mismatches}/{total} | {max_ulp} | {max_abs:.3e} |"
+            );
+            if variant == SPEC50_ROUTER_DEFAULT_VARIANT {
+                exact_mismatches = mismatches;
+            }
         }
-        eprintln!(
-            "[spec50 router] vec4 variant vs gemma4_router_batch_k_f32: {mismatches}/{total} \
-             logits differ, max ULP delta {max_ulp}, max abs diff {max_abs:.3e} \
-             -- this is why the shipping kernel stays scalar"
-        );
-        assert!(
-            mismatches > 0,
-            "vec4 variant is now bit-exact; re-evaluate promoting it"
+        assert_eq!(
+            exact_mismatches, 0,
+            "the default variant ({SPEC50_ROUTER_DEFAULT_VARIANT:?}) must be \
+             bit-identical to gemma4_router_batch_k_f32"
         );
     }
 
@@ -820,14 +2086,11 @@ mod tests {
              {:.1} MB of router matrix per measurement",
             matrix_bytes / 1e6
         );
-        eprintln!(
-            "| K | old ms | new ms | old GB/s | new GB/s | speedup | vec4 ms (INEXACT) |"
-        );
-        eprintln!("|---|--------|--------|----------|----------|---------|-------------------|");
+        eprintln!("| K | old ms | variant | new ms | old GB/s | new GB/s | speedup | bit-exact |");
+        eprintln!("|---|--------|---------|--------|----------|----------|---------|-----------|");
         for &k in &[1usize, 4, 8] {
             let mut best_old = f64::MAX;
-            let mut best_new = f64::MAX;
-            let mut best_vec4 = f64::MAX;
+            let mut best = [f64::MAX; VARIANTS.len()];
             for _round in 0..5 {
                 let t_old = run(&fx.queue, |e| {
                     for w in &layer_weights {
@@ -847,29 +2110,43 @@ mod tests {
                         .unwrap();
                     }
                 });
-                let t_new = run(&fx.queue, |e| {
-                    for w in &layer_weights {
-                        encode_new(e, kernels, &fx.input_buf, &fx, w, &fx.new_out, k, 0);
-                    }
-                });
-                let t_vec4 = run(&fx.queue, |e| {
-                    for w in &layer_weights {
-                        encode_vec4(e, kernels, &fx.input_buf, &fx, w, &fx.new_out, k, 0);
-                    }
-                });
                 best_old = best_old.min(t_old);
-                best_new = best_new.min(t_new);
-                best_vec4 = best_vec4.min(t_vec4);
+                for (idx, (variant, _)) in VARIANTS.iter().enumerate() {
+                    let t = run(&fx.queue, |e| {
+                        for w in &layer_weights {
+                            encode_variant(
+                                e,
+                                kernels,
+                                *variant,
+                                &fx.input_buf,
+                                &fx,
+                                w,
+                                &fx.new_out,
+                                k,
+                                0,
+                            );
+                        }
+                    });
+                    best[idx] = best[idx].min(t);
+                }
             }
-            // GB/s counts the router matrix only: that is the byte floor the lane
-            // is being measured against (1.44 MB/layer, read once).
+            // GB/s counts the router matrix only: 1.44 MB/layer, the byte floor this
+            // lane is measured against.
             let gbs = |ms: f64| matrix_bytes / (ms * 1e-3) / 1e9;
-            eprintln!(
-                "| {k} | {best_old:.3} | {best_new:.3} | {:.1} | {:.1} | {:.2}x | {best_vec4:.3} |",
-                gbs(best_old),
-                gbs(best_new),
-                best_old / best_new
-            );
+            for (idx, (variant, name)) in VARIANTS.iter().enumerate() {
+                let exact = if *variant == SPEC50_ROUTER_DEFAULT_VARIANT {
+                    "default"
+                } else {
+                    "see sweep"
+                };
+                eprintln!(
+                    "| {k} | {best_old:.3} | {name} | {:.3} | {:.1} | {:.1} | {:.2}x | {exact} |",
+                    best[idx],
+                    gbs(best_old),
+                    gbs(best[idx]),
+                    best_old / best[idx]
+                );
+            }
         }
     }
 }
