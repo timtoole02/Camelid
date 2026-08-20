@@ -1600,6 +1600,17 @@ struct GhostMetalSlotLoad {
     last_used: u64,
 }
 
+/// One resident entry invalidated by a plan. At plan time the evicted
+/// expert's record bytes are still intact in `slot` of the layer slab (fills
+/// only overwrite a slot after the plan returns), so the caller may salvage
+/// them to host memory before the slot is refilled.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GhostMetalSlotEviction {
+    slot: usize,
+    expert: usize,
+}
+
 #[cfg(any(target_os = "macos", test))]
 #[derive(Debug, PartialEq, Eq)]
 struct GhostMetalSlotPlan {
@@ -1611,8 +1622,10 @@ struct GhostMetalSlotPlan {
     /// Route entries served without another slot fill. Repeated experts within
     /// the same plan count as hits because they do not cause additional I/O.
     hits: usize,
-    /// Resident entries invalidated to make room for this plan's loads.
-    evictions: usize,
+    /// Resident entries invalidated to make room for this plan's loads, with
+    /// identity: each eviction's `slot` equals the slot of exactly one load in
+    /// `loads` (the load that displaced it).
+    evicted: Vec<GhostMetalSlotEviction>,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1672,7 +1685,7 @@ impl GhostMetalSlotDirectory {
         let mut route_slots = Vec::with_capacity(experts.len());
         let mut loads = Vec::<GhostMetalSlotLoad>::new();
         let mut planned = std::collections::HashMap::<usize, usize>::new();
-        let mut evictions = 0usize;
+        let mut evicted = Vec::<GhostMetalSlotEviction>::new();
 
         for &expert in experts {
             self.clock = self.clock.saturating_add(1);
@@ -1748,7 +1761,10 @@ impl GhostMetalSlotDirectory {
             };
 
             if let Some(old) = self.entries[slot].take() {
-                evictions += 1;
+                evicted.push(GhostMetalSlotEviction {
+                    slot,
+                    expert: old.expert,
+                });
                 if old.expert < 128 {
                     self.resident_slot_table[old.expert] = -1;
                 }
@@ -1770,7 +1786,7 @@ impl GhostMetalSlotDirectory {
             route_slots,
             loads,
             hits,
-            evictions,
+            evicted,
         })
     }
 
@@ -1891,6 +1907,11 @@ struct GhostMetalExpertLayer {
     slots: crate::metal::Gemma4Q4ExpertSlots,
     stats: GhostMetalSlotStats,
     shared: Option<GhostMetalSharedBuffers>,
+    /// Chained-round sequence number at which each expert was last EVICTED
+    /// from this layer's directory (0 = never). Prices the re-miss question:
+    /// on a miss whose expert has a nonzero entry, `current_round - entry` is
+    /// the eviction-to-re-route distance in rounds. Measurement only.
+    evicted_round: [u32; 128],
 }
 
 #[cfg(target_os = "macos")]
@@ -1914,6 +1935,11 @@ struct GhostMetalExpertRuntime {
     last_chained_sig: Option<(usize, usize, u64)>,
     /// Set while retrying a refused predicted round without prediction.
     suppress_prediction: bool,
+    /// Monotone chained-round sequence, incremented at the top of every
+    /// `execute_chained_round_all_layers` call (including refused-prediction
+    /// retries, so distances measured in it are upper bounds by at most the
+    /// retry count). Timebase for the eviction-to-re-miss histogram.
+    chained_round_seq: u32,
     /// Prefill chunks advance through fresh prompt segments; speculative
     /// slot fills from the previous round's unions are ~69% wrong there and
     /// evict live experts (measured 12.8 GB of fill reads across a 31-token
@@ -2025,6 +2051,7 @@ fn fill_metal_wave_slots_from_host_cache(
     layer_idx: usize,
     selected_experts: &[usize],
     counters: &WaveFillCounters,
+    round_seq: u32,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
     let nvme_us = &counters.nvme_us;
@@ -2044,7 +2071,40 @@ fn fill_metal_wave_slots_from_host_cache(
         .fetch_add(plan.loads.len() as u64, Relaxed);
     counters
         .plan_evictions
-        .fetch_add(plan.evictions as u64, Relaxed);
+        .fetch_add(plan.evicted.len() as u64, Relaxed);
+    // Eviction-cause measurement, before this plan's own evictions are
+    // recorded: a miss whose expert has a recorded eviction round is a
+    // RE-miss (the directory churned it out and the route came back); one
+    // without is a first touch in this layer since counters started. The
+    // distance histogram decides between a policy fix (short distances:
+    // eviction choice is bad) and a victim cache (any distance: bound the
+    // refill cost). Same-plan evict-then-re-miss shows up as distance 0.
+    for load in &plan.loads {
+        if load.expert < 128 {
+            let evicted_at = layer.evicted_round[load.expert];
+            if evicted_at == 0 {
+                crate::metal::SPEC_MISS_COLD.fetch_add(1, Relaxed);
+            } else {
+                let distance = round_seq.saturating_sub(evicted_at) as usize;
+                let bucket = match distance {
+                    0 => 0,
+                    1 => 1,
+                    2 => 2,
+                    3 => 3,
+                    4 => 4,
+                    5..=8 => 5,
+                    9..=16 => 6,
+                    _ => 7,
+                };
+                crate::metal::SPEC_REMISS_DIST_HIST[bucket].fetch_add(1, Relaxed);
+            }
+        }
+    }
+    for eviction in &plan.evicted {
+        if eviction.expert < 128 {
+            layer.evicted_round[eviction.expert] = round_seq;
+        }
+    }
     if plan.loads.is_empty() {
         return;
     }
@@ -2470,6 +2530,7 @@ impl GhostMetalExpertRuntime {
                 slots: slots_obj,
                 stats: GhostMetalSlotStats::default(),
                 shared: None,
+                evicted_round: [0; 128],
             });
         }
         // The overflow bank only holds experts beyond the resident slots. When
@@ -2519,6 +2580,7 @@ impl GhostMetalExpertRuntime {
             last_chained_sig: None,
             suppress_prediction: false,
             prefill_round: false,
+            chained_round_seq: 0,
         })
     }
 
@@ -2711,6 +2773,12 @@ impl GhostMetalExpertRuntime {
         // Last-round prefetch is background prediction, never the outer critical path.
         let prefetch_ms = 0.0;
 
+        // Timebase for the eviction-to-re-miss histogram. Incremented on the
+        // refused-prediction retry too, so distances are upper bounds by at
+        // most the (rare, logged) retry count.
+        self.chained_round_seq = self.chained_round_seq.saturating_add(1);
+        let round_seq = self.chained_round_seq;
+
         let t_setup = std::time::Instant::now();
         let mut slot_mappings = [[0xFFFFFFFFu32; 128]; 30];
         let mut num_slots_per_layer = [0usize; 30];
@@ -2832,6 +2900,7 @@ impl GhostMetalExpertRuntime {
                             layer_idx,
                             &w0,
                             &fill_counters,
+                            round_seq,
                         );
                         if !rest.is_empty() {
                             let (buf, nslots) = if let Some(buf) = wave1_bufs.get(layer_idx) {
@@ -2924,6 +2993,7 @@ impl GhostMetalExpertRuntime {
                     layer_idx,
                     &selected_experts,
                     &fill_counters,
+                    round_seq,
                 );
 
                 for e in 0..128 {
@@ -3334,6 +3404,7 @@ impl GhostMetalExpertRuntime {
         if experts.len() != 8 || route_scales.len() != 8 {
             return None;
         }
+        let round_seq = self.chained_round_seq;
         let layer = self.layers.get_mut(ghost.layer_idx)?;
         let plan = match layer.directory.plan(experts) {
             Ok(plan) => plan,
@@ -3346,7 +3417,7 @@ impl GhostMetalExpertRuntime {
             route_slots,
             loads,
             hits,
-            evictions,
+            evicted,
         } = plan;
         layer.stats.route_lookups = layer
             .stats
@@ -3354,7 +3425,17 @@ impl GhostMetalExpertRuntime {
             .saturating_add(experts.len() as u64);
         layer.stats.hits = layer.stats.hits.saturating_add(hits as u64);
         layer.stats.misses = layer.stats.misses.saturating_add(loads.len() as u64);
-        layer.stats.evictions = layer.stats.evictions.saturating_add(evictions as u64);
+        layer.stats.evictions = layer
+            .stats
+            .evictions
+            .saturating_add(evicted.len() as u64);
+        // HEAD-lane evictions share the chained-round timebase so a later
+        // chained-round miss of the same expert is not misread as cold.
+        for eviction in &evicted {
+            if eviction.expert < 128 && round_seq > 0 {
+                layer.evicted_round[eviction.expert] = round_seq;
+            }
+        }
 
         if !loads.is_empty() {
             let fill_started = std::time::Instant::now();
@@ -3784,6 +3865,7 @@ impl GhostMetalExpertRuntime {
             history.clear();
             history.extend_from_slice(unique_experts);
         }
+        let round_seq = self.chained_round_seq;
         let layer = self.layers.get_mut(ghost.layer_idx)?;
         let plan = match layer.directory.plan(unique_experts) {
             Ok(plan) => plan,
@@ -3793,7 +3875,7 @@ impl GhostMetalExpertRuntime {
             route_slots,
             loads,
             hits,
-            evictions,
+            evicted,
         } = plan;
         layer.stats.route_lookups = layer
             .stats
@@ -3801,7 +3883,15 @@ impl GhostMetalExpertRuntime {
             .saturating_add(unique_experts.len() as u64);
         layer.stats.hits = layer.stats.hits.saturating_add(hits as u64);
         layer.stats.misses = layer.stats.misses.saturating_add(loads.len() as u64);
-        layer.stats.evictions = layer.stats.evictions.saturating_add(evictions as u64);
+        layer.stats.evictions = layer
+            .stats
+            .evictions
+            .saturating_add(evicted.len() as u64);
+        for eviction in &evicted {
+            if eviction.expert < 128 && round_seq > 0 {
+                layer.evicted_round[eviction.expert] = round_seq;
+            }
+        }
 
         if !loads.is_empty() {
             let _stride = layer.slots.slot_stride_bytes();
@@ -16638,7 +16728,7 @@ mod ghost_moe_wire_tests {
         let plan = directory.plan(&[9, 2, 9, 4]).unwrap();
         assert_eq!(plan.route_slots, vec![0, 1, 0, 2]);
         assert_eq!(plan.hits, 1);
-        assert_eq!(plan.evictions, 0);
+        assert!(plan.evicted.is_empty());
         assert_eq!(
             plan.loads
                 .iter()
@@ -16653,8 +16743,30 @@ mod ghost_moe_wire_tests {
         let hits = directory.plan(&[4, 9]).unwrap();
         assert_eq!(hits.route_slots, vec![2, 0]);
         assert_eq!(hits.hits, 2);
-        assert_eq!(hits.evictions, 0);
+        assert!(hits.evicted.is_empty());
         assert!(hits.loads.is_empty());
+    }
+
+    /// An eviction's identity must name the displaced expert and the exact
+    /// slot the displacing load will overwrite: the victim-salvage copy reads
+    /// the old record from that slot before the fill clobbers it.
+    #[test]
+    fn metal_slot_plan_reports_eviction_identity() {
+        let mut directory = GhostMetalSlotDirectory::new(2);
+        for load in directory.plan(&[1, 2]).unwrap().loads {
+            directory.commit_load(load);
+        }
+        // Expert 1 becomes hotter, so expert 2 is the deterministic victim.
+        assert!(directory.plan(&[1]).unwrap().loads.is_empty());
+        let plan = directory.plan(&[3]).unwrap();
+        assert_eq!(plan.loads.len(), 1);
+        assert_eq!(
+            plan.evicted,
+            vec![GhostMetalSlotEviction {
+                slot: plan.loads[0].slot,
+                expert: 2,
+            }]
+        );
     }
 
     /// The overlap path copies a plan's host-cache loads to their slots in

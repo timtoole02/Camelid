@@ -272,6 +272,12 @@ fn gemma4_spec50_bench() {
             let acc0 = camelid::metal::SPEC_ACCEPTED_TOKENS.load(std::sync::atomic::Ordering::Relaxed);
             // Exposed-idle decomposition baselines.
             let idle0: Vec<u64> = IDLE_STATS.iter().map(|(_, a)| a.load(Relaxed)).collect();
+            // Eviction-cause baselines: cold misses + re-miss distance histogram.
+            let cold0 = camelid::metal::SPEC_MISS_COLD.load(Relaxed);
+            let remiss0: Vec<u64> = camelid::metal::SPEC_REMISS_DIST_HIST
+                .iter()
+                .map(|a| a.load(Relaxed))
+                .collect();
             let t1 = Instant::now();
             let spec_tokens = runtime
                 .spec_decode_generate(&mut kc, &mut vc, logits, &prompt_tokens, &eot, max_new)
@@ -374,6 +380,28 @@ fn gemma4_spec50_bench() {
                         100.0 * d[18] as f64 / (d[17].max(1)) as f64,
                         d[19],
                         d[20],
+                    );
+                    // Eviction cause: are misses first touches (cold) or
+                    // re-misses of recently evicted experts (churn)? Low
+                    // distance buckets dominating = the policy evicts experts
+                    // the router immediately re-routes.
+                    let rd: Vec<u64> = camelid::metal::SPEC_REMISS_DIST_HIST
+                        .iter()
+                        .zip(&remiss0)
+                        .map(|(a, b)| a.load(Relaxed) - b)
+                        .collect();
+                    println!(
+                        "[k-remiss K={k}] cold={} | re-miss distance (rounds): \
+                         d0={} d1={} d2={} d3={} d4={} d5_8={} d9_16={} d17+={}",
+                        camelid::metal::SPEC_MISS_COLD.load(Relaxed) - cold0,
+                        rd[0],
+                        rd[1],
+                        rd[2],
+                        rd[3],
+                        rd[4],
+                        rd[5],
+                        rd[6],
+                        rd[7],
                     );
                 }
                 println!(

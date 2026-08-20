@@ -21718,6 +21718,17 @@ pub static SPEC_SLOT_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 pub static SPEC_SLOT_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static SPEC_SLOT_EVICTIONS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Eviction-cause split of the chained lane's slot misses. `SPEC_MISS_COLD`
+/// counts misses of experts never evicted from that layer's directory since
+/// process start (true first touches). `SPEC_REMISS_DIST_HIST[b]` counts
+/// misses of previously EVICTED experts by eviction-to-re-miss distance in
+/// chained rounds: buckets are 0 (same round), 1, 2, 3, 4, 5-8, 9-16, >16.
+/// Mass in the low buckets means the eviction policy discards experts the
+/// router immediately wants back (a policy fix or victim cache pays); mass in
+/// cold means the working set genuinely moved (only more slots would pay).
+pub static SPEC_MISS_COLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_REMISS_DIST_HIST: [std::sync::atomic::AtomicU64; 8] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 /// Of this round's per-layer expert unions, how many members were (a) in the
 /// PREVIOUS successful chained round's union for the same layer and (b)
 /// resident in a slot when this round started. Totals share
