@@ -1580,7 +1580,8 @@ struct GhostMetalSlotEntry {
 /// been resolved. Consequently a route with at most `entries.len()` distinct
 /// experts cannot evict one of its own earlier selections while filling later
 /// misses. Eviction chooses the least frequently used unpinned slot and uses
-/// oldest access as its stable tie-break.
+/// oldest access as its stable tie-break (CAMELID_GEMMA4_SLOT_POLICY=lru
+/// switches the victim choice to pure recency; see `recency_first`).
 #[cfg(any(target_os = "macos", test))]
 #[derive(Debug)]
 struct GhostMetalSlotDirectory {
@@ -1589,6 +1590,16 @@ struct GhostMetalSlotDirectory {
     pinned_hot_slots: usize,
     clock: u64,
     accesses: u64,
+    /// CAMELID_GEMMA4_SLOT_POLICY=lru: pick the eviction victim by recency
+    /// alone (oldest `last_used` first, slot index as the deterministic
+    /// tie-break), ignoring frequency. Default false = today's LFU with
+    /// recency tie-break. A/B lever for the measured churn: with 54%
+    /// round-to-round union overlap, LFU can retain stale-but-once-hot
+    /// experts while evicting fresh ones the router immediately re-routes;
+    /// pure recency protects the last rounds' unions. Placement-only: which
+    /// experts are selected and their routing values never depend on WHICH
+    /// slot holds a record.
+    recency_first: bool,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1648,12 +1659,15 @@ impl GhostMetalSlotDirectory {
         } else {
             slot_count / 2
         };
+        let recency_first = std::env::var("CAMELID_GEMMA4_SLOT_POLICY")
+            .is_ok_and(|value| value.eq_ignore_ascii_case("lru"));
         Self {
             entries: vec![None; slot_count],
             resident_slot_table: [-1; 128],
             pinned_hot_slots,
             clock: 0,
             accesses: 0,
+            recency_first,
         }
     }
 
@@ -1748,13 +1762,19 @@ impl GhostMetalSlotDirectory {
                 } else {
                     0..self.entries.len()
                 };
+                let recency_first = self.recency_first;
                 self.entries[range.clone()]
                     .iter()
                     .enumerate()
                     .filter(|(s, _)| !pinned[range.start + *s])
                     .min_by_key(|(s, entry)| match entry {
                         None => (0u8, 0u16, 0u64, range.start + *s),
-                        Some(entry) => (1, entry.frequency, entry.last_used, range.start + *s),
+                        Some(entry) => (
+                            1,
+                            if recency_first { 1 } else { entry.frequency },
+                            entry.last_used,
+                            range.start + *s,
+                        ),
                     })
                     .map(|(s, _)| range.start + s)
                     .expect("distinct expert count was checked against slot count")
@@ -17119,6 +17139,38 @@ mod ghost_moe_wire_tests {
         }
         assert_eq!(forward.entries, reverse.entries);
         assert_eq!(forward.resident_slot_table, reverse.resident_slot_table);
+    }
+
+    /// CAMELID_GEMMA4_SLOT_POLICY=lru must pick the least recently USED
+    /// victim regardless of frequency, while the default keeps today's LFU
+    /// with recency tie-break, byte for byte.
+    #[test]
+    fn slot_policy_lru_evicts_least_recent_regardless_of_frequency() {
+        let mut lfu = GhostMetalSlotDirectory::new(2);
+        let mut lru = GhostMetalSlotDirectory::new(2);
+        lru.recency_first = true;
+        for directory in [&mut lfu, &mut lru] {
+            // Expert 1: frequency 3, accessed first. Expert 2: frequency 1,
+            // accessed last (most recent).
+            for load in directory.plan(&[1, 1, 1]).unwrap().loads {
+                directory.commit_load(load);
+            }
+            for load in directory.plan(&[2]).unwrap().loads {
+                directory.commit_load(load);
+            }
+        }
+        let lfu_plan = lfu.plan(&[3]).unwrap();
+        assert_eq!(
+            lfu_plan.evicted,
+            vec![GhostMetalSlotEviction { slot: 1, expert: 2 }],
+            "default LFU evicts the low-frequency expert"
+        );
+        let lru_plan = lru.plan(&[3]).unwrap();
+        assert_eq!(
+            lru_plan.evicted,
+            vec![GhostMetalSlotEviction { slot: 0, expert: 1 }],
+            "lru policy evicts the least recently used expert despite its frequency"
+        );
     }
 
     /// Ring semantics the fill path relies on: lookup returns exactly the
