@@ -657,6 +657,28 @@ fn chained_stage_profile_enabled() -> bool {
     })
 }
 
+/// CAMELID_GEMMA4_OVERLAP=0 restores the serial per-layer schedule of the
+/// unpredicted chained round (MoE+tail encoded only after the router readback
+/// and slot fill, host-cache slot copies serial). Default ON. The overlap
+/// changes WHEN host work runs and WHEN command buffers are committed, never
+/// what they contain: every pre-encoded command buffer is byte-identical to
+/// the one the serial path would have encoded, and any round shape the
+/// overlap cannot prove safe (expert-union overflow, stage profiling, layer
+/// dumps) falls back to the serial path for that layer.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn overlap_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        overlap_flag_from(std::env::var("CAMELID_GEMMA4_OVERLAP").ok().as_deref())
+    })
+}
+
+/// Pure parse for [`overlap_enabled`]: on unless explicitly "0"/"false".
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn overlap_flag_from(value: Option<&str>) -> bool {
+    !matches!(value, Some(v) if v == "0" || v.eq_ignore_ascii_case("false"))
+}
+
 #[cfg(target_os = "macos")]
 impl GpuStageStamp {
     fn new() -> Self {
@@ -23395,6 +23417,85 @@ impl Gemma4GhostCommonMetal {
         true
     }
 
+    /// Encode the layer tail (post-attention residual + MoE add + post-norms
+    /// + optional layer-output scale) into `encoder`, ending with a slab_a
+    /// barrier. Shared by the serial per-layer path and the pre-encoded
+    /// overlap path (CAMELID_GEMMA4_OVERLAP) so both encode byte-identical
+    /// command streams. GPU-side it reads slab_b, dn_batch and gpu_moe_acc
+    /// and writes slab_a; at ENCODE time nothing here depends on the routed
+    /// expert union, which is what makes pre-encoding it before the router
+    /// readback sound.
+    fn encode_layer_tail(
+        &self,
+        kernel: &MetalLinearKernel,
+        encoder: &metal::ComputeCommandEncoderRef,
+        layer_idx: usize,
+        k_tokens: usize,
+    ) -> bool {
+        let Some(moe_layer) = self.moe_layers.as_ref().and_then(|m| m.get(layer_idx)) else {
+            return false;
+        };
+        let layer = &self.layers[layer_idx];
+        let hidden = self.hidden_size;
+        if let Some(fused_pipeline) = kernel.gemma4_fused_layer_residual_pipeline.as_ref() {
+            encoder.set_compute_pipeline_state(fused_pipeline);
+            encoder.set_buffer(0, Some(&self.slab_b), 0);
+            encoder.set_buffer(1, Some(&self.resident_scratch.dn_batch), 0);
+            encoder.set_buffer(2, Some(&self.resident_scratch.gpu_moe_acc), 0);
+            encoder.set_buffer(3, Some(&moe_layer.post_norm_2), 0);
+            encoder.set_buffer(4, Some(&moe_layer.post_ffw_norm), 0);
+            encoder.set_buffer(5, Some(&self.slab_a), 0);
+            let hidden_u32 = GEMMA4_Q4_EXPERT_HIDDEN as u32;
+            let eps = 1.0e-6f32;
+            let scale_f32 = moe_layer.layer_output_scale;
+            encoder.set_bytes(6, 4, &hidden_u32 as *const u32 as *const _);
+            encoder.set_bytes(7, 4, &eps as *const f32 as *const _);
+            encoder.set_bytes(8, 4, &scale_f32 as *const f32 as *const _);
+            encoder.dispatch_thread_groups(
+                metal::MTLSize {
+                    width: k_tokens as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        } else {
+            unsafe {
+                *(layer.resid_n_batch.contents() as *mut u32) = (k_tokens * hidden) as u32;
+            }
+            encoder.set_compute_pipeline_state(&kernel.residual_add_pipeline);
+            encoder.set_buffer(0, Some(&self.slab_b), 0);
+            encoder.set_buffer(1, Some(&self.resident_scratch.dn_batch), 0);
+            encoder.set_buffer(2, Some(&self.slab_a), 0);
+            encoder.set_buffer(3, Some(&layer.resid_n_batch), 0);
+            dispatch_1d(encoder, &kernel.residual_add_pipeline, k_tokens * hidden);
+
+            encoder.set_compute_pipeline_state(&kernel.residual_add_pipeline);
+            encoder.set_buffer(0, Some(&self.slab_a), 0);
+            encoder.set_buffer(1, Some(&self.resident_scratch.gpu_moe_acc), 0);
+            encoder.set_buffer(2, Some(&self.slab_a), 0);
+            encoder.set_buffer(3, Some(&layer.resid_n_batch), 0);
+            dispatch_1d(encoder, &kernel.residual_add_pipeline, k_tokens * hidden);
+
+            if (moe_layer.layer_output_scale - 1.0).abs() > 1.0e-5 {
+                encode_scale_f32(
+                    encoder,
+                    kernel,
+                    &self.slab_a,
+                    &self.slab_a,
+                    &moe_layer.layer_scale_scalar,
+                    k_tokens * hidden,
+                );
+            }
+        }
+        encoder.memory_barrier_with_resources(&[&self.slab_a]);
+        true
+    }
+
     fn encode_moe_wave(
         &self,
         kernel: &MetalLinearKernel,
@@ -23689,6 +23790,13 @@ impl Gemma4GhostCommonMetal {
         // default: the boundary is a no-op and Metal memory barriers order the
         // stages inside one command buffer.
         let stage_profile = chained_stage_profile_enabled();
+        // Overlap scheduling for the unpredicted path: a commit-order /
+        // encode-timing reorder only (see `overlap_enabled`). Excluded under
+        // stage profiling (which owns command-buffer boundaries) and layer
+        // dumps (which wait mid-layer on the ambient command buffer).
+        let overlap_round = overlap_enabled()
+            && !stage_profile
+            && !std::env::var("CAMELID_GEMMA4_DUMP_LAYERS").is_ok_and(|v| v == "1");
         macro_rules! begin_gpu_stage {
             ($stage:expr) => {{
                 if stage_profile {
@@ -23714,6 +23822,10 @@ impl Gemma4GhostCommonMetal {
         for layer_idx in 0..self.layers.len() {
             let layer = &self.layers[layer_idx];
             let norms = &self.norms[layer_idx];
+            // Set when the overlap path already committed this layer's
+            // MoE+tail command buffer; the serial tail encode and the
+            // end-of-layer commit below are then skipped.
+            let mut layer_committed = false;
             let q_dim = layer.n_heads * layer.head_dim;
             let kv_dim = layer.n_kv_heads * layer.head_dim;
             if cb_closed {
@@ -24414,6 +24526,59 @@ impl Gemma4GhostCommonMetal {
                     ledger.encode_ms += encode_clock.elapsed().as_secs_f64() * 1000.0;
                 }
 
+                // CAMELID_GEMMA4_OVERLAP: pre-encode the single-wave MoE+tail
+                // command buffer NOW, while the GPU still owns this layer's
+                // attention/router and shared-MLP work and the host would
+                // otherwise block in wait_until_completed below. Soundness:
+                // every dispatch dimension depends only on (num_slots,
+                // k_tokens); the GPU reads the router logits, the
+                // expert->slot table and the slot slabs at EXECUTION time,
+                // and this buffer is committed only after the filler has
+                // loaded the routed experts and published the table, so the
+                // encoded command stream is byte-identical to the serial
+                // path's and consumes identical data. If the routed union
+                // overflows num_slots the buffer is dropped un-committed and
+                // the serial two-wave path below runs unchanged (fail
+                // closed).
+                let mut pre_encoded_moe: Option<metal::CommandBuffer> = None;
+                if overlap_round && num_slots >= 1 {
+                    let t_pre = std::time::Instant::now();
+                    let cb3 = kernel.queue.new_command_buffer().to_owned();
+                    let ok_enc = {
+                        let enc = cb3.new_compute_command_encoder();
+                        let ok = self.encode_moe_topk_gateup_down(
+                            kernel,
+                            enc,
+                            &down_exps_scale,
+                            &expert_to_slot_table,
+                            slab_buf,
+                            layer_idx,
+                            num_slots,
+                            num_slots,
+                            k_tokens,
+                            &self.resident_scratch.gpu_moe_acc,
+                            0,
+                            logits_off,
+                            None,
+                        ) && self.encode_moe_down(
+                            kernel,
+                            enc,
+                            slab_buf,
+                            layer_idx,
+                            k_tokens,
+                            &self.resident_scratch.gpu_moe_acc,
+                            0,
+                            None,
+                        ) && self.encode_layer_tail(kernel, enc, layer_idx, k_tokens);
+                        enc.end_encoding();
+                        ok
+                    };
+                    if ok_enc {
+                        pre_encoded_moe = Some(cb3);
+                    }
+                    ledger.pre_encode_ms += t_pre.elapsed().as_secs_f64() * 1000.0;
+                }
+
                 // Overlap predicted wave-0 copies with this layer's attn+router GPU.
                 // This layer's ping slab is idle. The shared pong slab may still be
                 // read by the previous layer's fused wave-1, so pong waits until
@@ -24663,8 +24828,54 @@ impl Gemma4GhostCommonMetal {
                     vec![wave0, wave1]
                 };
 
-                let can_fuse_waves =
-                    waves.len() == 2 && pong_slab.is_some() && fill_pong_wave.is_some();
+                if let Some(cb3) = pre_encoded_moe.take() {
+                    if waves.len() == 1 {
+                        // Single wave: the initial filler call above already
+                        // loaded the union into the resident slots (it fills
+                        // whenever the union fits) and published
+                        // updated_slots. Mirror the serial wave-0 steps —
+                        // spec-ping reuse, masking, fail-closed readiness —
+                        // then publish the table and commit the buffer that
+                        // was encoded during the router wait.
+                        let wave0 = &waves[0];
+                        if spec_filled && same_expert_set(&spec_w0, wave0) {
+                            updated_slots = spec_ping;
+                        }
+                        mask_slot_table_to_wave(&mut updated_slots, wave0);
+                        if let Some(expert) = wave_slots_ready(&updated_slots, wave0, num_slots) {
+                            eprintln!(
+                                "[metal chained round] layer {layer_idx} wave 0 missing slot for selected expert {expert}; refusing fail-close"
+                            );
+                            ledger.missing_expert_failclose += 1;
+                            self.last_chained_ledger = ledger;
+                            return false;
+                        }
+                        unsafe {
+                            let dest = moe_layer.expert_to_slot_table.contents() as *mut u32;
+                            std::ptr::copy_nonoverlapping(updated_slots.as_ptr(), dest, 128);
+                        }
+                        stamp.start(GPU_STAGE_GATEUP);
+                        stamp.push_current(&cb3);
+                        cb3.commit();
+                        last_committed_cb = Some(cb3);
+                        cb_closed = true;
+                        layer_committed = true;
+                        ledger.overlap_layers += 1;
+                        encode_clock = std::time::Instant::now();
+                    } else {
+                        // Union overflowed the resident slots: the
+                        // pre-encoded single-wave buffer is wrong for this
+                        // shape. Drop it un-committed; the serial two-wave
+                        // path below runs exactly as without the overlap.
+                        ledger.overlap_fallbacks += 1;
+                        drop(cb3);
+                    }
+                }
+
+                let can_fuse_waves = !layer_committed
+                    && waves.len() == 2
+                    && pong_slab.is_some()
+                    && fill_pong_wave.is_some();
 
                 if can_fuse_waves {
                     let wave0 = &waves[0];
@@ -24767,7 +24978,7 @@ impl Gemma4GhostCommonMetal {
                         self.last_chained_ledger = ledger;
                         return false;
                     }
-                } else {
+                } else if !layer_committed {
                     for (wi, wave) in waves.iter().enumerate() {
                         if unique > num_slots || wi > 0 {
                             let t_load = std::time::Instant::now();
@@ -24908,69 +25119,18 @@ impl Gemma4GhostCommonMetal {
                 }
             }
 
-            begin_gpu_stage!(GPU_STAGE_RESID);
-
-            // Pass 4: Fused Tail directly into slab_a
-            if let Some(fused_pipeline) = kernel.gemma4_fused_layer_residual_pipeline.as_ref() {
-                encoder.set_compute_pipeline_state(fused_pipeline);
-                encoder.set_buffer(0, Some(&self.slab_b), 0);
-                encoder.set_buffer(1, Some(&self.resident_scratch.dn_batch), 0);
-                encoder.set_buffer(2, Some(&self.resident_scratch.gpu_moe_acc), 0);
-                encoder.set_buffer(3, Some(&moe_layer.post_norm_2), 0);
-                encoder.set_buffer(4, Some(&moe_layer.post_ffw_norm), 0);
-                encoder.set_buffer(5, Some(&self.slab_a), 0);
-                let hidden_u32 = GEMMA4_Q4_EXPERT_HIDDEN as u32;
-                let eps = 1.0e-6f32;
-                let scale_f32 = moe_layer.layer_output_scale;
-                encoder.set_bytes(6, 4, &hidden_u32 as *const u32 as *const _);
-                encoder.set_bytes(7, 4, &eps as *const f32 as *const _);
-                encoder.set_bytes(8, 4, &scale_f32 as *const f32 as *const _);
-                encoder.dispatch_thread_groups(
-                    metal::MTLSize {
-                        width: k_tokens as u64,
-                        height: 1,
-                        depth: 1,
-                    },
-                    metal::MTLSize {
-                        width: 256,
-                        height: 1,
-                        depth: 1,
-                    },
-                );
-            } else {
-                unsafe {
-                    *(layer.resid_n_batch.contents() as *mut u32) = (k_tokens * hidden) as u32;
-                }
-                encoder.set_compute_pipeline_state(&kernel.residual_add_pipeline);
-                encoder.set_buffer(0, Some(&self.slab_b), 0);
-                encoder.set_buffer(1, Some(&self.resident_scratch.dn_batch), 0);
-                encoder.set_buffer(2, Some(&self.slab_a), 0);
-                encoder.set_buffer(3, Some(&layer.resid_n_batch), 0);
-                dispatch_1d(encoder, &kernel.residual_add_pipeline, k_tokens * hidden);
-
-                encoder.set_compute_pipeline_state(&kernel.residual_add_pipeline);
-                encoder.set_buffer(0, Some(&self.slab_a), 0);
-                encoder.set_buffer(1, Some(&self.resident_scratch.gpu_moe_acc), 0);
-                encoder.set_buffer(2, Some(&self.slab_a), 0);
-                encoder.set_buffer(3, Some(&layer.resid_n_batch), 0);
-                dispatch_1d(encoder, &kernel.residual_add_pipeline, k_tokens * hidden);
-
-                if (moe_layer.layer_output_scale - 1.0).abs() > 1.0e-5 {
-                    encode_scale_f32(
-                        encoder,
-                        kernel,
-                        &self.slab_a,
-                        &self.slab_a,
-                        &moe_layer.layer_scale_scalar,
-                        k_tokens * hidden,
-                    );
+            if !layer_committed {
+                begin_gpu_stage!(GPU_STAGE_RESID);
+                // Pass 4: Fused Tail directly into slab_a
+                if !self.encode_layer_tail(kernel, encoder, layer_idx, k_tokens) {
+                    encoder.end_encoding();
+                    self.last_chained_ledger = ledger;
+                    return false;
                 }
             }
-
-            encoder.memory_barrier_with_resources(&[&self.slab_a]);
             self.next_position[layer_idx] = start_pos + k_tokens;
 
-            if std::env::var("CAMELID_GEMMA4_DUMP_LAYERS").is_ok_and(|v| v == "1") {
+            if !layer_committed && std::env::var("CAMELID_GEMMA4_DUMP_LAYERS").is_ok_and(|v| v == "1") {
                 encoder.end_encoding();
                 cmd_buf.commit();
                 cmd_buf.wait_until_completed();
@@ -25280,7 +25440,7 @@ impl Gemma4GhostCommonMetal {
                 stamp.start(GPU_STAGE_QKV_O);
             }
 
-            if !predicted_ready {
+            if !predicted_ready && !layer_committed {
                 // Commit this layer's expert/tail work now so the GPU starts
                 // on it while the host encodes the next layer's attention;
                 // the next layer opens a fresh command buffer (same queue, so

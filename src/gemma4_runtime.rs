@@ -2052,17 +2052,61 @@ fn fill_metal_wave_slots_from_host_cache(
     let record_bytes = layer.slots.slot_record_bytes();
     let t_copy = std::time::Instant::now();
     let mut direct_fallback = Vec::with_capacity(plan.loads.len());
-    for load in plan.loads.iter().copied() {
-        if let Some(record) = cache.peek_resident(layer_idx, load.expert) {
-            if record.byte_len() == record_bytes {
-                if let Some(dest) = layer.slots.slot_bytes_mut(load.slot) {
-                    dest.copy_from_slice(record.record_bytes());
-                    layer.directory.commit_load(load);
-                    continue;
+    if crate::metal::overlap_enabled() && plan.loads.len() > 1 && cache.read_pool.is_some() {
+        // CAMELID_GEMMA4_OVERLAP: run the host-cache -> slot copies through
+        // the read pool instead of one serial memcpy per miss. This changes
+        // only copy scheduling: the destinations are distinct slots the plan
+        // has already invalidated (visible again only through commit_load),
+        // the sources are immutable Arc'd records, and commit_load below runs
+        // serially in the plan's load order, so the directory's end state is
+        // identical to the serial path's.
+        let mut resident: Vec<(GhostMetalSlotLoad, Arc<GhostMoeExpert>)> =
+            Vec::with_capacity(plan.loads.len());
+        for load in plan.loads.iter().copied() {
+            match cache.peek_resident(layer_idx, load.expert) {
+                Some(record)
+                    if record.byte_len() == record_bytes
+                        && layer.slots.slot_bytes_mut(load.slot).is_some() =>
+                {
+                    resident.push((load, record));
                 }
+                _ => direct_fallback.push(load),
             }
         }
-        direct_fallback.push(load);
+        if resident.len() > 1 {
+            let pool = cache.read_pool.as_ref().expect("checked above");
+            let slots_ref = &layer.slots;
+            pool.install(|| {
+                resident.par_iter().for_each(|(load, record)| {
+                    if let Some(dest) = unsafe { slots_ref.slot_bytes_mut_raw(load.slot) } {
+                        dest.copy_from_slice(record.record_bytes());
+                    }
+                });
+            });
+            for (load, _) in resident {
+                layer.directory.commit_load(load);
+            }
+        } else {
+            for (load, record) in resident {
+                if let Some(dest) = layer.slots.slot_bytes_mut(load.slot) {
+                    dest.copy_from_slice(record.record_bytes());
+                }
+                layer.directory.commit_load(load);
+            }
+        }
+    } else {
+        for load in plan.loads.iter().copied() {
+            if let Some(record) = cache.peek_resident(layer_idx, load.expert) {
+                if record.byte_len() == record_bytes {
+                    if let Some(dest) = layer.slots.slot_bytes_mut(load.slot) {
+                        dest.copy_from_slice(record.record_bytes());
+                        layer.directory.commit_load(load);
+                        continue;
+                    }
+                }
+            }
+            direct_fallback.push(load);
+        }
     }
     counters.copy_us.fetch_add(
         (t_copy.elapsed().as_secs_f64() * 1_000_000.0) as u64,
@@ -16611,6 +16655,67 @@ mod ghost_moe_wire_tests {
         assert_eq!(hits.hits, 2);
         assert_eq!(hits.evictions, 0);
         assert!(hits.loads.is_empty());
+    }
+
+    /// The overlap path copies a plan's host-cache loads to their slots in
+    /// parallel. That is race-free only because a single plan never assigns
+    /// two loads to the same slot: each load's slot is invalidated and
+    /// pinned within the plan, so the destination byte ranges are pairwise
+    /// disjoint.
+    #[test]
+    fn metal_slot_plan_loads_have_pairwise_distinct_slots() {
+        let mut directory = GhostMetalSlotDirectory::new(8);
+        let plan = directory.plan(&[3, 7, 7, 11, 3, 20, 5]).unwrap();
+        let mut slots: Vec<usize> = plan.loads.iter().map(|load| load.slot).collect();
+        let n = slots.len();
+        slots.sort_unstable();
+        slots.dedup();
+        assert_eq!(slots.len(), n);
+        // Same invariant after warmup + evictions.
+        for load in plan.loads {
+            directory.commit_load(load);
+        }
+        let churn = directory.plan(&[40, 41, 42, 43, 44, 45, 46, 47]).unwrap();
+        let mut slots: Vec<usize> = churn.loads.iter().map(|load| load.slot).collect();
+        let n = slots.len();
+        slots.sort_unstable();
+        slots.dedup();
+        assert_eq!(slots.len(), n);
+    }
+
+    /// The overlap path commits a plan's loads after the parallel copies
+    /// rather than interleaved with them. Directory end state must not
+    /// depend on commit order.
+    #[test]
+    fn metal_slot_commit_order_is_immaterial_for_directory_state() {
+        let mut forward = GhostMetalSlotDirectory::new(4);
+        let mut reverse = GhostMetalSlotDirectory::new(4);
+        let route = [9usize, 2, 9, 4, 17];
+        let plan_f = forward.plan(&route).unwrap();
+        let plan_r = reverse.plan(&route).unwrap();
+        assert_eq!(plan_f, plan_r);
+        let loads_r: Vec<GhostMetalSlotLoad> = plan_r.loads.iter().rev().copied().collect();
+        for load in plan_f.loads {
+            forward.commit_load(load);
+        }
+        for load in loads_r {
+            reverse.commit_load(load);
+        }
+        assert_eq!(forward.entries, reverse.entries);
+        assert_eq!(forward.resident_slot_table, reverse.resident_slot_table);
+    }
+
+    /// CAMELID_GEMMA4_OVERLAP parse: default ON, only an explicit "0" or
+    /// "false" restores the serial schedule.
+    #[test]
+    fn overlap_gate_defaults_on_and_disables_explicitly() {
+        assert!(crate::metal::overlap_flag_from(None));
+        assert!(crate::metal::overlap_flag_from(Some("1")));
+        assert!(crate::metal::overlap_flag_from(Some("true")));
+        assert!(crate::metal::overlap_flag_from(Some("")));
+        assert!(!crate::metal::overlap_flag_from(Some("0")));
+        assert!(!crate::metal::overlap_flag_from(Some("false")));
+        assert!(!crate::metal::overlap_flag_from(Some("FALSE")));
     }
 
     #[test]
