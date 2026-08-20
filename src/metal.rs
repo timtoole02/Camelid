@@ -21351,6 +21351,31 @@ pub struct ChainedRoundHostLedger {
     pub encode_ms: f64,
     pub slot_wait_ms: f64,
     pub slot_filler_ms: f64,
+    /// Split of `slot_filler_ms`: routing compute (softmax + sort + union)
+    /// vs slot fills (directory plan + copies/reads) for the post-router
+    /// filler call. `fill_copy_ms` is the host-cache memcpy portion of the
+    /// fills (disk time is `nvme_ms`).
+    pub filler_route_ms: f64,
+    pub filler_fill_ms: f64,
+    pub fill_copy_ms: f64,
+    /// Host encode time spent while the host would otherwise be blocked in
+    /// the router wait (the pre-encoded MoE+tail path). Hidden behind GPU
+    /// execution, unlike `encode_ms`.
+    pub pre_encode_ms: f64,
+    /// Slot-directory outcome of every wave plan in this round.
+    pub slot_hits: u32,
+    pub slot_misses: u32,
+    pub slot_evictions: u32,
+    /// Union continuity: of this round's per-layer union members
+    /// (`overlap_prev_total`), how many were in the previous successful
+    /// round's union for the same layer / already resident at round start.
+    pub overlap_prev_hits: u32,
+    pub overlap_prev_total: u32,
+    pub resident_start_hits: u32,
+    /// Layers that committed the pre-encoded single-wave MoE+tail command
+    /// buffer vs layers that fell back to the serial encode path.
+    pub overlap_layers: u32,
+    pub overlap_fallbacks: u32,
     pub nvme_ms: f64,
     pub nvme_bytes: u64,
     pub demand_loads: usize,
@@ -21522,6 +21547,61 @@ pub static SPEC_VERIFY_ROUNDS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 pub static SPEC_ACCEPTED_TOKENS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+/// Exposed-idle decomposition, accumulated per successful chained verify round
+/// (and, for the `SPEC_BOUNDARY/DRAFT/TRUNCATE/EMBED` group, per spec-loop
+/// round). The k-report's `idle = wall - gpu - head` is a single opaque
+/// number; these split it into the host phases that can leave the GPU with no
+/// committed work:
+///   per layer (unpredicted path, after the attention/router CB retires the
+///   GPU holds only the small shared-MLP CB):
+///     route (softmax + sort + union) -> miss fills -> slot table -> encode ->
+///     commit;
+///   per round boundary (nothing committed at all): head-result bookkeeping,
+///   drafting, KV truncate, next-round setup/upload/rope, embedding dequant.
+/// `SPEC_SLOT_*` and the union-overlap counters price the prefetch question:
+/// if round R+1's union is almost always already resident when the round
+/// starts, misses are rare and prefetching cannot help; if evictions churn,
+/// it can.
+pub static SPEC_FILLER_ROUTE_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_FILLER_FILL_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_FILL_COPY_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_ENCODE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_PRE_ENCODE_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_SLOT_WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_WAVE_LOAD_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_FINAL_WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_HOST_OTHER_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_SLOT_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_SLOT_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_SLOT_EVICTIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Of this round's per-layer expert unions, how many members were (a) in the
+/// PREVIOUS successful chained round's union for the same layer and (b)
+/// resident in a slot when this round started. Totals share
+/// `SPEC_PREV_UNION_TOTAL`.
+pub static SPEC_PREV_UNION_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_PREV_UNION_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_RESIDENT_START_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Spec-loop round-boundary host time: from one verify call returning to the
+/// next verify call being issued (drafting, acceptance bookkeeping, KV
+/// truncation, history). All of it runs with zero GPU work committed.
+pub static SPEC_BOUNDARY_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_DRAFT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_TRUNCATE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_EMBED_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Chained-lane layers that committed a pre-encoded single-wave MoE+tail
+/// command buffer vs layers that fell back to the serial encode path.
+pub static SPEC_OVERLAP_LAYERS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static SPEC_OVERLAP_FALLBACKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(target_os = "macos")]
 #[allow(dead_code)] // Phase 1 API; gemma4_runtime integration lands separately.

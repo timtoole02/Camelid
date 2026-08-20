@@ -19,6 +19,33 @@
 use camelid::gemma4_runtime::{gemma4_stop_token_ids, Gemma4Runtime};
 use std::{path::PathBuf, time::Instant};
 
+/// Exposed-idle decomposition counters read by the [k-idle] report line.
+/// Times are in microseconds; the tail entries are event counts. The report
+/// indexes this array by position, so order is load-bearing.
+const IDLE_STATS: [(&str, &std::sync::atomic::AtomicU64); 21] = [
+    ("route_us", &camelid::metal::SPEC_FILLER_ROUTE_US),
+    ("fill_us", &camelid::metal::SPEC_FILLER_FILL_US),
+    ("copy_us", &camelid::metal::SPEC_FILL_COPY_US),
+    ("encode_us", &camelid::metal::SPEC_ENCODE_US),
+    ("pre_encode_us", &camelid::metal::SPEC_PRE_ENCODE_US),
+    ("slot_wait_us", &camelid::metal::SPEC_SLOT_WAIT_US),
+    ("wave_load_us", &camelid::metal::SPEC_WAVE_LOAD_US),
+    ("final_wait_us", &camelid::metal::SPEC_FINAL_WAIT_US),
+    ("other_host_us", &camelid::metal::SPEC_HOST_OTHER_US),
+    ("boundary_us", &camelid::metal::SPEC_BOUNDARY_US),
+    ("draft_us", &camelid::metal::SPEC_DRAFT_US),
+    ("truncate_us", &camelid::metal::SPEC_TRUNCATE_US),
+    ("embed_us", &camelid::metal::SPEC_EMBED_US),
+    ("slot_hits", &camelid::metal::SPEC_SLOT_HITS),
+    ("slot_misses", &camelid::metal::SPEC_SLOT_MISSES),
+    ("slot_evictions", &camelid::metal::SPEC_SLOT_EVICTIONS),
+    ("prev_union_hits", &camelid::metal::SPEC_PREV_UNION_HITS),
+    ("prev_union_total", &camelid::metal::SPEC_PREV_UNION_TOTAL),
+    ("resident_start_hits", &camelid::metal::SPEC_RESIDENT_START_HITS),
+    ("overlap_layers", &camelid::metal::SPEC_OVERLAP_LAYERS),
+    ("overlap_fallbacks", &camelid::metal::SPEC_OVERLAP_FALLBACKS),
+];
+
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
@@ -243,6 +270,8 @@ fn gemma4_spec50_bench() {
             let hr0 = camelid::metal::HEAD_ROWS.load(Relaxed);
             let rounds0 = camelid::metal::SPEC_VERIFY_ROUNDS.load(std::sync::atomic::Ordering::Relaxed);
             let acc0 = camelid::metal::SPEC_ACCEPTED_TOKENS.load(std::sync::atomic::Ordering::Relaxed);
+            // Exposed-idle decomposition baselines.
+            let idle0: Vec<u64> = IDLE_STATS.iter().map(|(_, a)| a.load(Relaxed)).collect();
             let t1 = Instant::now();
             let spec_tokens = runtime
                 .spec_decode_generate(&mut kc, &mut vc, logits, &prompt_tokens, &eot, max_new)
@@ -307,6 +336,46 @@ fn gemma4_spec50_bench() {
                     }
                     du.last().map(|&(u, _)| u).unwrap_or(0)
                 };
+                {
+                    let d: Vec<u64> = IDLE_STATS
+                        .iter()
+                        .zip(&idle0)
+                        .map(|((_, a), b)| a.load(Relaxed) - b)
+                        .collect();
+                    let ms = |i: usize| d[i] as f64 / 1000.0;
+                    // Order must match IDLE_STATS below.
+                    println!(
+                        "[k-idle K={k}] route={:.0}ms fill={:.0}ms (copy={:.0}ms) encode={:.0}ms \
+                         pre_encode={:.0}ms slot_wait={:.0}ms wave_load={:.0}ms final_wait={:.0}ms \
+                         other_host={:.0}ms boundary={:.0}ms draft={:.0}ms truncate={:.0}ms \
+                         embed={:.0}ms | slots hit={} miss={} evict={} | union_vs_prev={}/{} \
+                         ({:.0}%) resident_at_start={}/{} ({:.0}%) | overlap_layers={} fallbacks={}",
+                        ms(0),
+                        ms(1),
+                        ms(2),
+                        ms(3),
+                        ms(4),
+                        ms(5),
+                        ms(6),
+                        ms(7),
+                        ms(8),
+                        ms(9),
+                        ms(10),
+                        ms(11),
+                        ms(12),
+                        d[13],
+                        d[14],
+                        d[15],
+                        d[16],
+                        d[17],
+                        100.0 * d[16] as f64 / (d[17].max(1)) as f64,
+                        d[18],
+                        d[17],
+                        100.0 * d[18] as f64 / (d[17].max(1)) as f64,
+                        d[19],
+                        d[20],
+                    );
+                }
                 println!(
                     "[k-report K={k}] rounds={cr} accepted_tokens={} expert_bytes={:.0}MB \
                      dense+head_bytes={:.0}MB total={:.0}MB gpu={:.0}ms head={:.0}ms \

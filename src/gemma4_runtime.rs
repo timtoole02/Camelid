@@ -1985,6 +1985,27 @@ fn ghost_metal_timing_enabled() -> bool {
         .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
+/// Shared counters for one chained round's slot fills. Grouping them keeps
+/// the fill functions' signatures stable while the ledger grows; all fields
+/// are accumulated with relaxed atomics because fills may run on the rayon
+/// read pool.
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct WaveFillCounters {
+    nvme_us: std::sync::atomic::AtomicU64,
+    nvme_bytes: std::sync::atomic::AtomicU64,
+    demand_loads: std::sync::atomic::AtomicUsize,
+    /// Host-cache -> slot memcpy time (the non-disk part of a fill).
+    copy_us: std::sync::atomic::AtomicU64,
+    /// Slot-directory plan outcomes across every wave fill of the round.
+    plan_hits: std::sync::atomic::AtomicU64,
+    plan_misses: std::sync::atomic::AtomicU64,
+    plan_evictions: std::sync::atomic::AtomicU64,
+    /// Post-router filler split: routing compute vs slot fill.
+    route_us: std::sync::atomic::AtomicU64,
+    fill_us: std::sync::atomic::AtomicU64,
+}
+
 /// Bring `selected_experts` into this layer's persistent Metal slots.
 ///
 /// Directory-first: experts already resident in a slot cost nothing (no host
@@ -2003,10 +2024,12 @@ fn fill_metal_wave_slots_from_host_cache(
     cache: &GhostMoeExpertCache,
     layer_idx: usize,
     selected_experts: &[usize],
-    nvme_us: &std::sync::atomic::AtomicU64,
-    nvme_bytes: &std::sync::atomic::AtomicU64,
-    demand_loads: &std::sync::atomic::AtomicUsize,
+    counters: &WaveFillCounters,
 ) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let nvme_us = &counters.nvme_us;
+    let nvme_bytes = &counters.nvme_bytes;
+    let demand_loads = &counters.demand_loads;
     let Ok(plan) = layer.directory.plan(selected_experts) else {
         eprintln!(
             "[gemma4-ghost-metal] layer {layer_idx} wave plan refused {} experts into {} slots",
@@ -2015,11 +2038,19 @@ fn fill_metal_wave_slots_from_host_cache(
         );
         return;
     };
+    counters.plan_hits.fetch_add(plan.hits as u64, Relaxed);
+    counters
+        .plan_misses
+        .fetch_add(plan.loads.len() as u64, Relaxed);
+    counters
+        .plan_evictions
+        .fetch_add(plan.evictions as u64, Relaxed);
     if plan.loads.is_empty() {
         return;
     }
 
     let record_bytes = layer.slots.slot_record_bytes();
+    let t_copy = std::time::Instant::now();
     let mut direct_fallback = Vec::with_capacity(plan.loads.len());
     for load in plan.loads.iter().copied() {
         if let Some(record) = cache.peek_resident(layer_idx, load.expert) {
@@ -2033,6 +2064,10 @@ fn fill_metal_wave_slots_from_host_cache(
         }
         direct_fallback.push(load);
     }
+    counters.copy_us.fetch_add(
+        (t_copy.elapsed().as_secs_f64() * 1_000_000.0) as u64,
+        Relaxed,
+    );
 
     if !direct_fallback.is_empty() {
         let file = &cache.file;
@@ -2130,10 +2165,11 @@ fn fill_compact_wave_into_slots(
     layer_idx: usize,
     experts: &[usize],
     updated_slots: &mut [u32; 128],
-    nvme_us: &std::sync::atomic::AtomicU64,
-    nvme_bytes: &std::sync::atomic::AtomicU64,
-    demand_loads: &std::sync::atomic::AtomicUsize,
+    counters: &WaveFillCounters,
 ) {
+    let nvme_us = &counters.nvme_us;
+    let nvme_bytes = &counters.nvme_bytes;
+    let demand_loads = &counters.demand_loads;
     updated_slots.fill(0xFFFFFFFFu32);
     if experts.is_empty() {
         return;
@@ -2709,9 +2745,26 @@ impl GhostMetalExpertRuntime {
         let wave1_gpu = wave1_bufs.clone();
 
         let mut collected_routes = vec![Vec::new(); self.layers.len()];
-        let nvme_us = std::sync::atomic::AtomicU64::new(0);
-        let nvme_bytes = std::sync::atomic::AtomicU64::new(0);
-        let demand_loads = std::sync::atomic::AtomicUsize::new(0);
+        let fill_counters = WaveFillCounters::default();
+        // Union-continuity measurement: the previous successful round's
+        // per-layer unions (latest_routed_experts is updated at the end of
+        // each round) and this round's start-of-round residency
+        // (slot_mappings snapshot above). Compared against this round's
+        // routed unions after the round to answer the prefetch question.
+        let prev_union_masks: Vec<[bool; 128]> = self
+            .latest_routed_experts
+            .iter()
+            .take(30)
+            .map(|union| {
+                let mut mask = [false; 128];
+                for &e in union {
+                    if e < 128 {
+                        mask[e] = true;
+                    }
+                }
+                mask
+            })
+            .collect();
 
         if allow_predicted {
             if let Some(cache) = ghost_cache {
@@ -2734,9 +2787,7 @@ impl GhostMetalExpertRuntime {
                             cache,
                             layer_idx,
                             &w0,
-                            &nvme_us,
-                            &nvme_bytes,
-                            &demand_loads,
+                            &fill_counters,
                         );
                         if !rest.is_empty() {
                             let (buf, nslots) = if let Some(buf) = wave1_bufs.get(layer_idx) {
@@ -2752,9 +2803,7 @@ impl GhostMetalExpertRuntime {
                                 layer_idx,
                                 &rest,
                                 &mut updated_slots,
-                                &nvme_us,
-                                &nvme_bytes,
-                                &demand_loads,
+                                &fill_counters,
                             );
                         }
                     });
@@ -2772,6 +2821,8 @@ impl GhostMetalExpertRuntime {
                 let n_tokens = k_tokens.min(crate::metal::GEMMA4_RESIDENT_MAX_BATCH);
                 let n_slots = layer.directory.entries.len();
 
+                let routed = wave.is_none();
+                let t_route = std::time::Instant::now();
                 let selected_experts: Vec<usize> = if let Some(wave) = wave {
                     wave.to_vec()
                 } else {
@@ -2807,24 +2858,39 @@ impl GhostMetalExpertRuntime {
                     if selected_experts.len() > n_slots {
                         // Overflow becomes extra waves. Keep any speculative
                         // wave-0 slot table filled during the router wait.
+                        fill_counters.route_us.fetch_add(
+                            (t_route.elapsed().as_secs_f64() * 1_000_000.0) as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                         return;
                     }
                     selected_experts
                 };
+                if routed {
+                    fill_counters.route_us.fetch_add(
+                        (t_route.elapsed().as_secs_f64() * 1_000_000.0) as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
 
+                let t_fill = std::time::Instant::now();
                 fill_metal_wave_slots_from_host_cache(
                     layer,
                     cache,
                     layer_idx,
                     &selected_experts,
-                    &nvme_us,
-                    &nvme_bytes,
-                    &demand_loads,
+                    &fill_counters,
                 );
 
                 for e in 0..128 {
                     let s = layer.directory.resident_slot_table[e];
                     updated_slots[e] = if s >= 0 { s as u32 } else { 0xFFFFFFFFu32 };
+                }
+                if routed {
+                    fill_counters.fill_us.fetch_add(
+                        (t_fill.elapsed().as_secs_f64() * 1_000_000.0) as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 }
             }
         });
@@ -2844,9 +2910,7 @@ impl GhostMetalExpertRuntime {
                     layer_idx,
                     wave,
                     updated_slots,
-                    &nvme_us,
-                    &nvme_bytes,
-                    &demand_loads,
+                    &fill_counters,
                 );
             }
         });
@@ -2931,15 +2995,87 @@ impl GhostMetalExpertRuntime {
                 crate::metal::SPEC_CHAINED_ROUNDS.fetch_add(1, Relaxed);
             }
         }
+        // Union continuity of this round's routed unions against the previous
+        // round's unions and against start-of-round slot residency. Only the
+        // unpredicted path collects routes, so predicted rounds contribute 0.
+        let mut overlap_prev_hits = 0u32;
+        let mut overlap_prev_total = 0u32;
+        let mut resident_start_hits = 0u32;
+        for (li, experts) in collected_routes.iter().enumerate().take(30) {
+            for &e in experts {
+                if e >= 128 {
+                    continue;
+                }
+                overlap_prev_total += 1;
+                if prev_union_masks.get(li).is_some_and(|mask| mask[e]) {
+                    overlap_prev_hits += 1;
+                }
+                if slot_mappings[li][e] != 0xFFFFFFFFu32 {
+                    resident_start_hits += 1;
+                }
+            }
+        }
         if let Some(common) = self.common.as_mut() {
+            use std::sync::atomic::Ordering::Relaxed;
             common.last_chained_ledger.nvme_ms =
-                nvme_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0;
-            common.last_chained_ledger.nvme_bytes =
-                nvme_bytes.load(std::sync::atomic::Ordering::Relaxed);
-            common.last_chained_ledger.demand_loads =
-                demand_loads.load(std::sync::atomic::Ordering::Relaxed);
+                fill_counters.nvme_us.load(Relaxed) as f64 / 1000.0;
+            common.last_chained_ledger.nvme_bytes = fill_counters.nvme_bytes.load(Relaxed);
+            common.last_chained_ledger.demand_loads = fill_counters.demand_loads.load(Relaxed);
             common.last_chained_ledger.prefetch_ms = prefetch_ms;
             common.last_chained_ledger.setup_ms = setup_ms;
+            common.last_chained_ledger.filler_route_ms =
+                fill_counters.route_us.load(Relaxed) as f64 / 1000.0;
+            common.last_chained_ledger.filler_fill_ms =
+                fill_counters.fill_us.load(Relaxed) as f64 / 1000.0;
+            common.last_chained_ledger.fill_copy_ms =
+                fill_counters.copy_us.load(Relaxed) as f64 / 1000.0;
+            common.last_chained_ledger.slot_hits =
+                fill_counters.plan_hits.load(Relaxed).min(u32::MAX as u64) as u32;
+            common.last_chained_ledger.slot_misses =
+                fill_counters.plan_misses.load(Relaxed).min(u32::MAX as u64) as u32;
+            common.last_chained_ledger.slot_evictions =
+                fill_counters.plan_evictions.load(Relaxed).min(u32::MAX as u64) as u32;
+            common.last_chained_ledger.overlap_prev_hits = overlap_prev_hits;
+            common.last_chained_ledger.overlap_prev_total = overlap_prev_total;
+            common.last_chained_ledger.resident_start_hits = resident_start_hits;
+            if ok {
+                let led = &common.last_chained_ledger;
+                crate::metal::SPEC_FILLER_ROUTE_US
+                    .fetch_add(fill_counters.route_us.load(Relaxed), Relaxed);
+                crate::metal::SPEC_FILLER_FILL_US
+                    .fetch_add(fill_counters.fill_us.load(Relaxed), Relaxed);
+                crate::metal::SPEC_FILL_COPY_US
+                    .fetch_add(fill_counters.copy_us.load(Relaxed), Relaxed);
+                crate::metal::SPEC_SLOT_HITS
+                    .fetch_add(fill_counters.plan_hits.load(Relaxed), Relaxed);
+                crate::metal::SPEC_SLOT_MISSES
+                    .fetch_add(fill_counters.plan_misses.load(Relaxed), Relaxed);
+                crate::metal::SPEC_SLOT_EVICTIONS
+                    .fetch_add(fill_counters.plan_evictions.load(Relaxed), Relaxed);
+                crate::metal::SPEC_PREV_UNION_HITS.fetch_add(overlap_prev_hits as u64, Relaxed);
+                crate::metal::SPEC_PREV_UNION_TOTAL.fetch_add(overlap_prev_total as u64, Relaxed);
+                crate::metal::SPEC_RESIDENT_START_HITS
+                    .fetch_add(resident_start_hits as u64, Relaxed);
+                crate::metal::SPEC_ENCODE_US
+                    .fetch_add((led.encode_ms * 1000.0) as u64, Relaxed);
+                crate::metal::SPEC_PRE_ENCODE_US
+                    .fetch_add((led.pre_encode_ms * 1000.0) as u64, Relaxed);
+                crate::metal::SPEC_SLOT_WAIT_US
+                    .fetch_add((led.slot_wait_ms * 1000.0) as u64, Relaxed);
+                crate::metal::SPEC_WAVE_LOAD_US
+                    .fetch_add((led.wave_load_ms * 1000.0) as u64, Relaxed);
+                crate::metal::SPEC_FINAL_WAIT_US
+                    .fetch_add((led.final_wait_ms * 1000.0) as u64, Relaxed);
+                crate::metal::SPEC_HOST_OTHER_US.fetch_add(
+                    ((led.upload_ms + led.rope_ms + led.download_ms + led.setup_ms) * 1000.0)
+                        as u64,
+                    Relaxed,
+                );
+                crate::metal::SPEC_OVERLAP_LAYERS
+                    .fetch_add(led.overlap_layers as u64, Relaxed);
+                crate::metal::SPEC_OVERLAP_FALLBACKS
+                    .fetch_add(led.overlap_fallbacks as u64, Relaxed);
+            }
             if ghost_metal_timing_enabled() {
                 let led = &common.last_chained_ledger;
                 eprintln!(
@@ -2954,6 +3090,23 @@ impl GhostMetalExpertRuntime {
                     led.nvme_bytes as f64 / (1024.0 * 1024.0),
                     led.nvme_ms,
                     led.unique_experts_sum,
+                );
+                eprintln!(
+                    "[metal chained idle] route={:.1}ms fill={:.1}ms (copy={:.1}ms disk={:.1}ms) pre_encode={:.1}ms slot hits={} misses={} evictions={} union_vs_prev={}/{} resident_at_start={}/{} overlap_layers={}/{}",
+                    led.filler_route_ms,
+                    led.filler_fill_ms,
+                    led.fill_copy_ms,
+                    led.nvme_ms,
+                    led.pre_encode_ms,
+                    led.slot_hits,
+                    led.slot_misses,
+                    led.slot_evictions,
+                    led.overlap_prev_hits,
+                    led.overlap_prev_total,
+                    led.resident_start_hits,
+                    led.overlap_prev_total,
+                    led.overlap_layers,
+                    led.overlap_layers + led.overlap_fallbacks,
                 );
                 eprintln!(
                     "[metal chained stages] split={} qkv_o={:.1}ms attn={:.1}ms router={:.1}ms shared={:.1}ms gateup={:.1}ms down={:.1}ms resid={:.1}ms gpu_total={:.1}ms",
@@ -6134,6 +6287,7 @@ impl Gemma4Runtime {
                 let kk = tokens.len();
                 let hidden = self.config.embedding_length as usize;
 
+                let t_embed = std::time::Instant::now();
                 let mut hs: Vec<Vec<f32>> = Vec::with_capacity(kk);
                 for &token in tokens {
                     let h0: Vec<f32> = self
@@ -6144,6 +6298,10 @@ impl Gemma4Runtime {
                         .collect();
                     hs.push(h0);
                 }
+                crate::metal::SPEC_EMBED_US.fetch_add(
+                    (t_embed.elapsed().as_secs_f64() * 1_000_000.0) as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
 
                 let mut hs_buf: Vec<Vec<f32>> = (0..kk).map(|_| vec![0.0f32; hidden]).collect();
                 let mut gpu_chained_round_ok = false;
@@ -9779,6 +9937,12 @@ impl Gemma4Runtime {
         history.extend_from_slice(prompt_tokens);
         let mut generated: Vec<u32> = Vec::new();
         let mut pos = prompt_tokens.len();
+        // Round-boundary exposure: everything between one verify round
+        // returning and the next being issued runs with zero GPU work
+        // committed. Measured per generation and fed to the SPEC_* statics
+        // the k-report reads.
+        let mut t_prev_round_end: Option<std::time::Instant> = None;
+        let (mut boundary_us, mut draft_us, mut truncate_us) = (0u64, 0u64, 0u64);
         while generated.len() < max_new {
             // t0 is the target's own next-token argmax — always greedy-correct.
             let t0 = argmax(&logits);
@@ -9792,8 +9956,10 @@ impl Gemma4Runtime {
             }
             let budget = max_new - generated.len();
             let want = if adaptive { cur_k } else { max_draft };
+            let t_draft = std::time::Instant::now();
             let (mut drafts, matched_n, miss) =
                 drafter.draft_explained(&history, want.min(budget));
+            draft_us += (t_draft.elapsed().as_secs_f64() * 1_000_000.0) as u64;
             let tier_now = tier_of(matched_n);
             let tier_priced_out = econ_enabled
                 && tier_offered[tier_now] >= econ_min_offered
@@ -9838,11 +10004,15 @@ impl Gemma4Runtime {
                 // step must share kernels (same per-token reduction order) for
                 // the speculative stream to equal the greedy stream exactly;
                 // mixing the HEAD lane in here diverges on near-ties.
+                if let Some(t) = t_prev_round_end.take() {
+                    boundary_us += (t.elapsed().as_secs_f64() * 1_000_000.0) as u64;
+                }
                 logits = if spec_k1_head_lane() {
                     self.step(t0, pos, kc, vc)?
                 } else {
                     self.step_chunk_speculative(&[t0], &[], pos, kc, vc)?.1
                 };
+                t_prev_round_end = Some(std::time::Instant::now());
                 pos += 1;
                 accepted_rounds += 1;
                 crate::metal::SPEC_VERIFY_ROUNDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -9865,7 +10035,11 @@ impl Gemma4Runtime {
                 );
             }
 
+            if let Some(t) = t_prev_round_end.take() {
+                boundary_us += (t.elapsed().as_secs_f64() * 1_000_000.0) as u64;
+            }
             let (j, next_logits) = self.step_chunk_speculative(&chunk, &drafts, pos, kc, vc)?;
+            t_prev_round_end = Some(std::time::Instant::now());
             accepted_rounds += 1;
             accepted_drafts += j as u64;
             offered_drafts += drafts.len() as u64;
@@ -9907,6 +10081,7 @@ impl Gemma4Runtime {
             // Keep KV through the last accepted position (pos+j); discard the rejected
             // draft tail. rows[j] predicts pos+j+1 → it's next round's t0 source.
             let keep = pos + j + 1;
+            let t_truncate = std::time::Instant::now();
             for li in 0..kc.len() {
                 kc[li].truncate(keep);
                 vc[li].truncate(keep);
@@ -9917,11 +10092,24 @@ impl Gemma4Runtime {
                     lane.truncate_sequence(keep);
                 }
             }
+            truncate_us += (t_truncate.elapsed().as_secs_f64() * 1_000_000.0) as u64;
             pos = keep;
             logits = next_logits;
         }
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            crate::metal::SPEC_BOUNDARY_US.fetch_add(boundary_us, Relaxed);
+            crate::metal::SPEC_DRAFT_US.fetch_add(draft_us, Relaxed);
+            crate::metal::SPEC_TRUNCATE_US.fetch_add(truncate_us, Relaxed);
+        }
         if spec_timing {
             let toks = generated.len().max(1) as f64;
+            eprintln!(
+                "[spec-boundary] boundary={:.1}ms draft={:.1}ms truncate={:.1}ms across {accepted_rounds} rounds",
+                boundary_us as f64 / 1000.0,
+                draft_us as f64 / 1000.0,
+                truncate_us as f64 / 1000.0,
+            );
             eprintln!(
                 "[spec] {} tokens in {accepted_rounds} verify passes ({:.2} tokens/pass; \
                  {accepted_drafts}/{offered_drafts} drafts accepted, p={:.3}; \
