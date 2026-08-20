@@ -579,6 +579,17 @@ struct GpuStageStamp {
     cbs: Vec<(u8, metal::CommandBuffer)>,
 }
 
+/// CAMELID_GEMMA4_MOE_SPEC50=0 falls back to the original routed-expert
+/// kernels. The replacements are bitwise identical; timing A/B lever only.
+#[cfg(target_os = "macos")]
+fn moe_spec50_disabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_MOE_SPEC50")
+            .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+    })
+}
+
 /// CAMELID_GEMMA4_DENSE_V4=0 falls back to the original dense batch kernels.
 /// The replacement is bitwise identical, so this is a timing A/B lever only.
 #[cfg(target_os = "macos")]
@@ -22952,6 +22963,37 @@ impl Gemma4GhostCommonMetal {
         ]);
 
         if k_tokens <= 8 {
+            // spec50 gateup: bitwise identical to the batch_k reference for
+            // every row/token/K in 1..=8 (packed_uchar4 loads, in-loop unpack,
+            // static token bound). Byte-for-byte the same binding; timing-only
+            // swap; CAMELID_GEMMA4_MOE_SPEC50=0 restores the reference.
+            if !moe_spec50_disabled() {
+                if let Some(dev) = Device::system_default() {
+                    if let Some(variant) = spec50_moe_pipelines(&dev) {
+                        encode_spec50_gateup(
+                            encoder,
+                            &variant.gateup,
+                            &self.resident_scratch.expert_input_scales_batch,
+                            &self.resident_scratch.expert_input_quants_batch,
+                            slab_buf,
+                            slab_byte_offset,
+                            &self.resident_scratch.gpu_work_list,
+                            &self.resident_scratch.gpu_moe_scales,
+                            &self.resident_scratch.gpu_moe_quants,
+                            gateup_unique_u32,
+                            k_u32,
+                            overflow_slab,
+                        );
+                        encoder.memory_barrier_with_resources(&[
+                            &self.resident_scratch.gpu_moe_scales,
+                            &self.resident_scratch.gpu_moe_quants,
+                            &self.resident_scratch.gpu_work_list,
+                            &self.resident_scratch.gpu_candidate_routes[layer_idx],
+                        ]);
+                        return true;
+                    }
+                }
+            }
             if let Some(fused_gu_q) = kernel
                 .gemma4_q4_multi_expert_fused_gateup_geglu_quant_batch_k_pipeline
                 .as_ref()
@@ -23055,6 +23097,30 @@ impl Gemma4GhostCommonMetal {
             return false;
         };
         let k_u32 = k_tokens as u32;
+        // spec50 down: union-tiled (one simdgroup per token, 4 hidden rows),
+        // bitwise identical to the scatter_reduce_simd reference for every
+        // row/token/K in 1..=8, same binding. 1.62x at K=8.
+        if !moe_spec50_disabled() && k_tokens <= 8 {
+            if let Some(dev) = Device::system_default() {
+                if let Some(variant) = spec50_moe_pipelines(&dev) {
+                    encode_spec50_down(
+                        encoder,
+                        &variant.down,
+                        &self.resident_scratch.gpu_moe_scales,
+                        &self.resident_scratch.gpu_moe_quants,
+                        slab_buf,
+                        slab_byte_offset,
+                        &self.resident_scratch.gpu_candidate_routes[layer_idx],
+                        &self.resident_scratch.gpu_work_list,
+                        down_dest,
+                        k_u32,
+                        overflow_slab,
+                    );
+                    encoder.memory_barrier_with_resources(&[down_dest]);
+                    return true;
+                }
+            }
+        }
         encoder.set_compute_pipeline_state(down_pipeline);
         encoder.set_buffer(0, Some(&self.resident_scratch.gpu_moe_scales), 0);
         encoder.set_buffer(1, Some(&self.resident_scratch.gpu_moe_quants), 0);
@@ -23426,10 +23492,10 @@ impl Gemma4GhostCommonMetal {
                 // 4-aligned q/k/v row splits, in which case the reference
                 // kernel below runs unchanged.
                 let staged_qkv = !dense_v4_disabled()
-                    && spec50_dense_kernels().is_some_and(|dk| {
+                    && {
                         encode_gemma4_q4_0_qkv_matmul_batch_k_v4(
                             encoder,
-                            dk,
+                            kernel,
                             &self.resident_scratch.normf_batch,
                             &layer.q_w,
                             &layer.k_w,
@@ -23441,7 +23507,7 @@ impl Gemma4GhostCommonMetal {
                             q_dim + 2 * kv_dim,
                             k_tokens,
                         )
-                    });
+                    };
                 if !staged_qkv {
                     encode_gemma4_q4_0_qkv_matmul_batch_k(
                         encoder,
