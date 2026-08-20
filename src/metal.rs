@@ -777,6 +777,14 @@ mod spec50_dense;
 #[allow(unused_imports)]
 pub(crate) use spec50_dense::*;
 
+/// Union-tiled routed-expert kernels (GateUp / Down) for the Gemma 4 26B MoE
+/// round. Additive: nothing here is dispatched by the existing lanes yet.
+#[cfg(target_os = "macos")]
+mod spec50_moe;
+#[cfg(target_os = "macos")]
+#[allow(unused_imports)]
+pub(crate) use spec50_moe::*;
+
 #[cfg(target_os = "macos")]
 const LINEAR_ROW_SHADER: &str = r#"
 #include <metal_stdlib>
