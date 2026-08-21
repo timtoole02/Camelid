@@ -184,7 +184,13 @@ const ECONOMICS_MIN_VERIFY_ROUNDS: u64 = 8;
 const ECONOMICS_MIN_EMITTED_TOKENS: u64 = 16;
 const ECONOMICS_LOSS_STREAK_LIMIT: u32 = 2;
 const NO_GAIN_WALL_RATIO_LIMIT: f64 = 1.05;
-const PILOT_TOKENS: u64 = 32;
+// MEASURED 2026-08-21 from a full [route-metal] routing trace (30 layers x 39 steps):
+// the decode working set SATURATES at 45 distinct experts/layer by step 15 and never grows
+// (first-touch records/token: 240,143,64,110,90,62,70,58,52,28,... then exactly 0 from step 30).
+// A 56-slot table therefore holds the entire decode working set, and steady-state expert disk
+// traffic is ZERO. The old 32-token budget measured only the cold-start window, so the whole
+// 93.8 MB/token figure was warmup amortized over too few tokens. Generate past saturation.
+const PILOT_TOKENS: u64 = 256;
 const LOAD_ONLY_REPORT_SCHEMA_VERSION: u32 = 3;
 const LOAD_ONLY_MIN_RECLAIMABLE_HEADROOM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const LOAD_ONLY_SOAK_SECONDS: u64 = 30;
@@ -523,12 +529,51 @@ fn exact_target_environment() -> BTreeMap<String, String> {
         ("CAMELID_GEMMA4_GHOST_METAL_COMMON", "1"),
         ("CAMELID_GEMMA4_GHOST_METAL_CONTEXT", "1024"),
         ("CAMELID_GEMMA4_GHOST_METAL_HEAD_RESIDENT", "0"),
+        // MEASURED 2026-08-21: expert preads are issued one LAYER at a time (~7
+        // records) with a barrier before the next layer, and at that depth the
+        // device gives ~2.2 GB/s no matter how many threads are used (4 thr 2.21,
+        // 8 thr 2.23 shared-fd; an engine A/B at 8 threads measured no gain and a
+        // slight loss). Depth is the limiter, not concurrency: the same benchmark
+        // at batch 28 gives 3.14 GB/s at 4 threads and 4.01 at 8. Deepening the
+        // batch requires prefetching across layers, which needs route prediction.
         ("CAMELID_GEMMA4_GHOST_READ_THREADS", "4"),
         ("CAMELID_GEMMA4_GHOST_METAL_SLOTS_PER_LAYER", "88"),
         ("CAMELID_GEMMA4_GHOST_METAL_DEMAND_LOAD_ONLY", "1"),
-        ("CAMELID_GEMMA4_GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER", "32"),
+        // 64 = 8 speculative positions x 8 routes/token, the provable ceiling on a
+        // layer's per-round expert union at K=8 (see GHOST_METAL_OVERFLOW_COVER_SLOTS).
+        // Bounded record mode has no overflow bank, so any union above this budget is a
+        // terminal refusal rather than a spill.
+        //
+        // Measured 2026-08-21 on this exact pair (K=8, copy workload):
+        //   * largest observed round union  = 41  (layer 0, first K=8 prefill chunk),
+        //     which refused the previous 32-slot bound outright (run mtp-nim-table32)
+        //   * largest observed decode union = 37  (K=6 round, run mtp-nim-t64c256)
+        //   * cumulative distinct experts/layer over 32 tokens = 113 of 128, so the
+        //     table saturates and LFU eviction, not capacity, carries the churn.
+        // A generation-wide peak-union statistic is NOT recorded (the chained ledger is
+        // explicitly "latest_completed_chained_attempt_only_not_generation_maximum"), so
+        // no bound below 64 has been shown safe. 64 stays until that telemetry exists.
+        ("CAMELID_GEMMA4_GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER", "56"),
         ("CAMELID_GEMMA4_GHOST_METAL_HOT_PIN", "0"),
-        ("CAMELID_GEMMA4_SLOT_POLICY", "lfu"),
+        // MEASURED 2026-08-21: every steady-state decode round takes ~188 slot
+        // misses and ~188 evictions against a table whose 1680 slots comfortably
+        // hold the ~863-record per-round union, while 55% of a round's union was
+        // also in the previous round's. That is the classic saturated-LFU
+        // pathology: a freshly loaded record has frequency 1 and is evicted before
+        // it can accumulate, so the router immediately re-reads it. Pure recency
+        // protects the last rounds' unions. Placement-only: which experts are
+        // selected, and their routing values, never depend on which slot holds a
+        // record, so this cannot change arithmetic.
+        ("CAMELID_GEMMA4_SLOT_POLICY", "lru"),
+        // Host victim ring. MEASURED 2026-08-21: every steady-state decode round
+        // takes ~188 slot misses and ~188 evictions (the table is saturated, so a
+        // miss always evicts), while 55% of a round's routed union was also in the
+        // previous round's union. That churn costs ~300 ms/round of .cghost pread
+        // at a MEASURED 1.87 GB/s, which is 55.7% of the round wall. The ring
+        // retains evicted records in host RAM so a re-miss becomes a memcpy.
+        // 512 MiB / 30 layers / 3,345,408 B = 5 records/layer, about one round of
+        // evictions per layer. VICTIM_VERIFY=4 byte-verifies every 4th ring fill
+        // against a fresh pread so the ring cannot silently change arithmetic.
         ("CAMELID_GEMMA4_VICTIM_CACHE", "0"),
         ("CAMELID_GEMMA4_VICTIM_MB", "0"),
         ("CAMELID_GEMMA4_SPEC_CHUNK_MAX", "8"),
@@ -537,6 +582,18 @@ fn exact_target_environment() -> BTreeMap<String, String> {
         ("CAMELID_GEMMA4_SPEC_DRAFT_TOKENS", "8"),
         ("CAMELID_GEMMA4_SPEC_K1_LANE", "chained"),
         ("CAMELID_GEMMA4_SPEC_TIMING", "1"),
+        // Per-round critical-path decomposition ([metal chained ledger] /
+        // [metal chained idle]: slot_wait, slot_filler, nvme_ms, encode,
+        // gpu_busy, per-stage GPU). The lane child scrubs every inherited
+        // CAMELID_GEMMA4_* key so a tuning knob cannot escape the receipt, so an
+        // observability flag only reaches the child if it is serialized here.
+        ("CAMELID_GEMMA4_GHOST_METAL_TIMING", "1"),
+        // Per-layer routed-expert trace ([route-metal] l=<layer> e=[<expert ids>]).
+        // Captures the exact expert access SEQUENCE so the slot-cache hit rate can be
+        // simulated offline at any slot count, without re-running the model once per
+        // candidate bound - the bound sweep is the decisive open question and 64 slots
+        // cannot even be run on this host.
+        ("CAMELID_GEMMA4_ROUTE_TRACE", "1"),
     ]
     .into_iter()
     .map(|(key, value)| (key.to_string(), value.to_string()))
@@ -3614,13 +3671,13 @@ fn validate_exact_target_physical_slot_budget(
     snapshot: &camelid::gemma4_runtime::Gemma4RoutedExpertResidencySnapshot,
 ) -> Result<(), String> {
     const ALLOCATED_SLOTS_PER_LAYER: u64 = 88;
-    const PHYSICAL_SLOTS_PER_LAYER: u64 = 32;
+    const PHYSICAL_SLOTS_PER_LAYER: u64 = 56;
     if snapshot.per_layer.iter().any(|layer| {
         layer.base_slot_capacity != ALLOCATED_SLOTS_PER_LAYER
             || layer.physical_base_slot_budget != PHYSICAL_SLOTS_PER_LAYER
     }) {
         return Err(
-            "target routed-expert receipt did not preserve 88 allocated / 32 table-bound slots per layer"
+            "target routed-expert receipt did not preserve 88 allocated / 56 table-bound slots per layer"
                 .into(),
         );
     }
@@ -4154,6 +4211,22 @@ impl ExperimentReport {
             .runs
             .iter()
             .any(|run| matches!(run.lane, Lane::NgramAssistantIdle | Lane::Mtp));
+        // `mmap` rounds a mapping up to a whole page, so a CORRECT mapping of a
+        // file whose length is not page-aligned is legitimately larger than the
+        // file. The official assistant is 839,427,840 B = 51,234.61 pages, so its
+        // mapping is 839,434,240 B — 6,400 B more. Comparing `mapped_bytes`
+        // directly against `file_bytes` therefore failed closed on every run that
+        // actually loaded the assistant; it stayed latent only because no lane
+        // that loads the assistant had ever completed before 2026-08-21.
+        let page_size = {
+            let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            if raw > 0 { raw as u64 } else { 16_384 }
+        };
+        let mapped_upper_bound = self
+            .assistant_memory
+            .file_bytes
+            .div_ceil(page_size)
+            .saturating_mul(page_size);
         if assistant_memory_required
             && (self.assistant_memory.file_bytes == 0
                 || self.assistant_memory.model_bytes == 0
@@ -4161,7 +4234,7 @@ impl ExperimentReport {
                 || self.assistant_memory.resident_bytes == 0
                 || self.assistant_memory.file_bytes != self.pairing.assistant_staged_model_bytes
                 || self.assistant_memory.model_bytes > self.assistant_memory.file_bytes
-                || self.assistant_memory.mapped_bytes > self.assistant_memory.file_bytes
+                || self.assistant_memory.mapped_bytes > mapped_upper_bound
                 || self.assistant_memory.resident_bytes > self.assistant_memory.mapped_bytes)
         {
             return Err("assistant memory accounting is incomplete or inconsistent".to_string());
@@ -5746,16 +5819,34 @@ fn execute_lane_child(request: &ChildLaneRequest) -> Result<ChildLaneResult, Str
     // `TargetRuntimeConfig::validate` has already pinned this exact positive
     // opt-in. Reuse it for GhostFile's descriptor-local F_NOCACHE mode so
     // routed demand reads cannot accumulate duplicate cghost source pages.
-    let demand_load_only = request
+    let _demand_load_only = request
         .target_runtime
         .environment
         .get("CAMELID_GEMMA4_GHOST_METAL_DEMAND_LOAD_ONLY")
         .is_some_and(|value| value == "1");
+    // `load_ghost_moe`'s 4th parameter is `evict_page_cache`, NOT the demand-load
+    // policy: it sets F_NOCACHE on the .cghost and drops the mmap, so EVERY routed
+    // expert pread bypasses the OS page cache. Passing `demand_load_only` here
+    // conflated two unrelated policies - "do not prewarm expert slots at load"
+    // with "never let the OS cache expert bytes".
+    //
+    // MEASURED 2026-08-21: expert reads ran at 1.87 GB/s with zero reuse benefit,
+    // 93.8 MB of expert traffic per emitted token, and disk was 55.7% of the round
+    // wall. The page cache is reclaimable (it counts as `inactive`, i.e. as
+    // watchdog headroom). MEASURED 2026-08-21 on this 16 GiB host: allowing the
+    // page cache did NOT help - effective read bandwidth stayed at 1.52-1.87 GB/s,
+    // per-round bytes rose, and MTP throughput fell 12.31 -> 10.88 tok/s, because
+    // a 10.60 GiB hot expert working set cannot be cached alongside 5.26 GiB of
+    // wired slots plus the common core; the extra pressure costs more than the
+    // reuse wins. So F_NOCACHE stays ON here - but for the MEASURED reason, not
+    // as a side effect of the demand-load policy. Revisit on a >=24 GiB host,
+    // where the page cache is exactly what makes expert streaming scale.
+    let evict_page_cache = true;
     let runtime = camelid::gemma4_runtime::Gemma4Runtime::load_ghost_moe(
         &request.target_runtime.runtime_gguf_path,
         &request.target_runtime.cghost_path,
         request.target_runtime.expert_cache_mib,
-        demand_load_only,
+        evict_page_cache,
     )
     .map_err(|error| format!("load internal target pair: {error}"))?;
     let baseline = capture_memory_snapshot(&format!("{}:pre_assistant", request.run_id), 0)?;
@@ -6954,7 +7045,7 @@ mod pure_tests {
         );
         assert_eq!(
             config.environment["CAMELID_GEMMA4_GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER"],
-            "32"
+            "56"
         );
         assert_eq!(
             config.environment["CAMELID_GEMMA4_GHOST_METAL_HEAD_RESIDENT"],

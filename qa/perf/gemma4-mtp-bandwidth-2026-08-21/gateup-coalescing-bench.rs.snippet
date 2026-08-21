@@ -1,0 +1,115 @@
+// Paste into the `mod tests` block of src/metal.rs to re-run.
+// NOTE: this changes METAL_SOURCE and therefore the admission-pinned
+// metal_rs_source_sha256 -- re-run admission (~4 s) or revert before a pilot.
+    /// Coalescing microbenchmark for the GateUp access pattern. MEASURED
+    /// 2026-08-21: `gateup` is ~57% of chained-round GPU time, and the argbuf
+    /// kernel maps `row = b*32 + lane` against a 1584 B row stride
+    /// (spec50_moe_argbuf.rs:88), so the 32 lanes of a simdgroup touch 32
+    /// different cache lines on every load. This isolates that one variable:
+    /// both kernels read exactly the same bytes and do exactly the same work;
+    /// only the address mapping differs. Run with
+    ///   CAMELID_METAL_COALESCE_BENCH=1 cargo test --release metal_gateup_coalescing_bench -- --ignored --nocapture
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "microbenchmark; opt in with CAMELID_METAL_COALESCE_BENCH=1"]
+    fn metal_gateup_coalescing_bench() {
+        use metal::{MTLResourceOptions, MTLSize};
+        if std::env::var("CAMELID_METAL_COALESCE_BENCH").as_deref() != Ok("1") {
+            eprintln!("SKIP: set CAMELID_METAL_COALESCE_BENCH=1");
+            return;
+        }
+        let Some(k) = super::metal_linear_kernel() else {
+            eprintln!("SKIP: no Metal device");
+            return;
+        };
+        const ROWS: u64 = 704;      // G4Q4_FF
+        const BLOCKS: u64 = 88;     // G4Q4_GU_BLOCKS
+        const WIRE: u64 = 18;       // G4Q4_WIRE
+        const ROW_BYTES: u64 = BLOCKS * WIRE;      // 1584
+        const HALF: u64 = ROWS * ROW_BYTES;        // 1,115,136
+        const EXPERTS: u64 = 56;                   // one layer's slot budget
+        let bytes = HALF * EXPERTS;
+
+        let src = r#"
+#include <metal_stdlib>
+using namespace metal;
+inline int blk_sum(device const uchar* blk) {
+    device const packed_uchar4* p = reinterpret_cast<device const packed_uchar4*>(blk + 2);
+    uchar4 a = uchar4(p[0]); uchar4 b = uchar4(p[1]);
+    uchar4 c = uchar4(p[2]); uchar4 d = uchar4(p[3]);
+    return int(a.x)+int(a.y)+int(a.z)+int(a.w)+int(b.x)+int(b.y)+int(b.z)+int(b.w)
+         + int(c.x)+int(c.y)+int(c.z)+int(c.w)+int(d.x)+int(d.y)+int(d.z)+int(d.w);
+}
+kernel void bench_strided(device const uchar* w [[buffer(0)]],
+                          device int* out [[buffer(1)]],
+                          uint group [[threadgroup_position_in_grid]],
+                          uint lane [[thread_index_in_threadgroup]]) {
+    const uint b = group % 22u;
+    const uint e = group / 22u;
+    device const uchar* base = w + (ulong)e * 1115136ul;
+    const uint row = b * 32u + lane;                       // rows 1584 B apart
+    device const uchar* rp = base + (ulong)row * 1584ul;
+    int acc = 0;
+    for (uint gb = 0; gb < 88u; ++gb) { acc += blk_sum(rp + (ulong)gb * 18ul); }
+    out[group * 32u + lane] = acc;
+}
+kernel void bench_tiled(device const uchar* w [[buffer(0)]],
+                        device int* out [[buffer(1)]],
+                        uint group [[threadgroup_position_in_grid]],
+                        uint lane [[thread_index_in_threadgroup]]) {
+    const uint b = group % 22u;
+    const uint e = group / 22u;
+    device const uchar* base = w + (ulong)e * 1115136ul;
+    const uint row = b * 32u + lane;                       // lanes 18 B apart
+    int acc = 0;
+    for (uint gb = 0; gb < 88u; ++gb) {
+        acc += blk_sum(base + (ulong)gb * (704ul * 18ul) + (ulong)row * 18ul);
+    }
+    out[group * 32u + lane] = acc;
+}
+"#;
+        let lib = k
+            .device
+            .new_library_with_source(src, &metal::CompileOptions::new())
+            .expect("bench shader compiles");
+        let groups = 22 * EXPERTS;
+        let wbuf = k.device.new_buffer(bytes, MTLResourceOptions::StorageModeShared);
+        unsafe {
+            let p = wbuf.contents() as *mut u8;
+            for i in 0..bytes as usize { *p.add(i) = (i % 251) as u8; }
+        }
+        let obuf = k.device.new_buffer(groups * 32 * 4, MTLResourceOptions::StorageModeShared);
+
+        let mut results = Vec::new();
+        for name in ["bench_strided", "bench_tiled"] {
+            let f = lib.get_function(name, None).expect("fn");
+            let pipe = k
+                .device
+                .new_compute_pipeline_state_with_function(&f)
+                .expect("pipeline");
+            let mut best = f64::MAX;
+            for _ in 0..12 {
+                let cb = k.queue.new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&pipe);
+                enc.set_buffer(0, Some(&wbuf), 0);
+                enc.set_buffer(1, Some(&obuf), 0);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(groups, 1, 1),
+                    MTLSize::new(32, 1, 1),
+                );
+                enc.end_encoding();
+                let t = std::time::Instant::now();
+                cb.commit();
+                cb.wait_until_completed();
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            let gbs = bytes as f64 / best / 1e9;
+            eprintln!("  {:14} {:7.3} ms   {:6.2} GB/s", name, best * 1000.0, gbs);
+            results.push(gbs);
+        }
+        eprintln!(
+            "\n  MEASURED speedup from contiguous lane access: {:.2}x",
+            results[1] / results[0]
+        );
+    }

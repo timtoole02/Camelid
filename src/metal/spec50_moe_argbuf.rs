@@ -265,14 +265,32 @@ inline float gemma4_q4_expert_argbuf_row_dot(
         const float weight_scale =
             float(*reinterpret_cast<device const half*>(block));
         device const char* x = input_quants + ulong(b) * 32ul;
+        // The 16 nibble bytes start 2 bytes into an 18-byte block, so the run is
+        // only 2-byte aligned: packed_uchar4 (alignment 1) is the legal wide load
+        // here, exactly as the GateUp path above already does. Four of these
+        // replace 16 scalar byte loads per block. `isum` is an INTEGER
+        // accumulator, and integer addition is exact and associative, so the
+        // regrouping is bit-identical; the float terms are untouched.
         int isum = 0;
-        #pragma unroll
-        for (uint j = 0; j < 16; ++j) {
-            const uint packed = uint(block[2 + j]);
-            const int lo = int(packed & 0x0fu) - 8;
-            const int hi = int(packed >> 4) - 8;
-            isum += lo * int(x[j]);
-            isum += hi * int(x[j + 16]);
+        {
+            device const packed_uchar4* p4 =
+                reinterpret_cast<device const packed_uchar4*>(block + 2);
+            const uchar4 w0 = uchar4(p4[0]);
+            const uchar4 w1 = uchar4(p4[1]);
+            const uchar4 w2 = uchar4(p4[2]);
+            const uchar4 w3 = uchar4(p4[3]);
+            const uchar wq[16] = {w0.x, w0.y, w0.z, w0.w,
+                                  w1.x, w1.y, w1.z, w1.w,
+                                  w2.x, w2.y, w2.z, w2.w,
+                                  w3.x, w3.y, w3.z, w3.w};
+            #pragma unroll
+            for (uint j = 0; j < 16; ++j) {
+                const uint packed = uint(wq[j]);
+                const int lo = int(packed & 0x0fu) - 8;
+                const int hi = int(packed >> 4) - 8;
+                isum += lo * int(x[j]);
+                isum += hi * int(x[j + 16]);
+            }
         }
         const float term =
             (float(isum) * weight_scale) * input_scales[b];
@@ -292,8 +310,17 @@ inline float gemma4_q4_expert_argbuf_block_term_simd(
         float(*reinterpret_cast<device const half*>(block));
     device const char* x = input_quants + ulong(b) * 32ul;
     int isum = 0;
+    device const packed_uchar4* p4 =
+        reinterpret_cast<device const packed_uchar4*>(block + 2);
+    const uchar4 w0 = uchar4(p4[0]);
+    const uchar4 w1 = uchar4(p4[1]);
+    const uchar4 w2 = uchar4(p4[2]);
+    const uchar4 w3 = uchar4(p4[3]);
+    const uchar wq[16] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w,
+                          w2.x, w2.y, w2.z, w2.w, w3.x, w3.y, w3.z, w3.w};
+    #pragma unroll
     for (uint j = 0; j < 16; ++j) {
-        const uint packed = uint(block[2 + j]);
+        const uint packed = uint(wq[j]);
         const int lo = int(packed & 0x0fu) - 8;
         const int hi = int(packed >> 4) - 8;
         isum += lo * int(x[j]);
@@ -490,8 +517,20 @@ kernel void gemma4_q4_expert_argbuf_down_reduce_simd(
         device const char* x = activation_quants
             + route * G4Q4_FF + b * 32u;
         int isum = 0;
+        // packed_uchar4 (alignment 1) is the legal wide load for a run that starts
+        // 2 bytes into an 18-byte block; 4 loads replace 16 scalar byte loads.
+        // isum is an INTEGER accumulator, so regrouping is bit-identical.
+        device const packed_uchar4* dp4 =
+            reinterpret_cast<device const packed_uchar4*>(block + 2);
+        const uchar4 d0 = uchar4(dp4[0]);
+        const uchar4 d1 = uchar4(dp4[1]);
+        const uchar4 d2 = uchar4(dp4[2]);
+        const uchar4 d3 = uchar4(dp4[3]);
+        const uchar dq[16] = {d0.x, d0.y, d0.z, d0.w, d1.x, d1.y, d1.z, d1.w,
+                              d2.x, d2.y, d2.z, d2.w, d3.x, d3.y, d3.z, d3.w};
+        #pragma unroll
         for (uint j = 0; j < 16; ++j) {
-            const uint packed = uint(block[2 + j]);
+            const uint packed = uint(dq[j]);
             const int lo = int(packed & 0x0fu) - 8;
             const int hi = int(packed >> 4) - 8;
             isum += lo * int(x[j]);
@@ -545,8 +584,20 @@ kernel void gemma4_q4_expert_argbuf_down_reduce_turbo(
             const float weight_scale =
                 float(*reinterpret_cast<device const half*>(block));
             int isum = 0;
+            // packed_uchar4 (alignment 1) is the legal wide load for a run that starts
+            // 2 bytes into an 18-byte block; 4 loads replace 16 scalar byte loads.
+            // isum is an INTEGER accumulator, so regrouping is bit-identical.
+            device const packed_uchar4* dp4 =
+                reinterpret_cast<device const packed_uchar4*>(block + 2);
+            const uchar4 d0 = uchar4(dp4[0]);
+            const uchar4 d1 = uchar4(dp4[1]);
+            const uchar4 d2 = uchar4(dp4[2]);
+            const uchar4 d3 = uchar4(dp4[3]);
+            const uchar dq[16] = {d0.x, d0.y, d0.z, d0.w, d1.x, d1.y, d1.z, d1.w,
+                                  d2.x, d2.y, d2.z, d2.w, d3.x, d3.y, d3.z, d3.w};
+            #pragma unroll
             for (uint j = 0; j < 16; ++j) {
-                const uint packed = uint(block[2 + j]);
+                const uint packed = uint(dq[j]);
                 const int lo = int(packed & 0x0fu) - 8;
                 const int hi = int(packed >> 4) - 8;
                 isum += lo * int(x[j]);
