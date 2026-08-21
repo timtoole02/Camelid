@@ -1401,16 +1401,17 @@ pub(crate) fn spec50_router_kernels() -> Option<&'static Spec50RouterKernels> {
                     eprintln!("[metal] SPEC50_ROUTER_SHADER (strict) compile failed: {err}")
                 })
                 .ok()?;
-            let pipeline_from = |lib: &metal::Library, name: &str| -> Option<ComputePipelineState> {
-                let function = lib
-                    .get_function(name, None)
-                    .map_err(|err| eprintln!("[metal] spec50 function {name} missing: {err}"))
-                    .ok()?;
-                device
-                    .new_compute_pipeline_state_with_function(&function)
-                    .map_err(|err| eprintln!("[metal] spec50 pipeline {name} failed: {err}"))
-                    .ok()
-            };
+            let pipeline_from =
+                |lib: &metal::Library, name: &str| -> Option<ComputePipelineState> {
+                    let function = lib
+                        .get_function(name, None)
+                        .map_err(|err| eprintln!("[metal] spec50 function {name} missing: {err}"))
+                        .ok()?;
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .map_err(|err| eprintln!("[metal] spec50 pipeline {name} failed: {err}"))
+                        .ok()
+                };
             let pipeline = |name: &str| pipeline_from(&library, name);
             let strict = |name: &str| pipeline_from(&strict_library, name);
             Some(Spec50RouterKernels {
@@ -1849,7 +1850,16 @@ mod tests {
         for t in 0..8 {
             let tok_buf = buf_f32(&fx.device, &fx.input[t * HIDDEN..(t + 1) * HIDDEN]);
             run(&fx.queue, |e| {
-                encode_new(e, kernels, &tok_buf, &fx, &fx.weights_buf, &fx.new_out, 1, 0);
+                encode_new(
+                    e,
+                    kernels,
+                    &tok_buf,
+                    &fx,
+                    &fx.weights_buf,
+                    &fx.new_out,
+                    1,
+                    0,
+                );
             });
             alone[t * EXPERTS..(t + 1) * EXPERTS].copy_from_slice(&read_f32(&fx.new_out, EXPERTS));
         }
@@ -1997,9 +2007,7 @@ mod tests {
                     }
                 }
             }
-            eprintln!(
-                "| {name} | {mismatches}/{total} | {max_ulp} | {max_abs:.3e} |"
-            );
+            eprintln!("| {name} | {mismatches}/{total} | {max_ulp} | {max_abs:.3e} |");
             if variant == SPEC50_ROUTER_DEFAULT_VARIANT {
                 exact_mismatches = mismatches;
             }

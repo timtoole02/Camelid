@@ -1090,6 +1090,13 @@ pub struct GhostFile {
 }
 
 impl GhostFile {
+    /// Retained file-backed payload mapping for non-faulting load-probe
+    /// residency snapshots. Strict no-page-cache mode intentionally has none.
+    #[cfg(unix)]
+    pub(crate) fn wire_mapping(&self) -> Option<&Arc<GgufWireMmap>> {
+        self.mmap.as_ref()
+    }
+
     /// Open with optional strict-ceiling mode: `evict_page_cache` sets `F_NOCACHE` on the
     /// handle (macOS) so streamed reads bypass the page cache entirely. For models that fit
     /// in RAM the cache is a free win (leave this off); for the over-RAM models ghost mode
@@ -1439,6 +1446,103 @@ impl GhostFile {
             }
         }
         Ok(())
+    }
+
+    /// Return one layer's canonical routed-expert records as a single slice of
+    /// the read-only `.cghost` mapping.
+    ///
+    /// The v2 writer aligns every expert group to [`CGHOST_ALIGN`].  For the
+    /// Gemma 4 26B Q4_0 geometry, rounding the canonical record length up to
+    /// that alignment is also the Metal expert-slot stride.  Consequently the
+    /// file is already a 128-slot Metal slab: expert `e` starts at
+    /// `layer_start + e * expected_stride`, with no repack or copy required.
+    ///
+    /// Keep this admission deliberately strict.  A malformed/foreign layout
+    /// falls back to the established writable slot cache rather than exposing
+    /// bytes under the fixed-stride GPU interpretation.  Payload identity is
+    /// checked here because the no-copy GPU path does not pass through
+    /// [`Self::read_moe_expert_into`].
+    #[cfg(target_os = "macos")]
+    pub(crate) fn mapped_moe_layer_slab(
+        &self,
+        layer_idx: usize,
+        expert_count: usize,
+        expected_record_bytes: usize,
+        expected_stride: usize,
+    ) -> Result<Option<(Arc<GgufWireMmap>, u64, usize)>> {
+        let Some(mmap) = self.mmap.as_ref() else {
+            return Ok(None);
+        };
+        if expert_count == 0
+            || expected_record_bytes == 0
+            || expected_stride < expected_record_bytes
+        {
+            return Err(invalid(
+                "mapped MoE layer slab requires non-zero canonical geometry".to_string(),
+            ));
+        }
+
+        let mut layer_start = None;
+        let mut layer_end = 0u64;
+        for expert_idx in 0..expert_count {
+            let (group, start, len) = self.checked_moe_expert_span(layer_idx, expert_idx)?;
+            if len != expected_record_bytes {
+                return Err(invalid(format!(
+                    "group {} canonical record length {len} does not match mapped-slab length {expected_record_bytes}",
+                    group.id
+                )));
+            }
+            let base = *layer_start.get_or_insert(start);
+            let expected_start = base
+                .checked_add(
+                    (expert_idx as u64)
+                        .checked_mul(expected_stride as u64)
+                        .ok_or_else(|| invalid("mapped MoE expert stride overflows".to_string()))?,
+                )
+                .ok_or_else(|| invalid("mapped MoE layer offset overflows".to_string()))?;
+            if start != expected_start {
+                return Err(invalid(format!(
+                    "group {} starts at {start}, expected fixed-stride offset {expected_start}",
+                    group.id
+                )));
+            }
+            let payload = mmap.bytes(start, len)?;
+            let (_, access) = self.moe_group_access(layer_idx, expert_idx)?;
+            self.validate_moe_expert_payload_identity(group, access, start, payload)?;
+            layer_end = start
+                .checked_add(len as u64)
+                .ok_or_else(|| invalid("mapped MoE layer end overflows".to_string()))?;
+        }
+
+        let start = layer_start.expect("expert_count was checked non-zero");
+        if !(start as usize).is_multiple_of(crate::wire_mmap::page_size()) {
+            return Err(invalid(format!(
+                "mapped MoE layer {layer_idx} starts at non-page-aligned offset {start}"
+            )));
+        }
+        let record_span = layer_end
+            .checked_sub(start)
+            .and_then(|len| usize::try_from(len).ok())
+            .ok_or_else(|| invalid("mapped MoE layer span is not representable".to_string()))?;
+        let span = expert_count
+            .checked_mul(expected_stride)
+            .ok_or_else(|| invalid("mapped MoE layer padded span overflows".to_string()))?;
+        if record_span > span || !span.is_multiple_of(crate::wire_mmap::page_size()) {
+            return Err(invalid(format!(
+                "mapped MoE layer {layer_idx} span {span} is not a page-aligned cover of {record_span} record bytes"
+            )));
+        }
+        let start_usize = usize::try_from(start)
+            .map_err(|_| invalid("mapped MoE layer start is not representable".to_string()))?;
+        if start_usize
+            .checked_add(span)
+            .is_none_or(|end| end > mmap.mapped_len())
+        {
+            return Err(invalid(format!(
+                "mapped MoE layer {layer_idx} padded span exceeds the file mapping"
+            )));
+        }
+        Ok(Some((Arc::clone(mmap), start, span)))
     }
 
     /// Borrow one routed expert directly from the read-only file mapping. The

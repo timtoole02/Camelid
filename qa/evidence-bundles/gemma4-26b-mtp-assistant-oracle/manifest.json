@@ -1,0 +1,182 @@
+{
+  "schema_version": 1,
+  "created_utc": "2026-08-20T17:51:42Z",
+  "purpose": "Independent, target-free BF16 forward oracle for the official Gemma 4 26B-A4B QAT MTP assistant.",
+  "scope": {
+    "target_model_loaded": false,
+    "target_inputs": "Deterministic synthetic BF16 tensors generated directly from bit patterns.",
+    "target_scaled_embedding_width": 2816,
+    "target_final_normalized_hidden_width": 2816,
+    "shared_kv_mapping": {
+      "sliding_attention": "logical target layer 28",
+      "full_attention": "logical target layer 29"
+    },
+    "kv_len": 1031,
+    "position_id": 1031,
+    "sliding_window": 1024,
+    "note": "The seven positions beyond the 1024-token window deliberately distinguish sliding from full attention. State mapping: shared target KV contains the processed prefix at positions [0, 1031); target_final_normalized_hidden is row 1030; target_scaled_embedding is the unforwarded authoritative bonus token at position 1031; the assistant query and every recurrent proposal use position_id 1031.",
+    "position_contract_authority": {
+      "transformers": {
+        "revision": "0c92811846095910816a87aca50050d10c545270",
+        "source": "src/transformers/generation/candidate_generator.py",
+        "lines": "1366-1389",
+        "mapping": "current_length includes the unforwarded bonus token; shared_kv_states are the processed target prefix; position_ids is input_ids.shape[1]-1, hence position_id equals shared-KV logical length"
+      },
+      "llama_cpp": {
+        "revision": "521a64cd01979bb5b1a466152c576a9d809b068d",
+        "source": "common/speculative.cpp",
+        "lines": "1301-1303, 1574-1575, 1587-1590, 1667-1671",
+        "mapping": "pair (h_p, x_{p+1}) runs at p+1; dp.n_past is the first position beyond target prefix KV and is reused for every Gemma shared-KV assistant proposal"
+      }
+    }
+  },
+  "assistant_model": {
+    "repository": "google/gemma-4-26B-A4B-it-qat-q4_0-unquantized-assistant",
+    "revision": "9537141506fe8875b3ed45b264af13580cb29166",
+    "class": "Gemma4AssistantForCausalLM",
+    "dtype": "bfloat16",
+    "model_safetensors_bytes": 839427840,
+    "model_safetensors_sha256": "c082cc581c3ec90d70285c1a41c81544ff56cbc96650f16c900a280940655801",
+    "config_sha256": "23d2bc4a8920f24c23653ff6871437bbd95e52527bf50007aaad05b0b6cab510",
+    "generation_config_sha256": "fb53f4c64e58896a63472e8eb304397db4a39453e1da0f5d57625ec5a8c1050e",
+    "loaded_parameter_and_buffer_bytes": 839425546,
+    "assistant_hidden_size": 1024,
+    "backbone_hidden_size": 2816,
+    "layer_types": [
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention"
+    ]
+  },
+  "transformers_authority": {
+    "repository": "https://github.com/huggingface/transformers.git",
+    "revision": "0c92811846095910816a87aca50050d10c545270",
+    "version": "5.16.0.dev0",
+    "locally_built_wheel_sha256": "efe7b47e8016e734cf0e0aa4c0a4c614dabc407cd6f901d4cec7c0bf618c1d1d",
+    "source_sha256": {
+      "src/transformers/models/gemma4_assistant/modeling_gemma4_assistant.py": "a77e67673ce7d2248294e361c3c074c29d8d6a092655d7b27b95fc9777a2d0d1",
+      "src/transformers/models/gemma4/modeling_gemma4.py": "51d9c119e7baa2ef342c3d7c6377d4b175930d00834e87ba59a123e68e4ac07b",
+      "src/transformers/generation/candidate_generator.py": "f31975e27814f03f927359b2a2363932693b05c8c0d04d9a282801464f075c1b"
+    }
+  },
+  "runtime": {
+    "platform": "macOS-26.5-arm64-arm-64bit-Mach-O",
+    "macos_build": "25F5058e",
+    "device": "cpu",
+    "attention_implementation": "eager",
+    "threads": 1,
+    "deterministic_algorithms": true,
+    "python": {
+      "version": "3.13.2",
+      "executable_sha256": "42f792544842512d02eb8a95a6009062591476558f09f07553c138661a0bca8e"
+    },
+    "packages": {
+      "torch": {
+        "version": "2.13.0",
+        "wheel": "torch-2.13.0-cp313-cp313-macosx_14_0_arm64.whl",
+        "sha256": "33449899ce5496c1b84b4853179d94fd102028ae1407314d9fb956bb79e70d09"
+      },
+      "numpy": {
+        "version": "2.5.2",
+        "wheel": "numpy-2.5.2-cp313-cp313-macosx_14_0_arm64.whl",
+        "sha256": "29d81e97f668489cba8ebfd796b9bdd453525d35dd9e162e2daec94bf3fc7740"
+      },
+      "safetensors": {
+        "version": "0.8.0",
+        "wheel": "safetensors-0.8.0-cp310-abi3-macosx_11_0_arm64.whl",
+        "sha256": "c80201d22cbf405b80647a60ada77bba06c8fba2da2743ba1e89cdcc39a81f25"
+      },
+      "huggingface_hub": {
+        "version": "1.28.0",
+        "wheel": "huggingface_hub-1.28.0-py3-none-any.whl",
+        "sha256": "58a8bacb03072edfc38067065e9dc24bbb34805410fcd36a1632de0b329660bb"
+      },
+      "tokenizers": {
+        "version": "0.23.1",
+        "wheel": "tokenizers-0.23.1-cp310-abi3-macosx_11_0_arm64.whl",
+        "sha256": "e0948bbb1ac1d7cdfc9fb6d62c596e3b7550036ad60ecd654a66ad273326324e"
+      }
+    }
+  },
+  "input_tensor_sha256": {
+    "target_scaled_embedding": "ca831f07035343e4fb1a58df0e45d983e23d98f54add6db99b408406ee0f8785",
+    "target_final_normalized_hidden": "20fda74951a15e05bfa709339fc45993e5acbc8375ceed4eed958f3a3e12ea20",
+    "sliding_key_layer28": "98052b8d5540fd67aabfc19774b89a63b2c0a255a4593af81da13eb4b8c572de",
+    "sliding_value_layer28": "c5adb4a90114b521458f9102a4a4233494a3ad943474101af61fa287062b44f6",
+    "full_key_layer29": "4edc71fa48a2725d0e76da0af9a8bd172029423834ed9b37db1cb95ff8c796cf",
+    "full_value_layer29": "c6638910629d3723f0c898328897c7e7e5948cead9f85d1af7d0872496a3b2d3"
+  },
+  "oracle_output": {
+    "top1_token_id": 53965,
+    "top1_logit_bf16_bits": 16804,
+    "top1_logit_f32": 20.5,
+    "top16_token_ids": [
+      53965,
+      1884,
+      237737,
+      123597,
+      112606,
+      140630,
+      51521,
+      6062,
+      104388,
+      238698,
+      22242,
+      91715,
+      16984,
+      37399,
+      149840,
+      8107
+    ],
+    "top16_logits_bf16_bits": [
+      16804,
+      16792,
+      16791,
+      16790,
+      16786,
+      16786,
+      16785,
+      16785,
+      16784,
+      16783,
+      16783,
+      16780,
+      16779,
+      16778,
+      16778,
+      16776
+    ],
+    "logits_bf16_sha256": "f326d10112dda57ae8757b2b326954390ef9e2a8a16539f0a2f9ff2729ed8f5b",
+    "recurrent_hidden_bf16_sha256": "e0e049e9660d6caa0a7536f4f7123f250b3546cdaef7197369c16b0bd143dce3"
+  },
+  "fixture": {
+    "file": "assistant_forward_bf16_cpu.npz",
+    "bytes": 430097,
+    "sha256": "d934a00ef4ea6bfb7188ec4c2e057ea1324687932d8d7534b4157b1fbb2ccbe4",
+    "generator": "generate_oracle.py",
+    "generator_sha256": "2110dae09f11b871a25bfab475af46b4794a13541dd97a837ef034462e58aee4",
+    "payload": {
+      "target_scaled_embedding_bf16_le": [2816],
+      "target_final_normalized_hidden_bf16_le": [2816],
+      "logits_bf16_le": [262144],
+      "recurrent_hidden_bf16_le": [2816],
+      "top16_token_ids": [16],
+      "top16_logits_bf16_le": [16]
+    },
+    "shared_kv_storage": "Not embedded; exact direct-BF16 generator, shapes, seeds, and hashes are pinned by generate_oracle.py and this manifest."
+  },
+  "evidence": {
+    "fresh_process_runs": 2,
+    "fixture_files_bitwise_identical": true,
+    "maximum_rss_bytes_observed": 1303166976,
+    "rss_limit_bytes": 3000000000,
+    "swap_outs": 0,
+    "first_forward_seconds": 0.098263666001003,
+    "second_forward_seconds": 0.07130895799855352
+  },
+  "reproduction": {
+    "command": "HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 OMP_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 python generate_oracle.py --model-dir /path/to/pinned-assistant --output assistant_forward_bf16_cpu.npz",
+    "expected_fixture_sha256": "d934a00ef4ea6bfb7188ec4c2e057ea1324687932d8d7534b4157b1fbb2ccbe4"
+  }
+}

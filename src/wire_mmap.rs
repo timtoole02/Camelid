@@ -37,6 +37,134 @@ pub fn page_size() -> usize {
     info.dwPageSize as usize
 }
 
+/// Non-faulting physical-residency snapshot for a file-backed mapping.
+/// `mincore` reports page-cache residency without reading any mapped byte.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WireMmapResidencySnapshot {
+    pub(crate) page_size_bytes: usize,
+    pub(crate) mapped_bytes: usize,
+    pub(crate) total_pages: usize,
+    pub(crate) resident_pages: usize,
+    pub(crate) resident_bytes: usize,
+}
+
+/// One validated page-aligned window inside a wire mapping. This geometry is
+/// shared by non-faulting residency sampling and targeted cache-discard
+/// advisories, so callers cannot accidentally round the end past the mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WireMmapAlignedRange {
+    pub(crate) aligned_offset: usize,
+    pub(crate) mapped_bytes: usize,
+}
+
+/// Result of one targeted `MADV_DONTNEED` advisory. The before/after snapshots
+/// are both collected with `mincore`, which does not fault the advised pages.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WireMmapDiscardSnapshot {
+    pub(crate) range: WireMmapAlignedRange,
+    pub(crate) resident_before_bytes: usize,
+    pub(crate) resident_after_bytes: usize,
+    /// Resident bytes that `mincore` confirmed became nonresident across this
+    /// advisory. This is an observed transition, not the requested capacity.
+    pub(crate) confirmed_discarded_bytes: usize,
+}
+
+/// Round an exact byte range outwards to system-page boundaries while proving
+/// that the resulting window remains inside `mapped_len`.
+pub(crate) fn aligned_page_range(
+    offset: u64,
+    len: usize,
+    mapped_len: usize,
+    page_size_bytes: usize,
+) -> Result<WireMmapAlignedRange> {
+    if len == 0
+        || mapped_len == 0
+        || page_size_bytes == 0
+        || !mapped_len.is_multiple_of(page_size_bytes)
+    {
+        return Err(BackendError::InvalidTensorData(format!(
+            "invalid wire page-range geometry: offset={offset} len={len} mapped_len={mapped_len} page_size={page_size_bytes}"
+        )));
+    }
+    let offset = usize::try_from(offset).map_err(|_| {
+        BackendError::InvalidTensorData(format!(
+            "wire page-range offset does not fit usize: {offset}"
+        ))
+    })?;
+    let end = offset.checked_add(len).ok_or_else(|| {
+        BackendError::InvalidTensorData(format!(
+            "wire page-range overflow at offset={offset} len={len}"
+        ))
+    })?;
+    if end > mapped_len {
+        return Err(BackendError::InvalidTensorData(format!(
+            "wire page range {offset}..{end} exceeds mapped length {mapped_len}"
+        )));
+    }
+    let aligned_offset = offset - (offset % page_size_bytes);
+    let aligned_end = end
+        .div_ceil(page_size_bytes)
+        .checked_mul(page_size_bytes)
+        .ok_or_else(|| {
+            BackendError::InvalidTensorData(format!(
+                "wire page-range aligned end overflowed for offset={offset} len={len} page_size={page_size_bytes}"
+            ))
+        })?;
+    if aligned_end > mapped_len {
+        return Err(BackendError::InvalidTensorData(format!(
+            "wire aligned page range {aligned_offset}..{aligned_end} exceeds mapped length {mapped_len}"
+        )));
+    }
+    Ok(WireMmapAlignedRange {
+        aligned_offset,
+        mapped_bytes: aligned_end - aligned_offset,
+    })
+}
+
+/// Page-align and merge exact byte ranges. Overlapping and directly adjacent
+/// windows coalesce, preventing a final cleanup pass from advising shared
+/// tensor-boundary pages more than once.
+pub(crate) fn merge_aligned_page_ranges(
+    ranges: &[(u64, usize)],
+    mapped_len: usize,
+    page_size_bytes: usize,
+) -> Result<Vec<WireMmapAlignedRange>> {
+    let mut aligned = ranges
+        .iter()
+        .map(|&(offset, len)| aligned_page_range(offset, len, mapped_len, page_size_bytes))
+        .collect::<Result<Vec<_>>>()?;
+    aligned.sort_unstable_by_key(|range| range.aligned_offset);
+    let mut merged: Vec<WireMmapAlignedRange> = Vec::with_capacity(aligned.len());
+    for range in aligned {
+        let range_end = range
+            .aligned_offset
+            .checked_add(range.mapped_bytes)
+            .ok_or_else(|| {
+                BackendError::InvalidTensorData(
+                    "wire aligned page range overflowed while merging".into(),
+                )
+            })?;
+        if let Some(previous) = merged.last_mut() {
+            let previous_end = previous
+                .aligned_offset
+                .checked_add(previous.mapped_bytes)
+                .ok_or_else(|| {
+                    BackendError::InvalidTensorData(
+                        "wire previous aligned page range overflowed while merging".into(),
+                    )
+                })?;
+            if range.aligned_offset <= previous_end {
+                previous.mapped_bytes = previous_end.max(range_end) - previous.aligned_offset;
+                continue;
+            }
+        }
+        merged.push(range);
+    }
+    Ok(merged)
+}
+
 /// A read-only, shared, page-cache-backed mapping of an entire GGUF file.
 ///
 /// Unix maps the file with `mmap(PROT_READ, MAP_SHARED)`; Windows maps it with
@@ -125,6 +253,204 @@ impl GgufWireMmap {
             file_len,
             path: path.to_path_buf(),
         }))
+    }
+
+    /// Snapshot the mapping's page-cache residency without faulting pages in.
+    pub(crate) fn residency_snapshot(&self) -> Result<WireMmapResidencySnapshot> {
+        let page_size_bytes = page_size();
+        if page_size_bytes == 0 || !self.mapped_len.is_multiple_of(page_size_bytes) {
+            return Err(BackendError::InvalidTensorData(format!(
+                "wire mmap {} has invalid page geometry: mapped_len={} page_size={page_size_bytes}",
+                self.path.display(),
+                self.mapped_len
+            )));
+        }
+        self.residency_snapshot_range(0, self.mapped_len)
+    }
+
+    /// Snapshot one page-aligned subrange without reading it. This is used to
+    /// distinguish tied-head residency from unrelated pages in the same GGUF.
+    pub(crate) fn residency_snapshot_range(
+        &self,
+        aligned_offset: usize,
+        mapped_bytes: usize,
+    ) -> Result<WireMmapResidencySnapshot> {
+        let page_size_bytes = page_size();
+        if page_size_bytes == 0
+            || mapped_bytes == 0
+            || !aligned_offset.is_multiple_of(page_size_bytes)
+            || !mapped_bytes.is_multiple_of(page_size_bytes)
+            || aligned_offset
+                .checked_add(mapped_bytes)
+                .is_none_or(|end| end > self.mapped_len)
+        {
+            return Err(BackendError::InvalidTensorData(format!(
+                "wire mmap {} has invalid residency range: offset={aligned_offset} len={mapped_bytes} mapped_len={} page_size={page_size_bytes}",
+                self.path.display(),
+                self.mapped_len
+            )));
+        }
+        let total_pages = mapped_bytes / page_size_bytes;
+        let mut status = vec![0u8; total_pages];
+        // SAFETY: the queried range is this live mapping and `status` contains
+        // exactly one output byte per mapped page. mincore does not fault pages.
+        let result = unsafe {
+            libc::mincore(
+                self.ptr
+                    .add(aligned_offset)
+                    .cast_mut()
+                    .cast::<libc::c_void>(),
+                mapped_bytes,
+                status.as_mut_ptr().cast::<libc::c_char>(),
+            )
+        };
+        if result != 0 {
+            return Err(BackendError::InvalidTensorData(format!(
+                "mincore failed for wire mmap {}: {}",
+                self.path.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+        let resident_pages = status.iter().filter(|entry| **entry & 1 != 0).count();
+        Ok(WireMmapResidencySnapshot {
+            page_size_bytes,
+            mapped_bytes,
+            total_pages,
+            resident_pages,
+            resident_bytes: resident_pages * page_size_bytes,
+        })
+    }
+
+    /// Synchronously make every page in one aligned file-backed window
+    /// required by issuing one volatile read per page. No readahead advisory or
+    /// anonymous copy is involved.
+    pub(crate) fn fault_pages_range(
+        &self,
+        aligned_offset: usize,
+        mapped_bytes: usize,
+    ) -> Result<()> {
+        // Validate the page geometry through the non-faulting query first.
+        let snapshot = self.residency_snapshot_range(aligned_offset, mapped_bytes)?;
+        // Keep the explicit page-stride walk bounded to this window instead of
+        // asking the kernel's sequential-fault heuristic to read ahead into an
+        // adjacent tensor.
+        let advise = unsafe {
+            libc::madvise(
+                self.ptr
+                    .add(aligned_offset)
+                    .cast_mut()
+                    .cast::<libc::c_void>(),
+                mapped_bytes,
+                libc::MADV_RANDOM,
+            )
+        };
+        if advise != 0 {
+            return Err(BackendError::InvalidTensorData(format!(
+                "MADV_RANDOM failed for wire mmap {} range {aligned_offset}..{}: {}",
+                self.path.display(),
+                aligned_offset + mapped_bytes,
+                std::io::Error::last_os_error()
+            )));
+        }
+        let mut observed = 0u8;
+        for relative in (0..mapped_bytes).step_by(snapshot.page_size_bytes) {
+            // SAFETY: range validation above proved every page-stride address
+            // lies in this live immutable mapping. Volatile prevents elision.
+            observed ^= unsafe { std::ptr::read_volatile(self.ptr.add(aligned_offset + relative)) };
+        }
+        std::hint::black_box(observed);
+        Ok(())
+    }
+
+    /// Advise that one exact immutable file range is no longer needed, rounded
+    /// outwards to page boundaries. `MADV_DONTNEED` never changes file contents;
+    /// a later CPU or GPU access simply faults the clean page back from disk.
+    /// The call is advisory, so before/after `mincore` facts are returned and a
+    /// higher-level load gate can fail closed if the kernel retained the pages.
+    pub(crate) fn advise_dontneed_range(
+        &self,
+        offset: u64,
+        len: usize,
+    ) -> Result<WireMmapDiscardSnapshot> {
+        let range = aligned_page_range(offset, len, self.mapped_len, page_size())?;
+        self.advise_dontneed_aligned_range(range)
+    }
+
+    /// Aligned sibling used by a merged final cleanup pass.
+    pub(crate) fn advise_dontneed_aligned_range(
+        &self,
+        range: WireMmapAlignedRange,
+    ) -> Result<WireMmapDiscardSnapshot> {
+        let before = self.residency_snapshot_range(range.aligned_offset, range.mapped_bytes)?;
+        // SAFETY: `residency_snapshot_range` validated that this page-aligned
+        // range lies wholly inside the live immutable mapping.
+        let advise = unsafe {
+            libc::madvise(
+                self.ptr
+                    .add(range.aligned_offset)
+                    .cast_mut()
+                    .cast::<libc::c_void>(),
+                range.mapped_bytes,
+                libc::MADV_DONTNEED,
+            )
+        };
+        if advise != 0 {
+            return Err(BackendError::InvalidTensorData(format!(
+                "MADV_DONTNEED failed for wire mmap {} range {}..{}: {}",
+                self.path.display(),
+                range.aligned_offset,
+                range.aligned_offset + range.mapped_bytes,
+                std::io::Error::last_os_error()
+            )));
+        }
+        let after = self.residency_snapshot_range(range.aligned_offset, range.mapped_bytes)?;
+        Ok(WireMmapDiscardSnapshot {
+            range,
+            resident_before_bytes: before.resident_bytes,
+            resident_after_bytes: after.resident_bytes,
+            confirmed_discarded_bytes: before.resident_bytes.saturating_sub(after.resident_bytes),
+        })
+    }
+
+    /// Invalidate cached data for one aligned range of this immutable,
+    /// read-only `MAP_SHARED` mapping while leaving the mapping live. Darwin's
+    /// `MS_INVALIDATE` is stronger than the advisory `MADV_DONTNEED`; callers
+    /// still receive before/after `mincore` facts so they can fail closed if
+    /// the kernel retained any clean source pages.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn invalidate_cached_aligned_range(
+        &self,
+        range: WireMmapAlignedRange,
+    ) -> Result<WireMmapDiscardSnapshot> {
+        let before = self.residency_snapshot_range(range.aligned_offset, range.mapped_bytes)?;
+        // SAFETY: `residency_snapshot_range` validated that this page-aligned
+        // range lies wholly inside the live immutable MAP_SHARED mapping.
+        let invalidate = unsafe {
+            libc::msync(
+                self.ptr
+                    .add(range.aligned_offset)
+                    .cast_mut()
+                    .cast::<libc::c_void>(),
+                range.mapped_bytes,
+                libc::MS_INVALIDATE,
+            )
+        };
+        if invalidate != 0 {
+            return Err(BackendError::InvalidTensorData(format!(
+                "MS_INVALIDATE failed for wire mmap {} range {}..{}: {}",
+                self.path.display(),
+                range.aligned_offset,
+                range.aligned_offset + range.mapped_bytes,
+                std::io::Error::last_os_error()
+            )));
+        }
+        let after = self.residency_snapshot_range(range.aligned_offset, range.mapped_bytes)?;
+        Ok(WireMmapDiscardSnapshot {
+            range,
+            resident_before_bytes: before.resident_bytes,
+            resident_after_bytes: after.resident_bytes,
+            confirmed_discarded_bytes: before.resident_bytes.saturating_sub(after.resident_bytes),
+        })
     }
 
     /// Hint the kernel to read the file ahead sequentially (weight order is
@@ -652,6 +978,61 @@ mod tests {
         assert!(mapping.bytes(payload.len() as u64 - 10, 11).is_err());
         assert_eq!(mapping.base_ptr() as usize % page_size(), 0);
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn aligned_page_range_rounds_outward_without_crossing_mapping() {
+        let page = 16_384;
+        let mapped_len = page * 10;
+        assert_eq!(
+            aligned_page_range((page + 7136) as u64, page * 2, mapped_len, page).unwrap(),
+            WireMmapAlignedRange {
+                aligned_offset: page,
+                mapped_bytes: page * 3,
+            }
+        );
+        assert_eq!(
+            aligned_page_range((page * 9 + 7) as u64, page - 7, mapped_len, page).unwrap(),
+            WireMmapAlignedRange {
+                aligned_offset: page * 9,
+                mapped_bytes: page,
+            }
+        );
+        assert!(aligned_page_range(0, 0, mapped_len, page).is_err());
+        assert!(aligned_page_range((mapped_len - 1) as u64, 2, mapped_len, page).is_err());
+        assert!(aligned_page_range(0, page, mapped_len - 1, page).is_err());
+        assert!(aligned_page_range(u64::MAX, usize::MAX, mapped_len, page).is_err());
+    }
+
+    #[test]
+    fn merged_page_ranges_coalesce_overlap_and_shared_boundaries() {
+        let page = 16_384;
+        let mapped_len = page * 20;
+        let ranges = [
+            ((page + 100) as u64, page),
+            ((page * 2 + 50) as u64, page),
+            ((page * 7) as u64, page),
+            ((page * 8) as u64, page),
+            ((page * 12 + 1) as u64, 32),
+        ];
+        assert_eq!(
+            merge_aligned_page_ranges(&ranges, mapped_len, page).unwrap(),
+            vec![
+                WireMmapAlignedRange {
+                    aligned_offset: page,
+                    mapped_bytes: page * 3,
+                },
+                WireMmapAlignedRange {
+                    aligned_offset: page * 7,
+                    mapped_bytes: page * 2,
+                },
+                WireMmapAlignedRange {
+                    aligned_offset: page * 12,
+                    mapped_bytes: page,
+                },
+            ]
+        );
+        assert!(merge_aligned_page_ranges(&[(u64::MAX, 8)], mapped_len, page).is_err());
     }
 
     #[test]

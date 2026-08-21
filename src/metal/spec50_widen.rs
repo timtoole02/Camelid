@@ -877,7 +877,17 @@ mod tests {
         let mut solo = vec![0f32; 16 * rows];
         for t in 0..16usize {
             let out = zeros(&c.device, rows);
-            plain_generic(&c, &y, (t * hidden * 4) as u64, &w, &out, 0, rows, blocks, 1);
+            plain_generic(
+                &c,
+                &y,
+                (t * hidden * 4) as u64,
+                &w,
+                &out,
+                0,
+                rows,
+                blocks,
+                1,
+            );
             solo[t * rows..(t + 1) * rows].copy_from_slice(&read(&out, rows));
         }
         nonzero("plain solo", &solo);
@@ -887,7 +897,11 @@ mod tests {
                 encode_spec50_widen_plain(e, c.widen, &y, &w, 0, &out, blocks as u32, rows, k);
             });
             let got = read(&out, k * rows);
-            let bad = bits_equal(&format!("plain independence K={k}"), &got, &solo[..k * rows]);
+            let bad = bits_equal(
+                &format!("plain independence K={k}"),
+                &got,
+                &solo[..k * rows],
+            );
             assert_eq!(bad, 0, "plain K={k}: tokens depend on batch width");
         }
     }
@@ -1241,7 +1255,9 @@ mod tests {
     }
 
     fn random_i8(rng: &mut Rng, n: usize) -> Vec<i8> {
-        (0..n).map(|_| (rng.next_u32() & 0xFF) as u8 as i8).collect()
+        (0..n)
+            .map(|_| (rng.next_u32() & 0xFF) as u8 as i8)
+            .collect()
     }
 
     fn random_scales(rng: &mut Rng, n: usize) -> Vec<f32> {
@@ -1355,11 +1371,7 @@ mod tests {
         let mut bad = bits_equal("moe gateup scales k=8", &a, &read(&os_old, n_scale));
         let qa = read_i8(&oq_new, n_quant);
         let qb = read_i8(&oq_old, n_quant);
-        let qbad = qa
-            .iter()
-            .zip(qb.iter())
-            .filter(|(x, y)| x != y)
-            .count();
+        let qbad = qa.iter().zip(qb.iter()).filter(|(x, y)| x != y).count();
         assert!(qa.iter().any(|&v| v != 0), "moe gateup quants degenerate");
         bad += qbad;
         assert_eq!(

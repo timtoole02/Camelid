@@ -1118,6 +1118,17 @@ pub(crate) fn spec50_activation_scratch_bytes(max_k: usize, hidden: usize) -> us
     max_k * hidden * SPEC50_YFMT_STRIDE
 }
 
+/// Byte offsets for one canonical, at-most-eight-token tied-head tile.
+/// Rebasing happens only at the binding boundary; the selected per-K pipeline
+/// and its floating-point program are otherwise unchanged.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Spec50HeadBufferOffsets {
+    pub(crate) input_scales: u64,
+    pub(crate) input_quants: u64,
+    pub(crate) activation_perm: u64,
+    pub(crate) output: u64,
+}
+
 /// Encode the K<=16 speculative Q6_K tied-head projection.
 ///
 /// Buffer order on `q6k_spec50_batch_k{K}`:
@@ -1146,6 +1157,43 @@ pub(crate) fn encode_q6k_spec50_batch(
     hidden: usize,
     softcap: f32,
 ) -> bool {
+    encode_q6k_spec50_batch_at_offsets(
+        encoder,
+        kernels,
+        input_scales,
+        input_quants,
+        activation_perm,
+        weight,
+        weight_offset,
+        output,
+        n_superblocks,
+        rows,
+        k_batch,
+        hidden,
+        softcap,
+        Spec50HeadBufferOffsets::default(),
+    )
+}
+
+/// Offset-aware form of [`encode_q6k_spec50_batch`], used to compose wider
+/// waves exclusively from the canonical K8 projection pipeline.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_q6k_spec50_batch_at_offsets(
+    encoder: &metal::ComputeCommandEncoderRef,
+    kernels: &Spec50HeadKernels,
+    input_scales: &Buffer,
+    input_quants: &Buffer,
+    activation_perm: &Buffer,
+    weight: &Buffer,
+    weight_offset: u64,
+    output: &Buffer,
+    n_superblocks: usize,
+    rows: usize,
+    k_batch: usize,
+    hidden: usize,
+    softcap: f32,
+    offsets: Spec50HeadBufferOffsets,
+) -> bool {
     if k_batch == 0 || k_batch > 16 || rows == 0 || n_superblocks == 0 {
         return false;
     }
@@ -1156,8 +1204,8 @@ pub(crate) fn encode_q6k_spec50_batch(
     let n_sb_expand = n_superblocks as u32;
     let k_expand = k_batch as u32;
     encoder.set_compute_pipeline_state(&kernels.expand);
-    encoder.set_buffer(0, Some(input_quants), 0);
-    encoder.set_buffer(1, Some(activation_perm), 0);
+    encoder.set_buffer(0, Some(input_quants), offsets.input_quants);
+    encoder.set_buffer(1, Some(activation_perm), offsets.activation_perm);
     encoder.set_bytes(2, 4, &n_sb_expand as *const u32 as *const _);
     encoder.set_bytes(3, 4, &k_expand as *const u32 as *const _);
     encoder.dispatch_thread_groups(
@@ -1179,10 +1227,10 @@ pub(crate) fn encode_q6k_spec50_batch(
     } else {
         encoder.set_compute_pipeline_state(&kernels.batch[k_batch - 1]);
     }
-    encoder.set_buffer(0, Some(input_scales), 0);
-    encoder.set_buffer(1, Some(activation_perm), 0);
+    encoder.set_buffer(0, Some(input_scales), offsets.input_scales);
+    encoder.set_buffer(1, Some(activation_perm), offsets.activation_perm);
     encoder.set_buffer(2, Some(weight), weight_offset);
-    encoder.set_buffer(3, Some(output), 0);
+    encoder.set_buffer(3, Some(output), offsets.output);
     let n_sb_u32 = n_superblocks as u32;
     let rows_u32 = rows as u32;
     encoder.set_bytes(4, 4, &n_sb_u32 as *const u32 as *const _);
@@ -1203,6 +1251,16 @@ pub(crate) fn encode_q6k_spec50_batch(
     true
 }
 
+/// Byte offsets for a width-independent argmax dispatch.  Its `k_batch`
+/// changes only the number of independent threadgroups, never a row's compare
+/// or tie-breaking program.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Spec50HeadArgmaxBufferOffsets {
+    pub(crate) logits: u64,
+    pub(crate) argmax_ids: u64,
+    pub(crate) argmax_vals: u64,
+}
+
 /// Encode the per-candidate-row argmax over the softcapped logits written by
 /// [`encode_q6k_spec50_batch`]. Must be encoded after it in the same encoder.
 ///
@@ -1217,10 +1275,32 @@ pub(crate) fn encode_q6k_spec50_argmax(
     rows: usize,
     k_batch: usize,
 ) {
+    encode_q6k_spec50_argmax_at_offsets(
+        encoder,
+        kernels,
+        logits,
+        argmax_ids,
+        argmax_vals,
+        rows,
+        k_batch,
+        Spec50HeadArgmaxBufferOffsets::default(),
+    );
+}
+
+pub(crate) fn encode_q6k_spec50_argmax_at_offsets(
+    encoder: &metal::ComputeCommandEncoderRef,
+    kernels: &Spec50HeadKernels,
+    logits: &Buffer,
+    argmax_ids: &Buffer,
+    argmax_vals: &Buffer,
+    rows: usize,
+    k_batch: usize,
+    offsets: Spec50HeadArgmaxBufferOffsets,
+) {
     encoder.set_compute_pipeline_state(&kernels.argmax);
-    encoder.set_buffer(0, Some(logits), 0);
-    encoder.set_buffer(1, Some(argmax_ids), 0);
-    encoder.set_buffer(2, Some(argmax_vals), 0);
+    encoder.set_buffer(0, Some(logits), offsets.logits);
+    encoder.set_buffer(1, Some(argmax_ids), offsets.argmax_ids);
+    encoder.set_buffer(2, Some(argmax_vals), offsets.argmax_vals);
     let rows_u32 = rows as u32;
     encoder.set_bytes(3, 4, &rows_u32 as *const u32 as *const _);
     encoder.dispatch_thread_groups(
@@ -1336,6 +1416,49 @@ mod tests {
         device.new_buffer(bytes.max(4) as u64, MTLResourceOptions::StorageModeShared)
     }
 
+    fn fill_shared(buffer: &Buffer, byte: u8, bytes: usize) {
+        assert!(bytes as u64 <= buffer.length());
+        unsafe {
+            std::slice::from_raw_parts_mut(buffer.contents().cast::<u8>(), bytes).fill(byte);
+        }
+    }
+
+    fn write_shared_at<T: Copy>(buffer: &Buffer, byte_offset: usize, values: &[T]) {
+        let bytes = std::mem::size_of_val(values);
+        assert!(byte_offset as u64 + bytes as u64 <= buffer.length());
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                values.as_ptr().cast::<u8>(),
+                buffer.contents().cast::<u8>().add(byte_offset),
+                bytes,
+            );
+        }
+    }
+
+    fn read_shared_bytes(buffer: &Buffer, byte_offset: usize, bytes: usize) -> Vec<u8> {
+        assert!(byte_offset as u64 + bytes as u64 <= buffer.length());
+        unsafe {
+            std::slice::from_raw_parts(buffer.contents().cast::<u8>().add(byte_offset), bytes)
+                .to_vec()
+        }
+    }
+
+    fn read_shared_f32(buffer: &Buffer, byte_offset: usize, len: usize) -> Vec<f32> {
+        assert!(byte_offset as u64 + (len * 4) as u64 <= buffer.length());
+        unsafe {
+            std::slice::from_raw_parts(buffer.contents().cast::<u8>().add(byte_offset).cast(), len)
+                .to_vec()
+        }
+    }
+
+    fn read_shared_u32(buffer: &Buffer, byte_offset: usize, len: usize) -> Vec<u32> {
+        assert!(byte_offset as u64 + (len * 4) as u64 <= buffer.length());
+        unsafe {
+            std::slice::from_raw_parts(buffer.contents().cast::<u8>().add(byte_offset).cast(), len)
+                .to_vec()
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn encode_reference(
         encoder: &metal::ComputeCommandEncoderRef,
@@ -1408,7 +1531,9 @@ mod tests {
             "q6k_linear_turbo_batch_k8",
         ] {
             let needle = format!("\nkernel void {name}(\n");
-            let start = source.find(&needle).unwrap_or_else(|| panic!("{name} not found"))
+            let start = source
+                .find(&needle)
+                .unwrap_or_else(|| panic!("{name} not found"))
                 + 1;
             let end = source[start..].find("\n}\n").expect("kernel end") + start + 3;
             let original = &source[start..end];
@@ -1458,8 +1583,21 @@ mod tests {
 
         let cb = refs.queue.new_command_buffer();
         let e = cb.new_compute_command_encoder();
-        encode_reference(e, &refs, &sbuf, &qbuf, &wbuf, &out_single, rows, 1, 0.0, false);
-        encode_reference(e, &refs, &sbuf, &qbuf, &wbuf, &out_batch, rows, 1, 0.0, true);
+        encode_reference(
+            e,
+            &refs,
+            &sbuf,
+            &qbuf,
+            &wbuf,
+            &out_single,
+            rows,
+            1,
+            0.0,
+            false,
+        );
+        encode_reference(
+            e, &refs, &sbuf, &qbuf, &wbuf, &out_batch, rows, 1, 0.0, true,
+        );
         e.set_compute_pipeline_state(&refs.probe_inline_acc);
         e.set_buffer(0, Some(&sbuf), 0);
         e.set_buffer(1, Some(&qbuf), 0);
@@ -1470,8 +1608,16 @@ mod tests {
         e.set_bytes(4, 4, &n_sb_u32 as *const u32 as *const _);
         e.set_bytes(5, 4, &rows_u32 as *const u32 as *const _);
         e.dispatch_thread_groups(
-            metal::MTLSize { width: rows.div_ceil(16) as u64, height: 1, depth: 1 },
-            metal::MTLSize { width: 128, height: 1, depth: 1 },
+            metal::MTLSize {
+                width: rows.div_ceil(16) as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            },
         );
         e.end_encoding();
         cb.commit();
@@ -1490,8 +1636,7 @@ mod tests {
             for i in 0..a.len() {
                 if a[i].to_bits() != b[i].to_bits() {
                     diff += 1;
-                    worst =
-                        worst.max((a[i].to_bits() as i64 - b[i].to_bits() as i64).abs());
+                    worst = worst.max((a[i].to_bits() as i64 - b[i].to_bits() as i64).abs());
                 }
             }
             (diff, worst)
@@ -1554,11 +1699,20 @@ mod tests {
                 // Reference == the kernel the oracle-verified chained lane runs
                 // for this K: batch_k8 at K=8, batch_k otherwise.
                 encode_reference(
-                    e, &refs, &sbuf, &qbuf, &wbuf, &out_ref, rows, k, SOFTCAP, k == 1,
+                    e,
+                    &refs,
+                    &sbuf,
+                    &qbuf,
+                    &wbuf,
+                    &out_ref,
+                    rows,
+                    k,
+                    SOFTCAP,
+                    k == 1,
                 );
                 assert!(encode_q6k_spec50_batch(
-                    e, kernels, &sbuf, &qbuf, &fbuf, &wbuf, 0, &out_new, N_SB, rows, k,
-                    HIDDEN, SOFTCAP,
+                    e, kernels, &sbuf, &qbuf, &fbuf, &wbuf, 0, &out_new, N_SB, rows, k, HIDDEN,
+                    SOFTCAP,
                 ));
                 e.end_encoding();
                 cb.commit();
@@ -1574,8 +1728,8 @@ mod tests {
                 for i in 0..k * rows {
                     if a[i].to_bits() != b[i].to_bits() {
                         diff += 1;
-                        worst_ulp = worst_ulp
-                            .max((a[i].to_bits() as i64 - b[i].to_bits() as i64).abs());
+                        worst_ulp =
+                            worst_ulp.max((a[i].to_bits() as i64 - b[i].to_bits() as i64).abs());
                     }
                 }
                 assert_eq!(
@@ -1650,6 +1804,244 @@ mod tests {
         eprintln!("[spec50] per-token batch independence holds for K=1..=8");
     }
 
+    /// The tied-head projection remains on its oracle-pinned fixed-K8 pipeline
+    /// when a 16-token wave is split at the binding layer.  The candidate uses
+    /// one guarded, contiguous K16 input/output allocation and a single K16
+    /// argmax grid; the reference uses two isolated K8 invocations.  Raw-byte
+    /// equality includes the activation repack scratch and the token-7/8 seam.
+    #[test]
+    fn spec50_head_k16_is_two_bit_exact_k8_tiles() {
+        let refs = reference_kernels();
+        let kernels = spec50_head_kernels().expect("spec50 pipelines");
+        const TILE_K: usize = 8;
+        const WAVE_K: usize = 16;
+        const ROWS: usize = 4096;
+        const GUARD_BYTES: usize = 64;
+        const BYTE_POISON: u8 = 0xa5;
+        const F32_POISON_BITS: u32 = 0x7fc5_a55a;
+        const U32_POISON: u32 = 0xa55a_5aa5;
+        let mut rng = Rng(0x4845_4144_0008_0016);
+
+        let weights = build_weights(&mut rng, ROWS);
+        let (scales, quants) = build_activations(&mut rng, WAVE_K);
+        let wbuf = shared(&refs.device, weights.len());
+        write_buffer_u8(&wbuf, &weights);
+
+        let tile_scale_bytes = TILE_K * N_SB * 4;
+        let tile_quant_bytes = TILE_K * HIDDEN;
+        let tile_perm_bytes = spec50_activation_scratch_bytes(TILE_K, HIDDEN);
+        let tile_logit_bytes = TILE_K * ROWS * 4;
+        let mut ref_perm = Vec::with_capacity(2 * tile_perm_bytes);
+        let mut ref_logits = Vec::with_capacity(WAVE_K * ROWS);
+        let mut ref_ids = Vec::with_capacity(WAVE_K);
+        let mut ref_vals = Vec::with_capacity(WAVE_K);
+
+        for tile in 0..2 {
+            let scales_buf = shared(&refs.device, tile_scale_bytes);
+            write_buffer_f32(
+                &scales_buf,
+                &scales[tile * TILE_K * N_SB..(tile + 1) * TILE_K * N_SB],
+            );
+            let quants_buf = shared(&refs.device, tile_quant_bytes);
+            write_buffer_i8(
+                &quants_buf,
+                &quants[tile * TILE_K * HIDDEN..(tile + 1) * TILE_K * HIDDEN],
+            );
+            let perm_buf = shared(&refs.device, tile_perm_bytes);
+            fill_shared(&perm_buf, BYTE_POISON, tile_perm_bytes);
+            let logits_buf = shared(&refs.device, tile_logit_bytes);
+            let ids_buf = shared(&refs.device, TILE_K * 4);
+            let vals_buf = shared(&refs.device, TILE_K * 4);
+
+            let cb = refs.queue.new_command_buffer();
+            let encoder = cb.new_compute_command_encoder();
+            assert!(encode_q6k_spec50_batch(
+                encoder,
+                kernels,
+                &scales_buf,
+                &quants_buf,
+                &perm_buf,
+                &wbuf,
+                0,
+                &logits_buf,
+                N_SB,
+                ROWS,
+                TILE_K,
+                HIDDEN,
+                SOFTCAP,
+            ));
+            encode_q6k_spec50_argmax(
+                encoder,
+                kernels,
+                &logits_buf,
+                &ids_buf,
+                &vals_buf,
+                ROWS,
+                TILE_K,
+            );
+            encoder.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            assert_eq!(cb.status(), metal::MTLCommandBufferStatus::Completed);
+
+            ref_perm.extend_from_slice(&read_shared_bytes(&perm_buf, 0, tile_perm_bytes));
+            ref_logits.extend_from_slice(&read_shared_f32(&logits_buf, 0, TILE_K * ROWS));
+            ref_ids.extend_from_slice(&read_shared_u32(&ids_buf, 0, TILE_K));
+            ref_vals.extend_from_slice(&read_shared_f32(&vals_buf, 0, TILE_K));
+        }
+
+        let scale_body_bytes = WAVE_K * N_SB * 4;
+        let scales_buf = shared(&refs.device, GUARD_BYTES + scale_body_bytes + GUARD_BYTES);
+        fill_shared(
+            &scales_buf,
+            BYTE_POISON,
+            GUARD_BYTES + scale_body_bytes + GUARD_BYTES,
+        );
+        write_shared_at(&scales_buf, GUARD_BYTES, &scales);
+
+        let quant_body_bytes = WAVE_K * HIDDEN;
+        let quants_buf = shared(&refs.device, GUARD_BYTES + quant_body_bytes + GUARD_BYTES);
+        fill_shared(
+            &quants_buf,
+            BYTE_POISON,
+            GUARD_BYTES + quant_body_bytes + GUARD_BYTES,
+        );
+        write_shared_at(&quants_buf, GUARD_BYTES, &quants);
+
+        let perm_body_bytes = spec50_activation_scratch_bytes(WAVE_K, HIDDEN);
+        let perm_buf = shared(&refs.device, GUARD_BYTES + perm_body_bytes + GUARD_BYTES);
+        fill_shared(
+            &perm_buf,
+            BYTE_POISON,
+            GUARD_BYTES + perm_body_bytes + GUARD_BYTES,
+        );
+
+        let logit_body_bytes = WAVE_K * ROWS * 4;
+        let logits_buf = shared(&refs.device, GUARD_BYTES + logit_body_bytes + GUARD_BYTES);
+        fill_shared(
+            &logits_buf,
+            BYTE_POISON,
+            GUARD_BYTES + logit_body_bytes + GUARD_BYTES,
+        );
+        let poison_logits = vec![f32::from_bits(F32_POISON_BITS); WAVE_K * ROWS];
+        write_shared_at(&logits_buf, GUARD_BYTES, &poison_logits);
+
+        let ids_body_bytes = WAVE_K * 4;
+        let ids_buf = shared(&refs.device, GUARD_BYTES + ids_body_bytes + GUARD_BYTES);
+        fill_shared(
+            &ids_buf,
+            BYTE_POISON,
+            GUARD_BYTES + ids_body_bytes + GUARD_BYTES,
+        );
+        write_shared_at(&ids_buf, GUARD_BYTES, &vec![U32_POISON; WAVE_K]);
+        let vals_buf = shared(&refs.device, GUARD_BYTES + ids_body_bytes + GUARD_BYTES);
+        fill_shared(
+            &vals_buf,
+            BYTE_POISON,
+            GUARD_BYTES + ids_body_bytes + GUARD_BYTES,
+        );
+        write_shared_at(
+            &vals_buf,
+            GUARD_BYTES,
+            &vec![f32::from_bits(F32_POISON_BITS); WAVE_K],
+        );
+
+        let cb = refs.queue.new_command_buffer();
+        let encoder = cb.new_compute_command_encoder();
+        for tile in 0..2 {
+            assert!(encode_q6k_spec50_batch_at_offsets(
+                encoder,
+                kernels,
+                &scales_buf,
+                &quants_buf,
+                &perm_buf,
+                &wbuf,
+                0,
+                &logits_buf,
+                N_SB,
+                ROWS,
+                TILE_K,
+                HIDDEN,
+                SOFTCAP,
+                Spec50HeadBufferOffsets {
+                    input_scales: (GUARD_BYTES + tile * tile_scale_bytes) as u64,
+                    input_quants: (GUARD_BYTES + tile * tile_quant_bytes) as u64,
+                    activation_perm: (GUARD_BYTES + tile * tile_perm_bytes) as u64,
+                    output: (GUARD_BYTES + tile * tile_logit_bytes) as u64,
+                },
+            ));
+        }
+        encode_q6k_spec50_argmax_at_offsets(
+            encoder,
+            kernels,
+            &logits_buf,
+            &ids_buf,
+            &vals_buf,
+            ROWS,
+            WAVE_K,
+            Spec50HeadArgmaxBufferOffsets {
+                logits: GUARD_BYTES as u64,
+                argmax_ids: GUARD_BYTES as u64,
+                argmax_vals: GUARD_BYTES as u64,
+            },
+        );
+        encoder.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        assert_eq!(cb.status(), metal::MTLCommandBufferStatus::Completed);
+
+        for (name, buffer, body_bytes) in [
+            ("head scales", &scales_buf, scale_body_bytes),
+            ("head quants", &quants_buf, quant_body_bytes),
+            ("head perm", &perm_buf, perm_body_bytes),
+            ("head logits", &logits_buf, logit_body_bytes),
+            ("head ids", &ids_buf, ids_body_bytes),
+            ("head vals", &vals_buf, ids_body_bytes),
+        ] {
+            let prefix = read_shared_bytes(buffer, 0, GUARD_BYTES);
+            let suffix = read_shared_bytes(buffer, GUARD_BYTES + body_bytes, GUARD_BYTES);
+            assert!(
+                prefix.iter().all(|byte| *byte == BYTE_POISON),
+                "{name}: prefix guard was modified"
+            );
+            assert!(
+                suffix.iter().all(|byte| *byte == BYTE_POISON),
+                "{name}: suffix guard was modified"
+            );
+        }
+
+        assert_eq!(
+            read_shared_bytes(&perm_buf, GUARD_BYTES, perm_body_bytes),
+            ref_perm,
+            "head activation repack differs between two K8 tiles"
+        );
+        let got_logits = read_shared_f32(&logits_buf, GUARD_BYTES, WAVE_K * ROWS);
+        let got_ids = read_shared_u32(&ids_buf, GUARD_BYTES, WAVE_K);
+        let got_vals = read_shared_f32(&vals_buf, GUARD_BYTES, WAVE_K);
+        for (index, (got, want)) in got_logits.iter().zip(&ref_logits).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "head logit differs at {index}"
+            );
+        }
+        assert_eq!(got_ids, ref_ids, "head argmax IDs differ");
+        for (index, (got, want)) in got_vals.iter().zip(&ref_vals).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "head argmax value differs at token {index}"
+            );
+        }
+        for seam in [TILE_K * ROWS - 1, TILE_K * ROWS] {
+            assert_eq!(
+                got_logits[seam].to_bits(),
+                ref_logits[seam].to_bits(),
+                "head token 7/8 seam differs at logit {seam}"
+            );
+        }
+    }
+
     /// Per-row argmax must equal a CPU first-maximum scan of the same softcapped
     /// logits (lowest index wins ties).
     #[test]
@@ -1688,11 +2080,7 @@ mod tests {
         read_buffer_f32(&vals, &mut got_vals);
         let mut got_ids = vec![0u32; k];
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                ids.contents().cast::<u32>(),
-                got_ids.as_mut_ptr(),
-                k,
-            );
+            std::ptr::copy_nonoverlapping(ids.contents().cast::<u32>(), got_ids.as_mut_ptr(), k);
         }
         for t in 0..k {
             let row = &logits[t * rows..(t + 1) * rows];
@@ -1704,7 +2092,10 @@ mod tests {
                     best_i = i;
                 }
             }
-            assert_eq!(got_ids[t] as usize, best_i, "argmax id mismatch at token {t}");
+            assert_eq!(
+                got_ids[t] as usize, best_i,
+                "argmax id mismatch at token {t}"
+            );
             assert_eq!(
                 got_vals[t].to_bits(),
                 best.to_bits(),
@@ -1805,46 +2196,58 @@ mod tests {
                     .device
                     .new_compute_pipeline_state_with_function(&f)
                     .unwrap();
-                let encode = |e: &metal::ComputeCommandEncoderRef,
-                              w: &Buffer,
-                              o: &Buffer,
-                              n_rows: usize| {
-                    let count = (k * HIDDEN) as u32;
-                    let n_sb_e = N_SB as u32;
-                    let k_e = k as u32;
-                    e.set_compute_pipeline_state(&expand);
-                    e.set_buffer(0, Some(&qbuf), 0);
-                    e.set_buffer(1, Some(&fbuf), 0);
-                    e.set_bytes(2, 4, &n_sb_e as *const u32 as *const _);
-                    e.set_bytes(3, 4, &k_e as *const u32 as *const _);
-                    e.dispatch_thread_groups(
-                        metal::MTLSize { width: (count as u64).div_ceil(256), height: 1, depth: 1 },
-                        metal::MTLSize { width: 256, height: 1, depth: 1 },
-                    );
-                    e.set_compute_pipeline_state(&pipe);
-                    e.set_buffer(0, Some(&sbuf), 0);
-                    e.set_buffer(1, Some(&fbuf), 0);
-                    e.set_buffer(2, Some(w), 0);
-                    e.set_buffer(3, Some(o), 0);
-                    let n_sb_u32 = N_SB as u32;
-                    let rows_u32 = n_rows as u32;
-                    let cap = SOFTCAP;
-                    e.set_bytes(4, 4, &n_sb_u32 as *const u32 as *const _);
-                    e.set_bytes(5, 4, &rows_u32 as *const u32 as *const _);
-                    e.set_bytes(6, 4, &cap as *const f32 as *const _);
-                    e.dispatch_thread_groups(
-                        metal::MTLSize {
-                            width: n_rows.div_ceil(sg * rb) as u64,
-                            height: 1,
-                            depth: 1,
-                        },
-                        metal::MTLSize { width: 32 * sg as u64, height: 1, depth: 1 },
-                    );
-                };
+                let encode =
+                    |e: &metal::ComputeCommandEncoderRef, w: &Buffer, o: &Buffer, n_rows: usize| {
+                        let count = (k * HIDDEN) as u32;
+                        let n_sb_e = N_SB as u32;
+                        let k_e = k as u32;
+                        e.set_compute_pipeline_state(&expand);
+                        e.set_buffer(0, Some(&qbuf), 0);
+                        e.set_buffer(1, Some(&fbuf), 0);
+                        e.set_bytes(2, 4, &n_sb_e as *const u32 as *const _);
+                        e.set_bytes(3, 4, &k_e as *const u32 as *const _);
+                        e.dispatch_thread_groups(
+                            metal::MTLSize {
+                                width: (count as u64).div_ceil(256),
+                                height: 1,
+                                depth: 1,
+                            },
+                            metal::MTLSize {
+                                width: 256,
+                                height: 1,
+                                depth: 1,
+                            },
+                        );
+                        e.set_compute_pipeline_state(&pipe);
+                        e.set_buffer(0, Some(&sbuf), 0);
+                        e.set_buffer(1, Some(&fbuf), 0);
+                        e.set_buffer(2, Some(w), 0);
+                        e.set_buffer(3, Some(o), 0);
+                        let n_sb_u32 = N_SB as u32;
+                        let rows_u32 = n_rows as u32;
+                        let cap = SOFTCAP;
+                        e.set_bytes(4, 4, &n_sb_u32 as *const u32 as *const _);
+                        e.set_bytes(5, 4, &rows_u32 as *const u32 as *const _);
+                        e.set_bytes(6, 4, &cap as *const f32 as *const _);
+                        e.dispatch_thread_groups(
+                            metal::MTLSize {
+                                width: n_rows.div_ceil(sg * rb) as u64,
+                                height: 1,
+                                depth: 1,
+                            },
+                            metal::MTLSize {
+                                width: 32 * sg as u64,
+                                height: 1,
+                                depth: 1,
+                            },
+                        );
+                    };
                 // exactness gate
                 let cb = refs.queue.new_command_buffer();
                 let e = cb.new_compute_command_encoder();
-                encode_reference(e, &refs, &sbuf, &qbuf, &swbuf, &sout_ref, SROWS, k, SOFTCAP, false);
+                encode_reference(
+                    e, &refs, &sbuf, &qbuf, &swbuf, &sout_ref, SROWS, k, SOFTCAP, false,
+                );
                 encode(e, &swbuf, &sout_new, SROWS);
                 e.end_encoding();
                 cb.commit();
@@ -1853,9 +2256,14 @@ mod tests {
                 let mut b = vec![0f32; k * SROWS];
                 read_buffer_f32(&sout_ref, &mut a);
                 read_buffer_f32(&sout_new, &mut b);
-                let bad = (0..k * SROWS).filter(|&i| a[i].to_bits() != b[i].to_bits()).count();
+                let bad = (0..k * SROWS)
+                    .filter(|&i| a[i].to_bits() != b[i].to_bits())
+                    .count();
                 if ablate == 0 {
-                    assert_eq!(bad, 0, "rb={rb} rg={rg} sg={sg} flat={flat} yfmt={yfmt} K={k} not bitwise exact");
+                    assert_eq!(
+                        bad, 0,
+                        "rb={rb} rg={rg} sg={sg} flat={flat} yfmt={yfmt} K={k} not bitwise exact"
+                    );
                 }
 
                 for pass in 0..2 {
@@ -1895,7 +2303,8 @@ mod tests {
         {
             let mut rng = Rng(0x2718_2818_2845_9045);
             // Fill in place: no 605 MB host-side staging copy.
-            let dst = unsafe { std::slice::from_raw_parts_mut(wbuf.contents().cast::<u8>(), bytes) };
+            let dst =
+                unsafe { std::slice::from_raw_parts_mut(wbuf.contents().cast::<u8>(), bytes) };
             for block in dst.chunks_exact_mut(Q6K_WIRE) {
                 fill_q6k_block(&mut rng, block);
             }

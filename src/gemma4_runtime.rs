@@ -892,6 +892,28 @@ pub(crate) fn rms_norm(x: &[f32], weight: Option<&[f32]>, eps: f32) -> Vec<f32> 
     }
 }
 
+fn mtp_final_normalized_hidden(
+    hidden_rows: &[Vec<f32>],
+    selected_row: usize,
+    output_norm: &[f32],
+    eps: f32,
+) -> Result<Vec<f32>> {
+    let hidden = hidden_rows.get(selected_row).ok_or_else(|| {
+        BackendError::RuntimeShapeMismatch(format!(
+            "Gemma 4 MTP selected verifier row {selected_row}, but only {} hidden rows exist",
+            hidden_rows.len()
+        ))
+    })?;
+    if hidden.len() != output_norm.len() {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "Gemma 4 MTP final RMSNorm width mismatch: hidden={}, output_norm={}",
+            hidden.len(),
+            output_norm.len()
+        )));
+    }
+    Ok(rms_norm(hidden, Some(output_norm), eps))
+}
+
 /// Camelid's gemma4 KV cache is f32. The reference's DEFAULT cache is f16
 /// (+ flash attention with an f16-rounded Q path), which flips near-tie argmax
 /// positions relative to plain-f32 math — llama.cpp's own `-ctk/-ctv/-fa`
@@ -1486,6 +1508,17 @@ const GHOST_METAL_EXPERT_SLOTS_MIN: usize = 8;
 const GHOST_METAL_EXPERT_SLOTS_DEFAULT: usize = 16;
 #[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_EXPERT_SLOTS_MAX: usize = 128;
+/// Positive experiment opt-in: leave persistent expert slots empty at load and
+/// populate them only from routed demand. Absence or any value other than the
+/// exact affirmative `1` preserves the shipping cold-start prewarm.
+const GHOST_METAL_DEMAND_LOAD_ONLY_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_DEMAND_LOAD_ONLY";
+/// Exact demand-only residency bound. The runtime still allocates the full
+/// logical slot set, but only this prefix is admitted into the directory and
+/// Tier-2 pointer table. Keeping unbound records out of that table matters:
+/// the first compute use may materialize every buffer encoded in it even when
+/// the encoder declares only the active route resources.
+const GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER_ENV: &str =
+    "CAMELID_GEMMA4_GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER";
 /// Global overflow experts reused across layers. 24 resident + 18 covers the
 /// measured K=8 unique max of 42. Two banks ping-pong so a predicted in-flight
 /// command buffer can keep reading bank A while CPU fills bank B. Never ×30.
@@ -1504,6 +1537,117 @@ fn parse_ghost_metal_slots_per_layer(value: Option<&str>) -> usize {
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .unwrap_or(GHOST_METAL_EXPERT_SLOTS_DEFAULT)
         .clamp(GHOST_METAL_EXPERT_SLOTS_MIN, GHOST_METAL_EXPERT_SLOTS_MAX)
+}
+
+fn ghost_metal_demand_load_only_from(value: Option<&str>) -> bool {
+    value.is_some_and(|raw| raw.trim() == "1")
+}
+
+fn ghost_metal_demand_load_only_from_env() -> bool {
+    ghost_metal_demand_load_only_from(
+        std::env::var(GHOST_METAL_DEMAND_LOAD_ONLY_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Once a demand runtime has admitted an explicit physical table prefix, a
+/// refused chained attempt must be terminal. Falling through to the CPU lane
+/// would hide the bounded-record correctness refusal inside a slow but
+/// apparently successful performance receipt.
+#[cfg(target_os = "macos")]
+fn ghost_metal_bounded_record_fallback_forbidden() -> bool {
+    ghost_metal_demand_load_only_from_env()
+        && std::env::var_os(GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER_ENV).is_some()
+}
+
+#[cfg(target_os = "macos")]
+fn bounded_record_chained_refusal(
+    context: &str,
+    start_pos: usize,
+    k_tokens: usize,
+    ledger: crate::metal::ChainedRoundHostLedger,
+) -> BackendError {
+    BackendError::RuntimeShapeMismatch(format!(
+        "{context}: bounded record chained attempt failed closed before CPU fallback/token commit: start_pos={start_pos} K={k_tokens} unique_max={} capacity_overflow={} selected_dropped={} missing_expert={} overflow_experts={}",
+        ledger.unique_experts_max,
+        ledger.slot_capacity_overflow,
+        ledger.selected_experts_dropped,
+        ledger.missing_expert_failclose,
+        ledger.overflow_experts,
+    ))
+}
+
+/// Parse the optional physical high-water mark for exact demand-only record
+/// backing. Outside demand-only mode the knob is deliberately ignored, so the
+/// shipping monolithic directory remains byte-for-byte unchanged. Absence in
+/// demand-only mode also preserves the previously admitted full directory.
+/// A supplied value must be a canonical decimal integer in the correctness
+/// range `8..=allocated_slots`; malformed or out-of-range values fail closed
+/// instead of silently changing the resident budget.
+#[cfg(any(target_os = "macos", test))]
+fn parse_ghost_metal_physical_slots_per_layer(
+    demand_load_only: bool,
+    value: Option<&str>,
+    allocated_slots: usize,
+) -> std::result::Result<Option<usize>, String> {
+    if !demand_load_only {
+        return Ok(None);
+    }
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let parsed = raw.parse::<usize>().map_err(|_| {
+        format!("{GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER_ENV} must be a canonical decimal integer")
+    })?;
+    if parsed.to_string() != raw {
+        return Err(format!(
+            "{GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER_ENV} must be canonical decimal without whitespace or leading zeroes"
+        ));
+    }
+    if !(GHOST_METAL_EXPERT_SLOTS_MIN..=allocated_slots).contains(&parsed) {
+        return Err(format!(
+            "{GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER_ENV}={parsed} is outside the exact demand-only range {GHOST_METAL_EXPERT_SLOTS_MIN}..={allocated_slots}"
+        ));
+    }
+    Ok(Some(parsed))
+}
+
+/// Allocation order for the production Ghost Metal runtime. Empty shared
+/// expert slabs remain physically lazy only when they are created after the
+/// common Metal resident state. The load-only residency probe established that
+/// order under the exact demand-only opt-in; the shipping path keeps its
+/// historical slot-first order.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GhostMetalAllocationOrder {
+    SlotsThenCommon,
+    CommonThenSlots,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn ghost_metal_allocation_order(demand_load_only: bool) -> GhostMetalAllocationOrder {
+    if demand_load_only {
+        GhostMetalAllocationOrder::CommonThenSlots
+    } else {
+        GhostMetalAllocationOrder::SlotsThenCommon
+    }
+}
+
+/// The predicted chained schedule binds every layer's expert slab into one
+/// command buffer. That is useful only when retaining every slab as a Metal
+/// resource is within the resident budget. Demand-only mode instead keeps the
+/// identical per-layer arithmetic on the unpredicted schedule, where completed
+/// command buffers can release each prior slab before later layers execute.
+#[cfg(any(target_os = "macos", test))]
+fn ghost_metal_chained_prediction_allowed(
+    demand_load_only: bool,
+    suppress_prediction: bool,
+    k_tokens: usize,
+    exact_repeat: bool,
+    prediction_forced: bool,
+) -> bool {
+    !demand_load_only && !suppress_prediction && k_tokens > 1 && (exact_repeat || prediction_forced)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1894,8 +2038,8 @@ impl GhostVictimRing {
         if let Some(old) = self.keys[pos] {
             self.index[old as usize] = -1;
         }
-        let slab = self.slabs[pos]
-            .get_or_insert_with(|| vec![0u8; self.record_bytes].into_boxed_slice());
+        let slab =
+            self.slabs[pos].get_or_insert_with(|| vec![0u8; self.record_bytes].into_boxed_slice());
         slab.copy_from_slice(record);
         self.keys[pos] = Some(expert as u16);
         self.index[expert] = pos as i32;
@@ -1906,7 +2050,7 @@ impl GhostVictimRing {
 /// Victim-ring sizing: CAMELID_GEMMA4_VICTIM_CACHE gates it (default ON;
 /// "0"/"false" restores today's pread-only refills exactly), and
 /// CAMELID_GEMMA4_VICTIM_MB is the TOTAL host budget across all layers
-/// (default 1536 MiB -> ~16 records/layer at the 26B record size; capped at
+/// (default 1024 MiB -> ~10 records/layer at the 26B record size; capped at
 /// 8192). The budget is a cap, not a reservation: slabs allocate lazily.
 #[cfg(any(target_os = "macos", test))]
 fn victim_ring_records_from(
@@ -1921,7 +2065,7 @@ fn victim_ring_records_from(
     }
     let mb = budget_mb
         .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(1536)
+        .unwrap_or(1024)
         .min(8192);
     (mb * 1024 * 1024) / layer_count / record_bytes
 }
@@ -2078,12 +2222,20 @@ struct GhostMetalExpertRuntime {
     common: Option<crate::metal::Gemma4GhostCommonMetal>,
     sequence_mode: GhostMetalSequenceMode,
     latest_routed_experts: Vec<Vec<usize>>,
+    /// Exact routed identities observed since the latest telemetry interval
+    /// boundary (or runtime construction for epoch zero). This is never read by
+    /// routing, eviction, prefetch, or admission policy.
+    routed_expert_interval_union: Vec<[u64; 2]>,
+    routed_expert_interval_epoch: u64,
     expert_decay_scores: Vec<Vec<f32>>,
     /// Eight 18-slot overflow slabs, reused across all 30 layers. Predicted
     /// rounds bind `overflow_bank[layer % copies]` so prior layers can stay
     /// in flight. Combined footprint is ~461 MiB, not 2.25 GiB.
     overflow_bank: Vec<crate::metal::Gemma4Q4ExpertSlots>,
+    /// K and outcome of the latest completed chained attempt. Telemetry only;
+    /// route prediction remains keyed exclusively by `last_chained_sig`.
     last_chained_k: Option<usize>,
+    last_chained_succeeded: bool,
     /// (start_pos, K, hash of the hidden rows) of the last successful chained
     /// round. Route prediction reuses the previous round's expert unions, which
     /// is only sound when the SAME chunk is re-verified at the SAME position
@@ -2101,6 +2253,24 @@ struct GhostMetalExpertRuntime {
     /// evict live experts (measured 12.8 GB of fill reads across a 31-token
     /// prompt). Decode/verify rounds keep the speculative fill.
     prefill_round: bool,
+    /// Cumulative payload bytes fetched by chained-wave demand fills. This is
+    /// telemetry only: HEAD-lane direct reads live in `GhostMetalSlotStats`,
+    /// while this counter covers the disjoint chained-wave source path.
+    chained_demand_read_bytes: u64,
+    /// Cumulative chained-wave records fetched from their backing source.
+    chained_demand_loads: u64,
+}
+
+/// Receipt for the load-only command that binds every production per-layer
+/// Tier-2 expert table without reading or committing an expert record.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GhostMetalDemandTableLoadOnlyReceipt {
+    layer_count: usize,
+    logical_slot_count: usize,
+    table_directory_slot_count: usize,
+    compute_active_slot_count: usize,
+    table_directory_capacity_bytes: usize,
 }
 
 /// K=1 decode lane selection. Default: the dedicated HEAD lane
@@ -2310,7 +2480,7 @@ fn fill_metal_wave_slots_from_host_cache(
                 .victims
                 .lookup(load.expert)
                 .is_some_and(|bytes| bytes.len() == record_bytes)
-                && load.slot < layer.slots.slot_count();
+                && load.slot < layer.slots.gpu_slot_count();
             if servable {
                 ring_hits.push(load);
             } else {
@@ -2803,6 +2973,21 @@ impl GhostMetalExpertRuntime {
             }
         }
         let engine = crate::metal::Gemma4Q4ExpertMetal::new()?;
+        let demand_record_backing = ghost_metal_demand_load_only_from_env();
+        let allocated_slot_floor = slots_per_layer.iter().copied().min()?;
+        let physical_slot_budget = match parse_ghost_metal_physical_slots_per_layer(
+            demand_record_backing,
+            std::env::var(GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER_ENV)
+                .ok()
+                .as_deref(),
+            allocated_slot_floor,
+        ) {
+            Ok(budget) => budget,
+            Err(error) => {
+                eprintln!("[gemma4-ghost-metal] physical slot budget refused: {error}");
+                return None;
+            }
+        };
         let victim_records = ghost_metal_victim_records_per_layer(layer_count);
         if victim_records > 0 {
             eprintln!(
@@ -2813,10 +2998,25 @@ impl GhostMetalExpertRuntime {
         }
         let mut layers = Vec::with_capacity(layer_count);
         for &slots in slots_per_layer {
-            let slots_obj = crate::metal::Gemma4Q4ExpertSlots::new(slots)?;
+            let directory_slots = physical_slot_budget.unwrap_or(slots);
+            let slots_obj = if demand_record_backing {
+                crate::metal::Gemma4Q4ExpertSlots::new_record_granular_with_table_slots(
+                    slots,
+                    directory_slots,
+                )?
+            } else {
+                crate::metal::Gemma4Q4ExpertSlots::new(slots)?
+            };
             debug_assert_eq!(slots_obj.slot_count(), slots);
+            let addressable_slots = slots_obj.gpu_slot_count();
+            if addressable_slots != directory_slots {
+                eprintln!(
+                    "[gemma4-ghost-metal] record table/directory mismatch: table={addressable_slots} directory={directory_slots}"
+                );
+                return None;
+            }
             layers.push(GhostMetalExpertLayer {
-                directory: GhostMetalSlotDirectory::new(slots),
+                directory: GhostMetalSlotDirectory::new(addressable_slots),
                 slots: slots_obj,
                 stats: GhostMetalSlotStats::default(),
                 shared: None,
@@ -2827,18 +3027,28 @@ impl GhostMetalExpertRuntime {
                 evicted_round: [0; 128],
             });
         }
+        if let Some(physical_slot_budget) = physical_slot_budget {
+            eprintln!(
+                "[gemma4-ghost-metal] {GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER_ENV}={physical_slot_budget}: allocated logical slots/layer={allocated_slot_floor}, bound table/directory slots/layer={physical_slot_budget}"
+            );
+        }
         // The overflow bank only holds experts beyond the resident slots. When
-        // min `slots_per_layer` already covers the worst-case per-layer union
+        // min configured `slots_per_layer` already covers the worst-case union
         // (observed max 42 for K=8), no layer ever spills, so `fill_pong` /
         // `fill_compact_wave_into_slots` are never called and a single copy is
-        // enough. Allocating 30 copies × 24 slots = 2.25 GiB of unified memory
-        // that is never written is pure RAM pressure (it swaps on 16 GB). When
-        // slots may spill we still need one distinct copy per layer, because
+        // enough. Bounded record mode likewise keeps one inert copy because it
+        // fails closed above its table/directory prefix instead of reaching a
+        // monolithic overflow binding. Allocating 30 copies × 24 slots = 2.25
+        // GiB of unified memory that is never written is pure RAM pressure.
+        // When shipping monolithic slots may spill we still need one distinct
+        // copy per layer, because
         // all 30 layers' fills complete before the single GPU commit — sharing
         // a copy across layers would overwrite an earlier layer's overflow
         // experts before the GPU reads them.
         let min_slots = slots_per_layer.iter().copied().min().unwrap_or(0);
-        let bank_never_written = min_slots >= GHOST_METAL_OVERFLOW_COVER_SLOTS;
+        let bounded_record_failclose = demand_record_backing && physical_slot_budget.is_some();
+        let bank_never_written =
+            min_slots >= GHOST_METAL_OVERFLOW_COVER_SLOTS || bounded_record_failclose;
         let bank_copies = if bank_never_written {
             1
         } else {
@@ -2846,19 +3056,28 @@ impl GhostMetalExpertRuntime {
         };
         let mut overflow_bank = Vec::with_capacity(bank_copies);
         for _ in 0..bank_copies {
-            overflow_bank.push(crate::metal::Gemma4Q4ExpertSlots::new(
-                GHOST_METAL_OVERFLOW_SLOTS,
-            )?);
+            overflow_bank.push(if demand_record_backing {
+                crate::metal::Gemma4Q4ExpertSlots::new_record_granular(GHOST_METAL_OVERFLOW_SLOTS)?
+            } else {
+                crate::metal::Gemma4Q4ExpertSlots::new(GHOST_METAL_OVERFLOW_SLOTS)?
+            });
         }
         eprintln!(
-            "[gemma4-ghost-metal] global overflow bank: {}×{} slots ({:.2} MiB total){}, reused across {} layers (not per-layer)",
+            "[gemma4-ghost-metal] global overflow bank: {}×{} slots ({:.2} MiB total){}{}, reused across {} layers (not per-layer)",
             bank_copies,
             GHOST_METAL_OVERFLOW_SLOTS,
             (bank_copies
                 * GHOST_METAL_OVERFLOW_SLOTS
                 * crate::metal::GEMMA4_Q4_EXPERT_SLOT_STRIDE) as f64
                 / (1024.0 * 1024.0),
-            if bank_never_written { " [inactive: resident slots cover the union]" } else { "" },
+            if bounded_record_failclose {
+                " [inactive: bounded record table fails closed above its physical budget]"
+            } else if bank_never_written {
+                " [inactive: resident slots cover the union]"
+            } else {
+                ""
+            },
+            if demand_record_backing { " [record-granular]" } else { "" },
             layer_count
         );
         Some(Self {
@@ -2868,13 +3087,18 @@ impl GhostMetalExpertRuntime {
             common: None,
             sequence_mode: GhostMetalSequenceMode::Idle,
             latest_routed_experts: vec![Vec::new(); layer_count],
+            routed_expert_interval_union: vec![[0; 2]; layer_count],
+            routed_expert_interval_epoch: 0,
             expert_decay_scores: vec![vec![0.0f32; 128]; layer_count],
             overflow_bank,
             last_chained_k: None,
+            last_chained_succeeded: false,
             last_chained_sig: None,
             suppress_prediction: false,
             prefill_round: false,
             chained_round_seq: 0,
+            chained_demand_read_bytes: 0,
+            chained_demand_loads: 0,
         })
     }
 
@@ -2890,6 +3114,13 @@ impl GhostMetalExpertRuntime {
     }
 
     pub(crate) fn record_layer_routes(&mut self, layer_idx: usize, experts: &[usize]) {
+        if let Some(union) = self.routed_expert_interval_union.get_mut(layer_idx) {
+            for &expert in experts {
+                if expert < 128 {
+                    union[expert / 64] |= 1u64 << (expert % 64);
+                }
+            }
+        }
         if let Some(scores) = self.expert_decay_scores.get_mut(layer_idx) {
             for s in scores.iter_mut() {
                 *s *= 0.85;
@@ -3076,12 +3307,16 @@ impl GhostMetalExpertRuntime {
         let t_setup = std::time::Instant::now();
         let mut slot_mappings = [[0xFFFFFFFFu32; 128]; 30];
         let mut num_slots_per_layer = [0usize; 30];
-        let expert_slabs: Vec<metal::Buffer> = self
+        let expert_bindings: Vec<crate::metal::Gemma4Q4ExpertSlotBinding> = self
             .layers
             .iter()
             .take(30)
-            .map(|l| l.slots.slab_buffer().clone())
+            .map(|l| l.slots.gpu_binding())
             .collect();
+        let demand_record_backing = self
+            .layers
+            .iter()
+            .all(|layer| layer.slots.is_record_granular());
 
         for (li, layer) in self.layers.iter().enumerate().take(30) {
             for e in 0..128 {
@@ -3109,9 +3344,13 @@ impl GhostMetalExpertRuntime {
         // only on an exact repeat of the previous chained round, or when the
         // caller opts in for benchmarks (CAMELID_GEMMA4_CHAINED_PREDICT=1).
         let exact_repeat = self.last_chained_sig == Some(chunk_sig);
-        let allow_predicted = !self.suppress_prediction
-            && k_tokens > 1
-            && (exact_repeat || chained_predict_forced());
+        let allow_predicted = ghost_metal_chained_prediction_allowed(
+            ghost_metal_demand_load_only_from_env(),
+            self.suppress_prediction,
+            k_tokens,
+            exact_repeat,
+            chained_predict_forced(),
+        );
         let predicted_unions: Vec<Vec<usize>> = self
             .layers
             .iter()
@@ -3128,12 +3367,19 @@ impl GhostMetalExpertRuntime {
             .collect();
         let overflow_slot_count = self.overflow_slot_count();
         let copies = self.overflow_bank.len().max(1);
-        let pong_slab_buf = self.overflow_bank[0].slab_buffer().clone();
+        let pong_slab_buf = if demand_record_backing {
+            None
+        } else {
+            let Some(pong) = self.overflow_bank[0].monolithic_slab_buffer() else {
+                return false;
+            };
+            Some(pong.clone())
+        };
         let pong_slot_count = overflow_slot_count;
         let overflow_bufs: Vec<metal::Buffer> = self
             .overflow_bank
             .iter()
-            .map(|b| b.slab_buffer().clone())
+            .filter_map(|b| b.monolithic_slab_buffer().cloned())
             .collect();
         let n_layers = self.layers.len();
         // Every layer's fill completes before the single GPU commit, so two
@@ -3141,6 +3387,9 @@ impl GhostMetalExpertRuntime {
         // the earlier one's experts before the GPU reads them. Only bind the
         // bank when there is a distinct copy per layer.
         let wave1_bufs: Vec<metal::Buffer> = if allow_predicted && copies >= n_layers {
+            if overflow_bufs.len() < copies {
+                return false;
+            }
             (0..n_layers)
                 .map(|i| overflow_bufs[i % copies].clone())
                 .collect()
@@ -3200,7 +3449,12 @@ impl GhostMetalExpertRuntime {
                             let (buf, nslots) = if let Some(buf) = wave1_bufs.get(layer_idx) {
                                 (buf, wave1_slot_count)
                             } else {
-                                (&pong_slab_buf, pong_slot_count)
+                                (
+                                    pong_slab_buf
+                                        .as_ref()
+                                        .expect("predicted monolithic overflow backing"),
+                                    pong_slot_count,
+                                )
                             };
                             let mut updated_slots = [0xFFFFFFFFu32; 128];
                             fill_compact_wave_into_slots(
@@ -3233,38 +3487,27 @@ impl GhostMetalExpertRuntime {
                 let selected_experts: Vec<usize> = if let Some(wave) = wave {
                     wave.to_vec()
                 } else {
-                    let mut selected_experts = Vec::with_capacity(n_tokens * 8);
-                    for t in 0..n_tokens {
-                        let logits = &router_logits[t * 128..(t + 1) * 128];
-                        let mut maxl = f32::MIN;
-                        for &v in logits {
-                            if v > maxl {
-                                maxl = v;
-                            }
-                        }
-                        let mut probs = [0.0f32; 128];
-                        for e in 0..128 {
-                            probs[e] = (logits[e] - maxl).exp();
-                        }
-                        let mut ranked: [usize; 128] = std::array::from_fn(|i| i);
-                        ranked.sort_unstable_by(|&a, &b| {
-                            probs[b]
-                                .partial_cmp(&probs[a])
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        });
-                        for i in 0..8 {
-                            let e = ranked[i];
-                            if !selected_experts.contains(&e) {
-                                selected_experts.push(e);
-                            }
-                        }
-                    }
+                    // Mirror gemma4_gpu_topk_routing's selection loop and
+                    // strict greater-than tie rule exactly. Demand resource
+                    // declaration is coupled to this union; an unstable sort
+                    // could fill a different tied expert and let the GPU mask
+                    // a route.
+                    let selected_experts =
+                        crate::metal::gemma4_top8_union_from_router_logits(router_logits, n_tokens);
                     union_out.clear();
                     union_out.extend_from_slice(&selected_experts);
                     collected_routes[layer_idx] = selected_experts.clone();
                     if selected_experts.len() > n_slots {
-                        // Overflow becomes extra waves. Keep any speculative
-                        // wave-0 slot table filled during the router wait.
+                        // Bounded record backing has no monolithic overflow
+                        // fallback. Return before planning/filling any record;
+                        // the Metal caller receipts the simultaneous-union
+                        // overflow and fails the chained attempt closed.
+                        if demand_record_backing {
+                            eprintln!(
+                                "[gemma4-ghost-metal] layer {layer_idx} routed union {} exceeds bound table/directory budget {n_slots}; no expert record filled",
+                                selected_experts.len()
+                            );
+                        }
                         fill_counters.route_us.fetch_add(
                             (t_route.elapsed().as_secs_f64() * 1_000_000.0) as u64,
                             std::sync::atomic::Ordering::Relaxed,
@@ -3304,12 +3547,14 @@ impl GhostMetalExpertRuntime {
         });
 
         let pong_slab_for_gpu = pong_slab_buf.clone();
-        let mut fill_pong = ghost_cache.map(|cache| {
-            |layer_idx: usize, wave: &[usize], updated_slots: &mut [u32; 128]| {
-                let (buf, nslots) = if let Some(buf) = wave1_bufs.get(layer_idx) {
+        let wave1_bufs_for_fill = &wave1_bufs;
+        let fill_counters_for_pong = &fill_counters;
+        let mut fill_pong = ghost_cache.zip(pong_slab_buf.clone()).map(|(cache, pong)| {
+            move |layer_idx: usize, wave: &[usize], updated_slots: &mut [u32; 128]| {
+                let (buf, nslots) = if let Some(buf) = wave1_bufs_for_fill.get(layer_idx) {
                     (buf, wave1_slot_count)
                 } else {
-                    (&pong_slab_buf, pong_slot_count)
+                    (&pong, pong_slot_count)
                 };
                 fill_compact_wave_into_slots(
                     buf,
@@ -3318,7 +3563,7 @@ impl GhostMetalExpertRuntime {
                     layer_idx,
                     wave,
                     updated_slots,
-                    &fill_counters,
+                    fill_counters_for_pong,
                 );
             }
         });
@@ -3335,7 +3580,6 @@ impl GhostMetalExpertRuntime {
                 None => None,
             };
 
-        let expert_slab_refs: Vec<&metal::Buffer> = expert_slabs.iter().collect();
         let wave1_refs: Vec<&metal::Buffer> = wave1_gpu.iter().collect();
         let slot_mapping_slices: Vec<&[u32; 128]> = slot_mappings.iter().collect();
         let empty_unions = vec![Vec::new(); n_layers];
@@ -3355,17 +3599,30 @@ impl GhostMetalExpertRuntime {
                 theta_local,
                 theta_global,
                 rope_factors,
-                &expert_slab_refs,
+                &expert_bindings,
                 &num_slots_per_layer,
                 out_rows,
                 slot_filler_fn,
-                Some(&pong_slab_for_gpu),
+                pong_slab_for_gpu.as_ref(),
                 gpu_unions,
                 fill_pong_fn,
                 &wave1_refs,
             )
         };
         if !ok && allow_predicted {
+            // Preserve the I/O cost of the refused attempt before the exact
+            // unpredicted retry. These counters are observational only and do
+            // not participate in routing or retry admission.
+            self.chained_demand_read_bytes = self.chained_demand_read_bytes.saturating_add(
+                fill_counters
+                    .nvme_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            );
+            self.chained_demand_loads = self.chained_demand_loads.saturating_add(
+                fill_counters
+                    .demand_loads
+                    .load(std::sync::atomic::Ordering::Relaxed) as u64,
+            );
             eprintln!(
                 "[gemma4-ghost-metal] predicted chained round refused at start_pos={start_pos} K={k_tokens}; retrying without route prediction"
             );
@@ -3382,8 +3639,9 @@ impl GhostMetalExpertRuntime {
             self.suppress_prediction = false;
             return retry;
         }
+        self.last_chained_k = Some(k_tokens);
+        self.last_chained_succeeded = ok;
         if ok {
-            self.last_chained_k = Some(k_tokens);
             self.last_chained_sig = Some(chunk_sig);
             // Feed the per-K sweep accounting from this round's ledger: the
             // union distribution and unique-expert total are what price a
@@ -3441,8 +3699,11 @@ impl GhostMetalExpertRuntime {
                 fill_counters.plan_hits.load(Relaxed).min(u32::MAX as u64) as u32;
             common.last_chained_ledger.slot_misses =
                 fill_counters.plan_misses.load(Relaxed).min(u32::MAX as u64) as u32;
-            common.last_chained_ledger.slot_evictions =
-                fill_counters.plan_evictions.load(Relaxed).min(u32::MAX as u64) as u32;
+            common.last_chained_ledger.slot_evictions = fill_counters
+                .plan_evictions
+                .load(Relaxed)
+                .min(u32::MAX as u64)
+                as u32;
             common.last_chained_ledger.victim_hits =
                 fill_counters.victim_hits.load(Relaxed).min(u32::MAX as u64) as u32;
             common.last_chained_ledger.victim_fill_ms =
@@ -3457,7 +3718,8 @@ impl GhostMetalExpertRuntime {
             common.last_chained_ledger.victim_verify_fails = fill_counters
                 .victim_verify_fails
                 .load(Relaxed)
-                .min(u32::MAX as u64) as u32;
+                .min(u32::MAX as u64)
+                as u32;
             common.last_chained_ledger.overlap_prev_hits = overlap_prev_hits;
             common.last_chained_ledger.overlap_prev_total = overlap_prev_total;
             common.last_chained_ledger.resident_start_hits = resident_start_hits;
@@ -3489,8 +3751,7 @@ impl GhostMetalExpertRuntime {
                 crate::metal::SPEC_PREV_UNION_TOTAL.fetch_add(overlap_prev_total as u64, Relaxed);
                 crate::metal::SPEC_RESIDENT_START_HITS
                     .fetch_add(resident_start_hits as u64, Relaxed);
-                crate::metal::SPEC_ENCODE_US
-                    .fetch_add((led.encode_ms * 1000.0) as u64, Relaxed);
+                crate::metal::SPEC_ENCODE_US.fetch_add((led.encode_ms * 1000.0) as u64, Relaxed);
                 crate::metal::SPEC_PRE_ENCODE_US
                     .fetch_add((led.pre_encode_ms * 1000.0) as u64, Relaxed);
                 crate::metal::SPEC_SLOT_WAIT_US
@@ -3504,8 +3765,7 @@ impl GhostMetalExpertRuntime {
                         as u64,
                     Relaxed,
                 );
-                crate::metal::SPEC_OVERLAP_LAYERS
-                    .fetch_add(led.overlap_layers as u64, Relaxed);
+                crate::metal::SPEC_OVERLAP_LAYERS.fetch_add(led.overlap_layers as u64, Relaxed);
                 crate::metal::SPEC_OVERLAP_FALLBACKS
                     .fetch_add(led.overlap_fallbacks as u64, Relaxed);
             }
@@ -3560,6 +3820,16 @@ impl GhostMetalExpertRuntime {
                 );
             }
         }
+        self.chained_demand_read_bytes = self.chained_demand_read_bytes.saturating_add(
+            fill_counters
+                .nvme_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        self.chained_demand_loads = self.chained_demand_loads.saturating_add(
+            fill_counters
+                .demand_loads
+                .load(std::sync::atomic::Ordering::Relaxed) as u64,
+        );
         for (i, experts) in collected_routes.into_iter().enumerate() {
             if !experts.is_empty() {
                 self.record_layer_routes(i, &experts);
@@ -3584,10 +3854,144 @@ impl GhostMetalExpertRuntime {
             .sum()
     }
 
+    fn resident_slot_count(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|layer| layer.slots.slot_count())
+            .sum()
+    }
+
+    /// Maximum record slots that can ever be filled or referenced by the
+    /// current per-layer directories. In bounded record mode this is smaller
+    /// than the allocated logical slot count; untouched logical records beyond
+    /// the directory/table prefix remain unbound and physically lazy.
+    fn physical_slot_budget_count(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|layer| layer.directory.entries.len())
+            .sum()
+    }
+
+    fn physical_slot_budget_bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|layer| layer.directory.entries.len() * layer.slots.slot_stride_bytes())
+            .sum()
+    }
+
+    /// Bind the actual per-layer record tables through both production HEAD
+    /// and chained address-only kernels. This is reachable only from the
+    /// observed load-only constructor after common, assistant, and tied-head
+    /// residency checkpoints. It performs no directory planning/fill, expert
+    /// I/O, tokenization, KV mutation, prefill, target step, or generation.
+    fn bind_load_only_record_tables(
+        &mut self,
+    ) -> std::result::Result<GhostMetalDemandTableLoadOnlyReceipt, String> {
+        let layer_count = self.layers.len();
+        let Some(first) = self.layers.first() else {
+            return Err("load-only table bind has no expert layers".into());
+        };
+        let logical_slots = first.slots.slot_count();
+        let table_slots = first.slots.gpu_slot_count();
+        if table_slots < 8
+            || self.layers.iter().any(|layer| {
+                !layer.slots.is_record_granular()
+                    || layer.slots.slot_count() != logical_slots
+                    || layer.slots.gpu_slot_count() != table_slots
+                    || layer.directory.entries.len() != table_slots
+            })
+        {
+            return Err(format!(
+                "load-only table bind requires uniform record backing: layers={layer_count} logical={logical_slots} table={table_slots}"
+            ));
+        }
+        if self.occupied_resident_slot_count() != 0 {
+            return Err("load-only table bind found a populated expert directory".into());
+        }
+        let stats_before = self.slot_stats();
+        let mut probe = crate::metal::Gemma4DemandTableLoadOnlyProbe::new(table_slots)
+            .ok_or_else(|| format!("load-only table probe refused {table_slots} table slots"))?;
+        let (engine, layers) = (&mut self.engine, &self.layers);
+        for (layer_index, layer) in layers.iter().enumerate() {
+            probe
+                .bind_actual_table(engine, &layer.slots)
+                .ok_or_else(|| {
+                    format!(
+                        "load-only production HEAD/chained table bind failed at layer {layer_index}"
+                    )
+                })?;
+        }
+        if self.occupied_resident_slot_count() != 0 || self.slot_stats() != stats_before {
+            return Err("load-only table bind mutated a directory or routed-expert counter".into());
+        }
+        Ok(GhostMetalDemandTableLoadOnlyReceipt {
+            layer_count,
+            logical_slot_count: self.resident_slot_count(),
+            table_directory_slot_count: self.physical_slot_budget_count(),
+            compute_active_slot_count: layer_count.saturating_mul(probe.active_slots()),
+            table_directory_capacity_bytes: self.physical_slot_budget_bytes(),
+        })
+    }
+
+    fn occupied_resident_slot_count(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|layer| {
+                layer
+                    .directory
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.is_some())
+                    .count()
+            })
+            .sum()
+    }
+
+    fn overflow_slot_capacity(&self) -> usize {
+        self.overflow_bank
+            .iter()
+            .map(|bank| bank.slot_count())
+            .sum()
+    }
+
+    fn overflow_capacity_bytes(&self) -> usize {
+        self.overflow_bank
+            .iter()
+            .map(|bank| bank.slot_count() * bank.slot_stride_bytes())
+            .sum()
+    }
+
+    fn victim_record_capacity(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|layer| layer.victims.capacity())
+            .sum()
+    }
+
+    fn victim_capacity_bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|layer| layer.victims.capacity() * layer.victims.record_bytes)
+            .sum()
+    }
+
+    fn arbitrary_prewarm_record_count(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|layer| layer.slots.slot_count().min(128))
+            .sum()
+    }
+
     fn slots_per_layer(&self) -> usize {
         self.layers
             .first()
             .map_or(0, |layer| layer.slots.slot_count())
+    }
+
+    fn physical_slots_per_layer(&self) -> usize {
+        self.layers
+            .first()
+            .map_or(0, |layer| layer.directory.entries.len())
     }
 
     fn slot_stats(&self) -> GhostMetalSlotStats {
@@ -3599,9 +4003,18 @@ impl GhostMetalExpertRuntime {
             })
     }
 
+    fn has_record_granular_backing(&self) -> bool {
+        self.layers
+            .iter()
+            .any(|layer| layer.slots.is_record_granular())
+    }
+
     /// Pre-warm the persistent pinned hot slots across all layers directly from the .cghost file
     /// during initialization so that initial decode steps have zero cold slot misses on hot experts.
     fn prewarm_hot_slots_direct(&mut self, ghost_file: &GhostFile) {
+        if self.has_record_granular_backing() {
+            return;
+        }
         let t0 = std::time::Instant::now();
         let mut total_prewarmed = 0usize;
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
@@ -3657,6 +4070,13 @@ impl GhostMetalExpertRuntime {
         request_sequence: &[usize],
         records: &std::collections::HashMap<usize, Arc<GhostMoeExpert>>,
     ) -> bool {
+        // Demand-only is a residency contract, not merely a load-order hint:
+        // even correctly routed prompt history can fill all 88 configured
+        // slots/layer before measured decode begins. Keep this sink fail-closed
+        // so future callers cannot bypass the planning-side guard below.
+        if ghost_metal_demand_load_only_from_env() || self.has_record_granular_backing() {
+            return true;
+        }
         if request_sequence.is_empty() {
             return true;
         }
@@ -3749,10 +4169,7 @@ impl GhostMetalExpertRuntime {
             .saturating_add(experts.len() as u64);
         layer.stats.hits = layer.stats.hits.saturating_add(hits as u64);
         layer.stats.misses = layer.stats.misses.saturating_add(loads.len() as u64);
-        layer.stats.evictions = layer
-            .stats
-            .evictions
-            .saturating_add(evicted.len() as u64);
+        layer.stats.evictions = layer.stats.evictions.saturating_add(evicted.len() as u64);
         // HEAD-lane evictions share the chained-round timebase so a later
         // chained-round miss of the same expert is not misread as cold.
         for eviction in &evicted {
@@ -3941,7 +4358,7 @@ impl GhostMetalExpertRuntime {
         layer_routes: &[Vec<usize>],
         pool: &Option<rayon::ThreadPool>,
     ) {
-        if layer_routes.is_empty() {
+        if layer_routes.is_empty() || self.has_record_granular_backing() {
             return;
         }
         let prefetch_tasks: Vec<(usize, Vec<GhostMetalSlotLoad>)> = self
@@ -4026,6 +4443,9 @@ impl GhostMetalExpertRuntime {
         file: &GhostFile,
         pool: &Option<rayon::ThreadPool>,
     ) {
+        if self.has_record_granular_backing() {
+            return;
+        }
         let mut union_routes: Vec<Vec<usize>> = Vec::with_capacity(self.layers.len());
         for layer_idx in 0..self.layers.len() {
             let mut set = std::collections::HashSet::new();
@@ -4055,6 +4475,9 @@ impl GhostMetalExpertRuntime {
         file: &GhostFile,
         pool: &Option<rayon::ThreadPool>,
     ) {
+        if self.has_record_granular_backing() {
+            return;
+        }
         let routes = self.latest_routed_experts.clone();
         self.prefetch_temporal_routes(file, &routes, pool);
     }
@@ -4066,6 +4489,9 @@ impl GhostMetalExpertRuntime {
         file: &GhostFile,
         pool: &Option<rayon::ThreadPool>,
     ) {
+        if self.has_record_granular_backing() {
+            return;
+        }
         let next_layer = current_layer + 1;
         if next_layer >= self.layers.len() {
             return;
@@ -4116,7 +4542,7 @@ impl GhostMetalExpertRuntime {
         file: &GhostFile,
         pool: &Option<rayon::ThreadPool>,
     ) {
-        if predicted_experts.is_empty() {
+        if predicted_experts.is_empty() || self.has_record_granular_backing() {
             return;
         }
         let Some(layer) = self.layers.get_mut(layer_idx) else {
@@ -4166,6 +4592,12 @@ impl GhostMetalExpertRuntime {
             history.extend_from_slice(unique_experts);
         }
         let layer = self.layers.get_mut(layer_idx)?;
+        // Record-granular demand backing is consumed only by the exact HEAD
+        // and chained argument-buffer lanes. This legacy chunk interface
+        // requires one monolithic buffer, so fail closed before loading slots.
+        if layer.slots.is_record_granular() {
+            return None;
+        }
         let mut slot_indices = Vec::with_capacity(unique_experts.len());
         for &e in unique_experts {
             let slot = layer.directory.lookup_resident_slot(e)?;
@@ -4176,7 +4608,7 @@ impl GhostMetalExpertRuntime {
             .route_lookups
             .saturating_add(unique_experts.len() as u64);
         layer.stats.hits = layer.stats.hits.saturating_add(unique_experts.len() as u64);
-        Some((layer.slots.slab_buffer(), slot_indices))
+        Some((layer.slots.monolithic_slab_buffer()?, slot_indices))
     }
 
     fn prepare_chunk_slots(
@@ -4191,6 +4623,9 @@ impl GhostMetalExpertRuntime {
         }
         let round_seq = self.chained_round_seq;
         let layer = self.layers.get_mut(ghost.layer_idx)?;
+        if layer.slots.is_record_granular() {
+            return None;
+        }
         let plan = match layer.directory.plan(unique_experts) {
             Ok(plan) => plan,
             Err(_) => return None,
@@ -4207,10 +4642,7 @@ impl GhostMetalExpertRuntime {
             .saturating_add(unique_experts.len() as u64);
         layer.stats.hits = layer.stats.hits.saturating_add(hits as u64);
         layer.stats.misses = layer.stats.misses.saturating_add(loads.len() as u64);
-        layer.stats.evictions = layer
-            .stats
-            .evictions
-            .saturating_add(evicted.len() as u64);
+        layer.stats.evictions = layer.stats.evictions.saturating_add(evicted.len() as u64);
         for eviction in &evicted {
             if eviction.expert < 128 && round_seq > 0 {
                 layer.evicted_round[eviction.expert] = round_seq;
@@ -4329,7 +4761,7 @@ impl GhostMetalExpertRuntime {
             }
         }
 
-        let slab_buffer = layer.slots.slab_buffer();
+        let slab_buffer = layer.slots.monolithic_slab_buffer()?;
         Some((slab_buffer, route_slots))
     }
 
@@ -4695,15 +5127,171 @@ fn ghost_source_filename_admitted(
 }
 
 #[cfg(target_os = "macos")]
-fn build_ghost_common_metal(
+struct GhostCommonMetalBuild {
+    common: crate::metal::Gemma4GhostCommonMetal,
+    wire_q4_payload_bytes: usize,
+    wire_q4_allocation_bytes: usize,
+}
+
+#[cfg(target_os = "macos")]
+struct GhostCommonWireLayerPrepared {
+    q: Arc<crate::wire_mmap::WirePages>,
+    k: Arc<crate::wire_mmap::WirePages>,
+    v: Option<Arc<crate::wire_mmap::WirePages>>,
+    output: Arc<crate::wire_mmap::WirePages>,
+    gate: Arc<crate::wire_mmap::WirePages>,
+    up: Arc<crate::wire_mmap::WirePages>,
+    down: Arc<crate::wire_mmap::WirePages>,
+}
+
+#[cfg(target_os = "macos")]
+struct GhostCommonMetalPrepared {
+    resident_layers: Vec<crate::metal::Gemma4ResidentLayer>,
+    /// Present only between the observed Q4-only callback and the explicit
+    /// resident-layer auxiliary allocation phase. Production keeps its
+    /// historical interleaved page-read/resident-layer construction order.
+    pending_wire_layers: Option<Vec<GhostCommonWireLayerPrepared>>,
+    post_norm_1: Option<Vec<Vec<f32>>>,
+    moe_configs: Option<Vec<crate::metal::Gemma4GhostMoeLayerConfig>>,
+    max_positions: usize,
+    wire_q4_payload_bytes: usize,
+    wire_q4_allocation_bytes: usize,
+    wire_q4_source_page_window_bytes: u64,
+    wire_q4_source_resident_before_bytes: u64,
+    wire_q4_source_resident_after_bytes: u64,
+    /// Cumulative resident-to-nonresident transitions confirmed by mincore
+    /// around each advisory. A boundary page read by two adjacent tensors may
+    /// transition twice; the union before/after fields remain the authoritative
+    /// unique-residency facts.
+    wire_q4_source_confirmed_discarded_bytes: u64,
+    wire_q4_source_discard_advisory_calls: u64,
+    wire_q4_source_final_cleanup_advisory_calls: u64,
+    wire_q4_source_uncached_reads: bool,
+    wire_q4_source_readahead_disabled: bool,
+    resident_layer_aux_capacity_bytes: u64,
+    resident_layer_aux_explicitly_touched_bytes: u64,
+    resident_layer_aux_transient_peak_capacity_bytes: u64,
+    resident_layer_aux_transient_peak_explicitly_touched_bytes: u64,
+}
+
+#[cfg(target_os = "macos")]
+fn ghost_common_source_resident_bytes(
+    mapping: &GgufWireMmap,
+    ranges: &[crate::wire_mmap::WireMmapAlignedRange],
+) -> Result<u64> {
+    ranges.iter().try_fold(0u64, |total, range| {
+        let resident = mapping
+            .residency_snapshot_range(range.aligned_offset, range.mapped_bytes)?
+            .resident_bytes as u64;
+        total.checked_add(resident).ok_or_else(|| {
+            BackendError::InvalidModelMetadata(
+                "cache-controlled common Q4 source residency total overflowed u64".into(),
+            )
+        })
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn checked_common_source_discard_bytes(
+    discard: crate::wire_mmap::WireMmapDiscardSnapshot,
+) -> Result<u64> {
+    if discard.range.mapped_bytes == 0
+        || discard.resident_before_bytes > discard.range.mapped_bytes
+        || discard.resident_after_bytes > discard.range.mapped_bytes
+        || discard.confirmed_discarded_bytes
+            != discard
+                .resident_before_bytes
+                .saturating_sub(discard.resident_after_bytes)
+    {
+        return Err(BackendError::InvalidTensorData(format!(
+            "cache-controlled common Q4 discard snapshot is inconsistent: range={:?} before={} after={} discarded={}",
+            discard.range,
+            discard.resident_before_bytes,
+            discard.resident_after_bytes,
+            discard.confirmed_discarded_bytes,
+        )));
+    }
+    Ok(discard.confirmed_discarded_bytes as u64)
+}
+
+#[cfg(target_os = "macos")]
+fn configure_common_q4_uncached_file(file: &std::fs::File, path: &Path) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    let fd = file.as_raw_fd();
+    // These controls are descriptor-local. Shipping-default production opens
+    // the same path without entering this experiment-opt-in branch.
+    let no_cache = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
+    if no_cache == -1 {
+        return Err(BackendError::InvalidTensorData(format!(
+            "cache-controlled common Q4 F_NOCACHE=1 failed for {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    let no_readahead = unsafe { libc::fcntl(fd, libc::F_RDAHEAD, 0) };
+    if no_readahead == -1 {
+        return Err(BackendError::InvalidTensorData(format!(
+            "cache-controlled common Q4 F_RDAHEAD=0 failed for {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn build_ghost_common_resident_layer(
+    layer_idx: usize,
+    layer: &LayerWeights,
+    wire: &GhostCommonWireLayerPrepared,
+    config: &LlamaModelConfig,
+    g: &Gemma4Metadata,
+) -> Result<crate::metal::Gemma4ResidentLayer> {
+    crate::metal::Gemma4ResidentLayer::from_wire_pages_owned(
+        crate::metal::GemmaWireFmt::Q4_0,
+        layer.attn_norm.clone(),
+        layer.q_norm.clone(),
+        layer.k_norm.clone().ok_or_else(|| {
+            BackendError::InvalidModelMetadata(format!(
+                "Ghost common Metal layer {layer_idx} omits attn_k_norm"
+            ))
+        })?,
+        layer.post_attn_norm.clone(),
+        layer.ffn_norm.clone(),
+        layer.post_ffw_norm.clone(),
+        &wire.q,
+        &wire.k,
+        wire.v.as_ref(),
+        &wire.output,
+        &wire.gate,
+        &wire.up,
+        &wire.down,
+        config.attention_head_count as usize,
+        g.kv_heads_at(layer_idx) as usize,
+        g.head_dim_at(layer_idx) as usize,
+        g.ffn_length_at(layer_idx) as usize,
+        config.rms_norm_epsilon,
+    )
+    .ok_or_else(|| {
+        BackendError::UnsupportedModelArchitecture(
+            "Metal unavailable while constructing Ghost common core".into(),
+        )
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_ghost_common_metal(
     path: &Path,
     store: &TensorStore,
+    target_mapping: Option<&GgufWireMmap>,
     binding: &Gemma4Binding,
     config: &LlamaModelConfig,
     g: &Gemma4Metadata,
     layers: &[LayerWeights],
     max_positions: usize,
-) -> Result<Option<crate::metal::Gemma4GhostCommonMetal>> {
+    defer_auxiliary: bool,
+) -> Result<Option<GhostCommonMetalPrepared>> {
     let mut refusals = Vec::new();
     let expect = |refusals: &mut Vec<String>, admitted: bool, detail: String| {
         if !admitted {
@@ -4852,22 +5440,140 @@ fn build_ghost_common_metal(
         }
         return Ok(None);
     }
+
+    // Source-cache control is independent of auxiliary construction order.
+    // The load-only observer combines it with deferred auxiliaries for phase
+    // attribution; demand-only production combines it with the established
+    // per-layer read -> resident-layer construction order.
+    let (
+        cache_controlled_source_mapping,
+        cache_controlled_source_ranges,
+        cache_controlled_source_descriptor_count,
+    ) = if let Some(mapping) = target_mapping {
+        let mut exact_ranges = Vec::with_capacity(binding.layers.len() * 7);
+        for bound in &binding.layers {
+            for descriptor in [
+                Some(&bound.attn_q),
+                bound.attn_k.as_ref(),
+                bound.attn_v.as_ref(),
+                Some(&bound.attn_output),
+                Some(&bound.ffn_gate),
+                Some(&bound.ffn_up),
+                Some(&bound.ffn_down),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                exact_ranges.push((descriptor.absolute_offset, descriptor.n_bytes as usize));
+            }
+        }
+        let descriptor_count = exact_ranges.len() as u64;
+        if descriptor_count != 205 {
+            return Err(BackendError::InvalidModelMetadata(format!(
+                    "cache-controlled common Q4 descriptor count changed: {descriptor_count} (expected 205)"
+                )));
+        }
+        let merged = crate::wire_mmap::merge_aligned_page_ranges(
+            &exact_ranges,
+            mapping.mapped_len(),
+            crate::wire_mmap::page_size(),
+        )?;
+        (Some(mapping), merged, descriptor_count)
+    } else {
+        (None, Vec::new(), 0)
+    };
+    let wire_q4_source_page_window_bytes =
+        cache_controlled_source_ranges
+            .iter()
+            .try_fold(0u64, |total, range| {
+                total.checked_add(range.mapped_bytes as u64).ok_or_else(|| {
+                    BackendError::InvalidModelMetadata(
+                        "cache-controlled common Q4 source page-window total overflowed u64".into(),
+                    )
+                })
+            })?;
+    let wire_q4_source_resident_before_bytes = match cache_controlled_source_mapping {
+        Some(mapping) => {
+            ghost_common_source_resident_bytes(mapping, &cache_controlled_source_ranges)?
+        }
+        None => 0,
+    };
+
     let file = std::fs::File::open(path).map_err(|source| BackendError::Io {
         path: path.to_path_buf(),
         source,
     })?;
+    if cache_controlled_source_mapping.is_some() {
+        configure_common_q4_uncached_file(&file, path)?;
+    }
+    let wire_q4_payload_bytes = std::cell::Cell::new(0usize);
+    let wire_q4_allocation_bytes = std::cell::Cell::new(0usize);
+    let wire_q4_source_confirmed_discarded_bytes = std::cell::Cell::new(0u64);
+    let wire_q4_source_discard_advisory_calls = std::cell::Cell::new(0u64);
     let pages = |name: &str| -> Result<Arc<crate::wire_mmap::WirePages>> {
         let descriptor = store.descriptor(name)?;
-        crate::wire_mmap::WirePages::read_from_file(
+        let loaded = crate::wire_mmap::WirePages::read_from_file(
             &file,
             descriptor.absolute_offset,
             descriptor.n_bytes as usize,
-        )
+        )?;
+        wire_q4_payload_bytes.set(
+            wire_q4_payload_bytes
+                .get()
+                .checked_add(loaded.byte_len())
+                .ok_or_else(|| {
+                    BackendError::InvalidModelMetadata(
+                        "Ghost common Q4 wire payload byte count overflowed usize".into(),
+                    )
+                })?,
+        );
+        wire_q4_allocation_bytes.set(
+            wire_q4_allocation_bytes
+                .get()
+                .checked_add(loaded.alloc_len())
+                .ok_or_else(|| {
+                    BackendError::InvalidModelMetadata(
+                        "Ghost common Q4 page allocation byte count overflowed usize".into(),
+                    )
+                })?,
+        );
+        if let Some(mapping) = cache_controlled_source_mapping {
+            let discard = mapping
+                .advise_dontneed_range(descriptor.absolute_offset, descriptor.n_bytes as usize)?;
+            wire_q4_source_confirmed_discarded_bytes.set(
+                wire_q4_source_confirmed_discarded_bytes
+                    .get()
+                    .checked_add(checked_common_source_discard_bytes(discard)?)
+                    .ok_or_else(|| {
+                        BackendError::InvalidModelMetadata(
+                            "cache-controlled common Q4 confirmed-discard byte count overflowed u64"
+                                .into(),
+                        )
+                    })?,
+            );
+            wire_q4_source_discard_advisory_calls.set(
+                wire_q4_source_discard_advisory_calls
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        BackendError::InvalidModelMetadata(
+                            "cache-controlled common Q4 discard-advisory count overflowed u64"
+                                .into(),
+                        )
+                    })?,
+            );
+        }
+        Ok(loaded)
     };
 
-    let mut resident_layers = Vec::with_capacity(layers.len());
-    let mut post_norm_1 = Vec::with_capacity(layers.len());
-    let mut moe_configs = Vec::with_capacity(layers.len());
+    let mut resident_layers = if defer_auxiliary {
+        Vec::new()
+    } else {
+        Vec::with_capacity(layers.len())
+    };
+    let mut pending_wire_layers = defer_auxiliary.then(|| Vec::with_capacity(layers.len()));
+    let mut post_norm_1 = (!defer_auxiliary).then(|| Vec::with_capacity(layers.len()));
+    let mut moe_configs = (!defer_auxiliary).then(|| Vec::with_capacity(layers.len()));
     for (layer_idx, (layer, bound)) in layers.iter().zip(&binding.layers).enumerate() {
         let k_descriptor = bound.attn_k.as_ref().ok_or_else(|| {
             BackendError::InvalidModelMetadata(format!(
@@ -4881,60 +5587,281 @@ fn build_ghost_common_metal(
             .as_ref()
             .map(|descriptor| pages(&descriptor.name))
             .transpose()?;
-        let resident = crate::metal::Gemma4ResidentLayer::from_wire_pages_owned(
-            crate::metal::GemmaWireFmt::Q4_0,
-            layer.attn_norm.clone(),
-            layer.q_norm.clone(),
-            layer.k_norm.clone().ok_or_else(|| {
-                BackendError::InvalidModelMetadata(format!(
-                    "Ghost common Metal layer {layer_idx} omits attn_k_norm"
-                ))
-            })?,
-            layer.post_attn_norm.clone(),
-            layer.ffn_norm.clone(),
-            layer.post_ffw_norm.clone(),
-            &q_pages,
-            &k_pages,
-            v_pages.as_ref(),
-            &pages(&bound.attn_output.name)?,
-            &pages(&bound.ffn_gate.name)?,
-            &pages(&bound.ffn_up.name)?,
-            &pages(&bound.ffn_down.name)?,
-            config.attention_head_count as usize,
-            g.kv_heads_at(layer_idx) as usize,
-            g.head_dim_at(layer_idx) as usize,
-            g.ffn_length_at(layer_idx) as usize,
-            config.rms_norm_epsilon,
-        )
-        .ok_or_else(|| {
-            BackendError::UnsupportedModelArchitecture(
-                "Metal unavailable while constructing Ghost common core".into(),
-            )
-        })?;
-        let moe = layer
-            .moe
-            .as_ref()
-            .expect("exact Ghost common preflight requires MoE on every layer");
-        resident_layers.push(resident);
-        post_norm_1.push(moe.post_norm_1.clone());
-        moe_configs.push(crate::metal::Gemma4GhostMoeLayerConfig {
-            router: moe.gate_inp.clone(),
-            gate_input_scale: moe.gate_inp_scale.clone(),
-            pre_norm_2: moe.pre_norm_2.clone(),
-            post_norm_2: moe.post_norm_2.clone(),
-            down_exps_scale: moe.down_exps_scale.clone(),
-            layer_output_scale: layer.ple_output_scale,
-        });
+        let wire = GhostCommonWireLayerPrepared {
+            q: q_pages,
+            k: k_pages,
+            v: v_pages,
+            output: pages(&bound.attn_output.name)?,
+            gate: pages(&bound.ffn_gate.name)?,
+            up: pages(&bound.ffn_up.name)?,
+            down: pages(&bound.ffn_down.name)?,
+        };
+        if defer_auxiliary {
+            pending_wire_layers
+                .as_mut()
+                .expect("deferred common build owns pending wire layers")
+                .push(wire);
+        } else {
+            // Keep production's historical per-layer ordering: read this
+            // layer's Q4 pages, build its resident auxiliaries, then advance.
+            resident_layers.push(build_ghost_common_resident_layer(
+                layer_idx, layer, &wire, config, g,
+            )?);
+            let moe = layer
+                .moe
+                .as_ref()
+                .expect("exact Ghost common preflight requires MoE on every layer");
+            post_norm_1
+                .as_mut()
+                .expect("non-deferred common build owns post norms")
+                .push(moe.post_norm_1.clone());
+            moe_configs
+                .as_mut()
+                .expect("non-deferred common build owns MoE configs")
+                .push(crate::metal::Gemma4GhostMoeLayerConfig {
+                    router: moe.gate_inp.clone(),
+                    gate_input_scale: moe.gate_inp_scale.clone(),
+                    pre_norm_2: moe.pre_norm_2.clone(),
+                    post_norm_2: moe.post_norm_2.clone(),
+                    down_exps_scale: moe.down_exps_scale.clone(),
+                    layer_output_scale: layer.ple_output_scale,
+                });
+        }
     }
-    let Some(mut common) =
-        crate::metal::Gemma4GhostCommonMetal::new_26b(resident_layers, post_norm_1, max_positions)
-    else {
-        return Ok(None);
+
+    if wire_q4_source_discard_advisory_calls.get() != cache_controlled_source_descriptor_count {
+        return Err(BackendError::InvalidModelMetadata(format!(
+            "cache-controlled common Q4 discard coverage changed: calls={} descriptors={cache_controlled_source_descriptor_count}",
+            wire_q4_source_discard_advisory_calls.get(),
+        )));
+    }
+
+    let mut wire_q4_source_final_cleanup_advisory_calls = 0u64;
+    let wire_q4_source_resident_after_bytes = match cache_controlled_source_mapping {
+        Some(mapping) => {
+            let after_individual =
+                ghost_common_source_resident_bytes(mapping, &cache_controlled_source_ranges)?;
+            if after_individual > wire_q4_source_resident_before_bytes {
+                for range in &cache_controlled_source_ranges {
+                    let discard = mapping.invalidate_cached_aligned_range(*range)?;
+                    wire_q4_source_confirmed_discarded_bytes.set(
+                        wire_q4_source_confirmed_discarded_bytes
+                            .get()
+                            .checked_add(checked_common_source_discard_bytes(discard)?)
+                            .ok_or_else(|| {
+                                BackendError::InvalidModelMetadata(
+                                    "cache-controlled common Q4 cleanup-discard byte count overflowed u64"
+                                        .into(),
+                                )
+                            })?,
+                    );
+                    wire_q4_source_final_cleanup_advisory_calls =
+                        wire_q4_source_final_cleanup_advisory_calls
+                            .checked_add(1)
+                            .ok_or_else(|| {
+                                BackendError::InvalidModelMetadata(
+                                    "cache-controlled common Q4 cleanup-advisory count overflowed u64"
+                                        .into(),
+                                )
+                            })?;
+                }
+            }
+            let after =
+                ghost_common_source_resident_bytes(mapping, &cache_controlled_source_ranges)?;
+            if after > wire_q4_source_resident_before_bytes {
+                return Err(BackendError::InvalidTensorData(format!(
+                    "cache-controlled common Q4 source cache remained above baseline after fail-closed discard: before={} after={} growth={} page_window={}",
+                    wire_q4_source_resident_before_bytes,
+                    after,
+                    after - wire_q4_source_resident_before_bytes,
+                    wire_q4_source_page_window_bytes,
+                )));
+            }
+            after
+        }
+        None => 0,
     };
-    if !common.configure_moe(moe_configs) {
-        return Ok(None);
+    Ok(Some(GhostCommonMetalPrepared {
+        resident_layers,
+        pending_wire_layers,
+        post_norm_1,
+        moe_configs,
+        max_positions,
+        wire_q4_payload_bytes: wire_q4_payload_bytes.get(),
+        wire_q4_allocation_bytes: wire_q4_allocation_bytes.get(),
+        wire_q4_source_page_window_bytes,
+        wire_q4_source_resident_before_bytes,
+        wire_q4_source_resident_after_bytes,
+        wire_q4_source_confirmed_discarded_bytes: wire_q4_source_confirmed_discarded_bytes.get(),
+        wire_q4_source_discard_advisory_calls: wire_q4_source_discard_advisory_calls.get(),
+        wire_q4_source_final_cleanup_advisory_calls,
+        wire_q4_source_uncached_reads: cache_controlled_source_mapping.is_some(),
+        wire_q4_source_readahead_disabled: cache_controlled_source_mapping.is_some(),
+        resident_layer_aux_capacity_bytes: 0,
+        resident_layer_aux_explicitly_touched_bytes: 0,
+        resident_layer_aux_transient_peak_capacity_bytes: 0,
+        resident_layer_aux_transient_peak_explicitly_touched_bytes: 0,
+    }))
+}
+
+#[cfg(target_os = "macos")]
+fn materialize_observed_ghost_common_resident_layers(
+    mut prepared: GhostCommonMetalPrepared,
+    config: &LlamaModelConfig,
+    g: &Gemma4Metadata,
+    layers: &[LayerWeights],
+) -> Result<GhostCommonMetalPrepared> {
+    let pending = prepared.pending_wire_layers.take().ok_or_else(|| {
+        BackendError::InvalidModelMetadata(
+            "observed Ghost common build has no deferred Q4 wire layers".into(),
+        )
+    })?;
+    if !prepared.resident_layers.is_empty() || pending.len() != layers.len() {
+        return Err(BackendError::InvalidModelMetadata(format!(
+            "observed Ghost resident-layer materialization geometry changed: resident={} pending={} layers={}",
+            prepared.resident_layers.len(),
+            pending.len(),
+            layers.len()
+        )));
     }
-    Ok(Some(common))
+
+    let mut resident_layers = Vec::with_capacity(layers.len());
+    let mut retained_capacity_bytes = 0u64;
+    let mut retained_explicitly_touched_bytes = 0u64;
+    let mut transient_peak_capacity_bytes = 0u64;
+    let mut transient_peak_explicitly_touched_bytes = 0u64;
+    for (layer_idx, (layer, wire)) in layers.iter().zip(&pending).enumerate() {
+        let resident = build_ghost_common_resident_layer(layer_idx, layer, wire, config, g)?;
+        let allocation = resident.auxiliary_allocation_ledger(true).ok_or_else(|| {
+            BackendError::InvalidModelMetadata(format!(
+                "observed Ghost resident-layer {layer_idx} auxiliary ledger overflowed"
+            ))
+        })?;
+        retained_capacity_bytes = retained_capacity_bytes
+            .checked_add(allocation.retained_capacity_bytes)
+            .ok_or_else(|| {
+                BackendError::InvalidModelMetadata(
+                    "observed Ghost resident-layer auxiliary capacity overflowed".into(),
+                )
+            })?;
+        retained_explicitly_touched_bytes = retained_explicitly_touched_bytes
+            .checked_add(allocation.retained_explicitly_touched_bytes)
+            .ok_or_else(|| {
+                BackendError::InvalidModelMetadata(
+                    "observed Ghost resident-layer auxiliary touch count overflowed".into(),
+                )
+            })?;
+        transient_peak_capacity_bytes =
+            transient_peak_capacity_bytes.max(allocation.transient_peak_capacity_bytes);
+        transient_peak_explicitly_touched_bytes = transient_peak_explicitly_touched_bytes
+            .max(allocation.transient_peak_explicitly_touched_bytes);
+        resident_layers.push(resident);
+    }
+    prepared.resident_layers = resident_layers;
+    prepared.resident_layer_aux_capacity_bytes = retained_capacity_bytes;
+    prepared.resident_layer_aux_explicitly_touched_bytes = retained_explicitly_touched_bytes;
+    prepared.resident_layer_aux_transient_peak_capacity_bytes = transient_peak_capacity_bytes;
+    prepared.resident_layer_aux_transient_peak_explicitly_touched_bytes =
+        transient_peak_explicitly_touched_bytes;
+    Ok(prepared)
+}
+
+#[cfg(target_os = "macos")]
+fn finish_ghost_common_metal(
+    prepared: GhostCommonMetalPrepared,
+    layers: &[LayerWeights],
+) -> Option<GhostCommonMetalBuild> {
+    let GhostCommonMetalPrepared {
+        resident_layers,
+        pending_wire_layers,
+        post_norm_1,
+        moe_configs,
+        max_positions,
+        wire_q4_payload_bytes,
+        wire_q4_allocation_bytes,
+        wire_q4_source_page_window_bytes: _,
+        wire_q4_source_resident_before_bytes: _,
+        wire_q4_source_resident_after_bytes: _,
+        wire_q4_source_confirmed_discarded_bytes: _,
+        wire_q4_source_discard_advisory_calls: _,
+        wire_q4_source_final_cleanup_advisory_calls: _,
+        wire_q4_source_uncached_reads: _,
+        wire_q4_source_readahead_disabled: _,
+        resident_layer_aux_capacity_bytes: _,
+        resident_layer_aux_explicitly_touched_bytes: _,
+        resident_layer_aux_transient_peak_capacity_bytes: _,
+        resident_layer_aux_transient_peak_explicitly_touched_bytes: _,
+    } = prepared;
+    if pending_wire_layers.is_some() {
+        return None;
+    }
+    let post_norm_1 = post_norm_1.unwrap_or_else(|| {
+        layers
+            .iter()
+            .map(|layer| {
+                layer
+                    .moe
+                    .as_ref()
+                    .expect("exact Ghost common preflight requires MoE on every layer")
+                    .post_norm_1
+                    .clone()
+            })
+            .collect()
+    });
+    let moe_configs = moe_configs.unwrap_or_else(|| {
+        layers
+            .iter()
+            .map(|layer| {
+                let moe = layer
+                    .moe
+                    .as_ref()
+                    .expect("exact Ghost common preflight requires MoE on every layer");
+                crate::metal::Gemma4GhostMoeLayerConfig {
+                    router: moe.gate_inp.clone(),
+                    gate_input_scale: moe.gate_inp_scale.clone(),
+                    pre_norm_2: moe.pre_norm_2.clone(),
+                    post_norm_2: moe.post_norm_2.clone(),
+                    down_exps_scale: moe.down_exps_scale.clone(),
+                    layer_output_scale: layer.ple_output_scale,
+                }
+            })
+            .collect()
+    });
+    let mut common =
+        crate::metal::Gemma4GhostCommonMetal::new_26b(resident_layers, post_norm_1, max_positions)?;
+    if !common.configure_moe(moe_configs) {
+        return None;
+    }
+    Some(GhostCommonMetalBuild {
+        common,
+        wire_q4_payload_bytes,
+        wire_q4_allocation_bytes,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn build_ghost_common_metal(
+    path: &Path,
+    store: &TensorStore,
+    cache_controlled_source_mapping: Option<&GgufWireMmap>,
+    binding: &Gemma4Binding,
+    config: &LlamaModelConfig,
+    g: &Gemma4Metadata,
+    layers: &[LayerWeights],
+    max_positions: usize,
+) -> Result<Option<GhostCommonMetalBuild>> {
+    Ok(prepare_ghost_common_metal(
+        path,
+        store,
+        cache_controlled_source_mapping,
+        binding,
+        config,
+        g,
+        layers,
+        max_positions,
+        false,
+    )?
+    .and_then(|prepared| finish_ghost_common_metal(prepared, layers)))
 }
 
 /// A loaded Gemma 4 model ready to generate.
@@ -4997,6 +5924,377 @@ pub struct Gemma4GhostMetalComponents {
     pub head: bool,
 }
 
+/// Cumulative directory and source-I/O counters for routed base slots.
+///
+/// This is a receipt-only view: reading it cannot load an expert, touch a slot
+/// slab, dispatch Metal work, or change routing policy.
+#[doc(hidden)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct Gemma4RoutedExpertSlotStatsSnapshot {
+    pub route_lookups: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    pub host_fills: u64,
+    pub prewarm_copies: u64,
+    pub direct_reads: u64,
+    pub direct_read_bytes: u64,
+    pub direct_read_failures: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl From<GhostMetalSlotStats> for Gemma4RoutedExpertSlotStatsSnapshot {
+    fn from(stats: GhostMetalSlotStats) -> Self {
+        Self {
+            route_lookups: stats.route_lookups,
+            hits: stats.hits,
+            misses: stats.misses,
+            evictions: stats.evictions,
+            host_fills: stats.host_fills,
+            prewarm_copies: stats.prewarm_copies,
+            direct_reads: stats.direct_reads,
+            direct_read_bytes: stats.direct_read_bytes,
+            direct_read_failures: stats.direct_read_failures,
+        }
+    }
+}
+
+/// Current base-slot occupancy for one routed-expert layer.
+#[doc(hidden)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct Gemma4RoutedExpertLayerResidencySnapshot {
+    pub layer_index: u32,
+    /// Allocated logical records, including unbound lazy capacity.
+    pub base_slot_capacity: u64,
+    /// Prefix encoded in the Tier-2 table and selectable by the directory.
+    /// This is the physical residency high-water in bounded record mode.
+    pub physical_base_slot_budget: u64,
+    pub physical_base_slot_budget_bytes: u64,
+    pub occupied_base_slots: u64,
+    pub occupied_base_payload_bytes: u64,
+    /// Explicitly CPU-filled directory span: exactly
+    /// `occupied * slot_stride_bytes`, kept separate from the smaller expert
+    /// payload count above. Compute binding may materialize the complete
+    /// `physical_base_slot_budget`; that cap is receipted separately.
+    pub occupied_base_touched_bytes: u64,
+    pub slot_stats: Gemma4RoutedExpertSlotStatsSnapshot,
+}
+
+/// Non-mutating routed-expert residency and demand-I/O receipt.
+///
+/// `direct_read_bytes` covers the HEAD lane's direct base-slot preads.
+/// `cumulative_chained_demand_read_bytes` covers chained-wave fills. The two
+/// source paths are disjoint, so `cumulative_expert_payload_read_bytes` is
+/// their sum without counting host-cache `bytes_read` a second time. The last
+/// chained ledger is deliberately labeled as the latest completed attempt, not
+/// a generation-wide maximum; `last_chained_round_succeeded` distinguishes a
+/// committed chained forward from an attempt that fell back.
+#[doc(hidden)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct Gemma4RoutedExpertResidencySnapshot {
+    pub layer_count: u32,
+    pub slot_record_bytes: u64,
+    pub slot_stride_bytes: u64,
+    /// Allocated logical records across all layers.
+    pub base_slot_capacity: u64,
+    pub base_slot_capacity_bytes: u64,
+    /// Table-bound/directory-selectable records across all layers.
+    pub physical_base_slot_budget: u64,
+    pub physical_base_slot_budget_bytes: u64,
+    pub occupied_base_slots: u64,
+    pub occupied_base_payload_bytes: u64,
+    /// Aggregate explicitly CPU-filled directory span. This is not a measure
+    /// of physical residency after the Tier-2 tables have been compute-bound;
+    /// `physical_base_slot_budget_bytes` is the worst-case bound for that.
+    pub occupied_base_touched_bytes: u64,
+    pub per_layer: Vec<Gemma4RoutedExpertLayerResidencySnapshot>,
+    pub aggregate_slot_stats: Gemma4RoutedExpertSlotStatsSnapshot,
+    pub cumulative_chained_demand_loads: u64,
+    pub cumulative_chained_demand_read_bytes: u64,
+    pub cumulative_expert_payload_read_bytes: u64,
+    pub host_cache_hits: u64,
+    pub host_cache_misses: u64,
+    pub host_cache_evictions: u64,
+    pub host_cache_bytes_read: u64,
+    pub host_cache_resident_experts: u64,
+    pub host_cache_resident_bytes: u64,
+    pub host_cache_budget_bytes: u64,
+    pub interval_routed_expert_union_scope: String,
+    pub interval_routed_expert_union_epoch: u64,
+    pub interval_routed_expert_ids_per_layer: Vec<Vec<u16>>,
+    pub interval_routed_unique_per_layer: Vec<u16>,
+    pub interval_routed_unique_experts_sum: u32,
+    pub interval_routed_unique_experts_max: u32,
+    pub last_chained_ledger_scope: String,
+    pub last_chained_round_available: bool,
+    pub last_chained_round_succeeded: bool,
+    pub last_chained_round_sequence: u64,
+    pub last_chained_k: Option<u32>,
+    pub last_chained_unique_per_layer: Vec<u16>,
+    pub last_chained_unique_experts_sum: u32,
+    pub last_chained_unique_experts_max: u32,
+    pub last_chained_slot_hits: u32,
+    pub last_chained_slot_misses: u32,
+    pub last_chained_slot_evictions: u32,
+    pub last_chained_demand_loads: u64,
+    pub last_chained_demand_read_bytes: u64,
+    pub last_chained_overflow_slots: u32,
+    pub last_chained_overflow_bytes: u64,
+    pub last_chained_overflow_layers: u32,
+    pub last_chained_overflow_experts: u32,
+    pub last_chained_victim_hits: u32,
+    pub last_chained_victim_salvage_copies: u32,
+    pub last_chained_selected_experts_dropped: u32,
+    pub last_chained_missing_expert_failclose: u32,
+    pub last_chained_slot_capacity_overflow: u32,
+}
+
+/// Stable observation points for the isolated, load-only Ghost/MTP residency
+/// probe. No phase performs tokenization, prefill, generation, or a target
+/// forward.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Gemma4GhostLoadPhase {
+    TargetObjectMetadataReady,
+    CommonQ4WeightsAllocated,
+    CommonResidentLayerAuxAllocated,
+    CommonKvScratchAllocated,
+    EmptyExpertSlotsAllocated,
+    AssistantResidencyBarrierComplete,
+    RequiredTargetPagesHeadReady,
+    ExpertSlotTablesComputeBound,
+    Complete,
+}
+
+/// Exact allocation/capacity facts accumulated by the load-only observer.
+///
+/// Capacity is deliberately distinct from touched/resident memory: Metal may
+/// reserve a shared slot slab without faulting every page. File-backed mapping
+/// residency is sampled non-faultingly with mincore at every phase; the
+/// external probe still owns process footprint, compressor, and swap telemetry.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Gemma4GhostLoadAllocationLedger {
+    pub target_gguf_logical_bytes: u64,
+    pub cghost_logical_bytes: u64,
+    pub mapping_page_size_bytes: u64,
+    pub target_gguf_mapped_bytes: u64,
+    pub target_gguf_total_pages: u64,
+    pub target_gguf_resident_pages: u64,
+    pub target_gguf_resident_bytes: u64,
+    pub cghost_mapped_bytes: u64,
+    pub cghost_total_pages: u64,
+    pub cghost_resident_pages: u64,
+    pub cghost_resident_bytes: u64,
+    pub host_cache_budget_bytes: u64,
+    pub host_cache_resident_bytes: u64,
+    pub host_cache_explicitly_touched_bytes: u64,
+    pub expert_layer_count: u64,
+    /// Allocated logical record count/capacity. In bounded demand mode this
+    /// remains 88 records/layer even though only a leading table prefix is GPU
+    /// addressable.
+    pub expert_slot_count: u64,
+    pub expert_slot_capacity_bytes: u64,
+    /// Table-encoded and directory-selectable prefix. A first compute binding
+    /// may physically materialize this entire capacity even when the kernel's
+    /// synthetic active union is smaller.
+    pub expert_table_directory_slot_count: u64,
+    pub expert_table_directory_capacity_bytes: u64,
+    /// Exact active slot declarations in the load-only synthetic HEAD/chained
+    /// bind. This is a command receipt, not a residency estimate.
+    pub expert_table_bound_active_slot_count: u64,
+    pub expert_tables_compute_bound: bool,
+    /// Bytes explicitly CPU-filled in expert records. The zero-record
+    /// load-only table bind leaves this at zero; table residency capacity is
+    /// receipted separately above.
+    pub expert_slot_explicitly_touched_bytes: u64,
+    pub overflow_slot_count: u64,
+    pub overflow_capacity_bytes: u64,
+    pub overflow_explicitly_touched_bytes: u64,
+    pub victim_record_capacity: u64,
+    pub victim_capacity_bytes: u64,
+    pub victim_explicitly_touched_bytes: u64,
+    pub planned_prewarm_records: u64,
+    pub planned_prewarm_bytes: u64,
+    pub touched_prewarm_records: u64,
+    pub touched_prewarm_bytes: u64,
+    pub common_wire_q4_payload_bytes: u64,
+    pub common_wire_q4_allocation_bytes: u64,
+    pub common_wire_q4_explicitly_touched_bytes: u64,
+    /// Unique union of the page-aligned target-GGUF windows that sourced the
+    /// observed common Q4 copies. This is file-cache capacity, not anonymous
+    /// `WirePages` capacity.
+    pub common_wire_q4_source_page_window_bytes: u64,
+    /// Non-faulting mincore totals over the unique source-window union before
+    /// the first copy and after the last fail-closed discard.
+    pub common_wire_q4_source_resident_before_bytes: u64,
+    pub common_wire_q4_source_resident_after_bytes: u64,
+    /// Cumulative mincore-confirmed resident-to-nonresident transitions across
+    /// per-tensor advisories. Shared boundary pages can transition more than
+    /// once, so compare unique pressure with the before/after fields above.
+    pub common_wire_q4_source_confirmed_discarded_bytes: u64,
+    pub common_wire_q4_source_discard_advisory_calls: u64,
+    pub common_wire_q4_source_final_cleanup_advisory_calls: u64,
+    pub common_wire_q4_source_uncached_reads: bool,
+    pub common_wire_q4_source_readahead_disabled: bool,
+    /// Retained non-Q4 payload capacity owned by `Gemma4ResidentLayer` values:
+    /// host norm copies, their Metal mirrors, RoPE tables, scalar/scratch
+    /// buffers, and WirePages ownership handles. This excludes the later
+    /// common-core norm/router auxiliaries below.
+    pub common_resident_layer_aux_capacity_bytes: u64,
+    pub common_resident_layer_aux_explicitly_touched_bytes: u64,
+    /// Maximum extra host RoPE staging capacity live while constructing any
+    /// one resident layer. It is transient and is not additive with retained
+    /// capacity after the phase callback.
+    pub common_resident_layer_aux_transient_peak_capacity_bytes: u64,
+    pub common_resident_layer_aux_transient_peak_explicitly_touched_bytes: u64,
+    pub common_kv_capacity_positions: u64,
+    pub common_kv_bytes: u64,
+    pub common_kv_explicitly_touched_bytes: u64,
+    pub verifier_scratch_capacity_bytes: u64,
+    pub verifier_scratch_explicitly_touched_bytes: u64,
+    pub common_non_kv_scratch_capacity_bytes: u64,
+    pub common_non_kv_scratch_explicitly_touched_bytes: u64,
+    pub common_norm_router_aux_capacity_bytes: u64,
+    pub common_norm_router_aux_explicitly_touched_bytes: u64,
+    pub required_head_wire_payload_bytes: u64,
+    pub required_head_page_window_bytes: u64,
+    pub required_head_page_size_bytes: u64,
+    pub required_head_total_pages: u64,
+    pub required_head_resident_pages: u64,
+    pub required_head_resident_bytes: u64,
+    pub required_head_explicitly_touched_bytes: u64,
+    pub required_head_scratch_capacity_bytes: u64,
+    pub required_head_scratch_explicitly_touched_bytes: u64,
+    pub background_readahead_started: bool,
+    pub expert_slots_active: bool,
+    pub common_kv_scratch_active: bool,
+    pub arbitrary_slot_prewarm_skipped: bool,
+    pub tied_head_active: bool,
+    pub required_head_file_backed_no_copy: bool,
+}
+
+#[cfg(unix)]
+fn refresh_ghost_load_mapping_residency(
+    ledger: &mut Gemma4GhostLoadAllocationLedger,
+    target_mapping: &GgufWireMmap,
+    cghost_mapping: &GgufWireMmap,
+) -> Result<()> {
+    let target = target_mapping.residency_snapshot()?;
+    let cghost = cghost_mapping.residency_snapshot()?;
+    if target.page_size_bytes != cghost.page_size_bytes {
+        return Err(BackendError::InvalidModelMetadata(format!(
+            "observed target/cghost page-size mismatch: target={} cghost={}",
+            target.page_size_bytes, cghost.page_size_bytes
+        )));
+    }
+    ledger.mapping_page_size_bytes = target.page_size_bytes as u64;
+    ledger.target_gguf_mapped_bytes = target.mapped_bytes as u64;
+    ledger.target_gguf_total_pages = target.total_pages as u64;
+    ledger.target_gguf_resident_pages = target.resident_pages as u64;
+    ledger.target_gguf_resident_bytes = target.resident_bytes as u64;
+    ledger.cghost_mapped_bytes = cghost.mapped_bytes as u64;
+    ledger.cghost_total_pages = cghost.total_pages as u64;
+    ledger.cghost_resident_pages = cghost.resident_pages as u64;
+    ledger.cghost_resident_bytes = cghost.resident_bytes as u64;
+    Ok(())
+}
+
+/// Owns a fully constructed target for a residency soak without exposing any
+/// generation/prefill entry point. Dropping this value releases the target.
+#[doc(hidden)]
+pub struct Gemma4GhostLoadOnlyRuntime {
+    _runtime: Gemma4Runtime,
+    allocation_ledger: Gemma4GhostLoadAllocationLedger,
+    target_mapping: Arc<GgufWireMmap>,
+    cghost_mapping: Arc<GgufWireMmap>,
+}
+
+#[doc(hidden)]
+impl Gemma4GhostLoadOnlyRuntime {
+    pub fn allocation_ledger(&self) -> Gemma4GhostLoadAllocationLedger {
+        self.allocation_ledger
+    }
+
+    pub fn metal_components(&self) -> Gemma4GhostMetalComponents {
+        self._runtime.ghost_metal_components()
+    }
+
+    /// Refresh only non-faulting file-backed residency facts for a load-only
+    /// soak sample. This calls `mincore` for the whole target/cghost mappings
+    /// and the exact tied-head page window; it cannot tokenize, prefill,
+    /// generate, dispatch Metal work, or make an evicted page resident.
+    #[cfg(target_os = "macos")]
+    pub fn refreshed_residency_ledger(&self) -> Result<Gemma4GhostLoadAllocationLedger> {
+        let mut ledger = self.allocation_ledger;
+        refresh_ghost_load_mapping_residency(
+            &mut ledger,
+            &self.target_mapping,
+            &self.cghost_mapping,
+        )?;
+        let head = self._runtime.metal_q6k_head.as_ref().ok_or_else(|| {
+            BackendError::UnsupportedModelArchitecture(
+                "observed Ghost target lost its no-copy head during soak".into(),
+            )
+        })?;
+        let head_residency = head.weight_residency_snapshot()?;
+        if head_residency.page_size_bytes as u64 != ledger.required_head_page_size_bytes
+            || head_residency.mapped_bytes as u64 != ledger.required_head_page_window_bytes
+            || head_residency.total_pages as u64 != ledger.required_head_total_pages
+        {
+            return Err(BackendError::InvalidTensorData(format!(
+                "observed tied-head soak residency geometry changed: page={} bytes={} pages={} (expected page={} bytes={} pages={})",
+                head_residency.page_size_bytes,
+                head_residency.mapped_bytes,
+                head_residency.total_pages,
+                ledger.required_head_page_size_bytes,
+                ledger.required_head_page_window_bytes,
+                ledger.required_head_total_pages,
+            )));
+        }
+        ledger.required_head_resident_pages = head_residency.resident_pages as u64;
+        ledger.required_head_resident_bytes = head_residency.resident_bytes as u64;
+        Ok(ledger)
+    }
+}
+
+struct Gemma4GhostLoadObserver<'a> {
+    callback:
+        &'a mut dyn FnMut(Gemma4GhostLoadPhase, Gemma4GhostLoadAllocationLedger) -> Result<()>,
+    ledger: Gemma4GhostLoadAllocationLedger,
+    target_mapping: Option<Arc<GgufWireMmap>>,
+    cghost_mapping: Arc<GgufWireMmap>,
+}
+
+impl Gemma4GhostLoadObserver<'_> {
+    fn bind_target_mapping(&mut self, mapping: Arc<GgufWireMmap>) {
+        self.target_mapping = Some(mapping);
+    }
+
+    #[cfg(unix)]
+    fn refresh_mapping_residency(&mut self) -> Result<()> {
+        let target = self.target_mapping.as_ref().ok_or_else(|| {
+            BackendError::InvalidModelMetadata(
+                "observed Gemma 4 target mapping was not bound before phase emission".into(),
+            )
+        })?;
+        refresh_ghost_load_mapping_residency(&mut self.ledger, target, &self.cghost_mapping)
+    }
+
+    #[cfg(not(unix))]
+    fn refresh_mapping_residency(&mut self) -> Result<()> {
+        Err(BackendError::UnsupportedModelArchitecture(
+            "observed Ghost mapping residency requires mincore".into(),
+        ))
+    }
+
+    fn emit(&mut self, phase: Gemma4GhostLoadPhase) -> Result<()> {
+        self.refresh_mapping_residency()?;
+        (self.callback)(phase, self.ledger)
+    }
+}
+
 /// CUDA components constructed for a single-node Ghost-MoE runtime. Kept as a
 /// small copyable snapshot so API health never needs to lock the stateful CUDA
 /// decoder while a generation owns it.
@@ -5017,6 +6315,309 @@ pub enum Gemma4StepOutput {
 /// Per-layer incremental KV cache: `cache[local_layer][position]` is one
 /// position's packed `[kv_heads * head_dim]` K (or V) row.
 pub type Gemma4KvCache = Vec<Vec<Vec<f32>>>;
+
+/// One shipping n-gram speculative round exposed only to the isolated MTP
+/// N/I/M experiment. Production callers continue through
+/// [`Gemma4Runtime::spec_decode_generate`] and never allocate these receipts.
+#[doc(hidden)]
+#[derive(Clone, Debug, Default)]
+pub struct Gemma4SpecDecodeExperimentRound {
+    pub round_index: usize,
+    pub prefix_tokens_before: usize,
+    pub remaining_budget_before: usize,
+    pub requested_k: usize,
+    pub verifier_k: usize,
+    pub budget_truncated: bool,
+    pub anchor_token: u32,
+    pub proposed_drafts: Vec<u32>,
+    pub accepted_drafts: usize,
+    /// Accepted draft tokens that are user-visible before the first EOT.
+    /// Raw verifier acceptance remains in `accepted_drafts`.
+    pub useful_accepted_drafts: usize,
+    pub committed_tokens: Vec<u32>,
+    pub draft_wall_us: u64,
+    pub target_verify_wall_us: u64,
+    pub target_verify_gpu_us: u64,
+    pub total_wall_us: u64,
+}
+
+/// Structured output from the observed shipping n-gram lane. The optional
+/// terminal token is the target argmax emitted at the caller's exact output
+/// boundary without a discarded forward pass; it was never an unverified
+/// assistant proposal and is intentionally kept outside the verifier-round
+/// histogram.
+#[doc(hidden)]
+#[derive(Clone, Debug, Default)]
+pub struct Gemma4SpecDecodeExperimentResult {
+    pub generated_tokens: Vec<u32>,
+    pub rounds: Vec<Gemma4SpecDecodeExperimentRound>,
+    pub terminal_unforwarded_target_token: Option<u32>,
+    /// Cooperative experiment abort. Receipts/tokens contain only the last
+    /// fully committed target-authoritative prefix.
+    pub aborted: bool,
+    pub total_wall_us: u64,
+}
+
+/// Target-authoritative result for the isolated Gemma 4 MTP assistant
+/// experiment. `target_hidden_normalized` is verifier row
+/// `accepted_drafts` after the target's canonical final RMSNorm; it is not the
+/// raw decoder `hs` row.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct Gemma4MtpVerifyResult {
+    pub accepted_drafts: usize,
+    pub next_logits: Vec<f32>,
+    pub target_hidden_normalized: Vec<f32>,
+}
+
+/// One target-authoritative round from the isolated official Gemma 4 MTP
+/// assistant experiment. `proposed_drafts` contains only tokens after the
+/// authoritative anchor; the target verifier always receives
+/// `[anchor_token, proposed_drafts...]` and remains the sole acceptance source.
+#[doc(hidden)]
+#[derive(Clone, Debug, Default)]
+pub struct Gemma4MtpGenerationRound {
+    pub round_index: usize,
+    pub prefix_tokens_before: usize,
+    /// `true` only for the initial authoritative K=1 forward that establishes
+    /// the first normalized target hidden. A final target token emitted at the
+    /// exact output boundary is unforwarded and has no round receipt.
+    pub bootstrap: bool,
+    /// Remaining caller token budget before this round committed anything.
+    pub remaining_budget_before: usize,
+    pub requested_k: usize,
+    pub verifier_k: usize,
+    pub budget_truncated: bool,
+    pub anchor_token: u32,
+    pub proposed_drafts: Vec<u32>,
+    pub accepted_drafts: usize,
+    /// Accepted draft tokens that are user-visible before the first EOT.
+    /// Raw verifier acceptance remains in `accepted_drafts`.
+    pub useful_accepted_drafts: usize,
+    /// Target-committed prefix for this round. This includes an accepted EOT
+    /// token even though EOT is omitted from `generated_tokens` below.
+    pub committed_tokens: Vec<u32>,
+    pub assistant_wall_us: u64,
+    pub assistant_gpu_us: u64,
+    pub target_verify_wall_us: u64,
+    pub target_verify_gpu_us: u64,
+    pub total_wall_us: u64,
+}
+
+/// Completed output of the default-off official-assistant generation driver.
+/// Production CLAIRE generation never constructs or consumes this type.
+#[doc(hidden)]
+#[derive(Clone, Debug, Default)]
+pub struct Gemma4MtpGenerationResult {
+    /// Generated token IDs with stop tokens omitted, matching the production
+    /// greedy-generation convention.
+    pub generated_tokens: Vec<u32>,
+    pub final_logits: Vec<f32>,
+    pub rounds: Vec<Gemma4MtpGenerationRound>,
+    /// Target argmax emitted at the caller's exact output boundary without a
+    /// discarded K=1 forward. It is not an assistant proposal and is excluded
+    /// from verifier-K and MTP economics receipts.
+    pub terminal_unforwarded_target_token: Option<u32>,
+    pub stopped_on_eot: bool,
+    /// Cooperative experiment abort, distinct from EOT, budget completion, and
+    /// inference errors. No unverified assistant token is committed on abort.
+    pub aborted: bool,
+    pub final_position: usize,
+    pub total_wall_us: u64,
+}
+
+#[derive(Debug)]
+struct Gemma4MtpCommitPlan {
+    committed_tokens: Vec<u32>,
+    visible_tokens: Vec<u32>,
+    stopped_on_eot: bool,
+    keep: usize,
+}
+
+fn mtp_us_saturating(micros: u128) -> u64 {
+    micros.min(u64::MAX as u128) as u64
+}
+
+fn mtp_argmax(logits: &[f32]) -> Result<u32> {
+    let (&first, rest) = logits.split_first().ok_or_else(|| {
+        BackendError::RuntimeShapeMismatch("Gemma 4 MTP received empty target logits".into())
+    })?;
+    if !first.is_finite() || rest.iter().any(|value| !value.is_finite()) {
+        return Err(BackendError::RuntimeShapeMismatch(
+            "Gemma 4 MTP target logits contain a non-finite value".into(),
+        ));
+    }
+    let mut best_index = 0usize;
+    let mut best_value = first;
+    for (index, &value) in rest.iter().enumerate() {
+        // Shipping generation uses Iterator::max_by, whose exact-tie policy is
+        // the later (higher) vocabulary ID. MTP anchors must use that same
+        // policy or a tied head could make the experiment non-authoritative.
+        if value >= best_value {
+            best_index = index + 1;
+            best_value = value;
+        }
+    }
+    u32::try_from(best_index).map_err(|_| {
+        BackendError::RuntimeShapeMismatch("Gemma 4 MTP argmax index exceeds u32".into())
+    })
+}
+
+fn useful_accepted_drafts(proposed_drafts: &[u32], accepted_drafts: usize, eot: &[u32]) -> usize {
+    proposed_drafts[..accepted_drafts.min(proposed_drafts.len())]
+        .iter()
+        .position(|token| eot.contains(token))
+        .unwrap_or(accepted_drafts.min(proposed_drafts.len()))
+}
+
+fn spec_receipt_committed_tokens(
+    chunk: &[u32],
+    accepted_drafts: usize,
+    eot: &[u32],
+) -> Result<Vec<u32>> {
+    let accepted_len = accepted_drafts.checked_add(1).ok_or_else(|| {
+        BackendError::RuntimeShapeMismatch(
+            "spec experiment receipt accepted-token count overflow".into(),
+        )
+    })?;
+    let accepted = chunk.get(..accepted_len).ok_or_else(|| {
+        BackendError::RuntimeShapeMismatch(format!(
+            "spec experiment receipt accepted {accepted_drafts} drafts from K={}",
+            chunk.len()
+        ))
+    })?;
+    let committed_len = accepted
+        .iter()
+        .position(|token| eot.contains(token))
+        .map_or(accepted.len(), |index| index + 1);
+    Ok(accepted[..committed_len].to_vec())
+}
+
+fn remove_uncommitted_spec_anchor(
+    generated: &mut Vec<u32>,
+    history: &mut Vec<u32>,
+    anchor: u32,
+) -> Result<()> {
+    if generated.last().copied() != Some(anchor) || history.last().copied() != Some(anchor) {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "spec experiment abort expected uncommitted anchor {anchor}, generated_tail={:?} history_tail={:?}",
+            generated.last(),
+            history.last()
+        )));
+    }
+    generated.pop();
+    history.pop();
+    Ok(())
+}
+
+fn truncate_spec_host_kv(kc: &mut [Vec<Vec<f32>>], vc: &mut [Vec<Vec<f32>>], keep: usize) {
+    for (keys, values) in kc.iter_mut().zip(vc.iter_mut()) {
+        keys.truncate(keep);
+        values.truncate(keep);
+    }
+}
+
+fn mtp_terminal_unforwarded_target_token(logits: &[f32], eot: &[u32]) -> Result<Option<u32>> {
+    let token = mtp_argmax(logits)?;
+    Ok((!eot.contains(&token)).then_some(token))
+}
+
+#[cfg(target_os = "macos")]
+fn mtp_target_gpu_snapshot() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        crate::metal::SPEC_CHAINED_GPU_US.load(Relaxed),
+        crate::metal::HEAD_GPU_US.load(Relaxed),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn mtp_target_gpu_delta(before: (u64, u64), after: (u64, u64)) -> u64 {
+    after
+        .0
+        .saturating_sub(before.0)
+        .saturating_add(after.1.saturating_sub(before.1))
+}
+
+fn spec_experiment_gpu_snapshot(enabled: bool) -> Option<(u64, u64)> {
+    #[cfg(target_os = "macos")]
+    {
+        enabled.then(mtp_target_gpu_snapshot)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = enabled;
+        None
+    }
+}
+
+fn spec_experiment_gpu_delta(before: Option<(u64, u64)>) -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        before
+            .map(|snapshot| mtp_target_gpu_delta(snapshot, mtp_target_gpu_snapshot()))
+            .unwrap_or(0)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = before;
+        0
+    }
+}
+
+fn mtp_commit_plan(
+    anchor: u32,
+    proposed_drafts: &[u32],
+    accepted_drafts: usize,
+    start_pos: usize,
+    remaining_budget: usize,
+    eot: &[u32],
+) -> Result<Gemma4MtpCommitPlan> {
+    if remaining_budget == 0 {
+        return Err(BackendError::RuntimeShapeMismatch(
+            "Gemma 4 MTP cannot commit an anchor with zero remaining budget".into(),
+        ));
+    }
+    if accepted_drafts > proposed_drafts.len() {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "Gemma 4 MTP verifier accepted {accepted_drafts} drafts from only {} proposals",
+            proposed_drafts.len()
+        )));
+    }
+    let committed_len = 1usize.checked_add(accepted_drafts).ok_or_else(|| {
+        BackendError::RuntimeShapeMismatch("Gemma 4 MTP commit width overflow".into())
+    })?;
+    if committed_len > remaining_budget {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "Gemma 4 MTP target committed {committed_len} tokens with budget {remaining_budget}"
+        )));
+    }
+
+    let mut committed_tokens = Vec::with_capacity(committed_len);
+    committed_tokens.push(anchor);
+    committed_tokens.extend_from_slice(&proposed_drafts[..accepted_drafts]);
+    let stopped_on_eot = committed_tokens.iter().any(|token| eot.contains(token));
+    let visible_tokens = committed_tokens
+        .iter()
+        .copied()
+        .take_while(|token| !eot.contains(token))
+        .collect();
+    let keep = start_pos.checked_add(committed_len).ok_or_else(|| {
+        BackendError::RuntimeShapeMismatch("Gemma 4 MTP target position overflow".into())
+    })?;
+    Ok(Gemma4MtpCommitPlan {
+        committed_tokens,
+        visible_tokens,
+        stopped_on_eot,
+        keep,
+    })
+}
+
+struct Gemma4SpeculativeStepResult {
+    accepted_drafts: usize,
+    next_logits: Vec<f32>,
+    target_hidden_normalized: Option<Vec<f32>>,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct Gemma4ChunkRoundProfile {
@@ -5148,7 +6749,84 @@ impl Gemma4Runtime {
             ))
         })?;
         let ghost = Arc::new(GhostFile::open_with_options(cghost, evict_page_cache)?);
-        Self::load_layer_range_impl(path, None, Some((ghost, budget_bytes)))
+        Self::load_layer_range_impl(path, None, Some((ghost, budget_bytes)), None)
+    }
+
+    /// Construct and retain the exact Ghost target for an isolated residency
+    /// probe without exposing prefill/generation methods. The observed-only
+    /// order is target metadata, common Q4 pages, resident-layer auxiliaries,
+    /// KV/scratch, empty expert slots, a post-assistant residency barrier, then
+    /// the required no-copy tied-head pages. Unlike production it
+    /// starts no background GGUF readahead and never seeds an arbitrary expert
+    /// ID. The empty-slots callback is a safe barrier for constructing and
+    /// retaining an assistant before the target head is faulted. Every callback
+    /// is synchronous and may abort fail-closed. Exact cghost residency requires
+    /// `evict_page_cache=false` so the retained payload mapping exists.
+    #[cfg(target_os = "macos")]
+    #[doc(hidden)]
+    pub fn load_ghost_moe_load_only_observed(
+        path: &Path,
+        cghost: &Path,
+        cache_mib: usize,
+        evict_page_cache: bool,
+        callback: &mut dyn FnMut(
+            Gemma4GhostLoadPhase,
+            Gemma4GhostLoadAllocationLedger,
+        ) -> Result<()>,
+    ) -> Result<Gemma4GhostLoadOnlyRuntime> {
+        let budget_bytes = cache_mib.checked_mul(1024 * 1024).ok_or_else(|| {
+            BackendError::InvalidModelMetadata(format!(
+                "ghost MoE cache size {cache_mib} MiB overflows usize"
+            ))
+        })?;
+        let target_gguf_logical_bytes = std::fs::metadata(path)
+            .map_err(|source| BackendError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?
+            .len();
+        let cghost_logical_bytes = std::fs::metadata(cghost)
+            .map_err(|source| BackendError::Io {
+                path: cghost.to_path_buf(),
+                source,
+            })?
+            .len();
+        let ghost = Arc::new(GhostFile::open_with_options(cghost, evict_page_cache)?);
+        let cghost_mapping = ghost.wire_mapping().cloned().ok_or_else(|| {
+            BackendError::InvalidModelMetadata(
+                "observed Ghost load requires a retained cghost mapping for exact residency attribution; page-cache eviction mode is unsupported"
+                    .into(),
+            )
+        })?;
+        let mut observer = Gemma4GhostLoadObserver {
+            callback,
+            ledger: Gemma4GhostLoadAllocationLedger {
+                target_gguf_logical_bytes,
+                cghost_logical_bytes,
+                host_cache_budget_bytes: budget_bytes as u64,
+                ..Gemma4GhostLoadAllocationLedger::default()
+            },
+            target_mapping: None,
+            cghost_mapping,
+        };
+        let runtime = Self::load_layer_range_impl(
+            path,
+            None,
+            Some((ghost, budget_bytes)),
+            Some(&mut observer),
+        )?;
+        let target_mapping = observer.target_mapping.as_ref().cloned().ok_or_else(|| {
+            BackendError::InvalidModelMetadata(
+                "observed Ghost target mapping disappeared after load".into(),
+            )
+        })?;
+        let cghost_mapping = Arc::clone(&observer.cghost_mapping);
+        Ok(Gemma4GhostLoadOnlyRuntime {
+            _runtime: runtime,
+            allocation_ledger: observer.ledger,
+            target_mapping,
+            cghost_mapping,
+        })
     }
 }
 
@@ -5429,13 +7107,14 @@ impl Gemma4Runtime {
     /// cache it reads (the split must keep every shared layer on the same shard
     /// as its source layer).
     pub fn load_layer_range(path: &Path, range: Option<std::ops::Range<usize>>) -> Result<Self> {
-        Self::load_layer_range_impl(path, range, None)
+        Self::load_layer_range_impl(path, range, None, None)
     }
 
     fn load_layer_range_impl(
         path: &Path,
         range: Option<std::ops::Range<usize>>,
         ghost_moe: Option<(Arc<GhostFile>, usize)>,
+        mut load_observer: Option<&mut Gemma4GhostLoadObserver<'_>>,
     ) -> Result<Self> {
         let gguf = read_metadata(path)?;
         // BASALT D-B2 fail-closed (DECISIONS.md D17): a ModelOpt-converted NVFP4
@@ -5456,7 +7135,7 @@ impl Gemma4Runtime {
             BackendError::UnsupportedModelArchitecture("not a gemma4 model".into())
         })?;
         let binding = Gemma4Binding::bind(&gguf, &config)?;
-        let ghost_moe_cache = match ghost_moe {
+        let validated_ghost_moe = match ghost_moe {
             Some((ghost, budget_bytes)) => {
                 let moe = config.moe.as_ref().ok_or_else(|| {
                     BackendError::UnsupportedModelArchitecture(
@@ -5482,9 +7161,19 @@ impl Gemma4Runtime {
                     )));
                 }
                 ghost.validate_moe_source_identity(path, &binding, moe.expert_count as usize)?;
-                Some(Arc::new(GhostMoeExpertCache::new(ghost, budget_bytes)))
+                Some((ghost, budget_bytes))
             }
             None => None,
+        };
+        // Preserve the production loader's established construction order.
+        // Only the observed load-only path defers the empty cache object until
+        // after its target-mapping callback, making the phase boundary literal.
+        let mut ghost_moe_cache = if load_observer.is_none() {
+            validated_ghost_moe.as_ref().map(|(ghost, budget_bytes)| {
+                Arc::new(GhostMoeExpertCache::new(Arc::clone(ghost), *budget_bytes))
+            })
+        } else {
+            None
         };
         let store = TensorStore::open(path, &gguf);
         let tokenizer = Tokenizer::from_gguf(&gguf)?;
@@ -5519,17 +7208,36 @@ impl Gemma4Runtime {
         // observed live as a 12.7 GB 12B mapping stalling a serve-lane model
         // load for 10+ minutes while loading a half-model shard.
         let mmap = GgufWireMmap::map(path)?;
-        {
+        if let Some(observer) = load_observer.as_mut() {
+            if mmap.file_len() != observer.ledger.target_gguf_logical_bytes {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "observed Gemma 4 target length changed during load: metadata={} mmap={}",
+                    observer.ledger.target_gguf_logical_bytes,
+                    mmap.file_len()
+                )));
+            }
+            observer.bind_target_mapping(Arc::clone(&mmap));
+        }
+        if ghost_moe_cache.is_none() {
+            ghost_moe_cache = validated_ghost_moe.as_ref().map(|(ghost, budget_bytes)| {
+                Arc::new(GhostMoeExpertCache::new(Arc::clone(ghost), *budget_bytes))
+            });
+        }
+        if load_observer.is_none() && !ghost_metal_demand_load_only_from_env() {
             let mmap = mmap.clone();
             // Warm only the spans this shard streams, not all 5GB — see
             // `shard_warm_spans`. Still off the loading thread: the advisory
             // blocks on macOS over USB until the range is resident.
-            let spans = Self::shard_warm_spans(&gguf, &range, ghost_moe_cache.is_some());
+            let spans = Self::shard_warm_spans(&gguf, &range, validated_ghost_moe.is_some());
             std::thread::spawn(move || {
                 for (offset, len) in spans {
                     mmap.advise_willneed_range(offset, len);
                 }
             });
+        } else if load_observer.is_none() {
+            eprintln!(
+                "[gemma4-ghost] {GHOST_METAL_DEMAND_LOAD_ONLY_ENV}=1: background target readahead skipped"
+            );
         }
         let q8 = |name: &str| WireQuant::new(&store, &mmap, name);
         // Matvec-role loads (projections, expert bands, the tied head) refuse
@@ -5615,6 +7323,63 @@ impl Gemma4Runtime {
             });
         }
 
+        // Make the observed target-object boundary complete: every descriptor
+        // and small f32 metadata tensor is bound before its callback. Keep the
+        // production path's historical ordering by deferring the same loads
+        // there until after expert/common construction.
+        let observed_target_metadata = if load_observer.is_some() {
+            Some((
+                q8m(&binding.token_embedding.name)?,
+                f32t(&binding.output_norm.name)?,
+                binding
+                    .per_layer_token_embd
+                    .as_ref()
+                    .map(|descriptor| q8(&descriptor.name))
+                    .transpose()?,
+                binding
+                    .per_layer_model_proj
+                    .as_ref()
+                    .map(|descriptor| f32t(&descriptor.name))
+                    .transpose()?,
+                binding
+                    .per_layer_proj_norm
+                    .as_ref()
+                    .map(|descriptor| f32t(&descriptor.name))
+                    .transpose()?,
+                binding
+                    .rope_freqs
+                    .as_ref()
+                    .map(|descriptor| f32t(&descriptor.name))
+                    .transpose()?,
+            ))
+        } else {
+            None
+        };
+
+        if let Some(observer) = load_observer.as_mut() {
+            let cache = ghost_moe_cache.as_ref().ok_or_else(|| {
+                BackendError::InvalidModelMetadata(
+                    "observed Ghost target did not construct its expert cache".into(),
+                )
+            })?;
+            let stats = cache.stats();
+            if stats.hits != 0
+                || stats.misses != 0
+                || stats.evictions != 0
+                || stats.bytes_read != 0
+                || stats.resident_experts != 0
+                || stats.resident_bytes != 0
+            {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "observed Ghost cache was not empty at bind: {stats:?}"
+                )));
+            }
+            observer.ledger.host_cache_budget_bytes = stats.budget_bytes as u64;
+            observer.ledger.host_cache_resident_bytes = stats.resident_bytes as u64;
+            observer.ledger.host_cache_explicitly_touched_bytes = 0;
+            observer.emit(Gemma4GhostLoadPhase::TargetObjectMetadataReady)?;
+        }
+
         #[cfg(target_os = "macos")]
         let metal_q4_experts = {
             let flag = |name: &str| {
@@ -5681,71 +7446,346 @@ impl Gemma4Runtime {
             } else {
                 false
             };
-            let mut lane = if enabled && exact_geometry && exact_records {
-                GhostMetalExpertRuntime::new(block_count, fused_fast, &per_layer_slots)
-            } else {
-                None
-            };
-            if common_enabled {
-                let max_positions = std::env::var("CAMELID_GEMMA4_GHOST_METAL_CONTEXT")
+            let common_max_positions = || {
+                std::env::var("CAMELID_GEMMA4_GHOST_METAL_CONTEXT")
                     .ok()
                     .and_then(|value| value.parse::<usize>().ok())
                     .filter(|&value| value > 0)
                     .unwrap_or(4_096)
-                    .min(config.context_length as usize);
-                if let Some(runtime) = lane.as_mut() {
+                    .min(config.context_length as usize)
+            };
+            let mut lane = if load_observer.is_some() {
+                if !enabled || !common_enabled || !exact_geometry || !exact_records {
+                    return Err(BackendError::InvalidModelMetadata(format!(
+                        "observed Ghost load requires exact Metal slots/common geometry: slots_enabled={enabled} common_enabled={common_enabled} exact_geometry={exact_geometry} exact_records={exact_records}"
+                    )));
+                }
+
+                // The observed path first materializes only anonymous Q4
+                // WirePages. No Metal kernel, resident-layer auxiliary, KV, or
+                // verifier scratch allocation occurs before this callback.
+                let prepared = prepare_ghost_common_metal(
+                    path,
+                    &store,
+                    Some(mmap.as_ref()),
+                    &binding,
+                    &config,
+                    &g,
+                    &layers,
+                    common_max_positions(),
+                    true,
+                )?
+                .ok_or_else(|| {
+                    BackendError::UnsupportedModelArchitecture(
+                        "observed Ghost common Q4 geometry was not admitted".into(),
+                    )
+                })?;
+                {
+                    let observer = load_observer
+                        .as_mut()
+                        .expect("observed branch retains its observer");
+                    observer.ledger.common_wire_q4_payload_bytes =
+                        prepared.wire_q4_payload_bytes as u64;
+                    observer.ledger.common_wire_q4_allocation_bytes =
+                        prepared.wire_q4_allocation_bytes as u64;
+                    // WirePages reads the payload and zeroes every byte in each
+                    // page-rounding tail, so the complete allocation is touched.
+                    observer.ledger.common_wire_q4_explicitly_touched_bytes =
+                        prepared.wire_q4_allocation_bytes as u64;
+                    observer.ledger.common_wire_q4_source_page_window_bytes =
+                        prepared.wire_q4_source_page_window_bytes;
+                    observer.ledger.common_wire_q4_source_resident_before_bytes =
+                        prepared.wire_q4_source_resident_before_bytes;
+                    observer.ledger.common_wire_q4_source_resident_after_bytes =
+                        prepared.wire_q4_source_resident_after_bytes;
+                    observer
+                        .ledger
+                        .common_wire_q4_source_confirmed_discarded_bytes =
+                        prepared.wire_q4_source_confirmed_discarded_bytes;
+                    observer.ledger.common_wire_q4_source_discard_advisory_calls =
+                        prepared.wire_q4_source_discard_advisory_calls;
+                    observer
+                        .ledger
+                        .common_wire_q4_source_final_cleanup_advisory_calls =
+                        prepared.wire_q4_source_final_cleanup_advisory_calls;
+                    observer.ledger.common_wire_q4_source_uncached_reads =
+                        prepared.wire_q4_source_uncached_reads;
+                    observer.ledger.common_wire_q4_source_readahead_disabled =
+                        prepared.wire_q4_source_readahead_disabled;
+                    observer.emit(Gemma4GhostLoadPhase::CommonQ4WeightsAllocated)?;
+                }
+
+                let prepared = materialize_observed_ghost_common_resident_layers(
+                    prepared, &config, &g, &layers,
+                )?;
+                {
+                    let observer = load_observer
+                        .as_mut()
+                        .expect("observed branch retains its observer");
+                    observer.ledger.common_resident_layer_aux_capacity_bytes =
+                        prepared.resident_layer_aux_capacity_bytes;
+                    observer
+                        .ledger
+                        .common_resident_layer_aux_explicitly_touched_bytes =
+                        prepared.resident_layer_aux_explicitly_touched_bytes;
+                    observer
+                        .ledger
+                        .common_resident_layer_aux_transient_peak_capacity_bytes =
+                        prepared.resident_layer_aux_transient_peak_capacity_bytes;
+                    observer
+                        .ledger
+                        .common_resident_layer_aux_transient_peak_explicitly_touched_bytes =
+                        prepared.resident_layer_aux_transient_peak_explicitly_touched_bytes;
+                    observer.emit(Gemma4GhostLoadPhase::CommonResidentLayerAuxAllocated)?;
+                }
+
+                let GhostCommonMetalBuild {
+                    mut common,
+                    wire_q4_payload_bytes: _,
+                    wire_q4_allocation_bytes: _,
+                } = finish_ghost_common_metal(prepared, &layers).ok_or_else(|| {
+                    BackendError::UnsupportedModelArchitecture(
+                        "observed Ghost common KV/scratch construction failed".into(),
+                    )
+                })?;
+                let q4_simd_fast = common.enable_fused_fast_q4(fused_fast);
+                let geometry = common.geometry();
+                let allocation = common.allocation_ledger();
+                {
+                    let observer = load_observer
+                        .as_mut()
+                        .expect("observed branch retains its observer");
+                    observer.ledger.common_kv_capacity_positions = geometry.kv_capacity as u64;
+                    observer.ledger.common_kv_bytes = allocation.kv_capacity_bytes;
+                    observer.ledger.common_kv_explicitly_touched_bytes =
+                        allocation.kv_explicitly_touched_bytes;
+                    observer.ledger.verifier_scratch_capacity_bytes =
+                        allocation.verifier_scratch_capacity_bytes;
+                    observer.ledger.verifier_scratch_explicitly_touched_bytes =
+                        allocation.verifier_scratch_explicitly_touched_bytes;
+                    observer.ledger.common_non_kv_scratch_capacity_bytes =
+                        allocation.non_kv_scratch_capacity_bytes;
+                    observer
+                        .ledger
+                        .common_non_kv_scratch_explicitly_touched_bytes =
+                        allocation.non_kv_scratch_explicitly_touched_bytes;
+                    observer.ledger.common_norm_router_aux_capacity_bytes =
+                        allocation.norm_router_aux_capacity_bytes;
+                    observer
+                        .ledger
+                        .common_norm_router_aux_explicitly_touched_bytes =
+                        allocation.norm_router_aux_explicitly_touched_bytes;
+                    observer.ledger.common_kv_scratch_active = common.moe_configured();
+                    observer.emit(Gemma4GhostLoadPhase::CommonKvScratchAllocated)?;
+                }
+
+                // Only now reserve the empty expert/overflow/victim capacity.
+                // The callback at this boundary is the harness's assistant-load
+                // barrier; all target state remains locally owned and idle.
+                let mut runtime =
+                    GhostMetalExpertRuntime::new(block_count, fused_fast, &per_layer_slots)
+                        .ok_or_else(|| {
+                            BackendError::UnsupportedModelArchitecture(
+                                "observed Ghost expert slot allocation failed".into(),
+                            )
+                        })?;
+                runtime.common = Some(common);
+                if runtime.occupied_resident_slot_count() != 0 {
+                    return Err(BackendError::InvalidModelMetadata(
+                        "observed Ghost expert slots were populated during allocation".into(),
+                    ));
+                }
+                let planned_records = runtime.arbitrary_prewarm_record_count();
+                {
+                    let observer = load_observer
+                        .as_mut()
+                        .expect("observed branch retains its observer");
+                    observer.ledger.expert_layer_count = runtime.layers.len() as u64;
+                    observer.ledger.expert_slot_count = runtime.resident_slot_count() as u64;
+                    observer.ledger.expert_slot_capacity_bytes = runtime.resident_bytes() as u64;
+                    observer.ledger.expert_table_directory_slot_count =
+                        runtime.physical_slot_budget_count() as u64;
+                    observer.ledger.expert_table_directory_capacity_bytes =
+                        runtime.physical_slot_budget_bytes() as u64;
+                    observer.ledger.expert_table_bound_active_slot_count = 0;
+                    observer.ledger.expert_tables_compute_bound = false;
+                    observer.ledger.expert_slot_explicitly_touched_bytes = 0;
+                    observer.ledger.overflow_slot_count = runtime.overflow_slot_capacity() as u64;
+                    observer.ledger.overflow_capacity_bytes =
+                        runtime.overflow_capacity_bytes() as u64;
+                    observer.ledger.overflow_explicitly_touched_bytes = 0;
+                    observer.ledger.victim_record_capacity =
+                        runtime.victim_record_capacity() as u64;
+                    observer.ledger.victim_capacity_bytes = runtime.victim_capacity_bytes() as u64;
+                    observer.ledger.victim_explicitly_touched_bytes = 0;
+                    observer.ledger.planned_prewarm_records = planned_records as u64;
+                    observer.ledger.planned_prewarm_bytes =
+                        planned_records as u64 * crate::metal::GEMMA4_Q4_EXPERT_RECORD_BYTES as u64;
+                    observer.ledger.touched_prewarm_records = 0;
+                    observer.ledger.touched_prewarm_bytes = 0;
+                    observer.ledger.expert_slots_active = true;
+                    observer.ledger.arbitrary_slot_prewarm_skipped = true;
+                    observer.emit(Gemma4GhostLoadPhase::EmptyExpertSlotsAllocated)?;
+                    // The empty-slots callback may synchronously retain the
+                    // isolated assistant. Refresh the target/cghost mappings
+                    // once it returns so the harness can attribute that load
+                    // against current mincore facts before the tied head is
+                    // constructed or faulted. `emit` performs no allocation,
+                    // dispatch, prefill, or generation.
+                    observer.emit(Gemma4GhostLoadPhase::AssistantResidencyBarrierComplete)?;
+                }
+                eprintln!(
+                    "[gemma4-ghost-common] OBSERVED: Q4 common + KV/scratch + empty slots active, context cap={} KV={:.2}GiB mode={} q4-row={}",
+                    geometry.max_positions,
+                    allocation.kv_capacity_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                    if fused_fast { "fused-fast" } else { "CPU-GeGLU parity" },
+                    if q4_simd_fast { "simdgroup-ordered" } else { "scalar-ordered" },
+                );
+                Some(runtime)
+            } else {
+                let demand_load_only = ghost_metal_demand_load_only_from_env();
+                let allocation_order = ghost_metal_allocation_order(demand_load_only);
+                let build_common = || -> Option<(crate::metal::Gemma4GhostCommonMetal, bool)> {
                     match build_ghost_common_metal(
                         path,
                         &store,
+                        demand_load_only.then_some(mmap.as_ref()),
                         &binding,
                         &config,
                         &g,
                         &layers,
-                        max_positions,
+                        common_max_positions(),
                     ) {
-                        Ok(Some(mut common)) => {
+                        Ok(Some(build)) => {
+                            let GhostCommonMetalBuild {
+                                mut common,
+                                wire_q4_payload_bytes: _,
+                                wire_q4_allocation_bytes: _,
+                            } = build;
                             let q4_simd_fast = common.enable_fused_fast_q4(fused_fast);
+                            Some((common, q4_simd_fast))
+                        }
+                        Ok(None) => {
+                            eprintln!(
+                                "[gemma4-ghost-common] requested but exact Gemma 4 26B Q4_0/no-PLE geometry was not admitted; CPU common core remains active"
+                            );
+                            None
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "[gemma4-ghost-common] construction failed: {error}; CPU common core remains active"
+                            );
+                            None
+                        }
+                    }
+                };
+
+                // Under the exact demand-only opt-in, mirror the proven
+                // load-only lifetime: finish common Q4/KV/scratch before the
+                // untouched expert slabs exist. Creating common state after
+                // those slabs caused Metal to wire gigabytes of empty capacity.
+                // The shipping path retains its established slots -> common ->
+                // prewarm order and soft fallback behavior.
+                let mut common_before_slots = if common_enabled
+                    && enabled
+                    && exact_geometry
+                    && exact_records
+                    && allocation_order == GhostMetalAllocationOrder::CommonThenSlots
+                {
+                    build_common()
+                } else {
+                    None
+                };
+                let mut runtime = if enabled && exact_geometry && exact_records {
+                    GhostMetalExpertRuntime::new(block_count, fused_fast, &per_layer_slots)
+                } else {
+                    None
+                };
+                if common_enabled {
+                    if let Some(lane) = runtime.as_mut() {
+                        let built_common = match allocation_order {
+                            GhostMetalAllocationOrder::CommonThenSlots => {
+                                common_before_slots.take()
+                            }
+                            GhostMetalAllocationOrder::SlotsThenCommon => build_common(),
+                        };
+                        if let Some((common, q4_simd_fast)) = built_common {
                             let geometry = common.geometry();
                             eprintln!(
                                 "[gemma4-ghost-common] ACTIVE: full Metal common core, context cap={} positions, allocated KV={} ({:.2}GiB of {:.2}GiB at cap), router/shared/expert/tail device-chained, mode={}, q4-row={}",
                                 geometry.max_positions,
                                 geometry.kv_capacity,
                                 geometry.kv_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-                                (geometry.max_positions as f64 / geometry.kv_capacity.max(1) as f64)
-                                    * (geometry.kv_bytes as f64 / (1024.0 * 1024.0 * 1024.0)),
+                                (geometry.max_positions as f64
+                                    / geometry.kv_capacity.max(1) as f64)
+                                    * (geometry.kv_bytes as f64
+                                        / (1024.0 * 1024.0 * 1024.0)),
                                 if fused_fast { "fused-fast" } else { "CPU-GeGLU parity" },
                                 if q4_simd_fast { "simdgroup-ordered" } else { "scalar-ordered" },
                             );
-                            runtime.common = Some(common);
+                            lane.common = Some(common);
                         }
-                        Ok(None) => eprintln!(
-                            "[gemma4-ghost-common] requested but exact Gemma 4 26B Q4_0/no-PLE geometry was not admitted; CPU common core remains active"
-                        ),
-                        Err(error) => eprintln!(
-                            "[gemma4-ghost-common] construction failed: {error}; CPU common core remains active"
-                        ),
+                    } else {
+                        eprintln!(
+                            "[gemma4-ghost-common] requested but persistent expert slots are unavailable; CPU common core remains active"
+                        );
                     }
-                } else {
+                }
+                if let Some(lane) = runtime.as_mut() {
+                    if demand_load_only {
+                        eprintln!(
+                            "[gemma4-ghost-metal] {GHOST_METAL_DEMAND_LOAD_ONLY_ENV}=1: arbitrary cold-start expert prewarm skipped; persistent slots will populate from routed demand"
+                        );
+                    } else if let Some(cache) = ghost_moe_cache.as_ref() {
+                        lane.prewarm_hot_slots_direct(&cache.file);
+                    }
+                    if lane.has_record_granular_backing() {
+                        eprintln!(
+                            "[gemma4-ghost-metal] persistent Q4_0 record slots enabled: layers={} allocated_slots/layer={} allocated_capacity_bytes={} allocated_capacity={:.2}GiB bound_table_directory_slots/layer={} bound_table_directory_slot_count={} physical_high_water_bytes={} physical_high_water={:.2}GiB mode={}",
+                            block_count,
+                            lane.slots_per_layer(),
+                            lane.resident_bytes(),
+                            lane.resident_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
+                            lane.physical_slots_per_layer(),
+                            lane.physical_slot_budget_count(),
+                            lane.physical_slot_budget_bytes(),
+                            lane.physical_slot_budget_bytes() as f64
+                                / (1024.0 * 1024.0 * 1024.0),
+                            if fused_fast { "fused-fast" } else { "CPU-GeGLU parity" },
+                        );
+                    } else {
+                        eprintln!(
+                            "[gemma4-ghost-metal] persistent Q4_0 slots enabled: layers={} slots/layer={} resident={:.2}GiB mode={}",
+                            block_count,
+                            lane.slots_per_layer(),
+                            lane.resident_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
+                            if fused_fast { "fused-fast" } else { "CPU-GeGLU parity" },
+                        );
+                    }
+                } else if enabled {
                     eprintln!(
-                        "[gemma4-ghost-common] requested but persistent expert slots are unavailable; CPU common core remains active"
+                        "[gemma4-ghost-metal] persistent slots unavailable or model geometry is not exact Gemma 4 26B Q4_0; using CPU Ghost experts"
                     );
                 }
-            }
-            if let Some(lane) = lane.as_mut() {
-                if let Some(cache) = ghost_moe_cache.as_ref() {
-                    lane.prewarm_hot_slots_direct(&cache.file);
+                runtime
+            };
+
+            if load_observer.is_some() {
+                let stats = ghost_moe_cache
+                    .as_ref()
+                    .map(|cache| cache.stats())
+                    .unwrap_or_default();
+                if stats.resident_experts != 0 || stats.resident_bytes != 0 || stats.bytes_read != 0
+                {
+                    return Err(BackendError::InvalidModelMetadata(format!(
+                        "observed Ghost load changed the empty host cache: {stats:?}"
+                    )));
                 }
-                eprintln!(
-                    "[gemma4-ghost-metal] persistent Q4_0 slots enabled: layers={} slots/layer={} resident={:.2}GiB mode={}",
-                    block_count,
-                    lane.slots_per_layer(),
-                    lane.resident_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
-                    if fused_fast { "fused-fast" } else { "CPU-GeGLU parity" },
-                );
-            } else if enabled {
-                eprintln!(
-                    "[gemma4-ghost-metal] persistent slots unavailable or model geometry is not exact Gemma 4 26B Q4_0; using CPU Ghost experts"
-                );
+                load_observer
+                    .as_mut()
+                    .expect("observed cache check retains its observer")
+                    .ledger
+                    .host_cache_resident_bytes = 0;
             }
             std::sync::Mutex::new(lane)
         };
@@ -5753,68 +7793,169 @@ impl Gemma4Runtime {
         let first_kv_shared = config.block_count as usize - g.num_kv_shared_layers as usize;
         // Bind the common tied table once so the CPU fallback and the optional
         // no-copy Metal head share the exact same validated GGUF descriptor.
-        let token_embd = q8m(&binding.token_embedding.name)?;
-        let output_norm = f32t(&binding.output_norm.name)?;
+        let (token_embd, output_norm, observed_non_head_metadata) = match observed_target_metadata {
+            Some((token_embd, output_norm, per_token, per_proj, per_norm, rope)) => (
+                token_embd,
+                output_norm,
+                Some((per_token, per_proj, per_norm, rope)),
+            ),
+            None => (
+                q8m(&binding.token_embedding.name)?,
+                f32t(&binding.output_norm.name)?,
+                None,
+            ),
+        };
         #[cfg(target_os = "macos")]
         let metal_q6k_head = {
-            let explicitly_disabled = std::env::var("CAMELID_GEMMA4_GHOST_METAL_HEAD")
-                .is_ok_and(|value| value == "0" || value.eq_ignore_ascii_case("false"));
-            let eligible = ghost_moe_cache.is_some()
-                && range.end == block_count
-                && token_embd.format == WireFormat::Q6K
-                && !explicitly_disabled
-                && !crate::inference::deterministic_mode_enabled();
-            let head = if eligible {
-                match &token_embd.backing {
-                    WireBacking::Mmap { mmap, offset } => crate::metal::Gemma4Q6KHead::new(
-                        Arc::clone(mmap),
-                        *offset,
-                        token_embd.bytes().len(),
-                        &output_norm,
-                        token_embd.element_count / config.embedding_length as usize,
-                        g.final_logit_softcapping.unwrap_or(0.0),
-                        config.rms_norm_epsilon,
-                    ),
+            if load_observer.is_some() {
+                if range.end != block_count || token_embd.format != WireFormat::Q6K {
+                    return Err(BackendError::UnsupportedModelArchitecture(
+                        "observed Ghost target requires its exact Q6_K tied head".into(),
+                    ));
+                }
+                let (head, head_ledger) = match &token_embd.backing {
+                    WireBacking::Mmap { mmap, offset } => {
+                        crate::metal::Gemma4Q6KHead::new_file_backed(
+                            Arc::clone(mmap),
+                            *offset,
+                            token_embd.bytes().len(),
+                            &output_norm,
+                            token_embd.element_count / config.embedding_length as usize,
+                            g.final_logit_softcapping.unwrap_or(0.0),
+                            config.rms_norm_epsilon,
+                        )
+                    }
                     WireBacking::Owned { .. } => None,
                 }
+                .ok_or_else(|| {
+                    BackendError::UnsupportedModelArchitecture(
+                        "observed Ghost no-copy Q6_K tied head construction failed".into(),
+                    )
+                })?;
+                let head_residency = head.fault_weight_pages()?;
+                if head_residency.resident_pages != head_residency.total_pages {
+                    return Err(BackendError::InvalidTensorData(format!(
+                        "observed tied-head synchronous page fault left {}/{} pages resident",
+                        head_residency.resident_pages, head_residency.total_pages
+                    )));
+                }
+                let observer = load_observer
+                    .as_mut()
+                    .expect("observed head branch retains its observer");
+                observer.ledger.required_head_wire_payload_bytes = head_ledger.wire_payload_bytes;
+                observer.ledger.required_head_page_window_bytes = head_ledger.page_window_bytes;
+                observer.ledger.required_head_page_size_bytes =
+                    head_residency.page_size_bytes as u64;
+                observer.ledger.required_head_total_pages = head_residency.total_pages as u64;
+                observer.ledger.required_head_resident_pages = head_residency.resident_pages as u64;
+                observer.ledger.required_head_resident_bytes = head_residency.resident_bytes as u64;
+                observer.ledger.required_head_explicitly_touched_bytes =
+                    head_ledger.page_window_bytes;
+                observer.ledger.required_head_scratch_capacity_bytes =
+                    head_ledger.scratch_capacity_bytes;
+                observer
+                    .ledger
+                    .required_head_scratch_explicitly_touched_bytes =
+                    head_ledger.scratch_explicitly_touched_bytes;
+                observer.ledger.required_head_file_backed_no_copy = true;
+                observer.ledger.tied_head_active = true;
+                Some(head)
             } else {
-                None
-            };
-            if head.is_some() {
-                eprintln!("[gemma4-ghost] Metal Q6_K tied head enabled (no-copy, file-backed)");
-            } else if eligible {
-                eprintln!("[gemma4-ghost] Metal Q6_K tied head unavailable; using CPU fallback");
+                let explicitly_disabled = std::env::var("CAMELID_GEMMA4_GHOST_METAL_HEAD")
+                    .is_ok_and(|value| value == "0" || value.eq_ignore_ascii_case("false"));
+                let eligible = ghost_moe_cache.is_some()
+                    && range.end == block_count
+                    && token_embd.format == WireFormat::Q6K
+                    && !explicitly_disabled
+                    && !crate::inference::deterministic_mode_enabled();
+                let head = if eligible {
+                    match &token_embd.backing {
+                        WireBacking::Mmap { mmap, offset } => crate::metal::Gemma4Q6KHead::new(
+                            Arc::clone(mmap),
+                            *offset,
+                            token_embd.bytes().len(),
+                            &output_norm,
+                            token_embd.element_count / config.embedding_length as usize,
+                            g.final_logit_softcapping.unwrap_or(0.0),
+                            config.rms_norm_epsilon,
+                        ),
+                        WireBacking::Owned { .. } => None,
+                    }
+                } else {
+                    None
+                };
+                if head.is_some() {
+                    eprintln!("[gemma4-ghost] Metal Q6_K tied head enabled (no-copy, file-backed)");
+                } else if eligible {
+                    eprintln!(
+                        "[gemma4-ghost] Metal Q6_K tied head unavailable; using CPU fallback"
+                    );
+                }
+                head
             }
-            head
         };
-        Ok(Self {
+        let (per_layer_token_embd, per_layer_model_proj, per_layer_proj_norm, rope_factors) =
+            match observed_non_head_metadata {
+                Some(metadata) => metadata,
+                None => (
+                    binding
+                        .per_layer_token_embd
+                        .as_ref()
+                        .map(|descriptor| q8(&descriptor.name))
+                        .transpose()?,
+                    binding
+                        .per_layer_model_proj
+                        .as_ref()
+                        .map(|descriptor| f32t(&descriptor.name))
+                        .transpose()?,
+                    binding
+                        .per_layer_proj_norm
+                        .as_ref()
+                        .map(|descriptor| f32t(&descriptor.name))
+                        .transpose()?,
+                    binding
+                        .rope_freqs
+                        .as_ref()
+                        .map(|descriptor| f32t(&descriptor.name))
+                        .transpose()?,
+                ),
+            };
+        #[cfg(target_os = "macos")]
+        if let Some(observer) = load_observer.as_mut() {
+            let head = metal_q6k_head.as_ref().ok_or_else(|| {
+                BackendError::UnsupportedModelArchitecture(
+                    "observed Ghost target lost its required no-copy head".into(),
+                )
+            })?;
+            let head_residency = head.weight_residency_snapshot()?;
+            if head_residency.page_size_bytes as u64
+                != observer.ledger.required_head_page_size_bytes
+                || head_residency.total_pages as u64 != observer.ledger.required_head_total_pages
+                || head_residency.resident_pages != head_residency.total_pages
+            {
+                return Err(BackendError::InvalidTensorData(format!(
+                    "observed tied-head final phase has invalid residency geometry: page={} pages={}/{}",
+                    head_residency.page_size_bytes,
+                    head_residency.resident_pages,
+                    head_residency.total_pages
+                )));
+            }
+            observer.ledger.required_head_resident_pages = head_residency.resident_pages as u64;
+            observer.ledger.required_head_resident_bytes = head_residency.resident_bytes as u64;
+            observer.emit(Gemma4GhostLoadPhase::RequiredTargetPagesHeadReady)?;
+        }
+        let runtime = Self {
             tokenizer,
             first_layer: range.start,
             // The tied head matvecs token_embd on the tail shard, so it takes
             // the matvec-role guard; per_layer_token_embd stays gather-only
             // (plain q8) — Q5_K is legitimate there.
             token_embd,
-            per_layer_token_embd: binding
-                .per_layer_token_embd
-                .as_ref()
-                .map(|d| q8(&d.name))
-                .transpose()?,
-            per_layer_model_proj: binding
-                .per_layer_model_proj
-                .as_ref()
-                .map(|d| f32t(&d.name))
-                .transpose()?,
-            per_layer_proj_norm: binding
-                .per_layer_proj_norm
-                .as_ref()
-                .map(|d| f32t(&d.name))
-                .transpose()?,
+            per_layer_token_embd,
+            per_layer_model_proj,
+            per_layer_proj_norm,
             output_norm,
-            rope_factors: binding
-                .rope_freqs
-                .as_ref()
-                .map(|d| f32t(&d.name))
-                .transpose()?,
+            rope_factors,
             first_kv_shared,
             last_sliding_layer: (0..first_kv_shared)
                 .rev()
@@ -5834,7 +7975,83 @@ impl Gemma4Runtime {
             layers,
             config,
             g,
-        })
+        };
+        if let Some(observer) = load_observer.as_mut() {
+            let stats = runtime.ghost_moe_cache_stats().ok_or_else(|| {
+                BackendError::InvalidModelMetadata(
+                    "observed Ghost target lost its expert cache before completion".into(),
+                )
+            })?;
+            if stats.resident_experts != 0
+                || stats.resident_bytes != 0
+                || stats.bytes_read != 0
+                || stats.hits != 0
+                || stats.misses != 0
+            {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "observed Ghost target cache changed before completion: {stats:?}"
+                )));
+            }
+            observer.ledger.host_cache_resident_bytes = stats.resident_bytes as u64;
+            #[cfg(target_os = "macos")]
+            {
+                let head = runtime.metal_q6k_head.as_ref().ok_or_else(|| {
+                    BackendError::UnsupportedModelArchitecture(
+                        "observed Ghost target lost its no-copy head before completion".into(),
+                    )
+                })?;
+                let head_residency = head.weight_residency_snapshot()?;
+                if head_residency.page_size_bytes as u64
+                    != observer.ledger.required_head_page_size_bytes
+                    || head_residency.total_pages as u64
+                        != observer.ledger.required_head_total_pages
+                {
+                    return Err(BackendError::InvalidTensorData(
+                        "observed tied-head residency geometry changed before completion".into(),
+                    ));
+                }
+                observer.ledger.required_head_resident_pages = head_residency.resident_pages as u64;
+                observer.ledger.required_head_resident_bytes = head_residency.resident_bytes as u64;
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let receipt = {
+                    let mut guard = runtime.metal_q4_experts.lock().map_err(|_| {
+                        BackendError::InvalidModelMetadata(
+                            "observed Ghost expert mutex poisoned before table bind".into(),
+                        )
+                    })?;
+                    let lane = guard.as_mut().ok_or_else(|| {
+                        BackendError::UnsupportedModelArchitecture(
+                            "observed Ghost target lost its expert lane before table bind".into(),
+                        )
+                    })?;
+                    lane.bind_load_only_record_tables().map_err(|error| {
+                        BackendError::InvalidTensorData(format!(
+                            "observed Ghost table residency bind failed: {error}"
+                        ))
+                    })?
+                };
+                if receipt.layer_count as u64 != observer.ledger.expert_layer_count
+                    || receipt.logical_slot_count as u64 != observer.ledger.expert_slot_count
+                    || receipt.table_directory_slot_count as u64
+                        != observer.ledger.expert_table_directory_slot_count
+                    || receipt.table_directory_capacity_bytes as u64
+                        != observer.ledger.expert_table_directory_capacity_bytes
+                {
+                    return Err(BackendError::InvalidModelMetadata(format!(
+                        "observed Ghost table bind receipt drift: {receipt:?} ledger={:?}",
+                        observer.ledger
+                    )));
+                }
+                observer.ledger.expert_table_bound_active_slot_count =
+                    receipt.compute_active_slot_count as u64;
+                observer.ledger.expert_tables_compute_bound = true;
+                observer.emit(Gemma4GhostLoadPhase::ExpertSlotTablesComputeBound)?;
+            }
+            observer.emit(Gemma4GhostLoadPhase::Complete)?;
+        }
+        Ok(runtime)
     }
 
     pub fn tokenizer(&self) -> &Tokenizer {
@@ -5912,6 +8129,241 @@ impl Gemma4Runtime {
         Ok(count)
     }
 
+    /// Begin a new routed-identity telemetry interval without changing any
+    /// slot, cache, route score, verifier state, or model allocation.
+    #[doc(hidden)]
+    pub fn begin_routed_expert_telemetry_interval(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            let Ok(mut guard) = self.metal_q4_experts.lock() else {
+                return false;
+            };
+            let Some(lane) = guard.as_mut() else {
+                return false;
+            };
+            for union in &mut lane.routed_expert_interval_union {
+                union.fill(0);
+            }
+            lane.routed_expert_interval_epoch = lane.routed_expert_interval_epoch.saturating_add(1);
+            true
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
+    /// Snapshot current routed-expert occupancy and cumulative demand-I/O
+    /// counters without touching any expert/source bytes.
+    #[doc(hidden)]
+    pub fn routed_expert_residency_snapshot(&self) -> Option<Gemma4RoutedExpertResidencySnapshot> {
+        #[cfg(target_os = "macos")]
+        {
+            let host_cache = self.ghost_moe_cache_stats().unwrap_or_default();
+            let guard = self.metal_q4_experts.lock().ok()?;
+            let lane = guard.as_ref()?;
+            let first = lane.layers.first()?;
+            let record_bytes = first.slots.slot_record_bytes() as u64;
+            let stride_bytes = first.slots.slot_stride_bytes() as u64;
+            let mut per_layer = Vec::with_capacity(lane.layers.len());
+            for (layer_index, layer) in lane.layers.iter().enumerate() {
+                let capacity = layer.slots.slot_count() as u64;
+                let physical_budget = layer.directory.entries.len() as u64;
+                let occupied = layer
+                    .directory
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.is_some())
+                    .count() as u64;
+                per_layer.push(Gemma4RoutedExpertLayerResidencySnapshot {
+                    layer_index: layer_index as u32,
+                    base_slot_capacity: capacity,
+                    physical_base_slot_budget: physical_budget,
+                    physical_base_slot_budget_bytes: physical_budget.saturating_mul(stride_bytes),
+                    occupied_base_slots: occupied,
+                    occupied_base_payload_bytes: occupied.saturating_mul(record_bytes),
+                    occupied_base_touched_bytes: occupied.saturating_mul(stride_bytes),
+                    slot_stats: layer.stats.into(),
+                });
+            }
+            let base_slot_capacity = per_layer
+                .iter()
+                .map(|layer| layer.base_slot_capacity)
+                .sum::<u64>();
+            let physical_base_slot_budget = per_layer
+                .iter()
+                .map(|layer| layer.physical_base_slot_budget)
+                .sum::<u64>();
+            let occupied_base_slots = per_layer
+                .iter()
+                .map(|layer| layer.occupied_base_slots)
+                .sum::<u64>();
+            let aggregate_slot_stats: Gemma4RoutedExpertSlotStatsSnapshot =
+                lane.slot_stats().into();
+            let chained = lane.last_chained_ledger();
+            let last_chained_round_available = lane.last_chained_k.is_some();
+            let mut last_chained_unique_per_layer = vec![0; lane.layers.len()];
+            if last_chained_round_available {
+                let covered = lane.layers.len().min(chained.unique_per_layer.len());
+                last_chained_unique_per_layer[..covered]
+                    .copy_from_slice(&chained.unique_per_layer[..covered]);
+            }
+            let cumulative_expert_payload_read_bytes = aggregate_slot_stats
+                .direct_read_bytes
+                .saturating_add(lane.chained_demand_read_bytes);
+            let interval_routed_expert_ids_per_layer = lane
+                .routed_expert_interval_union
+                .iter()
+                .map(|union| {
+                    (0..128)
+                        .filter_map(|expert| {
+                            ((union[expert / 64] & (1u64 << (expert % 64))) != 0)
+                                .then_some(expert as u16)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let interval_routed_unique_per_layer = interval_routed_expert_ids_per_layer
+                .iter()
+                .map(|experts| experts.len().min(u16::MAX as usize) as u16)
+                .collect::<Vec<_>>();
+            let interval_routed_unique_experts_sum = interval_routed_unique_per_layer
+                .iter()
+                .map(|value| u32::from(*value))
+                .sum::<u32>();
+            let interval_routed_unique_experts_max = interval_routed_unique_per_layer
+                .iter()
+                .copied()
+                .max()
+                .map(u32::from)
+                .unwrap_or(0);
+            Some(Gemma4RoutedExpertResidencySnapshot {
+                layer_count: lane.layers.len() as u32,
+                slot_record_bytes: record_bytes,
+                slot_stride_bytes: stride_bytes,
+                base_slot_capacity,
+                base_slot_capacity_bytes: base_slot_capacity.saturating_mul(stride_bytes),
+                physical_base_slot_budget,
+                physical_base_slot_budget_bytes: physical_base_slot_budget
+                    .saturating_mul(stride_bytes),
+                occupied_base_slots,
+                occupied_base_payload_bytes: occupied_base_slots.saturating_mul(record_bytes),
+                occupied_base_touched_bytes: occupied_base_slots.saturating_mul(stride_bytes),
+                per_layer,
+                aggregate_slot_stats,
+                cumulative_chained_demand_loads: lane.chained_demand_loads,
+                cumulative_chained_demand_read_bytes: lane.chained_demand_read_bytes,
+                cumulative_expert_payload_read_bytes,
+                host_cache_hits: host_cache.hits,
+                host_cache_misses: host_cache.misses,
+                host_cache_evictions: host_cache.evictions,
+                host_cache_bytes_read: host_cache.bytes_read,
+                host_cache_resident_experts: host_cache.resident_experts as u64,
+                host_cache_resident_bytes: host_cache.resident_bytes as u64,
+                host_cache_budget_bytes: host_cache.budget_bytes as u64,
+                interval_routed_expert_union_scope:
+                    "since_latest_explicit_telemetry_interval_begin_or_runtime_load".to_string(),
+                interval_routed_expert_union_epoch: lane.routed_expert_interval_epoch,
+                interval_routed_expert_ids_per_layer,
+                interval_routed_unique_per_layer,
+                interval_routed_unique_experts_sum,
+                interval_routed_unique_experts_max,
+                last_chained_ledger_scope:
+                    "latest_completed_chained_attempt_only_not_generation_maximum".to_string(),
+                last_chained_round_available,
+                last_chained_round_succeeded: last_chained_round_available
+                    && lane.last_chained_succeeded,
+                last_chained_round_sequence: lane.chained_round_seq as u64,
+                last_chained_k: lane.last_chained_k.map(|value| value as u32),
+                last_chained_unique_per_layer,
+                last_chained_unique_experts_sum: if last_chained_round_available {
+                    chained.unique_experts_sum
+                } else {
+                    0
+                },
+                last_chained_unique_experts_max: if last_chained_round_available {
+                    chained.unique_experts_max
+                } else {
+                    0
+                },
+                last_chained_slot_hits: if last_chained_round_available {
+                    chained.slot_hits
+                } else {
+                    0
+                },
+                last_chained_slot_misses: if last_chained_round_available {
+                    chained.slot_misses
+                } else {
+                    0
+                },
+                last_chained_slot_evictions: if last_chained_round_available {
+                    chained.slot_evictions
+                } else {
+                    0
+                },
+                last_chained_demand_loads: if last_chained_round_available {
+                    chained.demand_loads as u64
+                } else {
+                    0
+                },
+                last_chained_demand_read_bytes: if last_chained_round_available {
+                    chained.nvme_bytes
+                } else {
+                    0
+                },
+                last_chained_overflow_slots: if last_chained_round_available {
+                    chained.overflow_slots
+                } else {
+                    0
+                },
+                last_chained_overflow_bytes: if last_chained_round_available {
+                    chained.overflow_bytes
+                } else {
+                    0
+                },
+                last_chained_overflow_layers: if last_chained_round_available {
+                    chained.overflow_layers
+                } else {
+                    0
+                },
+                last_chained_overflow_experts: if last_chained_round_available {
+                    chained.overflow_experts
+                } else {
+                    0
+                },
+                last_chained_victim_hits: if last_chained_round_available {
+                    chained.victim_hits
+                } else {
+                    0
+                },
+                last_chained_victim_salvage_copies: if last_chained_round_available {
+                    chained.victim_salvage_copies
+                } else {
+                    0
+                },
+                last_chained_selected_experts_dropped: if last_chained_round_available {
+                    chained.selected_experts_dropped
+                } else {
+                    0
+                },
+                last_chained_missing_expert_failclose: if last_chained_round_available {
+                    chained.missing_expert_failclose
+                } else {
+                    0
+                },
+                last_chained_slot_capacity_overflow: if last_chained_round_available {
+                    chained.slot_capacity_overflow
+                } else {
+                    0
+                },
+            })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+
     /// Aggregate hits and misses across all persistent Metal slot directories.
     pub fn ghost_metal_aggregate_slot_stats(&self) -> (u64, u64) {
         #[cfg(target_os = "macos")]
@@ -5954,6 +8406,29 @@ impl Gemma4Runtime {
                 }
             }
         }
+    }
+
+    /// Run one isolated MTP assistant operation while borrowing the exact
+    /// Gemma 4 26B target KV sources (sliding layer 28 and full layer 29).
+    /// The callback is scoped under the target runtime mutex: borrowed buffer
+    /// views cannot escape, and no target cache mutation or growth can race it.
+    /// It must finish any assistant command using the views before returning
+    /// and must not re-enter a target operation that takes the same mutex.
+    /// Returns `Ok(None)` unless the strict 26B Ghost Metal common core is live
+    /// and every target layer is at the same logical sequence position.
+    #[cfg(target_os = "macos")]
+    #[doc(hidden)]
+    pub fn with_mtp_target_kv_experiment<R>(
+        &self,
+        use_view: impl for<'view> FnOnce(crate::metal::Gemma4MtpTargetKvView<'view>) -> R,
+    ) -> Result<Option<R>> {
+        let guard = self.metal_q4_experts.lock().map_err(|_| {
+            BackendError::InvalidModelMetadata("Ghost Metal runtime mutex is poisoned".into())
+        })?;
+        let Some(common) = guard.as_ref().and_then(|runtime| runtime.common.as_ref()) else {
+            return Ok(None);
+        };
+        Ok(common.with_mtp_target_kv(use_view))
     }
 
     /// Backwards-compatible common-core construction probe used by the real
@@ -6691,6 +9166,439 @@ impl Gemma4Runtime {
         Ok(h0)
     }
 
+    #[cfg(target_os = "macos")]
+    fn truncate_mtp_experiment_state(
+        &self,
+        kc: &mut [Vec<Vec<f32>>],
+        vc: &mut [Vec<Vec<f32>>],
+        keep: usize,
+    ) {
+        for (keys, values) in kc.iter_mut().zip(vc.iter_mut()) {
+            keys.truncate(keep);
+            values.truncate(keep);
+        }
+        self.rollback_sequence(keep);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn require_mtp_target_kv_len(&self, expected: usize) -> Result<()> {
+        let actual = self
+            .with_mtp_target_kv_experiment(|view| view.logical_len())?
+            .ok_or_else(|| {
+                BackendError::InvalidModelMetadata(
+                    "Gemma 4 MTP requires the strict 26B Metal target shared-KV path".into(),
+                )
+            })?;
+        if actual != expected {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "Gemma 4 MTP target KV length is {actual}, expected {expected}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn finish_mtp_experiment_abort(
+        &self,
+        mut output: Gemma4MtpGenerationResult,
+        kc: &mut [Vec<Vec<f32>>],
+        vc: &mut [Vec<Vec<f32>>],
+        logits: Vec<f32>,
+        committed_pos: usize,
+        generation_started: std::time::Instant,
+    ) -> Result<Gemma4MtpGenerationResult> {
+        self.truncate_mtp_experiment_state(kc, vc, committed_pos);
+        self.require_mtp_target_kv_len(committed_pos)?;
+        output.final_logits = logits;
+        output.final_position = committed_pos;
+        output.aborted = true;
+        output.total_wall_us = mtp_us_saturating(generation_started.elapsed().as_micros());
+        Ok(output)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn verify_mtp_round_timed(
+        &self,
+        tokens: &[u32],
+        drafts: &[u32],
+        start_pos: usize,
+        kc: &mut [Vec<Vec<f32>>],
+        vc: &mut [Vec<Vec<f32>>],
+    ) -> Result<(Gemma4MtpVerifyResult, u64, u64)> {
+        let gpu_before = mtp_target_gpu_snapshot();
+        let started = std::time::Instant::now();
+        let result = self.step_chunk_speculative_mtp_experiment(tokens, drafts, start_pos, kc, vc);
+        let wall_us = mtp_us_saturating(started.elapsed().as_micros());
+        let gpu_us = mtp_target_gpu_delta(gpu_before, mtp_target_gpu_snapshot());
+        result.map(|verified| (verified, wall_us, gpu_us))
+    }
+
+    /// Default-off target-authoritative generation driver for the official
+    /// Gemma 4 26B-A4B MTP assistant experiment. The caller supplies target
+    /// logits and caches produced by prompt prefill. Production CLAIRE's
+    /// speculative drafter and generation entry points never call this method.
+    ///
+    /// Unless only one output token remains, the first target anchor is verified
+    /// alone to establish the canonical final-normalized target hidden row.
+    /// Every later round drafts at most seven post-anchor tokens against a
+    /// read-only layer-28/layer-29 KV view, verifies `[anchor, drafts...]`
+    /// through the existing exact K<=8 target path, and truncates every rejected
+    /// cache tail before the next round. At an exact one-token output boundary,
+    /// the authoritative target argmax is returned without a discarded forward.
+    #[cfg(target_os = "macos")]
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_mtp_assistant_experiment(
+        &self,
+        assistant: &mut crate::metal::Gemma4MtpAssistantMetal,
+        kc: &mut [Vec<Vec<f32>>],
+        vc: &mut [Vec<Vec<f32>>],
+        logits: Vec<f32>,
+        start_pos: usize,
+        eot: &[u32],
+        max_new: usize,
+    ) -> Result<Gemma4MtpGenerationResult> {
+        self.generate_mtp_assistant_experiment_cancellable(
+            assistant,
+            kc,
+            vc,
+            logits,
+            start_pos,
+            eot,
+            max_new,
+            || false,
+        )
+    }
+
+    /// Cooperatively-cancellable form of
+    /// [`Self::generate_mtp_assistant_experiment`]. `should_abort` is checked
+    /// before each target verifier forward, between assistant proposals, and
+    /// once more after a target forward before its accepted prefix is committed.
+    /// An abort returns `Ok` with `aborted=true` and both host and Metal target
+    /// KV truncated to the last target-authoritative committed position.
+    #[cfg(target_os = "macos")]
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_mtp_assistant_experiment_cancellable<C: FnMut() -> bool>(
+        &self,
+        assistant: &mut crate::metal::Gemma4MtpAssistantMetal,
+        kc: &mut [Vec<Vec<f32>>],
+        vc: &mut [Vec<Vec<f32>>],
+        mut logits: Vec<f32>,
+        start_pos: usize,
+        eot: &[u32],
+        max_new: usize,
+        mut should_abort: C,
+    ) -> Result<Gemma4MtpGenerationResult> {
+        const MAX_VERIFY_K: usize = 8;
+        const MAX_DRAFTS: usize = MAX_VERIFY_K - 1;
+
+        let generation_started = std::time::Instant::now();
+        if kc.len() != self.layers.len() || vc.len() != self.layers.len() {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "Gemma 4 MTP cache layer counts are K={} V={}, expected {}",
+                kc.len(),
+                vc.len(),
+                self.layers.len()
+            )));
+        }
+        let vocab = self.config.vocab_size.ok_or_else(|| {
+            BackendError::InvalidModelMetadata("Gemma 4 MTP target has no vocabulary size".into())
+        })? as usize;
+        if logits.len() != vocab {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "Gemma 4 MTP prefilled logits width is {}, expected {vocab}",
+                logits.len()
+            )));
+        }
+        if !self.supports_speculative_chunk_forward() {
+            return Err(BackendError::InvalidModelMetadata(
+                "Gemma 4 MTP requires the single-node exact speculative target lane".into(),
+            ));
+        }
+
+        let mut output = Gemma4MtpGenerationResult {
+            final_logits: Vec::new(),
+            final_position: start_pos,
+            ..Gemma4MtpGenerationResult::default()
+        };
+        if max_new == 0 {
+            output.final_logits = logits;
+            output.total_wall_us = mtp_us_saturating(generation_started.elapsed().as_micros());
+            return Ok(output);
+        }
+
+        self.require_mtp_target_kv_len(start_pos)?;
+        if should_abort() {
+            return self.finish_mtp_experiment_abort(
+                output,
+                kc,
+                vc,
+                logits,
+                start_pos,
+                generation_started,
+            );
+        }
+        if max_new == 1 {
+            if let Some(token) = mtp_terminal_unforwarded_target_token(&logits, eot)? {
+                output.generated_tokens.push(token);
+                output.terminal_unforwarded_target_token = Some(token);
+            } else {
+                output.stopped_on_eot = true;
+            }
+            output.final_logits = logits;
+            output.total_wall_us = mtp_us_saturating(generation_started.elapsed().as_micros());
+            return Ok(output);
+        }
+        let bootstrap_started = std::time::Instant::now();
+        let bootstrap_anchor = mtp_argmax(&logits)?;
+        if eot.contains(&bootstrap_anchor) {
+            output.final_logits = logits;
+            output.stopped_on_eot = true;
+            output.total_wall_us = mtp_us_saturating(generation_started.elapsed().as_micros());
+            return Ok(output);
+        }
+
+        let bootstrap_verify =
+            self.verify_mtp_round_timed(&[bootstrap_anchor], &[], start_pos, kc, vc);
+        let (verified, verify_wall_us, verify_gpu_us) = match bootstrap_verify {
+            Ok(result) => result,
+            Err(error) => {
+                self.truncate_mtp_experiment_state(kc, vc, start_pos);
+                return Err(error);
+            }
+        };
+        if should_abort() {
+            return self.finish_mtp_experiment_abort(
+                output,
+                kc,
+                vc,
+                logits,
+                start_pos,
+                generation_started,
+            );
+        }
+        if verified.accepted_drafts != 0 {
+            self.truncate_mtp_experiment_state(kc, vc, start_pos);
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "Gemma 4 MTP K=1 bootstrap accepted {} nonexistent drafts",
+                verified.accepted_drafts
+            )));
+        }
+        let bootstrap_plan =
+            match mtp_commit_plan(bootstrap_anchor, &[], 0, start_pos, max_new, eot) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    self.truncate_mtp_experiment_state(kc, vc, start_pos);
+                    return Err(error);
+                }
+            };
+        self.truncate_mtp_experiment_state(kc, vc, bootstrap_plan.keep);
+        self.require_mtp_target_kv_len(bootstrap_plan.keep)?;
+        output
+            .generated_tokens
+            .extend_from_slice(&bootstrap_plan.visible_tokens);
+        output.rounds.push(Gemma4MtpGenerationRound {
+            round_index: 0,
+            prefix_tokens_before: start_pos,
+            bootstrap: true,
+            remaining_budget_before: max_new,
+            requested_k: 1,
+            verifier_k: 1,
+            budget_truncated: false,
+            anchor_token: bootstrap_anchor,
+            proposed_drafts: Vec::new(),
+            accepted_drafts: 0,
+            useful_accepted_drafts: 0,
+            committed_tokens: bootstrap_plan.committed_tokens,
+            assistant_wall_us: 0,
+            assistant_gpu_us: 0,
+            target_verify_wall_us: verify_wall_us,
+            target_verify_gpu_us: verify_gpu_us,
+            total_wall_us: mtp_us_saturating(bootstrap_started.elapsed().as_micros()),
+        });
+
+        let mut pos = bootstrap_plan.keep;
+        let mut pending_hidden = verified.target_hidden_normalized;
+        logits = verified.next_logits;
+        let mut stopped_on_eot = bootstrap_plan.stopped_on_eot;
+
+        while output.generated_tokens.len() < max_new && !stopped_on_eot {
+            if should_abort() {
+                return self.finish_mtp_experiment_abort(
+                    output,
+                    kc,
+                    vc,
+                    logits,
+                    pos,
+                    generation_started,
+                );
+            }
+            let remaining_budget = max_new - output.generated_tokens.len();
+            let anchor = mtp_argmax(&logits)?;
+            if eot.contains(&anchor) {
+                stopped_on_eot = true;
+                break;
+            }
+            if remaining_budget == 1 {
+                output.generated_tokens.push(anchor);
+                output.terminal_unforwarded_target_token = Some(anchor);
+                break;
+            }
+
+            let round_started = std::time::Instant::now();
+            let draft_limit = MAX_DRAFTS.min(remaining_budget - 1);
+            let budget_truncated = remaining_budget < MAX_VERIFY_K;
+            let mut proposed_drafts = Vec::with_capacity(draft_limit);
+            let mut assistant_gpu_us = 0u64;
+            let mut current = anchor;
+            let mut recurrent_hidden = pending_hidden.clone();
+            let assistant_started = std::time::Instant::now();
+            for _ in 0..draft_limit {
+                if should_abort() {
+                    return self.finish_mtp_experiment_abort(
+                        output,
+                        kc,
+                        vc,
+                        logits,
+                        pos,
+                        generation_started,
+                    );
+                }
+                let embedding = match self.token_embedding(current) {
+                    Ok(embedding) => embedding,
+                    Err(error) => {
+                        self.truncate_mtp_experiment_state(kc, vc, pos);
+                        return Err(error);
+                    }
+                };
+                let proposal_result = match self.with_mtp_target_kv_experiment(|view| {
+                    if view.logical_len() != pos {
+                        return Err(BackendError::RuntimeShapeMismatch(format!(
+                            "Gemma 4 MTP proposal target KV length is {}, expected {pos}",
+                            view.logical_len()
+                        )));
+                    }
+                    assistant.propose(&embedding, &recurrent_hidden, view)
+                }) {
+                    Ok(Some(result)) => result,
+                    Ok(None) => {
+                        self.truncate_mtp_experiment_state(kc, vc, pos);
+                        return Err(BackendError::InvalidModelMetadata(
+                            "Gemma 4 MTP target shared-KV view disappeared during drafting".into(),
+                        ));
+                    }
+                    Err(error) => {
+                        self.truncate_mtp_experiment_state(kc, vc, pos);
+                        return Err(error);
+                    }
+                };
+                let proposal = match proposal_result {
+                    Ok(proposal) => proposal,
+                    Err(error) => {
+                        self.truncate_mtp_experiment_state(kc, vc, pos);
+                        return Err(error);
+                    }
+                };
+                assistant_gpu_us =
+                    assistant_gpu_us.saturating_add(mtp_us_saturating(proposal.timing.gpu_us));
+                current = proposal.token;
+                recurrent_hidden = proposal.recurrent_hidden;
+                proposed_drafts.push(current);
+                if eot.contains(&current) {
+                    break;
+                }
+            }
+            let assistant_wall_us = mtp_us_saturating(assistant_started.elapsed().as_micros());
+
+            if should_abort() {
+                return self.finish_mtp_experiment_abort(
+                    output,
+                    kc,
+                    vc,
+                    logits,
+                    pos,
+                    generation_started,
+                );
+            }
+
+            let mut chunk = Vec::with_capacity(1 + proposed_drafts.len());
+            chunk.push(anchor);
+            chunk.extend_from_slice(&proposed_drafts);
+            let verify = self.verify_mtp_round_timed(&chunk, &proposed_drafts, pos, kc, vc);
+            let (verified, verify_wall_us, verify_gpu_us) = match verify {
+                Ok(result) => result,
+                Err(error) => {
+                    self.truncate_mtp_experiment_state(kc, vc, pos);
+                    return Err(error);
+                }
+            };
+            if should_abort() {
+                return self.finish_mtp_experiment_abort(
+                    output,
+                    kc,
+                    vc,
+                    logits,
+                    pos,
+                    generation_started,
+                );
+            }
+            let plan = match mtp_commit_plan(
+                anchor,
+                &proposed_drafts,
+                verified.accepted_drafts,
+                pos,
+                remaining_budget,
+                eot,
+            ) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    self.truncate_mtp_experiment_state(kc, vc, pos);
+                    return Err(error);
+                }
+            };
+
+            self.truncate_mtp_experiment_state(kc, vc, plan.keep);
+            self.require_mtp_target_kv_len(plan.keep)?;
+            output
+                .generated_tokens
+                .extend_from_slice(&plan.visible_tokens);
+            let accepted_drafts = verified.accepted_drafts;
+            let useful_accepted_drafts =
+                useful_accepted_drafts(&proposed_drafts, accepted_drafts, eot);
+            let round_index = output.rounds.len();
+            output.rounds.push(Gemma4MtpGenerationRound {
+                round_index,
+                prefix_tokens_before: pos,
+                bootstrap: false,
+                remaining_budget_before: remaining_budget,
+                requested_k: MAX_VERIFY_K,
+                verifier_k: chunk.len(),
+                budget_truncated,
+                anchor_token: anchor,
+                proposed_drafts,
+                accepted_drafts,
+                useful_accepted_drafts,
+                committed_tokens: plan.committed_tokens,
+                assistant_wall_us,
+                assistant_gpu_us,
+                target_verify_wall_us: verify_wall_us,
+                target_verify_gpu_us: verify_gpu_us,
+                total_wall_us: mtp_us_saturating(round_started.elapsed().as_micros()),
+            });
+            pos = plan.keep;
+            stopped_on_eot = plan.stopped_on_eot;
+            pending_hidden = verified.target_hidden_normalized;
+            logits = verified.next_logits;
+        }
+
+        output.final_logits = logits;
+        output.stopped_on_eot = stopped_on_eot;
+        output.final_position = pos;
+        output.total_wall_us = mtp_us_saturating(generation_started.elapsed().as_micros());
+        Ok(output)
+    }
+
     /// Speculative decode operates on single-node dense models as well as Ghost-backed MoE models.
     fn supports_speculative_chunk_forward(&self) -> bool {
         self.supports_chunk_forward()
@@ -6739,6 +9647,59 @@ impl Gemma4Runtime {
         kc: &mut [Vec<Vec<f32>>],
         vc: &mut [Vec<Vec<f32>>],
     ) -> Result<(usize, Vec<f32>)> {
+        let result = self.step_chunk_speculative_inner(tokens, drafts, start_pos, kc, vc, false)?;
+        Ok((result.accepted_drafts, result.next_logits))
+    }
+
+    /// Target-authoritative verifier seam for the isolated official Gemma 4
+    /// MTP assistant experiment. This runs the same exact target computation as
+    /// [`Self::step_chunk_speculative`], but also returns verifier row `j` after
+    /// the target's canonical final RMSNorm so it can seed the next MTP round.
+    ///
+    /// The experiment is deliberately capped at the currently parity-proven
+    /// K=8 target lane. `tokens` must be `[target_anchor, draft...]`; no draft
+    /// token is accepted or committed by this helper itself.
+    #[doc(hidden)]
+    pub fn step_chunk_speculative_mtp_experiment(
+        &self,
+        tokens: &[u32],
+        drafts: &[u32],
+        start_pos: usize,
+        kc: &mut [Vec<Vec<f32>>],
+        vc: &mut [Vec<Vec<f32>>],
+    ) -> Result<Gemma4MtpVerifyResult> {
+        const EXACT_MAX_VERIFY_TOKENS: usize = 8;
+        if tokens.is_empty()
+            || tokens.len() != drafts.len() + 1
+            || tokens.len() > EXACT_MAX_VERIFY_TOKENS
+        {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "Gemma 4 MTP verifier requires [anchor, drafts...] with K in 1..={EXACT_MAX_VERIFY_TOKENS}; tokens={}, drafts={}",
+                tokens.len(),
+                drafts.len()
+            )));
+        }
+        let result = self.step_chunk_speculative_inner(tokens, drafts, start_pos, kc, vc, true)?;
+        Ok(Gemma4MtpVerifyResult {
+            accepted_drafts: result.accepted_drafts,
+            next_logits: result.next_logits,
+            target_hidden_normalized: result.target_hidden_normalized.ok_or_else(|| {
+                BackendError::RuntimeShapeMismatch(
+                    "Gemma 4 MTP verifier did not capture the selected target hidden row".into(),
+                )
+            })?,
+        })
+    }
+
+    fn step_chunk_speculative_inner(
+        &self,
+        tokens: &[u32],
+        drafts: &[u32],
+        start_pos: usize,
+        kc: &mut [Vec<Vec<f32>>],
+        vc: &mut [Vec<Vec<f32>>],
+        capture_target_hidden: bool,
+    ) -> Result<Gemma4SpeculativeStepResult> {
         #[cfg(target_os = "macos")]
         if ghost_metal_acceleration_enabled() && self.supports_chunk_forward() {
             if let Some(head) = self.metal_q6k_head.as_ref() {
@@ -6763,6 +9724,7 @@ impl Gemma4Runtime {
 
                 let mut hs_buf: Vec<Vec<f32>> = (0..kk).map(|_| vec![0.0f32; hidden]).collect();
                 let mut gpu_chained_round_ok = false;
+                let mut chained_refusal_ledger = None;
 
                 let theta_local = (0..self.layers.len())
                     .find(|&l| self.g.is_sliding_layer(l))
@@ -6786,19 +9748,60 @@ impl Gemma4Runtime {
                             ghost_cache,
                             &mut hs_buf,
                         );
+                        if !gpu_chained_round_ok {
+                            chained_refusal_ledger = Some(lane.last_chained_ledger());
+                        }
                     }
+                }
+
+                if let Some(ledger) = chained_refusal_ledger
+                    .filter(|_| ghost_metal_bounded_record_fallback_forbidden())
+                {
+                    return Err(bounded_record_chained_refusal(
+                        "speculative verifier",
+                        start_pos,
+                        kk,
+                        ledger,
+                    ));
                 }
 
                 if gpu_chained_round_ok {
                     std::mem::swap(&mut hs, &mut hs_buf);
                     if let Some((j, logits)) = head.forward_batch_speculative(&hs, drafts) {
-                        return Ok((j, logits));
+                        let target_hidden_normalized = capture_target_hidden
+                            .then(|| {
+                                mtp_final_normalized_hidden(
+                                    &hs,
+                                    j,
+                                    &self.output_norm,
+                                    self.config.rms_norm_epsilon,
+                                )
+                            })
+                            .transpose()?;
+                        return Ok(Gemma4SpeculativeStepResult {
+                            accepted_drafts: j,
+                            next_logits: logits,
+                            target_hidden_normalized,
+                        });
                     }
                 }
             }
         }
 
-        let rows = self.step_chunk(tokens, start_pos, kc, vc)?;
+        let mut hidden_rows = Vec::new();
+        let rows = if capture_target_hidden {
+            self.step_chunk_with_head_capture(
+                tokens,
+                start_pos,
+                kc,
+                vc,
+                true,
+                None,
+                Some(&mut hidden_rows),
+            )?
+        } else {
+            self.step_chunk(tokens, start_pos, kc, vc)?
+        };
         let argmax = |l: &[f32]| -> u32 {
             l.iter()
                 .enumerate()
@@ -6809,7 +9812,21 @@ impl Gemma4Runtime {
         let preds: Vec<u32> = (0..drafts.len()).map(|i| argmax(&rows[i])).collect();
         let j = crate::inference::speculative::accepted_draft_prefix(drafts, &preds);
         let next_logits = rows.into_iter().nth(j).expect("rows[j] exists");
-        Ok((j, next_logits))
+        let target_hidden_normalized = capture_target_hidden
+            .then(|| {
+                mtp_final_normalized_hidden(
+                    &hidden_rows,
+                    j,
+                    &self.output_norm,
+                    self.config.rms_norm_epsilon,
+                )
+            })
+            .transpose()?;
+        Ok(Gemma4SpeculativeStepResult {
+            accepted_drafts: j,
+            next_logits,
+            target_hidden_normalized,
+        })
     }
 
     /// Shared chunk body. Prompt prefill requests only the final row's tied
@@ -6822,7 +9839,26 @@ impl Gemma4Runtime {
         kc: &mut [Vec<Vec<f32>>],
         vc: &mut [Vec<Vec<f32>>],
         all_logits: bool,
+        profile: Option<&mut Gemma4ChunkRoundProfile>,
+    ) -> Result<Vec<Vec<f32>>> {
+        self.step_chunk_with_head_capture(tokens, start_pos, kc, vc, all_logits, profile, None)
+    }
+
+    /// Internal sibling used only by the MTP experiment to retain the raw
+    /// final-layer rows long enough to normalize the verifier-selected row.
+    /// Normal production callers pass through [`Self::step_chunk_with_head`]
+    /// and incur no hidden-row clone.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::needless_range_loop)]
+    fn step_chunk_with_head_capture(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        kc: &mut [Vec<Vec<f32>>],
+        vc: &mut [Vec<Vec<f32>>],
+        all_logits: bool,
         mut profile: Option<&mut Gemma4ChunkRoundProfile>,
+        hidden_rows_capture: Option<&mut Vec<Vec<f32>>>,
     ) -> Result<Vec<Vec<f32>>> {
         let t_round_start = std::time::Instant::now();
         let kk = tokens.len();
@@ -6893,6 +9929,7 @@ impl Gemma4Runtime {
 
         #[cfg(target_os = "macos")]
         {
+            let mut chained_refusal_ledger = None;
             if self.ghost_metal_q4_is_enabled() && n_local == self.layers.len() {
                 let theta_local = (0..self.layers.len())
                     .find(|&l| self.g.is_sliding_layer(l))
@@ -6916,8 +9953,21 @@ impl Gemma4Runtime {
                             ghost_cache,
                             &mut hs_buf,
                         );
+                        if !gpu_chained_round_ok {
+                            chained_refusal_ledger = Some(lane.last_chained_ledger());
+                        }
                     }
                 }
+            }
+            if let Some(ledger) =
+                chained_refusal_ledger.filter(|_| ghost_metal_bounded_record_fallback_forbidden())
+            {
+                return Err(bounded_record_chained_refusal(
+                    "chunk forward",
+                    start_pos,
+                    kk,
+                    ledger,
+                ));
             }
         }
 
@@ -7312,6 +10362,11 @@ impl Gemma4Runtime {
             }
         }
 
+        if let Some(capture) = hidden_rows_capture {
+            capture.clear();
+            capture.extend(hs.iter().cloned());
+        }
+
         // --- tied head ---
         let t_head_start = std::time::Instant::now();
         let vocab = self.config.vocab_size.unwrap() as usize;
@@ -7397,7 +10452,10 @@ impl Gemma4Runtime {
     fn ghost_metal_q4_slots_per_layer(&self) -> Option<usize> {
         #[cfg(target_os = "macos")]
         {
-            if !ghost_metal_acceleration_enabled() {
+            // This query exists only to size prompt-history prewarm. In
+            // demand-only mode, returning no capacity prevents building and
+            // retaining a prewarm request/record map in the first place.
+            if ghost_metal_demand_load_only_from_env() || !ghost_metal_acceleration_enabled() {
                 return None;
             }
             self.metal_q4_experts
@@ -7453,6 +10511,10 @@ impl Gemma4Runtime {
         request_sequence: &[usize],
         records: &std::collections::HashMap<usize, Arc<GhostMoeExpert>>,
     ) {
+        #[cfg(target_os = "macos")]
+        if ghost_metal_demand_load_only_from_env() {
+            return;
+        }
         #[cfg(target_os = "macos")]
         if ghost_metal_acceleration_enabled() {
             if let Ok(mut guard) = self.metal_q4_experts.lock() {
@@ -9648,6 +12710,23 @@ impl Gemma4Runtime {
     /// A forward already submitted to CPU/Metal is allowed to finish, then the
     /// next chunk/token boundary observes the stop signal before touching any
     /// more model or Ghost-MoE state.
+    ///
+    /// The public wrapper is deliberately hidden and exists only so the isolated
+    /// official-MTP benchmark child can connect its 1 Hz memory-pressure kill
+    /// signal to prompt prefill. Production generation continues through the
+    /// existing private call sites and is behaviorally unchanged.
+    #[doc(hidden)]
+    pub fn prefill_tokens_cancellable_experiment<C: FnMut() -> bool>(
+        &self,
+        prompt_tokens: &[u32],
+        kc: &mut [Vec<Vec<f32>>],
+        vc: &mut [Vec<Vec<f32>>],
+        future_forwards: usize,
+        mut should_abort: C,
+    ) -> Result<Option<Vec<f32>>> {
+        self.prefill_tokens_cancellable(prompt_tokens, kc, vc, future_forwards, &mut should_abort)
+    }
+
     fn prefill_tokens_cancellable<C: FnMut() -> bool>(
         &self,
         prompt_tokens: &[u32],
@@ -10228,8 +13307,95 @@ impl Gemma4Runtime {
     /// KV cache back to the accepted length, and carry the divergence position's logits
     /// into the next round. Emits exactly the greedy token stream; drafts only change how
     /// many tokens fall out of a single weight read.
-    #[allow(clippy::needless_range_loop)]
     pub fn spec_decode_generate(
+        &self,
+        kc: &mut [Vec<Vec<f32>>],
+        vc: &mut [Vec<Vec<f32>>],
+        logits: Vec<f32>,
+        prompt_tokens: &[u32],
+        eot: &[u32],
+        max_new: usize,
+    ) -> Result<Vec<u32>> {
+        self.spec_decode_generate_core(kc, vc, logits, prompt_tokens, eot, max_new, None, None)
+            .map(|(tokens, _, _)| tokens)
+    }
+
+    /// Receipt-emitting sibling used only by the isolated official-assistant
+    /// experiment. The shipping entry point above passes no observer, so its
+    /// allocation and timing behavior remain unchanged.
+    #[doc(hidden)]
+    pub fn spec_decode_generate_observed_experiment(
+        &self,
+        kc: &mut [Vec<Vec<f32>>],
+        vc: &mut [Vec<Vec<f32>>],
+        logits: Vec<f32>,
+        prompt_tokens: &[u32],
+        eot: &[u32],
+        max_new: usize,
+    ) -> Result<Gemma4SpecDecodeExperimentResult> {
+        self.spec_decode_generate_observed_experiment_cancellable(
+            kc,
+            vc,
+            logits,
+            prompt_tokens,
+            eot,
+            max_new,
+            || false,
+        )
+    }
+
+    /// Cooperatively cancellable receipt-emitting shipping n-gram lane. The
+    /// callback is checked between rounds, immediately before every target
+    /// forward, and after each target forward before any resulting prefix is
+    /// committed. An abort rolls host and Metal KV back to the last committed
+    /// position and returns only target-authoritative partial receipts/tokens.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn spec_decode_generate_observed_experiment_cancellable<C: FnMut() -> bool>(
+        &self,
+        kc: &mut [Vec<Vec<f32>>],
+        vc: &mut [Vec<Vec<f32>>],
+        logits: Vec<f32>,
+        prompt_tokens: &[u32],
+        eot: &[u32],
+        max_new: usize,
+        mut should_abort: C,
+    ) -> Result<Gemma4SpecDecodeExperimentResult> {
+        let started = std::time::Instant::now();
+        let mut rounds = Vec::new();
+        let mut observe = |round| rounds.push(round);
+        let (generated_tokens, terminal_unforwarded_target_token, aborted) = self
+            .spec_decode_generate_core(
+                kc,
+                vc,
+                logits,
+                prompt_tokens,
+                eot,
+                max_new,
+                Some(&mut observe),
+                Some(&mut should_abort),
+            )?;
+        Ok(Gemma4SpecDecodeExperimentResult {
+            generated_tokens,
+            rounds,
+            terminal_unforwarded_target_token,
+            aborted,
+            total_wall_us: mtp_us_saturating(started.elapsed().as_micros()),
+        })
+    }
+
+    fn truncate_spec_decode_experiment_state(
+        &self,
+        kc: &mut [Vec<Vec<f32>>],
+        vc: &mut [Vec<Vec<f32>>],
+        keep: usize,
+    ) {
+        truncate_spec_host_kv(kc, vc, keep);
+        self.rollback_sequence(keep);
+    }
+
+    #[allow(clippy::needless_range_loop)]
+    fn spec_decode_generate_core(
         &self,
         kc: &mut [Vec<Vec<f32>>],
         vc: &mut [Vec<Vec<f32>>],
@@ -10237,10 +13403,10 @@ impl Gemma4Runtime {
         prompt_tokens: &[u32],
         eot: &[u32],
         max_new: usize,
-    ) -> Result<Vec<u32>> {
-        use crate::inference::speculative::{
-            accepted_draft_prefix, NGramDrafter, DEFAULT_NGRAM_DRAFT_TOKENS,
-        };
+        mut observe_round: Option<&mut dyn FnMut(Gemma4SpecDecodeExperimentRound)>,
+        mut should_abort: Option<&mut dyn FnMut() -> bool>,
+    ) -> Result<(Vec<u32>, Option<u32>, bool)> {
+        use crate::inference::speculative::{NGramDrafter, DEFAULT_NGRAM_DRAFT_TOKENS};
         let max_draft = std::env::var("CAMELID_GEMMA4_SPEC_DRAFT_TOKENS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -10390,7 +13556,9 @@ impl Gemma4Runtime {
         let mut history: Vec<u32> = if seed_text.is_empty() {
             Vec::new()
         } else {
-            self.tokenizer.encode(&seed_text, false, true).unwrap_or_default()
+            self.tokenizer
+                .encode(&seed_text, false, true)
+                .unwrap_or_default()
         };
         history.extend_from_slice(prompt_tokens);
         let mut generated: Vec<u32> = Vec::new();
@@ -10401,7 +13569,21 @@ impl Gemma4Runtime {
         // the k-report reads.
         let mut t_prev_round_end: Option<std::time::Instant> = None;
         let (mut boundary_us, mut draft_us, mut truncate_us) = (0u64, 0u64, 0u64);
+        let mut terminal_unforwarded_target_token = None;
+        let mut aborted = false;
         while generated.len() < max_new {
+            if should_abort
+                .as_deref_mut()
+                .is_some_and(|callback| callback())
+            {
+                aborted = true;
+                break;
+            }
+            let receipt_enabled = observe_round.is_some();
+            let round_started = receipt_enabled.then(std::time::Instant::now);
+            let round_index = accepted_rounds as usize;
+            let prefix_tokens_before = generated.len();
+            let remaining_budget_before = max_new - generated.len();
             // t0 is the target's own next-token argmax — always greedy-correct.
             let t0 = argmax(&logits);
             if eot.contains(&t0) {
@@ -10410,19 +13592,21 @@ impl Gemma4Runtime {
             generated.push(t0);
             history.push(t0);
             if generated.len() >= max_new {
+                terminal_unforwarded_target_token = Some(t0);
                 break;
             }
             let budget = max_new - generated.len();
             let want = if adaptive { cur_k } else { max_draft };
+            let requested_k = want.saturating_add(1);
+            let budget_truncated = remaining_budget_before < requested_k;
             let t_draft = std::time::Instant::now();
-            let (mut drafts, matched_n, miss) =
-                drafter.draft_explained(&history, want.min(budget));
-            draft_us += (t_draft.elapsed().as_secs_f64() * 1_000_000.0) as u64;
+            let (mut drafts, matched_n, miss) = drafter.draft_explained(&history, want.min(budget));
+            let round_draft_us = mtp_us_saturating(t_draft.elapsed().as_micros());
+            draft_us = draft_us.saturating_add(round_draft_us);
             let tier_now = tier_of(matched_n);
             let tier_priced_out = econ_enabled
                 && tier_offered[tier_now] >= econ_min_offered
-                && (tier_accepted[tier_now] as f64)
-                    < breakeven * tier_offered[tier_now] as f64;
+                && (tier_accepted[tier_now] as f64) < breakeven * tier_offered[tier_now] as f64;
             let width = if tier_priced_out {
                 0
             } else {
@@ -10431,7 +13615,10 @@ impl Gemma4Runtime {
             let had_candidates = !drafts.is_empty();
             drafts.truncate(width);
             if nomatch_dump.is_some()
-                && matches!(miss, Some(crate::inference::speculative::DraftMiss::NoMatch))
+                && matches!(
+                    miss,
+                    Some(crate::inference::speculative::DraftMiss::NoMatch)
+                )
             {
                 let tail_start = history.len().saturating_sub(12);
                 let tail = &history[tail_start..];
@@ -10465,17 +13652,68 @@ impl Gemma4Runtime {
                 if let Some(t) = t_prev_round_end.take() {
                     boundary_us += (t.elapsed().as_secs_f64() * 1_000_000.0) as u64;
                 }
+                if should_abort
+                    .as_deref_mut()
+                    .is_some_and(|callback| callback())
+                {
+                    remove_uncommitted_spec_anchor(&mut generated, &mut history, t0)?;
+                    let truncate_started = std::time::Instant::now();
+                    self.truncate_spec_decode_experiment_state(kc, vc, pos);
+                    truncate_us = truncate_us
+                        .saturating_add(mtp_us_saturating(truncate_started.elapsed().as_micros()));
+                    aborted = true;
+                    break;
+                }
+                let verify_gpu_before = spec_experiment_gpu_snapshot(receipt_enabled);
+                let verify_started = receipt_enabled.then(std::time::Instant::now);
                 logits = if spec_k1_head_lane() {
                     self.step(t0, pos, kc, vc)?
                 } else {
                     self.step_chunk_speculative(&[t0], &[], pos, kc, vc)?.1
                 };
+                let target_verify_wall_us = verify_started
+                    .map(|started| mtp_us_saturating(started.elapsed().as_micros()))
+                    .unwrap_or(0);
+                let target_verify_gpu_us = spec_experiment_gpu_delta(verify_gpu_before);
+                if should_abort
+                    .as_deref_mut()
+                    .is_some_and(|callback| callback())
+                {
+                    remove_uncommitted_spec_anchor(&mut generated, &mut history, t0)?;
+                    let truncate_started = std::time::Instant::now();
+                    self.truncate_spec_decode_experiment_state(kc, vc, pos);
+                    truncate_us = truncate_us
+                        .saturating_add(mtp_us_saturating(truncate_started.elapsed().as_micros()));
+                    aborted = true;
+                    break;
+                }
                 t_prev_round_end = Some(std::time::Instant::now());
                 pos += 1;
                 accepted_rounds += 1;
                 crate::metal::SPEC_VERIFY_ROUNDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 crate::metal::SPEC_ACCEPTED_TOKENS
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Some(observer) = observe_round.as_deref_mut() {
+                    observer(Gemma4SpecDecodeExperimentRound {
+                        round_index,
+                        prefix_tokens_before,
+                        remaining_budget_before,
+                        requested_k,
+                        verifier_k: 1,
+                        budget_truncated,
+                        anchor_token: t0,
+                        proposed_drafts: Vec::new(),
+                        accepted_drafts: 0,
+                        useful_accepted_drafts: 0,
+                        committed_tokens: vec![t0],
+                        draft_wall_us: round_draft_us,
+                        target_verify_wall_us,
+                        target_verify_gpu_us,
+                        total_wall_us: round_started
+                            .map(|started| mtp_us_saturating(started.elapsed().as_micros()))
+                            .unwrap_or(0),
+                    });
+                }
                 continue;
             }
 
@@ -10496,7 +13734,37 @@ impl Gemma4Runtime {
             if let Some(t) = t_prev_round_end.take() {
                 boundary_us += (t.elapsed().as_secs_f64() * 1_000_000.0) as u64;
             }
+            if should_abort
+                .as_deref_mut()
+                .is_some_and(|callback| callback())
+            {
+                remove_uncommitted_spec_anchor(&mut generated, &mut history, t0)?;
+                let truncate_started = std::time::Instant::now();
+                self.truncate_spec_decode_experiment_state(kc, vc, pos);
+                truncate_us = truncate_us
+                    .saturating_add(mtp_us_saturating(truncate_started.elapsed().as_micros()));
+                aborted = true;
+                break;
+            }
+            let verify_gpu_before = spec_experiment_gpu_snapshot(receipt_enabled);
+            let verify_started = receipt_enabled.then(std::time::Instant::now);
             let (j, next_logits) = self.step_chunk_speculative(&chunk, &drafts, pos, kc, vc)?;
+            let target_verify_wall_us = verify_started
+                .map(|started| mtp_us_saturating(started.elapsed().as_micros()))
+                .unwrap_or(0);
+            let target_verify_gpu_us = spec_experiment_gpu_delta(verify_gpu_before);
+            if should_abort
+                .as_deref_mut()
+                .is_some_and(|callback| callback())
+            {
+                remove_uncommitted_spec_anchor(&mut generated, &mut history, t0)?;
+                let truncate_started = std::time::Instant::now();
+                self.truncate_spec_decode_experiment_state(kc, vc, pos);
+                truncate_us = truncate_us
+                    .saturating_add(mtp_us_saturating(truncate_started.elapsed().as_micros()));
+                aborted = true;
+                break;
+            }
             t_prev_round_end = Some(std::time::Instant::now());
             accepted_rounds += 1;
             accepted_drafts += j as u64;
@@ -10534,6 +13802,27 @@ impl Gemma4Runtime {
                 history.push(d);
             }
             if stopped {
+                if let Some(observer) = observe_round.as_deref_mut() {
+                    observer(Gemma4SpecDecodeExperimentRound {
+                        round_index,
+                        prefix_tokens_before,
+                        remaining_budget_before,
+                        requested_k,
+                        verifier_k: chunk.len(),
+                        budget_truncated,
+                        anchor_token: t0,
+                        proposed_drafts: drafts.clone(),
+                        accepted_drafts: j,
+                        useful_accepted_drafts: useful_accepted_drafts(&drafts, j, eot),
+                        committed_tokens: spec_receipt_committed_tokens(&chunk, j, eot)?,
+                        draft_wall_us: round_draft_us,
+                        target_verify_wall_us,
+                        target_verify_gpu_us,
+                        total_wall_us: round_started
+                            .map(|started| mtp_us_saturating(started.elapsed().as_micros()))
+                            .unwrap_or(0),
+                    });
+                }
                 break;
             }
             // Keep KV through the last accepted position (pos+j); discard the rejected
@@ -10553,6 +13842,27 @@ impl Gemma4Runtime {
             truncate_us += (t_truncate.elapsed().as_secs_f64() * 1_000_000.0) as u64;
             pos = keep;
             logits = next_logits;
+            if let Some(observer) = observe_round.as_deref_mut() {
+                observer(Gemma4SpecDecodeExperimentRound {
+                    round_index,
+                    prefix_tokens_before,
+                    remaining_budget_before,
+                    requested_k,
+                    verifier_k: chunk.len(),
+                    budget_truncated,
+                    anchor_token: t0,
+                    proposed_drafts: drafts.clone(),
+                    accepted_drafts: j,
+                    useful_accepted_drafts: useful_accepted_drafts(&drafts, j, eot),
+                    committed_tokens: spec_receipt_committed_tokens(&chunk, j, eot)?,
+                    draft_wall_us: round_draft_us,
+                    target_verify_wall_us,
+                    target_verify_gpu_us,
+                    total_wall_us: round_started
+                        .map(|started| mtp_us_saturating(started.elapsed().as_micros()))
+                        .unwrap_or(0),
+                });
+            }
         }
         {
             use std::sync::atomic::Ordering::Relaxed;
@@ -10621,7 +13931,7 @@ impl Gemma4Runtime {
                 );
             }
         }
-        Ok(generated)
+        Ok((generated, terminal_unforwarded_target_token, aborted))
     }
 
     /// Greedy decode that emits the incremental decoded-text delta after each new
@@ -15664,6 +18974,151 @@ impl Gemma4CudaResident {
     }
 }
 
+#[cfg(test)]
+mod mtp_target_seam_tests {
+    use super::*;
+
+    #[test]
+    fn mtp_argmax_matches_shipping_higher_id_tie_policy_and_fails_closed() {
+        let logits = [-1.0, 3.0, 3.0, 2.0];
+        let shipping = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(index, _)| index as u32)
+            .unwrap();
+        assert_eq!(shipping, 2, "shipping max_by must keep the later exact tie");
+        assert_eq!(mtp_argmax(&logits).unwrap(), shipping);
+        assert!(matches!(
+            mtp_argmax(&[]),
+            Err(BackendError::RuntimeShapeMismatch(_))
+        ));
+        assert!(matches!(
+            mtp_argmax(&[0.0, f32::NAN]),
+            Err(BackendError::RuntimeShapeMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn useful_accepted_drafts_stops_before_the_first_accepted_eot() {
+        assert_eq!(useful_accepted_drafts(&[11, 99, 12], 3, &[99]), 1);
+        assert_eq!(useful_accepted_drafts(&[11, 12, 13], 3, &[99]), 3);
+        assert_eq!(useful_accepted_drafts(&[99, 11], 2, &[99]), 0);
+        assert_eq!(useful_accepted_drafts(&[11, 12], 99, &[]), 2);
+    }
+
+    #[test]
+    fn spec_receipt_commits_the_first_eot_but_nothing_after_it() {
+        assert_eq!(
+            spec_receipt_committed_tokens(&[10, 11, 99, 12], 3, &[99]).unwrap(),
+            vec![10, 11, 99]
+        );
+        assert_eq!(
+            spec_receipt_committed_tokens(&[10, 11, 12], 2, &[99]).unwrap(),
+            vec![10, 11, 12]
+        );
+        assert!(matches!(
+            spec_receipt_committed_tokens(&[10, 11], 2, &[99]),
+            Err(BackendError::RuntimeShapeMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn spec_abort_removes_only_the_uncommitted_anchor_and_truncates_host_kv() {
+        let mut generated = vec![10, 11];
+        let mut history = vec![1, 2, 10, 11];
+        remove_uncommitted_spec_anchor(&mut generated, &mut history, 11).unwrap();
+        assert_eq!(generated, vec![10]);
+        assert_eq!(history, vec![1, 2, 10]);
+
+        let generated_before = generated.clone();
+        let history_before = history.clone();
+        assert!(matches!(
+            remove_uncommitted_spec_anchor(&mut generated, &mut history, 99),
+            Err(BackendError::RuntimeShapeMismatch(_))
+        ));
+        assert_eq!(
+            generated, generated_before,
+            "failed rollback must be atomic"
+        );
+        assert_eq!(history, history_before, "failed rollback must be atomic");
+
+        let mut kc = vec![vec![vec![1.0]; 3]; 2];
+        let mut vc = vec![vec![vec![2.0]; 3]; 2];
+        truncate_spec_host_kv(&mut kc, &mut vc, 1);
+        assert!(kc.iter().all(|layer| layer.len() == 1));
+        assert!(vc.iter().all(|layer| layer.len() == 1));
+    }
+
+    #[test]
+    fn mtp_terminal_target_token_is_unforwarded_and_eot_is_hidden() {
+        assert_eq!(
+            mtp_terminal_unforwarded_target_token(&[-1.0, 3.0, 2.0], &[99]).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            mtp_terminal_unforwarded_target_token(&[-1.0, 3.0, 2.0], &[1]).unwrap(),
+            None
+        );
+        assert!(matches!(
+            mtp_terminal_unforwarded_target_token(&[], &[]),
+            Err(BackendError::RuntimeShapeMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn mtp_commit_plan_keeps_only_target_accepted_prefix() {
+        let plan = mtp_commit_plan(10, &[11, 12, 13], 1, 40, 4, &[99]).unwrap();
+        assert_eq!(plan.committed_tokens, vec![10, 11]);
+        assert_eq!(plan.visible_tokens, vec![10, 11]);
+        assert_eq!(plan.keep, 42);
+        assert!(!plan.stopped_on_eot);
+    }
+
+    #[test]
+    fn mtp_commit_plan_commits_but_hides_accepted_eot() {
+        let plan = mtp_commit_plan(10, &[11, 99], 2, 7, 3, &[99]).unwrap();
+        assert_eq!(plan.committed_tokens, vec![10, 11, 99]);
+        assert_eq!(plan.visible_tokens, vec![10, 11]);
+        assert_eq!(plan.keep, 10);
+        assert!(plan.stopped_on_eot);
+    }
+
+    #[test]
+    fn mtp_commit_plan_refuses_impossible_acceptance_or_budget() {
+        assert!(matches!(
+            mtp_commit_plan(10, &[11], 2, 0, 3, &[]),
+            Err(BackendError::RuntimeShapeMismatch(_))
+        ));
+        assert!(matches!(
+            mtp_commit_plan(10, &[11], 1, 0, 1, &[]),
+            Err(BackendError::RuntimeShapeMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn selected_mtp_hidden_is_target_final_normalized_row() {
+        let hidden_rows = vec![vec![1.0, 2.0, 3.0, 4.0], vec![4.0, 3.0, 2.0, 1.0]];
+        let output_norm = vec![0.5, 1.0, 1.5, 2.0];
+        let got = mtp_final_normalized_hidden(&hidden_rows, 1, &output_norm, 1.0e-6)
+            .expect("selected verifier row");
+        let expected = rms_norm(&hidden_rows[1], Some(&output_norm), 1.0e-6);
+        assert_eq!(got, expected);
+        assert_ne!(got, hidden_rows[1], "raw pre-norm hs must never escape");
+    }
+
+    #[test]
+    fn selected_mtp_hidden_refuses_missing_or_wrong_width_rows() {
+        let missing = mtp_final_normalized_hidden(&[vec![1.0, 2.0]], 1, &[1.0, 1.0], 1.0e-6)
+            .expect_err("missing selected row must fail closed");
+        assert!(matches!(missing, BackendError::RuntimeShapeMismatch(_)));
+
+        let wrong_width = mtp_final_normalized_hidden(&[vec![1.0]], 0, &[1.0, 1.0], 1.0e-6)
+            .expect_err("mismatched final norm width must fail closed");
+        assert!(matches!(wrong_width, BackendError::RuntimeShapeMismatch(_)));
+    }
+}
+
 #[cfg(all(test, feature = "cuda"))]
 mod cuda_parity_tests {
     use super::*;
@@ -17208,14 +20663,14 @@ mod ghost_moe_wire_tests {
     }
 
     /// CAMELID_GEMMA4_VICTIM_CACHE / CAMELID_GEMMA4_VICTIM_MB parse: default
-    /// ON with a 1536 MiB total budget split evenly across layers; "0" or
+    /// ON with a 1024 MiB total budget split evenly across layers; "0" or
     /// "false" (or a 0 MB budget) disables; the budget is capped.
     #[test]
     fn victim_ring_sizing_defaults_and_gates() {
         let record = 3_345_408usize; // 26B expert record bytes
         let default_records = victim_ring_records_from(None, None, 30, record);
-        assert_eq!(default_records, 16);
-        assert_eq!(victim_ring_records_from(Some("1"), None, 30, record), 16);
+        assert_eq!(default_records, 10);
+        assert_eq!(victim_ring_records_from(Some("1"), None, 30, record), 10);
         assert_eq!(victim_ring_records_from(Some("0"), None, 30, record), 0);
         assert_eq!(victim_ring_records_from(Some("false"), None, 30, record), 0);
         assert_eq!(victim_ring_records_from(None, Some("0"), 30, record), 0);
@@ -17256,6 +20711,116 @@ mod ghost_moe_wire_tests {
         assert_eq!(parse_ghost_metal_slots_per_layer(Some("32")), 32);
         assert_eq!(parse_ghost_metal_slots_per_layer(Some("96")), 96);
         assert_eq!(parse_ghost_metal_slots_per_layer(Some("4096")), 128);
+    }
+
+    #[test]
+    fn metal_demand_load_only_requires_exact_positive_opt_in() {
+        assert!(!ghost_metal_demand_load_only_from(None));
+        assert!(!ghost_metal_demand_load_only_from(Some("")));
+        assert!(!ghost_metal_demand_load_only_from(Some("0")));
+        assert!(!ghost_metal_demand_load_only_from(Some("true")));
+        assert!(!ghost_metal_demand_load_only_from(Some("junk")));
+        assert!(ghost_metal_demand_load_only_from(Some("1")));
+        assert!(ghost_metal_demand_load_only_from(Some(" 1 ")));
+    }
+
+    #[test]
+    fn metal_physical_slot_budget_requires_exact_demand_opt_in_and_range() {
+        assert_eq!(
+            parse_ghost_metal_physical_slots_per_layer(false, Some("32"), 88).unwrap(),
+            None,
+            "shipping mode must ignore the demand-only residency knob"
+        );
+        assert_eq!(
+            parse_ghost_metal_physical_slots_per_layer(true, None, 88).unwrap(),
+            None,
+            "absence preserves the previously admitted full demand directory"
+        );
+        assert_eq!(
+            parse_ghost_metal_physical_slots_per_layer(true, Some("32"), 88).unwrap(),
+            Some(32)
+        );
+        assert_eq!(
+            parse_ghost_metal_physical_slots_per_layer(true, Some("8"), 88).unwrap(),
+            Some(8)
+        );
+        assert_eq!(
+            parse_ghost_metal_physical_slots_per_layer(true, Some("88"), 88).unwrap(),
+            Some(88)
+        );
+        for invalid in ["", " 32", "32 ", "032", "+32", "junk", "0", "7", "89"] {
+            assert!(
+                parse_ghost_metal_physical_slots_per_layer(true, Some(invalid), 88).is_err(),
+                "invalid physical budget {invalid:?} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn metal_record_directory_caps_88_logical_slots_at_32_physical_records() {
+        let allocated_slots = 88usize;
+        let physical_budget =
+            parse_ghost_metal_physical_slots_per_layer(true, Some("32"), allocated_slots)
+                .unwrap()
+                .unwrap();
+        assert_eq!(allocated_slots, 88);
+        assert_eq!(physical_budget, 32);
+
+        // Synthetic K=1..8 overlap geometry remains under the receipted
+        // 32-slot bound in this modulo-30 fixture. Production telemetry is a
+        // separate receipt; this test proves only directory capacity/fail-close.
+        for k in 1usize..=8 {
+            let unique = (8 + (k - 1) * 4).min(30);
+            let experts = (0..unique).collect::<Vec<_>>();
+            let mut directory = GhostMetalSlotDirectory::new(physical_budget);
+            let plan = directory.plan(&experts).expect("union <= physical budget");
+            assert_eq!(plan.route_slots.len(), unique, "K={k}");
+            assert!(plan.loads.iter().all(|load| load.slot < physical_budget));
+        }
+
+        let mut directory = GhostMetalSlotDirectory::new(physical_budget);
+        let before = directory.entries.clone();
+        assert!(directory.plan(&(0..33).collect::<Vec<_>>()).is_err());
+        assert_eq!(
+            directory.entries, before,
+            "union >32 must be rejected before any directory mutation"
+        );
+    }
+
+    #[test]
+    fn metal_demand_only_uses_proven_common_before_empty_slots_order() {
+        assert_eq!(
+            ghost_metal_allocation_order(false),
+            GhostMetalAllocationOrder::SlotsThenCommon,
+            "shipping allocation order must remain unchanged"
+        );
+        assert_eq!(
+            ghost_metal_allocation_order(true),
+            GhostMetalAllocationOrder::CommonThenSlots,
+            "demand-only slots must not exist while common Metal state is materialized"
+        );
+    }
+
+    #[test]
+    fn metal_demand_only_never_selects_all_layer_predicted_schedule() {
+        assert!(ghost_metal_chained_prediction_allowed(
+            false, false, 8, true, false
+        ));
+        assert!(ghost_metal_chained_prediction_allowed(
+            false, false, 8, false, true
+        ));
+        assert!(!ghost_metal_chained_prediction_allowed(
+            true, false, 8, true, true
+        ));
+        assert!(!ghost_metal_chained_prediction_allowed(
+            false, true, 8, true, true
+        ));
+        assert!(!ghost_metal_chained_prediction_allowed(
+            false, false, 1, true, true
+        ));
+        assert!(!ghost_metal_chained_prediction_allowed(
+            false, false, 8, false, false
+        ));
     }
 
     #[cfg(target_os = "macos")]

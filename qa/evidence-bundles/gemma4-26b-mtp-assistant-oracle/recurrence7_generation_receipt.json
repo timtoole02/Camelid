@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "generator": {
+    "path": "qa/evidence-bundles/gemma4-26b-mtp-assistant-oracle/generate_recurrence_oracle.py",
+    "sha256": "4b8217ae125a97b5de67fd2bb8bbf4723428a09be2a24fceb02419d9b8ba5e46"
+  },
+  "interpreter": "/Volumes/Untitled/cargo-targets/gemma4-mtp-oracle.pLWdhU/venv/bin/python",
+  "assistant_model_dir": "/Users/timtoole/models/gemma4-26b-a4b-mtp-qat-assistant",
+  "assistant_model_sha256": "c082cc581c3ec90d70285c1a41c81544ff56cbc96650f16c900a280940655801",
+  "canonical_oracle": {
+    "path": "qa/evidence-bundles/gemma4-26b-mtp-assistant-oracle/assistant_recurrence7_bf16_cpu.json",
+    "bytes": 127153,
+    "sha256": "08cf02bedfec09074eeebaa24b1ffaaa5362badd412b523de6a0d52952e94109"
+  },
+  "rerun_oracle": {
+    "path": "/Volumes/Untitled/cargo-targets/gemma4-mtp-oracle.pLWdhU/assistant_recurrence7_bf16_cpu.rerun.json",
+    "bytes": 127153,
+    "sha256": "08cf02bedfec09074eeebaa24b1ffaaa5362badd412b523de6a0d52952e94109"
+  },
+  "byte_identical": true,
+  "top1_token_ids": [53965, 150062, 103463, 48277, 3947, 237729, 236764],
+  "reference_margin_bf16_ulp": [12, 6, 3, 0, 10, 1, 3],
+  "fresh_process_runs": 2,
+  "swapouts_start": 30618679,
+  "swapouts_end": 30618679,
+  "t7_model_safetensors_opened": false,
+  "salt_search": false,
+  "teacher_forcing": false,
+  "run_logs": [
+    "recurrence7_run1.log",
+    "recurrence7_run2.log"
+  ],
+  "failed_attempt_log": "recurrence7_failed_margin_floor_attempts.log"
+}

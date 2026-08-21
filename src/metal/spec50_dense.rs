@@ -979,6 +979,20 @@ fn spec50_tg(width: u64) -> metal::MTLSize {
     }
 }
 
+/// Byte offsets for one canonical eight-token fused-QKV tile.
+///
+/// A wider wave is composed by rebasing the token-major input and outputs at
+/// the Metal binding boundary.  The shader still sees exactly eight local
+/// tokens and therefore executes the already-pinned K=8 floating-point
+/// program unchanged.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Spec50QkvBufferOffsets {
+    pub(crate) y: u64,
+    pub(crate) query_out: u64,
+    pub(crate) key_out: u64,
+    pub(crate) val_out: u64,
+}
+
 fn spec50_encode_plain_with(
     ks: &Spec50V4Kernels,
     e: &metal::ComputeCommandEncoderRef,
@@ -1018,16 +1032,50 @@ fn spec50_encode_qkv_with(
     total_rows: usize,
     scalars: (u32, u32, u32, u32),
 ) {
+    spec50_encode_qkv_at_offsets(
+        ks,
+        e,
+        y,
+        q_weight,
+        k_weight,
+        v_weight,
+        query_out,
+        key_out,
+        val_out,
+        total_rows,
+        scalars,
+        Spec50QkvBufferOffsets::default(),
+    );
+}
+
+/// Offset-aware form of [`spec50_encode_qkv_with`] used to prove that a K=16
+/// token-major wave can be scheduled as two invocations of the exact same K=8
+/// arithmetic primitive.
+#[allow(clippy::too_many_arguments)]
+fn spec50_encode_qkv_at_offsets(
+    ks: &Spec50V4Kernels,
+    e: &metal::ComputeCommandEncoderRef,
+    y: &Buffer,
+    q_weight: &Buffer,
+    k_weight: &Buffer,
+    v_weight: &Buffer,
+    query_out: &Buffer,
+    key_out: &Buffer,
+    val_out: &Buffer,
+    total_rows: usize,
+    scalars: (u32, u32, u32, u32),
+    offsets: Spec50QkvBufferOffsets,
+) {
     let (bpr, q_rows, k_rows, v_rows) = scalars;
     let k_batch_u32 = 8u32;
     e.set_compute_pipeline_state(&ks.qkv);
-    e.set_buffer(0, Some(y), 0);
+    e.set_buffer(0, Some(y), offsets.y);
     e.set_buffer(1, Some(q_weight), 0);
     e.set_buffer(2, Some(k_weight), 0);
     e.set_buffer(3, Some(v_weight), 0);
-    e.set_buffer(4, Some(query_out), 0);
-    e.set_buffer(5, Some(key_out), 0);
-    e.set_buffer(6, Some(val_out), 0);
+    e.set_buffer(4, Some(query_out), offsets.query_out);
+    e.set_buffer(5, Some(key_out), offsets.key_out);
+    e.set_buffer(6, Some(val_out), offsets.val_out);
     e.set_bytes(7, 4, &bpr as *const u32 as *const _);
     e.set_bytes(8, 4, &q_rows as *const u32 as *const _);
     e.set_bytes(9, 4, &k_rows as *const u32 as *const _);
@@ -1336,6 +1384,69 @@ mod tests {
 
     fn read(b: &Buffer, n: usize) -> Vec<f32> {
         unsafe { std::slice::from_raw_parts(b.contents() as *const f32, n).to_vec() }
+    }
+
+    const TILE_GUARD_BITS: u32 = 0x7fc5_a55a;
+
+    fn poisoned_f32(device: &Device, n: usize) -> Buffer {
+        let poison = f32::from_bits(TILE_GUARD_BITS);
+        buf_from(device, &vec![poison; n])
+    }
+
+    fn assert_poisoned_guards(name: &str, values: &[f32], prefix: usize, body: usize) {
+        assert!(
+            values[..prefix]
+                .iter()
+                .all(|value| value.to_bits() == TILE_GUARD_BITS),
+            "{name}: prefix guard was modified"
+        );
+        assert!(
+            values[prefix + body..]
+                .iter()
+                .all(|value| value.to_bits() == TILE_GUARD_BITS),
+            "{name}: suffix guard was modified"
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_shipped_plain_k8_at_offsets(
+        c: &Ctx,
+        encoder: &metal::ComputeCommandEncoderRef,
+        y: &Buffer,
+        y_offset: u64,
+        weight: &Buffer,
+        output: &Buffer,
+        output_offset: u64,
+        rows: usize,
+        blocks_per_row: usize,
+    ) {
+        let pipeline = c
+            .old
+            .q4_0_block_batch_k8_pipeline
+            .as_ref()
+            .expect("shipped fixed-K8 plain pipeline");
+        let blocks_u32 = blocks_per_row as u32;
+        let rows_u32 = rows as u32;
+        let k_u32 = K8 as u32;
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(y), y_offset);
+        encoder.set_buffer(2, Some(weight), 0);
+        encoder.set_buffer(3, Some(output), output_offset);
+        encoder.set_bytes(4, 4, &blocks_u32 as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &rows_u32 as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &k_u32 as *const u32 as *const _);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize {
+                width: (rows as u64).div_ceil(4),
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        );
     }
 
     struct Ctx {
@@ -1713,6 +1824,167 @@ mod tests {
                 assert_eq!(bad, 0, "qkv {name} token {t} depends on its companions");
             }
         }
+    }
+
+    /// A 16-token dense wave is two rebased invocations of the canonical K=8
+    /// program, never a K=16 arithmetic flavor.  This covers the production
+    /// fused-QKV kernel and the shipped plain K8 kernel used by O projection at
+    /// real 26B local-layer shapes.  The guarded shared buffers make token 7/8
+    /// adjacent in memory and catch any write outside either tiled output.
+    #[test]
+    fn spec50_dense_qkv_o_k16_is_two_bit_exact_k8_tiles() {
+        let Some(c) = ctx() else {
+            return;
+        };
+        let ks = build(&c, SPEC50_V4_QKV);
+        const TILE_K: usize = 8;
+        const WAVE_K: usize = 16;
+        const GUARD: usize = 19;
+        let poison = f32::from_bits(TILE_GUARD_BITS);
+        let mut rng = Rng(0xd3e5_0008_0016_7e57);
+
+        // Production local-layer fused QKV: 4096 Q rows, 2048 K rows, 2048 V
+        // rows, over Gemma's 2,816-wide hidden vector (88 Q4 blocks).
+        let (q_rows, k_rows, v_rows, qkv_blocks) = (4096usize, 2048usize, 2048usize, 88usize);
+        let qkv_hidden = qkv_blocks * 32;
+        let q_weight = buf_from(&c.device, &random_q4_0(&mut rng, q_rows, qkv_blocks));
+        let k_weight = buf_from(&c.device, &random_q4_0(&mut rng, k_rows, qkv_blocks));
+        let v_weight = buf_from(&c.device, &random_q4_0(&mut rng, v_rows, qkv_blocks));
+        let qkv_y = random_f32(&mut rng, WAVE_K * qkv_hidden);
+
+        let mut q_ref = Vec::with_capacity(WAVE_K * q_rows);
+        let mut k_ref = Vec::with_capacity(WAVE_K * k_rows);
+        let mut v_ref = Vec::with_capacity(WAVE_K * v_rows);
+        for tile in 0..2 {
+            let y0 = tile * TILE_K * qkv_hidden;
+            let y = buf_from(&c.device, &qkv_y[y0..y0 + TILE_K * qkv_hidden]);
+            let (q, k, v) = qkv_new(
+                &c,
+                &ks,
+                &y,
+                &q_weight,
+                &k_weight,
+                &v_weight,
+                (q_rows, k_rows, v_rows),
+                qkv_blocks,
+            );
+            q_ref.extend_from_slice(&q);
+            k_ref.extend_from_slice(&k);
+            v_ref.extend_from_slice(&v);
+        }
+
+        let mut guarded_qkv_y = vec![poison; GUARD];
+        guarded_qkv_y.extend_from_slice(&qkv_y);
+        guarded_qkv_y.extend_from_slice(&vec![poison; GUARD]);
+        let qkv_y_buf = buf_from(&c.device, &guarded_qkv_y);
+        let q_out = poisoned_f32(&c.device, GUARD + WAVE_K * q_rows + GUARD);
+        let k_out = poisoned_f32(&c.device, GUARD + WAVE_K * k_rows + GUARD);
+        let v_out = poisoned_f32(&c.device, GUARD + WAVE_K * v_rows + GUARD);
+        run(&c.queue, |encoder| {
+            for tile in 0..2 {
+                spec50_encode_qkv_at_offsets(
+                    &ks,
+                    encoder,
+                    &qkv_y_buf,
+                    &q_weight,
+                    &k_weight,
+                    &v_weight,
+                    &q_out,
+                    &k_out,
+                    &v_out,
+                    q_rows + k_rows + v_rows,
+                    (
+                        qkv_blocks as u32,
+                        q_rows as u32,
+                        k_rows as u32,
+                        v_rows as u32,
+                    ),
+                    Spec50QkvBufferOffsets {
+                        y: ((GUARD + tile * TILE_K * qkv_hidden) * 4) as u64,
+                        query_out: ((GUARD + tile * TILE_K * q_rows) * 4) as u64,
+                        key_out: ((GUARD + tile * TILE_K * k_rows) * 4) as u64,
+                        val_out: ((GUARD + tile * TILE_K * v_rows) * 4) as u64,
+                    },
+                );
+            }
+        });
+
+        let q_all = read(&q_out, GUARD + WAVE_K * q_rows + GUARD);
+        let k_all = read(&k_out, GUARD + WAVE_K * k_rows + GUARD);
+        let v_all = read(&v_out, GUARD + WAVE_K * v_rows + GUARD);
+        let q_got = &q_all[GUARD..GUARD + WAVE_K * q_rows];
+        let k_got = &k_all[GUARD..GUARD + WAVE_K * k_rows];
+        let v_got = &v_all[GUARD..GUARD + WAVE_K * v_rows];
+        for (name, all, got, want, rows) in [
+            ("QKV.Q", &q_all, q_got, &q_ref, q_rows),
+            ("QKV.K", &k_all, k_got, &k_ref, k_rows),
+            ("QKV.V", &v_all, v_got, &v_ref, v_rows),
+        ] {
+            assert_poisoned_guards(name, all, GUARD, WAVE_K * rows);
+            assert_eq!(bits_equal(name, got, want), 0, "{name} K8 tiles diverged");
+            for seam in [TILE_K * rows - 1, TILE_K * rows] {
+                assert_eq!(
+                    got[seam].to_bits(),
+                    want[seam].to_bits(),
+                    "{name}: token 7/8 seam differs at element {seam}"
+                );
+            }
+        }
+        let qkv_y_after = read(&qkv_y_buf, GUARD + WAVE_K * qkv_hidden + GUARD);
+        assert_poisoned_guards("QKV input", &qkv_y_after, GUARD, WAVE_K * qkv_hidden);
+
+        // Production local O projection: 2,816 output rows over the concatenated
+        // 4,096-wide attention context (128 Q4 blocks).
+        let (o_rows, o_blocks) = (2816usize, 128usize);
+        let o_hidden = o_blocks * 32;
+        let o_weight = buf_from(&c.device, &random_q4_0(&mut rng, o_rows, o_blocks));
+        let o_y = random_f32(&mut rng, WAVE_K * o_hidden);
+        let mut o_ref = Vec::with_capacity(WAVE_K * o_rows);
+        for tile in 0..2 {
+            let y0 = tile * TILE_K * o_hidden;
+            let y = buf_from(&c.device, &o_y[y0..y0 + TILE_K * o_hidden]);
+            let out = zeros(&c.device, TILE_K * o_rows);
+            run(&c.queue, |encoder| {
+                encode_shipped_plain_k8_at_offsets(
+                    &c, encoder, &y, 0, &o_weight, &out, 0, o_rows, o_blocks,
+                );
+            });
+            o_ref.extend_from_slice(&read(&out, TILE_K * o_rows));
+        }
+
+        let mut guarded_o_y = vec![poison; GUARD];
+        guarded_o_y.extend_from_slice(&o_y);
+        guarded_o_y.extend_from_slice(&vec![poison; GUARD]);
+        let o_y_buf = buf_from(&c.device, &guarded_o_y);
+        let o_out = poisoned_f32(&c.device, GUARD + WAVE_K * o_rows + GUARD);
+        run(&c.queue, |encoder| {
+            for tile in 0..2 {
+                encode_shipped_plain_k8_at_offsets(
+                    &c,
+                    encoder,
+                    &o_y_buf,
+                    ((GUARD + tile * TILE_K * o_hidden) * 4) as u64,
+                    &o_weight,
+                    &o_out,
+                    ((GUARD + tile * TILE_K * o_rows) * 4) as u64,
+                    o_rows,
+                    o_blocks,
+                );
+            }
+        });
+        let o_all = read(&o_out, GUARD + WAVE_K * o_rows + GUARD);
+        let o_got = &o_all[GUARD..GUARD + WAVE_K * o_rows];
+        assert_poisoned_guards("O", &o_all, GUARD, WAVE_K * o_rows);
+        assert_eq!(bits_equal("O", o_got, &o_ref), 0, "O K8 tiles diverged");
+        for seam in [TILE_K * o_rows - 1, TILE_K * o_rows] {
+            assert_eq!(
+                o_got[seam].to_bits(),
+                o_ref[seam].to_bits(),
+                "O: token 7/8 seam differs at element {seam}"
+            );
+        }
+        let o_y_after = read(&o_y_buf, GUARD + WAVE_K * o_hidden + GUARD);
+        assert_poisoned_guards("O input", &o_y_after, GUARD, WAVE_K * o_hidden);
     }
 
     // -- gateup ----------------------------------------------------------------
@@ -2561,5 +2833,558 @@ mod tests {
                 old_ms / new_ms
             );
         }
+    }
+
+    /// Real-shape cost of making K=16 a scheduling decision (two canonical K8
+    /// dispatches) rather than selecting the widened arithmetic flavor.  This
+    /// is deliberately a hot single-layer stage breakdown.  The scaled totals
+    /// below are directional estimates, not a substitute for a distinct-weight
+    /// full sweep: cache residency and command-buffer amortization differ.
+    #[test]
+    #[ignore = "GPU microbenchmark; run explicitly with --ignored --test-threads=1"]
+    fn spec50_bench_k16_two_k8_tiles_vs_widened() {
+        let Some(c) = ctx() else {
+            return;
+        };
+        let dense = build(&c, SPEC50_V4_QKV);
+        let widen = spec50_widen_kernels().expect("widened K16 pipelines");
+        let packed = spec50_packed_gateup_kernels().expect("packed GateUp pipelines");
+        let packed_direct = spec50_packed_gateup_direct_k16_kernel()
+            .expect("experimental direct two-SG K16 pipeline");
+        const TILE_K: usize = 8;
+        const WAVE_K: usize = 16;
+        let mut rng = Rng(0x4b31_3654_494c_4538);
+        let mut qkv_o_model_tile_ms = 0.0f64;
+        let mut qkv_o_model_wide_ms = 0.0f64;
+        let mut shared_model_tile_ms = 0.0f64;
+        let mut shared_model_wide_ms = 0.0f64;
+        let mut shared_model_direct_ms = 0.0f64;
+        let head_tile_ms;
+        let head_wide_ms;
+
+        println!("\n[tile8-width] real-shape K16 GPU ms: two fixed K8 tiles vs widened K16");
+        println!("  stage              tile8x2    widened     ratio   raw mismatches");
+
+        // Local fused QKV: Q/K/V = 4096/2048/2048, hidden = 2816.
+        {
+            let (q_rows, k_rows, v_rows, blocks) = (4096usize, 2048usize, 2048usize, 88usize);
+            let hidden = blocks * 32;
+            let total_rows = q_rows + k_rows + v_rows;
+            let y = buf_from(&c.device, &random_f32(&mut rng, WAVE_K * hidden));
+            let qw = buf_from(&c.device, &random_q4_0(&mut rng, q_rows, blocks));
+            let kw = buf_from(&c.device, &random_q4_0(&mut rng, k_rows, blocks));
+            let vw = buf_from(&c.device, &random_q4_0(&mut rng, v_rows, blocks));
+            let tile_q = zeros(&c.device, WAVE_K * q_rows);
+            let tile_k = zeros(&c.device, WAVE_K * k_rows);
+            let tile_v = zeros(&c.device, WAVE_K * v_rows);
+            let wide_q = zeros(&c.device, WAVE_K * q_rows);
+            let wide_k = zeros(&c.device, WAVE_K * k_rows);
+            let wide_v = zeros(&c.device, WAVE_K * v_rows);
+            let scalars = (blocks as u32, q_rows as u32, k_rows as u32, v_rows as u32);
+            let encode_tiles = |encoder: &metal::ComputeCommandEncoderRef| {
+                for tile in 0..2 {
+                    spec50_encode_qkv_at_offsets(
+                        &dense,
+                        encoder,
+                        &y,
+                        &qw,
+                        &kw,
+                        &vw,
+                        &tile_q,
+                        &tile_k,
+                        &tile_v,
+                        total_rows,
+                        scalars,
+                        Spec50QkvBufferOffsets {
+                            y: (tile * TILE_K * hidden * 4) as u64,
+                            query_out: (tile * TILE_K * q_rows * 4) as u64,
+                            key_out: (tile * TILE_K * k_rows * 4) as u64,
+                            val_out: (tile * TILE_K * v_rows * 4) as u64,
+                        },
+                    );
+                }
+            };
+            let encode_wide = |encoder: &metal::ComputeCommandEncoderRef| {
+                encode_spec50_widen_qkv(
+                    encoder, widen, &y, &qw, &kw, &vw, &wide_q, &wide_k, &wide_v, scalars,
+                    total_rows, WAVE_K,
+                );
+            };
+            let tiled_ms = bench(&c.queue, encode_tiles);
+            let wide_ms = bench(&c.queue, encode_wide);
+            qkv_o_model_tile_ms += 25.0 * tiled_ms;
+            qkv_o_model_wide_ms += 25.0 * wide_ms;
+            run(&c.queue, encode_tiles);
+            run(&c.queue, encode_wide);
+            let bad = bits_equal(
+                "bench QKV.Q",
+                &read(&tile_q, WAVE_K * q_rows),
+                &read(&wide_q, WAVE_K * q_rows),
+            ) + bits_equal(
+                "bench QKV.K",
+                &read(&tile_k, WAVE_K * k_rows),
+                &read(&wide_k, WAVE_K * k_rows),
+            ) + bits_equal(
+                "bench QKV.V",
+                &read(&tile_v, WAVE_K * v_rows),
+                &read(&wide_v, WAVE_K * v_rows),
+            );
+            println!(
+                "  local QKV         {tiled_ms:9.3} {wide_ms:10.3} {:9.3} {bad:16}",
+                tiled_ms / wide_ms,
+            );
+        }
+
+        // Local O projection: 2816 rows over 4096 input columns.
+        {
+            let (rows, blocks) = (2816usize, 128usize);
+            let hidden = blocks * 32;
+            let y = buf_from(&c.device, &random_f32(&mut rng, WAVE_K * hidden));
+            let w = buf_from(&c.device, &random_q4_0(&mut rng, rows, blocks));
+            let tiled = zeros(&c.device, WAVE_K * rows);
+            let wide = zeros(&c.device, WAVE_K * rows);
+            let encode_tiles = |encoder: &metal::ComputeCommandEncoderRef| {
+                for tile in 0..2 {
+                    encode_shipped_plain_k8_at_offsets(
+                        &c,
+                        encoder,
+                        &y,
+                        (tile * TILE_K * hidden * 4) as u64,
+                        &w,
+                        &tiled,
+                        (tile * TILE_K * rows * 4) as u64,
+                        rows,
+                        blocks,
+                    );
+                }
+            };
+            let encode_wide = |encoder: &metal::ComputeCommandEncoderRef| {
+                encode_spec50_widen_plain(
+                    encoder,
+                    widen,
+                    &y,
+                    &w,
+                    0,
+                    &wide,
+                    blocks as u32,
+                    rows,
+                    WAVE_K,
+                );
+            };
+            let tiled_ms = bench(&c.queue, encode_tiles);
+            let wide_ms = bench(&c.queue, encode_wide);
+            qkv_o_model_tile_ms += 25.0 * tiled_ms;
+            qkv_o_model_wide_ms += 25.0 * wide_ms;
+            run(&c.queue, encode_tiles);
+            run(&c.queue, encode_wide);
+            let bad = bits_equal(
+                "bench O",
+                &read(&tiled, WAVE_K * rows),
+                &read(&wide, WAVE_K * rows),
+            );
+            println!(
+                "  local O           {tiled_ms:9.3} {wide_ms:10.3} {:9.3} {bad:16}",
+                tiled_ms / wide_ms,
+            );
+        }
+
+        // Global layers have no separate V tensor: Q and K are two plain
+        // projections at 8192/1024 rows, followed by the 8192-wide O input.
+        {
+            let (hidden, q_rows, k_rows, blocks) = (2816usize, 8192usize, 1024usize, 88usize);
+            let y = buf_from(&c.device, &random_f32(&mut rng, WAVE_K * hidden));
+            let qw = buf_from(&c.device, &random_q4_0(&mut rng, q_rows, blocks));
+            let kw = buf_from(&c.device, &random_q4_0(&mut rng, k_rows, blocks));
+            let tiled_q = zeros(&c.device, WAVE_K * q_rows);
+            let tiled_k = zeros(&c.device, WAVE_K * k_rows);
+            let wide_q = zeros(&c.device, WAVE_K * q_rows);
+            let wide_k = zeros(&c.device, WAVE_K * k_rows);
+            let encode_tiles = |encoder: &metal::ComputeCommandEncoderRef| {
+                for tile in 0..2 {
+                    encode_shipped_plain_k8_at_offsets(
+                        &c,
+                        encoder,
+                        &y,
+                        (tile * TILE_K * hidden * 4) as u64,
+                        &qw,
+                        &tiled_q,
+                        (tile * TILE_K * q_rows * 4) as u64,
+                        q_rows,
+                        blocks,
+                    );
+                    encode_shipped_plain_k8_at_offsets(
+                        &c,
+                        encoder,
+                        &y,
+                        (tile * TILE_K * hidden * 4) as u64,
+                        &kw,
+                        &tiled_k,
+                        (tile * TILE_K * k_rows * 4) as u64,
+                        k_rows,
+                        blocks,
+                    );
+                }
+            };
+            let encode_wide = |encoder: &metal::ComputeCommandEncoderRef| {
+                encode_spec50_widen_plain(
+                    encoder,
+                    widen,
+                    &y,
+                    &qw,
+                    0,
+                    &wide_q,
+                    blocks as u32,
+                    q_rows,
+                    WAVE_K,
+                );
+                encode_spec50_widen_plain(
+                    encoder,
+                    widen,
+                    &y,
+                    &kw,
+                    0,
+                    &wide_k,
+                    blocks as u32,
+                    k_rows,
+                    WAVE_K,
+                );
+            };
+            let tiled_ms = bench(&c.queue, encode_tiles);
+            let wide_ms = bench(&c.queue, encode_wide);
+            qkv_o_model_tile_ms += 5.0 * tiled_ms;
+            qkv_o_model_wide_ms += 5.0 * wide_ms;
+            run(&c.queue, encode_tiles);
+            run(&c.queue, encode_wide);
+            let bad = bits_equal(
+                "bench global Q",
+                &read(&tiled_q, WAVE_K * q_rows),
+                &read(&wide_q, WAVE_K * q_rows),
+            ) + bits_equal(
+                "bench global K",
+                &read(&tiled_k, WAVE_K * k_rows),
+                &read(&wide_k, WAVE_K * k_rows),
+            );
+            println!(
+                "  global Q+K        {tiled_ms:9.3} {wide_ms:10.3} {:9.3} {bad:16}",
+                tiled_ms / wide_ms,
+            );
+        }
+
+        {
+            let (rows, blocks) = (2816usize, 256usize);
+            let hidden = blocks * 32;
+            let y = buf_from(&c.device, &random_f32(&mut rng, WAVE_K * hidden));
+            let w = buf_from(&c.device, &random_q4_0(&mut rng, rows, blocks));
+            let tiled = zeros(&c.device, WAVE_K * rows);
+            let wide = zeros(&c.device, WAVE_K * rows);
+            let encode_tiles = |encoder: &metal::ComputeCommandEncoderRef| {
+                for tile in 0..2 {
+                    encode_shipped_plain_k8_at_offsets(
+                        &c,
+                        encoder,
+                        &y,
+                        (tile * TILE_K * hidden * 4) as u64,
+                        &w,
+                        &tiled,
+                        (tile * TILE_K * rows * 4) as u64,
+                        rows,
+                        blocks,
+                    );
+                }
+            };
+            let encode_wide = |encoder: &metal::ComputeCommandEncoderRef| {
+                encode_spec50_widen_plain(
+                    encoder,
+                    widen,
+                    &y,
+                    &w,
+                    0,
+                    &wide,
+                    blocks as u32,
+                    rows,
+                    WAVE_K,
+                );
+            };
+            let tiled_ms = bench(&c.queue, encode_tiles);
+            let wide_ms = bench(&c.queue, encode_wide);
+            qkv_o_model_tile_ms += 5.0 * tiled_ms;
+            qkv_o_model_wide_ms += 5.0 * wide_ms;
+            run(&c.queue, encode_tiles);
+            run(&c.queue, encode_wide);
+            let bad = bits_equal(
+                "bench global O",
+                &read(&tiled, WAVE_K * rows),
+                &read(&wide, WAVE_K * rows),
+            );
+            println!(
+                "  global O          {tiled_ms:9.3} {wide_ms:10.3} {:9.3} {bad:16}",
+                tiled_ms / wide_ms,
+            );
+        }
+
+        // Shared GateUp and Down, kept separate to expose which half benefits
+        // from cross-tile weight reuse.
+        {
+            let (hidden, ffn) = (2816usize, 2112usize);
+            let (gate_blocks, down_blocks) = (hidden / 32, ffn / 32);
+            let y = buf_from(&c.device, &random_f32(&mut rng, WAVE_K * hidden));
+            let gate = buf_from(&c.device, &random_q4_0(&mut rng, ffn, gate_blocks));
+            let up = buf_from(&c.device, &random_q4_0(&mut rng, ffn, gate_blocks));
+            let tile_act = zeros(&c.device, WAVE_K * ffn);
+            let wide_act = zeros(&c.device, WAVE_K * ffn);
+            let direct_act = zeros(&c.device, WAVE_K * ffn);
+            let encode_gate_tiles = |encoder: &metal::ComputeCommandEncoderRef| {
+                for tile in 0..2 {
+                    encode_spec50_packed_gateup_row_complete_at_offsets(
+                        encoder,
+                        packed,
+                        &y,
+                        &gate,
+                        &up,
+                        &tile_act,
+                        gate_blocks as u32,
+                        ffn,
+                        TILE_K,
+                        Spec50PackedGateupBufferOffsets {
+                            y: (tile * TILE_K * hidden * 4) as u64,
+                            act_output: (tile * TILE_K * ffn * 4) as u64,
+                        },
+                    );
+                }
+            };
+            let encode_gate_wide = |encoder: &metal::ComputeCommandEncoderRef| {
+                encode_spec50_widen_gateup(
+                    encoder,
+                    widen,
+                    &y,
+                    &gate,
+                    &up,
+                    &wide_act,
+                    gate_blocks as u32,
+                    ffn,
+                    WAVE_K,
+                );
+            };
+            let encode_gate_direct = |encoder: &metal::ComputeCommandEncoderRef| {
+                encode_spec50_packed_gateup_k16_direct_two_sg(
+                    encoder,
+                    packed_direct,
+                    &y,
+                    &gate,
+                    &up,
+                    &direct_act,
+                    gate_blocks as u32,
+                    ffn,
+                    Spec50PackedGateupBufferOffsets::default(),
+                );
+            };
+            let tiled_ms = bench(&c.queue, encode_gate_tiles);
+            let wide_ms = bench(&c.queue, encode_gate_wide);
+            let direct_ms = bench(&c.queue, encode_gate_direct);
+            shared_model_tile_ms += 30.0 * tiled_ms;
+            shared_model_wide_ms += 30.0 * wide_ms;
+            shared_model_direct_ms += 30.0 * direct_ms;
+            run(&c.queue, encode_gate_tiles);
+            run(&c.queue, encode_gate_wide);
+            run(&c.queue, encode_gate_direct);
+            let bad_wide = bits_equal(
+                "bench shared GateUp widened",
+                &read(&tile_act, WAVE_K * ffn),
+                &read(&wide_act, WAVE_K * ffn),
+            );
+            let bad_direct = bits_equal(
+                "bench shared GateUp direct two-SG",
+                &read(&tile_act, WAVE_K * ffn),
+                &read(&direct_act, WAVE_K * ffn),
+            );
+            println!(
+                "  shared GateUp     {tiled_ms:9.3} {wide_ms:10.3} {:9.3} {bad_wide:16}",
+                tiled_ms / wide_ms,
+            );
+            println!(
+                "    direct/tile     {direct_ms:9.3} {:10} {:9.3} {bad_direct:16}",
+                "--",
+                direct_ms / tiled_ms,
+            );
+
+            let down_w = buf_from(&c.device, &random_q4_0(&mut rng, hidden, down_blocks));
+            let tile_down = zeros(&c.device, WAVE_K * hidden);
+            let wide_down = zeros(&c.device, WAVE_K * hidden);
+            let encode_down_tiles = |encoder: &metal::ComputeCommandEncoderRef| {
+                for tile in 0..2 {
+                    encode_shipped_plain_k8_at_offsets(
+                        &c,
+                        encoder,
+                        &tile_act,
+                        (tile * TILE_K * ffn * 4) as u64,
+                        &down_w,
+                        &tile_down,
+                        (tile * TILE_K * hidden * 4) as u64,
+                        hidden,
+                        down_blocks,
+                    );
+                }
+            };
+            let encode_down_wide = |encoder: &metal::ComputeCommandEncoderRef| {
+                encode_spec50_widen_plain(
+                    encoder,
+                    widen,
+                    &tile_act,
+                    &down_w,
+                    0,
+                    &wide_down,
+                    down_blocks as u32,
+                    hidden,
+                    WAVE_K,
+                );
+            };
+            let tiled_down_ms = bench(&c.queue, encode_down_tiles);
+            let wide_down_ms = bench(&c.queue, encode_down_wide);
+            shared_model_tile_ms += 30.0 * tiled_down_ms;
+            shared_model_wide_ms += 30.0 * wide_down_ms;
+            shared_model_direct_ms += 30.0 * tiled_down_ms;
+            run(&c.queue, encode_down_tiles);
+            run(&c.queue, encode_down_wide);
+            let bad = bits_equal(
+                "bench shared Down",
+                &read(&tile_down, WAVE_K * hidden),
+                &read(&wide_down, WAVE_K * hidden),
+            );
+            println!(
+                "  shared Down       {tiled_down_ms:9.3} {wide_down_ms:10.3} {:9.3} {bad:16}",
+                tiled_down_ms / wide_down_ms,
+            );
+        }
+
+        // Full 26B tied head: 262,144 x 2,816 Q6_K (605.6 MB decimal).
+        // Fill the mapped Metal buffer directly so the benchmark never holds a
+        // second 605 MB host staging allocation.
+        {
+            const HEAD_ROWS: usize = 262_144;
+            const HEAD_HIDDEN: usize = 2816;
+            const HEAD_N_SB: usize = HEAD_HIDDEN / 256;
+            const Q6K_BYTES: usize = 210;
+            const SOFTCAP: f32 = 30.0;
+            let head = spec50_head_kernels().expect("spec50 head pipelines");
+            let weight_bytes = HEAD_ROWS * HEAD_N_SB * Q6K_BYTES;
+            let weight = c
+                .device
+                .new_buffer(weight_bytes as u64, MTLResourceOptions::StorageModeShared);
+            let bytes = unsafe {
+                std::slice::from_raw_parts_mut(weight.contents().cast::<u8>(), weight_bytes)
+            };
+            for (index, byte) in bytes.iter_mut().enumerate() {
+                *byte = index.wrapping_mul(37).wrapping_add(index >> 9) as u8;
+            }
+            for block in bytes.chunks_exact_mut(Q6K_BYTES) {
+                // Small finite normal f16 super-scale.
+                block[208] = 0x1f;
+                block[209] = 0x21;
+            }
+
+            let scales: Vec<f32> = (0..WAVE_K * HEAD_N_SB)
+                .map(|index| 0.002 + index as f32 * 1.0e-6)
+                .collect();
+            let quants: Vec<i8> = (0..WAVE_K * HEAD_HIDDEN)
+                .map(|index| index.wrapping_mul(29).wrapping_add(7) as u8 as i8)
+                .collect();
+            let scales = buf_from(&c.device, &scales);
+            let quants = buf_from(&c.device, &quants);
+            let perm = c.device.new_buffer(
+                spec50_activation_scratch_bytes(WAVE_K, HEAD_HIDDEN) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let tiled = zeros(&c.device, WAVE_K * HEAD_ROWS);
+            let wide = zeros(&c.device, WAVE_K * HEAD_ROWS);
+            let ids = c
+                .device
+                .new_buffer((WAVE_K * 4) as u64, MTLResourceOptions::StorageModeShared);
+            let vals = c
+                .device
+                .new_buffer((WAVE_K * 4) as u64, MTLResourceOptions::StorageModeShared);
+            let tile_perm_bytes = spec50_activation_scratch_bytes(TILE_K, HEAD_HIDDEN);
+            let encode_tiles = |encoder: &metal::ComputeCommandEncoderRef| {
+                for tile in 0..2 {
+                    assert!(encode_q6k_spec50_batch_at_offsets(
+                        encoder,
+                        head,
+                        &scales,
+                        &quants,
+                        &perm,
+                        &weight,
+                        0,
+                        &tiled,
+                        HEAD_N_SB,
+                        HEAD_ROWS,
+                        TILE_K,
+                        HEAD_HIDDEN,
+                        SOFTCAP,
+                        Spec50HeadBufferOffsets {
+                            input_scales: (tile * TILE_K * HEAD_N_SB * 4) as u64,
+                            input_quants: (tile * TILE_K * HEAD_HIDDEN) as u64,
+                            activation_perm: (tile * tile_perm_bytes) as u64,
+                            output: (tile * TILE_K * HEAD_ROWS * 4) as u64,
+                        },
+                    ));
+                }
+                encode_q6k_spec50_argmax(encoder, head, &tiled, &ids, &vals, HEAD_ROWS, WAVE_K);
+            };
+            let encode_wide = |encoder: &metal::ComputeCommandEncoderRef| {
+                assert!(encode_q6k_spec50_batch(
+                    encoder,
+                    head,
+                    &scales,
+                    &quants,
+                    &perm,
+                    &weight,
+                    0,
+                    &wide,
+                    HEAD_N_SB,
+                    HEAD_ROWS,
+                    WAVE_K,
+                    HEAD_HIDDEN,
+                    SOFTCAP,
+                ));
+                encode_q6k_spec50_argmax(encoder, head, &wide, &ids, &vals, HEAD_ROWS, WAVE_K);
+            };
+            let tiled_ms = bench(&c.queue, encode_tiles);
+            let wide_ms = bench(&c.queue, encode_wide);
+            head_tile_ms = tiled_ms;
+            head_wide_ms = wide_ms;
+            run(&c.queue, encode_tiles);
+            run(&c.queue, encode_wide);
+            let bad = bits_equal(
+                "bench tied head",
+                &read(&tiled, WAVE_K * HEAD_ROWS),
+                &read(&wide, WAVE_K * HEAD_ROWS),
+            );
+            println!(
+                "  tied head         {tiled_ms:9.3} {wide_ms:10.3} {:9.3} {bad:16}",
+                tiled_ms / wide_ms,
+            );
+            assert_eq!(bad, 0, "head widened K16 must retain canonical K8 bits");
+        }
+
+        println!(
+            "\n  hot single-layer-scaled estimates (not a distinct-weight sweep; 25 local + 5 global):"
+        );
+        println!(
+            "    QKV+O       tile8x2={qkv_o_model_tile_ms:8.3} ms widened={qkv_o_model_wide_ms:8.3} ms ({:.3}x)",
+            qkv_o_model_tile_ms / qkv_o_model_wide_ms,
+        );
+        println!(
+            "    shared MLP  tile8x2={shared_model_tile_ms:8.3} ms widened={shared_model_wide_ms:8.3} ms direct={shared_model_direct_ms:8.3} ms",
+        );
+        println!(
+            "    tied head   tile8x2={head_tile_ms:8.3} ms widened={head_wide_ms:8.3} ms ({:.3}x)",
+            head_tile_ms / head_wide_ms,
+        );
+
+        let [k8, direct_sg] = spec50_packed_gateup_pipeline_limits(packed, packed_direct);
+        println!(
+            "  GateUp limits: K8 max/TG={} SIMD={} tmem={} B; direct-K16 max/TG={} SIMD={} tmem={} B",
+            k8.0, k8.1, k8.2,
+            direct_sg.0, direct_sg.1, direct_sg.2,
+        );
     }
 }

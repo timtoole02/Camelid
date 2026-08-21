@@ -563,7 +563,9 @@ fn build_variant(device: &Device, fast_math: bool) -> Option<Spec50MoeVariant> {
     options.set_fast_math_enabled(fast_math);
     let library = device
         .new_library_with_source(SPEC50_MOE_SHADER, &options)
-        .map_err(|err| eprintln!("[metal] SPEC50_MOE_SHADER compile failed (fast={fast_math}): {err}"))
+        .map_err(|err| {
+            eprintln!("[metal] SPEC50_MOE_SHADER compile failed (fast={fast_math}): {err}")
+        })
         .ok()?;
     let build = |name: &str| -> Option<ComputePipelineState> {
         let function = library
@@ -605,6 +607,30 @@ pub(crate) fn spec50_moe_kernels(device: &Device) -> Option<&'static Spec50MoeKe
 // Encoders
 // ---------------------------------------------------------------------------
 
+/// Byte offsets for one canonical, at-most-eight-token GateUp tile.
+///
+/// Keeping these at the buffer-binding boundary is deliberate: a wider wave is
+/// composed by rebasing its buffers, while the shader still sees local token
+/// indices `0..k_candidates` and executes the exact same FP program as K=8.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Spec50GateupBufferOffsets {
+    pub(crate) input_scales: u64,
+    pub(crate) input_quants: u64,
+    pub(crate) work_list: u64,
+    pub(crate) output_scales: u64,
+    pub(crate) output_quants: u64,
+}
+
+/// Byte offsets for one canonical, at-most-eight-token Down tile.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Spec50DownBufferOffsets {
+    pub(crate) act_scales: u64,
+    pub(crate) act_quants: u64,
+    pub(crate) candidate_routes: u64,
+    pub(crate) work_list: u64,
+    pub(crate) output_moe_acc: u64,
+}
+
 /// GateUp + GeGLU + Q8 quantization over the unique-expert union.
 ///
 /// Buffer order is identical to
@@ -624,29 +650,77 @@ pub(crate) fn encode_spec50_gateup(
     num_unique_experts: u32,
     k_candidates: u32,
     overflow_expert_weights: Option<&Buffer>,
+    indirect_dispatch_args: Option<&Buffer>,
 ) {
+    encode_spec50_gateup_at_offsets(
+        encoder,
+        pipeline,
+        input_scales,
+        input_quants,
+        expert_weights,
+        expert_weights_offset,
+        work_list,
+        output_scales,
+        output_quants,
+        num_unique_experts,
+        k_candidates,
+        overflow_expert_weights,
+        indirect_dispatch_args,
+        Spec50GateupBufferOffsets::default(),
+    );
+}
+
+/// Offset-aware form of [`encode_spec50_gateup`], used to compose wider waves
+/// exclusively from the canonical K8 arithmetic tile.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_spec50_gateup_at_offsets(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    input_scales: &Buffer,
+    input_quants: &Buffer,
+    expert_weights: &Buffer,
+    expert_weights_offset: u64,
+    work_list: &Buffer,
+    output_scales: &Buffer,
+    output_quants: &Buffer,
+    num_unique_experts: u32,
+    k_candidates: u32,
+    overflow_expert_weights: Option<&Buffer>,
+    indirect_dispatch_args: Option<&Buffer>,
+    offsets: Spec50GateupBufferOffsets,
+) {
+    debug_assert!((1..=8).contains(&k_candidates));
     encoder.set_compute_pipeline_state(pipeline);
-    encoder.set_buffer(0, Some(input_scales), 0);
-    encoder.set_buffer(1, Some(input_quants), 0);
+    encoder.set_buffer(0, Some(input_scales), offsets.input_scales);
+    encoder.set_buffer(1, Some(input_quants), offsets.input_quants);
     encoder.set_buffer(2, Some(expert_weights), expert_weights_offset);
-    encoder.set_buffer(3, Some(work_list), 0);
-    encoder.set_buffer(4, Some(output_scales), 0);
-    encoder.set_buffer(5, Some(output_quants), 0);
+    encoder.set_buffer(3, Some(work_list), offsets.work_list);
+    encoder.set_buffer(4, Some(output_scales), offsets.output_scales);
+    encoder.set_buffer(5, Some(output_quants), offsets.output_quants);
     encoder.set_bytes(6, 4, &num_unique_experts as *const u32 as *const _);
     encoder.set_bytes(7, 4, &k_candidates as *const u32 as *const _);
-    encoder.set_buffer(8, overflow_expert_weights.map(|v| &**v), 0);
-    encoder.dispatch_thread_groups(
-        metal::MTLSize {
-            width: (num_unique_experts as u64) * (S50_FF as u64 / 32),
-            height: 1,
-            depth: 1,
-        },
-        metal::MTLSize {
-            width: 32,
-            height: 1,
-            depth: 1,
-        },
+    encoder.set_buffer(
+        8,
+        Some(overflow_expert_weights.unwrap_or(expert_weights)),
+        0,
     );
+    let threads_per_threadgroup = metal::MTLSize {
+        width: 32,
+        height: 1,
+        depth: 1,
+    };
+    if let Some(indirect) = indirect_dispatch_args {
+        encoder.dispatch_thread_groups_indirect(indirect, 0, threads_per_threadgroup);
+    } else {
+        encoder.dispatch_thread_groups(
+            metal::MTLSize {
+                width: (num_unique_experts as u64) * (S50_FF as u64 / 32),
+                height: 1,
+                depth: 1,
+            },
+            threads_per_threadgroup,
+        );
+    }
 }
 
 /// Hidden rows one Down simdgroup folds. Must match `S50_DOWN_ROWS` in the shader.
@@ -677,16 +751,53 @@ pub(crate) fn encode_spec50_down(
     k_candidates: u32,
     overflow_expert_weights: Option<&Buffer>,
 ) {
+    encode_spec50_down_at_offsets(
+        encoder,
+        pipeline,
+        act_scales,
+        act_quants,
+        expert_weights,
+        expert_weights_offset,
+        candidate_routes,
+        work_list,
+        output_moe_acc,
+        k_candidates,
+        overflow_expert_weights,
+        Spec50DownBufferOffsets::default(),
+    );
+}
+
+/// Offset-aware form of [`encode_spec50_down`], used to compose wider waves
+/// exclusively from the canonical K8 arithmetic tile.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_spec50_down_at_offsets(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    act_scales: &Buffer,
+    act_quants: &Buffer,
+    expert_weights: &Buffer,
+    expert_weights_offset: u64,
+    candidate_routes: &Buffer,
+    work_list: &Buffer,
+    output_moe_acc: &Buffer,
+    k_candidates: u32,
+    overflow_expert_weights: Option<&Buffer>,
+    offsets: Spec50DownBufferOffsets,
+) {
     debug_assert!((1..=8).contains(&k_candidates));
     encoder.set_compute_pipeline_state(pipeline);
-    encoder.set_buffer(0, Some(act_scales), 0);
-    encoder.set_buffer(1, Some(act_quants), 0);
+    encoder.set_buffer(0, Some(act_scales), offsets.act_scales);
+    encoder.set_buffer(1, Some(act_quants), offsets.act_quants);
     encoder.set_buffer(2, Some(expert_weights), expert_weights_offset);
-    encoder.set_buffer(3, Some(candidate_routes), 0);
-    encoder.set_buffer(4, Some(work_list), 0);
-    encoder.set_buffer(5, Some(output_moe_acc), 0);
+    encoder.set_buffer(3, Some(candidate_routes), offsets.candidate_routes);
+    encoder.set_buffer(4, Some(work_list), offsets.work_list);
+    encoder.set_buffer(5, Some(output_moe_acc), offsets.output_moe_acc);
     encoder.set_bytes(6, 4, &k_candidates as *const u32 as *const _);
-    encoder.set_buffer(7, overflow_expert_weights.map(|v| &**v), 0);
+    encoder.set_buffer(
+        7,
+        Some(overflow_expert_weights.unwrap_or(expert_weights)),
+        0,
+    );
     encoder.dispatch_thread_groups(
         metal::MTLSize {
             width: (S50_HIDDEN / S50_DOWN_ROWS_PER_SIMDGROUP) as u64,
@@ -741,13 +852,81 @@ mod tests {
     }
 
     fn write_bytes(buffer: &Buffer, bytes: &[u8]) {
+        write_bytes_at(buffer, 0, bytes);
+    }
+
+    fn write_bytes_at(buffer: &Buffer, offset: usize, bytes: &[u8]) {
+        assert!(offset + bytes.len() <= buffer.length() as usize);
         unsafe {
             std::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
-                buffer.contents().cast::<u8>(),
+                buffer.contents().cast::<u8>().add(offset),
                 bytes.len(),
             );
         }
+    }
+
+    fn fill_bytes(buffer: &Buffer, value: u8) {
+        unsafe {
+            std::ptr::write_bytes(
+                buffer.contents().cast::<u8>(),
+                value,
+                buffer.length() as usize,
+            );
+        }
+    }
+
+    fn read_bytes_at(buffer: &Buffer, offset: usize, len: usize) -> Vec<u8> {
+        assert!(offset + len <= buffer.length() as usize);
+        let mut out = vec![0u8; len];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                buffer.contents().cast::<u8>().add(offset),
+                out.as_mut_ptr(),
+                len,
+            );
+        }
+        out
+    }
+
+    fn pod_bytes<T>(values: &[T]) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+        }
+    }
+
+    fn assert_raw_bytes_eq(label: &str, expected: &[u8], actual: &[u8]) {
+        assert_eq!(expected.len(), actual.len(), "{label}: length");
+        if let Some(i) = expected.iter().zip(actual.iter()).position(|(a, b)| a != b) {
+            panic!(
+                "{label}: raw-bit mismatch at byte {i}/{} (expected 0x{:02x}, got 0x{:02x})",
+                expected.len(),
+                expected[i],
+                actual[i]
+            );
+        }
+    }
+
+    fn assert_sentinel_range(label: &str, buffer: &Buffer, start: usize, end: usize, sentinel: u8) {
+        let bytes = read_bytes_at(buffer, start, end - start);
+        if let Some(i) = bytes.iter().position(|byte| *byte != sentinel) {
+            panic!(
+                "{label}: sentinel overwritten at byte {} (got 0x{:02x}, expected 0x{sentinel:02x})",
+                start + i,
+                bytes[i]
+            );
+        }
+    }
+
+    fn guarded_pair_layout(
+        first_len: usize,
+        second_len: usize,
+        guard: usize,
+    ) -> (usize, usize, usize) {
+        let first_offset = guard;
+        let second_offset = (first_offset + first_len + guard + 255) & !255;
+        let total_len = second_offset + second_len + guard;
+        (first_offset, second_offset, total_len)
     }
 
     fn read_f32(buffer: &Buffer, len: usize) -> Vec<f32> {
@@ -926,7 +1105,10 @@ mod tests {
             let mut per_token_slots = Vec::new();
             let mut route_weights = Vec::new();
             for t in 0..8usize {
-                let mut rng_t = Rng::new(0x5150_1000 + t as u64);
+                // Rng::new forces the low bit to one, so adjacent even/odd
+                // seeds alias. Use distinct odd seeds to ensure all eight
+                // token routes and weights are independently exercised.
+                let mut rng_t = Rng::new(0x5150_1001 + 2 * t as u64);
                 let mut slots = [0u32; 8];
                 let mut chosen: Vec<u32> = Vec::new();
                 while chosen.len() < 8 {
@@ -1018,7 +1200,9 @@ mod tests {
         encoder.set_buffer(5, Some(quants), 0);
         encoder.set_bytes(6, 4, &num_unique as *const u32 as *const _);
         encoder.set_bytes(7, 4, &k as *const u32 as *const _);
-        encoder.set_buffer(8, None, 0);
+        // The selected work items all point at the primary slab, but Metal's
+        // validation layer still requires every pointer argument to be bound.
+        encoder.set_buffer(8, Some(&h.slab), 0);
         dispatch_one_simdgroup_per_row(encoder, num_unique as usize * (S50_FF / 32));
     }
 
@@ -1043,12 +1227,15 @@ mod tests {
         encoder.set_buffer(4, Some(&h.work_list), 0);
         encoder.set_buffer(5, Some(out), 0);
         encoder.set_bytes(6, 4, &k as *const u32 as *const _);
-        encoder.set_buffer(7, None, 0);
+        encoder.set_buffer(7, Some(&h.slab), 0);
         dispatch_one_simdgroup_per_row(encoder, k as usize * S50_HIDDEN);
     }
 
     /// One K: run reference and replacement for both stages and compare raw bits.
-    fn run_pair(h: &Harness, k: usize) -> (Vec<f32>, Vec<i8>, Vec<f32>, Vec<f32>, Vec<i8>, Vec<f32>) {
+    fn run_pair(
+        h: &Harness,
+        k: usize,
+    ) -> (Vec<f32>, Vec<i8>, Vec<f32>, Vec<f32>, Vec<i8>, Vec<f32>) {
         let kernel = metal_linear_kernel().expect("metal kernel");
         let spec = spec50_moe_kernels(&h.device).expect("spec50 pipelines");
         let routing = build_routing(&h.per_token_slots, &h.route_weights, k);
@@ -1073,6 +1260,7 @@ mod tests {
             &h.gu_quants_new,
             nu,
             ku,
+            None,
             None,
         );
         enc.memory_barrier_with_resources(&[&h.gu_scales_new, &h.gu_quants_new]);
@@ -1168,9 +1356,25 @@ mod tests {
         let enc = cb.new_compute_command_encoder();
         reference_gateup(kernel, enc, &h, &h.gu_scales_ref, &h.gu_quants_ref, nu, ku);
         enc.memory_barrier_with_resources(&[&h.gu_scales_ref, &h.gu_quants_ref]);
-        reference_down(kernel, enc, &h, &h.gu_scales_ref, &h.gu_quants_ref, &h.down_ref, ku);
+        reference_down(
+            kernel,
+            enc,
+            &h,
+            &h.gu_scales_ref,
+            &h.gu_quants_ref,
+            &h.down_ref,
+            ku,
+        );
         enc.memory_barrier_with_resources(&[&h.down_ref]);
-        reference_down(kernel, enc, &h, &h.gu_scales_ref, &h.gu_quants_ref, &ref_twice, ku);
+        reference_down(
+            kernel,
+            enc,
+            &h,
+            &h.gu_scales_ref,
+            &h.gu_quants_ref,
+            &ref_twice,
+            ku,
+        );
         enc.memory_barrier_with_resources(&[&ref_twice]);
         for (pipeline, out) in [
             (&spec.fast.down_clone_scalar, &clone_scalar),
@@ -1208,10 +1412,22 @@ mod tests {
             }
             (diffs, worst)
         };
-        eprintln!("[spec50 bisect] reference vs reference (rerun):       {:?}", cmp(&r, &r2));
-        eprintln!("[spec50 bisect] reference vs clone (fast-math):        {:?}", cmp(&r, &cs));
-        eprintln!("[spec50 bisect] reference vs clone (fast-math OFF):    {:?}", cmp(&r, &cv));
-        eprintln!("[spec50 bisect] clone fast vs clone strict:            {:?}", cmp(&cs, &cv));
+        eprintln!(
+            "[spec50 bisect] reference vs reference (rerun):       {:?}",
+            cmp(&r, &r2)
+        );
+        eprintln!(
+            "[spec50 bisect] reference vs clone (fast-math):        {:?}",
+            cmp(&r, &cs)
+        );
+        eprintln!(
+            "[spec50 bisect] reference vs clone (fast-math OFF):    {:?}",
+            cmp(&r, &cv)
+        );
+        eprintln!(
+            "[spec50 bisect] clone fast vs clone strict:            {:?}",
+            cmp(&cs, &cv)
+        );
     }
 
     #[test]
@@ -1256,6 +1472,426 @@ mod tests {
             );
         }
         eprintln!("[spec50] token 0 is bit-identical at K=1 and inside every K<=8 batch");
+    }
+
+    /// A K16 wave is scheduling only: two invocations of the canonical K8 FP
+    /// program with local routing masks and rebased buffers. This deliberately
+    /// does not introduce a K16 shader or a second arithmetic flavor.
+    #[test]
+    fn spec50_moe_k16_is_two_bit_exact_k8_tiles() {
+        const TILE_K: usize = 8;
+        const WAVE_K: usize = 16;
+        const GUARD: usize = 256;
+        const SENTINEL: u8 = 0xa5;
+
+        let Some(h) = Harness::new() else {
+            eprintln!("[spec50] no Metal device; skipping");
+            return;
+        };
+        let spec = spec50_moe_pipelines(&h.device).expect("strict spec50 pipelines");
+
+        // Generate one genuinely 16-token input. Tokens 7 and 8 are adjacent
+        // in this storage but enter different local K8 invocations below.
+        let mut rng = Rng::new(0x5150_1600);
+        let input_scales: Vec<f32> = (0..WAVE_K * S50_GU_BLOCKS)
+            .map(|i| 0.0005 + rng.next_f32() * 0.01 + (i / S50_GU_BLOCKS) as f32 * 1.0e-6)
+            .collect();
+        let input_quants: Vec<u8> = (0..WAVE_K * S50_HIDDEN)
+            .map(|i| {
+                let token = i / S50_HIDDEN;
+                (((rng.next_u32() ^ token as u32) % 255) as i32 - 127) as i8 as u8
+            })
+            .collect();
+        assert_ne!(
+            input_scales[7 * S50_GU_BLOCKS].to_bits(),
+            input_scales[8 * S50_GU_BLOCKS].to_bits(),
+            "boundary tokens must not accidentally share scale data"
+        );
+        assert_ne!(
+            input_quants[7 * S50_HIDDEN],
+            input_quants[8 * S50_HIDDEN],
+            "boundary tokens must not accidentally share quant data"
+        );
+
+        // Each tile has local mask bits 0..7. The two unions intentionally have
+        // different shapes (16 vs 12 experts), which also exercises distinct
+        // activation-region strides in the composed buffers.
+        let mut slots = Vec::with_capacity(WAVE_K);
+        let mut weights = Vec::with_capacity(WAVE_K);
+        for t in 0..WAVE_K {
+            let local_t = t % TILE_K;
+            let mut token_slots = [0u32; S50_ROUTES];
+            for (rank, slot) in token_slots.iter_mut().enumerate() {
+                *slot = if t < TILE_K {
+                    ((local_t + 2 * rank) % 16) as u32
+                } else {
+                    (20 + (local_t + rank) % 12) as u32
+                };
+            }
+            let mut token_weights = [0.0f32; S50_ROUTES];
+            for (rank, weight) in token_weights.iter_mut().enumerate() {
+                *weight = 0.015 + t as f32 * 0.0007 + rank as f32 * 0.011;
+            }
+            slots.push(token_slots);
+            weights.push(token_weights);
+        }
+        let routing = [
+            build_routing(&slots[..TILE_K], &weights[..TILE_K], TILE_K),
+            build_routing(&slots[TILE_K..], &weights[TILE_K..], TILE_K),
+        ];
+        assert_eq!(routing[0].num_unique, 16);
+        assert_eq!(routing[1].num_unique, 12);
+
+        let input_scale_tile_bytes = TILE_K * S50_GU_BLOCKS * 4;
+        let input_quant_tile_bytes = TILE_K * S50_HIDDEN;
+        let work_bytes = 128 * std::mem::size_of::<Gemma4UniqueExpertWork>();
+        let route_bytes = TILE_K * S50_ROUTES * std::mem::size_of::<Gemma4CandidateRouteEntry>();
+        let down_tile_bytes = TILE_K * S50_HIDDEN * 4;
+        let gu_scale_bytes = [
+            routing[0].num_unique * TILE_K * S50_DOWN_BLOCKS * 4,
+            routing[1].num_unique * TILE_K * S50_DOWN_BLOCKS * 4,
+        ];
+        let gu_quant_bytes = [
+            routing[0].num_unique * TILE_K * S50_FF,
+            routing[1].num_unique * TILE_K * S50_FF,
+        ];
+
+        // Isolated K8 executions are the reference for composition. They use
+        // the ordinary zero-offset API and compact, tile-local buffers.
+        let ref_input_scales: Vec<Buffer> = (0..2)
+            .map(|_| new_buffer(&h.device, input_scale_tile_bytes))
+            .collect();
+        let ref_input_quants: Vec<Buffer> = (0..2)
+            .map(|_| new_buffer(&h.device, input_quant_tile_bytes))
+            .collect();
+        let ref_work: Vec<Buffer> = (0..2).map(|_| new_buffer(&h.device, work_bytes)).collect();
+        let ref_routes: Vec<Buffer> = (0..2).map(|_| new_buffer(&h.device, route_bytes)).collect();
+        let ref_gu_scales: Vec<Buffer> = gu_scale_bytes
+            .iter()
+            .map(|len| new_buffer(&h.device, *len))
+            .collect();
+        let ref_gu_quants: Vec<Buffer> = gu_quant_bytes
+            .iter()
+            .map(|len| new_buffer(&h.device, *len))
+            .collect();
+        let ref_down: Vec<Buffer> = (0..2)
+            .map(|_| new_buffer(&h.device, down_tile_bytes))
+            .collect();
+
+        for tile in 0..2 {
+            let scale_start = tile * TILE_K * S50_GU_BLOCKS;
+            let quant_start = tile * TILE_K * S50_HIDDEN;
+            write_bytes(
+                &ref_input_scales[tile],
+                pod_bytes(&input_scales[scale_start..scale_start + TILE_K * S50_GU_BLOCKS]),
+            );
+            write_bytes(
+                &ref_input_quants[tile],
+                &input_quants[quant_start..quant_start + TILE_K * S50_HIDDEN],
+            );
+            write_bytes(&ref_work[tile], pod_bytes(&routing[tile].work_list));
+            write_bytes(&ref_routes[tile], pod_bytes(&routing[tile].routes));
+            fill_bytes(&ref_gu_scales[tile], SENTINEL);
+            fill_bytes(&ref_gu_quants[tile], SENTINEL);
+            fill_bytes(&ref_down[tile], SENTINEL);
+        }
+
+        let reference_cb = h.queue.new_command_buffer();
+        let reference_encoder = reference_cb.new_compute_command_encoder();
+        for tile in 0..2 {
+            encode_spec50_gateup(
+                reference_encoder,
+                &spec.gateup,
+                &ref_input_scales[tile],
+                &ref_input_quants[tile],
+                &h.slab,
+                0,
+                &ref_work[tile],
+                &ref_gu_scales[tile],
+                &ref_gu_quants[tile],
+                routing[tile].num_unique as u32,
+                TILE_K as u32,
+                None,
+                None,
+            );
+        }
+        reference_encoder.memory_barrier_with_resources(&[
+            &ref_gu_scales[0],
+            &ref_gu_quants[0],
+            &ref_gu_scales[1],
+            &ref_gu_quants[1],
+        ]);
+        for tile in 0..2 {
+            encode_spec50_down(
+                reference_encoder,
+                &spec.down,
+                &ref_gu_scales[tile],
+                &ref_gu_quants[tile],
+                &h.slab,
+                0,
+                &ref_routes[tile],
+                &ref_work[tile],
+                &ref_down[tile],
+                TILE_K as u32,
+                None,
+            );
+        }
+        reference_encoder.end_encoding();
+        reference_cb.commit();
+        reference_cb.wait_until_completed();
+
+        // Compose the same work from guarded shared buffers. Inputs and final
+        // Down output are truly contiguous across token 7/8. Per-tile union
+        // metadata and GateUp scratch have guarded, independently rebased
+        // regions because their unique-expert dimensions differ.
+        let wide_scale_offset = GUARD;
+        let wide_input_scales = new_buffer(&h.device, GUARD + WAVE_K * S50_GU_BLOCKS * 4 + GUARD);
+        fill_bytes(&wide_input_scales, SENTINEL);
+        write_bytes_at(
+            &wide_input_scales,
+            wide_scale_offset,
+            pod_bytes(&input_scales),
+        );
+
+        let wide_quant_offset = GUARD;
+        let wide_input_quants = new_buffer(&h.device, GUARD + WAVE_K * S50_HIDDEN + GUARD);
+        fill_bytes(&wide_input_quants, SENTINEL);
+        write_bytes_at(&wide_input_quants, wide_quant_offset, &input_quants);
+
+        let (work_offset_0, work_offset_1, wide_work_len) =
+            guarded_pair_layout(work_bytes, work_bytes, GUARD);
+        let wide_work = new_buffer(&h.device, wide_work_len);
+        fill_bytes(&wide_work, SENTINEL);
+        write_bytes_at(&wide_work, work_offset_0, pod_bytes(&routing[0].work_list));
+        write_bytes_at(&wide_work, work_offset_1, pod_bytes(&routing[1].work_list));
+
+        let (route_offset_0, route_offset_1, wide_route_len) =
+            guarded_pair_layout(route_bytes, route_bytes, GUARD);
+        let wide_routes = new_buffer(&h.device, wide_route_len);
+        fill_bytes(&wide_routes, SENTINEL);
+        write_bytes_at(&wide_routes, route_offset_0, pod_bytes(&routing[0].routes));
+        write_bytes_at(&wide_routes, route_offset_1, pod_bytes(&routing[1].routes));
+
+        let (gu_scale_offset_0, gu_scale_offset_1, wide_gu_scale_len) =
+            guarded_pair_layout(gu_scale_bytes[0], gu_scale_bytes[1], GUARD);
+        let wide_gu_scales = new_buffer(&h.device, wide_gu_scale_len);
+        fill_bytes(&wide_gu_scales, SENTINEL);
+        let (gu_quant_offset_0, gu_quant_offset_1, wide_gu_quant_len) =
+            guarded_pair_layout(gu_quant_bytes[0], gu_quant_bytes[1], GUARD);
+        let wide_gu_quants = new_buffer(&h.device, wide_gu_quant_len);
+        fill_bytes(&wide_gu_quants, SENTINEL);
+
+        let wide_down_offset = GUARD;
+        let wide_down_len = GUARD + WAVE_K * S50_HIDDEN * 4 + GUARD;
+        let wide_down = new_buffer(&h.device, wide_down_len);
+        fill_bytes(&wide_down, SENTINEL);
+
+        let gate_offsets = [
+            Spec50GateupBufferOffsets {
+                input_scales: wide_scale_offset as u64,
+                input_quants: wide_quant_offset as u64,
+                work_list: work_offset_0 as u64,
+                output_scales: gu_scale_offset_0 as u64,
+                output_quants: gu_quant_offset_0 as u64,
+            },
+            Spec50GateupBufferOffsets {
+                input_scales: (wide_scale_offset + input_scale_tile_bytes) as u64,
+                input_quants: (wide_quant_offset + input_quant_tile_bytes) as u64,
+                work_list: work_offset_1 as u64,
+                output_scales: gu_scale_offset_1 as u64,
+                output_quants: gu_quant_offset_1 as u64,
+            },
+        ];
+        let down_offsets = [
+            Spec50DownBufferOffsets {
+                act_scales: gu_scale_offset_0 as u64,
+                act_quants: gu_quant_offset_0 as u64,
+                candidate_routes: route_offset_0 as u64,
+                work_list: work_offset_0 as u64,
+                output_moe_acc: wide_down_offset as u64,
+            },
+            Spec50DownBufferOffsets {
+                act_scales: gu_scale_offset_1 as u64,
+                act_quants: gu_quant_offset_1 as u64,
+                candidate_routes: route_offset_1 as u64,
+                work_list: work_offset_1 as u64,
+                output_moe_acc: (wide_down_offset + down_tile_bytes) as u64,
+            },
+        ];
+
+        let tiled_cb = h.queue.new_command_buffer();
+        let tiled_encoder = tiled_cb.new_compute_command_encoder();
+        for tile in 0..2 {
+            encode_spec50_gateup_at_offsets(
+                tiled_encoder,
+                &spec.gateup,
+                &wide_input_scales,
+                &wide_input_quants,
+                &h.slab,
+                0,
+                &wide_work,
+                &wide_gu_scales,
+                &wide_gu_quants,
+                routing[tile].num_unique as u32,
+                TILE_K as u32,
+                None,
+                None,
+                gate_offsets[tile],
+            );
+        }
+        tiled_encoder.memory_barrier_with_resources(&[&wide_gu_scales, &wide_gu_quants]);
+        for tile in 0..2 {
+            encode_spec50_down_at_offsets(
+                tiled_encoder,
+                &spec.down,
+                &wide_gu_scales,
+                &wide_gu_quants,
+                &h.slab,
+                0,
+                &wide_routes,
+                &wide_work,
+                &wide_down,
+                TILE_K as u32,
+                None,
+                down_offsets[tile],
+            );
+        }
+        tiled_encoder.end_encoding();
+        tiled_cb.commit();
+        tiled_cb.wait_until_completed();
+
+        for tile in 0..2 {
+            let tiled_scale_offset = [gu_scale_offset_0, gu_scale_offset_1][tile];
+            let tiled_quant_offset = [gu_quant_offset_0, gu_quant_offset_1][tile];
+            assert_raw_bytes_eq(
+                &format!("K16 tile {tile} GateUp scales vs isolated K8"),
+                &read_bytes_at(&ref_gu_scales[tile], 0, gu_scale_bytes[tile]),
+                &read_bytes_at(&wide_gu_scales, tiled_scale_offset, gu_scale_bytes[tile]),
+            );
+            assert_raw_bytes_eq(
+                &format!("K16 tile {tile} GateUp quants vs isolated K8"),
+                &read_bytes_at(&ref_gu_quants[tile], 0, gu_quant_bytes[tile]),
+                &read_bytes_at(&wide_gu_quants, tiled_quant_offset, gu_quant_bytes[tile]),
+            );
+            assert_raw_bytes_eq(
+                &format!("K16 tile {tile} Down vs isolated K8"),
+                &read_bytes_at(&ref_down[tile], 0, down_tile_bytes),
+                &read_bytes_at(
+                    &wide_down,
+                    wide_down_offset + tile * down_tile_bytes,
+                    down_tile_bytes,
+                ),
+            );
+        }
+
+        // Name the exact seam explicitly: last token in tile 0 and first token
+        // in tile 1 must match their independently dispatched K8 counterparts.
+        let down_token_bytes = S50_HIDDEN * 4;
+        assert_raw_bytes_eq(
+            "K16 token 7 boundary",
+            &read_bytes_at(&ref_down[0], 7 * down_token_bytes, down_token_bytes),
+            &read_bytes_at(
+                &wide_down,
+                wide_down_offset + 7 * down_token_bytes,
+                down_token_bytes,
+            ),
+        );
+        assert_raw_bytes_eq(
+            "K16 token 8 boundary",
+            &read_bytes_at(&ref_down[1], 0, down_token_bytes),
+            &read_bytes_at(
+                &wide_down,
+                wide_down_offset + 8 * down_token_bytes,
+                down_token_bytes,
+            ),
+        );
+
+        // Every byte outside an intentional region remains poisoned. This
+        // catches tile-offset underflow/overflow even when the neighboring
+        // tile's valid output would otherwise hide it.
+        for (label, buffer, payload_start, payload_end) in [
+            (
+                "K16 input scales",
+                &wide_input_scales,
+                wide_scale_offset,
+                wide_scale_offset + WAVE_K * S50_GU_BLOCKS * 4,
+            ),
+            (
+                "K16 input quants",
+                &wide_input_quants,
+                wide_quant_offset,
+                wide_quant_offset + WAVE_K * S50_HIDDEN,
+            ),
+            (
+                "K16 Down output",
+                &wide_down,
+                wide_down_offset,
+                wide_down_offset + WAVE_K * S50_HIDDEN * 4,
+            ),
+        ] {
+            assert_sentinel_range(label, buffer, 0, payload_start, SENTINEL);
+            assert_sentinel_range(
+                label,
+                buffer,
+                payload_end,
+                buffer.length() as usize,
+                SENTINEL,
+            );
+        }
+        for (label, buffer, first_offset, first_len, second_offset, second_len) in [
+            (
+                "K16 work list",
+                &wide_work,
+                work_offset_0,
+                work_bytes,
+                work_offset_1,
+                work_bytes,
+            ),
+            (
+                "K16 routes",
+                &wide_routes,
+                route_offset_0,
+                route_bytes,
+                route_offset_1,
+                route_bytes,
+            ),
+            (
+                "K16 GateUp scales",
+                &wide_gu_scales,
+                gu_scale_offset_0,
+                gu_scale_bytes[0],
+                gu_scale_offset_1,
+                gu_scale_bytes[1],
+            ),
+            (
+                "K16 GateUp quants",
+                &wide_gu_quants,
+                gu_quant_offset_0,
+                gu_quant_bytes[0],
+                gu_quant_offset_1,
+                gu_quant_bytes[1],
+            ),
+        ] {
+            assert_sentinel_range(label, buffer, 0, first_offset, SENTINEL);
+            assert_sentinel_range(
+                label,
+                buffer,
+                first_offset + first_len,
+                second_offset,
+                SENTINEL,
+            );
+            assert_sentinel_range(
+                label,
+                buffer,
+                second_offset + second_len,
+                buffer.length() as usize,
+                SENTINEL,
+            );
+        }
+
+        eprintln!(
+            "[spec50] K16 = two canonical K8 MoE tiles: raw-bit exact at token 7/8; all guards intact"
+        );
     }
 
     /// 30 layers' worth of dispatches per measurement, GPU-timed, OLD vs NEW.
@@ -1313,7 +1949,8 @@ mod tests {
 
             let gateup_bytes =
                 BENCH_LAYERS as f64 * routing.num_unique as f64 * S50_GATE_UP_BYTES as f64;
-            let down_bytes = BENCH_LAYERS as f64 * routing.num_unique as f64 * S50_DOWN_BYTES as f64;
+            let down_bytes =
+                BENCH_LAYERS as f64 * routing.num_unique as f64 * S50_DOWN_BYTES as f64;
 
             let time = |body: &dyn Fn(&metal::ComputeCommandEncoderRef)| -> f64 {
                 let mut best = f64::MAX;
@@ -1348,6 +1985,7 @@ mod tests {
                     &h.gu_quants_new,
                     nu,
                     ku,
+                    None,
                     None,
                 )
             });
