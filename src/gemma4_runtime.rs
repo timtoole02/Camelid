@@ -6718,6 +6718,14 @@ pub struct Gemma4RoutedExpertLayerResidencySnapshot {
     pub layer_index: u32,
     /// Allocated logical records, including unbound lazy capacity.
     pub base_slot_capacity: u64,
+    /// Anonymous writable records retained by this layer. In the exact hybrid
+    /// lane this is the bounded 48-record hot tier, while
+    /// `file_mapped_addressable_slots` remains the complete canonical 128-ID
+    /// namespace.
+    #[serde(default)]
+    pub anonymous_slot_capacity: u64,
+    #[serde(default)]
+    pub anonymous_slot_capacity_bytes: u64,
     /// Prefix encoded in the Tier-2 table and selectable by the directory.
     /// This is the physical residency high-water in bounded record mode.
     pub physical_base_slot_budget: u64,
@@ -6755,6 +6763,10 @@ pub struct Gemma4RoutedExpertResidencySnapshot {
     /// Allocated logical records across all layers.
     pub base_slot_capacity: u64,
     pub base_slot_capacity_bytes: u64,
+    #[serde(default)]
+    pub anonymous_slot_capacity: u64,
+    #[serde(default)]
+    pub anonymous_slot_capacity_bytes: u64,
     /// Table-bound/directory-selectable records across all layers.
     pub physical_base_slot_budget: u64,
     pub physical_base_slot_budget_bytes: u64,
@@ -6768,6 +6780,14 @@ pub struct Gemma4RoutedExpertResidencySnapshot {
     /// of physical residency after the Tier-2 tables have been compute-bound;
     /// `physical_base_slot_budget_bytes` is the worst-case bound for that.
     pub occupied_base_touched_bytes: u64,
+    #[serde(default)]
+    pub overflow_slot_capacity: u64,
+    #[serde(default)]
+    pub overflow_capacity_bytes: u64,
+    #[serde(default)]
+    pub victim_record_capacity: u64,
+    #[serde(default)]
+    pub victim_capacity_bytes: u64,
     pub per_layer: Vec<Gemma4RoutedExpertLayerResidencySnapshot>,
     pub aggregate_slot_stats: Gemma4RoutedExpertSlotStatsSnapshot,
     pub cumulative_chained_demand_loads: u64,
@@ -6816,6 +6836,555 @@ pub struct Gemma4RoutedExpertResidencySnapshot {
     pub last_chained_selected_experts_dropped: u32,
     pub last_chained_missing_expert_failclose: u32,
     pub last_chained_slot_capacity_overflow: u32,
+}
+
+/// Stable response schema for one completed, measured request on the exact
+/// 48-anonymous-hot / canonical-file-mapped Gemma 4 lane. These structures are
+/// deliberately separate from [`Gemma4GenerationOutcome`]: existing runtime
+/// callers retain that enum unchanged, while the non-streaming serve bridge can
+/// carry this optional receipt as a sidecar.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct Gemma4HybridTelemetry {
+    pub schema_version: u32,
+    pub scope: &'static str,
+    pub geometry: Gemma4HybridTelemetryGeometry,
+    pub route_interval: Gemma4HybridTelemetryRouteInterval,
+    pub rounds: Vec<Gemma4HybridTelemetryRound>,
+    pub aggregate: Gemma4HybridTelemetryAggregate,
+    pub metrics: Gemma4HybridTelemetryMetrics,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Gemma4HybridTelemetryGeometry {
+    pub layers: u32,
+    pub record_payload_bytes: u64,
+    pub slot_stride_bytes: u64,
+    pub logical_addressable_slots: u64,
+    pub anonymous_hot_capacity_slots: u64,
+    pub anonymous_hot_capacity_bytes: u64,
+    pub file_mapped_addressable_slots: u64,
+    pub file_mapped_address_span_bytes: u64,
+    pub overflow_slots: u64,
+    pub overflow_capacity_bytes: u64,
+    pub victim_record_capacity: u64,
+    pub victim_capacity_bytes: u64,
+    pub host_cache_budget_bytes: u64,
+    pub per_layer: Vec<Gemma4HybridTelemetryLayerGeometry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Gemma4HybridTelemetryLayerGeometry {
+    pub layer: u32,
+    pub logical_addressable_slots: u64,
+    pub anonymous_hot_capacity_slots: u64,
+    pub anonymous_hot_capacity_bytes: u64,
+    pub file_mapped_addressable_slots: u64,
+    pub file_mapped_address_span_bytes: u64,
+    pub overflow_slots: u64,
+    pub victim_slots: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Gemma4HybridTelemetryRouteInterval {
+    pub scope: &'static str,
+    pub epoch: u64,
+    pub routed_expert_ids_per_layer: Vec<Vec<u16>>,
+    pub routed_unique_per_layer: Vec<u16>,
+    pub routed_unique_experts_sum: u32,
+    pub routed_unique_experts_max: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct Gemma4HybridTelemetryRound {
+    pub round_index: usize,
+    pub chained_round_sequence: u64,
+    pub prefix_tokens_before: usize,
+    pub bootstrap: bool,
+    pub remaining_budget_before: usize,
+    pub k: usize,
+    pub requested_k: usize,
+    pub proposed_k: usize,
+    pub verifier_k: usize,
+    pub budget_truncated: bool,
+    pub success: bool,
+    pub accepted_drafts: usize,
+    pub useful_accepted_drafts: usize,
+    pub committed_tokens: Vec<u32>,
+    pub assistant_exposed_ms: f64,
+    pub assistant_gpu_ms: f64,
+    pub verifier_wall_ms: f64,
+    pub verifier_gpu_ms: f64,
+    pub receipt_round_wall_ms: f64,
+    /// The following are exact totals from the latest chained ledger. The
+    /// current runtime does not retain per-layer attribution for these error
+    /// counters, so they must never be copied into each layer record.
+    pub selected_dropped: u32,
+    pub missing_failclose: u32,
+    pub slot_capacity_overflow: u32,
+    pub overflow_slots: u32,
+    pub overflow_bytes: u64,
+    pub overflow_layers: u32,
+    pub overflow_experts: u32,
+    pub victim_hits: u32,
+    pub per_layer: Vec<Gemma4HybridTelemetryRoundLayer>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Gemma4HybridTelemetryRoundLayer {
+    pub layer_index: u32,
+    pub active_unique: u16,
+    pub hot_bound: u16,
+    pub mapped_bound: u16,
+    pub bound_records: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Gemma4HybridTelemetryAggregate {
+    pub scope: &'static str,
+    pub route_lookups: u64,
+    pub hot_hits: u64,
+    pub mapped_cold_selections: u64,
+    pub slot_evictions: u64,
+    pub host_fills: u64,
+    pub prewarm_copies: u64,
+    pub direct_reads: u64,
+    pub direct_read_bytes: u64,
+    pub direct_read_failures: u64,
+    pub host_cache_hits: u64,
+    pub host_cache_misses: u64,
+    pub host_cache_evictions: u64,
+    pub chained_promotion_loads: u64,
+    pub chained_promotion_read_bytes: u64,
+    pub overflow_experts: u64,
+    pub victim_hits: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct Gemma4HybridTelemetryMetrics {
+    pub forwarded_decode_tokens: usize,
+    pub terminal_unforwarded_tokens: usize,
+    pub response_completion_tokens: usize,
+    pub receipt_round_wall_ms: f64,
+    pub proposed_drafts: usize,
+    pub accepted_drafts: usize,
+    pub decode_tokens_per_second: f64,
+    pub full_round_zero_accepts: usize,
+    pub max_full_assistant_exposed_ms: f64,
+    /// This clean runtime has no outer-lookahead launch path. Zero is a build
+    /// invariant, not a timer-derived estimate.
+    pub outer_lookahead_nonzero_count: usize,
+    pub outer_lookahead_observation: &'static str,
+}
+
+const HYBRID_TELEMETRY_LAYERS: usize = 30;
+const HYBRID_TELEMETRY_LOGICAL_PER_LAYER: u64 = 128;
+const HYBRID_TELEMETRY_HOT_PER_LAYER: u64 = 48;
+const HYBRID_TELEMETRY_RECORD_BYTES: u64 = 3_345_408;
+const HYBRID_TELEMETRY_STRIDE_BYTES: u64 = 3_358_720;
+
+#[derive(Clone, Debug)]
+struct Gemma4HybridRoundInput {
+    round_index: usize,
+    prefix_tokens_before: usize,
+    bootstrap: bool,
+    remaining_budget_before: usize,
+    requested_k: usize,
+    proposed_k: usize,
+    verifier_k: usize,
+    budget_truncated: bool,
+    accepted_drafts: usize,
+    useful_accepted_drafts: usize,
+    committed_tokens: Vec<u32>,
+    assistant_wall_us: u64,
+    assistant_gpu_us: u64,
+    verifier_wall_us: u64,
+    verifier_gpu_us: u64,
+    total_wall_us: u64,
+}
+
+impl From<&Gemma4MtpGenerationRound> for Gemma4HybridRoundInput {
+    fn from(round: &Gemma4MtpGenerationRound) -> Self {
+        Self {
+            round_index: round.round_index,
+            prefix_tokens_before: round.prefix_tokens_before,
+            bootstrap: round.bootstrap,
+            remaining_budget_before: round.remaining_budget_before,
+            requested_k: round.requested_k,
+            proposed_k: round.proposed_drafts.len(),
+            verifier_k: round.verifier_k,
+            budget_truncated: round.budget_truncated,
+            accepted_drafts: round.accepted_drafts,
+            useful_accepted_drafts: round.useful_accepted_drafts,
+            committed_tokens: round.committed_tokens.clone(),
+            assistant_wall_us: round.assistant_wall_us,
+            assistant_gpu_us: round.assistant_gpu_us,
+            verifier_wall_us: round.target_verify_wall_us,
+            verifier_gpu_us: round.target_verify_gpu_us,
+            total_wall_us: round.total_wall_us,
+        }
+    }
+}
+
+/// Request-local builder. A builder exists only when the live prefill-start
+/// snapshot proves the exact hybrid ownership geometry. Any stale/missing
+/// chained ledger or counter regression invalidates the whole sidecar rather
+/// than publishing a partial or inferred receipt.
+struct Gemma4HybridTelemetryCollector {
+    before: Gemma4RoutedExpertResidencySnapshot,
+    geometry: Gemma4HybridTelemetryGeometry,
+    last_chained_round_sequence: u64,
+    rounds: Vec<Gemma4HybridTelemetryRound>,
+    valid: bool,
+}
+
+impl Gemma4HybridTelemetryCollector {
+    fn begin(before: Gemma4RoutedExpertResidencySnapshot) -> Option<Self> {
+        let geometry = exact_hybrid_telemetry_geometry(&before)?;
+        Some(Self {
+            last_chained_round_sequence: before.last_chained_round_sequence,
+            before,
+            geometry,
+            rounds: Vec::new(),
+            valid: true,
+        })
+    }
+
+    fn capture_round(
+        &mut self,
+        input: Gemma4HybridRoundInput,
+        snapshot: Option<Gemma4RoutedExpertResidencySnapshot>,
+    ) {
+        if !self.valid {
+            return;
+        }
+        let Some(snapshot) = snapshot else {
+            self.valid = false;
+            return;
+        };
+        let sequence_is_valid = if self.rounds.is_empty() {
+            // Measured prefill is intentionally inside the aggregate/route
+            // interval but outside the decode-round list, so it may account
+            // for a sequence gap before the first recorded decode round.
+            snapshot.last_chained_round_sequence > self.last_chained_round_sequence
+        } else {
+            snapshot.last_chained_round_sequence
+                == self.last_chained_round_sequence.saturating_add(1)
+        };
+        if exact_hybrid_telemetry_geometry(&snapshot).as_ref() != Some(&self.geometry)
+            || snapshot.interval_routed_expert_union_epoch
+                != self.before.interval_routed_expert_union_epoch
+            || !snapshot.last_chained_round_available
+            || !snapshot.last_chained_round_succeeded
+            || !sequence_is_valid
+            || input.round_index != self.rounds.len()
+            || snapshot.last_chained_k != u32::try_from(input.verifier_k).ok()
+            || snapshot.last_chained_unique_per_layer.len() != HYBRID_TELEMETRY_LAYERS
+            || snapshot.last_chained_hot_bound_per_layer.len() != HYBRID_TELEMETRY_LAYERS
+            || snapshot.last_chained_mapped_bound_per_layer.len() != HYBRID_TELEMETRY_LAYERS
+            || input.verifier_k == 0
+            || input.verifier_k > crate::metal::GEMMA4_RESIDENT_MAX_BATCH
+            || input.proposed_k.saturating_add(1) != input.verifier_k
+            || input.accepted_drafts > input.proposed_k
+            || input.useful_accepted_drafts > input.accepted_drafts
+        {
+            self.valid = false;
+            return;
+        }
+
+        let mut per_layer = Vec::with_capacity(HYBRID_TELEMETRY_LAYERS);
+        let mut hot_total = 0u32;
+        let mut mapped_total = 0u32;
+        for layer in 0..HYBRID_TELEMETRY_LAYERS {
+            let active = snapshot.last_chained_unique_per_layer[layer];
+            let hot = snapshot.last_chained_hot_bound_per_layer[layer];
+            let mapped = snapshot.last_chained_mapped_bound_per_layer[layer];
+            if active != hot.saturating_add(mapped)
+                || u64::from(hot) > HYBRID_TELEMETRY_HOT_PER_LAYER
+                || u64::from(active) > HYBRID_TELEMETRY_LOGICAL_PER_LAYER
+                || usize::from(active) > input.verifier_k.saturating_mul(8)
+            {
+                self.valid = false;
+                return;
+            }
+            hot_total = hot_total.saturating_add(u32::from(hot));
+            mapped_total = mapped_total.saturating_add(u32::from(mapped));
+            per_layer.push(Gemma4HybridTelemetryRoundLayer {
+                layer_index: layer as u32,
+                active_unique: active,
+                hot_bound: hot,
+                mapped_bound: mapped,
+                bound_records: active,
+            });
+        }
+        if hot_total != snapshot.last_chained_hot_bound_records
+            || mapped_total != snapshot.last_chained_mapped_bound_records
+        {
+            self.valid = false;
+            return;
+        }
+
+        self.last_chained_round_sequence = snapshot.last_chained_round_sequence;
+        self.rounds.push(Gemma4HybridTelemetryRound {
+            round_index: input.round_index,
+            chained_round_sequence: snapshot.last_chained_round_sequence,
+            prefix_tokens_before: input.prefix_tokens_before,
+            bootstrap: input.bootstrap,
+            remaining_budget_before: input.remaining_budget_before,
+            k: input.verifier_k,
+            requested_k: input.requested_k,
+            proposed_k: input.proposed_k,
+            verifier_k: input.verifier_k,
+            budget_truncated: input.budget_truncated,
+            success: true,
+            accepted_drafts: input.accepted_drafts,
+            useful_accepted_drafts: input.useful_accepted_drafts,
+            committed_tokens: input.committed_tokens,
+            assistant_exposed_ms: input.assistant_wall_us as f64 / 1_000.0,
+            assistant_gpu_ms: input.assistant_gpu_us as f64 / 1_000.0,
+            verifier_wall_ms: input.verifier_wall_us as f64 / 1_000.0,
+            verifier_gpu_ms: input.verifier_gpu_us as f64 / 1_000.0,
+            receipt_round_wall_ms: input.total_wall_us as f64 / 1_000.0,
+            selected_dropped: snapshot.last_chained_selected_experts_dropped,
+            missing_failclose: snapshot.last_chained_missing_expert_failclose,
+            slot_capacity_overflow: snapshot.last_chained_slot_capacity_overflow,
+            overflow_slots: snapshot.last_chained_overflow_slots,
+            overflow_bytes: snapshot.last_chained_overflow_bytes,
+            overflow_layers: snapshot.last_chained_overflow_layers,
+            overflow_experts: snapshot.last_chained_overflow_experts,
+            victim_hits: snapshot.last_chained_victim_hits,
+            per_layer,
+        });
+    }
+
+    fn forwarded_decode_tokens(&self) -> Option<usize> {
+        self.rounds.iter().try_fold(0usize, |total, round| {
+            total.checked_add(1usize.checked_add(round.useful_accepted_drafts)?)
+        })
+    }
+
+    fn finish(
+        self,
+        after: Option<Gemma4RoutedExpertResidencySnapshot>,
+        response_completion_tokens: usize,
+        terminal_unforwarded_tokens: usize,
+    ) -> Option<Gemma4HybridTelemetry> {
+        let after = after?;
+        if !self.valid
+            || self.rounds.is_empty()
+            || exact_hybrid_telemetry_geometry(&after).as_ref() != Some(&self.geometry)
+            || after.interval_routed_expert_union_epoch
+                != self.before.interval_routed_expert_union_epoch
+            || after.last_chained_round_sequence != self.last_chained_round_sequence
+            || !after.last_chained_round_available
+            || !after.last_chained_round_succeeded
+            || terminal_unforwarded_tokens > 1
+        {
+            return None;
+        }
+
+        let delta = |later: u64, earlier: u64| later.checked_sub(earlier);
+        let before_stats = &self.before.aggregate_slot_stats;
+        let after_stats = &after.aggregate_slot_stats;
+        let aggregate = Gemma4HybridTelemetryAggregate {
+            scope: "single_completed_measured_request",
+            route_lookups: delta(after_stats.route_lookups, before_stats.route_lookups)?,
+            hot_hits: delta(after_stats.hits, before_stats.hits)?,
+            mapped_cold_selections: delta(after_stats.misses, before_stats.misses)?,
+            slot_evictions: delta(after_stats.evictions, before_stats.evictions)?,
+            host_fills: delta(after_stats.host_fills, before_stats.host_fills)?,
+            prewarm_copies: delta(after_stats.prewarm_copies, before_stats.prewarm_copies)?,
+            direct_reads: delta(after_stats.direct_reads, before_stats.direct_reads)?,
+            direct_read_bytes: delta(
+                after_stats.direct_read_bytes,
+                before_stats.direct_read_bytes,
+            )?,
+            direct_read_failures: delta(
+                after_stats.direct_read_failures,
+                before_stats.direct_read_failures,
+            )?,
+            host_cache_hits: delta(after.host_cache_hits, self.before.host_cache_hits)?,
+            host_cache_misses: delta(after.host_cache_misses, self.before.host_cache_misses)?,
+            host_cache_evictions: delta(
+                after.host_cache_evictions,
+                self.before.host_cache_evictions,
+            )?,
+            chained_promotion_loads: delta(
+                after.cumulative_chained_demand_loads,
+                self.before.cumulative_chained_demand_loads,
+            )?,
+            chained_promotion_read_bytes: delta(
+                after.cumulative_chained_demand_read_bytes,
+                self.before.cumulative_chained_demand_read_bytes,
+            )?,
+            overflow_experts: self
+                .rounds
+                .iter()
+                .map(|round| u64::from(round.overflow_experts))
+                .sum(),
+            victim_hits: self
+                .rounds
+                .iter()
+                .map(|round| u64::from(round.victim_hits))
+                .sum(),
+        };
+        if aggregate.route_lookups
+            != aggregate
+                .hot_hits
+                .checked_add(aggregate.mapped_cold_selections)?
+            || aggregate.chained_promotion_loads > aggregate.mapped_cold_selections
+            || aggregate.chained_promotion_read_bytes
+                != aggregate
+                    .chained_promotion_loads
+                    .checked_mul(self.geometry.record_payload_bytes)?
+        {
+            return None;
+        }
+
+        let forwarded_decode_tokens = self
+            .rounds
+            .iter()
+            .map(|round| 1usize.saturating_add(round.useful_accepted_drafts))
+            .sum::<usize>();
+        if forwarded_decode_tokens.checked_add(terminal_unforwarded_tokens)?
+            != response_completion_tokens
+        {
+            return None;
+        }
+        let proposed_drafts = self.rounds.iter().map(|round| round.proposed_k).sum();
+        let accepted_drafts = self.rounds.iter().map(|round| round.accepted_drafts).sum();
+        let receipt_round_wall_ms = self
+            .rounds
+            .iter()
+            .map(|round| round.receipt_round_wall_ms)
+            .sum::<f64>();
+        if !receipt_round_wall_ms.is_finite() || receipt_round_wall_ms <= 0.0 {
+            return None;
+        }
+        let full_round = |round: &&Gemma4HybridTelemetryRound| {
+            round.requested_k == 8
+                && round.proposed_k == 7
+                && round.verifier_k == 8
+                && !round.budget_truncated
+        };
+        let full_round_zero_accepts = self
+            .rounds
+            .iter()
+            .filter(full_round)
+            .filter(|round| round.accepted_drafts == 0)
+            .count();
+        let max_full_assistant_exposed_ms = self
+            .rounds
+            .iter()
+            .filter(full_round)
+            .map(|round| round.assistant_exposed_ms)
+            .fold(0.0f64, f64::max);
+        let metrics = Gemma4HybridTelemetryMetrics {
+            forwarded_decode_tokens,
+            terminal_unforwarded_tokens,
+            response_completion_tokens,
+            receipt_round_wall_ms,
+            proposed_drafts,
+            accepted_drafts,
+            decode_tokens_per_second: forwarded_decode_tokens as f64
+                / (receipt_round_wall_ms / 1_000.0),
+            full_round_zero_accepts,
+            max_full_assistant_exposed_ms,
+            outer_lookahead_nonzero_count: 0,
+            outer_lookahead_observation: "build_invariant_no_outer_lookahead_path",
+        };
+
+        Some(Gemma4HybridTelemetry {
+            schema_version: 1,
+            scope: "single_completed_measured_request",
+            geometry: self.geometry,
+            route_interval: Gemma4HybridTelemetryRouteInterval {
+                scope: "measured_request_prefill_plus_generation",
+                epoch: after.interval_routed_expert_union_epoch,
+                routed_expert_ids_per_layer: after.interval_routed_expert_ids_per_layer,
+                routed_unique_per_layer: after.interval_routed_unique_per_layer,
+                routed_unique_experts_sum: after.interval_routed_unique_experts_sum,
+                routed_unique_experts_max: after.interval_routed_unique_experts_max,
+            },
+            rounds: self.rounds,
+            aggregate,
+            metrics,
+        })
+    }
+}
+
+fn exact_hybrid_telemetry_geometry(
+    snapshot: &Gemma4RoutedExpertResidencySnapshot,
+) -> Option<Gemma4HybridTelemetryGeometry> {
+    let layers = HYBRID_TELEMETRY_LAYERS as u64;
+    let logical_total = layers.checked_mul(HYBRID_TELEMETRY_LOGICAL_PER_LAYER)?;
+    let hot_total = layers.checked_mul(HYBRID_TELEMETRY_HOT_PER_LAYER)?;
+    let hot_bytes = hot_total.checked_mul(HYBRID_TELEMETRY_STRIDE_BYTES)?;
+    let mapped_span = logical_total.checked_mul(HYBRID_TELEMETRY_STRIDE_BYTES)?;
+    if snapshot.layer_count != HYBRID_TELEMETRY_LAYERS as u32
+        || snapshot.slot_record_bytes != HYBRID_TELEMETRY_RECORD_BYTES
+        || snapshot.slot_stride_bytes != HYBRID_TELEMETRY_STRIDE_BYTES
+        || snapshot.base_slot_capacity != logical_total
+        || snapshot.base_slot_capacity_bytes
+            != logical_total.checked_mul(HYBRID_TELEMETRY_STRIDE_BYTES)?
+        || snapshot.anonymous_slot_capacity != hot_total
+        || snapshot.anonymous_slot_capacity_bytes != hot_bytes
+        || snapshot.physical_base_slot_budget != hot_total
+        || snapshot.physical_base_slot_budget_bytes != hot_bytes
+        || snapshot.file_mapped_addressable_slots != logical_total
+        || snapshot.file_mapped_address_span_bytes != mapped_span
+        || snapshot.overflow_slot_capacity != 0
+        || snapshot.overflow_capacity_bytes != 0
+        || snapshot.victim_record_capacity != 0
+        || snapshot.victim_capacity_bytes != 0
+        || snapshot.host_cache_budget_bytes != 0
+        || snapshot.per_layer.len() != HYBRID_TELEMETRY_LAYERS
+    {
+        return None;
+    }
+    let mut per_layer = Vec::with_capacity(HYBRID_TELEMETRY_LAYERS);
+    for (layer, observed) in snapshot.per_layer.iter().enumerate() {
+        let mapped_layer_span =
+            HYBRID_TELEMETRY_LOGICAL_PER_LAYER.checked_mul(HYBRID_TELEMETRY_STRIDE_BYTES)?;
+        let hot_layer_bytes =
+            HYBRID_TELEMETRY_HOT_PER_LAYER.checked_mul(HYBRID_TELEMETRY_STRIDE_BYTES)?;
+        if observed.layer_index != layer as u32
+            || observed.base_slot_capacity != HYBRID_TELEMETRY_LOGICAL_PER_LAYER
+            || observed.anonymous_slot_capacity != HYBRID_TELEMETRY_HOT_PER_LAYER
+            || observed.anonymous_slot_capacity_bytes != hot_layer_bytes
+            || observed.physical_base_slot_budget != HYBRID_TELEMETRY_HOT_PER_LAYER
+            || observed.physical_base_slot_budget_bytes != hot_layer_bytes
+            || observed.file_mapped_addressable_slots != HYBRID_TELEMETRY_LOGICAL_PER_LAYER
+            || observed.file_mapped_address_span_bytes != mapped_layer_span
+        {
+            return None;
+        }
+        per_layer.push(Gemma4HybridTelemetryLayerGeometry {
+            layer: layer as u32,
+            logical_addressable_slots: observed.base_slot_capacity,
+            anonymous_hot_capacity_slots: observed.anonymous_slot_capacity,
+            anonymous_hot_capacity_bytes: observed.anonymous_slot_capacity_bytes,
+            file_mapped_addressable_slots: observed.file_mapped_addressable_slots,
+            file_mapped_address_span_bytes: observed.file_mapped_address_span_bytes,
+            overflow_slots: 0,
+            victim_slots: 0,
+        });
+    }
+    Some(Gemma4HybridTelemetryGeometry {
+        layers: snapshot.layer_count,
+        record_payload_bytes: snapshot.slot_record_bytes,
+        slot_stride_bytes: snapshot.slot_stride_bytes,
+        logical_addressable_slots: snapshot.base_slot_capacity,
+        anonymous_hot_capacity_slots: snapshot.anonymous_slot_capacity,
+        anonymous_hot_capacity_bytes: snapshot.anonymous_slot_capacity_bytes,
+        file_mapped_addressable_slots: snapshot.file_mapped_addressable_slots,
+        file_mapped_address_span_bytes: snapshot.file_mapped_address_span_bytes,
+        overflow_slots: snapshot.overflow_slot_capacity,
+        overflow_capacity_bytes: snapshot.overflow_capacity_bytes,
+        victim_record_capacity: snapshot.victim_record_capacity,
+        victim_capacity_bytes: snapshot.victim_capacity_bytes,
+        host_cache_budget_bytes: snapshot.host_cache_budget_bytes,
+        per_layer,
+    })
 }
 
 /// Stable observation points for the isolated, load-only Ghost/MTP residency
@@ -8870,7 +9439,11 @@ impl Gemma4Runtime {
                 let assistant = if assistant_path.is_file() {
                     match crate::metal::Gemma4MtpAssistantMetal::load(&assistant_path) {
                         Ok(a) => {
-                            eprintln!("[gemma4-mtp] MTP QAT assistant loaded from {:?} (100+ tok/s speculative enabled)", assistant_path);
+                            eprintln!(
+                                "[gemma4-mtp] MTP QAT assistant loaded from {:?} lm_head={} (speculative enabled)",
+                                assistant_path,
+                                if a.q4_head_enabled() { "q4_0" } else { "bf16" },
+                            );
                             Some(a)
                         }
                         Err(e) => {
@@ -9102,6 +9675,8 @@ impl Gemma4Runtime {
                 per_layer.push(Gemma4RoutedExpertLayerResidencySnapshot {
                     layer_index: layer_index as u32,
                     base_slot_capacity: capacity,
+                    anonymous_slot_capacity: layer.slots.anonymous_slot_count() as u64,
+                    anonymous_slot_capacity_bytes: layer.slots.anonymous_capacity_bytes() as u64,
                     physical_base_slot_budget: physical_budget,
                     physical_base_slot_budget_bytes: physical_budget.saturating_mul(stride_bytes),
                     file_mapped_addressable_slots,
@@ -9115,6 +9690,14 @@ impl Gemma4Runtime {
             let base_slot_capacity = per_layer
                 .iter()
                 .map(|layer| layer.base_slot_capacity)
+                .sum::<u64>();
+            let anonymous_slot_capacity = per_layer
+                .iter()
+                .map(|layer| layer.anonymous_slot_capacity)
+                .sum::<u64>();
+            let anonymous_slot_capacity_bytes = per_layer
+                .iter()
+                .map(|layer| layer.anonymous_slot_capacity_bytes)
                 .sum::<u64>();
             let physical_base_slot_budget = per_layer
                 .iter()
@@ -9177,6 +9760,8 @@ impl Gemma4Runtime {
                 slot_stride_bytes: stride_bytes,
                 base_slot_capacity,
                 base_slot_capacity_bytes: base_slot_capacity.saturating_mul(stride_bytes),
+                anonymous_slot_capacity,
+                anonymous_slot_capacity_bytes,
                 physical_base_slot_budget,
                 physical_base_slot_budget_bytes: physical_base_slot_budget
                     .saturating_mul(stride_bytes),
@@ -9185,6 +9770,10 @@ impl Gemma4Runtime {
                 occupied_base_slots,
                 occupied_base_payload_bytes: occupied_base_slots.saturating_mul(record_bytes),
                 occupied_base_touched_bytes: occupied_base_slots.saturating_mul(stride_bytes),
+                overflow_slot_capacity: lane.overflow_slot_capacity() as u64,
+                overflow_capacity_bytes: lane.overflow_capacity_bytes() as u64,
+                victim_record_capacity: lane.victim_record_capacity() as u64,
+                victim_capacity_bytes: lane.victim_capacity_bytes() as u64,
                 per_layer,
                 aggregate_slot_stats,
                 cumulative_chained_demand_loads: lane.chained_demand_loads,
@@ -13912,7 +14501,28 @@ impl Gemma4Runtime {
         max_new: usize,
         should_cancel: C,
     ) -> Result<Gemma4GenerationOutcome> {
-        self.generate_greedy_controlled(prompt, max_new, None::<fn(&str)>, should_cancel)
+        self.generate_greedy_controlled(prompt, max_new, None::<fn(&str)>, should_cancel, None)
+    }
+
+    /// Non-streaming serve seam that preserves [`Gemma4GenerationOutcome`]
+    /// unchanged and returns the exact-hybrid receipt as an optional sidecar.
+    /// Every non-hybrid, non-chained, failed, cancelled, or structurally
+    /// incomplete observation returns `None` for the sidecar.
+    pub fn generate_greedy_cancellable_with_hybrid_telemetry<C: FnMut() -> bool>(
+        &self,
+        prompt: &str,
+        max_new: usize,
+        should_cancel: C,
+    ) -> Result<(Gemma4GenerationOutcome, Option<Gemma4HybridTelemetry>)> {
+        let mut hybrid_telemetry = None;
+        let outcome = self.generate_greedy_controlled(
+            prompt,
+            max_new,
+            None::<fn(&str)>,
+            should_cancel,
+            Some(&mut hybrid_telemetry),
+        )?;
+        Ok((outcome, hybrid_telemetry))
     }
 
     /// Streaming counterpart to [`Self::generate_greedy_cancellable`].
@@ -13923,7 +14533,7 @@ impl Gemma4Runtime {
         on_delta: F,
         should_cancel: C,
     ) -> Result<Gemma4GenerationOutcome> {
-        self.generate_greedy_controlled(prompt, max_new, Some(on_delta), should_cancel)
+        self.generate_greedy_controlled(prompt, max_new, Some(on_delta), should_cancel, None)
     }
 
     fn generate_greedy_controlled<F: FnMut(&str), C: FnMut() -> bool>(
@@ -13932,6 +14542,7 @@ impl Gemma4Runtime {
         max_new: usize,
         mut on_delta: Option<F>,
         mut should_cancel: C,
+        mut hybrid_telemetry_out: Option<&mut Option<Gemma4HybridTelemetry>>,
     ) -> Result<Gemma4GenerationOutcome> {
         #[cfg(target_os = "macos")]
         let _ghost_common_request = self.lock_ghost_common_generation()?;
@@ -13947,6 +14558,26 @@ impl Gemma4Runtime {
             eprintln!("[prompt tokens] {prompt_tokens:?}");
         }
         let eot = gemma4_stop_token_ids(&self.tokenizer);
+        if let Some(output) = hybrid_telemetry_out.as_mut() {
+            **output = None;
+        }
+        // Only the non-streaming receipted API asks for this interval. Inspect
+        // first so another lane is not even given a telemetry-epoch mutation;
+        // then clear the exact hybrid route union immediately before measured
+        // prefill and bind the baseline to the new epoch.
+        let mut hybrid_collector = if hybrid_telemetry_out.is_some()
+            && self
+                .routed_expert_residency_snapshot()
+                .as_ref()
+                .and_then(exact_hybrid_telemetry_geometry)
+                .is_some()
+            && self.begin_routed_expert_telemetry_interval()
+        {
+            self.routed_expert_residency_snapshot()
+                .and_then(Gemma4HybridTelemetryCollector::begin)
+        } else {
+            None
+        };
         let Some(mut logits) = self.prefill_tokens_cancellable(
             &prompt_tokens,
             &mut kc,
@@ -13967,8 +14598,20 @@ impl Gemma4Runtime {
         {
             let mut guard = self.mtp_assistant.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(assistant) = guard.as_mut() {
+                // The experiment may fall back to its BF16 tied projection if
+                // Q4 packing failed at load. Generation remains available, but
+                // the strict receipt is omitted rather than mislabelling it.
+                if !assistant.q4_head_enabled() {
+                    hybrid_collector = None;
+                }
                 let mut stream_tokens = Vec::new();
                 let mut emit_committed = |round: &Gemma4MtpGenerationRound| {
+                    if let Some(collector) = hybrid_collector.as_mut() {
+                        collector.capture_round(
+                            Gemma4HybridRoundInput::from(round),
+                            self.routed_expert_residency_snapshot(),
+                        );
+                    }
                     if let Some(on_delta_fn) = on_delta.as_mut() {
                         for &t in &round.committed_tokens {
                             stream_tokens.push(t);
@@ -13994,10 +14637,21 @@ impl Gemma4Runtime {
                     &mut (|| should_cancel()),
                     Some(&mut emit_committed),
                 )?;
+                drop(emit_committed);
                 if result.aborted {
                     return Ok(Gemma4GenerationOutcome::Cancelled {
                         generated_tokens: result.generated_tokens.len(),
                     });
+                }
+                let hybrid_telemetry = hybrid_collector.take().and_then(|collector| {
+                    collector.finish(
+                        self.routed_expert_residency_snapshot(),
+                        result.generated_tokens.len(),
+                        usize::from(result.terminal_unforwarded_target_token.is_some()),
+                    )
+                });
+                if let Some(output) = hybrid_telemetry_out.as_mut() {
+                    **output = hybrid_telemetry;
                 }
                 let text = if on_delta.is_some() {
                     emitted
@@ -14090,7 +14744,12 @@ impl Gemma4Runtime {
                         generated_tokens: generated.len(),
                     });
                 }
-                logits = if self.supports_speculative_chunk_forward() {
+                let round_index = hybrid_collector
+                    .as_ref()
+                    .map_or(0, |collector| collector.rounds.len());
+                let verify_gpu_before = spec_experiment_gpu_snapshot(hybrid_collector.is_some());
+                let verify_started = std::time::Instant::now();
+                let next_logits = if self.supports_speculative_chunk_forward() {
                     self.step_chunk(&[next], pos, &mut kc, &mut vc)?
                         .into_iter()
                         .next()
@@ -14098,6 +14757,32 @@ impl Gemma4Runtime {
                 } else {
                     self.step(next, pos, &mut kc, &mut vc)?
                 };
+                let verifier_wall_us = mtp_us_saturating(verify_started.elapsed().as_micros());
+                let verifier_gpu_us = spec_experiment_gpu_delta(verify_gpu_before);
+                if let Some(collector) = hybrid_collector.as_mut() {
+                    collector.capture_round(
+                        Gemma4HybridRoundInput {
+                            round_index,
+                            prefix_tokens_before: pos,
+                            bootstrap: false,
+                            remaining_budget_before: max_new.saturating_sub(generated_index),
+                            requested_k: 1,
+                            proposed_k: 0,
+                            verifier_k: 1,
+                            budget_truncated: false,
+                            accepted_drafts: 0,
+                            useful_accepted_drafts: 0,
+                            committed_tokens: vec![next],
+                            assistant_wall_us: 0,
+                            assistant_gpu_us: 0,
+                            verifier_wall_us,
+                            verifier_gpu_us,
+                            total_wall_us: verifier_wall_us,
+                        },
+                        self.routed_expert_residency_snapshot(),
+                    );
+                }
+                logits = next_logits;
                 pos += 1;
             }
         }
@@ -14109,6 +14794,18 @@ impl Gemma4Runtime {
         } else {
             self.tokenizer.decode(&generated, true)?
         };
+        let hybrid_telemetry = hybrid_collector.take().and_then(|collector| {
+            let forwarded = collector.forwarded_decode_tokens()?;
+            let terminal_unforwarded_tokens = generated.len().checked_sub(forwarded)?;
+            collector.finish(
+                self.routed_expert_residency_snapshot(),
+                generated.len(),
+                terminal_unforwarded_tokens,
+            )
+        });
+        if let Some(output) = hybrid_telemetry_out.as_mut() {
+            **output = hybrid_telemetry;
+        }
         Ok(Gemma4GenerationOutcome::Complete {
             text,
             token_ids: generated,
@@ -19925,6 +20622,303 @@ impl Gemma4CudaResident {
 #[cfg(test)]
 mod mtp_target_seam_tests {
     use super::*;
+
+    fn exact_hybrid_snapshot(
+        chained_sequence: u64,
+        chained_k: Option<u32>,
+        hot_per_layer: u16,
+        mapped_per_layer: u16,
+    ) -> Gemma4RoutedExpertResidencySnapshot {
+        let stride = HYBRID_TELEMETRY_STRIDE_BYTES;
+        let per_layer = (0..HYBRID_TELEMETRY_LAYERS)
+            .map(|layer| Gemma4RoutedExpertLayerResidencySnapshot {
+                layer_index: layer as u32,
+                base_slot_capacity: HYBRID_TELEMETRY_LOGICAL_PER_LAYER,
+                anonymous_slot_capacity: HYBRID_TELEMETRY_HOT_PER_LAYER,
+                anonymous_slot_capacity_bytes: HYBRID_TELEMETRY_HOT_PER_LAYER * stride,
+                physical_base_slot_budget: HYBRID_TELEMETRY_HOT_PER_LAYER,
+                physical_base_slot_budget_bytes: HYBRID_TELEMETRY_HOT_PER_LAYER * stride,
+                file_mapped_addressable_slots: HYBRID_TELEMETRY_LOGICAL_PER_LAYER,
+                file_mapped_address_span_bytes: HYBRID_TELEMETRY_LOGICAL_PER_LAYER * stride,
+                ..Gemma4RoutedExpertLayerResidencySnapshot::default()
+            })
+            .collect::<Vec<_>>();
+        let logical_total = HYBRID_TELEMETRY_LAYERS as u64 * HYBRID_TELEMETRY_LOGICAL_PER_LAYER;
+        let hot_total = HYBRID_TELEMETRY_LAYERS as u64 * HYBRID_TELEMETRY_HOT_PER_LAYER;
+        let active = hot_per_layer.saturating_add(mapped_per_layer);
+        Gemma4RoutedExpertResidencySnapshot {
+            layer_count: HYBRID_TELEMETRY_LAYERS as u32,
+            slot_record_bytes: HYBRID_TELEMETRY_RECORD_BYTES,
+            slot_stride_bytes: stride,
+            base_slot_capacity: logical_total,
+            base_slot_capacity_bytes: logical_total * stride,
+            anonymous_slot_capacity: hot_total,
+            anonymous_slot_capacity_bytes: hot_total * stride,
+            physical_base_slot_budget: hot_total,
+            physical_base_slot_budget_bytes: hot_total * stride,
+            file_mapped_addressable_slots: logical_total,
+            file_mapped_address_span_bytes: logical_total * stride,
+            per_layer,
+            interval_routed_expert_union_scope:
+                "since_latest_explicit_telemetry_interval_begin_or_runtime_load".into(),
+            interval_routed_expert_union_epoch: 7,
+            interval_routed_expert_ids_per_layer: vec![Vec::new(); HYBRID_TELEMETRY_LAYERS],
+            interval_routed_unique_per_layer: vec![0; HYBRID_TELEMETRY_LAYERS],
+            last_chained_ledger_scope:
+                "latest_completed_chained_attempt_only_not_generation_maximum".into(),
+            last_chained_round_available: chained_k.is_some(),
+            last_chained_round_succeeded: chained_k.is_some(),
+            last_chained_round_sequence: chained_sequence,
+            last_chained_k: chained_k,
+            last_chained_unique_per_layer: vec![active; HYBRID_TELEMETRY_LAYERS],
+            last_chained_unique_experts_sum: u32::from(active) * HYBRID_TELEMETRY_LAYERS as u32,
+            last_chained_unique_experts_max: u32::from(active),
+            last_chained_hot_bound_per_layer: vec![hot_per_layer; HYBRID_TELEMETRY_LAYERS],
+            last_chained_mapped_bound_per_layer: vec![mapped_per_layer; HYBRID_TELEMETRY_LAYERS],
+            last_chained_hot_bound_records: u32::from(hot_per_layer)
+                * HYBRID_TELEMETRY_LAYERS as u32,
+            last_chained_mapped_bound_records: u32::from(mapped_per_layer)
+                * HYBRID_TELEMETRY_LAYERS as u32,
+            last_chained_slot_hits: u32::from(hot_per_layer) * HYBRID_TELEMETRY_LAYERS as u32,
+            last_chained_slot_misses: u32::from(mapped_per_layer) * HYBRID_TELEMETRY_LAYERS as u32,
+            ..Gemma4RoutedExpertResidencySnapshot::default()
+        }
+    }
+
+    fn k8_round_input() -> Gemma4HybridRoundInput {
+        Gemma4HybridRoundInput {
+            round_index: 0,
+            prefix_tokens_before: 32,
+            bootstrap: false,
+            remaining_budget_before: 48,
+            requested_k: 8,
+            proposed_k: 7,
+            verifier_k: 8,
+            budget_truncated: false,
+            accepted_drafts: 5,
+            useful_accepted_drafts: 5,
+            committed_tokens: vec![10, 11, 12, 13, 14, 15],
+            assistant_wall_us: 20_000,
+            assistant_gpu_us: 15_000,
+            verifier_wall_us: 70_000,
+            verifier_gpu_us: 50_000,
+            total_wall_us: 100_000,
+        }
+    }
+
+    fn complete_k8_telemetry() -> Gemma4HybridTelemetry {
+        let mut before = exact_hybrid_snapshot(10, None, 0, 0);
+        before.aggregate_slot_stats = Gemma4RoutedExpertSlotStatsSnapshot {
+            route_lookups: 100,
+            hits: 60,
+            misses: 40,
+            ..Gemma4RoutedExpertSlotStatsSnapshot::default()
+        };
+        let mut collector =
+            Gemma4HybridTelemetryCollector::begin(before.clone()).expect("exact hybrid baseline");
+        let mut after = exact_hybrid_snapshot(11, Some(8), 10, 6);
+        after.aggregate_slot_stats = Gemma4RoutedExpertSlotStatsSnapshot {
+            route_lookups: 580,
+            hits: 360,
+            misses: 220,
+            ..Gemma4RoutedExpertSlotStatsSnapshot::default()
+        };
+        after.cumulative_chained_demand_loads = 5;
+        after.cumulative_chained_demand_read_bytes = 5 * HYBRID_TELEMETRY_RECORD_BYTES;
+        after.interval_routed_expert_ids_per_layer = vec![vec![1, 2, 3]; HYBRID_TELEMETRY_LAYERS];
+        after.interval_routed_unique_per_layer = vec![3; HYBRID_TELEMETRY_LAYERS];
+        after.interval_routed_unique_experts_sum = 3 * HYBRID_TELEMETRY_LAYERS as u32;
+        after.interval_routed_unique_experts_max = 3;
+        collector.capture_round(k8_round_input(), Some(after.clone()));
+        collector
+            .finish(Some(after), 6, 0)
+            .expect("complete strict telemetry")
+    }
+
+    #[test]
+    fn hybrid_telemetry_serializes_exact_schema_and_truthful_deltas() {
+        let telemetry = complete_k8_telemetry();
+        assert_eq!(telemetry.aggregate.route_lookups, 480);
+        assert_eq!(telemetry.aggregate.hot_hits, 300);
+        assert_eq!(telemetry.aggregate.mapped_cold_selections, 180);
+        assert_eq!(telemetry.aggregate.chained_promotion_loads, 5);
+        assert_eq!(telemetry.metrics.forwarded_decode_tokens, 6);
+        assert_eq!(telemetry.metrics.decode_tokens_per_second, 60.0);
+        assert_eq!(telemetry.metrics.max_full_assistant_exposed_ms, 20.0);
+
+        let value = serde_json::to_value(&telemetry).expect("finite telemetry JSON");
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["scope"], "single_completed_measured_request");
+        assert_eq!(
+            value["route_interval"]["scope"],
+            "measured_request_prefill_plus_generation"
+        );
+        assert_eq!(value["geometry"]["logical_addressable_slots"], 3_840);
+        assert_eq!(value["geometry"]["anonymous_hot_capacity_slots"], 1_440);
+        assert_eq!(value["geometry"]["victim_record_capacity"], 0);
+        assert_eq!(value["geometry"]["per_layer"][0]["layer"], 0);
+        assert_eq!(value["rounds"][0]["per_layer"][0]["layer_index"], 0);
+        assert_eq!(value["rounds"][0]["per_layer"][0]["mapped_bound"], 6);
+        assert!(value["rounds"][0]["per_layer"][0]
+            .get("selected_dropped")
+            .is_none());
+        assert!(value["geometry"]
+            .get("anonymous_hot_locked_bytes")
+            .is_none());
+    }
+
+    #[test]
+    fn hybrid_telemetry_k1_reconciles_forwarded_and_terminal_tokens() {
+        let before = exact_hybrid_snapshot(20, None, 0, 0);
+        let mut collector =
+            Gemma4HybridTelemetryCollector::begin(before).expect("exact hybrid baseline");
+        let mut after = exact_hybrid_snapshot(21, Some(1), 8, 0);
+        after.aggregate_slot_stats = Gemma4RoutedExpertSlotStatsSnapshot {
+            route_lookups: 240,
+            hits: 240,
+            ..Gemma4RoutedExpertSlotStatsSnapshot::default()
+        };
+        collector.capture_round(
+            Gemma4HybridRoundInput {
+                round_index: 0,
+                prefix_tokens_before: 32,
+                bootstrap: false,
+                remaining_budget_before: 2,
+                requested_k: 1,
+                proposed_k: 0,
+                verifier_k: 1,
+                budget_truncated: false,
+                accepted_drafts: 0,
+                useful_accepted_drafts: 0,
+                committed_tokens: vec![10],
+                assistant_wall_us: 0,
+                assistant_gpu_us: 0,
+                verifier_wall_us: 50_000,
+                verifier_gpu_us: 40_000,
+                total_wall_us: 50_000,
+            },
+            Some(after.clone()),
+        );
+        let telemetry = collector
+            .finish(Some(after), 2, 1)
+            .expect("K1 receipt reconciles");
+        assert_eq!(telemetry.rounds.len(), 1);
+        assert_eq!(telemetry.rounds[0].assistant_exposed_ms, 0.0);
+        assert_eq!(telemetry.metrics.forwarded_decode_tokens, 1);
+        assert_eq!(telemetry.metrics.terminal_unforwarded_tokens, 1);
+        assert_eq!(telemetry.metrics.response_completion_tokens, 2);
+        assert_eq!(telemetry.metrics.proposed_drafts, 0);
+        assert_eq!(telemetry.metrics.accepted_drafts, 0);
+
+        let before = exact_hybrid_snapshot(30, None, 0, 0);
+        let mut collector =
+            Gemma4HybridTelemetryCollector::begin(before).expect("exact hybrid baseline");
+        let mut after = exact_hybrid_snapshot(31, Some(1), 8, 0);
+        after.aggregate_slot_stats = Gemma4RoutedExpertSlotStatsSnapshot {
+            route_lookups: 240,
+            hits: 240,
+            ..Gemma4RoutedExpertSlotStatsSnapshot::default()
+        };
+        let mut input = k8_round_input();
+        input.requested_k = 1;
+        input.proposed_k = 0;
+        input.verifier_k = 1;
+        input.accepted_drafts = 0;
+        input.useful_accepted_drafts = 0;
+        input.committed_tokens = vec![10];
+        input.assistant_wall_us = 0;
+        input.assistant_gpu_us = 0;
+        collector.capture_round(input, Some(after.clone()));
+        assert!(
+            collector.finish(Some(after), 2, 0).is_none(),
+            "one forwarded K1 token cannot reconcile a two-token response without the terminal token"
+        );
+    }
+
+    #[test]
+    fn hybrid_telemetry_omits_non_hybrid_and_corrupt_geometry() {
+        let mut non_hybrid = exact_hybrid_snapshot(10, None, 0, 0);
+        non_hybrid.anonymous_slot_capacity = 0;
+        non_hybrid.anonymous_slot_capacity_bytes = 0;
+        assert!(Gemma4HybridTelemetryCollector::begin(non_hybrid).is_none());
+
+        let mut corrupt = exact_hybrid_snapshot(10, None, 0, 0);
+        corrupt.physical_base_slot_budget_bytes -= 1;
+        assert!(Gemma4HybridTelemetryCollector::begin(corrupt).is_none());
+    }
+
+    #[test]
+    fn hybrid_telemetry_rejects_stale_sequence_and_tier_partition_drift() {
+        let before = exact_hybrid_snapshot(10, None, 0, 0);
+        let mut collector = Gemma4HybridTelemetryCollector::begin(before).expect("exact baseline");
+        let stale = exact_hybrid_snapshot(10, Some(8), 10, 6);
+        collector.capture_round(k8_round_input(), Some(stale.clone()));
+        assert!(collector.finish(Some(stale), 6, 0).is_none());
+
+        let before = exact_hybrid_snapshot(20, None, 0, 0);
+        let mut collector = Gemma4HybridTelemetryCollector::begin(before).expect("exact baseline");
+        let mut partition_drift = exact_hybrid_snapshot(21, Some(8), 10, 6);
+        partition_drift.last_chained_unique_per_layer[7] = 15;
+        collector.capture_round(k8_round_input(), Some(partition_drift.clone()));
+        assert!(collector.finish(Some(partition_drift), 6, 0).is_none());
+    }
+
+    #[test]
+    fn hybrid_telemetry_rejects_unobserved_or_failed_final_chained_state() {
+        let before = exact_hybrid_snapshot(10, None, 0, 0);
+        let mut collector = Gemma4HybridTelemetryCollector::begin(before).expect("exact baseline");
+        let captured = exact_hybrid_snapshot(11, Some(8), 10, 6);
+        collector.capture_round(k8_round_input(), Some(captured));
+
+        let unobserved = exact_hybrid_snapshot(12, Some(8), 10, 6);
+        assert!(collector.finish(Some(unobserved), 6, 0).is_none());
+
+        let before = exact_hybrid_snapshot(20, None, 0, 0);
+        let mut collector = Gemma4HybridTelemetryCollector::begin(before).expect("exact baseline");
+        let captured = exact_hybrid_snapshot(21, Some(8), 10, 6);
+        collector.capture_round(k8_round_input(), Some(captured.clone()));
+        let mut failed = captured;
+        failed.last_chained_round_succeeded = false;
+        assert!(collector.finish(Some(failed), 6, 0).is_none());
+    }
+
+    #[test]
+    fn hybrid_telemetry_rejects_counter_regression() {
+        let mut before = exact_hybrid_snapshot(10, None, 0, 0);
+        before.aggregate_slot_stats = Gemma4RoutedExpertSlotStatsSnapshot {
+            route_lookups: 500,
+            hits: 300,
+            misses: 200,
+            ..Gemma4RoutedExpertSlotStatsSnapshot::default()
+        };
+        let mut collector = Gemma4HybridTelemetryCollector::begin(before).expect("exact baseline");
+        let mut after = exact_hybrid_snapshot(11, Some(8), 10, 6);
+        after.aggregate_slot_stats = Gemma4RoutedExpertSlotStatsSnapshot {
+            route_lookups: 480,
+            hits: 300,
+            misses: 180,
+            ..Gemma4RoutedExpertSlotStatsSnapshot::default()
+        };
+        collector.capture_round(k8_round_input(), Some(after.clone()));
+        assert!(collector.finish(Some(after), 6, 0).is_none());
+    }
+
+    #[test]
+    fn hybrid_telemetry_rejects_unreconciled_promotion_io() {
+        let before = exact_hybrid_snapshot(10, None, 0, 0);
+        let mut collector = Gemma4HybridTelemetryCollector::begin(before).expect("exact baseline");
+        let mut after = exact_hybrid_snapshot(11, Some(8), 10, 6);
+        after.aggregate_slot_stats = Gemma4RoutedExpertSlotStatsSnapshot {
+            route_lookups: 480,
+            hits: 300,
+            misses: 180,
+            ..Gemma4RoutedExpertSlotStatsSnapshot::default()
+        };
+        after.cumulative_chained_demand_loads = 2;
+        after.cumulative_chained_demand_read_bytes = HYBRID_TELEMETRY_RECORD_BYTES;
+        collector.capture_round(k8_round_input(), Some(after.clone()));
+        assert!(collector.finish(Some(after), 6, 0).is_none());
+    }
 
     #[test]
     fn mtp_argmax_matches_shipping_higher_id_tie_policy_and_fails_closed() {

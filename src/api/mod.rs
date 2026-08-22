@@ -10322,6 +10322,45 @@ impl Gemma4ServeRuntime {
         }
     }
 
+    /// Non-streaming serve variant carrying strict hybrid telemetry beside the
+    /// unchanged generation outcome. Only the local exact-hybrid runtime can
+    /// produce the sidecar; every other serve backend explicitly returns None.
+    fn generate_greedy_cancellable_receipted<C: FnMut() -> bool>(
+        &self,
+        prompt: &str,
+        max_new: usize,
+        should_cancel: C,
+    ) -> crate::Result<(
+        crate::gemma4_runtime::Gemma4GenerationOutcome,
+        Option<crate::gemma4_runtime::Gemma4HybridTelemetry>,
+    )> {
+        match self {
+            Self::Local(runtime) => runtime.generate_greedy_cancellable_with_hybrid_telemetry(
+                prompt,
+                max_new,
+                should_cancel,
+            ),
+            Self::Distributed(runtime) => runtime
+                .generate_greedy_cancellable(prompt, max_new, should_cancel)
+                .map(|outcome| (outcome, None)),
+            #[cfg(target_os = "macos")]
+            Self::Gpu(runtime) => runtime
+                .lock()
+                .expect("gemma4 gpu runtime lock")
+                .generate_greedy_cancellable(prompt, max_new, should_cancel)
+                .map(|outcome| (outcome, None)),
+            #[cfg(feature = "cuda")]
+            Self::Cuda {
+                runtime: runtime_mutex,
+                ..
+            } => runtime_mutex
+                .lock()
+                .expect("gemma4 cuda runtime lock")
+                .generate_greedy_cancellable(prompt, max_new, should_cancel)
+                .map(|outcome| (outcome, None)),
+        }
+    }
+
     fn generate_greedy_streaming_cancellable<F: FnMut(&str), C: FnMut() -> bool>(
         &self,
         prompt: &str,
@@ -10381,6 +10420,40 @@ async fn gemma4_generate_on_engine(
 ) -> std::result::Result<crate::gemma4_runtime::Gemma4GenerationOutcome, Box<Response>> {
     match run_cancellable_gemma4_job(state, move |worker_cancel| {
         runtime.generate_greedy_cancellable(&prompt, max_tokens, || worker_cancel.is_cancelled())
+    })
+    .await
+    {
+        Ok(Ok(outcome)) => Ok(outcome),
+        Ok(Err(error)) => Err(Box::new(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "generation_error",
+            error.to_string(),
+            None,
+        ))),
+        Err(error) => Err(engine_post_error_response(error)),
+    }
+}
+
+/// Receipt-enabled counterpart used only by an explicitly opted-in,
+/// non-streaming Gemma chat. Raw completions, streaming, and ordinary chat keep
+/// their established generation path and do not reset route intervals or take
+/// receipt snapshots that they will discard.
+async fn gemma4_generate_receipted_on_engine(
+    state: &AppState,
+    runtime: Arc<Gemma4ServeRuntime>,
+    prompt: String,
+    max_tokens: usize,
+) -> std::result::Result<
+    (
+        crate::gemma4_runtime::Gemma4GenerationOutcome,
+        Option<crate::gemma4_runtime::Gemma4HybridTelemetry>,
+    ),
+    Box<Response>,
+> {
+    match run_cancellable_gemma4_job(state, move |worker_cancel| {
+        runtime.generate_greedy_cancellable_receipted(&prompt, max_tokens, || {
+            worker_cancel.is_cancelled()
+        })
     })
     .await
     {
@@ -10763,18 +10836,19 @@ async fn gemma4_chat_nonstreaming(
         max_tokens as u32,
         false,
     ));
-    let result = gemma4_generate_on_engine(state, runtime, prompt, max_tokens).await;
+    // Strict hybrid capture is deliberately opt-in. Ordinary requests retain
+    // the original generation path, including no route-interval epoch reset and
+    // no per-round residency snapshots.
+    let result = if req.camelid_receipt.unwrap_or(false) {
+        gemma4_generate_receipted_on_engine(state, runtime, prompt, max_tokens).await
+    } else {
+        gemma4_generate_on_engine(state, runtime, prompt, max_tokens)
+            .await
+            .map(|outcome| (outcome, None))
+    };
     let generate_ms = t_generate.elapsed().as_secs_f64() * 1e3;
-    let (text, ids) = match result {
-        Ok(crate::gemma4_runtime::Gemma4GenerationOutcome::Complete { text, token_ids }) => {
-            (text, token_ids)
-        }
-        Ok(crate::gemma4_runtime::Gemma4GenerationOutcome::Cancelled { generated_tokens }) => {
-            telemetry_guard.finish(gemma4_telemetry_error(
-                "gemma4 generation cancelled by disconnected request".to_string(),
-            ));
-            return *generation_cancelled_response(generated_tokens);
-        }
+    let (outcome, hybrid_telemetry) = match result {
+        Ok(result) => result,
         Err(response) => {
             telemetry_guard.finish(gemma4_telemetry_error(
                 "gemma4 generation failed on the engine worker".to_string(),
@@ -10782,7 +10856,47 @@ async fn gemma4_chat_nonstreaming(
             return *response;
         }
     };
+    let (text, ids) = match outcome {
+        crate::gemma4_runtime::Gemma4GenerationOutcome::Complete { text, token_ids } => {
+            (text, token_ids)
+        }
+        crate::gemma4_runtime::Gemma4GenerationOutcome::Cancelled { generated_tokens } => {
+            telemetry_guard.finish(gemma4_telemetry_error(
+                "gemma4 generation cancelled by disconnected request".to_string(),
+            ));
+            return *generation_cancelled_response(generated_tokens);
+        }
+    };
+    let hybrid_telemetry = match gemma4_hybrid_telemetry_for_response(
+        req.camelid_receipt.unwrap_or(false),
+        hybrid_telemetry.as_ref(),
+    ) {
+        Ok(telemetry) => telemetry,
+        Err(message) => {
+            telemetry_guard.finish(gemma4_telemetry_error(message.to_string()));
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "hybrid_telemetry_unavailable",
+                message.to_string(),
+                Some("camelid_receipt"),
+            );
+        }
+    };
     let finish_reason = gemma4_finish_reason(ids.len(), max_tokens);
+    let camelid = match gemma4_chat_camelid_payload(&ids, generate_ms, hybrid_telemetry) {
+        Ok(camelid) => camelid,
+        Err(error) => {
+            telemetry_guard.finish(gemma4_telemetry_error(
+                "strict hybrid telemetry serialization failed".to_string(),
+            ));
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "generation_error",
+                format!("could not serialize strict hybrid telemetry: {error}"),
+                None,
+            );
+        }
+    };
     telemetry_guard.finish(telemetry::RequestFinish {
         status: "ok",
         finish_reason: Some(finish_reason.to_string()),
@@ -10805,19 +10919,113 @@ async fn gemma4_chat_nonstreaming(
             "finish_reason": finish_reason,
         }],
         "usage": gemma4_usage(prompt_tokens, ids.len()),
-        "camelid": {
-            "generated_token_ids": ids,
-            // Wall-clock totals only: the gemma4 lane does not (yet) report
-            // per-layer timing buckets like the Llama diagnostics do.
-            "timings_ms": {
-                "generate": generate_ms,
-                "generation": { "forward_total": generate_ms },
-                "prompt_evaluation": {},
-                "lane": "gemma4_wall_clock_total_only",
-            },
-        },
+        "camelid": camelid,
     });
     (StatusCode::OK, Json(body)).into_response()
+}
+
+/// Pure response-shape seam for the private Gemma diagnostics object. Keeping
+/// strict telemetry insertion here makes omission on an unreceipted/non-hybrid
+/// response directly testable without loading a model.
+fn gemma4_chat_camelid_payload<T: serde::Serialize>(
+    generated_token_ids: &[u32],
+    generate_ms: f64,
+    hybrid_telemetry: Option<&T>,
+) -> std::result::Result<serde_json::Value, serde_json::Error> {
+    let mut camelid = serde_json::json!({
+        "generated_token_ids": generated_token_ids,
+        // Wall-clock totals only: the gemma4 lane does not (yet) report
+        // per-layer timing buckets like the Llama diagnostics do.
+        "timings_ms": {
+            "generate": generate_ms,
+            "generation": { "forward_total": generate_ms },
+            "prompt_evaluation": {},
+            "lane": "gemma4_wall_clock_total_only",
+        },
+    });
+    if let Some(telemetry) = hybrid_telemetry {
+        camelid["hybrid_telemetry"] = serde_json::to_value(telemetry)?;
+    }
+    Ok(camelid)
+}
+
+fn gemma4_hybrid_telemetry_for_response<'a, T>(
+    receipt_requested: bool,
+    telemetry: Option<&'a T>,
+) -> std::result::Result<Option<&'a T>, &'static str> {
+    if receipt_requested && telemetry.is_none() {
+        Err("camelid_receipt was requested, but the exact hybrid runtime could not produce a complete strict telemetry receipt")
+    } else {
+        Ok(telemetry)
+    }
+}
+
+#[cfg(test)]
+mod gemma4_hybrid_response_tests {
+    use super::*;
+
+    #[test]
+    fn hybrid_telemetry_is_embedded_only_when_present() {
+        let receipt = serde_json::json!({
+            "schema_version": 1,
+            "scope": "single_completed_measured_request",
+        });
+        let embedded = gemma4_chat_camelid_payload(&[11, 12], 25.0, Some(&receipt))
+            .expect("hybrid receipt JSON");
+        assert_eq!(embedded["generated_token_ids"], serde_json::json!([11, 12]));
+        assert_eq!(embedded["hybrid_telemetry"]["schema_version"], 1);
+
+        let omitted = gemma4_chat_camelid_payload::<serde_json::Value>(&[11], 10.0, None)
+            .expect("ordinary response JSON");
+        assert!(omitted.get("hybrid_telemetry").is_none());
+    }
+
+    #[test]
+    fn requested_hybrid_telemetry_cannot_be_silently_omitted() {
+        assert!(gemma4_hybrid_telemetry_for_response::<serde_json::Value>(true, None).is_err());
+        assert!(
+            gemma4_hybrid_telemetry_for_response::<serde_json::Value>(false, None)
+                .expect("ordinary response remains unreceipted")
+                .is_none()
+        );
+        let receipt = serde_json::json!({"schema_version": 1});
+        assert_eq!(
+            gemma4_hybrid_telemetry_for_response(true, Some(&receipt))
+                .expect("requested receipt is present"),
+            Some(&receipt)
+        );
+    }
+
+    #[test]
+    fn receipt_request_shape_rejects_stream_and_multiple_choices() {
+        let ordinary: ChatCompletionRequest =
+            serde_json::from_value(serde_json::json!({})).expect("ordinary request");
+        assert!(validate_chat_receipt_request_shape(&ordinary).is_ok());
+
+        let streaming: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "camelid_receipt": true,
+            "stream": true
+        }))
+        .expect("streaming request");
+        assert_eq!(
+            validate_chat_receipt_request_shape(&streaming)
+                .expect_err("streaming receipt must fail closed")
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let multiple: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "camelid_receipt": true,
+            "n": 2
+        }))
+        .expect("multi-choice request");
+        assert_eq!(
+            validate_chat_receipt_request_shape(&multiple)
+                .expect_err("multi-choice receipt must fail closed")
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
 }
 
 /// Telemetry request identity for the gemma4 serve lane. Prompt token count is
@@ -16066,6 +16274,31 @@ async fn chat_completions_multi_choice(
         .into_response()
 }
 
+fn validate_chat_receipt_request_shape(
+    req: &ChatCompletionRequest,
+) -> std::result::Result<(), Response> {
+    if !req.camelid_receipt.unwrap_or(false) {
+        return Ok(());
+    }
+    if req.stream.unwrap_or(false) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "camelid_receipt is not supported with stream:true; receipts record one complete non-streaming generation".to_string(),
+            Some("camelid_receipt"),
+        ));
+    }
+    if req.n.unwrap_or(1) > 1 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "camelid_receipt is not supported with n greater than 1; a receipt records one complete generation".to_string(),
+            Some("camelid_receipt"),
+        ));
+    }
+    Ok(())
+}
+
 async fn chat_completions(
     State(state): State<AppState>,
     payload: std::result::Result<Json<ChatCompletionRequest>, JsonRejection>,
@@ -16074,6 +16307,9 @@ async fn chat_completions(
         Ok(payload) => payload,
         Err(err) => return malformed_json_error(err),
     };
+    if let Err(response) = validate_chat_receipt_request_shape(&req) {
+        return response;
+    }
     // Fail closed on unsupported multimodal types before routing. Prism
     // `image_url` parts are collected separately and handled by the qwen35
     // runnable lane; audio, video, and malformed parts never degrade into a

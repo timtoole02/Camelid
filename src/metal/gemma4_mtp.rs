@@ -2050,6 +2050,15 @@ impl Gemma4MtpAssistantMetal {
         self.resident_ledger
     }
 
+    /// Whether the admitted assistant is executing its tied output projection
+    /// through the bounded Q4_0 copy. Structured hybrid serve telemetry is
+    /// omitted when this is false so the receipt contract can never claim a Q4
+    /// assistant head while the runtime is using the BF16 fallback.
+    #[doc(hidden)]
+    pub fn q4_head_enabled(&self) -> bool {
+        self.q4_embedding.is_some()
+    }
+
     /// Ledger from the latest successful target-backed proposal. The
     /// target-free warmup restores this value, so its private one-position KV
     /// buffers can never be mistaken for the measured target allocation.
