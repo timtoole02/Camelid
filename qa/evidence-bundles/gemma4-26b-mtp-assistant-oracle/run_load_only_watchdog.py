@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed macOS watchdog for the Gemma 4 load-only residency probe.
+"""Fail-closed macOS watchdog for Gemma 4 residency/generation probes.
 
 The child must be a previously built, internal-APFS test binary.  This wrapper
 does not invoke Cargo and deliberately samples Mach/libproc directly instead
@@ -36,13 +36,15 @@ from typing import Any, NoReturn, Sequence
 from urllib.parse import unquote, urlparse
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SAMPLE_PERIOD_NS = 250_000_000
 TERM_GRACE_NS = 250_000_000
 MIN_RECLAIMABLE_HEADROOM_BYTES = 2 * 1024 * 1024 * 1024
 NORMAL_PRESSURE_LEVEL = 1
 HOST_VM_INFO64 = 4
 RUSAGE_INFO_V2 = 2
+PROC_PGRP_ONLY = 2
+MAX_PROCESS_GROUP_MEMBERS = 4096
 
 EXIT_WATCHDOG_ABORT = 86
 EXIT_BASELINE_REFUSED = 75
@@ -170,6 +172,13 @@ class NativeTelemetry:
             ctypes.c_void_p,
         ]
         self.lib.proc_pid_rusage.restype = ctypes.c_int
+        self.lib.proc_listpids.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        self.lib.proc_listpids.restype = ctypes.c_int
 
         self.host = self.lib.mach_host_self()
         page_size = ctypes.c_uint32()
@@ -283,6 +292,60 @@ class NativeTelemetry:
             "pageins": int(usage.pageins),
             "disk_read_bytes": int(usage.diskio_bytesread),
             "disk_written_bytes": int(usage.diskio_byteswritten),
+        }
+
+    def process_group_pids(self, process_group: int) -> list[int]:
+        pids = (ctypes.c_int * MAX_PROCESS_GROUP_MEMBERS)()
+        buffer_bytes = ctypes.sizeof(pids)
+        ctypes.set_errno(0)
+        result = self.lib.proc_listpids(
+            PROC_PGRP_ONLY,
+            process_group,
+            ctypes.byref(pids),
+            buffer_bytes,
+        )
+        if result < 0:
+            raise TelemetryError(
+                f"proc_listpids(PGRP {process_group}) failed: errno={ctypes.get_errno()}"
+            )
+        if result >= buffer_bytes:
+            raise TelemetryError(
+                f"process group {process_group} exceeded the {MAX_PROCESS_GROUP_MEMBERS}-PID telemetry buffer"
+            )
+        pid_size = ctypes.sizeof(ctypes.c_int)
+        if result % pid_size != 0:
+            raise TelemetryError(
+                f"proc_listpids(PGRP {process_group}) returned {result} unaligned bytes"
+            )
+        return sorted({int(pid) for pid in pids[: result // pid_size] if pid > 0})
+
+    def sample_process_group(
+        self, process_group: int, required_leader: int
+    ) -> dict[str, Any]:
+        pids = self.process_group_pids(process_group)
+        if required_leader not in pids:
+            raise TelemetryError(
+                f"live leader {required_leader} is absent from process group {process_group}"
+            )
+        members = [self.sample_process(pid) for pid in pids]
+        if not members:
+            raise TelemetryError(f"process group {process_group} has no members")
+        return {
+            "pid": required_leader,
+            "process_group": process_group,
+            "member_count": len(members),
+            "member_pids": pids,
+            "members": members,
+            "rss_bytes": sum(member["rss_bytes"] for member in members),
+            "physical_footprint_bytes": sum(
+                member["physical_footprint_bytes"] for member in members
+            ),
+            "wired_bytes": sum(member["wired_bytes"] for member in members),
+            "pageins": sum(member["pageins"] for member in members),
+            "disk_read_bytes": sum(member["disk_read_bytes"] for member in members),
+            "disk_written_bytes": sum(
+                member["disk_written_bytes"] for member in members
+            ),
         }
 
 
@@ -439,56 +502,101 @@ def _open_exclusive_child_log(path: Path):
 
 
 def _host_violation_reasons(
-    sample: dict[str, int], baseline_swapouts_pages: int
+    sample: dict[str, int],
+    baseline_swapouts_pages: int,
+    *,
+    baseline_swapins_pages: int | None = None,
+    minimum_reclaimable_headroom_bytes: int = MIN_RECLAIMABLE_HEADROOM_BYTES,
+    maximum_host_wired_bytes: int | None = None,
+    require_zero_current_swap: bool = False,
 ) -> list[str]:
     reasons: list[str] = []
-    if sample["swapouts_pages"] > baseline_swapouts_pages:
+    if sample["swapouts_pages"] != baseline_swapouts_pages:
+        delta = sample["swapouts_pages"] - baseline_swapouts_pages
+        reasons.append(f"swapouts_changed_by_{delta}_pages")
+    if (
+        baseline_swapins_pages is not None
+        and sample["swapins_pages"] != baseline_swapins_pages
+    ):
+        delta = sample["swapins_pages"] - baseline_swapins_pages
+        reasons.append(f"swapins_changed_by_{delta}_pages")
+    if require_zero_current_swap and sample["swapped_pages_current"] != 0:
         reasons.append(
-            "swapouts_increased_by_"
-            f"{sample['swapouts_pages'] - baseline_swapouts_pages}_pages"
+            f"swapped_pages_current_{sample['swapped_pages_current']}_is_not_zero"
         )
     if sample["pressure_level_raw"] != NORMAL_PRESSURE_LEVEL:
         reasons.append(f"pressure_level_{sample['pressure_level_raw']}_is_not_normal")
-    if sample["reclaimable_headroom_bytes"] < MIN_RECLAIMABLE_HEADROOM_BYTES:
+    if sample["reclaimable_headroom_bytes"] < minimum_reclaimable_headroom_bytes:
         reasons.append(
             "reclaimable_headroom_bytes_"
             f"{sample['reclaimable_headroom_bytes']}_below_"
-            f"{MIN_RECLAIMABLE_HEADROOM_BYTES}"
+            f"{minimum_reclaimable_headroom_bytes}"
+        )
+    if (
+        maximum_host_wired_bytes is not None
+        and sample["wired_bytes"] > maximum_host_wired_bytes
+    ):
+        reasons.append(
+            f"host_wired_bytes_{sample['wired_bytes']}_above_"
+            f"{maximum_host_wired_bytes}"
         )
     return reasons
 
 
-def _send_group_signal(child: subprocess.Popen[bytes], signum: int) -> bool:
-    if child.poll() is not None:
-        return False
+def _process_group_exists(process_group: int) -> bool:
     try:
-        os.killpg(child.pid, signum)
+        os.killpg(process_group, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # It still exists; inability to signal it must fail closed elsewhere.
+        return True
+
+
+def _send_group_signal(
+    process_group: int, signum: int, direct_pid: int | None = None
+) -> bool:
+    try:
+        os.killpg(process_group, signum)
         return True
     except ProcessLookupError:
         return False
     except OSError:
         # start_new_session=True should make pid==pgid.  A direct-PID fallback
-        # still prevents an allocating test process from escaping on anomaly.
+        # still stops the leader while the caller reports a cleanup failure.
+        if direct_pid is None:
+            raise
         try:
-            os.kill(child.pid, signum)
+            os.kill(direct_pid, signum)
             return True
         except ProcessLookupError:
             return False
 
 
 def _finish_term_then_kill(
-    child: subprocess.Popen[bytes], term_sent_ns: int
+    child: subprocess.Popen[bytes], process_group: int, term_sent_ns: int
 ) -> int:
     deadline_ns = term_sent_ns + TERM_GRACE_NS
-    while child.poll() is None and time.monotonic_ns() < deadline_ns:
+    while _process_group_exists(process_group) and time.monotonic_ns() < deadline_ns:
+        child.poll()
         time.sleep(0.01)
-    if child.poll() is None:
-        _send_group_signal(child, signal.SIGKILL)
+    if _process_group_exists(process_group):
+        _send_group_signal(process_group, signal.SIGKILL, child.pid)
     try:
-        return child.wait(timeout=1.0)
+        returncode = child.wait(timeout=1.0)
     except subprocess.TimeoutExpired:
-        _send_group_signal(child, signal.SIGKILL)
-        return child.wait()
+        _send_group_signal(process_group, signal.SIGKILL, child.pid)
+        returncode = child.wait()
+
+    group_deadline_ns = time.monotonic_ns() + 1_000_000_000
+    while _process_group_exists(process_group) and time.monotonic_ns() < group_deadline_ns:
+        time.sleep(0.01)
+    if _process_group_exists(process_group):
+        raise TelemetryError(
+            f"process group {process_group} remained alive after compulsory SIGKILL"
+        )
+    return returncode
 
 
 def _portable_child_exit(returncode: int) -> int:
@@ -564,15 +672,21 @@ def run(args: argparse.Namespace) -> int:
 
     environment = dict(os.environ)
     existing_report = environment.get(LOAD_ONLY_REPORT_ENV)
-    if existing_report is not None and Path(existing_report) != report:
-        raise PreflightError(
-            f"{LOAD_ONLY_REPORT_ENV} disagrees with --report: {existing_report}"
-        )
     existing_enable = environment.get(LOAD_ONLY_ENABLE_ENV)
-    if existing_enable is not None and existing_enable != "1":
-        raise PreflightError(f"{LOAD_ONLY_ENABLE_ENV} must be 1 when set")
-    environment[LOAD_ONLY_REPORT_ENV] = str(report)
-    environment[LOAD_ONLY_ENABLE_ENV] = "1"
+    if args.external_report_producer:
+        if existing_report is not None or existing_enable is not None:
+            raise PreflightError(
+                "external report mode refuses inherited load-only probe settings"
+            )
+    else:
+        if existing_report is not None and Path(existing_report) != report:
+            raise PreflightError(
+                f"{LOAD_ONLY_REPORT_ENV} disagrees with --report: {existing_report}"
+            )
+        if existing_enable is not None and existing_enable != "1":
+            raise PreflightError(f"{LOAD_ONLY_ENABLE_ENV} must be 1 when set")
+        environment[LOAD_ONLY_REPORT_ENV] = str(report)
+        environment[LOAD_ONLY_ENABLE_ENV] = "1"
     environment["PWD"] = str(Path.cwd())
     _preflight_environment(environment)
 
@@ -580,11 +694,14 @@ def run(args: argparse.Namespace) -> int:
     watchdog_log: JsonlLog | None = None
     child_log = None
     child: subprocess.Popen[bytes] | None = None
+    process_group: int | None = None
     previous_handlers: dict[int, Any] = {}
     min_free_bytes = 2**63 - 1
     min_reclaimable_headroom_bytes = 2**63 - 1
     peak_rss_bytes = 0
     peak_footprint_bytes = 0
+    peak_host_wired_bytes = 0
+    baseline_swapins_pages = 0
     baseline_swapouts_pages = 0
     sequence = 0
 
@@ -592,13 +709,24 @@ def run(args: argparse.Namespace) -> int:
         watchdog_log = JsonlLog(watchdog_path)
         child_log = _open_exclusive_child_log(child_log_path)
         baseline = telemetry.sample_host()
+        baseline_swapins_pages = baseline["swapins_pages"]
         baseline_swapouts_pages = baseline["swapouts_pages"]
         min_free_bytes = baseline["free_bytes_strict"]
         min_reclaimable_headroom_bytes = baseline[
             "reclaimable_headroom_bytes"
         ]
+        peak_host_wired_bytes = baseline["wired_bytes"]
         baseline_reasons = _host_violation_reasons(
-            baseline, baseline_swapouts_pages
+            baseline,
+            baseline_swapouts_pages,
+            baseline_swapins_pages=(
+                baseline_swapins_pages if args.reject_swapin_growth else None
+            ),
+            minimum_reclaimable_headroom_bytes=(
+                args.minimum_baseline_reclaimable_headroom_bytes
+            ),
+            maximum_host_wired_bytes=args.maximum_host_wired_bytes,
+            require_zero_current_swap=args.require_zero_current_swap,
         )
         if baseline["sample_duration_ns"] >= SAMPLE_PERIOD_NS:
             baseline_reasons.append("baseline_telemetry_exceeded_250ms")
@@ -620,6 +748,87 @@ def run(args: argparse.Namespace) -> int:
                 }
             )
             return EXIT_BASELINE_REFUSED
+
+        baseline_soak_started_ns = time.monotonic_ns()
+        baseline_soak_deadline_ns = baseline_soak_started_ns + int(
+            args.baseline_soak_seconds * 1_000_000_000
+        )
+        next_baseline_due_ns = baseline_soak_started_ns + SAMPLE_PERIOD_NS
+        while time.monotonic_ns() < baseline_soak_deadline_ns:
+            due_ns = min(next_baseline_due_ns, baseline_soak_deadline_ns)
+            now_ns = time.monotonic_ns()
+            if now_ns < due_ns:
+                time.sleep((due_ns - now_ns) / 1_000_000_000)
+            sample_started_ns = time.monotonic_ns()
+            schedule_lateness_ns = max(0, sample_started_ns - due_ns)
+            sequence += 1
+            host = telemetry.sample_host()
+            sample_finished_ns = time.monotonic_ns()
+            min_free_bytes = min(min_free_bytes, host["free_bytes_strict"])
+            min_reclaimable_headroom_bytes = min(
+                min_reclaimable_headroom_bytes,
+                host["reclaimable_headroom_bytes"],
+            )
+            peak_host_wired_bytes = max(peak_host_wired_bytes, host["wired_bytes"])
+            reasons = _host_violation_reasons(
+                host,
+                baseline_swapouts_pages,
+                baseline_swapins_pages=(
+                    baseline_swapins_pages if args.reject_swapin_growth else None
+                ),
+                minimum_reclaimable_headroom_bytes=(
+                    args.minimum_baseline_reclaimable_headroom_bytes
+                ),
+                maximum_host_wired_bytes=args.maximum_host_wired_bytes,
+                require_zero_current_swap=args.require_zero_current_swap,
+            )
+            telemetry_duration_ns = sample_finished_ns - sample_started_ns
+            if telemetry_duration_ns + schedule_lateness_ns >= SAMPLE_PERIOD_NS:
+                reasons.append(
+                    "baseline_telemetry_overrun:"
+                    f"lateness={schedule_lateness_ns},duration={telemetry_duration_ns}"
+                )
+            watchdog_log.write(
+                {
+                    "event": "baseline_soak_sample",
+                    "sequence": sequence,
+                    "scheduled_monotonic_ns": due_ns,
+                    "schedule_lateness_ns": schedule_lateness_ns,
+                    "telemetry_duration_ns": telemetry_duration_ns,
+                    "host": host,
+                    "violations": reasons,
+                }
+            )
+            durable_finished_ns = time.monotonic_ns()
+            if durable_finished_ns - sample_started_ns + schedule_lateness_ns >= SAMPLE_PERIOD_NS:
+                reasons.append(
+                    "baseline_durable_sample_overrun:"
+                    f"lateness={schedule_lateness_ns},"
+                    f"duration={durable_finished_ns - sample_started_ns}"
+                )
+            if reasons:
+                watchdog_log.write(
+                    {
+                        "event": "baseline_refused",
+                        "sequence": sequence,
+                        "violations": reasons,
+                        **_report_metadata(report),
+                    }
+                )
+                return EXIT_BASELINE_REFUSED
+            next_baseline_due_ns += SAMPLE_PERIOD_NS
+        watchdog_log.write(
+            {
+                "event": "baseline_soak_complete",
+                "sequence": sequence,
+                "required_duration_seconds": args.baseline_soak_seconds,
+                "observed_duration_ns": time.monotonic_ns() - baseline_soak_started_ns,
+                "minimum_reclaimable_headroom_bytes": (
+                    args.minimum_baseline_reclaimable_headroom_bytes
+                ),
+                "require_zero_current_swap": args.require_zero_current_swap,
+            }
+        )
 
         # Close the last race with a stale producer after reserving both logs.
         if os.path.lexists(report):
@@ -665,15 +874,31 @@ def run(args: argparse.Namespace) -> int:
                 "sequence": sequence,
                 "pid": child.pid,
                 "process_group": process_group,
+                "process_accounting_scope": "isolated_process_group_aggregate",
                 "command": command,
                 "sample_period_ns": SAMPLE_PERIOD_NS,
                 "reclaimable_headroom_formula": (
                     "free_bytes_strict_plus_inactive_bytes"
                 ),
                 "minimum_reclaimable_headroom_bytes": (
-                    MIN_RECLAIMABLE_HEADROOM_BYTES
+                    args.minimum_runtime_reclaimable_headroom_bytes
                 ),
+                "maximum_child_physical_footprint_bytes": (
+                    args.maximum_child_physical_footprint_bytes
+                ),
+                "maximum_host_wired_bytes": args.maximum_host_wired_bytes,
+                "require_zero_current_swap": args.require_zero_current_swap,
+                "reject_swapin_growth": args.reject_swapin_growth,
+                "baseline_swapins_pages": baseline_swapins_pages,
                 "baseline_swapouts_pages": baseline_swapouts_pages,
+                "report_producer": (
+                    "external" if args.external_report_producer else "child"
+                ),
+                "experiment_environment": {
+                    key: value
+                    for key, value in sorted(environment.items())
+                    if key.startswith(("CAMELID_", "SPEC50_"))
+                },
                 "report": str(report),
             }
         )
@@ -696,10 +921,12 @@ def run(args: argparse.Namespace) -> int:
 
             try:
                 host = telemetry.sample_host()
-                process: dict[str, int] | None = None
+                process: dict[str, Any] | None = None
                 if child.poll() is None:
                     try:
-                        process = telemetry.sample_process(child.pid)
+                        process = telemetry.sample_process_group(
+                            process_group, child.pid
+                        )
                     except TelemetryError:
                         # ESRCH is an ordinary race only after waitpid confirms
                         # that the direct child has exited.
@@ -710,7 +937,7 @@ def run(args: argparse.Namespace) -> int:
                 watchdog_aborted = True
                 abort_reasons = [f"telemetry_failure:{error}"]
                 term_sent_ns = time.monotonic_ns()
-                _send_group_signal(child, signal.SIGTERM)
+                _send_group_signal(process_group, signal.SIGTERM, child.pid)
                 watchdog_log.write(
                     {
                         "event": "watchdog_abort",
@@ -721,7 +948,9 @@ def run(args: argparse.Namespace) -> int:
                         **_report_metadata(report),
                     }
                 )
-                child_returncode = _finish_term_then_kill(child, term_sent_ns)
+                child_returncode = _finish_term_then_kill(
+                    child, process_group, term_sent_ns
+                )
                 break
 
             telemetry_duration_ns = telemetry_finished_ns - sample_started_ns
@@ -730,12 +959,35 @@ def run(args: argparse.Namespace) -> int:
                 min_reclaimable_headroom_bytes,
                 host["reclaimable_headroom_bytes"],
             )
+            peak_host_wired_bytes = max(peak_host_wired_bytes, host["wired_bytes"])
             if process is not None:
                 peak_rss_bytes = max(peak_rss_bytes, process["rss_bytes"])
                 peak_footprint_bytes = max(
                     peak_footprint_bytes, process["physical_footprint_bytes"]
                 )
-            reasons = _host_violation_reasons(host, baseline_swapouts_pages)
+            reasons = _host_violation_reasons(
+                host,
+                baseline_swapouts_pages,
+                baseline_swapins_pages=(
+                    baseline_swapins_pages if args.reject_swapin_growth else None
+                ),
+                minimum_reclaimable_headroom_bytes=(
+                    args.minimum_runtime_reclaimable_headroom_bytes
+                ),
+                maximum_host_wired_bytes=args.maximum_host_wired_bytes,
+                require_zero_current_swap=args.require_zero_current_swap,
+            )
+            if (
+                process is not None
+                and args.maximum_child_physical_footprint_bytes is not None
+                and process["physical_footprint_bytes"]
+                > args.maximum_child_physical_footprint_bytes
+            ):
+                reasons.append(
+                    "child_physical_footprint_bytes_"
+                    f"{process['physical_footprint_bytes']}_above_"
+                    f"{args.maximum_child_physical_footprint_bytes}"
+                )
             if telemetry_duration_ns + schedule_lateness_ns >= SAMPLE_PERIOD_NS:
                 reasons.append(
                     "telemetry_overrun:"
@@ -758,12 +1010,14 @@ def run(args: argparse.Namespace) -> int:
                 # Stop allocation first.  Evidence is then flushed/fsynced
                 # during the short TERM grace before a compulsory KILL.
                 term_sent_ns = time.monotonic_ns()
-                _send_group_signal(child, signal.SIGTERM)
+                _send_group_signal(process_group, signal.SIGTERM, child.pid)
                 sample_event["event"] = "watchdog_abort"
                 sample_event["term_sent_monotonic_ns"] = term_sent_ns
                 sample_event.update(_report_metadata(report))
                 watchdog_log.write(sample_event)
-                child_returncode = _finish_term_then_kill(child, term_sent_ns)
+                child_returncode = _finish_term_then_kill(
+                    child, process_group, term_sent_ns
+                )
                 break
 
             watchdog_log.write(sample_event)
@@ -779,7 +1033,7 @@ def run(args: argparse.Namespace) -> int:
                     f"duration={durable_sample_duration_ns}"
                 ]
                 term_sent_ns = time.monotonic_ns()
-                _send_group_signal(child, signal.SIGTERM)
+                _send_group_signal(process_group, signal.SIGTERM, child.pid)
                 watchdog_log.write(
                     {
                         "event": "watchdog_abort",
@@ -791,10 +1045,31 @@ def run(args: argparse.Namespace) -> int:
                         **_report_metadata(report),
                     }
                 )
-                child_returncode = _finish_term_then_kill(child, term_sent_ns)
+                child_returncode = _finish_term_then_kill(
+                    child, process_group, term_sent_ns
+                )
                 break
             child_returncode = child.poll()
             if child_returncode is not None:
+                if _process_group_exists(process_group):
+                    watchdog_aborted = True
+                    abort_reasons = ["child_exit_left_live_process_group"]
+                    term_sent_ns = time.monotonic_ns()
+                    _send_group_signal(process_group, signal.SIGTERM, child.pid)
+                    watchdog_log.write(
+                        {
+                            "event": "watchdog_abort",
+                            "sequence": sequence + 1,
+                            "pid": child.pid,
+                            "process_group": process_group,
+                            "violations": abort_reasons,
+                            "term_sent_monotonic_ns": term_sent_ns,
+                            **_report_metadata(report),
+                        }
+                    )
+                    child_returncode = _finish_term_then_kill(
+                        child, process_group, term_sent_ns
+                    )
                 # Close the interval between the last live sample and waitpid.
                 final_host = telemetry.sample_host()
                 min_free_bytes = min(
@@ -804,8 +1079,20 @@ def run(args: argparse.Namespace) -> int:
                     min_reclaimable_headroom_bytes,
                     final_host["reclaimable_headroom_bytes"],
                 )
+                peak_host_wired_bytes = max(
+                    peak_host_wired_bytes, final_host["wired_bytes"]
+                )
                 final_reasons = _host_violation_reasons(
-                    final_host, baseline_swapouts_pages
+                    final_host,
+                    baseline_swapouts_pages,
+                    baseline_swapins_pages=(
+                        baseline_swapins_pages if args.reject_swapin_growth else None
+                    ),
+                    minimum_reclaimable_headroom_bytes=(
+                        args.minimum_runtime_reclaimable_headroom_bytes
+                    ),
+                    maximum_host_wired_bytes=args.maximum_host_wired_bytes,
+                    require_zero_current_swap=args.require_zero_current_swap,
                 )
                 if final_host["sample_duration_ns"] >= SAMPLE_PERIOD_NS:
                     final_reasons.append("final_telemetry_exceeded_250ms")
@@ -840,7 +1127,12 @@ def run(args: argparse.Namespace) -> int:
                 ),
                 "peak_child_rss_bytes": peak_rss_bytes,
                 "peak_child_physical_footprint_bytes": peak_footprint_bytes,
+                "peak_host_wired_bytes": peak_host_wired_bytes,
+                "baseline_swapins_pages": baseline_swapins_pages,
                 "baseline_swapouts_pages": baseline_swapouts_pages,
+                "process_group": process_group,
+                "process_group_empty": not _process_group_exists(process_group),
+                "process_accounting_scope": "isolated_process_group_aggregate",
                 **report_metadata,
             }
         )
@@ -858,8 +1150,9 @@ def run(args: argparse.Namespace) -> int:
             # TERM/KILL cleanup path.
             for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
                 signal.signal(signum, signal.SIG_IGN)
+            cleanup_group = process_group or child.pid
             term_sent_ns = time.monotonic_ns()
-            _send_group_signal(child, signal.SIGTERM)
+            _send_group_signal(cleanup_group, signal.SIGTERM, child.pid)
             if watchdog_log is not None:
                 watchdog_log.write(
                     {
@@ -871,12 +1164,17 @@ def run(args: argparse.Namespace) -> int:
                         **_report_metadata(report),
                     }
                 )
-            _finish_term_then_kill(child, term_sent_ns)
+            _finish_term_then_kill(child, cleanup_group, term_sent_ns)
         return min(128 + caught.signum, 255)
     except Exception as error:
-        if child is not None and child.poll() is None:
+        cleanup_group = (process_group or child.pid) if child is not None else None
+        if child is not None and (
+            child.poll() is None
+            or (cleanup_group is not None and _process_group_exists(cleanup_group))
+        ):
             term_sent_ns = time.monotonic_ns()
-            _send_group_signal(child, signal.SIGTERM)
+            assert cleanup_group is not None
+            _send_group_signal(cleanup_group, signal.SIGTERM, child.pid)
             try:
                 if watchdog_log is not None:
                     watchdog_log.write(
@@ -890,7 +1188,7 @@ def run(args: argparse.Namespace) -> int:
                         }
                     )
             finally:
-                _finish_term_then_kill(child, term_sent_ns)
+                _finish_term_then_kill(child, cleanup_group, term_sent_ns)
         raise
     finally:
         if previous_handlers:
@@ -905,10 +1203,30 @@ def run(args: argparse.Namespace) -> int:
             watchdog_log.close()
 
 
+def _nonnegative_int(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be an integer") from error
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be nonnegative")
+    return value
+
+
+def _nonnegative_float(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a number") from error
+    if value < 0 or not value < float("inf"):
+        raise argparse.ArgumentTypeError("must be finite and nonnegative")
+    return value
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run the isolated Gemma 4 load-only probe under a 250 ms "
-        "fail-closed macOS memory watchdog."
+        description="Run an isolated Gemma 4 probe under a 250 ms fail-closed "
+        "macOS memory watchdog."
     )
     parser.add_argument(
         "--self-test",
@@ -918,6 +1236,49 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--report", help="absolute fresh child checkpoint path")
     parser.add_argument("--watchdog-log", help="absolute fresh watchdog JSONL path")
     parser.add_argument("--child-log", help="absolute fresh child stdout/stderr path")
+    parser.add_argument(
+        "--external-report-producer",
+        action="store_true",
+        help="do not inject load-only probe variables; a supervised client publishes --report",
+    )
+    parser.add_argument(
+        "--baseline-soak-seconds",
+        type=_nonnegative_float,
+        default=0.0,
+        help="require this many seconds of clean host samples before child spawn",
+    )
+    parser.add_argument(
+        "--minimum-baseline-reclaimable-headroom-bytes",
+        type=_nonnegative_int,
+        default=MIN_RECLAIMABLE_HEADROOM_BYTES,
+        help="minimum free+inactive bytes during the pre-spawn baseline soak",
+    )
+    parser.add_argument(
+        "--minimum-runtime-reclaimable-headroom-bytes",
+        type=_nonnegative_int,
+        default=MIN_RECLAIMABLE_HEADROOM_BYTES,
+        help="minimum free+inactive bytes after child spawn",
+    )
+    parser.add_argument(
+        "--maximum-child-physical-footprint-bytes",
+        type=_nonnegative_int,
+        help="abort while the direct child's physical footprint exceeds this limit",
+    )
+    parser.add_argument(
+        "--maximum-host-wired-bytes",
+        type=_nonnegative_int,
+        help="refuse/abort while host wired memory exceeds this limit",
+    )
+    parser.add_argument(
+        "--require-zero-current-swap",
+        action="store_true",
+        help="require swapped_pages_current=0 before and throughout the run",
+    )
+    parser.add_argument(
+        "--reject-swapin-growth",
+        action="store_true",
+        help="abort if host swap-in pages increase after the first baseline sample",
+    )
     parser.add_argument("child_command", nargs=argparse.REMAINDER)
     return parser
 

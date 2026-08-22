@@ -18,6 +18,10 @@ against the previous run; all three lanes stayed token-identical throughout.
 
 ## Tools
 
+- `hybrid-hot48-runner/` — manual, fail-closed load-only → K8/K1 smoke →
+  K8/K1 promotion ladder for the 48-hot/128-mapped hybrid profile. It blocks
+  real runs until matching load-only v4 and every-round structured-telemetry
+  integration contracts exist.
 - `run-pilot-instrumented.zsh <run-dir>` — admission + pilot under the fail-closed
   memory watchdog, with the per-round ledger enabled. Takes a fresh run dir.
 - `analyze-pilot.py <run-dir>` — summarizes a pilot report + watchdog: lanes,
