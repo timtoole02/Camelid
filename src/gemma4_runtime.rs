@@ -2550,6 +2550,44 @@ struct WaveFillCounters {
     victim_verify_fails: std::sync::atomic::AtomicU64,
 }
 
+/// Payload-I/O receipt owner for a terminal hybrid promotion. HEAD fills feed
+/// the cumulative per-layer slot stats; chained fills feed the per-round wave
+/// ledger. Keeping the choice explicit prevents the residency snapshot from
+/// summing the same positioned read through both paths.
+#[cfg(target_os = "macos")]
+enum HybridFillPayloadAccounting<'a> {
+    Head,
+    Chained(&'a WaveFillCounters),
+}
+
+#[cfg(target_os = "macos")]
+fn record_hybrid_fill_payload(
+    stats: &mut GhostMetalSlotStats,
+    accounting: HybridFillPayloadAccounting<'_>,
+    disk_reads: usize,
+    record_bytes: usize,
+    promotion_evictions: usize,
+    elapsed_us: u64,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let read_bytes = (disk_reads as u64).saturating_mul(record_bytes as u64);
+    match accounting {
+        HybridFillPayloadAccounting::Head => {
+            stats.direct_reads = stats.direct_reads.saturating_add(disk_reads as u64);
+            stats.direct_read_bytes = stats.direct_read_bytes.saturating_add(read_bytes);
+        }
+        HybridFillPayloadAccounting::Chained(counters) => {
+            counters.demand_loads.fetch_add(disk_reads, Relaxed);
+            counters.nvme_bytes.fetch_add(read_bytes, Relaxed);
+            counters.nvme_us.fetch_add(elapsed_us, Relaxed);
+            counters.copy_us.fetch_add(elapsed_us, Relaxed);
+            counters
+                .plan_evictions
+                .fetch_add(promotion_evictions as u64, Relaxed);
+        }
+    }
+}
+
 /// Promote already-computed cold experts into the bounded anonymous tier for
 /// a future command. The exclusive
 /// guard invalidates all previously published overrides before exposing the
@@ -2562,7 +2600,7 @@ fn fill_hybrid_hot_slots(
     cache: &GhostMoeExpertCache,
     layer_idx: usize,
     selected_experts: &[usize],
-    counters: &WaveFillCounters,
+    accounting: HybridFillPayloadAccounting<'_>,
     round_seq: u32,
 ) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
@@ -2644,29 +2682,17 @@ fn fill_hybrid_hot_slots(
         .evictions
         .saturating_add(plan.evicted.len() as u64);
     layer.stats.host_fills = layer.stats.host_fills.saturating_add(host_fills as u64);
-    layer.stats.direct_reads = layer.stats.direct_reads.saturating_add(disk_reads as u64);
-    layer.stats.direct_read_bytes = layer
-        .stats
-        .direct_read_bytes
-        .saturating_add((disk_reads as u64).saturating_mul(record_bytes as u64));
     layer.stats.direct_read_failures = layer
         .stats
         .direct_read_failures
         .saturating_add(read_failures as u64);
-    counters
-        .demand_loads
-        .fetch_add(disk_reads, Relaxed);
-    counters.nvme_bytes.fetch_add(
-        (disk_reads as u64).saturating_mul(record_bytes as u64),
-        Relaxed,
-    );
-    counters.nvme_us.fetch_add(
+    record_hybrid_fill_payload(
+        &mut layer.stats,
+        accounting,
+        disk_reads,
+        record_bytes,
+        plan.evicted.len(),
         (fill_started.elapsed().as_secs_f64() * 1_000_000.0) as u64,
-        Relaxed,
-    );
-    counters.copy_us.fetch_add(
-        (fill_started.elapsed().as_secs_f64() * 1_000_000.0) as u64,
-        Relaxed,
     );
     true
 }
@@ -4167,7 +4193,7 @@ impl GhostMetalExpertRuntime {
                         layer_idx,
                         experts,
                         cache,
-                        &fill_counters,
+                        HybridFillPayloadAccounting::Chained(&fill_counters),
                     )
                 {
                     eprintln!(
@@ -4623,7 +4649,7 @@ impl GhostMetalExpertRuntime {
         layer_idx: usize,
         experts: &[usize],
         cache: &GhostMoeExpertCache,
-        counters: &WaveFillCounters,
+        accounting: HybridFillPayloadAccounting<'_>,
     ) -> bool {
         let Some(layer) = self.layers.get_mut(layer_idx) else {
             return false;
@@ -4636,7 +4662,7 @@ impl GhostMetalExpertRuntime {
             cache,
             layer_idx,
             experts,
-            counters,
+            accounting,
             self.chained_round_seq,
         )
     }
@@ -4653,8 +4679,12 @@ impl GhostMetalExpertRuntime {
         if experts.is_empty() {
             return true;
         }
-        let counters = WaveFillCounters::default();
-        self.promote_hybrid_layer(layer_idx, &experts, cache, &counters)
+        self.promote_hybrid_layer(
+            layer_idx,
+            &experts,
+            cache,
+            HybridFillPayloadAccounting::Head,
+        )
     }
 
     /// Pre-warm the persistent pinned hot slots across all layers directly from the .cghost file
@@ -21861,6 +21891,54 @@ mod ghost_moe_wire_tests {
                 direct_read_bytes: 13_380,
                 direct_read_failures: 1,
             }
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_hybrid_fill_payload_ledgers_are_disjoint() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let mut stats = GhostMetalSlotStats::default();
+        let chained = WaveFillCounters::default();
+        record_hybrid_fill_payload(
+            &mut stats,
+            HybridFillPayloadAccounting::Head,
+            2,
+            100,
+            1,
+            7,
+        );
+        assert_eq!(stats.direct_reads, 2);
+        assert_eq!(stats.direct_read_bytes, 200);
+        assert_eq!(chained.demand_loads.load(Relaxed), 0);
+        assert_eq!(chained.nvme_bytes.load(Relaxed), 0);
+        assert_eq!(chained.plan_evictions.load(Relaxed), 0);
+
+        record_hybrid_fill_payload(
+            &mut stats,
+            HybridFillPayloadAccounting::Chained(&chained),
+            3,
+            100,
+            2,
+            11,
+        );
+        assert_eq!(
+            stats.direct_reads, 2,
+            "chained reads must not leak into HEAD slot stats"
+        );
+        assert_eq!(stats.direct_read_bytes, 200);
+        assert_eq!(chained.demand_loads.load(Relaxed), 3);
+        assert_eq!(chained.nvme_bytes.load(Relaxed), 300);
+        assert_eq!(chained.nvme_us.load(Relaxed), 11);
+        assert_eq!(chained.copy_us.load(Relaxed), 11);
+        assert_eq!(chained.plan_evictions.load(Relaxed), 2);
+        assert_eq!(
+            stats
+                .direct_read_bytes
+                .saturating_add(chained.nvme_bytes.load(Relaxed)),
+            500,
+            "snapshot payload total must count each lane exactly once"
         );
     }
 
