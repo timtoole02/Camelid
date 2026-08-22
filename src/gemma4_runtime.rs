@@ -2553,7 +2553,9 @@ struct WaveFillCounters {
 /// Payload-I/O receipt owner for a terminal hybrid promotion. HEAD fills feed
 /// the cumulative per-layer slot stats; chained fills feed the per-round wave
 /// ledger. Keeping the choice explicit prevents the residency snapshot from
-/// summing the same positioned read through both paths.
+/// summing the same positioned read through both paths. Chained disk and host
+/// copy clocks are measured around their respective operations and remain
+/// disjoint; planning and publication time belongs to neither category.
 #[cfg(target_os = "macos")]
 enum HybridFillPayloadAccounting<'a> {
     Head,
@@ -2567,7 +2569,8 @@ fn record_hybrid_fill_payload(
     disk_reads: usize,
     record_bytes: usize,
     promotion_evictions: usize,
-    elapsed_us: u64,
+    disk_read_us: u64,
+    host_copy_us: u64,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
     let read_bytes = (disk_reads as u64).saturating_mul(record_bytes as u64);
@@ -2579,13 +2582,24 @@ fn record_hybrid_fill_payload(
         HybridFillPayloadAccounting::Chained(counters) => {
             counters.demand_loads.fetch_add(disk_reads, Relaxed);
             counters.nvme_bytes.fetch_add(read_bytes, Relaxed);
-            counters.nvme_us.fetch_add(elapsed_us, Relaxed);
-            counters.copy_us.fetch_add(elapsed_us, Relaxed);
+            counters.nvme_us.fetch_add(disk_read_us, Relaxed);
+            counters.copy_us.fetch_add(host_copy_us, Relaxed);
             counters
                 .plan_evictions
                 .fetch_add(promotion_evictions as u64, Relaxed);
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn fold_chained_fill_payload_totals(
+    cumulative_bytes: &mut u64,
+    cumulative_loads: &mut u64,
+    counters: &WaveFillCounters,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    *cumulative_bytes = cumulative_bytes.saturating_add(counters.nvme_bytes.load(Relaxed));
+    *cumulative_loads = cumulative_loads.saturating_add(counters.demand_loads.load(Relaxed) as u64);
 }
 
 /// Promote already-computed cold experts into the bounded anonymous tier for
@@ -2633,28 +2647,37 @@ fn fill_hybrid_hot_slots(
     let mut disk_reads = 0usize;
     let mut host_fills = 0usize;
     let mut read_failures = 0usize;
-    let fill_started = std::time::Instant::now();
+    let mut disk_read_us = 0u64;
+    let mut host_copy_us = 0u64;
     for load in plan.loads.iter().copied() {
         let Some(destination) = refill.slot_bytes_mut(load.slot) else {
             read_failures = read_failures.saturating_add(1);
             continue;
         };
-        let copied = cache
+        let copied = if let Some(record) = cache
             .peek_resident(layer_idx, load.expert)
             .filter(|record| record.byte_len() == record_bytes)
-            .is_some_and(|record| {
-                destination.copy_from_slice(record.record_bytes());
-                true
-            });
+        {
+            let copy_started = std::time::Instant::now();
+            destination.copy_from_slice(record.record_bytes());
+            host_copy_us = host_copy_us
+                .saturating_add((copy_started.elapsed().as_secs_f64() * 1_000_000.0) as u64);
+            true
+        } else {
+            false
+        };
         if copied {
             directory.commit_load(load);
             host_fills = host_fills.saturating_add(1);
             continue;
         }
-        match cache
+        let read_started = std::time::Instant::now();
+        let read_result = cache
             .file
-            .read_moe_expert_into(layer_idx, load.expert, destination)
-        {
+            .read_moe_expert_into(layer_idx, load.expert, destination);
+        disk_read_us = disk_read_us
+            .saturating_add((read_started.elapsed().as_secs_f64() * 1_000_000.0) as u64);
+        match read_result {
             Ok(()) => {
                 directory.commit_load(load);
                 disk_reads = disk_reads.saturating_add(1);
@@ -2668,15 +2691,10 @@ fn fill_hybrid_hot_slots(
             }
         }
     }
-    let Some(hot_slot_ids) = directory.hot_slot_ids() else {
-        directory.clear_dynamic();
-        return false;
-    };
-    if !refill.publish_hot_slot_ids(&hot_slot_ids) {
-        directory.clear_dynamic();
-        return false;
-    }
-
+    // Receipt actual mutation and I/O before publication. If directory
+    // validation or publication fails, the anonymous bytes remain unreachable
+    // but their reads, copies, and evictions still happened and must not vanish
+    // from a failed-run receipt.
     layer.stats.evictions = layer
         .stats
         .evictions
@@ -2692,8 +2710,17 @@ fn fill_hybrid_hot_slots(
         disk_reads,
         record_bytes,
         plan.evicted.len(),
-        (fill_started.elapsed().as_secs_f64() * 1_000_000.0) as u64,
+        disk_read_us,
+        host_copy_us,
     );
+    let Some(hot_slot_ids) = directory.hot_slot_ids() else {
+        directory.clear_dynamic();
+        return false;
+    };
+    if !refill.publish_hot_slot_ids(&hot_slot_ids) {
+        directory.clear_dynamic();
+        return false;
+    }
     true
 }
 
@@ -4162,7 +4189,7 @@ impl GhostMetalExpertRuntime {
         } else {
             &empty_unions
         };
-        let ok = {
+        let mut ok = {
             let Some(common) = self.common.as_mut() else {
                 return false;
             };
@@ -4184,38 +4211,38 @@ impl GhostMetalExpertRuntime {
             )
         };
         if ok && hybrid_mapped_backing {
-            let Some(cache) = ghost_cache else {
-                return false;
-            };
-            for (layer_idx, experts) in collected_routes.iter().enumerate() {
-                if experts.is_empty()
-                    || !self.promote_hybrid_layer(
-                        layer_idx,
-                        experts,
-                        cache,
-                        HybridFillPayloadAccounting::Chained(&fill_counters),
-                    )
-                {
-                    eprintln!(
-                        "[gemma4-ghost-metal] hybrid layer {layer_idx} terminal promotion refused"
-                    );
-                    return false;
+            if let Some(cache) = ghost_cache {
+                for (layer_idx, experts) in collected_routes.iter().enumerate() {
+                    if experts.is_empty()
+                        || !self.promote_hybrid_layer(
+                            layer_idx,
+                            experts,
+                            cache,
+                            HybridFillPayloadAccounting::Chained(&fill_counters),
+                        )
+                    {
+                        eprintln!(
+                            "[gemma4-ghost-metal] hybrid layer {layer_idx} terminal promotion refused"
+                        );
+                        ok = false;
+                        break;
+                    }
                 }
+            } else {
+                eprintln!(
+                    "[gemma4-ghost-metal] hybrid terminal promotion lost its canonical cache owner"
+                );
+                ok = false;
             }
         }
         if !ok && allow_predicted {
             // Preserve the I/O cost of the refused attempt before the exact
             // unpredicted retry. These counters are observational only and do
             // not participate in routing or retry admission.
-            self.chained_demand_read_bytes = self.chained_demand_read_bytes.saturating_add(
-                fill_counters
-                    .nvme_bytes
-                    .load(std::sync::atomic::Ordering::Relaxed),
-            );
-            self.chained_demand_loads = self.chained_demand_loads.saturating_add(
-                fill_counters
-                    .demand_loads
-                    .load(std::sync::atomic::Ordering::Relaxed) as u64,
+            fold_chained_fill_payload_totals(
+                &mut self.chained_demand_read_bytes,
+                &mut self.chained_demand_loads,
+                &fill_counters,
             );
             eprintln!(
                 "[gemma4-ghost-metal] predicted chained round refused at start_pos={start_pos} K={k_tokens}; retrying without route prediction"
@@ -4414,15 +4441,10 @@ impl GhostMetalExpertRuntime {
                 );
             }
         }
-        self.chained_demand_read_bytes = self.chained_demand_read_bytes.saturating_add(
-            fill_counters
-                .nvme_bytes
-                .load(std::sync::atomic::Ordering::Relaxed),
-        );
-        self.chained_demand_loads = self.chained_demand_loads.saturating_add(
-            fill_counters
-                .demand_loads
-                .load(std::sync::atomic::Ordering::Relaxed) as u64,
+        fold_chained_fill_payload_totals(
+            &mut self.chained_demand_read_bytes,
+            &mut self.chained_demand_loads,
+            &fill_counters,
         );
         for (i, experts) in collected_routes.into_iter().enumerate() {
             if !experts.is_empty() {
@@ -21908,11 +21930,14 @@ mod ghost_moe_wire_tests {
             100,
             1,
             7,
+            3,
         );
         assert_eq!(stats.direct_reads, 2);
         assert_eq!(stats.direct_read_bytes, 200);
         assert_eq!(chained.demand_loads.load(Relaxed), 0);
         assert_eq!(chained.nvme_bytes.load(Relaxed), 0);
+        assert_eq!(chained.nvme_us.load(Relaxed), 0);
+        assert_eq!(chained.copy_us.load(Relaxed), 0);
         assert_eq!(chained.plan_evictions.load(Relaxed), 0);
 
         record_hybrid_fill_payload(
@@ -21922,6 +21947,7 @@ mod ghost_moe_wire_tests {
             100,
             2,
             11,
+            5,
         );
         assert_eq!(
             stats.direct_reads, 2,
@@ -21931,7 +21957,7 @@ mod ghost_moe_wire_tests {
         assert_eq!(chained.demand_loads.load(Relaxed), 3);
         assert_eq!(chained.nvme_bytes.load(Relaxed), 300);
         assert_eq!(chained.nvme_us.load(Relaxed), 11);
-        assert_eq!(chained.copy_us.load(Relaxed), 11);
+        assert_eq!(chained.copy_us.load(Relaxed), 5);
         assert_eq!(chained.plan_evictions.load(Relaxed), 2);
         assert_eq!(
             stats
@@ -21940,6 +21966,12 @@ mod ghost_moe_wire_tests {
             500,
             "snapshot payload total must count each lane exactly once"
         );
+
+        let mut cumulative_bytes = 1_000u64;
+        let mut cumulative_loads = 4u64;
+        fold_chained_fill_payload_totals(&mut cumulative_bytes, &mut cumulative_loads, &chained);
+        assert_eq!(cumulative_bytes, 1_300);
+        assert_eq!(cumulative_loads, 7);
     }
 
     #[test]
