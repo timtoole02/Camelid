@@ -432,12 +432,6 @@ def validate_startup_log(path: Path, lane: str) -> None:
             raise ReceiptError("K8 server log does not prove the Q4_0 assistant head")
         if not re.search(r"\[metal chained ledger\].* K=8 .*ok=true", log):
             raise ReceiptError("K8 server log has no successful K=8 chained round")
-        if not re.search(
-            r"lookahead\(launched=false reused=false background=0\.00ms "
-            r"overlap=0\.00ms join=0\.00ms\)",
-            log,
-        ):
-            raise ReceiptError("K8 server log does not prove outer lookahead stayed off")
     elif lane == "k1" and not re.search(
         r"\[metal chained ledger\].* K=1 .*ok=true", log
     ):

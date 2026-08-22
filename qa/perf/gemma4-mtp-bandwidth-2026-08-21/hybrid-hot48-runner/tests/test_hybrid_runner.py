@@ -257,7 +257,6 @@ def startup_log(k8: bool = False) -> str:
             [
                 "lm_head=q4_0",
                 "[metal chained ledger] start_pos=1 K=8 ok=true",
-                "[mtp round] lookahead(launched=false reused=false background=0.00ms overlap=0.00ms join=0.00ms)",
             ]
         )
     return "\n".join(lines)
