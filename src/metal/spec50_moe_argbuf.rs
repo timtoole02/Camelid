@@ -691,15 +691,31 @@ pub(crate) fn spec50_moe_argbuf_kernels(
         .as_ref()
 }
 
-/// Encode the static 128-entry expert pointer table from the GateUp function's
-/// reflected argument-buffer layout. The same struct occupies buffer 2 in Down.
-fn new_static_expert_table(
+const UNBOUND_RECORD_INDEX: u8 = u8::MAX;
+
+/// Encode selected records at their original slot IDs in the GateUp function's
+/// reflected 128-entry argument-buffer layout. The same struct occupies buffer
+/// 2 in Down. Slots without a corresponding record remain deterministic nulls.
+fn new_indexed_expert_table(
     device: &Device,
     kernels: &Spec50MoeArgbufKernels,
+    addressable_slot_count: usize,
+    record_slots: &[usize],
     records: &[Buffer],
-) -> Option<Buffer> {
-    if records.is_empty() || records.len() > 128 {
+) -> Option<(Buffer, [u8; 128])> {
+    if !(1..=128).contains(&addressable_slot_count)
+        || records.is_empty()
+        || records.len() != record_slots.len()
+        || records.len() > addressable_slot_count
+    {
         return None;
+    }
+    let mut slot_to_record = [UNBOUND_RECORD_INDEX; 128];
+    for (record_index, &slot) in record_slots.iter().enumerate() {
+        if slot >= addressable_slot_count || slot_to_record[slot] != UNBOUND_RECORD_INDEX {
+            return None;
+        }
+        slot_to_record[slot] = u8::try_from(record_index).ok()?;
     }
     let encoder = kernels.gateup_function.new_argument_encoder(2);
     let table = device.new_buffer(
@@ -718,10 +734,21 @@ fn new_static_expert_table(
         );
     }
     encoder.set_argument_buffer(&table, 0);
-    for (slot, record) in records.iter().enumerate() {
+    for (&slot, record) in record_slots.iter().zip(records) {
         encoder.set_buffer(slot as u64, record, 0);
     }
-    Some(table)
+    Some((table, slot_to_record))
+}
+
+/// Dense compatibility wrapper used by the original prototype and its tests.
+fn new_static_expert_table(
+    device: &Device,
+    kernels: &Spec50MoeArgbufKernels,
+    records: &[Buffer],
+) -> Option<Buffer> {
+    let record_slots = (0..records.len()).collect::<Vec<_>>();
+    new_indexed_expert_table(device, kernels, records.len(), &record_slots, records)
+        .map(|(table, _)| table)
 }
 
 /// Tier-2 pointer table for persistent anonymous expert-slot records.
@@ -734,7 +761,18 @@ fn new_static_expert_table(
 #[derive(Clone)]
 pub(crate) struct Gemma4MoeSlotArgTable {
     records: Vec<Buffer>,
+    /// Number of legal shader-visible slot IDs. Sparse mapped tables retain the
+    /// canonical width of 128 while owning only the exact selected records.
+    addressable_slot_count: usize,
+    /// Original slot ID -> index in `records`; `u8::MAX` is an unbound/null
+    /// argument-table entry.
+    slot_to_record: [u8; 128],
     table: Buffer,
+    /// A no-copy Metal record retains the caller's bytes, not the Rust owner
+    /// that mapped them. Production file-backed tables therefore keep the
+    /// complete read-only mapping alive for at least as long as any cloned GPU
+    /// binding. Anonymous slot tables leave this empty.
+    _mapped_owner: Option<std::sync::Arc<crate::wire_mmap::GgufWireMmap>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -753,14 +791,15 @@ pub(crate) enum Gemma4HeadArgbufDownMode {
 }
 
 impl Gemma4MoeSlotArgTable {
-    /// Build a fixed pointer table over already allocated anonymous slot
-    /// records. No record byte is read or written here, so construction itself
-    /// remains physically lazy. Callers must nevertheless encode only their
-    /// admitted physical prefix because first compute use may materialize the
-    /// table's complete referenced set.
-    pub(crate) fn from_slot_buffers(device: &Device, records: &[Buffer]) -> Option<Self> {
+    fn from_indexed_slot_buffers(
+        device: &Device,
+        addressable_slot_count: usize,
+        record_slots: &[usize],
+        records: &[Buffer],
+        mapped_owner: Option<std::sync::Arc<crate::wire_mmap::GgufWireMmap>>,
+    ) -> Option<Self> {
         if records.is_empty()
-            || records.len() > 128
+            || records.len() != record_slots.len()
             || records.iter().any(|record| {
                 record.length() as usize != S50_SLOT_STRIDE
                     || record.contents().is_null()
@@ -771,14 +810,107 @@ impl Gemma4MoeSlotArgTable {
             return None;
         }
         let kernels = spec50_moe_argbuf_kernels(device)?;
-        let table = new_static_expert_table(device, kernels, records)?;
+        let (table, slot_to_record) = new_indexed_expert_table(
+            device,
+            kernels,
+            addressable_slot_count,
+            record_slots,
+            records,
+        )?;
         Some(Self {
             records: records.to_vec(),
+            addressable_slot_count,
+            slot_to_record,
             table,
+            _mapped_owner: mapped_owner,
         })
     }
 
-    pub(crate) fn slot_count(&self) -> usize {
+    /// Build a fixed pointer table over already allocated anonymous slot
+    /// records. No record byte is read or written here, so construction itself
+    /// remains physically lazy. Callers must nevertheless encode only their
+    /// admitted physical prefix because first compute use may materialize the
+    /// table's complete referenced set.
+    pub(crate) fn from_slot_buffers(device: &Device, records: &[Buffer]) -> Option<Self> {
+        if records.is_empty() || records.len() > 128 {
+            return None;
+        }
+        let record_slots = (0..records.len()).collect::<Vec<_>>();
+        Self::from_indexed_slot_buffers(device, records.len(), &record_slots, records, None)
+    }
+
+    /// Build a transient sparse table over exactly the selected canonical
+    /// `.cghost` records. Record buffers remain indexed by their original slot
+    /// IDs, so HEAD route slots and chained fixed-stride work offsets require no
+    /// translation. The returned owner must live until the GPU command reaches
+    /// a terminal state.
+    pub(crate) fn from_mapped_active_slots(
+        mmap: std::sync::Arc<crate::wire_mmap::GgufWireMmap>,
+        offset: u64,
+        byte_len: usize,
+        active_slots: &[usize],
+    ) -> Option<Self> {
+        const EXPERTS: usize = 128;
+        let required = EXPERTS.checked_mul(S50_SLOT_STRIDE)?;
+        if S50_RECORD_BYTES > S50_SLOT_STRIDE || byte_len < required || active_slots.is_empty() {
+            return None;
+        }
+        let offset = usize::try_from(offset).ok()?;
+        let end = offset.checked_add(required)?;
+        if end > mmap.mapped_len() {
+            return None;
+        }
+        let page_size = crate::wire_mmap::page_size();
+        let base = unsafe { mmap.base_ptr().add(offset) };
+        if page_size == 0
+            || !S50_SLOT_STRIDE.is_multiple_of(page_size)
+            || !(base as usize).is_multiple_of(page_size)
+        {
+            return None;
+        }
+
+        let mut record_slots = active_slots.to_vec();
+        record_slots.sort_unstable();
+        record_slots.dedup();
+        if record_slots.iter().any(|&slot| slot >= EXPERTS) {
+            return None;
+        }
+
+        let kernel = metal_linear_kernel()?;
+        let device = &kernel.device;
+        if device.argument_buffers_support() != MTLArgumentBuffersTier::Tier2
+            || S50_SLOT_STRIDE > device.max_buffer_length() as usize
+        {
+            return None;
+        }
+        let mut records = Vec::with_capacity(record_slots.len());
+        for &slot in &record_slots {
+            let record_offset = slot.checked_mul(S50_SLOT_STRIDE)?;
+            let pointer = unsafe { base.add(record_offset) };
+            if !(pointer as usize).is_multiple_of(page_size) {
+                return None;
+            }
+            records.push(device.new_buffer_with_bytes_no_copy(
+                pointer.cast(),
+                S50_SLOT_STRIDE as u64,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            ));
+        }
+        Self::from_indexed_slot_buffers(device, EXPERTS, &record_slots, &records, Some(mmap))
+    }
+
+    pub(crate) const fn addressable_slot_count(&self) -> usize {
+        self.addressable_slot_count
+    }
+
+    /// Compatibility name for existing dense callers. For sparse mapped tables
+    /// this is the legal address width, not the number of owned record views.
+    pub(crate) const fn slot_count(&self) -> usize {
+        self.addressable_slot_count()
+    }
+
+    pub(crate) fn bound_record_count(&self) -> usize {
         self.records.len()
     }
 
@@ -794,14 +926,24 @@ impl Gemma4MoeSlotArgTable {
         encoder: &metal::ComputeCommandEncoderRef,
         active_slots: &[usize],
     ) -> Option<usize> {
-        if active_slots.is_empty() || active_slots.iter().any(|&slot| slot >= self.records.len()) {
+        if active_slots.is_empty()
+            || active_slots.iter().any(|&slot| {
+                if slot >= self.addressable_slot_count {
+                    return true;
+                }
+                let record_index = self.slot_to_record[slot];
+                record_index == UNBOUND_RECORD_INDEX
+                    || usize::from(record_index) >= self.records.len()
+            })
+        {
             return None;
         }
         let mut seen = [false; 128];
         let mut declared = 0usize;
         for &slot in active_slots {
             if !seen[slot] {
-                encoder.use_resource(&self.records[slot], MTLResourceUsage::Read);
+                let record_index = usize::from(self.slot_to_record[slot]);
+                encoder.use_resource(&self.records[record_index], MTLResourceUsage::Read);
                 seen[slot] = true;
                 declared += 1;
             }
@@ -822,7 +964,7 @@ impl Gemma4MoeSlotArgTable {
         k_candidates: usize,
     ) -> bool {
         if num_unique_experts == 0
-            || num_unique_experts > self.records.len()
+            || num_unique_experts > self.bound_record_count()
             || !(1..=16).contains(&k_candidates)
         {
             return false;
@@ -1713,6 +1855,82 @@ mod tests {
             }
         }
         true
+    }
+
+    #[test]
+    fn gemma4_moe_sparse_slot_table_preserves_original_ids_and_fails_closed() {
+        let Some(kernel) = metal_linear_kernel() else {
+            eprintln!("SKIP sparse argbuf structure gate: no Metal device");
+            return;
+        };
+        let device = &kernel.device;
+        if device.argument_buffers_support() != MTLArgumentBuffersTier::Tier2 {
+            return;
+        }
+        let records = vec![
+            new_buffer(device, S50_SLOT_STRIDE),
+            new_buffer(device, S50_SLOT_STRIDE),
+            new_buffer(device, S50_SLOT_STRIDE),
+        ];
+        let table = Gemma4MoeSlotArgTable::from_indexed_slot_buffers(
+            device,
+            128,
+            &[127, 3, 91],
+            &records,
+            None,
+        )
+        .expect("sparse original-ID table");
+        assert_eq!(table.addressable_slot_count(), 128);
+        assert_eq!(table.bound_record_count(), 3);
+        assert!(Gemma4MoeSlotArgTable::from_indexed_slot_buffers(
+            device,
+            128,
+            &[3, 3, 91],
+            &records,
+            None,
+        )
+        .is_none());
+        let cb = kernel.queue.new_command_buffer();
+        let encoder = cb.new_compute_command_encoder();
+        assert_eq!(table.declare_active_slots(encoder, &[3, 4]), None);
+        assert_eq!(table.declare_active_slots(encoder, &[127, 128]), None);
+        assert_eq!(table.declare_active_slots(encoder, &[127, 3, 91, 127]), Some(3));
+        encoder.end_encoding();
+    }
+
+    #[test]
+    fn gemma4_moe_mapped_active_slots_are_sparse_and_retain_owner() {
+        let Some(kernel) = metal_linear_kernel() else {
+            return;
+        };
+        if kernel.device.argument_buffers_support() != MTLArgumentBuffersTier::Tier2 {
+            return;
+        }
+        let mapped_bytes = 128usize * S50_SLOT_STRIDE;
+        let file = tempfile::NamedTempFile::new().expect("temporary sparse mapped fixture");
+        file.as_file()
+            .set_len(mapped_bytes as u64)
+            .expect("size sparse mapped fixture");
+        let mmap = crate::wire_mmap::GgufWireMmap::map(file.path())
+            .expect("map sparse mapped fixture");
+        let owner = std::sync::Arc::downgrade(&mmap);
+        let table = Gemma4MoeSlotArgTable::from_mapped_active_slots(
+            mmap,
+            0,
+            mapped_bytes,
+            &[127, 3, 3, 91, 0],
+        )
+        .expect("selected-only mapped table");
+        assert_eq!(table.addressable_slot_count(), 128);
+        assert_eq!(table.bound_record_count(), 4);
+        assert!(owner.upgrade().is_some());
+        let cb = kernel.queue.new_command_buffer();
+        let encoder = cb.new_compute_command_encoder();
+        assert_eq!(table.declare_active_slots(encoder, &[3, 42]), None);
+        assert_eq!(table.declare_active_slots(encoder, &[127, 3, 91, 0]), Some(4));
+        encoder.end_encoding();
+        drop(table);
+        assert!(owner.upgrade().is_none());
     }
 
     #[test]

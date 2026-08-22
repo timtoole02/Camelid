@@ -2545,9 +2545,9 @@ async fn main() -> anyhow::Result<()> {
             let open_ui = !no_open && std::io::IsTerminal::is_terminal(&std::io::stdout());
             // Journal the run. A `session_start` with no matching `session_exit`
             // means the process did not leave through the failure path. That
-            // includes an ordinary Ctrl-C as well as an external kill — `serve`
-            // installs no signal handler — so read it as "did not fail on the
-            // way out", never as proof of a kill. See src/diagnostics.rs.
+            // includes an external kill (plain HTTP Ctrl-C now returns through
+            // `serve` cleanly), so read it as "did not fail on the way out",
+            // never as proof of a kill. See src/diagnostics.rs.
             camelid::diagnostics::record_session_start(VERSION, &addr.to_string());
             eprintln!(
                 "  Diagnostics log: {}",

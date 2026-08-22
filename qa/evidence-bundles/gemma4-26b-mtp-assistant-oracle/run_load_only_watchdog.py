@@ -639,6 +639,13 @@ def run(args: argparse.Namespace) -> int:
                 env=environment,
                 start_new_session=True,
                 close_fds=True,
+                # The parent blocks these signals across Popen so a signal
+                # cannot land before `child` is assigned. Restore the original
+                # mask in the forked child before exec; otherwise SIGINT and
+                # the watchdog's fail-closed SIGTERM remain blocked forever.
+                preexec_fn=lambda: signal.pthread_sigmask(
+                    signal.SIG_SETMASK, previous_mask
+                ),
             )
         finally:
             # A pending parent signal is delivered only after Popen has either

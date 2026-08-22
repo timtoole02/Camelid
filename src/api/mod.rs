@@ -2973,7 +2973,11 @@ pub async fn serve(
         })
     } else {
         let listener = tokio::net::TcpListener::from_std(std_listener)?;
-        tokio::spawn(async move { axum::serve(listener, app).await })
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(plain_http_shutdown_signal())
+                .await
+        })
     };
     // Load the startup model AFTER the listener is accepting, so /health and
     // /api/capabilities answer throughout the load. The desktop supervisor
@@ -3042,6 +3046,15 @@ pub async fn serve(
         crate::web_ui::open_in_browser(&url);
     }
     server.await.map_err(std::io::Error::other)?
+}
+
+async fn plain_http_shutdown_signal() {
+    if tokio::signal::ctrl_c().await.is_err() {
+        // A signal-listener setup failure must not make the server shut down
+        // immediately. Keep serving until another explicit termination path
+        // ends the process.
+        std::future::pending::<()>().await;
+    }
 }
 
 #[cfg(test)]

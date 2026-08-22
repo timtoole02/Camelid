@@ -13341,6 +13341,60 @@ pub(crate) struct Gemma4Q4ExpertSlots {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Clone)]
+pub(crate) struct Gemma4Q4FileMappedExpertSource {
+    mmap: std::sync::Arc<crate::wire_mmap::GgufWireMmap>,
+    layer_offset: u64,
+    mapped_span_bytes: usize,
+}
+
+#[cfg(target_os = "macos")]
+impl Gemma4Q4FileMappedExpertSource {
+    fn new(
+        mmap: std::sync::Arc<crate::wire_mmap::GgufWireMmap>,
+        layer_offset: u64,
+        mapped_span_bytes: usize,
+    ) -> Option<Self> {
+        let required = 128usize.checked_mul(GEMMA4_Q4_EXPERT_SLOT_STRIDE)?;
+        let offset = usize::try_from(layer_offset).ok()?;
+        let end = offset.checked_add(mapped_span_bytes)?;
+        let base = unsafe { mmap.base_ptr().add(offset) };
+        let kernel = metal_linear_kernel()?;
+        if mapped_span_bytes != required
+            || end > mmap.mapped_len()
+            || !(base as usize).is_multiple_of(crate::wire_mmap::page_size())
+            || !GEMMA4_Q4_EXPERT_SLOT_STRIDE.is_multiple_of(crate::wire_mmap::page_size())
+            || kernel.device.argument_buffers_support()
+                != metal::MTLArgumentBuffersTier::Tier2
+            || GEMMA4_Q4_EXPERT_SLOT_STRIDE > kernel.device.max_buffer_length() as usize
+        {
+            return None;
+        }
+        Some(Self {
+            mmap,
+            layer_offset,
+            mapped_span_bytes,
+        })
+    }
+
+    fn materialize_for_active_slots(
+        &self,
+        active_slots: &[usize],
+    ) -> Option<spec50_moe_argbuf::Gemma4MoeSlotArgTable> {
+        spec50_moe_argbuf::Gemma4MoeSlotArgTable::from_mapped_active_slots(
+            std::sync::Arc::clone(&self.mmap),
+            self.layer_offset,
+            self.mapped_span_bytes,
+            active_slots,
+        )
+    }
+
+    const fn addressable_slot_count(&self) -> usize {
+        128
+    }
+}
+
+#[cfg(target_os = "macos")]
 enum Gemma4Q4ExpertSlotBacking {
     Monolithic {
         slab: Buffer,
@@ -13350,11 +13404,36 @@ enum Gemma4Q4ExpertSlotBacking {
         records: Vec<Buffer>,
         table: std::sync::Arc<spec50_moe_argbuf::Gemma4MoeSlotArgTable>,
     },
+    /// Canonical read-only `.cghost` records. No persistent Metal resource
+    /// exists: exact active unions are materialized as sparse no-copy views
+    /// only for an in-flight command.
+    FileMappedRecordGranular {
+        source: std::sync::Arc<Gemma4Q4FileMappedExpertSource>,
+    },
 }
 
 #[cfg(target_os = "macos")]
 fn gemma4_record_table_geometry_valid(slot_count: usize, table_slot_count: usize) -> bool {
     (1..=128).contains(&slot_count) && table_slot_count > 0 && table_slot_count <= slot_count
+}
+
+#[cfg(target_os = "macos")]
+fn gemma4_slot_pin_enabled() -> bool {
+    match std::env::var("CAMELID_GEMMA4_SLOT_PIN") {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        ),
+        Err(_) => true,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn pin_shared_metal_pages(ptr: *mut std::ffi::c_void, bytes: usize) -> bool {
+    if ptr.is_null() || bytes == 0 {
+        return false;
+    }
+    unsafe { libc::mlock(ptr, bytes) == 0 }
 }
 
 /// Cloneable, GPU-only view used by the chained lane while the runtime mutates
@@ -13364,18 +13443,19 @@ fn gemma4_record_table_geometry_valid(slot_count: usize, table_slot_count: usize
 pub(crate) enum Gemma4Q4ExpertSlotBinding {
     Monolithic(Buffer),
     RecordGranular(std::sync::Arc<spec50_moe_argbuf::Gemma4MoeSlotArgTable>),
+    FileMappedSource(std::sync::Arc<Gemma4Q4FileMappedExpertSource>),
 }
 
 #[cfg(target_os = "macos")]
 impl Gemma4Q4ExpertSlotBinding {
     fn is_record_granular(&self) -> bool {
-        matches!(self, Self::RecordGranular(_))
+        matches!(self, Self::RecordGranular(_) | Self::FileMappedSource(_))
     }
 
     fn monolithic_buffer(&self) -> Option<&Buffer> {
         match self {
             Self::Monolithic(buffer) => Some(buffer),
-            Self::RecordGranular(_) => None,
+            Self::RecordGranular(_) | Self::FileMappedSource(_) => None,
         }
     }
 
@@ -13383,7 +13463,32 @@ impl Gemma4Q4ExpertSlotBinding {
         match self {
             Self::Monolithic(_) => None,
             Self::RecordGranular(table) => Some(table),
+            Self::FileMappedSource(_) => None,
         }
+    }
+
+    fn addressable_slot_count(&self) -> Option<usize> {
+        match self {
+            Self::Monolithic(_) => None,
+            Self::RecordGranular(table) => Some(table.slot_count()),
+            Self::FileMappedSource(source) => Some(source.addressable_slot_count()),
+        }
+    }
+
+    fn materialize_for_active_slots(&self, active_slots: &[usize]) -> Option<Self> {
+        match self {
+            Self::Monolithic(buffer) => Some(Self::Monolithic(buffer.clone())),
+            Self::RecordGranular(table) => {
+                Some(Self::RecordGranular(std::sync::Arc::clone(table)))
+            }
+            Self::FileMappedSource(source) => source
+                .materialize_for_active_slots(active_slots)
+                .map(|table| Self::RecordGranular(std::sync::Arc::new(table))),
+        }
+    }
+
+    fn is_file_mapped_source(&self) -> bool {
+        matches!(self, Self::FileMappedSource(_))
     }
 }
 
@@ -13420,13 +13525,9 @@ impl Gemma4Q4ExpertSlots {
         Self::new_record_granular_with_table_slots(slot_count, slot_count)
     }
 
-    /// Allocate `slot_count` independent logical records while encoding only
-    /// `table_slot_count` leading records into the Tier-2 pointer table. Empty
-    /// records outside that prefix remain valid allocated capacity for the
-    /// logical residency contract, but no production GPU binding can retain
-    /// or dereference them. The runtime directory uses the identical prefix,
-    /// making this the physical high-water mark without changing slot stride,
-    /// route arithmetic, or the 88-slot logical allocation.
+    /// Preserve `slot_count` as logical metadata while allocating exactly
+    /// `table_slot_count` physical records. The Tier-2 table and directory use
+    /// that identical prefix; the logical tail owns no Metal allocation.
     pub(crate) fn new_record_granular_with_table_slots(
         slot_count: usize,
         table_slot_count: usize,
@@ -13438,8 +13539,8 @@ impl Gemma4Q4ExpertSlots {
         if GEMMA4_Q4_EXPERT_SLOT_STRIDE > kernel.device.max_buffer_length() as usize {
             return None;
         }
-        let mut records = Vec::with_capacity(slot_count);
-        for _ in 0..slot_count {
+        let mut records = Vec::with_capacity(table_slot_count);
+        for _ in 0..table_slot_count {
             let record = kernel.device.new_buffer(
                 GEMMA4_Q4_EXPERT_SLOT_STRIDE as u64,
                 MTLResourceOptions::StorageModeShared,
@@ -13449,10 +13550,8 @@ impl Gemma4Q4ExpertSlots {
             }
             records.push(record);
         }
-        let table = spec50_moe_argbuf::Gemma4MoeSlotArgTable::from_slot_buffers(
-            &kernel.device,
-            &records[..table_slot_count],
-        )?;
+        let table =
+            spec50_moe_argbuf::Gemma4MoeSlotArgTable::from_slot_buffers(&kernel.device, &records)?;
         if table.slot_count() != table_slot_count {
             return None;
         }
@@ -13460,6 +13559,25 @@ impl Gemma4Q4ExpertSlots {
             backing: Gemma4Q4ExpertSlotBacking::RecordGranular {
                 records,
                 table: std::sync::Arc::new(table),
+            },
+            slot_count,
+        })
+    }
+
+    /// Expose one canonical `.cghost` MoE layer directly through the same
+    /// Tier-2 record-table binding used by writable slots. Admission is exact:
+    /// all 128 fixed-stride records must be page aligned and covered by the
+    /// retained read-only mapping.
+    pub(crate) fn new_file_mapped_record_granular(
+        mmap: std::sync::Arc<crate::wire_mmap::GgufWireMmap>,
+        offset: u64,
+        byte_len: usize,
+    ) -> Option<Self> {
+        let source = Gemma4Q4FileMappedExpertSource::new(mmap, offset, byte_len)?;
+        let slot_count = source.addressable_slot_count();
+        Some(Self {
+            backing: Gemma4Q4ExpertSlotBacking::FileMappedRecordGranular {
+                source: std::sync::Arc::new(source),
             },
             slot_count,
         })
@@ -13477,6 +13595,69 @@ impl Gemma4Q4ExpertSlots {
         match &self.backing {
             Gemma4Q4ExpertSlotBacking::Monolithic { .. } => self.slot_count,
             Gemma4Q4ExpertSlotBacking::RecordGranular { table, .. } => table.slot_count(),
+            Gemma4Q4ExpertSlotBacking::FileMappedRecordGranular { source } => {
+                source.addressable_slot_count()
+            }
+        }
+    }
+
+    /// Anonymous Metal capacity owned by this object. File-mapped records are
+    /// addressable but contribute zero here; reporting their virtual span as
+    /// resident allocation would recreate the memory-accounting bug.
+    pub(crate) fn anonymous_capacity_bytes(&self) -> usize {
+        match &self.backing {
+            Gemma4Q4ExpertSlotBacking::Monolithic { slab_bytes, .. } => *slab_bytes,
+            Gemma4Q4ExpertSlotBacking::RecordGranular { records, .. } => {
+                records.len().saturating_mul(GEMMA4_Q4_EXPERT_SLOT_STRIDE)
+            }
+            Gemma4Q4ExpertSlotBacking::FileMappedRecordGranular { .. } => 0,
+        }
+    }
+
+    pub(crate) fn anonymous_slot_count(&self) -> usize {
+        match &self.backing {
+            Gemma4Q4ExpertSlotBacking::Monolithic { .. } => self.slot_count,
+            Gemma4Q4ExpertSlotBacking::RecordGranular { records, .. } => records.len(),
+            Gemma4Q4ExpertSlotBacking::FileMappedRecordGranular { .. } => 0,
+        }
+    }
+
+    pub(crate) fn mapped_address_span_bytes(&self) -> usize {
+        match &self.backing {
+            Gemma4Q4ExpertSlotBacking::FileMappedRecordGranular { source } => {
+                source.mapped_span_bytes
+            }
+            _ => 0,
+        }
+    }
+
+    /// Lock only anonymous slot records actually allocated by this backing.
+    /// Clean file-backed pages deliberately remain under the macOS file pager.
+    pub(crate) fn pin_working_set(&self) -> (usize, usize) {
+        if !gemma4_slot_pin_enabled() {
+            return (0, 0);
+        }
+        match &self.backing {
+            Gemma4Q4ExpertSlotBacking::Monolithic { slab, slab_bytes } => {
+                if pin_shared_metal_pages(slab.contents(), *slab_bytes) {
+                    (*slab_bytes, 0)
+                } else {
+                    (0, *slab_bytes)
+                }
+            }
+            Gemma4Q4ExpertSlotBacking::RecordGranular { records, .. } => {
+                let mut locked = 0usize;
+                let mut failed = 0usize;
+                for record in records {
+                    if pin_shared_metal_pages(record.contents(), GEMMA4_Q4_EXPERT_SLOT_STRIDE) {
+                        locked = locked.saturating_add(GEMMA4_Q4_EXPERT_SLOT_STRIDE);
+                    } else {
+                        failed = failed.saturating_add(GEMMA4_Q4_EXPERT_SLOT_STRIDE);
+                    }
+                }
+                (locked, failed)
+            }
+            Gemma4Q4ExpertSlotBacking::FileMappedRecordGranular { .. } => (0, 0),
         }
     }
 
@@ -13492,6 +13673,14 @@ impl Gemma4Q4ExpertSlots {
         matches!(
             self.backing,
             Gemma4Q4ExpertSlotBacking::RecordGranular { .. }
+                | Gemma4Q4ExpertSlotBacking::FileMappedRecordGranular { .. }
+        )
+    }
+
+    pub(crate) fn is_file_mapped(&self) -> bool {
+        matches!(
+            self.backing,
+            Gemma4Q4ExpertSlotBacking::FileMappedRecordGranular { .. }
         )
     }
 
@@ -13503,13 +13692,17 @@ impl Gemma4Q4ExpertSlots {
             Gemma4Q4ExpertSlotBacking::RecordGranular { table, .. } => {
                 Gemma4Q4ExpertSlotBinding::RecordGranular(std::sync::Arc::clone(table))
             }
+            Gemma4Q4ExpertSlotBacking::FileMappedRecordGranular { source } => {
+                Gemma4Q4ExpertSlotBinding::FileMappedSource(std::sync::Arc::clone(source))
+            }
         }
     }
 
     pub(crate) fn monolithic_slab_buffer(&self) -> Option<&Buffer> {
         match &self.backing {
             Gemma4Q4ExpertSlotBacking::Monolithic { slab, .. } => Some(slab),
-            Gemma4Q4ExpertSlotBacking::RecordGranular { .. } => None,
+            Gemma4Q4ExpertSlotBacking::RecordGranular { .. }
+            | Gemma4Q4ExpertSlotBacking::FileMappedRecordGranular { .. } => None,
         }
     }
 
@@ -13517,6 +13710,7 @@ impl Gemma4Q4ExpertSlots {
         match &self.backing {
             Gemma4Q4ExpertSlotBacking::Monolithic { .. } => None,
             Gemma4Q4ExpertSlotBacking::RecordGranular { table, .. } => Some(table),
+            Gemma4Q4ExpertSlotBacking::FileMappedRecordGranular { .. } => None,
         }
     }
 
@@ -13525,6 +13719,7 @@ impl Gemma4Q4ExpertSlots {
         match &self.backing {
             Gemma4Q4ExpertSlotBacking::Monolithic { .. } => None,
             Gemma4Q4ExpertSlotBacking::RecordGranular { records, .. } => records.get(slot),
+            Gemma4Q4ExpertSlotBacking::FileMappedRecordGranular { .. } => None,
         }
     }
 
@@ -13553,6 +13748,7 @@ impl Gemma4Q4ExpertSlots {
             Gemma4Q4ExpertSlotBacking::RecordGranular { records, .. } => {
                 records.get_mut(slot)?.contents().cast::<u8>()
             }
+            Gemma4Q4ExpertSlotBacking::FileMappedRecordGranular { .. } => return None,
         };
         // SAFETY: the selected backing owns a complete aligned slot and
         // `&mut self` makes the leading record bytes uniquely borrowed.
@@ -13571,6 +13767,7 @@ impl Gemma4Q4ExpertSlots {
             Gemma4Q4ExpertSlotBacking::RecordGranular { records, .. } => {
                 records.get(slot)?.contents().cast::<u8>()
             }
+            Gemma4Q4ExpertSlotBacking::FileMappedRecordGranular { .. } => return None,
         };
         Some(std::slice::from_raw_parts_mut(
             pointer,
@@ -13790,9 +13987,46 @@ impl Gemma4Q4ExpertDiagnostics {
 #[cfg(target_os = "macos")]
 pub(crate) struct Gemma4Q4ExpertPending {
     command_buffer: metal::CommandBuffer,
+    /// Retain indirect expert resources and any source mmap until the command
+    /// reaches a terminal state. `use_resource` is not an ownership edge.
+    _slot_binding: Gemma4Q4ExpertSlotBinding,
     started: std::time::Instant,
     dispatches: u32,
     streamed_weight_bytes: u64,
+}
+
+/// Own one transient file-mapped expert binding through terminal GPU status.
+/// Normal chained execution retires guards at the next layer's queue-order
+/// barrier. The blocking `Drop` path is reserved for fail-closed early exits.
+#[cfg(target_os = "macos")]
+struct Gemma4Q4MappedBindingGuard {
+    command_buffer: metal::CommandBuffer,
+    _slot_binding: Gemma4Q4ExpertSlotBinding,
+}
+
+#[cfg(target_os = "macos")]
+impl Gemma4Q4MappedBindingGuard {
+    fn new(
+        command_buffer: &metal::CommandBufferRef,
+        slot_binding: Gemma4Q4ExpertSlotBinding,
+    ) -> Self {
+        Self {
+            command_buffer: command_buffer.to_owned(),
+            _slot_binding: slot_binding,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Gemma4Q4MappedBindingGuard {
+    fn drop(&mut self) {
+        if !matches!(
+            self.command_buffer.status(),
+            metal::MTLCommandBufferStatus::Completed | metal::MTLCommandBufferStatus::Error
+        ) {
+            self.command_buffer.wait_until_completed();
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -13938,17 +14172,17 @@ impl Gemma4Q4ExpertMetal {
     fn encode_record_head_gateup(
         &self,
         encoder: &metal::ComputeCommandEncoderRef,
-        slots: &Gemma4Q4ExpertSlots,
+        slot_binding: &Gemma4Q4ExpertSlotBinding,
+        active_slots: &[usize],
         input_scales: &Buffer,
         input_quants: &Buffer,
         output: &Buffer,
         mode: spec50_moe_argbuf::Gemma4HeadArgbufGateMode,
     ) -> Option<bool> {
-        let table = slots.record_table()?;
-        let Some(active) = self.prepared_active_slots(slots) else {
-            return Some(false);
-        };
-        if table.declare_active_slots(encoder, &active) != Some(active.len()) {
+        let table = slot_binding.record_table()?;
+        if active_slots.is_empty()
+            || table.declare_active_slots(encoder, active_slots) != Some(active_slots.len())
+        {
             return Some(false);
         }
         Some(table.encode_head_gateup(
@@ -13965,7 +14199,8 @@ impl Gemma4Q4ExpertMetal {
         &self,
         encoder: &metal::ComputeCommandEncoderRef,
         kernel: &MetalLinearKernel,
-        slots: &Gemma4Q4ExpertSlots,
+        slot_binding: &Gemma4Q4ExpertSlotBinding,
+        active_slots: &[usize],
         output: &Buffer,
         simd_fast: bool,
     ) -> bool {
@@ -13986,11 +14221,11 @@ impl Gemma4Q4ExpertMetal {
         let pipeline = turbo_pipeline
             .or(simd_pipeline)
             .unwrap_or(&kernel.gemma4_q4_expert_down_reduce_pipeline);
-        if let Some(table) = slots.record_table() {
-            let Some(active) = self.prepared_active_slots(slots) else {
-                return false;
-            };
-            if table.declare_active_slots(encoder, &active) != Some(active.len()) {
+        if let Some(table) = slot_binding.record_table() {
+            if active_slots.is_empty()
+                || table.declare_active_slots(encoder, active_slots)
+                    != Some(active_slots.len())
+            {
                 return false;
             }
             let mode = if turbo_pipeline.is_some() {
@@ -14010,7 +14245,7 @@ impl Gemma4Q4ExpertMetal {
                 mode,
             );
         }
-        let Some(slab) = slots.monolithic_slab_buffer() else {
+        let Some(slab) = slot_binding.monolithic_buffer() else {
             return false;
         };
         encoder.set_compute_pipeline_state(pipeline);
@@ -14039,10 +14274,18 @@ impl Gemma4Q4ExpertMetal {
         &self,
         encoder: &metal::ComputeCommandEncoderRef,
         kernel: &MetalLinearKernel,
-        slots: &Gemma4Q4ExpertSlots,
+        slot_binding: &Gemma4Q4ExpertSlotBinding,
+        active_slots: &[usize],
         simd_fast: bool,
     ) -> bool {
-        self.encode_down_reduce_to(encoder, kernel, slots, &self.output, simd_fast)
+        self.encode_down_reduce_to(
+            encoder,
+            kernel,
+            slot_binding,
+            active_slots,
+            &self.output,
+            simd_fast,
+        )
     }
 
     /// Full-speed lane: fused ordered gate/up+GeGLU, Q8_0 requantization, then
@@ -14067,6 +14310,10 @@ impl Gemma4Q4ExpertMetal {
         prefer_simd: bool,
     ) -> Option<Gemma4Q4ExpertDiagnostics> {
         self.prepare(input, slots, routes, output)?;
+        let active_slots = self.prepared_active_slots(slots)?;
+        let slot_binding = slots
+            .gpu_binding()
+            .materialize_for_active_slots(&active_slots)?;
         let kernel = metal_linear_kernel()?;
         let simd_fast = prefer_simd && gemma4_q4_simd_fast_available(kernel);
         let started = std::time::Instant::now();
@@ -14094,7 +14341,8 @@ impl Gemma4Q4ExpertMetal {
         };
         if let Some(encoded) = self.encode_record_head_gateup(
             encoder,
-            slots,
+            &slot_binding,
+            &active_slots,
             &self.input_scales,
             &self.input_quants,
             &self.activated,
@@ -14110,7 +14358,7 @@ impl Gemma4Q4ExpertMetal {
                 return None;
             }
         } else {
-            let slab = slots.monolithic_slab_buffer()?;
+            let slab = slot_binding.monolithic_buffer()?;
             encoder.set_compute_pipeline_state(gate_pipeline);
             encoder.set_buffer(0, Some(&self.input_scales), 0);
             encoder.set_buffer(1, Some(&self.input_quants), 0);
@@ -14150,7 +14398,13 @@ impl Gemma4Q4ExpertMetal {
             GEMMA4_Q4_EXPERT_ROUTES * GEMMA4_Q4_EXPERT_ACT_BLOCKS,
         );
 
-        if !self.encode_down_reduce(encoder, kernel, slots, simd_fast) {
+        if !self.encode_down_reduce(
+            encoder,
+            kernel,
+            &slot_binding,
+            &active_slots,
+            simd_fast,
+        ) {
             encoder.end_encoding();
             return None;
         }
@@ -14196,6 +14450,10 @@ impl Gemma4Q4ExpertMetal {
         output: &mut [f32],
     ) -> Option<Gemma4Q4ExpertDiagnostics> {
         self.prepare(input, slots, routes, output)?;
+        let active_slots = self.prepared_active_slots(slots)?;
+        let slot_binding = slots
+            .gpu_binding()
+            .materialize_for_active_slots(&active_slots)?;
         let kernel = metal_linear_kernel()?;
         let started = std::time::Instant::now();
 
@@ -14203,7 +14461,8 @@ impl Gemma4Q4ExpertMetal {
         let gate_encoder = gate_command.new_compute_command_encoder();
         if let Some(encoded) = self.encode_record_head_gateup(
             gate_encoder,
-            slots,
+            &slot_binding,
+            &active_slots,
             &self.input_scales,
             &self.input_quants,
             &self.gate_up,
@@ -14214,7 +14473,7 @@ impl Gemma4Q4ExpertMetal {
                 return None;
             }
         } else {
-            let slab = slots.monolithic_slab_buffer()?;
+            let slab = slot_binding.monolithic_buffer()?;
             gate_encoder
                 .set_compute_pipeline_state(&kernel.gemma4_q4_expert_gate_up_split_pipeline);
             gate_encoder.set_buffer(0, Some(&self.input_scales), 0);
@@ -14238,7 +14497,13 @@ impl Gemma4Q4ExpertMetal {
 
         let down_command = kernel.queue.new_command_buffer();
         let down_encoder = down_command.new_compute_command_encoder();
-        if !self.encode_down_reduce(down_encoder, kernel, slots, false) {
+        if !self.encode_down_reduce(
+            down_encoder,
+            kernel,
+            &slot_binding,
+            &active_slots,
+            false,
+        ) {
             down_encoder.end_encoding();
             return None;
         }
@@ -14283,6 +14548,10 @@ impl Gemma4Q4ExpertMetal {
         }
 
         self.prepare_routes(slots, routes)?;
+        let active_slots = self.prepared_active_slots(slots)?;
+        let slot_binding = slots
+            .gpu_binding()
+            .materialize_for_active_slots(&active_slots)?;
         let kernel = metal_linear_kernel()?;
         let started = std::time::Instant::now();
 
@@ -14293,7 +14562,8 @@ impl Gemma4Q4ExpertMetal {
         let scratch = common.moe.as_ref()?;
         if let Some(encoded) = self.encode_record_head_gateup(
             gate_encoder,
-            slots,
+            &slot_binding,
+            &active_slots,
             &scratch.expert_input_scales,
             &scratch.expert_input_quants,
             &self.gate_up,
@@ -14304,7 +14574,7 @@ impl Gemma4Q4ExpertMetal {
                 return None;
             }
         } else {
-            let slab = slots.monolithic_slab_buffer()?;
+            let slab = slot_binding.monolithic_buffer()?;
             gate_encoder
                 .set_compute_pipeline_state(&kernel.gemma4_q4_expert_gate_up_split_pipeline);
             gate_encoder.set_buffer(0, Some(&scratch.expert_input_scales), 0);
@@ -14328,7 +14598,14 @@ impl Gemma4Q4ExpertMetal {
 
         let down_command = kernel.queue.new_command_buffer();
         let down_encoder = down_command.new_compute_command_encoder();
-        if !self.encode_down_reduce_to(down_encoder, kernel, slots, &common.routed_output, false) {
+        if !self.encode_down_reduce_to(
+            down_encoder,
+            kernel,
+            &slot_binding,
+            &active_slots,
+            &common.routed_output,
+            false,
+        ) {
             down_encoder.end_encoding();
             return None;
         }
@@ -14368,6 +14645,12 @@ impl Gemma4Q4ExpertMetal {
         routes: &[Gemma4Q4ExpertRoute; GEMMA4_Q4_EXPERT_ROUTES],
     ) -> Option<Gemma4Q4ExpertPending> {
         self.prepare_routes(slots, routes)?;
+        let active_slots = self.prepared_active_slots(slots)?;
+        // The returned pending handle may outlive this borrow of `slots`.
+        // Keep the complete binding alive while Metal dereferences it.
+        let slot_binding = slots
+            .gpu_binding()
+            .materialize_for_active_slots(&active_slots)?;
         let kernel = metal_linear_kernel()?;
         let started = std::time::Instant::now();
         let command_buffer = kernel.queue.new_command_buffer();
@@ -14395,7 +14678,8 @@ impl Gemma4Q4ExpertMetal {
         };
         if let Some(encoded) = self.encode_record_head_gateup(
             encoder,
-            slots,
+            &slot_binding,
+            &active_slots,
             &scratch.expert_input_scales,
             &scratch.expert_input_quants,
             &self.activated,
@@ -14412,7 +14696,7 @@ impl Gemma4Q4ExpertMetal {
                 return None;
             }
         } else {
-            let slab = slots.monolithic_slab_buffer()?;
+            let slab = slot_binding.monolithic_buffer()?;
             encoder.set_compute_pipeline_state(gate_pipeline);
             encoder.set_buffer(0, Some(&scratch.expert_input_scales), 0);
             encoder.set_buffer(1, Some(&scratch.expert_input_quants), 0);
@@ -14450,7 +14734,14 @@ impl Gemma4Q4ExpertMetal {
             &kernel.gemma4_q4_expert_quantize_pipeline,
             GEMMA4_Q4_EXPERT_ROUTES * GEMMA4_Q4_EXPERT_ACT_BLOCKS,
         );
-        if !self.encode_down_reduce_to(encoder, kernel, slots, &common.routed_output, simd_fast) {
+        if !self.encode_down_reduce_to(
+            encoder,
+            kernel,
+            &slot_binding,
+            &active_slots,
+            &common.routed_output,
+            simd_fast,
+        ) {
             encoder.end_encoding();
             return None;
         }
@@ -14460,6 +14751,7 @@ impl Gemma4Q4ExpertMetal {
         common.promote_tail_output();
         Some(Gemma4Q4ExpertPending {
             command_buffer: command_buffer.to_owned(),
+            _slot_binding: slot_binding,
             started,
             dispatches: 3 + tail_dispatches,
             streamed_weight_bytes: (GEMMA4_Q4_EXPERT_ROUTES * GEMMA4_Q4_EXPERT_RECORD_BYTES) as u64,
@@ -23015,7 +23307,7 @@ mod record_work_address_tests {
     use super::*;
 
     #[test]
-    fn record_table_prefix_retains_88_logical_allocations_with_32_bound_slots() {
+    fn record_table_prefix_supports_88_logical_ids_with_32_physical_slots() {
         assert!(gemma4_record_table_geometry_valid(88, 32));
         assert!(gemma4_record_table_geometry_valid(88, 88));
         assert!(!gemma4_record_table_geometry_valid(88, 0));
@@ -25479,12 +25771,23 @@ impl Gemma4GhostCommonMetal {
         let record_demand = expert_bindings
             .first()
             .is_some_and(Gemma4Q4ExpertSlotBinding::is_record_granular);
+        let file_mapped_demand = expert_bindings
+            .first()
+            .is_some_and(Gemma4Q4ExpertSlotBinding::is_file_mapped_source);
         if expert_bindings
             .iter()
             .take(self.layers.len())
             .any(|binding| binding.is_record_granular() != record_demand)
         {
             eprintln!("[metal chained round] rejected: mixed expert slot backing");
+            return false;
+        }
+        if expert_bindings
+            .iter()
+            .take(self.layers.len())
+            .any(|binding| binding.is_file_mapped_source() != file_mapped_demand)
+        {
+            eprintln!("[metal chained round] rejected: mixed mapped expert sources");
             return false;
         }
         if record_demand {
@@ -25494,9 +25797,7 @@ impl Gemma4GhostCommonMetal {
                     .copied()
                     .unwrap_or(0)
                     .min(128);
-                let actual_slots = binding
-                    .record_table()
-                    .map_or(0, spec50_moe_argbuf::Gemma4MoeSlotArgTable::slot_count);
+                let actual_slots = binding.addressable_slot_count().unwrap_or(0);
                 if expected_slots == 0 || actual_slots != expected_slots {
                     eprintln!(
                         "[metal chained round] rejected: layer {layer_idx} record table slots {actual_slots} != routing capacity {expected_slots}"
@@ -25514,6 +25815,12 @@ impl Gemma4GhostCommonMetal {
         if record_demand && (pong_slab.is_some() || !wave1_slabs.is_empty()) {
             eprintln!(
                 "[metal chained round] rejected: record-granular demand backing forbids monolithic overflow resources"
+            );
+            return false;
+        }
+        if file_mapped_demand && slot_filler.is_none() {
+            eprintln!(
+                "[metal chained round] rejected: mapped expert sources require an exact slot directory"
             );
             return false;
         }
@@ -25557,12 +25864,18 @@ impl Gemma4GhostCommonMetal {
         ledger.kv_capacity = self.kv_capacity as u32;
         ledger.kv_bytes = self.geometry.kv_bytes as u64;
         ledger.kv_filled = (start_pos + k_tokens) as u32;
-        ledger.overflow_slots = GEMMA4_OVERFLOW_BANK_SLOTS as u32;
+        ledger.overflow_slots = if file_mapped_demand {
+            0
+        } else {
+            GEMMA4_OVERFLOW_BANK_SLOTS as u32
+        };
         // Bounded record demand owns one deliberately inert overflow bank and
         // refuses any union beyond the table/directory prefix before encode.
         // Receipt that actual one-bank allocation, not the 30-copy shipping
         // capacity that cannot be bound from this path.
-        let overflow_bank_copies = if record_demand {
+        let overflow_bank_copies = if file_mapped_demand {
+            0
+        } else if record_demand {
             1
         } else {
             GEMMA4_OVERFLOW_BANK_COPIES
@@ -25757,6 +26070,16 @@ impl Gemma4GhostCommonMetal {
             ledger.wave_load_ms += t_pre.elapsed().as_secs_f64() * 1000.0;
         }
 
+        let stage_profile = chained_stage_profile_enabled();
+        let dump_layers =
+            std::env::var("CAMELID_GEMMA4_DUMP_LAYERS").is_ok_and(|value| value == "1");
+        if file_mapped_demand && (stage_profile || dump_layers) {
+            eprintln!(
+                "[metal chained round] rejected: transient mapped expert bindings do not support stage-split or layer-dump command buffers"
+            );
+            return false;
+        }
+
         let mut encode_clock = std::time::Instant::now();
         let mut stamp = GpuStageStamp::new();
         let mut cmd_buf = kernel.queue.new_command_buffer();
@@ -25768,7 +26091,6 @@ impl Gemma4GhostCommonMetal {
         // per-stage GPU time (at the cost of lost intra-layer overlap). Off by
         // default: the boundary is a no-op and Metal memory barriers order the
         // stages inside one command buffer.
-        let stage_profile = chained_stage_profile_enabled();
         // Overlap scheduling for the unpredicted path: a commit-order /
         // encode-timing reorder only (see `overlap_enabled`). Excluded under
         // stage profiling (which owns command-buffer boundaries) and layer
@@ -25776,7 +26098,7 @@ impl Gemma4GhostCommonMetal {
         let overlap_round = !record_demand
             && overlap_enabled()
             && !stage_profile
-            && !std::env::var("CAMELID_GEMMA4_DUMP_LAYERS").is_ok_and(|v| v == "1");
+            && !dump_layers;
         macro_rules! begin_gpu_stage {
             ($stage:expr) => {{
                 if stage_profile {
@@ -25799,6 +26121,10 @@ impl Gemma4GhostCommonMetal {
         // on directly); the next layer's CB1 queues behind CB3.
         let mut cb_closed = false;
         let mut last_committed_cb: Option<metal::CommandBuffer> = None;
+        // Sparse no-copy tables are created only after each layer's exact
+        // routed union is known and retained through a queue-order barrier.
+        let mut live_mapped_bindings: Vec<Gemma4Q4ExpertSlotBinding> = Vec::with_capacity(1);
+        let mut mapped_binding_guards: Vec<Gemma4Q4MappedBindingGuard> = Vec::with_capacity(1);
         for layer_idx in 0..self.layers.len() {
             let layer = &self.layers[layer_idx];
             let norms = &self.norms[layer_idx];
@@ -26633,6 +26959,16 @@ impl Gemma4GhostCommonMetal {
                     self.last_chained_ledger = ledger;
                     return false;
                 }
+                // The completed router command is later on the singleton queue
+                // than every guarded expert command from the previous layer.
+                mapped_binding_guards.clear();
+                if !live_mapped_bindings.is_empty() {
+                    eprintln!(
+                        "[metal chained round] layer {layer_idx} retirement barrier found an uncommitted mapped binding"
+                    );
+                    self.last_chained_ledger = ledger;
+                    return false;
+                }
                 if std::env::var("CAMELID_GEMMA4_GHOST_METAL_TIMING")
                     .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 {
@@ -26811,6 +27147,18 @@ impl Gemma4GhostCommonMetal {
                     eprintln!(
                             "[metal chained round] layer {layer_idx} routed an empty expert union; failing closed"
                         );
+                    self.last_chained_ledger = ledger;
+                    return false;
+                }
+                if file_mapped_demand
+                    && union.iter().any(|&expert| {
+                        expert >= updated_slots.len() || updated_slots[expert] != expert as u32
+                    })
+                {
+                    eprintln!(
+                        "[metal chained round] layer {layer_idx} mapped source directory is not canonical expert-to-slot identity"
+                    );
+                    ledger.missing_expert_failclose += 1;
                     self.last_chained_ledger = ledger;
                     return false;
                 }
@@ -27071,6 +27419,37 @@ impl Gemma4GhostCommonMetal {
                             None
                         };
 
+                        let materialized_binding = if slot_binding.is_file_mapped_source() {
+                            if !live_mapped_bindings.is_empty() {
+                                eprintln!(
+                                    "[metal chained round] layer {layer_idx} wave {wi} attempted to replace a live mapped binding"
+                                );
+                                self.last_chained_ledger = ledger;
+                                return false;
+                            }
+                            let Some(active_slots) = active_slots.as_deref() else {
+                                eprintln!(
+                                    "[metal chained round] layer {layer_idx} wave {wi} mapped source has no active-slot plan"
+                                );
+                                self.last_chained_ledger = ledger;
+                                return false;
+                            };
+                            let Some(binding) =
+                                slot_binding.materialize_for_active_slots(active_slots)
+                            else {
+                                eprintln!(
+                                    "[metal chained round] layer {layer_idx} wave {wi} could not materialize its sparse mapped binding"
+                                );
+                                self.last_chained_ledger = ledger;
+                                return false;
+                            };
+                            Some(binding)
+                        } else {
+                            None
+                        };
+                        let encode_slot_binding =
+                            materialized_binding.as_ref().unwrap_or(slot_binding);
+
                         encode_clock = std::time::Instant::now();
                         cmd_buf = kernel.queue.new_command_buffer();
                         encoder = cmd_buf.new_compute_command_encoder();
@@ -27086,7 +27465,7 @@ impl Gemma4GhostCommonMetal {
                             encoder,
                             &down_exps_scale,
                             &expert_to_slot_table,
-                            slot_binding,
+                            encode_slot_binding,
                             active_slots.as_deref(),
                             layer_idx,
                             num_slots,
@@ -27105,7 +27484,7 @@ impl Gemma4GhostCommonMetal {
                         if !self.encode_moe_down(
                             kernel,
                             encoder,
-                            slot_binding,
+                            encode_slot_binding,
                             active_slots.as_deref(),
                             layer_idx,
                             k_tokens,
@@ -27116,6 +27495,9 @@ impl Gemma4GhostCommonMetal {
                             encoder.end_encoding();
                             self.last_chained_ledger = ledger;
                             return false;
+                        }
+                        if let Some(binding) = materialized_binding {
+                            live_mapped_bindings.push(binding);
                         }
                         if wi > 0 {
                             let n_el = (k_tokens * GEMMA4_Q4_EXPERT_HIDDEN) as u32;
@@ -27548,6 +27930,10 @@ impl Gemma4GhostCommonMetal {
                 encoder.end_encoding();
                 stamp.push_current(cmd_buf);
                 cmd_buf.commit();
+                for binding in live_mapped_bindings.drain(..) {
+                    mapped_binding_guards
+                        .push(Gemma4Q4MappedBindingGuard::new(cmd_buf, binding));
+                }
                 last_committed_cb = Some(cmd_buf.to_owned());
                 cb_closed = true;
                 encode_clock = std::time::Instant::now();
@@ -27592,6 +27978,14 @@ impl Gemma4GhostCommonMetal {
         if let Err(error) = stamp.harvest_completed() {
             eprintln!(
                 "[metal chained round] final barrier failed to retire stamped command buffers: {error}"
+            );
+            self.last_chained_ledger = ledger;
+            return false;
+        }
+        mapped_binding_guards.clear();
+        if !live_mapped_bindings.is_empty() {
+            eprintln!(
+                "[metal chained round] final barrier found an uncommitted mapped expert binding"
             );
             self.last_chained_ledger = ledger;
             return false;
@@ -43695,9 +44089,97 @@ kernel void sample_active_expert_records(
         assert!(slots.slot_bytes_mut(2).is_none());
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_bounded_record_slots_allocate_and_pin_only_physical_prefix() {
+        if !detect_metal_device().available {
+            return;
+        }
+        const LOGICAL_SLOTS: usize = 4;
+        const PHYSICAL_SLOTS: usize = 2;
+        let mut slots = Gemma4Q4ExpertSlots::new_record_granular_with_table_slots(
+            LOGICAL_SLOTS,
+            PHYSICAL_SLOTS,
+        )
+        .expect("bounded record slots");
+        assert_eq!(slots.slot_count(), LOGICAL_SLOTS);
+        assert_eq!(slots.gpu_slot_count(), PHYSICAL_SLOTS);
+        assert_eq!(slots.anonymous_slot_count(), PHYSICAL_SLOTS);
+        assert_eq!(
+            slots.anonymous_capacity_bytes(),
+            PHYSICAL_SLOTS * GEMMA4_Q4_EXPERT_SLOT_STRIDE
+        );
+        assert!(slots.record_buffer(PHYSICAL_SLOTS - 1).is_some());
+        assert!(slots.record_buffer(PHYSICAL_SLOTS).is_none());
+        assert!(slots.slot_bytes_mut(PHYSICAL_SLOTS - 1).is_some());
+        assert!(slots.slot_bytes_mut(PHYSICAL_SLOTS).is_none());
+        let (locked, failed) = slots.pin_working_set();
+        let expected = if gemma4_slot_pin_enabled() {
+            PHYSICAL_SLOTS * GEMMA4_Q4_EXPERT_SLOT_STRIDE
+        } else {
+            0
+        };
+        assert_eq!(locked.saturating_add(failed), expected);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires the local Gemma 4 26B .cghost and a Tier-2 Metal device"]
+    fn metal_gemma4_file_mapped_slots_are_read_only_and_owner_retained() {
+        if std::env::var("CAMELID_GEMMA4_ARGBUF_MOE_TEST").as_deref() != Ok("1")
+            || !detect_metal_device().available
+        {
+            return;
+        }
+        let path = std::env::var_os("CAMELID_GEMMA4_26B_CGHOST")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(
+                    "/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost",
+                )
+            });
+        if !path.is_file() {
+            return;
+        }
+        let ghost = crate::ghost::GhostFile::open(&path).expect("open canonical .cghost");
+        let (mmap, offset, span) = ghost
+            .mapped_moe_layer_slab(
+                26,
+                128,
+                GEMMA4_Q4_EXPERT_RECORD_BYTES,
+                GEMMA4_Q4_EXPERT_SLOT_STRIDE,
+            )
+            .expect("validate mapped expert layer")
+            .expect("normal GhostFile open retains its mapping");
+        let mapped_owner = std::sync::Arc::downgrade(&mmap);
+        let mut slots = Gemma4Q4ExpertSlots::new_file_mapped_record_granular(mmap, offset, span)
+            .expect("production mapped slot adapter");
+        drop(ghost);
+
+        assert!(slots.is_file_mapped());
+        assert_eq!(slots.gpu_slot_count(), 128);
+        assert_eq!(slots.anonymous_slot_count(), 0);
+        assert_eq!(slots.anonymous_capacity_bytes(), 0);
+        assert!(slots.slot_bytes_mut(0).is_none());
+
+        let binding = slots.gpu_binding();
+        drop(slots);
+        assert!(binding.is_file_mapped_source());
+        assert_eq!(binding.addressable_slot_count(), Some(128));
+        assert!(mapped_owner.upgrade().is_some());
+        let sparse = binding
+            .materialize_for_active_slots(&[127, 3, 3, 91, 0, 42])
+            .expect("transient selected-only mapped binding");
+        assert_eq!(sparse.record_table().unwrap().bound_record_count(), 5);
+        drop(binding);
+        assert!(mapped_owner.upgrade().is_some());
+        drop(sparse);
+        assert!(mapped_owner.upgrade().is_none());
+    }
+
     /// Model-free residency gate for the external 250 ms swap watchdog.
-    /// It allocates the complete 30x88 logical demand capacity while encoding
-    /// only the production 32-record prefix in each Tier-2 table. Every layer
+    /// It preserves 30x88 logical metadata while allocating only the
+    /// production 32-record prefix in each Tier-2 table. Every layer
     /// receives explicit record fills, one real HEAD dispatch, and one real
     /// chained K=8 GateUp+Down dispatch with the argument table bound. The
     /// objects then remain live for a 30-second soak. The watchdog must observe
@@ -43738,7 +44220,7 @@ kernel void sample_active_expert_records(
                     LOGICAL_SLOTS,
                     PHYSICAL_TABLE_SLOTS,
                 )
-                .expect("30x88 record allocations with 32-entry tables")
+                .expect("30x32 physical allocations with 88-slot logical metadata")
             })
             .collect();
         let kernel = metal_linear_kernel().expect("Metal kernel");
@@ -43795,14 +44277,16 @@ kernel void sample_active_expert_records(
         let mut head_output = vec![0.0f32; GEMMA4_Q4_EXPERT_HIDDEN];
         let mut head = Gemma4Q4ExpertMetal::new().expect("HEAD expert executor");
         let active_slots = (0..active_per_layer).collect::<Vec<_>>();
-        let allocated_capacity = layers.len() * LOGICAL_SLOTS * GEMMA4_Q4_EXPERT_SLOT_STRIDE;
+        let logical_capacity = layers.len() * LOGICAL_SLOTS * GEMMA4_Q4_EXPERT_SLOT_STRIDE;
+        let allocated_capacity =
+            layers.len() * PHYSICAL_TABLE_SLOTS * GEMMA4_Q4_EXPERT_SLOT_STRIDE;
         let table_bound_capacity =
             layers.len() * PHYSICAL_TABLE_SLOTS * GEMMA4_Q4_EXPERT_SLOT_STRIDE;
         let filled_payload = layers.len() * active_per_layer * GEMMA4_Q4_EXPERT_RECORD_BYTES;
         let explicitly_touched_span =
             layers.len() * active_per_layer * GEMMA4_Q4_EXPERT_SLOT_STRIDE;
         eprintln!(
-            "[record-slot-watchdog] allocated_capacity={allocated_capacity} table_bound_capacity={table_bound_capacity} filled_payload={filled_payload} explicitly_touched_span={explicitly_touched_span} logical_slots_per_layer={LOGICAL_SLOTS} table_slots_per_layer={PHYSICAL_TABLE_SLOTS} active_per_layer={active_per_layer}",
+            "[record-slot-watchdog] logical_capacity={logical_capacity} allocated_capacity={allocated_capacity} table_bound_capacity={table_bound_capacity} filled_payload={filled_payload} explicitly_touched_span={explicitly_touched_span} logical_slots_per_layer={LOGICAL_SLOTS} table_slots_per_layer={PHYSICAL_TABLE_SLOTS} active_per_layer={active_per_layer}",
         );
         let mut layers = layers;
         for (layer_idx, slots) in layers.iter_mut().enumerate() {
@@ -43812,7 +44296,9 @@ kernel void sample_active_expert_records(
                 slots.record_table().map(|table| table.slot_count()),
                 Some(PHYSICAL_TABLE_SLOTS)
             );
-            assert!(slots.record_buffer(LOGICAL_SLOTS - 1).is_some());
+            assert!(slots.record_buffer(PHYSICAL_TABLE_SLOTS - 1).is_some());
+            assert!(slots.record_buffer(PHYSICAL_TABLE_SLOTS).is_none());
+            assert!(slots.record_buffer(LOGICAL_SLOTS - 1).is_none());
             assert!(slots.slot_bytes_mut(PHYSICAL_TABLE_SLOTS).is_none());
             for slot in 0..active_per_layer {
                 slots

@@ -6884,6 +6884,8 @@ mod pure_tests {
                 occupied_base_slots: 2,
                 occupied_base_payload_bytes: 200,
                 occupied_base_touched_bytes: 256,
+                file_mapped_addressable_slots: 0,
+                file_mapped_address_span_bytes: 0,
                 slot_stats: stats.clone(),
             }],
             aggregate_slot_stats: stats,

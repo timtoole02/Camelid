@@ -1512,9 +1512,14 @@ const GHOST_METAL_EXPERT_SLOTS_MAX: usize = 128;
 /// populate them only from routed demand. Absence or any value other than the
 /// exact affirmative `1` preserves the shipping cold-start prewarm.
 const GHOST_METAL_DEMAND_LOAD_ONLY_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_DEMAND_LOAD_ONLY";
-/// Exact demand-only residency bound. The runtime still allocates the full
-/// logical slot set, but only this prefix is admitted into the directory and
-/// Tier-2 pointer table. Keeping unbound records out of that table matters:
+/// Exact opt-in for the macOS clean-file-pager lane. Canonical expert records
+/// stay in the retained read-only `.cghost` mmap and are exposed through
+/// transient no-copy Tier-2 tables.
+const GHOST_METAL_FILE_MAPPED_EXPERTS_ENV: &str =
+    "CAMELID_GEMMA4_GHOST_METAL_FILE_MAPPED_EXPERTS";
+/// Exact demand-only residency bound. The runtime preserves the full logical
+/// expert namespace but allocates, pins, admits, and accounts only this
+/// physical prefix. Keeping unbound records out of the Tier-2 table matters:
 /// the first compute use may materialize every buffer encoded in it even when
 /// the encoder declares only the active route resources.
 const GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER_ENV: &str =
@@ -1551,14 +1556,8 @@ fn ghost_metal_demand_load_only_from_env() -> bool {
     )
 }
 
-/// Once a demand runtime has admitted an explicit physical table prefix, a
-/// refused chained attempt must be terminal. Falling through to the CPU lane
-/// would hide the bounded-record correctness refusal inside a slow but
-/// apparently successful performance receipt.
-#[cfg(target_os = "macos")]
-fn ghost_metal_bounded_record_fallback_forbidden() -> bool {
-    ghost_metal_demand_load_only_from_env()
-        && std::env::var_os(GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER_ENV).is_some()
+fn ghost_metal_file_mapped_experts_from(value: Option<&str>) -> bool {
+    value.is_some_and(|raw| raw.trim() == "1")
 }
 
 #[cfg(target_os = "macos")]
@@ -1757,6 +1756,10 @@ struct GhostMetalSlotDirectory {
     /// experts are selected and their routing values never depend on WHICH
     /// slot holds a record.
     recency_first: bool,
+    /// Every canonical expert is permanently addressable at the identical
+    /// slot index in a read-only file-backed table. Such a directory may
+    /// report hits but can never plan a load, eviction, or remap.
+    static_identity: bool,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1825,7 +1828,25 @@ impl GhostMetalSlotDirectory {
             clock: 0,
             accesses: 0,
             recency_first,
+            static_identity: false,
         }
+    }
+
+    fn new_static_identity(expert_count: usize) -> Option<Self> {
+        if expert_count == 0 || expert_count > 128 {
+            return None;
+        }
+        let mut directory = Self::new(expert_count);
+        directory.static_identity = true;
+        for expert in 0..expert_count {
+            directory.entries[expert] = Some(GhostMetalSlotEntry {
+                expert,
+                frequency: 1,
+                last_used: 0,
+            });
+            directory.resident_slot_table[expert] = expert as i16;
+        }
+        Some(directory)
     }
 
     #[inline(always)]
@@ -1840,6 +1861,33 @@ impl GhostMetalSlotDirectory {
     }
 
     fn plan(&mut self, experts: &[usize]) -> Result<GhostMetalSlotPlan> {
+        if self.static_identity {
+            if experts.iter().any(|&expert| {
+                expert >= self.entries.len()
+                    || self.resident_slot_table[expert] != expert as i16
+                    || self.entries[expert]
+                        .is_none_or(|entry| entry.expert != expert)
+            }) {
+                return Err(BackendError::InvalidModelMetadata(
+                    "file-mapped Ghost Metal directory received a non-canonical expert id"
+                        .into(),
+                ));
+            }
+            for &expert in experts {
+                self.clock = self.clock.saturating_add(1);
+                self.accesses = self.accesses.saturating_add(1);
+                if let Some(entry) = self.entries[expert].as_mut() {
+                    entry.frequency = entry.frequency.saturating_add(1);
+                    entry.last_used = self.clock;
+                }
+            }
+            return Ok(GhostMetalSlotPlan {
+                route_slots: experts.to_vec(),
+                loads: Vec::new(),
+                hits: experts.len(),
+                evicted: Vec::new(),
+            });
+        }
         let distinct = experts
             .iter()
             .copied()
@@ -1968,6 +2016,10 @@ impl GhostMetalSlotDirectory {
     }
 
     fn commit_load(&mut self, load: GhostMetalSlotLoad) {
+        assert!(
+            !self.static_identity,
+            "attempted to commit a writable load into a static file-mapped expert directory"
+        );
         debug_assert!(self.entries.get(load.slot).is_some_and(Option::is_none));
         self.entries[load.slot] = Some(GhostMetalSlotEntry {
             expert: load.expert,
@@ -2232,6 +2284,9 @@ struct GhostMetalExpertRuntime {
     engine: crate::metal::Gemma4Q4ExpertMetal,
     layers: Vec<GhostMetalExpertLayer>,
     fused_fast: bool,
+    /// Latched at construction so a later environment mutation cannot turn a
+    /// bounded or mapped correctness refusal into CPU fallback.
+    cpu_fallback_forbidden: bool,
     common: Option<crate::metal::Gemma4GhostCommonMetal>,
     sequence_mode: GhostMetalSequenceMode,
     latest_routed_experts: Vec<Vec<usize>>,
@@ -3042,7 +3097,7 @@ impl GhostMetalExpertRuntime {
         }
         if let Some(physical_slot_budget) = physical_slot_budget {
             eprintln!(
-                "[gemma4-ghost-metal] {GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER_ENV}={physical_slot_budget}: allocated logical slots/layer={allocated_slot_floor}, bound table/directory slots/layer={physical_slot_budget}"
+                "[gemma4-ghost-metal] {GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER_ENV}={physical_slot_budget}: logical namespace/layer={allocated_slot_floor}, allocated/bound slots/layer={physical_slot_budget}"
             );
         }
         // The overflow bank only holds experts beyond the resident slots. When
@@ -3075,6 +3130,25 @@ impl GhostMetalExpertRuntime {
                 crate::metal::Gemma4Q4ExpertSlots::new(GHOST_METAL_OVERFLOW_SLOTS)?
             });
         }
+        let mut pinned_bytes = 0usize;
+        let mut pin_failed_bytes = 0usize;
+        for layer in &layers {
+            let (locked, failed) = layer.slots.pin_working_set();
+            pinned_bytes = pinned_bytes.saturating_add(locked);
+            pin_failed_bytes = pin_failed_bytes.saturating_add(failed);
+        }
+        for bank in &overflow_bank {
+            let (locked, failed) = bank.pin_working_set();
+            pinned_bytes = pinned_bytes.saturating_add(locked);
+            pin_failed_bytes = pin_failed_bytes.saturating_add(failed);
+        }
+        if pinned_bytes > 0 || pin_failed_bytes > 0 {
+            eprintln!(
+                "[gemma4-ghost-metal] slot mlock: {:.2} GiB pinned, {:.2} GiB failed (CAMELID_GEMMA4_SLOT_PIN=0 skips)",
+                pinned_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                pin_failed_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+            );
+        }
         eprintln!(
             "[gemma4-ghost-metal] global overflow bank: {}×{} slots ({:.2} MiB total){}{}, reused across {} layers (not per-layer)",
             bank_copies,
@@ -3097,6 +3171,7 @@ impl GhostMetalExpertRuntime {
             engine,
             layers,
             fused_fast,
+            cpu_fallback_forbidden: bounded_record_failclose,
             common: None,
             sequence_mode: GhostMetalSequenceMode::Idle,
             latest_routed_experts: vec![Vec::new(); layer_count],
@@ -3115,6 +3190,107 @@ impl GhostMetalExpertRuntime {
         })
     }
 
+    /// Construct the exact clean-file-pager lane. Every expert is permanently
+    /// addressable as `slot == expert`; the runtime owns no writable expert
+    /// payload, victim cache, or overflow slab.
+    fn new_file_mapped(
+        layer_count: usize,
+        fused_fast: bool,
+        ghost_file: &GhostFile,
+    ) -> Result<Self> {
+        if layer_count == 0 {
+            return Err(BackendError::InvalidModelMetadata(
+                "file-mapped Ghost Metal requires at least one layer".into(),
+            ));
+        }
+        if ghost_file.wire_mapping().is_none() {
+            return Err(BackendError::InvalidModelMetadata(format!(
+                "{GHOST_METAL_FILE_MAPPED_EXPERTS_ENV}=1 requires the retained .cghost mmap; --evict-page-cache/F_NOCACHE mode is incompatible"
+            )));
+        }
+        let engine = crate::metal::Gemma4Q4ExpertMetal::new().ok_or_else(|| {
+            BackendError::UnsupportedModelArchitecture(
+                "file-mapped Ghost Metal could not initialize its exact Q4_0 kernels".into(),
+            )
+        })?;
+        let mut layers = Vec::with_capacity(layer_count);
+        let mut mapped_span_bytes = 0usize;
+        for layer_idx in 0..layer_count {
+            let Some((mmap, offset, span)) = ghost_file.mapped_moe_layer_slab(
+                layer_idx,
+                128,
+                crate::metal::GEMMA4_Q4_EXPERT_RECORD_BYTES,
+                crate::metal::GEMMA4_Q4_EXPERT_SLOT_STRIDE,
+            )?
+            else {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "file-mapped Ghost Metal layer {layer_idx} has no retained canonical mapping"
+                )));
+            };
+            let slots = crate::metal::Gemma4Q4ExpertSlots::new_file_mapped_record_granular(
+                mmap, offset, span,
+            )
+            .ok_or_else(|| {
+                BackendError::UnsupportedModelArchitecture(format!(
+                    "file-mapped Ghost Metal layer {layer_idx} failed Tier-2/no-copy admission"
+                ))
+            })?;
+            if slots.gpu_slot_count() != 128
+                || slots.anonymous_capacity_bytes() != 0
+                || slots.mapped_address_span_bytes() != span
+            {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "file-mapped Ghost Metal layer {layer_idx} produced inconsistent capacity accounting"
+                )));
+            }
+            mapped_span_bytes = mapped_span_bytes.saturating_add(span);
+            layers.push(GhostMetalExpertLayer {
+                directory: GhostMetalSlotDirectory::new_static_identity(128).ok_or_else(|| {
+                    BackendError::InvalidModelMetadata(
+                        "file-mapped Ghost Metal identity directory refused 128 experts".into(),
+                    )
+                })?,
+                slots,
+                stats: GhostMetalSlotStats::default(),
+                shared: None,
+                victims: GhostVictimRing::new(
+                    0,
+                    crate::metal::GEMMA4_Q4_EXPERT_RECORD_BYTES,
+                ),
+                evicted_round: [0; 128],
+            });
+        }
+        eprintln!(
+            "[gemma4-ghost-metal] {GHOST_METAL_FILE_MAPPED_EXPERTS_ENV}=1: clean file-backed experts active, layers={layer_count} addressable=128/layer mapped_span={:.2}GiB anonymous_expert_capacity=0 overflow=0 victim=0 mlock=0",
+            mapped_span_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        );
+        Ok(Self {
+            engine,
+            layers,
+            fused_fast,
+            cpu_fallback_forbidden: true,
+            common: None,
+            sequence_mode: GhostMetalSequenceMode::Idle,
+            latest_routed_experts: vec![Vec::new(); layer_count],
+            routed_expert_interval_union: vec![[0; 2]; layer_count],
+            routed_expert_interval_epoch: 0,
+            expert_decay_scores: vec![vec![0.0f32; 128]; layer_count],
+            overflow_bank: Vec::new(),
+            last_chained_k: None,
+            last_chained_succeeded: false,
+            last_chained_sig: None,
+            suppress_prediction: false,
+            prefill_round: false,
+            chained_round_seq: 0,
+            chained_demand_read_bytes: 0,
+            chained_demand_loads: 0,
+        })
+    }
+
+    fn cpu_fallback_forbidden(&self) -> bool {
+        self.cpu_fallback_forbidden
+    }
+
     pub(crate) fn last_chained_ledger(&self) -> crate::metal::ChainedRoundHostLedger {
         self.common
             .as_ref()
@@ -3123,7 +3299,9 @@ impl GhostMetalExpertRuntime {
     }
 
     fn overflow_slot_count(&self) -> usize {
-        self.overflow_bank[0].slot_count()
+        self.overflow_bank
+            .first()
+            .map_or(0, crate::metal::Gemma4Q4ExpertSlots::slot_count)
     }
 
     pub(crate) fn record_layer_routes(&mut self, layer_idx: usize, experts: &[usize]) {
@@ -3876,21 +4054,35 @@ impl GhostMetalExpertRuntime {
     fn resident_bytes(&self) -> usize {
         self.layers
             .iter()
-            .map(|layer| layer.slots.slot_count() * layer.slots.slot_stride_bytes())
+            .map(|layer| layer.slots.anonymous_capacity_bytes())
             .sum()
     }
 
     fn resident_slot_count(&self) -> usize {
         self.layers
             .iter()
+            .map(|layer| layer.slots.anonymous_slot_count())
+            .sum()
+    }
+
+    fn logical_slot_count(&self) -> usize {
+        self.layers
+            .iter()
             .map(|layer| layer.slots.slot_count())
+            .sum()
+    }
+
+    fn mapped_address_span_bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|layer| layer.slots.mapped_address_span_bytes())
             .sum()
     }
 
     /// Maximum record slots that can ever be filled or referenced by the
     /// current per-layer directories. In bounded record mode this is smaller
-    /// than the allocated logical slot count; untouched logical records beyond
-    /// the directory/table prefix remain unbound and physically lazy.
+    /// than the logical slot namespace; the logical tail beyond the
+    /// directory/table prefix is metadata-only and owns no allocation.
     fn physical_slot_budget_count(&self) -> usize {
         self.layers
             .iter()
@@ -3963,12 +4155,16 @@ impl GhostMetalExpertRuntime {
         self.layers
             .iter()
             .map(|layer| {
-                layer
-                    .directory
-                    .entries
-                    .iter()
-                    .filter(|entry| entry.is_some())
-                    .count()
+                if layer.slots.is_file_mapped() {
+                    0
+                } else {
+                    layer
+                        .directory
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.is_some())
+                        .count()
+                }
             })
             .sum()
     }
@@ -3983,7 +4179,7 @@ impl GhostMetalExpertRuntime {
     fn overflow_capacity_bytes(&self) -> usize {
         self.overflow_bank
             .iter()
-            .map(|bank| bank.slot_count() * bank.slot_stride_bytes())
+            .map(crate::metal::Gemma4Q4ExpertSlots::anonymous_capacity_bytes)
             .sum()
     }
 
@@ -4004,7 +4200,7 @@ impl GhostMetalExpertRuntime {
     fn arbitrary_prewarm_record_count(&self) -> usize {
         self.layers
             .iter()
-            .map(|layer| layer.slots.slot_count().min(128))
+            .map(|layer| layer.slots.anonymous_slot_count().min(128))
             .sum()
     }
 
@@ -4033,6 +4229,10 @@ impl GhostMetalExpertRuntime {
         self.layers
             .iter()
             .any(|layer| layer.slots.is_record_granular())
+    }
+
+    fn has_file_mapped_backing(&self) -> bool {
+        !self.layers.is_empty() && self.layers.iter().all(|layer| layer.slots.is_file_mapped())
     }
 
     /// Pre-warm the persistent pinned hot slots across all layers directly from the .cghost file
@@ -5998,6 +6198,11 @@ pub struct Gemma4RoutedExpertLayerResidencySnapshot {
     /// This is the physical residency high-water in bounded record mode.
     pub physical_base_slot_budget: u64,
     pub physical_base_slot_budget_bytes: u64,
+    /// Canonical read-only records addressable through transient Tier-2 tables.
+    #[serde(default)]
+    pub file_mapped_addressable_slots: u64,
+    #[serde(default)]
+    pub file_mapped_address_span_bytes: u64,
     pub occupied_base_slots: u64,
     pub occupied_base_payload_bytes: u64,
     /// Explicitly CPU-filled directory span: exactly
@@ -6029,6 +6234,10 @@ pub struct Gemma4RoutedExpertResidencySnapshot {
     /// Table-bound/directory-selectable records across all layers.
     pub physical_base_slot_budget: u64,
     pub physical_base_slot_budget_bytes: u64,
+    #[serde(default)]
+    pub file_mapped_addressable_slots: u64,
+    #[serde(default)]
+    pub file_mapped_address_span_bytes: u64,
     pub occupied_base_slots: u64,
     pub occupied_base_payload_bytes: u64,
     /// Aggregate explicitly CPU-filled directory span. This is not a measure
@@ -6119,11 +6328,18 @@ pub struct Gemma4GhostLoadAllocationLedger {
     pub host_cache_resident_bytes: u64,
     pub host_cache_explicitly_touched_bytes: u64,
     pub expert_layer_count: u64,
+    /// Logical address/cache metadata; mapped mode exposes 128 identities per
+    /// layer without allocating anonymous payload records.
+    pub expert_logical_slot_count: u64,
     /// Allocated logical record count/capacity. In bounded demand mode this
     /// remains 88 records/layer even though only a leading table prefix is GPU
     /// addressable.
     pub expert_slot_count: u64,
     pub expert_slot_capacity_bytes: u64,
+    /// Clean file-backed expert addressability, kept separate from anonymous
+    /// capacity and from proof of current physical residency.
+    pub expert_file_mapped_slot_count: u64,
+    pub expert_file_mapped_address_span_bytes: u64,
     /// Table-encoded and directory-selectable prefix. A first compute binding
     /// may physically materialize this entire capacity even when the kernel's
     /// synthetic active union is smaller.
@@ -7482,6 +7698,30 @@ impl Gemma4Runtime {
                     .unwrap_or(4_096)
                     .min(config.context_length as usize)
             };
+            // Validate the backing once before selecting either constructor;
+            // observed and production runs must not silently choose different
+            // expert ownership modes.
+            let demand_load_only = ghost_metal_demand_load_only_from_env();
+            let file_mapped_raw = std::env::var(GHOST_METAL_FILE_MAPPED_EXPERTS_ENV).ok();
+            let file_mapped_experts =
+                ghost_metal_file_mapped_experts_from(file_mapped_raw.as_deref());
+            if file_mapped_raw.is_some() && !file_mapped_experts {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "{GHOST_METAL_FILE_MAPPED_EXPERTS_ENV} is an exact opt-in and must be 1 when present"
+                )));
+            }
+            if file_mapped_experts && !demand_load_only {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "{GHOST_METAL_FILE_MAPPED_EXPERTS_ENV}=1 requires {GHOST_METAL_DEMAND_LOAD_ONLY_ENV}=1"
+                )));
+            }
+            if file_mapped_experts
+                && std::env::var_os(GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER_ENV).is_some()
+            {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "{GHOST_METAL_FILE_MAPPED_EXPERTS_ENV}=1 owns no anonymous hot-slot slab; unset {GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER_ENV}"
+                )));
+            }
             let mut lane = if load_observer.is_some() {
                 if !enabled || !common_enabled || !exact_geometry || !exact_records {
                     return Err(BackendError::InvalidModelMetadata(format!(
@@ -7610,13 +7850,26 @@ impl Gemma4Runtime {
                 // Only now reserve the empty expert/overflow/victim capacity.
                 // The callback at this boundary is the harness's assistant-load
                 // barrier; all target state remains locally owned and idle.
-                let mut runtime =
+                let mut runtime = if file_mapped_experts {
+                    let cache = ghost_moe_cache.as_ref().ok_or_else(|| {
+                        BackendError::InvalidModelMetadata(
+                            "observed file-mapped Ghost Metal has no validated .cghost owner"
+                                .into(),
+                        )
+                    })?;
+                    GhostMetalExpertRuntime::new_file_mapped(
+                        block_count,
+                        fused_fast,
+                        &cache.file,
+                    )?
+                } else {
                     GhostMetalExpertRuntime::new(block_count, fused_fast, &per_layer_slots)
                         .ok_or_else(|| {
                             BackendError::UnsupportedModelArchitecture(
                                 "observed Ghost expert slot allocation failed".into(),
                             )
-                        })?;
+                        })?
+                };
                 runtime.common = Some(common);
                 if runtime.occupied_resident_slot_count() != 0 {
                     return Err(BackendError::InvalidModelMetadata(
@@ -7629,8 +7882,17 @@ impl Gemma4Runtime {
                         .as_mut()
                         .expect("observed branch retains its observer");
                     observer.ledger.expert_layer_count = runtime.layers.len() as u64;
+                    observer.ledger.expert_logical_slot_count =
+                        runtime.logical_slot_count() as u64;
                     observer.ledger.expert_slot_count = runtime.resident_slot_count() as u64;
                     observer.ledger.expert_slot_capacity_bytes = runtime.resident_bytes() as u64;
+                    observer.ledger.expert_file_mapped_slot_count = runtime
+                        .layers
+                        .iter()
+                        .map(|layer| usize::from(layer.slots.is_file_mapped()) * 128)
+                        .sum::<usize>() as u64;
+                    observer.ledger.expert_file_mapped_address_span_bytes =
+                        runtime.mapped_address_span_bytes() as u64;
                     observer.ledger.expert_table_directory_slot_count =
                         runtime.physical_slot_budget_count() as u64;
                     observer.ledger.expert_table_directory_capacity_bytes =
@@ -7671,7 +7933,6 @@ impl Gemma4Runtime {
                 );
                 Some(runtime)
             } else {
-                let demand_load_only = ghost_metal_demand_load_only_from_env();
                 let allocation_order = ghost_metal_allocation_order(demand_load_only);
                 let build_common = || -> Option<(crate::metal::Gemma4GhostCommonMetal, bool)> {
                     match build_ghost_common_metal(
@@ -7724,8 +7985,32 @@ impl Gemma4Runtime {
                 } else {
                     None
                 };
+                if file_mapped_experts
+                    && (!enabled
+                        || !common_enabled
+                        || !exact_geometry
+                        || !exact_records
+                        || common_before_slots.is_none())
+                {
+                    return Err(BackendError::UnsupportedModelArchitecture(format!(
+                        "{GHOST_METAL_FILE_MAPPED_EXPERTS_ENV}=1 requires exact Gemma 4 26B Q4_0 slots/common geometry and a successfully constructed common Metal core"
+                    )));
+                }
                 let mut runtime = if enabled && exact_geometry && exact_records {
-                    GhostMetalExpertRuntime::new(block_count, fused_fast, &per_layer_slots)
+                    if file_mapped_experts {
+                        let cache = ghost_moe_cache.as_ref().ok_or_else(|| {
+                            BackendError::InvalidModelMetadata(
+                                "file-mapped Ghost Metal has no validated .cghost owner".into(),
+                            )
+                        })?;
+                        Some(GhostMetalExpertRuntime::new_file_mapped(
+                            block_count,
+                            fused_fast,
+                            &cache.file,
+                        )?)
+                    } else {
+                        GhostMetalExpertRuntime::new(block_count, fused_fast, &per_layer_slots)
+                    }
                 } else {
                     None
                 };
@@ -7767,7 +8052,18 @@ impl Gemma4Runtime {
                     } else if let Some(cache) = ghost_moe_cache.as_ref() {
                         lane.prewarm_hot_slots_direct(&cache.file);
                     }
-                    if lane.has_record_granular_backing() {
+                    if lane.has_file_mapped_backing() {
+                        eprintln!(
+                            "[gemma4-ghost-metal] clean file-pager Q4_0 experts enabled: layers={} logical_addressable_slots/layer={} anonymous_expert_capacity_bytes={} mapped_address_span_bytes={} mapped_address_span={:.2}GiB mode={}",
+                            block_count,
+                            lane.slots_per_layer(),
+                            lane.resident_bytes(),
+                            lane.mapped_address_span_bytes(),
+                            lane.mapped_address_span_bytes() as f64
+                                / (1024.0 * 1024.0 * 1024.0),
+                            if fused_fast { "fused-fast" } else { "CPU-GeGLU parity" },
+                        );
+                    } else if lane.has_record_granular_backing() {
                         eprintln!(
                             "[gemma4-ghost-metal] persistent Q4_0 record slots enabled: layers={} allocated_slots/layer={} allocated_capacity_bytes={} allocated_capacity={:.2}GiB bound_table_directory_slots/layer={} bound_table_directory_slot_count={} physical_high_water_bytes={} physical_high_water={:.2}GiB mode={}",
                             block_count,
@@ -8218,17 +8514,30 @@ impl Gemma4Runtime {
             for (layer_index, layer) in lane.layers.iter().enumerate() {
                 let capacity = layer.slots.slot_count() as u64;
                 let physical_budget = layer.directory.entries.len() as u64;
-                let occupied = layer
-                    .directory
-                    .entries
-                    .iter()
-                    .filter(|entry| entry.is_some())
-                    .count() as u64;
+                let file_mapped_addressable_slots = if layer.slots.is_file_mapped() {
+                    layer.slots.gpu_slot_count() as u64
+                } else {
+                    0
+                };
+                let file_mapped_address_span_bytes =
+                    layer.slots.mapped_address_span_bytes() as u64;
+                let occupied = if layer.slots.is_file_mapped() {
+                    0
+                } else {
+                    layer
+                        .directory
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.is_some())
+                        .count() as u64
+                };
                 per_layer.push(Gemma4RoutedExpertLayerResidencySnapshot {
                     layer_index: layer_index as u32,
                     base_slot_capacity: capacity,
                     physical_base_slot_budget: physical_budget,
                     physical_base_slot_budget_bytes: physical_budget.saturating_mul(stride_bytes),
+                    file_mapped_addressable_slots,
+                    file_mapped_address_span_bytes,
                     occupied_base_slots: occupied,
                     occupied_base_payload_bytes: occupied.saturating_mul(record_bytes),
                     occupied_base_touched_bytes: occupied.saturating_mul(stride_bytes),
@@ -8246,6 +8555,14 @@ impl Gemma4Runtime {
             let occupied_base_slots = per_layer
                 .iter()
                 .map(|layer| layer.occupied_base_slots)
+                .sum::<u64>();
+            let file_mapped_addressable_slots = per_layer
+                .iter()
+                .map(|layer| layer.file_mapped_addressable_slots)
+                .sum::<u64>();
+            let file_mapped_address_span_bytes = per_layer
+                .iter()
+                .map(|layer| layer.file_mapped_address_span_bytes)
                 .sum::<u64>();
             let aggregate_slot_stats: Gemma4RoutedExpertSlotStatsSnapshot =
                 lane.slot_stats().into();
@@ -8295,6 +8612,8 @@ impl Gemma4Runtime {
                 physical_base_slot_budget,
                 physical_base_slot_budget_bytes: physical_base_slot_budget
                     .saturating_mul(stride_bytes),
+                file_mapped_addressable_slots,
+                file_mapped_address_span_bytes,
                 occupied_base_slots,
                 occupied_base_payload_bytes: occupied_base_slots.saturating_mul(record_bytes),
                 occupied_base_touched_bytes: occupied_base_slots.saturating_mul(stride_bytes),
@@ -9773,6 +10092,7 @@ impl Gemma4Runtime {
                 let mut hs_buf: Vec<Vec<f32>> = (0..kk).map(|_| vec![0.0f32; hidden]).collect();
                 let mut gpu_chained_round_ok = false;
                 let mut chained_refusal_ledger = None;
+                let mut chained_fallback_forbidden = false;
 
                 let theta_local = (0..self.layers.len())
                     .find(|&l| self.g.is_sliding_layer(l))
@@ -9786,6 +10106,7 @@ impl Gemma4Runtime {
                 let ghost_cache = self.ghost_moe_cache.as_deref();
                 if let Ok(mut guard) = self.metal_q4_experts.lock() {
                     if let Some(lane) = guard.as_mut() {
+                        chained_fallback_forbidden = lane.cpu_fallback_forbidden();
                         lane.prefill_round = false;
                         gpu_chained_round_ok = lane.execute_chained_round_all_layers(
                             &hs,
@@ -9804,8 +10125,8 @@ impl Gemma4Runtime {
                     }
                 }
 
-                if let Some(ledger) = chained_refusal_ledger
-                    .filter(|_| ghost_metal_bounded_record_fallback_forbidden())
+                if let Some(ledger) =
+                    chained_refusal_ledger.filter(|_| chained_fallback_forbidden)
                 {
                     return Err(bounded_record_chained_refusal(
                         "speculative verifier",
@@ -9980,6 +10301,7 @@ impl Gemma4Runtime {
         #[cfg(target_os = "macos")]
         {
             let mut chained_refusal_ledger = None;
+            let mut chained_fallback_forbidden = false;
             if self.ghost_metal_q4_is_enabled() && n_local == self.layers.len() {
                 let theta_local = (0..self.layers.len())
                     .find(|&l| self.g.is_sliding_layer(l))
@@ -9993,6 +10315,7 @@ impl Gemma4Runtime {
                 let ghost_cache = self.ghost_moe_cache.as_deref();
                 if let Ok(mut guard) = self.metal_q4_experts.lock() {
                     if let Some(lane) = guard.as_mut() {
+                        chained_fallback_forbidden = lane.cpu_fallback_forbidden();
                         lane.prefill_round = !all_logits;
                         gpu_chained_round_ok = lane.execute_chained_round_all_layers(
                             &hs,
@@ -10009,9 +10332,7 @@ impl Gemma4Runtime {
                     }
                 }
             }
-            if let Some(ledger) =
-                chained_refusal_ledger.filter(|_| ghost_metal_bounded_record_fallback_forbidden())
-            {
+            if let Some(ledger) = chained_refusal_ledger.filter(|_| chained_fallback_forbidden) {
                 return Err(bounded_record_chained_refusal(
                     "chunk forward",
                     start_pos,
@@ -10527,31 +10848,48 @@ impl Gemma4Runtime {
         route_scales: &[f32],
         input: &[Q8_0Block],
         hidden: usize,
-    ) -> Option<Vec<f32>> {
+    ) -> Result<Option<Vec<f32>>> {
         #[cfg(target_os = "macos")]
         {
             if !ghost_metal_acceleration_enabled() {
-                return None;
+                return Ok(None);
             }
-            let mut guard = self.metal_q4_experts.lock().ok()?;
-            let lane = guard.as_mut()?;
+            let mut guard = self.metal_q4_experts.lock().map_err(|_| {
+                BackendError::InvalidModelMetadata("Ghost Metal runtime mutex is poisoned".into())
+            })?;
+            let Some(lane) = guard.as_mut() else {
+                return Ok(None);
+            };
+            let fallback_forbidden = lane.cpu_fallback_forbidden();
             let empty_sources = std::collections::HashMap::new();
             match lane.run_layer(ghost, experts, route_scales, input, hidden, &empty_sources) {
-                GhostMetalExpertAttempt::Output(output) => Some(output),
-                GhostMetalExpertAttempt::CpuFallback => None,
+                GhostMetalExpertAttempt::Output(output) => Ok(Some(output)),
+                GhostMetalExpertAttempt::CpuFallback if fallback_forbidden => {
+                    Err(BackendError::RuntimeShapeMismatch(format!(
+                        "bounded/file-mapped Ghost Metal slot preparation failed closed at layer {}; CPU expert fallback is forbidden",
+                        ghost.layer_idx
+                    )))
+                }
+                GhostMetalExpertAttempt::CpuFallback => Ok(None),
+                GhostMetalExpertAttempt::DisableMetal if fallback_forbidden => {
+                    Err(BackendError::UnsupportedModelArchitecture(format!(
+                        "bounded/file-mapped Ghost Metal expert dispatch failed closed at layer {}; CPU expert fallback is forbidden",
+                        ghost.layer_idx
+                    )))
+                }
                 GhostMetalExpertAttempt::DisableMetal => {
                     eprintln!(
                         "[gemma4-ghost-metal] Metal expert dispatch failed; disabling persistent slots and using CPU Ghost experts"
                     );
                     *guard = None;
-                    None
+                    Ok(None)
                 }
             }
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (ghost, experts, route_scales, input, hidden);
-            None
+            Ok(None)
         }
     }
 
@@ -11789,7 +12127,7 @@ impl Gemma4Runtime {
                     },
                     dense_mlp,
                 );
-                match metal {
+                match metal? {
                     Some(acc) => (None, mlp, Some(acc)),
                     None => (
                         Some(ghost.cache.get_many(ghost.layer_idx, &idx)?),
@@ -12269,7 +12607,7 @@ impl Gemma4Runtime {
                     &route_scales,
                     &cur_moe_q8,
                     hidden,
-                );
+                )?;
                 let bytes_after = ghost.cache.stats().bytes_read;
                 prof.bytes_read = (bytes_after.saturating_sub(bytes_before)) as usize;
                 match metal {
@@ -20695,6 +21033,75 @@ mod ghost_moe_wire_tests {
         assert!(!ghost_metal_demand_load_only_from(Some("junk")));
         assert!(ghost_metal_demand_load_only_from(Some("1")));
         assert!(ghost_metal_demand_load_only_from(Some(" 1 ")));
+    }
+
+    #[test]
+    fn metal_file_mapped_experts_require_exact_positive_opt_in() {
+        assert!(!ghost_metal_file_mapped_experts_from(None));
+        assert!(!ghost_metal_file_mapped_experts_from(Some("")));
+        assert!(!ghost_metal_file_mapped_experts_from(Some("0")));
+        assert!(!ghost_metal_file_mapped_experts_from(Some("true")));
+        assert!(!ghost_metal_file_mapped_experts_from(Some("junk")));
+        assert!(ghost_metal_file_mapped_experts_from(Some("1")));
+        assert!(ghost_metal_file_mapped_experts_from(Some(" 1 ")));
+    }
+
+    #[test]
+    fn metal_static_identity_directory_never_loads_evicts_or_remaps() {
+        let mut directory = GhostMetalSlotDirectory::new_static_identity(128).unwrap();
+        let routes = [127, 3, 3, 91, 0, 42, 7, 127];
+        let plan = directory.plan(&routes).unwrap();
+        assert_eq!(plan.route_slots, routes);
+        assert_eq!(plan.hits, routes.len());
+        assert!(plan.loads.is_empty());
+        assert!(plan.evicted.is_empty());
+        for expert in 0..128 {
+            assert_eq!(directory.lookup_resident_slot(expert), Some(expert));
+        }
+        assert!(directory.plan(&[128]).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires the local Gemma 4 26B .cghost and a Tier-2 Metal device"]
+    fn metal_file_mapped_runtime_constructs_all_layers_without_anonymous_expert_capacity() {
+        if std::env::var("CAMELID_GEMMA4_ARGBUF_MOE_TEST").as_deref() != Ok("1")
+            || !crate::metal::detect_metal_device().available
+        {
+            return;
+        }
+        let path = std::env::var_os("CAMELID_GEMMA4_26B_CGHOST")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(
+                    "/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost",
+                )
+            });
+        if !path.is_file() {
+            return;
+        }
+        let uncached = GhostFile::open_with_options(&path, true)
+            .expect("open descriptor-local F_NOCACHE .cghost");
+        assert!(GhostMetalExpertRuntime::new_file_mapped(30, true, &uncached).is_err());
+        drop(uncached);
+
+        let ghost = GhostFile::open(&path).expect("open canonical .cghost");
+        let runtime = GhostMetalExpertRuntime::new_file_mapped(30, true, &ghost)
+            .expect("construct all clean mapped expert layers");
+        drop(ghost);
+
+        assert!(runtime.has_file_mapped_backing());
+        assert_eq!(runtime.logical_slot_count(), 30 * 128);
+        assert_eq!(runtime.resident_slot_count(), 0);
+        assert_eq!(runtime.resident_bytes(), 0);
+        assert_eq!(runtime.physical_slot_budget_count(), 30 * 128);
+        assert_eq!(runtime.mapped_address_span_bytes(), 12_897_484_800);
+        assert_eq!(runtime.overflow_slot_capacity(), 0);
+        assert_eq!(runtime.overflow_capacity_bytes(), 0);
+        assert_eq!(runtime.victim_record_capacity(), 0);
+        assert_eq!(runtime.victim_capacity_bytes(), 0);
+        assert_eq!(runtime.arbitrary_prewarm_record_count(), 0);
+        assert_eq!(runtime.occupied_resident_slot_count(), 0);
     }
 
     #[test]
