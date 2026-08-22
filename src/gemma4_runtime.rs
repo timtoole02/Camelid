@@ -1517,6 +1517,12 @@ const GHOST_METAL_DEMAND_LOAD_ONLY_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_DEMAN
 /// transient no-copy Tier-2 tables.
 const GHOST_METAL_FILE_MAPPED_EXPERTS_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_FILE_MAPPED_EXPERTS";
+/// Exact opt-in for the mixed 48-hot/mapped-cold lane. The value is the
+/// receipted physical cache size and must be canonical `48`; absence preserves
+/// the mapped-only foundation.
+const GHOST_METAL_HYBRID_HOT_SLOTS_ENV: &str =
+    "CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS";
+const GHOST_METAL_HYBRID_HOT_SLOTS: usize = 48;
 /// Exact demand-only residency bound. The runtime preserves the full logical
 /// expert namespace but allocates, pins, admits, and accounts only this
 /// physical prefix. Keeping unbound records out of the Tier-2 table matters:
@@ -1558,6 +1564,22 @@ fn ghost_metal_demand_load_only_from_env() -> bool {
 
 fn ghost_metal_file_mapped_experts_from(value: Option<&str>) -> bool {
     value.is_some_and(|raw| raw.trim() == "1")
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_ghost_metal_hybrid_hot_slots(
+    value: Option<&str>,
+) -> std::result::Result<Option<usize>, String> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    if raw != GHOST_METAL_HYBRID_HOT_SLOTS.to_string() {
+        return Err(format!(
+            "{GHOST_METAL_HYBRID_HOT_SLOTS_ENV} must be the canonical exact value {}",
+            GHOST_METAL_HYBRID_HOT_SLOTS,
+        ));
+    }
+    Ok(Some(GHOST_METAL_HYBRID_HOT_SLOTS))
 }
 
 #[cfg(target_os = "macos")]
@@ -2015,6 +2037,97 @@ impl GhostMetalSlotDirectory {
         })
     }
 
+    /// Plan only the anonymous overrides for a mapped-cold hybrid layer. All
+    /// routed expert IDs remain correct through the mapped tier, so a union
+    /// wider than the physical cache is not an error. Existing routed hot
+    /// entries are admitted first and pinned; remaining canonical IDs are
+    /// admitted in route order only while physical capacity remains.
+    fn plan_hot_overrides(
+        &mut self,
+        experts: &[usize],
+    ) -> Result<(GhostMetalSlotPlan, Vec<usize>)> {
+        if self.static_identity || experts.iter().any(|&expert| expert >= 128) {
+            return Err(BackendError::InvalidModelMetadata(
+                "hybrid Ghost Metal hot directory received invalid canonical expert IDs".into(),
+            ));
+        }
+        let mut seen = [false; 128];
+        let unique = experts
+            .iter()
+            .copied()
+            .filter(|&expert| {
+                if seen[expert] {
+                    false
+                } else {
+                    seen[expert] = true;
+                    true
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut admitted = Vec::with_capacity(self.entries.len().min(unique.len()));
+        for &expert in &unique {
+            if self.lookup_resident_slot(expert).is_some() {
+                admitted.push(expert);
+            }
+        }
+        for &expert in &unique {
+            if admitted.len() == self.entries.len() {
+                break;
+            }
+            if self.lookup_resident_slot(expert).is_none() {
+                admitted.push(expert);
+            }
+        }
+        let admitted_set = admitted.iter().copied().collect::<std::collections::HashSet<_>>();
+        let cold = unique
+            .into_iter()
+            .filter(|expert| !admitted_set.contains(expert))
+            .collect::<Vec<_>>();
+        self.plan(&admitted).map(|plan| (plan, cold))
+    }
+
+    /// Snapshot the complete physical-slot -> canonical-expert bijection.
+    /// Any directory/table drift is rejected before the mixed backing can
+    /// publish an override.
+    fn hot_slot_ids(&self) -> Option<Vec<Option<usize>>> {
+        if self.static_identity || self.entries.len() > 128 {
+            return None;
+        }
+        let mut seen = [false; 128];
+        let mut result = Vec::with_capacity(self.entries.len());
+        for (slot, entry) in self.entries.iter().copied().enumerate() {
+            match entry {
+                Some(entry)
+                    if entry.expert < 128
+                        && !seen[entry.expert]
+                        && self.resident_slot_table[entry.expert] == slot as i16 =>
+                {
+                    seen[entry.expert] = true;
+                    result.push(Some(entry.expert));
+                }
+                Some(_) => return None,
+                None => result.push(None),
+            }
+        }
+        for (expert, &slot) in self.resident_slot_table.iter().enumerate() {
+            if slot >= 0
+                && (slot as usize >= result.len()
+                    || result[slot as usize] != Some(expert))
+            {
+                return None;
+            }
+        }
+        Some(result)
+    }
+
+    fn clear_dynamic(&mut self) {
+        if self.static_identity {
+            return;
+        }
+        self.entries.fill(None);
+        self.resident_slot_table.fill(-1);
+    }
+
     fn commit_load(&mut self, load: GhostMetalSlotLoad) {
         assert!(
             !self.static_identity,
@@ -2296,6 +2409,9 @@ struct GhostMetalExpertRuntime {
     routed_expert_interval_union: Vec<[u64; 2]>,
     routed_expert_interval_epoch: u64,
     expert_decay_scores: Vec<Vec<f32>>,
+    /// Canonical experts consumed through a hybrid mixed table and eligible
+    /// for promotion only after that layer's command reaches terminal status.
+    pending_hybrid_promotions: Vec<Vec<usize>>,
     /// Eight 18-slot overflow slabs, reused across all 30 layers. Predicted
     /// rounds bind `overflow_bank[layer % copies]` so prior layers can stay
     /// in flight. Combined footprint is ~461 MiB, not 2.25 GiB.
@@ -2434,6 +2550,127 @@ struct WaveFillCounters {
     victim_verify_fails: std::sync::atomic::AtomicU64,
 }
 
+/// Promote already-computed cold experts into the bounded anonymous tier for
+/// a future command. The exclusive
+/// guard invalidates all previously published overrides before exposing the
+/// first writable byte, then publishes one validated directory snapshot after
+/// complete-record reads and directory commits. Failed reads leave their
+/// destination unbound, so the command uses the mapped canonical fallback.
+#[cfg(target_os = "macos")]
+fn fill_hybrid_hot_slots(
+    layer: &mut GhostMetalExpertLayer,
+    cache: &GhostMoeExpertCache,
+    layer_idx: usize,
+    selected_experts: &[usize],
+    counters: &WaveFillCounters,
+    round_seq: u32,
+) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !layer.slots.is_hybrid_mapped() || !layer.slots.hot_refill_available() {
+        return false;
+    }
+    let (directory, slots) = (&mut layer.directory, &mut layer.slots);
+    let Some(mut refill) = slots.begin_hybrid_refill() else {
+        return false;
+    };
+    let Ok((plan, cold_fallback)) = directory.plan_hot_overrides(selected_experts) else {
+        return false;
+    };
+    let _ = cold_fallback;
+    for load in &plan.loads {
+        if load.expert < 128 {
+            let evicted_at = layer.evicted_round[load.expert];
+            if evicted_at == 0 {
+                crate::metal::SPEC_MISS_COLD.fetch_add(1, Relaxed);
+            }
+        }
+    }
+    for eviction in &plan.evicted {
+        if eviction.expert < 128 {
+            layer.evicted_round[eviction.expert] = round_seq;
+        }
+    }
+
+    let record_bytes = crate::metal::GEMMA4_Q4_EXPERT_RECORD_BYTES;
+    let mut disk_reads = 0usize;
+    let mut host_fills = 0usize;
+    let mut read_failures = 0usize;
+    let fill_started = std::time::Instant::now();
+    for load in plan.loads.iter().copied() {
+        let Some(destination) = refill.slot_bytes_mut(load.slot) else {
+            read_failures = read_failures.saturating_add(1);
+            continue;
+        };
+        let copied = cache
+            .peek_resident(layer_idx, load.expert)
+            .filter(|record| record.byte_len() == record_bytes)
+            .is_some_and(|record| {
+                destination.copy_from_slice(record.record_bytes());
+                true
+            });
+        if copied {
+            directory.commit_load(load);
+            host_fills = host_fills.saturating_add(1);
+            continue;
+        }
+        match cache
+            .file
+            .read_moe_expert_into(layer_idx, load.expert, destination)
+        {
+            Ok(()) => {
+                directory.commit_load(load);
+                disk_reads = disk_reads.saturating_add(1);
+            }
+            Err(error) => {
+                read_failures = read_failures.saturating_add(1);
+                eprintln!(
+                    "[gemma4-ghost-metal] hybrid layer {layer_idx} expert {} hot-slot {} refill failed; mapped fallback retained: {error}",
+                    load.expert, load.slot,
+                );
+            }
+        }
+    }
+    let Some(hot_slot_ids) = directory.hot_slot_ids() else {
+        directory.clear_dynamic();
+        return false;
+    };
+    if !refill.publish_hot_slot_ids(&hot_slot_ids) {
+        directory.clear_dynamic();
+        return false;
+    }
+
+    layer.stats.evictions = layer
+        .stats
+        .evictions
+        .saturating_add(plan.evicted.len() as u64);
+    layer.stats.host_fills = layer.stats.host_fills.saturating_add(host_fills as u64);
+    layer.stats.direct_reads = layer.stats.direct_reads.saturating_add(disk_reads as u64);
+    layer.stats.direct_read_bytes = layer
+        .stats
+        .direct_read_bytes
+        .saturating_add((disk_reads as u64).saturating_mul(record_bytes as u64));
+    layer.stats.direct_read_failures = layer
+        .stats
+        .direct_read_failures
+        .saturating_add(read_failures as u64);
+    counters
+        .demand_loads
+        .fetch_add(disk_reads, Relaxed);
+    counters.nvme_bytes.fetch_add(
+        (disk_reads as u64).saturating_mul(record_bytes as u64),
+        Relaxed,
+    );
+    counters.nvme_us.fetch_add(
+        (fill_started.elapsed().as_secs_f64() * 1_000_000.0) as u64,
+        Relaxed,
+    );
+    counters.copy_us.fetch_add(
+        (fill_started.elapsed().as_secs_f64() * 1_000_000.0) as u64,
+        Relaxed,
+    );
+    true
+}
+
 /// Bring `selected_experts` into this layer's persistent Metal slots.
 ///
 /// Directory-first: experts already resident in a slot cost nothing (no host
@@ -2455,6 +2692,11 @@ fn fill_metal_wave_slots_from_host_cache(
     counters: &WaveFillCounters,
     round_seq: u32,
 ) {
+    if layer.slots.is_hybrid_mapped() {
+        // The current command consumes hot hits plus mapped cold fallbacks.
+        // Promotion is deferred until its terminal queue barrier.
+        return;
+    }
     use std::sync::atomic::Ordering::Relaxed;
     let nvme_us = &counters.nvme_us;
     let nvme_bytes = &counters.nvme_bytes;
@@ -3178,6 +3420,7 @@ impl GhostMetalExpertRuntime {
             routed_expert_interval_union: vec![[0; 2]; layer_count],
             routed_expert_interval_epoch: 0,
             expert_decay_scores: vec![vec![0.0f32; 128]; layer_count],
+            pending_hybrid_promotions: vec![Vec::new(); layer_count],
             overflow_bank,
             last_chained_k: None,
             last_chained_succeeded: false,
@@ -3198,10 +3441,40 @@ impl GhostMetalExpertRuntime {
         fused_fast: bool,
         ghost_file: &GhostFile,
     ) -> Result<Self> {
+        Self::new_file_mapped_with_hot_cache(layer_count, fused_fast, ghost_file, None)
+    }
+
+    fn new_file_mapped_hybrid(
+        layer_count: usize,
+        fused_fast: bool,
+        ghost_file: &GhostFile,
+    ) -> Result<Self> {
+        Self::new_file_mapped_with_hot_cache(
+            layer_count,
+            fused_fast,
+            ghost_file,
+            Some(GHOST_METAL_HYBRID_HOT_SLOTS),
+        )
+    }
+
+    fn new_file_mapped_with_hot_cache(
+        layer_count: usize,
+        fused_fast: bool,
+        ghost_file: &GhostFile,
+        hot_slots: Option<usize>,
+    ) -> Result<Self> {
         if layer_count == 0 {
             return Err(BackendError::InvalidModelMetadata(
                 "file-mapped Ghost Metal requires at least one layer".into(),
             ));
+        }
+        if hot_slots.is_some_and(|slots| {
+            slots != GHOST_METAL_HYBRID_HOT_SLOTS
+                || slots != crate::metal::GEMMA4_Q4_HYBRID_HOT_SLOTS
+        }) {
+            return Err(BackendError::InvalidModelMetadata(format!(
+                "hybrid Ghost Metal requires exactly {GHOST_METAL_HYBRID_HOT_SLOTS} physical hot records per layer"
+            )));
         }
         if ghost_file.wire_mapping().is_none() {
             return Err(BackendError::InvalidModelMetadata(format!(
@@ -3227,16 +3500,27 @@ impl GhostMetalExpertRuntime {
                     "file-mapped Ghost Metal layer {layer_idx} has no retained canonical mapping"
                 )));
             };
-            let slots = crate::metal::Gemma4Q4ExpertSlots::new_file_mapped_record_granular(
-                mmap, offset, span,
-            )
+            let slots = if hot_slots.is_some() {
+                crate::metal::Gemma4Q4ExpertSlots::new_hybrid_mapped_record_granular(
+                    mmap, offset, span,
+                )
+            } else {
+                crate::metal::Gemma4Q4ExpertSlots::new_file_mapped_record_granular(
+                    mmap, offset, span,
+                )
+            }
             .ok_or_else(|| {
                 BackendError::UnsupportedModelArchitecture(format!(
-                    "file-mapped Ghost Metal layer {layer_idx} failed Tier-2/no-copy admission"
+                    "{} Ghost Metal layer {layer_idx} failed Tier-2/no-copy admission",
+                    if hot_slots.is_some() { "hybrid" } else { "file-mapped" },
                 ))
             })?;
             if slots.gpu_slot_count() != 128
-                || slots.anonymous_capacity_bytes() != 0
+                || slots.anonymous_slot_count() != hot_slots.unwrap_or(0)
+                || slots.anonymous_capacity_bytes()
+                    != hot_slots
+                        .unwrap_or(0)
+                        .saturating_mul(crate::metal::GEMMA4_Q4_EXPERT_SLOT_STRIDE)
                 || slots.mapped_address_span_bytes() != span
             {
                 return Err(BackendError::InvalidModelMetadata(format!(
@@ -3245,11 +3529,15 @@ impl GhostMetalExpertRuntime {
             }
             mapped_span_bytes = mapped_span_bytes.saturating_add(span);
             layers.push(GhostMetalExpertLayer {
-                directory: GhostMetalSlotDirectory::new_static_identity(128).ok_or_else(|| {
-                    BackendError::InvalidModelMetadata(
-                        "file-mapped Ghost Metal identity directory refused 128 experts".into(),
-                    )
-                })?,
+                directory: if let Some(hot_slots) = hot_slots {
+                    GhostMetalSlotDirectory::new(hot_slots)
+                } else {
+                    GhostMetalSlotDirectory::new_static_identity(128).ok_or_else(|| {
+                        BackendError::InvalidModelMetadata(
+                            "file-mapped Ghost Metal identity directory refused 128 experts".into(),
+                        )
+                    })?
+                },
                 slots,
                 stats: GhostMetalSlotStats::default(),
                 shared: None,
@@ -3260,10 +3548,20 @@ impl GhostMetalExpertRuntime {
                 evicted_round: [0; 128],
             });
         }
-        eprintln!(
-            "[gemma4-ghost-metal] {GHOST_METAL_FILE_MAPPED_EXPERTS_ENV}=1: clean file-backed experts active, layers={layer_count} addressable=128/layer mapped_span={:.2}GiB anonymous_expert_capacity=0 overflow=0 victim=0 mlock=0",
-            mapped_span_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-        );
+        if let Some(hot_slots) = hot_slots {
+            let hot_bytes = layers
+                .iter()
+                .map(|layer| layer.slots.anonymous_capacity_bytes())
+                .sum::<usize>();
+            eprintln!(
+                "[gemma4-ghost-metal] HYBRID ACTIVE: {GHOST_METAL_FILE_MAPPED_EXPERTS_ENV}=1 {GHOST_METAL_HYBRID_HOT_SLOTS_ENV}={hot_slots}, layers={layer_count} canonical_addressable=128/layer physical_hot={hot_slots}/layer hot_capacity_bytes={hot_bytes} mapped_cold_span_bytes={mapped_span_bytes} overflow=0 victim=0 slot_pin=off prediction=off",
+            );
+        } else {
+            eprintln!(
+                "[gemma4-ghost-metal] {GHOST_METAL_FILE_MAPPED_EXPERTS_ENV}=1: clean file-backed experts active, layers={layer_count} addressable=128/layer mapped_span={:.2}GiB anonymous_expert_capacity=0 overflow=0 victim=0 mlock=0",
+                mapped_span_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            );
+        }
         Ok(Self {
             engine,
             layers,
@@ -3275,6 +3573,7 @@ impl GhostMetalExpertRuntime {
             routed_expert_interval_union: vec![[0; 2]; layer_count],
             routed_expert_interval_epoch: 0,
             expert_decay_scores: vec![vec![0.0f32; 128]; layer_count],
+            pending_hybrid_promotions: vec![Vec::new(); layer_count],
             overflow_bank: Vec::new(),
             last_chained_k: None,
             last_chained_succeeded: false,
@@ -3497,6 +3796,7 @@ impl GhostMetalExpertRuntime {
 
         let t_setup = std::time::Instant::now();
         let mut slot_mappings = [[0xFFFFFFFFu32; 128]; 30];
+        let mut hot_at_start = [[false; 128]; 30];
         let mut num_slots_per_layer = [0usize; 30];
         let expert_bindings: Vec<crate::metal::Gemma4Q4ExpertSlotBinding> = self
             .layers
@@ -3504,19 +3804,31 @@ impl GhostMetalExpertRuntime {
             .take(30)
             .map(|l| l.slots.gpu_binding())
             .collect();
+        let hybrid_mapped_backing = self.has_hybrid_mapped_backing();
         let demand_record_backing = self
             .layers
             .iter()
             .all(|layer| layer.slots.is_record_granular());
 
         for (li, layer) in self.layers.iter().enumerate().take(30) {
-            for e in 0..128 {
-                let slot = layer.directory.resident_slot_table[e];
-                if slot >= 0 {
-                    slot_mappings[li][e] = slot as u32;
-                }
+            for expert in 0..128 {
+                hot_at_start[li][expert] =
+                    layer.directory.lookup_resident_slot(expert).is_some();
             }
-            num_slots_per_layer[li] = layer.directory.entries.len();
+            if layer.slots.is_hybrid_mapped() {
+                for e in 0..128 {
+                    slot_mappings[li][e] = e as u32;
+                }
+                num_slots_per_layer[li] = 128;
+            } else {
+                for e in 0..128 {
+                    let slot = layer.directory.resident_slot_table[e];
+                    if slot >= 0 {
+                        slot_mappings[li][e] = slot as u32;
+                    }
+                }
+                num_slots_per_layer[li] = layer.directory.entries.len();
+            }
         }
         let setup_ms = t_setup.elapsed().as_secs_f64() * 1000.0;
 
@@ -3671,7 +3983,11 @@ impl GhostMetalExpertRuntime {
              union_out: &mut Vec<usize>| {
                 let layer = &mut layers_ref[layer_idx];
                 let n_tokens = k_tokens.min(crate::metal::GEMMA4_RESIDENT_MAX_BATCH);
-                let n_slots = layer.directory.entries.len();
+                let n_slots = if layer.slots.is_hybrid_mapped() {
+                    128
+                } else {
+                    layer.directory.entries.len()
+                };
 
                 let routed = wave.is_none();
                 let t_route = std::time::Instant::now();
@@ -3712,6 +4028,34 @@ impl GhostMetalExpertRuntime {
                         (t_route.elapsed().as_secs_f64() * 1_000_000.0) as u64,
                         std::sync::atomic::Ordering::Relaxed,
                     );
+                }
+
+                if layer.slots.is_hybrid_mapped() {
+                    let hot_hits = selected_experts
+                        .iter()
+                        .filter(|&&expert| {
+                            layer.directory.lookup_resident_slot(expert).is_some()
+                        })
+                        .count();
+                    fill_counters
+                        .plan_hits
+                        .fetch_add(hot_hits as u64, std::sync::atomic::Ordering::Relaxed);
+                    fill_counters.plan_misses.fetch_add(
+                        selected_experts.len().saturating_sub(hot_hits) as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    layer.stats.route_lookups = layer
+                        .stats
+                        .route_lookups
+                        .saturating_add(selected_experts.len() as u64);
+                    layer.stats.hits = layer.stats.hits.saturating_add(hot_hits as u64);
+                    layer.stats.misses = layer.stats.misses.saturating_add(
+                        selected_experts.len().saturating_sub(hot_hits) as u64,
+                    );
+                    for (expert, slot) in updated_slots.iter_mut().enumerate() {
+                        *slot = expert as u32;
+                    }
+                    return;
                 }
 
                 let allow_drop = std::env::var("CAMELID_GEMMA4_ALLOW_DROPPED_EXPERTS")
@@ -3813,6 +4157,26 @@ impl GhostMetalExpertRuntime {
                 &wave1_refs,
             )
         };
+        if ok && hybrid_mapped_backing {
+            let Some(cache) = ghost_cache else {
+                return false;
+            };
+            for (layer_idx, experts) in collected_routes.iter().enumerate() {
+                if experts.is_empty()
+                    || !self.promote_hybrid_layer(
+                        layer_idx,
+                        experts,
+                        cache,
+                        &fill_counters,
+                    )
+                {
+                    eprintln!(
+                        "[gemma4-ghost-metal] hybrid layer {layer_idx} terminal promotion refused"
+                    );
+                    return false;
+                }
+            }
+        }
         if !ok && allow_predicted {
             // Preserve the I/O cost of the refused attempt before the exact
             // unpredicted retry. These counters are observational only and do
@@ -3880,7 +4244,7 @@ impl GhostMetalExpertRuntime {
                 if prev_union_masks.get(li).is_some_and(|mask| mask[e]) {
                     overlap_prev_hits += 1;
                 }
-                if slot_mappings[li][e] != 0xFFFFFFFFu32 {
+                if hot_at_start[li][e] {
                     resident_start_hits += 1;
                 }
             }
@@ -4116,7 +4480,12 @@ impl GhostMetalExpertRuntime {
                 !layer.slots.is_record_granular()
                     || layer.slots.slot_count() != logical_slots
                     || layer.slots.gpu_slot_count() != table_slots
-                    || layer.directory.entries.len() != table_slots
+                    || layer.directory.entries.len()
+                        != if layer.slots.is_hybrid_mapped() {
+                            GHOST_METAL_HYBRID_HOT_SLOTS
+                        } else {
+                            table_slots
+                        }
             })
         {
             return Err(format!(
@@ -4155,7 +4524,7 @@ impl GhostMetalExpertRuntime {
         self.layers
             .iter()
             .map(|layer| {
-                if layer.slots.is_file_mapped() {
+                if layer.slots.is_file_mapped() && !layer.slots.is_hybrid_mapped() {
                     0
                 } else {
                     layer
@@ -4200,7 +4569,13 @@ impl GhostMetalExpertRuntime {
     fn arbitrary_prewarm_record_count(&self) -> usize {
         self.layers
             .iter()
-            .map(|layer| layer.slots.anonymous_slot_count().min(128))
+            .map(|layer| {
+                if layer.slots.is_hybrid_mapped() {
+                    0
+                } else {
+                    layer.slots.anonymous_slot_count().min(128)
+                }
+            })
             .sum()
     }
 
@@ -4233,6 +4608,53 @@ impl GhostMetalExpertRuntime {
 
     fn has_file_mapped_backing(&self) -> bool {
         !self.layers.is_empty() && self.layers.iter().all(|layer| layer.slots.is_file_mapped())
+    }
+
+    fn has_hybrid_mapped_backing(&self) -> bool {
+        !self.layers.is_empty()
+            && self
+                .layers
+                .iter()
+                .all(|layer| layer.slots.is_hybrid_mapped())
+    }
+
+    fn promote_hybrid_layer(
+        &mut self,
+        layer_idx: usize,
+        experts: &[usize],
+        cache: &GhostMoeExpertCache,
+        counters: &WaveFillCounters,
+    ) -> bool {
+        let Some(layer) = self.layers.get_mut(layer_idx) else {
+            return false;
+        };
+        if !layer.slots.is_hybrid_mapped() {
+            return true;
+        }
+        fill_hybrid_hot_slots(
+            layer,
+            cache,
+            layer_idx,
+            experts,
+            counters,
+            self.chained_round_seq,
+        )
+    }
+
+    fn promote_pending_hybrid_layer(
+        &mut self,
+        layer_idx: usize,
+        cache: &GhostMoeExpertCache,
+    ) -> bool {
+        let Some(pending) = self.pending_hybrid_promotions.get_mut(layer_idx) else {
+            return false;
+        };
+        let experts = std::mem::take(pending);
+        if experts.is_empty() {
+            return true;
+        }
+        let counters = WaveFillCounters::default();
+        self.promote_hybrid_layer(layer_idx, &experts, cache, &counters)
     }
 
     /// Pre-warm the persistent pinned hot slots across all layers directly from the .cghost file
@@ -4375,6 +4797,48 @@ impl GhostMetalExpertRuntime {
             return None;
         }
         let round_seq = self.chained_round_seq;
+        if self
+            .layers
+            .get(ghost.layer_idx)
+            .is_some_and(|layer| layer.slots.is_hybrid_mapped())
+        {
+            let hot_hits = {
+                let layer = self.layers.get_mut(ghost.layer_idx)?;
+                if !layer.slots.hot_refill_available()
+                    || experts.iter().any(|&expert| expert >= 128)
+                {
+                    return None;
+                }
+                let hot_hits = experts
+                    .iter()
+                    .filter(|&&expert| layer.directory.lookup_resident_slot(expert).is_some())
+                    .count();
+                layer.stats.route_lookups = layer
+                    .stats
+                    .route_lookups
+                    .saturating_add(experts.len() as u64);
+                layer.stats.hits = layer.stats.hits.saturating_add(hot_hits as u64);
+                layer.stats.misses = layer
+                    .stats
+                    .misses
+                    .saturating_add(experts.len().saturating_sub(hot_hits) as u64);
+                hot_hits
+            };
+            let _ = hot_hits;
+            let pending = self.pending_hybrid_promotions.get_mut(ghost.layer_idx)?;
+            pending.clear();
+            pending.extend_from_slice(experts);
+            // The mixed table is indexed only by canonical expert ID. Current
+            // hot hits override those IDs; current misses execute directly
+            // from the mapped cold tier and are promoted after terminal GPU
+            // status for the next command.
+            return Some(std::array::from_fn(|rank| {
+                crate::metal::Gemma4Q4ExpertRoute {
+                    slot: experts[rank],
+                    scale: route_scales[rank],
+                }
+            }));
+        }
         let layer = self.layers.get_mut(ghost.layer_idx)?;
         let plan = match layer.directory.plan(experts) {
             Ok(plan) => plan,
@@ -5019,7 +5483,15 @@ impl GhostMetalExpertRuntime {
                 .run_q8_into_parity(input, &layer.slots, &routes, &mut output)
         };
         match diagnostics {
-            Some(_) => GhostMetalExpertAttempt::Output(output),
+            Some(_) => {
+                if self.has_hybrid_mapped_backing()
+                    && !self.promote_pending_hybrid_layer(ghost.layer_idx, &ghost.cache)
+                {
+                    GhostMetalExpertAttempt::DisableMetal
+                } else {
+                    GhostMetalExpertAttempt::Output(output)
+                }
+            }
             None => GhostMetalExpertAttempt::DisableMetal,
         }
     }
@@ -6270,6 +6742,14 @@ pub struct Gemma4RoutedExpertResidencySnapshot {
     pub last_chained_unique_per_layer: Vec<u16>,
     pub last_chained_unique_experts_sum: u32,
     pub last_chained_unique_experts_max: u32,
+    #[serde(default)]
+    pub last_chained_hot_bound_per_layer: Vec<u16>,
+    #[serde(default)]
+    pub last_chained_mapped_bound_per_layer: Vec<u16>,
+    #[serde(default)]
+    pub last_chained_hot_bound_records: u32,
+    #[serde(default)]
+    pub last_chained_mapped_bound_records: u32,
     pub last_chained_slot_hits: u32,
     pub last_chained_slot_misses: u32,
     pub last_chained_slot_evictions: u32,
@@ -7705,6 +8185,9 @@ impl Gemma4Runtime {
             let file_mapped_raw = std::env::var(GHOST_METAL_FILE_MAPPED_EXPERTS_ENV).ok();
             let file_mapped_experts =
                 ghost_metal_file_mapped_experts_from(file_mapped_raw.as_deref());
+            let hybrid_hot_raw = std::env::var(GHOST_METAL_HYBRID_HOT_SLOTS_ENV).ok();
+            let hybrid_hot_slots = parse_ghost_metal_hybrid_hot_slots(hybrid_hot_raw.as_deref())
+                .map_err(BackendError::InvalidModelMetadata)?;
             if file_mapped_raw.is_some() && !file_mapped_experts {
                 return Err(BackendError::InvalidModelMetadata(format!(
                     "{GHOST_METAL_FILE_MAPPED_EXPERTS_ENV} is an exact opt-in and must be 1 when present"
@@ -7715,11 +8198,26 @@ impl Gemma4Runtime {
                     "{GHOST_METAL_FILE_MAPPED_EXPERTS_ENV}=1 requires {GHOST_METAL_DEMAND_LOAD_ONLY_ENV}=1"
                 )));
             }
+            if hybrid_hot_slots.is_some() && !file_mapped_experts {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "{GHOST_METAL_HYBRID_HOT_SLOTS_ENV}={} requires {GHOST_METAL_FILE_MAPPED_EXPERTS_ENV}=1",
+                    GHOST_METAL_HYBRID_HOT_SLOTS,
+                )));
+            }
+            if hybrid_hot_slots.is_some()
+                && std::env::var("CAMELID_GEMMA4_SLOT_PIN").as_deref() != Ok("0")
+            {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "{GHOST_METAL_HYBRID_HOT_SLOTS_ENV}={} currently requires canonical CAMELID_GEMMA4_SLOT_PIN=0; a pinned hybrid tier needs a separate residency receipt",
+                    GHOST_METAL_HYBRID_HOT_SLOTS,
+                )));
+            }
             if file_mapped_experts
                 && std::env::var_os(GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER_ENV).is_some()
             {
                 return Err(BackendError::InvalidModelMetadata(format!(
-                    "{GHOST_METAL_FILE_MAPPED_EXPERTS_ENV}=1 owns no anonymous hot-slot slab; unset {GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER_ENV}"
+                    "{GHOST_METAL_FILE_MAPPED_EXPERTS_ENV}=1 uses only its mapped tier or the exact {GHOST_METAL_HYBRID_HOT_SLOTS_ENV}={} cache; unset {GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER_ENV}",
+                    GHOST_METAL_HYBRID_HOT_SLOTS,
                 )));
             }
             let mut lane = if load_observer.is_some() {
@@ -7857,11 +8355,19 @@ impl Gemma4Runtime {
                                 .into(),
                         )
                     })?;
-                    GhostMetalExpertRuntime::new_file_mapped(
-                        block_count,
-                        fused_fast,
-                        &cache.file,
-                    )?
+                    if hybrid_hot_slots.is_some() {
+                        GhostMetalExpertRuntime::new_file_mapped_hybrid(
+                            block_count,
+                            fused_fast,
+                            &cache.file,
+                        )?
+                    } else {
+                        GhostMetalExpertRuntime::new_file_mapped(
+                            block_count,
+                            fused_fast,
+                            &cache.file,
+                        )?
+                    }
                 } else {
                     GhostMetalExpertRuntime::new(block_count, fused_fast, &per_layer_slots)
                         .ok_or_else(|| {
@@ -8003,11 +8509,19 @@ impl Gemma4Runtime {
                                 "file-mapped Ghost Metal has no validated .cghost owner".into(),
                             )
                         })?;
-                        Some(GhostMetalExpertRuntime::new_file_mapped(
-                            block_count,
-                            fused_fast,
-                            &cache.file,
-                        )?)
+                        Some(if hybrid_hot_slots.is_some() {
+                            GhostMetalExpertRuntime::new_file_mapped_hybrid(
+                                block_count,
+                                fused_fast,
+                                &cache.file,
+                            )?
+                        } else {
+                            GhostMetalExpertRuntime::new_file_mapped(
+                                block_count,
+                                fused_fast,
+                                &cache.file,
+                            )?
+                        })
                     } else {
                         GhostMetalExpertRuntime::new(block_count, fused_fast, &per_layer_slots)
                     }
@@ -8521,7 +9035,9 @@ impl Gemma4Runtime {
                 };
                 let file_mapped_address_span_bytes =
                     layer.slots.mapped_address_span_bytes() as u64;
-                let occupied = if layer.slots.is_file_mapped() {
+                let occupied = if layer.slots.is_file_mapped()
+                    && !layer.slots.is_hybrid_mapped()
+                {
                     0
                 } else {
                     layer
@@ -8651,6 +9167,26 @@ impl Gemma4Runtime {
                 },
                 last_chained_unique_experts_max: if last_chained_round_available {
                     chained.unique_experts_max
+                } else {
+                    0
+                },
+                last_chained_hot_bound_per_layer: if last_chained_round_available {
+                    chained.hot_bound_per_layer[..lane.layers.len().min(30)].to_vec()
+                } else {
+                    vec![0; lane.layers.len()]
+                },
+                last_chained_mapped_bound_per_layer: if last_chained_round_available {
+                    chained.mapped_bound_per_layer[..lane.layers.len().min(30)].to_vec()
+                } else {
+                    vec![0; lane.layers.len()]
+                },
+                last_chained_hot_bound_records: if last_chained_round_available {
+                    chained.hot_bound_records
+                } else {
+                    0
+                },
+                last_chained_mapped_bound_records: if last_chained_round_available {
+                    chained.mapped_bound_records
                 } else {
                     0
                 },
@@ -9199,6 +9735,23 @@ impl Gemma4Runtime {
                             "Ghost common Metal asynchronous expert/tail failed at layer {pending_layer}"
                         )));
                     }
+                    if runtime.has_hybrid_mapped_backing() {
+                        let cache = self.layers[pending_layer]
+                            .moe
+                            .as_ref()
+                            .and_then(|moe| moe.ghost.as_ref())
+                            .map(|ghost| &ghost.cache)
+                            .ok_or_else(|| {
+                                BackendError::InvalidModelMetadata(format!(
+                                    "hybrid Ghost Metal layer {pending_layer} lost its canonical cache owner"
+                                ))
+                            })?;
+                        if !runtime.promote_pending_hybrid_layer(pending_layer, cache) {
+                            return Err(BackendError::InvalidTensorData(format!(
+                                "hybrid Ghost Metal layer {pending_layer} promotion failed after terminal command"
+                            )));
+                        }
+                    }
                 }
                 let logits = runtime
                     .common
@@ -9307,6 +9860,14 @@ impl Gemma4Runtime {
                                     "Ghost common Metal expert/tail failed at layer {layer_idx} (debug drain)"
                                 )));
                             }
+                            if runtime.has_hybrid_mapped_backing()
+                                && !runtime
+                                    .promote_pending_hybrid_layer(layer_idx, &ghost.cache)
+                            {
+                                return Err(BackendError::InvalidTensorData(format!(
+                                    "hybrid Ghost Metal layer {layer_idx} promotion failed after debug terminal drain"
+                                )));
+                            }
                             if let Some(common) = runtime.common.as_ref() {
                                 let h = common.read_hidden();
                                 let l2 = h.iter().map(|v| v * v).sum::<f32>().sqrt();
@@ -9324,6 +9885,13 @@ impl Gemma4Runtime {
                         if !shared_pending.finish() {
                             return Err(BackendError::UnsupportedModelArchitecture(format!(
                                 "Ghost common Metal shared branch failed at layer {layer_idx}"
+                            )));
+                        }
+                        if runtime.has_hybrid_mapped_backing()
+                            && !runtime.promote_pending_hybrid_layer(layer_idx, &ghost.cache)
+                        {
+                            return Err(BackendError::InvalidTensorData(format!(
+                                "hybrid Ghost Metal layer {layer_idx} promotion failed after terminal command"
                             )));
                         }
                     }
@@ -9347,6 +9915,23 @@ impl Gemma4Runtime {
                     return Err(BackendError::UnsupportedModelArchitecture(format!(
                         "Ghost common Metal asynchronous expert/tail failed at final layer {pending_layer}"
                     )));
+                }
+                if runtime.has_hybrid_mapped_backing() {
+                    let cache = self.layers[pending_layer]
+                        .moe
+                        .as_ref()
+                        .and_then(|moe| moe.ghost.as_ref())
+                        .map(|ghost| &ghost.cache)
+                        .ok_or_else(|| {
+                            BackendError::InvalidModelMetadata(format!(
+                                "hybrid Ghost Metal final layer {pending_layer} lost its canonical cache owner"
+                            ))
+                        })?;
+                    if !runtime.promote_pending_hybrid_layer(pending_layer, cache) {
+                        return Err(BackendError::InvalidTensorData(format!(
+                            "hybrid Ghost Metal final layer {pending_layer} promotion failed after terminal command"
+                        )));
+                    }
                 }
             }
             if !project_head {
@@ -21044,6 +21629,43 @@ mod ghost_moe_wire_tests {
         assert!(!ghost_metal_file_mapped_experts_from(Some("junk")));
         assert!(ghost_metal_file_mapped_experts_from(Some("1")));
         assert!(ghost_metal_file_mapped_experts_from(Some(" 1 ")));
+    }
+
+    #[test]
+    fn metal_hybrid_hot_slots_requires_exact_canonical_48() {
+        assert_eq!(parse_ghost_metal_hybrid_hot_slots(None).unwrap(), None);
+        assert_eq!(
+            parse_ghost_metal_hybrid_hot_slots(Some("48")).unwrap(),
+            Some(48)
+        );
+        for invalid in ["", "0", "47", "49", "048", " 48", "48 ", "+48", "junk"] {
+            assert!(
+                parse_ghost_metal_hybrid_hot_slots(Some(invalid)).is_err(),
+                "hybrid budget {invalid:?} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn metal_hybrid_49_to_64_unions_spill_to_mapped_without_overflow() {
+        for unique in [49usize, 64] {
+            let experts = (0..unique).collect::<Vec<_>>();
+            let mut directory = GhostMetalSlotDirectory::new(48);
+            let (plan, cold) = directory
+                .plan_hot_overrides(&experts)
+                .expect("hybrid union is not capped by physical cache size");
+            assert_eq!(plan.loads.len(), 48, "unique={unique}");
+            assert_eq!(cold.len(), unique - 48, "unique={unique}");
+            assert!(plan.loads.iter().all(|load| load.slot < 48));
+            let mut represented = plan
+                .loads
+                .iter()
+                .map(|load| load.expert)
+                .chain(cold.iter().copied())
+                .collect::<Vec<_>>();
+            represented.sort_unstable();
+            assert_eq!(represented, experts, "unique={unique}");
+        }
     }
 
     #[test]

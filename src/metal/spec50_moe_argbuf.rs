@@ -761,6 +761,11 @@ fn new_static_expert_table(
 #[derive(Clone)]
 pub(crate) struct Gemma4MoeSlotArgTable {
     records: Vec<Buffer>,
+    /// Exact selected-record split for this committed table. Anonymous dense
+    /// tables report every bound record as hot; mapped-only tables report
+    /// every bound record as mapped; mixed tables receipt both independently.
+    hot_bound_record_count: usize,
+    mapped_bound_record_count: usize,
     /// Number of legal shader-visible slot IDs. Sparse mapped tables retain the
     /// canonical width of 128 while owning only the exact selected records.
     addressable_slot_count: usize,
@@ -796,10 +801,13 @@ impl Gemma4MoeSlotArgTable {
         addressable_slot_count: usize,
         record_slots: &[usize],
         records: &[Buffer],
+        mapped_bound_record_count: usize,
         mapped_owner: Option<std::sync::Arc<crate::wire_mmap::GgufWireMmap>>,
     ) -> Option<Self> {
         if records.is_empty()
             || records.len() != record_slots.len()
+            || mapped_bound_record_count > records.len()
+            || (mapped_bound_record_count == 0) != mapped_owner.is_none()
             || records.iter().any(|record| {
                 record.length() as usize != S50_SLOT_STRIDE
                     || record.contents().is_null()
@@ -819,6 +827,8 @@ impl Gemma4MoeSlotArgTable {
         )?;
         Some(Self {
             records: records.to_vec(),
+            hot_bound_record_count: records.len() - mapped_bound_record_count,
+            mapped_bound_record_count,
             addressable_slot_count,
             slot_to_record,
             table,
@@ -836,7 +846,7 @@ impl Gemma4MoeSlotArgTable {
             return None;
         }
         let record_slots = (0..records.len()).collect::<Vec<_>>();
-        Self::from_indexed_slot_buffers(device, records.len(), &record_slots, records, None)
+        Self::from_indexed_slot_buffers(device, records.len(), &record_slots, records, 0, None)
     }
 
     fn from_mixed_active_slots_with_addressable_count(
@@ -933,6 +943,7 @@ impl Gemma4MoeSlotArgTable {
             addressable_slot_count,
             &record_slots,
             &records,
+            mapped_record_count,
             mapped_owner,
         )
     }
@@ -991,6 +1002,14 @@ impl Gemma4MoeSlotArgTable {
 
     pub(crate) fn bound_record_count(&self) -> usize {
         self.records.len()
+    }
+
+    pub(crate) const fn hot_bound_record_count(&self) -> usize {
+        self.hot_bound_record_count
+    }
+
+    pub(crate) const fn mapped_bound_record_count(&self) -> usize {
+        self.mapped_bound_record_count
     }
 
     pub(crate) fn argument_buffer(&self) -> &Buffer {
@@ -1956,16 +1975,20 @@ mod tests {
             128,
             &[127, 3, 91],
             &records,
+            0,
             None,
         )
         .expect("sparse original-ID table");
         assert_eq!(table.addressable_slot_count(), 128);
         assert_eq!(table.bound_record_count(), 3);
+        assert_eq!(table.hot_bound_record_count(), 3);
+        assert_eq!(table.mapped_bound_record_count(), 0);
         assert!(Gemma4MoeSlotArgTable::from_indexed_slot_buffers(
             device,
             128,
             &[3, 3, 91],
             &records,
+            0,
             None,
         )
         .is_none());
@@ -2002,6 +2025,8 @@ mod tests {
         .expect("selected-only mapped table");
         assert_eq!(table.addressable_slot_count(), 128);
         assert_eq!(table.bound_record_count(), 4);
+        assert_eq!(table.hot_bound_record_count(), 0);
+        assert_eq!(table.mapped_bound_record_count(), 4);
         assert!(owner.upgrade().is_some());
         let cb = kernel.queue.new_command_buffer();
         let encoder = cb.new_compute_command_encoder();
@@ -2238,6 +2263,27 @@ mod tests {
             .is_none()
         );
 
+        let split_receipt =
+            Gemma4MoeSlotArgTable::from_mixed_active_slots_with_addressable_count(
+                std::sync::Arc::clone(&mmap),
+                0,
+                mapped_bytes,
+                SYNTHETIC_EXPERTS,
+                &[1, 0, 1],
+                &hot_slot_ids,
+                &hot_records,
+            )
+            .expect("one-hot/one-cold deduplicated receipt");
+        assert_eq!(split_receipt.bound_record_count(), 2);
+        assert_eq!(split_receipt.hot_bound_record_count(), 1);
+        assert_eq!(split_receipt.mapped_bound_record_count(), 1);
+        assert_eq!(
+            split_receipt.hot_bound_record_count()
+                + split_receipt.mapped_bound_record_count(),
+            split_receipt.bound_record_count()
+        );
+        drop(split_receipt);
+
         let table = Gemma4MoeSlotArgTable::from_mixed_active_slots_with_addressable_count(
             std::sync::Arc::clone(&mmap),
             0,
@@ -2250,6 +2296,15 @@ mod tests {
         .expect("mixed canonical-ID expert table");
         assert_eq!(table.addressable_slot_count(), SYNTHETIC_EXPERTS);
         assert_eq!(table.bound_record_count(), SYNTHETIC_EXPERTS);
+        assert_eq!(table.hot_bound_record_count(), hot_slot_ids.len());
+        assert_eq!(
+            table.mapped_bound_record_count(),
+            SYNTHETIC_EXPERTS - hot_slot_ids.len()
+        );
+        assert_eq!(
+            table.hot_bound_record_count() + table.mapped_bound_record_count(),
+            table.bound_record_count()
+        );
 
         // The table is the lifetime-safe binding: its Objective-C references
         // retain selected anonymous records, and its Arc retains the mapping.

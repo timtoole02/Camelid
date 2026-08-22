@@ -13306,6 +13306,12 @@ pub(crate) const GEMMA4_Q4_EXPERT_DOWN_BYTES: usize = 1_115_136;
 const GEMMA4_Q4_EXPERT_SLOT_ALIGNMENT: usize = 16 * 1024;
 #[cfg(target_os = "macos")]
 pub(crate) const GEMMA4_Q4_EXPERT_SLOT_STRIDE: usize = 3_358_720;
+/// Exact anonymous hot-tier capacity for the opt-in mapped-cold hybrid lane.
+/// This is a physical-record budget, not a limit on routed canonical expert
+/// IDs: every one of the 128 experts remains addressable through the mapped
+/// fallback.
+#[cfg(target_os = "macos")]
+pub(crate) const GEMMA4_Q4_HYBRID_HOT_SLOTS: usize = 48;
 /// Global overflow experts reused across layers. 20 resident + 24 overflow covers
 /// measured K=8 unique max of 42.
 #[cfg(target_os = "macos")]
@@ -13394,6 +13400,257 @@ impl Gemma4Q4FileMappedExpertSource {
     }
 }
 
+/// One layer's mixed expert backing. `hot_records` are indexed by physical
+/// cache slot, while `hot_slot_ids[physical]` names the canonical expert ID
+/// currently occupying that record. GPU tables never expose physical cache
+/// indices: the mixed argument table installs each hot buffer at its canonical
+/// ID and falls back to the corresponding mapped record for every cold ID.
+#[cfg(target_os = "macos")]
+pub(crate) struct Gemma4Q4HybridExpertSource {
+    mapped: Gemma4Q4FileMappedExpertSource,
+    hot_records: Vec<Buffer>,
+    hot_slot_ids: std::sync::RwLock<Vec<Option<usize>>>,
+    /// Materialized mixed tables increment this count before snapshotting the
+    /// directory. The existing pending/command-buffer guards retain their
+    /// lease through terminal GPU status, so refill access can fail closed.
+    /// `-1` is one exclusive refill transaction, `0` is idle, and positive
+    /// values are live GPU-table leases. CAS transitions make byte mutation
+    /// and GPU binding structurally exclusive rather than relying on the
+    /// runtime's outer mutex alone.
+    lease_state: std::sync::atomic::AtomicIsize,
+}
+
+#[cfg(target_os = "macos")]
+impl Gemma4Q4HybridExpertSource {
+    fn new(
+        mmap: std::sync::Arc<crate::wire_mmap::GgufWireMmap>,
+        layer_offset: u64,
+        mapped_span_bytes: usize,
+    ) -> Option<Self> {
+        let mapped = Gemma4Q4FileMappedExpertSource::new(
+            mmap,
+            layer_offset,
+            mapped_span_bytes,
+        )?;
+        let kernel = metal_linear_kernel()?;
+        let mut hot_records = Vec::with_capacity(GEMMA4_Q4_HYBRID_HOT_SLOTS);
+        let mut addresses = std::collections::HashSet::with_capacity(
+            GEMMA4_Q4_HYBRID_HOT_SLOTS,
+        );
+        for _ in 0..GEMMA4_Q4_HYBRID_HOT_SLOTS {
+            let record = kernel.device.new_buffer(
+                GEMMA4_Q4_EXPERT_SLOT_STRIDE as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let address = record.contents() as usize;
+            if address == 0
+                || !address.is_multiple_of(GEMMA4_Q4_EXPERT_SLOT_ALIGNMENT)
+                || !addresses.insert(address)
+            {
+                return None;
+            }
+            hot_records.push(record);
+        }
+        Some(Self {
+            mapped,
+            hot_records,
+            hot_slot_ids: std::sync::RwLock::new(vec![None; GEMMA4_Q4_HYBRID_HOT_SLOTS]),
+            lease_state: std::sync::atomic::AtomicIsize::new(0),
+        })
+    }
+
+    fn hot_slot_count(&self) -> usize {
+        self.hot_records.len()
+    }
+
+    fn refill_available(&self) -> bool {
+        self.lease_state
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 0
+    }
+
+    fn try_begin_refill(&self) -> Option<Gemma4Q4HybridRefillGuard<'_>> {
+        self.lease_state
+            .compare_exchange(
+                0,
+                -1,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .ok()?;
+        Some(Gemma4Q4HybridRefillGuard {
+            source: self,
+            identities_invalidated: false,
+            committed: false,
+        })
+    }
+
+    /// Publish a complete physical-slot -> canonical-expert snapshot. The
+    /// directory must be a bijection over its occupied entries. Validation is
+    /// completed before mutation, and publication is forbidden while a GPU
+    /// table can still reference any hot record.
+    fn validate_hot_slot_ids(&self, hot_slot_ids: &[Option<usize>]) -> bool {
+        if hot_slot_ids.len() != self.hot_records.len() {
+            return false;
+        }
+        let mut seen = [false; 128];
+        for expert in hot_slot_ids.iter().flatten().copied() {
+            if expert >= 128 || seen[expert] {
+                return false;
+            }
+            seen[expert] = true;
+        }
+        true
+    }
+
+    fn materialize_for_active_slots(
+        self: &std::sync::Arc<Self>,
+        active_slots: &[usize],
+    ) -> Option<(
+        spec50_moe_argbuf::Gemma4MoeSlotArgTable,
+        std::sync::Arc<Gemma4Q4HybridBindingLease>,
+    )> {
+        if active_slots.is_empty() || active_slots.iter().any(|&slot| slot >= 128) {
+            return None;
+        }
+        loop {
+            let state = self.lease_state.load(std::sync::atomic::Ordering::Acquire);
+            if state < 0 || state == isize::MAX {
+                return None;
+            }
+            if self
+                .lease_state
+                .compare_exchange_weak(
+                    state,
+                    state + 1,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                break;
+            }
+        }
+        let lease = std::sync::Arc::new(Gemma4Q4HybridBindingLease {
+            source: std::sync::Arc::clone(self),
+        });
+        let published = self.hot_slot_ids.read().ok()?;
+        let mut hot_expert_ids = Vec::with_capacity(self.hot_records.len());
+        let mut hot_records = Vec::with_capacity(self.hot_records.len());
+        for (physical_slot, expert_id) in published.iter().copied().enumerate() {
+            if let Some(expert_id) = expert_id {
+                hot_expert_ids.push(expert_id);
+                hot_records.push(self.hot_records[physical_slot].clone());
+            }
+        }
+        let table = spec50_moe_argbuf::Gemma4MoeSlotArgTable::from_mixed_active_slots(
+            std::sync::Arc::clone(&self.mapped.mmap),
+            self.mapped.layer_offset,
+            self.mapped.mapped_span_bytes,
+            active_slots,
+            &hot_expert_ids,
+            &hot_records,
+        )?;
+        Some((table, lease))
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) struct Gemma4Q4HybridBindingLease {
+    source: std::sync::Arc<Gemma4Q4HybridExpertSource>,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Gemma4Q4HybridBindingLease {
+    fn drop(&mut self) {
+        let prior = self
+            .source
+            .lease_state
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        debug_assert!(prior > 0, "hybrid expert binding lease underflow");
+    }
+}
+
+/// Exclusive hot-tier mutation transaction. Callers fill complete records,
+/// update their CPU directory, and publish the resulting canonical identities
+/// before dropping this guard. While it exists no mixed table can materialize;
+/// while any mixed-table lease exists this guard cannot be acquired.
+#[cfg(target_os = "macos")]
+pub(crate) struct Gemma4Q4HybridRefillGuard<'a> {
+    source: &'a Gemma4Q4HybridExpertSource,
+    identities_invalidated: bool,
+    committed: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl Gemma4Q4HybridRefillGuard<'_> {
+    fn invalidate_all_identities(&mut self) -> bool {
+        if self.identities_invalidated {
+            return true;
+        }
+        let Ok(mut published) = self.source.hot_slot_ids.write() else {
+            return false;
+        };
+        published.fill(None);
+        self.identities_invalidated = true;
+        true
+    }
+
+    pub(crate) fn slot_bytes_mut(&mut self, slot: usize) -> Option<&mut [u8]> {
+        // Clear every old override before the first byte can change. If any
+        // later read/copy/publication step fails, Drop releases the writer but
+        // the possibly modified records remain unreachable and the next table
+        // safely falls back to the mapped canonical records.
+        if !self.invalidate_all_identities() {
+            return None;
+        }
+        let pointer = self.source.hot_records.get(slot)?.contents().cast::<u8>();
+        // SAFETY: the exclusive refill state prevents any GPU table from
+        // referencing hot records. Runtime plans assign pairwise-disjoint
+        // physical slots, and this mutable guard serializes the publication.
+        Some(unsafe {
+            std::slice::from_raw_parts_mut(pointer, GEMMA4_Q4_EXPERT_RECORD_BYTES)
+        })
+    }
+
+    pub(crate) fn publish_hot_slot_ids(&mut self, hot_slot_ids: &[Option<usize>]) -> bool {
+        if !self.source.validate_hot_slot_ids(hot_slot_ids)
+            || self
+                .source
+                .lease_state
+                .load(std::sync::atomic::Ordering::Acquire)
+                != -1
+        {
+            return false;
+        }
+        let Ok(mut published) = self.source.hot_slot_ids.write() else {
+            return false;
+        };
+        published.clone_from_slice(hot_slot_ids);
+        self.committed = true;
+        true
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Gemma4Q4HybridRefillGuard<'_> {
+    fn drop(&mut self) {
+        if self.identities_invalidated && !self.committed {
+            // The invalidation happened before any mutable slice was exposed.
+            // Reassert it on ordinary early-exit paths. A poisoned lock makes
+            // future materialization fail, which is also fail-closed.
+            if let Ok(mut published) = self.source.hot_slot_ids.write() {
+                published.fill(None);
+            }
+        }
+        let prior = self
+            .source
+            .lease_state
+            .swap(0, std::sync::atomic::Ordering::AcqRel);
+        debug_assert_eq!(prior, -1, "hybrid expert refill lease drift");
+    }
+}
+
 #[cfg(target_os = "macos")]
 enum Gemma4Q4ExpertSlotBacking {
     Monolithic {
@@ -13409,6 +13666,12 @@ enum Gemma4Q4ExpertSlotBacking {
     /// only for an in-flight command.
     FileMappedRecordGranular {
         source: std::sync::Arc<Gemma4Q4FileMappedExpertSource>,
+    },
+    /// Exactly 48 anonymous writable records layered over the complete clean
+    /// mapped expert namespace. The directory is dynamic, but GPU-visible
+    /// addresses always remain canonical expert IDs.
+    HybridMappedRecordGranular {
+        source: std::sync::Arc<Gemma4Q4HybridExpertSource>,
     },
 }
 
@@ -13444,18 +13707,32 @@ pub(crate) enum Gemma4Q4ExpertSlotBinding {
     Monolithic(Buffer),
     RecordGranular(std::sync::Arc<spec50_moe_argbuf::Gemma4MoeSlotArgTable>),
     FileMappedSource(std::sync::Arc<Gemma4Q4FileMappedExpertSource>),
+    HybridMappedSource(std::sync::Arc<Gemma4Q4HybridExpertSource>),
+    HybridMappedTable {
+        table: std::sync::Arc<spec50_moe_argbuf::Gemma4MoeSlotArgTable>,
+        _lease: std::sync::Arc<Gemma4Q4HybridBindingLease>,
+    },
 }
 
 #[cfg(target_os = "macos")]
 impl Gemma4Q4ExpertSlotBinding {
     fn is_record_granular(&self) -> bool {
-        matches!(self, Self::RecordGranular(_) | Self::FileMappedSource(_))
+        matches!(
+            self,
+            Self::RecordGranular(_)
+                | Self::FileMappedSource(_)
+                | Self::HybridMappedSource(_)
+                | Self::HybridMappedTable { .. }
+        )
     }
 
     fn monolithic_buffer(&self) -> Option<&Buffer> {
         match self {
             Self::Monolithic(buffer) => Some(buffer),
-            Self::RecordGranular(_) | Self::FileMappedSource(_) => None,
+            Self::RecordGranular(_)
+            | Self::FileMappedSource(_)
+            | Self::HybridMappedSource(_)
+            | Self::HybridMappedTable { .. } => None,
         }
     }
 
@@ -13463,8 +13740,17 @@ impl Gemma4Q4ExpertSlotBinding {
         match self {
             Self::Monolithic(_) => None,
             Self::RecordGranular(table) => Some(table),
-            Self::FileMappedSource(_) => None,
+            Self::HybridMappedTable { table, .. } => Some(table),
+            Self::FileMappedSource(_) | Self::HybridMappedSource(_) => None,
         }
+    }
+
+    fn bound_tier_record_counts(&self) -> Option<(usize, usize)> {
+        let table = self.record_table()?;
+        Some((
+            table.hot_bound_record_count(),
+            table.mapped_bound_record_count(),
+        ))
     }
 
     fn addressable_slot_count(&self) -> Option<usize> {
@@ -13472,6 +13758,8 @@ impl Gemma4Q4ExpertSlotBinding {
             Self::Monolithic(_) => None,
             Self::RecordGranular(table) => Some(table.slot_count()),
             Self::FileMappedSource(source) => Some(source.addressable_slot_count()),
+            Self::HybridMappedSource(source) => Some(source.mapped.addressable_slot_count()),
+            Self::HybridMappedTable { table, .. } => Some(table.slot_count()),
         }
     }
 
@@ -13484,11 +13772,21 @@ impl Gemma4Q4ExpertSlotBinding {
             Self::FileMappedSource(source) => source
                 .materialize_for_active_slots(active_slots)
                 .map(|table| Self::RecordGranular(std::sync::Arc::new(table))),
+            Self::HybridMappedSource(source) => source
+                .materialize_for_active_slots(active_slots)
+                .map(|(table, lease)| Self::HybridMappedTable {
+                    table: std::sync::Arc::new(table),
+                    _lease: lease,
+                }),
+            Self::HybridMappedTable { table, _lease } => Some(Self::HybridMappedTable {
+                table: std::sync::Arc::clone(table),
+                _lease: std::sync::Arc::clone(_lease),
+            }),
         }
     }
 
     fn is_file_mapped_source(&self) -> bool {
-        matches!(self, Self::FileMappedSource(_))
+        matches!(self, Self::FileMappedSource(_) | Self::HybridMappedSource(_))
     }
 }
 
@@ -13583,6 +13881,28 @@ impl Gemma4Q4ExpertSlots {
         })
     }
 
+    /// Exact 48-hot/mapped-cold backing. The logical and GPU-visible
+    /// namespaces both remain the complete 128 canonical expert IDs; only the
+    /// anonymous writable cache is bounded to 48 physical records.
+    pub(crate) fn new_hybrid_mapped_record_granular(
+        mmap: std::sync::Arc<crate::wire_mmap::GgufWireMmap>,
+        offset: u64,
+        byte_len: usize,
+    ) -> Option<Self> {
+        let source = Gemma4Q4HybridExpertSource::new(mmap, offset, byte_len)?;
+        if source.hot_slot_count() != GEMMA4_Q4_HYBRID_HOT_SLOTS
+            || source.mapped.addressable_slot_count() != 128
+        {
+            return None;
+        }
+        Some(Self {
+            backing: Gemma4Q4ExpertSlotBacking::HybridMappedRecordGranular {
+                source: std::sync::Arc::new(source),
+            },
+            slot_count: 128,
+        })
+    }
+
     pub(crate) const fn slot_count(&self) -> usize {
         self.slot_count
     }
@@ -13598,6 +13918,9 @@ impl Gemma4Q4ExpertSlots {
             Gemma4Q4ExpertSlotBacking::FileMappedRecordGranular { source } => {
                 source.addressable_slot_count()
             }
+            Gemma4Q4ExpertSlotBacking::HybridMappedRecordGranular { source } => {
+                source.mapped.addressable_slot_count()
+            }
         }
     }
 
@@ -13611,6 +13934,10 @@ impl Gemma4Q4ExpertSlots {
                 records.len().saturating_mul(GEMMA4_Q4_EXPERT_SLOT_STRIDE)
             }
             Gemma4Q4ExpertSlotBacking::FileMappedRecordGranular { .. } => 0,
+            Gemma4Q4ExpertSlotBacking::HybridMappedRecordGranular { source } => source
+                .hot_records
+                .len()
+                .saturating_mul(GEMMA4_Q4_EXPERT_SLOT_STRIDE),
         }
     }
 
@@ -13619,6 +13946,9 @@ impl Gemma4Q4ExpertSlots {
             Gemma4Q4ExpertSlotBacking::Monolithic { .. } => self.slot_count,
             Gemma4Q4ExpertSlotBacking::RecordGranular { records, .. } => records.len(),
             Gemma4Q4ExpertSlotBacking::FileMappedRecordGranular { .. } => 0,
+            Gemma4Q4ExpertSlotBacking::HybridMappedRecordGranular { source } => {
+                source.hot_records.len()
+            }
         }
     }
 
@@ -13626,6 +13956,9 @@ impl Gemma4Q4ExpertSlots {
         match &self.backing {
             Gemma4Q4ExpertSlotBacking::FileMappedRecordGranular { source } => {
                 source.mapped_span_bytes
+            }
+            Gemma4Q4ExpertSlotBacking::HybridMappedRecordGranular { source } => {
+                source.mapped.mapped_span_bytes
             }
             _ => 0,
         }
@@ -13658,6 +13991,18 @@ impl Gemma4Q4ExpertSlots {
                 (locked, failed)
             }
             Gemma4Q4ExpertSlotBacking::FileMappedRecordGranular { .. } => (0, 0),
+            Gemma4Q4ExpertSlotBacking::HybridMappedRecordGranular { source } => {
+                let mut locked = 0usize;
+                let mut failed = 0usize;
+                for record in &source.hot_records {
+                    if pin_shared_metal_pages(record.contents(), GEMMA4_Q4_EXPERT_SLOT_STRIDE) {
+                        locked = locked.saturating_add(GEMMA4_Q4_EXPERT_SLOT_STRIDE);
+                    } else {
+                        failed = failed.saturating_add(GEMMA4_Q4_EXPERT_SLOT_STRIDE);
+                    }
+                }
+                (locked, failed)
+            }
         }
     }
 
@@ -13674,6 +14019,7 @@ impl Gemma4Q4ExpertSlots {
             self.backing,
             Gemma4Q4ExpertSlotBacking::RecordGranular { .. }
                 | Gemma4Q4ExpertSlotBacking::FileMappedRecordGranular { .. }
+                | Gemma4Q4ExpertSlotBacking::HybridMappedRecordGranular { .. }
         )
     }
 
@@ -13681,7 +14027,44 @@ impl Gemma4Q4ExpertSlots {
         matches!(
             self.backing,
             Gemma4Q4ExpertSlotBacking::FileMappedRecordGranular { .. }
+                | Gemma4Q4ExpertSlotBacking::HybridMappedRecordGranular { .. }
         )
+    }
+
+    pub(crate) fn is_hybrid_mapped(&self) -> bool {
+        matches!(
+            self.backing,
+            Gemma4Q4ExpertSlotBacking::HybridMappedRecordGranular { .. }
+        )
+    }
+
+    /// Physical anonymous cache capacity. This differs from
+    /// [`Self::gpu_slot_count`] only for the hybrid lane, where 48 writable
+    /// records back a 128-ID canonical address space.
+    pub(crate) fn writable_slot_count(&self) -> usize {
+        self.anonymous_slot_count()
+    }
+
+    pub(crate) fn hot_refill_available(&self) -> bool {
+        match &self.backing {
+            Gemma4Q4ExpertSlotBacking::HybridMappedRecordGranular { source } => {
+                source.refill_available()
+            }
+            _ => true,
+        }
+    }
+
+    /// Begin one structurally exclusive hybrid refill transaction. Hybrid hot
+    /// bytes are intentionally inaccessible through the generic slot writers;
+    /// callers must retain this guard through complete-record copy, directory
+    /// commit, and canonical-ID publication.
+    pub(crate) fn begin_hybrid_refill(&mut self) -> Option<Gemma4Q4HybridRefillGuard<'_>> {
+        match &self.backing {
+            Gemma4Q4ExpertSlotBacking::HybridMappedRecordGranular { source } => {
+                source.try_begin_refill()
+            }
+            _ => None,
+        }
     }
 
     pub(crate) fn gpu_binding(&self) -> Gemma4Q4ExpertSlotBinding {
@@ -13695,6 +14078,9 @@ impl Gemma4Q4ExpertSlots {
             Gemma4Q4ExpertSlotBacking::FileMappedRecordGranular { source } => {
                 Gemma4Q4ExpertSlotBinding::FileMappedSource(std::sync::Arc::clone(source))
             }
+            Gemma4Q4ExpertSlotBacking::HybridMappedRecordGranular { source } => {
+                Gemma4Q4ExpertSlotBinding::HybridMappedSource(std::sync::Arc::clone(source))
+            }
         }
     }
 
@@ -13702,7 +14088,8 @@ impl Gemma4Q4ExpertSlots {
         match &self.backing {
             Gemma4Q4ExpertSlotBacking::Monolithic { slab, .. } => Some(slab),
             Gemma4Q4ExpertSlotBacking::RecordGranular { .. }
-            | Gemma4Q4ExpertSlotBacking::FileMappedRecordGranular { .. } => None,
+            | Gemma4Q4ExpertSlotBacking::FileMappedRecordGranular { .. }
+            | Gemma4Q4ExpertSlotBacking::HybridMappedRecordGranular { .. } => None,
         }
     }
 
@@ -13710,7 +14097,8 @@ impl Gemma4Q4ExpertSlots {
         match &self.backing {
             Gemma4Q4ExpertSlotBacking::Monolithic { .. } => None,
             Gemma4Q4ExpertSlotBacking::RecordGranular { table, .. } => Some(table),
-            Gemma4Q4ExpertSlotBacking::FileMappedRecordGranular { .. } => None,
+            Gemma4Q4ExpertSlotBacking::FileMappedRecordGranular { .. }
+            | Gemma4Q4ExpertSlotBacking::HybridMappedRecordGranular { .. } => None,
         }
     }
 
@@ -13720,7 +14108,19 @@ impl Gemma4Q4ExpertSlots {
             Gemma4Q4ExpertSlotBacking::Monolithic { .. } => None,
             Gemma4Q4ExpertSlotBacking::RecordGranular { records, .. } => records.get(slot),
             Gemma4Q4ExpertSlotBacking::FileMappedRecordGranular { .. } => None,
+            Gemma4Q4ExpertSlotBacking::HybridMappedRecordGranular { source } => {
+                source.hot_records.get(slot)
+            }
         }
+    }
+
+    #[cfg(test)]
+    fn hybrid_published_hot_slot_ids(&self) -> Option<Vec<Option<usize>>> {
+        let Gemma4Q4ExpertSlotBacking::HybridMappedRecordGranular { source } = &self.backing
+        else {
+            return None;
+        };
+        source.hot_slot_ids.read().ok().map(|ids| ids.clone())
     }
 
     /// Entire aligned slab for safe disjoint parallel fills. Callers split with
@@ -13736,7 +14136,7 @@ impl Gemma4Q4ExpertSlots {
     }
 
     pub(crate) fn slot_bytes_mut(&mut self, slot: usize) -> Option<&mut [u8]> {
-        if slot >= self.gpu_slot_count() {
+        if slot >= self.writable_slot_count() || !self.hot_refill_available() {
             return None;
         }
         let pointer = match &mut self.backing {
@@ -13749,6 +14149,7 @@ impl Gemma4Q4ExpertSlots {
                 records.get_mut(slot)?.contents().cast::<u8>()
             }
             Gemma4Q4ExpertSlotBacking::FileMappedRecordGranular { .. } => return None,
+            Gemma4Q4ExpertSlotBacking::HybridMappedRecordGranular { .. } => return None,
         };
         // SAFETY: the selected backing owns a complete aligned slot and
         // `&mut self` makes the leading record bytes uniquely borrowed.
@@ -13756,7 +14157,7 @@ impl Gemma4Q4ExpertSlots {
     }
 
     pub(crate) unsafe fn slot_bytes_mut_raw(&self, slot: usize) -> Option<&mut [u8]> {
-        if slot >= self.gpu_slot_count() {
+        if slot >= self.writable_slot_count() || !self.hot_refill_available() {
             return None;
         }
         let pointer = match &self.backing {
@@ -13768,6 +14169,7 @@ impl Gemma4Q4ExpertSlots {
                 records.get(slot)?.contents().cast::<u8>()
             }
             Gemma4Q4ExpertSlotBacking::FileMappedRecordGranular { .. } => return None,
+            Gemma4Q4ExpertSlotBacking::HybridMappedRecordGranular { .. } => return None,
         };
         Some(std::slice::from_raw_parts_mut(
             pointer,
@@ -13921,7 +14323,13 @@ impl Gemma4DemandTableLoadOnlyProbe {
             &mut self.head_output,
         )?;
 
-        let table = slots.record_table()?;
+        // Mapped and hybrid backings intentionally have no persistent table.
+        // Materialize the exact probe union and retain that binding through
+        // command completion, just like the production chained path.
+        let materialized_binding = slots
+            .gpu_binding()
+            .materialize_for_active_slots(&self.active_slots)?;
+        let table = materialized_binding.record_table()?;
         let kernel = metal_linear_kernel()?;
         let command = kernel.queue.new_command_buffer();
         let encoder = command.new_compute_command_encoder();
@@ -23136,6 +23544,14 @@ pub struct ChainedRoundHostLedger {
     pub unique_experts_sum: u32,
     pub unique_experts_max: u32,
     pub unique_per_layer: [u16; 30],
+    /// Exact resources encoded into the latest round's transient expert
+    /// tables. For every admitted layer, hot+cold must equal its deduplicated
+    /// active union; hybrid rounds require both tiers to be independently
+    /// observable rather than inferred from cache policy.
+    pub hot_bound_records: u32,
+    pub mapped_bound_records: u32,
+    pub hot_bound_per_layer: [u16; 30],
+    pub mapped_bound_per_layer: [u16; 30],
     pub kv_capacity: u32,
     pub kv_bytes: u64,
     pub kv_filled: u32,
@@ -27449,6 +27865,47 @@ impl Gemma4GhostCommonMetal {
                         };
                         let encode_slot_binding =
                             materialized_binding.as_ref().unwrap_or(slot_binding);
+                        if materialized_binding.is_some() {
+                            let active_unique = active_slots
+                                .as_deref()
+                                .unwrap_or_default()
+                                .iter()
+                                .copied()
+                                .collect::<std::collections::HashSet<_>>()
+                                .len();
+                            let Some((hot_bound, mapped_bound)) =
+                                encode_slot_binding.bound_tier_record_counts()
+                            else {
+                                eprintln!(
+                                    "[metal chained round] layer {layer_idx} wave {wi} has no mixed-table tier receipt"
+                                );
+                                self.last_chained_ledger = ledger;
+                                return false;
+                            };
+                            if hot_bound.saturating_add(mapped_bound) != active_unique {
+                                eprintln!(
+                                    "[metal chained round] layer {layer_idx} wave {wi} tier receipt drift: hot={hot_bound} mapped={mapped_bound} active_unique={active_unique}"
+                                );
+                                self.last_chained_ledger = ledger;
+                                return false;
+                            }
+                            ledger.hot_bound_records = ledger
+                                .hot_bound_records
+                                .saturating_add(hot_bound.min(u32::MAX as usize) as u32);
+                            ledger.mapped_bound_records = ledger
+                                .mapped_bound_records
+                                .saturating_add(mapped_bound.min(u32::MAX as usize) as u32);
+                            if let Some(value) = ledger.hot_bound_per_layer.get_mut(layer_idx) {
+                                *value = value.saturating_add(
+                                    hot_bound.min(u16::MAX as usize) as u16,
+                                );
+                            }
+                            if let Some(value) = ledger.mapped_bound_per_layer.get_mut(layer_idx) {
+                                *value = value.saturating_add(
+                                    mapped_bound.min(u16::MAX as usize) as u16,
+                                );
+                            }
+                        }
 
                         encode_clock = std::time::Instant::now();
                         cmd_buf = kernel.queue.new_command_buffer();
@@ -44120,6 +44577,66 @@ kernel void sample_active_expert_records(
             0
         };
         assert_eq!(locked.saturating_add(failed), expected);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_hybrid_backing_is_exact_and_refill_is_terminally_exclusive() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let span = 128usize
+            .checked_mul(GEMMA4_Q4_EXPERT_SLOT_STRIDE)
+            .expect("mapped hybrid span");
+        let file = tempfile::NamedTempFile::new().expect("hybrid sparse fixture");
+        file.as_file()
+            .set_len(span as u64)
+            .expect("size sparse mapped cold tier");
+        let mmap = crate::wire_mmap::GgufWireMmap::map(file.path())
+            .expect("map sparse hybrid cold tier");
+        let mut slots = Gemma4Q4ExpertSlots::new_hybrid_mapped_record_granular(mmap, 0, span)
+            .expect("exact hybrid backing");
+
+        assert!(slots.is_hybrid_mapped());
+        assert!(slots.is_file_mapped());
+        assert_eq!(slots.slot_count(), 128);
+        assert_eq!(slots.gpu_slot_count(), 128);
+        assert_eq!(slots.writable_slot_count(), GEMMA4_Q4_HYBRID_HOT_SLOTS);
+        assert_eq!(slots.anonymous_slot_count(), GEMMA4_Q4_HYBRID_HOT_SLOTS);
+        assert_eq!(
+            slots.anonymous_capacity_bytes(),
+            GEMMA4_Q4_HYBRID_HOT_SLOTS * GEMMA4_Q4_EXPERT_SLOT_STRIDE
+        );
+        assert_eq!(slots.mapped_address_span_bytes(), span);
+        assert!(slots.slot_bytes_mut(0).is_none());
+
+        let mut identities = vec![None; GEMMA4_Q4_HYBRID_HOT_SLOTS];
+        identities[0] = Some(7);
+        {
+            let mut refill = slots.begin_hybrid_refill().expect("exclusive refill");
+            refill.slot_bytes_mut(0).expect("hot record")[0] = 0x5a;
+            assert!(refill.publish_hot_slot_ids(&identities));
+        }
+        assert_eq!(slots.hybrid_published_hot_slot_ids(), Some(identities));
+
+        let source = slots.gpu_binding();
+        let materialized = source
+            .materialize_for_active_slots(&[7])
+            .expect("hot canonical override binding");
+        assert!(slots.begin_hybrid_refill().is_none());
+        drop(materialized);
+
+        // An abandoned transaction must invalidate the old identity before
+        // its first mutation, leaving the modified record unreachable.
+        {
+            let mut refill = slots.begin_hybrid_refill().expect("refill after terminal drop");
+            refill.slot_bytes_mut(0).expect("hot record")[0] = 0xa5;
+        }
+        assert_eq!(
+            slots.hybrid_published_hot_slot_ids(),
+            Some(vec![None; GEMMA4_Q4_HYBRID_HOT_SLOTS])
+        );
+        assert!(source.materialize_for_active_slots(&[7]).is_some());
     }
 
     #[cfg(target_os = "macos")]
