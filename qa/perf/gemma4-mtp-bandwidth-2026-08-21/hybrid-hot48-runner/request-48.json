@@ -10,5 +10,6 @@
   "top_k": 1,
   "seed": 0,
   "stream": false,
+  "camelid_receipt": true,
   "camelid_enable_thinking": false
 }

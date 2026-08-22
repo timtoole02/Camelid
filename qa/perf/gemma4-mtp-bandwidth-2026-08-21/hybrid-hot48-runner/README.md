@@ -209,7 +209,9 @@ qa/perf/gemma4-mtp-bandwidth-2026-08-21/hybrid-hot48-runner/run_stage.zsh promot
 ```
 
 K1 and K8 use the same deterministic request fixture and must return identical
-token IDs and decoded text. The 48-token K8 promotion additionally requires at
+token IDs and decoded text. Both fixtures explicitly set
+`"camelid_receipt": true`; ordinary API requests remain outside this diagnostic
+path. The 48-token K8 promotion additionally requires at
 least 28 decode tok/s, at least 0.85 accepted/proposed drafts, no zero-accept
 full round, at most 35 ms exposed assistant time for every full round, and zero
 outer-lookahead activity.

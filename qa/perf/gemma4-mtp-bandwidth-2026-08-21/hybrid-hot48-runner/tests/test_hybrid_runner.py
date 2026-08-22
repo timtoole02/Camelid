@@ -504,6 +504,12 @@ class ReceiptTests(unittest.TestCase):
 
 
 class RunnerPreflightTests(unittest.TestCase):
+    def test_request_fixtures_explicitly_opt_in_to_hybrid_receipts(self) -> None:
+        for name in ("request-8.json", "request-48.json"):
+            request = json.loads((RUNNER_DIR / name).read_text(encoding="utf-8"))
+            self.assertIs(request.get("camelid_receipt"), True, name)
+            self.assertIs(request.get("stream"), False, name)
+
     def run_stage(self, stage: str, root: Path, extra: dict[str, str] | None = None):
         model = root / "model.gguf"
         cghost = root / "model.cghost"
