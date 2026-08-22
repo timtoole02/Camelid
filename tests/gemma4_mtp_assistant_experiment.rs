@@ -6124,6 +6124,7 @@ fn execute_lane_child(request: &ChildLaneRequest) -> Result<ChildLaneResult, Str
                     &eot,
                     max_new,
                     || control.should_abort(),
+                    None,
                 ),
                 "native MTP measured lane"
             );
@@ -7036,7 +7037,7 @@ mod pure_tests {
         };
         assert!(config.validate().is_ok());
         assert_eq!(config.expert_cache_mib, 2_900);
-        assert_eq!(config.environment["CAMELID_GEMMA4_SLOT_POLICY"], "lfu");
+        assert_eq!(config.environment["CAMELID_GEMMA4_SLOT_POLICY"], "lru");
         assert_eq!(config.environment["CAMELID_GEMMA4_VICTIM_CACHE"], "0");
         assert_eq!(config.environment["CAMELID_GEMMA4_VICTIM_MB"], "0");
         assert_eq!(
@@ -7057,7 +7058,7 @@ mod pure_tests {
         let mut drifted = config;
         drifted
             .environment
-            .insert("CAMELID_GEMMA4_SLOT_POLICY".into(), "lru".into());
+            .insert("CAMELID_GEMMA4_SLOT_POLICY".into(), "lfu".into());
         assert!(drifted
             .validate()
             .unwrap_err()
@@ -7504,7 +7505,7 @@ mod pure_tests {
         assert_eq!(
             policy.observe_pilot(&PilotComparison {
                 workload: Workload::Copy,
-                emitted_tokens: 31,
+                emitted_tokens: PILOT_TOKENS.saturating_sub(1),
                 n_median_wall_us: 100,
                 m_median_wall_us: 200,
             }),
@@ -7513,7 +7514,7 @@ mod pure_tests {
         assert_eq!(
             policy.observe_pilot(&PilotComparison {
                 workload: Workload::Copy,
-                emitted_tokens: 32,
+                emitted_tokens: PILOT_TOKENS,
                 n_median_wall_us: 100,
                 m_median_wall_us: 100,
             }),

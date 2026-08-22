@@ -176,7 +176,7 @@ kernel void spec50_moe_gateup_geglu_quant_batch_k(
     const uint b = group % G4Q4_DOWN_BLOCKS;
     const uint u = group / G4Q4_DOWN_BLOCKS;
     if (u >= num_unique_experts) return;
-    if (k_candidates == 0u || k_candidates > 8u) return;
+    if (k_candidates == 0u || k_candidates > 16u) return;
 
     const Gemma4UniqueExpertWork work = work_list[u];
     const ulong mask = work.candidate_mask;
@@ -190,10 +190,10 @@ kernel void spec50_moe_gateup_geglu_quant_batch_k(
     device const uchar* gate_row = weights + expert_base + ulong(row) * G4Q4_GU_ROW_BYTES;
     device const uchar* up_row = weights + expert_base + ulong(row + G4Q4_FF) * G4Q4_GU_ROW_BYTES;
 
-    float gate_acc[8];
-    float up_acc[8];
+    float gate_acc[16];
+    float up_acc[16];
     #pragma unroll
-    for (uint t = 0; t < 8; ++t) {
+    for (uint t = 0; t < 16; ++t) {
         gate_acc[t] = 0.0f;
         up_acc[t] = 0.0f;
     }
@@ -221,7 +221,7 @@ kernel void spec50_moe_gateup_geglu_quant_batch_k(
         }
 
         #pragma unroll
-        for (uint t = 0; t < 8; ++t) {
+        for (uint t = 0; t < 16; ++t) {
             if (t >= k_candidates) continue;
             if ((mask & (1ULL << t)) == 0ULL) continue;
             device const char* x = input_quants + ulong(t) * G4Q4_HIDDEN + ulong(gb) * 32ul;
@@ -247,7 +247,7 @@ kernel void spec50_moe_gateup_geglu_quant_batch_k(
     }
 
     #pragma unroll
-    for (uint t = 0; t < 8; ++t) {
+    for (uint t = 0; t < 16; ++t) {
         if (t >= k_candidates) continue;
         if ((mask & (1ULL << t)) == 0ULL) continue;
         const float gate = gate_acc[t];
@@ -784,7 +784,7 @@ pub(crate) fn encode_spec50_down_at_offsets(
     overflow_expert_weights: Option<&Buffer>,
     offsets: Spec50DownBufferOffsets,
 ) {
-    debug_assert!((1..=8).contains(&k_candidates));
+    debug_assert!((1..=16).contains(&k_candidates));
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_buffer(0, Some(act_scales), offsets.act_scales);
     encoder.set_buffer(1, Some(act_quants), offsets.act_quants);
@@ -805,7 +805,7 @@ pub(crate) fn encode_spec50_down_at_offsets(
             depth: 1,
         },
         metal::MTLSize {
-            width: 32 * u64::from(k_candidates.clamp(1, 8)),
+            width: 32 * u64::from(k_candidates.clamp(1, 16)),
             height: 1,
             depth: 1,
         },

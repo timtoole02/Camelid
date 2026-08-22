@@ -7,15 +7,28 @@ use std::{path::PathBuf, time::Instant};
 fn test_gemma4_26b_speculative_advancing() {
     let model_path = std::env::var_os("CAMELID_GEMMA4_26B_GGUF")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf"));
+        .unwrap_or_else(|| {
+            if PathBuf::from("/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf").exists() {
+                PathBuf::from("/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf")
+            } else {
+                PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.gguf")
+            }
+        });
     let cghost_path = std::env::var_os("CAMELID_GEMMA4_26B_CGHOST")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost"));
+        .unwrap_or_else(|| {
+            if PathBuf::from("/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost").exists() {
+                PathBuf::from("/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost")
+            } else {
+                PathBuf::from("/Users/timtoole/models/gemma-4-26B_q4_0-it.cghost")
+            }
+        });
 
-    std::env::set_var("CAMELID_GHOST_ALLOW_LEGACY_SPARSE", "1");
+    std::env::set_var("CAMELID_GHOST_ALLOW_LEGACY_SPARSE", "0");
     std::env::set_var("CAMELID_GEMMA4_GHOST_METAL", "1");
     std::env::set_var("CAMELID_GEMMA4_GHOST_METAL_SLOTS", "1");
     std::env::set_var("CAMELID_GEMMA4_GHOST_METAL_SLOTS_FAST", "1");
+    std::env::set_var("CAMELID_GEMMA4_SPEC_K1_LANE", "chained");
     if std::env::var("CAMELID_GEMMA4_GHOST_METAL_PER_LAYER_SLOTS").is_err() {
         std::env::set_var(
             "CAMELID_GEMMA4_GHOST_METAL_PER_LAYER_SLOTS",
@@ -94,8 +107,9 @@ fn test_gemma4_26b_speculative_advancing() {
                 break;
             }
             cur_logits = runtime
-                .step(tok, cur_pos, &mut greedy_kc, &mut greedy_vc)
-                .expect("step");
+                .step_chunk_speculative(&[tok], &[], cur_pos, &mut greedy_kc, &mut greedy_vc)
+                .expect("step_chunk_speculative")
+                .1;
             cur_pos += 1;
         }
         let greedy_decode_dur_s = t_decode_greedy_start.elapsed().as_secs_f64();
@@ -107,8 +121,9 @@ fn test_gemma4_26b_speculative_advancing() {
             greedy_tok_s
         );
 
-        // 2. Speculative Decode Across Draft Widths (Max batch capacity is 8 tokens -> max draft K=7)
-        for draft_k in [2, 3, 4, 5, 6, 7] {
+        std::env::set_var("CAMELID_GEMMA4_SPEC_CHUNK_MAX", "16");
+        // 2. Speculative Decode Across Draft Widths (up to K=16 widened batch)
+        for draft_k in [2, 4, 8, 12, 16] {
             std::env::set_var("CAMELID_GEMMA4_SPEC_DRAFT_TOKENS", draft_k.to_string());
             println!("\n----------------------------------------------------------------------------------------------------------");
             println!("ADVANCING SPECULATIVE DECODE (Draft K = {})", draft_k);

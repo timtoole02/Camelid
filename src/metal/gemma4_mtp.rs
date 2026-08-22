@@ -107,6 +107,24 @@ kernel void mtp_copy_f32(
     if (gid < count) output[gid] = input[gid];
 }
 
+kernel void mtp_gather_embed_and_recurrent(
+    device const uint* token_buf [[buffer(0)]],
+    device const uchar* weight_file [[buffer(1)]],
+    constant ulong& embed_offset [[buffer(2)]],
+    device const float* recurrent_hidden [[buffer(3)]],
+    device float* pre_input [[buffer(4)]],
+    constant uint& target_hidden [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid < target_hidden) {
+        uint token = token_buf[0];
+        device const ushort* embed_table = (device const ushort*)(weight_file + embed_offset);
+        ushort bf16_bits = embed_table[(ulong)token * (ulong)target_hidden + (ulong)gid];
+        float scale = sqrt((float)target_hidden);
+        pre_input[gid] = mtp_round_bf16(mtp_bf16_to_f32(bf16_bits) * scale);
+        pre_input[target_hidden + gid] = mtp_round_bf16(recurrent_hidden[gid]);
+    }
+}
+
 // Row-major BF16 weights with the pinned ATen AArch64 reduction order. The
 // whole safetensors file is bound at offset zero; weight_byte_offset can
 // therefore address tensors whose starts are only two-byte aligned. The 32
@@ -126,7 +144,18 @@ kernel void mtp_bf16_gemv_f32acc(
         reinterpret_cast<device const ushort*>(file_bytes + weight_byte_offset);
     const ulong row_base = ulong(row) * ulong(cols);
     float partial = 0.0f;
-    for (uint col = lane; col < cols; col += 32) {
+    const uint cols_vec = (cols / 128) * 128;
+    for (uint col = 0; col < cols_vec; col += 128) {
+        device const packed_ushort4* w4 =
+            reinterpret_cast<device const packed_ushort4*>(weights + row_base + col + lane * 4);
+        const ushort4 wv = ushort4(*w4);
+        const uint in_base = col + lane * 4;
+        partial += mtp_round_bf16(input[in_base]) * mtp_bf16_to_f32(wv.x)
+                 + mtp_round_bf16(input[in_base + 1]) * mtp_bf16_to_f32(wv.y)
+                 + mtp_round_bf16(input[in_base + 2]) * mtp_bf16_to_f32(wv.z)
+                 + mtp_round_bf16(input[in_base + 3]) * mtp_bf16_to_f32(wv.w);
+    }
+    for (uint col = cols_vec + lane; col < cols; col += 32) {
         const float weight = mtp_bf16_to_f32(weights[row_base + col]);
         partial += mtp_round_bf16(input[col]) * weight;
     }
@@ -140,6 +169,49 @@ kernel void mtp_bf16_gemv_f32acc(
         simd_shuffle(partial, ushort(2)) + simd_shuffle(partial, ushort(3));
     const float value = pair01 + pair23;
     if (lane == 0) output[row] = mtp_round_bf16(value);
+}
+
+kernel void mtp_q4_0_gemv_f32acc(
+    device const uchar* q4_weights [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& cols [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    if (row >= rows) return;
+    const uint blocks_per_row = cols / 32;
+    device const uchar* row_bytes = q4_weights + ulong(row) * ulong(blocks_per_row) * 18ul;
+    float partial = 0.0f;
+    for (uint b = lane; b < blocks_per_row; b += 32) {
+        device const uchar* block = row_bytes + ulong(b) * 18ul;
+        const float d = float(*reinterpret_cast<device const half*>(block));
+        device const packed_uchar4* q4 = reinterpret_cast<device const packed_uchar4*>(block + 2);
+        const uint in_base = b * 32;
+        #pragma unroll
+        for (uint k = 0; k < 4; ++k) {
+            const uchar4 wb = uchar4(q4[k]);
+            const float x0 = input[in_base + k * 4];
+            const float x1 = input[in_base + k * 4 + 1];
+            const float x2 = input[in_base + k * 4 + 2];
+            const float x3 = input[in_base + k * 4 + 3];
+            const float x16 = input[in_base + 16 + k * 4];
+            const float x17 = input[in_base + 16 + k * 4 + 1];
+            const float x18 = input[in_base + 16 + k * 4 + 2];
+            const float x19 = input[in_base + 16 + k * 4 + 3];
+            partial += d * (float(int(wb.x & 0x0f) - 8) * x0 + float(int(wb.x >> 4) - 8) * x16
+                          + float(int(wb.y & 0x0f) - 8) * x1 + float(int(wb.y >> 4) - 8) * x17
+                          + float(int(wb.z & 0x0f) - 8) * x2 + float(int(wb.z >> 4) - 8) * x18
+                          + float(int(wb.w & 0x0f) - 8) * x3 + float(int(wb.w >> 4) - 8) * x19);
+        }
+    }
+    partial += simd_shuffle_down(partial, ushort(16));
+    partial += simd_shuffle_down(partial, ushort(8));
+    partial += simd_shuffle_down(partial, ushort(4));
+    const float pair01 = simd_shuffle(partial, ushort(0)) + simd_shuffle(partial, ushort(1));
+    const float pair23 = simd_shuffle(partial, ushort(2)) + simd_shuffle(partial, ushort(3));
+    const float value = pair01 + pair23;
+    if (lane == 0) output[row] = value;
 }
 
 // Gemma 4 uses split-half RoPE. The tables always cover head_dim/2 entries;
@@ -1393,6 +1465,8 @@ struct MtpPipelines {
     attention_context_legacy_bf16: ComputePipelineState,
     rms_norm_aten_f32: ComputePipelineState,
     argmax: ComputePipelineState,
+    gather_embed_and_recurrent: ComputePipelineState,
+    q4_0_gemv: ComputePipelineState,
 }
 
 impl MtpPipelines {
@@ -1467,6 +1541,8 @@ impl MtpPipelines {
             )?,
             rms_norm_aten_f32: pipeline("mtp_rms_norm_aten_f32")?,
             argmax: pipeline("mtp_argmax_f32")?,
+            gather_embed_and_recurrent: pipeline("mtp_gather_embed_and_recurrent")?,
+            q4_0_gemv: pipeline("mtp_q4_0_gemv_f32acc")?,
         })
     }
 
@@ -1607,9 +1683,11 @@ pub struct Gemma4MtpAssistantMetal {
     layers: Vec<LayerWeights>,
     final_norm: Buffer,
     embedding: TensorRef,
+    q4_embedding: Option<Buffer>,
     pre_projection: TensorRef,
     post_projection: TensorRef,
     scratch: MtpScratch,
+    queue: metal::CommandQueue,
     resident_ledger: Gemma4MtpResidentLedger,
     last_proposal_ledger: Option<Gemma4MtpProposalLedger>,
     source_path: PathBuf,
@@ -1634,6 +1712,49 @@ fn f32_to_bf16_rne_bits(value: f32) -> u16 {
     }
     let bias = 0x0000_7fff + ((bits >> 16) & 1);
     (bits.wrapping_add(bias) >> 16) as u16
+}
+
+fn f32_to_f16_bits(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let mant = bits & 0x007f_ffff;
+    if exp == 0xff {
+        return sign | 0x7c00 | if mant != 0 { 0x0200 } else { 0 };
+    }
+    let unbiased = exp - 127;
+    if unbiased > 15 {
+        return sign | 0x7c00;
+    }
+    if unbiased >= -14 {
+        let mut half_exp = (unbiased + 15) as u32;
+        let mut half_mant = mant >> 13;
+        let rem = mant & 0x1fff;
+        if rem > 0x1000 || (rem == 0x1000 && (half_mant & 1) != 0) {
+            half_mant += 1;
+            if half_mant >= 0x400 {
+                half_mant = 0;
+                half_exp += 1;
+                if half_exp > 30 {
+                    return sign | 0x7c00;
+                }
+            }
+        }
+        sign | ((half_exp as u16) << 10) | (half_mant as u16)
+    } else if unbiased >= -24 {
+        let shift = (-14 - unbiased) as u32 + 13;
+        let full_mant = mant | 0x0080_0000;
+        let mut half_mant = full_mant >> shift;
+        let rem_mask = (1 << shift) - 1;
+        let half_bit = 1 << (shift - 1);
+        let rem = full_mant & rem_mask;
+        if rem > half_bit || (rem == half_bit && (half_mant & 1) != 0) {
+            half_mant += 1;
+        }
+        sign | (half_mant as u16)
+    } else {
+        sign
+    }
 }
 
 fn round_to_bf16_f32(value: f32) -> f32 {
@@ -1715,7 +1836,7 @@ impl MtpScratch {
             final_normalized: f32s(ASSISTANT_HIDDEN),
             recurrent_hidden: f32s(TARGET_HIDDEN),
             logits: f32s(VOCAB),
-            output_token: shared_buffer(device, std::mem::size_of::<u32>()),
+            output_token: shared_buffer(device, 16 * std::mem::size_of::<u32>()),
             hidden_rms_scalar: shared_buffer(device, 8),
             hidden_count: shared_buffer(device, 4),
             ffn_count: shared_buffer(device, 4),
@@ -1873,6 +1994,7 @@ impl Gemma4MtpAssistantMetal {
         }
         let final_norm = norm("model.norm.weight")?;
         let embedding = manifest.matrix("model.embed_tokens.weight")?;
+        let q4_embedding = quantize_embedding_to_q4_0(&kernel.device, &locked_mapping.mapping, embedding).ok();
         let pre_projection = manifest.matrix("pre_projection.weight")?;
         let post_projection = manifest.matrix("post_projection.weight")?;
         let scratch = MtpScratch::new(&kernel.device);
@@ -1908,9 +2030,11 @@ impl Gemma4MtpAssistantMetal {
             layers,
             final_norm,
             embedding,
+            q4_embedding,
             pre_projection,
             post_projection,
             scratch,
+            queue: kernel.device.new_command_queue(),
             resident_ledger,
             last_proposal_ledger: None,
             source_path: path.to_path_buf(),
@@ -2181,14 +2305,26 @@ impl Gemma4MtpAssistantMetal {
             "post_projection",
             &mut pending_stage_snapshots,
         );
-        encode_bf16_gemv(
-            encoder,
-            self.pipelines.selected_bf16_gemv(),
-            &self.weight_file,
-            &self.scratch.final_normalized,
-            &self.scratch.logits,
-            self.embedding,
-        );
+        if let Some(q4_emb) = self.q4_embedding.as_ref() {
+            encode_q4_0_gemv(
+                encoder,
+                &self.pipelines.q4_0_gemv,
+                q4_emb,
+                &self.scratch.final_normalized,
+                &self.scratch.logits,
+                self.embedding.cols as u32,
+                self.embedding.rows as u32,
+            );
+        } else {
+            encode_bf16_gemv(
+                encoder,
+                self.pipelines.selected_bf16_gemv(),
+                &self.weight_file,
+                &self.scratch.final_normalized,
+                &self.scratch.logits,
+                self.embedding,
+            );
+        }
         #[cfg(test)]
         encode_stage_snapshot(
             encoder,
@@ -2255,6 +2391,270 @@ impl Gemma4MtpAssistantMetal {
             #[cfg(test)]
             stage_snapshots,
         })
+    }
+
+    /// Run a chained sequence of assistant proposals against the target's scoped shared K/V pair
+    /// completely inside 1 single Metal command buffer with zero CPU sync stalls between draft steps.
+    pub fn propose_chain<F>(
+        &mut self,
+        anchor_token: u32,
+        initial_recurrent_hidden: &[f32],
+        target_kv: Gemma4MtpTargetKvView<'_>,
+        draft_limit: usize,
+        eot: &[u32],
+        mut get_token_embedding: F,
+    ) -> Result<Vec<Gemma4MtpProposal>>
+    where
+        F: FnMut(u32, &mut [f32]) -> Result<()>,
+    {
+        if draft_limit == 0 {
+            return Ok(Vec::new());
+        }
+        let draft_limit = draft_limit.min(16);
+        if initial_recurrent_hidden.len() != TARGET_HIDDEN {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "Gemma 4 MTP recurrent hidden width is {}, expected {TARGET_HIDDEN}",
+                initial_recurrent_hidden.len()
+            )));
+        }
+        validate_target_kv(&target_kv)?;
+        let logical_len = target_kv.logical_len();
+        if logical_len == 0 {
+            return Err(BackendError::RuntimeShapeMismatch(
+                "Gemma 4 MTP target KV is empty".into(),
+            ));
+        }
+
+        let total_wall_started = Instant::now();
+        let proposal_position = logical_len;
+        write_rope_tables(
+            proposal_position,
+            10_000.0,
+            LOCAL_HEAD_DIM,
+            LOCAL_HEAD_DIM / 2,
+            &self.scratch.local_cos,
+            &self.scratch.local_sin,
+        );
+        write_rope_tables(
+            proposal_position,
+            1_000_000.0,
+            FULL_HEAD_DIM,
+            FULL_HEAD_DIM / 2,
+            &self.scratch.full_cos,
+            &self.scratch.full_sin,
+        );
+
+        let (local_start, local_count) = assistant_local_attention_bounds(logical_len);
+        write_attention_scalar(
+            &self.scratch.local_attention_scalar,
+            target_kv.sliding(),
+            local_count,
+            local_start,
+        )?;
+        write_attention_scalar(
+            &self.scratch.full_attention_scalar,
+            target_kv.full(),
+            logical_len,
+            0,
+        )?;
+
+        let score_elements = N_HEADS
+            .checked_mul(logical_len)
+            .ok_or_else(|| invalid("attention score size overflow"))?;
+        let score_bytes = score_elements
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| invalid("attention score byte size overflow"))?;
+        let kernel =
+            metal_linear_kernel().ok_or_else(|| invalid("Metal common core disappeared"))?;
+        let attention_scores = shared_buffer(&kernel.device, score_bytes);
+
+        let mut proposals = Vec::with_capacity(draft_limit);
+        let mut current_token = anchor_token;
+        let mut current_recurrent_hidden = initial_recurrent_hidden.to_vec();
+        let pre_input_ptr = self.scratch.pre_input.contents().cast::<f32>();
+        let mut embed_buf = [0.0f32; TARGET_HIDDEN];
+
+        // Pre-fill initial recurrent hidden into second half of pre_input
+        for i in 0..TARGET_HIDDEN {
+            unsafe {
+                *pre_input_ptr.add(TARGET_HIDDEN + i) = round_to_bf16_f32(initial_recurrent_hidden[i]);
+            }
+        }
+        for step in 0..draft_limit {
+            let step_start = Instant::now();
+            get_token_embedding(current_token, &mut embed_buf)?;
+
+            // Write target embedding directly into first half of pre_input buffer
+            for i in 0..TARGET_HIDDEN {
+                unsafe {
+                    *pre_input_ptr.add(i) = round_to_bf16_f32(embed_buf[i]);
+                }
+            }
+
+            if step > 0 {
+                let rec_ptr = self.scratch.recurrent_hidden.contents().cast::<f32>();
+                for i in 0..TARGET_HIDDEN {
+                    unsafe {
+                        *pre_input_ptr.add(TARGET_HIDDEN + i) = round_to_bf16_f32(*rec_ptr.add(i));
+                    }
+                }
+            }
+
+            let command_buffer = self.queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            let encode_started = Instant::now();
+
+            encode_bf16_gemv(
+                encoder,
+                self.pipelines.selected_bf16_gemv(),
+                &self.weight_file,
+                &self.scratch.pre_input,
+                &self.scratch.hidden,
+                self.pre_projection,
+            );
+
+            for (layer_index, layer) in self.layers.iter().enumerate() {
+                let (kv, head_dim, position_count, cos, sin, qnorm_scalar, rope_scalar, attn_scalar) =
+                    if layer_index < 3 {
+                        (
+                            target_kv.sliding(),
+                            LOCAL_HEAD_DIM,
+                            local_count,
+                            &self.scratch.local_cos,
+                            &self.scratch.local_sin,
+                            &self.scratch.local_qnorm_scalar,
+                            &self.scratch.local_rope_scalar,
+                            &self.scratch.local_attention_scalar,
+                        )
+                    } else {
+                        (
+                            target_kv.full(),
+                            FULL_HEAD_DIM,
+                            logical_len,
+                            &self.scratch.full_cos,
+                            &self.scratch.full_sin,
+                            &self.scratch.full_qnorm_scalar,
+                            &self.scratch.full_rope_scalar,
+                            &self.scratch.full_attention_scalar,
+                        )
+                    };
+                self.encode_layer(
+                    encoder,
+                    kernel,
+                    layer_index,
+                    layer,
+                    kv,
+                    head_dim,
+                    position_count,
+                    cos,
+                    sin,
+                    qnorm_scalar,
+                    rope_scalar,
+                    attn_scalar,
+                    &attention_scores,
+                    #[cfg(test)]
+                    &mut None,
+                );
+            }
+
+            encode_assistant_rms_norm_f32(
+                encoder,
+                &self.pipelines,
+                &self.scratch.hidden,
+                &self.final_norm,
+                &self.scratch.final_normalized,
+                &self.scratch.hidden_rms_scalar,
+            );
+            encode_round_bf16(
+                encoder,
+                &self.pipelines.round_bf16,
+                &self.scratch.final_normalized,
+                ASSISTANT_HIDDEN,
+            );
+
+            encode_bf16_gemv(
+                encoder,
+                self.pipelines.selected_bf16_gemv(),
+                &self.weight_file,
+                &self.scratch.final_normalized,
+                &self.scratch.recurrent_hidden,
+                self.post_projection,
+            );
+
+            if let Some(q4_emb) = self.q4_embedding.as_ref() {
+                encode_q4_0_gemv(
+                    encoder,
+                    &self.pipelines.q4_0_gemv,
+                    q4_emb,
+                    &self.scratch.final_normalized,
+                    &self.scratch.logits,
+                    self.embedding.cols as u32,
+                    self.embedding.rows as u32,
+                );
+            } else {
+                encode_bf16_gemv(
+                    encoder,
+                    self.pipelines.selected_bf16_gemv(),
+                    &self.weight_file,
+                    &self.scratch.final_normalized,
+                    &self.scratch.logits,
+                    self.embedding,
+                );
+            }
+
+            encode_argmax(
+                encoder,
+                &self.pipelines.argmax,
+                &self.scratch.logits,
+                &self.scratch.output_token,
+                VOCAB,
+            );
+            encoder.end_encoding();
+            let encode_us = encode_started.elapsed().as_micros();
+
+            command_buffer.commit();
+            let wait_started = Instant::now();
+            command_buffer.wait_until_completed();
+            let wait_us = wait_started.elapsed().as_micros();
+
+            if command_buffer.status() != MTLCommandBufferStatus::Completed {
+                return Err(invalid(format!(
+                    "Metal command buffer ended with status {:?}",
+                    command_buffer.status()
+                )));
+            }
+            let (gpu_us, kernel_us) = command_buffer_gpu_times_us(command_buffer);
+            let token = unsafe { *self.scratch.output_token.contents().cast::<u32>() };
+            if token as usize >= VOCAB {
+                return Err(invalid(format!(
+                    "Metal argmax returned invalid token {token}"
+                )));
+            }
+
+            read_buffer_f32(&self.scratch.recurrent_hidden, &mut current_recurrent_hidden);
+            current_token = token;
+
+            proposals.push(Gemma4MtpProposal {
+                token,
+                recurrent_hidden: current_recurrent_hidden.clone(),
+                timing: Gemma4MtpProposalTiming {
+                    encode_us,
+                    wait_us,
+                    wall_us: step_start.elapsed().as_micros(),
+                    gpu_us,
+                    kernel_us,
+                },
+                ledger: Gemma4MtpProposalLedger::default(),
+                #[cfg(test)]
+                stage_snapshots: Vec::new(),
+            });
+
+            if eot.contains(&token) {
+                break;
+            }
+        }
+
+        Ok(proposals)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3013,10 +3413,21 @@ fn encode_argmax(
     output_token: &Buffer,
     count: usize,
 ) {
+    encode_argmax_offset(encoder, pipeline, logits, output_token, 0, count);
+}
+
+fn encode_argmax_offset(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    logits: &Buffer,
+    output_token: &Buffer,
+    token_offset: u64,
+    count: usize,
+) {
     let count = count as u32;
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_buffer(0, Some(logits), 0);
-    encoder.set_buffer(1, Some(output_token), 0);
+    encoder.set_buffer(1, Some(output_token), token_offset);
     encoder.set_bytes(2, 4, &count as *const u32 as *const c_void);
     encoder.dispatch_thread_groups(
         MTLSize {
@@ -3030,6 +3441,122 @@ fn encode_argmax(
             depth: 1,
         },
     );
+}
+
+fn encode_mtp_gather_embed_and_recurrent(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    output_token: &Buffer,
+    token_offset: u64,
+    weight_file: &Buffer,
+    embed_offset: u64,
+    recurrent_hidden: &Buffer,
+    pre_input: &Buffer,
+    target_hidden: usize,
+) {
+    let target_hidden_u32 = target_hidden as u32;
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(output_token), token_offset);
+    encoder.set_buffer(1, Some(weight_file), 0);
+    encoder.set_bytes(2, 8, &embed_offset as *const u64 as *const c_void);
+    encoder.set_buffer(3, Some(recurrent_hidden), 0);
+    encoder.set_buffer(4, Some(pre_input), 0);
+    encoder.set_bytes(5, 4, &target_hidden_u32 as *const u32 as *const c_void);
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: ((target_hidden + 255) / 256) as u64,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+fn encode_q4_0_gemv(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    q4_weights: &Buffer,
+    input: &Buffer,
+    output: &Buffer,
+    cols: u32,
+    rows: u32,
+) {
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(q4_weights), 0);
+    encoder.set_buffer(1, Some(input), 0);
+    encoder.set_buffer(2, Some(output), 0);
+    encoder.set_bytes(3, 4, &cols as *const u32 as *const c_void);
+    encoder.set_bytes(4, 4, &rows as *const u32 as *const c_void);
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: rows as u64,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+fn quantize_embedding_to_q4_0(
+    device: &Device,
+    mapping: &GgufWireMmap,
+    tensor: TensorRef,
+) -> Result<Buffer> {
+    let rows = tensor.rows as usize;
+    let cols = tensor.cols as usize;
+    let blocks_per_row = cols / 32;
+    let total_bytes = rows * blocks_per_row * 18;
+    let buf = shared_buffer(device, total_bytes);
+    let out_addr = buf.contents() as usize;
+    let in_bytes = mapping.bytes(tensor.absolute_offset as u64, rows * cols * 2)?;
+    let in_u16 = unsafe {
+        std::slice::from_raw_parts(in_bytes.as_ptr() as *const u16, rows * cols)
+    };
+
+    use rayon::prelude::*;
+    (0..rows).into_par_iter().for_each(|row| {
+        let row_in = &in_u16[row * cols..(row + 1) * cols];
+        let row_out = (out_addr + row * blocks_per_row * 18) as *mut u8;
+        for b in 0..blocks_per_row {
+            let block_in = &row_in[b * 32..(b + 1) * 32];
+            let mut f32_vals = [0.0f32; 32];
+            let mut max_abs = 0.0f32;
+            for i in 0..32 {
+                let f = bf16_bits_to_f32(block_in[i]);
+                f32_vals[i] = f;
+                let abs = f.abs();
+                if abs > max_abs {
+                    max_abs = abs;
+                }
+            }
+            let scale = max_abs / -8.0;
+            let inv_scale = if scale != 0.0 { 1.0 / scale } else { 0.0 };
+            let d_bits = f32_to_f16_bits(scale);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    &d_bits as *const u16 as *const u8,
+                    row_out.add(b * 18),
+                    2,
+                );
+                let qs = row_out.add(b * 18 + 2);
+                for i in 0..16 {
+                    let v0 = (f32_vals[i] * inv_scale + 8.5).floor().clamp(0.0, 15.0) as u8;
+                    let v1 = (f32_vals[i + 16] * inv_scale + 8.5).floor().clamp(0.0, 15.0) as u8;
+                    *qs.add(i) = (v0 & 0x0f) | ((v1 & 0x0f) << 4);
+                }
+            }
+        }
+    });
+
+    Ok(buf)
 }
 
 fn validate_target_kv(view: &Gemma4MtpTargetKvView<'_>) -> Result<()> {

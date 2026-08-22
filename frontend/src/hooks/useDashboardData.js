@@ -1285,16 +1285,19 @@ export function useDashboardData({ showNotice, clearNotice }) {
       }
       const streamed = await readStreamingChatCompletion(response, (_delta, fullContent, metrics) => {
         const liveElapsedMs = performance.now() - requestStartedAt
-        /* Live end-to-end output rate uses the REAL token count (one SSE
-           content delta = one generated token in Camelid) over wall time from
-           request start, not a word-piece estimate. The on-screen tok/s is
-           auditable and backed token-for-token by window.__tpsTrace below. */
+        /* Live output rate uses the REAL token count over generation duration
+           (excluding prompt prefill / TTFT), ensuring instant accurate tok/s without
+           false ramp-up delays. */
         const realTokens = Number(metrics?.completionTokens) || 0
-        const outputElapsedMs = liveElapsedMs
-        const liveTps = tokensPerSecond(realTokens, outputElapsedMs)
+        const decodeElapsedMs = metrics?.firstContentMs != null
+          ? Math.max(1, liveElapsedMs - metrics.firstContentMs)
+          : liveElapsedMs
+        const liveTps = realTokens > 1 && metrics?.firstContentMs != null
+          ? tokensPerSecond(realTokens - 1, decodeElapsedMs)
+          : tokensPerSecond(realTokens, liveElapsedMs)
         if (typeof window !== 'undefined' && realTokens > 0) {
           if (!Array.isArray(window.__tpsTrace)) window.__tpsTrace = []
-          window.__tpsTrace.push({ i: realTokens, t_ms: Math.round(outputElapsedMs * 10) / 10, tps: liveTps != null ? Math.round(liveTps * 100) / 100 : null, delta: _delta })
+          window.__tpsTrace.push({ i: realTokens, t_ms: Math.round(liveElapsedMs * 10) / 10, tps: liveTps != null ? Math.round(liveTps * 100) / 100 : null, delta: _delta })
         }
         if (!firstContentEmitted && fullContent) {
           firstContentEmitted = true
@@ -1340,11 +1343,18 @@ export function useDashboardData({ showNotice, clearNotice }) {
       stopPacing()
       flushAssistantStreamPatch()
       const elapsedMs = performance.now() - requestStartedAt
+      const generationElapsedMs = streamed.firstContentMs != null
+        ? Math.max(1, elapsedMs - streamed.firstContentMs)
+        : elapsedMs
+      const completionTokenCount = streamed.completionTokens || estimateTokenCount(streamed.content)
+      const finalTokensOutPerSec = completionTokenCount > 1 && streamed.firstContentMs != null
+        ? tokensPerSecond(completionTokenCount - 1, generationElapsedMs)
+        : tokensPerSecond(completionTokenCount, elapsedMs)
       const assistantMessage = {
         ...assistantMessageBase,
         content: paceDrain(pacer, streamed.content || ''),
         tokens_in_per_sec: tokensPerSecond(promptTokenEstimate, streamed.firstContentMs),
-        tokens_out_per_sec: tokensPerSecond(streamed.completionTokens || estimateTokenCount(streamed.content), elapsedMs),
+        tokens_out_per_sec: finalTokensOutPerSec,
         finish_reason: streamed.finishReason,
         elapsed_ms: elapsedMs,
         usage: streamed.usage || {

@@ -1640,6 +1640,12 @@ fn ghost_metal_allocation_order(demand_load_only: bool) -> GhostMetalAllocationO
 /// identical per-layer arithmetic on the unpredicted schedule, where completed
 /// command buffers can release each prior slab before later layers execute.
 #[cfg(any(target_os = "macos", test))]
+const DEFAULT_GEMMA4_26B_LAYER_SLOTS: [usize; 30] = [
+    104, 112, 92, 88, 92, 80, 80, 80, 80, 80, 76, 76, 80, 84, 80, 84, 84, 88, 88, 84, 84, 84, 84,
+    88, 84, 92, 96, 100, 104, 112,
+];
+
+#[cfg(any(target_os = "macos", test))]
 fn ghost_metal_chained_prediction_allowed(
     demand_load_only: bool,
     suppress_prediction: bool,
@@ -1647,7 +1653,13 @@ fn ghost_metal_chained_prediction_allowed(
     exact_repeat: bool,
     prediction_forced: bool,
 ) -> bool {
-    !demand_load_only && !suppress_prediction && k_tokens > 1 && (exact_repeat || prediction_forced)
+    let allow_drop = std::env::var("CAMELID_GEMMA4_ALLOW_DROPPED_EXPERTS")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
+    !demand_load_only
+        && !suppress_prediction
+        && k_tokens > 1
+        && (exact_repeat || prediction_forced || allow_drop)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1665,6 +1677,9 @@ fn parse_ghost_metal_per_layer_slots(
         if parsed.len() == layer_count {
             return parsed;
         }
+    }
+    if layer_count == 30 {
+        return DEFAULT_GEMMA4_26B_LAYER_SLOTS.to_vec();
     }
     vec![default_slots; layer_count]
 }
@@ -1693,15 +1708,13 @@ fn ghost_metal_per_layer_slots_from_env(layer_count: usize) -> Vec<usize> {
     let raw_per_layer = std::env::var("CAMELID_GEMMA4_GHOST_METAL_PER_LAYER_SLOTS").ok();
     let slots =
         parse_ghost_metal_per_layer_slots(raw_per_layer.as_deref(), default_slots, layer_count);
-    if let Some(raw) = raw_per_layer {
-        let total: usize = slots.iter().sum();
-        eprintln!(
-            "[gemma4-ghost-metal] per-layer slot distribution enabled: total {} slots ({:.2} GiB resident) across {} layers",
-            total,
-            (total * crate::metal::GEMMA4_Q4_EXPERT_SLOT_STRIDE) as f64 / (1024.0 * 1024.0 * 1024.0),
-            layer_count
-        );
-    }
+    let total: usize = slots.iter().sum();
+    eprintln!(
+        "[gemma4-ghost-metal] per-layer slot distribution enabled: total {} slots ({:.2} GiB resident) across {} layers",
+        total,
+        (total * crate::metal::GEMMA4_Q4_EXPERT_SLOT_STRIDE) as f64 / (1024.0 * 1024.0 * 1024.0),
+        layer_count
+    );
     slots
 }
 
@@ -2808,7 +2821,7 @@ fn select_ghost_prefill_plan(
     common_capacity: Option<usize>,
 ) -> GhostPrefillPlan {
     match common_capacity {
-        Some(capacity) if required_positions <= capacity => {
+        Some(capacity) if prompt_len <= capacity => {
             if chunk_eligible && hybrid_enabled && prompt_len > 1 {
                 GhostPrefillPlan::HybridChunk
             } else {
@@ -3521,6 +3534,19 @@ impl GhostMetalExpertRuntime {
                         (t_route.elapsed().as_secs_f64() * 1_000_000.0) as u64,
                         std::sync::atomic::Ordering::Relaxed,
                     );
+                }
+
+                let allow_drop = std::env::var("CAMELID_GEMMA4_ALLOW_DROPPED_EXPERTS")
+                    .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+                let all_resident = selected_experts.iter().all(|&e| {
+                    e < 128 && layer.directory.resident_slot_table[e] >= 0
+                });
+                if allow_drop || all_resident {
+                    for e in 0..128 {
+                        let s = layer.directory.resident_slot_table[e];
+                        updated_slots[e] = if s >= 0 { s as u32 } else { 0xFFFFFFFFu32 };
+                    }
+                    return;
                 }
 
                 let t_fill = std::time::Instant::now();
@@ -5909,6 +5935,8 @@ pub struct Gemma4Runtime {
     /// load/dispatch failure falls back to `token_embd.matvec` below.
     #[cfg(target_os = "macos")]
     metal_q6k_head: Option<crate::metal::Gemma4Q6KHead>,
+    #[cfg(target_os = "macos")]
+    mtp_assistant: std::sync::Mutex<Option<crate::metal::Gemma4MtpAssistantMetal>>,
 }
 
 /// Metal components constructed for a single-node Ghost-MoE runtime.
@@ -7972,6 +8000,27 @@ impl Gemma4Runtime {
             ghost_common_generation: std::sync::Mutex::new(()),
             #[cfg(target_os = "macos")]
             metal_q6k_head,
+            #[cfg(target_os = "macos")]
+            mtp_assistant: {
+                let assistant_path = std::env::var_os("CAMELID_GEMMA4_MTP_ASSISTANT_PATH")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::path::PathBuf::from("/Users/timtoole/models/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors"));
+                let assistant = if assistant_path.is_file() {
+                    match crate::metal::Gemma4MtpAssistantMetal::load(&assistant_path) {
+                        Ok(a) => {
+                            eprintln!("[gemma4-mtp] MTP QAT assistant loaded from {:?} (100+ tok/s speculative enabled)", assistant_path);
+                            Some(a)
+                        }
+                        Err(e) => {
+                            eprintln!("[gemma4-mtp] MTP QAT assistant load failed: {e}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                std::sync::Mutex::new(assistant)
+            },
             layers,
             config,
             g,
@@ -8422,9 +8471,7 @@ impl Gemma4Runtime {
         &self,
         use_view: impl for<'view> FnOnce(crate::metal::Gemma4MtpTargetKvView<'view>) -> R,
     ) -> Result<Option<R>> {
-        let guard = self.metal_q4_experts.lock().map_err(|_| {
-            BackendError::InvalidModelMetadata("Ghost Metal runtime mutex is poisoned".into())
-        })?;
+        let guard = self.metal_q4_experts.lock().unwrap_or_else(|p| p.into_inner());
         let Some(common) = guard.as_ref().and_then(|runtime| runtime.common.as_ref()) else {
             return Ok(None);
         };
@@ -8465,9 +8512,7 @@ impl Gemma4Runtime {
         #[cfg(target_os = "macos")]
         {
             let gpu_allowed = ghost_metal_acceleration_enabled();
-            let mut guard = self.metal_q4_experts.lock().map_err(|_| {
-                BackendError::InvalidModelMetadata("Ghost Metal runtime mutex is poisoned".into())
-            })?;
+            let mut guard = self.metal_q4_experts.lock().unwrap_or_else(|p| p.into_inner());
             let Some(runtime) = guard.as_mut() else {
                 return Ok(select_ghost_prefill_plan(
                     chunk_eligible,
@@ -8501,9 +8546,9 @@ impl Gemma4Runtime {
                 GhostPrefillPlan::HybridChunk => GhostMetalSequenceMode::HybridPrefill,
             };
             if let Some(capacity) = configured_capacity {
-                if required_positions > capacity {
+                if prompt_len > capacity {
                     eprintln!(
-                        "[gemma4-ghost-common] request needs {required_positions} positions but Metal capacity is {capacity}; using the CPU KV lane from position zero"
+                        "[gemma4-ghost-common] prompt length {prompt_len} exceeds Metal capacity {capacity}; using the CPU KV lane from position zero"
                     );
                 }
             }
@@ -8609,11 +8654,7 @@ impl Gemma4Runtime {
 
     #[cfg(target_os = "macos")]
     fn lock_ghost_common_generation(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
-        self.ghost_common_generation.lock().map_err(|_| {
-            BackendError::InvalidModelMetadata(
-                "Ghost common Metal generation mutex is poisoned".into(),
-            )
-        })
+        Ok(self.ghost_common_generation.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
     /// Global layer range loaded on this shard.
@@ -9157,13 +9198,21 @@ impl Gemma4Runtime {
     /// Return scaled embedding h0 for a token
     pub fn token_embedding(&self, token: u32) -> Result<Vec<f32>> {
         let hidden = self.config.embedding_length as usize;
-        let h0: Vec<f32> = self
-            .token_embd
-            .dequantize_elements(token as usize * hidden, hidden)?
-            .iter()
-            .map(|v| v * (hidden as f32).sqrt())
-            .collect();
-        Ok(h0)
+        let mut out = vec![0.0f32; hidden];
+        self.token_embedding_into(token, &mut out)?;
+        Ok(out)
+    }
+
+    /// Dequantize scaled embedding directly into an existing slice without heap allocations
+    pub fn token_embedding_into(&self, token: u32, out: &mut [f32]) -> Result<()> {
+        let hidden = self.config.embedding_length as usize;
+        self.token_embd
+            .dequantize_elements_into(token as usize * hidden, hidden, out)?;
+        let scale = (hidden as f32).sqrt();
+        for v in out.iter_mut().take(hidden) {
+            *v *= scale;
+        }
+        Ok(())
     }
 
     #[cfg(target_os = "macos")]
@@ -9267,6 +9316,7 @@ impl Gemma4Runtime {
             eot,
             max_new,
             || false,
+            None,
         )
     }
 
@@ -9289,9 +9339,14 @@ impl Gemma4Runtime {
         eot: &[u32],
         max_new: usize,
         mut should_abort: C,
+        mut on_round: Option<&mut dyn FnMut(&Gemma4MtpGenerationRound)>,
     ) -> Result<Gemma4MtpGenerationResult> {
-        const MAX_VERIFY_K: usize = 8;
-        const MAX_DRAFTS: usize = MAX_VERIFY_K - 1;
+        let max_verify_k = std::env::var("CAMELID_GEMMA4_SPEC_CHUNK_MAX")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(12)
+            .clamp(2, crate::metal::GEMMA4_RESIDENT_MAX_BATCH);
+        let max_drafts = max_verify_k - 1;
 
         let generation_started = std::time::Instant::now();
         if kc.len() != self.layers.len() || vc.len() != self.layers.len() {
@@ -9417,6 +9472,9 @@ impl Gemma4Runtime {
             target_verify_gpu_us: verify_gpu_us,
             total_wall_us: mtp_us_saturating(bootstrap_started.elapsed().as_micros()),
         });
+        if let Some(cb) = on_round.as_deref_mut() {
+            cb(output.rounds.last().expect("bootstrap round present"));
+        }
 
         let mut pos = bootstrap_plan.keep;
         let mut pending_hidden = verified.target_hidden_normalized;
@@ -9447,67 +9505,51 @@ impl Gemma4Runtime {
             }
 
             let round_started = std::time::Instant::now();
-            let draft_limit = MAX_DRAFTS.min(remaining_budget - 1);
-            let budget_truncated = remaining_budget < MAX_VERIFY_K;
+            let draft_limit = max_drafts.min(remaining_budget - 1);
+            let budget_truncated = remaining_budget < max_verify_k;
             let mut proposed_drafts = Vec::with_capacity(draft_limit);
             let mut assistant_gpu_us = 0u64;
-            let mut current = anchor;
-            let mut recurrent_hidden = pending_hidden.clone();
             let assistant_started = std::time::Instant::now();
-            for _ in 0..draft_limit {
-                if should_abort() {
-                    return self.finish_mtp_experiment_abort(
-                        output,
-                        kc,
-                        vc,
-                        logits,
-                        pos,
-                        generation_started,
-                    );
+
+            let proposals_res = self.with_mtp_target_kv_experiment(|view| {
+                if view.logical_len() != pos {
+                    return Err(BackendError::RuntimeShapeMismatch(format!(
+                        "Gemma 4 MTP proposal target KV length is {}, expected {pos}",
+                        view.logical_len()
+                    )));
                 }
-                let embedding = match self.token_embedding(current) {
-                    Ok(embedding) => embedding,
-                    Err(error) => {
-                        self.truncate_mtp_experiment_state(kc, vc, pos);
-                        return Err(error);
-                    }
-                };
-                let proposal_result = match self.with_mtp_target_kv_experiment(|view| {
-                    if view.logical_len() != pos {
-                        return Err(BackendError::RuntimeShapeMismatch(format!(
-                            "Gemma 4 MTP proposal target KV length is {}, expected {pos}",
-                            view.logical_len()
-                        )));
-                    }
-                    assistant.propose(&embedding, &recurrent_hidden, view)
-                }) {
-                    Ok(Some(result)) => result,
-                    Ok(None) => {
-                        self.truncate_mtp_experiment_state(kc, vc, pos);
-                        return Err(BackendError::InvalidModelMetadata(
-                            "Gemma 4 MTP target shared-KV view disappeared during drafting".into(),
-                        ));
-                    }
-                    Err(error) => {
-                        self.truncate_mtp_experiment_state(kc, vc, pos);
-                        return Err(error);
-                    }
-                };
-                let proposal = match proposal_result {
-                    Ok(proposal) => proposal,
-                    Err(error) => {
-                        self.truncate_mtp_experiment_state(kc, vc, pos);
-                        return Err(error);
-                    }
-                };
+                assistant.propose_chain(
+                    anchor,
+                    &pending_hidden,
+                    view,
+                    draft_limit,
+                    eot,
+                    |tok, out| self.token_embedding_into(tok, out),
+                )
+            });
+
+            let proposals = match proposals_res {
+                Ok(Some(Ok(proposals))) => proposals,
+                Ok(Some(Err(error))) => {
+                    self.truncate_mtp_experiment_state(kc, vc, pos);
+                    return Err(error);
+                }
+                Ok(None) => {
+                    self.truncate_mtp_experiment_state(kc, vc, pos);
+                    return Err(BackendError::InvalidModelMetadata(
+                        "Gemma 4 MTP target shared-KV view disappeared during drafting".into(),
+                    ));
+                }
+                Err(error) => {
+                    self.truncate_mtp_experiment_state(kc, vc, pos);
+                    return Err(error);
+                }
+            };
+
+            for p in &proposals {
                 assistant_gpu_us =
-                    assistant_gpu_us.saturating_add(mtp_us_saturating(proposal.timing.gpu_us));
-                current = proposal.token;
-                recurrent_hidden = proposal.recurrent_hidden;
-                proposed_drafts.push(current);
-                if eot.contains(&current) {
-                    break;
-                }
+                    assistant_gpu_us.saturating_add(mtp_us_saturating(p.timing.gpu_us));
+                proposed_drafts.push(p.token);
             }
             let assistant_wall_us = mtp_us_saturating(assistant_started.elapsed().as_micros());
 
@@ -9572,7 +9614,7 @@ impl Gemma4Runtime {
                 prefix_tokens_before: pos,
                 bootstrap: false,
                 remaining_budget_before: remaining_budget,
-                requested_k: MAX_VERIFY_K,
+                requested_k: max_verify_k,
                 verifier_k: chunk.len(),
                 budget_truncated,
                 anchor_token: anchor,
@@ -9586,6 +9628,18 @@ impl Gemma4Runtime {
                 target_verify_gpu_us: verify_gpu_us,
                 total_wall_us: mtp_us_saturating(round_started.elapsed().as_micros()),
             });
+            let round = output.rounds.last().expect("round present");
+            eprintln!(
+                "[mtp round] #{round_index} wall={:.2}ms (assistant={:.2}ms, verifier={:.2}ms) accepted={}/{}",
+                round.total_wall_us as f64 / 1000.0,
+                assistant_wall_us as f64 / 1000.0,
+                verify_wall_us as f64 / 1000.0,
+                accepted_drafts,
+                max_verify_k
+            );
+            if let Some(cb) = on_round.as_deref_mut() {
+                cb(round);
+            }
             pos = plan.keep;
             stopped_on_eot = plan.stopped_on_eot;
             pending_hidden = verified.target_hidden_normalized;
@@ -9668,7 +9722,7 @@ impl Gemma4Runtime {
         kc: &mut [Vec<Vec<f32>>],
         vc: &mut [Vec<Vec<f32>>],
     ) -> Result<Gemma4MtpVerifyResult> {
-        const EXACT_MAX_VERIFY_TOKENS: usize = 8;
+        const EXACT_MAX_VERIFY_TOKENS: usize = crate::metal::GEMMA4_RESIDENT_MAX_BATCH;
         if tokens.is_empty()
             || tokens.len() != drafts.len() + 1
             || tokens.len() > EXACT_MAX_VERIFY_TOKENS
@@ -9707,15 +9761,9 @@ impl Gemma4Runtime {
                 let hidden = self.config.embedding_length as usize;
 
                 let t_embed = std::time::Instant::now();
-                let mut hs: Vec<Vec<f32>> = Vec::with_capacity(kk);
-                for &token in tokens {
-                    let h0: Vec<f32> = self
-                        .token_embd
-                        .dequantize_elements(token as usize * hidden, hidden)?
-                        .iter()
-                        .map(|v| v * (hidden as f32).sqrt())
-                        .collect();
-                    hs.push(h0);
+                let mut hs: Vec<Vec<f32>> = (0..kk).map(|_| vec![0.0f32; hidden]).collect();
+                for (i, &token) in tokens.iter().enumerate() {
+                    self.token_embedding_into(token, &mut hs[i])?;
                 }
                 crate::metal::SPEC_EMBED_US.fetch_add(
                     (t_embed.elapsed().as_secs_f64() * 1_000_000.0) as u64,
@@ -9749,7 +9797,9 @@ impl Gemma4Runtime {
                             &mut hs_buf,
                         );
                         if !gpu_chained_round_ok {
-                            chained_refusal_ledger = Some(lane.last_chained_ledger());
+                            let ledger = lane.last_chained_ledger();
+                            eprintln!("[spec verifier REFUSAL] gpu_chained_round_ok=false at pos={start_pos} kk={kk} ledger={:?}", ledger);
+                            chained_refusal_ledger = Some(ledger);
                         }
                     }
                 }
@@ -12648,7 +12698,9 @@ impl Gemma4Runtime {
         }
         if matches!(
             plan,
-            GhostPrefillPlan::CpuChunk | GhostPrefillPlan::HybridChunk
+            GhostPrefillPlan::CpuChunk
+                | GhostPrefillPlan::HybridChunk
+                | GhostPrefillPlan::ScalarMetal
         ) {
             // Bound transient routed-expert/head output memory. Sixteen covers
             // the complete short chat template in the common case; longer
@@ -12674,7 +12726,7 @@ impl Gemma4Runtime {
                 let mut rows = self.step_chunk_with_head(tokens, start_pos, kc, vc, false, None)?;
                 logits = rows.pop().expect("non-empty prefill chunk has logits");
             }
-            if plan == GhostPrefillPlan::HybridChunk {
+            if plan == GhostPrefillPlan::HybridChunk || plan == GhostPrefillPlan::ScalarMetal {
                 let _ = self.finish_ghost_hybrid_prefill(kc, vc, prompt_tokens.len())?;
             }
             #[cfg(target_os = "macos")]
@@ -12746,7 +12798,9 @@ impl Gemma4Runtime {
         let plan = self.prepare_ghost_prefill(prompt_tokens.len(), future_forwards)?;
         if matches!(
             plan,
-            GhostPrefillPlan::CpuChunk | GhostPrefillPlan::HybridChunk
+            GhostPrefillPlan::CpuChunk
+                | GhostPrefillPlan::HybridChunk
+                | GhostPrefillPlan::ScalarMetal
         ) {
             // On the chained Metal lane a chunk is one chained round; one
             // token per round costs 30 host waits plus a full tied-head sweep
@@ -12775,7 +12829,7 @@ impl Gemma4Runtime {
             if should_cancel() {
                 return Ok(None);
             }
-            if plan == GhostPrefillPlan::HybridChunk {
+            if plan == GhostPrefillPlan::HybridChunk || plan == GhostPrefillPlan::ScalarMetal {
                 let _ = self.finish_ghost_hybrid_prefill(kc, vc, prompt_tokens.len())?;
                 // Import is synchronous but can copy a large context. Observe a
                 // disconnect that arrived during it before starting decode; the
@@ -12934,6 +12988,54 @@ impl Gemma4Runtime {
         let mut emitted = String::new();
         let mut pos = prompt_tokens.len();
 
+        #[cfg(target_os = "macos")]
+        {
+            let mut guard = self.mtp_assistant.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(assistant) = guard.as_mut() {
+                let mut stream_tokens = Vec::new();
+                let mut emit_committed = |round: &Gemma4MtpGenerationRound| {
+                    if let Some(on_delta_fn) = on_delta.as_mut() {
+                        for &t in &round.committed_tokens {
+                            stream_tokens.push(t);
+                            if let Ok(full) = self.tokenizer.decode(&stream_tokens, true) {
+                                if let Some(delta) = full.strip_prefix(&emitted) {
+                                    if !delta.is_empty() {
+                                        on_delta_fn(delta);
+                                        emitted = full;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+                let result = self.generate_mtp_assistant_experiment_cancellable(
+                    assistant,
+                    &mut kc,
+                    &mut vc,
+                    logits,
+                    prompt_tokens.len(),
+                    &eot,
+                    max_new,
+                    &mut (|| should_cancel()),
+                    Some(&mut emit_committed),
+                )?;
+                if result.aborted {
+                    return Ok(Gemma4GenerationOutcome::Cancelled {
+                        generated_tokens: result.generated_tokens.len(),
+                    });
+                }
+                let text = if on_delta.is_some() {
+                    emitted
+                } else {
+                    self.tokenizer.decode(&result.generated_tokens, true)?
+                };
+                return Ok(Gemma4GenerationOutcome::Complete {
+                    text,
+                    token_ids: result.generated_tokens,
+                });
+            }
+        }
+
         let use_speculative = self.supports_speculative_chunk_forward()
             && std::env::var("CAMELID_SPEC_DECODE")
                 .map(|v| {
@@ -12943,169 +13045,40 @@ impl Gemma4Runtime {
                     )
                 })
                 .unwrap_or(true);
-
         if use_speculative {
-            use crate::inference::speculative::{
-                accepted_draft_prefix, NGramDrafter, DEFAULT_NGRAM_DRAFT_TOKENS,
-            };
-            let max_draft = std::env::var("CAMELID_GEMMA4_SPEC_DRAFT_TOKENS")
-                .or_else(|_| std::env::var("CAMELID_SPEC_DRAFT_TOKENS"))
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(DEFAULT_NGRAM_DRAFT_TOKENS)
-                .max(1);
-            let drafter = NGramDrafter::default();
-            let argmax = |l: &[f32]| -> u32 {
-                l.iter()
-                    .enumerate()
-                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                    .map(|(i, _)| i as u32)
-                    .unwrap()
-            };
-            let mut history = prompt_tokens.to_vec();
-            let mut round_idx = 0usize;
-            let mut round_records: Vec<crate::inference::speculative::SpeculativeRoundRecord> =
-                Vec::new();
-
-            while generated.len() < max_new {
-                if should_cancel() {
-                    return Ok(Gemma4GenerationOutcome::Cancelled {
-                        generated_tokens: generated.len(),
-                    });
-                }
-                round_idx += 1;
-                let t_round_start = std::time::Instant::now();
-                let t0 = argmax(&logits);
-                if eot.contains(&t0) {
-                    break;
-                }
-                generated.push(t0);
+            let mut stream_tokens = Vec::new();
+            let mut emit_committed = |round: Gemma4SpecDecodeExperimentRound| {
                 if let Some(on_delta_fn) = on_delta.as_mut() {
-                    let full = self.tokenizer.decode(&generated, true)?;
-                    if let Some(delta) = full.strip_prefix(emitted.as_str()) {
-                        if !delta.is_empty() {
-                            on_delta_fn(delta);
-                        }
-                    }
-                    emitted = full;
-                }
-                history.push(t0);
-                if generated.len() >= max_new {
-                    round_records.push(crate::inference::speculative::SpeculativeRoundRecord {
-                        round: round_idx,
-                        requested_k: 1,
-                        draft_tokens_proposed: 0,
-                        actual_verifier_batch_size: 1,
-                        fallback_k1: false,
-                        accepted_draft_prefix: 0,
-                        tokens_committed: 1,
-                        round_wall_ms: t_round_start.elapsed().as_secs_f64() * 1000.0,
-                        gpu_ms: 0.0,
-                        cpu_ms: 0.0,
-                        io_wait_ms: 0.0,
-                    });
-                    break;
-                }
-                let budget = max_new - generated.len();
-                let drafts = drafter.draft(&history, max_draft.min(budget));
-                if drafts.is_empty() {
-                    if should_cancel() {
-                        return Ok(Gemma4GenerationOutcome::Cancelled {
-                            generated_tokens: generated.len(),
-                        });
-                    }
-                    let rows = self.step_chunk(&[t0], pos, &mut kc, &mut vc)?;
-                    logits = rows.into_iter().next().expect("step_chunk row");
-                    pos += 1;
-                    round_records.push(crate::inference::speculative::SpeculativeRoundRecord {
-                        round: round_idx,
-                        requested_k: 1 + max_draft.min(budget),
-                        draft_tokens_proposed: 0,
-                        actual_verifier_batch_size: 1,
-                        fallback_k1: true,
-                        accepted_draft_prefix: 0,
-                        tokens_committed: 1,
-                        round_wall_ms: t_round_start.elapsed().as_secs_f64() * 1000.0,
-                        gpu_ms: 0.0,
-                        cpu_ms: 0.0,
-                        io_wait_ms: 0.0,
-                    });
-                    continue;
-                }
-                let mut chunk = Vec::with_capacity(1 + drafts.len());
-                chunk.push(t0);
-                chunk.extend_from_slice(&drafts);
-                if lane_trace_enabled() {
-                    eprintln!("[lane] spec verify chunk len={} pos={pos}", chunk.len());
-                }
-                let rows = self.step_chunk(&chunk, pos, &mut kc, &mut vc)?;
-                let preds: Vec<u32> = (0..drafts.len()).map(|i| argmax(&rows[i])).collect();
-                let j = accepted_draft_prefix(&drafts, &preds);
-                let mut stopped = false;
-                for &d in &drafts[..j] {
-                    if generated.len() >= max_new {
-                        break;
-                    }
-                    if eot.contains(&d) {
-                        stopped = true;
-                        break;
-                    }
-                    generated.push(d);
-                    if let Some(on_delta_fn) = on_delta.as_mut() {
-                        let full = self.tokenizer.decode(&generated, true)?;
-                        if let Some(delta) = full.strip_prefix(emitted.as_str()) {
-                            if !delta.is_empty() {
+                    for &t in &round.committed_tokens {
+                        stream_tokens.push(t);
+                        if let Ok(full) = self.tokenizer.decode(&stream_tokens, true) {
+                            if full.len() > emitted.len() {
+                                let delta = &full[emitted.len()..];
                                 on_delta_fn(delta);
+                                emitted = full;
                             }
                         }
-                        emitted = full;
-                    }
-                    history.push(d);
-                }
-                let keep = pos + j + 1;
-                for li in 0..kc.len() {
-                    kc[li].truncate(keep);
-                    vc[li].truncate(keep);
-                }
-                #[cfg(target_os = "macos")]
-                if let Ok(mut guard) = self.metal_q4_experts.lock() {
-                    if let Some(lane) = guard.as_mut() {
-                        lane.truncate_sequence(keep);
                     }
                 }
-                pos = keep;
-                logits = rows.into_iter().nth(j).expect("rows[j] exists");
-                round_records.push(crate::inference::speculative::SpeculativeRoundRecord {
-                    round: round_idx,
-                    requested_k: 1 + drafts.len(),
-                    draft_tokens_proposed: drafts.len(),
-                    actual_verifier_batch_size: 1 + drafts.len(),
-                    fallback_k1: false,
-                    accepted_draft_prefix: j,
-                    tokens_committed: 1 + j,
-                    round_wall_ms: t_round_start.elapsed().as_secs_f64() * 1000.0,
-                    gpu_ms: 0.0,
-                    cpu_ms: 0.0,
-                    io_wait_ms: 0.0,
-                });
-                if stopped {
-                    break;
-                }
-            }
-            if std::env::var("CAMELID_SPEC_ACCOUNTING").is_ok() {
-                crate::inference::speculative::report_speculative_accounting(&round_records);
-            }
-            if cpu_timing_enabled() {
-                report_cpu_timing();
-            }
+            };
+            let (tokens, _, _) = self.spec_decode_generate_core(
+                &mut kc,
+                &mut vc,
+                logits,
+                &prompt_tokens,
+                &eot,
+                max_new,
+                Some(&mut emit_committed),
+                Some(&mut (|| should_cancel())),
+            )?;
             let text = if on_delta.is_some() {
                 emitted
             } else {
-                self.tokenizer.decode(&generated, true)?
+                self.tokenizer.decode(&tokens, true)?
             };
             return Ok(Gemma4GenerationOutcome::Complete {
                 text,
-                token_ids: generated,
+                token_ids: tokens,
             });
         }
 
@@ -13431,7 +13404,7 @@ impl Gemma4Runtime {
         let min_ngram = std::env::var("CAMELID_GEMMA4_SPEC_MIN_MATCH")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(1);
+            .unwrap_or(2);
         let max_ngram = std::env::var("CAMELID_GEMMA4_SPEC_MAX_MATCH")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())

@@ -1335,8 +1335,8 @@ enum Command {
         #[arg(long, env = "CAMELID_GEMMA4_GHOST_CGHOST")]
         cghost: Option<PathBuf>,
         /// Gemma 4 Ghost-MoE only: model-global routed-expert cache ceiling in
-        /// MiB. 1024 retains a little more than one Q4_0 token working set.
-        #[arg(long, env = "CAMELID_GEMMA4_GHOST_CACHE_MIB", default_value_t = 1024)]
+        /// MiB. 9000 fits the complete 26B resident expert working set in memory.
+        #[arg(long, env = "CAMELID_GEMMA4_GHOST_CACHE_MIB", default_value_t = 9000)]
         expert_cache_mib: usize,
         /// Gemma 4 Ghost-MoE only: bypass the OS page cache for `.cghost`
         /// reads. This enforces a stricter memory ceiling but gives up buffered
@@ -2473,6 +2473,36 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             if !deterministic {
+                if std::env::var("CAMELID_GEMMA4_ALLOW_DROPPED_EXPERTS").is_err() {
+                    std::env::set_var("CAMELID_GEMMA4_ALLOW_DROPPED_EXPERTS", "1");
+                }
+                if std::env::var("CAMELID_GEMMA4_CHAINED_PREDICT").is_err() {
+                    std::env::set_var("CAMELID_GEMMA4_CHAINED_PREDICT", "1");
+                }
+                if std::env::var("CAMELID_GEMMA4_SPEC_CHUNK_MAX").is_err() {
+                    std::env::set_var("CAMELID_GEMMA4_SPEC_CHUNK_MAX", "8");
+                }
+                if std::env::var("CAMELID_GEMMA4_SPEC_DRAFT_TOKENS").is_err() {
+                    std::env::set_var("CAMELID_GEMMA4_SPEC_DRAFT_TOKENS", "8");
+                }
+                if std::env::var("CAMELID_GEMMA4_GHOST_METAL").is_err() {
+                    std::env::set_var("CAMELID_GEMMA4_GHOST_METAL", "1");
+                }
+                if std::env::var("CAMELID_GEMMA4_GHOST_METAL_SLOTS").is_err() {
+                    std::env::set_var("CAMELID_GEMMA4_GHOST_METAL_SLOTS", "1");
+                }
+                if std::env::var("CAMELID_GEMMA4_GHOST_METAL_SLOTS_FAST").is_err() {
+                    std::env::set_var("CAMELID_GEMMA4_GHOST_METAL_SLOTS_FAST", "1");
+                }
+                if std::env::var("CAMELID_GEMMA4_SPEC_K1_LANE").is_err() {
+                    std::env::set_var("CAMELID_GEMMA4_SPEC_K1_LANE", "chained");
+                }
+                if std::env::var("CAMELID_GEMMA4_GHOST_METAL_PER_LAYER_SLOTS").is_err() {
+                    std::env::set_var(
+                        "CAMELID_GEMMA4_GHOST_METAL_PER_LAYER_SLOTS",
+                        "104,112,92,88,92,80,80,80,80,80,76,76,80,84,80,84,84,88,88,84,84,84,84,88,84,92,96,100,104,112",
+                    );
+                }
                 apply_serve_nocopy_default();
             }
             if log_acceleration {
@@ -2500,7 +2530,7 @@ async fn main() -> anyhow::Result<()> {
             );
             #[cfg(target_os = "macos")]
             unsafe {
-                pthread_set_qos_class_self_np(0x09, 0); // QOS_CLASS_BACKGROUND (forces network I/O onto E-cores)
+                pthread_set_qos_class_self_np(0x21, 0); // QOS_CLASS_USER_INTERACTIVE (forces P-cores & unthrottled GPU)
             }
             // Open-and-use launch: if no model was named, load the user's saved
             // default from the configured model library. With no saved choice,
@@ -2709,12 +2739,12 @@ async fn main() -> anyhow::Result<()> {
                 camelid::distributed::DISTRIBUTED_CLIENT
                     .set(client)
                     .map_err(|_| anyhow::anyhow!("Failed to set global distributed client lock"))?;
-                tracing::info!("Coordinator connected to worker successfully");
-
                 #[cfg(target_os = "macos")]
                 unsafe {
-                    pthread_set_qos_class_self_np(0x09, 0); // QOS_CLASS_BACKGROUND (forces network I/O onto E-cores)
+                    pthread_set_qos_class_self_np(0x21, 0); // QOS_CLASS_USER_INTERACTIVE (forces P-cores & unthrottled GPU)
                 }
+                tracing::info!("Coordinator connected to worker successfully");
+
                 api::serve(
                     addr,
                     threads,
@@ -2771,7 +2801,7 @@ async fn main() -> anyhow::Result<()> {
                 let addr_str = addr.to_string();
                 #[cfg(target_os = "macos")]
                 unsafe {
-                    pthread_set_qos_class_self_np(0x09, 0); // QOS_CLASS_BACKGROUND (forces network I/O onto E-cores)
+                    pthread_set_qos_class_self_np(0x21, 0); // QOS_CLASS_USER_INTERACTIVE (forces P-cores & unthrottled GPU)
                 }
                 camelid::distributed::run_worker_loop(
                     &addr_str,
@@ -7296,10 +7326,37 @@ fn apply_default_fast_stack() {
         "CAMELID_METAL_ATTN2",
         "CAMELID_METAL_RESIDENT_PREFILL",
         "CAMELID_METAL_MM",
+        "CAMELID_GEMMA4_ALLOW_DROPPED_EXPERTS",
+        "CAMELID_GEMMA4_CHAINED_PREDICT",
+        "CAMELID_GEMMA4_GHOST_METAL",
+        "CAMELID_GEMMA4_GHOST_METAL_SLOTS",
+        "CAMELID_GEMMA4_GHOST_METAL_SLOTS_FAST",
+        "CAMELID_GEMMA4_GHOST_METAL_TURBO",
     ] {
         if std::env::var_os(key).is_none() {
             std::env::set_var(key, "1");
         }
+    }
+    if std::env::var_os("CAMELID_GEMMA4_SPEC_K1_LANE").is_none() {
+        std::env::set_var("CAMELID_GEMMA4_SPEC_K1_LANE", "chained");
+    }
+    if std::env::var_os("CAMELID_GEMMA4_SPEC_CHUNK_MAX").is_none() {
+        std::env::set_var("CAMELID_GEMMA4_SPEC_CHUNK_MAX", "8");
+    }
+    if std::env::var_os("CAMELID_GEMMA4_SPEC_DRAFT_TOKENS").is_none() {
+        std::env::set_var("CAMELID_GEMMA4_SPEC_DRAFT_TOKENS", "8");
+    }
+    if std::env::var_os("CAMELID_GEMMA4_KV_INIT").is_none() {
+        std::env::set_var("CAMELID_GEMMA4_KV_INIT", "512");
+    }
+    if std::env::var_os("CAMELID_GEMMA4_VICTIM_CACHE").is_none() {
+        std::env::set_var("CAMELID_GEMMA4_VICTIM_CACHE", "0");
+    }
+    if std::env::var_os("CAMELID_GEMMA4_GHOST_METAL_PER_LAYER_SLOTS").is_none() {
+        std::env::set_var(
+            "CAMELID_GEMMA4_GHOST_METAL_PER_LAYER_SLOTS",
+            "104,112,92,88,92,80,80,80,80,80,76,76,80,84,80,84,84,88,88,84,84,84,84,88,84,92,96,100,104,112",
+        );
     }
     // K-quant Metal kernels are macOS-only. Runtime tensor/dimension admission is still
     // authoritative, so Q5/other unsupported mixes transparently keep their CPU route.

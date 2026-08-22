@@ -74,7 +74,7 @@ kernel void spec50_moe_argbuf_gateup_geglu_quant_batch_k(
     const uint b = group % G4Q4_DOWN_BLOCKS;
     const uint u = group / G4Q4_DOWN_BLOCKS;
     if (u >= num_unique_experts) return;
-    if (k_candidates == 0u || k_candidates > 8u) return;
+    if (k_candidates == 0u || k_candidates > 16u) return;
 
     const Gemma4UniqueExpertWork work = work_list[u];
     const ulong mask = work.candidate_mask;
@@ -88,10 +88,10 @@ kernel void spec50_moe_argbuf_gateup_geglu_quant_batch_k(
     device const uchar* gate_row = weights + ulong(row) * G4Q4_GU_ROW_BYTES;
     device const uchar* up_row = weights + ulong(row + G4Q4_FF) * G4Q4_GU_ROW_BYTES;
 
-    float gate_acc[8];
-    float up_acc[8];
+    float gate_acc[16];
+    float up_acc[16];
     #pragma unroll
-    for (uint t = 0; t < 8; ++t) {
+    for (uint t = 0; t < 16; ++t) {
         gate_acc[t] = 0.0f;
         up_acc[t] = 0.0f;
     }
@@ -115,7 +115,7 @@ kernel void spec50_moe_argbuf_gateup_geglu_quant_batch_k(
         }
 
         #pragma unroll
-        for (uint t = 0; t < 8; ++t) {
+        for (uint t = 0; t < 16; ++t) {
             if (t >= k_candidates) continue;
             if ((mask & (1ULL << t)) == 0ULL) continue;
             device const char* x = input_quants + ulong(t) * G4Q4_HIDDEN + ulong(gb) * 32ul;
@@ -141,7 +141,7 @@ kernel void spec50_moe_argbuf_gateup_geglu_quant_batch_k(
     }
 
     #pragma unroll
-    for (uint t = 0; t < 8; ++t) {
+    for (uint t = 0; t < 16; ++t) {
         if (t >= k_candidates) continue;
         if ((mask & (1ULL << t)) == 0ULL) continue;
         const float gate = gate_acc[t];
@@ -823,7 +823,7 @@ impl Gemma4MoeSlotArgTable {
     ) -> bool {
         if num_unique_experts == 0
             || num_unique_experts > self.records.len()
-            || !(1..=8).contains(&k_candidates)
+            || !(1..=16).contains(&k_candidates)
         {
             return false;
         }
@@ -859,7 +859,7 @@ impl Gemma4MoeSlotArgTable {
         output: &Buffer,
         k_candidates: usize,
     ) -> bool {
-        if !(1..=8).contains(&k_candidates) {
+        if !(1..=16).contains(&k_candidates) {
             return false;
         }
         let Some(kernel) = metal_linear_kernel() else {
@@ -1153,7 +1153,7 @@ impl Spec50MoeArgbufLayer {
         num_unique_experts: usize,
         k_candidates: usize,
     ) -> bool {
-        if num_unique_experts == 0 || num_unique_experts > 128 || !(1..=8).contains(&k_candidates) {
+        if num_unique_experts == 0 || num_unique_experts > 128 || !(1..=16).contains(&k_candidates) {
             return false;
         }
         let Some(kernel) = metal_linear_kernel() else {
@@ -1188,7 +1188,7 @@ impl Spec50MoeArgbufLayer {
         output_moe_acc: &Buffer,
         k_candidates: usize,
     ) -> bool {
-        if !(1..=8).contains(&k_candidates) {
+        if !(1..=16).contains(&k_candidates) {
             return false;
         }
         let Some(kernel) = metal_linear_kernel() else {
@@ -1225,7 +1225,7 @@ fn encode_argbuf_gateup(
     num_unique_experts: u32,
     k_candidates: u32,
 ) {
-    debug_assert!((1..=8).contains(&k_candidates));
+    debug_assert!((1..=16).contains(&k_candidates));
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_buffer(0, Some(input_scales), 0);
     encoder.set_buffer(1, Some(input_quants), 0);
@@ -1261,7 +1261,7 @@ fn encode_argbuf_down(
     output_moe_acc: &Buffer,
     k_candidates: u32,
 ) {
-    debug_assert!((1..=8).contains(&k_candidates));
+    debug_assert!((1..=16).contains(&k_candidates));
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_buffer(0, Some(act_scales), 0);
     encoder.set_buffer(1, Some(act_quants), 0);

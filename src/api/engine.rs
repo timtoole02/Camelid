@@ -21,6 +21,11 @@ use std::sync::{
     Arc,
 };
 
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+}
+
 use super::continuous_batch::ContinuousBatch;
 pub(crate) use super::continuous_batch::StepOutcome;
 
@@ -180,6 +185,10 @@ impl EngineHandle {
         std::thread::Builder::new()
             .name("camelid-engine".to_string())
             .spawn(move || {
+                #[cfg(target_os = "macos")]
+                unsafe {
+                    pthread_set_qos_class_self_np(0x21, 0);
+                }
                 let mut batch = ContinuousBatch::<CooperativeJob>::new(continuous_batch_slots);
                 // At most ONE task is ever held outside the channel: work that
                 // cannot run against the KV owners currently retained by the

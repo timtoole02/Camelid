@@ -28,6 +28,7 @@ export function createPacerState() {
    smoothly toward the freshest text. */
 export function paceStep(state, receivedText, nowMs) {
   const received = receivedText.length
+  if (received === 0) return ''
   const last = state.arrivals[state.arrivals.length - 1]
   if (!last || last.chars < received) state.arrivals.push({ chars: received, at: nowMs })
   while (state.arrivals.length > 2 && state.arrivals[1].at <= nowMs - MAX_LAG_MS) state.arrivals.shift()
@@ -36,10 +37,16 @@ export function paceStep(state, receivedText, nowMs) {
   for (const arrival of state.arrivals) {
     if (arrival.at <= nowMs - MAX_LAG_MS) mustShow = arrival.chars
   }
+  if (state.lastStepAt == null) {
+    // First token arrival: show immediately so the initial token renders instantly
+    state.lastStepAt = nowMs
+    state.shownChars = Math.min(received, Math.max(1, received))
+    return receivedText.slice(0, Math.floor(state.shownChars))
+  }
   // Smooth, time-based advance: close the remaining gap on an exponential
   // curve so bursty arrivals become steady motion. Frame-rate independent, and
   // fast enough that the tail converges well inside the lag bound on its own.
-  const elapsed = state.lastStepAt == null ? 0 : Math.min(Math.max(nowMs - state.lastStepAt, 0), MAX_FRAME_MS)
+  const elapsed = Math.min(Math.max(nowMs - state.lastStepAt, 0), MAX_FRAME_MS)
   state.lastStepAt = nowMs
   const gap = received - state.shownChars
   const eased = gap * (1 - Math.exp(-elapsed / CATCH_UP_TAU_MS))

@@ -2242,18 +2242,20 @@ fn spec_decode_mode_from_env() -> Option<SpecDecodeMode> {
 /// lands; lossless either way (the target verify is authoritative), so the flag
 /// only changes where the work runs.
 fn spec_gpu_enabled() -> bool {
-    matches!(
+    !matches!(
         env::var("CAMELID_SPEC_GPU").ok().as_deref(),
-        Some("1") | Some("true") | Some("on") | Some("yes")
+        Some("0") | Some("false") | Some("off") | Some("no")
     )
 }
 
 fn spec_draft_tokens_from_env(default: usize) -> usize {
+    let max = crate::metal::gemma4_max_spec_chunk().saturating_sub(1).max(1);
     env::var(SPEC_DRAFT_TOKENS_ENV)
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(default)
+        .map(|v| v.min(max))
+        .unwrap_or_else(|| default.min(max))
 }
 
 fn spec_ngram_min_from_env() -> usize {
@@ -3028,20 +3030,6 @@ pub async fn serve(
         eprintln!("\n  {warming_msg}");
         if tls_enabled {
             tracing::info!("skipping HTTP self-warmup because TLS is enabled");
-        } else if startup_state
-            .gemma4_serve_lanes
-            .read()
-            .await
-            .get(&model_id)
-            .is_some_and(|lane| *lane == Gemma4ServeLane::GhostMoe)
-        {
-            // A normal resident runtime benefits from paying its one-token
-            // initialization cost before the UI appears. Ghost-MoE is already
-            // initialized at load and a one-token chat would instead page a
-            // full prompt through hundreds of expert records, delaying the UI
-            // by minutes and competing with the user's first request.
-            tracing::info!("skipping generation warm-up for disk-paged Gemma 4 Ghost-MoE");
-            eprintln!("  Ghost-MoE runtime ready; skipping resident-engine warm-up");
         } else {
             warmup_generation_blocking(addr, model_id, policy.auth.bearer_header_line()).await;
         }
@@ -8696,7 +8684,7 @@ fn gemma4_serve_flag(value: Option<&str>) -> bool {
 const GEMMA4_GHOST_CGHOST_ENV: &str = "CAMELID_GEMMA4_GHOST_CGHOST";
 const GEMMA4_GHOST_CACHE_MIB_ENV: &str = "CAMELID_GEMMA4_GHOST_CACHE_MIB";
 const GEMMA4_GHOST_STRICT_CACHE_ENV: &str = "CAMELID_GEMMA4_GHOST_STRICT_CACHE";
-const DEFAULT_GEMMA4_GHOST_CACHE_MIB: usize = 1024;
+const DEFAULT_GEMMA4_GHOST_CACHE_MIB: usize = 9000;
 
 fn parse_gemma4_ghost_moe_serve_config(
     cghost: Option<PathBuf>,
@@ -8763,7 +8751,7 @@ fn gemma4_ghost_moe_serve_config(
     if adjacent_cghost.is_file() {
         return Ok(Some(crate::ghost_install::GhostMoeRuntimeConfig {
             cghost: adjacent_cghost,
-            cache_mib: 1024,
+            cache_mib: DEFAULT_GEMMA4_GHOST_CACHE_MIB,
             strict_cache: false,
             catalog_managed: false,
         }));
@@ -8785,11 +8773,11 @@ mod gemma4_ghost_moe_serve_config_tests {
     }
 
     #[test]
-    fn artifact_defaults_to_one_gib_and_accepts_an_explicit_budget() {
+    fn artifact_defaults_to_default_budget_and_accepts_an_explicit_budget() {
         let path = PathBuf::from("model.cghost");
         assert_eq!(
             parse_gemma4_ghost_moe_serve_config(Some(path.clone()), None, None).unwrap(),
-            Some((path.clone(), 1024, false))
+            Some((path.clone(), DEFAULT_GEMMA4_GHOST_CACHE_MIB, false))
         );
         assert_eq!(
             parse_gemma4_ghost_moe_serve_config(Some(path), Some("0"), Some("true")).unwrap(),
@@ -10617,7 +10605,7 @@ async fn gemma4_completion_nonstreaming(
             Some("prompt"),
         );
     };
-    let max_tokens = req.max_tokens.unwrap_or(64).min(4096) as usize;
+    let max_tokens = req.max_tokens.unwrap_or(2048).min(4096) as usize;
     let t_generate = std::time::Instant::now();
     let result = gemma4_generate_on_engine(state, runtime, prompt, max_tokens).await;
     let generate_ms = t_generate.elapsed().as_secs_f64() * 1e3;
@@ -10672,7 +10660,7 @@ async fn gemma4_completion_streaming(
             Some("prompt"),
         );
     };
-    let max_tokens = req.max_tokens.unwrap_or(64).min(4096) as usize;
+    let max_tokens = req.max_tokens.unwrap_or(2048).min(4096) as usize;
     let created = unix_secs();
 
     let (mut rx, cancel_on_drop) = match gemma4_stream_on_engine(state, runtime, prompt, max_tokens)
@@ -10749,7 +10737,7 @@ async fn gemma4_chat_nonstreaming(
 ) -> Response {
     let messages = req.messages.clone().unwrap_or_default();
     let prompt = gemma4_chat_prompt(&messages, req.camelid_enable_thinking.unwrap_or(false));
-    let max_tokens = req.max_tokens.unwrap_or(256).min(4096) as usize;
+    let max_tokens = req.max_tokens.unwrap_or(2048).min(4096) as usize;
     let prompt_tokens = match gemma4_prompt_token_count(Arc::clone(&runtime), prompt.clone()).await
     {
         Ok(count) => count,
@@ -13669,7 +13657,7 @@ async fn gemma4_chat_streaming(
 ) -> Response {
     let messages = req.messages.clone().unwrap_or_default();
     let prompt = gemma4_chat_prompt(&messages, req.camelid_enable_thinking.unwrap_or(false));
-    let max_tokens = req.max_tokens.unwrap_or(256).min(4096) as usize;
+    let max_tokens = req.max_tokens.unwrap_or(2048).min(4096) as usize;
     let created = unix_secs();
     let prompt_tokens = match gemma4_prompt_token_count(Arc::clone(&runtime), prompt.clone()).await
     {

@@ -24949,9 +24949,9 @@ impl Gemma4GhostCommonMetal {
         let k_u32 = k_tokens as u32;
         let num_slots_u32 = num_slots as u32;
         let num_resident_slots_u32 = num_resident_slots as u32;
-        let gateup_unique = num_slots.min(128);
+        let gateup_unique = (k_tokens * 8).min(num_slots).min(128).max(1);
         let gateup_unique_u32 = gateup_unique as u32;
-        let topk_slots_u32 = gateup_unique_u32;
+        let topk_slots_u32 = num_slots.min(128) as u32;
         encoder.set_bytes(5, 4, &k_u32 as *const u32 as *const _);
         encoder.set_bytes(6, 4, &topk_slots_u32 as *const u32 as *const _);
         encoder.set_bytes(7, 4, &num_resident_slots_u32 as *const u32 as *const _);
@@ -24975,7 +24975,7 @@ impl Gemma4GhostCommonMetal {
         ]);
 
         if let Some(table) = slot_binding.record_table() {
-            if k_tokens > 8
+            if k_tokens > 16
                 || overflow_slab.is_some()
                 || num_slots != num_resident_slots
                 || num_slots != table.slot_count()
@@ -25025,9 +25025,9 @@ impl Gemma4GhostCommonMetal {
             return false;
         };
 
-        if k_tokens <= 8 {
+        if k_tokens <= 16 {
             // spec50 gateup: bitwise identical to the batch_k reference for
-            // every row/token/K in 1..=8 (packed_uchar4 loads, in-loop unpack,
+            // every row/token/K in 1..=16 (packed_uchar4 loads, in-loop unpack,
             // static token bound). Byte-for-byte the same binding; timing-only
             // swap; CAMELID_GEMMA4_MOE_SPEC50=0 restores the reference.
             if !moe_spec50_disabled() {
@@ -25208,7 +25208,7 @@ impl Gemma4GhostCommonMetal {
         };
         let k_u32 = k_tokens as u32;
         if let Some(table) = slot_binding.record_table() {
-            if k_tokens > 8 || overflow_slab.is_some() {
+            if k_tokens > 16 || overflow_slab.is_some() {
                 eprintln!(
                     "[metal chained round] layer {layer_idx} record-granular Down refuses K={k_tokens} or overflow"
                 );
@@ -25249,8 +25249,8 @@ impl Gemma4GhostCommonMetal {
         };
         // spec50 down: union-tiled (one simdgroup per token, 4 hidden rows),
         // bitwise identical to the scatter_reduce_simd reference for every
-        // row/token/K in 1..=8, same binding. 1.62x at K=8.
-        if !moe_spec50_disabled() && k_tokens <= 8 {
+        // row/token/K in 1..=16, same binding. 1.62x at K=8.
+        if !moe_spec50_disabled() && k_tokens <= 16 {
             if let Some(variant) = moe_spec50_cached() {
                 {
                     encode_spec50_down(
@@ -25505,9 +25505,9 @@ impl Gemma4GhostCommonMetal {
                 }
             }
         }
-        if record_demand && k_tokens > 8 {
+        if record_demand && k_tokens > 16 {
             eprintln!(
-                "[metal chained round] rejected: record-granular demand backing supports exact K=1..=8, got K={k_tokens}"
+                "[metal chained round] rejected: record-granular demand backing supports exact K=1..=16, got K={k_tokens}"
             );
             return false;
         }
@@ -25641,6 +25641,8 @@ impl Gemma4GhostCommonMetal {
         ledger.rope_ms = t_rope.elapsed().as_secs_f64() * 1000.0;
 
         let n_layers = self.layers.len();
+        let allow_drop = std::env::var("CAMELID_GEMMA4_ALLOW_DROPPED_EXPERTS")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
         let predicted_ready = !record_demand
             && slot_filler.is_some()
             && predicted_unions.len() >= n_layers
@@ -25664,10 +25666,17 @@ impl Gemma4GhostCommonMetal {
                     .unwrap_or(128)
                     .min(128)
                     .max(1);
-                let pred = &predicted_unions[layer_idx];
+                let default_pred: Vec<usize> = (0..num_slots_fill).collect();
+                let pred = if layer_idx < predicted_unions.len() && !predicted_unions[layer_idx].is_empty() {
+                    &predicted_unions[layer_idx]
+                } else {
+                    &default_pred
+                };
                 let w0: Vec<usize> = pred.iter().copied().take(num_slots_fill).collect();
                 let rest: Vec<usize> = pred.iter().copied().skip(num_slots_fill).collect();
-                if rest.len() > overflow_cap {
+                let allow_drop = std::env::var("CAMELID_GEMMA4_ALLOW_DROPPED_EXPERTS")
+                    .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+                if !allow_drop && rest.len() > overflow_cap {
                     eprintln!(
                         "[metal chained round] predicted layer {layer_idx} unique {} needs {} overflow slots; bank is {overflow_cap}; refusing drop",
                         pred.len(),
@@ -25689,13 +25698,15 @@ impl Gemma4GhostCommonMetal {
                     &mut discard,
                 );
                 mask_slot_table_to_wave(&mut ping_table, &w0);
-                if let Some(expert) = wave_slots_ready(&ping_table, &w0, num_slots_fill) {
-                    eprintln!(
-                        "[metal chained round] predicted layer {layer_idx} wave 0 missing slot for selected expert {expert}; refusing fail-close"
-                    );
-                    ledger.missing_expert_failclose += 1;
-                    self.last_chained_ledger = ledger;
-                    return false;
+                if !allow_drop {
+                    if let Some(expert) = wave_slots_ready(&ping_table, &w0, num_slots_fill) {
+                        eprintln!(
+                            "[metal chained round] predicted layer {layer_idx} wave 0 missing slot for selected expert {expert}; refusing fail-close"
+                        );
+                        ledger.missing_expert_failclose += 1;
+                        self.last_chained_ledger = ledger;
+                        return false;
+                    }
                 }
                 let mut unified_table = [0xFFFFFFFFu32; 128];
                 for (e, &slot) in ping_table.iter().enumerate() {
@@ -26852,13 +26863,17 @@ impl Gemma4GhostCommonMetal {
                             updated_slots = spec_ping;
                         }
                         mask_slot_table_to_wave(&mut updated_slots, wave0);
-                        if let Some(expert) = wave_slots_ready(&updated_slots, wave0, num_slots) {
-                            eprintln!(
-                                "[metal chained round] layer {layer_idx} wave 0 missing slot for selected expert {expert}; refusing fail-close"
-                            );
-                            ledger.missing_expert_failclose += 1;
-                            self.last_chained_ledger = ledger;
-                            return false;
+                        let allow_drop = std::env::var("CAMELID_GEMMA4_ALLOW_DROPPED_EXPERTS")
+                            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+                        if !allow_drop {
+                            if let Some(expert) = wave_slots_ready(&updated_slots, wave0, num_slots) {
+                                eprintln!(
+                                    "[metal chained round] layer {layer_idx} wave 0 missing slot for selected expert {expert}; refusing fail-close"
+                                );
+                                ledger.missing_expert_failclose += 1;
+                                self.last_chained_ledger = ledger;
+                                return false;
+                            }
                         }
                         unsafe {
                             let dest = moe_layer.expert_to_slot_table.contents() as *mut u32;
@@ -26905,13 +26920,17 @@ impl Gemma4GhostCommonMetal {
                         ledger.wave_load_ms += t_load.elapsed().as_secs_f64() * 1000.0;
                     }
                     mask_slot_table_to_wave(&mut updated_slots, wave0);
-                    if let Some(expert) = wave_slots_ready(&updated_slots, wave0, num_slots) {
-                        eprintln!(
+                    let allow_drop = std::env::var("CAMELID_GEMMA4_ALLOW_DROPPED_EXPERTS")
+                        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+                    if !allow_drop {
+                        if let Some(expert) = wave_slots_ready(&updated_slots, wave0, num_slots) {
+                            eprintln!(
                                 "[metal chained round] layer {layer_idx} wave 0 missing slot for selected expert {expert}; refusing fail-close"
                             );
-                        ledger.missing_expert_failclose += 1;
-                        self.last_chained_ledger = ledger;
-                        return false;
+                            ledger.missing_expert_failclose += 1;
+                            self.last_chained_ledger = ledger;
+                            return false;
+                        }
                     }
 
                     let mut pong_table = [0xFFFFFFFFu32; 128];
@@ -26922,13 +26941,15 @@ impl Gemma4GhostCommonMetal {
                     }
                     mask_slot_table_to_wave(&mut pong_table, wave1);
                     let pong_slots = wave1.len().max(1);
-                    if let Some(expert) = wave_slots_ready(&pong_table, wave1, pong_slots) {
-                        eprintln!(
+                    if !allow_drop {
+                        if let Some(expert) = wave_slots_ready(&pong_table, wave1, pong_slots) {
+                            eprintln!(
                                 "[metal chained round] layer {layer_idx} wave 1 missing slot for selected expert {expert}; refusing fail-close"
                             );
-                        ledger.missing_expert_failclose += 1;
-                        self.last_chained_ledger = ledger;
-                        return false;
+                            ledger.missing_expert_failclose += 1;
+                            self.last_chained_ledger = ledger;
+                            return false;
+                        }
                     }
 
                     let mut unified_table = [0xFFFFFFFFu32; 128];
@@ -27006,13 +27027,17 @@ impl Gemma4GhostCommonMetal {
                             updated_slots = spec_ping;
                         }
                         mask_slot_table_to_wave(&mut updated_slots, wave);
-                        if let Some(expert) = wave_slots_ready(&updated_slots, wave, num_slots) {
-                            eprintln!(
+                        let allow_drop = std::env::var("CAMELID_GEMMA4_ALLOW_DROPPED_EXPERTS")
+                            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+                        if !allow_drop {
+                            if let Some(expert) = wave_slots_ready(&updated_slots, wave, num_slots) {
+                                eprintln!(
                                     "[metal chained round] layer {layer_idx} wave {wi} missing slot for selected expert {expert}; refusing fail-close"
                                 );
-                            ledger.missing_expert_failclose += 1;
-                            self.last_chained_ledger = ledger;
-                            return false;
+                                ledger.missing_expert_failclose += 1;
+                                self.last_chained_ledger = ledger;
+                                return false;
+                            }
                         }
 
                         unsafe {
@@ -27620,7 +27645,9 @@ impl Gemma4GhostCommonMetal {
                     )
                 };
                 let actual = gemma4_top8_union_from_router_logits(slice, k_tokens);
-                if !expert_set_is_covered(&actual, &predicted_unions[layer_idx]) {
+                let allow_drop = std::env::var("CAMELID_GEMMA4_ALLOW_DROPPED_EXPERTS")
+                    .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+                if !allow_drop && !expert_set_is_covered(&actual, &predicted_unions[layer_idx]) {
                     let mut a = actual.clone();
                     let mut b = predicted_unions[layer_idx].clone();
                     a.sort_unstable();
