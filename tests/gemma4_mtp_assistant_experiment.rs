@@ -67,14 +67,14 @@ const DEFAULT_TARGET_RUNTIME_PATH: &str =
 const DEFAULT_TARGET_CGHOST_PATH: &str =
     "/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost";
 const DEFAULT_TARGET_SOURCE_PATH: &str = "/Volumes/Untitled/models/gemma-4-26B_q4_0-it.gguf";
-const DEFAULT_TARGET_CACHE_MIB: usize = 2_900;
+const DEFAULT_TARGET_CACHE_MIB: usize = 0;
 const DEFAULT_SEEDED_NGRAM_TEXT: &str = "<|channel>thought\n<channel|>";
 const TARGET_WARMUP_TOKENS: u64 = 24;
 const PILOT_REPETITIONS: u32 = 3;
 const DEFAULT_MATRIX_TOKENS: u64 = 64;
 const DEFAULT_MATRIX_REPETITIONS: u32 = 3;
 const DEFAULT_CHILD_TIMEOUT_SECS: u64 = 30 * 60;
-const REPORT_SCHEMA_VERSION: u32 = 3;
+const REPORT_SCHEMA_VERSION: u32 = 4;
 const NATIVE_ADMISSION_SCHEMA_VERSION: u32 = 1;
 const NATIVE_RECURRENCE_TEST_NAME: &str =
     "camelid::metal::gemma4_mtp::tests::official_target_free_bf16_oracle_matches_native_seven_proposal_recurrence";
@@ -191,7 +191,7 @@ const NO_GAIN_WALL_RATIO_LIMIT: f64 = 1.05;
 // traffic is ZERO. The old 32-token budget measured only the cold-start window, so the whole
 // 93.8 MB/token figure was warmup amortized over too few tokens. Generate past saturation.
 const PILOT_TOKENS: u64 = 256;
-const LOAD_ONLY_REPORT_SCHEMA_VERSION: u32 = 3;
+const LOAD_ONLY_REPORT_SCHEMA_VERSION: u32 = 4;
 const LOAD_ONLY_MIN_RECLAIMABLE_HEADROOM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const LOAD_ONLY_SOAK_SECONDS: u64 = 30;
 
@@ -310,16 +310,31 @@ impl TargetRuntimeConfig {
         if !self.runtime_gguf_path.is_absolute() || !self.cghost_path.is_absolute() {
             return Err("target runtime and cghost paths must be absolute".into());
         }
-        if self.expert_cache_mib == 0 {
-            return Err("target expert cache budget must be non-zero".into());
+        if self.expert_cache_mib != 0 {
+            return Err(
+                "hybrid mapped-cold target profile requires a zero-byte host expert cache".into(),
+            );
         }
-        for (key, expected) in exact_target_environment() {
-            if self.environment.get(&key) != Some(&expected) {
+        let expected_environment = exact_target_environment();
+        for (key, expected) in &expected_environment {
+            if self.environment.get(key) != Some(expected) {
                 return Err(format!(
                     "target runtime setting {key} is {:?}, expected {expected:?}",
-                    self.environment.get(&key)
+                    self.environment.get(key)
                 ));
             }
+        }
+        let unexpected = self
+            .environment
+            .keys()
+            .filter(|key| !expected_environment.contains_key(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unexpected.is_empty() {
+            return Err(format!(
+                "target runtime contains unexpected settings: {}",
+                unexpected.join(", ")
+            ));
         }
         Ok(())
     }
@@ -529,53 +544,23 @@ fn exact_target_environment() -> BTreeMap<String, String> {
         ("CAMELID_GEMMA4_GHOST_METAL_COMMON", "1"),
         ("CAMELID_GEMMA4_GHOST_METAL_CONTEXT", "1024"),
         ("CAMELID_GEMMA4_GHOST_METAL_HEAD_RESIDENT", "0"),
-        // MEASURED 2026-08-21: expert preads are issued one LAYER at a time (~7
-        // records) with a barrier before the next layer, and at that depth the
-        // device gives ~2.2 GB/s no matter how many threads are used (4 thr 2.21,
-        // 8 thr 2.23 shared-fd; an engine A/B at 8 threads measured no gain and a
-        // slight loss). Depth is the limiter, not concurrency: the same benchmark
-        // at batch 28 gives 3.14 GB/s at 4 threads and 4.01 at 8. Deepening the
-        // batch requires prefetching across layers, which needs route prediction.
-        ("CAMELID_GEMMA4_GHOST_READ_THREADS", "4"),
-        ("CAMELID_GEMMA4_GHOST_METAL_SLOTS_PER_LAYER", "88"),
+        // Hybrid clean-pager profile: 48 pageable anonymous records cache the
+        // hot set while all 128 canonical IDs remain addressable through the
+        // retained read-only mapping. No legacy physical-prefix knob may
+        // silently redefine either namespace.
+        ("CAMELID_GEMMA4_GHOST_READ_THREADS", "1"),
         ("CAMELID_GEMMA4_GHOST_METAL_DEMAND_LOAD_ONLY", "1"),
-        // 64 = 8 speculative positions x 8 routes/token, the provable ceiling on a
-        // layer's per-round expert union at K=8 (see GHOST_METAL_OVERFLOW_COVER_SLOTS).
-        // Bounded record mode has no overflow bank, so any union above this budget is a
-        // terminal refusal rather than a spill.
-        //
-        // Measured 2026-08-21 on this exact pair (K=8, copy workload):
-        //   * largest observed round union  = 41  (layer 0, first K=8 prefill chunk),
-        //     which refused the previous 32-slot bound outright (run mtp-nim-table32)
-        //   * largest observed decode union = 37  (K=6 round, run mtp-nim-t64c256)
-        //   * cumulative distinct experts/layer over 32 tokens = 113 of 128, so the
-        //     table saturates and LFU eviction, not capacity, carries the churn.
-        // A generation-wide peak-union statistic is NOT recorded (the chained ledger is
-        // explicitly "latest_completed_chained_attempt_only_not_generation_maximum"), so
-        // no bound below 64 has been shown safe. 64 stays until that telemetry exists.
-        ("CAMELID_GEMMA4_GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER", "56"),
+        ("CAMELID_GEMMA4_GHOST_METAL_FILE_MAPPED_EXPERTS", "1"),
+        ("CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS", "48"),
+        // The initial hybrid receipt is deliberately pageable. Pinned hot
+        // records are a separate experiment and must not reuse this profile.
+        ("CAMELID_GEMMA4_SLOT_PIN", "0"),
         ("CAMELID_GEMMA4_GHOST_METAL_HOT_PIN", "0"),
-        // MEASURED 2026-08-21: every steady-state decode round takes ~188 slot
-        // misses and ~188 evictions against a table whose 1680 slots comfortably
-        // hold the ~863-record per-round union, while 55% of a round's union was
-        // also in the previous round's. That is the classic saturated-LFU
-        // pathology: a freshly loaded record has frequency 1 and is evicted before
-        // it can accumulate, so the router immediately re-reads it. Pure recency
-        // protects the last rounds' unions. Placement-only: which experts are
-        // selected, and their routing values, never depend on which slot holds a
-        // record, so this cannot change arithmetic.
-        ("CAMELID_GEMMA4_SLOT_POLICY", "lru"),
-        // Host victim ring. MEASURED 2026-08-21: every steady-state decode round
-        // takes ~188 slot misses and ~188 evictions (the table is saturated, so a
-        // miss always evicts), while 55% of a round's routed union was also in the
-        // previous round's union. That churn costs ~300 ms/round of .cghost pread
-        // at a MEASURED 1.87 GB/s, which is 55.7% of the round wall. The ring
-        // retains evicted records in host RAM so a re-miss becomes a memcpy.
-        // 512 MiB / 30 layers / 3,345,408 B = 5 records/layer, about one round of
-        // evictions per layer. VICTIM_VERIFY=4 byte-verifies every 4th ring fill
-        // against a fresh pread so the ring cannot silently change arithmetic.
         ("CAMELID_GEMMA4_VICTIM_CACHE", "0"),
         ("CAMELID_GEMMA4_VICTIM_MB", "0"),
+        ("CAMELID_GEMMA4_ALLOW_DROPPED_EXPERTS", "0"),
+        ("CAMELID_GEMMA4_CHAINED_PREDICT", "0"),
+        ("CAMELID_SPEC_DECODE", "off"),
         ("CAMELID_GEMMA4_SPEC_CHUNK_MAX", "8"),
         // Preserve spec50's K=8 request exactly. The runtime's K=8 verifier
         // ceiling clamps this to seven proposals plus the target anchor.
@@ -1789,6 +1774,9 @@ struct AssistantMemory {
     model_bytes: u64,
     file_bytes: u64,
     mapped_bytes: u64,
+    /// Directly observed from the native resident ledger. No environment
+    /// setting is allowed to stand in for the actual mlock receipt.
+    locked_bytes: u64,
     resident_bytes: u64,
     private_bytes: u64,
     /// Target-owned KV pages referenced by the assistant; never count these as
@@ -1947,8 +1935,11 @@ struct LoadOnlyTargetLedger {
     host_cache_resident_bytes: u64,
     host_cache_explicitly_touched_bytes: u64,
     expert_layer_count: u64,
+    expert_logical_slot_count: u64,
     expert_slot_count: u64,
     expert_slot_capacity_bytes: u64,
+    expert_file_mapped_slot_count: u64,
+    expert_file_mapped_address_span_bytes: u64,
     expert_table_directory_slot_count: u64,
     expert_table_directory_capacity_bytes: u64,
     expert_table_bound_active_slot_count: u64,
@@ -2026,8 +2017,12 @@ impl From<camelid::gemma4_runtime::Gemma4GhostLoadAllocationLedger> for LoadOnly
             host_cache_resident_bytes: value.host_cache_resident_bytes,
             host_cache_explicitly_touched_bytes: value.host_cache_explicitly_touched_bytes,
             expert_layer_count: value.expert_layer_count,
+            expert_logical_slot_count: value.expert_logical_slot_count,
             expert_slot_count: value.expert_slot_count,
             expert_slot_capacity_bytes: value.expert_slot_capacity_bytes,
+            expert_file_mapped_slot_count: value.expert_file_mapped_slot_count,
+            expert_file_mapped_address_span_bytes: value
+                .expert_file_mapped_address_span_bytes,
             expert_table_directory_slot_count: value.expert_table_directory_slot_count,
             expert_table_directory_capacity_bytes: value.expert_table_directory_capacity_bytes,
             expert_table_bound_active_slot_count: value.expert_table_bound_active_slot_count,
@@ -2198,6 +2193,51 @@ fn load_only_target_phase_name(
 }
 
 #[cfg(target_os = "macos")]
+fn load_only_hybrid_expert_capacity_ready(
+    ledger: &camelid::gemma4_runtime::Gemma4GhostLoadAllocationLedger,
+) -> bool {
+    // Serialized Gemma 4 routed-record geometry: 3,345,408-byte payload
+    // rounded up to the existing 16 KiB slot boundary. The anonymous hot
+    // tier owns exactly 48 records/layer while the clean mapped tier keeps
+    // all 128 canonical expert IDs addressable.
+    let stride = 3_358_720u64;
+    ledger.expert_slots_active
+        && ledger.expert_layer_count == 30
+        && ledger.expert_logical_slot_count == ledger.expert_layer_count.saturating_mul(128)
+        && ledger.expert_slot_count == ledger.expert_layer_count.saturating_mul(48)
+        && ledger.expert_slot_capacity_bytes == ledger.expert_slot_count.saturating_mul(stride)
+        && ledger.expert_file_mapped_slot_count
+            == ledger.expert_layer_count.saturating_mul(128)
+        && ledger.expert_file_mapped_address_span_bytes
+            == ledger
+                .expert_file_mapped_slot_count
+                .saturating_mul(stride)
+        && ledger.cghost_logical_bytes >= ledger.expert_file_mapped_address_span_bytes
+        && ledger.cghost_mapped_bytes >= ledger.expert_file_mapped_address_span_bytes
+        && ledger.expert_table_directory_slot_count
+            == ledger.expert_layer_count.saturating_mul(48)
+        && ledger.expert_table_directory_capacity_bytes
+            == ledger
+                .expert_table_directory_slot_count
+                .saturating_mul(stride)
+        && ledger.overflow_slot_count == 0
+        && ledger.overflow_capacity_bytes == 0
+        && ledger.victim_record_capacity == 0
+        && ledger.victim_capacity_bytes == 0
+        && ledger.host_cache_budget_bytes == 0
+        && ledger.host_cache_resident_bytes == 0
+        && ledger.host_cache_explicitly_touched_bytes == 0
+        && ledger.expert_slot_explicitly_touched_bytes == 0
+        && ledger.overflow_explicitly_touched_bytes == 0
+        && ledger.victim_explicitly_touched_bytes == 0
+        && ledger.planned_prewarm_records == 0
+        && ledger.planned_prewarm_bytes == 0
+        && ledger.touched_prewarm_records == 0
+        && ledger.touched_prewarm_bytes == 0
+        && ledger.arbitrary_slot_prewarm_skipped
+}
+
+#[cfg(target_os = "macos")]
 fn load_only_target_phase_violation(
     phase: camelid::gemma4_runtime::Gemma4GhostLoadPhase,
     ledger: &camelid::gemma4_runtime::Gemma4GhostLoadAllocationLedger,
@@ -2288,31 +2328,7 @@ fn load_only_target_phase_violation(
             && ledger.common_norm_router_aux_capacity_bytes == 0
             && ledger.common_norm_router_aux_explicitly_touched_bytes == 0
     };
-    let empty_slot_capacity_ready = || {
-        // Serialized Gemma 4 routed-record geometry: 3,345,408-byte payload
-        // rounded up to the existing 16 KiB slot boundary.
-        let stride = 3_358_720u64;
-        ledger.expert_slots_active
-            && ledger.expert_layer_count > 0
-            && ledger.expert_slot_count == ledger.expert_layer_count.saturating_mul(88)
-            && ledger.expert_slot_capacity_bytes == ledger.expert_slot_count.saturating_mul(stride)
-            && ledger.expert_table_directory_slot_count
-                == ledger.expert_layer_count.saturating_mul(32)
-            && ledger.expert_table_directory_capacity_bytes
-                == ledger
-                    .expert_table_directory_slot_count
-                    .saturating_mul(stride)
-            && ledger.overflow_slot_count == 24
-            && ledger.overflow_capacity_bytes == 24u64.saturating_mul(stride)
-            && ledger.host_cache_resident_bytes == 0
-            && ledger.host_cache_explicitly_touched_bytes == 0
-            && ledger.expert_slot_explicitly_touched_bytes == 0
-            && ledger.overflow_explicitly_touched_bytes == 0
-            && ledger.victim_explicitly_touched_bytes == 0
-            && ledger.touched_prewarm_records == 0
-            && ledger.touched_prewarm_bytes == 0
-            && ledger.arbitrary_slot_prewarm_skipped
-    };
+    let empty_slot_capacity_ready = || load_only_hybrid_expert_capacity_ready(ledger);
     let empty_slots_unbound = || {
         empty_slot_capacity_ready()
             && !ledger.expert_tables_compute_bound
@@ -2324,7 +2340,7 @@ fn load_only_target_phase_violation(
             && ledger.expert_table_bound_active_slot_count
                 == ledger.expert_layer_count.saturating_mul(8)
             && ledger.expert_table_bound_active_slot_count
-                <= ledger.expert_table_directory_slot_count
+                <= ledger.expert_file_mapped_slot_count
     };
     let required_head_ready = || {
         ledger.tied_head_active
@@ -2344,8 +2360,11 @@ fn load_only_target_phase_violation(
     let empty_slots_absent = || {
         !ledger.expert_slots_active
             && ledger.expert_layer_count == 0
+            && ledger.expert_logical_slot_count == 0
             && ledger.expert_slot_count == 0
             && ledger.expert_slot_capacity_bytes == 0
+            && ledger.expert_file_mapped_slot_count == 0
+            && ledger.expert_file_mapped_address_span_bytes == 0
             && ledger.expert_table_directory_slot_count == 0
             && ledger.expert_table_directory_capacity_bytes == 0
             && ledger.expert_table_bound_active_slot_count == 0
@@ -2357,6 +2376,10 @@ fn load_only_target_phase_violation(
             && ledger.victim_record_capacity == 0
             && ledger.victim_capacity_bytes == 0
             && ledger.victim_explicitly_touched_bytes == 0
+            && ledger.planned_prewarm_records == 0
+            && ledger.planned_prewarm_bytes == 0
+            && ledger.touched_prewarm_records == 0
+            && ledger.touched_prewarm_bytes == 0
     };
     let required_head_absent = || {
         !ledger.tied_head_active
@@ -3506,16 +3529,24 @@ fn validate_routed_expert_snapshot(
     }
     let mut capacity = 0u64;
     let mut physical_budget = 0u64;
+    let mut file_mapped_slots = 0u64;
+    let mut file_mapped_span = 0u64;
     let mut occupied = 0u64;
     let mut aggregate = Gemma4RoutedExpertSlotStatsSnapshot::default();
     for (index, layer) in snapshot.per_layer.iter().enumerate() {
         if layer.layer_index as usize != index
             || layer.base_slot_capacity == 0
-            || layer.physical_base_slot_budget == 0
             || layer.physical_base_slot_budget > layer.base_slot_capacity
+            || layer.file_mapped_addressable_slots > layer.base_slot_capacity
+            || (layer.physical_base_slot_budget == 0
+                && layer.file_mapped_addressable_slots == 0)
             || layer.physical_base_slot_budget_bytes
                 != layer
                     .physical_base_slot_budget
+                    .saturating_mul(snapshot.slot_stride_bytes)
+            || layer.file_mapped_address_span_bytes
+                != layer
+                    .file_mapped_addressable_slots
                     .saturating_mul(snapshot.slot_stride_bytes)
             || layer.occupied_base_slots > layer.physical_base_slot_budget
             || layer.occupied_base_payload_bytes
@@ -3533,6 +3564,10 @@ fn validate_routed_expert_snapshot(
         }
         capacity = capacity.saturating_add(layer.base_slot_capacity);
         physical_budget = physical_budget.saturating_add(layer.physical_base_slot_budget);
+        file_mapped_slots =
+            file_mapped_slots.saturating_add(layer.file_mapped_addressable_slots);
+        file_mapped_span =
+            file_mapped_span.saturating_add(layer.file_mapped_address_span_bytes);
         occupied = occupied.saturating_add(layer.occupied_base_slots);
         aggregate.route_lookups = aggregate
             .route_lookups
@@ -3560,6 +3595,8 @@ fn validate_routed_expert_snapshot(
     }
     if capacity != snapshot.base_slot_capacity
         || physical_budget != snapshot.physical_base_slot_budget
+        || file_mapped_slots != snapshot.file_mapped_addressable_slots
+        || file_mapped_span != snapshot.file_mapped_address_span_bytes
         || occupied != snapshot.occupied_base_slots
         || snapshot.base_slot_capacity_bytes != capacity.saturating_mul(snapshot.slot_stride_bytes)
         || snapshot.physical_base_slot_budget_bytes
@@ -3578,7 +3615,18 @@ fn validate_routed_expert_snapshot(
             != aggregate
                 .direct_read_bytes
                 .saturating_add(snapshot.cumulative_chained_demand_read_bytes)
+        || snapshot.cumulative_chained_demand_read_bytes
+            != snapshot
+                .cumulative_chained_demand_loads
+                .saturating_mul(snapshot.slot_record_bytes)
         || snapshot.host_cache_resident_bytes > snapshot.host_cache_budget_bytes
+        || (snapshot.host_cache_budget_bytes == 0
+            && (snapshot.host_cache_hits != 0
+                || snapshot.host_cache_misses != 0
+                || snapshot.host_cache_evictions != 0
+                || snapshot.host_cache_bytes_read != 0
+                || snapshot.host_cache_resident_experts != 0
+                || snapshot.host_cache_resident_bytes != 0))
     {
         return Err(format!(
             "{label} aggregate routed-expert accounting is inconsistent"
@@ -3620,8 +3668,13 @@ fn validate_routed_expert_snapshot(
     if snapshot.last_chained_ledger_scope
         != "latest_completed_chained_attempt_only_not_generation_maximum"
         || snapshot.last_chained_unique_per_layer.len() != snapshot.layer_count as usize
+        || snapshot.last_chained_hot_bound_per_layer.len() != snapshot.layer_count as usize
+        || snapshot.last_chained_mapped_bound_per_layer.len() != snapshot.layer_count as usize
         || snapshot.last_chained_demand_loads > snapshot.cumulative_chained_demand_loads
         || snapshot.last_chained_demand_read_bytes > snapshot.cumulative_chained_demand_read_bytes
+        || u64::from(snapshot.last_chained_slot_hits) > aggregate.hits
+        || u64::from(snapshot.last_chained_slot_misses) > aggregate.misses
+        || u64::from(snapshot.last_chained_slot_evictions) > aggregate.evictions
     {
         return Err(format!("{label} has an invalid last-chained scope"));
     }
@@ -3637,11 +3690,94 @@ fn validate_routed_expert_snapshot(
         .max()
         .map(u32::from)
         .unwrap_or(0);
+    let hot_bound_sum = snapshot
+        .last_chained_hot_bound_per_layer
+        .iter()
+        .map(|value| u32::from(*value))
+        .sum::<u32>();
+    let mapped_bound_sum = snapshot
+        .last_chained_mapped_bound_per_layer
+        .iter()
+        .map(|value| u32::from(*value))
+        .sum::<u32>();
+    let hybrid_mapped_backing = file_mapped_slots > 0 && physical_budget < capacity;
+    let tier_counts_fit_unique = snapshot
+        .last_chained_unique_per_layer
+        .iter()
+        .zip(&snapshot.last_chained_hot_bound_per_layer)
+        .zip(&snapshot.last_chained_mapped_bound_per_layer)
+        .all(|((unique, hot), mapped)| {
+            u32::from(*hot).saturating_add(u32::from(*mapped)) <= u32::from(*unique)
+        });
+    let unique_counts_fit_geometry = snapshot
+        .last_chained_unique_per_layer
+        .iter()
+        .zip(&snapshot.per_layer)
+        .all(|(unique, layer)| u64::from(*unique) <= layer.base_slot_capacity);
+    let tier_counts_fit_geometry = snapshot
+        .last_chained_hot_bound_per_layer
+        .iter()
+        .zip(&snapshot.last_chained_mapped_bound_per_layer)
+        .zip(&snapshot.per_layer)
+        .all(|((hot, mapped), layer)| {
+            u64::from(*hot) <= layer.physical_base_slot_budget
+                && u64::from(*mapped) <= layer.file_mapped_addressable_slots
+        });
+    if hot_bound_sum != snapshot.last_chained_hot_bound_records
+        || mapped_bound_sum != snapshot.last_chained_mapped_bound_records
+        || !tier_counts_fit_unique
+        || !unique_counts_fit_geometry
+        || !tier_counts_fit_geometry
+        || (file_mapped_slots == 0 && (hot_bound_sum != 0 || mapped_bound_sum != 0))
+        || snapshot.last_chained_demand_read_bytes
+            != snapshot
+                .last_chained_demand_loads
+                .saturating_mul(snapshot.slot_record_bytes)
+        || (hybrid_mapped_backing
+            && (snapshot
+                .last_chained_slot_hits
+                .saturating_add(snapshot.last_chained_slot_misses)
+                > unique_sum
+                || snapshot.last_chained_slot_evictions > snapshot.last_chained_slot_misses
+                || snapshot.last_chained_demand_loads
+                    > u64::from(snapshot.last_chained_slot_misses)
+                || snapshot.last_chained_demand_loads > u64::from(mapped_bound_sum)
+                || snapshot.last_chained_overflow_slots != 0
+                || snapshot.last_chained_overflow_bytes != 0
+                || snapshot.last_chained_overflow_layers != 0
+                || snapshot.last_chained_overflow_experts != 0
+                || snapshot.last_chained_victim_hits != 0
+                || snapshot.last_chained_victim_salvage_copies != 0))
+    {
+        return Err(format!(
+            "{label} has inconsistent chained hot/mapped tier totals"
+        ));
+    }
     if snapshot.last_chained_round_available {
-        if !snapshot.last_chained_k.is_some_and(|value| value > 0)
+        let tier_partition_is_exact = snapshot
+            .last_chained_unique_per_layer
+            .iter()
+            .zip(&snapshot.last_chained_hot_bound_per_layer)
+            .zip(&snapshot.last_chained_mapped_bound_per_layer)
+            .all(|((unique, hot), mapped)| {
+                u32::from(*hot).saturating_add(u32::from(*mapped)) == u32::from(*unique)
+            });
+        if snapshot.last_chained_round_sequence == 0
+            || !snapshot.last_chained_k.is_some_and(|value| value > 0)
             || unique_sum != snapshot.last_chained_unique_experts_sum
             || unique_max != snapshot.last_chained_unique_experts_max
             || snapshot.last_chained_overflow_experts > unique_sum
+            || (snapshot.last_chained_round_succeeded
+                && file_mapped_slots > 0
+                && (!tier_partition_is_exact
+                    || hot_bound_sum.saturating_add(mapped_bound_sum) != unique_sum
+                    || (hybrid_mapped_backing
+                        && (snapshot.last_chained_slot_hits != hot_bound_sum
+                            || snapshot.last_chained_slot_misses != mapped_bound_sum))
+                    || snapshot.last_chained_overflow_slots != 0
+                    || snapshot.last_chained_overflow_bytes != 0
+                    || snapshot.last_chained_overflow_layers != 0
+                    || snapshot.last_chained_overflow_experts != 0))
             || (snapshot.last_chained_round_succeeded
                 && (snapshot.last_chained_selected_experts_dropped != 0
                     || snapshot.last_chained_missing_expert_failclose != 0
@@ -3652,13 +3788,29 @@ fn validate_routed_expert_snapshot(
             ));
         }
     } else if snapshot.last_chained_round_succeeded
+        || snapshot.last_chained_round_sequence != 0
         || snapshot.last_chained_k.is_some()
         || unique_sum != 0
         || snapshot.last_chained_unique_experts_sum != 0
         || snapshot.last_chained_unique_experts_max != 0
+        || hot_bound_sum != 0
+        || mapped_bound_sum != 0
         || snapshot.last_chained_demand_loads != 0
         || snapshot.last_chained_demand_read_bytes != 0
+        || snapshot.last_chained_slot_hits != 0
+        || snapshot.last_chained_slot_misses != 0
+        || snapshot.last_chained_slot_evictions != 0
+        || snapshot.last_chained_overflow_slots != 0
+        || snapshot.last_chained_overflow_bytes != 0
+        || snapshot.last_chained_overflow_layers != 0
         || snapshot.last_chained_overflow_experts != 0
+        || snapshot.last_chained_victim_hits != 0
+        || snapshot.last_chained_victim_salvage_copies != 0
+        || snapshot.last_chained_selected_experts_dropped != 0
+        || snapshot.last_chained_missing_expert_failclose != 0
+        || snapshot.last_chained_slot_capacity_overflow != 0
+        || snapshot.cumulative_chained_demand_loads != 0
+        || snapshot.cumulative_chained_demand_read_bytes != 0
     {
         return Err(format!(
             "{label} reports chained facts without an available chained round"
@@ -3667,35 +3819,108 @@ fn validate_routed_expert_snapshot(
     Ok(())
 }
 
-fn validate_exact_target_physical_slot_budget(
+fn validate_exact_target_hybrid_experts(
     snapshot: &camelid::gemma4_runtime::Gemma4RoutedExpertResidencySnapshot,
 ) -> Result<(), String> {
-    const ALLOCATED_SLOTS_PER_LAYER: u64 = 88;
-    const PHYSICAL_SLOTS_PER_LAYER: u64 = 56;
-    if snapshot.per_layer.iter().any(|layer| {
-        layer.base_slot_capacity != ALLOCATED_SLOTS_PER_LAYER
-            || layer.physical_base_slot_budget != PHYSICAL_SLOTS_PER_LAYER
-    }) {
+    const LAYERS: u64 = 30;
+    const CANONICAL_SLOTS_PER_LAYER: u64 = 128;
+    const HOT_SLOTS_PER_LAYER: u64 = 48;
+    const RECORD_BYTES: u64 = 3_345_408;
+    const STRIDE_BYTES: u64 = 3_358_720;
+    if snapshot.per_layer.len() != LAYERS as usize
+        || snapshot.last_chained_unique_per_layer.len() != LAYERS as usize
+        || snapshot.last_chained_hot_bound_per_layer.len() != LAYERS as usize
+        || snapshot.last_chained_mapped_bound_per_layer.len() != LAYERS as usize
+        || snapshot.per_layer.iter().any(|layer| {
+            layer.base_slot_capacity != CANONICAL_SLOTS_PER_LAYER
+                || layer.physical_base_slot_budget != HOT_SLOTS_PER_LAYER
+                || layer.physical_base_slot_budget_bytes
+                    != HOT_SLOTS_PER_LAYER.saturating_mul(STRIDE_BYTES)
+                || layer.file_mapped_addressable_slots != CANONICAL_SLOTS_PER_LAYER
+                || layer.file_mapped_address_span_bytes
+                    != CANONICAL_SLOTS_PER_LAYER.saturating_mul(STRIDE_BYTES)
+                || layer.occupied_base_slots > HOT_SLOTS_PER_LAYER
+        })
+    {
         return Err(
-            "target routed-expert receipt did not preserve 88 allocated / 56 table-bound slots per layer"
-                .into(),
+            "target routed-expert receipt did not preserve 128 canonical / 48 anonymous-hot / 128 mapped-cold records per layer".into(),
         );
     }
-    let layers = u64::from(snapshot.layer_count);
-    if snapshot.base_slot_capacity != layers.saturating_mul(ALLOCATED_SLOTS_PER_LAYER)
-        || snapshot.physical_base_slot_budget != layers.saturating_mul(PHYSICAL_SLOTS_PER_LAYER)
+    if u64::from(snapshot.layer_count) != LAYERS
+        || snapshot.slot_record_bytes != RECORD_BYTES
+        || snapshot.slot_stride_bytes != STRIDE_BYTES
+        || snapshot.base_slot_capacity != LAYERS.saturating_mul(CANONICAL_SLOTS_PER_LAYER)
+        || snapshot.physical_base_slot_budget != LAYERS.saturating_mul(HOT_SLOTS_PER_LAYER)
+        || snapshot.file_mapped_addressable_slots
+            != LAYERS.saturating_mul(CANONICAL_SLOTS_PER_LAYER)
         || snapshot.base_slot_capacity_bytes
             != snapshot
                 .base_slot_capacity
-                .saturating_mul(snapshot.slot_stride_bytes)
+                .saturating_mul(STRIDE_BYTES)
         || snapshot.physical_base_slot_budget_bytes
             != snapshot
                 .physical_base_slot_budget
-                .saturating_mul(snapshot.slot_stride_bytes)
+                .saturating_mul(STRIDE_BYTES)
+        || snapshot.file_mapped_address_span_bytes
+            != snapshot
+                .file_mapped_addressable_slots
+                .saturating_mul(STRIDE_BYTES)
+        || snapshot.occupied_base_slots > snapshot.physical_base_slot_budget
+        || snapshot.host_cache_budget_bytes != 0
+        || snapshot.host_cache_resident_experts != 0
+        || snapshot.host_cache_resident_bytes != 0
+        || snapshot.host_cache_hits != 0
+        || snapshot.host_cache_misses != 0
+        || snapshot.host_cache_evictions != 0
+        || snapshot.host_cache_bytes_read != 0
+        || snapshot.aggregate_slot_stats.host_fills != 0
+        || snapshot.aggregate_slot_stats.prewarm_copies != 0
+        || snapshot.aggregate_slot_stats.direct_read_failures != 0
+        || snapshot.last_chained_overflow_slots != 0
+        || snapshot.last_chained_overflow_bytes != 0
+        || snapshot.last_chained_overflow_layers != 0
+        || snapshot.last_chained_overflow_experts != 0
+        || snapshot.last_chained_victim_hits != 0
+        || snapshot.last_chained_victim_salvage_copies != 0
+        || snapshot.last_chained_selected_experts_dropped != 0
+        || snapshot.last_chained_missing_expert_failclose != 0
+        || snapshot.last_chained_slot_capacity_overflow != 0
     {
         return Err(
-            "target routed-expert aggregate physical budget receipt is inconsistent".into(),
+            "target routed-expert aggregate hybrid capacity/accounting receipt is inconsistent"
+                .into(),
         );
+    }
+    if snapshot.last_chained_round_available && snapshot.last_chained_round_succeeded {
+        let expected_promotion_loads = snapshot
+            .last_chained_hot_bound_per_layer
+            .iter()
+            .zip(&snapshot.last_chained_mapped_bound_per_layer)
+            .zip(&snapshot.per_layer)
+            .map(|((hot, mapped), layer)| {
+                u64::from(*mapped).min(
+                    layer
+                        .physical_base_slot_budget
+                        .saturating_sub(u64::from(*hot)),
+                )
+            })
+            .sum::<u64>();
+        if snapshot
+            .last_chained_slot_hits
+            .saturating_add(snapshot.last_chained_slot_misses)
+            != snapshot.last_chained_unique_experts_sum
+            || snapshot.last_chained_slot_hits != snapshot.last_chained_hot_bound_records
+            || snapshot.last_chained_slot_misses != snapshot.last_chained_mapped_bound_records
+            || snapshot.last_chained_demand_loads != expected_promotion_loads
+            || snapshot.last_chained_demand_read_bytes
+                != expected_promotion_loads.saturating_mul(RECORD_BYTES)
+            || u64::from(snapshot.last_chained_slot_evictions) > expected_promotion_loads
+        {
+            return Err(
+                "target hybrid chained selection/refill ledger is not an exact unique-expert/promotion partition"
+                    .into(),
+            );
+        }
     }
     Ok(())
 }
@@ -3721,6 +3946,23 @@ fn validate_routed_expert_transition(
 ) -> Result<(), String> {
     validate_routed_expert_snapshot("post-target-warm snapshot", before)?;
     validate_routed_expert_snapshot("post-generation snapshot", after)?;
+    let hybrid_generation = after.file_mapped_addressable_slots > 0
+        && after.physical_base_slot_budget < after.base_slot_capacity;
+    if hybrid_generation {
+        validate_exact_target_hybrid_experts(before)?;
+        validate_exact_target_hybrid_experts(after)?;
+    }
+    let hybrid_generation_accounting_ready = !hybrid_generation
+        || (after.aggregate_slot_stats.hits > before.aggregate_slot_stats.hits
+            && after.aggregate_slot_stats.misses > before.aggregate_slot_stats.misses
+            && after.aggregate_slot_stats.host_fills == 0
+            && after.aggregate_slot_stats.prewarm_copies == 0
+            && after.aggregate_slot_stats.direct_read_failures == 0);
+    if !hybrid_generation_accounting_ready {
+        return Err(
+            "hybrid generation did not prove positive hot/mapped selection deltas or reported a forbidden host/prewarm/read-failure event".into(),
+        );
+    }
     if before.layer_count != after.layer_count
         || before.slot_record_bytes != after.slot_record_bytes
         || before.slot_stride_bytes != after.slot_stride_bytes
@@ -3728,6 +3970,8 @@ fn validate_routed_expert_transition(
         || before.base_slot_capacity_bytes != after.base_slot_capacity_bytes
         || before.physical_base_slot_budget != after.physical_base_slot_budget
         || before.physical_base_slot_budget_bytes != after.physical_base_slot_budget_bytes
+        || before.file_mapped_addressable_slots != after.file_mapped_addressable_slots
+        || before.file_mapped_address_span_bytes != after.file_mapped_address_span_bytes
         || after.occupied_base_slots < before.occupied_base_slots
         || after.cumulative_chained_demand_loads < before.cumulative_chained_demand_loads
         || after.cumulative_chained_demand_read_bytes < before.cumulative_chained_demand_read_bytes
@@ -3752,6 +3996,10 @@ fn validate_routed_expert_transition(
                     || before.physical_base_slot_budget != after.physical_base_slot_budget
                     || before.physical_base_slot_budget_bytes
                         != after.physical_base_slot_budget_bytes
+                    || before.file_mapped_addressable_slots
+                        != after.file_mapped_addressable_slots
+                    || before.file_mapped_address_span_bytes
+                        != after.file_mapped_address_span_bytes
                     || after.occupied_base_slots < before.occupied_base_slots
                     || !routed_slot_stats_are_monotonic(&before.slot_stats, &after.slot_stats)
             })
@@ -4231,10 +4479,12 @@ impl ExperimentReport {
             && (self.assistant_memory.file_bytes == 0
                 || self.assistant_memory.model_bytes == 0
                 || self.assistant_memory.mapped_bytes == 0
+                || self.assistant_memory.locked_bytes == 0
                 || self.assistant_memory.resident_bytes == 0
                 || self.assistant_memory.file_bytes != self.pairing.assistant_staged_model_bytes
                 || self.assistant_memory.model_bytes > self.assistant_memory.file_bytes
                 || self.assistant_memory.mapped_bytes > mapped_upper_bound
+                || self.assistant_memory.locked_bytes != self.assistant_memory.mapped_bytes
                 || self.assistant_memory.resident_bytes > self.assistant_memory.mapped_bytes)
         {
             return Err("assistant memory accounting is incomplete or inconsistent".to_string());
@@ -5704,6 +5954,7 @@ fn assistant_memory_from_ledger(
         model_bytes: ledger.payload_bytes,
         file_bytes: ledger.file_bytes,
         mapped_bytes: ledger.mapped_bytes,
+        locked_bytes: ledger.locked_bytes,
         resident_bytes: ledger.resident_pages.saturating_mul(page_size),
         private_bytes: ledger
             .decoded_norm_bytes
@@ -5816,32 +6067,10 @@ fn execute_lane_child(request: &ChildLaneRequest) -> Result<ChildLaneResult, Str
         ));
     }
 
-    // `TargetRuntimeConfig::validate` has already pinned this exact positive
-    // opt-in. Reuse it for GhostFile's descriptor-local F_NOCACHE mode so
-    // routed demand reads cannot accumulate duplicate cghost source pages.
-    let _demand_load_only = request
-        .target_runtime
-        .environment
-        .get("CAMELID_GEMMA4_GHOST_METAL_DEMAND_LOAD_ONLY")
-        .is_some_and(|value| value == "1");
-    // `load_ghost_moe`'s 4th parameter is `evict_page_cache`, NOT the demand-load
-    // policy: it sets F_NOCACHE on the .cghost and drops the mmap, so EVERY routed
-    // expert pread bypasses the OS page cache. Passing `demand_load_only` here
-    // conflated two unrelated policies - "do not prewarm expert slots at load"
-    // with "never let the OS cache expert bytes".
-    //
-    // MEASURED 2026-08-21: expert reads ran at 1.87 GB/s with zero reuse benefit,
-    // 93.8 MB of expert traffic per emitted token, and disk was 55.7% of the round
-    // wall. The page cache is reclaimable (it counts as `inactive`, i.e. as
-    // watchdog headroom). MEASURED 2026-08-21 on this 16 GiB host: allowing the
-    // page cache did NOT help - effective read bandwidth stayed at 1.52-1.87 GB/s,
-    // per-round bytes rose, and MTP throughput fell 12.31 -> 10.88 tok/s, because
-    // a 10.60 GiB hot expert working set cannot be cached alongside 5.26 GiB of
-    // wired slots plus the common core; the extra pressure costs more than the
-    // reuse wins. So F_NOCACHE stays ON here - but for the MEASURED reason, not
-    // as a side effect of the demand-load policy. Revisit on a >=24 GiB host,
-    // where the page cache is exactly what makes expert streaming scale.
-    let evict_page_cache = true;
+    // The hybrid mapped-cold lane requires the retained read-only `.cghost`
+    // mapping. `evict_page_cache=true` would set F_NOCACHE and deliberately
+    // discard that owner, so this exact profile always keeps the file pager.
+    let evict_page_cache = false;
     let runtime = camelid::gemma4_runtime::Gemma4Runtime::load_ghost_moe(
         &request.target_runtime.runtime_gguf_path,
         &request.target_runtime.cghost_path,
@@ -5978,8 +6207,8 @@ fn execute_lane_child(request: &ChildLaneRequest) -> Result<ChildLaneResult, Str
         "validate post-target-warm expert residency"
     );
     child_try!(
-        validate_exact_target_physical_slot_budget(&target_warm_experts),
-        "bind exact 88-allocated/32-physical expert residency"
+        validate_exact_target_hybrid_experts(&target_warm_experts),
+        "bind exact 128-canonical/48-hot/mapped-cold expert residency"
     );
     routed_experts_after_target_warm = Some(target_warm_experts);
     child_try!(
@@ -6420,7 +6649,17 @@ fn gemma4_mtp_assistant_load_only_probe() {
                     ))
                 },
             )?;
-            report.assistant_ledger = Some(loaded.resident_ledger().into());
+            let resident = loaded.resident_ledger();
+            if resident.locked_bytes == 0
+                || resident.locked_bytes != resident.mapped_bytes
+                || resident.resident_pages == 0
+                || resident.resident_pages != resident.total_pages
+            {
+                return Err(camelid::BackendError::InvalidModelMetadata(format!(
+                    "assistant native locked-residency receipt is inconsistent: {resident:?}"
+                )));
+            }
+            report.assistant_ledger = Some(resident.into());
             assistant = Some(loaded);
         }
         Ok(())
@@ -6900,6 +7139,122 @@ mod pure_tests {
             last_chained_ledger_scope:
                 "latest_completed_chained_attempt_only_not_generation_maximum".into(),
             last_chained_unique_per_layer: vec![0],
+            last_chained_hot_bound_per_layer: vec![0],
+            last_chained_mapped_bound_per_layer: vec![0],
+            ..Default::default()
+        }
+    }
+
+    fn hybrid_chained_snapshot(
+        unique: u16,
+        hot: u16,
+        mapped: u16,
+    ) -> camelid::gemma4_runtime::Gemma4RoutedExpertResidencySnapshot {
+        use camelid::gemma4_runtime::{
+            Gemma4RoutedExpertLayerResidencySnapshot, Gemma4RoutedExpertResidencySnapshot,
+            Gemma4RoutedExpertSlotStatsSnapshot,
+        };
+        assert_eq!(u32::from(hot) + u32::from(mapped), u32::from(unique));
+        let stats = Gemma4RoutedExpertSlotStatsSnapshot {
+            route_lookups: u64::from(unique),
+            hits: u64::from(hot),
+            misses: u64::from(mapped),
+            ..Default::default()
+        };
+        Gemma4RoutedExpertResidencySnapshot {
+            layer_count: 1,
+            slot_record_bytes: 100,
+            slot_stride_bytes: 128,
+            base_slot_capacity: 128,
+            base_slot_capacity_bytes: 128 * 128,
+            physical_base_slot_budget: 48,
+            physical_base_slot_budget_bytes: 48 * 128,
+            file_mapped_addressable_slots: 128,
+            file_mapped_address_span_bytes: 128 * 128,
+            occupied_base_slots: 48,
+            occupied_base_payload_bytes: 48 * 100,
+            occupied_base_touched_bytes: 48 * 128,
+            per_layer: vec![Gemma4RoutedExpertLayerResidencySnapshot {
+                layer_index: 0,
+                base_slot_capacity: 128,
+                physical_base_slot_budget: 48,
+                physical_base_slot_budget_bytes: 48 * 128,
+                file_mapped_addressable_slots: 128,
+                file_mapped_address_span_bytes: 128 * 128,
+                occupied_base_slots: 48,
+                occupied_base_payload_bytes: 48 * 100,
+                occupied_base_touched_bytes: 48 * 128,
+                slot_stats: stats.clone(),
+            }],
+            aggregate_slot_stats: stats,
+            interval_routed_expert_union_scope:
+                "since_latest_explicit_telemetry_interval_begin_or_runtime_load".into(),
+            interval_routed_expert_ids_per_layer: vec![(0..unique).collect()],
+            interval_routed_unique_per_layer: vec![unique],
+            interval_routed_unique_experts_sum: u32::from(unique),
+            interval_routed_unique_experts_max: u32::from(unique),
+            last_chained_ledger_scope:
+                "latest_completed_chained_attempt_only_not_generation_maximum".into(),
+            last_chained_round_available: true,
+            last_chained_round_succeeded: true,
+            last_chained_round_sequence: 1,
+            last_chained_k: Some(8),
+            last_chained_unique_per_layer: vec![unique],
+            last_chained_unique_experts_sum: u32::from(unique),
+            last_chained_unique_experts_max: u32::from(unique),
+            last_chained_hot_bound_per_layer: vec![hot],
+            last_chained_mapped_bound_per_layer: vec![mapped],
+            last_chained_hot_bound_records: u32::from(hot),
+            last_chained_mapped_bound_records: u32::from(mapped),
+            last_chained_slot_hits: u32::from(hot),
+            last_chained_slot_misses: u32::from(mapped),
+            ..Default::default()
+        }
+    }
+
+    fn exact_hybrid_geometry_snapshot(
+    ) -> camelid::gemma4_runtime::Gemma4RoutedExpertResidencySnapshot {
+        use camelid::gemma4_runtime::{
+            Gemma4RoutedExpertLayerResidencySnapshot, Gemma4RoutedExpertResidencySnapshot,
+        };
+        const LAYERS: usize = 30;
+        const CANONICAL: u64 = 128;
+        const HOT: u64 = 48;
+        const RECORD: u64 = 3_345_408;
+        const STRIDE: u64 = 3_358_720;
+        let per_layer = (0..LAYERS)
+            .map(|layer_index| Gemma4RoutedExpertLayerResidencySnapshot {
+                layer_index: layer_index as u32,
+                base_slot_capacity: CANONICAL,
+                physical_base_slot_budget: HOT,
+                physical_base_slot_budget_bytes: HOT * STRIDE,
+                file_mapped_addressable_slots: CANONICAL,
+                file_mapped_address_span_bytes: CANONICAL * STRIDE,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let canonical_total = LAYERS as u64 * CANONICAL;
+        let hot_total = LAYERS as u64 * HOT;
+        Gemma4RoutedExpertResidencySnapshot {
+            layer_count: LAYERS as u32,
+            slot_record_bytes: RECORD,
+            slot_stride_bytes: STRIDE,
+            base_slot_capacity: canonical_total,
+            base_slot_capacity_bytes: canonical_total * STRIDE,
+            physical_base_slot_budget: hot_total,
+            physical_base_slot_budget_bytes: hot_total * STRIDE,
+            file_mapped_addressable_slots: canonical_total,
+            file_mapped_address_span_bytes: canonical_total * STRIDE,
+            per_layer,
+            interval_routed_expert_union_scope:
+                "since_latest_explicit_telemetry_interval_begin_or_runtime_load".into(),
+            interval_routed_expert_ids_per_layer: vec![Vec::new(); LAYERS],
+            interval_routed_unique_per_layer: vec![0; LAYERS],
+            last_chained_ledger_scope:
+                "latest_completed_chained_attempt_only_not_generation_maximum".into(),
+            last_chained_unique_per_layer: vec![0; LAYERS],
+            last_chained_hot_bound_per_layer: vec![0; LAYERS],
+            last_chained_mapped_bound_per_layer: vec![0; LAYERS],
             ..Default::default()
         }
     }
@@ -6928,6 +7283,205 @@ mod pure_tests {
         let mut invalid_union = after;
         invalid_union.interval_routed_expert_ids_per_layer[0] = vec![9, 3];
         assert!(validate_routed_expert_snapshot("test", &invalid_union).is_err());
+    }
+
+    #[test]
+    fn hybrid_chained_49_to_64_union_is_hot_plus_mapped_not_overflow() {
+        for (unique, hot, mapped) in [(49, 48, 1), (64, 48, 16)] {
+            let receipt = hybrid_chained_snapshot(unique, hot, mapped);
+            assert!(
+                validate_routed_expert_snapshot("hybrid spill", &receipt).is_ok(),
+                "unique={unique} hot={hot} mapped={mapped}"
+            );
+
+            let mut wrong_partition = receipt.clone();
+            wrong_partition.last_chained_mapped_bound_per_layer[0] -= 1;
+            wrong_partition.last_chained_mapped_bound_records -= 1;
+            assert!(validate_routed_expert_snapshot("hybrid spill", &wrong_partition).is_err());
+
+            let mut swapped_tier_labels = receipt.clone();
+            swapped_tier_labels.last_chained_hot_bound_per_layer[0] -= 1;
+            swapped_tier_labels.last_chained_mapped_bound_per_layer[0] += 1;
+            swapped_tier_labels.last_chained_hot_bound_records -= 1;
+            swapped_tier_labels.last_chained_mapped_bound_records += 1;
+            assert!(
+                validate_routed_expert_snapshot("hybrid spill", &swapped_tier_labels).is_err()
+            );
+
+            let mut false_overflow = receipt;
+            false_overflow.last_chained_slot_capacity_overflow = 1;
+            assert!(validate_routed_expert_snapshot("hybrid spill", &false_overflow).is_err());
+        }
+
+        let impossible_hot = hybrid_chained_snapshot(64, 64, 0);
+        assert!(validate_routed_expert_snapshot("hybrid hot overflow", &impossible_hot).is_err());
+
+        let mut malformed_bytes = hybrid_chained_snapshot(49, 47, 2);
+        malformed_bytes.last_chained_demand_loads = 1;
+        malformed_bytes.last_chained_demand_read_bytes = 99;
+        malformed_bytes.cumulative_chained_demand_loads = 1;
+        malformed_bytes.cumulative_chained_demand_read_bytes = 99;
+        malformed_bytes.cumulative_expert_payload_read_bytes = 99;
+        assert!(validate_routed_expert_snapshot("hybrid read bytes", &malformed_bytes).is_err());
+
+        malformed_bytes.last_chained_demand_read_bytes = 100;
+        malformed_bytes.cumulative_chained_demand_read_bytes = 100;
+        malformed_bytes.cumulative_expert_payload_read_bytes = 100;
+        assert!(validate_routed_expert_snapshot("hybrid read bytes", &malformed_bytes).is_ok());
+    }
+
+    #[test]
+    fn hybrid_no_round_receipt_rejects_tier_or_overflow_facts() {
+        let clean = exact_hybrid_geometry_snapshot();
+        assert!(validate_routed_expert_snapshot("hybrid clean", &clean).is_ok());
+        assert!(validate_exact_target_hybrid_experts(&clean).is_ok());
+
+        let mut tier_without_round = clean.clone();
+        tier_without_round.last_chained_hot_bound_per_layer[0] = 1;
+        tier_without_round.last_chained_hot_bound_records = 1;
+        assert!(
+            validate_routed_expert_snapshot("hybrid clean", &tier_without_round).is_err()
+        );
+
+        let mut no_round_sequence = clean.clone();
+        no_round_sequence.last_chained_round_sequence = 1;
+        assert!(validate_routed_expert_snapshot("hybrid no round", &no_round_sequence).is_err());
+
+        let mut no_round_io = clean.clone();
+        no_round_io.cumulative_chained_demand_loads = 1;
+        no_round_io.cumulative_chained_demand_read_bytes = 3_345_408;
+        no_round_io.cumulative_expert_payload_read_bytes = 3_345_408;
+        assert!(validate_routed_expert_snapshot("hybrid no round", &no_round_io).is_err());
+
+        let mut wrong_capacity = clean.clone();
+        wrong_capacity.per_layer[0].physical_base_slot_budget = 49;
+        wrong_capacity.per_layer[0].physical_base_slot_budget_bytes = 49 * 3_358_720;
+        wrong_capacity.physical_base_slot_budget += 1;
+        wrong_capacity.physical_base_slot_budget_bytes += 3_358_720;
+        assert!(validate_routed_expert_snapshot("hybrid wrong capacity", &wrong_capacity).is_ok());
+        assert!(validate_exact_target_hybrid_experts(&wrong_capacity).is_err());
+
+        let mut failed_overflow = clean.clone();
+        failed_overflow.last_chained_round_available = true;
+        failed_overflow.last_chained_round_sequence = 1;
+        failed_overflow.last_chained_k = Some(8);
+        failed_overflow.last_chained_overflow_slots = 1;
+        assert!(validate_routed_expert_snapshot("hybrid failed", &failed_overflow).is_err());
+        assert!(validate_exact_target_hybrid_experts(&failed_overflow).is_err());
+
+        let mut promoted = clean.clone();
+        promoted.last_chained_round_available = true;
+        promoted.last_chained_round_succeeded = true;
+        promoted.last_chained_round_sequence = 1;
+        promoted.last_chained_k = Some(8);
+        promoted.last_chained_unique_per_layer[0] = 49;
+        promoted.last_chained_unique_experts_sum = 49;
+        promoted.last_chained_unique_experts_max = 49;
+        promoted.last_chained_hot_bound_per_layer[0] = 47;
+        promoted.last_chained_mapped_bound_per_layer[0] = 2;
+        promoted.last_chained_hot_bound_records = 47;
+        promoted.last_chained_mapped_bound_records = 2;
+        promoted.last_chained_slot_hits = 47;
+        promoted.last_chained_slot_misses = 2;
+        promoted.last_chained_demand_loads = 1;
+        promoted.last_chained_demand_read_bytes = 3_345_408;
+        promoted.cumulative_chained_demand_loads = 1;
+        promoted.cumulative_chained_demand_read_bytes = 3_345_408;
+        promoted.cumulative_expert_payload_read_bytes = 3_345_408;
+        promoted.aggregate_slot_stats.route_lookups = 49;
+        promoted.aggregate_slot_stats.hits = 47;
+        promoted.aggregate_slot_stats.misses = 2;
+        promoted.per_layer[0].slot_stats = promoted.aggregate_slot_stats.clone();
+        assert!(validate_routed_expert_snapshot("hybrid promoted", &promoted).is_ok());
+        assert!(validate_exact_target_hybrid_experts(&promoted).is_ok());
+
+        let mut missing_promotion_io = promoted;
+        missing_promotion_io.last_chained_demand_loads = 0;
+        missing_promotion_io.last_chained_demand_read_bytes = 0;
+        missing_promotion_io.cumulative_chained_demand_loads = 0;
+        missing_promotion_io.cumulative_chained_demand_read_bytes = 0;
+        missing_promotion_io.cumulative_expert_payload_read_bytes = 0;
+        assert!(validate_routed_expert_snapshot("hybrid promoted", &missing_promotion_io).is_ok());
+        assert!(validate_exact_target_hybrid_experts(&missing_promotion_io).is_err());
+
+        for mutate in [
+            |stats: &mut camelid::gemma4_runtime::Gemma4RoutedExpertSlotStatsSnapshot| {
+                stats.host_fills = 1;
+            },
+            |stats: &mut camelid::gemma4_runtime::Gemma4RoutedExpertSlotStatsSnapshot| {
+                stats.prewarm_copies = 1;
+            },
+            |stats: &mut camelid::gemma4_runtime::Gemma4RoutedExpertSlotStatsSnapshot| {
+                stats.direct_read_failures = 1;
+            },
+        ] {
+            let mut unexpected_fill = exact_hybrid_geometry_snapshot();
+            mutate(&mut unexpected_fill.aggregate_slot_stats);
+            assert!(validate_exact_target_hybrid_experts(&unexpected_fill).is_err());
+        }
+    }
+
+    #[test]
+    fn hybrid_generation_transition_requires_hot_and_mapped_deltas() {
+        let before = exact_hybrid_geometry_snapshot();
+        let mut after = before.clone();
+        after.interval_routed_expert_union_epoch =
+            before.interval_routed_expert_union_epoch.saturating_add(1);
+        after.aggregate_slot_stats.route_lookups = 2;
+        after.aggregate_slot_stats.hits = 1;
+        after.aggregate_slot_stats.misses = 1;
+        after.per_layer[0].slot_stats = after.aggregate_slot_stats.clone();
+        assert!(validate_routed_expert_transition(&before, &after).is_ok());
+
+        let mut no_mapped_delta = after.clone();
+        no_mapped_delta.aggregate_slot_stats.route_lookups = 1;
+        no_mapped_delta.aggregate_slot_stats.misses = 0;
+        no_mapped_delta.per_layer[0].slot_stats = no_mapped_delta.aggregate_slot_stats.clone();
+        assert!(validate_routed_expert_transition(&before, &no_mapped_delta).is_err());
+
+        let mut no_hot_delta = after;
+        no_hot_delta.aggregate_slot_stats.route_lookups = 1;
+        no_hot_delta.aggregate_slot_stats.hits = 0;
+        no_hot_delta.per_layer[0].slot_stats = no_hot_delta.aggregate_slot_stats.clone();
+        assert!(validate_routed_expert_transition(&before, &no_hot_delta).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn load_only_ledger_requires_exact_hybrid_capacity_and_zero_side_caches() {
+        use camelid::gemma4_runtime::Gemma4GhostLoadAllocationLedger;
+        const LAYERS: u64 = 30;
+        const CANONICAL: u64 = 128;
+        const HOT: u64 = 48;
+        const STRIDE: u64 = 3_358_720;
+        let mut ledger = Gemma4GhostLoadAllocationLedger {
+            cghost_logical_bytes: LAYERS * CANONICAL * STRIDE,
+            cghost_mapped_bytes: LAYERS * CANONICAL * STRIDE,
+            expert_layer_count: LAYERS,
+            expert_logical_slot_count: LAYERS * CANONICAL,
+            expert_slot_count: LAYERS * HOT,
+            expert_slot_capacity_bytes: LAYERS * HOT * STRIDE,
+            expert_file_mapped_slot_count: LAYERS * CANONICAL,
+            expert_file_mapped_address_span_bytes: LAYERS * CANONICAL * STRIDE,
+            expert_table_directory_slot_count: LAYERS * HOT,
+            expert_table_directory_capacity_bytes: LAYERS * HOT * STRIDE,
+            expert_slots_active: true,
+            arbitrary_slot_prewarm_skipped: true,
+            ..Default::default()
+        };
+        assert!(load_only_hybrid_expert_capacity_ready(&ledger));
+
+        ledger.expert_file_mapped_slot_count -= 1;
+        assert!(!load_only_hybrid_expert_capacity_ready(&ledger));
+        ledger.expert_file_mapped_slot_count += 1;
+        ledger.host_cache_budget_bytes = 1;
+        assert!(!load_only_hybrid_expert_capacity_ready(&ledger));
+        ledger.host_cache_budget_bytes = 0;
+        ledger.overflow_slot_count = 1;
+        assert!(!load_only_hybrid_expert_capacity_ready(&ledger));
+        ledger.overflow_slot_count = 0;
+        ledger.cghost_mapped_bytes = 1;
+        assert!(!load_only_hybrid_expert_capacity_ready(&ledger));
     }
 
     fn key() -> WindowKey {
@@ -7038,8 +7592,7 @@ mod pure_tests {
             environment: exact_target_environment(),
         };
         assert!(config.validate().is_ok());
-        assert_eq!(config.expert_cache_mib, 2_900);
-        assert_eq!(config.environment["CAMELID_GEMMA4_SLOT_POLICY"], "lru");
+        assert_eq!(config.expert_cache_mib, 0);
         assert_eq!(config.environment["CAMELID_GEMMA4_VICTIM_CACHE"], "0");
         assert_eq!(config.environment["CAMELID_GEMMA4_VICTIM_MB"], "0");
         assert_eq!(
@@ -7047,9 +7600,24 @@ mod pure_tests {
             "1"
         );
         assert_eq!(
-            config.environment["CAMELID_GEMMA4_GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER"],
-            "56"
+            config.environment["CAMELID_GEMMA4_GHOST_METAL_FILE_MAPPED_EXPERTS"],
+            "1"
         );
+        assert_eq!(
+            config.environment["CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS"],
+            "48"
+        );
+        assert_eq!(config.environment["CAMELID_GEMMA4_SLOT_PIN"], "0");
+        assert!(!config
+            .environment
+            .contains_key("CAMELID_GEMMA4_GHOST_METAL_SLOTS_PER_LAYER"));
+        assert!(!config
+            .environment
+            .contains_key("CAMELID_GEMMA4_GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER"));
+        assert!(!config
+            .environment
+            .contains_key("CAMELID_GEMMA4_GHOST_METAL_PER_LAYER_SLOTS"));
+        assert!(!config.environment.contains_key("CAMELID_GEMMA4_MTP_PIN"));
         assert_eq!(
             config.environment["CAMELID_GEMMA4_GHOST_METAL_HEAD_RESIDENT"],
             "0"
@@ -7057,14 +7625,39 @@ mod pure_tests {
         assert_eq!(config.environment["CAMELID_GEMMA4_SPEC_CHUNK_MAX"], "8");
         assert_eq!(config.environment["CAMELID_GEMMA4_SPEC_DRAFT_TOKENS"], "8");
 
-        let mut drifted = config;
+        let mut drifted = config.clone();
         drifted
             .environment
-            .insert("CAMELID_GEMMA4_SLOT_POLICY".into(), "lfu".into());
+            .insert("CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS".into(), "048".into());
         assert!(drifted
             .validate()
             .unwrap_err()
-            .contains("CAMELID_GEMMA4_SLOT_POLICY"));
+            .contains("CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS"));
+
+        for legacy_key in [
+            "CAMELID_GEMMA4_GHOST_METAL_SLOTS_PER_LAYER",
+            "CAMELID_GEMMA4_GHOST_METAL_PER_LAYER_SLOTS",
+            "CAMELID_GEMMA4_GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER",
+        ] {
+            let mut legacy_geometry = config.clone();
+            legacy_geometry
+                .environment
+                .insert(legacy_key.into(), "48".into());
+            assert!(
+                legacy_geometry
+                    .validate()
+                    .unwrap_err()
+                    .contains("unexpected settings"),
+                "{legacy_key}"
+            );
+        }
+
+        let mut host_cached = config;
+        host_cached.expert_cache_mib = 1;
+        assert!(host_cached
+            .validate()
+            .unwrap_err()
+            .contains("zero-byte host expert cache"));
     }
 
     #[test]

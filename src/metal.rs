@@ -14205,9 +14205,11 @@ pub(crate) struct Gemma4Q4ExpertDiagnostics {
 /// Synthetic, model-free command resources used only by the observed
 /// load-only residency path. It binds an actual runtime record table through
 /// both production address-only kernel families without tokenization,
-/// routing, prefill, KV mutation, target stepping, or generation. Slots 0..8
-/// contain their allocation-time zeroes; no expert file page is read and no
-/// runtime directory entry is committed.
+/// routing, prefill, KV mutation, target stepping, or generation. Anonymous
+/// tables consume their allocation-time zeroes. A mapped or hybrid table
+/// instead faults exactly the selected 0..8 clean records as compute-bind
+/// residency evidence; no runtime directory entry is committed in either
+/// case.
 #[cfg(target_os = "macos")]
 pub(crate) struct Gemma4DemandTableLoadOnlyProbe {
     table_slots: usize,
