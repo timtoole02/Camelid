@@ -839,40 +839,63 @@ impl Gemma4MoeSlotArgTable {
         Self::from_indexed_slot_buffers(device, records.len(), &record_slots, records, None)
     }
 
-    /// Build a transient sparse table over exactly the selected canonical
-    /// `.cghost` records. Record buffers remain indexed by their original slot
-    /// IDs, so HEAD route slots and chained fixed-stride work offsets require no
-    /// translation. The returned owner must live until the GPU command reaches
-    /// a terminal state.
-    pub(crate) fn from_mapped_active_slots(
+    fn from_mixed_active_slots_with_addressable_count(
         mmap: std::sync::Arc<crate::wire_mmap::GgufWireMmap>,
         offset: u64,
         byte_len: usize,
+        addressable_slot_count: usize,
         active_slots: &[usize],
+        hot_slot_ids: &[usize],
+        hot_records: &[Buffer],
     ) -> Option<Self> {
-        const EXPERTS: usize = 128;
-        let required = EXPERTS.checked_mul(S50_SLOT_STRIDE)?;
-        if S50_RECORD_BYTES > S50_SLOT_STRIDE || byte_len < required || active_slots.is_empty() {
-            return None;
-        }
-        let offset = usize::try_from(offset).ok()?;
-        let end = offset.checked_add(required)?;
-        if end > mmap.mapped_len() {
-            return None;
-        }
-        let page_size = crate::wire_mmap::page_size();
-        let base = unsafe { mmap.base_ptr().add(offset) };
-        if page_size == 0
-            || !S50_SLOT_STRIDE.is_multiple_of(page_size)
-            || !(base as usize).is_multiple_of(page_size)
+        if !(1..=128).contains(&addressable_slot_count)
+            || S50_RECORD_BYTES > S50_SLOT_STRIDE
+            || active_slots.is_empty()
+            || hot_slot_ids.len() != hot_records.len()
+            || hot_records.len() > addressable_slot_count
         {
             return None;
+        }
+        let required = addressable_slot_count.checked_mul(S50_SLOT_STRIDE)?;
+        let offset = usize::try_from(offset).ok()?;
+        let end = offset.checked_add(required)?;
+        let page_size = crate::wire_mmap::page_size();
+        if byte_len != required
+            || end > mmap.mapped_len()
+            || page_size == 0
+            || !S50_SLOT_STRIDE.is_multiple_of(page_size)
+        {
+            return None;
+        }
+        let base = unsafe { mmap.base_ptr().add(offset) };
+        if !(base as usize).is_multiple_of(page_size) {
+            return None;
+        }
+
+        // Validate the complete bounded hot directory before constructing the
+        // first no-copy view. Any malformed canonical ID, duplicate override,
+        // or record geometry therefore fails without partially materializing a
+        // mixed residency set.
+        let mut hot_slot_to_record = [UNBOUND_RECORD_INDEX; 128];
+        for (record_index, (&slot, record)) in hot_slot_ids.iter().zip(hot_records).enumerate() {
+            if slot >= addressable_slot_count
+                || hot_slot_to_record[slot] != UNBOUND_RECORD_INDEX
+                || record.length() as usize != S50_SLOT_STRIDE
+                || record.contents().is_null()
+                || !(record.contents() as usize).is_multiple_of(page_size)
+            {
+                return None;
+            }
+            hot_slot_to_record[slot] = u8::try_from(record_index).ok()?;
         }
 
         let mut record_slots = active_slots.to_vec();
         record_slots.sort_unstable();
         record_slots.dedup();
-        if record_slots.iter().any(|&slot| slot >= EXPERTS) {
+        if record_slots
+            .iter()
+            .any(|&slot| slot >= addressable_slot_count)
+        {
             return None;
         }
 
@@ -884,7 +907,13 @@ impl Gemma4MoeSlotArgTable {
             return None;
         }
         let mut records = Vec::with_capacity(record_slots.len());
+        let mut mapped_record_count = 0usize;
         for &slot in &record_slots {
+            let hot_record_index = hot_slot_to_record[slot];
+            if hot_record_index != UNBOUND_RECORD_INDEX {
+                records.push(hot_records[usize::from(hot_record_index)].clone());
+                continue;
+            }
             let record_offset = slot.checked_mul(S50_SLOT_STRIDE)?;
             let pointer = unsafe { base.add(record_offset) };
             if !(pointer as usize).is_multiple_of(page_size) {
@@ -896,8 +925,58 @@ impl Gemma4MoeSlotArgTable {
                 MTLResourceOptions::StorageModeShared,
                 None,
             ));
+            mapped_record_count += 1;
         }
-        Self::from_indexed_slot_buffers(device, EXPERTS, &record_slots, &records, Some(mmap))
+        let mapped_owner = (mapped_record_count > 0).then_some(mmap);
+        Self::from_indexed_slot_buffers(
+            device,
+            addressable_slot_count,
+            &record_slots,
+            &records,
+            mapped_owner,
+        )
+    }
+
+    /// Build one transient canonical-ID table over a clean mapped cold tier and
+    /// a bounded anonymous hot tier. Hot records override the same canonical
+    /// IDs in the mapped layer; all other active IDs receive exact no-copy
+    /// views. Inactive hot and cold records are not encoded into the table.
+    ///
+    /// The returned table retains every selected anonymous buffer and, when at
+    /// least one cold record is selected, the mmap owner. It must remain alive
+    /// until the command buffer reaches a terminal state, and callers must not
+    /// refill a selected hot record before that same terminal state.
+    pub(crate) fn from_mixed_active_slots(
+        mmap: std::sync::Arc<crate::wire_mmap::GgufWireMmap>,
+        offset: u64,
+        byte_len: usize,
+        active_slots: &[usize],
+        hot_slot_ids: &[usize],
+        hot_records: &[Buffer],
+    ) -> Option<Self> {
+        Self::from_mixed_active_slots_with_addressable_count(
+            mmap,
+            offset,
+            byte_len,
+            128,
+            active_slots,
+            hot_slot_ids,
+            hot_records,
+        )
+    }
+
+    /// Build a transient sparse table over exactly the selected canonical
+    /// `.cghost` records. Record buffers remain indexed by their original slot
+    /// IDs, so HEAD route slots and chained fixed-stride work offsets require no
+    /// translation. The returned owner must live until the GPU command reaches
+    /// a terminal state.
+    pub(crate) fn from_mapped_active_slots(
+        mmap: std::sync::Arc<crate::wire_mmap::GgufWireMmap>,
+        offset: u64,
+        byte_len: usize,
+        active_slots: &[usize],
+    ) -> Option<Self> {
+        Self::from_mixed_active_slots(mmap, offset, byte_len, active_slots, &[], &[])
     }
 
     pub(crate) const fn addressable_slot_count(&self) -> usize {
@@ -2066,6 +2145,224 @@ mod tests {
                 &read_bytes(&buffers.arg_down, down_bytes),
             );
         }
+    }
+
+    #[test]
+    fn gemma4_moe_mixed_hot_cold_table_chained_k1_to_k8_raw_bit_parity_and_lifetime() {
+        use std::io::Write as _;
+
+        let Some(kernel) = metal_linear_kernel() else {
+            eprintln!("SKIP mixed hot/cold argbuf parity gate: no Metal device");
+            return;
+        };
+        let device = &kernel.device;
+        if device.argument_buffers_support() != MTLArgumentBuffersTier::Tier2 {
+            eprintln!(
+                "SKIP mixed hot/cold argbuf parity gate: Tier-2 argument buffers unavailable"
+            );
+            return;
+        }
+
+        let (records, copied_slab) = synthetic_slot_backings(device);
+        let hot_slot_ids = [1usize, 4, 6];
+        let hot_records = hot_slot_ids
+            .iter()
+            .map(|&slot| records[slot].clone())
+            .collect::<Vec<_>>();
+
+        // The mapped copy deliberately poisons every hot slot while retaining
+        // valid Q4_0 block structure. Exact parity with `copied_slab` therefore
+        // proves that canonical hot overrides won and every other slot came
+        // from the cold mapping.
+        let mapped_bytes = SYNTHETIC_EXPERTS * S50_SLOT_STRIDE;
+        let mut file = tempfile::NamedTempFile::new().expect("temporary mixed expert fixture");
+        file.as_file()
+            .set_len(mapped_bytes as u64)
+            .expect("size mixed expert fixture");
+        for (slot, record) in records.iter().enumerate() {
+            let mut bytes = read_bytes(record, S50_SLOT_STRIDE);
+            if hot_slot_ids.contains(&slot) {
+                for block in bytes[..S50_RECORD_BYTES].chunks_exact_mut(18) {
+                    block[2] ^= 0x5a;
+                }
+            }
+            file.as_file_mut()
+                .write_all(&bytes)
+                .expect("write mixed expert fixture record");
+        }
+        file.as_file()
+            .sync_all()
+            .expect("sync mixed expert fixture");
+
+        let mmap =
+            crate::wire_mmap::GgufWireMmap::map(file.path()).expect("map mixed expert fixture");
+        let mapped_owner = std::sync::Arc::downgrade(&mmap);
+
+        // The complete hot directory and active union are validated before any
+        // no-copy view exists. Duplicates, mismatched pairs, and out-of-range
+        // canonical IDs must all fail closed.
+        assert!(
+            Gemma4MoeSlotArgTable::from_mixed_active_slots_with_addressable_count(
+                std::sync::Arc::clone(&mmap),
+                0,
+                mapped_bytes,
+                SYNTHETIC_EXPERTS,
+                &[0],
+                &[1, 1],
+                &hot_records[..2],
+            )
+            .is_none()
+        );
+        assert!(
+            Gemma4MoeSlotArgTable::from_mixed_active_slots_with_addressable_count(
+                std::sync::Arc::clone(&mmap),
+                0,
+                mapped_bytes,
+                SYNTHETIC_EXPERTS,
+                &[0],
+                &hot_slot_ids,
+                &hot_records[..2],
+            )
+            .is_none()
+        );
+        assert!(
+            Gemma4MoeSlotArgTable::from_mixed_active_slots_with_addressable_count(
+                std::sync::Arc::clone(&mmap),
+                0,
+                mapped_bytes,
+                SYNTHETIC_EXPERTS,
+                &[0, SYNTHETIC_EXPERTS],
+                &hot_slot_ids,
+                &hot_records,
+            )
+            .is_none()
+        );
+
+        let table = Gemma4MoeSlotArgTable::from_mixed_active_slots_with_addressable_count(
+            std::sync::Arc::clone(&mmap),
+            0,
+            mapped_bytes,
+            SYNTHETIC_EXPERTS,
+            &(0..SYNTHETIC_EXPERTS).collect::<Vec<_>>(),
+            &hot_slot_ids,
+            &hot_records,
+        )
+        .expect("mixed canonical-ID expert table");
+        assert_eq!(table.addressable_slot_count(), SYNTHETIC_EXPERTS);
+        assert_eq!(table.bound_record_count(), SYNTHETIC_EXPERTS);
+
+        // The table is the lifetime-safe binding: its Objective-C references
+        // retain selected anonymous records, and its Arc retains the mapping.
+        // Prove both by dropping every source-side handle before GPU use.
+        drop(mmap);
+        drop(hot_records);
+        drop(records);
+        assert!(mapped_owner.upgrade().is_some());
+        let retained_table = table.clone();
+        drop(table);
+        let table = retained_table;
+
+        let copied = spec50_moe_pipelines(device).expect("copied-slab SPEC50 pipelines");
+        let buffers = Buffers::new(device);
+        for k in 1..=MAX_K {
+            let routing = build_synthetic_routing(k);
+            buffers.upload(&routing);
+            buffers.zero_outputs();
+            let cb = kernel.queue.new_command_buffer();
+            let encoder = cb.new_compute_command_encoder();
+            assert_eq!(
+                table.declare_active_slots(encoder, &routing.active_experts),
+                Some(SYNTHETIC_EXPERTS)
+            );
+
+            encode_spec50_gateup(
+                encoder,
+                &copied.gateup,
+                &buffers.input_scales,
+                &buffers.input_quants,
+                &copied_slab,
+                0,
+                &buffers.work,
+                &buffers.copy_scales,
+                &buffers.copy_quants,
+                SYNTHETIC_EXPERTS as u32,
+                k as u32,
+                None,
+                None,
+            );
+            assert!(table.encode_chained_gateup_k8(
+                encoder,
+                &buffers.input_scales,
+                &buffers.input_quants,
+                &buffers.work,
+                &buffers.arg_scales,
+                &buffers.arg_quants,
+                SYNTHETIC_EXPERTS,
+                k,
+            ));
+            encoder.memory_barrier_with_resources(&[
+                &buffers.copy_scales,
+                &buffers.copy_quants,
+                &buffers.arg_scales,
+                &buffers.arg_quants,
+            ]);
+            encode_spec50_down(
+                encoder,
+                &copied.down,
+                &buffers.copy_scales,
+                &buffers.copy_quants,
+                &copied_slab,
+                0,
+                &buffers.routes,
+                &buffers.work,
+                &buffers.copy_down,
+                k as u32,
+                None,
+            );
+            assert!(table.encode_chained_down_k8(
+                encoder,
+                &buffers.arg_scales,
+                &buffers.arg_quants,
+                &buffers.routes,
+                &buffers.work,
+                &buffers.arg_down,
+                k,
+            ));
+            encoder.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            assert_eq!(
+                cb.status(),
+                MTLCommandBufferStatus::Completed,
+                "mixed hot/cold argbuf K={k} command failed: {}",
+                command_buffer_error_details(cb)
+            );
+
+            let scale_bytes = SYNTHETIC_EXPERTS * k * S50_DOWN_BLOCKS * 4;
+            let quant_bytes = SYNTHETIC_EXPERTS * k * S50_FF;
+            let down_bytes = k * S50_HIDDEN * 4;
+            assert_raw_eq(
+                &format!("mixed hot/cold K={k} GateUp scales"),
+                &read_bytes(&buffers.copy_scales, scale_bytes),
+                &read_bytes(&buffers.arg_scales, scale_bytes),
+            );
+            assert_raw_eq(
+                &format!("mixed hot/cold K={k} GateUp quants"),
+                &read_bytes(&buffers.copy_quants, quant_bytes),
+                &read_bytes(&buffers.arg_quants, quant_bytes),
+            );
+            assert_raw_eq(
+                &format!("mixed hot/cold K={k} Down output"),
+                &read_bytes(&buffers.copy_down, down_bytes),
+                &read_bytes(&buffers.arg_down, down_bytes),
+            );
+        }
+
+        drop(table);
+        assert!(
+            mapped_owner.upgrade().is_none(),
+            "dropping the final mixed table must release the mmap owner"
+        );
     }
 
     #[test]
