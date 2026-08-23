@@ -1543,6 +1543,66 @@ mod tests {
         read(&out, rows * K8)
     }
 
+    fn plain_runtime_width_reference(
+        c: &Ctx,
+        y: &Buffer,
+        w: &Buffer,
+        rows: usize,
+        blocks: usize,
+    ) -> Vec<f32> {
+        let out = zeros(&c.device, rows * K8);
+        let pipeline = c
+            .old
+            .q4_0_block_batch_k_pipeline
+            .as_ref()
+            .expect("runtime-width plain pipeline");
+        let blocks = blocks as u32;
+        let rows_u32 = rows as u32;
+        let k_u32 = K8 as u32;
+        run(&c.queue, |e| {
+            e.set_compute_pipeline_state(pipeline);
+            e.set_buffer(0, Some(y), 0);
+            e.set_buffer(2, Some(w), 0);
+            e.set_buffer(3, Some(&out), 0);
+            e.set_bytes(4, 4, &blocks as *const u32 as *const _);
+            e.set_bytes(5, 4, &rows_u32 as *const u32 as *const _);
+            e.set_bytes(6, 4, &k_u32 as *const u32 as *const _);
+            e.dispatch_thread_groups(
+                metal::MTLSize {
+                    width: (rows as u64).div_ceil(4),
+                    height: 1,
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 32,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        });
+        read(&out, rows * K8)
+    }
+
+    /// Pins why exact speculative verification must not select the legacy
+    /// fixed-K8 plain kernel: it compiles a different floating-point program
+    /// from the runtime-width kernel used by K=1.
+    #[test]
+    fn legacy_fixed_k8_plain_is_not_partition_safe() {
+        let Some(c) = ctx() else {
+            return;
+        };
+        let mut rng = Rng(0x504c_4149_4e50_4152);
+        let (rows, blocks) = (68usize, 11usize);
+        let w = buf_from(&c.device, &random_q4_0(&mut rng, rows, blocks));
+        let y = buf_from(&c.device, &random_f32(&mut rng, blocks * 32 * K8));
+        let fixed = plain_old(&c, &y, &w, rows, blocks);
+        let runtime = plain_runtime_width_reference(&c, &y, &w, rows, blocks);
+        assert!(
+            bits_equal("fixed/runtime plain", &fixed, &runtime) > 0,
+            "legacy fixed K8 unexpectedly became partition-safe; re-evaluate its admission gate"
+        );
+    }
+
     /// Total bit mismatches for one config across the loop-carried shape set
     /// (blocks > 8 forces multi-iteration accumulation chains — the regime
     /// where compiled FMA contraction can diverge).
@@ -1708,6 +1768,84 @@ mod tests {
             );
         });
         (read(&oq, qr * K8), read(&ok, kr * K8), read(&ov, vr * K8))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qkv_runtime_width_reference(
+        c: &Ctx,
+        y: &Buffer,
+        wq: &Buffer,
+        wk: &Buffer,
+        wv: &Buffer,
+        (qr, kr, vr): (usize, usize, usize),
+        blocks: usize,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let oq = zeros(&c.device, qr * K8);
+        let ok = zeros(&c.device, kr * K8);
+        let ov = zeros(&c.device, vr * K8);
+        let pipeline = c
+            .old
+            .q4_0_qkv_block_batch_k_pipeline
+            .as_ref()
+            .expect("runtime-width QKV pipeline");
+        let blocks = blocks as u32;
+        let qr_u32 = qr as u32;
+        let kr_u32 = kr as u32;
+        let vr_u32 = vr as u32;
+        let k_u32 = K8 as u32;
+        run(&c.queue, |e| {
+            e.set_compute_pipeline_state(pipeline);
+            e.set_buffer(0, Some(y), 0);
+            e.set_buffer(1, Some(wq), 0);
+            e.set_buffer(2, Some(wk), 0);
+            e.set_buffer(3, Some(wv), 0);
+            e.set_buffer(4, Some(&oq), 0);
+            e.set_buffer(5, Some(&ok), 0);
+            e.set_buffer(6, Some(&ov), 0);
+            e.set_bytes(7, 4, &blocks as *const u32 as *const _);
+            e.set_bytes(8, 4, &qr_u32 as *const u32 as *const _);
+            e.set_bytes(9, 4, &kr_u32 as *const u32 as *const _);
+            e.set_bytes(10, 4, &vr_u32 as *const u32 as *const _);
+            e.set_bytes(11, 4, &k_u32 as *const u32 as *const _);
+            e.dispatch_thread_groups(
+                metal::MTLSize {
+                    width: ((qr + kr + vr) as u64).div_ceil(2),
+                    height: 1,
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 32,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        });
+        (read(&oq, qr * K8), read(&ok, kr * K8), read(&ov, vr * K8))
+    }
+
+    /// Existing v4 tests compare staged QKV to this legacy fixed-K8 kernel.
+    /// This oracle instead compares that shared fixed program to the
+    /// runtime-width K=1 family and pins the partition-parity defect directly.
+    #[test]
+    fn legacy_fixed_k8_qkv_is_not_partition_safe() {
+        let Some(c) = ctx() else {
+            return;
+        };
+        let mut rng = Rng(0x4b31_5041_5254_4954);
+        let (qr, kr, vr, blocks) = (48usize, 16usize, 16usize, 11usize);
+        let wq = buf_from(&c.device, &random_q4_0(&mut rng, qr, blocks));
+        let wk = buf_from(&c.device, &random_q4_0(&mut rng, kr, blocks));
+        let wv = buf_from(&c.device, &random_q4_0(&mut rng, vr, blocks));
+        let y = buf_from(&c.device, &random_f32(&mut rng, blocks * 32 * K8));
+        let fixed = qkv_old(&c, &y, &wq, &wk, &wv, (qr, kr, vr), blocks);
+        let runtime = qkv_runtime_width_reference(&c, &y, &wq, &wk, &wv, (qr, kr, vr), blocks);
+        let bad = bits_equal("fixed/runtime Q", &fixed.0, &runtime.0)
+            + bits_equal("fixed/runtime K", &fixed.1, &runtime.1)
+            + bits_equal("fixed/runtime V", &fixed.2, &runtime.2);
+        assert!(
+            bad > 0,
+            "legacy fixed K8 unexpectedly became partition-safe; re-evaluate its admission gate"
+        );
     }
 
     fn qkv_mismatches(c: &Ctx, cfg: Spec50Cfg) -> usize {
