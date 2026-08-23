@@ -168,6 +168,12 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
     )
     if log.count(bootstrap_marker) != 1:
         raise GateError("generation did not consume the exact final-prefill seed")
+    partition_marker = (
+        "[gemma4 exact partition] CAMELID_GEMMA4_DENSE_K8_GENERIC=1 "
+        "static_k8_dense=off runtime_k_dense=on"
+    )
+    if log.count(partition_marker) != 1:
+        raise GateError("generation did not use the K1/K8 partition-parity dense path")
     chain_receipts = DEVICE_CHAIN_PATTERN.findall(log)
     if len(chain_receipts) != assistant_rounds:
         raise GateError(

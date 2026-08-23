@@ -704,6 +704,47 @@ fn dense_v4_disabled() -> bool {
     })
 }
 
+/// `CAMELID_GEMMA4_DENSE_K8_GENERIC=1` keeps K=8 on the same runtime-width
+/// dense Q4_0 kernels used by K=1. This is an exactness lever for partition
+/// parity: a target stream split as `[token] + K8` must not differ from the
+/// same target tokens verified in one K8 chunk merely because the static-K8
+/// pipelines compile a different floating-point program.
+#[cfg(any(target_os = "macos", test))]
+fn dense_k8_generic_from(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn dense_k8_generic() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        let value = std::env::var("CAMELID_GEMMA4_DENSE_K8_GENERIC").ok();
+        let enabled = dense_k8_generic_from(value.as_deref());
+        if enabled {
+            eprintln!(
+                "[gemma4 exact partition] CAMELID_GEMMA4_DENSE_K8_GENERIC=1 static_k8_dense=off runtime_k_dense=on"
+            );
+        }
+        enabled
+    })
+}
+
+#[cfg(test)]
+mod dense_k8_partition_tests {
+    use super::dense_k8_generic_from;
+
+    #[test]
+    fn exact_partition_dense_path_is_default_off_and_explicit() {
+        assert!(!dense_k8_generic_from(None));
+        for value in ["", "0", "false", "yes", " 1", "1 ", "junk"] {
+            assert!(!dense_k8_generic_from(Some(value)), "value={value:?}");
+        }
+        for value in ["1", "true", "TRUE"] {
+            assert!(dense_k8_generic_from(Some(value)), "value={value:?}");
+        }
+    }
+}
+
 /// CAMELID_GEMMA4_HEAD_SPEC50=0 falls back to the original batched tied-head
 /// kernels. The replacement is bitwise identical for K in 1..=8, so this is an
 /// A/B lever for timing, not a correctness switch.
@@ -20586,7 +20627,7 @@ fn encode_gemma4_q4_0_matmul_batch_k(
         return;
     }
 
-    if k_batch == 8 {
+    if k_batch == 8 && !dense_k8_generic() {
         if let Some(pipe) = &k.q4_0_block_batch_k8_pipeline {
             e.set_compute_pipeline_state(pipe);
             e.set_buffer(0, Some(y), 0);
@@ -20712,7 +20753,7 @@ fn encode_gemma4_q4_0_qkv_matmul_batch_k(
         return;
     }
 
-    if k_batch == 8 {
+    if k_batch == 8 && !dense_k8_generic() {
         if let Some(pipe) = &k.q4_0_qkv_block_batch_k8_pipeline {
             e.set_compute_pipeline_state(pipe);
             e.set_buffer(0, Some(y), 0);
@@ -20919,7 +20960,8 @@ fn encode_gemma4_q4_0_gateup_matmul_batch_k(
     // predicate and measured 18.302 -> 14.942 ms over all 30 K=8 layers. K<8
     // keeps its existing path until it has an independent timing receipt;
     // K>8 returned through spec50_widen above.
-    if spec50_packed_gateup_row_complete_eligible(rows, k_batch)
+    if !dense_k8_generic()
+        && spec50_packed_gateup_row_complete_eligible(rows, k_batch)
         && spec50_packed_gateup_row_complete_enabled()
     {
         if let Some(packed) = spec50_packed_gateup_kernels() {
@@ -20938,7 +20980,7 @@ fn encode_gemma4_q4_0_gateup_matmul_batch_k(
         }
     }
 
-    if k_batch == 8 {
+    if k_batch == 8 && !dense_k8_generic() {
         if let Some(pipe) = &k.q4_0_gateup_geglu_block_batch_k8_pipeline {
             e.set_compute_pipeline_state(pipe);
             e.set_buffer(0, Some(y), 0);
@@ -26720,7 +26762,7 @@ impl Gemma4GhostCommonMetal {
                 // block counts). Returns false unless k_batch == 8 with
                 // 4-aligned q/k/v row splits, in which case the reference
                 // kernel below runs unchanged.
-                let staged_qkv = !dense_v4_disabled() && {
+                let staged_qkv = !dense_k8_generic() && !dense_v4_disabled() && {
                     encode_gemma4_q4_0_qkv_matmul_batch_k_v4(
                         encoder,
                         kernel,

@@ -78,6 +78,8 @@ class Gate50TpsTests(unittest.TestCase):
             + "hybrid decode promotion policy: CAMELID_GEMMA4_GHOST_METAL_DECODE_PROMOTION "
             "effective=0 terminal_decode_promotion=off final_prefill_hot_handoff=on\n"
             + "[gemma4-mtp bootstrap] prefill_seed_attempted=1 used=1 fallback=none\n"
+            + "[gemma4 exact partition] CAMELID_GEMMA4_DENSE_K8_GENERIC=1 "
+            "static_k8_dense=off runtime_k_dense=on\n"
             + chain * 6,
             encoding="utf-8",
         )
@@ -113,6 +115,19 @@ class Gate50TpsTests(unittest.TestCase):
             response["camelid"]["generated_token_ids"][17] = 999
             response_path.write_text(json.dumps(response), encoding="utf-8")
             with self.assertRaisesRegex(gate.GateError, "target-authoritative K1 baseline"):
+                gate.analyze(response_path, log_path, expected_path)
+
+    def test_missing_partition_parity_marker_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            response_path, log_path, expected_path = self.fixture(Path(temporary))
+            log = log_path.read_text(encoding="utf-8")
+            log = log.replace(
+                "[gemma4 exact partition] CAMELID_GEMMA4_DENSE_K8_GENERIC=1 "
+                "static_k8_dense=off runtime_k_dense=on\n",
+                "",
+            )
+            log_path.write_text(log, encoding="utf-8")
+            with self.assertRaisesRegex(gate.GateError, "partition-parity"):
                 gate.analyze(response_path, log_path, expected_path)
 
 

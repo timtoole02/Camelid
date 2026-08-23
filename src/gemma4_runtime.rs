@@ -11609,30 +11609,36 @@ impl Gemma4Runtime {
         let mut seeded_hidden = None;
         if mtp_prefill_seed_bootstrap_enabled() {
             output.prefill_seed_bootstrap_attempted = true;
-            match prefill_seed {
-                Some(seed) => match validate_mtp_prefill_seed(
-                    &seed,
-                    self.pending_mtp_prefill_seed_nonce(),
-                    start_pos,
-                    &logits,
-                    self.config.embedding_length as usize,
-                ) {
-                    Ok(()) => {
-                        if self.consume_mtp_prefill_seed_nonce(seed.provenance_nonce) {
-                            output.prefill_seed_bootstrap_used = true;
-                            seeded_hidden = Some(seed.target_hidden_normalized);
-                        } else {
-                            output.prefill_seed_bootstrap_fallback_reason =
-                                Some("target_state_provenance_mismatch".to_string());
+            if !crate::metal::dense_k8_generic() {
+                output.prefill_seed_bootstrap_fallback_reason =
+                    Some("k8_partition_parity_not_enabled".to_string());
+            } else {
+                match prefill_seed {
+                    Some(seed) => match validate_mtp_prefill_seed(
+                        &seed,
+                        self.pending_mtp_prefill_seed_nonce(),
+                        start_pos,
+                        &logits,
+                        self.config.embedding_length as usize,
+                    ) {
+                        Ok(()) => {
+                            if self.consume_mtp_prefill_seed_nonce(seed.provenance_nonce) {
+                                output.prefill_seed_bootstrap_used = true;
+                                seeded_hidden = Some(seed.target_hidden_normalized);
+                            } else {
+                                output.prefill_seed_bootstrap_fallback_reason =
+                                    Some("target_state_provenance_mismatch".to_string());
+                            }
                         }
+                        Err(reason) => {
+                            output.prefill_seed_bootstrap_fallback_reason =
+                                Some(reason.to_string());
+                        }
+                    },
+                    None => {
+                        output.prefill_seed_bootstrap_fallback_reason =
+                            Some("seed_unavailable".to_string());
                     }
-                    Err(reason) => {
-                        output.prefill_seed_bootstrap_fallback_reason = Some(reason.to_string());
-                    }
-                },
-                None => {
-                    output.prefill_seed_bootstrap_fallback_reason =
-                        Some("seed_unavailable".to_string());
                 }
             }
             eprintln!(
