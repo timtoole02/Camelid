@@ -13411,8 +13411,7 @@ impl Gemma4Q4FileMappedExpertSource {
             || end > mmap.mapped_len()
             || !(base as usize).is_multiple_of(crate::wire_mmap::page_size())
             || !GEMMA4_Q4_EXPERT_SLOT_STRIDE.is_multiple_of(crate::wire_mmap::page_size())
-            || kernel.device.argument_buffers_support()
-                != metal::MTLArgumentBuffersTier::Tier2
+            || kernel.device.argument_buffers_support() != metal::MTLArgumentBuffersTier::Tier2
             || GEMMA4_Q4_EXPERT_SLOT_STRIDE > kernel.device.max_buffer_length() as usize
         {
             return None;
@@ -13472,11 +13471,7 @@ impl Gemma4Q4HybridExpertSource {
         if !(1..=128).contains(&hot_slot_count) {
             return None;
         }
-        let mapped = Gemma4Q4FileMappedExpertSource::new(
-            mmap,
-            layer_offset,
-            mapped_span_bytes,
-        )?;
+        let mapped = Gemma4Q4FileMappedExpertSource::new(mmap, layer_offset, mapped_span_bytes)?;
         let kernel = metal_linear_kernel()?;
         let mut hot_records = Vec::with_capacity(hot_slot_count);
         let mut addresses = std::collections::HashSet::with_capacity(hot_slot_count);
@@ -13507,9 +13502,7 @@ impl Gemma4Q4HybridExpertSource {
     }
 
     fn refill_available(&self) -> bool {
-        self.lease_state
-            .load(std::sync::atomic::Ordering::Acquire)
-            == 0
+        self.lease_state.load(std::sync::atomic::Ordering::Acquire) == 0
     }
 
     fn try_begin_refill(&self) -> Option<Gemma4Q4HybridRefillGuard<'_>> {
@@ -13651,9 +13644,7 @@ impl Gemma4Q4HybridRefillGuard<'_> {
         // SAFETY: the exclusive refill state prevents any GPU table from
         // referencing hot records. Runtime plans assign pairwise-disjoint
         // physical slots, and this mutable guard serializes the publication.
-        Some(unsafe {
-            std::slice::from_raw_parts_mut(pointer, GEMMA4_Q4_EXPERT_RECORD_BYTES)
-        })
+        Some(unsafe { std::slice::from_raw_parts_mut(pointer, GEMMA4_Q4_EXPERT_RECORD_BYTES) })
     }
 
     pub(crate) fn publish_hot_slot_ids(&mut self, hot_slot_ids: &[Option<usize>]) -> bool {
@@ -13809,9 +13800,7 @@ impl Gemma4Q4ExpertSlotBinding {
     fn materialize_for_active_slots(&self, active_slots: &[usize]) -> Option<Self> {
         match self {
             Self::Monolithic(buffer) => Some(Self::Monolithic(buffer.clone())),
-            Self::RecordGranular(table) => {
-                Some(Self::RecordGranular(std::sync::Arc::clone(table)))
-            }
+            Self::RecordGranular(table) => Some(Self::RecordGranular(std::sync::Arc::clone(table))),
             Self::FileMappedSource(source) => source
                 .materialize_for_active_slots(active_slots)
                 .map(|table| Self::RecordGranular(std::sync::Arc::new(table))),
@@ -13829,7 +13818,10 @@ impl Gemma4Q4ExpertSlotBinding {
     }
 
     fn is_file_mapped_source(&self) -> bool {
-        matches!(self, Self::FileMappedSource(_) | Self::HybridMappedSource(_))
+        matches!(
+            self,
+            Self::FileMappedSource(_) | Self::HybridMappedSource(_)
+        )
     }
 }
 
@@ -13949,8 +13941,7 @@ impl Gemma4Q4ExpertSlots {
         byte_len: usize,
         hot_slot_count: usize,
     ) -> Option<Self> {
-        let source =
-            Gemma4Q4HybridExpertSource::new(mmap, offset, byte_len, hot_slot_count)?;
+        let source = Gemma4Q4HybridExpertSource::new(mmap, offset, byte_len, hot_slot_count)?;
         if source.hot_slot_count() != hot_slot_count
             || source.mapped.addressable_slot_count() != 128
         {
@@ -14177,8 +14168,7 @@ impl Gemma4Q4ExpertSlots {
 
     #[cfg(test)]
     fn hybrid_published_hot_slot_ids(&self) -> Option<Vec<Option<usize>>> {
-        let Gemma4Q4ExpertSlotBacking::HybridMappedRecordGranular { source } = &self.backing
-        else {
+        let Gemma4Q4ExpertSlotBacking::HybridMappedRecordGranular { source } = &self.backing else {
             return None;
         };
         source.hot_slot_ids.read().ok().map(|ids| ids.clone())
@@ -14694,8 +14684,7 @@ impl Gemma4Q4ExpertMetal {
             .unwrap_or(&kernel.gemma4_q4_expert_down_reduce_pipeline);
         if let Some(table) = slot_binding.record_table() {
             if active_slots.is_empty()
-                || table.declare_active_slots(encoder, active_slots)
-                    != Some(active_slots.len())
+                || table.declare_active_slots(encoder, active_slots) != Some(active_slots.len())
             {
                 return false;
             }
@@ -14869,13 +14858,7 @@ impl Gemma4Q4ExpertMetal {
             GEMMA4_Q4_EXPERT_ROUTES * GEMMA4_Q4_EXPERT_ACT_BLOCKS,
         );
 
-        if !self.encode_down_reduce(
-            encoder,
-            kernel,
-            &slot_binding,
-            &active_slots,
-            simd_fast,
-        ) {
+        if !self.encode_down_reduce(encoder, kernel, &slot_binding, &active_slots, simd_fast) {
             encoder.end_encoding();
             return None;
         }
@@ -14968,13 +14951,7 @@ impl Gemma4Q4ExpertMetal {
 
         let down_command = kernel.queue.new_command_buffer();
         let down_encoder = down_command.new_compute_command_encoder();
-        if !self.encode_down_reduce(
-            down_encoder,
-            kernel,
-            &slot_binding,
-            &active_slots,
-            false,
-        ) {
+        if !self.encode_down_reduce(down_encoder, kernel, &slot_binding, &active_slots, false) {
             down_encoder.end_encoding();
             return None;
         }
@@ -23751,13 +23728,20 @@ pub struct ChainedRoundHostLedger {
     pub mapped_bound_records: u32,
     pub hot_bound_per_layer: [u16; 30],
     pub mapped_bound_per_layer: [u16; 30],
-    /// Selected-cold file ranges accepted by the asynchronous pager-advice
-    /// queue. Bytes are exact expert payload ranges, never layer slabs. Enqueue
-    /// time is nested inside `slot_filler_ms`; advisory completion is never
-    /// awaited by the chained round.
+    /// Current-routing selected-cold file ranges accepted by the asynchronous
+    /// pager-advice queue. Bytes are exact expert payload ranges, never layer
+    /// slabs. Enqueue time is nested inside `slot_filler_ms`; advisory
+    /// completion is never awaited by the chained round.
     pub mapped_readahead_advised_records: u32,
     pub mapped_readahead_advised_bytes: u64,
     pub mapped_readahead_enqueue_us: u64,
+    /// Advice dispatched before the assistant from the previous successful
+    /// target round's exact routed union and carried into this verifier's
+    /// receipt. It is separate from current-routing advice above and is never
+    /// awaited or used to declare an expert binding.
+    pub mapped_readahead_previous_union_advised_records: u32,
+    pub mapped_readahead_previous_union_advised_bytes: u64,
+    pub mapped_readahead_previous_union_enqueue_us: u64,
     pub kv_capacity: u32,
     pub kv_bytes: u64,
     pub kv_filled: u32,
@@ -26602,7 +26586,9 @@ impl Gemma4GhostCommonMetal {
                     .min(128)
                     .max(1);
                 let default_pred: Vec<usize> = (0..num_slots_fill).collect();
-                let pred = if layer_idx < predicted_unions.len() && !predicted_unions[layer_idx].is_empty() {
+                let pred = if layer_idx < predicted_unions.len()
+                    && !predicted_unions[layer_idx].is_empty()
+                {
                     &predicted_unions[layer_idx]
                 } else {
                     &default_pred
@@ -26717,10 +26703,7 @@ impl Gemma4GhostCommonMetal {
         // encode-timing reorder only (see `overlap_enabled`). Excluded under
         // stage profiling (which owns command-buffer boundaries) and layer
         // dumps (which wait mid-layer on the ambient command buffer).
-        let overlap_round = !record_demand
-            && overlap_enabled()
-            && !stage_profile
-            && !dump_layers;
+        let overlap_round = !record_demand && overlap_enabled() && !stage_profile && !dump_layers;
         macro_rules! begin_gpu_stage {
             ($stage:expr) => {{
                 if stage_profile {
@@ -27836,7 +27819,8 @@ impl Gemma4GhostCommonMetal {
                         let allow_drop = std::env::var("CAMELID_GEMMA4_ALLOW_DROPPED_EXPERTS")
                             .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
                         if !allow_drop {
-                            if let Some(expert) = wave_slots_ready(&updated_slots, wave0, num_slots) {
+                            if let Some(expert) = wave_slots_ready(&updated_slots, wave0, num_slots)
+                            {
                                 eprintln!(
                                     "[metal chained round] layer {layer_idx} wave 0 missing slot for selected expert {expert}; refusing fail-close"
                                 );
@@ -28000,7 +27984,8 @@ impl Gemma4GhostCommonMetal {
                         let allow_drop = std::env::var("CAMELID_GEMMA4_ALLOW_DROPPED_EXPERTS")
                             .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
                         if !allow_drop {
-                            if let Some(expert) = wave_slots_ready(&updated_slots, wave, num_slots) {
+                            if let Some(expert) = wave_slots_ready(&updated_slots, wave, num_slots)
+                            {
                                 eprintln!(
                                     "[metal chained round] layer {layer_idx} wave {wi} missing slot for selected expert {expert}; refusing fail-close"
                                 );
@@ -28102,14 +28087,12 @@ impl Gemma4GhostCommonMetal {
                                 .mapped_bound_records
                                 .saturating_add(mapped_bound.min(u32::MAX as usize) as u32);
                             if let Some(value) = ledger.hot_bound_per_layer.get_mut(layer_idx) {
-                                *value = value.saturating_add(
-                                    hot_bound.min(u16::MAX as usize) as u16,
-                                );
+                                *value =
+                                    value.saturating_add(hot_bound.min(u16::MAX as usize) as u16);
                             }
                             if let Some(value) = ledger.mapped_bound_per_layer.get_mut(layer_idx) {
-                                *value = value.saturating_add(
-                                    mapped_bound.min(u16::MAX as usize) as u16,
-                                );
+                                *value = value
+                                    .saturating_add(mapped_bound.min(u16::MAX as usize) as u16);
                             }
                         }
 
@@ -28594,8 +28577,7 @@ impl Gemma4GhostCommonMetal {
                 stamp.push_current(cmd_buf);
                 cmd_buf.commit();
                 for binding in live_mapped_bindings.drain(..) {
-                    mapped_binding_guards
-                        .push(Gemma4Q4MappedBindingGuard::new(cmd_buf, binding));
+                    mapped_binding_guards.push(Gemma4Q4MappedBindingGuard::new(cmd_buf, binding));
                 }
                 last_committed_cb = Some(cmd_buf.to_owned());
                 cb_closed = true;
@@ -44817,8 +44799,8 @@ kernel void sample_active_expert_records(
         file.as_file()
             .set_len(span as u64)
             .expect("size sparse mapped cold tier");
-        let mmap = crate::wire_mmap::GgufWireMmap::map(file.path())
-            .expect("map sparse hybrid cold tier");
+        let mmap =
+            crate::wire_mmap::GgufWireMmap::map(file.path()).expect("map sparse hybrid cold tier");
         let mut slots = Gemma4Q4ExpertSlots::new_hybrid_mapped_record_granular(mmap, 0, span)
             .expect("exact hybrid backing");
 
@@ -44854,7 +44836,9 @@ kernel void sample_active_expert_records(
         // An abandoned transaction must invalidate the old identity before
         // its first mutation, leaving the modified record unreachable.
         {
-            let mut refill = slots.begin_hybrid_refill().expect("refill after terminal drop");
+            let mut refill = slots
+                .begin_hybrid_refill()
+                .expect("refill after terminal drop");
             refill.slot_bytes_mut(0).expect("hot record")[0] = 0xa5;
         }
         assert_eq!(
@@ -45037,8 +45021,7 @@ kernel void sample_active_expert_records(
         let mut head = Gemma4Q4ExpertMetal::new().expect("HEAD expert executor");
         let active_slots = (0..active_per_layer).collect::<Vec<_>>();
         let logical_capacity = layers.len() * LOGICAL_SLOTS * GEMMA4_Q4_EXPERT_SLOT_STRIDE;
-        let allocated_capacity =
-            layers.len() * PHYSICAL_TABLE_SLOTS * GEMMA4_Q4_EXPERT_SLOT_STRIDE;
+        let allocated_capacity = layers.len() * PHYSICAL_TABLE_SLOTS * GEMMA4_Q4_EXPERT_SLOT_STRIDE;
         let table_bound_capacity =
             layers.len() * PHYSICAL_TABLE_SLOTS * GEMMA4_Q4_EXPERT_SLOT_STRIDE;
         let filled_payload = layers.len() * active_per_layer * GEMMA4_Q4_EXPERT_RECORD_BYTES;
