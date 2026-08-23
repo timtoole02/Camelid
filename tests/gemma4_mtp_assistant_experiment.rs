@@ -544,14 +544,14 @@ fn exact_target_environment() -> BTreeMap<String, String> {
         ("CAMELID_GEMMA4_GHOST_METAL_COMMON", "1"),
         ("CAMELID_GEMMA4_GHOST_METAL_CONTEXT", "1024"),
         ("CAMELID_GEMMA4_GHOST_METAL_HEAD_RESIDENT", "0"),
-        // Hybrid clean-pager profile: 48 pageable anonymous records cache the
+        // Hybrid clean-pager profile: 32 pageable anonymous records cache the
         // hot set while all 128 canonical IDs remain addressable through the
         // retained read-only mapping. No legacy physical-prefix knob may
         // silently redefine either namespace.
         ("CAMELID_GEMMA4_GHOST_READ_THREADS", "1"),
         ("CAMELID_GEMMA4_GHOST_METAL_DEMAND_LOAD_ONLY", "1"),
         ("CAMELID_GEMMA4_GHOST_METAL_FILE_MAPPED_EXPERTS", "1"),
-        ("CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS", "48"),
+        ("CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS", "32"),
         // The initial hybrid receipt is deliberately pageable. Pinned hot
         // records are a separate experiment and must not reuse this profile.
         ("CAMELID_GEMMA4_SLOT_PIN", "0"),
@@ -2198,13 +2198,13 @@ fn load_only_hybrid_expert_capacity_ready(
 ) -> bool {
     // Serialized Gemma 4 routed-record geometry: 3,345,408-byte payload
     // rounded up to the existing 16 KiB slot boundary. The anonymous hot
-    // tier owns exactly 48 records/layer while the clean mapped tier keeps
+    // tier owns exactly 32 records/layer while the clean mapped tier keeps
     // all 128 canonical expert IDs addressable.
     let stride = 3_358_720u64;
     ledger.expert_slots_active
         && ledger.expert_layer_count == 30
         && ledger.expert_logical_slot_count == ledger.expert_layer_count.saturating_mul(128)
-        && ledger.expert_slot_count == ledger.expert_layer_count.saturating_mul(48)
+        && ledger.expert_slot_count == ledger.expert_layer_count.saturating_mul(32)
         && ledger.expert_slot_capacity_bytes == ledger.expert_slot_count.saturating_mul(stride)
         && ledger.expert_file_mapped_slot_count
             == ledger.expert_layer_count.saturating_mul(128)
@@ -2215,7 +2215,7 @@ fn load_only_hybrid_expert_capacity_ready(
         && ledger.cghost_logical_bytes >= ledger.expert_file_mapped_address_span_bytes
         && ledger.cghost_mapped_bytes >= ledger.expert_file_mapped_address_span_bytes
         && ledger.expert_table_directory_slot_count
-            == ledger.expert_layer_count.saturating_mul(48)
+            == ledger.expert_layer_count.saturating_mul(32)
         && ledger.expert_table_directory_capacity_bytes
             == ledger
                 .expert_table_directory_slot_count
@@ -3824,7 +3824,7 @@ fn validate_exact_target_hybrid_experts(
 ) -> Result<(), String> {
     const LAYERS: u64 = 30;
     const CANONICAL_SLOTS_PER_LAYER: u64 = 128;
-    const HOT_SLOTS_PER_LAYER: u64 = 48;
+    const HOT_SLOTS_PER_LAYER: u64 = 32;
     const RECORD_BYTES: u64 = 3_345_408;
     const STRIDE_BYTES: u64 = 3_358_720;
     if snapshot.per_layer.len() != LAYERS as usize
@@ -3843,7 +3843,7 @@ fn validate_exact_target_hybrid_experts(
         })
     {
         return Err(
-            "target routed-expert receipt did not preserve 128 canonical / 48 anonymous-hot / 128 mapped-cold records per layer".into(),
+            "target routed-expert receipt did not preserve 128 canonical / 32 anonymous-hot / 128 mapped-cold records per layer".into(),
         );
     }
     if u64::from(snapshot.layer_count) != LAYERS
@@ -6208,7 +6208,7 @@ fn execute_lane_child(request: &ChildLaneRequest) -> Result<ChildLaneResult, Str
     );
     child_try!(
         validate_exact_target_hybrid_experts(&target_warm_experts),
-        "bind exact 128-canonical/48-hot/mapped-cold expert residency"
+        "bind exact 128-canonical/32-hot/mapped-cold expert residency"
     );
     routed_experts_after_target_warm = Some(target_warm_experts);
     child_try!(
@@ -7171,27 +7171,27 @@ mod pure_tests {
             slot_stride_bytes: 128,
             base_slot_capacity: 128,
             base_slot_capacity_bytes: 128 * 128,
-            anonymous_slot_capacity: 48,
-            anonymous_slot_capacity_bytes: 48 * 128,
-            physical_base_slot_budget: 48,
-            physical_base_slot_budget_bytes: 48 * 128,
+            anonymous_slot_capacity: 32,
+            anonymous_slot_capacity_bytes: 32 * 128,
+            physical_base_slot_budget: 32,
+            physical_base_slot_budget_bytes: 32 * 128,
             file_mapped_addressable_slots: 128,
             file_mapped_address_span_bytes: 128 * 128,
-            occupied_base_slots: 48,
-            occupied_base_payload_bytes: 48 * 100,
-            occupied_base_touched_bytes: 48 * 128,
+            occupied_base_slots: 32,
+            occupied_base_payload_bytes: 32 * 100,
+            occupied_base_touched_bytes: 32 * 128,
             per_layer: vec![Gemma4RoutedExpertLayerResidencySnapshot {
                 layer_index: 0,
                 base_slot_capacity: 128,
-                anonymous_slot_capacity: 48,
-                anonymous_slot_capacity_bytes: 48 * 128,
-                physical_base_slot_budget: 48,
-                physical_base_slot_budget_bytes: 48 * 128,
+                anonymous_slot_capacity: 32,
+                anonymous_slot_capacity_bytes: 32 * 128,
+                physical_base_slot_budget: 32,
+                physical_base_slot_budget_bytes: 32 * 128,
                 file_mapped_addressable_slots: 128,
                 file_mapped_address_span_bytes: 128 * 128,
-                occupied_base_slots: 48,
-                occupied_base_payload_bytes: 48 * 100,
-                occupied_base_touched_bytes: 48 * 128,
+                occupied_base_slots: 32,
+                occupied_base_payload_bytes: 32 * 100,
+                occupied_base_touched_bytes: 32 * 128,
                 slot_stats: stats.clone(),
             }],
             aggregate_slot_stats: stats,
@@ -7227,7 +7227,7 @@ mod pure_tests {
         };
         const LAYERS: usize = 30;
         const CANONICAL: u64 = 128;
-        const HOT: u64 = 48;
+        const HOT: u64 = 32;
         const RECORD: u64 = 3_345_408;
         const STRIDE: u64 = 3_358_720;
         let per_layer = (0..LAYERS)
@@ -7294,8 +7294,8 @@ mod pure_tests {
     }
 
     #[test]
-    fn hybrid_chained_49_to_64_union_is_hot_plus_mapped_not_overflow() {
-        for (unique, hot, mapped) in [(49, 48, 1), (64, 48, 16)] {
+    fn hybrid_chained_33_to_64_union_is_hot_plus_mapped_not_overflow() {
+        for (unique, hot, mapped) in [(33, 32, 1), (64, 32, 32)] {
             let receipt = hybrid_chained_snapshot(unique, hot, mapped);
             assert!(
                 validate_routed_expert_snapshot("hybrid spill", &receipt).is_ok(),
@@ -7324,7 +7324,7 @@ mod pure_tests {
         let impossible_hot = hybrid_chained_snapshot(64, 64, 0);
         assert!(validate_routed_expert_snapshot("hybrid hot overflow", &impossible_hot).is_err());
 
-        let mut malformed_bytes = hybrid_chained_snapshot(49, 47, 2);
+        let mut malformed_bytes = hybrid_chained_snapshot(33, 31, 2);
         malformed_bytes.last_chained_demand_loads = 1;
         malformed_bytes.last_chained_demand_read_bytes = 99;
         malformed_bytes.cumulative_chained_demand_loads = 1;
@@ -7362,8 +7362,8 @@ mod pure_tests {
         assert!(validate_routed_expert_snapshot("hybrid no round", &no_round_io).is_err());
 
         let mut wrong_capacity = clean.clone();
-        wrong_capacity.per_layer[0].physical_base_slot_budget = 49;
-        wrong_capacity.per_layer[0].physical_base_slot_budget_bytes = 49 * 3_358_720;
+        wrong_capacity.per_layer[0].physical_base_slot_budget = 33;
+        wrong_capacity.per_layer[0].physical_base_slot_budget_bytes = 33 * 3_358_720;
         wrong_capacity.physical_base_slot_budget += 1;
         wrong_capacity.physical_base_slot_budget_bytes += 3_358_720;
         assert!(validate_routed_expert_snapshot("hybrid wrong capacity", &wrong_capacity).is_ok());
@@ -7382,22 +7382,22 @@ mod pure_tests {
         promoted.last_chained_round_succeeded = true;
         promoted.last_chained_round_sequence = 1;
         promoted.last_chained_k = Some(8);
-        promoted.last_chained_unique_per_layer[0] = 49;
-        promoted.last_chained_unique_experts_sum = 49;
-        promoted.last_chained_unique_experts_max = 49;
-        promoted.last_chained_hot_bound_per_layer[0] = 47;
+        promoted.last_chained_unique_per_layer[0] = 33;
+        promoted.last_chained_unique_experts_sum = 33;
+        promoted.last_chained_unique_experts_max = 33;
+        promoted.last_chained_hot_bound_per_layer[0] = 31;
         promoted.last_chained_mapped_bound_per_layer[0] = 2;
-        promoted.last_chained_hot_bound_records = 47;
+        promoted.last_chained_hot_bound_records = 31;
         promoted.last_chained_mapped_bound_records = 2;
-        promoted.last_chained_slot_hits = 47;
+        promoted.last_chained_slot_hits = 31;
         promoted.last_chained_slot_misses = 2;
         promoted.last_chained_demand_loads = 1;
         promoted.last_chained_demand_read_bytes = 3_345_408;
         promoted.cumulative_chained_demand_loads = 1;
         promoted.cumulative_chained_demand_read_bytes = 3_345_408;
         promoted.cumulative_expert_payload_read_bytes = 3_345_408;
-        promoted.aggregate_slot_stats.route_lookups = 49;
-        promoted.aggregate_slot_stats.hits = 47;
+        promoted.aggregate_slot_stats.route_lookups = 33;
+        promoted.aggregate_slot_stats.hits = 31;
         promoted.aggregate_slot_stats.misses = 2;
         promoted.per_layer[0].slot_stats = promoted.aggregate_slot_stats.clone();
         assert!(validate_routed_expert_snapshot("hybrid promoted", &promoted).is_ok());
@@ -7460,7 +7460,7 @@ mod pure_tests {
         use camelid::gemma4_runtime::Gemma4GhostLoadAllocationLedger;
         const LAYERS: u64 = 30;
         const CANONICAL: u64 = 128;
-        const HOT: u64 = 48;
+        const HOT: u64 = 32;
         const STRIDE: u64 = 3_358_720;
         let mut ledger = Gemma4GhostLoadAllocationLedger {
             cghost_logical_bytes: LAYERS * CANONICAL * STRIDE,
@@ -7613,7 +7613,7 @@ mod pure_tests {
         );
         assert_eq!(
             config.environment["CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS"],
-            "48"
+            "32"
         );
         assert_eq!(config.environment["CAMELID_GEMMA4_SLOT_PIN"], "0");
         assert!(!config
@@ -7633,14 +7633,17 @@ mod pure_tests {
         assert_eq!(config.environment["CAMELID_GEMMA4_SPEC_CHUNK_MAX"], "8");
         assert_eq!(config.environment["CAMELID_GEMMA4_SPEC_DRAFT_TOKENS"], "8");
 
-        let mut drifted = config.clone();
-        drifted
-            .environment
-            .insert("CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS".into(), "048".into());
-        assert!(drifted
-            .validate()
-            .unwrap_err()
-            .contains("CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS"));
+        for invalid in ["032", "48"] {
+            let mut drifted = config.clone();
+            drifted.environment.insert(
+                "CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS".into(),
+                invalid.into(),
+            );
+            assert!(drifted
+                .validate()
+                .unwrap_err()
+                .contains("CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS"));
+        }
 
         for legacy_key in [
             "CAMELID_GEMMA4_GHOST_METAL_SLOTS_PER_LAYER",
@@ -7650,7 +7653,7 @@ mod pure_tests {
             let mut legacy_geometry = config.clone();
             legacy_geometry
                 .environment
-                .insert(legacy_key.into(), "48".into());
+                .insert(legacy_key.into(), "32".into());
             assert!(
                 legacy_geometry
                     .validate()
