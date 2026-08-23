@@ -281,6 +281,229 @@ kernel void spec50_moe_argbuf_gateup_geglu_quant_batch_k8(
     }
 }
 
+// Exact low-register-pressure K<=8 twin. One threadgroup owns one
+// (unique expert, candidate, 32-row block), so each lane keeps only the gate
+// and up accumulator for that candidate live. Candidate-local arithmetic and
+// accumulation order are identical to the shipping K8 kernel; only the grid
+// partition changes. Inactive (expert, candidate) pairs return before touching
+// expert pages. This deliberately trades repeated warm weight reads for lower
+// register pressure. It remains benchmark-only because the M4 result did not
+// beat the current K8 kernel materially.
+kernel void spec50_moe_argbuf_gateup_geglu_quant_batch_k8_candidate(
+    device const float* input_scales [[buffer(0)]],
+    device const char* input_quants [[buffer(1)]],
+    device Gemma4ExpertPointerTable& expert_table [[buffer(2)]],
+    device const Gemma4UniqueExpertWork* work_list [[buffer(3)]],
+    device float* output_scales [[buffer(4)]],
+    device char* output_quants [[buffer(5)]],
+    constant uint& num_unique_experts [[buffer(6)]],
+    constant uint& k_candidates [[buffer(7)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    if (k_candidates == 0u || k_candidates > 8u) return;
+    const uint b = group % G4Q4_DOWN_BLOCKS;
+    const uint pair = group / G4Q4_DOWN_BLOCKS;
+    const uint t = pair % k_candidates;
+    const uint u = pair / k_candidates;
+    if (u >= num_unique_experts) return;
+
+    const Gemma4UniqueExpertWork work = work_list[u];
+    if ((work.candidate_mask & (1ULL << t)) == 0ULL) return;
+
+    const uint expert_id = work.expert_weight_offset / G4Q4_SLOT_STRIDE;
+    device const uchar* weights = expert_table.records[expert_id];
+    const uint row = b * 32u + lane;
+    device const uchar* gate_row = weights + ulong(row) * G4Q4_GU_ROW_BYTES;
+    device const uchar* up_row = weights + ulong(row + G4Q4_FF) * G4Q4_GU_ROW_BYTES;
+
+    float gate_acc = 0.0f;
+    float up_acc = 0.0f;
+    for (uint gb = 0; gb < G4Q4_GU_BLOCKS; ++gb) {
+        device const uchar* b_gate = gate_row + ulong(gb) * G4Q4_WIRE;
+        device const uchar* b_up = up_row + ulong(gb) * G4Q4_WIRE;
+        const float w_scale_gate = float(*reinterpret_cast<device const half*>(b_gate));
+        const float w_scale_up = float(*reinterpret_cast<device const half*>(b_up));
+
+        device const packed_uchar4* pg4 =
+            reinterpret_cast<device const packed_uchar4*>(b_gate + 2);
+        device const packed_uchar4* pu4 =
+            reinterpret_cast<device const packed_uchar4*>(b_up + 2);
+
+        uchar4 rg[4], ru[4];
+        #pragma unroll
+        for (uint k = 0; k < 4; ++k) {
+            rg[k] = uchar4(pg4[k]);
+            ru[k] = uchar4(pu4[k]);
+        }
+
+        device const char* x =
+            input_quants + ulong(t) * G4Q4_HIDDEN + ulong(gb) * 32ul;
+        device const char4* xlo4 = reinterpret_cast<device const char4*>(x);
+        device const char4* xhi4 = reinterpret_cast<device const char4*>(x + 16);
+        const float in_scale = input_scales[ulong(t) * G4Q4_GU_BLOCKS + gb];
+
+        int4 ag = int4(0);
+        int4 au = int4(0);
+        #pragma unroll
+        for (uint k = 0; k < 4; ++k) {
+            const int4 xl = int4(xlo4[k]);
+            const int4 xh = int4(xhi4[k]);
+            ag += (int4(rg[k] & uchar4(0x0f)) - 8) * xl
+                + (int4(rg[k] >> 4) - 8) * xh;
+            au += (int4(ru[k] & uchar4(0x0f)) - 8) * xl
+                + (int4(ru[k] >> 4) - 8) * xh;
+        }
+        const int isum_gate = (ag.x + ag.y) + (ag.z + ag.w);
+        const int isum_up = (au.x + au.y) + (au.z + au.w);
+
+        gate_acc += (float(isum_gate) * w_scale_gate) * in_scale;
+        up_acc += (float(isum_up) * w_scale_up) * in_scale;
+    }
+
+    const float gate = gate_acc;
+    const float up = up_acc;
+    const float inner = 0.7978845608f * (gate + 0.044715f * gate * gate * gate);
+    const float gelu = 0.5f * gate * (1.0f + tanh(clamp(inner, -15.0f, 15.0f)));
+    const float act_val = gelu * up;
+
+    const float max_abs = simd_max(fabs(act_val));
+    const float unrounded = max_abs / 127.0f;
+    const float stored_scale = float(half(unrounded));
+    const float inverse = unrounded == 0.0f ? 0.0f : 1.0f / unrounded;
+
+    if (lane == 0) {
+        const ulong scale_idx = ulong(u) * ulong(k_candidates) * G4Q4_DOWN_BLOCKS
+            + ulong(t) * G4Q4_DOWN_BLOCKS + ulong(b);
+        output_scales[scale_idx] = stored_scale;
+    }
+
+    const int q = clamp(int(round(act_val * inverse)), -127, 127);
+    const ulong quant_idx = ulong(u) * ulong(k_candidates) * G4Q4_FF
+        + ulong(t) * G4Q4_FF + ulong(row);
+    output_quants[quant_idx] = char(q);
+}
+
+// Exact four-candidate tiled twin. Compared with the current K8 kernel, each
+// lane keeps eight rather than sixteen floating accumulators live. Compared
+// with the one-candidate twin, it reuses each resident weight row across up to
+// four candidates. Candidate-local accumulation order remains unchanged.
+kernel void spec50_moe_argbuf_gateup_geglu_quant_batch_k8_tile4(
+    device const float* input_scales [[buffer(0)]],
+    device const char* input_quants [[buffer(1)]],
+    device Gemma4ExpertPointerTable& expert_table [[buffer(2)]],
+    device const Gemma4UniqueExpertWork* work_list [[buffer(3)]],
+    device float* output_scales [[buffer(4)]],
+    device char* output_quants [[buffer(5)]],
+    constant uint& num_unique_experts [[buffer(6)]],
+    constant uint& k_candidates [[buffer(7)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    if (k_candidates == 0u || k_candidates > 8u) return;
+    const uint tiles = (k_candidates + 3u) / 4u;
+    const uint b = group % G4Q4_DOWN_BLOCKS;
+    const uint packed = group / G4Q4_DOWN_BLOCKS;
+    const uint tile = packed % tiles;
+    const uint u = packed / tiles;
+    if (u >= num_unique_experts) return;
+
+    const Gemma4UniqueExpertWork work = work_list[u];
+    const uint first_t = tile * 4u;
+    const ulong tile_mask = 0xFULL << first_t;
+    if ((work.candidate_mask & tile_mask) == 0ULL) return;
+
+    const uint expert_id = work.expert_weight_offset / G4Q4_SLOT_STRIDE;
+    device const uchar* weights = expert_table.records[expert_id];
+    const uint row = b * 32u + lane;
+    device const uchar* gate_row = weights + ulong(row) * G4Q4_GU_ROW_BYTES;
+    device const uchar* up_row = weights + ulong(row + G4Q4_FF) * G4Q4_GU_ROW_BYTES;
+
+    float gate_acc[4];
+    float up_acc[4];
+    #pragma unroll
+    for (uint local_t = 0; local_t < 4; ++local_t) {
+        gate_acc[local_t] = 0.0f;
+        up_acc[local_t] = 0.0f;
+    }
+
+    for (uint gb = 0; gb < G4Q4_GU_BLOCKS; ++gb) {
+        device const uchar* b_gate = gate_row + ulong(gb) * G4Q4_WIRE;
+        device const uchar* b_up = up_row + ulong(gb) * G4Q4_WIRE;
+        const float w_scale_gate = float(*reinterpret_cast<device const half*>(b_gate));
+        const float w_scale_up = float(*reinterpret_cast<device const half*>(b_up));
+
+        device const packed_uchar4* pg4 =
+            reinterpret_cast<device const packed_uchar4*>(b_gate + 2);
+        device const packed_uchar4* pu4 =
+            reinterpret_cast<device const packed_uchar4*>(b_up + 2);
+
+        uchar4 rg[4], ru[4];
+        #pragma unroll
+        for (uint k = 0; k < 4; ++k) {
+            rg[k] = uchar4(pg4[k]);
+            ru[k] = uchar4(pu4[k]);
+        }
+
+        #pragma unroll
+        for (uint local_t = 0; local_t < 4; ++local_t) {
+            const uint t = first_t + local_t;
+            if (t >= k_candidates) continue;
+            if ((work.candidate_mask & (1ULL << t)) == 0ULL) continue;
+            device const char* x =
+                input_quants + ulong(t) * G4Q4_HIDDEN + ulong(gb) * 32ul;
+            device const char4* xlo4 = reinterpret_cast<device const char4*>(x);
+            device const char4* xhi4 = reinterpret_cast<device const char4*>(x + 16);
+            const float in_scale = input_scales[ulong(t) * G4Q4_GU_BLOCKS + gb];
+
+            int4 ag = int4(0);
+            int4 au = int4(0);
+            #pragma unroll
+            for (uint k = 0; k < 4; ++k) {
+                const int4 xl = int4(xlo4[k]);
+                const int4 xh = int4(xhi4[k]);
+                ag += (int4(rg[k] & uchar4(0x0f)) - 8) * xl
+                    + (int4(rg[k] >> 4) - 8) * xh;
+                au += (int4(ru[k] & uchar4(0x0f)) - 8) * xl
+                    + (int4(ru[k] >> 4) - 8) * xh;
+            }
+            const int isum_gate = (ag.x + ag.y) + (ag.z + ag.w);
+            const int isum_up = (au.x + au.y) + (au.z + au.w);
+
+            gate_acc[local_t] += (float(isum_gate) * w_scale_gate) * in_scale;
+            up_acc[local_t] += (float(isum_up) * w_scale_up) * in_scale;
+        }
+    }
+
+    #pragma unroll
+    for (uint local_t = 0; local_t < 4; ++local_t) {
+        const uint t = first_t + local_t;
+        if (t >= k_candidates) continue;
+        if ((work.candidate_mask & (1ULL << t)) == 0ULL) continue;
+        const float gate = gate_acc[local_t];
+        const float up = up_acc[local_t];
+        const float inner = 0.7978845608f * (gate + 0.044715f * gate * gate * gate);
+        const float gelu = 0.5f * gate * (1.0f + tanh(clamp(inner, -15.0f, 15.0f)));
+        const float act_val = gelu * up;
+
+        const float max_abs = simd_max(fabs(act_val));
+        const float unrounded = max_abs / 127.0f;
+        const float stored_scale = float(half(unrounded));
+        const float inverse = unrounded == 0.0f ? 0.0f : 1.0f / unrounded;
+
+        if (lane == 0) {
+            const ulong scale_idx = ulong(u) * ulong(k_candidates) * G4Q4_DOWN_BLOCKS
+                + ulong(t) * G4Q4_DOWN_BLOCKS + ulong(b);
+            output_scales[scale_idx] = stored_scale;
+        }
+
+        const int q = clamp(int(round(act_val * inverse)), -127, 127);
+        const ulong quant_idx = ulong(u) * ulong(k_candidates) * G4Q4_FF
+            + ulong(t) * G4Q4_FF + ulong(row);
+        output_quants[quant_idx] = char(q);
+    }
+}
+
 kernel void spec50_moe_argbuf_down_union_batch_k(
     device const float* act_scales [[buffer(0)]],
     device const char* act_quants [[buffer(1)]],
@@ -731,6 +954,11 @@ pub(crate) struct Spec50MoeArgbufKernels {
     /// Register-narrow K<=8 twin. Optional so an older Metal compiler can
     /// retain the proven K=16 pipeline instead of failing construction.
     gateup_k8: Option<ComputePipelineState>,
+    /// Exact candidate-sliced K<=8 twin. It is kept independent from the
+    /// shipping K8 pipeline so production can fail closed when unavailable.
+    gateup_k8_candidate: Option<ComputePipelineState>,
+    /// Exact four-candidate tiled K<=8 twin.
+    gateup_k8_tile4: Option<ComputePipelineState>,
     pub(crate) down: ComputePipelineState,
     head_gateup_split: ComputePipelineState,
     head_gateup_scalar: ComputePipelineState,
@@ -743,7 +971,6 @@ pub(crate) struct Spec50MoeArgbufKernels {
 }
 
 static SPEC50_MOE_ARGBUF_KERNELS: OnceLock<Option<Spec50MoeArgbufKernels>> = OnceLock::new();
-
 pub(crate) fn spec50_moe_argbuf_kernels(
     device: &Device,
 ) -> Option<&'static Spec50MoeArgbufKernels> {
@@ -782,6 +1009,30 @@ pub(crate) fn spec50_moe_argbuf_kernels(
                     )
                 })
                 .ok();
+            let gateup_k8_candidate = library
+                .get_function(
+                    "spec50_moe_argbuf_gateup_geglu_quant_batch_k8_candidate",
+                    None,
+                )
+                .and_then(|function| device.new_compute_pipeline_state_with_function(&function))
+                .map_err(|err| {
+                    eprintln!(
+                        "[metal] argbuf candidate-sliced K8 GateUp unavailable; using current K8 pipeline: {err}"
+                    )
+                })
+                .ok();
+            let gateup_k8_tile4 = library
+                .get_function(
+                    "spec50_moe_argbuf_gateup_geglu_quant_batch_k8_tile4",
+                    None,
+                )
+                .and_then(|function| device.new_compute_pipeline_state_with_function(&function))
+                .map_err(|err| {
+                    eprintln!(
+                        "[metal] argbuf four-candidate tiled K8 GateUp unavailable: {err}"
+                    )
+                })
+                .ok();
             let down = device
                 .new_compute_pipeline_state_with_function(&down_function)
                 .map_err(|err| eprintln!("[metal] argbuf Down pipeline failed: {err}"))
@@ -806,6 +1057,8 @@ pub(crate) fn spec50_moe_argbuf_kernels(
             Some(Spec50MoeArgbufKernels {
                 gateup,
                 gateup_k8,
+                gateup_k8_candidate,
+                gateup_k8_tile4,
                 down,
                 head_gateup_split,
                 head_gateup_scalar,
@@ -1624,6 +1877,81 @@ fn encode_argbuf_gateup(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn encode_argbuf_gateup_candidate(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    input_scales: &Buffer,
+    input_quants: &Buffer,
+    expert_table: &Buffer,
+    work_list: &Buffer,
+    output_scales: &Buffer,
+    output_quants: &Buffer,
+    num_unique_experts: u32,
+    k_candidates: u32,
+) {
+    debug_assert!((1..=8).contains(&k_candidates));
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(input_scales), 0);
+    encoder.set_buffer(1, Some(input_quants), 0);
+    encoder.set_buffer(2, Some(expert_table), 0);
+    encoder.set_buffer(3, Some(work_list), 0);
+    encoder.set_buffer(4, Some(output_scales), 0);
+    encoder.set_buffer(5, Some(output_quants), 0);
+    encoder.set_bytes(6, 4, &num_unique_experts as *const u32 as *const _);
+    encoder.set_bytes(7, 4, &k_candidates as *const u32 as *const _);
+    encoder.dispatch_thread_groups(
+        metal::MTLSize {
+            width: u64::from(num_unique_experts) * u64::from(k_candidates) * (S50_FF as u64 / 32),
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_argbuf_gateup_tile4(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    input_scales: &Buffer,
+    input_quants: &Buffer,
+    expert_table: &Buffer,
+    work_list: &Buffer,
+    output_scales: &Buffer,
+    output_quants: &Buffer,
+    num_unique_experts: u32,
+    k_candidates: u32,
+) {
+    debug_assert!((1..=8).contains(&k_candidates));
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(input_scales), 0);
+    encoder.set_buffer(1, Some(input_quants), 0);
+    encoder.set_buffer(2, Some(expert_table), 0);
+    encoder.set_buffer(3, Some(work_list), 0);
+    encoder.set_buffer(4, Some(output_scales), 0);
+    encoder.set_buffer(5, Some(output_quants), 0);
+    encoder.set_bytes(6, 4, &num_unique_experts as *const u32 as *const _);
+    encoder.set_bytes(7, 4, &k_candidates as *const u32 as *const _);
+    let tiles = (k_candidates + 3) / 4;
+    encoder.dispatch_thread_groups(
+        metal::MTLSize {
+            width: u64::from(num_unique_experts) * u64::from(tiles) * (S50_FF as u64 / 32),
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 fn encode_argbuf_down(
     encoder: &metal::ComputeCommandEncoderRef,
     pipeline: &ComputePipelineState,
@@ -1884,11 +2212,15 @@ mod tests {
     /// Create valid, deterministic Q4_0 records without consulting a model
     /// file. Every 18-byte wire block carries a finite f16 scale, so parity
     /// failures cannot be hidden by NaNs from arbitrary test bytes.
-    fn synthetic_slot_backings(device: &Device) -> (Vec<Buffer>, Buffer) {
+    fn synthetic_slot_backings_count(
+        device: &Device,
+        expert_count: usize,
+    ) -> (Vec<Buffer>, Buffer) {
+        assert!((1..=EXPERTS).contains(&expert_count));
         assert_eq!(S50_RECORD_BYTES % 18, 0);
-        let copied_slab = new_buffer(device, SYNTHETIC_EXPERTS * S50_SLOT_STRIDE);
-        let mut records = Vec::with_capacity(SYNTHETIC_EXPERTS);
-        for slot in 0..SYNTHETIC_EXPERTS {
+        let copied_slab = new_buffer(device, expert_count * S50_SLOT_STRIDE);
+        let mut records = Vec::with_capacity(expert_count);
+        for slot in 0..expert_count {
             let record = new_buffer(device, S50_SLOT_STRIDE);
             let bytes = unsafe {
                 std::slice::from_raw_parts_mut(record.contents().cast::<u8>(), S50_SLOT_STRIDE)
@@ -1918,6 +2250,10 @@ mod tests {
             records.push(record);
         }
         (records, copied_slab)
+    }
+
+    fn synthetic_slot_backings(device: &Device) -> (Vec<Buffer>, Buffer) {
+        synthetic_slot_backings_count(device, SYNTHETIC_EXPERTS)
     }
 
     /// Every token routes to all eight synthetic records in a different order.
@@ -2306,6 +2642,134 @@ mod tests {
                 &format!("anonymous K={k} Down output"),
                 &read_bytes(&buffers.copy_down, down_bytes),
                 &read_bytes(&buffers.arg_down, down_bytes),
+            );
+        }
+    }
+
+    /// Real-Metal proof that the candidate-sliced grid changes scheduling,
+    /// not arithmetic. Compare the complete scale and quant payload at every
+    /// admitted width; byte equality also covers inactive output holes.
+    #[test]
+    fn gemma4_moe_candidate_sliced_gateup_k1_to_k8_raw_bit_parity() {
+        let Some(kernel) = metal_linear_kernel() else {
+            eprintln!("SKIP candidate-sliced GateUp parity: no Metal device");
+            return;
+        };
+        let device = &kernel.device;
+        if device.argument_buffers_support() != MTLArgumentBuffersTier::Tier2 {
+            eprintln!("SKIP candidate-sliced GateUp parity: Tier-2 argument buffers unavailable");
+            return;
+        }
+        let pipelines = spec50_moe_argbuf_kernels(device).expect("argument-buffer MoE pipelines");
+        let fast = pipelines
+            .gateup_k8_candidate
+            .as_ref()
+            .expect("candidate-sliced K8 GateUp pipeline");
+        let tile4 = pipelines
+            .gateup_k8_tile4
+            .as_ref()
+            .expect("four-candidate tiled K8 GateUp pipeline");
+        let current = pipelines.gateup_k8.as_ref().unwrap_or(&pipelines.gateup);
+        let (records, _) = synthetic_slot_backings(device);
+        let table = Gemma4MoeSlotArgTable::from_slot_buffers(device, &records)
+            .expect("anonymous per-slot Tier-2 table");
+        let buffers = Buffers::new(device);
+
+        for k in 1..=MAX_K {
+            let routing = build_synthetic_routing(k);
+            buffers.upload(&routing);
+            buffers.zero_outputs();
+            let cb = kernel.queue.new_command_buffer();
+            let encoder = cb.new_compute_command_encoder();
+            assert_eq!(
+                table.declare_active_slots(encoder, &routing.active_experts),
+                Some(SYNTHETIC_EXPERTS)
+            );
+            encode_argbuf_gateup(
+                encoder,
+                current,
+                &buffers.input_scales,
+                &buffers.input_quants,
+                table.argument_buffer(),
+                &buffers.work,
+                &buffers.copy_scales,
+                &buffers.copy_quants,
+                SYNTHETIC_EXPERTS as u32,
+                k as u32,
+            );
+            encode_argbuf_gateup_candidate(
+                encoder,
+                fast,
+                &buffers.input_scales,
+                &buffers.input_quants,
+                table.argument_buffer(),
+                &buffers.work,
+                &buffers.arg_scales,
+                &buffers.arg_quants,
+                SYNTHETIC_EXPERTS as u32,
+                k as u32,
+            );
+            encoder.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            assert_eq!(
+                cb.status(),
+                MTLCommandBufferStatus::Completed,
+                "candidate-sliced GateUp K={k} command failed: {}",
+                command_buffer_error_details(cb)
+            );
+
+            let scale_bytes = SYNTHETIC_EXPERTS * k * S50_DOWN_BLOCKS * 4;
+            let quant_bytes = SYNTHETIC_EXPERTS * k * S50_FF;
+            assert_raw_eq(
+                &format!("candidate-sliced K={k} GateUp scales"),
+                &read_bytes(&buffers.copy_scales, scale_bytes),
+                &read_bytes(&buffers.arg_scales, scale_bytes),
+            );
+            assert_raw_eq(
+                &format!("candidate-sliced K={k} GateUp quants"),
+                &read_bytes(&buffers.copy_quants, quant_bytes),
+                &read_bytes(&buffers.arg_quants, quant_bytes),
+            );
+
+            fill_zero(&buffers.arg_scales);
+            fill_zero(&buffers.arg_quants);
+            let cb = kernel.queue.new_command_buffer();
+            let encoder = cb.new_compute_command_encoder();
+            assert_eq!(
+                table.declare_active_slots(encoder, &routing.active_experts),
+                Some(SYNTHETIC_EXPERTS)
+            );
+            encode_argbuf_gateup_tile4(
+                encoder,
+                tile4,
+                &buffers.input_scales,
+                &buffers.input_quants,
+                table.argument_buffer(),
+                &buffers.work,
+                &buffers.arg_scales,
+                &buffers.arg_quants,
+                SYNTHETIC_EXPERTS as u32,
+                k as u32,
+            );
+            encoder.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            assert_eq!(
+                cb.status(),
+                MTLCommandBufferStatus::Completed,
+                "four-candidate tiled GateUp K={k} command failed: {}",
+                command_buffer_error_details(cb)
+            );
+            assert_raw_eq(
+                &format!("four-candidate tiled K={k} GateUp scales"),
+                &read_bytes(&buffers.copy_scales, scale_bytes),
+                &read_bytes(&buffers.arg_scales, scale_bytes),
+            );
+            assert_raw_eq(
+                &format!("four-candidate tiled K={k} GateUp quants"),
+                &read_bytes(&buffers.copy_quants, quant_bytes),
+                &read_bytes(&buffers.arg_quants, quant_bytes),
             );
         }
     }
@@ -2827,6 +3291,91 @@ mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn time_gateup_layers(
+        queue: &metal::CommandQueue,
+        pipeline: &ComputePipelineState,
+        candidate_tile: usize,
+        table: &Gemma4MoeSlotArgTable,
+        buffers: &Buffers,
+        routing: &Routing,
+        k: usize,
+        layers: usize,
+    ) -> Timing {
+        buffers.upload(routing);
+        buffers.zero_outputs();
+        let before = vm_counters();
+        let started = std::time::Instant::now();
+        let cb = queue.new_command_buffer();
+        let encoder = cb.new_compute_command_encoder();
+        assert_eq!(
+            table.declare_active_slots(encoder, &routing.active_experts),
+            Some(routing.active_experts.len())
+        );
+        for _ in 0..layers {
+            match candidate_tile {
+                1 => encode_argbuf_gateup_candidate(
+                    encoder,
+                    pipeline,
+                    &buffers.input_scales,
+                    &buffers.input_quants,
+                    table.argument_buffer(),
+                    &buffers.work,
+                    &buffers.arg_scales,
+                    &buffers.arg_quants,
+                    routing.active_experts.len() as u32,
+                    k as u32,
+                ),
+                4 => encode_argbuf_gateup_tile4(
+                    encoder,
+                    pipeline,
+                    &buffers.input_scales,
+                    &buffers.input_quants,
+                    table.argument_buffer(),
+                    &buffers.work,
+                    &buffers.arg_scales,
+                    &buffers.arg_quants,
+                    routing.active_experts.len() as u32,
+                    k as u32,
+                ),
+                0 => encode_argbuf_gateup(
+                    encoder,
+                    pipeline,
+                    &buffers.input_scales,
+                    &buffers.input_quants,
+                    table.argument_buffer(),
+                    &buffers.work,
+                    &buffers.arg_scales,
+                    &buffers.arg_quants,
+                    routing.active_experts.len() as u32,
+                    k as u32,
+                ),
+                _ => panic!("unsupported GateUp candidate tile {candidate_tile}"),
+            }
+        }
+        encoder.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        let wall_us = started.elapsed().as_micros();
+        assert_eq!(
+            cb.status(),
+            MTLCommandBufferStatus::Completed,
+            "GateUp benchmark command failed: {}",
+            command_buffer_error_details(cb)
+        );
+        let (gpu_us, kernel_us) = command_buffer_gpu_times_us(cb);
+        let after = vm_counters();
+        Timing {
+            wall_us,
+            gpu_us,
+            kernel_us,
+            pageins: vm_delta(after, before, |stats| stats.pageins),
+            faults: vm_delta(after, before, |stats| stats.faults),
+            decompressions: vm_delta(after, before, |stats| stats.decompressions),
+            swapins: vm_delta(after, before, |stats| stats.swapins),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn time_argbuf_round(
         queue: &metal::CommandQueue,
         pipelines: &Spec50MoeArgbufKernels,
@@ -2962,6 +3511,139 @@ mod tests {
             faults: vm_delta(after, before, |stats| stats.faults),
             decompressions: vm_delta(after, before, |stats| stats.decompressions),
             swapins: vm_delta(after, before, |stats| stats.swapins),
+        }
+    }
+
+    /// Warm, real-Metal comparison shaped like one complete 30-layer target
+    /// pass: K=8, 30 unique experts, and 30 consecutive GateUp dispatches.
+    /// The explicit ignore keeps a timing-sensitive result out of ordinary CI.
+    #[test]
+    #[ignore = "real-Metal 30-layer GateUp microbenchmark"]
+    fn spec50_moe_candidate_sliced_gateup_30_layer_microbenchmark() {
+        let Some(kernel) = metal_linear_kernel() else {
+            eprintln!("SKIP candidate-sliced GateUp benchmark: no Metal device");
+            return;
+        };
+        let device = &kernel.device;
+        if device.argument_buffers_support() != MTLArgumentBuffersTier::Tier2 {
+            eprintln!("SKIP candidate-sliced GateUp benchmark: Tier-2 unavailable");
+            return;
+        }
+        let pipelines = spec50_moe_argbuf_kernels(device).expect("argument-buffer MoE pipelines");
+        let fast = pipelines
+            .gateup_k8_candidate
+            .as_ref()
+            .expect("candidate-sliced K8 GateUp pipeline");
+        let tile4 = pipelines
+            .gateup_k8_tile4
+            .as_ref()
+            .expect("four-candidate tiled K8 GateUp pipeline");
+        let current = pipelines.gateup_k8.as_ref().unwrap_or(&pipelines.gateup);
+        let (records, _) = synthetic_slot_backings_count(device, ACTIVE_EXPERTS);
+        let table = Gemma4MoeSlotArgTable::from_slot_buffers(device, &records)
+            .expect("30-expert anonymous Tier-2 table");
+        let buffers = Buffers::new(device);
+        let routing = build_routing(MAX_K);
+        assert_eq!(routing.active_experts.len(), ACTIVE_EXPERTS);
+
+        // Discard one pipeline warm-up of each shape, then alternate to reduce
+        // thermal/frequency bias. The middle GPU sample is the headline.
+        let _ = time_gateup_layers(
+            &kernel.queue,
+            current,
+            0,
+            &table,
+            &buffers,
+            &routing,
+            MAX_K,
+            30,
+        );
+        let _ = time_gateup_layers(
+            &kernel.queue,
+            fast,
+            1,
+            &table,
+            &buffers,
+            &routing,
+            MAX_K,
+            30,
+        );
+        let _ = time_gateup_layers(
+            &kernel.queue,
+            tile4,
+            4,
+            &table,
+            &buffers,
+            &routing,
+            MAX_K,
+            30,
+        );
+        let mut current_samples = Vec::with_capacity(7);
+        let mut fast_samples = Vec::with_capacity(7);
+        let mut tile4_samples = Vec::with_capacity(7);
+        for _ in 0..7 {
+            current_samples.push(time_gateup_layers(
+                &kernel.queue,
+                current,
+                0,
+                &table,
+                &buffers,
+                &routing,
+                MAX_K,
+                30,
+            ));
+            fast_samples.push(time_gateup_layers(
+                &kernel.queue,
+                fast,
+                1,
+                &table,
+                &buffers,
+                &routing,
+                MAX_K,
+                30,
+            ));
+            tile4_samples.push(time_gateup_layers(
+                &kernel.queue,
+                tile4,
+                4,
+                &table,
+                &buffers,
+                &routing,
+                MAX_K,
+                30,
+            ));
+        }
+        let median_gpu = |samples: &[Timing]| {
+            let mut ordered = samples.to_vec();
+            ordered.sort_unstable_by_key(|timing| timing.gpu_us);
+            ordered[ordered.len() / 2]
+        };
+        let current_median = median_gpu(&current_samples);
+        let fast_median = median_gpu(&fast_samples);
+        let tile4_median = median_gpu(&tile4_samples);
+        let candidate_speedup = current_median.gpu_us as f64 / fast_median.gpu_us as f64;
+        let tile4_speedup = current_median.gpu_us as f64 / tile4_median.gpu_us as f64;
+        eprintln!(
+            "[spec50-fast-moe-gateup] K=8 U=30 layers=30 current_gpu_us={} candidate_gpu_us={} candidate_speedup={candidate_speedup:.4} tile4_gpu_us={} tile4_speedup={tile4_speedup:.4}",
+            current_median.gpu_us,
+            fast_median.gpu_us,
+            tile4_median.gpu_us,
+        );
+        for (sample, ((current, fast), tile4)) in current_samples
+            .iter()
+            .zip(&fast_samples)
+            .zip(&tile4_samples)
+            .enumerate()
+        {
+            eprintln!(
+                "[spec50-fast-moe-gateup] sample={sample} current_wall_us={} current_gpu_us={} candidate_wall_us={} candidate_gpu_us={} tile4_wall_us={} tile4_gpu_us={}",
+                current.wall_us,
+                current.gpu_us,
+                fast.wall_us,
+                fast.gpu_us,
+                tile4.wall_us,
+                tile4.gpu_us,
+            );
         }
     }
 
