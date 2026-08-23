@@ -40,6 +40,11 @@ PREVIOUS_UNION_READAHEAD_MARKER = (
     "scope=selected-cold-only advice=MADV_WILLNEED dispatch=async-read-pool "
     "correctness_dependency=0"
 )
+CURRENT_SYNC_READAHEAD_MARKER = (
+    "[gemma4-ghost-metal] mapped-cold current-route policy: "
+    "source=current-target-exact-routed-union timing=before-expert-dispatch "
+    "advice=MADV_WILLNEED dispatch=sync-caller correctness_dependency=0"
+)
 MAPPED_READAHEAD_REFUSAL_MARKER = (
     "[gemma4-ghost-metal] mapped-cold MADV_WILLNEED refused:"
 )
@@ -66,6 +71,12 @@ DEVICE_CHAIN_PATTERN = re.compile(
     r"command_buffers=1 commits=1 waits=1 cpu_embedding_callbacks=0 "
     r"linear_format=([^ ]+) matrix_bytes_per_draft=(\d+) "
     r"encode_us=(\d+) wait_us=(\d+) gpu_us=(\d+) kernel_us=(\d+) wall_us=(\d+)$",
+    re.MULTILINE,
+)
+SYNC_CURRENT_RECEIPT_PATTERN = re.compile(
+    r"^\[gemma4-ghost-metal\] mapped-cold sync-current receipt: "
+    r"sequence=(\d+) start_pos=(\d+) K=(\d+) ok=(true|false) "
+    r"records=(\d+) bytes=(\d+) issue_us=(\d+)$",
     re.MULTILINE,
 )
 
@@ -162,6 +173,7 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
     previous_prefix: int | None = None
     previous_sequence: int | None = None
     assistant_round_expectations: list[tuple[int, int]] = []
+    sync_current_expectations: list[tuple[int, int, int, int]] = []
     for index, receipt in enumerate(rounds):
         if not isinstance(receipt, dict) or receipt.get("round_index") != index:
             raise GateError(f"round {index} is missing or reordered")
@@ -274,6 +286,7 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
         if proposed_k:
             assistant_rounds += 1
             assistant_round_expectations.append((min(7, remaining - 1), proposed_k))
+        sync_current_expectations.append((sequence, prefix, verifier_k, mapped_bound))
         proposed += proposed_k
         accepted += accepted_k
         committed += len(committed_tokens)
@@ -333,6 +346,8 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
         raise GateError("server did not admit exact selected-cold mapped readahead")
     if log.splitlines().count(PREVIOUS_UNION_READAHEAD_MARKER) != 1:
         raise GateError("server did not admit pre-assistant previous-union readahead")
+    if log.splitlines().count(CURRENT_SYNC_READAHEAD_MARKER) != 1:
+        raise GateError("server did not admit synchronous exact current-route page advice")
     if MAPPED_READAHEAD_REFUSAL_MARKER in log:
         raise GateError("the kernel refused at least one mapped-cold page advisory")
     bootstrap_marker = (
@@ -350,6 +365,35 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
         raise GateError("generation did not admit the exact packed K8 GateUp path")
     if log.splitlines().count(COMPACT_K8_HEAD_MARKER) != 1:
         raise GateError("generation did not admit the compact exact K8 tied head")
+    if log.find(COMPACT_K8_HEAD_MARKER) > log.find(bootstrap_marker):
+        raise GateError("compact exact K8 tied head was initialized after measured generation began")
+    sync_receipts: dict[tuple[int, int, int], tuple[str, int, int, int]] = {}
+    for sequence, start_pos, k, ok, records, byte_count, issue_us in (
+        SYNC_CURRENT_RECEIPT_PATTERN.findall(log)
+    ):
+        key = (int(sequence), int(start_pos), int(k))
+        if key in sync_receipts:
+            raise GateError("duplicate synchronous current-route advice receipt")
+        sync_receipts[key] = (ok, int(records), int(byte_count), int(issue_us))
+    sync_current_records = 0
+    sync_current_bytes = 0
+    sync_current_issue_us = 0
+    for sequence, prefix, verifier_k, expected_records in sync_current_expectations:
+        receipt = sync_receipts.get((sequence, prefix, verifier_k))
+        if receipt is None:
+            raise GateError("missing synchronous current-route advice receipt")
+        ok, records, byte_count, issue_us = receipt
+        if (
+            ok != "true"
+            or records != expected_records
+            or byte_count != records * record_payload_bytes
+        ):
+            raise GateError("invalid synchronous current-route advice receipt")
+        sync_current_records += records
+        sync_current_bytes += byte_count
+        sync_current_issue_us += issue_us
+    if sync_current_records == 0:
+        raise GateError("generation issued no synchronous current-route page advice")
     if previous_union_readahead_records == 0:
         raise GateError("generation did not dispatch any previous-union page advice")
     full_q4_markers = FULL_Q4_MARKER_PATTERN.findall(log)
@@ -391,6 +435,7 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
         "no_zero_accept_full_k8": zero_accept_full_k8 == 0,
         "terminal_decode_promotion_off": True,
         "mapped_cold_readahead_active": True,
+        "synchronous_current_route_readahead_active": True,
         "previous_union_readahead_active": True,
         "exact_packed_k8_gateup_active": True,
         "compact_exact_k8_head_active": True,
@@ -415,6 +460,9 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
         "mapped_readahead_enqueued_records": mapped_readahead_records,
         "mapped_readahead_enqueued_bytes": mapped_readahead_bytes,
         "mapped_readahead_enqueue_ms": mapped_readahead_enqueue_ms,
+        "synchronous_current_route_advised_records": sync_current_records,
+        "synchronous_current_route_advised_bytes": sync_current_bytes,
+        "synchronous_current_route_issue_ms": sync_current_issue_us / 1000.0,
         "previous_union_readahead_enqueued_records": previous_union_readahead_records,
         "previous_union_readahead_enqueued_bytes": previous_union_readahead_bytes,
         "previous_union_readahead_enqueue_ms": previous_union_readahead_enqueue_ms,
