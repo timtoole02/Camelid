@@ -15,6 +15,8 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 ANALYZER_PATH = BASE_DIR / "analyze_hot48.py"
+HOST_SAMPLER_PATH = BASE_DIR / "capture_host_memory.py"
+HASHER_PATH = BASE_DIR / "sha256_nocache.py"
 RUNNER_PATH = BASE_DIR / "run_hot48.zsh"
 REQUEST_PATH = BASE_DIR / "request-48.json"
 EXPECTED_IDS_PATH = BASE_DIR / "expected-48-token-ids.json"
@@ -51,11 +53,35 @@ class SyntheticRun:
         shutil.copyfile(EXPECTED_IDS_PATH, self.root / "expected-token-ids.json")
 
         self.inputs: dict[str, Path] = {}
-        for label in ("binary", "model", "cghost", "assistant", "runner", "analyzer", "watchdog"):
+        for label in (
+            "binary",
+            "model",
+            "cghost",
+            "assistant",
+            "runner",
+            "analyzer",
+            "host_sampler",
+            "nocache_hasher",
+            "watchdog",
+        ):
             path = self.root.parent / f"{self.root.name}-{label}.bin"
             path.write_bytes(f"synthetic-{label}\n".encode())
             self.inputs[label] = path
         os.chmod(self.inputs["binary"], 0o700)
+
+        self.hashing_memory_before = {
+            "schema_version": 1,
+            "telemetry_source": "run_load_only_watchdog.NativeTelemetry.sample_host",
+            "boot_identity": "synthetic",
+            "host": self.host(headroom=9 * 1024**3),
+        }
+        self.hashing_memory_before["host"]["sample_started_monotonic_ns"] = 100
+        self.hashing_memory_before["host"]["observed_monotonic_ns"] = 110
+        self.hashing_memory_after = copy.deepcopy(self.hashing_memory_before)
+        self.hashing_memory_after["host"]["sample_started_monotonic_ns"] = 200
+        self.hashing_memory_after["host"]["observed_monotonic_ns"] = 210
+        write_json(self.root / "hashing-memory-before.json", self.hashing_memory_before)
+        write_json(self.root / "hashing-memory-after.json", self.hashing_memory_after)
 
         self.response = self._response()
         write_json(self.root / "response.json", self.response)
@@ -76,9 +102,19 @@ class SyntheticRun:
     @staticmethod
     def host(*, headroom: int, swapins: int = 100, swapped: int = 4096) -> dict[str, int]:
         return {
+            "sample_started_monotonic_ns": 1,
+            "observed_monotonic_ns": 2,
+            "sample_duration_ns": 1,
+            "unix_time_ns": 1,
+            "page_size_bytes": 16_384,
+            "free_bytes_strict": headroom // 2,
+            "active_bytes": 3 * 1024**3,
+            "inactive_bytes": headroom // 2,
             "pressure_level_raw": 1,
             "reclaimable_headroom_bytes": headroom,
             "wired_bytes": 4 * 1024**3,
+            "compressor_occupied_bytes": 1024**3,
+            "compressed_logical_bytes": 2 * 1024**3,
             "swapins_pages": swapins,
             "swapouts_pages": 25,
             "swapped_pages_current": swapped,
@@ -112,6 +148,12 @@ class SyntheticRun:
                 "request_frozen": artifact(self.root / "request.json"),
                 "expected_ids_source": artifact(EXPECTED_IDS_PATH),
                 "expected_ids_frozen": artifact(self.root / "expected-token-ids.json"),
+                "hashing_memory_before": artifact(
+                    self.root / "hashing-memory-before.json"
+                ),
+                "hashing_memory_after": artifact(
+                    self.root / "hashing-memory-after.json"
+                ),
             }
         )
         return {
@@ -151,6 +193,26 @@ class SyntheticRun:
                 "maximum_host_wired_bytes": 8 * 1024**3,
                 "reject_swapin_growth": True,
                 "require_zero_current_swap": False,
+            },
+            "hashing_contract": {
+                "schema_version": 1,
+                "algorithm": "sha256",
+                "platform": "darwin",
+                "f_nocache_command": 48,
+                "f_nocache_value": 1,
+                "read_chunk_bytes": 4 * 1024 * 1024,
+                "helper_artifact_label": "nocache_hasher",
+                "host_sampler_artifact_label": "host_sampler",
+                "telemetry_watchdog_artifact_label": "watchdog",
+                "telemetry_source": "run_load_only_watchdog.NativeTelemetry.sample_host",
+                "minimum_pre_hash_reclaimable_headroom_bytes": 8 * 1024**3,
+                "minimum_post_hash_reclaimable_headroom_bytes": 8 * 1024**3,
+                "maximum_host_wired_bytes": 8 * 1024**3,
+                "require_normal_pressure": True,
+                "reject_swapin_growth": True,
+                "reject_swapout_growth": True,
+                "memory_before": self.hashing_memory_before,
+                "memory_after": self.hashing_memory_after,
             },
             "artifacts": artifacts,
         }
@@ -432,6 +494,10 @@ class Hot48AnalyzerTests(unittest.TestCase):
         )
         self.assertEqual(verdict["memory"]["baseline_swapped_pages_current"], 4096)
         self.assertEqual(verdict["memory"]["swapins_growth_pages"], 0)
+        self.assertEqual(verdict["hashing"]["swapins_growth_pages"], 0)
+        self.assertGreaterEqual(
+            verdict["hashing"]["post_hash_reclaimable_headroom_bytes"], 8 * 1024**3
+        )
         self.assertEqual(verdict["stages"]["receipt_count"], 6)
 
     def test_rejects_one_layer_with_47_hot_slots(self) -> None:
@@ -491,6 +557,17 @@ class Hot48AnalyzerTests(unittest.TestCase):
         with self.assertRaisesRegex(hot48.ReceiptError, "readiness"):
             hot48.analyze(self.run.root)
 
+    def test_rejects_hash_phase_swap_growth(self) -> None:
+        after = self.run.intent["hashing_contract"]["memory_after"]
+        after["host"]["swapins_pages"] += 1
+        write_json(self.run.root / "hashing-memory-after.json", after)
+        self.run.intent["artifacts"]["hashing_memory_after"] = artifact(
+            self.run.root / "hashing-memory-after.json"
+        )
+        write_json(self.run.root / "intent.json", self.run.intent)
+        with self.assertRaisesRegex(hot48.ReceiptError, "changed swap"):
+            hot48.analyze(self.run.root)
+
 
 class Hot48SourceContractTests(unittest.TestCase):
     def test_frozen_fixture_hashes(self) -> None:
@@ -513,6 +590,11 @@ class Hot48SourceContractTests(unittest.TestCase):
         self.assertNotIn("target/release/camelid", source)
         self.assertIn("data_volume_device", source)
         self.assertIn("/usr/bin/env -i", source)
+        self.assertIn("sha256_nocache.py", source)
+        self.assertIn("capture_host_memory.py", source)
+        self.assertIn("hashing-memory-before.json", source)
+        self.assertIn("hashing-memory-after.json", source)
+        self.assertNotIn("/usr/bin/shasum", source)
         self.assertIn("status --porcelain=v1 --untracked-files=all", source)
         self.assertIn('endswith("-dirty")', source)
         for key in hot48.PER_LAYER_ENVIRONMENT:
@@ -525,6 +607,37 @@ class Hot48SourceContractTests(unittest.TestCase):
             py_compile.compile(
                 str(ANALYZER_PATH), cfile=str(Path(directory) / "analyzer.pyc"), doraise=True
             )
+            py_compile.compile(
+                str(HASHER_PATH), cfile=str(Path(directory) / "hasher.pyc"), doraise=True
+            )
+            py_compile.compile(
+                str(HOST_SAMPLER_PATH),
+                cfile=str(Path(directory) / "host_sampler.pyc"),
+                doraise=True,
+            )
+
+    def test_nocache_hasher_matches_canonical_fixture_hashes(self) -> None:
+        for path in (REQUEST_PATH, EXPECTED_IDS_PATH):
+            result = subprocess.run(
+                ["/usr/bin/python3", str(HASHER_PATH), str(path)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.stdout.strip(), sha256(path))
+
+    def test_nocache_hasher_rejects_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            link = Path(directory) / "request-link.json"
+            link.symlink_to(REQUEST_PATH)
+            result = subprocess.run(
+                ["/usr/bin/python3", str(HASHER_PATH), str(link)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 75)
+            self.assertIn("REFUSED:", result.stderr)
 
 
 if __name__ == "__main__":

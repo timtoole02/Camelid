@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import math
 import os
 import re
+import stat
 import statistics
 import sys
 from pathlib import Path
@@ -40,6 +42,7 @@ REQUEST_SHA256 = "b2f1110079fc726699cc936a628a268a7ec5bf2076fa970899de39d4ea9039
 EXPECTED_IDS_SHA256 = "45e65ac09155d7627373c262f1edd1faf6188fb6dad26c5d5994fe5226a97975"
 FULL_Q4_MATRIX_BYTES = 236_077_056
 FULL_Q4_BF16_MATRIX_BYTES = 839_385_088
+F_NOCACHE = 48
 FULL_Q4_RESIDENCY_MARKER = (
     "[gemma4-mtp full-q4 residency] source_retained=false mapped_bytes=0 "
     "locked_bytes=0 resident_pages=0 total_pages=0 packed_bytes=236077056"
@@ -165,15 +168,41 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def _sha256(path: Path) -> str:
+    if sys.platform != "darwin":
+        raise ReceiptError("F_NOCACHE receipt validation is supported only on macOS")
     if path.is_symlink() or not path.is_file():
         raise ReceiptError(f"hashed input is not a regular non-symlink file: {path}")
     digest = hashlib.sha256()
+    descriptor = -1
+    bytes_read = 0
     try:
-        with path.open("rb") as handle:
-            for block in iter(lambda: handle.read(4 * 1024 * 1024), b""):
-                digest.update(block)
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        identity_before = os.fstat(descriptor)
+        if not stat.S_ISREG(identity_before.st_mode):
+            raise ReceiptError(f"hashed input is not a regular file: {path}")
+        fcntl.fcntl(descriptor, F_NOCACHE, 1)
+        while block := os.read(descriptor, 4 * 1024 * 1024):
+            digest.update(block)
+            bytes_read += len(block)
+        identity_after = os.fstat(descriptor)
+        stable_identity = (
+            identity_before.st_dev,
+            identity_before.st_ino,
+            identity_before.st_size,
+            identity_before.st_mtime_ns,
+        ) == (
+            identity_after.st_dev,
+            identity_after.st_ino,
+            identity_after.st_size,
+            identity_after.st_mtime_ns,
+        )
+        if not stable_identity or bytes_read != identity_before.st_size:
+            raise ReceiptError(f"hashed input identity changed while reading: {path}")
     except OSError as error:
         raise ReceiptError(f"could not hash {path}: {error}") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
     return digest.hexdigest()
 
 
@@ -219,6 +248,10 @@ def _validate_hashes(run_dir: Path, intent: dict[str, Any]) -> None:
         "expected_ids_frozen",
         "runner",
         "analyzer",
+        "host_sampler",
+        "nocache_hasher",
+        "hashing_memory_before",
+        "hashing_memory_after",
         "watchdog",
     }
     if not isinstance(artifacts, dict) or set(artifacts) != required:
@@ -251,12 +284,107 @@ def _validate_hashes(run_dir: Path, intent: dict[str, Any]) -> None:
         raise ReceiptError("intent does not bind the run-local frozen request")
     if Path(artifacts["expected_ids_frozen"]["path"]) != run_dir / "expected-token-ids.json":
         raise ReceiptError("intent does not bind the run-local frozen token IDs")
+    if Path(artifacts["hashing_memory_before"]["path"]) != run_dir / "hashing-memory-before.json":
+        raise ReceiptError("intent does not bind the run-local pre-hash memory sample")
+    if Path(artifacts["hashing_memory_after"]["path"]) != run_dir / "hashing-memory-after.json":
+        raise ReceiptError("intent does not bind the run-local post-hash memory sample")
     for label in ("request_source", "request_frozen"):
         if artifacts[label]["sha256"] != REQUEST_SHA256:
             raise ReceiptError("request fixture differs from the frozen canonical request")
     for label in ("expected_ids_source", "expected_ids_frozen"):
         if artifacts[label]["sha256"] != EXPECTED_IDS_SHA256:
             raise ReceiptError("expected-token fixture differs from the frozen K1 IDs")
+
+
+def _validate_hashing_contract(run_dir: Path, intent: dict[str, Any]) -> None:
+    contract = intent.get("hashing_contract")
+    expected_static = {
+        "schema_version": 1,
+        "algorithm": "sha256",
+        "platform": "darwin",
+        "f_nocache_command": F_NOCACHE,
+        "f_nocache_value": 1,
+        "read_chunk_bytes": 4 * 1024 * 1024,
+        "helper_artifact_label": "nocache_hasher",
+        "host_sampler_artifact_label": "host_sampler",
+        "telemetry_watchdog_artifact_label": "watchdog",
+        "telemetry_source": "run_load_only_watchdog.NativeTelemetry.sample_host",
+        "minimum_pre_hash_reclaimable_headroom_bytes": MIN_BASELINE_HEADROOM_BYTES,
+        "minimum_post_hash_reclaimable_headroom_bytes": MIN_BASELINE_HEADROOM_BYTES,
+        "maximum_host_wired_bytes": MAX_HOST_WIRED_BYTES,
+        "require_normal_pressure": True,
+        "reject_swapin_growth": True,
+        "reject_swapout_growth": True,
+    }
+    if (
+        not isinstance(contract, dict)
+        or set(contract) != set(expected_static) | {"memory_before", "memory_after"}
+        or any(contract.get(key) != value for key, value in expected_static.items())
+    ):
+        raise ReceiptError("intent hashing contract is absent or inexact")
+
+    boot_identity = intent.get("boot_identity")
+    if not isinstance(boot_identity, str) or not boot_identity:
+        raise ReceiptError("intent has no boot identity for hash-phase telemetry")
+    samples: list[dict[str, Any]] = []
+    for phase in ("before", "after"):
+        sample = contract.get(f"memory_{phase}")
+        if (
+            not isinstance(sample, dict)
+            or set(sample) != {
+                "schema_version",
+                "telemetry_source",
+                "boot_identity",
+                "host",
+            }
+            or sample.get("schema_version") != 1
+            or sample.get("telemetry_source") != expected_static["telemetry_source"]
+            or sample.get("boot_identity") != boot_identity
+            or not isinstance(sample.get("host"), dict)
+        ):
+            raise ReceiptError(f"hash-phase {phase} memory sample is invalid")
+        host = sample["host"]
+        required_nonnegative = {
+            "sample_started_monotonic_ns",
+            "observed_monotonic_ns",
+            "sample_duration_ns",
+            "unix_time_ns",
+            "page_size_bytes",
+            "free_bytes_strict",
+            "active_bytes",
+            "inactive_bytes",
+            "reclaimable_headroom_bytes",
+            "wired_bytes",
+            "compressor_occupied_bytes",
+            "compressed_logical_bytes",
+            "swapins_pages",
+            "swapouts_pages",
+            "swapped_pages_current",
+        }
+        if (
+            any(not _is_nonnegative_int(host.get(field)) for field in required_nonnegative)
+            or host.get("page_size_bytes") != 16_384
+            or host.get("pressure_level_raw") != 1
+            or host["reclaimable_headroom_bytes"] < MIN_BASELINE_HEADROOM_BYTES
+            or host["wired_bytes"] > MAX_HOST_WIRED_BYTES
+            or host["observed_monotonic_ns"] < host["sample_started_monotonic_ns"]
+        ):
+            raise ReceiptError(f"hash-phase {phase} memory safety gate failed")
+        samples.append(sample)
+
+    before_host, after_host = (sample["host"] for sample in samples)
+    if (
+        before_host["swapins_pages"] != after_host["swapins_pages"]
+        or before_host["swapouts_pages"] != after_host["swapouts_pages"]
+        or before_host["observed_monotonic_ns"] >= after_host["observed_monotonic_ns"]
+    ):
+        raise ReceiptError("integrity hashing changed swap or reordered host samples")
+
+    artifacts = intent["artifacts"]
+    before_file = _read_json(Path(artifacts["hashing_memory_before"]["path"]))
+    after_file = _read_json(Path(artifacts["hashing_memory_after"]["path"]))
+    if before_file != samples[0] or after_file != samples[1]:
+        raise ReceiptError("intent hash-phase telemetry differs from its bound artifacts")
 
 
 def _validate_intent(run_dir: Path) -> dict[str, Any]:
@@ -309,6 +437,7 @@ def _validate_intent(run_dir: Path) -> dict[str, Any]:
     }:
         raise ReceiptError("intent watchdog contract is not exact")
     _validate_hashes(run_dir, intent)
+    _validate_hashing_contract(run_dir, intent)
     return intent
 
 
@@ -819,6 +948,9 @@ def analyze(run_dir: Path) -> dict[str, Any]:
     assistant_sha256 = intent["artifacts"]["assistant"]["sha256"]
     stages = _validate_log(run_dir, assistant_proposals, assistant_sha256)
     _validate_ports(run_dir)
+    hashing_contract = intent["hashing_contract"]
+    hashing_before = hashing_contract["memory_before"]["host"]
+    hashing_after = hashing_contract["memory_after"]["host"]
     return {
         "schema_version": 1,
         "pass": True,
@@ -833,10 +965,28 @@ def analyze(run_dir: Path) -> dict[str, Any]:
             "no_swapin_or_swapout_growth": True,
             "existing_swap_allowed": True,
             "ports_clear_after_run": True,
+            "f_nocache_integrity_hashing": True,
+            "hash_phase_bounded_memory": True,
+            "hash_phase_no_swap_growth": True,
         },
         "geometry": intent["geometry"],
         "performance": performance,
         "stages": stages,
+        "hashing": {
+            "algorithm": "sha256",
+            "f_nocache_command": F_NOCACHE,
+            "read_chunk_bytes": 4 * 1024 * 1024,
+            "pre_hash_reclaimable_headroom_bytes": hashing_before[
+                "reclaimable_headroom_bytes"
+            ],
+            "post_hash_reclaimable_headroom_bytes": hashing_after[
+                "reclaimable_headroom_bytes"
+            ],
+            "pre_hash_wired_bytes": hashing_before["wired_bytes"],
+            "post_hash_wired_bytes": hashing_after["wired_bytes"],
+            "swapins_growth_pages": 0,
+            "swapouts_growth_pages": 0,
+        },
         "memory": memory,
     }
 

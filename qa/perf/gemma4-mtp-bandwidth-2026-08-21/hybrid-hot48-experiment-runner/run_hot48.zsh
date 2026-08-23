@@ -26,6 +26,8 @@ readonly script_dir=${0:A:h}
 readonly runner=${0:A}
 readonly repo_root=$(/usr/bin/git -C "$script_dir" rev-parse --show-toplevel)
 readonly analyzer="$script_dir/analyze_hot48.py"
+readonly host_sampler="$script_dir/capture_host_memory.py"
+readonly hasher="$script_dir/sha256_nocache.py"
 readonly watchdog="$repo_root/qa/evidence-bundles/gemma4-26b-mtp-assistant-oracle/run_load_only_watchdog.py"
 readonly request_source="$script_dir/request-48.json"
 readonly expected_ids_source="$script_dir/expected-48-token-ids.json"
@@ -69,7 +71,7 @@ internal_data_path "$repo_root" || refuse "repository working directory is not o
 internal_data_path "${receipt_root:h}" || refuse "receipt parent is not on the internal Data volume"
 
 for input in "$model" "$cghost" "$assistant" "$request_source" \
-  "$expected_ids_source" "$analyzer" "$watchdog" "$runner"; do
+  "$expected_ids_source" "$analyzer" "$host_sampler" "$hasher" "$watchdog" "$runner"; do
   [[ -f "$input" && ! -L "$input" ]] || \
     refuse "required input is missing, non-regular, or symlinked: $input"
 done
@@ -85,12 +87,9 @@ readonly disk_available_kib=$(/bin/df -Pk /System/Volumes/Data | /usr/bin/awk 'N
   refuse "Data volume needs at least 20 GiB available before the benchmark"
 
 typeset request_source_sha expected_ids_source_sha
-request_source_sha=$(/usr/bin/shasum -a 256 "$request_source" | /usr/bin/awk '{print $1}')
-expected_ids_source_sha=$(/usr/bin/shasum -a 256 "$expected_ids_source" | /usr/bin/awk '{print $1}')
-[[ "$request_source_sha" == "$REQUEST_SHA256" ]] || \
-  refuse "frozen request fixture SHA-256 drifted"
-[[ "$expected_ids_source_sha" == "$EXPECTED_IDS_SHA256" ]] || \
-  refuse "frozen expected-token fixture SHA-256 drifted"
+sha256_file() {
+  /usr/bin/python3 "$hasher" "$1"
+}
 /usr/bin/jq -e '
   .max_tokens == 48 and .temperature == 0 and .top_k == 1 and .seed == 0 and
   .stream == false and .camelid_receipt == true and
@@ -179,26 +178,73 @@ readonly expected_ids_frozen="$receipt_root/expected-token-ids.json"
 [[ -f "$request_frozen" && ! -L "$request_frozen" ]] || refuse "request freeze failed"
 [[ -f "$expected_ids_frozen" && ! -L "$expected_ids_frozen" ]] || refuse "token-ID freeze failed"
 
-print -r -- "Hashing the prebuilt binary, model inputs, frozen fixtures, and tooling..."
-typeset binary_sha model_sha cghost_sha assistant_sha request_frozen_sha expected_ids_frozen_sha
-typeset runner_sha analyzer_sha watchdog_sha
-binary_sha=$(/usr/bin/shasum -a 256 "$binary" | /usr/bin/awk '{print $1}')
-model_sha=$(/usr/bin/shasum -a 256 "$model" | /usr/bin/awk '{print $1}')
-cghost_sha=$(/usr/bin/shasum -a 256 "$cghost" | /usr/bin/awk '{print $1}')
-assistant_sha=$(/usr/bin/shasum -a 256 "$assistant" | /usr/bin/awk '{print $1}')
-request_frozen_sha=$(/usr/bin/shasum -a 256 "$request_frozen" | /usr/bin/awk '{print $1}')
-expected_ids_frozen_sha=$(/usr/bin/shasum -a 256 "$expected_ids_frozen" | /usr/bin/awk '{print $1}')
-runner_sha=$(/usr/bin/shasum -a 256 "$runner" | /usr/bin/awk '{print $1}')
-analyzer_sha=$(/usr/bin/shasum -a 256 "$analyzer" | /usr/bin/awk '{print $1}')
-watchdog_sha=$(/usr/bin/shasum -a 256 "$watchdog" | /usr/bin/awk '{print $1}')
-[[ "$request_frozen_sha" == "$REQUEST_SHA256" ]] || refuse "frozen request copy drifted"
-[[ "$expected_ids_frozen_sha" == "$EXPECTED_IDS_SHA256" ]] || refuse "frozen token-ID copy drifted"
-
 readonly source_commit=$(/usr/bin/git -C "$repo_root" rev-parse HEAD)
 readonly run_nonce=$(/usr/bin/uuidgen)
 readonly boot_identity=$(/usr/sbin/sysctl -n kern.boottime)
+readonly hashing_memory_before="$receipt_root/hashing-memory-before.json"
+readonly hashing_memory_after="$receipt_root/hashing-memory-after.json"
+/usr/bin/python3 "$host_sampler" --watchdog "$watchdog" --output "$hashing_memory_before"
+/usr/bin/jq -e \
+  --arg boot "$boot_identity" \
+  --argjson minimum_headroom "$MIN_BASELINE_HEADROOM_BYTES" \
+  --argjson maximum_wired "$MAX_HOST_WIRED_BYTES" '
+  .schema_version == 1 and
+  .telemetry_source == "run_load_only_watchdog.NativeTelemetry.sample_host" and
+  .boot_identity == $boot and
+  .host.pressure_level_raw == 1 and
+  .host.reclaimable_headroom_bytes >= $minimum_headroom and
+  .host.wired_bytes <= $maximum_wired
+' "$hashing_memory_before" >/dev/null || \
+  refuse "host memory was not clean enough to begin integrity hashing"
+
+print -r -- "Hashing the prebuilt binary, model inputs, frozen fixtures, and tooling..."
+typeset binary_sha model_sha cghost_sha assistant_sha request_frozen_sha expected_ids_frozen_sha
+typeset runner_sha analyzer_sha host_sampler_sha hasher_sha watchdog_sha
+typeset hashing_memory_before_sha hashing_memory_after_sha
+request_source_sha=$(sha256_file "$request_source")
+expected_ids_source_sha=$(sha256_file "$expected_ids_source")
+binary_sha=$(sha256_file "$binary")
+model_sha=$(sha256_file "$model")
+cghost_sha=$(sha256_file "$cghost")
+assistant_sha=$(sha256_file "$assistant")
+request_frozen_sha=$(sha256_file "$request_frozen")
+expected_ids_frozen_sha=$(sha256_file "$expected_ids_frozen")
+runner_sha=$(sha256_file "$runner")
+analyzer_sha=$(sha256_file "$analyzer")
+host_sampler_sha=$(sha256_file "$host_sampler")
+hasher_sha=$(sha256_file "$hasher")
+watchdog_sha=$(sha256_file "$watchdog")
+[[ "$request_source_sha" == "$REQUEST_SHA256" ]] || \
+  refuse "frozen request fixture SHA-256 drifted"
+[[ "$expected_ids_source_sha" == "$EXPECTED_IDS_SHA256" ]] || \
+  refuse "frozen expected-token fixture SHA-256 drifted"
+[[ "$request_frozen_sha" == "$REQUEST_SHA256" ]] || refuse "frozen request copy drifted"
+[[ "$expected_ids_frozen_sha" == "$EXPECTED_IDS_SHA256" ]] || refuse "frozen token-ID copy drifted"
+
+/usr/bin/python3 "$host_sampler" --watchdog "$watchdog" --output "$hashing_memory_after"
+/usr/bin/jq -e -s \
+  --arg boot "$boot_identity" \
+  --argjson minimum_headroom "$MIN_BASELINE_HEADROOM_BYTES" \
+  --argjson maximum_wired "$MAX_HOST_WIRED_BYTES" '
+  .[0] as $before | .[1] as $after |
+  all($before, $after;
+    .schema_version == 1 and
+    .telemetry_source == "run_load_only_watchdog.NativeTelemetry.sample_host" and
+    .boot_identity == $boot and
+    .host.pressure_level_raw == 1 and
+    .host.reclaimable_headroom_bytes >= $minimum_headroom and
+    .host.wired_bytes <= $maximum_wired
+  ) and
+  $before.host.swapins_pages == $after.host.swapins_pages and
+  $before.host.swapouts_pages == $after.host.swapouts_pages
+' "$hashing_memory_before" "$hashing_memory_after" >/dev/null || \
+  refuse "integrity hashing changed swap or left an unsafe memory baseline"
+hashing_memory_before_sha=$(sha256_file "$hashing_memory_before")
+hashing_memory_after_sha=$(sha256_file "$hashing_memory_after")
+
 typeset binary_size model_size cghost_size assistant_size request_source_size request_frozen_size
-typeset expected_source_size expected_frozen_size runner_size analyzer_size watchdog_size
+typeset expected_source_size expected_frozen_size runner_size analyzer_size host_sampler_size
+typeset hasher_size watchdog_size hashing_memory_before_size hashing_memory_after_size
 binary_size=$(/usr/bin/stat -f '%z' "$binary")
 model_size=$(/usr/bin/stat -f '%z' "$model")
 cghost_size=$(/usr/bin/stat -f '%z' "$cghost")
@@ -209,7 +255,11 @@ expected_source_size=$(/usr/bin/stat -f '%z' "$expected_ids_source")
 expected_frozen_size=$(/usr/bin/stat -f '%z' "$expected_ids_frozen")
 runner_size=$(/usr/bin/stat -f '%z' "$runner")
 analyzer_size=$(/usr/bin/stat -f '%z' "$analyzer")
+host_sampler_size=$(/usr/bin/stat -f '%z' "$host_sampler")
+hasher_size=$(/usr/bin/stat -f '%z' "$hasher")
 watchdog_size=$(/usr/bin/stat -f '%z' "$watchdog")
+hashing_memory_before_size=$(/usr/bin/stat -f '%z' "$hashing_memory_before")
+hashing_memory_after_size=$(/usr/bin/stat -f '%z' "$hashing_memory_after")
 
 /usr/bin/jq -n \
   --arg source_commit "$source_commit" --arg nonce "$run_nonce" --arg boot "$boot_identity" \
@@ -224,6 +274,12 @@ watchdog_size=$(/usr/bin/stat -f '%z' "$watchdog")
   --arg expected_frozen "$expected_ids_frozen" --arg expected_frozen_sha "$expected_ids_frozen_sha" --argjson expected_frozen_size "$expected_frozen_size" \
   --arg runner "$runner" --arg runner_sha "$runner_sha" --argjson runner_size "$runner_size" \
   --arg analyzer "$analyzer" --arg analyzer_sha "$analyzer_sha" --argjson analyzer_size "$analyzer_size" \
+  --arg host_sampler "$host_sampler" --arg host_sampler_sha "$host_sampler_sha" --argjson host_sampler_size "$host_sampler_size" \
+  --arg hasher "$hasher" --arg hasher_sha "$hasher_sha" --argjson hasher_size "$hasher_size" \
+  --arg hashing_before "$hashing_memory_before" --arg hashing_before_sha "$hashing_memory_before_sha" --argjson hashing_before_size "$hashing_memory_before_size" \
+  --arg hashing_after "$hashing_memory_after" --arg hashing_after_sha "$hashing_memory_after_sha" --argjson hashing_after_size "$hashing_memory_after_size" \
+  --slurpfile hashing_before_json "$hashing_memory_before" \
+  --slurpfile hashing_after_json "$hashing_memory_after" \
   --arg watchdog "$watchdog" --arg watchdog_sha "$watchdog_sha" --argjson watchdog_size "$watchdog_size" '
   def artifact($path; $sha; $size): {path: $path, sha256: $sha, size_bytes: $size};
   {
@@ -264,6 +320,26 @@ watchdog_size=$(/usr/bin/stat -f '%z' "$watchdog")
       reject_swapin_growth: true,
       require_zero_current_swap: false
     },
+    hashing_contract: {
+      schema_version: 1,
+      algorithm: "sha256",
+      platform: "darwin",
+      f_nocache_command: 48,
+      f_nocache_value: 1,
+      read_chunk_bytes: 4194304,
+      helper_artifact_label: "nocache_hasher",
+      host_sampler_artifact_label: "host_sampler",
+      telemetry_watchdog_artifact_label: "watchdog",
+      telemetry_source: "run_load_only_watchdog.NativeTelemetry.sample_host",
+      minimum_pre_hash_reclaimable_headroom_bytes: 8589934592,
+      minimum_post_hash_reclaimable_headroom_bytes: 8589934592,
+      maximum_host_wired_bytes: 8589934592,
+      require_normal_pressure: true,
+      reject_swapin_growth: true,
+      reject_swapout_growth: true,
+      memory_before: $hashing_before_json[0],
+      memory_after: $hashing_after_json[0]
+    },
     artifacts: {
       binary: artifact($binary; $binary_sha; $binary_size),
       model: artifact($model; $model_sha; $model_size),
@@ -275,6 +351,10 @@ watchdog_size=$(/usr/bin/stat -f '%z' "$watchdog")
       expected_ids_frozen: artifact($expected_frozen; $expected_frozen_sha; $expected_frozen_size),
       runner: artifact($runner; $runner_sha; $runner_size),
       analyzer: artifact($analyzer; $analyzer_sha; $analyzer_size),
+      host_sampler: artifact($host_sampler; $host_sampler_sha; $host_sampler_size),
+      nocache_hasher: artifact($hasher; $hasher_sha; $hasher_size),
+      hashing_memory_before: artifact($hashing_before; $hashing_before_sha; $hashing_before_size),
+      hashing_memory_after: artifact($hashing_after; $hashing_after_sha; $hashing_after_size),
       watchdog: artifact($watchdog; $watchdog_sha; $watchdog_size)
     }
   }' > "$receipt_root/.intent.json.tmp"
@@ -293,7 +373,13 @@ watchdog_size=$(/usr/bin/stat -f '%z' "$watchdog")
   print -r -- "expected_ids_sha256=$expected_ids_frozen_sha $expected_ids_frozen"
   print -r -- "runner_sha256=$runner_sha $runner"
   print -r -- "analyzer_sha256=$analyzer_sha $analyzer"
+  print -r -- "host_sampler_sha256=$host_sampler_sha $host_sampler"
+  print -r -- "nocache_hasher_sha256=$hasher_sha $hasher"
+  print -r -- "hashing_memory_before_sha256=$hashing_memory_before_sha $hashing_memory_before"
+  print -r -- "hashing_memory_after_sha256=$hashing_memory_after_sha $hashing_memory_after"
   print -r -- "watchdog_sha256=$watchdog_sha $watchdog"
+  /usr/bin/jq -c '{hashing_memory_before:.}' "$hashing_memory_before"
+  /usr/bin/jq -c '{hashing_memory_after:.}' "$hashing_memory_after"
   /usr/sbin/sysctl kern.boottime vm.swapusage
   /usr/bin/memory_pressure -Q
   /usr/bin/vm_stat
