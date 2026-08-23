@@ -66,6 +66,9 @@ const MTP_CHAIN_MAX_DRAFTS: usize = 16;
 const FULL_ROPE_ACTIVE_PAIRS: usize = FULL_HEAD_DIM / 8;
 const RMS_EPS: f32 = 1.0e-6;
 const MATRIX_BYTES_PER_PROPOSAL: u64 = 839_385_088;
+const EMBEDDING_BF16_BYTES: u64 = 536_870_912;
+const Q4_0_BLOCK_VALUES: usize = 32;
+const Q4_0_BLOCK_BYTES: usize = 18;
 
 const MTP_SHADER: &str = r#"
 #include <metal_stdlib>
@@ -215,11 +218,14 @@ kernel void mtp_q4_0_gemv_f32acc(
     device float* output [[buffer(2)]],
     constant uint& cols [[buffer(3)]],
     constant uint& rows [[buffer(4)]],
+    constant ulong& weight_byte_offset [[buffer(5)]],
+    constant uint& round_output_bf16 [[buffer(6)]],
     uint row [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_threadgroup]]) {
     if (row >= rows) return;
     const uint blocks_per_row = cols / 32;
-    device const uchar* row_bytes = q4_weights + ulong(row) * ulong(blocks_per_row) * 18ul;
+    device const uchar* row_bytes = q4_weights + weight_byte_offset
+        + ulong(row) * ulong(blocks_per_row) * 18ul;
     float partial = 0.0f;
     for (uint b = lane; b < blocks_per_row; b += 32) {
         device const uchar* block = row_bytes + ulong(b) * 18ul;
@@ -249,7 +255,9 @@ kernel void mtp_q4_0_gemv_f32acc(
     const float pair01 = simd_shuffle(partial, ushort(0)) + simd_shuffle(partial, ushort(1));
     const float pair23 = simd_shuffle(partial, ushort(2)) + simd_shuffle(partial, ushort(3));
     const float value = pair01 + pair23;
-    if (lane == 0) output[row] = value;
+    if (lane == 0) output[row] = round_output_bf16 != 0u
+        ? mtp_round_bf16(value)
+        : value;
 }
 
 // Gemma 4 uses split-half RoPE. The tables always cover head_dim/2 entries;
@@ -1106,6 +1114,32 @@ struct TensorRef {
     cols: u32,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Q4TensorRef {
+    byte_offset: u64,
+    byte_len: u64,
+    rows: u32,
+    cols: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FullQ4LayerWeights {
+    q: Q4TensorRef,
+    o: Q4TensorRef,
+    gate: Q4TensorRef,
+    up: Q4TensorRef,
+    down: Q4TensorRef,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FullQ4Layout {
+    embedding: Q4TensorRef,
+    layers: [FullQ4LayerWeights; 4],
+    pre_projection: Q4TensorRef,
+    post_projection: Q4TensorRef,
+    matrix_bytes: u64,
+}
+
 #[derive(Clone, Debug)]
 struct TensorEntry {
     shape: Vec<u64>,
@@ -1161,6 +1195,22 @@ fn parse_device_chain_opt_in(value: Option<&str>) -> std::result::Result<bool, &
         Some("1") => Ok(true),
         Some(value) if value.eq_ignore_ascii_case("true") => Ok(true),
         Some(_) => Err("expected 0, 1, false, or true"),
+    }
+}
+
+fn parse_full_q4_opt_in(value: Option<&str>) -> std::result::Result<bool, &'static str> {
+    parse_device_chain_opt_in(value)
+}
+
+fn full_q4_requested_from_environment() -> Result<bool> {
+    const NAME: &str = "CAMELID_GEMMA4_MTP_FULL_Q4";
+    match std::env::var(NAME) {
+        Ok(value) => parse_full_q4_opt_in(Some(&value))
+            .map_err(|detail| invalid(format!("{NAME} {detail}, got {value:?}"))),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(invalid(format!("{NAME} must contain Unicode text")))
+        }
     }
 }
 
@@ -1634,6 +1684,12 @@ struct LayerWeights {
     scale_scalar: Buffer,
 }
 
+struct FullQ4Weights {
+    buffer: Buffer,
+    layout: FullQ4Layout,
+    quantize_us: u128,
+}
+
 struct MtpScratch {
     pre_input: Buffer,
     hidden: Buffer,
@@ -1683,6 +1739,10 @@ pub struct Gemma4MtpResidentLedger {
     pub payload_bytes: u64,
     pub decoded_norm_bytes: u64,
     pub fixed_scratch_bytes: u64,
+    /// Anonymous packed Q4_0 assistant matrices. Zero on the established
+    /// BF16-linear path (the separately packed tied head is not included).
+    pub full_q4_matrix_bytes: u64,
+    pub full_q4_quantize_us: u128,
     pub hash_us: u128,
     pub lock_and_residency_us: u128,
     pub pipeline_compile_us: u128,
@@ -1746,6 +1806,7 @@ pub struct Gemma4MtpAssistantMetal {
     final_norm: Buffer,
     embedding: TensorRef,
     q4_embedding: Option<Buffer>,
+    full_q4: Option<FullQ4Weights>,
     pre_projection: TensorRef,
     post_projection: TensorRef,
     scratch: MtpScratch,
@@ -1899,10 +1960,7 @@ impl MtpScratch {
             recurrent_hidden: f32s(TARGET_HIDDEN),
             chain_recurrent_hidden: f32s(MTP_CHAIN_MAX_DRAFTS * TARGET_HIDDEN),
             logits: f32s(VOCAB),
-            output_token: shared_buffer(
-                device,
-                MTP_CHAIN_MAX_DRAFTS * std::mem::size_of::<u32>(),
-            ),
+            output_token: shared_buffer(device, MTP_CHAIN_MAX_DRAFTS * std::mem::size_of::<u32>()),
             hidden_rms_scalar: shared_buffer(device, 8),
             hidden_count: shared_buffer(device, 4),
             ffn_count: shared_buffer(device, 4),
@@ -1989,6 +2047,11 @@ impl Gemma4MtpAssistantMetal {
     /// Load an exact byte-identical copy of the official artifact. Shape,
     /// offsets, config, file length and SHA-256 are all pinned before mlock.
     pub fn load(path: &Path) -> Result<Self> {
+        let full_q4 = full_q4_requested_from_environment()?;
+        Self::load_with_full_q4(path, full_q4)
+    }
+
+    fn load_with_full_q4(path: &Path, full_q4_requested: bool) -> Result<Self> {
         let load_started = Instant::now();
         validate_official_config(path)?;
         let mapping = GgufWireMmap::map(path)?;
@@ -2061,10 +2124,33 @@ impl Gemma4MtpAssistantMetal {
         }
         let final_norm = norm("model.norm.weight")?;
         let embedding = manifest.matrix("model.embed_tokens.weight")?;
-        let q4_embedding = quantize_embedding_to_q4_0(&kernel.device, &locked_mapping.mapping, embedding).ok();
         let pre_projection = manifest.matrix("pre_projection.weight")?;
         let post_projection = manifest.matrix("post_projection.weight")?;
+        let full_q4 = full_q4_requested
+            .then(|| {
+                quantize_full_assistant_to_q4_0(
+                    &kernel.device,
+                    &locked_mapping.mapping,
+                    embedding,
+                    &layers,
+                    pre_projection,
+                    post_projection,
+                )
+            })
+            .transpose()?;
+        // Preserve the established best-effort Q4 tied-head optimization when
+        // full-Q4 is off. The explicit full-Q4 admission above is fail-closed:
+        // it never falls back to a partially quantized assistant.
+        let q4_embedding = if full_q4.is_none() {
+            quantize_embedding_to_q4_0(&kernel.device, &locked_mapping.mapping, embedding).ok()
+        } else {
+            None
+        };
         let scratch = MtpScratch::new(&kernel.device);
+        let full_q4_matrix_bytes = full_q4
+            .as_ref()
+            .map_or(0, |weights| weights.layout.matrix_bytes);
+        let full_q4_quantize_us = full_q4.as_ref().map_or(0, |weights| weights.quantize_us);
         let resident_ledger = Gemma4MtpResidentLedger {
             file_bytes: locked_mapping.mapping.file_len(),
             mapped_bytes: locked_mapping.mapping.mapped_len() as u64,
@@ -2085,11 +2171,23 @@ impl Gemma4MtpAssistantMetal {
                 .sum::<u64>()
                 + final_norm.length(),
             fixed_scratch_bytes: scratch.byte_len(),
+            full_q4_matrix_bytes,
+            full_q4_quantize_us,
             hash_us,
             lock_and_residency_us,
             pipeline_compile_us,
             load_wall_us: load_started.elapsed().as_micros(),
         };
+
+        if let Some(weights) = full_q4.as_ref() {
+            eprintln!(
+                "[gemma4-mtp full-q4] enabled=true source_sha256={} matrices=23 packed_bytes={} bf16_matrix_bytes={} quantize_us={} norms_quantized=false fallback=false",
+                EXPECTED_SHA256,
+                weights.layout.matrix_bytes,
+                MATRIX_BYTES_PER_PROPOSAL,
+                weights.quantize_us,
+            );
+        }
 
         Ok(Self {
             weight_file,
@@ -2098,6 +2196,7 @@ impl Gemma4MtpAssistantMetal {
             final_norm,
             embedding,
             q4_embedding,
+            full_q4,
             pre_projection,
             post_projection,
             scratch,
@@ -2123,7 +2222,22 @@ impl Gemma4MtpAssistantMetal {
     /// assistant head while the runtime is using the BF16 fallback.
     #[doc(hidden)]
     pub fn q4_head_enabled(&self) -> bool {
-        self.q4_embedding.is_some()
+        self.q4_embedding.is_some() || self.full_q4.is_some()
+    }
+
+    #[doc(hidden)]
+    pub fn full_q4_enabled(&self) -> bool {
+        self.full_q4.is_some()
+    }
+
+    fn assistant_matrix_bytes_per_proposal(&self) -> u64 {
+        if let Some(full_q4) = self.full_q4.as_ref() {
+            full_q4.layout.matrix_bytes
+        } else if let Some(q4_embedding) = self.q4_embedding.as_ref() {
+            MATRIX_BYTES_PER_PROPOSAL - EMBEDDING_BF16_BYTES + q4_embedding.length()
+        } else {
+            MATRIX_BYTES_PER_PROPOSAL
+        }
     }
 
     /// Ledger from the latest successful target-backed proposal. The
@@ -2279,10 +2393,14 @@ impl Gemma4MtpAssistantMetal {
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             || std::env::var_os("CAMELID_GEMMA4_MTP_STAGE_ORACLE_JSON").is_some())
         .then(Vec::new);
-        encode_bf16_gemv(
+        encode_assistant_matrix(
             encoder,
-            self.pipelines.selected_bf16_gemv(),
+            &self.pipelines,
             &self.weight_file,
+            self.full_q4.as_ref(),
+            self.full_q4
+                .as_ref()
+                .map(|weights| weights.layout.pre_projection),
             &self.scratch.pre_input,
             &self.scratch.hidden,
             self.pre_projection,
@@ -2364,10 +2482,14 @@ impl Gemma4MtpAssistantMetal {
             "final_norm",
             &mut pending_stage_snapshots,
         );
-        encode_bf16_gemv(
+        encode_assistant_matrix(
             encoder,
-            self.pipelines.selected_bf16_gemv(),
+            &self.pipelines,
             &self.weight_file,
+            self.full_q4.as_ref(),
+            self.full_q4
+                .as_ref()
+                .map(|weights| weights.layout.post_projection),
             &self.scratch.final_normalized,
             &self.scratch.recurrent_hidden,
             self.post_projection,
@@ -2381,7 +2503,17 @@ impl Gemma4MtpAssistantMetal {
             "post_projection",
             &mut pending_stage_snapshots,
         );
-        if let Some(q4_emb) = self.q4_embedding.as_ref() {
+        if let Some(full_q4) = self.full_q4.as_ref() {
+            encode_q4_0_gemv_packed(
+                encoder,
+                &self.pipelines.q4_0_gemv,
+                &full_q4.buffer,
+                &self.scratch.final_normalized,
+                &self.scratch.logits,
+                full_q4.layout.embedding,
+                false,
+            );
+        } else if let Some(q4_emb) = self.q4_embedding.as_ref() {
             encode_q4_0_gemv(
                 encoder,
                 &self.pipelines.q4_0_gemv,
@@ -2445,7 +2577,7 @@ impl Gemma4MtpAssistantMetal {
         let target_kv_read_bytes = target_kv_read_bytes(local_count, logical_len)?;
 
         let ledger = Gemma4MtpProposalLedger {
-            assistant_matrix_bytes: MATRIX_BYTES_PER_PROPOSAL,
+            assistant_matrix_bytes: self.assistant_matrix_bytes_per_proposal(),
             borrowed_target_kv_capacity_bytes,
             target_kv_read_bytes,
             dynamic_attention_scratch_bytes: attention_scores.length(),
@@ -2553,7 +2685,8 @@ impl Gemma4MtpAssistantMetal {
         // Pre-fill initial recurrent hidden into second half of pre_input
         for i in 0..TARGET_HIDDEN {
             unsafe {
-                *pre_input_ptr.add(TARGET_HIDDEN + i) = round_to_bf16_f32(initial_recurrent_hidden[i]);
+                *pre_input_ptr.add(TARGET_HIDDEN + i) =
+                    round_to_bf16_f32(initial_recurrent_hidden[i]);
             }
         }
         for step in 0..draft_limit {
@@ -2580,40 +2713,52 @@ impl Gemma4MtpAssistantMetal {
             let encoder = command_buffer.new_compute_command_encoder();
             let encode_started = Instant::now();
 
-            encode_bf16_gemv(
+            encode_assistant_matrix(
                 encoder,
-                self.pipelines.selected_bf16_gemv(),
+                &self.pipelines,
                 &self.weight_file,
+                self.full_q4.as_ref(),
+                self.full_q4
+                    .as_ref()
+                    .map(|weights| weights.layout.pre_projection),
                 &self.scratch.pre_input,
                 &self.scratch.hidden,
                 self.pre_projection,
             );
 
             for (layer_index, layer) in self.layers.iter().enumerate() {
-                let (kv, head_dim, position_count, cos, sin, qnorm_scalar, rope_scalar, attn_scalar) =
-                    if layer_index < 3 {
-                        (
-                            target_kv.sliding(),
-                            LOCAL_HEAD_DIM,
-                            local_count,
-                            &self.scratch.local_cos,
-                            &self.scratch.local_sin,
-                            &self.scratch.local_qnorm_scalar,
-                            &self.scratch.local_rope_scalar,
-                            &self.scratch.local_attention_scalar,
-                        )
-                    } else {
-                        (
-                            target_kv.full(),
-                            FULL_HEAD_DIM,
-                            logical_len,
-                            &self.scratch.full_cos,
-                            &self.scratch.full_sin,
-                            &self.scratch.full_qnorm_scalar,
-                            &self.scratch.full_rope_scalar,
-                            &self.scratch.full_attention_scalar,
-                        )
-                    };
+                let (
+                    kv,
+                    head_dim,
+                    position_count,
+                    cos,
+                    sin,
+                    qnorm_scalar,
+                    rope_scalar,
+                    attn_scalar,
+                ) = if layer_index < 3 {
+                    (
+                        target_kv.sliding(),
+                        LOCAL_HEAD_DIM,
+                        local_count,
+                        &self.scratch.local_cos,
+                        &self.scratch.local_sin,
+                        &self.scratch.local_qnorm_scalar,
+                        &self.scratch.local_rope_scalar,
+                        &self.scratch.local_attention_scalar,
+                    )
+                } else {
+                    (
+                        target_kv.full(),
+                        FULL_HEAD_DIM,
+                        logical_len,
+                        &self.scratch.full_cos,
+                        &self.scratch.full_sin,
+                        &self.scratch.full_qnorm_scalar,
+                        &self.scratch.full_rope_scalar,
+                        &self.scratch.full_attention_scalar,
+                    )
+                };
                 self.encode_layer(
                     encoder,
                     kernel,
@@ -2648,16 +2793,30 @@ impl Gemma4MtpAssistantMetal {
                 ASSISTANT_HIDDEN,
             );
 
-            encode_bf16_gemv(
+            encode_assistant_matrix(
                 encoder,
-                self.pipelines.selected_bf16_gemv(),
+                &self.pipelines,
                 &self.weight_file,
+                self.full_q4.as_ref(),
+                self.full_q4
+                    .as_ref()
+                    .map(|weights| weights.layout.post_projection),
                 &self.scratch.final_normalized,
                 &self.scratch.recurrent_hidden,
                 self.post_projection,
             );
 
-            if let Some(q4_emb) = self.q4_embedding.as_ref() {
+            if let Some(full_q4) = self.full_q4.as_ref() {
+                encode_q4_0_gemv_packed(
+                    encoder,
+                    &self.pipelines.q4_0_gemv,
+                    &full_q4.buffer,
+                    &self.scratch.final_normalized,
+                    &self.scratch.logits,
+                    full_q4.layout.embedding,
+                    false,
+                );
+            } else if let Some(q4_emb) = self.q4_embedding.as_ref() {
                 encode_q4_0_gemv(
                     encoder,
                     &self.pipelines.q4_0_gemv,
@@ -2707,7 +2866,10 @@ impl Gemma4MtpAssistantMetal {
                 )));
             }
 
-            read_buffer_f32(&self.scratch.recurrent_hidden, &mut current_recurrent_hidden);
+            read_buffer_f32(
+                &self.scratch.recurrent_hidden,
+                &mut current_recurrent_hidden,
+            );
             current_token = token;
 
             proposals.push(Gemma4MtpProposal {
@@ -2856,40 +3018,52 @@ impl Gemma4MtpAssistantMetal {
                 &self.scratch.pre_input,
                 TARGET_HIDDEN,
             );
-            encode_bf16_gemv(
+            encode_assistant_matrix(
                 encoder,
-                self.pipelines.selected_bf16_gemv(),
+                &self.pipelines,
                 &self.weight_file,
+                self.full_q4.as_ref(),
+                self.full_q4
+                    .as_ref()
+                    .map(|weights| weights.layout.pre_projection),
                 &self.scratch.pre_input,
                 &self.scratch.hidden,
                 self.pre_projection,
             );
 
             for (layer_index, layer) in self.layers.iter().enumerate() {
-                let (kv, head_dim, position_count, cos, sin, qnorm_scalar, rope_scalar, attn_scalar) =
-                    if layer_index < 3 {
-                        (
-                            target_kv.sliding(),
-                            LOCAL_HEAD_DIM,
-                            local_count,
-                            &self.scratch.local_cos,
-                            &self.scratch.local_sin,
-                            &self.scratch.local_qnorm_scalar,
-                            &self.scratch.local_rope_scalar,
-                            &self.scratch.local_attention_scalar,
-                        )
-                    } else {
-                        (
-                            target_kv.full(),
-                            FULL_HEAD_DIM,
-                            logical_len,
-                            &self.scratch.full_cos,
-                            &self.scratch.full_sin,
-                            &self.scratch.full_qnorm_scalar,
-                            &self.scratch.full_rope_scalar,
-                            &self.scratch.full_attention_scalar,
-                        )
-                    };
+                let (
+                    kv,
+                    head_dim,
+                    position_count,
+                    cos,
+                    sin,
+                    qnorm_scalar,
+                    rope_scalar,
+                    attn_scalar,
+                ) = if layer_index < 3 {
+                    (
+                        target_kv.sliding(),
+                        LOCAL_HEAD_DIM,
+                        local_count,
+                        &self.scratch.local_cos,
+                        &self.scratch.local_sin,
+                        &self.scratch.local_qnorm_scalar,
+                        &self.scratch.local_rope_scalar,
+                        &self.scratch.local_attention_scalar,
+                    )
+                } else {
+                    (
+                        target_kv.full(),
+                        FULL_HEAD_DIM,
+                        logical_len,
+                        &self.scratch.full_cos,
+                        &self.scratch.full_sin,
+                        &self.scratch.full_qnorm_scalar,
+                        &self.scratch.full_rope_scalar,
+                        &self.scratch.full_attention_scalar,
+                    )
+                };
                 self.encode_layer(
                     encoder,
                     kernel,
@@ -2923,10 +3097,14 @@ impl Gemma4MtpAssistantMetal {
                 &self.scratch.final_normalized,
                 ASSISTANT_HIDDEN,
             );
-            encode_bf16_gemv(
+            encode_assistant_matrix(
                 encoder,
-                self.pipelines.selected_bf16_gemv(),
+                &self.pipelines,
                 &self.weight_file,
+                self.full_q4.as_ref(),
+                self.full_q4
+                    .as_ref()
+                    .map(|weights| weights.layout.post_projection),
                 &self.scratch.final_normalized,
                 &self.scratch.recurrent_hidden,
                 self.post_projection,
@@ -2940,7 +3118,17 @@ impl Gemma4MtpAssistantMetal {
                 TARGET_HIDDEN,
             );
 
-            if let Some(q4_emb) = self.q4_embedding.as_ref() {
+            if let Some(full_q4) = self.full_q4.as_ref() {
+                encode_q4_0_gemv_packed(
+                    encoder,
+                    &self.pipelines.q4_0_gemv,
+                    &full_q4.buffer,
+                    &self.scratch.final_normalized,
+                    &self.scratch.logits,
+                    full_q4.layout.embedding,
+                    false,
+                );
+            } else if let Some(q4_emb) = self.q4_embedding.as_ref() {
                 encode_q4_0_gemv(
                     encoder,
                     &self.pipelines.q4_0_gemv,
@@ -2993,7 +3181,8 @@ impl Gemma4MtpAssistantMetal {
         let per_step_kv_read_bytes = target_kv_read_bytes(local_count, logical_len)?;
         let draft_count_u64 = draft_limit as u64;
         let ledger = Gemma4MtpProposalLedger {
-            assistant_matrix_bytes: MATRIX_BYTES_PER_PROPOSAL
+            assistant_matrix_bytes: self
+                .assistant_matrix_bytes_per_proposal()
                 .checked_mul(draft_count_u64)
                 .ok_or_else(|| invalid("device-chain matrix-byte ledger overflow"))?,
             borrowed_target_kv_capacity_bytes,
@@ -3053,8 +3242,10 @@ impl Gemma4MtpAssistantMetal {
             }
         }
         eprintln!(
-            "[gemma4-mtp device-chain] requested_drafts={draft_limit} returned_drafts={} command_buffers=1 commits=1 waits=1 cpu_embedding_callbacks=0 encode_us={} wait_us={} gpu_us={} kernel_us={} wall_us={}",
+            "[gemma4-mtp device-chain] requested_drafts={draft_limit} returned_drafts={} command_buffers=1 commits=1 waits=1 cpu_embedding_callbacks=0 linear_format={} matrix_bytes_per_draft={} encode_us={} wait_us={} gpu_us={} kernel_us={} wall_us={}",
             proposals.len(),
+            if self.full_q4.is_some() { "q4_0_all" } else if self.q4_embedding.is_some() { "bf16_q4_0_head" } else { "bf16" },
+            self.assistant_matrix_bytes_per_proposal(),
             total_timing.encode_us,
             total_timing.wait_us,
             total_timing.gpu_us,
@@ -3085,6 +3276,10 @@ impl Gemma4MtpAssistantMetal {
         #[cfg(test)] pending_stage_snapshots: &mut Option<Vec<PendingMtpStageSnapshot>>,
     ) {
         let q_dim = N_HEADS * head_dim;
+        let q4_layer = self
+            .full_q4
+            .as_ref()
+            .map(|weights| weights.layout.layers[layer_index]);
         debug_assert!(position_count > 0);
         encode_assistant_rms_norm_f32(
             encoder,
@@ -3109,10 +3304,12 @@ impl Gemma4MtpAssistantMetal {
             format!("layer.{layer_index}.input_norm"),
             pending_stage_snapshots,
         );
-        encode_bf16_gemv(
+        encode_assistant_matrix(
             encoder,
-            self.pipelines.selected_bf16_gemv(),
+            &self.pipelines,
             &self.weight_file,
+            self.full_q4.as_ref(),
+            q4_layer.map(|weights| weights.q),
             &self.scratch.normed,
             &self.scratch.query,
             layer.q,
@@ -3191,10 +3388,12 @@ impl Gemma4MtpAssistantMetal {
             pending_stage_snapshots,
         );
         debug_assert_eq!(layer.o.cols as usize, q_dim);
-        encode_bf16_gemv(
+        encode_assistant_matrix(
             encoder,
-            self.pipelines.selected_bf16_gemv(),
+            &self.pipelines,
             &self.weight_file,
+            self.full_q4.as_ref(),
+            q4_layer.map(|weights| weights.o),
             &self.scratch.context,
             &self.scratch.attention_projection,
             layer.o,
@@ -3269,10 +3468,12 @@ impl Gemma4MtpAssistantMetal {
             format!("layer.{layer_index}.pre_feedforward_norm"),
             pending_stage_snapshots,
         );
-        encode_bf16_gemv(
+        encode_assistant_matrix(
             encoder,
-            self.pipelines.selected_bf16_gemv(),
+            &self.pipelines,
             &self.weight_file,
+            self.full_q4.as_ref(),
+            q4_layer.map(|weights| weights.gate),
             &self.scratch.normed,
             &self.scratch.gate,
             layer.gate,
@@ -3286,10 +3487,12 @@ impl Gemma4MtpAssistantMetal {
             format!("layer.{layer_index}.gate_proj"),
             pending_stage_snapshots,
         );
-        encode_bf16_gemv(
+        encode_assistant_matrix(
             encoder,
-            self.pipelines.selected_bf16_gemv(),
+            &self.pipelines,
             &self.weight_file,
+            self.full_q4.as_ref(),
+            q4_layer.map(|weights| weights.up),
             &self.scratch.normed,
             &self.scratch.up,
             layer.up,
@@ -3311,10 +3514,12 @@ impl Gemma4MtpAssistantMetal {
             &self.scratch.gated,
             FFN_HIDDEN,
         );
-        encode_bf16_gemv(
+        encode_assistant_matrix(
             encoder,
-            self.pipelines.selected_bf16_gemv(),
+            &self.pipelines,
             &self.weight_file,
+            self.full_q4.as_ref(),
+            q4_layer.map(|weights| weights.down),
             &self.scratch.gated,
             &self.scratch.down,
             layer.down,
@@ -3923,12 +4128,44 @@ fn encode_q4_0_gemv(
     cols: u32,
     rows: u32,
 ) {
+    encode_q4_0_gemv_packed(
+        encoder,
+        pipeline,
+        q4_weights,
+        input,
+        output,
+        Q4TensorRef {
+            byte_offset: 0,
+            byte_len: q4_weights.length(),
+            rows,
+            cols,
+        },
+        false,
+    );
+}
+
+fn encode_q4_0_gemv_packed(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    q4_weights: &Buffer,
+    input: &Buffer,
+    output: &Buffer,
+    matrix: Q4TensorRef,
+    round_output_bf16: bool,
+) {
+    debug_assert!(matrix.byte_offset + matrix.byte_len <= q4_weights.length());
+    let cols = matrix.cols;
+    let rows = matrix.rows;
+    let weight_byte_offset = matrix.byte_offset;
+    let round_output_bf16 = u32::from(round_output_bf16);
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_buffer(0, Some(q4_weights), 0);
     encoder.set_buffer(1, Some(input), 0);
     encoder.set_buffer(2, Some(output), 0);
     encoder.set_bytes(3, 4, &cols as *const u32 as *const c_void);
     encoder.set_bytes(4, 4, &rows as *const u32 as *const c_void);
+    encoder.set_bytes(5, 8, &weight_byte_offset as *const u64 as *const c_void);
+    encoder.set_bytes(6, 4, &round_output_bf16 as *const u32 as *const c_void);
     encoder.dispatch_thread_groups(
         MTLSize {
             width: rows as u64,
@@ -3943,58 +4180,238 @@ fn encode_q4_0_gemv(
     );
 }
 
+fn encode_assistant_matrix(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipelines: &MtpPipelines,
+    weight_file: &Buffer,
+    full_q4: Option<&FullQ4Weights>,
+    q4_matrix: Option<Q4TensorRef>,
+    input: &Buffer,
+    output: &Buffer,
+    bf16_matrix: TensorRef,
+) {
+    if let Some(full_q4) = full_q4 {
+        let q4_matrix = q4_matrix.expect("full-Q4 admission populated every matrix");
+        debug_assert_eq!(
+            (q4_matrix.rows, q4_matrix.cols),
+            (bf16_matrix.rows, bf16_matrix.cols)
+        );
+        encode_q4_0_gemv_packed(
+            encoder,
+            &pipelines.q4_0_gemv,
+            &full_q4.buffer,
+            input,
+            output,
+            q4_matrix,
+            true,
+        );
+    } else {
+        encode_bf16_gemv(
+            encoder,
+            pipelines.selected_bf16_gemv(),
+            weight_file,
+            input,
+            output,
+            bf16_matrix,
+        );
+    }
+}
+
+fn q4_0_matrix_bytes(tensor: TensorRef) -> Result<usize> {
+    let rows = tensor.rows as usize;
+    let cols = tensor.cols as usize;
+    if rows == 0 || cols == 0 || !cols.is_multiple_of(Q4_0_BLOCK_VALUES) {
+        return Err(invalid(format!(
+            "Q4_0 matrix geometry {}x{} is empty or not divisible by {Q4_0_BLOCK_VALUES}",
+            tensor.rows, tensor.cols
+        )));
+    }
+    rows.checked_mul(cols / Q4_0_BLOCK_VALUES)
+        .and_then(|blocks| blocks.checked_mul(Q4_0_BLOCK_BYTES))
+        .ok_or_else(|| invalid("Q4_0 matrix byte size overflow"))
+}
+
+fn append_q4_0_layout(tensor: TensorRef, cursor: &mut u64) -> Result<Q4TensorRef> {
+    let byte_len = u64::try_from(q4_0_matrix_bytes(tensor)?)
+        .map_err(|_| invalid("Q4_0 matrix byte size exceeds u64"))?;
+    let result = Q4TensorRef {
+        byte_offset: *cursor,
+        byte_len,
+        rows: tensor.rows,
+        cols: tensor.cols,
+    };
+    *cursor = cursor
+        .checked_add(byte_len)
+        .ok_or_else(|| invalid("full-Q4 layout byte size overflow"))?;
+    Ok(result)
+}
+
+impl FullQ4Layout {
+    fn build(
+        embedding: TensorRef,
+        layers: &[LayerWeights],
+        pre_projection: TensorRef,
+        post_projection: TensorRef,
+    ) -> Result<Self> {
+        if layers.len() != 4 {
+            return Err(invalid(format!(
+                "full-Q4 layout has {} layers, expected 4",
+                layers.len()
+            )));
+        }
+        let mut cursor = 0u64;
+        let embedding = append_q4_0_layout(embedding, &mut cursor)?;
+        let mut packed_layers = [FullQ4LayerWeights::default(); 4];
+        for (destination, source) in packed_layers.iter_mut().zip(layers) {
+            *destination = FullQ4LayerWeights {
+                q: append_q4_0_layout(source.q, &mut cursor)?,
+                o: append_q4_0_layout(source.o, &mut cursor)?,
+                gate: append_q4_0_layout(source.gate, &mut cursor)?,
+                up: append_q4_0_layout(source.up, &mut cursor)?,
+                down: append_q4_0_layout(source.down, &mut cursor)?,
+            };
+        }
+        let pre_projection = append_q4_0_layout(pre_projection, &mut cursor)?;
+        let post_projection = append_q4_0_layout(post_projection, &mut cursor)?;
+        Ok(Self {
+            embedding,
+            layers: packed_layers,
+            pre_projection,
+            post_projection,
+            matrix_bytes: cursor,
+        })
+    }
+}
+
+fn quantize_q4_0_row(input: &[u16], output: &mut [u8]) {
+    debug_assert_eq!(input.len() % Q4_0_BLOCK_VALUES, 0);
+    debug_assert_eq!(
+        output.len(),
+        input.len() / Q4_0_BLOCK_VALUES * Q4_0_BLOCK_BYTES
+    );
+    for (block_in, block_out) in input
+        .chunks_exact(Q4_0_BLOCK_VALUES)
+        .zip(output.chunks_exact_mut(Q4_0_BLOCK_BYTES))
+    {
+        let mut f32_vals = [0.0f32; Q4_0_BLOCK_VALUES];
+        let mut max_abs = 0.0f32;
+        for (destination, bits) in f32_vals.iter_mut().zip(block_in) {
+            let value = bf16_bits_to_f32(*bits);
+            *destination = value;
+            max_abs = max_abs.max(value.abs());
+        }
+        let scale = max_abs / -8.0;
+        let inv_scale = if scale != 0.0 { 1.0 / scale } else { 0.0 };
+        block_out[..2].copy_from_slice(&f32_to_f16_bits(scale).to_le_bytes());
+        for index in 0..16 {
+            let low = (f32_vals[index] * inv_scale + 8.5).floor().clamp(0.0, 15.0) as u8;
+            let high = (f32_vals[index + 16] * inv_scale + 8.5)
+                .floor()
+                .clamp(0.0, 15.0) as u8;
+            block_out[2 + index] = (low & 0x0f) | ((high & 0x0f) << 4);
+        }
+    }
+}
+
+fn quantize_matrix_into_q4_0(
+    mapping: &GgufWireMmap,
+    tensor: TensorRef,
+    destination: &Buffer,
+    packed: Q4TensorRef,
+) -> Result<()> {
+    let rows = tensor.rows as usize;
+    let cols = tensor.cols as usize;
+    let row_bytes = cols / Q4_0_BLOCK_VALUES * Q4_0_BLOCK_BYTES;
+    let expected_bytes = q4_0_matrix_bytes(tensor)?;
+    if packed.rows != tensor.rows
+        || packed.cols != tensor.cols
+        || packed.byte_len != expected_bytes as u64
+        || packed
+            .byte_offset
+            .checked_add(packed.byte_len)
+            .is_none_or(|end| end > destination.length())
+    {
+        return Err(invalid(
+            "full-Q4 matrix layout does not cover its destination",
+        ));
+    }
+    let input_bytes = mapping.bytes(tensor.absolute_offset as u64, rows * cols * 2)?;
+    let input =
+        unsafe { std::slice::from_raw_parts(input_bytes.as_ptr().cast::<u16>(), rows * cols) };
+    let output_address = destination.contents() as usize + packed.byte_offset as usize;
+
+    use rayon::prelude::*;
+    (0..rows).into_par_iter().for_each(|row| {
+        let row_input = &input[row * cols..(row + 1) * cols];
+        let row_output = unsafe {
+            std::slice::from_raw_parts_mut((output_address + row * row_bytes) as *mut u8, row_bytes)
+        };
+        quantize_q4_0_row(row_input, row_output);
+    });
+    Ok(())
+}
+
+fn quantize_full_assistant_to_q4_0(
+    device: &Device,
+    mapping: &GgufWireMmap,
+    embedding: TensorRef,
+    layers: &[LayerWeights],
+    pre_projection: TensorRef,
+    post_projection: TensorRef,
+) -> Result<FullQ4Weights> {
+    let layout = FullQ4Layout::build(embedding, layers, pre_projection, post_projection)?;
+    let buffer = shared_buffer(
+        device,
+        usize::try_from(layout.matrix_bytes)
+            .map_err(|_| invalid("full-Q4 matrix pack exceeds usize"))?,
+    );
+    let started = Instant::now();
+    quantize_matrix_into_q4_0(mapping, embedding, &buffer, layout.embedding)?;
+    for ((source, destination), layer_index) in
+        layers.iter().zip(layout.layers.iter()).zip(0usize..)
+    {
+        for (name, tensor, packed) in [
+            ("q", source.q, destination.q),
+            ("o", source.o, destination.o),
+            ("gate", source.gate, destination.gate),
+            ("up", source.up, destination.up),
+            ("down", source.down, destination.down),
+        ] {
+            quantize_matrix_into_q4_0(mapping, tensor, &buffer, packed).map_err(|error| {
+                invalid(format!(
+                    "full-Q4 layer {layer_index} {name} packing failed: {error}"
+                ))
+            })?;
+        }
+    }
+    quantize_matrix_into_q4_0(mapping, pre_projection, &buffer, layout.pre_projection)?;
+    quantize_matrix_into_q4_0(mapping, post_projection, &buffer, layout.post_projection)?;
+    Ok(FullQ4Weights {
+        buffer,
+        layout,
+        quantize_us: started.elapsed().as_micros(),
+    })
+}
+
 fn quantize_embedding_to_q4_0(
     device: &Device,
     mapping: &GgufWireMmap,
     tensor: TensorRef,
 ) -> Result<Buffer> {
-    let rows = tensor.rows as usize;
-    let cols = tensor.cols as usize;
-    let blocks_per_row = cols / 32;
-    let total_bytes = rows * blocks_per_row * 18;
-    let buf = shared_buffer(device, total_bytes);
-    let out_addr = buf.contents() as usize;
-    let in_bytes = mapping.bytes(tensor.absolute_offset as u64, rows * cols * 2)?;
-    let in_u16 = unsafe {
-        std::slice::from_raw_parts(in_bytes.as_ptr() as *const u16, rows * cols)
-    };
-
-    use rayon::prelude::*;
-    (0..rows).into_par_iter().for_each(|row| {
-        let row_in = &in_u16[row * cols..(row + 1) * cols];
-        let row_out = (out_addr + row * blocks_per_row * 18) as *mut u8;
-        for b in 0..blocks_per_row {
-            let block_in = &row_in[b * 32..(b + 1) * 32];
-            let mut f32_vals = [0.0f32; 32];
-            let mut max_abs = 0.0f32;
-            for i in 0..32 {
-                let f = bf16_bits_to_f32(block_in[i]);
-                f32_vals[i] = f;
-                let abs = f.abs();
-                if abs > max_abs {
-                    max_abs = abs;
-                }
-            }
-            let scale = max_abs / -8.0;
-            let inv_scale = if scale != 0.0 { 1.0 / scale } else { 0.0 };
-            let d_bits = f32_to_f16_bits(scale);
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    &d_bits as *const u16 as *const u8,
-                    row_out.add(b * 18),
-                    2,
-                );
-                let qs = row_out.add(b * 18 + 2);
-                for i in 0..16 {
-                    let v0 = (f32_vals[i] * inv_scale + 8.5).floor().clamp(0.0, 15.0) as u8;
-                    let v1 = (f32_vals[i + 16] * inv_scale + 8.5).floor().clamp(0.0, 15.0) as u8;
-                    *qs.add(i) = (v0 & 0x0f) | ((v1 & 0x0f) << 4);
-                }
-            }
-        }
-    });
-
-    Ok(buf)
+    let byte_len = q4_0_matrix_bytes(tensor)?;
+    let buffer = shared_buffer(device, byte_len);
+    quantize_matrix_into_q4_0(
+        mapping,
+        tensor,
+        &buffer,
+        Q4TensorRef {
+            byte_offset: 0,
+            byte_len: byte_len as u64,
+            rows: tensor.rows,
+            cols: tensor.cols,
+        },
+    )?;
+    Ok(buffer)
 }
 
 fn validate_target_embedding_geometry(
@@ -4355,6 +4772,252 @@ mod tests {
         assert_eq!(parse_device_chain_opt_in(Some("TrUe")), Ok(true));
         assert!(parse_device_chain_opt_in(Some("yes")).is_err());
         assert!(parse_device_chain_opt_in(Some("")).is_err());
+    }
+
+    #[test]
+    fn full_q4_opt_in_is_explicit_and_malformed_values_fail_closed() {
+        assert_eq!(parse_full_q4_opt_in(None), Ok(false));
+        assert_eq!(parse_full_q4_opt_in(Some("0")), Ok(false));
+        assert_eq!(parse_full_q4_opt_in(Some("FALSE")), Ok(false));
+        assert_eq!(parse_full_q4_opt_in(Some("1")), Ok(true));
+        assert_eq!(parse_full_q4_opt_in(Some("TrUe")), Ok(true));
+        assert!(parse_full_q4_opt_in(Some("yes")).is_err());
+        assert!(parse_full_q4_opt_in(Some("")).is_err());
+    }
+
+    #[test]
+    fn full_q4_layout_covers_every_matrix_without_padding_or_overlap() {
+        let mut cursor = 0u64;
+        let mut matrix_count = 0usize;
+        for expected in EXPECTED_TENSORS
+            .iter()
+            .filter(|tensor| tensor.shape.len() == 2)
+        {
+            let tensor = TensorRef {
+                absolute_offset: (PAYLOAD_FILE_OFFSET as u64 + expected.start) as u32,
+                rows: expected.shape[0] as u32,
+                cols: expected.shape[1] as u32,
+            };
+            let packed = append_q4_0_layout(tensor, &mut cursor).unwrap();
+            assert_eq!(packed.byte_offset + packed.byte_len, cursor);
+            assert_eq!((packed.rows, packed.cols), (tensor.rows, tensor.cols));
+            matrix_count += 1;
+        }
+        assert_eq!(matrix_count, 23);
+        assert_eq!(cursor, 236_077_056);
+        assert_eq!(cursor, 225 * 1_048_576 + 147_456);
+    }
+
+    #[test]
+    fn q4_row_encoder_has_pinned_zero_and_finite_block_contract() {
+        let zeros = [0u16; Q4_0_BLOCK_VALUES];
+        let mut zero_block = [0u8; Q4_0_BLOCK_BYTES];
+        quantize_q4_0_row(&zeros, &mut zero_block);
+        assert_eq!(&zero_block[..2], &[0, 0x80]);
+        assert!(zero_block[2..].iter().all(|byte| *byte == 0x88));
+
+        let input: Vec<u16> = (0..Q4_0_BLOCK_VALUES)
+            .map(|index| {
+                let value = (index as f32 - 15.5) / 7.0;
+                f32_to_bf16_rne_bits(value)
+            })
+            .collect();
+        let mut first = [0u8; Q4_0_BLOCK_BYTES];
+        let mut second = [0u8; Q4_0_BLOCK_BYTES];
+        quantize_q4_0_row(&input, &mut first);
+        quantize_q4_0_row(&input, &mut second);
+        assert_eq!(first, second);
+        assert_ne!(&first[..2], &[0, 0]);
+        assert!(first[2..].iter().any(|byte| *byte != 0x88));
+    }
+
+    #[test]
+    fn q4_packed_nonzero_offset_is_raw_bit_identical() {
+        const ROWS: usize = 64;
+        const COLS: usize = 1_024;
+        const OFFSET: usize = 256;
+        let kernel = metal_linear_kernel().expect("Metal kernel");
+        let pipelines = MtpPipelines::new(&kernel.device).expect("MTP pipelines");
+        let input: Vec<f32> = (0..COLS)
+            .map(|index| ((index as f32 * 0.03125).sin() * 0.75) + 0.125)
+            .collect();
+        let weights: Vec<u16> = (0..ROWS * COLS)
+            .map(|index| {
+                f32_to_bf16_rne_bits(((index as f32 * 0.000_976_562_5).cos() * 0.5) - 0.0625)
+            })
+            .collect();
+        let row_bytes = COLS / Q4_0_BLOCK_VALUES * Q4_0_BLOCK_BYTES;
+        let mut packed = vec![0u8; ROWS * row_bytes];
+        for row in 0..ROWS {
+            quantize_q4_0_row(
+                &weights[row * COLS..(row + 1) * COLS],
+                &mut packed[row * row_bytes..(row + 1) * row_bytes],
+            );
+        }
+        let standalone = shared_buffer(&kernel.device, packed.len());
+        let offset_buffer = shared_buffer(&kernel.device, OFFSET + packed.len() + 256);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                packed.as_ptr(),
+                standalone.contents().cast::<u8>(),
+                packed.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                packed.as_ptr(),
+                offset_buffer.contents().cast::<u8>().add(OFFSET),
+                packed.len(),
+            );
+        }
+        let input = f32_buffer(&kernel.device, &input);
+        let run = |weights: &Buffer, offset: u64| {
+            let output = shared_buffer(&kernel.device, ROWS * std::mem::size_of::<f32>());
+            let command_buffer = kernel.queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            encode_q4_0_gemv_packed(
+                encoder,
+                &pipelines.q4_0_gemv,
+                weights,
+                &input,
+                &output,
+                Q4TensorRef {
+                    byte_offset: offset,
+                    byte_len: packed.len() as u64,
+                    rows: ROWS as u32,
+                    cols: COLS as u32,
+                },
+                true,
+            );
+            encoder.end_encoding();
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
+            let mut values = vec![0.0f32; ROWS];
+            read_buffer_f32(&output, &mut values);
+            values
+        };
+        let zero_offset = run(&standalone, 0);
+        let nonzero_offset = run(&offset_buffer, OFFSET as u64);
+        assert_eq!(
+            zero_offset
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            nonzero_offset
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    #[ignore = "loads and quantizes the pinned 800 MiB official artifact"]
+    fn official_full_q4_k7_warm_benchmark_receipt() {
+        #[derive(Debug)]
+        struct BenchResult {
+            load_wall_us: u128,
+            quantize_us: u128,
+            locked_bytes: u64,
+            packed_bytes: u64,
+            matrix_bytes_per_draft: u64,
+            k7_gpu_us: u128,
+            k7_proposal_wall_us: u128,
+            k7_outer_wall_us: u128,
+        }
+
+        fn run(full_q4: bool) -> BenchResult {
+            let path = Path::new(OFFICIAL_STAGED_ASSISTANT_PATH);
+            assert!(path.is_file(), "missing official assistant at {path:?}");
+            let load_started = Instant::now();
+            let mut assistant = Gemma4MtpAssistantMetal::load_with_full_q4(path, full_q4)
+                .expect("load official assistant");
+            let load_wall_us = load_started.elapsed().as_micros();
+            assert_eq!(assistant.full_q4_enabled(), full_q4);
+            assistant.warm_target_free().expect("warm assistant");
+
+            let kernel = metal_linear_kernel().expect("Metal kernel");
+            let sliding_elements = LOCAL_KV_HEADS * LOCAL_HEAD_DIM;
+            let full_elements = FULL_KV_HEADS * FULL_HEAD_DIM;
+            let sliding_key = f32_buffer(&kernel.device, &vec![0.0; sliding_elements]);
+            let sliding_value = f32_buffer(&kernel.device, &vec![0.0; sliding_elements]);
+            let full_key = f32_buffer(&kernel.device, &vec![0.0; full_elements]);
+            let full_value = f32_buffer(&kernel.device, &vec![0.0; full_elements]);
+            let target_kv = Gemma4MtpTargetKvView {
+                sliding: Gemma4MtpTargetKvLayerView {
+                    layer_index: 28,
+                    key: &sliding_key,
+                    value: &sliding_value,
+                    logical_len: 1,
+                    kv_stride: 1,
+                    kv_heads: LOCAL_KV_HEADS,
+                    head_dim: LOCAL_HEAD_DIM,
+                    sliding_window: Some(LOCAL_WINDOW),
+                },
+                full: Gemma4MtpTargetKvLayerView {
+                    layer_index: 29,
+                    key: &full_key,
+                    value: &full_value,
+                    logical_len: 1,
+                    kv_stride: 1,
+                    kv_heads: FULL_KV_HEADS,
+                    head_dim: FULL_HEAD_DIM,
+                    sliding_window: None,
+                },
+            };
+            let initial_recurrent = vec![0.0f32; TARGET_HIDDEN];
+            let outer_started = Instant::now();
+            let proposals = assistant
+                .propose_chain(
+                    0,
+                    &initial_recurrent,
+                    target_kv,
+                    7,
+                    &[],
+                    |_token, output| {
+                        output.fill(0.0);
+                        Ok(())
+                    },
+                )
+                .expect("run K7 assistant chain");
+            let k7_outer_wall_us = outer_started.elapsed().as_micros();
+            assert_eq!(proposals.len(), 7);
+            assert!(proposals.iter().all(|proposal| {
+                proposal.recurrent_hidden.len() == TARGET_HIDDEN
+                    && proposal
+                        .recurrent_hidden
+                        .iter()
+                        .all(|value| value.is_finite())
+            }));
+            let ledger = assistant.resident_ledger();
+            BenchResult {
+                load_wall_us,
+                quantize_us: ledger.full_q4_quantize_us,
+                locked_bytes: ledger.locked_bytes,
+                packed_bytes: ledger.full_q4_matrix_bytes,
+                matrix_bytes_per_draft: assistant.assistant_matrix_bytes_per_proposal(),
+                k7_gpu_us: proposals
+                    .iter()
+                    .map(|proposal| proposal.timing.gpu_us)
+                    .sum(),
+                k7_proposal_wall_us: proposals
+                    .iter()
+                    .map(|proposal| proposal.timing.wall_us)
+                    .sum(),
+                k7_outer_wall_us,
+            }
+        }
+
+        let baseline = run(false);
+        let full_q4 = run(true);
+        assert_eq!(full_q4.packed_bytes, 236_077_056);
+        assert_eq!(full_q4.matrix_bytes_per_draft, full_q4.packed_bytes);
+        assert_eq!(baseline.matrix_bytes_per_draft, 453_509_120);
+        assert!(full_q4.quantize_us > 0);
+        eprintln!(
+            "[gemma4-mtp full-q4 benchmark] baseline={baseline:?} full_q4={full_q4:?} traffic_ratio={:.3} gpu_speedup={:.3} proposal_wall_speedup={:.3}",
+            baseline.matrix_bytes_per_draft as f64 / full_q4.matrix_bytes_per_draft as f64,
+            baseline.k7_gpu_us as f64 / full_q4.k7_gpu_us as f64,
+            baseline.k7_proposal_wall_us as f64 / full_q4.k7_proposal_wall_us as f64,
+        );
     }
 
     #[test]
