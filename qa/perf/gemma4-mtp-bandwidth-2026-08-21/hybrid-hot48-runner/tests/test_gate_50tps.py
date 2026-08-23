@@ -42,6 +42,9 @@ class Gate50TpsTests(unittest.TestCase):
                     "mapped_readahead_advised_records": 1,
                     "mapped_readahead_advised_bytes": 3_345_408,
                     "mapped_readahead_enqueue_ms": 0.01,
+                    "mapped_readahead_previous_union_advised_records": 1,
+                    "mapped_readahead_previous_union_advised_bytes": 3_345_408,
+                    "mapped_readahead_previous_union_enqueue_ms": 0.01,
                     "per_layer": per_layer,
                 }
             )
@@ -91,9 +94,13 @@ class Gate50TpsTests(unittest.TestCase):
             "effective=0 terminal_decode_promotion=off final_prefill_hot_handoff=on\n"
             + gate.MAPPED_READAHEAD_MARKER
             + "\n"
+            + gate.PREVIOUS_UNION_READAHEAD_MARKER
+            + "\n"
             + "[gemma4-mtp bootstrap] prefill_seed_attempted=1 used=1 fallback=none\n"
             + "[gemma4 exact partition] CAMELID_GEMMA4_DENSE_K8_GENERIC=1 "
             "static_k8_dense=off runtime_k_dense=on\n"
+            + gate.PACKED_K8_GATEUP_MARKER
+            + "\n"
             + chain * 6,
             encoding="utf-8",
         )
@@ -172,6 +179,39 @@ class Gate50TpsTests(unittest.TestCase):
             ] += 1
             response_path.write_text(json.dumps(response), encoding="utf-8")
             with self.assertRaisesRegex(gate.GateError, "mapped-cold readahead receipt"):
+                gate.analyze(response_path, log_path, expected_path)
+
+    def test_missing_previous_union_marker_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            response_path, log_path, expected_path = self.fixture(Path(temporary))
+            log = log_path.read_text(encoding="utf-8")
+            log_path.write_text(
+                log.replace(gate.PREVIOUS_UNION_READAHEAD_MARKER + "\n", ""),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(gate.GateError, "previous-union readahead"):
+                gate.analyze(response_path, log_path, expected_path)
+
+    def test_inconsistent_previous_union_bytes_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            response_path, log_path, expected_path = self.fixture(Path(temporary))
+            response = json.loads(response_path.read_text(encoding="utf-8"))
+            response["camelid"]["hybrid_telemetry"]["rounds"][0][
+                "mapped_readahead_previous_union_advised_bytes"
+            ] += 1
+            response_path.write_text(json.dumps(response), encoding="utf-8")
+            with self.assertRaisesRegex(gate.GateError, "previous-union readahead receipt"):
+                gate.analyze(response_path, log_path, expected_path)
+
+    def test_missing_exact_packed_gateup_marker_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            response_path, log_path, expected_path = self.fixture(Path(temporary))
+            log = log_path.read_text(encoding="utf-8")
+            log_path.write_text(
+                log.replace(gate.PACKED_K8_GATEUP_MARKER + "\n", ""),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(gate.GateError, "exact packed K8 GateUp"):
                 gate.analyze(response_path, log_path, expected_path)
 
 

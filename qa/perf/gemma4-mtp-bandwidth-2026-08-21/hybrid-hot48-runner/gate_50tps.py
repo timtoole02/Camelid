@@ -26,6 +26,16 @@ MAPPED_READAHEAD_MARKER = (
     "CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD effective=1 "
     "scope=selected-cold-only advice=MADV_WILLNEED dispatch=async-read-pool"
 )
+PREVIOUS_UNION_READAHEAD_MARKER = (
+    "[gemma4-ghost-metal] mapped-cold previous-union policy: "
+    "source=previous-target-exact-routed-union timing=before-assistant "
+    "scope=selected-cold-only advice=MADV_WILLNEED dispatch=async-read-pool "
+    "correctness_dependency=0"
+)
+PACKED_K8_GATEUP_MARKER = (
+    "[gemma4 exact partition] packed_k8_gateup=row_complete "
+    "runtime_width_oracle=raw_bit_exact"
+)
 DEVICE_CHAIN_PATTERN = re.compile(
     r"^\[gemma4-mtp device-chain\] requested_drafts=(\d+) returned_drafts=(\d+) "
     r"command_buffers=1 commits=1 waits=1 cpu_embedding_callbacks=0 "
@@ -104,6 +114,9 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
     mapped_readahead_records = 0
     mapped_readahead_bytes = 0
     mapped_readahead_enqueue_ms = 0.0
+    previous_union_readahead_records = 0
+    previous_union_readahead_bytes = 0
+    previous_union_readahead_enqueue_ms = 0.0
     for index, receipt in enumerate(rounds):
         if not isinstance(receipt, dict) or receipt.get("round_index") != index:
             raise GateError(f"round {index} is missing or reordered")
@@ -120,6 +133,15 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
         advised_records = receipt.get("mapped_readahead_advised_records")
         advised_bytes = receipt.get("mapped_readahead_advised_bytes")
         enqueue_ms = receipt.get("mapped_readahead_enqueue_ms")
+        previous_advised_records = receipt.get(
+            "mapped_readahead_previous_union_advised_records"
+        )
+        previous_advised_bytes = receipt.get(
+            "mapped_readahead_previous_union_advised_bytes"
+        )
+        previous_enqueue_ms = receipt.get(
+            "mapped_readahead_previous_union_enqueue_ms"
+        )
         per_layer = receipt.get("per_layer")
         if (
             not all(isinstance(value, int) and value >= 0 for value in (
@@ -160,6 +182,19 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
             or float(enqueue_ms) < 0.0
         ):
             raise GateError(f"round {index} has an invalid mapped-cold readahead receipt")
+        if (
+            not isinstance(previous_advised_records, int)
+            or isinstance(previous_advised_records, bool)
+            or previous_advised_records < 0
+            or not isinstance(previous_advised_bytes, int)
+            or isinstance(previous_advised_bytes, bool)
+            or previous_advised_bytes != previous_advised_records * record_payload_bytes
+            or not finite_number(previous_enqueue_ms)
+            or float(previous_enqueue_ms) < 0.0
+        ):
+            raise GateError(
+                f"round {index} has an invalid previous-union readahead receipt"
+            )
         for field in ("selected_dropped", "missing_failclose", "slot_capacity_overflow", "overflow_experts"):
             if receipt.get(field) != 0:
                 raise GateError(f"round {index} has nonzero {field}")
@@ -176,6 +211,9 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
         mapped_readahead_records += advised_records
         mapped_readahead_bytes += advised_bytes
         mapped_readahead_enqueue_ms += float(enqueue_ms)
+        previous_union_readahead_records += previous_advised_records
+        previous_union_readahead_bytes += previous_advised_bytes
+        previous_union_readahead_enqueue_ms += float(previous_enqueue_ms)
 
     metrics = telemetry.get("metrics")
     if not isinstance(metrics, dict):
@@ -218,6 +256,8 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
         raise GateError("server did not disable terminal decode promotion")
     if log.splitlines().count(MAPPED_READAHEAD_MARKER) != 1:
         raise GateError("server did not admit exact selected-cold mapped readahead")
+    if log.splitlines().count(PREVIOUS_UNION_READAHEAD_MARKER) != 1:
+        raise GateError("server did not admit pre-assistant previous-union readahead")
     bootstrap_marker = (
         "[gemma4-mtp bootstrap] prefill_seed_attempted=1 used=1 fallback=none"
     )
@@ -229,6 +269,10 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
     )
     if log.count(partition_marker) != 1:
         raise GateError("generation did not use the K1/K8 partition-parity dense path")
+    if log.splitlines().count(PACKED_K8_GATEUP_MARKER) != 1:
+        raise GateError("generation did not admit the exact packed K8 GateUp path")
+    if previous_union_readahead_records == 0:
+        raise GateError("generation did not dispatch any previous-union page advice")
     chain_receipts = DEVICE_CHAIN_PATTERN.findall(log)
     if len(chain_receipts) != assistant_rounds:
         raise GateError(
@@ -247,6 +291,8 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
         "no_zero_accept_full_k8": zero_accept_full_k8 == 0,
         "terminal_decode_promotion_off": True,
         "mapped_cold_readahead_active": True,
+        "previous_union_readahead_active": True,
+        "exact_packed_k8_gateup_active": True,
     }
     return {
         "schema_version": 1,
@@ -265,6 +311,9 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
         "mapped_readahead_advised_records": mapped_readahead_records,
         "mapped_readahead_advised_bytes": mapped_readahead_bytes,
         "mapped_readahead_enqueue_ms": mapped_readahead_enqueue_ms,
+        "previous_union_readahead_advised_records": previous_union_readahead_records,
+        "previous_union_readahead_advised_bytes": previous_union_readahead_bytes,
+        "previous_union_readahead_enqueue_ms": previous_union_readahead_enqueue_ms,
         "performance_gates": gates,
     }
 
