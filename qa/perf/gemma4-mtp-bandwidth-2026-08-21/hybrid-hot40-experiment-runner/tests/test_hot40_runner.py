@@ -167,6 +167,9 @@ class SyntheticRun:
 
     def _environment(self) -> dict[str, str]:
         environment = dict(hot40.EXPECTED_ENVIRONMENT)
+        if getattr(self, "intent", {}).get("pager_rdadvise") is True:
+            environment[hot40.MAPPED_READAHEAD_ENV] = "1"
+            environment[hot40.MAPPED_RDADVISE_ENV] = "1"
         environment["CAMELID_GEMMA4_MTP_ASSISTANT_PATH"] = str(self.inputs["assistant"])
         return environment
 
@@ -238,6 +241,22 @@ class SyntheticRun:
             "protected_port": 8181,
             "protected_port_policy": "never-bound-connected-or-signaled",
             "allow_warning_pressure": False,
+            "pager_rdadvise": False,
+            "pager_contract": {
+                "strategy": "disabled",
+                "exact_record_ranges": False,
+                "record_payload_bytes": 3_345_408,
+                "correctness_dependency": False,
+                "runtime_flags": {},
+                "mapped_readahead_enabled": False,
+                "mapped_readahead_max_inflight_records": 0,
+                "mapped_rdadvise_enabled": False,
+                "mapped_rdadvise_early_max_records": 0,
+                "mapped_rdadvise_total_max_records": 0,
+                "mapped_rdadvise_anonymous_capacity_bytes": 0,
+                "legacy_madv_receipts_required_zero": True,
+            },
+            "comparison_baseline": None,
             "disk": {
                 "available_kib": 24 * 1024 * 1024,
                 "minimum_available_kib": 20 * 1024 * 1024,
@@ -253,6 +272,10 @@ class SyntheticRun:
                 "file_mapped_address_span_bytes": 12_897_484_800,
                 "mapped_readahead_enabled": False,
                 "mapped_readahead_max_inflight_records": 0,
+                "mapped_rdadvise_enabled": False,
+                "mapped_rdadvise_early_max_records": 0,
+                "mapped_rdadvise_total_max_records": 0,
+                "mapped_rdadvise_anonymous_capacity_bytes": 0,
                 "overflow_slots": 0,
                 "victim_slots": 0,
                 "host_cache_budget_bytes": 0,
@@ -426,6 +449,10 @@ class SyntheticRun:
             "mapped_readahead_enabled": False,
             "mapped_readahead_max_inflight_records": 0,
             "mapped_readahead_anonymous_capacity_bytes": 0,
+            "mapped_rdadvise_enabled": False,
+            "mapped_rdadvise_early_max_records": 0,
+            "mapped_rdadvise_total_max_records": 0,
+            "mapped_rdadvise_anonymous_capacity_bytes": 0,
             "per_layer": [
                 {
                     "layer": layer,
@@ -480,6 +507,15 @@ class SyntheticRun:
                     "mapped_readahead_previous_union_enqueued_records": 0,
                     "mapped_readahead_previous_union_enqueued_bytes": 0,
                     "mapped_readahead_previous_union_enqueue_ms": 0.0,
+                    "mapped_rdadvise_early_accepted_records": 0,
+                    "mapped_rdadvise_early_accepted_bytes": 0,
+                    "mapped_rdadvise_early_refused_records": 0,
+                    "mapped_rdadvise_early_dispatch_ms": 0.0,
+                    "mapped_rdadvise_current_accepted_records": 0,
+                    "mapped_rdadvise_current_accepted_bytes": 0,
+                    "mapped_rdadvise_current_refused_records": 0,
+                    "mapped_rdadvise_current_dispatch_ms": 0.0,
+                    "mapped_rdadvise_reserved_records": 0,
                     "per_layer": [
                         {
                             "layer_index": layer,
@@ -640,6 +676,30 @@ class Hot40AnalyzerTests(unittest.TestCase):
         )
         self.assertFalse(verdict["pressure_policy"]["allow_warning_pressure"])
         self.assertEqual(verdict["pressure_policy"]["maximum_pressure_level_raw"], 1)
+
+    def test_bounded_rdadvise_receipt_is_exercised_and_refusals_fail(self) -> None:
+        geometry = self.run.response["camelid"]["hybrid_telemetry"]["geometry"]
+        geometry.update(
+            mapped_readahead_enabled=True,
+            mapped_readahead_max_inflight_records=64,
+            mapped_rdadvise_enabled=True,
+            mapped_rdadvise_early_max_records=32,
+            mapped_rdadvise_total_max_records=64,
+        )
+        receipt = self.run.response["camelid"]["hybrid_telemetry"]["rounds"][0]
+        receipt["mapped_rdadvise_early_accepted_records"] = 1
+        receipt["mapped_rdadvise_early_accepted_bytes"] = 3_345_408
+        receipt["mapped_rdadvise_reserved_records"] = 1
+        self.run.write_response()
+        _, _, pager = hot40._validate_response(self.run.root, True)
+        self.assertEqual(pager["accepted_records"], 1)
+        self.assertTrue(pager["legacy_madv_receipts_zero"])
+
+        receipt["mapped_rdadvise_early_refused_records"] = 1
+        receipt["mapped_rdadvise_reserved_records"] = 2
+        self.run.write_response()
+        with self.assertRaisesRegex(hot40.ReceiptError, "invalid bounded F_RDADVISE"):
+            hot40._validate_response(self.run.root, True)
 
     def test_explicit_warning_pressure_receipt_passes_at_four_and_a_half_gib_baseline(self) -> None:
         self.run.enable_warning_pressure()
@@ -869,9 +929,11 @@ class Hot40SourceContractTests(unittest.TestCase):
         self.assertIn("WARNING_MIN_BASELINE_HEADROOM_BYTES=4831838208", source)
         self.assertIn("CAMELID_HOT40_ALLOW_WARNING_PRESSURE", source)
         self.assertIn('--maximum-pressure-level-raw "$maximum_pressure_level_raw"', source)
-        self.assertNotIn("CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD=", source)
-        self.assertIn("mapped_readahead_enabled: false", source)
-        self.assertIn("mapped_readahead_max_inflight_records: 0", source)
+        self.assertIn("CAMELID_HOT40_PAGER_RDADVISE", source)
+        self.assertIn("CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD=1", source)
+        self.assertIn("CAMELID_GEMMA4_GHOST_METAL_MAPPED_RDADVISE=1", source)
+        self.assertIn("mapped_readahead_enabled: $pager_rdadvise", source)
+        self.assertIn("mapped_rdadvise_enabled: $pager_rdadvise", source)
         self.assertIn("--baseline-soak-seconds 60", source)
         self.assertIn("--reject-swapin-growth", source)
         self.assertNotIn("--require-zero-current-swap", source)

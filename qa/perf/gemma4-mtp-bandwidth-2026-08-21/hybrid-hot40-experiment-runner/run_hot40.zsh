@@ -15,6 +15,10 @@ readonly MAX_CHILD_FOOTPRINT_BYTES=8053063680
 readonly MAX_HOST_WIRED_BYTES=8589934592
 readonly REQUEST_SHA256=b2f1110079fc726699cc936a628a268a7ec5bf2076fa970899de39d4ea903939
 readonly EXPECTED_IDS_SHA256=45e65ac09155d7627373c262f1edd1faf6188fb6dad26c5d5994fe5226a97975
+readonly PAGER_BASELINE_RECEIPT=/Users/timtoole/Documents/Camelid-hot48-receipts/run-hot40-49757102-v4
+readonly PAGER_BASELINE_INTENT_SHA256=3697a2e3c25c051de1d46d8ac3f008b87a55bfc89b4eaff2bbacd472f4f7689e
+readonly PAGER_BASELINE_WATCHDOG_SHA256=6165548cdfecb5f5e5ae9caf3dea33ad97040f5544be0c1f69ba9fa92b5c2965
+readonly PAGER_BASELINE_RESPONSE_SHA256=0eb42179050e4354dad2b597d10c742b6088c56e86078a5ae60646b6c1b43cbe
 readonly DEFAULT_MODEL=/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf
 readonly DEFAULT_CGHOST=/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost
 readonly DEFAULT_ASSISTANT=/Users/timtoole/models/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors
@@ -52,6 +56,13 @@ if (( ${+parameters[CAMELID_HOT40_ALLOW_WARNING_PRESSURE]} )); then
   minimum_baseline_headroom_bytes=$WARNING_MIN_BASELINE_HEADROOM_BYTES
 fi
 readonly allow_warning_pressure maximum_pressure_level_raw minimum_baseline_headroom_bytes
+typeset pager_rdadvise=false
+if (( ${+parameters[CAMELID_HOT40_PAGER_RDADVISE]} )); then
+  [[ "$CAMELID_HOT40_PAGER_RDADVISE" == "1" ]] || \
+    refuse "CAMELID_HOT40_PAGER_RDADVISE is an exact opt-in and must be 1"
+  pager_rdadvise=true
+fi
+readonly pager_rdadvise
 readonly harness_commit=$(/usr/bin/git -C "$repo_root" rev-parse --verify "HEAD^{commit}")
 typeset source_worktree_status
 source_worktree_status=$(/usr/bin/git -C "$repo_root" status --porcelain=v1 --untracked-files=all)
@@ -159,6 +170,14 @@ for input in "$model" "$cghost" "$assistant" "$request_source" \
   [[ -f "$input" && ! -L "$input" ]] || \
     refuse "required input is missing, non-regular, or symlinked: $input"
 done
+if [[ "$pager_rdadvise" == true ]]; then
+  [[ -d "$PAGER_BASELINE_RECEIPT" && ! -L "$PAGER_BASELINE_RECEIPT" ]] || \
+    refuse "fixed pager comparison baseline receipt is missing or symlinked"
+  for input in intent.json watchdog.jsonl response.json; do
+    [[ -f "$PAGER_BASELINE_RECEIPT/$input" && ! -L "$PAGER_BASELINE_RECEIPT/$input" ]] || \
+      refuse "fixed pager comparison baseline artifact is missing or symlinked: $input"
+  done
+fi
 [[ -x "$binary" && -f "$binary" && ! -L "$binary" ]] || \
   refuse "prebuilt binary is missing, non-regular, symlinked, or not executable: $binary"
 for input in "$binary" "$model" "$cghost" "$assistant"; do
@@ -285,6 +304,17 @@ readonly expected_ids_frozen="$receipt_root/expected-token-ids.json"
 /bin/chmod 600 "$request_frozen" "$expected_ids_frozen"
 [[ -f "$request_frozen" && ! -L "$request_frozen" ]] || refuse "request freeze failed"
 [[ -f "$expected_ids_frozen" && ! -L "$expected_ids_frozen" ]] || refuse "token-ID freeze failed"
+typeset baseline_intent_frozen="" baseline_watchdog_frozen="" baseline_response_frozen=""
+if [[ "$pager_rdadvise" == true ]]; then
+  baseline_intent_frozen="$receipt_root/comparison-baseline-intent.json"
+  baseline_watchdog_frozen="$receipt_root/comparison-baseline-watchdog.jsonl"
+  baseline_response_frozen="$receipt_root/comparison-baseline-response.json"
+  /bin/cp "$PAGER_BASELINE_RECEIPT/intent.json" "$baseline_intent_frozen"
+  /bin/cp "$PAGER_BASELINE_RECEIPT/watchdog.jsonl" "$baseline_watchdog_frozen"
+  /bin/cp "$PAGER_BASELINE_RECEIPT/response.json" "$baseline_response_frozen"
+  /bin/chmod 600 "$baseline_intent_frozen" "$baseline_watchdog_frozen" "$baseline_response_frozen"
+fi
+readonly baseline_intent_frozen baseline_watchdog_frozen baseline_response_frozen
 
 readonly run_nonce=$(/usr/bin/uuidgen)
 readonly boot_identity=$(/usr/sbin/sysctl -n kern.boottime)
@@ -306,10 +336,11 @@ readonly hashing_memory_after="$receipt_root/hashing-memory-after.json"
 ' "$hashing_memory_before" >/dev/null || \
   refuse "host memory was not clean enough to begin integrity hashing"
 
-print -r -- "Hashing only the prebuilt binary, frozen fixtures, and tooling; large inputs remain stat-only..."
+print -r -- "Hashing only the prebuilt binary, frozen fixtures, tooling, and any small comparison receipt; large inputs remain stat-only..."
 typeset binary_sha request_frozen_sha expected_ids_frozen_sha
 typeset runner_sha analyzer_sha host_sampler_sha hasher_sha watchdog_sha
 typeset hashing_memory_before_sha hashing_memory_after_sha
+typeset baseline_intent_sha="" baseline_watchdog_sha="" baseline_response_sha=""
 request_source_sha=$(sha256_file "$request_source")
 expected_ids_source_sha=$(sha256_file "$expected_ids_source")
 binary_sha=$(sha256_file "$binary")
@@ -320,6 +351,17 @@ analyzer_sha=$(sha256_file "$analyzer")
 host_sampler_sha=$(sha256_file "$host_sampler")
 hasher_sha=$(sha256_file "$hasher")
 watchdog_sha=$(sha256_file "$watchdog")
+if [[ "$pager_rdadvise" == true ]]; then
+  baseline_intent_sha=$(sha256_file "$baseline_intent_frozen")
+  baseline_watchdog_sha=$(sha256_file "$baseline_watchdog_frozen")
+  baseline_response_sha=$(sha256_file "$baseline_response_frozen")
+  [[ "$baseline_intent_sha" == "$PAGER_BASELINE_INTENT_SHA256" ]] || \
+    refuse "fixed pager comparison baseline intent SHA-256 drifted"
+  [[ "$baseline_watchdog_sha" == "$PAGER_BASELINE_WATCHDOG_SHA256" ]] || \
+    refuse "fixed pager comparison baseline watchdog SHA-256 drifted"
+  [[ "$baseline_response_sha" == "$PAGER_BASELINE_RESPONSE_SHA256" ]] || \
+    refuse "fixed pager comparison baseline response SHA-256 drifted"
+fi
 [[ "$request_source_sha" == "$REQUEST_SHA256" ]] || \
   refuse "frozen request fixture SHA-256 drifted"
 [[ "$expected_ids_source_sha" == "$EXPECTED_IDS_SHA256" ]] || \
@@ -353,6 +395,7 @@ hashing_memory_after_sha=$(sha256_file "$hashing_memory_after")
 typeset binary_size request_source_size request_frozen_size
 typeset expected_source_size expected_frozen_size runner_size analyzer_size host_sampler_size
 typeset hasher_size watchdog_size hashing_memory_before_size hashing_memory_after_size
+typeset baseline_intent_size=0 baseline_watchdog_size=0 baseline_response_size=0
 binary_size=$(/usr/bin/stat -f '%z' "$binary")
 request_source_size=$(/usr/bin/stat -f '%z' "$request_source")
 request_frozen_size=$(/usr/bin/stat -f '%z' "$request_frozen")
@@ -365,6 +408,11 @@ hasher_size=$(/usr/bin/stat -f '%z' "$hasher")
 watchdog_size=$(/usr/bin/stat -f '%z' "$watchdog")
 hashing_memory_before_size=$(/usr/bin/stat -f '%z' "$hashing_memory_before")
 hashing_memory_after_size=$(/usr/bin/stat -f '%z' "$hashing_memory_after")
+if [[ "$pager_rdadvise" == true ]]; then
+  baseline_intent_size=$(/usr/bin/stat -f '%z' "$baseline_intent_frozen")
+  baseline_watchdog_size=$(/usr/bin/stat -f '%z' "$baseline_watchdog_frozen")
+  baseline_response_size=$(/usr/bin/stat -f '%z' "$baseline_response_frozen")
+fi
 
 /usr/bin/jq -n \
   --arg source_commit "$source_commit" \
@@ -374,6 +422,7 @@ hashing_memory_after_size=$(/usr/bin/stat -f '%z' "$hashing_memory_after")
   --argjson allow_warning_pressure "$allow_warning_pressure" \
   --argjson maximum_pressure_level_raw "$maximum_pressure_level_raw" \
   --argjson minimum_baseline_headroom_bytes "$minimum_baseline_headroom_bytes" \
+  --argjson pager_rdadvise "$pager_rdadvise" \
   --arg nonce "$run_nonce" --arg boot "$boot_identity" \
   --argjson disk_available_kib "$disk_available_kib" \
   --arg binary "$binary" --arg binary_sha "$binary_sha" --argjson binary_size "$binary_size" \
@@ -398,7 +447,11 @@ hashing_memory_after_size=$(/usr/bin/stat -f '%z' "$hashing_memory_after")
   --arg hashing_after "$hashing_memory_after" --arg hashing_after_sha "$hashing_memory_after_sha" --argjson hashing_after_size "$hashing_memory_after_size" \
   --slurpfile hashing_before_json "$hashing_memory_before" \
   --slurpfile hashing_after_json "$hashing_memory_after" \
-  --arg watchdog "$watchdog" --arg watchdog_sha "$watchdog_sha" --argjson watchdog_size "$watchdog_size" '
+  --arg watchdog "$watchdog" --arg watchdog_sha "$watchdog_sha" --argjson watchdog_size "$watchdog_size" \
+  --arg baseline_receipt "$PAGER_BASELINE_RECEIPT" \
+  --arg baseline_intent "$baseline_intent_frozen" --arg baseline_intent_sha "$baseline_intent_sha" --argjson baseline_intent_size "$baseline_intent_size" \
+  --arg baseline_watchdog "$baseline_watchdog_frozen" --arg baseline_watchdog_sha "$baseline_watchdog_sha" --argjson baseline_watchdog_size "$baseline_watchdog_size" \
+  --arg baseline_response "$baseline_response_frozen" --arg baseline_response_sha "$baseline_response_sha" --argjson baseline_response_size "$baseline_response_size" '
   def artifact($path; $sha; $size): {
     path: $path,
     sha256: $sha,
@@ -440,6 +493,40 @@ hashing_memory_after_size=$(/usr/bin/stat -f '%z' "$hashing_memory_after")
     protected_port: 8181,
     protected_port_policy: "never-bound-connected-or-signaled",
     allow_warning_pressure: $allow_warning_pressure,
+    pager_rdadvise: $pager_rdadvise,
+    pager_contract: {
+      strategy: (if $pager_rdadvise then "darwin-f_rdadvise" else "disabled" end),
+      exact_record_ranges: $pager_rdadvise,
+      record_payload_bytes: 3345408,
+      correctness_dependency: false,
+      runtime_flags: (if $pager_rdadvise then {
+        CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD: "1",
+        CAMELID_GEMMA4_GHOST_METAL_MAPPED_RDADVISE: "1"
+      } else {} end),
+      mapped_readahead_enabled: $pager_rdadvise,
+      mapped_readahead_max_inflight_records: (if $pager_rdadvise then 64 else 0 end),
+      mapped_rdadvise_enabled: $pager_rdadvise,
+      mapped_rdadvise_early_max_records: (if $pager_rdadvise then 32 else 0 end),
+      mapped_rdadvise_total_max_records: (if $pager_rdadvise then 64 else 0 end),
+      mapped_rdadvise_anonymous_capacity_bytes: 0,
+      legacy_madv_receipts_required_zero: true
+    },
+    comparison_baseline: (if $pager_rdadvise then {
+      source_receipt: $baseline_receipt,
+      binding: "frozen-sha256-copies",
+      causal_attribution: false,
+      limitation: "Page-cache state is not proven identical; performance deltas are observational.",
+      artifact_labels: {
+        intent: "comparison_baseline_intent",
+        watchdog: "comparison_baseline_watchdog",
+        response: "comparison_baseline_response"
+      },
+      sha256: {
+        intent: $baseline_intent_sha,
+        watchdog: $baseline_watchdog_sha,
+        response: $baseline_response_sha
+      }
+    } else null end),
     disk: {
       available_kib: $disk_available_kib,
       minimum_available_kib: 20971520,
@@ -453,8 +540,12 @@ hashing_memory_after_size=$(/usr/bin/stat -f '%z' "$hashing_memory_after")
       anonymous_hot_capacity_bytes: 4030464000,
       file_mapped_addressable_slots: 3840,
       file_mapped_address_span_bytes: 12897484800,
-      mapped_readahead_enabled: false,
-      mapped_readahead_max_inflight_records: 0,
+      mapped_readahead_enabled: $pager_rdadvise,
+      mapped_readahead_max_inflight_records: (if $pager_rdadvise then 64 else 0 end),
+      mapped_rdadvise_enabled: $pager_rdadvise,
+      mapped_rdadvise_early_max_records: (if $pager_rdadvise then 32 else 0 end),
+      mapped_rdadvise_total_max_records: (if $pager_rdadvise then 64 else 0 end),
+      mapped_rdadvise_anonymous_capacity_bytes: 0,
       overflow_slots: 0,
       victim_slots: 0,
       host_cache_budget_bytes: 0
@@ -507,7 +598,7 @@ hashing_memory_after_size=$(/usr/bin/stat -f '%z' "$hashing_memory_after")
       cghost: large_input($cghost; $cghost_sha; $cghost_size; $cghost_device; $cghost_inode; $cghost_mtime),
       assistant: large_input($assistant; $assistant_sha; $assistant_size; $assistant_device; $assistant_inode; $assistant_mtime)
     },
-    artifacts: {
+    artifacts: ({
       binary: artifact($binary; $binary_sha; $binary_size),
       request_source: artifact($request_source; $request_source_sha; $request_source_size),
       request_frozen: artifact($request_frozen; $request_frozen_sha; $request_frozen_size),
@@ -520,7 +611,11 @@ hashing_memory_after_size=$(/usr/bin/stat -f '%z' "$hashing_memory_after")
       hashing_memory_before: artifact($hashing_before; $hashing_before_sha; $hashing_before_size),
       hashing_memory_after: artifact($hashing_after; $hashing_after_sha; $hashing_after_size),
       watchdog: artifact($watchdog; $watchdog_sha; $watchdog_size)
-    }
+    } + (if $pager_rdadvise then {
+      comparison_baseline_intent: artifact($baseline_intent; $baseline_intent_sha; $baseline_intent_size),
+      comparison_baseline_watchdog: artifact($baseline_watchdog; $baseline_watchdog_sha; $baseline_watchdog_size),
+      comparison_baseline_response: artifact($baseline_response; $baseline_response_sha; $baseline_response_size)
+    } else {} end))
   }' > "$receipt_root/.intent.json.tmp"
 /bin/mv "$receipt_root/.intent.json.tmp" "$receipt_root/intent.json"
 
@@ -534,6 +629,13 @@ hashing_memory_after_size=$(/usr/bin/stat -f '%z' "$hashing_memory_after")
   print -r -- "allow_warning_pressure=$allow_warning_pressure"
   print -r -- "maximum_pressure_level_raw=$maximum_pressure_level_raw"
   print -r -- "minimum_baseline_headroom_bytes=$minimum_baseline_headroom_bytes"
+  print -r -- "pager_rdadvise=$pager_rdadvise"
+  if [[ "$pager_rdadvise" == true ]]; then
+    print -r -- "pager_runtime_flags=CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD=1,CAMELID_GEMMA4_GHOST_METAL_MAPPED_RDADVISE=1"
+    print -r -- "comparison_baseline_intent_sha256=$baseline_intent_sha $baseline_intent_frozen"
+    print -r -- "comparison_baseline_watchdog_sha256=$baseline_watchdog_sha $baseline_watchdog_frozen"
+    print -r -- "comparison_baseline_response_sha256=$baseline_response_sha $baseline_response_frozen"
+  fi
   print -r -- "source_worktree_clean=true"
   print -r -- "harness_worktree_clean=true"
   print -r -- "nonce=$run_nonce"
@@ -605,6 +707,12 @@ experiment_env=(
   CAMELID_GEMMA4_GHOST_METAL_TIMING=1
   CAMELID_GEMMA4_ROUTE_TRACE=1
 )
+if [[ "$pager_rdadvise" == true ]]; then
+  experiment_env+=(
+    CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD=1
+    CAMELID_GEMMA4_GHOST_METAL_MAPPED_RDADVISE=1
+  )
+fi
 watchdog_args=(
   --baseline-soak-seconds 60
   --minimum-baseline-reclaimable-headroom-bytes "$minimum_baseline_headroom_bytes"

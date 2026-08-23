@@ -41,6 +41,15 @@ MAX_HOST_WIRED_BYTES = 8 * 1024**3
 
 REQUEST_SHA256 = "b2f1110079fc726699cc936a628a268a7ec5bf2076fa970899de39d4ea903939"
 EXPECTED_IDS_SHA256 = "45e65ac09155d7627373c262f1edd1faf6188fb6dad26c5d5994fe5226a97975"
+PAGER_BASELINE_RECEIPT = "/Users/timtoole/Documents/Camelid-hot48-receipts/run-hot40-49757102-v4"
+PAGER_BASELINE_INTENT_SHA256 = "3697a2e3c25c051de1d46d8ac3f008b87a55bfc89b4eaff2bbacd472f4f7689e"
+PAGER_BASELINE_WATCHDOG_SHA256 = "6165548cdfecb5f5e5ae9caf3dea33ad97040f5544be0c1f69ba9fa92b5c2965"
+PAGER_BASELINE_RESPONSE_SHA256 = "0eb42179050e4354dad2b597d10c742b6088c56e86078a5ae60646b6c1b43cbe"
+PAGER_COMPARISON_LIMITATION = (
+    "Page-cache state is not proven identical; performance deltas are observational."
+)
+PAGER_EARLY_MAX_RECORDS = 32
+PAGER_TOTAL_MAX_RECORDS = 64
 PROVENANCE_LIMITATION = (
     "Large model, cghost, and assistant contents are not hashed by this run. "
     "Historical SHA-256 claims are carried forward and bound only to live "
@@ -55,8 +64,17 @@ FULL_Q4_RESIDENCY_MARKER = (
     "[gemma4-mtp full-q4 residency] source_retained=false mapped_bytes=0 "
     "locked_bytes=0 resident_pages=0 total_pages=0 packed_bytes=236077056"
 )
+PAGER_POLICY_MARKER = (
+    "[gemma4-ghost-metal] mapped-cold rdadvise policy: "
+    "CAMELID_GEMMA4_GHOST_METAL_MAPPED_RDADVISE effective=1 "
+    "parent=CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD strategy=F_RDADVISE "
+    "dispatch=direct exact_record_ranges=1 early_max_records=32 "
+    "total_max_records=64 anonymous_capacity_bytes=0 correctness_dependency=0"
+)
 
 EXPERIMENT_ENV = "CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT40_EXPERIMENT"
+MAPPED_READAHEAD_ENV = "CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD"
+MAPPED_RDADVISE_ENV = "CAMELID_GEMMA4_GHOST_METAL_MAPPED_RDADVISE"
 SPARSE_PREDICT_PROBE_ENV = "CAMELID_GEMMA4_GHOST_METAL_SPARSE_PREDICT_PROBE"
 PER_LAYER_ENVIRONMENT = {
     "CAMELID_GEMMA4_GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER",
@@ -273,6 +291,14 @@ def _validate_hashes(run_dir: Path, intent: dict[str, Any]) -> None:
         "hashing_memory_after",
         "watchdog",
     }
+    if intent.get("pager_rdadvise") is True:
+        required.update(
+            {
+                "comparison_baseline_intent",
+                "comparison_baseline_watchdog",
+                "comparison_baseline_response",
+            }
+        )
     if not isinstance(artifacts, dict) or set(artifacts) != required:
         raise ReceiptError("small-artifact hash manifest is incomplete or has extra entries")
     for label in sorted(required):
@@ -310,6 +336,27 @@ def _validate_hashes(run_dir: Path, intent: dict[str, Any]) -> None:
         raise ReceiptError("intent does not bind the run-local preflight memory sample")
     if Path(artifacts["hashing_memory_after"]["path"]) != run_dir / "hashing-memory-after.json":
         raise ReceiptError("intent does not bind the run-local post-hash memory sample")
+    if intent.get("pager_rdadvise") is True:
+        expected_baseline = {
+            "comparison_baseline_intent": (
+                run_dir / "comparison-baseline-intent.json",
+                PAGER_BASELINE_INTENT_SHA256,
+            ),
+            "comparison_baseline_watchdog": (
+                run_dir / "comparison-baseline-watchdog.jsonl",
+                PAGER_BASELINE_WATCHDOG_SHA256,
+            ),
+            "comparison_baseline_response": (
+                run_dir / "comparison-baseline-response.json",
+                PAGER_BASELINE_RESPONSE_SHA256,
+            ),
+        }
+        for label, (expected_path, expected_sha) in expected_baseline.items():
+            if (
+                Path(artifacts[label]["path"]) != expected_path
+                or artifacts[label]["sha256"] != expected_sha
+            ):
+                raise ReceiptError(f"pager baseline artifact {label} is not exactly bound")
     for label in ("request_source", "request_frozen"):
         if artifacts[label]["sha256"] != REQUEST_SHA256:
             raise ReceiptError("request fixture differs from the frozen canonical request")
@@ -517,6 +564,9 @@ def _validate_intent(run_dir: Path) -> dict[str, Any]:
     allow_warning_pressure = (
         intent.get("allow_warning_pressure") if isinstance(intent, dict) else None
     )
+    pager_rdadvise = (
+        intent.get("pager_rdadvise") if isinstance(intent, dict) else None
+    )
     contract_expected = {
         "environment": "CAMELID_HOT40_BINARY_SOURCE_COMMIT",
         "canonical_full_commit": True,
@@ -532,8 +582,18 @@ def _validate_intent(run_dir: Path) -> dict[str, Any]:
         "anonymous_hot_capacity_bytes": HOT_CAPACITY_BYTES,
         "file_mapped_addressable_slots": LOGICAL_SLOTS_TOTAL,
         "file_mapped_address_span_bytes": MAPPED_ADDRESS_SPAN_BYTES,
-        "mapped_readahead_enabled": False,
-        "mapped_readahead_max_inflight_records": 0,
+        "mapped_readahead_enabled": pager_rdadvise,
+        "mapped_readahead_max_inflight_records": (
+            PAGER_TOTAL_MAX_RECORDS if pager_rdadvise else 0
+        ),
+        "mapped_rdadvise_enabled": pager_rdadvise,
+        "mapped_rdadvise_early_max_records": (
+            PAGER_EARLY_MAX_RECORDS if pager_rdadvise else 0
+        ),
+        "mapped_rdadvise_total_max_records": (
+            PAGER_TOTAL_MAX_RECORDS if pager_rdadvise else 0
+        ),
+        "mapped_rdadvise_anonymous_capacity_bytes": 0,
         "overflow_slots": 0,
         "victim_slots": 0,
         "host_cache_budget_bytes": 0,
@@ -554,11 +614,61 @@ def _validate_intent(run_dir: Path) -> dict[str, Any]:
         or re.fullmatch(r"[0-9a-f]{40}", harness_commit) is None
         or source_commit != binary_source_commit
         or not isinstance(allow_warning_pressure, bool)
+        or not isinstance(pager_rdadvise, bool)
         or intent.get("source_worktree_clean") is not True
         or intent.get("harness_worktree_clean") is not True
         or intent.get("geometry") != expected_geometry
     ):
         raise ReceiptError("intent does not bind the exact Hot40 experiment")
+    expected_pager_contract = {
+        "strategy": "darwin-f_rdadvise" if pager_rdadvise else "disabled",
+        "exact_record_ranges": pager_rdadvise,
+        "record_payload_bytes": RECORD_PAYLOAD_BYTES,
+        "correctness_dependency": False,
+        "runtime_flags": (
+            {MAPPED_READAHEAD_ENV: "1", MAPPED_RDADVISE_ENV: "1"}
+            if pager_rdadvise
+            else {}
+        ),
+        "mapped_readahead_enabled": pager_rdadvise,
+        "mapped_readahead_max_inflight_records": (
+            PAGER_TOTAL_MAX_RECORDS if pager_rdadvise else 0
+        ),
+        "mapped_rdadvise_enabled": pager_rdadvise,
+        "mapped_rdadvise_early_max_records": (
+            PAGER_EARLY_MAX_RECORDS if pager_rdadvise else 0
+        ),
+        "mapped_rdadvise_total_max_records": (
+            PAGER_TOTAL_MAX_RECORDS if pager_rdadvise else 0
+        ),
+        "mapped_rdadvise_anonymous_capacity_bytes": 0,
+        "legacy_madv_receipts_required_zero": True,
+    }
+    expected_comparison = (
+        {
+            "source_receipt": PAGER_BASELINE_RECEIPT,
+            "binding": "frozen-sha256-copies",
+            "causal_attribution": False,
+            "limitation": PAGER_COMPARISON_LIMITATION,
+            "artifact_labels": {
+                "intent": "comparison_baseline_intent",
+                "watchdog": "comparison_baseline_watchdog",
+                "response": "comparison_baseline_response",
+            },
+            "sha256": {
+                "intent": PAGER_BASELINE_INTENT_SHA256,
+                "watchdog": PAGER_BASELINE_WATCHDOG_SHA256,
+                "response": PAGER_BASELINE_RESPONSE_SHA256,
+            },
+        }
+        if pager_rdadvise
+        else None
+    )
+    if (
+        intent.get("pager_contract") != expected_pager_contract
+        or intent.get("comparison_baseline") != expected_comparison
+    ):
+        raise ReceiptError("intent pager or comparison-baseline contract is not exact")
     if (
         not isinstance(binary_source_contract, dict)
         or set(binary_source_contract)
@@ -609,7 +719,7 @@ def _validate_intent(run_dir: Path) -> dict[str, Any]:
     return intent
 
 
-def _validate_environment(environment: Any) -> None:
+def _validate_environment(environment: Any, pager_rdadvise: bool) -> None:
     if not isinstance(environment, dict):
         raise ReceiptError("watchdog did not receipt the experiment environment")
     if PER_LAYER_ENVIRONMENT.intersection(environment):
@@ -617,6 +727,9 @@ def _validate_environment(environment: Any) -> None:
     if SPARSE_PREDICT_PROBE_ENV in environment:
         raise ReceiptError("the no-prediction Hot40 child received a sparse-predict probe")
     expected = dict(EXPECTED_ENVIRONMENT)
+    if pager_rdadvise:
+        expected[MAPPED_READAHEAD_ENV] = "1"
+        expected[MAPPED_RDADVISE_ENV] = "1"
     assistant = environment.get("CAMELID_GEMMA4_MTP_ASSISTANT_PATH")
     if not isinstance(assistant, str) or not assistant.startswith("/"):
         raise ReceiptError("the child did not receive an absolute MTP assistant path")
@@ -744,7 +857,7 @@ def _validate_watchdog(run_dir: Path, intent: dict[str, Any]) -> dict[str, Any]:
         or started.get("baseline_swapouts_pages") != baseline_swapouts
     ):
         raise ReceiptError("watchdog child identity, report, or swap baseline drifted")
-    _validate_environment(started.get("experiment_environment"))
+    _validate_environment(started.get("experiment_environment"), intent["pager_rdadvise"])
 
     if (
         final.get("child_returncode") != 0
@@ -816,7 +929,7 @@ def _validate_health(run_dir: Path, binary_source_commit: str) -> None:
         raise ReceiptError("health receipt did not prove full-Metal, full-Q4 readiness")
 
 
-def _validate_geometry(geometry: Any) -> None:
+def _validate_geometry(geometry: Any, pager_rdadvise: bool) -> None:
     expected = {
         "layers": EXPECTED_LAYERS,
         "record_payload_bytes": RECORD_PAYLOAD_BYTES,
@@ -831,9 +944,19 @@ def _validate_geometry(geometry: Any) -> None:
         "victim_record_capacity": 0,
         "victim_capacity_bytes": 0,
         "host_cache_budget_bytes": 0,
-        "mapped_readahead_enabled": False,
-        "mapped_readahead_max_inflight_records": 0,
+        "mapped_readahead_enabled": pager_rdadvise,
+        "mapped_readahead_max_inflight_records": (
+            PAGER_TOTAL_MAX_RECORDS if pager_rdadvise else 0
+        ),
         "mapped_readahead_anonymous_capacity_bytes": 0,
+        "mapped_rdadvise_enabled": pager_rdadvise,
+        "mapped_rdadvise_early_max_records": (
+            PAGER_EARLY_MAX_RECORDS if pager_rdadvise else 0
+        ),
+        "mapped_rdadvise_total_max_records": (
+            PAGER_TOTAL_MAX_RECORDS if pager_rdadvise else 0
+        ),
+        "mapped_rdadvise_anonymous_capacity_bytes": 0,
     }
     if not isinstance(geometry, dict) or any(geometry.get(key) != value for key, value in expected.items()):
         raise ReceiptError("telemetry aggregate geometry is not exact uniform Hot40")
@@ -869,7 +992,8 @@ def _summary(values: list[float]) -> dict[str, float]:
 
 def _validate_response(
     run_dir: Path,
-) -> tuple[dict[str, Any], list[int]]:
+    pager_rdadvise: bool,
+) -> tuple[dict[str, Any], list[int], dict[str, Any]]:
     response = _read_json(run_dir / "response.json")
     expected_ids = _read_json(run_dir / "expected-token-ids.json")
     if not isinstance(expected_ids, list) or len(expected_ids) != EXPECTED_TOKENS:
@@ -895,7 +1019,7 @@ def _validate_response(
         or telemetry.get("scope") != "single_completed_measured_request"
     ):
         raise ReceiptError("response has no exact schema-v2 hybrid telemetry")
-    _validate_geometry(telemetry.get("geometry"))
+    _validate_geometry(telemetry.get("geometry"), pager_rdadvise)
 
     route_interval = telemetry.get("route_interval")
     if not isinstance(route_interval, dict):
@@ -932,6 +1056,10 @@ def _validate_response(
     assistant_proposals: list[int] = []
     seen_round_sequences: set[int] = set()
     full_k8_rounds = 0
+    rdadvise_early_accepted = 0
+    rdadvise_current_accepted = 0
+    rdadvise_accepted_bytes = 0
+    rdadvise_dispatch_ms = 0.0
     for index, receipt in enumerate(rounds):
         if not isinstance(receipt, dict) or receipt.get("round_index") != index:
             raise ReceiptError(f"round {index} is absent or reordered")
@@ -955,6 +1083,58 @@ def _validate_response(
         ):
             if receipt.get(field) != 0:
                 raise ReceiptError(f"round {index} has nonzero safety field {field}")
+        rdadvise_fields = (
+            "mapped_rdadvise_early_accepted_records",
+            "mapped_rdadvise_early_accepted_bytes",
+            "mapped_rdadvise_early_refused_records",
+            "mapped_rdadvise_early_dispatch_ms",
+            "mapped_rdadvise_current_accepted_records",
+            "mapped_rdadvise_current_accepted_bytes",
+            "mapped_rdadvise_current_refused_records",
+            "mapped_rdadvise_current_dispatch_ms",
+            "mapped_rdadvise_reserved_records",
+        )
+        if not pager_rdadvise:
+            if any(receipt.get(field) != 0 for field in rdadvise_fields):
+                raise ReceiptError(f"round {index} has pager receipts while pager is disabled")
+        else:
+            early_accepted = receipt.get("mapped_rdadvise_early_accepted_records")
+            early_bytes = receipt.get("mapped_rdadvise_early_accepted_bytes")
+            early_refused = receipt.get("mapped_rdadvise_early_refused_records")
+            early_dispatch = receipt.get("mapped_rdadvise_early_dispatch_ms")
+            current_accepted = receipt.get("mapped_rdadvise_current_accepted_records")
+            current_bytes = receipt.get("mapped_rdadvise_current_accepted_bytes")
+            current_refused = receipt.get("mapped_rdadvise_current_refused_records")
+            current_dispatch = receipt.get("mapped_rdadvise_current_dispatch_ms")
+            reserved = receipt.get("mapped_rdadvise_reserved_records")
+            integer_values = (
+                early_accepted,
+                early_bytes,
+                early_refused,
+                current_accepted,
+                current_bytes,
+                current_refused,
+                reserved,
+            )
+            if (
+                not all(_is_nonnegative_int(value) for value in integer_values)
+                or not _is_finite(early_dispatch)
+                or not _is_finite(current_dispatch)
+                or early_refused != 0
+                or current_refused != 0
+                or early_accepted + early_refused > PAGER_EARLY_MAX_RECORDS
+                or early_accepted + early_refused + current_accepted + current_refused
+                > PAGER_TOTAL_MAX_RECORDS
+                or reserved
+                != early_accepted + early_refused + current_accepted + current_refused
+                or early_bytes != early_accepted * RECORD_PAYLOAD_BYTES
+                or current_bytes != current_accepted * RECORD_PAYLOAD_BYTES
+            ):
+                raise ReceiptError(f"round {index} has an invalid bounded F_RDADVISE receipt")
+            rdadvise_early_accepted += early_accepted
+            rdadvise_current_accepted += current_accepted
+            rdadvise_accepted_bytes += early_bytes + current_bytes
+            rdadvise_dispatch_ms += float(early_dispatch) + float(current_dispatch)
         proposed_k = receipt.get("proposed_k")
         accepted_k = receipt.get("accepted_drafts")
         useful = receipt.get("useful_accepted_drafts")
@@ -1025,6 +1205,8 @@ def _validate_response(
         raise ReceiptError("round-committed token IDs do not reconcile the frozen response IDs")
     if assistant_rounds == 0 or full_k8_rounds == 0:
         raise ReceiptError("the K8 benchmark did not execute a full assistant/verifier round")
+    if pager_rdadvise and rdadvise_early_accepted + rdadvise_current_accepted == 0:
+        raise ReceiptError("the F_RDADVISE pager was enabled but never accepted a record")
 
     aggregate = telemetry.get("aggregate")
     metrics = telemetry.get("metrics")
@@ -1062,6 +1244,23 @@ def _validate_response(
             "assistant_gpu": _summary(assistant_gpu_values),
         },
         assistant_proposals,
+        {
+            "enabled": pager_rdadvise,
+            "early_max_records_per_round": (
+                PAGER_EARLY_MAX_RECORDS if pager_rdadvise else 0
+            ),
+            "total_max_records_per_round": (
+                PAGER_TOTAL_MAX_RECORDS if pager_rdadvise else 0
+            ),
+            "early_accepted_records": rdadvise_early_accepted,
+            "current_accepted_records": rdadvise_current_accepted,
+            "accepted_records": rdadvise_early_accepted + rdadvise_current_accepted,
+            "accepted_bytes": rdadvise_accepted_bytes,
+            "refused_records": 0,
+            "dispatch_ms": rdadvise_dispatch_ms,
+            "anonymous_capacity_bytes": 0,
+            "legacy_madv_receipts_zero": True,
+        },
     )
 
 
@@ -1069,6 +1268,7 @@ def _validate_log(
     run_dir: Path,
     assistant_proposals: list[int],
     assistant_sha256: str,
+    pager_rdadvise: bool,
 ) -> dict[str, Any]:
     try:
         log = (run_dir / "server.log").read_text(encoding="utf-8", errors="replace")
@@ -1082,6 +1282,11 @@ def _validate_log(
         raise ReceiptError("no-prediction Hot40 log contains a sparse-predict probe receipt")
     if "[gemma4-ghost-metal] mapped-cold MADV_WILLNEED refused:" in log:
         raise ReceiptError("the kernel refused mapped-cold page advice")
+    if "[gemma4-ghost-metal] mapped-cold F_RDADVISE refused:" in log:
+        raise ReceiptError("the kernel refused an F_RDADVISE pager request")
+    pager_policy_count = log.splitlines().count(PAGER_POLICY_MARKER)
+    if pager_policy_count != (1 if pager_rdadvise else 0):
+        raise ReceiptError("server log did not bind the selected F_RDADVISE pager policy")
     full_q4 = FULL_Q4_PATTERN.findall(log)
     if len(full_q4) != 1:
         raise ReceiptError("server did not admit exactly one full-Q4 assistant")
@@ -1133,6 +1338,7 @@ def _validate_log(
             "bf16_matrix_bytes": int(bf16_bytes),
         },
         "device_chain_receipts": len(chains),
+        "pager_policy_receipted": pager_rdadvise,
     }
 
 
@@ -1151,16 +1357,244 @@ def _validate_ports(run_dir: Path) -> None:
         raise ReceiptError("final port-clear receipt does not prove ports 8181 and 8189 clear")
 
 
+def _validate_comparison_baseline(
+    run_dir: Path, intent: dict[str, Any]
+) -> dict[str, Any] | None:
+    if not intent["pager_rdadvise"]:
+        return None
+    artifacts = intent["artifacts"]
+    baseline_intent = _read_json(Path(artifacts["comparison_baseline_intent"]["path"]))
+    baseline_response = _read_json(
+        Path(artifacts["comparison_baseline_response"]["path"])
+    )
+    baseline_events = _read_jsonl(
+        Path(artifacts["comparison_baseline_watchdog"]["path"])
+    )
+    if (
+        not isinstance(baseline_intent, dict)
+        or baseline_intent.get("benchmark") != "gemma4-uniform-hot40-experiment"
+        or baseline_intent.get("expected_tokens") != EXPECTED_TOKENS
+        or baseline_intent.get("large_inputs") != intent.get("large_inputs")
+        or baseline_intent.get("artifacts", {}).get("request_frozen", {}).get("sha256")
+        != REQUEST_SHA256
+        or baseline_intent.get("artifacts", {}).get("expected_ids_frozen", {}).get(
+            "sha256"
+        )
+        != EXPECTED_IDS_SHA256
+    ):
+        raise ReceiptError("frozen pager baseline does not match candidate inputs or fixtures")
+    baseline_intent_geometry = baseline_intent.get("geometry")
+    if (
+        not isinstance(baseline_intent_geometry, dict)
+        or baseline_intent_geometry.get("hot_slots_per_layer") != HOT_SLOTS_PER_LAYER
+        or baseline_intent_geometry.get("anonymous_hot_capacity_slots")
+        != HOT_SLOTS_TOTAL
+        or baseline_intent_geometry.get("mapped_readahead_enabled") is not False
+        or baseline_intent_geometry.get("mapped_readahead_max_inflight_records") != 0
+    ):
+        raise ReceiptError("frozen pager baseline is not the exact no-readahead Hot40 lane")
+
+    expected_ids = _read_json(run_dir / "expected-token-ids.json")
+    baseline_camelid = (
+        baseline_response.get("camelid") if isinstance(baseline_response, dict) else None
+    )
+    baseline_telemetry = (
+        baseline_camelid.get("hybrid_telemetry")
+        if isinstance(baseline_camelid, dict)
+        else None
+    )
+    baseline_metrics = (
+        baseline_telemetry.get("metrics")
+        if isinstance(baseline_telemetry, dict)
+        else None
+    )
+    baseline_rounds = (
+        baseline_telemetry.get("rounds")
+        if isinstance(baseline_telemetry, dict)
+        else None
+    )
+    baseline_geometry = (
+        baseline_telemetry.get("geometry")
+        if isinstance(baseline_telemetry, dict)
+        else None
+    )
+    if (
+        not isinstance(baseline_metrics, dict)
+        or not isinstance(baseline_rounds, list)
+        or not baseline_rounds
+        or not isinstance(baseline_geometry, dict)
+        or baseline_camelid.get("generated_token_ids") != expected_ids
+        or baseline_geometry.get("anonymous_hot_capacity_slots") != HOT_SLOTS_TOTAL
+        or baseline_geometry.get("mapped_readahead_enabled") is not False
+        or baseline_geometry.get("mapped_readahead_max_inflight_records") != 0
+    ):
+        raise ReceiptError("frozen pager baseline response is not exact no-readahead Hot40")
+    legacy_fields = (
+        "mapped_readahead_enqueued_records",
+        "mapped_readahead_enqueued_bytes",
+        "mapped_readahead_enqueue_ms",
+        "mapped_readahead_previous_union_enqueued_records",
+        "mapped_readahead_previous_union_enqueued_bytes",
+        "mapped_readahead_previous_union_enqueue_ms",
+    )
+    if any(
+        not isinstance(receipt, dict)
+        or any(receipt.get(field) != 0 for field in legacy_fields)
+        for receipt in baseline_rounds
+    ):
+        raise ReceiptError("frozen pager baseline contains nonzero advisory receipts")
+    baseline_wall_ms = baseline_metrics.get("receipt_round_wall_ms")
+    baseline_tps = baseline_metrics.get("decode_tokens_per_second")
+    baseline_proposed = baseline_metrics.get("proposed_drafts")
+    baseline_accepted = baseline_metrics.get("accepted_drafts")
+    if (
+        not _is_finite(baseline_wall_ms, positive=True)
+        or not _is_finite(baseline_tps, positive=True)
+        or not _is_nonnegative_int(baseline_proposed)
+        or not _is_nonnegative_int(baseline_accepted)
+        or baseline_accepted > baseline_proposed
+        or not math.isclose(
+            float(baseline_tps),
+            EXPECTED_TOKENS / (float(baseline_wall_ms) / 1000.0),
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        )
+    ):
+        raise ReceiptError("frozen pager baseline performance metrics are invalid")
+
+    baseline_clean = _one(baseline_events, "clean_parent_baseline")
+    baseline_final = _one(baseline_events, "final")
+    host_events = [
+        event for event in baseline_events if isinstance(event.get("host"), dict)
+    ]
+    clean_host = baseline_clean.get("host")
+    if not isinstance(clean_host, dict) or not host_events:
+        raise ReceiptError("frozen pager baseline has no host safety evidence")
+    swapins = clean_host.get("swapins_pages")
+    swapouts = clean_host.get("swapouts_pages")
+    if (
+        not _is_nonnegative_int(swapins)
+        or not _is_nonnegative_int(swapouts)
+        or any(
+            event["host"].get("swapins_pages") != swapins
+            or event["host"].get("swapouts_pages") != swapouts
+            for event in host_events
+        )
+        or baseline_final.get("child_returncode") != 0
+        or baseline_final.get("watchdog_aborted") is not False
+        or baseline_final.get("abort_reasons") != []
+        or baseline_final.get("minimum_reclaimable_headroom_bytes_observed", -1)
+        < MIN_RUNTIME_HEADROOM_BYTES
+        or baseline_final.get("peak_child_physical_footprint_bytes", MAX_CHILD_FOOTPRINT_BYTES + 1)
+        > MAX_CHILD_FOOTPRINT_BYTES
+        or baseline_final.get("peak_host_wired_bytes", MAX_HOST_WIRED_BYTES + 1)
+        > MAX_HOST_WIRED_BYTES
+    ):
+        raise ReceiptError("frozen pager baseline watchdog safety evidence failed")
+    return {
+        "source_receipt": PAGER_BASELINE_RECEIPT,
+        "sha256": {
+            "intent": PAGER_BASELINE_INTENT_SHA256,
+            "watchdog": PAGER_BASELINE_WATCHDOG_SHA256,
+            "response": PAGER_BASELINE_RESPONSE_SHA256,
+        },
+        "boot_identity": baseline_intent.get("boot_identity"),
+        "performance": {
+            "tokens": EXPECTED_TOKENS,
+            "receipt_round_wall_ms": float(baseline_wall_ms),
+            "effective_decode_tokens_per_second": float(baseline_tps),
+            "proposed_drafts": baseline_proposed,
+            "accepted_drafts": baseline_accepted,
+            "rounds": len(baseline_rounds),
+        },
+        "memory": {
+            "minimum_reclaimable_headroom_bytes": baseline_final[
+                "minimum_reclaimable_headroom_bytes_observed"
+            ],
+            "peak_child_physical_footprint_bytes": baseline_final[
+                "peak_child_physical_footprint_bytes"
+            ],
+            "peak_host_wired_bytes": baseline_final["peak_host_wired_bytes"],
+            "swapins_growth_pages": 0,
+            "swapouts_growth_pages": 0,
+        },
+    }
+
+
 def analyze(run_dir: Path) -> dict[str, Any]:
     if run_dir.is_symlink() or not run_dir.is_dir():
         raise ReceiptError(f"run directory is missing or symlinked: {run_dir}")
     intent = _validate_intent(run_dir)
     _validate_health(run_dir, intent["binary_source_commit"])
     memory = _validate_watchdog(run_dir, intent)
-    performance, assistant_proposals = _validate_response(run_dir)
+    performance, assistant_proposals, pager = _validate_response(
+        run_dir, intent["pager_rdadvise"]
+    )
     assistant_sha256 = intent["large_inputs"]["assistant"]["preverified_sha256"]
-    stages = _validate_log(run_dir, assistant_proposals, assistant_sha256)
+    stages = _validate_log(
+        run_dir, assistant_proposals, assistant_sha256, intent["pager_rdadvise"]
+    )
     _validate_ports(run_dir)
+    comparison_baseline = _validate_comparison_baseline(run_dir, intent)
+    comparison = None
+    if comparison_baseline is not None:
+        baseline_performance = comparison_baseline["performance"]
+        baseline_memory = comparison_baseline["memory"]
+        comparison = {
+            "baseline": comparison_baseline,
+            "candidate": {
+                "performance": {
+                    key: performance[key]
+                    for key in (
+                        "tokens",
+                        "receipt_round_wall_ms",
+                        "effective_decode_tokens_per_second",
+                        "proposed_drafts",
+                        "accepted_drafts",
+                        "rounds",
+                    )
+                },
+                "memory": {
+                    key: memory[key]
+                    for key in (
+                        "minimum_reclaimable_headroom_bytes",
+                        "peak_child_physical_footprint_bytes",
+                        "peak_host_wired_bytes",
+                        "swapins_growth_pages",
+                        "swapouts_growth_pages",
+                    )
+                },
+            },
+            "deltas": {
+                "effective_decode_tokens_per_second": performance[
+                    "effective_decode_tokens_per_second"
+                ]
+                - baseline_performance["effective_decode_tokens_per_second"],
+                "speedup_ratio": performance["effective_decode_tokens_per_second"]
+                / baseline_performance["effective_decode_tokens_per_second"],
+                "receipt_round_wall_ms": performance["receipt_round_wall_ms"]
+                - baseline_performance["receipt_round_wall_ms"],
+                "accepted_drafts": performance["accepted_drafts"]
+                - baseline_performance["accepted_drafts"],
+                "rounds": performance["rounds"] - baseline_performance["rounds"],
+                "minimum_reclaimable_headroom_bytes": memory[
+                    "minimum_reclaimable_headroom_bytes"
+                ]
+                - baseline_memory["minimum_reclaimable_headroom_bytes"],
+                "peak_child_physical_footprint_bytes": memory[
+                    "peak_child_physical_footprint_bytes"
+                ]
+                - baseline_memory["peak_child_physical_footprint_bytes"],
+                "peak_host_wired_bytes": memory["peak_host_wired_bytes"]
+                - baseline_memory["peak_host_wired_bytes"],
+            },
+            "speedup_required_for_pass": False,
+            "causal_attribution": False,
+            "same_boot_as_baseline": (
+                intent["boot_identity"] == comparison_baseline["boot_identity"]
+            ),
+            "limitation": PAGER_COMPARISON_LIMITATION,
+        }
     hashing_contract = intent["hashing_contract"]
     hashing_before = hashing_contract["memory_before"]["host"]
     hashing_after = hashing_contract["memory_after"]["host"]
@@ -1190,7 +1624,14 @@ def analyze(run_dir: Path) -> dict[str, Any]:
             "binary_source_is_ancestor_of_harness": True,
             "runtime_source_diff_empty_between_binary_and_harness": True,
             "pressure_never_exceeded_configured_maximum": True,
-            "mapped_readahead_disabled_with_zero_counters": True,
+            "mapped_readahead_policy_exact": True,
+            "legacy_madv_receipts_zero": True,
+            "bounded_rdadvise_exercised_without_refusals": (
+                not intent["pager_rdadvise"] or pager["accepted_records"] > 0
+            ),
+            "comparison_baseline_hash_bound": (
+                not intent["pager_rdadvise"] or comparison_baseline is not None
+            ),
         },
         "pressure_policy": {
             "allow_warning_pressure": intent["allow_warning_pressure"],
@@ -1202,6 +1643,8 @@ def analyze(run_dir: Path) -> dict[str, Any]:
             ],
         },
         "geometry": intent["geometry"],
+        "pager": pager,
+        "comparison": comparison,
         "performance": {
             **performance,
             "throughput_contaminated_by_sparse_predict_probe": False,

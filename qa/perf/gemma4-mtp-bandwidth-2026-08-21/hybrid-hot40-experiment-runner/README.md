@@ -31,9 +31,12 @@ rejected. Both policies retain the 2 GiB runtime floor, 7.5 GiB child physical
 footprint ceiling, 8 GiB wired-memory ceiling, and hard abort on any current-run
 swap-in or swap-out counter change. Existing swap is allowed.
 
-Mapped readahead is omitted rather than set to zero. A PASS requires telemetry
-to report `mapped_readahead_enabled=false`, maximum inflight records `0`, and
-all per-round readahead counters `0`; this avoids the advisory memory burst.
+Mapped readahead is omitted by default rather than set to zero. The exact
+`CAMELID_HOT40_PAGER_RDADVISE=1` variant enables bounded Darwin `F_RDADVISE`
+on exact expert-record ranges: at most 32 early and 64 total records per round,
+with zero anonymous pager capacity. It suppresses the legacy `MADV_WILLNEED`
+path. A PASS requires zero advisory refusals, exact byte accounting, at least
+one accepted record, and all legacy readahead counters to remain zero.
 
 ## Page-cache-safe provenance
 
@@ -81,6 +84,20 @@ CAMELID_HOT40_ALLOW_WARNING_PRESSURE=1 \
 ./run_hot40.zsh
 ```
 
+To run the bounded pager comparison against the frozen 9.857 tok/s Hot40
+receipt, add both exact harness opt-ins:
+
+```sh
+CAMELID_HOT40_BINARY=/private/tmp/camelid-hot40-rdadvise-2b0c4452 \
+CAMELID_HOT40_BINARY_SOURCE_COMMIT=2b0c4452 \
+CAMELID_HOT40_ALLOW_WARNING_PRESSURE=1 \
+CAMELID_HOT40_PAGER_RDADVISE=1 \
+./run_hot40.zsh
+```
+
+The resulting speed delta is observational: the baseline and candidate do not
+prove identical macOS file-cache state, and speedup is not a correctness gate.
+
 The revision is canonicalized to a full 40-character commit and must be an
 ancestor of the clean harness HEAD. Admission also requires an empty Git diff
 between those commits for `src`, `Cargo.toml`, `Cargo.lock`, and `build.rs`.
@@ -92,10 +109,11 @@ Optional path/output overrides are `CAMELID_HOT40_MODEL`,
 `CAMELID_HOT40_RECEIPT_ROOT`. The receipt root must be a fresh path on the
 internal Data volume.
 
-A PASS proves exact 48-token IDs, exact 40-by-30 telemetry, disabled readahead,
-K8/full-Q4 execution, pressure within the selected policy, no current-run swap
-delta, bounded memory, and clean ports afterward. It reports throughput; it is
-not by itself a claim that the 50 tok/s target has been reached.
+A PASS proves exact 48-token IDs, exact 40-by-30 telemetry, the selected pager
+policy, K8/full-Q4 execution, pressure within the selected policy, no
+current-run swap delta, bounded memory, and clean ports afterward. It reports
+throughput; it is not by itself a claim that the 50 tok/s target has been
+reached.
 
 Run model-free contract tests with:
 
