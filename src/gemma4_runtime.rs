@@ -10138,6 +10138,37 @@ impl Gemma4Runtime {
         Ok(common.with_mtp_target_kv(use_view))
     }
 
+    /// Borrow both scoped target resources needed by the opt-in device-fed MTP
+    /// chain: layer-28/layer-29 KV and the exact no-copy Q6_K token table.
+    /// Both owner mutexes remain held until the callback has completed its
+    /// command buffer, so neither KV growth nor head teardown can invalidate a
+    /// bound Metal resource. Missing/inexact resources return `Ok(None)` and
+    /// the explicitly requested device lane fails closed at its call site.
+    #[cfg(target_os = "macos")]
+    #[doc(hidden)]
+    pub fn with_mtp_target_device_views_experiment<R>(
+        &self,
+        use_views: impl for<'kv, 'embedding> FnOnce(
+            crate::metal::Gemma4MtpTargetKvView<'kv>,
+            crate::metal::Gemma4MtpTargetEmbeddingView<'embedding>,
+        ) -> R,
+    ) -> Result<Option<R>> {
+        let guard = self
+            .metal_q4_experts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let Some(common) = guard.as_ref().and_then(|runtime| runtime.common.as_ref()) else {
+            return Ok(None);
+        };
+        let Some(head) = self.metal_q6k_head.as_ref() else {
+            return Ok(None);
+        };
+        let result = head.with_mtp_target_embedding(|embedding| {
+            common.with_mtp_target_kv(|kv| use_views(kv, embedding))
+        });
+        Ok(result.flatten())
+    }
+
     /// Backwards-compatible common-core construction probe used by the real
     /// fixture gate. Live GPU/deterministic policy is deliberately not folded
     /// into this model-owned state.
@@ -11080,6 +11111,7 @@ impl Gemma4Runtime {
         let max_verify_k = crate::metal::gemma4_max_spec_chunk()
             .clamp(2, crate::metal::GEMMA4_MAX_WIDENED_SPEC_CHUNK);
         let max_drafts = max_verify_k - 1;
+        let device_chain_requested = crate::metal::device_chain_requested_from_environment()?;
 
         let generation_started = std::time::Instant::now();
         if kc.len() != self.layers.len() || vc.len() != self.layers.len() {
@@ -11244,22 +11276,41 @@ impl Gemma4Runtime {
             let mut assistant_gpu_us = 0u64;
             let assistant_started = std::time::Instant::now();
 
-            let proposals_res = self.with_mtp_target_kv_experiment(|view| {
-                if view.logical_len() != pos {
-                    return Err(BackendError::RuntimeShapeMismatch(format!(
-                        "Gemma 4 MTP proposal target KV length is {}, expected {pos}",
-                        view.logical_len()
-                    )));
-                }
-                assistant.propose_chain(
-                    anchor,
-                    &pending_hidden,
-                    view,
-                    draft_limit,
-                    eot,
-                    |tok, out| self.token_embedding_into(tok, out),
-                )
-            });
+            let proposals_res = if device_chain_requested {
+                self.with_mtp_target_device_views_experiment(|view, embedding| {
+                    if view.logical_len() != pos {
+                        return Err(BackendError::RuntimeShapeMismatch(format!(
+                            "Gemma 4 MTP proposal target KV length is {}, expected {pos}",
+                            view.logical_len()
+                        )));
+                    }
+                    assistant.propose_chain_device_resident(
+                        anchor,
+                        &pending_hidden,
+                        view,
+                        embedding,
+                        draft_limit,
+                        eot,
+                    )
+                })
+            } else {
+                self.with_mtp_target_kv_experiment(|view| {
+                    if view.logical_len() != pos {
+                        return Err(BackendError::RuntimeShapeMismatch(format!(
+                            "Gemma 4 MTP proposal target KV length is {}, expected {pos}",
+                            view.logical_len()
+                        )));
+                    }
+                    assistant.propose_chain(
+                        anchor,
+                        &pending_hidden,
+                        view,
+                        draft_limit,
+                        eot,
+                        |tok, out| self.token_embedding_into(tok, out),
+                    )
+                })
+            };
 
             let proposals = match proposals_res {
                 Ok(Some(Ok(proposals))) => proposals,
@@ -11270,7 +11321,12 @@ impl Gemma4Runtime {
                 Ok(None) => {
                     self.truncate_mtp_experiment_state(kc, vc, pos);
                     return Err(BackendError::InvalidModelMetadata(
-                        "Gemma 4 MTP target shared-KV view disappeared during drafting".into(),
+                        if device_chain_requested {
+                            "Gemma 4 MTP device chain requires exact scoped Q6_K target embedding and shared-KV views"
+                                .into()
+                        } else {
+                            "Gemma 4 MTP target shared-KV view disappeared during drafting".into()
+                        },
                     ));
                 }
                 Err(error) => {

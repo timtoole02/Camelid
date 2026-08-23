@@ -49,8 +49,8 @@ mod gemma4_mtp;
 #[cfg(target_os = "macos")]
 #[doc(hidden)]
 pub use gemma4_mtp::{
-    Gemma4MtpAssistantMetal, Gemma4MtpProposal, Gemma4MtpProposalLedger, Gemma4MtpProposalTiming,
-    Gemma4MtpResidentLedger,
+    device_chain_requested_from_environment, Gemma4MtpAssistantMetal, Gemma4MtpProposal,
+    Gemma4MtpProposalLedger, Gemma4MtpProposalTiming, Gemma4MtpResidentLedger,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16656,6 +16656,7 @@ pub(crate) struct Gemma4Q6KHead {
     _mmap: std::sync::Arc<crate::wire_mmap::GgufWireMmap>,
     weight_window_aligned_offset: usize,
     weight_window_bytes: usize,
+    weight_file_backed_no_copy: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -16693,6 +16694,51 @@ struct Gemma4Q6KHeadInner {
 
 #[cfg(target_os = "macos")]
 impl Gemma4Q6KHead {
+    /// Borrow the no-copy Q6_K token table for the opt-in MTP device chain.
+    ///
+    /// This refuses every geometry except the exact Gemma 4 26B-A4B target and
+    /// keeps the head mutex (and therefore the mmap-owning `self`) borrowed for
+    /// the complete callback. The callback must complete its Metal command
+    /// buffer before returning; the view is not an ownership-transfer API.
+    pub(crate) fn with_mtp_target_embedding<R>(
+        &self,
+        use_view: impl for<'view> FnOnce(Gemma4MtpTargetEmbeddingView<'view>) -> R,
+    ) -> Option<R> {
+        const TARGET_HIDDEN: usize = 2_816;
+        const TARGET_VOCAB: usize = 262_144;
+        const Q6K_VALUES: usize = 256;
+        const Q6K_WIRE: usize = 210;
+
+        let state = self.inner.lock().ok()?;
+        if !self.weight_file_backed_no_copy
+            || state.hidden != TARGET_HIDDEN
+            || state.vocab != TARGET_VOCAB
+            || !state.hidden.is_multiple_of(Q6K_VALUES)
+        {
+            return None;
+        }
+        let byte_len = state
+            .vocab
+            .checked_mul(state.hidden / Q6K_VALUES)?
+            .checked_mul(Q6K_WIRE)?;
+        let byte_end = state.weight_offset.checked_add(byte_len)?;
+        if !state
+            .weight_offset
+            .is_multiple_of(std::mem::align_of::<u16>())
+            || byte_end > usize::try_from(state.weight.length()).ok()?
+        {
+            return None;
+        }
+        Some(use_view(Gemma4MtpTargetEmbeddingView {
+            buffer: &state.weight,
+            byte_offset: state.weight_offset,
+            byte_len,
+            hidden: state.hidden,
+            vocab: state.vocab,
+            format: Gemma4MtpTargetEmbeddingFormat::Q6K,
+        }))
+    }
+
     /// Wrap one vocab-major Q6_K tensor in the existing GGUF mmap. `absolute_offset`
     /// and `byte_len` come from its descriptor. Returns `None` on unavailable Metal,
     /// an invalid tensor shape/range, or a device buffer-size limit smaller than the
@@ -16899,6 +16945,7 @@ impl Gemma4Q6KHead {
                 _mmap: mmap,
                 weight_window_aligned_offset: tensor.window.aligned_offset as usize,
                 weight_window_bytes: tensor.window.len as usize,
+                weight_file_backed_no_copy: !resident_head,
             },
             ledger,
         ))
@@ -23453,6 +23500,66 @@ impl Gemma4MtpTargetKvView<'_> {
     pub fn logical_len(&self) -> usize {
         debug_assert_eq!(self.sliding.logical_len, self.full.logical_len);
         self.sliding.logical_len
+    }
+}
+
+/// Wire format of the target token table borrowed by the opt-in MTP device
+/// chain. The official 26B-A4B lane admits only `Q6K`; the remaining variants
+/// exist so validation can reject a future provider explicitly instead of
+/// silently decoding its bytes as Q6_K.
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gemma4MtpTargetEmbeddingFormat {
+    Q6K,
+    Q4K,
+    Q8_0,
+    Bf16,
+}
+
+/// Scoped, read-only view of the exact target token-embedding table required
+/// by the opt-in MTP device chain.
+///
+/// The backing buffer points at the no-copy GGUF mapping owned by
+/// [`Gemma4Q6KHead`]. Callers must encode and complete every command that reads
+/// it before the provider callback returns. In particular, retaining/cloning
+/// the Metal buffer would outlive the mapping's scoped ownership contract.
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub struct Gemma4MtpTargetEmbeddingView<'a> {
+    buffer: &'a Buffer,
+    byte_offset: usize,
+    byte_len: usize,
+    hidden: usize,
+    vocab: usize,
+    format: Gemma4MtpTargetEmbeddingFormat,
+}
+
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+impl Gemma4MtpTargetEmbeddingView<'_> {
+    pub fn buffer(&self) -> &Buffer {
+        self.buffer
+    }
+
+    pub fn byte_offset(&self) -> usize {
+        self.byte_offset
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.byte_len
+    }
+
+    pub fn hidden(&self) -> usize {
+        self.hidden
+    }
+
+    pub fn vocab(&self) -> usize {
+        self.vocab
+    }
+
+    pub fn format(&self) -> Gemma4MtpTargetEmbeddingFormat {
+        self.format
     }
 }
 
