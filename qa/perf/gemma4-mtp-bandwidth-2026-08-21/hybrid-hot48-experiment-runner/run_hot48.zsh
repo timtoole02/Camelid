@@ -12,6 +12,7 @@ readonly MIN_BASELINE_HEADROOM_BYTES=8589934592
 readonly MIN_RUNTIME_HEADROOM_BYTES=2147483648
 readonly MAX_CHILD_FOOTPRINT_BYTES=8053063680
 readonly MAX_HOST_WIRED_BYTES=8589934592
+readonly POST_HASH_COOLDOWN_SECONDS=300
 readonly REQUEST_SHA256=b2f1110079fc726699cc936a628a268a7ec5bf2076fa970899de39d4ea903939
 readonly EXPECTED_IDS_SHA256=45e65ac09155d7627373c262f1edd1faf6188fb6dad26c5d5994fe5226a97975
 
@@ -221,8 +222,8 @@ watchdog_sha=$(sha256_file "$watchdog")
 [[ "$request_frozen_sha" == "$REQUEST_SHA256" ]] || refuse "frozen request copy drifted"
 [[ "$expected_ids_frozen_sha" == "$EXPECTED_IDS_SHA256" ]] || refuse "frozen token-ID copy drifted"
 
-print -r -- "Cooling transient no-cache read pages for 60 seconds..."
-/bin/sleep 60
+print -r -- "Cooling transient no-cache read pages for ${POST_HASH_COOLDOWN_SECONDS} seconds..."
+/bin/sleep "$POST_HASH_COOLDOWN_SECONDS"
 /usr/bin/python3 "$host_sampler" --watchdog "$watchdog" --output "$hashing_memory_after"
 /usr/bin/jq -e -s \
   --arg boot "$boot_identity" \
@@ -331,7 +332,7 @@ hashing_memory_after_size=$(/usr/bin/stat -f '%z' "$hashing_memory_after")
       f_nocache_command: 48,
       f_nocache_value: 1,
       read_chunk_bytes: 4194304,
-      post_hash_cooldown_seconds: 60,
+      post_hash_cooldown_seconds: 300,
       helper_artifact_label: "nocache_hasher",
       host_sampler_artifact_label: "host_sampler",
       telemetry_watchdog_artifact_label: "watchdog",

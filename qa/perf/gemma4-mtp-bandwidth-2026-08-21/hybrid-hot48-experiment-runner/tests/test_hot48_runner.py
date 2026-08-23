@@ -211,7 +211,7 @@ class SyntheticRun:
                 "f_nocache_command": 48,
                 "f_nocache_value": 1,
                 "read_chunk_bytes": 4 * 1024 * 1024,
-                "post_hash_cooldown_seconds": 60,
+                "post_hash_cooldown_seconds": 300,
                 "helper_artifact_label": "nocache_hasher",
                 "host_sampler_artifact_label": "host_sampler",
                 "telemetry_watchdog_artifact_label": "watchdog",
@@ -743,7 +743,11 @@ class Hot48SourceContractTests(unittest.TestCase):
         self.assertIn("capture_host_memory.py", source)
         self.assertIn("hashing-memory-before.json", source)
         self.assertIn("hashing-memory-after.json", source)
-        self.assertIn("Cooling transient no-cache read pages for 60 seconds", source)
+        self.assertIn("POST_HASH_COOLDOWN_SECONDS=300", source)
+        self.assertIn(
+            "Cooling transient no-cache read pages for ${POST_HASH_COOLDOWN_SECONDS} seconds",
+            source,
+        )
         self.assertNotIn("/usr/bin/shasum", source)
         self.assertIn("status --porcelain=v1 --untracked-files=all", source)
         self.assertIn('endswith("-dirty")', source)

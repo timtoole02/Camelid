@@ -320,7 +320,7 @@ def _validate_hashing_contract(run_dir: Path, intent: dict[str, Any]) -> None:
         "f_nocache_command": F_NOCACHE,
         "f_nocache_value": 1,
         "read_chunk_bytes": 4 * 1024 * 1024,
-        "post_hash_cooldown_seconds": 60,
+        "post_hash_cooldown_seconds": 300,
         "helper_artifact_label": "nocache_hasher",
         "host_sampler_artifact_label": "host_sampler",
         "telemetry_watchdog_artifact_label": "watchdog",
@@ -1288,7 +1288,7 @@ def analyze(run_dir: Path) -> dict[str, Any]:
             "f_rdahead_command": F_RDAHEAD,
             "f_nocache_command": F_NOCACHE,
             "read_chunk_bytes": 4 * 1024 * 1024,
-            "post_hash_cooldown_seconds": 60,
+            "post_hash_cooldown_seconds": 300,
             "pre_hash_reclaimable_headroom_bytes": hashing_before[
                 "reclaimable_headroom_bytes"
             ],
