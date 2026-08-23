@@ -1,4 +1,9 @@
-# 48-hot / mapped-cold hybrid receipt ladder
+# 32-hot / mapped-cold hybrid receipt ladder
+
+The directory name is historical: hot-48 was rejected by the strict macOS
+pressure gate, and this version now fail-closes on the separately receipted
+hot-32 geometry. Receipt contents and contracts, never the path name, define
+the admitted capacity.
 
 This directory defines the fail-closed runner for the first real Gemma 4 hybrid
 lane. It does not build binaries and it never advances to another rung by
@@ -45,7 +50,7 @@ are:
 ```text
 CAMELID_GEMMA4_GHOST_METAL_DEMAND_LOAD_ONLY=1
 CAMELID_GEMMA4_GHOST_METAL_FILE_MAPPED_EXPERTS=1
-CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS=48
+CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS=32
 CAMELID_GEMMA4_SLOT_PIN=0
 ```
 
@@ -57,7 +62,7 @@ K1 additionally sets the consumed `CAMELID_GEMMA4_CHAINED_K1=1` selector.
 Without it, ordinary non-speculative serving would use the HEAD step and could
 not produce the same chained per-layer ledger required of K8.
 
-`SLOT_PIN=0` labels the 1,440-slot anonymous hot tier as pageable. It does not
+`SLOT_PIN=0` labels the 960-slot anonymous hot tier as pageable. It does not
 claim that the independent MTP assistant mapping is unpinned. The runner does
 not set unused zero-looking controls such as `CAMELID_GEMMA4_MTP_PIN`,
 `CAMELID_GEMMA4_PREFILL_SLOT_RESERVE`, `CAMELID_STARTUP_WARMUP`,
@@ -66,8 +71,8 @@ not set unused zero-looking controls such as `CAMELID_GEMMA4_MTP_PIN`,
 
 The startup receipt must contain exactly one of each:
 
-- `HYBRID ACTIVE` with 30 layers, 128 canonical IDs/layer, 48 physical hot
-  slots/layer, 4,836,556,800 hot bytes, 12,897,484,800 mapped-span bytes, zero
+- `HYBRID ACTIVE` with 30 layers, 128 canonical IDs/layer, 32 physical hot
+  slots/layer, 3,224,371,200 hot bytes, 12,897,484,800 mapped-span bytes, zero
   overflow/victim, pin off, and prediction off.
 - The exact clean file-pager geometry line.
 - The demand-prewarm-skipped line.
@@ -96,7 +101,7 @@ aggregate child physical footprint, more than 8 GiB host wired memory, or a
 even if its leader has already exited. A lane cannot pass until the group is
 gone and port 8189 is independently observed clear.
 
-The 4.5 GiB hot tier is pageable by design. If macOS compresses/swaps it, that
+The 3.0 GiB hot tier is pageable by design. If macOS compresses/swaps it, that
 is a safety-rung failure and evidence for a separate explicitly pinned-hot
 trial; it is not evidence that the hybrid address/binding arithmetic was
 wrong. This ladder never silently relaxes the zero-swap gate.
@@ -107,7 +112,7 @@ The default root is:
 
 ```text
 qa/perf/gemma4-mtp-bandwidth-2026-08-21/
-  hybrid-hot48-mapped-cold-2026-08-22-v1/
+  hybrid-hot32-mapped-cold-2026-08-22-v1/
 ```
 
 It is overrideable with the task-specific
@@ -143,15 +148,15 @@ The load-only contract is
   "schema_version": 1,
   "load_binary_sha256": "<sha256>",
   "test_name": "gemma4_mtp_assistant_load_only_probe",
-  "hybrid_hot_slots": 48,
+  "hybrid_hot_slots": 32,
   "assistant_residency_receipted": true,
   "evict_page_cache": false
 }
 ```
 
 Its v4 report must have zero tokenize/prefill/step/proposal/generation counters
-and the exact final ledger: 3,840 canonical/mapped records, 1,440 anonymous hot
-records, 4,836,556,800 hot bytes, 12,897,484,800 mapped span, 240 initially
+and the exact final ledger: 3,840 canonical/mapped records, 960 anonymous hot
+records, 3,224,371,200 hot bytes, 12,897,484,800 mapped span, 240 initially
 bound active records, and zero overflow/victim/host cache/touch/prewarm.
 The independent assistant ledger must report a nonzero hard lock with
 `locked_bytes == mapped_bytes` and `resident_pages == total_pages`; this is
@@ -189,7 +194,7 @@ The response telemetry itself uses schema v1 and must include:
   selections may legitimately exceed promotion loads); and
 - structured performance metrics used by the promotion verdict.
 
-A K8 union of 49–64 unique experts is a valid mapped-cold spill. It must retain
+A K8 union of 33–64 unique experts is a valid mapped-cold spill. It must retain
 all records and remain `slot_capacity_overflow=0`; it is not an overflow or a
 reason to drop experts. K8 must prove both nonzero hot-tier use and nonzero
 mapped-cold selection.

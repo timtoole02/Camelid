@@ -1517,12 +1517,12 @@ const GHOST_METAL_DEMAND_LOAD_ONLY_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_DEMAN
 /// transient no-copy Tier-2 tables.
 const GHOST_METAL_FILE_MAPPED_EXPERTS_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_FILE_MAPPED_EXPERTS";
-/// Exact opt-in for the mixed 48-hot/mapped-cold lane. The value is the
-/// receipted physical cache size and must be canonical `48`; absence preserves
+/// Exact opt-in for the mixed 32-hot/mapped-cold lane. The value is the
+/// receipted physical cache size and must be canonical `32`; absence preserves
 /// the mapped-only foundation.
 const GHOST_METAL_HYBRID_HOT_SLOTS_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS";
-const GHOST_METAL_HYBRID_HOT_SLOTS: usize = 48;
+const GHOST_METAL_HYBRID_HOT_SLOTS: usize = 32;
 /// Exact demand-only residency bound. The runtime preserves the full logical
 /// expert namespace but allocates, pins, admits, and accounts only this
 /// physical prefix. Keeping unbound records out of the Tier-2 table matters:
@@ -6791,7 +6791,7 @@ pub struct Gemma4RoutedExpertLayerResidencySnapshot {
     /// Allocated logical records, including unbound lazy capacity.
     pub base_slot_capacity: u64,
     /// Anonymous writable records retained by this layer. In the exact hybrid
-    /// lane this is the bounded 48-record hot tier, while
+    /// lane this is the bounded 32-record hot tier, while
     /// `file_mapped_addressable_slots` remains the complete canonical 128-ID
     /// namespace.
     #[serde(default)]
@@ -6911,7 +6911,7 @@ pub struct Gemma4RoutedExpertResidencySnapshot {
 }
 
 /// Stable response schema for one completed, measured request on the exact
-/// 48-anonymous-hot / canonical-file-mapped Gemma 4 lane. These structures are
+/// 32-anonymous-hot / canonical-file-mapped Gemma 4 lane. These structures are
 /// deliberately separate from [`Gemma4GenerationOutcome`]: existing runtime
 /// callers retain that enum unchanged, while the non-streaming serve bridge can
 /// carry this optional receipt as a sidecar.
@@ -7050,7 +7050,7 @@ pub struct Gemma4HybridTelemetryMetrics {
 
 const HYBRID_TELEMETRY_LAYERS: usize = 30;
 const HYBRID_TELEMETRY_LOGICAL_PER_LAYER: u64 = 128;
-const HYBRID_TELEMETRY_HOT_PER_LAYER: u64 = 48;
+const HYBRID_TELEMETRY_HOT_PER_LAYER: u64 = GHOST_METAL_HYBRID_HOT_SLOTS as u64;
 const HYBRID_TELEMETRY_RECORD_BYTES: u64 = 3_345_408;
 const HYBRID_TELEMETRY_STRIDE_BYTES: u64 = 3_358_720;
 
@@ -20792,7 +20792,7 @@ mod mtp_target_seam_tests {
             "measured_request_prefill_plus_generation"
         );
         assert_eq!(value["geometry"]["logical_addressable_slots"], 3_840);
-        assert_eq!(value["geometry"]["anonymous_hot_capacity_slots"], 1_440);
+        assert_eq!(value["geometry"]["anonymous_hot_capacity_slots"], 960);
         assert_eq!(value["geometry"]["victim_record_capacity"], 0);
         assert_eq!(value["geometry"]["per_layer"][0]["layer"], 0);
         assert_eq!(value["rounds"][0]["per_layer"][0]["layer_index"], 0);
@@ -22716,13 +22716,15 @@ mod ghost_moe_wire_tests {
     }
 
     #[test]
-    fn metal_hybrid_hot_slots_requires_exact_canonical_48() {
+    fn metal_hybrid_hot_slots_requires_exact_canonical_32() {
         assert_eq!(parse_ghost_metal_hybrid_hot_slots(None).unwrap(), None);
         assert_eq!(
-            parse_ghost_metal_hybrid_hot_slots(Some("48")).unwrap(),
-            Some(48)
+            parse_ghost_metal_hybrid_hot_slots(Some("32")).unwrap(),
+            Some(32)
         );
-        for invalid in ["", "0", "47", "49", "048", " 48", "48 ", "+48", "junk"] {
+        for invalid in [
+            "", "0", "31", "33", "48", "032", " 32", "32 ", "+32", "junk",
+        ] {
             assert!(
                 parse_ghost_metal_hybrid_hot_slots(Some(invalid)).is_err(),
                 "hybrid budget {invalid:?} must fail closed"
@@ -22740,25 +22742,25 @@ mod ghost_moe_wire_tests {
             clean_file_pager_admission_line(
                 30,
                 128,
-                4_836_556_800,
+                3_224_371_200,
                 12_897_484_800,
                 true,
             ),
-            "[gemma4-ghost-metal] clean file-pager Q4_0 experts enabled: layers=30 logical_addressable_slots/layer=128 anonymous_expert_capacity_bytes=4836556800 mapped_address_span_bytes=12897484800 mapped_address_span=12.01GiB mode=fused-fast"
+            "[gemma4-ghost-metal] clean file-pager Q4_0 experts enabled: layers=30 logical_addressable_slots/layer=128 anonymous_expert_capacity_bytes=3224371200 mapped_address_span_bytes=12897484800 mapped_address_span=12.01GiB mode=fused-fast"
         );
     }
 
     #[test]
-    fn metal_hybrid_49_to_64_unions_spill_to_mapped_without_overflow() {
-        for unique in [49usize, 64] {
+    fn metal_hybrid_33_to_64_unions_spill_to_mapped_without_overflow() {
+        for unique in [33usize, 64] {
             let experts = (0..unique).collect::<Vec<_>>();
-            let mut directory = GhostMetalSlotDirectory::new(48);
+            let mut directory = GhostMetalSlotDirectory::new(32);
             let (plan, cold) = directory
                 .plan_hot_overrides(&experts)
                 .expect("hybrid union is not capped by physical cache size");
-            assert_eq!(plan.loads.len(), 48, "unique={unique}");
-            assert_eq!(cold.len(), unique - 48, "unique={unique}");
-            assert!(plan.loads.iter().all(|load| load.slot < 48));
+            assert_eq!(plan.loads.len(), 32, "unique={unique}");
+            assert_eq!(cold.len(), unique - 32, "unique={unique}");
+            assert!(plan.loads.iter().all(|load| load.slot < 32));
             let mut represented = plan
                 .loads
                 .iter()

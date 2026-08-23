@@ -13311,7 +13311,7 @@ pub(crate) const GEMMA4_Q4_EXPERT_SLOT_STRIDE: usize = 3_358_720;
 /// IDs: every one of the 128 experts remains addressable through the mapped
 /// fallback.
 #[cfg(target_os = "macos")]
-pub(crate) const GEMMA4_Q4_HYBRID_HOT_SLOTS: usize = 48;
+pub(crate) const GEMMA4_Q4_HYBRID_HOT_SLOTS: usize = 32;
 /// Global overflow experts reused across layers. 20 resident + 24 overflow covers
 /// measured K=8 unique max of 42.
 #[cfg(target_os = "macos")]
@@ -13667,7 +13667,7 @@ enum Gemma4Q4ExpertSlotBacking {
     FileMappedRecordGranular {
         source: std::sync::Arc<Gemma4Q4FileMappedExpertSource>,
     },
-    /// Exactly 48 anonymous writable records layered over the complete clean
+    /// Exactly 32 anonymous writable records layered over the complete clean
     /// mapped expert namespace. The directory is dynamic, but GPU-visible
     /// addresses always remain canonical expert IDs.
     HybridMappedRecordGranular {
@@ -13881,9 +13881,9 @@ impl Gemma4Q4ExpertSlots {
         })
     }
 
-    /// Exact 48-hot/mapped-cold backing. The logical and GPU-visible
+    /// Exact 32-hot/mapped-cold backing. The logical and GPU-visible
     /// namespaces both remain the complete 128 canonical expert IDs; only the
-    /// anonymous writable cache is bounded to 48 physical records.
+    /// anonymous writable cache is bounded to 32 physical records.
     pub(crate) fn new_hybrid_mapped_record_granular(
         mmap: std::sync::Arc<crate::wire_mmap::GgufWireMmap>,
         offset: u64,
@@ -14039,7 +14039,7 @@ impl Gemma4Q4ExpertSlots {
     }
 
     /// Physical anonymous cache capacity. This differs from
-    /// [`Self::gpu_slot_count`] only for the hybrid lane, where 48 writable
+    /// [`Self::gpu_slot_count`] only for the hybrid lane, where 32 writable
     /// records back a 128-ID canonical address space.
     pub(crate) fn writable_slot_count(&self) -> usize {
         self.anonymous_slot_count()

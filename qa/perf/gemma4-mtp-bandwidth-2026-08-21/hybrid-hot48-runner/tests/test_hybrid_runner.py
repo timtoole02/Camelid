@@ -248,9 +248,9 @@ def watchdog_events(lane_dir: Path, lane: str = "k8") -> list[dict[str, object]]
 
 def startup_log(k8: bool = False) -> str:
     lines = [
-        "[gemma4-ghost-metal] HYBRID ACTIVE: CAMELID_GEMMA4_GHOST_METAL_FILE_MAPPED_EXPERTS=1 CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS=48, layers=30 canonical_addressable=128/layer physical_hot=48/layer hot_capacity_bytes=4836556800 mapped_cold_span_bytes=12897484800 overflow=0 victim=0 slot_pin=off prediction=off",
+        "[gemma4-ghost-metal] HYBRID ACTIVE: CAMELID_GEMMA4_GHOST_METAL_FILE_MAPPED_EXPERTS=1 CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS=32, layers=30 canonical_addressable=128/layer physical_hot=32/layer hot_capacity_bytes=3224371200 mapped_cold_span_bytes=12897484800 overflow=0 victim=0 slot_pin=off prediction=off",
         "[gemma4-ghost-metal] " + receipt.DEMAND_PREWARM_MARKER,
-        "[gemma4-ghost-metal] clean file-pager Q4_0 experts enabled: layers=30 logical_addressable_slots/layer=128 anonymous_expert_capacity_bytes=4836556800 mapped_address_span_bytes=12897484800 mapped_address_span=12.01GiB mode=fused-fast",
+        "[gemma4-ghost-metal] clean file-pager Q4_0 experts enabled: layers=30 logical_addressable_slots/layer=128 anonymous_expert_capacity_bytes=3224371200 mapped_address_span_bytes=12897484800 mapped_address_span=12.01GiB mode=fused-fast",
     ]
     if k8:
         lines.extend(
@@ -306,8 +306,11 @@ class WatchdogBoundaryTests(unittest.TestCase):
 
 
 class ReceiptTests(unittest.TestCase):
-    def test_valid_49_through_64_unique_is_cold_spill_not_overflow(self) -> None:
-        for unique in (49, 64):
+    def test_hot32_geometry_and_valid_33_through_64_cold_spill(self) -> None:
+        self.assertEqual(receipt.HOT_PER_LAYER, 32)
+        self.assertEqual(receipt.HOT_TOTAL, 960)
+        self.assertEqual(receipt.HOT_CAPACITY_BYTES, 3_224_371_200)
+        for unique in (33, 64):
             with self.subTest(unique=unique):
                 metrics = receipt.validate_hybrid_telemetry(
                     hybrid_telemetry(unique), "k8"
@@ -362,7 +365,7 @@ class ReceiptTests(unittest.TestCase):
     def test_environment_requires_hybrid_knob_and_rejects_legacy_physical(self) -> None:
         environment = lane_environment("k8")
         receipt.validate_environment(environment, "k8")
-        environment["CAMELID_GEMMA4_GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER"] = "48"
+        environment["CAMELID_GEMMA4_GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER"] = "32"
         with self.assertRaises(receipt.ReceiptError):
             receipt.validate_environment(environment, "k8")
 
@@ -431,7 +434,7 @@ class ReceiptTests(unittest.TestCase):
                         "profile": {
                             "demand_load_only": 1,
                             "file_mapped_experts": 1,
-                            "hybrid_hot_slots": 48,
+                            "hybrid_hot_slots": 32,
                             "slot_pin": 0,
                             "assistant_residency_policy": "observed_from_assistant_ledger",
                             "physical_slots_per_layer": "unset",
@@ -580,7 +583,7 @@ class RunnerPreflightTests(unittest.TestCase):
             "CAMELID_GEMMA4_OPTION_B=",
         ):
             self.assertNotIn(key, source)
-        self.assertIn("CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS=48", source)
+        self.assertIn("CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS=32", source)
         self.assertIn("CAMELID_GEMMA4_SLOT_PIN=0", source)
         self.assertIn("CAMELID_GEMMA4_CHAINED_K1=1", source)
 
@@ -590,7 +593,7 @@ class RunnerPreflightTests(unittest.TestCase):
             result = self.run_stage(
                 "load-only",
                 root,
-                {"CAMELID_GEMMA4_GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER": "48"},
+                {"CAMELID_GEMMA4_GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER": "32"},
             )
             self.assertEqual(result.returncode, 75, result.stderr)
             self.assertIn("legacy physical-slot", result.stderr)

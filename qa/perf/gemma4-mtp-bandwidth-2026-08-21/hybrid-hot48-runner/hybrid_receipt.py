@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed analyzer for the 48-hot/mapped-cold Gemma 4 receipt ladder."""
+"""Fail-closed analyzer for the 32-hot/mapped-cold Gemma 4 receipt ladder."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from typing import Any, Iterable
 GIB = 1024**3
 LAYERS = 30
 CANONICAL_PER_LAYER = 128
-HOT_PER_LAYER = 48
+HOT_PER_LAYER = 32
 CANONICAL_TOTAL = LAYERS * CANONICAL_PER_LAYER
 HOT_TOTAL = LAYERS * HOT_PER_LAYER
 SLOT_STRIDE_BYTES = 3_358_720
@@ -48,7 +48,7 @@ COMMON_ENVIRONMENT = {
     "CAMELID_GEMMA4_GHOST_READ_THREADS": "1",
     "CAMELID_GEMMA4_GHOST_METAL_DEMAND_LOAD_ONLY": "1",
     "CAMELID_GEMMA4_GHOST_METAL_FILE_MAPPED_EXPERTS": "1",
-    "CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS": "48",
+    "CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS": "32",
     "CAMELID_GEMMA4_SLOT_PIN": "0",
     "CAMELID_GEMMA4_GHOST_METAL_HOT_PIN": "0",
     "CAMELID_GEMMA4_VICTIM_CACHE": "0",
@@ -63,15 +63,15 @@ COMMON_ENVIRONMENT = {
 }
 
 STARTUP_PATTERN = re.compile(
-    r"HYBRID ACTIVE: .*FILE_MAPPED_EXPERTS=1 .*HYBRID_HOT_SLOTS=48, "
-    r"layers=30 canonical_addressable=128/layer physical_hot=48/layer "
-    r"hot_capacity_bytes=4836556800 mapped_cold_span_bytes=12897484800 "
+    r"HYBRID ACTIVE: .*FILE_MAPPED_EXPERTS=1 .*HYBRID_HOT_SLOTS=32, "
+    r"layers=30 canonical_addressable=128/layer physical_hot=32/layer "
+    r"hot_capacity_bytes=3224371200 mapped_cold_span_bytes=12897484800 "
     r"overflow=0 victim=0 slot_pin=off prediction=off"
 )
 FILE_PAGER_PATTERN = re.compile(
     r"clean file-pager Q4_0 experts enabled: layers=30 "
     r"logical_addressable_slots/layer=128 "
-    r"anonymous_expert_capacity_bytes=4836556800 "
+    r"anonymous_expert_capacity_bytes=3224371200 "
     r"mapped_address_span_bytes=12897484800 mapped_address_span=12\.01GiB "
     r"mode=(?:fused-fast|CPU-GeGLU parity)"
 )
@@ -373,7 +373,7 @@ def validate_auxiliary_receipts(
     expected_profile = {
         "demand_load_only": 1,
         "file_mapped_experts": 1,
-        "hybrid_hot_slots": 48,
+        "hybrid_hot_slots": 32,
         "slot_pin": 0,
         "assistant_residency_policy": "observed_from_assistant_ledger",
         "physical_slots_per_layer": "unset",

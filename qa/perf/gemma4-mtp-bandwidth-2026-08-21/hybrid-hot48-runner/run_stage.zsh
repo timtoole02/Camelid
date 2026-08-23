@@ -35,7 +35,7 @@ readonly script_dir=${0:A:h}
 readonly repo_root=$(/usr/bin/git -C "$script_dir" rev-parse --show-toplevel)
 readonly watchdog="$repo_root/qa/evidence-bundles/gemma4-26b-mtp-assistant-oracle/run_load_only_watchdog.py"
 readonly analyzer="$script_dir/hybrid_receipt.py"
-readonly receipt_root=${CAMELID_HYBRID_RECEIPT_ROOT:-"$repo_root/qa/perf/gemma4-mtp-bandwidth-2026-08-21/hybrid-hot48-mapped-cold-2026-08-22-v1"}
+readonly receipt_root=${CAMELID_HYBRID_RECEIPT_ROOT:-"$repo_root/qa/perf/gemma4-mtp-bandwidth-2026-08-21/hybrid-hot32-mapped-cold-2026-08-22-v1"}
 readonly server_binary=${CAMELID_HYBRID_SERVER_BINARY:-"$receipt_root/camelid"}
 readonly load_binary=${CAMELID_HYBRID_LOAD_BINARY:-"$receipt_root/gemma4-mtp-assistant-experiment"}
 readonly model=${CAMELID_HYBRID_MODEL:-/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf}
@@ -136,7 +136,7 @@ if [[ "$stage" == "load-only" ]]; then
     .schema_version == 1 and
     .load_binary_sha256 == $sha and
     .test_name == "gemma4_mtp_assistant_load_only_probe" and
-    .hybrid_hot_slots == 48 and
+    .hybrid_hot_slots == 32 and
     .assistant_residency_receipted == true and
     .evict_page_cache == false
   ' "$contract" >/dev/null || refuse "load-only integration contract does not match the frozen binary"
@@ -287,7 +287,7 @@ readonly assistant_mtime=$(/usr/bin/stat -f '%m' "$assistant")
     profile: {
       demand_load_only: 1,
       file_mapped_experts: 1,
-      hybrid_hot_slots: 48,
+      hybrid_hot_slots: 32,
       slot_pin: 0,
       assistant_residency_policy: "observed_from_assistant_ledger",
       physical_slots_per_layer: "unset"
@@ -324,7 +324,7 @@ common_env=(
   CAMELID_GEMMA4_GHOST_READ_THREADS=1
   CAMELID_GEMMA4_GHOST_METAL_DEMAND_LOAD_ONLY=1
   CAMELID_GEMMA4_GHOST_METAL_FILE_MAPPED_EXPERTS=1
-  CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS=48
+  CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS=32
   CAMELID_GEMMA4_SLOT_PIN=0
   CAMELID_GEMMA4_GHOST_METAL_HOT_PIN=0
   CAMELID_GEMMA4_VICTIM_CACHE=0
