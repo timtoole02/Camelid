@@ -110,11 +110,11 @@ kernel void mtp_copy_f32(
 }
 
 inline int mtp_q6k_code(device const uchar* block, uint index) {
-    const uint half = index >> 7;
+    const uint half_index = index >> 7;
     const uint position = index & 127u;
     const uint lane = position & 31u;
-    const uint ql_base = half * 64u;
-    const uint qh_base = 128u + half * 32u;
+    const uint ql_base = half_index * 64u;
+    const uint qh_base = 128u + half_index * 32u;
     if (position < 32u) {
         return int((block[ql_base + lane] & 0x0fu) |
                    ((block[qh_base + lane] & 3u) << 4u)) - 32;
