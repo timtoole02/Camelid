@@ -1531,6 +1531,13 @@ const GHOST_METAL_HYBRID_HOT_SLOTS: usize = 32;
 /// the already receipted anonymous-memory ceiling.
 const GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER";
+/// Exact hybrid-only policy for post-terminal decode promotion. Unset and the
+/// canonical value `1` preserve the established behavior; canonical `0`
+/// keeps the mapped tier authoritative without copying the just-consumed
+/// decode union into anonymous hot storage. The final-prefill handoff remains
+/// a distinct, unconditional hybrid seed.
+const GHOST_METAL_DECODE_PROMOTION_ENV: &str =
+    "CAMELID_GEMMA4_GHOST_METAL_DECODE_PROMOTION";
 const GHOST_METAL_HYBRID_PROFILE_LAYERS: usize = 30;
 const GHOST_METAL_HYBRID_PROFILE_MIN_SLOTS: usize = 8;
 const GHOST_METAL_HYBRID_PROFILE_MAX_SLOTS: usize = 64;
@@ -1647,6 +1654,31 @@ fn parse_ghost_metal_hybrid_hot_profile(
     }
     validate_ghost_metal_hybrid_hot_profile(&profile)?;
     Ok(Some(profile))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn resolve_ghost_metal_decode_promotion(
+    value: Option<&str>,
+    hybrid_mapped: bool,
+) -> std::result::Result<bool, String> {
+    let Some(raw) = value else {
+        return Ok(true);
+    };
+    let enabled = match raw {
+        "1" => true,
+        "0" => false,
+        _ => {
+            return Err(format!(
+                "{GHOST_METAL_DECODE_PROMOTION_ENV} must be canonical 0 or 1 when present"
+            ));
+        }
+    };
+    if !hybrid_mapped {
+        return Err(format!(
+            "{GHOST_METAL_DECODE_PROMOTION_ENV} requires {GHOST_METAL_FILE_MAPPED_EXPERTS_ENV}=1 and {GHOST_METAL_HYBRID_HOT_SLOTS_ENV}={GHOST_METAL_HYBRID_HOT_SLOTS}"
+        ));
+    }
+    Ok(enabled)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -2508,6 +2540,10 @@ struct GhostMetalExpertRuntime {
     /// Canonical experts consumed through a hybrid mixed table and eligible
     /// for promotion only after that layer's command reaches terminal status.
     pending_hybrid_promotions: Vec<Vec<usize>>,
+    /// Construction-time policy latch. Decode terminal barriers never read
+    /// process environment; disabling this still leaves the explicit final-
+    /// prefill hot handoff active.
+    hybrid_decode_promotion_enabled: bool,
     /// Eight 18-slot overflow slabs, reused across all 30 layers. Predicted
     /// rounds bind `overflow_bank[layer % copies]` so prior layers can stay
     /// in flight. Combined footprint is ~461 MiB, not 2.25 GiB.
@@ -2531,7 +2567,8 @@ struct GhostMetalExpertRuntime {
     /// Prefill chunks advance through fresh prompt segments. Their routed
     /// unions are observed for telemetry/hotness, but payload promotion is
     /// deferred until the prefill-to-decode handoff, where only the final
-    /// prompt union is seeded. Decode/verify rounds promote immediately.
+    /// prompt union is seeded. Decode/verify rounds promote immediately only
+    /// when the construction-time decode-promotion policy is enabled.
     prefill_round: bool,
     /// Cumulative payload bytes fetched by chained-wave demand fills. This is
     /// telemetry only: HEAD-lane direct reads live in `GhostMetalSlotStats`,
@@ -2829,8 +2866,9 @@ fn hybrid_terminal_promotion_allowed(
     round_ok: bool,
     hybrid_mapped: bool,
     prefill_round: bool,
+    decode_promotion_enabled: bool,
 ) -> bool {
-    round_ok && hybrid_mapped && !prefill_round
+    round_ok && hybrid_mapped && !prefill_round && decode_promotion_enabled
 }
 
 /// Promote one routed union per layer after every mixed-table lease is
@@ -3642,6 +3680,7 @@ impl GhostMetalExpertRuntime {
             routed_expert_interval_epoch: 0,
             expert_decay_scores: vec![vec![0.0f32; 128]; layer_count],
             pending_hybrid_promotions: vec![Vec::new(); layer_count],
+            hybrid_decode_promotion_enabled: true,
             overflow_bank,
             last_chained_k: None,
             last_chained_succeeded: false,
@@ -3662,7 +3701,7 @@ impl GhostMetalExpertRuntime {
         fused_fast: bool,
         ghost_file: &GhostFile,
     ) -> Result<Self> {
-        Self::new_file_mapped_with_hot_cache(layer_count, fused_fast, ghost_file, None)
+        Self::new_file_mapped_with_hot_cache(layer_count, fused_fast, ghost_file, None, true)
     }
 
     fn new_file_mapped_hybrid(
@@ -3670,12 +3709,14 @@ impl GhostMetalExpertRuntime {
         fused_fast: bool,
         ghost_file: &GhostFile,
         hot_slots_per_layer: &[usize],
+        hybrid_decode_promotion_enabled: bool,
     ) -> Result<Self> {
         Self::new_file_mapped_with_hot_cache(
             layer_count,
             fused_fast,
             ghost_file,
             Some(hot_slots_per_layer),
+            hybrid_decode_promotion_enabled,
         )
     }
 
@@ -3684,6 +3725,7 @@ impl GhostMetalExpertRuntime {
         fused_fast: bool,
         ghost_file: &GhostFile,
         hot_slots_per_layer: Option<&[usize]>,
+        hybrid_decode_promotion_enabled: bool,
     ) -> Result<Self> {
         if layer_count == 0 {
             return Err(BackendError::InvalidModelMetadata(
@@ -3699,6 +3741,10 @@ impl GhostMetalExpertRuntime {
                     profile.len(),
                 )));
             }
+        } else if !hybrid_decode_promotion_enabled {
+            return Err(BackendError::InvalidModelMetadata(format!(
+                "{GHOST_METAL_DECODE_PROMOTION_ENV}=0 requires hybrid mapped backing"
+            )));
         }
         if ghost_file.wire_mapping().is_none() {
             return Err(BackendError::InvalidModelMetadata(format!(
@@ -3804,6 +3850,15 @@ impl GhostMetalExpertRuntime {
                     GHOST_METAL_HYBRID_HOT_SLOTS,
                 );
             }
+            eprintln!(
+                "[gemma4-ghost-metal] hybrid decode promotion policy: {GHOST_METAL_DECODE_PROMOTION_ENV} effective={} terminal_decode_promotion={} final_prefill_hot_handoff=on",
+                if hybrid_decode_promotion_enabled { 1 } else { 0 },
+                if hybrid_decode_promotion_enabled {
+                    "on"
+                } else {
+                    "off"
+                },
+            );
         } else {
             eprintln!(
                 "[gemma4-ghost-metal] {GHOST_METAL_FILE_MAPPED_EXPERTS_ENV}=1: clean file-backed experts active, layers={layer_count} addressable=128/layer mapped_span={:.2}GiB anonymous_expert_capacity=0 overflow=0 victim=0 mlock=0",
@@ -3822,6 +3877,7 @@ impl GhostMetalExpertRuntime {
             routed_expert_interval_epoch: 0,
             expert_decay_scores: vec![vec![0.0f32; 128]; layer_count],
             pending_hybrid_promotions: vec![Vec::new(); layer_count],
+            hybrid_decode_promotion_enabled,
             overflow_bank: Vec::new(),
             last_chained_k: None,
             last_chained_succeeded: false,
@@ -4465,7 +4521,12 @@ impl GhostMetalExpertRuntime {
                 &wave1_refs,
             )
         };
-        if hybrid_terminal_promotion_allowed(ok, hybrid_mapped_backing, self.prefill_round) {
+        if hybrid_terminal_promotion_allowed(
+            ok,
+            hybrid_mapped_backing,
+            self.prefill_round,
+            self.hybrid_decode_promotion_enabled,
+        ) {
             if let Some(cache) = ghost_cache {
                 if !fill_chained_hybrid_hot_layers(
                     &mut self.layers,
@@ -5006,7 +5067,7 @@ impl GhostMetalExpertRuntime {
             return false;
         };
         let experts = std::mem::take(pending);
-        if experts.is_empty() {
+        if experts.is_empty() || !self.hybrid_decode_promotion_enabled {
             return true;
         }
         self.promote_hybrid_layer(
@@ -9260,6 +9321,20 @@ impl Gemma4Runtime {
                 hybrid_hot_profile_raw.as_deref(),
             )
             .map_err(BackendError::InvalidModelMetadata)?;
+            let decode_promotion_raw = match std::env::var(GHOST_METAL_DECODE_PROMOTION_ENV) {
+                Ok(value) => Some(value),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    return Err(BackendError::InvalidModelMetadata(format!(
+                        "{GHOST_METAL_DECODE_PROMOTION_ENV} must be canonical UTF-8 0 or 1 when present"
+                    )));
+                }
+            };
+            let hybrid_decode_promotion_enabled = resolve_ghost_metal_decode_promotion(
+                decode_promotion_raw.as_deref(),
+                hybrid_hot_slots.is_some(),
+            )
+            .map_err(BackendError::InvalidModelMetadata)?;
             if file_mapped_raw.is_some() && !file_mapped_experts {
                 return Err(BackendError::InvalidModelMetadata(format!(
                     "{GHOST_METAL_FILE_MAPPED_EXPERTS_ENV} is an exact opt-in and must be 1 when present"
@@ -9444,6 +9519,7 @@ impl Gemma4Runtime {
                             hybrid_hot_slots_per_layer
                                 .as_deref()
                                 .expect("hybrid profile is present when hybrid is selected"),
+                            hybrid_decode_promotion_enabled,
                         )?
                     } else {
                         GhostMetalExpertRuntime::new_file_mapped(
@@ -9610,6 +9686,7 @@ impl Gemma4Runtime {
                                 hybrid_hot_slots_per_layer
                                     .as_deref()
                                     .expect("hybrid profile is present when hybrid is selected"),
+                                hybrid_decode_promotion_enabled,
                             )?
                         } else {
                             GhostMetalExpertRuntime::new_file_mapped(
@@ -23569,6 +23646,30 @@ mod ghost_moe_wire_tests {
     }
 
     #[test]
+    fn metal_hybrid_decode_promotion_contract_is_exact_and_hybrid_only() {
+        assert!(resolve_ghost_metal_decode_promotion(None, false).unwrap());
+        assert!(resolve_ghost_metal_decode_promotion(None, true).unwrap());
+        assert!(resolve_ghost_metal_decode_promotion(Some("1"), true).unwrap());
+        assert!(!resolve_ghost_metal_decode_promotion(Some("0"), true).unwrap());
+
+        for configured in ["0", "1"] {
+            assert!(
+                resolve_ghost_metal_decode_promotion(Some(configured), false).is_err(),
+                "an explicit policy requires the hybrid mapped lane"
+            );
+        }
+        for invalid in [
+            "", "00", "01", "+0", "+1", "-0", " 0", "0 ", " 1", "1 ", "true", "false",
+            "2", "junk",
+        ] {
+            assert!(
+                resolve_ghost_metal_decode_promotion(Some(invalid), true).is_err(),
+                "decode-promotion policy {invalid:?} must fail closed"
+            );
+        }
+    }
+
+    #[test]
     fn metal_hybrid_per_layer_profile_is_canonical_bounded_and_budget_neutral() {
         let profile = [
             39, 40, 33, 30, 30, 31, 31, 30, 34, 30, 26, 28, 30, 31, 28, 37, 31, 30, 31,
@@ -23681,11 +23782,12 @@ mod ghost_moe_wire_tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn metal_hybrid_terminal_promotion_defers_prefill_only() {
-        assert!(hybrid_terminal_promotion_allowed(true, true, false));
-        assert!(!hybrid_terminal_promotion_allowed(true, true, true));
-        assert!(!hybrid_terminal_promotion_allowed(false, true, false));
-        assert!(!hybrid_terminal_promotion_allowed(true, false, false));
+    fn metal_hybrid_terminal_promotion_requires_decode_policy_and_defers_prefill() {
+        assert!(hybrid_terminal_promotion_allowed(true, true, false, true));
+        assert!(!hybrid_terminal_promotion_allowed(true, true, false, false));
+        assert!(!hybrid_terminal_promotion_allowed(true, true, true, true));
+        assert!(!hybrid_terminal_promotion_allowed(false, true, false, true));
+        assert!(!hybrid_terminal_promotion_allowed(true, false, false, true));
     }
 
     #[test]
