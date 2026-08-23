@@ -167,11 +167,11 @@ The independent assistant ledger must report a nonzero hard lock with
 `locked_bytes == mapped_bytes` and `resident_pages == total_pages`; this is
 recorded separately from the pageable anonymous expert tier.
 
-The server contract is `hybrid-telemetry-schema-v1.json`:
+The server contract is `hybrid-telemetry-schema-v2.json`:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "server_binary_sha256": "<sha256>",
   "response_field": "camelid.hybrid_telemetry",
   "coverage": "every_completed_measured_round_and_layer",
@@ -179,7 +179,7 @@ The server contract is `hybrid-telemetry-schema-v1.json`:
 }
 ```
 
-The response telemetry itself uses schema v1 and must include:
+The response telemetry itself uses schema v2 and must include:
 
 - record payload 3,345,408 bytes and stride 3,358,720 bytes;
 - live total/layer logical-addressable, anonymous-hot-capacity,

@@ -468,14 +468,14 @@ impl GgufWireMmap {
 
     /// Kick off asynchronous population of the whole mapping (warm the page
     /// cache without blocking).
-    pub fn advise_willneed(&self) {
+    pub fn advise_willneed(&self) -> bool {
         // SAFETY: the range is exactly this mapping.
         unsafe {
             libc::madvise(
                 self.ptr as *mut libc::c_void,
                 self.mapped_len,
                 libc::MADV_WILLNEED,
-            );
+            ) == 0
         }
     }
 
@@ -492,9 +492,9 @@ impl GgufWireMmap {
     /// The range is clamped to the mapping and the start is rounded DOWN to a
     /// page boundary (`madvise` requires page-aligned addresses); a zero-length
     /// or out-of-bounds request is a no-op.
-    pub fn advise_willneed_range(&self, offset: usize, len: usize) {
+    pub fn advise_willneed_range(&self, offset: usize, len: usize) -> bool {
         if len == 0 || offset >= self.mapped_len {
-            return;
+            return false;
         }
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         let page = if page > 0 { page as usize } else { 4096 };
@@ -503,7 +503,7 @@ impl GgufWireMmap {
         // overflow past `mapped_len` for a caller-computed tensor extent.
         let end = offset.saturating_add(len).min(self.mapped_len);
         let Some(span) = end.checked_sub(start).filter(|s| *s > 0) else {
-            return;
+            return false;
         };
         // SAFETY: `start` is page-aligned and `start + span <= mapped_len`, so
         // the range lies entirely within this mapping.
@@ -512,7 +512,7 @@ impl GgufWireMmap {
                 self.ptr.add(start) as *mut libc::c_void,
                 span,
                 libc::MADV_WILLNEED,
-            );
+            ) == 0
         }
     }
 
@@ -610,10 +610,14 @@ impl GgufWireMmap {
     pub fn advise_sequential(&self) {}
 
     /// Population hint; a no-op on Windows (see `advise_sequential`).
-    pub fn advise_willneed(&self) {}
+    pub fn advise_willneed(&self) -> bool {
+        false
+    }
 
     /// Ranged population hint; a no-op on Windows (see `advise_sequential`).
-    pub fn advise_willneed_range(&self, _offset: usize, _len: usize) {}
+    pub fn advise_willneed_range(&self, _offset: usize, _len: usize) -> bool {
+        false
+    }
 
     pub fn file_len(&self) -> u64 {
         self.file_len

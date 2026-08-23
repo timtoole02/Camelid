@@ -16,7 +16,8 @@ SPEC.loader.exec_module(gate)
 
 class Gate50TpsTests(unittest.TestCase):
     def fixture(self, root: Path, wall_per_round: float = 150.0) -> tuple[Path, Path, Path]:
-        expected = list(range(48))
+        frozen_expected_path = SCRIPT_DIR / "expected-48-token-ids.json"
+        expected = json.loads(frozen_expected_path.read_text(encoding="utf-8"))
         rounds = []
         for index in range(6):
             per_layer = [{"mapped_bound": 1}]
@@ -24,7 +25,10 @@ class Gate50TpsTests(unittest.TestCase):
             rounds.append(
                 {
                     "round_index": index,
+                    "chained_round_sequence": 100 + index,
+                    "prefix_tokens_before": 200 + index * 8,
                     "bootstrap": False,
+                    "remaining_budget_before": 48 - index * 8,
                     "k": 8,
                     "requested_k": 8,
                     "proposed_k": 7,
@@ -39,11 +43,11 @@ class Gate50TpsTests(unittest.TestCase):
                     "missing_failclose": 0,
                     "slot_capacity_overflow": 0,
                     "overflow_experts": 0,
-                    "mapped_readahead_advised_records": 1,
-                    "mapped_readahead_advised_bytes": 3_345_408,
+                    "mapped_readahead_enqueued_records": 1,
+                    "mapped_readahead_enqueued_bytes": 3_345_408,
                     "mapped_readahead_enqueue_ms": 0.01,
-                    "mapped_readahead_previous_union_advised_records": 1,
-                    "mapped_readahead_previous_union_advised_bytes": 3_345_408,
+                    "mapped_readahead_previous_union_enqueued_records": 1,
+                    "mapped_readahead_previous_union_enqueued_bytes": 3_345_408,
                     "mapped_readahead_previous_union_enqueue_ms": 0.01,
                     "per_layer": per_layer,
                 }
@@ -55,7 +59,7 @@ class Gate50TpsTests(unittest.TestCase):
             "camelid": {
                 "generated_token_ids": expected,
                 "hybrid_telemetry": {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "geometry": {
                         "record_payload_bytes": 3_345_408,
                         "mapped_readahead_enabled": True,
@@ -80,7 +84,7 @@ class Gate50TpsTests(unittest.TestCase):
         expected_path = root / "expected.json"
         log_path = root / "server.log"
         response_path.write_text(json.dumps(response), encoding="utf-8")
-        expected_path.write_text(json.dumps(expected), encoding="utf-8")
+        expected_path.write_bytes(frozen_expected_path.read_bytes())
         chain = (
             "[gemma4-mtp device-chain] requested_drafts=7 returned_drafts=7 "
             "command_buffers=1 commits=1 waits=1 cpu_embedding_callbacks=0 "
@@ -101,6 +105,8 @@ class Gate50TpsTests(unittest.TestCase):
             + "[gemma4 exact partition] CAMELID_GEMMA4_DENSE_K8_GENERIC=1 "
             "static_k8_dense=off runtime_k_dense=on\n"
             + gate.PACKED_K8_GATEUP_MARKER
+            + "\n"
+            + gate.COMPACT_K8_HEAD_MARKER
             + "\n"
             + "[gemma4-mtp full-q4] enabled=true source_sha256="
             + gate.FULL_Q4_SOURCE_SHA256
@@ -145,6 +151,27 @@ class Gate50TpsTests(unittest.TestCase):
             with self.assertRaisesRegex(gate.GateError, "target-authoritative K1 baseline"):
                 gate.analyze(response_path, log_path, expected_path)
 
+    def test_expected_token_fixture_hash_drift_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            response_path, log_path, expected_path = self.fixture(Path(temporary))
+            expected_path.write_text(
+                expected_path.read_text(encoding="utf-8") + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(gate.GateError, "fixture SHA-256 drifted"):
+                gate.analyze(response_path, log_path, expected_path)
+
+    def test_request_fixture_hash_drift_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            request_path = Path(temporary) / "request.json"
+            request_path.write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(gate.GateError, "fixture SHA-256 drifted"):
+                gate.require_sha256(
+                    request_path,
+                    gate.REQUEST_SHA256,
+                    "request fixture",
+                )
+
     def test_missing_partition_parity_marker_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             response_path, log_path, expected_path = self.fixture(Path(temporary))
@@ -177,12 +204,23 @@ class Gate50TpsTests(unittest.TestCase):
             with self.assertRaisesRegex(gate.GateError, "selected-cold mapped readahead"):
                 gate.analyze(response_path, log_path, expected_path)
 
+    def test_kernel_refused_mapped_readahead_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            response_path, log_path, expected_path = self.fixture(Path(temporary))
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    gate.MAPPED_READAHEAD_REFUSAL_MARKER
+                    + " layer=0 expert=7 bytes=3345408\n"
+                )
+            with self.assertRaisesRegex(gate.GateError, "kernel refused"):
+                gate.analyze(response_path, log_path, expected_path)
+
     def test_inconsistent_mapped_readahead_bytes_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             response_path, log_path, expected_path = self.fixture(Path(temporary))
             response = json.loads(response_path.read_text(encoding="utf-8"))
             response["camelid"]["hybrid_telemetry"]["rounds"][0][
-                "mapped_readahead_advised_bytes"
+                "mapped_readahead_enqueued_bytes"
             ] += 1
             response_path.write_text(json.dumps(response), encoding="utf-8")
             with self.assertRaisesRegex(gate.GateError, "mapped-cold readahead receipt"):
@@ -204,7 +242,7 @@ class Gate50TpsTests(unittest.TestCase):
             response_path, log_path, expected_path = self.fixture(Path(temporary))
             response = json.loads(response_path.read_text(encoding="utf-8"))
             response["camelid"]["hybrid_telemetry"]["rounds"][0][
-                "mapped_readahead_previous_union_advised_bytes"
+                "mapped_readahead_previous_union_enqueued_bytes"
             ] += 1
             response_path.write_text(json.dumps(response), encoding="utf-8")
             with self.assertRaisesRegex(gate.GateError, "previous-union readahead receipt"):
@@ -219,6 +257,17 @@ class Gate50TpsTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(gate.GateError, "exact packed K8 GateUp"):
+                gate.analyze(response_path, log_path, expected_path)
+
+    def test_missing_compact_exact_k8_head_marker_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            response_path, log_path, expected_path = self.fixture(Path(temporary))
+            log = log_path.read_text(encoding="utf-8")
+            log_path.write_text(
+                log.replace(gate.COMPACT_K8_HEAD_MARKER + "\n", ""),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(gate.GateError, "compact exact K8 tied head"):
                 gate.analyze(response_path, log_path, expected_path)
 
     def test_missing_full_q4_marker_is_rejected(self) -> None:
@@ -241,6 +290,37 @@ class Gate50TpsTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(gate.GateError, "full-Q4 assistant"):
+                gate.analyze(response_path, log_path, expected_path)
+
+    def test_device_chain_drafts_must_match_their_round(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            response_path, log_path, expected_path = self.fixture(Path(temporary))
+            log = log_path.read_text(encoding="utf-8")
+            log_path.write_text(
+                log.replace("requested_drafts=7", "requested_drafts=6", 1),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(gate.GateError, "reconcile their structured round"):
+                gate.analyze(response_path, log_path, expected_path)
+
+    def test_round_tokens_must_match_the_api_stream(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            response_path, log_path, expected_path = self.fixture(Path(temporary))
+            response = json.loads(response_path.read_text(encoding="utf-8"))
+            response["camelid"]["hybrid_telemetry"]["rounds"][2]["committed_tokens"][3] = 999
+            response_path.write_text(json.dumps(response), encoding="utf-8")
+            with self.assertRaisesRegex(gate.GateError, "structured metrics"):
+                gate.analyze(response_path, log_path, expected_path)
+
+    def test_round_budget_and_prefix_continuity_are_required(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            response_path, log_path, expected_path = self.fixture(Path(temporary))
+            response = json.loads(response_path.read_text(encoding="utf-8"))
+            response["camelid"]["hybrid_telemetry"]["rounds"][3][
+                "prefix_tokens_before"
+            ] += 1
+            response_path.write_text(json.dumps(response), encoding="utf-8")
+            with self.assertRaisesRegex(gate.GateError, "continuity drifted"):
                 gate.analyze(response_path, log_path, expected_path)
 
     def test_retained_full_q4_bf16_source_is_rejected(self) -> None:

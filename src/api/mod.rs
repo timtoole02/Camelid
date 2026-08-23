@@ -731,6 +731,10 @@ pub struct HealthResponse {
     /// otherwise the crate version. On a released binary these two agree; on a developer
     /// build this is the field that says how far the process has drifted from a tag.
     pub build: String,
+    /// Exact source commit embedded by `build.rs`. Strict local launchers bind
+    /// readiness to the checkout they came from so an older release binary
+    /// cannot silently serve a newer performance profile.
+    pub source_commit: String,
     pub loaded_now: bool,
     pub generation_ready: bool,
     /// True when the active runnable model has a resident Prism/Qwen3-VL
@@ -762,6 +766,13 @@ pub struct HealthResponse {
     /// Effective high-level Ghost-MoE execution shape after applying the live
     /// GPU switch and deterministic-mode gate.
     pub gemma4_ghost_execution_mode: Option<Gemma4GhostExecutionMode>,
+    /// True when the active local Gemma 4 runtime owns a loaded MTP assistant.
+    /// `None` means the active lane cannot host this macOS-only experiment.
+    pub gemma4_mtp_assistant_loaded: Option<bool>,
+    /// True only when that assistant admitted the strict all-matrix Q4_0
+    /// profile. Launchers use this to reject a silent target-only or BF16
+    /// fallback before presenting the WebUI as ready.
+    pub gemma4_mtp_full_q4_active: Option<bool>,
     /// True when persistent routed Q4_0 expert slots are live on Metal. This
     /// remains independently useful when the common core runs on CPU.
     pub gemma4_ghost_experts_metal_active: Option<bool>,
@@ -2249,7 +2260,9 @@ fn spec_gpu_enabled() -> bool {
 }
 
 fn spec_draft_tokens_from_env(default: usize) -> usize {
-    let max = crate::metal::gemma4_max_spec_chunk().saturating_sub(1).max(1);
+    let max = crate::metal::gemma4_max_spec_chunk()
+        .saturating_sub(1)
+        .max(1);
     env::var(SPEC_DRAFT_TOKENS_ENV)
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
@@ -3508,12 +3521,16 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         crate::cuda::gpu_accel_enabled(),
         crate::inference::deterministic_mode_enabled(),
     );
+    let mtp_assistant_health = gemma4_runtime
+        .as_deref()
+        .and_then(Gemma4ServeRuntime::mtp_assistant_health);
     let slot = state.engine.slot_snapshot();
     HealthResponse {
         ok: true,
         engine: "camelid",
         version: env!("CARGO_PKG_VERSION"),
         build: crate::receipt::camelid_version(),
+        source_commit: crate::receipt::camelid_commit(),
         loaded_now,
         generation_ready,
         vision_ready,
@@ -3526,6 +3543,8 @@ async fn health_registry_snapshot(state: &AppState) -> HealthResponse {
         gemma4_serve_lane,
         gemma4_ghost_common_metal_active: ghost_execution.map(|health| health.common_metal_active),
         gemma4_ghost_execution_mode: ghost_execution.map(|health| health.mode),
+        gemma4_mtp_assistant_loaded: mtp_assistant_health.map(|health| health.0),
+        gemma4_mtp_full_q4_active: mtp_assistant_health.map(|health| health.1),
         gemma4_ghost_experts_metal_active: ghost_execution
             .map(|health| health.experts_metal_active),
         gemma4_ghost_head_metal_active: ghost_execution.map(|health| health.head_metal_active),
@@ -3629,6 +3648,7 @@ fn busy_health_response(state: &AppState) -> HealthResponse {
         engine: "camelid",
         version: env!("CARGO_PKG_VERSION"),
         build: crate::receipt::camelid_version(),
+        source_commit: crate::receipt::camelid_commit(),
         loaded_now: false,
         generation_ready: false,
         vision_ready: false,
@@ -3641,6 +3661,8 @@ fn busy_health_response(state: &AppState) -> HealthResponse {
         gemma4_serve_lane: None,
         gemma4_ghost_common_metal_active: None,
         gemma4_ghost_execution_mode: None,
+        gemma4_mtp_assistant_loaded: None,
+        gemma4_mtp_full_q4_active: None,
         gemma4_ghost_experts_metal_active: None,
         gemma4_ghost_head_metal_active: None,
         gemma4_ghost_backend: None,
@@ -3785,6 +3807,7 @@ mod gemma4_serve_lane_health_tests {
     #[test]
     fn busy_health_never_reuses_a_stale_gemma4_lane() {
         let value = serde_json::to_value(busy_health_response(&AppState::default())).unwrap();
+        assert_eq!(value["source_commit"], crate::receipt::camelid_commit());
         assert_eq!(value["gemma4_serve_lane"], serde_json::Value::Null);
         assert_eq!(
             value["gemma4_ghost_common_metal_active"],
@@ -3794,6 +3817,11 @@ mod gemma4_serve_lane_health_tests {
             value["gemma4_ghost_execution_mode"],
             serde_json::Value::Null
         );
+        assert_eq!(
+            value["gemma4_mtp_assistant_loaded"],
+            serde_json::Value::Null
+        );
+        assert_eq!(value["gemma4_mtp_full_q4_active"], serde_json::Value::Null);
         assert_eq!(
             value["gemma4_ghost_experts_metal_active"],
             serde_json::Value::Null
@@ -4036,6 +4064,8 @@ mod gemma4_serve_lane_health_tests {
         response.gemma4_ghost_common_gpu_active = Some(false);
         response.gemma4_ghost_experts_gpu_active = Some(true);
         response.gemma4_ghost_head_gpu_active = Some(false);
+        response.gemma4_mtp_assistant_loaded = Some(true);
+        response.gemma4_mtp_full_q4_active = Some(true);
         let value = serde_json::to_value(&response).unwrap();
         assert_eq!(value["gemma4_ghost_common_metal_active"], false);
         assert_eq!(value["gemma4_ghost_execution_mode"], "hybrid_metal");
@@ -4043,6 +4073,8 @@ mod gemma4_serve_lane_health_tests {
         assert_eq!(value["gemma4_ghost_head_metal_active"], false);
         assert_eq!(value["gemma4_ghost_backend"], "metal");
         assert_eq!(value["gemma4_ghost_experts_gpu_active"], true);
+        assert_eq!(value["gemma4_mtp_assistant_loaded"], true);
+        assert_eq!(value["gemma4_mtp_full_q4_active"], true);
 
         response.gemma4_ghost_common_metal_active = Some(true);
         response.gemma4_ghost_execution_mode = Some(Gemma4GhostExecutionMode::FullCommonMetal);
@@ -10246,6 +10278,19 @@ pub enum Gemma4ServeRuntime {
 }
 
 impl Gemma4ServeRuntime {
+    /// MTP admission is meaningful only for the local macOS runtime. Returning
+    /// `None` on every other lane keeps health from implying assistant support.
+    fn mtp_assistant_health(&self) -> Option<(bool, bool)> {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Local(runtime) => {
+                let health = runtime.mtp_assistant_health();
+                Some((health.loaded, health.full_q4_active))
+            }
+            _ => None,
+        }
+    }
+
     /// Metal components still owned by this live runtime. The process-wide GPU
     /// and deterministic gates are deliberately applied by the health snapshot,
     /// not latched here.
@@ -10967,13 +11012,13 @@ mod gemma4_hybrid_response_tests {
     #[test]
     fn hybrid_telemetry_is_embedded_only_when_present() {
         let receipt = serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "scope": "single_completed_measured_request",
         });
         let embedded = gemma4_chat_camelid_payload(&[11, 12], 25.0, Some(&receipt))
             .expect("hybrid receipt JSON");
         assert_eq!(embedded["generated_token_ids"], serde_json::json!([11, 12]));
-        assert_eq!(embedded["hybrid_telemetry"]["schema_version"], 1);
+        assert_eq!(embedded["hybrid_telemetry"]["schema_version"], 2);
 
         let omitted = gemma4_chat_camelid_payload::<serde_json::Value>(&[11], 10.0, None)
             .expect("ordinary response JSON");

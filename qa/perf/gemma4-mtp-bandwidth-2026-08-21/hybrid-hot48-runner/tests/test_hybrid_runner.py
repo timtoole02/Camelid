@@ -105,7 +105,7 @@ def hybrid_telemetry(unique: int = 64) -> dict[str, object]:
     hot_total = (8 + hot) * receipt.LAYERS
     cold_total = cold * receipt.LAYERS
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "scope": "single_completed_measured_request",
         "route_interval": {"scope": "measured_request_prefill_plus_generation"},
         "geometry": {

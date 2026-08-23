@@ -6,6 +6,7 @@ set -euo pipefail
 
 readonly script_dir=${0:A:h}
 readonly repo_root=${script_dir:h}
+readonly source_commit=$(/usr/bin/git -C "$repo_root" rev-parse HEAD)
 readonly port=${CAMELID_GEMMA4_WEBUI_PORT:-8181}
 readonly model=${CAMELID_GEMMA4_WEBUI_MODEL:-/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf}
 readonly cghost=${CAMELID_GEMMA4_WEBUI_CGHOST:-/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.v3.cghost}
@@ -15,8 +16,8 @@ readonly profile=39,40,33,30,30,31,31,30,34,30,26,28,30,31,28,37,31,30,31,32,31,
 typeset binary=${CAMELID_GEMMA4_WEBUI_BINARY:-}
 if [[ -z "$binary" ]]; then
   for candidate in \
-    /Volumes/Untitled/cargo-targets/global/release/camelid \
-    "$repo_root/target/release/camelid"; do
+    "$repo_root/target/release/camelid" \
+    /Volumes/Untitled/cargo-targets/global/release/camelid; do
     if [[ -x "$candidate" && -f "$candidate" ]]; then
       binary=$candidate
       break
@@ -94,6 +95,7 @@ print "Starting the exact Gemma 4 MTP WebUI on http://127.0.0.1:$port ..."
   CAMELID_GEMMA4_MTP_FULL_Q4=1 \
   CAMELID_GEMMA4_MTP_PREFILL_SEED_BOOTSTRAP=1 \
   CAMELID_GEMMA4_DENSE_K8_GENERIC=1 \
+  CAMELID_GEMMA4_HEAD_SPEC50_K8_COMPACT=1 \
   "$binary" serve \
     --addr "127.0.0.1:$port" \
     --model "$model" \
@@ -101,13 +103,31 @@ print "Starting the exact Gemma 4 MTP WebUI on http://127.0.0.1:$port ..."
     --expert-cache-mib 0 --gpu on --no-open &
 child_pid=$!
 
-typeset ready=0
+typeset ready=0 health=""
 for _ in {1..900}; do
-  if /usr/bin/curl -fsS --max-time 2 "http://127.0.0.1:$port/v1/health" 2>/dev/null \
-    | /usr/bin/jq -e '.generation_ready == true and .gemma4_ghost_execution_mode == "full_common_metal"' \
-      >/dev/null 2>&1; then
-    ready=1
-    break
+  if health=$(/usr/bin/curl -fsS --max-time 2 "http://127.0.0.1:$port/v1/health" 2>/dev/null); then
+    if print -r -- "$health" | /usr/bin/jq -e --arg source_commit "$source_commit" '
+      (.source_commit // "") != $source_commit
+    ' >/dev/null 2>&1; then
+      typeset running_commit
+      running_commit=$(print -r -- "$health" | /usr/bin/jq -r '.source_commit // "missing"')
+      print -u2 "Gemma 4 WebUI refused a stale build: binary=$running_commit source=$source_commit"
+      exit 75
+    fi
+    if print -r -- "$health" | /usr/bin/jq -e --arg source_commit "$source_commit" '
+        .source_commit == $source_commit and
+        .generation_ready == true and
+        .gemma4_serve_lane == "ghost_moe" and
+        .gemma4_ghost_execution_mode == "full_common_metal" and
+        .gemma4_ghost_common_metal_active == true and
+        .gemma4_ghost_experts_metal_active == true and
+        .gemma4_ghost_head_metal_active == true and
+        .gemma4_mtp_assistant_loaded == true and
+        .gemma4_mtp_full_q4_active == true
+      ' >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
   fi
   /bin/kill -0 "$child_pid" 2>/dev/null || {
     print -u2 "Gemma 4 WebUI stopped before the model became ready."
@@ -116,7 +136,7 @@ for _ in {1..900}; do
   /bin/sleep 1
 done
 (( ready == 1 )) || {
-  print -u2 "Gemma 4 WebUI did not become ready in 15 minutes."
+  print -u2 "Gemma 4 WebUI did not reach full-Metal + full-Q4 MTP readiness in 15 minutes."
   exit 75
 }
 

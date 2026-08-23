@@ -58,7 +58,7 @@ readonly cghost=${CAMELID_HYBRID_CGHOST:-/Users/timtoole/models/gemma4-mtp-pair/
 readonly assistant=${CAMELID_HYBRID_ASSISTANT:-/Users/timtoole/models/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors}
 readonly cam_lock=${CAMELID_CAM_LOCK:-/Users/timtoole/bin/cam-lock.sh}
 readonly load_contract=${CAMELID_HYBRID_LOAD_CONTRACT:-"$receipt_root/hybrid-load-only-schema-v1.json"}
-readonly telemetry_contract=${CAMELID_HYBRID_TELEMETRY_CONTRACT:-"$receipt_root/hybrid-telemetry-schema-v1.json"}
+readonly telemetry_contract=${CAMELID_HYBRID_TELEMETRY_CONTRACT:-"$receipt_root/hybrid-telemetry-schema-v2.json"}
 
 for key in \
   CAMELID_GEMMA4_GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER \
@@ -178,7 +178,7 @@ if [[ "$stage" == "load-only" ]]; then
   ' "$contract" >/dev/null || refuse "load-only integration contract does not match the frozen binary"
 else
   /usr/bin/jq -e --arg sha "$executable_sha" '
-    .schema_version == 1 and
+    .schema_version == 2 and
     .server_binary_sha256 == $sha and
     .response_field == "camelid.hybrid_telemetry" and
     .coverage == "every_completed_measured_round_and_layer" and

@@ -646,8 +646,8 @@ def validate_hybrid_telemetry(
         raise ReceiptError(f"unknown hybrid lane {lane!r}")
     if not _nonnegative_int(expected_tokens) or expected_tokens == 0:
         raise ReceiptError("hybrid telemetry validation requires a positive token budget")
-    if telemetry.get("schema_version") != 1:
-        raise ReceiptError("hybrid telemetry schema_version must be 1")
+    if telemetry.get("schema_version") != 2:
+        raise ReceiptError("hybrid telemetry schema_version must be 2")
     if telemetry.get("scope") != "single_completed_measured_request":
         raise ReceiptError("hybrid telemetry does not cover one completed measured request")
     route_interval = telemetry.get("route_interval")

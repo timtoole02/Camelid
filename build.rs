@@ -115,15 +115,35 @@ fn main() {
 // without a git checkout simply omit the env vars; the receipt module falls
 // back to the crate version.
 fn embed_build_provenance() {
-    // Re-run when HEAD or the index moves so the embedded commit stays current.
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/index");
+    // Resolve paths through Git rather than assuming `.git` is a directory.
+    // Linked worktrees use a `.git` pointer file, and their HEAD/index live in
+    // the main checkout's worktrees directory. The symbolic branch ref is the
+    // path that actually changes when a worktree commit advances.
+    for path in ["HEAD", "index", "packed-refs"] {
+        emit_git_rerun_path(path);
+    }
+    if let Some(head_ref) = git_stdout(&["symbolic-ref", "-q", "HEAD"]) {
+        emit_git_rerun_path(&head_ref);
+    }
     if let Some(commit) = git_stdout(&["rev-parse", "HEAD"]) {
         println!("cargo:rustc-env=CAMELID_GIT_COMMIT={commit}");
     }
     if let Some(describe) = git_stdout(&["describe", "--tags", "--dirty"]) {
         println!("cargo:rustc-env=CAMELID_GIT_DESCRIBE={describe}");
     }
+}
+
+fn emit_git_rerun_path(git_path: &str) {
+    let Some(path) = git_stdout(&["rev-parse", "--git-path", git_path]) else {
+        return;
+    };
+    let path = PathBuf::from(path);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR")).join(path)
+    };
+    println!("cargo:rerun-if-changed={}", path.display());
 }
 
 // The web UI (frontend/dist) is embedded into the binary via rust-embed, which

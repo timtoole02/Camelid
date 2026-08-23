@@ -16,6 +16,8 @@ readonly cghost=${CAMELID_50TPS_CGHOST:-/Users/timtoole/models/gemma4-mtp-pair/g
 readonly assistant=${CAMELID_50TPS_ASSISTANT:-/Users/timtoole/models/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors}
 readonly request="$script_dir/request-48.json"
 readonly expected="$script_dir/expected-48-token-ids.json"
+readonly REQUEST_SHA256=b2f1110079fc726699cc936a628a268a7ec5bf2076fa970899de39d4ea903939
+readonly EXPECTED_SHA256=45e65ac09155d7627373c262f1edd1faf6188fb6dad26c5d5994fe5226a97975
 readonly analyzer="$script_dir/gate_50tps.py"
 readonly run_id=$(/bin/date -u '+%Y%m%dT%H%M%SZ')-$$
 readonly receipt_root=${CAMELID_50TPS_RECEIPT_ROOT:-"$repo_root/qa/perf/gemma4-mtp-bandwidth-2026-08-21/50tps-gate-$run_id"}
@@ -49,6 +51,17 @@ for input in "$model" "$cghost" "$assistant" "$request" "$expected" "$analyzer";
     exit 75
   }
 done
+typeset request_sha256 expected_sha256
+request_sha256=$(/usr/bin/shasum -a 256 "$request" | /usr/bin/awk '{print $1}')
+expected_sha256=$(/usr/bin/shasum -a 256 "$expected" | /usr/bin/awk '{print $1}')
+[[ "$request_sha256" == "$REQUEST_SHA256" ]] || {
+  print -u2 "REFUSED: frozen request fixture SHA-256 drifted"
+  exit 75
+}
+[[ "$expected_sha256" == "$EXPECTED_SHA256" ]] || {
+  print -u2 "REFUSED: frozen expected-token fixture SHA-256 drifted"
+  exit 75
+}
 if /usr/sbin/lsof -nP -iTCP:$PORT -sTCP:LISTEN >/dev/null 2>&1; then
   print -u2 "REFUSED: TCP port $PORT is already in use"
   exit 76
@@ -115,6 +128,7 @@ free_percent=$(/usr/bin/memory_pressure -Q | /usr/bin/awk '/free percentage/ {gs
   CAMELID_GEMMA4_MTP_FULL_Q4=1 \
   CAMELID_GEMMA4_MTP_PREFILL_SEED_BOOTSTRAP=1 \
   CAMELID_GEMMA4_DENSE_K8_GENERIC=1 \
+  CAMELID_GEMMA4_HEAD_SPEC50_K8_COMPACT=1 \
   CAMELID_GEMMA4_SPEC_TIMING=1 \
   CAMELID_GEMMA4_GHOST_METAL_TIMING=1 \
   CAMELID_GEMMA4_ROUTE_TRACE=1 \
@@ -129,13 +143,16 @@ child_pid=$!
 typeset health="" ready=0
 for _ in {1..900}; do
   if health=$(/usr/bin/curl -fsS --max-time 2 "http://127.0.0.1:$PORT/v1/health" 2>/dev/null); then
-    if print -r -- "$health" | /usr/bin/jq -e '
+    if print -r -- "$health" | /usr/bin/jq -e --arg source_commit "$source_commit" '
+      .source_commit == $source_commit and
       .generation_ready == true and
       .gemma4_serve_lane == "ghost_moe" and
       .gemma4_ghost_execution_mode == "full_common_metal" and
       .gemma4_ghost_common_metal_active == true and
       .gemma4_ghost_experts_metal_active == true and
-      .gemma4_ghost_head_metal_active == true
+      .gemma4_ghost_head_metal_active == true and
+      .gemma4_mtp_assistant_loaded == true and
+      .gemma4_mtp_full_q4_active == true
     ' >/dev/null; then
       ready=1
       break
@@ -149,7 +166,7 @@ for _ in {1..900}; do
 done
 print -r -- "$health" > "$receipt_root/health.json"
 (( ready == 1 )) || {
-  print -u2 "REFUSED: server did not reach full-Metal readiness"
+  print -u2 "REFUSED: server did not reach full-Metal + full-Q4 MTP readiness"
   exit 75
 }
 
@@ -171,6 +188,7 @@ child_pid=""
 /usr/bin/python3 "$analyzer" \
   --response "$response" \
   --server-log "$server_log" \
+  --request "$request" \
   --expected-token-ids "$expected" \
   --output "$verdict"
 print -r -- "50TPS_RECEIPT=$receipt_root"

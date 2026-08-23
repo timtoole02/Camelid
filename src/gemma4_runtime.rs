@@ -35,6 +35,52 @@ use std::sync::Arc;
 const Q8_VALUES_PER_BLOCK: usize = 32;
 const Q8_WIRE_BYTES_PER_BLOCK: usize = 34;
 
+#[cfg(target_os = "macos")]
+const GEMMA4_MTP_FULL_Q4_ENV: &str = "CAMELID_GEMMA4_MTP_FULL_Q4";
+
+#[cfg(target_os = "macos")]
+fn parse_gemma4_mtp_full_q4_required(value: Option<&str>) -> std::result::Result<bool, String> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some(value) if value.eq_ignore_ascii_case("false") => Ok(false),
+        Some("1") => Ok(true),
+        Some(value) if value.eq_ignore_ascii_case("true") => Ok(true),
+        Some(value) => Err(format!(
+            "{GEMMA4_MTP_FULL_Q4_ENV} must be 0, 1, false, or true, got {value:?}"
+        )),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn gemma4_mtp_full_q4_required_from_environment() -> Result<bool> {
+    let value = match std::env::var(GEMMA4_MTP_FULL_Q4_ENV) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(BackendError::InvalidModelMetadata(format!(
+                "{GEMMA4_MTP_FULL_Q4_ENV} must contain Unicode text"
+            )));
+        }
+    };
+    parse_gemma4_mtp_full_q4_required(value.as_deref()).map_err(BackendError::InvalidModelMetadata)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod mtp_profile_env_tests {
+    use super::parse_gemma4_mtp_full_q4_required;
+
+    #[test]
+    fn full_q4_requirement_is_explicit_and_fail_closed() {
+        assert_eq!(parse_gemma4_mtp_full_q4_required(None), Ok(false));
+        assert_eq!(parse_gemma4_mtp_full_q4_required(Some("0")), Ok(false));
+        assert_eq!(parse_gemma4_mtp_full_q4_required(Some("FALSE")), Ok(false));
+        assert_eq!(parse_gemma4_mtp_full_q4_required(Some("1")), Ok(true));
+        assert_eq!(parse_gemma4_mtp_full_q4_required(Some("TrUe")), Ok(true));
+        assert!(parse_gemma4_mtp_full_q4_required(Some("yes")).is_err());
+        assert!(parse_gemma4_mtp_full_q4_required(Some("")).is_err());
+    }
+}
+
 /// Result of a cooperatively-cancellable Gemma 4 generation.
 ///
 /// Cancellation is not an inference failure: the HTTP owner went away, so the
@@ -1257,16 +1303,16 @@ struct GhostMoeExpertCache {
 #[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct MappedReadaheadEnqueueReceipt {
-    advised_records: u64,
-    advised_bytes: u64,
+    enqueued_records: u64,
+    enqueued_bytes: u64,
     enqueue_us: u64,
 }
 
 #[cfg(any(target_os = "macos", test))]
 impl MappedReadaheadEnqueueReceipt {
     fn add_assign_saturating(&mut self, other: Self) {
-        self.advised_records = self.advised_records.saturating_add(other.advised_records);
-        self.advised_bytes = self.advised_bytes.saturating_add(other.advised_bytes);
+        self.enqueued_records = self.enqueued_records.saturating_add(other.enqueued_records);
+        self.enqueued_bytes = self.enqueued_bytes.saturating_add(other.enqueued_bytes);
         self.enqueue_us = self.enqueue_us.saturating_add(other.enqueue_us);
     }
 }
@@ -1381,11 +1427,15 @@ impl GhostMoeExpertCache {
                 }
                 continue;
             };
-            receipt.advised_records = receipt.advised_records.saturating_add(1);
-            receipt.advised_bytes = receipt.advised_bytes.saturating_add(len as u64);
+            receipt.enqueued_records = receipt.enqueued_records.saturating_add(1);
+            receipt.enqueued_bytes = receipt.enqueued_bytes.saturating_add(len as u64);
             let inflight = Arc::clone(&self.mapped_readahead_inflight);
             pool.spawn_fifo(move || {
-                mmap.advise_willneed_range(offset, len);
+                if !mmap.advise_willneed_range(offset, len) {
+                    eprintln!(
+                        "[gemma4-ghost-metal] mapped-cold MADV_WILLNEED refused: layer={layer} expert={expert} bytes={len}"
+                    );
+                }
                 if let Ok(mut inflight) = inflight.lock() {
                     inflight.remove(&(layer, expert));
                 }
@@ -2851,8 +2901,9 @@ struct WaveFillCounters {
     salvage_us: std::sync::atomic::AtomicU64,
     victim_verify_fails: std::sync::atomic::AtomicU64,
     /// Record-sized, selected-cold mmap ranges accepted by the asynchronous
-    /// pager-advice queue. `enqueue_us` is nested inside `slot_filler_ms`; the
-    /// background MADV_WILLNEED duration is intentionally never awaited.
+    /// pager-advice queue. These are enqueue counts, not claims that the kernel
+    /// accepted or completed MADV_WILLNEED. `enqueue_us` is nested inside
+    /// `slot_filler_ms`; the background advisory duration is never awaited.
     mapped_readahead_advised_records: std::sync::atomic::AtomicU64,
     mapped_readahead_advised_bytes: std::sync::atomic::AtomicU64,
     mapped_readahead_enqueue_us: std::sync::atomic::AtomicU64,
@@ -3586,6 +3637,7 @@ impl Drop for GhostMetalSequenceCleanup<'_> {
             if let Some(runtime) = guard.as_mut() {
                 runtime.sequence_mode = GhostMetalSequenceMode::Idle;
                 runtime.prefill_round = false;
+                runtime.pending_previous_union_readahead = None;
                 if let Some(common) = runtime.common.as_mut() {
                     common.reset_sequence();
                 }
@@ -4048,7 +4100,7 @@ impl GhostMetalExpertRuntime {
                 eprintln!("{GHOST_METAL_MAPPED_READAHEAD_POLICY_MARKER}");
                 eprintln!("{GHOST_METAL_MAPPED_READAHEAD_PREVIOUS_UNION_POLICY_MARKER}");
                 eprintln!(
-                    "[gemma4-ghost-metal] mapped-cold readahead admission: max_inflight_records={} whole_slab_advice=0 anonymous_capacity_bytes=0 current_routing_advised_records=0 current_routing_advised_bytes=0 current_routing_enqueue_time_us=0 previous_union_advised_records=0 previous_union_advised_bytes=0 previous_union_enqueue_time_us=0",
+                    "[gemma4-ghost-metal] mapped-cold readahead admission: max_inflight_records={} whole_slab_advice=0 anonymous_capacity_bytes=0 current_routing_enqueued_records=0 current_routing_enqueued_bytes=0 current_routing_enqueue_time_us=0 previous_union_enqueued_records=0 previous_union_enqueued_bytes=0 previous_union_enqueue_time_us=0",
                     GHOST_METAL_MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS,
                 );
             }
@@ -4133,8 +4185,8 @@ impl GhostMetalExpertRuntime {
         if ghost_metal_timing_enabled() {
             eprintln!(
                 "[gemma4-ghost-metal] previous-union readahead next_start_pos={next_target_start_pos} records={} bytes={:.1}MiB enqueue={:.3}ms waited=0 bound_experts=0 copied_bytes=0",
-                total.advised_records,
-                total.advised_bytes as f64 / (1024.0 * 1024.0),
+                total.enqueued_records,
+                total.enqueued_bytes as f64 / (1024.0 * 1024.0),
                 total.enqueue_us as f64 / 1_000.0,
             );
         }
@@ -4601,6 +4653,18 @@ impl GhostMetalExpertRuntime {
                 let routed = wave.is_none();
                 let t_route = std::time::Instant::now();
                 let selected_experts: Vec<usize> = if let Some(wave) = wave {
+                    // The predicted wave remains the execution resource set.
+                    // When mapped readahead is active, separately recompute the
+                    // canonical strict-tie route union so a successful predicted
+                    // round publishes this target's exact union, not an older or
+                    // over-complete prediction, for the next assistant interval.
+                    if mapped_readahead_enabled {
+                        collected_routes[layer_idx] =
+                            crate::metal::gemma4_top8_union_from_router_logits(
+                                router_logits,
+                                n_tokens,
+                            );
+                    }
                     wave.to_vec()
                 } else {
                     // Mirror gemma4_gpu_topk_routing's selection loop and
@@ -4655,13 +4719,13 @@ impl GhostMetalExpertRuntime {
                         fill_counters
                             .mapped_readahead_advised_records
                             .fetch_add(
-                                receipt.advised_records,
+                                receipt.enqueued_records,
                                 std::sync::atomic::Ordering::Relaxed,
                             );
                         fill_counters
                             .mapped_readahead_advised_bytes
                             .fetch_add(
-                                receipt.advised_bytes,
+                                receipt.enqueued_bytes,
                                 std::sync::atomic::Ordering::Relaxed,
                             );
                         fill_counters
@@ -4864,8 +4928,8 @@ impl GhostMetalExpertRuntime {
             }
         }
         // Union continuity of this round's routed unions against the previous
-        // round's unions and against start-of-round slot residency. Only the
-        // unpredicted path collects routes, so predicted rounds contribute 0.
+        // round's unions and against start-of-round slot residency. Predicted
+        // rounds collect exact routes only when mapped readahead requests them.
         let mut overlap_prev_hits = 0u32;
         let mut overlap_prev_total = 0u32;
         let mut resident_start_hits = 0u32;
@@ -4901,13 +4965,13 @@ impl GhostMetalExpertRuntime {
             common
                 .last_chained_ledger
                 .mapped_readahead_previous_union_advised_records = previous_union_readahead
-                .advised_records
+                .enqueued_records
                 .min(u32::MAX as u64)
                 as u32;
             common
                 .last_chained_ledger
                 .mapped_readahead_previous_union_advised_bytes =
-                previous_union_readahead.advised_bytes;
+                previous_union_readahead.enqueued_bytes;
             common
                 .last_chained_ledger
                 .mapped_readahead_previous_union_enqueue_us = previous_union_readahead.enqueue_us;
@@ -7330,6 +7394,11 @@ pub struct Gemma4Runtime {
     metal_q6k_head: Option<crate::metal::Gemma4Q6KHead>,
     #[cfg(target_os = "macos")]
     mtp_assistant: std::sync::Mutex<Option<crate::metal::Gemma4MtpAssistantMetal>>,
+    /// Immutable load-time truth for lock-free health polling. Generation
+    /// holds `mtp_assistant` for an entire speculative request, so health must
+    /// never contend on that execution mutex.
+    #[cfg(target_os = "macos")]
+    mtp_assistant_health: Gemma4MtpAssistantHealth,
     /// Non-zero only between an exact seeded prefill and the one generation
     /// call allowed to consume it. Every target-state mutation clears it.
     mtp_prefill_seed_pending_nonce: std::sync::atomic::AtomicU64,
@@ -7346,6 +7415,18 @@ pub struct Gemma4GhostMetalComponents {
     pub common: bool,
     pub experts: bool,
     pub head: bool,
+}
+
+/// Live admission state for the optional Metal MTP assistant.
+///
+/// Keeping this separate from the target's Metal component receipt prevents a
+/// healthy target-only fallback from being mistaken for the optimized WebUI
+/// profile when the assistant artifact is missing or failed to load.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Gemma4MtpAssistantHealth {
+    pub loaded: bool,
+    pub full_q4_active: bool,
 }
 
 /// Cumulative directory and source-I/O counters for routed base slots.
@@ -7626,13 +7707,15 @@ pub struct Gemma4HybridTelemetryRound {
     pub overflow_layers: u32,
     pub overflow_experts: u32,
     pub victim_hits: u32,
-    pub mapped_readahead_advised_records: u32,
-    pub mapped_readahead_advised_bytes: u64,
+    /// Record ranges accepted by Camelid's async advisory queue. This does not
+    /// claim that the kernel accepted MADV_WILLNEED or finished page-in.
+    pub mapped_readahead_enqueued_records: u32,
+    pub mapped_readahead_enqueued_bytes: u64,
     pub mapped_readahead_enqueue_ms: f64,
     /// Separate early advice sourced from the previous target union. The
     /// unqualified fields above are the current verifier's routing-time advice.
-    pub mapped_readahead_previous_union_advised_records: u32,
-    pub mapped_readahead_previous_union_advised_bytes: u64,
+    pub mapped_readahead_previous_union_enqueued_records: u32,
+    pub mapped_readahead_previous_union_enqueued_bytes: u64,
     pub mapped_readahead_previous_union_enqueue_ms: f64,
     pub per_layer: Vec<Gemma4HybridTelemetryRoundLayer>,
 }
@@ -7879,14 +7962,14 @@ impl Gemma4HybridTelemetryCollector {
             overflow_layers: snapshot.last_chained_overflow_layers,
             overflow_experts: snapshot.last_chained_overflow_experts,
             victim_hits: snapshot.last_chained_victim_hits,
-            mapped_readahead_advised_records: snapshot
+            mapped_readahead_enqueued_records: snapshot
                 .last_chained_mapped_readahead_advised_records,
-            mapped_readahead_advised_bytes: snapshot.last_chained_mapped_readahead_advised_bytes,
+            mapped_readahead_enqueued_bytes: snapshot.last_chained_mapped_readahead_advised_bytes,
             mapped_readahead_enqueue_ms: snapshot.last_chained_mapped_readahead_enqueue_us as f64
                 / 1_000.0,
-            mapped_readahead_previous_union_advised_records: snapshot
+            mapped_readahead_previous_union_enqueued_records: snapshot
                 .last_chained_mapped_readahead_previous_union_advised_records,
-            mapped_readahead_previous_union_advised_bytes: snapshot
+            mapped_readahead_previous_union_enqueued_bytes: snapshot
                 .last_chained_mapped_readahead_previous_union_advised_bytes,
             mapped_readahead_previous_union_enqueue_ms: snapshot
                 .last_chained_mapped_readahead_previous_union_enqueue_us
@@ -8034,7 +8117,9 @@ impl Gemma4HybridTelemetryCollector {
         };
 
         Some(Gemma4HybridTelemetry {
-            schema_version: 1,
+            // v2 renames page-advice round fields from `advised` to the
+            // truthful `enqueued`; queue admission is not kernel page-in.
+            schema_version: 2,
             scope: "single_completed_measured_request",
             geometry: self.geometry,
             route_interval: Gemma4HybridTelemetryRouteInterval {
@@ -10311,6 +10396,67 @@ impl Gemma4Runtime {
             observer.ledger.required_head_resident_bytes = head_residency.resident_bytes as u64;
             observer.emit(Gemma4GhostLoadPhase::RequiredTargetPagesHeadReady)?;
         }
+        #[cfg(target_os = "macos")]
+        let mtp_assistant = {
+            let full_q4_required = gemma4_mtp_full_q4_required_from_environment()?;
+            let assistant_path =
+                std::env::var_os("CAMELID_GEMMA4_MTP_ASSISTANT_PATH").map(std::path::PathBuf::from);
+            match assistant_path {
+                Some(assistant_path) if assistant_path.is_file() => {
+                    match crate::metal::Gemma4MtpAssistantMetal::load(&assistant_path) {
+                        Ok(assistant) => {
+                            if full_q4_required && !assistant.full_q4_enabled() {
+                                return Err(BackendError::InvalidModelMetadata(format!(
+                                    "{GEMMA4_MTP_FULL_Q4_ENV}=1 was requested but the admitted MTP assistant is not full-Q4"
+                                )));
+                            }
+                            eprintln!(
+                                "[gemma4-mtp] MTP QAT assistant loaded from {:?} lm_head={} matrices={} (speculative enabled)",
+                                assistant_path,
+                                if assistant.q4_head_enabled() { "q4_0" } else { "bf16" },
+                                if assistant.full_q4_enabled() { "q4_0_all" } else { "bf16" },
+                            );
+                            Some(assistant)
+                        }
+                        Err(error) if full_q4_required => {
+                            return Err(BackendError::InvalidModelMetadata(format!(
+                                "{GEMMA4_MTP_FULL_Q4_ENV}=1 requires the MTP assistant to load successfully: {error}"
+                            )));
+                        }
+                        Err(error) => {
+                            eprintln!("[gemma4-mtp] MTP QAT assistant load failed: {error}");
+                            None
+                        }
+                    }
+                }
+                Some(assistant_path) if full_q4_required => {
+                    return Err(BackendError::InvalidModelMetadata(format!(
+                        "{GEMMA4_MTP_FULL_Q4_ENV}=1 requires an existing MTP assistant at {:?}",
+                        assistant_path
+                    )));
+                }
+                Some(assistant_path) => {
+                    eprintln!(
+                        "[gemma4-mtp] configured assistant path does not exist: {:?}",
+                        assistant_path
+                    );
+                    None
+                }
+                None if full_q4_required => {
+                    return Err(BackendError::InvalidModelMetadata(format!(
+                        "{GEMMA4_MTP_FULL_Q4_ENV}=1 requires CAMELID_GEMMA4_MTP_ASSISTANT_PATH"
+                    )));
+                }
+                None => None,
+            }
+        };
+        #[cfg(target_os = "macos")]
+        let mtp_assistant_health = Gemma4MtpAssistantHealth {
+            loaded: mtp_assistant.is_some(),
+            full_q4_active: mtp_assistant
+                .as_ref()
+                .is_some_and(crate::metal::Gemma4MtpAssistantMetal::full_q4_enabled),
+        };
         let runtime = Self {
             tokenizer,
             first_layer: range.start,
@@ -10340,30 +10486,9 @@ impl Gemma4Runtime {
             #[cfg(target_os = "macos")]
             metal_q6k_head,
             #[cfg(target_os = "macos")]
-            mtp_assistant: {
-                let assistant_path = std::env::var_os("CAMELID_GEMMA4_MTP_ASSISTANT_PATH")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|| std::path::PathBuf::from("/Users/timtoole/models/gemma4-26b-a4b-mtp-qat-assistant/model.safetensors"));
-                let assistant = if assistant_path.is_file() {
-                    match crate::metal::Gemma4MtpAssistantMetal::load(&assistant_path) {
-                        Ok(a) => {
-                            eprintln!(
-                                "[gemma4-mtp] MTP QAT assistant loaded from {:?} lm_head={} (speculative enabled)",
-                                assistant_path,
-                                if a.q4_head_enabled() { "q4_0" } else { "bf16" },
-                            );
-                            Some(a)
-                        }
-                        Err(e) => {
-                            eprintln!("[gemma4-mtp] MTP QAT assistant load failed: {e}");
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-                std::sync::Mutex::new(assistant)
-            },
+            mtp_assistant: std::sync::Mutex::new(mtp_assistant),
+            #[cfg(target_os = "macos")]
+            mtp_assistant_health,
             mtp_prefill_seed_pending_nonce: std::sync::atomic::AtomicU64::new(0),
             layers,
             config,
@@ -10485,6 +10610,13 @@ impl Gemma4Runtime {
         {
             Gemma4GhostMetalComponents::default()
         }
+    }
+
+    /// Snapshot whether the local runtime actually owns the optimized MTP
+    /// assistant requested by the strict WebUI profile.
+    #[cfg(target_os = "macos")]
+    pub fn mtp_assistant_health(&self) -> Gemma4MtpAssistantHealth {
+        self.mtp_assistant_health
     }
 
     /// Evaluates predicted routes for candidate tokens across all 30 layers and
@@ -22045,18 +22177,18 @@ mod mtp_target_seam_tests {
             telemetry.geometry.mapped_readahead_anonymous_capacity_bytes,
             0
         );
-        assert_eq!(telemetry.rounds[0].mapped_readahead_advised_records, 120);
+        assert_eq!(telemetry.rounds[0].mapped_readahead_enqueued_records, 120);
         assert_eq!(
-            telemetry.rounds[0].mapped_readahead_advised_bytes,
+            telemetry.rounds[0].mapped_readahead_enqueued_bytes,
             120 * HYBRID_TELEMETRY_RECORD_BYTES
         );
         assert_eq!(telemetry.rounds[0].mapped_readahead_enqueue_ms, 0.321);
         assert_eq!(
-            telemetry.rounds[0].mapped_readahead_previous_union_advised_records,
+            telemetry.rounds[0].mapped_readahead_previous_union_enqueued_records,
             64
         );
         assert_eq!(
-            telemetry.rounds[0].mapped_readahead_previous_union_advised_bytes,
+            telemetry.rounds[0].mapped_readahead_previous_union_enqueued_bytes,
             64 * HYBRID_TELEMETRY_RECORD_BYTES
         );
         assert_eq!(
@@ -22068,7 +22200,7 @@ mod mtp_target_seam_tests {
         assert_eq!(telemetry.metrics.max_full_assistant_exposed_ms, 20.0);
 
         let value = serde_json::to_value(&telemetry).expect("finite telemetry JSON");
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], 2);
         assert_eq!(value["scope"], "single_completed_measured_request");
         assert_eq!(
             value["route_interval"]["scope"],
@@ -22078,9 +22210,9 @@ mod mtp_target_seam_tests {
         assert_eq!(value["geometry"]["anonymous_hot_capacity_slots"], 960);
         assert_eq!(value["geometry"]["victim_record_capacity"], 0);
         assert_eq!(value["geometry"]["mapped_readahead_enabled"], true);
-        assert_eq!(value["rounds"][0]["mapped_readahead_advised_records"], 120);
+        assert_eq!(value["rounds"][0]["mapped_readahead_enqueued_records"], 120);
         assert_eq!(
-            value["rounds"][0]["mapped_readahead_previous_union_advised_records"],
+            value["rounds"][0]["mapped_readahead_previous_union_enqueued_records"],
             64
         );
         assert_eq!(value["geometry"]["per_layer"][0]["layer"], 0);
@@ -24253,18 +24385,18 @@ mod ghost_moe_wire_tests {
         );
 
         let mut previous_union_receipt = MappedReadaheadEnqueueReceipt {
-            advised_records: 2,
-            advised_bytes: 2 * HYBRID_TELEMETRY_RECORD_BYTES,
+            enqueued_records: 2,
+            enqueued_bytes: 2 * HYBRID_TELEMETRY_RECORD_BYTES,
             enqueue_us: 7,
         };
         previous_union_receipt.add_assign_saturating(MappedReadaheadEnqueueReceipt {
-            advised_records: 3,
-            advised_bytes: 3 * HYBRID_TELEMETRY_RECORD_BYTES,
+            enqueued_records: 3,
+            enqueued_bytes: 3 * HYBRID_TELEMETRY_RECORD_BYTES,
             enqueue_us: 11,
         });
-        assert_eq!(previous_union_receipt.advised_records, 5);
+        assert_eq!(previous_union_receipt.enqueued_records, 5);
         assert_eq!(
-            previous_union_receipt.advised_bytes,
+            previous_union_receipt.enqueued_bytes,
             5 * HYBRID_TELEMETRY_RECORD_BYTES
         );
         assert_eq!(previous_union_receipt.enqueue_us, 18);
