@@ -26,7 +26,7 @@ signals anything through that port. The benchmark child binds only
 By default, the schema-v3 watchdog requires 60 seconds at pressure level 1
 and at least 7.5 GiB reclaimable before spawn. Setting the exact opt-in
 `CAMELID_HOT40_ALLOW_WARNING_PRESSURE=1` admits pressure levels 1 or 2 and
-lowers only that pre-spawn floor to 5 GiB. Critical/unknown pressure is always
+lowers only that pre-spawn floor to 4.5 GiB. Critical/unknown pressure is always
 rejected. Both policies retain the 2 GiB runtime floor, 7.5 GiB child physical
 footprint ceiling, 8 GiB wired-memory ceiling, and hard abort on any current-run
 swap-in or swap-out counter change. Existing swap is allowed.

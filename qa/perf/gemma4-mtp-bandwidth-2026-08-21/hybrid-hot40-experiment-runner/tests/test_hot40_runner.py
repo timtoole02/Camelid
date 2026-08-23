@@ -567,12 +567,12 @@ class SyntheticRun:
         self.intent["allow_warning_pressure"] = True
         watchdog = self.intent["watchdog_contract"]
         watchdog["maximum_pressure_level_raw"] = 2
-        watchdog["minimum_baseline_reclaimable_headroom_bytes"] = 5 * 1024**3
+        watchdog["minimum_baseline_reclaimable_headroom_bytes"] = 4_608 * 1024**2
         hashing = self.intent["hashing_contract"]
         hashing["allow_warning_pressure"] = True
         hashing["maximum_pressure_level_raw"] = 2
-        hashing["minimum_pre_hash_reclaimable_headroom_bytes"] = 5 * 1024**3
-        hashing["minimum_post_hash_reclaimable_headroom_bytes"] = 5 * 1024**3
+        hashing["minimum_pre_hash_reclaimable_headroom_bytes"] = 4_608 * 1024**2
+        hashing["minimum_post_hash_reclaimable_headroom_bytes"] = 4_608 * 1024**2
         for sample in (self.hashing_memory_before, self.hashing_memory_after):
             sample["host"]["pressure_level_raw"] = 2
         write_json(self.root / "hashing-memory-before.json", self.hashing_memory_before)
@@ -587,7 +587,7 @@ class SyntheticRun:
             if isinstance(event.get("host"), dict):
                 event["host"]["pressure_level_raw"] = 2
             if event["event"] == "baseline_soak_complete":
-                event["minimum_reclaimable_headroom_bytes"] = 5 * 1024**3
+                event["minimum_reclaimable_headroom_bytes"] = 4_608 * 1024**2
                 event["maximum_pressure_level_raw"] = 2
             if event["event"] == "child_started":
                 event["maximum_pressure_level_raw"] = 2
@@ -637,7 +637,7 @@ class Hot40AnalyzerTests(unittest.TestCase):
         self.assertFalse(verdict["pressure_policy"]["allow_warning_pressure"])
         self.assertEqual(verdict["pressure_policy"]["maximum_pressure_level_raw"], 1)
 
-    def test_explicit_warning_pressure_receipt_passes_at_five_gib_baseline(self) -> None:
+    def test_explicit_warning_pressure_receipt_passes_at_four_and_a_half_gib_baseline(self) -> None:
         self.run.enable_warning_pressure()
         verdict = hot40.analyze(self.run.root)
         self.assertTrue(verdict["pass"])
@@ -809,7 +809,7 @@ class Hot40AnalyzerTests(unittest.TestCase):
 class Hot40SourceContractTests(unittest.TestCase):
     def test_baseline_gate_is_exactly_seven_and_a_half_gib(self) -> None:
         self.assertEqual(hot40.MIN_BASELINE_HEADROOM_BYTES, 7_680 * 1024**2)
-        self.assertEqual(hot40.WARNING_MIN_BASELINE_HEADROOM_BYTES, 5 * 1024**3)
+        self.assertEqual(hot40.WARNING_MIN_BASELINE_HEADROOM_BYTES, 4_608 * 1024**2)
 
     def test_watchdog_warning_opt_in_preserves_hard_memory_and_swap_gates(self) -> None:
         sample = SyntheticRun.host(headroom=5 * 1024**3)
@@ -825,7 +825,7 @@ class Hot40SourceContractTests(unittest.TestCase):
                 sample,
                 25,
                 baseline_swapins_pages=100,
-                minimum_reclaimable_headroom_bytes=5 * 1024**3,
+                minimum_reclaimable_headroom_bytes=4_608 * 1024**2,
                 maximum_host_wired_bytes=8 * 1024**3,
                 maximum_pressure_level_raw=2,
             ),
@@ -862,7 +862,7 @@ class Hot40SourceContractTests(unittest.TestCase):
         self.assertIn("anonymous_hot_capacity_slots: 1200", source)
         self.assertIn("anonymous_hot_capacity_bytes: 4030464000", source)
         self.assertIn("MIN_BASELINE_HEADROOM_BYTES=8053063680", source)
-        self.assertIn("WARNING_MIN_BASELINE_HEADROOM_BYTES=5368709120", source)
+        self.assertIn("WARNING_MIN_BASELINE_HEADROOM_BYTES=4831838208", source)
         self.assertIn("CAMELID_HOT40_ALLOW_WARNING_PRESSURE", source)
         self.assertIn('--maximum-pressure-level-raw "$maximum_pressure_level_raw"', source)
         self.assertNotIn("CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD=", source)
