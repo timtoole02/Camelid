@@ -229,10 +229,10 @@ cleanup() {
 }
 
 abort_on_signal() {
-  typeset status="$1"
+  typeset signal_exit_code="$1"
   trap - EXIT INT TERM HUP
   cleanup
-  exit "$status"
+  exit "$signal_exit_code"
 }
 
 trap cleanup EXIT
@@ -358,7 +358,7 @@ common_env=(
   CAMELID_GEMMA4_GHOST_METAL_COMMON=1
   CAMELID_GEMMA4_GHOST_METAL_CONTEXT=1024
   CAMELID_GEMMA4_GHOST_METAL_HEAD_RESIDENT=0
-  CAMELID_GEMMA4_GHOST_READ_THREADS=1
+  CAMELID_GEMMA4_GHOST_READ_THREADS=8
   CAMELID_GEMMA4_GHOST_METAL_DEMAND_LOAD_ONLY=1
   CAMELID_GEMMA4_GHOST_METAL_FILE_MAPPED_EXPERTS=1
   CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS=32
@@ -458,9 +458,9 @@ for _ in {1..1200}; do
   if ! /bin/kill -0 "$supervisor_pid" 2>/dev/null; then
     set +e
     wait "$supervisor_pid"
-    typeset status=$?
+    typeset watchdog_exit_code=$?
     set -e
-    refuse "watchdog exited before child_started (status $status)"
+    refuse "watchdog exited before child_started (status $watchdog_exit_code)"
   fi
   /bin/sleep 1
 done
@@ -484,9 +484,9 @@ for _ in {1..900}; do
   if ! /bin/kill -0 "$supervisor_pid" 2>/dev/null; then
     set +e
     wait "$supervisor_pid"
-    typeset status=$?
+    typeset watchdog_exit_code=$?
     set -e
-    refuse "watchdog exited before readiness (status $status)"
+    refuse "watchdog exited before readiness (status $watchdog_exit_code)"
   fi
   /bin/sleep 1
 done

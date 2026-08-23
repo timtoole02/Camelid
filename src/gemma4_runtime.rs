@@ -2456,10 +2456,10 @@ struct GhostMetalExpertRuntime {
     /// retries, so distances measured in it are upper bounds by at most the
     /// retry count). Timebase for the eviction-to-re-miss histogram.
     chained_round_seq: u32,
-    /// Prefill chunks advance through fresh prompt segments; speculative
-    /// slot fills from the previous round's unions are ~69% wrong there and
-    /// evict live experts (measured 12.8 GB of fill reads across a 31-token
-    /// prompt). Decode/verify rounds keep the speculative fill.
+    /// Prefill chunks advance through fresh prompt segments. Their routed
+    /// unions are observed for telemetry/hotness, but payload promotion is
+    /// deferred until the prefill-to-decode handoff, where only the final
+    /// prompt union is seeded. Decode/verify rounds promote immediately.
     prefill_round: bool,
     /// Cumulative payload bytes fetched by chained-wave demand fills. This is
     /// telemetry only: HEAD-lane direct reads live in `GhostMetalSlotStats`,
@@ -2746,6 +2746,77 @@ fn fill_hybrid_hot_slots(
         return false;
     }
     true
+}
+
+/// A chained prefill round already consumed the canonical mapped records for
+/// its current command. Re-reading that whole routed union into hot storage on
+/// every prompt chunk only churns the bounded tier. Decode rounds promote at
+/// their terminal barrier; prefill performs one explicit handoff seed instead.
+#[cfg(target_os = "macos")]
+fn hybrid_terminal_promotion_allowed(
+    round_ok: bool,
+    hybrid_mapped: bool,
+    prefill_round: bool,
+) -> bool {
+    round_ok && hybrid_mapped && !prefill_round
+}
+
+/// Promote one routed union per layer after every mixed-table lease is
+/// terminal. Layers own disjoint hot buffers/directories, the counters are
+/// atomic, and `.cghost` reads are positioned, so the configured read pool can
+/// fill layers in parallel while preserving the serial directory result. A
+/// one-thread configuration remains serial. Collect every outcome before
+/// reducing it so one refusal cannot cancel other in-flight refills halfway
+/// through the layer set.
+#[cfg(target_os = "macos")]
+fn fill_chained_hybrid_hot_layers(
+    layers: &mut [GhostMetalExpertLayer],
+    routes: &[Vec<usize>],
+    cache: &GhostMoeExpertCache,
+    counters: &WaveFillCounters,
+    round_seq: u32,
+) -> bool {
+    if layers.len() != routes.len() {
+        return false;
+    }
+    let outcomes = if let Some(pool) = cache.read_pool.as_ref() {
+        pool.install(|| {
+            layers
+                .par_iter_mut()
+                .enumerate()
+                .map(|(layer_idx, layer)| {
+                    let experts = &routes[layer_idx];
+                    experts.is_empty()
+                        || fill_hybrid_hot_slots(
+                            layer,
+                            cache,
+                            layer_idx,
+                            experts,
+                            HybridFillPayloadAccounting::Chained(counters),
+                            round_seq,
+                        )
+                })
+                .collect::<Vec<_>>()
+        })
+    } else {
+        layers
+            .iter_mut()
+            .enumerate()
+            .map(|(layer_idx, layer)| {
+                let experts = &routes[layer_idx];
+                experts.is_empty()
+                    || fill_hybrid_hot_slots(
+                        layer,
+                        cache,
+                        layer_idx,
+                        experts,
+                        HybridFillPayloadAccounting::Chained(counters),
+                        round_seq,
+                    )
+            })
+            .collect::<Vec<_>>()
+    };
+    outcomes.into_iter().all(std::convert::identity)
 }
 
 /// Bring `selected_experts` into this layer's persistent Metal slots.
@@ -3229,6 +3300,7 @@ impl Drop for GhostMetalSequenceCleanup<'_> {
         if let Ok(mut guard) = self.lane.lock() {
             if let Some(runtime) = guard.as_mut() {
                 runtime.sequence_mode = GhostMetalSequenceMode::Idle;
+                runtime.prefill_round = false;
                 if let Some(common) = runtime.common.as_mut() {
                     common.reset_sequence();
                 }
@@ -3712,6 +3784,66 @@ impl GhostMetalExpertRuntime {
             .collect();
         idx.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         idx.into_iter().take(top_n).map(|(e, _)| e).collect()
+    }
+
+    /// Seed the bounded hot tier once at the prefill-to-decode boundary from
+    /// the final prompt chunk's exact routed union. That union is the strongest
+    /// available next-token locality signal and preserves the decode hit rate
+    /// without copying nearly the full 12 GiB expert payload across all prompt
+    /// chunks. The mapped tier remains authoritative for every unseeded ID.
+    fn finish_hybrid_prefill_hot_handoff(&mut self, cache: &GhostMoeExpertCache) -> bool {
+        self.prefill_round = false;
+        if !self.has_hybrid_mapped_backing() {
+            return true;
+        }
+
+        let routes = self.latest_routed_experts.clone();
+        let counters = WaveFillCounters::default();
+        let started = std::time::Instant::now();
+        let ok = fill_chained_hybrid_hot_layers(
+            &mut self.layers,
+            &routes,
+            cache,
+            &counters,
+            self.chained_round_seq,
+        );
+        // This is the terminal promotion belonging to the final prefill
+        // round, merely delayed to the explicit handoff barrier. Keep the
+        // latest-round receipt exact: its hot/mapped partition predicts these
+        // loads because `routes` is that same final routed union and the real
+        // directory has not changed since the command materialized its table.
+        if let Some(common) = self.common.as_mut() {
+            use std::sync::atomic::Ordering::Relaxed;
+            common.last_chained_ledger.nvme_ms =
+                counters.nvme_us.load(Relaxed) as f64 / 1_000.0;
+            common.last_chained_ledger.nvme_bytes = counters.nvme_bytes.load(Relaxed);
+            common.last_chained_ledger.demand_loads = counters.demand_loads.load(Relaxed);
+            common.last_chained_ledger.fill_copy_ms =
+                counters.copy_us.load(Relaxed) as f64 / 1_000.0;
+            common.last_chained_ledger.slot_evictions = counters
+                .plan_evictions
+                .load(Relaxed)
+                .min(u32::MAX as u64) as u32;
+        }
+        fold_chained_fill_payload_totals(
+            &mut self.chained_demand_read_bytes,
+            &mut self.chained_demand_loads,
+            &counters,
+        );
+
+        if ghost_metal_timing_enabled() {
+            use std::sync::atomic::Ordering::Relaxed;
+            eprintln!(
+                "[gemma4-ghost-metal] prefill hot32 handoff ok={ok} candidates={} loads={} bytes={:.1}MiB evictions={} io_sum={:.1}ms wall={:.1}ms",
+                routes.iter().map(Vec::len).sum::<usize>(),
+                counters.demand_loads.load(Relaxed),
+                counters.nvme_bytes.load(Relaxed) as f64 / (1024.0 * 1024.0),
+                counters.plan_evictions.load(Relaxed),
+                counters.nvme_us.load(Relaxed) as f64 / 1_000.0,
+                started.elapsed().as_secs_f64() * 1_000.0,
+            );
+        }
+        ok
     }
 
     fn get_or_init_shared_buffers(
@@ -4234,23 +4366,17 @@ impl GhostMetalExpertRuntime {
                 &wave1_refs,
             )
         };
-        if ok && hybrid_mapped_backing {
+        if hybrid_terminal_promotion_allowed(ok, hybrid_mapped_backing, self.prefill_round) {
             if let Some(cache) = ghost_cache {
-                for (layer_idx, experts) in collected_routes.iter().enumerate() {
-                    if experts.is_empty()
-                        || !self.promote_hybrid_layer(
-                            layer_idx,
-                            experts,
-                            cache,
-                            HybridFillPayloadAccounting::Chained(&fill_counters),
-                        )
-                    {
-                        eprintln!(
-                            "[gemma4-ghost-metal] hybrid layer {layer_idx} terminal promotion refused"
-                        );
-                        ok = false;
-                        break;
-                    }
+                if !fill_chained_hybrid_hot_layers(
+                    &mut self.layers,
+                    &collected_routes,
+                    cache,
+                    &fill_counters,
+                    round_seq,
+                ) {
+                    eprintln!("[gemma4-ghost-metal] chained hybrid terminal promotion refused");
+                    ok = false;
                 }
             } else {
                 eprintln!(
@@ -10072,6 +10198,7 @@ impl Gemma4Runtime {
             if let Some(common) = runtime.common.as_mut() {
                 common.reset_sequence();
             }
+            runtime.prefill_round = false;
             runtime.sequence_mode = match plan {
                 GhostPrefillPlan::ScalarCpu | GhostPrefillPlan::CpuChunk => {
                     GhostMetalSequenceMode::Cpu
@@ -10112,6 +10239,8 @@ impl Gemma4Runtime {
         #[cfg(target_os = "macos")]
         {
             let started = std::time::Instant::now();
+            let kv_ready_ms;
+            let ghost_cache = self.ghost_moe_cache.as_deref();
             let imported = {
                 let mut guard = self.metal_q4_experts.lock().map_err(|_| {
                     BackendError::InvalidModelMetadata(
@@ -10124,6 +10253,7 @@ impl Gemma4Runtime {
                 if runtime.sequence_mode != GhostMetalSequenceMode::HybridPrefill
                     || !ghost_metal_acceleration_enabled()
                 {
+                    runtime.prefill_round = false;
                     runtime.sequence_mode = GhostMetalSequenceMode::Cpu;
                     if let Some(common) = runtime.common.as_mut() {
                         common.reset_sequence();
@@ -10131,27 +10261,46 @@ impl Gemma4Runtime {
                     return Ok(false);
                 }
                 let Some(common) = runtime.common.as_mut() else {
+                    runtime.prefill_round = false;
                     runtime.sequence_mode = GhostMetalSequenceMode::Cpu;
                     return Ok(false);
                 };
-                if common.is_at_position(positions) {
-                    runtime.sequence_mode = GhostMetalSequenceMode::Metal;
+                let common_ready = if common.is_at_position(positions) {
                     true
                 } else {
                     match common.import_position_major_kv(kc, vc, positions) {
-                        Ok(()) => {
-                            runtime.sequence_mode = GhostMetalSequenceMode::Metal;
-                            true
-                        }
+                        Ok(()) => true,
                         Err(error) => {
                             eprintln!(
                                 "[gemma4-ghost-common] CPU prefill KV import refused: {error}; continuing this request on CPU"
                             );
                             common.reset_sequence();
-                            runtime.sequence_mode = GhostMetalSequenceMode::Cpu;
                             false
                         }
                     }
+                };
+                kv_ready_ms = started.elapsed().as_secs_f64() * 1_000.0;
+                if common_ready {
+                    runtime.sequence_mode = GhostMetalSequenceMode::Metal;
+                    if let Some(cache) = ghost_cache {
+                        if !runtime.finish_hybrid_prefill_hot_handoff(cache) {
+                            eprintln!(
+                                "[gemma4-ghost-metal] prefill hot32 handoff refused; mapped fallback remains authoritative"
+                            );
+                        }
+                    } else {
+                        runtime.prefill_round = false;
+                        if runtime.has_hybrid_mapped_backing() {
+                            eprintln!(
+                                "[gemma4-ghost-metal] prefill hot32 handoff lost its canonical cache owner; mapped fallback retained"
+                            );
+                        }
+                    }
+                    true
+                } else {
+                    runtime.prefill_round = false;
+                    runtime.sequence_mode = GhostMetalSequenceMode::Cpu;
+                    false
                 }
             };
             if imported {
@@ -10173,7 +10322,7 @@ impl Gemma4Runtime {
                 if ghost_metal_timing_enabled() {
                     eprintln!(
                         "[gemma4-ghost-common] imported {positions} CPU-prefilled positions into Metal KV in {:.1}ms",
-                        started.elapsed().as_secs_f64() * 1_000.0
+                        kv_ready_ms
                     );
                 }
             }
@@ -22770,6 +22919,36 @@ mod ghost_moe_wire_tests {
             represented.sort_unstable();
             assert_eq!(represented, experts, "unique={unique}");
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_hybrid_terminal_promotion_defers_prefill_only() {
+        assert!(hybrid_terminal_promotion_allowed(true, true, false));
+        assert!(!hybrid_terminal_promotion_allowed(true, true, true));
+        assert!(!hybrid_terminal_promotion_allowed(false, true, false));
+        assert!(!hybrid_terminal_promotion_allowed(true, false, false));
+    }
+
+    #[test]
+    fn metal_hybrid_handoff_loads_match_final_round_mapped_admission() {
+        let mut directory = GhostMetalSlotDirectory::new(32);
+        for load in directory.plan(&(0..32).collect::<Vec<_>>()).unwrap().loads {
+            directory.commit_load(load);
+        }
+        let final_union = (0..16).chain(32..64).collect::<Vec<_>>();
+        let hot_bound = final_union
+            .iter()
+            .filter(|&&expert| directory.lookup_resident_slot(expert).is_some())
+            .count();
+        let mapped_bound = final_union.len() - hot_bound;
+        let expected_loads = mapped_bound.min(32 - hot_bound);
+        let (handoff, cold) = directory.plan_hot_overrides(&final_union).unwrap();
+        assert_eq!(hot_bound, 16);
+        assert_eq!(mapped_bound, 32);
+        assert_eq!(handoff.loads.len(), expected_loads);
+        assert_eq!(handoff.loads.len(), 16);
+        assert_eq!(cold.len(), 16);
     }
 
     #[test]

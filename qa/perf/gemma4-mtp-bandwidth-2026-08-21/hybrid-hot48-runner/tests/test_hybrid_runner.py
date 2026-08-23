@@ -1016,8 +1016,10 @@ class RunnerPreflightTests(unittest.TestCase):
         ):
             self.assertNotIn(key, source)
         self.assertIn("CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS=32", source)
+        self.assertIn("CAMELID_GEMMA4_GHOST_READ_THREADS=8", source)
         self.assertIn("CAMELID_GEMMA4_SLOT_PIN=0", source)
         self.assertIn("CAMELID_GEMMA4_CHAINED_K1=1", source)
+        self.assertNotIn("typeset status=", source)
         self.assertIn('lane_dir="$receipt_root/02-smoke-9t/k8"', source)
         self.assertIn('lane_dir="$receipt_root/02-smoke-9t/k1"', source)
         self.assertNotIn("02-smoke-8t", source)

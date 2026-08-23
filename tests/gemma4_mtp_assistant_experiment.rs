@@ -548,7 +548,7 @@ fn exact_target_environment() -> BTreeMap<String, String> {
         // hot set while all 128 canonical IDs remain addressable through the
         // retained read-only mapping. No legacy physical-prefix knob may
         // silently redefine either namespace.
-        ("CAMELID_GEMMA4_GHOST_READ_THREADS", "1"),
+        ("CAMELID_GEMMA4_GHOST_READ_THREADS", "8"),
         ("CAMELID_GEMMA4_GHOST_METAL_DEMAND_LOAD_ONLY", "1"),
         ("CAMELID_GEMMA4_GHOST_METAL_FILE_MAPPED_EXPERTS", "1"),
         ("CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS", "32"),
@@ -7632,6 +7632,10 @@ mod pure_tests {
         );
         assert_eq!(config.environment["CAMELID_GEMMA4_SPEC_CHUNK_MAX"], "8");
         assert_eq!(config.environment["CAMELID_GEMMA4_SPEC_DRAFT_TOKENS"], "8");
+        assert_eq!(
+            config.environment["CAMELID_GEMMA4_GHOST_READ_THREADS"],
+            "8"
+        );
 
         for invalid in ["032", "48"] {
             let mut drifted = config.clone();
