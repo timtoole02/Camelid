@@ -42,6 +42,7 @@ REQUEST_SHA256 = "b2f1110079fc726699cc936a628a268a7ec5bf2076fa970899de39d4ea9039
 EXPECTED_IDS_SHA256 = "45e65ac09155d7627373c262f1edd1faf6188fb6dad26c5d5994fe5226a97975"
 FULL_Q4_MATRIX_BYTES = 236_077_056
 FULL_Q4_BF16_MATRIX_BYTES = 839_385_088
+F_RDAHEAD = 45
 F_NOCACHE = 48
 FULL_Q4_RESIDENCY_MARKER = (
     "[gemma4-mtp full-q4 residency] source_retained=false mapped_bytes=0 "
@@ -180,6 +181,7 @@ def _sha256(path: Path) -> str:
         identity_before = os.fstat(descriptor)
         if not stat.S_ISREG(identity_before.st_mode):
             raise ReceiptError(f"hashed input is not a regular file: {path}")
+        fcntl.fcntl(descriptor, F_RDAHEAD, 0)
         fcntl.fcntl(descriptor, F_NOCACHE, 1)
         while block := os.read(descriptor, 4 * 1024 * 1024):
             digest.update(block)
@@ -302,9 +304,12 @@ def _validate_hashing_contract(run_dir: Path, intent: dict[str, Any]) -> None:
         "schema_version": 1,
         "algorithm": "sha256",
         "platform": "darwin",
+        "f_rdahead_command": F_RDAHEAD,
+        "f_rdahead_value": 0,
         "f_nocache_command": F_NOCACHE,
         "f_nocache_value": 1,
         "read_chunk_bytes": 4 * 1024 * 1024,
+        "post_hash_cooldown_seconds": 60,
         "helper_artifact_label": "nocache_hasher",
         "host_sampler_artifact_label": "host_sampler",
         "telemetry_watchdog_artifact_label": "watchdog",
@@ -974,8 +979,10 @@ def analyze(run_dir: Path) -> dict[str, Any]:
         "stages": stages,
         "hashing": {
             "algorithm": "sha256",
+            "f_rdahead_command": F_RDAHEAD,
             "f_nocache_command": F_NOCACHE,
             "read_chunk_bytes": 4 * 1024 * 1024,
+            "post_hash_cooldown_seconds": 60,
             "pre_hash_reclaimable_headroom_bytes": hashing_before[
                 "reclaimable_headroom_bytes"
             ],

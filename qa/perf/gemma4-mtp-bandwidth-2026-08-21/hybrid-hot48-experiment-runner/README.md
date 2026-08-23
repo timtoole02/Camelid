@@ -30,8 +30,9 @@ Optional input overrides are `CAMELID_HOT48_MODEL`, `CAMELID_HOT48_CGHOST`,
 must resolve to a regular non-symlink file or a fresh output directory on the
 internal system data volume. The runner hashes the binary, all model inputs,
 fixtures, and tooling into `intent.json` and `baseline.txt` before launch.
-Large-file integrity hashing uses macOS `F_NOCACHE`, so receipt creation does
-not turn the model files into artificial page-cache pressure before baseline.
+Large-file integrity hashing disables macOS read-ahead and enables
+`F_NOCACHE`, then allows 60 seconds for transient read pages to age out, so
+receipt creation does not turn model files into artificial baseline pressure.
 Canonical watchdog telemetry is captured immediately before and after that
 hash phase; both samples must retain 8 GiB headroom, normal pressure, bounded
 wired memory, one boot identity, and unchanged swap-in/swap-out counters.

@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 
+F_RDAHEAD = 45
 F_NOCACHE = 48
 READ_BYTES = 4 * 1024 * 1024
 
@@ -27,6 +28,7 @@ def sha256_nocache(path: Path) -> str:
         identity_before = os.fstat(descriptor)
         if not stat.S_ISREG(identity_before.st_mode):
             raise RuntimeError(f"input is not a regular file: {path}")
+        fcntl.fcntl(descriptor, F_RDAHEAD, 0)
         fcntl.fcntl(descriptor, F_NOCACHE, 1)
         while block := os.read(descriptor, READ_BYTES):
             digest.update(block)

@@ -221,6 +221,8 @@ watchdog_sha=$(sha256_file "$watchdog")
 [[ "$request_frozen_sha" == "$REQUEST_SHA256" ]] || refuse "frozen request copy drifted"
 [[ "$expected_ids_frozen_sha" == "$EXPECTED_IDS_SHA256" ]] || refuse "frozen token-ID copy drifted"
 
+print -r -- "Cooling transient no-cache read pages for 60 seconds..."
+/bin/sleep 60
 /usr/bin/python3 "$host_sampler" --watchdog "$watchdog" --output "$hashing_memory_after"
 /usr/bin/jq -e -s \
   --arg boot "$boot_identity" \
@@ -324,9 +326,12 @@ hashing_memory_after_size=$(/usr/bin/stat -f '%z' "$hashing_memory_after")
       schema_version: 1,
       algorithm: "sha256",
       platform: "darwin",
+      f_rdahead_command: 45,
+      f_rdahead_value: 0,
       f_nocache_command: 48,
       f_nocache_value: 1,
       read_chunk_bytes: 4194304,
+      post_hash_cooldown_seconds: 60,
       helper_artifact_label: "nocache_hasher",
       host_sampler_artifact_label: "host_sampler",
       telemetry_watchdog_artifact_label: "watchdog",
