@@ -50,6 +50,16 @@ FULL_Q4_RESIDENCY_MARKER = (
 )
 
 EXPERIMENT_ENV = "CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT48_EXPERIMENT"
+SPARSE_PREDICT_PROBE_ENV = "CAMELID_GEMMA4_GHOST_METAL_SPARSE_PREDICT_PROBE"
+SPARSE_PREDICT_SCHEMA_VERSION = 2
+SPARSE_PREDICT_CAP = 48
+SPARSE_PREDICT_STRATEGIES = (
+    "previous-approx-hot-decay-canonical",
+    "approx-previous-hot-decay-canonical",
+    "decay-approx-previous-hot-canonical",
+    "previous-decay-approx-hot-canonical",
+)
+SPARSE_PREDICT_LOG_PREFIX = "[gemma4 sparse-predict probe] "
 PER_LAYER_ENVIRONMENT = {
     "CAMELID_GEMMA4_GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER",
     "CAMELID_GEMMA4_GHOST_METAL_SLOTS_PER_LAYER",
@@ -70,6 +80,7 @@ EXPECTED_ENVIRONMENT = {
     "CAMELID_GEMMA4_GHOST_METAL_FILE_MAPPED_EXPERTS": "1",
     "CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS": "32",
     EXPERIMENT_ENV: "1",
+    SPARSE_PREDICT_PROBE_ENV: "1",
     "CAMELID_GEMMA4_GHOST_METAL_DECODE_PROMOTION": "0",
     "CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD": "1",
     "CAMELID_GEMMA4_SLOT_PIN": "0",
@@ -685,7 +696,265 @@ def _summary(values: list[float]) -> dict[str, float]:
     }
 
 
-def _validate_response(run_dir: Path) -> tuple[dict[str, Any], list[int]]:
+def _parse_decimal_list(raw: str, *, field: str) -> list[int]:
+    values = raw.split(",")
+    if len(values) != EXPECTED_LAYERS or any(
+        re.fullmatch(r"[0-9]+", value) is None for value in values
+    ):
+        raise ReceiptError(f"sparse-predict {field} is not exactly 30 canonical decimals")
+    return [int(value) for value in values]
+
+
+def _parse_mask_list(raw: str, *, field: str) -> list[int]:
+    values = raw.split(",")
+    if len(values) != EXPECTED_LAYERS or any(
+        re.fullmatch(r"[0-9a-f]{32}", value) is None for value in values
+    ):
+        raise ReceiptError(f"sparse-predict {field} is not exactly 30 canonical 128-bit masks")
+    return [int(value, 16) for value in values]
+
+
+def _parse_probe_missing(raw: str) -> dict[int, list[int]]:
+    if raw == "none":
+        return {}
+    parsed: dict[int, list[int]] = {}
+    for encoded in raw.split(";"):
+        match = re.fullmatch(r"L([0-9]+):\[([0-9, ]+)\]", encoded)
+        if match is None:
+            raise ReceiptError("sparse-predict missing-ID receipt is malformed")
+        layer = int(match.group(1))
+        ids_raw = match.group(2).split(", ")
+        if (
+            layer >= EXPECTED_LAYERS
+            or layer in parsed
+            or any(re.fullmatch(r"[0-9]+", value) is None for value in ids_raw)
+        ):
+            raise ReceiptError("sparse-predict missing-ID receipt has invalid layer or IDs")
+        ids = [int(value) for value in ids_raw]
+        if (
+            not ids
+            or len(set(ids)) != len(ids)
+            or any(value >= LOGICAL_SLOTS_PER_LAYER for value in ids)
+        ):
+            raise ReceiptError("sparse-predict missing-ID receipt is not canonical")
+        # The runtime preserves current-route discovery order in the diagnostic
+        # list. Coverage is a set contract, so normalize only after rejecting
+        # duplicate or out-of-range identities.
+        parsed[layer] = sorted(ids)
+    return parsed
+
+
+def _parse_sparse_probe_line(line: str) -> dict[str, str]:
+    if not line.startswith(SPARSE_PREDICT_LOG_PREFIX):
+        raise ReceiptError("sparse-predict receipt has a malformed prefix")
+    body = line[len(SPARSE_PREDICT_LOG_PREFIX) :]
+    header, separator, missing = body.partition(" missing=")
+    if not separator:
+        raise ReceiptError("sparse-predict receipt has no terminal missing-ID field")
+    fields: dict[str, str] = {}
+    for encoded in header.split(" "):
+        key, separator, value = encoded.partition("=")
+        if not separator or not key or not value or key in fields:
+            raise ReceiptError("sparse-predict receipt has malformed or duplicate fields")
+        fields[key] = value
+    expected = {
+        "schema",
+        "round_seq",
+        "start_pos",
+        "K",
+        "strategy",
+        "cap",
+        "predict_us",
+        "truth_valid",
+        "eligible",
+        "missing_pairs",
+        "missing_layers",
+        "candidate_sizes",
+        "actual_sizes",
+        "candidate_masks",
+        "actual_masks",
+    }
+    if set(fields) != expected:
+        raise ReceiptError(
+            "sparse-predict receipt field set drifted: "
+            f"missing={sorted(expected.difference(fields))}, "
+            f"extra={sorted(set(fields).difference(expected))}"
+        )
+    fields["missing"] = missing
+    return fields
+
+
+def _validate_sparse_probe(
+    log: str, expected_rounds: list[dict[str, Any]]
+) -> dict[str, Any]:
+    lines = [
+        line
+        for line in log.splitlines()
+        if "[gemma4 sparse-predict probe]" in line
+    ]
+    expected_count = len(expected_rounds) * len(SPARSE_PREDICT_STRATEGIES)
+    if len(lines) != expected_count:
+        raise ReceiptError(
+            "sparse-predict receipt count does not equal four strategies for every K8 round"
+        )
+
+    expected_by_key: dict[tuple[int, int, int], dict[str, Any]] = {}
+    for round_receipt in expected_rounds:
+        key = (
+            round_receipt["round_seq"],
+            round_receipt["start_pos"],
+            round_receipt["k"],
+        )
+        if key in expected_by_key:
+            raise ReceiptError("response contains duplicate sparse-predict round bindings")
+        expected_by_key[key] = round_receipt
+
+    observed: dict[tuple[int, int, int], dict[str, dict[str, Any]]] = {}
+    for line in lines:
+        fields = _parse_sparse_probe_line(line)
+        decimal_fields = (
+            "schema",
+            "round_seq",
+            "start_pos",
+            "K",
+            "cap",
+            "predict_us",
+            "truth_valid",
+            "eligible",
+            "missing_pairs",
+            "missing_layers",
+        )
+        if any(re.fullmatch(r"[0-9]+", fields[field]) is None for field in decimal_fields):
+            raise ReceiptError("sparse-predict receipt has a non-canonical numeric field")
+        values = {field: int(fields[field]) for field in decimal_fields}
+        key = (values["round_seq"], values["start_pos"], values["K"])
+        expected = expected_by_key.get(key)
+        if expected is None:
+            raise ReceiptError("sparse-predict receipt does not bind a measured K8 round")
+        strategy = fields["strategy"]
+        if strategy not in SPARSE_PREDICT_STRATEGIES:
+            raise ReceiptError(f"sparse-predict receipt has unknown strategy {strategy!r}")
+        round_observed = observed.setdefault(key, {})
+        if strategy in round_observed:
+            raise ReceiptError("sparse-predict receipt duplicates a round strategy")
+        if (
+            values["schema"] != SPARSE_PREDICT_SCHEMA_VERSION
+            or values["K"] != 8
+            or values["cap"] != SPARSE_PREDICT_CAP
+            or values["predict_us"] <= 0
+            or values["truth_valid"] != 1
+            or values["eligible"] not in (0, 1)
+        ):
+            raise ReceiptError("sparse-predict schema, K8/Hot48 cap, timing, or truth validity failed")
+
+        candidate_sizes = _parse_decimal_list(
+            fields["candidate_sizes"], field="candidate_sizes"
+        )
+        actual_sizes = _parse_decimal_list(fields["actual_sizes"], field="actual_sizes")
+        candidate_masks = _parse_mask_list(
+            fields["candidate_masks"], field="candidate_masks"
+        )
+        actual_masks = _parse_mask_list(fields["actual_masks"], field="actual_masks")
+        if any(size != SPARSE_PREDICT_CAP for size in candidate_sizes):
+            raise ReceiptError("sparse-predict candidate size is not uniform 48")
+        if any(not 8 <= size <= 64 for size in actual_sizes):
+            raise ReceiptError("sparse-predict actual size is outside the exact K8 union bounds")
+        if actual_sizes != expected["actual_sizes"]:
+            raise ReceiptError("sparse-predict actual sizes do not match response telemetry")
+        for layer, (candidate_size, actual_size, candidate_mask, actual_mask) in enumerate(
+            zip(candidate_sizes, actual_sizes, candidate_masks, actual_masks)
+        ):
+            if candidate_mask.bit_count() != candidate_size:
+                raise ReceiptError(
+                    f"sparse-predict layer {layer} candidate mask popcount drifted"
+                )
+            if actual_mask.bit_count() != actual_size:
+                raise ReceiptError(f"sparse-predict layer {layer} actual mask popcount drifted")
+
+        missing_masks = [
+            actual_mask & ~candidate_mask
+            for actual_mask, candidate_mask in zip(actual_masks, candidate_masks)
+        ]
+        missing_pairs = sum(mask.bit_count() for mask in missing_masks)
+        missing_layers = sum(mask != 0 for mask in missing_masks)
+        if (
+            values["missing_pairs"] != missing_pairs
+            or values["missing_layers"] != missing_layers
+            or bool(values["eligible"]) != (missing_pairs == 0)
+        ):
+            raise ReceiptError("sparse-predict missing or eligibility accounting drifted")
+        missing_receipt = _parse_probe_missing(fields["missing"])
+        expected_missing_receipt = {
+            layer: [expert for expert in range(128) if mask & (1 << expert)]
+            for layer, mask in enumerate(missing_masks)
+            if mask
+        }
+        if missing_receipt != expected_missing_receipt:
+            raise ReceiptError("sparse-predict missing-ID receipt disagrees with exact masks")
+
+        round_observed[strategy] = {
+            "predict_us": values["predict_us"],
+            "eligible": bool(values["eligible"]),
+            "missing_pairs": missing_pairs,
+            "missing_layers": missing_layers,
+            "actual_sizes": actual_sizes,
+            "actual_masks": actual_masks,
+        }
+
+    expected_strategies = set(SPARSE_PREDICT_STRATEGIES)
+    prediction_us: list[int] = []
+    strategy_summary = {
+        strategy: {
+            "rounds": 0,
+            "eligible_rounds": 0,
+            "missing_pairs": 0,
+            "maximum_missing_layers": 0,
+        }
+        for strategy in SPARSE_PREDICT_STRATEGIES
+    }
+    for key, expected in expected_by_key.items():
+        round_observed = observed.get(key)
+        if round_observed is None or set(round_observed) != expected_strategies:
+            raise ReceiptError("sparse-predict round is missing an exact strategy set")
+        actual_sizes = {tuple(value["actual_sizes"]) for value in round_observed.values()}
+        actual_masks = {tuple(value["actual_masks"]) for value in round_observed.values()}
+        timings = {value["predict_us"] for value in round_observed.values()}
+        if len(actual_sizes) != 1 or len(actual_masks) != 1 or len(timings) != 1:
+            raise ReceiptError("sparse-predict strategies disagree on round truth or timing")
+        if next(iter(actual_sizes)) != tuple(expected["actual_sizes"]):
+            raise ReceiptError("sparse-predict round truth drifted after strategy reconciliation")
+        prediction_us.append(next(iter(timings)))
+        for strategy, value in round_observed.items():
+            summary = strategy_summary[strategy]
+            summary["rounds"] += 1
+            summary["eligible_rounds"] += int(value["eligible"])
+            summary["missing_pairs"] += value["missing_pairs"]
+            summary["maximum_missing_layers"] = max(
+                summary["maximum_missing_layers"], value["missing_layers"]
+            )
+
+    return {
+        "schema_version": SPARSE_PREDICT_SCHEMA_VERSION,
+        "observational_only": True,
+        "throughput_contaminated": True,
+        "throughput_promotion_allowed": False,
+        "cap_experts_per_layer": SPARSE_PREDICT_CAP,
+        "k": 8,
+        "rounds": len(expected_rounds),
+        "receipt_count": len(lines),
+        "strategies": strategy_summary,
+        "prediction_microseconds": {
+            "count": len(prediction_us),
+            "minimum": min(prediction_us),
+            "mean": statistics.fmean(prediction_us),
+            "maximum": max(prediction_us),
+        },
+    }
+
+
+def _validate_response(
+    run_dir: Path,
+) -> tuple[dict[str, Any], list[int], list[dict[str, Any]]]:
     response = _read_json(run_dir / "response.json")
     expected_ids = _read_json(run_dir / "expected-token-ids.json")
     if not isinstance(expected_ids, list) or len(expected_ids) != EXPECTED_TOKENS:
@@ -746,6 +1015,8 @@ def _validate_response(run_dir: Path) -> tuple[dict[str, Any], list[int]]:
     assistant_gpu_values: list[float] = []
     assistant_rounds = 0
     assistant_proposals: list[int] = []
+    sparse_probe_rounds: list[dict[str, Any]] = []
+    seen_round_sequences: set[int] = set()
     full_k8_rounds = 0
     for index, receipt in enumerate(rounds):
         if not isinstance(receipt, dict) or receipt.get("round_index") != index:
@@ -768,6 +1039,8 @@ def _validate_response(run_dir: Path) -> tuple[dict[str, Any], list[int]]:
         accepted_k = receipt.get("accepted_drafts")
         useful = receipt.get("useful_accepted_drafts")
         verifier_k = receipt.get("verifier_k")
+        round_sequence = receipt.get("chained_round_sequence")
+        start_pos = receipt.get("prefix_tokens_before")
         committed = receipt.get("committed_tokens")
         if (
             not _is_nonnegative_int(proposed_k)
@@ -782,8 +1055,13 @@ def _validate_response(run_dir: Path) -> tuple[dict[str, Any], list[int]]:
             or not isinstance(committed, list)
             or len(committed) != useful + 1
             or any(not _is_nonnegative_int(token) or token > 0xFFFF_FFFF for token in committed)
+            or not _is_nonnegative_int(round_sequence)
+            or round_sequence == 0
+            or round_sequence in seen_round_sequences
+            or not _is_nonnegative_int(start_pos)
         ):
             raise ReceiptError(f"round {index} has inconsistent K or commit accounting")
+        seen_round_sequences.add(round_sequence)
         per_layer = receipt.get("per_layer")
         if not isinstance(per_layer, list) or len(per_layer) != EXPECTED_LAYERS:
             raise ReceiptError(f"round {index} lacks exact per-layer routing evidence")
@@ -820,6 +1098,16 @@ def _validate_response(run_dir: Path) -> tuple[dict[str, Any], list[int]]:
             assistant_proposals.append(proposed_k)
         if proposed_k == 7 and verifier_k == 8 and receipt.get("budget_truncated") is False:
             full_k8_rounds += 1
+        if verifier_k == 8:
+            sparse_probe_rounds.append(
+                {
+                    "round_index": index,
+                    "round_seq": round_sequence,
+                    "start_pos": start_pos,
+                    "k": verifier_k,
+                    "actual_sizes": [layer["active_unique"] for layer in per_layer],
+                }
+            )
         proposed += proposed_k
         accepted += accepted_k
         committed_ids.extend(committed)
@@ -864,12 +1152,16 @@ def _validate_response(run_dir: Path) -> tuple[dict[str, Any], list[int]]:
             "assistant_gpu": _summary(assistant_gpu_values),
         },
         assistant_proposals,
+        sparse_probe_rounds,
     )
 
 
 def _validate_log(
-    run_dir: Path, assistant_proposals: list[int], assistant_sha256: str
-) -> dict[str, Any]:
+    run_dir: Path,
+    assistant_proposals: list[int],
+    assistant_sha256: str,
+    sparse_probe_rounds: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
     try:
         log = (run_dir / "server.log").read_text(encoding="utf-8", errors="replace")
     except OSError as error:
@@ -920,18 +1212,22 @@ def _validate_log(
             if not math.isfinite(value) or value < 0.0:
                 raise ReceiptError("Metal stage receipt contains an invalid duration")
             values[name].append(value)
-    return {
-        "receipt_count": len(stage_matches),
-        "split_mode": "per-cb",
-        "milliseconds": {name: _summary(series) for name, series in values.items()},
-        "full_q4": {
-            "source_sha256": source_sha,
-            "matrices": int(matrices),
-            "packed_bytes": int(packed_bytes),
-            "bf16_matrix_bytes": int(bf16_bytes),
+    sparse_probe = _validate_sparse_probe(log, sparse_probe_rounds)
+    return (
+        {
+            "receipt_count": len(stage_matches),
+            "split_mode": "per-cb",
+            "milliseconds": {name: _summary(series) for name, series in values.items()},
+            "full_q4": {
+                "source_sha256": source_sha,
+                "matrices": int(matrices),
+                "packed_bytes": int(packed_bytes),
+                "bf16_matrix_bytes": int(bf16_bytes),
+            },
+            "device_chain_receipts": len(chains),
         },
-        "device_chain_receipts": len(chains),
-    }
+        sparse_probe,
+    )
 
 
 def _validate_ports(run_dir: Path) -> None:
@@ -949,9 +1245,11 @@ def analyze(run_dir: Path) -> dict[str, Any]:
     intent = _validate_intent(run_dir)
     _validate_health(run_dir, intent["source_commit"])
     memory = _validate_watchdog(run_dir)
-    performance, assistant_proposals = _validate_response(run_dir)
+    performance, assistant_proposals, sparse_probe_rounds = _validate_response(run_dir)
     assistant_sha256 = intent["artifacts"]["assistant"]["sha256"]
-    stages = _validate_log(run_dir, assistant_proposals, assistant_sha256)
+    stages, sparse_probe = _validate_log(
+        run_dir, assistant_proposals, assistant_sha256, sparse_probe_rounds
+    )
     _validate_ports(run_dir)
     hashing_contract = intent["hashing_contract"]
     hashing_before = hashing_contract["memory_before"]["host"]
@@ -973,9 +1271,17 @@ def analyze(run_dir: Path) -> dict[str, Any]:
             "f_nocache_integrity_hashing": True,
             "hash_phase_bounded_memory": True,
             "hash_phase_no_swap_growth": True,
+            "exact_sparse_predict_probe_receipts": True,
+            "throughput_contamination_disclosed": True,
         },
         "geometry": intent["geometry"],
-        "performance": performance,
+        "performance": {
+            **performance,
+            "throughput_contaminated_by_sparse_predict_probe": True,
+            "throughput_promotion_allowed": False,
+            "measurement_scope": "sparse_predict_observation_only",
+        },
+        "sparse_predict_probe": sparse_probe,
         "stages": stages,
         "hashing": {
             "algorithm": "sha256",
@@ -1015,8 +1321,9 @@ def main(argv: list[str] | None = None) -> int:
         return 75
     print(
         "HOT48_PASS "
-        f"tps={verdict['performance']['effective_decode_tokens_per_second']:.3f} "
+        f"observed_tps_contaminated={verdict['performance']['effective_decode_tokens_per_second']:.3f} "
         f"wall_ms={verdict['performance']['receipt_round_wall_ms']:.3f} "
+        "throughput_promotion_allowed=false "
         f"peak_footprint_gib={verdict['memory']['peak_child_physical_footprint_bytes'] / 1024**3:.3f}"
     )
     return 0

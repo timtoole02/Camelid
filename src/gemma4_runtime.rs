@@ -1700,6 +1700,13 @@ const GHOST_METAL_DECODE_PROMOTION_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_DECOD
 /// dependency.
 const GHOST_METAL_MAPPED_READAHEAD_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD";
 const GHOST_METAL_MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS: usize = 64;
+/// Observation-only admission probe for the fail-closed sparse continuous
+/// verifier. The probe freezes several 48-expert candidate sets before the
+/// target round, then compares them with the exact post-router unions. It
+/// never changes a slot, table, command buffer, token, or fallback decision.
+const GHOST_METAL_SPARSE_PREDICT_PROBE_ENV: &str =
+    "CAMELID_GEMMA4_GHOST_METAL_SPARSE_PREDICT_PROBE";
+const GHOST_METAL_SPARSE_PREDICT_CAP: usize = 48;
 #[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_MAPPED_READAHEAD_POLICY_MARKER: &str =
     "[gemma4-ghost-metal] mapped-cold readahead policy: CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD effective=1 scope=selected-cold-only advice=MADV_WILLNEED dispatch=async-read-pool";
@@ -1748,6 +1755,101 @@ fn ghost_metal_demand_load_only_from_env() -> bool {
             .ok()
             .as_deref(),
     )
+}
+
+fn ghost_metal_sparse_predict_probe_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var(GHOST_METAL_SPARSE_PREDICT_PROBE_ENV).is_ok_and(|value| value == "1")
+    })
+}
+
+/// Stable, fail-closed candidate construction. Earlier sources have strict
+/// priority; duplicates and invalid canonical IDs never consume capacity.
+/// A final canonical source may be supplied by probes to keep every compared
+/// table at the same exact footprint.
+#[cfg(any(target_os = "macos", test))]
+fn bounded_sparse_expert_candidates(cap: usize, sources: &[&[usize]]) -> Vec<usize> {
+    if cap == 0 {
+        return Vec::new();
+    }
+    let mut seen = [false; 128];
+    let mut out = Vec::with_capacity(cap.min(128));
+    for source in sources {
+        for &expert in *source {
+            if expert < 128 && !seen[expert] {
+                seen[expert] = true;
+                out.push(expert);
+                if out.len() == cap.min(128) {
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn deterministic_sparse_decay_candidates(scores: &[f32], top_n: usize) -> Vec<usize> {
+    let mut ranked = scores
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, score)| score.is_finite() && *score > 0.01)
+        .collect::<Vec<_>>();
+    ranked.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked
+        .into_iter()
+        .take(top_n)
+        .map(|(expert, _)| expert)
+        .collect()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn sparse_expert_mask_hex(experts: &[usize]) -> Option<String> {
+    let mut seen = [false; 128];
+    let mut mask = [0u64; 2];
+    for &expert in experts {
+        if expert >= 128 || seen[expert] {
+            return None;
+        }
+        seen[expert] = true;
+        mask[expert / 64] |= 1u64 << (expert % 64);
+    }
+    Some(format!("{:016x}{:016x}", mask[1], mask[0]))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn sparse_route_truth_valid(
+    actual_per_layer: &[Vec<usize>],
+    expected_layers: usize,
+    ledger_unique_per_layer: &[u16],
+    ledger_unique_sum: u32,
+) -> bool {
+    expected_layers == 30
+        && actual_per_layer.len() == expected_layers
+        && ledger_unique_per_layer.len() >= expected_layers
+        && actual_per_layer.iter().enumerate().all(|(layer, actual)| {
+            (8..=64).contains(&actual.len())
+                && sparse_expert_mask_hex(actual).is_some()
+                && ledger_unique_per_layer[layer] as usize == actual.len()
+        })
+        && actual_per_layer.iter().map(Vec::len).sum::<usize>() == ledger_unique_sum as usize
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn sparse_candidate_missing(actual: &[usize], candidates: &[usize]) -> Vec<usize> {
+    let mut covered = [false; 128];
+    for &expert in candidates {
+        if expert < 128 {
+            covered[expert] = true;
+        }
+    }
+    actual
+        .iter()
+        .copied()
+        .filter(|&expert| expert >= 128 || !covered[expert])
+        .collect()
 }
 
 fn ghost_metal_file_mapped_experts_from(value: Option<&str>) -> bool {
@@ -4557,6 +4659,8 @@ impl GhostMetalExpertRuntime {
     pub(crate) fn execute_chained_round_all_layers(
         &mut self,
         hidden_rows: &[Vec<f32>],
+        sparse_probe_approx_routes: Option<&[Vec<usize>]>,
+        sparse_probe_predict_us: Option<u64>,
         theta_local: f32,
         theta_global: f32,
         rope_factors: Option<&[f32]>,
@@ -4710,6 +4814,76 @@ impl GhostMetalExpertRuntime {
                 mask
             })
             .collect();
+
+        // Freeze every observation-only candidate table before this round's
+        // router runs. Four priority orders are compared because the bounded
+        // cap, not raw member overlap, decides whether a whole 30-layer round
+        // could safely use the continuous schedule. Canonical fill keeps each
+        // virtual table at exactly 48 records so coverage comparisons have an
+        // identical memory price.
+        let sparse_probe_candidates: Vec<(&'static str, Vec<Vec<usize>>)> =
+            if ghost_metal_sparse_predict_probe_enabled()
+                && demand_record_backing
+                && k_tokens == 8
+                && n_layers == 30
+                && n_layers <= hot_at_start.len()
+                && self.hybrid_hot_admission
+                    == Some(GhostMetalHybridHotAdmission::UniformHot48Experiment)
+                && sparse_probe_predict_us.is_some()
+                && sparse_probe_approx_routes.is_some_and(|routes| {
+                    routes.len() >= n_layers
+                        && routes.iter().take(n_layers).all(|route| {
+                            !route.is_empty() && sparse_expert_mask_hex(route).is_some()
+                        })
+                })
+            {
+                let approx = sparse_probe_approx_routes.expect("checked");
+                let canonical = (0..128).collect::<Vec<_>>();
+                let mut previous_first = Vec::with_capacity(n_layers);
+                let mut approximate_first = Vec::with_capacity(n_layers);
+                let mut decay_first = Vec::with_capacity(n_layers);
+                let mut previous_decay_first = Vec::with_capacity(n_layers);
+                for layer_idx in 0..n_layers {
+                    let previous = self
+                        .latest_routed_experts
+                        .get(layer_idx)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default();
+                    let approximate = approx.get(layer_idx).map(Vec::as_slice).unwrap_or_default();
+                    let hot = (0..128)
+                        .filter(|&expert| hot_at_start[layer_idx][expert])
+                        .collect::<Vec<_>>();
+                    let decay = self
+                        .expert_decay_scores
+                        .get(layer_idx)
+                        .map(|scores| deterministic_sparse_decay_candidates(scores, 128))
+                        .unwrap_or_default();
+                    previous_first.push(bounded_sparse_expert_candidates(
+                        GHOST_METAL_SPARSE_PREDICT_CAP,
+                        &[previous, approximate, &hot, &decay, &canonical],
+                    ));
+                    approximate_first.push(bounded_sparse_expert_candidates(
+                        GHOST_METAL_SPARSE_PREDICT_CAP,
+                        &[approximate, previous, &hot, &decay, &canonical],
+                    ));
+                    decay_first.push(bounded_sparse_expert_candidates(
+                        GHOST_METAL_SPARSE_PREDICT_CAP,
+                        &[&decay, approximate, previous, &hot, &canonical],
+                    ));
+                    previous_decay_first.push(bounded_sparse_expert_candidates(
+                        GHOST_METAL_SPARSE_PREDICT_CAP,
+                        &[previous, &decay, approximate, &hot, &canonical],
+                    ));
+                }
+                vec![
+                    ("previous-approx-hot-decay-canonical", previous_first),
+                    ("approx-previous-hot-decay-canonical", approximate_first),
+                    ("decay-approx-previous-hot-canonical", decay_first),
+                    ("previous-decay-approx-hot-canonical", previous_decay_first),
+                ]
+            } else {
+                Vec::new()
+            };
 
         if allow_predicted {
             if let Some(cache) = ghost_cache {
@@ -5021,6 +5195,8 @@ impl GhostMetalExpertRuntime {
             self.suppress_prediction = true;
             let retry = self.execute_chained_round_all_layers(
                 hidden_rows,
+                None,
+                None,
                 theta_local,
                 theta_global,
                 rope_factors,
@@ -5051,6 +5227,72 @@ impl GhostMetalExpertRuntime {
                 crate::metal::SPEC_CHAINED_GPU_US
                     .fetch_add((led.gpu_busy_ms * 1000.0) as u64, Relaxed);
                 crate::metal::SPEC_CHAINED_ROUNDS.fetch_add(1, Relaxed);
+            }
+        }
+        if ok && !sparse_probe_candidates.is_empty() {
+            let truth_valid = self.common.as_ref().is_some_and(|common| {
+                sparse_route_truth_valid(
+                    &collected_routes,
+                    n_layers,
+                    &common.last_chained_ledger.unique_per_layer,
+                    common.last_chained_ledger.unique_experts_sum,
+                )
+            });
+            let actual_masks = collected_routes
+                .iter()
+                .take(n_layers)
+                .map(|actual| sparse_expert_mask_hex(actual).unwrap_or_else(|| "invalid".into()))
+                .collect::<Vec<_>>();
+            for (strategy, candidates_per_layer) in &sparse_probe_candidates {
+                let mut missing_pairs = 0usize;
+                let mut missing_layers = 0usize;
+                let mut missing_receipt = Vec::new();
+                let mut candidate_sizes = Vec::with_capacity(n_layers);
+                let mut candidate_masks = Vec::with_capacity(n_layers);
+                let mut actual_sizes = Vec::with_capacity(n_layers);
+                for layer_idx in 0..n_layers {
+                    let candidates = candidates_per_layer
+                        .get(layer_idx)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default();
+                    let actual = collected_routes
+                        .get(layer_idx)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default();
+                    candidate_sizes.push(candidates.len().to_string());
+                    candidate_masks.push(
+                        sparse_expert_mask_hex(candidates).unwrap_or_else(|| "invalid".into()),
+                    );
+                    actual_sizes.push(actual.len().to_string());
+                    let missing = sparse_candidate_missing(actual, candidates);
+                    if !missing.is_empty() {
+                        missing_pairs = missing_pairs.saturating_add(missing.len());
+                        missing_layers = missing_layers.saturating_add(1);
+                        missing_receipt.push(format!("L{layer_idx}:{missing:?}"));
+                    }
+                }
+                let eligible = candidates_per_layer.len() == n_layers
+                    && truth_valid
+                    && candidates_per_layer
+                        .iter()
+                        .all(|candidates| candidates.len() == GHOST_METAL_SPARSE_PREDICT_CAP)
+                    && missing_pairs == 0;
+                eprintln!(
+                    "[gemma4 sparse-predict probe] schema=2 round_seq={round_seq} start_pos={start_pos} K={k_tokens} strategy={strategy} cap={} predict_us={} truth_valid={} eligible={} missing_pairs={missing_pairs} missing_layers={missing_layers} candidate_sizes={} actual_sizes={} candidate_masks={} actual_masks={} missing={}",
+                    GHOST_METAL_SPARSE_PREDICT_CAP,
+                    sparse_probe_predict_us.expect("candidate admission requires timing"),
+                    if truth_valid { 1 } else { 0 },
+                    if eligible { 1 } else { 0 },
+                    candidate_sizes.join(","),
+                    actual_sizes.join(","),
+                    candidate_masks.join(","),
+                    actual_masks.join(","),
+                    if missing_receipt.is_empty() {
+                        "none".to_string()
+                    } else {
+                        missing_receipt.join(";")
+                    },
+                );
             }
         }
         // Union continuity of this round's routed unions against the previous
@@ -12824,12 +13066,33 @@ impl Gemma4Runtime {
                     .unwrap_or(theta_local);
                 let rope_factors = self.rope_factors.as_deref();
                 let ghost_cache = self.ghost_moe_cache.as_deref();
+                // Freeze the observation-only predictor before the target
+                // verifier acquires its lane. These routes are derived only
+                // from candidate-token embeddings; current target router
+                // output cannot leak into admission.
+                let (sparse_probe_routes, sparse_probe_predict_us) = if kk == 8
+                    && ghost_metal_sparse_predict_probe_enabled()
+                    && std::env::var(GHOST_METAL_HYBRID_HOT48_EXPERIMENT_ENV).as_deref() == Ok("1")
+                {
+                    let probe_started = std::time::Instant::now();
+                    let routes = (0..self.layers.len())
+                        .map(|layer_idx| self.predict_next_layer_routes_top_k(layer_idx, &hs, 8))
+                        .collect::<Vec<_>>();
+                    (
+                        Some(routes),
+                        Some(probe_started.elapsed().as_micros().min(u64::MAX as u128) as u64),
+                    )
+                } else {
+                    (None, None)
+                };
                 if let Ok(mut guard) = self.metal_q4_experts.lock() {
                     if let Some(lane) = guard.as_mut() {
                         chained_fallback_forbidden = lane.cpu_fallback_forbidden();
                         lane.prefill_round = false;
                         gpu_chained_round_ok = lane.execute_chained_round_all_layers(
                             &hs,
+                            sparse_probe_routes.as_deref(),
+                            sparse_probe_predict_us,
                             theta_local,
                             theta_global,
                             rope_factors,
@@ -13039,6 +13302,8 @@ impl Gemma4Runtime {
                         lane.prefill_round = !all_logits;
                         gpu_chained_round_ok = lane.execute_chained_round_all_layers(
                             &hs,
+                            None,
+                            None,
                             theta_local,
                             theta_global,
                             rope_factors,
@@ -13699,10 +13964,15 @@ impl Gemma4Runtime {
                 *rv = *rv * inv * sv;
             }
             let logits = f32_matvec(&moe.gate_inp, hidden, moe.n_expert, &r);
+            if logits.iter().any(|value| !value.is_finite()) {
+                // Prediction is advisory. A non-finite approximation must
+                // disable it, never panic or perturb canonical inference.
+                return Vec::new();
+            }
             let maxl = logits.iter().cloned().fold(f32::MIN, f32::max);
             let probs: Vec<f32> = logits.iter().map(|&v| (v - maxl).exp()).collect();
             let mut idx: Vec<usize> = (0..moe.n_expert).collect();
-            idx.sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap().then(a.cmp(&b)));
+            idx.sort_unstable_by(|&a, &b| probs[b].total_cmp(&probs[a]).then(a.cmp(&b)));
             idx.truncate(top_k.min(moe.n_expert));
             for &e in &idx {
                 selected[e] = true;
@@ -22222,6 +22492,57 @@ impl Gemma4CudaResident {
 #[cfg(test)]
 mod mtp_target_seam_tests {
     use super::*;
+
+    #[test]
+    fn sparse_candidates_preserve_priority_deduplicate_and_cap() {
+        let first = [7, 3, 7, 200, 5];
+        let second = [5, 9, 3, 11];
+        assert_eq!(
+            bounded_sparse_expert_candidates(5, &[&first, &second]),
+            vec![7, 3, 5, 9, 11]
+        );
+        assert_eq!(
+            bounded_sparse_expert_candidates(3, &[&first, &second]),
+            vec![7, 3, 5]
+        );
+        assert!(bounded_sparse_expert_candidates(0, &[&first, &second]).is_empty());
+    }
+
+    #[test]
+    fn sparse_candidate_missing_reports_only_uncovered_actual_ids() {
+        assert_eq!(sparse_candidate_missing(&[9, 3, 7], &[7, 9]), vec![3]);
+        assert!(sparse_candidate_missing(&[9, 3, 7], &[3, 7, 9]).is_empty());
+    }
+
+    #[test]
+    fn sparse_decay_candidates_break_score_ties_by_expert_id() {
+        let mut scores = vec![0.0; 128];
+        scores[9] = 2.0;
+        scores[3] = 2.0;
+        scores[7] = 1.0;
+        assert_eq!(
+            deterministic_sparse_decay_candidates(&scores, 3),
+            vec![3, 9, 7]
+        );
+    }
+
+    #[test]
+    fn sparse_truth_refuses_empty_invalid_or_unreconciled_layers() {
+        let valid_layer = (0..8).collect::<Vec<_>>();
+        let valid = vec![valid_layer.clone(); 30];
+        let counts = vec![8u16; 30];
+        assert!(sparse_route_truth_valid(&valid, 30, &counts, 240));
+
+        let mut empty = valid.clone();
+        empty[4].clear();
+        assert!(!sparse_route_truth_valid(&empty, 30, &counts, 232));
+
+        let mut duplicate = valid.clone();
+        duplicate[4] = vec![0, 1, 2, 3, 4, 5, 6, 6];
+        assert!(!sparse_route_truth_valid(&duplicate, 30, &counts, 240));
+        assert!(!sparse_route_truth_valid(&valid, 30, &counts, 239));
+        assert!(!sparse_route_truth_valid(&valid[..29], 30, &counts, 232));
+    }
 
     fn exact_hybrid_snapshot(
         chained_sequence: u64,

@@ -43,6 +43,13 @@ def artifact(path: Path) -> dict[str, object]:
     }
 
 
+def expert_mask(experts: range | list[int]) -> str:
+    mask = 0
+    for expert in experts:
+        mask |= 1 << expert
+    return f"{mask:032x}"
+
+
 class SyntheticRun:
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -90,7 +97,8 @@ class SyntheticRun:
         write_json(self.root / "intent.json", self.intent)
         self.events = self._events()
         self.write_events()
-        (self.root / "server.log").write_text(self._server_log(), encoding="utf-8")
+        self.server_log = self._server_log()
+        self.write_server_log()
         write_json(
             self.root / "port-clear.json",
             {
@@ -456,7 +464,11 @@ class SyntheticRun:
             "quantize_us=123 norms_quantized=false fallback=false",
             hot48.FULL_Q4_RESIDENCY_MARKER,
         ]
-        for _ in range(6):
+        candidate_sizes = ",".join(["48"] * 30)
+        actual_sizes = ",".join(["8"] * 30)
+        candidate_masks = ",".join([expert_mask(range(48))] * 30)
+        actual_masks = ",".join([expert_mask(range(8))] * 30)
+        for round_index in range(6):
             lines.append(
                 "[gemma4-mtp device-chain] requested_drafts=7 returned_drafts=7 "
                 "command_buffers=1 commits=1 waits=1 cpu_embedding_callbacks=0 "
@@ -468,6 +480,16 @@ class SyntheticRun:
                 "router=2.0ms shared=3.0ms gateup=20.0ms down=15.0ms "
                 "resid=1.0ms gpu_total=56.0ms"
             )
+            for strategy in hot48.SPARSE_PREDICT_STRATEGIES:
+                lines.append(
+                    "[gemma4 sparse-predict probe] schema=2 "
+                    f"round_seq={round_index + 1} start_pos={round_index * 8} K=8 "
+                    f"strategy={strategy} cap=48 predict_us=123 truth_valid=1 "
+                    "eligible=1 missing_pairs=0 missing_layers=0 "
+                    f"candidate_sizes={candidate_sizes} actual_sizes={actual_sizes} "
+                    f"candidate_masks={candidate_masks} actual_masks={actual_masks} "
+                    "missing=none"
+                )
         return "\n".join(lines) + "\n"
 
     def write_events(self) -> None:
@@ -477,6 +499,9 @@ class SyntheticRun:
 
     def write_response(self) -> None:
         write_json(self.root / "response.json", self.response)
+
+    def write_server_log(self) -> None:
+        (self.root / "server.log").write_text(self.server_log, encoding="utf-8")
 
 
 class Hot48AnalyzerTests(unittest.TestCase):
@@ -502,6 +527,126 @@ class Hot48AnalyzerTests(unittest.TestCase):
             verdict["hashing"]["post_hash_reclaimable_headroom_bytes"], 8 * 1024**3
         )
         self.assertEqual(verdict["stages"]["receipt_count"], 6)
+        self.assertTrue(
+            verdict["performance"]["throughput_contaminated_by_sparse_predict_probe"]
+        )
+        self.assertFalse(verdict["performance"]["throughput_promotion_allowed"])
+        self.assertTrue(verdict["sparse_predict_probe"]["observational_only"])
+        self.assertEqual(verdict["sparse_predict_probe"]["rounds"], 6)
+        self.assertEqual(verdict["sparse_predict_probe"]["receipt_count"], 24)
+
+    def test_rejects_missing_sparse_probe_strategy(self) -> None:
+        lines = self.run.server_log.splitlines()
+        receipt_index = next(
+            index
+            for index, line in enumerate(lines)
+            if line.startswith(hot48.SPARSE_PREDICT_LOG_PREFIX)
+        )
+        del lines[receipt_index]
+        self.run.server_log = "\n".join(lines) + "\n"
+        self.run.write_server_log()
+        with self.assertRaisesRegex(hot48.ReceiptError, "four strategies"):
+            hot48.analyze(self.run.root)
+
+    def test_rejects_sparse_probe_round_binding_drift(self) -> None:
+        self.run.server_log = self.run.server_log.replace(
+            "schema=2 round_seq=1 start_pos=0 K=8",
+            "schema=2 round_seq=999 start_pos=0 K=8",
+            1,
+        )
+        self.run.write_server_log()
+        with self.assertRaisesRegex(hot48.ReceiptError, "measured K8 round"):
+            hot48.analyze(self.run.root)
+
+    def test_rejects_sparse_probe_invalid_truth(self) -> None:
+        self.run.server_log = self.run.server_log.replace("truth_valid=1", "truth_valid=0", 1)
+        self.run.write_server_log()
+        with self.assertRaisesRegex(hot48.ReceiptError, "truth validity"):
+            hot48.analyze(self.run.root)
+
+    def test_rejects_sparse_probe_candidate_mask_popcount_drift(self) -> None:
+        valid = ",".join([expert_mask(range(48))] * 30)
+        invalid_masks = [expert_mask(range(47)), *([expert_mask(range(48))] * 29)]
+        self.run.server_log = self.run.server_log.replace(
+            f"candidate_masks={valid}",
+            f"candidate_masks={','.join(invalid_masks)}",
+            1,
+        )
+        self.run.write_server_log()
+        with self.assertRaisesRegex(hot48.ReceiptError, "candidate mask popcount"):
+            hot48.analyze(self.run.root)
+
+    def test_rejects_sparse_probe_actual_size_outside_k8_bounds(self) -> None:
+        valid_sizes = ",".join(["8"] * 30)
+        invalid_sizes = ",".join(["7", *(["8"] * 29)])
+        self.run.server_log = self.run.server_log.replace(
+            f"actual_sizes={valid_sizes}", f"actual_sizes={invalid_sizes}", 1
+        )
+        self.run.write_server_log()
+        with self.assertRaisesRegex(hot48.ReceiptError, "actual size"):
+            hot48.analyze(self.run.root)
+
+    def test_rejects_sparse_probe_forged_missing_accounting(self) -> None:
+        valid = ",".join([expert_mask(range(48))] * 30)
+        missing_actual = [expert_mask(range(8, 56)), *([expert_mask(range(48))] * 29)]
+        self.run.server_log = self.run.server_log.replace(
+            f"candidate_masks={valid}",
+            f"candidate_masks={','.join(missing_actual)}",
+            1,
+        )
+        self.run.write_server_log()
+        with self.assertRaisesRegex(hot48.ReceiptError, "missing or eligibility"):
+            hot48.analyze(self.run.root)
+
+    def test_rejects_sparse_probe_truth_disagreement_across_strategies(self) -> None:
+        valid = ",".join([expert_mask(range(8))] * 30)
+        drifted = [expert_mask(range(1, 9)), *([expert_mask(range(8))] * 29)]
+        self.run.server_log = self.run.server_log.replace(
+            f"actual_masks={valid}",
+            f"actual_masks={','.join(drifted)}",
+            1,
+        )
+        self.run.write_server_log()
+        with self.assertRaisesRegex(hot48.ReceiptError, "disagree on round truth"):
+            hot48.analyze(self.run.root)
+
+    def test_rejects_missing_sparse_probe_environment_opt_in(self) -> None:
+        started = next(event for event in self.run.events if event["event"] == "child_started")
+        del started["experiment_environment"][hot48.SPARSE_PREDICT_PROBE_ENV]
+        self.run.write_events()
+        with self.assertRaisesRegex(hot48.ReceiptError, "environment drifted"):
+            hot48.analyze(self.run.root)
+
+    def test_valid_sparse_probe_miss_reconciles_discovery_order_ids(self) -> None:
+        lines = self.run.server_log.splitlines()
+        receipt_index = next(
+            index
+            for index, line in enumerate(lines)
+            if line.startswith(hot48.SPARSE_PREDICT_LOG_PREFIX)
+        )
+        line = lines[receipt_index]
+        valid_masks = ",".join([expert_mask(range(48))] * 30)
+        missing_masks = [expert_mask(range(2, 50)), *([expert_mask(range(48))] * 29)]
+        line = line.replace(
+            f"candidate_masks={valid_masks}",
+            f"candidate_masks={','.join(missing_masks)}",
+        )
+        line = line.replace(
+            "eligible=1 missing_pairs=0 missing_layers=0",
+            "eligible=0 missing_pairs=2 missing_layers=1",
+        )
+        line = line.replace("missing=none", "missing=L0:[1, 0]")
+        lines[receipt_index] = line
+        self.run.server_log = "\n".join(lines) + "\n"
+        self.run.write_server_log()
+
+        verdict = hot48.analyze(self.run.root)
+        summary = verdict["sparse_predict_probe"]["strategies"][
+            hot48.SPARSE_PREDICT_STRATEGIES[0]
+        ]
+        self.assertEqual(summary["eligible_rounds"], 5)
+        self.assertEqual(summary["missing_pairs"], 2)
+        self.assertEqual(summary["maximum_missing_layers"], 1)
 
     def test_rejects_one_layer_with_47_hot_slots(self) -> None:
         geometry = self.run.response["camelid"]["hybrid_telemetry"]["geometry"]
@@ -581,6 +726,7 @@ class Hot48SourceContractTests(unittest.TestCase):
     def test_runner_is_exact_and_does_not_reintroduce_zero_swap_gate(self) -> None:
         source = RUNNER_PATH.read_text(encoding="utf-8")
         self.assertIn("CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT48_EXPERIMENT=1", source)
+        self.assertIn("CAMELID_GEMMA4_GHOST_METAL_SPARSE_PREDICT_PROBE=1", source)
         self.assertIn("CAMELID_GEMMA4_MTP_DEVICE_CHAIN=1", source)
         self.assertIn("CAMELID_GEMMA4_MTP_FULL_Q4=1", source)
         self.assertIn("--baseline-soak-seconds 60", source)
@@ -601,6 +747,7 @@ class Hot48SourceContractTests(unittest.TestCase):
         self.assertNotIn("/usr/bin/shasum", source)
         self.assertIn("status --porcelain=v1 --untracked-files=all", source)
         self.assertIn('endswith("-dirty")', source)
+        self.assertIn("observed_tps_contaminated", ANALYZER_PATH.read_text(encoding="utf-8"))
         for key in hot48.PER_LAYER_ENVIRONMENT:
             self.assertIn(key, source)
             self.assertNotIn(f"{key}=", source)
