@@ -168,6 +168,119 @@ kernel void spec50_moe_argbuf_gateup_geglu_quant_batch_k(
     }
 }
 
+// Preserve the original K<=8 register geometry after widening the general
+// argument-buffer kernel to K=16.  The widened kernel keeps 32 floating-point
+// accumulators live per lane (gate + up), even for the shipping K=8 round.
+// This exact twin keeps only the 16 accumulators K=8 can address.  Every load,
+// integer fold, floating-point expression, and output index is otherwise
+// identical to the general kernel above.
+kernel void spec50_moe_argbuf_gateup_geglu_quant_batch_k8(
+    device const float* input_scales [[buffer(0)]],
+    device const char* input_quants [[buffer(1)]],
+    device Gemma4ExpertPointerTable& expert_table [[buffer(2)]],
+    device const Gemma4UniqueExpertWork* work_list [[buffer(3)]],
+    device float* output_scales [[buffer(4)]],
+    device char* output_quants [[buffer(5)]],
+    constant uint& num_unique_experts [[buffer(6)]],
+    constant uint& k_candidates [[buffer(7)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    const uint b = group % G4Q4_DOWN_BLOCKS;
+    const uint u = group / G4Q4_DOWN_BLOCKS;
+    if (u >= num_unique_experts) return;
+    if (k_candidates == 0u || k_candidates > 8u) return;
+
+    const Gemma4UniqueExpertWork work = work_list[u];
+    const ulong mask = work.candidate_mask;
+    if (mask == 0ULL) return;
+
+    const uint expert_id = work.expert_weight_offset / G4Q4_SLOT_STRIDE;
+    device const uchar* weights = expert_table.records[expert_id];
+    const uint row = b * 32u + lane;
+    device const uchar* gate_row = weights + ulong(row) * G4Q4_GU_ROW_BYTES;
+    device const uchar* up_row = weights + ulong(row + G4Q4_FF) * G4Q4_GU_ROW_BYTES;
+
+    float gate_acc[8];
+    float up_acc[8];
+    #pragma unroll
+    for (uint t = 0; t < 8; ++t) {
+        gate_acc[t] = 0.0f;
+        up_acc[t] = 0.0f;
+    }
+
+    for (uint gb = 0; gb < G4Q4_GU_BLOCKS; ++gb) {
+        device const uchar* b_gate = gate_row + ulong(gb) * G4Q4_WIRE;
+        device const uchar* b_up = up_row + ulong(gb) * G4Q4_WIRE;
+        const float w_scale_gate = float(*reinterpret_cast<device const half*>(b_gate));
+        const float w_scale_up = float(*reinterpret_cast<device const half*>(b_up));
+
+        device const packed_uchar4* pg4 =
+            reinterpret_cast<device const packed_uchar4*>(b_gate + 2);
+        device const packed_uchar4* pu4 =
+            reinterpret_cast<device const packed_uchar4*>(b_up + 2);
+
+        uchar4 rg[4], ru[4];
+        #pragma unroll
+        for (uint k = 0; k < 4; ++k) {
+            rg[k] = uchar4(pg4[k]);
+            ru[k] = uchar4(pu4[k]);
+        }
+
+        #pragma unroll
+        for (uint t = 0; t < 8; ++t) {
+            if (t >= k_candidates) continue;
+            if ((mask & (1ULL << t)) == 0ULL) continue;
+            device const char* x = input_quants + ulong(t) * G4Q4_HIDDEN + ulong(gb) * 32ul;
+            device const char4* xlo4 = reinterpret_cast<device const char4*>(x);
+            device const char4* xhi4 = reinterpret_cast<device const char4*>(x + 16);
+            const float in_scale = input_scales[ulong(t) * G4Q4_GU_BLOCKS + gb];
+
+            int4 ag = int4(0);
+            int4 au = int4(0);
+            #pragma unroll
+            for (uint k = 0; k < 4; ++k) {
+                const int4 xl = int4(xlo4[k]);
+                const int4 xh = int4(xhi4[k]);
+                ag += (int4(rg[k] & uchar4(0x0f)) - 8) * xl + (int4(rg[k] >> 4) - 8) * xh;
+                au += (int4(ru[k] & uchar4(0x0f)) - 8) * xl + (int4(ru[k] >> 4) - 8) * xh;
+            }
+            const int isum_gate = (ag.x + ag.y) + (ag.z + ag.w);
+            const int isum_up = (au.x + au.y) + (au.z + au.w);
+
+            gate_acc[t] += (float(isum_gate) * w_scale_gate) * in_scale;
+            up_acc[t] += (float(isum_up) * w_scale_up) * in_scale;
+        }
+    }
+
+    #pragma unroll
+    for (uint t = 0; t < 8; ++t) {
+        if (t >= k_candidates) continue;
+        if ((mask & (1ULL << t)) == 0ULL) continue;
+        const float gate = gate_acc[t];
+        const float up = up_acc[t];
+        const float inner = 0.7978845608f * (gate + 0.044715f * gate * gate * gate);
+        const float gelu = 0.5f * gate * (1.0f + tanh(clamp(inner, -15.0f, 15.0f)));
+        const float act_val = gelu * up;
+
+        const float max_abs = simd_max(fabs(act_val));
+        const float unrounded = max_abs / 127.0f;
+        const float stored_scale = float(half(unrounded));
+        const float inverse = unrounded == 0.0f ? 0.0f : 1.0f / unrounded;
+
+        if (lane == 0) {
+            const ulong scale_idx = ulong(u) * ulong(k_candidates) * G4Q4_DOWN_BLOCKS
+                + ulong(t) * G4Q4_DOWN_BLOCKS + ulong(b);
+            output_scales[scale_idx] = stored_scale;
+        }
+
+        const int q = clamp(int(round(act_val * inverse)), -127, 127);
+        const ulong quant_idx = ulong(u) * ulong(k_candidates) * G4Q4_FF
+            + ulong(t) * G4Q4_FF + ulong(row);
+        output_quants[quant_idx] = char(q);
+    }
+}
+
 kernel void spec50_moe_argbuf_down_union_batch_k(
     device const float* act_scales [[buffer(0)]],
     device const char* act_quants [[buffer(1)]],
@@ -615,6 +728,9 @@ kernel void gemma4_q4_expert_argbuf_down_reduce_turbo(
 
 pub(crate) struct Spec50MoeArgbufKernels {
     pub(crate) gateup: ComputePipelineState,
+    /// Register-narrow K<=8 twin. Optional so an older Metal compiler can
+    /// retain the proven K=16 pipeline instead of failing construction.
+    gateup_k8: Option<ComputePipelineState>,
     pub(crate) down: ComputePipelineState,
     head_gateup_split: ComputePipelineState,
     head_gateup_scalar: ComputePipelineState,
@@ -654,6 +770,18 @@ pub(crate) fn spec50_moe_argbuf_kernels(
                 .new_compute_pipeline_state_with_function(&gateup_function)
                 .map_err(|err| eprintln!("[metal] argbuf GateUp pipeline failed: {err}"))
                 .ok()?;
+            let gateup_k8 = library
+                .get_function(
+                    "spec50_moe_argbuf_gateup_geglu_quant_batch_k8",
+                    None,
+                )
+                .and_then(|function| device.new_compute_pipeline_state_with_function(&function))
+                .map_err(|err| {
+                    eprintln!(
+                        "[metal] argbuf K8-specialized GateUp unavailable; using K16 pipeline: {err}"
+                    )
+                })
+                .ok();
             let down = device
                 .new_compute_pipeline_state_with_function(&down_function)
                 .map_err(|err| eprintln!("[metal] argbuf Down pipeline failed: {err}"))
@@ -677,6 +805,7 @@ pub(crate) fn spec50_moe_argbuf_kernels(
             let head_down_turbo = make_pipeline("gemma4_q4_expert_argbuf_down_reduce_turbo")?;
             Some(Spec50MoeArgbufKernels {
                 gateup,
+                gateup_k8,
                 down,
                 head_gateup_split,
                 head_gateup_scalar,
@@ -1073,9 +1202,14 @@ impl Gemma4MoeSlotArgTable {
         let Some(pipelines) = spec50_moe_argbuf_kernels(&kernel.device) else {
             return false;
         };
+        let gateup = if k_candidates <= 8 {
+            pipelines.gateup_k8.as_ref().unwrap_or(&pipelines.gateup)
+        } else {
+            &pipelines.gateup
+        };
         encode_argbuf_gateup(
             encoder,
-            &pipelines.gateup,
+            gateup,
             input_scales,
             input_quants,
             &self.table,
@@ -1536,7 +1670,9 @@ mod tests {
 
     const EXPERTS: usize = 128;
     const ACTIVE_EXPERTS: usize = 30;
-    const MAX_K: usize = 8;
+    // Exercise both sides of the production dispatch boundary: K<=8 uses the
+    // register-narrow pipeline and K=9..16 retains the widened pipeline.
+    const MAX_K: usize = 16;
 
     struct Rng(u64);
 
@@ -2038,7 +2174,7 @@ mod tests {
     }
 
     #[test]
-    fn gemma4_moe_slot_arg_table_chained_k1_to_k8_raw_bit_parity_and_dedup() {
+    fn gemma4_moe_slot_arg_table_chained_k1_to_k16_raw_bit_parity_and_dedup() {
         let Some(kernel) = metal_linear_kernel() else {
             eprintln!("SKIP anonymous argbuf parity gate: no Metal device");
             return;
@@ -2173,7 +2309,7 @@ mod tests {
     }
 
     #[test]
-    fn gemma4_moe_mixed_hot_cold_table_chained_k1_to_k8_raw_bit_parity_and_lifetime() {
+    fn gemma4_moe_mixed_hot_cold_table_chained_k1_to_k16_raw_bit_parity_and_lifetime() {
         use std::io::Write as _;
 
         let Some(kernel) = metal_linear_kernel() else {
