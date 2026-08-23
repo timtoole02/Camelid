@@ -91,6 +91,7 @@ print "Starting the exact Gemma 4 MTP WebUI on http://127.0.0.1:$port ..."
   CAMELID_GEMMA4_SPEC_DRAFT_TOKENS=8 \
   CAMELID_GEMMA4_MTP_ASSISTANT_PATH="$assistant" \
   CAMELID_GEMMA4_MTP_DEVICE_CHAIN=1 \
+  CAMELID_GEMMA4_MTP_FULL_Q4=1 \
   CAMELID_GEMMA4_MTP_PREFILL_SEED_BOOTSTRAP=1 \
   CAMELID_GEMMA4_DENSE_K8_GENERIC=1 \
   "$binary" serve \
@@ -123,4 +124,3 @@ done
 print "Gemma 4 MTP is ready. Leave this window open; press Control-C to stop it."
 wait "$child_pid"
 child_pid=""
-

@@ -21,6 +21,9 @@ PROFILE = (
 )
 PROFILE_CSV = ",".join(str(value) for value in PROFILE)
 MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS = 64
+FULL_Q4_MATRIX_BYTES = 236_077_056
+FULL_Q4_SOURCE_SHA256 = "c082cc581c3ec90d70285c1a41c81544ff56cbc96650f16c900a280940655801"
+BF16_MATRIX_BYTES = 839_385_088
 MAPPED_READAHEAD_MARKER = (
     "[gemma4-ghost-metal] mapped-cold readahead policy: "
     "CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD effective=1 "
@@ -36,9 +39,16 @@ PACKED_K8_GATEUP_MARKER = (
     "[gemma4 exact partition] packed_k8_gateup=row_complete "
     "runtime_width_oracle=raw_bit_exact"
 )
+FULL_Q4_MARKER_PATTERN = re.compile(
+    r"^\[gemma4-mtp full-q4\] enabled=true source_sha256=([0-9a-f]{64}) "
+    r"matrices=23 packed_bytes=(\d+) bf16_matrix_bytes=(\d+) quantize_us=(\d+) "
+    r"norms_quantized=false fallback=false$",
+    re.MULTILINE,
+)
 DEVICE_CHAIN_PATTERN = re.compile(
     r"^\[gemma4-mtp device-chain\] requested_drafts=(\d+) returned_drafts=(\d+) "
     r"command_buffers=1 commits=1 waits=1 cpu_embedding_callbacks=0 "
+    r"linear_format=([^ ]+) matrix_bytes_per_draft=(\d+) "
     r"encode_us=(\d+) wait_us=(\d+) gpu_us=(\d+) kernel_us=(\d+) wall_us=(\d+)$",
     re.MULTILINE,
 )
@@ -273,6 +283,17 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
         raise GateError("generation did not admit the exact packed K8 GateUp path")
     if previous_union_readahead_records == 0:
         raise GateError("generation did not dispatch any previous-union page advice")
+    full_q4_markers = FULL_Q4_MARKER_PATTERN.findall(log)
+    if len(full_q4_markers) != 1:
+        raise GateError("server did not admit one exact full-Q4 assistant")
+    full_q4_hash, packed_bytes, bf16_bytes, quantize_us = full_q4_markers[0]
+    if (
+        full_q4_hash != FULL_Q4_SOURCE_SHA256
+        or int(packed_bytes) != FULL_Q4_MATRIX_BYTES
+        or int(bf16_bytes) != BF16_MATRIX_BYTES
+        or int(quantize_us) <= 0
+    ):
+        raise GateError("full-Q4 assistant admission receipt is inconsistent")
     chain_receipts = DEVICE_CHAIN_PATTERN.findall(log)
     if len(chain_receipts) != assistant_rounds:
         raise GateError(
@@ -280,6 +301,11 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
         )
     if any(int(requested) < int(returned) for requested, returned, *_ in chain_receipts):
         raise GateError("a device-chain receipt returned more drafts than it encoded")
+    if any(
+        linear_format != "q4_0_all" or int(matrix_bytes) != FULL_Q4_MATRIX_BYTES
+        for _, _, linear_format, matrix_bytes, *_ in chain_receipts
+    ):
+        raise GateError("a device-chain receipt did not execute the full-Q4 assistant")
 
     gates = {
         "exact_k1_token_identity": True,
@@ -293,6 +319,7 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
         "mapped_cold_readahead_active": True,
         "previous_union_readahead_active": True,
         "exact_packed_k8_gateup_active": True,
+        "full_q4_assistant_active": True,
     }
     return {
         "schema_version": 1,
@@ -308,6 +335,7 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
         "rounds": len(rounds),
         "full_k8_rounds": full_k8_rounds,
         "device_chain_receipts": len(chain_receipts),
+        "full_q4_matrix_bytes_per_draft": FULL_Q4_MATRIX_BYTES,
         "mapped_readahead_advised_records": mapped_readahead_records,
         "mapped_readahead_advised_bytes": mapped_readahead_bytes,
         "mapped_readahead_enqueue_ms": mapped_readahead_enqueue_ms,

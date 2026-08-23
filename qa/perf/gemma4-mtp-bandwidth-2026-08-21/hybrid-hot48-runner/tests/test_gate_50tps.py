@@ -84,6 +84,7 @@ class Gate50TpsTests(unittest.TestCase):
         chain = (
             "[gemma4-mtp device-chain] requested_drafts=7 returned_drafts=7 "
             "command_buffers=1 commits=1 waits=1 cpu_embedding_callbacks=0 "
+            "linear_format=q4_0_all matrix_bytes_per_draft=236077056 "
             "encode_us=1 wait_us=2 gpu_us=3 kernel_us=4 wall_us=5\n"
         )
         log_path.write_text(
@@ -101,6 +102,10 @@ class Gate50TpsTests(unittest.TestCase):
             "static_k8_dense=off runtime_k_dense=on\n"
             + gate.PACKED_K8_GATEUP_MARKER
             + "\n"
+            + "[gemma4-mtp full-q4] enabled=true source_sha256="
+            + gate.FULL_Q4_SOURCE_SHA256
+            + " matrices=23 packed_bytes=236077056 bf16_matrix_bytes=839385088 "
+            "quantize_us=1 norms_quantized=false fallback=false\n"
             + chain * 6,
             encoding="utf-8",
         )
@@ -212,6 +217,28 @@ class Gate50TpsTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(gate.GateError, "exact packed K8 GateUp"):
+                gate.analyze(response_path, log_path, expected_path)
+
+    def test_missing_full_q4_marker_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            response_path, log_path, expected_path = self.fixture(Path(temporary))
+            log = log_path.read_text(encoding="utf-8")
+            log_path.write_text(
+                gate.FULL_Q4_MARKER_PATTERN.sub("", log),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(gate.GateError, "exact full-Q4 assistant"):
+                gate.analyze(response_path, log_path, expected_path)
+
+    def test_non_full_q4_device_chain_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            response_path, log_path, expected_path = self.fixture(Path(temporary))
+            log = log_path.read_text(encoding="utf-8")
+            log_path.write_text(
+                log.replace("linear_format=q4_0_all", "linear_format=bf16_q4_0_head"),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(gate.GateError, "full-Q4 assistant"):
                 gate.analyze(response_path, log_path, expected_path)
 
 
