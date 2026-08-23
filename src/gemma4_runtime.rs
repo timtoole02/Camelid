@@ -11073,11 +11073,12 @@ impl Gemma4Runtime {
         mut should_abort: C,
         mut on_round: Option<&mut dyn FnMut(&Gemma4MtpGenerationRound)>,
     ) -> Result<Gemma4MtpGenerationResult> {
-        let max_verify_k = std::env::var("CAMELID_GEMMA4_SPEC_CHUNK_MAX")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(12)
-            .clamp(2, crate::metal::GEMMA4_RESIDENT_MAX_BATCH);
+        // The resident scratch can hold more rows than the executable
+        // speculative kernels.  Read the single authoritative K contract so
+        // malformed or oversized environment values can never route the MTP
+        // assistant into an unimplemented accumulator width.
+        let max_verify_k = crate::metal::gemma4_max_spec_chunk()
+            .clamp(2, crate::metal::GEMMA4_MAX_WIDENED_SPEC_CHUNK);
         let max_drafts = max_verify_k - 1;
 
         let generation_started = std::time::Instant::now();

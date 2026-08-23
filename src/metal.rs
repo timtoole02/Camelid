@@ -22599,20 +22599,30 @@ pub(crate) const GEMMA4_RESIDENT_MAX_BATCH: usize = 64;
 /// so default behavior is exactly the historical K<=8 round.
 pub const GEMMA4_MAX_SPEC_CHUNK: usize = 8;
 
+/// Largest speculative chunk implemented by the widened target, MoE, and
+/// tied-head kernels.  Keep every user-facing parser tied to this executable
+/// contract rather than the larger resident-scratch allocation ceiling.
+pub const GEMMA4_MAX_WIDENED_SPEC_CHUNK: usize = 16;
+
+fn parse_gemma4_max_spec_chunk(value: Option<&str>) -> usize {
+    value
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .map(|parsed| parsed.clamp(1, GEMMA4_MAX_WIDENED_SPEC_CHUNK))
+        .unwrap_or(GEMMA4_MAX_SPEC_CHUNK)
+}
+
 /// Runtime chunk ceiling for the speculative verify round.
 ///
-/// `CAMELID_GEMMA4_SPEC_CHUNK_MAX` (clamped to 1..=16) opts into the widened
+/// `CAMELID_GEMMA4_SPEC_CHUNK_MAX` (clamped to
+/// 1..=[`GEMMA4_MAX_WIDENED_SPEC_CHUNK`]) opts into the widened
 /// K=9..16 round; unset, the ceiling is [`GEMMA4_MAX_SPEC_CHUNK`] (8), i.e.
 /// exactly today's behavior. Values above 8 require the `spec50_widen` `_k16`
 /// pipelines, which the dense encode fns verify at dispatch.
 pub fn gemma4_max_spec_chunk() -> usize {
     static CHUNK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CHUNK.get_or_init(|| {
-        std::env::var("CAMELID_GEMMA4_SPEC_CHUNK_MAX")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .map(|v| v.clamp(1, 16))
-            .unwrap_or(GEMMA4_MAX_SPEC_CHUNK)
+        let configured = std::env::var("CAMELID_GEMMA4_SPEC_CHUNK_MAX").ok();
+        parse_gemma4_max_spec_chunk(configured.as_deref())
     })
 }
 
@@ -41391,6 +41401,25 @@ pub fn detect_metal_device() -> MetalDeviceInfo {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gemma4_spec_chunk_parser_matches_executable_kernel_width() {
+        assert_eq!(
+            super::parse_gemma4_max_spec_chunk(None),
+            super::GEMMA4_MAX_SPEC_CHUNK
+        );
+        assert_eq!(super::parse_gemma4_max_spec_chunk(Some("8")), 8);
+        assert_eq!(super::parse_gemma4_max_spec_chunk(Some("12")), 12);
+        assert_eq!(
+            super::parse_gemma4_max_spec_chunk(Some("64")),
+            super::GEMMA4_MAX_WIDENED_SPEC_CHUNK
+        );
+        assert_eq!(super::parse_gemma4_max_spec_chunk(Some("0")), 1);
+        assert_eq!(
+            super::parse_gemma4_max_spec_chunk(Some("not-a-number")),
+            super::GEMMA4_MAX_SPEC_CHUNK
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn bitnet_i2_s_cleanroom_modes_execute_on_metal() {
