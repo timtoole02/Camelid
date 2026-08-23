@@ -1158,8 +1158,8 @@ impl GhostFile {
             .collect();
         Ok(Self {
             index,
+            mmap: Some(GgufWireMmap::map_file(&file, path)?),
             file,
-            mmap: Some(GgufWireMmap::map(path)?),
             moe_access,
             moe_payload_verified,
             #[cfg(windows)]
@@ -1572,6 +1572,55 @@ impl GhostFile {
             )));
         }
         Ok(Some((Arc::clone(mmap), start, len)))
+    }
+
+    /// Ask Darwin to start an asynchronous read of one exact canonical MoE
+    /// payload range. `F_RDADVISE` copies no payload into Camelid-owned memory,
+    /// does not move the file cursor, and is never a correctness dependency.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn rdadvise_moe_expert_range(
+        &self,
+        layer_idx: usize,
+        expert_idx: usize,
+    ) -> Result<usize> {
+        use std::os::fd::AsRawFd;
+
+        if self.mmap.is_none() {
+            return Err(invalid(
+                "Darwin MoE F_RDADVISE requires the retained file mapping".to_string(),
+            ));
+        }
+        let (_, start, len) = self.checked_moe_expert_span(layer_idx, expert_idx)?;
+        let ra_offset = libc::off_t::try_from(start).map_err(|_| {
+            invalid(format!(
+                "Darwin MoE F_RDADVISE offset is not representable for layer {layer_idx} expert {expert_idx}"
+            ))
+        })?;
+        let ra_count = libc::c_int::try_from(len).map_err(|_| {
+            invalid(format!(
+                "Darwin MoE F_RDADVISE length is not representable for layer {layer_idx} expert {expert_idx}"
+            ))
+        })?;
+        let advisory = libc::radvisory {
+            ra_offset,
+            ra_count,
+        };
+        // SAFETY: `self.file` owns a live descriptor and `advisory` remains
+        // valid for the complete variadic fcntl call.
+        let status = unsafe {
+            libc::fcntl(
+                self.file.as_raw_fd(),
+                libc::F_RDADVISE,
+                &advisory as *const libc::radvisory,
+            )
+        };
+        if status == -1 {
+            return Err(invalid(format!(
+                "Darwin MoE F_RDADVISE refused layer {layer_idx} expert {expert_idx}: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(len)
     }
 
     /// Borrow one routed expert directly from the read-only file mapping. The

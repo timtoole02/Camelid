@@ -204,13 +204,20 @@ impl Drop for GgufWireMmap {
 impl GgufWireMmap {
     /// Map `path` read-only. The mapping covers the whole file.
     pub fn map(path: &Path) -> Result<Arc<Self>> {
-        use std::os::unix::io::AsRawFd;
         let file = File::open(path).map_err(|err| {
             BackendError::InvalidTensorData(format!(
                 "wire mmap open failed for {}: {err}",
                 path.display()
             ))
         })?;
+        Self::map_file(&file, path)
+    }
+
+    /// Map an already-open descriptor. Callers that also issue descriptor-
+    /// scoped advisory I/O can thereby prove the mmap and advisory target the
+    /// same vnode, even if the pathname is concurrently replaced.
+    pub(crate) fn map_file(file: &File, path: &Path) -> Result<Arc<Self>> {
+        use std::os::unix::io::AsRawFd;
         let file_len = file
             .metadata()
             .map_err(|err| {
@@ -575,6 +582,12 @@ impl GgufWireMmap {
                 path.display()
             ))
         })?;
+        Self::map_file(&file, path)
+    }
+
+    /// Windows counterpart of the descriptor-preserving mapper used by
+    /// `GhostFile`; keeping one API avoids reopening a replaceable path.
+    pub(crate) fn map_file(file: &File, path: &Path) -> Result<Arc<Self>> {
         let file_len = file
             .metadata()
             .map_err(|err| {
@@ -592,7 +605,7 @@ impl GgufWireMmap {
         }
         // SAFETY: the file is opened read-only and the mapping is treated as
         // immutable for its whole lifetime; no other handle here writes to it.
-        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|err| {
+        let mmap = unsafe { memmap2::Mmap::map(file) }.map_err(|err| {
             BackendError::InvalidTensorData(format!(
                 "wire mmap failed for {}: {err}",
                 path.display()
@@ -982,6 +995,24 @@ mod tests {
         assert!(mapping.bytes(payload.len() as u64 - 10, 11).is_err());
         assert_eq!(mapping.base_ptr() as usize % page_size(), 0);
         std::fs::remove_file(&path).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn map_file_uses_the_supplied_vnode_when_path_is_replaced() {
+        let original = vec![0x3cu8; 32_768];
+        let replacement = vec![0xa5u8; 32_768];
+        let path = write_temp(&original);
+        let retained = File::open(&path).unwrap();
+        let moved = path.with_extension("retained-vnode");
+        std::fs::rename(&path, &moved).unwrap();
+        std::fs::write(&path, &replacement).unwrap();
+
+        let mapping = GgufWireMmap::map_file(&retained, &path).unwrap();
+        assert_eq!(mapping.bytes(0, original.len()).unwrap(), &original);
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&moved).ok();
     }
 
     #[test]

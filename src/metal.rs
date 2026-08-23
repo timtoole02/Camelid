@@ -23752,6 +23752,19 @@ pub struct ChainedRoundHostLedger {
     pub mapped_readahead_previous_union_advised_records: u32,
     pub mapped_readahead_previous_union_advised_bytes: u64,
     pub mapped_readahead_previous_union_enqueue_us: u64,
+    /// Direct Darwin `F_RDADVISE` receipts for the opt-in replacement pager
+    /// strategy. Early and current phases share `reserved_records`, whose hard
+    /// cap is 64; accepted bytes are exact record payload bytes and no owned
+    /// payload allocation is associated with these counters.
+    pub mapped_rdadvise_early_accepted_records: u32,
+    pub mapped_rdadvise_early_accepted_bytes: u64,
+    pub mapped_rdadvise_early_refused_records: u32,
+    pub mapped_rdadvise_early_dispatch_us: u64,
+    pub mapped_rdadvise_current_accepted_records: u32,
+    pub mapped_rdadvise_current_accepted_bytes: u64,
+    pub mapped_rdadvise_current_refused_records: u32,
+    pub mapped_rdadvise_current_dispatch_us: u64,
+    pub mapped_rdadvise_reserved_records: u32,
     pub kv_capacity: u32,
     pub kv_bytes: u64,
     pub kv_filled: u32,

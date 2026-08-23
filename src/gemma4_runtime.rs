@@ -1308,6 +1308,46 @@ struct MappedReadaheadEnqueueReceipt {
     enqueue_us: u64,
 }
 
+/// Kernel-accepted Darwin read advisories. Unlike the MADV receipt above,
+/// these counters describe completed `F_RDADVISE` syscalls (the kernel's
+/// asynchronous page-in may still complete later).
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MappedRdadviseDispatchReceipt {
+    accepted_records: u64,
+    accepted_bytes: u64,
+    refused_records: u64,
+    dispatch_us: u64,
+}
+
+/// One persistent reservation shared by the pre-assistant and post-router
+/// phases of a target round. The identity set bounds syscall attempts, not
+/// merely concurrently executing calls, and contains no expert payload.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Default)]
+struct MappedRdadviseRoundReservation {
+    expected_start_pos: usize,
+    reserved: std::collections::HashSet<(usize, usize)>,
+    early: MappedRdadviseDispatchReceipt,
+    current: MappedRdadviseDispatchReceipt,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl MappedRdadviseRoundReservation {
+    fn new(expected_start_pos: usize) -> Self {
+        Self {
+            expected_start_pos,
+            ..Self::default()
+        }
+    }
+
+    fn reserve(&mut self, layer: usize, expert: usize, phase_limit: usize) -> bool {
+        expert < 128
+            && self.reserved.len() < phase_limit
+            && self.reserved.insert((layer, expert))
+    }
+}
+
 #[cfg(any(target_os = "macos", test))]
 impl MappedReadaheadEnqueueReceipt {
     fn add_assign_saturating(&mut self, other: Self) {
@@ -1442,6 +1482,42 @@ impl GhostMoeExpertCache {
             });
         }
         receipt.enqueue_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        receipt
+    }
+
+    /// Issue bounded, exact-record Darwin advisory reads directly on the
+    /// retained `.cghost` descriptor. No Rayon job or anonymous payload buffer
+    /// is created: `F_RDADVISE` asks the kernel to start the file read itself.
+    #[cfg(target_os = "macos")]
+    fn dispatch_mapped_rdadvise(
+        &self,
+        candidates: &[(usize, usize)],
+        reservation: &mut MappedRdadviseRoundReservation,
+        phase_limit: usize,
+    ) -> MappedRdadviseDispatchReceipt {
+        let started = std::time::Instant::now();
+        let mut receipt = MappedRdadviseDispatchReceipt::default();
+        for &(layer, expert) in candidates {
+            if reservation.reserved.len() >= phase_limit {
+                break;
+            }
+            if !reservation.reserve(layer, expert, phase_limit) {
+                continue;
+            }
+            match self.file.rdadvise_moe_expert_range(layer, expert) {
+                Ok(len) => {
+                    receipt.accepted_records = receipt.accepted_records.saturating_add(1);
+                    receipt.accepted_bytes = receipt.accepted_bytes.saturating_add(len as u64);
+                }
+                Err(err) => {
+                    receipt.refused_records = receipt.refused_records.saturating_add(1);
+                    eprintln!(
+                        "[gemma4-ghost-metal] mapped-cold F_RDADVISE refused: layer={layer} expert={expert}: {err}"
+                    );
+                }
+            }
+        }
+        receipt.dispatch_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
         receipt
     }
 
@@ -1708,6 +1784,13 @@ const GHOST_METAL_DECODE_PROMOTION_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_DECOD
 /// dependency.
 const GHOST_METAL_MAPPED_READAHEAD_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD";
 const GHOST_METAL_MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS: usize = 64;
+/// Darwin-only stronger page-in experiment. It is deliberately subordinate to
+/// mapped readahead so existing launch receipts cannot silently change pager
+/// strategy. The early and total limits share one per-target identity set.
+const GHOST_METAL_MAPPED_RDADVISE_ENV: &str =
+    "CAMELID_GEMMA4_GHOST_METAL_MAPPED_RDADVISE";
+const GHOST_METAL_MAPPED_RDADVISE_EARLY_MAX_RECORDS: usize = 32;
+const GHOST_METAL_MAPPED_RDADVISE_TOTAL_MAX_RECORDS: usize = 64;
 /// Observation-only admission probe for the fail-closed sparse continuous
 /// verifier. The probe freezes several 48-expert candidate sets before the
 /// target round, then compares them with the exact post-router unions. It
@@ -1721,6 +1804,9 @@ const GHOST_METAL_MAPPED_READAHEAD_POLICY_MARKER: &str =
 #[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_MAPPED_READAHEAD_PREVIOUS_UNION_POLICY_MARKER: &str =
     "[gemma4-ghost-metal] mapped-cold previous-union policy: source=previous-target-exact-routed-union timing=before-assistant scope=selected-cold-only advice=MADV_WILLNEED dispatch=async-read-pool correctness_dependency=0";
+#[cfg(any(target_os = "macos", test))]
+const GHOST_METAL_MAPPED_RDADVISE_POLICY_MARKER: &str =
+    "[gemma4-ghost-metal] mapped-cold rdadvise policy: CAMELID_GEMMA4_GHOST_METAL_MAPPED_RDADVISE effective=1 parent=CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD strategy=F_RDADVISE dispatch=direct exact_record_ranges=1 early_max_records=32 total_max_records=64 anonymous_capacity_bytes=0 correctness_dependency=0";
 const GHOST_METAL_HYBRID_PROFILE_LAYERS: usize = 30;
 const GHOST_METAL_HYBRID_PROFILE_MIN_SLOTS: usize = 8;
 const GHOST_METAL_HYBRID_PROFILE_MAX_SLOTS: usize = 64;
@@ -2116,6 +2202,33 @@ fn resolve_ghost_metal_mapped_readahead(
     if !async_read_pool_available {
         return Err(format!(
             "{GHOST_METAL_MAPPED_READAHEAD_ENV}=1 requires an asynchronous Ghost read pool; set CAMELID_GEMMA4_GHOST_READ_THREADS=2..=8"
+        ));
+    }
+    Ok(true)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn resolve_ghost_metal_mapped_rdadvise(
+    value: Option<&str>,
+    mapped_readahead_enabled: bool,
+    hybrid_mapped: bool,
+) -> std::result::Result<bool, String> {
+    let Some(raw) = value else {
+        return Ok(false);
+    };
+    if raw != "1" {
+        return Err(format!(
+            "{GHOST_METAL_MAPPED_RDADVISE_ENV} is an exact opt-in and must be canonical 1 when present"
+        ));
+    }
+    if !mapped_readahead_enabled {
+        return Err(format!(
+            "{GHOST_METAL_MAPPED_RDADVISE_ENV}=1 requires {GHOST_METAL_MAPPED_READAHEAD_ENV}=1"
+        ));
+    }
+    if !hybrid_mapped {
+        return Err(format!(
+            "{GHOST_METAL_MAPPED_RDADVISE_ENV}=1 requires hybrid mapped backing"
         ));
     }
     Ok(true)
@@ -3008,11 +3121,19 @@ struct GhostMetalExpertRuntime {
     /// Construction-time exact opt-in. No routing/Metal hot path rereads the
     /// environment, and non-hybrid runtimes always keep this false.
     mapped_readahead_enabled: bool,
+    /// Stronger Darwin pager experiment. This can only be true when mapped
+    /// readahead is also admitted; it substitutes direct `F_RDADVISE` for the
+    /// MADV queue while preserving all routing and binding behavior.
+    mapped_rdadvise_enabled: bool,
     /// Advice dispatched from the previous successful target round's exact
     /// routed union before the MTP assistant starts. The expected target start
     /// position prevents an aborted generation from attributing stale advice
     /// to an unrelated later verifier. This receipt is observational only.
     pending_previous_union_readahead: Option<(usize, MappedReadaheadEnqueueReceipt)>,
+    /// Shared by the pre-assistant and post-router phases so the 32-record
+    /// early subset counts toward the same hard 64-record target-round cap.
+    pending_mapped_rdadvise_round:
+        Option<Arc<std::sync::Mutex<MappedRdadviseRoundReservation>>>,
     /// Eight 18-slot overflow slabs, reused across all 30 layers. Predicted
     /// rounds bind `overflow_bank[layer % copies]` so prior layers can stay
     /// in flight. Combined footprint is ~461 MiB, not 2.25 GiB.
@@ -3145,6 +3266,84 @@ fn selected_mapped_cold_experts(
             }
         })
         .collect()
+}
+
+/// Build the pre-assistant advisory set without consulting future tokens. Each
+/// layer starts with its previous exact cold union, then fills from its decayed
+/// routed history. A round-robin merge prevents an early layer from consuming
+/// the complete 32-record overlap budget. Resident hot records and duplicates
+/// are excluded before any syscall is attempted.
+#[cfg(any(target_os = "macos", test))]
+fn mapped_rdadvise_early_candidates(
+    previous_routes: &[Vec<usize>],
+    decay_scores: &[Vec<f32>],
+    resident_tables: &[[i16; 128]],
+    max_records: usize,
+) -> Vec<(usize, usize)> {
+    let layer_count = previous_routes
+        .len()
+        .min(decay_scores.len())
+        .min(resident_tables.len());
+    let mut exact_by_layer = Vec::with_capacity(layer_count);
+    let mut historical_by_layer = Vec::with_capacity(layer_count);
+    for layer in 0..layer_count {
+        let exact = selected_mapped_cold_experts(
+            &previous_routes[layer],
+            &resident_tables[layer],
+        );
+        let mut seen = [false; 128];
+        for &expert in &exact {
+            seen[expert] = true;
+        }
+        let mut historical = decay_scores[layer]
+            .iter()
+            .copied()
+            .enumerate()
+            .take(128)
+            .filter(|&(expert, score)| {
+                score.is_finite()
+                    && score > 0.0
+                    && !seen[expert]
+                    && resident_tables[layer][expert] < 0
+            })
+            .collect::<Vec<_>>();
+        historical.sort_by(|(left_expert, left_score), (right_expert, right_score)| {
+            right_score
+                .total_cmp(left_score)
+                .then_with(|| left_expert.cmp(right_expert))
+        });
+        exact_by_layer.push(exact);
+        historical_by_layer.push(
+            historical
+                .into_iter()
+                .map(|(expert, _)| expert)
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    let mut merged = Vec::with_capacity(max_records.min(layer_count.saturating_mul(128)));
+    for by_layer in [&exact_by_layer, &historical_by_layer] {
+        let mut depth = 0usize;
+        while merged.len() < max_records {
+            let before = merged.len();
+            for (layer, candidates) in by_layer.iter().enumerate() {
+                if let Some(&expert) = candidates.get(depth) {
+                    merged.push((layer, expert));
+                    if merged.len() == max_records {
+                        break;
+                    }
+                }
+            }
+            if merged.len() == before {
+                break;
+            }
+            depth = depth.saturating_add(1);
+        }
+        if merged.len() == max_records {
+            break;
+        }
+    }
+    merged
 }
 
 /// Shared counters for one chained round's slot fills. Grouping them keeps
@@ -3912,6 +4111,7 @@ impl Drop for GhostMetalSequenceCleanup<'_> {
                 runtime.sequence_mode = GhostMetalSequenceMode::Idle;
                 runtime.prefill_round = false;
                 runtime.pending_previous_union_readahead = None;
+                runtime.pending_mapped_rdadvise_round = None;
                 if let Some(common) = runtime.common.as_mut() {
                     common.reset_sequence();
                 }
@@ -4184,7 +4384,9 @@ impl GhostMetalExpertRuntime {
             hybrid_decode_promotion_enabled: true,
             hybrid_hot_admission: None,
             mapped_readahead_enabled: false,
+            mapped_rdadvise_enabled: false,
             pending_previous_union_readahead: None,
+            pending_mapped_rdadvise_round: None,
             overflow_bank,
             last_chained_k: None,
             last_chained_succeeded: false,
@@ -4213,6 +4415,7 @@ impl GhostMetalExpertRuntime {
             None,
             true,
             false,
+            false,
         )
     }
 
@@ -4224,6 +4427,7 @@ impl GhostMetalExpertRuntime {
         hybrid_hot_admission: GhostMetalHybridHotAdmission,
         hybrid_decode_promotion_enabled: bool,
         mapped_readahead_enabled: bool,
+        mapped_rdadvise_enabled: bool,
     ) -> Result<Self> {
         Self::new_file_mapped_with_hot_cache(
             layer_count,
@@ -4233,6 +4437,7 @@ impl GhostMetalExpertRuntime {
             Some(hybrid_hot_admission),
             hybrid_decode_promotion_enabled,
             mapped_readahead_enabled,
+            mapped_rdadvise_enabled,
         )
     }
 
@@ -4244,6 +4449,7 @@ impl GhostMetalExpertRuntime {
         hybrid_hot_admission: Option<GhostMetalHybridHotAdmission>,
         hybrid_decode_promotion_enabled: bool,
         mapped_readahead_enabled: bool,
+        mapped_rdadvise_enabled: bool,
     ) -> Result<Self> {
         if layer_count == 0 {
             return Err(BackendError::InvalidModelMetadata(
@@ -4275,6 +4481,11 @@ impl GhostMetalExpertRuntime {
         } else if mapped_readahead_enabled {
             return Err(BackendError::InvalidModelMetadata(format!(
                 "{GHOST_METAL_MAPPED_READAHEAD_ENV}=1 requires hybrid mapped backing"
+            )));
+        }
+        if mapped_rdadvise_enabled && !mapped_readahead_enabled {
+            return Err(BackendError::InvalidModelMetadata(format!(
+                "{GHOST_METAL_MAPPED_RDADVISE_ENV}=1 requires {GHOST_METAL_MAPPED_READAHEAD_ENV}=1"
             )));
         }
         if ghost_file.wire_mapping().is_none() {
@@ -4407,11 +4618,18 @@ impl GhostMetalExpertRuntime {
                 },
             );
             if mapped_readahead_enabled {
-                eprintln!("{GHOST_METAL_MAPPED_READAHEAD_POLICY_MARKER}");
-                eprintln!("{GHOST_METAL_MAPPED_READAHEAD_PREVIOUS_UNION_POLICY_MARKER}");
+                if mapped_rdadvise_enabled {
+                    eprintln!("{GHOST_METAL_MAPPED_RDADVISE_POLICY_MARKER}");
+                } else {
+                    eprintln!("{GHOST_METAL_MAPPED_READAHEAD_POLICY_MARKER}");
+                    eprintln!("{GHOST_METAL_MAPPED_READAHEAD_PREVIOUS_UNION_POLICY_MARKER}");
+                }
                 eprintln!(
-                    "[gemma4-ghost-metal] mapped-cold readahead admission: max_inflight_records={} whole_slab_advice=0 anonymous_capacity_bytes=0 current_routing_enqueued_records=0 current_routing_enqueued_bytes=0 current_routing_enqueue_time_us=0 previous_union_enqueued_records=0 previous_union_enqueued_bytes=0 previous_union_enqueue_time_us=0",
+                    "[gemma4-ghost-metal] mapped-cold readahead admission: max_inflight_records={} whole_slab_advice=0 anonymous_capacity_bytes=0 rdadvise={} rdadvise_early_max_records={} rdadvise_total_max_records={} current_routing_enqueued_records=0 current_routing_enqueued_bytes=0 current_routing_enqueue_time_us=0 previous_union_enqueued_records=0 previous_union_enqueued_bytes=0 previous_union_enqueue_time_us=0",
                     GHOST_METAL_MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS,
+                    u8::from(mapped_rdadvise_enabled),
+                    if mapped_rdadvise_enabled { GHOST_METAL_MAPPED_RDADVISE_EARLY_MAX_RECORDS } else { 0 },
+                    if mapped_rdadvise_enabled { GHOST_METAL_MAPPED_RDADVISE_TOTAL_MAX_RECORDS } else { 0 },
                 );
             }
         } else {
@@ -4435,7 +4653,9 @@ impl GhostMetalExpertRuntime {
             hybrid_decode_promotion_enabled,
             hybrid_hot_admission,
             mapped_readahead_enabled,
+            mapped_rdadvise_enabled,
             pending_previous_union_readahead: None,
+            pending_mapped_rdadvise_round: None,
             overflow_bank: Vec::new(),
             last_chained_k: None,
             last_chained_succeeded: false,
@@ -4470,13 +4690,53 @@ impl GhostMetalExpertRuntime {
         next_target_start_pos: usize,
     ) -> MappedReadaheadEnqueueReceipt {
         self.pending_previous_union_readahead = None;
+        self.pending_mapped_rdadvise_round = None;
         let Some(cache) = cache else {
             return MappedReadaheadEnqueueReceipt::default();
         };
-        if !self.mapped_readahead_enabled
-            || !self.last_chained_succeeded
-            || !self.has_hybrid_mapped_backing()
-        {
+        if !self.mapped_readahead_enabled || !self.has_hybrid_mapped_backing() {
+            return MappedReadaheadEnqueueReceipt::default();
+        }
+
+        if self.mapped_rdadvise_enabled {
+            let mut reservation = MappedRdadviseRoundReservation::new(next_target_start_pos);
+            if self.last_chained_succeeded {
+                let resident_tables = self
+                    .layers
+                    .iter()
+                    .map(|layer| layer.directory.resident_slot_table)
+                    .collect::<Vec<_>>();
+                let candidates = mapped_rdadvise_early_candidates(
+                    &self.latest_routed_experts,
+                    &self.expert_decay_scores,
+                    &resident_tables,
+                    GHOST_METAL_MAPPED_RDADVISE_EARLY_MAX_RECORDS,
+                );
+                let receipt = cache.dispatch_mapped_rdadvise(
+                    &candidates,
+                    &mut reservation,
+                    GHOST_METAL_MAPPED_RDADVISE_EARLY_MAX_RECORDS,
+                );
+                reservation.early = receipt;
+            }
+            if ghost_metal_timing_enabled() {
+                eprintln!(
+                    "[gemma4-ghost-metal] early rdadvise next_start_pos={next_target_start_pos} accepted={} refused={} bytes={:.1}MiB dispatch={:.3}ms reserved={} waited=0 bound_experts=0 copied_bytes=0",
+                    reservation.early.accepted_records,
+                    reservation.early.refused_records,
+                    reservation.early.accepted_bytes as f64 / (1024.0 * 1024.0),
+                    reservation.early.dispatch_us as f64 / 1_000.0,
+                    reservation.reserved.len(),
+                );
+            }
+            self.pending_mapped_rdadvise_round =
+                Some(Arc::new(std::sync::Mutex::new(reservation)));
+            // F_RDADVISE is a substitute A/B strategy. Never also enqueue the
+            // legacy MADV_WILLNEED path for the same target round.
+            return MappedReadaheadEnqueueReceipt::default();
+        }
+
+        if !self.last_chained_succeeded {
             return MappedReadaheadEnqueueReceipt::default();
         }
 
@@ -4759,6 +5019,7 @@ impl GhostMetalExpertRuntime {
             // advice, command encoding, or token/KV mutation and invalidate
             // the prior attempt's ledger so telemetry cannot reuse it.
             self.pending_previous_union_readahead = None;
+            self.pending_mapped_rdadvise_round = None;
             self.chained_round_seq = self.chained_round_seq.saturating_add(1);
             self.last_chained_k = Some(k_tokens);
             self.last_chained_succeeded = false;
@@ -4781,6 +5042,23 @@ impl GhostMetalExpertRuntime {
             Some((expected_start_pos, receipt)) if expected_start_pos == start_pos => receipt,
             _ => MappedReadaheadEnqueueReceipt::default(),
         };
+        let pending_rdadvise = self.pending_mapped_rdadvise_round.take();
+        let pending_rdadvise_matches = pending_rdadvise.as_ref().is_some_and(|round| {
+            round
+                .lock()
+                .is_ok_and(|reservation| reservation.expected_start_pos == start_pos)
+        });
+        let mapped_rdadvise_round = if self.mapped_rdadvise_enabled {
+            if pending_rdadvise_matches {
+                pending_rdadvise
+            } else {
+                Some(Arc::new(std::sync::Mutex::new(
+                    MappedRdadviseRoundReservation::new(start_pos),
+                )))
+            }
+        } else {
+            None
+        };
 
         // Timebase for the eviction-to-re-miss histogram. Incremented on the
         // refused-prediction retry too, so distances are upper bounds by at
@@ -4800,6 +5078,7 @@ impl GhostMetalExpertRuntime {
             .collect();
         let hybrid_mapped_backing = self.has_hybrid_mapped_backing();
         let mapped_readahead_enabled = self.mapped_readahead_enabled;
+        let mapped_rdadvise_enabled = self.mapped_rdadvise_enabled;
         let demand_record_backing = self
             .layers
             .iter()
@@ -5116,7 +5395,11 @@ impl GhostMetalExpertRuntime {
                             layer.directory.lookup_resident_slot(expert).is_some()
                         })
                         .count();
-                    if routed && mapped_readahead_enabled && !cold_experts.is_empty() {
+                    if routed
+                        && mapped_readahead_enabled
+                        && !mapped_rdadvise_enabled
+                        && !cold_experts.is_empty()
+                    {
                         let receipt = cache.enqueue_mapped_readahead(layer_idx, &cold_experts);
                         fill_counters
                             .mapped_readahead_advised_records
@@ -5133,6 +5416,38 @@ impl GhostMetalExpertRuntime {
                         fill_counters
                             .mapped_readahead_enqueue_us
                             .fetch_add(receipt.enqueue_us, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if routed && mapped_rdadvise_enabled && !cold_experts.is_empty() {
+                        if let Some(round) = mapped_rdadvise_round.as_ref() {
+                            if let Ok(mut reservation) = round.lock() {
+                                let candidates = cold_experts
+                                    .iter()
+                                    .copied()
+                                    .map(|expert| (layer_idx, expert))
+                                    .collect::<Vec<_>>();
+                                let receipt = cache.dispatch_mapped_rdadvise(
+                                    &candidates,
+                                    &mut reservation,
+                                    GHOST_METAL_MAPPED_RDADVISE_TOTAL_MAX_RECORDS,
+                                );
+                                reservation.current.accepted_records = reservation
+                                    .current
+                                    .accepted_records
+                                    .saturating_add(receipt.accepted_records);
+                                reservation.current.accepted_bytes = reservation
+                                    .current
+                                    .accepted_bytes
+                                    .saturating_add(receipt.accepted_bytes);
+                                reservation.current.refused_records = reservation
+                                    .current
+                                    .refused_records
+                                    .saturating_add(receipt.refused_records);
+                                reservation.current.dispatch_us = reservation
+                                    .current
+                                    .dispatch_us
+                                    .saturating_add(receipt.dispatch_us);
+                            }
+                        }
                     }
                     fill_counters
                         .plan_hits
@@ -5294,6 +5609,7 @@ impl GhostMetalExpertRuntime {
             // advice belongs to. Carry its observational receipt across the
             // internal retry; never dispatch or wait for the advice again.
             self.pending_previous_union_readahead = Some((start_pos, previous_union_readahead));
+            self.pending_mapped_rdadvise_round = mapped_rdadvise_round.clone();
             self.suppress_prediction = true;
             let retry = self.execute_chained_round_all_layers(
                 hidden_rows,
@@ -5417,6 +5733,17 @@ impl GhostMetalExpertRuntime {
                 }
             }
         }
+        let mapped_rdadvise_snapshot = mapped_rdadvise_round
+            .as_ref()
+            .and_then(|round| round.lock().ok())
+            .map(|reservation| {
+                (
+                    reservation.early,
+                    reservation.current,
+                    reservation.reserved.len(),
+                )
+            })
+            .unwrap_or_default();
         if let Some(common) = self.common.as_mut() {
             use std::sync::atomic::Ordering::Relaxed;
             common.last_chained_ledger.nvme_ms =
@@ -5445,6 +5772,44 @@ impl GhostMetalExpertRuntime {
             common
                 .last_chained_ledger
                 .mapped_readahead_previous_union_enqueue_us = previous_union_readahead.enqueue_us;
+            common
+                .last_chained_ledger
+                .mapped_rdadvise_early_accepted_records = mapped_rdadvise_snapshot
+                .0
+                .accepted_records
+                .min(u32::MAX as u64) as u32;
+            common
+                .last_chained_ledger
+                .mapped_rdadvise_early_accepted_bytes =
+                mapped_rdadvise_snapshot.0.accepted_bytes;
+            common
+                .last_chained_ledger
+                .mapped_rdadvise_early_refused_records = mapped_rdadvise_snapshot
+                .0
+                .refused_records
+                .min(u32::MAX as u64) as u32;
+            common.last_chained_ledger.mapped_rdadvise_early_dispatch_us =
+                mapped_rdadvise_snapshot.0.dispatch_us;
+            common
+                .last_chained_ledger
+                .mapped_rdadvise_current_accepted_records = mapped_rdadvise_snapshot
+                .1
+                .accepted_records
+                .min(u32::MAX as u64) as u32;
+            common
+                .last_chained_ledger
+                .mapped_rdadvise_current_accepted_bytes =
+                mapped_rdadvise_snapshot.1.accepted_bytes;
+            common
+                .last_chained_ledger
+                .mapped_rdadvise_current_refused_records = mapped_rdadvise_snapshot
+                .1
+                .refused_records
+                .min(u32::MAX as u64) as u32;
+            common.last_chained_ledger.mapped_rdadvise_current_dispatch_us =
+                mapped_rdadvise_snapshot.1.dispatch_us;
+            common.last_chained_ledger.mapped_rdadvise_reserved_records =
+                mapped_rdadvise_snapshot.2.min(u32::MAX as usize) as u32;
             common.last_chained_ledger.prefetch_ms = prefetch_ms;
             common.last_chained_ledger.setup_ms = setup_ms;
             common.last_chained_ledger.filler_route_ms =
@@ -5571,6 +5936,21 @@ impl GhostMetalExpertRuntime {
                     led.overlap_layers,
                     led.overlap_layers + led.overlap_fallbacks,
                 );
+                if mapped_rdadvise_enabled {
+                    eprintln!(
+                        "[metal chained rdadvise] early_accepted={} early_refused={} early_bytes={:.1}MiB early_dispatch={:.3}ms current_accepted={} current_refused={} current_bytes={:.1}MiB current_dispatch={:.3}ms reserved={}/{} anonymous_capacity_bytes=0",
+                        led.mapped_rdadvise_early_accepted_records,
+                        led.mapped_rdadvise_early_refused_records,
+                        led.mapped_rdadvise_early_accepted_bytes as f64 / (1024.0 * 1024.0),
+                        led.mapped_rdadvise_early_dispatch_us as f64 / 1_000.0,
+                        led.mapped_rdadvise_current_accepted_records,
+                        led.mapped_rdadvise_current_refused_records,
+                        led.mapped_rdadvise_current_accepted_bytes as f64 / (1024.0 * 1024.0),
+                        led.mapped_rdadvise_current_dispatch_us as f64 / 1_000.0,
+                        led.mapped_rdadvise_reserved_records,
+                        GHOST_METAL_MAPPED_RDADVISE_TOTAL_MAX_RECORDS,
+                    );
+                }
                 eprintln!(
                     "[metal chained stages] split={} qkv_o={:.1}ms attn={:.1}ms router={:.1}ms shared={:.1}ms gateup={:.1}ms down={:.1}ms resid={:.1}ms gpu_total={:.1}ms",
                     if led.gpu_stage_split_measured { "measured" } else { "per-cb" },
@@ -8036,6 +8416,12 @@ pub struct Gemma4RoutedExpertResidencySnapshot {
     pub mapped_readahead_enabled: bool,
     #[serde(default)]
     pub mapped_readahead_max_inflight_records: u32,
+    #[serde(default)]
+    pub mapped_rdadvise_enabled: bool,
+    #[serde(default)]
+    pub mapped_rdadvise_early_max_records: u32,
+    #[serde(default)]
+    pub mapped_rdadvise_total_max_records: u32,
     pub interval_routed_expert_union_scope: String,
     pub interval_routed_expert_union_epoch: u64,
     pub interval_routed_expert_ids_per_layer: Vec<Vec<u16>>,
@@ -8074,6 +8460,24 @@ pub struct Gemma4RoutedExpertResidencySnapshot {
     pub last_chained_mapped_readahead_previous_union_advised_bytes: u64,
     #[serde(default)]
     pub last_chained_mapped_readahead_previous_union_enqueue_us: u64,
+    #[serde(default)]
+    pub last_chained_mapped_rdadvise_early_accepted_records: u32,
+    #[serde(default)]
+    pub last_chained_mapped_rdadvise_early_accepted_bytes: u64,
+    #[serde(default)]
+    pub last_chained_mapped_rdadvise_early_refused_records: u32,
+    #[serde(default)]
+    pub last_chained_mapped_rdadvise_early_dispatch_us: u64,
+    #[serde(default)]
+    pub last_chained_mapped_rdadvise_current_accepted_records: u32,
+    #[serde(default)]
+    pub last_chained_mapped_rdadvise_current_accepted_bytes: u64,
+    #[serde(default)]
+    pub last_chained_mapped_rdadvise_current_refused_records: u32,
+    #[serde(default)]
+    pub last_chained_mapped_rdadvise_current_dispatch_us: u64,
+    #[serde(default)]
+    pub last_chained_mapped_rdadvise_reserved_records: u32,
     pub last_chained_slot_hits: u32,
     pub last_chained_slot_misses: u32,
     pub last_chained_slot_evictions: u32,
@@ -8127,6 +8531,10 @@ pub struct Gemma4HybridTelemetryGeometry {
     pub mapped_readahead_enabled: bool,
     pub mapped_readahead_max_inflight_records: u32,
     pub mapped_readahead_anonymous_capacity_bytes: u64,
+    pub mapped_rdadvise_enabled: bool,
+    pub mapped_rdadvise_early_max_records: u32,
+    pub mapped_rdadvise_total_max_records: u32,
+    pub mapped_rdadvise_anonymous_capacity_bytes: u64,
     pub per_layer: Vec<Gemma4HybridTelemetryLayerGeometry>,
 }
 
@@ -8194,6 +8602,15 @@ pub struct Gemma4HybridTelemetryRound {
     pub mapped_readahead_previous_union_enqueued_records: u32,
     pub mapped_readahead_previous_union_enqueued_bytes: u64,
     pub mapped_readahead_previous_union_enqueue_ms: f64,
+    pub mapped_rdadvise_early_accepted_records: u32,
+    pub mapped_rdadvise_early_accepted_bytes: u64,
+    pub mapped_rdadvise_early_refused_records: u32,
+    pub mapped_rdadvise_early_dispatch_ms: f64,
+    pub mapped_rdadvise_current_accepted_records: u32,
+    pub mapped_rdadvise_current_accepted_bytes: u64,
+    pub mapped_rdadvise_current_refused_records: u32,
+    pub mapped_rdadvise_current_dispatch_ms: f64,
+    pub mapped_rdadvise_reserved_records: u32,
     pub per_layer: Vec<Gemma4HybridTelemetryRoundLayer>,
 }
 
@@ -8387,6 +8804,12 @@ impl Gemma4HybridTelemetryCollector {
                 bound_records: active,
             });
         }
+        let rdadvise_early_attempts = snapshot
+            .last_chained_mapped_rdadvise_early_accepted_records
+            .saturating_add(snapshot.last_chained_mapped_rdadvise_early_refused_records);
+        let rdadvise_current_attempts = snapshot
+            .last_chained_mapped_rdadvise_current_accepted_records
+            .saturating_add(snapshot.last_chained_mapped_rdadvise_current_refused_records);
         if hot_total != snapshot.last_chained_hot_bound_records
             || mapped_total != snapshot.last_chained_mapped_bound_records
             || snapshot.last_chained_mapped_readahead_advised_records > mapped_total
@@ -8400,6 +8823,36 @@ impl Gemma4HybridTelemetryCollector {
                 != u64::from(snapshot.last_chained_mapped_readahead_previous_union_advised_records)
                     .checked_mul(self.geometry.record_payload_bytes)
                     .unwrap_or(u64::MAX)
+            || snapshot.last_chained_mapped_rdadvise_early_accepted_bytes
+                != u64::from(snapshot.last_chained_mapped_rdadvise_early_accepted_records)
+                    .checked_mul(self.geometry.record_payload_bytes)
+                    .unwrap_or(u64::MAX)
+            || snapshot.last_chained_mapped_rdadvise_current_accepted_bytes
+                != u64::from(snapshot.last_chained_mapped_rdadvise_current_accepted_records)
+                    .checked_mul(self.geometry.record_payload_bytes)
+                    .unwrap_or(u64::MAX)
+            || rdadvise_early_attempts > self.geometry.mapped_rdadvise_early_max_records
+            || rdadvise_early_attempts.saturating_add(rdadvise_current_attempts)
+                != snapshot.last_chained_mapped_rdadvise_reserved_records
+            || snapshot.last_chained_mapped_rdadvise_reserved_records
+                > self.geometry.mapped_rdadvise_total_max_records
+            || (self.geometry.mapped_rdadvise_enabled
+                && (snapshot.last_chained_mapped_readahead_advised_records != 0
+                    || snapshot.last_chained_mapped_readahead_advised_bytes != 0
+                    || snapshot.last_chained_mapped_readahead_enqueue_us != 0
+                    || snapshot.last_chained_mapped_readahead_previous_union_advised_records != 0
+                    || snapshot.last_chained_mapped_readahead_previous_union_advised_bytes != 0
+                    || snapshot.last_chained_mapped_readahead_previous_union_enqueue_us != 0))
+            || (!self.geometry.mapped_rdadvise_enabled
+                && (snapshot.last_chained_mapped_rdadvise_early_accepted_records != 0
+                    || snapshot.last_chained_mapped_rdadvise_early_accepted_bytes != 0
+                    || snapshot.last_chained_mapped_rdadvise_early_refused_records != 0
+                    || snapshot.last_chained_mapped_rdadvise_early_dispatch_us != 0
+                    || snapshot.last_chained_mapped_rdadvise_current_accepted_records != 0
+                    || snapshot.last_chained_mapped_rdadvise_current_accepted_bytes != 0
+                    || snapshot.last_chained_mapped_rdadvise_current_refused_records != 0
+                    || snapshot.last_chained_mapped_rdadvise_current_dispatch_us != 0
+                    || snapshot.last_chained_mapped_rdadvise_reserved_records != 0))
             || (!self.geometry.mapped_readahead_enabled
                 && (snapshot.last_chained_mapped_readahead_advised_records != 0
                     || snapshot.last_chained_mapped_readahead_advised_bytes != 0
@@ -8454,6 +8907,28 @@ impl Gemma4HybridTelemetryCollector {
                 .last_chained_mapped_readahead_previous_union_enqueue_us
                 as f64
                 / 1_000.0,
+            mapped_rdadvise_early_accepted_records: snapshot
+                .last_chained_mapped_rdadvise_early_accepted_records,
+            mapped_rdadvise_early_accepted_bytes: snapshot
+                .last_chained_mapped_rdadvise_early_accepted_bytes,
+            mapped_rdadvise_early_refused_records: snapshot
+                .last_chained_mapped_rdadvise_early_refused_records,
+            mapped_rdadvise_early_dispatch_ms: snapshot
+                .last_chained_mapped_rdadvise_early_dispatch_us
+                as f64
+                / 1_000.0,
+            mapped_rdadvise_current_accepted_records: snapshot
+                .last_chained_mapped_rdadvise_current_accepted_records,
+            mapped_rdadvise_current_accepted_bytes: snapshot
+                .last_chained_mapped_rdadvise_current_accepted_bytes,
+            mapped_rdadvise_current_refused_records: snapshot
+                .last_chained_mapped_rdadvise_current_refused_records,
+            mapped_rdadvise_current_dispatch_ms: snapshot
+                .last_chained_mapped_rdadvise_current_dispatch_us
+                as f64
+                / 1_000.0,
+            mapped_rdadvise_reserved_records: snapshot
+                .last_chained_mapped_rdadvise_reserved_records,
             per_layer,
         });
     }
@@ -8668,6 +9143,16 @@ fn exact_hybrid_telemetry_geometry(
         } else {
             snapshot.mapped_readahead_max_inflight_records != 0
         }
+        || if snapshot.mapped_rdadvise_enabled {
+            !snapshot.mapped_readahead_enabled
+                || snapshot.mapped_rdadvise_early_max_records
+                    != GHOST_METAL_MAPPED_RDADVISE_EARLY_MAX_RECORDS as u32
+                || snapshot.mapped_rdadvise_total_max_records
+                    != GHOST_METAL_MAPPED_RDADVISE_TOTAL_MAX_RECORDS as u32
+        } else {
+            snapshot.mapped_rdadvise_early_max_records != 0
+                || snapshot.mapped_rdadvise_total_max_records != 0
+        }
         || snapshot.per_layer.len() != HYBRID_TELEMETRY_LAYERS
     {
         return None;
@@ -8726,6 +9211,10 @@ fn exact_hybrid_telemetry_geometry(
         mapped_readahead_enabled: snapshot.mapped_readahead_enabled,
         mapped_readahead_max_inflight_records: snapshot.mapped_readahead_max_inflight_records,
         mapped_readahead_anonymous_capacity_bytes: 0,
+        mapped_rdadvise_enabled: snapshot.mapped_rdadvise_enabled,
+        mapped_rdadvise_early_max_records: snapshot.mapped_rdadvise_early_max_records,
+        mapped_rdadvise_total_max_records: snapshot.mapped_rdadvise_total_max_records,
+        mapped_rdadvise_anonymous_capacity_bytes: 0,
         per_layer,
     })
 }
@@ -10356,6 +10845,21 @@ impl Gemma4Runtime {
                     .is_some_and(|cache| cache.read_pool.is_some()),
             )
             .map_err(BackendError::InvalidModelMetadata)?;
+            let mapped_rdadvise_raw = match std::env::var(GHOST_METAL_MAPPED_RDADVISE_ENV) {
+                Ok(value) => Some(value),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    return Err(BackendError::InvalidModelMetadata(format!(
+                        "{GHOST_METAL_MAPPED_RDADVISE_ENV} must be canonical UTF-8 1 when present"
+                    )));
+                }
+            };
+            let mapped_rdadvise_enabled = resolve_ghost_metal_mapped_rdadvise(
+                mapped_rdadvise_raw.as_deref(),
+                mapped_readahead_enabled,
+                hybrid_hot_slots.is_some(),
+            )
+            .map_err(BackendError::InvalidModelMetadata)?;
             if file_mapped_raw.is_some() && !file_mapped_experts {
                 return Err(BackendError::InvalidModelMetadata(format!(
                     "{GHOST_METAL_FILE_MAPPED_EXPERTS_ENV} is an exact opt-in and must be 1 when present"
@@ -10551,6 +11055,7 @@ impl Gemma4Runtime {
                                 .expect("hybrid admission is present when hybrid is selected"),
                             hybrid_decode_promotion_enabled,
                             mapped_readahead_enabled,
+                            mapped_rdadvise_enabled,
                         )?
                     } else {
                         GhostMetalExpertRuntime::new_file_mapped(
@@ -10721,6 +11226,7 @@ impl Gemma4Runtime {
                                     .expect("hybrid admission is present when hybrid is selected"),
                                 hybrid_decode_promotion_enabled,
                                 mapped_readahead_enabled,
+                                mapped_rdadvise_enabled,
                             )?
                         } else {
                             GhostMetalExpertRuntime::new_file_mapped(
@@ -11395,6 +11901,17 @@ impl Gemma4Runtime {
                 } else {
                     0
                 },
+                mapped_rdadvise_enabled: lane.mapped_rdadvise_enabled,
+                mapped_rdadvise_early_max_records: if lane.mapped_rdadvise_enabled {
+                    GHOST_METAL_MAPPED_RDADVISE_EARLY_MAX_RECORDS as u32
+                } else {
+                    0
+                },
+                mapped_rdadvise_total_max_records: if lane.mapped_rdadvise_enabled {
+                    GHOST_METAL_MAPPED_RDADVISE_TOTAL_MAX_RECORDS as u32
+                } else {
+                    0
+                },
                 interval_routed_expert_union_scope:
                     "since_latest_explicit_telemetry_interval_begin_or_runtime_load".to_string(),
                 interval_routed_expert_union_epoch: lane.routed_expert_interval_epoch,
@@ -11470,6 +11987,60 @@ impl Gemma4Runtime {
                 last_chained_mapped_readahead_previous_union_enqueue_us:
                     if last_chained_round_available {
                         chained.mapped_readahead_previous_union_enqueue_us
+                    } else {
+                        0
+                    },
+                last_chained_mapped_rdadvise_early_accepted_records:
+                    if last_chained_round_available {
+                        chained.mapped_rdadvise_early_accepted_records
+                    } else {
+                        0
+                    },
+                last_chained_mapped_rdadvise_early_accepted_bytes:
+                    if last_chained_round_available {
+                        chained.mapped_rdadvise_early_accepted_bytes
+                    } else {
+                        0
+                    },
+                last_chained_mapped_rdadvise_early_refused_records:
+                    if last_chained_round_available {
+                        chained.mapped_rdadvise_early_refused_records
+                    } else {
+                        0
+                    },
+                last_chained_mapped_rdadvise_early_dispatch_us:
+                    if last_chained_round_available {
+                        chained.mapped_rdadvise_early_dispatch_us
+                    } else {
+                        0
+                    },
+                last_chained_mapped_rdadvise_current_accepted_records:
+                    if last_chained_round_available {
+                        chained.mapped_rdadvise_current_accepted_records
+                    } else {
+                        0
+                    },
+                last_chained_mapped_rdadvise_current_accepted_bytes:
+                    if last_chained_round_available {
+                        chained.mapped_rdadvise_current_accepted_bytes
+                    } else {
+                        0
+                    },
+                last_chained_mapped_rdadvise_current_refused_records:
+                    if last_chained_round_available {
+                        chained.mapped_rdadvise_current_refused_records
+                    } else {
+                        0
+                    },
+                last_chained_mapped_rdadvise_current_dispatch_us:
+                    if last_chained_round_available {
+                        chained.mapped_rdadvise_current_dispatch_us
+                    } else {
+                        0
+                    },
+                last_chained_mapped_rdadvise_reserved_records:
+                    if last_chained_round_available {
+                        chained.mapped_rdadvise_reserved_records
                     } else {
                         0
                     },
@@ -12899,6 +13470,7 @@ impl Gemma4Runtime {
                         planned_verifier_k,
                     ) {
                         lane.pending_previous_union_readahead = None;
+                        lane.pending_mapped_rdadvise_round = None;
                         return Err(BackendError::InvalidModelMetadata(format!(
                             "Hot40 refused planned verifier K={planned_verifier_k} before assistant or mapped page advice; exact range is 1..={GHOST_METAL_HYBRID_HOT40_MAX_K}"
                         )));
@@ -22939,6 +23511,57 @@ mod mtp_target_seam_tests {
     }
 
     #[test]
+    fn hybrid_telemetry_receipts_bounded_rdadvise_and_zero_madv_overlap() {
+        let mut before = exact_hybrid_snapshot(10, None, 0, 0);
+        before.mapped_readahead_enabled = true;
+        before.mapped_readahead_max_inflight_records =
+            GHOST_METAL_MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS as u32;
+        before.mapped_rdadvise_enabled = true;
+        before.mapped_rdadvise_early_max_records =
+            GHOST_METAL_MAPPED_RDADVISE_EARLY_MAX_RECORDS as u32;
+        before.mapped_rdadvise_total_max_records =
+            GHOST_METAL_MAPPED_RDADVISE_TOTAL_MAX_RECORDS as u32;
+        let mut collector =
+            Gemma4HybridTelemetryCollector::begin(before).expect("exact rdadvise geometry");
+        let mut after = exact_hybrid_snapshot(11, Some(8), 10, 6);
+        after.mapped_readahead_enabled = true;
+        after.mapped_readahead_max_inflight_records =
+            GHOST_METAL_MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS as u32;
+        after.mapped_rdadvise_enabled = true;
+        after.mapped_rdadvise_early_max_records =
+            GHOST_METAL_MAPPED_RDADVISE_EARLY_MAX_RECORDS as u32;
+        after.mapped_rdadvise_total_max_records =
+            GHOST_METAL_MAPPED_RDADVISE_TOTAL_MAX_RECORDS as u32;
+        after.last_chained_mapped_rdadvise_early_accepted_records = 24;
+        after.last_chained_mapped_rdadvise_early_accepted_bytes =
+            24 * HYBRID_TELEMETRY_RECORD_BYTES;
+        after.last_chained_mapped_rdadvise_early_refused_records = 8;
+        after.last_chained_mapped_rdadvise_early_dispatch_us = 80;
+        after.last_chained_mapped_rdadvise_current_accepted_records = 20;
+        after.last_chained_mapped_rdadvise_current_accepted_bytes =
+            20 * HYBRID_TELEMETRY_RECORD_BYTES;
+        after.last_chained_mapped_rdadvise_current_refused_records = 12;
+        after.last_chained_mapped_rdadvise_current_dispatch_us = 70;
+        after.last_chained_mapped_rdadvise_reserved_records = 64;
+        collector.capture_round(k8_round_input(), Some(after.clone()));
+        let telemetry = collector
+            .finish(Some(after), 6, 0)
+            .expect("bounded direct advisory receipt");
+        assert!(telemetry.geometry.mapped_rdadvise_enabled);
+        assert_eq!(telemetry.geometry.mapped_rdadvise_early_max_records, 32);
+        assert_eq!(telemetry.geometry.mapped_rdadvise_total_max_records, 64);
+        assert_eq!(telemetry.geometry.mapped_rdadvise_anonymous_capacity_bytes, 0);
+        assert_eq!(telemetry.rounds[0].mapped_rdadvise_reserved_records, 64);
+        assert_eq!(telemetry.rounds[0].mapped_rdadvise_early_accepted_records, 24);
+        assert_eq!(telemetry.rounds[0].mapped_rdadvise_current_refused_records, 12);
+        assert_eq!(telemetry.rounds[0].mapped_readahead_enqueued_records, 0);
+        assert_eq!(
+            telemetry.rounds[0].mapped_readahead_previous_union_enqueued_records,
+            0
+        );
+    }
+
+    #[test]
     fn hybrid_telemetry_preserves_real_per_layer_hot_capacities() {
         let profile = [
             39u64, 40, 33, 30, 30, 31, 31, 30, 34, 30, 26, 28, 30, 31, 28, 37, 31, 30, 31, 32, 31,
@@ -25273,6 +25896,72 @@ mod ghost_moe_wire_tests {
         assert_eq!(
             GHOST_METAL_MAPPED_READAHEAD_PREVIOUS_UNION_POLICY_MARKER,
             "[gemma4-ghost-metal] mapped-cold previous-union policy: source=previous-target-exact-routed-union timing=before-assistant scope=selected-cold-only advice=MADV_WILLNEED dispatch=async-read-pool correctness_dependency=0"
+        );
+    }
+
+    #[test]
+    fn metal_hybrid_mapped_rdadvise_is_exact_parented_and_bounded_per_round() {
+        assert!(!resolve_ghost_metal_mapped_rdadvise(None, false, false).unwrap());
+        assert!(!resolve_ghost_metal_mapped_rdadvise(None, true, true).unwrap());
+        assert!(resolve_ghost_metal_mapped_rdadvise(Some("1"), true, true).unwrap());
+        assert!(resolve_ghost_metal_mapped_rdadvise(Some("1"), false, true).is_err());
+        assert!(resolve_ghost_metal_mapped_rdadvise(Some("1"), true, false).is_err());
+        for invalid in ["", "0", "01", "+1", " 1", "1 ", "true", "yes", "2"] {
+            assert!(
+                resolve_ghost_metal_mapped_rdadvise(Some(invalid), true, true).is_err(),
+                "rdadvise value {invalid:?} must fail closed"
+            );
+        }
+        assert_eq!(
+            GHOST_METAL_MAPPED_RDADVISE_POLICY_MARKER,
+            "[gemma4-ghost-metal] mapped-cold rdadvise policy: CAMELID_GEMMA4_GHOST_METAL_MAPPED_RDADVISE effective=1 parent=CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD strategy=F_RDADVISE dispatch=direct exact_record_ranges=1 early_max_records=32 total_max_records=64 anonymous_capacity_bytes=0 correctness_dependency=0"
+        );
+
+        let mut reservation = MappedRdadviseRoundReservation::new(77);
+        for expert in 0..GHOST_METAL_MAPPED_RDADVISE_EARLY_MAX_RECORDS {
+            assert!(reservation.reserve(0, expert, GHOST_METAL_MAPPED_RDADVISE_EARLY_MAX_RECORDS));
+        }
+        assert!(!reservation.reserve(
+            0,
+            GHOST_METAL_MAPPED_RDADVISE_EARLY_MAX_RECORDS,
+            GHOST_METAL_MAPPED_RDADVISE_EARLY_MAX_RECORDS
+        ));
+        assert!(!reservation.reserve(
+            0,
+            0,
+            GHOST_METAL_MAPPED_RDADVISE_TOTAL_MAX_RECORDS
+        ));
+        for expert in GHOST_METAL_MAPPED_RDADVISE_EARLY_MAX_RECORDS
+            ..GHOST_METAL_MAPPED_RDADVISE_TOTAL_MAX_RECORDS
+        {
+            assert!(reservation.reserve(
+                1,
+                expert,
+                GHOST_METAL_MAPPED_RDADVISE_TOTAL_MAX_RECORDS
+            ));
+        }
+        assert_eq!(reservation.expected_start_pos, 77);
+        assert_eq!(reservation.reserved.len(), 64);
+        assert!(!reservation.reserve(2, 64, GHOST_METAL_MAPPED_RDADVISE_TOTAL_MAX_RECORDS));
+    }
+
+    #[test]
+    fn metal_hybrid_rdadvise_early_plan_prefers_exact_cold_then_decay_round_robin() {
+        let previous = vec![vec![1, 2], vec![3], vec![]];
+        let mut decay = vec![vec![0.0; 128]; 3];
+        decay[0][4] = 0.9;
+        decay[1][5] = 0.8;
+        decay[2][6] = 0.7;
+        let mut resident = vec![[-1i16; 128]; 3];
+        resident[0][1] = 0;
+        assert_eq!(
+            mapped_rdadvise_early_candidates(&previous, &decay, &resident, 5),
+            vec![(0, 2), (1, 3), (0, 4), (1, 5), (2, 6)]
+        );
+        assert_eq!(
+            mapped_rdadvise_early_candidates(&previous, &decay, &resident, 2),
+            vec![(0, 2), (1, 3)],
+            "the early planner must obey its exact record cap"
         );
     }
 
