@@ -73,6 +73,8 @@ def hybrid_telemetry(unique: int = 64) -> dict[str, object]:
             "layer": layer,
             "logical_addressable_slots": receipt.CANONICAL_PER_LAYER,
             "anonymous_hot_capacity_slots": receipt.HOT_PER_LAYER,
+            "anonymous_hot_capacity_bytes": receipt.HOT_PER_LAYER
+            * receipt.SLOT_STRIDE_BYTES,
             "file_mapped_addressable_slots": receipt.CANONICAL_PER_LAYER,
             "file_mapped_address_span_bytes": receipt.MAPPED_COLD_SPAN_BYTES_PER_LAYER,
             "overflow_slots": 0,
@@ -527,6 +529,29 @@ class WatchdogBoundaryTests(unittest.TestCase):
 
 
 class ReceiptTests(unittest.TestCase):
+    def test_v5_profile_is_budget_neutral_and_improves_observed_union_coverage(self) -> None:
+        observed = (
+            34, 41, 30, 27, 25, 23, 25, 26, 25, 25,
+            26, 20, 25, 28, 24, 23, 22, 23, 24, 25,
+            27, 27, 27, 30, 32, 39, 32, 31, 32, 31,
+        )
+        represented = lambda profile: sum(
+            min(capacity, demand) for capacity, demand in zip(profile, observed)
+        )
+        self.assertEqual(sum(receipt.V5_HOT_PROFILE), receipt.HOT_TOTAL)
+        self.assertGreater(
+            represented(receipt.V5_HOT_PROFILE),
+            represented(receipt.UNIFORM_HOT_PROFILE),
+        )
+
+        telemetry = hybrid_telemetry(8)
+        for layer, slots in zip(
+            telemetry["geometry"]["per_layer"], receipt.V5_HOT_PROFILE
+        ):
+            layer["anonymous_hot_capacity_slots"] = slots
+            layer["anonymous_hot_capacity_bytes"] = slots * receipt.SLOT_STRIDE_BYTES
+        receipt._geometry(telemetry, receipt.V5_HOT_PROFILE)
+
     def test_hot32_geometry_and_valid_33_through_64_cold_spill(self) -> None:
         self.assertEqual(receipt.HOT_PER_LAYER, 32)
         self.assertEqual(receipt.HOT_TOTAL, 960)
@@ -1016,6 +1041,8 @@ class RunnerPreflightTests(unittest.TestCase):
         ):
             self.assertNotIn(key, source)
         self.assertIn("CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS=32", source)
+        self.assertIn("CAMELID_HYBRID_RESIDENCY_PROFILE", source)
+        self.assertIn(receipt.V5_HOT_PROFILE_ENCODED, source)
         self.assertIn("CAMELID_GEMMA4_GHOST_READ_THREADS=8", source)
         self.assertIn("CAMELID_GEMMA4_SLOT_PIN=0", source)
         self.assertIn("CAMELID_GEMMA4_CHAINED_K1=1", source)
@@ -1036,6 +1063,16 @@ class RunnerPreflightTests(unittest.TestCase):
             self.assertEqual(result.returncode, 75, result.stderr)
             self.assertIn("legacy physical-slot", result.stderr)
             self.assertFalse((root / "01-load-only").exists())
+
+    def test_unknown_residency_profile_refuses_before_spawn(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            result = self.run_stage(
+                "load-only",
+                Path(raw),
+                {"CAMELID_HYBRID_RESIDENCY_PROFILE": "unreviewed"},
+            )
+            self.assertEqual(result.returncode, 75)
+            self.assertIn("uniform-hot32 or v5-k8-max-960", result.stderr)
 
     def test_missing_predecessor_never_creates_or_starts_k1(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

@@ -13426,18 +13426,20 @@ impl Gemma4Q4HybridExpertSource {
         mmap: std::sync::Arc<crate::wire_mmap::GgufWireMmap>,
         layer_offset: u64,
         mapped_span_bytes: usize,
+        hot_slot_count: usize,
     ) -> Option<Self> {
+        if !(1..=128).contains(&hot_slot_count) {
+            return None;
+        }
         let mapped = Gemma4Q4FileMappedExpertSource::new(
             mmap,
             layer_offset,
             mapped_span_bytes,
         )?;
         let kernel = metal_linear_kernel()?;
-        let mut hot_records = Vec::with_capacity(GEMMA4_Q4_HYBRID_HOT_SLOTS);
-        let mut addresses = std::collections::HashSet::with_capacity(
-            GEMMA4_Q4_HYBRID_HOT_SLOTS,
-        );
-        for _ in 0..GEMMA4_Q4_HYBRID_HOT_SLOTS {
+        let mut hot_records = Vec::with_capacity(hot_slot_count);
+        let mut addresses = std::collections::HashSet::with_capacity(hot_slot_count);
+        for _ in 0..hot_slot_count {
             let record = kernel.device.new_buffer(
                 GEMMA4_Q4_EXPERT_SLOT_STRIDE as u64,
                 MTLResourceOptions::StorageModeShared,
@@ -13454,7 +13456,7 @@ impl Gemma4Q4HybridExpertSource {
         Some(Self {
             mapped,
             hot_records,
-            hot_slot_ids: std::sync::RwLock::new(vec![None; GEMMA4_Q4_HYBRID_HOT_SLOTS]),
+            hot_slot_ids: std::sync::RwLock::new(vec![None; hot_slot_count]),
             lease_state: std::sync::atomic::AtomicIsize::new(0),
         })
     }
@@ -13889,8 +13891,26 @@ impl Gemma4Q4ExpertSlots {
         offset: u64,
         byte_len: usize,
     ) -> Option<Self> {
-        let source = Gemma4Q4HybridExpertSource::new(mmap, offset, byte_len)?;
-        if source.hot_slot_count() != GEMMA4_Q4_HYBRID_HOT_SLOTS
+        Self::new_hybrid_mapped_record_granular_with_hot_slots(
+            mmap,
+            offset,
+            byte_len,
+            GEMMA4_Q4_HYBRID_HOT_SLOTS,
+        )
+    }
+
+    /// Per-layer anonymous hot capacity for the mapped-cold hybrid lane. The
+    /// complete 128-entry canonical namespace remains mapped and GPU-visible;
+    /// `hot_slot_count` changes only the number of writable override records.
+    pub(crate) fn new_hybrid_mapped_record_granular_with_hot_slots(
+        mmap: std::sync::Arc<crate::wire_mmap::GgufWireMmap>,
+        offset: u64,
+        byte_len: usize,
+        hot_slot_count: usize,
+    ) -> Option<Self> {
+        let source =
+            Gemma4Q4HybridExpertSource::new(mmap, offset, byte_len, hot_slot_count)?;
+        if source.hot_slot_count() != hot_slot_count
             || source.mapped.addressable_slot_count() != 128
         {
             return None;
@@ -44775,6 +44795,23 @@ kernel void sample_active_expert_records(
             Some(vec![None; GEMMA4_Q4_HYBRID_HOT_SLOTS])
         );
         assert!(source.materialize_for_active_slots(&[7]).is_some());
+
+        let profiled_mmap = crate::wire_mmap::GgufWireMmap::map(file.path())
+            .expect("map profiled hybrid cold tier");
+        let profiled = Gemma4Q4ExpertSlots::new_hybrid_mapped_record_granular_with_hot_slots(
+            profiled_mmap,
+            0,
+            span,
+            41,
+        )
+        .expect("profiled hybrid backing");
+        assert_eq!(profiled.slot_count(), 128);
+        assert_eq!(profiled.gpu_slot_count(), 128);
+        assert_eq!(profiled.anonymous_slot_count(), 41);
+        assert_eq!(
+            profiled.anonymous_capacity_bytes(),
+            41 * GEMMA4_Q4_EXPERT_SLOT_STRIDE
+        );
     }
 
     #[cfg(target_os = "macos")]

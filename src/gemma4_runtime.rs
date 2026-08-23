@@ -1518,11 +1518,23 @@ const GHOST_METAL_DEMAND_LOAD_ONLY_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_DEMAN
 const GHOST_METAL_FILE_MAPPED_EXPERTS_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_FILE_MAPPED_EXPERTS";
 /// Exact opt-in for the mixed 32-hot/mapped-cold lane. The value is the
-/// receipted physical cache size and must be canonical `32`; absence preserves
-/// the mapped-only foundation.
+/// receipted uniform physical cache size and must be canonical `32`; absence
+/// preserves the mapped-only foundation.
 const GHOST_METAL_HYBRID_HOT_SLOTS_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS";
 const GHOST_METAL_HYBRID_HOT_SLOTS: usize = 32;
+/// Experimental per-layer override for the hybrid anonymous cache. It is
+/// deliberately subordinate to the canonical `HYBRID_HOT_SLOTS=32` opt-in:
+/// absence preserves uniform Hot32, while presence must be exactly 30
+/// canonical comma-separated decimals whose fixed 960-record total preserves
+/// the already receipted anonymous-memory ceiling.
+const GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER_ENV: &str =
+    "CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER";
+const GHOST_METAL_HYBRID_PROFILE_LAYERS: usize = 30;
+const GHOST_METAL_HYBRID_PROFILE_MIN_SLOTS: usize = 8;
+const GHOST_METAL_HYBRID_PROFILE_MAX_SLOTS: usize = 64;
+const GHOST_METAL_HYBRID_PROFILE_TOTAL_SLOTS: usize =
+    GHOST_METAL_HYBRID_PROFILE_LAYERS * GHOST_METAL_HYBRID_HOT_SLOTS;
 /// Exact demand-only residency bound. The runtime preserves the full logical
 /// expert namespace but allocates, pins, admits, and accounts only this
 /// physical prefix. Keeping unbound records out of the Tier-2 table matters:
@@ -1580,6 +1592,65 @@ fn parse_ghost_metal_hybrid_hot_slots(
         ));
     }
     Ok(Some(GHOST_METAL_HYBRID_HOT_SLOTS))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn validate_ghost_metal_hybrid_hot_profile(profile: &[usize]) -> std::result::Result<(), String> {
+    if profile.len() != GHOST_METAL_HYBRID_PROFILE_LAYERS {
+        return Err(format!(
+            "{GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER_ENV} must contain exactly {GHOST_METAL_HYBRID_PROFILE_LAYERS} entries, found {}",
+            profile.len(),
+        ));
+    }
+    if let Some((layer, slots)) = profile.iter().copied().enumerate().find(|(_, slots)| {
+        !(GHOST_METAL_HYBRID_PROFILE_MIN_SLOTS..=GHOST_METAL_HYBRID_PROFILE_MAX_SLOTS)
+            .contains(slots)
+    }) {
+        return Err(format!(
+            "{GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER_ENV} layer {layer} has {slots} slots; exact range is {GHOST_METAL_HYBRID_PROFILE_MIN_SLOTS}..={GHOST_METAL_HYBRID_PROFILE_MAX_SLOTS}",
+        ));
+    }
+    let total = profile.iter().try_fold(0usize, |sum, &slots| {
+        sum.checked_add(slots).ok_or_else(|| {
+            format!("{GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER_ENV} total overflowed")
+        })
+    })?;
+    if total != GHOST_METAL_HYBRID_PROFILE_TOTAL_SLOTS {
+        return Err(format!(
+            "{GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER_ENV} must total exactly {GHOST_METAL_HYBRID_PROFILE_TOTAL_SLOTS} slots, found {total}",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_ghost_metal_hybrid_hot_profile(
+    value: Option<&str>,
+) -> std::result::Result<Option<Vec<usize>>, String> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let mut profile = Vec::new();
+    for encoded in raw.split(',') {
+        let slots = encoded.parse::<usize>().map_err(|_| {
+            format!(
+                "{GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER_ENV} entries must be canonical decimal without whitespace or signs"
+            )
+        })?;
+        if slots.to_string() != encoded {
+            return Err(format!(
+                "{GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER_ENV} entries must be canonical decimal without whitespace, signs, or leading zeroes"
+            ));
+        }
+        profile.push(slots);
+    }
+    validate_ghost_metal_hybrid_hot_profile(&profile)?;
+    Ok(Some(profile))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn ghost_metal_uniform_hybrid_hot_profile() -> Vec<usize> {
+    vec![GHOST_METAL_HYBRID_HOT_SLOTS; GHOST_METAL_HYBRID_PROFILE_LAYERS]
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -3597,12 +3668,13 @@ impl GhostMetalExpertRuntime {
         layer_count: usize,
         fused_fast: bool,
         ghost_file: &GhostFile,
+        hot_slots_per_layer: &[usize],
     ) -> Result<Self> {
         Self::new_file_mapped_with_hot_cache(
             layer_count,
             fused_fast,
             ghost_file,
-            Some(GHOST_METAL_HYBRID_HOT_SLOTS),
+            Some(hot_slots_per_layer),
         )
     }
 
@@ -3610,20 +3682,22 @@ impl GhostMetalExpertRuntime {
         layer_count: usize,
         fused_fast: bool,
         ghost_file: &GhostFile,
-        hot_slots: Option<usize>,
+        hot_slots_per_layer: Option<&[usize]>,
     ) -> Result<Self> {
         if layer_count == 0 {
             return Err(BackendError::InvalidModelMetadata(
                 "file-mapped Ghost Metal requires at least one layer".into(),
             ));
         }
-        if hot_slots.is_some_and(|slots| {
-            slots != GHOST_METAL_HYBRID_HOT_SLOTS
-                || slots != crate::metal::GEMMA4_Q4_HYBRID_HOT_SLOTS
-        }) {
-            return Err(BackendError::InvalidModelMetadata(format!(
-                "hybrid Ghost Metal requires exactly {GHOST_METAL_HYBRID_HOT_SLOTS} physical hot records per layer"
-            )));
+        if let Some(profile) = hot_slots_per_layer {
+            validate_ghost_metal_hybrid_hot_profile(profile)
+                .map_err(BackendError::InvalidModelMetadata)?;
+            if layer_count != profile.len() {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "hybrid Ghost Metal layer count {layer_count} differs from the validated {}-entry physical hot profile",
+                    profile.len(),
+                )));
+            }
         }
         if ghost_file.wire_mapping().is_none() {
             return Err(BackendError::InvalidModelMetadata(format!(
@@ -3649,9 +3723,13 @@ impl GhostMetalExpertRuntime {
                     "file-mapped Ghost Metal layer {layer_idx} has no retained canonical mapping"
                 )));
             };
-            let slots = if hot_slots.is_some() {
-                crate::metal::Gemma4Q4ExpertSlots::new_hybrid_mapped_record_granular(
-                    mmap, offset, span,
+            let layer_hot_slots = hot_slots_per_layer.map(|profile| profile[layer_idx]);
+            let slots = if let Some(layer_hot_slots) = layer_hot_slots {
+                crate::metal::Gemma4Q4ExpertSlots::new_hybrid_mapped_record_granular_with_hot_slots(
+                    mmap,
+                    offset,
+                    span,
+                    layer_hot_slots,
                 )
             } else {
                 crate::metal::Gemma4Q4ExpertSlots::new_file_mapped_record_granular(
@@ -3661,13 +3739,13 @@ impl GhostMetalExpertRuntime {
             .ok_or_else(|| {
                 BackendError::UnsupportedModelArchitecture(format!(
                     "{} Ghost Metal layer {layer_idx} failed Tier-2/no-copy admission",
-                    if hot_slots.is_some() { "hybrid" } else { "file-mapped" },
+                    if hot_slots_per_layer.is_some() { "hybrid" } else { "file-mapped" },
                 ))
             })?;
             if slots.gpu_slot_count() != 128
-                || slots.anonymous_slot_count() != hot_slots.unwrap_or(0)
+                || slots.anonymous_slot_count() != layer_hot_slots.unwrap_or(0)
                 || slots.anonymous_capacity_bytes()
-                    != hot_slots
+                    != layer_hot_slots
                         .unwrap_or(0)
                         .saturating_mul(crate::metal::GEMMA4_Q4_EXPERT_SLOT_STRIDE)
                 || slots.mapped_address_span_bytes() != span
@@ -3678,8 +3756,8 @@ impl GhostMetalExpertRuntime {
             }
             mapped_span_bytes = mapped_span_bytes.saturating_add(span);
             layers.push(GhostMetalExpertLayer {
-                directory: if let Some(hot_slots) = hot_slots {
-                    GhostMetalSlotDirectory::new(hot_slots)
+                directory: if let Some(layer_hot_slots) = layer_hot_slots {
+                    GhostMetalSlotDirectory::new(layer_hot_slots)
                 } else {
                     GhostMetalSlotDirectory::new_static_identity(128).ok_or_else(|| {
                         BackendError::InvalidModelMetadata(
@@ -3697,14 +3775,34 @@ impl GhostMetalExpertRuntime {
                 evicted_round: [0; 128],
             });
         }
-        if let Some(hot_slots) = hot_slots {
+        if let Some(profile) = hot_slots_per_layer {
             let hot_bytes = layers
                 .iter()
                 .map(|layer| layer.slots.anonymous_capacity_bytes())
                 .sum::<usize>();
-            eprintln!(
-                "[gemma4-ghost-metal] HYBRID ACTIVE: {GHOST_METAL_FILE_MAPPED_EXPERTS_ENV}=1 {GHOST_METAL_HYBRID_HOT_SLOTS_ENV}={hot_slots}, layers={layer_count} canonical_addressable=128/layer physical_hot={hot_slots}/layer hot_capacity_bytes={hot_bytes} mapped_cold_span_bytes={mapped_span_bytes} overflow=0 victim=0 slot_pin=off prediction=off",
-            );
+            let hot_slots = profile.iter().sum::<usize>();
+            let uniform = profile
+                .iter()
+                .all(|&slots| slots == GHOST_METAL_HYBRID_HOT_SLOTS);
+            if uniform {
+                // Preserve the exact legacy admission line so frozen uniform
+                // Hot32 receipts remain replayable.
+                eprintln!(
+                    "[gemma4-ghost-metal] HYBRID ACTIVE: {GHOST_METAL_FILE_MAPPED_EXPERTS_ENV}=1 {GHOST_METAL_HYBRID_HOT_SLOTS_ENV}={}, layers={layer_count} canonical_addressable=128/layer physical_hot={}/layer hot_capacity_bytes={hot_bytes} mapped_cold_span_bytes={mapped_span_bytes} overflow=0 victim=0 slot_pin=off prediction=off",
+                    GHOST_METAL_HYBRID_HOT_SLOTS,
+                    GHOST_METAL_HYBRID_HOT_SLOTS,
+                );
+            } else {
+                let encoded_profile = profile
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                eprintln!(
+                    "[gemma4-ghost-metal] HYBRID ACTIVE: {GHOST_METAL_FILE_MAPPED_EXPERTS_ENV}=1 {GHOST_METAL_HYBRID_HOT_SLOTS_ENV}={} {GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER_ENV}={encoded_profile}, layers={layer_count} canonical_addressable=128/layer physical_hot=per-layer-profile hot_capacity_slots={hot_slots} hot_capacity_bytes={hot_bytes} mapped_cold_span_bytes={mapped_span_bytes} overflow=0 victim=0 slot_pin=off prediction=off",
+                    GHOST_METAL_HYBRID_HOT_SLOTS,
+                );
+            }
         } else {
             eprintln!(
                 "[gemma4-ghost-metal] {GHOST_METAL_FILE_MAPPED_EXPERTS_ENV}=1: clean file-backed experts active, layers={layer_count} addressable=128/layer mapped_span={:.2}GiB anonymous_expert_capacity=0 overflow=0 victim=0 mlock=0",
@@ -4627,6 +4725,17 @@ impl GhostMetalExpertRuntime {
             .sum()
     }
 
+    fn anonymous_slots_per_layer_receipt(&self) -> Option<[u16; 30]> {
+        if self.layers.len() != 30 {
+            return None;
+        }
+        let mut profile = [0u16; 30];
+        for (layer, slots) in self.layers.iter().enumerate() {
+            profile[layer] = u16::try_from(slots.slots.anonymous_slot_count()).ok()?;
+        }
+        Some(profile)
+    }
+
     fn logical_slot_count(&self) -> usize {
         self.layers
             .iter()
@@ -4680,14 +4789,14 @@ impl GhostMetalExpertRuntime {
                     || layer.slots.gpu_slot_count() != table_slots
                     || layer.directory.entries.len()
                         != if layer.slots.is_hybrid_mapped() {
-                            GHOST_METAL_HYBRID_HOT_SLOTS
+                            layer.slots.anonymous_slot_count()
                         } else {
                             table_slots
                         }
             })
         {
             return Err(format!(
-                "load-only table bind requires uniform record backing: layers={layer_count} logical={logical_slots} table={table_slots}"
+                "load-only table bind requires exact record backing: layers={layer_count} logical={logical_slots} table={table_slots}"
             ));
         }
         if self.occupied_resident_slot_count() != 0 {
@@ -7036,11 +7145,13 @@ pub struct Gemma4RoutedExpertResidencySnapshot {
     pub last_chained_slot_capacity_overflow: u32,
 }
 
-/// Stable response schema for one completed, measured request on the exact
-/// 32-anonymous-hot / canonical-file-mapped Gemma 4 lane. These structures are
-/// deliberately separate from [`Gemma4GenerationOutcome`]: existing runtime
-/// callers retain that enum unchanged, while the non-streaming serve bridge can
-/// carry this optional receipt as a sidecar.
+/// Stable response schema for one completed, measured request on the bounded
+/// anonymous-hot / canonical-file-mapped Gemma 4 lane. Per-layer capacity is
+/// explicit, while the aggregate anonymous ceiling remains the receipted
+/// 960-record Hot32 budget. These structures are deliberately separate from
+/// [`Gemma4GenerationOutcome`]: existing runtime callers retain that enum
+/// unchanged, while the non-streaming serve bridge can carry this optional
+/// receipt as a sidecar.
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct Gemma4HybridTelemetry {
     pub schema_version: u32,
@@ -7296,8 +7407,9 @@ impl Gemma4HybridTelemetryCollector {
             let active = snapshot.last_chained_unique_per_layer[layer];
             let hot = snapshot.last_chained_hot_bound_per_layer[layer];
             let mapped = snapshot.last_chained_mapped_bound_per_layer[layer];
+            let hot_capacity = self.geometry.per_layer[layer].anonymous_hot_capacity_slots;
             if active != hot.saturating_add(mapped)
-                || u64::from(hot) > HYBRID_TELEMETRY_HOT_PER_LAYER
+                || u64::from(hot) > hot_capacity
                 || u64::from(active) > HYBRID_TELEMETRY_LOGICAL_PER_LAYER
                 || usize::from(active) > input.verifier_k.saturating_mul(8)
             {
@@ -7540,22 +7652,28 @@ fn exact_hybrid_telemetry_geometry(
         return None;
     }
     let mut per_layer = Vec::with_capacity(HYBRID_TELEMETRY_LAYERS);
+    let mut observed_hot_total = 0u64;
+    let mut observed_hot_bytes = 0u64;
     for (layer, observed) in snapshot.per_layer.iter().enumerate() {
         let mapped_layer_span =
             HYBRID_TELEMETRY_LOGICAL_PER_LAYER.checked_mul(HYBRID_TELEMETRY_STRIDE_BYTES)?;
-        let hot_layer_bytes =
-            HYBRID_TELEMETRY_HOT_PER_LAYER.checked_mul(HYBRID_TELEMETRY_STRIDE_BYTES)?;
+        let hot_layer = observed.anonymous_slot_capacity;
+        let hot_layer_bytes = hot_layer.checked_mul(HYBRID_TELEMETRY_STRIDE_BYTES)?;
         if observed.layer_index != layer as u32
             || observed.base_slot_capacity != HYBRID_TELEMETRY_LOGICAL_PER_LAYER
-            || observed.anonymous_slot_capacity != HYBRID_TELEMETRY_HOT_PER_LAYER
+            || !(GHOST_METAL_HYBRID_PROFILE_MIN_SLOTS as u64
+                ..=GHOST_METAL_HYBRID_PROFILE_MAX_SLOTS as u64)
+                .contains(&hot_layer)
             || observed.anonymous_slot_capacity_bytes != hot_layer_bytes
-            || observed.physical_base_slot_budget != HYBRID_TELEMETRY_HOT_PER_LAYER
+            || observed.physical_base_slot_budget != hot_layer
             || observed.physical_base_slot_budget_bytes != hot_layer_bytes
             || observed.file_mapped_addressable_slots != HYBRID_TELEMETRY_LOGICAL_PER_LAYER
             || observed.file_mapped_address_span_bytes != mapped_layer_span
         {
             return None;
         }
+        observed_hot_total = observed_hot_total.checked_add(hot_layer)?;
+        observed_hot_bytes = observed_hot_bytes.checked_add(hot_layer_bytes)?;
         per_layer.push(Gemma4HybridTelemetryLayerGeometry {
             layer: layer as u32,
             logical_addressable_slots: observed.base_slot_capacity,
@@ -7566,6 +7684,9 @@ fn exact_hybrid_telemetry_geometry(
             overflow_slots: 0,
             victim_slots: 0,
         });
+    }
+    if observed_hot_total != hot_total || observed_hot_bytes != hot_bytes {
+        return None;
     }
     Some(Gemma4HybridTelemetryGeometry {
         layers: snapshot.layer_count,
@@ -7635,6 +7756,10 @@ pub struct Gemma4GhostLoadAllocationLedger {
     /// addressable.
     pub expert_slot_count: u64,
     pub expert_slot_capacity_bytes: u64,
+    /// Exact anonymous record allocation by layer. This distinguishes a
+    /// profiled 960-record cache from the legacy uniform 32×30 geometry while
+    /// preserving the same aggregate byte ceiling.
+    pub expert_anonymous_slots_per_layer: [u16; 30],
     /// Clean file-backed expert addressability, kept separate from anonymous
     /// capacity and from proof of current physical residency.
     pub expert_file_mapped_slot_count: u64,
@@ -9007,6 +9132,12 @@ impl Gemma4Runtime {
             let hybrid_hot_raw = std::env::var(GHOST_METAL_HYBRID_HOT_SLOTS_ENV).ok();
             let hybrid_hot_slots = parse_ghost_metal_hybrid_hot_slots(hybrid_hot_raw.as_deref())
                 .map_err(BackendError::InvalidModelMetadata)?;
+            let hybrid_hot_profile_raw =
+                std::env::var(GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER_ENV).ok();
+            let hybrid_hot_profile_override = parse_ghost_metal_hybrid_hot_profile(
+                hybrid_hot_profile_raw.as_deref(),
+            )
+            .map_err(BackendError::InvalidModelMetadata)?;
             if file_mapped_raw.is_some() && !file_mapped_experts {
                 return Err(BackendError::InvalidModelMetadata(format!(
                     "{GHOST_METAL_FILE_MAPPED_EXPERTS_ENV} is an exact opt-in and must be 1 when present"
@@ -9023,6 +9154,15 @@ impl Gemma4Runtime {
                     GHOST_METAL_HYBRID_HOT_SLOTS,
                 )));
             }
+            if hybrid_hot_profile_override.is_some() && hybrid_hot_slots.is_none() {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "{GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER_ENV} requires {GHOST_METAL_HYBRID_HOT_SLOTS_ENV}={GHOST_METAL_HYBRID_HOT_SLOTS}"
+                )));
+            }
+            let hybrid_hot_slots_per_layer = hybrid_hot_slots.map(|_| {
+                hybrid_hot_profile_override
+                    .unwrap_or_else(ghost_metal_uniform_hybrid_hot_profile)
+            });
             if hybrid_hot_slots.is_some()
                 && std::env::var("CAMELID_GEMMA4_SLOT_PIN").as_deref() != Ok("0")
             {
@@ -9179,6 +9319,9 @@ impl Gemma4Runtime {
                             block_count,
                             fused_fast,
                             &cache.file,
+                            hybrid_hot_slots_per_layer
+                                .as_deref()
+                                .expect("hybrid profile is present when hybrid is selected"),
                         )?
                     } else {
                         GhostMetalExpertRuntime::new_file_mapped(
@@ -9211,6 +9354,14 @@ impl Gemma4Runtime {
                         runtime.logical_slot_count() as u64;
                     observer.ledger.expert_slot_count = runtime.resident_slot_count() as u64;
                     observer.ledger.expert_slot_capacity_bytes = runtime.resident_bytes() as u64;
+                    observer.ledger.expert_anonymous_slots_per_layer = runtime
+                        .anonymous_slots_per_layer_receipt()
+                        .ok_or_else(|| {
+                            BackendError::InvalidModelMetadata(
+                                "observed Ghost load could not receipt exact per-layer anonymous capacity"
+                                    .into(),
+                            )
+                        })?;
                     observer.ledger.expert_file_mapped_slot_count = runtime
                         .layers
                         .iter()
@@ -9334,6 +9485,9 @@ impl Gemma4Runtime {
                                 block_count,
                                 fused_fast,
                                 &cache.file,
+                                hybrid_hot_slots_per_layer
+                                    .as_deref()
+                                    .expect("hybrid profile is present when hybrid is selected"),
                             )?
                         } else {
                             GhostMetalExpertRuntime::new_file_mapped(
@@ -21012,6 +21166,33 @@ mod mtp_target_seam_tests {
     }
 
     #[test]
+    fn hybrid_telemetry_preserves_real_per_layer_hot_capacities() {
+        let profile = [
+            39u64, 40, 33, 30, 30, 31, 31, 30, 34, 30, 26, 28, 30, 31, 28, 37, 31, 30,
+            31, 32, 31, 32, 30, 31, 32, 35, 32, 34, 34, 37,
+        ];
+        let mut snapshot = exact_hybrid_snapshot(10, None, 0, 0);
+        for (layer, &slots) in snapshot.per_layer.iter_mut().zip(&profile) {
+            layer.anonymous_slot_capacity = slots;
+            layer.anonymous_slot_capacity_bytes = slots * HYBRID_TELEMETRY_STRIDE_BYTES;
+            layer.physical_base_slot_budget = slots;
+            layer.physical_base_slot_budget_bytes = slots * HYBRID_TELEMETRY_STRIDE_BYTES;
+        }
+        let geometry = exact_hybrid_telemetry_geometry(&snapshot)
+            .expect("budget-neutral uneven profile remains exact hybrid geometry");
+        assert_eq!(
+            geometry
+                .per_layer
+                .iter()
+                .map(|layer| layer.anonymous_hot_capacity_slots)
+                .collect::<Vec<_>>(),
+            profile.to_vec()
+        );
+        assert_eq!(geometry.anonymous_hot_capacity_slots, 960);
+        assert_eq!(geometry.anonymous_hot_capacity_bytes, 3_224_371_200);
+    }
+
+    #[test]
     fn hybrid_telemetry_k1_reconciles_forwarded_and_terminal_tokens() {
         let before = exact_hybrid_snapshot(20, None, 0, 0);
         let mut collector =
@@ -22936,6 +23117,77 @@ mod ghost_moe_wire_tests {
                 "hybrid budget {invalid:?} must fail closed"
             );
         }
+    }
+
+    #[test]
+    fn metal_hybrid_per_layer_profile_is_canonical_bounded_and_budget_neutral() {
+        let profile = [
+            39, 40, 33, 30, 30, 31, 31, 30, 34, 30, 26, 28, 30, 31, 28, 37, 31, 30, 31,
+            32, 31, 32, 30, 31, 32, 35, 32, 34, 34, 37,
+        ];
+        let encoded = profile
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(
+            parse_ghost_metal_hybrid_hot_profile(None).unwrap(),
+            None,
+            "absence preserves uniform Hot32"
+        );
+        assert_eq!(
+            parse_ghost_metal_hybrid_hot_profile(Some(&encoded)).unwrap(),
+            Some(profile.to_vec())
+        );
+        assert_eq!(profile.iter().sum::<usize>(), 30 * 32);
+
+        let invalid = [
+            profile[..29]
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            encoded.replacen("39", "7", 1),
+            encoded.replacen("39", "65", 1),
+            encoded.replacen("39", "38", 1),
+            encoded.replacen("39", "40", 1),
+            encoded.replacen("39", "039", 1),
+            encoded.replacen("39", " 39", 1),
+        ];
+        for invalid in invalid {
+            assert!(
+                parse_ghost_metal_hybrid_hot_profile(Some(&invalid)).is_err(),
+                "invalid profile must fail closed: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn metal_hybrid_profile_represents_observed_uneven_k8_union_better_than_uniform32() {
+        // Per-layer maxima captured by the V5 K1+K7 diagnostic receipt. The
+        // telemetry-derived profile redistributes the same 960-record budget
+        // in proportion to the full measured request's per-layer uniqueness.
+        let observed = [
+            34, 41, 30, 27, 25, 23, 25, 26, 25, 25, 26, 20, 25, 28, 24, 23, 22, 23, 24,
+            25, 27, 27, 27, 30, 32, 39, 32, 31, 32, 31,
+        ];
+        let uniform = [32usize; 30];
+        let profiled = [
+            39, 40, 33, 30, 30, 31, 31, 30, 34, 30, 26, 28, 30, 31, 28, 37, 31, 30, 31,
+            32, 31, 32, 30, 31, 32, 35, 32, 34, 34, 37,
+        ];
+        let represented = |capacity: &[usize; 30]| {
+            capacity
+                .iter()
+                .zip(observed)
+                .map(|(&slots, demand)| slots.min(demand))
+                .sum::<usize>()
+        };
+        assert_eq!(uniform.iter().sum::<usize>(), 960);
+        assert_eq!(profiled.iter().sum::<usize>(), 960);
+        assert_eq!(represented(&uniform), 811);
+        assert_eq!(represented(&profiled), 824);
+        assert!(represented(&profiled) > represented(&uniform));
     }
 
     #[test]

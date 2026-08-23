@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed analyzer for the 32-hot/mapped-cold Gemma 4 receipt ladder."""
+"""Fail-closed analyzer for fixed-budget hot/mapped-cold Gemma 4 receipts."""
 
 from __future__ import annotations
 
@@ -18,6 +18,16 @@ GIB = 1024**3
 LAYERS = 30
 CANONICAL_PER_LAYER = 128
 HOT_PER_LAYER = 32
+UNIFORM_HOT_PROFILE = (HOT_PER_LAYER,) * LAYERS
+V5_HOT_PROFILE = (
+    39, 40, 33, 30, 30, 31, 31, 30, 34, 30,
+    26, 28, 30, 31, 28, 37, 31, 30, 31, 32,
+    31, 32, 30, 31, 32, 35, 32, 34, 34, 37,
+)
+PROFILE_SELECTOR_ENV = "CAMELID_HYBRID_RESIDENCY_PROFILE"
+PROFILE_SELECTOR_V5 = "v5-k8-max-960"
+HOT_PROFILE_ENV = "CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER"
+V5_HOT_PROFILE_ENCODED = ",".join(str(slots) for slots in V5_HOT_PROFILE)
 CANONICAL_TOTAL = LAYERS * CANONICAL_PER_LAYER
 HOT_TOTAL = LAYERS * HOT_PER_LAYER
 SLOT_STRIDE_BYTES = 3_358_720
@@ -71,6 +81,16 @@ COMMON_ENVIRONMENT = {
 STARTUP_PATTERN = re.compile(
     r"HYBRID ACTIVE: .*FILE_MAPPED_EXPERTS=1 .*HYBRID_HOT_SLOTS=32, "
     r"layers=30 canonical_addressable=128/layer physical_hot=32/layer "
+    r"hot_capacity_bytes=3224371200 mapped_cold_span_bytes=12897484800 "
+    r"overflow=0 victim=0 slot_pin=off prediction=off"
+)
+PROFILED_STARTUP_PATTERN = re.compile(
+    r"HYBRID ACTIVE: .*FILE_MAPPED_EXPERTS=1 .*HYBRID_HOT_SLOTS=32 "
+    + re.escape(HOT_PROFILE_ENV)
+    + r"="
+    + re.escape(V5_HOT_PROFILE_ENCODED)
+    + r", layers=30 canonical_addressable=128/layer "
+    r"physical_hot=per-layer-profile hot_capacity_slots=960 "
     r"hot_capacity_bytes=3224371200 mapped_cold_span_bytes=12897484800 "
     r"overflow=0 victim=0 slot_pin=off prediction=off"
 )
@@ -170,7 +190,14 @@ def _last(events: Iterable[dict[str, Any]], name: str) -> dict[str, Any]:
     return matches[-1]
 
 
-def validate_environment(environment: dict[str, Any], lane: str) -> None:
+def validate_environment(
+    environment: dict[str, Any],
+    lane: str,
+    hot_profile: tuple[int, ...] = UNIFORM_HOT_PROFILE,
+    *,
+    include_selector: bool = True,
+    require_assistant: bool = True,
+) -> None:
     expected = dict(COMMON_ENVIRONMENT)
     expected.update(
         {
@@ -180,6 +207,13 @@ def validate_environment(environment: dict[str, Any], lane: str) -> None:
     )
     if lane == "k1":
         expected["CAMELID_GEMMA4_CHAINED_K1"] = "1"
+    profiled = hot_profile == V5_HOT_PROFILE
+    if profiled:
+        expected[HOT_PROFILE_ENV] = V5_HOT_PROFILE_ENCODED
+        if include_selector:
+            expected[PROFILE_SELECTOR_ENV] = PROFILE_SELECTOR_V5
+    elif hot_profile != UNIFORM_HOT_PROFILE:
+        raise ReceiptError("environment validator received an unadmitted hot profile")
     for key, expected_value in expected.items():
         if environment.get(key) != expected_value:
             raise ReceiptError(
@@ -188,17 +222,23 @@ def validate_environment(environment: dict[str, Any], lane: str) -> None:
     present_forbidden = sorted(FORBIDDEN_ENVIRONMENT.intersection(environment))
     if present_forbidden:
         raise ReceiptError(f"forbidden environment keys present: {present_forbidden}")
+    for key in (HOT_PROFILE_ENV, PROFILE_SELECTOR_ENV):
+        if key not in expected and key in environment:
+            raise ReceiptError(f"uniform Hot32 environment unexpectedly contains {key}")
     if lane == "k1" and "CAMELID_GEMMA4_MTP_ASSISTANT_PATH" in environment:
         raise ReceiptError("K1 lane unexpectedly received an assistant path")
     if lane != "k1" and "CAMELID_GEMMA4_CHAINED_K1" in environment:
         raise ReceiptError(f"{lane} lane unexpectedly enabled chained K1")
-    if lane != "k1" and not str(
+    if lane != "k1" and require_assistant and not str(
         environment.get("CAMELID_GEMMA4_MTP_ASSISTANT_PATH", "")
     ).startswith("/"):
         raise ReceiptError(f"{lane} lane has no absolute assistant path")
 
 
-def validate_effective_load_environment(environment: dict[str, Any]) -> None:
+def validate_effective_load_environment(
+    environment: dict[str, Any],
+    hot_profile: tuple[int, ...] = UNIFORM_HOT_PROFILE,
+) -> None:
     """Validate the target process after the load-only harness scrubs tuning vars.
 
     The watchdog receipts the complete outer runner environment.  The harness
@@ -206,29 +246,22 @@ def validate_effective_load_environment(environment: dict[str, Any]) -> None:
     so the effective target receipt has a smaller, separately frozen contract.
     """
 
-    expected = dict(COMMON_ENVIRONMENT)
-    expected.update(
-        {
-            "CAMELID_GEMMA4_SPEC_CHUNK_MAX": "8",
-            "CAMELID_GEMMA4_SPEC_DRAFT_TOKENS": "8",
-        }
+    validate_environment(
+        environment,
+        "k8",
+        hot_profile,
+        include_selector=False,
+        require_assistant=False,
     )
-    for key, expected_value in expected.items():
-        if environment.get(key) != expected_value:
-            raise ReceiptError(
-                "effective load-only environment "
-                f"{key}={environment.get(key)!r}, expected {expected_value!r}"
-            )
-    present_forbidden = sorted(FORBIDDEN_ENVIRONMENT.intersection(environment))
-    if present_forbidden:
-        raise ReceiptError(
-            f"effective load-only environment has forbidden keys: {present_forbidden}"
-        )
     if "CAMELID_GEMMA4_MTP_ASSISTANT_PATH" in environment:
         raise ReceiptError("effective load-only target unexpectedly received an assistant")
 
 
-def validate_watchdog(path: Path, lane: str) -> dict[str, Any]:
+def validate_watchdog(
+    path: Path,
+    lane: str,
+    hot_profile: tuple[int, ...] = UNIFORM_HOT_PROFILE,
+) -> dict[str, Any]:
     events = read_jsonl(path)
     if any(event.get("schema_version") != 3 for event in events):
         raise ReceiptError("hybrid receipts require watchdog schema version 3 throughout")
@@ -377,7 +410,7 @@ def validate_watchdog(path: Path, lane: str) -> dict[str, Any]:
     environment = started.get("experiment_environment")
     if not isinstance(environment, dict):
         raise ReceiptError("watchdog child_started event has no environment receipt")
-    validate_environment(environment, lane)
+    validate_environment(environment, lane, hot_profile)
     return final
 
 
@@ -423,7 +456,7 @@ def validate_request_identity(
 
 def validate_auxiliary_receipts(
     lane_dir: Path, stage: str, lane: str, expected_tokens: int
-) -> None:
+) -> tuple[int, ...]:
     intent = read_json(lane_dir / "intent.json")
     if (
         intent.get("schema_version") != 1
@@ -452,6 +485,17 @@ def validate_auxiliary_receipts(
         profile.get(key) != value for key, value in expected_profile.items()
     ):
         raise ReceiptError("intent does not bind the exact hybrid profile")
+    residency_profile = profile.get("residency_profile")
+    per_layer = profile.get("hybrid_hot_slots_per_layer")
+    if residency_profile is None and per_layer is None:
+        hot_profile = UNIFORM_HOT_PROFILE
+    elif (
+        residency_profile == PROFILE_SELECTOR_V5
+        and per_layer == list(V5_HOT_PROFILE)
+    ):
+        hot_profile = V5_HOT_PROFILE
+    else:
+        raise ReceiptError("intent contains an unadmitted per-layer residency profile")
     executable = intent.get("executable")
     tooling = intent.get("tooling")
     integration = intent.get("integration_contract")
@@ -474,14 +518,24 @@ def validate_auxiliary_receipts(
     port = read_json(lane_dir / "port-clear.json")
     if port != {"schema_version": 1, "port": 8189, "clear": True}:
         raise ReceiptError("lane does not contain the exact port-clear receipt")
+    return hot_profile
 
 
-def validate_startup_log(path: Path, lane: str) -> None:
+def validate_startup_log(
+    path: Path,
+    lane: str,
+    hot_profile: tuple[int, ...] = UNIFORM_HOT_PROFILE,
+) -> None:
     try:
         log = path.read_text(encoding="utf-8", errors="replace")
     except OSError as error:
         raise ReceiptError(f"read server log {path}: {error}") from error
-    if len(STARTUP_PATTERN.findall(log)) != 1:
+    startup_pattern = (
+        PROFILED_STARTUP_PATTERN if hot_profile == V5_HOT_PROFILE else STARTUP_PATTERN
+    )
+    if hot_profile not in (UNIFORM_HOT_PROFILE, V5_HOT_PROFILE):
+        raise ReceiptError("startup validator received an unadmitted hot profile")
+    if len(startup_pattern.findall(log)) != 1:
         raise ReceiptError("server log must contain one exact HYBRID ACTIVE admission line")
     if len(FILE_PAGER_PATTERN.findall(log)) != 1:
         raise ReceiptError("server log must contain one exact clean file-pager line")
@@ -525,7 +579,12 @@ def validate_response(path: Path, expected_tokens: int) -> dict[str, Any]:
     return response
 
 
-def _geometry(telemetry: dict[str, Any]) -> None:
+def _geometry(
+    telemetry: dict[str, Any],
+    hot_profile: tuple[int, ...] = UNIFORM_HOT_PROFILE,
+) -> None:
+    if hot_profile not in (UNIFORM_HOT_PROFILE, V5_HOT_PROFILE):
+        raise ReceiptError("geometry validator received an unadmitted hot profile")
     geometry = telemetry.get("geometry")
     expected = {
         "layers": LAYERS,
@@ -554,17 +613,19 @@ def _geometry(telemetry: dict[str, Any]) -> None:
     per_layer = geometry.get("per_layer")
     if not isinstance(per_layer, list) or len(per_layer) != LAYERS:
         raise ReceiptError("hybrid geometry must contain exactly 30 layer records")
-    layer_expected = {
-        "logical_addressable_slots": CANONICAL_PER_LAYER,
-        "anonymous_hot_capacity_slots": HOT_PER_LAYER,
-        "file_mapped_addressable_slots": CANONICAL_PER_LAYER,
-        "file_mapped_address_span_bytes": MAPPED_COLD_SPAN_BYTES_PER_LAYER,
-        "overflow_slots": 0,
-        "victim_slots": 0,
-    }
     for layer_index, layer in enumerate(per_layer):
         if not isinstance(layer, dict) or layer.get("layer") != layer_index:
             raise ReceiptError(f"hybrid geometry layer {layer_index} is absent or reordered")
+        layer_slots = hot_profile[layer_index]
+        layer_expected = {
+            "logical_addressable_slots": CANONICAL_PER_LAYER,
+            "anonymous_hot_capacity_slots": layer_slots,
+            "anonymous_hot_capacity_bytes": layer_slots * SLOT_STRIDE_BYTES,
+            "file_mapped_addressable_slots": CANONICAL_PER_LAYER,
+            "file_mapped_address_span_bytes": MAPPED_COLD_SPAN_BYTES_PER_LAYER,
+            "overflow_slots": 0,
+            "victim_slots": 0,
+        }
         drift = {
             key: {"actual": layer.get(key), "expected": value}
             for key, value in layer_expected.items()
@@ -579,6 +640,7 @@ def validate_hybrid_telemetry(
     lane: str,
     expected_tokens: int | None = None,
     expected_token_ids: list[int] | None = None,
+    hot_profile: tuple[int, ...] = UNIFORM_HOT_PROFILE,
 ) -> dict[str, Any]:
     if lane not in ("k1", "k8"):
         raise ReceiptError(f"unknown hybrid lane {lane!r}")
@@ -594,7 +656,7 @@ def validate_hybrid_telemetry(
         or route_interval.get("scope") != "measured_request_prefill_plus_generation"
     ):
         raise ReceiptError("hybrid route interval does not cover measured prefill+generation")
-    _geometry(telemetry)
+    _geometry(telemetry, hot_profile)
     rounds = telemetry.get("rounds")
     if not isinstance(rounds, list) or not rounds:
         raise ReceiptError("hybrid telemetry contains no completed rounds")
@@ -750,7 +812,7 @@ def validate_hybrid_telemetry(
                 raise ReceiptError(
                     f"round {round_index} layer {layer_index} is outside 8..K×8"
                 )
-            if unique > CANONICAL_PER_LAYER or hot > HOT_PER_LAYER:
+            if unique > CANONICAL_PER_LAYER or hot > hot_profile[layer_index]:
                 raise ReceiptError(
                     f"round {round_index} layer {layer_index} exceeds hybrid geometry"
                 )
@@ -900,9 +962,9 @@ def _load_hybrid_telemetry(response: dict[str, Any]) -> dict[str, Any]:
 
 
 def validate_load_only(lane_dir: Path) -> dict[str, Any]:
-    validate_auxiliary_receipts(lane_dir, "load-only", "load-only", 0)
-    validate_watchdog(lane_dir / "watchdog.jsonl", "load-only")
-    validate_startup_log(lane_dir / "child.log", "load-only")
+    hot_profile = validate_auxiliary_receipts(lane_dir, "load-only", "load-only", 0)
+    validate_watchdog(lane_dir / "watchdog.jsonl", "load-only", hot_profile)
+    validate_startup_log(lane_dir / "child.log", "load-only", hot_profile)
     report = read_json(lane_dir / "load-only-report.json")
     if report.get("schema_version") != 4:
         raise ReceiptError("hybrid load-only report schema_version must be 4")
@@ -964,6 +1026,13 @@ def validate_load_only(lane_dir: Path) -> dict[str, Any]:
         "touched_prewarm_records": 0,
         "touched_prewarm_bytes": 0,
     }
+    if hot_profile == V5_HOT_PROFILE:
+        expected["expert_anonymous_slots_per_layer"] = list(hot_profile)
+    elif target.get("expert_anonymous_slots_per_layer") not in (
+        None,
+        list(UNIFORM_HOT_PROFILE),
+    ):
+        raise ReceiptError("uniform load-only ledger has a non-uniform anonymous profile")
     drift = {
         key: {"actual": target.get(key), "expected": value}
         for key, value in expected.items()
@@ -985,7 +1054,7 @@ def validate_load_only(lane_dir: Path) -> dict[str, Any]:
     effective = report.get("target_runtime", {}).get("environment")
     if not isinstance(effective, dict):
         raise ReceiptError("load-only report has no effective target environment")
-    validate_effective_load_environment(effective)
+    validate_effective_load_environment(effective, hot_profile)
     return {
         "pass": True,
         "stage": "load-only",
@@ -1011,9 +1080,9 @@ def validate_lane(lane_dir: Path, lane: str, expected_tokens: int) -> dict[str, 
         raise ReceiptError(
             f"unsupported lane/token contract: lane={lane!r} tokens={expected_tokens!r}"
         )
-    validate_auxiliary_receipts(lane_dir, stage, lane, expected_tokens)
-    final = validate_watchdog(lane_dir / "watchdog.jsonl", lane)
-    validate_startup_log(lane_dir / "server.log", lane)
+    hot_profile = validate_auxiliary_receipts(lane_dir, stage, lane, expected_tokens)
+    final = validate_watchdog(lane_dir / "watchdog.jsonl", lane, hot_profile)
+    validate_startup_log(lane_dir / "server.log", lane, hot_profile)
     response = validate_response(lane_dir / "response.json", expected_tokens)
     telemetry = _load_hybrid_telemetry(response)
     metrics = validate_hybrid_telemetry(
@@ -1021,6 +1090,7 @@ def validate_lane(lane_dir: Path, lane: str, expected_tokens: int) -> dict[str, 
         lane,
         expected_tokens,
         response["camelid"]["generated_token_ids"],
+        hot_profile,
     )
     return {
         "pass": True,

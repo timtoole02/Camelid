@@ -13,6 +13,8 @@ readonly MIN_BASELINE_HEADROOM_BYTES=8589934592
 readonly MIN_RUNTIME_HEADROOM_BYTES=2147483648
 readonly MAX_CHILD_FOOTPRINT_BYTES=8053063680
 readonly MAX_HOST_WIRED_BYTES=8589934592
+readonly HOT_PROFILE_ENV=CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER
+readonly V5_HOT_PROFILE=39,40,33,30,30,31,31,30,34,30,26,28,30,31,28,37,31,30,31,32,31,32,30,31,32,35,32,34,34,37
 
 usage() {
   print -u2 "usage: $0 load-only|smoke-k8|smoke-k1|promotion-k8|promotion-k1"
@@ -33,9 +35,22 @@ esac
 
 readonly script_dir=${0:A:h}
 readonly repo_root=$(/usr/bin/git -C "$script_dir" rev-parse --show-toplevel)
+readonly residency_profile=${CAMELID_HYBRID_RESIDENCY_PROFILE:-uniform-hot32}
+typeset default_receipt_root
+case "$residency_profile" in
+  uniform-hot32)
+    default_receipt_root="$repo_root/qa/perf/gemma4-mtp-bandwidth-2026-08-21/hybrid-hot32-mapped-cold-2026-08-22-v1"
+    ;;
+  v5-k8-max-960)
+    default_receipt_root="$repo_root/qa/perf/gemma4-mtp-bandwidth-2026-08-21/hybrid-profile-v5-k8-max-960-2026-08-23-v1"
+    ;;
+  *)
+    refuse "CAMELID_HYBRID_RESIDENCY_PROFILE must be uniform-hot32 or v5-k8-max-960"
+    ;;
+esac
 readonly watchdog="$repo_root/qa/evidence-bundles/gemma4-26b-mtp-assistant-oracle/run_load_only_watchdog.py"
 readonly analyzer="$script_dir/hybrid_receipt.py"
-readonly receipt_root=${CAMELID_HYBRID_RECEIPT_ROOT:-"$repo_root/qa/perf/gemma4-mtp-bandwidth-2026-08-21/hybrid-hot32-mapped-cold-2026-08-22-v1"}
+readonly receipt_root=${CAMELID_HYBRID_RECEIPT_ROOT:-"$default_receipt_root"}
 readonly server_binary=${CAMELID_HYBRID_SERVER_BINARY:-"$receipt_root/camelid"}
 readonly load_binary=${CAMELID_HYBRID_LOAD_BINARY:-"$receipt_root/gemma4-mtp-assistant-experiment"}
 readonly model=${CAMELID_HYBRID_MODEL:-/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf}
@@ -48,7 +63,8 @@ readonly telemetry_contract=${CAMELID_HYBRID_TELEMETRY_CONTRACT:-"$receipt_root/
 for key in \
   CAMELID_GEMMA4_GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER \
   CAMELID_GEMMA4_GHOST_METAL_SLOTS_PER_LAYER \
-  CAMELID_GEMMA4_GHOST_METAL_PER_LAYER_SLOTS; do
+  CAMELID_GEMMA4_GHOST_METAL_PER_LAYER_SLOTS \
+  CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER; do
   if (( ${+parameters[$key]} )); then
     refuse "legacy physical-slot environment key is inherited: $key"
   fi
@@ -292,6 +308,8 @@ readonly assistant_mtime=$(/usr/bin/stat -f '%m' "$assistant")
   --arg predecessor "$predecessor" \
   --arg predecessor_sha "$predecessor_sha" \
   --arg boot "$boot_identity" \
+  --arg residency_profile "$residency_profile" \
+  --arg hot_profile_csv "$V5_HOT_PROFILE" \
   --arg model "$model" --argjson model_size "$model_size" --argjson model_mtime "$model_mtime" \
   --arg cghost "$cghost" --argjson cghost_size "$cghost_size" --argjson cghost_mtime "$cghost_mtime" \
   --arg assistant "$assistant" --argjson assistant_size "$assistant_size" --argjson assistant_mtime "$assistant_mtime" \
@@ -318,14 +336,17 @@ readonly assistant_mtime=$(/usr/bin/stat -f '%m' "$assistant")
       cghost: {path: $cghost, size: $cghost_size, mtime_epoch: $cghost_mtime},
       assistant: {path: $assistant, size: $assistant_size, mtime_epoch: $assistant_mtime}
     },
-    profile: {
+    profile: ({
       demand_load_only: 1,
       file_mapped_experts: 1,
       hybrid_hot_slots: 32,
       slot_pin: 0,
       assistant_residency_policy: "observed_from_assistant_ledger",
       physical_slots_per_layer: "unset"
-    }
+    } + (if $residency_profile == "v5-k8-max-960" then {
+      residency_profile: $residency_profile,
+      hybrid_hot_slots_per_layer: ($hot_profile_csv | split(",") | map(tonumber))
+    } else {} end))
   }' > "$lane_dir/.intent.json.tmp"
 /bin/mv "$lane_dir/.intent.json.tmp" "$lane_dir/intent.json"
 
@@ -374,6 +395,12 @@ common_env=(
   CAMELID_GEMMA4_GHOST_METAL_TIMING=1
   CAMELID_GEMMA4_ROUTE_TRACE=1
 )
+if [[ "$residency_profile" == "v5-k8-max-960" ]]; then
+  common_env+=(
+    CAMELID_HYBRID_RESIDENCY_PROFILE=v5-k8-max-960
+    "$HOT_PROFILE_ENV=$V5_HOT_PROFILE"
+  )
+fi
 if [[ "$lane_kind" == "k1" ]]; then
   lane_env=(
     CAMELID_GEMMA4_SPEC_CHUNK_MAX=1

@@ -62,6 +62,16 @@ const NATIVE_ADMISSION_RUN_NONCE_ENV: &str = "CAMELID_GEMMA4_MTP_NATIVE_ADMISSIO
 const NATIVE_ADMISSION_TEST_EXE_ENV: &str = "CAMELID_GEMMA4_MTP_NATIVE_ADMISSION_TEST_EXE";
 const LOAD_ONLY_PROBE_ENABLE_ENV: &str = "CAMELID_GEMMA4_MTP_LOAD_ONLY_PROBE";
 const LOAD_ONLY_PROBE_REPORT_PATH_ENV: &str = "CAMELID_GEMMA4_MTP_LOAD_ONLY_REPORT_PATH";
+const HYBRID_RESIDENCY_PROFILE_SELECTOR_ENV: &str = "CAMELID_HYBRID_RESIDENCY_PROFILE";
+const HYBRID_RESIDENCY_PROFILE_V5: &str = "v5-k8-max-960";
+const HYBRID_HOT_PROFILE_ENV: &str =
+    "CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER";
+const HYBRID_HOT_PROFILE_V5_SLOTS: [u16; 30] = [
+    39, 40, 33, 30, 30, 31, 31, 30, 34, 30, 26, 28, 30, 31, 28, 37, 31, 30, 31, 32, 31,
+    32, 30, 31, 32, 35, 32, 34, 34, 37,
+];
+const HYBRID_HOT_PROFILE_V5_ENCODED: &str =
+    "39,40,33,30,30,31,31,30,34,30,26,28,30,31,28,37,31,30,31,32,31,32,30,31,32,35,32,34,34,37";
 const DEFAULT_TARGET_RUNTIME_PATH: &str =
     "/Users/timtoole/models/gemma4-mtp-pair/gemma-4-26B_q4_0-it.hot.gguf";
 const DEFAULT_TARGET_CGHOST_PATH: &str =
@@ -315,7 +325,16 @@ impl TargetRuntimeConfig {
                 "hybrid mapped-cold target profile requires a zero-byte host expert cache".into(),
             );
         }
-        let expected_environment = exact_target_environment();
+        let profiled = match self.environment.get(HYBRID_HOT_PROFILE_ENV) {
+            None => false,
+            Some(value) if value == HYBRID_HOT_PROFILE_V5_ENCODED => true,
+            Some(_) => {
+                return Err(format!(
+                    "target runtime setting {HYBRID_HOT_PROFILE_ENV} is not the exact admitted V5 profile"
+                ))
+            }
+        };
+        let expected_environment = exact_target_environment_with_profile(profiled);
         for (key, expected) in &expected_environment {
             if self.environment.get(key) != Some(expected) {
                 return Err(format!(
@@ -534,8 +553,8 @@ fn validate_lane_plans(plans: &[LaneExecutionPlan]) -> Result<(), String> {
     Ok(())
 }
 
-fn exact_target_environment() -> BTreeMap<String, String> {
-    [
+fn exact_target_environment_with_profile(profiled: bool) -> BTreeMap<String, String> {
+    let mut environment = [
         ("CAMELID_GHOST_ALLOW_LEGACY_SPARSE", "0"),
         ("CAMELID_GEMMA4_GHOST_METAL", "1"),
         ("CAMELID_GEMMA4_GHOST_METAL_SLOTS", "1"),
@@ -544,9 +563,10 @@ fn exact_target_environment() -> BTreeMap<String, String> {
         ("CAMELID_GEMMA4_GHOST_METAL_COMMON", "1"),
         ("CAMELID_GEMMA4_GHOST_METAL_CONTEXT", "1024"),
         ("CAMELID_GEMMA4_GHOST_METAL_HEAD_RESIDENT", "0"),
-        // Hybrid clean-pager profile: 32 pageable anonymous records cache the
-        // hot set while all 128 canonical IDs remain addressable through the
-        // retained read-only mapping. No legacy physical-prefix knob may
+        // Hybrid clean-pager profile: the fixed 960-record anonymous budget is
+        // uniform Hot32 unless the explicit V5 selector adds the validated
+        // per-layer profile. All 128 canonical IDs remain addressable through
+        // the retained read-only mapping. No legacy physical-prefix knob may
         // silently redefine either namespace.
         ("CAMELID_GEMMA4_GHOST_READ_THREADS", "8"),
         ("CAMELID_GEMMA4_GHOST_METAL_DEMAND_LOAD_ONLY", "1"),
@@ -582,7 +602,18 @@ fn exact_target_environment() -> BTreeMap<String, String> {
     ]
     .into_iter()
     .map(|(key, value)| (key.to_string(), value.to_string()))
-    .collect()
+    .collect::<BTreeMap<_, _>>();
+    if profiled {
+        environment.insert(
+            HYBRID_HOT_PROFILE_ENV.to_string(),
+            HYBRID_HOT_PROFILE_V5_ENCODED.to_string(),
+        );
+    }
+    environment
+}
+
+fn exact_target_environment() -> BTreeMap<String, String> {
+    exact_target_environment_with_profile(false)
 }
 
 fn target_runtime_config_from_environment() -> Result<TargetRuntimeConfig, String> {
@@ -607,11 +638,25 @@ fn target_runtime_config_from_environment() -> Result<TargetRuntimeConfig, Strin
         })
         .transpose()?
         .unwrap_or(DEFAULT_TARGET_CACHE_MIB);
+    let profiled = match std::env::var(HYBRID_RESIDENCY_PROFILE_SELECTOR_ENV) {
+        Err(std::env::VarError::NotPresent) => false,
+        Ok(value) if value == HYBRID_RESIDENCY_PROFILE_V5 => true,
+        Ok(value) => {
+            return Err(format!(
+                "{HYBRID_RESIDENCY_PROFILE_SELECTOR_ENV}={value:?} is not the exact admitted profile {HYBRID_RESIDENCY_PROFILE_V5:?}"
+            ))
+        }
+        Err(error) => {
+            return Err(format!(
+                "read {HYBRID_RESIDENCY_PROFILE_SELECTOR_ENV}: {error}"
+            ))
+        }
+    };
     let config = TargetRuntimeConfig {
         runtime_gguf_path: path(TARGET_RUNTIME_PATH_ENV, DEFAULT_TARGET_RUNTIME_PATH)?,
         cghost_path: path(TARGET_CGHOST_PATH_ENV, DEFAULT_TARGET_CGHOST_PATH)?,
         expert_cache_mib,
-        environment: exact_target_environment(),
+        environment: exact_target_environment_with_profile(profiled),
     };
     config.validate()?;
     Ok(config)
@@ -1938,6 +1983,8 @@ struct LoadOnlyTargetLedger {
     expert_logical_slot_count: u64,
     expert_slot_count: u64,
     expert_slot_capacity_bytes: u64,
+    #[serde(default)]
+    expert_anonymous_slots_per_layer: [u16; 30],
     expert_file_mapped_slot_count: u64,
     expert_file_mapped_address_span_bytes: u64,
     expert_table_directory_slot_count: u64,
@@ -2020,6 +2067,7 @@ impl From<camelid::gemma4_runtime::Gemma4GhostLoadAllocationLedger> for LoadOnly
             expert_logical_slot_count: value.expert_logical_slot_count,
             expert_slot_count: value.expert_slot_count,
             expert_slot_capacity_bytes: value.expert_slot_capacity_bytes,
+            expert_anonymous_slots_per_layer: value.expert_anonymous_slots_per_layer,
             expert_file_mapped_slot_count: value.expert_file_mapped_slot_count,
             expert_file_mapped_address_span_bytes: value
                 .expert_file_mapped_address_span_bytes,
@@ -2197,14 +2245,26 @@ fn load_only_hybrid_expert_capacity_ready(
     ledger: &camelid::gemma4_runtime::Gemma4GhostLoadAllocationLedger,
 ) -> bool {
     // Serialized Gemma 4 routed-record geometry: 3,345,408-byte payload
-    // rounded up to the existing 16 KiB slot boundary. The anonymous hot
-    // tier owns exactly 32 records/layer while the clean mapped tier keeps
-    // all 128 canonical expert IDs addressable.
+    // rounded up to the existing 16 KiB slot boundary. The anonymous hot tier
+    // owns the fixed 960-record Hot32 budget, either uniformly or through the
+    // exact receipted 30-layer profile; the clean mapped tier keeps all 128
+    // canonical expert IDs addressable.
     let stride = 3_358_720u64;
+    let profile_total = ledger
+        .expert_anonymous_slots_per_layer
+        .iter()
+        .map(|&slots| u64::from(slots))
+        .sum::<u64>();
+    let profile_bounded = ledger
+        .expert_anonymous_slots_per_layer
+        .iter()
+        .all(|&slots| (8..=64).contains(&slots));
     ledger.expert_slots_active
         && ledger.expert_layer_count == 30
         && ledger.expert_logical_slot_count == ledger.expert_layer_count.saturating_mul(128)
         && ledger.expert_slot_count == ledger.expert_layer_count.saturating_mul(32)
+        && profile_total == ledger.expert_slot_count
+        && profile_bounded
         && ledger.expert_slot_capacity_bytes == ledger.expert_slot_count.saturating_mul(stride)
         && ledger.expert_file_mapped_slot_count
             == ledger.expert_layer_count.saturating_mul(128)
@@ -3824,33 +3884,52 @@ fn validate_exact_target_hybrid_experts(
 ) -> Result<(), String> {
     const LAYERS: u64 = 30;
     const CANONICAL_SLOTS_PER_LAYER: u64 = 128;
-    const HOT_SLOTS_PER_LAYER: u64 = 32;
+    const HOT_SLOT_TOTAL: u64 = LAYERS * 32;
     const RECORD_BYTES: u64 = 3_345_408;
     const STRIDE_BYTES: u64 = 3_358_720;
+    let per_layer_hot_total = snapshot
+        .per_layer
+        .iter()
+        .try_fold(0u64, |sum, layer| {
+            sum.checked_add(layer.anonymous_slot_capacity)
+        });
     if snapshot.per_layer.len() != LAYERS as usize
+        || per_layer_hot_total != Some(HOT_SLOT_TOTAL)
         || snapshot.last_chained_unique_per_layer.len() != LAYERS as usize
         || snapshot.last_chained_hot_bound_per_layer.len() != LAYERS as usize
         || snapshot.last_chained_mapped_bound_per_layer.len() != LAYERS as usize
         || snapshot.per_layer.iter().any(|layer| {
             layer.base_slot_capacity != CANONICAL_SLOTS_PER_LAYER
-                || layer.physical_base_slot_budget != HOT_SLOTS_PER_LAYER
+                || !(8..=64).contains(&layer.anonymous_slot_capacity)
+                || layer.physical_base_slot_budget != layer.anonymous_slot_capacity
+                || layer.anonymous_slot_capacity_bytes
+                    != layer
+                        .anonymous_slot_capacity
+                        .saturating_mul(STRIDE_BYTES)
                 || layer.physical_base_slot_budget_bytes
-                    != HOT_SLOTS_PER_LAYER.saturating_mul(STRIDE_BYTES)
+                    != layer
+                        .physical_base_slot_budget
+                        .saturating_mul(STRIDE_BYTES)
                 || layer.file_mapped_addressable_slots != CANONICAL_SLOTS_PER_LAYER
                 || layer.file_mapped_address_span_bytes
                     != CANONICAL_SLOTS_PER_LAYER.saturating_mul(STRIDE_BYTES)
-                || layer.occupied_base_slots > HOT_SLOTS_PER_LAYER
+                || layer.occupied_base_slots > layer.physical_base_slot_budget
         })
     {
         return Err(
-            "target routed-expert receipt did not preserve 128 canonical / 32 anonymous-hot / 128 mapped-cold records per layer".into(),
+            "target routed-expert receipt did not preserve 128 canonical / bounded anonymous-hot / 128 mapped-cold records per layer".into(),
         );
     }
     if u64::from(snapshot.layer_count) != LAYERS
         || snapshot.slot_record_bytes != RECORD_BYTES
         || snapshot.slot_stride_bytes != STRIDE_BYTES
         || snapshot.base_slot_capacity != LAYERS.saturating_mul(CANONICAL_SLOTS_PER_LAYER)
-        || snapshot.physical_base_slot_budget != LAYERS.saturating_mul(HOT_SLOTS_PER_LAYER)
+        || snapshot.anonymous_slot_capacity != HOT_SLOT_TOTAL
+        || snapshot.anonymous_slot_capacity_bytes
+            != snapshot
+                .anonymous_slot_capacity
+                .saturating_mul(STRIDE_BYTES)
+        || snapshot.physical_base_slot_budget != HOT_SLOT_TOTAL
         || snapshot.file_mapped_addressable_slots
             != LAYERS.saturating_mul(CANONICAL_SLOTS_PER_LAYER)
         || snapshot.base_slot_capacity_bytes
@@ -7234,6 +7313,8 @@ mod pure_tests {
             .map(|layer_index| Gemma4RoutedExpertLayerResidencySnapshot {
                 layer_index: layer_index as u32,
                 base_slot_capacity: CANONICAL,
+                anonymous_slot_capacity: HOT,
+                anonymous_slot_capacity_bytes: HOT * STRIDE,
                 physical_base_slot_budget: HOT,
                 physical_base_slot_budget_bytes: HOT * STRIDE,
                 file_mapped_addressable_slots: CANONICAL,
@@ -7249,6 +7330,8 @@ mod pure_tests {
             slot_stride_bytes: STRIDE,
             base_slot_capacity: canonical_total,
             base_slot_capacity_bytes: canonical_total * STRIDE,
+            anonymous_slot_capacity: hot_total,
+            anonymous_slot_capacity_bytes: hot_total * STRIDE,
             physical_base_slot_budget: hot_total,
             physical_base_slot_budget_bytes: hot_total * STRIDE,
             file_mapped_addressable_slots: canonical_total,
@@ -7430,6 +7513,31 @@ mod pure_tests {
     }
 
     #[test]
+    fn exact_hybrid_receipt_accepts_budget_neutral_per_layer_profile() {
+        const STRIDE: u64 = 3_358_720;
+        let mut profiled = exact_hybrid_geometry_snapshot();
+        for (layer, &slots) in profiled
+            .per_layer
+            .iter_mut()
+            .zip(&HYBRID_HOT_PROFILE_V5_SLOTS)
+        {
+            let slots = u64::from(slots);
+            layer.anonymous_slot_capacity = slots;
+            layer.anonymous_slot_capacity_bytes = slots * STRIDE;
+            layer.physical_base_slot_budget = slots;
+            layer.physical_base_slot_budget_bytes = slots * STRIDE;
+        }
+        assert_eq!(
+            HYBRID_HOT_PROFILE_V5_SLOTS
+                .iter()
+                .map(|&slots| u64::from(slots))
+                .sum::<u64>(),
+            960
+        );
+        assert!(validate_exact_target_hybrid_experts(&profiled).is_ok());
+    }
+
+    #[test]
     fn hybrid_generation_transition_requires_hot_and_mapped_deltas() {
         let before = exact_hybrid_geometry_snapshot();
         let mut after = before.clone();
@@ -7469,6 +7577,7 @@ mod pure_tests {
             expert_logical_slot_count: LAYERS * CANONICAL,
             expert_slot_count: LAYERS * HOT,
             expert_slot_capacity_bytes: LAYERS * HOT * STRIDE,
+            expert_anonymous_slots_per_layer: [HOT as u16; LAYERS as usize],
             expert_file_mapped_slot_count: LAYERS * CANONICAL,
             expert_file_mapped_address_span_bytes: LAYERS * CANONICAL * STRIDE,
             expert_table_directory_slot_count: LAYERS * HOT,
@@ -7478,6 +7587,11 @@ mod pure_tests {
             ..Default::default()
         };
         assert!(load_only_hybrid_expert_capacity_ready(&ledger));
+        ledger.expert_anonymous_slots_per_layer = HYBRID_HOT_PROFILE_V5_SLOTS;
+        assert!(load_only_hybrid_expert_capacity_ready(&ledger));
+        ledger.expert_anonymous_slots_per_layer[0] -= 1;
+        assert!(!load_only_hybrid_expert_capacity_ready(&ledger));
+        ledger.expert_anonymous_slots_per_layer = [HOT as u16; LAYERS as usize];
 
         ledger.expert_file_mapped_slot_count -= 1;
         assert!(!load_only_hybrid_expert_capacity_ready(&ledger));
@@ -7615,6 +7729,7 @@ mod pure_tests {
             config.environment["CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS"],
             "32"
         );
+        assert!(!config.environment.contains_key(HYBRID_HOT_PROFILE_ENV));
         assert_eq!(config.environment["CAMELID_GEMMA4_SLOT_PIN"], "0");
         assert!(!config
             .environment
@@ -7648,6 +7763,26 @@ mod pure_tests {
                 .unwrap_err()
                 .contains("CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS"));
         }
+
+        let profiled = TargetRuntimeConfig {
+            runtime_gguf_path: "/runtime/target.gguf".into(),
+            cghost_path: "/runtime/target.cghost".into(),
+            expert_cache_mib: DEFAULT_TARGET_CACHE_MIB,
+            environment: exact_target_environment_with_profile(true),
+        };
+        assert!(profiled.validate().is_ok());
+        assert_eq!(
+            profiled.environment[HYBRID_HOT_PROFILE_ENV],
+            HYBRID_HOT_PROFILE_V5_ENCODED
+        );
+        let mut invalid_profile = profiled;
+        invalid_profile
+            .environment
+            .insert(HYBRID_HOT_PROFILE_ENV.into(), "32,32".into());
+        assert!(invalid_profile
+            .validate()
+            .unwrap_err()
+            .contains(HYBRID_HOT_PROFILE_ENV));
 
         for legacy_key in [
             "CAMELID_GEMMA4_GHOST_METAL_SLOTS_PER_LAYER",
