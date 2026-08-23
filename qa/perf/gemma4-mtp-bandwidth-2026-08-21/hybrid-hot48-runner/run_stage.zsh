@@ -63,32 +63,35 @@ for input in "$model" "$cghost" "$assistant"; do
   [[ -f "$input" ]] || refuse "missing required internal model input: $input"
 done
 
-typeset lane_kind expected_tokens lane_dir request predecessor executable contract
+typeset lane_kind expected_tokens lane_dir request expected_request_sha predecessor executable contract
 case "$stage" in
   load-only)
     lane_kind=load-only
     expected_tokens=0
     lane_dir="$receipt_root/01-load-only"
     request=""
+    expected_request_sha=""
     predecessor=""
     executable="$load_binary"
     contract="$load_contract"
     ;;
   smoke-k8)
     lane_kind=k8
-    expected_tokens=8
-    lane_dir="$receipt_root/02-smoke-8t/k8"
-    request="$script_dir/request-8.json"
+    expected_tokens=9
+    lane_dir="$receipt_root/02-smoke-9t/k8"
+    request="$script_dir/request-9.json"
+    expected_request_sha="a612ca079082b32a1cf80cd51f76d41ffe6f26cf22266089e148b9aed966a0d4"
     predecessor="$receipt_root/01-load-only/verdict.json"
     executable="$server_binary"
     contract="$telemetry_contract"
     ;;
   smoke-k1)
     lane_kind=k1
-    expected_tokens=8
-    lane_dir="$receipt_root/02-smoke-8t/k1"
-    request="$script_dir/request-8.json"
-    predecessor="$receipt_root/02-smoke-8t/k8/verdict.json"
+    expected_tokens=9
+    lane_dir="$receipt_root/02-smoke-9t/k1"
+    request="$script_dir/request-9.json"
+    expected_request_sha="a612ca079082b32a1cf80cd51f76d41ffe6f26cf22266089e148b9aed966a0d4"
+    predecessor="$receipt_root/02-smoke-9t/k8/verdict.json"
     executable="$server_binary"
     contract="$telemetry_contract"
     ;;
@@ -97,7 +100,8 @@ case "$stage" in
     expected_tokens=48
     lane_dir="$receipt_root/03-promotion-48t/k8"
     request="$script_dir/request-48.json"
-    predecessor="$receipt_root/02-smoke-8t/parity.json"
+    expected_request_sha="b2f1110079fc726699cc936a628a268a7ec5bf2076fa970899de39d4ea903939"
+    predecessor="$receipt_root/02-smoke-9t/parity.json"
     executable="$server_binary"
     contract="$telemetry_contract"
     [[ "${CAMELID_HYBRID_PROMOTION_ACK:-}" == "smoke-parity-reviewed" ]] || \
@@ -108,6 +112,7 @@ case "$stage" in
     expected_tokens=48
     lane_dir="$receipt_root/03-promotion-48t/k1"
     request="$script_dir/request-48.json"
+    expected_request_sha="b2f1110079fc726699cc936a628a268a7ec5bf2076fa970899de39d4ea903939"
     predecessor="$receipt_root/03-promotion-48t/k8/verdict.json"
     executable="$server_binary"
     contract="$telemetry_contract"
@@ -118,6 +123,21 @@ esac
   refuse "frozen executable is missing, non-regular, symlinked, or not executable: $executable"
 [[ -z "$request" || ( -f "$request" && ! -L "$request" ) ]] || \
   refuse "request fixture is missing or symlinked: $request"
+if [[ -n "$request" ]]; then
+  typeset source_request_sha
+  source_request_sha=$(/usr/bin/shasum -a 256 "$request" | /usr/bin/awk '{print $1}')
+  [[ "$source_request_sha" == "$expected_request_sha" ]] || \
+    refuse "request fixture bytes do not match the canonical stage request"
+  /usr/bin/jq -e --argjson tokens "$expected_tokens" '
+    .max_tokens == $tokens and
+    .temperature == 0 and
+    .top_k == 1 and
+    .seed == 0 and
+    .stream == false and
+    .camelid_receipt == true and
+    .camelid_enable_thinking == false
+  ' "$request" >/dev/null || refuse "request fixture does not match the stage token/receipt contract"
+fi
 
 typeset predecessor_sha=""
 if [[ -n "$predecessor" ]]; then
@@ -230,6 +250,16 @@ fi
   refuse "receipt lane already exists: $lane_dir" "$EX_RECEIPT_EXISTS"
 /bin/mkdir -m 700 "$lane_dir"
 
+typeset frozen_request="" request_sha=""
+if [[ -n "$request" ]]; then
+  frozen_request="$lane_dir/request.json"
+  /bin/cp "$request" "$frozen_request"
+  /bin/chmod 600 "$frozen_request"
+  [[ -f "$frozen_request" && ! -L "$frozen_request" ]] || \
+    refuse "failed to freeze request fixture as a regular file"
+  request_sha=$(/usr/bin/shasum -a 256 "$frozen_request" | /usr/bin/awk '{print $1}')
+fi
+
 readonly source_commit=$(/usr/bin/git -C "$repo_root" rev-parse HEAD)
 readonly runner_sha=$(/usr/bin/shasum -a 256 "$0" | /usr/bin/awk '{print $1}')
 readonly watchdog_sha=$(/usr/bin/shasum -a 256 "$watchdog" | /usr/bin/awk '{print $1}')
@@ -256,6 +286,9 @@ readonly assistant_mtime=$(/usr/bin/stat -f '%m' "$assistant")
   --arg analyzer_sha "$analyzer_sha" \
   --arg contract "$contract" \
   --arg contract_sha "$contract_sha" \
+  --arg request_source "$request" \
+  --arg request_frozen "$frozen_request" \
+  --arg request_sha "$request_sha" \
   --arg predecessor "$predecessor" \
   --arg predecessor_sha "$predecessor_sha" \
   --arg boot "$boot_identity" \
@@ -275,6 +308,7 @@ readonly assistant_mtime=$(/usr/bin/stat -f '%m' "$assistant")
     executable: {path: $executable, sha256: $executable_sha},
     tooling: {runner_sha256: $runner_sha, watchdog_sha256: $watchdog_sha, analyzer_sha256: $analyzer_sha},
     integration_contract: {path: $contract, sha256: $contract_sha},
+    request: {source_path: $request_source, frozen_path: $request_frozen, sha256: $request_sha},
     predecessor: {path: $predecessor, sha256: $predecessor_sha},
     boot_identity: $boot,
     disk: {available_kib: $disk_available_kib, used_percent: $disk_used_percent},
@@ -305,6 +339,9 @@ readonly assistant_mtime=$(/usr/bin/stat -f '%m' "$assistant")
   /usr/bin/vm_stat
   /bin/df -h /System/Volumes/Data
   /usr/bin/shasum -a 256 "$executable" "$0" "$watchdog" "$analyzer" "$contract"
+  if [[ -n "$frozen_request" ]]; then
+    /usr/bin/shasum -a 256 "$frozen_request"
+  fi
 } > "$lane_dir/.baseline.txt.tmp"
 /bin/mv "$lane_dir/.baseline.txt.tmp" "$lane_dir/baseline.txt"
 
@@ -459,7 +496,7 @@ print -r -- "$health" > "$lane_dir/.health.json.tmp"
 
 /usr/bin/curl -fsS --max-time 1800 \
   -H 'Content-Type: application/json' \
-  --data-binary "@$request" \
+  --data-binary "@$frozen_request" \
   "http://127.0.0.1:$PORT/v1/chat/completions" > "$lane_dir/response.tmp"
 /usr/bin/jq -e --argjson tokens "$expected_tokens" '
   .usage.completion_tokens == $tokens and
@@ -490,7 +527,7 @@ if [[ "$stage" == "smoke-k1" ]]; then
   /usr/bin/python3 "$analyzer" parity \
     --receipt-root "$receipt_root" \
     --stage smoke \
-    --output "$receipt_root/02-smoke-8t/parity.json"
+    --output "$receipt_root/02-smoke-9t/parity.json"
 elif [[ "$stage" == "promotion-k1" ]]; then
   /usr/bin/python3 "$analyzer" parity \
     --receipt-root "$receipt_root" \

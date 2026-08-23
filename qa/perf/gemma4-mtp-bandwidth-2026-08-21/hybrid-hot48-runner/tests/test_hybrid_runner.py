@@ -90,7 +90,17 @@ def hybrid_telemetry(unique: int = 64) -> dict[str, object]:
         }
         for layer in range(receipt.LAYERS)
     ]
-    hot_total = hot * receipt.LAYERS
+    bootstrap_layer = [
+        {
+            "layer_index": layer,
+            "active_unique": 8,
+            "hot_bound": 8,
+            "mapped_bound": 0,
+            "bound_records": 8,
+        }
+        for layer in range(receipt.LAYERS)
+    ]
+    hot_total = (8 + hot) * receipt.LAYERS
     cold_total = cold * receipt.LAYERS
     return {
         "schema_version": 1,
@@ -114,12 +124,47 @@ def hybrid_telemetry(unique: int = 64) -> dict[str, object]:
         },
         "rounds": [
             {
+                "round_index": 0,
+                "chained_round_sequence": 10,
+                "prefix_tokens_before": 100,
+                "bootstrap": True,
+                "remaining_budget_before": 9,
+                "k": 1,
+                "requested_k": 1,
+                "proposed_k": 0,
+                "verifier_k": 1,
+                "budget_truncated": False,
+                "success": True,
+                "accepted_drafts": 0,
+                "useful_accepted_drafts": 0,
+                "committed_tokens": [10],
+                "assistant_exposed_ms": 0.0,
+                "assistant_gpu_ms": 0.0,
+                "receipt_round_wall_ms": 10.0,
+                "selected_dropped": 0,
+                "missing_failclose": 0,
+                "slot_capacity_overflow": 0,
+                "overflow_experts": 0,
+                "per_layer": bootstrap_layer,
+            },
+            {
+                "round_index": 1,
+                "chained_round_sequence": 11,
+                "prefix_tokens_before": 101,
+                "bootstrap": False,
+                "remaining_budget_before": 8,
                 "k": 8,
                 "requested_k": 8,
                 "proposed_k": 7,
                 "verifier_k": 8,
                 "budget_truncated": False,
                 "success": True,
+                "accepted_drafts": 7,
+                "useful_accepted_drafts": 7,
+                "committed_tokens": list(range(11, 19)),
+                "assistant_exposed_ms": 20.0,
+                "assistant_gpu_ms": 15.0,
+                "receipt_round_wall_ms": 290.0,
                 "selected_dropped": 0,
                 "missing_failclose": 0,
                 "slot_capacity_overflow": 0,
@@ -143,8 +188,12 @@ def hybrid_telemetry(unique: int = 64) -> dict[str, object]:
             "chained_promotion_read_bytes": receipt.RECORD_PAYLOAD_BYTES,
         },
         "metrics": {
-            "proposed_drafts": 47,
-            "accepted_drafts": 42,
+            "forwarded_decode_tokens": 9,
+            "terminal_unforwarded_tokens": 0,
+            "response_completion_tokens": 9,
+            "receipt_round_wall_ms": 300.0,
+            "proposed_drafts": 7,
+            "accepted_drafts": 7,
             "decode_tokens_per_second": 30.0,
             "full_round_zero_accepts": 0,
             "max_full_assistant_exposed_ms": 20.0,
@@ -256,7 +305,6 @@ def startup_log(k8: bool = False) -> str:
         lines.extend(
             [
                 "lm_head=q4_0",
-                "[metal chained ledger] start_pos=1 K=8 ok=true",
             ]
         )
     return "\n".join(lines)
@@ -486,7 +534,7 @@ class ReceiptTests(unittest.TestCase):
         for unique in (33, 64):
             with self.subTest(unique=unique):
                 metrics = receipt.validate_hybrid_telemetry(
-                    hybrid_telemetry(unique), "k8"
+                    hybrid_telemetry(unique), "k8", 9
                 )
                 self.assertEqual(metrics["decode_tokens_per_second"], 30.0)
 
@@ -494,13 +542,90 @@ class ReceiptTests(unittest.TestCase):
         telemetry = hybrid_telemetry(64)
         telemetry["rounds"][0]["selected_dropped"] = 1
         with self.assertRaises(receipt.ReceiptError):
-            receipt.validate_hybrid_telemetry(telemetry, "k8")
+            receipt.validate_hybrid_telemetry(telemetry, "k8", 9)
+
+        telemetry = hybrid_telemetry(64)
+        telemetry["rounds"][1]["per_layer"][0].update(
+            {
+                "active_unique": 1,
+                "hot_bound": 0,
+                "mapped_bound": 1,
+                "bound_records": 1,
+            }
+        )
+        with self.assertRaisesRegex(receipt.ReceiptError, "outside 8..K×8"):
+            receipt.validate_hybrid_telemetry(telemetry, "k8", 9)
+
+    def test_nine_token_smoke_proves_bootstrap_plus_full_k8(self) -> None:
+        receipt.validate_hybrid_telemetry(
+            hybrid_telemetry(64), "k8", 9, list(range(10, 19))
+        )
+
+        with self.assertRaisesRegex(receipt.ReceiptError, "API response"):
+            receipt.validate_hybrid_telemetry(
+                hybrid_telemetry(64), "k8", 9, list(range(10, 18)) + [999]
+            )
+
+        actual_eight_token_shape = hybrid_telemetry(56)
+        bootstrap = actual_eight_token_shape["rounds"][0]
+        bootstrap["remaining_budget_before"] = 8
+        truncated = actual_eight_token_shape["rounds"][1]
+        truncated.update(
+            {
+                "remaining_budget_before": 7,
+                "k": 7,
+                "proposed_k": 6,
+                "verifier_k": 7,
+                "budget_truncated": True,
+                "accepted_drafts": 6,
+                "useful_accepted_drafts": 6,
+                "committed_tokens": list(range(11, 18)),
+                "assistant_exposed_ms": 65.668,
+                "assistant_gpu_ms": 40.727,
+                "receipt_round_wall_ms": 290.0,
+            }
+        )
+        actual_eight_token_shape["metrics"].update(
+            {
+                "forwarded_decode_tokens": 8,
+                "response_completion_tokens": 8,
+                "proposed_drafts": 6,
+                "accepted_drafts": 6,
+                "decode_tokens_per_second": 8 / 0.3,
+                "max_full_assistant_exposed_ms": 0.0,
+            }
+        )
+        with self.assertRaisesRegex(receipt.ReceiptError, "no K=8 round"):
+            receipt.validate_hybrid_telemetry(actual_eight_token_shape, "k8", 8)
+
+    def test_k8_bootstrap_is_mandatory_exact_and_first(self) -> None:
+        cases = (
+            ("missing", lambda telemetry: telemetry["rounds"].pop(0)),
+            (
+                "reordered",
+                lambda telemetry: telemetry["rounds"].reverse(),
+            ),
+            (
+                "assistant exposure",
+                lambda telemetry: telemetry["rounds"][0].__setitem__(
+                    "assistant_exposed_ms", 0.01
+                ),
+            ),
+        )
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                telemetry = hybrid_telemetry(64)
+                mutate(telemetry)
+                with self.assertRaises(receipt.ReceiptError):
+                    receipt.validate_hybrid_telemetry(telemetry, "k8", 9)
 
     def test_k1_rounds_are_zero_draft_and_reconcile_response_tokens(self) -> None:
         telemetry = hybrid_telemetry(8)
         round_receipt = telemetry["rounds"][0]
         round_receipt.update(
             {
+                "bootstrap": False,
+                "remaining_budget_before": 2,
                 "k": 1,
                 "requested_k": 1,
                 "proposed_k": 0,
@@ -509,31 +634,34 @@ class ReceiptTests(unittest.TestCase):
                 "useful_accepted_drafts": 0,
                 "assistant_exposed_ms": 0.0,
                 "assistant_gpu_ms": 0.0,
+                "committed_tokens": [10],
             }
         )
-        telemetry["rounds"] = [round_receipt, copy.deepcopy(round_receipt)]
+        telemetry["rounds"] = [round_receipt]
         telemetry["aggregate"]["chained_promotion_loads"] = 0
         telemetry["aggregate"]["chained_promotion_read_bytes"] = 0
         telemetry["metrics"].update(
             {
-                "forwarded_decode_tokens": 2,
-                "terminal_unforwarded_tokens": 0,
+                "forwarded_decode_tokens": 1,
+                "terminal_unforwarded_tokens": 1,
                 "response_completion_tokens": 2,
+                "receipt_round_wall_ms": 10.0,
                 "proposed_drafts": 0,
                 "accepted_drafts": 0,
+                "decode_tokens_per_second": 100.0,
                 "full_round_zero_accepts": 0,
                 "max_full_assistant_exposed_ms": 0.0,
                 "outer_lookahead_nonzero_count": 0,
             }
         )
         receipt.validate_hybrid_telemetry(telemetry, "k1", 2)
-        telemetry["rounds"][1]["assistant_exposed_ms"] = 0.01
+        telemetry["rounds"][0]["assistant_exposed_ms"] = 0.01
         with self.assertRaises(receipt.ReceiptError):
             receipt.validate_hybrid_telemetry(telemetry, "k1", 2)
         telemetry = hybrid_telemetry(64)
-        telemetry["rounds"][0]["per_layer"][0]["mapped_bound"] = 15
+        telemetry["rounds"][1]["per_layer"][0]["mapped_bound"] = 15
         with self.assertRaises(receipt.ReceiptError):
-            receipt.validate_hybrid_telemetry(telemetry, "k8")
+            receipt.validate_hybrid_telemetry(telemetry, "k8", 9)
 
     def test_environment_requires_hybrid_knob_and_rejects_legacy_physical(self) -> None:
         environment = lane_environment("k8")
@@ -541,6 +669,121 @@ class ReceiptTests(unittest.TestCase):
         environment["CAMELID_GEMMA4_GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER"] = "32"
         with self.assertRaises(receipt.ReceiptError):
             receipt.validate_environment(environment, "k8")
+
+    def test_unknown_lane_token_contract_fails_before_receipt_io(self) -> None:
+        with self.assertRaisesRegex(receipt.ReceiptError, "unsupported lane/token contract"):
+            receipt.validate_lane(Path("/definitely/absent"), "k8", 8)
+
+    def test_nine_token_k1_length_finish_has_eight_forwards_and_one_terminal(self) -> None:
+        telemetry = hybrid_telemetry(8)
+        template = telemetry["rounds"][0]
+        template.update(
+            {
+                "bootstrap": False,
+                "k": 1,
+                "requested_k": 1,
+                "proposed_k": 0,
+                "verifier_k": 1,
+                "accepted_drafts": 0,
+                "useful_accepted_drafts": 0,
+                "committed_tokens": [10],
+                "assistant_exposed_ms": 0.0,
+                "assistant_gpu_ms": 0.0,
+            }
+        )
+        rounds = []
+        for index in range(8):
+            round_receipt = copy.deepcopy(template)
+            round_receipt["round_index"] = index
+            round_receipt["chained_round_sequence"] = 10 + index
+            round_receipt["prefix_tokens_before"] = 100 + index
+            round_receipt["remaining_budget_before"] = 9 - index
+            round_receipt["committed_tokens"] = [10 + index]
+            rounds.append(round_receipt)
+        telemetry["rounds"] = rounds
+        telemetry["aggregate"]["chained_promotion_loads"] = 0
+        telemetry["aggregate"]["chained_promotion_read_bytes"] = 0
+        telemetry["metrics"].update(
+            {
+                "forwarded_decode_tokens": 8,
+                "terminal_unforwarded_tokens": 1,
+                "response_completion_tokens": 9,
+                "receipt_round_wall_ms": 80.0,
+                "proposed_drafts": 0,
+                "accepted_drafts": 0,
+                "decode_tokens_per_second": 100.0,
+                "full_round_zero_accepts": 0,
+                "max_full_assistant_exposed_ms": 0.0,
+                "outer_lookahead_nonzero_count": 0,
+            }
+        )
+        receipt.validate_hybrid_telemetry(telemetry, "k1", 9)
+        telemetry["metrics"]["terminal_unforwarded_tokens"] = 0
+        with self.assertRaises(receipt.ReceiptError):
+            receipt.validate_hybrid_telemetry(telemetry, "k1", 9)
+
+    def test_smoke_parity_compares_ninth_token_and_frozen_request_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            pair = root / "02-smoke-9t"
+            ids = list(range(9))
+            request_bytes = (RUNNER_DIR / "request-9.json").read_bytes()
+            for lane in ("k8", "k1"):
+                lane_dir = pair / lane
+                lane_dir.mkdir(parents=True)
+                request_path = lane_dir / "request.json"
+                request_path.write_bytes(request_bytes)
+                request_sha = receipt.sha256_regular_file(request_path)
+                (lane_dir / "intent.json").write_text(
+                    json.dumps(
+                        {
+                            "request": {
+                                "source_path": str(RUNNER_DIR / "request-9.json"),
+                                "frozen_path": str(request_path),
+                                "sha256": request_sha,
+                            }
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (lane_dir / "verdict.json").write_text(
+                    json.dumps({"pass": True}), encoding="utf-8"
+                )
+                (lane_dir / "response.json").write_text(
+                    json.dumps(
+                        {
+                            "usage": {"completion_tokens": 9},
+                            "camelid": {"generated_token_ids": ids},
+                            "choices": [
+                                {
+                                    "finish_reason": "length",
+                                    "message": {"content": "nine tokens"},
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            self.assertTrue(receipt.validate_parity(root, "smoke")["pass"])
+            k1_response_path = pair / "k1" / "response.json"
+            k1_response = json.loads(k1_response_path.read_text(encoding="utf-8"))
+            k1_response["camelid"]["generated_token_ids"][-1] = 999
+            k1_response_path.write_text(json.dumps(k1_response), encoding="utf-8")
+            with self.assertRaisesRegex(receipt.ReceiptError, "token IDs"):
+                receipt.validate_parity(root, "smoke")
+
+            k1_response["camelid"]["generated_token_ids"][-1] = 8
+            k1_response_path.write_text(json.dumps(k1_response), encoding="utf-8")
+            k1_request_path = pair / "k1" / "request.json"
+            changed_request = json.loads(k1_request_path.read_text(encoding="utf-8"))
+            changed_request["audit_nonce"] = 1
+            k1_request_path.write_text(json.dumps(changed_request), encoding="utf-8")
+            k1_intent_path = pair / "k1" / "intent.json"
+            k1_intent = json.loads(k1_intent_path.read_text(encoding="utf-8"))
+            k1_intent["request"]["sha256"] = receipt.sha256_regular_file(k1_request_path)
+            k1_intent_path.write_text(json.dumps(k1_intent), encoding="utf-8")
+            with self.assertRaisesRegex(receipt.ReceiptError, "canonical lane contract"):
+                receipt.validate_parity(root, "smoke")
 
     def test_exact_startup_markers_are_singletons(self) -> None:
         log = startup_log(k8=True)
@@ -619,6 +862,11 @@ class ReceiptTests(unittest.TestCase):
                             "analyzer_sha256": sha,
                         },
                         "integration_contract": {"sha256": sha},
+                        "request": {
+                            "source_path": "",
+                            "frozen_path": "",
+                            "sha256": "",
+                        },
                     }
                 ),
                 encoding="utf-8",
@@ -703,10 +951,21 @@ class ReceiptTests(unittest.TestCase):
 
 class RunnerPreflightTests(unittest.TestCase):
     def test_request_fixtures_explicitly_opt_in_to_hybrid_receipts(self) -> None:
-        for name in ("request-8.json", "request-48.json"):
-            request = json.loads((RUNNER_DIR / name).read_text(encoding="utf-8"))
+        for name, tokens in (("request-9.json", 9), ("request-48.json", 48)):
+            request_path = RUNNER_DIR / name
+            request = json.loads(request_path.read_text(encoding="utf-8"))
             self.assertIs(request.get("camelid_receipt"), True, name)
             self.assertIs(request.get("stream"), False, name)
+            self.assertEqual(request.get("temperature"), 0, name)
+            self.assertEqual(request.get("top_k"), 1, name)
+            self.assertEqual(request.get("seed"), 0, name)
+            self.assertIs(request.get("camelid_enable_thinking"), False, name)
+            self.assertEqual(request.get("max_tokens"), tokens, name)
+            self.assertEqual(
+                receipt.sha256_regular_file(request_path),
+                receipt.EXPECTED_REQUEST_SHA256[tokens],
+                name,
+            )
 
     def run_stage(self, stage: str, root: Path, extra: dict[str, str] | None = None):
         model = root / "model.gguf"
@@ -759,6 +1018,10 @@ class RunnerPreflightTests(unittest.TestCase):
         self.assertIn("CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS=32", source)
         self.assertIn("CAMELID_GEMMA4_SLOT_PIN=0", source)
         self.assertIn("CAMELID_GEMMA4_CHAINED_K1=1", source)
+        self.assertIn('lane_dir="$receipt_root/02-smoke-9t/k8"', source)
+        self.assertIn('lane_dir="$receipt_root/02-smoke-9t/k1"', source)
+        self.assertNotIn("02-smoke-8t", source)
+        self.assertNotIn("request-8.json", source)
 
     def test_inherited_legacy_physical_key_refuses_before_spawn(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -778,7 +1041,7 @@ class RunnerPreflightTests(unittest.TestCase):
             result = self.run_stage("smoke-k1", root)
             self.assertEqual(result.returncode, 75, result.stderr)
             self.assertIn("predecessor PASS", result.stderr)
-            self.assertFalse((root / "02-smoke-8t/k1").exists())
+            self.assertFalse((root / "02-smoke-9t/k1").exists())
 
     def test_missing_load_integration_contract_refuses_before_lane_creation(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

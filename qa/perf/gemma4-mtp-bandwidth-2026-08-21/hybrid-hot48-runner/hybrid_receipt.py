@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -29,6 +31,10 @@ MAX_CHILD_FOOTPRINT_BYTES = 8_053_063_680  # 7.5 GiB
 MAX_HOST_WIRED_BYTES = 8 * GIB
 MIN_BASELINE_SOAK_NS = 60_000_000_000
 WATCHDOG_SAMPLE_PERIOD_NS = 250_000_000
+EXPECTED_REQUEST_SHA256 = {
+    9: "a612ca079082b32a1cf80cd51f76d41ffe6f26cf22266089e148b9aed966a0d4",
+    48: "b2f1110079fc726699cc936a628a268a7ec5bf2076fa970899de39d4ea903939",
+}
 
 FORBIDDEN_ENVIRONMENT = {
     "CAMELID_GEMMA4_GHOST_METAL_PHYSICAL_SLOTS_PER_LAYER",
@@ -83,6 +89,30 @@ DEMAND_PREWARM_MARKER = (
 
 class ReceiptError(RuntimeError):
     pass
+
+
+def sha256_regular_file(path: Path) -> str:
+    if path.is_symlink() or not path.is_file():
+        raise ReceiptError(f"hashed input is not a regular non-symlink file: {path}")
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as error:
+        raise ReceiptError(f"hash input {path}: {error}") from error
+    return digest.hexdigest()
+
+
+def _nonnegative_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _finite_number(value: Any, *, positive: bool = False) -> bool:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    number = float(value)
+    return math.isfinite(number) and (number > 0.0 if positive else number >= 0.0)
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -351,6 +381,46 @@ def validate_watchdog(path: Path, lane: str) -> dict[str, Any]:
     return final
 
 
+def validate_request_identity(
+    lane_dir: Path, intent: dict[str, Any], expected_tokens: int
+) -> str:
+    request = intent.get("request")
+    if not isinstance(request, dict):
+        raise ReceiptError("intent has no frozen request identity")
+    if expected_tokens == 0:
+        if request != {"source_path": "", "frozen_path": "", "sha256": ""}:
+            raise ReceiptError("load-only intent unexpectedly binds a request fixture")
+        return ""
+
+    source_path = request.get("source_path")
+    frozen_path = request.get("frozen_path")
+    recorded_sha = request.get("sha256")
+    expected_frozen_path = lane_dir / "request.json"
+    if (
+        not isinstance(source_path, str)
+        or Path(source_path).name != f"request-{expected_tokens}.json"
+        or frozen_path != str(expected_frozen_path)
+        or not isinstance(recorded_sha, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", recorded_sha)
+        or recorded_sha != EXPECTED_REQUEST_SHA256.get(expected_tokens)
+    ):
+        raise ReceiptError("intent request identity does not match the canonical lane contract")
+    if sha256_regular_file(expected_frozen_path) != recorded_sha:
+        raise ReceiptError("frozen request bytes do not match the intent hash")
+    fixture = read_json(expected_frozen_path)
+    if (
+        fixture.get("max_tokens") != expected_tokens
+        or fixture.get("temperature") != 0
+        or fixture.get("top_k") != 1
+        or fixture.get("seed") != 0
+        or fixture.get("stream") is not False
+        or fixture.get("camelid_receipt") is not True
+        or fixture.get("camelid_enable_thinking") is not False
+    ):
+        raise ReceiptError("frozen request does not match the deterministic token/receipt contract")
+    return recorded_sha
+
+
 def validate_auxiliary_receipts(
     lane_dir: Path, stage: str, lane: str, expected_tokens: int
 ) -> None:
@@ -400,6 +470,7 @@ def validate_auxiliary_receipts(
         for value in hashes
     ):
         raise ReceiptError("intent is missing frozen executable/tooling hashes")
+    validate_request_identity(lane_dir, intent, expected_tokens)
     port = read_json(lane_dir / "port-clear.json")
     if port != {"schema_version": 1, "port": 8189, "clear": True}:
         raise ReceiptError("lane does not contain the exact port-clear receipt")
@@ -427,15 +498,8 @@ def validate_startup_log(path: Path, lane: str) -> None:
     for marker in forbidden:
         if marker in log:
             raise ReceiptError(f"server log contains forbidden marker {marker!r}")
-    if lane == "k8":
-        if "lm_head=q4_0" not in log:
-            raise ReceiptError("K8 server log does not prove the Q4_0 assistant head")
-        if not re.search(r"\[metal chained ledger\].* K=8 .*ok=true", log):
-            raise ReceiptError("K8 server log has no successful K=8 chained round")
-    elif lane == "k1" and not re.search(
-        r"\[metal chained ledger\].* K=1 .*ok=true", log
-    ):
-        raise ReceiptError("K1 server log has no successful chained K=1 round")
+    if lane == "k8" and "lm_head=q4_0" not in log:
+        raise ReceiptError("K8 server log does not prove the Q4_0 assistant head")
 
 
 def validate_response(path: Path, expected_tokens: int) -> dict[str, Any]:
@@ -511,8 +575,15 @@ def _geometry(telemetry: dict[str, Any]) -> None:
 
 
 def validate_hybrid_telemetry(
-    telemetry: dict[str, Any], lane: str, expected_tokens: int | None = None
+    telemetry: dict[str, Any],
+    lane: str,
+    expected_tokens: int | None = None,
+    expected_token_ids: list[int] | None = None,
 ) -> dict[str, Any]:
+    if lane not in ("k1", "k8"):
+        raise ReceiptError(f"unknown hybrid lane {lane!r}")
+    if not _nonnegative_int(expected_tokens) or expected_tokens == 0:
+        raise ReceiptError("hybrid telemetry validation requires a positive token budget")
     if telemetry.get("schema_version") != 1:
         raise ReceiptError("hybrid telemetry schema_version must be 1")
     if telemetry.get("scope") != "single_completed_measured_request":
@@ -531,32 +602,115 @@ def validate_hybrid_telemetry(
     observed_full_k8 = False
     hot_bound_total = 0
     cold_bound_total = 0
+    forwarded_total = 0
+    proposed_total = 0
+    accepted_total = 0
+    round_wall_total = 0.0
+    full_round_zero_accepts = 0
+    full_round_assistant_exposed: list[float] = []
+    committed_forwarded: list[int] = []
+    previous_prefix: int | None = None
+    previous_sequence: int | None = None
     for round_index, round_receipt in enumerate(rounds):
         if not isinstance(round_receipt, dict):
             raise ReceiptError(f"hybrid round {round_index} is not an object")
+        if round_receipt.get("round_index") != round_index:
+            raise ReceiptError(f"hybrid round {round_index} has a reordered round_index")
+        prefix = round_receipt.get("prefix_tokens_before")
+        sequence = round_receipt.get("chained_round_sequence")
+        if not _nonnegative_int(prefix) or not _nonnegative_int(sequence):
+            raise ReceiptError(f"hybrid round {round_index} has invalid sequence identity")
+        if round_index > 0 and (
+            prefix != previous_prefix or sequence != previous_sequence
+        ):
+            raise ReceiptError(f"hybrid round {round_index} sequence continuity drifted")
+        remaining = round_receipt.get("remaining_budget_before")
+        expected_remaining = expected_tokens - forwarded_total
+        if remaining != expected_remaining or expected_remaining <= 0:
+            raise ReceiptError(
+                f"hybrid round {round_index} remaining budget does not reconcile"
+            )
         k = round_receipt.get("k")
+        requested = round_receipt.get("requested_k")
+        proposed = round_receipt.get("proposed_k")
+        verifier = round_receipt.get("verifier_k")
+        accepted = round_receipt.get("accepted_drafts")
+        useful = round_receipt.get("useful_accepted_drafts")
+        if not all(
+            _nonnegative_int(value)
+            for value in (k, requested, proposed, verifier, accepted, useful)
+        ):
+            raise ReceiptError(f"hybrid round {round_index} has invalid K/draft counts")
+        if (
+            k != verifier
+            or verifier != proposed + 1
+            or accepted > proposed
+            or useful != accepted
+        ):
+            raise ReceiptError(f"hybrid round {round_index} has inconsistent K/draft counts")
+        committed = round_receipt.get("committed_tokens")
+        if (
+            not isinstance(committed, list)
+            or len(committed) != 1 + accepted
+            or any(
+                not _nonnegative_int(token) or token > 0xFFFF_FFFF
+                for token in committed
+            )
+        ):
+            raise ReceiptError(f"hybrid round {round_index} has invalid committed tokens")
+        assistant_exposed = round_receipt.get("assistant_exposed_ms")
+        assistant_gpu = round_receipt.get("assistant_gpu_ms")
+        round_wall = round_receipt.get("receipt_round_wall_ms")
+        if (
+            not _finite_number(assistant_exposed)
+            or not _finite_number(assistant_gpu)
+            or not _finite_number(round_wall, positive=True)
+        ):
+            raise ReceiptError(f"hybrid round {round_index} has invalid timing")
+
         observed_k8 |= k == 8
-        if lane == "k1" and (
-            k != 1
-            or round_receipt.get("requested_k") != 1
-            or round_receipt.get("proposed_k") != 0
-            or round_receipt.get("verifier_k") != 1
-            or round_receipt.get("accepted_drafts") != 0
-            or round_receipt.get("useful_accepted_drafts") != 0
-            or round_receipt.get("assistant_exposed_ms") != 0
-            or round_receipt.get("assistant_gpu_ms") != 0
+        if lane == "k8":
+            if round_index == 0:
+                if (
+                    round_receipt.get("bootstrap") is not True
+                    or (k, requested, proposed, verifier, accepted, useful)
+                    != (1, 1, 0, 1, 0, 0)
+                    or round_receipt.get("budget_truncated") is not False
+                    or assistant_exposed != 0
+                    or assistant_gpu != 0
+                ):
+                    raise ReceiptError("hybrid K8 telemetry has no exact round-zero K1 bootstrap")
+            else:
+                if (
+                    round_receipt.get("bootstrap") is not False
+                    or remaining < 2
+                    or requested != 8
+                    or verifier > min(8, remaining)
+                    or proposed > min(7, remaining - 1)
+                    or round_receipt.get("budget_truncated") is not (remaining < 8)
+                ):
+                    raise ReceiptError(
+                        f"hybrid K8 round {round_index} does not match its remaining budget"
+                    )
+                if (
+                    verifier == 8
+                    and proposed == 7
+                    and round_receipt.get("budget_truncated") is False
+                ):
+                    observed_full_k8 = True
+                    full_round_assistant_exposed.append(float(assistant_exposed))
+                    if accepted == 0:
+                        full_round_zero_accepts += 1
+        elif (
+            round_receipt.get("bootstrap") is not False
+            or (k, requested, proposed, verifier, accepted, useful)
+            != (1, 1, 0, 1, 0, 0)
+            or round_receipt.get("budget_truncated") is not False
+            or assistant_exposed != 0
+            or assistant_gpu != 0
         ):
             raise ReceiptError(f"hybrid K1 round {round_index} is not a zero-draft K1 forward")
-        if k == 8 and round_receipt.get("budget_truncated") is False:
-            if (
-                round_receipt.get("requested_k") != 8
-                or round_receipt.get("proposed_k") != 7
-                or round_receipt.get("verifier_k") != 8
-            ):
-                raise ReceiptError(
-                    f"hybrid round {round_index} is not an exact full K8 verifier round"
-                )
-            observed_full_k8 = True
+
         if round_receipt.get("success") is not True:
             raise ReceiptError(f"hybrid round {round_index} did not complete successfully")
         for key in (
@@ -592,14 +746,23 @@ def validate_hybrid_telemetry(
                 raise ReceiptError(
                     f"round {round_index} layer {layer_index} tier partition drift"
                 )
-            if isinstance(k, int) and 1 <= k <= 8 and unique > k * 8:
-                raise ReceiptError(f"round {round_index} layer {layer_index} exceeds K×8")
+            if isinstance(k, int) and 1 <= k <= 8 and not (8 <= unique <= k * 8):
+                raise ReceiptError(
+                    f"round {round_index} layer {layer_index} is outside 8..K×8"
+                )
             if unique > CANONICAL_PER_LAYER or hot > HOT_PER_LAYER:
                 raise ReceiptError(
                     f"round {round_index} layer {layer_index} exceeds hybrid geometry"
                 )
             hot_bound_total += hot
             cold_bound_total += cold
+        forwarded_total += 1 + useful
+        committed_forwarded.extend(committed)
+        proposed_total += proposed
+        accepted_total += accepted
+        round_wall_total += float(round_wall)
+        previous_prefix = prefix + len(committed)
+        previous_sequence = sequence + 1
     if lane == "k8" and not observed_k8:
         raise ReceiptError("K8 telemetry contains no K=8 round")
     if lane == "k8" and not observed_full_k8:
@@ -628,7 +791,7 @@ def validate_hybrid_telemetry(
         "chained_promotion_loads",
         "chained_promotion_read_bytes",
     ):
-        if not isinstance(aggregate.get(field), int) or aggregate[field] < 0:
+        if not _nonnegative_int(aggregate.get(field)):
             raise ReceiptError(f"hybrid aggregate has invalid {field}")
     if aggregate["route_lookups"] != (
         aggregate["hot_hits"] + aggregate["mapped_cold_selections"]
@@ -654,26 +817,76 @@ def validate_hybrid_telemetry(
     metrics = telemetry.get("metrics")
     if not isinstance(metrics, dict):
         raise ReceiptError("hybrid telemetry has no structured metrics")
+    forwarded = metrics.get("forwarded_decode_tokens")
+    terminal_unforwarded = metrics.get("terminal_unforwarded_tokens")
+    response_tokens = metrics.get("response_completion_tokens")
+    proposed_metric = metrics.get("proposed_drafts")
+    accepted_metric = metrics.get("accepted_drafts")
+    receipt_round_wall = metrics.get("receipt_round_wall_ms")
+    decode_tokens_per_second = metrics.get("decode_tokens_per_second")
+    reported_zero_accepts = metrics.get("full_round_zero_accepts")
+    reported_max_exposed = metrics.get("max_full_assistant_exposed_ms")
+    outer_lookahead = metrics.get("outer_lookahead_nonzero_count")
+    expected_decode_tps = forwarded_total / (round_wall_total / 1_000.0)
+    expected_max_exposed = max(full_round_assistant_exposed, default=0.0)
+    if (
+        not all(
+            _nonnegative_int(value)
+            for value in (
+                forwarded,
+                terminal_unforwarded,
+                response_tokens,
+                proposed_metric,
+                accepted_metric,
+                reported_zero_accepts,
+                outer_lookahead,
+            )
+        )
+        or forwarded != forwarded_total
+        or terminal_unforwarded not in (0, 1)
+        or response_tokens != expected_tokens
+        or forwarded + terminal_unforwarded != response_tokens
+        or proposed_metric != proposed_total
+        or accepted_metric != accepted_total
+        or not _finite_number(receipt_round_wall, positive=True)
+        or not math.isclose(
+            float(receipt_round_wall), round_wall_total, rel_tol=1e-9, abs_tol=1e-6
+        )
+        or not _finite_number(decode_tokens_per_second, positive=True)
+        or not math.isclose(
+            float(decode_tokens_per_second), expected_decode_tps, rel_tol=1e-9, abs_tol=1e-6
+        )
+        or reported_zero_accepts != full_round_zero_accepts
+        or not _finite_number(reported_max_exposed)
+        or not math.isclose(
+            float(reported_max_exposed), expected_max_exposed, rel_tol=1e-9, abs_tol=1e-6
+        )
+        or outer_lookahead != 0
+    ):
+        raise ReceiptError("hybrid metrics do not reconcile the measured rounds")
     if lane == "k1":
-        forwarded = metrics.get("forwarded_decode_tokens")
-        terminal_unforwarded = metrics.get("terminal_unforwarded_tokens")
-        response_tokens = metrics.get("response_completion_tokens")
         if (
-            expected_tokens is None
-            or not isinstance(forwarded, int)
-            or forwarded < 0
-            or forwarded != len(rounds)
-            or not isinstance(terminal_unforwarded, int)
-            or terminal_unforwarded not in (0, 1)
-            or response_tokens != expected_tokens
-            or forwarded + terminal_unforwarded != response_tokens
-            or metrics.get("proposed_drafts") != 0
-            or metrics.get("accepted_drafts") != 0
-            or metrics.get("full_round_zero_accepts") != 0
-            or metrics.get("max_full_assistant_exposed_ms") != 0
-            or metrics.get("outer_lookahead_nonzero_count") != 0
+            terminal_unforwarded != 1
+            or forwarded != expected_tokens - 1
+            or len(rounds) != expected_tokens - 1
+            or proposed_metric != 0
+            or accepted_metric != 0
+            or reported_zero_accepts != 0
+            or reported_max_exposed != 0
         ):
-            raise ReceiptError("K1 metrics do not reconcile zero-draft forwards to response tokens")
+            raise ReceiptError(
+                "K1 metrics do not reconcile length-finished zero-draft forwards"
+            )
+    if expected_token_ids is not None:
+        if (
+            len(expected_token_ids) != expected_tokens
+            or any(
+                not _nonnegative_int(token) or token > 0xFFFF_FFFF
+                for token in expected_token_ids
+            )
+            or committed_forwarded != expected_token_ids[:forwarded_total]
+        ):
+            raise ReceiptError("hybrid committed tokens do not match the API response")
     return metrics
 
 
@@ -788,21 +1001,27 @@ def validate_load_only(lane_dir: Path) -> dict[str, Any]:
 
 
 def validate_lane(lane_dir: Path, lane: str, expected_tokens: int) -> dict[str, Any]:
-    stage = (
-        "smoke-k8"
-        if lane == "k8" and expected_tokens == 8
-        else "smoke-k1"
-        if lane == "k1" and expected_tokens == 8
-        else "promotion-k8"
-        if lane == "k8"
-        else "promotion-k1"
-    )
+    stage = {
+        ("k8", 9): "smoke-k8",
+        ("k1", 9): "smoke-k1",
+        ("k8", 48): "promotion-k8",
+        ("k1", 48): "promotion-k1",
+    }.get((lane, expected_tokens))
+    if stage is None:
+        raise ReceiptError(
+            f"unsupported lane/token contract: lane={lane!r} tokens={expected_tokens!r}"
+        )
     validate_auxiliary_receipts(lane_dir, stage, lane, expected_tokens)
     final = validate_watchdog(lane_dir / "watchdog.jsonl", lane)
     validate_startup_log(lane_dir / "server.log", lane)
     response = validate_response(lane_dir / "response.json", expected_tokens)
     telemetry = _load_hybrid_telemetry(response)
-    metrics = validate_hybrid_telemetry(telemetry, lane, expected_tokens)
+    metrics = validate_hybrid_telemetry(
+        telemetry,
+        lane,
+        expected_tokens,
+        response["camelid"]["generated_token_ids"],
+    )
     return {
         "pass": True,
         "lane": lane,
@@ -813,12 +1032,20 @@ def validate_lane(lane_dir: Path, lane: str, expected_tokens: int) -> dict[str, 
 
 
 def validate_parity(root: Path, stage: str) -> dict[str, Any]:
-    tokens = 8 if stage == "smoke" else 48
-    pair = root / ("02-smoke-8t" if stage == "smoke" else "03-promotion-48t")
+    tokens = 9 if stage == "smoke" else 48
+    pair = root / ("02-smoke-9t" if stage == "smoke" else "03-promotion-48t")
     k8_verdict = read_json(pair / "k8" / "verdict.json")
     k1_verdict = read_json(pair / "k1" / "verdict.json")
     if k8_verdict.get("pass") is not True or k1_verdict.get("pass") is not True:
         raise ReceiptError("both lane verdicts must pass before parity analysis")
+    k8_request_sha = validate_request_identity(
+        pair / "k8", read_json(pair / "k8" / "intent.json"), tokens
+    )
+    k1_request_sha = validate_request_identity(
+        pair / "k1", read_json(pair / "k1" / "intent.json"), tokens
+    )
+    if k8_request_sha != k1_request_sha:
+        raise ReceiptError("K1/K8 frozen request hashes differ")
     k8 = validate_response(pair / "k8" / "response.json", tokens)
     k1 = validate_response(pair / "k1" / "response.json", tokens)
     k8_ids = k8["camelid"]["generated_token_ids"]
@@ -831,6 +1058,7 @@ def validate_parity(root: Path, stage: str) -> dict[str, Any]:
         "pass": True,
         "stage": stage,
         "tokens": tokens,
+        "request_sha256": k8_request_sha,
         "exact_token_id_parity": True,
         "exact_text_parity": True,
     }
@@ -903,7 +1131,7 @@ def parser() -> argparse.ArgumentParser:
     lane = commands.add_parser("lane")
     lane.add_argument("--lane-dir", type=Path, required=True)
     lane.add_argument("--lane", choices=("k1", "k8"), required=True)
-    lane.add_argument("--expected-tokens", type=int, choices=(8, 48), required=True)
+    lane.add_argument("--expected-tokens", type=int, choices=(9, 48), required=True)
     lane.add_argument("--output", type=Path, required=True)
     parity = commands.add_parser("parity")
     parity.add_argument("--receipt-root", type=Path, required=True)

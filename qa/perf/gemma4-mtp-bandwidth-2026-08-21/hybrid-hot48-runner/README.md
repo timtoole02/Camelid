@@ -121,9 +121,9 @@ executables and integration contracts. Stage outputs are:
 
 ```text
 01-load-only/
-02-smoke-8t/k8/
-02-smoke-8t/k1/
-02-smoke-8t/parity.json
+02-smoke-9t/k8/
+02-smoke-9t/k1/
+02-smoke-9t/parity.json
 03-promotion-48t/k8/
 03-promotion-48t/k1/
 03-promotion-48t/parity.json
@@ -131,12 +131,17 @@ executables and integration contracts. Stage outputs are:
 
 Every lane directory is new and mode 0700. It contains `intent.json`, a
 human-readable `baseline.txt`, the watchdog JSONL, child log, child/report or
-response JSON, `port-clear.json`, and finally `verdict.json`. Existing lane or
-verdict paths are never reused. The intent freezes the source/binary/tooling
-and predecessor hashes, boot identity, disk gate, input file stat identities,
-and exact hybrid profile. Large model files are deliberately not re-hashed
-after the fresh baseline because doing so would populate the file cache and
-change the experiment.
+response JSON, `port-clear.json`, and finally `verdict.json`. Generation lanes
+also contain the exact `request.json` bytes sent to the server. Existing lane
+or verdict paths are never reused. The intent freezes the request,
+source/binary/tooling and predecessor hashes, boot identity, disk gate, input
+file stat identities, and exact hybrid profile. Large model files are
+deliberately not re-hashed after the fresh baseline because doing so would
+populate the file cache and change the experiment.
+
+The runner and analyzer both pin the canonical SHA-256 for the 9-token smoke
+and 48-token promotion fixtures. Matching K1/K8 hashes alone is insufficient;
+modified request bytes are refused before launch and again during analysis.
 
 ## Integration contracts
 
@@ -199,6 +204,13 @@ all records and remain `slot_capacity_overflow=0`; it is not an overflow or a
 reason to drop experts. K8 must prove both nonzero hot-tier use and nonzero
 mapped-cold selection.
 
+The smoke request emits nine completion tokens by design. MTP first performs a
+mandatory zero-draft K1 bootstrap to establish the target hidden state, leaving
+eight tokens for one exact, non-truncated `requested=8/proposed=7/verifier=8`
+round. An eight-token completion budget can only expose K1 plus a truncated K7
+round and is not admissible as full-K8 evidence. The startup log is not
+measured-round proof; the structured response telemetry is authoritative.
+
 ## Manual sequence
 
 After placing qualified frozen binaries/contracts in the receipt root, invoke
@@ -213,8 +225,10 @@ CAMELID_HYBRID_PROMOTION_ACK=smoke-parity-reviewed \
 qa/perf/gemma4-mtp-bandwidth-2026-08-21/hybrid-hot48-runner/run_stage.zsh promotion-k1
 ```
 
-K1 and K8 use the same deterministic request fixture and must return identical
-token IDs and decoded text. Both fixtures explicitly set
+K1 and K8 use the same frozen deterministic request fixture and must return
+identical token IDs and decoded text across all nine smoke tokens. The runner
+copies the request into each lane, hashes it in the intent, and requires equal
+request hashes before parity can pass. Both fixtures explicitly set
 `"camelid_receipt": true`; ordinary API requests remain outside this diagnostic
 path. The 48-token K8 promotion additionally requires at
 least 28 decode tok/s, at least 0.85 accepted/proposed drafts, no zero-accept
