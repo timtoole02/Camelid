@@ -376,6 +376,28 @@ class ReceiptTests(unittest.TestCase):
             with self.assertRaises(receipt.ReceiptError):
                 receipt.validate_startup_log(path, "k8")
 
+    def test_observed_startup_requires_each_admission_marker(self) -> None:
+        log = startup_log() + (
+            "\n[gemma4-ghost-common] OBSERVED: Q4 common + KV/scratch + empty slots "
+            "active, context cap=1024 KV=0.11GiB mode=fused-fast "
+            "q4-row=simdgroup-ordered"
+        )
+        cases = [
+            ("HYBRID ACTIVE", "one exact HYBRID ACTIVE admission line"),
+            (receipt.DEMAND_PREWARM_MARKER, "one exact demand-prewarm-skip line"),
+            ("clean file-pager Q4_0 experts enabled", "one exact clean file-pager line"),
+        ]
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "child.log"
+            for marker, expected_error in cases:
+                with self.subTest(marker=marker):
+                    filtered = "\n".join(
+                        line for line in log.splitlines() if marker not in line
+                    )
+                    path.write_text(filtered, encoding="utf-8")
+                    with self.assertRaisesRegex(receipt.ReceiptError, expected_error):
+                        receipt.validate_startup_log(path, "load-only")
+
     def test_watchdog_receipt_requires_all_240_soak_samples(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             lane_dir = Path(raw)

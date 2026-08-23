@@ -1582,6 +1582,30 @@ fn parse_ghost_metal_hybrid_hot_slots(
     Ok(Some(GHOST_METAL_HYBRID_HOT_SLOTS))
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn clean_file_pager_backing_from(file_mapped: bool, hybrid_mapped: bool) -> bool {
+    file_mapped || hybrid_mapped
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn clean_file_pager_admission_line(
+    layer_count: usize,
+    logical_slots_per_layer: usize,
+    anonymous_expert_capacity_bytes: usize,
+    mapped_address_span_bytes: usize,
+    fused_fast: bool,
+) -> String {
+    format!(
+        "[gemma4-ghost-metal] clean file-pager Q4_0 experts enabled: layers={layer_count} logical_addressable_slots/layer={logical_slots_per_layer} anonymous_expert_capacity_bytes={anonymous_expert_capacity_bytes} mapped_address_span_bytes={mapped_address_span_bytes} mapped_address_span={:.2}GiB mode={}",
+        mapped_address_span_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        if fused_fast {
+            "fused-fast"
+        } else {
+            "CPU-GeGLU parity"
+        },
+    )
+}
+
 #[cfg(target_os = "macos")]
 fn bounded_record_chained_refusal(
     context: &str,
@@ -4664,6 +4688,54 @@ impl GhostMetalExpertRuntime {
                 .layers
                 .iter()
                 .all(|layer| layer.slots.is_hybrid_mapped())
+    }
+
+    fn has_clean_file_pager_backing(&self) -> bool {
+        clean_file_pager_backing_from(
+            self.has_file_mapped_backing(),
+            self.has_hybrid_mapped_backing(),
+        )
+    }
+
+    fn log_startup_admission(&self, demand_load_only: bool, block_count: usize, fused_fast: bool) {
+        if demand_load_only {
+            eprintln!(
+                "[gemma4-ghost-metal] {GHOST_METAL_DEMAND_LOAD_ONLY_ENV}=1: arbitrary cold-start expert prewarm skipped; persistent slots will populate from routed demand"
+            );
+        }
+        if self.has_clean_file_pager_backing() {
+            eprintln!(
+                "{}",
+                clean_file_pager_admission_line(
+                    block_count,
+                    self.slots_per_layer(),
+                    self.resident_bytes(),
+                    self.mapped_address_span_bytes(),
+                    fused_fast,
+                )
+            );
+        } else if self.has_record_granular_backing() {
+            eprintln!(
+                "[gemma4-ghost-metal] persistent Q4_0 record slots enabled: layers={} allocated_slots/layer={} allocated_capacity_bytes={} allocated_capacity={:.2}GiB bound_table_directory_slots/layer={} bound_table_directory_slot_count={} physical_high_water_bytes={} physical_high_water={:.2}GiB mode={}",
+                block_count,
+                self.slots_per_layer(),
+                self.resident_bytes(),
+                self.resident_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
+                self.physical_slots_per_layer(),
+                self.physical_slot_budget_count(),
+                self.physical_slot_budget_bytes(),
+                self.physical_slot_budget_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
+                if fused_fast { "fused-fast" } else { "CPU-GeGLU parity" },
+            );
+        } else {
+            eprintln!(
+                "[gemma4-ghost-metal] persistent Q4_0 slots enabled: layers={} slots/layer={} resident={:.2}GiB mode={}",
+                block_count,
+                self.slots_per_layer(),
+                self.resident_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
+                if fused_fast { "fused-fast" } else { "CPU-GeGLU parity" },
+            );
+        }
     }
 
     fn promote_hybrid_layer(
@@ -9051,6 +9123,7 @@ impl Gemma4Runtime {
                     // dispatch, prefill, or generation.
                     observer.emit(Gemma4GhostLoadPhase::AssistantResidencyBarrierComplete)?;
                 }
+                runtime.log_startup_admission(demand_load_only, block_count, fused_fast);
                 eprintln!(
                     "[gemma4-ghost-common] OBSERVED: Q4 common + KV/scratch + empty slots active, context cap={} KV={:.2}GiB mode={} q4-row={}",
                     geometry.max_positions,
@@ -9180,47 +9253,12 @@ impl Gemma4Runtime {
                     }
                 }
                 if let Some(lane) = runtime.as_mut() {
-                    if demand_load_only {
-                        eprintln!(
-                            "[gemma4-ghost-metal] {GHOST_METAL_DEMAND_LOAD_ONLY_ENV}=1: arbitrary cold-start expert prewarm skipped; persistent slots will populate from routed demand"
-                        );
-                    } else if let Some(cache) = ghost_moe_cache.as_ref() {
-                        lane.prewarm_hot_slots_direct(&cache.file);
+                    if !demand_load_only {
+                        if let Some(cache) = ghost_moe_cache.as_ref() {
+                            lane.prewarm_hot_slots_direct(&cache.file);
+                        }
                     }
-                    if lane.has_file_mapped_backing() {
-                        eprintln!(
-                            "[gemma4-ghost-metal] clean file-pager Q4_0 experts enabled: layers={} logical_addressable_slots/layer={} anonymous_expert_capacity_bytes={} mapped_address_span_bytes={} mapped_address_span={:.2}GiB mode={}",
-                            block_count,
-                            lane.slots_per_layer(),
-                            lane.resident_bytes(),
-                            lane.mapped_address_span_bytes(),
-                            lane.mapped_address_span_bytes() as f64
-                                / (1024.0 * 1024.0 * 1024.0),
-                            if fused_fast { "fused-fast" } else { "CPU-GeGLU parity" },
-                        );
-                    } else if lane.has_record_granular_backing() {
-                        eprintln!(
-                            "[gemma4-ghost-metal] persistent Q4_0 record slots enabled: layers={} allocated_slots/layer={} allocated_capacity_bytes={} allocated_capacity={:.2}GiB bound_table_directory_slots/layer={} bound_table_directory_slot_count={} physical_high_water_bytes={} physical_high_water={:.2}GiB mode={}",
-                            block_count,
-                            lane.slots_per_layer(),
-                            lane.resident_bytes(),
-                            lane.resident_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
-                            lane.physical_slots_per_layer(),
-                            lane.physical_slot_budget_count(),
-                            lane.physical_slot_budget_bytes(),
-                            lane.physical_slot_budget_bytes() as f64
-                                / (1024.0 * 1024.0 * 1024.0),
-                            if fused_fast { "fused-fast" } else { "CPU-GeGLU parity" },
-                        );
-                    } else {
-                        eprintln!(
-                            "[gemma4-ghost-metal] persistent Q4_0 slots enabled: layers={} slots/layer={} resident={:.2}GiB mode={}",
-                            block_count,
-                            lane.slots_per_layer(),
-                            lane.resident_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
-                            if fused_fast { "fused-fast" } else { "CPU-GeGLU parity" },
-                        );
-                    }
+                    lane.log_startup_admission(demand_load_only, block_count, fused_fast);
                 } else if enabled {
                     eprintln!(
                         "[gemma4-ghost-metal] persistent slots unavailable or model geometry is not exact Gemma 4 26B Q4_0; using CPU Ghost experts"
@@ -22690,6 +22728,24 @@ mod ghost_moe_wire_tests {
                 "hybrid budget {invalid:?} must fail closed"
             );
         }
+    }
+
+    #[test]
+    fn metal_clean_file_pager_admission_includes_hybrid_backing() {
+        assert!(!clean_file_pager_backing_from(false, false));
+        assert!(clean_file_pager_backing_from(true, false));
+        assert!(clean_file_pager_backing_from(false, true));
+        assert!(clean_file_pager_backing_from(true, true));
+        assert_eq!(
+            clean_file_pager_admission_line(
+                30,
+                128,
+                4_836_556_800,
+                12_897_484_800,
+                true,
+            ),
+            "[gemma4-ghost-metal] clean file-pager Q4_0 experts enabled: layers=30 logical_addressable_slots/layer=128 anonymous_expert_capacity_bytes=4836556800 mapped_address_span_bytes=12897484800 mapped_address_span=12.01GiB mode=fused-fast"
+        );
     }
 
     #[test]
