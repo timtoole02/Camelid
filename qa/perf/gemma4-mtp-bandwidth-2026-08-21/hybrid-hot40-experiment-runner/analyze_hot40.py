@@ -488,7 +488,12 @@ def _validate_hashing_contract(run_dir: Path, intent: dict[str, Any]) -> None:
     if (
         before_host["swapins_pages"] != after_host["swapins_pages"]
         or before_host["swapouts_pages"] != after_host["swapouts_pages"]
-        or before_host["observed_monotonic_ns"] >= after_host["observed_monotonic_ns"]
+        # The system /usr/bin/python3 on macOS reports time.monotonic_ns()
+        # relative to each sampler process.  It is valid only for the
+        # start/finish ordering inside one sample, not across the two separate
+        # capture_host_memory.py processes.  Wall-clock Unix time plus the
+        # boot identity above provides the cross-process order.
+        or before_host["unix_time_ns"] >= after_host["unix_time_ns"]
     ):
         raise ReceiptError("small-artifact hashing changed swap or reordered host samples")
 

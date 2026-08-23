@@ -105,9 +105,13 @@ class SyntheticRun:
         }
         self.hashing_memory_before["host"]["sample_started_monotonic_ns"] = 100
         self.hashing_memory_before["host"]["observed_monotonic_ns"] = 110
+        self.hashing_memory_before["host"]["unix_time_ns"] = 1_000
         self.hashing_memory_after = copy.deepcopy(self.hashing_memory_before)
-        self.hashing_memory_after["host"]["sample_started_monotonic_ns"] = 200
-        self.hashing_memory_after["host"]["observed_monotonic_ns"] = 210
+        # Apple /usr/bin/python3 uses a process-local monotonic epoch, so the
+        # second capture may legitimately have lower monotonic values.
+        self.hashing_memory_after["host"]["sample_started_monotonic_ns"] = 50
+        self.hashing_memory_after["host"]["observed_monotonic_ns"] = 60
+        self.hashing_memory_after["host"]["unix_time_ns"] = 2_000
         write_json(self.root / "hashing-memory-before.json", self.hashing_memory_before)
         write_json(self.root / "hashing-memory-after.json", self.hashing_memory_after)
 
