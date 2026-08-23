@@ -14,9 +14,10 @@ with:
 
 It only starts an absolute prebuilt binary supplied through
 `CAMELID_HOT40_BINARY`; it never builds. Both ports 8181 and 8189 must be clear
-before the run. Port 8181 is only observed with `lsof`: the runner never binds,
-connects to, or signals anything through that port. The benchmark child binds
-only `127.0.0.1:8189` and is supervised in its own process group.
+before the run. Port 8181 is observed with `lsof` through startup, readiness,
+the measured request, and shutdown: the runner never binds, connects to, or
+signals anything through that port. The benchmark child binds only
+`127.0.0.1:8189` and is supervised in its own process group.
 
 ## Memory admission
 

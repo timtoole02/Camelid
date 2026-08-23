@@ -124,6 +124,7 @@ done
 [[ -x "$binary" && -f "$binary" && ! -L "$binary" ]] || \
   refuse "prebuilt binary is missing, non-regular, symlinked, or not executable: $binary"
 for input in "$binary" "$model" "$cghost" "$assistant"; do
+  [[ "$input" == /* ]] || refuse "runtime input path must be absolute: $input"
   internal_data_path "$input" || refuse "runtime input is not on the internal Data volume: $input"
 done
 
@@ -173,7 +174,7 @@ port_listening "$PROTECTED_PORT" && \
 port_listening "$PORT" && \
   refuse "benchmark port $PORT is already in use" "$EX_PORT_BUSY"
 
-typeset lock_owned=0 cleanup_started=0 supervisor_pid="" child_pid="" child_pgid=""
+typeset lock_owned=0 cleanup_started=0 supervisor_pid="" child_pid="" child_pgid="" request_pid=""
 /bin/mkdir -m 700 "$lock_dir" 2>/dev/null || \
   refuse "another Hot40 benchmark owns the runner lock: $lock_dir"
 lock_owned=1
@@ -201,6 +202,11 @@ cleanup() {
   set +e
   (( cleanup_started == 0 )) || return 0
   cleanup_started=1
+  if [[ "$request_pid" == <-> ]] && /bin/kill -0 "$request_pid" 2>/dev/null; then
+    /bin/kill -TERM "$request_pid" 2>/dev/null
+    wait "$request_pid" 2>/dev/null
+  fi
+  request_pid=""
   refresh_child_identity
   if group_alive; then
     /bin/kill -TERM -- "-$child_pgid" 2>/dev/null
@@ -616,7 +622,25 @@ print -r -- "$health" > "$receipt_root/.health.json.tmp"
 /usr/bin/curl -fsS --max-time 1800 \
   -H 'Content-Type: application/json' \
   --data-binary "@$request_frozen" \
-  "http://127.0.0.1:$PORT/v1/chat/completions" > "$receipt_root/response.tmp"
+  "http://127.0.0.1:$PORT/v1/chat/completions" > "$receipt_root/response.tmp" &
+request_pid=$!
+while /bin/kill -0 "$request_pid" 2>/dev/null; do
+  if port_listening "$PROTECTED_PORT"; then
+    refuse "protected WebUI port $PROTECTED_PORT became active during the request; benchmark child will be stopped" "$EX_PORT_BUSY"
+  fi
+  if ! /bin/kill -0 "$supervisor_pid" 2>/dev/null; then
+    refuse "watchdog exited while the measured request was active"
+  fi
+  /bin/sleep 1
+done
+set +e
+wait "$request_pid"
+typeset request_status=$?
+set -e
+request_pid=""
+(( request_status == 0 )) || refuse "measured request failed (curl status $request_status)"
+port_listening "$PROTECTED_PORT" && \
+  refuse "protected WebUI port $PROTECTED_PORT became active at request completion" "$EX_PORT_BUSY"
 /usr/bin/jq -e '
   .usage.completion_tokens == 48 and
   (.camelid.generated_token_ids | length) == 48 and
