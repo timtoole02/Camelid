@@ -10346,6 +10346,13 @@ impl Gemma4Runtime {
                 head
             }
         };
+        // Compile the exact speculative tied-head pipelines while the model is
+        // still loading. The first measured K8 verifier must not absorb this
+        // one-time Metal compilation cost.
+        #[cfg(target_os = "macos")]
+        if metal_q6k_head.is_some() {
+            let _ = crate::metal::spec50_head_kernels();
+        }
         let (per_layer_token_embd, per_layer_model_proj, per_layer_proj_norm, rope_factors) =
             match observed_non_head_metadata {
                 Some(metadata) => metadata,
