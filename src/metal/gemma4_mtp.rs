@@ -3052,6 +3052,15 @@ impl Gemma4MtpAssistantMetal {
                 break;
             }
         }
+        eprintln!(
+            "[gemma4-mtp device-chain] requested_drafts={draft_limit} returned_drafts={} command_buffers=1 commits=1 waits=1 cpu_embedding_callbacks=0 encode_us={} wait_us={} gpu_us={} kernel_us={} wall_us={}",
+            proposals.len(),
+            total_timing.encode_us,
+            total_timing.wait_us,
+            total_timing.gpu_us,
+            total_timing.kernel_us,
+            total_timing.wall_us,
+        );
         self.last_proposal_ledger = Some(ledger);
         Ok(proposals)
     }
