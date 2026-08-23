@@ -39,6 +39,10 @@ PACKED_K8_GATEUP_MARKER = (
     "[gemma4 exact partition] packed_k8_gateup=row_complete "
     "runtime_width_oracle=raw_bit_exact"
 )
+FULL_Q4_RESIDENCY_MARKER = (
+    "[gemma4-mtp full-q4 residency] source_retained=false mapped_bytes=0 "
+    "locked_bytes=0 resident_pages=0 total_pages=0 packed_bytes=236077056"
+)
 FULL_Q4_MARKER_PATTERN = re.compile(
     r"^\[gemma4-mtp full-q4\] enabled=true source_sha256=([0-9a-f]{64}) "
     r"matrices=23 packed_bytes=(\d+) bf16_matrix_bytes=(\d+) quantize_us=(\d+) "
@@ -294,6 +298,8 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
         or int(quantize_us) <= 0
     ):
         raise GateError("full-Q4 assistant admission receipt is inconsistent")
+    if log.splitlines().count(FULL_Q4_RESIDENCY_MARKER) != 1:
+        raise GateError("full-Q4 assistant did not release its BF16 source mapping")
     chain_receipts = DEVICE_CHAIN_PATTERN.findall(log)
     if len(chain_receipts) != assistant_rounds:
         raise GateError(
@@ -320,6 +326,7 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
         "previous_union_readahead_active": True,
         "exact_packed_k8_gateup_active": True,
         "full_q4_assistant_active": True,
+        "full_q4_bf16_source_released": True,
     }
     return {
         "schema_version": 1,

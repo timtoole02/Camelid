@@ -106,6 +106,8 @@ class Gate50TpsTests(unittest.TestCase):
             + gate.FULL_Q4_SOURCE_SHA256
             + " matrices=23 packed_bytes=236077056 bf16_matrix_bytes=839385088 "
             "quantize_us=1 norms_quantized=false fallback=false\n"
+            + gate.FULL_Q4_RESIDENCY_MARKER
+            + "\n"
             + chain * 6,
             encoding="utf-8",
         )
@@ -239,6 +241,17 @@ class Gate50TpsTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(gate.GateError, "full-Q4 assistant"):
+                gate.analyze(response_path, log_path, expected_path)
+
+    def test_retained_full_q4_bf16_source_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            response_path, log_path, expected_path = self.fixture(Path(temporary))
+            log = log_path.read_text(encoding="utf-8")
+            log_path.write_text(
+                log.replace(gate.FULL_Q4_RESIDENCY_MARKER + "\n", ""),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(gate.GateError, "release its BF16 source mapping"):
                 gate.analyze(response_path, log_path, expected_path)
 
 
