@@ -91,12 +91,6 @@ class Gate50TpsTests(unittest.TestCase):
             "linear_format=q4_0_all matrix_bytes_per_draft=236077056 "
             "encode_us=1 wait_us=2 gpu_us=3 kernel_us=4 wall_us=5\n"
         )
-        sync_current = "".join(
-            "[gemma4-ghost-metal] mapped-cold sync-current receipt: "
-            f"sequence={100 + index} start_pos={200 + index * 8} K=8 ok=true "
-            "records=1 bytes=3345408 issue_us=1\n"
-            for index in range(6)
-        )
         log_path.write_text(
             "CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER="
             + gate.PROFILE_CSV
@@ -107,14 +101,12 @@ class Gate50TpsTests(unittest.TestCase):
             + "\n"
             + gate.PREVIOUS_UNION_READAHEAD_MARKER
             + "\n"
-            + gate.CURRENT_SYNC_READAHEAD_MARKER
-            + "\n"
-            + gate.COMPACT_K8_HEAD_MARKER
-            + "\n"
             + "[gemma4-mtp bootstrap] prefill_seed_attempted=1 used=1 fallback=none\n"
             + "[gemma4 exact partition] CAMELID_GEMMA4_DENSE_K8_GENERIC=1 "
             "static_k8_dense=off runtime_k_dense=on\n"
             + gate.PACKED_K8_GATEUP_MARKER
+            + "\n"
+            + gate.COMPACT_K8_HEAD_MARKER
             + "\n"
             + "[gemma4-mtp full-q4] enabled=true source_sha256="
             + gate.FULL_Q4_SOURCE_SHA256
@@ -122,7 +114,6 @@ class Gate50TpsTests(unittest.TestCase):
             "quantize_us=1 norms_quantized=false fallback=false\n"
             + gate.FULL_Q4_RESIDENCY_MARKER
             + "\n"
-            + sync_current
             + chain * 6,
             encoding="utf-8",
         )
@@ -244,60 +235,6 @@ class Gate50TpsTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(gate.GateError, "previous-union readahead"):
-                gate.analyze(response_path, log_path, expected_path)
-
-    def test_missing_sync_current_marker_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            response_path, log_path, expected_path = self.fixture(Path(temporary))
-            log = log_path.read_text(encoding="utf-8")
-            log_path.write_text(
-                log.replace(gate.CURRENT_SYNC_READAHEAD_MARKER + "\n", ""),
-                encoding="utf-8",
-            )
-            with self.assertRaisesRegex(gate.GateError, "synchronous exact current-route"):
-                gate.analyze(response_path, log_path, expected_path)
-
-    def test_missing_sync_current_receipt_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            response_path, log_path, expected_path = self.fixture(Path(temporary))
-            log = log_path.read_text(encoding="utf-8")
-            receipt = (
-                "[gemma4-ghost-metal] mapped-cold sync-current receipt: "
-                "sequence=102 start_pos=216 K=8 ok=true records=1 "
-                "bytes=3345408 issue_us=1\n"
-            )
-            log_path.write_text(log.replace(receipt, ""), encoding="utf-8")
-            with self.assertRaisesRegex(gate.GateError, "missing synchronous current-route"):
-                gate.analyze(response_path, log_path, expected_path)
-
-    def test_sync_current_receipt_must_equal_exact_mapped_union(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            response_path, log_path, expected_path = self.fixture(Path(temporary))
-            original = log_path.read_text(encoding="utf-8")
-            receipt = (
-                "sequence=100 start_pos=200 K=8 ok=true records=1 "
-                "bytes=3345408 issue_us=1"
-            )
-            for records in (0, 2):
-                byte_count = records * 3_345_408
-                drifted = (
-                    f"sequence=100 start_pos=200 K=8 ok=true records={records} "
-                    f"bytes={byte_count} issue_us=1"
-                )
-                log_path.write_text(original.replace(receipt, drifted), encoding="utf-8")
-                with self.assertRaisesRegex(
-                    gate.GateError, "invalid synchronous current-route"
-                ):
-                    gate.analyze(response_path, log_path, expected_path)
-
-    def test_late_compact_head_initialization_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            response_path, log_path, expected_path = self.fixture(Path(temporary))
-            log = log_path.read_text(encoding="utf-8")
-            log = log.replace(gate.COMPACT_K8_HEAD_MARKER + "\n", "")
-            log += gate.COMPACT_K8_HEAD_MARKER + "\n"
-            log_path.write_text(log, encoding="utf-8")
-            with self.assertRaisesRegex(gate.GateError, "initialized after measured generation"):
                 gate.analyze(response_path, log_path, expected_path)
 
     def test_inconsistent_previous_union_bytes_are_rejected(self) -> None:

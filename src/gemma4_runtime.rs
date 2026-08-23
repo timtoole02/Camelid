@@ -1317,17 +1317,6 @@ impl MappedReadaheadEnqueueReceipt {
     }
 }
 
-/// Exact current-route `MADV_WILLNEED` syscalls issued by the routing caller.
-/// `issued_*` proves only that the kernel accepted the advisory; it never
-/// claims that page-in completed before the verifier consumed the record.
-#[cfg(any(target_os = "macos", test))]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct MappedReadaheadIssueReceipt {
-    issued_records: u64,
-    issued_bytes: u64,
-    issue_us: u64,
-}
-
 /// Reserve a bounded set of record identities for asynchronous advice. Input
 /// duplicates and identities already queued by an earlier layer/round are
 /// suppressed. The caller removes every returned key after its advisory runs
@@ -1453,54 +1442,6 @@ impl GhostMoeExpertCache {
             });
         }
         receipt.enqueue_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
-        receipt
-    }
-
-    /// Issue bounded record-level advice for this layer's exact routed cold
-    /// union before its expert command buffer is committed. The syscall runs
-    /// on the routing caller so it cannot sit behind older work in the read
-    /// pool; actual page-in remains asynchronous kernel work and is never a
-    /// correctness dependency.
-    #[cfg(target_os = "macos")]
-    fn advise_mapped_current_now(
-        &self,
-        layer: usize,
-        cold_experts: &[usize],
-    ) -> MappedReadaheadIssueReceipt {
-        let started = std::time::Instant::now();
-        let mut seen = [false; 128];
-        let mut receipt = MappedReadaheadIssueReceipt::default();
-        for &expert in cold_experts {
-            if expert >= seen.len() || seen[expert] {
-                continue;
-            }
-            seen[expert] = true;
-            let range = self.file.mapped_moe_expert_readahead_range(layer, expert);
-            let (mmap, offset, len) = match range {
-                Ok(Some(range)) => range,
-                Ok(None) => {
-                    eprintln!(
-                        "[gemma4-ghost-metal] mapped-cold MADV_WILLNEED refused: source=current-sync reason=range-unavailable layer={layer} expert={expert}"
-                    );
-                    continue;
-                }
-                Err(error) => {
-                    eprintln!(
-                        "[gemma4-ghost-metal] mapped-cold MADV_WILLNEED refused: source=current-sync reason=range-resolution layer={layer} expert={expert} error={error}"
-                    );
-                    continue;
-                }
-            };
-            if mmap.advise_willneed_range(offset, len) {
-                receipt.issued_records = receipt.issued_records.saturating_add(1);
-                receipt.issued_bytes = receipt.issued_bytes.saturating_add(len as u64);
-            } else {
-                eprintln!(
-                    "[gemma4-ghost-metal] mapped-cold MADV_WILLNEED refused: source=current-sync layer={layer} expert={expert} bytes={len}"
-                );
-            }
-        }
-        receipt.issue_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
         receipt
     }
 
@@ -1759,9 +1700,6 @@ const GHOST_METAL_MAPPED_READAHEAD_POLICY_MARKER: &str =
 #[cfg(any(target_os = "macos", test))]
 const GHOST_METAL_MAPPED_READAHEAD_PREVIOUS_UNION_POLICY_MARKER: &str =
     "[gemma4-ghost-metal] mapped-cold previous-union policy: source=previous-target-exact-routed-union timing=before-assistant scope=selected-cold-only advice=MADV_WILLNEED dispatch=async-read-pool correctness_dependency=0";
-#[cfg(any(target_os = "macos", test))]
-const GHOST_METAL_MAPPED_READAHEAD_CURRENT_SYNC_POLICY_MARKER: &str =
-    "[gemma4-ghost-metal] mapped-cold current-route policy: source=current-target-exact-routed-union timing=before-expert-dispatch advice=MADV_WILLNEED dispatch=sync-caller correctness_dependency=0";
 const GHOST_METAL_HYBRID_PROFILE_LAYERS: usize = 30;
 const GHOST_METAL_HYBRID_PROFILE_MIN_SLOTS: usize = 8;
 const GHOST_METAL_HYBRID_PROFILE_MAX_SLOTS: usize = 64;
@@ -2969,12 +2907,6 @@ struct WaveFillCounters {
     mapped_readahead_advised_records: std::sync::atomic::AtomicU64,
     mapped_readahead_advised_bytes: std::sync::atomic::AtomicU64,
     mapped_readahead_enqueue_us: std::sync::atomic::AtomicU64,
-    /// Exact current-route advisory syscalls accepted inline before expert
-    /// dispatch. These are distinct from the compatibility async-queue
-    /// receipt above and do not claim that page-in completed.
-    mapped_readahead_sync_issued_records: std::sync::atomic::AtomicU64,
-    mapped_readahead_sync_issued_bytes: std::sync::atomic::AtomicU64,
-    mapped_readahead_sync_issue_us: std::sync::atomic::AtomicU64,
 }
 
 /// Payload-I/O receipt owner for a terminal hybrid promotion. HEAD fills feed
@@ -4167,7 +4099,6 @@ impl GhostMetalExpertRuntime {
             if mapped_readahead_enabled {
                 eprintln!("{GHOST_METAL_MAPPED_READAHEAD_POLICY_MARKER}");
                 eprintln!("{GHOST_METAL_MAPPED_READAHEAD_PREVIOUS_UNION_POLICY_MARKER}");
-                eprintln!("{GHOST_METAL_MAPPED_READAHEAD_CURRENT_SYNC_POLICY_MARKER}");
                 eprintln!(
                     "[gemma4-ghost-metal] mapped-cold readahead admission: max_inflight_records={} whole_slab_advice=0 anonymous_capacity_bytes=0 current_routing_enqueued_records=0 current_routing_enqueued_bytes=0 current_routing_enqueue_time_us=0 previous_union_enqueued_records=0 previous_union_enqueued_bytes=0 previous_union_enqueue_time_us=0",
                     GHOST_METAL_MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS,
@@ -4784,26 +4715,22 @@ impl GhostMetalExpertRuntime {
                         })
                         .count();
                     if routed && mapped_readahead_enabled && !cold_experts.is_empty() {
-                        let sync_receipt =
-                            cache.advise_mapped_current_now(layer_idx, &cold_experts);
+                        let receipt = cache.enqueue_mapped_readahead(layer_idx, &cold_experts);
                         fill_counters
-                            .mapped_readahead_sync_issued_records
+                            .mapped_readahead_advised_records
                             .fetch_add(
-                                sync_receipt.issued_records,
+                                receipt.enqueued_records,
                                 std::sync::atomic::Ordering::Relaxed,
                             );
                         fill_counters
-                            .mapped_readahead_sync_issued_bytes
+                            .mapped_readahead_advised_bytes
                             .fetch_add(
-                                sync_receipt.issued_bytes,
+                                receipt.enqueued_bytes,
                                 std::sync::atomic::Ordering::Relaxed,
                             );
                         fill_counters
-                            .mapped_readahead_sync_issue_us
-                            .fetch_add(
-                                sync_receipt.issue_us,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
+                            .mapped_readahead_enqueue_us
+                            .fetch_add(receipt.enqueue_us, std::sync::atomic::Ordering::Relaxed);
                     }
                     fill_counters
                         .plan_hits
@@ -5132,18 +5059,6 @@ impl GhostMetalExpertRuntime {
             }
             if ghost_metal_timing_enabled() {
                 let led = &common.last_chained_ledger;
-                if mapped_readahead_enabled {
-                    eprintln!(
-                        "[gemma4-ghost-metal] mapped-cold sync-current receipt: sequence={round_seq} start_pos={start_pos} K={k_tokens} ok={ok} records={} bytes={} issue_us={}",
-                        fill_counters
-                            .mapped_readahead_sync_issued_records
-                            .load(Relaxed),
-                        fill_counters
-                            .mapped_readahead_sync_issued_bytes
-                            .load(Relaxed),
-                        fill_counters.mapped_readahead_sync_issue_us.load(Relaxed),
-                    );
-                }
                 eprintln!(
                     "[metal chained ledger] start_pos={start_pos} K={k_tokens} ok={ok} predicted={allow_predicted} slot_wait={:.1}ms slot_filler={:.1}ms wave_load={:.1}ms final_wait={:.1}ms encode={:.1}ms gpu_busy(last_cb)={:.1}ms disk_loads={} disk_bytes={:.1}MiB disk_time={:.1}ms unique={} mapped_readahead_current_records={} mapped_readahead_current_bytes={:.1}MiB mapped_readahead_current_enqueue={:.3}ms mapped_readahead_previous_union_records={} mapped_readahead_previous_union_bytes={:.1}MiB mapped_readahead_previous_union_enqueue={:.3}ms",
                     led.slot_wait_ms,
@@ -10431,13 +10346,6 @@ impl Gemma4Runtime {
                 head
             }
         };
-        // Compile the exact speculative tied-head pipelines while the model is
-        // still loading. The first measured K8 verifier must not absorb this
-        // one-time Metal compilation cost.
-        #[cfg(target_os = "macos")]
-        if metal_q6k_head.is_some() {
-            let _ = crate::metal::spec50_head_kernels();
-        }
         let (per_layer_token_embd, per_layer_model_proj, per_layer_proj_norm, rope_factors) =
             match observed_non_head_metadata {
                 Some(metadata) => metadata,
@@ -24449,10 +24357,6 @@ mod ghost_moe_wire_tests {
         assert_eq!(
             GHOST_METAL_MAPPED_READAHEAD_PREVIOUS_UNION_POLICY_MARKER,
             "[gemma4-ghost-metal] mapped-cold previous-union policy: source=previous-target-exact-routed-union timing=before-assistant scope=selected-cold-only advice=MADV_WILLNEED dispatch=async-read-pool correctness_dependency=0"
-        );
-        assert_eq!(
-            GHOST_METAL_MAPPED_READAHEAD_CURRENT_SYNC_POLICY_MARKER,
-            "[gemma4-ghost-metal] mapped-cold current-route policy: source=current-target-exact-routed-union timing=before-expert-dispatch advice=MADV_WILLNEED dispatch=sync-caller correctness_dependency=0"
         );
     }
 
