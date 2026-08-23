@@ -20951,15 +20951,25 @@ fn encode_gemma4_q4_0_gateup_matmul_batch_k(
     }
 
     // The shared-MLP GateUp has 2,112 rows, so every four-row SIMD group is
-    // complete. The exact packed twin removes only the never-taken row-tail
-    // predicate and measured 18.302 -> 14.942 ms over all 30 K=8 layers. K<8
-    // keeps its existing path until it has an independent timing receipt;
+    // complete. The packed twin removes only the never-taken row-tail
+    // predicate. Unlike the legacy fixed-K8 plain and QKV kernels, its K8
+    // output is raw-bit identical to the runtime-width GateUp oracle at both
+    // stress and production shapes, so exact-partition mode may retain this
+    // one independently proven specialization. K<8 keeps its existing path;
     // K>8 returned through spec50_widen above.
-    if !dense_k8_generic()
-        && spec50_packed_gateup_row_complete_eligible(rows, k_batch)
+    let exact_partition = dense_k8_generic();
+    if spec50_packed_gateup_row_complete_eligible(rows, k_batch)
         && spec50_packed_gateup_row_complete_enabled()
     {
         if let Some(packed) = spec50_packed_gateup_kernels() {
+            if exact_partition {
+                static EXACT_PACKED_GATEUP_RECEIPT: std::sync::Once = std::sync::Once::new();
+                EXACT_PACKED_GATEUP_RECEIPT.call_once(|| {
+                    eprintln!(
+                        "[gemma4 exact partition] packed_k8_gateup=row_complete runtime_width_oracle=raw_bit_exact"
+                    );
+                });
+            }
             encode_spec50_packed_gateup_row_complete(
                 e,
                 packed,
@@ -20975,7 +20985,7 @@ fn encode_gemma4_q4_0_gateup_matmul_batch_k(
         }
     }
 
-    if k_batch == 8 && !dense_k8_generic() {
+    if k_batch == 8 && !exact_partition {
         if let Some(pipe) = &k.q4_0_gateup_geglu_block_batch_k8_pipeline {
             e.set_compute_pipeline_state(pipe);
             e.set_buffer(0, Some(y), 0);

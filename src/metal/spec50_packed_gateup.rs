@@ -763,6 +763,50 @@ mod tests {
         );
     }
 
+    /// Encode the runtime-width GateUp pipeline directly, even for K=8.  This
+    /// is the partition-parity oracle used when
+    /// `CAMELID_GEMMA4_DENSE_K8_GENERIC=1`: K=8 must preserve the exact
+    /// floating-point program selected for the K=1 target stream.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_shipped_runtime_gateup(
+        encoder: &metal::ComputeCommandEncoderRef,
+        shipped: &MetalLinearKernel,
+        y: &Buffer,
+        gate_weight: &Buffer,
+        up_weight: &Buffer,
+        act_output: &Buffer,
+        blocks_per_row: u32,
+        rows: usize,
+        k_batch: usize,
+    ) {
+        let pipeline = shipped
+            .q4_0_gateup_geglu_block_batch_k_pipeline
+            .as_ref()
+            .expect("runtime-width guarded GateUp pipeline");
+        let rows_u32 = rows as u32;
+        let k_batch_u32 = k_batch as u32;
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(y), 0);
+        encoder.set_buffer(1, Some(gate_weight), 0);
+        encoder.set_buffer(2, Some(up_weight), 0);
+        encoder.set_buffer(3, Some(act_output), 0);
+        encoder.set_bytes(4, 4, &blocks_per_row as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &rows_u32 as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &k_batch_u32 as *const u32 as *const _);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize {
+                width: (rows as u64).div_ceil(4),
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+
     /// The experiment is admissible only if deleting the row-tail control has
     /// no numerical side effect for every supported wave width. The sweep
     /// includes the real shared GateUp geometry (2112 x 88 blocks).
@@ -831,6 +875,64 @@ mod tests {
                 }
                 assert_eq!(bad, 0, "packed row-complete GateUp lost raw-bit parity");
             }
+        }
+    }
+
+    /// The exact-partition mode deliberately refuses the legacy fixed-K8
+    /// plain and QKV programs.  GateUp is admitted independently only if the
+    /// packed row-complete K8 pipeline remains raw-bit identical to the
+    /// runtime-width GateUp oracle at both a loop-carried stress shape and the
+    /// real 2,112 x 88 shared-MLP geometry.
+    #[test]
+    fn spec50_packed_gateup_k8_is_exact_to_runtime_width_oracle() {
+        let Some(shipped) = metal_linear_kernel() else {
+            eprintln!("[s50p] no Metal device; skipping");
+            return;
+        };
+        let kernels = spec50_packed_gateup_kernels().expect("packed GateUp pipelines");
+        let mut rng = Rng(0x4558_4143_545f_4755);
+
+        for &(rows, blocks) in &[(68usize, 11usize), (2112usize, 88usize)] {
+            let gate = buffer_from(&shipped.device, &random_q4_0(&mut rng, rows, blocks));
+            let up = buffer_from(&shipped.device, &random_q4_0(&mut rng, rows, blocks));
+            let y = buffer_from(&shipped.device, &random_f32(&mut rng, blocks * 32 * 8));
+            let oracle = zero_f32(&shipped.device, rows * 8);
+            let candidate = zero_f32(&shipped.device, rows * 8);
+
+            run(&shipped.queue, |encoder| {
+                encode_shipped_runtime_gateup(
+                    encoder,
+                    shipped,
+                    &y,
+                    &gate,
+                    &up,
+                    &oracle,
+                    blocks as u32,
+                    rows,
+                    8,
+                );
+            });
+            run(&shipped.queue, |encoder| {
+                encode_spec50_packed_gateup_row_complete(
+                    encoder,
+                    kernels,
+                    &y,
+                    &gate,
+                    &up,
+                    &candidate,
+                    blocks as u32,
+                    rows,
+                    8,
+                );
+            });
+
+            let want = read_f32(&oracle, rows * 8);
+            let got = read_f32(&candidate, rows * 8);
+            assert_eq!(
+                mismatch_count(&got, &want),
+                0,
+                "packed K8 GateUp differs from runtime-width oracle at rows={rows} blocks={blocks}"
+            );
         }
     }
 
@@ -1121,7 +1223,9 @@ mod tests {
     }
 
     /// Isolates the row-complete control change from pre-unpacking: candidate
-    /// and reference read the same 30 pairs of packed Q4_0 matrices.
+    /// and both references read the same 30 pairs of packed Q4_0 matrices.
+    /// The runtime-width line is the exact-partition baseline; the fixed-K8
+    /// line remains useful for comparing this result with earlier receipts.
     #[test]
     #[ignore = "GPU microbenchmark; run explicitly with --ignored --test-threads=1"]
     fn spec50_packed_gateup_row_complete_bench_30_layers() {
@@ -1149,9 +1253,24 @@ mod tests {
         }
         let y = buffer_from(&shipped.device, &random_f32(&mut rng, BLOCKS * 32 * K));
         let out = zero_f32(&shipped.device, ROWS * K);
-        let old_ms = timed_sweep(&shipped.queue, |encoder| {
+        let fixed_k8_ms = timed_sweep(&shipped.queue, |encoder| {
             for layer in 0..LAYERS {
                 encode_shipped_guarded_gateup(
+                    encoder,
+                    shipped,
+                    &y,
+                    &gates[layer],
+                    &ups[layer],
+                    &out,
+                    BLOCKS as u32,
+                    ROWS,
+                    K,
+                );
+            }
+        });
+        let runtime_width_ms = timed_sweep(&shipped.queue, |encoder| {
+            for layer in 0..LAYERS {
+                encode_shipped_runtime_gateup(
                     encoder,
                     shipped,
                     &y,
@@ -1186,14 +1305,18 @@ mod tests {
             bytes / 1.0e6
         );
         println!(
-            "  shipped guarded : {old_ms:8.3} ms ({:6.1} GB/s)",
-            bytes / old_ms / 1.0e6
+            "  shipped fixed K8: {fixed_k8_ms:8.3} ms ({:6.1} GB/s)",
+            bytes / fixed_k8_ms / 1.0e6
         );
         println!(
-            "  packed row-complete: {candidate_ms:8.3} ms ({:6.1} GB/s), {:.3}x, {:+.3} ms",
+            "  runtime-width K8: {runtime_width_ms:8.3} ms ({:6.1} GB/s)",
+            bytes / runtime_width_ms / 1.0e6
+        );
+        println!(
+            "  packed row-complete: {candidate_ms:8.3} ms ({:6.1} GB/s), {:.3}x exact, {:+.3} ms",
             bytes / candidate_ms / 1.0e6,
-            old_ms / candidate_ms,
-            candidate_ms - old_ms,
+            runtime_width_ms / candidate_ms,
+            candidate_ms - runtime_width_ms,
         );
         println!(
             "  pipeline limits: guarded max/TG={} width={} | row-complete max/TG={} width={}",
