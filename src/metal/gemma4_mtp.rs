@@ -1839,49 +1839,6 @@ fn f32_to_bf16_rne_bits(value: f32) -> u16 {
     (bits.wrapping_add(bias) >> 16) as u16
 }
 
-fn f32_to_f16_bits(x: f32) -> u16 {
-    let bits = x.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exp = ((bits >> 23) & 0xff) as i32;
-    let mant = bits & 0x007f_ffff;
-    if exp == 0xff {
-        return sign | 0x7c00 | if mant != 0 { 0x0200 } else { 0 };
-    }
-    let unbiased = exp - 127;
-    if unbiased > 15 {
-        return sign | 0x7c00;
-    }
-    if unbiased >= -14 {
-        let mut half_exp = (unbiased + 15) as u32;
-        let mut half_mant = mant >> 13;
-        let rem = mant & 0x1fff;
-        if rem > 0x1000 || (rem == 0x1000 && (half_mant & 1) != 0) {
-            half_mant += 1;
-            if half_mant >= 0x400 {
-                half_mant = 0;
-                half_exp += 1;
-                if half_exp > 30 {
-                    return sign | 0x7c00;
-                }
-            }
-        }
-        sign | ((half_exp as u16) << 10) | (half_mant as u16)
-    } else if unbiased >= -24 {
-        let shift = (-14 - unbiased) as u32 + 13;
-        let full_mant = mant | 0x0080_0000;
-        let mut half_mant = full_mant >> shift;
-        let rem_mask = (1 << shift) - 1;
-        let half_bit = 1 << (shift - 1);
-        let rem = full_mant & rem_mask;
-        if rem > half_bit || (rem == half_bit && (half_mant & 1) != 0) {
-            half_mant += 1;
-        }
-        sign | (half_mant as u16)
-    } else {
-        sign
-    }
-}
-
 fn round_to_bf16_f32(value: f32) -> f32 {
     bf16_bits_to_f32(f32_to_bf16_rne_bits(value))
 }
@@ -4432,14 +4389,21 @@ fn quantize_q4_0_row(input: &[u16], output: &mut [u8]) {
     {
         let mut f32_vals = [0.0f32; Q4_0_BLOCK_VALUES];
         let mut max_abs = 0.0f32;
+        let mut signed_max = 0.0f32;
         for (destination, bits) in f32_vals.iter_mut().zip(block_in) {
             let value = bf16_bits_to_f32(*bits);
             *destination = value;
-            max_abs = max_abs.max(value.abs());
+            let absolute = value.abs();
+            if absolute > max_abs {
+                max_abs = absolute;
+                signed_max = value;
+            }
         }
-        let scale = max_abs / -8.0;
+        // Match ggml Q4_0 exactly: the sign of the first max-magnitude
+        // element selects which side of the block receives the -8 code.
+        let scale = signed_max / -8.0;
         let inv_scale = if scale != 0.0 { 1.0 / scale } else { 0.0 };
-        block_out[..2].copy_from_slice(&f32_to_f16_bits(scale).to_le_bytes());
+        block_out[..2].copy_from_slice(&crate::tensor::f32_to_f16_bits(scale).to_le_bytes());
         for index in 0..16 {
             let low = (f32_vals[index] * inv_scale + 8.5).floor().clamp(0.0, 15.0) as u8;
             let high = (f32_vals[index + 16] * inv_scale + 8.5)
@@ -4988,6 +4952,43 @@ mod tests {
         assert_eq!(first, second);
         assert_ne!(&first[..2], &[0, 0]);
         assert!(first[2..].iter().any(|byte| *byte != 0x88));
+    }
+
+    #[test]
+    fn q4_row_encoder_matches_canonical_signed_max_for_both_dominant_signs() {
+        fn assert_matches_reference(values: [f32; Q4_0_BLOCK_VALUES]) {
+            let bf16: [u16; Q4_0_BLOCK_VALUES] = values.map(f32_to_bf16_rne_bits);
+            let reference_input: [f32; Q4_0_BLOCK_VALUES] = bf16.map(bf16_bits_to_f32);
+            let reference = crate::tensor::kv_quant::quantize_block_q4_0(&reference_input);
+            let mut actual = [0u8; Q4_0_BLOCK_BYTES];
+            quantize_q4_0_row(&bf16, &mut actual);
+            assert_eq!(&actual[..2], &reference.scale.to_le_bytes());
+            assert_eq!(&actual[2..], &reference.qs);
+        }
+
+        let mut negative_dominant = [0.0f32; Q4_0_BLOCK_VALUES];
+        negative_dominant[0] = -8.0;
+        negative_dominant[Q4_0_BLOCK_VALUES / 2] = 7.0;
+        assert_matches_reference(negative_dominant);
+
+        let mut positive_dominant = [0.0f32; Q4_0_BLOCK_VALUES];
+        positive_dominant[0] = 8.0;
+        positive_dominant[Q4_0_BLOCK_VALUES / 2] = -7.0;
+        assert_matches_reference(positive_dominant);
+
+        // Exercise an f16 subnormal scale just above the halfway-to-zero tie.
+        // This catches local conversion shortcuts that incorrectly flush the
+        // entire unbiased-exponent -25 range instead of rounding to 0x0001.
+        let tiny = f32::from_bits(0x3481_0000);
+        let mut tiny_positive_dominant = [0.0f32; Q4_0_BLOCK_VALUES];
+        tiny_positive_dominant[0] = tiny;
+        tiny_positive_dominant[Q4_0_BLOCK_VALUES / 2] = -tiny * 0.5;
+        assert_matches_reference(tiny_positive_dominant);
+
+        let mut tiny_negative_dominant = [0.0f32; Q4_0_BLOCK_VALUES];
+        tiny_negative_dominant[0] = -tiny;
+        tiny_negative_dominant[Q4_0_BLOCK_VALUES / 2] = tiny * 0.5;
+        assert_matches_reference(tiny_negative_dominant);
     }
 
     #[test]
