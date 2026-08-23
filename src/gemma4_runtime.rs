@@ -1675,6 +1675,14 @@ const GHOST_METAL_FILE_MAPPED_EXPERTS_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_FI
 /// preserves the mapped-only foundation.
 const GHOST_METAL_HYBRID_HOT_SLOTS_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS";
 const GHOST_METAL_HYBRID_HOT_SLOTS: usize = 32;
+/// Default-off exact A/B selector for a uniform 40-record anonymous cache.
+/// Like Hot48, this remains subordinate to the canonical Hot32 parent opt-in;
+/// the experiment name changes physical geometry without widening the public
+/// parent selector. The verifier is admitted only for exact K=1..=8 rounds.
+const GHOST_METAL_HYBRID_HOT40_EXPERIMENT_ENV: &str =
+    "CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT40_EXPERIMENT";
+const GHOST_METAL_HYBRID_HOT40_SLOTS: usize = 40;
+const GHOST_METAL_HYBRID_HOT40_MAX_K: usize = 8;
 /// Runtime-only exact A/B selector for a uniform 48-record anonymous cache.
 /// It remains subordinate to the frozen `HYBRID_HOT_SLOTS=32` admission so
 /// merely changing the receipted parent selector can never enter this lane.
@@ -1876,6 +1884,7 @@ fn parse_ghost_metal_hybrid_hot_slots(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GhostMetalHybridHotAdmission {
     CanonicalHot32,
+    UniformHot40Experiment,
     UniformHot48Experiment,
 }
 
@@ -1884,8 +1893,22 @@ impl GhostMetalHybridHotAdmission {
     fn handoff_label(self) -> &'static str {
         match self {
             Self::CanonicalHot32 => "hot32",
+            Self::UniformHot40Experiment => "hot40-experiment",
             Self::UniformHot48Experiment => "hot48-experiment",
         }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_ghost_metal_hybrid_hot40_experiment(
+    value: Option<&str>,
+) -> std::result::Result<bool, String> {
+    match value {
+        None => Ok(false),
+        Some("1") => Ok(true),
+        Some(_) => Err(format!(
+            "{GHOST_METAL_HYBRID_HOT40_EXPERIMENT_ENV} is an exact opt-in and must be canonical 1 when present"
+        )),
     }
 }
 
@@ -1905,9 +1928,28 @@ fn parse_ghost_metal_hybrid_hot48_experiment(
 #[cfg(any(target_os = "macos", test))]
 fn resolve_ghost_metal_hybrid_hot_admission(
     canonical_hot_slots: Option<usize>,
+    uniform_hot40_experiment: bool,
     uniform_hot48_experiment: bool,
     per_layer_profile_present: bool,
 ) -> std::result::Result<Option<GhostMetalHybridHotAdmission>, String> {
+    if uniform_hot40_experiment && uniform_hot48_experiment {
+        return Err(format!(
+            "{GHOST_METAL_HYBRID_HOT40_EXPERIMENT_ENV}=1 and {GHOST_METAL_HYBRID_HOT48_EXPERIMENT_ENV}=1 are mutually exclusive exact geometries"
+        ));
+    }
+    if uniform_hot40_experiment {
+        if canonical_hot_slots != Some(GHOST_METAL_HYBRID_HOT_SLOTS) {
+            return Err(format!(
+                "{GHOST_METAL_HYBRID_HOT40_EXPERIMENT_ENV}=1 requires {GHOST_METAL_HYBRID_HOT_SLOTS_ENV}={GHOST_METAL_HYBRID_HOT_SLOTS}"
+            ));
+        }
+        if per_layer_profile_present {
+            return Err(format!(
+                "{GHOST_METAL_HYBRID_HOT40_EXPERIMENT_ENV}=1 forbids {GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER_ENV}; Hot40 is an exact uniform experiment"
+            ));
+        }
+        return Ok(Some(GhostMetalHybridHotAdmission::UniformHot40Experiment));
+    }
     if uniform_hot48_experiment {
         if canonical_hot_slots != Some(GHOST_METAL_HYBRID_HOT_SLOTS) {
             return Err(format!(
@@ -1960,6 +2002,25 @@ fn validate_ghost_metal_hybrid_hot_profile_for_admission(
     match admission {
         GhostMetalHybridHotAdmission::CanonicalHot32 => {
             validate_ghost_metal_hybrid_hot_profile(profile)
+        }
+        GhostMetalHybridHotAdmission::UniformHot40Experiment => {
+            if profile.len() != GHOST_METAL_HYBRID_PROFILE_LAYERS {
+                return Err(format!(
+                    "{GHOST_METAL_HYBRID_HOT40_EXPERIMENT_ENV}=1 requires exactly {GHOST_METAL_HYBRID_PROFILE_LAYERS} hot-cache layers, found {}",
+                    profile.len(),
+                ));
+            }
+            if let Some((layer, slots)) = profile
+                .iter()
+                .copied()
+                .enumerate()
+                .find(|(_, slots)| *slots != GHOST_METAL_HYBRID_HOT40_SLOTS)
+            {
+                return Err(format!(
+                    "{GHOST_METAL_HYBRID_HOT40_EXPERIMENT_ENV}=1 requires exactly {GHOST_METAL_HYBRID_HOT40_SLOTS} slots on every layer; layer {layer} has {slots}"
+                ));
+            }
+            Ok(())
         }
         GhostMetalHybridHotAdmission::UniformHot48Experiment => {
             if profile.len() != GHOST_METAL_HYBRID_PROFILE_LAYERS {
@@ -2066,8 +2127,22 @@ fn ghost_metal_uniform_hybrid_hot_profile() -> Vec<usize> {
 }
 
 #[cfg(any(target_os = "macos", test))]
+fn ghost_metal_uniform_hybrid_hot40_profile() -> Vec<usize> {
+    vec![GHOST_METAL_HYBRID_HOT40_SLOTS; GHOST_METAL_HYBRID_PROFILE_LAYERS]
+}
+
+#[cfg(any(target_os = "macos", test))]
 fn ghost_metal_uniform_hybrid_hot48_profile() -> Vec<usize> {
     vec![GHOST_METAL_HYBRID_HOT48_SLOTS; GHOST_METAL_HYBRID_PROFILE_LAYERS]
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn ghost_metal_hybrid_hot_admits_verifier_k(
+    admission: Option<GhostMetalHybridHotAdmission>,
+    k_tokens: usize,
+) -> bool {
+    admission != Some(GhostMetalHybridHotAdmission::UniformHot40Experiment)
+        || (1..=GHOST_METAL_HYBRID_HOT40_MAX_K).contains(&k_tokens)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -4288,7 +4363,16 @@ impl GhostMetalExpertRuntime {
             let uniform = profile
                 .iter()
                 .all(|&slots| slots == GHOST_METAL_HYBRID_HOT_SLOTS);
-            if hybrid_hot_admission == Some(GhostMetalHybridHotAdmission::UniformHot48Experiment) {
+            if hybrid_hot_admission == Some(GhostMetalHybridHotAdmission::UniformHot40Experiment) {
+                eprintln!(
+                    "[gemma4-ghost-metal] HYBRID HOT40 EXPERIMENT ACTIVE: {GHOST_METAL_FILE_MAPPED_EXPERTS_ENV}=1 {GHOST_METAL_HYBRID_HOT_SLOTS_ENV}={} {GHOST_METAL_HYBRID_HOT40_EXPERIMENT_ENV}=1, layers={layer_count} canonical_addressable=128/layer physical_hot={}/layer hot_capacity_slots={hot_slots} hot_capacity_bytes={hot_bytes} mapped_cold_span_bytes={mapped_span_bytes} verifier_k=1..={} overflow=0 victim=0 slot_pin=off prediction=off",
+                    GHOST_METAL_HYBRID_HOT_SLOTS,
+                    GHOST_METAL_HYBRID_HOT40_SLOTS,
+                    GHOST_METAL_HYBRID_HOT40_MAX_K,
+                );
+            } else if hybrid_hot_admission
+                == Some(GhostMetalHybridHotAdmission::UniformHot48Experiment)
+            {
                 eprintln!(
                     "[gemma4-ghost-metal] HYBRID HOT48 EXPERIMENT ACTIVE: {GHOST_METAL_FILE_MAPPED_EXPERTS_ENV}=1 {GHOST_METAL_HYBRID_HOT_SLOTS_ENV}={} {GHOST_METAL_HYBRID_HOT48_EXPERIMENT_ENV}=1, layers={layer_count} canonical_addressable=128/layer physical_hot={}/layer hot_capacity_slots={hot_slots} hot_capacity_bytes={hot_bytes} mapped_cold_span_bytes={mapped_span_bytes} overflow=0 victim=0 slot_pin=off prediction=off",
                     GHOST_METAL_HYBRID_HOT_SLOTS,
@@ -4668,6 +4752,25 @@ impl GhostMetalExpertRuntime {
         ghost_cache: Option<&GhostMoeExpertCache>,
         out_rows: &mut [Vec<f32>],
     ) -> bool {
+        let k_tokens = hidden_rows.len();
+        if !ghost_metal_hybrid_hot_admits_verifier_k(self.hybrid_hot_admission, k_tokens) {
+            // Hot40 is intentionally a K<=8 experiment, not a new general
+            // geometry. Refuse before table construction, routing, page
+            // advice, command encoding, or token/KV mutation and invalidate
+            // the prior attempt's ledger so telemetry cannot reuse it.
+            self.pending_previous_union_readahead = None;
+            self.chained_round_seq = self.chained_round_seq.saturating_add(1);
+            self.last_chained_k = Some(k_tokens);
+            self.last_chained_succeeded = false;
+            self.last_chained_sig = None;
+            if let Some(common) = self.common.as_mut() {
+                common.last_chained_ledger = crate::metal::ChainedRoundHostLedger::default();
+            }
+            eprintln!(
+                "[gemma4-ghost-metal] Hot40 verifier refused before routing: start_pos={start_pos} K={k_tokens} exact_range=1..={GHOST_METAL_HYBRID_HOT40_MAX_K}"
+            );
+            return false;
+        }
         // Last-round prefetch is background prediction, never the outer critical path.
         let prefetch_ms = 0.0;
         // MTP schedules this receipt from the previous successful target union
@@ -4723,7 +4826,6 @@ impl GhostMetalExpertRuntime {
         }
         let setup_ms = t_setup.elapsed().as_secs_f64() * 1000.0;
 
-        let k_tokens = hidden_rows.len();
         // Predicted round-level submit reuses the previous round's per-layer
         // expert unions. That is only sound when the previous chained round
         // verified the SAME chunk at the SAME position (identical hidden rows):
@@ -7991,8 +8093,8 @@ pub struct Gemma4RoutedExpertResidencySnapshot {
 /// Stable response schema for one completed, measured request on the bounded
 /// anonymous-hot / canonical-file-mapped Gemma 4 lane. Per-layer capacity is
 /// explicit. Schema v2 admits the receipted 960-record Hot32/profile family
-/// and the exact uniform 1,440-record Hot48 experiment only. These structures
-/// are deliberately separate from
+/// plus the exact uniform 1,200-record Hot40 and 1,440-record Hot48 experiments
+/// only. These structures are deliberately separate from
 /// [`Gemma4GenerationOutcome`]: existing runtime callers retain that enum
 /// unchanged, while the non-streaming serve bridge can carry this optional
 /// receipt as a sidecar.
@@ -8145,6 +8247,7 @@ pub struct Gemma4HybridTelemetryMetrics {
 const HYBRID_TELEMETRY_LAYERS: usize = 30;
 const HYBRID_TELEMETRY_LOGICAL_PER_LAYER: u64 = 128;
 const HYBRID_TELEMETRY_HOT_PER_LAYER: u64 = GHOST_METAL_HYBRID_HOT_SLOTS as u64;
+const HYBRID_TELEMETRY_HOT40_PER_LAYER: u64 = GHOST_METAL_HYBRID_HOT40_SLOTS as u64;
 const HYBRID_TELEMETRY_HOT48_PER_LAYER: u64 = GHOST_METAL_HYBRID_HOT48_SLOTS as u64;
 const HYBRID_TELEMETRY_RECORD_BYTES: u64 = 3_345_408;
 const HYBRID_TELEMETRY_STRIDE_BYTES: u64 = 3_358_720;
@@ -8518,15 +8621,23 @@ fn exact_hybrid_telemetry_geometry(
 ) -> Option<Gemma4HybridTelemetryGeometry> {
     let layers = HYBRID_TELEMETRY_LAYERS as u64;
     let logical_total = layers.checked_mul(HYBRID_TELEMETRY_LOGICAL_PER_LAYER)?;
-    // Schema v2 admits exactly the frozen aggregate-960 Hot32/profile family
-    // or the runtime-only uniform Hot48 A/B. A mixed or uneven 1,440-record
-    // geometry intentionally falls back to the 960 expectation and refuses.
+    // Schema v2 admits exactly the frozen aggregate-960 Hot32/profile family,
+    // runtime-only uniform Hot40, or runtime-only uniform Hot48. Mixed or
+    // uneven experiment totals intentionally fall back to the 960 expectation
+    // and refuse.
+    let uniform_hot40 = snapshot.per_layer.len() == HYBRID_TELEMETRY_LAYERS
+        && snapshot
+            .per_layer
+            .iter()
+            .all(|layer| layer.anonymous_slot_capacity == HYBRID_TELEMETRY_HOT40_PER_LAYER);
     let uniform_hot48 = snapshot.per_layer.len() == HYBRID_TELEMETRY_LAYERS
         && snapshot
             .per_layer
             .iter()
             .all(|layer| layer.anonymous_slot_capacity == HYBRID_TELEMETRY_HOT48_PER_LAYER);
-    let hot_per_layer = if uniform_hot48 {
+    let hot_per_layer = if uniform_hot40 {
+        HYBRID_TELEMETRY_HOT40_PER_LAYER
+    } else if uniform_hot48 {
         HYBRID_TELEMETRY_HOT48_PER_LAYER
     } else {
         HYBRID_TELEMETRY_HOT_PER_LAYER
@@ -8671,7 +8782,7 @@ pub struct Gemma4GhostLoadAllocationLedger {
     pub expert_slot_capacity_bytes: u64,
     /// Exact anonymous record allocation by layer. This distinguishes the
     /// profiled 960-record cache, legacy uniform 32×30 geometry, and exact
-    /// uniform 48×30 experiment without inferring a memory ceiling.
+    /// uniform 40×30 / 48×30 experiments without inferring a memory ceiling.
     pub expert_anonymous_slots_per_layer: [u16; 30],
     /// Clean file-backed expert addressability, kept separate from anonymous
     /// capacity and from proof of current physical residency.
@@ -10167,6 +10278,18 @@ impl Gemma4Runtime {
                 std::env::var_os(GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER_ENV).is_some();
             let hybrid_hot_profile_raw =
                 std::env::var(GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER_ENV).ok();
+            let hybrid_hot40_raw = match std::env::var(GHOST_METAL_HYBRID_HOT40_EXPERIMENT_ENV) {
+                Ok(value) => Some(value),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    return Err(BackendError::InvalidModelMetadata(format!(
+                        "{GHOST_METAL_HYBRID_HOT40_EXPERIMENT_ENV} must be canonical UTF-8 1 when present"
+                    )));
+                }
+            };
+            let hybrid_hot40_experiment =
+                parse_ghost_metal_hybrid_hot40_experiment(hybrid_hot40_raw.as_deref())
+                    .map_err(BackendError::InvalidModelMetadata)?;
             let hybrid_hot48_raw = match std::env::var(GHOST_METAL_HYBRID_HOT48_EXPERIMENT_ENV) {
                 Ok(value) => Some(value),
                 Err(std::env::VarError::NotPresent) => None,
@@ -10181,11 +10304,22 @@ impl Gemma4Runtime {
                     .map_err(BackendError::InvalidModelMetadata)?;
             let hybrid_hot_admission = resolve_ghost_metal_hybrid_hot_admission(
                 hybrid_hot_slots,
+                hybrid_hot40_experiment,
                 hybrid_hot48_experiment,
                 hybrid_hot_profile_present,
             )
             .map_err(BackendError::InvalidModelMetadata)?;
-            let hybrid_hot_profile_override = if hybrid_hot48_experiment {
+            let configured_verifier_k = crate::metal::gemma4_max_spec_chunk();
+            if !ghost_metal_hybrid_hot_admits_verifier_k(
+                hybrid_hot_admission,
+                configured_verifier_k,
+            ) {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "{GHOST_METAL_HYBRID_HOT40_EXPERIMENT_ENV}=1 requires CAMELID_GEMMA4_SPEC_CHUNK_MAX in 1..={GHOST_METAL_HYBRID_HOT40_MAX_K}; configured verifier ceiling is K={configured_verifier_k}"
+                )));
+            }
+            let hybrid_hot_profile_override = if hybrid_hot40_experiment || hybrid_hot48_experiment
+            {
                 None
             } else {
                 parse_ghost_metal_hybrid_hot_profile(hybrid_hot_profile_raw.as_deref())
@@ -10243,14 +10377,17 @@ impl Gemma4Runtime {
                     "{GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER_ENV} requires {GHOST_METAL_HYBRID_HOT_SLOTS_ENV}={GHOST_METAL_HYBRID_HOT_SLOTS}"
                 )));
             }
-            let hybrid_hot_slots_per_layer = hybrid_hot_admission.map(|admission| {
-                if admission == GhostMetalHybridHotAdmission::UniformHot48Experiment {
-                    ghost_metal_uniform_hybrid_hot48_profile()
-                } else {
-                    hybrid_hot_profile_override
-                        .unwrap_or_else(ghost_metal_uniform_hybrid_hot_profile)
-                }
-            });
+            let hybrid_hot_slots_per_layer =
+                hybrid_hot_admission.map(|admission| match admission {
+                    GhostMetalHybridHotAdmission::UniformHot40Experiment => {
+                        ghost_metal_uniform_hybrid_hot40_profile()
+                    }
+                    GhostMetalHybridHotAdmission::UniformHot48Experiment => {
+                        ghost_metal_uniform_hybrid_hot48_profile()
+                    }
+                    GhostMetalHybridHotAdmission::CanonicalHot32 => hybrid_hot_profile_override
+                        .unwrap_or_else(ghost_metal_uniform_hybrid_hot_profile),
+                });
             if hybrid_hot_slots.is_some()
                 && std::env::var("CAMELID_GEMMA4_SLOT_PIN").as_deref() != Ok("0")
             {
@@ -12749,19 +12886,29 @@ impl Gemma4Runtime {
             }
 
             let round_started = std::time::Instant::now();
+            let draft_limit = max_drafts.min(remaining_budget - 1);
+            let planned_verifier_k = draft_limit.saturating_add(1);
             // Reuse the previous successful target round's exact routed union
             // as advice only. Dispatch before starting the assistant timer so
             // clean mmap faults can overlap assistant Metal work and are in
             // flight before this round's verifier begins.
             if let Ok(mut guard) = self.metal_q4_experts.lock() {
                 if let Some(lane) = guard.as_mut() {
+                    if !ghost_metal_hybrid_hot_admits_verifier_k(
+                        lane.hybrid_hot_admission,
+                        planned_verifier_k,
+                    ) {
+                        lane.pending_previous_union_readahead = None;
+                        return Err(BackendError::InvalidModelMetadata(format!(
+                            "Hot40 refused planned verifier K={planned_verifier_k} before assistant or mapped page advice; exact range is 1..={GHOST_METAL_HYBRID_HOT40_MAX_K}"
+                        )));
+                    }
                     let _ = lane.enqueue_previous_target_union_mapped_readahead(
                         self.ghost_moe_cache.as_deref(),
                         pos,
                     );
                 }
             }
-            let draft_limit = max_drafts.min(remaining_budget - 1);
             let budget_truncated = remaining_budget < max_verify_k;
             let mut proposed_drafts = Vec::with_capacity(draft_limit);
             let mut assistant_gpu_us = 0u64;
@@ -22819,6 +22966,45 @@ mod mtp_target_seam_tests {
     }
 
     #[test]
+    fn hybrid_telemetry_schema_v2_whitelists_exact_uniform_hot40_ledger() {
+        let mut uniform_hot40 = exact_hybrid_snapshot(10, None, 0, 0);
+        set_uniform_hybrid_hot_capacity(&mut uniform_hot40, HYBRID_TELEMETRY_HOT40_PER_LAYER);
+        let geometry = exact_hybrid_telemetry_geometry(&uniform_hot40)
+            .expect("uniform Hot40 is an exact schema-v2 experiment geometry");
+        assert_eq!(geometry.layers, 30);
+        assert_eq!(geometry.logical_addressable_slots, 3_840);
+        assert_eq!(geometry.anonymous_hot_capacity_slots, 1_200);
+        assert_eq!(geometry.anonymous_hot_capacity_bytes, 4_030_464_000);
+        assert_eq!(geometry.file_mapped_addressable_slots, 3_840);
+        assert_eq!(geometry.file_mapped_address_span_bytes, 12_897_484_800);
+        assert_eq!(geometry.overflow_slots, 0);
+        assert_eq!(geometry.victim_record_capacity, 0);
+        assert_eq!(geometry.per_layer.len(), 30);
+        assert!(geometry.per_layer.iter().all(|layer| {
+            layer.logical_addressable_slots == 128
+                && layer.anonymous_hot_capacity_slots == 40
+                && layer.anonymous_hot_capacity_bytes == 134_348_800
+                && layer.file_mapped_addressable_slots == 128
+                && layer.overflow_slots == 0
+                && layer.victim_slots == 0
+        }));
+
+        let mut mixed_hot40 = uniform_hot40;
+        for (layer, slots) in [(0usize, 39u64), (1, 41)] {
+            mixed_hot40.per_layer[layer].anonymous_slot_capacity = slots;
+            mixed_hot40.per_layer[layer].anonymous_slot_capacity_bytes =
+                slots * HYBRID_TELEMETRY_STRIDE_BYTES;
+            mixed_hot40.per_layer[layer].physical_base_slot_budget = slots;
+            mixed_hot40.per_layer[layer].physical_base_slot_budget_bytes =
+                slots * HYBRID_TELEMETRY_STRIDE_BYTES;
+        }
+        assert!(
+            exact_hybrid_telemetry_geometry(&mixed_hot40).is_none(),
+            "aggregate 1,200 is not sufficient: every layer must be exactly 40"
+        );
+    }
+
+    #[test]
     fn hybrid_telemetry_schema_v2_whitelists_exact_uniform_hot48_only() {
         let mut uniform_hot48 = exact_hybrid_snapshot(10, None, 0, 0);
         set_uniform_hybrid_hot_capacity(&mut uniform_hot48, HYBRID_TELEMETRY_HOT48_PER_LAYER);
@@ -24877,20 +25063,20 @@ mod ghost_moe_wire_tests {
         }
 
         assert_eq!(
-            resolve_ghost_metal_hybrid_hot_admission(None, false, false).unwrap(),
+            resolve_ghost_metal_hybrid_hot_admission(None, false, false, false).unwrap(),
             None
         );
         assert_eq!(
-            resolve_ghost_metal_hybrid_hot_admission(Some(32), false, false).unwrap(),
+            resolve_ghost_metal_hybrid_hot_admission(Some(32), false, false, false).unwrap(),
             Some(GhostMetalHybridHotAdmission::CanonicalHot32)
         );
         assert_eq!(
-            resolve_ghost_metal_hybrid_hot_admission(Some(32), true, false).unwrap(),
+            resolve_ghost_metal_hybrid_hot_admission(Some(32), false, true, false).unwrap(),
             Some(GhostMetalHybridHotAdmission::UniformHot48Experiment)
         );
-        assert!(resolve_ghost_metal_hybrid_hot_admission(None, true, false).is_err());
-        assert!(resolve_ghost_metal_hybrid_hot_admission(Some(48), true, false).is_err());
-        assert!(resolve_ghost_metal_hybrid_hot_admission(Some(32), true, true).is_err());
+        assert!(resolve_ghost_metal_hybrid_hot_admission(None, false, true, false).is_err());
+        assert!(resolve_ghost_metal_hybrid_hot_admission(Some(48), false, true, false).is_err());
+        assert!(resolve_ghost_metal_hybrid_hot_admission(Some(32), false, true, true).is_err());
         assert_eq!(
             GhostMetalHybridHotAdmission::CanonicalHot32.handoff_label(),
             "hot32"
@@ -24899,6 +25085,103 @@ mod ghost_moe_wire_tests {
             GhostMetalHybridHotAdmission::UniformHot48Experiment.handoff_label(),
             "hot48-experiment"
         );
+    }
+
+    #[test]
+    fn metal_hybrid_hot40_experiment_is_exact_subordinate_mutually_exclusive_and_k8_bounded() {
+        assert!(!parse_ghost_metal_hybrid_hot40_experiment(None).unwrap());
+        assert!(parse_ghost_metal_hybrid_hot40_experiment(Some("1")).unwrap());
+        for invalid in ["", "0", "01", "+1", " 1", "1 ", "true", "40", "junk"] {
+            assert!(
+                parse_ghost_metal_hybrid_hot40_experiment(Some(invalid)).is_err(),
+                "Hot40 experiment value {invalid:?} must fail closed"
+            );
+        }
+
+        assert_eq!(
+            resolve_ghost_metal_hybrid_hot_admission(Some(32), true, false, false).unwrap(),
+            Some(GhostMetalHybridHotAdmission::UniformHot40Experiment)
+        );
+        assert!(resolve_ghost_metal_hybrid_hot_admission(None, true, false, false).is_err());
+        assert!(resolve_ghost_metal_hybrid_hot_admission(Some(40), true, false, false).is_err());
+        assert!(resolve_ghost_metal_hybrid_hot_admission(Some(32), true, false, true).is_err());
+        assert!(
+            resolve_ghost_metal_hybrid_hot_admission(Some(32), true, true, false).is_err(),
+            "Hot40 and Hot48 exact selectors must never coexist"
+        );
+        assert_eq!(
+            GhostMetalHybridHotAdmission::UniformHot40Experiment.handoff_label(),
+            "hot40-experiment"
+        );
+        let hot40_admission = Some(GhostMetalHybridHotAdmission::UniformHot40Experiment);
+        assert!(ghost_metal_hybrid_hot_admits_verifier_k(
+            hot40_admission,
+            1,
+        ));
+        assert!(ghost_metal_hybrid_hot_admits_verifier_k(
+            hot40_admission,
+            8,
+        ));
+        assert!(!ghost_metal_hybrid_hot_admits_verifier_k(
+            hot40_admission,
+            9,
+        ));
+        for k in 2..8 {
+            assert!(ghost_metal_hybrid_hot_admits_verifier_k(
+                hot40_admission,
+                k,
+            ));
+        }
+        for k in [0, 16] {
+            assert!(!ghost_metal_hybrid_hot_admits_verifier_k(
+                hot40_admission,
+                k,
+            ));
+        }
+        assert!(ghost_metal_hybrid_hot_admits_verifier_k(
+            Some(GhostMetalHybridHotAdmission::CanonicalHot32),
+            9,
+        ));
+    }
+
+    #[test]
+    fn metal_hybrid_hot40_profile_admission_is_exact_uniform_30_by_40() {
+        let hot32 = ghost_metal_uniform_hybrid_hot_profile();
+        let hot40 = ghost_metal_uniform_hybrid_hot40_profile();
+        let encoded_hot40 = hot40
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(hot40.len(), 30);
+        assert_eq!(hot40.iter().sum::<usize>(), 1_200);
+        assert!(parse_ghost_metal_hybrid_hot_profile(Some(&encoded_hot40)).is_err());
+        assert!(validate_ghost_metal_hybrid_hot_profile(&hot40).is_err());
+        assert!(validate_ghost_metal_hybrid_hot_profile_for_admission(
+            &hot40,
+            GhostMetalHybridHotAdmission::UniformHot40Experiment,
+        )
+        .is_ok());
+        assert!(validate_ghost_metal_hybrid_hot_profile_for_admission(
+            &hot32,
+            GhostMetalHybridHotAdmission::UniformHot40Experiment,
+        )
+        .is_err());
+        assert!(validate_ghost_metal_hybrid_hot_profile_for_admission(
+            &hot40[..29],
+            GhostMetalHybridHotAdmission::UniformHot40Experiment,
+        )
+        .is_err());
+
+        let mut mixed = hot40;
+        mixed[0] = 39;
+        mixed[1] = 41;
+        assert_eq!(mixed.iter().sum::<usize>(), 30 * 40);
+        assert!(validate_ghost_metal_hybrid_hot_profile_for_admission(
+            &mixed,
+            GhostMetalHybridHotAdmission::UniformHot40Experiment,
+        )
+        .is_err());
     }
 
     #[test]
