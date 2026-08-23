@@ -687,6 +687,389 @@ static inline void spec50_gateup_tiled_body(
 "#;
 
 // ---------------------------------------------------------------------------
+// Exact-partition K=8 experiments.
+//
+// These bodies deliberately preserve the *runtime-width* kernels' floating
+// point program.  In particular, `k_batch` remains a runtime loop bound and
+// QKV keeps its post-dot scale multiply.  The legacy fixed-K8 kernels and the
+// v4 kernels above instead expose a compile-time K=8 loop to the compiler;
+// that changes FMA contraction and is not partition-safe against K=1.
+//
+// The only transformations below are scheduling and bit-copying activation
+// values through threadgroup memory.  `SG` groups independent SIMD groups in
+// one threadgroup.  `TB`, when non-zero, shares an activation tile across those
+// SIMD groups while preserving every lane's strictly increasing `ib` order.
+//
+// M4 falsification result (724.8 MB distinct-weight 30-layer sweep): every
+// candidate below was raw-bit exact, but the best result was SG=4/TB=0 at
+// 37.912 ms versus the runtime-width oracle's 38.196 ms (1.007x, within run
+// noise). Tiled candidates ranged from 0.438x to 0.964x. Consequently none is
+// connected to a production selector, and
+// `CAMELID_GEMMA4_MTP_FAST_DENSE_K8` is intentionally not admitted.
+// ---------------------------------------------------------------------------
+
+const SPEC50_EXACT_DENSE_PRELUDE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+template <uint SG>
+static inline void spec50_exact_plain_flat_body(
+    device const float* y,
+    device const char* weight_blocks,
+    device float* output,
+    uint blocks_per_row,
+    uint rows,
+    uint k_batch,
+    uint tg,
+    uint sg,
+    uint lane
+) {
+    constexpr uint NR0 = 4;
+    constexpr uint NQ = 8;
+    constexpr uint NB = 4;
+    constexpr uint q4_block_bytes = 18;
+    const uint r0 = (tg * SG + sg) * NR0;
+    if (r0 >= rows) return;
+    const uint row_stride = blocks_per_row * q4_block_bytes;
+    const uint hidden = blocks_per_row * 32;
+    const uint ix = lane / 4;
+    const uint ilb = (lane % 4) * NB;
+
+    bool has_row[4];
+#pragma unroll
+    for (uint i = 0; i < 4; ++i) {
+        has_row[i] = (r0 + i < rows);
+    }
+    float sums[4][8] = {{0.0f}};
+
+    for (uint ib = ix; ib < blocks_per_row; ib += NQ) {
+        float4 scaled_lo[4], scaled_hi[4];
+#pragma unroll
+        for (uint i = 0; i < 4; ++i) {
+            if (has_row[i]) {
+                const uint r = r0 + i;
+                device const char* wb = weight_blocks + r * row_stride + ib * q4_block_bytes;
+                const float w_scale = float(*reinterpret_cast<device const half*>(wb));
+                const uchar4 wq = uchar4(*reinterpret_cast<device const packed_uchar4*>(wb + 2 + ilb));
+                const float4 lo = float4(int4(wq & 0x0F) - 8);
+                const float4 hi = float4(int4(wq >> 4) - 8);
+                scaled_lo[i] = lo * w_scale;
+                scaled_hi[i] = hi * w_scale;
+            }
+        }
+
+#pragma unroll
+        for (uint k = 0; k < k_batch; ++k) {
+            device const float* yb = y + k * hidden + ib * 32;
+            const float4 ylo = *reinterpret_cast<device const float4*>(yb + ilb);
+            const float4 yhi = *reinterpret_cast<device const float4*>(yb + 16 + ilb);
+#pragma unroll
+            for (uint i = 0; i < 4; ++i) {
+                if (has_row[i]) {
+                    sums[i][k] += dot(scaled_lo[i], ylo) + dot(scaled_hi[i], yhi);
+                }
+            }
+        }
+    }
+
+    for (uint k = 0; k < k_batch; ++k) {
+#pragma unroll
+        for (uint i = 0; i < 4; ++i) {
+            if (has_row[i]) {
+                const float tot = simd_sum(sums[i][k]);
+                if (lane == 0) output[k * rows + r0 + i] = tot;
+            }
+        }
+    }
+}
+
+template <uint SG, uint TB>
+static inline void spec50_exact_plain_tiled_body(
+    device const float* y,
+    device const char* weight_blocks,
+    device float* output,
+    uint blocks_per_row,
+    uint rows,
+    uint k_batch,
+    uint tg,
+    uint sg,
+    uint lane,
+    threadgroup float4* tile4
+) {
+    constexpr uint NR0 = 4;
+    constexpr uint NQ = 8;
+    constexpr uint NB = 4;
+    constexpr uint q4_block_bytes = 18;
+    const uint r0 = (tg * SG + sg) * NR0;
+    const uint row_stride = blocks_per_row * q4_block_bytes;
+    const uint hidden = blocks_per_row * 32;
+    const uint ix = lane / 4;
+    const uint ilb = (lane % 4) * NB;
+    const uint iq = lane % 4;
+    const uint tid = sg * 32 + lane;
+    device const float4* y4 = reinterpret_cast<device const float4*>(y);
+
+    bool has_row[4];
+#pragma unroll
+    for (uint i = 0; i < 4; ++i) {
+        has_row[i] = (r0 + i < rows);
+    }
+    float sums[4][8] = {{0.0f}};
+
+    for (uint ts = 0; ts < blocks_per_row; ts += TB) {
+        const uint tb = min(TB, blocks_per_row - ts);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint idx = tid; idx < k_batch * TB * 8; idx += 32 * SG) {
+            const uint k = idx / (TB * 8);
+            const uint f = idx % (TB * 8);
+            if (f < tb * 8) tile4[idx] = y4[k * (hidden >> 2) + (ts << 3) + f];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint ib = ts + ix; ib < ts + tb; ib += NQ) {
+            float4 scaled_lo[4], scaled_hi[4];
+#pragma unroll
+            for (uint i = 0; i < 4; ++i) {
+                if (has_row[i]) {
+                    const uint r = r0 + i;
+                    device const char* wb = weight_blocks + r * row_stride + ib * q4_block_bytes;
+                    const float w_scale = float(*reinterpret_cast<device const half*>(wb));
+                    const uchar4 wq = uchar4(*reinterpret_cast<device const packed_uchar4*>(wb + 2 + ilb));
+                    const float4 lo = float4(int4(wq & 0x0F) - 8);
+                    const float4 hi = float4(int4(wq >> 4) - 8);
+                    scaled_lo[i] = lo * w_scale;
+                    scaled_hi[i] = hi * w_scale;
+                }
+            }
+            const uint lb8 = (ib - ts) * 8;
+#pragma unroll
+            for (uint k = 0; k < k_batch; ++k) {
+                const float4 ylo = tile4[k * (TB * 8) + lb8 + iq];
+                const float4 yhi = tile4[k * (TB * 8) + lb8 + 4 + iq];
+#pragma unroll
+                for (uint i = 0; i < 4; ++i) {
+                    if (has_row[i]) {
+                        sums[i][k] += dot(scaled_lo[i], ylo) + dot(scaled_hi[i], yhi);
+                    }
+                }
+            }
+        }
+    }
+
+    for (uint k = 0; k < k_batch; ++k) {
+#pragma unroll
+        for (uint i = 0; i < 4; ++i) {
+            if (has_row[i]) {
+                const float tot = simd_sum(sums[i][k]);
+                if (lane == 0) output[k * rows + r0 + i] = tot;
+            }
+        }
+    }
+}
+
+template <uint SG>
+static inline void spec50_exact_qkv_flat_body(
+    device const float* y,
+    device const char* q_weight,
+    device const char* k_weight,
+    device const char* v_weight,
+    device float* query_out,
+    device float* key_out,
+    device float* val_out,
+    uint blocks_per_row,
+    uint q_rows,
+    uint k_rows,
+    uint v_rows,
+    uint k_batch,
+    uint tg,
+    uint sg,
+    uint lane
+) {
+    constexpr uint NR0 = 2;
+    constexpr uint NQ = 8;
+    constexpr uint NB = 4;
+    constexpr uint q4_block_bytes = 18;
+    const uint total_rows = q_rows + k_rows + v_rows;
+    const uint r0 = (tg * SG + sg) * NR0;
+    if (r0 >= total_rows) return;
+    const uint row_stride = blocks_per_row * q4_block_bytes;
+    const uint hidden = blocks_per_row * 32;
+    const uint ix = lane / 4;
+    const uint ilb = (lane % 4) * NB;
+    const bool has_row1 = (r0 + 1 < total_rows);
+
+    device const char* w_base0;
+    uint target_r0;
+    uint target_kind0;
+    if (r0 < q_rows) { w_base0 = q_weight; target_r0 = r0; target_kind0 = 0; }
+    else if (r0 < q_rows + k_rows) { w_base0 = k_weight; target_r0 = r0 - q_rows; target_kind0 = 1; }
+    else { w_base0 = v_weight; target_r0 = r0 - (q_rows + k_rows); target_kind0 = 2; }
+
+    device const char* w_base1 = nullptr;
+    uint target_r1 = 0;
+    uint target_kind1 = 0;
+    if (has_row1) {
+        const uint r1 = r0 + 1;
+        if (r1 < q_rows) { w_base1 = q_weight; target_r1 = r1; target_kind1 = 0; }
+        else if (r1 < q_rows + k_rows) { w_base1 = k_weight; target_r1 = r1 - q_rows; target_kind1 = 1; }
+        else { w_base1 = v_weight; target_r1 = r1 - (q_rows + k_rows); target_kind1 = 2; }
+    }
+
+    float sum0[8] = {0.0f};
+    float sum1[8] = {0.0f};
+    for (uint ib = ix; ib < blocks_per_row; ib += NQ) {
+        device const char* wb0 = w_base0 + target_r0 * row_stride + ib * q4_block_bytes;
+        const float w_scale0 = float(*reinterpret_cast<device const half*>(wb0));
+        const uchar4 wq0 = uchar4(*reinterpret_cast<device const packed_uchar4*>(wb0 + 2 + ilb));
+        const float4 lo0 = float4(int4(wq0 & 0x0F) - 8);
+        const float4 hi0 = float4(int4(wq0 >> 4) - 8);
+        float w_scale1 = 0.0f;
+        float4 lo1 = 0.0f;
+        float4 hi1 = 0.0f;
+        if (has_row1) {
+            device const char* wb1 = w_base1 + target_r1 * row_stride + ib * q4_block_bytes;
+            w_scale1 = float(*reinterpret_cast<device const half*>(wb1));
+            const uchar4 wq1 = uchar4(*reinterpret_cast<device const packed_uchar4*>(wb1 + 2 + ilb));
+            lo1 = float4(int4(wq1 & 0x0F) - 8);
+            hi1 = float4(int4(wq1 >> 4) - 8);
+        }
+        for (uint k = 0; k < k_batch; ++k) {
+            device const float* yb = y + k * hidden + ib * 32;
+            const float4 ylo = *reinterpret_cast<device const float4*>(yb + ilb);
+            const float4 yhi = *reinterpret_cast<device const float4*>(yb + 16 + ilb);
+            sum0[k] += (dot(lo0, ylo) + dot(hi0, yhi)) * w_scale0;
+            if (has_row1) sum1[k] += (dot(lo1, ylo) + dot(hi1, yhi)) * w_scale1;
+        }
+    }
+    for (uint k = 0; k < k_batch; ++k) {
+        const float tot0 = simd_sum(sum0[k]);
+        if (lane == 0) {
+            if (target_kind0 == 0) query_out[k * q_rows + target_r0] = tot0;
+            else if (target_kind0 == 1) key_out[k * k_rows + target_r0] = tot0;
+            else val_out[k * v_rows + target_r0] = tot0;
+        }
+        if (has_row1) {
+            const float tot1 = simd_sum(sum1[k]);
+            if (lane == 0) {
+                if (target_kind1 == 0) query_out[k * q_rows + target_r1] = tot1;
+                else if (target_kind1 == 1) key_out[k * k_rows + target_r1] = tot1;
+                else val_out[k * v_rows + target_r1] = tot1;
+            }
+        }
+    }
+}
+
+template <uint SG, uint TB>
+static inline void spec50_exact_qkv_tiled_body(
+    device const float* y,
+    device const char* q_weight,
+    device const char* k_weight,
+    device const char* v_weight,
+    device float* query_out,
+    device float* key_out,
+    device float* val_out,
+    uint blocks_per_row,
+    uint q_rows,
+    uint k_rows,
+    uint v_rows,
+    uint k_batch,
+    uint tg,
+    uint sg,
+    uint lane,
+    threadgroup float4* tile4
+) {
+    constexpr uint NR0 = 2;
+    constexpr uint NQ = 8;
+    constexpr uint NB = 4;
+    constexpr uint q4_block_bytes = 18;
+    const uint total_rows = q_rows + k_rows + v_rows;
+    const uint r0 = (tg * SG + sg) * NR0;
+    const bool live0 = r0 < total_rows;
+    const uint safe_r0 = live0 ? r0 : 0;
+    const bool has_row1 = live0 && (r0 + 1 < total_rows);
+    const uint row_stride = blocks_per_row * q4_block_bytes;
+    const uint hidden = blocks_per_row * 32;
+    const uint ix = lane / 4;
+    const uint ilb = (lane % 4) * NB;
+    const uint iq = lane % 4;
+    const uint tid = sg * 32 + lane;
+    device const float4* y4 = reinterpret_cast<device const float4*>(y);
+
+    device const char* w_base0;
+    uint target_r0;
+    uint target_kind0;
+    if (safe_r0 < q_rows) { w_base0 = q_weight; target_r0 = safe_r0; target_kind0 = 0; }
+    else if (safe_r0 < q_rows + k_rows) { w_base0 = k_weight; target_r0 = safe_r0 - q_rows; target_kind0 = 1; }
+    else { w_base0 = v_weight; target_r0 = safe_r0 - (q_rows + k_rows); target_kind0 = 2; }
+
+    device const char* w_base1 = nullptr;
+    uint target_r1 = 0;
+    uint target_kind1 = 0;
+    if (has_row1) {
+        const uint r1 = r0 + 1;
+        if (r1 < q_rows) { w_base1 = q_weight; target_r1 = r1; target_kind1 = 0; }
+        else if (r1 < q_rows + k_rows) { w_base1 = k_weight; target_r1 = r1 - q_rows; target_kind1 = 1; }
+        else { w_base1 = v_weight; target_r1 = r1 - (q_rows + k_rows); target_kind1 = 2; }
+    }
+
+    float sum0[8] = {0.0f};
+    float sum1[8] = {0.0f};
+    for (uint ts = 0; ts < blocks_per_row; ts += TB) {
+        const uint tb = min(TB, blocks_per_row - ts);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint idx = tid; idx < k_batch * TB * 8; idx += 32 * SG) {
+            const uint k = idx / (TB * 8);
+            const uint f = idx % (TB * 8);
+            if (f < tb * 8) tile4[idx] = y4[k * (hidden >> 2) + (ts << 3) + f];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint ib = ts + ix; ib < ts + tb; ib += NQ) {
+            device const char* wb0 = w_base0 + target_r0 * row_stride + ib * q4_block_bytes;
+            const float w_scale0 = float(*reinterpret_cast<device const half*>(wb0));
+            const uchar4 wq0 = uchar4(*reinterpret_cast<device const packed_uchar4*>(wb0 + 2 + ilb));
+            const float4 lo0 = float4(int4(wq0 & 0x0F) - 8);
+            const float4 hi0 = float4(int4(wq0 >> 4) - 8);
+            float w_scale1 = 0.0f;
+            float4 lo1 = 0.0f;
+            float4 hi1 = 0.0f;
+            if (has_row1) {
+                device const char* wb1 = w_base1 + target_r1 * row_stride + ib * q4_block_bytes;
+                w_scale1 = float(*reinterpret_cast<device const half*>(wb1));
+                const uchar4 wq1 = uchar4(*reinterpret_cast<device const packed_uchar4*>(wb1 + 2 + ilb));
+                lo1 = float4(int4(wq1 & 0x0F) - 8);
+                hi1 = float4(int4(wq1 >> 4) - 8);
+            }
+            const uint lb8 = (ib - ts) * 8;
+            for (uint k = 0; k < k_batch; ++k) {
+                const float4 ylo = tile4[k * (TB * 8) + lb8 + iq];
+                const float4 yhi = tile4[k * (TB * 8) + lb8 + 4 + iq];
+                sum0[k] += (dot(lo0, ylo) + dot(hi0, yhi)) * w_scale0;
+                if (has_row1) sum1[k] += (dot(lo1, ylo) + dot(hi1, yhi)) * w_scale1;
+            }
+        }
+    }
+    if (!live0) return;
+    for (uint k = 0; k < k_batch; ++k) {
+        const float tot0 = simd_sum(sum0[k]);
+        if (lane == 0) {
+            if (target_kind0 == 0) query_out[k * q_rows + target_r0] = tot0;
+            else if (target_kind0 == 1) key_out[k * k_rows + target_r0] = tot0;
+            else val_out[k * v_rows + target_r0] = tot0;
+        }
+        if (has_row1) {
+            const float tot1 = simd_sum(sum1[k]);
+            if (lane == 0) {
+                if (target_kind1 == 0) query_out[k * q_rows + target_r1] = tot1;
+                else if (target_kind1 == 1) key_out[k * k_rows + target_r1] = tot1;
+                else val_out[k * v_rows + target_r1] = tot1;
+            }
+        }
+    }
+}
+"#;
+
+// ---------------------------------------------------------------------------
 // Entry-point generation
 // ---------------------------------------------------------------------------
 
@@ -847,6 +1230,145 @@ fn spec50_shader_src(plain: Spec50Cfg, qkv: Spec50Cfg, gateup: Spec50Cfg) -> Str
     src
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Spec50ExactCfg {
+    pub sg: u32,
+    pub tb: u32,
+}
+
+impl Spec50ExactCfg {
+    fn valid(self) -> bool {
+        self.sg >= 1 && self.sg <= 16 && (self.tb == 0 || (self.tb % 8 == 0 && self.tb <= 32))
+    }
+
+    fn suffix(self) -> String {
+        format!("sg{}_tb{}", self.sg, self.tb)
+    }
+
+    fn tg_width(self) -> u64 {
+        32 * self.sg as u64
+    }
+}
+
+fn spec50_exact_dense_shader_src(cfg: Spec50ExactCfg) -> String {
+    let mut src = String::with_capacity(SPEC50_EXACT_DENSE_PRELUDE.len() + 4096);
+    src.push_str(SPEC50_EXACT_DENSE_PRELUDE);
+    let sg = cfg.sg;
+    let w = cfg.tg_width();
+    let suffix = cfg.suffix();
+    let plain_body = if cfg.tb == 0 {
+        format!(
+            "spec50_exact_plain_flat_body<{sg}u>(y, weight_blocks, output, blocks_per_row, rows, k_batch, tg, sg, lane);"
+        )
+    } else {
+        let tb = cfg.tb;
+        let tile4 = 8 * tb * 8;
+        format!(
+            "threadgroup float4 tile4[{tile4}];\n    spec50_exact_plain_tiled_body<{sg}u, {tb}u>(y, weight_blocks, output, blocks_per_row, rows, k_batch, tg, sg, lane, tile4);"
+        )
+    };
+    src.push_str(&format!(
+        r#"
+[[max_total_threads_per_threadgroup({w})]]
+kernel void spec50_exact_plain_k8_{suffix}(
+    device const float* y [[buffer(0)]],
+    device const char* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& blocks_per_row [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& k_batch [[buffer(6)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {{
+    {plain_body}
+}}
+"#
+    ));
+
+    let qkv_body = if cfg.tb == 0 {
+        format!(
+            "spec50_exact_qkv_flat_body<{sg}u>(y, q_weight, k_weight, v_weight, query_out, key_out, val_out, blocks_per_row, q_rows, k_rows, v_rows, k_batch, tg, sg, lane);"
+        )
+    } else {
+        let tb = cfg.tb;
+        let tile4 = 8 * tb * 8;
+        format!(
+            "threadgroup float4 tile4[{tile4}];\n    spec50_exact_qkv_tiled_body<{sg}u, {tb}u>(y, q_weight, k_weight, v_weight, query_out, key_out, val_out, blocks_per_row, q_rows, k_rows, v_rows, k_batch, tg, sg, lane, tile4);"
+        )
+    };
+    src.push_str(&format!(
+        r#"
+[[max_total_threads_per_threadgroup({w})]]
+kernel void spec50_exact_qkv_k8_{suffix}(
+    device const float* y [[buffer(0)]],
+    device const char* q_weight [[buffer(1)]],
+    device const char* k_weight [[buffer(2)]],
+    device const char* v_weight [[buffer(3)]],
+    device float* query_out [[buffer(4)]],
+    device float* key_out [[buffer(5)]],
+    device float* val_out [[buffer(6)]],
+    constant uint& blocks_per_row [[buffer(7)]],
+    constant uint& q_rows [[buffer(8)]],
+    constant uint& k_rows [[buffer(9)]],
+    constant uint& v_rows [[buffer(10)]],
+    constant uint& k_batch [[buffer(11)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {{
+    {qkv_body}
+}}
+"#
+    ));
+    src
+}
+
+pub(crate) struct Spec50ExactDenseKernels {
+    plain: ComputePipelineState,
+    qkv: ComputePipelineState,
+    cfg: Spec50ExactCfg,
+}
+
+impl Spec50ExactDenseKernels {
+    pub(crate) fn build(device: &Device, cfg: Spec50ExactCfg) -> Option<Self> {
+        if !cfg.valid() {
+            return None;
+        }
+        let src = spec50_exact_dense_shader_src(cfg);
+        let options = CompileOptions::new();
+        let library = device
+            .new_library_with_source(&src, &options)
+            .map_err(|err| eprintln!("[metal] exact dense K8 shader compile failed: {err}"))
+            .ok()?;
+        let pipe = |prefix: &str| -> Option<ComputePipelineState> {
+            let name = format!("{prefix}_{}", cfg.suffix());
+            let function = library
+                .get_function(&name, None)
+                .map_err(|err| eprintln!("[metal] exact dense K8 missing {name}: {err}"))
+                .ok()?;
+            let pipeline = device
+                .new_compute_pipeline_state_with_function(&function)
+                .map_err(|err| eprintln!("[metal] exact dense K8 pipeline {name} failed: {err}"))
+                .ok()?;
+            if pipeline.max_total_threads_per_threadgroup() < cfg.tg_width() {
+                eprintln!(
+                    "[metal] exact dense K8 {name} width {} exceeds pipeline maximum {}",
+                    cfg.tg_width(),
+                    pipeline.max_total_threads_per_threadgroup()
+                );
+                return None;
+            }
+            Some(pipeline)
+        };
+        Some(Self {
+            plain: pipe("spec50_exact_plain_k8")?,
+            qkv: pipe("spec50_exact_qkv_k8")?,
+            cfg,
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pipelines
 // ---------------------------------------------------------------------------
@@ -977,6 +1499,67 @@ fn spec50_tg(width: u64) -> metal::MTLSize {
         height: 1,
         depth: 1,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spec50_encode_exact_plain_with(
+    ks: &Spec50ExactDenseKernels,
+    e: &metal::ComputeCommandEncoderRef,
+    y: &Buffer,
+    weight: &Buffer,
+    weight_offset: u64,
+    output: &Buffer,
+    rows: usize,
+    blocks_per_row: u32,
+    k_batch: u32,
+) {
+    e.set_compute_pipeline_state(&ks.plain);
+    e.set_buffer(0, Some(y), 0);
+    e.set_buffer(2, Some(weight), weight_offset);
+    e.set_buffer(3, Some(output), 0);
+    e.set_bytes(4, 4, &blocks_per_row as *const u32 as *const _);
+    let rows_u32 = rows as u32;
+    e.set_bytes(5, 4, &rows_u32 as *const u32 as *const _);
+    e.set_bytes(6, 4, &k_batch as *const u32 as *const _);
+    e.dispatch_thread_groups(
+        spec50_grid(rows, 4 * ks.cfg.sg as u64),
+        spec50_tg(ks.cfg.tg_width()),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spec50_encode_exact_qkv_with(
+    ks: &Spec50ExactDenseKernels,
+    e: &metal::ComputeCommandEncoderRef,
+    y: &Buffer,
+    q_weight: &Buffer,
+    k_weight: &Buffer,
+    v_weight: &Buffer,
+    query_out: &Buffer,
+    key_out: &Buffer,
+    val_out: &Buffer,
+    total_rows: usize,
+    scalars: (u32, u32, u32, u32),
+    k_batch: u32,
+) {
+    let (blocks, q_rows, k_rows, v_rows) = scalars;
+    e.set_compute_pipeline_state(&ks.qkv);
+    e.set_buffer(0, Some(y), 0);
+    e.set_buffer(1, Some(q_weight), 0);
+    e.set_buffer(2, Some(k_weight), 0);
+    e.set_buffer(3, Some(v_weight), 0);
+    e.set_buffer(4, Some(query_out), 0);
+    e.set_buffer(5, Some(key_out), 0);
+    e.set_buffer(6, Some(val_out), 0);
+    e.set_bytes(7, 4, &blocks as *const u32 as *const _);
+    e.set_bytes(8, 4, &q_rows as *const u32 as *const _);
+    e.set_bytes(9, 4, &k_rows as *const u32 as *const _);
+    e.set_bytes(10, 4, &v_rows as *const u32 as *const _);
+    e.set_bytes(11, 4, &k_batch as *const u32 as *const _);
+    e.dispatch_thread_groups(
+        spec50_grid(total_rows, 2 * ks.cfg.sg as u64),
+        spec50_tg(ks.cfg.tg_width()),
+    );
 }
 
 /// Byte offsets for one canonical eight-token fused-QKV tile.
@@ -1543,14 +2126,15 @@ mod tests {
         read(&out, rows * K8)
     }
 
-    fn plain_runtime_width_reference(
+    fn encode_plain_runtime_width(
         c: &Ctx,
+        e: &metal::ComputeCommandEncoderRef,
         y: &Buffer,
         w: &Buffer,
+        out: &Buffer,
         rows: usize,
         blocks: usize,
-    ) -> Vec<f32> {
-        let out = zeros(&c.device, rows * K8);
+    ) {
         let pipeline = c
             .old
             .q4_0_block_batch_k_pipeline
@@ -1559,26 +2143,52 @@ mod tests {
         let blocks = blocks as u32;
         let rows_u32 = rows as u32;
         let k_u32 = K8 as u32;
+        e.set_compute_pipeline_state(pipeline);
+        e.set_buffer(0, Some(y), 0);
+        e.set_buffer(2, Some(w), 0);
+        e.set_buffer(3, Some(out), 0);
+        e.set_bytes(4, 4, &blocks as *const u32 as *const _);
+        e.set_bytes(5, 4, &rows_u32 as *const u32 as *const _);
+        e.set_bytes(6, 4, &k_u32 as *const u32 as *const _);
+        e.dispatch_thread_groups(
+            metal::MTLSize {
+                width: (rows as u64).div_ceil(4),
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+
+    fn plain_runtime_width_reference(
+        c: &Ctx,
+        y: &Buffer,
+        w: &Buffer,
+        rows: usize,
+        blocks: usize,
+    ) -> Vec<f32> {
+        let out = zeros(&c.device, rows * K8);
         run(&c.queue, |e| {
-            e.set_compute_pipeline_state(pipeline);
-            e.set_buffer(0, Some(y), 0);
-            e.set_buffer(2, Some(w), 0);
-            e.set_buffer(3, Some(&out), 0);
-            e.set_bytes(4, 4, &blocks as *const u32 as *const _);
-            e.set_bytes(5, 4, &rows_u32 as *const u32 as *const _);
-            e.set_bytes(6, 4, &k_u32 as *const u32 as *const _);
-            e.dispatch_thread_groups(
-                metal::MTLSize {
-                    width: (rows as u64).div_ceil(4),
-                    height: 1,
-                    depth: 1,
-                },
-                metal::MTLSize {
-                    width: 32,
-                    height: 1,
-                    depth: 1,
-                },
-            );
+            encode_plain_runtime_width(c, e, y, w, &out, rows, blocks);
+        });
+        read(&out, rows * K8)
+    }
+
+    fn plain_exact_candidate(
+        c: &Ctx,
+        ks: &Spec50ExactDenseKernels,
+        y: &Buffer,
+        w: &Buffer,
+        rows: usize,
+        blocks: usize,
+    ) -> Vec<f32> {
+        let out = zeros(&c.device, rows * K8);
+        run(&c.queue, |e| {
+            spec50_encode_exact_plain_with(ks, e, y, w, 0, &out, rows, blocks as u32, K8 as u32);
         });
         read(&out, rows * K8)
     }
@@ -1771,6 +2381,57 @@ mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn encode_qkv_runtime_width(
+        c: &Ctx,
+        e: &metal::ComputeCommandEncoderRef,
+        y: &Buffer,
+        wq: &Buffer,
+        wk: &Buffer,
+        wv: &Buffer,
+        oq: &Buffer,
+        ok: &Buffer,
+        ov: &Buffer,
+        (qr, kr, vr): (usize, usize, usize),
+        blocks: usize,
+    ) {
+        let pipeline = c
+            .old
+            .q4_0_qkv_block_batch_k_pipeline
+            .as_ref()
+            .expect("runtime-width QKV pipeline");
+        let blocks = blocks as u32;
+        let qr_u32 = qr as u32;
+        let kr_u32 = kr as u32;
+        let vr_u32 = vr as u32;
+        let k_u32 = K8 as u32;
+        e.set_compute_pipeline_state(pipeline);
+        e.set_buffer(0, Some(y), 0);
+        e.set_buffer(1, Some(wq), 0);
+        e.set_buffer(2, Some(wk), 0);
+        e.set_buffer(3, Some(wv), 0);
+        e.set_buffer(4, Some(oq), 0);
+        e.set_buffer(5, Some(ok), 0);
+        e.set_buffer(6, Some(ov), 0);
+        e.set_bytes(7, 4, &blocks as *const u32 as *const _);
+        e.set_bytes(8, 4, &qr_u32 as *const u32 as *const _);
+        e.set_bytes(9, 4, &kr_u32 as *const u32 as *const _);
+        e.set_bytes(10, 4, &vr_u32 as *const u32 as *const _);
+        e.set_bytes(11, 4, &k_u32 as *const u32 as *const _);
+        e.dispatch_thread_groups(
+            metal::MTLSize {
+                width: ((qr + kr + vr) as u64).div_ceil(2),
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn qkv_runtime_width_reference(
         c: &Ctx,
         y: &Buffer,
@@ -1783,44 +2444,160 @@ mod tests {
         let oq = zeros(&c.device, qr * K8);
         let ok = zeros(&c.device, kr * K8);
         let ov = zeros(&c.device, vr * K8);
-        let pipeline = c
-            .old
-            .q4_0_qkv_block_batch_k_pipeline
-            .as_ref()
-            .expect("runtime-width QKV pipeline");
-        let blocks = blocks as u32;
-        let qr_u32 = qr as u32;
-        let kr_u32 = kr as u32;
-        let vr_u32 = vr as u32;
-        let k_u32 = K8 as u32;
         run(&c.queue, |e| {
-            e.set_compute_pipeline_state(pipeline);
-            e.set_buffer(0, Some(y), 0);
-            e.set_buffer(1, Some(wq), 0);
-            e.set_buffer(2, Some(wk), 0);
-            e.set_buffer(3, Some(wv), 0);
-            e.set_buffer(4, Some(&oq), 0);
-            e.set_buffer(5, Some(&ok), 0);
-            e.set_buffer(6, Some(&ov), 0);
-            e.set_bytes(7, 4, &blocks as *const u32 as *const _);
-            e.set_bytes(8, 4, &qr_u32 as *const u32 as *const _);
-            e.set_bytes(9, 4, &kr_u32 as *const u32 as *const _);
-            e.set_bytes(10, 4, &vr_u32 as *const u32 as *const _);
-            e.set_bytes(11, 4, &k_u32 as *const u32 as *const _);
-            e.dispatch_thread_groups(
-                metal::MTLSize {
-                    width: ((qr + kr + vr) as u64).div_ceil(2),
-                    height: 1,
-                    depth: 1,
-                },
-                metal::MTLSize {
-                    width: 32,
-                    height: 1,
-                    depth: 1,
-                },
+            encode_qkv_runtime_width(c, e, y, wq, wk, wv, &oq, &ok, &ov, (qr, kr, vr), blocks);
+        });
+        (read(&oq, qr * K8), read(&ok, kr * K8), read(&ov, vr * K8))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qkv_exact_candidate(
+        c: &Ctx,
+        ks: &Spec50ExactDenseKernels,
+        y: &Buffer,
+        wq: &Buffer,
+        wk: &Buffer,
+        wv: &Buffer,
+        (qr, kr, vr): (usize, usize, usize),
+        blocks: usize,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let oq = zeros(&c.device, qr * K8);
+        let ok = zeros(&c.device, kr * K8);
+        let ov = zeros(&c.device, vr * K8);
+        run(&c.queue, |e| {
+            spec50_encode_exact_qkv_with(
+                ks,
+                e,
+                y,
+                wq,
+                wk,
+                wv,
+                &oq,
+                &ok,
+                &ov,
+                qr + kr + vr,
+                (blocks as u32, qr as u32, kr as u32, vr as u32),
+                K8 as u32,
             );
         });
         (read(&oq, qr * K8), read(&ok, kr * K8), read(&ov, vr * K8))
+    }
+
+    const EXACT_CANDIDATES: [Spec50ExactCfg; 10] = [
+        Spec50ExactCfg { sg: 1, tb: 0 },
+        Spec50ExactCfg { sg: 2, tb: 0 },
+        Spec50ExactCfg { sg: 4, tb: 0 },
+        Spec50ExactCfg { sg: 8, tb: 0 },
+        Spec50ExactCfg { sg: 2, tb: 8 },
+        Spec50ExactCfg { sg: 2, tb: 16 },
+        Spec50ExactCfg { sg: 4, tb: 8 },
+        Spec50ExactCfg { sg: 4, tb: 16 },
+        Spec50ExactCfg { sg: 4, tb: 32 },
+        Spec50ExactCfg { sg: 8, tb: 16 },
+    ];
+
+    /// Direct Metal admission sweep against the runtime-width oracle.  This is
+    /// intentionally not the legacy fixed-K8 oracle: exact speculative
+    /// verification must preserve the K=1 partition's raw `f32` bits.
+    #[test]
+    fn spec50_exact_dense_k8_candidate_raw_bit_sweep() {
+        let Some(c) = ctx() else {
+            return;
+        };
+        for cfg in EXACT_CANDIDATES {
+            let ks = Spec50ExactDenseKernels::build(&c.device, cfg)
+                .unwrap_or_else(|| panic!("exact dense config {cfg:?}"));
+            let mut rng = Rng(0x4558_4143_544b_3800 ^ ((cfg.sg as u64) << 8) ^ cfg.tb as u64);
+
+            let (rows, blocks) = (68usize, 22usize);
+            let w = buf_from(&c.device, &random_q4_0(&mut rng, rows, blocks));
+            let y = buf_from(&c.device, &random_f32(&mut rng, blocks * 32 * K8));
+            let plain = plain_exact_candidate(&c, &ks, &y, &w, rows, blocks);
+            let plain_ref = plain_runtime_width_reference(&c, &y, &w, rows, blocks);
+            let mut bad = bits_equal(&format!("exact plain {cfg:?}"), &plain, &plain_ref);
+
+            let (qr, kr, vr, blocks) = (48usize, 16usize, 16usize, 22usize);
+            let wq = buf_from(&c.device, &random_q4_0(&mut rng, qr, blocks));
+            let wk = buf_from(&c.device, &random_q4_0(&mut rng, kr, blocks));
+            let wv = buf_from(&c.device, &random_q4_0(&mut rng, vr, blocks));
+            let y = buf_from(&c.device, &random_f32(&mut rng, blocks * 32 * K8));
+            let got = qkv_exact_candidate(&c, &ks, &y, &wq, &wk, &wv, (qr, kr, vr), blocks);
+            let oracle = qkv_runtime_width_reference(&c, &y, &wq, &wk, &wv, (qr, kr, vr), blocks);
+            bad += bits_equal(&format!("exact Q {cfg:?}"), &got.0, &oracle.0);
+            bad += bits_equal(&format!("exact K {cfg:?}"), &got.1, &oracle.1);
+            bad += bits_equal(&format!("exact V {cfg:?}"), &got.2, &oracle.2);
+            println!(
+                "[spec50 exact dense] {cfg:?}: {}",
+                if bad == 0 {
+                    "runtime-width RAW-BIT EXACT".to_string()
+                } else {
+                    format!("REJECTED ({bad} raw-bit mismatches)")
+                }
+            );
+            if cfg == (Spec50ExactCfg { sg: 1, tb: 0 }) {
+                assert_eq!(bad, 0, "literal runtime-width geometry must be exact");
+            }
+        }
+    }
+
+    /// The least-slow exact candidate is also pinned at every real Gemma 4
+    /// dense shape before being classified as a performance no-win.  Keeping
+    /// this separate from the small stress sweep makes the falsification
+    /// reproducible if a future compiler or GPU changes the result.
+    #[test]
+    fn spec50_exact_dense_k8_best_candidate_real_shape_raw_bit_parity() {
+        let Some(c) = ctx() else {
+            return;
+        };
+        let cfg = Spec50ExactCfg { sg: 4, tb: 0 };
+        let ks = Spec50ExactDenseKernels::build(&c.device, cfg)
+            .expect("least-slow exact dense candidate");
+        let mut rng = Rng(0x4558_4143_5452_4541);
+        for (name, rows, blocks) in [
+            ("local_o", 2816usize, 128usize),
+            ("global_o", 2816, 256),
+            ("global_q", 8192, 88),
+            ("global_k", 1024, 88),
+            ("shared_down", 2816, 66),
+        ] {
+            let weight = buf_from(&c.device, &random_q4_0(&mut rng, rows, blocks));
+            let y = buf_from(&c.device, &random_f32(&mut rng, blocks * 32 * K8));
+            let got = plain_exact_candidate(&c, &ks, &y, &weight, rows, blocks);
+            let oracle = plain_runtime_width_reference(&c, &y, &weight, rows, blocks);
+            assert_eq!(
+                bits_equal(&format!("real {name} {cfg:?}"), &got, &oracle),
+                0,
+                "{name} must preserve runtime-width raw bits"
+            );
+        }
+
+        let (q_rows, k_rows, v_rows, blocks) = (4096usize, 2048usize, 2048usize, 88usize);
+        let q_weight = buf_from(&c.device, &random_q4_0(&mut rng, q_rows, blocks));
+        let k_weight = buf_from(&c.device, &random_q4_0(&mut rng, k_rows, blocks));
+        let v_weight = buf_from(&c.device, &random_q4_0(&mut rng, v_rows, blocks));
+        let y = buf_from(&c.device, &random_f32(&mut rng, blocks * 32 * K8));
+        let got = qkv_exact_candidate(
+            &c,
+            &ks,
+            &y,
+            &q_weight,
+            &k_weight,
+            &v_weight,
+            (q_rows, k_rows, v_rows),
+            blocks,
+        );
+        let oracle = qkv_runtime_width_reference(
+            &c,
+            &y,
+            &q_weight,
+            &k_weight,
+            &v_weight,
+            (q_rows, k_rows, v_rows),
+            blocks,
+        );
+        assert_eq!(bits_equal("real local Q", &got.0, &oracle.0), 0);
+        assert_eq!(bits_equal("real local K", &got.1, &oracle.1), 0);
+        assert_eq!(bits_equal("real local V", &got.2, &oracle.2), 0);
     }
 
     /// Existing v4 tests compare staged QKV to this legacy fixed-K8 kernel.
@@ -2971,6 +3748,361 @@ mod tests {
                 old_ms / new_ms
             );
         }
+    }
+
+    /// Exact-partition 30-layer dense sweep.  The baseline is the dynamic
+    /// runtime-width Metal oracle (never the faster but partition-drifting
+    /// fixed-K8 kernels).  Each candidate runs the same 25 local + 5 global
+    /// QKV/O schedule plus all 30 shared-down projections using distinct
+    /// per-layer weights.  GateUp is deliberately excluded because its exact
+    /// packed specialization is owned and benchmarked by `spec50_packed_gateup`.
+    #[test]
+    #[ignore = "30-layer GPU microbenchmark; run explicitly with --ignored --test-threads=1"]
+    fn spec50_exact_dense_k8_bench_30_layer_runtime_oracle() {
+        let Some(c) = ctx() else {
+            return;
+        };
+        let hidden = 2816usize;
+        let blocks_h = hidden / 32;
+        let shared = 2112usize;
+        let blocks_shared = shared / 32;
+        let local_q = 4096usize;
+        let local_kv = 2048usize;
+        let local_qkv = local_q + 2 * local_kv;
+        let local_o_blocks = local_q / 32;
+        let global_q = 8192usize;
+        let global_kv = 1024usize;
+        let global_o_blocks = global_q / 32;
+
+        let mut rng = Rng(0x4558_4143_5433_304c);
+        let mut locals = Vec::with_capacity(25);
+        let mut globals = Vec::with_capacity(5);
+        let mut shared_down = Vec::with_capacity(BENCH_LAYERS);
+        for layer in 0..BENCH_LAYERS {
+            if BENCH_GLOBALS.contains(&layer) {
+                globals.push(GlobalLayer {
+                    wq: buf_from(&c.device, &random_q4_0(&mut rng, global_q, blocks_h)),
+                    wk: buf_from(&c.device, &random_q4_0(&mut rng, global_kv, blocks_h)),
+                    wo: buf_from(&c.device, &random_q4_0(&mut rng, hidden, global_o_blocks)),
+                });
+            } else {
+                locals.push(LocalLayer {
+                    wq: buf_from(&c.device, &random_q4_0(&mut rng, local_q, blocks_h)),
+                    wk: buf_from(&c.device, &random_q4_0(&mut rng, local_kv, blocks_h)),
+                    wv: buf_from(&c.device, &random_q4_0(&mut rng, local_kv, blocks_h)),
+                    wo: buf_from(&c.device, &random_q4_0(&mut rng, hidden, local_o_blocks)),
+                });
+            }
+            shared_down.push(buf_from(
+                &c.device,
+                &random_q4_0(&mut rng, hidden, blocks_shared),
+            ));
+        }
+
+        let y_norm = buf_from(&c.device, &random_f32(&mut rng, hidden * K8));
+        let y_context = buf_from(&c.device, &random_f32(&mut rng, global_q * K8));
+        let y_shared = buf_from(&c.device, &random_f32(&mut rng, shared * K8));
+        let query = zeros(&c.device, global_q * K8);
+        let key = zeros(&c.device, local_kv * K8);
+        let value = zeros(&c.device, local_kv * K8);
+        let hidden_out = zeros(&c.device, hidden * K8);
+
+        let qkv_o_weight_bytes = (25 * ((local_qkv * blocks_h) + (hidden * local_o_blocks))
+            + 5 * (((global_q + global_kv) * blocks_h) + (hidden * global_o_blocks)))
+            as f64
+            * Q4_BLOCK as f64;
+        let shared_down_weight_bytes = (BENCH_LAYERS * hidden * blocks_shared * Q4_BLOCK) as f64;
+        let weight_bytes = qkv_o_weight_bytes + shared_down_weight_bytes;
+
+        let oracle = |e: &metal::ComputeCommandEncoderRef| {
+            let mut li = 0usize;
+            let mut gi = 0usize;
+            for layer in 0..BENCH_LAYERS {
+                if BENCH_GLOBALS.contains(&layer) {
+                    let weights = &globals[gi];
+                    gi += 1;
+                    encode_plain_runtime_width(
+                        &c,
+                        e,
+                        &y_norm,
+                        &weights.wq,
+                        &query,
+                        global_q,
+                        blocks_h,
+                    );
+                    encode_plain_runtime_width(
+                        &c,
+                        e,
+                        &y_norm,
+                        &weights.wk,
+                        &key,
+                        global_kv,
+                        blocks_h,
+                    );
+                    encode_plain_runtime_width(
+                        &c,
+                        e,
+                        &y_context,
+                        &weights.wo,
+                        &hidden_out,
+                        hidden,
+                        global_o_blocks,
+                    );
+                } else {
+                    let weights = &locals[li];
+                    li += 1;
+                    encode_qkv_runtime_width(
+                        &c,
+                        e,
+                        &y_norm,
+                        &weights.wq,
+                        &weights.wk,
+                        &weights.wv,
+                        &query,
+                        &key,
+                        &value,
+                        (local_q, local_kv, local_kv),
+                        blocks_h,
+                    );
+                    encode_plain_runtime_width(
+                        &c,
+                        e,
+                        &y_context,
+                        &weights.wo,
+                        &hidden_out,
+                        hidden,
+                        local_o_blocks,
+                    );
+                }
+                encode_plain_runtime_width(
+                    &c,
+                    e,
+                    &y_shared,
+                    &shared_down[layer],
+                    &hidden_out,
+                    hidden,
+                    blocks_shared,
+                );
+            }
+        };
+        let oracle_ms = bench(&c.queue, oracle);
+        println!(
+            "\n[spec50 exact dense] 30-layer QKV/O/shared-down, {:.1} MB weights/sweep",
+            weight_bytes / 1.0e6
+        );
+        println!(
+            "  runtime-width oracle: {oracle_ms:8.3} ms ({:6.1} GB/s weights)",
+            gbs(weight_bytes, oracle_ms)
+        );
+
+        for cfg in EXACT_CANDIDATES {
+            let ks = Spec50ExactDenseKernels::build(&c.device, cfg)
+                .unwrap_or_else(|| panic!("exact dense config {cfg:?}"));
+            let candidate_ms = bench(&c.queue, |e| {
+                let mut li = 0usize;
+                let mut gi = 0usize;
+                for layer in 0..BENCH_LAYERS {
+                    if BENCH_GLOBALS.contains(&layer) {
+                        let weights = &globals[gi];
+                        gi += 1;
+                        spec50_encode_exact_plain_with(
+                            &ks,
+                            e,
+                            &y_norm,
+                            &weights.wq,
+                            0,
+                            &query,
+                            global_q,
+                            blocks_h as u32,
+                            K8 as u32,
+                        );
+                        spec50_encode_exact_plain_with(
+                            &ks,
+                            e,
+                            &y_norm,
+                            &weights.wk,
+                            0,
+                            &key,
+                            global_kv,
+                            blocks_h as u32,
+                            K8 as u32,
+                        );
+                        spec50_encode_exact_plain_with(
+                            &ks,
+                            e,
+                            &y_context,
+                            &weights.wo,
+                            0,
+                            &hidden_out,
+                            hidden,
+                            global_o_blocks as u32,
+                            K8 as u32,
+                        );
+                    } else {
+                        let weights = &locals[li];
+                        li += 1;
+                        spec50_encode_exact_qkv_with(
+                            &ks,
+                            e,
+                            &y_norm,
+                            &weights.wq,
+                            &weights.wk,
+                            &weights.wv,
+                            &query,
+                            &key,
+                            &value,
+                            local_qkv,
+                            (
+                                blocks_h as u32,
+                                local_q as u32,
+                                local_kv as u32,
+                                local_kv as u32,
+                            ),
+                            K8 as u32,
+                        );
+                        spec50_encode_exact_plain_with(
+                            &ks,
+                            e,
+                            &y_context,
+                            &weights.wo,
+                            0,
+                            &hidden_out,
+                            hidden,
+                            local_o_blocks as u32,
+                            K8 as u32,
+                        );
+                    }
+                    spec50_encode_exact_plain_with(
+                        &ks,
+                        e,
+                        &y_shared,
+                        &shared_down[layer],
+                        0,
+                        &hidden_out,
+                        hidden,
+                        blocks_shared as u32,
+                        K8 as u32,
+                    );
+                }
+            });
+            println!(
+                "  candidate {cfg:?}: {candidate_ms:8.3} ms ({:6.1} GB/s)  {:.3}x vs oracle",
+                gbs(weight_bytes, candidate_ms),
+                oracle_ms / candidate_ms
+            );
+        }
+    }
+
+    /// Stage attribution for the exact candidates.  Thirty repeated real-shape
+    /// dispatches isolate whether a QKV-only win is hidden by a plain-kernel
+    /// loss in the distinct-weight whole-model sweep above.
+    #[test]
+    #[ignore = "GPU attribution benchmark; run explicitly with --ignored --test-threads=1"]
+    fn spec50_exact_dense_k8_bench_per_dispatch_kind() {
+        let Some(c) = ctx() else {
+            return;
+        };
+        let mut rng = Rng(0x4558_4143_5453_5447);
+        let reps = 30usize;
+        for (label, rows, blocks) in [
+            ("o_local", 2816usize, 128usize),
+            ("o_global", 2816, 256),
+            ("q_global", 8192, 88),
+            ("k_global", 1024, 88),
+            ("shared_down", 2816, 66),
+        ] {
+            let weight = buf_from(&c.device, &random_q4_0(&mut rng, rows, blocks));
+            let y = buf_from(&c.device, &random_f32(&mut rng, blocks * 32 * K8));
+            let out = zeros(&c.device, rows * K8);
+            let oracle_ms = bench(&c.queue, |e| {
+                for _ in 0..reps {
+                    encode_plain_runtime_width(&c, e, &y, &weight, &out, rows, blocks);
+                }
+            });
+            print!("[spec50 exact dense] plain {label:11} oracle={oracle_ms:7.3} ms");
+            for cfg in EXACT_CANDIDATES {
+                let ks = Spec50ExactDenseKernels::build(&c.device, cfg)
+                    .unwrap_or_else(|| panic!("exact dense config {cfg:?}"));
+                let candidate_ms = bench(&c.queue, |e| {
+                    for _ in 0..reps {
+                        spec50_encode_exact_plain_with(
+                            &ks,
+                            e,
+                            &y,
+                            &weight,
+                            0,
+                            &out,
+                            rows,
+                            blocks as u32,
+                            K8 as u32,
+                        );
+                    }
+                });
+                print!(
+                    " | sg{}tb{} {:.3}x",
+                    cfg.sg,
+                    cfg.tb,
+                    oracle_ms / candidate_ms
+                );
+            }
+            println!();
+        }
+
+        let (q_rows, k_rows, v_rows, blocks) = (4096usize, 2048usize, 2048usize, 88usize);
+        let q_weight = buf_from(&c.device, &random_q4_0(&mut rng, q_rows, blocks));
+        let k_weight = buf_from(&c.device, &random_q4_0(&mut rng, k_rows, blocks));
+        let v_weight = buf_from(&c.device, &random_q4_0(&mut rng, v_rows, blocks));
+        let y = buf_from(&c.device, &random_f32(&mut rng, blocks * 32 * K8));
+        let query = zeros(&c.device, q_rows * K8);
+        let key = zeros(&c.device, k_rows * K8);
+        let value = zeros(&c.device, v_rows * K8);
+        let oracle_ms = bench(&c.queue, |e| {
+            for _ in 0..reps {
+                encode_qkv_runtime_width(
+                    &c,
+                    e,
+                    &y,
+                    &q_weight,
+                    &k_weight,
+                    &v_weight,
+                    &query,
+                    &key,
+                    &value,
+                    (q_rows, k_rows, v_rows),
+                    blocks,
+                );
+            }
+        });
+        print!("[spec50 exact dense] qkv local   oracle={oracle_ms:7.3} ms");
+        for cfg in EXACT_CANDIDATES {
+            let ks = Spec50ExactDenseKernels::build(&c.device, cfg)
+                .unwrap_or_else(|| panic!("exact dense config {cfg:?}"));
+            let candidate_ms = bench(&c.queue, |e| {
+                for _ in 0..reps {
+                    spec50_encode_exact_qkv_with(
+                        &ks,
+                        e,
+                        &y,
+                        &q_weight,
+                        &k_weight,
+                        &v_weight,
+                        &query,
+                        &key,
+                        &value,
+                        q_rows + k_rows + v_rows,
+                        (blocks as u32, q_rows as u32, k_rows as u32, v_rows as u32),
+                        K8 as u32,
+                    );
+                }
+            });
+            print!(
+                " | sg{}tb{} {:.3}x",
+                cfg.sg,
+                cfg.tb,
+                oracle_ms / candidate_ms
+            );
+        }
+        println!();
     }
 
     /// Real-shape cost of making K=16 a scheduling decision (two canonical K8
