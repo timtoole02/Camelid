@@ -67,6 +67,7 @@ const FULL_ROPE_ACTIVE_PAIRS: usize = FULL_HEAD_DIM / 8;
 const RMS_EPS: f32 = 1.0e-6;
 const MATRIX_BYTES_PER_PROPOSAL: u64 = 839_385_088;
 const EMBEDDING_BF16_BYTES: u64 = 536_870_912;
+const FULL_Q4_MATRIX_BYTES: u64 = 236_077_056;
 const Q4_0_BLOCK_VALUES: usize = 32;
 const Q4_0_BLOCK_BYTES: usize = 18;
 
@@ -1797,8 +1798,9 @@ struct PendingMtpStageSnapshot {
     count: usize,
 }
 
-/// Explicit, default-off native assistant. The locked file mapping owns the
-/// physical BF16 pages and the Metal buffer points directly at those pages.
+/// Explicit, default-off native assistant. The established path retains a
+/// locked BF16 file mapping; full-Q4 releases it after every matrix and norm
+/// needed at runtime has been copied into independently owned Metal buffers.
 pub struct Gemma4MtpAssistantMetal {
     weight_file: Buffer,
     pipelines: MtpPipelines,
@@ -1816,7 +1818,7 @@ pub struct Gemma4MtpAssistantMetal {
     source_path: PathBuf,
     // Must remain last: Rust drops struct fields in declaration order, so all
     // no-copy Metal buffers are released before this unlocks/unmaps the pages.
-    _locked_mapping: LockedAssistantMapping,
+    _locked_mapping: Option<LockedAssistantMapping>,
 }
 
 fn shared_buffer(device: &Device, bytes: usize) -> Buffer {
@@ -2038,8 +2040,8 @@ impl MtpScratch {
 }
 
 impl Gemma4MtpAssistantMetal {
-    /// Load and hard-pin the exact staged official artifact. This is never
-    /// called by the production drafter.
+    /// Load the exact staged official artifact. The established BF16 path
+    /// retains its hard pin; full-Q4 releases the source after packing.
     pub fn load_staged_official() -> Result<Self> {
         Self::load(Path::new(OFFICIAL_STAGED_ASSISTANT_PATH))
     }
@@ -2079,13 +2081,6 @@ impl Gemma4MtpAssistantMetal {
         let pipeline_started = Instant::now();
         let pipelines = MtpPipelines::new(&kernel.device)?;
         let pipeline_compile_us = pipeline_started.elapsed().as_micros();
-        let weight_file = kernel.device.new_buffer_with_bytes_no_copy(
-            locked_mapping.mapping.base_ptr().cast::<c_void>(),
-            locked_mapping.mapping.mapped_len() as u64,
-            MTLResourceOptions::StorageModeShared,
-            None,
-        );
-
         let norm = |name: &str| -> Result<Buffer> {
             let values = decode_bf16(&locked_mapping.mapping, manifest.tensor(name)?)?;
             Ok(f32_buffer(&kernel.device, &values))
@@ -2151,25 +2146,69 @@ impl Gemma4MtpAssistantMetal {
             .as_ref()
             .map_or(0, |weights| weights.layout.matrix_bytes);
         let full_q4_quantize_us = full_q4.as_ref().map_or(0, |weights| weights.quantize_us);
+        let file_bytes = locked_mapping.mapping.file_len();
+        let decoded_norm_bytes = layers
+            .iter()
+            .map(|layer| {
+                layer.input_norm.length()
+                    + layer.post_attention_norm.length()
+                    + layer.pre_feedforward_norm.length()
+                    + layer.post_feedforward_norm.length()
+                    + layer.q_norm.length()
+                    + layer.scale_scalar.length()
+            })
+            .sum::<u64>()
+            + final_norm.length();
+
+        // Every full-Q4 runtime matrix must be backed by an exact, contiguous
+        // packed slice before the sole BF16 source mapping may be released.
+        // The four-byte buffer preserves existing encoder signatures; the
+        // validated full-Q4 branch never dereferences it.
+        let (
+            weight_file,
+            retained_mapping,
+            mapped_bytes,
+            locked_bytes,
+            resident_pages,
+            total_pages,
+        ) = if let Some(weights) = full_q4.as_ref() {
+            weights.layout.validate_complete(
+                embedding,
+                &layers,
+                pre_projection,
+                post_projection,
+                weights.buffer.length(),
+            )?;
+            drop(locked_mapping);
+            (shared_buffer(&kernel.device, 4), None, 0, 0, 0, 0)
+        } else {
+            let mapped_bytes = locked_mapping.mapping.mapped_len() as u64;
+            let locked_bytes = locked_mapping.locked_bytes as u64;
+            let resident_pages = locked_mapping.resident_pages as u64;
+            let total_pages = locked_mapping.total_pages as u64;
+            let weight_file = kernel.device.new_buffer_with_bytes_no_copy(
+                locked_mapping.mapping.base_ptr().cast::<c_void>(),
+                locked_mapping.mapping.mapped_len() as u64,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            );
+            (
+                weight_file,
+                Some(locked_mapping),
+                mapped_bytes,
+                locked_bytes,
+                resident_pages,
+                total_pages,
+            )
+        };
         let resident_ledger = Gemma4MtpResidentLedger {
-            file_bytes: locked_mapping.mapping.file_len(),
-            mapped_bytes: locked_mapping.mapping.mapped_len() as u64,
-            locked_bytes: locked_mapping.locked_bytes as u64,
-            resident_pages: locked_mapping.resident_pages as u64,
-            total_pages: locked_mapping.total_pages as u64,
+            file_bytes,
+            mapped_bytes,
+            locked_bytes,
+            resident_pages,
+            total_pages,
             payload_bytes: EXPECTED_PAYLOAD_BYTES as u64,
-            decoded_norm_bytes: layers
-                .iter()
-                .map(|layer| {
-                    layer.input_norm.length()
-                        + layer.post_attention_norm.length()
-                        + layer.pre_feedforward_norm.length()
-                        + layer.post_feedforward_norm.length()
-                        + layer.q_norm.length()
-                        + layer.scale_scalar.length()
-                })
-                .sum::<u64>()
-                + final_norm.length(),
+            decoded_norm_bytes,
             fixed_scratch_bytes: scratch.byte_len(),
             full_q4_matrix_bytes,
             full_q4_quantize_us,
@@ -2186,6 +2225,14 @@ impl Gemma4MtpAssistantMetal {
                 weights.layout.matrix_bytes,
                 MATRIX_BYTES_PER_PROPOSAL,
                 weights.quantize_us,
+            );
+            eprintln!(
+                "[gemma4-mtp full-q4 residency] source_retained=false mapped_bytes={} locked_bytes={} resident_pages={} total_pages={} packed_bytes={}",
+                resident_ledger.mapped_bytes,
+                resident_ledger.locked_bytes,
+                resident_ledger.resident_pages,
+                resident_ledger.total_pages,
+                weights.layout.matrix_bytes,
             );
         }
 
@@ -2204,7 +2251,7 @@ impl Gemma4MtpAssistantMetal {
             resident_ledger,
             last_proposal_ledger: None,
             source_path: path.to_path_buf(),
-            _locked_mapping: locked_mapping,
+            _locked_mapping: retained_mapping,
         })
     }
 
@@ -4246,6 +4293,44 @@ fn append_q4_0_layout(tensor: TensorRef, cursor: &mut u64) -> Result<Q4TensorRef
     Ok(result)
 }
 
+fn validate_q4_layout_pairs(pairs: &[(TensorRef, Q4TensorRef)], buffer_len: u64) -> Result<u64> {
+    if pairs.is_empty() {
+        return Err(invalid("full-Q4 layout contains no matrices"));
+    }
+    let mut cursor = 0u64;
+    for (index, (source, packed)) in pairs.iter().enumerate() {
+        let expected_len = u64::try_from(q4_0_matrix_bytes(*source)?)
+            .map_err(|_| invalid("Q4_0 matrix byte size exceeds u64"))?;
+        if packed.byte_offset != cursor {
+            return Err(invalid(format!(
+                "full-Q4 matrix {index} begins at {}, expected contiguous offset {cursor}",
+                packed.byte_offset
+            )));
+        }
+        if (packed.rows, packed.cols) != (source.rows, source.cols) {
+            return Err(invalid(format!(
+                "full-Q4 matrix {index} geometry {}x{} does not match source {}x{}",
+                packed.rows, packed.cols, source.rows, source.cols
+            )));
+        }
+        if packed.byte_len != expected_len {
+            return Err(invalid(format!(
+                "full-Q4 matrix {index} has {} bytes, expected {expected_len}",
+                packed.byte_len
+            )));
+        }
+        cursor = cursor
+            .checked_add(packed.byte_len)
+            .ok_or_else(|| invalid("full-Q4 layout byte size overflow"))?;
+    }
+    if cursor != buffer_len {
+        return Err(invalid(format!(
+            "full-Q4 layout covers {cursor} bytes, but packed buffer has {buffer_len}"
+        )));
+    }
+    Ok(cursor)
+}
+
 impl FullQ4Layout {
     fn build(
         embedding: TensorRef,
@@ -4280,6 +4365,58 @@ impl FullQ4Layout {
             post_projection,
             matrix_bytes: cursor,
         })
+    }
+
+    fn validate_complete(
+        &self,
+        embedding: TensorRef,
+        layers: &[LayerWeights],
+        pre_projection: TensorRef,
+        post_projection: TensorRef,
+        buffer_len: u64,
+    ) -> Result<()> {
+        if layers.len() != self.layers.len() {
+            return Err(invalid(format!(
+                "full-Q4 validation has {} source layers and {} packed layers",
+                layers.len(),
+                self.layers.len()
+            )));
+        }
+        let mut pairs = Vec::with_capacity(23);
+        pairs.push((embedding, self.embedding));
+        for (source, packed) in layers.iter().zip(self.layers.iter()) {
+            pairs.extend([
+                (source.q, packed.q),
+                (source.o, packed.o),
+                (source.gate, packed.gate),
+                (source.up, packed.up),
+                (source.down, packed.down),
+            ]);
+        }
+        pairs.extend([
+            (pre_projection, self.pre_projection),
+            (post_projection, self.post_projection),
+        ]);
+        if pairs.len() != 23 {
+            return Err(invalid(format!(
+                "full-Q4 layout has {} matrices, expected 23",
+                pairs.len()
+            )));
+        }
+        let validated_bytes = validate_q4_layout_pairs(&pairs, buffer_len)?;
+        if validated_bytes != self.matrix_bytes {
+            return Err(invalid(format!(
+                "full-Q4 layout records {} bytes after validating {validated_bytes}",
+                self.matrix_bytes
+            )));
+        }
+        if self.matrix_bytes != FULL_Q4_MATRIX_BYTES {
+            return Err(invalid(format!(
+                "full-Q4 official pack has {} bytes, expected {FULL_Q4_MATRIX_BYTES}",
+                self.matrix_bytes
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -4360,6 +4497,13 @@ fn quantize_full_assistant_to_q4_0(
     post_projection: TensorRef,
 ) -> Result<FullQ4Weights> {
     let layout = FullQ4Layout::build(embedding, layers, pre_projection, post_projection)?;
+    layout.validate_complete(
+        embedding,
+        layers,
+        pre_projection,
+        post_projection,
+        layout.matrix_bytes,
+    )?;
     let buffer = shared_buffer(
         device,
         usize::try_from(layout.matrix_bytes)
@@ -4386,6 +4530,13 @@ fn quantize_full_assistant_to_q4_0(
     }
     quantize_matrix_into_q4_0(mapping, pre_projection, &buffer, layout.pre_projection)?;
     quantize_matrix_into_q4_0(mapping, post_projection, &buffer, layout.post_projection)?;
+    layout.validate_complete(
+        embedding,
+        layers,
+        pre_projection,
+        post_projection,
+        buffer.length(),
+    )?;
     Ok(FullQ4Weights {
         buffer,
         layout,
@@ -4789,6 +4940,7 @@ mod tests {
     fn full_q4_layout_covers_every_matrix_without_padding_or_overlap() {
         let mut cursor = 0u64;
         let mut matrix_count = 0usize;
+        let mut pairs = Vec::with_capacity(23);
         for expected in EXPECTED_TENSORS
             .iter()
             .filter(|tensor| tensor.shape.len() == 2)
@@ -4801,11 +4953,18 @@ mod tests {
             let packed = append_q4_0_layout(tensor, &mut cursor).unwrap();
             assert_eq!(packed.byte_offset + packed.byte_len, cursor);
             assert_eq!((packed.rows, packed.cols), (tensor.rows, tensor.cols));
+            pairs.push((tensor, packed));
             matrix_count += 1;
         }
         assert_eq!(matrix_count, 23);
-        assert_eq!(cursor, 236_077_056);
+        assert_eq!(cursor, FULL_Q4_MATRIX_BYTES);
         assert_eq!(cursor, 225 * 1_048_576 + 147_456);
+        assert_eq!(validate_q4_layout_pairs(&pairs, cursor).unwrap(), cursor);
+
+        let mut noncontiguous = pairs.clone();
+        noncontiguous[1].1.byte_offset += 1;
+        assert!(validate_q4_layout_pairs(&noncontiguous, cursor).is_err());
+        assert!(validate_q4_layout_pairs(&pairs, cursor + 1).is_err());
     }
 
     #[test]
@@ -4916,7 +5075,10 @@ mod tests {
         struct BenchResult {
             load_wall_us: u128,
             quantize_us: u128,
+            mapped_bytes: u64,
             locked_bytes: u64,
+            resident_pages: u64,
+            total_pages: u64,
             packed_bytes: u64,
             matrix_bytes_per_draft: u64,
             k7_gpu_us: u128,
@@ -4991,7 +5153,10 @@ mod tests {
             BenchResult {
                 load_wall_us,
                 quantize_us: ledger.full_q4_quantize_us,
+                mapped_bytes: ledger.mapped_bytes,
                 locked_bytes: ledger.locked_bytes,
+                resident_pages: ledger.resident_pages,
+                total_pages: ledger.total_pages,
                 packed_bytes: ledger.full_q4_matrix_bytes,
                 matrix_bytes_per_draft: assistant.assistant_matrix_bytes_per_proposal(),
                 k7_gpu_us: proposals
@@ -5008,9 +5173,17 @@ mod tests {
 
         let baseline = run(false);
         let full_q4 = run(true);
-        assert_eq!(full_q4.packed_bytes, 236_077_056);
+        assert_eq!(full_q4.packed_bytes, FULL_Q4_MATRIX_BYTES);
         assert_eq!(full_q4.matrix_bytes_per_draft, full_q4.packed_bytes);
         assert_eq!(baseline.matrix_bytes_per_draft, 453_509_120);
+        assert!(baseline.mapped_bytes > 0);
+        assert!(baseline.locked_bytes > 0);
+        assert!(baseline.resident_pages > 0);
+        assert_eq!(baseline.resident_pages, baseline.total_pages);
+        assert_eq!(full_q4.mapped_bytes, 0);
+        assert_eq!(full_q4.locked_bytes, 0);
+        assert_eq!(full_q4.resident_pages, 0);
+        assert_eq!(full_q4.total_pages, 0);
         assert!(full_q4.quantize_us > 0);
         eprintln!(
             "[gemma4-mtp full-q4 benchmark] baseline={baseline:?} full_q4={full_q4:?} traffic_ratio={:.3} gpu_speedup={:.3} proposal_wall_speedup={:.3}",
