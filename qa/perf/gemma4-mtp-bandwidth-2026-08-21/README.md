@@ -18,6 +18,10 @@ against the previous run; all three lanes stayed token-identical throughout.
 
 ## Tools
 
+- `hybrid-hot40-experiment-runner/` — isolated, fail-closed K8/full-Q4 A/B for
+  the exact uniform 40-hot/128-mapped geometry. It preserves port 8181, requires
+  a 60-second clean-memory baseline, and rejects any current-run swap growth or
+  token-ID drift.
 - `hybrid-hot48-runner/` — manual, fail-closed load-only → K8/K1 smoke →
   K8/K1 promotion ladder for the 48-hot/128-mapped hybrid profile. It blocks
   real runs until matching load-only v4 and every-round structured-telemetry
@@ -50,6 +54,13 @@ Negative, with receipts:
   engine. Depth is the limiter, not concurrency.
 - **Channel-tiled repack**: only 1.20x from coalescing; not worth a 12.9 GB
   format change and new payload-identity hashes.
+- **Exact-f32 MoE block dots**: bit-exact for K=1 through K=8, but GateUp was
+  12.1% slower and Down was 7.4% slower.
+- **Dense O pre-unpack**: bit-exact, but 0.513 ms slower per 30-layer K8 sweep
+  and 409 MiB of extra retained representation.
+- **GateUp MMA**: both staged and direct-fragment layouts were bit-exact, but
+  saved only 5.122 ms and 3.436 ms respectively, below the 10 ms promotion
+  threshold. All experimental integration was removed.
 
 Two microbenchmarks misled this session and the real engine run caught both.
 Prefer an engine A/B over a synthetic benchmark when the two disagree.
