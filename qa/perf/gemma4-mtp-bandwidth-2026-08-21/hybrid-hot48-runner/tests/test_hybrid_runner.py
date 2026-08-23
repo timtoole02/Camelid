@@ -263,6 +263,18 @@ def startup_log(k8: bool = False) -> str:
 
 
 class WatchdogBoundaryTests(unittest.TestCase):
+    @staticmethod
+    def _process_sample(pid: int, multiplier: int = 1) -> dict[str, int]:
+        return {
+            "pid": pid,
+            "rss_bytes": 10 * multiplier,
+            "physical_footprint_bytes": 20 * multiplier,
+            "wired_bytes": 30 * multiplier,
+            "pageins": 40 * multiplier,
+            "disk_read_bytes": 50 * multiplier,
+            "disk_written_bytes": 60 * multiplier,
+        }
+
     def test_host_threshold_boundaries_and_counter_regression(self) -> None:
         baseline = host_sample()
         self.assertEqual(
@@ -303,6 +315,167 @@ class WatchdogBoundaryTests(unittest.TestCase):
         with mock.patch.object(watchdog.os, "killpg") as killpg:
             self.assertTrue(watchdog._send_group_signal(4321, 15, 4321))
         killpg.assert_called_once_with(4321, 15)
+
+    def test_departed_nonleader_restarts_complete_group_sample(self) -> None:
+        leader = 4321
+        helper = 4322
+        telemetry = mock.Mock()
+        telemetry.process_group_pids.side_effect = [
+            [leader, helper],
+            [leader],
+        ]
+        telemetry.sample_process.side_effect = [
+            self._process_sample(leader),
+            watchdog.ProcessDisappeared(helper, "helper vanished"),
+            self._process_sample(leader, multiplier=2),
+        ]
+
+        with mock.patch.object(watchdog, "_pid_exists", return_value=False):
+            sample = watchdog.NativeTelemetry.sample_process_group(
+                telemetry, leader, leader
+            )
+
+        self.assertEqual(sample["member_pids"], [leader])
+        self.assertEqual(sample["initial_member_pids"], [leader, helper])
+        self.assertEqual(sample["departed_member_pids"], [helper])
+        self.assertEqual(
+            sample["membership_rechecks"],
+            [
+                {
+                    "sampling_attempt": 1,
+                    "failed_pid": helper,
+                    "telemetry_error_type": "ProcessDisappeared",
+                    "telemetry_error": "helper vanished",
+                    "member_pids": [leader],
+                }
+            ],
+        )
+        self.assertEqual(sample["sampling_attempts"], 2)
+        self.assertEqual(sample["member_count"], 1)
+        self.assertEqual(sample["rss_bytes"], 20)
+        self.assertEqual(sample["physical_footprint_bytes"], 40)
+        self.assertEqual(
+            telemetry.sample_process.call_args_list,
+            [mock.call(leader), mock.call(helper), mock.call(leader)],
+        )
+
+    def test_live_nonleader_failure_immediately_fails_closed(self) -> None:
+        leader = 4321
+        helper = 4322
+        telemetry = mock.Mock()
+        telemetry.process_group_pids.return_value = [leader, helper]
+        telemetry.sample_process.side_effect = [
+            self._process_sample(leader),
+            watchdog.ProcessAccountingError(helper, "live helper failure"),
+        ]
+
+        with self.assertRaisesRegex(
+            watchdog.ProcessAccountingError, "live helper failure"
+        ):
+            watchdog.NativeTelemetry.sample_process_group(
+                telemetry, leader, leader
+            )
+        self.assertEqual(telemetry.sample_process.call_count, 2)
+        telemetry.process_group_pids.assert_called_once_with(leader)
+
+    def test_group_absence_does_not_tolerate_live_escaped_member(self) -> None:
+        leader = 4321
+        helper = 4322
+        telemetry = mock.Mock()
+        telemetry.process_group_pids.side_effect = [
+            [leader, helper],
+            [leader],
+        ]
+        telemetry.sample_process.side_effect = [
+            self._process_sample(leader),
+            watchdog.ProcessDisappeared(helper, "helper accounting vanished"),
+        ]
+
+        with mock.patch.object(watchdog, "_pid_exists", return_value=True):
+            with self.assertRaisesRegex(
+                watchdog.TelemetryError, "remains live or escaped"
+            ):
+                watchdog.NativeTelemetry.sample_process_group(
+                    telemetry, leader, leader
+                )
+
+    def test_zero_rusage_is_a_typed_live_accounting_failure(self) -> None:
+        pid = 4322
+        telemetry = object.__new__(watchdog.NativeTelemetry)
+        telemetry.lib = mock.Mock()
+        telemetry.lib.proc_pid_rusage.return_value = 0
+
+        with mock.patch.object(watchdog.os, "kill") as kill:
+            with self.assertRaisesRegex(
+                watchdog.ProcessAccountingError,
+                "returned zero resident/footprint bytes",
+            ):
+                telemetry.sample_process(pid)
+        kill.assert_called_once_with(pid, 0)
+
+    def test_zero_rusage_with_esrch_is_typed_as_disappeared(self) -> None:
+        pid = 4322
+        telemetry = object.__new__(watchdog.NativeTelemetry)
+        telemetry.lib = mock.Mock()
+        telemetry.lib.proc_pid_rusage.return_value = 0
+
+        with mock.patch.object(
+            watchdog.os, "kill", side_effect=ProcessLookupError
+        ):
+            with self.assertRaisesRegex(
+                watchdog.ProcessDisappeared,
+                "returned zero resident/footprint bytes",
+            ):
+                telemetry.sample_process(pid)
+
+    def test_pid_liveness_permission_error_is_fail_closed_live(self) -> None:
+        with mock.patch.object(
+            watchdog.os, "kill", side_effect=PermissionError
+        ):
+            self.assertTrue(watchdog._pid_exists(4322))
+
+    def test_required_leader_failure_is_never_skipped(self) -> None:
+        leader = 4321
+        telemetry = mock.Mock()
+        telemetry.process_group_pids.return_value = [leader]
+        telemetry.sample_process.side_effect = watchdog.ProcessDisappeared(
+            leader, "leader accounting failed"
+        )
+
+        with self.assertRaisesRegex(
+            watchdog.TelemetryError, "leader accounting failed"
+        ):
+            watchdog.NativeTelemetry.sample_process_group(
+                telemetry, leader, leader
+            )
+        telemetry.process_group_pids.assert_called_once_with(leader)
+
+    def test_second_departure_fails_closed_instead_of_churning(self) -> None:
+        leader = 4321
+        first_helper = 4322
+        second_helper = 4323
+        telemetry = mock.Mock()
+        telemetry.process_group_pids.side_effect = [
+            [leader, first_helper],
+            [leader, second_helper],
+            [leader],
+        ]
+        telemetry.sample_process.side_effect = [
+            self._process_sample(leader),
+            watchdog.ProcessDisappeared(first_helper, "first helper vanished"),
+            self._process_sample(leader),
+            watchdog.ProcessDisappeared(second_helper, "second helper vanished"),
+        ]
+
+        with mock.patch.object(watchdog, "_pid_exists", return_value=False):
+            with self.assertRaisesRegex(
+                watchdog.TelemetryError,
+                "changed during both telemetry attempts",
+            ):
+                watchdog.NativeTelemetry.sample_process_group(
+                    telemetry, leader, leader
+                )
+
 
 
 class ReceiptTests(unittest.TestCase):

@@ -64,6 +64,18 @@ class TelemetryError(RuntimeError):
     """Required fail-closed telemetry was unavailable or malformed."""
 
 
+class ProcessAccountingError(TelemetryError):
+    """libproc could not provide valid accounting for one process."""
+
+    def __init__(self, pid: int, message: str) -> None:
+        super().__init__(message)
+        self.pid = pid
+
+
+class ProcessDisappeared(ProcessAccountingError):
+    """Process accounting failed and a fresh liveness check proved ESRCH."""
+
+
 class ParentSignal(RuntimeError):
     """The watchdog parent received a signal that must reach the child."""
 
@@ -126,6 +138,30 @@ class RusageInfoV2(ctypes.Structure):
         ("diskio_bytesread", ctypes.c_uint64),
         ("diskio_byteswritten", ctypes.c_uint64),
     ]
+
+
+def _pid_exists(pid: int) -> bool:
+    """Return False only when kill(2) proves that ``pid`` no longer exists."""
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # EPERM still proves that a process exists.  Treat it as live so the
+        # watchdog fails closed rather than accepting uncertain accounting.
+        return True
+    except OSError as error:
+        raise TelemetryError(
+            f"kill(0) liveness check for PID {pid} failed: {error}"
+        ) from error
+    return True
+
+
+def _raise_process_accounting_error(pid: int, message: str) -> NoReturn:
+    if not _pid_exists(pid):
+        raise ProcessDisappeared(pid, message)
+    raise ProcessAccountingError(pid, message)
 
 
 class NativeTelemetry:
@@ -277,12 +313,14 @@ class NativeTelemetry:
         )
         if result != 0:
             err = ctypes.get_errno()
-            raise TelemetryError(
-                f"proc_pid_rusage({pid}) failed: result={result}, errno={err}"
+            _raise_process_accounting_error(
+                pid,
+                f"proc_pid_rusage({pid}) failed: result={result}, errno={err}",
             )
         if usage.resident_size == 0 or usage.phys_footprint == 0:
-            raise TelemetryError(
-                f"proc_pid_rusage({pid}) returned zero resident/footprint bytes"
+            _raise_process_accounting_error(
+                pid,
+                f"proc_pid_rusage({pid}) returned zero resident/footprint bytes",
             )
         return {
             "pid": pid,
@@ -322,19 +360,93 @@ class NativeTelemetry:
     def sample_process_group(
         self, process_group: int, required_leader: int
     ) -> dict[str, Any]:
-        pids = self.process_group_pids(process_group)
-        if required_leader not in pids:
-            raise TelemetryError(
-                f"live leader {required_leader} is absent from process group {process_group}"
+        initial_pids = self.process_group_pids(process_group)
+        if required_leader not in initial_pids:
+            message = (
+                f"live leader {required_leader} is absent from process group "
+                f"{process_group}"
             )
-        members = [self.sample_process(pid) for pid in pids]
-        if not members:
-            raise TelemetryError(f"process group {process_group} has no members")
+            if not _pid_exists(required_leader):
+                raise ProcessDisappeared(required_leader, message)
+            raise TelemetryError(message)
+        pids = initial_pids
+        departed_member_pids: list[int] = []
+        membership_rechecks: list[dict[str, Any]] = []
+        members: list[dict[str, int]] = []
+
+        # proc_listpids() and proc_pid_rusage() cannot form one atomic
+        # snapshot.  A short-lived child can therefore exit between those
+        # calls.  Confirm that exact PID left the group, then restart the
+        # entire group sample once so the aggregate is never assembled from
+        # a partial first pass.  All other telemetry failures remain fatal.
+        for sampling_attempt in range(1, 3):
+            members = []
+            restart_group_sample = False
+            for pid in pids:
+                try:
+                    member = self.sample_process(pid)
+                except ProcessDisappeared as error:
+                    if pid == required_leader:
+                        raise
+                    current_pids = self.process_group_pids(process_group)
+                    membership_rechecks.append(
+                        {
+                            "sampling_attempt": sampling_attempt,
+                            "failed_pid": pid,
+                            "telemetry_error_type": type(error).__name__,
+                            "telemetry_error": str(error),
+                            "member_pids": current_pids,
+                        }
+                    )
+                    if required_leader not in current_pids:
+                        message = (
+                            f"live leader {required_leader} is absent from process group "
+                            f"{process_group} during member {pid} telemetry recheck"
+                        )
+                        if not _pid_exists(required_leader):
+                            raise ProcessDisappeared(
+                                required_leader, message
+                            ) from error
+                        raise TelemetryError(message) from error
+                    if pid in current_pids or _pid_exists(pid):
+                        raise TelemetryError(
+                            f"process accounting failed for PID {pid}, but it "
+                            f"remains live or escaped process group {process_group}"
+                        ) from error
+                    if sampling_attempt != 1:
+                        raise TelemetryError(
+                            f"process group {process_group} changed during both "
+                            f"telemetry attempts; latest departed member was {pid}"
+                        ) from error
+                    departed_member_pids.append(pid)
+                    pids = current_pids
+                    restart_group_sample = True
+                    break
+                members.append(member)
+            if restart_group_sample:
+                continue
+            break
+        else:  # pragma: no cover - the bounded loop exits or raises above.
+            raise TelemetryError(
+                f"process group {process_group} could not produce a stable sample"
+            )
+
+        if not members or not any(
+            member["pid"] == required_leader for member in members
+        ):
+            raise TelemetryError(
+                f"process group {process_group} has no successfully sampled live leader"
+            )
+        sampled_pids = [member["pid"] for member in members]
         return {
             "pid": required_leader,
             "process_group": process_group,
             "member_count": len(members),
-            "member_pids": pids,
+            "member_pids": sampled_pids,
+            "initial_member_pids": initial_pids,
+            "departed_member_pids": departed_member_pids,
+            "membership_rechecks": membership_rechecks,
+            "sampling_attempts": sampling_attempt,
             "members": members,
             "rss_bytes": sum(member["rss_bytes"] for member in members),
             "physical_footprint_bytes": sum(
@@ -927,9 +1039,9 @@ def run(args: argparse.Namespace) -> int:
                         process = telemetry.sample_process_group(
                             process_group, child.pid
                         )
-                    except TelemetryError:
-                        # ESRCH is an ordinary race only after waitpid confirms
-                        # that the direct child has exited.
+                    except ProcessDisappeared:
+                        # Confirmed ESRCH is an ordinary race only after
+                        # waitpid confirms that the direct child has exited.
                         if child.poll() is None:
                             raise
                 telemetry_finished_ns = time.monotonic_ns()
