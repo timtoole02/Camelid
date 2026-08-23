@@ -23733,6 +23733,13 @@ pub struct ChainedRoundHostLedger {
     pub mapped_bound_records: u32,
     pub hot_bound_per_layer: [u16; 30],
     pub mapped_bound_per_layer: [u16; 30],
+    /// Selected-cold file ranges accepted by the asynchronous pager-advice
+    /// queue. Bytes are exact expert payload ranges, never layer slabs. Enqueue
+    /// time is nested inside `slot_filler_ms`; advisory completion is never
+    /// awaited by the chained round.
+    pub mapped_readahead_advised_records: u32,
+    pub mapped_readahead_advised_bytes: u64,
+    pub mapped_readahead_enqueue_us: u64,
     pub kv_capacity: u32,
     pub kv_bytes: u64,
     pub kv_filled: u32,

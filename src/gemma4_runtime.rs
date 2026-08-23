@@ -1244,7 +1244,45 @@ struct GhostMoeExpertCache {
     /// storage. Windows' unbuffered reader is serialized internally, so it
     /// defaults to one thread there.
     read_pool: Option<rayon::ThreadPool>,
+    /// Exact mapped-record advisories are fire-and-forget on `read_pool`. Keep
+    /// only currently queued/running identities here: that suppresses duplicate
+    /// work without permanently preventing a record from being advised again
+    /// after the OS later reclaims its clean pages. The set is hard-bounded by
+    /// `GHOST_METAL_MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS`.
+    #[cfg(target_os = "macos")]
+    mapped_readahead_inflight: Arc<std::sync::Mutex<std::collections::HashSet<(usize, usize)>>>,
     state: std::sync::Mutex<GhostMoeCacheState>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MappedReadaheadEnqueueReceipt {
+    advised_records: u64,
+    advised_bytes: u64,
+    enqueue_us: u64,
+}
+
+/// Reserve a bounded set of record identities for asynchronous advice. Input
+/// duplicates and identities already queued by an earlier layer/round are
+/// suppressed. The caller removes every returned key after its advisory runs
+/// (or immediately if range resolution fails).
+#[cfg(any(target_os = "macos", test))]
+fn reserve_mapped_readahead_records(
+    inflight: &mut std::collections::HashSet<(usize, usize)>,
+    layer: usize,
+    experts: &[usize],
+    max_inflight: usize,
+) -> Vec<usize> {
+    let mut reserved = Vec::new();
+    for &expert in experts {
+        if expert >= 128 || inflight.len() >= max_inflight {
+            continue;
+        }
+        if inflight.insert((layer, expert)) {
+            reserved.push(expert);
+        }
+    }
+    reserved
 }
 
 impl GhostMoeExpertCache {
@@ -1275,6 +1313,10 @@ impl GhostMoeExpertCache {
             budget_bytes,
             layer_budgets,
             read_pool,
+            #[cfg(target_os = "macos")]
+            mapped_readahead_inflight: Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             state: std::sync::Mutex::new(GhostMoeCacheState {
                 entries: std::collections::HashMap::new(),
                 seen_keys: std::collections::HashSet::new(),
@@ -1290,6 +1332,58 @@ impl GhostMoeExpertCache {
                 bytes_read: 0,
             }),
         }
+    }
+
+    /// Queue only exact, selected cold records for background page advice.
+    /// This function never waits for an advisory and never reads/copies payload
+    /// bytes or mutates the hot-slot directory. Every worker owns a cloned mmap
+    /// reference and removes its bounded in-flight key when done.
+    #[cfg(target_os = "macos")]
+    fn enqueue_mapped_readahead(
+        &self,
+        layer: usize,
+        cold_experts: &[usize],
+    ) -> MappedReadaheadEnqueueReceipt {
+        let Some(pool) = self.read_pool.as_ref() else {
+            return MappedReadaheadEnqueueReceipt::default();
+        };
+        let started = std::time::Instant::now();
+        let reserved = {
+            let Ok(mut inflight) = self.mapped_readahead_inflight.lock() else {
+                return MappedReadaheadEnqueueReceipt::default();
+            };
+            reserve_mapped_readahead_records(
+                &mut inflight,
+                layer,
+                cold_experts,
+                GHOST_METAL_MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS,
+            )
+        };
+        let mut receipt = MappedReadaheadEnqueueReceipt::default();
+        for expert in reserved {
+            let range = self
+                .file
+                .mapped_moe_expert_readahead_range(layer, expert)
+                .ok()
+                .flatten();
+            let Some((mmap, offset, len)) = range else {
+                if let Ok(mut inflight) = self.mapped_readahead_inflight.lock() {
+                    inflight.remove(&(layer, expert));
+                }
+                continue;
+            };
+            receipt.advised_records = receipt.advised_records.saturating_add(1);
+            receipt.advised_bytes = receipt.advised_bytes.saturating_add(len as u64);
+            let inflight = Arc::clone(&self.mapped_readahead_inflight);
+            pool.spawn_fifo(move || {
+                mmap.advise_willneed_range(offset, len);
+                if let Ok(mut inflight) = inflight.lock() {
+                    inflight.remove(&(layer, expert));
+                }
+            });
+        }
+        receipt.enqueue_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        receipt
     }
 
     #[cfg(test)]
@@ -1538,6 +1632,15 @@ const GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER_ENV: &str =
 /// a distinct, unconditional hybrid seed.
 const GHOST_METAL_DECODE_PROMOTION_ENV: &str =
     "CAMELID_GEMMA4_GHOST_METAL_DECODE_PROMOTION";
+/// Exact hybrid-only opt-in for selected-cold mapped-record page advice. The
+/// routing thread only resolves and enqueues record-sized ranges; advisory work
+/// runs on the existing Ghost read pool and may never become a correctness
+/// dependency.
+const GHOST_METAL_MAPPED_READAHEAD_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD";
+const GHOST_METAL_MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS: usize = 64;
+#[cfg(any(target_os = "macos", test))]
+const GHOST_METAL_MAPPED_READAHEAD_POLICY_MARKER: &str =
+    "[gemma4-ghost-metal] mapped-cold readahead policy: CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD effective=1 scope=selected-cold-only advice=MADV_WILLNEED dispatch=async-read-pool";
 const GHOST_METAL_HYBRID_PROFILE_LAYERS: usize = 30;
 const GHOST_METAL_HYBRID_PROFILE_MIN_SLOTS: usize = 8;
 const GHOST_METAL_HYBRID_PROFILE_MAX_SLOTS: usize = 64;
@@ -1679,6 +1782,33 @@ fn resolve_ghost_metal_decode_promotion(
         ));
     }
     Ok(enabled)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn resolve_ghost_metal_mapped_readahead(
+    value: Option<&str>,
+    hybrid_mapped: bool,
+    async_read_pool_available: bool,
+) -> std::result::Result<bool, String> {
+    let Some(raw) = value else {
+        return Ok(false);
+    };
+    if raw != "1" {
+        return Err(format!(
+            "{GHOST_METAL_MAPPED_READAHEAD_ENV} is an exact opt-in and must be canonical 1 when present"
+        ));
+    }
+    if !hybrid_mapped {
+        return Err(format!(
+            "{GHOST_METAL_MAPPED_READAHEAD_ENV}=1 requires {GHOST_METAL_FILE_MAPPED_EXPERTS_ENV}=1 and {GHOST_METAL_HYBRID_HOT_SLOTS_ENV}={GHOST_METAL_HYBRID_HOT_SLOTS}"
+        ));
+    }
+    if !async_read_pool_available {
+        return Err(format!(
+            "{GHOST_METAL_MAPPED_READAHEAD_ENV}=1 requires an asynchronous Ghost read pool; set CAMELID_GEMMA4_GHOST_READ_THREADS=2..=8"
+        ));
+    }
+    Ok(true)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -2544,6 +2674,9 @@ struct GhostMetalExpertRuntime {
     /// process environment; disabling this still leaves the explicit final-
     /// prefill hot handoff active.
     hybrid_decode_promotion_enabled: bool,
+    /// Construction-time exact opt-in. No routing/Metal hot path rereads the
+    /// environment, and non-hybrid runtimes always keep this false.
+    mapped_readahead_enabled: bool,
     /// Eight 18-slot overflow slabs, reused across all 30 layers. Predicted
     /// rounds bind `overflow_bank[layer % copies]` so prior layers can stay
     /// in flight. Combined footprint is ~461 MiB, not 2.25 GiB.
@@ -2654,6 +2787,30 @@ fn ghost_metal_timing_enabled() -> bool {
         .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
+/// Preserve exact routed order while retaining only distinct canonical experts
+/// that do not currently have an anonymous hot override. The router union is
+/// already distinct in production; the explicit de-duplication keeps the
+/// advisory contract bounded if a diagnostic caller supplies duplicates.
+#[cfg(any(target_os = "macos", test))]
+fn selected_mapped_cold_experts(
+    selected_experts: &[usize],
+    resident_slot_table: &[i16; 128],
+) -> Vec<usize> {
+    let mut seen = [false; 128];
+    selected_experts
+        .iter()
+        .copied()
+        .filter(|&expert| {
+            if expert >= 128 || seen[expert] || resident_slot_table[expert] >= 0 {
+                false
+            } else {
+                seen[expert] = true;
+                true
+            }
+        })
+        .collect()
+}
+
 /// Shared counters for one chained round's slot fills. Grouping them keeps
 /// the fill functions' signatures stable while the ledger grows; all fields
 /// are accumulated with relaxed atomics because fills may run on the rayon
@@ -2681,6 +2838,12 @@ struct WaveFillCounters {
     salvage_copies: std::sync::atomic::AtomicU64,
     salvage_us: std::sync::atomic::AtomicU64,
     victim_verify_fails: std::sync::atomic::AtomicU64,
+    /// Record-sized, selected-cold mmap ranges accepted by the asynchronous
+    /// pager-advice queue. `enqueue_us` is nested inside `slot_filler_ms`; the
+    /// background MADV_WILLNEED duration is intentionally never awaited.
+    mapped_readahead_advised_records: std::sync::atomic::AtomicU64,
+    mapped_readahead_advised_bytes: std::sync::atomic::AtomicU64,
+    mapped_readahead_enqueue_us: std::sync::atomic::AtomicU64,
 }
 
 /// Payload-I/O receipt owner for a terminal hybrid promotion. HEAD fills feed
@@ -3681,6 +3844,7 @@ impl GhostMetalExpertRuntime {
             expert_decay_scores: vec![vec![0.0f32; 128]; layer_count],
             pending_hybrid_promotions: vec![Vec::new(); layer_count],
             hybrid_decode_promotion_enabled: true,
+            mapped_readahead_enabled: false,
             overflow_bank,
             last_chained_k: None,
             last_chained_succeeded: false,
@@ -3701,7 +3865,7 @@ impl GhostMetalExpertRuntime {
         fused_fast: bool,
         ghost_file: &GhostFile,
     ) -> Result<Self> {
-        Self::new_file_mapped_with_hot_cache(layer_count, fused_fast, ghost_file, None, true)
+        Self::new_file_mapped_with_hot_cache(layer_count, fused_fast, ghost_file, None, true, false)
     }
 
     fn new_file_mapped_hybrid(
@@ -3710,6 +3874,7 @@ impl GhostMetalExpertRuntime {
         ghost_file: &GhostFile,
         hot_slots_per_layer: &[usize],
         hybrid_decode_promotion_enabled: bool,
+        mapped_readahead_enabled: bool,
     ) -> Result<Self> {
         Self::new_file_mapped_with_hot_cache(
             layer_count,
@@ -3717,6 +3882,7 @@ impl GhostMetalExpertRuntime {
             ghost_file,
             Some(hot_slots_per_layer),
             hybrid_decode_promotion_enabled,
+            mapped_readahead_enabled,
         )
     }
 
@@ -3726,6 +3892,7 @@ impl GhostMetalExpertRuntime {
         ghost_file: &GhostFile,
         hot_slots_per_layer: Option<&[usize]>,
         hybrid_decode_promotion_enabled: bool,
+        mapped_readahead_enabled: bool,
     ) -> Result<Self> {
         if layer_count == 0 {
             return Err(BackendError::InvalidModelMetadata(
@@ -3744,6 +3911,10 @@ impl GhostMetalExpertRuntime {
         } else if !hybrid_decode_promotion_enabled {
             return Err(BackendError::InvalidModelMetadata(format!(
                 "{GHOST_METAL_DECODE_PROMOTION_ENV}=0 requires hybrid mapped backing"
+            )));
+        } else if mapped_readahead_enabled {
+            return Err(BackendError::InvalidModelMetadata(format!(
+                "{GHOST_METAL_MAPPED_READAHEAD_ENV}=1 requires hybrid mapped backing"
             )));
         }
         if ghost_file.wire_mapping().is_none() {
@@ -3859,6 +4030,13 @@ impl GhostMetalExpertRuntime {
                     "off"
                 },
             );
+            if mapped_readahead_enabled {
+                eprintln!("{GHOST_METAL_MAPPED_READAHEAD_POLICY_MARKER}");
+                eprintln!(
+                    "[gemma4-ghost-metal] mapped-cold readahead admission: max_inflight_records={} whole_slab_advice=0 anonymous_capacity_bytes=0 advised_records=0 advised_bytes=0 enqueue_time_us=0",
+                    GHOST_METAL_MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS,
+                );
+            }
         } else {
             eprintln!(
                 "[gemma4-ghost-metal] {GHOST_METAL_FILE_MAPPED_EXPERTS_ENV}=1: clean file-backed experts active, layers={layer_count} addressable=128/layer mapped_span={:.2}GiB anonymous_expert_capacity=0 overflow=0 victim=0 mlock=0",
@@ -3878,6 +4056,7 @@ impl GhostMetalExpertRuntime {
             expert_decay_scores: vec![vec![0.0f32; 128]; layer_count],
             pending_hybrid_promotions: vec![Vec::new(); layer_count],
             hybrid_decode_promotion_enabled,
+            mapped_readahead_enabled,
             overflow_bank: Vec::new(),
             last_chained_k: None,
             last_chained_succeeded: false,
@@ -4169,6 +4348,7 @@ impl GhostMetalExpertRuntime {
             .map(|l| l.slots.gpu_binding())
             .collect();
         let hybrid_mapped_backing = self.has_hybrid_mapped_backing();
+        let mapped_readahead_enabled = self.mapped_readahead_enabled;
         let demand_record_backing = self
             .layers
             .iter()
@@ -4395,12 +4575,34 @@ impl GhostMetalExpertRuntime {
                 }
 
                 if layer.slots.is_hybrid_mapped() {
+                    let cold_experts = selected_mapped_cold_experts(
+                        &selected_experts,
+                        &layer.directory.resident_slot_table,
+                    );
                     let hot_hits = selected_experts
                         .iter()
                         .filter(|&&expert| {
                             layer.directory.lookup_resident_slot(expert).is_some()
                         })
                         .count();
+                    if routed && mapped_readahead_enabled && !cold_experts.is_empty() {
+                        let receipt = cache.enqueue_mapped_readahead(layer_idx, &cold_experts);
+                        fill_counters
+                            .mapped_readahead_advised_records
+                            .fetch_add(
+                                receipt.advised_records,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        fill_counters
+                            .mapped_readahead_advised_bytes
+                            .fetch_add(
+                                receipt.advised_bytes,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        fill_counters
+                            .mapped_readahead_enqueue_us
+                            .fetch_add(receipt.enqueue_us, std::sync::atomic::Ordering::Relaxed);
+                    }
                     fill_counters
                         .plan_hits
                         .fetch_add(hot_hits as u64, std::sync::atomic::Ordering::Relaxed);
@@ -4618,6 +4820,15 @@ impl GhostMetalExpertRuntime {
                 fill_counters.nvme_us.load(Relaxed) as f64 / 1000.0;
             common.last_chained_ledger.nvme_bytes = fill_counters.nvme_bytes.load(Relaxed);
             common.last_chained_ledger.demand_loads = fill_counters.demand_loads.load(Relaxed);
+            common.last_chained_ledger.mapped_readahead_advised_records = fill_counters
+                .mapped_readahead_advised_records
+                .load(Relaxed)
+                .min(u32::MAX as u64)
+                as u32;
+            common.last_chained_ledger.mapped_readahead_advised_bytes =
+                fill_counters.mapped_readahead_advised_bytes.load(Relaxed);
+            common.last_chained_ledger.mapped_readahead_enqueue_us =
+                fill_counters.mapped_readahead_enqueue_us.load(Relaxed);
             common.last_chained_ledger.prefetch_ms = prefetch_ms;
             common.last_chained_ledger.setup_ms = setup_ms;
             common.last_chained_ledger.filler_route_ms =
@@ -4703,7 +4914,7 @@ impl GhostMetalExpertRuntime {
             if ghost_metal_timing_enabled() {
                 let led = &common.last_chained_ledger;
                 eprintln!(
-                    "[metal chained ledger] start_pos={start_pos} K={k_tokens} ok={ok} predicted={allow_predicted} slot_wait={:.1}ms slot_filler={:.1}ms wave_load={:.1}ms final_wait={:.1}ms encode={:.1}ms gpu_busy(last_cb)={:.1}ms disk_loads={} disk_bytes={:.1}MiB disk_time={:.1}ms unique={}",
+                    "[metal chained ledger] start_pos={start_pos} K={k_tokens} ok={ok} predicted={allow_predicted} slot_wait={:.1}ms slot_filler={:.1}ms wave_load={:.1}ms final_wait={:.1}ms encode={:.1}ms gpu_busy(last_cb)={:.1}ms disk_loads={} disk_bytes={:.1}MiB disk_time={:.1}ms unique={} mapped_readahead_records={} mapped_readahead_bytes={:.1}MiB mapped_readahead_enqueue={:.3}ms",
                     led.slot_wait_ms,
                     led.slot_filler_ms,
                     led.wave_load_ms,
@@ -4714,6 +4925,9 @@ impl GhostMetalExpertRuntime {
                     led.nvme_bytes as f64 / (1024.0 * 1024.0),
                     led.nvme_ms,
                     led.unique_experts_sum,
+                    led.mapped_readahead_advised_records,
+                    led.mapped_readahead_advised_bytes as f64 / (1024.0 * 1024.0),
+                    led.mapped_readahead_enqueue_us as f64 / 1000.0,
                 );
                 eprintln!(
                     "[metal chained idle] route={:.1}ms fill={:.1}ms (copy={:.1}ms disk={:.1}ms victim={:.1}ms) pre_encode={:.1}ms slot hits={} misses={} evictions={} victim_hits={} salvage={} ({:.1}ms) verify_fails={} union_vs_prev={}/{} resident_at_start={}/{} overlap_layers={}/{}",
@@ -7172,6 +7386,13 @@ pub struct Gemma4RoutedExpertResidencySnapshot {
     pub host_cache_resident_experts: u64,
     pub host_cache_resident_bytes: u64,
     pub host_cache_budget_bytes: u64,
+    /// Load-time admission for selected-cold mapped-record page advice. This
+    /// experiment owns no anonymous payload capacity; the bounded in-flight
+    /// count limits queued advisory work only.
+    #[serde(default)]
+    pub mapped_readahead_enabled: bool,
+    #[serde(default)]
+    pub mapped_readahead_max_inflight_records: u32,
     pub interval_routed_expert_union_scope: String,
     pub interval_routed_expert_union_epoch: u64,
     pub interval_routed_expert_ids_per_layer: Vec<Vec<u16>>,
@@ -7194,6 +7415,12 @@ pub struct Gemma4RoutedExpertResidencySnapshot {
     pub last_chained_hot_bound_records: u32,
     #[serde(default)]
     pub last_chained_mapped_bound_records: u32,
+    #[serde(default)]
+    pub last_chained_mapped_readahead_advised_records: u32,
+    #[serde(default)]
+    pub last_chained_mapped_readahead_advised_bytes: u64,
+    #[serde(default)]
+    pub last_chained_mapped_readahead_enqueue_us: u64,
     pub last_chained_slot_hits: u32,
     pub last_chained_slot_misses: u32,
     pub last_chained_slot_evictions: u32,
@@ -7243,6 +7470,9 @@ pub struct Gemma4HybridTelemetryGeometry {
     pub victim_record_capacity: u64,
     pub victim_capacity_bytes: u64,
     pub host_cache_budget_bytes: u64,
+    pub mapped_readahead_enabled: bool,
+    pub mapped_readahead_max_inflight_records: u32,
+    pub mapped_readahead_anonymous_capacity_bytes: u64,
     pub per_layer: Vec<Gemma4HybridTelemetryLayerGeometry>,
 }
 
@@ -7300,6 +7530,9 @@ pub struct Gemma4HybridTelemetryRound {
     pub overflow_layers: u32,
     pub overflow_experts: u32,
     pub victim_hits: u32,
+    pub mapped_readahead_advised_records: u32,
+    pub mapped_readahead_advised_bytes: u64,
+    pub mapped_readahead_enqueue_ms: f64,
     pub per_layer: Vec<Gemma4HybridTelemetryRoundLayer>,
 }
 
@@ -7493,6 +7726,15 @@ impl Gemma4HybridTelemetryCollector {
         }
         if hot_total != snapshot.last_chained_hot_bound_records
             || mapped_total != snapshot.last_chained_mapped_bound_records
+            || snapshot.last_chained_mapped_readahead_advised_records > mapped_total
+            || snapshot.last_chained_mapped_readahead_advised_bytes
+                != u64::from(snapshot.last_chained_mapped_readahead_advised_records)
+                    .checked_mul(self.geometry.record_payload_bytes)
+                    .unwrap_or(u64::MAX)
+            || (!self.geometry.mapped_readahead_enabled
+                && (snapshot.last_chained_mapped_readahead_advised_records != 0
+                    || snapshot.last_chained_mapped_readahead_advised_bytes != 0
+                    || snapshot.last_chained_mapped_readahead_enqueue_us != 0))
         {
             self.valid = false;
             return;
@@ -7527,6 +7769,11 @@ impl Gemma4HybridTelemetryCollector {
             overflow_layers: snapshot.last_chained_overflow_layers,
             overflow_experts: snapshot.last_chained_overflow_experts,
             victim_hits: snapshot.last_chained_victim_hits,
+            mapped_readahead_advised_records: snapshot
+                .last_chained_mapped_readahead_advised_records,
+            mapped_readahead_advised_bytes: snapshot.last_chained_mapped_readahead_advised_bytes,
+            mapped_readahead_enqueue_ms: snapshot.last_chained_mapped_readahead_enqueue_us as f64
+                / 1_000.0,
             per_layer,
         });
     }
@@ -7712,6 +7959,12 @@ fn exact_hybrid_telemetry_geometry(
         || snapshot.victim_record_capacity != 0
         || snapshot.victim_capacity_bytes != 0
         || snapshot.host_cache_budget_bytes != 0
+        || if snapshot.mapped_readahead_enabled {
+            snapshot.mapped_readahead_max_inflight_records
+                != GHOST_METAL_MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS as u32
+        } else {
+            snapshot.mapped_readahead_max_inflight_records != 0
+        }
         || snapshot.per_layer.len() != HYBRID_TELEMETRY_LAYERS
     {
         return None;
@@ -7767,6 +8020,9 @@ fn exact_hybrid_telemetry_geometry(
         victim_record_capacity: snapshot.victim_record_capacity,
         victim_capacity_bytes: snapshot.victim_capacity_bytes,
         host_cache_budget_bytes: snapshot.host_cache_budget_bytes,
+        mapped_readahead_enabled: snapshot.mapped_readahead_enabled,
+        mapped_readahead_max_inflight_records: snapshot.mapped_readahead_max_inflight_records,
+        mapped_readahead_anonymous_capacity_bytes: 0,
         per_layer,
     })
 }
@@ -9335,6 +9591,23 @@ impl Gemma4Runtime {
                 hybrid_hot_slots.is_some(),
             )
             .map_err(BackendError::InvalidModelMetadata)?;
+            let mapped_readahead_raw = match std::env::var(GHOST_METAL_MAPPED_READAHEAD_ENV) {
+                Ok(value) => Some(value),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    return Err(BackendError::InvalidModelMetadata(format!(
+                        "{GHOST_METAL_MAPPED_READAHEAD_ENV} must be canonical UTF-8 1 when present"
+                    )));
+                }
+            };
+            let mapped_readahead_enabled = resolve_ghost_metal_mapped_readahead(
+                mapped_readahead_raw.as_deref(),
+                hybrid_hot_slots.is_some(),
+                ghost_moe_cache
+                    .as_ref()
+                    .is_some_and(|cache| cache.read_pool.is_some()),
+            )
+            .map_err(BackendError::InvalidModelMetadata)?;
             if file_mapped_raw.is_some() && !file_mapped_experts {
                 return Err(BackendError::InvalidModelMetadata(format!(
                     "{GHOST_METAL_FILE_MAPPED_EXPERTS_ENV} is an exact opt-in and must be 1 when present"
@@ -9520,6 +9793,7 @@ impl Gemma4Runtime {
                                 .as_deref()
                                 .expect("hybrid profile is present when hybrid is selected"),
                             hybrid_decode_promotion_enabled,
+                            mapped_readahead_enabled,
                         )?
                     } else {
                         GhostMetalExpertRuntime::new_file_mapped(
@@ -9687,6 +9961,7 @@ impl Gemma4Runtime {
                                     .as_deref()
                                     .expect("hybrid profile is present when hybrid is selected"),
                                 hybrid_decode_promotion_enabled,
+                                mapped_readahead_enabled,
                             )?
                         } else {
                             GhostMetalExpertRuntime::new_file_mapped(
@@ -10304,6 +10579,12 @@ impl Gemma4Runtime {
                 host_cache_resident_experts: host_cache.resident_experts as u64,
                 host_cache_resident_bytes: host_cache.resident_bytes as u64,
                 host_cache_budget_bytes: host_cache.budget_bytes as u64,
+                mapped_readahead_enabled: lane.mapped_readahead_enabled,
+                mapped_readahead_max_inflight_records: if lane.mapped_readahead_enabled {
+                    GHOST_METAL_MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS as u32
+                } else {
+                    0
+                },
                 interval_routed_expert_union_scope:
                     "since_latest_explicit_telemetry_interval_begin_or_runtime_load".to_string(),
                 interval_routed_expert_union_epoch: lane.routed_expert_interval_epoch,
@@ -10346,6 +10627,21 @@ impl Gemma4Runtime {
                 },
                 last_chained_mapped_bound_records: if last_chained_round_available {
                     chained.mapped_bound_records
+                } else {
+                    0
+                },
+                last_chained_mapped_readahead_advised_records: if last_chained_round_available {
+                    chained.mapped_readahead_advised_records
+                } else {
+                    0
+                },
+                last_chained_mapped_readahead_advised_bytes: if last_chained_round_available {
+                    chained.mapped_readahead_advised_bytes
+                } else {
+                    0
+                },
+                last_chained_mapped_readahead_enqueue_us: if last_chained_round_available {
+                    chained.mapped_readahead_enqueue_us
                 } else {
                     0
                 },
@@ -21546,6 +21842,9 @@ mod mtp_target_seam_tests {
 
     fn complete_k8_telemetry() -> Gemma4HybridTelemetry {
         let mut before = exact_hybrid_snapshot(10, None, 0, 0);
+        before.mapped_readahead_enabled = true;
+        before.mapped_readahead_max_inflight_records =
+            GHOST_METAL_MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS as u32;
         before.aggregate_slot_stats = Gemma4RoutedExpertSlotStatsSnapshot {
             route_lookups: 100,
             hits: 60,
@@ -21555,6 +21854,13 @@ mod mtp_target_seam_tests {
         let mut collector =
             Gemma4HybridTelemetryCollector::begin(before.clone()).expect("exact hybrid baseline");
         let mut after = exact_hybrid_snapshot(11, Some(8), 10, 6);
+        after.mapped_readahead_enabled = true;
+        after.mapped_readahead_max_inflight_records =
+            GHOST_METAL_MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS as u32;
+        after.last_chained_mapped_readahead_advised_records = 120;
+        after.last_chained_mapped_readahead_advised_bytes =
+            120 * HYBRID_TELEMETRY_RECORD_BYTES;
+        after.last_chained_mapped_readahead_enqueue_us = 321;
         after.aggregate_slot_stats = Gemma4RoutedExpertSlotStatsSnapshot {
             route_lookups: 580,
             hits: 360,
@@ -21580,6 +21886,18 @@ mod mtp_target_seam_tests {
         assert_eq!(telemetry.aggregate.hot_hits, 300);
         assert_eq!(telemetry.aggregate.mapped_cold_selections, 180);
         assert_eq!(telemetry.aggregate.chained_promotion_loads, 5);
+        assert!(telemetry.geometry.mapped_readahead_enabled);
+        assert_eq!(
+            telemetry.geometry.mapped_readahead_max_inflight_records,
+            GHOST_METAL_MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS as u32
+        );
+        assert_eq!(telemetry.geometry.mapped_readahead_anonymous_capacity_bytes, 0);
+        assert_eq!(telemetry.rounds[0].mapped_readahead_advised_records, 120);
+        assert_eq!(
+            telemetry.rounds[0].mapped_readahead_advised_bytes,
+            120 * HYBRID_TELEMETRY_RECORD_BYTES
+        );
+        assert_eq!(telemetry.rounds[0].mapped_readahead_enqueue_ms, 0.321);
         assert_eq!(telemetry.metrics.forwarded_decode_tokens, 6);
         assert_eq!(telemetry.metrics.decode_tokens_per_second, 60.0);
         assert_eq!(telemetry.metrics.max_full_assistant_exposed_ms, 20.0);
@@ -21594,6 +21912,11 @@ mod mtp_target_seam_tests {
         assert_eq!(value["geometry"]["logical_addressable_slots"], 3_840);
         assert_eq!(value["geometry"]["anonymous_hot_capacity_slots"], 960);
         assert_eq!(value["geometry"]["victim_record_capacity"], 0);
+        assert_eq!(value["geometry"]["mapped_readahead_enabled"], true);
+        assert_eq!(
+            value["rounds"][0]["mapped_readahead_advised_records"],
+            120
+        );
         assert_eq!(value["geometry"]["per_layer"][0]["layer"], 0);
         assert_eq!(value["rounds"][0]["per_layer"][0]["layer_index"], 0);
         assert_eq!(value["rounds"][0]["per_layer"][0]["mapped_bound"], 6);
@@ -21603,6 +21926,26 @@ mod mtp_target_seam_tests {
         assert!(value["geometry"]
             .get("anonymous_hot_locked_bytes")
             .is_none());
+    }
+
+    #[test]
+    fn hybrid_telemetry_rejects_inconsistent_mapped_readahead_receipt() {
+        let mut before = exact_hybrid_snapshot(10, None, 0, 0);
+        before.mapped_readahead_enabled = true;
+        before.mapped_readahead_max_inflight_records =
+            GHOST_METAL_MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS as u32;
+        let mut collector =
+            Gemma4HybridTelemetryCollector::begin(before).expect("exact hybrid baseline");
+        let mut after = exact_hybrid_snapshot(11, Some(8), 10, 6);
+        after.mapped_readahead_enabled = true;
+        after.mapped_readahead_max_inflight_records =
+            GHOST_METAL_MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS as u32;
+        after.last_chained_mapped_readahead_advised_records = 1;
+        after.last_chained_mapped_readahead_advised_bytes =
+            HYBRID_TELEMETRY_RECORD_BYTES + 1;
+        after.last_chained_mapped_readahead_enqueue_us = 1;
+        collector.capture_round(k8_round_input(), Some(after.clone()));
+        assert!(collector.finish(Some(after), 6, 0).is_none());
     }
 
     #[test]
@@ -23673,6 +24016,53 @@ mod ghost_moe_wire_tests {
                 "decode-promotion policy {invalid:?} must fail closed"
             );
         }
+    }
+
+    #[test]
+    fn metal_hybrid_mapped_readahead_contract_is_exact_async_and_hybrid_only() {
+        assert!(!resolve_ghost_metal_mapped_readahead(None, false, false).unwrap());
+        assert!(!resolve_ghost_metal_mapped_readahead(None, true, true).unwrap());
+        assert!(resolve_ghost_metal_mapped_readahead(Some("1"), true, true).unwrap());
+
+        assert!(resolve_ghost_metal_mapped_readahead(Some("1"), false, true).is_err());
+        assert!(resolve_ghost_metal_mapped_readahead(Some("1"), true, false).is_err());
+        for invalid in [
+            "", "0", "01", "+1", " 1", "1 ", "true", "TRUE", "yes", "2", "junk",
+        ] {
+            assert!(
+                resolve_ghost_metal_mapped_readahead(Some(invalid), true, true).is_err(),
+                "mapped readahead value {invalid:?} must fail closed"
+            );
+        }
+        assert_eq!(
+            GHOST_METAL_MAPPED_READAHEAD_POLICY_MARKER,
+            "[gemma4-ghost-metal] mapped-cold readahead policy: CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD effective=1 scope=selected-cold-only advice=MADV_WILLNEED dispatch=async-read-pool"
+        );
+    }
+
+    #[test]
+    fn metal_hybrid_mapped_readahead_selects_only_cold_and_bounds_inflight() {
+        let mut resident = [-1i16; 128];
+        resident[2] = 0;
+        resident[9] = 1;
+        assert_eq!(
+            selected_mapped_cold_experts(&[2, 3, 3, 200, 9, 4], &resident),
+            vec![3, 4]
+        );
+
+        let mut inflight = std::collections::HashSet::from([(7usize, 3usize)]);
+        assert_eq!(
+            reserve_mapped_readahead_records(&mut inflight, 7, &[3, 4, 4, 5, 6], 3),
+            vec![4, 5]
+        );
+        assert_eq!(inflight.len(), 3);
+        assert!(!inflight.contains(&(7, 6)));
+        inflight.remove(&(7, 4));
+        assert_eq!(
+            reserve_mapped_readahead_records(&mut inflight, 7, &[4], 3),
+            vec![4],
+            "completion removal permits a later re-advice after page reclamation"
+        );
     }
 
     #[test]

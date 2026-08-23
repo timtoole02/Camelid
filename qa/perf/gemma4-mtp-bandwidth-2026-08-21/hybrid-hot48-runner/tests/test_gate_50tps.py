@@ -19,6 +19,8 @@ class Gate50TpsTests(unittest.TestCase):
         expected = list(range(48))
         rounds = []
         for index in range(6):
+            per_layer = [{"mapped_bound": 1}]
+            per_layer.extend({"mapped_bound": 0} for _ in gate.PROFILE[1:])
             rounds.append(
                 {
                     "round_index": index,
@@ -37,6 +39,10 @@ class Gate50TpsTests(unittest.TestCase):
                     "missing_failclose": 0,
                     "slot_capacity_overflow": 0,
                     "overflow_experts": 0,
+                    "mapped_readahead_advised_records": 1,
+                    "mapped_readahead_advised_bytes": 3_345_408,
+                    "mapped_readahead_enqueue_ms": 0.01,
+                    "per_layer": per_layer,
                 }
             )
         total_wall = wall_per_round * len(rounds)
@@ -47,6 +53,12 @@ class Gate50TpsTests(unittest.TestCase):
                 "generated_token_ids": expected,
                 "hybrid_telemetry": {
                     "schema_version": 1,
+                    "geometry": {
+                        "record_payload_bytes": 3_345_408,
+                        "mapped_readahead_enabled": True,
+                        "mapped_readahead_max_inflight_records": 64,
+                        "mapped_readahead_anonymous_capacity_bytes": 0,
+                    },
                     "rounds": rounds,
                     "metrics": {
                         "forwarded_decode_tokens": 48,
@@ -77,6 +89,8 @@ class Gate50TpsTests(unittest.TestCase):
             + "\n"
             + "hybrid decode promotion policy: CAMELID_GEMMA4_GHOST_METAL_DECODE_PROMOTION "
             "effective=0 terminal_decode_promotion=off final_prefill_hot_handoff=on\n"
+            + gate.MAPPED_READAHEAD_MARKER
+            + "\n"
             + "[gemma4-mtp bootstrap] prefill_seed_attempted=1 used=1 fallback=none\n"
             + "[gemma4 exact partition] CAMELID_GEMMA4_DENSE_K8_GENERIC=1 "
             "static_k8_dense=off runtime_k_dense=on\n"
@@ -128,6 +142,36 @@ class Gate50TpsTests(unittest.TestCase):
             )
             log_path.write_text(log, encoding="utf-8")
             with self.assertRaisesRegex(gate.GateError, "partition-parity"):
+                gate.analyze(response_path, log_path, expected_path)
+
+    def test_missing_mapped_readahead_marker_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            response_path, log_path, expected_path = self.fixture(Path(temporary))
+            log = log_path.read_text(encoding="utf-8")
+            log_path.write_text(
+                log.replace(gate.MAPPED_READAHEAD_MARKER + "\n", ""),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(gate.GateError, "selected-cold mapped readahead"):
+                gate.analyze(response_path, log_path, expected_path)
+
+    def test_duplicate_mapped_readahead_marker_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            response_path, log_path, expected_path = self.fixture(Path(temporary))
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(gate.MAPPED_READAHEAD_MARKER + "\n")
+            with self.assertRaisesRegex(gate.GateError, "selected-cold mapped readahead"):
+                gate.analyze(response_path, log_path, expected_path)
+
+    def test_inconsistent_mapped_readahead_bytes_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            response_path, log_path, expected_path = self.fixture(Path(temporary))
+            response = json.loads(response_path.read_text(encoding="utf-8"))
+            response["camelid"]["hybrid_telemetry"]["rounds"][0][
+                "mapped_readahead_advised_bytes"
+            ] += 1
+            response_path.write_text(json.dumps(response), encoding="utf-8")
+            with self.assertRaisesRegex(gate.GateError, "mapped-cold readahead receipt"):
                 gate.analyze(response_path, log_path, expected_path)
 
 

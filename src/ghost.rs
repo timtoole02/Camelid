@@ -1545,6 +1545,35 @@ impl GhostFile {
         Ok(Some((Arc::clone(mmap), start, span)))
     }
 
+    /// Resolve one canonical MoE record to an owned mmap range suitable for a
+    /// background `MADV_WILLNEED`. This is deliberately a range description,
+    /// not an advisory itself: callers can move the cloned mapping onto their
+    /// existing I/O pool without borrowing `GhostFile` or blocking the routing
+    /// thread. The payload range excludes inter-record padding and never expands
+    /// to a layer or whole-file span.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn mapped_moe_expert_readahead_range(
+        &self,
+        layer_idx: usize,
+        expert_idx: usize,
+    ) -> Result<Option<(Arc<GgufWireMmap>, usize, usize)>> {
+        let Some(mmap) = self.mmap.as_ref() else {
+            return Ok(None);
+        };
+        let (_, start, len) = self.checked_moe_expert_span(layer_idx, expert_idx)?;
+        let start = usize::try_from(start)
+            .map_err(|_| invalid("mapped MoE readahead start is not representable".to_string()))?;
+        if start
+            .checked_add(len)
+            .is_none_or(|end| end > mmap.mapped_len())
+        {
+            return Err(invalid(format!(
+                "mapped MoE readahead range for layer {layer_idx} expert {expert_idx} exceeds the file mapping"
+            )));
+        }
+        Ok(Some((Arc::clone(mmap), start, len)))
+    }
+
     /// Borrow one routed expert directly from the read-only file mapping. The
     /// same payload-identity check as the positioned reader runs before bytes
     /// are exposed. Strict-cache mode returns `None` because it disables mmap.

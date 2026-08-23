@@ -20,6 +20,12 @@ PROFILE = (
     31, 32, 30, 31, 32, 35, 32, 34, 34, 37,
 )
 PROFILE_CSV = ",".join(str(value) for value in PROFILE)
+MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS = 64
+MAPPED_READAHEAD_MARKER = (
+    "[gemma4-ghost-metal] mapped-cold readahead policy: "
+    "CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD effective=1 "
+    "scope=selected-cold-only advice=MADV_WILLNEED dispatch=async-read-pool"
+)
 DEVICE_CHAIN_PATTERN = re.compile(
     r"^\[gemma4-mtp device-chain\] requested_drafts=(\d+) returned_drafts=(\d+) "
     r"command_buffers=1 commits=1 waits=1 cpu_embedding_callbacks=0 "
@@ -71,6 +77,19 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
     telemetry = camelid.get("hybrid_telemetry")
     if not isinstance(telemetry, dict) or telemetry.get("schema_version") != 1:
         raise GateError("response has no schema-v1 exact-hybrid telemetry")
+    geometry = telemetry.get("geometry")
+    if (
+        not isinstance(geometry, dict)
+        or geometry.get("mapped_readahead_enabled") is not True
+        or geometry.get("mapped_readahead_max_inflight_records")
+        != MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS
+        or geometry.get("mapped_readahead_anonymous_capacity_bytes") != 0
+        or not isinstance(geometry.get("record_payload_bytes"), int)
+        or isinstance(geometry.get("record_payload_bytes"), bool)
+        or geometry["record_payload_bytes"] <= 0
+    ):
+        raise GateError("telemetry did not admit bounded mapped-cold readahead")
+    record_payload_bytes = geometry["record_payload_bytes"]
     rounds = telemetry.get("rounds")
     if not isinstance(rounds, list) or not rounds:
         raise GateError("response has no completed verifier rounds")
@@ -82,6 +101,9 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
     zero_accept_full_k8 = 0
     assistant_rounds = 0
     round_wall_ms = 0.0
+    mapped_readahead_records = 0
+    mapped_readahead_bytes = 0
+    mapped_readahead_enqueue_ms = 0.0
     for index, receipt in enumerate(rounds):
         if not isinstance(receipt, dict) or receipt.get("round_index") != index:
             raise GateError(f"round {index} is missing or reordered")
@@ -95,6 +117,10 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
         useful = receipt.get("useful_accepted_drafts")
         committed_tokens = receipt.get("committed_tokens")
         wall = receipt.get("receipt_round_wall_ms")
+        advised_records = receipt.get("mapped_readahead_advised_records")
+        advised_bytes = receipt.get("mapped_readahead_advised_bytes")
+        enqueue_ms = receipt.get("mapped_readahead_enqueue_ms")
+        per_layer = receipt.get("per_layer")
         if (
             not all(isinstance(value, int) and value >= 0 for value in (
                 k, requested, proposed_k, verifier_k, accepted_k, useful
@@ -110,6 +136,30 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
             or not finite_number(wall, positive=True)
         ):
             raise GateError(f"round {index} has inconsistent K, commit, or timing fields")
+        if not isinstance(per_layer, list) or len(per_layer) != len(PROFILE):
+            raise GateError(f"round {index} has no exact per-layer mapped receipt")
+        mapped_bound = 0
+        for layer in per_layer:
+            layer_mapped = layer.get("mapped_bound") if isinstance(layer, dict) else None
+            if (
+                not isinstance(layer_mapped, int)
+                or isinstance(layer_mapped, bool)
+                or layer_mapped < 0
+            ):
+                raise GateError(f"round {index} has an invalid per-layer mapped bound")
+            mapped_bound += layer_mapped
+        if (
+            not isinstance(advised_records, int)
+            or isinstance(advised_records, bool)
+            or advised_records < 0
+            or advised_records > mapped_bound
+            or not isinstance(advised_bytes, int)
+            or isinstance(advised_bytes, bool)
+            or advised_bytes != advised_records * record_payload_bytes
+            or not finite_number(enqueue_ms)
+            or float(enqueue_ms) < 0.0
+        ):
+            raise GateError(f"round {index} has an invalid mapped-cold readahead receipt")
         for field in ("selected_dropped", "missing_failclose", "slot_capacity_overflow", "overflow_experts"):
             if receipt.get(field) != 0:
                 raise GateError(f"round {index} has nonzero {field}")
@@ -123,6 +173,9 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
         accepted += accepted_k
         committed += len(committed_tokens)
         round_wall_ms += float(wall)
+        mapped_readahead_records += advised_records
+        mapped_readahead_bytes += advised_bytes
+        mapped_readahead_enqueue_ms += float(enqueue_ms)
 
     metrics = telemetry.get("metrics")
     if not isinstance(metrics, dict):
@@ -163,6 +216,8 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
     )
     if log.count(promotion_marker) != 1:
         raise GateError("server did not disable terminal decode promotion")
+    if log.splitlines().count(MAPPED_READAHEAD_MARKER) != 1:
+        raise GateError("server did not admit exact selected-cold mapped readahead")
     bootstrap_marker = (
         "[gemma4-mtp bootstrap] prefill_seed_attempted=1 used=1 fallback=none"
     )
@@ -191,6 +246,7 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
         "acceptance_ge_85_percent": acceptance >= 0.85,
         "no_zero_accept_full_k8": zero_accept_full_k8 == 0,
         "terminal_decode_promotion_off": True,
+        "mapped_cold_readahead_active": True,
     }
     return {
         "schema_version": 1,
@@ -206,6 +262,9 @@ def analyze(response_path: Path, log_path: Path, expected_ids_path: Path) -> dic
         "rounds": len(rounds),
         "full_k8_rounds": full_k8_rounds,
         "device_chain_receipts": len(chain_receipts),
+        "mapped_readahead_advised_records": mapped_readahead_records,
+        "mapped_readahead_advised_bytes": mapped_readahead_bytes,
+        "mapped_readahead_enqueue_ms": mapped_readahead_enqueue_ms,
         "performance_gates": gates,
     }
 
