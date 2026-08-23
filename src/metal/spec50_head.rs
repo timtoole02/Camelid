@@ -904,6 +904,12 @@ kernel void q6k_spec50_batch_k##N(                                            \
                    n_sb, rows, softcap, group, sgitg, lane);                  \
 }
 
+#ifndef SPEC50_COMPILE_K8_ONLY
+#define SPEC50_COMPILE_K8_ONLY 0
+#endif
+#if SPEC50_COMPILE_K8_ONLY
+SPEC50_BATCH_ENTRY(8)
+#else
 SPEC50_BATCH_ENTRY(1)
 SPEC50_BATCH_ENTRY(2)
 SPEC50_BATCH_ENTRY(3)
@@ -912,10 +918,15 @@ SPEC50_BATCH_ENTRY(5)
 SPEC50_BATCH_ENTRY(6)
 SPEC50_BATCH_ENTRY(7)
 SPEC50_BATCH_ENTRY(8)
+#endif
 // K=9..16 capacity extension (spec50-widen). K is a compile-time template
 // parameter and the per-row program is identical for every row regardless of
 // K, so these instantiations change nothing about K<=8; the widened table is
 // optional at build time and K<=8 selection never touches it.
+#ifndef SPEC50_COMPILE_WIDE
+#define SPEC50_COMPILE_WIDE 1
+#endif
+#if SPEC50_COMPILE_WIDE
 SPEC50_BATCH_ENTRY(9)
 SPEC50_BATCH_ENTRY(10)
 SPEC50_BATCH_ENTRY(11)
@@ -924,6 +935,7 @@ SPEC50_BATCH_ENTRY(13)
 SPEC50_BATCH_ENTRY(14)
 SPEC50_BATCH_ENTRY(15)
 SPEC50_BATCH_ENTRY(16)
+#endif
 
 // Per-candidate-row argmax with the same semantics as `argmax_f32_greedy`:
 // a strictly-greater scan (so the first maximum in a thread's ascending stride
@@ -990,6 +1002,16 @@ const SPEC50_FLAT: u32 = 1;
 /// Simdgroups per threadgroup; mirrors `SPEC50_SG_PER_TG`.
 const SPEC50_SG_PER_TG: usize = 4;
 
+/// Opt-in K8-only dispatch geometry.  The shader arithmetic is unchanged; the
+/// compact geometry reduces each lane's live K8 accumulator set from 64 to 16.
+const SPEC50_K8_COMPACT_ROWS_PER_SG: usize = 2;
+const SPEC50_K8_COMPACT_SG_PER_TG: usize = 4;
+
+fn spec50_k8_compact_enabled() -> bool {
+    std::env::var("CAMELID_GEMMA4_HEAD_SPEC50_K8_COMPACT")
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
 /// Activation repack format, mirroring `SPEC50_YFMT`: 0 = int8, 1 = f32, 2 = f16.
 const SPEC50_YFMT: u32 = 2;
 
@@ -1018,6 +1040,9 @@ pub(crate) struct Spec50HeadKernels {
     /// when absent, `encode_q6k_spec50_batch` refuses K>8 and the caller keeps
     /// its existing fallback.
     batch_wide: Option<[ComputePipelineState; 8]>,
+    /// Exact K8 arithmetic with a lower-register row dispatch. Compiled only
+    /// when the explicit opt-in is present; failure keeps the shipped geometry.
+    batch_k8_compact: Option<ComputePipelineState>,
     expand: ComputePipelineState,
     argmax: ComputePipelineState,
 }
@@ -1091,6 +1116,59 @@ pub(crate) fn spec50_head_kernels() -> Option<&'static Spec50HeadKernels> {
                 eprintln!("[metal] spec50 head: K=9..16 table unavailable; K<=8 unaffected");
                 None
             };
+            let batch_k8_compact = if spec50_k8_compact_enabled() {
+                let compact_source = format!(
+                    "#define SPEC50_ROWS_PER_SG {SPEC50_K8_COMPACT_ROWS_PER_SG}\n\
+                     #define SPEC50_ROWS_PER_STEP 1\n\
+                     #define SPEC50_FLAT 1\n\
+                     #define SPEC50_SG_PER_TG {SPEC50_K8_COMPACT_SG_PER_TG}\n\
+                     #define SPEC50_YFMT {SPEC50_YFMT}\n\
+                     #define SPEC50_COMPILE_K8_ONLY 1\n\
+                     #define SPEC50_COMPILE_WIDE 0\n{SPEC50_HEAD_SHADER}"
+                );
+                let compiled = (|| -> Option<ComputePipelineState> {
+                    let compact_library = device
+                        .new_library_with_source(&compact_source, &options)
+                        .map_err(|err| {
+                            eprintln!(
+                                "[metal] spec50 compact K8 shader compile failed; using shipped geometry: {err}"
+                            )
+                        })
+                        .ok()?;
+                    let function = compact_library
+                        .get_function("q6k_spec50_batch_k8", None)
+                        .map_err(|err| {
+                            eprintln!(
+                                "[metal] spec50 compact K8 function missing; using shipped geometry: {err}"
+                            )
+                        })
+                        .ok()?;
+                    let pipeline = device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .map_err(|err| {
+                            eprintln!(
+                                "[metal] spec50 compact K8 pipeline failed; using shipped geometry: {err}"
+                            )
+                        })
+                        .ok()?;
+                    (pipeline.thread_execution_width() == 32
+                        && pipeline.max_total_threads_per_threadgroup()
+                            >= (32 * SPEC50_K8_COMPACT_SG_PER_TG) as u64)
+                        .then_some(pipeline)
+                })();
+                if compiled.is_some() {
+                    eprintln!(
+                        "[metal] CAMELID_GEMMA4_HEAD_SPEC50_K8_COMPACT=1 exact RB{SPEC50_K8_COMPACT_ROWS_PER_SG}/SG{SPEC50_K8_COMPACT_SG_PER_TG} dispatch active"
+                    );
+                } else {
+                    eprintln!(
+                        "[metal] compact K8 dispatch not admitted; using shipped exact geometry"
+                    );
+                }
+                compiled
+            } else {
+                None
+            };
             let expand = pipeline(SPEC50_EXPAND_KERNEL)?;
             let argmax = pipeline("q6k_spec50_argmax_rows")?;
             if argmax.max_total_threads_per_threadgroup() < 1024 {
@@ -1103,6 +1181,7 @@ pub(crate) fn spec50_head_kernels() -> Option<&'static Spec50HeadKernels> {
                 queue,
                 batch,
                 batch_wide,
+                batch_k8_compact,
                 expand,
                 argmax,
             })
@@ -1221,12 +1300,24 @@ pub(crate) fn encode_q6k_spec50_batch_at_offsets(
         },
     );
 
-    if k_batch > 8 {
-        let wide = kernels.batch_wide.as_ref().expect("checked above");
-        encoder.set_compute_pipeline_state(&wide[k_batch - 9]);
-    } else {
-        encoder.set_compute_pipeline_state(&kernels.batch[k_batch - 1]);
-    }
+    let (batch_pipeline, rows_per_sg, simdgroups_per_tg) =
+        if k_batch == 8 && kernels.batch_k8_compact.is_some() {
+            (
+                kernels.batch_k8_compact.as_ref().expect("checked above"),
+                SPEC50_K8_COMPACT_ROWS_PER_SG,
+                SPEC50_K8_COMPACT_SG_PER_TG,
+            )
+        } else if k_batch > 8 {
+            let wide = kernels.batch_wide.as_ref().expect("checked above");
+            (&wide[k_batch - 9], SPEC50_ROWS_PER_SG, SPEC50_SG_PER_TG)
+        } else {
+            (
+                &kernels.batch[k_batch - 1],
+                SPEC50_ROWS_PER_SG,
+                SPEC50_SG_PER_TG,
+            )
+        };
+    encoder.set_compute_pipeline_state(batch_pipeline);
     encoder.set_buffer(0, Some(input_scales), offsets.input_scales);
     encoder.set_buffer(1, Some(activation_perm), offsets.activation_perm);
     encoder.set_buffer(2, Some(weight), weight_offset);
@@ -1238,12 +1329,12 @@ pub(crate) fn encode_q6k_spec50_batch_at_offsets(
     encoder.set_bytes(6, 4, &softcap as *const f32 as *const _);
     encoder.dispatch_thread_groups(
         metal::MTLSize {
-            width: rows.div_ceil(SPEC50_SG_PER_TG * SPEC50_ROWS_PER_SG) as u64,
+            width: rows.div_ceil(simdgroups_per_tg * rows_per_sg) as u64,
             height: 1,
             depth: 1,
         },
         metal::MTLSize {
-            width: 32 * SPEC50_SG_PER_TG as u64,
+            width: 32 * simdgroups_per_tg as u64,
             height: 1,
             depth: 1,
         },
@@ -1514,6 +1605,112 @@ mod tests {
             device,
             queue,
         }
+    }
+
+    struct K8Geometry {
+        expand: ComputePipelineState,
+        batch: ComputePipelineState,
+        rows_per_sg: usize,
+        simdgroups_per_tg: usize,
+    }
+
+    /// Compile one K8-only dispatch geometry from the production shader.  This
+    /// changes only how rows are assigned to simdgroups; the dot-product,
+    /// accumulation, reduction, softcap, and argmax programs remain verbatim.
+    fn compile_k8_geometry(
+        device: &Device,
+        rows_per_sg: usize,
+        rows_per_step: usize,
+        simdgroups_per_tg: usize,
+    ) -> K8Geometry {
+        let options = CompileOptions::new();
+        options.set_fast_math_enabled(false);
+        let source = format!(
+            "#define SPEC50_ROWS_PER_SG {rows_per_sg}\n\
+             #define SPEC50_ROWS_PER_STEP {rows_per_step}\n\
+             #define SPEC50_SG_PER_TG {simdgroups_per_tg}\n\
+             #define SPEC50_FLAT 1\n\
+             #define SPEC50_ABLATE 0\n\
+             #define SPEC50_YFMT 2\n\
+             #define SPEC50_COMPILE_K8_ONLY 1\n\
+             #define SPEC50_COMPILE_WIDE 0\n{SPEC50_HEAD_SHADER}"
+        );
+        let library = device
+            .new_library_with_source(&source, &options)
+            .expect("K8 geometry shader compile");
+        let pipeline = |name: &str| {
+            let function = library.get_function(name, None).expect(name);
+            device
+                .new_compute_pipeline_state_with_function(&function)
+                .expect(name)
+        };
+        let geometry = K8Geometry {
+            expand: pipeline("q6k_spec50_expand_f16"),
+            batch: pipeline("q6k_spec50_batch_k8"),
+            rows_per_sg,
+            simdgroups_per_tg,
+        };
+        assert_eq!(geometry.batch.thread_execution_width(), 32);
+        assert!(
+            geometry.batch.max_total_threads_per_threadgroup() >= (32 * simdgroups_per_tg) as u64
+        );
+        geometry
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_k8_geometry(
+        encoder: &metal::ComputeCommandEncoderRef,
+        geometry: &K8Geometry,
+        scales: &Buffer,
+        quants: &Buffer,
+        activation_perm: &Buffer,
+        weight: &Buffer,
+        output: &Buffer,
+        rows: usize,
+    ) {
+        let count = (8 * HIDDEN) as u32;
+        let n_sb = N_SB as u32;
+        let k_batch = 8u32;
+        encoder.set_compute_pipeline_state(&geometry.expand);
+        encoder.set_buffer(0, Some(quants), 0);
+        encoder.set_buffer(1, Some(activation_perm), 0);
+        encoder.set_bytes(2, 4, &n_sb as *const u32 as *const _);
+        encoder.set_bytes(3, 4, &k_batch as *const u32 as *const _);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize {
+                width: (count as u64).div_ceil(256),
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+
+        let rows_u32 = rows as u32;
+        let softcap = SOFTCAP;
+        encoder.set_compute_pipeline_state(&geometry.batch);
+        encoder.set_buffer(0, Some(scales), 0);
+        encoder.set_buffer(1, Some(activation_perm), 0);
+        encoder.set_buffer(2, Some(weight), 0);
+        encoder.set_buffer(3, Some(output), 0);
+        encoder.set_bytes(4, 4, &n_sb as *const u32 as *const _);
+        encoder.set_bytes(5, 4, &rows_u32 as *const u32 as *const _);
+        encoder.set_bytes(6, 4, &softcap as *const f32 as *const _);
+        encoder.dispatch_thread_groups(
+            metal::MTLSize {
+                width: rows.div_ceil(geometry.simdgroups_per_tg * geometry.rows_per_sg) as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: (32 * geometry.simdgroups_per_tg) as u64,
+                height: 1,
+                depth: 1,
+            },
+        );
     }
 
     fn shared(device: &Device, bytes: usize) -> Buffer {
@@ -2294,6 +2491,275 @@ mod tests {
         eprintln!("[spec50] per-row argmax matches CPU first-maximum, ties to lowest index");
     }
 
+    /// Directly gate the leading K8 dispatch geometry against the exact
+    /// production K8 tile on the real Metal device.  Comparing the copied
+    /// reference shader is useful, but this is the stronger integration
+    /// contract: every softcapped logit bit, every GPU argmax bit, and the CPU
+    /// accepted-prefix decision consumed by `forward_batch_speculative` must be
+    /// identical to the currently shipped path.
+    #[test]
+    fn spec50_k8_rb2_sg4_matches_production_bits_tokens_and_acceptance() {
+        const ROWS: usize = 4093;
+        const K: usize = 8;
+        let refs = reference_kernels();
+        let production = spec50_head_kernels().expect("production spec50 pipelines");
+        let candidate = compile_k8_geometry(&refs.device, 2, 1, 4);
+        let mut rng = Rng(0x5242_325f_5347_3408);
+        let weights = build_weights(&mut rng, ROWS);
+        let (scales, quants) = build_activations(&mut rng, K);
+
+        let wbuf = shared(&refs.device, weights.len());
+        write_buffer_u8(&wbuf, &weights);
+        let sbuf = shared(&refs.device, scales.len() * std::mem::size_of::<f32>());
+        write_buffer_f32(&sbuf, &scales);
+        let qbuf = shared(&refs.device, quants.len());
+        write_buffer_i8(&qbuf, &quants);
+        let prod_perm = shared(&refs.device, spec50_activation_scratch_bytes(K, HIDDEN));
+        let cand_perm = shared(&refs.device, spec50_activation_scratch_bytes(K, HIDDEN));
+        let prod_logits = shared(&refs.device, K * ROWS * std::mem::size_of::<f32>());
+        let cand_logits = shared(&refs.device, K * ROWS * std::mem::size_of::<f32>());
+        let prod_ids = shared(&refs.device, K * std::mem::size_of::<u32>());
+        let cand_ids = shared(&refs.device, K * std::mem::size_of::<u32>());
+        let prod_vals = shared(&refs.device, K * std::mem::size_of::<f32>());
+        let cand_vals = shared(&refs.device, K * std::mem::size_of::<f32>());
+
+        let cb = refs.queue.new_command_buffer();
+        let encoder = cb.new_compute_command_encoder();
+        assert!(encode_q6k_spec50_batch(
+            encoder,
+            production,
+            &sbuf,
+            &qbuf,
+            &prod_perm,
+            &wbuf,
+            0,
+            &prod_logits,
+            N_SB,
+            ROWS,
+            K,
+            HIDDEN,
+            SOFTCAP,
+        ));
+        encode_q6k_spec50_argmax(
+            encoder,
+            production,
+            &prod_logits,
+            &prod_ids,
+            &prod_vals,
+            ROWS,
+            K,
+        );
+        encode_k8_geometry(
+            encoder,
+            &candidate,
+            &sbuf,
+            &qbuf,
+            &cand_perm,
+            &wbuf,
+            &cand_logits,
+            ROWS,
+        );
+        encode_q6k_spec50_argmax(
+            encoder,
+            production,
+            &cand_logits,
+            &cand_ids,
+            &cand_vals,
+            ROWS,
+            K,
+        );
+        encoder.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        assert_eq!(cb.status(), metal::MTLCommandBufferStatus::Completed);
+
+        let prod_bits = read_shared_f32(&prod_logits, 0, K * ROWS);
+        let cand_bits = read_shared_f32(&cand_logits, 0, K * ROWS);
+        for (index, (got, want)) in cand_bits.iter().zip(&prod_bits).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "candidate differs from production at K8 logit {index}"
+            );
+        }
+        let prod_token_ids = read_shared_u32(&prod_ids, 0, K);
+        let cand_token_ids = read_shared_u32(&cand_ids, 0, K);
+        assert_eq!(cand_token_ids, prod_token_ids, "GPU argmax IDs differ");
+        let prod_token_vals = read_shared_f32(&prod_vals, 0, K);
+        let cand_token_vals = read_shared_f32(&cand_vals, 0, K);
+        for (token, (got, want)) in cand_token_vals.iter().zip(&prod_token_vals).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "GPU argmax value differs at token {token}"
+            );
+        }
+
+        let accepted_prefix = |ids: &[u32], drafts: &[u32]| {
+            drafts
+                .iter()
+                .zip(ids)
+                .position(|(draft, target)| draft != target)
+                .unwrap_or(drafts.len())
+        };
+        let all_match = prod_token_ids[..K - 1].to_vec();
+        assert_eq!(accepted_prefix(&prod_token_ids, &all_match), K - 1);
+        assert_eq!(accepted_prefix(&cand_token_ids, &all_match), K - 1);
+        for mismatch in [0usize, 3, K - 2] {
+            let mut drafts = all_match.clone();
+            drafts[mismatch] = (drafts[mismatch] + 1) % ROWS as u32;
+            assert_eq!(accepted_prefix(&prod_token_ids, &drafts), mismatch);
+            assert_eq!(accepted_prefix(&cand_token_ids, &drafts), mismatch);
+        }
+        eprintln!(
+            "[spec50] K8 RB2/SG4 == production: {} raw logits, {K} GPU tokens, accepted-prefix 0/3/6/7",
+            K * ROWS
+        );
+    }
+
+    /// Controlled production A/B receipt for the full Gemma 4 26B tied head.
+    /// Four alternating samples each contain exactly 30 complete
+    /// expand+projection+argmax encodes; the median-of-four comparison avoids
+    /// selecting a geometry from one favorable ordering or clock interval.
+    #[test]
+    #[ignore = "allocates the full 605 MB 26B tied head and is a performance receipt"]
+    fn spec50_bench_k8_compact_vs_production_30x() {
+        const ROWS: usize = 262_144;
+        const K: usize = 8;
+        const REPS: usize = 30;
+        assert!(
+            !spec50_k8_compact_enabled(),
+            "run the A/B receipt without the production opt-in"
+        );
+        let refs = reference_kernels();
+        let production = spec50_head_kernels().expect("production spec50 pipelines");
+        assert!(production.batch_k8_compact.is_none());
+        let candidate = compile_k8_geometry(&refs.device, 2, 1, 4);
+        let weight_bytes = ROWS * N_SB * Q6K_WIRE;
+        let wbuf = shared(&refs.device, weight_bytes);
+        {
+            let mut rng = Rng(0x4b38_4142_4241_0030);
+            let dst = unsafe {
+                std::slice::from_raw_parts_mut(wbuf.contents().cast::<u8>(), weight_bytes)
+            };
+            for block in dst.chunks_exact_mut(Q6K_WIRE) {
+                fill_q6k_block(&mut rng, block);
+            }
+        }
+        let mut rng = Rng(0x4b38_434f_4d50_4143);
+        let (scales, quants) = build_activations(&mut rng, K);
+        let sbuf = shared(&refs.device, scales.len() * std::mem::size_of::<f32>());
+        write_buffer_f32(&sbuf, &scales);
+        let qbuf = shared(&refs.device, quants.len());
+        write_buffer_i8(&qbuf, &quants);
+        let prod_perm = shared(&refs.device, spec50_activation_scratch_bytes(K, HIDDEN));
+        let cand_perm = shared(&refs.device, spec50_activation_scratch_bytes(K, HIDDEN));
+        let prod_logits = shared(&refs.device, K * ROWS * std::mem::size_of::<f32>());
+        let cand_logits = shared(&refs.device, K * ROWS * std::mem::size_of::<f32>());
+        let prod_ids = shared(&refs.device, K * std::mem::size_of::<u32>());
+        let cand_ids = shared(&refs.device, K * std::mem::size_of::<u32>());
+        let prod_vals = shared(&refs.device, K * std::mem::size_of::<f32>());
+        let cand_vals = shared(&refs.device, K * std::mem::size_of::<f32>());
+
+        let measure_production = |reps: usize| {
+            let cb = refs.queue.new_command_buffer();
+            let encoder = cb.new_compute_command_encoder();
+            for _ in 0..reps {
+                assert!(encode_q6k_spec50_batch(
+                    encoder,
+                    production,
+                    &sbuf,
+                    &qbuf,
+                    &prod_perm,
+                    &wbuf,
+                    0,
+                    &prod_logits,
+                    N_SB,
+                    ROWS,
+                    K,
+                    HIDDEN,
+                    SOFTCAP,
+                ));
+                encode_q6k_spec50_argmax(
+                    encoder,
+                    production,
+                    &prod_logits,
+                    &prod_ids,
+                    &prod_vals,
+                    ROWS,
+                    K,
+                );
+            }
+            encoder.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            assert_eq!(cb.status(), metal::MTLCommandBufferStatus::Completed);
+            let (gpu_us, _) = command_buffer_gpu_times_us(&cb);
+            gpu_us as f64 / 1000.0 / reps as f64
+        };
+        let measure_candidate = |reps: usize| {
+            let cb = refs.queue.new_command_buffer();
+            let encoder = cb.new_compute_command_encoder();
+            for _ in 0..reps {
+                encode_k8_geometry(
+                    encoder,
+                    &candidate,
+                    &sbuf,
+                    &qbuf,
+                    &cand_perm,
+                    &wbuf,
+                    &cand_logits,
+                    ROWS,
+                );
+                encode_q6k_spec50_argmax(
+                    encoder,
+                    production,
+                    &cand_logits,
+                    &cand_ids,
+                    &cand_vals,
+                    ROWS,
+                    K,
+                );
+            }
+            encoder.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            assert_eq!(cb.status(), metal::MTLCommandBufferStatus::Completed);
+            let (gpu_us, _) = command_buffer_gpu_times_us(&cb);
+            gpu_us as f64 / 1000.0 / reps as f64
+        };
+
+        // Page/compile warm-up is excluded from all four measurements.
+        let _ = measure_production(1);
+        let _ = measure_candidate(1);
+        let mut production_ms = Vec::with_capacity(4);
+        let mut candidate_ms = Vec::with_capacity(4);
+        for trial in 0..4 {
+            if trial % 2 == 0 {
+                production_ms.push(measure_production(REPS));
+                candidate_ms.push(measure_candidate(REPS));
+            } else {
+                candidate_ms.push(measure_candidate(REPS));
+                production_ms.push(measure_production(REPS));
+            }
+        }
+        let median = |values: &[f64]| {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            (sorted[1] + sorted[2]) * 0.5
+        };
+        let production_median = median(&production_ms);
+        let candidate_median = median(&candidate_ms);
+        let speedup = production_median / candidate_median;
+        eprintln!(
+            "[spec50] controlled exact K8 30x A/B: production RB8/SG4={production_ms:?} median={production_median:.3} ms; compact RB2/SG4={candidate_ms:?} median={candidate_median:.3} ms; speedup={speedup:.3}x"
+        );
+        assert!(
+            speedup >= 1.05,
+            "compact K8 geometry is not a material >=5% win: {speedup:.3}x"
+        );
+    }
+
     /// Geometry sweep: rows-per-simdgroup x weight-decode shape, on the real
     /// 26B table. Each variant is first checked bitwise against the reference on
     /// a small table, so no configuration can win by being wrong.
@@ -2342,7 +2808,7 @@ mod tests {
         ];
         for (rb, rg, sg, flat, ablate, yfmt) in configs {
             let src = format!(
-                "#define SPEC50_ROWS_PER_SG {rb}\n#define SPEC50_ROWS_PER_STEP {rg}\n#define SPEC50_SG_PER_TG {sg}\n#define SPEC50_FLAT {flat}\n#define SPEC50_ABLATE {ablate}\n#define SPEC50_YFMT {yfmt}\n{SPEC50_HEAD_SHADER}"
+                "#define SPEC50_ROWS_PER_SG {rb}\n#define SPEC50_ROWS_PER_STEP {rg}\n#define SPEC50_SG_PER_TG {sg}\n#define SPEC50_FLAT {flat}\n#define SPEC50_ABLATE {ablate}\n#define SPEC50_YFMT {yfmt}\n#define SPEC50_COMPILE_WIDE 0\n{SPEC50_HEAD_SHADER}"
             );
             let library = match refs.device.new_library_with_source(&src, &options) {
                 Ok(l) => l,
