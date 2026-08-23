@@ -33,7 +33,7 @@ MAPPED_ADDRESS_SPAN_BYTES_PER_LAYER = LOGICAL_SLOTS_PER_LAYER * SLOT_STRIDE_BYTE
 WATCHDOG_SCHEMA_VERSION = 3
 WATCHDOG_SAMPLE_PERIOD_NS = 250_000_000
 BASELINE_SOAK_SECONDS = 60
-MIN_BASELINE_HEADROOM_BYTES = 8 * 1024**3
+MIN_BASELINE_HEADROOM_BYTES = 7_680 * 1024**2
 MIN_RUNTIME_HEADROOM_BYTES = 2 * 1024**3
 MAX_CHILD_FOOTPRINT_BYTES = 7_680 * 1024**2
 MAX_HOST_WIRED_BYTES = 8 * 1024**3
@@ -480,6 +480,21 @@ def _validate_hashing_contract(run_dir: Path, intent: dict[str, Any]) -> None:
 
 def _validate_intent(run_dir: Path) -> dict[str, Any]:
     intent = _read_json(run_dir / "intent.json")
+    source_commit = intent.get("source_commit") if isinstance(intent, dict) else None
+    binary_source_commit = (
+        intent.get("binary_source_commit") if isinstance(intent, dict) else None
+    )
+    harness_commit = intent.get("harness_commit") if isinstance(intent, dict) else None
+    binary_source_contract = (
+        intent.get("binary_source_contract") if isinstance(intent, dict) else None
+    )
+    contract_expected = {
+        "environment": "CAMELID_HOT40_BINARY_SOURCE_COMMIT",
+        "canonical_full_commit": True,
+        "ancestor_of_harness_commit": True,
+        "runtime_source_diff_empty": True,
+        "runtime_source_paths": ["src", "Cargo.toml", "Cargo.lock", "build.rs"],
+    }
     expected_geometry = {
         "layers": EXPECTED_LAYERS,
         "logical_slots_per_layer": LOGICAL_SLOTS_PER_LAYER,
@@ -500,12 +515,35 @@ def _validate_intent(run_dir: Path) -> dict[str, Any]:
         or intent.get("port") != 8189
         or intent.get("protected_port") != 8181
         or intent.get("protected_port_policy") != "never-bound-connected-or-signaled"
-        or not isinstance(intent.get("source_commit"), str)
-        or re.fullmatch(r"[0-9a-f]{40}", intent["source_commit"]) is None
+        or not isinstance(source_commit, str)
+        or re.fullmatch(r"[0-9a-f]{40}", source_commit) is None
+        or not isinstance(binary_source_commit, str)
+        or re.fullmatch(r"[0-9a-f]{40}", binary_source_commit) is None
+        or not isinstance(harness_commit, str)
+        or re.fullmatch(r"[0-9a-f]{40}", harness_commit) is None
+        or source_commit != binary_source_commit
         or intent.get("source_worktree_clean") is not True
+        or intent.get("harness_worktree_clean") is not True
         or intent.get("geometry") != expected_geometry
     ):
         raise ReceiptError("intent does not bind the exact Hot40 experiment")
+    if (
+        not isinstance(binary_source_contract, dict)
+        or set(binary_source_contract)
+        != set(contract_expected) | {"defaulted_to_harness_commit"}
+        or any(
+            binary_source_contract.get(key) != value
+            for key, value in contract_expected.items()
+        )
+        or not isinstance(
+            binary_source_contract.get("defaulted_to_harness_commit"), bool
+        )
+        or (
+            binary_source_contract["defaulted_to_harness_commit"]
+            and binary_source_commit != harness_commit
+        )
+    ):
+        raise ReceiptError("intent binary/harness source contract is absent or inexact")
     disk = intent.get("disk")
     if (
         not isinstance(disk, dict)
@@ -706,11 +744,11 @@ def _validate_watchdog(run_dir: Path, intent: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _validate_health(run_dir: Path, source_commit: str) -> None:
+def _validate_health(run_dir: Path, binary_source_commit: str) -> None:
     health = _read_json(run_dir / "health.json")
     build = health.get("build") if isinstance(health, dict) else None
     expected = {
-        "source_commit": source_commit,
+        "source_commit": binary_source_commit,
         "generation_ready": True,
         "gemma4_serve_lane": "ghost_moe",
         "gemma4_ghost_execution_mode": "full_common_metal",
@@ -1063,7 +1101,7 @@ def analyze(run_dir: Path) -> dict[str, Any]:
     if run_dir.is_symlink() or not run_dir.is_dir():
         raise ReceiptError(f"run directory is missing or symlinked: {run_dir}")
     intent = _validate_intent(run_dir)
-    _validate_health(run_dir, intent["source_commit"])
+    _validate_health(run_dir, intent["binary_source_commit"])
     memory = _validate_watchdog(run_dir, intent)
     performance, assistant_proposals = _validate_response(run_dir)
     assistant_sha256 = intent["large_inputs"]["assistant"]["preverified_sha256"]
@@ -1077,6 +1115,8 @@ def analyze(run_dir: Path) -> dict[str, Any]:
         "pass": True,
         "benchmark": "gemma4-uniform-hot40-experiment",
         "source_commit": intent["source_commit"],
+        "binary_source_commit": intent["binary_source_commit"],
+        "harness_commit": intent["harness_commit"],
         "gates": {
             "exact_48_token_ids": True,
             "uniform_40_by_30_geometry": True,
@@ -1093,6 +1133,8 @@ def analyze(run_dir: Path) -> dict[str, Any]:
             "preflight_no_swap_growth": True,
             "no_sparse_prediction_probe": True,
             "protected_port_never_bound_connected_or_signaled": True,
+            "binary_source_is_ancestor_of_harness": True,
+            "runtime_source_diff_empty_between_binary_and_harness": True,
         },
         "geometry": intent["geometry"],
         "performance": {

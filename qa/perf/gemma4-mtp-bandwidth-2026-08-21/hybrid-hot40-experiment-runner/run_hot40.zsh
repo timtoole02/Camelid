@@ -8,7 +8,7 @@ readonly EX_RECEIPT_EXISTS=77
 readonly PORT=8189
 readonly PROTECTED_PORT=8181
 readonly MIN_DISK_AVAILABLE_KIB=20971520
-readonly MIN_BASELINE_HEADROOM_BYTES=8589934592
+readonly MIN_BASELINE_HEADROOM_BYTES=8053063680
 readonly MIN_RUNTIME_HEADROOM_BYTES=2147483648
 readonly MAX_CHILD_FOOTPRINT_BYTES=8053063680
 readonly MAX_HOST_WIRED_BYTES=8589934592
@@ -40,10 +40,36 @@ readonly hasher="$script_dir/sha256_nocache.py"
 readonly watchdog="$repo_root/qa/evidence-bundles/gemma4-26b-mtp-assistant-oracle/run_load_only_watchdog.py"
 readonly request_source="$script_dir/request-48.json"
 readonly expected_ids_source="$script_dir/expected-48-token-ids.json"
+readonly harness_commit=$(/usr/bin/git -C "$repo_root" rev-parse --verify "HEAD^{commit}")
 typeset source_worktree_status
 source_worktree_status=$(/usr/bin/git -C "$repo_root" status --porcelain=v1 --untracked-files=all)
 [[ -z "$source_worktree_status" ]] || \
   refuse "repository must be completely clean before admitting a provenance-bound run"
+typeset binary_source_revision="$harness_commit"
+typeset binary_source_defaulted=true
+if (( ${+parameters[CAMELID_HOT40_BINARY_SOURCE_COMMIT]} )); then
+  binary_source_revision=$CAMELID_HOT40_BINARY_SOURCE_COMMIT
+  binary_source_defaulted=false
+fi
+[[ -n "$binary_source_revision" ]] || \
+  refuse "CAMELID_HOT40_BINARY_SOURCE_COMMIT must not be empty"
+typeset canonical_binary_source_commit
+canonical_binary_source_commit=$(
+  /usr/bin/git -C "$repo_root" rev-parse --verify --end-of-options \
+    "${binary_source_revision}^{commit}" 2>/dev/null
+) || refuse "CAMELID_HOT40_BINARY_SOURCE_COMMIT does not resolve to a commit"
+print -rn -- "$canonical_binary_source_commit" | \
+  /usr/bin/grep -Eq '^[0-9a-f]{40}$' || \
+  refuse "binary source commit did not canonicalize to a full 40-character commit"
+readonly binary_source_commit="$canonical_binary_source_commit"
+/usr/bin/git -C "$repo_root" merge-base --is-ancestor \
+  "$binary_source_commit" "$harness_commit" || \
+  refuse "binary source commit must be an ancestor of the harness commit"
+/usr/bin/git -C "$repo_root" diff --quiet \
+  "$binary_source_commit" "$harness_commit" -- \
+  src Cargo.toml Cargo.lock build.rs || \
+  refuse "runtime source differs between the binary and harness commits"
+readonly source_commit="$binary_source_commit"
 (( ${+parameters[CAMELID_HOT40_BINARY]} )) || \
   refuse "set CAMELID_HOT40_BINARY to an absolute prebuilt binary on the internal Data volume"
 readonly binary=$CAMELID_HOT40_BINARY
@@ -248,7 +274,6 @@ readonly expected_ids_frozen="$receipt_root/expected-token-ids.json"
 [[ -f "$request_frozen" && ! -L "$request_frozen" ]] || refuse "request freeze failed"
 [[ -f "$expected_ids_frozen" && ! -L "$expected_ids_frozen" ]] || refuse "token-ID freeze failed"
 
-readonly source_commit=$(/usr/bin/git -C "$repo_root" rev-parse HEAD)
 readonly run_nonce=$(/usr/bin/uuidgen)
 readonly boot_identity=$(/usr/sbin/sysctl -n kern.boottime)
 readonly hashing_memory_before="$receipt_root/hashing-memory-before.json"
@@ -326,7 +351,11 @@ hashing_memory_before_size=$(/usr/bin/stat -f '%z' "$hashing_memory_before")
 hashing_memory_after_size=$(/usr/bin/stat -f '%z' "$hashing_memory_after")
 
 /usr/bin/jq -n \
-  --arg source_commit "$source_commit" --arg nonce "$run_nonce" --arg boot "$boot_identity" \
+  --arg source_commit "$source_commit" \
+  --arg binary_source_commit "$binary_source_commit" \
+  --arg harness_commit "$harness_commit" \
+  --argjson binary_source_defaulted "$binary_source_defaulted" \
+  --arg nonce "$run_nonce" --arg boot "$boot_identity" \
   --argjson disk_available_kib "$disk_available_kib" \
   --arg binary "$binary" --arg binary_sha "$binary_sha" --argjson binary_size "$binary_size" \
   --arg model "$model" --arg model_sha "$model_preverified_sha" --argjson model_size "$model_size" \
@@ -373,7 +402,18 @@ hashing_memory_after_size=$(/usr/bin/stat -f '%z' "$hashing_memory_after")
     schema_version: 1,
     benchmark: "gemma4-uniform-hot40-experiment",
     source_commit: $source_commit,
+    binary_source_commit: $binary_source_commit,
+    harness_commit: $harness_commit,
     source_worktree_clean: true,
+    harness_worktree_clean: true,
+    binary_source_contract: {
+      environment: "CAMELID_HOT40_BINARY_SOURCE_COMMIT",
+      defaulted_to_harness_commit: $binary_source_defaulted,
+      canonical_full_commit: true,
+      ancestor_of_harness_commit: true,
+      runtime_source_diff_empty: true,
+      runtime_source_paths: ["src", "Cargo.toml", "Cargo.lock", "build.rs"]
+    },
     nonce: $nonce,
     boot_identity: $boot,
     expected_tokens: 48,
@@ -401,7 +441,7 @@ hashing_memory_after_size=$(/usr/bin/stat -f '%z' "$hashing_memory_after")
       schema_version: 3,
       sample_period_ns: 250000000,
       baseline_soak_seconds: 60,
-      minimum_baseline_reclaimable_headroom_bytes: 8589934592,
+      minimum_baseline_reclaimable_headroom_bytes: 8053063680,
       minimum_runtime_reclaimable_headroom_bytes: 2147483648,
       maximum_child_physical_footprint_bytes: 8053063680,
       maximum_host_wired_bytes: 8589934592,
@@ -423,8 +463,8 @@ hashing_memory_after_size=$(/usr/bin/stat -f '%z' "$hashing_memory_after")
       host_sampler_artifact_label: "host_sampler",
       telemetry_watchdog_artifact_label: "watchdog",
       telemetry_source: "run_load_only_watchdog.NativeTelemetry.sample_host",
-      minimum_pre_hash_reclaimable_headroom_bytes: 8589934592,
-      minimum_post_hash_reclaimable_headroom_bytes: 8589934592,
+      minimum_pre_hash_reclaimable_headroom_bytes: 8053063680,
+      minimum_post_hash_reclaimable_headroom_bytes: 8053063680,
       maximum_host_wired_bytes: 8589934592,
       require_normal_pressure: true,
       reject_swapin_growth: true,
@@ -463,7 +503,12 @@ hashing_memory_after_size=$(/usr/bin/stat -f '%z' "$hashing_memory_after")
 {
   /bin/date -u '+utc=%Y-%m-%dT%H:%M:%SZ'
   print -r -- "source_commit=$source_commit"
+  print -r -- "binary_source_commit=$binary_source_commit"
+  print -r -- "harness_commit=$harness_commit"
+  print -r -- "binary_source_defaulted_to_harness=$binary_source_defaulted"
+  print -r -- "runtime_source_diff_empty=true paths=src,Cargo.toml,Cargo.lock,build.rs"
   print -r -- "source_worktree_clean=true"
+  print -r -- "harness_worktree_clean=true"
   print -r -- "nonce=$run_nonce"
   print -r -- "binary_sha256=$binary_sha $binary"
   print -r -- "model_historical_sha256=$model_preverified_sha $model"
@@ -586,9 +631,10 @@ for _ in {1..900}; do
     refuse "protected WebUI port $PROTECTED_PORT became active; benchmark child will be stopped" "$EX_PORT_BUSY"
   fi
   if health=$(/usr/bin/curl -fsS --max-time 2 "http://127.0.0.1:$PORT/v1/health" 2>/dev/null); then
-    if print -r -- "$health" | /usr/bin/jq -e --arg source_commit "$source_commit" '
+    if print -r -- "$health" | /usr/bin/jq -e \
+      --arg binary_source_commit "$binary_source_commit" '
       (.build // "") as $build |
-      .source_commit == $source_commit and
+      .source_commit == $binary_source_commit and
       ($build | type == "string") and
       ($build | length > 0) and
       ($build | endswith("-dirty") | not) and

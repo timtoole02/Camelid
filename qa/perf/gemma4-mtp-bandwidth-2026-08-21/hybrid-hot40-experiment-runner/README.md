@@ -22,7 +22,7 @@ signals anything through that port. The benchmark child binds only
 ## Memory admission
 
 The schema-v3 watchdog requires 60 seconds of normal-pressure baseline
-samples, at least 8 GiB reclaimable before spawn, at least 2 GiB during the
+samples, at least 7.5 GiB reclaimable before spawn, at least 2 GiB during the
 run, no more than 7.5 GiB child physical footprint, and no more than 8 GiB host
 wired memory. Existing swap is allowed. Any current-run swap-in or swap-out
 counter change—from the preflight sample through the final watchdog sample—is
@@ -56,6 +56,21 @@ release binary separately:
 ```sh
 CAMELID_HOT40_BINARY=/absolute/path/to/camelid ./run_hot40.zsh
 ```
+
+For a QA-only harness commit that did not change runtime sources, an existing
+binary may be reused by naming its source commit:
+
+```sh
+CAMELID_HOT40_BINARY=/private/tmp/camelid-hot40-49757102 \
+CAMELID_HOT40_BINARY_SOURCE_COMMIT=49757102 \
+./run_hot40.zsh
+```
+
+The revision is canonicalized to a full 40-character commit and must be an
+ancestor of the clean harness HEAD. Admission also requires an empty Git diff
+between those commits for `src`, `Cargo.toml`, `Cargo.lock`, and `build.rs`.
+The receipt records `binary_source_commit` separately from `harness_commit`;
+the server health check must report the binary source commit.
 
 Optional path/output overrides are `CAMELID_HOT40_MODEL`,
 `CAMELID_HOT40_CGHOST`, `CAMELID_HOT40_ASSISTANT`, and

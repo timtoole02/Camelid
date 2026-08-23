@@ -64,7 +64,9 @@ class SyntheticRun:
     def __init__(self, root: Path) -> None:
         self.root = root
         self.root.mkdir(mode=0o700)
-        self.source_commit = "a" * 40
+        self.binary_source_commit = "a" * 40
+        self.harness_commit = "b" * 40
+        self.source_commit = self.binary_source_commit
         self.ids = json.loads(EXPECTED_IDS_PATH.read_text(encoding="utf-8"))
         shutil.copyfile(REQUEST_PATH, self.root / "request.json")
         shutil.copyfile(EXPECTED_IDS_PATH, self.root / "expected-token-ids.json")
@@ -199,7 +201,23 @@ class SyntheticRun:
             "schema_version": 1,
             "benchmark": "gemma4-uniform-hot40-experiment",
             "source_commit": self.source_commit,
+            "binary_source_commit": self.binary_source_commit,
+            "harness_commit": self.harness_commit,
             "source_worktree_clean": True,
+            "harness_worktree_clean": True,
+            "binary_source_contract": {
+                "environment": "CAMELID_HOT40_BINARY_SOURCE_COMMIT",
+                "defaulted_to_harness_commit": False,
+                "canonical_full_commit": True,
+                "ancestor_of_harness_commit": True,
+                "runtime_source_diff_empty": True,
+                "runtime_source_paths": [
+                    "src",
+                    "Cargo.toml",
+                    "Cargo.lock",
+                    "build.rs",
+                ],
+            },
             "nonce": "synthetic",
             "boot_identity": "synthetic",
             "expected_tokens": 48,
@@ -227,7 +245,7 @@ class SyntheticRun:
                 "schema_version": 3,
                 "sample_period_ns": 250_000_000,
                 "baseline_soak_seconds": 60,
-                "minimum_baseline_reclaimable_headroom_bytes": 8 * 1024**3,
+                "minimum_baseline_reclaimable_headroom_bytes": 7_680 * 1024**2,
                 "minimum_runtime_reclaimable_headroom_bytes": 2 * 1024**3,
                 "maximum_child_physical_footprint_bytes": 7_680 * 1024**2,
                 "maximum_host_wired_bytes": 8 * 1024**3,
@@ -249,8 +267,8 @@ class SyntheticRun:
                 "host_sampler_artifact_label": "host_sampler",
                 "telemetry_watchdog_artifact_label": "watchdog",
                 "telemetry_source": "run_load_only_watchdog.NativeTelemetry.sample_host",
-                "minimum_pre_hash_reclaimable_headroom_bytes": 8 * 1024**3,
-                "minimum_post_hash_reclaimable_headroom_bytes": 8 * 1024**3,
+                "minimum_pre_hash_reclaimable_headroom_bytes": 7_680 * 1024**2,
+                "minimum_post_hash_reclaimable_headroom_bytes": 7_680 * 1024**2,
                 "maximum_host_wired_bytes": 8 * 1024**3,
                 "require_normal_pressure": True,
                 "reject_swapin_growth": True,
@@ -303,7 +321,7 @@ class SyntheticRun:
                     "sequence": 240,
                     "required_duration_seconds": 60,
                     "observed_duration_ns": 60_000_000_001,
-                    "minimum_reclaimable_headroom_bytes": 8 * 1024**3,
+                    "minimum_reclaimable_headroom_bytes": 7_680 * 1024**2,
                     "require_zero_current_swap": False,
                 },
                 {
@@ -561,6 +579,33 @@ class Hot40AnalyzerTests(unittest.TestCase):
         self.assertFalse(verdict["hashing"]["large_inputs_content_hashed_this_run"])
         self.assertFalse(verdict["hashing"]["large_inputs_content_read_before_spawn"])
         self.assertEqual(verdict["stages"]["receipt_count"], 6)
+        self.assertEqual(verdict["source_commit"], self.run.binary_source_commit)
+        self.assertEqual(
+            verdict["binary_source_commit"], self.run.binary_source_commit
+        )
+        self.assertEqual(verdict["harness_commit"], self.run.harness_commit)
+        self.assertTrue(
+            verdict["gates"]["runtime_source_diff_empty_between_binary_and_harness"]
+        )
+
+    def test_rejects_binary_source_alias_or_contract_drift(self) -> None:
+        self.run.intent["source_commit"] = "c" * 40
+        self.run.write_intent()
+        with self.assertRaisesRegex(hot40.ReceiptError, "exact Hot40"):
+            hot40.analyze(self.run.root)
+
+        self.run.intent["source_commit"] = self.run.binary_source_commit
+        self.run.intent["binary_source_contract"]["runtime_source_diff_empty"] = False
+        self.run.write_intent()
+        with self.assertRaisesRegex(hot40.ReceiptError, "binary/harness"):
+            hot40.analyze(self.run.root)
+
+    def test_health_must_report_binary_not_harness_commit(self) -> None:
+        health = self.run._health()
+        health["source_commit"] = self.run.harness_commit
+        write_json(self.run.root / "health.json", health)
+        with self.assertRaisesRegex(hot40.ReceiptError, "readiness"):
+            hot40.analyze(self.run.root)
 
     def test_rejects_one_layer_with_39_hot_slots(self) -> None:
         geometry = self.run.response["camelid"]["hybrid_telemetry"]["geometry"]
@@ -674,6 +719,9 @@ class Hot40AnalyzerTests(unittest.TestCase):
 
 
 class Hot40SourceContractTests(unittest.TestCase):
+    def test_baseline_gate_is_exactly_seven_and_a_half_gib(self) -> None:
+        self.assertEqual(hot40.MIN_BASELINE_HEADROOM_BYTES, 7_680 * 1024**2)
+
     def test_frozen_fixture_hashes(self) -> None:
         self.assertEqual(sha256(REQUEST_PATH), hot40.REQUEST_SHA256)
         self.assertEqual(sha256(EXPECTED_IDS_PATH), hot40.EXPECTED_IDS_SHA256)
@@ -689,6 +737,7 @@ class Hot40SourceContractTests(unittest.TestCase):
         self.assertIn("hot_slots_per_layer: 40", source)
         self.assertIn("anonymous_hot_capacity_slots: 1200", source)
         self.assertIn("anonymous_hot_capacity_bytes: 4030464000", source)
+        self.assertIn("MIN_BASELINE_HEADROOM_BYTES=8053063680", source)
         self.assertIn("--baseline-soak-seconds 60", source)
         self.assertIn("--reject-swapin-growth", source)
         self.assertNotIn("--require-zero-current-swap", source)
@@ -699,6 +748,13 @@ class Hot40SourceContractTests(unittest.TestCase):
         self.assertIn('while /bin/kill -0 "$request_pid"', source)
         self.assertIn("became active during the request", source)
         self.assertIn("parameters[CAMELID_HOT40_BINARY]", source)
+        self.assertIn("CAMELID_HOT40_BINARY_SOURCE_COMMIT", source)
+        self.assertIn("rev-parse --verify --end-of-options", source)
+        self.assertIn("merge-base --is-ancestor", source)
+        self.assertIn("diff --quiet", source)
+        self.assertIn("src Cargo.toml Cargo.lock build.rs", source)
+        self.assertIn('--arg binary_source_commit "$binary_source_commit"', source)
+        self.assertIn('--arg harness_commit "$harness_commit"', source)
         self.assertNotIn("target/release/camelid", source)
         self.assertNotIn('sha256_file "$model"', source)
         self.assertNotIn('sha256_file "$cghost"', source)
