@@ -26,6 +26,7 @@ use crate::tokenizer::Tokenizer;
 use crate::wire_mmap::GgufWireMmap;
 use crate::{BackendError, Result};
 use rayon::prelude::*;
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -6968,6 +6969,9 @@ pub struct Gemma4Runtime {
     metal_q6k_head: Option<crate::metal::Gemma4Q6KHead>,
     #[cfg(target_os = "macos")]
     mtp_assistant: std::sync::Mutex<Option<crate::metal::Gemma4MtpAssistantMetal>>,
+    /// Non-zero only between an exact seeded prefill and the one generation
+    /// call allowed to consume it. Every target-state mutation clears it.
+    mtp_prefill_seed_pending_nonce: std::sync::atomic::AtomicU64,
 }
 
 /// Metal components constructed for a single-node Ghost-MoE runtime.
@@ -8073,7 +8077,7 @@ pub struct Gemma4MtpGenerationRound {
 }
 
 /// Completed output of the default-off official-assistant generation driver.
-/// Production CLAIRE generation never constructs or consumes this type.
+/// The serving path consumes it only when an official MTP assistant is loaded.
 #[doc(hidden)]
 #[derive(Clone, Debug, Default)]
 pub struct Gemma4MtpGenerationResult {
@@ -8092,6 +8096,40 @@ pub struct Gemma4MtpGenerationResult {
     pub aborted: bool,
     pub final_position: usize,
     pub total_wall_us: u64,
+    /// The default-off prefill-seed experiment was requested for a generation
+    /// that otherwise would have needed the authoritative K=1 bootstrap.
+    pub prefill_seed_bootstrap_attempted: bool,
+    /// A valid exact prefill seed was selected and the legacy K=1 target
+    /// bootstrap was not run (even if cancellation preceded the full round).
+    pub prefill_seed_bootstrap_used: bool,
+    /// Stable fail-closed reason for retaining the legacy K=1 bootstrap. `None`
+    /// means either the experiment was off/not applicable or the seed was used.
+    pub prefill_seed_bootstrap_fallback_reason: Option<String>,
+}
+
+/// Exact target state exported by chunked prompt prefill for the default-off
+/// K=1-bootstrap elimination experiment. The hidden row is the final prompt
+/// decoder row after the target's canonical output RMSNorm. It is valid only
+/// with the target KV positioned at `position` and the exact logits/hidden bits
+/// identified by the opaque state digest. Private fields and the absence of
+/// `Clone` keep the request-local seed move-only for safe callers.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct Gemma4MtpPrefillSeed {
+    provenance_nonce: u64,
+    position: usize,
+    target_hidden_normalized: Vec<f32>,
+    state_sha256: [u8; 32],
+}
+
+/// Prompt-prefill output that keeps the logits and their optional official-MTP
+/// seed together. Scalar prefill deliberately returns `mtp_seed=None`: it has
+/// no retained final decoder row and must use the legacy K=1 bootstrap.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct Gemma4MtpPrefillOutput {
+    pub logits: Vec<f32>,
+    pub mtp_seed: Option<Gemma4MtpPrefillSeed>,
 }
 
 #[derive(Debug)]
@@ -8104,6 +8142,90 @@ struct Gemma4MtpCommitPlan {
 
 fn mtp_us_saturating(micros: u128) -> u64 {
     micros.min(u64::MAX as u128) as u64
+}
+
+const GEMMA4_MTP_PREFILL_SEED_BOOTSTRAP_ENV: &str = "CAMELID_GEMMA4_MTP_PREFILL_SEED_BOOTSTRAP";
+static GEMMA4_MTP_PREFILL_SEED_NONCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+fn mtp_prefill_seed_bootstrap_enabled_value(value: Option<&str>) -> bool {
+    value
+        .map(str::trim)
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn mtp_prefill_seed_bootstrap_enabled() -> bool {
+    mtp_prefill_seed_bootstrap_enabled_value(
+        std::env::var(GEMMA4_MTP_PREFILL_SEED_BOOTSTRAP_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn mtp_prefill_state_sha256(
+    provenance_nonce: u64,
+    position: usize,
+    logits: &[f32],
+    target_hidden_normalized: &[f32],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"camelid-gemma4-mtp-prefill-seed-v1");
+    hasher.update(provenance_nonce.to_le_bytes());
+    hasher.update((position as u64).to_le_bytes());
+    hasher.update((logits.len() as u64).to_le_bytes());
+    for value in logits {
+        hasher.update(value.to_bits().to_le_bytes());
+    }
+    hasher.update((target_hidden_normalized.len() as u64).to_le_bytes());
+    for value in target_hidden_normalized {
+        hasher.update(value.to_bits().to_le_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut output = [0u8; 32];
+    output.copy_from_slice(&digest);
+    output
+}
+
+fn validate_mtp_prefill_seed(
+    seed: &Gemma4MtpPrefillSeed,
+    pending_nonce: u64,
+    start_pos: usize,
+    logits: &[f32],
+    hidden_width: usize,
+) -> std::result::Result<(), &'static str> {
+    if seed.provenance_nonce == 0 || seed.provenance_nonce != pending_nonce {
+        return Err("target_state_provenance_mismatch");
+    }
+    if seed.position != start_pos {
+        return Err("position_mismatch");
+    }
+    if seed.target_hidden_normalized.len() != hidden_width {
+        return Err("hidden_width_mismatch");
+    }
+    if seed
+        .target_hidden_normalized
+        .iter()
+        .any(|value| !value.is_finite())
+    {
+        return Err("hidden_non_finite");
+    }
+    if seed.state_sha256
+        != mtp_prefill_state_sha256(
+            seed.provenance_nonce,
+            seed.position,
+            logits,
+            &seed.target_hidden_normalized,
+        )
+    {
+        return Err("state_digest_mismatch");
+    }
+    Ok(())
 }
 
 fn mtp_argmax(logits: &[f32]) -> Result<u32> {
@@ -9774,6 +9896,7 @@ impl Gemma4Runtime {
                 };
                 std::sync::Mutex::new(assistant)
             },
+            mtp_prefill_seed_pending_nonce: std::sync::atomic::AtomicU64::new(0),
             layers,
             config,
             g,
@@ -10261,6 +10384,7 @@ impl Gemma4Runtime {
 
     /// Truncate the resident sequence in the Ghost Metal common core to `keep` positions.
     pub fn truncate_sequence(&self, keep: usize) {
+        self.invalidate_mtp_prefill_seed();
         #[cfg(target_os = "macos")]
         {
             if let Ok(mut guard) = self.metal_q4_experts.lock() {
@@ -10421,6 +10545,7 @@ impl Gemma4Runtime {
         vc: &mut [Vec<Vec<f32>>],
         positions: usize,
     ) -> Result<bool> {
+        self.invalidate_mtp_prefill_seed();
         #[cfg(target_os = "macos")]
         {
             let started = std::time::Instant::now();
@@ -11007,6 +11132,7 @@ impl Gemma4Runtime {
         kc: &mut [Vec<Vec<f32>>],
         vc: &mut [Vec<Vec<f32>>],
     ) -> Result<Vec<f32>> {
+        self.invalidate_mtp_prefill_seed();
         // K=1 decode: HEAD lane by default (see `chained_k1_enabled`);
         // the chained lane is the K>1 verifier.
         #[cfg(target_os = "macos")]
@@ -11049,6 +11175,7 @@ impl Gemma4Runtime {
         kc: &mut [Vec<Vec<f32>>],
         vc: &mut [Vec<Vec<f32>>],
     ) -> Result<()> {
+        self.invalidate_mtp_prefill_seed();
         #[cfg(target_os = "macos")]
         if chained_k1_enabled() && self.supports_chunk_forward() {
             self.step_chunk_with_head(&[token], pos, kc, vc, false, None)?;
@@ -11088,6 +11215,7 @@ impl Gemma4Runtime {
 
     /// Roll back on-device Metal sequence state to a prior position (e.g. during speculative rejection).
     pub fn rollback_sequence(&self, keep: usize) {
+        self.invalidate_mtp_prefill_seed();
         #[cfg(target_os = "macos")]
         if let Ok(mut guard) = self.metal_q4_experts.lock() {
             if let Some(lane) = guard.as_mut() {
@@ -11130,6 +11258,39 @@ impl Gemma4Runtime {
             *v *= scale;
         }
         Ok(())
+    }
+
+    fn invalidate_mtp_prefill_seed(&self) {
+        self.mtp_prefill_seed_pending_nonce
+            .store(0, std::sync::atomic::Ordering::Release);
+    }
+
+    fn issue_mtp_prefill_seed_nonce(&self) -> u64 {
+        loop {
+            let nonce = GEMMA4_MTP_PREFILL_SEED_NONCE
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if nonce != 0 {
+                self.mtp_prefill_seed_pending_nonce
+                    .store(nonce, std::sync::atomic::Ordering::Release);
+                return nonce;
+            }
+        }
+    }
+
+    fn pending_mtp_prefill_seed_nonce(&self) -> u64 {
+        self.mtp_prefill_seed_pending_nonce
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn consume_mtp_prefill_seed_nonce(&self, nonce: u64) -> bool {
+        self.mtp_prefill_seed_pending_nonce
+            .compare_exchange(
+                nonce,
+                0,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
     }
 
     #[cfg(target_os = "macos")]
@@ -11251,7 +11412,43 @@ impl Gemma4Runtime {
         assistant: &mut crate::metal::Gemma4MtpAssistantMetal,
         kc: &mut [Vec<Vec<f32>>],
         vc: &mut [Vec<Vec<f32>>],
+        logits: Vec<f32>,
+        start_pos: usize,
+        eot: &[u32],
+        max_new: usize,
+        should_abort: C,
+        on_round: Option<&mut dyn FnMut(&Gemma4MtpGenerationRound)>,
+    ) -> Result<Gemma4MtpGenerationResult> {
+        self.generate_mtp_assistant_experiment_cancellable_with_prefill_seed(
+            assistant,
+            kc,
+            vc,
+            logits,
+            None,
+            start_pos,
+            eot,
+            max_new,
+            should_abort,
+            on_round,
+        )
+    }
+
+    /// Default-off sibling that may consume a seed retained by the exact same
+    /// prompt prefill. When the opt-in is disabled, or the seed is absent or
+    /// fails any position/logits/shape check, this executes the legacy K=1
+    /// bootstrap unchanged. A valid seed starts round zero at `start_pos`, lets
+    /// the assistant draft after the first target argmax, and verifies
+    /// `[anchor, drafts...]` in one target forward.
+    #[cfg(target_os = "macos")]
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_mtp_assistant_experiment_cancellable_with_prefill_seed<C: FnMut() -> bool>(
+        &self,
+        assistant: &mut crate::metal::Gemma4MtpAssistantMetal,
+        kc: &mut [Vec<Vec<f32>>],
+        vc: &mut [Vec<Vec<f32>>],
         mut logits: Vec<f32>,
+        prefill_seed: Option<Gemma4MtpPrefillSeed>,
         start_pos: usize,
         eot: &[u32],
         max_new: usize,
@@ -11324,81 +11521,130 @@ impl Gemma4Runtime {
             output.total_wall_us = mtp_us_saturating(generation_started.elapsed().as_micros());
             return Ok(output);
         }
-        let bootstrap_started = std::time::Instant::now();
-        let bootstrap_anchor = mtp_argmax(&logits)?;
-        if eot.contains(&bootstrap_anchor) {
+        let initial_anchor = mtp_argmax(&logits)?;
+        if eot.contains(&initial_anchor) {
             output.final_logits = logits;
             output.stopped_on_eot = true;
             output.total_wall_us = mtp_us_saturating(generation_started.elapsed().as_micros());
             return Ok(output);
         }
 
-        let bootstrap_verify =
-            self.verify_mtp_round_timed(&[bootstrap_anchor], &[], start_pos, kc, vc);
-        let (verified, verify_wall_us, verify_gpu_us) = match bootstrap_verify {
-            Ok(result) => result,
-            Err(error) => {
-                self.truncate_mtp_experiment_state(kc, vc, start_pos);
-                return Err(error);
+        let mut seeded_hidden = None;
+        if mtp_prefill_seed_bootstrap_enabled() {
+            output.prefill_seed_bootstrap_attempted = true;
+            match prefill_seed {
+                Some(seed) => match validate_mtp_prefill_seed(
+                    &seed,
+                    self.pending_mtp_prefill_seed_nonce(),
+                    start_pos,
+                    &logits,
+                    self.config.embedding_length as usize,
+                ) {
+                    Ok(()) => {
+                        if self.consume_mtp_prefill_seed_nonce(seed.provenance_nonce) {
+                            output.prefill_seed_bootstrap_used = true;
+                            seeded_hidden = Some(seed.target_hidden_normalized);
+                        } else {
+                            output.prefill_seed_bootstrap_fallback_reason =
+                                Some("target_state_provenance_mismatch".to_string());
+                        }
+                    }
+                    Err(reason) => {
+                        output.prefill_seed_bootstrap_fallback_reason = Some(reason.to_string());
+                    }
+                },
+                None => {
+                    output.prefill_seed_bootstrap_fallback_reason =
+                        Some("seed_unavailable".to_string());
+                }
             }
-        };
-        if should_abort() {
-            return self.finish_mtp_experiment_abort(
-                output,
-                kc,
-                vc,
-                logits,
-                start_pos,
-                generation_started,
+            eprintln!(
+                "[gemma4-mtp bootstrap] prefill_seed_attempted=1 used={} fallback={}",
+                usize::from(output.prefill_seed_bootstrap_used),
+                output
+                    .prefill_seed_bootstrap_fallback_reason
+                    .as_deref()
+                    .unwrap_or("none")
             );
         }
-        if verified.accepted_drafts != 0 {
-            self.truncate_mtp_experiment_state(kc, vc, start_pos);
-            return Err(BackendError::RuntimeShapeMismatch(format!(
-                "Gemma 4 MTP K=1 bootstrap accepted {} nonexistent drafts",
-                verified.accepted_drafts
-            )));
-        }
-        let bootstrap_plan =
-            match mtp_commit_plan(bootstrap_anchor, &[], 0, start_pos, max_new, eot) {
-                Ok(plan) => plan,
-                Err(error) => {
-                    self.truncate_mtp_experiment_state(kc, vc, start_pos);
-                    return Err(error);
-                }
-            };
-        self.truncate_mtp_experiment_state(kc, vc, bootstrap_plan.keep);
-        self.require_mtp_target_kv_len(bootstrap_plan.keep)?;
-        output
-            .generated_tokens
-            .extend_from_slice(&bootstrap_plan.visible_tokens);
-        output.rounds.push(Gemma4MtpGenerationRound {
-            round_index: 0,
-            prefix_tokens_before: start_pos,
-            bootstrap: true,
-            remaining_budget_before: max_new,
-            requested_k: 1,
-            verifier_k: 1,
-            budget_truncated: false,
-            anchor_token: bootstrap_anchor,
-            proposed_drafts: Vec::new(),
-            accepted_drafts: 0,
-            useful_accepted_drafts: 0,
-            committed_tokens: bootstrap_plan.committed_tokens,
-            assistant_wall_us: 0,
-            assistant_gpu_us: 0,
-            target_verify_wall_us: verify_wall_us,
-            target_verify_gpu_us: verify_gpu_us,
-            total_wall_us: mtp_us_saturating(bootstrap_started.elapsed().as_micros()),
-        });
-        if let Some(cb) = on_round.as_deref_mut() {
-            cb(output.rounds.last().expect("bootstrap round present"));
-        }
 
-        let mut pos = bootstrap_plan.keep;
-        let mut pending_hidden = verified.target_hidden_normalized;
-        logits = verified.next_logits;
-        let mut stopped_on_eot = bootstrap_plan.stopped_on_eot;
+        let (mut pos, mut pending_hidden, mut stopped_on_eot) =
+            if let Some(pending_hidden) = seeded_hidden {
+                // The target KV still ends at the prompt. The first assistant
+                // proposal consumes the prompt's final-normalized hidden and
+                // recurrent KV view, then the target verifies the first anchor
+                // and every proposed draft together at exactly `start_pos`.
+                (start_pos, pending_hidden, false)
+            } else {
+                let bootstrap_started = std::time::Instant::now();
+                let bootstrap_verify =
+                    self.verify_mtp_round_timed(&[initial_anchor], &[], start_pos, kc, vc);
+                let (verified, verify_wall_us, verify_gpu_us) = match bootstrap_verify {
+                    Ok(result) => result,
+                    Err(error) => {
+                        self.truncate_mtp_experiment_state(kc, vc, start_pos);
+                        return Err(error);
+                    }
+                };
+                if should_abort() {
+                    return self.finish_mtp_experiment_abort(
+                        output,
+                        kc,
+                        vc,
+                        logits,
+                        start_pos,
+                        generation_started,
+                    );
+                }
+                if verified.accepted_drafts != 0 {
+                    self.truncate_mtp_experiment_state(kc, vc, start_pos);
+                    return Err(BackendError::RuntimeShapeMismatch(format!(
+                        "Gemma 4 MTP K=1 bootstrap accepted {} nonexistent drafts",
+                        verified.accepted_drafts
+                    )));
+                }
+                let bootstrap_plan =
+                    match mtp_commit_plan(initial_anchor, &[], 0, start_pos, max_new, eot) {
+                        Ok(plan) => plan,
+                        Err(error) => {
+                            self.truncate_mtp_experiment_state(kc, vc, start_pos);
+                            return Err(error);
+                        }
+                    };
+                self.truncate_mtp_experiment_state(kc, vc, bootstrap_plan.keep);
+                self.require_mtp_target_kv_len(bootstrap_plan.keep)?;
+                output
+                    .generated_tokens
+                    .extend_from_slice(&bootstrap_plan.visible_tokens);
+                output.rounds.push(Gemma4MtpGenerationRound {
+                    round_index: 0,
+                    prefix_tokens_before: start_pos,
+                    bootstrap: true,
+                    remaining_budget_before: max_new,
+                    requested_k: 1,
+                    verifier_k: 1,
+                    budget_truncated: false,
+                    anchor_token: initial_anchor,
+                    proposed_drafts: Vec::new(),
+                    accepted_drafts: 0,
+                    useful_accepted_drafts: 0,
+                    committed_tokens: bootstrap_plan.committed_tokens,
+                    assistant_wall_us: 0,
+                    assistant_gpu_us: 0,
+                    target_verify_wall_us: verify_wall_us,
+                    target_verify_gpu_us: verify_gpu_us,
+                    total_wall_us: mtp_us_saturating(bootstrap_started.elapsed().as_micros()),
+                });
+                if let Some(cb) = on_round.as_deref_mut() {
+                    cb(output.rounds.last().expect("bootstrap round present"));
+                }
+                logits = verified.next_logits;
+                (
+                    bootstrap_plan.keep,
+                    verified.target_hidden_normalized,
+                    bootstrap_plan.stopped_on_eot,
+                )
+            };
 
         while output.generated_tokens.len() < max_new && !stopped_on_eot {
             if should_abort() {
@@ -11697,6 +11943,7 @@ impl Gemma4Runtime {
         vc: &mut [Vec<Vec<f32>>],
         capture_target_hidden: bool,
     ) -> Result<Gemma4SpeculativeStepResult> {
+        self.invalidate_mtp_prefill_seed();
         #[cfg(target_os = "macos")]
         if ghost_metal_acceleration_enabled() && self.supports_chunk_forward() {
             if let Some(head) = self.metal_q6k_head.as_ref() {
@@ -11839,9 +12086,9 @@ impl Gemma4Runtime {
         self.step_chunk_with_head_capture(tokens, start_pos, kc, vc, all_logits, profile, None)
     }
 
-    /// Internal sibling used only by the MTP experiment to retain the raw
-    /// final-layer rows long enough to normalize the verifier-selected row.
-    /// Normal production callers pass through [`Self::step_chunk_with_head`]
+    /// Internal sibling used by MTP verification and the opt-in seeded prefill
+    /// to retain raw final-layer rows long enough to normalize the selected row.
+    /// Default production callers pass through [`Self::step_chunk_with_head`]
     /// and incur no hidden-row clone.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::needless_range_loop)]
@@ -11855,6 +12102,7 @@ impl Gemma4Runtime {
         mut profile: Option<&mut Gemma4ChunkRoundProfile>,
         hidden_rows_capture: Option<&mut Vec<Vec<f32>>>,
     ) -> Result<Vec<Vec<f32>>> {
+        self.invalidate_mtp_prefill_seed();
         let t_round_start = std::time::Instant::now();
         let kk = tokens.len();
         debug_assert!(kk > 0);
@@ -13895,6 +14143,7 @@ impl Gemma4Runtime {
         kc: &mut [Vec<Vec<f32>>],
         vc: &mut [Vec<Vec<f32>>],
     ) -> Result<(Gemma4StepOutput, TokenStepProfile)> {
+        self.invalidate_mtp_prefill_seed();
         let hidden = self.config.embedding_length as usize;
         let heads = self.config.attention_head_count as usize;
         let ple_dim = self.g.per_layer_input_dim as usize;
@@ -14316,6 +14565,7 @@ impl Gemma4Runtime {
         kc: &mut [Vec<Vec<f32>>],
         vc: &mut [Vec<Vec<f32>>],
     ) -> Result<Gemma4StepOutput> {
+        self.invalidate_mtp_prefill_seed();
         self.step_range_with_head(token, pos, h_in, kc, vc, true)
     }
 
@@ -14646,6 +14896,7 @@ impl Gemma4Runtime {
         vc: &mut [Vec<Vec<f32>>],
         future_forwards: usize,
     ) -> Result<Vec<f32>> {
+        self.invalidate_mtp_prefill_seed();
         if prompt_tokens.is_empty() {
             return Err(BackendError::InvalidModelMetadata(
                 "Gemma 4 tokenizer produced an empty prompt".into(),
@@ -14741,6 +14992,29 @@ impl Gemma4Runtime {
         self.prefill_tokens_cancellable(prompt_tokens, kc, vc, future_forwards, &mut should_abort)
     }
 
+    /// Experimental prompt-prefill sibling that retains the exact final prompt
+    /// decoder row when the chunk lane makes it available. The row is normalized
+    /// with the target's canonical output RMSNorm and bound to the returned
+    /// logits and target-KV position. No scalar-path approximation is fabricated.
+    #[doc(hidden)]
+    pub fn prefill_tokens_cancellable_with_mtp_seed_experiment<C: FnMut() -> bool>(
+        &self,
+        prompt_tokens: &[u32],
+        kc: &mut [Vec<Vec<f32>>],
+        vc: &mut [Vec<Vec<f32>>],
+        future_forwards: usize,
+        mut should_abort: C,
+    ) -> Result<Option<Gemma4MtpPrefillOutput>> {
+        self.prefill_tokens_cancellable_with_mtp_seed(
+            prompt_tokens,
+            kc,
+            vc,
+            future_forwards,
+            true,
+            &mut should_abort,
+        )
+    }
+
     fn prefill_tokens_cancellable<C: FnMut() -> bool>(
         &self,
         prompt_tokens: &[u32],
@@ -14749,6 +15023,27 @@ impl Gemma4Runtime {
         future_forwards: usize,
         should_cancel: &mut C,
     ) -> Result<Option<Vec<f32>>> {
+        self.prefill_tokens_cancellable_with_mtp_seed(
+            prompt_tokens,
+            kc,
+            vc,
+            future_forwards,
+            false,
+            should_cancel,
+        )
+        .map(|output| output.map(|output| output.logits))
+    }
+
+    fn prefill_tokens_cancellable_with_mtp_seed<C: FnMut() -> bool>(
+        &self,
+        prompt_tokens: &[u32],
+        kc: &mut [Vec<Vec<f32>>],
+        vc: &mut [Vec<Vec<f32>>],
+        future_forwards: usize,
+        capture_mtp_seed: bool,
+        should_cancel: &mut C,
+    ) -> Result<Option<Gemma4MtpPrefillOutput>> {
+        self.invalidate_mtp_prefill_seed();
         if prompt_tokens.is_empty() {
             return Err(BackendError::InvalidModelMetadata(
                 "Gemma 4 tokenizer produced an empty prompt".into(),
@@ -14780,13 +15075,50 @@ impl Gemma4Runtime {
                     64
                 });
             let mut logits = Vec::new();
+            let mut mtp_hidden = None;
             for (chunk_idx, tokens) in prompt_tokens.chunks(chunk_size).enumerate() {
                 if should_cancel() {
                     return Ok(None);
                 }
                 let start_pos = chunk_idx * chunk_size;
-                let mut rows = self.step_chunk_with_head(tokens, start_pos, kc, vc, false, None)?;
+                let final_chunk = start_pos + tokens.len() == prompt_tokens.len();
+                let mut hidden_rows = Vec::new();
+                let mut rows = if capture_mtp_seed && final_chunk {
+                    self.step_chunk_with_head_capture(
+                        tokens,
+                        start_pos,
+                        kc,
+                        vc,
+                        false,
+                        None,
+                        Some(&mut hidden_rows),
+                    )?
+                } else {
+                    self.step_chunk_with_head(tokens, start_pos, kc, vc, false, None)?
+                };
                 logits = rows.pop().expect("non-empty prefill chunk has logits");
+                if capture_mtp_seed && final_chunk {
+                    // Invariant: this is the same final raw `hs` row whose
+                    // canonical target head produced `logits`; the completed
+                    // chunk has also appended exactly `prompt_tokens.len()` KV
+                    // rows. Normalizing it here yields the recurrent hidden
+                    // immediately preceding the still-unforwarded first anchor.
+                    let selected_row = hidden_rows
+                        .len()
+                        .checked_sub(1)
+                        .ok_or_else(|| {
+                            BackendError::RuntimeShapeMismatch(
+                                "Gemma 4 MTP seeded prefill retained no final hidden row".into(),
+                            )
+                        })?;
+                    let target_hidden_normalized = mtp_final_normalized_hidden(
+                        &hidden_rows,
+                        selected_row,
+                        &self.output_norm,
+                        self.config.rms_norm_epsilon,
+                    )?;
+                    mtp_hidden = Some(target_hidden_normalized);
+                }
             }
             if should_cancel() {
                 return Ok(None);
@@ -14800,7 +15132,23 @@ impl Gemma4Runtime {
                     return Ok(None);
                 }
             }
-            Ok(Some(logits))
+            let mtp_seed = mtp_hidden.map(|target_hidden_normalized| {
+                let provenance_nonce = self.issue_mtp_prefill_seed_nonce();
+                let position = prompt_tokens.len();
+                let state_sha256 = mtp_prefill_state_sha256(
+                    provenance_nonce,
+                    position,
+                    &logits,
+                    &target_hidden_normalized,
+                );
+                Gemma4MtpPrefillSeed {
+                    provenance_nonce,
+                    position,
+                    target_hidden_normalized,
+                    state_sha256,
+                }
+            });
+            Ok(Some(Gemma4MtpPrefillOutput { logits, mtp_seed }))
         } else {
             let (&last_token, prefix) = prompt_tokens
                 .split_last()
@@ -14818,7 +15166,10 @@ impl Gemma4Runtime {
             if should_cancel() {
                 Ok(None)
             } else {
-                Ok(Some(logits))
+                Ok(Some(Gemma4MtpPrefillOutput {
+                    logits,
+                    mtp_seed: None,
+                }))
             }
         }
     }
@@ -14976,11 +15327,13 @@ impl Gemma4Runtime {
         } else {
             None
         };
-        let Some(mut logits) = self.prefill_tokens_cancellable(
+        let capture_mtp_prefill_seed = mtp_prefill_seed_bootstrap_enabled();
+        let Some(prefill) = self.prefill_tokens_cancellable_with_mtp_seed(
             &prompt_tokens,
             &mut kc,
             &mut vc,
             max_new.saturating_sub(1),
+            capture_mtp_prefill_seed,
             &mut should_cancel,
         )?
         else {
@@ -14988,6 +15341,9 @@ impl Gemma4Runtime {
                 generated_tokens: 0,
             });
         };
+        let mut logits = prefill.logits;
+        #[cfg(target_os = "macos")]
+        let mtp_prefill_seed = prefill.mtp_seed;
         let mut generated = Vec::new();
         let mut emitted = String::new();
         let mut pos = prompt_tokens.len();
@@ -15024,11 +15380,12 @@ impl Gemma4Runtime {
                         }
                     }
                 };
-                let result = self.generate_mtp_assistant_experiment_cancellable(
+                let result = self.generate_mtp_assistant_experiment_cancellable_with_prefill_seed(
                     assistant,
                     &mut kc,
                     &mut vc,
                     logits,
+                    mtp_prefill_seed,
                     prompt_tokens.len(),
                     &eot,
                     max_new,
@@ -21461,6 +21818,98 @@ mod mtp_target_seam_tests {
             mtp_commit_plan(10, &[11], 1, 0, 1, &[]),
             Err(BackendError::RuntimeShapeMismatch(_))
         ));
+    }
+
+    #[test]
+    fn mtp_prefill_seed_opt_in_is_default_off_and_parses_explicit_values() {
+        assert!(!mtp_prefill_seed_bootstrap_enabled_value(None));
+        for disabled in ["", "0", "false", "OFF", "no", "none", "experiment", "treu"] {
+            assert!(!mtp_prefill_seed_bootstrap_enabled_value(Some(disabled)));
+        }
+        for enabled in ["1", "true", "on", "yes"] {
+            assert!(mtp_prefill_seed_bootstrap_enabled_value(Some(enabled)));
+        }
+
+        let telemetry = Gemma4MtpGenerationResult::default();
+        assert!(!telemetry.prefill_seed_bootstrap_attempted);
+        assert!(!telemetry.prefill_seed_bootstrap_used);
+        assert!(telemetry.prefill_seed_bootstrap_fallback_reason.is_none());
+    }
+
+    #[test]
+    fn mtp_prefill_seed_fingerprint_binds_position_logits_and_hidden_bits() {
+        let base = mtp_prefill_state_sha256(7, 9, &[0.0, 1.0], &[-2.5, 4.0]);
+        assert_ne!(
+            base,
+            mtp_prefill_state_sha256(7, 10, &[0.0, 1.0], &[-2.5, 4.0])
+        );
+        assert_ne!(
+            base,
+            mtp_prefill_state_sha256(7, 9, &[-0.0, 1.0], &[-2.5, 4.0])
+        );
+        assert_ne!(
+            base,
+            mtp_prefill_state_sha256(7, 9, &[0.0, 1.0], &[-2.5, 4.5])
+        );
+        assert_ne!(
+            base,
+            mtp_prefill_state_sha256(7, 9, &[0.0, 1.0, 0.0], &[-2.5, 4.0])
+        );
+        assert_eq!(
+            base,
+            mtp_prefill_state_sha256(7, 9, &[0.0, 1.0], &[-2.5, 4.0])
+        );
+    }
+
+    #[test]
+    fn mtp_prefill_seed_validation_fails_closed_on_every_stale_axis() {
+        let logits = vec![0.25, -1.0, 3.5];
+        let seed = || {
+            let hidden = vec![1.0, -2.0, 0.5, 4.0];
+            Gemma4MtpPrefillSeed {
+                provenance_nonce: 42,
+                position: 17,
+                state_sha256: mtp_prefill_state_sha256(42, 17, &logits, &hidden),
+                target_hidden_normalized: hidden,
+            }
+        };
+        assert_eq!(
+            validate_mtp_prefill_seed(&seed(), 42, 17, &logits, 4),
+            Ok(())
+        );
+        assert_eq!(
+            validate_mtp_prefill_seed(&seed(), 43, 17, &logits, 4),
+            Err("target_state_provenance_mismatch")
+        );
+        assert_eq!(
+            validate_mtp_prefill_seed(&seed(), 42, 18, &logits, 4),
+            Err("position_mismatch")
+        );
+        assert_eq!(
+            validate_mtp_prefill_seed(&seed(), 42, 17, &[0.25, -1.0, 3.0], 4),
+            Err("state_digest_mismatch")
+        );
+
+        let mut wrong_width = seed();
+        wrong_width.target_hidden_normalized.pop();
+        assert_eq!(
+            validate_mtp_prefill_seed(&wrong_width, 42, 17, &logits, 4),
+            Err("hidden_width_mismatch")
+        );
+
+        let mut wrong_hidden = seed();
+        wrong_hidden.target_hidden_normalized[2] = 0.75;
+        assert_eq!(
+            validate_mtp_prefill_seed(&wrong_hidden, 42, 17, &logits, 4),
+            Err("state_digest_mismatch")
+        );
+
+        let mut non_finite = seed();
+        non_finite.target_hidden_normalized[2] = f32::NAN;
+        assert_eq!(
+            validate_mtp_prefill_seed(&non_finite, 42, 17, &logits, 4),
+            Err("hidden_non_finite")
+        );
     }
 
     #[test]

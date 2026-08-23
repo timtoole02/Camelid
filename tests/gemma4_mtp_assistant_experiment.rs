@@ -84,7 +84,7 @@ const PILOT_REPETITIONS: u32 = 3;
 const DEFAULT_MATRIX_TOKENS: u64 = 64;
 const DEFAULT_MATRIX_REPETITIONS: u32 = 3;
 const DEFAULT_CHILD_TIMEOUT_SECS: u64 = 30 * 60;
-const REPORT_SCHEMA_VERSION: u32 = 4;
+const REPORT_SCHEMA_VERSION: u32 = 5;
 const NATIVE_ADMISSION_SCHEMA_VERSION: u32 = 1;
 const NATIVE_RECURRENCE_TEST_NAME: &str =
     "camelid::metal::gemma4_mtp::tests::official_target_free_bf16_oracle_matches_native_seven_proposal_recurrence";
@@ -582,6 +582,10 @@ fn exact_target_environment_with_profile(profiled: bool) -> BTreeMap<String, Str
         ("CAMELID_GEMMA4_CHAINED_PREDICT", "0"),
         ("CAMELID_SPEC_DECODE", "off"),
         ("CAMELID_GEMMA4_SPEC_CHUNK_MAX", "8"),
+        // Default-off runtime experiment: M retains the exact final prompt
+        // hidden and attempts its first full verifier round without a separate
+        // target K=1 bootstrap. Missing/stale state falls back to K1.
+        ("CAMELID_GEMMA4_MTP_PREFILL_SEED_BOOTSTRAP", "1"),
         // Preserve spec50's K=8 request exactly. The runtime's K=8 verifier
         // ceiling clamps this to seven proposals plus the target anchor.
         ("CAMELID_GEMMA4_SPEC_DRAFT_TOKENS", "8"),
@@ -3566,6 +3570,12 @@ struct LaneRun {
     terminal_target_tokens: u64,
     generation_wall_us: u64,
     completed: bool,
+    #[serde(default)]
+    mtp_prefill_seed_bootstrap_attempted: bool,
+    #[serde(default)]
+    mtp_prefill_seed_bootstrap_used: bool,
+    #[serde(default)]
+    mtp_prefill_seed_bootstrap_fallback_reason: Option<String>,
     rounds: Vec<RoundTelemetry>,
     metrics: RunMetrics,
     /// Post-generation target residency captured after the final measured
@@ -4132,6 +4142,20 @@ impl LaneRun {
             ));
         }
         match self.lane {
+            Lane::Mtp
+                if self.completed
+                    && (!self.mtp_prefill_seed_bootstrap_attempted
+                        || !self.mtp_prefill_seed_bootstrap_used) =>
+            {
+                return Err(format!(
+                    "M opt-in did not eliminate K1 bootstrap: attempted={} used={} fallback={}",
+                    self.mtp_prefill_seed_bootstrap_attempted,
+                    self.mtp_prefill_seed_bootstrap_used,
+                    self.mtp_prefill_seed_bootstrap_fallback_reason
+                        .as_deref()
+                        .unwrap_or("none")
+                ));
+            }
             Lane::Mtp if self.completed && self.assistant_invocations == 0 => {
                 return Err("M run never invoked the assistant".into());
             }
@@ -4144,6 +4168,11 @@ impl LaneRun {
                 ));
             }
             _ => {}
+        }
+        if self.mtp_prefill_seed_bootstrap_used
+            && self.mtp_prefill_seed_bootstrap_fallback_reason.is_some()
+        {
+            return Err("MTP prefill seed reports both use and fallback".into());
         }
         if self
             .rounds
@@ -4289,6 +4318,9 @@ fn ngram_lane_run(
         terminal_target_tokens,
         generation_wall_us: result.total_wall_us,
         completed: !result.aborted,
+        mtp_prefill_seed_bootstrap_attempted: false,
+        mtp_prefill_seed_bootstrap_used: false,
+        mtp_prefill_seed_bootstrap_fallback_reason: None,
         rounds,
         metrics,
         routed_experts_after_generation: None,
@@ -4306,6 +4338,9 @@ fn mtp_lane_run(
     eot: &[u32],
     result: camelid::gemma4_runtime::Gemma4MtpGenerationResult,
 ) -> Result<LaneRun, String> {
+    let seed_attempted = result.prefill_seed_bootstrap_attempted;
+    let seed_used = result.prefill_seed_bootstrap_used;
+    let seed_fallback = result.prefill_seed_bootstrap_fallback_reason.clone();
     let plan = LaneExecutionPlan::for_lane(Lane::Mtp);
     let mut trace =
         ProposalTraceHasher::new(workload, prompt_token_ids, &plan.proposal_environment);
@@ -4376,6 +4411,9 @@ fn mtp_lane_run(
         terminal_target_tokens,
         generation_wall_us: result.total_wall_us,
         completed: !result.aborted,
+        mtp_prefill_seed_bootstrap_attempted: seed_attempted,
+        mtp_prefill_seed_bootstrap_used: seed_used,
+        mtp_prefill_seed_bootstrap_fallback_reason: seed_fallback,
         rounds,
         metrics,
         routed_experts_after_generation: None,
@@ -6345,17 +6383,33 @@ fn execute_lane_child(request: &ChildLaneRequest) -> Result<ChildLaneResult, Str
             .map_err(|_| "requested output token budget exceeds usize".to_string()),
         "convert measured output budget"
     );
-    let logits = child_try!(
-        runtime.prefill_tokens_cancellable_experiment(
-            &prompt_tokens,
-            &mut kc,
-            &mut vc,
-            max_new.saturating_sub(1),
-            || control.should_abort(),
+    let prefill = match request.plan.driver {
+        LaneDriver::CurrentSpecDecodeGenerate => child_try!(
+            runtime
+                .prefill_tokens_cancellable_experiment(
+                    &prompt_tokens,
+                    &mut kc,
+                    &mut vc,
+                    max_new.saturating_sub(1),
+                    || control.should_abort(),
+                )
+                .map(|output| output.map(|logits| (logits, None))),
+            "measured target prefill"
         ),
-        "measured target prefill"
-    );
-    let Some(logits) = logits else {
+        LaneDriver::NativeMtpExperiment => child_try!(
+            runtime
+                .prefill_tokens_cancellable_with_mtp_seed_experiment(
+                    &prompt_tokens,
+                    &mut kc,
+                    &mut vc,
+                    max_new.saturating_sub(1),
+                    || control.should_abort(),
+                )
+                .map(|output| output.map(|prefill| (prefill.logits, prefill.mtp_seed))),
+            "measured target prefill with MTP seed"
+        ),
+    };
+    let Some((logits, mtp_prefill_seed)) = prefill else {
         let aborted_snapshot = child_try!(
             capture_memory_snapshot(
                 &format!("{}:aborted_prefill", request.run_id),
@@ -6423,11 +6477,12 @@ fn execute_lane_child(request: &ChildLaneRequest) -> Result<ChildLaneResult, Str
                 "enter native MTP driver"
             );
             let result = child_try!(
-                runtime.generate_mtp_assistant_experiment_cancellable(
+                runtime.generate_mtp_assistant_experiment_cancellable_with_prefill_seed(
                     loaded,
                     &mut kc,
                     &mut vc,
                     logits,
+                    mtp_prefill_seed,
                     prompt_tokens.len(),
                     &eot,
                     max_new,
@@ -7746,6 +7801,10 @@ mod pure_tests {
             "0"
         );
         assert_eq!(config.environment["CAMELID_GEMMA4_SPEC_CHUNK_MAX"], "8");
+        assert_eq!(
+            config.environment["CAMELID_GEMMA4_MTP_PREFILL_SEED_BOOTSTRAP"],
+            "1"
+        );
         assert_eq!(config.environment["CAMELID_GEMMA4_SPEC_DRAFT_TOKENS"], "8");
         assert_eq!(
             config.environment["CAMELID_GEMMA4_GHOST_READ_THREADS"],
@@ -7979,12 +8038,24 @@ mod pure_tests {
             terminal_target_tokens: 0,
             generation_wall_us: 4_500,
             completed: true,
+            mtp_prefill_seed_bootstrap_attempted: true,
+            mtp_prefill_seed_bootstrap_used: true,
+            mtp_prefill_seed_bootstrap_fallback_reason: None,
             rounds,
             metrics,
             routed_experts_after_generation: Some(routed_expert_snapshot()),
         };
         let plan = LaneExecutionPlan::for_lane(Lane::Mtp);
         assert!(run.validate(&plan).is_ok());
+
+        run.mtp_prefill_seed_bootstrap_used = false;
+        run.mtp_prefill_seed_bootstrap_fallback_reason = Some("seed_unavailable".into());
+        assert!(run
+            .validate(&plan)
+            .unwrap_err()
+            .contains("did not eliminate K1 bootstrap"));
+        run.mtp_prefill_seed_bootstrap_used = true;
+        run.mtp_prefill_seed_bootstrap_fallback_reason = None;
 
         run.driver = LaneDriver::CurrentSpecDecodeGenerate;
         assert!(run.validate(&plan).unwrap_err().contains("expected"));
