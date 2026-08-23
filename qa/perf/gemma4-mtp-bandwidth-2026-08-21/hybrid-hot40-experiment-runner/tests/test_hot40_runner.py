@@ -20,11 +20,20 @@ HASHER_PATH = BASE_DIR / "sha256_nocache.py"
 RUNNER_PATH = BASE_DIR / "run_hot40.zsh"
 REQUEST_PATH = BASE_DIR / "request-48.json"
 EXPECTED_IDS_PATH = BASE_DIR / "expected-48-token-ids.json"
+WATCHDOG_PATH = (
+    BASE_DIR.parents[2]
+    / "evidence-bundles/gemma4-26b-mtp-assistant-oracle/run_load_only_watchdog.py"
+)
 
 SPEC = importlib.util.spec_from_file_location("hot40_analyzer", ANALYZER_PATH)
 assert SPEC is not None and SPEC.loader is not None
 hot40 = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(hot40)
+
+WATCHDOG_SPEC = importlib.util.spec_from_file_location("hot40_watchdog", WATCHDOG_PATH)
+assert WATCHDOG_SPEC is not None and WATCHDOG_SPEC.loader is not None
+watchdog_module = importlib.util.module_from_spec(WATCHDOG_SPEC)
+WATCHDOG_SPEC.loader.exec_module(watchdog_module)
 
 
 def sha256(path: Path) -> str:
@@ -224,6 +233,7 @@ class SyntheticRun:
             "port": 8189,
             "protected_port": 8181,
             "protected_port_policy": "never-bound-connected-or-signaled",
+            "allow_warning_pressure": False,
             "disk": {
                 "available_kib": 24 * 1024 * 1024,
                 "minimum_available_kib": 20 * 1024 * 1024,
@@ -237,6 +247,8 @@ class SyntheticRun:
                 "anonymous_hot_capacity_bytes": 4_030_464_000,
                 "file_mapped_addressable_slots": 3840,
                 "file_mapped_address_span_bytes": 12_897_484_800,
+                "mapped_readahead_enabled": False,
+                "mapped_readahead_max_inflight_records": 0,
                 "overflow_slots": 0,
                 "victim_slots": 0,
                 "host_cache_budget_bytes": 0,
@@ -249,6 +261,7 @@ class SyntheticRun:
                 "minimum_runtime_reclaimable_headroom_bytes": 2 * 1024**3,
                 "maximum_child_physical_footprint_bytes": 7_680 * 1024**2,
                 "maximum_host_wired_bytes": 8 * 1024**3,
+                "maximum_pressure_level_raw": 1,
                 "reject_swapin_growth": True,
                 "reject_swapout_growth": True,
                 "require_zero_current_swap": False,
@@ -270,7 +283,8 @@ class SyntheticRun:
                 "minimum_pre_hash_reclaimable_headroom_bytes": 7_680 * 1024**2,
                 "minimum_post_hash_reclaimable_headroom_bytes": 7_680 * 1024**2,
                 "maximum_host_wired_bytes": 8 * 1024**3,
-                "require_normal_pressure": True,
+                "allow_warning_pressure": False,
+                "maximum_pressure_level_raw": 1,
                 "reject_swapin_growth": True,
                 "reject_swapout_growth": True,
                 "large_inputs_content_hashed_this_run": False,
@@ -323,6 +337,7 @@ class SyntheticRun:
                     "observed_duration_ns": 60_000_000_001,
                     "minimum_reclaimable_headroom_bytes": 7_680 * 1024**2,
                     "require_zero_current_swap": False,
+                    "maximum_pressure_level_raw": 1,
                 },
                 {
                     "schema_version": 3,
@@ -335,6 +350,7 @@ class SyntheticRun:
                     "minimum_reclaimable_headroom_bytes": 2 * 1024**3,
                     "maximum_child_physical_footprint_bytes": 7_680 * 1024**2,
                     "maximum_host_wired_bytes": 8 * 1024**3,
+                    "maximum_pressure_level_raw": 1,
                     "require_zero_current_swap": False,
                     "reject_swapin_growth": True,
                     "baseline_swapins_pages": 100,
@@ -403,8 +419,8 @@ class SyntheticRun:
             "victim_record_capacity": 0,
             "victim_capacity_bytes": 0,
             "host_cache_budget_bytes": 0,
-            "mapped_readahead_enabled": True,
-            "mapped_readahead_max_inflight_records": 64,
+            "mapped_readahead_enabled": False,
+            "mapped_readahead_max_inflight_records": 0,
             "mapped_readahead_anonymous_capacity_bytes": 0,
             "per_layer": [
                 {
@@ -454,12 +470,12 @@ class SyntheticRun:
                     "overflow_layers": 0,
                     "overflow_experts": 0,
                     "victim_hits": 0,
-                    "mapped_readahead_enqueued_records": 10,
-                    "mapped_readahead_enqueued_bytes": 33_454_080,
-                    "mapped_readahead_enqueue_ms": 0.1,
-                    "mapped_readahead_previous_union_enqueued_records": 10,
-                    "mapped_readahead_previous_union_enqueued_bytes": 33_454_080,
-                    "mapped_readahead_previous_union_enqueue_ms": 0.1,
+                    "mapped_readahead_enqueued_records": 0,
+                    "mapped_readahead_enqueued_bytes": 0,
+                    "mapped_readahead_enqueue_ms": 0.0,
+                    "mapped_readahead_previous_union_enqueued_records": 0,
+                    "mapped_readahead_previous_union_enqueued_bytes": 0,
+                    "mapped_readahead_previous_union_enqueue_ms": 0.0,
                     "per_layer": [
                         {
                             "layer_index": layer,
@@ -547,6 +563,37 @@ class SyntheticRun:
     def write_response(self) -> None:
         write_json(self.root / "response.json", self.response)
 
+    def enable_warning_pressure(self) -> None:
+        self.intent["allow_warning_pressure"] = True
+        watchdog = self.intent["watchdog_contract"]
+        watchdog["maximum_pressure_level_raw"] = 2
+        watchdog["minimum_baseline_reclaimable_headroom_bytes"] = 5 * 1024**3
+        hashing = self.intent["hashing_contract"]
+        hashing["allow_warning_pressure"] = True
+        hashing["maximum_pressure_level_raw"] = 2
+        hashing["minimum_pre_hash_reclaimable_headroom_bytes"] = 5 * 1024**3
+        hashing["minimum_post_hash_reclaimable_headroom_bytes"] = 5 * 1024**3
+        for sample in (self.hashing_memory_before, self.hashing_memory_after):
+            sample["host"]["pressure_level_raw"] = 2
+        write_json(self.root / "hashing-memory-before.json", self.hashing_memory_before)
+        write_json(self.root / "hashing-memory-after.json", self.hashing_memory_after)
+        self.intent["artifacts"]["hashing_memory_before"] = artifact(
+            self.root / "hashing-memory-before.json"
+        )
+        self.intent["artifacts"]["hashing_memory_after"] = artifact(
+            self.root / "hashing-memory-after.json"
+        )
+        for event in self.events:
+            if isinstance(event.get("host"), dict):
+                event["host"]["pressure_level_raw"] = 2
+            if event["event"] == "baseline_soak_complete":
+                event["minimum_reclaimable_headroom_bytes"] = 5 * 1024**3
+                event["maximum_pressure_level_raw"] = 2
+            if event["event"] == "child_started":
+                event["maximum_pressure_level_raw"] = 2
+        self.write_intent()
+        self.write_events()
+
     def write_intent(self) -> None:
         write_json(self.root / "intent.json", self.intent)
 
@@ -587,6 +634,47 @@ class Hot40AnalyzerTests(unittest.TestCase):
         self.assertTrue(
             verdict["gates"]["runtime_source_diff_empty_between_binary_and_harness"]
         )
+        self.assertFalse(verdict["pressure_policy"]["allow_warning_pressure"])
+        self.assertEqual(verdict["pressure_policy"]["maximum_pressure_level_raw"], 1)
+
+    def test_explicit_warning_pressure_receipt_passes_at_five_gib_baseline(self) -> None:
+        self.run.enable_warning_pressure()
+        verdict = hot40.analyze(self.run.root)
+        self.assertTrue(verdict["pass"])
+        self.assertTrue(verdict["pressure_policy"]["allow_warning_pressure"])
+        self.assertEqual(verdict["pressure_policy"]["maximum_pressure_level_raw"], 2)
+        self.assertEqual(
+            verdict["pressure_policy"]["maximum_pressure_level_raw_observed"], 2
+        )
+
+    def test_default_policy_rejects_warning_pressure(self) -> None:
+        self.run.hashing_memory_before["host"]["pressure_level_raw"] = 2
+        write_json(
+            self.run.root / "hashing-memory-before.json", self.run.hashing_memory_before
+        )
+        self.run.intent["hashing_contract"]["memory_before"] = (
+            self.run.hashing_memory_before
+        )
+        self.run.intent["artifacts"]["hashing_memory_before"] = artifact(
+            self.run.root / "hashing-memory-before.json"
+        )
+        self.run.write_intent()
+        with self.assertRaisesRegex(hot40.ReceiptError, "hash-phase before"):
+            hot40.analyze(self.run.root)
+
+    def test_rejects_mapped_readahead_or_nonzero_counter(self) -> None:
+        geometry = self.run.response["camelid"]["hybrid_telemetry"]["geometry"]
+        geometry["mapped_readahead_enabled"] = True
+        self.run.write_response()
+        with self.assertRaisesRegex(hot40.ReceiptError, "geometry"):
+            hot40.analyze(self.run.root)
+
+        geometry["mapped_readahead_enabled"] = False
+        rounds = self.run.response["camelid"]["hybrid_telemetry"]["rounds"]
+        rounds[0]["mapped_readahead_enqueued_records"] = 1
+        self.run.write_response()
+        with self.assertRaisesRegex(hot40.ReceiptError, "mapped_readahead"):
+            hot40.analyze(self.run.root)
 
     def test_rejects_binary_source_alias_or_contract_drift(self) -> None:
         self.run.intent["source_commit"] = "c" * 40
@@ -721,6 +809,42 @@ class Hot40AnalyzerTests(unittest.TestCase):
 class Hot40SourceContractTests(unittest.TestCase):
     def test_baseline_gate_is_exactly_seven_and_a_half_gib(self) -> None:
         self.assertEqual(hot40.MIN_BASELINE_HEADROOM_BYTES, 7_680 * 1024**2)
+        self.assertEqual(hot40.WARNING_MIN_BASELINE_HEADROOM_BYTES, 5 * 1024**3)
+
+    def test_watchdog_warning_opt_in_preserves_hard_memory_and_swap_gates(self) -> None:
+        sample = SyntheticRun.host(headroom=5 * 1024**3)
+        sample["pressure_level_raw"] = 2
+        self.assertTrue(
+            any(
+                "pressure_level" in reason
+                for reason in watchdog_module._host_violation_reasons(sample, 25)
+            )
+        )
+        self.assertEqual(
+            watchdog_module._host_violation_reasons(
+                sample,
+                25,
+                baseline_swapins_pages=100,
+                minimum_reclaimable_headroom_bytes=5 * 1024**3,
+                maximum_host_wired_bytes=8 * 1024**3,
+                maximum_pressure_level_raw=2,
+            ),
+            [],
+        )
+        sample["swapouts_pages"] += 1
+        sample["reclaimable_headroom_bytes"] = 2 * 1024**3 - 1
+        sample["wired_bytes"] = 8 * 1024**3 + 1
+        reasons = watchdog_module._host_violation_reasons(
+            sample,
+            25,
+            baseline_swapins_pages=100,
+            minimum_reclaimable_headroom_bytes=2 * 1024**3,
+            maximum_host_wired_bytes=8 * 1024**3,
+            maximum_pressure_level_raw=2,
+        )
+        self.assertTrue(any("swapouts_changed" in reason for reason in reasons))
+        self.assertTrue(any("reclaimable_headroom" in reason for reason in reasons))
+        self.assertTrue(any("host_wired" in reason for reason in reasons))
 
     def test_frozen_fixture_hashes(self) -> None:
         self.assertEqual(sha256(REQUEST_PATH), hot40.REQUEST_SHA256)
@@ -738,6 +862,12 @@ class Hot40SourceContractTests(unittest.TestCase):
         self.assertIn("anonymous_hot_capacity_slots: 1200", source)
         self.assertIn("anonymous_hot_capacity_bytes: 4030464000", source)
         self.assertIn("MIN_BASELINE_HEADROOM_BYTES=8053063680", source)
+        self.assertIn("WARNING_MIN_BASELINE_HEADROOM_BYTES=5368709120", source)
+        self.assertIn("CAMELID_HOT40_ALLOW_WARNING_PRESSURE", source)
+        self.assertIn('--maximum-pressure-level-raw "$maximum_pressure_level_raw"', source)
+        self.assertNotIn("CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD=", source)
+        self.assertIn("mapped_readahead_enabled: false", source)
+        self.assertIn("mapped_readahead_max_inflight_records: 0", source)
         self.assertIn("--baseline-soak-seconds 60", source)
         self.assertIn("--reject-swapin-growth", source)
         self.assertNotIn("--require-zero-current-swap", source)
@@ -774,6 +904,7 @@ class Hot40SourceContractTests(unittest.TestCase):
                 ("analyzer", ANALYZER_PATH),
                 ("hasher", HASHER_PATH),
                 ("host_sampler", HOST_SAMPLER_PATH),
+                ("watchdog", WATCHDOG_PATH),
             ):
                 py_compile.compile(
                     str(path),

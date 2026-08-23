@@ -9,6 +9,7 @@ readonly PORT=8189
 readonly PROTECTED_PORT=8181
 readonly MIN_DISK_AVAILABLE_KIB=20971520
 readonly MIN_BASELINE_HEADROOM_BYTES=8053063680
+readonly WARNING_MIN_BASELINE_HEADROOM_BYTES=5368709120
 readonly MIN_RUNTIME_HEADROOM_BYTES=2147483648
 readonly MAX_CHILD_FOOTPRINT_BYTES=8053063680
 readonly MAX_HOST_WIRED_BYTES=8589934592
@@ -40,6 +41,17 @@ readonly hasher="$script_dir/sha256_nocache.py"
 readonly watchdog="$repo_root/qa/evidence-bundles/gemma4-26b-mtp-assistant-oracle/run_load_only_watchdog.py"
 readonly request_source="$script_dir/request-48.json"
 readonly expected_ids_source="$script_dir/expected-48-token-ids.json"
+typeset allow_warning_pressure=false
+typeset maximum_pressure_level_raw=1
+typeset minimum_baseline_headroom_bytes=$MIN_BASELINE_HEADROOM_BYTES
+if (( ${+parameters[CAMELID_HOT40_ALLOW_WARNING_PRESSURE]} )); then
+  [[ "$CAMELID_HOT40_ALLOW_WARNING_PRESSURE" == "1" ]] || \
+    refuse "CAMELID_HOT40_ALLOW_WARNING_PRESSURE is an exact opt-in and must be 1"
+  allow_warning_pressure=true
+  maximum_pressure_level_raw=2
+  minimum_baseline_headroom_bytes=$WARNING_MIN_BASELINE_HEADROOM_BYTES
+fi
+readonly allow_warning_pressure maximum_pressure_level_raw minimum_baseline_headroom_bytes
 readonly harness_commit=$(/usr/bin/git -C "$repo_root" rev-parse --verify "HEAD^{commit}")
 typeset source_worktree_status
 source_worktree_status=$(/usr/bin/git -C "$repo_root" status --porcelain=v1 --untracked-files=all)
@@ -281,12 +293,14 @@ readonly hashing_memory_after="$receipt_root/hashing-memory-after.json"
 /usr/bin/python3 "$host_sampler" --watchdog "$watchdog" --output "$hashing_memory_before"
 /usr/bin/jq -e \
   --arg boot "$boot_identity" \
-  --argjson minimum_headroom "$MIN_BASELINE_HEADROOM_BYTES" \
-  --argjson maximum_wired "$MAX_HOST_WIRED_BYTES" '
+  --argjson minimum_headroom "$minimum_baseline_headroom_bytes" \
+  --argjson maximum_wired "$MAX_HOST_WIRED_BYTES" \
+  --argjson maximum_pressure "$maximum_pressure_level_raw" '
   .schema_version == 1 and
   .telemetry_source == "run_load_only_watchdog.NativeTelemetry.sample_host" and
   .boot_identity == $boot and
-  .host.pressure_level_raw == 1 and
+  (.host.pressure_level_raw == 1 or
+    ($maximum_pressure == 2 and .host.pressure_level_raw == 2)) and
   .host.reclaimable_headroom_bytes >= $minimum_headroom and
   .host.wired_bytes <= $maximum_wired
 ' "$hashing_memory_before" >/dev/null || \
@@ -316,14 +330,16 @@ watchdog_sha=$(sha256_file "$watchdog")
 /usr/bin/python3 "$host_sampler" --watchdog "$watchdog" --output "$hashing_memory_after"
 /usr/bin/jq -e -s \
   --arg boot "$boot_identity" \
-  --argjson minimum_headroom "$MIN_BASELINE_HEADROOM_BYTES" \
-  --argjson maximum_wired "$MAX_HOST_WIRED_BYTES" '
+  --argjson minimum_headroom "$minimum_baseline_headroom_bytes" \
+  --argjson maximum_wired "$MAX_HOST_WIRED_BYTES" \
+  --argjson maximum_pressure "$maximum_pressure_level_raw" '
   .[0] as $before | .[1] as $after |
   all($before, $after;
     .schema_version == 1 and
     .telemetry_source == "run_load_only_watchdog.NativeTelemetry.sample_host" and
     .boot_identity == $boot and
-    .host.pressure_level_raw == 1 and
+    (.host.pressure_level_raw == 1 or
+      ($maximum_pressure == 2 and .host.pressure_level_raw == 2)) and
     .host.reclaimable_headroom_bytes >= $minimum_headroom and
     .host.wired_bytes <= $maximum_wired
   ) and
@@ -355,6 +371,9 @@ hashing_memory_after_size=$(/usr/bin/stat -f '%z' "$hashing_memory_after")
   --arg binary_source_commit "$binary_source_commit" \
   --arg harness_commit "$harness_commit" \
   --argjson binary_source_defaulted "$binary_source_defaulted" \
+  --argjson allow_warning_pressure "$allow_warning_pressure" \
+  --argjson maximum_pressure_level_raw "$maximum_pressure_level_raw" \
+  --argjson minimum_baseline_headroom_bytes "$minimum_baseline_headroom_bytes" \
   --arg nonce "$run_nonce" --arg boot "$boot_identity" \
   --argjson disk_available_kib "$disk_available_kib" \
   --arg binary "$binary" --arg binary_sha "$binary_sha" --argjson binary_size "$binary_size" \
@@ -420,6 +439,7 @@ hashing_memory_after_size=$(/usr/bin/stat -f '%z' "$hashing_memory_after")
     port: 8189,
     protected_port: 8181,
     protected_port_policy: "never-bound-connected-or-signaled",
+    allow_warning_pressure: $allow_warning_pressure,
     disk: {
       available_kib: $disk_available_kib,
       minimum_available_kib: 20971520,
@@ -433,6 +453,8 @@ hashing_memory_after_size=$(/usr/bin/stat -f '%z' "$hashing_memory_after")
       anonymous_hot_capacity_bytes: 4030464000,
       file_mapped_addressable_slots: 3840,
       file_mapped_address_span_bytes: 12897484800,
+      mapped_readahead_enabled: false,
+      mapped_readahead_max_inflight_records: 0,
       overflow_slots: 0,
       victim_slots: 0,
       host_cache_budget_bytes: 0
@@ -441,10 +463,11 @@ hashing_memory_after_size=$(/usr/bin/stat -f '%z' "$hashing_memory_after")
       schema_version: 3,
       sample_period_ns: 250000000,
       baseline_soak_seconds: 60,
-      minimum_baseline_reclaimable_headroom_bytes: 8053063680,
+      minimum_baseline_reclaimable_headroom_bytes: $minimum_baseline_headroom_bytes,
       minimum_runtime_reclaimable_headroom_bytes: 2147483648,
       maximum_child_physical_footprint_bytes: 8053063680,
       maximum_host_wired_bytes: 8589934592,
+      maximum_pressure_level_raw: $maximum_pressure_level_raw,
       reject_swapin_growth: true,
       reject_swapout_growth: true,
       require_zero_current_swap: false
@@ -463,10 +486,11 @@ hashing_memory_after_size=$(/usr/bin/stat -f '%z' "$hashing_memory_after")
       host_sampler_artifact_label: "host_sampler",
       telemetry_watchdog_artifact_label: "watchdog",
       telemetry_source: "run_load_only_watchdog.NativeTelemetry.sample_host",
-      minimum_pre_hash_reclaimable_headroom_bytes: 8053063680,
-      minimum_post_hash_reclaimable_headroom_bytes: 8053063680,
+      minimum_pre_hash_reclaimable_headroom_bytes: $minimum_baseline_headroom_bytes,
+      minimum_post_hash_reclaimable_headroom_bytes: $minimum_baseline_headroom_bytes,
       maximum_host_wired_bytes: 8589934592,
-      require_normal_pressure: true,
+      allow_warning_pressure: $allow_warning_pressure,
+      maximum_pressure_level_raw: $maximum_pressure_level_raw,
       reject_swapin_growth: true,
       reject_swapout_growth: true,
       large_inputs_content_hashed_this_run: false,
@@ -507,6 +531,9 @@ hashing_memory_after_size=$(/usr/bin/stat -f '%z' "$hashing_memory_after")
   print -r -- "harness_commit=$harness_commit"
   print -r -- "binary_source_defaulted_to_harness=$binary_source_defaulted"
   print -r -- "runtime_source_diff_empty=true paths=src,Cargo.toml,Cargo.lock,build.rs"
+  print -r -- "allow_warning_pressure=$allow_warning_pressure"
+  print -r -- "maximum_pressure_level_raw=$maximum_pressure_level_raw"
+  print -r -- "minimum_baseline_headroom_bytes=$minimum_baseline_headroom_bytes"
   print -r -- "source_worktree_clean=true"
   print -r -- "harness_worktree_clean=true"
   print -r -- "nonce=$run_nonce"
@@ -558,7 +585,6 @@ experiment_env=(
   CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS=32
   CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT40_EXPERIMENT=1
   CAMELID_GEMMA4_GHOST_METAL_DECODE_PROMOTION=0
-  CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD=1
   CAMELID_GEMMA4_SLOT_PIN=0
   CAMELID_GEMMA4_GHOST_METAL_HOT_PIN=0
   CAMELID_GEMMA4_VICTIM_CACHE=0
@@ -581,10 +607,11 @@ experiment_env=(
 )
 watchdog_args=(
   --baseline-soak-seconds 60
-  --minimum-baseline-reclaimable-headroom-bytes "$MIN_BASELINE_HEADROOM_BYTES"
+  --minimum-baseline-reclaimable-headroom-bytes "$minimum_baseline_headroom_bytes"
   --minimum-runtime-reclaimable-headroom-bytes "$MIN_RUNTIME_HEADROOM_BYTES"
   --maximum-child-physical-footprint-bytes "$MAX_CHILD_FOOTPRINT_BYTES"
   --maximum-host-wired-bytes "$MAX_HOST_WIRED_BYTES"
+  --maximum-pressure-level-raw "$maximum_pressure_level_raw"
   --reject-swapin-growth
 )
 

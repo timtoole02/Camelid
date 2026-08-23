@@ -34,6 +34,7 @@ WATCHDOG_SCHEMA_VERSION = 3
 WATCHDOG_SAMPLE_PERIOD_NS = 250_000_000
 BASELINE_SOAK_SECONDS = 60
 MIN_BASELINE_HEADROOM_BYTES = 7_680 * 1024**2
+WARNING_MIN_BASELINE_HEADROOM_BYTES = 5 * 1024**3
 MIN_RUNTIME_HEADROOM_BYTES = 2 * 1024**3
 MAX_CHILD_FOOTPRINT_BYTES = 7_680 * 1024**2
 MAX_HOST_WIRED_BYTES = 8 * 1024**3
@@ -78,7 +79,6 @@ EXPECTED_ENVIRONMENT = {
     "CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_SLOTS": "32",
     EXPERIMENT_ENV: "1",
     "CAMELID_GEMMA4_GHOST_METAL_DECODE_PROMOTION": "0",
-    "CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD": "1",
     "CAMELID_GEMMA4_SLOT_PIN": "0",
     "CAMELID_GEMMA4_GHOST_METAL_HOT_PIN": "0",
     "CAMELID_GEMMA4_VICTIM_CACHE": "0",
@@ -148,6 +148,19 @@ def _is_finite(value: Any, *, positive: bool = False) -> bool:
         return False
     number = float(value)
     return math.isfinite(number) and (number > 0.0 if positive else number >= 0.0)
+
+
+def _pressure_allowed(value: Any, maximum_pressure_level_raw: int) -> bool:
+    allowed = {1} if maximum_pressure_level_raw == 1 else {1, 2}
+    return maximum_pressure_level_raw in {1, 2} and value in allowed
+
+
+def _effective_baseline_headroom(allow_warning_pressure: bool) -> int:
+    return (
+        WARNING_MIN_BASELINE_HEADROOM_BYTES
+        if allow_warning_pressure
+        else MIN_BASELINE_HEADROOM_BYTES
+    )
 
 
 def _read_json(path: Path) -> Any:
@@ -360,6 +373,11 @@ def _validate_hashes(run_dir: Path, intent: dict[str, Any]) -> None:
 
 def _validate_hashing_contract(run_dir: Path, intent: dict[str, Any]) -> None:
     contract = intent.get("hashing_contract")
+    allow_warning_pressure = intent["allow_warning_pressure"]
+    maximum_pressure_level_raw = 2 if allow_warning_pressure else 1
+    minimum_baseline_headroom_bytes = _effective_baseline_headroom(
+        allow_warning_pressure
+    )
     expected_static = {
         "schema_version": 1,
         "algorithm": "sha256",
@@ -374,10 +392,11 @@ def _validate_hashing_contract(run_dir: Path, intent: dict[str, Any]) -> None:
         "host_sampler_artifact_label": "host_sampler",
         "telemetry_watchdog_artifact_label": "watchdog",
         "telemetry_source": "run_load_only_watchdog.NativeTelemetry.sample_host",
-        "minimum_pre_hash_reclaimable_headroom_bytes": MIN_BASELINE_HEADROOM_BYTES,
-        "minimum_post_hash_reclaimable_headroom_bytes": MIN_BASELINE_HEADROOM_BYTES,
+        "minimum_pre_hash_reclaimable_headroom_bytes": minimum_baseline_headroom_bytes,
+        "minimum_post_hash_reclaimable_headroom_bytes": minimum_baseline_headroom_bytes,
         "maximum_host_wired_bytes": MAX_HOST_WIRED_BYTES,
-        "require_normal_pressure": True,
+        "allow_warning_pressure": allow_warning_pressure,
+        "maximum_pressure_level_raw": maximum_pressure_level_raw,
         "reject_swapin_growth": True,
         "reject_swapout_growth": True,
         "large_inputs_content_hashed_this_run": False,
@@ -455,8 +474,10 @@ def _validate_hashing_contract(run_dir: Path, intent: dict[str, Any]) -> None:
         if (
             any(not _is_nonnegative_int(host.get(field)) for field in required_nonnegative)
             or host.get("page_size_bytes") != 16_384
-            or host.get("pressure_level_raw") != 1
-            or host["reclaimable_headroom_bytes"] < MIN_BASELINE_HEADROOM_BYTES
+            or not _pressure_allowed(
+                host.get("pressure_level_raw"), maximum_pressure_level_raw
+            )
+            or host["reclaimable_headroom_bytes"] < minimum_baseline_headroom_bytes
             or host["wired_bytes"] > MAX_HOST_WIRED_BYTES
             or host["observed_monotonic_ns"] < host["sample_started_monotonic_ns"]
         ):
@@ -488,6 +509,9 @@ def _validate_intent(run_dir: Path) -> dict[str, Any]:
     binary_source_contract = (
         intent.get("binary_source_contract") if isinstance(intent, dict) else None
     )
+    allow_warning_pressure = (
+        intent.get("allow_warning_pressure") if isinstance(intent, dict) else None
+    )
     contract_expected = {
         "environment": "CAMELID_HOT40_BINARY_SOURCE_COMMIT",
         "canonical_full_commit": True,
@@ -503,6 +527,8 @@ def _validate_intent(run_dir: Path) -> dict[str, Any]:
         "anonymous_hot_capacity_bytes": HOT_CAPACITY_BYTES,
         "file_mapped_addressable_slots": LOGICAL_SLOTS_TOTAL,
         "file_mapped_address_span_bytes": MAPPED_ADDRESS_SPAN_BYTES,
+        "mapped_readahead_enabled": False,
+        "mapped_readahead_max_inflight_records": 0,
         "overflow_slots": 0,
         "victim_slots": 0,
         "host_cache_budget_bytes": 0,
@@ -522,6 +548,7 @@ def _validate_intent(run_dir: Path) -> dict[str, Any]:
         or not isinstance(harness_commit, str)
         or re.fullmatch(r"[0-9a-f]{40}", harness_commit) is None
         or source_commit != binary_source_commit
+        or not isinstance(allow_warning_pressure, bool)
         or intent.get("source_worktree_clean") is not True
         or intent.get("harness_worktree_clean") is not True
         or intent.get("geometry") != expected_geometry
@@ -554,14 +581,19 @@ def _validate_intent(run_dir: Path) -> dict[str, Any]:
     ):
         raise ReceiptError("intent does not prove at least 20 GiB Data-volume headroom")
     watchdog = intent.get("watchdog_contract")
+    maximum_pressure_level_raw = 2 if allow_warning_pressure else 1
+    minimum_baseline_headroom_bytes = _effective_baseline_headroom(
+        allow_warning_pressure
+    )
     if watchdog != {
         "schema_version": WATCHDOG_SCHEMA_VERSION,
         "sample_period_ns": WATCHDOG_SAMPLE_PERIOD_NS,
         "baseline_soak_seconds": BASELINE_SOAK_SECONDS,
-        "minimum_baseline_reclaimable_headroom_bytes": MIN_BASELINE_HEADROOM_BYTES,
+        "minimum_baseline_reclaimable_headroom_bytes": minimum_baseline_headroom_bytes,
         "minimum_runtime_reclaimable_headroom_bytes": MIN_RUNTIME_HEADROOM_BYTES,
         "maximum_child_physical_footprint_bytes": MAX_CHILD_FOOTPRINT_BYTES,
         "maximum_host_wired_bytes": MAX_HOST_WIRED_BYTES,
+        "maximum_pressure_level_raw": maximum_pressure_level_raw,
         "reject_swapin_growth": True,
         "reject_swapout_growth": True,
         "require_zero_current_swap": False,
@@ -598,6 +630,10 @@ def _validate_environment(environment: Any) -> None:
 
 
 def _validate_watchdog(run_dir: Path, intent: dict[str, Any]) -> dict[str, Any]:
+    maximum_pressure_level_raw = 2 if intent["allow_warning_pressure"] else 1
+    minimum_baseline_headroom_bytes = _effective_baseline_headroom(
+        intent["allow_warning_pressure"]
+    )
     events = _read_jsonl(run_dir / "watchdog.jsonl")
     if any(event.get("schema_version") != WATCHDOG_SCHEMA_VERSION for event in events):
         raise ReceiptError("every watchdog record must use schema version 3")
@@ -620,8 +656,10 @@ def _validate_watchdog(run_dir: Path, intent: dict[str, Any]) -> dict[str, Any]:
     if (
         complete.get("required_duration_seconds") != BASELINE_SOAK_SECONDS
         or complete.get("observed_duration_ns", 0) < BASELINE_SOAK_SECONDS * 1_000_000_000
-        or complete.get("minimum_reclaimable_headroom_bytes") != MIN_BASELINE_HEADROOM_BYTES
+        or complete.get("minimum_reclaimable_headroom_bytes")
+        != minimum_baseline_headroom_bytes
         or complete.get("require_zero_current_swap") is not False
+        or complete.get("maximum_pressure_level_raw") != maximum_pressure_level_raw
     ):
         raise ReceiptError("watchdog did not complete the exact 60 second nonzero-swap baseline")
     baseline_samples = [event for event in events if event.get("event") == "baseline_soak_sample"]
@@ -665,7 +703,9 @@ def _validate_watchdog(run_dir: Path, intent: dict[str, Any]) -> dict[str, Any]:
         if event.get("violations", []) != []:
             raise ReceiptError("a watchdog host sample recorded a safety violation")
         if (
-            host.get("pressure_level_raw") != 1
+            not _pressure_allowed(
+                host.get("pressure_level_raw"), maximum_pressure_level_raw
+            )
             or host.get("swapins_pages") != baseline_swapins
             or host.get("swapouts_pages") != baseline_swapouts
             or not _is_nonnegative_int(host.get("swapped_pages_current"))
@@ -673,7 +713,7 @@ def _validate_watchdog(run_dir: Path, intent: dict[str, Any]) -> dict[str, Any]:
         ):
             raise ReceiptError("host pressure, swap growth, or wired-memory evidence failed")
         minimum = (
-            MIN_BASELINE_HEADROOM_BYTES if event in baseline_events
+            minimum_baseline_headroom_bytes if event in baseline_events
             else MIN_RUNTIME_HEADROOM_BYTES
         )
         if host.get("reclaimable_headroom_bytes", -1) < minimum:
@@ -684,6 +724,7 @@ def _validate_watchdog(run_dir: Path, intent: dict[str, Any]) -> dict[str, Any]:
         "minimum_reclaimable_headroom_bytes": MIN_RUNTIME_HEADROOM_BYTES,
         "maximum_child_physical_footprint_bytes": MAX_CHILD_FOOTPRINT_BYTES,
         "maximum_host_wired_bytes": MAX_HOST_WIRED_BYTES,
+        "maximum_pressure_level_raw": maximum_pressure_level_raw,
         "require_zero_current_swap": False,
         "reject_swapin_growth": True,
         "report_producer": "external",
@@ -724,6 +765,7 @@ def _validate_watchdog(run_dir: Path, intent: dict[str, Any]) -> dict[str, Any]:
     if not _is_nonnegative_int(peak_rss):
         raise ReceiptError("watchdog final receipt has no valid child RSS peak")
     swapped_current = [event["host"]["swapped_pages_current"] for event in host_events]
+    pressure_levels = [event["host"]["pressure_level_raw"] for event in host_events]
     return {
         "baseline_swapins_pages": baseline_swapins,
         "baseline_swapouts_pages": baseline_swapouts,
@@ -731,6 +773,7 @@ def _validate_watchdog(run_dir: Path, intent: dict[str, Any]) -> dict[str, Any]:
         "swapouts_growth_pages": 0,
         "baseline_swapped_pages_current": first_host["swapped_pages_current"],
         "maximum_swapped_pages_current": max(swapped_current),
+        "maximum_pressure_level_raw_observed": max(pressure_levels),
         "minimum_reclaimable_headroom_bytes": final[
             "minimum_reclaimable_headroom_bytes_observed"
         ],
@@ -783,8 +826,8 @@ def _validate_geometry(geometry: Any) -> None:
         "victim_record_capacity": 0,
         "victim_capacity_bytes": 0,
         "host_cache_budget_bytes": 0,
-        "mapped_readahead_enabled": True,
-        "mapped_readahead_max_inflight_records": 64,
+        "mapped_readahead_enabled": False,
+        "mapped_readahead_max_inflight_records": 0,
         "mapped_readahead_anonymous_capacity_bytes": 0,
     }
     if not isinstance(geometry, dict) or any(geometry.get(key) != value for key, value in expected.items()):
@@ -898,6 +941,12 @@ def _validate_response(
             "overflow_layers",
             "overflow_experts",
             "victim_hits",
+            "mapped_readahead_enqueued_records",
+            "mapped_readahead_enqueued_bytes",
+            "mapped_readahead_enqueue_ms",
+            "mapped_readahead_previous_union_enqueued_records",
+            "mapped_readahead_previous_union_enqueued_bytes",
+            "mapped_readahead_previous_union_enqueue_ms",
         ):
             if receipt.get(field) != 0:
                 raise ReceiptError(f"round {index} has nonzero safety field {field}")
@@ -1135,6 +1184,17 @@ def analyze(run_dir: Path) -> dict[str, Any]:
             "protected_port_never_bound_connected_or_signaled": True,
             "binary_source_is_ancestor_of_harness": True,
             "runtime_source_diff_empty_between_binary_and_harness": True,
+            "pressure_never_exceeded_configured_maximum": True,
+            "mapped_readahead_disabled_with_zero_counters": True,
+        },
+        "pressure_policy": {
+            "allow_warning_pressure": intent["allow_warning_pressure"],
+            "maximum_pressure_level_raw": (
+                2 if intent["allow_warning_pressure"] else 1
+            ),
+            "maximum_pressure_level_raw_observed": memory[
+                "maximum_pressure_level_raw_observed"
+            ],
         },
         "geometry": intent["geometry"],
         "performance": {

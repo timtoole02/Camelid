@@ -10,6 +10,8 @@ with:
 - exactly 40 anonymous physical hot slots on each of 30 layers;
 - 128 logical mapped-cold slots per layer;
 - K8 speculative verification and full-Q4 MTP;
+- mapped readahead omitted from the child environment, with disabled/zero
+  geometry and counters;
 - no victim cache, overflow, slot pinning, prediction, or sparse-predict probe.
 
 It only starts an absolute prebuilt binary supplied through
@@ -21,13 +23,17 @@ signals anything through that port. The benchmark child binds only
 
 ## Memory admission
 
-The schema-v3 watchdog requires 60 seconds of normal-pressure baseline
-samples, at least 7.5 GiB reclaimable before spawn, at least 2 GiB during the
-run, no more than 7.5 GiB child physical footprint, and no more than 8 GiB host
-wired memory. Existing swap is allowed. Any current-run swap-in or swap-out
-counter change—from the preflight sample through the final watchdog sample—is
-a failure. The watchdog always rejects swap-out changes; `--reject-swapin-growth`
-adds the matching swap-in rule.
+By default, the schema-v3 watchdog requires 60 seconds at pressure level 1
+and at least 7.5 GiB reclaimable before spawn. Setting the exact opt-in
+`CAMELID_HOT40_ALLOW_WARNING_PRESSURE=1` admits pressure levels 1 or 2 and
+lowers only that pre-spawn floor to 5 GiB. Critical/unknown pressure is always
+rejected. Both policies retain the 2 GiB runtime floor, 7.5 GiB child physical
+footprint ceiling, 8 GiB wired-memory ceiling, and hard abort on any current-run
+swap-in or swap-out counter change. Existing swap is allowed.
+
+Mapped readahead is omitted rather than set to zero. A PASS requires telemetry
+to report `mapped_readahead_enabled=false`, maximum inflight records `0`, and
+all per-round readahead counters `0`; this avoids the advisory memory burst.
 
 ## Page-cache-safe provenance
 
@@ -66,6 +72,15 @@ CAMELID_HOT40_BINARY_SOURCE_COMMIT=49757102 \
 ./run_hot40.zsh
 ```
 
+For the authorized pressure-warning measurement path, add the exact opt-in:
+
+```sh
+CAMELID_HOT40_BINARY=/private/tmp/camelid-hot40-49757102 \
+CAMELID_HOT40_BINARY_SOURCE_COMMIT=49757102 \
+CAMELID_HOT40_ALLOW_WARNING_PRESSURE=1 \
+./run_hot40.zsh
+```
+
 The revision is canonicalized to a full 40-character commit and must be an
 ancestor of the clean harness HEAD. Admission also requires an empty Git diff
 between those commits for `src`, `Cargo.toml`, `Cargo.lock`, and `build.rs`.
@@ -77,10 +92,10 @@ Optional path/output overrides are `CAMELID_HOT40_MODEL`,
 `CAMELID_HOT40_RECEIPT_ROOT`. The receipt root must be a fresh path on the
 internal Data volume.
 
-A PASS proves exact 48-token IDs, exact 40-by-30 telemetry, K8/full-Q4
-execution, normal pressure, no current-run swap delta, bounded memory, and
-clean ports afterward. It reports throughput; it is not by itself a claim
-that the 50 tok/s target has been reached.
+A PASS proves exact 48-token IDs, exact 40-by-30 telemetry, disabled readahead,
+K8/full-Q4 execution, pressure within the selected policy, no current-run swap
+delta, bounded memory, and clean ports afterward. It reports throughput; it is
+not by itself a claim that the 50 tok/s target has been reached.
 
 Run model-free contract tests with:
 

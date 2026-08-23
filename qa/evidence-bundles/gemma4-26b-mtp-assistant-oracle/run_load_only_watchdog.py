@@ -41,6 +41,7 @@ SAMPLE_PERIOD_NS = 250_000_000
 TERM_GRACE_NS = 250_000_000
 MIN_RECLAIMABLE_HEADROOM_BYTES = 2 * 1024 * 1024 * 1024
 NORMAL_PRESSURE_LEVEL = 1
+WARNING_PRESSURE_LEVEL = 2
 HOST_VM_INFO64 = 4
 RUSAGE_INFO_V2 = 2
 PROC_PGRP_ONLY = 2
@@ -621,6 +622,7 @@ def _host_violation_reasons(
     minimum_reclaimable_headroom_bytes: int = MIN_RECLAIMABLE_HEADROOM_BYTES,
     maximum_host_wired_bytes: int | None = None,
     require_zero_current_swap: bool = False,
+    maximum_pressure_level_raw: int = NORMAL_PRESSURE_LEVEL,
 ) -> list[str]:
     reasons: list[str] = []
     if sample["swapouts_pages"] != baseline_swapouts_pages:
@@ -636,8 +638,18 @@ def _host_violation_reasons(
         reasons.append(
             f"swapped_pages_current_{sample['swapped_pages_current']}_is_not_zero"
         )
-    if sample["pressure_level_raw"] != NORMAL_PRESSURE_LEVEL:
-        reasons.append(f"pressure_level_{sample['pressure_level_raw']}_is_not_normal")
+    allowed_pressure_levels = {NORMAL_PRESSURE_LEVEL}
+    if maximum_pressure_level_raw == WARNING_PRESSURE_LEVEL:
+        allowed_pressure_levels.add(WARNING_PRESSURE_LEVEL)
+    if (
+        maximum_pressure_level_raw
+        not in {NORMAL_PRESSURE_LEVEL, WARNING_PRESSURE_LEVEL}
+        or sample["pressure_level_raw"] not in allowed_pressure_levels
+    ):
+        reasons.append(
+            f"pressure_level_{sample['pressure_level_raw']}_outside_allowed_"
+            f"{sorted(allowed_pressure_levels)}"
+        )
     if sample["reclaimable_headroom_bytes"] < minimum_reclaimable_headroom_bytes:
         reasons.append(
             "reclaimable_headroom_bytes_"
@@ -839,6 +851,7 @@ def run(args: argparse.Namespace) -> int:
             ),
             maximum_host_wired_bytes=args.maximum_host_wired_bytes,
             require_zero_current_swap=args.require_zero_current_swap,
+            maximum_pressure_level_raw=args.maximum_pressure_level_raw,
         )
         if baseline["sample_duration_ns"] >= SAMPLE_PERIOD_NS:
             baseline_reasons.append("baseline_telemetry_exceeded_250ms")
@@ -893,6 +906,7 @@ def run(args: argparse.Namespace) -> int:
                 ),
                 maximum_host_wired_bytes=args.maximum_host_wired_bytes,
                 require_zero_current_swap=args.require_zero_current_swap,
+                maximum_pressure_level_raw=args.maximum_pressure_level_raw,
             )
             telemetry_duration_ns = sample_finished_ns - sample_started_ns
             if telemetry_duration_ns + schedule_lateness_ns >= SAMPLE_PERIOD_NS:
@@ -939,6 +953,7 @@ def run(args: argparse.Namespace) -> int:
                     args.minimum_baseline_reclaimable_headroom_bytes
                 ),
                 "require_zero_current_swap": args.require_zero_current_swap,
+                "maximum_pressure_level_raw": args.maximum_pressure_level_raw,
             }
         )
 
@@ -1000,6 +1015,7 @@ def run(args: argparse.Namespace) -> int:
                 ),
                 "maximum_host_wired_bytes": args.maximum_host_wired_bytes,
                 "require_zero_current_swap": args.require_zero_current_swap,
+                "maximum_pressure_level_raw": args.maximum_pressure_level_raw,
                 "reject_swapin_growth": args.reject_swapin_growth,
                 "baseline_swapins_pages": baseline_swapins_pages,
                 "baseline_swapouts_pages": baseline_swapouts_pages,
@@ -1088,6 +1104,7 @@ def run(args: argparse.Namespace) -> int:
                 ),
                 maximum_host_wired_bytes=args.maximum_host_wired_bytes,
                 require_zero_current_swap=args.require_zero_current_swap,
+                maximum_pressure_level_raw=args.maximum_pressure_level_raw,
             )
             if (
                 process is not None
@@ -1205,6 +1222,7 @@ def run(args: argparse.Namespace) -> int:
                     ),
                     maximum_host_wired_bytes=args.maximum_host_wired_bytes,
                     require_zero_current_swap=args.require_zero_current_swap,
+                    maximum_pressure_level_raw=args.maximum_pressure_level_raw,
                 )
                 if final_host["sample_duration_ns"] >= SAMPLE_PERIOD_NS:
                     final_reasons.append("final_telemetry_exceeded_250ms")
@@ -1380,6 +1398,13 @@ def _parser() -> argparse.ArgumentParser:
         "--maximum-host-wired-bytes",
         type=_nonnegative_int,
         help="refuse/abort while host wired memory exceeds this limit",
+    )
+    parser.add_argument(
+        "--maximum-pressure-level-raw",
+        type=int,
+        choices=(NORMAL_PRESSURE_LEVEL, WARNING_PRESSURE_LEVEL),
+        default=NORMAL_PRESSURE_LEVEL,
+        help="allow normal pressure only (1), or normal and warning pressure (2)",
     )
     parser.add_argument(
         "--require-zero-current-swap",
