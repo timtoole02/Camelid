@@ -17281,28 +17281,46 @@ impl Gemma4Q6KHead {
         // its own (fma-contraction) numerics that we deliberately do not disturb here.
         // spec50's k<=8 table is bitwise-proven against the batch reference;
         // the k>8 wide table was anchored to the single-token kernel's flavor
-        // (which diverges from the oracle stream on near-ties), so wide chunks
-        // take encode_q6k_ordered_batch below, which slabs them through the
-        // proven batch pipelines at the same per-row arithmetic as K<=8.
+        // (which diverges from the oracle stream on near-ties). Wide chunks
+        // therefore run as one canonical K8 tile plus a canonical K<=8 tail,
+        // matching encode_q6k_ordered_batch's target-authoritative slabs while
+        // retaining spec50's faster tied-head projection.
         let head_kernels = spec50_head_kernels();
         let used_spec50 = !head_spec50_disabled()
-            && k <= 8
             && head_kernels.is_some_and(|kernels| {
-                encode_q6k_spec50_batch(
-                    encoder,
-                    kernels,
-                    &state.q8k_scales_batch,
-                    &state.q8k_quants_batch,
-                    &state.activation_perm,
-                    &state.weight,
-                    state.weight_offset as u64,
-                    &state.logits_batch,
-                    n_superblocks,
-                    vocab,
-                    k,
-                    hidden,
-                    state.softcap,
-                )
+                if k <= 8 {
+                    encode_q6k_spec50_batch(
+                        encoder,
+                        kernels,
+                        &state.q8k_scales_batch,
+                        &state.q8k_quants_batch,
+                        &state.activation_perm,
+                        &state.weight,
+                        state.weight_offset as u64,
+                        &state.logits_batch,
+                        n_superblocks,
+                        vocab,
+                        k,
+                        hidden,
+                        state.softcap,
+                    )
+                } else {
+                    encode_q6k_spec50_batch_tiled(
+                        encoder,
+                        kernels,
+                        &state.q8k_scales_batch,
+                        &state.q8k_quants_batch,
+                        &state.activation_perm,
+                        &state.weight,
+                        state.weight_offset as u64,
+                        &state.logits_batch,
+                        n_superblocks,
+                        vocab,
+                        k,
+                        hidden,
+                        state.softcap,
+                    )
+                }
             });
         if !used_spec50 {
             encode_q6k_ordered_batch(

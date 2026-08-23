@@ -1251,6 +1251,110 @@ pub(crate) fn encode_q6k_spec50_batch_at_offsets(
     true
 }
 
+/// Encode one bounded K=9..=16 wave as the same two at-most-K8 tiles used by
+/// the target-authoritative fallback.  The first tile is always K8 and the
+/// second is K-8; both therefore select only the canonical, bitwise-gated
+/// `batch` table and never the numerically distinct `batch_wide` table.
+///
+/// All byte offsets are checked before either tile is encoded, so an invalid
+/// geometry returns `false` without leaving a partially encoded command stream.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_q6k_spec50_batch_tiled(
+    encoder: &metal::ComputeCommandEncoderRef,
+    kernels: &Spec50HeadKernels,
+    input_scales: &Buffer,
+    input_quants: &Buffer,
+    activation_perm: &Buffer,
+    weight: &Buffer,
+    weight_offset: u64,
+    output: &Buffer,
+    n_superblocks: usize,
+    rows: usize,
+    k_batch: usize,
+    hidden: usize,
+    softcap: f32,
+) -> bool {
+    if !(9..=16).contains(&k_batch)
+        || rows == 0
+        || n_superblocks == 0
+        || hidden == 0
+        || rows > u32::MAX as usize
+        || n_superblocks > u32::MAX as usize
+    {
+        return false;
+    }
+
+    let Some(expand_count) = 8usize.checked_mul(hidden) else {
+        return false;
+    };
+    if expand_count > u32::MAX as usize {
+        return false;
+    }
+    let Some(input_scales_offset) = 8usize
+        .checked_mul(n_superblocks)
+        .and_then(|count| count.checked_mul(std::mem::size_of::<f32>()))
+    else {
+        return false;
+    };
+    let Some(input_quants_offset) = 8usize.checked_mul(hidden) else {
+        return false;
+    };
+    let Some(activation_perm_offset) = 8usize
+        .checked_mul(hidden)
+        .and_then(|count| count.checked_mul(SPEC50_YFMT_STRIDE))
+    else {
+        return false;
+    };
+    let Some(output_offset) = 8usize
+        .checked_mul(rows)
+        .and_then(|count| count.checked_mul(std::mem::size_of::<f32>()))
+    else {
+        return false;
+    };
+
+    let tail_offsets = Spec50HeadBufferOffsets {
+        input_scales: input_scales_offset as u64,
+        input_quants: input_quants_offset as u64,
+        activation_perm: activation_perm_offset as u64,
+        output: output_offset as u64,
+    };
+    let first_encoded = encode_q6k_spec50_batch_at_offsets(
+        encoder,
+        kernels,
+        input_scales,
+        input_quants,
+        activation_perm,
+        weight,
+        weight_offset,
+        output,
+        n_superblocks,
+        rows,
+        8,
+        hidden,
+        softcap,
+        Spec50HeadBufferOffsets::default(),
+    );
+    debug_assert!(first_encoded);
+    let tail_encoded = encode_q6k_spec50_batch_at_offsets(
+        encoder,
+        kernels,
+        input_scales,
+        input_quants,
+        activation_perm,
+        weight,
+        weight_offset,
+        output,
+        n_superblocks,
+        rows,
+        k_batch - 8,
+        hidden,
+        softcap,
+        tail_offsets,
+    );
+    debug_assert!(tail_encoded);
+    first_encoded && tail_encoded
+}
+
 /// Byte offsets for a width-independent argmax dispatch.  Its `k_batch`
 /// changes only the number of independent threadgroups, never a row's compare
 /// or tie-breaking program.
@@ -1802,6 +1906,76 @@ mod tests {
             }
         }
         eprintln!("[spec50] per-token batch independence holds for K=1..=8");
+    }
+
+    /// Production K=9..=16 verification is target-authoritative: compare the
+    /// new two-tile spec50 route directly with `encode_q6k_ordered_batch`, not
+    /// with a copied shader or a separately reconstructed reference path.
+    #[test]
+    fn spec50_tiled_k16_is_bitwise_identical_to_target_fallback() {
+        let target = super::super::metal_linear_kernel().expect("target Metal pipelines");
+        let kernels = spec50_head_kernels().expect("spec50 pipelines");
+        const ROWS: usize = 2045;
+        const MAX_K: usize = 16;
+        let mut rng = Rng(0x5449_4c45_0009_1016);
+
+        let weights = build_weights(&mut rng, ROWS);
+        let (scales, quants) = build_activations(&mut rng, MAX_K);
+        let wbuf = shared(&target.device, weights.len());
+        write_buffer_u8(&wbuf, &weights);
+        let sbuf = shared(&target.device, scales.len() * std::mem::size_of::<f32>());
+        write_buffer_f32(&sbuf, &scales);
+        let qbuf = shared(&target.device, quants.len());
+        write_buffer_i8(&qbuf, &quants);
+        let fbuf = shared(
+            &target.device,
+            spec50_activation_scratch_bytes(MAX_K, HIDDEN),
+        );
+        let scalar = shared(&target.device, 4 * std::mem::size_of::<u32>());
+        write_shared_at(&scalar, 0, &[N_SB as u32, ROWS as u32, MAX_K as u32, 0]);
+
+        for k in [9usize, 12, 16] {
+            let out_target = shared(&target.device, k * ROWS * std::mem::size_of::<f32>());
+            let out_tiled = shared(&target.device, k * ROWS * std::mem::size_of::<f32>());
+            fill_shared(&out_target, 0xa5, k * ROWS * std::mem::size_of::<f32>());
+            fill_shared(&out_tiled, 0x5a, k * ROWS * std::mem::size_of::<f32>());
+
+            let cb = target.queue.new_command_buffer();
+            let encoder = cb.new_compute_command_encoder();
+            super::super::encode_q6k_ordered_batch(
+                encoder,
+                target,
+                &sbuf,
+                &qbuf,
+                &wbuf,
+                0,
+                &out_target,
+                &scalar,
+                N_SB,
+                ROWS,
+                k,
+                HIDDEN,
+                SOFTCAP,
+            );
+            assert!(encode_q6k_spec50_batch_tiled(
+                encoder, kernels, &sbuf, &qbuf, &fbuf, &wbuf, 0, &out_tiled, N_SB, ROWS, k, HIDDEN,
+                SOFTCAP,
+            ));
+            encoder.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            assert_eq!(cb.status(), metal::MTLCommandBufferStatus::Completed);
+
+            let target_logits = read_shared_f32(&out_target, 0, k * ROWS);
+            let tiled_logits = read_shared_f32(&out_tiled, 0, k * ROWS);
+            for (index, (got, want)) in tiled_logits.iter().zip(&target_logits).enumerate() {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "K={k}: target fallback differs at logit {index}"
+                );
+            }
+        }
     }
 
     /// The tied-head projection remains on its oracle-pinned fixed-K8 pipeline
