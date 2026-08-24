@@ -26621,7 +26621,7 @@ impl Gemma4GhostCommonMetal {
         let is_decode_hot = expert_bindings
             .first()
             .is_some_and(Gemma4Q4ExpertSlotBinding::is_hot_ready);
-        let unified_single_cb = predicted_ready || (record_demand && is_decode_hot);
+        let unified_single_cb = predicted_ready || (record_demand && is_decode_hot && start_pos > 0);
         let mut predicted_w1: Vec<Vec<usize>> = vec![Vec::new(); n_layers];
         let mut predicted_ping_tables: Vec<[u32; 128]> = vec![[0xFFFFFFFFu32; 128]; n_layers];
         let mut predicted_pong_tables: Vec<[u32; 128]> = vec![[0xFFFFFFFFu32; 128]; n_layers];
