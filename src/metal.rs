@@ -27538,7 +27538,9 @@ impl Gemma4GhostCommonMetal {
                             mapped_binding_guards.push(Gemma4Q4MappedBindingGuard::new(&cb3, binding));
                         }
                         last_committed_cb = Some(cb3);
+                        cb_closed = true;
                         layer_committed = true;
+                        encode_clock = std::time::Instant::now();
                         continue;
                     }
                 }
