@@ -806,6 +806,26 @@ pub(crate) fn overlap_enabled() -> bool {
     *FLAG.get_or_init(|| overlap_flag_from(std::env::var("CAMELID_GEMMA4_OVERLAP").ok().as_deref()))
 }
 
+/// `CAMELID_GEMMA4_GHOST_METAL_DEMAND_PROMOTION=1`: bind ONLY the round's exact
+/// routed union, after promoting that union into the layer's anonymous hot
+/// records, instead of declaring all 128 canonical records and letting the GPU
+/// reach the mapped tier.
+///
+/// Measured 2026-08-24 on the 16 GiB M4: the unified decode command buffer
+/// declares `active = 0..128` per layer, so every round binds 30 x 96 = 2,880
+/// file-mapped no-copy records (~9.65 GiB). That costs a flat ~9.0 s of
+/// command-buffer time whether 94 or 44 of those records are actually routed,
+/// which is why hot-slot promotion alone never moved the round. Binding the
+/// ~12-record union instead, sourced from anonymous memory, removes the mapped
+/// tier from the command entirely.
+#[cfg(target_os = "macos")]
+pub(crate) fn gemma4_hybrid_demand_promotion_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_GHOST_METAL_DEMAND_PROMOTION").is_ok_and(|value| value == "1")
+    })
+}
+
 /// Pure parse for [`overlap_enabled`]: on unless explicitly "0"/"false".
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn overlap_flag_from(value: Option<&str>) -> bool {
@@ -26634,7 +26654,17 @@ impl Gemma4GhostCommonMetal {
         let is_decode_hot = expert_bindings
             .first()
             .is_some_and(Gemma4Q4ExpertSlotBinding::is_hot_ready);
-        let unified_single_cb = predicted_ready || (record_demand && is_decode_hot && is_decode_round);
+        // The unified decode command buffer can only be encoded before the
+        // GPU router has run, so it declares every canonical record active.
+        // Under a file-mapped hybrid source that means binding ~96 mapped
+        // records per layer that the round never routes. Demand promotion
+        // trades this schedule for the per-layer route barrier and binds only
+        // the routed union.
+        let unified_single_cb = predicted_ready
+            || (record_demand
+                && is_decode_hot
+                && is_decode_round
+                && !(file_mapped_demand && gemma4_hybrid_demand_promotion_enabled()));
         let mut predicted_w1: Vec<Vec<usize>> = vec![Vec::new(); n_layers];
         let mut predicted_ping_tables: Vec<[u32; 128]> = vec![[0xFFFFFFFFu32; 128]; n_layers];
         let mut predicted_pong_tables: Vec<[u32; 128]> = vec![[0xFFFFFFFFu32; 128]; n_layers];
@@ -26769,7 +26799,15 @@ impl Gemma4GhostCommonMetal {
         // encode-timing reorder only (see `overlap_enabled`). Excluded under
         // stage profiling (which owns command-buffer boundaries) and layer
         // dumps (which wait mid-layer on the ambient command buffer).
-        let overlap_round = overlap_enabled() && !stage_profile && !dump_layers;
+        // The overlap pre-encodes a layer's MoE command buffer during the
+        // router wait, which requires materializing a binding before the union
+        // is known: without a predicted union it falls back to all 128 records,
+        // reintroducing the mapped-tier bind that demand promotion exists to
+        // remove. Serial encode for those rounds costs a few ms per round.
+        let overlap_round = overlap_enabled()
+            && !stage_profile
+            && !dump_layers
+            && !(file_mapped_demand && gemma4_hybrid_demand_promotion_enabled());
         macro_rules! begin_gpu_stage {
             ($stage:expr) => {{
                 if stage_profile {
@@ -28749,7 +28787,13 @@ impl Gemma4GhostCommonMetal {
             self.last_chained_ledger = ledger;
             return false;
         }
-        if record_demand {
+        // The unified schedule never routes on the host mid-round, so it owes
+        // the directory one post-round publication. The per-layer schedule
+        // already routed and filled every layer inside the round, which makes
+        // this pass a second full fill over the same unions: measured 2026-08-24
+        // it doubled `disk_loads` (231 loads against 1 directory miss) and
+        // evicted as many records as it loaded.
+        if record_demand && (unified_single_cb || !gemma4_hybrid_demand_promotion_enabled()) {
             if let Some(filler) = slot_filler.as_deref_mut() {
                 for layer_idx in 0..self.layers.len() {
                     let logits_off = layer_idx * k_tokens * 128 * 4;

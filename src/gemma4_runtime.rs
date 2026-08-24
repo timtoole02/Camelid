@@ -1782,6 +1782,22 @@ const GHOST_METAL_DECODE_PROMOTION_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_DECOD
 /// routing thread only resolves and enqueues record-sized ranges; advisory work
 /// runs on the existing Ghost read pool and may never become a correctness
 /// dependency.
+/// Exact hybrid-only opt-in that promotes the current round's routed union
+/// into this layer's anonymous hot records BEFORE its mixed argument table is
+/// materialized, instead of after the terminal barrier.
+///
+/// Measured 2026-08-24 on the 16 GiB M4: a decode round that binds ANY
+/// file-mapped record pays a fixed ~9.0 s command-buffer cost that does not
+/// scale with the number of cold records (94 mapped selections and 44 mapped
+/// selections both measured ~9.0 s of `final_wait`), while the same records
+/// read explicitly through the Ghost read pool move at 2.1-6.5 GB/s. Deferring
+/// promotion to the terminal barrier can never reach zero mapped selections,
+/// because ~10% of each round's union is newly routed. Promoting on demand can,
+/// which is the point of this switch. Refusal (a live table lease or a union
+/// wider than the hot budget) simply retains the mapped fallback, so the switch
+/// is a performance opt-in and never a correctness dependency.
+const GHOST_METAL_HYBRID_DEMAND_PROMOTION_ENV: &str =
+    "CAMELID_GEMMA4_GHOST_METAL_DEMAND_PROMOTION";
 const GHOST_METAL_MAPPED_READAHEAD_ENV: &str = "CAMELID_GEMMA4_GHOST_METAL_MAPPED_READAHEAD";
 const GHOST_METAL_MAPPED_READAHEAD_MAX_INFLIGHT_RECORDS: usize = 512;
 /// Darwin-only stronger page-in experiment. It is deliberately subordinate to
@@ -2052,6 +2068,36 @@ fn resolve_ghost_metal_hybrid_hot_admission(
     Ok(canonical_hot_slots.map(|_| GhostMetalHybridHotAdmission::CanonicalHot32))
 }
 
+/// `CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_PROFILE_FREE=1` lifts the frozen
+/// 960-slot hybrid budget so the per-layer profile can be sized from a layer's
+/// measured routed union instead of an equal share.
+///
+/// Measured 2026-08-24 on the 16 GiB M4 (48 uniform hot slots/layer, K=8): the
+/// per-layer routed union is not uniform. Layer medians run 25.5-39 with maxima
+/// 31-52, so the widest layers thrash — layer 5 was observed evicting experts
+/// it reloaded on the very next round — while the narrowest sit on ~35 slots of
+/// dead residency. The equal partition is the wrong shape; this switch is the
+/// static approximation of a global pool.
+///
+/// The cap is memory, not policy: 2,400 records x 3,358,720 B = 8.06 GiB of
+/// anonymous hot residency, which is already more than this host can pair with
+/// dense weights, the assistant, and KV.
+#[cfg(any(target_os = "macos", test))]
+const GHOST_METAL_HYBRID_HOT_PROFILE_FREE_ENV: &str =
+    "CAMELID_GEMMA4_GHOST_METAL_HYBRID_HOT_PROFILE_FREE";
+#[cfg(any(target_os = "macos", test))]
+const GHOST_METAL_HYBRID_PROFILE_FREE_MAX_SLOTS: usize = 128;
+#[cfg(any(target_os = "macos", test))]
+const GHOST_METAL_HYBRID_PROFILE_FREE_MAX_TOTAL_SLOTS: usize = 2400;
+
+#[cfg(any(target_os = "macos", test))]
+fn ghost_metal_hybrid_hot_profile_free() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var(GHOST_METAL_HYBRID_HOT_PROFILE_FREE_ENV).is_ok_and(|value| value == "1")
+    })
+}
+
 #[cfg(any(target_os = "macos", test))]
 fn validate_ghost_metal_hybrid_hot_profile(profile: &[usize]) -> std::result::Result<(), String> {
     if profile.len() != GHOST_METAL_HYBRID_PROFILE_LAYERS {
@@ -2060,19 +2106,33 @@ fn validate_ghost_metal_hybrid_hot_profile(profile: &[usize]) -> std::result::Re
             profile.len(),
         ));
     }
-    if let Some((layer, slots)) = profile.iter().copied().enumerate().find(|(_, slots)| {
-        !(GHOST_METAL_HYBRID_PROFILE_MIN_SLOTS..=GHOST_METAL_HYBRID_PROFILE_MAX_SLOTS)
-            .contains(slots)
-    }) {
+    let free_budget = ghost_metal_hybrid_hot_profile_free();
+    let max_slots = if free_budget {
+        GHOST_METAL_HYBRID_PROFILE_FREE_MAX_SLOTS
+    } else {
+        GHOST_METAL_HYBRID_PROFILE_MAX_SLOTS
+    };
+    if let Some((layer, slots)) = profile
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, slots)| !(GHOST_METAL_HYBRID_PROFILE_MIN_SLOTS..=max_slots).contains(slots))
+    {
         return Err(format!(
-            "{GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER_ENV} layer {layer} has {slots} slots; exact range is {GHOST_METAL_HYBRID_PROFILE_MIN_SLOTS}..={GHOST_METAL_HYBRID_PROFILE_MAX_SLOTS}",
+            "{GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER_ENV} layer {layer} has {slots} slots; exact range is {GHOST_METAL_HYBRID_PROFILE_MIN_SLOTS}..={max_slots}",
         ));
     }
     let total = profile.iter().try_fold(0usize, |sum, &slots| {
         sum.checked_add(slots)
             .ok_or_else(|| format!("{GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER_ENV} total overflowed"))
     })?;
-    if total != GHOST_METAL_HYBRID_PROFILE_TOTAL_SLOTS {
+    if free_budget {
+        if total > GHOST_METAL_HYBRID_PROFILE_FREE_MAX_TOTAL_SLOTS {
+            return Err(format!(
+                "{GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER_ENV} with {GHOST_METAL_HYBRID_HOT_PROFILE_FREE_ENV}=1 totals {total} slots; the memory cap is {GHOST_METAL_HYBRID_PROFILE_FREE_MAX_TOTAL_SLOTS}",
+            ));
+        }
+    } else if total != GHOST_METAL_HYBRID_PROFILE_TOTAL_SLOTS {
         return Err(format!(
             "{GHOST_METAL_HYBRID_HOT_SLOTS_PER_LAYER_ENV} must total exactly {GHOST_METAL_HYBRID_PROFILE_TOTAL_SLOTS} slots, found {total}",
         ));
@@ -3439,6 +3499,67 @@ fn fold_chained_fill_payload_totals(
 /// first writable byte, then publishes one validated directory snapshot after
 /// complete-record reads and directory commits. Failed reads leave their
 /// destination unbound, so the command uses the mapped canonical fallback.
+/// Resolve `CAMELID_GEMMA4_GHOST_METAL_DEMAND_PROMOTION` once. Absent or any
+/// non-canonical value keeps the established deferred-promotion behavior, so
+/// every existing launch receipt is unchanged.
+#[cfg(target_os = "macos")]
+fn ghost_metal_hybrid_demand_promotion_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var(GHOST_METAL_HYBRID_DEMAND_PROMOTION_ENV).is_ok_and(|value| value == "1")
+    })
+}
+
+/// Separates the two halves of demand promotion so they can be measured apart:
+/// binding only the routed union (always on with the parent switch) and
+/// copying that union into anonymous hot records (this one). `...FILL=0` keeps
+/// the exact-union binding and lets the few cold IDs stay mapped.
+#[cfg(target_os = "macos")]
+fn ghost_metal_hybrid_demand_promotion_fill_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var("CAMELID_GEMMA4_GHOST_METAL_DEMAND_PROMOTION_FILL")
+            .is_ok_and(|value| value == "0")
+    })
+}
+
+/// `CAMELID_GEMMA4_GHOST_METAL_DEMAND_PROMOTION_PREFETCH=1` fills layer N from
+/// the PREVIOUS round's routed union in the pre-router window, before the exact
+/// union is known. **Default off: measured a net loss.**
+///
+/// The idea was to hide the ~105 ms of record copies behind the ~116 ms of GPU
+/// the round already has. It cannot work here, and the reason is worth keeping:
+/// once the hot tier is sized to the per-layer union, the previous round's
+/// union is ALREADY resident, so the speculative pass finds nothing to fetch
+/// (measured `wave_load` 0.2 ms) while still paying a plan/publish transaction
+/// and an LFU frequency perturbation per layer. 2026-08-24, 48-token fixture:
+/// 435.1 ms/round and 15.74 tok/s with it on, against 306.0 ms and 21.52 tok/s
+/// with it off, both token-identical.
+///
+/// The residual reads are, by construction, the experts this round routes for
+/// the first time. Hiding those needs a predictor that sees the FUTURE token —
+/// the MTP assistant's drafts are the obvious candidate — not the past one.
+#[cfg(target_os = "macos")]
+fn ghost_metal_hybrid_demand_promotion_prefetch_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_GHOST_METAL_DEMAND_PROMOTION_PREFETCH")
+            .is_ok_and(|value| value == "1")
+    })
+}
+
+/// `CAMELID_GEMMA4_GHOST_METAL_DEMAND_PROMOTION_TRACE=1`: one line per demand
+/// fill with the plan shape, so load/eviction churn can be attributed to a
+/// caller instead of inferred from round totals.
+#[cfg(target_os = "macos")]
+fn ghost_metal_hybrid_demand_promotion_trace() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_GHOST_METAL_DEMAND_PROMOTION_TRACE")
+            .is_ok_and(|value| value == "1")
+    })
+}
+
 #[cfg(target_os = "macos")]
 fn fill_hybrid_hot_slots(
     layer: &mut GhostMetalExpertLayer,
@@ -3450,6 +3571,13 @@ fn fill_hybrid_hot_slots(
 ) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     if !layer.slots.is_hybrid_mapped() || !layer.slots.hot_refill_available() {
+        if ghost_metal_hybrid_demand_promotion_trace() {
+            eprintln!(
+                "[hybrid fill trace] layer={layer_idx} SKIPPED: hybrid={} refill_available={}",
+                layer.slots.is_hybrid_mapped(),
+                layer.slots.hot_refill_available(),
+            );
+        }
         return false;
     }
     let (directory, slots) = (&mut layer.directory, &mut layer.slots);
@@ -3459,6 +3587,19 @@ fn fill_hybrid_hot_slots(
     let Ok((plan, cold_fallback)) = directory.plan_hot_overrides(selected_experts) else {
         return false;
     };
+    if ghost_metal_hybrid_demand_promotion_trace() {
+        let occupied = directory.entries.iter().filter(|e| e.is_some()).count();
+        eprintln!(
+            "[hybrid fill trace] layer={layer_idx} selected={} slots={} occupied={} hits={} loads={} evicted={} cold_fallback={}",
+            selected_experts.len(),
+            directory.entries.len(),
+            occupied,
+            plan.hits,
+            plan.loads.len(),
+            plan.evicted.len(),
+            cold_fallback.len(),
+        );
+    }
     let _ = cold_fallback;
     for load in &plan.loads {
         if load.expert < 128 {
@@ -3545,10 +3686,21 @@ fn fill_hybrid_hot_slots(
         host_copy_us,
     );
     let Some(hot_slot_ids) = directory.hot_slot_ids() else {
+        if ghost_metal_hybrid_demand_promotion_trace() {
+            eprintln!(
+                "[hybrid fill trace] layer={layer_idx} REFUSED: hot_slot_ids() returned None; directory residency cleared"
+            );
+        }
         directory.clear_dynamic();
         return false;
     };
     if !refill.publish_hot_slot_ids(&hot_slot_ids) {
+        if ghost_metal_hybrid_demand_promotion_trace() {
+            eprintln!(
+                "[hybrid fill trace] layer={layer_idx} REFUSED: publish_hot_slot_ids rejected {} ids; directory residency cleared",
+                hot_slot_ids.len()
+            );
+        }
         directory.clear_dynamic();
         return false;
     }
@@ -5140,20 +5292,34 @@ impl GhostMetalExpertRuntime {
             exact_repeat,
             chained_predict_forced(),
         );
-        let predicted_unions: Vec<Vec<usize>> = self
-            .layers
-            .iter()
-            .take(30)
-            .map(|l| {
-                let mut experts = Vec::new();
-                for e in 0..128 {
-                    if l.directory.resident_slot_table[e] >= 0 {
-                        experts.push(e);
+        // The pre-router speculative fill wants a PREDICTION of what this layer
+        // will route, and "every expert currently resident" is not one: under
+        // demand promotion those records are resident by construction, so the
+        // speculative pass has nothing to fetch and the whole copy cost lands
+        // after the router. The previous round's actual routed union is the
+        // real predictor (75-90% by `union_vs_prev`). Only the demand-promotion
+        // path takes it; `predicted_ready` requires `!record_demand` and the
+        // covered-union audit lives under it, so neither observes this.
+        let hybrid_demand_prefetch = ghost_metal_hybrid_demand_promotion_enabled()
+            && ghost_metal_hybrid_demand_promotion_prefetch_enabled()
+            && self.has_hybrid_mapped_backing();
+        let predicted_unions: Vec<Vec<usize>> = if hybrid_demand_prefetch {
+            self.latest_routed_experts.iter().take(30).cloned().collect()
+        } else {
+            self.layers
+                .iter()
+                .take(30)
+                .map(|l| {
+                    let mut experts = Vec::new();
+                    for e in 0..128 {
+                        if l.directory.resident_slot_table[e] >= 0 {
+                            experts.push(e);
+                        }
                     }
-                }
-                experts
-            })
-            .collect();
+                    experts
+                })
+                .collect()
+        };
         let overflow_slot_count = self.overflow_slot_count();
         let copies = self.overflow_bank.len().max(1);
         let pong_slab_buf = if demand_record_backing {
@@ -5353,7 +5519,13 @@ impl GhostMetalExpertRuntime {
                     // canonical strict-tie route union so a successful predicted
                     // round publishes this target's exact union, not an older or
                     // over-complete prediction, for the next assistant interval.
-                    if mapped_readahead_enabled {
+                    // The pre-router speculative pass has no router result to
+                    // offer and passes an empty slice; only a real wave carries
+                    // logits. Recomputing unconditionally indexes `[0..128]`
+                    // into an empty slice.
+                    if mapped_readahead_enabled
+                        && router_logits.len() >= n_tokens.saturating_mul(128)
+                    {
                         collected_routes[layer_idx] =
                             crate::metal::gemma4_top8_union_from_router_logits(
                                 router_logits,
@@ -5399,6 +5571,23 @@ impl GhostMetalExpertRuntime {
                 }
 
                 if layer.slots.is_hybrid_mapped() {
+                    // Promote this round's exact routed union into the layer's
+                    // anonymous hot records BEFORE the mixed table is built, so
+                    // the command buffer binds zero file-mapped records. A
+                    // refusal keeps the mapped fallback and only costs speed.
+                    if (routed || ghost_metal_hybrid_demand_promotion_prefetch_enabled())
+                        && ghost_metal_hybrid_demand_promotion_enabled()
+                        && ghost_metal_hybrid_demand_promotion_fill_enabled()
+                    {
+                        let _ = fill_hybrid_hot_slots(
+                            layer,
+                            cache,
+                            layer_idx,
+                            &selected_experts,
+                            HybridFillPayloadAccounting::Chained(&fill_counters),
+                            round_seq,
+                        );
+                    }
                     let cold_experts = selected_mapped_cold_experts(
                         &selected_experts,
                         &layer.directory.resident_slot_table,
@@ -5557,7 +5746,13 @@ impl GhostMetalExpertRuntime {
         let wave1_refs: Vec<&metal::Buffer> = wave1_gpu.iter().collect();
         let slot_mapping_slices: Vec<&[u32; 128]> = slot_mappings.iter().collect();
         let empty_unions = vec![Vec::new(); n_layers];
-        let gpu_unions = if allow_predicted {
+        // `allow_predicted` gates the fully-predicted round, which this lane
+        // never takes (it requires `!record_demand`). The pre-router
+        // speculative fill reads the same slice though, so blanking it here is
+        // what kept `wave_load_ms` at 0.0 and left every record copy after the
+        // router. Demand promotion needs the prediction delivered; everything
+        // else in the callee that reads it sits under `predicted_ready`.
+        let gpu_unions = if allow_predicted || hybrid_demand_prefetch {
             &predicted_unions
         } else {
             &empty_unions
