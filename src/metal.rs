@@ -26724,7 +26724,7 @@ impl Gemma4GhostCommonMetal {
         // encode-timing reorder only (see `overlap_enabled`). Excluded under
         // stage profiling (which owns command-buffer boundaries) and layer
         // dumps (which wait mid-layer on the ambient command buffer).
-        let overlap_round = !record_demand && overlap_enabled() && !stage_profile && !dump_layers;
+        let overlap_round = overlap_enabled() && !stage_profile && !dump_layers;
         macro_rules! begin_gpu_stage {
             ($stage:expr) => {{
                 if stage_profile {
