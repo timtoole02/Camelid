@@ -1,0 +1,14 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "Add a `pub expires_at: u64,` field at the end of this struct and output the COMPLETE struct definition again, unchanged otherwise, with no explanation:\n\npub struct CacheEntry<K, V> {\n    pub key: K,\n    pub value: V,\n    pub access_count: u64,\n    pub created_at: u64,\n    pub last_hit: u64,\n}"
+    }
+  ],
+  "max_tokens": 48,
+  "temperature": 0,
+  "top_k": 1,
+  "seed": 0,
+  "stream": false,
+  "camelid_enable_thinking": false
+}
